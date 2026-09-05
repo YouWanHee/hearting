@@ -5583,12 +5583,35 @@ def marker_bound_process_identity(
     return tuple((key, metadata.get(key, "")) for key in _MARKER_BOUND_PROCESS_KEYS)
 
 
+# SD-96: a sub-session row (`stage_authority=0`) can never publish a stage marker
+# -- `capability-route.py complete` refuses it before touching the row -- so it
+# needs a terminal note of its own. Without one it had no closure path at all and
+# every success was booked as `dead-route-completion-rejected` (defect F).
+# Deliberately NOT `completed-supervisor`: several gates read that note to mean "a
+# checked supervisor closed a depth-1 owner", and one of them (SD-94 marker
+# eligibility, `capability-route.py`) grants a privilege a sub-session must never
+# have.
+SUBSESSION_NOTE = "completed-subsession"
+
+# The one definition of "this row's note says it succeeded". It lives in this
+# module because `dispatch_completion_join` imports this one, never the reverse.
+# Consumers that ask "did this attempt succeed?" use this set; the two that ask
+# "*which producer* closed this row" (SD-94 marker eligibility and
+# `supervisor_terminal` below) keep their narrow literal on purpose.
+SUCCESS_NOTES = frozenset({"completed-marker", "completed-supervisor", SUBSESSION_NOTE})
+
+
+def row_is_subsession(metadata: dict[str, str]) -> bool:
+    """One definition of "this row is a sub-session slice, not a stage owner"."""
+
+    return bool(metadata.get("subsession_id")) or str(
+        metadata.get("stage_authority", "1")
+    ).lower() in {"0", "false"}
+
+
 def _marker_bound_row_verdict(metadata: dict[str, str]) -> str:
     failure_class = metadata.get("failure_class", "").lower()
-    if failure_class == "pass" or metadata.get("note") in {
-        "completed-marker",
-        "completed-supervisor",
-    }:
+    if failure_class == "pass" or metadata.get("note") in SUCCESS_NOTES:
         return "PASS"
     if failure_class == "fail":
         return "FAIL"
@@ -6185,7 +6208,7 @@ def _delivery_intent_values(fields: list[str], metadata: dict[str, str]) -> dict
     route_node = metadata.get("route_node", "")
     is_success = (
         metadata.get("failure_class") == "pass"
-        or metadata.get("note") in {"completed-marker", "completed-supervisor"}
+        or metadata.get("note") in SUCCESS_NOTES
     )
     child = {
         "attempt_id": attempt_id,

@@ -45,7 +45,11 @@ from dispatch_completion_join import (
     validate_delivery_timing,
     write_supervisor_state,
 )
-from dispatch_contract import DispatchContractError, hold_supervisor_lease
+from dispatch_contract import (
+    SUCCESS_NOTES as COMPLETION_JOIN_SUCCESS_NOTES,
+    DispatchContractError,
+    hold_supervisor_lease,
+)
 from dispatch_continuation_budget import (
     AdmitVerdict,
     ContinuationLedger,
@@ -164,7 +168,7 @@ def terminal_route_completion(
             getattr(row, "status", "") != "done"
             or not (
                 metadata.get("failure_class") == "pass"
-                or metadata.get("note") in {"completed-marker", "completed-supervisor"}
+                or metadata.get("note") in COMPLETION_JOIN_SUCCESS_NOTES
             )
             or metadata.get("route_id") != args.route_id
             or metadata.get("route_hash") != args.route_hash

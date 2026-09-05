@@ -1099,6 +1099,24 @@ def worktree_mutating_scope(scope):
 def _node_mutates_worktree(node):
     return any(worktree_mutating_scope(scope) for scope in (node.get("write_scope") or []))
 
+_COMPLETION_JOIN=None
+
+def _completion_join():
+    """The success-note vocabulary has one definition, in the join module.
+
+    Seven call sites used to spell the set as a literal. Adding a note to a
+    vocabulary that several gates read is how this defect family starts, so the
+    consumers that ask "did this attempt succeed?" import the set instead. The
+    two that ask "*which producer* closed this row" (SD-94 marker eligibility,
+    `supervisor_terminal`) deliberately keep their narrow literal.
+    """
+    global _COMPLETION_JOIN
+    if _COMPLETION_JOIN is None:
+        sys.path.insert(0,str(ROOT/"utilities"))
+        import dispatch_completion_join as module
+        _COMPLETION_JOIN=module
+    return _COMPLETION_JOIN
+
 _STAGE_FALLBACK=None
 
 def _stage_fallback():
@@ -4219,7 +4237,7 @@ def complete_subsession_stage(route, node, node_id, evidence, manifest_path, job
             raise ValueError(f"subsession attempt identity mismatch:{session['attempt_id']}")
         if (
             fields[1]!="done"
-            or metadata.get("note") not in {"completed-supervisor", "completed-marker"}
+            or metadata.get("note") not in _completion_join().SUCCESS_NOTES
             or metadata.get("failure_class")!="pass"
         ):
             raise ValueError(f"subsession not semantic PASS:{session['attempt_id']}")
