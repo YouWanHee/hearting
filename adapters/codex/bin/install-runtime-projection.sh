@@ -182,14 +182,34 @@ printf 'skills_mode=%s\n' "$skills_mode"
 printf 'skills_linked=%s\n' "$skills_linked"
 [ "$skills_mode" = "plugin" ] && printf 'skills_unlinked=%s\n' "$skills_unlinked"
 
-# Native Codex custom-agent discovery: one symlink per generated TOML.
+# O1 (Astra guide alignment): native Codex custom-agent discovery links the
+# effective payload (this CODEX_HOME's user models.conf if complete, else the
+# whole shipped one -- never merged), not the shipped repo TOML directly. The
+# payload materializer runs only after the user config above is seeded/
+# preserved, and only its returned exact TOML paths are linked.
+payload_result=$(python3 "$AGENT_HOME/tools/install/native_agent_payload.py" materialize \
+  --runtime-home "$CODEX_HOME" --source-root "$AGENT_HOME") || {
+    printf '%s\n' "$payload_result" >&2
+    echo "install-runtime-projection: native agent payload materialization failed" >&2
+    exit 3
+  }
+printf 'native_agent_payload=%s\n' "$payload_result"
+
 agents_linked=0
 mkdir -p "$CODEX_HOME/agents"
-for f in "$S/codex-agents"/*.toml; do
-  [ -f "$f" ] || continue
-  ln -sfn "$f" "$CODEX_HOME/agents/$(basename "$f")"
+payload_links=$(python3 "$AGENT_HOME/tools/install/native_agent_payload.py" links \
+  --runtime-home "$CODEX_HOME" --source-root "$AGENT_HOME") || {
+    printf '%s\n' "$payload_links" >&2
+    echo "install-runtime-projection: native agent payload link listing failed" >&2
+    exit 3
+  }
+while IFS="$(printf '\t')" read -r agent_name agent_path; do
+  [ -n "$agent_name" ] || continue
+  ln -sfn "$agent_path" "$CODEX_HOME/agents/$agent_name"
   agents_linked=$((agents_linked + 1))
-done
+done <<EOF
+$payload_links
+EOF
 printf 'agents_linked=%s\n' "$agents_linked"
 
 if [ "$install_plugin" = "1" ]; then

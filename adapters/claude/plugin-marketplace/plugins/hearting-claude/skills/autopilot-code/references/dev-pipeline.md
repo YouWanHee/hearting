@@ -88,7 +88,7 @@ Keep `ROUTE_FILE`, `CANONICAL_JOBS`, `NODE_ID`, and the captured `ATTEMPT_ID` to
 that node's completion transaction succeeds. Never dispatch standard+ with a raw wrapper
 command that omits the route record.
 
-The prompt carries only subskill name, absolute input paths, output contract, intensity, and slug. It never carries plan bodies or prior-stage conversation. Each stage reads files; the conductor reads only verdict and gate state. Register every stage in `.dispatch/jobs.log` and keep conductor plus active stages at or below five processes. Runtime-owned completion observes exact liveness outside the model; the conductor never adds a recurring monitor. One-line or no-artifact micro-stages stay inline.
+The prompt carries only subskill name, absolute input paths, output contract, intensity, and slug. It never carries plan bodies or prior-stage conversation. Each stage reads files; the conductor reads only verdict and gate state. Register every stage in `.dispatch/jobs.log`; `core/OPERATIONS.md`'s checked `utilities/model-worker-governor.py` owns the actual global/per-class registered-worker caps, so this reference does not restate a numeric ceiling that would drift from it. Runtime-native subagent/delegation limits are a separate, adapter-owned surface and are never substituted for the registered governor's caps. Runtime-owned completion observes exact liveness outside the model; the conductor never adds a recurring monitor. One-line or no-artifact micro-stages stay inline.
 
 #### Runtime-Owned Batch Join
 

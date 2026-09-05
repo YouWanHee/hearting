@@ -55,12 +55,23 @@ make_fixture() {
   printf '%s\n' '# role fixture' > "$root/roles/README.md"
 
   printf '%s\n' '# Codex instructions' > "$root/adapters/codex/AGENTS.md"
-  printf '%s\n' 'CFG_TIER_DEEP_MODEL=codex-default' > "$root/adapters/codex/config/models.conf"
+  printf '%s\n' 'CFG_TIER_DEEP_MODEL=codex-default' 'CFG_PROFILE_DEFAULT=deep:high:workspace-write' \
+    > "$root/adapters/codex/config/models.conf"
   printf '%s\n' '#!/bin/sh' 'exit 0' > "$root/adapters/codex/bin/preflight.sh"
   chmod +x "$root/adapters/codex/bin/preflight.sh"
   cp "$ROOT/adapters/codex/bin/check-runtime-projection.sh" \
     "$root/adapters/codex/bin/check-runtime-projection.sh"
   chmod +x "$root/adapters/codex/bin/check-runtime-projection.sh"
+  # check-runtime-projection.sh calls the real native-agent payload checker by
+  # $AGENT_HOME-relative path (O1, Astra guide alignment); this fixture is
+  # executed standalone (its own AGENT_HOME), so it needs its own copies of
+  # that module and its small, self-contained import chain.
+  mkdir -p "$root/tools/install" "$root/utilities"
+  cp "$ROOT/tools/harness_manifest.py" "$root/tools/harness_manifest.py"
+  cp "$ROOT/tools/install/native_agent_payload.py" "$root/tools/install/native_agent_payload.py"
+  cp "$ROOT/adapters/codex/bin/native_agent_renderer.py" "$root/adapters/codex/bin/native_agent_renderer.py"
+  cp "$ROOT/utilities/model_config.py" "$root/utilities/model_config.py"
+  cp "$ROOT/utilities/model_profile.py" "$root/utilities/model_profile.py"
   printf '%s\n' '{"hooks":{}}' > "$root/adapters/codex/hooks/hooks.json"
   printf '%s\n' '# mode' > "$root/adapters/codex/modes/dev/refactor.md"
   printf '%s\n' '---' 'name: demo' 'description: demo' '---' '# demo codex' \
@@ -366,7 +377,7 @@ for runtime_home in "$HOME/.claude" "$HOME/.codex" "$HOME/.config/opencode"; do
   test ! -L "$runtime_home/agent-config/models.conf" \
     || fail "user model config remained a symlink for $runtime_home"
 done
-printf '%s\n' 'CFG_TIER_DEEP_MODEL=user-custom' \
+printf '%s\n' 'CFG_TIER_DEEP_MODEL=user-custom' 'CFG_PROFILE_DEFAULT=deep:high:workspace-write' \
   > "$HOME/.codex/agent-config/models.conf"
 harness runtime refresh --runtime codex --json >/dev/null
 grep -q '^CFG_TIER_DEEP_MODEL=user-custom$' \

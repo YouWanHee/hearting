@@ -315,7 +315,7 @@ class DispatchDefaultsV4Tests(unittest.TestCase):
     def test_v3_config_without_new_blocks_validates_and_defaults(self):
         config = self.v3_config()
         self.assertEqual(D.validate(config, self.capmap), [])
-        self.assertEqual(D.query_confirmation_mode(config), "hybrid")
+        self.assertEqual(D.query_confirmation_mode(config), "autonomous")
         self.assertEqual(D.query_steward_child_permission_mode(config), "bypass")
 
     def test_v3_config_with_new_blocks_is_rejected(self):
@@ -340,15 +340,15 @@ class DispatchDefaultsV4Tests(unittest.TestCase):
         config = self.v4_config()
         self.assertNotIn("confirmation", config)
         self.assertNotIn("steward", config)
-        self.assertEqual(D.query_confirmation_mode(config), "hybrid")
+        self.assertEqual(D.query_confirmation_mode(config), "autonomous")
         self.assertEqual(D.query_steward_child_permission_mode(config), "bypass")
 
     def test_absent_config_defaults(self):
-        self.assertEqual(D.query_confirmation_mode({}), "hybrid")
+        self.assertEqual(D.query_confirmation_mode({}), "autonomous")
         self.assertEqual(D.query_steward_child_permission_mode({}), "bypass")
 
     def test_every_valid_confirmation_mode_and_steward_mode_validates(self):
-        for mode in ("hybrid", "both", "post-frame-only"):
+        for mode in ("hybrid", "both", "post-frame-only", "autonomous"):
             config = self.v4_config()
             config["confirmation"] = {"mode": mode}
             self.assertEqual(D.validate(config, self.capmap), [])
@@ -365,7 +365,7 @@ class DispatchDefaultsV4Tests(unittest.TestCase):
         errors = D.validate(config, self.capmap)
         self.assertTrue(any("confirmation.mode must be one of" in e for e in errors), errors)
         # an invalid value never falls back to the default silently
-        self.assertEqual(D.query_confirmation_mode(config), "hybrid")
+        self.assertEqual(D.query_confirmation_mode(config), "autonomous")
 
         config = self.v4_config()
         config["steward"] = {"child_permission_mode": "root"}
@@ -389,8 +389,33 @@ class DispatchDefaultsV4Tests(unittest.TestCase):
             parsed = D.parse_yaml_subset(f.read())
         self.assertEqual(parsed.get("schema_version"), 4)
         self.assertEqual(D.validate(parsed, capmap), [])
-        self.assertEqual(D.query_confirmation_mode(parsed), "hybrid")
+        self.assertEqual(D.query_confirmation_mode(parsed), "autonomous")
         self.assertEqual(D.query_steward_child_permission_mode(parsed), "bypass")
+
+    def test_no_user_file_at_all_resolves_autonomous_through_the_real_resolver(self):
+        """O3 required correction: a unit fixture that only queries an empty
+        dict cannot cover this. With no user file anywhere, `default_config_path()`
+        falls back to the shipped `profiles/dispatch-defaults.yaml`, so the
+        fallback is only proven autonomous once the shipped file itself says
+        `autonomous` -- this exercises that exact fallback chain."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": tmp}, clear=False):
+                os.environ.pop("DISPATCH_DEFAULTS_CONFIG", None)
+                resolved_path = D.default_config_path()
+                self.assertEqual(Path(resolved_path), Path(D.SHIPPED_CONFIG_PATH))
+                config = D.load_and_validate(resolved_path, D.default_topology_path())
+                self.assertEqual(D.query_confirmation_mode(config), "autonomous")
+
+    def test_fresh_routing_config_ensure_generated_config_resolves_autonomous(self):
+        """A fresh install writes a new schema-v3 file with no `confirmation`
+        block at all (`tools/install/routing_config.py::render()`); that must
+        resolve through the same accessor as every other absent-block case."""
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools" / "install"))
+        import routing_config
+        rendered = routing_config.render(enabled=["claude", "codex"])
+        config = D.parse_yaml_subset(rendered)
+        self.assertNotIn("confirmation", config)
+        self.assertEqual(D.query_confirmation_mode(config), "autonomous")
 
 
 class ShippedBaselineMergeTests(unittest.TestCase):

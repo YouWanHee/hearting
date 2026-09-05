@@ -513,14 +513,29 @@ Registry writes and harvest rewrites are serialized with a `.lock` file.
 `adapters/codex/config/models.conf` is the shipped concrete default. Install
 seeds `$CODEX_HOME/agent-config/models.conf` once; a valid complete user file is
 selected as one unit, otherwise the shipped file is selected as one unit.
-Behavioral roles resolve through `preflight.sh role`; registered route profiles resolve as:
+Behavioral roles resolve through `preflight.sh role`; `preflight.sh model-config`
+(backed by `utilities/model_config.py --diagnose`) reports the effective
+receipt plus the deep tier model/effort, deep profile tier/budget, and parsed
+failover cascade for whichever file was actually selected, flagging (never
+rewriting) a coherence mismatch between those three independently-configured
+values. Registered route profiles resolve as (shipped default shown, not a
+fixed pin — read the diagnostic for the live mapping):
 
-| Model profile | Concrete realization |
+| Model profile | Concrete realization (shipped default shown) |
 |---|---|
-| `deep` | configured deep tier / `xhigh` |
-| `balanced-deep` | configured deep tier / `medium` |
-| `light` | configured light tier / `medium` |
-| `mini` | configured mini tier / `medium`, lifecycle/micro-only |
+| `deep` | configured deep tier / configured deep effort (shipped: `xhigh`) |
+| `balanced-deep` | configured deep tier / configured balanced-deep effort (shipped: `medium`) |
+| `light` | configured light tier / configured light effort (shipped: `medium`) |
+| `mini` | configured mini tier / configured mini effort (shipped: `low`, not `medium`), lifecycle/micro-only |
+
+An Astra Ultra opt-in changes only the existing `CFG_TIER_DEEP_MODEL`,
+`CFG_TIER_DEEP_EFFORT`, `CFG_MODEL_PROFILE_DEEP`, and first
+`CFG_TIER_DEEP_FAILOVER_CASCADE` step in a copied complete user file — see the
+comments in `adapters/codex/config/models.conf`. It adds no new `CFG_*` key
+(one would make every existing user file `user-incomplete`, per
+`utilities/model_config.py:158-207`), does not change any shipped Codex or
+Claude default, and is not evidence of universal runtime/account availability
+for the selected model.
 
 Non-route role compatibility overrides remain explicit and config-derived:
 

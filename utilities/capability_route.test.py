@@ -263,6 +263,13 @@ class TestRoute(unittest.TestCase):
        recipe["capability"],
        auxiliary_check_units=registry.get("auxiliary_check_units"))
       for node in expected: node.pop("fallback_hops",None)
+      # O3: the shipped default confirmation mode is now `autonomous`, which
+      # realizes `autopilot-code`'s `frame` continuation as `inline-next`
+      # instead of the recipe's `human-gate` -- the same transform compile
+      # applies, so re-derive the expectation through the shared helper
+      # rather than asserting the untransformed recipe shape.
+      expected,_=R._effective_confirmation_graph(
+       expected,recipe,intensity,recipe["capability"],route["confirmation_mode"])
       def stable(nodes):
        return [
         {key:value for key,value in node.items()
@@ -1263,7 +1270,7 @@ class TestRoute(unittest.TestCase):
   # (None, None, None) early return for an absent config file -- that would
   # seal confirmation_mode=None instead of the "hybrid" default for exactly
   # the user this config is absent for.
-  self.assertEqual(route["confirmation_mode"],"hybrid")
+  self.assertEqual(route["confirmation_mode"],"autonomous")
  def test_seal_confirmation_mode_reads_v4_config(self):
   v4_config=(
    "schema_version: 4\n"
@@ -1284,7 +1291,103 @@ class TestRoute(unittest.TestCase):
  def test_seal_confirmation_mode_defaults_for_v1_config_without_block(self):
   with dispatch_defaults_config(DD_CONFIG_A):
    route=self._standard()
+  self.assertEqual(route["confirmation_mode"],"autonomous")
+ def _v4_confirmation_config(self,mode):
+  return (
+   "schema_version: 4\n"
+   "harnesses:\n  enabled: [claude, codex]\n"
+   "profiles:\n"
+   + "".join(
+     f"  {profile}:\n    primary: [claude, codex]\n    relief: []\n"
+     "    last_resort: []\n    promote_relief_below: 0\n"
+     for profile in ("deep","balanced-deep","light","mini")
+   )
+   + "allocation:\n  strategy: capacity-aware\n  window: 30\n"
+   f"confirmation:\n  mode: {mode}\n"
+   "capabilities:\n"
+  )
+ def test_o3_four_mode_confirmation_compile_verify_matrix(self):
+  """O3/plan.md WP4: autonomous removes only the autopilot-code frame-review
+  binding and rewrites frame/frame-clone continuations to inline-next;
+  explicit legacy modes keep today's bindings/continuation unchanged. Assert
+  through the real compile+verify path (not a dict-only query) at both
+  standard and strong, and that workflow_contract/route hash agree."""
+  for intensity in ("standard","strong"):
+   frame_ids={
+    "standard":{"frame","frame-alternative"},
+    "strong":{"frame","frame-alternative","frame-contrarian"},
+   }[intensity]
+   for mode in ("autonomous","hybrid","both","post-frame-only"):
+    with self.subTest(intensity=intensity,mode=mode):
+     with dispatch_defaults_config(self._v4_confirmation_config(mode)):
+      route=R.compile_route(**self.args(
+       requested_intensity=intensity,predicates=[],signals=["shared-contract"],
+       transport="headless",inline_reason=None,
+       dispatch_evidence=self.dispatch(self.nested())))
+     R.verify_route(route,R.ROOT)
+     self.assertEqual(route["confirmation_mode"],mode)
+     frame_nodes=[n for n in route["nodes"] if n["id"] in frame_ids]
+     self.assertEqual({n["id"] for n in frame_nodes},frame_ids)
+     other_nodes=[n for n in route["nodes"] if n["id"] not in frame_ids]
+     # join policy/all-join and every non-frame node are unaffected by mode.
+     frame_group=next(g for g in route["parallel_groups"] if g["id"]=="frame")
+     self.assertEqual(set(frame_group["members"]),frame_ids)
+     self.assertEqual(frame_group["join_policy"],"all")
+     if mode=="autonomous":
+      self.assertEqual(route["human_gate_bindings"],[])
+      for node in frame_nodes:
+       self.assertEqual(node["continuation"],{"kind":"inline-next"})
+      self.assertNotIn("frame-review",route["workflow_contract"]["continuations"].values())
+      for frame_id in frame_ids:
+       self.assertEqual(route["workflow_contract"]["continuations"][frame_id],"inline-next")
+      self.assertEqual(route["workflow_contract"]["human_gate_bindings"],[])
+     else:
+      self.assertEqual(
+       route["human_gate_bindings"],
+       [{"gate":"frame-review","node":"plan","position":"entry"}])
+      for node in frame_nodes:
+       self.assertEqual(node["continuation"],{"kind":"human-gate","gate":"frame-review"})
+      for frame_id in frame_ids:
+       self.assertEqual(route["workflow_contract"]["continuations"][frame_id],"human-gate")
+      self.assertEqual(
+       route["workflow_contract"]["human_gate_bindings"],
+       [{"gate":"frame-review","node":"plan","position":"entry"}])
+     # every other realized node's continuation is untouched by mode.
+     for node in other_nodes:
+      if node.get("terminal") is True: continue
+      self.assertIn("continuation",node)
+ def test_o3_autonomous_tampered_continuation_is_rejected(self):
+  with dispatch_defaults_config(self._v4_confirmation_config("autonomous")):
+   route=self._standard()
+  tampered=json.loads(json.dumps(route))
+  for node in tampered["nodes"]:
+   if node["id"]=="frame":
+    node["continuation"]={"kind":"human-gate","gate":"frame-review"}
+  tampered["route_hash"]=R.route_hash(tampered)
+  tampered["route_id"]="rt-"+tampered["route_hash"].split(":",1)[1][:16]
+  with self.assertRaisesRegex(ValueError,"route node continuation differs"):
+   R.verify_route(tampered,R.ROOT)
+ def test_o3_legacy_route_with_no_sealed_confirmation_mode_keeps_old_semantics(self):
+  """A route sealed before SD-123 introduced `confirmation_mode` never had
+  the field at all -- deleting it (rather than setting an explicit legacy
+  string) is the honest fixture for that population, and it must keep
+  verifying under the original recipe-verbatim human-gate semantics even
+  though the shipped default is now `autonomous`."""
+  with dispatch_defaults_config(self._v4_confirmation_config("hybrid")):
+   route=self._standard()
   self.assertEqual(route["confirmation_mode"],"hybrid")
+  legacy=json.loads(json.dumps(route))
+  del legacy["confirmation_mode"]
+  legacy["route_hash"]=R.route_hash(legacy)
+  legacy["route_id"]="rt-"+legacy["route_hash"].split(":",1)[1][:16]
+  # verifies fine even under a config that would now seal `autonomous` for a
+  # *new* route -- the absent field is never retro-fitted.
+  with dispatch_defaults_config(self._v4_confirmation_config("autonomous")):
+   R.verify_route(legacy,R.ROOT)
+  frame=next(n for n in legacy["nodes"] if n["id"]=="frame")
+  self.assertEqual(frame["continuation"],{"kind":"human-gate","gate":"frame-review"})
+  self.assertEqual(
+   legacy["human_gate_bindings"],[{"gate":"frame-review","node":"plan","position":"entry"}])
  def test_seal_corrupt_config_fails_loud(self):
   with dispatch_defaults_config(DD_CONFIG_CORRUPT):
    with self.assertRaisesRegex(ValueError,"corrupt dispatch-defaults config"):
@@ -1315,6 +1418,31 @@ class TestRoute(unittest.TestCase):
    R.compile_composed_route(
     self._composed_recipe(),"composed-fixture","direct",R.ROOT,R.ROOT,
     predicates=ALL,tracking="tracked",tracked_gate_evidence=self.args()["tracked_gate_evidence"])
+ def test_autonomous_preserves_explicit_composed_frame_gate(self):
+  recipe=self._composed_recipe()
+  with dispatch_defaults_config(self._v4_confirmation_config("autonomous")):
+   route=self._composed(recipe)
+  bindings=recipe["human_gate_bindings"]
+  self.assertEqual(route["confirmation_mode"],"autonomous")
+  self.assertEqual(route["human_gate_bindings"],bindings)
+  self.assertEqual(route["workflow_contract"]["human_gate_bindings"],bindings)
+  frames=[n for n in route["nodes"] if n.get("parallel_group")=="frame"]
+  self.assertEqual(len(frames),3)
+  for node in frames:
+   self.assertEqual(node["continuation"],{"kind":"human-gate","gate":"frame-review"})
+   self.assertEqual(route["workflow_contract"]["continuations"][node["id"]],"human-gate")
+  R.verify_route(route,R.ROOT)
+
+  tampered=json.loads(json.dumps(route))
+  tampered["human_gate_bindings"]=[]
+  for node in tampered["nodes"]:
+   if node.get("parallel_group")=="frame":
+    node["continuation"]={"kind":"inline-next"}
+  tampered["workflow_contract"]=R._workflow_contract(R.TOPO.load_registry(),tampered["nodes"],[])
+  tampered["route_hash"]=R.route_hash(tampered)
+  tampered["route_id"]="rt-"+tampered["route_hash"].split(":",1)[1][:16]
+  with self.assertRaisesRegex(ValueError,"composed route nodes differ"):
+   R.verify_route(tampered,R.ROOT)
  def test_composed_spec_touch_gate(self):
   recipe=self._composed_recipe()
   execute=next(n for n in recipe["standard_plus"]["nodes"] if n["id"]=="execute")
@@ -2087,10 +2215,10 @@ class TestContinuation(unittest.TestCase):
   with tempfile.TemporaryDirectory() as tmp:
    artifact=Path(tmp)/"artifacts"
    source=self._source(artifact)
-   self.assertEqual(source["confirmation_mode"],"hybrid")
+   self.assertEqual(source["confirmation_mode"],"autonomous")
    self._complete_prefix(source,"test",Path(tmp)/"evidence")
    continuation=self._build(source)
-   self.assertEqual(continuation["confirmation_mode"],"hybrid")
+   self.assertEqual(continuation["confirmation_mode"],"autonomous")
 
  def test_at2_boundary_and_first_runnable_blockers_are_disjoint(self):
   with tempfile.TemporaryDirectory() as tmp:

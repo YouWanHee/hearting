@@ -141,6 +141,28 @@ Portable docs use role names, not vendor model names:
 
 Adapters map two independent portable axes: `model_role` describes behavior, while `model_profile` (`deep|balanced-deep|light|mini`) describes the execution budget. Each adapter declares concrete models, effort/variant projections, profile granularity, and interactive-main-only families in `adapters/<adapter>/config/models.conf`; every resolver, wrapper, generated agent, lifecycle worker, and documentation table derives from that single source. A route-bound job carries both sealed axes and rejects trailing model/effort replacement. `mini` is unavailable to substantive registered dispatch-depth-1/2 owners, stages, and reviewers. A profile may share another profile's concrete model as long as the resulting execution points stay distinct; the ladder is a set of operating points, not a set of models. An adapter lacking a verified effort/variant distinction may collapse `balanced-deep` into `deep` and `mini` into `light` only with explicit reduced-granularity metadata naming which profiles collapsed. Non-route surfaces may retain checked explicit selection or inheritance when the resulting model is execution-surface eligible; main-only or unprovable inheritance is a typed deny.
 
+O2 (Astra guide alignment): a single tier's execution budget is not one value. A deep-capable tier carries at least three independently-configured settings that must stay coherent by convention, not by a shared cell: the tier's own default effort (`CFG_TIER_<TIER>_EFFORT`), the `deep`-profile route budget that a route-bound job actually receives (`CFG_MODEL_PROFILE_DEEP`'s `tier:budget`), and the first step of that tier's capacity-failover cascade (`CFG_TIER_DEEP_FAILOVER_CASCADE`). A read-only diagnostic (`utilities/model_config.py --diagnose`, exposed per-adapter through the runtime surface, e.g. Codex's `preflight.sh model-config`) must report all three explicitly and flag — never silently equate or rewrite — a mismatch between them; treating them as one value hides exactly the "configured but not applied" drift class this alignment closes. An opt-in that changes only existing keys in a copied complete user file is the only supported customization path; no new required `CFG_*` key is introduced (the shipped baseline is selected whole-file, so a new required key would make every existing user file incomplete and discard it).
+
+O1 (Astra guide alignment): native delegated agent definitions and repository-generated
+agent projections resolve config differently on purpose. Repository generation (e.g.
+`adapters/codex/bin/sync-native-agents.py`'s ordinary and `--check` paths) stays
+shipped-config deterministic — it parses only the checked-in `models.conf` and never reads
+a runtime home, so the committed `adapters/codex/agents/*.toml` files are reproducible from
+source alone. A runtime's installed native-agent definitions instead use the effective
+whole user config (`utilities/model_config.py`'s `resolve_config`, selected whole-file, never
+merged) computed and materialized at install/activation time under that runtime's own
+`.harness/native-agents/<digest>/` directory, so a user's customized `models.conf` actually
+reaches the agents Codex loads. A read-only planner may compute that effective mapping (for
+`status`/`doctor`/`check`) without writing; only a named mutating step tied to
+install/activate/refresh may create the directory or files. Ownership of a materialized
+payload is proved by canonical runtime-home containment plus exact metadata, runtime, digest
+and per-file checksum agreement — never by a `.harness` substring or directory-name match,
+which would let a foreign link be adopted or deleted.
+The immutable payload identity includes the configuration source and fallback reason
+stored in its metadata. Repairing an invalid user configuration therefore selects a new
+payload even when its effective model values equal the previous shipped fallback; it
+must not collide with or rewrite the previous payload's provenance.
+
 Adapter and projection edits are derived core-first: change the portable invariant in
 `core/` first, read that governing core document in the current session, then update
 the adapter realization and generated projection. A runtime marker proves the read

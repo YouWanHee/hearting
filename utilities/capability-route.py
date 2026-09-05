@@ -1498,6 +1498,55 @@ def _seal_confirmation_mode():
     return DEFAULTS.query_confirmation_mode(cfg)
 
 
+_AUTONOMOUS_REMOVABLE_GATE = "frame-review"
+_AUTONOMOUS_REMOVABLE_CAPABILITY = "autopilot-code"
+
+
+def _effective_confirmation_graph(
+    nodes, recipe, effective_intensity, capability, sealed_mode, *, composed=False
+):
+    """O3/SD-123: the single place that turns `confirmation_mode` into a
+    realized node graph and human-gate binding set. Compile and verify both
+    call this exactly once (after parallel-group expansion) and feed its
+    result to node graph matching, `human_gate_bindings`, `_workflow_contract()`
+    and every hash comparison, so the two paths cannot disagree.
+
+    - `direct`/`quick` -> no bindings, nodes unchanged.
+    - `sealed_mode` is anything other than the literal `"autonomous"` --
+      including `None` (an old route sealed before this field existed, or a
+      route that predates SD-123 entirely) and every explicit legacy mode
+      (`hybrid`, `both`, `post-frame-only`) -- returns the recipe's nodes and
+      bindings verbatim. Legacy routes must keep verifying exactly as before;
+      this is never a retro-fit.
+    - `autonomous` removes only the `autopilot-code` `frame-review` binding
+      and rewrites every realized node (including frame parallel-group
+      clones) whose continuation targets that gate to `inline-next`. Every
+      other capability/gate pairing is untouched. Explicit composed recipes
+      retain all declared gates regardless of the default confirmation mode.
+    """
+    bindings = json.loads(json.dumps(recipe["human_gate_bindings"]))
+    if effective_intensity in ("direct", "quick"):
+        return nodes, []
+    if composed or sealed_mode != "autonomous" or capability != _AUTONOMOUS_REMOVABLE_CAPABILITY:
+        return nodes, bindings
+    removed_gates = {
+        row["gate"] for row in bindings if row["gate"] == _AUTONOMOUS_REMOVABLE_GATE
+    }
+    if not removed_gates:
+        return nodes, bindings
+    bindings = [row for row in bindings if row["gate"] not in removed_gates]
+    nodes = json.loads(json.dumps(nodes))
+    for node in nodes:
+        continuation = node.get("continuation")
+        if (
+            isinstance(continuation, dict)
+            and continuation.get("kind") == "human-gate"
+            and continuation.get("gate") in removed_gates
+        ):
+            node["continuation"] = {"kind": "inline-next"}
+    return nodes, bindings
+
+
 def _validation_basis():
     """Seal which install root produced `registry_digest`/`unit_catalog_digest`.
 
@@ -1588,6 +1637,8 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
     effective=max((requested,inferred),key=ORDER.get)
     if composed and effective in ("direct","quick"):
         raise ValueError("composed routes require a standard+ effective intensity")
+    sealed_confirmation_mode=_seal_confirmation_mode()
+    realized_human_gate_bindings=[]
     registered_headless_candidates=None
     if effective=="direct":
         transport="interactive"
@@ -1630,6 +1681,10 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
         )
         for node in nodes:
             node.pop("fallback_hops", None)
+        nodes,realized_human_gate_bindings=_effective_confirmation_graph(
+            nodes, recipe, effective, capability, sealed_confirmation_mode,
+            composed=composed
+        )
         selection_basis=[{"axis":"promotion","signal":s,"source":"caller"} for s in signals]
     _validate_output_scopes(nodes)
     if effective != "direct" and inline_reason is not None:
@@ -1686,7 +1741,7 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
       "dispatch_defaults_digest":dispatch_defaults_digest,
       "dispatch_allocation":dispatch_allocation,
       "owner_harness_policy":owner_harness_policy,
-      "confirmation_mode":_seal_confirmation_mode(),
+      "confirmation_mode":sealed_confirmation_mode,
       "selection":{"direct_predicates":predicates,"promotion_signals":[{"signal":s,"source":"caller"} for s in signals],
                    "selection_basis":selection_basis,
                    "escalation_basis":[{"signal":s,"source":"caller"} for s in signals],
@@ -1695,11 +1750,9 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
       "nodes":nodes,"parallel_groups":_realized_parallel_groups(nodes),
       "conditional_extensions":_realize_conditional_extensions(recipe, effective),
       "completion_gates":gates,"human_gates":recipe["human_gates"],
-      "human_gate_bindings":json.loads(json.dumps(
-          recipe["human_gate_bindings"] if effective not in ("direct","quick") else [])),
+      "human_gate_bindings":json.loads(json.dumps(realized_human_gate_bindings)),
       "workflow_contract":_workflow_contract(
-          registry, nodes,
-          recipe["human_gate_bindings"] if effective not in ("direct","quick") else []),
+          registry, nodes, realized_human_gate_bindings),
       "resume_retry_boundaries":recipe["resume_retry_boundaries"],
       "dispatch_evidence":checked_dispatch,
       "dispatch_contract_version":DISPATCH_CONTRACT_VERSION,
@@ -1865,6 +1918,7 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
             k: v for k, v in node.items()
             if k not in ("fallback_hops", "harness_affinity", "harness_policy")
         }
+    expected_bindings=[]
     if route.get("composed"):
         if route.get("effective_intensity") in ("direct","quick"):
             raise ValueError("composed routes require a standard+ effective intensity")
@@ -1880,6 +1934,9 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
             expected_nodes, composed_recipe["standard_plus"].get("parallel_groups"),
             route.get("effective_intensity"), route.get("capability"),
             auxiliary_check_units=registry.get("auxiliary_check_units"))
+        expected_nodes,expected_bindings=_effective_confirmation_graph(
+            expected_nodes, composed_recipe, route.get("effective_intensity"),
+            route.get("capability"), route.get("confirmation_mode"), composed=True)
         if ([_node_identity(n) for n in route.get("nodes",[])]
                 != [_node_identity(n) for n in expected_nodes]):
             raise ValueError("composed route nodes differ from embedded composed recipe")
@@ -1894,12 +1951,27 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
                 expected_nodes, route_recipe["standard_plus"].get("parallel_groups"),
                 route.get("effective_intensity"), route.get("capability"),
                 auxiliary_check_units=registry.get("auxiliary_check_units"))
+            expected_nodes,expected_bindings=_effective_confirmation_graph(
+                expected_nodes, route_recipe, route.get("effective_intensity"),
+                route.get("capability"), route.get("confirmation_mode"))
             # The remaining verifier owns field-level diagnostics.  This
             # census closes only the undeclared fanout hole: a rehashed route
             # may not add, remove, reorder, or rename recipe nodes.
             if ([n.get("id") for n in route.get("nodes", [])]
                     != [n.get("id") for n in expected_nodes]):
                 raise ValueError("route nodes differ from the declared recipe")
+            # SD-123/O3: confirmation_mode has already been realized into
+            # `expected_nodes` above, so compile and verify cannot disagree
+            # on which nodes' continuations are rewritten to `inline-next`.
+            # Checked narrowly (continuation only, by id) so this does not
+            # shadow the more specific per-field diagnostics below for an
+            # unrelated tampered field (e.g. `model_profile`).
+            expected_continuation_by_id={n["id"]:n.get("continuation") for n in expected_nodes}
+            for node in route.get("nodes", []):
+                if node.get("continuation") != expected_continuation_by_id.get(node.get("id")):
+                    raise ValueError(
+                        "route node continuation differs from the realized confirmation-mode graph"
+                    )
     expected_extensions=_realize_conditional_extensions(
         route_recipe, route.get("effective_intensity")
     )
@@ -1908,9 +1980,6 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
     route_node_ids={node.get("id") for node in route.get("nodes", [])}
     if any(not set(row["after"]) <= route_node_ids for row in expected_extensions):
         raise ValueError("route conditional extension anchor is not realized")
-    expected_bindings=json.loads(json.dumps(
-        route_recipe["human_gate_bindings"]
-        if route.get("effective_intensity") not in ("direct","quick") else []))
     if route.get("human_gate_bindings") != expected_bindings:
         raise ValueError("route human gate bindings differ from the sealed recipe")
     if route.get("workflow_contract") != _workflow_contract(

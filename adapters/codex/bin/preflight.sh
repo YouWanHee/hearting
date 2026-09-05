@@ -1018,7 +1018,7 @@ feature_check=codex features list
 native_agents_path=\$CODEX_HOME/agents
 projection=codex_setting/codex-agents
 trigger=explicit-user-request-or-main-dispatch
-auto_spawn=explicit-only
+auto_spawn=explicit-or-main-dispatched
 custom_agent_config=model,model_reasoning_effort,sandbox_mode
 memory_scout=adapters/codex/agents/memory-scout.toml
 dispatch_fallback=adapters/codex/bin/preflight.sh dispatch --dry-run|--register|--start
@@ -1235,6 +1235,14 @@ EOF
     [ "$#" -ge 2 ] || { echo "codex preflight: role requires a portable role" >&2; exit 64; }
     shift
     "$ROOT/adapters/codex/bin/role-map.sh" "$@"
+    ;;
+  model-config)
+    # O2 (Astra guide alignment): read-only effective-mapping diagnostic.
+    # Reports the same resolve_config() receipt the runtime renderer/payload
+    # uses, plus the deep tier model/effort, deep profile tier/budget, and
+    # parsed failover cascade, flagging (never rewriting) a mismatch. Does
+    # not change the existing `role` output contract.
+    exec python3 "$ROOT/utilities/model_config.py" --adapter codex --diagnose
     ;;
   capability-info)
     [ "$#" -eq 2 ] || { echo "codex preflight: capability-info requires one capability" >&2; exit 64; }

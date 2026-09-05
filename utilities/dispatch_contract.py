@@ -2925,7 +2925,10 @@ def _abort_fenced_launch(
 def _parent_liveness_evidence(
     jobs: Path, metadata: dict[str, str]
 ) -> tuple[bool, str, AuthoritativeProcessIdentity | None]:
-    process = attempt_process_quiescence(metadata)
+    # Descendants keep an attempt from draining, but do not prove its parent
+    # is alive. Preserve the governed process verdict so a namespace mismatch
+    # can use the exact held supervisor lease without masking PID reuse.
+    process = attempt_governed_process_quiescence(metadata)
     if process.state == "live" and process.identity is not None:
         return True, "process", process.identity
     if (

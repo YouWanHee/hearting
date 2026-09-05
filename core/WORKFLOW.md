@@ -288,11 +288,26 @@ group join, before `plan` starts:
 Deliver this card through a native structured-question surface when one is
 available, the plain-text form otherwise — the same fallback rule as the §0.4
 card. `direct`/`quick` have no `frame` node and keep the ordinary blocking §0.4
-card unchanged. `confirmation.mode` (`profiles/dispatch-defaults.yaml`, default
-`hybrid`) governs the pair: `hybrid` is the shape above, `both` restores a
-blocking start card, `post-frame-only` drops the start notify entirely. A route
-compiled before this cycle keeps `frame.continuation=inline-next` and is never
-retro-fitted onto this gate.
+card unchanged. `confirmation.mode` (`profiles/dispatch-defaults.yaml`) governs
+the pair and has four values: `autonomous` (the shipped default as of O3 —
+resolved whenever a config's `confirmation` block or `mode` key is absent, for
+any schema version, and whenever no config file exists at all) drops both the
+post-frame `[방향 확인]` block and its `frame-review` human gate for routine,
+already-authorized `autopilot-code` work — `frame`'s continuation realizes as
+`inline-next` and `plan` starts immediately; `hybrid` is the two-card shape
+above; `both` restores a blocking start card; `post-frame-only` drops the
+start notify entirely but keeps the post-frame gate. Explicit user-declared,
+composed-recipe, deploy, destructive, and other-capability gates are untouched by `autonomous`
+— it only ever removes the one routine `autopilot-code` `frame-review`
+binding. A route sealed with no `confirmation_mode` field at all (compiled
+before SD-123 introduced the field) keeps its recipe's legacy nodes and
+bindings verbatim and is never retro-fitted onto `autonomous`; a user file
+seeded from the shipped profile before this change, or that selects
+`hybrid`/`both`/`post-frame-only` explicitly, keeps that legacy behavior too —
+the shipped default change is not migrated into existing config files.
+`utilities/capability-route.py`'s `_effective_confirmation_graph()` is the one
+helper both compile and verify call to realize this, so the two paths cannot
+disagree.
 
 Entry routers therefore have two deterministic load phases: manifest-owned
 metadata before approval, then the selected portable owner contract after

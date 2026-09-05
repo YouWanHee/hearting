@@ -247,11 +247,22 @@ Efficiency is not corner cutting. Reduce duplicated orchestrator reasoning, not 
   files, commands, logs, findings, and reasoning stay in the artifact; worker
   output is a machine handoff, not a user-facing report.
 - At `standard+`, the dispatch-depth-1 owner reads the selected entry contract and
-  extends file-only handoff to dispatch-depth-2 stages. Each plan, execute, test, and
-  report worker reads only its stage contract and writes a complete artifact
-  for the next stage. Main retains route, state, artifact paths, and verdicts;
-  the owner remains a thin conductor. If a file cannot carry required context,
-  improve the artifact schema instead of passing conversation history.
+  extends file-only handoff to dispatch-depth-2 stages by default. Each plan,
+  execute, test, and report worker reads only its stage contract and writes a
+  complete artifact for the next stage. Main retains route, state, artifact
+  paths, and verdicts; the owner remains a thin conductor. If a file cannot
+  carry required context, improve the artifact schema instead of passing
+  conversation history. A durable completion gate is a state/authority
+  boundary, not a mandate to discard useful in-flight context: tightly
+  coupled implement-debug-verify work may use the existing recorded
+  "nonseparable" closed inline fallback (`dev-pipeline.md`'s Closed Inline
+  Fallback case 3), or a checked inline/reuse continuation where the runtime
+  and project policy support it, while still writing independent artifacts,
+  recording the reason, and keeping stage-gate authority exactly where the
+  route sealed it. `OPERATIONS §5.10` and
+  `skills/autopilot-code/references/context-and-guards.md` own the mechanics
+  and boundaries of that exception; it never substitutes for separable-stage
+  dispatch as the default.
 - Waiting and harvesting are part of the deterministic flow only when the parent runtime owns either a checked session supervisor or an explicitly entered single-ingress gateway. Registered standard+ conductors yield while their supervisor joins the exact child batch outside the model. A managed interactive Codex session stays conversational while its gateway serializes manual input and one bounded typed completion receipt; its control-only sidecar owns neither the upstream connection nor approvals. Parent runtime chooses the wake adapter independently of child runtime. Hooks must not simulate wake by blocking Stop, parking all tools, or creating a synthetic user turn. When atomic idle claim, durable idempotency, or approval routing cannot be proved, `dispatch-wait`/later-turn harvest is a disclosed finite fallback and ambiguous sends fail closed. `OPERATIONS §5.10` owns the runtime details.
 - Reduce fixed input before squeezing output: keep always-loaded bootstraps as routers, expose Skill detail progressively, prevent duplicate discovery, and keep ordinary hooks silent. `ADAPTATION §6.1` owns the measurable budgets.
 - Worker pruning follows the same rule: one minimal kernel, one worker-type

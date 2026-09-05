@@ -16,6 +16,7 @@ import projector
 import manifest
 import verifier
 import codex_launcher
+import native_agent_payload
 import user_model_config
 import safe_fs
 
@@ -87,7 +88,64 @@ def install(scope="global", plugin=False, dry_run=False):
 
     actions = []
 
-    for entry in entries:
+    # `seed_once` (user model config) runs first so the payload below, if a
+    # user file is being created for the first time, resolves against
+    # whatever is on disk *after* seeding -- matching
+    # install-runtime-projection.sh's order.
+    seed_entries = [entry for entry in entries if entry["action"] == "seed_once"]
+    other_entries = [entry for entry in entries if entry["action"] != "seed_once"]
+    for entry in seed_entries:
+        try:
+            actions.append(
+                user_model_config.seed_model_config(
+                    RUNTIME,
+                    entry["source"],
+                    paths.runtime_home(RUNTIME, scope),
+                    dry_run=dry_run,
+                )
+            )
+        except user_model_config.UserModelConfigError as exc:
+            actions.append(
+                {
+                    "action": "seed_once",
+                    "source": entry["source"],
+                    "dest": entry["dest"],
+                    "status": "blocked",
+                    "detail": str(exc),
+                }
+            )
+
+    # O1 (Astra guide alignment): materialize the effective native-agent
+    # payload before any transactional link below reads it as a symlink
+    # source. Dry-run only reports the plan; it never writes.
+    try:
+        payload_plan = native_agent_payload.plan_payload(
+            paths.runtime_home(RUNTIME, scope), source_root=paths.agent_home()
+        )
+    except native_agent_payload.PayloadError as exc:
+        actions.append(
+            {
+                "action": "materialize_native_agent_payload",
+                "status": "blocked",
+                "detail": str(exc),
+            }
+        )
+    else:
+        if dry_run:
+            actions.append(native_agent_payload.materialize_payload(payload_plan, dry_run=True))
+        else:
+            try:
+                actions.append(native_agent_payload.materialize_payload(payload_plan))
+            except native_agent_payload.PayloadMaterializeError as exc:
+                actions.append(
+                    {
+                        "action": "materialize_native_agent_payload",
+                        "status": "blocked",
+                        "detail": str(exc),
+                    }
+                )
+
+    for entry in other_entries:
         action = entry["action"]
 
         if action == "skip":
@@ -189,28 +247,6 @@ def install(scope="global", plugin=False, dry_run=False):
             )
             continue
 
-        if action == "seed_once":
-            try:
-                actions.append(
-                    user_model_config.seed_model_config(
-                        RUNTIME,
-                        entry["source"],
-                        paths.runtime_home(RUNTIME, scope),
-                        dry_run=dry_run,
-                    )
-                )
-            except user_model_config.UserModelConfigError as exc:
-                actions.append(
-                    {
-                        "action": "seed_once",
-                        "source": entry["source"],
-                        "dest": entry["dest"],
-                        "status": "blocked",
-                        "detail": str(exc),
-                    }
-                )
-            continue
-
     if plugin:
         actions.append(_plugin_action(dry_run))
         try:
@@ -251,6 +287,21 @@ def checks(scope="global"):
     agent_home = str(paths.agent_home())
 
     check_list = []
+
+    def _native_agent_payload_check():
+        try:
+            result = native_agent_payload.check_payload(
+                paths.runtime_home(RUNTIME, scope), source_root=paths.agent_home()
+            )
+        except native_agent_payload.PayloadError as exc:
+            return {"id": "codex.native-agent-payload", "ok": False, "detail": str(exc)}
+        return {
+            "id": "codex.native-agent-payload",
+            "ok": result["ok"],
+            "detail": result["detail"],
+        }
+
+    check_list.append(_native_agent_payload_check)
 
     for entry in entries:
         if entry["action"] == "symlink":
