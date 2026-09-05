@@ -42,6 +42,7 @@ sys.path.insert(0, str(ROOT / "utilities"))
 import workflow_state as WS  # noqa: E402
 import resource_run_registry as RR  # noqa: E402
 import dispatch_pending_delivery as PENDING  # noqa: E402
+import frame_interview as INTERVIEW  # noqa: E402
 
 ARMED_SCHEMA_VERSION = 1
 PREDECESSOR_KINDS = ("resource", "registered")
@@ -581,9 +582,25 @@ def cmd_gate(args):
                     "person reviews at this gate"
                 )
             jobs_path = Path(args.jobs) if args.jobs else default_jobs_path()
+            epoch = gate_raise_epoch(ledger, args.gate)
+            interview = load_interview_artifact(args.artifact)
+            if interview is not None:
+                # SD-129: an interview is refused BEFORE it reaches a person when
+                # a tired reader could not answer it -- the validator is the
+                # acceptance bar, not a style hint.
+                errors = INTERVIEW.validate(
+                    interview, intensity=str(route.get("effective_intensity") or "standard"))
+                if errors:
+                    raise SupervisorError("interview-invalid: " + "; ".join(errors[:8]))
+                if interview.get("round", 1) != epoch + 1:
+                    raise SupervisorError(
+                        f"interview-round-mismatch: interview round {interview.get('round', 1)} "
+                        f"but this is raise {epoch + 1} of {args.gate!r}")
+                if interview.get("route_id") != route["route_id"]:
+                    raise SupervisorError(
+                        f"interview-route-mismatch: {interview.get('route_id')!r} is not this route")
             record_path, created = create_gate_delivery(
-                route, args.gate, args.artifact, jobs_path,
-                gate_raise_epoch(ledger, args.gate),
+                route, args.gate, args.artifact, jobs_path, epoch,
             )
             try:
                 # `artifact` rides in the journal so every later reader -- the
@@ -594,13 +611,18 @@ def cmd_gate(args):
                                           evidence={"gate": args.gate,
                                                     "binding": gates[args.gate],
                                                     "delivery": str(record_path),
-                                                    "artifact": str(args.artifact)},
+                                                    "artifact": str(args.artifact),
+                                                    "interview": interview is not None,
+                                                    "questions": len(interview.get("questions") or [])
+                                                    if interview is not None else 0},
                                           actor="gate")
             except BaseException:
                 if created:
                     _rollback_gate_delivery(record_path)
                 raise
             payload.update({"delivery": str(record_path), "delivery_created": created,
+                            "interview": interview is not None,
+                            "questions": len(interview.get("questions") or []) if interview is not None else 0,
                             "await_command": await_release_command(args.route, args.gate)})
             action = "blocked"
     payload.update({"action": action, "workflow_state": ledger.state()["workflow_state"]})
@@ -999,7 +1021,8 @@ def gate_release_sidecar_path(route_path):
     return path.with_name(path.stem + ".gate-release.json")
 
 
-def record_gate_release(route, route_path, *, gate, decision, released_by, actor_kind):
+def record_gate_release(route, route_path, *, gate, decision, released_by, actor_kind,
+                        answers=None):
     """Append one gate release to the route's sidecar; `close_route` folds it into
     the outcome. Fail-soft: a release must never be lost because a sidecar could
     not be written, and the ledger already holds the authoritative transition.
@@ -1015,6 +1038,8 @@ def record_gate_release(route, route_path, *, gate, decision, released_by, actor
         "actor_kind": actor_kind, "route_hash": route.get("route_hash", ""),
         "at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
+    if answers is not None:
+        row["answers"] = answers
     try:
         existing = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
         rows = existing.get("gate_releases") if isinstance(existing, dict) else None
@@ -1072,11 +1097,13 @@ def cmd_release(args):
         state = ledger.state()["workflow_state"]
         if state != "BLOCKED_HUMAN_GATE":
             raise SupervisorError(f"workflow is {state}, not blocked on a human gate")
+        answers = release_answers(ledger, args.gate, args.decision, getattr(args, "answers", None))
         if args.decision == "proceed":
             ledger.set_workflow_state(
                 "RUNNING",
                 evidence={"released_gate": args.gate, "released_by": actor,
-                          "actor_kind": actor_kind, "decision": "proceed"},
+                          "actor_kind": actor_kind, "decision": "proceed",
+                          "answers": answers},
                 actor="release",
             )
             successors = WS.route_successors(route, node_id)
@@ -1106,7 +1133,8 @@ def cmd_release(args):
             ledger.set_workflow_state(
                 "RUNNING",
                 evidence={"released_gate": args.gate, "released_by": actor,
-                          "actor_kind": actor_kind, "decision": "revise"},
+                          "actor_kind": actor_kind, "decision": "revise",
+                          "answers": answers},
                 actor="release",
             )
             ledger.set_workflow_state(
@@ -1132,15 +1160,64 @@ def cmd_release(args):
             raise SupervisorError(f"unknown --decision: {args.decision!r}")
         payload["released_by"] = actor
         payload["actor_kind"] = actor_kind
+        payload["answers_recorded"] = len((answers or {}).get("answers") or {}) if answers else 0
         # `route_id` lets the depth-0 carrier (`hooks/dispatch-owner-rewake.py`)
         # re-arm its wait on this route's owner from the release output alone,
         # even when the command spelled the route through a shell variable.
         payload["route_id"] = route["route_id"]
         record_gate_release(route, args.route, gate=args.gate, decision=args.decision,
-                            released_by=actor, actor_kind=actor_kind)
+                            released_by=actor, actor_kind=actor_kind, answers=answers)
         retire_gate_delivery(route, args.gate, args.jobs)
     print(json.dumps(payload, sort_keys=True))
     return 0
+
+
+def load_interview_artifact(artifact):
+    """The interview at `artifact`, or None when the artifact is something else
+    (a legacy frame summary, a directory, a non-JSON file). Unreadable JSON that
+    claims to be an interview is an error, not None."""
+    if not artifact or artifact == "-":
+        return None
+    path = Path(str(artifact))
+    if not path.is_file() or path.suffix.lower() != ".json":
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise SupervisorError(f"interview-unreadable: {path}: {exc}") from exc
+    if not INTERVIEW.is_interview(value):
+        return None
+    value.setdefault("self_path", str(path))
+    return value
+
+
+def release_answers(ledger, gate, decision, answers_path):
+    """The validated answers this release records, or None.
+
+    An interview gate released `proceed` without answers is refused: the
+    questions were the point, and a plan written without the answers is the
+    guess the interview exists to replace. `revise`/`stop` may carry answers or
+    not. Answers offered for a gate whose artifact is not an interview are
+    refused rather than dropped silently."""
+    resolution = WS.human_gate_resolution(ledger.journal(), gate)
+    interview = load_interview_artifact(resolution.get("artifact"))
+    if answers_path is None:
+        if interview is not None and decision == "proceed":
+            raise SupervisorError(
+                "interview-answers-required: this gate carries "
+                f"{len(interview.get('questions') or [])} question(s); record the user's "
+                "answers with --answers <file> (template: frame_interview.py answers-template)")
+        return None
+    if interview is None:
+        raise SupervisorError("interview-absent: --answers given but the gate artifact is not an interview")
+    try:
+        answers = json.loads(Path(answers_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise SupervisorError(f"interview-answers-unreadable: {answers_path}: {exc}") from exc
+    errors = INTERVIEW.validate_answers(interview, answers)
+    if errors:
+        raise SupervisorError("interview-answers-invalid: " + "; ".join(errors[:8]))
+    return answers
 
 
 # --- SD-129: the owner waits for the release on a checked, bounded surface ------
@@ -1197,7 +1274,16 @@ def cmd_await_release(args):
     if status == "proceed":
         payload["successor"] = [str(b.get("node")) for b in route.get("human_gate_bindings") or []
                                 if b.get("gate") == args.gate]
-    print(json.dumps(payload, sort_keys=True))
+    answers_out = getattr(args, "answers_out", None)
+    if answers_out and resolution["answers"] is not None and status in ("proceed", "revise"):
+        out = Path(answers_out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        tmp = out.with_name(out.name + ".tmp")
+        tmp.write_text(json.dumps(resolution["answers"], ensure_ascii=False, indent=2) + "\n",
+                       encoding="utf-8")
+        os.replace(str(tmp), str(out))
+        payload["answers_file"] = str(out)
+    print(json.dumps(payload, sort_keys=True, ensure_ascii=False))
     return AWAIT_RELEASE_EXIT[status]
 
 
@@ -1694,6 +1780,9 @@ def build_parser():
     release.add_argument("--gate", required=True)
     release.add_argument("--decision", required=True, choices=("proceed", "revise", "stop"))
     release.add_argument("--actor")
+    release.add_argument("--answers",
+                         help="frame interview answers file (frame_interview.py answers-template); "
+                              "required for --decision proceed when the gate artifact is an interview")
     release.add_argument("--jobs",
                          help="canonical registry, used to retire the gate's pending "
                               "delivery record; without it retirement is skipped and a "
@@ -1708,6 +1797,9 @@ def build_parser():
     await_release.add_argument("--max", type=float, default=DEFAULT_AWAIT_MAX_SECONDS,
                                help=f"seconds to wait before exit 2 (clamped to {int(MAX_AWAIT_SECONDS)})")
     await_release.add_argument("--interval", type=float, default=DEFAULT_POLL_INTERVAL)
+    await_release.add_argument("--answers-out",
+                               help="write the recorded interview answers here (owner-owned path) "
+                                    "so `frame_interview.py render-intent` can consume them")
 
     status = sub.add_parser("status", help="portable workflow/stage/resource projection")
     status.add_argument("--route", required=True)

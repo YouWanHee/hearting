@@ -39,6 +39,7 @@ Run the `plan/plan-author` unit with this task, adapted only for the selected ar
 Plan mode. Create a new implementation plan.
 
 Task: {$ARGUMENTS}
+Intent: {absolute path of shards/frame/intent.md when the route ran a frame gate — read it first; its Decisions bind the plan}
 Save canonical plan to: $AGENT_ARTIFACT_OUTPUT_DIR/plans/{YYYY-MM-DD}_{short-task-name}/plan.md
 Save execution checklist to: $AGENT_ARTIFACT_OUTPUT_DIR/plans/{YYYY-MM-DD}_{short-task-name}/checklist.md
 Artifact language: {selected audience or conversation language}

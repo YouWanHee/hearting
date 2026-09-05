@@ -99,10 +99,13 @@ def main() -> int:
         # the session on its next prompt. Telling the recipient to *harvest* a
         # gate would be wrong -- a gate is answered, not collected.
         blocks.append(
-            "Hearting human gate awaiting your decision (SD-123). Read the named artifact, then "
-            "record the answer with `workflow-supervisor.py release --route <route file> "
-            "--gate <name> --decision proceed|revise|stop`. Do not start Monitor, dispatch-wait, "
-            "or a polling loop.\n"
+            "Hearting human gate awaiting your decision (SD-123/129). Read the named artifact "
+            "(an interview file or a frame summary), put the [방향 확인] card and every interview "
+            "question to the user through AskUserQuestion -- one topic at a time, in plain words, "
+            "recommended answer first -- then record the answer with `workflow-supervisor.py "
+            "release --route <route file> --gate <name> --decision proceed|revise|stop "
+            "[--answers <file from frame_interview.py answers-template>]`. The owner is waiting on "
+            "`await-release`. Do not start Monitor, dispatch-wait, or a polling loop.\n"
             + "\n".join(f"- {line}" for line in gate_lines)
         )
     if lines:

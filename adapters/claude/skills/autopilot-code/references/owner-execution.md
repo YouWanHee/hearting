@@ -76,9 +76,30 @@ never retro-fitted; do not attempt to apply this gate to an already-open route.
    summary, a `required_action`, or a gate field inside a stage-advance receipt
    body (seam 3 — `utilities/dispatch_completion_join.py`'s v2/v3 receipt
    negotiation returns its body by identity when no advanced record exists).
+   Then build the **interview** `shards/frame/interview.json` (schema
+   `frame_interview_v1`, SD-129) from the briefs: `understanding` (one plain
+   sentence restating what the user wants, which the user confirms or
+   corrects), `brief` (problem / outcome / affected / constraints / open, each a
+   few plain lines), and `questions` — only the decisions the briefs leave to
+   the user. Rules, all checked by `utilities/frame_interview.py validate
+   --intensity <intensity>` and refused by `gate --block` when broken: no
+   harness words (route, owner, gate, node, shard, worker, …); one topic per
+   question; at most two short sentences (≤160 chars); 2–4 options, each with
+   a one-line "what choosing it means"; exactly one `recommended` option so the
+   user can answer "yes" and move on; a `why` naming why only the user can
+   decide it — a fact you can establish by reading code or running a tool is
+   never a question, investigate it instead; at most 7 questions at
+   `standard+` (3 at `quick`, 1 at `direct`), and nothing whose answer is
+   already obvious. A tired reader must be able to answer every question
+   without opening the plan. Questions the frame legs listed under "Questions
+   only the user can answer" are the first candidates.
 2. Raise the existing typed attention path (SD-78/108) with
-   `required_action=human-gate:frame-review`, naming `shards/frame/frame-summary.json`
-   as the reviewable artifact.
+   `required_action=human-gate:frame-review`, naming
+   `shards/frame/interview.json` as the reviewable artifact
+   (`workflow-supervisor.py gate --route <route file> --gate frame-review
+   --block --artifact <absolute interview path>`); the interview references
+   `frame-summary.json` by path. The depth-0 session puts the summary card and
+   the questions to the user and records the answers on the release.
 3. Wait for the release on the one checked surface (SD-129), in bounded
    foreground calls, doing nothing else in between:
    `python3 <agent-home>/utilities/workflow-supervisor.py await-release --route
@@ -96,8 +117,21 @@ never retro-fitted; do not attempt to apply this gate to an already-open route.
    released (`human-gate-unreleased` / `human-gate-not-raised`, defect M).
    The person records the answer from the depth-0 session with
    `workflow-supervisor.py release --route <route file> --gate frame-review
-   --decision proceed|revise|stop`; `proceed` claims the `plan` successor
-   atomically (never spawn `plan` a second time on retry).
+   --decision proceed|revise|stop --answers <answers file>`; `proceed` claims
+   the `plan` successor atomically (never spawn `plan` a second time on retry).
+   Pass `--answers-out shards/frame/interview-answers.json` to `await-release`
+   so the recorded answers land in your cycle directory.
+4. On `proceed`, render the agreed intent before anything else:
+   `python3 <agent-home>/utilities/frame_interview.py render-intent --interview
+   shards/frame/interview.json --answers shards/frame/interview-answers.json
+   --out shards/frame/intent.md`. `intent.md` is the brief `plan` reads first
+   (pass its absolute path in the plan prompt as `Intent:`); a plan that
+   contradicts a recorded decision is a plan-check blocker. When the user
+   corrected your understanding (`status: agreed-with-correction`), fold the
+   correction into the plan prompt verbatim. If the answers open a genuinely
+   new decision, you may raise the gate once more with a round-2 interview
+   (`round: 2`, same caps); never a third time — remaining doubts go to the
+   plan's risk section.
 4. `confirmation.mode` (`profiles/dispatch-defaults.yaml` /
    `utilities/dispatch-defaults.py`, default `hybrid`) governs whether this
    post-frame gate is the sole confirmation point (`post-frame-only`), layers
