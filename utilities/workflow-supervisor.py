@@ -16,7 +16,9 @@ read as "the stage succeeded".
   workflow-supervisor.py arm     --route R --node N --predecessor-kind resource|registered ...
   workflow-supervisor.py poll    --route R
   workflow-supervisor.py watch   --route R --max 3600
-  workflow-supervisor.py gate    --route R --gate G --release|--block
+  workflow-supervisor.py gate    --route R --gate G --release|--block [--artifact P]
+  workflow-supervisor.py release --route R --gate G --decision proceed|revise|stop
+  workflow-supervisor.py await-release --route R --gate G [--max S] [--interval S]
   workflow-supervisor.py status  --route R [--json]
   workflow-supervisor.py complete --route R
   workflow-supervisor.py survey  --artifact-root ROOT [--stale-after-seconds S] [--json]
@@ -584,16 +586,22 @@ def cmd_gate(args):
                 gate_raise_epoch(ledger, args.gate),
             )
             try:
+                # `artifact` rides in the journal so every later reader -- the
+                # owner's await-release, the launch fence, a release that
+                # validates interview answers -- finds the reviewable path
+                # from the ledger alone, without reopening the delivery record.
                 ledger.set_workflow_state("BLOCKED_HUMAN_GATE",
                                           evidence={"gate": args.gate,
                                                     "binding": gates[args.gate],
-                                                    "delivery": str(record_path)},
+                                                    "delivery": str(record_path),
+                                                    "artifact": str(args.artifact)},
                                           actor="gate")
             except BaseException:
                 if created:
                     _rollback_gate_delivery(record_path)
                 raise
-            payload.update({"delivery": str(record_path), "delivery_created": created})
+            payload.update({"delivery": str(record_path), "delivery_created": created,
+                            "await_command": await_release_command(args.route, args.gate)})
             action = "blocked"
     payload.update({"action": action, "workflow_state": ledger.state()["workflow_state"]})
     print(json.dumps(payload, sort_keys=True))
@@ -1067,7 +1075,8 @@ def cmd_release(args):
         if args.decision == "proceed":
             ledger.set_workflow_state(
                 "RUNNING",
-                evidence={"released_gate": args.gate, "released_by": actor, "decision": "proceed"},
+                evidence={"released_gate": args.gate, "released_by": actor,
+                          "actor_kind": actor_kind, "decision": "proceed"},
                 actor="release",
             )
             successors = WS.route_successors(route, node_id)
@@ -1096,7 +1105,8 @@ def cmd_release(args):
             # them in the same lock rather than widening the vocabulary.
             ledger.set_workflow_state(
                 "RUNNING",
-                evidence={"released_gate": args.gate, "released_by": actor, "decision": "revise"},
+                evidence={"released_gate": args.gate, "released_by": actor,
+                          "actor_kind": actor_kind, "decision": "revise"},
                 actor="release",
             )
             ledger.set_workflow_state(
@@ -1111,7 +1121,8 @@ def cmd_release(args):
         elif args.decision == "stop":
             ledger.set_workflow_state(
                 "CANCELLED",
-                evidence={"gate": args.gate, "released_by": actor,
+                evidence={"gate": args.gate, "released_gate": args.gate,
+                          "released_by": actor, "actor_kind": actor_kind,
                           "abandon_reason": "operator-decision"},
                 actor="release",
             )
@@ -1121,11 +1132,73 @@ def cmd_release(args):
             raise SupervisorError(f"unknown --decision: {args.decision!r}")
         payload["released_by"] = actor
         payload["actor_kind"] = actor_kind
+        # `route_id` lets the depth-0 carrier (`hooks/dispatch-owner-rewake.py`)
+        # re-arm its wait on this route's owner from the release output alone,
+        # even when the command spelled the route through a shell variable.
+        payload["route_id"] = route["route_id"]
         record_gate_release(route, args.route, gate=args.gate, decision=args.decision,
                             released_by=actor, actor_kind=actor_kind)
         retire_gate_delivery(route, args.gate, args.jobs)
     print(json.dumps(payload, sort_keys=True))
     return 0
+
+
+# --- SD-129: the owner waits for the release on a checked, bounded surface ------
+#
+# SD-123 (8) gave the gate a way to reach a person. It gave the owner nothing to
+# wait on: "wait for the release rather than polling or sleeping" was prose, and
+# a headless owner has exactly two ways to wait -- poll or exit. Measured on the
+# eight real `frame-review` raises before this cycle: three owners released
+# their own gate, one wrote an ad-hoc polling script and sat 53 minutes, one
+# did not wait at all and spawned `plan` before the release (defect M). This is
+# the one checked wait: bounded, read-only, and answered from the same journal
+# rule the launch fence uses, so the owner and the fence can never disagree.
+
+AWAIT_RELEASE_EXIT = {"proceed": 0, "blocked": 2, "revise": 3, "stop": 4}
+DEFAULT_AWAIT_MAX_SECONDS = 110.0   # one foreground Bash call in an owner turn
+MAX_AWAIT_SECONDS = 600.0
+
+
+def await_release_command(route_path, gate):
+    return (f"python3 <agent-home>/utilities/workflow-supervisor.py await-release "
+            f"--route {route_path} --gate {gate} --max {int(DEFAULT_AWAIT_MAX_SECONDS)}")
+
+
+def cmd_await_release(args):
+    route = load_route(args.route)
+    ledger = ledger_for(route)
+    gates = {row["gate"]: row for row in (route.get("human_gate_bindings") or [])}
+    if args.gate not in gates:
+        raise SupervisorError(f"route declares no human gate {args.gate!r}")
+    interval = max(1.0, float(args.interval))
+    maximum = min(max(0.0, float(args.max)), MAX_AWAIT_SECONDS)
+    started = time.monotonic()
+    deadline = started + maximum
+    while True:
+        # Read-only on purpose: `read_only_state()` never repairs the cache or
+        # creates the ledger directory, so a waiting owner mutates nothing.
+        resolution = WS.human_gate_resolution(ledger.journal(), args.gate)
+        status = resolution["status"]
+        if status == "not-raised":
+            raise SupervisorError(
+                f"gate-never-raised: {args.gate!r} has no BLOCKED_HUMAN_GATE entry; "
+                "raise it with `gate --block --artifact <path>` first"
+            )
+        if status != "blocked" or time.monotonic() >= deadline:
+            break
+        time.sleep(min(interval, max(0.0, deadline - time.monotonic())))
+    payload = {
+        "route_id": route["route_id"], "gate": args.gate, "status": status,
+        "epoch": resolution["epoch"], "waited_seconds": round(time.monotonic() - started, 1),
+        "released_by": resolution["released_by"], "actor_kind": resolution["actor_kind"],
+        "artifact": resolution["artifact"], "answers": resolution["answers"],
+        "workflow_state": ledger.read_only_state()["workflow_state"],
+    }
+    if status == "proceed":
+        payload["successor"] = [str(b.get("node")) for b in route.get("human_gate_bindings") or []
+                                if b.get("gate") == args.gate]
+    print(json.dumps(payload, sort_keys=True))
+    return AWAIT_RELEASE_EXIT[status]
 
 
 def resource_children(route, ledger):
@@ -1626,6 +1699,16 @@ def build_parser():
                               "delivery record; without it retirement is skipped and a "
                               "released gate keeps being announced by the sweep")
 
+    await_release = sub.add_parser(
+        "await-release",
+        help="bounded, read-only wait for a raised human gate to be released "
+             "(exit 0 proceed, 2 still blocked, 3 revise, 4 stop)")
+    await_release.add_argument("--route", required=True)
+    await_release.add_argument("--gate", required=True)
+    await_release.add_argument("--max", type=float, default=DEFAULT_AWAIT_MAX_SECONDS,
+                               help=f"seconds to wait before exit 2 (clamped to {int(MAX_AWAIT_SECONDS)})")
+    await_release.add_argument("--interval", type=float, default=DEFAULT_POLL_INTERVAL)
+
     status = sub.add_parser("status", help="portable workflow/stage/resource projection")
     status.add_argument("--route", required=True)
     status.add_argument("--json", action="store_true")
@@ -1644,7 +1727,7 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     handler = {
         "arm": cmd_arm, "poll": cmd_poll, "watch": cmd_watch, "gate": cmd_gate,
-        "release": cmd_release,
+        "release": cmd_release, "await-release": cmd_await_release,
         "status": cmd_status, "complete": cmd_complete, "survey": cmd_survey,
     }[args.command]
     return handler(args)

@@ -79,12 +79,25 @@ never retro-fitted; do not attempt to apply this gate to an already-open route.
 2. Raise the existing typed attention path (SD-78/108) with
    `required_action=human-gate:frame-review`, naming `shards/frame/frame-summary.json`
    as the reviewable artifact.
-3. Wait for the release rather than polling or sleeping:
+3. Wait for the release on the one checked surface (SD-129), in bounded
+   foreground calls, doing nothing else in between:
+   `python3 <agent-home>/utilities/workflow-supervisor.py await-release --route
+   <route file> --gate frame-review --max 110` — exit 2 means still blocked:
+   call it again; exit 0 (`status=proceed`) means a person released the gate,
+   and the payload carries `released_by`, `artifact`, and any interview
+   `answers`; exit 3 (`revise`) returns to `frame` under the `code-refine`
+   retry boundary and the gate is raised again afterwards; exit 4 (`stop`)
+   cancels the route with `abandon_reason=operator-decision`. Never release
+   your own gate (`release`/`gate --release`) to move on: a registered owner's
+   release is recorded `released_by=headless-owner` and the plan it unblocks
+   was never confirmed by anyone. Never sleep, never write an ad-hoc polling
+   loop, and never spawn `plan` while `await-release` has not returned 0 —
+   every launch surface refuses a `plan` start whose entry gate is not
+   released (`human-gate-unreleased` / `human-gate-not-raised`, defect M).
+   The person records the answer from the depth-0 session with
    `workflow-supervisor.py release --route <route file> --gate frame-review
-   --decision proceed|revise|stop --actor <actor>`. `proceed` claims and reports
-   the `plan` successor atomically (never spawn `plan` a second time on retry);
-   `revise` returns to `frame` under the `code-refine` retry boundary; `stop`
-   cancels the route with `abandon_reason=operator-decision`.
+   --decision proceed|revise|stop`; `proceed` claims the `plan` successor
+   atomically (never spawn `plan` a second time on retry).
 4. `confirmation.mode` (`profiles/dispatch-defaults.yaml` /
    `utilities/dispatch-defaults.py`, default `hybrid`) governs whether this
    post-frame gate is the sole confirmation point (`post-frame-only`), layers

@@ -1649,6 +1649,149 @@ class TestGateSubjectNotCaller(WorkflowFixture):
                       "--decision", "stop", "--jobs", str(jobs)])
         self.assertEqual(PENDING.read(root, session, delivery_id)["state"], "acked")
 
+    # -- SD-129: the owner's checked wait and the journal's one gate rule -------
+
+    def _raise(self, path, jobs):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = SUP.main(["gate", "--route", str(path), "--gate", "frame-review",
+                             "--block", "--jobs", str(jobs), "--artifact",
+                             "shards/frame/interview.json"])
+        self.assertEqual(code, 0)
+        return json.loads(buf.getvalue())
+
+    def _await(self, path, *, maximum="0.2"):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = SUP.main(["await-release", "--route", str(path), "--gate",
+                             "frame-review", "--max", maximum, "--interval", "1"])
+        return code, json.loads(buf.getvalue())
+
+    def test_block_records_the_artifact_and_names_the_wait(self):
+        route, path = self.two_stage_route(
+            human_gate="frame-review",
+            continuation={"kind": "human-gate", "gate": "frame-review"})
+        jobs, _session, _attempt = self.owner_registry()
+        payload = self._raise(path, jobs)
+        self.assertIn("await-release", payload["await_command"])
+        self.assertIn("--gate frame-review", payload["await_command"])
+        last = SUP.ledger_for(route).journal()[-1]
+        self.assertEqual(last["evidence"]["artifact"], "shards/frame/interview.json")
+        resolution = WS.human_gate_resolution(SUP.ledger_for(route).journal(), "frame-review")
+        self.assertEqual(resolution["status"], "blocked")
+        self.assertEqual(resolution["artifact"], "shards/frame/interview.json")
+        self.assertEqual(resolution["epoch"], 1)
+
+    def test_await_release_never_raised_is_a_typed_error(self):
+        _route, path = self.two_stage_route(
+            human_gate="frame-review",
+            continuation={"kind": "human-gate", "gate": "frame-review"})
+        with self.assertRaisesRegex(SUP.SupervisorError, "gate-never-raised"):
+            SUP.main(["await-release", "--route", str(path), "--gate", "frame-review",
+                      "--max", "0"])
+
+    def test_await_release_stays_bounded_while_blocked(self):
+        _route, path = self.two_stage_route(
+            human_gate="frame-review",
+            continuation={"kind": "human-gate", "gate": "frame-review"})
+        jobs, _session, _attempt = self.owner_registry()
+        self._raise(path, jobs)
+        code, payload = self._await(path)
+        self.assertEqual(code, 2)
+        self.assertEqual(payload["status"], "blocked")
+        self.assertEqual(payload["workflow_state"], "BLOCKED_HUMAN_GATE")
+        self.assertEqual(payload["artifact"], "shards/frame/interview.json")
+
+    def test_await_release_returns_the_persons_decision(self):
+        for decision, expected in (("proceed", 0), ("revise", 3), ("stop", 4)):
+            with self.subTest(decision=decision):
+                route, path = self.two_stage_route(
+                    human_gate="frame-review",
+                    continuation={"kind": "human-gate", "gate": "frame-review"},
+                    route_id=f"rt-await-{decision}00")
+                jobs, _session, _attempt = self.owner_registry(route_id=f"rt-await-{decision}00")
+                self._raise(path, jobs)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    SUP.main(["release", "--route", str(path), "--gate", "frame-review",
+                              "--decision", decision, "--actor", "fixture-user",
+                              "--jobs", str(jobs)])
+                code, payload = self._await(path)
+                self.assertEqual(code, expected)
+                self.assertEqual(payload["status"], decision)
+                self.assertEqual(payload["released_by"], "fixture-user")
+                self.assertEqual(payload["actor_kind"], "user")
+                if decision == "proceed":
+                    self.assertEqual(payload["successor"], ["verify"])
+
+    def test_await_release_wakes_when_the_release_lands_mid_wait(self):
+        route, path = self.two_stage_route(
+            human_gate="frame-review",
+            continuation={"kind": "human-gate", "gate": "frame-review"})
+        jobs, _session, _attempt = self.owner_registry()
+        self._raise(path, jobs)
+        ledger = SUP.ledger_for(route)
+        calls = {"n": 0}
+        real_journal = ledger.journal
+
+        def journal_then_release(*_a, **_k):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    SUP.main(["release", "--route", str(path), "--gate", "frame-review",
+                              "--decision", "proceed", "--jobs", str(jobs)])
+            return real_journal()
+
+        with mock.patch.object(SUP, "ledger_for", return_value=ledger), \
+                mock.patch.object(ledger, "journal", side_effect=journal_then_release), \
+                mock.patch.object(SUP.time, "sleep"):
+            code, payload = self._await(path, maximum="30")
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["status"], "proceed")
+
+    def test_release_output_names_the_route_for_the_carrier(self):
+        _route, path = self.two_stage_route(
+            human_gate="frame-review",
+            continuation={"kind": "human-gate", "gate": "frame-review"})
+        jobs, _session, _attempt = self.owner_registry()
+        self._raise(path, jobs)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            SUP.main(["release", "--route", str(path), "--gate", "frame-review",
+                      "--decision", "proceed", "--jobs", str(jobs)])
+        self.assertEqual(json.loads(buf.getvalue())["route_id"], "rt-fixture0000000")
+
+    def test_a_revise_leaves_the_gate_unreleased_until_it_is_raised_again(self):
+        route, path = self.two_stage_route(
+            human_gate="frame-review",
+            continuation={"kind": "human-gate", "gate": "frame-review"})
+        jobs, _session, _attempt = self.owner_registry()
+        self._raise(path, jobs)
+        with contextlib.redirect_stdout(io.StringIO()):
+            SUP.main(["release", "--route", str(path), "--gate", "frame-review",
+                      "--decision", "revise", "--jobs", str(jobs)])
+        ledger = SUP.ledger_for(route)
+        self.assertEqual(WS.human_gate_resolution(ledger.journal(), "frame-review")["status"],
+                         "revise")
+        # The retry boundary reruns frame and raises again: a second epoch.
+        with ledger.lock():
+            ledger.set_workflow_state("READY", evidence={"retry": "frame"}, actor="retry")
+        payload = self._raise(path, jobs)
+        self.assertTrue(payload["delivery_created"])
+        resolution = WS.human_gate_resolution(ledger.journal(), "frame-review")
+        self.assertEqual((resolution["status"], resolution["epoch"]), ("blocked", 2))
+
+    def test_legacy_gate_release_counts_as_proceed(self):
+        route, path = self.two_stage_route(
+            human_gate="frame-review",
+            continuation={"kind": "human-gate", "gate": "frame-review"})
+        jobs, _session, _attempt = self.owner_registry()
+        self._raise(path, jobs)
+        with contextlib.redirect_stdout(io.StringIO()):
+            SUP.main(["gate", "--route", str(path), "--gate", "frame-review", "--release",
+                      "--jobs", str(jobs)])
+        code, payload = self._await(path)
+        self.assertEqual((code, payload["status"]), (0, "proceed"))
+
     def test_no_test_in_this_class_writes_outside_its_temporary_root(self):
         """The leak was a test writing into real runtime state. Pin the invariant."""
         canonical = Path.home() / ".agent_reports"

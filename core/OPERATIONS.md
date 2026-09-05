@@ -430,6 +430,22 @@ decision, never two independently toggled ones.
 
 ### §5.10a. Completion Delivery Clarifications (SD-92/97)
 
+- **Human gate in flight (SD-123 (8), SD-129).** While the armed `asyncRewake`
+  hook waits on an open owner attempt it also watches, once per interval, for
+  a pending gate record addressed to this session and raised by that attempt;
+  when one appears the hook spends its single wake immediately (exit 2,
+  `owner=alive-waiting`), acks the record, and tells the session to put the
+  `[방향 확인]` card and interview questions to the user and record the answer
+  with `workflow-supervisor.py release`. That release command — the typed
+  `release` or legacy `gate --release` surface, run in the same session — is
+  the second arming event: from its `route_id` and the registry's one open
+  depth-1 owner bound to this session, a new hook process waits on the owner's
+  completion exactly as the start did. A release with no open owner (the owner
+  ended at the gate), a failed release, or an ambiguous owner set arms nothing;
+  the `UserPromptSubmit` sweep still delivers the pending record at the next
+  prompt. The owner itself waits on `workflow-supervisor.py await-release`
+  (bounded, read-only), and every launch surface refuses to start a node whose
+  entry gate is not released (`human-gate-unreleased`/`human-gate-not-raised`).
 - The interactive Claude `asyncRewake` bridge recognizes both an exact
   `dispatch-owner --start` and the quick one-shot
   `dispatch-node --action start` surface. Neither command is wake authority by

@@ -2459,6 +2459,114 @@ class DispatchContractTest(unittest.TestCase):
     self.sibling_gate_case(td,"completed-marker",sibling,status="open")
   self.assertEqual(caught.exception.reason,"prior-attempt-unverifiable")
 
+ # -- SD-129 defect M: a gated node cannot start until a person released it -----
+ def _gated_route(self,base,route_id="rt-gate-fence00001"):
+  """`frame -> plan` with `frame-review` bound at plan's entry, frame's marker
+  present, so only the human gate decides whether plan may start."""
+  route={"dispatch_contract_version":3,"route_id":route_id,
+         "route_hash":"sha256:"+"9"*64,"registry_digest":"sha256:"+"a"*64,
+         "human_gates":["frame-review"],
+         "human_gate_bindings":[{"gate":"frame-review","node":"plan","position":"entry"}],
+         "nodes":[{"id":"frame","depends_on":[],"kind":"pipeline-stage",
+                   "completion_gate":"code-frame","dispatch_depth":2,
+                   "continuation":{"kind":"human-gate","gate":"frame-review"}},
+                  {"id":"plan","depends_on":["frame"],"kind":"pipeline-stage",
+                   "completion_gate":"code-plan","dispatch_depth":2}]}
+  path=base/"route.json"; path.write_text(json.dumps(route),encoding="utf-8")
+  marker_dir=base/".dispatch"/"completion"/route_id
+  marker_dir.mkdir(parents=True,exist_ok=True)
+  (marker_dir/"frame.json").write_text(json.dumps({"attempt_id":"att-frame",
+   "registered_worker":True}),encoding="utf-8")
+  return route,path
+
+ def _fence_start(self,base,path,node="plan"):
+  ready=D.AttemptReadiness("ready","fixture-ready","att-frame")
+  with mock.patch.object(D,"completion_marker_is_current",return_value=True), \
+       mock.patch.object(D,"completion_attempt_readiness",return_value=ready), \
+       mock.patch.object(D,"_sibling_attempt_gate"):
+   D.completion_marker_gate(str(path),node,"start",base,base/"jobs.log",
+                            registry_lines=[],attempt_id="att-plan-new")
+
+ def _gate_ledger(self,base,route):
+  import workflow_state as WS
+  return WS.WorkflowLedger(route["route_id"],route["route_hash"],root=base/"workflow")
+
+ def test_a_gated_node_never_raised_is_refused_before_spawn(self):
+  with tempfile.TemporaryDirectory() as td:
+   base=Path(td); route,path=self._gated_route(base)
+   with mock.patch.dict(os.environ,{"AGENT_WORKFLOW_ROOT":str(base/"workflow")}):
+    with self.assertRaises(D.DispatchContractError) as caught:
+     self._fence_start(base,path)
+    self.assertEqual(caught.exception.reason,"human-gate-not-raised")
+    self.assertIn("frame-review",caught.exception.detail)
+    # the gated predecessor itself is not fenced by its own successor's gate
+    self._fence_start(base,path,node="frame")
+
+ def test_a_raised_unreleased_gate_refuses_the_start(self):
+  with tempfile.TemporaryDirectory() as td:
+   base=Path(td); route,path=self._gated_route(base)
+   with mock.patch.dict(os.environ,{"AGENT_WORKFLOW_ROOT":str(base/"workflow")}):
+    ledger=self._gate_ledger(base,route)
+    with ledger.lock():
+     ledger.set_workflow_state("READY",evidence={},actor="fixture")
+     ledger.set_workflow_state("BLOCKED_HUMAN_GATE",
+      evidence={"gate":"frame-review","artifact":"shards/frame/interview.json"},actor="gate")
+    with self.assertRaises(D.DispatchContractError) as caught:
+     self._fence_start(base,path)
+    self.assertEqual(caught.exception.reason,"human-gate-unreleased")
+    self.assertIn("blocked",caught.exception.detail)
+
+ def test_a_released_gate_opens_the_start_and_revise_or_stop_keeps_it_shut(self):
+  for decision,opens in (("proceed",True),("revise",False),("stop",False)):
+   with self.subTest(decision=decision), tempfile.TemporaryDirectory() as td:
+    base=Path(td); route,path=self._gated_route(base)
+    with mock.patch.dict(os.environ,{"AGENT_WORKFLOW_ROOT":str(base/"workflow")}):
+     ledger=self._gate_ledger(base,route)
+     with ledger.lock():
+      ledger.set_workflow_state("READY",evidence={},actor="fixture")
+      ledger.set_workflow_state("BLOCKED_HUMAN_GATE",
+       evidence={"gate":"frame-review","artifact":"a.json"},actor="gate")
+      if decision=="stop":
+       ledger.set_workflow_state("CANCELLED",evidence={"gate":"frame-review",
+        "released_gate":"frame-review","released_by":"user","actor_kind":"user",
+        "abandon_reason":"operator-decision"},actor="release")
+      else:
+       ledger.set_workflow_state("RUNNING",evidence={"released_gate":"frame-review",
+        "released_by":"user","actor_kind":"user","decision":decision},actor="release")
+     if opens:
+      self._fence_start(base,path)
+     else:
+      with self.assertRaises(D.DispatchContractError) as caught:
+       self._fence_start(base,path)
+      self.assertEqual(caught.exception.reason,"human-gate-unreleased")
+      self.assertIn(decision,caught.exception.detail)
+
+ def test_the_fence_reads_the_supervisors_ledger_root_not_the_wrappers_jobs(self):
+  """The writer (`workflow-supervisor.py`) resolves its ledger root from the
+  environment; a reader deriving a different root from `--jobs` would report
+  `not-raised` for a gate that was released a second ago."""
+  with tempfile.TemporaryDirectory() as td:
+   base=Path(td); route,path=self._gated_route(base)
+   elsewhere=base/"elsewhere"
+   with mock.patch.dict(os.environ,{"AGENT_WORKFLOW_ROOT":str(elsewhere)}):
+    import workflow_state as WS
+    ledger=WS.WorkflowLedger(route["route_id"],route["route_hash"])
+    self.assertEqual(ledger.root,elsewhere/route["route_id"])
+    with ledger.lock():
+     ledger.set_workflow_state("READY",evidence={},actor="fixture")
+     ledger.set_workflow_state("BLOCKED_HUMAN_GATE",evidence={"gate":"frame-review"},actor="gate")
+     ledger.set_workflow_state("RUNNING",evidence={"released_gate":"frame-review",
+      "decision":"proceed","released_by":"user"},actor="release")
+    self._fence_start(base,path)
+
+ def test_a_route_without_bindings_is_not_fenced(self):
+  with tempfile.TemporaryDirectory() as td:
+   base=Path(td); route,path=self._gated_route(base)
+   route["human_gate_bindings"]=[]; route["human_gates"]=[]
+   path.write_text(json.dumps(route),encoding="utf-8")
+   with mock.patch.dict(os.environ,{"AGENT_WORKFLOW_ROOT":str(base/"workflow")}):
+    self._fence_start(base,path)
+
  def _auxiliary_group_route(self,base,route_id="rt-aux-arbitration"):
   """A realized auxiliary-bearing group (owner-merge arbiter) plus one consumer."""
   def leg(index,suffix,leg_class):

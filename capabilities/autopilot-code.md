@@ -119,10 +119,14 @@ builds `shards/frame/frame-summary.json` (five fields — 방향/대안/위험/�
 변경/비용, ≤1KB) from `shards/frame/direction-brief.md`, raises the existing
 typed attention path with `required_action=human-gate:frame-review` referencing
 that file **by path** (never embedded in a stage-advance receipt body), and
-waits for `workflow-supervisor.py release --gate frame-review --decision
-proceed|revise|stop`. `proceed` claims and starts `plan` exactly once; `revise`
-returns to `frame` under the `code-refine` retry boundary; `stop` cancels the
-route. The declared `confirmation.mode` (default `hybrid`) governs whether this
+waits on the bounded checked surface `workflow-supervisor.py await-release
+--gate frame-review` (SD-129) until a person records `workflow-supervisor.py
+release --gate frame-review --decision proceed|revise|stop` from the depth-0
+session. `proceed` claims and starts `plan` exactly once; `revise` returns to
+`frame` under the `code-refine` retry boundary; `stop` cancels the route. A
+`plan` start whose entry gate is not released is refused by every launch
+surface (`human-gate-unreleased`), and an owner never releases its own gate to
+move on. The declared `confirmation.mode` (default `hybrid`) governs whether this
 is the sole confirmation point, layers onto the pre-plan notify, or both apply;
 `core/WORKFLOW.md` §0.4 owns the user-facing card.
 

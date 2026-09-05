@@ -430,3 +430,80 @@ def route_successors(route: dict, node_id: str) -> list:
 
 def unix_now() -> float:
     return time.time()
+
+
+# ---------------------------------------------------------------------------
+# human gates: one resolution rule for every reader (SD-129)
+# ---------------------------------------------------------------------------
+
+HUMAN_GATE_STATUSES = ("not-raised", "blocked", "proceed", "revise", "stop")
+
+
+def human_gate_resolution(entries: list, gate: str) -> dict:
+    """Resolve one declared human gate from the append-only journal.
+
+    Three readers need the same answer -- the launch fence that refuses to start
+    a gated node (`dispatch_contract.completion_marker_gate`), the owner's
+    bounded `workflow-supervisor.py await-release`, and the delivery carriers --
+    and before this helper each would have re-derived it from the journal on
+    its own. One definition, so "released" cannot mean two things (the
+    2026-09-04 M defect: an owner saw `BLOCKED_HUMAN_GATE` and still spawned
+    `plan`, because no launch surface asked the journal at all).
+
+    The answer is about the LATEST raise of `gate`:
+
+      not-raised  the journal never blocked on this gate
+      blocked     raised and not yet resolved
+      proceed     released to continue (`release --decision proceed` or the
+                  legacy `gate --release`)
+      revise      released back to the retry boundary; a new raise must follow
+                  before the gated node may start
+      stop        cancelled at the gate
+
+    Returns a dict with `status`, `epoch` (how many raises so far), and the
+    evidence of the latest raise/resolution (`raised_at`, `resolved_at`,
+    `released_by`, `actor_kind`, `artifact`, `delivery`, `answers`).
+    """
+
+    result = {
+        "gate": gate, "status": "not-raised", "epoch": 0,
+        "raised_at": None, "resolved_at": None, "released_by": None,
+        "actor_kind": None, "artifact": None, "delivery": None, "answers": None,
+    }
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        evidence = entry.get("evidence") if isinstance(entry.get("evidence"), dict) else {}
+        state = entry.get("workflow_state")
+        if state == "BLOCKED_HUMAN_GATE" and evidence.get("gate") == gate:
+            result.update({
+                "status": "blocked", "epoch": result["epoch"] + 1,
+                "raised_at": entry.get("at"), "resolved_at": None,
+                "released_by": None, "actor_kind": None,
+                "artifact": evidence.get("artifact"), "delivery": evidence.get("delivery"),
+                "answers": None,
+            })
+            continue
+        if result["status"] != "blocked":
+            continue
+        if state == "CANCELLED" and evidence.get("gate") == gate \
+                and evidence.get("abandon_reason") == "operator-decision":
+            result.update({
+                "status": "stop", "resolved_at": entry.get("at"),
+                "released_by": evidence.get("released_by"),
+                "actor_kind": evidence.get("actor_kind"),
+            })
+            continue
+        if evidence.get("released_gate") == gate:
+            # `release --decision proceed|revise` stamps `decision`; the legacy
+            # `gate --release` transition carries none and is a proceed.
+            decision = evidence.get("decision") or "proceed"
+            if decision not in ("proceed", "revise"):
+                continue
+            result.update({
+                "status": decision, "resolved_at": entry.get("at"),
+                "released_by": evidence.get("released_by"),
+                "actor_kind": evidence.get("actor_kind"),
+                "answers": evidence.get("answers"),
+            })
+    return result

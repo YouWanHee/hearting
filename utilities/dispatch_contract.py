@@ -4426,6 +4426,60 @@ def validate_nested_eligibility(
         raise DispatchContractError(f"nested-child-spawn-{status}", source or "no checked evidence")
 
 
+def _human_gate_entry_fence(route: dict, node: dict) -> None:
+    """Refuse to start a node whose entry human gate is not released (SD-129).
+
+    Defect M, measured 2026-09-04 on route rt-da62cded: the owner raised
+    `frame-review`, read `BLOCKED_HUMAN_GATE` from `status`, and spawned `plan`
+    anyway -- the gate wait was a sentence in `owner-execution.md` and no launch
+    surface asked the workflow journal. Every wrapper (the three adapters'
+    `dispatch-headless.py`, `dispatch-batch.py`) funnels through this gate, so
+    the fence lives here once.
+
+    The answer comes from `workflow_state.human_gate_resolution`, the same rule
+    the owner's `await-release` and the carriers read, and from the same ledger
+    root the supervisor writes (`workflow_state.default_ledger_root()`); the
+    reader never derives its own root from the wrapper's `--jobs`, because the
+    writer does not either. Both "never raised" and "raised, not released" are
+    refusals: a route sealed with the binding must pass through the gate, or a
+    self-approving owner is back to the two 2026-09-03 cycles that pressed
+    their own gate. `revise` and `stop` leave the gate unreleased too.
+    """
+
+    bindings = [
+        row for row in (route.get("human_gate_bindings") or [])
+        if isinstance(row, dict) and row.get("node") == node.get("id")
+        and (row.get("position") or "entry") == "entry" and row.get("gate")
+    ]
+    if not bindings:
+        return
+    import workflow_state as WS  # noqa: WPS433 -- workflow_state imports this module
+
+    ledger = WS.WorkflowLedger(str(route["route_id"]), str(route.get("route_hash", "")))
+    entries = ledger.journal()
+    for binding in bindings:
+        gate = str(binding["gate"])
+        resolution = WS.human_gate_resolution(entries, gate)
+        status = resolution["status"]
+        if status == "proceed":
+            continue
+        if status == "not-raised":
+            raise DispatchContractError(
+                "human-gate-not-raised",
+                f"{gate}: node {node.get('id')} enters through human gate {gate!r}, "
+                "which this route has never raised; the owner raises it with "
+                "`workflow-supervisor.py gate --block --artifact <path>` and waits "
+                "with `await-release` before starting this node",
+            )
+        raise DispatchContractError(
+            "human-gate-unreleased",
+            f"{gate}: latest raise (epoch {resolution['epoch']}) is {status}; "
+            "wait with `workflow-supervisor.py await-release` until a person "
+            "releases it with --decision proceed"
+            + (" (a revise needs the gate raised again first)" if status == "revise" else ""),
+        )
+
+
 def completion_marker_gate(
     route_file: str | None,
     route_node: str | None,
@@ -4501,6 +4555,7 @@ def completion_marker_gate(
             blocked.append((dep, readiness))
     if missing:
         raise DispatchContractError("completion-marker-missing", ",".join(missing))
+    _human_gate_entry_fence(route, node)
     _auxiliary_arbitration_gate(route, node, agent_home, jobs)
     if blocked:
         reason = (
