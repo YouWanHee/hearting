@@ -107,11 +107,110 @@ if [ "$native_managed" -eq 1 ]; then
   printf 'check=agent-modes:ok reason=runtime-managed-per-file\n'
   if [ "${CODEX_RUNTIME_PROJECTION_FAST:-0}" = "1" ]; then
     printf 'check=runtime-activation:ok reason=fast-pinned-identity\n'
-  elif "$AGENT_HOME/tools/install/harness.sh" runtime doctor --runtime codex --strict --json >/dev/null 2>&1; then
-    printf 'check=runtime-activation:ok reason=strict-doctor\n'
+    printf 'check=installation-surface-skew:skipped reason=fast-pinned-identity\n'
   else
-    printf 'check=runtime-activation:failed\n'
-    fails=$((fails + 1))
+    doctor_json=$("$AGENT_HOME/tools/install/harness.sh" runtime doctor \
+      --runtime codex --strict --json 2>/dev/null) && doctor_rc=0 || doctor_rc=$?
+    doctor_fields=$(python3 - "$doctor_json" "$doctor_rc" <<'PY' 2>/dev/null || true
+import json, sys
+
+raw, rc = sys.argv[1], sys.argv[2]
+def bounded_token(value):
+    import re
+    return value if isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9_-]{1,32}', value) else 'unknown'
+def bounded_action(value):
+    if not isinstance(value, str):
+        return 'unknown'
+    return ''.join(' ' if ord(c) < 32 or ord(c) == 127 else c for c in value)[:120]
+def classify():
+    if not raw:
+        return ['check=runtime-activation:failed reason=doctor-report-unavailable exit=%s detail=no-output' % rc,
+                'check=installation-surface-skew:failed reason=surface-skew-unreported detail=no-output'], 2
+    try:
+        report = json.loads(raw)
+    except Exception:
+        return ['check=runtime-activation:failed reason=doctor-report-unavailable exit=%s detail=invalid-json' % rc,
+                'check=installation-surface-skew:failed reason=surface-skew-unreported detail=invalid-json'], 2
+    if not isinstance(report, dict):
+        return ['check=runtime-activation:failed reason=doctor-report-unavailable exit=%s detail=not-an-object' % rc,
+                'check=installation-surface-skew:failed reason=surface-skew-unreported detail=not-an-object'], 2
+    if 'runtimes' in report:
+        detail = 'nested-multi-runtime-shape'
+        return ['check=runtime-activation:failed reason=doctor-report-unavailable exit=%s detail=%s' % (rc, detail),
+                'check=installation-surface-skew:failed reason=surface-skew-unreported detail=%s' % detail], 2
+    if 'ok' not in report:
+        detail = 'missing-ok-key'
+        return ['check=runtime-activation:failed reason=doctor-report-unavailable exit=%s detail=%s' % (rc, detail),
+                'check=installation-surface-skew:failed reason=surface-skew-unreported detail=%s' % detail], 2
+    if type(report['ok']) is not bool:
+        detail = 'ok-not-boolean'
+        return ['check=runtime-activation:failed reason=doctor-report-unavailable exit=%s detail=%s' % (rc, detail),
+                'check=installation-surface-skew:failed reason=surface-skew-unreported detail=%s' % detail], 2
+    if report.get('runtime') != 'codex':
+        detail = 'runtime-mismatch'
+        return ['check=runtime-activation:failed reason=doctor-report-unavailable exit=%s detail=%s' % (rc, detail),
+                'check=installation-surface-skew:failed reason=surface-skew-unreported detail=%s' % detail], 2
+    if 'surface_skew' not in report:
+        detail = 'missing-surface-skew'
+        return ['check=runtime-activation:failed reason=doctor-report-unavailable exit=%s detail=%s' % (rc, detail),
+                'check=installation-surface-skew:failed reason=surface-skew-unreported detail=%s' % detail], 2
+    skew = report['surface_skew']
+    if not isinstance(skew, dict) or type(skew.get('ok')) is not bool:
+        detail = 'surface-skew-malformed'
+        return ['check=runtime-activation:failed reason=doctor-report-unavailable exit=%s detail=%s' % (rc, detail),
+                'check=installation-surface-skew:failed reason=surface-skew-unreported detail=%s' % detail], 2
+    freshness = bounded_token(report.get('freshness'))
+    if report['ok']:
+        first = 'check=runtime-activation:ok reason=strict-doctor freshness=%s' % freshness
+        delta = 0
+    else:
+        first = 'check=runtime-activation:failed reason=doctor-runtime-not-ok freshness=%s next_action=%s' % (freshness, bounded_action(report.get('next_action')))
+        delta = 1
+    compared = len(skew['compared']) if isinstance(skew.get('compared'), list) else 'unknown'
+    if skew['ok']:
+        second = 'check=installation-surface-skew:ok compared=%s' % compared
+    else:
+        names = []
+        for item in skew.get('skewed', []) if isinstance(skew.get('skewed'), list) else []:
+            value = item.get('subtree') if isinstance(item, dict) else None
+            if isinstance(value, str) and __import__('re').fullmatch(r'[A-Za-z0-9_.-]{1,64}', value) and value not in names and len(names) < 8:
+                names.append(value)
+        second = 'check=installation-surface-skew:failed reason=cross-surface-skew subtrees=%s' % (','.join(names) if names else 'unknown')
+        delta += 1
+    return [first, second], delta
+try:
+    lines, delta = classify()
+    for line in lines:
+        print('emit=' + line)
+    print('fails_delta=%d' % delta)
+except Exception:
+    print('emit=check=runtime-activation:failed reason=doctor-report-unavailable exit=%s detail=parser-unavailable' % rc)
+    print('emit=check=installation-surface-skew:failed reason=surface-skew-unreported detail=parser-unavailable')
+    print('fails_delta=2')
+PY
+)
+    doctor_fails=$(printf '%s\n' "$doctor_fields" | awk '
+      BEGIN { count = 0; value = ""; invalid = 0 }
+      /^fails_delta=/ {
+        count++
+        value = $0
+        if ($0 !~ /^fails_delta=[0-9]+$/) invalid = 1
+      }
+      END {
+        if (count == 1 && invalid == 0) {
+          sub(/^fails_delta=/, "", value)
+          print value
+        }
+      }
+    ')
+    if [ -z "$doctor_fields" ] || [ -z "$doctor_fails" ]; then
+      printf 'check=runtime-activation:failed reason=doctor-report-unavailable exit=%s detail=parser-unavailable\n' "$doctor_rc"
+      printf 'check=installation-surface-skew:failed reason=surface-skew-unreported detail=parser-unavailable\n'
+      doctor_fails=2
+    else
+      printf '%s\n' "$doctor_fields" | sed -n 's/^emit=//p'
+    fi
+    fails=$((fails + doctor_fails))
   fi
 else
   expect_link "$CODEX_HOME/hearting-readme.md"  "$S/README.md"                 hearting-readme
@@ -219,10 +318,15 @@ print_plugin_check() {
       printf 'check=plugin:ok\n'
       ;;
     missing)
+      if [ "$skill_discovery" = native ]; then
+        printf 'check=plugin:missing reason=optional-marketplace-copy skill_discovery=native\n'
+        printf 'plugin_note=native skill discovery is active; the marketplace plugin is an optional duplicate\n'
+      else
       printf 'check=plugin:missing\n'
       printf 'plugin_install_1=codex plugin marketplace add %s/codex-plugin-marketplace\n' "$S"
       printf 'plugin_install_2=codex plugin add hearting-codex@hearting\n'
       printf 'plugin_hint=run install-runtime-projection.sh --install-plugin\n'
+      fi
       ;;
     skipped_cli)
       printf 'check=plugin:skipped reason=codex-cli-discovery-skipped\n'
@@ -231,10 +335,7 @@ print_plugin_check() {
       printf 'check=plugin:skipped reason=codex-cli-timeout timeout=%s\n' "$CLI_TIMEOUT"
       ;;
     list_failed)
-      printf 'check=plugin:missing reason=codex-plugin-list-failed exit=%s\n' "${plugin_rc:-unknown}"
-      printf 'plugin_install_1=codex plugin marketplace add %s/codex-plugin-marketplace\n' "$S"
-      printf 'plugin_install_2=codex plugin add hearting-codex@hearting\n'
-      printf 'plugin_hint=run install-runtime-projection.sh --install-plugin\n'
+      printf 'check=plugin:unknown reason=codex-plugin-list-failed exit=%s skill_discovery=%s\n' "${plugin_rc:-unknown}" "$skill_discovery"
       ;;
     command_not_found|*)
       printf 'check=plugin:skipped reason=codex-command-not-found\n'
@@ -244,6 +345,7 @@ print_plugin_check() {
 
 plugin_state=unknown
 plugin_rc=
+skill_discovery=unknown
 detect_plugin_state
 
 # Codex skill discovery may be native symlinks or the installable plugin. A
@@ -252,6 +354,7 @@ detect_plugin_state
 if [ "$native_managed" -eq 1 ]; then
   linked_skills=$(find "$CODEX_HOME/skills" -mindepth 1 -maxdepth 1 -type l 2>/dev/null | wc -l | tr -d ' ')
   printf 'skills_linked=%s plugin_state=%s\n' "$linked_skills" "$plugin_state"
+  skill_discovery=native
   printf 'check=skill-discovery:native\n'
   printf 'check=skills-linked:ok reason=runtime-activation-verified\n'
 else
@@ -282,28 +385,34 @@ for d in "$S/codex-skills"/*; do
   fi
 done
 if [ "$projected_skills" -eq 0 ]; then
+  skill_discovery=failed
   printf 'check=skill-discovery:failed reason=no-projected-skills\n'
   printf 'check=skills-linked:failed reason=no-projected-skills\n'
   fails=$((fails + 1))
 elif [ "$skill_link_fails" -gt 0 ]; then
+  skill_discovery=failed
   printf 'check=skill-discovery:failed reason=harness-skills-miswired\n'
   printf 'check=skills-linked:failed reason=harness-skills-miswired\n'
   fails=$((fails + 1))
 elif [ "$skill_link_ok" -eq "$projected_skills" ]; then
   if [ "$plugin_state" = installed ]; then
+    skill_discovery=native
     printf 'check=skill-discovery:native duplicate-warning=plugin-also-installed\n'
   else
     printf 'check=skill-discovery:native\n'
   fi
   printf 'check=skills-linked:ok\n'
 elif [ "$skill_link_absent" -eq "$projected_skills" ] && [ "$plugin_state" = installed ]; then
+  skill_discovery=plugin
   printf 'check=skill-discovery:plugin plugin=installed\n'
   printf 'check=skills-linked:skipped reason=plugin-skill-discovery\n'
 elif [ "$skill_link_absent" -eq "$projected_skills" ]; then
+  skill_discovery=failed
   printf 'check=skill-discovery:failed reason=no-native-skill-links-and-plugin-unavailable plugin_state=%s\n' "$plugin_state"
   printf 'check=skills-linked:failed reason=harness-skills-not-linked-and-plugin-unavailable\n'
   fails=$((fails + 1))
 else
+  skill_discovery=failed
   printf 'check=skill-discovery:failed reason=partial-native-skill-links ok=%s absent=%s projected=%s\n' "$skill_link_ok" "$skill_link_absent" "$projected_skills"
   printf 'check=skills-linked:failed reason=partial-native-skill-links\n'
   fails=$((fails + 1))
