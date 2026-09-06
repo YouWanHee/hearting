@@ -2379,7 +2379,154 @@ def _open_route_artifact_roots(
     return roots, route_files, ""
 
 
-def _route_record_launch_home(path: Path):
+# Mirror of `dispatch_subsession_advance.TERMINAL_STATUSES` /
+# `dispatch_contract.PARENT_EXTINCTION_TERMINAL_STATUSES`. An **allowlist**, not
+# the complement of the live states: a status word this reader does not
+# recognise -- a partially written field, a hand-repaired row, a word a future
+# cycle adds the way `killed`/`cancelled` were added before anything wrote them
+# -- is an unknown, and every unknown must keep the pin. Written as a denylist
+# first, which read `queued` as "this route is over" (review 🔴2).
+_ROUTE_TERMINAL_ROW_STATES = frozenset({"done", "killed", "cancelled"})
+
+
+def _route_registry_index(text: str) -> dict:
+    """One pass over a registry: which routes are named, and which are still live.
+
+    `{"malformed": bool, "seen": set[route_id], "live": set[route_id]}`.
+
+    Built once per registry file rather than re-scanned per route record: the
+    text cache alone left the work `O(open_records x registry_bytes)`, measured
+    at 3.6 s for 2,000 records naming one 2.2 MB registry (review 🟡4). Today
+    only four open-shaped records name one registry, so this is about the
+    ceiling (`_ROUTE_SCAN_MAX_FILES`), not about now.
+
+    **A depth-1 owner is not a route node**: its row carries `owner_route_id`
+    and no `route_id` (`dispatch-progress.py`, `workflow-supervisor.py`,
+    `dispatch_completion_join.py` all match on both keys). Matching only
+    `route_id=` made a live owner invisible, so a route whose node rows were all
+    terminal -- the normal state between two serial stages, and the whole of
+    `code-report` -- read as finished and dropped its pin while its owner was
+    still running. Measured on the live registry: 77 rows carry
+    `owner_route_id=` and no `route_id=`, 49 of 96 routes have both an owner row
+    and node rows, and 0 rows carry both keys (review 🔴1).
+    """
+
+    index: dict = {"malformed": False, "seen": set(), "live": set()}
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        fields = line.split("\t")
+        if len(fields) < 6:
+            index["malformed"] = True
+            return index
+        terminal = fields[1] in _ROUTE_TERMINAL_ROW_STATES
+        for item in fields[5].split(","):
+            key, _, value = item.partition("=")
+            if key not in ("route_id", "owner_route_id") or not value:
+                continue
+            index["seen"].add(value)
+            if not terminal:
+                index["live"].add(value)
+    return index
+
+
+def _read_route_registry_index(jobs_path: str, cache: dict):
+    """Cached `_route_registry_index` for one registry path, or `None`.
+
+    Keyed on `realpath` so two spellings of one file are one read and therefore
+    one snapshot -- a registry appended to mid-scan otherwise reads in two
+    states within a single pass. The whole file is read, unbounded, exactly as
+    `_release_in_use` reads its reference registries; the 1 MiB
+    `_ROUTE_RECORD_MAX_BYTES` two functions above caps a *route record*, and
+    deliberately does not apply here (the live registry is already 2.2 MB). If a
+    cap is ever added it must yield `None` -- undecidable -- never `True`.
+    """
+
+    try:
+        key = os.path.realpath(jobs_path)
+    except OSError:
+        key = jobs_path
+    if key not in cache:
+        try:
+            cache[key] = _route_registry_index(
+                Path(jobs_path).read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeDecodeError):
+            cache[key] = None
+    return cache[key]
+
+
+def _route_attempts_finished(route_id: str, raw: dict, cache: dict, environ: dict):
+    """Is every registry attempt of this route terminal? `None` = cannot tell.
+
+    P2, mirroring the registry reference source. A release is pinned by a route
+    record until that route is closed -- and a route whose only attempt *died*
+    is never closed, because nobody runs `close` on a route that failed to
+    launch. Measured 2026-09-06: `rt-0319e7bd` (v2.107.0,
+    `dead-launch-runtime-root-mismatch`) and `rt-1ccafd47` (v2.109.1,
+    `dead-invalid-envelope`) each held a release with a single `done` row, no
+    completion marker, no live process, and no other reference source. The
+    registry source had already released them; only this one had not.
+
+    `route_id` is the caller's identity (the record's *filename stem*), which
+    `_open_route_launch_homes` documents as authoritative. If the body disagrees
+    the answer is `None`: two sources for one value is the shape that has bitten
+    this repo repeatedly, and 83 records on disk already have stem != body.
+
+    Finished is decided by the route's OWN sealed `jobs_path` -- a registry this
+    route never wrote to cannot certify it (defect C, B2). Any OTHER registry may
+    still veto: a live row anywhere keeps the pin. That asymmetry closes the
+    `_jobs_path_alias_relieves_mismatch` hole (review 🟡6) without needing alias
+    resolution the installer cannot import -- it can only ever be more
+    conservative, never release something the sealed registry would have held.
+
+    `None` -- no sealed jobs path, unreadable, a malformed row, or **no rows at
+    all** -- keeps the release pinned. Absence of evidence is the one direction
+    that deletes data: a route compiled but not yet launched has no rows, and so
+    does a route whose rows were pruned out from under it.
+    """
+
+    body_id = raw.get("route_id")
+    if not isinstance(route_id, str) or not route_id:
+        return None
+    if isinstance(body_id, str) and body_id and body_id != route_id:
+        return None
+    tuple_ = raw.get("launch_compatibility_tuple")
+    jobs = (tuple_ or {}).get("jobs_path") if isinstance(tuple_, dict) else None
+    jobs_path = jobs.get("path") if isinstance(jobs, dict) else None
+    if not isinstance(jobs_path, str) or not jobs_path:
+        return None
+    index = _read_route_registry_index(jobs_path, cache)
+    if index is None or index["malformed"]:
+        return None
+    # Veto pass: any other registry that still shows this route live keeps the
+    # pin, even though only the sealed one may declare it finished.
+    for other in _veto_registry_paths(environ):
+        veto = _read_route_registry_index(other, cache)
+        if veto is not None and not veto["malformed"] and route_id in veto["live"]:
+            return False
+    if route_id in index["live"]:
+        return False
+    return True if route_id in index["seen"] else None
+
+
+def _veto_registry_paths(environ: dict) -> list[str]:
+    """Registries that may only ever KEEP a pin, never release one."""
+
+    paths: list[str] = []
+    try:
+        paths.append(str(stable_state_root(environ) / "jobs.log"))
+    except (DistributionError, OSError):
+        pass
+    ambient = environ.get("AGENT_DISPATCH_JOBS")
+    if ambient:
+        paths.append(ambient)
+    return paths
+
+
+def _route_record_launch_home(
+    path: Path, registry_cache: dict | None = None, environ: dict | None = None
+):
     """`launch_compatibility_tuple.launch_home.path` from one route record.
 
     Returns `None` if the route is **closed** -- an `.outcome.json` sibling
@@ -2389,6 +2536,11 @@ def _route_record_launch_home(path: Path):
     corrupt *closed* route record is likewise ignored: one rotten record
     among hundreds of closed ones must not block prune forever (over-eager
     fail-closed is its own bug).
+
+    Also `None` when the route is unclosed but every one of its registry
+    attempts is terminal (`_route_attempts_finished`) -- the P2 mirror of the
+    registry source's `open`-only rule. "Unclosed" and "still working" are not
+    the same thing, and a route that died at launch is never closed by anyone.
 
     Returns `_UNDECIDABLE` if the record looks open (no outcome sibling) but
     cannot be trusted: oversized, unreadable, unparsable, or missing the
@@ -2414,6 +2566,15 @@ def _route_record_launch_home(path: Path):
     value = launch_home.get("path") if isinstance(launch_home, dict) else None
     if not isinstance(value, str) or not value:
         return _UNDECIDABLE
+    # Checked only after the record parses and names a launch_home: an
+    # undecidable record must stay undecidable, never be released by a
+    # terminality answer derived from a body we could not trust.
+    if _route_attempts_finished(
+        path.stem, raw,
+        registry_cache if registry_cache is not None else {},
+        environ if environ is not None else os.environ,
+    ) is True:
+        return None
     return value
 
 
@@ -2530,10 +2691,12 @@ def _open_route_launch_homes(environ: dict[str, str]) -> tuple[list[tuple[str, s
         candidates[str(path.resolve(strict=False))] = path
 
     results: list[tuple[str, str]] = []
+    registry_cache: dict = {}
+    environ = environ or {}
     for path in candidates.values():
         if not path.is_file():
             continue
-        launch_home = _route_record_launch_home(path)
+        launch_home = _route_record_launch_home(path, registry_cache, environ)
         if launch_home is None:
             continue
         if launch_home is _UNDECIDABLE:
