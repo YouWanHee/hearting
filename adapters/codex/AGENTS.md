@@ -108,16 +108,12 @@ tool to claim Codex parity.
 
 ## Dispatch
 
-Route by `core/WORKFLOW.md §0.2`, then pick the work **shape** before any
-preset (§0.2.1): `direct`/`solo`/`staged` go through `preflight.sh compose`
-(flags, spec-read gate and probes default; `--graph execute,test,report` is
-your own stage subgraph); the preset recipe (`preflight.sh route
---capability …`) only when the request names the entry's full loop or a
-promotion signal requires it. Apply §0.3. `direct`/`solo` routes get one
-`[경로]` line instead of the blocking card unless destructive or
-external-facing (§0.4 SD-136); otherwise present the §0.4 card before
-material work unless already approved, and close with the §0.5 card. Load
-full capability detail only in the acting owner or worker.
+Route by `core/WORKFLOW.md §0.2`; pick the shape first (§0.2.1):
+`direct`/`solo`/`staged` use `preflight.sh compose` (defaults fill the rest;
+`--graph` = stage subgraph); `preflight.sh route --capability …` only for the
+entry's full loop or a promotion signal. Apply §0.3. `direct`/`solo`: one
+`[경로]` line unless destructive or external-facing (§0.4 SD-136); else the
+§0.4 card unless approved. Close with §0.5.
 
 An ordinary dispatch-depth-1 owner launches through `preflight.sh dispatch-owner
 --dry-run|--register|--start`, a separate low-level surface from `preflight.sh
