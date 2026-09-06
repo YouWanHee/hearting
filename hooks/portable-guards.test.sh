@@ -1878,10 +1878,16 @@ if "$CODEX" subagent-info >/tmp/codex_subagent_info.out 2>/tmp/codex_subagent_in
   && grep -q '^runtime_surface=codex-native-subagents$' /tmp/codex_subagent_info.out \
   && grep -q '^feature=multi_agent$' /tmp/codex_subagent_info.out \
   && grep -q '^trigger=explicit-user-request-or-main-dispatch$' /tmp/codex_subagent_info.out \
+  && grep -q '^auto_spawn=explicit-or-main-dispatched$' /tmp/codex_subagent_info.out \
   && grep -q '^claude_subagent_frontmatter=unsupported$' /tmp/codex_subagent_info.out; then
   ok "codex subagent-info reports native subagent contract"
 else
   bad "codex subagent-info should report native subagent contract"
+fi
+if ! grep -q 'auto_spawn=explicit-only' "$CODEX"; then
+  ok "codex preflight no longer reports the stale auto_spawn=explicit-only pairing"
+else
+  bad "codex preflight should not report auto_spawn=explicit-only next to an explicit-or-main-dispatch trigger"
 fi
 if "$CODEX" subagent-info --check >/tmp/codex_subagent_check.out 2>/tmp/codex_subagent_check.err \
   && grep -q '^check=ok$' /tmp/codex_subagent_check.out \

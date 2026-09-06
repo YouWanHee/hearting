@@ -310,34 +310,48 @@ else
 fi
 fi
 
-# Native agent links: every projected custom-agent TOML must be linked to the
-# matching adapter-owned file.
-if [ "$native_managed" -eq 1 ]; then
-  linked_agents=$(find "$CODEX_HOME/agents" -mindepth 1 -maxdepth 1 -type l 2>/dev/null | wc -l | tr -d ' ')
-  printf 'agents_linked=%s\n' "$linked_agents"
-  printf 'check=agents-linked:ok reason=runtime-activation-verified\n'
+# O1 (Astra guide alignment): native agent links resolve to the effective
+# payload computed from this CODEX_HOME's config (complete user file, else
+# the whole shipped fallback -- never merged), not to the shipped repo TOML
+# directly. The payload checker and link lister are both read-only; neither
+# creates or repairs anything.
+if payload_check_json=$(python3 "$AGENT_HOME/tools/install/native_agent_payload.py" check \
+  --runtime-home "$CODEX_HOME" --source-root "$AGENT_HOME" 2>/dev/null); then
+  payload_check_rc=0
 else
-projected_agents=$(find -L "$S/codex-agents" -mindepth 1 -maxdepth 1 -type f -name '*.toml' 2>/dev/null | wc -l | tr -d ' ')
-linked_agents=$(find "$CODEX_HOME/agents" -mindepth 1 -maxdepth 1 -type l 2>/dev/null | wc -l | tr -d ' ')
-printf 'agents_projected=%s agents_linked=%s\n' "$projected_agents" "$linked_agents"
+  payload_check_rc=$?
+fi
+payload_links=$(python3 "$AGENT_HOME/tools/install/native_agent_payload.py" links \
+  --runtime-home "$CODEX_HOME" --source-root "$AGENT_HOME" 2>/dev/null || true)
+
+projected_agents=0
 agent_link_fails=0
-for f in "$S/codex-agents"/*.toml; do
-  [ -f "$f" ] || continue
-  name=$(basename "$f")
-  linkpath="$CODEX_HOME/agents/$name"
-  if [ -L "$linkpath" ] && [ -n "$(real "$linkpath")" ] && [ "$(real "$linkpath")" = "$(real "$f")" ]; then
-    printf 'check=agent-link:%s:ok\n' "$name"
+while IFS="$(printf '\t')" read -r agent_name agent_path; do
+  [ -n "$agent_name" ] || continue
+  projected_agents=$((projected_agents + 1))
+  linkpath="$CODEX_HOME/agents/$agent_name"
+  if [ -L "$linkpath" ] && [ -n "$(real "$linkpath")" ] && [ "$(real "$linkpath")" = "$(real "$agent_path")" ]; then
+    printf 'check=agent-link:%s:ok\n' "$agent_name"
   else
-    printf 'check=agent-link:%s:failed reason=expected-symlink-to:%s\n' "$name" "$f"
+    printf 'check=agent-link:%s:failed reason=expected-symlink-to:%s\n' "$agent_name" "$agent_path"
     agent_link_fails=$((agent_link_fails + 1))
   fi
-done
-if [ "$agent_link_fails" -eq 0 ] && [ "$projected_agents" -gt 0 ]; then
+done <<EOF
+$payload_links
+EOF
+
+linked_agents=$(find "$CODEX_HOME/agents" -mindepth 1 -maxdepth 1 -type l 2>/dev/null | wc -l | tr -d ' ')
+printf 'agents_projected=%s agents_linked=%s\n' "$projected_agents" "$linked_agents"
+if [ "$payload_check_rc" -eq 0 ]; then
+  printf 'check=native-agent-payload:ok\n'
+else
+  printf 'check=native-agent-payload:failed\n'
+fi
+if [ "$payload_check_rc" -eq 0 ] && [ "$agent_link_fails" -eq 0 ] && [ "$projected_agents" -gt 0 ]; then
   printf 'check=agents-linked:ok\n'
 else
   printf 'check=agents-linked:failed reason=harness-agents-not-linked-or-miswired\n'
   fails=$((fails + 1))
-fi
 fi
 
 # Transparent interactive launcher. A private CODEX_HOME without an explicit

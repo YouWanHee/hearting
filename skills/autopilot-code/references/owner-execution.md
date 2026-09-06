@@ -63,10 +63,18 @@ Before merge/commit: (1) run `python3 tools/generate.py`, (2) record new `utilit
 
 ## Post-Frame Direction Gate (SD-123)
 
-`standard+` routes compiled after this cycle seal `human_gates: ["frame-review"]`
-and the `frame` node's continuation as `{"kind": "human-gate", "gate":
-"frame-review"}` — a route sealed before this cycle keeps `inline-next` and is
-never retro-fitted; do not attempt to apply this gate to an already-open route.
+This gate is mode-conditional, not universal. `standard+` `autopilot-code` routes
+compiled under an explicit `hybrid`/`both`/`post-frame-only` `confirmation.mode`
+seal `human_gates: ["frame-review"]` and the `frame` node's (and any frame
+parallel-group clone's) continuation as `{"kind": "human-gate", "gate":
+"frame-review"}` — steps 1-4 below apply to those routes. A route compiled
+under the shipped `autonomous` default (O3) instead realizes that same
+continuation as `{"kind": "inline-next"}` and seals an empty
+`human_gate_bindings` for this gate: `plan` starts immediately after `frame`
+joins and steps 1-3 below do not apply. A route sealed before `confirmation_mode`
+existed at all keeps whatever the recipe declared at compile time and is never
+retro-fitted onto either shape; do not attempt to apply this gate to an
+already-open route regardless of which shape it sealed.
 
 1. After `frame` (and, at `standard`, `frame-alternative`) completes, before
    dispatching `plan`: build `shards/frame/frame-summary.json` from
@@ -86,10 +94,13 @@ never retro-fitted; do not attempt to apply this gate to an already-open route.
    `revise` returns to `frame` under the `code-refine` retry boundary; `stop`
    cancels the route with `abandon_reason=operator-decision`.
 4. `confirmation.mode` (`profiles/dispatch-defaults.yaml` /
-   `utilities/dispatch-defaults.py`, default `hybrid`) governs whether this
-   post-frame gate is the sole confirmation point (`post-frame-only`), layers
-   onto the existing pre-plan notify (`hybrid`), or both are always explicit
-   (`both`) — read it via `query_confirmation_mode`, never hardcode `hybrid`.
+   `utilities/dispatch-defaults.py`, default `autonomous`) governs this gate
+   and has four values: `autonomous` removes this binding entirely for
+   routine, already-authorized `autopilot-code` work (`frame`'s continuation
+   realizes as `inline-next`, steps 1-3 above do not apply); `post-frame-only`
+   makes this gate the sole confirmation point; `hybrid` layers it onto the
+   existing pre-plan notify; `both` makes both stages always explicit — read
+   it via `query_confirmation_mode`, never hardcode a mode.
    `core/WORKFLOW.md` §0.4 owns the user-facing card text.
 
 ## Artifact Producer Lifecycle (W7C)

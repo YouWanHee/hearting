@@ -62,7 +62,7 @@ Follow [OPERATIONS §5.10](../../../core/OPERATIONS.md#510-work-isolation-and-pa
 
 - Every feature, new module, or multi-file change uses a worktree and task branch regardless of intensity. Only a typo or one-line isolated edit belongs directly in main.
 - After creating the worktree, dispatch the whole autopilot-code cycle into a dispatch-depth-1 headless session. Main scouts, dispatches, and harvests; it does not split one pipeline between dispatch depth 0 and headless execution.
-- Inside the dispatch-depth-1 conductor, standard+ dispatches code-plan, code-execute, code-test, and code-report as file-handoff dispatch-depth-2 sessions. File contracts preserve continuity. The conductor reads only verdicts and gate state.
+- Inside the dispatch-depth-1 conductor, standard+ dispatches code-plan, code-execute, code-test, and code-report as file-handoff dispatch-depth-2 sessions by default. File contracts preserve continuity. The conductor reads only verdicts and gate state. This default is not absolute: `dev-pipeline.md`'s Closed Inline Fallback case 3 (a checked, reason-recorded nonseparable edit) and other checked inline/reuse continuations remain available for tightly coupled implement-debug-verify work, without weakening the default separable-stage dispatch rule above or moving stage-gate authority off the route.
 - Keep micro-stages with no durable artifact, such as a one-line plan-check, inline. direct and quick remain inline at their intended layer.
 - A new independent request uses another worktree when files do not overlap; overlapping work queues behind the active branch. Merge selection remains with the user or main harvest flow.
 

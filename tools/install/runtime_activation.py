@@ -34,6 +34,7 @@ if str(UTILITIES_ROOT) not in sys.path:
 
 import harness_manifest
 import model_config
+import native_agent_payload
 import projector
 import safe_fs
 import user_model_config
@@ -503,14 +504,18 @@ def _linked_entries(
                 "skill",
             )
         )
+        # O1 (Astra guide alignment): link the runtime's *effective* payload
+        # (this home's user models.conf if complete, else the whole shipped
+        # one -- never merged), not the shipped-only repo TOML directly.
+        # `expected_links` only computes paths; it never writes.
+        try:
+            agent_links = native_agent_payload.expected_links(home, source_root=source_root)
+        except native_agent_payload.PayloadError:
+            agent_links = {}
         entries.extend(
-            _children(
-                source_root / "adapters/codex/agents",
-                home / "agents",
-                "agent",
-                "*.toml",
-                allowed=projected_agents,
-            )
+            _entry(path, home / "agents" / name, "agent")
+            for name, path in sorted(agent_links.items())
+            if Path(name).stem in projected_agents
         )
 
     elif runtime == "claude":
@@ -792,17 +797,30 @@ def _native_present(runtime: str, scope: str = "global") -> bool:
     for candidate in candidates:
         if not candidate.is_symlink():
             continue
-        if _native_harness_target(runtime, candidate):
+        if _native_harness_target(runtime, candidate, home):
             return True
     return False
 
 
-def _native_harness_target(runtime: str, candidate: Path) -> bool:
-    """Recognize only a canonical harness projection, never a path substring."""
+def _native_harness_target(
+    runtime: str, candidate: Path, home: Optional[Path] = None
+) -> bool:
+    """Recognize only a canonical harness projection, never a path substring.
+
+    O1 (Astra guide alignment): a Codex native-agent link may instead resolve
+    into this runtime home's own materialized payload directory rather than
+    into the source tree below. `verify_owned_target` proves that ownership by
+    canonical containment plus exact metadata/runtime/digest/checksum
+    agreement -- never by a `.harness` substring or directory-name match --
+    so it is checked first and independently of the source-tree recognition
+    below, which is unchanged.
+    """
     try:
         target = candidate.resolve(strict=False)
     except RuntimeError:
         return False
+    if runtime == "codex" and home is not None and native_agent_payload.verify_owned_target(home, target):
+        return True
     for root in (target, *target.parents):
         if not (root / "harness-manifest.json").is_file():
             continue
@@ -849,7 +867,7 @@ def _discovered_harness_links(runtime: str, scope: str = "global") -> set[Path]:
     found: set[Path] = set()
     for pattern in patterns:
         for candidate in home.glob(pattern):
-            if candidate.is_symlink() and _native_harness_target(runtime, candidate):
+            if candidate.is_symlink() and _native_harness_target(runtime, candidate, home):
                 found.add(candidate)
     return found
 
@@ -2328,6 +2346,19 @@ def activate(
         )
     except user_model_config.UserModelConfigError as exc:
         raise ActivationError(str(exc)) from exc
+
+    # O1 (Astra guide alignment): materialize the effective Codex native-agent
+    # payload only here, on the mutating activate/refresh path, and only after
+    # the user config above is seeded/preserved -- never inside a compute-only
+    # path like `_desired_entries()`/status/doctor/deactivate.
+    if runtime == "codex":
+        try:
+            payload_plan = native_agent_payload.plan_payload(
+                paths.runtime_home(runtime, scope), source_root=active_root
+            )
+            native_agent_payload.materialize_payload(payload_plan)
+        except (native_agent_payload.PayloadError, native_agent_payload.PayloadMaterializeError) as exc:
+            raise ActivationError(str(exc)) from exc
 
     desired = _desired_entries(runtime, mode, source_root, active_root, revision, scope)
     digest = _projection_digest(desired)

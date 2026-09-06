@@ -254,6 +254,38 @@ class ModelProfileTest(unittest.TestCase):
         self.assertIn("--model", command)
         self.assertNotIn("--variant", command)
 
+    def test_existing_key_astra_ultra_fixture_resolves_deep_profile(self):
+        # O2: the opt-in changes only existing values (deep tier model/effort,
+        # deep profile tier:budget, first failover-cascade step) -- no new
+        # CFG_* key is introduced, and no empty-budget inheritance occurs.
+        import tempfile
+        conf_text = (
+            "CFG_TIER_DEEP_MODEL=gpt-6-astra\n"
+            "CFG_TIER_DEEP_EFFORT=ultra\n"
+            "CFG_TIER_LIGHT_MODEL=gpt-5.6-luna\n"
+            "CFG_TIER_LIGHT_EFFORT=medium\n"
+            "CFG_TIER_MINI_MODEL=gpt-5.6-luna\n"
+            "CFG_TIER_MINI_EFFORT=low\n"
+            "CFG_MODEL_PROFILE_DEEP=deep:ultra\n"
+            "CFG_MODEL_PROFILE_BALANCED_DEEP=deep:medium\n"
+            "CFG_MODEL_PROFILE_LIGHT=light:medium\n"
+            "CFG_MODEL_PROFILE_MINI=mini:low\n"
+            "CFG_MODEL_PROFILE_GRANULARITY=full\n"
+        )
+        with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as handle:
+            handle.write(conf_text)
+            path = handle.name
+        deep = PROFILE.resolve_profile("codex", path, "deep")
+        self.assertEqual(deep["tier"], "deep")
+        self.assertEqual(deep["model"], "gpt-6-astra")
+        self.assertEqual(deep["budget"], "ultra")
+        self.assertEqual(deep["budget_kind"], "effort")
+        balanced_deep = PROFILE.resolve_profile("codex", path, "balanced-deep")
+        self.assertEqual(balanced_deep["model"], "gpt-6-astra")
+        self.assertEqual(balanced_deep["budget"], "medium")
+        self.assertNotEqual(deep["budget"], "")
+        self.assertNotEqual(balanced_deep["budget"], "")
+
 
 if __name__ == "__main__":
     unittest.main()

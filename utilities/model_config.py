@@ -207,6 +207,62 @@ def resolve_config(
     )
 
 
+def diagnose(
+    adapter: str,
+    *,
+    runtime: str | Path | None = None,
+    environ: Mapping[str, str] | None = None,
+    source_root: str | Path | None = None,
+) -> dict:
+    """O2 (Astra guide alignment): read-only effective-mapping diagnostic.
+
+    Uses the exact same `resolve_config()` result the runtime renderer/payload
+    consumes, so the diagnostic and the effective config can never disagree.
+    Reports, for `codex`, the three independently-configured deep settings a
+    coherent Astra Ultra opt-in must agree on: `CFG_TIER_DEEP_MODEL`/
+    `CFG_TIER_DEEP_EFFORT`, `CFG_MODEL_PROFILE_DEEP`'s tier:budget, and the
+    first `CFG_TIER_DEEP_FAILOVER_CASCADE` step. A mismatch is flagged, never
+    rewritten -- this never mutates config or claims universal runtime/account
+    availability. Other adapters get only the receipt: no deep-tier opt-in is
+    defined for them here.
+    """
+    values, receipt = resolve_config(adapter, runtime=runtime, environ=environ, source_root=source_root)
+    report: dict = {"receipt": receipt.as_dict()}
+    if adapter != "codex":
+        return report
+    tier_model = values.get("CFG_TIER_DEEP_MODEL")
+    tier_effort = values.get("CFG_TIER_DEEP_EFFORT")
+    profile_spec = values.get("CFG_MODEL_PROFILE_DEEP", "")
+    profile_tier, _, profile_budget = profile_spec.partition(":")
+    cascade: list[dict[str, str]] = []
+    for token in values.get("CFG_TIER_DEEP_FAILOVER_CASCADE", "").split():
+        if ":" not in token:
+            continue
+        model, effort = token.split(":", 1)
+        cascade.append({"model": model, "effort": effort})
+    first_cascade_effort = cascade[0]["effort"] if cascade else None
+    mismatches: list[str] = []
+    if tier_effort and profile_budget and tier_effort != profile_budget:
+        mismatches.append(
+            f"CFG_TIER_DEEP_EFFORT={tier_effort!r} disagrees with "
+            f"CFG_MODEL_PROFILE_DEEP effort {profile_budget!r}"
+        )
+    if tier_effort and first_cascade_effort and tier_effort != first_cascade_effort:
+        mismatches.append(
+            f"CFG_TIER_DEEP_EFFORT={tier_effort!r} disagrees with the first "
+            f"CFG_TIER_DEEP_FAILOVER_CASCADE step effort {first_cascade_effort!r}"
+        )
+    report["deep"] = {
+        "tier_model": tier_model,
+        "tier_effort": tier_effort,
+        "profile_tier": profile_tier or None,
+        "profile_budget": profile_budget or None,
+        "failover_cascade": cascade,
+        "mismatches": mismatches,
+    }
+    return report
+
+
 def _shell_quote(value: str) -> str:
     return "'" + value.replace("'", "'\"'\"'") + "'"
 
@@ -221,10 +277,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--runtime-home")
     parser.add_argument("--source-root")
     parser.add_argument("--receipt-fd", type=int)
+    parser.add_argument("--diagnose", action="store_true", help="print the read-only effective-mapping diagnostic and exit")
     try:
         args = parser.parse_args(argv)
         if args.receipt_fd is not None and args.receipt_fd < 0:
             return 64
+        if args.diagnose:
+            report = diagnose(args.adapter, runtime=args.runtime_home, source_root=args.source_root)
+            print(json.dumps(report, indent=2, sort_keys=True))
+            return 0
         values, receipt = resolve_config(
             args.adapter, runtime=args.runtime_home, source_root=args.source_root
         )

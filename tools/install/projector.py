@@ -6,6 +6,7 @@ only computes links, copies, and delegated actions; runtime drivers apply them.
 
 from pathlib import Path
 
+import native_agent_payload
 import paths
 
 
@@ -91,13 +92,14 @@ _CODEX_TABLE = (
             "dest_subdir": "skills",
             "pattern": "*",
         },
+        # O1 (Astra guide alignment): link the runtime's *effective* Codex
+        # native-agent payload, not the shipped-only repo TOML directly, so a
+        # user's complete models.conf actually reaches the installed agents.
+        # Project scope still redirects into the project's local .codex/agents/
+        # (see `_dest_dir_for`).
         {
-            "action": "symlink_glob",
-            "source_dir": "codex_setting/codex-agents",
+            "action": "native_agent_payload",
             "dest_subdir": "agents",
-            "pattern": "*.toml",
-            # Project scope redirects agents into the project's local .codex/agents/.
-            "project_scope_override": True,
         },
     ]
 )
@@ -248,6 +250,32 @@ def _expand(table, runtime, scope):
                             "action": "skip",
                             "reason": f"source absent: {match}",
                             "dest": str(dest_path),
+                        }
+                    )
+
+        elif action == "native_agent_payload":
+            dest_dir = _dest_dir_for(runtime, scope, item["dest_subdir"])
+            home = paths.runtime_home(runtime, scope)
+            try:
+                agent_links = native_agent_payload.expected_links(
+                    home, source_root=paths.agent_home()
+                )
+            except native_agent_payload.PayloadError as exc:
+                entries.append(
+                    {
+                        "action": "skip",
+                        "reason": f"native agent payload unavailable: {exc}",
+                        "dest": str(dest_dir),
+                    }
+                )
+            else:
+                for name, source_path in sorted(agent_links.items()):
+                    entries.append(
+                        {
+                            "action": "symlink",
+                            "source": str(source_path),
+                            "dest": str(dest_dir / name),
+                            "source_present": True,
                         }
                     )
 

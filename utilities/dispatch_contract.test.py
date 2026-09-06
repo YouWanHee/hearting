@@ -918,6 +918,68 @@ class DispatchContractTest(unittest.TestCase):
     if parent.poll() is None:parent.kill()
     parent.wait()
 
+ def test_namespace_hidden_parent_with_tagged_child_requires_exact_held_lease(self):
+  with tempfile.TemporaryDirectory() as td:
+   base=Path(td);jobs=base/"jobs.log"
+   attempt=f"att-parent-lease-descendant-{base.name}";nonce="a"*64
+   lease=D.supervisor_lease_path(jobs,attempt);lease.parent.mkdir(parents=True)
+   extra=(",harness=codex,runtime_sandbox=workspace-write,"
+          "completion_delivery=app-server-supervised,"
+          f"supervisor_lease={D.SUPERVISOR_LEASE_KIND},"
+          f"supervisor_lease_file={lease},supervisor_lease_nonce={nonce},"
+          "pid_scope=namespace-local,"
+          "pid_observer_ns=pid:[outer],pid_ns=pid:[outer]")
+   row=self.owner_row(attempt,424242,"1",extra=extra)+"\n"
+   metadata=D.parse_registry_metadata(row.rstrip().split("\t",5)[5])
+   jobs.write_text(row)
+   child=subprocess.Popen(
+    ["sleep","60"],start_new_session=True,
+    env=dict(os.environ,AGENT_DISPATCH_ATTEMPT_ID=attempt))
+   try:
+    with lease.open("w+") as holder, \
+         mock.patch.object(D,"process_namespace_identity",return_value="pid:[inner]"):
+     holder.write(f"kind={D.SUPERVISOR_LEASE_KIND}\nattempt_id={attempt}\nnonce={nonce}\n")
+     holder.flush();fcntl.flock(holder.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
+     # Drain and terminal gates must still see the real tagged child, even
+     # though neither its existence nor its PID proves that the parent lives.
+     for terminal in (False,True):
+      process=D.attempt_process_quiescence(metadata,terminal_receipt=terminal)
+      self.assertEqual((process.state,process.reason,process.pid),
+                       ("live","attempt-descendant-live",child.pid))
+      self.assertIsNone(process.identity)
+     resolve=lambda: D.resolve_live_parent_attempt(
+      jobs,parent_slug="owner",repo="/repo",worktree="/wt",
+      expected_attempt_id=attempt)
+     binding=resolve()
+     self.assertEqual(binding.liveness_source,"supervisor-lease")
+     self.assertIsNone(binding.observed_pid)
+     self.assertTrue(D.parent_attempt_binding_is_live(jobs,binding))
+     child_fields=["2026-09-05T00:00:00Z","open","/repo","/wt","leg","meta"]
+     self.assertEqual(
+      D.parent_completion_window(
+       jobs,child_fields,{"parent_attempt_id":attempt,"parent":"owner"}),
+      D.ParentCompletionWindow(True,"parent-live:supervisor-lease"))
+     for key,bad_value in (
+      ("supervisor_lease_nonce","e"*64),("supervisor_lease_nonce",""),
+      ("supervisor_lease",""),("supervisor_lease_file",""),
+     ):
+      with self.subTest(key=key,bad_value=bad_value):
+       jobs.write_text(row.replace(f"{key}={metadata[key]}",f"{key}={bad_value}"))
+       with self.assertRaises(D.DispatchContractError) as caught:resolve()
+       self.assertEqual(caught.exception.reason,"parent-attempt-not-live")
+       self.assertFalse(D.parent_attempt_binding_is_live(jobs,binding))
+     jobs.write_text(row)
+     fcntl.flock(holder.fileno(),fcntl.LOCK_UN)
+     with self.assertRaises(D.DispatchContractError) as released:resolve()
+     self.assertEqual(released.exception.reason,"parent-attempt-not-live")
+     self.assertFalse(D.parent_attempt_binding_is_live(jobs,binding))
+     lease.unlink()
+     with self.assertRaises(D.DispatchContractError) as missing:resolve()
+     self.assertEqual(missing.exception.reason,"parent-attempt-not-live")
+   finally:
+    if child.poll() is None:child.kill()
+    child.wait(timeout=5)
+
  def test_supervised_lease_never_overrides_positive_pid_reuse(self):
   with tempfile.TemporaryDirectory() as td:
    base=Path(td);jobs=base/"jobs.log";attempt="att-parent-reused"
@@ -933,7 +995,12 @@ class DispatchContractTest(unittest.TestCase):
     holder.write(f"kind={D.SUPERVISOR_LEASE_KIND}\nattempt_id={attempt}\nnonce={nonce}\n")
     holder.flush()
     with mock.patch.object(
-        D,"_proc_observation",return_value=("present","different","S")):
+        D,"_proc_observation",return_value=("present","different","S")), \
+         mock.patch.object(D,"attempt_tagged_descendants",return_value=
+                           D.ProcessGroupObservation("populated",((901,"42","S"),))):
+     metadata=D.parse_registry_metadata(jobs.read_text().rstrip().split("\t",5)[5])
+     self.assertEqual(D._parent_liveness_evidence(jobs,metadata),
+                      (False,"local-pid-reused",None))
      with self.assertRaises(D.DispatchContractError) as caught:
       D.resolve_live_parent_attempt(
        jobs,parent_slug="owner",repo="/repo",worktree="/wt",

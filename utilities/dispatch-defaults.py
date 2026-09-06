@@ -33,8 +33,13 @@ TOP_LEVEL_KEYS = {
 HEADLESS_KEYS = {"claude_permission_mode"}
 HEADLESS_PERMISSION_MODES = ("bypass", "allowlist")
 DEFAULT_HEADLESS_PERMISSION_MODE = "bypass"
-CONFIRMATION_MODES = ("hybrid", "both", "post-frame-only")
-DEFAULT_CONFIRMATION_MODE = "hybrid"
+CONFIRMATION_MODES = ("hybrid", "both", "post-frame-only", "autonomous")
+# O3 (Astra guide alignment): the implicit/absent-config default is now
+# `autonomous` (skip only the routine autopilot-code frame-review wait).
+# Explicit `hybrid`/`both`/`post-frame-only` selections, and every route
+# already sealed under the old default, are unaffected -- see
+# utilities/capability-route.py's `_effective_confirmation_graph`.
+DEFAULT_CONFIRMATION_MODE = "autonomous"
 STEWARD_CHILD_PERMISSION_MODES = ("bypass", "inherit")
 DEFAULT_STEWARD_CHILD_PERMISSION_MODE = "bypass"
 
@@ -616,10 +621,12 @@ def query_opencode_policy(config):
 def query_confirmation_mode(config):
     """SD-123: post-frame direction-gate confirmation mode.
 
-    Returns the default (`hybrid`) whenever the `confirmation` block or its
-    `mode` key is absent — including for a schema_version < 4 document,
-    where the block is not legal at all — so every caller gets a value
-    without special-casing older configs.
+    Returns the default (`autonomous` as of O3) whenever the `confirmation`
+    block or its `mode` key is absent — including for a schema_version < 4
+    document, where the block is not legal at all, and for a schema_version 4
+    document whose `confirmation` block is present but has no `mode` key — so
+    every caller gets a value without special-casing older or partial
+    configs.
     """
     confirmation = config.get("confirmation")
     if isinstance(confirmation, dict):

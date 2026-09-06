@@ -26,6 +26,17 @@ BASE = (
     'CFG_TIER_DEEP_EFFORT=xhigh\n'
 )
 
+# O2 (Astra guide alignment): a coherent existing-key deep-tier opt-in fixture.
+# Every CFG_ key here already exists in BASE's shape -- the opt-in changes only
+# values, never adds a key -- with CFG_TIER_DEEP_FAILOVER_CASCADE added so the
+# diagnostic has a first step to compare.
+ASTRA_ULTRA_COHERENT = (
+    'CFG_MODEL_PROFILE_DEEP=deep:ultra\n'
+    'CFG_TIER_DEEP_MODEL=gpt-6-astra\n'
+    'CFG_TIER_DEEP_EFFORT=ultra\n'
+    'CFG_TIER_DEEP_FAILOVER_CASCADE="gpt-6-astra:ultra gpt-5.6-luna:medium"\n'
+)
+
 
 class ModelConfigTest(unittest.TestCase):
     def make_root(self, adapter="claude", shipped=BASE):
@@ -58,6 +69,20 @@ class ModelConfigTest(unittest.TestCase):
         self.assertEqual(receipt.source, "user")
         self.assertEqual(receipt.reason, "user-valid")
         self.assertEqual(values["CFG_USER_EXTRA"], "literal")
+
+    def test_resolve_config_accepts_the_exact_call_shape_native_agent_payload_uses(self):
+        # WP1 (O1): tools/install/native_agent_payload.py's plan_payload() calls
+        # resolve_config("codex", runtime=<absolute Path>, source_root=...) to
+        # compute the effective mapping it renders and digests. Pin that exact
+        # call shape here so a signature drift breaks this test, not silently
+        # the payload primitive.
+        root = self.make_root(adapter="codex")
+        home = root / "runtime-home"
+        values, receipt = config.resolve_config("codex", runtime=home, source_root=root)
+        self.assertEqual(receipt.adapter, "codex")
+        self.assertEqual(receipt.source, "shipped")
+        self.assertEqual(receipt.reason, "user-missing")
+        self.assertEqual(values["CFG_TIER_DEEP_MODEL"], "shipped-model")
 
     def test_missing_incomplete_malformed_and_unsafe_user_files_fallback_whole_file(self):
         for text, reason in ((None, "user-missing"), ("CFG_TIER_DEEP_MODEL=user-only\n", "user-incomplete"),
@@ -100,6 +125,70 @@ class ModelConfigTest(unittest.TestCase):
         self.assertEqual(receipt.source, "shipped")
         self.assertEqual(receipt.reason, "user-unreadable")
         self.assertEqual(values["CFG_TIER_DEEP_MODEL"], "shipped-model")
+
+    def test_diagnose_reports_only_receipt_for_non_codex_adapters(self):
+        root = self.make_root(adapter="claude")
+        report = config.diagnose("claude", runtime=root / "home", source_root=root)
+        self.assertEqual(report["receipt"]["adapter"], "claude")
+        self.assertNotIn("deep", report)
+
+    def test_diagnose_coherent_astra_ultra_fixture_reports_no_mismatch(self):
+        root = self.make_root(adapter="codex")
+        home = root / "home"
+        user = home / "agent-config" / "models.conf"
+        user.parent.mkdir(parents=True)
+        user.write_text(ASTRA_ULTRA_COHERENT, encoding="utf-8")
+        report = config.diagnose("codex", runtime=home, source_root=root)
+        self.assertEqual(report["receipt"]["source"], "user")
+        deep = report["deep"]
+        self.assertEqual(deep["tier_model"], "gpt-6-astra")
+        self.assertEqual(deep["tier_effort"], "ultra")
+        self.assertEqual(deep["profile_tier"], "deep")
+        self.assertEqual(deep["profile_budget"], "ultra")
+        self.assertEqual(
+            deep["failover_cascade"],
+            [{"model": "gpt-6-astra", "effort": "ultra"}, {"model": "gpt-5.6-luna", "effort": "medium"}],
+        )
+        self.assertEqual(deep["mismatches"], [])
+
+    def test_diagnose_one_field_perturbation_reports_exact_mismatch(self):
+        root = self.make_root(adapter="codex")
+        home = root / "home"
+        user = home / "agent-config" / "models.conf"
+        user.parent.mkdir(parents=True)
+        # Only CFG_MODEL_PROFILE_DEEP's effort is perturbed to `high` -- tier
+        # effort and the failover cascade's first step still say `ultra`.
+        user.write_text(
+            ASTRA_ULTRA_COHERENT.replace("CFG_MODEL_PROFILE_DEEP=deep:ultra", "CFG_MODEL_PROFILE_DEEP=deep:high"),
+            encoding="utf-8",
+        )
+        report = config.diagnose("codex", runtime=home, source_root=root)
+        deep = report["deep"]
+        self.assertEqual(deep["profile_budget"], "high")
+        self.assertEqual(len(deep["mismatches"]), 1)
+        self.assertIn("CFG_TIER_DEEP_EFFORT", deep["mismatches"][0])
+        self.assertIn("CFG_MODEL_PROFILE_DEEP", deep["mismatches"][0])
+
+    def test_diagnose_shipped_fallback_uses_same_receipt_as_resolve_config(self):
+        root = self.make_root(adapter="codex")
+        home = root / "home"  # no user file at all -> shipped fallback
+        report = config.diagnose("codex", runtime=home, source_root=root)
+        _, receipt = config.resolve_config("codex", runtime=home, source_root=root)
+        self.assertEqual(report["receipt"], receipt.as_dict())
+        self.assertEqual(report["deep"]["mismatches"], [])
+
+    def test_diagnose_cli_prints_json(self):
+        root = self.make_root(adapter="codex")
+        home = root / "home"
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "utilities" / "model_config.py"), "--adapter", "codex",
+             "--runtime-home", str(home), "--source-root", str(root), "--diagnose"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertIn("receipt", payload)
+        self.assertIn("deep", payload)
 
     def test_bridge_quotes_metacharacters_and_receipt(self):
         root = self.make_root()

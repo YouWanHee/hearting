@@ -377,12 +377,19 @@ resolution remains available through `preflight.sh role`; a compiled registered
 route additionally seals one of these profiles from the single
 `adapters/codex/config/models.conf` source:
 
-| Model profile | Codex realization | Registered topology use |
+Each row's tier/effort is whatever `CFG_MODEL_PROFILE_<PROFILE>` and the
+matching `CFG_TIER_<TIER>_EFFORT` resolve to in the effective (user-or-shipped)
+`models.conf` — read `adapters/codex/bin/preflight.sh model-config` for the
+live mapping rather than treating the labels below as a fixed pin; the
+shipped defaults are shown only as an illustration and are the population
+most likely to drift when the shipped file changes:
+
+| Model profile | Codex realization (shipped default shown) | Registered topology use |
 |---|---|---|
-| `deep` | configured deep tier / `xhigh` | standard+ ownership, convergence, and highest-risk legs |
-| `balanced-deep` | configured deep tier / `medium` | quick one-shot conduction and subordinate deep-model judgment at a lower coordination budget |
-| `light` | configured light tier / `medium` | routine implementation, verification, reporting, and breadth legs |
-| `mini` | configured mini tier / `medium` | lifecycle and micro-semantic helpers only; substantive dispatch-depth-1/2 work is rejected |
+| `deep` | configured deep tier / configured deep effort (shipped: `xhigh`; an Astra Ultra opt-in changes this coherently, see `models.conf` comments) | standard+ ownership, convergence, and highest-risk legs |
+| `balanced-deep` | configured deep tier / configured balanced-deep effort (shipped: `medium`) | quick one-shot conduction and subordinate deep-model judgment at a lower coordination budget |
+| `light` | configured light tier / configured light effort (shipped: `medium`) | routine implementation, verification, reporting, and breadth legs |
+| `mini` | configured mini tier / configured mini effort (shipped: `low`, not `medium` — mini rides the light model at a lower effort step) | lifecycle and micro-semantic helpers only; substantive dispatch-depth-1/2 work is rejected |
 
 Non-route role compatibility overrides remain explicit and config-derived:
 
