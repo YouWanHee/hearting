@@ -2417,6 +2417,11 @@ def _route_record_launch_home(path: Path):
     return value
 
 
+# `capability-route.py` names every route record exactly `{route_id}.json`, and
+# a route id is `"rt-" + route_hash[:16]` (16 lowercase hex).
+_CANONICAL_ROUTE_NAME_RE = re.compile(r"^rt-[0-9a-f]{16}\.json$")
+
+
 def _open_route_launch_homes(environ: dict[str, str]) -> tuple[list[tuple[str, str]], str]:
     """`([(route_id, launch_home_path), ...], unreliable_reason)`.
 
@@ -2460,7 +2465,19 @@ def _open_route_launch_homes(environ: dict[str, str]) -> tuple[list[tuple[str, s
         except OSError:
             return [], f"route-discovery-unreliable:{routes_dir}"
         for entry in entries:
-            if entry.name.endswith(".outcome.json"):
+            if not _CANONICAL_ROUTE_NAME_RE.fullmatch(entry.name):
+                # Select route records by the name `canonical_route_path()`
+                # actually writes, rather than skipping the sidecar shapes we
+                # happen to know about. This used to exclude `.outcome.json`
+                # only, so the later `.gate-release.json` sidecar was read as a
+                # route record, came back undecidable, and made the whole scan
+                # unreliable -- which marks EVERY release in use and disables
+                # release pruning entirely. Measured 2026-09-06: 20 releases,
+                # 606 MB, zero open attempts, all retained by one 354-byte
+                # sidecar. A denylist of sidecars is a list that silently grows
+                # stale; the allowlist is the naming contract this function's
+                # own docstring already relies on to take `route_id` from the
+                # stem.
                 continue
             scanned += 1
             if scanned > _ROUTE_SCAN_MAX_FILES:

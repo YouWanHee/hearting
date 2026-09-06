@@ -22,6 +22,7 @@ import codex_launcher  # noqa: E402
 import fixture_env  # noqa: E402
 import installer  # noqa: E402
 import manifest  # noqa: E402
+import distribution  # noqa: E402
 import runtime_activation  # noqa: E402
 import safe_fs  # noqa: E402
 
@@ -321,6 +322,90 @@ class DeletionSafetyTest(unittest.TestCase):
         manifest_path.write_bytes(b"{not-json")
         with self.assertRaisesRegex(ValueError, "ownership-unproved"):
             manifest.load_ownership_manifest(manifest_path, "codex", "global")
+
+
+class ReleaseScanSelectsRouteRecordsTest(unittest.TestCase):
+    """One sidecar must not disable release pruning (measured 2026-09-06).
+
+    `_open_route_launch_homes` globbed `*.json` in the routes directory and
+    skipped only `.outcome.json`. The later `.gate-release.json` sidecar was
+    therefore read as a route record, came back undecidable, and made the whole
+    scan unreliable -- and an unreliable scan marks EVERY release in use. On
+    this machine that held 20 releases and 606 MB with zero open attempts,
+    behind one valid 354-byte sidecar.
+
+    The fix selects by the name `canonical_route_path()` writes, so a sidecar
+    shape nobody has invented yet cannot re-break it.
+    """
+
+    ROUTE_ID = "rt-da62cded1408b893"
+
+    def _routes_dir(self, base: Path) -> Path:
+        routes = base / ".agent_reports" / ".runtime" / "routes"
+        routes.mkdir(parents=True)
+        return routes
+
+    def _record(self, path: Path, launch_home: str) -> None:
+        path.write_text(json.dumps({
+            "route_id": path.stem, "schema_version": 2,
+            "launch_compatibility_tuple": {
+                "launch_home": {"kind": "launch_home", "path": launch_home}},
+        }), encoding="utf-8")
+
+    def _scan(self, base: Path):
+        with mock.patch.object(
+            distribution, "_open_route_artifact_roots",
+            return_value=([str(base / ".agent_reports")], [], ""),
+        ):
+            return distribution._open_route_launch_homes({})
+
+    def test_a_gate_release_sidecar_does_not_make_the_scan_unreliable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            routes = self._routes_dir(base)
+            self._record(routes / f"{self.ROUTE_ID}.json", str(base / "release"))
+            (routes / f"{self.ROUTE_ID}.gate-release.json").write_text(json.dumps({
+                "route_id": self.ROUTE_ID, "schema_version": 1,
+                "gate_releases": [{"gate": "frame-review", "decision": "proceed"}],
+            }), encoding="utf-8")
+            results, reason = self._scan(base)
+            self.assertEqual(reason, "", "one sidecar must not poison the scan")
+            self.assertEqual([route_id for route_id, _ in results], [self.ROUTE_ID])
+
+    def test_every_sidecar_shape_beside_a_route_record_is_ignored(self):
+        # Not a denylist of the shapes we happen to know: anything that is not
+        # `<route_id>.json` is not a route record.
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            routes = self._routes_dir(base)
+            self._record(routes / f"{self.ROUTE_ID}.json", str(base / "release"))
+            # Sidecars of a DIFFERENT route: an `.outcome.json` beside this
+            # route's own record would (correctly) mark it closed, which is a
+            # separate rule and not what this test is about.
+            other = "rt-0000000000000000"
+            for name in (
+                f"{other}.outcome.json",
+                f"{self.ROUTE_ID}.gate-release.json",
+                f"{other}.superseded-20260904T000000Z.outcome.json",
+                f"{self.ROUTE_ID}.some-future-sidecar.json",
+                "notes.json",
+                "rt-NOTHEX.json",
+            ):
+                (routes / name).write_text("{ not a route record", encoding="utf-8")
+            results, reason = self._scan(base)
+            self.assertEqual(reason, "")
+            self.assertEqual([route_id for route_id, _ in results], [self.ROUTE_ID])
+
+    def test_a_genuinely_unparsable_route_record_still_fails_closed(self):
+        # The undecidable-is-in-use rule is the point of the scan and must
+        # survive: only the SELECTION narrowed, not the judgement.
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            routes = self._routes_dir(base)
+            (routes / f"{self.ROUTE_ID}.json").write_text("{ truncated", encoding="utf-8")
+            results, reason = self._scan(base)
+            self.assertTrue(reason.startswith("route-record-unparsable:"), reason)
+            self.assertEqual(results, [])
 
 
 if __name__ == "__main__":
