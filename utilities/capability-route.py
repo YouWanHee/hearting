@@ -922,7 +922,7 @@ def build_continuation_route(
         "tracked_gate_evidence","spec_touch","cwd","source_commit",
         "registry_digest","dispatch_defaults_digest","dispatch_allocation",
         "owner_harness_policy","selection","human_gates","human_gate_bindings",
-        "confirmation_mode",
+        "confirmation_mode","small_work_confirmation",
         "resume_retry_boundaries","dispatch_evidence","dispatch_contract_version",
         "dispatch_evidence_scope_version","registered_headless_candidates",
         "registered_headless_policy","unit_catalog_digest","validation_basis",
@@ -1814,6 +1814,19 @@ def _seal_confirmation_mode():
         return DEFAULTS.DEFAULT_CONFIRMATION_MODE
     return DEFAULTS.query_confirmation_mode(cfg)
 
+def _seal_small_work_confirmation():
+    """SD-136: seal `confirmation.small_work` (notice|card) the same way as
+    `_seal_confirmation_mode`: absent/corrupt config -> the shipped default,
+    never None."""
+    config_path = DEFAULTS.default_config_path()
+    if not os.path.exists(config_path):
+        return DEFAULTS.DEFAULT_SMALL_WORK_CONFIRMATION
+    try:
+        cfg = DEFAULTS.load_and_validate(config_path, DEFAULTS.default_topology_path())
+    except (DEFAULTS.DefaultsConfigError, OSError, json.JSONDecodeError):
+        return DEFAULTS.DEFAULT_SMALL_WORK_CONFIRMATION
+    return DEFAULTS.query_small_work_confirmation(cfg)
+
 
 def _validation_basis():
     """Seal which install root produced `registry_digest`/`unit_catalog_digest`.
@@ -1850,7 +1863,8 @@ def compile_route(capability, capability_mode, requested_intensity, cwd, artifac
                   predicates=(), signals=(), transport=None,
                   transport_evidence="caller-selected", inline_reason=None,
                   tracking="tracked", tracked_gate_evidence=None, dispatch_evidence=None,
-                  registered_headless_evidence=None, slug=None):
+                  registered_headless_evidence=None, slug=None,
+                  route_origin="preset", shape=None):
     registry=TOPO.load_registry(); TOPO.validate_registry(registry)
     recipe=TOPO.resolve_recipe(registry, capability, capability_mode)
     return _compile_from_recipe(
@@ -1859,7 +1873,281 @@ def compile_route(capability, capability_mode, requested_intensity, cwd, artifac
         transport_evidence=transport_evidence, inline_reason=inline_reason,
         tracking=tracking, tracked_gate_evidence=tracked_gate_evidence,
         dispatch_evidence=dispatch_evidence,
-        registered_headless_evidence=registered_headless_evidence, slug=slug)
+        registered_headless_evidence=registered_headless_evidence, slug=slug,
+        route_origin=route_origin, shape=shape)
+
+# ---------------------------------------------------------------------------
+# compose: the preset-free work route (SD-135).
+#
+# `compile` asks the caller to pick a registry recipe by entry-router trigger
+# and to restate ~15 flags plus evidence files by hand. `compose` inverts that:
+# the caller names the *shape* of the work (direct / solo / staged) and, for a
+# staged shape, the stage subgraph it actually wants; every other flag and both
+# evidence probes default from the checkout and the registry. The result goes
+# through the SAME validator, sealer, verifier and guards as a preset route --
+# composition changes route shape only (WORKFLOW §7 compose-on-demand).
+# ---------------------------------------------------------------------------
+COMPOSE_SHAPES = ("direct", "solo", "staged")
+SHAPE_INTENSITY = {"direct": "direct", "solo": "quick", "staged": "standard"}
+INTENSITY_SHAPE = {"direct": "direct", "quick": "solo"}
+ROUTE_ORIGINS = ("preset", "compose")
+COMPOSE_DEFAULT_CAPABILITY = "autopilot-code"
+COMPOSE_DEFAULT_CHILDREN = ("claude", "codex")
+COMPOSE_SPEC_CANDIDATES = ("spec/prd.md",)
+
+
+def shape_for_intensity(effective):
+    return INTENSITY_SHAPE.get(effective, "staged")
+
+
+def parse_graph_spec(text):
+    """`execute,test,report` or `execute:dev/refactor,test` -> [(id, unit|None)]."""
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("compose-graph-empty")
+    rows = []
+    for raw in text.split(","):
+        item = raw.strip()
+        if not item:
+            raise ValueError("compose-graph-empty-node")
+        node_id, _, unit = item.partition(":")
+        node_id = node_id.strip()
+        if not re.fullmatch(r"[a-z][a-z0-9-]*", node_id):
+            raise ValueError(f"compose-graph-node-invalid:{node_id}")
+        rows.append((node_id, unit.strip() or None))
+    ids = [row[0] for row in rows]
+    if len(ids) != len(set(ids)):
+        raise ValueError("compose-graph-duplicate-node")
+    return rows
+
+
+def compose_subgraph_recipe(registry, base_recipe, graph_spec):
+    """Cut the caller's stage subgraph out of the capability's own recipe.
+
+    The nodes keep their unit, kind, gate, write scope, profile and permissions;
+    only the edges change: the subgraph is re-linked in the caller's order, the
+    last node becomes the terminal, a human gate a kept node raised is rebound
+    to the entry of the node that now follows it (dropped when nothing
+    follows), and a parallel group survives only when its anchor is kept and is
+    not the new terminal (G6). Validation stays with `_validate_recipe` --
+    this function never re-implements a rule, it only assembles.
+    """
+    base_nodes = {node["id"]: node for node in base_recipe["standard_plus"]["nodes"]}
+    ids = [node_id for node_id, _ in graph_spec]
+    unknown = [node_id for node_id in ids if node_id not in base_nodes]
+    if unknown:
+        raise ValueError(
+            "compose-graph-unknown-node:" + ",".join(unknown)
+            + " (available: " + ",".join(base_nodes) + ")"
+        )
+    nodes = []
+    overrides = {}
+    for index, (node_id, unit) in enumerate(graph_spec):
+        node = json.loads(json.dumps(base_nodes[node_id]))
+        if unit:
+            choices = node.get("unit_choices")
+            if choices is not None and unit not in choices:
+                raise ValueError(
+                    f"compose-unit-not-in-choices:{node_id}:{unit} (choices: {','.join(choices)})"
+                )
+            if node.get("kind") in ("capability-owner", "resource-runner"):
+                raise ValueError(f"compose-unit-override-reserved:{node_id}")
+            node["unit"] = unit
+            node["role"] = TOPO._unit_frontmatter(unit)["role"]
+            overrides[node_id] = unit
+        previous = nodes[-1] if nodes else None
+        node["depends_on"] = [previous["id"]] if previous else []
+        node["inputs"] = list(previous["outputs"]) if previous else ["task"]
+        node.pop("terminal", None)
+        node.pop("terminal_gate", None)
+        node.pop("continuation", None)
+        node.pop("parallel_group", None)
+        nodes.append(node)
+    terminal = nodes[-1]
+    terminal["terminal"] = True
+    terminal["terminal_gate"] = terminal["completion_gate"]
+    if terminal.get("advance_class") != "model-required":
+        terminal["advance_class"] = "model-required"
+        terminal["model_required_reason"] = "terminal-report"
+    # Human gates: a base node whose continuation was `human-gate G` keeps G
+    # only when a graph node follows it; G is rebound to that node's entry.
+    bindings, gates = [], []
+    for index, node in enumerate(nodes[:-1]):
+        base = base_nodes[node["id"]]
+        continuation = base.get("continuation") or {}
+        if continuation.get("kind") == "human-gate":
+            gate = continuation["gate"]
+            bindings.append({"gate": gate, "node": nodes[index + 1]["id"], "position": "entry"})
+            gates.append(gate)
+            node["continuation"] = {"kind": "human-gate", "gate": gate}
+        elif node.get("kind") == "resource-runner":
+            node["continuation"] = {"kind": "supervised"}
+        else:
+            node["continuation"] = {"kind": "inline-next"}
+    kept_ids = set(ids)
+    groups = [
+        json.loads(json.dumps(group))
+        for group in base_recipe["standard_plus"].get("parallel_groups") or []
+        if group["node"] in kept_ids and group["node"] != terminal["id"]
+    ]
+    extensions = [
+        json.loads(json.dumps(row))
+        for row in base_recipe.get("conditional_extensions") or []
+        if set(row.get("after") or []) <= kept_ids
+        and {ref.get("node") for ref in row.get("source_outputs") or []} <= kept_ids
+    ]
+    recipe = {
+        "capability": base_recipe["capability"],
+        "modes": list(base_recipe["modes"]),
+        "topology_class": base_recipe["topology_class"],
+        "direct_predicates": list(base_recipe["direct_predicates"]),
+        "promotion_signals": list(base_recipe["promotion_signals"]),
+        "artifact_scope": json.loads(json.dumps(base_recipe["artifact_scope"])),
+        "quick": json.loads(json.dumps(base_recipe["quick"])),
+        "standard_plus": {
+            "topology": base_recipe["standard_plus"].get("topology", base_recipe["topology_class"]),
+            "owner_dispatch_depth": base_recipe["standard_plus"]["owner_dispatch_depth"],
+            "max_dispatch_depth": max(
+                (node.get("dispatch_depth", 0) for node in nodes if node.get("kind") != "resource-runner"),
+                default=0,
+            ),
+            "nodes": nodes,
+        },
+        "conditional_extensions": extensions,
+        "completion_gates": sorted({node["completion_gate"] for node in nodes}),
+        "human_gates": sorted(set(gates)),
+        "human_gate_bindings": bindings,
+        "resume_retry_boundaries": list(ids),
+        "compose": {"origin": "compose", "shape": "staged", "graph": list(ids),
+                    "unit_overrides": overrides, "base_capability": base_recipe["capability"]},
+    }
+    if groups:
+        recipe["standard_plus"]["parallel_groups"] = groups
+    return recipe
+
+
+def _compose_default_jobs():
+    inherited = os.environ.get("AGENT_DISPATCH_JOBS")
+    if inherited:
+        return Path(inherited)
+    return stable_state_root(os.environ) / "jobs.log"
+
+
+def _compose_readiness(cwd, jobs, parent_harness, children):
+    spec = importlib.util.spec_from_file_location(
+        "hearting_dispatch_readiness", ROOT / "utilities" / "dispatch-readiness.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    try:
+        return module.generate(
+            worktree=Path(cwd), jobs=Path(jobs),
+            owner_harnesses=[parent_harness], child_harnesses=list(children),
+        )
+    except module.ReadinessError as exc:
+        raise ValueError(f"compose-readiness-unavailable:{exc}") from exc
+
+
+def compose_spec_read(cwd, artifact_root, explicit):
+    """`auto` is honest, not permissive: with no spec candidate it records the
+    absence; with one present it refuses and names the file the caller must
+    read and assert (`--spec-read <source>`). The spec-read gate is a real
+    invariant (WORKFLOW §7.0); compose only removes the boilerplate case."""
+    if explicit not in (None, "", "auto"):
+        return {"satisfied": explicit.lower() not in ("0", "false", "no"), "source": explicit}
+    present = []
+    for root in (Path(cwd), Path(artifact_root)):
+        for rel in COMPOSE_SPEC_CANDIDATES:
+            candidate = root / rel
+            if candidate.is_file():
+                present.append(str(candidate))
+    if present:
+        raise ValueError("compose-spec-read-required:" + ",".join(sorted(set(present))))
+    return {"satisfied": True, "source": "compose-auto: no spec/prd.md under cwd or artifact root"}
+
+
+def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artifact_root,
+                  intensity=None, signals=(), spec_read=None, drift_verdict=None,
+                  tracking=None, artifact_guard=None, children=None, parent_harness="claude",
+                  dispatch_evidence=None, registered_headless_evidence=None,
+                  transport_evidence="compose-default", jobs=None):
+    """Resolve every default, then compile through the ordinary sealer."""
+    if shape not in COMPOSE_SHAPES:
+        raise ValueError(f"compose-shape-invalid:{shape}")
+    if shape != "staged" and graph:
+        raise ValueError(f"compose-graph-only-staged:{shape}")
+    if shape == "staged" and not graph:
+        raise ValueError("compose-graph-required")
+    registry = TOPO.load_registry()
+    base = next((r for r in registry["recipes"] if r["capability"] == capability), None)
+    if base is None:
+        raise ValueError(f"compose-capability-unknown:{capability}")
+    if capability_mode is None:
+        capability_mode = "dev" if "dev" in base["modes"] else sorted(base["modes"])[0]
+    if capability_mode not in base["modes"]:
+        raise ValueError(f"compose-mode-unknown:{capability_mode} (modes: {','.join(sorted(base['modes']))})")
+    requested = intensity or SHAPE_INTENSITY[shape]
+    if requested not in ORDER:
+        raise ValueError("invalid intensity")
+    if shape == "direct" and requested != "direct":
+        raise ValueError("compose-shape-intensity-mismatch:direct")
+    if shape == "solo" and requested != "quick":
+        raise ValueError("compose-shape-intensity-mismatch:solo")
+    if shape == "staged" and ORDER[requested] < ORDER["standard"]:
+        raise ValueError("compose-shape-intensity-mismatch:staged")
+    cwd = str(Path(cwd).resolve(strict=True))
+    artifact_root = str(Path(artifact_root).resolve())
+    if tracking is None:
+        tracking = "tracked" if shape == "staged" else "untracked"
+    gate = {
+        "spec_read": compose_spec_read(cwd, artifact_root, spec_read),
+        "drift_verdict": drift_verdict or "no-spec-impact: compose default (caller asserted no spec-significant change)",
+        "workflow_mode": tracking,
+        "artifact_guard": {"satisfied": True, "source": artifact_guard or "compose-prechecked"},
+    }
+    predicates = list(base["direct_predicates"]) if shape == "direct" else []
+    signals = sorted(set(signals or ()))
+    if shape == "direct" and signals:
+        raise ValueError("compose-direct-signals-conflict")
+    readiness = None
+    if shape == "staged" and dispatch_evidence is None:
+        readiness = _compose_readiness(cwd, jobs or _compose_default_jobs(), parent_harness,
+                                       children or COMPOSE_DEFAULT_CHILDREN)
+        dispatch_evidence = {"tuples": readiness["tuples"], "native_subagent": []}
+    if shape == "solo" and registered_headless_evidence is None:
+        readiness = readiness or _compose_readiness(cwd, jobs or _compose_default_jobs(),
+                                                    parent_harness, children or COMPOSE_DEFAULT_CHILDREN)
+        registered_headless_evidence = {"candidates": readiness["candidates"]}
+    common = dict(
+        signals=signals, transport=None, transport_evidence=transport_evidence,
+        tracking=tracking, tracked_gate_evidence=gate, slug=slug,
+        dispatch_evidence=dispatch_evidence,
+        registered_headless_evidence=registered_headless_evidence,
+        route_origin="compose", shape=shape,
+    )
+    if shape == "staged":
+        recipe = compose_subgraph_recipe(registry, base, parse_graph_spec(graph))
+        route = compile_composed_route(
+            recipe, capability_mode, requested, cwd, artifact_root,
+            predicates=predicates, inline_reason=None, **common)
+    else:
+        route = compile_route(
+            capability, capability_mode, requested, cwd, artifact_root,
+            predicates=predicates, inline_reason="atomic-direct" if shape == "direct" else None,
+            **common)
+    return route
+
+
+def compose_card(route):
+    """One-line `[경로]` notice the acting session pastes instead of a card."""
+    shape = route.get("selection", {}).get("shape") or shape_for_intensity(route["effective_intensity"])
+    ids = [node["id"] for node in route["nodes"]]
+    graph = "→".join(ids) if route.get("composed") else (ids[0] if ids else "-")
+    gates = ",".join(sorted({row["gate"] for row in route.get("human_gate_bindings") or []})) or "없음"
+    return (
+        f"[경로] {route['capability']} · {shape}({route['effective_intensity']}) {graph}"
+        f" · route {route['route_id']} · origin compose · 사람 게이트 {gates}\n"
+        f"  cwd {route['cwd']} · slug {route.get('slug', '-')}"
+    )
+
 
 def compile_composed_route(composed_recipe, capability_mode, requested_intensity, cwd, artifact_root,
                            **kwargs):
@@ -1883,7 +2171,9 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
                          cwd, artifact_root, predicates=(), signals=(), transport=None,
                          transport_evidence="caller-selected", inline_reason=None,
                          tracking="tracked", tracked_gate_evidence=None, dispatch_evidence=None,
-                         registered_headless_evidence=None, slug=None, composed=False):
+                         registered_headless_evidence=None, slug=None, composed=False,
+                  route_origin="preset", shape=None):
+    if route_origin not in ROUTE_ORIGINS: raise ValueError("invalid route origin")
     cwd=Path(cwd).resolve(strict=True); artifact=Path(artifact_root).resolve()
     if not cwd.is_absolute() or not artifact.is_absolute(): raise ValueError("cwd and artifact root must be absolute")
     slug_fields={}
@@ -2004,10 +2294,12 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
       "dispatch_allocation":dispatch_allocation,
       "owner_harness_policy":owner_harness_policy,
       "confirmation_mode":_seal_confirmation_mode(),
+      "small_work_confirmation":_seal_small_work_confirmation(),
       "selection":{"direct_predicates":predicates,"promotion_signals":[{"signal":s,"source":"caller"} for s in signals],
                    "selection_basis":selection_basis,
                    "escalation_basis":[{"signal":s,"source":"caller"} for s in signals],
-                   "transport":transport,"transport_evidence":transport_evidence,"inline_reason":inline_reason},
+                   "transport":transport,"transport_evidence":transport_evidence,"inline_reason":inline_reason,
+                   "route_origin":route_origin,"shape":shape or shape_for_intensity(effective)},
       "continuation_budget":continuation_budget,
       "nodes":nodes,"parallel_groups":_realized_parallel_groups(nodes),
       "conditional_extensions":_realize_conditional_extensions(recipe, effective),
@@ -4668,6 +4960,68 @@ def complete_subsession_stage(route, node, node_id, evidence, manifest_path, job
         )
     return marker,{"status":"stage-gate-aggregated","sessions":len(manifest["sessions"])}
 
+def _compose_artifact_root(cwd):
+    script=ROOT/"utilities"/"artifact-root.sh"
+    result=subprocess.run(["sh",str(script),str(cwd)],text=True,capture_output=True,check=False)
+    root=(result.stdout or "").strip().splitlines()[-1] if (result.stdout or "").strip() else ""
+    if result.returncode!=0 or not root:
+        raise ValueError("compose-artifact-root-unresolved:"+(result.stderr or "").strip()[:200])
+    return root
+
+
+def _emit_compiled_route(a,route,artifact_root,output=None):
+    """Shared tail of compile/compose: runtime-root check, canonical write-once, owner binding, prints."""
+    output=output if output is not None else getattr(a,"output",None)
+    vbasis=route.get("validation_basis") or {}
+    if vbasis.get("runtime_root_match") is False:
+        launch_tuple=route.get("launch_compatibility_tuple") or {}
+        expected=launch_tuple.get("registry_root")
+        observed=launch_tuple.get("runtime_root")
+        print("route_file_written=0 registered=0 started=0 child_spawned=0",file=sys.stderr)
+        print(_RUNTIME_ROOT_HINT,file=sys.stderr)
+        raise ValueError(
+            "launch-runtime-root-mismatch "
+            f"expected={canonical(expected).decode()} observed={canonical(observed).decode()}"
+        )
+    expected_output=canonical_route_path(artifact_root,route["route_id"])
+    if output:
+        output_path=Path(output)
+        if classify_route_location(output_path,artifact_root) != "canonical":
+            raise ValueError("route-output-outside-canonical")
+        if not route_path_is_exact(output_path,artifact_root,route["route_id"]):
+            raise ValueError("route-output-alias-basename")
+    else:
+        output_path=expected_output
+    write_once(output_path,route)
+    retired=retire_stale_closure(output_path)
+    if retired is not None:
+        print(f"route_closure_retired={retired}",file=sys.stderr)
+    # A registered depth-1 owner can compile its first route only after it
+    # has started.  Attach those immutable bytes to the exact active owner
+    # attempt; non-owner and ordinary interactive compiles remain no-ops.
+    try:
+        from owner_route_binding import (
+            OwnerRouteBindingError,
+            publish_owner_route_attachment_from_environment,
+        )
+        route_for_binding = dict(route)
+        route_for_binding["route_file"] = str(output_path.resolve())
+        attachment = publish_owner_route_attachment_from_environment(
+            os.environ.get("AGENT_DISPATCH_JOBS", ""),
+            target_route=route_for_binding,
+            environ=os.environ,
+        ) if os.environ.get("AGENT_DISPATCH_ATTEMPT_ID") else None
+    except OwnerRouteBindingError as exc:
+        print(
+            f"route_file_written=1 owner_route_binding_written=0 reason={exc}",
+            file=sys.stderr,
+        )
+        raise ValueError(str(exc)) from exc
+    if attachment is not None:
+        print("owner_route_binding_written=1", file=sys.stderr)
+    print(f"route_file={output_path.resolve()}",file=sys.stderr)
+    print(json.dumps(route,sort_keys=True))
+
 def main():
     p=argparse.ArgumentParser(); sub=p.add_subparsers(dest="command",required=True)
     c=sub.add_parser("compile"); c.add_argument("--capability",required=True); c.add_argument("--capability-mode",default="default")
@@ -4682,6 +5036,25 @@ def main():
     c.add_argument("--spec-read",required=True); c.add_argument("--drift-verdict",required=True)
     c.add_argument("--workflow-mode",choices=sorted(TRACKING),required=True); c.add_argument("--artifact-guard",required=True)
     c.add_argument("--output")
+    cp=sub.add_parser("compose",help="preset-free work route: name the shape (and stage subgraph), defaults fill the rest")
+    cp.add_argument("--slug",required=True)
+    cp.add_argument("--shape",choices=COMPOSE_SHAPES,default=None,help="direct (inline) | solo (one registered depth-1 owner) | staged (owner + your stage subgraph); default staged when --graph is given, else direct")
+    cp.add_argument("--graph",default=None,help="comma list of the capability's stage ids in your order, optional :unit override, e.g. execute,test,report or execute:dev/refactor,test")
+    cp.add_argument("--capability",default=COMPOSE_DEFAULT_CAPABILITY); cp.add_argument("--capability-mode",default=None)
+    cp.add_argument("--intensity",default=None,help="default by shape: direct/quick/standard; staged accepts strong+")
+    cp.add_argument("--cwd",default=None,help="default: current directory"); cp.add_argument("--artifact-root",default=None,help="default: utilities/artifact-root.sh for cwd")
+    cp.add_argument("--signal",action="append",default=[])
+    cp.add_argument("--spec-read",default="auto",help="auto: refuse when a spec/prd.md exists unless you name it here")
+    cp.add_argument("--drift-verdict",default=None); cp.add_argument("--tracking",choices=sorted(TRACKING),default=None)
+    cp.add_argument("--artifact-guard",default=None)
+    cp.add_argument("--children",default=None,help="comma list of child harnesses to probe for staged/solo (default claude,codex)")
+    cp.add_argument("--parent-harness",default="claude",choices=("claude","codex","opencode"))
+    cp.add_argument("--jobs",default=None,help="registry for the readiness probe (default AGENT_DISPATCH_JOBS or the stable state root)")
+    cp.add_argument("--dispatch-evidence",help="checked evidence JSON (skips the live probe)")
+    cp.add_argument("--registered-headless-evidence",help="checked quick candidates JSON (skips the live probe)")
+    cp.add_argument("--transport-evidence",default="compose-default")
+    cp.add_argument("--explain",action="store_true",help="print the [경로] card and the sealed graph without writing the route")
+    cp.add_argument("--output")
     co=sub.add_parser("continuation")
     co.add_argument("--source-route",required=True)
     co.add_argument("--resume-from-node",required=True)
@@ -4730,6 +5103,36 @@ def main():
     st=sub.add_parser("status"); st.add_argument("--artifact-root",required=True)
     st.add_argument("--open-only",action="store_true",help="list only routes with no recorded outcome")
     a=p.parse_args()
+    if a.command=="compose":
+        shape=a.shape or ("staged" if a.graph else "direct")
+        cwd=a.cwd or os.getcwd()
+        artifact_root=a.artifact_root or _compose_artifact_root(cwd)
+        route=compose_route(
+            capability=a.capability,capability_mode=a.capability_mode,shape=shape,graph=a.graph,
+            slug=a.slug,cwd=cwd,artifact_root=artifact_root,intensity=a.intensity,signals=a.signal,
+            spec_read=a.spec_read,drift_verdict=a.drift_verdict,tracking=a.tracking,
+            artifact_guard=a.artifact_guard,
+            children=[c.strip() for c in a.children.split(",") if c.strip()] if a.children else None,
+            parent_harness=a.parent_harness,
+            dispatch_evidence=json.loads(Path(a.dispatch_evidence).read_text()) if a.dispatch_evidence else None,
+            registered_headless_evidence=(json.loads(Path(a.registered_headless_evidence).read_text())
+                                          if a.registered_headless_evidence else None),
+            transport_evidence=a.transport_evidence,jobs=a.jobs,
+        )
+        print(compose_card(route),file=sys.stderr)
+        if a.explain:
+            print("route_file_written=0 explain=1",file=sys.stderr)
+            print(json.dumps({"route_id":route["route_id"],"capability":route["capability"],
+                              "effective_intensity":route["effective_intensity"],"shape":shape,
+                              "composed":bool(route.get("composed")),
+                              "nodes":[{"id":n["id"],"unit":n.get("unit"),"dispatch_depth":n.get("dispatch_depth"),
+                                        "completion_gate":n.get("completion_gate"),"terminal":n.get("terminal") is True}
+                                       for n in route["nodes"]],
+                              "human_gates":route.get("human_gates"),"parallel_groups":route.get("parallel_groups"),
+                              "tracked_gate_evidence":route.get("tracked_gate_evidence")},sort_keys=True))
+            return 0
+        _emit_compiled_route(a,route,artifact_root)
+        return 0
     if a.command=="compile":
         gate={"spec_read":{"satisfied":a.spec_read.lower() not in ("0","false","no"),"source":a.spec_read},
               "drift_verdict":a.drift_verdict,"workflow_mode":a.workflow_mode,
@@ -4759,55 +5162,7 @@ def main():
                 a.tracking,gate,dispatch_evidence,registered_headless_evidence,
                 slug=a.slug,
             )
-        vbasis=route.get("validation_basis") or {}
-        if vbasis.get("runtime_root_match") is False:
-            launch_tuple=route.get("launch_compatibility_tuple") or {}
-            expected=launch_tuple.get("registry_root")
-            observed=launch_tuple.get("runtime_root")
-            print("route_file_written=0 registered=0 started=0 child_spawned=0",file=sys.stderr)
-            print(_RUNTIME_ROOT_HINT,file=sys.stderr)
-            raise ValueError(
-                "launch-runtime-root-mismatch "
-                f"expected={canonical(expected).decode()} observed={canonical(observed).decode()}"
-            )
-        expected_output=canonical_route_path(a.artifact_root,route["route_id"])
-        if a.output:
-            output_path=Path(a.output)
-            if classify_route_location(output_path,a.artifact_root) != "canonical":
-                raise ValueError("route-output-outside-canonical")
-            if not route_path_is_exact(output_path,a.artifact_root,route["route_id"]):
-                raise ValueError("route-output-alias-basename")
-        else:
-            output_path=expected_output
-        write_once(output_path,route)
-        retired=retire_stale_closure(output_path)
-        if retired is not None:
-            print(f"route_closure_retired={retired}",file=sys.stderr)
-        # A registered depth-1 owner can compile its first route only after it
-        # has started.  Attach those immutable bytes to the exact active owner
-        # attempt; non-owner and ordinary interactive compiles remain no-ops.
-        try:
-            from owner_route_binding import (
-                OwnerRouteBindingError,
-                publish_owner_route_attachment_from_environment,
-            )
-            route_for_binding = dict(route)
-            route_for_binding["route_file"] = str(output_path.resolve())
-            attachment = publish_owner_route_attachment_from_environment(
-                os.environ.get("AGENT_DISPATCH_JOBS", ""),
-                target_route=route_for_binding,
-                environ=os.environ,
-            ) if os.environ.get("AGENT_DISPATCH_ATTEMPT_ID") else None
-        except OwnerRouteBindingError as exc:
-            print(
-                f"route_file_written=1 owner_route_binding_written=0 reason={exc}",
-                file=sys.stderr,
-            )
-            raise ValueError(str(exc)) from exc
-        if attachment is not None:
-            print("owner_route_binding_written=1", file=sys.stderr)
-        print(f"route_file={output_path.resolve()}",file=sys.stderr)
-        print(json.dumps(route,sort_keys=True))
+        _emit_compiled_route(a,route,a.artifact_root)
     elif a.command=="continuation":
         source_path=Path(a.source_route).resolve(strict=True)
         source=verify_route(json.loads(source_path.read_text(encoding="utf-8")))

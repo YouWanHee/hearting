@@ -894,12 +894,20 @@ EOF
     shift
     "$ROOT/adapters/opencode/bin/role-map.sh" "$@"
     ;;
-  route)
-    if [ "${2:-}" != "--capability" ]; then
-      echo "opencode preflight: route requires --capability option form" >&2
-      exit 64
+  compose|route)
+    if [ "$1" = "compose" ]; then
+      # SD-135: preset-free work route (shape/subgraph); same compiler, same
+      # D1 bind rule below (exactly one --output plus --cwd and a session id).
+      subcommand=compose
+      shift
+    else
+      if [ "${2:-}" != "--capability" ]; then
+        echo "opencode preflight: route requires --capability option form" >&2
+        exit 64
+      fi
+      subcommand=compile
+      shift
     fi
-    shift
     # D1: bind only after a successful compile with exactly one --output, a
     # --cwd, and a nonempty OPENCODE_SESSION_ID (from the plugin's shell.env
     # hook). Scan the already-tokenized argv only, never the command text.
@@ -922,7 +930,7 @@ EOF
       prev=$a
     done
     set +e
-    AGENT_HOME="$AGENT_ROOT" python3 "$ROOT/utilities/capability-route.py" compile "$@"
+    AGENT_HOME="$AGENT_ROOT" python3 "$ROOT/utilities/capability-route.py" "$subcommand" "$@"
     compile_rc=$?
     set -e
     bind_rc=0

@@ -842,6 +842,11 @@ def _shell_segments(command: str) -> Iterable[list[str]]:
     return segments
 
 
+# `compile` (preset recipe) and `compose` (SD-135 preset-free shape/subgraph)
+# both seal a route through the same compiler and bind the same way.
+ROUTE_COMPILE_SUBCOMMANDS = ("compile", "compose")
+
+
 def _route_compile_argv(segment: list[str]) -> list[str] | None:
     """Return compile arguments only for an actual router invocation.
 
@@ -868,9 +873,29 @@ def _route_compile_argv(segment: list[str]) -> list[str] | None:
     elif executable != "capability-route.py":
         return None
     index += 1
-    if index >= len(segment) or segment[index] != "compile":
+    if index >= len(segment) or segment[index] not in ROUTE_COMPILE_SUBCOMMANDS:
         return None
     return segment[index + 1:]
+
+
+def _route_compile_subcommand(segment: list[str], command_cwd: Path) -> str | None:
+    """`compile` / `compose` for a recognized router or trusted-preflight
+    invocation, else None. Mirrors the two argv recognizers above."""
+    index = 0
+    while index < len(segment) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", segment[index]):
+        index += 1
+    if index < len(segment) and segment[index] == "command":
+        index += 1
+    if index >= len(segment):
+        return None
+    executable = Path(segment[index]).name
+    if re.fullmatch(r"python(?:3(?:\.\d+)?)?", executable):
+        index += 1
+    if index < len(segment) and Path(segment[index]).name == "capability-route.py":
+        return segment[index + 1] if index + 1 < len(segment) and segment[index + 1] in ROUTE_COMPILE_SUBCOMMANDS else None
+    if index < len(segment) and _trusted_codex_preflight(segment[index], command_cwd):
+        return "compose" if segment[index + 1:index + 2] == ["compose"] else "compile"
+    return None
 
 
 class CompileInvocation(NamedTuple):
@@ -928,6 +953,8 @@ def _codex_route_compile_argv(segment: list[str], command_cwd: Path) -> list[str
         index += 1
     if index >= len(segment) or not _trusted_codex_preflight(segment[index], command_cwd):
         return None
+    if segment[index + 1:index + 2] == ["compose"]:
+        return segment[index + 2:]
     if segment[index + 1:index + 3] != ["route", "--capability"]:
         return None
     return segment[index + 3:]
@@ -976,29 +1003,43 @@ def route_compile_invocations(command: str, cwd: Path) -> list[CompileInvocation
                 unique.append(path)
         if unique:
             invocations.append(CompileInvocation(tuple(unique), command_cwd, artifact_root))
-        elif artifact_root is not None:
+        elif artifact_root is not None or _route_compile_subcommand(segment, command_cwd) == "compose":
             # SD-2.5: `--output` omitted means compile writes to the canonical
             # default (`<artifact-root>/.runtime/routes/<route_id>.json`), whose
             # route_id is only known after the command runs. PostToolUse resolves
             # it from `tool_response` stdout; this zero-output invocation is the
-            # marker that a resolution attempt should happen.
+            # marker that a resolution attempt should happen. `compose` (SD-135)
+            # may also omit `--artifact-root`; the sealed route on stdout then
+            # carries the resolved root, and PostToolUse reads both from there.
+            # A `compile` without `--artifact-root` cannot have succeeded and
+            # stays unmarked, as before.
             invocations.append(CompileInvocation((), command_cwd, artifact_root))
     return invocations
 
 
-def _compiled_route_id(tool_response: object) -> str | None:
-    """Read `route_id` from a compile invocation's stdout (the route JSON)."""
+def _compiled_route_fields(tool_response: object) -> tuple[str | None, Path | None]:
+    """Read `route_id` and `artifact_root` from a compile/compose invocation's
+    stdout (the sealed route JSON)."""
     if not isinstance(tool_response, dict):
-        return None
+        return None, None
     stdout = tool_response.get("stdout")
     if not isinstance(stdout, str) or not stdout.strip():
-        return None
+        return None, None
     try:
         route = json.loads(stdout.strip().splitlines()[-1])
     except (json.JSONDecodeError, IndexError):
-        return None
-    route_id = route.get("route_id") if isinstance(route, dict) else None
-    return route_id if isinstance(route_id, str) and route_id else None
+        return None, None
+    if not isinstance(route, dict):
+        return None, None
+    route_id = route.get("route_id")
+    root = route.get("artifact_root")
+    root_path = Path(root).resolve(strict=False) if isinstance(root, str) and root and Path(root).is_absolute() else None
+    return (route_id if isinstance(route_id, str) and route_id else None), root_path
+
+
+def _compiled_route_id(tool_response: object) -> str | None:
+    """Read `route_id` from a compile invocation's stdout (the route JSON)."""
+    return _compiled_route_fields(tool_response)[0]
 
 
 def route_compile_outputs(command: str, cwd: Path) -> list[Path]:
@@ -1339,16 +1380,17 @@ def hook_main(payload: dict[str, Any], agent_home: Path) -> int:
             session_id
             and len(invocations) == 1
             and not invocations[0].outputs
-            and invocations[0].artifact_root is not None
         ):
             # `--output` was omitted, so compile wrote its canonical default. The
             # route_id is only known from the compiled route JSON on stdout; if
             # that is not readable, bind nothing rather than guess (no silent
-            # over-binding).
-            route_id = _compiled_route_id(payload.get("tool_response"))
-            if route_id:
+            # over-binding). An argv `--artifact-root` wins; a `compose` that
+            # defaulted it is resolved from the same stdout record.
+            route_id, stdout_root = _compiled_route_fields(payload.get("tool_response"))
+            artifact_root = invocations[0].artifact_root or stdout_root
+            if route_id and artifact_root is not None:
                 canonical = (
-                    invocations[0].artifact_root / ".runtime" / "routes" / f"{route_id}.json"
+                    artifact_root / ".runtime" / "routes" / f"{route_id}.json"
                 )
                 try:
                     bind_route(canonical, invocations[0].effective_cwd, session_id, agent_home)

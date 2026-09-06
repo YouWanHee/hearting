@@ -934,6 +934,61 @@ class MaterialRouteGuardTest(unittest.TestCase):
         )
         self.assertEqual(allowed.returncode, 0, allowed.stderr)
 
+    def test_posttool_compose_with_defaults_binds_via_stdout_route(self) -> None:
+        """SD-135: `compose` omits --output and --artifact-root; the sealed
+        route on stdout carries both, and the PostToolUse bind reads them."""
+        command = [
+            sys.executable, str(ROUTER), "compose",
+            "--slug", "compose-fixture", "--cwd", str(self.repo),
+        ]
+        result = subprocess.run(
+            command, text=True, capture_output=True,
+            env={**os.environ, "AGENT_HOME": str(ROOT)},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        route = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(route["selection"]["route_origin"], "compose")
+        self.assertEqual(route["selection"]["shape"], "direct")
+        self.assertIn("[경로] autopilot-code · direct(direct)", result.stderr)
+        canonical = Path(route["artifact_root"]) / ".runtime" / "routes" / f"{route['route_id']}.json"
+        self.assertTrue(canonical.is_file())
+        self.assertEqual(Path(route["artifact_root"]), (self.repo / ".agent_reports").resolve())
+
+        shell_command = " ".join(shlex.quote(part) for part in command)
+        guard_spec = importlib.util.spec_from_file_location("compose_material_route_guard", GUARD)
+        assert guard_spec and guard_spec.loader
+        fixture_guard = importlib.util.module_from_spec(guard_spec)
+        guard_spec.loader.exec_module(fixture_guard)
+        argv = fixture_guard._route_compile_argv(shlex.split(shell_command))
+        self.assertIsNotNone(argv)
+        invocations = fixture_guard.route_compile_invocations(shell_command, self.repo)
+        self.assertEqual(len(invocations), 1)
+        self.assertEqual(invocations[0].outputs, ())
+        self.assertIsNone(invocations[0].artifact_root)
+        payload = {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": shell_command},
+            "tool_response": {"stdout": result.stdout, "stderr": result.stderr},
+            "cwd": str(self.repo),
+            "session_id": "compose-session",
+        }
+        hook_result = subprocess.run(
+            [sys.executable, str(GUARD)], input=json.dumps(payload), text=True,
+            capture_output=True, env={**os.environ, "AGENT_HOME": str(self.home)},
+        )
+        self.assertEqual(hook_result.returncode, 0, hook_result.stderr)
+        allowed = self.guard(
+            "--tool", "Edit", "--file", str(self.repo / "app.py"), session="compose-session"
+        )
+        self.assertEqual(allowed.returncode, 0, allowed.stderr)
+        codex = str(ROOT / "adapters" / "codex" / "bin" / "preflight.sh")
+        tail = fixture_guard._codex_route_compile_argv(
+            [codex, "compose", "--slug", "x", "--cwd", str(self.repo)], self.repo,
+        )
+        self.assertEqual(tail, ["--slug", "x", "--cwd", str(self.repo)])
+        self.assertIsNone(fixture_guard._route_compile_argv(["capability-route.py", "status", "--artifact-root", "x"]))
+
     def test_posttool_compile_without_output_and_without_stdout_does_not_bind(self) -> None:
         command = self._compile_command()
         shell_command = " ".join(shlex.quote(part) for part in command)

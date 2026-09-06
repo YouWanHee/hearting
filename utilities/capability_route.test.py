@@ -4728,4 +4728,93 @@ class FixtureRegistryGuardTest(unittest.TestCase):
         self.assertFalse(self._guard("/tmpfoo/jobs.log"))
         self.assertFalse(self._guard("/var/tmpish/jobs.log"))
 
+
+class ComposeRouteTest(TestRoute):
+ """SD-135: `compose` seals a preset-free shape/subgraph through the same sealer."""
+ def evidence(self):
+  return self.dispatch(self.nested(parent="claude",child="claude"),self.nested(parent="claude",child="codex"))
+ def compose(self,**kw):
+  d=dict(capability="autopilot-code",capability_mode="dev",shape="staged",graph="execute,test,report",slug="compose-fixture",cwd=R.ROOT,artifact_root=R.ROOT,dispatch_evidence=self.evidence())
+  d.update(kw); return R.compose_route(**d)
+ def test_graph_spec_parsing(self):
+  self.assertEqual(R.parse_graph_spec("execute,test:qa/test , report"),[("execute",None),("test","qa/test"),("report",None)])
+  for bad in ("", " , ", "execute,execute", "Bad!"):
+   with self.assertRaises(ValueError): R.parse_graph_spec(bad)
+ def test_staged_subgraph_is_composed_verified_and_linear(self):
+  route=self.compose()
+  self.assertTrue(route["composed"]); self.assertEqual(route["effective_intensity"],"standard")
+  self.assertEqual([n["id"] for n in route["nodes"]],["execute","test","report"])
+  self.assertEqual(route["nodes"][1]["depends_on"],["execute"]); self.assertEqual(route["nodes"][2]["depends_on"],["test"])
+  self.assertTrue(route["nodes"][2]["terminal"]); self.assertEqual(route["nodes"][2]["terminal_gate"],"code-report")
+  self.assertEqual(route["nodes"][0]["continuation"],{"kind":"inline-next"})
+  self.assertEqual(route["nodes"][0]["unit"],"dev/backend"); self.assertEqual(route["nodes"][0]["completion_gate"],"code-execute")
+  self.assertEqual(route["human_gates"],[]); self.assertEqual(route["human_gate_bindings"],[]); self.assertEqual(route["parallel_groups"],[])
+  self.assertEqual(route["selection"]["route_origin"],"compose"); self.assertEqual(route["selection"]["shape"],"staged")
+  self.assertEqual(route["composed_recipe"]["compose"]["graph"],["execute","test","report"])
+  self.assertEqual(route["resume_retry_boundaries"],["execute","test","report"])
+  self.assertEqual(route["conditional_extensions"][0]["after"],["report"])
+  self.assertIn("small_work_confirmation",route)
+  R.verify_route(route,R.ROOT)
+ def test_frame_gate_rebinds_to_the_node_that_follows(self):
+  route=self.compose(graph="frame,execute,test")
+  self.assertEqual(route["human_gate_bindings"],[{"gate":"frame-review","node":"execute","position":"entry"}])
+  frame=next(n for n in route["nodes"] if n["id"]=="frame")
+  self.assertEqual(frame["continuation"],{"kind":"human-gate","gate":"frame-review"})
+  self.assertEqual([g["id"] for g in route["parallel_groups"]],["frame"])
+  self.assertIn("frame-alternative",[n["id"] for n in route["nodes"]])
+  R.verify_route(route,R.ROOT)
+ def test_terminal_frame_drops_its_group_and_gate(self):
+  route=self.compose(graph="frame")
+  self.assertEqual([n["id"] for n in route["nodes"]],["frame"]); self.assertTrue(route["nodes"][0]["terminal"])
+  self.assertEqual(route["parallel_groups"],[]); self.assertEqual(route["human_gates"],[])
+  self.assertEqual(route["conditional_extensions"],[])
+  self.assertEqual(route["nodes"][0]["advance_class"],"model-required")
+  R.verify_route(route,R.ROOT)
+ def test_unit_override_must_be_a_declared_choice(self):
+  route=self.compose(graph="execute:dev/refactor,test")
+  self.assertEqual(route["nodes"][0]["unit"],"dev/refactor"); self.assertEqual(route["nodes"][0]["role"],"fast implementer")
+  self.assertEqual(route["composed_recipe"]["compose"]["unit_overrides"],{"execute":"dev/refactor"})
+  with self.assertRaisesRegex(ValueError,"compose-unit-not-in-choices"): self.compose(graph="execute:qa/test,test")
+ def test_typed_refusals(self):
+  with self.assertRaisesRegex(ValueError,"compose-graph-unknown-node"): self.compose(graph="execute,deploy")
+  with self.assertRaisesRegex(ValueError,"compose-graph-required"): self.compose(graph=None)
+  with self.assertRaisesRegex(ValueError,"compose-graph-only-staged"): self.compose(shape="direct",graph="execute")
+  with self.assertRaisesRegex(ValueError,"compose-shape-intensity-mismatch"): self.compose(intensity="quick")
+  with self.assertRaisesRegex(ValueError,"compose-shape-intensity-mismatch"): self.compose(shape="direct",graph=None,intensity="standard")
+  with self.assertRaisesRegex(ValueError,"compose-capability-unknown"): self.compose(capability="autopilot-nope")
+  with self.assertRaisesRegex(ValueError,"compose-mode-unknown"): self.compose(capability_mode="deploy")
+  with self.assertRaisesRegex(ValueError,"compose-shape-invalid"): self.compose(shape="huge")
+  with self.assertRaisesRegex(ValueError,"compose-direct-signals-conflict"): self.compose(shape="direct",graph=None,signals=["public-api"])
+ def test_direct_shape_is_the_inline_node_with_compose_origin(self):
+  route=self.compose(shape="direct",graph=None,dispatch_evidence=None)
+  self.assertFalse(route.get("composed")); self.assertEqual(route["effective_intensity"],"direct")
+  self.assertEqual(route["nodes"][0]["id"],"inline"); self.assertEqual(route["tracking"],"untracked")
+  self.assertEqual(route["selection"],dict(route["selection"],route_origin="compose",shape="direct"))
+  self.assertEqual(sorted(route["selection"]["direct_predicates"]),sorted(ALL))
+  self.assertEqual(route["tracked_gate_evidence"]["spec_read"]["source"],"compose-auto: no spec/prd.md under cwd or artifact root")
+  R.verify_route(route,R.ROOT)
+  card=R.compose_card(route); self.assertIn("direct(direct)",card); self.assertIn(route["route_id"],card); self.assertIn("사람 게이트 없음",card)
+ def test_solo_shape_is_one_registered_owner(self):
+  cands={"candidates":[{"harness":"claude","transport":"headless","surface":"registered-headless","status":"supported","probe_source":"fixture","probe_time":"2026-09-07T00:00:00Z"}]}
+  route=self.compose(shape="solo",graph=None,dispatch_evidence=None,registered_headless_evidence=cands)
+  self.assertEqual(route["effective_intensity"],"quick"); self.assertEqual(route["nodes"][0]["id"],"one-shot")
+  self.assertEqual(route["selection"]["shape"],"solo"); self.assertEqual(route["selection"]["route_origin"],"compose")
+  R.verify_route(route,R.ROOT)
+ def test_staged_accepts_strong_and_expands_declared_groups(self):
+  route=self.compose(graph="plan,plan-check,execute",intensity="strong")
+  self.assertEqual(route["effective_intensity"],"strong")
+  self.assertEqual(sorted(g["id"] for g in route["parallel_groups"]),["plan","plan-check"])
+  R.verify_route(route,R.ROOT)
+ def test_spec_read_auto_refuses_when_a_spec_exists(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   root=Path(tmp); (root/"spec").mkdir(); (root/"spec"/"prd.md").write_text("# prd\n",encoding="utf-8")
+   with self.assertRaisesRegex(ValueError,"compose-spec-read-required"): R.compose_spec_read(root,root,"auto")
+   self.assertEqual(R.compose_spec_read(root,root,"read spec/prd.md v3")["source"],"read spec/prd.md v3")
+   self.assertTrue(R.compose_spec_read(R.ROOT,R.ROOT,None)["satisfied"])
+ def test_preset_compile_records_preset_origin_and_derived_shape(self):
+  route=R.compile_route(**self.args())
+  self.assertEqual(route["selection"]["route_origin"],"preset"); self.assertEqual(route["selection"]["shape"],"direct")
+  self.assertEqual(R.shape_for_intensity("quick"),"solo"); self.assertEqual(R.shape_for_intensity("thorough"),"staged")
+  with self.assertRaisesRegex(ValueError,"invalid route origin"): R.compile_route(**self.args(route_origin="guess"))
+
 if __name__=="__main__": unittest.main()
