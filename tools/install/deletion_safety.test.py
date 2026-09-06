@@ -407,6 +407,72 @@ class ReleaseScanSelectsRouteRecordsTest(unittest.TestCase):
             self.assertTrue(reason.startswith("route-record-unparsable:"), reason)
             self.assertEqual(results, [])
 
+    def test_an_unrecognised_open_route_record_is_never_skipped_silently(self):
+        # Skipping a real route record removes a release's protection, and that
+        # is the direction that deletes data. A name the reader does not know is
+        # adjudicated by content, not waved through.
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            routes = self._routes_dir(base)
+            self._record(routes / f"{self.ROUTE_ID}.json", str(base / "release"))
+            legacy = routes / "2026-08-13_wwd-eval-labels.json"
+            self._record(legacy, str(base / "other-release"))
+            results, reason = self._scan(base)
+            self.assertTrue(
+                reason.startswith("route-record-unrecognised-name:"), reason)
+            self.assertEqual(results, [])
+
+    def test_a_closed_record_under_a_legacy_name_costs_nothing(self):
+        # 79 such records exist on this machine, all closed. A closed record's
+        # launch_home is stale by definition, so it must not poison the scan.
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            routes = self._routes_dir(base)
+            self._record(routes / f"{self.ROUTE_ID}.json", str(base / "release"))
+            legacy = routes / "2026-08-13_wwd-eval-labels.json"
+            self._record(legacy, str(base / "other-release"))
+            legacy.with_name(legacy.stem + ".outcome.json").write_text("{}", encoding="utf-8")
+            results, reason = self._scan(base)
+            self.assertEqual(reason, "")
+            self.assertEqual([route_id for route_id, _ in results], [self.ROUTE_ID])
+
+
+class ReleaseHeldByLiveProcessTest(unittest.TestCase):
+    """A release a live process runs out of is in use, however it was launched.
+
+    Measured 2026-09-06: three managed codex sessions had
+    `AGENT_HOME=<releases/v2.110.1>` and had been alive two days, while jobs.log
+    held only `done` rows for it and no activation named it. Restoring release
+    pruning without this source would have deleted that tree out from under
+    them. The scan bug had been shielding them since 2026-09-04.
+    """
+
+    def test_this_process_holds_its_own_interpreter_tree(self):
+        # A positive case that needs no fixture process: this very interpreter's
+        # cmdline names the test file, so the repo root is "held".
+        held, why = distribution._release_held_by_live_process(
+            Path(__file__).resolve().parents[2])
+        self.assertTrue(held)
+        self.assertTrue(why.startswith("live-process:"), why)
+
+    def test_an_unrelated_tree_is_not_held(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            held, why = distribution._release_held_by_live_process(Path(tmp))
+            self.assertFalse(held, why)
+
+    def test_an_unreadable_process_does_not_mark_every_release_in_use(self):
+        # Some of our own processes deny /proc entirely (`(sd-pam)`), and pid 1
+        # belongs to another user. If either were treated as undecidable, every
+        # release would be in use -- the exact bug this change repairs. They are
+        # skipped and counted instead, so the scan still reaches a verdict.
+        #
+        # The uid filter is noise reduction, not a correctness gate: with
+        # unreadable processes skipped, ownership changes no verdict. Saying so
+        # here rather than pretending this test proves it.
+        with tempfile.TemporaryDirectory() as tmp:
+            held, why = distribution._release_held_by_live_process(Path(tmp))
+        self.assertFalse(held, why)
+
 
 if __name__ == "__main__":
     unittest.main()

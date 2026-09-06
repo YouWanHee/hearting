@@ -1746,6 +1746,10 @@ class OpenAttemptSealedReleasePruneTest(unittest.TestCase):
         with open(jobs, "a", encoding="utf-8") as fh:
             fh.write(line)
 
+    # Route record filenames must be the canonical `rt-<16 hex>.json`: the
+    # release-prune reader selects records by that shape, so a fixture id like
+    # `rt-sealed1` is silently not a route record and the release these tests
+    # assert must survive gets deleted. Ids below are sha256(name)[:16].
     def _write_route_record(self, route_id, launch_home_path, *, closed=False, corrupt=False, routes_dir=None):
         routes_dir = routes_dir or (self.artifact_root / ".runtime" / "routes")
         routes_dir.mkdir(parents=True, exist_ok=True)
@@ -1770,7 +1774,7 @@ class OpenAttemptSealedReleasePruneTest(unittest.TestCase):
         n2 = self._make_release("vN+2", 3000.0)
         self._seal_current(n2)
         self._write_registry_row("open", "att-sealed", f"artifact_root={self.artifact_root}")
-        self._write_route_record("rt-sealed1", n)
+        self._write_route_record("rt-95e2db8fa2b8e5f5", n)
 
         before = sorted(str(p) for p in n.rglob("*"))
         stderr = io.StringIO()
@@ -1780,7 +1784,7 @@ class OpenAttemptSealedReleasePruneTest(unittest.TestCase):
 
         self.assertTrue(n.is_dir())
         self.assertEqual(before, after)
-        self.assertIn("open-route:rt-sealed1", stderr.getvalue())
+        self.assertIn("open-route:rt-95e2db8fa2b8e5f5", stderr.getvalue())
         self.assertTrue(n1.is_dir())
         self.assertTrue(n2.is_dir())
 
@@ -1790,7 +1794,7 @@ class OpenAttemptSealedReleasePruneTest(unittest.TestCase):
         n2 = self._make_release("vN+2", 3000.0)
         self._seal_current(n2)
         self._write_registry_row("open", "att-sealed", f"artifact_root={self.artifact_root}")
-        self._write_route_record("rt-sealed-force", n)
+        self._write_route_record("rt-6a04c8e64fb10fc0", n)
 
         DISTRIBUTION._cleanup_releases(keep=set(), force_prune_unproven=True)
         self.assertTrue(n.is_dir())
@@ -1806,14 +1810,14 @@ class OpenAttemptSealedReleasePruneTest(unittest.TestCase):
         self._write_registry_row(
             "open", "att-current", f"artifact_root={self.artifact_root},launch_home={current}"
         )
-        self._write_route_record("rt-current-protects-n", n)
+        self._write_route_record("rt-6192da33bb716262", n)
 
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
             DISTRIBUTION._cleanup_releases(keep=set())
 
         self.assertTrue(n.is_dir())
-        self.assertIn("open-route:rt-current-protects-n", stderr.getvalue())
+        self.assertIn("open-route:rt-6192da33bb716262", stderr.getvalue())
 
     def test_route_record_alone_protects_the_release_with_no_registry_row(self):
         n = self._make_release("vN", 1000.0)
@@ -1901,8 +1905,8 @@ class OpenAttemptSealedReleasePruneTest(unittest.TestCase):
 
         # Second undecidable shape: the scan cap itself, patched down to a
         # deterministically small value rather than materializing 20000 files.
-        self._write_route_record("rt-cap-1", n)
-        self._write_route_record("rt-cap-2", n)
+        self._write_route_record("rt-7f60d4c7066dad2d", n)
+        self._write_route_record("rt-af18a307bea64633", n)
         with mock.patch.object(DISTRIBUTION, "_ROUTE_SCAN_MAX_FILES", 1):
             stderr2 = io.StringIO()
             with contextlib.redirect_stderr(stderr2):
@@ -1958,7 +1962,7 @@ class OpenAttemptSealedReleasePruneTest(unittest.TestCase):
         # A corrupt route record that is already CLOSED (.outcome.json
         # sibling present) must never block prune -- over-eager fail-closed
         # on hundreds of harmless closed records would be its own bug.
-        self._write_route_record("rt-closed-corrupt", n, corrupt=True, closed=True)
+        self._write_route_record("rt-b68b0453889693d1", n, corrupt=True, closed=True)
 
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
