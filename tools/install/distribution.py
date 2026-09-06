@@ -2417,6 +2417,40 @@ def _route_record_launch_home(path: Path):
     return value
 
 
+# `capability-route.py` names every route record exactly `{route_id}.json`, and
+# a route id is `"rt-" + route_hash[:16]` (16 lowercase hex).
+_CANONICAL_ROUTE_NAME_RE = re.compile(r"^rt-[0-9a-f]{16}\.json$")
+
+
+def _unrecognised_open_route_record(path: Path) -> bool:
+    """Does this non-canonically-named file still look like an OPEN route record?
+
+    The discriminator is content, not name: a real record carries `nodes` or a
+    `launch_compatibility_tuple`; a sidecar (`.gate-release.json`, and whatever
+    is invented next) carries neither. A closed record -- one with an
+    `.outcome.json` sibling for its own stem, the same rule
+    `_route_record_launch_home` applies -- is irrelevant either way.
+
+    Unreadable or oversized reads as "yes": we cannot prove it is safe to skip,
+    and the cost of over-retaining is disk, while the cost of skipping a real
+    record is deleting a release out from under it.
+    """
+
+    if path.with_name(path.stem + ".outcome.json").exists():
+        return False
+    try:
+        if path.stat().st_size > _ROUTE_RECORD_MAX_BYTES:
+            return True
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError):
+        return True
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(record, dict):
+        return False
+    return "nodes" in record or "launch_compatibility_tuple" in record
+
+
 def _open_route_launch_homes(environ: dict[str, str]) -> tuple[list[tuple[str, str]], str]:
     """`([(route_id, launch_home_path), ...], unreliable_reason)`.
 
@@ -2460,7 +2494,29 @@ def _open_route_launch_homes(environ: dict[str, str]) -> tuple[list[tuple[str, s
         except OSError:
             return [], f"route-discovery-unreliable:{routes_dir}"
         for entry in entries:
-            if entry.name.endswith(".outcome.json"):
+            if not _CANONICAL_ROUTE_NAME_RE.fullmatch(entry.name):
+                # Select route records by the name `canonical_route_path()`
+                # actually writes, rather than skipping the sidecar shapes we
+                # happen to know about. This used to exclude `.outcome.json`
+                # only, so the later `.gate-release.json` sidecar was read as a
+                # route record, came back undecidable, and made the whole scan
+                # unreliable -- which marks EVERY release in use and disables
+                # release pruning entirely. Measured 2026-09-06: 20 releases,
+                # 606 MB, zero open attempts, all retained by one 354-byte
+                # sidecar. A denylist of sidecars is a list that silently grows
+                # stale.
+                #
+                # But a name this reader does not recognise must never be
+                # skipped SILENTLY: skipping a real route record removes a
+                # release's protection, and that is the one direction that
+                # deletes data. So the name selects, and content adjudicates the
+                # exceptions -- anything that still looks like an open route
+                # record under an unexpected name fails the scan closed, exactly
+                # as an unparsable canonical record does. 79 legacy
+                # alias-basename records exist on this machine from before the
+                # `rt-` generator; every one is closed, so they cost nothing.
+                if _unrecognised_open_route_record(entry):
+                    return [], f"route-record-unrecognised-name:{entry}"
                 continue
             scanned += 1
             if scanned > _ROUTE_SCAN_MAX_FILES:
@@ -2484,6 +2540,76 @@ def _open_route_launch_homes(environ: dict[str, str]) -> tuple[list[tuple[str, s
             return [], f"route-record-unparsable:{path}"
         results.append((path.stem, launch_home))
     return results, ""
+
+
+def _release_held_by_live_process(candidate: Path) -> tuple[bool, str]:
+    """Is any live process running out of this release right now?
+
+    The fifth reference source, and the only one that sees an *unregistered
+    interactive* session. Measured 2026-09-06: three managed codex sessions had
+    `AGENT_HOME=<releases/v2.110.1>` and had been alive for two days, while
+    `jobs.log` held only two `done` rows for that release and no activation
+    named it. Every existing source -- registry, stable registry, route records,
+    activation -- looked straight past them, so restoring release pruning would
+    have deleted the tree those processes resolve `adapters/.../preflight.sh`
+    from at request time. The bug this fix repairs had been accidentally
+    shielding them since 2026-09-04.
+
+    Reads `/proc/<pid>/environ` and `cmdline` only. A `/proc` that cannot be
+    enumerated returns in-use: undecidable is in use, like every other source
+    here. A pid that disappears mid-scan is skipped -- that one is decidable
+    (it is gone).
+    """
+
+    real = os.path.realpath(candidate)
+    prefix = real.rstrip("/") + "/"
+    proc = Path("/proc")
+    try:
+        entries = [entry for entry in proc.iterdir() if entry.name.isdigit()]
+    except OSError:
+        return True, "proc-unreadable"
+    uid = os.getuid()
+    opaque = 0
+    for entry in entries:
+        try:
+            if entry.stat().st_uid != uid:
+                # Noise reduction, not a correctness gate: another user's
+                # process cannot be running out of this user's
+                # `~/.local/share` release tree, and skipping them keeps the
+                # opaque-process count below from naming hundreds of foreign
+                # pids. Because unreadable processes are skipped rather than
+                # treated as undecidable, removing this filter changes no
+                # verdict -- so no test claims otherwise.
+                continue
+        except OSError:
+            continue
+        readable = False
+        for name, separator in (("environ", "\0"), ("cmdline", "\0")):
+            try:
+                blob = (entry / name).read_text(encoding="utf-8", errors="replace")
+            except (OSError, UnicodeDecodeError):
+                continue
+            readable = True
+            for field in blob.split(separator):
+                if not field:
+                    continue
+                value = field.split("=", 1)[1] if name == "environ" and "=" in field else field
+                if value == real or value.startswith(prefix):
+                    return True, f"live-process:{entry.name}"
+        if not readable:
+            opaque += 1
+    if opaque:
+        # Honest limit, stated rather than hidden: a handful of our own
+        # processes (`(sd-pam)` and friends) deny `/proc` reads entirely, and
+        # they are never harness processes. Failing closed on them would mark
+        # every release in use -- the exact bug this change repairs -- so they
+        # are skipped, and the count is printed so the skip is not silent.
+        print(
+            f"harness release: {opaque} own process(es) could not be inspected while "
+            f"checking {candidate}; they were not treated as holding it",
+            file=sys.stderr,
+        )
+    return False, ""
 
 
 def _release_in_use(
@@ -2720,6 +2846,14 @@ def _cleanup_releases(keep: set[Path], *, force_prune_unproven: bool = False) ->
         # routes, so it covers a release pinned by an OPEN attempt (SD-115 axis 4)
         # and not one pinned by an idle activation -- an update that skips a
         # runtime as `foreign` leaves exactly that shape behind.
+        held, why_held = _release_held_by_live_process(candidate)
+        if held:
+            print(
+                f"harness release: {candidate} is still in use by a live process "
+                f"({why_held}); keeping it instead of deleting it",
+                file=sys.stderr,
+            )
+            continue
         if _release_projection_referenced(candidate):
             print(
                 f"harness release: {candidate} is still the activation source of a "
