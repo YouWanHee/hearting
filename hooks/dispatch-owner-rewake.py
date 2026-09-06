@@ -419,8 +419,11 @@ def release_launch(payload: object) -> Launch | None:
     registry names that route's one open depth-1 owner bound to this session,
     and the new hook process waits on it exactly as the start did. A failed
     release (no JSON payload naming the route -- review round 1, M1: the
-    `--route` literal is deliberately NOT a fallback, because every refused
-    release names one too), a route with no started open owner (the owner
+    `--route` literal is NOT a fallback for the route id; the one exception,
+    SD-OPEN-48 (#13), is a release refused as already released -- "not blocked
+    on a human gate" -- whose `--route` literal names a readable route file:
+    the owner is running towards a completion that still owes this session a
+    wake, so the file's own `route_id` arms it), a route with no started open owner (the owner
     ended at the gate -- contract (c); or a row that was registered and
     refused at start), or an ambiguous set of owner rows arms nothing and
     says so once (`release_no_arm_notice`); the SD-111 sweep still delivers
@@ -456,8 +459,22 @@ def release_launch(payload: object) -> Launch | None:
             value = rendered.get("route_id")
             route_id = value if isinstance(value, str) and value else None
         break
+    armed = "release"
     if not isinstance(route_id, str) or not route_id:
-        return None
+        # SD-OPEN-48 (#13): a release refused with "not blocked on a human
+        # gate" means somebody else already released it -- on 2026-09-07 the
+        # headless owner itself (cairn W15b, rt-bf75754935faf8de) -- and the
+        # owner is RUNNING towards its completion. That completion still owes
+        # this session a wake, and the start-armed hook already spent its one
+        # wake on the gate, so arming nothing here is exactly the lost wake
+        # SD-111 exists to prevent. The route id comes from the route FILE the
+        # `--route` literal names (read and parsed), never from the literal
+        # itself; any other refusal (undeclared gate, unreadable route, answers
+        # required) still arms nothing.
+        route_id = _refused_release_route_id(payload, route_literal)
+        if route_id is None:
+            return None
+        armed = "release-refused"
     jobs = (
         _validated_jobs(_command_jobs(command))
         or _validated_jobs(os.environ.get("AGENT_DISPATCH_JOBS"))
@@ -489,14 +506,45 @@ def release_launch(payload: object) -> Launch | None:
     ]
     if len(candidates) != 1:
         return None
-    return Launch(attempt_id=candidates[0], jobs=jobs, session_id=session, armed="release")
+    return Launch(attempt_id=candidates[0], jobs=jobs, session_id=session, armed=armed)
+
+
+NOT_BLOCKED_REFUSAL = "not blocked on a human gate"
+
+
+def _refused_release_route_id(payload: dict, route_literal: str | None) -> str | None:
+    """The `route_id` inside the route file a refused-as-already-released
+    release named, or None when the refusal was anything else or the literal
+    does not resolve to a readable route record."""
+
+    response = payload.get("tool_response")
+    text = _stdout(response)
+    if isinstance(response, dict):
+        stderr = response.get("stderr")
+        if isinstance(stderr, str):
+            text = text + "\n" + stderr
+    if NOT_BLOCKED_REFUSAL not in text:
+        return None
+    if not isinstance(route_literal, str) or not route_literal or "$" in route_literal:
+        return None
+    path = Path(route_literal).expanduser()
+    if not path.is_absolute() or path.suffix != ".json" or not path.is_file():
+        return None
+    try:
+        route = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    route_id = route.get("route_id") if isinstance(route, dict) else None
+    return route_id if isinstance(route_id, str) and route_id else None
 
 
 def release_no_arm_notice(payload: object) -> int:
     """One typed exit-0 notice when a proven release armed nothing (review round
     1, M2): the session was told the release re-arms the wait, so a silent
     non-arm would be the lost wake SD-111 exists to prevent. A refused release
-    (no JSON payload) stays silent -- its own stderr already told the story."""
+    (no JSON payload) stays silent -- its own stderr already told the story --
+    except one refused as already released (SD-OPEN-48), which names the route
+    file and so was expected to arm."""
 
     if not isinstance(payload, dict):
         return 0
@@ -506,6 +554,19 @@ def release_no_arm_notice(payload: object) -> int:
         return 0
     stdout = _stdout(payload.get("tool_response"))
     if not any(line.strip().startswith("{") and '"route_id"' in line for line in stdout.splitlines()):
+        if _refused_release_route_id(payload, _release_command(command)[1]) is None:
+            return 0
+        # SD-OPEN-48 (#13): refused as already released, but no single started
+        # open owner of that route is bound to this session -- say so once.
+        message = (
+            "[dispatch-owner-rewake] schema=2 state=not-armed surface=release-refused — this gate "
+            "was already released (workflow not blocked), and no single started open depth-1 owner "
+            "of that route is bound to this session, so the owner's completion will not wake this "
+            "session from this command. If the owner is still running, its completion arrives "
+            "through the UserPromptSubmit sweep at your next prompt. Do not start Monitor, "
+            "dispatch-wait, or a polling loop."
+        )
+        print(json.dumps({"systemMessage": message}, ensure_ascii=False, separators=(",", ":")))
         return 0
     message = (
         "[dispatch-owner-rewake] schema=2 state=not-armed surface=release — this release recorded, "

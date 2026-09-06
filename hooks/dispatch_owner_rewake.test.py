@@ -1828,10 +1828,10 @@ class ReleaseRearmTest(unittest.TestCase):
         self.assertEqual(launch.attempt_id, "att-gate-owner")
 
     def test_a_failed_release_arms_nothing(self):
-        stdout = "workflow-supervisor: workflow is RUNNING, not blocked on a human gate"
+        stdout = "workflow-supervisor: route declares no human gate 'frame-review'"
         self.assertIsNone(rewake.release_launch(self.payload(stdout=stdout)))
-        # review round 1, M1: a literal --route path is not a fallback -- every
-        # refused release names one too
+        # review round 1, M1: a literal --route path is not a fallback for the
+        # route id -- every refused release names one too
         literal = (f"python3 utilities/workflow-supervisor.py release --route {self.route} "
                    f"--gate frame-review --decision proceed --jobs {self.jobs}")
         self.assertIsNone(rewake.release_launch(self.payload(command=literal, stdout=stdout)))
@@ -1840,6 +1840,36 @@ class ReleaseRearmTest(unittest.TestCase):
         with mock.patch.object(sys, "stdout", io.StringIO()) as out:
             self.assertEqual(rewake.release_no_arm_notice(self.payload(command=literal, stdout=stdout)), 0)
         self.assertEqual(out.getvalue(), "")
+
+    def test_sd_open_48_a_release_refused_as_already_released_still_arms_the_running_owner(self):
+        """#13 (cairn W15b, 2026-09-07 07:48): the owner had released its own
+        gate, the depth-0 release was refused "RUNNING, not blocked", nothing
+        armed, and the owner's completion sat in pending-delivery until the
+        next prompt sweep."""
+        refusal = "workflow-supervisor: workflow is RUNNING, not blocked on a human gate"
+        literal = (f"python3 utilities/workflow-supervisor.py release --route {self.route} "
+                   f"--gate frame-review --decision proceed --jobs {self.jobs}")
+        payload = self.payload(command=literal, stdout="")
+        payload["tool_response"]["stderr"] = refusal
+        launch = rewake.release_launch(payload)
+        self.assertIsNotNone(launch)
+        self.assertEqual((launch.attempt_id, launch.armed), ("att-gate-owner", "release-refused"))
+        # the route id comes from the route FILE, never from the literal
+        self.route.write_text(json.dumps({"route_id": "rt-other", "nodes": []}), encoding="utf-8")
+        self.assertIsNone(rewake.release_launch(payload))
+        # a shell-variable literal, an unreadable file, or any other refusal arms nothing
+        self.assertIsNone(rewake.release_launch(self.payload(stdout=refusal)))
+        missing = literal.replace(str(self.route), str(self.root / "nope.json"))
+        self.assertIsNone(rewake.release_launch(self.payload(command=missing, stdout=refusal)))
+        self.route.write_text(json.dumps({"route_id": "rt-gate", "nodes": []}), encoding="utf-8")
+        other = self.payload(command=literal, stdout="workflow-supervisor: interview-answers-required: ...")
+        self.assertIsNone(rewake.release_launch(other))
+        # refused-as-released with no started open owner says so once
+        self.write_rows([("att-gate-owner", "done", "session-gate", "rt-gate")])
+        self.assertIsNone(rewake.release_launch(payload))
+        with mock.patch.object(sys, "stdout", io.StringIO()) as out:
+            self.assertEqual(rewake.release_no_arm_notice(payload), 0)
+        self.assertIn("state=not-armed surface=release-refused", json.loads(out.getvalue())["systemMessage"])
 
     def test_a_registered_but_never_started_owner_never_arms(self):
         """review round 1, M2: the row the fence leaves behind (registered, refused

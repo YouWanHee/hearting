@@ -213,6 +213,39 @@ class AnswersTest(unittest.TestCase):
         self.assertEqual(FI.validate_answers(interview, answers), [])
         self.assertEqual(answers["answers"]["q-cap"]["choice"], 1)
 
+    def test_sd_open_48_a_foreign_interview_schema_is_one_typed_reason(self):
+        """#12: real answers against `cairn-frame-interview/v1` came back as
+        one `no such question` per answer; the schema is the reason."""
+        foreign = {"schema": "cairn-frame-interview/v1", "route_id": "rt-fixture0000000",
+                   "release_authority": "depth-0", "open_decisions_for_user": []}
+        answers = FI.answers_template(good_interview())
+        answers["understanding_confirmed"] = True
+        for qid in answers["answers"]:
+            answers["answers"][qid]["choice"] = 0
+        errors = FI.validate_answers(foreign, answers)
+        self.assertEqual(len(errors), 1)
+        self.assertTrue(errors[0].startswith("interview.schema: expected 'frame_interview_v1'"))
+        self.assertNotIn("no such question", errors[0])
+        self.assertEqual(FI.foreign_interview_schema(foreign), "cairn-frame-interview/v1")
+        self.assertEqual(FI.foreign_interview_schema({"schema": "x/v1", "questions": []}), "x/v1")
+        self.assertIsNone(FI.foreign_interview_schema({"schema": "frame_summary_v1"}))
+        self.assertIsNone(FI.foreign_interview_schema(good_interview()))
+        with tempfile.TemporaryDirectory() as td:
+            interview_path = Path(td) / "interview.json"
+            answers_path = Path(td) / "answers.json"
+            interview_path.write_text(json.dumps(foreign), encoding="utf-8")
+            answers_path.write_text(json.dumps(answers), encoding="utf-8")
+            for argv in (["validate-answers", "--interview", str(interview_path), "--answers", str(answers_path)],
+                         ["answers-template", "--interview", str(interview_path)]):
+                with self.subTest(argv=argv[0]):
+                    with self.assertRaises(FI.InterviewError) as caught:
+                        FI.main(argv)
+                    self.assertEqual(caught.exception.reason, "interview-schema-unsupported")
+            out = io.StringIO()
+            with redirect_stdout(out):
+                self.assertEqual(FI.main(["validate", "--interview", str(interview_path)]), 65)
+            self.assertIn("schema: expected", json.loads(out.getvalue())["errors"][0])
+
     def test_missing_unknown_or_out_of_range_answers_are_refused(self):
         interview = good_interview()
         answers = good_answers(interview)

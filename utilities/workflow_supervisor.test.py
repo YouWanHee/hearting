@@ -1992,6 +1992,101 @@ class TestGateSubjectNotCaller(WorkflowFixture):
             os.chdir(previous)
         self.assertEqual(SUP.ledger_for(route).read_only_state()["workflow_state"], "BLOCKED_HUMAN_GATE")
 
+    def test_sd_open_48_headless_owner_may_not_release_an_interview_gate(self):
+        """#11 (cairn W15b, rt-bf75754935faf8de, 2026-09-06): the owner released
+        its own frame-review gate as `headless-owner`; the plan it unblocked was
+        confirmed by nobody, and the depth-0 release was then refused."""
+        _route, path = self.two_stage_route(
+            human_gate="frame-review",
+            continuation={"kind": "human-gate", "gate": "frame-review"})
+        jobs, _session, _attempt = self.owner_registry()
+        interview, value = self._interview()
+        code, payload = self._block_with(path, jobs, interview)
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["release_authority"], "depth-0")
+        answers, _ = self._answers(value)
+        env = {"AGENT_DISPATCH_REGISTERED_WORKER": "1"}
+        with mock.patch.dict(os.environ, env):
+            with self.assertRaisesRegex(SUP.SupervisorError, "gate-release-authority-refused"):
+                SUP.main(["release", "--route", str(path), "--gate", "frame-review",
+                          "--decision", "proceed", "--answers", str(answers), "--jobs", str(jobs)])
+            with self.assertRaisesRegex(SUP.SupervisorError, "gate-release-authority-refused"):
+                SUP.main(["gate", "--route", str(path), "--gate", "frame-review", "--release",
+                          "--jobs", str(jobs)])
+        code, waited = self._await(path)
+        self.assertEqual(waited["status"], "blocked", "the owner's refused release changed nothing")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = SUP.main(["release", "--route", str(path), "--gate", "frame-review",
+                             "--decision", "proceed", "--answers", str(answers), "--jobs", str(jobs)])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(buf.getvalue())["released_by"], "user")
+
+    def test_sd_open_48_artifact_declaring_depth0_authority_binds_its_owner(self):
+        """The cairn owner's own artifact said `release_authority: depth-0`."""
+        _route, path = self.two_stage_route(
+            human_gate="frame-review",
+            continuation={"kind": "human-gate", "gate": "frame-review"})
+        jobs, _session, _attempt = self.owner_registry()
+        artifact = self.base / "shards" / "frame" / "frame-summary.json"
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_text(json.dumps({"schema": "frame_summary_v1", "release_authority": "depth-0",
+                                        "restatement": "plain"}), encoding="utf-8")
+        code, payload = self._block_with(path, jobs, artifact)
+        self.assertEqual(code, 0)
+        self.assertFalse(payload["interview"])
+        self.assertEqual(payload["release_authority"], "depth-0")
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_REGISTERED_WORKER": "1"}):
+            with self.assertRaisesRegex(SUP.SupervisorError, "gate-release-authority-refused"):
+                SUP.main(["release", "--route", str(path), "--gate", "frame-review",
+                          "--decision", "proceed", "--jobs", str(jobs)])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(SUP.main(["release", "--route", str(path), "--gate", "frame-review",
+                                       "--decision", "proceed", "--jobs", str(jobs)]), 0)
+
+    def test_sd_open_48_plain_gate_keeps_the_owner_allowance_unless_the_binding_says_otherwise(self):
+        for declared in (None, "depth-0"):
+            with self.subTest(binding_release_authority=declared):
+                route, path = self.two_stage_route(
+                    human_gate="frame-review",
+                    continuation={"kind": "human-gate", "gate": "frame-review"})
+                if declared:
+                    route["human_gate_bindings"][0]["release_authority"] = declared
+                    path.write_text(json.dumps(route, indent=2), encoding="utf-8")
+                jobs, _session, _attempt = self.owner_registry()
+                code, payload = self._block_with(path, jobs, "shards/frame/frame-summary.md")
+                self.assertEqual(code, 0)
+                self.assertEqual(payload["release_authority"], declared or "any")
+                with mock.patch.dict(os.environ, {"AGENT_DISPATCH_REGISTERED_WORKER": "1"}):
+                    buf = io.StringIO()
+                    if declared:
+                        with self.assertRaisesRegex(SUP.SupervisorError, "gate-release-authority-refused"):
+                            SUP.main(["release", "--route", str(path), "--gate", "frame-review",
+                                      "--decision", "proceed", "--jobs", str(jobs)])
+                    else:
+                        with contextlib.redirect_stdout(buf):
+                            code = SUP.main(["release", "--route", str(path), "--gate", "frame-review",
+                                             "--decision", "proceed", "--jobs", str(jobs)])
+                        self.assertEqual(code, 0)
+                        self.assertEqual(json.loads(buf.getvalue())["released_by"], "headless-owner")
+
+    def test_sd_open_48_foreign_interview_schema_is_refused_at_the_raise(self):
+        """#12: `cairn-frame-interview/v1` passed as "not an interview", so the
+        gate owed no answers and validate-answers later refused every answer."""
+        _route, path = self.two_stage_route(
+            human_gate="frame-review",
+            continuation={"kind": "human-gate", "gate": "frame-review"})
+        jobs, _session, _attempt = self.owner_registry()
+        artifact = self.base / "shards" / "frame" / "interview.json"
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_text(json.dumps({"schema": "cairn-frame-interview/v1", "route_id": "rt-fixture0000000",
+                                        "release_authority": "depth-0", "open_decisions_for_user": []}),
+                            encoding="utf-8")
+        with self.assertRaisesRegex(SUP.SupervisorError, "interview-schema-unsupported.*cairn-frame-interview/v1"):
+            SUP.main(["gate", "--route", str(path), "--gate", "frame-review", "--block",
+                      "--jobs", str(jobs), "--artifact", str(artifact)])
+
     def test_legacy_gate_release_refuses_an_interview_gate(self):
         """review round 1, M3."""
         _route, path = self.two_stage_route(
