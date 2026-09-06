@@ -2963,10 +2963,24 @@ class TestContinuation(unittest.TestCase):
 
  @staticmethod
  def _is_fixture_registry(jobs):
-  root=Path(tempfile.gettempdir()).resolve(strict=False)
-  try: Path(jobs).resolve(strict=False).relative_to(root)
-  except ValueError: return False
-  return True
+  # Every scratch root a fixture may legitimately live under, not just the one
+  # `tempfile.gettempdir()` names right now. `tools/run-tests.py`'s isolated
+  # profile repoints TMPDIR at a per-invocation directory, while the F47-3
+  # golden fixture hardcodes `/tmp` on purpose (its path is hashed into route
+  # identity, so it must not drift). With one source this guard refused that
+  # fixture under the runner and passed it everywhere else -- the same
+  # two-sources-for-one-value shape it was written to catch. The live registry
+  # is under XDG state and can be under none of these.
+  candidates={tempfile.gettempdir(),"/tmp"}
+  candidates.add(os.environ.get("TMPDIR") or "/tmp")
+  target=Path(jobs).resolve(strict=False)
+  for candidate in candidates:
+   try:
+    target.relative_to(Path(candidate).resolve(strict=False))
+   except ValueError:
+    continue
+   return True
+  return False
 
  def test_c_pin_and_grounding_must_name_one_commit(self):
   # S5: the pin (`git rev-parse HEAD`) and the grounding (`source_revision`) are
@@ -4466,5 +4480,44 @@ class ReviewIndependenceTest(InlineStageCompletionRecipeTest):
   # unrecorded, never guessed at.
   self.assertEqual(
    outcome["review_independence"]["plan-check"]["review_independence"],"unrecorded")
+
+
+class FixtureRegistryGuardTest(unittest.TestCase):
+    """The guard that keeps fixture rows out of the operator's live registry.
+
+    It exists because 660 fixture rows were once written to the real
+    `jobs.log`. It then drifted the other way: it asked
+    `tempfile.gettempdir()` while the F47-3 golden fixture hardcodes `/tmp`
+    (its path is hashed into route identity), so under
+    `tools/run-tests.py --profile isolated`, which repoints TMPDIR, the guard
+    refused a legitimate fixture and main was red on that one test while every
+    direct run passed. Both directions are pinned here; neither was before.
+    """
+
+    _guard = staticmethod(TestContinuation._is_fixture_registry)
+
+    def test_a_hardcoded_tmp_fixture_is_accepted_even_when_tmpdir_moved(self):
+        with tempfile.TemporaryDirectory() as moved:
+            with mock.patch.dict(os.environ, {"TMPDIR": moved}):
+                self.assertTrue(self._guard("/tmp/hearting-f47-3-golden-fixture/state/jobs.log"))
+
+    def test_a_fixture_under_the_current_tmpdir_is_accepted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertTrue(self._guard(Path(tmp)/"state"/"jobs.log"))
+
+    def test_the_live_registry_is_still_refused(self):
+        # The whole point. XDG state is where the real registry lives, and no
+        # widening of the accepted scratch roots may reach it.
+        for live in (
+            "/home/someone/.local/state/hearting/dispatch/jobs.log",
+            "/var/lib/hearting/dispatch/jobs.log",
+            "/home/someone/hearting/.dispatch/jobs.log",
+        ):
+            with self.subTest(live):
+                self.assertFalse(self._guard(live))
+
+    def test_a_path_that_only_looks_like_tmp_is_refused(self):
+        self.assertFalse(self._guard("/tmpfoo/jobs.log"))
+        self.assertFalse(self._guard("/var/tmpish/jobs.log"))
 
 if __name__=="__main__": unittest.main()
