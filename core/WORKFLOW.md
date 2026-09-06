@@ -356,6 +356,14 @@ completed, partial, failed, or blocked, localized for the audience — and must
 not present partial, failed, or blocked work as completed. Use `없음` (or its
 audience-language equivalent) when there is no artifact or remaining item.
 
+If any review gate of the work closed without an independent reviewer's PASS —
+the route outcome's `review_independence_degraded`, or a
+`completed-review-degraded` line from `complete` — `검증` must say so and name
+the node. That list covers both `degraded` (the owner reviewed its own work) and
+`owner-overridden` (the owner ruled over a review that returned FAIL). Either is
+a real result and neither blocks the route, but reporting it as review would
+make "reviewed" mean nothing (`OPERATIONS §5.10`, SD-OPEN-41(b)).
+
 For dispatched or long-running work, main emits this card only after it has
 synchronously waited or polled for terminal state, harvested the result and
 worker artifact, integrated it when authorized, and verified the final state.
