@@ -139,6 +139,29 @@ re-isolate/re-probe stop and never reaches this list. For case 3, record reasoni
 Still parallelize separable census or disjoint file groups. Dispatch-infrastructure
 self-modification requires the explicit `STAGE_DISPATCH_INLINE_OK` opt-out.
 
+**An inline stage still owes its marker, and the same command writes it.** A stage run
+in-session has no registry row, so the `--jobs --attempt-id` recipe above cannot apply — but
+`complete` does not require one. State the axes the run actually had instead:
+
+```bash
+python3 <agent-home>/utilities/capability-route.py complete \
+  --route <route-file> --node <node-id> --evidence <stage terminal artifact> \
+  --attempt-id <stable id for this inline run> \
+  --dispatch-depth <the node's own dispatch_depth> \
+  --transport headless --execution-surface inline \
+  --registered-worker 0 --fallback-hop inline
+```
+
+No `--jobs`. The marker this publishes is current and opens the dependency gate for the next
+stage exactly like a dispatched one; `registered_worker=0` is what tells the readiness check
+there is no process to verify. Skipping this is the single most expensive mistake available
+here: the next stage is refused for the missing dependency, its fallback descends to inline,
+that run publishes no marker either, and **one marker-less stage forces the whole remainder of
+the route inline** — measured on route `rt-b2d68cbf14d31c62`, eight nodes and zero markers.
+
+`--execution-surface inline` with `dispatch_depth > 0` requires `--fallback-hop inline`; the
+contract refuses the mismatched combination rather than recording a surface the run did not have.
+
 #### Usage-Aware Cross-Harness Routing
 
 Before dispatch, run `sh <agent-home>/utilities/usage-check.sh`. It reports per-harness `ok`, `limited(<reset>)`, or `unknown`; `ok` means no known block, not guaranteed capacity. Avoid limited runtimes. An automatic/model-selected recovery also requires known positive capacity; unknown capacity is not positive availability. A user's explicit `--adapter` override may retain its separately audited unknown-capacity path when route evidence and hard eligibility still permit it. Otherwise default to the free cross-harness posture (OPERATIONS §5.10 SD-16, 2026-07-24): with two or more eligible harnesses, spread consecutive stage nodes across model families rather than homing to the conductor's harness, always place test or review on a different family than implementation, and record a task-fit or limit reason when a run intentionally keeps every node on one harness. Preserve `dispatch_depth`, `parent`, `worker_type`, `assigned_contract`, `model_role`, `harness`, `owner_harness`, and `parent_sid` metadata across runtimes.
