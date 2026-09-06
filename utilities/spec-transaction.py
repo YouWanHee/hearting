@@ -20,7 +20,6 @@ GUARD=importlib.util.module_from_spec(SPEC); SPEC.loader.exec_module(GUARD)
 sys.path.insert(0,str(ROOT/"utilities"))
 import artifact_producer as PRODUCER  # noqa: E402
 import artifact_cutover as CUTOVER  # noqa: E402
-import artifact_reader as READER  # noqa: E402
 
 
 def emit(event, events=None):
@@ -83,6 +82,12 @@ def legacy_spec_state(artifact: Path):
     return state
 
 
+class VersionChainError(Exception):
+    """The v{N} chain could not be enumerated. A monotone counter must not guess low."""
+    def __init__(self, reason: str, detail: str):
+        super().__init__(f"{reason}: {detail}"); self.reason=reason; self.detail=detail
+
+
 def versions_max(tree: Path) -> int:
     """Highest `_internal/versions/v{N}` directory under one spec tree (0 when none)."""
     versions=tree/"_internal"/"versions"
@@ -94,33 +99,88 @@ def versions_max(tree: Path) -> int:
     return max(found,default=0)
 
 
+def _cycle_spec_trees(artifact_root: Path) -> list[Path]:
+    """Every cycle-held spec tree, by a plain walk that follows symlinks.
+
+    This is deliberately NOT the reader's enumeration (`artifact_reader.cycle_bucket_dirs`):
+    that one is a read surface -- identity-bound (campaign/cycle records via
+    `artifact_locator.scan_index`, which raises on a malformed root) and real
+    directories only. A monotone counter must see a superset of what any reader
+    sees: a symlinked bucket or cycle directory, a cycle whose identity record
+    is missing or half-written, and the W7H `--include-spec-top` residue home
+    `artifacts/_internal/spec` (where a retired legacy `spec/` chain now lives)
+    all still hold real v{N} snapshots whose numbers must never be reused.
+    Missing a tree costs a silent reuse; over-counting costs one skipped number.
+    """
+    out: list[Path]=[]
+    campaigns=artifact_root/"campaigns"
+    if not campaigns.is_dir(): return out
+    for camp in sorted(campaigns.iterdir()):
+        if camp.name.startswith(".") or not camp.is_dir(): continue
+        cycles=[c for c in camp.iterdir() if c.is_dir() and not c.name.startswith(".") and c.name!="cycles"]
+        legacy_layer=camp/"cycles"   # pre-W7I layout (D-88 removed the layer; sealed roots may keep it)
+        if legacy_layer.is_dir(): cycles.extend(c for c in legacy_layer.iterdir() if c.is_dir() and not c.name.startswith("."))
+        for cyc in sorted(cycles):
+            for rel in ("artifacts/spec","artifacts/_internal/spec"):
+                tree=cyc/rel
+                if tree.is_dir(): out.append(tree)
+    return out
+
+
 def version_history_trees(spec_root: Path, artifact_root: Path, component: str="") -> list[Path]:
     """Every tree this spec's `_internal/versions/v{N}` chain has lived in.
 
-    The reader's three layouts, by the reader's own enumeration: the current
-    spec root, every recorded producer cycle's `artifacts/spec` bucket (a
-    sealed cycle keeps its chain even when it was never admitted to
-    `shared/`; an open sibling keeps the snapshot it just wrote), every
-    immutable `shared/spec` revision of every reference, and the legacy
-    read-only `spec/` bucket. `component` narrows each tree to
-    `<tree>/<component>` so a component spec stays on its own chain.
+    The current spec root, the legacy read-only `spec/`, every cycle-held spec
+    tree (`_cycle_spec_trees`: `artifacts/spec` of every cycle in both layouts,
+    symlinks followed, plus the W7H residue home `artifacts/_internal/spec`),
+    and every immutable `shared/spec/<ref>/revisions/<rrev>` of every
+    reference. `component` narrows each tree to `<tree>/<component>` so a
+    component spec stays on its own chain. Raises `VersionChainError` when the
+    root cannot be walked; the caller must fail closed, never count low.
     """
     artifact_root=Path(artifact_root)
     def under(base: Path) -> Path: return base/component if component else base
     trees=[Path(spec_root),under(artifact_root/"spec")]
-    trees.extend(under(bucket) for bucket,_ in READER.cycle_bucket_dirs(artifact_root,"spec"))
-    shared=artifact_root/"shared"/"spec"
-    if shared.is_dir():
-        for ref in sorted(shared.iterdir()):
-            revisions=ref/"revisions"
-            if not revisions.is_dir(): continue
-            trees.extend(under(rev) for rev in sorted(revisions.iterdir()) if rev.is_dir())
+    try:
+        trees.extend(under(tree) for tree in _cycle_spec_trees(artifact_root))
+        shared=artifact_root/"shared"/"spec"
+        if shared.is_dir():
+            # Every reference, whatever its D-3-b lifecycle state (active /
+            # superseded / retired) -- the immutable bytes of a superseded
+            # reference are real v{N}s on this chain. Registered as an explicit
+            # exception to the D-3-b exclusion list (artifact-path-contract
+            # D-87-b); a future D-3-b filter must not reach this enumeration.
+            for ref in sorted(shared.iterdir()):
+                revisions=ref/"revisions"
+                if not revisions.is_dir(): continue
+                trees.extend(under(rev) for rev in sorted(revisions.iterdir()) if rev.is_dir())
+    except OSError as exc:
+        raise VersionChainError("version-chain-unenumerable",f"{type(exc).__name__}: {exc}") from exc
     seen=set(); unique=[]
     for tree in trees:
-        key=str(tree.resolve()) if tree.exists() else str(tree)
+        key=str(tree)
         if key in seen: continue
         seen.add(key); unique.append(tree)
     return unique
+
+
+def chain_next(trees: list[Path]) -> tuple[int, Path | None]:
+    """`(max(N)+1, the first tree holding max(N))`; `(1, None)` on an empty chain."""
+    best=0; source=None
+    for tree in trees:
+        found=versions_max(tree)
+        if found>best: best,source=found,tree
+    return best+1,source
+
+
+def version_source_layout(tree: Path | None, spec_root: Path, artifact_root: Path) -> str:
+    if tree is None: return "none"
+    tree=Path(tree); artifact_root=Path(artifact_root)
+    if tree==Path(spec_root): return "spec-root"
+    try: rel=tree.relative_to(artifact_root)
+    except ValueError: return "outside-root"
+    head=rel.parts[0] if rel.parts else ""
+    return {"spec":"legacy","shared":"shared","campaigns":"cycle"}.get(head,"unknown")
 
 
 def next_version(spec_root: Path, artifact_root: Path, component: str="") -> int:
@@ -136,8 +196,7 @@ def next_version(spec_root: Path, artifact_root: Path, component: str="") -> int
     number. The number therefore comes from every tree the spec has lived in;
     the snapshot itself still lands under the current `spec_root`.
     """
-    trees=version_history_trees(spec_root,artifact_root,component)
-    return max((versions_max(tree) for tree in trees),default=0)+1
+    return chain_next(version_history_trees(spec_root,artifact_root,component))[0]
 
 
 def read_regular_file(path: Path, *, allow_missing: bool) -> bytes | None:
@@ -245,13 +304,21 @@ def main():
                 if time.monotonic()>=deadline:
                     emit({"status":"blocked","reason":"spec-lock-timeout","route_id":route["route_id"]},args.events); return 3
                 time.sleep(max(.01,args.poll))
+        # Enumerate the v{N} chain before seeding: a root that cannot be walked
+        # is a typed refusal that leaves no seed residue behind, and the counter
+        # never guesses low (review round 1, blocking finding 1).
+        try: trees=version_history_trees(spec_root,artifact,component)
+        except VersionChainError as exc:
+            emit({"status":"blocked","reason":exc.reason,"detail":exc.detail,"route_id":route["route_id"],"spec_root":str(spec_root)},args.events)
+            lock.seek(0); lock.truncate(); lock.flush(); os.fsync(lock.fileno())
+            return 65
         if spec_layout=="cycle":
             # Seed only once the route contract passed and the spec lock is ours:
             # a refused run must leave no admittable content behind, and two
             # transactions on one cycle must not interleave a half copy.
             seeded=seed_cycle_spec(spec_base,artifact)
             emit({**seeded,"route_id":route["route_id"]},args.events)
-        version=next_version(spec_root,artifact,component)
+        version,source=chain_next(trees)   # re-reads the disk, so the seeded copy is seen
         if spec_layout=="cycle" and version==1 and (spec_root/"prd.md").is_file():
             # A pre-image with no history in ANY tree of this spec's chain
             # (current root, cycle buckets, shared revisions, legacy): the
@@ -259,7 +326,8 @@ def main():
             emit({"status":"version-history-absent","route_id":route["route_id"],"spec_root":str(spec_root),"detail":"prd.md present but no _internal/versions history in any tree of this spec's chain (cycle buckets, shared revisions, legacy spec/); the counter starts at 1"},args.events)
         owner={"route_id":route["route_id"],"node_id":node["id"],"worktree":str(worktree.resolve()),"pid":os.getpid(),"next_version":version}
         lock.seek(0); lock.truncate(); lock.write(json.dumps(owner,sort_keys=True)+"\n"); lock.flush(); os.fsync(lock.fileno())
-        emit({"status":"acquired","action":"latest-reread","route_id":route["route_id"],"next_version":version,"waited":waited,"layout":spec_layout,"spec_root":str(spec_root)},args.events)
+        emit({"status":"acquired","action":"latest-reread","route_id":route["route_id"],"next_version":version,"waited":waited,"layout":spec_layout,"spec_root":str(spec_root),
+              "version_source":(str(source) if source is not None else None),"version_source_layout":version_source_layout(source,spec_root,artifact)},args.events)
         prd=spec_root/"prd.md"
         try:
             preimage=read_regular_file(prd,allow_missing=True)

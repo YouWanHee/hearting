@@ -122,6 +122,62 @@ class SpecTransactionTest(unittest.TestCase):
    self.assertEqual([t.resolve() for t in trees],[legacy.resolve()])
    self.assertEqual(TX.next_version(legacy,artifact),4)
 
+ def test_chain_counts_residue_home_symlinked_bucket_and_legacy_cycles_layer(self):
+  # Review round 1 (major 2, 3): trees the reader's enumeration cannot see still hold real v{N}.
+  with tempfile.TemporaryDirectory() as td:
+   artifact=Path(td)/".agent_reports"; open_bucket=artifact/"campaigns/2026-09-07_o/2026-09-07_o/artifacts/spec"; open_bucket.mkdir(parents=True)
+   self.assertEqual(TX.next_version(open_bucket,artifact),1)
+   # W7H --include-spec-top parked the legacy chain at artifacts/_internal/spec (no top-level spec/ left)
+   (artifact/"campaigns/2026-09-05_support-residue/2026-06-16_support-residue-2/artifacts/_internal/spec/_internal/versions/v170").mkdir(parents=True)
+   self.assertEqual(TX.next_version(open_bucket,artifact),171,"the residue home of a retired legacy spec/ is on the chain")
+   # a sealed cycle whose bucket was moved and replaced by a symlink
+   moved=Path(td)/"moved-bucket"; (moved/"_internal/versions/v180").mkdir(parents=True)
+   link=artifact/"campaigns/2026-09-06_a/2026-09-06_a/artifacts/spec"; link.parent.mkdir(parents=True); link.symlink_to(moved)
+   self.assertEqual(TX.next_version(open_bucket,artifact),181,"a symlinked bucket is followed")
+   # a symlinked cycle directory
+   moved_cycle=Path(td)/"moved-cycle"; (moved_cycle/"artifacts/spec/_internal/versions/v190").mkdir(parents=True)
+   (artifact/"campaigns/2026-09-06_b").mkdir(); (artifact/"campaigns/2026-09-06_b/2026-09-06_b").symlink_to(moved_cycle)
+   self.assertEqual(TX.next_version(open_bucket,artifact),191,"a symlinked cycle directory is followed")
+   # the pre-W7I cycles/ layer
+   (artifact/"campaigns/2026-08-01_old/cycles/cyc_1/artifacts/spec/_internal/versions/v200").mkdir(parents=True)
+   self.assertEqual(TX.next_version(open_bucket,artifact),201,"the legacy cycles/ layer is on the chain")
+   version,source=TX.chain_next(TX.version_history_trees(open_bucket,artifact))
+   self.assertEqual((version,TX.version_source_layout(source,open_bucket,artifact)),(201,"cycle"))
+
+ @unittest.skipIf(os.geteuid()==0,"permission bits do not bind root")
+ def test_unwalkable_root_raises_a_typed_chain_error(self):
+  # Review round 1 (blocking 1): the chain must fail closed, never count low.
+  with tempfile.TemporaryDirectory() as td:
+   artifact=Path(td)/".agent_reports"; open_bucket=artifact/"campaigns/2026-09-07_o/2026-09-07_o/artifacts/spec"; open_bucket.mkdir(parents=True)
+   sealed=artifact/"campaigns/2026-09-06_a"; (sealed/"2026-09-06_a/artifacts/spec/_internal/versions/v9").mkdir(parents=True)
+   os.chmod(sealed,0)
+   try:
+    with self.assertRaises(TX.VersionChainError) as ctx: TX.next_version(open_bucket,artifact)
+    self.assertEqual(ctx.exception.reason,"version-chain-unenumerable")
+   finally: os.chmod(sealed,0o755)
+   self.assertEqual(TX.next_version(open_bucket,artifact),10)
+
+ @unittest.skipIf(os.geteuid()==0,"permission bits do not bind root")
+ def test_unwalkable_root_is_a_typed_refusal(self):
+  # Review round 1 (blocking 1, repro A): on a legacy-layout root nothing runs before the
+  # transaction, so an unwalkable campaign dir used to surface as a bare traceback (exit 1)
+  # inside the lock. In the cycle layout `check_write` refuses first (`cycle-unknown`) except
+  # inside the lock-wait window, which this same path covers.
+  with tempfile.TemporaryDirectory() as td:
+   root=Path(td); artifact,spec,route=self.fixture(root); (spec/"prd.md").write_text("before\n")
+   broken=artifact/"campaigns/2026-01-01_broken"; (broken/"2026-01-01_broken/artifacts/spec").mkdir(parents=True); os.chmod(broken,0)
+   events=root/"ev.jsonl"
+   try: result=subprocess.run(self.command(root,artifact,route,"pass",events=events),text=True,capture_output=True)
+   finally: os.chmod(broken,0o755)
+   self.assertEqual(result.returncode,65,result.stdout+result.stderr)
+   rows=[json.loads(l) for l in events.read_text().splitlines()]
+   self.assertEqual([(r["status"],r["reason"]) for r in rows if r["status"]=="blocked"],[("blocked","version-chain-unenumerable")])
+   self.assertIn("PermissionError",[r for r in rows if r["status"]=="blocked"][0]["detail"])
+   self.assertFalse(any(r["status"] in ("acquired","released") for r in rows),rows)
+   self.assertFalse((spec/"_internal").exists(),"no snapshot on a refused run")
+   self.assertEqual((artifact/".pipeline-lock").read_text(),"","the owner line is cleared")
+   self.assertEqual((spec/"prd.md").read_text(),"before\n")
+
  def test_component_spec_root_owns_its_version_sequence(self):
   with tempfile.TemporaryDirectory() as td:
    root=Path(td); artifact,component,route=self.fixture(root,component="component"); (component/"prd.md").write_text("before\n")
@@ -257,11 +313,12 @@ class CycleLayoutTest(unittest.TestCase):
   self.assertEqual(result.returncode,0,result.stdout+result.stderr)
   rows=[json.loads(l) for l in events.read_text().splitlines()]
   self.assertEqual([r["reason"] for r in rows if r["status"]=="seed-skipped"],["no-shared-revision"])
-  self.assertEqual([r["next_version"] for r in rows if r["status"]=="acquired"],[169])
+  self.assertEqual([(r["next_version"],r["version_source_layout"]) for r in rows if r["status"]=="acquired"],[(169,"legacy")])
   released=[r for r in rows if r["status"]=="released"][0]
   self.assertEqual((released["version"],released["snapshot"]),(169,"not-required-new"))
   self.assertEqual((cycle_dir/"artifacts"/"spec"/"prd.md").read_text(),"v169\n")
   self.assertFalse((cycle_dir/"artifacts"/"spec"/"_internal").exists(),"no pre-image, no snapshot; the number alone continues")
+
 
  def test_unadmitted_sealed_cycle_still_advances_the_chain(self):
   # Cycle A snapshots v2 but is sealed without admit_shared; cycle B seeds
@@ -275,7 +332,9 @@ class CycleLayoutTest(unittest.TestCase):
   _r,_f,begun=self._cycle("spec-edit-b"); cycle_b=Path(begun["cycle_dir"]); ev_b=Path(self._tmp.name)/"ev-b.jsonl"
   result=self._run(cycle_b,code,ev_b); self.assertEqual(result.returncode,0,result.stdout+result.stderr)
   rows=[json.loads(l) for l in ev_b.read_text().splitlines()]
-  self.assertEqual([r["next_version"] for r in rows if r["status"]=="acquired"],[3])
+  acquired=[r for r in rows if r["status"]=="acquired"]
+  self.assertEqual([r["next_version"] for r in acquired],[3])
+  self.assertEqual(acquired[0]["version_source_layout"],"cycle"); self.assertEqual(Path(acquired[0]["version_source"]),cycle_a/"artifacts"/"spec")
   spec_b=cycle_b/"artifacts"/"spec"
   self.assertEqual((spec_b/"_internal"/"versions"/"v3"/"prd.md").read_text(),"v1\n")
   self.assertFalse((spec_b/"_internal"/"versions"/"v2").exists(),"the seeded copy carries only shared history; v2 lives in cycle A")
