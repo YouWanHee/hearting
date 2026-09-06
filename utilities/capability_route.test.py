@@ -4482,6 +4482,214 @@ class ReviewIndependenceTest(InlineStageCompletionRecipeTest):
    outcome["review_independence"]["plan-check"]["review_independence"],"unrecorded")
 
 
+
+ # -- review round 1 fixes -------------------------------------------------
+
+ def test_a_claimed_reviewer_must_have_reviewed_this_node(self):
+  # Round 1 (1): the job title is not the assignment. Verifying only
+  # `worker_type=review` collapsed the check to "does any review worker exist
+  # anywhere in this registry", and the canonical registry answers yes
+  # thousands of times. A stale attempt id from a previous cycle is the likely
+  # case, not an attack.
+  for label,route_id,node in (
+   ("foreign route","rt-someotherroute","impl-review"),
+   ("foreign node",None,"some-other-node"),
+  ):
+   with self.subTest(label):
+    self.setUp()
+    route=self._route(self.base/"artifacts"); rnode=self._review_node(route)
+    self._registered_row("att-completer",route,"impl-review","owner")
+    meta=",".join([
+     "attempt_schema_version=2","dispatch_depth=2","transport=headless",
+     "execution_surface=registered-headless","registered_worker=1",
+     "fallback_hop=same-harness-headless","attempt_id=att-foreign",
+     "worker_type=review","note=completed-marker",
+     f"route_id={route_id or route['route_id']}",f"route_node={node}",
+    ])
+    with self.jobs.open("a",encoding="utf-8") as handle:
+     handle.write("\t".join(["2026-09-06T00:00:00Z","done","r","w","s",meta])+"\n")
+    marker,_=R.complete_node(
+     route,rnode,"impl-review",self._evidence(),
+     jobs=str(self.jobs),attempt_id="att-completer",
+     review_claim={"kind":"registered-worker","attempt_id":"att-foreign"})
+    self.assertEqual(marker["reviewer_kind"],"owner-inline")
+    self.assertEqual(marker["reviewer_downgrade_reason"],
+                     "reviewer-attempt-foreign-route-node")
+
+ def test_a_route_less_ad_hoc_reviewer_is_still_admissible(self):
+  # The predicate has to stay conditional: an SD-OPEN-40 reviewer is
+  # deliberately route-less, and its row carries no route_id at all.
+  route=self._route(self.base/"artifacts"); node=self._review_node(route)
+  self._registered_row("att-completer",route,"impl-review","owner")
+  meta=",".join([
+   "attempt_schema_version=2","dispatch_depth=1","transport=headless",
+   "execution_surface=registered-headless","registered_worker=1",
+   "fallback_hop=same-harness-headless","attempt_id=att-adhoc",
+   "worker_type=review","unit=qa/code-review","note=completed-marker",
+  ])
+  with self.jobs.open("a",encoding="utf-8") as handle:
+   handle.write("\t".join(["2026-09-06T00:00:00Z","done","r","w","s",meta])+"\n")
+  marker,_=R.complete_node(
+   route,node,"impl-review",self._evidence(),
+   jobs=str(self.jobs),attempt_id="att-completer",
+   review_claim={"kind":"registered-worker","attempt_id":"att-adhoc"})
+  self.assertEqual(marker["reviewer_kind"],"registered-worker")
+  self.assertEqual(marker["review_independence"],"independent")
+
+ def test_a_claimed_reviewer_that_produced_no_verdict_is_not_independent(self):
+  # Round 1 (2): a review worker that was launched and died was
+  # indistinguishable from one that reviewed. `open` qualified identically --
+  # the passing test happened to set done, nothing required it.
+  cases=(
+   ("still running","open","",  "reviewer-attempt-no-terminal-verdict"),
+   ("died","done","dead-worker-fail","reviewer-attempt-no-terminal-verdict"),
+   ("api error","done","dead-api-error","reviewer-attempt-no-terminal-verdict"),
+   ("blocking verdict","done","completed-review-blocking",None),
+  )
+  for label,status,note,expected in cases:
+   with self.subTest(label):
+    self.setUp()
+    route=self._route(self.base/"artifacts"); node=self._review_node(route)
+    self._registered_row("att-completer",route,"impl-review","owner")
+    meta=",".join([
+     "attempt_schema_version=2","dispatch_depth=2","transport=headless",
+     "execution_surface=registered-headless","registered_worker=1",
+     "fallback_hop=same-harness-headless","attempt_id=att-r",
+     "worker_type=review",f"route_id={route['route_id']}",
+     "route_node=impl-review",
+    ]+([f"note={note}"] if note else []))
+    with self.jobs.open("a",encoding="utf-8") as handle:
+     handle.write("\t".join(["2026-09-06T00:00:00Z",status,"r","w","s",meta])+"\n")
+    marker,_=R.complete_node(
+     route,node,"impl-review",self._evidence(),
+     jobs=str(self.jobs),attempt_id="att-completer",
+     review_claim={"kind":"registered-worker","attempt_id":"att-r"})
+    if expected is None:
+     # A FAIL verdict is a produced verdict.
+     self.assertEqual(marker["reviewer_kind"],"registered-worker")
+    else:
+     self.assertEqual(marker["reviewer_downgrade_reason"],expected)
+
+ def test_a_subsession_slice_cannot_certify_a_review_gate(self):
+  # Round 1 (3): `_complete_node_locked` already refuses a sub-session row as
+  # the COMPLETER (`subsession-has-no-stage-gate-authority`); the reviewer path
+  # simply never asked. A slice that may not satisfy the marker may not be the
+  # evidence that the marker is independent either.
+  route=self._route(self.base/"artifacts"); node=self._review_node(route)
+  self._registered_row("att-completer",route,"impl-review","owner")
+  meta=",".join([
+   "attempt_schema_version=2","dispatch_depth=2","transport=headless",
+   "execution_surface=registered-headless","registered_worker=1",
+   "fallback_hop=same-harness-headless","attempt_id=att-slice",
+   "worker_type=review","subsession_id=sub-1","stage_authority=0",
+   f"route_id={route['route_id']}","route_node=impl-review",
+   "note=completed-marker",
+  ])
+  with self.jobs.open("a",encoding="utf-8") as handle:
+   handle.write("\t".join(["2026-09-06T00:00:00Z","done","r","w","s",meta])+"\n")
+  marker,_=R.complete_node(
+   route,node,"impl-review",self._evidence(),
+   jobs=str(self.jobs),attempt_id="att-completer",
+   review_claim={"kind":"registered-worker","attempt_id":"att-slice"})
+  self.assertEqual(marker["reviewer_downgrade_reason"],"reviewer-attempt-subsession")
+
+ def test_owner_closure_is_the_opposite_of_independent(self):
+  # Round 1 (4), the sharpest one. SD-94 owner-closure hands the marker the
+  # BLOCKING REVIEWER's row, so the ordinary rules read `worker_type=review`
+  # and called the gate independent -- the exact inversion of what happened,
+  # which is that the owner ruled over a review that returned FAIL. Proven at
+  # the function boundary with the inputs that branch constructs (the full
+  # owner-closure fixture needs an exhausted round budget and a re-inspectable
+  # FAIL handoff; the code between here and the marker adds no reviewer logic).
+  node={"kind":"review-worker"}
+  axes={"attempt_id":"att-blocking-reviewer","registered_worker":True}
+  plain=R.resolve_review_identity(node,axes,{"worker_type":"review"})
+  self.assertEqual(plain["review_independence"],"independent")
+  overridden=R.resolve_review_identity(
+   node,axes,{"worker_type":"review"},owner_override=True)
+  self.assertEqual(overridden["review_independence"],"owner-overridden")
+  self.assertEqual(overridden["review_gate_closure"],"owner-closure")
+  self.assertEqual(overridden["reviewer_identity"],"att-blocking-reviewer")
+
+ def test_an_owner_overridden_gate_is_listed_with_the_degraded_ones(self):
+  # The §0.5 card rule reads one list, so both non-independent verdicts have to
+  # be in it -- otherwise the obligation never fires for the owner-closure case.
+  route=self._route(self.base/"artifacts"); node=self._review_node(route)
+  R.complete_node(route,node,"impl-review",self._evidence(),
+                  attempt_id="att-inline",
+                  explicit_attempt_metadata=self._inline_axes())
+  path=R.completion_dir(route["route_id"],jobs=self.jobs)/"impl-review.json"
+  marker=json.loads(path.read_text(encoding="utf-8"))
+  marker["review_independence"]="owner-overridden"
+  marker["review_gate_closure"]="owner-closure"
+  marker.pop("reviewer_downgrade_reason",None)
+  R.atomic_write(path,marker)
+  route_file=R.canonical_route_path(self.base/"artifacts",route["route_id"])
+  route_file.parent.mkdir(parents=True,exist_ok=True)
+  R.atomic_write(route_file,route)
+  outcome,_=R.close_route(route,route_file,commit="0"*40,summary="x")
+  self.assertEqual(outcome["review_independence_degraded"],["impl-review"])
+  self.assertEqual(
+   outcome["review_independence"]["impl-review"]["review_gate_closure"],
+   "owner-closure")
+
+ def test_a_marker_written_before_provenance_existed_is_named_as_such(self):
+  # Round 1 (5): the assertion that claimed to cover this took the
+  # `marker-unreadable` branch instead, because the node had never completed at
+  # all. `marker-predates-provenance` is the whole back-compat story for the
+  # existing corpus and appeared in no test.
+  route=self._route(self.base/"artifacts"); node=self._review_node(route)
+  R.complete_node(route,node,"impl-review",self._evidence(),
+                  attempt_id="att-inline",
+                  explicit_attempt_metadata=self._inline_axes())
+  path=R.completion_dir(route["route_id"],jobs=self.jobs)/"impl-review.json"
+  marker=json.loads(path.read_text(encoding="utf-8"))
+  for key in ("reviewer_kind","review_independence","reviewer_identity",
+              "reviewer_downgrade_reason"):
+   marker.pop(key,None)
+  R.atomic_write(path,marker)
+  route_file=R.canonical_route_path(self.base/"artifacts",route["route_id"])
+  route_file.parent.mkdir(parents=True,exist_ok=True)
+  R.atomic_write(route_file,route)
+  outcome,_=R.close_route(route,route_file,commit="0"*40,summary="x")
+  rows=outcome["review_independence"]
+  self.assertEqual(rows["impl-review"],
+                   {"review_independence":"unrecorded",
+                    "reason":"marker-predates-provenance"})
+  # and the never-completed node takes the OTHER branch -- the two are
+  # distinguishable now, which is what the old assertion could not do.
+  self.assertEqual(rows["plan-check"]["reason"],"marker-unreadable")
+  self.assertNotIn("impl-review",outcome.get("review_independence_degraded",[]))
+
+ def test_a_reviewer_claim_arriving_on_a_replay_says_it_was_ignored(self):
+  # Round 1 (6): provenance stays out of marker identity (correct), so naming
+  # the reviewer after the node completed is a no-op with exit 0. Honest, but
+  # it read as "still degraded" rather than "your evidence was dropped".
+  route=self._route(self.base/"artifacts"); node=self._review_node(route)
+  evidence=self._evidence()
+  R.complete_node(route,node,"impl-review",evidence,
+                  attempt_id="att-inline",
+                  explicit_attempt_metadata=self._inline_axes())
+  stream=io.StringIO()
+  with contextlib.redirect_stderr(stream):
+   again,_=R.complete_node(
+    route,node,"impl-review",evidence,
+    attempt_id="att-inline",explicit_attempt_metadata=self._inline_axes(),
+    review_claim={"kind":"native-subagent",
+                  "transcript":str(self._evidence("late.jsonl","x\n"))})
+  self.assertEqual(again["reviewer_kind"],"owner-inline")
+  self.assertIn("reviewer-claim-ignored-on-replay",stream.getvalue())
+
+ def test_an_owner_chain_aggregation_names_its_own_mechanism(self):
+  # Round 1 (8): the owner-chain gate carries no per-slice worker_type, so it
+  # is conservatively degraded -- but calling that `review-completed-inline`
+  # described the wrong mechanism.
+  node={"kind":"review-worker"}
+  axes={"attempt_id":"att-chain","registered_worker":False}
+  identity=R.resolve_review_identity(node,axes,{},owner_chain=True)
+  self.assertEqual(identity["reviewer_downgrade_reason"],
+                   "review-completed-owner-chain")
+
 class FixtureRegistryGuardTest(unittest.TestCase):
     """The guard that keeps fixture rows out of the operator's live registry.
 

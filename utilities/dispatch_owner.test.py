@@ -778,5 +778,49 @@ class RegisteredReviewerLaunchTest(unittest.TestCase):
                     OWNER._parse([*argv, *extra])
                 self.assertIn("owner-tuple-required", str(caught.exception))
 
+    def test_a_unit_must_be_in_the_catalog_not_merely_shaped_like_one(self):
+        # Round 1 (10b): the comment says "catalog persona" while the regex
+        # accepted any lowercase pair, so `foo/bar` passed.
+        with self.assertRaises(OWNER.OwnerError) as caught:
+            self._parse("--worker-type", "review", "--unit", "foo/bar")
+        self.assertIn("unknown-review-worker-unit", str(caught.exception))
+        # and a real one still passes
+        _, values, _, _ = self._parse(
+            "--worker-type", "review", "--unit", "qa/code-review")
+        self.assertEqual(values["--unit"], "qa/code-review")
+
+    def test_an_equal_form_flag_reaches_the_wrapper_exactly_once(self):
+        # Round 1 (10): the equal-form branch appended and then fell through to
+        # the unconditional append, so every `--flag=value` was forwarded twice.
+        # Pre-existing for `_REQUIRED`, and this branch widened it to `--unit`.
+        # Harmless while all three wrappers parse these as plain `store`, and one
+        # `action="append"` away from not being. Nothing pinned `forwarded`.
+        argv = [
+            "--worktree=/w", "--slug=s", "--capability=autopilot-code",
+            "--capability-mode=dev", "--qa=standard", "--intensity=standard",
+            "--dispatch-depth=1", "--worker-type=review",
+            "--unit=qa/code-review", "--assigned-contract=autopilot-code",
+            "--owner=autopilot-code", "--model-profile=deep", "--dry-run",
+        ]
+        _, _, forwarded, _ = OWNER._parse(argv)
+        flags = [a.split("=", 1)[0] for a in forwarded if a.startswith("--")]
+        duplicates = sorted({f for f in flags if flags.count(f) > 1})
+        self.assertEqual(duplicates, [], f"forwarded twice: {duplicates}")
+        for arg in argv:
+            self.assertIn(arg, forwarded)
+
+    def test_the_split_form_is_unchanged_by_that_fix(self):
+        # The split form already `continue`d; the fix must not disturb it.
+        # Count FLAGS, not tokens: distinct split-form flags legitimately share
+        # a value (`--capability` and `--assigned-contract` are both
+        # `autopilot-code`, `--qa` and `--intensity` both `standard`), so a
+        # token-level uniqueness assertion fails on correct output.
+        _, values, forwarded, _ = self._parse(
+            "--worker-type", "review", "--unit", "qa/code-review")
+        self.assertEqual(values["--worker-type"], "review")
+        flags = [a.split("=", 1)[0] for a in forwarded if a.startswith("--")]
+        duplicates = sorted({f for f in flags if flags.count(f) > 1})
+        self.assertEqual(duplicates, [], f"forwarded twice: {duplicates}")
+
 if __name__ == "__main__":
     unittest.main()

@@ -233,6 +233,12 @@ def _parse(argv):
             if equal:
                 values[name] = value
                 forwarded.append(arg)
+                i += 1
+                # Without this the equal form fell through to the unconditional
+                # append below and every `--flag=value` reached the wrapper
+                # twice. Harmless while all three wrappers parse these as plain
+                # `store`, and one `action="append"` away from not being.
+                continue
             else:
                 if i + 1 >= len(argv) or argv[i + 1].startswith("--"):
                     raise OwnerError(f"missing-value:{name}")
@@ -276,6 +282,10 @@ def _parse(argv):
             raise OwnerError("review-worker-unit-reserved")
         if not _UNIT_REF.fullmatch(unit):
             raise OwnerError("invalid-review-worker-unit")
+        # The comment above says "catalog persona", so check the catalog rather
+        # than a shape that `foo/bar` also satisfies.
+        if not (ROOT / "roles" / "units" / f"{unit}.md").is_file():
+            raise OwnerError("unknown-review-worker-unit")
         if route_evidence:
             # A route node's review worker is launched by the stage dispatcher
             # with its node binding, not by this selector. Accepting route

@@ -189,16 +189,35 @@ python3 <agent-home>/utilities/capability-route.py complete \
   --reviewer-subagent <transcript path>
 ```
 
+A named reviewer attempt must have reviewed *this* gate, not merely hold the
+job title: the row must not be a sub-session slice, must — if it is bound to a
+route at all — be bound to this route and node, and must have reached a terminal
+verdict (`done`, and not a `dead-*` note; `completed-review-blocking` counts,
+because a FAIL is a produced verdict). An ad-hoc SD-OPEN-40 reviewer carries no
+route binding and stays admissible.
+
 Name nothing and the completing attempt is the reviewer, which is independent
 only when its own registry row says `worker_type=review`. Everything else — no
-claim on an inline completion, a claimed row that is absent or is not a review
-worker, an unreadable transcript, no `--jobs` to adjudicate with — **is recorded
-as `reviewer_kind=owner-inline`, `review_independence=degraded`, with a typed
+claim on an inline completion, a claimed row that is absent, foreign, a
+sub-session, not a review worker, or never produced a verdict; an unreadable
+transcript; no `--jobs` to adjudicate with — **is recorded as
+`reviewer_kind=owner-inline`, `review_independence=degraded`, with a typed
 `reviewer_downgrade_reason`. It is never refused.** The node completes, the next
 one proceeds, and the degradation travels: `complete` prints
 `completed-review-degraded` on stderr, the row carries the same axes, the closed
 outcome lists the node under `review_independence_degraded`, and the §0.5
 completion card has to say that gate was not independently reviewed.
+
+The SD-94 owner-closure path — the owner ruling over a review that returned
+FAIL — is recorded `review_independence=owner-overridden` with
+`review_gate_closure=owner-closure`, and is listed alongside the degraded ones.
+It is the most literal case of "reviewed" meaning "the owner decided", and the
+row it closes genuinely belongs to a review worker, so without this it would
+have read as independent.
+
+Naming a reviewer *after* the node completed is a no-op: provenance is not part
+of marker identity, so the call replays the existing marker and prints
+`reviewer-claim-ignored-on-replay` rather than recording the late claim.
 
 To make the degraded path an exception rather than the norm, launch the reviewer
 as a registered review worker instead of an owner:

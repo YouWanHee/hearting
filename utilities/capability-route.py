@@ -16,6 +16,7 @@ import route_identity as ROUTE_IDENTITY
 import review_round_cap as REVIEW_ROUND_CAP
 from dispatch_continuation_budget import COMPATIBILITY_FLOOR, TERMINAL_RESERVE_DEFAULT
 from dispatch_contract import (
+    row_is_subsession,
     CANONICAL_PARENT_TRANSPORTS,
     DispatchContractError,
     EXECUTION_SURFACES,
@@ -2740,9 +2741,12 @@ def close_route(route, route_file, commit=None, summary=None, publication=None, 
     reviews=review_independence_observation(route)
     if reviews:
         outcome["review_independence"]=reviews
+        # `owner-overridden` belongs here with `degraded`: both mean "this gate
+        # was not closed by an independent reviewer's PASS", and the §0.5 card
+        # rule reads this one list.
         degraded=sorted(
             node_id for node_id,row in reviews.items()
-            if row.get("review_independence")=="degraded"
+            if row.get("review_independence") in ("degraded","owner-overridden")
         )
         if degraded: outcome["review_independence_degraded"]=degraded
     atomic_write(target,outcome)
@@ -2784,6 +2788,8 @@ def review_independence_observation(route):
         }
         if marker.get("reviewer_downgrade_reason"):
             row["reviewer_downgrade_reason"]=marker["reviewer_downgrade_reason"]
+        if marker.get("review_gate_closure"):
+            row["review_gate_closure"]=marker["review_gate_closure"]
         rows[node_id]=row
     return rows
 
@@ -2923,15 +2929,26 @@ def _marker_attempt_axes(node, attempt_id, attempt_metadata):
 REVIEWER_KINDS = ("registered-worker", "native-subagent", "owner-inline")
 
 
-def resolve_review_identity(node, axes, attempt_metadata, *, claim=None, jobs=None):
+def resolve_review_identity(
+    node, axes, attempt_metadata, *,
+    claim=None, jobs=None, route_id=None, node_id=None,
+    owner_override=False, owner_chain=False,
+):
     """Name who actually reviewed, for a `review-worker` node's completion marker.
 
     Returns `{}` for every other node kind, so no non-review marker changes shape.
 
-    Measured on 2026-09-06 across 2,911 production review markers: the axes
-    already separate registered (2,899) from inline (12), but among the inline
+    Measured 2026-09-06 over canonical markers under the dispatch state root's
+    `completion/` (excluding `*.attempt.json` and `<node>.<seq>.json` history
+    siblings). The total depends entirely on the predicate -- 67 for markers
+    whose route record still declares `kind=review-worker` (most route records
+    were pruned), 2,911 for markers whose node id merely contains "review" --
+    so the count is quoted with its predicate or not at all. What is stable
+    across both scopes is the shape: the axes already separate registered from
+    inline, and **12** are inline (not the same 12 -- 10 overlap; one predicate
+    misses `plan-check`, the other misses pruned routes). Among those inline
     ones nothing distinguished "the owner reviewed its own work" from "a native
-    subagent reviewed it" -- and the user's rule counts the second as independent.
+    subagent reviewed it", and the user's rule counts the second as independent.
     Nothing bound a *registered* completer to `worker_type=review` either, so
     `registered_worker=true` was not proof that a review worker produced the
     verdict.
@@ -2949,10 +2966,24 @@ def resolve_review_identity(node, axes, attempt_metadata, *, claim=None, jobs=No
     `reviewer_downgrade_reason`. Downgrade and not refusal is the whole point:
     the next node still proceeds, and the route's own outcome carries the fact
     that this gate was not independently reviewed.
+
+    `owner_override` is the SD-94 owner-closure path: the owner ruled over a
+    review that returned FAIL. That row genuinely is a review worker's, so the
+    plain rules below would call it `independent` -- which is precisely
+    backwards, because it is the one case where the owner overrode a real
+    reviewer. It gets its own verdict.
     """
 
     if node.get("kind") != "review-worker":
         return {}
+
+    if owner_override:
+        return {
+            "reviewer_kind": "registered-worker",
+            "review_independence": "owner-overridden",
+            "reviewer_identity": axes.get("attempt_id") or "-",
+            "review_gate_closure": "owner-closure",
+        }
 
     def degraded(reason):
         return {
@@ -2974,6 +3005,29 @@ def resolve_review_identity(node, axes, attempt_metadata, *, claim=None, jobs=No
             return degraded("reviewer-attempt-row-absent")
         if row.get("worker_type") != "review":
             return degraded("reviewer-attempt-not-review-worker")
+        # A sub-session slice "must not create, claim, or satisfy the route
+        # stage's completion marker" (SD-96 / OPERATIONS §5.10), and
+        # `_complete_node_locked` already refuses one as the *completer*. It
+        # cannot be the evidence that the marker is independent either.
+        if row_is_subsession(row):
+            return degraded("reviewer-attempt-subsession")
+        # The job title is not the assignment. A row bound to a route must be
+        # bound to THIS route and node; otherwise any review worker anywhere in
+        # the registry -- or a stale id pasted from a previous cycle -- would
+        # certify this gate. An SD-OPEN-40 ad-hoc reviewer is deliberately
+        # route-less, and stays admissible.
+        claimed_route = row.get("route_id")
+        if claimed_route and (
+            claimed_route != route_id or row.get("route_node") != node_id
+        ):
+            return degraded("reviewer-attempt-foreign-route-node")
+        # A reviewer that was launched and died produced no verdict. `done` plus
+        # a non-`dead-*` note is the contract's own definition of "this attempt
+        # finished its work"; `completed-review-blocking` stays admissible
+        # because a FAIL verdict is a produced verdict.
+        note = str(row.get("note") or "")
+        if row.get("_status") != "done" or note.startswith("dead-"):
+            return degraded("reviewer-attempt-no-terminal-verdict")
         return {
             "reviewer_kind": "registered-worker",
             "review_independence": "independent",
@@ -3007,7 +3061,36 @@ def resolve_review_identity(node, axes, attempt_metadata, *, claim=None, jobs=No
         }
     if axes.get("registered_worker"):
         return degraded("completer-not-review-worker")
+    if owner_chain:
+        # An owner-chain aggregation carries no per-slice `worker_type`, so the
+        # slices' own review status cannot be inherited today. Conservative and
+        # named: `review-completed-inline` would misdescribe the mechanism.
+        return degraded("review-completed-owner-chain")
     return degraded("review-completed-inline")
+
+
+def _notify_reviewer_claim_ignored(route, node_id, existing, resolved, review_claim):
+    """Say so when a replay drops a reviewer claim the caller just supplied.
+
+    The replay path has TWO entrances -- `write_completion_marker`'s own
+    `_completion_marker_replay`, and `_publish_completion_locked`'s
+    existing-attempt-link branch, which reads the marker off disk and never
+    calls the writer at all. The first version of this notice lived at one of
+    them, so an inline re-`complete` with a valid `--reviewer-subagent`
+    silently dropped the claim and printed nothing. One definition, both doors.
+    """
+
+    if not review_claim:
+        return
+    if all(existing.get(key) == value for key, value in resolved.items()):
+        return
+    print(
+        "capability-route: reviewer-claim-ignored-on-replay "
+        f"route_id={route['route_id']} node={node_id} "
+        f"recorded={existing.get('reviewer_kind','-')} "
+        f"claimed={resolved.get('reviewer_kind','-')}",
+        file=sys.stderr,
+    )
 
 
 def _next_marker_sequence(directory, node_id):
@@ -3120,14 +3203,28 @@ def evidence_digest(evidence):
 def write_completion_marker(
     route, node, node_id, evidence, *,
     attempt_id=None, attempt_metadata=None, review_claim=None, jobs=None,
+    owner_override=False, owner_chain=False,
 ):
     _migrate_completion_dir_forward(route["route_id"])
     directory=completion_dir(route["route_id"])
     canonical_path=directory/f"{node_id}.json"
     sha=evidence_digest(evidence)
     axes=_marker_attempt_axes(node, attempt_id, attempt_metadata)
+    review_identity=resolve_review_identity(
+        node, axes, attempt_metadata,
+        claim=review_claim, jobs=jobs,
+        route_id=route["route_id"], node_id=node_id,
+        owner_override=owner_override, owner_chain=owner_chain,
+    )
     replayed=_completion_marker_replay(route,node,node_id,evidence,axes,directory)
     if replayed is not None:
+        # A replay is the same completion, so provenance is deliberately not in
+        # marker identity -- but a caller that named a reviewer this time and
+        # gets the old marker back deserves to be told the claim was dropped,
+        # rather than reading exit 0 as "recorded".
+        _notify_reviewer_claim_ignored(
+            route,node_id,replayed,review_identity,review_claim,
+        )
         return replayed
     sequence=_next_marker_sequence(directory,node_id)
     marker={
@@ -3140,9 +3237,7 @@ def write_completion_marker(
         # is a fact recorded about a completion, not a second thing that has to
         # match for a replay to be the same completion. Empty for every node
         # kind but `review-worker`.
-        **resolve_review_identity(
-            node, axes, attempt_metadata, claim=review_claim, jobs=jobs,
-        ),
+        **review_identity,
         "completion_gate":node["completion_gate"],
         "evidence":{"path":str(evidence),"sha256":sha},
         "sequence":sequence,
@@ -3598,6 +3693,8 @@ def _publish_completion_locked(
     require_existing_link=False,
     review_claim=None,
     jobs=None,
+    owner_override=False,
+    owner_chain=False,
 ):
     """Publish marker history, exact-attempt link, and canonical marker under one node lock."""
 
@@ -3665,6 +3762,16 @@ def _publish_completion_locked(
         }
         if actual_static!=marker_static:
             raise ValueError("immutable attempt completion route identity differs from link")
+        _notify_reviewer_claim_ignored(
+            route,node_id,marker,
+            resolve_review_identity(
+                node,axes,attempt_metadata,
+                claim=review_claim,jobs=jobs,
+                route_id=route["route_id"],node_id=node_id,
+                owner_override=owner_override,owner_chain=owner_chain,
+            ),
+            review_claim,
+        )
     elif require_existing_link:
         raise ValueError("completed attempt row lacks immutable completion link")
 
@@ -3675,6 +3782,8 @@ def _publish_completion_locked(
             attempt_metadata=attempt_metadata,
             review_claim=review_claim,
             jobs=jobs,
+            owner_override=owner_override,
+            owner_chain=owner_chain,
         )
     if not attempt_id:
         return marker
@@ -4079,6 +4188,11 @@ def _complete_node_locked(
                 require_existing_link=already_closed and not marker_eligible,
                 review_claim=review_claim,
                 jobs=jobs_path,
+                # SD-94 owner-closure: the row IS a review worker's, so the
+                # ordinary rules would call this gate `independent` -- the exact
+                # inversion of what happened, which is that the owner ruled over
+                # a review that returned FAIL.
+                owner_override=owner_closure is not None,
             )
             if already_closed and not marker_eligible:
                 return marker, {"attempt_id":attempt_id,"status":"already-closed"}
@@ -4111,7 +4225,8 @@ def _complete_node_locked(
             # own already-closed branch), so spelling the degradation into `note`
             # would make an idempotent second `complete` refuse the very row it
             # had just closed.
-            for key in ("reviewer_kind","review_independence","reviewer_downgrade_reason"):
+            for key in ("reviewer_kind","review_independence",
+                        "reviewer_downgrade_reason","review_gate_closure"):
                 if marker.get(key):
                     row_fields[5] += f",{key}={marker[key]}"
             # DR-1: seal the pass verdict alongside the marker so partial-continuation
@@ -4549,6 +4664,7 @@ def complete_subsession_stage(route, node, node_id, evidence, manifest_path, job
         marker=write_completion_marker(
             route,node,node_id,evidence,
             attempt_id=attempt_id,attempt_metadata=metadata,
+            owner_chain=True,
         )
     return marker,{"status":"stage-gate-aggregated","sessions":len(manifest["sessions"])}
 
@@ -4904,15 +5020,18 @@ def main():
                 if a.output: atomic_write(a.output, marker)
                 print(json.dumps(marker,sort_keys=True))
                 if row: print(json.dumps(row,sort_keys=True))
-                if marker.get("review_independence")=="degraded":
+                if marker.get("review_independence") in ("degraded","owner-overridden"):
                     # Typed and on stderr, so an owner that closed its own review
                     # node cannot finish the stage without being told -- and so
                     # the §0.5 completion card has something to quote.
+                    reason=(marker.get("reviewer_downgrade_reason")
+                            or marker.get("review_gate_closure") or "-")
                     print(
                         "capability-route: completed-review-degraded "
                         f"route_id={route['route_id']} node={a.node} "
+                        f"independence={marker['review_independence']} "
                         f"reviewer_kind={marker['reviewer_kind']} "
-                        f"reason={marker.get('reviewer_downgrade_reason','-')}",
+                        f"reason={reason}",
                         file=sys.stderr,
                     )
 

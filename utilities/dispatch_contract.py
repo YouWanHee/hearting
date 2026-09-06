@@ -228,13 +228,17 @@ ATTEMPT_TERMINAL_EVIDENCE_KEYS = {
     "gate_closure",
     # SD-OPEN-41(b): verdict provenance for a `review-worker` node's completion.
     # `reviewer_kind` is one of capability-route's REVIEWER_KINDS,
-    # `review_independence` is independent|degraded, and the reason is present
-    # only on a degraded close. Terminal evidence, not a mutable axis: sealed
-    # beside `note=completed-marker` at the row's one close and never rewritten
-    # with a different value afterwards.
+    # `review_independence` is independent|degraded|owner-overridden, and the
+    # last two are present only on the corresponding close. Written once, beside
+    # `note=completed-marker`, at the row's one close -- but like `gate_closure`
+    # and every other member of this set except `launch_outcome` and the
+    # delivery-intent keys, that is a property of the only writer, NOT enforced
+    # by `_updated_attempt_metadata`: a later `terminal=True` write can still
+    # change them. Do not cite this list as a write-once guarantee.
     "reviewer_kind",
     "review_independence",
     "reviewer_downgrade_reason",
+    "review_gate_closure",
     "owner_closure",
 }
 _MODULE_ROOT = Path(__file__).resolve().parents[1]
