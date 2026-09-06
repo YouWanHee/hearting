@@ -202,6 +202,32 @@ class SubdivisionContractTest(unittest.TestCase):
         """Record the admission-time baseline exactly as dispatch-batch does."""
         return CR.record_subdivision_baseline(route, node["id"], manifest)
 
+    def test_sd_open_49_baseline_follows_the_explicit_jobs_not_the_inherited_root(self):
+        """H8: `dispatch-batch --jobs <fixture>` wrote rt-fixture baselines into
+        the live per-user completion root because the baseline path ignored the
+        registry the caller held."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            pinned = base / "pinned" / "jobs.log"
+            inherited = base / "inherited" / "jobs.log"
+            for path in (pinned, inherited):
+                path.parent.mkdir(parents=True)
+                path.write_text("", encoding="utf-8")
+            route = {"route_id": "rt-fixture", "route_hash": "sha256:fixture"}
+            worktree = base / "wt"
+            worktree.mkdir()
+            manifest = {"_manifest_sha256": "a" * 64, "worktree": str(worktree)}
+            with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(inherited)}):
+                path = CR.subdivision_baseline_path("rt-fixture", "plan", "a" * 64, jobs=pinned)
+                self.assertEqual(path.parent.parent.parent, pinned.parent / "completion")
+                CR.record_subdivision_baseline(route, "plan", manifest, jobs=pinned)
+                self.assertTrue(path.is_file())
+                self.assertFalse((inherited.parent / "completion").exists())
+                self.assertIsNotNone(CR.load_subdivision_baseline(route, "plan", manifest, jobs=pinned))
+                # the env root is still the default when no registry is pinned
+                fallback = CR.subdivision_baseline_path("rt-fixture", "plan", "a" * 64)
+                self.assertEqual(fallback.parent.parent.parent, inherited.parent / "completion")
+
     def test_ac27_marker_requires_all_slices_and_slice_complete_refused(self):
         # G7: exercise complete_subsession_stage through production code --
         # exactly one aggregated marker for the two slices, and an attempt to

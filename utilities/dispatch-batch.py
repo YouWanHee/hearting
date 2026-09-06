@@ -1905,7 +1905,7 @@ def main(argv: list[str] | None = None) -> int:
                 # at admission. Record it here, keyed by manifest hash, so a
                 # resumed admission recovers the original start state.
                 ROUTE_MODULE.record_subdivision_baseline(
-                    route, str(node["id"]), _manifest
+                    route, str(node["id"]), _manifest, jobs=args.jobs
                 )
         parent_identity = DISPATCH_NODE.current_parent_identity()
         if parent_identity is None:
