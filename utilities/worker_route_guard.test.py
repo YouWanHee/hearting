@@ -305,4 +305,130 @@ class WorkerRouteGuardTest(unittest.TestCase):
    state=G._git_state(nongit)
    self.assertEqual(state,{"repository":"non-git","operation":"none","branch":"non-git","head":"unversioned"})
 
+class ContinuationRetryLineageTest(WorkerRouteGuardTest):
+ """SD-133: an SD-67 retry carried by a continuation is adjudicated, not refused.
+
+ A continuation gets a new `route_id`, so the prior attempt that IS the retry
+ evidence lives under its ancestor's id. `_qualifying_retry_evidence` looked
+ only under the route's own id, so the evidence could never be found: the node
+ was refused `route-source-commit-mismatch` and the operator's only recourse was
+ to re-dispatch in place on the original route. Reproduced on main.
+ """
+
+ def _lineage_fixture(self, td):
+  repo, source, _path = self._lineage_repo(td, lineage_rows=False)
+  jobs = Path(os.environ["AGENT_DISPATCH_JOBS"])
+  execute = next(n for n in source["nodes"] if n["id"] == "execute")
+  self.assertIn("execute", source.get("resume_retry_boundaries", ()))
+  # execute ran once under the SOURCE route and its commit advanced HEAD.
+  self._write_registry_row(jobs, source["route_id"], "execute", "att-execute-prior")
+  (repo/"x").write_text("b")
+  subprocess.run(["git","-C",str(repo),"commit","-qam","execute output"],check=True)
+  continuation = self._continuation(source, repo)
+  # The pin stays inherited: this is the SD-67 decline, working as designed.
+  self.assertEqual(continuation["source_commit"], source["source_commit"])
+  self.assertNotEqual(continuation["route_id"], source["route_id"])
+  path = Path(td)/"continuation.json"
+  path.write_text(json.dumps(continuation))
+  return repo, source, continuation, path, execute
+
+ def test_the_ancestors_attempt_is_found_through_the_lineage(self):
+  with tempfile.TemporaryDirectory() as td:
+   repo, source, continuation, path, _execute = self._lineage_fixture(td)
+   self.assertIn(source["route_id"], R.continuation_lineage_route_ids(continuation))
+   # Under the continuation's own id alone there is nothing -- which is why
+   # main refuses.
+   self.assertEqual(
+    G.FALLBACK.registry_rows(
+     Path(os.environ["AGENT_DISPATCH_JOBS"]), continuation["route_id"], "execute"),
+    [])
+   self.assertTrue(G._qualifying_retry_evidence(continuation, "execute", None))
+
+ def test_the_mutation_node_now_validates_on_the_continuation(self):
+  with tempfile.TemporaryDirectory() as td:
+   repo, _source, _continuation, path, _execute = self._lineage_fixture(td)
+   _route, node, _git = G.validate_route_contract(path, "execute", repo, repo)
+   self.assertEqual(node["id"], "execute")
+
+ def test_without_the_ancestor_attempt_the_node_is_still_refused(self):
+  # The gate did not go away: remove the evidence and the same call refuses.
+  with tempfile.TemporaryDirectory() as td:
+   repo, _source, _continuation, path, _execute = self._lineage_fixture(td)
+   Path(os.environ["AGENT_DISPATCH_JOBS"]).write_text("", encoding="utf-8")
+   with self.assertRaises(G.WorkerRouteError) as ctx:
+    G.validate_route_contract(path, "execute", repo, repo)
+   self.assertEqual(ctx.exception.reason, "route-source-commit-mismatch")
+
+ def test_an_attempt_on_a_different_node_does_not_authorise_this_one(self):
+  # The widening is about WHERE the evidence may live, not WHAT counts as
+  # evidence. An ancestor's attempt on `plan` must not license an `execute`
+  # retry -- without the node filter it would, because the lineage read
+  # returns every row for every ancestor route.
+  with tempfile.TemporaryDirectory() as td:
+   repo, source, _continuation, path, _execute = self._lineage_fixture(td)
+   jobs = Path(os.environ["AGENT_DISPATCH_JOBS"])
+   jobs.write_text("", encoding="utf-8")
+   self._write_registry_row(jobs, source["route_id"], "plan", "att-plan-prior")
+   with self.assertRaises(G.WorkerRouteError) as ctx:
+    G.validate_route_contract(path, "execute", repo, repo)
+   self.assertEqual(ctx.exception.reason, "route-source-commit-mismatch")
+
+ def test_the_immediate_parent_arrives_by_two_paths(self):
+  # For the FIRST generation only, `source_route_id` and the single
+  # `supersession_edges` entry both name the same predecessor, so dropping
+  # either alone changes nothing here. That redundancy does not extend to
+  # grandparents -- see the next test, which is the majority shape in
+  # production.
+  with tempfile.TemporaryDirectory() as td:
+   _repo, source, continuation, _path, _execute = self._lineage_fixture(td)
+   self.assertEqual(continuation["source_route_id"], source["route_id"])
+   self.assertIn(source["route_id"],
+                 [edge.get("from_route_id")
+                  for edge in continuation.get("supersession_edges", [])])
+
+ def test_a_grandparents_attempt_reaches_only_through_supersession_edges(self):
+  # The second generation is where the edges stop being redundant: the
+  # grandparent is named by NO `source_route_id` on this record, only by an
+  # inherited edge. I claimed this branch was un-catchable; it is not, and it
+  # is the majority path -- 16 of 31 production continuation records carry two
+  # or more edges (independent review, 2026-09-06).
+  with tempfile.TemporaryDirectory() as td:
+   repo, grandparent, first, _path, _execute = self._lineage_fixture(td)
+   # Resume at the first node, as the first generation did: a later resume
+   # point would need reused-evidence markers for the skipped prefix, which is
+   # a different contract and not what this test is about.
+   head_node = first["nodes"][0]["id"]
+   second = R.build_continuation_route(
+    first, resume_from_node=head_node, requested_boundary=head_node,
+    reason="second-generation", artifact_root=first["artifact_root"])
+   self.assertEqual(second["source_route_id"], first["route_id"])
+   self.assertNotEqual(second["source_route_id"], grandparent["route_id"])
+   # The grandparent is reachable only through the inherited edges.
+   edges = [edge.get("from_route_id") for edge in second.get("supersession_edges", [])]
+   self.assertIn(grandparent["route_id"], edges)
+   self.assertIn(grandparent["route_id"], R.continuation_lineage_route_ids(second))
+   # And its attempt is what admits the node two generations later.
+   self.assertTrue(G._qualifying_retry_evidence(second, "execute", None))
+   path = Path(td)/"second.json"
+   path.write_text(json.dumps(second))
+   _route, node, _git = G.validate_route_contract(path, "execute", repo, repo)
+   self.assertEqual(node["id"], "execute")
+
+ def test_a_node_outside_resume_retry_boundaries_is_still_refused(self):
+  # SD-67's first condition is untouched: only a declared boundary may retry.
+  with tempfile.TemporaryDirectory() as td:
+   repo, _source, continuation, path, _execute = self._lineage_fixture(td)
+   stripped = json.loads(json.dumps(continuation))
+   stripped["resume_retry_boundaries"] = [
+    n for n in stripped.get("resume_retry_boundaries", []) if n != "execute"]
+   # Re-seal so the record still verifies with the narrowed boundary set.
+   stripped["route_hash"] = R.route_hash(stripped)
+   stripped["route_id"] = "rt-" + stripped["route_hash"].split(":",1)[1][:16]
+   narrowed = Path(td)/"narrowed.json"
+   narrowed.write_text(json.dumps(stripped))
+   with self.assertRaises(G.WorkerRouteError) as ctx:
+    G.validate_route_contract(narrowed, "execute", repo, repo)
+   self.assertEqual(ctx.exception.reason, "route-source-commit-mismatch")
+
+
 if __name__=="__main__": unittest.main()

@@ -84,14 +84,41 @@ def _direct_mutation_node(node: dict) -> bool:
     return any(_worktree_mutating_scope(s) for s in node.get("write_scope", []))
 
 
-def _qualifying_retry_evidence(route_id: str, node_id: str, current_attempt: str | None) -> bool:
-    """SD-67: a different prior global-registry attempt for the same route/node."""
+def _qualifying_retry_evidence(route: dict, node_id: str, current_attempt: str | None) -> bool:
+    """SD-67: a different prior global-registry attempt for this node.
+
+    SD-133: the lookup follows the route's own lineage, not just its id. A
+    continuation gets a new `route_id`, so the attempt that *is* the retry
+    evidence was written under an ancestor's id and this gate could never see
+    it -- an SD-67 retry carried by a continuation was refused rather than
+    adjudicated, and the operator's only route was to re-dispatch in place on
+    the original route.
+
+    The lineage comes from the record's `source_route_id` and
+    `supersession_edges`. **This is not an authentication boundary**, and an
+    earlier version of this comment wrongly said it was: `route_hash` is
+    unkeyed, and nothing checks that a named ancestor is semantically this
+    route's ancestor (same cwd, reachable chain). Anyone able to author a route
+    record could already set `source_commit` or `resume_retry_boundaries`
+    directly, and the registry this reads is the ambient
+    `AGENT_DISPATCH_JOBS` -- forgeable on `main` too. So this widening rests on
+    exactly the trust boundary the surrounding gate already assumed; it does
+    not add one, and it must not be cited as providing one.
+
+    The three SD-67 conditions are unchanged: the node must still be declared
+    in `resume_retry_boundaries`, the prior attempt must still be a different
+    one, and `HEAD` must still be a first-parent descendant of the pin. Only
+    *where the evidence may live* widened.
+    """
     jobs_env = os.environ.get("AGENT_DISPATCH_JOBS")
     if not jobs_env: return False
     jobs_path = Path(jobs_env)
     if not jobs_path.is_absolute() or not jobs_path.is_file(): return False
     try:
-        rows = FALLBACK.registry_rows(jobs_path, route_id, node_id)
+        rows = FALLBACK.registry_route_rows(
+            jobs_path, ROUTE.continuation_lineage_route_ids(route)
+        )
+        rows = [row for row in rows if row.get("route_node") == node_id]
     except (OSError, ValueError):
         return False
     current = next((row for row in rows if row.get("attempt_id") == current_attempt), None)
@@ -215,7 +242,7 @@ def validate_route_contract(route_path: str | Path, node_id: str, cwd: str | Pat
                       and _is_first_parent_descendant(actual_cwd, route["source_commit"], git["head"]))
         mutation_retry_ok = (_direct_mutation_node(node)
                       and node_id in route.get("resume_retry_boundaries", ())
-                      and _qualifying_retry_evidence(route["route_id"], node_id, current_attempt)
+                      and _qualifying_retry_evidence(route, node_id, current_attempt)
                       and _is_first_parent_descendant(actual_cwd, route["source_commit"], git["head"]))
         planned_subsession_ok = (_direct_mutation_node(node)
                       and node_id in route.get("resume_retry_boundaries", ())

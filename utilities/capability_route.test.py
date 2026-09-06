@@ -2812,7 +2812,7 @@ class TestContinuation(unittest.TestCase):
    self.assertIn("execute",[node["id"] for node in second["nodes"]])
    # And the ancestor whose rows carry the evidence is reachable from the
    # second-generation source route.
-   self.assertIn(source["route_id"],R._continuation_lineage_route_ids(first))
+   self.assertIn(source["route_id"],R.continuation_lineage_route_ids(first))
    self.assertNotEqual(moved,pinned)
 
  def _stage_rows(self,jobs,route_id):
