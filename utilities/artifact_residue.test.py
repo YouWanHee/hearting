@@ -522,6 +522,9 @@ class GateTests(ResidueFixture):
         self.seed("spec/.pipeline-lock", "")
         self.seed("spec/_internal/versions/v1/prd.md", "# v1\n")
         shas = {rel: _sha(self.root / rel) for rel in ("spec/prd.md", "spec/.pipeline-lock", "spec/_internal/versions/v1/prd.md")}
+        # The spec lane needs a shared/spec revision to fall back to (review M6).
+        self.seed(f"shared/spec/ref_{'a' * 32}/revisions/rrev_{'b' * 32}/prd.md", "# shared\n")
+        self.assertIsNotNone(C.latest_shared_revision(self.root, "spec"))
         # An earlier W7H run already sealed this root's `support:root` residue
         # cycle (cairn's case); the spec lane opens a second one later.
         self.seed("_internal/dev_reviews/phase.md")
@@ -742,6 +745,128 @@ class RejoinTests(ResidueFixture):
         done = self.apply()
         self.assertEqual(done["status"], "complete", done)
         self.assertEqual(done["report"]["totals"]["rejoined"], 1)
+
+    def test_occupied_target_defers_the_link_instead_of_failing_the_run(self):
+        # Review B1: a migrated sibling already holds the name the link would take.
+        sealed, d1 = self.migrated_plan_cycle(files=("STORY.md",), directory_row=False)
+        self.seed(f"plans/{d1}/_internal/plan_reviews/round_1.md")  # ordinary residue in the same run
+        (self.root / "plans" / d1 / "STORY.md").symlink_to(self.corpus())
+        plan = RES.build_plan(self.root)
+        self.assertEqual(plan["totals"]["rejoined"], 0)
+        (deferred,) = plan["deferred"]
+        self.assertEqual(deferred["reason"], "symlink-target-occupied")
+        self.assertTrue(deferred["rejoin_target"].endswith(f"/artifacts/plans/{d1}/STORY.md"))
+        result = self.apply()
+        self.assertEqual(result["status"], "complete", result)  # the residue file still moves
+        self.assertTrue((self.root / "plans" / d1 / "STORY.md").is_symlink())
+        self.assertEqual(RES.status(self.root)["legacy_top_level"], "deferred-only")
+        self.assertEqual(G.evaluate([self.gate_row()], waived=False, require_residue=True)[0], "complete")
+
+    def test_rejoin_never_lands_in_a_shared_revision(self):
+        # Review B2: a compat row into `shared/<kind>/.../rrev_*` lends an ancestor home that is not a cycle.
+        rev = self.root / "shared" / "analysis" / ("ref_" + "d" * 32) / "revisions" / ("rrev_" + "c" * 32) / "code"
+        rev.mkdir(parents=True)
+        (rev / "audit.md").write_text("audit\n")
+        later = Path(self._tmp.name) / "shared-map.jsonl"
+        C._write_jsonl(later, [{"schema_version": C.MAP_SCHEMA, "kind": "file", "source_locator": "analysis_project/code/audit.md",
+                                "target_locator": rev.relative_to(self.root).as_posix() + "/audit.md",
+                                "sha256": "sha256:" + _sha(rev / "audit.md"), "identity_refs": []}])
+        C.compat_close(self.root, maps=[later], approval_receipt_sha256=None)
+        (self.root / "analysis_project" / "code" / "evidence").mkdir(parents=True)
+        (self.root / "analysis_project" / "code" / "evidence" / "run.wav").symlink_to(self.corpus())
+        self.assertIsNone(RES.rejoin_target(self.root, "analysis_project/code/evidence/run.wav"))
+        plan = RES.build_plan(self.root)
+        self.assertEqual(plan["totals"]["rejoined"], 0)
+        self.assertEqual(plan["deferred"][0]["reason"], "symlink")
+        self.assertEqual([p for p in rev.rglob("*") if p.is_symlink()], [])
+
+    def test_absolute_link_whose_target_this_run_moves_is_deferred_and_backstopped(self):
+        # Review B3: the link is live at plan time; its target (a legacy note) moves in the same run.
+        sealed, d1 = self.migrated_plan_cycle(directory_row=False)
+        note = self.seed("notes/keep/data.bin", b"\x00\x01")
+        (self.root / "plans" / d1 / "audio").mkdir(parents=True)
+        legacy = f"plans/{d1}/audio/data.bin"
+        (self.root / legacy).symlink_to(note)
+        plan = RES.build_plan(self.root)
+        self.assertEqual(plan["totals"]["rejoined"], 0)
+        (deferred,) = plan["deferred"]
+        self.assertEqual(deferred["reason"], "symlink-target-moving")
+        result = self.apply()
+        self.assertEqual(result["status"], "complete", result)
+        self.assertTrue((self.root / legacy).is_symlink())
+        self.assertFalse((self.root / legacy).exists())  # now dangling, still at the legacy path, typed
+        view = RES.status(self.root)
+        self.assertEqual((view["legacy_top_level"], view["symlinks_dangling"]), ("deferred-only", 1))
+        # Backstop: a rename-time drift (target vanished after planning) is refused before the rename.
+        wav = self.corpus("late.wav")
+        (self.root / "plans" / d1 / "audio" / "late.wav").symlink_to(wav)
+        plan = RES.build_plan(self.root)
+        self.assertEqual(plan["totals"]["rejoined"], 1)
+        wav.unlink()
+        run_dir = Path(self._tmp.name) / "run-b3"; run_dir.mkdir()
+        with self.assertRaises(RES.ResidueError) as ctx:
+            RES._phase_rename(self.root, run_dir, {"begun": {}}, plan)
+        self.assertEqual(ctx.exception.code, "symlink-unresolvable")
+        self.assertTrue((self.root / "plans" / d1 / "audio" / "late.wav").is_symlink())
+
+    def test_nested_relative_link_resolves_through_a_parent_this_run_creates(self):
+        # Review M1: the link sits one directory below the mapped ancestor; its `..` target must fold lexically.
+        d1 = "2026-07-27_tts-wwd"
+        sealed, _ = self.migrated_plan_cycle(d1, top="experiments", files=("html/index.html",), directory_row=False)
+        (self.root / "experiments" / d1 / "html").mkdir(parents=True)  # empty legacy shell keeps the link live
+        (self.root / "experiments" / d1 / "sub").mkdir()
+        legacy = f"experiments/{d1}/sub/up"
+        (self.root / legacy).symlink_to("../html")
+        plan = RES.build_plan(self.root)
+        self.assertEqual(plan["totals"]["rejoined"], 1, plan["deferred"])
+        result = self.apply()
+        self.assertEqual(result["status"], "complete", result)
+        moved = self.root / plan["rejoins"][0]["target"]
+        self.assertEqual(os.readlink(moved), "../html")
+        self.assertTrue((moved / "index.html").is_file())
+        self.assertEqual(RES.status(self.root)["legacy_top_level"], "empty")
+
+    def test_rejoin_only_run_can_roll_back_from_any_phase(self):
+        # Review M3: no cycle is ever sealed, so there is no commit point to be past.
+        sealed, d1 = self.migrated_plan_cycle(directory_row=False)
+        wav = self.corpus()
+        legacy = f"plans/{d1}/audio_fullband/EN2002a.wav"
+        (self.root / legacy).parent.mkdir(parents=True)
+        (self.root / legacy).symlink_to(wav)
+        compat_before = C.compat_path(self.root).read_bytes()
+        for phase in ("sealed", "compat-reissued", "indexed"):
+            with self.subTest(phase=phase):
+                with self.assertRaises(RES.ResidueError):
+                    self.apply(crash_after_phase=phase)
+                rolled = RES.rollback(self.root)
+                self.assertEqual(rolled["status"], "rolled-back", rolled)
+                self.assertTrue((self.root / legacy).is_symlink())
+                self.assertEqual(os.readlink(self.root / legacy), str(wav))
+                self.assertEqual(C.compat_path(self.root).read_bytes(), compat_before)
+                self.assertIsNone(RES.residue_hold(self.root))
+        done = self.apply()
+        self.assertEqual(done["status"], "complete", done)
+        self.assertEqual(done["report"]["totals"]["rejoined"], 1)
+
+    def test_spec_top_refuses_when_no_shared_spec_fallback_exists(self):
+        # Review M6: moving the only PRD a root has would leave the spec gate with nothing to read.
+        self.seed("spec/prd.md", "# only copy\n")
+        self.assertIsNone(C.latest_shared_revision(self.root, "spec"))
+        with self.assertRaises(RES.ResidueError) as ctx:
+            RES.build_plan(self.root, include_spec_top=True)
+        self.assertEqual(ctx.exception.code, "spec-top-no-shared-fallback")
+        self.assertEqual(RES.build_plan(self.root)["totals"]["movable"], 0)  # default lane unaffected
+
+    def test_link_inside_sealed_evidence_tree_stays_with_the_evidence_lane(self):
+        # Review M4: the evidence prefix wins over rejoin for a link too.
+        evidence = C.SEALED_EVIDENCE_PATHS[2]  # plans/2026-08-25_artifact-knowledge-index-w7-e2-e3
+        d1 = evidence.split("/")[1]
+        self.migrated_plan_cycle(d1, files=("note.md",), directory_row=False)
+        (self.root / evidence / "evidence").mkdir(parents=True)
+        (self.root / evidence / "evidence" / "corpus.wav").symlink_to(self.corpus())
+        plan = RES.build_plan(self.root)
+        self.assertEqual(plan["totals"]["rejoined"], 0)
+        self.assertEqual(plan["deferred"][0]["reason"], "symlink-sealed-evidence")
 
     def test_rejoin_refuses_a_link_that_changed_after_planning(self):
         sealed, d1 = self.migrated_plan_cycle(directory_row=False)

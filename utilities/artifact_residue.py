@@ -77,7 +77,7 @@ import re
 import sys
 import tarfile
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Set, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -327,9 +327,11 @@ def rejoin_target(root: Path, rel: str) -> Optional[Dict[str, Any]]:
 
     Nearest ancestor first, never shallower than `<bucket>/<d1>` (D-23
     boundary); among that ancestor's mapped homes the one most rows support
-    (ties: lexicographic), and only a home that is a real directory right now.
+    (ties: lexicographic), and only a home that is a real directory inside a
+    *sealed cycle* right now -- a content-addressed shared revision
+    (`shared/<kind>/ref_*/revisions/rrev_*`) never receives a new file.
     Returns `{"target": <root-relative>, "ancestor": <legacy dir>,
-    "mapped_ancestor": <current dir>, "rows": <votes>}`.
+    "mapped_ancestor": <current dir>, "rows": <votes>, "cycle_id": <id>}`.
     """
     amap = _ancestor_map(root)
     parts = rel.split("/")
@@ -338,13 +340,31 @@ def rejoin_target(root: Path, rel: str) -> Optional[Dict[str, Any]]:
         votes = amap.get(ancestor)
         if not votes:
             continue
-        ranked = sorted(votes.items(), key=lambda item: (-item[1], item[0]))
+        # Most rows first; on a tie the cycle's own `artifacts/<bucket>/` beats
+        # a support-residue `artifacts/_internal/` home; then lexicographic.
+        ranked = sorted(votes.items(), key=lambda item: (-item[1], "/artifacts/_internal/" in item[0] + "/", item[0]))
         for mapped, count in ranked:
             home = Path(root) / mapped
-            if home.is_dir() and not home.is_symlink():
-                tail = "/".join(parts[depth:])
-                return {"target": f"{mapped}/{tail}", "ancestor": ancestor, "mapped_ancestor": mapped, "rows": count}
+            if not home.is_dir() or home.is_symlink():
+                continue
+            cycle_id = _cycle_id_above(root, f"{mapped}/x")
+            if cycle_id is None:
+                continue
+            tail = "/".join(parts[depth:])
+            return {"target": f"{mapped}/{tail}", "ancestor": ancestor, "mapped_ancestor": mapped,
+                    "rows": count, "cycle_id": cycle_id}
     return None
+
+
+def _link_resolves_at(root: Path, target_rel: str, link_target: str) -> bool:
+    """Would a link placed at `target_rel` resolve?  A relative target is folded
+    lexically (`normpath`) so a parent directory this run has yet to `mkdir`
+    does not fail the probe; intermediate symlinks are therefore judged
+    conservatively (the kernel would follow them, this probe does not)."""
+    if os.path.isabs(link_target):
+        return os.path.exists(link_target)
+    probe = os.path.normpath(os.path.join(os.path.dirname(str(Path(root) / target_rel)), link_target))
+    return os.path.exists(probe)
 
 
 def _origin_cycle(root: Path, rel_dir: str) -> Optional[Dict[str, Any]]:
@@ -441,6 +461,7 @@ def classify(root: Path, rel: str, *, origin_cache: Dict[str, Optional[Dict[str,
     top, name = parts[0], parts[-1]
     row: Dict[str, Any] = {"path": rel, "top": top}
     link = Path(root) / rel
+    evidence_prefix = next((s for s in C.SEALED_EVIDENCE_PATHS if rel == s or rel.startswith(s + "/")), None)
     if link.is_symlink():
         link_target = os.readlink(link)
         absolute = os.path.isabs(link_target)
@@ -449,17 +470,27 @@ def classify(root: Path, rel: str, *, origin_cache: Dict[str, Optional[Dict[str,
                    link_target=link_target, link_absolute=absolute, dangling=not resolved.exists())
         if row["dangling"]:
             return row  # retire path (`retire-trash --include-dangling-symlinks`), never a rejoin
+        if evidence_prefix is not None:
+            # A link inside a sealed-evidence tree belongs to the evidence
+            # lane; rejoining it elsewhere would split that tree. Typed deferral.
+            row.update(reason="symlink-sealed-evidence", evidence_prefix=evidence_prefix)
+            return row
         found = rejoin_target(root, rel)
         if found is None:
             return row
-        if not absolute and not ((Path(root) / found["target"]).parent / link_target).exists():
+        if os.path.lexists(Path(root) / found["target"]):
+            # A migrated sibling already holds that name. One immovable link
+            # must not fail the whole run: typed deferral, like any other.
+            row.update(reason="symlink-target-occupied", rejoin_target=found["target"])
+            return row
+        if not absolute and not _link_resolves_at(root, found["target"], link_target):
             # The link would dangle at its new home (its target did not
             # migrate, or migrates in this very run): leave it, typed.
             row.update(reason="symlink-relative-unresolvable", rejoin_target=found["target"])
             return row
         row.update(disposition="rejoin", target=found["target"], reason=None,
                    rejoin_ancestor=found["ancestor"], rejoin_mapped_ancestor=found["mapped_ancestor"],
-                   rejoin_rows=found["rows"], rejoin_cycle_id=_cycle_id_above(root, found["target"]))
+                   rejoin_rows=found["rows"], rejoin_cycle_id=found["cycle_id"])
         return row
     if name == ".gitkeep" or any(p in {".agent_reports", ".claude_reports", ".runtime"} for p in parts[1:]):
         row.update(shape="trash", disposition="retire-with-approval", group=None, target=None)
@@ -467,7 +498,6 @@ def classify(root: Path, rel: str, *, origin_cache: Dict[str, Optional[Dict[str,
     safe_rel, renamed = sanitize_locator(rel)
     if renamed:
         row["locator_renamed_from"] = rel
-    evidence_prefix = next((s for s in C.SEALED_EVIDENCE_PATHS if rel == s or rel.startswith(s + "/")), None)
     if evidence_prefix is not None:
         row.update(shape="sealed-evidence", disposition="evidence-cycle", group=f"evidence:{evidence_prefix}",
                    target=f"artifacts/{safe_rel}", evidence_prefix=evidence_prefix)
@@ -573,18 +603,22 @@ def _cycle_spec(root: Path, group: str, rows: List[Dict[str, Any]]) -> Dict[str,
     raise ResidueError("residue-group-unknown", group)
 
 
-def _free_cycle_key(root: Path, ledger: Mapping[str, Mapping[str, Any]], base: str) -> str:
+def _free_cycle_key(root: Path, ledger: Mapping[str, Mapping[str, Any]], base: str,
+                    spent_routes: Set[str]) -> str:
     """The residue cycle key this run may `begin` under.
 
     The per-cycle route ledger is keyed by cycle key (D-77-b idempotency), and a
     sealed residue cycle leaves its derived route closed, so a later run that
     finds *new* residue for the same group (a root whose `support:root` cycle
     was sealed on 2026-09-05 and now disposes of `spec/` under
-    `--include-spec-top`) must open the next ordinal, `<base>#2`. An open key
-    is kept, so a resumed run still finds its own route.
+    `--include-spec-top`) must open the next ordinal, `<base>#2`. A key whose
+    route is closed *or already carries a non-open cycle record* (`begin`
+    refuses a second cycle per route: `index-route-composite-duplicate`) is
+    spent; a key whose route is open with no cycle, or with its own still-open
+    cycle, is a resumable run's and is kept.
     """
     key, ordinal = base, 1
-    while key in ledger and P.route_is_closed(root, ledger[key]):
+    while key in ledger and (P.route_is_closed(root, ledger[key]) or ledger[key].get("route_id") in spent_routes):
         ordinal += 1
         key = f"{base}#{ordinal}"
     return key
@@ -600,18 +634,40 @@ def build_plan(root: Path, *, include_spec_top: bool = False) -> Dict[str, Any]:
         st = (root / row["path"]).lstat()
         row["size"] = st.st_size
         row["inode"] = st.st_ino
+    # An absolute link into this root whose target this very run moves would be
+    # live at plan time and dangling after `_phase_rename` (cycle and route
+    # renames run before rejoins). Typed deferral now; the rename-time and
+    # witness checks stay as the fail-closed backstop.
+    moving = {r["path"] for r in rows if r["disposition"] not in {"deferred", "retire-with-approval"}}
+    for row in rows:
+        if row["disposition"] != "rejoin" or not row["link_absolute"]:
+            continue
+        try:
+            inside = Path(row["link_target"]).resolve().relative_to(root).as_posix()
+        except ValueError:
+            continue
+        if inside in moving or any(m.startswith(inside + "/") for m in moving):
+            row.update(disposition="deferred", reason="symlink-target-moving", rejoin_target=row["target"], target=None)
+    if include_spec_top and any(r.get("spec_top") for r in rows) and C.latest_shared_revision(root, "spec") is None:
+        # `spec/` is the only PRD this root has: the spec gate and `find_prd`
+        # would resolve nothing once it moves. Refuse, typed.
+        raise ResidueError("spec-top-no-shared-fallback", str(root / "spec"))
     by_disposition: collections.Counter = collections.Counter(r["disposition"] for r in rows)
     by_shape: collections.Counter = collections.Counter(r["shape"] for r in rows)
     groups: Dict[str, List[Dict[str, Any]]] = collections.OrderedDict()
     for row in rows:
         if row["group"] and row["disposition"] != "runtime-routes-legacy":
             groups.setdefault(row["group"], []).append(row)
-    ledger = RS.ledger_resplit_routes(root)
+    # The route ledger is an O(routes) file sweep (hearting: 1,270 files);
+    # a rejoin-only plan never needs it.
+    ledger = RS.ledger_resplit_routes(root) if groups else {}
+    spent_routes = ({rec.get("route_id") for rec in P.list_cycle_records(root) if rec.get("state") != "open"}
+                    if groups else set())
     cycles = []
     for group, grows in groups.items():
         spec = _cycle_spec(root, group, grows)
         cycles.append({**spec, "group": group,
-                       "cycle_key": _free_cycle_key(root, ledger, f"residue:{_root_slug(root)}:{group}"),
+                       "cycle_key": _free_cycle_key(root, ledger, f"residue:{_root_slug(root)}:{group}", spent_routes),
                        "files": [{"path": r["path"], "target": r["target"], "size": r["size"], "inode": r["inode"],
                                   **({"locator_renamed_from": r["locator_renamed_from"]} if r.get("locator_renamed_from") else {})}
                                  for r in grows],
@@ -859,8 +915,10 @@ def _rename_link(root: Path, run_dir: Path, rows: List[Dict[str, Any]], source: 
         raise ResidueError("residue-source-missing", _rel(root, source))
     if os.readlink(source) != expected["link_target"]:
         raise ResidueError("residue-link-drifted", _rel(root, source))
-    if not expected["link_absolute"] and not (target.parent / expected["link_target"]).exists():
-        raise ResidueError("symlink-relative-unresolvable", _rel(root, target))
+    # Absolute or relative: the link must resolve at its new home. An absolute
+    # target this run has just moved (plan drift) fails here, before the rename.
+    if not _link_resolves_at(root, _rel(root, target), expected["link_target"]):
+        raise ResidueError("symlink-unresolvable", _rel(root, target))
     target.parent.mkdir(parents=True, exist_ok=True)
     os.rename(source, target)
     _append_inverse(run_dir, rows, {"action": "rename_back", "kind": "symlink",
@@ -932,7 +990,7 @@ def _witness(root: Path, journal: Dict[str, Any], plan: Dict[str, Any]) -> Dict[
             continue
         if st.st_ino != r["inode"] or not path.is_symlink() or os.readlink(path) != r["link_target"]:
             mismatches.append({"path": r["target"], "reason": "link-changed"})
-        elif not r["link_absolute"] and not path.exists():
+        elif not path.exists():  # absolute or relative: a rejoined link must be live
             mismatches.append({"path": r["target"], "reason": "link-unresolved"})
         else:
             checked += 1
@@ -1335,8 +1393,12 @@ def rollback(root: Path, *, run_dir: Optional[Path] = None) -> Dict[str, Any]:
         return {"status": "no-op", "reason": "no-open-run"}
     _acquire(root, run_dir)
     try:
-        journal, _plan = _load_run(root, run_dir)
-        if journal.get("phase") not in ROLLBACK_PHASES:
+        journal, plan = _load_run(root, run_dir)
+        # The commit point is the first `finalize`; a rejoin-only run (no
+        # cycles) never seals anything, so every non-terminal phase of it is
+        # still a plain rename journal that reverses cleanly.
+        past_commit = journal.get("phase") not in ROLLBACK_PHASES and (plan.get("cycles") or journal.get("sealed_cycles"))
+        if journal.get("phase") in TERMINAL_PHASES or past_commit:
             raise ResidueError("residue-past-commit-point", str(journal.get("phase")))
         _rollback(root, run_dir, journal)
         return {"status": "rolled-back", "run_dir": str(run_dir)}
