@@ -988,20 +988,27 @@ def retire_gate_delivery(route, gate, jobs):
             record = PENDING.read(root, recipient_key, delivery_id)
             if record is None or record.get("state") in {"acked", "expired"}:
                 continue
-            if (record.get("attempts") or 0) >= PENDING.RECLAIM_LIMIT:
-                # `claim` refuses a record whose reclaim budget is spent, so
-                # ack can never reach it; the release still supersedes it
-                # (review round 2, N3) -- expire it under the declared actor
-                # rather than leave it `pending` forever.
-                PENDING.expire_if_due(root, recipient_key, delivery_id,
-                                      actor=PENDING.EXPIRY_ACTOR,
-                                      reason="receipt-row-superseded")
-                return "expired"
-            if record.get("state") in {"claimed", "sent-ambiguous"}:
-                PENDING.reclaim(root, recipient_key, delivery_id, now_ns=time.monotonic_ns())
-            PENDING.claim(root, recipient_key, delivery_id,
-                          claim_owner=f"gate-release:{os.getpid()}",
-                          lease_seconds=60.0, require_generation_proof=False)
+            if record.get("state") not in {"claimed", "sent-ambiguous"}:
+                # `pending`: nobody holds it, so take the ordinary claim path.
+                if (record.get("attempts") or 0) >= PENDING.RECLAIM_LIMIT:
+                    # `claim` refuses a record whose reclaim budget is spent, so
+                    # ack can never reach it; the release still supersedes it
+                    # (review round 2, N3) -- expire it under the declared actor
+                    # rather than leave it `pending` forever.
+                    PENDING.expire_if_due(root, recipient_key, delivery_id,
+                                          actor=PENDING.EXPIRY_ACTOR,
+                                          reason="receipt-row-superseded")
+                    return "expired"
+                PENDING.claim(root, recipient_key, delivery_id,
+                              claim_owner=f"gate-release:{os.getpid()}",
+                              lease_seconds=60.0, require_generation_proof=False)
+            # `claimed` / `sent-ambiguous`: ack straight from the carrier's own
+            # state. The release supersedes the record whoever holds its lease
+            # -- a hook that claimed it seconds ago (lease unexpired) must not
+            # keep the record alive past the release, or the next prompt sweep
+            # re-announces a gate that is already closed (rt-94b7f5a5,
+            # 2026-09-06: `reclaim` refused `lease-not-expired`, the record
+            # stayed `sent-ambiguous`, and the sweep re-delivered it once).
             PENDING.ack(root, recipient_key, delivery_id,
                         acked_by=f"gate-released:{gate}")
             return "acked"

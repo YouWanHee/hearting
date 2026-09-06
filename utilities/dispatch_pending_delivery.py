@@ -83,6 +83,18 @@ EXPIRY_REASONS = frozenset({
     "receipt-row-superseded",
 })
 EXPIRY_ACTOR = "dispatch-reconcile"
+# SD-111 §13.33.1-(7) v67: terminal records are kept for a retention window and
+# then pruned by the same single declared actor (the dispatch reconcile path);
+# open-state records are never pruned whatever their age. Ages are file mtimes:
+# the terminal transition is the record's last write. A pruned record leaves a
+# zero-byte tombstone (`<record>.json.pruned`, never deleted) so the
+# materialize backstop cannot resurrect it from the append-only jobs.log row
+# (review round 1, B1).
+TERMINAL_STATES = frozenset({"acked", "expired"})
+TERMINAL_RETENTION_SECONDS = 7 * 86400
+ORPHAN_LOCK_RETENTION_SECONDS = 24 * 3600
+TOMBSTONE_SUFFIX = ".pruned"
+_LOCK_REOPEN_LIMIT = 16
 
 REQUIRED_FIELDS = (
     "schema_version", "delivery_id", "recipient_kind", "recipient_digest",
@@ -182,19 +194,32 @@ def _record_lock(path: Path):
         except OSError:
             pass
     lock_path = path.with_name(path.name + ".lock")
-    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, FILE_MODE)
-    try:
+    # The lock is identified by inode, not by name: a lock file unlinked while a
+    # waiter still holds the old inode (the orphan-lock prune, review round 1
+    # M1) must not let two holders into the critical section. After acquiring
+    # the flock, the fd's inode has to be the inode the path currently names;
+    # otherwise the file was replaced and this holder reopens.
+    for _attempt in range(_LOCK_REOPEN_LIMIT):
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, FILE_MODE)
         try:
-            os.chmod(lock_path, FILE_MODE)
-        except OSError:
-            pass
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        try:
-            yield
+            try:
+                os.chmod(lock_path, FILE_MODE)
+            except OSError:
+                pass
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                try:
+                    current = os.stat(lock_path).st_ino == os.fstat(fd).st_ino
+                except FileNotFoundError:
+                    current = False
+                if current:
+                    yield
+                    return
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
+            os.close(fd)
+    raise PendingDeliveryError("delivery-persistence-refused", "lock-file-replaced")
 
 
 def _read_unlocked(path: Path) -> dict | None:
@@ -476,3 +501,235 @@ def expire_if_due(
         updated["expiry_reason"] = reason
         _write_unlocked(path, updated)
         return updated
+
+
+def tombstone_path(record_file: Path) -> Path:
+    """`<record>.json.pruned` -- proof that a terminal record was pruned, so the
+    append-only jobs.log row behind it is never materialized again."""
+
+    return record_file.with_name(record_file.name + TOMBSTONE_SUFFIX)
+
+
+def prune_plan(
+    root: Path,
+    *,
+    now: float | None = None,
+    retention_seconds: float = TERMINAL_RETENTION_SECONDS,
+    lock_retention_seconds: float = ORPHAN_LOCK_RETENTION_SECONDS,
+) -> dict:
+    """SD-111 §(7) v67 retention plan -- an observer read: no transition, no
+    unlink. Lists terminal (``acked``/``expired``) records whose last write is
+    older than ``retention_seconds`` and ``.lock`` files with no sibling record
+    older than ``lock_retention_seconds``. Every open-state record is kept
+    regardless of age; an unreadable record is counted and kept."""
+
+    now = time.time() if now is None else now
+    pending_root = root / "pending-delivery"
+    plan = {
+        "retention_seconds": retention_seconds,
+        "lock_retention_seconds": lock_retention_seconds,
+        "records": [],
+        "orphan_locks": [],
+        "kept_open": 0,
+        "kept_terminal_recent": 0,
+        "kept_locks_recent": 0,
+        "unreadable": 0,
+    }
+    if not pending_root.is_dir():
+        return plan
+    for record_file in sorted(pending_root.glob("*/*.json")):
+        try:
+            stat = record_file.stat()
+            value = json.loads(record_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            plan["unreadable"] += 1
+            continue
+        state = value.get("state") if isinstance(value, dict) else None
+        if state not in TERMINAL_STATES:
+            plan["kept_open"] += 1
+            continue
+        age = now - stat.st_mtime
+        if age < retention_seconds:
+            plan["kept_terminal_recent"] += 1
+            continue
+        plan["records"].append({
+            "path": str(record_file),
+            "state": state,
+            "expiry_reason": value.get("expiry_reason"),
+            "delivery_id": value.get("delivery_id"),
+            "age_seconds": int(age),
+            "mtime": stat.st_mtime,
+        })
+    for lock_file in sorted(pending_root.glob("*/*.json.lock")):
+        if lock_file.with_name(lock_file.name[: -len(".lock")]).exists():
+            continue
+        try:
+            age = now - lock_file.stat().st_mtime
+        except OSError:
+            continue
+        if age < lock_retention_seconds:
+            plan["kept_locks_recent"] += 1
+            continue
+        plan["orphan_locks"].append({"path": str(lock_file), "age_seconds": int(age)})
+    return plan
+
+
+def prune(
+    root: Path,
+    *,
+    apply: bool,
+    now: float | None = None,
+    retention_seconds: float = TERMINAL_RETENTION_SECONDS,
+    lock_retention_seconds: float = ORPHAN_LOCK_RETENTION_SECONDS,
+) -> dict:
+    """Retention prune under the single declared actor (SD-111 §(7) v67).
+
+    ``apply=False`` returns the plan only. With ``apply=True`` each planned
+    record is re-read under its own lock and unlinked only if it is still
+    terminal and unchanged since the plan: tombstone first, then ``.json``,
+    then its ``.lock``. A planned orphan lock is unlinked only while this
+    process holds it and only if its record is still absent (holders waiting
+    on the old inode reopen, see ``_record_lock``). Recipient directories are
+    never removed (the tombstones live there). Open-state records are never
+    touched. Never raises: one bad file is counted in ``skipped`` and the sweep
+    continues."""
+
+    plan = prune_plan(
+        root, now=now, retention_seconds=retention_seconds,
+        lock_retention_seconds=lock_retention_seconds,
+    )
+    result = {
+        "apply": apply,
+        "planned_records": len(plan["records"]),
+        "planned_locks": len(plan["orphan_locks"]),
+        "pruned_records": 0,
+        "pruned_locks": 0,
+        "skipped": 0,
+        "plan": plan,
+    }
+    if not apply:
+        return result
+    for item in plan["records"]:
+        path = Path(item["path"])
+        lock_path = path.with_name(path.name + ".lock")
+        try:
+            with _record_lock(path):
+                value = _read_unlocked(path)
+                if value is None:
+                    # Gone since the plan (a concurrent prune): the lock this
+                    # process just created must not become a new orphan
+                    # (review round 1, minor 2).
+                    try:
+                        lock_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    result["skipped"] += 1
+                    continue
+                if (
+                    value["state"] not in TERMINAL_STATES
+                    or path.stat().st_mtime != item["mtime"]
+                ):
+                    result["skipped"] += 1
+                    continue
+                tombstone_path(path).touch(mode=FILE_MODE, exist_ok=True)
+                path.unlink()
+                try:
+                    lock_path.unlink()
+                except FileNotFoundError:
+                    pass
+            result["pruned_records"] += 1
+        except (PendingDeliveryError, OSError):
+            result["skipped"] += 1
+    for item in plan["orphan_locks"]:
+        lock_path = Path(item["path"])
+        record_file = lock_path.with_name(lock_path.name[: -len(".lock")])
+        try:
+            fd = os.open(str(lock_path), os.O_RDWR)  # no O_CREAT: a vanished lock is not recreated
+        except FileNotFoundError:
+            continue
+        except OSError:
+            result["skipped"] += 1
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                if record_file.exists():
+                    result["skipped"] += 1
+                    continue
+                try:
+                    lock_path.unlink()
+                    result["pruned_locks"] += 1
+                except FileNotFoundError:
+                    pass
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            result["skipped"] += 1
+        finally:
+            os.close(fd)
+    return result
+
+
+def _default_state_root() -> Path:
+    from dispatch_contract import resolve_agent_home, resolve_dispatch_state_root
+
+    return resolve_dispatch_state_root(
+        resolve_agent_home(), os.environ.get("AGENT_DISPATCH_JOBS") or None
+    )
+
+
+def _render_prune_table(result: dict) -> str:
+    plan = result["plan"]
+    lines = [
+        f"pending-delivery prune {'APPLY' if result['apply'] else 'DRY-RUN'} "
+        f"retention={int(plan['retention_seconds'] // 86400)}d "
+        f"lock_retention={int(plan['lock_retention_seconds'] // 3600)}h",
+        f"kept: open={plan['kept_open']} terminal_recent={plan['kept_terminal_recent']} "
+        f"locks_recent={plan['kept_locks_recent']} unreadable={plan['unreadable']}",
+        f"planned: records={result['planned_records']} orphan_locks={result['planned_locks']}",
+    ]
+    if result["apply"]:
+        lines.append(
+            f"pruned: records={result['pruned_records']} locks={result['pruned_locks']} "
+            f"skipped={result['skipped']}"
+        )
+    lines.append("state          age_d  expiry_reason              delivery_id")
+    for item in plan["records"]:
+        lines.append(
+            f"{item['state']:<14} {item['age_seconds'] / 86400:5.1f}  "
+            f"{(item.get('expiry_reason') or '-'):<26} {item.get('delivery_id') or '-'}"
+        )
+    for item in plan["orphan_locks"]:
+        lines.append(f"orphan-lock    {item['age_seconds'] / 86400:5.1f}  -                          {item['path']}")
+    return "\n".join(lines)
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="SD-111 pending-delivery retention prune")
+    sub = parser.add_subparsers(dest="command", required=True)
+    pr = sub.add_parser("prune", help="list (default) or delete terminal records past retention")
+    pr.add_argument("--root", type=Path, default=None, help="dispatch state root (default: resolved)")
+    pr.add_argument("--apply", action="store_true", help="delete; without it only the plan is printed")
+    pr.add_argument("--retention-days", type=float, default=TERMINAL_RETENTION_SECONDS / 86400)
+    pr.add_argument("--lock-retention-hours", type=float, default=ORPHAN_LOCK_RETENTION_SECONDS / 3600)
+    pr.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+    root = args.root or _default_state_root()
+    result = prune(
+        root, apply=args.apply,
+        retention_seconds=args.retention_days * 86400,
+        lock_retention_seconds=args.lock_retention_hours * 3600,
+    )
+    result["root"] = str(root)
+    if args.json:
+        print(json.dumps(result, sort_keys=True))
+    else:
+        print(f"root={root}")
+        print(_render_prune_table(result))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

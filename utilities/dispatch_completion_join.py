@@ -463,6 +463,10 @@ def reconcile_pending_delivery(jobs: Path) -> dict[str, int]:
        that trigger 1 has not yet turned into a record (the crash window
        between the terminal commit and trigger 1's in-process call) is
        materialized here, idempotently converging with any other trigger.
+    3. **Retention prune** (v67): terminal records past retention and orphan
+       lock files are unlinked by this same actor -- see ``pending_delivery.prune``.
+       A pruned record leaves a tombstone that sweep 1 honours, so the
+       append-only row never re-materializes a delivered receipt (B1).
     2. **Expiry.** Any open-state (``pending``/``claimed``/``sent-ambiguous``)
        record whose owning row's recorded launch-time incarnation
        (``parent_runtime_pid``/``parent_runtime_pid_start``, §2-a-5) is
@@ -477,7 +481,8 @@ def reconcile_pending_delivery(jobs: Path) -> dict[str, int]:
     """
 
     root = jobs.resolve(strict=False).parent
-    result = {"materialized": 0, "expired": 0, "skipped": 0}
+    result = {"materialized": 0, "expired": 0, "skipped": 0,
+              "pruned_records": 0, "pruned_locks": 0, "prune_skipped": 0}
     try:
         lines = jobs.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
@@ -500,7 +505,11 @@ def reconcile_pending_delivery(jobs: Path) -> dict[str, int]:
                     )
                 except pending_delivery.PendingDeliveryError:
                     record_file = None
-            if record_file is not None and not record_file.is_file():
+            if (
+                record_file is not None
+                and not record_file.is_file()
+                and not pending_delivery.tombstone_path(record_file).is_file()
+            ):
                 if materialize_after_terminal_close(jobs, attempt_id) is not None:
                     result["materialized"] += 1
 
@@ -559,6 +568,18 @@ def reconcile_pending_delivery(jobs: Path) -> dict[str, int]:
                 result["expired"] += 1
             except pending_delivery.PendingDeliveryError:
                 pass
+    # 3. **Retention prune** (SD-111 §(7) v67). Terminal (`acked`/`expired`)
+    #    records past `TERMINAL_RETENTION_SECONDS` and orphan `.lock` files
+    #    past `ORPHAN_LOCK_RETENTION_SECONDS` are unlinked under the same
+    #    single actor; open-state records are never touched (see
+    #    `pending_delivery.prune`). Observers still delete nothing.
+    try:
+        pruned = pending_delivery.prune(root, apply=True)
+        result["pruned_records"] = pruned["pruned_records"]
+        result["pruned_locks"] = pruned["pruned_locks"]
+        result["prune_skipped"] = pruned["skipped"]
+    except Exception:  # noqa: BLE001 -- the sweep never raises
+        pass
     return result
 
 

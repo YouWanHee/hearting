@@ -789,6 +789,37 @@ session that has SENT a steer/handoff/gate-relay/watch record — or ran
 `<dispatch-state-root>/peer-steward/`, which Fleet renders as the bold-yellow tag badge;
 `peer-steward.py steward off` (or `peer-message release`) clears it.
 
+**Prompt submission is verified, never assumed** (SD-122 (11), v67/v70). `peer-steward.py prompt`
+prints `prompted=true` only after the submission was observed, and every other verdict is typed:
+`failed` (exit 1), `queued` (exit 3, our text still sits in the target's input), `unverified`
+(exit 5, nothing could be observed) — never `true` from herdr's exit code alone. Before any send the
+visible pane is scanned for a selection/permission form (AskUserQuestion, permission prompt) in
+every state, and a `blocked` target or an open form is refused as `failed reason=target-form-open`:
+measured 2026-09-06, text typed into an open form is lost and the Enter answers the form with its
+default. A target that is not working is sent with `herdr agent prompt --wait --until working`
+(bound clamped to herdr's 5000 ms stall floor) and must flip state (`agent_prompt_stalled` →
+`failed reason=agent-prompt-stalled`). A working target, or a herdr `timeout`, is settled by
+`_verify_after_send`: the target transcript first (`verify=transcript-arrival`, Claude only),
+then the prompt box — but only when `herdr agent explain` actually read it
+(`region=prompt_box_body`; a working Claude pane is explained by its terminal title and an
+OpenCode pane by `rule: none`, neither is a box read → `verify=prompt-box-unavailable`,
+`unverified`); our own first line still in a read box after one `Enter` retry is `queued`.
+Measured the same day on a probe Claude session (Claude Code 2.1.263, herdr 0.8.0): `herdr agent
+prompt`, this command, and `pane send-text`+`send-keys Enter` each submitted within 1 s whether
+the target was idle or mid-turn (6/6), and every steward send in that day's ledger arrived within
+1 s. The "text sitting unsubmitted in the input box" reports were Claude Code's
+predicted-next-prompt ghost in an *empty* box (`❯ [handoff] … …`, present in no transcript or
+ledger, gone as soon as anything is typed, unmoved by Enter/Return/ctrl+m): before calling a
+prompt unsubmitted, type one character into the box or check the target transcript. `--no-verify`
+keeps the legacy exit-code report; `--wait-idle-ms N` defers a send to a working/blocked target.
+**Every pane prompt goes through this wrapper.** herdr's own server log records `cli:agent:prompt` with
+no target pane and no caller (324 such rows on 2026-09-06 — an unsubmitted-text sighting cannot be
+attributed from it), so the wrapper writes one ledger row per send whatever the outcome: `to.pane`
+(the resolved herdr pane), `to.session_id`, `from.session_id`, `ts`, `body_sha256`, and the verdict as
+`delivery.receipt` (`prompted=… state_before=… verify=… herdr_rc=… ms=… reason=…`). Harness code and a
+session's own Bash never call `herdr agent prompt`, `herdr pane send-text`, `send-keys` or `pane run`
+directly (census 2026-09-06: 0 callers outside `peer-steward.py`; `peer_steward.test.py` asserts it).
+
 Same-behavior guarantees are still not claimed: the watched-side herdr realization is
 measured for both Claude and Codex, and **no runtime's steward-side wake is measured** —
 the Claude carrier becomes `measured` only after a live-session capture, not before. The

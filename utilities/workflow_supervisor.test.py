@@ -1616,6 +1616,41 @@ class TestGateSubjectNotCaller(WorkflowFixture):
                       "--jobs", str(jobs), "--artifact", "a.json"])
         self.assertTrue(json.loads(buf.getvalue())["delivery_created"])
 
+    def _retire_held_record(self, carrier_state):
+        """A record the asyncRewake hook claimed moments ago (lease unexpired)
+        must still be acked by the release: the release supersedes the record
+        whoever holds its lease. Before the fix `reclaim` refused
+        `lease-not-expired`, retirement fell through, the record stayed
+        `claimed`/`sent-ambiguous` and the next prompt sweep re-announced the
+        closed gate (rt-94b7f5a5, 2026-09-06)."""
+        route, path = self.two_stage_route(human_gate="frame-review")
+        jobs, session, _attempt = self.owner_registry(route_id="rt-fixture0000000")
+        root = Path(jobs).resolve(strict=False).parent
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            SUP.main(["gate", "--route", str(path), "--gate", "frame-review",
+                      "--block", "--jobs", str(jobs), "--artifact", "a.json"])
+        delivery_id = json.loads(
+            Path(json.loads(out.getvalue())["delivery"]).read_text("utf-8")
+        )["delivery_id"]
+        PENDING.claim(root, session, delivery_id, claim_owner="hook:fixture",
+                      lease_seconds=300.0)
+        if carrier_state == "sent-ambiguous":
+            PENDING.mark_sent_ambiguous(root, session, delivery_id,
+                                        claim_owner="hook:fixture")
+        self.assertEqual(PENDING.read(root, session, delivery_id)["state"], carrier_state)
+        self.assertEqual(
+            SUP.retire_gate_delivery(route, "frame-review", str(jobs)), "acked")
+        after = PENDING.read(root, session, delivery_id)
+        self.assertEqual(after["state"], "acked")
+        self.assertEqual(after["acked_by"], "gate-released:frame-review")
+
+    def test_release_retires_a_record_the_hook_still_holds_claimed(self):
+        self._retire_held_record("claimed")
+
+    def test_release_retires_a_record_the_hook_still_holds_sent_ambiguous(self):
+        self._retire_held_record("sent-ambiguous")
+
     def test_release_retirement_survives_a_ledger_failure(self):
         """Review New-2: `ledger_for`/`gate_raise_epoch` sat outside the try, so a
         non-OSError there aborted the CLI after the release had already been
