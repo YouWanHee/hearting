@@ -216,6 +216,20 @@ class PlanSlicesTest(unittest.TestCase):
                                          node=json.loads(route_path.read_text())["nodes"][0])
             self.assertEqual(len(proven["sessions"]), 2)
 
+    def test_plan_slices_worktree_must_be_the_sealed_cwd(self):
+        """Round-1 B2: a foreign worktree is refused; omitting it uses the route's cwd."""
+        with tempfile.TemporaryDirectory() as td:
+            route_path, worktree, slices_path, output = self._fixture(td)
+            other = Path(td) / "elsewhere"; other.mkdir()
+            with self.assertRaisesRegex(CHAIN.StageSessionError, "plan-slices-worktree-mismatch"):
+                CHAIN.plan_slices(route_path=route_path, node_id="execute", worktree=other,
+                                  slices_path=slices_path, output_path=output)
+            self.assertFalse(output.exists())
+            receipt = CHAIN.plan_slices(route_path=route_path, node_id="execute",
+                                        slices_path=slices_path, output_path=output)
+            self.assertEqual(json.loads(output.read_text())["worktree"], str(worktree.resolve()))
+            self.assertEqual(receipt["planned"], "ok")
+
     def test_plan_slices_refuses_overlap_and_leaves_no_files(self):
         with tempfile.TemporaryDirectory() as td:
             route_path, worktree, slices_path, output = self._fixture(td, overlap=True)

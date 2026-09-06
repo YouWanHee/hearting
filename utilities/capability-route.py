@@ -1920,6 +1920,34 @@ def parse_graph_spec(text):
     return rows
 
 
+def _compose_inputs(base_nodes, base_node, previous, kept):
+    """Keep the base node's declared inputs wherever they can still exist.
+
+    An input stays when it is not produced by any recipe node (an external
+    literal such as `task`/`spec`/`source`), when its producer is a kept
+    node, or when it is a semantic token of the tree (`source-diff`, …) that
+    no node has to author. An input whose only producer was dropped is
+    removed -- the stage brief (`dispatch_stage_advance.render_stage_brief`)
+    prints `inputs` verbatim, so a dropped node's file must not be promised.
+    The previous kept node's outputs are appended so the chain edge is
+    explicit. (Canary review round 1, B1.)
+    """
+    producers = {}
+    for candidate in base_nodes.values():
+        for output in candidate.get("outputs") or []:
+            producers.setdefault(output, set()).add(candidate["id"])
+    inputs = []
+    for item in base_node.get("inputs") or []:
+        owners = producers.get(item)
+        if owners is None or owners & kept or TOPO._is_semantic_output(item):
+            if item not in inputs:
+                inputs.append(item)
+    for output in (previous or {}).get("outputs") or []:
+        if output not in inputs:
+            inputs.append(output)
+    return inputs or ["task"]
+
+
 def compose_subgraph_recipe(registry, base_recipe, graph_spec):
     """Cut the caller's stage subgraph out of the capability's own recipe.
 
@@ -1956,7 +1984,7 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec):
             overrides[node_id] = unit
         previous = nodes[-1] if nodes else None
         node["depends_on"] = [previous["id"]] if previous else []
-        node["inputs"] = list(previous["outputs"]) if previous else ["task"]
+        node["inputs"] = _compose_inputs(base_nodes, base_nodes[node_id], previous, set(ids))
         node.pop("terminal", None)
         node.pop("terminal_gate", None)
         node.pop("continuation", None)

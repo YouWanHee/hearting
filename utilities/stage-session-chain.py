@@ -222,8 +222,8 @@ _SLICE_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
 
 
 def plan_slices(
-    *, route_path: Path, node_id: str, worktree: Path, slices_path: Path,
-    output_path: Path, default_adapter: str = "claude",
+    *, route_path: Path, node_id: str, slices_path: Path,
+    output_path: Path, worktree: Path | None = None, default_adapter: str = "claude",
 ) -> dict:
     """Build and prove a parallel sub-session manifest from a slice list.
 
@@ -250,7 +250,17 @@ def plan_slices(
     cap = permission.get("max_slices", 4)
     if not 2 <= len(slices) <= cap:
         raise StageSessionError(f"parallel-session-count-invalid:2:{cap}")
-    worktree = Path(worktree).resolve()
+    sealed_cwd = route.get("cwd")
+    if not isinstance(sealed_cwd, str) or not sealed_cwd:
+        raise StageSessionError("plan-slices-route-cwd-missing")
+    sealed_cwd = Path(sealed_cwd).resolve()
+    worktree = Path(worktree).resolve() if worktree is not None else sealed_cwd
+    if worktree != sealed_cwd:
+        # The manifest's `worktree` becomes every slice's `--cwd`; a manifest
+        # that names any tree but the route's sealed cwd would dispatch real
+        # work outside the route while every identity field still matches
+        # (canary review round 1, B2).
+        raise StageSessionError(f"plan-slices-worktree-mismatch:{worktree}:{sealed_cwd}")
     output_path = Path(output_path).resolve()
     seed = json.dumps(
         [route.get("route_id"), node_id, [sorted(map(str, s.get("fixed_files") or [])) for s in slices]],
@@ -336,18 +346,19 @@ def main() -> int:
     p.add_argument("--jobs")
     p.add_argument("--route", help="plan-slices: compiled route file")
     p.add_argument("--node", default="execute", help="plan-slices: subdivision-permitted node id")
-    p.add_argument("--worktree", help="plan-slices: the route's sealed cwd")
+    p.add_argument("--worktree", help="plan-slices: must equal the route's sealed cwd (default: the route's cwd)")
     p.add_argument("--slices", help="plan-slices: JSON slice list transcribed from the plan")
     p.add_argument("--output", help="plan-slices: manifest path to write (briefs are written beside it)")
     p.add_argument("--adapter", default="claude", choices=("claude", "codex", "opencode"))
     args = p.parse_args()
     if args.action == "plan-slices":
-        missing = [name for name in ("route", "worktree", "slices", "output") if not getattr(args, name)]
+        missing = [name for name in ("route", "slices", "output") if not getattr(args, name)]
         if missing:
             p.error("plan-slices requires --" + ", --".join(missing))
         try:
             print(json.dumps(plan_slices(
-                route_path=Path(args.route), node_id=args.node, worktree=Path(args.worktree),
+                route_path=Path(args.route), node_id=args.node,
+                worktree=Path(args.worktree) if args.worktree else None,
                 slices_path=Path(args.slices), output_path=Path(args.output), default_adapter=args.adapter,
             ), sort_keys=True))
         except StageSessionError as exc:

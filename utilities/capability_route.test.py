@@ -4755,6 +4755,19 @@ class ComposeRouteTest(TestRoute):
   self.assertEqual(route["conditional_extensions"][0]["after"],["report"])
   self.assertIn("small_work_confirmation",route)
   R.verify_route(route,R.ROOT)
+ def test_subgraph_inputs_keep_the_base_contract(self):
+  """Round-1 B1: a kept node keeps every declared input it can still get; a dropped producer's file is not promised."""
+  route=self.compose(graph="execute,test,report")
+  by_id={n["id"]:n for n in route["nodes"]}
+  self.assertEqual(by_id["execute"]["inputs"],["task"])  # plan.md/checklist.md come from the dropped plan node
+  self.assertEqual(by_id["test"]["inputs"],["source-diff","dev_logs/**"])  # semantic token kept, execute outputs appended
+  self.assertEqual(by_id["report"]["inputs"],["dev_logs/**","test_logs/**"])
+  full=self.compose(graph="frame,plan,plan-check,execute,impl-review,test,report")
+  base={n["id"]:n for n in R.TOPO.resolve_recipe(R.TOPO.load_registry(),"autopilot-code","dev")["standard_plus"]["nodes"]}
+  for node in full["nodes"]:
+   if node["id"] in base:
+    self.assertTrue(set(base[node["id"]]["inputs"])<=set(node["inputs"]),node["id"])
+  self.assertEqual({n["id"]:n["inputs"][0] for n in self.compose(graph="impl-review,test").get("nodes")}["impl-review"],"source-diff")
  def test_frame_gate_rebinds_to_the_node_that_follows(self):
   route=self.compose(graph="frame,execute,test")
   self.assertEqual(route["human_gate_bindings"],[{"gate":"frame-review","node":"execute","position":"entry"}])
