@@ -35,6 +35,13 @@ HEADLESS_PERMISSION_MODES = ("bypass", "allowlist")
 DEFAULT_HEADLESS_PERMISSION_MODE = "bypass"
 CONFIRMATION_MODES = ("hybrid", "both", "post-frame-only")
 DEFAULT_CONFIRMATION_MODE = "hybrid"
+# SD-136: how a `direct`/`solo`(quick) route is confirmed before material work.
+# `notice` replaces the blocking five-field card with one `[경로]` line (the
+# route is atomic or one bounded owner and reversible); `card` keeps the
+# blocking §0.4 card. Destructive or external-facing work keeps the card under
+# either value -- the route seals the value, WORKFLOW §0.4 owns the rule.
+SMALL_WORK_CONFIRMATION_MODES = ("notice", "card")
+DEFAULT_SMALL_WORK_CONFIRMATION = "notice"
 STEWARD_CHILD_PERMISSION_MODES = ("bypass", "inherit")
 DEFAULT_STEWARD_CHILD_PERMISSION_MODE = "bypass"
 
@@ -415,12 +422,18 @@ def validate(config, capmap):
             if not isinstance(confirmation, dict):
                 errors.append("confirmation must be a mapping")
             else:
-                for key in sorted(set(confirmation) - {"mode"}):
+                for key in sorted(set(confirmation) - {"mode", "small_work"}):
                     errors.append(f"unknown confirmation key: {key!r}")
                 mode = confirmation.get("mode", DEFAULT_CONFIRMATION_MODE)
                 if mode not in CONFIRMATION_MODES:
                     errors.append(
                         f"confirmation.mode must be one of {sorted(CONFIRMATION_MODES)}"
+                    )
+                small = confirmation.get("small_work", DEFAULT_SMALL_WORK_CONFIRMATION)
+                if small not in SMALL_WORK_CONFIRMATION_MODES:
+                    errors.append(
+                        "confirmation.small_work must be one of "
+                        f"{sorted(SMALL_WORK_CONFIRMATION_MODES)}"
                     )
         if steward is not None:
             if not isinstance(steward, dict):
@@ -627,6 +640,18 @@ def query_confirmation_mode(config):
         if mode in CONFIRMATION_MODES:
             return mode
     return DEFAULT_CONFIRMATION_MODE
+
+
+def query_small_work_confirmation(config):
+    """SD-136: `direct`/`solo` confirmation surface. Returns the default
+    (`notice`) whenever the `confirmation` block or its `small_work` key is
+    absent, including for schema_version < 4."""
+    confirmation = config.get("confirmation")
+    if isinstance(confirmation, dict):
+        mode = confirmation.get("small_work")
+        if mode in SMALL_WORK_CONFIRMATION_MODES:
+            return mode
+    return DEFAULT_SMALL_WORK_CONFIRMATION
 
 
 def query_steward_child_permission_mode(config):

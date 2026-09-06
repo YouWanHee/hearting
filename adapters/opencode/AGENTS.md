@@ -69,12 +69,19 @@ partial. OpenCode native UI/config owns model and context fields.
 
 ## Dispatch
 
-Route by `core/WORKFLOW.md §0.2`: when a request matches one manifest
-`entry-router` trigger and no exclusion, that entry is the primary route
-and `direct` sets intensity, not routing. Apply §0.3 and present the
-five-field card in §0.4 before material work unless scope and route are
-already approved, and close material work with the five-field completion card
-in §0.5. Load full capability detail only in the acting owner or worker.
+Route by `core/WORKFLOW.md §0.2`: precedence names the capability that owns
+the artifacts; §0.2.1 then picks the work **shape** before any preset.
+`direct`/`solo`/`staged` go through `preflight.sh compose` (portable
+`capability-route.py compose`; flags, spec-read gate and probes default from
+the checkout; a staged `--graph execute,test,report` is your own stage
+subgraph). Use the preset recipe (`preflight.sh route --capability …`) only
+when the request names the entry's full loop or a promotion signal or
+spec-backed flow requires it. Apply §0.3. `direct`/`solo` routes carry the
+sealed `small_work_confirmation` (`notice` default): one `[경로]` line plus a
+scope clause instead of the blocking card, unless the work is destructive or
+external-facing; otherwise present the §0.4 five-field card before material
+work unless already approved, and close with the §0.5 card. Load full
+capability detail only in the acting owner or worker.
 
 Check `preflight.sh headless [--check] <worktree>`. Launch only registered jobs
 through `preflight.sh dispatch --dry-run|--register|--start` with the complete

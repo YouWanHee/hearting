@@ -455,7 +455,7 @@
               "kind": "inline-next"
             },
             "subdivision": {
-              "min_intensity": "strong",
+              "min_intensity": "standard",
               "max_slices": 4,
               "disjointness": "exact-fixed-files"
             },
