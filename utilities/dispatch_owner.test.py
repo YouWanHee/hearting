@@ -692,5 +692,91 @@ class RouteEvidenceOwnerHarnessTest(unittest.TestCase):
         self.assertNotIn("/tmp/r.json", forwarded)
 
 
+
+class RegisteredReviewerLaunchTest(unittest.TestCase):
+    """SD-OPEN-40: a depth-1 independent reviewer may be a review worker.
+
+    Before this, `dispatch-owner.py` refused every tuple but
+    `--dispatch-depth 1 --worker-type owner`, and stage dispatch only launches a
+    review worker that is bound to a route node. An ad-hoc independent review --
+    the kind a session runs on its own branch -- therefore had exactly one
+    reachable shape: `worker_type=owner`. That is the self-declaration
+    SD-OPEN-41(b)'s marker gate has to downgrade, so the degraded path was the
+    only path, and "degraded" would have described normal practice rather than
+    an exception.
+    """
+
+    _BASE = [
+        "--worktree", "/w", "--slug", "s", "--capability", "autopilot-code",
+        "--capability-mode", "dev", "--qa", "standard", "--intensity", "standard",
+        "--dispatch-depth", "1", "--assigned-contract", "autopilot-code",
+        "--owner", "autopilot-code", "--model-profile", "deep", "--dry-run",
+    ]
+
+    def _parse(self, *extra):
+        return OWNER._parse([*self._BASE, *extra])
+
+    def test_a_review_tuple_launches_when_it_names_a_catalog_unit(self):
+        _, values, forwarded, _ = self._parse(
+            "--worker-type", "review", "--unit", "qa/code-review")
+        self.assertEqual(values["--worker-type"], "review")
+        # The unit has to reach the wrapper: it is what selects the persona the
+        # reviewer reads, and it is the field the completion gate later checks.
+        self.assertIn("--unit", forwarded)
+        self.assertIn("qa/code-review", forwarded)
+
+    def test_a_review_tuple_without_a_unit_is_refused(self):
+        # `worker_type=review` with no unit reaches the mode contract as
+        # `missing-dispatch-worker-mode` after the process is already
+        # committed; refusing here keeps the failure at the caller.
+        with self.assertRaises(OWNER.OwnerError) as caught:
+            self._parse("--worker-type", "review")
+        self.assertIn("review-worker-unit-required", str(caught.exception))
+
+    def test_a_review_worker_may_not_borrow_the_owner_unit(self):
+        for unit, expected in (
+            ("_kernel/owner", "review-worker-unit-reserved"),
+            ("_kernel/resource", "review-worker-unit-reserved"),
+            ("Not A Unit", "invalid-review-worker-unit"),
+        ):
+            with self.subTest(unit):
+                with self.assertRaises(OWNER.OwnerError) as caught:
+                    self._parse("--worker-type", "review", "--unit", unit)
+                self.assertIn(expected, str(caught.exception))
+
+    def test_a_route_bound_review_node_is_not_launched_from_here(self):
+        # One node, one launch path. Stage dispatch owns a review node with its
+        # binding; accepting route evidence here would let two paths claim it.
+        with self.assertRaises(OWNER.OwnerError) as caught:
+            self._parse("--worker-type", "review", "--unit", "qa/code-review",
+                        "--route-evidence", "/tmp/r.json")
+        self.assertIn("review-worker-route-evidence-unsupported", str(caught.exception))
+
+    def test_every_other_worker_type_is_still_refused(self):
+        for worker_type in ("stage", "support", "conductor", ""):
+            with self.subTest(worker_type):
+                with self.assertRaises(OWNER.OwnerError) as caught:
+                    self._parse("--worker-type", worker_type or "-",
+                                "--unit", "qa/code-review")
+                self.assertIn("owner-tuple-required", str(caught.exception))
+
+    def test_the_owner_tuple_is_unchanged(self):
+        _, values, _, _ = self._parse("--worker-type", "owner")
+        self.assertEqual(values["--worker-type"], "owner")
+        with self.assertRaises(OWNER.OwnerError) as caught:
+            self._parse("--worker-type", "owner", "--unit", "qa/code-review")
+        self.assertIn("invalid-owner-unit", str(caught.exception))
+        # depth is still pinned for both types
+        for worker_type, unit in (("owner", None), ("review", "qa/code-review")):
+            with self.subTest(worker_type):
+                extra = ["--worker-type", worker_type]
+                if unit:
+                    extra += ["--unit", unit]
+                argv = [a for a in self._BASE]
+                argv[argv.index("--dispatch-depth") + 1] = "2"
+                with self.assertRaises(OWNER.OwnerError) as caught:
+                    OWNER._parse([*argv, *extra])
+                self.assertIn("owner-tuple-required", str(caught.exception))
+
 if __name__ == "__main__":
     unittest.main()

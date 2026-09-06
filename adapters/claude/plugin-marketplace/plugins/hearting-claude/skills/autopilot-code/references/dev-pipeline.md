@@ -162,6 +162,61 @@ the route inline** — measured on route `rt-b2d68cbf14d31c62`, eight nodes and 
 `--execution-surface inline` with `dispatch_depth > 0` requires `--fallback-hop inline`; the
 contract refuses the mismatched combination rather than recording a surface the run did not have.
 
+#### A Review Node Says Who Reviewed
+
+A `review-worker` node's completion has one extra obligation: name the reviewer.
+The marker records `reviewer_kind`, `review_independence`, and the reviewer's
+identity, and none of it is taken on the caller's word.
+
+When a *different* registered attempt produced the verdict, name it — the row is
+looked up in `--jobs` and must carry `worker_type=review`:
+
+```bash
+python3 <agent-home>/utilities/capability-route.py complete \
+  --route <route-file> --node <review-node-id> --evidence <review artifact> \
+  --jobs <canonical-jobs.log> --attempt-id <the completing attempt> \
+  --reviewer-attempt <the review worker's attempt id>
+```
+
+When a native subagent reviewed, name its transcript instead. A subagent with a
+recorded identity counts as independent review; the digest is what keeps that
+claim checkable later:
+
+```bash
+python3 <agent-home>/utilities/capability-route.py complete \
+  --route <route-file> --node <review-node-id> --evidence <review artifact> \
+  --jobs <canonical-jobs.log> --attempt-id <the completing attempt> \
+  --reviewer-subagent <transcript path>
+```
+
+Name nothing and the completing attempt is the reviewer, which is independent
+only when its own registry row says `worker_type=review`. Everything else — no
+claim on an inline completion, a claimed row that is absent or is not a review
+worker, an unreadable transcript, no `--jobs` to adjudicate with — **is recorded
+as `reviewer_kind=owner-inline`, `review_independence=degraded`, with a typed
+`reviewer_downgrade_reason`. It is never refused.** The node completes, the next
+one proceeds, and the degradation travels: `complete` prints
+`completed-review-degraded` on stderr, the row carries the same axes, the closed
+outcome lists the node under `review_independence_degraded`, and the §0.5
+completion card has to say that gate was not independently reviewed.
+
+To make the degraded path an exception rather than the norm, launch the reviewer
+as a registered review worker instead of an owner:
+
+```bash
+python3 <agent-home>/utilities/dispatch-owner.py --adapter <harness> --start \
+  --worktree <worktree> --slug <slug> \
+  --capability autopilot-code --capability-mode debug --qa standard \
+  --intensity standard --dispatch-depth 1 --worker-type review \
+  --unit qa/code-review --model-role qa/code-review \
+  --assigned-contract autopilot-code --owner <slug> --model-profile deep \
+  --prompt-file <review brief>
+```
+
+`--unit` is required for a review tuple and may not be a `_kernel/*` unit;
+`--route-evidence` is refused, because a review node that belongs to a route is
+launched by stage dispatch with its node binding.
+
 #### Usage-Aware Cross-Harness Routing
 
 Before dispatch, run `sh <agent-home>/utilities/usage-check.sh`. It reports per-harness `ok`, `limited(<reset>)`, or `unknown`; `ok` means no known block, not guaranteed capacity. Avoid limited runtimes. An automatic/model-selected recovery also requires known positive capacity; unknown capacity is not positive availability. A user's explicit `--adapter` override may retain its separately audited unknown-capacity path when route evidence and hard eligibility still permit it. Otherwise default to the free cross-harness posture (OPERATIONS §5.10 SD-16, 2026-07-24): with two or more eligible harnesses, spread consecutive stage nodes across model families rather than homing to the conductor's harness, always place test or review on a different family than implementation, and record a task-fit or limit reason when a run intentionally keeps every node on one harness. Preserve `dispatch_depth`, `parent`, `worker_type`, `assigned_contract`, `model_role`, `harness`, `owner_harness`, and `parent_sid` metadata across runtimes.

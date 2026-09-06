@@ -50,6 +50,19 @@ _REQUIRED = {
     "--intensity", "--dispatch-depth", "--worker-type", "--assigned-contract",
     "--owner", "--model-profile",
 }
+# Captured for validation but not required: `--unit` is meaningless for an owner
+# (the tuple contract pins it to `_kernel/owner`) and mandatory for the SD-OPEN-40
+# review launch below.
+_CAPTURED = _REQUIRED | {"--unit"}
+# SD-OPEN-40: the depth-1 tuples this selector may launch. `review` exists so an
+# independent reviewer can be a *registered review worker* instead of an owner
+# wearing a reviewer's prompt. Before it, every ad-hoc independent review landed
+# in the registry as `worker_type=owner`, which is exactly the self-declaration
+# SD-OPEN-41(b)'s marker gate has to reject -- the degraded path was the only
+# reachable one because no normal path existed.
+_LAUNCHABLE_WORKER_TYPES = {"owner", "review"}
+_UNIT_REF = re.compile(r"^[a-z-]+/[a-z-]+$")
+_RESERVED_UNITS = {"_kernel/owner", "_kernel/resource"}
 
 
 class OwnerError(ValueError):
@@ -216,7 +229,7 @@ def _parse(argv):
             continue
         if name in _FORBIDDEN or (equal and name in _FORBIDDEN):
             raise OwnerError(f"forbidden-flag:{name}")
-        if name in _REQUIRED:
+        if name in _CAPTURED:
             if equal:
                 values[name] = value
                 forwarded.append(arg)
@@ -244,8 +257,30 @@ def _parse(argv):
         raise OwnerError("missing-required:" + ",".join(missing))
     if len(actions) != 1:
         raise OwnerError("exactly-one-action-required")
-    if values["--dispatch-depth"] != "1" or values["--worker-type"] != "owner":
+    worker_type = values["--worker-type"]
+    if values["--dispatch-depth"] != "1" or worker_type not in _LAUNCHABLE_WORKER_TYPES:
         raise OwnerError("owner-tuple-required")
+    unit = (values.get("--unit") or "").strip()
+    if worker_type == "owner":
+        # Unchanged: the owner tuple pins its own unit downstream
+        # (`dispatch_mode_contract`), and an owner that names one is a
+        # contradiction the tuple contract already refuses.
+        if unit and unit != "_kernel/owner":
+            raise OwnerError("invalid-owner-unit")
+    else:
+        # A review worker is a *unit*, not a kernel role: it must name the
+        # catalog persona it reviews as, and it can never borrow the owner's.
+        if not unit:
+            raise OwnerError("review-worker-unit-required")
+        if unit in _RESERVED_UNITS:
+            raise OwnerError("review-worker-unit-reserved")
+        if not _UNIT_REF.fullmatch(unit):
+            raise OwnerError("invalid-review-worker-unit")
+        if route_evidence:
+            # A route node's review worker is launched by the stage dispatcher
+            # with its node binding, not by this selector. Accepting route
+            # evidence here would let one node be claimed by two launch paths.
+            raise OwnerError("review-worker-route-evidence-unsupported")
     if values["--model-profile"] not in {"deep", "balanced-deep", "light"}:
         raise OwnerError("invalid-model-profile")
     # Equal-form required options are forwarded unchanged; split-form options

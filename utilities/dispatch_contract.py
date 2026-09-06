@@ -226,6 +226,15 @@ ATTEMPT_TERMINAL_EVIDENCE_KEYS = {
     # through `_updated_attempt_metadata(..., terminal=True)` so the operator-
     # chosen evidence path is sanitized like every other terminal value.
     "gate_closure",
+    # SD-OPEN-41(b): verdict provenance for a `review-worker` node's completion.
+    # `reviewer_kind` is one of capability-route's REVIEWER_KINDS,
+    # `review_independence` is independent|degraded, and the reason is present
+    # only on a degraded close. Terminal evidence, not a mutable axis: sealed
+    # beside `note=completed-marker` at the row's one close and never rewritten
+    # with a different value afterwards.
+    "reviewer_kind",
+    "review_independence",
+    "reviewer_downgrade_reason",
     "owner_closure",
 }
 _MODULE_ROOT = Path(__file__).resolve().parents[1]

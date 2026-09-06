@@ -2737,8 +2737,55 @@ def close_route(route, route_file, commit=None, summary=None, publication=None, 
     if publication is not None: outcome["publication"]=publication
     releases=_gate_releases(route_file)
     if releases: outcome["gate_releases"]=releases
+    reviews=review_independence_observation(route)
+    if reviews:
+        outcome["review_independence"]=reviews
+        degraded=sorted(
+            node_id for node_id,row in reviews.items()
+            if row.get("review_independence")=="degraded"
+        )
+        if degraded: outcome["review_independence_degraded"]=degraded
     atomic_write(target,outcome)
     return outcome, True
+
+def review_independence_observation(route):
+    """Per review-class node: who produced the verdict, read live from the markers.
+
+    SD-OPEN-41(b) requirement (2) -- an owner-inline review does not block the
+    route, but the route's own closed outcome has to say the gate was not
+    independently reviewed, so a later reader is never left inferring
+    independence from the fact that the route closed.
+
+    Computed at close time from the markers on disk, exactly like
+    `terminal_gate_observation`: a route closed once is never reopened to
+    recompute it. A review node completed before this field existed has no
+    provenance in its marker and is reported `unrecorded` rather than being
+    guessed at.
+    """
+
+    rows={}
+    for node in route.get("nodes",[]):
+        if node.get("kind")!="review-worker":
+            continue
+        node_id=node.get("id")
+        path=completion_dir(route["route_id"])/f"{node_id}.json"
+        try:
+            marker=json.loads(path.read_text(encoding="utf-8"))
+        except (OSError,ValueError):
+            rows[node_id]={"review_independence":"unrecorded","reason":"marker-unreadable"}
+            continue
+        if not isinstance(marker,dict) or not marker.get("review_independence"):
+            rows[node_id]={"review_independence":"unrecorded","reason":"marker-predates-provenance"}
+            continue
+        row={
+            "review_independence":marker["review_independence"],
+            "reviewer_kind":marker.get("reviewer_kind"),
+            "reviewer_identity":marker.get("reviewer_identity"),
+        }
+        if marker.get("reviewer_downgrade_reason"):
+            row["reviewer_downgrade_reason"]=marker["reviewer_downgrade_reason"]
+        rows[node_id]=row
+    return rows
 
 def _gate_releases(route_file):
     """SD-123 (8)(d): fold the gate-release sidecar into the closed outcome.
@@ -2868,6 +2915,101 @@ def _marker_attempt_axes(node, attempt_id, attempt_metadata):
         "fallback_hop":str(attempt_metadata.get("fallback_hop") or "") or None,
     }
 
+# SD-OPEN-41(b): the three ways a review-class node's verdict can be produced.
+# `registered-worker` and `native-subagent` are independent review; `owner-inline`
+# is the owner ruling on its own work and is recorded as a degraded gate, never
+# refused -- refusing would deadlock every route whose review node seals
+# `native-subagent` and `inline` as its last two fallback hops (SD-132's mistake).
+REVIEWER_KINDS = ("registered-worker", "native-subagent", "owner-inline")
+
+
+def resolve_review_identity(node, axes, attempt_metadata, *, claim=None, jobs=None):
+    """Name who actually reviewed, for a `review-worker` node's completion marker.
+
+    Returns `{}` for every other node kind, so no non-review marker changes shape.
+
+    Measured on 2026-09-06 across 2,911 production review markers: the axes
+    already separate registered (2,899) from inline (12), but among the inline
+    ones nothing distinguished "the owner reviewed its own work" from "a native
+    subagent reviewed it" -- and the user's rule counts the second as independent.
+    Nothing bound a *registered* completer to `worker_type=review` either, so
+    `registered_worker=true` was not proof that a review worker produced the
+    verdict.
+
+    A claim is adjudicated against evidence, never taken on its word:
+
+    * `registered-worker` names another attempt; the row must exist in `jobs`
+      and carry `worker_type=review`.
+    * `native-subagent` names a transcript; it must be a readable regular file,
+      and its sha256 is recorded so the identity is checkable later.
+    * no claim: the completing attempt is the reviewer, which is independent
+      only when its own row says `worker_type=review`.
+
+    Every failed claim **downgrades** to `owner-inline` carrying a typed
+    `reviewer_downgrade_reason`. Downgrade and not refusal is the whole point:
+    the next node still proceeds, and the route's own outcome carries the fact
+    that this gate was not independently reviewed.
+    """
+
+    if node.get("kind") != "review-worker":
+        return {}
+
+    def degraded(reason):
+        return {
+            "reviewer_kind": "owner-inline",
+            "review_independence": "degraded",
+            "reviewer_identity": axes.get("attempt_id") or "-",
+            "reviewer_downgrade_reason": reason,
+        }
+
+    if claim and claim.get("kind") == "registered-worker":
+        reviewer_attempt = claim.get("attempt_id") or ""
+        if not jobs:
+            return degraded("reviewer-claim-unverifiable-no-registry")
+        try:
+            row = _find_attempt_row_metadata(Path(jobs), reviewer_attempt)
+        except OSError:
+            return degraded("reviewer-registry-unreadable")
+        if row is None:
+            return degraded("reviewer-attempt-row-absent")
+        if row.get("worker_type") != "review":
+            return degraded("reviewer-attempt-not-review-worker")
+        return {
+            "reviewer_kind": "registered-worker",
+            "review_independence": "independent",
+            "reviewer_identity": reviewer_attempt,
+        }
+
+    if claim and claim.get("kind") == "native-subagent":
+        transcript = Path(claim.get("transcript") or "")
+        try:
+            readable = transcript.is_file()
+            digest = (
+                hashlib.sha256(transcript.read_bytes()).hexdigest() if readable else None
+            )
+        except OSError:
+            return degraded("reviewer-transcript-unreadable")
+        if not readable or digest is None:
+            return degraded("reviewer-transcript-unreadable")
+        return {
+            "reviewer_kind": "native-subagent",
+            "review_independence": "independent",
+            "reviewer_identity": str(transcript.resolve(strict=False)),
+            "reviewer_identity_sha256": digest,
+        }
+
+    worker_type = (attempt_metadata or {}).get("worker_type")
+    if axes.get("registered_worker") and worker_type == "review":
+        return {
+            "reviewer_kind": "registered-worker",
+            "review_independence": "independent",
+            "reviewer_identity": axes.get("attempt_id") or "-",
+        }
+    if axes.get("registered_worker"):
+        return degraded("completer-not-review-worker")
+    return degraded("review-completed-inline")
+
+
 def _next_marker_sequence(directory, node_id):
     maximum=0
     if directory.is_dir():
@@ -2975,7 +3117,10 @@ def evidence_digest(evidence):
             raise ValueError(f"evidence-member-not-regular:{child}")
     return digest.hexdigest()
 
-def write_completion_marker(route, node, node_id, evidence, *, attempt_id=None, attempt_metadata=None):
+def write_completion_marker(
+    route, node, node_id, evidence, *,
+    attempt_id=None, attempt_metadata=None, review_claim=None, jobs=None,
+):
     _migrate_completion_dir_forward(route["route_id"])
     directory=completion_dir(route["route_id"])
     canonical_path=directory/f"{node_id}.json"
@@ -2990,6 +3135,14 @@ def write_completion_marker(route, node, node_id, evidence, *, attempt_id=None, 
         "route_id":route["route_id"],"route_hash":route["route_hash"],
         "registry_digest":route["registry_digest"],"node_id":node_id,
         **axes,
+        # SD-OPEN-41(b). Deliberately NOT part of marker identity
+        # (`_completion_marker_replay` compares `axes` + evidence): who reviewed
+        # is a fact recorded about a completion, not a second thing that has to
+        # match for a replay to be the same completion. Empty for every node
+        # kind but `review-worker`.
+        **resolve_review_identity(
+            node, axes, attempt_metadata, claim=review_claim, jobs=jobs,
+        ),
         "completion_gate":node["completion_gate"],
         "evidence":{"path":str(evidence),"sha256":sha},
         "sequence":sequence,
@@ -3443,6 +3596,8 @@ def _publish_completion_locked(
     attempt_id,
     attempt_metadata,
     require_existing_link=False,
+    review_claim=None,
+    jobs=None,
 ):
     """Publish marker history, exact-attempt link, and canonical marker under one node lock."""
 
@@ -3518,6 +3673,8 @@ def _publish_completion_locked(
             route,node,node_id,evidence,
             attempt_id=attempt_id,
             attempt_metadata=attempt_metadata,
+            review_claim=review_claim,
+            jobs=jobs,
         )
     if not attempt_id:
         return marker
@@ -3576,6 +3733,7 @@ def complete_node(
     jobs=None,
     attempt_id=None,
     explicit_attempt_metadata=None,
+    review_claim=None,
 ):
     """Atomically publish one exact-attempt completion and close only its row.
 
@@ -3591,6 +3749,7 @@ def complete_node(
         route, node, node_id, evidence,
         jobs=jobs, attempt_id=attempt_id,
         explicit_attempt_metadata=explicit_attempt_metadata,
+        review_claim=review_claim,
     )
     if jobs and attempt_id and isinstance(row, dict) and row.get("status") == "closed":
         try:
@@ -3780,7 +3939,10 @@ def _complete_node_locked(
     jobs=None,
     attempt_id=None,
     explicit_attempt_metadata=None,
+    review_claim=None,
 ):
+    if review_claim and node.get("kind")!="review-worker":
+        raise ValueError("reviewer-claim-on-non-review-node")
     if jobs and not attempt_id:
         raise ValueError("registered completion requires --attempt-id")
     if not jobs and attempt_id and explicit_attempt_metadata is None:
@@ -3797,6 +3959,7 @@ def _complete_node_locked(
                 route,node,node_id,evidence,
                 attempt_id=attempt_id,
                 attempt_metadata=explicit_attempt_metadata,
+                review_claim=review_claim,
             )
             status="unregistered-complete" if attempt_id else None
             return marker, ({"attempt_id":attempt_id,"status":status} if status else None)
@@ -3809,6 +3972,8 @@ def _complete_node_locked(
                     route,node,node_id,evidence,
                     attempt_id=attempt_id,
                     attempt_metadata=explicit_attempt_metadata,
+                    review_claim=review_claim,
+                    jobs=jobs_path,
                 )
             raise ValueError(f"row-close-failed:{exc.reason}") from exc
         with _exclusive_lock(Path(f"{jobs_path}.lock")):
@@ -3830,6 +3995,8 @@ def _complete_node_locked(
                         route,node,node_id,evidence,
                         attempt_id=attempt_id,
                         attempt_metadata=explicit_attempt_metadata,
+                        review_claim=review_claim,
+                        jobs=jobs_path,
                     )
                 raise ValueError(
                     f"attempt-row-absent:{attempt_id}; exact fallback attempt metadata required"
@@ -3910,6 +4077,8 @@ def _complete_node_locked(
                 attempt_id=attempt_id,
                 attempt_metadata=attempt_metadata,
                 require_existing_link=already_closed and not marker_eligible,
+                review_claim=review_claim,
+                jobs=jobs_path,
             )
             if already_closed and not marker_eligible:
                 return marker, {"attempt_id":attempt_id,"status":"already-closed"}
@@ -3931,6 +4100,20 @@ def _complete_node_locked(
                 f",note=completed-marker,completion_marker={canonical_marker_path}"
                 f",completion_marker_history={history_marker_path}"
             )
+            # SD-OPEN-41(b): the row carries the same verdict-provenance axes the
+            # marker does, so a consumer reading the registry alone (Fleet, the
+            # reconcile carrier, a report) sees a degraded review without opening
+            # the marker. Only the short enum tokens travel here -- the reviewer's
+            # path-shaped identity stays in the marker, out of a comma-delimited
+            # field. `note` is deliberately still `completed-marker`: two gates
+            # read that exact literal to mean "this row terminated with a marker"
+            # (`dispatch_contract.marker_attempt_readiness` and this function's
+            # own already-closed branch), so spelling the degradation into `note`
+            # would make an idempotent second `complete` refuse the very row it
+            # had just closed.
+            for key in ("reviewer_kind","review_independence","reviewer_downgrade_reason"):
+                if marker.get(key):
+                    row_fields[5] += f",{key}={marker[key]}"
             # DR-1: seal the pass verdict alongside the marker so partial-continuation
             # peer checks see immutable terminal success without re-deriving it.
             if owner_closure is None and row_metadata.get("failure_class") in (None,"","-"):
@@ -4412,6 +4595,13 @@ def main():
     d.add_argument("--registered-worker",choices=("0","1","false","true"))
     d.add_argument("--fallback-hop")
     d.add_argument("--subsession-manifest",help="aggregate declared sub-sessions into this one stage gate")
+    d.add_argument("--reviewer-attempt",
+                   help="review-worker node only: the registered review attempt that produced the verdict; "
+                        "verified against --jobs and downgraded to owner-inline when the row is absent "
+                        "or is not worker_type=review")
+    d.add_argument("--reviewer-subagent",
+                   help="review-worker node only: transcript path of the native subagent that produced "
+                        "the verdict; recorded with its sha256 and counted as independent review")
     ar=sub.add_parser("arbitrate"); ar.add_argument("--route",required=True)
     ar.add_argument("--group",required=True,help="realized auxiliary-bearing parallel group id")
     ar.add_argument("--evidence",required=True,help="owner merge record carrying auxiliary_findings_considered")
@@ -4648,6 +4838,14 @@ def main():
             outcome,created=close_route(route,a.route,a.commit,a.summary,allow_unproven=a.allow_unproven)
             print(json.dumps(outcome,sort_keys=True))
             if not created: print("capability-route: route already closed",file=sys.stderr)
+            if outcome.get("review_independence_degraded"):
+                print(
+                    "capability-route: completed-review-degraded "
+                    f"route_id={outcome['route_id']} "
+                    f"nodes={','.join(outcome['review_independence_degraded'])} "
+                    "-- these gates were not independently reviewed",
+                    file=sys.stderr,
+                )
             if outcome.get("terminal_gate_proven") is False:
                 reasons={node_id:row.get("reason") for node_id,row in
                          (outcome.get("terminal_gates") or {}).items() if not row.get("passed")}
@@ -4668,6 +4866,13 @@ def main():
                 # completion marker written behind a refused copy.
                 if a.output and Path(a.output).exists():
                     raise ValueError("completion-output-exists")
+                if a.reviewer_attempt and a.reviewer_subagent:
+                    raise ValueError("reviewer-claim-conflict")
+                review_claim=None
+                if a.reviewer_attempt:
+                    review_claim={"kind":"registered-worker","attempt_id":a.reviewer_attempt}
+                elif a.reviewer_subagent:
+                    review_claim={"kind":"native-subagent","transcript":a.reviewer_subagent}
                 raw_axes=(a.dispatch_depth,a.transport,a.execution_surface,a.registered_worker,a.fallback_hop)
                 explicit_attempt_metadata=None
                 if any(value is not None for value in raw_axes):
@@ -4680,6 +4885,8 @@ def main():
                         "fallback_hop":a.fallback_hop,
                     }
                 if a.subsession_manifest:
+                    if review_claim:
+                        raise ValueError("reviewer-claim-unsupported-on-subsession-gate")
                     if not a.jobs or a.attempt_id or explicit_attempt_metadata is not None:
                         raise ValueError("subsession completion requires --jobs and forbids attempt axes")
                     route["_route_file"]=str(Path(a.route).resolve())
@@ -4692,10 +4899,22 @@ def main():
                         jobs=a.jobs,
                         attempt_id=a.attempt_id,
                         explicit_attempt_metadata=explicit_attempt_metadata,
+                        review_claim=review_claim,
                     )
                 if a.output: atomic_write(a.output, marker)
                 print(json.dumps(marker,sort_keys=True))
                 if row: print(json.dumps(row,sort_keys=True))
+                if marker.get("review_independence")=="degraded":
+                    # Typed and on stderr, so an owner that closed its own review
+                    # node cannot finish the stage without being told -- and so
+                    # the §0.5 completion card has something to quote.
+                    print(
+                        "capability-route: completed-review-degraded "
+                        f"route_id={route['route_id']} node={a.node} "
+                        f"reviewer_kind={marker['reviewer_kind']} "
+                        f"reason={marker.get('reviewer_downgrade_reason','-')}",
+                        file=sys.stderr,
+                    )
 
 if __name__=="__main__":
     try: main()
