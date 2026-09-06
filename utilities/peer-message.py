@@ -27,20 +27,24 @@ _SURFACES = (
 )
 _STATUSES = ("sent", "delivered", "received", "failed", "unknown")
 _SUMMARY_MAX = 200
-# F-100c (revised 2026-09-06, fleet-steward-role) — the steward flag (depth −1) is a ROLE,
-# not a side effect of talking. A marker target counts as steward evidence only when its
+# F-100c-2 (2026-09-06, fleet-steward-role) — the steward flag (depth −1) is a ROLE, not a
+# side effect of talking. A marker target counts as steward evidence only when its
 # `source` is one of `_STEWARD_SOURCES`: `explicit` (`peer-steward.py steward on`),
-# `watch` (a SENT `watch` record — `wait`/`watch` observed the target) or `start`
-# (`peer-steward.py start` launched the target). A SENT steer/handoff/gate-relay never
-# raises the flag any more: workers hand off to their steward with exactly those kinds,
-# so the old rule made every worker look like a steward (13 markers measured on the real
-# root, most of them handoff-only). Send counts stay in F-98a `peer_sent_1h`.
+# `watch` (`peer-steward.py wait`/`watch` — written by that surface AFTER herdr answered
+# about a real target) or `start` (`peer-steward.py start` received an error-free agent
+# block). **No `record` path raises the flag, whatever the kind**: a SendMessage with
+# `notify_when_idle` is recorded as `kind=watch` by the Claude hook, and a worker's
+# `[handoff]` to its steward is a message — under the old rule ("SENT steer/handoff/
+# gate-relay/watch = steward") every worker that talked looked like a steward (13 markers
+# measured on the real root, most of them handoff-only). Send counts stay in F-98a
+# `peer_sent_1h`. The role claim lives only in `peer-steward.py`, at the points where
+# something was actually observed or launched (review round 1, #1/#2).
 _STEWARD_SOURCES = ("explicit", "watch", "start")
-# Record kinds whose SENT row still raises the flag (source = the kind itself).
-_STEWARD_MARKING_KINDS = ("watch",)
 # Legacy entries (written before `source` existed) are judged by their kind alone:
-# `wait`/`watch` wrote kind=watch, and so did the old `steward on` placeholder.
-_STEWARD_LEGACY_KINDS = ("watch", "start")
+# `wait`/`watch` wrote kind=watch, and so did the old `steward on` placeholder. The old
+# `start` was recorded as a `steer` row and is intentionally not evidence (a restart
+# raises it again with source=start).
+_STEWARD_LEGACY_KINDS = ("watch",)
 _STEWARD_TARGETS_MAX = 32
 
 # F-100c — the harness-neutral sender trailer a steward appends to a herdr prompt so the
@@ -154,25 +158,23 @@ def _ledger_path(from_session_id, when=None):
 
 def steward_marker_path(harness, session_id):
     """F-100c steward flag: ``<dispatch-state-root>/peer-steward/<harness>/<sid>.json``.
-    Raised only by steward-role evidence — a SENT `watch` record, `peer-steward.py start`
-    or `peer-steward.py steward on` (see `_STEWARD_SOURCES`) — read by the Fleet steward
-    collector through `steward_evidence_targets`, cleared by `peer-message release`,
-    and swept of evidence-less leftovers by `peer-message prune-steward-markers`."""
+    Raised only by `peer-steward.py` (`wait`/`watch` after observing a real target,
+    `start` after an error-free launch, `steward on`; see `_STEWARD_SOURCES`), never by
+    `record`; read by the Fleet steward collector through `steward_evidence_targets`,
+    cleared by `peer-message release`, and swept of evidence-less leftovers by
+    `peer-message prune-steward-markers`."""
     safe = "".join(ch if (ch.isalnum() or ch in "._-") else "_" for ch in str(session_id or ""))
     return _ledger_root() / "peer-steward" / str(harness or "unknown") / f"{safe or 'unknown'}.json"
 
 
 def mark_steward(harness, session_id, to, kind, ts, source=None):
-    """Raise (or extend) the sender's steward marker with one evidence entry.
+    """Raise (or extend) the session's steward marker with one evidence entry.
 
-    ``source`` says why the entry counts (`explicit` | `watch` | `start`); it defaults
-    to ``kind`` when that kind is itself a marking kind. Anything else is refused —
-    returns False and writes nothing — so no send path can raise the flag by accident
-    again. Every entry carries its ``source`` so the reader can show the grounds."""
-    if not session_id:
-        return False
-    source = source or (kind if kind in _STEWARD_MARKING_KINDS else None)
-    if source not in _STEWARD_SOURCES:
+    ``source`` is required and says why the entry counts (`explicit` | `watch` |
+    `start`); anything else — including a missing source — is refused: returns False
+    and writes nothing, so no send path can raise the flag by accident again. Every
+    entry carries its ``source`` so the reader can show the grounds."""
+    if not session_id or source not in _STEWARD_SOURCES:
         return False
     path = steward_marker_path(harness, session_id)
     try:
@@ -197,7 +199,12 @@ def mark_steward(harness, session_id, to, kind, ts, source=None):
                 targets.pop(k, None)
         data["targets"] = targets
         data["updated"] = ts
-        data["schema_version"] = 2  # entries carry `source`
+        # schema_version 2 = every entry carries `source`. A legacy file that keeps a
+        # source-less entry stays at its own version (the rule is per entry anyway).
+        if all(isinstance(e, dict) and e.get("source") is not None for e in targets.values()):
+            data["schema_version"] = 2
+        else:
+            data["schema_version"] = data.get("schema_version") or 1
         tmp = path.with_name(path.name + ".tmp")
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(data, fh, ensure_ascii=False)
@@ -260,21 +267,50 @@ def _iter_marker_files(base):
             yield hdir.name, f, data if isinstance(data, dict) else None
 
 
-def read_steward_markers(roots=None, include_unevidenced=False):
+def steward_marker_roots():
+    """``(roots, source)`` — the dispatch state roots a marker sweep must cover, which is
+    the SAME set the Fleet steward collector reads (`fleet.collectors.peer_messages
+    ._state_roots`: the writer's resolver chain plus every installed runtime's own
+    root). Two markers under `~/.codex/.harness/dispatch` were unreachable from the
+    single-root default (review round 1, #3). Falls back to the resolver chain alone,
+    then to this process's own root; ``source`` names which one applied so the sweep's
+    summary can say it."""
+    tools_dir = Path(__file__).resolve().parent.parent / "tools"
+    try:
+        if tools_dir.is_dir() and str(tools_dir) not in sys.path:
+            sys.path.insert(0, str(tools_dir))
+        from fleet.collectors import peer_messages as _fleet_pm  # noqa: WPS433
+        roots = [Path(r) for r in (_fleet_pm._state_roots() or ())]
+        if roots:
+            return roots, "fleet-reader"
+    except Exception:
+        pass
+    try:
+        from dispatch_contract import dispatch_state_roots  # noqa: WPS433
+        roots = [Path(r) for r in dispatch_state_roots(
+            _agent_home(), jobs=os.environ.get("AGENT_DISPATCH_JOBS"), environ=os.environ)]
+        if roots:
+            return roots, "dispatch-chain"
+    except Exception:
+        pass
+    return [_ledger_root()], "own-root"
+
+
+def read_steward_markers(roots=None):
     """``{(harness, session_id): marker_dict}`` over every marker under the ledger
     root(s). ``roots`` = iterable of dispatch state roots (F-100c: Fleet passes every
     installed runtime's own root as well); default = this process's own root.
 
-    By default a marker with no steward evidence (`steward_evidence_targets` empty) is
-    left out, so every consumer is defended against leftovers of the old send-marks
-    rule. ``include_unevidenced=True`` is for the prune surface only."""
+    A marker with no steward evidence (`steward_evidence_targets` empty) is left out,
+    so every consumer is defended against leftovers of the old send-marks rule. The
+    prune surface walks the files itself (`_iter_marker_files`) because it needs paths."""
     out = {}
     root_list = [Path(r) for r in roots] if roots else [_ledger_root()]
     for base in root_list:
         for harness, _path, data in _iter_marker_files(base):
             if data is None or not data.get("session_id"):
                 continue
-            if not include_unevidenced and not is_steward_marker(data):
+            if not is_steward_marker(data):
                 continue
             key = (harness, str(data["session_id"]))
             if key not in out or (data.get("updated") or "") > (out[key].get("updated") or ""):
@@ -366,10 +402,9 @@ def cmd_record(args):
                 os.fsync(fh.fileno())
             finally:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-        # A SENT `watch` is steward evidence (the sender observes the target); a SENT
-        # steer/handoff/gate-relay is just a message and raises nothing.
-        if args.status == "sent" and kind in _STEWARD_MARKING_KINDS:
-            mark_steward(args.from_harness, args.from_session_id, to, kind, ts, source=kind)
+        # No send path raises the steward flag (F-100c-2): `peer-steward.py` marks after
+        # it observed or launched something. A `kind=watch` row here may be a plain
+        # SendMessage with `notify_when_idle`, which is not a role.
         return 0
     except Exception as exc:
         print(f"peer-message record failed: {exc}", file=sys.stderr)
@@ -394,12 +429,18 @@ def cmd_release(args):
 def cmd_prune_steward_markers(args):
     """List (default, dry-run) or delete (`--apply`) markers that hold no steward
     evidence — the leftovers an earlier version raised on every SENT steer/handoff/
-    gate-relay. Unreadable markers are reported and never touched."""
-    roots = [Path(r) for r in (getattr(args, "root", None) or [])] or [_ledger_root()]
+    gate-relay. Roots default to the Fleet reader's own set (`steward_marker_roots`)
+    and are printed one per line. Unreadable markers are counted and never touched;
+    each candidate is re-read right before its unlink so a flag raised meanwhile
+    survives. Exit: dry-run 2 when candidates exist (0 when clean); apply 0 when every
+    candidate was removed or kept-now-evidenced, 1 when an unlink failed."""
+    explicit = [Path(r) for r in (getattr(args, "root", None) or [])]
+    roots, roots_source = (explicit, "explicit") if explicit else steward_marker_roots()
     mode = "apply" if args.apply else "dry-run"
     total = unreadable = removed = 0
     stale = []
     for base in roots:
+        print(f"root={base}")
         for harness, path, data in _iter_marker_files(base):
             total += 1
             if data is None:
@@ -414,20 +455,39 @@ def cmd_prune_steward_markers(args):
     for harness, sid, count, kinds, path in stale:
         verdict = "candidate"
         if args.apply:
-            try:
-                # destructive-ok: reason=evidence-less steward marker under the dispatch state root, opt-in --apply after a dry-run listing; boundary=<dispatch-state-root>/peer-steward/<harness>/<sid>.json
-                path.unlink()
+            verdict = _unlink_unevidenced_marker(path)
+            if verdict == "removed":
                 removed += 1
-                verdict = "removed"
-            except FileNotFoundError:
-                verdict = "gone"
-            except OSError as exc:
-                verdict = f"failed:{exc.errno}"
+            elif verdict.startswith("failed"):
                 rc = 1
         print(f"{verdict} {harness} {sid} entries={count} kinds={','.join(kinds) or '-'} path={path}")
-    print(f"prune-steward-markers mode={mode} roots={len(roots)} markers={total} "
-          f"unevidenced={len(stale)} removed={removed} unreadable={unreadable}")
+    print(f"prune-steward-markers mode={mode} roots={len(roots)} roots_source={roots_source} "
+          f"markers={total} unevidenced={len(stale)} removed={removed} unreadable={unreadable}")
+    if not args.apply and stale:
+        return 2
     return rc
+
+
+def _unlink_unevidenced_marker(path):
+    """Re-read ``path`` and unlink it only if it STILL holds no steward evidence
+    (a `steward on`/`wait` may have landed between the scan and this call)."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            fresh = json.load(fh)
+    except FileNotFoundError:
+        return "gone"
+    except Exception:
+        fresh = None
+    if isinstance(fresh, dict) and is_steward_marker(fresh):
+        return "kept:now-evidenced"
+    try:
+        # destructive-ok: reason=evidence-less steward marker re-checked immediately before removal, opt-in --apply; boundary=<dispatch-state-root>/peer-steward/<harness>/<sid>.json
+        path.unlink()
+    except FileNotFoundError:
+        return "gone"
+    except OSError as exc:
+        return f"failed:{exc.errno}"
+    return "removed"
 
 
 def _iter_records(since_hours=None):
@@ -526,7 +586,7 @@ def main(argv=None):
                              help="list (default) or delete (--apply) markers with no steward evidence")
     p_prune.add_argument("--apply", action="store_true")
     p_prune.add_argument("--root", action="append", default=[],
-                         help="dispatch state root to scan (repeatable; default: this runtime's own)")
+                         help="dispatch state root to scan (repeatable; default: the same root set the Fleet steward collector reads)")
     p_prune.set_defaults(func=cmd_prune_steward_markers)
 
     args = parser.parse_args(argv)

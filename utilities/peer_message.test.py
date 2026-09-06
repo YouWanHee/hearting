@@ -331,47 +331,54 @@ class F100cSenderAndStewardTest(unittest.TestCase):
         self.assertEqual(peer_message.parse_peer_trailer(
             peer_message.peer_trailer("claude", "s", "a) b"))["name"], "a  b".replace("  ", " "))
 
-    def test_sent_steer_handoff_gate_relay_do_not_mark_the_sender(self):
+    def _marker_keys_on_disk(self):
+        return {(h, d.get("session_id")) for h, _p, d in
+                peer_message._iter_marker_files(peer_message._ledger_root()) if d}
+
+    def test_record_never_marks_the_sender_whatever_the_kind(self):
         """Role ≠ communication (user 2026-09-06: every session that talked showed d=−1).
-        A worker's `[handoff]` to its steward is a message, not a steward act."""
-        for kind in ("steer", "handoff", "gate-relay"):
-            self.assertEqual(peer_message.cmd_record(self._ns(kind=kind)), 0)
+        A worker's `[handoff]` to its steward is a message; so is a SendMessage with
+        `notify_when_idle`, which the Claude hook records as `kind=watch` (review #1)."""
+        for kind in peer_message._KINDS:
+            for status in ("sent", "delivered", "received"):
+                self.assertEqual(peer_message.cmd_record(self._ns(kind=kind, status=status)), 0)
         self.assertEqual(peer_message.read_steward_markers(), {})
-        self.assertEqual(peer_message.read_steward_markers(include_unevidenced=True), {})
+        self.assertEqual(self._marker_keys_on_disk(), set())
         self.assertFalse(peer_message.steward_marker_path("claude", "sid-a").exists())
+        self.assertFalse((peer_message._ledger_root() / "peer-steward").exists())
 
-    def test_sent_watch_marks_the_sender_with_source_watch_notice_does_not(self):
-        self.assertEqual(peer_message.cmd_record(self._ns(kind="watch")), 0)
-        markers = peer_message.read_steward_markers()
-        self.assertEqual(set(markers), {("claude", "sid-a")})
-        entry = markers[("claude", "sid-a")]["targets"]["sid-c"]
-        self.assertEqual((entry["harness"], entry["kind"], entry["source"]), ("codex", "watch", "watch"))
-        self.assertEqual(markers[("claude", "sid-a")]["schema_version"], 2)
-        self.assertEqual(peer_message.cmd_record(self._ns(
-            from_harness="codex", from_session_id="sid-c", to_harness="claude",
-            to_session_id="sid-a", kind="notice", status="received")), 0)
-        # a watch that was not SENT (failed/unknown) is not evidence either
-        self.assertEqual(peer_message.cmd_record(self._ns(
-            from_session_id="sid-z", kind="watch", status="failed")), 0)
-        self.assertEqual(set(peer_message.read_steward_markers()), {("claude", "sid-a")})
-        self.assertEqual(peer_message.cmd_release(peer_message.argparse.Namespace(
-            harness="claude", session_id="sid-a")), 0)
-        self.assertEqual(peer_message.read_steward_markers(), {})
-
-    def test_mark_steward_refuses_a_non_evidence_source(self):
+    def test_mark_steward_requires_an_evidence_source_and_release_clears(self):
         ts = "2026-09-06T00:00:00Z"
         to = {"harness": "codex", "session_id": "sid-c", "name": "child"}
         self.assertFalse(peer_message.mark_steward("claude", "sid-a", to, "handoff", ts))
+        self.assertFalse(peer_message.mark_steward("claude", "sid-a", to, "watch", ts))       # no source
         self.assertFalse(peer_message.mark_steward("claude", "sid-a", to, "steer", ts, source="steer"))
-        self.assertFalse(peer_message.mark_steward("claude", "", to, "watch", ts))
+        self.assertFalse(peer_message.mark_steward("claude", "", to, "watch", ts, source="watch"))
         self.assertFalse(peer_message.steward_marker_path("claude", "sid-a").exists())
         self.assertTrue(peer_message.mark_steward("claude", "sid-a", to, "start", ts, source="start"))
-        self.assertTrue(peer_message.mark_steward("claude", "sid-a", to, "watch", ts))
+        self.assertTrue(peer_message.mark_steward("claude", "sid-a", to, "watch", ts, source="watch"))
         self.assertTrue(peer_message.mark_steward("claude", "sid-a",
                                                   {"harness": "unknown", "name": "-"},
                                                   "explicit", ts, source="explicit"))
         marker = peer_message.read_steward_markers()[("claude", "sid-a")]
         self.assertEqual({e["source"] for e in marker["targets"].values()}, {"watch", "explicit"})
+        self.assertEqual(marker["targets"]["sid-c"]["harness"], "codex")
+        self.assertEqual(marker["schema_version"], 2)
+        self.assertEqual(peer_message.cmd_release(peer_message.argparse.Namespace(
+            harness="claude", session_id="sid-a")), 0)
+        self.assertEqual(peer_message.read_steward_markers(), {})
+
+    def test_schema_version_2_only_when_every_entry_carries_a_source(self):
+        path = self._write_marker("claude", "sid-a", {
+            "h": {"harness": "claude", "session_id": "h", "name": "h", "kind": "handoff", "ts": "1"}})
+        to = {"harness": "codex", "session_id": "w", "name": "w"}
+        self.assertTrue(peer_message.mark_steward("claude", "sid-a", to, "watch", "2", source="watch"))
+        data = json.loads(path.read_text())
+        self.assertEqual(data["schema_version"], 1)      # a source-less entry remains
+        self.assertEqual({e.get("source") for e in data["targets"].values()}, {None, "watch"})
+        self.assertTrue(peer_message.mark_steward("claude", "sid-b", to, "watch", "2", source="watch"))
+        self.assertEqual(json.loads(peer_message.steward_marker_path("claude", "sid-b").read_text())
+                         ["schema_version"], 2)
 
     def _write_marker(self, harness, sid, targets, updated="2026-09-06T00:00:00Z"):
         path = peer_message.steward_marker_path(harness, sid)
@@ -398,9 +405,15 @@ class F100cSenderAndStewardTest(unittest.TestCase):
             "-": {"harness": "unknown", "session_id": None, "name": "-", "kind": "watch",
                   "ts": "2026-09-06T02:00:00Z"}})
         self._write_marker("opencode", "oc-1", {})
+        self._write_marker("claude", "old-launcher", {
+            "c": {"harness": "codex", "session_id": "c", "name": "c", "kind": "steer",
+                  "ts": "2026-09-06T01:00:00Z"}})          # the old `start` wrote a steer row
         self.assertEqual(set(peer_message.read_steward_markers()), {("claude", "steward-1")})
-        self.assertEqual(set(peer_message.read_steward_markers(include_unevidenced=True)),
-                         {("claude", "worker-1"), ("claude", "steward-1"), ("opencode", "oc-1")})
+        self.assertEqual(self._marker_keys_on_disk(),
+                         {("claude", "worker-1"), ("claude", "steward-1"), ("opencode", "oc-1"),
+                          ("claude", "old-launcher")})
+        self.assertFalse(peer_message.is_steward_marker({"session_id": "z", "targets": {
+            "q": {"kind": "start", "ts": "1"}}}))                # legacy kind=start is not evidence
         marker = peer_message.read_steward_markers()[("claude", "steward-1")]
         self.assertEqual([e["session_id"] for e in peer_message.steward_evidence_targets(marker)],
                          ["child-b", None])
@@ -412,6 +425,9 @@ class F100cSenderAndStewardTest(unittest.TestCase):
         self.assertEqual(peer_message.steward_evidence_targets({"targets": "junk"}), [])
 
     def test_prune_steward_markers_dry_run_lists_and_apply_removes_only_unevidenced(self):
+        """Every run here names the temp root explicitly (`--root`): the default root set is
+        the Fleet reader's, which includes the real per-user root."""
+        root = str(peer_message._ledger_root())
         stale = self._write_marker("claude", "worker-1", {
             "s": {"harness": "claude", "session_id": "s", "name": "n", "kind": "handoff", "ts": "1"}})
         empty = self._write_marker("claude", "worker-2", {})
@@ -420,31 +436,55 @@ class F100cSenderAndStewardTest(unittest.TestCase):
         broken = keep.parent / "broken.json"
         broken.write_text("{not json")
         with mock.patch("builtins.print") as print_mock:
-            self.assertEqual(peer_message.main(["prune-steward-markers"]), 0)
+            self.assertEqual(peer_message.main(["prune-steward-markers", "--root", root]), 2)
         lines = [c[0][0] for c in print_mock.call_args_list]
-        self.assertTrue(lines[-1].startswith("prune-steward-markers mode=dry-run roots=1 markers=4 "
-                                             "unevidenced=2 removed=0 unreadable=1"), lines[-1])
-        self.assertEqual(sorted(l.split()[2] for l in lines[:-1]), ["worker-1", "worker-2"])
-        self.assertTrue(all(l.startswith("candidate ") for l in lines[:-1]))
-        self.assertIn("kinds=handoff", next(l for l in lines if " worker-1 " in l))
+        self.assertEqual(lines[0], f"root={root}")
+        self.assertTrue(lines[-1].startswith("prune-steward-markers mode=dry-run roots=1 "
+                                             "roots_source=explicit markers=4 unevidenced=2 "
+                                             "removed=0 unreadable=1"), lines[-1])
+        cands = [l for l in lines if l.startswith("candidate ")]
+        self.assertEqual(sorted(l.split()[2] for l in cands), ["worker-1", "worker-2"])
+        self.assertIn("kinds=handoff", next(l for l in cands if " worker-1 " in l))
         for p in (stale, empty, keep, broken):
             self.assertTrue(p.exists())
-        with mock.patch("builtins.print") as print_mock:
-            self.assertEqual(peer_message.main(["prune-steward-markers", "--apply"]), 0)
+        # a flag raised between the scan and the unlink survives (review #7)
+        real_unlink = peer_message._unlink_unevidenced_marker
+        def racing_unlink(path):
+            if path == empty:
+                peer_message.mark_steward("claude", "worker-2", {"harness": "codex", "session_id": "z",
+                                                                 "name": "z"}, "watch", "9", source="watch")
+            return real_unlink(path)
+        with mock.patch("builtins.print") as print_mock, \
+             mock.patch.object(peer_message, "_unlink_unevidenced_marker", side_effect=racing_unlink):
+            self.assertEqual(peer_message.main(["prune-steward-markers", "--apply", "--root", root]), 0)
         lines = [c[0][0] for c in print_mock.call_args_list]
-        self.assertTrue(lines[-1].startswith("prune-steward-markers mode=apply roots=1 markers=4 "
-                                             "unevidenced=2 removed=2 unreadable=1"), lines[-1])
-        self.assertTrue(all(l.startswith("removed ") for l in lines[:-1]))
-        self.assertFalse(stale.exists()); self.assertFalse(empty.exists())
-        self.assertTrue(keep.exists()); self.assertTrue(broken.exists())
-        # an explicit --root scans that root instead of the resolved one
-        other = self.root / "other"
-        (other / "peer-steward" / "codex").mkdir(parents=True)
-        (other / "peer-steward" / "codex" / "t.json").write_text(json.dumps(
-            {"session_id": "t", "targets": {"a": {"kind": "steer", "ts": "1"}}}))
+        self.assertTrue(lines[-1].startswith("prune-steward-markers mode=apply roots=1 "
+                                             "roots_source=explicit markers=4 unevidenced=2 "
+                                             "removed=1 unreadable=1"), lines[-1])
+        self.assertTrue(any(l.startswith("removed claude worker-1 ") for l in lines))
+        self.assertTrue(any(l.startswith("kept:now-evidenced claude worker-2 ") for l in lines))
+        self.assertFalse(stale.exists())
+        self.assertTrue(empty.exists()); self.assertTrue(keep.exists()); self.assertTrue(broken.exists())
+        # clean root → dry-run exits 0
         with mock.patch("builtins.print") as print_mock:
-            self.assertEqual(peer_message.main(["prune-steward-markers", "--root", str(other)]), 0)
-        self.assertIn("markers=1 unevidenced=1", print_mock.call_args[0][0])
+            self.assertEqual(peer_message.main(["prune-steward-markers", "--root", root]), 0)
+        self.assertIn("unevidenced=0", print_mock.call_args[0][0])
+
+    def test_prune_default_roots_are_the_fleet_readers_and_are_printed(self):
+        roots, source = peer_message.steward_marker_roots()
+        self.assertEqual(source, "fleet-reader")
+        self.assertEqual(roots[0], peer_message._ledger_root())     # chain index 0 = the writer's root
+        fake = self.root / "fake-root"
+        (fake / "peer-steward" / "codex").mkdir(parents=True)
+        (fake / "peer-steward" / "codex" / "t.json").write_text(json.dumps(
+            {"session_id": "t", "targets": {"a": {"kind": "steer", "ts": "1"}}}))
+        with mock.patch("builtins.print") as print_mock, \
+             mock.patch.object(peer_message, "steward_marker_roots", return_value=([fake], "fleet-reader")):
+            self.assertEqual(peer_message.main(["prune-steward-markers"]), 2)
+        lines = [c[0][0] for c in print_mock.call_args_list]
+        self.assertEqual(lines[0], f"root={fake}")
+        self.assertIn("roots=1 roots_source=fleet-reader markers=1 unevidenced=1", lines[-1])
+        self.assertTrue((fake / "peer-steward" / "codex" / "t.json").exists())
 
     def test_claude_session_name_reads_the_registry_by_session_id(self):
         cfg = self.root / "cfg"

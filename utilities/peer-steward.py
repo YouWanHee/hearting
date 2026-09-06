@@ -259,6 +259,22 @@ def _interpret_payload(payload, target):
     }, 0, None
 
 
+def _mark_observed(to_harness, to_session_id, to_name, from_identity=None):
+    """F-100c-2 — the ONE place `source=watch` steward evidence is written: after
+    herdr answered about a real target (`wait` returned a typed state other than
+    agent-not-found, or `watch` armed its watcher). The `kind=watch` ledger row itself
+    is only the message; `record` never marks (review round 1, #1/#2)."""
+    if from_identity is not None:
+        from_sid, from_harness = from_identity[0], from_identity[1]
+    else:
+        from_sid, from_harness = _current_session_identity()
+    to = {"harness": to_harness if to_harness and to_harness != "-" else "unknown",
+          "session_id": to_session_id if to_session_id and to_session_id != "-" else None,
+          "name": to_name}
+    return peer_message.mark_steward(from_harness, from_sid, to, "watch", _utc_now(),
+                                     source="watch")
+
+
 def cmd_wait(args):
     target = args.target
     # S6: one record at wait start, append-only, never updated on return. F-100c: the
@@ -275,6 +291,11 @@ def cmd_wait(args):
     state, agent, code, reason = _interpret_payload(payload, target)
     if reason is not None:
         return _unavailable(reason)
+    # Role evidence only now: herdr answered about a real target. A mistyped target
+    # (agent-not-found) or an unavailable herdr leaves the ledger row and no flag.
+    if state != "agent-not-found":
+        _mark_observed(agent["harness"] if agent["harness"] != "-" else t_harness,
+                       agent["session_id"] if agent["session_id"] != "-" else t_sid, target)
     print(_typed_line(state, agent["harness"], agent["session_id"], agent["name"], agent["pane"]))
     return code
 
@@ -300,24 +321,33 @@ def cmd_start(args):
     except (OSError, subprocess.SubprocessError):
         return _unavailable("herdr-invocation-failed")
 
-    started = proc.returncode == 0
     # F-100c: herdr answers `agent_started` with the agent block; a Claude/Codex id is
     # usually present already, OpenCode's never is (measured) — record what we got.
+    # `started` needs exit 0 AND no error body (review round 1, #9): a herdr that exits
+    # 0 with `{"error": …}` launched nobody.
     started_sid = None
+    agent_block = None
+    payload_error = None
     try:
-        agent = (json.loads(proc.stdout or "").get("result") or {}).get("agent") or {}
-        started_sid = (agent.get("agent_session") or {}).get("value") or None
+        payload = json.loads(proc.stdout or "")
+        if isinstance(payload, dict):
+            payload_error = payload.get("error")
+            agent_block = (payload.get("result") or {}).get("agent")
+        if isinstance(agent_block, dict):
+            started_sid = (agent_block.get("agent_session") or {}).get("value") or None
     except Exception:
-        started_sid = None
+        agent_block = None
+    started = proc.returncode == 0 and not payload_error
     _record(
         to_harness=args.kind, to_name=args.name, kind="steer",
         summary_text=f"[start] {args.name} kind={args.kind} mode={mode}",
         to_session_id=started_sid,
     )
     # Launching a session is steward-role evidence (source=start); the `[start]` steer
-    # row above is only the message and raises nothing by itself. A start herdr refused
-    # launched nobody, so it marks nothing.
-    if started:
+    # row above is only the message and raises nothing by itself. Marked only from an
+    # error-free payload that carries the agent block — a refused start, an error body
+    # or an unparsable answer launched nothing we can point at.
+    if started and isinstance(agent_block, dict):
         from_sid, from_harness = _current_session_identity()
         peer_message.mark_steward(
             from_harness, from_sid,
@@ -720,6 +750,9 @@ def cmd_watch(args):
             to_name=target, kind="watch", ref=args.ref, receipt=watch_id,
             from_identity=(steward_sid, steward_harness, steward_project),
         )
+        # The watcher is armed on a target herdr resolved above: steward evidence.
+        _mark_observed(agent["harness"], agent["session_id"], target,
+                       from_identity=(steward_sid, steward_harness))
     finally:
         os.close(claim_fd)
 
@@ -1379,9 +1412,10 @@ def _herdr_error_reason(payload, rc):
 
 
 def cmd_steward(args):
-    """F-100c — explicit steward mode switch. The flag is a role, not a side effect of
-    sending: only `steward on` (source=explicit), a `wait`/`watch` (source=watch) or a
-    `start` that launched a session (source=start) raise it; `off` releases it."""
+    """F-100c-2 — explicit steward mode switch. The flag is a role, not a side effect of
+    sending: only `steward on` (source=explicit), a `wait`/`watch` that observed a real
+    target (source=watch) or a `start` that launched a session (source=start) raise it;
+    `off` releases it. A session taking the role runs `steward on` once."""
     sid, harness = _current_session_identity()
     if not sid:
         print("steward=unchanged reason=no-session-identity")

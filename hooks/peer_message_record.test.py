@@ -77,6 +77,15 @@ class PostToolTest(_BaseTest):
         recs = self._all_records()
         self.assertEqual(recs[0]["kind"], "watch")
 
+    def test_notify_when_idle_send_raises_no_steward_marker(self):
+        """F-100c-2 (review round 1 #1): the hook's `kind=watch` row is a delivery option,
+        not the steward role — a plain `[handoff]` with notify_when_idle used to flag the
+        sender as d=−1."""
+        for message in ("[handoff] done — please review", "plain message", "[steer] do X"):
+            self._run("post-tool", self._sendmessage_payload(message=message, notify_when_idle=True))
+        self.assertEqual(len(self._all_records()), 3)
+        self.assertFalse((self.tmp_root / "peer-steward").exists())
+
     def test_no_prefix_maps_to_steer(self):
         self._run("post-tool", self._sendmessage_payload(message="plain message"))
         recs = self._all_records()

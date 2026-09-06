@@ -788,10 +788,13 @@ exact session id, so a child row shows its steward on every harness; the pane pi
 (`herdr pane process-info`) is what places an OpenCode session in its herdr pane. The
 steward marker under `<dispatch-state-root>/peer-steward/` is a **role** flag, not a
 side effect of talking (revised 2026-09-06): it is raised only by `peer-steward.py
-steward on` (`source=explicit`), by a SENT `watch` record — `wait`/`watch` observed the
-target (`source=watch`) — or by a `peer-steward.py start` that launched a session
-(`source=start`). Sending a steer/handoff/gate-relay raises nothing (a worker's
-`[handoff]` to its steward used to flag the worker). Fleet renders an evidenced marker
+steward on` (`source=explicit`), by `peer-steward.py wait`/`watch` once herdr answered
+about a real target (`source=watch`; a mistyped target leaves no flag), or by a
+`peer-steward.py start` that launched a session (`source=start`). No `record` path and
+no send raises it — not a steer/handoff/gate-relay (a worker's `[handoff]` to its steward
+used to flag the worker) and not a `SendMessage` with `notify_when_idle`, which the
+Claude hook records as `kind=watch`. A session taking the role runs `peer-steward.py
+steward on` once. Fleet renders an evidenced marker
 as the bold-yellow tag badge and ignores one whose entries carry no such source, so
 old handoff-only markers are harmless; `peer-message prune-steward-markers [--apply]`
 lists/removes them, and `peer-steward.py steward off` (or `peer-message release`)

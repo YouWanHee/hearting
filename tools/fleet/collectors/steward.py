@@ -3,10 +3,11 @@
 The ledger tool (`utilities/peer-message.py`) keeps one marker per session under
 `<dispatch-state-root>/peer-steward/<harness>/<sid>.json`. Since 2026-09-06 the flag
 is a ROLE: a marker entry is evidence only when its `source` is `explicit`
-(`peer-steward.py steward on`), `watch` (a SENT `watch` record) or `start`
-(`peer-steward.py start` launched the target). Sending a steer/handoff/gate-relay
-raises nothing — under the old rule every worker that handed off to its steward
-wore the steward tag. This collector joins markers onto live sessions by exact
+(`peer-steward.py steward on`), `watch` (`peer-steward.py wait`/`watch` observed a
+real target) or `start` (`peer-steward.py start` launched the target). No `record`
+path raises it — not a steer/handoff/gate-relay send and not a SendMessage with
+`notify_when_idle` (recorded as `kind=watch`) — under the old rule every worker that
+handed off to its steward wore the steward tag. This collector joins markers onto live sessions by exact
 (harness, session_id) and asks the ledger tool's `steward_evidence_targets` — the
 one definition of the rule — which entries count; a marker with none (an old
 handoff-only leftover) is treated as absent, so `steward_targets` holds evidence

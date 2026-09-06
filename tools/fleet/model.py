@@ -315,8 +315,9 @@ class Session:
     herdr_attached: Optional[bool] = None
     # F-100c — steward flag (depth −1 role): True when this session's marker (under the
     # dispatch state root's `peer-steward/`) holds role evidence — `steward on`
-    # (source=explicit), a SENT `watch` record (source=watch) or a `start` that launched
-    # the target (source=start). Sending steer/handoff/gate-relay is not evidence.
+    # (source=explicit), a `wait`/`watch` that observed a real target (source=watch) or a
+    # `start` that launched the target (source=start). No send is evidence, not even a
+    # SendMessage with `notify_when_idle` (which the ledger records as `kind=watch`).
     # `steward_targets` = the evidence entries only, [{harness, session_id, name, kind,
     # ts, source}].
     steward: bool = False

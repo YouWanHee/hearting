@@ -182,7 +182,11 @@ class StewardCollectorTest(unittest.TestCase):
                 self.assertEqual(pm.cmd_record(ns), 0)
                 self.assertNotIn(("claude", "sid-a"), steward.read_markers())   # a handoff is not the role
                 ns.kind = "watch"
-                self.assertEqual(pm.cmd_record(ns), 0)
+                self.assertEqual(pm.cmd_record(ns), 0)                          # neither is a watch ROW
+                self.assertNotIn(("claude", "sid-a"), steward.read_markers())
+                self.assertTrue(pm.mark_steward("claude", "sid-a", {"harness": "codex", "session_id": "sid-c",
+                                                                    "name": "child"}, "watch",
+                                                "2026-09-06T00:00:00Z", source="watch"))
                 markers = steward.read_markers()
                 self.assertIn(("claude", "sid-a"), markers)
                 sessions = [Session(harness="claude", pid=1, session_id="sid-a")]
