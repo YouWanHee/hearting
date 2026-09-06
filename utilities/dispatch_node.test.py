@@ -963,6 +963,13 @@ class SubsessionChainSealTest(unittest.TestCase):
     def test_manifest_naming_a_different_index_is_refused(self):
         self._assert_refused(*self._start(seal=self._manifest(index=3)))
 
+    def test_manifest_with_a_null_index_is_refused_typed(self):
+        # The manifest is on-disk JSON. `"index": null` used to raise TypeError
+        # and print a traceback where every other refusal in main() prints a
+        # typed envelope (review round 1, item 8).
+        code, printed = self._start(seal=self._manifest(index=None))
+        self._assert_refused(code, printed)
+
     def test_sealed_slice_starts(self):
         # Control. Without this the gate could refuse everything and the three
         # refusal tests above would still pass.
@@ -1014,6 +1021,28 @@ class SubsessionChainSealTest(unittest.TestCase):
             printed,
         )
 
+    def test_parallel_admission_is_still_fail_closed(self):
+        # F3 requires a sealed manifest, and only `stage-session-chain.py`
+        # persists one. `subdivision_batch_admission.py` builds slice starts too
+        # and never persists -- so the day parallel admission is enabled, every
+        # parallel slice would be refused by the gate above for a reason that
+        # would look nothing like its cause.
+        #
+        # This test pins the assumption that makes F3 safe today. When parallel
+        # admission stops being fail-closed, this test fails, and the fix is to
+        # persist the chain manifest before starting a slice -- not to weaken the
+        # gate.
+        import subdivision_batch_admission as SBA
+        with self.assertRaises(SBA.SubdivisionAdmissionError):
+            SBA.raise_if_parallel_entry_fail_closed()
+        source = (Path(N.ROOT) / "utilities" / "subdivision_batch_admission.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn(
+            "persist_chain_manifest", source,
+            "parallel admission now persists a manifest: re-verify F3 against it "
+            "and delete this guard",
+        )
 
 if __name__ == "__main__":
     unittest.main()

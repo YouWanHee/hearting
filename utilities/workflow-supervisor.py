@@ -208,6 +208,10 @@ def registered_evidence(armed):
                 "identity": identity}
     note = meta.get("note") or ""
     failure_class = meta.get("failure_class") or ""
+    # SUCCESS_NOTES gained `completed-subsession` (SD-130), so a slice row can
+    # now satisfy an armed stage's terminal evidence. That is not an authority
+    # grant: arming names an exact attempt id, so a slice only counts where a
+    # supervisor was armed on that slice deliberately.
     succeeded = (
         note in (*SUCCESS_NOTES, "completed")
         and failure_class in ("", "pass")

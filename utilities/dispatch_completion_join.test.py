@@ -1732,6 +1732,12 @@ class FinishedChildClosure(unittest.TestCase):
         # invalid-envelope death by the pre-existing branch above -- it must never
         # be booked as a sub-session *success*, which is the only thing the new
         # branch is allowed to produce.
+        #
+        # This pins the guard, NOT the surrounding policy. A slice that declares
+        # `artifact: -` (which the worker kernel permits) takes the same branch
+        # and so cannot reach a terminal at all, identically to main. Whether a
+        # slice may legitimately be artifact-less is a spec question, not
+        # something this test settles -- see SD-OPEN-37's neighbourhood.
         noart = self.child(
             quiescent=True, subsession=True, artifact=None, attempt_id="att-noart"
         )

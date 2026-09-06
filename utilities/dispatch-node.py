@@ -480,12 +480,24 @@ def main():
   print("check=failed");print(f"reason={e.reason}");print(f"detail={e.detail}");print("child_spawned=0");raise SystemExit(65)
  if a.subsession_id and a.action=="start":
   # Defect F3. A slice may only start once the chain it belongs to has been
-  # sealed. `stage-session-chain.py` persists the manifest AFTER its register
-  # loop and BEFORE it starts index 1, so this is safe for the legitimate
-  # path and refuses exactly the orphan: a row carrying a chain identity that
+  # sealed. It refuses exactly the orphan: a row carrying a chain identity that
   # no manifest names, which no surface can ever aggregate
   # (`complete_subsession_stage` reads the manifest, finds nothing, and the
   # chain stalls with the slice's work already done). Observed in W7G.
+  #
+  # Safe for both live start surfaces: `stage-session-chain.py` persists the
+  # manifest AFTER its register loop and BEFORE it starts index 1, and the
+  # supervisor advance of indexes 2..N reads that same sealed pointer much
+  # later.
+  #
+  # PRECONDITION FOR PARALLEL SUBDIVISION. `subdivision_batch_admission.py`
+  # builds slice starts too and never calls `persist_chain_manifest` -- the only
+  # call in the repo is `stage-session-chain.py:293`. That path is unreachable
+  # today (`raise_if_parallel_entry_fail_closed` raises unconditionally, SD-119
+  # R4), so this gate refuses nothing live. Whoever lands parallel admission
+  # must persist the manifest before starting a slice, or every parallel slice
+  # will be refused here. `SubsessionChainSealTest.test_parallel_admission_is_
+  # still_fail_closed` fails the moment that assumption stops holding.
   manifest=SUBSESSION.load_chain_manifest(registry.path,a.session_chain_id)
   pointer=SUBSESSION.chain_manifest_pointer_path(registry.path,a.session_chain_id)
   sealed=None
@@ -495,7 +507,14 @@ def main():
     if str(session.get("subsession_id"))==a.subsession_id:
      sealed=session
      break
-  if sealed is None or str(sealed.get("attempt_id"))!=str(a.attempt_id) or int(sealed.get("index",-1))!=int(a.subsession_index):
+  # The manifest is on-disk JSON: coerce, never trust. `"index": null` used to
+  # raise TypeError and print a traceback instead of the typed refusal envelope
+  # every other refusal here emits (review round 1, item 8).
+  try:
+   sealed_index=int(sealed.get("index")) if sealed is not None else None
+  except (TypeError,ValueError):
+   sealed_index=None
+  if sealed is None or str(sealed.get("attempt_id"))!=str(a.attempt_id) or sealed_index!=int(a.subsession_index):
    print("check=failed")
    print("reason=subsession-chain-manifest-unsealed")
    print(f"session_chain_id={a.session_chain_id}")

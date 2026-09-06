@@ -75,6 +75,75 @@ class DispatchAttemptReadyTest(unittest.TestCase):
         self.assertEqual(receipt["state"], "ready")
         self.assertEqual(receipt["children"][0]["readiness"], "ready")
 
+    def _slice_metadata(self, note, **overrides):
+        metadata = {
+            "attempt_schema_version": "2",
+            "dispatch_depth": "2",
+            "transport": "headless",
+            "execution_surface": "registered-headless",
+            "registered_worker": "1",
+            "fallback_hop": "same-harness-headless",
+            "attempt_id": "att-ready-slice",
+            "subsession_id": "ss-fixture",
+            "stage_authority": "0",
+            "session_chain_id": "ssc-fixture",
+            "subsession_index": "1",
+            "subsession_count": "3",
+            "subsession_mode": "serial",
+            "subsession_purpose": "planned",
+            "completion_delivery": "one-shot",
+            "note": note,
+            "failure_class": "pass",
+            "pid": "999998",
+            "pid_start": "1",
+            "pgid": "999998",
+            "pid_observer_ns": "pid:[test]",
+            "pid_ns": "pid:[test]",
+            "launch_lifecycle": "detached",
+            "launch_outcome": "governed-process-group-drained",
+            "group_reap_proof": "pgid-empty-v1",
+            "group_reap_pgid": "999998",
+            "attempt_descendant_proof": "attempt-tagged-empty-v1",
+            "attempt_descendant_observer_ns": "pid:[test]",
+        }
+        metadata.update(overrides)
+        return ["2026-09-06T00:00:00Z", "done", "/r", "/w", "slice", ""], metadata
+
+    def test_subsession_terminal_is_ready(self):
+        # SD-130. This readiness arm existed before the note did -- it required
+        # `completed-supervisor`, which a slice can never carry (one-shot
+        # delivery, so no supervisor). It was a reader waiting for a writer that
+        # did not exist, and this is the first test that reaches it.
+        fields, metadata = self._slice_metadata("completed-subsession")
+        receipt = READY.classify([(fields, metadata)])
+        self.assertEqual(receipt["state"], "ready")
+        self.assertEqual(receipt["children"][0]["readiness"], "ready")
+
+    def test_subsession_terminal_without_a_pass_verdict_is_not_ready(self):
+        fields, metadata = self._slice_metadata(
+            "completed-subsession", failure_class="contract"
+        )
+        receipt = READY.classify([(fields, metadata)])
+        self.assertNotEqual(receipt["children"][0]["readiness"], "ready")
+
+    def test_subsession_note_on_a_stage_owner_row_is_not_ready(self):
+        # The note only means "ready" for a row that actually is a slice; a
+        # forged note on a stage-authoritative row must not buy readiness.
+        fields, metadata = self._slice_metadata("completed-subsession")
+        for key in ("subsession_id", "stage_authority", "session_chain_id",
+                    "subsession_index", "subsession_count", "subsession_mode",
+                    "subsession_purpose"):
+            metadata.pop(key, None)
+        receipt = READY.classify([(fields, metadata)])
+        self.assertNotEqual(receipt["children"][0]["readiness"], "ready")
+
+    def test_slice_carrying_the_supervisor_note_is_not_ready(self):
+        # The arm this replaced. A slice cannot be closed by a supervisor, so a
+        # row claiming both is malformed and buys nothing.
+        fields, metadata = self._slice_metadata("completed-supervisor")
+        receipt = READY.classify([(fields, metadata)])
+        self.assertNotEqual(receipt["children"][0]["readiness"], "ready")
+
     def test_supervised_stage_pass_still_requires_a_completion_marker(self):
         fields = [
             "2026-08-11T00:00:00Z", "done", "/r", "/w", "stage", "",

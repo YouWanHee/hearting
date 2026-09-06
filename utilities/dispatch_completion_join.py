@@ -3234,6 +3234,16 @@ def close_finished_child(row: ChildRow, *, jobs: str | Path) -> str:
         # Fixed here rather than at the reap-watch caller so that every caller
         # is fixed at once: both supervisors' `reconcile_finished_children` and
         # the Codex headless path reach this same function.
+        # Say which of the two things went wrong. A draining slice is ordinary
+        # and must NOT escalate -- `dispatch-reap-watch.py` escalates only on a
+        # `completion-` prefix -- but a refused close is a contract problem that
+        # main used to surface as `completion-rejected`, and collapsing both into
+        # one string would hide it (review round 1, item 2).
+        observed = observed_attempt_liveness(
+            row.status, metadata, terminal_envelope=True
+        )
+        if observed.state != "reconcile-needed" or observed.process_state != "quiescent":
+            return "subsession-not-quiescent"
         if _close_invalid_envelope_child(
             row,
             jobs=jobs,
@@ -3243,7 +3253,7 @@ def close_finished_child(row: ChildRow, *, jobs: str | Path) -> str:
             extra_evidence={"failure_class": "pass"},
         ):
             return ""
-        return "subsession-not-quiescent"
+        return "completion-subsession-close-refused"
     command = [
         sys.executable,
         str(ROOT / "utilities" / "capability-route.py"),
