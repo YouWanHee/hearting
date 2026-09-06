@@ -2379,7 +2379,77 @@ def _open_route_artifact_roots(
     return roots, route_files, ""
 
 
-def _route_record_launch_home(path: Path):
+# A registry row holds a release only while it is `open` (`_release_in_use`).
+# The mirror of that for a route record needs the complement: the states in
+# which the route's work is NOT over. `running` is included even though
+# `_release_in_use` does not treat it as holding -- the two answer different
+# questions ("does an open row name this release" vs "is this route's work
+# over"), and for a question whose wrong answer deletes a release, "not yet
+# over" is the safe reading. Measured 2026-09-06: the live registry carries
+# only `done` and `open`, so this costs nothing today.
+_ROUTE_LIVE_ROW_STATES = frozenset({"open", "running"})
+
+
+def _route_attempts_finished(raw: dict, cache: dict):
+    """Is every registry attempt of this route terminal? `None` = cannot tell.
+
+    P2, mirroring the registry reference source. A release is pinned by a route
+    record until that route is closed -- and a route whose only attempt *died*
+    is never closed, because nobody runs `close` on a route that failed to
+    launch. Measured 2026-09-06: `rt-0319e7bd` (v2.107.0,
+    `dead-launch-runtime-root-mismatch`) and `rt-1ccafd47` (v2.109.1,
+    `dead-invalid-envelope`) each held a release with a single `done` row, no
+    completion marker, no live process, and no other reference source. The
+    registry source had already released them; only this one had not.
+
+    Read from the route's OWN sealed `jobs_path`, not the ambient registry: a
+    registry this route never wrote to cannot answer for it (defect C, B2).
+
+    `None` -- no sealed jobs path, unreadable, a malformed row, or **no rows at
+    all** -- keeps the release pinned. Absence of evidence is the one direction
+    that deletes data: a route compiled but not yet launched has no rows, and so
+    does a route whose rows were pruned out from under it.
+    """
+
+    route_id = raw.get("route_id")
+    if not isinstance(route_id, str) or not route_id:
+        return None
+    tuple_ = raw.get("launch_compatibility_tuple")
+    jobs = (tuple_ or {}).get("jobs_path") if isinstance(tuple_, dict) else None
+    jobs_path = jobs.get("path") if isinstance(jobs, dict) else None
+    if not isinstance(jobs_path, str) or not jobs_path:
+        return None
+    if jobs_path not in cache:
+        try:
+            cache[jobs_path] = Path(jobs_path).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            cache[jobs_path] = None
+    text = cache[jobs_path]
+    if text is None:
+        return None
+    seen = False
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        fields = line.split("\t")
+        if len(fields) < 6:
+            return None
+        if f"route_id={route_id}" not in fields[5]:
+            continue
+        # Substring containment above is a cheap prefilter; confirm the field
+        # really is `route_id`, so `source_route_id=rt-x` cannot answer for
+        # `rt-x` and a longer id cannot be matched by its own prefix.
+        if not any(
+            item == f"route_id={route_id}" for item in fields[5].split(",")
+        ):
+            continue
+        seen = True
+        if fields[1] in _ROUTE_LIVE_ROW_STATES:
+            return False
+    return True if seen else None
+
+
+def _route_record_launch_home(path: Path, registry_cache: dict | None = None):
     """`launch_compatibility_tuple.launch_home.path` from one route record.
 
     Returns `None` if the route is **closed** -- an `.outcome.json` sibling
@@ -2389,6 +2459,11 @@ def _route_record_launch_home(path: Path):
     corrupt *closed* route record is likewise ignored: one rotten record
     among hundreds of closed ones must not block prune forever (over-eager
     fail-closed is its own bug).
+
+    Also `None` when the route is unclosed but every one of its registry
+    attempts is terminal (`_route_attempts_finished`) -- the P2 mirror of the
+    registry source's `open`-only rule. "Unclosed" and "still working" are not
+    the same thing, and a route that died at launch is never closed by anyone.
 
     Returns `_UNDECIDABLE` if the record looks open (no outcome sibling) but
     cannot be trusted: oversized, unreadable, unparsable, or missing the
@@ -2414,6 +2489,11 @@ def _route_record_launch_home(path: Path):
     value = launch_home.get("path") if isinstance(launch_home, dict) else None
     if not isinstance(value, str) or not value:
         return _UNDECIDABLE
+    # Checked only after the record parses and names a launch_home: an
+    # undecidable record must stay undecidable, never be released by a
+    # terminality answer derived from a body we could not trust.
+    if _route_attempts_finished(raw, registry_cache if registry_cache is not None else {}) is True:
+        return None
     return value
 
 
@@ -2530,10 +2610,11 @@ def _open_route_launch_homes(environ: dict[str, str]) -> tuple[list[tuple[str, s
         candidates[str(path.resolve(strict=False))] = path
 
     results: list[tuple[str, str]] = []
+    registry_cache: dict = {}
     for path in candidates.values():
         if not path.is_file():
             continue
-        launch_home = _route_record_launch_home(path)
+        launch_home = _route_record_launch_home(path, registry_cache)
         if launch_home is None:
             continue
         if launch_home is _UNDECIDABLE:

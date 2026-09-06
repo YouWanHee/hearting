@@ -474,5 +474,178 @@ class ReleaseHeldByLiveProcessTest(unittest.TestCase):
         self.assertFalse(held, why)
 
 
+
+class RouteStaleOpenMirrorTest(unittest.TestCase):
+    """P2: an unclosed route whose attempts all finished must stop pinning.
+
+    A release is retained by four reference sources. The registry source holds
+    one only while a row is `open`. The route source held one until the route
+    was **closed** -- and a route whose only attempt died is never closed,
+    because nobody runs `close` on a route that failed to launch.
+
+    Measured 2026-09-06 on this machine, before the fix: `rt-0319e7bd` pinned
+    `v2.107.0` and `rt-1ccafd47` pinned `v2.109.1`, each with a single `done`
+    row carrying a `dead-*` note, no completion marker, no live process, and no
+    other reference source naming them. `open-route:` was the sole reason, and
+    it would never have expired.
+
+    The direction that deletes data is releasing a release that is still needed,
+    so every unknown keeps the pin: no sealed registry, an unreadable one, a
+    malformed row, or **no rows at all**.
+    """
+
+    ROUTE_ID = "rt-0319e7bdb6bede69"
+
+    def _routes_dir(self, base: Path) -> Path:
+        routes = base / ".agent_reports" / ".runtime" / "routes"
+        routes.mkdir(parents=True)
+        return routes
+
+    def _record(self, path: Path, launch_home: str, jobs: str | None) -> None:
+        tuple_: dict = {"launch_home": {"kind": "launch_home", "path": launch_home}}
+        if jobs is not None:
+            tuple_["jobs_path"] = {"kind": "jobs_path", "path": jobs}
+        path.write_text(json.dumps({
+            "route_id": path.stem, "schema_version": 2,
+            "launch_compatibility_tuple": tuple_,
+        }), encoding="utf-8")
+
+    def _registry(self, path: Path, rows) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lines = []
+        for status, meta in rows:
+            lines.append("\t".join(
+                ["2026-09-06T00:00:00Z", status, "repo", "worktree", "slug", meta]))
+        path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+
+    def _scan(self, base: Path):
+        with mock.patch.object(
+            distribution, "_open_route_artifact_roots",
+            return_value=([str(base / ".agent_reports")], [], ""),
+        ):
+            return distribution._open_route_launch_homes({})
+
+    def _pins(self, rows, *, jobs="present", write_registry=True):
+        """Return whether the route still pins its launch_home."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        routes = self._routes_dir(base)
+        jobs_path = base / "state" / "jobs.log"
+        self._record(
+            routes / f"{self.ROUTE_ID}.json", str(base / "release"),
+            str(jobs_path) if jobs == "present" else jobs,
+        )
+        if write_registry:
+            self._registry(jobs_path, rows)
+        results, reason = self._scan(base)
+        self.assertEqual(reason, "", "the scan itself must stay reliable")
+        return [route_id for route_id, _ in results] == [self.ROUTE_ID]
+
+    # -- the measured case ---------------------------------------------------
+
+    def test_a_route_whose_only_attempt_died_stops_pinning(self):
+        self.assertFalse(self._pins([
+            ("done", f"route_id={self.ROUTE_ID},route_node=one-shot,"
+                     "attempt_id=att-75b90f34764c4d62,"
+                     "note=dead-launch-runtime-root-mismatch"),
+        ]))
+
+    def test_a_route_whose_attempt_completed_normally_also_stops_pinning(self):
+        self.assertFalse(self._pins([
+            ("done", f"route_id={self.ROUTE_ID},attempt_id=att-1,note=completed-marker"),
+        ]))
+
+    # -- everything that must keep the pin -----------------------------------
+
+    def test_a_live_attempt_keeps_the_pin(self):
+        for status in ("open", "running"):
+            with self.subTest(status):
+                self.assertTrue(self._pins([
+                    ("done", f"route_id={self.ROUTE_ID},attempt_id=att-1"),
+                    (status, f"route_id={self.ROUTE_ID},attempt_id=att-2"),
+                ]), f"a {status} attempt is not finished work")
+
+    def test_no_rows_at_all_keeps_the_pin(self):
+        # Absence of evidence is not evidence of completion. A route compiled
+        # but not yet launched has no rows -- and so does one whose rows were
+        # pruned out from under it.
+        self.assertTrue(self._pins([]))
+        self.assertTrue(self._pins([
+            ("done", "route_id=rt-someotherroute,attempt_id=att-x"),
+        ]))
+
+    def test_a_missing_or_unreadable_registry_keeps_the_pin(self):
+        self.assertTrue(self._pins([], write_registry=False))
+        self.assertTrue(self._pins([], jobs=None))
+        self.assertTrue(self._pins([], jobs=""))
+
+    def test_a_malformed_registry_row_keeps_the_pin(self):
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        routes = self._routes_dir(base)
+        jobs_path = base / "state" / "jobs.log"
+        self._record(routes / f"{self.ROUTE_ID}.json", str(base / "release"), str(jobs_path))
+        jobs_path.parent.mkdir(parents=True)
+        jobs_path.write_text(
+            f"2026-09-06T00:00:00Z\tdone\trepo\tworktree\tslug\troute_id={self.ROUTE_ID}\n"
+            "this row has too few fields\n", encoding="utf-8")
+        results, reason = self._scan(base)
+        self.assertEqual(reason, "")
+        self.assertEqual([r for r, _ in results], [self.ROUTE_ID],
+                         "a registry we cannot fully parse cannot certify completion")
+
+    def test_a_closed_route_is_still_released_the_old_way(self):
+        # The pre-existing rule must be untouched: an outcome sibling releases
+        # the route even with a live row.
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        routes = self._routes_dir(base)
+        jobs_path = base / "state" / "jobs.log"
+        self._record(routes / f"{self.ROUTE_ID}.json", str(base / "release"), str(jobs_path))
+        self._registry(jobs_path, [("open", f"route_id={self.ROUTE_ID},attempt_id=att-1")])
+        (routes / f"{self.ROUTE_ID}.outcome.json").write_text("{}", encoding="utf-8")
+        results, reason = self._scan(base)
+        self.assertEqual(reason, "")
+        self.assertEqual(results, [])
+
+    # -- the two ways this could answer for the wrong route ------------------
+
+    def test_only_the_routes_own_sealed_registry_can_answer_for_it(self):
+        # Defect C, B2: a registry this route never wrote to is not evidence
+        # about it. Its sealed jobs_path says `open`; an ambient registry that
+        # happens to carry a `done` row for the same id must not release it.
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        routes = self._routes_dir(base)
+        sealed = base / "sealed" / "jobs.log"
+        ambient = base / "ambient" / "jobs.log"
+        self._record(routes / f"{self.ROUTE_ID}.json", str(base / "release"), str(sealed))
+        self._registry(sealed, [("open", f"route_id={self.ROUTE_ID},attempt_id=att-1")])
+        self._registry(ambient, [("done", f"route_id={self.ROUTE_ID},attempt_id=att-1")])
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(ambient)}):
+            results, reason = self._scan(base)
+        self.assertEqual(reason, "")
+        self.assertEqual([r for r, _ in results], [self.ROUTE_ID])
+
+    def test_a_lineage_field_is_not_this_routes_row(self):
+        # `source_route_id=rt-x` contains `route_id=rt-x` as a substring. The
+        # prefilter is allowed to match it; the confirmation must not.
+        self.assertTrue(self._pins([
+            ("done", f"source_route_id={self.ROUTE_ID},route_id=rt-1111111111111111,"
+                     "attempt_id=att-1"),
+        ]), "a continuation descendant's row says nothing about the ancestor")
+
+    def test_an_undecidable_record_stays_undecidable(self):
+        # Terminality is read from the record body, so it must never be able to
+        # release a record we could not trust in the first place.
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        routes = self._routes_dir(base)
+        (routes / f"{self.ROUTE_ID}.json").write_text("{ truncated", encoding="utf-8")
+        results, reason = self._scan(base)
+        self.assertTrue(reason.startswith("route-record-unparsable:"), reason)
+        self.assertEqual(results, [])
+
 if __name__ == "__main__":
     unittest.main()
