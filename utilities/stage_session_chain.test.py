@@ -158,6 +158,88 @@ class StageSessionChainStartTest(unittest.TestCase):
             self.assertNotEqual(ctx.exception.code, 0)
 
 
+class PlanSlicesTest(unittest.TestCase):
+    """SD-103 cheap path: one command turns the plan's slice list into a proven
+    parallel manifest, or a typed refusal."""
+
+    def _fixture(self, td, *, overlap=False, min_intensity="standard"):
+        import subprocess
+        root = Path(td)
+        worktree = root / "wt"
+        worktree.mkdir()
+        subprocess.run(["git", "init", "-q", str(worktree)], check=True)
+        (worktree / "source").mkdir()
+        route = {
+            "route_id": "rt-plan", "route_hash": "sha256:" + "3" * 64, "cwd": str(worktree),
+            "effective_intensity": "standard",
+            "nodes": [{
+                "id": "execute", "dispatch_depth": 2, "completion_gate": "code-execute",
+                "kind": "pipeline-stage", "write_scope": ["source/**", "dev_logs/**"],
+                "subdivision": {"min_intensity": min_intensity, "max_slices": 4, "disjointness": "exact-fixed-files"},
+            }],
+        }
+        route_path = root / "route.json"
+        route_path.write_text(json.dumps(route), encoding="utf-8")
+        second = "source/a.py" if overlap else "source/b.py"
+        slices = [
+            {"id": "model", "fixed_files": ["source/a.py"], "brief": "change the model", "narrow_verify": "python -m unittest a"},
+            {"id": "engine", "fixed_files": [second, "source/c.py"], "brief": "change the engine", "narrow_verify": "python -m unittest b", "expected_round_trips": 3, "adapter": "codex"},
+        ]
+        slices_path = root / "slices.json"
+        slices_path.write_text(json.dumps(slices), encoding="utf-8")
+        return route_path, worktree, slices_path, root / "out" / "chain.json"
+
+    def test_plan_slices_writes_a_proven_manifest_and_briefs(self):
+        with tempfile.TemporaryDirectory() as td:
+            route_path, worktree, slices_path, output = self._fixture(td)
+            receipt = CHAIN.plan_slices(route_path=route_path, node_id="execute", worktree=worktree,
+                                        slices_path=slices_path, output_path=output)
+            self.assertEqual(receipt["planned"], "ok"); self.assertEqual(receipt["sessions"], 2)
+            self.assertEqual(receipt["fixed_files"], 3)
+            manifest = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["mode"], "parallel"); self.assertEqual(manifest["route_node"], "execute")
+            self.assertTrue(manifest["chain_id"].startswith("ssc-execute-"))
+            ids = [s["subsession_id"] for s in manifest["sessions"]]
+            self.assertEqual(ids, [f"ss-{manifest['chain_id'][4:]}-model", f"ss-{manifest['chain_id'][4:]}-engine"])
+            self.assertEqual([s["adapter"] for s in manifest["sessions"]], ["claude", "codex"])
+            self.assertEqual([s["expected_round_trips"] for s in manifest["sessions"]], [2, 3])
+            self.assertEqual([s["node"] for s in manifest["sessions"]], ["execute-slice-1", "execute-slice-2"])
+            for session in manifest["sessions"]:
+                self.assertTrue(Path(session["phase_brief"]).is_file())
+                self.assertIn("commit nothing", Path(session["phase_brief"]).read_text(encoding="utf-8"))
+            # deterministic ids: same inputs, same chain id
+            again = CHAIN.plan_slices(route_path=route_path, node_id="execute", worktree=worktree,
+                                      slices_path=slices_path, output_path=output)
+            self.assertEqual(again["chain_id"], receipt["chain_id"])
+            # the proven manifest is exactly what admission re-proves
+            proven = CHAIN.load_manifest(output, route=json.loads(route_path.read_text()) | {"_route_file": str(route_path)},
+                                         node=json.loads(route_path.read_text())["nodes"][0])
+            self.assertEqual(len(proven["sessions"]), 2)
+
+    def test_plan_slices_refuses_overlap_and_leaves_no_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            route_path, worktree, slices_path, output = self._fixture(td, overlap=True)
+            with self.assertRaisesRegex(CHAIN.StageSessionError, "parallel-fixed-file-overlap"):
+                CHAIN.plan_slices(route_path=route_path, node_id="execute", worktree=worktree,
+                                  slices_path=slices_path, output_path=output)
+            self.assertFalse(output.exists())
+            self.assertEqual([p.name for p in output.parent.iterdir()] if output.parent.exists() else [], [])
+
+    def test_plan_slices_cli_refusal_is_typed(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as td:
+            route_path, worktree, slices_path, output = self._fixture(td, overlap=True)
+            result = subprocess.run(
+                [sys.executable, str(PATH), "plan-slices", "--route", str(route_path), "--worktree", str(worktree),
+                 "--slices", str(slices_path), "--output", str(output)],
+                text=True, capture_output=True,
+            )
+            self.assertEqual(result.returncode, 65, result.stderr)
+            receipt = json.loads(result.stdout)
+            self.assertEqual(receipt["planned"], "refused"); self.assertEqual(receipt["fallback"], "single-session-required")
+            self.assertIn("parallel-fixed-file-overlap", receipt["reason"])
+
+
 class RuntimeJoinsCensusTest(unittest.TestCase):
     """F-2 (impl-review round 2): `runtime_joins` is derived from the unique
     owner-resume delivery census and from nothing else -- not from the

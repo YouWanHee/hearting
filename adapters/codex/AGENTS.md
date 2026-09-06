@@ -108,23 +108,16 @@ tool to claim Codex parity.
 
 ## Dispatch
 
-Route by `core/WORKFLOW.md §0.2`: the semantic precedence names the
-capability that owns the artifacts; §0.2.1 then picks the **shape** of the
-work before any preset. `direct`, `solo`, and `staged` go through
-`preflight.sh compose` (the portable `capability-route.py compose`: cwd, artifact
-root, tracking, drift verdict, spec-read gate, and both eligibility probes
-default from the checkout; a staged `--graph execute,test,report` is your own
-stage subgraph of the owning capability). Use the preset recipe
-(`preflight.sh route --capability …`) only when the request names the entry's
-full loop or a promotion signal or spec-backed flow requires it; never bend a
-loosely matching request into the nearest preset graph. Apply §0.3. For
-`direct`/`solo` routes the sealed `small_work_confirmation` (`notice`, the
-default) replaces the blocking card with the one `[경로]` line `compose`
-prints plus one clause of scope, unless the work is destructive or
-external-facing; otherwise present the five-field card in §0.4 before
-material work unless scope and route are already approved, and close material
-work with the five-field completion card in §0.5. Load full capability detail
-only in the acting owner or worker.
+Route by `core/WORKFLOW.md §0.2`, then pick the work **shape** before any
+preset (§0.2.1): `direct`/`solo`/`staged` go through `preflight.sh compose`
+(flags, spec-read gate and probes default; `--graph execute,test,report` is
+your own stage subgraph); the preset recipe (`preflight.sh route
+--capability …`) only when the request names the entry's full loop or a
+promotion signal requires it. Apply §0.3. `direct`/`solo` routes get one
+`[경로]` line instead of the blocking card unless destructive or
+external-facing (§0.4 SD-136); otherwise present the §0.4 card before
+material work unless already approved, and close with the §0.5 card. Load
+full capability detail only in the acting owner or worker.
 
 An ordinary dispatch-depth-1 owner launches through `preflight.sh dispatch-owner
 --dry-run|--register|--start`, a separate low-level surface from `preflight.sh

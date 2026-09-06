@@ -246,7 +246,7 @@ If a stage dies immediately from usage, session, or authentication limits, the w
 
 ### Optional Material Delegation
 
-When implementation or reporting requires result plots, experiment-log visualization, or result tables, the code-execute or code-report worker records the need in its artifact. The enumerated autopilot-code recipe compiles no `material/*` node, so the owner satisfies the need per the WORKFLOW compose-on-demand doctrine: a composed route extension node bound to the matching `material/*` unit (e.g. `material/figure-gen`, `material/data-script`) that passes the same validator and hash-seal as a recipe route — or, for narrow throwaway scaffolding only, an ephemeral native helper with no unit semantics. Training and experiment execution remain in autopilot-code; the material units own postprocessing. Record generated asset paths in the relevant dev log.
+When implementation or reporting requires result plots, experiment-log visualization, or result tables, the code-execute or code-report worker records the need in its artifact. The enumerated autopilot-code recipe compiles no `material/*` node, so the owner satisfies the need per the WORKFLOW compose-on-demand doctrine (§0.2.1, `capability-route.py compose`; an autopilot-code graph carries no `material/*` stage id, so a material node is composed through `utilities/compose-route.py` with an explicit unit): a composed route extension node bound to the matching `material/*` unit (e.g. `material/figure-gen`, `material/data-script`) that passes the same validator and hash-seal as a recipe route — or, for narrow throwaway scaffolding only, an ephemeral native helper with no unit semantics. Training and experiment execution remain in autopilot-code; the material units own postprocessing. Record generated asset paths in the relevant dev log.
 
 ### Higher-Intensity Perspective Extensions
 
@@ -367,20 +367,29 @@ to in-session only under the closed rules above.
 
 **Subdivision check (SD-103) — perform it explicitly before the single-session dispatch.**
 `execute` is the one node that carries a sealed `subdivision` permission
-(`min_intensity: strong`, `max_slices: 4`, `disjointness: exact-fixed-files`). When the
-route's effective intensity is `strong+` AND `plan.md` partitions the work into 2–4
-packages whose file ownership is exactly disjoint, do not default to one long serial
-session: build the slice manifest from the plan's declared `fixed_files` per package and
-admit the parallel slices with one `dispatch-batch.py --parallel-group execute --route
-<route-file> --parent <owner slug> --slug-prefix <prefix> --subdivision-manifest
-<chain.json> --start` call, then close the single stage gate with `capability-route.py
-complete --route <route-file> --node execute --evidence <stage evidence> --jobs <registry>
---subsession-manifest <chain.json>`. Slices are
-no-commit workers; close the gate first, commit after. A typed `single-session-required`
-receipt means "run this stage as one ordinary session" — proceed single-session and record
-the reason; it is not a failure. At `standard` intensity, or when the plan's packages share
-files, subdivision is unavailable by contract — a declared serial sub-session split under
-the same route node is then the sanctioned way to bound session length. Record which of the
+(`min_intensity: standard`, `max_slices: 4`, `disjointness: exact-fixed-files` — `standard`
+since SD-103's routing-flex correction: the permission sat at `strong` while 100/100 execute
+rows ran at `standard`, so it never fired). The firing condition is the owner's judgment,
+not a rule: when `plan.md` partitions the work into 2–4 packages whose file ownership is
+exactly disjoint and that can finish independently, do not default to one long serial
+session. Transcribe the plan's `slice` blocks into one JSON list
+(`[{"id","fixed_files":[…],"brief","narrow_verify","expected_round_trips"}]`) and run
+`python3 utilities/stage-session-chain.py plan-slices --route <route-file> --node execute
+--worktree <cwd> --slices <slices.json> --output <chain.json>`: it mints the chain and slice
+ids, writes one phase brief per slice beside the manifest, and proves exact files, worktree
+and write-scope containment and pairwise disjointness with the same `load_manifest` the
+admission re-proves. Then admit the slices with one `dispatch-batch.py --parallel-group
+execute --route <route-file> --parent <owner slug> --slug-prefix <prefix>
+--subdivision-manifest <chain.json> --action start` call, and close the single stage gate
+with `capability-route.py complete --route <route-file> --node execute --evidence <stage
+evidence> --jobs <registry> --subsession-manifest <chain.json>`. Slices are no-commit
+workers; close the gate first, commit after. A typed refusal from `plan-slices`
+(`planned: refused`, exit 65) or a `single-session-required` receipt means "run this stage
+as one ordinary session" — proceed single-session and record the reason; it is not a
+failure. A slice that declares a non-worktree `base` is still refused (`scope-unproven`,
+SD-119 R5 unlanded). When the plan's packages share files, subdivision is unavailable by
+contract — a declared serial sub-session split under the same route node is then the
+sanctioned way to bound session length. Record which of the
 three shapes (parallel slices / serial split / single session) was chosen and why in the
 dev log. `core/OPERATIONS.md §5.10` owns the manifest, baseline, and refusal vocabulary.
 

@@ -307,7 +307,7 @@ A legacy hash collision is diagnostic
 
      ```
      python3 utilities/dispatch-batch.py --parallel-group <node> --route <route-file> \
-       --parent <owner slug> --slug-prefix <prefix> --subdivision-manifest <chain.json> --start
+       --parent <owner slug> --slug-prefix <prefix> --subdivision-manifest <chain.json> --action start
      python3 utilities/capability-route.py complete --route <route-file> --node <node> \
        --evidence <stage evidence> --jobs <registry> --subsession-manifest <chain.json>
      ```

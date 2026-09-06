@@ -23,7 +23,7 @@ PRESERVED_FULL_FIELD_DIGESTS = {
         "926c9eff35134529d23574f9052da464493b09fd52cb98da03785ff7798669d7",
     ),
     ("autopilot-code", ('audit', 'debug', 'dev')): (
-        "323b9d5b0c83a22c1321b5ef4c7cbc21e824b1d8c09975a54d1f7cf2b96b6a15",
+        "5e4adf36d808f9ed0b420e70c69b1893b42c57799f4bfe467a0eb2e3fd65cda7",
         "6999e2b826a3f458169cf5d54906f4da79e33090815b7439504a39aa6d4cf341",
     ),
     ("autopilot-design", ('default',)): (
