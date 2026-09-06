@@ -255,6 +255,11 @@ def cmd_record(args):
             to["session_id"] = usable_session_id(args.to_session_id)
         if args.to_name:
             to["name"] = args.to_name
+        to_pane = getattr(args, "to_pane", None)
+        if to_pane:
+            # SD-122 (11): the exact herdr pane the text was typed into -- the
+            # one field the herdr server log itself does not keep.
+            to["pane"] = str(to_pane)
         from_block = {
             "harness": args.from_harness,
             "session_id": args.from_session_id,
@@ -381,6 +386,7 @@ def main(argv=None):
     p_record.add_argument("--to-harness", required=True)
     p_record.add_argument("--to-session-id", default=None)
     p_record.add_argument("--to-name", default=None)
+    p_record.add_argument("--to-pane", default=None)
     p_record.add_argument("--kind", default="steer")
     p_record.add_argument("--surface", required=True)
     p_record.add_argument("--status", default="sent")

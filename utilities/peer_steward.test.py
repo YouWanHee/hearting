@@ -903,7 +903,7 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
         self.assertTrue(prompt_call[4].startswith("[handoff] do the thing\nline two"))
         rec = self._all_records()[-1]
         self.assertEqual(rec["kind"], "handoff")
-        self.assertEqual(rec["to"], {"harness": "codex", "session_id": "thread-9", "name": "child"})
+        self.assertEqual(rec["to"], {"harness": "codex", "session_id": "thread-9", "name": "child", "pane": "w1:pX"})
         self.assertEqual(rec["from"]["name"], "hearting-46")
         self.assertEqual(rec["summary"], "[handoff] do the thing")
         line = print_mock.call_args[0][0]
@@ -960,7 +960,13 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
         line = print_mock.call_args[0][0]
         self.assertIn("prompted=true", line)
         self.assertIn("state_before=idle verify=state-flip", line)
-        self.assertEqual(self._all_records()[-1]["delivery"]["status"], "sent")
+        rec = self._all_records()[-1]
+        self.assertEqual(rec["delivery"]["status"], "sent")
+        # SD-122 (11): the ledger row is the caller attribution herdr's own log lacks
+        self.assertEqual(rec["to"]["pane"], "w1:pX")
+        self.assertIn("prompted=true state_before=idle verify=state-flip herdr_rc=0", rec["delivery"]["receipt"])
+        self.assertEqual(rec["from"]["session_id"], "sid-steward")
+        self.assertTrue(rec["body_sha256"])
 
     def test_prompt_stalled_is_a_typed_failure_not_a_success(self):
         os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
@@ -1024,7 +1030,37 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
                                  "nothing may be typed into an open form")
                 self.assertIn("prompted=failed", print_mock.call_args[0][0])
                 self.assertIn("reason=target-form-open", print_mock.call_args[0][0])
-                self.assertEqual(self._all_records()[-1]["delivery"]["status"], "failed")
+                rec = self._all_records()[-1]
+                self.assertEqual(rec["delivery"]["status"], "failed")
+                self.assertIn("reason=target-form-open", rec["delivery"]["receipt"])
+                self.assertEqual(rec["to"]["pane"], "w1:pX")
+
+    def test_only_peer_steward_types_into_panes(self):
+        """SD-122 (11): every pane prompt goes through `peer-steward.py prompt` so
+        the ledger row exists -- herdr's server log keeps no target and no
+        caller. Asserted over the repo's code (not docs/tests): any other
+        `herdr agent prompt|send-keys` / `herdr pane send-text|send-keys|run`
+        caller is a defect. Census 2026-09-06: 0 outside this module."""
+        import re
+        root = (_HERE / "..").resolve()
+        pattern = re.compile(r"herdr[\"', \[]+(agent|pane)[\"', ]+(prompt|send-text|send-keys|run)\b")
+        offenders = []
+        for path in root.rglob("*"):
+            if path.suffix not in {".py", ".sh", ".js", ".mjs", ".ts", ".toml", ".yaml", ".json"}:
+                continue
+            rel = path.relative_to(root).as_posix()
+            if any(part in rel for part in ("/dist/", "_scratch", ".agent_reports", "node_modules", ".test.", "/tests/")):
+                continue
+            if rel.startswith(("dist/", ".agent_reports/")) or path.name == "peer-steward.py":
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for n, line in enumerate(text.splitlines(), 1):
+                if pattern.search(line) and not line.lstrip().startswith(("#", "//", "*", '"""', "'")):
+                    offenders.append(f"{rel}:{n}: {line.strip()[:100]}")
+        self.assertEqual(offenders, [], "pane prompts must go through peer-steward.py prompt")
 
     def test_prompt_no_verify_keeps_the_legacy_exit_code_report(self):
         os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"

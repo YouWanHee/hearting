@@ -806,6 +806,13 @@ predicted-next-prompt ghost in an *empty* box (`❯ [handoff] … …`, present 
 ledger, gone as soon as anything is typed, unmoved by Enter/Return/ctrl+m): before calling a
 prompt unsubmitted, type one character into the box or check the target transcript. `--no-verify`
 keeps the legacy exit-code report; `--wait-idle-ms N` defers a send to a working/blocked target.
+**Every pane prompt goes through this wrapper.** herdr's own server log records `cli:agent:prompt` with
+no target pane and no caller (324 such rows on 2026-09-06 — an unsubmitted-text sighting cannot be
+attributed from it), so the wrapper writes one ledger row per send whatever the outcome: `to.pane`
+(the resolved herdr pane), `to.session_id`, `from.session_id`, `ts`, `body_sha256`, and the verdict as
+`delivery.receipt` (`prompted=… state_before=… verify=… herdr_rc=… ms=… reason=…`). Harness code and a
+session's own Bash never call `herdr agent prompt`, `herdr pane send-text`, `send-keys` or `pane run`
+directly (census 2026-09-06: 0 callers outside `peer-steward.py`; `peer_steward.test.py` asserts it).
 
 Same-behavior guarantees are still not claimed: the watched-side herdr realization is
 measured for both Claude and Codex, and **no runtime's steward-side wake is measured** —

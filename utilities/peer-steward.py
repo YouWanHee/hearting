@@ -119,7 +119,8 @@ def _resolve_target(target):
 
 
 def _record(*, to_harness, to_name, kind, ref=None, summary_text=None,
-            receipt=None, status="sent", from_identity=None, to_session_id=None):
+            receipt=None, status="sent", from_identity=None, to_session_id=None,
+            to_pane=None):
     """Write one peer_message_v1 row.
 
     `from_identity` exists for the detached watcher: `_current_session_identity`
@@ -149,6 +150,7 @@ def _record(*, to_harness, to_name, kind, ref=None, summary_text=None,
         to_harness=to_harness,
         to_session_id=to_session_id,
         to_name=to_name,
+        to_pane=to_pane,
         kind=kind,
         surface="herdr",
         status=status,
@@ -1039,9 +1041,13 @@ _PROMPT_EXIT = {"true": 0, "failed": 1, "queued": 3}
 
 
 def _agent_state(target):
-    """(9) state word for `target` via one `herdr agent get` (never raises)."""
-    state, _agent, _code, _reason = _interpret_payload(_run_herdr_get(target), target)
-    return state
+    """(9) state word and pane id for `target` via one `herdr agent get`
+    (never raises). The pane is what the ledger keeps: herdr's own server log
+    records `cli:agent:prompt` with no target and no caller (measured
+    2026-09-06, 324 such rows), so the wrapper's row is the only attribution."""
+    state, agent, _code, _reason = _interpret_payload(_run_herdr_get(target), target)
+    pane = agent.get("pane") if isinstance(agent, dict) else None
+    return state, (pane if pane and pane != "-" else None)
 
 
 def _prompt_box_evidence(target):
@@ -1187,7 +1193,9 @@ def cmd_prompt(args):
     started = time.monotonic()
     verify = "none"
     reason = None
-    state_before = _agent_state(args.target) if not args.no_verify else "-"
+    state_before, target_pane = _agent_state(args.target)
+    if args.no_verify:
+        state_before = "-"
     if args.no_verify:
         rc, _payload = _herdr_prompt(args.target, text, wait=False,
                                      timeout_ms=_PROMPT_VERIFY_TIMEOUT_MS)
@@ -1198,7 +1206,7 @@ def cmd_prompt(args):
     else:
         if state_before in {"working", "blocked"} and args.wait_idle_ms > 0:
             _run_herdr_wait(args.target, ["idle", "done"], args.wait_idle_ms)
-            state_before = _agent_state(args.target)
+            state_before, target_pane = _agent_state(args.target)
         if state_before == "blocked" or (state_before != "working" and _form_open(args.target)):
             # Refuse: the text would be typed into an open form and the Enter
             # would answer it with the default (measured 3/3, 2026-09-06).
@@ -1243,8 +1251,16 @@ def cmd_prompt(args):
                     outcome = "failed"
     elapsed_ms = int((time.monotonic() - started) * 1000)
     ledger_status = {"true": "sent", "failed": "failed", "queued": "unknown"}[outcome]
+    # SD-122 (11): one ledger row per send, whatever happened -- target pane,
+    # caller session (from `_record`), time, body digest, and the submission
+    # verdict as the receipt. This row is the only caller attribution that
+    # exists for a pane prompt.
+    receipt = (f"prompted={outcome} state_before={state_before} verify={verify} "
+               f"herdr_rc={'-' if rc is None else rc} ms={elapsed_ms}"
+               + (f" reason={reason}" if reason else ""))
     _record(to_harness=t_harness or "unknown", to_name=args.target, kind=kind,
-            summary_text=body, to_session_id=t_sid, ref=args.ref, status=ledger_status)
+            summary_text=body, to_session_id=t_sid, to_pane=target_pane,
+            ref=args.ref, status=ledger_status, receipt=receipt)
     line = (f"prompted={outcome} target={args.target} "
             f"to_harness={t_harness or '-'} to_session_id={t_sid or '-'} kind={kind} "
             f"state_before={state_before} verify={verify} ms={elapsed_ms}")
