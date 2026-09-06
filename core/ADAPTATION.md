@@ -103,6 +103,13 @@ instead of inferring from another adapter or from local harness state.
   Include concrete parity gaps such as model pinning, tool restriction,
   permission inheritance, session/worktree isolation, hook lifecycle, discovery,
   UI visibility, and noninteractive/headless behavior.
+- **Separate a report from its exit code**: a diagnostic that consumes another tool's structured report
+  must read that report, not only the producer's exit status. Validate the report against a named
+  accepted shape; classify a missing, unparseable, or shape-violating report as *unknown* and fail
+  closed rather than as a measured pass or a measured absence. When a producer packs several
+  independent verdicts into one status, emit one check per verdict. Surface a bounded cause — a fixed
+  maximum number of lines and characters, drawn from the single invocation already made — never the raw
+  report and never a second run.
 - **Plan with verification**: when a projection change depends on a runtime
   capability, the implementation plan must include a current-doc citation or
   note, a local runtime/projection check, and a fallback if the feature is

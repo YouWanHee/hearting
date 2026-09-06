@@ -206,14 +206,46 @@ settings.json.
 EOF
 }
 
+DOCTOR_CAUSE_MAX_LINES=5
+DOCTOR_CAUSE_MAX_COLS=200
+
+doctor_emit_cause() {
+  name=$1
+  source=$(printf '%s\n' "$2" | LC_ALL=C tr -d '\000\r' | sed '/^$/d')
+  total=$(printf '%s\n' "$source" | sed '/^$/d' | wc -l | tr -d ' ')
+  if [ "$total" -eq 0 ]; then
+    printf 'cause_%s_1=no-output-captured\n' "$name"
+    printf 'cause_%s_lines=0/0\n' "$name"
+    return 0
+  fi
+  selected=$(printf '%s\n' "$source" | LC_ALL=C grep -E '(^check=[^ ]*:(failed|review-needed))|(^status=failed)|(^[a-z_]*reason=)|(Traceback)|([Ee]rror)' | sed -n "1,${DOCTOR_CAUSE_MAX_LINES}p" || true)
+  if [ -z "$selected" ]; then
+    selected=$(printf '%s\n' "$source" | tail -n "$DOCTOR_CAUSE_MAX_LINES")
+  fi
+  printed=$(printf '%s\n' "$selected" | sed '/^$/d' | wc -l | tr -d ' ')
+  i=1
+  printf '%s\n' "$selected" | while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    if [ "$(printf '%s' "$line" | wc -c | tr -d ' ')" -gt "$DOCTOR_CAUSE_MAX_COLS" ]; then
+      line="$(printf '%s' "$line" | cut -c 1-197)..."
+    else
+      line=$(printf '%s' "$line" | cut -c 1-"$DOCTOR_CAUSE_MAX_COLS")
+    fi
+    printf 'cause_%s_%s=%s\n' "$name" "$i" "$line"
+    i=$((i + 1))
+  done
+  printf 'cause_%s_lines=%s/%s\n' "$name" "$printed" "$total"
+}
+
 doctor_check() {
   name=$1
   shift
-  if "$@" >/dev/null 2>&1; then
+  if doctor_out=$("$@" 2>&1); then
     printf 'check=%s:ok\n' "$name"
     return 0
   fi
   printf 'check=%s:failed\n' "$name"
+  doctor_emit_cause "$name" "$doctor_out"
   return 1
 }
 
@@ -238,10 +270,10 @@ doctor_boundary() {
   printf '%s' "$$" > "$lock/pid"
   trap 'rm -rf "$lock" 2>/dev/null || true' EXIT HUP INT TERM
   "$ROOT/tools/check-adaptation-boundary.sh"
-  rc=$?
+  boundary_rc=$?
   rm -rf "$lock" 2>/dev/null || true
   trap - EXIT HUP INT TERM
-  return "$rc"
+  return "$boundary_rc"
 }
 
 doctor() {
