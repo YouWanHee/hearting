@@ -1108,47 +1108,78 @@ def _prompt_box_residue(evidence, first_line):
     return ours.startswith(body[:_PROMPT_RESIDUE_MIN_CHARS])
 
 
-def _transcript_arrival(t_harness, t_sid, first_line, since_epoch):
-    """Ground truth for a Claude target: the exact first line as a `user` row in
-    the target's own transcript, written at or after `since_epoch`. Returns
-    the row timestamp or None. Other harnesses: None (no transcript contract
-    known here)."""
-    if t_harness != "claude" or not t_sid or not first_line:
+def _transcript_rows_with(path, needle, since_epoch):
+    """Rows of one Claude transcript that carry `needle` at/after `since_epoch`:
+    a `user` row (delivered) or a `queue-operation` `enqueue` row (accepted
+    mid-turn, delivered when the turn ends -- measured 2026-09-06 06:25Z on
+    the steward pane). Either proves the text left the input box."""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - 512 * 1024))
+            tail = fh.read().decode("utf-8", "replace")
+    except OSError:
         return None
-    import glob as _glob
-    needle = first_line.strip()
-    for path in _glob.glob(os.path.expanduser(f"~/.claude/projects/*/{t_sid}.jsonl")):
+    for line in tail.splitlines():
+        # No raw-line prefilter: a writer may `\uXXXX`-escape non-ASCII, so
+        # the needle is compared against the decoded text only.
         try:
-            with open(path, "rb") as fh:
-                fh.seek(0, os.SEEK_END)
-                size = fh.tell()
-                fh.seek(max(0, size - 512 * 1024))
-                tail = fh.read().decode("utf-8", "replace")
-        except OSError:
+            row = json.loads(line)
+        except ValueError:
             continue
-        for line in tail.splitlines():
-            if needle not in line:
-                continue
-            try:
-                row = json.loads(line)
-            except ValueError:
-                continue
-            if row.get("type") != "user":
-                continue
+        if not isinstance(row, dict):
+            continue
+        kind = row.get("type")
+        if kind == "user":
             content = (row.get("message") or {}).get("content")
             if isinstance(content, list):
                 text = " ".join(str(x.get("text", "")) for x in content if isinstance(x, dict))
             else:
                 text = str(content or "")
-            if needle not in text:
+        elif kind == "queue-operation" and row.get("operation") == "enqueue":
+            text = str(row.get("content") or "")
+        else:
+            continue
+        if needle not in text:
+            continue
+        ts = row.get("timestamp") or ""
+        try:
+            epoch = time.mktime(time.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S")) - time.timezone
+        except ValueError:
+            epoch = None
+        if epoch is None or epoch >= since_epoch - 2:
+            return ts
+    return None
+
+
+def _transcript_arrival(t_harness, t_sid, first_line, since_epoch):
+    """Ground truth for a Claude target: our exact first line in the target's
+    own transcript at/after `since_epoch` (see `_transcript_rows_with`).
+    herdr may report a stale session id for a pane (measured: w1:p15 reported
+    16a75687 while 7a001534 was running), so after the named transcript every
+    transcript written since the send is scanned too -- the first line is a
+    unique needle. Other harnesses: None (no transcript contract known here)."""
+    if t_harness != "claude" or not first_line:
+        return None
+    import glob as _glob
+    needle = first_line.strip()
+    seen = []
+    if t_sid:
+        seen += _glob.glob(os.path.expanduser(f"~/.claude/projects/*/{t_sid}.jsonl"))
+    for path in _glob.glob(os.path.expanduser("~/.claude/projects/*/*.jsonl")):
+        if path in seen:
+            continue
+        try:
+            if os.stat(path).st_mtime < since_epoch - 2:
                 continue
-            ts = row.get("timestamp") or ""
-            try:
-                epoch = time.mktime(time.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S")) - time.timezone
-            except ValueError:
-                epoch = None
-            if epoch is None or epoch >= since_epoch - 2:
-                return ts
+        except OSError:
+            continue
+        seen.append(path)
+    for path in seen:
+        ts = _transcript_rows_with(path, needle, since_epoch)
+        if ts:
+            return ts
     return None
 
 

@@ -1098,6 +1098,32 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
                 self.assertIn("reason=target-form-open", rec["delivery"]["receipt"])
                 self.assertEqual(rec["to"]["pane"], "w1:pX")
 
+    def test_transcript_arrival_accepts_queued_rows_and_survives_a_stale_session_id(self):
+        """Measured 2026-09-06 06:25Z: a mid-turn send lands in the target
+        transcript as `queue-operation`/`enqueue` first; and herdr reported a
+        stale session id for the steward pane, so recently written transcripts
+        are scanned too."""
+        import tempfile, time as _time
+        home = tempfile.mkdtemp(); saved = os.environ.get("HOME"); os.environ["HOME"] = home
+        try:
+            proj = Path(home) / ".claude" / "projects" / "-proj"; proj.mkdir(parents=True)
+            now = _time.time(); ts = _time.strftime("%Y-%m-%dT%H:%M:%S.000Z", _time.gmtime(now))
+            (proj / "real-sid.jsonl").write_text(json.dumps({
+                "type": "queue-operation", "operation": "enqueue", "timestamp": ts,
+                "sessionId": "real-sid", "content": "[handoff] merge it now — carrier(w1:p18)\n\nbody"}) + "\n",
+                encoding="utf-8")
+            (proj / "stale-sid.jsonl").write_text("", encoding="utf-8")
+            old = now - 3600; os.utime(proj / "stale-sid.jsonl", (old, old))
+            self.assertEqual(peer_steward._transcript_arrival("claude", "stale-sid", "[handoff] merge it now — carrier(w1:p18)", now - 5), ts)
+            self.assertIsNone(peer_steward._transcript_arrival("claude", "stale-sid", "[handoff] something else", now - 5))
+            self.assertIsNone(peer_steward._transcript_arrival("codex", "x", "[handoff] merge it now — carrier(w1:p18)", now - 5))
+            (proj / "real-sid.jsonl").write_text(json.dumps({
+                "type": "user", "timestamp": ts, "message": {"content": "[steer] plain user row"}}) + "\n", encoding="utf-8")
+            self.assertEqual(peer_steward._transcript_arrival("claude", "real-sid", "[steer] plain user row", now - 5), ts)
+        finally:
+            if saved is None: os.environ.pop("HOME", None)
+            else: os.environ["HOME"] = saved
+
     def test_only_peer_steward_types_into_panes(self):
         """SD-122 (11): every pane prompt goes through `peer-steward.py prompt` so
         the ledger row exists -- herdr's server log keeps no target and no
