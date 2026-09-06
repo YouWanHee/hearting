@@ -313,9 +313,12 @@ class Session:
     # herdr answered and this (id-verified) session is not in its list; None = no
     # evidence either way (herdr absent/unreachable, or an unverified-id harness).
     herdr_attached: Optional[bool] = None
-    # F-100c — steward flag (depth −1 role): True when this session has SENT a
-    # steer/handoff/gate-relay/watch record (marker under the dispatch state root's
-    # `peer-steward/`); `steward_targets` = [{harness, session_id, name, kind, ts}].
+    # F-100c — steward flag (depth −1 role): True when this session's marker (under the
+    # dispatch state root's `peer-steward/`) holds role evidence — `steward on`
+    # (source=explicit), a SENT `watch` record (source=watch) or a `start` that launched
+    # the target (source=start). Sending steer/handoff/gate-relay is not evidence.
+    # `steward_targets` = the evidence entries only, [{harness, session_id, name, kind,
+    # ts, source}].
     steward: bool = False
     steward_targets: Optional[list] = None
     state_evidence: Optional[dict] = None  # F-25 classifier verdict + inputs (additive; --json via asdict)

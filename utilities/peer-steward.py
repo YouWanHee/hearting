@@ -165,6 +165,7 @@ def _record(*, to_harness, to_name, kind, ref=None, summary_text=None,
     finally:
         if tmp_path is not None:
             try:
+                # destructive-ok: reason=this call's own mkstemp summary file, already consumed by cmd_record; boundary=<TMPDIR>/peer-steward-summary-<random>
                 os.unlink(tmp_path)
             except OSError:
                 pass
@@ -313,6 +314,16 @@ def cmd_start(args):
         summary_text=f"[start] {args.name} kind={args.kind} mode={mode}",
         to_session_id=started_sid,
     )
+    # Launching a session is steward-role evidence (source=start); the `[start]` steer
+    # row above is only the message and raises nothing by itself. A start herdr refused
+    # launched nobody, so it marks nothing.
+    if started:
+        from_sid, from_harness = _current_session_identity()
+        peer_message.mark_steward(
+            from_harness, from_sid,
+            {"harness": args.kind, "session_id": started_sid, "name": args.name},
+            "start", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), source="start",
+        )
     print(
         f"started={str(started).lower()} agent={args.kind} name={args.name} "
         f"pane={args.pane} permission_mode={mode}"
@@ -1368,9 +1379,9 @@ def _herdr_error_reason(payload, rc):
 
 
 def cmd_steward(args):
-    """F-100c — explicit steward mode switch. Every steer/handoff/watch SEND already
-    raises the flag implicitly; `on` raises it before the first send (so Fleet shows
-    the yellow tag the moment a session takes the role), `off` releases it."""
+    """F-100c — explicit steward mode switch. The flag is a role, not a side effect of
+    sending: only `steward on` (source=explicit), a `wait`/`watch` (source=watch) or a
+    `start` that launched a session (source=start) raise it; `off` releases it."""
     sid, harness = _current_session_identity()
     if not sid:
         print("steward=unchanged reason=no-session-identity")
@@ -1378,7 +1389,7 @@ def cmd_steward(args):
     if args.state == "on":
         ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         ok = peer_message.mark_steward(harness, sid, {"harness": "unknown", "name": "-"},
-                                       "watch", ts)
+                                       "explicit", ts, source="explicit")
         print(f"steward={'on' if ok else 'unchanged'} harness={harness} session_id={sid}")
         return 0 if ok else 1
     rc = peer_message.cmd_release(peer_message.argparse.Namespace(harness=harness, session_id=sid))

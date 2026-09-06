@@ -785,11 +785,17 @@ through `herdr agent get` (Claude UUID, Codex thread id; herdr reports NO id for
 OpenCode — measured 2026-09-03) and `from.name` (the sender's registry name, Claude
 only today). Fleet joins sent/recv counts and the `← <name> · kind · age` subtitle on the
 exact session id, so a child row shows its steward on every harness; the pane pid probe
-(`herdr pane process-info`) is what places an OpenCode session in its herdr pane. A
-session that has SENT a steer/handoff/gate-relay/watch record — or ran
-`peer-steward.py steward on` — carries the steward marker under
-`<dispatch-state-root>/peer-steward/`, which Fleet renders as the bold-yellow tag badge;
-`peer-steward.py steward off` (or `peer-message release`) clears it.
+(`herdr pane process-info`) is what places an OpenCode session in its herdr pane. The
+steward marker under `<dispatch-state-root>/peer-steward/` is a **role** flag, not a
+side effect of talking (revised 2026-09-06): it is raised only by `peer-steward.py
+steward on` (`source=explicit`), by a SENT `watch` record — `wait`/`watch` observed the
+target (`source=watch`) — or by a `peer-steward.py start` that launched a session
+(`source=start`). Sending a steer/handoff/gate-relay raises nothing (a worker's
+`[handoff]` to its steward used to flag the worker). Fleet renders an evidenced marker
+as the bold-yellow tag badge and ignores one whose entries carry no such source, so
+old handoff-only markers are harmless; `peer-message prune-steward-markers [--apply]`
+lists/removes them, and `peer-steward.py steward off` (or `peer-message release`)
+clears a marker.
 
 **Prompt submission is verified, never assumed** (SD-122 (11), v67/v70). `peer-steward.py prompt`
 prints `prompted=true` only after the submission was observed, and every other verdict is typed:
