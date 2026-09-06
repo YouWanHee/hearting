@@ -82,7 +82,8 @@ def collect(harness_filter=None):
           # F-100c: it stewards two children → bold-yellow tag.
           session_tag="a7", herdr_attached=True, steward=True,
           steward_targets=[{"harness": "codex", "session_id": "demo-codex-1",
-                            "name": "demo-app", "kind": "steer", "ts": "2026-09-03T02:00:00Z"}],
+                            "name": "demo-app", "kind": "start", "ts": "2026-09-03T02:00:00Z",
+                            "source": "start"}],
           # F-16/F-17 merge demo — the live subtitle row under a session row.
           summary="지금 render.py 그룹 루프의 틴트 적용 경로를 분석 중"),
         # Deterministic composed-DAG owner: the group row must show both active

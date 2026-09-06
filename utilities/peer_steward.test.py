@@ -124,6 +124,45 @@ class WaitTest(_TmpRootMixin, unittest.TestCase):
             rc = self._wait()
         self.assertEqual(rc, 2)
 
+    def test_wait_on_a_mistyped_target_records_but_never_marks(self):
+        """Review round 1 #2: the old code marked before herdr answered, so one typo was a
+        permanent bold-yellow badge over an empty steward strip."""
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-innocent"
+        payload = {"error": {"code": "agent_not_found"}}
+        with mock.patch("builtins.print"), \
+             mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run", return_value=_herdr_json(payload)):
+            self.assertEqual(self._wait(target="no-such-target"), 2)
+        self.assertEqual(len(self._all_records()), 1)
+        self.assertEqual(peer_steward.peer_message.read_steward_markers(), {})
+        self.assertFalse(peer_steward.peer_message.steward_marker_path("claude", "sid-innocent").exists())
+
+    def test_wait_marks_the_caller_only_after_a_real_target_answered(self):
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
+        with mock.patch("builtins.print"), \
+             mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run",
+                               return_value=_herdr_json(_agent_json("codex", "thread-1", "fleet-cycle2"))):
+            self.assertEqual(self._wait(), 0)
+        markers = peer_steward.peer_message.read_steward_markers()
+        self.assertEqual(set(markers), {("claude", "sid-steward")})
+        entry = markers[("claude", "sid-steward")]["targets"]["thread-1"]
+        self.assertEqual((entry["harness"], entry["session_id"], entry["kind"], entry["source"]),
+                         ("codex", "thread-1", "watch", "watch"))
+        # a timeout still names a real target (herdr resolved it), so it counts
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward-2"
+        with mock.patch("builtins.print"), \
+             mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run",
+                               return_value=_herdr_json({"error": {"code": "timeout"}})):
+            self.assertEqual(self._wait(), 3)
+        self.assertIn(("claude", "sid-steward-2"), peer_steward.peer_message.read_steward_markers())
+        # herdr missing: record, no flag
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward-3"
+        with mock.patch("builtins.print"), mock.patch.object(peer_steward.shutil, "which", return_value=None):
+            self.assertEqual(self._wait(), 4)
+        self.assertNotIn(("claude", "sid-steward-3"), peer_steward.peer_message.read_steward_markers())
+
     def test_herdr_binary_missing_is_herdr_unavailable_exit_4(self):
         with mock.patch.object(peer_steward.shutil, "which", return_value=None):
             rc = self._wait()
@@ -268,6 +307,44 @@ class StartTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual(recs[0]["kind"], "steer")
         self.assertEqual(recs[0]["summary"], "[start] peer-d kind=claude mode=bypass")
         self.assertEqual(recs[0]["delivery"]["surface"], "herdr")
+
+    def test_start_that_launched_marks_the_launcher_with_source_start(self):
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
+        started = json.dumps({"result": {"agent": {"agent_session": {"value": "child-sid"}}}})
+        with mock.patch("builtins.print"), \
+             mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run",
+                                return_value=subprocess.CompletedProcess([], 0, stdout=started, stderr="")):
+            self.assertEqual(self._start(name="peer-e", kind="codex"), 0)
+        markers = peer_steward.peer_message.read_steward_markers()
+        self.assertEqual(set(markers), {("claude", "sid-steward")})
+        entry = markers[("claude", "sid-steward")]["targets"]["child-sid"]
+        self.assertEqual((entry["harness"], entry["name"], entry["kind"], entry["source"]),
+                         ("codex", "peer-e", "start", "start"))
+        self.assertEqual(entry["session_id"], "child-sid")
+
+    def test_start_that_herdr_refused_marks_nothing(self):
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
+        with mock.patch("builtins.print"), \
+             mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run",
+                                return_value=subprocess.CompletedProcess([], 1, stdout="", stderr="boom")):
+            self.assertEqual(self._start(name="peer-f", kind="claude"), 0)
+        self.assertEqual(peer_steward.peer_message.read_steward_markers(), {})
+
+    def test_start_with_an_error_body_or_no_agent_block_marks_nothing(self):
+        """Review round 1 #9: exit 0 alone is not a launch."""
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
+        for stdout, expect in ((json.dumps({"error": {"code": "pane_busy"}}), "started=false"),
+                               ("", "started=true"), ("not json", "started=true")):
+            with self.subTest(stdout=stdout):
+                with mock.patch("builtins.print") as print_mock, \
+                     mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+                     mock.patch.object(peer_steward.subprocess, "run",
+                                       return_value=subprocess.CompletedProcess([], 0, stdout=stdout, stderr="")):
+                    self.assertEqual(self._start(name="peer-g", kind="codex"), 0)
+                self.assertIn(expect, print_mock.call_args[0][0])
+                self.assertEqual(peer_steward.peer_message.read_steward_markers(), {})
 
     def test_herdr_missing_exit_4(self):
         with mock.patch.object(peer_steward.shutil, "which", return_value=None):
@@ -479,6 +556,12 @@ class WatchArmTest(_WatchMixin, unittest.TestCase):
         self.assertEqual(rows[0]["delivery"]["surface"], "herdr")
         self.assertEqual(rows[0]["delivery"]["status"], "sent")
         self.assertEqual(rows[0]["delivery"]["receipt"], fields["watch_id"])
+
+        # F-100c-2: arming a watcher on a resolved target is steward evidence (source=watch)
+        markers = peer_steward.peer_message.read_steward_markers()
+        self.assertIn(("claude", "steward-1"), markers)
+        entry = next(iter(markers[("claude", "steward-1")]["targets"].values()))
+        self.assertEqual((entry["name"], entry["kind"], entry["source"]), ("peer-a", "watch", "watch"))
 
         self._release()
         self._wait_for_receipt(fields["watch_id"])
@@ -909,8 +992,9 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
         line = print_mock.call_args[0][0]
         self.assertIn("prompted=true", line)
         self.assertIn("to_session_id=thread-9", line)
-        # the sender is now flagged as steward of the target
-        self.assertIn(("claude", "sid-steward"), peer_steward.peer_message.read_steward_markers())
+        # sending a handoff is a message, not a steward act: no marker (user 2026-09-06)
+        self.assertEqual(peer_steward.peer_message.read_steward_markers(), {})
+        self.assertFalse(peer_steward.peer_message.steward_marker_path("claude", "sid-steward").exists())
 
     def test_prompt_without_trailer_flag_and_unresolvable_target(self):
         os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
@@ -1185,7 +1269,10 @@ class F100cStewardModeTest(_TmpRootMixin, unittest.TestCase):
         with mock.patch("builtins.print") as print_mock:
             self.assertEqual(peer_steward.main(["steward", "on"]), 0)
         self.assertIn("steward=on", print_mock.call_args[0][0])
-        self.assertIn(("claude", "sid-steward"), peer_steward.peer_message.read_steward_markers())
+        markers = peer_steward.peer_message.read_steward_markers()
+        self.assertIn(("claude", "sid-steward"), markers)
+        entry = markers[("claude", "sid-steward")]["targets"]["-"]
+        self.assertEqual((entry["kind"], entry["source"], entry["session_id"]), ("explicit", "explicit", None))
         with mock.patch("builtins.print") as print_mock:
             self.assertEqual(peer_steward.main(["steward", "off"]), 0)
         self.assertIn("steward=off", print_mock.call_args[0][0])
