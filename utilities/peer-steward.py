@@ -21,6 +21,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -187,7 +188,10 @@ def _run_herdr_wait(target, until, timeout_ms):
     global _LAST_HERDR_EXIT
     _LAST_HERDR_EXIT = None
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        # A wedged herdr socket must not hang the caller past its own bound
+        # (review round 1, minor 3); an unbounded wait stays unbounded.
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=(timeout_ms / 1000 + 15) if timeout_ms is not None else None)
     except (OSError, subprocess.SubprocessError):
         return None
     _LAST_HERDR_EXIT = proc.returncode
@@ -1035,9 +1039,12 @@ def cmd_ack(args):
     return 0
 
 _PROMPT_VERIFY_TIMEOUT_MS = 8000      # herdr `--wait --until working` bound (submission observed)
+_PROMPT_STALL_FLOOR_MS = 5000         # herdr's own stall bound: a shorter --timeout hides `agent_prompt_stalled`
 _PROMPT_SETTLE_MS = 1500              # bounded herdr wait before the prompt-box re-read (no sleep loop)
-_PROMPT_RESIDUE_MIN_CHARS = 12        # shortest prompt-box residue we call "our text"
-_PROMPT_EXIT = {"true": 0, "failed": 1, "queued": 3}
+_PROMPT_RESIDUE_MIN_CHARS = 24        # shortest prompt-box residue (after the [kind] prefix) we call "our text"
+_PROMPT_EXIT = {"true": 0, "failed": 1, "queued": 3, "unverified": 5}
+_PROMPT_LEDGER_STATUS = {"true": "sent", "failed": "failed", "queued": "unknown", "unverified": "unknown"}
+_KIND_PREFIX = re.compile(r"^\[(?:steer|handoff|gate|notice|start|probe)[^\]]*\]\s*")
 
 
 def _agent_state(target):
@@ -1051,39 +1058,98 @@ def _agent_state(target):
 
 
 def _prompt_box_evidence(target):
-    """The `evidence:` line of `herdr agent explain` -- for Claude the live
-    prompt-box body (`❯ …`), for Codex/OpenCode the detection region herdr
-    matched. None when herdr cannot explain the pane."""
+    """`(evidence, readable)` from `herdr agent explain`.
+
+    The `evidence:` line is the prompt-box body only when the rule that fired
+    reads `region=prompt_box_body` (Claude idle). A working Claude pane is
+    explained by `osc_title_working` (the terminal title), an OpenCode pane by
+    `rule: none` with no evidence line at all -- neither is a box read, and a
+    box that was not read is never "clear" (review round 1, B2/B3)."""
     try:
         proc = subprocess.run(["herdr", "agent", "explain", target],
                               capture_output=True, text=True, timeout=_herdr_get_timeout())
     except (OSError, subprocess.SubprocessError):
-        return None
+        return None, False
+    if proc.returncode != 0:
+        return None, False
+    rule = evidence = None
     for line in (proc.stdout or "").splitlines():
-        if line.startswith("evidence:"):
-            return line.split(":", 1)[1].strip()
-    return None
+        if line.startswith("rule:"):
+            rule = line.split(":", 1)[1].strip()
+        elif line.startswith("evidence:"):
+            evidence = line.split(":", 1)[1].strip()
+    readable = evidence is not None and rule is not None and "region=prompt_box_body" in rule
+    return (evidence if readable else None), readable
+
+
+def _strip_kind(text):
+    return _KIND_PREFIX.sub("", (text or "").strip())
 
 
 def _prompt_box_residue(evidence, first_line):
-    """True when the prompt box still shows *our* first line.
+    """True when a *read* prompt box still shows our first line.
 
-    Measured 2026-09-06 (Claude Code 2.1.263): an empty prompt box renders a
-    dim *suggested* next prompt (`❯ [handoff] … …`) that no key submits and no
-    transcript contains -- four "unsubmitted prompt" reports that day were this
-    ghost. So a residue counts only when at least `_PROMPT_RESIDUE_MIN_CHARS`
-    of our own first line are in the box; a narrow pane truncates with `…`,
-    so a shorter box body that is a prefix of our line also counts.
+    Only the text after the `[kind]` prefix counts, at least
+    `_PROMPT_RESIDUE_MIN_CHARS` of it (a narrow pane truncates with `…`; a
+    box body shorter than that is undecidable and is not residue). Claude Code
+    2.1.263 renders a *predicted* next prompt in an empty box; when that
+    prediction equals what we sent, text alone cannot tell them apart -- which
+    is why `_verify_after_send` consults the target transcript first and only
+    then this heuristic (review round 1, M4).
     """
     if not evidence or not first_line:
         return False
     body = evidence.strip().strip('"')
-    body = body.replace("\\n", "\n").replace("\\u{a0}", " ").replace("\u00a0", " ")
-    body = body.lstrip("❯›>").strip().rstrip("…").strip()
-    ours = first_line.strip()
-    if len(body) >= _PROMPT_RESIDUE_MIN_CHARS and ours.startswith(body[:_PROMPT_RESIDUE_MIN_CHARS]):
-        return True
-    return len(body) >= _PROMPT_RESIDUE_MIN_CHARS and body[:_PROMPT_RESIDUE_MIN_CHARS] in ours
+    body = body.replace("\\n", "\n").replace("\\u{a0}", " ").replace(" ", " ")
+    body = _strip_kind(body.lstrip("❯›>").strip().rstrip("…").strip())
+    ours = _strip_kind(first_line)
+    if len(body) < _PROMPT_RESIDUE_MIN_CHARS:
+        return False
+    return ours.startswith(body[:_PROMPT_RESIDUE_MIN_CHARS])
+
+
+def _transcript_arrival(t_harness, t_sid, first_line, since_epoch):
+    """Ground truth for a Claude target: the exact first line as a `user` row in
+    the target's own transcript, written at or after `since_epoch`. Returns
+    the row timestamp or None. Other harnesses: None (no transcript contract
+    known here)."""
+    if t_harness != "claude" or not t_sid or not first_line:
+        return None
+    import glob as _glob
+    needle = first_line.strip()
+    for path in _glob.glob(os.path.expanduser(f"~/.claude/projects/*/{t_sid}.jsonl")):
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                size = fh.tell()
+                fh.seek(max(0, size - 512 * 1024))
+                tail = fh.read().decode("utf-8", "replace")
+        except OSError:
+            continue
+        for line in tail.splitlines():
+            if needle not in line:
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if row.get("type") != "user":
+                continue
+            content = (row.get("message") or {}).get("content")
+            if isinstance(content, list):
+                text = " ".join(str(x.get("text", "")) for x in content if isinstance(x, dict))
+            else:
+                text = str(content or "")
+            if needle not in text:
+                continue
+            ts = row.get("timestamp") or ""
+            try:
+                epoch = time.mktime(time.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S")) - time.timezone
+            except ValueError:
+                epoch = None
+            if epoch is None or epoch >= since_epoch - 2:
+                return ts
+    return None
 
 
 def _herdr_prompt(target, text, *, wait, timeout_ms):
@@ -1107,12 +1173,12 @@ def _herdr_prompt(target, text, *, wait, timeout_ms):
     return proc.returncode, payload
 
 
-def _settle(target):
+def _settle(target, bound_ms=_PROMPT_SETTLE_MS):
     """Bounded, event-driven pause before re-reading the prompt box: one
     `herdr agent wait --until idle|done|blocked --timeout` call (S3: no
     self-written sleep or poll loop). Its result is irrelevant -- only the
     elapsed bound matters."""
-    _run_herdr_wait(target, ["idle", "done", "blocked"], _PROMPT_SETTLE_MS)
+    _run_herdr_wait(target, ["idle", "done", "blocked"], bound_ms)
 
 
 _FORM_TOKENS = ("esctocancel", "entertoselect", "entertoconfirm", "doyouwanttoproceed",
@@ -1125,9 +1191,11 @@ def _form_open(target):
     injected into such a form is lost and its `Enter` picks the form's
     default answer -- the one injection path that silently destroys state.
     herdr reports `blocked` for a normal-width pane; a narrow pane wraps the
-    footer words so the state stays `idle`, hence this whitespace-free scan."""
+    footer words so the state stays `idle` (or `working` for a mid-turn
+    permission prompt), hence this whitespace-free scan of the whole visible
+    buffer, run for every state (review round 1, M3/minor 5)."""
     try:
-        proc = subprocess.run(["herdr", "agent", "read", target, "--source", "visible", "--lines", "16"],
+        proc = subprocess.run(["herdr", "agent", "read", target, "--source", "visible"],
                               capture_output=True, text=True, timeout=_herdr_get_timeout())
     except (OSError, subprocess.SubprocessError):
         return False
@@ -1143,29 +1211,59 @@ def _send_enter(target):
         pass
 
 
+def _verify_after_send(target, first, t_harness, t_sid, sent_at):
+    """(outcome, verify, reason) once herdr itself could not prove the submission.
+
+    Order: the target transcript (exact, Claude only) → a *read* prompt box
+    (`region=prompt_box_body`; residue → one Enter retry → re-check) → nothing
+    observed is `unverified`, never `true`."""
+    if _transcript_arrival(t_harness, t_sid, first, sent_at):
+        return "true", "transcript-arrival", None
+    evidence, readable = _prompt_box_evidence(target)
+    if not readable:
+        return "unverified", "prompt-box-unavailable", "submission-not-observed"
+    if not _prompt_box_residue(evidence, first):
+        return "true", "prompt-box-clear", None
+    _send_enter(target)
+    _settle(target)
+    if _transcript_arrival(t_harness, t_sid, first, sent_at):
+        return "true", "transcript-arrival", None
+    evidence, readable = _prompt_box_evidence(target)
+    if not readable:
+        return "unverified", "prompt-box-unavailable", "submission-not-observed"
+    if _prompt_box_residue(evidence, first):
+        return "queued", "prompt-box", "prompt-box-residue"
+    return "true", "prompt-box-clear", None
+
+
 def cmd_prompt(args):
     """F-100c — the harness-neutral steward send: `herdr agent prompt <target> <body +
     trailer>`, recorded with the target's exact session id (herdr `agent get`) and the
     sender's name. The trailer lets the receiving harness write its own `notice`.
 
-    SD-122 (11) v66 — `prompted=true` is printed only after the submission was
+    SD-122 (11) v67/v70 — `prompted=true` is printed only after the submission was
     observed, never from herdr's exit code alone:
 
-    * target not working (idle/done/blocked/unknown): `herdr agent prompt --wait
-      --until working` must see the state change; herdr's `agent_prompt_stalled`
-      is `prompted=failed reason=agent-prompt-stalled`.
-    * target `blocked` (or its visible pane shows a selection/permission form):
-      refused as `prompted=failed reason=target-form-open` -- typed text would
-      be lost and the Enter would answer the form with its default (measured).
-    * target already working (a state change proves nothing): the prompt box is
-      re-read after a bounded herdr wait; our own first line still sitting in
-      it is one `Enter` retry, and a residue after that is `prompted=queued`
-      (exit 3) -- the text is in the target's input, not submitted.
+    * target `blocked`, or its visible pane shows a selection/permission form
+      (checked for every state): refused as `prompted=failed
+      reason=target-form-open` -- typed text would be lost and the Enter would
+      answer the form with its default (measured 3/3).
+    * target not working (idle/done/unknown): `herdr agent prompt --wait --until
+      working` must see the state change; herdr's `agent_prompt_stalled` is
+      `prompted=failed reason=agent-prompt-stalled`; a herdr `timeout` falls
+      through to `_verify_after_send`.
+    * target already working (a state change proves nothing): after a bounded
+      herdr wait, `_verify_after_send` -- the target transcript first, then a
+      prompt box that was actually read; residue after one Enter retry is
+      `prompted=queued` (exit 3); nothing observed is `prompted=unverified`
+      (exit 5), ledger `unknown`.
 
     Measured 2026-09-06 on a probe Claude session: every path (herdr prompt,
     this command, send-text+Enter) submitted within 1 s whether the target was
     idle or working; the verification exists so that a future failure is a
-    typed refusal instead of a false `prompted=true`.
+    typed refusal instead of a false `prompted=true`. Every send leaves one
+    ledger row (`to.pane`, caller session, digest, verdict receipt) -- the only
+    attribution that exists for a pane prompt.
     """
     if _herdr_missing():
         return _unavailable("herdr-not-found")
@@ -1191,12 +1289,14 @@ def cmd_prompt(args):
             kind = k
 
     started = time.monotonic()
+    sent_at = time.time()
     verify = "none"
     reason = None
+    rc = None
+    verify_timeout_ms = max(_PROMPT_STALL_FLOOR_MS, int(args.verify_timeout_ms))
     state_before, target_pane = _agent_state(args.target)
     if args.no_verify:
         state_before = "-"
-    if args.no_verify:
         rc, _payload = _herdr_prompt(args.target, text, wait=False,
                                      timeout_ms=_PROMPT_VERIFY_TIMEOUT_MS)
         if rc is None:
@@ -1207,13 +1307,9 @@ def cmd_prompt(args):
         if state_before in {"working", "blocked"} and args.wait_idle_ms > 0:
             _run_herdr_wait(args.target, ["idle", "done"], args.wait_idle_ms)
             state_before, target_pane = _agent_state(args.target)
-        if state_before == "blocked" or (state_before != "working" and _form_open(args.target)):
-            # Refuse: the text would be typed into an open form and the Enter
-            # would answer it with the default (measured 3/3, 2026-09-06).
+        if state_before == "blocked" or _form_open(args.target):
             outcome, reason = "failed", "target-form-open"
-            rc = None
         elif state_before == "working":
-            # A state change cannot prove submission here: verify by the box.
             rc, payload = _herdr_prompt(args.target, text, wait=False,
                                         timeout_ms=_PROMPT_VERIFY_TIMEOUT_MS)
             if rc is None:
@@ -1221,19 +1317,12 @@ def cmd_prompt(args):
             if rc != 0:
                 outcome, reason = "failed", _herdr_error_reason(payload, rc)
             else:
-                _settle(args.target)
-                residue = _prompt_box_residue(_prompt_box_evidence(args.target), first)
-                if residue:
-                    _send_enter(args.target)
-                    _settle(args.target)
-                    residue = _prompt_box_residue(_prompt_box_evidence(args.target), first)
-                if residue:
-                    outcome, reason, verify = "queued", "prompt-box-residue", "prompt-box"
-                else:
-                    outcome, verify = "true", "prompt-box-clear"
+                _settle(args.target, max(_PROMPT_SETTLE_MS, int(args.wait_idle_ms)))
+                outcome, verify, reason = _verify_after_send(
+                    args.target, first, t_harness, t_sid, sent_at)
         else:
             rc, payload = _herdr_prompt(args.target, text, wait=True,
-                                        timeout_ms=args.verify_timeout_ms)
+                                        timeout_ms=verify_timeout_ms)
             if rc is None:
                 return _unavailable("herdr-invocation-failed")
             if rc == 0:
@@ -1241,16 +1330,14 @@ def cmd_prompt(args):
             else:
                 reason = _herdr_error_reason(payload, rc)
                 if reason == "timeout":
-                    # herdr saw the state change (else it would have said
-                    # stalled) but no `working` within the bound: the box decides.
-                    residue = _prompt_box_residue(_prompt_box_evidence(args.target), first)
-                    outcome = "queued" if residue else "true"
-                    verify = "prompt-box" if residue else "prompt-box-clear"
-                    reason = "prompt-box-residue" if residue else None
+                    # herdr saw a state change (else it would have said
+                    # stalled) but no `working` within the bound.
+                    outcome, verify, reason = _verify_after_send(
+                        args.target, first, t_harness, t_sid, sent_at)
                 else:
                     outcome = "failed"
     elapsed_ms = int((time.monotonic() - started) * 1000)
-    ledger_status = {"true": "sent", "failed": "failed", "queued": "unknown"}[outcome]
+    ledger_status = _PROMPT_LEDGER_STATUS[outcome]
     # SD-122 (11): one ledger row per send, whatever happened -- target pane,
     # caller session (from `_record`), time, body digest, and the submission
     # verdict as the receipt. This row is the only caller attribution that
@@ -1372,7 +1459,7 @@ def build_parser():
     p_prompt.add_argument("--no-verify", action="store_true",
                           help="legacy: report herdr's exit code as prompted=true (no submission check)")
     p_prompt.add_argument("--verify-timeout-ms", type=int, default=_PROMPT_VERIFY_TIMEOUT_MS,
-                          help="bound for observing the target's state flip after submission")
+                          help="bound for observing the target's state flip after submission (clamped to herdr's 5000 ms stall bound)")
     p_prompt.add_argument("--wait-idle-ms", type=int, default=0,
                           help="defer the send until a working target settles (0 = send now; measured: mid-turn sends submit)")
     p_prompt.set_defaults(func=cmd_prompt)

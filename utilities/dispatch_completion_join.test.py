@@ -2965,6 +2965,12 @@ class ReconcilePendingDeliveryTest(unittest.TestCase):
             self.assertEqual(second["pruned_records"], 1)
             self.assertFalse(record_file.exists())
             self.assertFalse(record_file.with_name(record_file.name + ".lock").exists())
+            self.assertTrue(JOIN.pending_delivery.tombstone_path(record_file).is_file())
+            # Review round 1, B1: the append-only row must not resurrect the
+            # delivered receipt as a fresh `pending` obligation.
+            third = JOIN.reconcile_pending_delivery(jobs)
+            self.assertEqual(third["materialized"], 0)
+            self.assertFalse(record_file.exists(), "pruned record resurrected")
 
     def test_never_expires_a_record_whose_owning_process_is_alive(self):
         with tempfile.TemporaryDirectory() as td:

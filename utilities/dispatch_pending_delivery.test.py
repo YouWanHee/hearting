@@ -442,14 +442,69 @@ class PruneTest(IsolatedRootMixin, unittest.TestCase):
         for path in (old_acked, old_expired, fresh_acked):
             self.assertTrue(path.is_file())
 
-    def test_apply_unlinks_record_and_lock_and_empty_directory(self):
+    def test_apply_unlinks_record_and_lock_and_leaves_a_tombstone(self):
         old_acked = self._record("7", state="acked", age_seconds=8 * self.DAY)
         result = PD.prune(self.root, apply=True)
         self.assertEqual(result["pruned_records"], 1)
         self.assertEqual(result["skipped"], 0)
         self.assertFalse(old_acked.exists())
         self.assertFalse(old_acked.with_name(old_acked.name + ".lock").exists())
-        self.assertFalse(old_acked.parent.exists())
+        tomb = PD.tombstone_path(old_acked)
+        self.assertTrue(tomb.is_file(), "the tombstone is what stops re-materialization (B1)")
+        self.assertTrue(old_acked.parent.is_dir(), "recipient directories are never removed")
+        # a second prune sees nothing to do and creates no orphan lock
+        again = PD.prune(self.root, apply=True)
+        self.assertEqual((again["pruned_records"], again["pruned_locks"], again["skipped"]), (0, 0, 0))
+        self.assertEqual(sorted(p.name for p in old_acked.parent.iterdir()), [tomb.name])
+
+    def test_apply_leaves_no_orphan_lock_when_the_record_vanished_since_the_plan(self):
+        """Review round 1, minor 2: the skip path created a brand-new orphan."""
+        old_acked = self._record("c", state="acked", age_seconds=8 * self.DAY)
+        real_plan = PD.prune_plan
+        def plan_then_vanish(root, **kwargs):
+            plan = real_plan(root, **kwargs)
+            old_acked.unlink()
+            old_acked.with_name(old_acked.name + ".lock").unlink()
+            return plan
+        with unittest.mock.patch.object(PD, "prune_plan", side_effect=plan_then_vanish):
+            result = PD.prune(self.root, apply=True)
+        self.assertEqual(result["skipped"], 1)
+        self.assertEqual(list(old_acked.parent.iterdir()), [], "no lock left behind")
+
+    def test_record_lock_survives_the_lock_file_being_replaced(self):
+        """Review round 1, M1: a holder on an unlinked inode must not share the
+        critical section with a holder on the new inode."""
+        import fcntl, threading
+        path = self.root / "pending-delivery" / ("e" * 64) / "delivery-race.json"
+        lock_path = path.with_name(path.name + ".lock")
+        path.parent.mkdir(parents=True)
+        lock_path.write_bytes(b"")
+        old_fd = os.open(lock_path, os.O_RDWR)
+        fcntl.flock(old_fd, fcntl.LOCK_EX)          # "B" holds the old inode
+        os.unlink(lock_path)                        # the prune removes the file
+        entered = threading.Event()
+        def contender():
+            with PD._record_lock(path):             # "C" opens the new inode
+                entered.set()
+        t = threading.Thread(target=contender); t.start()
+        self.assertTrue(entered.wait(2.0), "a fresh holder acquires the new inode")
+        t.join()
+        # "B" itself, re-validating, would see the inode mismatch and reopen:
+        self.assertNotEqual(os.fstat(old_fd).st_ino, os.stat(lock_path).st_ino)
+        fcntl.flock(old_fd, fcntl.LOCK_UN); os.close(old_fd)
+
+    def test_orphan_lock_is_unlinked_only_while_held_and_only_if_still_absent(self):
+        old_lock = self._orphan_lock("delivery-held", 2 * self.DAY)
+        real_plan = PD.prune_plan
+        def plan_then_record_appears(root, **kwargs):
+            plan = real_plan(root, **kwargs)
+            old_lock.with_name(old_lock.name[:-5]).write_text("{}", encoding="utf-8")
+            return plan
+        with unittest.mock.patch.object(PD, "prune_plan", side_effect=plan_then_record_appears):
+            result = PD.prune(self.root, apply=True)
+        self.assertEqual(result["pruned_locks"], 0)
+        self.assertEqual(result["skipped"], 1)
+        self.assertTrue(old_lock.exists(), "a lock whose record reappeared is not an orphan")
 
     def test_apply_skips_a_record_rewritten_since_the_plan(self):
         old_acked = self._record("8", state="acked", age_seconds=8 * self.DAY)
