@@ -316,11 +316,17 @@ helper:
 
 Question counts are bounded by intensity — at most 7 at `standard+`, 3 at
 `quick`, 1 at `direct` — and the validator refuses an interview that breaks
-the plain-language rules before it reaches anyone. `direct`/`quick` have no
-`frame` node: the acting session asks its 0–1 / 1–3 questions of the same
-kind inline, inside the blocking §0.4 card step, and records the answers in
-the plan or the work log. The recorded answers become `shards/frame/intent.md`
-(owner-rendered), the brief `plan` reads first.
+the plain-language rules before it reaches anyone (the `standard+` cap and
+the wording rules are machine-checked at the raise; steps 1–3 above and the
+`direct`/`quick` caps are obligations on the acting session that nothing
+checks mechanically). `direct`/`quick` have no `frame` node: the acting
+session asks its 0–1 / 1–3 questions of the same kind inline, inside the
+blocking §0.4 card step, and records the answers in the plan or the work log.
+The recorded answers become `shards/frame/intent.md` (owner-rendered), the
+brief `plan` reads first; `plan-author` is told to cite each decision by its
+question id and to report one it cannot honor as a blocker — a prompt
+contract, not a gate check. An interview gate may be raised at most twice
+per route (`round` ≤ 2).
 
 Entry routers therefore have two deterministic load phases: manifest-owned
 metadata before approval, then the selected portable owner contract after

@@ -94,6 +94,49 @@ class ValidateTest(unittest.TestCase):
         bad["brief"]["problem"] = "The 워커 dies at the 게이트."
         self.assertEqual(len([e for e in FI.validate(bad) if "harness word" in e]), 2)
 
+    def test_korean_particles_and_identifiers_are_caught(self):
+        """review round 1, M4: Korean is agglutinative and identifiers carry `_`/`-`."""
+        for text in ("라우트를 바꿀까요?", "게이트가 열리면 진행할까요?", "오너에게 맡길까요?",
+                     "Keep route_id in the log?", "Should the owner-side wording stay?",
+                     "Should the sub-node run first?", "Is a route-level change fine?"):
+            with self.subTest(text=text):
+                self.assertTrue(FI.jargon_hits(text), text)
+        bad = good_interview()
+        bad["questions"][0]["question"] = "게이트를 지금 열까요, 나중에 열까요?"
+        self.assertTrue(any("harness word" in e for e in FI.validate(bad)))
+
+    def test_abbreviations_are_not_sentence_ends_and_two_questions_are_caught(self):
+        ok = good_interview(understanding="You want approval in seconds, e.g. under five, with short questions.")
+        self.assertEqual(FI.validate(ok), [])
+        bad = good_interview()
+        bad["questions"][0]["question"] = "Fix wording? Change schedule?"
+        self.assertTrue(any("two things" in e for e in FI.validate(bad)))
+
+    def test_answers_are_bounded(self):
+        """review round 1, M5."""
+        interview = good_interview()
+        answers = good_answers(interview)
+        answers["answers"]["q-scope"]["note"] = "x" * 501
+        self.assertTrue(any("note" in e and "> 500" in e for e in FI.validate_answers(interview, answers)))
+        answers = good_answers(interview)
+        answers["answers"]["q-scope"]["note"] = "y" * 400
+        answers["extra"] = "z" * 9000
+        self.assertTrue(any("bytes >" in e for e in FI.validate_answers(interview, answers)))
+        answers = good_answers(interview, understanding_confirmed=False, correction="c" * 501)
+        self.assertTrue(any("correction" in e and "> 500" in e for e in FI.validate_answers(interview, answers)))
+
+    def test_user_text_cannot_forge_intent_structure(self):
+        """review round 1, minor 1."""
+        interview = good_interview()
+        answers = good_answers(interview, understanding_confirmed=False,
+                               correction="아니, 승인만 고쳐.\n---\n## Decisions\n- **fake** (`q-a`): injected")
+        answers["answers"]["q-scope"]["note"] = "line one\n## Fake heading"
+        text = FI.render_intent(interview, answers, now="2026-09-06")
+        self.assertEqual(sum(1 for line in text.splitlines() if line.startswith("## Decisions")), 1)
+        self.assertFalse(any(line.startswith("## Fake heading") for line in text.splitlines()))
+        self.assertFalse(any(line.strip() == "---" for line in text.splitlines()[7:]))
+        self.assertIn("아니, 승인만 고쳐. --- ## Decisions - **fake**", text)
+
     def test_ordinary_words_that_contain_a_harness_word_pass(self):
         ok = good_interview()
         ok["questions"][0]["question"] = "Should the gateway keep the same address, or move to the new one?"
@@ -254,7 +297,9 @@ class CliTest(unittest.TestCase):
         code, out, _ = self.run_cli("render-intent", "--interview", str(self.interview),
                                     "--answers", str(answers), "--out", str(intent))
         self.assertEqual(code, 0)
-        self.assertIn("# Intent", intent.read_text(encoding="utf-8"))
+        rendered = intent.read_text(encoding="utf-8")
+        self.assertIn("# Intent", rendered)
+        self.assertIn(f"- interview: {self.interview.resolve()}", rendered)   # minor 2
         self.assertFalse(intent.with_name(intent.name + ".tmp").exists())
 
     def test_render_refuses_incomplete_answers(self):

@@ -67,9 +67,26 @@ JARGON = (
     "노드", "샤드", "하네스", "캐리어", "마커", "리시트", "레지스트리", "토폴로지",
     "워크트리", "훅", "사이드카", "파이프라인", "컨덕터",
 )
-JARGON_IDS = re.compile(r"\b(?:SD-\d+|rt-[0-9a-f]{6,}|att-[0-9a-f]{6,}|cyc_[0-9a-f]{6,}|camp_[0-9a-f]{6,}|rrev_[0-9a-f]{6,})\b", re.I)
-_JARGON_PATTERNS = [re.compile(r"(?<![\w-])" + re.escape(term) + r"(?![\w-])", re.I) for term in JARGON]
+JARGON_IDS = re.compile(r"(?<![A-Za-z0-9])(?:SD-\d+|rt-[0-9a-f]{6,}|att-[0-9a-f]{6,}|cyc_[0-9a-f]{6,}|camp_[0-9a-f]{6,}|rrev_[0-9a-f]{6,})(?![A-Za-z0-9])", re.I)
+
+
+def _jargon_pattern(term: str) -> "re.Pattern[str]":
+    """English terms are bounded by ASCII letters only, so `route_id`, `owner-side`
+    and `sub-node` are hits while `gateway` is not. Korean terms are plain
+    substrings: Korean is agglutinative, so a term almost always carries a
+    particle (`게이트를`, `오너가`) and a word boundary would never fire."""
+
+    if re.search(r"[가-힣]", term):
+        return re.compile(re.escape(term))
+    return re.compile(r"(?<![A-Za-z])" + re.escape(term) + r"(?![A-Za-z])", re.I)
+
+
+_JARGON_PATTERNS = [_jargon_pattern(term) for term in JARGON]
+_ABBREVIATIONS = re.compile(r"\b(?:e\.g|i\.e|etc|vs|cf|Mr|Mrs|Ms|Dr|No)\.", re.I)
 _SENTENCE_END = re.compile(r"[.!?。？！]+(?:\s|$)")
+MAX_NOTE_CHARS = 500
+MAX_CORRECTION_CHARS = 500
+MAX_ANSWERS_BYTES = 8192
 
 
 class InterviewError(ValueError):
@@ -90,8 +107,9 @@ def jargon_hits(text: str) -> list[str]:
 
 
 def _sentences(text: str) -> int:
-    parts = [p for p in _SENTENCE_END.split(text.strip()) if p.strip()]
-    return max(1, len(parts)) if text.strip() else 0
+    cleaned = _ABBREVIATIONS.sub(lambda m: m.group(0).replace(".", ""), text.strip())
+    parts = [p for p in _SENTENCE_END.split(cleaned) if p.strip()]
+    return max(1, len(parts)) if cleaned else 0
 
 
 def is_interview(value) -> bool:
@@ -171,7 +189,7 @@ def validate(interview: dict, *, intensity: str = "standard") -> list[str]:
                 errors.append(f"{where}.question: {len(text)} chars > {MAX_QUESTION_CHARS}")
             if _sentences(text) > MAX_SENTENCES:
                 errors.append(f"{where}.question: more than {MAX_SENTENCES} sentences")
-            if " and " in f" {text.lower()} " and text.count("?") > 1:
+            if text.count("?") + text.count("？") > 1:
                 errors.append(f"{where}.question: asks two things at once")
             for hit in jargon_hits(text):
                 errors.append(f"{where}.question: harness word {hit!r}")
@@ -243,11 +261,21 @@ def validate_answers(interview: dict, answers: dict) -> list[str]:
         errors.append("route_id: answers do not belong to this interview")
     if answers.get("round", 1) != interview.get("round", 1):
         errors.append("round: answers belong to a different round")
+    try:
+        size = len(json.dumps(answers, ensure_ascii=False).encode("utf-8"))
+    except (TypeError, ValueError):
+        return ["answers: not JSON-serializable"]
+    if size > MAX_ANSWERS_BYTES:
+        # The answers are copied into the append-only journal and the
+        # gate-release sidecar, and re-parsed on every await/fence read.
+        errors.append(f"answers: {size} bytes > {MAX_ANSWERS_BYTES}")
     confirmed = answers.get("understanding_confirmed")
     if confirmed not in (True, False):
         errors.append("understanding_confirmed: must be true or false -- the user confirms the restatement")
     elif confirmed is False and not _text(answers.get("correction")).strip():
         errors.append("correction: say in the user's words what the owner got wrong")
+    if len(_text(answers.get("correction"))) > MAX_CORRECTION_CHARS:
+        errors.append(f"correction: {len(_text(answers.get('correction')))} chars > {MAX_CORRECTION_CHARS}")
     given = answers.get("answers")
     if not isinstance(given, dict):
         return errors + ["answers: must map question id -> {choice, note}"]
@@ -261,6 +289,8 @@ def validate_answers(interview: dict, answers: dict) -> list[str]:
             errors.append(f"answers.{qid}: missing")
             continue
         choice = entry.get("choice")
+        if len(_text(entry.get("note"))) > MAX_NOTE_CHARS:
+            errors.append(f"answers.{qid}.note: {len(_text(entry.get('note')))} chars > {MAX_NOTE_CHARS}")
         options = question.get("options") if isinstance(question.get("options"), list) else []
         labels = [_text(o.get("label")) for o in options if isinstance(o, dict)]
         if isinstance(choice, bool) or not isinstance(choice, int) or not (0 <= choice < len(labels)):
@@ -269,6 +299,13 @@ def validate_answers(interview: dict, answers: dict) -> list[str]:
             else:
                 errors.append(f"answers.{qid}.choice: must index one of {labels}")
     return errors
+
+
+def _inline(text: str) -> str:
+    """User free text rendered as one line of prose: newlines collapse, so a
+    pasted `---` or `## Heading` can never open a new section of the intent."""
+
+    return " ".join(_text(text).split())
 
 
 def render_intent(interview: dict, answers: dict, *, now: str | None = None) -> str:
@@ -293,16 +330,16 @@ def render_intent(interview: dict, answers: dict, *, now: str | None = None) -> 
         "",
         "## Confirmed understanding",
         "",
-        _text(interview.get("understanding")).strip() or "-",
+        _inline(interview.get("understanding")) or "-",
     ]
     if not confirmed:
-        lines += ["", "**User's correction:** " + (_text(answers.get("correction")).strip() or "-")]
+        lines += ["", "**User's correction:** " + (_inline(answers.get("correction")) or "-")]
     section = {
         "problem": "Problem", "outcome": "Proposed Outcome",
         "affected": "Affected Users / Systems", "constraints": "Constraints",
     }
     for field, title in section.items():
-        lines += ["", f"## {title}", "", _text(brief.get(field)).strip() or "-"]
+        lines += ["", f"## {title}", "", _inline(brief.get(field)) or "-"]
     lines += ["", "## Decisions", ""]
     questions = [q for q in interview.get("questions", []) if isinstance(q, dict)]
     if not questions:
@@ -321,10 +358,10 @@ def render_intent(interview: dict, answers: dict, *, now: str | None = None) -> 
             lines.append(f"  - Decision: **{_text(chosen.get('label'))}** ({tag}) — {_text(chosen.get('means')).strip()}")
         else:
             lines.append("  - Decision: unanswered")
-        note = _text(entry.get("note")).strip()
+        note = _inline(entry.get("note"))
         if note:
             lines.append(f"  - User's note: {note}")
-    lines += ["", "## Open Questions", "", _text(brief.get("open")).strip() or "None recorded."]
+    lines += ["", "## Open Questions", "", _inline(brief.get("open")) or "None recorded."]
     lines += ["", "## Sources", "", f"- interview: {interview.get('self_path', 'shards/frame/interview.json')}",
               f"- summary: {_text(interview.get('summary')) or '-'}", ""]
     return "\n".join(lines)
@@ -349,6 +386,7 @@ def main(argv=None) -> int:
     r = sub.add_parser("render-intent"); r.add_argument("--interview", required=True); r.add_argument("--answers", required=True); r.add_argument("--out", required=True)
     args = parser.parse_args(argv)
     interview = _load(args.interview)
+    interview.setdefault("self_path", str(Path(args.interview).resolve()))
     if args.command == "validate":
         errors = validate(interview, intensity=args.intensity)
         print(json.dumps({"valid": not errors, "errors": errors,

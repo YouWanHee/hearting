@@ -469,6 +469,7 @@ def human_gate_resolution(entries: list, gate: str) -> dict:
         "gate": gate, "status": "not-raised", "epoch": 0,
         "raised_at": None, "resolved_at": None, "released_by": None,
         "actor_kind": None, "artifact": None, "delivery": None, "answers": None,
+        "interview": False, "questions": 0,
     }
     for entry in entries:
         if not isinstance(entry, dict):
@@ -482,6 +483,11 @@ def human_gate_resolution(entries: list, gate: str) -> dict:
                 "released_by": None, "actor_kind": None,
                 "artifact": evidence.get("artifact"), "delivery": evidence.get("delivery"),
                 "answers": None,
+                # Recorded at the raise, so a release never has to re-read the
+                # artifact from disk to learn whether answers are owed (review
+                # round 1, B2).
+                "interview": bool(evidence.get("interview")),
+                "questions": int(evidence.get("questions") or 0),
             })
             continue
         if result["status"] != "blocked":

@@ -137,7 +137,11 @@ blocker. `proceed` claims and starts `plan` exactly once; `revise` returns to
 `plan` start whose entry gate is not released is refused by every launch
 surface (`human-gate-unreleased`), and an owner never releases its own gate to
 move on. `direct`/`quick` have no gate: the depth-0 session asks the same kind
-of question inline inside the §0.4 card step (at most 1 / 3). The declared `confirmation.mode` (default `hybrid`) governs whether this
+of question inline inside the §0.4 card step (at most 1 / 3 — a documented
+obligation on the acting session, not a machine-checked cap, since those
+routes carry no gate binding).
+
+The declared `confirmation.mode` (default `hybrid`) governs whether this
 is the sole confirmation point, layers onto the pre-plan notify, or both apply;
 `core/WORKFLOW.md` §0.4 owns the user-facing card.
 

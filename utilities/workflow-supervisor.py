@@ -537,6 +537,13 @@ def cmd_gate(args):
                 raise SupervisorError(f"workflow is {state}, not blocked on a human gate")
             actor_kind = release_actor_kind()
             released_by = resolved_released_by(actor_kind, args.by)
+            if WS.human_gate_resolution(ledger.journal(), args.gate)["interview"]:
+                # The legacy surface has no --answers, and an interview gate
+                # released without them is the guess the interview replaces
+                # (review round 1, M3).
+                raise SupervisorError(
+                    "interview-answers-required: this gate carries an interview; release it "
+                    "with `release --decision proceed --answers <file>` (or revise/stop)")
             ledger.set_workflow_state("RUNNING", evidence={"released_gate": args.gate,
                                                            "released_by": released_by,
                                                            "actor_kind": actor_kind},
@@ -545,7 +552,7 @@ def cmd_gate(args):
                                 released_by=released_by, actor_kind=actor_kind)
             retired = retire_gate_delivery(route, args.gate, args.jobs)
             payload.update({"released_by": released_by, "actor_kind": actor_kind,
-                            "delivery_retired": retired})
+                            "delivery_retired": retired, "route_id": route["route_id"]})
             action = "released"
         else:
             # SD-123 (8)(a): the record and the transition are one transaction.
@@ -567,9 +574,15 @@ def cmd_gate(args):
                 # record. Releasing then acked only the newest, leaving the older
                 # one pending forever — the sweep would announce a closed gate on
                 # every prompt, the exact symptom the release-time retirement
-                # exists to remove. Converge on the raise already made.
+                # exists to remove. Converge on the raise already made, and hand
+                # back the same payload a first raise gets (review round 1, minor 7).
+                current = WS.human_gate_resolution(ledger.journal(), args.gate)
                 payload.update(existing_gate_delivery(route, args.gate, args.jobs))
                 payload.update({"action": "blocked",
+                                "interview": current["interview"],
+                                "questions": current["questions"],
+                                "artifact": current["artifact"],
+                                "await_command": await_release_command(args.route, args.gate),
                                 "workflow_state": ledger.state()["workflow_state"]})
                 print(json.dumps(payload, sort_keys=True))
                 return 0
@@ -583,6 +596,11 @@ def cmd_gate(args):
                 )
             jobs_path = Path(args.jobs) if args.jobs else default_jobs_path()
             epoch = gate_raise_epoch(ledger, args.gate)
+            # The raise happens in the owner's cwd and the release in the
+            # depth-0 session's; a relative artifact path would name two files
+            # (review round 1, B2). Seal the absolute path in the record and
+            # the journal.
+            args.artifact = str(Path(str(args.artifact)).expanduser().resolve(strict=False))
             interview = load_interview_artifact(args.artifact)
             if interview is not None:
                 # SD-129: an interview is refused BEFORE it reaches a person when
@@ -1194,22 +1212,34 @@ def load_interview_artifact(artifact):
 def release_answers(ledger, gate, decision, answers_path):
     """The validated answers this release records, or None.
 
+    Whether answers are owed is decided by what the RAISE recorded in the
+    journal (`interview`, `questions`), never by re-reading the artifact at
+    release time (review round 1, B2: a relative path, a moved file or a
+    rewritten round-2 interview each let `proceed` through without answers).
     An interview gate released `proceed` without answers is refused: the
     questions were the point, and a plan written without the answers is the
     guess the interview exists to replace. `revise`/`stop` may carry answers or
-    not. Answers offered for a gate whose artifact is not an interview are
-    refused rather than dropped silently."""
+    not. Answers offered for a gate whose raise was not an interview are
+    refused rather than dropped silently. Validating the answers still needs
+    the interview text; when it cannot be read the release is refused, not
+    waved through."""
     resolution = WS.human_gate_resolution(ledger.journal(), gate)
-    interview = load_interview_artifact(resolution.get("artifact"))
+    is_interview = bool(resolution.get("interview"))
     if answers_path is None:
-        if interview is not None and decision == "proceed":
+        if is_interview and decision == "proceed":
             raise SupervisorError(
                 "interview-answers-required: this gate carries "
-                f"{len(interview.get('questions') or [])} question(s); record the user's "
+                f"{resolution.get('questions') or 0} question(s); record the user's "
                 "answers with --answers <file> (template: frame_interview.py answers-template)")
         return None
+    if not is_interview:
+        raise SupervisorError("interview-absent: --answers given but this gate was not raised with an interview")
+    interview = load_interview_artifact(resolution.get("artifact"))
     if interview is None:
-        raise SupervisorError("interview-absent: --answers given but the gate artifact is not an interview")
+        raise SupervisorError(
+            f"interview-artifact-unreadable: the raise named {resolution.get('artifact')!r} as its "
+            "interview and it is no longer a readable interview file; restore it or release with "
+            "revise/stop")
     try:
         answers = json.loads(Path(answers_path).read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
@@ -1257,6 +1287,9 @@ def cmd_await_release(args):
         resolution = WS.human_gate_resolution(ledger.journal(), args.gate)
         status = resolution["status"]
         if status == "not-raised":
+            print(json.dumps({"route_id": route["route_id"], "gate": args.gate,
+                              "status": "not-raised", "reason": "gate-never-raised"},
+                             sort_keys=True))
             raise SupervisorError(
                 f"gate-never-raised: {args.gate!r} has no BLOCKED_HUMAN_GATE entry; "
                 "raise it with `gate --block --artifact <path>` first"

@@ -2559,6 +2559,31 @@ class DispatchContractTest(unittest.TestCase):
       "decision":"proceed","released_by":"user"},actor="release")
     self._fence_start(base,path)
 
+ def test_a_binding_no_node_raises_is_not_fenced(self):
+  """review round 1, B1: `intent-confirmation`, `direction-confirmation`,
+  `preview-disposition`, `explicit-handback` are bound at entry in the topology
+  but no node's continuation raises them -- the §0.4 card satisfies them, and
+  no command in the harness could release them. Only a gate that some node
+  raises (`continuation.kind == human-gate`) is fenced."""
+  with tempfile.TemporaryDirectory() as td:
+   base=Path(td); route,path=self._gated_route(base)
+   route["human_gates"]=["intent-confirmation","frame-review"]
+   route["human_gate_bindings"]=[{"gate":"intent-confirmation","node":"frame","position":"entry"},
+                                 {"gate":"frame-review","node":"plan","position":"entry"}]
+   path.write_text(json.dumps(route),encoding="utf-8")
+   with mock.patch.dict(os.environ,{"AGENT_WORKFLOW_ROOT":str(base/"workflow")}):
+    self._fence_start(base,path,node="frame")      # bound, never raised, not fenced
+    with self.assertRaises(D.DispatchContractError) as caught:
+     self._fence_start(base,path)                  # frame raises frame-review: fenced
+    self.assertEqual(caught.exception.reason,"human-gate-not-raised")
+    self.assertIn("ledger",caught.exception.detail)
+    self.assertIn(route["route_id"],caught.exception.detail)
+   # the same binding on a route whose frame does NOT continue into the gate
+   route["nodes"][0]["continuation"]={"kind":"inline-next"}
+   path.write_text(json.dumps(route),encoding="utf-8")
+   with mock.patch.dict(os.environ,{"AGENT_WORKFLOW_ROOT":str(base/"workflow")}):
+    self._fence_start(base,path)
+
  def test_a_route_without_bindings_is_not_fenced(self):
   with tempfile.TemporaryDirectory() as td:
    base=Path(td); route,path=self._gated_route(base)

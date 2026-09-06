@@ -1386,6 +1386,8 @@ class GateCarrierTest(unittest.TestCase):
         )
 
     def _gate_record(self, *, delivery_id="delivery-gate-0001", state=None):
+        rewake._PROBE_DIRECTORY_MTIME.clear()
+        rewake._RECIPIENT_KEY_CACHE.clear()
         receipt = {
             "schema_version": 2, "state": "attention",
             "parent_attempt_id": "att-gate-owner", "job_registry": str(self.jobs),
@@ -1539,7 +1541,62 @@ class GateCarrierTest(unittest.TestCase):
         # the terminal wake still folds every open gate for the recipient in
         self.assertEqual(len(rewake._gate_notices(self._launch())), 1)
 
-    def test_main_wakes_once_on_the_gate_and_leaves_the_record_acked(self):
+    def test_the_probe_ignores_a_record_whose_reclaim_budget_is_spent(self):
+        """review round 1, B3: an unclaimable record must not keep the probe
+        returning True forever."""
+        delivery_id = self._gate_record()
+        for _ in range(rewake.pending_delivery.RECLAIM_LIMIT):
+            rewake.pending_delivery.claim(self.state, "session-gate", delivery_id,
+                                          claim_owner="x", lease_seconds=0.001)
+            rewake.pending_delivery.reclaim(self.state, "session-gate", delivery_id,
+                                            now_ns=time.monotonic_ns() + 10**12)
+        record = rewake.pending_delivery.read(self.state, "session-gate", delivery_id)
+        self.assertGreaterEqual(record["attempts"], rewake.pending_delivery.RECLAIM_LIMIT)
+        rewake._PROBE_DIRECTORY_MTIME.clear()
+        self.assertFalse(rewake._open_gate_pending(self._launch()))
+
+    def test_an_unannounced_probe_sleeps_and_the_wait_stays_bounded(self):
+        """review round 1, B3: when the probe fires but nothing can be announced the
+        loop sleeps one interval, and the overall deadline is the caller's."""
+        self._gate_record()
+        payload = {
+            "hook_event_name": "PostToolUse", "tool_name": "Bash",
+            "session_id": "session-gate",
+            "tool_input": {"command": "python3 utilities/dispatch-owner.py --start --slug owner"},
+            "tool_response": {"stdout": "\n".join((
+                "check=ok", "status=start", "dispatch_depth=1", "worker_type=owner",
+                "parent_completion_delivery=claude-parent-runtime",
+                "parent_session_id=session-gate", f"job_registry={self.jobs}",
+                "attempt_id=att-gate-owner", "registered=1", "started=1")), "stderr": ""},
+        }
+        (self.root / "utilities").mkdir()
+        (self.root / "utilities" / "dispatch-attempt-ready.py").write_text("", encoding="utf-8")
+        pending = subprocess.CompletedProcess([], 2, stdout="pending")
+        clock = {"t": 0.0}
+
+        def monotonic():
+            clock["t"] += 1.0
+            return clock["t"]
+
+        with mock.patch.object(rewake.subprocess, "run", return_value=pending) as run, \
+                mock.patch.object(rewake, "_open_gate_pending", return_value=True), \
+                mock.patch.object(rewake, "_gate_notices", return_value=[]), \
+                mock.patch.object(rewake, "agent_home", return_value=self.root), \
+                mock.patch.object(rewake.time, "monotonic", side_effect=monotonic), \
+                mock.patch.object(rewake.time, "sleep") as sleep, \
+                mock.patch.dict(os.environ, {"AGENT_CLAUDE_REWAKE_INTERVAL_SECONDS": "1",
+                                             "AGENT_CLAUDE_REWAKE_MAX_SECONDS": "6"}), \
+                mock.patch.object(sys, "stdin", io.StringIO(json.dumps(payload))), \
+                mock.patch.object(sys, "stdout", io.StringIO()), \
+                mock.patch.object(sys, "stderr", io.StringIO()):
+            code = rewake.main()
+        self.assertEqual(code, 0)              # timeout: a non-terminal bridge state
+        # one sleep per empty announce; the last probe hits the deadline and
+        # returns timeout without sleeping
+        self.assertEqual(sleep.call_count, run.call_count - 1)
+        self.assertLessEqual(run.call_count, 8)              # bounded by the deadline
+
+    def test_main_wakes_once_on_the_gate_and_leaves_the_record_for_the_sweep(self):
         delivery_id = self._gate_record()
         payload = {
             "hook_event_name": "PostToolUse", "tool_name": "Bash",
@@ -1569,9 +1626,19 @@ class GateCarrierTest(unittest.TestCase):
         self.assertIn("await-release", text)
         self.assertIn("AskUserQuestion", text)
         self.assertNotIn("harvest --jobs", text)
+        # review round 1, M6: the in-wait wake is speculative, so the record is
+        # left `sent-ambiguous` -- the next-prompt sweep can still deliver it if
+        # this wake was lost, and the release retires it either way.
         record = rewake.pending_delivery.read(self.state, "session-gate", delivery_id)
-        self.assertEqual(record["state"], "acked")
-        self.assertTrue(record["acked_by"].startswith("async-rewake:session-gate"))
+        self.assertEqual(record["state"], "sent-ambiguous")
+        self.assertTrue(record["claim_owner"].startswith("claude-async-rewake-gate:"))
+        rewake._PROBE_DIRECTORY_MTIME.clear()
+        self.assertFalse(rewake._open_gate_pending(self._launch()))   # lease still live
+        # the terminal wake still acks
+        from dispatch_session_sweep import sweep_deliver
+        records, _n = sweep_deliver(self.state, "claude-parent-runtime", "session-gate",
+                                    now_ns=time.monotonic_ns() + 10**12)
+        self.assertEqual([r["delivery_id"] for r in records], [delivery_id])
 
     def test_a_probe_raced_by_the_sweep_resumes_waiting_for_the_terminal(self):
         delivery_id = self._gate_record()
@@ -1692,7 +1759,7 @@ class ReleaseRearmTest(unittest.TestCase):
         command = (f"python3 utilities/workflow-supervisor.py gate --route {self.route} "
                    f"--gate frame-review --release --jobs {self.jobs}")
         stdout = json.dumps({"gate": "frame-review", "action": "released",
-                             "released_by": "user"})
+                             "released_by": "user", "route_id": "rt-gate"})
         launch = rewake.release_launch(self.payload(command=command, stdout=stdout))
         self.assertIsNotNone(launch)
         self.assertEqual(launch.attempt_id, "att-gate-owner")
@@ -1700,6 +1767,33 @@ class ReleaseRearmTest(unittest.TestCase):
     def test_a_failed_release_arms_nothing(self):
         stdout = "workflow-supervisor: workflow is RUNNING, not blocked on a human gate"
         self.assertIsNone(rewake.release_launch(self.payload(stdout=stdout)))
+        # review round 1, M1: a literal --route path is not a fallback -- every
+        # refused release names one too
+        literal = (f"python3 utilities/workflow-supervisor.py release --route {self.route} "
+                   f"--gate frame-review --decision proceed --jobs {self.jobs}")
+        self.assertIsNone(rewake.release_launch(self.payload(command=literal, stdout=stdout)))
+        self.assertIsNone(rewake.release_launch(self.payload(command=literal, stdout="")))
+        # and a refused release emits no not-armed notice either (its stderr told the story)
+        with mock.patch.object(sys, "stdout", io.StringIO()) as out:
+            self.assertEqual(rewake.release_no_arm_notice(self.payload(command=literal, stdout=stdout)), 0)
+        self.assertEqual(out.getvalue(), "")
+
+    def test_a_registered_but_never_started_owner_never_arms(self):
+        """review round 1, M2: the row the fence leaves behind (registered, refused
+        at start) must not arm a six-hour wait on nothing."""
+        lines = self.jobs.read_text(encoding="utf-8").replace("launch_started=1", "launch_started=0")
+        self.jobs.write_text(lines, encoding="utf-8")
+        self.assertIsNone(rewake.release_launch(self.payload()))
+
+    def test_a_proven_release_that_arms_nothing_says_so_once(self):
+        self.write_rows([("att-gate-owner", "done", "session-gate", "rt-gate")])
+        with mock.patch.object(sys, "stdout", io.StringIO()) as out, \
+                mock.patch.object(sys, "stdin", io.StringIO(json.dumps(self.payload()))), \
+                mock.patch.object(sys, "stderr", io.StringIO()):
+            code = rewake.main()
+        self.assertEqual(code, 0)
+        rendered = json.loads(out.getvalue())
+        self.assertIn("state=not-armed surface=release", rendered["systemMessage"])
 
     def test_no_open_owner_or_an_ambiguous_set_arms_nothing(self):
         self.write_rows([("att-gate-owner", "done", "session-gate", "rt-gate")])

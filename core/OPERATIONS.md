@@ -434,16 +434,23 @@ decision, never two independently toggled ones.
   hook waits on an open owner attempt it also watches, once per interval, for
   a pending gate record addressed to this session and raised by that attempt;
   when one appears the hook spends its single wake immediately (exit 2,
-  `owner=alive-waiting`), acks the record, and tells the session to put the
-  `[방향 확인]` card and interview questions to the user and record the answer
-  with `workflow-supervisor.py release`. That release command — the typed
-  `release` or legacy `gate --release` surface, run in the same session — is
-  the second arming event: from its `route_id` and the registry's one open
-  depth-1 owner bound to this session, a new hook process waits on the owner's
-  completion exactly as the start did. A release with no open owner (the owner
-  ended at the gate), a failed release, or an ambiguous owner set arms nothing;
-  the `UserPromptSubmit` sweep still delivers the pending record at the next
-  prompt. The owner itself waits on `workflow-supervisor.py await-release`
+  `owner=alive-waiting`), leaves the record `sent-ambiguous` (the wake is
+  speculative, so the next-prompt sweep can still re-deliver it once if the
+  wake was lost; the release retires it either way), and tells the session to
+  put the `[방향 확인]` card and interview questions to the user and record
+  the answer with `workflow-supervisor.py release`. That release command — the
+  typed `release` or legacy `gate --release` surface, run in the same session
+  — is the second arming event: from the `route_id` in its JSON output (never
+  from the `--route` literal, which a refused release names too) and the
+  registry's one started open depth-1 owner bound to this session, a new hook
+  process waits on the owner's completion exactly as the start did. A refused
+  release arms nothing silently; a recorded release with no started open owner
+  (the owner ended at the gate, or was refused at start) or an ambiguous owner
+  set arms nothing and emits one typed `not-armed surface=release` notice; the
+  `UserPromptSubmit` sweep still delivers the pending record at the next
+  prompt. While waiting, an announced-but-unclaimable gate record never spins
+  the hook: the probe skips records whose reclaim budget is spent and sleeps
+  one interval after an empty announce, under the same overall deadline. The owner itself waits on `workflow-supervisor.py await-release`
   (bounded, read-only), and every launch surface refuses to start a node whose
   entry gate is not released (`human-gate-unreleased`/`human-gate-not-raised`).
 - The interactive Claude `asyncRewake` bridge recognizes both an exact

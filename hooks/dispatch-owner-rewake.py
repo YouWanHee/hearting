@@ -374,11 +374,7 @@ def _registry_start_candidates(
     return command, session, jobs, candidates
 
 
-RELEASE_OWNER_ROW = {
-    "worker_type": "owner",
-    "dispatch_depth": "1",
-    "parent_completion_delivery": "claude-parent-runtime",
-}
+RELEASE_OWNER_ROW = dict(REGISTRY_OWNER_START)  # the same row shape the start path arms on
 
 
 def _release_command(command: str) -> tuple[str, str | None] | None:
@@ -422,9 +418,13 @@ def release_launch(payload: object) -> Launch | None:
     is the second arming event: the release output names the `route_id`, the
     registry names that route's one open depth-1 owner bound to this session,
     and the new hook process waits on it exactly as the start did. A failed
-    release (no JSON payload), a route with no open owner (the owner ended at
-    the gate -- contract (c)), or an ambiguous set of owner rows arms nothing;
-    the SD-111 sweep still delivers the completion at the next prompt.
+    release (no JSON payload naming the route -- review round 1, M1: the
+    `--route` literal is deliberately NOT a fallback, because every refused
+    release names one too), a route with no started open owner (the owner
+    ended at the gate -- contract (c); or a row that was registered and
+    refused at start), or an ambiguous set of owner rows arms nothing and
+    says so once (`release_no_arm_notice`); the SD-111 sweep still delivers
+    the completion at the next prompt.
     """
 
     if not isinstance(payload, dict):
@@ -456,11 +456,6 @@ def release_launch(payload: object) -> Launch | None:
             value = rendered.get("route_id")
             route_id = value if isinstance(value, str) and value else None
         break
-    if route_id is None and route_literal:
-        try:
-            route_id = json.loads(Path(route_literal).read_text(encoding="utf-8")).get("route_id")
-        except (OSError, ValueError, AttributeError):
-            route_id = None
     if not isinstance(route_id, str) or not route_id:
         return None
     jobs = (
@@ -497,6 +492,33 @@ def release_launch(payload: object) -> Launch | None:
     return Launch(attempt_id=candidates[0], jobs=jobs, session_id=session, armed="release")
 
 
+def release_no_arm_notice(payload: object) -> int:
+    """One typed exit-0 notice when a proven release armed nothing (review round
+    1, M2): the session was told the release re-arms the wait, so a silent
+    non-arm would be the lost wake SD-111 exists to prevent. A refused release
+    (no JSON payload) stays silent -- its own stderr already told the story."""
+
+    if not isinstance(payload, dict):
+        return 0
+    tool_input = payload.get("tool_input")
+    command = tool_input.get("command") if isinstance(tool_input, dict) else None
+    if not isinstance(command, str) or _release_command(command) is None:
+        return 0
+    stdout = _stdout(payload.get("tool_response"))
+    if not any(line.strip().startswith("{") and '"route_id"' in line for line in stdout.splitlines()):
+        return 0
+    message = (
+        "[dispatch-owner-rewake] schema=2 state=not-armed surface=release — this release recorded, "
+        "but no single started open depth-1 owner of that route is bound to this session, so the "
+        "owner's completion will not wake this session from this command. If the owner is still "
+        "running, its completion arrives through the UserPromptSubmit sweep at your next prompt; "
+        "if it ended at the gate, continue the route with a continuation owner. Do not start "
+        "Monitor, dispatch-wait, or a polling loop."
+    )
+    print(json.dumps({"systemMessage": message}, ensure_ascii=False, separators=(",", ":")))
+    return 0
+
+
 def agent_home() -> Path:
     return _resolve_agent_home()
 
@@ -510,7 +532,7 @@ def _bounded_number(name: str, default: int, minimum: int, maximum: int) -> int:
 
 
 def wait_for_attempt(
-    launch: Launch, readiness: Path, *, gate_probe: Any = None
+    launch: Launch, readiness: Path, *, gate_probe: Any = None, deadline: float | None = None
 ) -> tuple[str, str]:
     """Poll the exact attempt to terminal quiescence.
 
@@ -529,7 +551,11 @@ def wait_for_attempt(
     maximum = _bounded_number(
         "AGENT_CLAUDE_REWAKE_MAX_SECONDS", DEFAULT_MAX_SECONDS, interval, 86_400
     )
-    deadline = time.monotonic() + maximum
+    # The deadline is the caller's when it re-enters after a gate probe (review
+    # round 1, B3): recomputing it here on every re-entry made the bound
+    # unreachable.
+    if deadline is None:
+        deadline = time.monotonic() + maximum
     command = [
         sys.executable,
         str(readiness),
@@ -556,10 +582,10 @@ def wait_for_attempt(
             return "attention", "terminal-failure-or-unclosed"
         if result.returncode != 2:
             return "bridge-error", f"readiness-exit-{result.returncode}"
-        if gate_probe is not None and gate_probe():
-            return "gate", "human-gate-open"
         if time.monotonic() >= deadline:
             return "timeout", f"owner-not-quiescent-after-{maximum}s"
+        if gate_probe is not None and gate_probe():
+            return "gate", "human-gate-open"
         time.sleep(interval)
 
 
@@ -839,15 +865,34 @@ def _carrier_one_claim(launch: Launch, metadata: dict[str, str]) -> ClaimWin | N
     return ClaimWin(claim_owner, recipient_key, delivery_id, root)
 
 
+_RECIPIENT_KEY_CACHE: dict[tuple[str, str], str] = {}
+
+
+def _recipient_key(launch: Launch) -> str:
+    """The owner row's `parent_sid`, read from the registry once per hook
+    process: the row's recipient never changes, and re-reading `jobs.log` every
+    interval for the owner's whole life was the per-interval cost review round
+    1 (minor 9) measured."""
+
+    key = (str(launch.jobs), launch.attempt_id)
+    cached = _RECIPIENT_KEY_CACHE.get(key)
+    if cached:
+        return cached
+    try:
+        row = current_attempt_row(launch.jobs, launch.attempt_id)
+    except (JoinContractError, OSError):
+        return ""
+    recipient_key = row.metadata.get("parent_sid", "") if row is not None else ""
+    if recipient_key:
+        _RECIPIENT_KEY_CACHE[key] = recipient_key
+    return recipient_key
+
+
 def _recipient_gate_records(launch: Launch) -> list[tuple[Path, str, str, dict]]:
     """Every open gate record addressed to this launch's depth-0 session:
     `(root, recipient_key, delivery_id, record)`; empty on any refusal."""
 
-    try:
-        row = current_attempt_row(launch.jobs, launch.attempt_id)
-    except (JoinContractError, OSError):
-        return []
-    recipient_key = row.metadata.get("parent_sid", "") if row is not None else ""
+    recipient_key = _recipient_key(launch)
     if not recipient_key:
         return []
     root = launch.jobs.resolve(strict=False).parent
@@ -871,14 +916,39 @@ def _recipient_gate_records(launch: Launch) -> list[tuple[Path, str, str, dict]]
     return found
 
 
+_PROBE_DIRECTORY_MTIME: dict[str, float] = {}
+
+
 def _open_gate_pending(launch: Launch) -> bool:
     """SD-129 probe for `wait_for_attempt`: is a gate record for THIS attempt
-    waiting for a carrier? `pending`, or a lease another carrier let expire.
-    A live claim by the sweep is left alone -- it acks within its own turn."""
+    waiting for a carrier? `pending`, or a lease another carrier let expire,
+    and still claimable (`attempts` below `RECLAIM_LIMIT`; a record whose
+    reclaim budget is spent is left to the release-time retirement, so the
+    hook never spins on something it can never claim -- review round 1, B3).
+    A live claim by the sweep is left alone -- it acks within its own turn.
 
+    The recipient directory is only scanned when its mtime moved since the
+    last probe: a record being created, claimed or acked rewrites a file in it.
+    """
+
+    recipient_key = _recipient_key(launch)
+    if not recipient_key:
+        return False
+    root = launch.jobs.resolve(strict=False).parent
+    try:
+        directory = pending_delivery.record_directory(root, recipient_key)
+        mtime = directory.stat().st_mtime
+    except (pending_delivery.PendingDeliveryError, OSError):
+        return False
+    key = str(directory)
+    if _PROBE_DIRECTORY_MTIME.get(key) == mtime:
+        return False
+    _PROBE_DIRECTORY_MTIME[key] = mtime
     now = time.monotonic_ns()
-    for _root, _recipient_key, _delivery_id, record in _recipient_gate_records(launch):
+    for _root, _key, _delivery_id, record in _recipient_gate_records(launch):
         if launch.attempt_id not in (record.get("attempt_ids") or []):
+            continue
+        if (record.get("attempts") or 0) >= pending_delivery.RECLAIM_LIMIT:
             continue
         state = record.get("state")
         if state == "pending":
@@ -888,7 +958,7 @@ def _open_gate_pending(launch: Launch) -> bool:
     return False
 
 
-def _gate_notices(launch: Launch, *, attempt_only: bool = False) -> list[str]:
+def _gate_notices(launch: Launch, *, attempt_only: bool = False, settle: str = "ack") -> list[str]:
     """SD-123 (8)(b) carrier 1: fold every open gate record for this recipient
     into the wake this hook is about to emit.
 
@@ -898,6 +968,14 @@ def _gate_notices(launch: Launch, *, attempt_only: bool = False) -> list[str]:
     it announces only the gate this owner raised -- a parallel owner's gate is
     that owner's hook's wake, and spending this process's single wake on it
     would lose this attempt's completion notice.
+
+    `settle` is how the announced record is left. The terminal wake acks
+    (A59-3: a gate folded into a terminal receipt is not re-announced). The
+    in-wait wake passes `sent-ambiguous` (review round 1, M6): whether an
+    exit-2 wake reaches the session is unmeasured (SD-OPEN-29/32), and an
+    acked record would have spent the sweep fallback the contract still
+    requires. The cost is bounded at-least-once: if the person has not
+    released by the next prompt the sweep shows the same gate once more.
 
     Each record is claimed and then acked -- not left `sent-ambiguous`. A gate
     record is a pointer; the gate itself is durable in the workflow ledger, so
@@ -937,9 +1015,14 @@ def _gate_notices(launch: Launch, *, attempt_only: bool = False) -> list[str]:
             continue
         notices.append(_bounded_receipt_text(record))
         try:
-            pending_delivery.ack(
-                root, recipient_key, delivery_id, acked_by=f"async-rewake:{launch.session_id}"
-            )
+            if settle == "sent-ambiguous":
+                pending_delivery.mark_sent_ambiguous(
+                    root, recipient_key, delivery_id, claim_owner=claim_owner
+                )
+            else:
+                pending_delivery.ack(
+                    root, recipient_key, delivery_id, acked_by=f"async-rewake:{launch.session_id}"
+                )
         except pending_delivery.PendingDeliveryError:
             pass
     return notices
@@ -1015,7 +1098,7 @@ def main() -> int:
         return 0
     launch = parse_launch(payload) or registry_launch(payload) or release_launch(payload)
     if launch is None:
-        return no_arm_notice(payload)
+        return no_arm_notice(payload) or release_no_arm_notice(payload)
     root = agent_home()
     readiness = root / "utilities" / "dispatch-attempt-ready.py"
     if not readiness.is_file():
@@ -1023,19 +1106,29 @@ def main() -> int:
             launch, "bridge-error", "readiness-helper-missing", root
         )
     else:
+        interval = _bounded_number(
+            "AGENT_CLAUDE_REWAKE_INTERVAL_SECONDS", DEFAULT_INTERVAL_SECONDS, 1, 300
+        )
+        maximum = _bounded_number(
+            "AGENT_CLAUDE_REWAKE_MAX_SECONDS", DEFAULT_MAX_SECONDS, interval, 86_400
+        )
+        deadline = time.monotonic() + maximum
         while True:
             wait_state, wait_reason = wait_for_attempt(
-                launch, readiness, gate_probe=lambda: _open_gate_pending(launch)
+                launch, readiness, gate_probe=lambda: _open_gate_pending(launch),
+                deadline=deadline,
             )
             if wait_state != "gate":
                 break
             # SD-129: the owner is alive at its gate. Wake the person now with
             # this process's one wake; the release command re-arms the wait
             # (`release_launch`). A probe that another carrier beat to the
-            # record (nothing left to announce) simply resumes waiting.
-            notices = _gate_notices(launch, attempt_only=True)
+            # record (nothing left to announce) sleeps one interval and resumes
+            # waiting -- never a tight loop (review round 1, B3).
+            notices = _gate_notices(launch, attempt_only=True, settle="sent-ambiguous")
             if notices:
                 return emit_receipt("attention", gate_wake_message(launch, notices), block=False)
+            time.sleep(interval)
         state, message = classified_receipt(launch, wait_state, wait_reason, root)
     # SD-123 (8)(b): an open gate rides this same wake. It also forces the
     # attention state -- a route whose next step is a human decision has not

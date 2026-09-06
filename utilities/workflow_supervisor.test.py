@@ -1676,10 +1676,11 @@ class TestGateSubjectNotCaller(WorkflowFixture):
         self.assertIn("await-release", payload["await_command"])
         self.assertIn("--gate frame-review", payload["await_command"])
         last = SUP.ledger_for(route).journal()[-1]
-        self.assertEqual(last["evidence"]["artifact"], "shards/frame/interview.json")
+        absolute = str(Path("shards/frame/interview.json").resolve())
+        self.assertEqual(last["evidence"]["artifact"], absolute)   # sealed absolute (B2)
         resolution = WS.human_gate_resolution(SUP.ledger_for(route).journal(), "frame-review")
         self.assertEqual(resolution["status"], "blocked")
-        self.assertEqual(resolution["artifact"], "shards/frame/interview.json")
+        self.assertEqual(resolution["artifact"], absolute)
         self.assertEqual(resolution["epoch"], 1)
 
     def test_await_release_never_raised_is_a_typed_error(self):
@@ -1700,7 +1701,7 @@ class TestGateSubjectNotCaller(WorkflowFixture):
         self.assertEqual(code, 2)
         self.assertEqual(payload["status"], "blocked")
         self.assertEqual(payload["workflow_state"], "BLOCKED_HUMAN_GATE")
-        self.assertEqual(payload["artifact"], "shards/frame/interview.json")
+        self.assertEqual(payload["artifact"], str(Path("shards/frame/interview.json").resolve()))
 
     def test_await_release_returns_the_persons_decision(self):
         for decision, expected in (("proceed", 0), ("revise", 3), ("stop", 4)):
@@ -1920,6 +1921,68 @@ class TestGateSubjectNotCaller(WorkflowFixture):
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(buf.getvalue())["answers_file"], str(out))
         self.assertEqual(json.loads(out.read_text("utf-8"))["answers"]["q-scope"]["choice"], 1)
+
+    def test_a_relative_interview_path_is_sealed_absolute_and_answers_stay_required(self):
+        """review round 1, B2: the raise runs in the owner's cwd, the release in the
+        depth-0 session's; whether answers are owed comes from the journal."""
+        route, path = self.two_stage_route(
+            human_gate="frame-review",
+            continuation={"kind": "human-gate", "gate": "frame-review"})
+        jobs, _session, _attempt = self.owner_registry()
+        interview, value = self._interview()
+        previous = os.getcwd()
+        os.chdir(self.base)
+        try:
+            code, payload = self._block_with(path, jobs, "shards/frame/interview.json")
+        finally:
+            os.chdir(previous)
+        self.assertEqual(code, 0)
+        self.assertEqual(SUP.ledger_for(route).journal()[-1]["evidence"]["artifact"], str(interview))
+        elsewhere = self.base / "elsewhere"; elsewhere.mkdir()
+        os.chdir(elsewhere)
+        try:
+            with self.assertRaisesRegex(SUP.SupervisorError, "interview-answers-required"):
+                SUP.main(["release", "--route", str(path), "--gate", "frame-review",
+                          "--decision", "proceed", "--jobs", str(jobs)])
+            # and a raise whose interview vanished before the release is refused, not waved through
+            answers_path, _answers = self._answers(value)
+            interview.unlink()
+            with self.assertRaisesRegex(SUP.SupervisorError, "interview-artifact-unreadable"):
+                SUP.main(["release", "--route", str(path), "--gate", "frame-review",
+                          "--decision", "proceed", "--jobs", str(jobs), "--answers", str(answers_path)])
+            with self.assertRaisesRegex(SUP.SupervisorError, "interview-answers-required"):
+                SUP.main(["release", "--route", str(path), "--gate", "frame-review",
+                          "--decision", "proceed", "--jobs", str(jobs)])
+        finally:
+            os.chdir(previous)
+        self.assertEqual(SUP.ledger_for(route).read_only_state()["workflow_state"], "BLOCKED_HUMAN_GATE")
+
+    def test_legacy_gate_release_refuses_an_interview_gate(self):
+        """review round 1, M3."""
+        _route, path = self.two_stage_route(
+            human_gate="frame-review",
+            continuation={"kind": "human-gate", "gate": "frame-review"})
+        jobs, _session, _attempt = self.owner_registry()
+        interview, _value = self._interview()
+        self._block_with(path, jobs, interview)
+        with self.assertRaisesRegex(SUP.SupervisorError, "interview-answers-required"):
+            SUP.main(["gate", "--route", str(path), "--gate", "frame-review", "--release",
+                      "--jobs", str(jobs)])
+
+    def test_a_repeated_block_returns_the_full_payload(self):
+        """review round 1, minor 7."""
+        _route, path = self.two_stage_route(
+            human_gate="frame-review",
+            continuation={"kind": "human-gate", "gate": "frame-review"})
+        jobs, _session, _attempt = self.owner_registry()
+        interview, _value = self._interview()
+        self._block_with(path, jobs, interview)
+        code, payload = self._block_with(path, jobs, interview)
+        self.assertEqual(code, 0)
+        self.assertFalse(payload["delivery_created"])
+        self.assertTrue(payload["interview"])
+        self.assertEqual(payload["questions"], 1)
+        self.assertIn("await-release", payload["await_command"])
 
     def test_answers_for_a_summary_gate_are_refused_not_dropped(self):
         _route, path = self.two_stage_route(

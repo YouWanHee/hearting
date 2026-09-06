@@ -130,9 +130,11 @@ never retro-fitted; do not attempt to apply this gate to an already-open route.
    corrected your understanding (`status: agreed-with-correction`), fold the
    correction into the plan prompt verbatim. If the answers open a genuinely
    new decision, you may raise the gate once more with a round-2 interview
-   (`round: 2`, same caps); never a third time — remaining doubts go to the
-   plan's risk section.
-4. `confirmation.mode` (`profiles/dispatch-defaults.yaml` /
+   (`round: 2`, same caps). A third interview raise is refused by the
+   validator (`round` ≤ 2); remaining doubts go to the plan's risk section,
+   and a third raise, if a route ever needs one, carries the frame summary
+   alone.
+5. `confirmation.mode` (`profiles/dispatch-defaults.yaml` /
    `utilities/dispatch-defaults.py`, default `hybrid`) governs whether this
    post-frame gate is the sole confirmation point (`post-frame-only`), layers
    onto the existing pre-plan notify (`hybrid`), or both are always explicit

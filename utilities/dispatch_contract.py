@@ -4446,10 +4446,24 @@ def _human_gate_entry_fence(route: dict, node: dict) -> None:
     their own gate. `revise` and `stop` leave the gate unreleased too.
     """
 
+    # Only a gate some node of this route actually RAISES is fenced: the
+    # SD-123 mechanism is `predecessor.continuation = {kind: human-gate, gate}`
+    # -> BLOCKED_HUMAN_GATE -> release. Bindings with no raising continuation
+    # (`intent-confirmation`, `direction-confirmation`, `preview-disposition`,
+    # `explicit-handback`, ...) are satisfied by the §0.4 card and no command in
+    # the harness raises or releases them -- fencing those refused every
+    # standard+ autopilot-spec route at its first node (review round 1, B1).
+    raised_gates = {
+        str((n.get("continuation") or {}).get("gate"))
+        for n in (route.get("nodes") or [])
+        if isinstance(n, dict) and (n.get("continuation") or {}).get("kind") == "human-gate"
+        and (n.get("continuation") or {}).get("gate")
+    }
     bindings = [
         row for row in (route.get("human_gate_bindings") or [])
         if isinstance(row, dict) and row.get("node") == node.get("id")
         and (row.get("position") or "entry") == "entry" and row.get("gate")
+        and str(row.get("gate")) in raised_gates
     ]
     if not bindings:
         return
@@ -4457,6 +4471,7 @@ def _human_gate_entry_fence(route: dict, node: dict) -> None:
 
     ledger = WS.WorkflowLedger(str(route["route_id"]), str(route.get("route_hash", "")))
     entries = ledger.journal()
+    where = f"route {route['route_id']} ledger {ledger.root}"
     for binding in bindings:
         gate = str(binding["gate"])
         resolution = WS.human_gate_resolution(entries, gate)
@@ -4467,13 +4482,13 @@ def _human_gate_entry_fence(route: dict, node: dict) -> None:
             raise DispatchContractError(
                 "human-gate-not-raised",
                 f"{gate}: node {node.get('id')} enters through human gate {gate!r}, "
-                "which this route has never raised; the owner raises it with "
+                f"which this route has never raised ({where}); the owner raises it with "
                 "`workflow-supervisor.py gate --block --artifact <path>` and waits "
                 "with `await-release` before starting this node",
             )
         raise DispatchContractError(
             "human-gate-unreleased",
-            f"{gate}: latest raise (epoch {resolution['epoch']}) is {status}; "
+            f"{gate}: latest raise (epoch {resolution['epoch']}) is {status} ({where}); "
             "wait with `workflow-supervisor.py await-release` until a person "
             "releases it with --decision proceed"
             + (" (a revise needs the gate raised again first)" if status == "revise" else ""),
