@@ -185,6 +185,19 @@ merge for framing: `plan` is record-bound to every group marker, reads every bri
 and must record which direction it adopts (and why, when the legs disagree —
 disagreement between briefs is signal, not an error).
 
+On a gate-bearing route — a `standard+` route whose compiled graph retains the
+`frame-review` binding, which is an explicit `hybrid`/`both`/`post-frame-only`
+`confirmation.mode` or any composed recipe that declares the gate — the
+post-frame direction gate follows (owner-execution.md "Post-Frame Direction
+Gate"): build `shards/frame/frame-summary.json` and the plain-language
+interview `shards/frame/interview.json`, raise `frame-review` with the
+interview as the artifact, wait on `workflow-supervisor.py await-release`, and
+on `proceed` render `shards/frame/intent.md` from the recorded answers. `plan`
+does not start before that — every launch surface refuses it. Under
+`autonomous` a non-composed `standard+` route seals no `frame-review` binding,
+`frame` continues `inline-next`, and `plan` starts immediately after the frame
+group joins; `direct`/`quick` have no `frame` node at all.
+
 ### Step 1: code-plan
 
 Skip for direct. quick uses an inline micro-plan. For standard+, first verify the SD-13 precondition: the repository has an artifact root and `spec/`. Then dispatch:
@@ -194,7 +207,7 @@ AGENT_HOME=$(utilities/agent-home.sh)
 NODE_ID=plan
 STAGE_ADAPTER=claude # choose claude, codex, or opencode from checked route evidence
 STAGE_SLUG="${CONDUCTOR_SLUG}-plan"
-STAGE_PROMPT="<sub-skill contract + absolute input paths + output contract + slug>"
+STAGE_PROMPT="<sub-skill contract + absolute input paths (Intent: shards/frame/intent.md first when the route raised the frame-review gate, then every direction brief) + output contract + slug>"
 # Run the route-bound dispatch transaction from "Standard+ Stage Dispatch",
 # capture ATTEMPT_ID, then use that same value for `capability-route.py complete`.
 ```

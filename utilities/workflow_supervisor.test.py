@@ -1649,6 +1649,409 @@ class TestGateSubjectNotCaller(WorkflowFixture):
                       "--decision", "stop", "--jobs", str(jobs)])
         self.assertEqual(PENDING.read(root, session, delivery_id)["state"], "acked")
 
+    # -- SD-129: the owner's checked wait and the journal's one gate rule -------
+
+    def _raise(self, path, jobs):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = SUP.main(["gate", "--route", str(path), "--gate", "frame-review",
+                             "--block", "--jobs", str(jobs), "--artifact",
+                             "shards/frame/interview.json"])
+        self.assertEqual(code, 0)
+        return json.loads(buf.getvalue())
+
+    def _await(self, path, *, maximum="0.2"):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = SUP.main(["await-release", "--route", str(path), "--gate",
+                             "frame-review", "--max", maximum, "--interval", "1"])
+        return code, json.loads(buf.getvalue())
+
+    def test_block_records_the_artifact_and_names_the_wait(self):
+        route, path = self.two_stage_route(
+            human_gate="frame-review",
+            continuation={"kind": "human-gate", "gate": "frame-review"})
+        jobs, _session, _attempt = self.owner_registry()
+        payload = self._raise(path, jobs)
+        self.assertIn("await-release", payload["await_command"])
+        self.assertIn("--gate frame-review", payload["await_command"])
+        last = SUP.ledger_for(route).journal()[-1]
+        absolute = str(Path("shards/frame/interview.json").resolve())
+        self.assertEqual(last["evidence"]["artifact"], absolute)   # sealed absolute (B2)
+        resolution = WS.human_gate_resolution(SUP.ledger_for(route).journal(), "frame-review")
+        self.assertEqual(resolution["status"], "blocked")
+        self.assertEqual(resolution["artifact"], absolute)
+        self.assertEqual(resolution["epoch"], 1)
+
+    def test_await_release_never_raised_is_a_typed_error(self):
+        _route, path = self.two_stage_route(
+            human_gate="frame-review",
+            continuation={"kind": "human-gate", "gate": "frame-review"})
+        with self.assertRaisesRegex(SUP.SupervisorError, "gate-never-raised"):
+            SUP.main(["await-release", "--route", str(path), "--gate", "frame-review",
+                      "--max", "0"])
+
+    def test_await_release_stays_bounded_while_blocked(self):
+        _route, path = self.two_stage_route(
+            human_gate="frame-review",
+            continuation={"kind": "human-gate", "gate": "frame-review"})
+        jobs, _session, _attempt = self.owner_registry()
+        self._raise(path, jobs)
+        code, payload = self._await(path)
+        self.assertEqual(code, 2)
+        self.assertEqual(payload["status"], "blocked")
+        self.assertEqual(payload["workflow_state"], "BLOCKED_HUMAN_GATE")
+        self.assertEqual(payload["artifact"], str(Path("shards/frame/interview.json").resolve()))
+
+    def test_await_release_returns_the_persons_decision(self):
+        for decision, expected in (("proceed", 0), ("revise", 3), ("stop", 4)):
+            with self.subTest(decision=decision):
+                route, path = self.two_stage_route(
+                    human_gate="frame-review",
+                    continuation={"kind": "human-gate", "gate": "frame-review"},
+                    route_id=f"rt-await-{decision}00")
+                jobs, _session, _attempt = self.owner_registry(route_id=f"rt-await-{decision}00")
+                self._raise(path, jobs)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    SUP.main(["release", "--route", str(path), "--gate", "frame-review",
+                              "--decision", decision, "--actor", "fixture-user",
+                              "--jobs", str(jobs)])
+                code, payload = self._await(path)
+                self.assertEqual(code, expected)
+                self.assertEqual(payload["status"], decision)
+                self.assertEqual(payload["released_by"], "fixture-user")
+                self.assertEqual(payload["actor_kind"], "user")
+                if decision == "proceed":
+                    self.assertEqual(payload["successor"], ["verify"])
+
+    def test_await_release_wakes_when_the_release_lands_mid_wait(self):
+        route, path = self.two_stage_route(
+            human_gate="frame-review",
+            continuation={"kind": "human-gate", "gate": "frame-review"})
+        jobs, _session, _attempt = self.owner_registry()
+        self._raise(path, jobs)
+        ledger = SUP.ledger_for(route)
+        calls = {"n": 0}
+        real_journal = ledger.journal
+
+        def journal_then_release(*_a, **_k):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    SUP.main(["release", "--route", str(path), "--gate", "frame-review",
+                              "--decision", "proceed", "--jobs", str(jobs)])
+            return real_journal()
+
+        with mock.patch.object(SUP, "ledger_for", return_value=ledger), \
+                mock.patch.object(ledger, "journal", side_effect=journal_then_release), \
+                mock.patch.object(SUP.time, "sleep"):
+            code, payload = self._await(path, maximum="30")
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["status"], "proceed")
+
+    def test_release_output_names_the_route_for_the_carrier(self):
+        _route, path = self.two_stage_route(
+            human_gate="frame-review",
+            continuation={"kind": "human-gate", "gate": "frame-review"})
+        jobs, _session, _attempt = self.owner_registry()
+        self._raise(path, jobs)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            SUP.main(["release", "--route", str(path), "--gate", "frame-review",
+                      "--decision", "proceed", "--jobs", str(jobs)])
+        self.assertEqual(json.loads(buf.getvalue())["route_id"], "rt-fixture0000000")
+
+    def test_a_revise_leaves_the_gate_unreleased_until_it_is_raised_again(self):
+        route, path = self.two_stage_route(
+            human_gate="frame-review",
+            continuation={"kind": "human-gate", "gate": "frame-review"})
+        jobs, _session, _attempt = self.owner_registry()
+        self._raise(path, jobs)
+        with contextlib.redirect_stdout(io.StringIO()):
+            SUP.main(["release", "--route", str(path), "--gate", "frame-review",
+                      "--decision", "revise", "--jobs", str(jobs)])
+        ledger = SUP.ledger_for(route)
+        self.assertEqual(WS.human_gate_resolution(ledger.journal(), "frame-review")["status"],
+                         "revise")
+        # The retry boundary reruns frame and raises again: a second epoch.
+        with ledger.lock():
+            ledger.set_workflow_state("READY", evidence={"retry": "frame"}, actor="retry")
+        payload = self._raise(path, jobs)
+        self.assertTrue(payload["delivery_created"])
+        resolution = WS.human_gate_resolution(ledger.journal(), "frame-review")
+        self.assertEqual((resolution["status"], resolution["epoch"]), ("blocked", 2))
+
+    def test_legacy_gate_release_counts_as_proceed(self):
+        route, path = self.two_stage_route(
+            human_gate="frame-review",
+            continuation={"kind": "human-gate", "gate": "frame-review"})
+        jobs, _session, _attempt = self.owner_registry()
+        self._raise(path, jobs)
+        with contextlib.redirect_stdout(io.StringIO()):
+            SUP.main(["gate", "--route", str(path), "--gate", "frame-review", "--release",
+                      "--jobs", str(jobs)])
+        code, payload = self._await(path)
+        self.assertEqual((code, payload["status"]), (0, "proceed"))
+
+    # -- SD-129: the interview rides the gate ----------------------------------
+
+    def _interview(self, **overrides):
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import frame_interview as FI
+        value = {
+            "schema": FI.SCHEMA, "route_id": "rt-fixture0000000", "round": 1,
+            "summary": "shards/frame/frame-summary.json",
+            "understanding": "You want the approval request to reach you at once and to ask a few short questions first.",
+            "brief": {"problem": "Approval arrives late.", "outcome": "It arrives in seconds.",
+                      "affected": "You.", "constraints": "No new background process.", "open": ""},
+            "questions": [{
+                "id": "q-scope", "topic": "How much to change",
+                "question": "Fix only the approval step, or the questions too?",
+                "kind": "choice",
+                "options": [{"label": "Both (recommended)", "means": "Fix both."},
+                            {"label": "Approval only", "means": "Leave the questions."}],
+                "recommended": 0, "why": "Only you can weigh the wording against the schedule."}],
+        }
+        value.update(overrides)
+        path = self.base / "shards" / "frame" / "interview.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
+        return path, value
+
+    def _answers(self, interview, **overrides):
+        import frame_interview as FI
+        answers = FI.answers_template(interview)
+        answers["understanding_confirmed"] = True
+        for qid in answers["answers"]:
+            answers["answers"][qid]["choice"] = 1
+            answers["answers"][qid]["note"] = "wording can wait"
+        answers.update(overrides)
+        path = self.base / "answers.json"
+        path.write_text(json.dumps(answers, ensure_ascii=False), encoding="utf-8")
+        return path, answers
+
+    def _block_with(self, path, jobs, artifact):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = SUP.main(["gate", "--route", str(path), "--gate", "frame-review", "--block",
+                             "--jobs", str(jobs), "--artifact", str(artifact)])
+        return code, json.loads(buf.getvalue())
+
+    def test_a_hard_to_read_interview_never_reaches_a_person(self):
+        route, path = self.two_stage_route(
+            human_gate="frame-review",
+            continuation={"kind": "human-gate", "gate": "frame-review"})
+        jobs, session, _attempt = self.owner_registry()
+        interview, value = self._interview()
+        value["questions"][0]["question"] = "Should the owner re-dispatch the plan node on this route?"
+        interview.write_text(json.dumps(value), encoding="utf-8")
+        with self.assertRaisesRegex(SUP.SupervisorError, "interview-invalid: .*harness word"):
+            self._block_with(path, jobs, interview)
+        ledger = SUP.ledger_for(route)
+        self.assertEqual(ledger.read_only_state()["workflow_state"], "CREATED")
+        root = Path(jobs).resolve(strict=False).parent
+        self.assertFalse(list(PENDING.record_directory(root, session).glob("delivery-*.json"))
+                         if PENDING.record_directory(root, session).is_dir() else [])
+
+    def test_a_valid_interview_is_recorded_on_the_raise(self):
+        route, path = self.two_stage_route(
+            human_gate="frame-review",
+            continuation={"kind": "human-gate", "gate": "frame-review"})
+        jobs, _session, _attempt = self.owner_registry()
+        interview, _value = self._interview()
+        code, payload = self._block_with(path, jobs, interview)
+        self.assertEqual(code, 0)
+        self.assertTrue(payload["interview"])
+        self.assertEqual(payload["questions"], 1)
+        last = SUP.ledger_for(route).journal()[-1]["evidence"]
+        self.assertEqual((last["interview"], last["questions"], last["artifact"]),
+                         (True, 1, str(interview)))
+
+    def test_an_interview_for_another_route_or_round_is_refused(self):
+        _route, path = self.two_stage_route(
+            human_gate="frame-review",
+            continuation={"kind": "human-gate", "gate": "frame-review"})
+        jobs, _session, _attempt = self.owner_registry()
+        interview, _value = self._interview(route_id="rt-someone-else0")
+        with self.assertRaisesRegex(SUP.SupervisorError, "interview-route-mismatch"):
+            self._block_with(path, jobs, interview)
+        interview, _value = self._interview(round=2)
+        with self.assertRaisesRegex(SUP.SupervisorError, "interview-round-mismatch"):
+            self._block_with(path, jobs, interview)
+
+    def test_proceed_requires_the_answers_and_records_them(self):
+        route, path = self.two_stage_route(
+            human_gate="frame-review",
+            continuation={"kind": "human-gate", "gate": "frame-review"})
+        jobs, _session, _attempt = self.owner_registry()
+        interview, value = self._interview()
+        self._block_with(path, jobs, interview)
+        with self.assertRaisesRegex(SUP.SupervisorError, "interview-answers-required"):
+            SUP.main(["release", "--route", str(path), "--gate", "frame-review",
+                      "--decision", "proceed", "--jobs", str(jobs)])
+        ledger = SUP.ledger_for(route)
+        self.assertEqual(ledger.read_only_state()["workflow_state"], "BLOCKED_HUMAN_GATE")
+        answers_path, answers = self._answers(value)
+        # an incomplete answer set is refused with the reason
+        broken = dict(answers, understanding_confirmed=None)
+        answers_path.write_text(json.dumps(broken), encoding="utf-8")
+        with self.assertRaisesRegex(SUP.SupervisorError, "interview-answers-invalid"):
+            SUP.main(["release", "--route", str(path), "--gate", "frame-review",
+                      "--decision", "proceed", "--jobs", str(jobs), "--answers", str(answers_path)])
+        answers_path.write_text(json.dumps(answers), encoding="utf-8")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = SUP.main(["release", "--route", str(path), "--gate", "frame-review",
+                             "--decision", "proceed", "--jobs", str(jobs),
+                             "--answers", str(answers_path), "--actor", "fixture-user"])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(buf.getvalue())["answers_recorded"], 1)
+        resolution = WS.human_gate_resolution(ledger.journal(), "frame-review")
+        self.assertEqual(resolution["status"], "proceed")
+        self.assertEqual(resolution["answers"]["answers"]["q-scope"]["choice"], 1)
+        sidecar = json.loads(path.with_name(path.stem + ".gate-release.json").read_text("utf-8"))
+        self.assertEqual(sidecar["gate_releases"][0]["answers"]["answers"]["q-scope"]["note"],
+                         "wording can wait")
+        # the owner receives the answers as a file it can render
+        out = self.base / "owner" / "answers.json"
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = SUP.main(["await-release", "--route", str(path), "--gate", "frame-review",
+                             "--max", "0", "--answers-out", str(out)])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(buf.getvalue())["answers_file"], str(out))
+        self.assertEqual(json.loads(out.read_text("utf-8"))["answers"]["q-scope"]["choice"], 1)
+
+    def test_a_relative_interview_path_is_sealed_absolute_and_answers_stay_required(self):
+        """review round 1, B2: the raise runs in the owner's cwd, the release in the
+        depth-0 session's; whether answers are owed comes from the journal."""
+        route, path = self.two_stage_route(
+            human_gate="frame-review",
+            continuation={"kind": "human-gate", "gate": "frame-review"})
+        jobs, _session, _attempt = self.owner_registry()
+        interview, value = self._interview()
+        previous = os.getcwd()
+        os.chdir(self.base)
+        try:
+            code, payload = self._block_with(path, jobs, "shards/frame/interview.json")
+        finally:
+            os.chdir(previous)
+        self.assertEqual(code, 0)
+        self.assertEqual(SUP.ledger_for(route).journal()[-1]["evidence"]["artifact"], str(interview))
+        elsewhere = self.base / "elsewhere"; elsewhere.mkdir()
+        os.chdir(elsewhere)
+        try:
+            with self.assertRaisesRegex(SUP.SupervisorError, "interview-answers-required"):
+                SUP.main(["release", "--route", str(path), "--gate", "frame-review",
+                          "--decision", "proceed", "--jobs", str(jobs)])
+            # and a raise whose interview vanished before the release is refused, not waved through
+            answers_path, _answers = self._answers(value)
+            interview.unlink()
+            with self.assertRaisesRegex(SUP.SupervisorError, "interview-artifact-unreadable"):
+                SUP.main(["release", "--route", str(path), "--gate", "frame-review",
+                          "--decision", "proceed", "--jobs", str(jobs), "--answers", str(answers_path)])
+            with self.assertRaisesRegex(SUP.SupervisorError, "interview-answers-required"):
+                SUP.main(["release", "--route", str(path), "--gate", "frame-review",
+                          "--decision", "proceed", "--jobs", str(jobs)])
+        finally:
+            os.chdir(previous)
+        self.assertEqual(SUP.ledger_for(route).read_only_state()["workflow_state"], "BLOCKED_HUMAN_GATE")
+
+    def test_legacy_gate_release_refuses_an_interview_gate(self):
+        """review round 1, M3."""
+        _route, path = self.two_stage_route(
+            human_gate="frame-review",
+            continuation={"kind": "human-gate", "gate": "frame-review"})
+        jobs, _session, _attempt = self.owner_registry()
+        interview, _value = self._interview()
+        self._block_with(path, jobs, interview)
+        with self.assertRaisesRegex(SUP.SupervisorError, "interview-answers-required"):
+            SUP.main(["gate", "--route", str(path), "--gate", "frame-review", "--release",
+                      "--jobs", str(jobs)])
+
+    def test_a_repeated_block_returns_the_full_payload(self):
+        """review round 1, minor 7."""
+        _route, path = self.two_stage_route(
+            human_gate="frame-review",
+            continuation={"kind": "human-gate", "gate": "frame-review"})
+        jobs, _session, _attempt = self.owner_registry()
+        interview, _value = self._interview()
+        self._block_with(path, jobs, interview)
+        code, payload = self._block_with(path, jobs, interview)
+        self.assertEqual(code, 0)
+        self.assertFalse(payload["delivery_created"])
+        self.assertTrue(payload["interview"])
+        self.assertEqual(payload["questions"], 1)
+        self.assertIn("await-release", payload["await_command"])
+
+    def test_a_burned_record_is_expired_by_the_release_not_orphaned(self):
+        """review round 2, N3."""
+        route, path = self.two_stage_route(
+            human_gate="frame-review",
+            continuation={"kind": "human-gate", "gate": "frame-review"})
+        jobs, session, _attempt = self.owner_registry()
+        root = Path(jobs).resolve(strict=False).parent
+        interview, value = self._interview()
+        _code, payload = self._block_with(path, jobs, interview)
+        delivery_id = json.loads(Path(payload["delivery"]).read_text("utf-8"))["delivery_id"]
+        for _ in range(PENDING.RECLAIM_LIMIT):
+            PENDING.claim(root, session, delivery_id, claim_owner="x", lease_seconds=0.001)
+            PENDING.reclaim(root, session, delivery_id, now_ns=time.monotonic_ns() + 10**12)
+        self.assertGreaterEqual(PENDING.read(root, session, delivery_id)["attempts"], PENDING.RECLAIM_LIMIT)
+        answers_path, _answers = self._answers(value)
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = SUP.main(["release", "--route", str(path), "--gate", "frame-review",
+                             "--decision", "proceed", "--jobs", str(jobs), "--answers", str(answers_path)])
+        self.assertEqual(code, 0)
+        record = PENDING.read(root, session, delivery_id)
+        self.assertEqual((record["state"], record["expiry_reason"]), ("expired", "receipt-row-superseded"))
+
+    def test_await_release_refusals_carry_a_typed_reason(self):
+        """review round 1, minor 6."""
+        _route, path = self.two_stage_route(
+            human_gate="frame-review",
+            continuation={"kind": "human-gate", "gate": "frame-review"})
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), self.assertRaises(SUP.SupervisorError):
+            SUP.main(["await-release", "--route", str(path), "--gate", "nope", "--max", "0"])
+        self.assertEqual(json.loads(buf.getvalue())["reason"], "gate-undeclared")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), self.assertRaises(SUP.SupervisorError):
+            SUP.main(["await-release", "--route", str(self.base / "missing.json"), "--gate", "frame-review", "--max", "0"])
+        self.assertEqual(json.loads(buf.getvalue())["reason"], "route-unreadable")
+
+    def test_answers_for_a_summary_gate_are_refused_not_dropped(self):
+        _route, path = self.two_stage_route(
+            human_gate="frame-review",
+            continuation={"kind": "human-gate", "gate": "frame-review"})
+        jobs, _session, _attempt = self.owner_registry()
+        self.block_gate(path, "frame-review", jobs=jobs)  # legacy frame-summary artifact
+        _interview, value = self._interview()
+        answers_path, _answers = self._answers(value)
+        with self.assertRaisesRegex(SUP.SupervisorError, "interview-absent"):
+            SUP.main(["release", "--route", str(path), "--gate", "frame-review",
+                      "--decision", "proceed", "--jobs", str(jobs), "--answers", str(answers_path)])
+        # and a summary gate still releases without answers, as before
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = SUP.main(["release", "--route", str(path), "--gate", "frame-review",
+                             "--decision", "proceed", "--jobs", str(jobs)])
+        self.assertEqual(code, 0)
+
+    def test_stop_and_revise_do_not_need_answers(self):
+        for decision in ("revise", "stop"):
+            with self.subTest(decision=decision):
+                _route, path = self.two_stage_route(
+                    human_gate="frame-review",
+                    continuation={"kind": "human-gate", "gate": "frame-review"},
+                    route_id=f"rt-noans-{decision}00")
+                jobs, _session, _attempt = self.owner_registry(route_id=f"rt-noans-{decision}00")
+                interview, _value = self._interview(route_id=f"rt-noans-{decision}00")
+                self._block_with(path, jobs, interview)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    code = SUP.main(["release", "--route", str(path), "--gate", "frame-review",
+                                     "--decision", decision, "--jobs", str(jobs)])
+                self.assertEqual(code, 0)
+
     def test_no_test_in_this_class_writes_outside_its_temporary_root(self):
         """The leak was a test writing into real runtime state. Pin the invariant."""
         canonical = Path.home() / ".agent_reports"

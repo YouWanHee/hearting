@@ -4429,6 +4429,88 @@ def validate_nested_eligibility(
         raise DispatchContractError(f"nested-child-spawn-{status}", source or "no checked evidence")
 
 
+# The human gates whose owner contract implements raise + await (SD-129
+# §13.41.2-5). See `_human_gate_entry_fence`.
+FENCED_HUMAN_GATES = frozenset({"frame-review"})
+
+
+def _human_gate_entry_fence(route: dict, node: dict) -> None:
+    """Refuse to start a node whose entry human gate is not released (SD-129).
+
+    Defect M, measured 2026-09-04 on route rt-da62cded: the owner raised
+    `frame-review`, read `BLOCKED_HUMAN_GATE` from `status`, and spawned `plan`
+    anyway -- the gate wait was a sentence in `owner-execution.md` and no launch
+    surface asked the workflow journal. Every wrapper (the three adapters'
+    `dispatch-headless.py`, `dispatch-batch.py`) funnels through this gate, so
+    the fence lives here once.
+
+    The answer comes from `workflow_state.human_gate_resolution`, the same rule
+    the owner's `await-release` and the carriers read, and from the same ledger
+    root the supervisor writes (`workflow_state.default_ledger_root()`); the
+    reader never derives its own root from the wrapper's `--jobs`, because the
+    writer does not either. Both "never raised" and "raised, not released" are
+    refusals: a route sealed with the binding must pass through the gate, or a
+    self-approving owner is back to the two 2026-09-03 cycles that pressed
+    their own gate. `revise` and `stop` leave the gate unreleased too.
+    """
+
+    # Two conditions, both required (review rounds 1 and 2, B1):
+    #   1. some node of THIS route raises the gate -- the SD-123 mechanism is
+    #      `predecessor.continuation = {kind: human-gate, gate}` ->
+    #      BLOCKED_HUMAN_GATE -> release; a binding with no raising continuation
+    #      (`intent-confirmation`) is satisfied by the §0.4 card;
+    #   2. the gate is in FENCED_HUMAN_GATES -- the gates whose owner contract
+    #      actually implements the raise and the wait. The topology declares
+    #      raising continuations for five more gates (`direction-confirmation`,
+    #      `preview-disposition`, `explicit-handback`, `full-run-authorization`,
+    #      `deploy-authorization`) that no capability document, skill or owner
+    #      reference tells an owner to raise; fencing those would turn a
+    #      declaration into a mandatory step nobody documented (round 2, B1).
+    # A gate joins the set in the same change that teaches its owner to raise
+    # it; `dispatch_contract.test.py` pins the set against the real topology.
+    raised_gates = {
+        str((n.get("continuation") or {}).get("gate"))
+        for n in (route.get("nodes") or [])
+        if isinstance(n, dict) and (n.get("continuation") or {}).get("kind") == "human-gate"
+        and (n.get("continuation") or {}).get("gate")
+    }
+    bindings = [
+        row for row in (route.get("human_gate_bindings") or [])
+        if isinstance(row, dict) and row.get("node") == node.get("id")
+        and (row.get("position") or "entry") == "entry" and row.get("gate")
+        and str(row.get("gate")) in raised_gates
+        and str(row.get("gate")) in FENCED_HUMAN_GATES
+    ]
+    if not bindings:
+        return
+    import workflow_state as WS  # noqa: WPS433 -- workflow_state imports this module
+
+    ledger = WS.WorkflowLedger(str(route["route_id"]), str(route.get("route_hash", "")))
+    entries = ledger.journal()
+    where = f"route {route['route_id']} ledger {ledger.root}"
+    for binding in bindings:
+        gate = str(binding["gate"])
+        resolution = WS.human_gate_resolution(entries, gate)
+        status = resolution["status"]
+        if status == "proceed":
+            continue
+        if status == "not-raised":
+            raise DispatchContractError(
+                "human-gate-not-raised",
+                f"{gate}: node {node.get('id')} enters through human gate {gate!r}, "
+                f"which this route has never raised ({where}); the owner raises it with "
+                "`workflow-supervisor.py gate --block --artifact <path>` and waits "
+                "with `await-release` before starting this node",
+            )
+        raise DispatchContractError(
+            "human-gate-unreleased",
+            f"{gate}: latest raise (epoch {resolution['epoch']}) is {status} ({where}); "
+            "wait with `workflow-supervisor.py await-release` until a person "
+            "releases it with --decision proceed"
+            + (" (a revise needs the gate raised again first)" if status == "revise" else ""),
+        )
+
+
 def completion_marker_gate(
     route_file: str | None,
     route_node: str | None,
@@ -4504,6 +4586,7 @@ def completion_marker_gate(
             blocked.append((dep, readiness))
     if missing:
         raise DispatchContractError("completion-marker-missing", ",".join(missing))
+    _human_gate_entry_fence(route, node)
     _auxiliary_arbitration_gate(route, node, agent_home, jobs)
     if blocked:
         reason = (
@@ -5503,12 +5586,35 @@ def marker_bound_process_identity(
     return tuple((key, metadata.get(key, "")) for key in _MARKER_BOUND_PROCESS_KEYS)
 
 
+# SD-96: a sub-session row (`stage_authority=0`) can never publish a stage marker
+# -- `capability-route.py complete` refuses it before touching the row -- so it
+# needs a terminal note of its own. Without one it had no closure path at all and
+# every success was booked as `dead-route-completion-rejected` (defect F).
+# Deliberately NOT `completed-supervisor`: several gates read that note to mean "a
+# checked supervisor closed a depth-1 owner", and one of them (SD-94 marker
+# eligibility, `capability-route.py`) grants a privilege a sub-session must never
+# have.
+SUBSESSION_NOTE = "completed-subsession"
+
+# The one definition of "this row's note says it succeeded". It lives in this
+# module because `dispatch_completion_join` imports this one, never the reverse.
+# Consumers that ask "did this attempt succeed?" use this set; the two that ask
+# "*which producer* closed this row" (SD-94 marker eligibility and
+# `supervisor_terminal` below) keep their narrow literal on purpose.
+SUCCESS_NOTES = frozenset({"completed-marker", "completed-supervisor", SUBSESSION_NOTE})
+
+
+def row_is_subsession(metadata: dict[str, str]) -> bool:
+    """One definition of "this row is a sub-session slice, not a stage owner"."""
+
+    return bool(metadata.get("subsession_id")) or str(
+        metadata.get("stage_authority", "1")
+    ).lower() in {"0", "false"}
+
+
 def _marker_bound_row_verdict(metadata: dict[str, str]) -> str:
     failure_class = metadata.get("failure_class", "").lower()
-    if failure_class == "pass" or metadata.get("note") in {
-        "completed-marker",
-        "completed-supervisor",
-    }:
+    if failure_class == "pass" or metadata.get("note") in SUCCESS_NOTES:
         return "PASS"
     if failure_class == "fail":
         return "FAIL"
@@ -6105,7 +6211,7 @@ def _delivery_intent_values(fields: list[str], metadata: dict[str, str]) -> dict
     route_node = metadata.get("route_node", "")
     is_success = (
         metadata.get("failure_class") == "pass"
-        or metadata.get("note") in {"completed-marker", "completed-supervisor"}
+        or metadata.get("note") in SUCCESS_NOTES
     )
     child = {
         "attempt_id": attempt_id,

@@ -21,6 +21,7 @@ from dispatch_contract import (
     EXECUTION_SURFACES,
     FALLBACK_HOPS,
     PARENT_TRANSPORT_BY_DISPATCH_DEPTH,
+    SUCCESS_NOTES,
     WRAPPER_PARENT_SANDBOXES,
     WRAPPER_TRANSPORTS,
     _atomic_registry_replace,
@@ -4288,7 +4289,7 @@ def complete_subsession_stage(route, node, node_id, evidence, manifest_path, job
             raise ValueError(f"subsession attempt identity mismatch:{session['attempt_id']}")
         if (
             fields[1]!="done"
-            or metadata.get("note") not in {"completed-supervisor", "completed-marker"}
+            or metadata.get("note") not in SUCCESS_NOTES
             or metadata.get("failure_class")!="pass"
         ):
             raise ValueError(f"subsession not semantic PASS:{session['attempt_id']}")

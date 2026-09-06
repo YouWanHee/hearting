@@ -287,8 +287,7 @@ group join, before `plan` starts:
 
 Deliver this card through a native structured-question surface when one is
 available, the plain-text form otherwise — the same fallback rule as the §0.4
-card. `direct`/`quick` have no `frame` node and keep the ordinary blocking §0.4
-card unchanged. `confirmation.mode` (`profiles/dispatch-defaults.yaml`) governs
+card. `confirmation.mode` (`profiles/dispatch-defaults.yaml`) governs
 the pair and has four values: `autonomous` (the shipped default as of O3 —
 resolved whenever a config's `confirmation` block or `mode` key is absent, for
 any schema version, and whenever no config file exists at all) drops both the
@@ -308,6 +307,45 @@ the shipped default change is not migrated into existing config files.
 `utilities/capability-route.py`'s `_effective_confirmation_graph()` is the one
 helper both compile and verify call to realize this, so the two paths cannot
 disagree.
+
+**The frame interview (SD-129).** On a `standard+`, non-composed
+`autopilot-code` route whose compiled graph actually retains the
+`frame-review` binding — an explicitly declared `hybrid`, `both`, or
+`post-frame-only` `confirmation.mode`, and equally any composed recipe that
+declares the gate — the `[방향 확인]` card is not the whole gate. The gate
+record names `shards/frame/interview.json`: the owner's
+one-sentence restatement of what the user wants, a plain-language brief, and
+the few decisions the frame legs could not settle without the user. The
+depth-0 session that receives the gate (asyncRewake wake or the next-prompt
+sweep) does the interview itself, in this order, and never leaves it to a
+helper:
+
+1. Ask first whether the restatement is right — the owner's sentence, verbatim,
+   with 예 / 아니오(고쳐 말하기) — and record a correction in the user's words.
+2. Put the `[방향 확인]` five-field summary as the card above.
+3. Ask each interview question through `AskUserQuestion` (at most four per
+   call), one topic per question, the recommended option first and labelled
+   (권장), each option with its one-line meaning; never paraphrase a question
+   into harness vocabulary, and never add questions the interview does not
+   carry. A tired reader must be able to answer without opening the plan.
+4. Write the answers with `frame_interview.py answers-template` as the shape
+   and record them on the release: `workflow-supervisor.py release --route
+   <route file> --gate frame-review --decision proceed --answers <file>`.
+   `proceed` without answers is refused for an interview gate.
+
+Question counts are bounded by intensity — at most 7 at `standard+`, 3 at
+`quick`, 1 at `direct` — and the validator refuses an interview that breaks
+the plain-language rules before it reaches anyone (the `standard+` cap and
+the wording rules are machine-checked at the raise; steps 1–3 above and the
+`direct`/`quick` caps are obligations on the acting session that nothing
+checks mechanically). `direct`/`quick` have no `frame` node: the acting
+session asks its 0–1 / 1–3 questions of the same kind inline, inside the
+blocking §0.4 card step, and records the answers in the plan or the work log.
+The recorded answers become `shards/frame/intent.md` (owner-rendered), the
+brief `plan` reads first; `plan-author` is told to cite each decision by its
+question id and to report one it cannot honor as a blocker — a prompt
+contract, not a gate check. An interview gate may be raised at most twice
+per route (`round` ≤ 2).
 
 Entry routers therefore have two deterministic load phases: manifest-owned
 metadata before approval, then the selected portable owner contract after

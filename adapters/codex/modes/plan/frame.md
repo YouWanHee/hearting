@@ -106,6 +106,12 @@ created: {YYYY-MM-DD}
 5. **Hotfix Boundary**: what a patch-style shortcut here would look like and
    why it is (or is not) unacceptable for this task.
 6. **Open Risks**: what stays uncertain after this brief.
+7. **Questions only the user can answer**: 0–5 decisions the evidence cannot
+   settle — preferences, scope trade-offs, acceptable cost — each as one plain
+   sentence a non-engineer could answer, with your recommended answer and one
+   line on why you cannot decide it yourself. Facts you could establish by
+   reading code or running a tool do not belong here; establish them. The
+   owner turns this list into the frame interview (SD-129).
 
 ## Constraints
 

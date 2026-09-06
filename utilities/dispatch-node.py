@@ -13,6 +13,7 @@ from dispatch_contract import (
 )
 from worker_bootstrap import assigned_contract, worker_type_for_kind
 import review_round_cap as REVIEW_ROUND_CAP
+import dispatch_subsession_advance as SUBSESSION
 
 _route_spec = importlib.util.spec_from_file_location(
     "capability_route", ROOT / "utilities" / "capability-route.py"
@@ -477,6 +478,52 @@ def main():
       ROOT,requested_jobs,int(node.get("dispatch_depth",1)),a.action,child_env())
  except DispatchContractError as e:
   print("check=failed");print(f"reason={e.reason}");print(f"detail={e.detail}");print("child_spawned=0");raise SystemExit(65)
+ if a.subsession_id and a.action=="start":
+  # Defect F3. A slice may only start once the chain it belongs to has been
+  # sealed. It refuses exactly the orphan: a row carrying a chain identity that
+  # no manifest names, which no surface can ever aggregate
+  # (`complete_subsession_stage` reads the manifest, finds nothing, and the
+  # chain stalls with the slice's work already done). Observed in W7G.
+  #
+  # Safe for both live start surfaces: `stage-session-chain.py` persists the
+  # manifest AFTER its register loop and BEFORE it starts index 1, and the
+  # supervisor advance of indexes 2..N reads that same sealed pointer much
+  # later.
+  #
+  # PRECONDITION FOR PARALLEL SUBDIVISION. `subdivision_batch_admission.py`
+  # builds slice starts too and never calls `persist_chain_manifest` -- the only
+  # call in the repo is `stage-session-chain.py:293`. That path is unreachable
+  # today (`raise_if_parallel_entry_fail_closed` raises unconditionally, SD-119
+  # R4), so this gate refuses nothing live. Whoever lands parallel admission
+  # must persist the manifest before starting a slice, or every parallel slice
+  # will be refused here. `SubsessionChainSealTest.test_parallel_admission_is_
+  # still_fail_closed` fails the moment that assumption stops holding.
+  manifest=SUBSESSION.load_chain_manifest(registry.path,a.session_chain_id)
+  pointer=SUBSESSION.chain_manifest_pointer_path(registry.path,a.session_chain_id)
+  sealed=None
+  if isinstance(manifest,dict):
+   for session in (manifest.get("sessions") or []):
+    if not isinstance(session,dict): continue
+    if str(session.get("subsession_id"))==a.subsession_id:
+     sealed=session
+     break
+  # The manifest is on-disk JSON: coerce, never trust. `"index": null` used to
+  # raise TypeError and print a traceback instead of the typed refusal envelope
+  # every other refusal here emits (review round 1, item 8).
+  try:
+   sealed_index=int(sealed.get("index")) if sealed is not None else None
+  except (TypeError,ValueError):
+   sealed_index=None
+  if sealed is None or str(sealed.get("attempt_id"))!=str(a.attempt_id) or sealed_index!=int(a.subsession_index):
+   print("check=failed")
+   print("reason=subsession-chain-manifest-unsealed")
+   print(f"session_chain_id={a.session_chain_id}")
+   print(f"subsession_id={a.subsession_id}")
+   print(f"manifest_pointer={pointer}")
+   print(f"manifest_present={int(isinstance(manifest,dict))}")
+   print(f"subsession_declared={int(sealed is not None)}")
+   print("child_spawned=0")
+   raise SystemExit(64)
  print("completion_marker="+str(ROUTE.completion_dir(route["route_id"],jobs=registry.path)/(node["id"]+".json")))
  wrapper=ROOT/"adapters"/a.adapter/"bin"/"dispatch-headless.py"
  try:
