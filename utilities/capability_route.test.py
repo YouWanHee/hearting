@@ -4096,4 +4096,115 @@ class FrameSummaryContractTest(unittest.TestCase):
   self.assertNotIn("frame-summary", source)
 
 
+class InlineStageCompletionRecipeTest(unittest.TestCase):
+ """The documented inline-completion recipe must keep working (defect H).
+
+ Defect H looked like "the writer refuses an inline depth-2 stage". It is not:
+ the refusal fires only when the caller supplies NO attempt metadata, and an
+ inline owner can state the axes it actually had. Nobody invoked it that way
+ because the recipe appeared in no document -- `rt-b2d68cbf14d31c62` has eight
+ nodes and zero markers for that reason, not because `complete` said no.
+
+ This pins both halves: the command works, and the document still shows it.
+ """
+
+ def setUp(self):
+  self.tmp=tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
+  self.base=Path(self.tmp.name)
+  self.jobs=self.base/"state"/"jobs.log"
+  self.jobs.parent.mkdir(parents=True,exist_ok=True); self.jobs.touch()
+  self.previous=os.environ.get("AGENT_DISPATCH_JOBS")
+  os.environ["AGENT_DISPATCH_JOBS"]=str(self.jobs)
+  self.addCleanup(self._restore)
+
+ def _restore(self):
+  if self.previous is None: os.environ.pop("AGENT_DISPATCH_JOBS",None)
+  else: os.environ["AGENT_DISPATCH_JOBS"]=self.previous
+
+ def _route(self,artifact_root):
+  gate={"spec_read":{"satisfied":True,"source":"canonical-prd-sha256"},
+        "drift_verdict":"within-spec","workflow_mode":"tracked",
+        "artifact_guard":{"satisfied":True,"source":"conductor-prechecked"}}
+  evidence={"tuples":[{
+    "parent_harness":"codex","parent_transport":"headless",
+    "parent_sandbox":R.WRAPPER_PARENT_SANDBOXES["codex"][0],
+    "child_harness":"codex","launch_authority":"conductor","status":"supported",
+    "probe_source":"inline-recipe","probe_time":"2026-09-06T00:00:00Z",
+    "failure_class":"","checked_worktree":str(R.ROOT.resolve()),
+    "failure_scope":"none","codex_command":"ok","retry_on_isolated_worktree":0,
+   }],"native_subagent":[{
+    "harness":"codex","transport":"headless",
+    "execution_surface":"codex-native-subagent","registered_worker":False,
+    "status":"supported","check_source":"inline-recipe"}]}
+  return R.compile_route(
+   "autopilot-code","dev","strong",R.ROOT,artifact_root,
+   predicates=[],signals=["shared-contract"],transport="headless",
+   tracking="tracked",tracked_gate_evidence=gate,dispatch_evidence=evidence)
+
+ def _axes(self,depth=2):
+  return {"attempt_schema_version":2,"dispatch_depth":depth,"transport":"headless",
+          "execution_surface":"inline","registered_worker":False,
+          "fallback_hop":"inline"}
+
+ def test_the_documented_inline_recipe_publishes_a_current_marker(self):
+  artifact=self.base/"artifacts"
+  route=self._route(artifact)
+  node=next(n for n in route["nodes"] if n["id"]=="execute")
+  out=artifact/"evidence"/"execute.md"
+  out.parent.mkdir(parents=True,exist_ok=True); out.write_text("ran inline\n",encoding="utf-8")
+  marker,row=R.complete_node(route,node,"execute",out,
+   attempt_id="att-inline-execute",explicit_attempt_metadata=self._axes())
+  # No registry row is closed; the returned row is the typed
+  # `unregistered-complete` receipt saying so.
+  self.assertEqual(row.get("status"),"unregistered-complete")
+  self.assertEqual(self.jobs.read_text(encoding="utf-8"),"",
+                   "an inline completion must not write to the registry")
+  path=R.completion_dir(route["route_id"],jobs=self.jobs)/"execute.json"
+  self.assertTrue(path.is_file())
+  self.assertTrue(D.completion_marker_is_current(route,node,path))
+  self.assertEqual(marker["execution_surface"],"inline")
+  self.assertIs(marker["registered_worker"],False)
+  # `registered_worker=0` is what makes readiness answerable without a process.
+  self.assertEqual(D.completion_attempt_readiness(route,node,marker,self.jobs).state,"ready")
+
+ def test_inline_surface_at_depth_requires_the_inline_hop(self):
+  # The combination is contract-checked, so a run cannot record a surface it
+  # did not have. This is why the recipe names both flags.
+  artifact=self.base/"artifacts"
+  route=self._route(artifact)
+  node=next(n for n in route["nodes"] if n["id"]=="execute")
+  out=artifact/"evidence"/"execute.md"
+  out.parent.mkdir(parents=True,exist_ok=True); out.write_text("x\n",encoding="utf-8")
+  axes=dict(self._axes(),fallback_hop="same-harness-headless")
+  with self.assertRaises((ValueError,D.DispatchContractError)):
+   R.complete_node(route,node,"execute",out,attempt_id="att-bad",
+                   explicit_attempt_metadata=axes)
+
+ def test_the_recipe_is_actually_documented(self):
+  # Defect H's real cause: the flags exist and appear in no document, so the
+  # one published recipe (`--jobs --attempt-id`) is the only one an owner sees
+  # -- and an inline run cannot satisfy it.
+  for relative in (
+   "skills/autopilot-code/references/dev-pipeline.md",
+   "adapters/claude/skills/autopilot-code/references/dev-pipeline.md",
+   "adapters/claude/plugin-marketplace/plugins/hearting-claude/skills/"
+   "autopilot-code/references/dev-pipeline.md",
+  ):
+   text=(Path(R.ROOT)/relative).read_text(encoding="utf-8")
+   with self.subTest(relative):
+    # The recipe must be a runnable block, not a passing mention: find the
+    # fenced command that completes without `--jobs` and check its flags.
+    flags=("--execution-surface inline","--fallback-hop inline",
+           "--registered-worker 0","--dispatch-depth")
+    recipes=[block for block in text.split("```")
+             if "capability-route.py complete" in block
+             and "--jobs" not in block
+             and all(flag in block for flag in flags)]
+    self.assertEqual(
+     len(recipes),1,
+     "the inline completion recipe must appear exactly once, as a runnable "
+     "block that states every axis and passes no --jobs",
+    )
+
+
 if __name__=="__main__": unittest.main()
