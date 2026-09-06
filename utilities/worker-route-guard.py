@@ -92,9 +92,18 @@ def _qualifying_retry_evidence(route: dict, node_id: str, current_attempt: str |
     evidence was written under an ancestor's id and this gate could never see
     it -- an SD-67 retry carried by a continuation was refused rather than
     adjudicated, and the operator's only route was to re-dispatch in place on
-    the original route. The lineage comes from the sealed record
-    (`source_route_id`, `supersession_edges`), both covered by `route_hash`, so
-    a forged ancestor fails `verify_route` before this runs.
+    the original route.
+
+    The lineage comes from the record's `source_route_id` and
+    `supersession_edges`. **This is not an authentication boundary**, and an
+    earlier version of this comment wrongly said it was: `route_hash` is
+    unkeyed, and nothing checks that a named ancestor is semantically this
+    route's ancestor (same cwd, reachable chain). Anyone able to author a route
+    record could already set `source_commit` or `resume_retry_boundaries`
+    directly, and the registry this reads is the ambient
+    `AGENT_DISPATCH_JOBS` -- forgeable on `main` too. So this widening rests on
+    exactly the trust boundary the surrounding gate already assumed; it does
+    not add one, and it must not be cited as providing one.
 
     The three SD-67 conditions are unchanged: the node must still be declared
     in `resume_retry_boundaries`, the prior attempt must still be a different

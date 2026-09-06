@@ -373,17 +373,46 @@ class ContinuationRetryLineageTest(WorkerRouteGuardTest):
     G.validate_route_contract(path, "execute", repo, repo)
    self.assertEqual(ctx.exception.reason, "route-source-commit-mismatch")
 
- def test_the_lineage_carries_the_ancestor_twice_on_purpose(self):
-  # `source_route_id` and the `supersession_edges` entry both name the
-  # predecessor, so dropping either alone changes nothing. Recorded here
-  # rather than claimed as coverage: a mutation removing one is correctly
-  # un-catchable.
+ def test_the_immediate_parent_arrives_by_two_paths(self):
+  # For the FIRST generation only, `source_route_id` and the single
+  # `supersession_edges` entry both name the same predecessor, so dropping
+  # either alone changes nothing here. That redundancy does not extend to
+  # grandparents -- see the next test, which is the majority shape in
+  # production.
   with tempfile.TemporaryDirectory() as td:
    _repo, source, continuation, _path, _execute = self._lineage_fixture(td)
    self.assertEqual(continuation["source_route_id"], source["route_id"])
    self.assertIn(source["route_id"],
                  [edge.get("from_route_id")
                   for edge in continuation.get("supersession_edges", [])])
+
+ def test_a_grandparents_attempt_reaches_only_through_supersession_edges(self):
+  # The second generation is where the edges stop being redundant: the
+  # grandparent is named by NO `source_route_id` on this record, only by an
+  # inherited edge. I claimed this branch was un-catchable; it is not, and it
+  # is the majority path -- 16 of 31 production continuation records carry two
+  # or more edges (independent review, 2026-09-06).
+  with tempfile.TemporaryDirectory() as td:
+   repo, grandparent, first, _path, _execute = self._lineage_fixture(td)
+   # Resume at the first node, as the first generation did: a later resume
+   # point would need reused-evidence markers for the skipped prefix, which is
+   # a different contract and not what this test is about.
+   head_node = first["nodes"][0]["id"]
+   second = R.build_continuation_route(
+    first, resume_from_node=head_node, requested_boundary=head_node,
+    reason="second-generation", artifact_root=first["artifact_root"])
+   self.assertEqual(second["source_route_id"], first["route_id"])
+   self.assertNotEqual(second["source_route_id"], grandparent["route_id"])
+   # The grandparent is reachable only through the inherited edges.
+   edges = [edge.get("from_route_id") for edge in second.get("supersession_edges", [])]
+   self.assertIn(grandparent["route_id"], edges)
+   self.assertIn(grandparent["route_id"], R.continuation_lineage_route_ids(second))
+   # And its attempt is what admits the node two generations later.
+   self.assertTrue(G._qualifying_retry_evidence(second, "execute", None))
+   path = Path(td)/"second.json"
+   path.write_text(json.dumps(second))
+   _route, node, _git = G.validate_route_contract(path, "execute", repo, repo)
+   self.assertEqual(node["id"], "execute")
 
  def test_a_node_outside_resume_retry_boundaries_is_still_refused(self):
   # SD-67's first condition is untouched: only a declared boundary may retry.

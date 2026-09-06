@@ -1122,12 +1122,16 @@ def continuation_lineage_route_ids(source_route):
     needs it to find the retry evidence that pin implies (SD-133). One
     definition, so the two can never disagree about what an ancestor is.
 
-    A declined continuation records no attempts of its own -- the guard refuses
-    its whole pre-mutation prefix -- so asking the registry only about the
-    immediate predecessor finds a clean slate one generation later, and the
-    decline evaporates (review round 3, B1). The lineage is already carried:
-    `source_route_id` names the predecessor and `supersession_edges` accumulates
-    every earlier `from_route_id`.
+    A declined continuation records no attempts of its own, so asking the
+    registry only about the immediate predecessor finds a clean slate one
+    generation later and the decline evaporates (SD-128 review round 3, B1).
+    The lineage is already carried: `source_route_id` names the predecessor and
+    `supersession_edges` accumulates every earlier `from_route_id`.
+
+    `source_route_id` and the first edge name the same route, so for a
+    first-generation continuation they are redundant. They stop being redundant
+    at the second generation, where a grandparent is reachable **only** through
+    an inherited edge -- and that is the common shape, not the exception.
     """
     ids=[]
     candidates=[source_route.get("route_id"),source_route.get("source_route_id")]
