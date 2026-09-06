@@ -7,6 +7,10 @@ def load(name,path):
  spec=importlib.util.spec_from_file_location(name,path); mod=importlib.util.module_from_spec(spec); spec.loader.exec_module(mod); return mod
 R=load("route",ROOT/"utilities/capability-route.py")
 TX=load("spec_transaction",ROOT/"utilities/spec-transaction.py")
+# Owner finding D1 (2026-09-07): `spec-transaction.py` resolves its spec bucket from
+# AGENT_ARTIFACT_* (not from --artifact-root), so a child inheriting a dispatch
+# environment wrote a LIVE cycle bucket. Every child gets a scrubbed environment.
+HERMETIC_ENV={k:v for k,v in os.environ.items() if not k.startswith("AGENT_ARTIFACT_")}
 
 def dispatch(worktree):
  return {"tuples":[{"parent_harness":"codex","parent_transport":"headless","parent_sandbox":"workspace-write","child_harness":"codex","launch_authority":"conductor","status":"supported","probe_source":"fixture","probe_time":"2026-07-16T00:00:00Z","failure_class":"","checked_worktree":str(Path(worktree).resolve()),"failure_scope":"none","codex_command":"ok","retry_on_isolated_worktree":0}],"native_subagent":[]}
@@ -34,10 +38,10 @@ class SpecTransactionTest(unittest.TestCase):
    root=Path(td); artifact,spec,route=self.fixture(root); (spec/"prd.md").write_text("v0\n"); events=root/"events.jsonl"
    code="import os,time; from pathlib import Path; Path(os.environ['AGENT_SPEC_ROOT'],'prd.md').write_text('v'+os.environ['AGENT_SPEC_NEXT_VERSION']+'\\n'); time.sleep(float(os.environ.get('HOLD','0')))"
    base=self.command(root,artifact,route,code,events=events)
-   first=subprocess.Popen(base,env={**os.environ,"HOLD":".4"},stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+   first=subprocess.Popen(base,env={**HERMETIC_ENV,"HOLD":".4"},stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
    deadline=time.time()+2
    while time.time()<deadline and (not events.exists() or '"status": "acquired"' not in events.read_text()): time.sleep(.02)
-   second=subprocess.Popen(base,env={**os.environ,"HOLD":"0"},stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+   second=subprocess.Popen(base,env={**HERMETIC_ENV,"HOLD":"0"},stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
    out1,err1=first.communicate(timeout=4); out2,err2=second.communicate(timeout=4)
    self.assertEqual(first.returncode,0,out1+err1); self.assertEqual(second.returncode,0,out2+err2)
    rows=[json.loads(line) for line in events.read_text().splitlines()]
@@ -51,7 +55,7 @@ class SpecTransactionTest(unittest.TestCase):
    with self.subTest(existing=existing), tempfile.TemporaryDirectory() as td:
     root=Path(td); artifact,spec,route=self.fixture(root)
     if existing: (spec/"prd.md").write_text("same\n")
-    result=subprocess.run(self.command(root,artifact,route,code),text=True,capture_output=True)
+    result=subprocess.run(self.command(root,artifact,route,code),text=True,capture_output=True,env=HERMETIC_ENV)
     self.assertEqual(result.returncode,0,result.stdout+result.stderr)
     self.assertFalse((spec/"_internal/versions").exists())
 
@@ -59,7 +63,7 @@ class SpecTransactionTest(unittest.TestCase):
   with tempfile.TemporaryDirectory() as td:
    root=Path(td); artifact,spec,route=self.fixture(root); (spec/"prd.md").write_text("before\n")
    code="import os; from pathlib import Path; root=Path(os.environ['AGENT_SPEC_ROOT']); (root/'_internal/versions'/('v'+os.environ['AGENT_SPEC_NEXT_VERSION'])).mkdir(parents=True,exist_ok=True); (root/'prd.md').write_text('after\\n')"
-   result=subprocess.run(self.command(root,artifact,route,code),text=True,capture_output=True)
+   result=subprocess.run(self.command(root,artifact,route,code),text=True,capture_output=True,env=HERMETIC_ENV)
    self.assertEqual(result.returncode,0,result.stdout+result.stderr)
    self.assertEqual((spec/"_internal/versions/v1/prd.md").read_text(),"before\n")
 
@@ -67,7 +71,7 @@ class SpecTransactionTest(unittest.TestCase):
   with tempfile.TemporaryDirectory() as td:
    root=Path(td); artifact,spec,route=self.fixture(root); (spec/"prd.md").write_text("before\n")
    code="import os; from pathlib import Path; root=Path(os.environ['AGENT_SPEC_ROOT']); snap=root/'_internal/versions'/('v'+os.environ['AGENT_SPEC_NEXT_VERSION']); snap.mkdir(parents=True,exist_ok=True); (snap/'prd.md').write_text('wrong\\n'); (root/'prd.md').write_text('after\\n')"
-   result=subprocess.run(self.command(root,artifact,route,code),text=True,capture_output=True)
+   result=subprocess.run(self.command(root,artifact,route,code),text=True,capture_output=True,env=HERMETIC_ENV)
    self.assertEqual(result.returncode,65,result.stdout+result.stderr)
    self.assertIn("version-snapshot-mismatch",result.stdout)
 
@@ -75,7 +79,7 @@ class SpecTransactionTest(unittest.TestCase):
   with tempfile.TemporaryDirectory() as td:
    root=Path(td); artifact,spec,route=self.fixture(root); (spec/"prd.md").write_text("before\n")
    code="import os,sys; from pathlib import Path; Path(os.environ['AGENT_SPEC_ROOT'],'prd.md').write_text('partial\\n'); sys.exit(7)"
-   result=subprocess.run(self.command(root,artifact,route,code),text=True,capture_output=True)
+   result=subprocess.run(self.command(root,artifact,route,code),text=True,capture_output=True,env=HERMETIC_ENV)
    self.assertEqual(result.returncode,7,result.stdout+result.stderr)
    self.assertEqual((spec/"_internal/versions/v1/prd.md").read_text(),"before\n")
 
@@ -84,7 +88,7 @@ class SpecTransactionTest(unittest.TestCase):
    root=Path(td); artifact=root/".agent_reports"; artifact.mkdir(); subprocess.run(["git","init","-q",str(root)],check=True)
    gate={"spec_read":{"satisfied":True,"source":"fixture"},"drift_verdict":"within-spec","workflow_mode":"tracked","artifact_guard":{"satisfied":True,"source":"fixture"}}
    route=R.compile_route("autopilot-code","dev","direct",root,artifact,predicates=["atomic-outcome","known-scope","no-shared-contract","no-resource-run","no-artifact-handoff","no-independent-verifier","focused-verification"],inline_reason="atomic-direct",tracking="tracked",tracked_gate_evidence=gate)
-   path=root/"route.json"; path.write_text(json.dumps(route)); result=subprocess.run([sys.executable,str(ROOT/"utilities/spec-transaction.py"),"run","--artifact-root",str(artifact),"--worktree",str(root),"--route",str(path),"--node","inline","--",sys.executable,"-c","pass"],text=True,capture_output=True)
+   path=root/"route.json"; path.write_text(json.dumps(route)); result=subprocess.run([sys.executable,str(ROOT/"utilities/spec-transaction.py"),"run","--artifact-root",str(artifact),"--worktree",str(root),"--route",str(path),"--node","inline","--",sys.executable,"-c","pass"],text=True,capture_output=True,env=HERMETIC_ENV)
    self.assertEqual(result.returncode,65); self.assertIn("spec-touch-not-declared",result.stdout)
 
   # -- the v{N} chain is canonical, not per-tree ------------------------------
@@ -156,6 +160,11 @@ class SpecTransactionTest(unittest.TestCase):
     self.assertEqual(ctx.exception.reason,"version-chain-unenumerable")
    finally: os.chmod(sealed,0o755)
    self.assertEqual(TX.next_version(open_bucket,artifact),10)
+   # owner finding F1: an unreadable `_internal/versions` of a walkable tree is typed as well
+   versions=sealed/"2026-09-06_a/artifacts/spec/_internal/versions"; os.chmod(versions,0)
+   try:
+    with self.assertRaises(TX.VersionChainError): TX.next_version(open_bucket,artifact)
+   finally: os.chmod(versions,0o755)
 
  @unittest.skipIf(os.geteuid()==0,"permission bits do not bind root")
  def test_unwalkable_root_is_a_typed_refusal(self):
@@ -167,7 +176,7 @@ class SpecTransactionTest(unittest.TestCase):
    root=Path(td); artifact,spec,route=self.fixture(root); (spec/"prd.md").write_text("before\n")
    broken=artifact/"campaigns/2026-01-01_broken"; (broken/"2026-01-01_broken/artifacts/spec").mkdir(parents=True); os.chmod(broken,0)
    events=root/"ev.jsonl"
-   try: result=subprocess.run(self.command(root,artifact,route,"pass",events=events),text=True,capture_output=True)
+   try: result=subprocess.run(self.command(root,artifact,route,"pass",events=events),text=True,capture_output=True,env=HERMETIC_ENV)
    finally: os.chmod(broken,0o755)
    self.assertEqual(result.returncode,65,result.stdout+result.stderr)
    rows=[json.loads(l) for l in events.read_text().splitlines()]
@@ -182,7 +191,7 @@ class SpecTransactionTest(unittest.TestCase):
   with tempfile.TemporaryDirectory() as td:
    root=Path(td); artifact,component,route=self.fixture(root,component="component"); (component/"prd.md").write_text("before\n")
    code="import os; from pathlib import Path; Path(os.environ['AGENT_SPEC_ROOT'],'prd.md').write_text('after\\n')"
-   result=subprocess.run(self.command(root,artifact,route,code,spec_root=component),text=True,capture_output=True)
+   result=subprocess.run(self.command(root,artifact,route,code,spec_root=component),text=True,capture_output=True,env=HERMETIC_ENV)
    self.assertEqual(result.returncode,0,result.stdout+result.stderr)
    self.assertEqual((component/"_internal/versions/v1/prd.md").read_text(),"before\n")
    self.assertFalse((artifact/"spec/_internal/versions/v1").exists())
@@ -239,7 +248,7 @@ class CycleLayoutTest(unittest.TestCase):
   return self.P.admit_shared(self.artifact,cycle_id=begun["cycle_id"],kind="spec",source="spec",key="spec")
 
  def _run(self, cycle_dir, code, events):
-  env={**os.environ,"AGENT_ARTIFACT_CYCLE_DIR":str(cycle_dir),"AGENT_ARTIFACT_ROOT":str(self.artifact)}
+  env={**HERMETIC_ENV,"AGENT_ARTIFACT_CYCLE_DIR":str(cycle_dir),"AGENT_ARTIFACT_ROOT":str(self.artifact)}
   cmd=[sys.executable,str(ROOT/"utilities/spec-transaction.py"),"run","--artifact-root",str(self.artifact),"--worktree",str(self.repo),"--route",str(self.spec_route),"--node","prd-transaction","--events",str(events),"--",sys.executable,"-c",code]
   return subprocess.run(cmd,text=True,capture_output=True,env=env)
 
@@ -343,7 +352,7 @@ class CycleLayoutTest(unittest.TestCase):
  def test_refused_route_seeds_nothing(self):
   self._shared_v1()
   _r,_f,begun=self._cycle("spec-edit-4"); cycle_dir=Path(begun["cycle_dir"]); events=Path(self._tmp.name)/"ev4.jsonl"
-  env={**os.environ,"AGENT_ARTIFACT_CYCLE_DIR":str(cycle_dir),"AGENT_ARTIFACT_ROOT":str(self.artifact)}
+  env={**HERMETIC_ENV,"AGENT_ARTIFACT_CYCLE_DIR":str(cycle_dir),"AGENT_ARTIFACT_ROOT":str(self.artifact)}
   cmd=[sys.executable,str(ROOT/"utilities/spec-transaction.py"),"run","--artifact-root",str(self.artifact),"--worktree",str(self.repo),"--route",str(self.spec_route),"--node","no-such-node","--events",str(events),"--",sys.executable,"-c","pass"]
   result=subprocess.run(cmd,text=True,capture_output=True,env=env)
   self.assertEqual(result.returncode,65,result.stdout+result.stderr)

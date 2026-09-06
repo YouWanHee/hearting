@@ -165,10 +165,18 @@ def version_history_trees(spec_root: Path, artifact_root: Path, component: str="
 
 
 def chain_next(trees: list[Path]) -> tuple[int, Path | None]:
-    """`(max(N)+1, the first tree holding max(N))`; `(1, None)` on an empty chain."""
+    """`(max(N)+1, the first tree holding max(N))`; `(1, None)` on an empty chain.
+
+    Raises `VersionChainError` when any tree's `_internal/versions` cannot be
+    read: an unreadable tree may hold the maximum, so the counter must not
+    answer at all (spec owner finding F1: this read used to sit outside the
+    typed guard and after the seed).
+    """
     best=0; source=None
     for tree in trees:
-        found=versions_max(tree)
+        try: found=versions_max(tree)
+        except OSError as exc:
+            raise VersionChainError("version-chain-unenumerable",f"{type(exc).__name__}: {exc}") from exc
         if found>best: best,source=found,tree
     return best+1,source
 
@@ -304,10 +312,13 @@ def main():
                 if time.monotonic()>=deadline:
                     emit({"status":"blocked","reason":"spec-lock-timeout","route_id":route["route_id"]},args.events); return 3
                 time.sleep(max(.01,args.poll))
-        # Enumerate the v{N} chain before seeding: a root that cannot be walked
-        # is a typed refusal that leaves no seed residue behind, and the counter
-        # never guesses low (review round 1, blocking finding 1).
-        try: trees=version_history_trees(spec_root,artifact,component)
+        # Enumerate the v{N} chain and read every tree's versions BEFORE seeding:
+        # a root that cannot be walked or read is a typed refusal that leaves no
+        # seed residue behind, and the counter never guesses low (review round 1
+        # blocking 1; owner finding F1). The seeded copy only carries history
+        # the chain already counted (the latest shared revision and its
+        # siblings), so the number is final before the seed runs.
+        try: version,source=chain_next(version_history_trees(spec_root,artifact,component))
         except VersionChainError as exc:
             emit({"status":"blocked","reason":exc.reason,"detail":exc.detail,"route_id":route["route_id"],"spec_root":str(spec_root)},args.events)
             lock.seek(0); lock.truncate(); lock.flush(); os.fsync(lock.fileno())
@@ -318,7 +329,6 @@ def main():
             # transactions on one cycle must not interleave a half copy.
             seeded=seed_cycle_spec(spec_base,artifact)
             emit({**seeded,"route_id":route["route_id"]},args.events)
-        version,source=chain_next(trees)   # re-reads the disk, so the seeded copy is seen
         if spec_layout=="cycle" and version==1 and (spec_root/"prd.md").is_file():
             # A pre-image with no history in ANY tree of this spec's chain
             # (current root, cycle buckets, shared revisions, legacy): the
