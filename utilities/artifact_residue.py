@@ -40,10 +40,24 @@ spec-impact where D-23 has no row):
   trash              `.gitkeep`, nested `.agent_reports|.claude_reports/.runtime`
                      -> deletion only through `retire-trash --approval`
                      (backup tar + inventory digest, W7F/D-84 pattern).
+  rejoin             a *live* symlink whose nearest legacy ancestor directory
+                     (a sibling regular file's parent, or a `kind: directory`
+                     row) resolves through the compat chain -> the link itself
+                     is renamed to `<mapped ancestor>/<tail>` (readlink bytes
+                     preserved, never copied; absolute targets untouched, a
+                     relative target must resolve at the new place). No cycle
+                     is begun and no sealed manifest is rewritten: the compat
+                     row (`kind: symlink`, `link_target`, `relocated_from`)
+                     is the record (spec-impact, D-23-b symlink row).
   deferred           `spec/` (consumers still read the legacy PRD: cairn's
-                     nightly backfill, `spec-skill-gate` `find_prd`) and files
-                     whose locator cannot be a D-6 locator -> typed, left in
-                     place, counted in the gate as `deferred`.
+                     nightly backfill, `spec-skill-gate` `find_prd`; opt in
+                     with `--include-spec-top` to dispose of it as root
+                     support residue), a live symlink with no mapped ancestor
+                     or whose relative target would not resolve after the
+                     move (`symlink-relative-unresolvable`), a dangling
+                     symlink (retire path), and files whose locator cannot be
+                     a D-6 locator -> typed, left in place, counted in the
+                     gate as `deferred`.
 
 Mechanics reuse W7G/W7I: same-filesystem rename only, per-operation inverse
 rows, monotone journal under `.runtime/artifact-producer/v1/migrations/
@@ -261,6 +275,78 @@ def _map_sources(root: Path) -> List[Tuple[str, str]]:
     return _MAP_SOURCES[key]
 
 
+_ANCESTOR_MAPS: Dict[str, Dict[str, Dict[str, int]]] = {}
+
+
+def _ancestor_map(root: Path) -> Dict[str, Dict[str, int]]:
+    """`legacy directory -> {current directory: supporting rows}` derived from the compat chain.
+
+    The chain is collapsed to one *current* target per source first (a later
+    map re-maps the same legacy source to its newer home, D-82 latest wins),
+    then every row lends its mapping to each ancestor directory that shares the
+    same path tail on both sides (`plans/d1/plan/plan.md -> .../artifacts/
+    plans/d1/plan/plan.md` says `plans/d1 -> .../artifacts/plans/d1`). A
+    `kind: directory` row contributes itself. A sanitized D-6-b locator shares
+    no tail and lends nothing. The counts let a caller prefer the home most of
+    a directory's siblings went to (its origin cycle) over a home only its
+    support residue went to.
+    """
+    compat = C.compat_path(root)
+    try:
+        st = compat.stat()
+        key = f"{root}|{st.st_mtime_ns}|{st.st_size}"
+    except OSError:
+        key = f"{root}|absent"
+    if key not in _ANCESTOR_MAPS:
+        _ANCESTOR_MAPS.clear()
+        current: Dict[str, str] = {}
+        for source, target in _map_sources(root):
+            current[source] = target
+        out: Dict[str, Dict[str, int]] = {}
+        for source, target in current.items():
+            s_parts, t_parts = source.split("/"), target.split("/")
+            if len(s_parts) >= 2:
+                out.setdefault(source, {})
+                out[source][target] = out[source].get(target, 0) + 1
+            # Never below the D-23 boundary: a bare bucket (`plans`) is nobody's
+            # home, only `<bucket>/<d1>` and deeper directories are.
+            for depth in range(2, len(s_parts)):
+                tail = s_parts[depth:]
+                if len(t_parts) <= len(tail) or t_parts[-len(tail):] != tail:
+                    continue  # a sanitized component breaks this tail, a shorter one may still match
+                ancestor = "/".join(s_parts[:depth])
+                mapped = "/".join(t_parts[:-len(tail)])
+                votes = out.setdefault(ancestor, {})
+                votes[mapped] = votes.get(mapped, 0) + 1
+        _ANCESTOR_MAPS[key] = out
+    return _ANCESTOR_MAPS[key]
+
+
+def rejoin_target(root: Path, rel: str) -> Optional[Dict[str, Any]]:
+    """Where a legacy symlink at `rel` rejoins its migrated siblings, or None.
+
+    Nearest ancestor first, never shallower than `<bucket>/<d1>` (D-23
+    boundary); among that ancestor's mapped homes the one most rows support
+    (ties: lexicographic), and only a home that is a real directory right now.
+    Returns `{"target": <root-relative>, "ancestor": <legacy dir>,
+    "mapped_ancestor": <current dir>, "rows": <votes>}`.
+    """
+    amap = _ancestor_map(root)
+    parts = rel.split("/")
+    for depth in range(len(parts) - 1, 1, -1):
+        ancestor = "/".join(parts[:depth])
+        votes = amap.get(ancestor)
+        if not votes:
+            continue
+        ranked = sorted(votes.items(), key=lambda item: (-item[1], item[0]))
+        for mapped, count in ranked:
+            home = Path(root) / mapped
+            if home.is_dir() and not home.is_symlink():
+                tail = "/".join(parts[depth:])
+                return {"target": f"{mapped}/{tail}", "ancestor": ancestor, "mapped_ancestor": mapped, "rows": count}
+    return None
+
+
 def _origin_cycle(root: Path, rel_dir: str) -> Optional[Dict[str, Any]]:
     """The migrated cycle a legacy `<bucket>/<d1>` directory resolves to, if any.
 
@@ -293,6 +379,20 @@ def _origin_cycle(root: Path, rel_dir: str) -> Optional[Dict[str, Any]]:
                     "started_on": record.get("resplit_started_on") or record.get("started_on") or cycle.get("started_on")}
         if probe == Path(root) or probe.parent == probe:
             break
+        probe = probe.parent
+    return None
+
+
+def _cycle_id_above(root: Path, rel: str) -> Optional[str]:
+    """The sealed cycle a root-relative path sits in (nearest `manifest.json` above it), if any."""
+    probe = (Path(root) / rel).parent
+    for _ in range(12):
+        if (probe / "manifest.json").is_file():
+            manifest = P._read_json(probe / "manifest.json") or {}
+            cycle_id = (manifest.get("cycle") or {}).get("cycle_id")
+            return cycle_id if isinstance(cycle_id, str) else None
+        if probe == Path(root) or probe.parent == probe:
+            return None
         probe = probe.parent
     return None
 
@@ -335,16 +435,31 @@ def sanitize_locator(rel: str) -> Tuple[str, bool]:
     return joined, joined != rel
 
 
-def classify(root: Path, rel: str, *, origin_cache: Dict[str, Optional[Dict[str, Any]]]) -> Dict[str, Any]:
+def classify(root: Path, rel: str, *, origin_cache: Dict[str, Optional[Dict[str, Any]]],
+             include_spec_top: bool = False) -> Dict[str, Any]:
     parts = rel.split("/")
     top, name = parts[0], parts[-1]
     row: Dict[str, Any] = {"path": rel, "top": top}
     link = Path(root) / rel
     if link.is_symlink():
-        target = os.readlink(link)
-        resolved = Path(target) if os.path.isabs(target) else link.parent / target
+        link_target = os.readlink(link)
+        absolute = os.path.isabs(link_target)
+        resolved = Path(link_target) if absolute else link.parent / link_target
         row.update(shape="symlink", disposition="deferred", group=None, target=None, reason="symlink",
-                   link_target=target, dangling=not resolved.exists())
+                   link_target=link_target, link_absolute=absolute, dangling=not resolved.exists())
+        if row["dangling"]:
+            return row  # retire path (`retire-trash --include-dangling-symlinks`), never a rejoin
+        found = rejoin_target(root, rel)
+        if found is None:
+            return row
+        if not absolute and not ((Path(root) / found["target"]).parent / link_target).exists():
+            # The link would dangle at its new home (its target did not
+            # migrate, or migrates in this very run): leave it, typed.
+            row.update(reason="symlink-relative-unresolvable", rejoin_target=found["target"])
+            return row
+        row.update(disposition="rejoin", target=found["target"], reason=None,
+                   rejoin_ancestor=found["ancestor"], rejoin_mapped_ancestor=found["mapped_ancestor"],
+                   rejoin_rows=found["rows"], rejoin_cycle_id=_cycle_id_above(root, found["target"]))
         return row
     if name == ".gitkeep" or any(p in {".agent_reports", ".claude_reports", ".runtime"} for p in parts[1:]):
         row.update(shape="trash", disposition="retire-with-approval", group=None, target=None)
@@ -358,7 +473,14 @@ def classify(root: Path, rel: str, *, origin_cache: Dict[str, Optional[Dict[str,
                    target=f"artifacts/{safe_rel}", evidence_prefix=evidence_prefix)
         return row
     if top in DEFERRED_TOPS:
-        row.update(shape="spec", disposition="deferred", group=None, target=None, reason="spec-consumer-pinned")
+        if not include_spec_top:
+            row.update(shape="spec", disposition="deferred", group=None, target=None, reason="spec-consumer-pinned")
+            return row
+        # `--include-spec-top`: the operator has verified no consumer reads the
+        # legacy tree any more; it moves as root support residue (rename only,
+        # compat rows keep the way back).
+        row.update(shape="root-support", disposition="root-support-cycle", group="support:root",
+                   target=f"artifacts/_internal/{safe_rel}", spec_top=True)
         return row
     if top in ROUTE_TOPS or (len(parts) == 1 and _ROUTEISH.search(name)):
         row.update(shape="route-container", disposition="runtime-routes-legacy", group="routes",
@@ -451,11 +573,29 @@ def _cycle_spec(root: Path, group: str, rows: List[Dict[str, Any]]) -> Dict[str,
     raise ResidueError("residue-group-unknown", group)
 
 
-def build_plan(root: Path) -> Dict[str, Any]:
+def _free_cycle_key(root: Path, ledger: Mapping[str, Mapping[str, Any]], base: str) -> str:
+    """The residue cycle key this run may `begin` under.
+
+    The per-cycle route ledger is keyed by cycle key (D-77-b idempotency), and a
+    sealed residue cycle leaves its derived route closed, so a later run that
+    finds *new* residue for the same group (a root whose `support:root` cycle
+    was sealed on 2026-09-05 and now disposes of `spec/` under
+    `--include-spec-top`) must open the next ordinal, `<base>#2`. An open key
+    is kept, so a resumed run still finds its own route.
+    """
+    key, ordinal = base, 1
+    while key in ledger and P.route_is_closed(root, ledger[key]):
+        ordinal += 1
+        key = f"{base}#{ordinal}"
+    return key
+
+
+def build_plan(root: Path, *, include_spec_top: bool = False) -> Dict[str, Any]:
     root = Path(root).resolve()
     identity = P.artifact_lifecycle.read_root_identity(root)
     origin_cache: Dict[str, Optional[Dict[str, Any]]] = {}
-    rows = [classify(root, rel, origin_cache=origin_cache) for rel in iter_residue_files(root)]
+    rows = [classify(root, rel, origin_cache=origin_cache, include_spec_top=include_spec_top)
+            for rel in iter_residue_files(root)]
     for row in rows:
         st = (root / row["path"]).lstat()
         row["size"] = st.st_size
@@ -466,10 +606,12 @@ def build_plan(root: Path) -> Dict[str, Any]:
     for row in rows:
         if row["group"] and row["disposition"] != "runtime-routes-legacy":
             groups.setdefault(row["group"], []).append(row)
+    ledger = RS.ledger_resplit_routes(root)
     cycles = []
     for group, grows in groups.items():
         spec = _cycle_spec(root, group, grows)
-        cycles.append({**spec, "group": group, "cycle_key": f"residue:{_root_slug(root)}:{group}",
+        cycles.append({**spec, "group": group,
+                       "cycle_key": _free_cycle_key(root, ledger, f"residue:{_root_slug(root)}:{group}"),
                        "files": [{"path": r["path"], "target": r["target"], "size": r["size"], "inode": r["inode"],
                                   **({"locator_renamed_from": r["locator_renamed_from"]} if r.get("locator_renamed_from") else {})}
                                  for r in grows],
@@ -478,8 +620,15 @@ def build_plan(root: Path) -> Dict[str, Any]:
     routes = [{"path": r["path"], "target": r["target"], "size": r["size"], "inode": r["inode"]}
               for r in rows if r["disposition"] == "runtime-routes-legacy"]
     trash = [{"path": r["path"], "size": r["size"]} for r in rows if r["disposition"] == "retire-with-approval"]
+    rejoins = [{"path": r["path"], "target": r["target"], "link_target": r["link_target"],
+                "link_absolute": r["link_absolute"], "ancestor": r["rejoin_ancestor"],
+                "mapped_ancestor": r["rejoin_mapped_ancestor"], "rows": r["rejoin_rows"],
+                "cycle_id": r["rejoin_cycle_id"], "size": r["size"], "inode": r["inode"]}
+               for r in rows if r["disposition"] == "rejoin"]
     deferred = [{"path": r["path"], "shape": r["shape"], "reason": r["reason"],
-                 **({"link_target": r["link_target"], "dangling": r["dangling"]} if r["shape"] == "symlink" else {})}
+                 **({"link_target": r["link_target"], "dangling": r["dangling"],
+                     **({"rejoin_target": r["rejoin_target"]} if r.get("rejoin_target") else {})}
+                    if r["shape"] == "symlink" else {})}
                 for r in rows if r["disposition"] == "deferred"]
     map_state = C.load_map_state(root) if C.compat_path(root).is_file() else {"maps": [], "missing": [], "drifted": []}
     moved_maps = []
@@ -513,18 +662,28 @@ def build_plan(root: Path) -> Dict[str, Any]:
     if any(r["disposition"] == "origin-residue-cycle" for r in rows):
         spec_impact.append({"id": "D-79-residue-cycle", "detail": "support residue attaches to its migrated origin through a "
                             "separate sealed residue cycle (`residue_of`) in the origin campaign, never by rewriting the sealed manifest"})
+    if rejoins:
+        spec_impact.append({"id": "D-23-b-symlink-rejoin", "detail": f"{len(rejoins)} live symlink(s) whose siblings migrated "
+                            "rejoin them by rename (readlink bytes preserved, no copy) inside the sealed destination cycle; "
+                            "the sealed manifest is not rewritten and the compat row (kind: symlink, link_target, relocated_from) "
+                            "is the only record; D-23-b's `symlink -> typed deferral in place` row narrows to links with no mapped ancestor"})
+    if any(r.get("spec_top") for r in rows):
+        spec_impact.append({"id": "D-23-b-spec-top", "detail": "legacy `spec/` moved as root support residue under "
+                            "`--include-spec-top` (operator-verified no legacy consumer); D-23-b's `spec/` deferral row is lifted for this root"})
     return {
         "schema_version": 1, "kind": PLAN_KIND, "algorithm_version": RESIDUE_ALGORITHM_VERSION,
         "artifact_root": str(root), "artifact_root_id": identity.artifact_root_id if identity else None,
         "root_slug": _root_slug(root),
         "totals": {"files": len(rows), "bytes": sum(r["size"] for r in rows), "cycles": len(cycles),
                    "route_files": len(routes), "trash": len(trash), "deferred": len(deferred),
+                   "rejoined": len(rejoins),
                    "movable": len(rows) - len(trash) - len(deferred), "empty_dirs": len(empty_dirs),
                    "renamed_locators": sum(c["renamed_locators"] for c in cycles),
                    "symlinks": sum(1 for r in rows if r["shape"] == "symlink"),
                    "symlinks_dangling": sum(1 for r in rows if r["shape"] == "symlink" and r.get("dangling"))},
         "by_disposition": dict(sorted(by_disposition.items())), "by_shape": dict(sorted(by_shape.items())),
-        "cycles": cycles, "routes": routes, "trash": trash, "deferred": deferred, "empty_dirs": empty_dirs,
+        "cycles": cycles, "routes": routes, "trash": trash, "deferred": deferred, "rejoins": rejoins,
+        "empty_dirs": empty_dirs, "include_spec_top": include_spec_top,
         "moved_compat_maps": moved_maps,
         "compat_state": {"maps": len(map_state["maps"]), "missing": map_state["missing"], "drifted": map_state["drifted"]},
         "spec_impact": spec_impact,
@@ -537,6 +696,8 @@ def _public(plan: Mapping[str, Any]) -> Dict[str, Any]:
         for f in cycle["files"]:
             f.pop("inode", None)
     for r in body["routes"]:
+        r.pop("inode", None)
+    for r in body.get("rejoins", []):
         r.pop("inode", None)
     return body
 
@@ -685,6 +846,27 @@ def _rename(root: Path, run_dir: Path, rows: List[Dict[str, Any]], source: Path,
     _append_inverse(run_dir, rows, {"action": "rename_back", "source": _rel(root, source), "target": _rel(root, target)})
 
 
+def _rename_link(root: Path, run_dir: Path, rows: List[Dict[str, Any]], source: Path, target: Path,
+                 expected: Mapping[str, Any]) -> None:
+    """Move a symlink by rename: the link bytes travel, the target is never read or copied."""
+    if target.is_symlink() and not source.is_symlink():
+        if os.readlink(target) != expected["link_target"]:
+            raise ResidueError("residue-link-drifted", _rel(root, target))
+        return
+    if os.path.lexists(target):
+        raise ResidueError("residue-target-exists", _rel(root, target))
+    if not source.is_symlink():
+        raise ResidueError("residue-source-missing", _rel(root, source))
+    if os.readlink(source) != expected["link_target"]:
+        raise ResidueError("residue-link-drifted", _rel(root, source))
+    if not expected["link_absolute"] and not (target.parent / expected["link_target"]).exists():
+        raise ResidueError("symlink-relative-unresolvable", _rel(root, target))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    os.rename(source, target)
+    _append_inverse(run_dir, rows, {"action": "rename_back", "kind": "symlink",
+                                    "source": _rel(root, source), "target": _rel(root, target)})
+
+
 def _phase_rename(root: Path, run_dir: Path, journal: Dict[str, Any], plan: Dict[str, Any]) -> None:
     rows = _inverse_rows(run_dir)
     first = True
@@ -697,6 +879,8 @@ def _phase_rename(root: Path, run_dir: Path, journal: Dict[str, Any], plan: Dict
                 _crash(journal, "rename:after-first-file")
     for r in plan["routes"]:
         _rename(root, run_dir, rows, root / r["path"], root / r["target"])
+    for r in plan.get("rejoins", []):
+        _rename_link(root, run_dir, rows, root / r["path"], root / r["target"], r)
     created = journal.setdefault("created_sidecars", [])
     for cycle in plan["cycles"]:
         # The cycle's primary artifact: what moved in, from where, under which
@@ -739,6 +923,19 @@ def _witness(root: Path, journal: Dict[str, Any], plan: Dict[str, Any]) -> Dict[
             check(base / f["target"], f, f["target"])
     for r in plan["routes"]:
         check(root / r["target"], r, r["target"])
+    for r in plan.get("rejoins", []):
+        path = root / r["target"]
+        try:
+            st = path.lstat()
+        except FileNotFoundError:
+            mismatches.append({"path": r["target"], "reason": "missing"})
+            continue
+        if st.st_ino != r["inode"] or not path.is_symlink() or os.readlink(path) != r["link_target"]:
+            mismatches.append({"path": r["target"], "reason": "link-changed"})
+        elif not r["link_absolute"] and not path.exists():
+            mismatches.append({"path": r["target"], "reason": "link-unresolved"})
+        else:
+            checked += 1
     if mismatches:
         raise ResidueError("residue-witness-mismatch", json.dumps(mismatches[:3], sort_keys=True))
     return {"files_checked": checked}
@@ -807,6 +1004,13 @@ def _phase_compat(root: Path, run_dir: Path, journal: Dict[str, Any], plan: Dict
     for r in plan["routes"]:
         rows.append({"schema_version": C.MAP_SCHEMA, "kind": "file", "source_locator": r["path"],
                      "target_locator": r["target"], "sha256": _sha_file(root / r["target"]), "identity_refs": []})
+    for r in plan.get("rejoins", []):
+        # The digest is of the link text, as `retire-trash` seals a symlink;
+        # the target's bytes are not this root's to hash.
+        rows.append({"schema_version": C.MAP_SCHEMA, "kind": "symlink", "source_locator": r["path"],
+                     "target_locator": r["target"], "sha256": _sha_bytes(r["link_target"].encode("utf-8")),
+                     "link_target": r["link_target"], "relocated_from": r["path"],
+                     "identity_refs": [r["cycle_id"]] if r.get("cycle_id") else []})
     pre["compat_json"] = {"bytes_b64": _b64(compat_path.read_bytes())}
     _write_journal(run_dir, journal)
     # A sealed-evidence map file that moved is re-pointed before the append so
@@ -903,7 +1107,8 @@ def _execute(root: Path, run_dir: Path, journal: Dict[str, Any], plan: Dict[str,
     if phase == "indexed":
         state = {"schema_version": 1, "contract": P.CONTRACT, "algorithm_version": RESIDUE_ALGORITHM_VERSION,
                  "state": "complete", "completed_at": _now(), "run_dir": str(run_dir),
-                 "deferred": plan["deferred"], "trash_pending": plan["trash"]}
+                 "deferred": plan["deferred"], "trash_pending": plan["trash"],
+                 "rejoined": len(plan.get("rejoins", [])), "include_spec_top": plan.get("include_spec_top", False)}
         P._write_atomic(state_path(root), P._json_bytes(state), 0o600)
         journal["phase"] = "complete"
         journal["completed_at"] = _now()
@@ -919,7 +1124,9 @@ def _rollback(root: Path, run_dir: Path, journal: Dict[str, Any]) -> None:
     for row in sorted(_inverse_rows(run_dir), key=lambda r: -r["ordinal"]):
         if row["action"] == "rename_back":
             target, source = root / row["target"], root / row["source"]
-            if target.is_file() and not source.exists():
+            # `lexists`: a moved symlink (to a directory, or dangling by now)
+            # must travel back as the link it is.
+            if (target.is_symlink() or target.is_file()) and not os.path.lexists(source):
                 source.parent.mkdir(parents=True, exist_ok=True)
                 os.rename(target, source)
     for rel in journal.get("created_sidecars", []):
@@ -1008,6 +1215,10 @@ def _report(root: Path, run_dir: Optional[Path], journal: Mapping[str, Any], pla
                        if c["cycle_key"] in begun else {})}
                    for c in plan["cycles"]],
         "routes": len(plan["routes"]),
+        "rejoins": [{"path": r["path"], "target": r["target"], "link_target": r["link_target"],
+                     "link_absolute": r["link_absolute"], "cycle_id": r.get("cycle_id")}
+                    for r in plan.get("rejoins", [])],
+        "include_spec_top": plan.get("include_spec_top", False),
     }
     body["digest"] = _canonical_digest(body)
     if run_dir is not None and not dry_run:
@@ -1016,7 +1227,8 @@ def _report(root: Path, run_dir: Optional[Path], journal: Mapping[str, Any], pla
 
 
 def apply(root: Path, *, route_file: Optional[Path] = None, dry_run: bool = False,
-          crash_at: Optional[str] = None, crash_after_phase: Optional[str] = None) -> Dict[str, Any]:
+          crash_at: Optional[str] = None, crash_after_phase: Optional[str] = None,
+          include_spec_top: bool = False) -> Dict[str, Any]:
     root = Path(root).resolve()
     C._require_active(root)
     other = RL.migration_hold(root)
@@ -1028,7 +1240,7 @@ def apply(root: Path, *, route_file: Optional[Path] = None, dry_run: bool = Fals
             journal = P._read_json(open_run / JOURNAL_NAME) or {}
             return {"status": "hold", "code": "residue-in-progress", "run_dir": str(open_run), "phase": journal.get("phase")}
         return resume(root, run_dir=open_run, route_file=route_file, crash_at=crash_at, crash_after_phase=crash_after_phase)
-    plan = build_plan(root)
+    plan = build_plan(root, include_spec_top=include_spec_top)
     if plan["compat_state"]["missing"] or plan["compat_state"]["drifted"]:
         raise ResidueError("compat-map-missing" if plan["compat_state"]["missing"] else "compat-map-drifted",
                            json.dumps(plan["compat_state"], sort_keys=True))
@@ -1049,9 +1261,11 @@ def apply(root: Path, *, route_file: Optional[Path] = None, dry_run: bool = Fals
     try:
         P._write_atomic(run_dir / PLAN_NAME, P._json_bytes({**public, "digest": plan_digest}))
         P._write_atomic(run_dir / INVENTORY_NAME, P._json_bytes(
-            {"cycles": {c["cycle_key"]: c["files"] for c in plan["cycles"]}, "routes": plan["routes"]}))
+            {"cycles": {c["cycle_key"]: c["files"] for c in plan["cycles"]}, "routes": plan["routes"],
+             "rejoins": plan["rejoins"]}))
         journal = {"schema_version": 1, "algorithm_version": RESIDUE_ALGORITHM_VERSION, "phase": "planned",
                    "started_at": _now(), "plan_digest": plan_digest, "route_file": str(Path(route_file).resolve()),
+                   "include_spec_top": include_spec_top,
                    "crash_at": crash_at, "crash_after_phase": crash_after_phase, "pre_image": {}, "begun": {}}
         _write_journal(run_dir, journal)
         try:
@@ -1084,6 +1298,7 @@ def _load_run(root: Path, run_dir: Path) -> Tuple[Dict[str, Any], Dict[str, Any]
     for cycle in plan["cycles"]:
         cycle["files"] = inventory.get("cycles", {}).get(cycle["cycle_key"], cycle["files"])
     plan["routes"] = inventory.get("routes", plan["routes"])
+    plan["rejoins"] = inventory.get("rejoins", plan.get("rejoins", []))
     return journal, plan
 
 
@@ -1147,7 +1362,8 @@ def trash_inventory(root: Path, *, include_symlinks: bool = False,
     for rel in iter_residue_files(root):
         row = classify(root, rel, origin_cache=origin_cache)
         is_trash = row["disposition"] == "retire-with-approval"
-        is_symlink = row["shape"] == "symlink"
+        # A link that can rejoin its siblings is a move, never a deletion candidate.
+        is_symlink = row["shape"] == "symlink" and row["disposition"] == "deferred"
         wanted_symlink = is_symlink and (include_symlinks or (include_dangling_symlinks and row.get("dangling")))
         if is_trash or wanted_symlink:
             path = root / rel
@@ -1276,8 +1492,9 @@ def status(root: Path) -> Dict[str, Any]:
     else:
         layout = "residue"
     return {"legacy_top_level": layout, "legacy_top_level_files": total, "by_disposition": dict(sorted(counts.items())),
-            "symlinks": sum(1 for d in deferred if d["reason"] == "symlink"),
+            "symlinks": sum(1 for d in deferred if str(d["reason"]).startswith("symlink")),
             "symlinks_dangling": sum(1 for d in deferred if d.get("dangling")),
+            "rejoin_pending": counts.get("rejoin", 0),
             "deferred": deferred, "trash_pending": counts.get("retire-with-approval", 0), "residue_hold": hold,
             "residue_state": state.get("state"), "error": error}
 
@@ -1297,9 +1514,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     plan_p = sub.add_parser("plan", help="pure read: classification and disposition of every residue file")
     plan_p.add_argument("--full", action="store_true")
+    plan_p.add_argument("--include-spec-top", action="store_true",
+                        help="dispose of legacy `spec/` as root support residue instead of deferring it")
     apply_p = sub.add_parser("apply", help="journaled disposal (moves only; trash needs retire-trash)")
     apply_p.add_argument("--route-file", help="the caller's route; one route per residue cycle is derived from it")
     apply_p.add_argument("--dry-run", action="store_true")
+    apply_p.add_argument("--include-spec-top", action="store_true",
+                         help="move legacy `spec/` as root support residue (operator has verified no legacy consumer)")
     apply_p.add_argument("--crash-at")
     apply_p.add_argument("--crash-after-phase")
     resume_p = sub.add_parser("resume")
@@ -1324,13 +1545,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     root = Path(args.artifact_root).resolve()
     try:
         if args.command == "plan":
-            plan = _public(build_plan(root))
+            plan = _public(build_plan(root, include_spec_top=args.include_spec_top))
             if not args.full:
-                plan = {k: v for k, v in plan.items() if k not in {"cycles", "routes", "trash"}}
+                plan = {k: v for k, v in plan.items() if k not in {"cycles", "routes", "trash", "rejoins"}}
             _print(plan)
         elif args.command == "apply":
             result = apply(root, route_file=Path(args.route_file) if args.route_file else None, dry_run=args.dry_run,
-                           crash_at=args.crash_at, crash_after_phase=args.crash_after_phase)
+                           crash_at=args.crash_at, crash_after_phase=args.crash_after_phase,
+                           include_spec_top=args.include_spec_top)
             _print(result)
             return 0 if result.get("status") in {"complete", "dry-run", "no-op"} else HOLD_EXIT
         elif args.command == "resume":
