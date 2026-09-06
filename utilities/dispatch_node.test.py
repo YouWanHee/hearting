@@ -881,5 +881,139 @@ class ReviewRoundCapTest(unittest.TestCase):
         self.assertFalse([l for l in printed if l.startswith("reason=review-round-budget-exhausted")])
 
 
+class SubsessionChainSealTest(unittest.TestCase):
+    """F3: a slice may only start once its chain manifest is sealed.
+
+    W7G produced a `stage_authority=0` row carrying a chain identity that no
+    manifest named. Nothing could ever aggregate it -- `complete_subsession_stage`
+    reads the manifest, finds no such chain, and the stage never closes -- so the
+    slice's work was done and permanently unusable. The seal is written by
+    `stage-session-chain.py` after its register loop and before it starts index 1,
+    so requiring it here refuses exactly the orphan and nothing legitimate.
+    """
+
+    def _start(self, *, seal, subsession_id="ss-fixture", attempt_id="att-sub-1",
+               index=1):
+        node = dict(make_node(depth=1, dispatch_fallback=[]), id="plan-check",
+                    kind="review-worker", unit="qa/code-review",
+                    completion_gate="code-plan-check")
+        route = make_route(node, tuples=[])
+        route["effective_intensity"] = "direct"
+        printed = []
+        code = None
+        with tempfile.TemporaryDirectory() as td:
+            jobs = Path(td) / ".dispatch" / "jobs.log"
+            jobs.parent.mkdir()
+            jobs.write_text("")
+            if seal is not None:
+                pointer = jobs.parent / "session_chains" / "ssc-fixture.json"
+                pointer.parent.mkdir(parents=True, exist_ok=True)
+                pointer.write_text(json.dumps(seal), encoding="utf-8")
+            route_path = Path(td) / "route.json"
+            route_path.write_text(json.dumps(route))
+            argv = ["dispatch-node.py", "--route", str(route_path), "--node",
+                    "plan-check", "--adapter", "claude", "--slug", "slug-sub",
+                    "--action", "start",
+                    "--prompt-text", "Perform a fresh independent pass.",
+                    "--subsession-id", subsession_id,
+                    "--subsession-index", str(index),
+                    "--subsession-count", "5", "--subsession-mode", "serial",
+                    "--session-chain-id", "ssc-fixture", "--phase-brief", "brief",
+                    "--narrow-verify", "true", "--expected-round-trips", "1",
+                    "--stage-authority", "0", "--attempt-id", attempt_id]
+            with mock.patch.object(sys, "argv", argv), \
+                 mock.patch.dict(N.os.environ, {"AGENT_DISPATCH_JOBS": str(jobs)},
+                                 clear=True), \
+                 mock.patch.object(N.subprocess, "run",
+                                   side_effect=lambda cmd, **kw: mock.Mock(returncode=0)), \
+                 mock.patch("builtins.print",
+                            side_effect=lambda *a, **k: printed.append(" ".join(map(str, a)))):
+                try:
+                    N.main()
+                except SystemExit as exc:
+                    code = exc.code
+        return code, printed
+
+    @staticmethod
+    def _manifest(**session):
+        base = {"subsession_id": "ss-fixture", "index": 1, "attempt_id": "att-sub-1"}
+        base.update(session)
+        return {"chain_id": "ssc-fixture", "mode": "serial", "sessions": [base]}
+
+    def _assert_refused(self, code, printed):
+        self.assertEqual(code, 64)
+        self.assertIn("reason=subsession-chain-manifest-unsealed", printed)
+        self.assertIn("child_spawned=0", printed)
+
+    def test_orphan_slice_start_is_refused(self):
+        self._assert_refused(*self._start(seal=None))
+
+    def test_manifest_that_does_not_name_this_slice_is_refused(self):
+        self._assert_refused(
+            *self._start(seal=self._manifest(subsession_id="ss-someone-else"))
+        )
+
+    def test_manifest_naming_a_different_attempt_is_refused(self):
+        # The chain is sealed and names this subsession, but against another
+        # attempt identity -- a replacement row must not ride an existing seal.
+        self._assert_refused(
+            *self._start(seal=self._manifest(attempt_id="att-other"))
+        )
+
+    def test_manifest_naming_a_different_index_is_refused(self):
+        self._assert_refused(*self._start(seal=self._manifest(index=3)))
+
+    def test_sealed_slice_starts(self):
+        # Control. Without this the gate could refuse everything and the three
+        # refusal tests above would still pass.
+        code, printed = self._start(seal=self._manifest())
+        self.assertFalse(
+            [line for line in printed
+             if line.startswith("reason=subsession-chain-manifest-unsealed")],
+            printed,
+        )
+
+    def test_register_action_is_not_gated(self):
+        # `stage-session-chain.py` persists the manifest AFTER its register loop,
+        # so gating `register` would refuse the legitimate path outright.
+        node = dict(make_node(depth=1, dispatch_fallback=[]), id="plan-check",
+                    kind="review-worker", unit="qa/code-review",
+                    completion_gate="code-plan-check")
+        route = make_route(node, tuples=[])
+        route["effective_intensity"] = "direct"
+        printed = []
+        with tempfile.TemporaryDirectory() as td:
+            jobs = Path(td) / ".dispatch" / "jobs.log"
+            jobs.parent.mkdir()
+            jobs.write_text("")
+            route_path = Path(td) / "route.json"
+            route_path.write_text(json.dumps(route))
+            argv = ["dispatch-node.py", "--route", str(route_path), "--node",
+                    "plan-check", "--adapter", "claude", "--slug", "slug-sub",
+                    "--action", "register",
+                    "--prompt-text", "Perform a fresh independent pass.",
+                    "--subsession-id", "ss-fixture", "--subsession-index", "1",
+                    "--subsession-count", "5", "--subsession-mode", "serial",
+                    "--session-chain-id", "ssc-fixture", "--phase-brief", "brief",
+                    "--narrow-verify", "true", "--expected-round-trips", "1",
+                    "--stage-authority", "0", "--attempt-id", "att-sub-1"]
+            with mock.patch.object(sys, "argv", argv), \
+                 mock.patch.dict(N.os.environ, {"AGENT_DISPATCH_JOBS": str(jobs)},
+                                 clear=True), \
+                 mock.patch.object(N.subprocess, "run",
+                                   side_effect=lambda cmd, **kw: mock.Mock(returncode=0)), \
+                 mock.patch("builtins.print",
+                            side_effect=lambda *a, **k: printed.append(" ".join(map(str, a)))):
+                try:
+                    N.main()
+                except SystemExit:
+                    pass
+        self.assertFalse(
+            [line for line in printed
+             if line.startswith("reason=subsession-chain-manifest-unsealed")],
+            printed,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

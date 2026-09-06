@@ -13,6 +13,7 @@ from dispatch_contract import (
 )
 from worker_bootstrap import assigned_contract, worker_type_for_kind
 import review_round_cap as REVIEW_ROUND_CAP
+import dispatch_subsession_advance as SUBSESSION
 
 _route_spec = importlib.util.spec_from_file_location(
     "capability_route", ROOT / "utilities" / "capability-route.py"
@@ -477,6 +478,33 @@ def main():
       ROOT,requested_jobs,int(node.get("dispatch_depth",1)),a.action,child_env())
  except DispatchContractError as e:
   print("check=failed");print(f"reason={e.reason}");print(f"detail={e.detail}");print("child_spawned=0");raise SystemExit(65)
+ if a.subsession_id and a.action=="start":
+  # Defect F3. A slice may only start once the chain it belongs to has been
+  # sealed. `stage-session-chain.py` persists the manifest AFTER its register
+  # loop and BEFORE it starts index 1, so this is safe for the legitimate
+  # path and refuses exactly the orphan: a row carrying a chain identity that
+  # no manifest names, which no surface can ever aggregate
+  # (`complete_subsession_stage` reads the manifest, finds nothing, and the
+  # chain stalls with the slice's work already done). Observed in W7G.
+  manifest=SUBSESSION.load_chain_manifest(registry.path,a.session_chain_id)
+  pointer=SUBSESSION.chain_manifest_pointer_path(registry.path,a.session_chain_id)
+  sealed=None
+  if isinstance(manifest,dict):
+   for session in (manifest.get("sessions") or []):
+    if not isinstance(session,dict): continue
+    if str(session.get("subsession_id"))==a.subsession_id:
+     sealed=session
+     break
+  if sealed is None or str(sealed.get("attempt_id"))!=str(a.attempt_id) or int(sealed.get("index",-1))!=int(a.subsession_index):
+   print("check=failed")
+   print("reason=subsession-chain-manifest-unsealed")
+   print(f"session_chain_id={a.session_chain_id}")
+   print(f"subsession_id={a.subsession_id}")
+   print(f"manifest_pointer={pointer}")
+   print(f"manifest_present={int(isinstance(manifest,dict))}")
+   print(f"subsession_declared={int(sealed is not None)}")
+   print("child_spawned=0")
+   raise SystemExit(64)
  print("completion_marker="+str(ROUTE.completion_dir(route["route_id"],jobs=registry.path)/(node["id"]+".json")))
  wrapper=ROOT/"adapters"/a.adapter/"bin"/"dispatch-headless.py"
  try:
