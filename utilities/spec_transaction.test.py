@@ -6,6 +6,7 @@ ROOT=Path(__file__).resolve().parents[1]
 def load(name,path):
  spec=importlib.util.spec_from_file_location(name,path); mod=importlib.util.module_from_spec(spec); spec.loader.exec_module(mod); return mod
 R=load("route",ROOT/"utilities/capability-route.py")
+TX=load("spec_transaction",ROOT/"utilities/spec-transaction.py")
 
 def dispatch(worktree):
  return {"tuples":[{"parent_harness":"codex","parent_transport":"headless","parent_sandbox":"workspace-write","child_harness":"codex","launch_authority":"conductor","status":"supported","probe_source":"fixture","probe_time":"2026-07-16T00:00:00Z","failure_class":"","checked_worktree":str(Path(worktree).resolve()),"failure_scope":"none","codex_command":"ok","retry_on_isolated_worktree":0}],"native_subagent":[]}
@@ -85,6 +86,41 @@ class SpecTransactionTest(unittest.TestCase):
    route=R.compile_route("autopilot-code","dev","direct",root,artifact,predicates=["atomic-outcome","known-scope","no-shared-contract","no-resource-run","no-artifact-handoff","no-independent-verifier","focused-verification"],inline_reason="atomic-direct",tracking="tracked",tracked_gate_evidence=gate)
    path=root/"route.json"; path.write_text(json.dumps(route)); result=subprocess.run([sys.executable,str(ROOT/"utilities/spec-transaction.py"),"run","--artifact-root",str(artifact),"--worktree",str(root),"--route",str(path),"--node","inline","--",sys.executable,"-c","pass"],text=True,capture_output=True)
    self.assertEqual(result.returncode,65); self.assertIn("spec-touch-not-declared",result.stdout)
+
+  # -- the v{N} chain is canonical, not per-tree ------------------------------
+
+ def test_next_version_continues_the_chain_across_legacy_and_shared(self):
+  with tempfile.TemporaryDirectory() as td:
+   artifact=Path(td)/".agent_reports"; cycle_spec=artifact/"campaigns/c/cycles/y/artifacts/spec"; cycle_spec.mkdir(parents=True)
+   self.assertEqual(TX.next_version(cycle_spec,artifact),1)
+   (artifact/"spec/_internal/versions/v168").mkdir(parents=True)
+   self.assertEqual(TX.next_version(cycle_spec,artifact),169,"an empty cycle bucket must not restart at v1 while legacy holds the chain")
+   (artifact/"shared/spec/ref_x/revisions/rrev_x/_internal/versions/v200").mkdir(parents=True)
+   (artifact/"shared/spec/ref_y/revisions/rrev_y/_internal/versions/v201").mkdir(parents=True)
+   self.assertEqual(TX.next_version(cycle_spec,artifact),202,"every shared reference and revision carries history")
+   (cycle_spec/"_internal/versions/v300").mkdir(parents=True)
+   self.assertEqual(TX.next_version(cycle_spec,artifact),301)
+   (artifact/"spec/_internal/versions/v9_prd.md").mkdir(parents=True)   # not a v{N} directory name
+   (artifact/"spec/_internal/versions/v400").write_text("file, not a version dir\n")
+   self.assertEqual(TX.next_version(cycle_spec,artifact),301)
+
+ def test_next_version_keeps_a_component_on_its_own_chain(self):
+  with tempfile.TemporaryDirectory() as td:
+   artifact=Path(td)/".agent_reports"; cycle_spec=artifact/"campaigns/c/cycles/y/artifacts/spec"; (cycle_spec/"comp").mkdir(parents=True)
+   (artifact/"spec/_internal/versions/v168").mkdir(parents=True)
+   (artifact/"spec/comp/_internal/versions/v5").mkdir(parents=True)
+   (artifact/"shared/spec/ref_x/revisions/rrev_x/comp/_internal/versions/v7").mkdir(parents=True)
+   self.assertEqual(TX.next_version(cycle_spec/"comp",artifact,"comp"),8)
+   self.assertEqual(TX.next_version(cycle_spec,artifact),169)
+   trees=TX.version_history_trees(cycle_spec/"comp",artifact,"comp")
+   self.assertTrue(all(t.name=="comp" for t in trees),trees)
+
+ def test_version_history_trees_dedupes_the_legacy_root(self):
+  with tempfile.TemporaryDirectory() as td:
+   artifact=Path(td)/".agent_reports"; legacy=artifact/"spec"; (legacy/"_internal/versions/v3").mkdir(parents=True)
+   trees=TX.version_history_trees(legacy,artifact)
+   self.assertEqual([t.resolve() for t in trees],[legacy.resolve()])
+   self.assertEqual(TX.next_version(legacy,artifact),4)
 
  def test_component_spec_root_owns_its_version_sequence(self):
   with tempfile.TemporaryDirectory() as td:
@@ -189,6 +225,61 @@ class CycleLayoutTest(unittest.TestCase):
   self.assertEqual((spec/"_internal"/"versions"/"v2"/"prd.md").read_text(),"v3\n")
   self.assertEqual((spec/"prd.md").read_text(),"v4\n")
   self.assertFalse(any(r["status"]=="version-history-absent" for r in rows))
+
+
+ def test_legacy_only_chain_continues_in_the_first_cutover_cycle(self):
+  # The cairn W13 shape: cutover active, no shared revision yet, the whole
+  # chain lives in the legacy read-only bucket (v1..v168). The seed is
+  # skipped and the counter used to restart at v1.
+  legacy=self.artifact/"spec"; (legacy/"_internal"/"versions"/"v168").mkdir(parents=True); (legacy/"prd.md").write_text("v168 body\n")
+  _r,_f,begun=self._cycle("first-cutover-cycle"); cycle_dir=Path(begun["cycle_dir"]); events=Path(self._tmp.name)/"ev5.jsonl"
+  spec=cycle_dir/"artifacts"/"spec"; spec.mkdir(parents=True,exist_ok=True); (spec/"prd.md").write_text("v168 body\n")
+  code="import os; from pathlib import Path; Path(os.environ['AGENT_SPEC_ROOT'],'prd.md').write_text('v'+os.environ['AGENT_SPEC_NEXT_VERSION']+'\\n')"
+  result=self._run(cycle_dir,code,events)
+  self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+  rows=[json.loads(l) for l in events.read_text().splitlines()]
+  self.assertEqual([r["reason"] for r in rows if r["status"]=="seed-skipped"],["spec-base-not-empty"])
+  self.assertEqual([r["next_version"] for r in rows if r["status"]=="acquired"],[169])
+  self.assertFalse(any(r["status"]=="version-history-absent" for r in rows),rows)
+  self.assertEqual((spec/"_internal"/"versions"/"v169"/"prd.md").read_text(),"v168 body\n")
+  self.assertEqual((spec/"prd.md").read_text(),"v169\n")
+  self.assertFalse((spec/"_internal"/"versions"/"v1").exists(),"the chain must not restart at v1")
+  self.assertFalse((legacy/"_internal"/"versions"/"v169").exists(),"legacy stays read-only")
+
+
+ def test_empty_first_cutover_bucket_with_no_shared_revision_continues_the_legacy_chain(self):
+  # Exact cairn W13 shape: empty open bucket, no shared revision, legacy holds v1..v168.
+  legacy=self.artifact/"spec"; (legacy/"_internal"/"versions"/"v168").mkdir(parents=True); (legacy/"prd.md").write_text("v168 body\n")
+  _r,_f,begun=self._cycle("first-cutover-cycle-empty"); cycle_dir=Path(begun["cycle_dir"]); events=Path(self._tmp.name)/"ev6.jsonl"
+  self.assertFalse((cycle_dir/"artifacts"/"spec").exists(),"the producer creates the bucket lazily; the transaction must cope with an absent spec root")
+  code="import os; from pathlib import Path; r=Path(os.environ['AGENT_SPEC_ROOT']); r.mkdir(parents=True,exist_ok=True); (r/'prd.md').write_text('v'+os.environ['AGENT_SPEC_NEXT_VERSION']+'\\n')"
+  result=self._run(cycle_dir,code,events)
+  self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+  rows=[json.loads(l) for l in events.read_text().splitlines()]
+  self.assertEqual([r["reason"] for r in rows if r["status"]=="seed-skipped"],["no-shared-revision"])
+  self.assertEqual([r["next_version"] for r in rows if r["status"]=="acquired"],[169])
+  released=[r for r in rows if r["status"]=="released"][0]
+  self.assertEqual((released["version"],released["snapshot"]),(169,"not-required-new"))
+  self.assertEqual((cycle_dir/"artifacts"/"spec"/"prd.md").read_text(),"v169\n")
+  self.assertFalse((cycle_dir/"artifacts"/"spec"/"_internal").exists(),"no pre-image, no snapshot; the number alone continues")
+
+ def test_unadmitted_sealed_cycle_still_advances_the_chain(self):
+  # Cycle A snapshots v2 but is sealed without admit_shared; cycle B seeds
+  # from the shared v1 revision and must not reuse v2.
+  self._shared_v1()
+  route,route_file,begun=self._cycle("spec-edit-a"); cycle_a=Path(begun["cycle_dir"]); ev_a=Path(self._tmp.name)/"ev-a.jsonl"
+  code="import os; from pathlib import Path; Path(os.environ['AGENT_SPEC_ROOT'],'prd.md').write_text('v'+os.environ['AGENT_SPEC_NEXT_VERSION']+'\\n')"
+  result=self._run(cycle_a,code,ev_a); self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+  self.assertTrue((cycle_a/"artifacts"/"spec"/"_internal"/"versions"/"v2"/"prd.md").is_file())
+  self._close(route,route_file); self.P.finalize(self.artifact,cycle_id=begun["cycle_id"])
+  _r,_f,begun=self._cycle("spec-edit-b"); cycle_b=Path(begun["cycle_dir"]); ev_b=Path(self._tmp.name)/"ev-b.jsonl"
+  result=self._run(cycle_b,code,ev_b); self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+  rows=[json.loads(l) for l in ev_b.read_text().splitlines()]
+  self.assertEqual([r["next_version"] for r in rows if r["status"]=="acquired"],[3])
+  spec_b=cycle_b/"artifacts"/"spec"
+  self.assertEqual((spec_b/"_internal"/"versions"/"v3"/"prd.md").read_text(),"v1\n")
+  self.assertFalse((spec_b/"_internal"/"versions"/"v2").exists(),"the seeded copy carries only shared history; v2 lives in cycle A")
+  self.assertEqual((spec_b/"prd.md").read_text(),"v3\n")
 
  def test_refused_route_seeds_nothing(self):
   self._shared_v1()
