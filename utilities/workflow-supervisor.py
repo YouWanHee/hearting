@@ -39,6 +39,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
 
+from dispatch_contract import SUCCESS_NOTES  # noqa: E402
 import workflow_state as WS  # noqa: E402
 import resource_run_registry as RR  # noqa: E402
 import dispatch_pending_delivery as PENDING  # noqa: E402
@@ -207,8 +208,12 @@ def registered_evidence(armed):
                 "identity": identity}
     note = meta.get("note") or ""
     failure_class = meta.get("failure_class") or ""
+    # SUCCESS_NOTES gained `completed-subsession` (SD-130), so a slice row can
+    # now satisfy an armed stage's terminal evidence. That is not an authority
+    # grant: arming names an exact attempt id, so a slice only counts where a
+    # supervisor was armed on that slice deliberately.
     succeeded = (
-        note in ("completed-marker", "completed-supervisor", "completed")
+        note in (*SUCCESS_NOTES, "completed")
         and failure_class in ("", "pass")
     )
     # A live exact PID after a terminal row is draining, not quiescent: the successor

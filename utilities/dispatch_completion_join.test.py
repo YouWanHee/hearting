@@ -1586,7 +1586,8 @@ class FinishedChildClosure(unittest.TestCase):
 
     def child(self, *, route: bool = True, verdict: str = "PASS",
               artifact: str | None = "brief.md", quiescent: bool = False,
-              attempt_id: str = "att-child") -> JOIN.ChildRow:
+              attempt_id: str = "att-child",
+              subsession: bool = False) -> JOIN.ChildRow:
         log = self.base / f"{attempt_id}.claude.jsonl"
         target = "-" if artifact is None else str(self.artifact / artifact)
         if artifact is not None:
@@ -1614,6 +1615,27 @@ class FinishedChildClosure(unittest.TestCase):
         if route:
             meta["route_file"] = str(self.base / "route.json")
             meta["route_node"] = "frame"
+        if subsession:
+            # SD-96 slice: no supervisor (one-shot delivery), no stage gate
+            # authority. Exactly the shape of the observed row att-174d9f66.
+            meta["subsession_id"] = "ss-fixture"
+            meta["stage_authority"] = "0"
+            meta["session_chain_id"] = "ssc-fixture"
+            meta["subsession_index"] = "1"
+            meta["subsession_count"] = "5"
+            meta["subsession_mode"] = "serial"
+            meta["subsession_purpose"] = "planned"
+            meta["completion_delivery"] = "one-shot"
+            # SD-96 requires the full slice contract on the row before it can be
+            # closed (`subsession-metadata-missing`); a real slice carries these,
+            # so the fixture must too.
+            meta["route_id"] = "rt-fixture"
+            meta["phase_brief"] = str(self.base / "phase-brief.md")
+            meta["phase_brief_sha256"] = "a" * 64
+            meta["state_ledger"] = str(self.base / "state-ledger.json")
+            meta["fixed_files_sha256"] = "b" * 64
+            meta["narrow_verify_sha256"] = "c" * 64
+            meta["expected_round_trips"] = "1"
         raw = "\t".join([
             "2026-07-28T06:00:00.000000Z", "open", str(self.base), str(self.base),
             f"{attempt_id}-slug", ",".join(f"{k}={v}" for k, v in meta.items()),
@@ -1646,6 +1668,99 @@ class FinishedChildClosure(unittest.TestCase):
                      "--execution-surface", "--fallback-hop"):
             self.assertIn(flag, command)
         self.assertNotIn("--mark-done", command)
+
+    def test_f_subsession_closes_without_entering_the_completion_command(self):
+        # Defect F. `capability-route.py complete` publishes the stage marker AND
+        # closes the row in one transaction, and a sub-session must have the
+        # second without the first -- it holds no stage gate authority, so the
+        # command it used to run was guaranteed to fail
+        # (`subsession-has-no-stage-gate-authority`) and a proven success was
+        # recorded as `dead-route-completion-rejected`. Observed on
+        # att-174d9f66 (w7g-s0-compat); chain indexes 2..5 never launched,
+        # because `complete_subsession_stage` needs every slice to be a PASS.
+        calls: list[list[str]] = []
+
+        def fake_completion(command):
+            calls.append(command)
+            return "completion-rejected"
+
+        slice_row = self.child(
+            quiescent=True, subsession=True, attempt_id="att-slice"
+        )
+        self.jobs.write_text(slice_row.raw + "\n", encoding="utf-8")
+        real = JOIN.run_route_completion
+        JOIN.run_route_completion = fake_completion
+        try:
+            reason = JOIN.close_finished_child(slice_row, jobs=self.jobs)
+        finally:
+            JOIN.run_route_completion = real
+        self.assertEqual(reason, "")
+        self.assertEqual(
+            calls, [], "a sub-session must never reach the completion command"
+        )
+        row = [
+            line for line in self.jobs.read_text(encoding="utf-8").splitlines()
+            if "att-slice" in line
+        ]
+        self.assertEqual(len(row), 1)
+        fields = row[0].split("\t")
+        metadata = dict(
+            part.split("=", 1) for part in fields[5].split(",") if "=" in part
+        )
+        self.assertEqual(fields[1], "done")
+        self.assertEqual(metadata.get("note"), JOIN.SUBSESSION_NOTE)
+        self.assertEqual(metadata.get("failure_class"), "pass")
+        self.assertEqual(
+            metadata.get("classifier_source"), "completion-join-subsession-terminal-v1"
+        )
+        # And the note this produces is one `complete_subsession_stage` accepts,
+        # which is the whole point -- the chain can now aggregate.
+        self.assertIn(metadata["note"], JOIN.SUCCESS_NOTES)
+
+    def test_f_subsession_still_needs_real_terminal_evidence(self):
+        # The closure is evidence-bound like every other: a live or unverifiable
+        # process keeps the row open, and a missing artifact is never invented.
+        live = self.child(subsession=True, attempt_id="att-live")
+        self.jobs.write_text(live.raw + "\n", encoding="utf-8")
+        reason = JOIN.close_finished_child(live, jobs=self.jobs)
+        self.assertEqual(reason, "subsession-not-quiescent")
+        self.assertNotIn(
+            "\tdone\t", self.jobs.read_text(encoding="utf-8"),
+            "a non-quiescent slice must not be closed",
+        )
+        # A slice whose envelope names no readable artifact is closed as a typed
+        # invalid-envelope death by the pre-existing branch above -- it must never
+        # be booked as a sub-session *success*, which is the only thing the new
+        # branch is allowed to produce.
+        #
+        # This pins the guard, NOT the surrounding policy. A slice that declares
+        # `artifact: -` (which the worker kernel permits) takes the same branch
+        # and so cannot reach a terminal at all, identically to main. Whether a
+        # slice may legitimately be artifact-less is a spec question, not
+        # something this test settles -- see SD-OPEN-37's neighbourhood.
+        noart = self.child(
+            quiescent=True, subsession=True, artifact=None, attempt_id="att-noart"
+        )
+        self.jobs.write_text(noart.raw + "\n", encoding="utf-8")
+        JOIN.close_finished_child(noart, jobs=self.jobs)
+        text = self.jobs.read_text(encoding="utf-8")
+        self.assertNotIn(f"note={JOIN.SUBSESSION_NOTE}", text)
+        self.assertIn("note=dead-invalid-envelope", text)
+
+    def test_f_ordinary_stage_row_is_unaffected(self):
+        # Control: a stage owner row still goes through the completion command.
+        # Without this the sub-session branch could swallow every closure.
+        calls: list[list[str]] = []
+        stage_row = self.child(quiescent=True, attempt_id="att-stage")
+        self.jobs.write_text(stage_row.raw + "\n", encoding="utf-8")
+        real = JOIN.run_route_completion
+        JOIN.run_route_completion = lambda command: (calls.append(command) or "")
+        try:
+            reason = JOIN.close_finished_child(stage_row, jobs=self.jobs)
+        finally:
+            JOIN.run_route_completion = real
+        self.assertEqual(reason, "")
+        self.assertEqual(len(calls), 1)
 
     def test_absent_terminal_evidence_never_invents_completion(self):
         row_without_log = self.child()

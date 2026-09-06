@@ -10,7 +10,12 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
-from dispatch_contract import observed_attempt_liveness, parse_registry_metadata  # noqa: E402
+from dispatch_contract import (  # noqa: E402
+    SUBSESSION_NOTE,
+    observed_attempt_liveness,
+    parse_registry_metadata,
+    row_is_subsession,
+)
 from codex_dispatch_terminal import terminal_envelope_observed  # noqa: E402
 
 
@@ -87,14 +92,17 @@ def classify(rows: list[tuple[list[str], dict[str, str]]]) -> dict[str, object]:
             note == "completed-marker"
             or metadata.get("attempt_schema_version") != "2"
             or (
-                note == "completed-supervisor"
-                and metadata.get("failure_class") == "pass"
+                metadata.get("failure_class") == "pass"
                 and (
-                    metadata.get("worker_type") == "owner"
-                    or (
-                        metadata.get("subsession_id")
-                        and metadata.get("stage_authority") in {"0", "false"}
-                    )
+                    # A supervisor closed the depth-1 owner it supervises.
+                    (note == "completed-supervisor"
+                     and metadata.get("worker_type") == "owner")
+                    # A sub-session slice reached its own terminal. This arm used
+                    # to require `completed-supervisor`, a note no sub-session can
+                    # carry (it gets `completion_delivery=one-shot`, so it has no
+                    # supervisor) -- the reader was built for a writer that did not
+                    # exist. Defect F gave it one.
+                    or (note == SUBSESSION_NOTE and row_is_subsession(metadata))
                 )
             )
         ):

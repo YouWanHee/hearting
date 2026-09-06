@@ -28,6 +28,8 @@ from typing import Callable
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
 from dispatch_contract import (  # noqa: E402
+    SUBSESSION_NOTE,
+    SUCCESS_NOTES,
     DispatchContractError,
     ProcessQuiescence,
     attempt_process_quiescence,
@@ -38,6 +40,7 @@ from dispatch_contract import (  # noqa: E402
     parse_registry_metadata,
     process_identity_disposition,
     reconcile_attempt_terminal,
+    row_is_subsession,
 )
 import dispatch_pending_delivery as pending_delivery  # noqa: E402
 from codex_dispatch_terminal import (  # noqa: E402
@@ -83,7 +86,6 @@ MANAGED_SESSION_PARENT_DELIVERY = "codex-managed-gateway"
 SESSION_PARENT_DELIVERIES = frozenset(
     {SESSION_PARENT_DELIVERY, MANAGED_SESSION_PARENT_DELIVERY}
 )
-SUCCESS_NOTES = frozenset({"completed-marker", "completed-supervisor"})
 RUNTIME_WAIT_SENTINEL = "runtime_wait: registered-children"
 DELIVERY_TIMING_SCHEMA_VERSION = 1
 DELIVERY_TIMING_POINTS = (
@@ -109,6 +111,10 @@ CANONICAL_CHILD_KEYS = frozenset({
     "delivery_classification",
 })
 MAX_DELIVERY_RECEIPT_BYTES = 2048
+# SUCCESS_NOTES / SUBSESSION_NOTE / row_is_subsession are re-exported from
+# `dispatch_contract`, which owns the definition (this module imports that one,
+# so the vocabulary cannot live here without a cycle). `worker-route-guard.py`
+# imports SUCCESS_NOTES from this module by name.
 
 
 class JoinContractError(RuntimeError):
@@ -3215,6 +3221,39 @@ def close_finished_child(row: ChildRow, *, jobs: str | Path) -> str:
     )
     if artifact is None:
         return evidence_reason
+    if row_is_subsession(metadata):
+        # Defect F. `capability-route.py complete` is one transaction that
+        # publishes the node's stage marker AND closes the row, and a
+        # sub-session must have the second without the first: it holds no stage
+        # gate authority (`subsession-has-no-stage-gate-authority`), so running
+        # the command here guaranteed a typed contract failure and left a proven
+        # success recorded as `dead-route-completion-rejected` -- which then
+        # stalled the whole declared chain, because `complete_subsession_stage`
+        # requires every slice row to be a semantic PASS.
+        #
+        # Fixed here rather than at the reap-watch caller so that every caller
+        # is fixed at once: both supervisors' `reconcile_finished_children` and
+        # the Codex headless path reach this same function.
+        # Say which of the two things went wrong. A draining slice is ordinary
+        # and must NOT escalate -- `dispatch-reap-watch.py` escalates only on a
+        # `completion-` prefix -- but a refused close is a contract problem that
+        # main used to surface as `completion-rejected`, and collapsing both into
+        # one string would hide it (review round 1, item 2).
+        observed = observed_attempt_liveness(
+            row.status, metadata, terminal_envelope=True
+        )
+        if observed.state != "reconcile-needed" or observed.process_state != "quiescent":
+            return "subsession-not-quiescent"
+        if _close_invalid_envelope_child(
+            row,
+            jobs=jobs,
+            reason="subsession-terminal",
+            note=SUBSESSION_NOTE,
+            classifier_source="completion-join-subsession-terminal-v1",
+            extra_evidence={"failure_class": "pass"},
+        ):
+            return ""
+        return "completion-subsession-close-refused"
     command = [
         sys.executable,
         str(ROOT / "utilities" / "capability-route.py"),
@@ -3255,7 +3294,7 @@ def close_wrapper_pass(row: ChildRow, *, jobs: str | Path) -> str:
         return reason
     if (
         current.status == "done"
-        and current.metadata.get("note") in {"completed-marker", "completed-supervisor"}
+        and current.metadata.get("note") in SUCCESS_NOTES
     ):
         return ""
     try:
