@@ -205,6 +205,13 @@ def load_manifest(
         expected_file = route.get("_route_file")
         if expected_file and route_file != Path(str(expected_file)).resolve():
             raise StageSessionError("manifest-route-file-mismatch")
+        # The manifest's `worktree` becomes every session's `--cwd`, so the
+        # common loader -- not only `plan-slices` -- must pin it to the route's
+        # sealed cwd; every identity field can match while the tree is foreign
+        # (routing-flex canary review round 2, M1).
+        sealed_cwd = route.get("cwd")
+        if isinstance(sealed_cwd, str) and sealed_cwd and worktree != Path(sealed_cwd).resolve():
+            raise StageSessionError(f"manifest-worktree-mismatch:{worktree}:{Path(sealed_cwd).resolve()}")
     if node is not None:
         if raw.get("route_node") != node.get("id"):
             raise StageSessionError("manifest-route-node-mismatch")

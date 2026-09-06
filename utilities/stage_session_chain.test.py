@@ -230,6 +230,27 @@ class PlanSlicesTest(unittest.TestCase):
             self.assertEqual(json.loads(output.read_text())["worktree"], str(worktree.resolve()))
             self.assertEqual(receipt["planned"], "ok")
 
+    def test_load_manifest_pins_worktree_to_the_route_cwd(self):
+        """Round-2 M1: the common loader, not only plan-slices, refuses a foreign worktree."""
+        with tempfile.TemporaryDirectory() as td:
+            route_path, worktree, slices_path, output = self._fixture(td)
+            CHAIN.plan_slices(route_path=route_path, node_id="execute", slices_path=slices_path, output_path=output)
+            route = json.loads(route_path.read_text()) | {"_route_file": str(route_path)}
+            node = route["nodes"][0]
+            manifest = json.loads(output.read_text())
+            foreign = Path(td) / "foreign"; (foreign / "source").mkdir(parents=True)
+            for session in manifest["sessions"]:
+                session["fixed_files"] = [
+                    str(foreign / (Path(f).relative_to(worktree.resolve()) if Path(f).is_absolute() else Path(f)))
+                    for f in session["fixed_files"]
+                ]
+            manifest["worktree"] = str(foreign)
+            tampered = Path(td) / "tampered.json"; tampered.write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(CHAIN.StageSessionError, "manifest-worktree-mismatch"):
+                CHAIN.load_manifest(tampered, route=route, node=node)
+            # without a route the loader cannot pin it (the node alone carries the permission)
+            self.assertEqual(CHAIN.load_manifest(tampered, node=node)["worktree"], str(foreign.resolve()))
+
     def test_plan_slices_refuses_overlap_and_leaves_no_files(self):
         with tempfile.TemporaryDirectory() as td:
             route_path, worktree, slices_path, output = self._fixture(td, overlap=True)

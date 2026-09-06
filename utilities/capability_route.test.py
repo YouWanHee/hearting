@@ -4760,14 +4760,12 @@ class ComposeRouteTest(TestRoute):
   route=self.compose(graph="execute,test,report")
   by_id={n["id"]:n for n in route["nodes"]}
   self.assertEqual(by_id["execute"]["inputs"],["task"])  # plan.md/checklist.md come from the dropped plan node
-  self.assertEqual(by_id["test"]["inputs"],["source-diff","dev_logs/**"])  # semantic token kept, execute outputs appended
+  self.assertEqual(by_id["test"]["inputs"],["source-diff"])  # semantic token kept; nothing appended (round 2 M2)
   self.assertEqual(by_id["report"]["inputs"],["dev_logs/**","test_logs/**"])
   full=self.compose(graph="frame,plan,plan-check,execute,impl-review,test,report")
-  base={n["id"]:n for n in R.TOPO.resolve_recipe(R.TOPO.load_registry(),"autopilot-code","dev")["standard_plus"]["nodes"]}
-  for node in full["nodes"]:
-   if node["id"] in base:
-    self.assertTrue(set(base[node["id"]]["inputs"])<=set(node["inputs"]),node["id"])
-  self.assertEqual({n["id"]:n["inputs"][0] for n in self.compose(graph="impl-review,test").get("nodes")}["impl-review"],"source-diff")
+  preset=R.compile_route(**self.args(requested_intensity="standard",predicates=[],signals=["shared-contract"],inline_reason=None,dispatch_evidence=self.evidence()))
+  self.assertEqual({n["id"]:n["inputs"] for n in full["nodes"]},{n["id"]:n["inputs"] for n in preset["nodes"]})  # a full-graph compose equals the preset (group expansion included)
+  self.assertEqual({n["id"]:n["inputs"] for n in self.compose(graph="impl-review,test")["nodes"]},{"impl-review":["source-diff"],"test":["source-diff"]})
  def test_frame_gate_rebinds_to_the_node_that_follows(self):
   route=self.compose(graph="frame,execute,test")
   self.assertEqual(route["human_gate_bindings"],[{"gate":"frame-review","node":"execute","position":"entry"}])

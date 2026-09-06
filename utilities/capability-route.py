@@ -1920,7 +1920,7 @@ def parse_graph_spec(text):
     return rows
 
 
-def _compose_inputs(base_nodes, base_node, previous, kept):
+def _compose_inputs(base_nodes, base_node, kept):
     """Keep the base node's declared inputs wherever they can still exist.
 
     An input stays when it is not produced by any recipe node (an external
@@ -1929,8 +1929,9 @@ def _compose_inputs(base_nodes, base_node, previous, kept):
     no node has to author. An input whose only producer was dropped is
     removed -- the stage brief (`dispatch_stage_advance.render_stage_brief`)
     prints `inputs` verbatim, so a dropped node's file must not be promised.
-    The previous kept node's outputs are appended so the chain edge is
-    explicit. (Canary review round 1, B1.)
+    Nothing is added: the chain edge lives in `depends_on`, and a full-graph
+    compose must yield exactly the preset's inputs. (Canary review round 1
+    B1, round 2 M2.)
     """
     producers = {}
     for candidate in base_nodes.values():
@@ -1942,9 +1943,6 @@ def _compose_inputs(base_nodes, base_node, previous, kept):
         if owners is None or owners & kept or TOPO._is_semantic_output(item):
             if item not in inputs:
                 inputs.append(item)
-    for output in (previous or {}).get("outputs") or []:
-        if output not in inputs:
-            inputs.append(output)
     return inputs or ["task"]
 
 
@@ -1984,7 +1982,7 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec):
             overrides[node_id] = unit
         previous = nodes[-1] if nodes else None
         node["depends_on"] = [previous["id"]] if previous else []
-        node["inputs"] = _compose_inputs(base_nodes, base_nodes[node_id], previous, set(ids))
+        node["inputs"] = _compose_inputs(base_nodes, base_nodes[node_id], set(ids))
         node.pop("terminal", None)
         node.pop("terminal_gate", None)
         node.pop("continuation", None)
