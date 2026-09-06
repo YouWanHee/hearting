@@ -121,6 +121,9 @@ ATTEMPT_MUTABLE_METADATA = {
     "group_reap_pgid",
     "attempt_descendant_proof",
     "attempt_descendant_observer_ns",
+    "attempt_descendant_residue",
+    "attempt_descendant_residue_basis",
+    "attempt_descendant_residue_at",
     "reap_watch",
     "reap_watch_pid",
     "launch_lifecycle",
@@ -1675,6 +1678,15 @@ def process_group_members(pgid: int) -> tuple[tuple[int, str, str], ...]:
 
 ATTEMPT_DESCENDANT_ENV = "AGENT_DISPATCH_ATTEMPT_ID"
 ATTEMPT_DESCENDANT_PROOF = "attempt-tagged-empty-v1"
+# SD-OPEN-47 (H7): the detached drain observer seals this instead of the
+# empty proof when the governed leader and its process group are gone, the
+# attempt already holds semantic terminal evidence (terminal row status or a
+# final runtime envelope), and tagged residue -- a worker-spawned background
+# shell, a `herdr agent wait`, anything that inherited the tag and outlived
+# the worker -- still survives past the residue grace. The residue pids are
+# recorded beside it; they are leftovers of a finished worker, never the
+# worker, so they must not veto quiescence forever.
+ATTEMPT_DESCENDANT_RESIDUE_PROOF = "attempt-tagged-residue-v1"
 # Operator-sealed substitute for a post-exit receipt that can never be issued.
 # `dispatch-registry.py reconcile --seal-artifact-proof-receipt` writes it only
 # after re-deriving the whole evidence chain; nothing issues it automatically.
@@ -1712,6 +1724,15 @@ def attempt_tagged_descendants(metadata: dict[str, str]) -> ProcessGroupObservat
     if not attempt_id:
         return ProcessGroupObservation("unverifiable", reason="attempt-id-missing")
     tag = f"{ATTEMPT_DESCENDANT_ENV}={attempt_id}".encode()
+    # SD-OPEN-47 (H7-b): a child's liveness is its own process set. The
+    # recorded parent leader (the owner's governed process) is an ancestor,
+    # never a descendant, so it is excluded by identity before any tag match;
+    # the owner living on must not keep the child row open.
+    excluded_pids = {
+        int(metadata.get(key, ""))
+        for key in ("parent_pid", "parent_pid_host")
+        if str(metadata.get(key, "")).isdigit()
+    }
     members: list[tuple[int, str, str]] = []
     incomplete_reason = ""
     try:
@@ -1739,6 +1760,8 @@ def attempt_tagged_descendants(metadata: dict[str, str]) -> ProcessGroupObservat
             continue
         except (IndexError, ValueError):
             incomplete_reason = f"procfs-member:{entry.name}:malformed"
+            continue
+        if int(entry.name) in excluded_pids:
             continue
         if tag in environ.split(b"\0"):
             members.append((int(entry.name), start, state))
@@ -1787,9 +1810,43 @@ def _detached_group_drain_receipt(metadata: dict[str, str]) -> bool:
         and metadata.get("launch_outcome") == "governed-process-group-drained"
         and metadata.get("group_reap_proof") == GROUP_REAP_PROOF
         and metadata.get("group_reap_pgid") == raw_group
-        and metadata.get("attempt_descendant_proof") == ATTEMPT_DESCENDANT_PROOF
+        and (
+            metadata.get("attempt_descendant_proof") == ATTEMPT_DESCENDANT_PROOF
+            or _tagged_residue_receipt(metadata)
+        )
         and metadata.get("attempt_descendant_observer_ns") == observer_namespace
     )
+
+
+def _tagged_residue_receipt(metadata: dict[str, str]) -> bool:
+    """Did the detached drain observer seal a typed tagged-residue receipt?
+
+    SD-OPEN-47 (H7): `dispatch-reap-watch.py` writes this only after the exact
+    leader exited, its process group drained, the attempt already carried
+    semantic terminal evidence, and tagged survivors outlived the residue grace.
+    The pids it names are residue of a finished worker; every quiescence
+    consumer treats them exactly like the operator-sealed artifact proof.
+    """
+
+    observer_namespace = metadata.get("pid_observer_ns", "")
+    return bool(
+        observer_namespace
+        and metadata.get("pid_ns", "") == observer_namespace
+        and metadata.get("launch_lifecycle") == "detached"
+        and metadata.get("launch_outcome") == "governed-process-group-drained"
+        and metadata.get("attempt_descendant_proof")
+        == ATTEMPT_DESCENDANT_RESIDUE_PROOF
+        and metadata.get("attempt_descendant_observer_ns") == observer_namespace
+        and bool(metadata.get("attempt_descendant_residue"))
+        and metadata.get("attempt_descendant_residue_basis")
+        in {"registry-terminal", "terminal-envelope"}
+    )
+
+
+def tagged_residue_receipt(metadata: dict[str, str]) -> bool:
+    """Public read-only view of ``_tagged_residue_receipt``."""
+
+    return _tagged_residue_receipt(metadata)
 
 
 _CANCELLATION_QUIESCENCE_BINDING_KEYS = (
@@ -2101,6 +2158,13 @@ def attempt_process_quiescence(
         # gate, and only with the operator-sealed proof -- an unsealed row keeps
         # the veto.
         if terminal_receipt and _artifact_proof_receipt(metadata):
+            return result
+        # SD-OPEN-47 (H7): the drain observer already proved, after terminal
+        # evidence and the residue grace, that these tagged survivors are
+        # leftovers of a finished worker. They never veto again, at any gate:
+        # the alternative is a child row no join, reconcile, or successor
+        # gate can ever close while the residue lives.
+        if _tagged_residue_receipt(metadata):
             return result
         return ProcessQuiescence(
             "live", "attempt-descendant-live", probe.members[0][0]

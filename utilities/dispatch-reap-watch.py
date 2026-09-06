@@ -11,6 +11,7 @@ import time
 
 from dispatch_contract import (
     ATTEMPT_DESCENDANT_PROOF,
+    ATTEMPT_DESCENDANT_RESIDUE_PROOF,
     GROUP_REAP_PROOF,
     annotate_attempt_row,
     annotate_attempt_row_if,
@@ -107,6 +108,23 @@ def record_missing_result_degradation(
         return
 
 
+def residue_terminal_basis(fields: list[str], metadata: dict[str, str]) -> str:
+    """Name the semantic terminal evidence that makes tagged survivors residue.
+
+    A terminal registry status (someone already closed the row with evidence)
+    or the worker's own final runtime envelope both mean the worker declared
+    itself finished; anything still carrying its tag afterwards is a leftover.
+    Without either, survivors keep their veto -- the worker may still be
+    writing its output.
+    """
+
+    if fields[1] not in {"open", "running"}:
+        return "registry-terminal"
+    if terminal_envelope_observed(metadata.get("log_file")):
+        return "terminal-envelope"
+    return ""
+
+
 def watch(args: argparse.Namespace) -> int:
     metadata = attempt_metadata(args.jobs, args.attempt_id)
     if not exact_binding(metadata, args):
@@ -120,114 +138,144 @@ def watch(args: argparse.Namespace) -> int:
     while process_start_ticks(args.pid) == args.pid_start:
         time.sleep(args.interval)
 
+    # SD-OPEN-47 (H7-a): the post-exit drain loop used to rescan every
+    # `/proc/<pid>/environ` at the launch interval (0.2 s) for as long as any
+    # tagged process lived, which for a worker-spawned background shell meant
+    # forever at ~25% CPU. The scan interval now backs off, and tagged residue
+    # that outlives the grace after the attempt already holds semantic
+    # terminal evidence is sealed as a typed residue receipt instead of being
+    # waited on without bound.
+    drain_started = time.monotonic()
+    drain_interval = args.interval
+    descendant_proof: dict[str, str] = {
+        "attempt_descendant_proof": ATTEMPT_DESCENDANT_PROOF,
+    }
     while True:
-        metadata = attempt_metadata(args.jobs, args.attempt_id)
+        record = attempt_record(args.jobs, args.attempt_id)
+        if record is None:
+            return 65
+        fields, metadata = record
         if not exact_binding(metadata, args):
             return 65
         group = process_group_observation(args.pgid)
         descendants = attempt_tagged_descendants(metadata)
         if group.state == "unverifiable" or descendants.state == "unverifiable":
             return 69
-        if group.state == "populated" or descendants.state == "populated":
-            time.sleep(args.interval)
-            continue
-        annotated = annotate_attempt_row(
+        if group.state == "empty" and descendants.state == "empty":
+            break
+        if group.state == "empty" and descendants.state == "populated":
+            basis = residue_terminal_basis(fields, metadata)
+            if basis and time.monotonic() - drain_started >= args.residue_grace:
+                descendant_proof = {
+                    "attempt_descendant_proof": ATTEMPT_DESCENDANT_RESIDUE_PROOF,
+                    "attempt_descendant_residue": ";".join(
+                        f"{pid}:{start}" for pid, start, _state in descendants.members
+                    ),
+                    "attempt_descendant_residue_basis": basis,
+                    "attempt_descendant_residue_at": datetime.now(timezone.utc)
+                    .isoformat()
+                    .replace("+00:00", "Z"),
+                }
+                break
+        time.sleep(drain_interval)
+        drain_interval = min(args.drain_interval_max, drain_interval * 2)
+
+    annotated = annotate_attempt_row(
+        args.jobs,
+        args.attempt_id,
+        {
+            "launch_outcome": "governed-process-group-drained",
+            "group_reap_proof": GROUP_REAP_PROOF,
+            "group_reap_pgid": str(args.pgid),
+            **descendant_proof,
+            "attempt_descendant_observer_ns": metadata["pid_observer_ns"],
+        },
+    )
+    if not annotated:
+        return 65
+    # The drain proof is the last moment at which the detached watcher has
+    # exact process authority.  If no semantic terminal envelope exists and
+    # the row is still open, close the residue as typed missing-result.
+    # A concurrently written result always wins this fallback, and F-1
+    # additionally defers the close while an exact live parent conductor
+    # still owns delivery of `capability-route.py complete` for this row.
+    record = attempt_record(args.jobs, args.attempt_id)
+    if record is None or record[0][1] not in {"open", "running"}:
+        return 0
+    if terminal_envelope_observed(record[1].get("log_file")):
+        # Detached registered workers cannot write their own marker after
+        # exit.  This wrapper-launched watcher owns the durable drain
+        # receipt, so it also performs the exact evidence-backed closure
+        # before any supervisor may resume the parent.
+        if record[1].get("route_file") and record[1].get("route_node"):
+            try:
+                row = exact_attempt_row(args.jobs, args.attempt_id)
+                reason = close_finished_child(row, jobs=args.jobs)
+                if reason.startswith("completion-"):
+                    close_wrapper_pass(row, jobs=args.jobs)
+            except JoinContractError:
+                return 65
+        return 0
+
+    fields, metadata = record
+    expected = dict(metadata)
+    window = parent_completion_window(args.jobs, fields, metadata)
+    if window.deferred:
+        annotate_attempt_row_if(
             args.jobs,
             args.attempt_id,
             {
-                "launch_outcome": "governed-process-group-drained",
-                "group_reap_proof": GROUP_REAP_PROOF,
-                "group_reap_pgid": str(args.pgid),
-                "attempt_descendant_proof": ATTEMPT_DESCENDANT_PROOF,
-                "attempt_descendant_observer_ns": metadata["pid_observer_ns"],
+                "reap_close_deferred": window.source,
+                "reap_close_deferred_at": datetime.now(timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z"),
             },
+            lambda current_fields: exact_binding(
+                parse_registry_metadata(current_fields[5]), args
+            ),
         )
-        if not annotated:
-            return 65
+        while True:
+            time.sleep(args.parent_recheck_interval)
+            record = attempt_record(args.jobs, args.attempt_id)
+            if record is None:
+                return 65
+            fields, metadata = record
+            if not exact_binding(metadata, args):
+                return 65
+            if fields[1] not in {"open", "running"}:
+                return 0  # the conductor's complete won the race
+            if terminal_envelope_observed(metadata.get("log_file")):
+                return 0  # semantic terminal evidence takes precedence
+            if not parent_completion_window(args.jobs, fields, metadata).deferred:
+                break
 
-        # The drain proof is the last moment at which the detached watcher has
-        # exact process authority.  If no semantic terminal envelope exists and
-        # the row is still open, close the residue as typed missing-result.
-        # A concurrently written result always wins this fallback, and F-1
-        # additionally defers the close while an exact live parent conductor
-        # still owns delivery of `capability-route.py complete` for this row.
-        record = attempt_record(args.jobs, args.attempt_id)
-        if record is None or record[0][1] not in {"open", "running"}:
-            return 0
-        if terminal_envelope_observed(record[1].get("log_file")):
-            # Detached registered workers cannot write their own marker after
-            # exit.  This wrapper-launched watcher owns the durable drain
-            # receipt, so it also performs the exact evidence-backed closure
-            # before any supervisor may resume the parent.
-            if record[1].get("route_file") and record[1].get("route_node"):
-                try:
-                    row = exact_attempt_row(args.jobs, args.attempt_id)
-                    reason = close_finished_child(row, jobs=args.jobs)
-                    if reason.startswith("completion-"):
-                        close_wrapper_pass(row, jobs=args.jobs)
-                except JoinContractError:
-                    return 65
-            return 0
-
-        fields, metadata = record
-        expected = dict(metadata)
-        window = parent_completion_window(args.jobs, fields, metadata)
-        if window.deferred:
-            annotate_attempt_row_if(
-                args.jobs,
-                args.attempt_id,
-                {
-                    "reap_close_deferred": window.source,
-                    "reap_close_deferred_at": datetime.now(timezone.utc)
-                    .isoformat()
-                    .replace("+00:00", "Z"),
-                },
-                lambda current_fields: exact_binding(
-                    parse_registry_metadata(current_fields[5]), args
-                ),
-            )
-            while True:
-                time.sleep(args.parent_recheck_interval)
-                record = attempt_record(args.jobs, args.attempt_id)
-                if record is None:
-                    return 65
-                fields, metadata = record
-                if not exact_binding(metadata, args):
-                    return 65
-                if fields[1] not in {"open", "running"}:
-                    return 0  # the conductor's complete won the race
-                if terminal_envelope_observed(metadata.get("log_file")):
-                    return 0  # semantic terminal evidence takes precedence
-                if not parent_completion_window(args.jobs, fields, metadata).deferred:
-                    break
-
-        def still_missing_result(current_fields):
-            current = parse_registry_metadata(current_fields[5])
-            return bool(
-                current_fields[1] in {"open", "running"}
-                and current.get("pid") == expected.get("pid")
-                and current.get("pid_start") == expected.get("pid_start")
-                and current.get("pgid") == expected.get("pgid")
-                and not terminal_envelope_observed(current.get("log_file"))
-                and not parent_completion_window(
-                    args.jobs, current_fields, current
-                ).deferred
-            )
-
-        closed = close_attempt_row_if(
-            args.jobs,
-            args.attempt_id,
-            "dead-missing-result",
-            still_missing_result,
-            evidence={
-                "classifier_source": "dispatch-reap-missing-result-v1",
-                "reconcile_reason": "governed-process-group-drained",
-            },
+    def still_missing_result(current_fields):
+        current = parse_registry_metadata(current_fields[5])
+        return bool(
+            current_fields[1] in {"open", "running"}
+            and current.get("pid") == expected.get("pid")
+            and current.get("pid_start") == expected.get("pid_start")
+            and current.get("pgid") == expected.get("pgid")
+            and not terminal_envelope_observed(current.get("log_file"))
+            and not parent_completion_window(
+                args.jobs, current_fields, current
+            ).deferred
         )
-        if closed:
-            materialize_after_terminal_close(args.jobs, args.attempt_id)
-            record_missing_result_degradation(metadata, args)
-        return 0
+
+    closed = close_attempt_row_if(
+        args.jobs,
+        args.attempt_id,
+        "dead-missing-result",
+        still_missing_result,
+        evidence={
+            "classifier_source": "dispatch-reap-missing-result-v1",
+            "reconcile_reason": "governed-process-group-drained",
+        },
+    )
+    if closed:
+        materialize_after_terminal_close(args.jobs, args.attempt_id)
+        record_missing_result_degradation(metadata, args)
+    return 0
 
 
 def main(argv=None) -> int:
@@ -239,11 +287,30 @@ def main(argv=None) -> int:
     parser.add_argument("--pgid", type=int, required=True)
     parser.add_argument("--interval", type=float, default=0.2)
     parser.add_argument("--parent-recheck-interval", type=float, default=1.0)
+    parser.add_argument(
+        "--drain-interval-max",
+        type=float,
+        default=2.0,
+        help="ceiling for the post-exit drain rescan backoff (seconds)",
+    )
+    parser.add_argument(
+        "--residue-grace",
+        type=float,
+        default=30.0,
+        help=(
+            "seconds after leader exit before tagged survivors of an attempt "
+            "that already holds terminal evidence are sealed as residue"
+        ),
+    )
     args = parser.parse_args(argv)
     if args.pid <= 0 or args.pgid <= 0 or args.interval <= 0:
         parser.error("--pid, --pgid, and --interval must be positive")
     if args.parent_recheck_interval <= 0:
         parser.error("--parent-recheck-interval must be positive")
+    if args.drain_interval_max < args.interval or args.residue_grace < 0:
+        parser.error(
+            "--drain-interval-max must be >= --interval and --residue-grace >= 0"
+        )
     args.jobs = args.jobs.resolve()
     return watch(args)
 

@@ -2437,7 +2437,8 @@ def classify_validation_basis(route, *, registry_digest_now, units_digest_now,
             "verdict": "skew",
             "message": (
                 f"{skew_reason}(compiled={sealed_digest}@{sealed_root}, "
-                f"validator={own_digest}@{own_root})"
+                f"validator={own_digest}@{own_root}); re-run via the tooling "
+                f"under {sealed_root} (the root that created the row)"
             ),
         }
     verdict, message = "current", None

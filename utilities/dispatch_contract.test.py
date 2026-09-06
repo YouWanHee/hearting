@@ -2248,6 +2248,65 @@ class DispatchContractTest(unittest.TestCase):
     try:os.kill(pid,9)
     except OSError:pass
 
+ # SD-OPEN-47 (H7-b): the recorded parent leader is an ancestor of the child,
+ # never its descendant. Even a mis-tagged owner process must not keep the
+ # child's row alive for as long as the owner lives.
+ def test_sd_open_47_parent_leader_pid_is_never_a_descendant_of_its_child(self):
+  attempt="att-child-of-owner-fixture"
+  owner=subprocess.Popen([sys.executable,"-c","import time; time.sleep(30)"],
+                         env=dict(os.environ,AGENT_DISPATCH_ATTEMPT_ID=attempt),
+                         start_new_session=True)
+  self.addCleanup(lambda:(owner.kill(),owner.wait(timeout=5)))
+  child=subprocess.Popen([sys.executable,"-c","pass"],start_new_session=True)
+  identity=dict(D.process_launch_identity(child.pid),attempt_id=attempt)
+  child.wait(timeout=10)
+  probe=None
+  for _ in range(50):
+   probe=D.attempt_tagged_descendants(identity)
+   if probe.state=="populated":break
+   time.sleep(0.1)
+  self.assertEqual(probe.state,"populated",probe.reason)
+  self.assertEqual([pid for pid,_s,_st in probe.members],[owner.pid])
+  excluded=dict(identity,parent_pid=str(owner.pid))
+  self.assertEqual(D.attempt_tagged_descendants(excluded).state,"empty")
+  self.assertEqual(D.attempt_process_quiescence(excluded).state,"quiescent")
+
+ # SD-OPEN-47 (H7): a sidecar-sealed residue receipt names the survivors as
+ # leftovers of a finished worker; they never veto quiescence again.
+ def test_sd_open_47_tagged_residue_receipt_lifts_the_descendant_veto(self):
+  attempt="att-residue-receipt-fixture"
+  residue=subprocess.Popen([sys.executable,"-c","import time; time.sleep(30)"],
+                           env=dict(os.environ,AGENT_DISPATCH_ATTEMPT_ID=attempt),
+                           start_new_session=True)
+  self.addCleanup(lambda:(residue.kill(),residue.wait(timeout=5)))
+  leader=subprocess.Popen([sys.executable,"-c","pass"],start_new_session=True)
+  identity=dict(D.process_launch_identity(leader.pid),attempt_id=attempt,
+                launch_lifecycle="detached")
+  leader.wait(timeout=10)
+  for _ in range(50):
+   if D.attempt_tagged_descendants(identity).state=="populated":break
+   time.sleep(0.1)
+  self.assertEqual(D.attempt_process_quiescence(identity).reason,
+                   "attempt-descendant-live")
+  ns=identity["pid_observer_ns"]
+  sealed=dict(identity,launch_outcome="governed-process-group-drained",
+              group_reap_proof=D.GROUP_REAP_PROOF,group_reap_pgid=identity["pgid"],
+              attempt_descendant_proof=D.ATTEMPT_DESCENDANT_RESIDUE_PROOF,
+              attempt_descendant_observer_ns=ns,
+              attempt_descendant_residue=f"{residue.pid}:1",
+              attempt_descendant_residue_basis="terminal-envelope")
+  self.assertTrue(D.tagged_residue_receipt(sealed))
+  self.assertEqual(D.post_exit_receipt_reason(sealed),"governed-process-group-drained")
+  self.assertEqual(D.attempt_process_quiescence(sealed).state,"quiescent")
+  self.assertEqual(D.attempt_process_quiescence(sealed,terminal_receipt=True).state,
+                   "quiescent")
+  # The empty proof is still the only other accepted descendant proof.
+  bogus=dict(sealed,attempt_descendant_proof="attempt-tagged-anything-v1")
+  self.assertFalse(D.tagged_residue_receipt(bogus))
+  self.assertEqual(D.attempt_process_quiescence(bogus).reason,"attempt-descendant-live")
+  unbased=dict(sealed,attempt_descendant_residue_basis="")
+  self.assertFalse(D.tagged_residue_receipt(unbased))
+
  # A-N1. A confirmed death still advances, with its original reason intact.
  def test_confirmed_death_without_tagged_processes_stays_quiescent(self):
   proc=subprocess.Popen([sys.executable,"-c","import time; time.sleep(30)"],

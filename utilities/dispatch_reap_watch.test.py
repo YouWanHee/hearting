@@ -157,6 +157,138 @@ class DispatchReapWatchTest(unittest.TestCase):
             )
             self.assertFalse((base / "degradations").exists())
 
+    def _tagged_residue_worker(self, attempt, residue_seconds="30"):
+        """Spawn a worker that leaves one tagged, re-setsid'd survivor behind."""
+
+        script = (
+            "import os,subprocess,sys,time\n"
+            "env=dict(os.environ,AGENT_DISPATCH_ATTEMPT_ID=sys.argv[1])\n"
+            "subprocess.Popen(['sleep',sys.argv[2]],env=env,start_new_session=True)\n"
+            "time.sleep(0.04)\n"
+        )
+        worker = subprocess.Popen(
+            [sys.executable, "-c", script, attempt, residue_seconds],
+            env=dict(os.environ, AGENT_DISPATCH_ATTEMPT_ID=attempt),
+            start_new_session=True,
+        )
+        identity = D.process_launch_identity(worker.pid)
+        worker.wait(timeout=5)
+
+        def reap_residue():
+            probe = D.attempt_tagged_descendants({"attempt_id": attempt, **identity})
+            for pid, _start, _state in probe.members:
+                try:
+                    os.kill(pid, 9)
+                except OSError:
+                    pass
+
+        self.addCleanup(reap_residue)
+        return identity
+
+    def test_sd_open_47_tagged_residue_after_terminal_evidence_is_sealed_not_waited_forever(self):
+        """H7 (rt-8561efa2 / att-e72e08e0): a worker-spawned background process
+        that inherited the attempt tag outlived the worker. The sidecar rescanned
+        /proc every 0.2 s for 95 minutes and the row could never drain."""
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            jobs = base / "jobs.log"
+            attempt = "att-tagged-residue-terminal"
+            identity = self._tagged_residue_worker(attempt)
+            metadata = ",".join(
+                f"{key}={value}"
+                for key, value in {
+                    **identity,
+                    "attempt_id": attempt,
+                    "launch_lifecycle": "detached",
+                    "pid_scope": "namespace-local",
+                }.items()
+            )
+            jobs.write_text(
+                "2026-08-09T00:00:00Z\tdone\t/repo\t/wt\tworker\t"
+                f"{CURRENT},{metadata},note=completed-marker\n",
+                encoding="utf-8",
+            )
+            started = time.monotonic()
+            watcher = subprocess.Popen(
+                [
+                    sys.executable, str(WATCH),
+                    "--jobs", str(jobs),
+                    "--attempt-id", attempt,
+                    "--pid", identity["pid"],
+                    "--pid-start", identity["pid_start"],
+                    "--pgid", identity["pgid"],
+                    "--interval", "0.02",
+                    "--residue-grace", "0.3",
+                ]
+            )
+            self.assertEqual(watcher.wait(timeout=10), 0)
+            self.assertLess(time.monotonic() - started, 8.0)
+            row = jobs.read_text(encoding="utf-8")
+            meta = D.parse_registry_metadata(row.strip().split("\t")[5])
+            self.assertEqual(meta["launch_outcome"], "governed-process-group-drained")
+            self.assertEqual(
+                meta["attempt_descendant_proof"], D.ATTEMPT_DESCENDANT_RESIDUE_PROOF
+            )
+            self.assertEqual(meta["attempt_descendant_residue_basis"], "registry-terminal")
+            residue_pids = {
+                int(item.split(":")[0]) for item in meta["attempt_descendant_residue"].split(";")
+            }
+            self.assertTrue(residue_pids)
+            live = D.attempt_tagged_descendants(meta)
+            self.assertEqual(live.state, "populated", "residue must still be alive")
+            self.assertTrue(residue_pids.issuperset({pid for pid, _s, _st in live.members}))
+            # The receipt is a complete post-exit receipt and the residue never
+            # vetoes again: reconcile, join, and successor gates all read this.
+            self.assertTrue(D.tagged_residue_receipt(meta))
+            self.assertEqual(D.post_exit_receipt_reason(meta), "governed-process-group-drained")
+            verdict = D.attempt_process_quiescence(meta, terminal_receipt=True)
+            self.assertEqual(verdict.state, "quiescent", verdict.reason)
+            self.assertEqual(D.attempt_process_quiescence(meta).state, "quiescent")
+            observed = D.observed_attempt_liveness("done", meta)
+            self.assertEqual((observed.state, observed.reason), ("terminal", "registry-closed"))
+
+    def test_sd_open_47_tagged_residue_without_terminal_evidence_keeps_the_veto(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            jobs = base / "jobs.log"
+            attempt = "att-tagged-residue-open"
+            identity = self._tagged_residue_worker(attempt, residue_seconds="1.2")
+            metadata = ",".join(
+                f"{key}={value}"
+                for key, value in {
+                    **identity,
+                    "attempt_id": attempt,
+                    "launch_lifecycle": "detached",
+                    "log_file": str(base / "missing.jsonl"),
+                }.items()
+            )
+            jobs.write_text(
+                "2026-08-09T00:00:00Z\topen\t/repo\t/wt\tworker\t"
+                f"{CURRENT},{metadata}\n",
+                encoding="utf-8",
+            )
+            watcher = subprocess.Popen(
+                [
+                    sys.executable, str(WATCH),
+                    "--jobs", str(jobs),
+                    "--attempt-id", attempt,
+                    "--pid", identity["pid"],
+                    "--pid-start", identity["pid_start"],
+                    "--pgid", identity["pgid"],
+                    "--interval", "0.02",
+                    "--residue-grace", "0.1",
+                ]
+            )
+            time.sleep(0.6)
+            self.assertIsNone(
+                watcher.poll(), "open row without terminal evidence must keep waiting"
+            )
+            self.assertEqual(watcher.wait(timeout=10), 0)
+            row = jobs.read_text(encoding="utf-8")
+            self.assertIn(f"attempt_descendant_proof={D.ATTEMPT_DESCENDANT_PROOF}", row)
+            self.assertNotIn("attempt_descendant_residue=", row)
+
     def test_open_missing_result_is_closed_after_exact_group_drain(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)

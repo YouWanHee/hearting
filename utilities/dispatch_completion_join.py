@@ -29,6 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
 from dispatch_contract import (  # noqa: E402
     SUBSESSION_NOTE,
+    _marker_bound_prepare_marker_proof,
     SUCCESS_NOTES,
     DispatchContractError,
     ProcessQuiescence,
@@ -2819,6 +2820,16 @@ def _join_snapshot(
             if row.status == "done":
                 if observed.state == "terminal":
                     readiness, reason = "ready", "registry-closed"
+                elif _marker_bound_prepare_marker_proof(
+                    row.metadata, row.attempt_id
+                ) is not None:
+                    # SD-OPEN-47 (H7-c): a done row whose completion marker
+                    # chain already proves this exact attempt is semantically
+                    # finished. Process residue that inherited the worker's
+                    # tag (a background shell, a detached wait) must not hold
+                    # the owner in `runtime_wait: registered-children` until
+                    # the join times out and reparks forever.
+                    readiness, reason = "ready", "registry-closed-marker"
                 else:
                     readiness = "pending"
                     reason = (
