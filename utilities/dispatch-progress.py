@@ -392,6 +392,12 @@ def heartbeat(args, now):
     hb_path, _, lock_path = state_paths(dispatch_state_root(args.jobs), args.attempt_id)
     with locked(lock_path):
         old = read_json(hb_path)
+        if getattr(args, "if_absent", False) and old.get("phase") in PROGRESS_PHASES:
+            # SD-OPEN-38 (#9): a launcher's seed is a floor, not a regression.
+            # The wrapper already seeds `launch` at spawn and the worker may
+            # have heartbeated past it before the launcher's own seed runs;
+            # the existing later heartbeat is the answer, unchanged.
+            return old
         if old.get("phase") in PROGRESS_PHASES and PROGRESS_PHASES.index(args.phase) < PROGRESS_PHASES.index(old["phase"]):
             raise DispatchContractError("progress-phase-regression", f"{old['phase']}->{args.phase}")
         evidence_digest = deterministic_progress_fingerprint({
@@ -695,6 +701,8 @@ def main(argv):
     p.add_argument("--progress-window-seconds", type=float, default=300.0)
     p.add_argument("--watchdog-max-windows", type=int, default=2)
     p.add_argument("--apply", action="store_true"); p.add_argument("--now", type=float, help=argparse.SUPPRESS)
+    p.add_argument("--if-absent", action="store_true",
+                   help="heartbeat only: keep an existing heartbeat at any phase instead of failing phase regression")
     args = p.parse_args(argv[1:]); args.agent_home = (args.agent_home or resolve_agent_home()).resolve()
     args.jobs = args.jobs.resolve(); now = args.now if args.now is not None else time.time()
     try:

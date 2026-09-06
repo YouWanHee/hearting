@@ -342,6 +342,61 @@ class FallbackTest(unittest.TestCase):
   self.assertEqual(F.launch_confirm_deadline_seconds(absent),
                    F.DIRECT_TIMEOUT_DEFAULT)
 
+ def _live_row(self,attempt="att-live",route_id="rt-fixture",node="plan"):
+  proc=subprocess.Popen(["sleep","30"],start_new_session=True)
+  self.addCleanup(lambda:(proc.kill() if proc.poll() is None else None,proc.wait()))
+  start=(Path("/proc")/str(proc.pid)/"stat").read_text().split()[21]
+  self.jobs.write_text(
+   f"2026-07-24T00:00:00Z\topen\t/repo\t/wt\t{node}\t"
+   f"route_id={route_id},route_node={node},attempt_id={attempt},"
+   f"pid={proc.pid},pid_start={start},pgid={proc.pid},"
+   f"pid_observer_ns={os.readlink('/proc/self/ns/pid')}\n")
+  return proc
+ def test_sd_open_38_seed_phase_regression_is_not_a_launch_failure(self):
+  # #9 root cause: the worker heartbeated past `launch` before the launcher's
+  # seed ran; the seed's `progress-phase-regression` exit became
+  # `progress-watchdog-fail-closed` with `watchdog_action=unknown`.
+  args=SimpleNamespace(jobs=self.jobs,progress_window_seconds=0.4,watchdog_max_windows=12,direct_timeout=0.2)
+  route={"route_id":"rt-fixture"};node={"id":"plan"}
+  regressed=mock.Mock(returncode=65,stdout="check=failed\nreason=progress-phase-regression\ndetail=analysis->launch\n",stderr="")
+  alive=mock.Mock(returncode=0,stdout="check=ok\naction=observe\n",stderr="")
+  with mock.patch.object(F.subprocess,"run",side_effect=[regressed]+[alive]*50) as run:
+   state,fields=F.watch_launched_attempt(args,route,node,"att-seed",{"child_pid":"1","child_pid_start":"2"})
+  self.assertEqual(state,"observed")
+  self.assertNotIn("watchdog_verdict",fields)
+  seed_argv=run.call_args_list[0].args[0]
+  self.assertIn("--if-absent",seed_argv)
+  self.assertEqual(seed_argv[seed_argv.index("--phase")+1],"launch")
+ def test_sd_open_38_progress_tool_failure_with_a_live_child_is_advisory(self):
+  # cairn W15b: `--start` said progress-watchdog-fail-closed while the row was
+  # open and the claude child alive; all three stages finished normally.
+  proc=self._live_row(attempt="att-tool")
+  args=SimpleNamespace(jobs=self.jobs,progress_window_seconds=0.4,watchdog_max_windows=12,direct_timeout=0.2)
+  route={"route_id":"rt-fixture"};node={"id":"plan"}
+  seed=mock.Mock(returncode=0,stdout="check=ok\n",stderr="")
+  crashed=mock.Mock(returncode=65,stdout="check=failed\nreason=progress-error\ndetail=boom\n",stderr="")
+  with mock.patch.object(F.subprocess,"run",side_effect=[seed]+[crashed]*50):
+   state,fields=F.watch_launched_attempt(args,route,node,"att-tool",{"child_pid":str(proc.pid),"child_pid_start":"2"})
+  self.assertEqual(state,"observed")
+  self.assertEqual(fields["watchdog_verdict"],"advisory")
+  self.assertEqual((fields["watchdog_advisory_tool"],fields["watchdog_advisory_reason"]),("watchdog","progress-error"))
+  # a seed-tool crash with a live child is advisory as well
+  seed_crash=mock.Mock(returncode=65,stdout="check=failed\nreason=progress-error\ndetail=boom\n",stderr="")
+  alive=mock.Mock(returncode=0,stdout="check=ok\naction=observe\n",stderr="")
+  with mock.patch.object(F.subprocess,"run",side_effect=[seed_crash]+[alive]*50):
+   state,fields=F.watch_launched_attempt(args,route,node,"att-tool",{"child_pid":str(proc.pid),"child_pid_start":"2"})
+  self.assertEqual(state,"observed")
+  # a genuine watchdog verdict (tool ran, action=fail-closed-*) is still a verdict
+  identity=mock.Mock(returncode=0,stdout="check=ok\naction=fail-closed-identity\n",stderr="")
+  with mock.patch.object(F.subprocess,"run",side_effect=[seed,identity]):
+   state,fields=F.watch_launched_attempt(args,route,node,"att-tool",{"child_pid":str(proc.pid),"child_pid_start":"2"})
+  self.assertEqual(state,"fail-closed")
+  # no live child and no terminal row: the tool failure stays fail-closed
+  proc.kill();proc.wait()
+  with mock.patch.object(F.subprocess,"run",side_effect=[seed]+[crashed]*50):
+   state,fields=F.watch_launched_attempt(args,route,node,"att-tool",{"child_pid":str(proc.pid),"child_pid_start":"2"})
+  self.assertEqual(state,"fail-closed")
+  self.assertEqual(fields.get("reason"),"progress-error")
  def test_process_exit_without_marker_advances_fallback(self):
   args=SimpleNamespace(jobs=self.jobs,progress_window_seconds=1,watchdog_max_windows=2)
   route={"route_id":"rt-fixture"}
