@@ -2009,7 +2009,17 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec):
             node["continuation"] = {"kind": "supervised"}
         else:
             node["continuation"] = {"kind": "inline-next"}
+    # A gate declared on the entry of a base SOURCE node (no predecessor raises
+    # it, e.g. autopilot-spec `intent-confirmation` on `research`) is kept
+    # verbatim when that node is kept: it is parent-owned, not a continuation.
     kept_ids = set(ids)
+    for row in base_recipe.get("human_gate_bindings") or []:
+        node_id = row.get("node")
+        if (row.get("position") == "entry" and node_id in kept_ids
+                and not (base_nodes[node_id].get("depends_on") or [])
+                and row.get("gate") not in gates):
+            bindings.append({"gate": row["gate"], "node": node_id, "position": "entry"})
+            gates.append(row["gate"])
     groups = [
         json.loads(json.dumps(group))
         for group in base_recipe["standard_plus"].get("parallel_groups") or []

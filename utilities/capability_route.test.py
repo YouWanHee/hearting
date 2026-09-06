@@ -4774,6 +4774,17 @@ class ComposeRouteTest(TestRoute):
   self.assertEqual([g["id"] for g in route["parallel_groups"]],["frame"])
   self.assertIn("frame-alternative",[n["id"] for n in route["nodes"]])
   R.verify_route(route,R.ROOT)
+ def test_source_node_entry_gate_is_kept(self):
+  """autopilot-spec `intent-confirmation` binds the entry of the first node; a full-graph compose keeps it."""
+  route=self.compose(capability="autopilot-spec",capability_mode="update",graph="research,review,prd-transaction",signals=["shared-contract"])
+  self.assertEqual(route["human_gate_bindings"],[{"gate":"intent-confirmation","node":"research","position":"entry"}])
+  self.assertEqual(route["human_gates"],["intent-confirmation"])
+  self.assertEqual([n["id"] for n in route["nodes"] if not n.get("parallel_leg_index")],["research","review","prd-transaction"])
+  self.assertTrue(route["nodes"][-1]["terminal"]); self.assertEqual(route["nodes"][-1]["dispatch_depth"],1)
+  R.verify_route(route,R.ROOT)
+  # dropping the research anchor leaves spec-review's auxiliary_arbiter declaration orphaned: the registry validator refuses it as-is
+  with self.assertRaisesRegex(Exception,"auxiliary_arbiter"):
+   self.compose(capability="autopilot-spec",capability_mode="update",graph="review,prd-transaction",signals=["shared-contract"])
  def test_terminal_frame_drops_its_group_and_gate(self):
   route=self.compose(graph="frame")
   self.assertEqual([n["id"] for n in route["nodes"]],["frame"]); self.assertTrue(route["nodes"][0]["terminal"])
