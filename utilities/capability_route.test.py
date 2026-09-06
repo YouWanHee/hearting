@@ -1358,6 +1358,112 @@ class TestRoute(unittest.TestCase):
      for node in other_nodes:
       if node.get("terminal") is True: continue
       self.assertIn("continuation",node)
+ def _write_route_and_dep_markers(self,base,route):
+  path=base/"route.json"; path.write_text(json.dumps(route),encoding="utf-8")
+  plan=next(n for n in route["nodes"] if n["id"]=="plan")
+  marker_dir=base/".dispatch"/"completion"/route["route_id"]
+  marker_dir.mkdir(parents=True,exist_ok=True)
+  for dep in plan["depends_on"]:
+   (marker_dir/f"{dep}.json").write_text(
+    json.dumps({"attempt_id":f"att-{dep}","registered_worker":True}),encoding="utf-8")
+  return path
+ def test_compiled_route_meets_the_upstream_entry_fence(self):
+  """SD-129 x O3 seam: the shipped `autonomous` default and upstream's
+  `_human_gate_entry_fence` are only compatible if a REALLY COMPILED route
+  carries the shape the fence reads. Upstream's own fence tests use
+  hand-built route dicts; this one crosses compile -> fence."""
+  import workflow_state as WS
+
+  # (a) autonomous compile: no binding, frame continuations inline-next.
+  with dispatch_defaults_config(self._v4_confirmation_config("autonomous")):
+   route=R.compile_route(**self.args(
+    requested_intensity="standard",predicates=[],signals=["shared-contract"],
+    transport="headless",inline_reason=None,
+    dispatch_evidence=self.dispatch(self.nested())))
+  R.verify_route(route,R.ROOT)
+  self.assertEqual(route["confirmation_mode"],"autonomous")
+  self.assertEqual(route["human_gate_bindings"],[])
+  for node_id in ("frame","frame-alternative"):
+   node=next(n for n in route["nodes"] if n["id"]==node_id)
+   self.assertEqual(node["continuation"],{"kind":"inline-next"})
+
+  # (b) the fence accepts a `plan` start WITHOUT touching the ledger.
+  with tempfile.TemporaryDirectory() as td:
+   base=Path(td); path=self._write_route_and_dep_markers(base,route)
+   workflow_root=base/"workflow"
+   self.assertFalse(workflow_root.exists())
+   ready=D.AttemptReadiness("ready","fixture-ready","att-dep")
+   def _boom(*a,**k):
+    raise AssertionError("autonomous route must not touch the workflow ledger")
+   with mock.patch.dict(os.environ,{"AGENT_WORKFLOW_ROOT":str(workflow_root)}), \
+        mock.patch.object(WS,"WorkflowLedger",_boom), \
+        mock.patch.object(D,"completion_marker_is_current",return_value=True), \
+        mock.patch.object(D,"completion_attempt_readiness",return_value=ready), \
+        mock.patch.object(D,"_sibling_attempt_gate"), \
+        mock.patch.object(D,"_auxiliary_arbitration_gate"):
+    try:
+     D.completion_marker_gate(str(path),"plan","start",base,base/"jobs.log",
+                              registry_lines=[],attempt_id="att-plan-new")
+    except D.DispatchContractError as exc:
+     self.assertNotEqual(exc.reason,"completion-marker-missing",
+      "dependency-marker setup is a fixture defect, not a fence result")
+     raise
+   self.assertFalse(workflow_root.exists())
+
+  # (c) explicit hybrid compile: the entry binding and human-gate continuations return.
+  with dispatch_defaults_config(self._v4_confirmation_config("hybrid")):
+   hybrid_route=R.compile_route(**self.args(
+    requested_intensity="standard",predicates=[],signals=["shared-contract"],
+    transport="headless",inline_reason=None,
+    dispatch_evidence=self.dispatch(self.nested())))
+  R.verify_route(hybrid_route,R.ROOT)
+  self.assertEqual(
+   hybrid_route["human_gate_bindings"],
+   [{"gate":"frame-review","node":"plan","position":"entry"}])
+  for node_id in ("frame","frame-alternative"):
+   node=next(n for n in hybrid_route["nodes"] if n["id"]==node_id)
+   self.assertEqual(node["continuation"],{"kind":"human-gate","gate":"frame-review"})
+
+  # (d) the fence's three outcomes on that compiled route.
+  with tempfile.TemporaryDirectory() as td:
+   base=Path(td); path=self._write_route_and_dep_markers(base,hybrid_route)
+   ready=D.AttemptReadiness("ready","fixture-ready","att-dep")
+
+   def _start():
+    with mock.patch.object(D,"completion_marker_is_current",return_value=True), \
+         mock.patch.object(D,"completion_attempt_readiness",return_value=ready), \
+         mock.patch.object(D,"_sibling_attempt_gate"), \
+         mock.patch.object(D,"_auxiliary_arbitration_gate"):
+     D.completion_marker_gate(str(path),"plan","start",base,base/"jobs.log",
+                              registry_lines=[],attempt_id="att-plan-new")
+
+   with mock.patch.dict(os.environ,{"AGENT_WORKFLOW_ROOT":str(base/"workflow")}):
+    # (d1) missing gate.
+    with self.assertRaises(D.DispatchContractError) as caught:
+     _start()
+    self.assertNotEqual(caught.exception.reason,"completion-marker-missing",
+     "dependency-marker setup is a fixture defect, not a fence result")
+    self.assertEqual(caught.exception.reason,"human-gate-not-raised")
+
+    # (d2) unreleased gate.
+    ledger=WS.WorkflowLedger(hybrid_route["route_id"],hybrid_route["route_hash"],
+                              root=base/"workflow")
+    with ledger.lock():
+     ledger.set_workflow_state("READY",evidence={},actor="fixture")
+     ledger.set_workflow_state("BLOCKED_HUMAN_GATE",
+      evidence={"gate":"frame-review","artifact":"shards/frame/interview.json"},
+      actor="gate")
+    with self.assertRaises(D.DispatchContractError) as caught:
+     _start()
+    self.assertNotEqual(caught.exception.reason,"completion-marker-missing",
+     "dependency-marker setup is a fixture defect, not a fence result")
+    self.assertEqual(caught.exception.reason,"human-gate-unreleased")
+
+    # (d3) recorded release: the start succeeds.
+    with ledger.lock():
+     ledger.set_workflow_state("RUNNING",evidence={"released_gate":"frame-review",
+      "released_by":"user","actor_kind":"user","decision":"proceed"},actor="release")
+    _start()
  def test_o3_autonomous_tampered_continuation_is_rejected(self):
   with dispatch_defaults_config(self._v4_confirmation_config("autonomous")):
    route=self._standard()

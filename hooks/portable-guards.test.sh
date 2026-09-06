@@ -3347,6 +3347,12 @@ fi
 # Until the §6.1-owned baseline refresh lands, accept only the exact known
 # bootstrap/router/unit-catalog warning census. The count and representative
 # warnings keep an unrelated footprint regression from passing silently.
+# The four totals below are OBSERVED values re-pinned at the 88f93b130
+# integration merge (2026-09-06), produced by:
+#   python3 tools/context-footprint.py --root . --skip-runtime --skip-hooks
+# They are worker-bootstrap kernel + fragment sizes, which the contract
+# legitimately grows; growing them is a deliberate re-pin, never an automatic
+# refresh. The `> 4096` budget overrun they report is real and stays reported.
 if python3 "$ROOT/tools/context-footprint.py" --root "$ROOT" --skip-runtime --skip-hooks >"$TMP/context_footprint.out" 2>"$TMP/context_footprint.err" \
   && grep -q '^context_footprint_report=1' "$TMP/context_footprint.out" \
   && grep -q '^surface=codex-plugin ' "$TMP/context_footprint.out" \
@@ -3357,10 +3363,10 @@ if python3 "$ROOT/tools/context-footprint.py" --root "$ROOT" --skip-runtime --sk
   && ! grep -q '^surface=native-bootstrap-agent-modes' "$TMP/context_footprint.out" \
   && { grep -q '^status=ok' "$TMP/context_footprint.out" \
     || { grep -q '^status=warn warnings=19$' "$TMP/context_footprint.out" \
-      && grep -q 'owner worker bootstrap 7467 > 4096 bytes' "$TMP/context_footprint.out" \
-      && grep -q 'stage worker bootstrap 6492 > 4096 bytes' "$TMP/context_footprint.out" \
-      && grep -q 'review worker bootstrap 5526 > 4096 bytes' "$TMP/context_footprint.out" \
-      && grep -q 'support worker bootstrap 5155 > 4096 bytes' "$TMP/context_footprint.out" \
+      && grep -q 'owner worker bootstrap 8047 > 4096 bytes' "$TMP/context_footprint.out" \
+      && grep -q 'stage worker bootstrap 7072 > 4096 bytes' "$TMP/context_footprint.out" \
+      && grep -q 'review worker bootstrap 6106 > 4096 bytes' "$TMP/context_footprint.out" \
+      && grep -q 'support worker bootstrap 5735 > 4096 bytes' "$TMP/context_footprint.out" \
       && grep -q 'bootstrap:claude footprint regression' "$TMP/context_footprint.out" \
       && grep -q 'bootstrap:codex footprint regression' "$TMP/context_footprint.out" \
       && grep -q 'bootstrap:opencode footprint regression' "$TMP/context_footprint.out" \
