@@ -18,6 +18,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -370,6 +371,130 @@ class ClaimCasTest(IsolatedRootMixin, unittest.TestCase):
                 require_generation_proof=False,
             )
         self.assertEqual(ctx.exception.reason, "pending-delivery-reclaim-exhausted")
+
+
+class PruneTest(IsolatedRootMixin, unittest.TestCase):
+    """SD-111 §(7) v66: terminal records are kept for the retention window and
+    then pruned by the reconcile actor; open records are never pruned."""
+
+    DAY = 86400
+
+    def _record(self, suffix, *, state="pending", age_seconds=0.0):
+        receipt = _receipt()
+        delivery_id = "delivery-" + suffix * 32
+        recipient_key = "sess-prune"
+        PD.create(
+            self.root, recipient_kind="claude-parent-runtime", recipient_key=recipient_key,
+            delivery_id=delivery_id, session_generation="", session_generation_supported="0",
+            attempt_ids=["att-" + suffix * 32], parent_attempt_id="att-" + "a" * 32,
+            route_id="rt-prune", route_node="execute", receipt=receipt,
+            receipt_digest=_digest(receipt), row_revisions={"att-" + suffix * 32: "deadbeef"},
+        )
+        if state in {"claimed", "sent-ambiguous", "acked"}:
+            PD.claim(self.root, recipient_key, delivery_id, claim_owner="hook:1", lease_seconds=60)
+        if state == "sent-ambiguous":
+            PD.mark_sent_ambiguous(self.root, recipient_key, delivery_id, claim_owner="hook:1")
+        if state == "acked":
+            PD.ack(self.root, recipient_key, delivery_id, acked_by="fixture")
+        if state == "expired":
+            PD.expire_if_due(self.root, recipient_key, delivery_id, actor=PD.EXPIRY_ACTOR,
+                             reason="pending-delivery-ttl-exceeded")
+        path = PD.record_path(self.root, recipient_key, delivery_id)
+        self.assertEqual(json.loads(path.read_text("utf-8"))["state"], state)
+        old = time.time() - age_seconds
+        os.utime(path, (old, old))
+        return path
+
+    def _orphan_lock(self, name, age_seconds):
+        directory = self.root / "pending-delivery" / ("f" * 64)
+        directory.mkdir(parents=True, exist_ok=True)
+        lock = directory / f"{name}.json.lock"
+        lock.write_bytes(b"")
+        old = time.time() - age_seconds
+        os.utime(lock, (old, old))
+        return lock
+
+    def test_plan_keeps_open_records_whatever_their_age(self):
+        kept = [self._record(s, state=st, age_seconds=400 * self.DAY)
+                for s, st in (("1", "pending"), ("2", "claimed"), ("3", "sent-ambiguous"))]
+        plan = PD.prune_plan(self.root)
+        self.assertEqual(plan["records"], [])
+        self.assertEqual(plan["kept_open"], 3)
+        result = PD.prune(self.root, apply=True)
+        self.assertEqual(result["pruned_records"], 0)
+        for path in kept:
+            self.assertTrue(path.is_file())
+            self.assertTrue(path.with_name(path.name + ".lock").is_file())
+
+    def test_plan_lists_only_terminal_records_past_retention(self):
+        old_acked = self._record("4", state="acked", age_seconds=8 * self.DAY)
+        old_expired = self._record("5", state="expired", age_seconds=30 * self.DAY)
+        fresh_acked = self._record("6", state="acked", age_seconds=1 * self.DAY)
+        plan = PD.prune_plan(self.root)
+        self.assertEqual(
+            sorted(item["path"] for item in plan["records"]),
+            sorted([str(old_acked), str(old_expired)]),
+        )
+        self.assertEqual(plan["kept_terminal_recent"], 1)
+        self.assertEqual({item["state"] for item in plan["records"]}, {"acked", "expired"})
+        # dry-run never unlinks
+        PD.prune(self.root, apply=False)
+        for path in (old_acked, old_expired, fresh_acked):
+            self.assertTrue(path.is_file())
+
+    def test_apply_unlinks_record_and_lock_and_empty_directory(self):
+        old_acked = self._record("7", state="acked", age_seconds=8 * self.DAY)
+        result = PD.prune(self.root, apply=True)
+        self.assertEqual(result["pruned_records"], 1)
+        self.assertEqual(result["skipped"], 0)
+        self.assertFalse(old_acked.exists())
+        self.assertFalse(old_acked.with_name(old_acked.name + ".lock").exists())
+        self.assertFalse(old_acked.parent.exists())
+
+    def test_apply_skips_a_record_rewritten_since_the_plan(self):
+        old_acked = self._record("8", state="acked", age_seconds=8 * self.DAY)
+        real_plan = PD.prune_plan
+        def stale_plan(root, **kwargs):
+            plan = real_plan(root, **kwargs)
+            now = time.time()
+            os.utime(old_acked, (now, now))  # rewritten between plan and apply
+            return plan
+        with unittest.mock.patch.object(PD, "prune_plan", side_effect=stale_plan):
+            result = PD.prune(self.root, apply=True)
+        self.assertEqual(result["pruned_records"], 0)
+        self.assertEqual(result["skipped"], 1)
+        self.assertTrue(old_acked.is_file())
+
+    def test_orphan_locks_past_retention_are_pruned_recent_ones_kept(self):
+        old_lock = self._orphan_lock("delivery-old", 2 * self.DAY)
+        new_lock = self._orphan_lock("delivery-new", 3600)
+        live = self._record("9", state="pending", age_seconds=2 * self.DAY)
+        live_lock = live.with_name(live.name + ".lock")
+        os.utime(live_lock, (time.time() - 2 * self.DAY,) * 2)
+        plan = PD.prune_plan(self.root)
+        self.assertEqual([item["path"] for item in plan["orphan_locks"]], [str(old_lock)])
+        self.assertEqual(plan["kept_locks_recent"], 1)
+        result = PD.prune(self.root, apply=True)
+        self.assertEqual(result["pruned_locks"], 1)
+        self.assertFalse(old_lock.exists())
+        self.assertTrue(new_lock.exists())
+        self.assertTrue(live_lock.exists(), "a lock with a live record is never an orphan")
+
+    def test_cli_prune_defaults_to_dry_run_and_prints_the_table(self):
+        old_acked = self._record("b", state="acked", age_seconds=8 * self.DAY)
+        import contextlib, io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = PD.main(["prune", "--root", str(self.root)])
+        self.assertEqual(code, 0)
+        self.assertIn("DRY-RUN", buf.getvalue())
+        self.assertIn("planned: records=1 orphan_locks=0", buf.getvalue())
+        self.assertTrue(old_acked.is_file())
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            PD.main(["prune", "--root", str(self.root), "--apply", "--json"])
+        self.assertEqual(json.loads(buf.getvalue())["pruned_records"], 1)
+        self.assertFalse(old_acked.exists())
 
 
 class ExpiryTest(IsolatedRootMixin, unittest.TestCase):

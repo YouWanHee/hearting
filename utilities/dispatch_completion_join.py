@@ -463,6 +463,8 @@ def reconcile_pending_delivery(jobs: Path) -> dict[str, int]:
        that trigger 1 has not yet turned into a record (the crash window
        between the terminal commit and trigger 1's in-process call) is
        materialized here, idempotently converging with any other trigger.
+    3. **Retention prune** (v66): terminal records past retention and orphan
+       lock files are unlinked by this same actor -- see ``pending_delivery.prune``.
     2. **Expiry.** Any open-state (``pending``/``claimed``/``sent-ambiguous``)
        record whose owning row's recorded launch-time incarnation
        (``parent_runtime_pid``/``parent_runtime_pid_start``, §2-a-5) is
@@ -477,7 +479,8 @@ def reconcile_pending_delivery(jobs: Path) -> dict[str, int]:
     """
 
     root = jobs.resolve(strict=False).parent
-    result = {"materialized": 0, "expired": 0, "skipped": 0}
+    result = {"materialized": 0, "expired": 0, "skipped": 0,
+              "pruned_records": 0, "pruned_locks": 0, "prune_skipped": 0}
     try:
         lines = jobs.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
@@ -559,6 +562,18 @@ def reconcile_pending_delivery(jobs: Path) -> dict[str, int]:
                 result["expired"] += 1
             except pending_delivery.PendingDeliveryError:
                 pass
+    # 3. **Retention prune** (SD-111 §(7) v66). Terminal (`acked`/`expired`)
+    #    records past `TERMINAL_RETENTION_SECONDS` and orphan `.lock` files
+    #    past `ORPHAN_LOCK_RETENTION_SECONDS` are unlinked under the same
+    #    single actor; open-state records are never touched (see
+    #    `pending_delivery.prune`). Observers still delete nothing.
+    try:
+        pruned = pending_delivery.prune(root, apply=True)
+        result["pruned_records"] = pruned["pruned_records"]
+        result["pruned_locks"] = pruned["pruned_locks"]
+        result["prune_skipped"] = pruned["skipped"]
+    except Exception:  # noqa: BLE001 -- the sweep never raises
+        pass
     return result
 
 

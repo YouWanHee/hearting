@@ -927,6 +927,127 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual(rec["to"], {"harness": "unknown", "name": "ghost"})
         self.assertEqual(rec["kind"], "steer")
 
+    def _verify_run(self, status, *, prompt_rc=0, prompt_err="", explain_evidence="\"❯\\n\"", calls=None,
+                    pane_text="❯ "):
+        get_payload = _agent_json("claude", "sid-child", "child", status=status)
+        def run(argv, **kw):
+            if calls is not None:
+                calls.append(argv)
+            if argv[:3] == ["herdr", "agent", "get"]:
+                return _herdr_json(get_payload)
+            if argv[:3] == ["herdr", "agent", "read"]:
+                return subprocess.CompletedProcess(argv, 0, stdout=pane_text, stderr="")
+            if argv[:3] == ["herdr", "agent", "prompt"]:
+                return subprocess.CompletedProcess(argv, prompt_rc, stdout="{}" if prompt_rc == 0 else "",
+                                                   stderr=prompt_err)
+            if argv[:3] == ["herdr", "agent", "explain"]:
+                return subprocess.CompletedProcess(
+                    argv, 0, stdout=f"agent: claude\nstate: {status}\nevidence: {explain_evidence}\n", stderr="")
+            return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
+        return run
+
+    def test_prompt_to_an_idle_target_waits_for_the_state_flip(self):
+        """SD-122 (11): `prompted=true` only after herdr observed the submission."""
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
+        calls = []
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=self._verify_run("idle", calls=calls)), \
+             mock.patch("builtins.print") as print_mock:
+            rc = peer_steward.main(["prompt", "child", "[steer] go"])
+        self.assertEqual(rc, 0)
+        prompt_call = next(c for c in calls if c[:3] == ["herdr", "agent", "prompt"])
+        self.assertEqual(prompt_call[5:], ["--wait", "--until", "working", "--timeout", "8000"])
+        line = print_mock.call_args[0][0]
+        self.assertIn("prompted=true", line)
+        self.assertIn("state_before=idle verify=state-flip", line)
+        self.assertEqual(self._all_records()[-1]["delivery"]["status"], "sent")
+
+    def test_prompt_stalled_is_a_typed_failure_not_a_success(self):
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
+        stalled = json.dumps({"error": {"code": "agent_prompt_stalled", "message": "no state change"}})
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run",
+                               side_effect=self._verify_run("idle", prompt_rc=1, prompt_err=stalled)), \
+             mock.patch("builtins.print") as print_mock:
+            rc = peer_steward.main(["prompt", "child", "[steer] go"])
+        self.assertEqual(rc, 1)
+        line = print_mock.call_args[0][0]
+        self.assertIn("prompted=failed", line)
+        self.assertIn("reason=agent-prompt-stalled", line)
+        self.assertEqual(self._all_records()[-1]["delivery"]["status"], "failed")
+
+    def test_prompt_to_a_working_target_is_verified_by_the_prompt_box(self):
+        """A state change proves nothing for a working target: the box decides.
+        Our own first line still in the box after one Enter retry is `queued`."""
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
+        calls = []
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=self._verify_run("working", calls=calls)), \
+             mock.patch("builtins.print") as print_mock:
+            rc = peer_steward.main(["prompt", "child", "[handoff] all done, merge it"])
+        self.assertEqual(rc, 0)
+        prompt_call = next(c for c in calls if c[:3] == ["herdr", "agent", "prompt"])
+        self.assertNotIn("--wait", prompt_call, "a working target is never waited on for a flip")
+        self.assertIn("prompted=true", print_mock.call_args[0][0])
+        self.assertIn("state_before=working verify=prompt-box-clear", print_mock.call_args[0][0])
+        calls.clear()
+        residue = '"❯\\u{a0}[handoff] all done, merge it\\n"'
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run",
+                               side_effect=self._verify_run("working", explain_evidence=residue, calls=calls)), \
+             mock.patch("builtins.print") as print_mock:
+            rc = peer_steward.main(["prompt", "child", "[handoff] all done, merge it"])
+        self.assertEqual(rc, 3)
+        self.assertEqual([c for c in calls if c[:3] == ["herdr", "agent", "send-keys"]],
+                         [["herdr", "agent", "send-keys", "child", "Enter"]])
+        line = print_mock.call_args[0][0]
+        self.assertIn("prompted=queued", line)
+        self.assertIn("reason=prompt-box-residue", line)
+        self.assertEqual(self._all_records()[-1]["delivery"]["status"], "unknown")
+
+    def test_prompt_refuses_a_blocked_target_or_an_open_form(self):
+        """Measured 2026-09-06 (3/3): text injected into an open AskUserQuestion
+        form is lost and the Enter answers it with the default. `blocked` from
+        herdr, or the form footer in a narrow pane, is a typed refusal."""
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
+        form = "Probe: pick one?\n❯ 1. A\n  2. B\nEnter to select · ↑/↓ to navigate · Esc to cancel\n"
+        for status, pane_text in (("blocked", "❯ "), ("idle", form)):
+            with self.subTest(status=status):
+                calls = []
+                with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+                     mock.patch.object(peer_steward.subprocess, "run",
+                                       side_effect=self._verify_run(status, calls=calls, pane_text=pane_text)), \
+                     mock.patch("builtins.print") as print_mock:
+                    rc = peer_steward.main(["prompt", "child", "[steer] go"])
+                self.assertEqual(rc, 1)
+                self.assertFalse([c for c in calls if c[:3] == ["herdr", "agent", "prompt"]],
+                                 "nothing may be typed into an open form")
+                self.assertIn("prompted=failed", print_mock.call_args[0][0])
+                self.assertIn("reason=target-form-open", print_mock.call_args[0][0])
+                self.assertEqual(self._all_records()[-1]["delivery"]["status"], "failed")
+
+    def test_prompt_no_verify_keeps_the_legacy_exit_code_report(self):
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
+        calls = []
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=self._verify_run("working", calls=calls)), \
+             mock.patch("builtins.print") as print_mock:
+            rc = peer_steward.main(["prompt", "child", "[steer] go", "--no-verify"])
+        self.assertEqual(rc, 0)
+        self.assertFalse([c for c in calls if c[:3] == ["herdr", "agent", "explain"]])
+        self.assertIn("verify=none", print_mock.call_args[0][0])
+
+    def test_prompt_box_residue_ignores_the_suggested_prompt_ghost(self):
+        """Claude Code 2.1.263 renders a predicted next prompt in the empty box
+        (`❯ [handoff] 후속 결과 확인 — steward-carrier…`); it is not our text."""
+        ghost = '"❯\\u{a0}[handoff] 후속 결과 확인 — steward-carrier…\\n"'
+        self.assertFalse(peer_steward._prompt_box_residue(ghost, "[steer] 리뷰 끝나면 handoff 보내라"))
+        self.assertFalse(peer_steward._prompt_box_residue('"❯\\n"', "[steer] anything"))
+        self.assertTrue(peer_steward._prompt_box_residue(ghost, "[handoff] 후속 결과 확인 — steward-carrier 후속 4건"))
+        # a narrow pane truncates the box with `…`: a long-enough prefix of ours still counts
+        self.assertTrue(peer_steward._prompt_box_residue('"❯[handoff] all done, m…"', "[handoff] all done, merge it"))
+        self.assertFalse(peer_steward._prompt_box_residue('"❯[h…"', "[handoff] all done, merge it"))
+
     def test_prompt_empty_body_sends_nothing(self):
         with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
              mock.patch.object(peer_steward.subprocess, "run") as run_mock, \

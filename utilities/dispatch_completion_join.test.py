@@ -2943,6 +2943,29 @@ class ReconcilePendingDeliveryTest(unittest.TestCase):
             # Expired records are never deleted (§10.2).
             self.assertTrue(record_file.is_file())
 
+    def test_reconcile_prunes_terminal_records_past_retention_only(self):
+        """SD-111 §(7) v66: the reconcile actor prunes acked/expired records
+        older than the retention window and leaves open ones alone."""
+        with tempfile.TemporaryDirectory() as td:
+            jobs = Path(td) / "jobs.log"
+            dead_ancestry = ("999999999", "123456789")
+            jobs.write_text(
+                self._row("att-reconcile-p", ancestry=dead_ancestry) + "\n", encoding="utf-8"
+            )
+            self.assertTrue(D.close_attempt_row(jobs, "att-reconcile-p", "completed-marker"))
+            first = JOIN.reconcile_pending_delivery(jobs)
+            self.assertEqual(first["expired"], 1)
+            self.assertEqual(first["pruned_records"], 0, "fresh terminal records are kept")
+            root = jobs.resolve(strict=False).parent
+            record_file = next((root / "pending-delivery").glob("*/*.json"))
+            self.assertTrue(record_file.is_file())
+            old = time.time() - JOIN.pending_delivery.TERMINAL_RETENTION_SECONDS - 60
+            os.utime(record_file, (old, old))
+            second = JOIN.reconcile_pending_delivery(jobs)
+            self.assertEqual(second["pruned_records"], 1)
+            self.assertFalse(record_file.exists())
+            self.assertFalse(record_file.with_name(record_file.name + ".lock").exists())
+
     def test_never_expires_a_record_whose_owning_process_is_alive(self):
         with tempfile.TemporaryDirectory() as td:
             jobs = Path(td) / "jobs.log"
@@ -3009,7 +3032,8 @@ class ReconcilePendingDeliveryTest(unittest.TestCase):
             jobs = Path(td) / "jobs.log"
             jobs.write_text("fixture\n", encoding="utf-8")
             result = JOIN.reconcile_pending_delivery(jobs)
-            self.assertEqual(result, {"materialized": 0, "expired": 0, "skipped": 0})
+            self.assertEqual(result, {"materialized": 0, "expired": 0, "skipped": 0,
+                                  "pruned_records": 0, "pruned_locks": 0, "prune_skipped": 0})
 
 
 class RefusalWriterOwnFailureStaysSilentTest(unittest.TestCase):

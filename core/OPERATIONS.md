@@ -789,6 +789,24 @@ session that has SENT a steer/handoff/gate-relay/watch record — or ran
 `<dispatch-state-root>/peer-steward/`, which Fleet renders as the bold-yellow tag badge;
 `peer-steward.py steward off` (or `peer-message release`) clears it.
 
+**Prompt submission is verified, never assumed** (SD-122 (11), v67). `peer-steward.py prompt`
+prints `prompted=true` only after the submission was observed: a target that is not working is
+sent with `herdr agent prompt --wait --until working` and must flip state (herdr's
+`agent_prompt_stalled` → `prompted=failed reason=agent-prompt-stalled`, exit 1); a target that is
+already working has its prompt box re-read after a bounded herdr wait, and our own first line still
+in it after one `Enter` retry is `prompted=queued reason=prompt-box-residue` (exit 3 — the text sits
+in the target's input, unsubmitted). A `blocked` target, or a visible selection/permission form
+(AskUserQuestion, permission prompt), is refused as `prompted=failed reason=target-form-open`:
+measured 2026-09-06, text typed into an open form is lost and the Enter answers the form with its
+default. Measured the same day on a probe Claude session (Claude Code 2.1.263, herdr 0.8.0):
+`herdr agent prompt`, this command, and `pane send-text`+`send-keys Enter` each submitted within
+1 s whether the target was idle or mid-turn (6/6), and every steward send in that day's ledger
+arrived within 1 s. The "text sitting unsubmitted in the input box" reports were Claude Code's
+predicted-next-prompt ghost in an *empty* box (`❯ [handoff] … …`, present in no transcript or
+ledger, gone as soon as anything is typed, unmoved by Enter/Return/ctrl+m): before calling a
+prompt unsubmitted, type one character into the box or check the target transcript. `--no-verify`
+keeps the legacy exit-code report; `--wait-idle-ms N` defers a send to a working/blocked target.
+
 Same-behavior guarantees are still not claimed: the watched-side herdr realization is
 measured for both Claude and Codex, and **no runtime's steward-side wake is measured** —
 the Claude carrier becomes `measured` only after a live-session capture, not before. The
