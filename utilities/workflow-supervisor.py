@@ -983,8 +983,17 @@ def retire_gate_delivery(route, gate, jobs):
             record = PENDING.read(root, recipient_key, delivery_id)
             if record is None or record.get("state") in {"acked", "expired"}:
                 continue
+            if (record.get("attempts") or 0) >= PENDING.RECLAIM_LIMIT:
+                # `claim` refuses a record whose reclaim budget is spent, so
+                # ack can never reach it; the release still supersedes it
+                # (review round 2, N3) -- expire it under the declared actor
+                # rather than leave it `pending` forever.
+                PENDING.expire_if_due(root, recipient_key, delivery_id,
+                                      actor=PENDING.EXPIRY_ACTOR,
+                                      reason="receipt-row-superseded")
+                return "expired"
             if record.get("state") in {"claimed", "sent-ambiguous"}:
-                PENDING.reclaim(root, recipient_key, delivery_id, now_ns=time.time_ns())
+                PENDING.reclaim(root, recipient_key, delivery_id, now_ns=time.monotonic_ns())
             PENDING.claim(root, recipient_key, delivery_id,
                           claim_owner=f"gate-release:{os.getpid()}",
                           lease_seconds=60.0, require_generation_proof=False)
@@ -1272,10 +1281,20 @@ def await_release_command(route_path, gate):
 
 
 def cmd_await_release(args):
-    route = load_route(args.route)
+    try:
+        route = load_route(args.route)
+    except SupervisorError:
+        print(json.dumps({"route": str(args.route), "gate": args.gate,
+                          "status": "error", "reason": "route-unreadable"}, sort_keys=True))
+        raise
     ledger = ledger_for(route)
     gates = {row["gate"]: row for row in (route.get("human_gate_bindings") or [])}
     if args.gate not in gates:
+        # Every refusal of this surface prints one typed JSON line on stdout
+        # before the exit-64 prose (review round 1, minor 6): an owner script
+        # branches on `reason`, not on the message.
+        print(json.dumps({"route_id": route["route_id"], "gate": args.gate,
+                          "status": "error", "reason": "gate-undeclared"}, sort_keys=True))
         raise SupervisorError(f"route declares no human gate {args.gate!r}")
     interval = max(1.0, float(args.interval))
     maximum = min(max(0.0, float(args.max)), MAX_AWAIT_SECONDS)

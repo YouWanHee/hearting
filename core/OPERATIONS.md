@@ -449,8 +449,16 @@ decision, never two independently toggled ones.
   set arms nothing and emits one typed `not-armed surface=release` notice; the
   `UserPromptSubmit` sweep still delivers the pending record at the next
   prompt. While waiting, an announced-but-unclaimable gate record never spins
-  the hook: the probe skips records whose reclaim budget is spent and sleeps
-  one interval after an empty announce, under the same overall deadline. The owner itself waits on `workflow-supervisor.py await-release`
+  the hook: the probe skips records whose reclaim budget is spent (the release
+  expires such a record as `receipt-row-superseded`) and sleeps one interval
+  after an empty announce, under the same overall deadline; it reads the
+  registry once and rescans the recipient directory only when a record was
+  written or a lease it saw has expired. The launch fence
+  (`dispatch_contract.completion_marker_gate`) refuses a node whose entry gate
+  is unreleased only for gates that some node of the route raises through its
+  continuation **and** that an owner contract implements
+  (`dispatch_contract.FENCED_HUMAN_GATES`, today `frame-review`); a binding the
+  topology merely declares is not a mandatory step. The owner itself waits on `workflow-supervisor.py await-release`
   (bounded, read-only), and every launch surface refuses to start a node whose
   entry gate is not released (`human-gate-unreleased`/`human-gate-not-raised`).
 - The interactive Claude `asyncRewake` bridge recognizes both an exact

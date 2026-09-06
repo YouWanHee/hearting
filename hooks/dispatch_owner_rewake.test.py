@@ -1387,6 +1387,7 @@ class GateCarrierTest(unittest.TestCase):
 
     def _gate_record(self, *, delivery_id="delivery-gate-0001", state=None):
         rewake._PROBE_DIRECTORY_MTIME.clear()
+        rewake._PROBE_NEXT_DEADLINE_NS.clear()
         rewake._RECIPIENT_KEY_CACHE.clear()
         receipt = {
             "schema_version": 2, "state": "attention",
@@ -1540,6 +1541,68 @@ class GateCarrierTest(unittest.TestCase):
         self.assertEqual(rewake._gate_notices(self._launch(), attempt_only=True), [])
         # the terminal wake still folds every open gate for the recipient in
         self.assertEqual(len(rewake._gate_notices(self._launch())), 1)
+
+    def test_the_probe_rescans_only_on_a_directory_write_or_an_expired_lease(self):
+        """review round 2, N1 / N4: the mtime gate is exercised, not cleared."""
+        delivery_id = self._gate_record()
+        launch = self._launch()
+        self.assertTrue(rewake._open_gate_pending(launch))          # first scan: pending
+        with mock.patch.object(rewake, "_recipient_gate_records") as scan:
+            self.assertFalse(rewake._open_gate_pending(launch))     # no write: no scan
+            scan.assert_not_called()
+        rewake.pending_delivery.claim(self.state, "session-gate", delivery_id,
+                                      claim_owner="session-sweep:x:1:1", lease_seconds=0.05)
+        self.assertFalse(rewake._open_gate_pending(launch))         # write: scanned, lease live
+        time.sleep(0.08)
+        # no directory write since, but the lease seen at the last scan expired
+        self.assertTrue(rewake._open_gate_pending(launch))
+        # the registry was read once for the whole sequence
+        with mock.patch.object(rewake, "current_attempt_row") as row:
+            rewake._open_gate_pending(launch)
+            row.assert_not_called()
+
+    def test_the_real_unclaimable_record_never_spins_the_loop(self):
+        """review round 2, N4: B3 with the real probe and real notices."""
+        delivery_id = self._gate_record()
+        for _ in range(rewake.pending_delivery.RECLAIM_LIMIT):
+            rewake.pending_delivery.claim(self.state, "session-gate", delivery_id,
+                                          claim_owner="x", lease_seconds=0.001)
+            rewake.pending_delivery.reclaim(self.state, "session-gate", delivery_id,
+                                            now_ns=time.monotonic_ns() + 10**12)
+        rewake._PROBE_DIRECTORY_MTIME.clear()
+        payload = {
+            "hook_event_name": "PostToolUse", "tool_name": "Bash",
+            "session_id": "session-gate",
+            "tool_input": {"command": "python3 utilities/dispatch-owner.py --start --slug owner"},
+            "tool_response": {"stdout": "\n".join((
+                "check=ok", "status=start", "dispatch_depth=1", "worker_type=owner",
+                "parent_completion_delivery=claude-parent-runtime",
+                "parent_session_id=session-gate", f"job_registry={self.jobs}",
+                "attempt_id=att-gate-owner", "registered=1", "started=1")), "stderr": ""},
+        }
+        (self.root / "utilities").mkdir()
+        (self.root / "utilities" / "dispatch-attempt-ready.py").write_text("", encoding="utf-8")
+        pending = subprocess.CompletedProcess([], 2, stdout="pending")
+        clock = {"t": 0.0}
+
+        def monotonic():
+            clock["t"] += 1.0
+            return clock["t"]
+
+        with mock.patch.object(rewake.subprocess, "run", return_value=pending) as run, \
+                mock.patch.object(rewake, "agent_home", return_value=self.root), \
+                mock.patch.object(rewake.time, "monotonic", side_effect=monotonic), \
+                mock.patch.object(rewake.time, "sleep") as sleep, \
+                mock.patch.dict(os.environ, {"AGENT_CLAUDE_REWAKE_INTERVAL_SECONDS": "1",
+                                             "AGENT_CLAUDE_REWAKE_MAX_SECONDS": "6"}), \
+                mock.patch.object(sys, "stdin", io.StringIO(json.dumps(payload))), \
+                mock.patch.object(sys, "stdout", io.StringIO()), \
+                mock.patch.object(sys, "stderr", io.StringIO()) as stderr:
+            code = rewake.main()
+        self.assertEqual(code, 0)
+        self.assertNotIn("owner=alive-waiting", stderr.getvalue())
+        self.assertEqual(sleep.call_count, run.call_count - 1)
+        self.assertLessEqual(run.call_count, 8)
 
     def test_the_probe_ignores_a_record_whose_reclaim_budget_is_spent(self):
         """review round 1, B3: an unclaimable record must not keep the probe

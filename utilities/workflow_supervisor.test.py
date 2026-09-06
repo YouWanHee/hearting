@@ -1984,6 +1984,42 @@ class TestGateSubjectNotCaller(WorkflowFixture):
         self.assertEqual(payload["questions"], 1)
         self.assertIn("await-release", payload["await_command"])
 
+    def test_a_burned_record_is_expired_by_the_release_not_orphaned(self):
+        """review round 2, N3."""
+        route, path = self.two_stage_route(
+            human_gate="frame-review",
+            continuation={"kind": "human-gate", "gate": "frame-review"})
+        jobs, session, _attempt = self.owner_registry()
+        root = Path(jobs).resolve(strict=False).parent
+        interview, value = self._interview()
+        _code, payload = self._block_with(path, jobs, interview)
+        delivery_id = json.loads(Path(payload["delivery"]).read_text("utf-8"))["delivery_id"]
+        for _ in range(PENDING.RECLAIM_LIMIT):
+            PENDING.claim(root, session, delivery_id, claim_owner="x", lease_seconds=0.001)
+            PENDING.reclaim(root, session, delivery_id, now_ns=time.monotonic_ns() + 10**12)
+        self.assertGreaterEqual(PENDING.read(root, session, delivery_id)["attempts"], PENDING.RECLAIM_LIMIT)
+        answers_path, _answers = self._answers(value)
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = SUP.main(["release", "--route", str(path), "--gate", "frame-review",
+                             "--decision", "proceed", "--jobs", str(jobs), "--answers", str(answers_path)])
+        self.assertEqual(code, 0)
+        record = PENDING.read(root, session, delivery_id)
+        self.assertEqual((record["state"], record["expiry_reason"]), ("expired", "receipt-row-superseded"))
+
+    def test_await_release_refusals_carry_a_typed_reason(self):
+        """review round 1, minor 6."""
+        _route, path = self.two_stage_route(
+            human_gate="frame-review",
+            continuation={"kind": "human-gate", "gate": "frame-review"})
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), self.assertRaises(SUP.SupervisorError):
+            SUP.main(["await-release", "--route", str(path), "--gate", "nope", "--max", "0"])
+        self.assertEqual(json.loads(buf.getvalue())["reason"], "gate-undeclared")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), self.assertRaises(SUP.SupervisorError):
+            SUP.main(["await-release", "--route", str(self.base / "missing.json"), "--gate", "frame-review", "--max", "0"])
+        self.assertEqual(json.loads(buf.getvalue())["reason"], "route-unreadable")
+
     def test_answers_for_a_summary_gate_are_refused_not_dropped(self):
         _route, path = self.two_stage_route(
             human_gate="frame-review",

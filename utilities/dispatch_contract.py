@@ -4426,6 +4426,11 @@ def validate_nested_eligibility(
         raise DispatchContractError(f"nested-child-spawn-{status}", source or "no checked evidence")
 
 
+# The human gates whose owner contract implements raise + await (SD-129
+# §13.41.2-5). See `_human_gate_entry_fence`.
+FENCED_HUMAN_GATES = frozenset({"frame-review"})
+
+
 def _human_gate_entry_fence(route: dict, node: dict) -> None:
     """Refuse to start a node whose entry human gate is not released (SD-129).
 
@@ -4446,13 +4451,20 @@ def _human_gate_entry_fence(route: dict, node: dict) -> None:
     their own gate. `revise` and `stop` leave the gate unreleased too.
     """
 
-    # Only a gate some node of this route actually RAISES is fenced: the
-    # SD-123 mechanism is `predecessor.continuation = {kind: human-gate, gate}`
-    # -> BLOCKED_HUMAN_GATE -> release. Bindings with no raising continuation
-    # (`intent-confirmation`, `direction-confirmation`, `preview-disposition`,
-    # `explicit-handback`, ...) are satisfied by the §0.4 card and no command in
-    # the harness raises or releases them -- fencing those refused every
-    # standard+ autopilot-spec route at its first node (review round 1, B1).
+    # Two conditions, both required (review rounds 1 and 2, B1):
+    #   1. some node of THIS route raises the gate -- the SD-123 mechanism is
+    #      `predecessor.continuation = {kind: human-gate, gate}` ->
+    #      BLOCKED_HUMAN_GATE -> release; a binding with no raising continuation
+    #      (`intent-confirmation`) is satisfied by the §0.4 card;
+    #   2. the gate is in FENCED_HUMAN_GATES -- the gates whose owner contract
+    #      actually implements the raise and the wait. The topology declares
+    #      raising continuations for five more gates (`direction-confirmation`,
+    #      `preview-disposition`, `explicit-handback`, `full-run-authorization`,
+    #      `deploy-authorization`) that no capability document, skill or owner
+    #      reference tells an owner to raise; fencing those would turn a
+    #      declaration into a mandatory step nobody documented (round 2, B1).
+    # A gate joins the set in the same change that teaches its owner to raise
+    # it; `dispatch_contract.test.py` pins the set against the real topology.
     raised_gates = {
         str((n.get("continuation") or {}).get("gate"))
         for n in (route.get("nodes") or [])
@@ -4464,6 +4476,7 @@ def _human_gate_entry_fence(route: dict, node: dict) -> None:
         if isinstance(row, dict) and row.get("node") == node.get("id")
         and (row.get("position") or "entry") == "entry" and row.get("gate")
         and str(row.get("gate")) in raised_gates
+        and str(row.get("gate")) in FENCED_HUMAN_GATES
     ]
     if not bindings:
         return

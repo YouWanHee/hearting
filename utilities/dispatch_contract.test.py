@@ -2584,6 +2584,47 @@ class DispatchContractTest(unittest.TestCase):
    with mock.patch.dict(os.environ,{"AGENT_WORKFLOW_ROOT":str(base/"workflow")}):
     self._fence_start(base,path)
 
+ def test_the_fence_scope_against_the_real_topology(self):
+  """review round 2, B1 residue / N4: table-driven over `capabilities/topologies.json`.
+  Exactly the gates in FENCED_HUMAN_GATES fence their bound node; every other
+  bound node of every other recipe starts, whether or not the topology declares
+  a raising continuation for its gate."""
+  registry=json.loads((Path(__file__).resolve().parents[1]/"capabilities"/"topologies.json").read_text(encoding="utf-8"))
+  self.assertEqual(D.FENCED_HUMAN_GATES,frozenset({"frame-review"}))
+  seen=[]
+  for recipe in registry["recipes"]:
+   bindings=recipe.get("human_gate_bindings") or []
+   nodes=(recipe.get("standard_plus") or {}).get("nodes") or []
+   if not bindings or not nodes: continue
+   for binding in bindings:
+    if (binding.get("position") or "entry")!="entry": continue
+    with tempfile.TemporaryDirectory() as td:
+     base=Path(td)
+     route={"dispatch_contract_version":3,"route_id":"rt-topo-"+recipe["capability"][-8:],
+            "route_hash":"sha256:"+"b"*64,"registry_digest":"sha256:"+"c"*64,
+            "human_gates":recipe.get("human_gates") or [],"human_gate_bindings":bindings,
+            "nodes":[{k:v for k,v in n.items()} for n in nodes]}
+     path=base/"route.json"; path.write_text(json.dumps(route),encoding="utf-8")
+     marker_dir=base/".dispatch"/"completion"/route["route_id"]; marker_dir.mkdir(parents=True)
+     for n in nodes:
+      (marker_dir/f"{n['id']}.json").write_text(json.dumps({"attempt_id":"att-"+n["id"],"registered_worker":True}),encoding="utf-8")
+     ready=D.AttemptReadiness("ready","fixture-ready","att-dep")
+     with mock.patch.dict(os.environ,{"AGENT_WORKFLOW_ROOT":str(base/"workflow")}), \
+          mock.patch.object(D,"completion_marker_is_current",return_value=True), \
+          mock.patch.object(D,"completion_attempt_readiness",return_value=ready), \
+          mock.patch.object(D,"_sibling_attempt_gate"), \
+          mock.patch.object(D,"_auxiliary_arbitration_gate"):
+      try:
+       D.completion_marker_gate(str(path),binding["node"],"start",base,base/"jobs.log",
+                                registry_lines=[],attempt_id="att-new")
+       verdict="started"
+      except D.DispatchContractError as exc:
+       verdict=exc.reason
+     seen.append((recipe["capability"],binding["gate"],binding["node"],verdict))
+  fenced=[row for row in seen if row[3]!="started"]
+  self.assertEqual(fenced,[("autopilot-code","frame-review","plan","human-gate-not-raised")],seen)
+  self.assertGreaterEqual(len(seen),5)
+
  def test_a_route_without_bindings_is_not_fenced(self):
   with tempfile.TemporaryDirectory() as td:
    base=Path(td); route,path=self._gated_route(base)

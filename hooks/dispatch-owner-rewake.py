@@ -917,6 +917,7 @@ def _recipient_gate_records(launch: Launch) -> list[tuple[Path, str, str, dict]]
 
 
 _PROBE_DIRECTORY_MTIME: dict[str, float] = {}
+_PROBE_NEXT_DEADLINE_NS: dict[str, int] = {}
 
 
 def _open_gate_pending(launch: Launch) -> bool:
@@ -928,7 +929,9 @@ def _open_gate_pending(launch: Launch) -> bool:
     A live claim by the sweep is left alone -- it acks within its own turn.
 
     The recipient directory is only scanned when its mtime moved since the
-    last probe: a record being created, claimed or acked rewrites a file in it.
+    last probe -- a record being created, claimed or acked rewrites a file in
+    it -- or when the earliest live lease seen at the last scan has now expired
+    (a lease expiring is a clock event with no write; review round 2, N1).
     """
 
     recipient_key = _recipient_key(launch)
@@ -941,10 +944,12 @@ def _open_gate_pending(launch: Launch) -> bool:
     except (pending_delivery.PendingDeliveryError, OSError):
         return False
     key = str(directory)
-    if _PROBE_DIRECTORY_MTIME.get(key) == mtime:
+    now = time.monotonic_ns()
+    next_deadline = _PROBE_NEXT_DEADLINE_NS.get(key)
+    if _PROBE_DIRECTORY_MTIME.get(key) == mtime and (next_deadline is None or now < next_deadline):
         return False
     _PROBE_DIRECTORY_MTIME[key] = mtime
-    now = time.monotonic_ns()
+    _PROBE_NEXT_DEADLINE_NS.pop(key, None)
     for _root, _key, _delivery_id, record in _recipient_gate_records(launch):
         if launch.attempt_id not in (record.get("attempt_ids") or []):
             continue
@@ -953,8 +958,11 @@ def _open_gate_pending(launch: Launch) -> bool:
         state = record.get("state")
         if state == "pending":
             return True
-        if state in {"claimed", "sent-ambiguous"} and (record.get("claim_deadline_ns") or 0) < now:
-            return True
+        if state in {"claimed", "sent-ambiguous"}:
+            deadline = int(record.get("claim_deadline_ns") or 0)
+            if deadline < now:
+                return True
+            _PROBE_NEXT_DEADLINE_NS[key] = min(_PROBE_NEXT_DEADLINE_NS.get(key, deadline), deadline)
     return False
 
 

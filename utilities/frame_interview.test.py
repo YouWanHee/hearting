@@ -104,6 +104,11 @@ class ValidateTest(unittest.TestCase):
         bad = good_interview()
         bad["questions"][0]["question"] = "게이트를 지금 열까요, 나중에 열까요?"
         self.assertTrue(any("harness word" in e for e in FI.validate(bad)))
+        # review round 2, N2: ordinary Korean words that contain a term are not hits
+        for text in ("가격이 훅 오를까요?", "마커펜을 쓸까요?", "게이트볼을 할까요?", "노드 대신 마디라고 부를까요?"):
+            with self.subTest(text=text):
+                self.assertEqual([h for h in FI.jargon_hits(text) if h not in ("노드",)], [], text)
+        self.assertEqual(FI.jargon_hits("노드 대신 마디라고 부를까요?"), ["노드"])
 
     def test_abbreviations_are_not_sentence_ends_and_two_questions_are_caught(self):
         ok = good_interview(understanding="You want approval in seconds, e.g. under five, with short questions.")
@@ -111,6 +116,11 @@ class ValidateTest(unittest.TestCase):
         bad = good_interview()
         bad["questions"][0]["question"] = "Fix wording? Change schedule?"
         self.assertTrue(any("two things" in e for e in FI.validate(bad)))
+        bad["questions"][0]["question"] = "Should we fix the wording and also change the schedule?"
+        self.assertTrue(any("two things" in e for e in FI.validate(bad)))
+        ok = good_interview()
+        ok["questions"][0]["question"] = "Should the fix cover the wording and the schedule together?"
+        self.assertEqual(FI.validate(ok), [])
 
     def test_answers_are_bounded(self):
         """review round 1, M5."""

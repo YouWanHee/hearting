@@ -65,8 +65,13 @@ JARGON = (
     "quiescent", "asyncrewake", "sweep", "envelope", "pipeline", "conductor",
     "라우트", "디스패치", "오너", "어템프트", "워커", "게이트", "레저", "슈퍼바이저",
     "노드", "샤드", "하네스", "캐리어", "마커", "리시트", "레지스트리", "토폴로지",
-    "워크트리", "훅", "사이드카", "파이프라인", "컨덕터",
+    "워크트리", "사이드카", "파이프라인", "컨덕터",
 )
+# 훅 is not in the Korean list: as an adverb ("suddenly") it is ordinary
+# Korean, and the English `hook` still catches the harness sense.
+_KOREAN_PARTICLES = ("을", "를", "이", "가", "은", "는", "의", "에", "에서", "로", "으로", "와", "과",
+                     "도", "만", "까지", "부터", "처럼", "마다", "보다", "에게", "께", "한테", "이라",
+                     "라고", "이나", "나", "이며", "며", "이고", "고", "든", "이든", "이란", "란")
 JARGON_IDS = re.compile(r"(?<![A-Za-z0-9])(?:SD-\d+|rt-[0-9a-f]{6,}|att-[0-9a-f]{6,}|cyc_[0-9a-f]{6,}|camp_[0-9a-f]{6,}|rrev_[0-9a-f]{6,})(?![A-Za-z0-9])", re.I)
 
 
@@ -77,7 +82,11 @@ def _jargon_pattern(term: str) -> "re.Pattern[str]":
     particle (`게이트를`, `오너가`) and a word boundary would never fire."""
 
     if re.search(r"[가-힣]", term):
-        return re.compile(re.escape(term))
+        # A harness term followed by a particle (`게이트를`, `오너가`) or by a
+        # non-Hangul character; a term that continues into another Hangul
+        # syllable is a different word (`게이트볼`, `마커펜` -- review round 2, N2).
+        particles = "|".join(sorted(map(re.escape, _KOREAN_PARTICLES), key=len, reverse=True))
+        return re.compile(re.escape(term) + r"(?:(?![가-힣])|(?:" + particles + r")(?![가-힣]))")
     return re.compile(r"(?<![A-Za-z])" + re.escape(term) + r"(?![A-Za-z])", re.I)
 
 
@@ -189,7 +198,8 @@ def validate(interview: dict, *, intensity: str = "standard") -> list[str]:
                 errors.append(f"{where}.question: {len(text)} chars > {MAX_QUESTION_CHARS}")
             if _sentences(text) > MAX_SENTENCES:
                 errors.append(f"{where}.question: more than {MAX_SENTENCES} sentences")
-            if text.count("?") + text.count("？") > 1:
+            lowered = f" {text.lower()} "
+            if text.count("?") + text.count("？") > 1 or " and also " in lowered or ", and " in lowered:
                 errors.append(f"{where}.question: asks two things at once")
             for hit in jargon_hits(text):
                 errors.append(f"{where}.question: harness word {hit!r}")
