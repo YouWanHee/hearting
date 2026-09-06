@@ -268,6 +268,34 @@ class CycleLayoutTest(unittest.TestCase):
   self.assertEqual((spec/"pipeline_state.yaml").read_text(),"s\n")                   # whole tree seeded (D-87)
   self.assertTrue(any(r["status"]=="snapshot" and r["version"]==2 for r in rows),rows)
 
+ def test_sd_open_50_worker_research_residue_without_a_prd_still_seeds(self):
+  # H1 (cairn v173 owner, 2026-09-07): the route's spec write scope let the
+  # research worker write `_internal/research/**` before the transaction, so
+  # the any-file predicate skipped the seed -> no pre-image, next_version=1,
+  # no snapshot. The predicate is "prd.md absent"; residue is preserved.
+  self._shared_v1()
+  _r,_f,begun=self._cycle("spec-edit-residue"); cycle_dir=Path(begun["cycle_dir"]); events=Path(self._tmp.name)/"ev-residue.jsonl"
+  spec=cycle_dir/"artifacts"/"spec"; note=spec/"_internal"/"research"/"note.md"; note.parent.mkdir(parents=True); note.write_text("worker wrote this first\n")
+  code="import os; from pathlib import Path; Path(os.environ['AGENT_SPEC_ROOT'],'prd.md').write_text('v'+os.environ['AGENT_SPEC_NEXT_VERSION']+'\\n')"
+  result=self._run(cycle_dir,code,events)
+  self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+  rows=[json.loads(l) for l in events.read_text().splitlines()]
+  seeded=[r for r in rows if r["status"]=="seeded"]
+  self.assertEqual(len(seeded),1,rows); self.assertEqual((seeded[0]["files"],seeded[0]["preexisting_files"],seeded[0]["kept_existing"]),(3,1,0))
+  self.assertFalse(any(r["status"]=="seed-skipped" for r in rows),rows)
+  self.assertEqual([r["next_version"] for r in rows if r["status"]=="acquired"],[2])
+  self.assertEqual((spec/"_internal"/"versions"/"v2"/"prd.md").read_text(),"v1\n")   # pre-image snapshot from the tool
+  self.assertEqual((spec/"prd.md").read_text(),"v2\n")
+  self.assertEqual(note.read_text(),"worker wrote this first\n")                      # residue preserved
+  # a prd.md already present still skips the seed, and says the prd is there
+  _r,_f,begun2=self._cycle("spec-edit-present"); cycle2=Path(begun2["cycle_dir"]); events2=Path(self._tmp.name)/"ev-present.jsonl"
+  spec2=cycle2/"artifacts"/"spec"; spec2.mkdir(parents=True); (spec2/"prd.md").write_text("v1\n"); (spec2/"_internal"/"versions"/"v1").mkdir(parents=True); (spec2/"_internal"/"versions"/"v1"/"prd.md").write_text("v0\n")
+  result=self._run(cycle2,code,events2)
+  self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+  rows=[json.loads(l) for l in events2.read_text().splitlines()]
+  skipped=[r for r in rows if r["status"]=="seed-skipped"]
+  self.assertEqual([(r["reason"],r["prd_present"]) for r in skipped],[("spec-base-not-empty",True)])
+
  def test_seed_unions_version_history_across_revisions(self):
   # Latest revision carries the PRD but no history (cairn's rrev_511a shape);
   # an earlier revision holds _internal/versions/v3. The counter must continue at 4.

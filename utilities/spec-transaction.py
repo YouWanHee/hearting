@@ -37,20 +37,31 @@ def seed_cycle_spec(spec_base: Path, artifact: Path):
     (every component, D-87) plus the `_internal/versions/v*` history of every
     earlier revision of that reference, so the pre-image, the version counter
     and the snapshot all come from the tool. Returns an event dict."""
-    if any(p.is_file() for p in spec_base.rglob("*")):
-        has_prd=(spec_base/"prd.md").is_file() or any(p.name=="prd.md" and p.parent.parent==spec_base for p in spec_base.rglob("prd.md"))
-        return {"status":"seed-skipped","reason":"spec-base-not-empty","prd_present":has_prd,"spec_base":str(spec_base)}
+    # SD-OPEN-50 (H1): the seed predicate is "no prd.md", not "no file". A
+    # transactional standard+ owner's worker writes `_internal/research/**`
+    # under the route's spec write scope BEFORE the transaction runs, so the
+    # old any-file test skipped the seed on a bucket that held research notes
+    # and no PRD: no pre-image, `next_version=1`, no snapshot (cairn v173,
+    # 2026-09-07 -- the owner worked around it by mv -> staging -> restore).
+    # Worker residue is preserved: seeding never overwrites an existing file.
+    has_prd=(spec_base/"prd.md").is_file() or any(p.name=="prd.md" and p.parent.parent==spec_base for p in spec_base.rglob("prd.md"))
+    preexisting=sum(1 for p in spec_base.rglob("*") if p.is_file()) if spec_base.is_dir() else 0
+    if has_prd:
+        return {"status":"seed-skipped","reason":"spec-base-not-empty","prd_present":True,"preexisting_files":preexisting,"spec_base":str(spec_base)}
     revision=CUTOVER.latest_shared_revision(artifact,"spec")
     if revision is None:
-        return {"status":"seed-skipped","reason":"no-shared-revision","spec_base":str(spec_base)}
-    copied=0
+        return {"status":"seed-skipped","reason":"no-shared-revision","prd_present":False,"preexisting_files":preexisting,"spec_base":str(spec_base)}
+    copied=0; kept=0
     for src in sorted(revision.rglob("*")):
         if not src.is_file() or src.is_symlink():
             continue
         rel=src.relative_to(revision)
         if rel.as_posix()=="revision.json":
             continue
-        dst=spec_base/rel; dst.parent.mkdir(parents=True,exist_ok=True)
+        dst=spec_base/rel
+        if dst.exists():
+            kept+=1; continue
+        dst.parent.mkdir(parents=True,exist_ok=True)
         dst.write_bytes(src.read_bytes()); copied+=1
     history=0
     revisions_dir=revision.parent
@@ -68,7 +79,8 @@ def seed_cycle_spec(spec_base: Path, artifact: Path):
                 if dst.exists() or src.is_symlink() or not src.is_file():
                     continue
                 dst.parent.mkdir(parents=True,exist_ok=True); dst.write_bytes(src.read_bytes()); history+=1
-    return {"status":"seeded","source":str(revision),"files":copied,"history_versions":history,"spec_base":str(spec_base)}
+    return {"status":"seeded","source":str(revision),"files":copied,"history_versions":history,
+            "preexisting_files":preexisting,"kept_existing":kept,"spec_base":str(spec_base)}
 
 
 def legacy_spec_state(artifact: Path):
