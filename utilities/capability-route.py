@@ -1114,8 +1114,13 @@ def _stage_fallback():
         _STAGE_FALLBACK=module
     return _STAGE_FALLBACK
 
-def _continuation_lineage_route_ids(source_route):
+def continuation_lineage_route_ids(source_route):
     """Every route id in this continuation's lineage, nearest ancestor first.
+
+    Shared with `worker-route-guard.py`, which asks the same question from the
+    other side: the builder needs it to decide whether to keep a pin, the guard
+    needs it to find the retry evidence that pin implies (SD-133). One
+    definition, so the two can never disagree about what an ancestor is.
 
     A declined continuation records no attempts of its own -- the guard refuses
     its whole pre-mutation prefix -- so asking the registry only about the
@@ -1188,7 +1193,7 @@ def _prior_registry_attempt(source_route, node_id):
     jobs=_authoritative_lineage_registry(source_route)
     if jobs is None:
         return True
-    lineage=_continuation_lineage_route_ids(source_route)
+    lineage=continuation_lineage_route_ids(source_route)
     if not lineage:
         return True
     try:
