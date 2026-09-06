@@ -16,7 +16,9 @@ read as "the stage succeeded".
   workflow-supervisor.py arm     --route R --node N --predecessor-kind resource|registered ...
   workflow-supervisor.py poll    --route R
   workflow-supervisor.py watch   --route R --max 3600
-  workflow-supervisor.py gate    --route R --gate G --release|--block
+  workflow-supervisor.py gate    --route R --gate G --release|--block [--artifact P]
+  workflow-supervisor.py release --route R --gate G --decision proceed|revise|stop
+  workflow-supervisor.py await-release --route R --gate G [--max S] [--interval S]
   workflow-supervisor.py status  --route R [--json]
   workflow-supervisor.py complete --route R
   workflow-supervisor.py survey  --artifact-root ROOT [--stale-after-seconds S] [--json]
@@ -40,6 +42,7 @@ sys.path.insert(0, str(ROOT / "utilities"))
 import workflow_state as WS  # noqa: E402
 import resource_run_registry as RR  # noqa: E402
 import dispatch_pending_delivery as PENDING  # noqa: E402
+import frame_interview as INTERVIEW  # noqa: E402
 
 ARMED_SCHEMA_VERSION = 1
 PREDECESSOR_KINDS = ("resource", "registered")
@@ -534,6 +537,13 @@ def cmd_gate(args):
                 raise SupervisorError(f"workflow is {state}, not blocked on a human gate")
             actor_kind = release_actor_kind()
             released_by = resolved_released_by(actor_kind, args.by)
+            if WS.human_gate_resolution(ledger.journal(), args.gate)["interview"]:
+                # The legacy surface has no --answers, and an interview gate
+                # released without them is the guess the interview replaces
+                # (review round 1, M3).
+                raise SupervisorError(
+                    "interview-answers-required: this gate carries an interview; release it "
+                    "with `release --decision proceed --answers <file>` (or revise/stop)")
             ledger.set_workflow_state("RUNNING", evidence={"released_gate": args.gate,
                                                            "released_by": released_by,
                                                            "actor_kind": actor_kind},
@@ -542,7 +552,7 @@ def cmd_gate(args):
                                 released_by=released_by, actor_kind=actor_kind)
             retired = retire_gate_delivery(route, args.gate, args.jobs)
             payload.update({"released_by": released_by, "actor_kind": actor_kind,
-                            "delivery_retired": retired})
+                            "delivery_retired": retired, "route_id": route["route_id"]})
             action = "released"
         else:
             # SD-123 (8)(a): the record and the transition are one transaction.
@@ -564,9 +574,15 @@ def cmd_gate(args):
                 # record. Releasing then acked only the newest, leaving the older
                 # one pending forever — the sweep would announce a closed gate on
                 # every prompt, the exact symptom the release-time retirement
-                # exists to remove. Converge on the raise already made.
+                # exists to remove. Converge on the raise already made, and hand
+                # back the same payload a first raise gets (review round 1, minor 7).
+                current = WS.human_gate_resolution(ledger.journal(), args.gate)
                 payload.update(existing_gate_delivery(route, args.gate, args.jobs))
                 payload.update({"action": "blocked",
+                                "interview": current["interview"],
+                                "questions": current["questions"],
+                                "artifact": current["artifact"],
+                                "await_command": await_release_command(args.route, args.gate),
                                 "workflow_state": ledger.state()["workflow_state"]})
                 print(json.dumps(payload, sort_keys=True))
                 return 0
@@ -579,21 +595,53 @@ def cmd_gate(args):
                     "person reviews at this gate"
                 )
             jobs_path = Path(args.jobs) if args.jobs else default_jobs_path()
+            epoch = gate_raise_epoch(ledger, args.gate)
+            # The raise happens in the owner's cwd and the release in the
+            # depth-0 session's; a relative artifact path would name two files
+            # (review round 1, B2). Seal the absolute path in the record and
+            # the journal.
+            args.artifact = str(Path(str(args.artifact)).expanduser().resolve(strict=False))
+            interview = load_interview_artifact(args.artifact)
+            if interview is not None:
+                # SD-129: an interview is refused BEFORE it reaches a person when
+                # a tired reader could not answer it -- the validator is the
+                # acceptance bar, not a style hint.
+                errors = INTERVIEW.validate(
+                    interview, intensity=str(route.get("effective_intensity") or "standard"))
+                if errors:
+                    raise SupervisorError("interview-invalid: " + "; ".join(errors[:8]))
+                if interview.get("round", 1) != epoch + 1:
+                    raise SupervisorError(
+                        f"interview-round-mismatch: interview round {interview.get('round', 1)} "
+                        f"but this is raise {epoch + 1} of {args.gate!r}")
+                if interview.get("route_id") != route["route_id"]:
+                    raise SupervisorError(
+                        f"interview-route-mismatch: {interview.get('route_id')!r} is not this route")
             record_path, created = create_gate_delivery(
-                route, args.gate, args.artifact, jobs_path,
-                gate_raise_epoch(ledger, args.gate),
+                route, args.gate, args.artifact, jobs_path, epoch,
             )
             try:
+                # `artifact` rides in the journal so every later reader -- the
+                # owner's await-release, the launch fence, a release that
+                # validates interview answers -- finds the reviewable path
+                # from the ledger alone, without reopening the delivery record.
                 ledger.set_workflow_state("BLOCKED_HUMAN_GATE",
                                           evidence={"gate": args.gate,
                                                     "binding": gates[args.gate],
-                                                    "delivery": str(record_path)},
+                                                    "delivery": str(record_path),
+                                                    "artifact": str(args.artifact),
+                                                    "interview": interview is not None,
+                                                    "questions": len(interview.get("questions") or [])
+                                                    if interview is not None else 0},
                                           actor="gate")
             except BaseException:
                 if created:
                     _rollback_gate_delivery(record_path)
                 raise
-            payload.update({"delivery": str(record_path), "delivery_created": created})
+            payload.update({"delivery": str(record_path), "delivery_created": created,
+                            "interview": interview is not None,
+                            "questions": len(interview.get("questions") or []) if interview is not None else 0,
+                            "await_command": await_release_command(args.route, args.gate)})
             action = "blocked"
     payload.update({"action": action, "workflow_state": ledger.state()["workflow_state"]})
     print(json.dumps(payload, sort_keys=True))
@@ -935,8 +983,17 @@ def retire_gate_delivery(route, gate, jobs):
             record = PENDING.read(root, recipient_key, delivery_id)
             if record is None or record.get("state") in {"acked", "expired"}:
                 continue
+            if (record.get("attempts") or 0) >= PENDING.RECLAIM_LIMIT:
+                # `claim` refuses a record whose reclaim budget is spent, so
+                # ack can never reach it; the release still supersedes it
+                # (review round 2, N3) -- expire it under the declared actor
+                # rather than leave it `pending` forever.
+                PENDING.expire_if_due(root, recipient_key, delivery_id,
+                                      actor=PENDING.EXPIRY_ACTOR,
+                                      reason="receipt-row-superseded")
+                return "expired"
             if record.get("state") in {"claimed", "sent-ambiguous"}:
-                PENDING.reclaim(root, recipient_key, delivery_id, now_ns=time.time_ns())
+                PENDING.reclaim(root, recipient_key, delivery_id, now_ns=time.monotonic_ns())
             PENDING.claim(root, recipient_key, delivery_id,
                           claim_owner=f"gate-release:{os.getpid()}",
                           lease_seconds=60.0, require_generation_proof=False)
@@ -991,7 +1048,8 @@ def gate_release_sidecar_path(route_path):
     return path.with_name(path.stem + ".gate-release.json")
 
 
-def record_gate_release(route, route_path, *, gate, decision, released_by, actor_kind):
+def record_gate_release(route, route_path, *, gate, decision, released_by, actor_kind,
+                        answers=None):
     """Append one gate release to the route's sidecar; `close_route` folds it into
     the outcome. Fail-soft: a release must never be lost because a sidecar could
     not be written, and the ledger already holds the authoritative transition.
@@ -1007,6 +1065,8 @@ def record_gate_release(route, route_path, *, gate, decision, released_by, actor
         "actor_kind": actor_kind, "route_hash": route.get("route_hash", ""),
         "at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
+    if answers is not None:
+        row["answers"] = answers
     try:
         existing = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
         rows = existing.get("gate_releases") if isinstance(existing, dict) else None
@@ -1064,10 +1124,13 @@ def cmd_release(args):
         state = ledger.state()["workflow_state"]
         if state != "BLOCKED_HUMAN_GATE":
             raise SupervisorError(f"workflow is {state}, not blocked on a human gate")
+        answers = release_answers(ledger, args.gate, args.decision, getattr(args, "answers", None))
         if args.decision == "proceed":
             ledger.set_workflow_state(
                 "RUNNING",
-                evidence={"released_gate": args.gate, "released_by": actor, "decision": "proceed"},
+                evidence={"released_gate": args.gate, "released_by": actor,
+                          "actor_kind": actor_kind, "decision": "proceed",
+                          "answers": answers},
                 actor="release",
             )
             successors = WS.route_successors(route, node_id)
@@ -1096,7 +1159,9 @@ def cmd_release(args):
             # them in the same lock rather than widening the vocabulary.
             ledger.set_workflow_state(
                 "RUNNING",
-                evidence={"released_gate": args.gate, "released_by": actor, "decision": "revise"},
+                evidence={"released_gate": args.gate, "released_by": actor,
+                          "actor_kind": actor_kind, "decision": "revise",
+                          "answers": answers},
                 actor="release",
             )
             ledger.set_workflow_state(
@@ -1111,7 +1176,8 @@ def cmd_release(args):
         elif args.decision == "stop":
             ledger.set_workflow_state(
                 "CANCELLED",
-                evidence={"gate": args.gate, "released_by": actor,
+                evidence={"gate": args.gate, "released_gate": args.gate,
+                          "released_by": actor, "actor_kind": actor_kind,
                           "abandon_reason": "operator-decision"},
                 actor="release",
             )
@@ -1121,11 +1187,156 @@ def cmd_release(args):
             raise SupervisorError(f"unknown --decision: {args.decision!r}")
         payload["released_by"] = actor
         payload["actor_kind"] = actor_kind
+        payload["answers_recorded"] = len((answers or {}).get("answers") or {}) if answers else 0
+        # `route_id` lets the depth-0 carrier (`hooks/dispatch-owner-rewake.py`)
+        # re-arm its wait on this route's owner from the release output alone,
+        # even when the command spelled the route through a shell variable.
+        payload["route_id"] = route["route_id"]
         record_gate_release(route, args.route, gate=args.gate, decision=args.decision,
-                            released_by=actor, actor_kind=actor_kind)
+                            released_by=actor, actor_kind=actor_kind, answers=answers)
         retire_gate_delivery(route, args.gate, args.jobs)
     print(json.dumps(payload, sort_keys=True))
     return 0
+
+
+def load_interview_artifact(artifact):
+    """The interview at `artifact`, or None when the artifact is something else
+    (a legacy frame summary, a directory, a non-JSON file). Unreadable JSON that
+    claims to be an interview is an error, not None."""
+    if not artifact or artifact == "-":
+        return None
+    path = Path(str(artifact))
+    if not path.is_file() or path.suffix.lower() != ".json":
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise SupervisorError(f"interview-unreadable: {path}: {exc}") from exc
+    if not INTERVIEW.is_interview(value):
+        return None
+    value.setdefault("self_path", str(path))
+    return value
+
+
+def release_answers(ledger, gate, decision, answers_path):
+    """The validated answers this release records, or None.
+
+    Whether answers are owed is decided by what the RAISE recorded in the
+    journal (`interview`, `questions`), never by re-reading the artifact at
+    release time (review round 1, B2: a relative path, a moved file or a
+    rewritten round-2 interview each let `proceed` through without answers).
+    An interview gate released `proceed` without answers is refused: the
+    questions were the point, and a plan written without the answers is the
+    guess the interview exists to replace. `revise`/`stop` may carry answers or
+    not. Answers offered for a gate whose raise was not an interview are
+    refused rather than dropped silently. Validating the answers still needs
+    the interview text; when it cannot be read the release is refused, not
+    waved through."""
+    resolution = WS.human_gate_resolution(ledger.journal(), gate)
+    is_interview = bool(resolution.get("interview"))
+    if answers_path is None:
+        if is_interview and decision == "proceed":
+            raise SupervisorError(
+                "interview-answers-required: this gate carries "
+                f"{resolution.get('questions') or 0} question(s); record the user's "
+                "answers with --answers <file> (template: frame_interview.py answers-template)")
+        return None
+    if not is_interview:
+        raise SupervisorError("interview-absent: --answers given but this gate was not raised with an interview")
+    interview = load_interview_artifact(resolution.get("artifact"))
+    if interview is None:
+        raise SupervisorError(
+            f"interview-artifact-unreadable: the raise named {resolution.get('artifact')!r} as its "
+            "interview and it is no longer a readable interview file; restore it or release with "
+            "revise/stop")
+    try:
+        answers = json.loads(Path(answers_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise SupervisorError(f"interview-answers-unreadable: {answers_path}: {exc}") from exc
+    errors = INTERVIEW.validate_answers(interview, answers)
+    if errors:
+        raise SupervisorError("interview-answers-invalid: " + "; ".join(errors[:8]))
+    return answers
+
+
+# --- SD-129: the owner waits for the release on a checked, bounded surface ------
+#
+# SD-123 (8) gave the gate a way to reach a person. It gave the owner nothing to
+# wait on: "wait for the release rather than polling or sleeping" was prose, and
+# a headless owner has exactly two ways to wait -- poll or exit. Measured on the
+# eight real `frame-review` raises before this cycle: three owners released
+# their own gate, one wrote an ad-hoc polling script and sat 53 minutes, one
+# did not wait at all and spawned `plan` before the release (defect M). This is
+# the one checked wait: bounded, read-only, and answered from the same journal
+# rule the launch fence uses, so the owner and the fence can never disagree.
+
+AWAIT_RELEASE_EXIT = {"proceed": 0, "blocked": 2, "revise": 3, "stop": 4}
+DEFAULT_AWAIT_MAX_SECONDS = 110.0   # one foreground Bash call in an owner turn
+MAX_AWAIT_SECONDS = 600.0
+
+
+def await_release_command(route_path, gate):
+    return (f"python3 <agent-home>/utilities/workflow-supervisor.py await-release "
+            f"--route {route_path} --gate {gate} --max {int(DEFAULT_AWAIT_MAX_SECONDS)}")
+
+
+def cmd_await_release(args):
+    try:
+        route = load_route(args.route)
+    except SupervisorError:
+        print(json.dumps({"route": str(args.route), "gate": args.gate,
+                          "status": "error", "reason": "route-unreadable"}, sort_keys=True))
+        raise
+    ledger = ledger_for(route)
+    gates = {row["gate"]: row for row in (route.get("human_gate_bindings") or [])}
+    if args.gate not in gates:
+        # Every refusal of this surface prints one typed JSON line on stdout
+        # before the exit-64 prose (review round 1, minor 6): an owner script
+        # branches on `reason`, not on the message.
+        print(json.dumps({"route_id": route["route_id"], "gate": args.gate,
+                          "status": "error", "reason": "gate-undeclared"}, sort_keys=True))
+        raise SupervisorError(f"route declares no human gate {args.gate!r}")
+    interval = max(1.0, float(args.interval))
+    maximum = min(max(0.0, float(args.max)), MAX_AWAIT_SECONDS)
+    started = time.monotonic()
+    deadline = started + maximum
+    while True:
+        # Read-only on purpose: `read_only_state()` never repairs the cache or
+        # creates the ledger directory, so a waiting owner mutates nothing.
+        resolution = WS.human_gate_resolution(ledger.journal(), args.gate)
+        status = resolution["status"]
+        if status == "not-raised":
+            print(json.dumps({"route_id": route["route_id"], "gate": args.gate,
+                              "status": "not-raised", "reason": "gate-never-raised"},
+                             sort_keys=True))
+            raise SupervisorError(
+                f"gate-never-raised: {args.gate!r} has no BLOCKED_HUMAN_GATE entry; "
+                "raise it with `gate --block --artifact <path>` first"
+            )
+        if status != "blocked" or time.monotonic() >= deadline:
+            break
+        time.sleep(min(interval, max(0.0, deadline - time.monotonic())))
+    payload = {
+        "route_id": route["route_id"], "gate": args.gate, "status": status,
+        "epoch": resolution["epoch"], "waited_seconds": round(time.monotonic() - started, 1),
+        "released_by": resolution["released_by"], "actor_kind": resolution["actor_kind"],
+        "artifact": resolution["artifact"], "answers": resolution["answers"],
+        "workflow_state": ledger.read_only_state()["workflow_state"],
+    }
+    if status == "proceed":
+        payload["successor"] = [str(b.get("node")) for b in route.get("human_gate_bindings") or []
+                                if b.get("gate") == args.gate]
+    answers_out = getattr(args, "answers_out", None)
+    if answers_out and resolution["answers"] is not None and status in ("proceed", "revise"):
+        out = Path(answers_out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        tmp = out.with_name(out.name + ".tmp")
+        tmp.write_text(json.dumps(resolution["answers"], ensure_ascii=False, indent=2) + "\n",
+                       encoding="utf-8")
+        os.replace(str(tmp), str(out))
+        payload["answers_file"] = str(out)
+    print(json.dumps(payload, sort_keys=True, ensure_ascii=False))
+    return AWAIT_RELEASE_EXIT[status]
 
 
 def resource_children(route, ledger):
@@ -1621,10 +1832,26 @@ def build_parser():
     release.add_argument("--gate", required=True)
     release.add_argument("--decision", required=True, choices=("proceed", "revise", "stop"))
     release.add_argument("--actor")
+    release.add_argument("--answers",
+                         help="frame interview answers file (frame_interview.py answers-template); "
+                              "required for --decision proceed when the gate artifact is an interview")
     release.add_argument("--jobs",
                          help="canonical registry, used to retire the gate's pending "
                               "delivery record; without it retirement is skipped and a "
                               "released gate keeps being announced by the sweep")
+
+    await_release = sub.add_parser(
+        "await-release",
+        help="bounded, read-only wait for a raised human gate to be released "
+             "(exit 0 proceed, 2 still blocked, 3 revise, 4 stop)")
+    await_release.add_argument("--route", required=True)
+    await_release.add_argument("--gate", required=True)
+    await_release.add_argument("--max", type=float, default=DEFAULT_AWAIT_MAX_SECONDS,
+                               help=f"seconds to wait before exit 2 (clamped to {int(MAX_AWAIT_SECONDS)})")
+    await_release.add_argument("--interval", type=float, default=DEFAULT_POLL_INTERVAL)
+    await_release.add_argument("--answers-out",
+                               help="write the recorded interview answers here (owner-owned path) "
+                                    "so `frame_interview.py render-intent` can consume them")
 
     status = sub.add_parser("status", help="portable workflow/stage/resource projection")
     status.add_argument("--route", required=True)
@@ -1644,7 +1871,7 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     handler = {
         "arm": cmd_arm, "poll": cmd_poll, "watch": cmd_watch, "gate": cmd_gate,
-        "release": cmd_release,
+        "release": cmd_release, "await-release": cmd_await_release,
         "status": cmd_status, "complete": cmd_complete, "survey": cmd_survey,
     }[args.command]
     return handler(args)

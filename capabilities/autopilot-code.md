@@ -116,13 +116,32 @@ cycle seals `human_gates: ["frame-review"]` and the `frame` node's continuation
 as a human gate; a route sealed before this cycle keeps `inline-next` and is
 never retro-fitted. After `frame` completes and before `plan` starts, the owner
 builds `shards/frame/frame-summary.json` (five fields — 방향/대안/위험/범위
-변경/비용, ≤1KB) from `shards/frame/direction-brief.md`, raises the existing
+변경/비용, ≤1KB) from `shards/frame/direction-brief.md` and the **frame
+interview** `shards/frame/interview.json` (SD-129: a one-sentence restatement
+the user confirms, a plain-language brief, and at most 7 short questions —
+one topic each, 2–4 options, one recommended, no harness vocabulary, only
+decisions the user alone can make; `utilities/frame_interview.py validate`
+is the bar and `gate --block` refuses what fails it), raises the existing
 typed attention path with `required_action=human-gate:frame-review` referencing
-that file **by path** (never embedded in a stage-advance receipt body), and
-waits for `workflow-supervisor.py release --gate frame-review --decision
-proceed|revise|stop`. `proceed` claims and starts `plan` exactly once; `revise`
-returns to `frame` under the `code-refine` retry boundary; `stop` cancels the
-route. The declared `confirmation.mode` (default `hybrid`) governs whether this
+the interview **by path** (never embedded in a stage-advance receipt body), and
+waits on the bounded checked surface `workflow-supervisor.py await-release
+--gate frame-review` (SD-129) until a person records `workflow-supervisor.py
+release --gate frame-review --decision proceed|revise|stop` from the depth-0
+session. `proceed` carries the user's answers (`--answers`, required when the
+artifact is an interview), which the owner renders into `shards/frame/intent.md`
+(`frame_interview.py render-intent`) — the agreed intent `plan` reads first
+(Problem / Proposed Outcome / Affected / Constraints / Decisions / Open
+Questions), so a plan that contradicts a recorded decision is a plan-check
+blocker. `proceed` claims and starts `plan` exactly once; `revise` returns to
+`frame` under the `code-refine` retry boundary; `stop` cancels the route. A
+`plan` start whose entry gate is not released is refused by every launch
+surface (`human-gate-unreleased`), and an owner never releases its own gate to
+move on. `direct`/`quick` have no gate: the depth-0 session asks the same kind
+of question inline inside the §0.4 card step (at most 1 / 3 — a documented
+obligation on the acting session, not a machine-checked cap, since those
+routes carry no gate binding).
+
+The declared `confirmation.mode` (default `hybrid`) governs whether this
 is the sole confirmation point, layers onto the pre-plan notify, or both apply;
 `core/WORKFLOW.md` §0.4 owns the user-facing card.
 

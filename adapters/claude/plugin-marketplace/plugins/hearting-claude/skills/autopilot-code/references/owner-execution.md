@@ -76,16 +76,65 @@ never retro-fitted; do not attempt to apply this gate to an already-open route.
    summary, a `required_action`, or a gate field inside a stage-advance receipt
    body (seam 3 — `utilities/dispatch_completion_join.py`'s v2/v3 receipt
    negotiation returns its body by identity when no advanced record exists).
+   Then build the **interview** `shards/frame/interview.json` (schema
+   `frame_interview_v1`, SD-129) from the briefs: `understanding` (one plain
+   sentence restating what the user wants, which the user confirms or
+   corrects), `brief` (problem / outcome / affected / constraints / open, each a
+   few plain lines), and `questions` — only the decisions the briefs leave to
+   the user. Rules, all checked by `utilities/frame_interview.py validate
+   --intensity <intensity>` and refused by `gate --block` when broken: no
+   harness words (route, owner, gate, node, shard, worker, …); one topic per
+   question; at most two short sentences (≤160 chars); 2–4 options, each with
+   a one-line "what choosing it means"; exactly one `recommended` option so the
+   user can answer "yes" and move on; a `why` naming why only the user can
+   decide it — a fact you can establish by reading code or running a tool is
+   never a question, investigate it instead; at most 7 questions at
+   `standard+` (3 at `quick`, 1 at `direct`), and nothing whose answer is
+   already obvious. A tired reader must be able to answer every question
+   without opening the plan. Questions the frame legs listed under "Questions
+   only the user can answer" are the first candidates.
 2. Raise the existing typed attention path (SD-78/108) with
-   `required_action=human-gate:frame-review`, naming `shards/frame/frame-summary.json`
-   as the reviewable artifact.
-3. Wait for the release rather than polling or sleeping:
+   `required_action=human-gate:frame-review`, naming
+   `shards/frame/interview.json` as the reviewable artifact
+   (`workflow-supervisor.py gate --route <route file> --gate frame-review
+   --block --artifact <absolute interview path>`); the interview references
+   `frame-summary.json` by path. The depth-0 session puts the summary card and
+   the questions to the user and records the answers on the release.
+3. Wait for the release on the one checked surface (SD-129), in bounded
+   foreground calls, doing nothing else in between:
+   `python3 <agent-home>/utilities/workflow-supervisor.py await-release --route
+   <route file> --gate frame-review --max 110` — exit 2 means still blocked:
+   call it again; exit 0 (`status=proceed`) means a person released the gate,
+   and the payload carries `released_by`, `artifact`, and any interview
+   `answers`; exit 3 (`revise`) returns to `frame` under the `code-refine`
+   retry boundary and the gate is raised again afterwards; exit 4 (`stop`)
+   cancels the route with `abandon_reason=operator-decision`. Never release
+   your own gate (`release`/`gate --release`) to move on: a registered owner's
+   release is recorded `released_by=headless-owner` and the plan it unblocks
+   was never confirmed by anyone. Never sleep, never write an ad-hoc polling
+   loop, and never spawn `plan` while `await-release` has not returned 0 —
+   every launch surface refuses a `plan` start whose entry gate is not
+   released (`human-gate-unreleased` / `human-gate-not-raised`, defect M).
+   The person records the answer from the depth-0 session with
    `workflow-supervisor.py release --route <route file> --gate frame-review
-   --decision proceed|revise|stop --actor <actor>`. `proceed` claims and reports
-   the `plan` successor atomically (never spawn `plan` a second time on retry);
-   `revise` returns to `frame` under the `code-refine` retry boundary; `stop`
-   cancels the route with `abandon_reason=operator-decision`.
-4. `confirmation.mode` (`profiles/dispatch-defaults.yaml` /
+   --decision proceed|revise|stop --answers <answers file>`; `proceed` claims
+   the `plan` successor atomically (never spawn `plan` a second time on retry).
+   Pass `--answers-out shards/frame/interview-answers.json` to `await-release`
+   so the recorded answers land in your cycle directory.
+4. On `proceed`, render the agreed intent before anything else:
+   `python3 <agent-home>/utilities/frame_interview.py render-intent --interview
+   shards/frame/interview.json --answers shards/frame/interview-answers.json
+   --out shards/frame/intent.md`. `intent.md` is the brief `plan` reads first
+   (pass its absolute path in the plan prompt as `Intent:`); a plan that
+   contradicts a recorded decision is a plan-check blocker. When the user
+   corrected your understanding (`status: agreed-with-correction`), fold the
+   correction into the plan prompt verbatim. If the answers open a genuinely
+   new decision, you may raise the gate once more with a round-2 interview
+   (`round: 2`, same caps). A third interview raise is refused by the
+   validator (`round` ≤ 2); remaining doubts go to the plan's risk section,
+   and a third raise, if a route ever needs one, carries the frame summary
+   alone.
+5. `confirmation.mode` (`profiles/dispatch-defaults.yaml` /
    `utilities/dispatch-defaults.py`, default `hybrid`) governs whether this
    post-frame gate is the sole confirmation point (`post-frame-only`), layers
    onto the existing pre-plan notify (`hybrid`), or both are always explicit

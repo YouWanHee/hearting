@@ -65,6 +65,16 @@ user-invoked directly.
   explicit caller target or to keep an existing companion synchronized; `_ko.md`
   is only the compatibility suffix, not a Korean default.
 
+## Intent First (SD-129)
+
+- When the prompt names an `Intent:` file (`shards/frame/intent.md`), read it
+  before any source: its Confirmed understanding, Problem, Proposed Outcome,
+  Constraints, and **Decisions** were agreed with the user at the frame gate.
+  The plan's direction section cites each decision by its question id and
+  never contradicts one; a decision the plan cannot honor is reported as a
+  blocker in the plan's risk section, not silently re-decided. A user
+  correction (`status: agreed-with-correction`) overrides every brief.
+
 ## Branch Selection
 
 - **plan**: prompt contains "plan mode" — create a new plan.
