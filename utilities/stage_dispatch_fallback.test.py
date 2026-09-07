@@ -59,13 +59,49 @@ class FallbackTest(unittest.TestCase):
     f"attempt_id=att-fallback-parent,pid={self.owner.pid},pid_start={start}\n")
  def tuple(self,child,status):
   return {"parent_harness":"codex","parent_transport":"headless","parent_sandbox":"workspace-write","child_harness":child,"launch_authority":"conductor","status":status,"probe_source":"fixture","probe_time":"2026-07-16T00:00:00Z","failure_class":"nested-network-unconfirmed" if status!="supported" else "","checked_worktree":str(self.repo.resolve()),"failure_scope":"runtime-global" if status!="supported" else "none","codex_command":"ok" if child=="codex" else "not-applicable","retry_on_isolated_worktree":0}
+ def cli_verdict(self,stdout):
+  """This wrapper's OWN verdict block, parsed as key=value.
+
+  A successful chain prints two blocks: this wrapper's verdict, then the child
+  wrapper's relayed output, which repeats several keys with the child's values
+  (`attempt_id=-` under `preview=1`, its own `job_registry`, ...). Folding the
+  whole stream into one dict makes the last producer win and silently answers a
+  question about this wrapper with the child's value. The second `check=` line
+  is the block boundary; before it is this wrapper's own verdict.
+  """
+  lines=stdout.splitlines()
+  starts=[i for i,line in enumerate(lines) if line.startswith("check=")]
+  own=lines[:starts[1]] if len(starts)>1 else lines
+  return dict(line.split("=",1) for line in own if "=" in line)
+ def launch_roots_env(self):
+  """The env keys `launch_compatibility_tuple` reads. Seal and launch share it."""
+  return {"AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(self.art),
+          "AGENT_MODEL_GOVERNOR_ROOT":str(self.art/".runtime/model-worker-governor"),
+          "AGENT_DISPATCH_JOBS":str(self.jobs)}
  def route(self,native="unsupported",same_status="unsupported"):
+  """Compile the fixture route under the SAME runtime root the launch uses.
+
+  `launch_compatibility_tuple` seals the runtime root, the artifact root and
+  the registry path that `resolve_agent_home()`/`resolve_global_registry()`
+  answer at compile time. Sealing them from whatever this test process
+  inherited (a developer's installed release and their live
+  `~/.codex/.harness/dispatch/jobs.log`, or -- with nothing installed, as under
+  the isolated suite profile and CI -- the nonexistent
+  `$XDG_DATA_HOME/hearting/current`) and then launching through `run_chain`,
+  which names this checkout and the fixture registry, is exactly the
+  two-sources-one-value shape the dry run's `launch-runtime-root-mismatch`
+  check exists to refuse. It was refusing correctly; the fixture was sealing
+  and launching against different roots. Pinning the compile to `run_chain`'s
+  own env also stops the fixture from reading the installed release and the
+  live registry -- runtime-owned state -- at all.
+  """
   gate={"spec_read":{"satisfied":True,"source":"fixture"},"drift_verdict":"within-spec","workflow_mode":"tracked","artifact_guard":{"satisfied":True,"source":"fixture"}}
   evidence={"tuples":[self.tuple("codex",same_status),self.tuple("claude","supported")],"native_subagent":[{
    "harness":"codex","transport":"headless",
    "execution_surface":"codex-native-subagent","registered_worker":False,
    "status":native,"check_source":"fixture"}]}
-  route=R.compile_route("autopilot-code","dev","strong",self.repo,self.art,signals=["shared-contract"],transport="headless",tracking="tracked",tracked_gate_evidence=gate,dispatch_evidence=evidence)
+  with mock.patch.dict(os.environ,self.launch_roots_env()):
+   route=R.compile_route("autopilot-code","dev","strong",self.repo,self.art,signals=["shared-contract"],transport="headless",tracking="tracked",tracked_gate_evidence=gate,dispatch_evidence=evidence)
   path=Path(self.tmp.name)/"route.json"; path.write_text(json.dumps(route),encoding="utf-8"); return path
  def run_chain(self,path,*extra,seed=True,**envkw):
   if seed:self.seed_parent()
@@ -78,16 +114,14 @@ class FallbackTest(unittest.TestCase):
   """The same env `run_chain` injects into its subprocess, applied to THIS
   process instead (B47-1/2/5/6/7/10 fixtures). Must wrap both the route
   compile (`self.route()`) and `run_inline()` -- the grounding tuple baked
-  into route.json at compile time must see the same `AGENT_DISPATCH_JOBS`/
-  `AGENT_ARTIFACT_ROOT` that `_dispatch()` resolves against later, or the
-  dry-run's own root-mismatch check (correctly) refuses. Also strips any
-  ambient `AGENT_DISPATCH_CURRENT_*` this test process happens to carry,
-  matching `run_chain`'s `clean` filter.
+  into route.json at compile time must see the same `AGENT_HOME`/
+  `AGENT_DISPATCH_JOBS`/`AGENT_ARTIFACT_ROOT` that `_dispatch()` resolves
+  against later, or the dry-run's own root-mismatch check (correctly) refuses.
+  Also strips any ambient `AGENT_DISPATCH_CURRENT_*` this test process happens
+  to carry, matching `run_chain`'s `clean` filter.
   """
   removed={k:os.environ.pop(k) for k in list(os.environ) if k.startswith("AGENT_DISPATCH_CURRENT_")}
-  env={"AGENT_ARTIFACT_ROOT":str(self.art),
-       "AGENT_MODEL_GOVERNOR_ROOT":str(self.art/".runtime/model-worker-governor"),
-       "AGENT_DISPATCH_JOBS":str(self.jobs),
+  env={**self.launch_roots_env(),
        "AGENT_DISPATCH_SELF_SLUG":"owner","AGENT_DISPATCH_ATTEMPT_ID":"att-fallback-parent",**envkw}
   try:
    with mock.patch.dict(os.environ,env):
@@ -133,7 +167,7 @@ class FallbackTest(unittest.TestCase):
  def run_review_inline(self,path,node_id="plan-check",worker_mode="qa/plan-review",model_role="fast reviewer",seed=True):
   """`run_inline` for a capped review node (C-14). In-process like run_inline:
   the subprocess `run_chain` path additionally binds a launch runtime root,
-  which is a separate axis and is independently unavailable here."""
+  which is a separate axis this fixture does not need to exercise."""
   if seed:self.seed_parent()
   argv=["stage-dispatch-fallback.py","--route",str(path),"--node",node_id,"--slug",f"fallback-{node_id}",
         "--parent","owner","--capability-mode","dev","--worker-mode",worker_mode,
@@ -237,14 +271,11 @@ class FallbackTest(unittest.TestCase):
  def test_allocation_receipt_row_pairs_with_the_cli_verdict(self):
   path=self.route(same_status="supported"); route=json.loads(path.read_text())
   result=self.run_chain(path)
-  if "reason=launch-runtime-root-mismatch" in result.stdout:
-   # Pre-existing whole-suite condition (baseline MA-W1-147): the in-process
-   # compile and the CLI subprocess disagree on the grounding release id in
-   # this environment, before any allocation code runs. Skip loudly rather
-   # than pretend the CLI pairing was observed.
-   self.skipTest("MA-W1-147 launch-runtime-root-mismatch precedes allocation in this environment")
+  # The MA-W1-147 skip guard is gone: `route()` now seals the same runtime,
+  # artifact and registry roots `run_chain` launches with, so the CLI pairing
+  # is actually observed instead of skipped.
   self.assertEqual(result.returncode,0,result.stdout+result.stderr)
-  receipt=dict(line.split("=",1) for line in result.stdout.splitlines() if "=" in line)
+  receipt=self.cli_verdict(result.stdout)
   self.assertIn("allocation_rank",receipt,result.stdout)
   self.assertEqual(receipt["allocation_preferred"],"codex")
   self.assertEqual(receipt["allocation_inert_keys"],"-")
@@ -450,8 +481,14 @@ class FallbackTest(unittest.TestCase):
   self.assertNotIn("review_verdict",fields)
  def test_attempt_identity_is_stable_across_actions(self):
   path=self.route(); first=self.run_chain(path); second=self.run_chain(path)
-  def attempt(out): return next(line.split("=",1)[1] for line in out.splitlines() if line.startswith("attempt_id="))
-  self.assertEqual(attempt(first.stdout),attempt(second.stdout))
+  def attempt(result):
+   # Report the chain's own refusal instead of a bare StopIteration: when the
+   # dry run fails there is no attempt_id= line, and the reason is the finding.
+   self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+   attempt_id=self.cli_verdict(result.stdout).get("attempt_id","-")
+   self.assertTrue(attempt_id.startswith("att-"),result.stdout)
+   return attempt_id
+  self.assertEqual(attempt(first),attempt(second))
  def test_attempt_identity_includes_exact_parent_generation(self):
   route={"route_id":"rt-parent-generation"};node={"id":"plan"};row={"child_harness":"codex"}
   one=SimpleNamespace(slug="stage",parent="owner",parent_attempt_id="att-parent-one")
@@ -1033,9 +1070,13 @@ class FallbackTest(unittest.TestCase):
                                 "execution_surface":"codex-native-subagent",
                                 "registered_worker":False,"status":"unsupported",
                                 "check_source":"fixture"}]}
-  route=R.compile_route("autopilot-code","dev","strong",self.repo,self.art,
-    signals=["shared-contract"],transport="headless",tracking="tracked",
-    tracked_gate_evidence=gate,dispatch_evidence=evidence)
+  # Same seal-and-launch pairing as `route()`: this fixture compiles here and
+  # launches the CLI below, so both sides must name one runtime/artifact/registry
+  # root or the dry run refuses with launch-runtime-root-mismatch.
+  with mock.patch.dict(os.environ,self.launch_roots_env()):
+   route=R.compile_route("autopilot-code","dev","strong",self.repo,self.art,
+     signals=["shared-contract"],transport="headless",tracking="tracked",
+     tracked_gate_evidence=gate,dispatch_evidence=evidence)
   path=Path(self.tmp.name)/"evidence-pair-route.json"
   path.write_text(json.dumps(route),encoding="utf-8")
   self.seed_parent()
@@ -1052,7 +1093,7 @@ class FallbackTest(unittest.TestCase):
        "AGENT_DISPATCH_CURRENT_SANDBOX":"workspace-write"}
   result=subprocess.run(cmd,text=True,capture_output=True,env=env)
   self.assertEqual(result.returncode,0,result.stdout+result.stderr)
-  receipt=dict(line.split("=",1) for line in result.stdout.splitlines() if "=" in line)
+  receipt=self.cli_verdict(result.stdout)
   # evidence 1: the stdout receipt fields
   self.assertEqual(receipt["child_harness"],"codex")
   self.assertEqual(receipt["parent_cross"],"degraded")
@@ -1092,9 +1133,13 @@ class FallbackTest(unittest.TestCase):
                                 "execution_surface":"codex-native-subagent",
                                 "registered_worker":False,"status":"unsupported",
                                 "check_source":"fixture"}]}
-  route=R.compile_route("autopilot-code","dev","strong",self.repo,self.art,
-    signals=["shared-contract"],transport="headless",tracking="tracked",
-    tracked_gate_evidence=gate,dispatch_evidence=evidence)
+  # Same seal-and-launch pairing as `route()`: this fixture compiles here and
+  # launches the CLI below, so both sides must name one runtime/artifact/registry
+  # root or the dry run refuses with launch-runtime-root-mismatch.
+  with mock.patch.dict(os.environ,self.launch_roots_env()):
+   route=R.compile_route("autopilot-code","dev","strong",self.repo,self.art,
+     signals=["shared-contract"],transport="headless",tracking="tracked",
+     tracked_gate_evidence=gate,dispatch_evidence=evidence)
   path=Path(self.tmp.name)/"sole-gate-route.json"
   path.write_text(json.dumps(route),encoding="utf-8")
   self.seed_parent()
@@ -1111,7 +1156,7 @@ class FallbackTest(unittest.TestCase):
        "AGENT_DISPATCH_CURRENT_SANDBOX":"workspace-write"}
   result=subprocess.run(cmd,text=True,capture_output=True,env=env)
   self.assertEqual(result.returncode,0,result.stdout+result.stderr)
-  receipt=dict(line.split("=",1) for line in result.stdout.splitlines() if "=" in line)
+  receipt=self.cli_verdict(result.stdout)
   # evidence 1: the stdout receipt field
   self.assertEqual(receipt["sole_gate"],"degraded")
   self.assertEqual(receipt["child_harness"],"opencode")
@@ -1353,10 +1398,11 @@ class FallbackTest(unittest.TestCase):
 class LaunchTupleReportOnlyTest(unittest.TestCase):
  """SD-114 (2)-C: P1/P2/P3 producer wiring + report-only stage 1
  byte-identical guarantee. Uses `FallbackTest.run_inline`/`dispatch_env`
- in-process (never a subprocess) so the fixture is immune to this dev
- worktree's known `AGENT_HOME`-vs-installed-release grounding digest
- mismatch that breaks `run_chain`/`run_node`-based tests in this file
- (pre-existing, unrelated to SD-114 -- see round3 dev log)."""
+ in-process (never a subprocess) because these fixtures patch `F` internals,
+ which only reaches an in-process call. (The `AGENT_HOME`-vs-installed-release
+ grounding digest mismatch this class used to route around was a fixture
+ defect, not a runtime one: `route()`/`dispatch_env` now seal and launch
+ against one root, so `run_chain`-based tests hold too.)"""
 
  # A fully-specified but harness-mismatched parent identity forces every
  # candidate down either P2 (codex, unsupported by the default fixture) or
