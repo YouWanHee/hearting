@@ -38,6 +38,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import sys
 import time
 from pathlib import Path
@@ -1522,6 +1523,164 @@ def review_lease_status(root: Path, *, cycle_id: str, attempt_id: Optional[str] 
     return {"cycle_id": cycle_id, "live": live_path is not None}
 
 
+_SEALED_CYCLE_STATES = {"active", "completed", "abandoned"}
+
+
+def _valid_cycle_state(value: Any) -> bool:
+    """`value` is a genuine member of the cycle work-state enum only if it is a
+    *string* member of it.
+
+    The type check has to live inside this predicate: JSON can put a list or
+    dict in this slot, and a bare `value in _SEALED_CYCLE_STATES` raises
+    `TypeError: unhashable type` for either -- an exception that is not a
+    `ProducerError` and so is not caught by `main()`'s `except ProducerError
+    as exc:` arm. Every state comparison, manifest side or record-cache side,
+    goes through this one function; nowhere else tests set membership
+    directly.
+    """
+    return isinstance(value, str) and value in _SEALED_CYCLE_STATES
+
+
+def _record_cycle_manifest_path(root: Path, record: Mapping[str, Any]) -> Path:
+    """Resolve this record's manifest without scanning other cycle bindings."""
+    root = Path(root).resolve()
+    campaign_id = record.get("campaign_id")
+    cycle_id = record.get("cycle_id")
+    if not artifact_identity.is_well_formed(campaign_id, "campaign") or not artifact_identity.is_well_formed(cycle_id, "cycle"):
+        raise ProducerError("sealed-cycle-state-unknown", f"{cycle_id}: record identity invalid")
+    try:
+        campaigns = artifact_locator.safe_child(root, root, "campaigns")
+    except artifact_locator.LocatorError as exc:
+        raise ProducerError("sealed-cycle-state-unknown", exc.detail or exc.code) from exc
+    matches = []
+    if campaigns.is_dir() and not campaigns.is_symlink():
+        for candidate in campaigns.iterdir():
+            if candidate.is_symlink() or not candidate.is_dir():
+                continue
+            campaign = _read_json(candidate / "campaign.json")
+            if campaign is not None and campaign.get("campaign_id") == campaign_id:
+                matches.append(candidate)
+    if len(matches) != 1:
+        raise ProducerError(
+            "sealed-cycle-state-unknown",
+            f"{cycle_id}: campaign-locator={'missing' if not matches else 'ambiguous'}",
+        )
+    parent = matches[0]
+    locator = record.get("locator")
+    try:
+        if locator:
+            cycle_path = artifact_locator.safe_child(root, parent, locator)
+            binding = artifact_locator.read_cycle_binding(cycle_path)
+            if binding is None:
+                raise ProducerError(
+                    "sealed-cycle-state-unknown",
+                    f"{cycle_id}: cycle-binding=missing",
+                )
+        else:
+            cycle_path = artifact_locator.safe_child(
+                root, artifact_locator.safe_child(root, parent, "cycles"), cycle_id
+            )
+            # Legacy ``cycles/<cycle_id>`` directories predate cycle bindings.
+            # If one is present it must still agree with the record; absence is
+            # allowed only because the stable ID is the legacy path component.
+            binding = artifact_locator.read_cycle_binding(cycle_path)
+    except artifact_locator.LocatorError as exc:
+        detail = exc.code if not exc.detail else f"{exc.code}: {exc.detail}"
+        raise ProducerError("sealed-cycle-state-unknown", detail) from exc
+    if binding is not None and (
+        binding.get("campaign_id") != campaign_id
+        or binding.get("cycle_id") != cycle_id
+    ):
+        raise ProducerError(
+            "sealed-cycle-state-unknown",
+            f"{cycle_id}: cycle-binding-identity-mismatch",
+        )
+    return cycle_path / "manifest.json"
+
+
+def _published_cycle_state(root: Path, record: Mapping[str, Any]) -> str:
+    """Return the *work* state of a sealed cycle.
+
+    `record["state"] == "sealed"` is a storage fact -- it means an immutable
+    snapshot exists, not that the work is done (D-10: the four completion
+    results are independent). The work state is the published manifest's
+    `cycle.state` (the D-6 folded state); `record["cycle_state"]` is a cache
+    `_commit_sealed` copied from that same document. The cache is only a
+    fallback when the canonical source is entirely absent. If the canonical
+    source exists but cannot be trusted -- unreadable, wrong shape, naming a
+    different cycle, or holding a value outside the enum -- this raises a
+    typed refusal instead of ever returning a false success. The only
+    exception this function can raise is `ProducerError`.
+    """
+    cycle_id = str(record.get("cycle_id", "?"))
+    cached = record.get("cycle_state")
+    record_state = cached if _valid_cycle_state(cached) else None
+    try:
+        manifest_path = cycle_dir(root, record["campaign_id"], cycle_id, record) / "manifest.json"
+    except artifact_locator.LocatorError:
+        # The global index can fail because of an unrelated binding. Resolve
+        # this record through its own campaign/cycle locator before deciding
+        # that the canonical manifest is absent.
+        manifest_path = _record_cycle_manifest_path(root, record)
+    except (ProducerError, OSError, KeyError, TypeError):
+        manifest_path = _record_cycle_manifest_path(root, record)
+    if manifest_path is None:
+        raise ProducerError("sealed-cycle-state-unreadable", f"{cycle_id}: manifest=path-unresolved")
+    try:
+        manifest_stat = manifest_path.lstat()
+    except FileNotFoundError:
+        # Canonical source absent is the *only* case that falls back to the
+        # cache (compatibility for W7G/W7I/W7H relocation roots carrying
+        # legacy sealed records). A directory, special node, or symlink is
+        # present-but-invalid and must never be mistaken for absence.
+        if record_state is not None:
+            return record_state
+        shown = "missing" if cached is None else repr(cached)
+        raise ProducerError("sealed-cycle-state-unknown", f"{cycle_id}: manifest=absent record={shown}")
+    except OSError as exc:
+        raise ProducerError(
+            "sealed-cycle-state-unreadable", f"{cycle_id}: manifest={manifest_path} lookup-error={exc.__class__.__name__}:{exc}"
+        ) from exc
+    if not stat.S_ISREG(manifest_stat.st_mode):
+        raise ProducerError(
+            "sealed-cycle-state-unreadable", f"{cycle_id}: manifest={manifest_path} entry-kind=non-regular"
+        )
+    document = _read_json(manifest_path)
+    if document is None:  # unparsable JSON, symlink, or encoding error
+        raise ProducerError("sealed-cycle-state-unreadable", f"{cycle_id}: manifest={manifest_path} unparsable")
+    # Structure checks come before any field access. `_read_json:168` already
+    # guarantees a dict, but the invariant is pinned here too so it keeps
+    # holding even if `_read_json` is loosened later.
+    if not isinstance(document, Mapping):
+        raise ProducerError(
+            "sealed-cycle-state-unreadable",
+            f"{cycle_id}: manifest={manifest_path} document-structure type={type(document).__name__}",
+        )
+    cycle = document.get("cycle")
+    if not isinstance(cycle, Mapping):
+        raise ProducerError(
+            "sealed-cycle-state-unreadable",
+            f"{cycle_id}: manifest={manifest_path} cycle-structure type={type(cycle).__name__}",
+        )
+    manifest_cycle_id = cycle.get("cycle_id")  # `!=` is safe against any type
+    if manifest_cycle_id != record.get("cycle_id"):
+        raise ProducerError(
+            "sealed-cycle-state-unreadable",
+            f"{cycle_id}: manifest={manifest_path} manifest_cycle_id={manifest_cycle_id!r} "
+            f"record_cycle_id={record.get('cycle_id')!r}",
+        )
+    manifest_state = cycle.get("state")
+    if not _valid_cycle_state(manifest_state):  # non-string and out-of-enum share one gate
+        raise ProducerError(
+            "sealed-cycle-state-unreadable", f"{cycle_id}: manifest={manifest_path} cycle_state={manifest_state!r}"
+        )
+    if record_state is not None and record_state != manifest_state:
+        raise ProducerError("sealed-cycle-state-ambiguous", f"{cycle_id}: manifest={manifest_state} record={record_state}")
+    # A damaged cache (non-string, out-of-enum, or absent) does not block
+    # success once the canonical source is valid -- the canonical source wins.
+    return manifest_state
+
+
 def finalize(
     root: Path,
     *,
@@ -1550,8 +1709,22 @@ def finalize(
         if record is None:
             raise ProducerError("cycle-unknown", cycle_id)
         if record.get("state") == "sealed":
+            # Storage sealing is not task completion: the manifest commit is an
+            # immutable snapshot, and the *published* cycle state
+            # (`_published_cycle_state`) is the only thing a re-finalize
+            # request can be judged against. Any request whose `state` does
+            # not match that published state is a conflict -- no flag makes
+            # it idempotent, because the storage schema does not persist the
+            # request fingerprint needed to prove "same retry" (D-8).
+            published = _published_cycle_state(root, record)
+            if published != state:
+                raise ProducerError(
+                    "finalize-state-conflict",
+                    f"{cycle_id}: requested={state} published_cycle_state={published} storage_state=sealed",
+                )
             return {"status": "already-sealed", "cycle_id": cycle_id,
-                    "manifest_digest": record.get("manifest_digest")}
+                    "manifest_digest": record.get("manifest_digest"),
+                    "storage_state": "sealed", "cycle_state": published}
         if record.get("state") != "open":
             raise ProducerError("cycle-not-open", record.get("state", "?"))
         if state == "abandoned":
@@ -1658,6 +1831,7 @@ def finalize(
             "status": "sealed", "cycle_id": cycle_id, "campaign_id": record["campaign_id"],
             "manifest_digest": digest, "manifest_path": str(manifest_path),
             "artifact_count": len(rows), "lineage_committed": True, "cycle_state": document["cycle"]["state"],
+            "storage_state": "sealed",
         }
     finally:
         artifact_admission._release_lock(root, lock_fd)
