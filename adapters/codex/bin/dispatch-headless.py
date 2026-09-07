@@ -123,6 +123,13 @@ from codex_managed_dispatch import (  # noqa: E402
     probe_managed_codex_parent,
     registered_parent_delivery,
 )
+from execution_access import (  # noqa: E402
+    AccessContext,
+    ExecutionAccessError,
+    adapter_default_roots,
+    bind_request as bind_execution_access_request,
+    receipt_fragment as execution_access_receipt_fragment,
+)
 QA_LEVELS = {"quick", "light", "standard", "thorough", "adversarial"}
 # Verification rigor is derived from intensity — CONVENTIONS §1.1 mapping table (SoT).
 # `--qa` is no longer a user-facing axis; optional, derived from --intensity when omitted.
@@ -249,6 +256,7 @@ def parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--prompt-file")
     p.add_argument("--prompt-text")
+    p.add_argument("--execution-access-file")
     p.add_argument("--jobs")
     p.add_argument("--attempt-id")
     p.add_argument("--broker-request-id")
@@ -1278,6 +1286,9 @@ def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -
             # SD-69: a commit-expected linked-worktree run gets the exact
             # primary Git metadata dirs; no-commit stages get none of these.
             command += ["--writable-root", str(writable_dir)]
+        if getattr(args, "execution_access_grant", None) is not None:
+            for writable_dir in args.execution_access_grant.additional_writable_roots:
+                command += ["--writable-root", str(writable_dir)]
         if args.nested_headless_network:
             command += ["--network-access"]
         if args.resolved_model_settings["source"] != "inherit":
@@ -1336,6 +1347,9 @@ def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -
         # itself, hooks/, and config stay ungranted, and every other worker
         # type (no-commit mutation stages included) gets none of these.
         cmd += ["--add-dir", str(writable_dir)]
+    if getattr(args, "execution_access_grant", None) is not None:
+        for writable_dir in args.execution_access_grant.additional_writable_roots:
+            cmd += ["--add-dir", str(writable_dir)]
     cmd += ["--sandbox", effective_runtime_sandbox(args)]
     if args.nested_headless_network:
         cmd += ["-c", "sandbox_workspace_write.network_access=true"]
@@ -1569,6 +1583,9 @@ def append_job(jobs: Path, args: argparse.Namespace) -> bool:
             f",eligibility_probe={getattr(args, 'eligibility_probe', None) or '-'}"
         )
     pipe += f",runtime_sandbox={effective_runtime_sandbox(args)}"
+    pipe += execution_access_receipt_fragment(
+        getattr(args, "execution_access_grant", None)
+    )
     for key, value in sorted(args.launch_lifecycle_resolution.metadata().items()):
         pipe += f",{key}={value}"
     for key in ("route_file", "route_id", "route_hash", "route_node", "registry_digest", "write_scope", "completion_gate", "harness_affinity"):
@@ -2447,6 +2464,52 @@ def main(argv: list[str]) -> int:
         except DispatchContractError as exc:
             return fail(exc.reason, 65, detail=exc.detail, child_spawned="0")
     args.nested_headless_network = nested_headless_network_enabled(args)
+    try:
+        default_roots = adapter_default_roots(
+            args,
+            progress_writable_dirs(args),
+            nested_owner_writable_dirs(args),
+            route_bound_worker_writable_dirs(args),
+            linked_worktree_git_writable_dirs(args),
+            (
+                (_spec_grounding_dir(args),)
+                if args.route_id or args.nested_headless_network
+                else ()
+            ),
+            (
+                (dispatch_state_root(args.jobs_path),)
+                if args.nested_headless_network
+                or (
+                    args.dispatch_depth == 2
+                    and args.route_id
+                    and getattr(args, "command_attempt_id", None)
+                )
+                else ()
+            ),
+        )
+        args.execution_access_grant = bind_execution_access_request(
+            args.execution_access_file,
+            environ=os.environ,
+            context=AccessContext.build(
+                worktree=args.worktree,
+                artifact_root=args.artifact_root,
+                dispatch_state_root=dispatch_state_root(args.jobs_path),
+                agent_home=args.agent_home,
+                environ=os.environ,
+            ),
+            is_child=args.dispatch_depth >= 2,
+            parent=None,
+            runtime=(
+                "codex-app-server"
+                if args.resolved_completion_delivery == "app-server-supervised"
+                else "codex-exec"
+            ),
+            default_writable_roots=default_roots,
+            network_available=args.nested_headless_network,
+            effective_sandbox=effective_runtime_sandbox(args),
+        )
+    except ExecutionAccessError as exc:
+        return fail(exc.reason, 64, detail=exc.detail, child_spawned="0")
     try:
         validate_nested_owner_registry_projection(args)
     except DispatchContractError as e:

@@ -580,3 +580,14 @@ it can never receive a `stage_advance` v3 block, and no route compiled for an
 OpenCode-owned node is a runtime-advance source or target. This is a parity
 gap, not a rejected design: the moment OpenCode exposes its own route-owned
 dispatch-depth-2 evidence, this section is the one to revisit.
+
+## Execution access request
+
+`dispatch-headless.py --execution-access-file <execution_access_v1.json>` (or
+`AGENT_DISPATCH_EXECUTION_ACCESS_FILE`) adds validated writable roots to the
+per-launch `permission.external_directory` rules. This is
+`tool-permission`, not an OS filesystem sandbox; network enforcement is
+`none`. Consequently an `any` network request is `granted-unenforced`, while
+`enforcement_required=os-sandbox` is refused before registration/model spawn.
+The adapter never reports `enforced`, edits global configuration, or weakens
+approval defaults. Cross-launch propagation is not implemented by this slice.
