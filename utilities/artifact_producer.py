@@ -1532,8 +1532,8 @@ def _valid_cycle_state(value: Any) -> bool:
     The type check has to live inside this predicate: JSON can put a list or
     dict in this slot, and a bare `value in _SEALED_CYCLE_STATES` raises
     `TypeError: unhashable type` for either -- an exception that is not a
-    `ProducerError` and so is not caught by the CLI's `except ProducerError`
-    (2623-2624). Every state comparison, manifest side or record-cache side,
+    `ProducerError` and so is not caught by `main()`'s `except ProducerError
+    as exc:` arm. Every state comparison, manifest side or record-cache side,
     goes through this one function; nowhere else tests set membership
     directly.
     """
