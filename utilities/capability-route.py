@@ -926,6 +926,11 @@ def build_continuation_route(
         "resume_retry_boundaries","dispatch_evidence","dispatch_contract_version",
         "dispatch_evidence_scope_version","registered_headless_candidates",
         "registered_headless_policy","unit_catalog_digest","validation_basis",
+        # SD-OPEN-46: a composed source's composition fields must ride the
+        # suffix, or the continuation presents itself as a preset route and the
+        # embedded composed_recipe loses its hash seal. (`route_origin`/`shape`
+        # live inside `selection`, inherited above.)
+        "composed","composed_recipe",
     )
     route={key:json.loads(json.dumps(source_route[key]))
            for key in inherited_keys if key in source_route}

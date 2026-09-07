@@ -2105,6 +2105,41 @@ class TestContinuation(unittest.TestCase):
    continuation=self._build(source)
    self.assertEqual(continuation["confirmation_mode"],"hybrid")
 
+ def test_sd_open_46_composed_route_continuation_inherits_composition(self):
+  # SD-OPEN-46: a continuation of a composed (compose-on-demand) route must
+  # carry the source's composition fields. Without `composed`/`composed_recipe`
+  # in inherited_keys the suffix looks like a preset route to every consumer
+  # (`compose_card`, CLI status, guards) and the embedded recipe loses its
+  # tamper seal. `route_origin`/`shape` ride `selection`, which is inherited
+  # wholesale -- asserted here so a future refactor cannot drop them.
+  with tempfile.TemporaryDirectory() as tmp:
+   artifact=Path(tmp)/"artifacts"
+   recipe=json.loads(json.dumps(
+    R.TOPO.resolve_recipe(R.TOPO.load_registry(),"autopilot-code","dev")))
+   recipe["modes"]=["composed-fixture"]
+   gate={
+    "spec_read":{"satisfied":True,"source":"canonical-prd-sha256"},
+    "drift_verdict":"within-spec","workflow_mode":"tracked",
+    "artifact_guard":{"satisfied":True,"source":"conductor-prechecked"},
+   }
+   source=R.compile_composed_route(
+    recipe,"composed-fixture","strong",R.ROOT,artifact,
+    predicates=[],signals=["shared-contract"],transport="headless",
+    tracking="tracked",tracked_gate_evidence=gate,
+    dispatch_evidence=self._dispatch(),
+    route_origin="compose",shape="staged",
+   )
+   self.assertIs(source["composed"],True)
+   self.assertEqual(source["selection"]["route_origin"],"compose")
+   self.assertEqual(source["selection"]["shape"],"staged")
+   self._complete_prefix(source,"test",Path(tmp)/"evidence")
+   continuation=self._build(source)
+   self.assertIs(continuation["composed"],True)
+   self.assertEqual(continuation["composed_recipe"],source["composed_recipe"])
+   self.assertEqual(continuation["selection"]["route_origin"],"compose")
+   self.assertEqual(continuation["selection"]["shape"],"staged")
+   R.verify_route(continuation,R.ROOT)
+
  def test_at2_boundary_and_first_runnable_blockers_are_disjoint(self):
   with tempfile.TemporaryDirectory() as tmp:
    source=self._source(Path(tmp)/"artifacts-request")
