@@ -200,6 +200,26 @@ class FailureKindClassifierTest(unittest.TestCase):
                     self.result(stderr, stdout=stdout)), "error")
 
 
+class MixedReporterFixture(RunTestsFixtureBase):
+    def test_named_rows_keep_their_own_failure_kind(self):
+        write_suite(self.root, "mixed.test.py", """
+            import sys, unittest
+            class C(unittest.TestCase):
+                def test_assertion(self): self.assertEqual(1, 2)
+                def test_error(self): raise RuntimeError('setup broke')
+            unittest.main(testRunner=unittest.TextTestRunner(stream=sys.stdout))
+        """)
+        baseline = [
+            f"mixed.test.py\tC.test_assertion\tassertion\tisolated\treal-bug: fixture\tTEST\t{TOMORROW}",
+            f"mixed.test.py\tC.test_error\terror\tisolated\treal-bug: fixture\tTEST\t{TOMORROW}",
+        ]
+        result, rows = self.run_fixture(baseline)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual({row["test_id"]: row["kind"] for row in rows},
+                         {"C.test_assertion": "assertion", "C.test_error": "error"})
+        self.assertEqual({row["verdict"] for row in rows}, {"KNOWN-FAIL"})
+
+
 class XPassFixture(RunTestsFixtureBase):
     def test_xpass_is_hard_failure_not_silent_shrink(self):
         write_suite(self.root, "now_passes.test.py", "import sys\nsys.exit(0)\n")

@@ -435,22 +435,33 @@ def failure_signature(result: SuiteResult) -> str:
     return f"{classify_kind(result)}:{line}" if line else classify_kind(result)
 
 
-def extract_failing_test_ids(stdout: str, stderr: str) -> list[str]:
-    """Parse unittest-style 'FAIL: test_x (module.Class)' / 'ERROR: ...' lines
-    into `Class.test_method` ids. Falls back to no per-test ids (whole-file
-    granularity) when nothing recognizable is present — that is expected for
-    *.test.sh suites and any suite not using unittest's default reporter.
-    """
-    ids: list[str] = []
+def extract_failing_test_kinds(stdout: str, stderr: str) -> dict[str, str]:
+    """Keep each unittest row's FAIL/ERROR kind, including mixed suites."""
+    kinds: dict[str, str] = {}
     for blob in (stdout, stderr):
-        for m in _UNITTEST_FAIL_RE.finditer(blob or ""):
-            method, qualname = m.group(2), m.group(3)
-            # qualname is "module.Class.method" (or "module.method" for a
-            # bare function test) — the class is the second-to-last segment.
+        for match in _UNITTEST_FAIL_RE.finditer(blob or ""):
+            method, qualname = match.group(2), match.group(3)
             parts = qualname.split(".")
             cls = parts[-2] if len(parts) >= 2 else parts[-1]
-            ids.append(f"{cls}.{method}")
-    return sorted(set(ids))
+            test_id = f"{cls}.{method}"
+            kind = "error" if match.group(1) == "ERROR" else "assertion"
+            if kinds.get(test_id) != "error":
+                kinds[test_id] = kind
+    return kinds
+
+
+def extract_failing_test_ids(stdout: str, stderr: str) -> list[str]:
+    return sorted(extract_failing_test_kinds(stdout, stderr))
+
+
+def test_failure_kind(result: SuiteResult, test_id: str) -> str:
+    # A suite-wide timeout still wins. Whole-file rows retain the aggregate
+    # kind; named rows use their own reporter header, not a peer's exception.
+    if not result.timed_out and test_id != "-":
+        kind = extract_failing_test_kinds(result.stdout, result.stderr).get(test_id)
+        if kind:
+            return kind
+    return classify_kind(result)
 
 
 LIVE_STATE_ROOT = Path(os.path.expanduser("~")) / ".local" / "state" / "hearting"
@@ -940,6 +951,7 @@ def classify_result(
 
     # Per-test failure ids available.
     for test_id in failing_ids:
+        kind = test_failure_kind(result, test_id)
         row = specific_entries.get(test_id) or whole_file_entry
         if row is None:
             was_foreign = test_id in foreign_specific or foreign_whole_file
@@ -1673,7 +1685,7 @@ def main(argv: list[str]) -> int:
             verdicts = classify_result(result, baseline, today, run_fingerprint)
         for v in verdicts:
             verdict_counts[v.verdict] = verdict_counts.get(v.verdict, 0) + 1
-            result_kind = classify_kind(result) if not result.passed else ""
+            result_kind = test_failure_kind(result, v.test_id) if not result.passed else ""
             signature = failure_signature(result) if not result.passed else ""
             report_rows.append(
                 {
