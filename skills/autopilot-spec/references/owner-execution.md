@@ -86,7 +86,11 @@ by the dispatch-depth-1 owner). Full contract: `capabilities/autopilot-spec.md`
 3. Pass the exported `AGENT_ARTIFACT_*` variables to every stage dispatch
    (the adapters forward them); stage workers call `begin --node <id>` and
    join the same cycle.
-4. Close the route, then `artifact_producer.py finalize --artifact-root <root>
+4. Complete the terminal node using the verified cycle-local PRD as evidence,
+   then close the route. The fixed order is **complete → close → finalize →
+   admit-shared**; an admitted revision is not required to complete the node.
+   Run `artifact_producer.py finalize --artifact-root <root>
    --cycle $AGENT_ARTIFACT_CYCLE_ID`; on `recovery-required`, run
-   `artifact_producer.py recover` and retry.
+   `artifact_producer.py recover` and retry. Do not use `--allow-open-route`
+   to work around an unfinished terminal node.
 5. Only then, if this capability owns a shared kind, `admit-shared`.
