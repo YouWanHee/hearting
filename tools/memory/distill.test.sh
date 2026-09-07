@@ -10,6 +10,7 @@ set -u
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 MEM="$ROOT/tools/memory/mem.py"
 [ -f "$MEM" ] || { echo "FAIL: mem.py not found at $MEM"; exit 1; }
+export MEM_PY="$MEM"
 
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  ✅ %s\n' "$1"; }
@@ -94,11 +95,14 @@ echo '{"session_id":"x","cwd":"/tmp"}' \
 rm -rf "$STUBBIN"
 
 echo "== Verification ④ turn-nudge 11종 regression =="
-nudge_out="$(bash "$ROOT/hooks/mem-turn-nudge.test.sh" 2>&1)" || true
+nudge_rc=0
+nudge_out="$(bash "$ROOT/hooks/mem-turn-nudge.test.sh" 2>&1)" || nudge_rc=$?
 echo "$nudge_out" | tail -3
-echo "$nudge_out" | grep -q "RESULT: PASS=21 FAIL=0" \
-  && ok "mem-turn-nudge.test.sh → PASS=21 FAIL=0" \
-  || bad "turn-nudge regression not 21/0: $(echo "$nudge_out" | grep RESULT)"
+if [ "$nudge_rc" = 0 ] && echo "$nudge_out" | grep -Eq '^RESULT: PASS=[1-9][0-9]* FAIL=0$'; then
+  ok "mem-turn-nudge.test.sh passed every current assertion"
+else
+  bad "turn-nudge regression failed (rc=$nudge_rc): $(echo "$nudge_out" | grep RESULT)"
+fi
 
 
 # ============================================================
@@ -108,7 +112,10 @@ echo "$nudge_out" | grep -q "RESULT: PASS=21 FAIL=0" \
 # ---- 공통 sentinel stub (A~C 케이스용) ----
 TMPSTUB="$(mktemp -d)"  # trap 은 파일 상단에 등록돼 있음; 여기서 재등록 X
 mkdir -p "$TMPSTUB/bin"
-printf '#!/bin/sh\ntouch "%s/CLAUDE_CALLED"\n' "$TMPSTUB" > "$TMPSTUB/bin/claude"
+mkfifo "$TMPSTUB/release"
+exec 9<>"$TMPSTUB/release"
+printf '#!/bin/sh\ntouch "%s/CLAUDE_CALLED"\nread -r release < "%s/release"\n' \
+  "$TMPSTUB" "$TMPSTUB" > "$TMPSTUB/bin/claude"
 chmod +x "$TMPSTUB/bin/claude"
 export MEM_DISTILL_WORKER=claude
 
@@ -147,6 +154,9 @@ rmdir "$LOCK_A" 2>/dev/null
 [ "$?" = "0" ] \
   && ok "A-pos: lock dir 실제 acquire 됨 (rmdir rc 0 — v7 lock 경로 진입 positive)" \
   || bad "A-pos: lock dir 미생성 — v7 lock acquire 경로 미진입"
+# Keep the synthetic worker alive until the synchronous lock assertion ends.
+printf 'release\n' >&9
+exec 9>&-
 
 # negative: MEM_DISTILL=1 (재귀가드) → 즉시 exit 0, sentinel ABSENT.
 # A-neg 격리 (🔴-1): A-pos 의 detached `setsid claude &` 자식이 A-pos sentinel 을 async touch 할 수

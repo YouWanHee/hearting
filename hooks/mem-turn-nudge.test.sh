@@ -3,6 +3,12 @@
 # Fully isolated via MEM_STORE temp dir + MEM_NUDGE_INTERVAL — never touches real ~/.claude state.
 # Added 2026-06-16 (Cluster B doc-sync cycle) — commit 5a9ea18 claimed standalone-verified but committed no test.
 set -u
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+. "$ROOT/tools/memory/test-isolation.sh"
+hearting_test_isolate
+export MEM_PY="$ROOT/tools/memory/mem.py"
+export TMPDIR="$HEARTING_TEST_ROOT/tmp"
+mkdir -p "$TMPDIR"
 
 HOOK="$(cd "$(dirname "$0")" && pwd)/mem-turn-nudge.sh"
 [ -f "$HOOK" ] || { echo "FAIL: hook not found at $HOOK"; exit 1; }
@@ -26,7 +32,7 @@ run() {  # $1=event $2=prompt ; uses $TMP/$N/$SID env ; echoes hook stdout
     | MEM_STORE="$TMP" MEM_NUDGE_INTERVAL="$N" bash "$HOOK"
 }
 
-TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+TMP="$(mktemp -d)"; trap 'rm -rf "$HEARTING_TEST_ROOT"' EXIT
 N=3; SID="testsid"
 
 # seed a memory.db with a stable mtime (simulates an already-populated store)
@@ -197,5 +203,25 @@ else
 fi
 
 echo
+echo "== store conflict: nudge and briefing stop before counters or markers =="
+CONFLICT=$(mktemp -d)
+mkdir -p "$CONFLICT/home/hearting/memory" "$CONFLICT/home/.claude/memory"
+touch "$CONFLICT/home/hearting/memory/memory.db" "$CONFLICT/home/.claude/memory/memory.db"
+for conflict_hook in "$HOOK" "$BRIEFING"; do
+  printf '{"hook_event_name":"UserPromptSubmit","session_id":"conflict-sid","cwd":"%s","prompt":"x"}' "$CONFLICT" \
+    | env -u MEM_STORE -u CLAUDE_HOME HOME="$CONFLICT/home" AGENT_HOME="$CONFLICT/bundle" \
+        MEM_BRIEFING_DESK="$CONFLICT" MEM_NUDGE_INTERVAL=1 \
+        bash "$conflict_hook" >"$CONFLICT/stdout" 2>"$CONFLICT/stderr"
+  conflict_rc=$?
+  if [ "$conflict_rc" = 0 ] && [ ! -s "$CONFLICT/stdout" ] \
+    && [ "$(wc -l < "$CONFLICT/stderr")" = 2 ] \
+    && grep -q '^memory store resolution error:' "$CONFLICT/stderr" \
+    && [ "$(grep -c 'skipping' "$CONFLICT/stderr")" = 1 ] \
+    && [ "$(find "$CONFLICT/home" -type f | wc -l)" = 2 ]; then
+    ok "conflict: $conflict_hook exits 0 before counter/marker writes"
+  else
+    bad "conflict: $conflict_hook did not fail open without side effects"
+  fi
+done
 echo "RESULT: PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" = "0" ]

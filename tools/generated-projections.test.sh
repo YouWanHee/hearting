@@ -168,32 +168,52 @@ if grep -Fq 'auto-proceed and report in one line' "$ROOT/roles/response-policy.m
   echo "not ok - one-line follow-up close contradicts the completion report card" >&2
   exit 1
 fi
+require_bootstrap_clause() {
+  case "$bootstrap_flat" in
+    *"$1"*) ;;
+    *)
+      echo "not ok - $2 missing from $bootstrap" >&2
+      exit 1
+      ;;
+  esac
+}
 for bootstrap in \
   "$ROOT/adapters/claude/CLAUDE.md" \
   "$ROOT/adapters/codex/AGENTS.md" \
   "$ROOT/adapters/opencode/AGENTS.md"; do
-  grep -Fq 'five-field card in §0.4' "$bootstrap" || {
+  case "$bootstrap" in
+    "$ROOT/adapters/claude/CLAUDE.md")
+      entry_pointer='five-field card in §0.4'
+      completion_pointer='five-field completion card in §0.5'
+      autonomy_clause='continue low-risk reversible work autonomously'
+      ;;
+    "$ROOT/adapters/codex/AGENTS.md")
+      entry_pointer='§0.4 card unless approved'
+      completion_pointer='close with §0.5'
+      autonomy_clause='continue reversible in-flow work and its implied validation, records, commit, and push'
+      ;;
+    "$ROOT/adapters/opencode/AGENTS.md")
+      entry_pointer='§0.4 five-field card'
+      completion_pointer='close with the §0.5 card'
+      autonomy_clause='continue low-risk reversible work autonomously'
+      ;;
+  esac
+  grep -Fq "$entry_pointer" "$bootstrap" || {
     echo "not ok - entry confirmation pointer missing from $bootstrap" >&2
     exit 1
   }
   # Bootstrap prose is hard-wrapped, so match against a whitespace-normalized
   # copy: a restored clause must survive an unrelated reflow.
   bootstrap_flat=$(tr '\n' ' ' < "$bootstrap" | tr -s ' ' | tr 'A-Z' 'a-z')
+  require_bootstrap_clause "$completion_pointer" 'WORKFLOW §0.5 completion report pointer'
+  require_bootstrap_clause "$autonomy_clause" 'structured-input autonomy threshold'
   while IFS='|' read -r needle label; do
     [ -n "$needle" ] || continue
-    case "$bootstrap_flat" in
-      *"$needle"*) ;;
-      *)
-        echo "not ok - $label missing from $bootstrap" >&2
-        exit 1
-        ;;
-    esac
+    require_bootstrap_clause "$needle" "$label"
   done <<'BOOTSTRAP_PARITY_EOF'
-five-field completion card in §0.5|WORKFLOW §0.5 completion report pointer
 §5.11|OPERATIONS §5.11 same-turn commit/push policy
 dispatch depth 3 is forbidden|dispatch-depth-3 prohibition
 genuinely non-obvious|genuinely-non-obvious ask clause
-continue low-risk reversible work autonomously|structured-input autonomy threshold
 if structured input is unavailable|structured-input fallback clause
 legacy `.claude_reports/` is only a fallback|legacy artifact-root fallback qualifier
 depth, tests, safety, and validation on fallback|fallback preservation guarantee

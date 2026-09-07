@@ -17,6 +17,10 @@
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+. "$ROOT/tools/memory/test-isolation.sh"
+hearting_test_isolate
+export TMPDIR="$HEARTING_TEST_ROOT/tmp"
+mkdir -p "$TMPDIR"
 DISPATCH="$ROOT/hooks/mem-distill-dispatch.sh"
 TURNNUDGE="$ROOT/hooks/mem-turn-nudge.sh"
 MEM="$ROOT/tools/memory/mem.py"
@@ -45,7 +49,7 @@ STUBBIN="$(mktemp -d)"      # sentinel stub (touch CLAUDE_CALLED iff claude invo
 STUBCAP="$(mktemp -d)"      # argv-capture stub (echoes argv to ARGV file)
 # 단일 EXIT trap + 누적 cleanup 배열: bash 의 trap EXIT 는 append 아니라 replace 이므로,
 # 신규 테스트(a/M3/M4/b)는 새 trap 을 선언하는 대신 CLEANUP 에 경로를 append 한다 (누수 방지).
-CLEANUP=("$STORE" "$PROJ" "$STUBBIN" "$STUBCAP")
+CLEANUP=("$HEARTING_TEST_ROOT" "$STORE" "$PROJ" "$STUBBIN" "$STUBCAP")
 trap 'rm -rf "${CLEANUP[@]}"; rm -f "${SENTINEL_B:-}"' EXIT
 export MEM_STORE="$STORE" MEM_PROJECTS="$PROJ"
 # Isolate shared model-worker admission from live sessions and other tests.
@@ -982,5 +986,29 @@ JSONL
 done
 
 echo
+echo "== store conflict: portable and Claude dispatchers stop before work =="
+CONFLICT=$(mktemp -d)
+mkdir -p "$CONFLICT/home/hearting/memory" "$CONFLICT/home/.claude/memory"
+touch "$CONFLICT/home/hearting/memory/memory.db" "$CONFLICT/home/.claude/memory/memory.db"
+printf '#!/bin/sh\ntouch "%s/called"\n' "$CONFLICT" > "$CONFLICT/forbidden-worker"
+chmod +x "$CONFLICT/forbidden-worker"
+for conflict_hook in "$DISPATCH" "$CLAUDE_DISPATCH"; do
+  env -u MEM_STORE -u CLAUDE_HOME HOME="$CONFLICT/home" AGENT_HOME="$CONFLICT/bundle" \
+    MEM_DISTILL_ENABLE=1 MEM_DISTILL_WORKER="$CONFLICT/forbidden-worker" \
+    MEM_PY="$CONFLICT/forbidden-worker" \
+    bash "$conflict_hook" distill conflict-sid "$CONFLICT" \
+    >"$CONFLICT/stdout" 2>"$CONFLICT/stderr"
+  conflict_rc=$?
+  if [ "$conflict_rc" = 0 ] && [ ! -s "$CONFLICT/stdout" ] \
+    && [ "$(wc -l < "$CONFLICT/stderr")" = 2 ] \
+    && grep -q '^memory store resolution error:' "$CONFLICT/stderr" \
+    && [ "$(grep -c 'skipping' "$CONFLICT/stderr")" = 1 ] \
+    && [ ! -e "$CONFLICT/called" ] \
+    && [ "$(find "$CONFLICT/home" -type f | wc -l)" = 2 ]; then
+    ok "conflict: $conflict_hook exits 0 before state, transcript or worker"
+  else
+    bad "conflict: $conflict_hook did not fail open without side effects"
+  fi
+done
 echo "RESULT: PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" = "0" ]

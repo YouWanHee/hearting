@@ -30,8 +30,11 @@ source.
 
 `STORE` is resolved by `store_resolve.resolve_store()`, a stdlib-only,
 read-only module imported by `mem.py`; `utilities/memory-store.sh` is its
-POSIX-shell realization for every shell consumer (installer, adapter
-preflights, distill workers, hooks). Both implement the same closed R0-R5
+POSIX-shell realization for adapter preflights, distill workers and hooks;
+the installer imports the Python resolver. The shell uses GNU-compatible
+`stat` and `realpath` to distinguish filesystem errors and resolve file symlinks,
+and fails closed if those path tools are unavailable. It never invokes Python.
+Both implement the same closed R0-R5
 contract from `core/MEMORY.md` Section 7.0: a non-empty `MEM_STORE` wins
 verbatim (R0); otherwise an ordered candidate set spanning `AGENT_HOME`,
 `CLAUDE_HOME`, `$HOME/hearting`, `$HOME/agent_setting`, `$HOME/.claude`, and

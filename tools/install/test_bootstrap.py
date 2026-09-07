@@ -196,7 +196,16 @@ class RestoreMemoryTest(unittest.TestCase):
         self.env_patch = mock.patch.dict(os.environ, {}, clear=True)
         self.env_patch.start()
         self.addCleanup(self.env_patch.stop)
-        os.environ["HOME"] = str(self.home)
+        for variable, relative in {
+            "HOME": "home", "XDG_CONFIG_HOME": "config", "XDG_DATA_HOME": "data",
+            "XDG_STATE_HOME": "state", "MEM_WRITE_EVENTS": "state/write.jsonl",
+            "MEM_RECALL_EVENTS": "state/recall.jsonl", "MEM_RECALL_RECEIPTS": "state/receipts",
+        }.items():
+            os.environ[variable] = str(self.root / relative)
+            self.assertTrue(Path(os.environ[variable]).is_relative_to(self.root))
+        original_cwd = Path.cwd()
+        os.chdir(self.root)
+        self.addCleanup(os.chdir, original_cwd)
 
         self.resolve_patch = mock.patch.object(
             bootstrap.paths,
@@ -249,12 +258,17 @@ class RestoreMemoryTest(unittest.TestCase):
 
     def test_empty_environment_mem_store_is_unset_not_current_directory(self):
         os.environ["MEM_STORE"] = ""
-        cwd_sentinel = Path.cwd() / "memory.db"
-        self.assertFalse(cwd_sentinel.exists())
-        result = bootstrap.restore_memory(mem_store=None)
-        # No database anywhere -> falls to XDG default; must never inspect '.'
+        cwd_sentinel = self.root / "memory.db"
+        cwd_sentinel.write_text("untouched fixture")
+        original_exists = Path.exists
+        def guarded_exists(path):
+            if path.absolute() in {cwd_sentinel, self.root / "dump.jsonl"}:
+                raise AssertionError("empty override inspected cwd")
+            return original_exists(path)
+        with mock.patch.object(Path, "exists", guarded_exists):
+            result = bootstrap.restore_memory(mem_store="")
         self.assertEqual(result["action"], "skipped")
-        self.assertFalse(cwd_sentinel.exists())
+        self.assertEqual(cwd_sentinel.read_text(), "untouched fixture")
 
     def test_empty_argument_plus_non_empty_environment_uses_environment(self):
         env_store = self.root / "env-store"

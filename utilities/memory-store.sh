@@ -1,112 +1,101 @@
 #!/usr/bin/env sh
-# Print the memory store directory, resolved exactly like
-# tools/memory/store_resolve.py (R0-R5; see core/MEMORY.md Section 7.0).
-#
-# The store is runtime state, not harness source, so it must never resolve
-# into a managed release tree. This is a read-only probe: it never opens
-# memory.db, and never moves, copies, or imports anything. On conflict
-# (R4) or a real probe/canonicalization error, it exits 3 with no stdout and
-# a path-only diagnostic on stderr. Callers under `set -e` must guard the
-# call with an explicit `if STORE=$(...); then ... else ... fi` so this
-# script's fail-closed exit cannot be silently swallowed nor bypass a
-# fail-open hook contract.
+# Read-only R0-R5 resolver; Python consumers use tools/memory/store_resolve.py.
+# Uses the core path tools stat and realpath, never Python on hook hot paths.
 set -u
-set -f  # disable globbing: candidate paths are split with '|' below, unquoted
 
-_mem_store_die() {
+_mem_die() {
   printf 'memory store resolution error: %s\n' "$1" >&2
   exit 3
 }
 
-# R0 -- explicit override: a non-empty MEM_STORE wins verbatim, unprobed.
+# Unlike test -e/-f, stat lets us distinguish absence from EACCES/ELOOP.
+# Normalize tool diagnostics to the candidate path; never expose tool stderr.
+_mem_probe() {
+  if _mem_kind=$(LC_ALL=C stat -L -c '%F' -- "$1" 2>&1); then
+    case $_mem_kind in
+      'regular file'|'regular empty file') _mem_kind=file ;;
+      directory) _mem_kind=directory ;;
+      *) _mem_kind=other ;;
+    esac
+  else
+    case $_mem_kind in
+      *': No such file or directory'|*': Not a directory') _mem_kind=missing ;;
+      *) _mem_die "$2" ;;
+    esac
+  fi
+}
+
 if [ -n "${MEM_STORE:-}" ]; then
   printf '%s\n' "$MEM_STORE"
   exit 0
 fi
-
 _mem_home=$HOME
-_mem_xdg_data=${XDG_DATA_HOME:-$_mem_home/.local/share}
+_mem_xdg=${XDG_DATA_HOME:-$_mem_home/.local/share}
 
-# R1 -- ordered candidate set. Each entry is "<marker><SEP><path>", where
-# marker is "1" only for the managed-current compatibility spelling (excluded
-# from the R5 no-database fallback) and "0" otherwise. Skip a candidate whose
-# source variable is empty/unset; HOME-derived candidates are always present.
-_mem_sep=:
-_mem_entries=""
-if [ -n "${AGENT_HOME:-}" ]; then
-  _mem_entries="$_mem_entries|0$_mem_sep$AGENT_HOME/memory"
-fi
-if [ -n "${CLAUDE_HOME:-}" ]; then
-  _mem_entries="$_mem_entries|0$_mem_sep$CLAUDE_HOME/memory"
-fi
-_mem_entries="$_mem_entries|0$_mem_sep$_mem_home/hearting/memory"
-_mem_entries="$_mem_entries|0$_mem_sep$_mem_home/agent_setting/memory"
-_mem_entries="$_mem_entries|0$_mem_sep$_mem_home/.claude/memory"
-_mem_entries="$_mem_entries|1$_mem_sep$_mem_xdg_data/hearting/current/memory"
-_mem_entries="$_mem_entries|0$_mem_sep$_mem_xdg_data/hearting/memory"
+# Prefix marks the one R5-excluded candidate. Each complete path is a quoted
+# argument: no delimiter, whitespace, newline, glob or eval parsing of paths.
+set --
+[ -z "${AGENT_HOME:-}" ] || set -- "$@" "0:$AGENT_HOME/memory"
+[ -z "${CLAUDE_HOME:-}" ] || set -- "$@" "0:$CLAUDE_HOME/memory"
+set -- "$@" "0:$_mem_home/hearting/memory" \
+  "0:$_mem_home/agent_setting/memory" "0:$_mem_home/.claude/memory" \
+  "1:$_mem_xdg/hearting/current/memory" "0:$_mem_xdg/hearting/memory"
 
-# Strip the leading separator and split on '|' using quoted positional
-# parameters -- no eval, no word splitting on IFS default whitespace, no
-# newline-delimited parsing of environment-influenced paths.
-_mem_entries=${_mem_entries#|}
-
-_mem_old_ifs=$IFS
-IFS='|'
-set -- $_mem_entries
-IFS=$_mem_old_ifs
-
-_mem_populated_identities=""
-_mem_populated_originals=""
-_mem_conflict_list=""
-_mem_conflict_count=0
-
+_mem_count=0
+_mem_list=
+_mem_selected=
+# At most seven candidates. Separate variables preserve arbitrary path bytes
+# without encoding a list in a string or creating temporary state.
+_mem_id1= _mem_id2= _mem_id3= _mem_id4= _mem_id5= _mem_id6= _mem_id7=
 for _mem_entry in "$@"; do
-  _mem_cand=${_mem_entry#?:}
-  _mem_db="$_mem_cand/memory.db"
-  if [ -L "$_mem_db" ]; then
-    if [ ! -e "$_mem_db" ]; then
-      continue  # dangling symlink: not populated, not an error
-    fi
-  elif [ ! -e "$_mem_db" ]; then
-    continue  # ordinary absence: not populated, not an error
+  _mem_candidate=${_mem_entry#*:}
+  _mem_db=$_mem_candidate/memory.db
+  _mem_probe "$_mem_db" "$_mem_candidate"
+  [ "$_mem_kind" = file ] || continue
+  # Resolve the database file itself, including a file symlink, not just its
+  # parent directory. The suffix retains any trailing newlines in its name.
+  if _mem_identity=$(realpath -e -- "$_mem_db" 2>/dev/null && printf '.'); then
+    _mem_identity=${_mem_identity%.}
+    _mem_identity=${_mem_identity%"
+"}
+  else
+    _mem_die "$_mem_candidate"
   fi
-  if [ ! -f "$_mem_db" ]; then
-    continue  # R2 wrong-type (e.g. a directory named memory.db): not populated
-  fi
-  _mem_identity=$(CDPATH= cd -P -- "$(dirname -- "$_mem_db")" 2>/dev/null && pwd -P) || _mem_store_die "$_mem_cand"
-  _mem_identity="$_mem_identity/memory.db"
-  case "|$_mem_populated_identities|" in
-    *"|$_mem_identity|"*) continue ;;
+  _mem_duplicate=0
+  for _mem_seen in "$_mem_id1" "$_mem_id2" "$_mem_id3" "$_mem_id4" \
+    "$_mem_id5" "$_mem_id6" "$_mem_id7"; do
+    [ "$_mem_seen" != "$_mem_identity" ] || _mem_duplicate=1
+  done
+  [ "$_mem_duplicate" = 0 ] || continue
+  _mem_count=$((_mem_count + 1))
+  case $_mem_count in
+    1) _mem_id1=$_mem_identity; _mem_selected=$_mem_candidate; _mem_list=$_mem_candidate ;;
+    2) _mem_id2=$_mem_identity ;;
+    3) _mem_id3=$_mem_identity ;;
+    4) _mem_id4=$_mem_identity ;;
+    5) _mem_id5=$_mem_identity ;;
+    6) _mem_id6=$_mem_identity ;;
+    7) _mem_id7=$_mem_identity ;;
   esac
-  _mem_populated_identities="$_mem_populated_identities|$_mem_identity"
-  _mem_populated_originals="$_mem_populated_originals|$_mem_cand"
-  _mem_conflict_count=$((_mem_conflict_count + 1))
-  _mem_conflict_list="$_mem_conflict_list, $_mem_cand"
+  [ "$_mem_count" = 1 ] || _mem_list="$_mem_list, $_mem_candidate"
 done
 
-if [ "$_mem_conflict_count" -ge 2 ]; then
-  _mem_conflict_list=${_mem_conflict_list#, }
+if [ "$_mem_count" -gt 1 ]; then
   printf 'memory store resolution error: multiple memory databases found: %s; set MEM_STORE to one of them\n' \
-    "$_mem_conflict_list" >&2
+    "$_mem_list" >&2
   exit 3
 fi
-
-if [ "$_mem_conflict_count" -eq 1 ]; then
-  printf '%s\n' "${_mem_populated_originals#|}"
+if [ "$_mem_count" = 1 ]; then
+  printf '%s\n' "$_mem_selected"
   exit 0
 fi
-
-# R5 -- no database anywhere: first existing candidate directory, excluding
-# the managed-current compatibility spelling, else the canonical XDG path.
 for _mem_entry in "$@"; do
-  _mem_marker=${_mem_entry%%:*}
-  _mem_cand=${_mem_entry#?:}
-  [ "$_mem_marker" = "1" ] && continue
-  if [ -e "$_mem_cand" ] || [ -L "$_mem_cand" ]; then
-    printf '%s\n' "$_mem_cand"
+  case $_mem_entry in 1:*) continue ;; esac
+  _mem_candidate=${_mem_entry#*:}
+  _mem_probe "$_mem_candidate" "$_mem_candidate"
+  if [ "$_mem_kind" = directory ]; then
+    printf '%s\n' "$_mem_candidate"
     exit 0
   fi
 done
-
-printf '%s\n' "$_mem_xdg_data/hearting/memory"
-exit 0
+printf '%s\n' "$_mem_xdg/hearting/memory"

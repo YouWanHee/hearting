@@ -5,6 +5,10 @@
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+. "$ROOT/tools/memory/test-isolation.sh"
+hearting_test_isolate
+export TMPDIR="$HEARTING_TEST_ROOT/tmp"
+mkdir -p "$TMPDIR"
 UTIL="$ROOT/utilities/mem-periodic-curate.sh"
 MEM="$ROOT/tools/memory/mem.py"
 [ -f "$UTIL" ] || { echo "FAIL: periodic curator not found at $UTIL"; exit 1; }
@@ -13,7 +17,7 @@ PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  ✅ %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  ❌ %s\n' "$1"; }
 
-CLEANUP=()
+CLEANUP=("$HEARTING_TEST_ROOT")
 trap 'rm -rf "${CLEANUP[@]}"' EXIT
 
 # D-42 hermeticity: unset any inherited worker/dispatch markers so every case
@@ -458,5 +462,25 @@ grep -q "project=$REALDIR12 " "$LOG12" \
   || bad "⑫: reachable project was not dispatched"
 
 echo
+echo "== store conflict: curator stops before selection or worker =="
+CONFLICT=$(mktemp -d)
+mkdir -p "$CONFLICT/home/hearting/memory" "$CONFLICT/home/.claude/memory"
+touch "$CONFLICT/home/hearting/memory/memory.db" "$CONFLICT/home/.claude/memory/memory.db"
+printf '#!/bin/sh\ntouch "%s/called"\n' "$CONFLICT" > "$CONFLICT/forbidden-worker"
+chmod +x "$CONFLICT/forbidden-worker"
+env -u MEM_STORE -u CLAUDE_HOME HOME="$CONFLICT/home" AGENT_HOME="$CONFLICT/bundle" \
+  MEM_PERIODIC_CURATE_ENABLE=1 MEM_PY="$CONFLICT/forbidden-worker" \
+  bash "$UTIL" >"$CONFLICT/stdout" 2>"$CONFLICT/stderr"
+conflict_rc=$?
+if [ "$conflict_rc" = 0 ] && [ ! -s "$CONFLICT/stdout" ] \
+  && [ "$(wc -l < "$CONFLICT/stderr")" = 2 ] \
+  && grep -q '^memory store resolution error:' "$CONFLICT/stderr" \
+  && [ "$(grep -c 'skipping' "$CONFLICT/stderr")" = 1 ] \
+  && [ ! -e "$CONFLICT/called" ] \
+  && [ "$(find "$CONFLICT/home" -type f | wc -l)" = 2 ]; then
+  ok "conflict exits 0 before selection, locks and workers"
+else
+  bad "conflict did not fail open without side effects"
+fi
 echo "RESULT: PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" = "0" ]

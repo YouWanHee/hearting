@@ -14,14 +14,15 @@ against the shell realization by invoking each as a subprocess and diffing
 stdout/exit status/stderr.
 """
 import os
+import stat
 import sys
 from pathlib import Path
 
-# The managed-current compatibility spelling. It reconnects an already
-# populated release-adjacent store, but an *empty* directory there is never a
-# creation/import target: the release tree is immutable, not runtime state.
-_MANAGED_CURRENT_SEGMENTS = ("hearting", "current", "memory")
-_CANONICAL_SEGMENTS = ("hearting", "memory")
+class _StorePath(type(Path())):
+    """Keep the selected spelling at the API boundary, with normal Path children."""
+
+    def __str__(self):
+        return getattr(self, "_store_spelling", super().__str__())
 
 
 class StoreResolutionError(Exception):
@@ -47,8 +48,8 @@ def _diagnostic(candidate):
 def _xdg_data_home(env, home):
     value = env.get("XDG_DATA_HOME")
     if value:
-        return Path(value)
-    return home / ".local" / "share"
+        return value
+    return f"{home}/.local/share"
 
 
 def _candidate_list(env, home):
@@ -61,50 +62,38 @@ def _candidate_list(env, home):
     candidates = []
     agent_home = env.get("AGENT_HOME")
     if agent_home:
-        candidates.append((Path(agent_home) / "memory", False))
+        candidates.append((f"{agent_home}/memory", False))
     claude_home = env.get("CLAUDE_HOME")
     if claude_home:
-        candidates.append((Path(claude_home) / "memory", False))
-    candidates.append((home / "hearting" / "memory", False))
-    candidates.append((home / "agent_setting" / "memory", False))
-    candidates.append((home / ".claude" / "memory", False))
+        candidates.append((f"{claude_home}/memory", False))
+    candidates.append((f"{home}/hearting/memory", False))
+    candidates.append((f"{home}/agent_setting/memory", False))
+    candidates.append((f"{home}/.claude/memory", False))
     xdg_data = _xdg_data_home(env, home)
-    candidates.append((xdg_data.joinpath(*_MANAGED_CURRENT_SEGMENTS), True))
-    candidates.append((xdg_data.joinpath(*_CANONICAL_SEGMENTS), False))
+    candidates.append((f"{xdg_data}/hearting/current/memory", True))
+    candidates.append((f"{xdg_data}/hearting/memory", False))
     return candidates
 
 
-def _probe_populated(candidate):
-    """Return True/False, or raise StoreResolutionError on a real probe error.
-
-    Ordinary absence and the "memory.db is a directory" wrong-type case are
-    not errors -- they simply mean "not populated". A permission failure or
-    symlink loop while checking is a real error and must abort the scan
-    rather than silently choosing a different candidate.
-    """
-    db = candidate / "memory.db"
+def _probe_mode(path, candidate):
+    """Path predicates suppress some OS errors; stat preserves their cause."""
     try:
-        if db.is_symlink():
-            if not db.exists():
-                return False  # dangling symlink: not populated, not an error
-            resolved = db.resolve(strict=True)
-            return resolved.is_file()
-        if not db.exists():
-            return False
-        return db.is_file()
+        return os.stat(path).st_mode
+    except (FileNotFoundError, NotADirectoryError):
+        return 0
     except OSError as exc:
         raise _diagnostic(candidate) from exc
 
 
 def _resolved_identity(candidate):
-    db = candidate / "memory.db"
+    db = Path(candidate) / "memory.db"
     try:
         return str(db.resolve(strict=True))
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:
         raise _diagnostic(candidate) from exc
 
 
-def resolve_store(env=None, home=None):
+def _resolve_store_text(env=None, home=None):
     """Resolve the one memory store directory per core/MEMORY.md Section 7.0.
 
     Raises StoreConflict when two or more distinct databases are populated,
@@ -114,19 +103,18 @@ def resolve_store(env=None, home=None):
     if env is None:
         env = os.environ
     if home is None:
-        home = Path(os.path.expanduser("~"))
-    else:
-        home = Path(home)
+        home = env.get("HOME") or os.path.expanduser("~")
+    home = str(home)
 
     override = env.get("MEM_STORE")
     if override:
-        return Path(override)
+        return override
 
     candidates = _candidate_list(env, home)
 
     populated_identity = {}  # resolved memory.db path -> original candidate path
     for candidate, _is_managed_current in candidates:
-        if not _probe_populated(candidate):
+        if not stat.S_ISREG(_probe_mode(f"{candidate}/memory.db", candidate)):
             continue
         identity = _resolved_identity(candidate)
         if identity not in populated_identity:
@@ -142,19 +130,24 @@ def resolve_store(env=None, home=None):
     for candidate, is_managed_current in candidates:
         if is_managed_current:
             continue
-        try:
-            exists = candidate.exists() or candidate.is_symlink()
-        except OSError as exc:
-            raise _diagnostic(candidate) from exc
-        if exists:
+        if stat.S_ISDIR(_probe_mode(candidate, candidate)):
             return candidate
     return candidates[-1][0]
+
+
+def resolve_store(env=None, home=None) -> Path:
+    """Return the selected store as a Path without resolving its spelling."""
+    spelling = _resolve_store_text(env, home)
+    selected = _StorePath(spelling)
+    selected._store_spelling = spelling
+    return selected
 
 
 def main(argv):
     del argv
     try:
-        store = resolve_store()
+        # Preserve even lexical spellings (./, repeated /) at the text boundary.
+        store = _resolve_store_text()
     except StoreResolutionError as exc:
         print(str(exc), file=sys.stderr)
         return 3

@@ -31,6 +31,10 @@ bad() { FAIL=$((FAIL+1)); printf '  BAD %s\n' "$1"; }
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
+. "$ROOT/tools/memory/test-isolation.sh"
+hearting_test_isolate "$TMP"
+export TMPDIR="$TMP/tmp"
+mkdir -p "$TMPDIR" "$TMP/logs"
 export AGENT_HOME="$TMP/agent_home"
 export AGENT_MODEL_GOVERNOR_ROOT="$TMP/repo/.agent_reports/.runtime/model-worker-governor"
 export MEM_RECALL_RECEIPTS="$TMP/recall-opportunities"
@@ -75,13 +79,15 @@ CODEX_DIRECT_DISPATCH_HOME="$CODEX_WRAPPED_DISPATCH_HOME"
 OPENCODE_DIRECT_DISPATCH_HOME=$(AGENT_HOME="$TMP/not-agent-home" HOME="$DISPATCH_RESOLVER_HOME" XDG_DATA_HOME="$DISPATCH_RESOLVER_XDG" \
   "$ROOT/adapters/opencode/utilities/agent-home.sh")
 
+# Route validation needs a real source contract; MEM_STORE remains synthetic.
+export AGENT_HOME="$ROOT"
 echo "== artifact guard CLI =="
 ROUTE_FIXTURE_JOBS="$TMP/proj/.dispatch/jobs.log"
 mkdir -p "$TMP/proj/.agent_reports/spec" "$(dirname "$ROUTE_FIXTURE_JOBS")"
-if "$ART" --file "$TMP/proj/.agent_reports/spec/prd.md" --session test >/tmp/art.out 2>/tmp/art.err; then
+if "$ART" --file "$TMP/proj/.agent_reports/spec/prd.md" --session test >"$TMP/logs/art.out" 2>"$TMP/logs/art.err"; then
   bad "spec write with no route declared should fail"
 else
-  [ "$?" -eq 2 ] && grep -q 'capability-artifact-route-required' /tmp/art.err \
+  [ "$?" -eq 2 ] && grep -q 'capability-artifact-route-required' "$TMP/logs/art.err" \
     && ok "spec write with no route declared fails closed" \
     || bad "spec write with no route declared returned the wrong failure"
 fi
@@ -116,34 +122,34 @@ fixture_route_id() {
 route_no_spec=$(fixture_route autopilot-code dev route-no-spec)
 route_no_spec_id=$(fixture_route_id "$route_no_spec")
 if AGENT_ROUTE_FILE="$route_no_spec" AGENT_ROUTE_ID="$route_no_spec_id" AGENT_ROUTE_NODE=inline \
-  "$ART" --file "$TMP/proj/.agent_reports/spec/prd.md" >/tmp/art_route.out 2>/tmp/art_route.err; then
+  "$ART" --file "$TMP/proj/.agent_reports/spec/prd.md" >"$TMP/logs/art_route.out" 2>"$TMP/logs/art_route.err"; then
   bad "a non-spec capability route should not authorize spec output"
 else
-  [ "$?" -eq 2 ] && grep -q 'capability-artifact-route-required' /tmp/art_route.err \
-    && grep -q "$route_no_spec_id" /tmp/art_route.err \
+  [ "$?" -eq 2 ] && grep -q 'capability-artifact-route-required' "$TMP/logs/art_route.err" \
+    && grep -q "$route_no_spec_id" "$TMP/logs/art_route.err" \
     && ok "a non-spec route is a route-addressed structured failure" \
     || bad "non-spec route mismatch missing structured failure"
 fi
 route_spec=$(fixture_route autopilot-spec update route-spec)
 route_spec_id=$(fixture_route_id "$route_spec")
 if AGENT_ROUTE_FILE="$route_spec" AGENT_ROUTE_ID="$route_spec_id" AGENT_ROUTE_NODE=inline \
-  "$ART" --file "$TMP/proj/.agent_reports/spec/prd.md" >/tmp/art_route_guard.out 2>/tmp/art_route_guard.err; then
+  "$ART" --file "$TMP/proj/.agent_reports/spec/prd.md" >"$TMP/logs/art_route_guard.out" 2>"$TMP/logs/art_route_guard.err"; then
   ok "verified spec route authorizes its declared output"
 else
   bad "verified spec route should authorize its declared output"
 fi
 mkdir -p "$TMP/proj/.agent_reports/spec/dispatch-profiles/nested"
 if AGENT_ROUTE_FILE="$route_spec" AGENT_ROUTE_ID="$route_spec_id" AGENT_ROUTE_NODE=inline \
-  "$ART" --file "$TMP/proj/.agent_reports/spec/dispatch-profiles/prd.md" >/tmp/art_component_guard.out 2>/tmp/art_component_guard.err; then
+  "$ART" --file "$TMP/proj/.agent_reports/spec/dispatch-profiles/prd.md" >"$TMP/logs/art_component_guard.out" 2>"$TMP/logs/art_component_guard.err"; then
   ok "verified spec route authorizes a declared component output"
 else
   bad "verified spec route should authorize a declared component output"
 fi
 if AGENT_ROUTE_FILE="$route_spec" AGENT_ROUTE_ID="$route_spec_id" AGENT_ROUTE_NODE=inline \
-  "$ART" --file "$TMP/proj/.agent_reports/spec/dispatch-profiles/nested/prd.md" >/tmp/art_component_nested.out 2>/tmp/art_component_nested.err; then
+  "$ART" --file "$TMP/proj/.agent_reports/spec/dispatch-profiles/nested/prd.md" >"$TMP/logs/art_component_nested.out" 2>"$TMP/logs/art_component_nested.err"; then
   bad "a component placeholder must not absorb multiple path segments"
 else
-  [ "$?" -eq 2 ] && grep -q 'artifact-write-outside-node-scope' /tmp/art_component_nested.err \
+  [ "$?" -eq 2 ] && grep -q 'artifact-write-outside-node-scope' "$TMP/logs/art_component_nested.err" \
     && ok "a component placeholder binds exactly one path segment" \
     || bad "nested component path rejection missing structured scope failure"
 fi
@@ -152,26 +158,26 @@ route_plan=$(fixture_route autopilot-code dev route-plan)
 route_plan_id=$(fixture_route_id "$route_plan")
 mkdir -p "$TMP/proj/.agent_reports/plans/2026-08-03_fixture/plan" "$TMP/proj/.agent_reports/test_logs" "$TMP/proj/.agent_reports/.runtime"
 if AGENT_ROUTE_FILE="$route_plan" AGENT_ROUTE_ID="$route_plan_id" AGENT_ROUTE_NODE=inline \
-  "$ART" --file "$TMP/proj/.agent_reports/plans/2026-08-03_fixture/plan/plan.md" >/tmp/art_scope_in.out 2>/tmp/art_scope_in.err; then
+  "$ART" --file "$TMP/proj/.agent_reports/plans/2026-08-03_fixture/plan/plan.md" >"$TMP/logs/art_scope_in.out" 2>"$TMP/logs/art_scope_in.err"; then
   ok "artifact write inside the declared node scope passes"
 else
   bad "artifact write inside the declared node scope should pass"
 fi
 if AGENT_ROUTE_FILE="$route_plan" AGENT_ROUTE_ID="$route_plan_id" AGENT_ROUTE_NODE=inline \
-  "$ART" --file "$TMP/proj/.agent_reports/test_logs/run.log" >/tmp/art_scope_out.out 2>/tmp/art_scope_out.err; then
+  "$ART" --file "$TMP/proj/.agent_reports/test_logs/run.log" >"$TMP/logs/art_scope_out.out" 2>"$TMP/logs/art_scope_out.err"; then
   bad "artifact write outside the declared node scope should fail"
 else
-  [ "$?" -eq 2 ] && grep -q 'artifact-write-outside-node-scope' /tmp/art_scope_out.err \
-    && grep -q "$route_plan_id" /tmp/art_scope_out.err && ok "out-of-scope artifact write is a route-addressed structured failure" \
+  [ "$?" -eq 2 ] && grep -q 'artifact-write-outside-node-scope' "$TMP/logs/art_scope_out.err" \
+    && grep -q "$route_plan_id" "$TMP/logs/art_scope_out.err" && ok "out-of-scope artifact write is a route-addressed structured failure" \
     || bad "out-of-scope artifact write missing structured route failure"
 fi
-if "$ART" --file "$TMP/proj/.agent_reports/test_logs/run.log" >/tmp/art_scope_noroute.out 2>/tmp/art_scope_noroute.err; then
+if "$ART" --file "$TMP/proj/.agent_reports/test_logs/run.log" >"$TMP/logs/art_scope_noroute.out" 2>"$TMP/logs/art_scope_noroute.err"; then
   ok "artifact write with no route declared stays unbound"
 else
   bad "artifact write with no route declared should stay unbound"
 fi
 if AGENT_ROUTE_FILE="$route_plan" AGENT_ROUTE_ID="$route_plan_id" AGENT_ROUTE_NODE=inline \
-  "$ART" --file "$TMP/proj/.agent_reports/.runtime/state.json" >/tmp/art_scope_dot.out 2>/tmp/art_scope_dot.err; then
+  "$ART" --file "$TMP/proj/.agent_reports/.runtime/state.json" >"$TMP/logs/art_scope_dot.out" 2>"$TMP/logs/art_scope_dot.err"; then
   ok "dot-prefixed runtime state is exempt from node scope binding"
 else
   bad "dot-prefixed runtime state should be exempt from node scope binding"
@@ -183,13 +189,13 @@ fi
 route_owner="$route_plan"
 route_owner_id="$route_plan_id"
 if AGENT_ROUTE_FILE="$route_owner" AGENT_ROUTE_ID="$route_owner_id" AGENT_ROUTE_NODE=inline \
-  "$ART" --file "$TMP/proj/.agent_reports/plans/2026-08-03_fixture/plan/plan.md" >/tmp/art_cycle_in.out 2>/tmp/art_cycle_in.err; then
+  "$ART" --file "$TMP/proj/.agent_reports/plans/2026-08-03_fixture/plan/plan.md" >"$TMP/logs/art_cycle_in.out" 2>"$TMP/logs/art_cycle_in.err"; then
   ok "a <cycle> placeholder scope binds one path segment"
 else
   bad "a <cycle> placeholder scope should bind one path segment"
 fi
 if AGENT_ROUTE_FILE="$route_owner" AGENT_ROUTE_ID="$route_owner_id" AGENT_ROUTE_NODE=inline \
-  "$ART" --file "$TMP/proj/.agent_reports/test_logs/run.log" >/tmp/art_cycle_out.out 2>/tmp/art_cycle_out.err; then
+  "$ART" --file "$TMP/proj/.agent_reports/test_logs/run.log" >"$TMP/logs/art_cycle_out.out" 2>"$TMP/logs/art_cycle_out.err"; then
   bad "a worktree-only scope should not authorize an unrelated artifact write"
 else
   [ "$?" -eq 2 ] && ok "a worktree-only scope does not authorize an unrelated artifact write" \
@@ -200,31 +206,31 @@ fi
 # write-scope matching, not fall through the node lookup's StopIteration.
 mkdir -p "$TMP/proj/.agent_reports/plans/owner_cycle/dev_logs"
 if AGENT_ROUTE_FILE="$route_owner" AGENT_ROUTE_ID="$route_owner_id" AGENT_ROUTE_NODE="" \
-  "$ART" --file "$TMP/proj/.agent_reports/plans/owner_cycle/checklist.md" >/tmp/art_owner_ck.out 2>/tmp/art_owner_ck.err; then
+  "$ART" --file "$TMP/proj/.agent_reports/plans/owner_cycle/checklist.md" >"$TMP/logs/art_owner_ck.out" 2>"$TMP/logs/art_owner_ck.err"; then
   ok "owner binding (empty route node) can write cycle artifacts"
 else
   bad "owner binding (empty route node) should be able to write cycle artifacts"
 fi
 if AGENT_ROUTE_FILE="$route_owner" AGENT_ROUTE_ID="$route_owner_id" AGENT_ROUTE_NODE="" \
-  "$ART" --file "$TMP/proj/.agent_reports/plans/owner_cycle/dev_logs/x.md" >/tmp/art_owner_dl.out 2>/tmp/art_owner_dl.err; then
+  "$ART" --file "$TMP/proj/.agent_reports/plans/owner_cycle/dev_logs/x.md" >"$TMP/logs/art_owner_dl.out" 2>"$TMP/logs/art_owner_dl.err"; then
   ok "owner binding (empty route node) can write dev_logs artifacts"
 else
   bad "owner binding (empty route node) should be able to write dev_logs artifacts"
 fi
 mkdir -p "$TMP/proj/.agent_reports/spec"
 if AGENT_ROUTE_FILE="$route_owner" AGENT_ROUTE_ID="$route_owner_id" AGENT_ROUTE_NODE="" \
-  "$ART" --file "$TMP/proj/.agent_reports/spec/x.md" >/tmp/art_owner_spec.out 2>/tmp/art_owner_spec.err; then
+  "$ART" --file "$TMP/proj/.agent_reports/spec/x.md" >"$TMP/logs/art_owner_spec.out" 2>"$TMP/logs/art_owner_spec.err"; then
   bad "owner binding must still be rejected from spec/ writes"
 else
-  [ "$?" -eq 2 ] && grep -q 'capability-artifact-route-required' /tmp/art_owner_spec.err \
+  [ "$?" -eq 2 ] && grep -q 'capability-artifact-route-required' "$TMP/logs/art_owner_spec.err" \
     && ok "owner binding is rejected from spec/ writes" \
     || bad "owner binding spec/ rejection missing structured reason"
 fi
 if AGENT_ROUTE_FILE="$route_owner" AGENT_ROUTE_ID="$route_owner_id" AGENT_ROUTE_NODE=inline \
-  "$ART" --file "$TMP/proj/.agent_reports/documents/fake/doc.md" >/tmp/art_node_scope.out 2>/tmp/art_node_scope.err; then
+  "$ART" --file "$TMP/proj/.agent_reports/documents/fake/doc.md" >"$TMP/logs/art_node_scope.out" 2>"$TMP/logs/art_node_scope.err"; then
   bad "a real node's out-of-scope write must still be rejected"
 else
-  [ "$?" -eq 2 ] && grep -q 'capability-artifact-route-required' /tmp/art_node_scope.err \
+  [ "$?" -eq 2 ] && grep -q 'capability-artifact-route-required' "$TMP/logs/art_node_scope.err" \
     && ok "a real node's out-of-scope write is still rejected (owner exception did not widen)" \
     || bad "real node out-of-scope rejection missing structured reason"
 fi
@@ -240,10 +246,10 @@ mkdir -p "$TMP/ownerrepo/.agent_reports/_internal" "$TMP/ownerrepo-wt"
   git worktree add -q -b owner-topic "$TMP/ownerrepo-wt/topic"
 )
 if AGENT_ROUTE_FILE="$route_owner" AGENT_ROUTE_ID="$route_owner_id" AGENT_ROUTE_NODE="" \
-  "$ART" --file "$TMP/ownerrepo-wt/topic/.agent_reports/plans/owner_cycle/checklist.md" >/tmp/art_owner_root.out 2>/tmp/art_owner_root.err; then
+  "$ART" --file "$TMP/ownerrepo-wt/topic/.agent_reports/plans/owner_cycle/checklist.md" >"$TMP/logs/art_owner_root.out" 2>"$TMP/logs/art_owner_root.err"; then
   bad "owner binding must still respect the canonical artifact root boundary"
 else
-  [ "$?" -eq 2 ] && grep -q 'canonical-artifact-root-mismatch' /tmp/art_owner_root.err \
+  [ "$?" -eq 2 ] && grep -q 'canonical-artifact-root-mismatch' "$TMP/logs/art_owner_root.err" \
     && ok "owner binding does not bypass the canonical artifact root boundary" \
     || bad "owner binding canonical-root rejection missing structured reason"
 fi
@@ -254,7 +260,7 @@ mkdir -p "$TMP/proj/.agent_reports/documents/cycle" "$TMP/proj/.agent_reports/re
 printf 'before\n' > "$TMP/proj/.agent_reports/documents/cycle/doc.md"
 printf 'legacy\n' > "$TMP/proj/.agent_reports/rebuttal/rebuttal.md"
 if AGENT_ROUTE_FILE="$route_refine" AGENT_ROUTE_ID="$route_refine_id" AGENT_ROUTE_NODE=inline \
-  "$ART" --file "$TMP/proj/.agent_reports/documents/cycle/doc.md" >/tmp/art_refine_owned.out 2>/tmp/art_refine_owned.err; then
+  "$ART" --file "$TMP/proj/.agent_reports/documents/cycle/doc.md" >"$TMP/logs/art_refine_owned.out" 2>"$TMP/logs/art_refine_owned.err"; then
   [ ! -e "$TMP/proj/.agent_reports/documents/cycle/_internal/versions" ] \
     && ok "direct refine authorizes an owned document without a snapshot" \
     || bad "direct refine unexpectedly created a snapshot"
@@ -262,10 +268,10 @@ else
   bad "target-artifact should authorize an owned document"
 fi
 if AGENT_ROUTE_FILE="$route_refine" AGENT_ROUTE_ID="$route_refine_id" AGENT_ROUTE_NODE=inline \
-  "$ART" --file "$TMP/proj/.agent_reports/rebuttal/rebuttal.md" >/tmp/art_refine_unowned.out 2>/tmp/art_refine_unowned.err; then
+  "$ART" --file "$TMP/proj/.agent_reports/rebuttal/rebuttal.md" >"$TMP/logs/art_refine_unowned.out" 2>"$TMP/logs/art_refine_unowned.err"; then
   bad "target-artifact should not authorize an unowned rebuttal container"
 else
-  [ "$?" -eq 2 ] && grep -q 'artifact-write-outside-node-scope' /tmp/art_refine_unowned.err \
+  [ "$?" -eq 2 ] && grep -q 'artifact-write-outside-node-scope' "$TMP/logs/art_refine_unowned.err" \
     && ok "target-artifact rejects unowned top-level artifact containers" \
     || bad "unowned target-artifact failure was not route-addressed"
 fi
@@ -274,7 +280,7 @@ route_refine_direct_id="$route_refine_id"
 mkdir -p "$TMP/proj/.agent_reports/documents/minor"
 printf 'minor\n' > "$TMP/proj/.agent_reports/documents/minor/doc.md"
 if AGENT_ROUTE_FILE="$route_refine_direct" AGENT_ROUTE_ID="$route_refine_direct_id" AGENT_ROUTE_NODE=inline \
-  "$ART" --file "$TMP/proj/.agent_reports/documents/minor/doc.md" >/tmp/art_refine_direct.out 2>/tmp/art_refine_direct.err; then
+  "$ART" --file "$TMP/proj/.agent_reports/documents/minor/doc.md" >"$TMP/logs/art_refine_direct.out" 2>"$TMP/logs/art_refine_direct.err"; then
   [ ! -e "$TMP/proj/.agent_reports/documents/minor/_internal/versions" ] \
     && ok "direct minor refine remains snapshot-free" \
     || bad "direct minor refine unexpectedly created a snapshot"
@@ -283,7 +289,7 @@ else
 fi
 mkdir -p "$TMP/proj/.agent_reports/plans/cycle/documents/fake"
 if AGENT_ROUTE_FILE="$route_refine_direct" AGENT_ROUTE_ID="$route_refine_direct_id" AGENT_ROUTE_NODE=inline \
-  "$ART" --file "$TMP/proj/.agent_reports/plans/cycle/documents/fake/doc.md" >/tmp/art_refine_nested.out 2>/tmp/art_refine_nested.err; then
+  "$ART" --file "$TMP/proj/.agent_reports/plans/cycle/documents/fake/doc.md" >"$TMP/logs/art_refine_nested.out" 2>"$TMP/logs/art_refine_nested.err"; then
   bad "target-artifact must be anchored to a canonical top-level container"
 else
   [ "$?" -eq 2 ] && ok "target-artifact cannot match an owned-looking nested suffix" \
@@ -304,7 +310,7 @@ obs_count() { [ -f "$OBS_FILE" ] && wc -l < "$OBS_FILE" || echo 0; }
 if AGENT_ROUTE_FILE="$route_plan" AGENT_ROUTE_ID="$route_plan_id" AGENT_ROUTE_NODE=inline \
   "$ART" --command "cat <<EOF > $TMP/proj/.agent_reports/plans/2026-08-03_fixture/plan/heredoc.md
 x
-EOF" >/tmp/art_bash_scope_in.out 2>/tmp/art_bash_scope_in.err; then
+EOF" >"$TMP/logs/art_bash_scope_in.out" 2>"$TMP/logs/art_bash_scope_in.err"; then
   ok "regression (2): Bash heredoc write inside node scope matches Write tool (exit 0)"
 else
   bad "regression (2): Bash heredoc in-scope should match Write tool exit 0"
@@ -312,10 +318,10 @@ fi
 if AGENT_ROUTE_FILE="$route_plan" AGENT_ROUTE_ID="$route_plan_id" AGENT_ROUTE_NODE=inline \
   "$ART" --command "cat <<EOF > $TMP/proj/.agent_reports/test_logs/bash-run.log
 x
-EOF" >/tmp/art_bash_scope_out.out 2>/tmp/art_bash_scope_out.err; then
+EOF" >"$TMP/logs/art_bash_scope_out.out" 2>"$TMP/logs/art_bash_scope_out.err"; then
   bad "regression (2): Bash heredoc write outside node scope should be blocked like Write tool"
 else
-  [ "$?" -eq 2 ] && grep -q 'artifact-write-outside-node-scope' /tmp/art_bash_scope_out.err \
+  [ "$?" -eq 2 ] && grep -q 'artifact-write-outside-node-scope' "$TMP/logs/art_bash_scope_out.err" \
     && ok "regression (2): Bash heredoc write outside node scope matches Write tool (exit 2)" \
     || bad "regression (2): Bash heredoc out-of-scope failure missing structured reason"
 fi
@@ -327,7 +333,7 @@ route_analyze_id=$(fixture_route_id "$route_analyze")
 mkdir -p "$TMP/proj/.agent_reports/analysis_project/code/mega-audit/cg"
 if AGENT_ROUTE_FILE="$route_analyze" AGENT_ROUTE_ID="$route_analyze_id" AGENT_ROUTE_NODE=inline \
   "$ART" --command "echo x > $TMP/proj/.agent_reports/analysis_project/code/mega-audit/cg/00_overview.md" \
-  >/tmp/art_bash_mode.out 2>/tmp/art_bash_mode.err; then
+  >"$TMP/logs/art_bash_mode.out" 2>"$TMP/logs/art_bash_mode.err"; then
   ok "regression (3): analysis_project/<mode>/** admits a real analyze-mode path via Bash channel"
 else
   bad "regression (3): analysis_project/<mode>/** should admit a real analyze-mode path"
@@ -338,7 +344,7 @@ fi
 before_obs=$(obs_count)
 if AGENT_ROUTE_FILE="$route_plan" AGENT_ROUTE_ID="$route_plan_id" AGENT_ROUTE_NODE=inline \
   "$ART" --command "python3 -c \"open('$TMP/proj/.agent_reports/test_logs/pywrite.log','w')\"" \
-  >/tmp/art_tierb.out 2>/tmp/art_tierb.err; then
+  >"$TMP/logs/art_tierb.out" 2>"$TMP/logs/art_tierb.err"; then
   after_obs=$(obs_count)
   [ "$after_obs" -eq $((before_obs + 1)) ] \
     && ! grep -q "pywrite" "$OBS_FILE" \
@@ -351,7 +357,7 @@ fi
 # sh -c depth-1 recursion is still decidable and still enforces node scope.
 if AGENT_ROUTE_FILE="$route_plan" AGENT_ROUTE_ID="$route_plan_id" AGENT_ROUTE_NODE=inline \
   "$ART" --command "sh -c 'echo x > $TMP/proj/.agent_reports/test_logs/shc.log'" \
-  >/tmp/art_shc.out 2>/tmp/art_shc.err; then
+  >"$TMP/logs/art_shc.out" 2>"$TMP/logs/art_shc.err"; then
   bad "sh -c depth-1 recursion should still enforce node scope"
 else
   [ "$?" -eq 2 ] && ok "sh -c depth-1 recursion still resolves to a literal, enforced target" \
@@ -365,7 +371,7 @@ before_obs5=$(obs_count)
 bash_root_outside_case() {
   desc=$1; command=$2
   if AGENT_ROUTE_FILE="$route_plan" AGENT_ROUTE_ID="$route_plan_id" AGENT_ROUTE_NODE=inline \
-    "$ART" --command "$command" >/tmp/art_out5.out 2>/tmp/art_out5.err; then
+    "$ART" --command "$command" >"$TMP/logs/art_out5.out" 2>"$TMP/logs/art_out5.err"; then
     ok "regression (5): $desc -> exit 0 (root-outside, guard does not engage)"
   else
     bad "regression (5): $desc should exit 0 (root-outside)"
@@ -389,37 +395,38 @@ mkdir -p "$TMP/proj/.agent_reports/test_logs/other-scope" "$TMP/proj/.agent_repo
 printf 'x\n' > "$TMP/proj/.agent_reports/test_logs/other-scope/x.md"
 if AGENT_ROUTE_FILE="$route_plan" AGENT_ROUTE_ID="$route_plan_id" AGENT_ROUTE_NODE=inline \
   "$ART" --command "rm $TMP/proj/.agent_reports/test_logs/other-scope/x.md" \
-  >/tmp/art_out6f.out 2>/tmp/art_out6f.err; then
+  >"$TMP/logs/art_out6f.out" 2>"$TMP/logs/art_out6f.err"; then
   bad "regression (6f): rm inside canonical root but outside node scope should be blocked"
 else
-  [ "$?" -eq 2 ] && grep -q 'artifact-write-outside-node-scope' /tmp/art_out6f.err \
+  [ "$?" -eq 2 ] && grep -q 'artifact-write-outside-node-scope' "$TMP/logs/art_out6f.err" \
     && ok "regression (6f): rm inside canonical root, outside node scope -> exit 2" \
     || bad "regression (6f): missing structured reason"
 fi
 if AGENT_ROUTE_FILE="$route_plan" AGENT_ROUTE_ID="$route_plan_id" AGENT_ROUTE_NODE=inline \
   "$ART" --command "echo x > $TMP/proj/.agent_reports/test_logs/other-scope/y.md" \
-  >/tmp/art_out6g.out 2>/tmp/art_out6g.err; then
+  >"$TMP/logs/art_out6g.out" 2>"$TMP/logs/art_out6g.err"; then
   bad "regression (6g): redirect inside canonical root but outside node scope should be blocked"
 else
-  [ "$?" -eq 2 ] && grep -q 'artifact-write-outside-node-scope' /tmp/art_out6g.err \
+  [ "$?" -eq 2 ] && grep -q 'artifact-write-outside-node-scope' "$TMP/logs/art_out6g.err" \
     && ok "regression (6g): redirect inside canonical root, outside node scope -> exit 2" \
     || bad "regression (6g): missing structured reason"
 fi
 if AGENT_ROUTE_FILE="$route_plan" AGENT_ROUTE_ID="$route_plan_id" AGENT_ROUTE_NODE=inline \
   "$ART" --command "echo x > $TMP/proj/.agent_reports/plans/2026-08-03_fixture/plan/own.md" \
-  >/tmp/art_out6h.out 2>/tmp/art_out6h.err; then
+  >"$TMP/logs/art_out6h.out" 2>"$TMP/logs/art_out6h.err"; then
   ok "regression (6h): redirect inside the caller's own node scope -> exit 0"
 else
   bad "regression (6h): redirect inside own node scope should pass"
 fi
 if AGENT_ROUTE_FILE="$route_plan" AGENT_ROUTE_ID="$route_plan_id" AGENT_ROUTE_NODE=inline \
   "$ART" --command "echo x > $TMP/proj/.agent_reports/plans/2026-08-03_fixture/plan/_internal/x.md" \
-  >/tmp/art_out6i.out 2>/tmp/art_out6i.err; then
+  >"$TMP/logs/art_out6i.out" 2>"$TMP/logs/art_out6i.err"; then
   ok "regression (6i): redirect into _internal/ stays exempt -> exit 0"
 else
   bad "regression (6i): _internal/ exemption should still hold on the Bash channel"
 fi
 
+export AGENT_HOME="$TMP/agent_home"
 echo "== source-only worktree artifact guard =="
 mkdir -p "$TMP/artrepo/.agent_reports/_internal" "$TMP/artrepo-wt"
 (
@@ -432,15 +439,15 @@ mkdir -p "$TMP/artrepo/.agent_reports/_internal" "$TMP/artrepo-wt"
   git commit -q -m init
   git worktree add -q -b artifact-topic "$TMP/artrepo-wt/topic"
 )
-if "$ART" --file "$TMP/artrepo-wt/topic/.agent_reports/_internal/probe.md" >/tmp/art_local.out 2>/tmp/art_local.err; then
+if "$ART" --file "$TMP/artrepo-wt/topic/.agent_reports/_internal/probe.md" >"$TMP/logs/art_local.out" 2>"$TMP/logs/art_local.err"; then
   bad "linked-worktree artifact write should fail"
 else
   [ "$?" -eq 2 ] \
-    && grep -q 'source-only' /tmp/art_local.err \
+    && grep -q 'source-only' "$TMP/logs/art_local.err" \
     && ok "linked-worktree artifact write exits 2" \
     || bad "linked-worktree artifact write wrong exit/message"
 fi
-if "$ART" --file "$TMP/artrepo/.agent_reports/_internal/probe.md" >/tmp/art_main.out 2>/tmp/art_main.err; then
+if "$ART" --file "$TMP/artrepo/.agent_reports/_internal/probe.md" >"$TMP/logs/art_main.out" 2>"$TMP/logs/art_main.err"; then
   ok "canonical artifact write passes"
 else
   bad "canonical artifact write should pass"
@@ -458,13 +465,13 @@ mkdir -p "$TMP/repo"
   git add f .gitignore
   git commit -q -m init
 )
-if "$GIT" --file "$TMP/repo/f" >/tmp/git.out 2>/tmp/git.err; then
+if "$GIT" --file "$TMP/repo/f" >"$TMP/logs/git.out" 2>"$TMP/logs/git.err"; then
   ok "clean repo passes"
 else
   bad "clean repo should pass"
 fi
 git -C "$TMP/repo" checkout --detach -q HEAD
-if "$GIT" --file "$TMP/repo/f" >/tmp/git.out 2>/tmp/git.err; then
+if "$GIT" --file "$TMP/repo/f" >"$TMP/logs/git.out" 2>"$TMP/logs/git.err"; then
   bad "detached repo should fail"
 else
   [ "$?" -eq 2 ] && ok "detached repo exits 2" || bad "detached repo wrong exit"
@@ -473,47 +480,47 @@ fi
 echo "== worktree path guard CLI =="
 # git repo for the guard (reuse "$TMP/repo"; a git toplevel is all the guard needs).
 # (a) 내장 EnterWorktree 전면 deny (repo 안 .claude/worktrees/ 오염).
-if "$WTG" --tool EnterWorktree --cwd "$TMP/repo" --session wtgsid >/tmp/wtg.out 2>/tmp/wtg.err; then
+if "$WTG" --tool EnterWorktree --cwd "$TMP/repo" --session wtgsid >"$TMP/logs/wtg.out" 2>"$TMP/logs/wtg.err"; then
   bad "EnterWorktree should be denied"
 else
-  [ "$?" -eq 2 ] && grep -q 'EnterWorktree' /tmp/wtg.err && ok "worktree guard denies builtin EnterWorktree (exit 2)" \
+  [ "$?" -eq 2 ] && grep -q 'EnterWorktree' "$TMP/logs/wtg.err" && ok "worktree guard denies builtin EnterWorktree (exit 2)" \
     || bad "worktree guard wrong exit/message on EnterWorktree"
 fi
 # (b) Bash `git worktree add` 대상이 <repo>-wt/ 밖 → deny.
-if "$WTG" --tool Bash --command 'git worktree add .claude/worktrees/foo -b foo' --cwd "$TMP/repo" --session wtgsid >/tmp/wtg.out 2>/tmp/wtg.err; then
+if "$WTG" --tool Bash --command 'git worktree add .claude/worktrees/foo -b foo' --cwd "$TMP/repo" --session wtgsid >"$TMP/logs/wtg.out" 2>"$TMP/logs/wtg.err"; then
   bad "git worktree add outside -wt/ should be denied"
 else
-  [ "$?" -eq 2 ] && grep -q -- '-wt/' /tmp/wtg.err && ok "worktree guard denies git worktree add outside -wt/ (exit 2)" \
+  [ "$?" -eq 2 ] && grep -q -- '-wt/' "$TMP/logs/wtg.err" && ok "worktree guard denies git worktree add outside -wt/ (exit 2)" \
     || bad "worktree guard wrong exit/message on non -wt/ worktree add"
 fi
 # 오차단 금지 ①: 정규 형제 경로 <repo>-wt/<slug> 의 git worktree add 는 절대 차단 금지 (분사 정상 흐름).
-if "$WTG" --tool Bash --command 'git worktree add /home/x/repo-wt/slug -b slug main' --cwd "$TMP/repo" --session wtgsid >/tmp/wtg.out 2>/tmp/wtg.err; then
+if "$WTG" --tool Bash --command 'git worktree add /home/x/repo-wt/slug -b slug main' --cwd "$TMP/repo" --session wtgsid >"$TMP/logs/wtg.out" 2>"$TMP/logs/wtg.err"; then
   ok "worktree guard passes regular <repo>-wt/<slug> add"
 else
   bad "worktree guard should never block a regular <repo>-wt/ add"
 fi
 # 오차단 금지 ②: 비-add 서브커맨드(remove/list/prune)는 무간섭.
-if "$WTG" --tool Bash --command 'git worktree remove /home/x/repo-wt/slug' --cwd "$TMP/repo" --session wtgsid >/tmp/wtg.out 2>/tmp/wtg.err \
-  && "$WTG" --tool Bash --command 'git worktree prune' --cwd "$TMP/repo" --session wtgsid >/tmp/wtg.out 2>/tmp/wtg.err \
-  && "$WTG" --tool Bash --command 'git worktree list' --cwd "$TMP/repo" --session wtgsid >/tmp/wtg.out 2>/tmp/wtg.err; then
+if "$WTG" --tool Bash --command 'git worktree remove /home/x/repo-wt/slug' --cwd "$TMP/repo" --session wtgsid >"$TMP/logs/wtg.out" 2>"$TMP/logs/wtg.err" \
+  && "$WTG" --tool Bash --command 'git worktree prune' --cwd "$TMP/repo" --session wtgsid >"$TMP/logs/wtg.out" 2>"$TMP/logs/wtg.err" \
+  && "$WTG" --tool Bash --command 'git worktree list' --cwd "$TMP/repo" --session wtgsid >"$TMP/logs/wtg.out" 2>"$TMP/logs/wtg.err"; then
   ok "worktree guard leaves non-add worktree subcommands alone"
 else
   bad "worktree guard should leave remove/prune/list alone"
 fi
 # 오차단 금지 ③: WORKTREE_GUARD_BYPASS=1 → 전면 우회.
-if WORKTREE_GUARD_BYPASS=1 "$WTG" --tool EnterWorktree --cwd "$TMP/repo" --session wtgbypass >/tmp/wtg.out 2>/tmp/wtg.err; then
+if WORKTREE_GUARD_BYPASS=1 "$WTG" --tool EnterWorktree --cwd "$TMP/repo" --session wtgbypass >"$TMP/logs/wtg.out" 2>"$TMP/logs/wtg.err"; then
   ok "worktree guard honors WORKTREE_GUARD_BYPASS=1"
 else
   bad "worktree guard should bypass under WORKTREE_GUARD_BYPASS=1"
 fi
 # 오차단 금지 ④: 비-git cwd → 무간섭 (fail-open).
-if "$WTG" --tool EnterWorktree --cwd "$TMP" --session wtgsid >/tmp/wtg.out 2>/tmp/wtg.err; then
+if "$WTG" --tool EnterWorktree --cwd "$TMP" --session wtgsid >"$TMP/logs/wtg.out" 2>"$TMP/logs/wtg.err"; then
   ok "worktree guard fails open outside a git repo"
 else
   bad "worktree guard should fail open outside a git repo"
 fi
 # 오차단 금지 ⑤: 무관한 Bash 명령 → 무간섭.
-if "$WTG" --tool Bash --command 'ls -la && git status' --cwd "$TMP/repo" --session wtgsid >/tmp/wtg.out 2>/tmp/wtg.err; then
+if "$WTG" --tool Bash --command 'ls -la && git status' --cwd "$TMP/repo" --session wtgsid >"$TMP/logs/wtg.out" 2>"$TMP/logs/wtg.err"; then
   ok "worktree guard leaves unrelated Bash commands alone"
 else
   bad "worktree guard should leave unrelated Bash commands alone"
@@ -521,37 +528,37 @@ fi
 
 echo "== codex preflight wrapper =="
 git -C "$TMP/repo" switch -q -c work
-if "$CODEX" write "$TMP/repo/f" testsid >/tmp/codex.out 2>/tmp/codex.err; then
+if "$CODEX" write "$TMP/repo/f" testsid >"$TMP/logs/codex.out" 2>"$TMP/logs/codex.err"; then
   ok "codex preflight passes clean write"
 else
   bad "codex preflight should pass clean write"
 fi
 # A3 fallback verb: `preflight worktree-path` reproduces the same CLI outcomes
 # already asserted against $WTG directly.
-if "$CODEX" worktree-path --tool Bash --command 'git worktree add .claude/worktrees/foo -b foo' --cwd "$TMP/repo" --session wtgsid >/tmp/codex_wtp.out 2>/tmp/codex_wtp.err; then
+if "$CODEX" worktree-path --tool Bash --command 'git worktree add .claude/worktrees/foo -b foo' --cwd "$TMP/repo" --session wtgsid >"$TMP/logs/codex_wtp.out" 2>"$TMP/logs/codex_wtp.err"; then
   bad "codex preflight worktree-path should deny non -wt/ worktree add"
 else
   [ "$?" -eq 2 ] && ok "codex preflight worktree-path fallback denies non -wt/ worktree add" \
     || bad "codex preflight worktree-path wrong exit on non -wt/ worktree add"
 fi
-if "$CODEX" worktree-path --tool Bash --command 'git worktree add /home/x/repo-wt/slug -b slug main' --cwd "$TMP/repo" --session wtgsid >/tmp/codex_wtp.out 2>/tmp/codex_wtp.err; then
+if "$CODEX" worktree-path --tool Bash --command 'git worktree add /home/x/repo-wt/slug -b slug main' --cwd "$TMP/repo" --session wtgsid >"$TMP/logs/codex_wtp.out" 2>"$TMP/logs/codex_wtp.err"; then
   ok "codex preflight worktree-path fallback passes canonical <repo>-wt/ add"
 else
   bad "codex preflight worktree-path fallback should pass canonical <repo>-wt/ add"
 fi
 mkdir -p "$TMP/runtime/projects/abc/memory"
-if "$MEM" --file "$TMP/runtime/projects/abc/memory/MEMORY.md" >/tmp/mem.out 2>/tmp/mem.err; then
+if "$MEM" --file "$TMP/runtime/projects/abc/memory/MEMORY.md" >"$TMP/logs/mem.out" 2>"$TMP/logs/mem.err"; then
   bad "builtin memory guard should fail memory file write"
 else
   [ "$?" -eq 2 ] && ok "builtin memory guard exits 2" || bad "builtin memory guard wrong exit"
 fi
-if "$CODEX" write "$TMP/runtime/projects/abc/memory/MEMORY.md" testsid >/tmp/codex.out 2>/tmp/codex.err; then
+if "$CODEX" write "$TMP/runtime/projects/abc/memory/MEMORY.md" testsid >"$TMP/logs/codex.out" 2>"$TMP/logs/codex.err"; then
   bad "codex preflight should block memory file write"
 else
   [ "$?" -eq 2 ] && ok "codex preflight blocks memory file write" || bad "codex preflight memory wrong exit"
 fi
-if AGENT_HOME="$ROOT" bash "$DESIGN" --file "$TMP/not-design.txt" >/tmp/design.out 2>/tmp/design.err \
-  && "$CODEX" design "$TMP/not-design.txt" >/tmp/design.out 2>/tmp/design.err; then
+if AGENT_HOME="$ROOT" bash "$DESIGN" --file "$TMP/not-design.txt" >"$TMP/logs/design.out" 2>"$TMP/logs/design.err" \
+  && "$CODEX" design "$TMP/not-design.txt" >"$TMP/logs/design.out" 2>"$TMP/logs/design.err"; then
   ok "design postwrite wrappers no-op on non-html"
 else
   bad "design postwrite wrappers should no-op on non-html"
@@ -564,27 +571,27 @@ printf 'project_name: demo\nmode: [research]\n' > "$SSNPROJ/.agent_reports/spec/
 printf '# Demo Spec\n- requirement: SD-31\n- schema_version=1\n- sample rate: 48 kHz\n- optimizer: Adam\n' > "$SSNPROJ/.agent_reports/spec/prd.md"
 printf 'schema_version=1\n' > "$SSNPROJ/train.py"
 # ① removed value still described in spec → nudge surfaces the stale spec line
-if AGENT_HOME="$ROOT" bash "$SSN" --file "$SSNPROJ/train.py" --old 'schema_version=1' --new 'schema_version=2' --cwd "$SSNPROJ" >/tmp/ssn.out 2>/tmp/ssn.err \
-  && grep -q 'spec/prd.md' /tmp/ssn.out && grep -q 'schema_version=1' /tmp/ssn.out; then
+if AGENT_HOME="$ROOT" bash "$SSN" --file "$SSNPROJ/train.py" --old 'schema_version=1' --new 'schema_version=2' --cwd "$SSNPROJ" >"$TMP/logs/ssn.out" 2>"$TMP/logs/ssn.err" \
+  && grep -q 'spec/prd.md' "$TMP/logs/ssn.out" && grep -q 'schema_version=1' "$TMP/logs/ssn.out"; then
   ok "spec sync nudge surfaces stale spec line for a removed value"
 else
   bad "spec sync nudge should surface the stale spec line"
 fi
-if AGENT_HOME="$ROOT" bash "$SSN" --file "$SSNPROJ/train.py" --old 'shape = «3» and rank = «1»' --new 'shape = «4» and rank = «2»' --cwd "$SSNPROJ" >/tmp/ssn7.out 2>/tmp/ssn7.err \
-  && [ ! -s /tmp/ssn7.out ]; then
+if AGENT_HOME="$ROOT" bash "$SSN" --file "$SSNPROJ/train.py" --old 'shape = «3» and rank = «1»' --new 'shape = «4» and rank = «2»' --cwd "$SSNPROJ" >"$TMP/logs/ssn7.out" 2>"$TMP/logs/ssn7.err" \
+  && [ ! -s "$TMP/logs/ssn7.out" ]; then
   ok "spec sync nudge ignores standalone numeric tokens"
 else
   bad "spec sync nudge should ignore standalone numeric tokens"
 fi
-if AGENT_HOME="$ROOT" bash "$SSN" --file "$SSNPROJ/train.py" --old 'SD-31 uses 48 kHz' --new 'SD-32 uses 44 kHz' --cwd "$SSNPROJ" >/tmp/ssn8.out 2>/tmp/ssn8.err \
-  && grep -q 'SD-31' /tmp/ssn8.out && grep -q '48 kHz' /tmp/ssn8.out; then
+if AGENT_HOME="$ROOT" bash "$SSN" --file "$SSNPROJ/train.py" --old 'SD-31 uses 48 kHz' --new 'SD-32 uses 44 kHz' --cwd "$SSNPROJ" >"$TMP/logs/ssn8.out" 2>"$TMP/logs/ssn8.err" \
+  && grep -q 'SD-31' "$TMP/logs/ssn8.out" && grep -q '48 kHz' "$TMP/logs/ssn8.out"; then
   ok "spec sync nudge retains requirement and unit identifiers"
 else
   bad "spec sync nudge should retain requirement and unit identifiers"
 fi
 # ② removed token absent from spec → silent no-op (empty stdout)
-if AGENT_HOME="$ROOT" bash "$SSN" --file "$SSNPROJ/train.py" --old 'zqx_unique_token' --new 'other' --cwd "$SSNPROJ" >/tmp/ssn2.out 2>/tmp/ssn2.err \
-  && [ ! -s /tmp/ssn2.out ]; then
+if AGENT_HOME="$ROOT" bash "$SSN" --file "$SSNPROJ/train.py" --old 'zqx_unique_token' --new 'other' --cwd "$SSNPROJ" >"$TMP/logs/ssn2.out" 2>"$TMP/logs/ssn2.err" \
+  && [ ! -s "$TMP/logs/ssn2.out" ]; then
   ok "spec sync nudge no-ops when the removed token is absent from spec"
 else
   bad "spec sync nudge should no-op when the removed token is absent from spec"
@@ -593,53 +600,53 @@ fi
 SSNNOSPEC="$TMP/ssn_nospec"
 mkdir -p "$SSNNOSPEC"
 printf 'x = 30\n' > "$SSNNOSPEC/a.py"
-if AGENT_HOME="$ROOT" bash "$SSN" --file "$SSNNOSPEC/a.py" --old 'x = 30' --new 'x = 50' --cwd "$SSNNOSPEC" >/tmp/ssn3.out 2>/tmp/ssn3.err \
-  && [ ! -s /tmp/ssn3.out ]; then
+if AGENT_HOME="$ROOT" bash "$SSN" --file "$SSNNOSPEC/a.py" --old 'x = 30' --new 'x = 50' --cwd "$SSNNOSPEC" >"$TMP/logs/ssn3.out" 2>"$TMP/logs/ssn3.err" \
+  && [ ! -s "$TMP/logs/ssn3.out" ]; then
   ok "spec sync nudge no-ops outside a spec-backed project"
 else
   bad "spec sync nudge should no-op outside a spec-backed project"
 fi
 # ④ editing the spec file itself → not a target, silent no-op
-if AGENT_HOME="$ROOT" bash "$SSN" --file "$SSNPROJ/.agent_reports/spec/prd.md" --old '30' --new '50' --cwd "$SSNPROJ" >/tmp/ssn4.out 2>/tmp/ssn4.err \
-  && [ ! -s /tmp/ssn4.out ]; then
+if AGENT_HOME="$ROOT" bash "$SSN" --file "$SSNPROJ/.agent_reports/spec/prd.md" --old '30' --new '50' --cwd "$SSNPROJ" >"$TMP/logs/ssn4.out" 2>"$TMP/logs/ssn4.err" \
+  && [ ! -s "$TMP/logs/ssn4.out" ]; then
   ok "spec sync nudge no-ops when the edited file is the spec itself"
 else
   bad "spec sync nudge should no-op when the edited file is the spec itself"
 fi
 # ⑤ prose/문서 편집(.md 등)은 대상 아님 — 흔한 단어 reword 가 무관 spec 산문과 오탐 매칭되던 회귀
 printf 'see runtime bootstrap adapter notes\n' > "$SSNPROJ/NOTES.md"
-if AGENT_HOME="$ROOT" bash "$SSN" --file "$SSNPROJ/NOTES.md" --old 'runtime bootstrap adapter' --new 'see docs' --cwd "$SSNPROJ" >/tmp/ssn5.out 2>/tmp/ssn5.err \
-  && [ ! -s /tmp/ssn5.out ]; then
+if AGENT_HOME="$ROOT" bash "$SSN" --file "$SSNPROJ/NOTES.md" --old 'runtime bootstrap adapter' --new 'see docs' --cwd "$SSNPROJ" >"$TMP/logs/ssn5.out" 2>"$TMP/logs/ssn5.err" \
+  && [ ! -s "$TMP/logs/ssn5.out" ]; then
   ok "spec sync nudge no-ops on prose/doc edits (markdown reword)"
 else
   bad "spec sync nudge should no-op on prose/doc edits"
 fi
 # ⑥ code 편집이라도 흔한 소문자 산문 단어(code-like 아님)는 후보에서 제외 — spec 에 있어도 발동 X
 printf 'optimizer = Adam\n' > "$SSNPROJ/model.py"
-if AGENT_HOME="$ROOT" bash "$SSN" --file "$SSNPROJ/model.py" --old 'optimizer here' --new 'thing here' --cwd "$SSNPROJ" >/tmp/ssn6.out 2>/tmp/ssn6.err \
-  && [ ! -s /tmp/ssn6.out ]; then
+if AGENT_HOME="$ROOT" bash "$SSN" --file "$SSNPROJ/model.py" --old 'optimizer here' --new 'thing here' --cwd "$SSNPROJ" >"$TMP/logs/ssn6.out" 2>"$TMP/logs/ssn6.err" \
+  && [ ! -s "$TMP/logs/ssn6.out" ]; then
   ok "spec sync nudge ignores plain-lowercase prose words (non code-like) even inside code"
 else
   bad "spec sync nudge should ignore plain-lowercase prose words"
 fi
 
-if "$CODEX_PROJECTION" capability-info audit >/tmp/codex_projection.out 2>/tmp/codex_projection.err \
-  && grep -q '^capability=audit$' /tmp/codex_projection.out \
-  && grep -q '^adapter=codex$' /tmp/codex_projection.out; then
+if "$CODEX_PROJECTION" capability-info audit >"$TMP/logs/codex_projection.out" 2>"$TMP/logs/codex_projection.err" \
+  && grep -q '^capability=audit$' "$TMP/logs/codex_projection.out" \
+  && grep -q '^adapter=codex$' "$TMP/logs/codex_projection.out"; then
   ok "codex projection preflight resolves harness root"
 else
   bad "codex projection preflight should resolve harness root"
 fi
 mkdir -p "$TMP/codex_pointer_home/.codex"
 ln -s "$ROOT" "$TMP/codex_pointer_home/.codex/hearting"
-if env -u AGENT_HOME HOME="$TMP/codex_pointer_home" "$ROOT/adapters/codex/utilities/agent-home.sh" >/tmp/codex_agent_home.out 2>/tmp/codex_agent_home.err \
-  && grep -q "^$TMP/codex_pointer_home/.codex/hearting$" /tmp/codex_agent_home.out; then
+if env -u AGENT_HOME HOME="$TMP/codex_pointer_home" "$ROOT/adapters/codex/utilities/agent-home.sh" >"$TMP/logs/codex_agent_home.out" 2>"$TMP/logs/codex_agent_home.err" \
+  && grep -q "^$TMP/codex_pointer_home/.codex/hearting$" "$TMP/logs/codex_agent_home.out"; then
   ok "codex agent-home wrapper resolves runtime pointer"
 else
   bad "codex agent-home wrapper should resolve runtime pointer"
 fi
-if AGENT_HOME="$TMP/not-agent-home" HOME="$TMP/codex_pointer_home" "$ROOT/adapters/codex/utilities/agent-home.sh" >/tmp/codex_agent_home_invalid.out 2>/tmp/codex_agent_home_invalid.err \
-  && grep -q "^$TMP/codex_pointer_home/.codex/hearting$" /tmp/codex_agent_home_invalid.out; then
+if AGENT_HOME="$TMP/not-agent-home" HOME="$TMP/codex_pointer_home" "$ROOT/adapters/codex/utilities/agent-home.sh" >"$TMP/logs/codex_agent_home_invalid.out" 2>"$TMP/logs/codex_agent_home_invalid.err" \
+  && grep -q "^$TMP/codex_pointer_home/.codex/hearting$" "$TMP/logs/codex_agent_home_invalid.out"; then
   ok "codex agent-home wrapper ignores invalid AGENT_HOME"
 else
   bad "codex agent-home wrapper should ignore invalid AGENT_HOME"
@@ -647,15 +654,15 @@ fi
 mkdir -p "$TMP/codex_linked_home/hearting/core" "$TMP/codex_linked_home/agent_setting/core"
 printf 'core\n' > "$TMP/codex_linked_home/hearting/core/CORE.md"
 printf 'legacy\n' > "$TMP/codex_linked_home/agent_setting/core/CORE.md"
-if env -u AGENT_HOME HOME="$TMP/codex_linked_home" "$ROOT/adapters/codex/utilities/agent-home.sh" >/tmp/codex_agent_home_linked.out 2>/tmp/codex_agent_home_linked.err \
-  && grep -q "^$TMP/codex_linked_home/hearting$" /tmp/codex_agent_home_linked.out; then
+if env -u AGENT_HOME HOME="$TMP/codex_linked_home" "$ROOT/adapters/codex/utilities/agent-home.sh" >"$TMP/logs/codex_agent_home_linked.out" 2>"$TMP/logs/codex_agent_home_linked.err" \
+  && grep -q "^$TMP/codex_linked_home/hearting$" "$TMP/logs/codex_agent_home_linked.out"; then
   ok "codex agent-home wrapper prefers canonical hearting checkout"
 else
   bad "codex agent-home wrapper must prefer canonical hearting checkout"
 fi
 rm -rf "$TMP/codex_linked_home/hearting"
-if env -u AGENT_HOME HOME="$TMP/codex_linked_home" "$ROOT/adapters/codex/utilities/agent-home.sh" >/tmp/codex_agent_home_legacy.out 2>/tmp/codex_agent_home_legacy.err \
-  && grep -q "^$TMP/codex_linked_home/agent_setting$" /tmp/codex_agent_home_legacy.out; then
+if env -u AGENT_HOME HOME="$TMP/codex_linked_home" "$ROOT/adapters/codex/utilities/agent-home.sh" >"$TMP/logs/codex_agent_home_legacy.out" 2>"$TMP/logs/codex_agent_home_legacy.err" \
+  && grep -q "^$TMP/codex_linked_home/agent_setting$" "$TMP/logs/codex_agent_home_legacy.out"; then
   ok "codex agent-home wrapper retains legacy agent_setting fallback"
 else
   bad "codex agent-home wrapper must retain legacy agent_setting fallback"
@@ -677,8 +684,8 @@ printf '2026-07-24T00:00:00Z\topen\t%s\t%s\tcanonical-root-sentinel\tcapability=
 # `stable_state_root` reads HARNESS_STATE_ROOT -> XDG_STATE_HOME -> HOME, so
 # pinning HOME alone would leave an ambient XDG_STATE_HOME selecting a root
 # this fixture never seeded -- unset the whole chain above HOME.
-env -u AGENT_HOME -u XDG_STATE_HOME -u HARNESS_STATE_ROOT HOME="$TMP/codex_preflight_home" "$CODEX" liveness >/tmp/codex_preflight_root.out 2>/tmp/codex_preflight_root.err || true
-if grep -q 'canonical-root-sentinel' /tmp/codex_preflight_root.out; then
+env -u AGENT_HOME -u XDG_STATE_HOME -u HARNESS_STATE_ROOT HOME="$TMP/codex_preflight_home" "$CODEX" liveness >"$TMP/logs/codex_preflight_root.out" 2>"$TMP/logs/codex_preflight_root.err" || true
+if grep -q 'canonical-root-sentinel' "$TMP/logs/codex_preflight_root.out"; then
   ok "worktree-local codex preflight resolves the canonical installed harness root"
 else
   bad "worktree-local codex preflight must not use its source worktree as AGENT_HOME"
@@ -692,9 +699,9 @@ printf 'core\n' > "$TMP/codex_explicit_home/core/CORE.md"
 printf '2026-07-24T00:00:00Z\topen\t%s\t%s\texplicit-root-sentinel\tcapability=audit\n' "$TMP/repo" "$TMP/repo" \
   > "$TMP/codex_explicit_home/.dispatch/jobs.log"
 AGENT_HOME="$TMP/codex_explicit_home" AGENT_DISPATCH_JOBS="$TMP/codex_explicit_home/.dispatch/jobs.log" \
-  HOME="$TMP/codex_preflight_home" "$CODEX" liveness >/tmp/codex_preflight_explicit.out 2>/tmp/codex_preflight_explicit.err || true
-if grep -q 'explicit-root-sentinel' /tmp/codex_preflight_explicit.out \
-  && ! grep -q 'canonical-root-sentinel' /tmp/codex_preflight_explicit.out; then
+  HOME="$TMP/codex_preflight_home" "$CODEX" liveness >"$TMP/logs/codex_preflight_explicit.out" 2>"$TMP/logs/codex_preflight_explicit.err" || true
+if grep -q 'explicit-root-sentinel' "$TMP/logs/codex_preflight_explicit.out" \
+  && ! grep -q 'canonical-root-sentinel' "$TMP/logs/codex_preflight_explicit.out"; then
   ok "codex preflight preserves a valid explicit registry override"
 else
   bad "codex preflight should prefer a valid explicit registry override"
@@ -703,37 +710,37 @@ fi
 echo "== spec read gate CLI =="
 mkdir -p "$TMP/specproj/.agent_reports/spec"
 printf 'prd\n' > "$TMP/specproj/.agent_reports/spec/prd.md"
-if "$SPEC" --skill autopilot-code --cwd "$TMP/specproj" --session testsid >/tmp/spec.out 2>/tmp/spec.err; then
+if "$SPEC" --skill autopilot-code --cwd "$TMP/specproj" --session testsid >"$TMP/logs/spec.out" 2>"$TMP/logs/spec.err"; then
   bad "spec-backed capability without read marker should fail"
 else
   [ "$?" -eq 2 ] && ok "spec-backed capability without read marker exits 2" || bad "spec-backed capability wrong exit"
 fi
-if "$SPEC" --skill audit --cwd "$TMP/specproj" --session testsid >/tmp/spec.out 2>/tmp/spec.err; then
+if "$SPEC" --skill audit --cwd "$TMP/specproj" --session testsid >"$TMP/logs/spec.out" 2>"$TMP/logs/spec.err"; then
   ok "non spec-changing capability passes"
 else
   bad "non spec-changing capability should pass"
 fi
-if "$MARK" --file "$TMP/specproj/.agent_reports/spec/prd.md" --session testsid >/tmp/spec.out 2>/tmp/spec.err \
-  && "$SPEC" --skill autopilot-code --cwd "$TMP/specproj" --session testsid >/tmp/spec.out 2>/tmp/spec.err; then
+if "$MARK" --file "$TMP/specproj/.agent_reports/spec/prd.md" --session testsid >"$TMP/logs/spec.out" 2>"$TMP/logs/spec.err" \
+  && "$SPEC" --skill autopilot-code --cwd "$TMP/specproj" --session testsid >"$TMP/logs/spec.out" 2>"$TMP/logs/spec.err"; then
   ok "read marker allows spec-changing capability"
 else
   bad "read marker should allow spec-changing capability"
 fi
 sleep 1
 printf 'prd updated\n' > "$TMP/specproj/.agent_reports/spec/prd.md"
-if "$SPEC" --skill autopilot-code --cwd "$TMP/specproj" --session testsid >/tmp/spec.out 2>/tmp/spec.err; then
+if "$SPEC" --skill autopilot-code --cwd "$TMP/specproj" --session testsid >"$TMP/logs/spec.out" 2>"$TMP/logs/spec.err"; then
   bad "updated prd after marker should fail"
 else
   [ "$?" -eq 2 ] && ok "updated prd after marker exits 2" || bad "updated prd wrong exit"
 fi
-if "$CODEX" read "$TMP/specproj/.agent_reports/spec/prd.md" testsid >/tmp/codex.out 2>/tmp/codex.err \
-  && "$CODEX" capability autopilot-code "$TMP/specproj" testsid >/tmp/codex.out 2>/tmp/codex.err; then
+if "$CODEX" read "$TMP/specproj/.agent_reports/spec/prd.md" testsid >"$TMP/logs/codex.out" 2>"$TMP/logs/codex.err" \
+  && "$CODEX" capability autopilot-code "$TMP/specproj" testsid >"$TMP/logs/codex.out" 2>"$TMP/logs/codex.err"; then
   ok "codex read+capability wrapper passes spec gate"
 else
   bad "codex read+capability wrapper should pass spec gate"
 fi
-if (cd "$TMP/specproj" && "$CODEX" read .agent_reports/spec/prd.md relsid >/tmp/codex_relative_read.out 2>/tmp/codex_relative_read.err) \
-  && "$CODEX" capability autopilot-code "$TMP/specproj" relsid >/tmp/codex_relative_capability.out 2>/tmp/codex_relative_capability.err; then
+if (cd "$TMP/specproj" && "$CODEX" read .agent_reports/spec/prd.md relsid >"$TMP/logs/codex_relative_read.out" 2>"$TMP/logs/codex_relative_read.err") \
+  && "$CODEX" capability autopilot-code "$TMP/specproj" relsid >"$TMP/logs/codex_relative_capability.out" 2>"$TMP/logs/codex_relative_capability.err"; then
   ok "codex read wrapper resolves relative prd paths for spec gate"
 else
   bad "codex read wrapper should resolve relative prd paths for spec gate"
@@ -751,7 +758,7 @@ mkdir -p "$TMP/canonical-spec/.agent_reports/spec" "$TMP/canonical-spec-wt"
   git worktree add -q -b spec-topic "$TMP/canonical-spec-wt/topic"
 )
 "$MARK" --file "$TMP/canonical-spec-wt/topic/.agent_reports/spec/prd.md" --session shadowread
-if "$SPEC" --skill autopilot-code --cwd "$TMP/canonical-spec-wt/topic" --session shadowread >/tmp/spec_shadow.out 2>/tmp/spec_shadow.err; then
+if "$SPEC" --skill autopilot-code --cwd "$TMP/canonical-spec-wt/topic" --session shadowread >"$TMP/logs/spec_shadow.out" 2>"$TMP/logs/spec_shadow.err"; then
   bad "worker-local shadow spec read should not satisfy canonical gate"
 else
   [ "$?" -eq 2 ] \
@@ -788,21 +795,21 @@ if ls "$AGENT_HOME/.spec-grounding/msinternalsid__"* >/dev/null 2>&1; then
 else
   ok "_internal snapshot read writes no marker"
 fi
-if "$SPEC" --skill autopilot-code --cwd "$TMP/multispec" --session msinternalsid >/tmp/ms_internal.out 2>/tmp/ms_internal.err; then
+if "$SPEC" --skill autopilot-code --cwd "$TMP/multispec" --session msinternalsid >"$TMP/logs/ms_internal.out" 2>"$TMP/logs/ms_internal.err"; then
   bad "_internal snapshot read should not satisfy the gate"
 else
   [ "$?" -eq 2 ] && ok "_internal snapshot read leaves gate denied" || bad "_internal snapshot deny wrong exit"
 fi
 
 # c. no read at all: deny, enumerate every candidate path + the governing-scope phrase
-if "$SPEC" --skill autopilot-code --cwd "$TMP/multispec" --session msnoreadsid >/tmp/ms_noread.out 2>/tmp/ms_noread.err; then
+if "$SPEC" --skill autopilot-code --cwd "$TMP/multispec" --session msnoreadsid >"$TMP/logs/ms_noread.out" 2>"$TMP/logs/ms_noread.err"; then
   bad "unread multi-spec project should deny"
 else
   if [ "$?" -eq 2 ] \
-    && grep -qF "$TMP/multispec/.agent_reports/spec/prd.md" /tmp/ms_noread.err \
-    && grep -qF "$TMP/multispec/.agent_reports/spec/alpha/prd.md" /tmp/ms_noread.err \
-    && grep -qF "$TMP/multispec/.agent_reports/spec/beta/prd.md" /tmp/ms_noread.err \
-    && grep -qF "Read the one governing the declared work scope" /tmp/ms_noread.err; then
+    && grep -qF "$TMP/multispec/.agent_reports/spec/prd.md" "$TMP/logs/ms_noread.err" \
+    && grep -qF "$TMP/multispec/.agent_reports/spec/alpha/prd.md" "$TMP/logs/ms_noread.err" \
+    && grep -qF "$TMP/multispec/.agent_reports/spec/beta/prd.md" "$TMP/logs/ms_noread.err" \
+    && grep -qF "Read the one governing the declared work scope" "$TMP/logs/ms_noread.err"; then
     ok "unread multi-spec project lists every candidate and the governing-scope phrase"
   else
     bad "unread multi-spec project deny message incomplete"
@@ -818,7 +825,7 @@ else
 fi
 sleep 1
 printf 'alpha prd updated\n' > "$TMP/multispec/.agent_reports/spec/alpha/prd.md"
-if "$SPEC" --skill autopilot-code --cwd "$TMP/multispec" --session msdriftsid >/tmp/ms_drift.out 2>/tmp/ms_drift.err; then
+if "$SPEC" --skill autopilot-code --cwd "$TMP/multispec" --session msdriftsid >"$TMP/logs/ms_drift.out" 2>"$TMP/logs/ms_drift.err"; then
   bad "drifted sub-spec candidate should deny"
 else
   [ "$?" -eq 2 ] && ok "drifted sub-spec candidate denies" || bad "drifted sub-spec candidate wrong exit"
@@ -831,11 +838,11 @@ else
 fi
 
 # e. root-only deny message parity, fresh session id (no marker at all under this sid)
-if "$SPEC" --skill autopilot-code --cwd "$TMP/specproj" --session msparitysid >/tmp/ms_parity.out 2>/tmp/ms_parity.err; then
+if "$SPEC" --skill autopilot-code --cwd "$TMP/specproj" --session msparitysid >"$TMP/logs/ms_parity.out" 2>"$TMP/logs/ms_parity.err"; then
   bad "fresh-session root-only project should deny"
 else
   if [ "$?" -eq 2 ] \
-    && grep -qF "This cwd is spec-backed, but prd.md was not read in this session. Read $TMP/specproj/.agent_reports/spec/prd.md directly with the Read tool, then retry. A code comment or brief quotation does not satisfy the gate." /tmp/ms_parity.err; then
+    && grep -qF "This cwd is spec-backed, but prd.md was not read in this session. Read $TMP/specproj/.agent_reports/spec/prd.md directly with the Read tool, then retry. A code comment or brief quotation does not satisfy the gate." "$TMP/logs/ms_parity.err"; then
     ok "root-only single-candidate deny message matches byte-for-byte parity"
   else
     bad "root-only single-candidate deny message should match today's exact text"
@@ -876,31 +883,31 @@ mkdir -p "$TMP/coreproj/core" "$TMP/coreproj/adapters/codex"
   git add core/CORE.md adapters/codex/AGENTS.md
   git commit -q -m init
 )
-if "$CORE_GUARD" --file "$TMP/coreproj/adapters/codex/AGENTS.md" --session coregatesid >/tmp/core_gate.out 2>/tmp/core_gate.err; then
+if "$CORE_GUARD" --file "$TMP/coreproj/adapters/codex/AGENTS.md" --session coregatesid >"$TMP/logs/core_gate.out" 2>"$TMP/logs/core_gate.err"; then
   bad "adapter edit without core read marker should fail"
 else
   [ "$?" -eq 2 ] && ok "adapter edit without core read marker exits 2" || bad "adapter edit without core marker wrong exit"
 fi
-if "$CORE_GUARD" --file "$TMP/coreproj/adapters/codex/new/sub/AGENTS.md" --session coregatesid >/tmp/core_gate_newdir.out 2>/tmp/core_gate_newdir.err; then
+if "$CORE_GUARD" --file "$TMP/coreproj/adapters/codex/new/sub/AGENTS.md" --session coregatesid >"$TMP/logs/core_gate_newdir.out" 2>"$TMP/logs/core_gate_newdir.err"; then
   bad "new adapter subdir edit without core read marker should fail"
 else
   [ "$?" -eq 2 ] && ok "new adapter subdir edit without core marker exits 2" || bad "new adapter subdir core marker wrong exit"
 fi
-if "$CORE_MARK" --file "$TMP/coreproj/core/CORE.md" --session coregatesid >/tmp/core_gate.out 2>/tmp/core_gate.err \
-  && "$CORE_GUARD" --file "$TMP/coreproj/adapters/codex/AGENTS.md" --session coregatesid >/tmp/core_gate.out 2>/tmp/core_gate.err; then
+if "$CORE_MARK" --file "$TMP/coreproj/core/CORE.md" --session coregatesid >"$TMP/logs/core_gate.out" 2>"$TMP/logs/core_gate.err" \
+  && "$CORE_GUARD" --file "$TMP/coreproj/adapters/codex/AGENTS.md" --session coregatesid >"$TMP/logs/core_gate.out" 2>"$TMP/logs/core_gate.err"; then
   ok "core read marker allows adapter edit"
 else
   bad "core read marker should allow adapter edit"
 fi
 sleep 1
 printf 'core updated\n' > "$TMP/coreproj/core/CORE.md"
-if "$CORE_GUARD" --file "$TMP/coreproj/adapters/codex/AGENTS.md" --session coregatesid >/tmp/core_gate.out 2>/tmp/core_gate.err; then
+if "$CORE_GUARD" --file "$TMP/coreproj/adapters/codex/AGENTS.md" --session coregatesid >"$TMP/logs/core_gate.out" 2>"$TMP/logs/core_gate.err"; then
   bad "updated core after marker should fail adapter edit"
 else
   [ "$?" -eq 2 ] && ok "updated core after marker exits 2" || bad "updated core after marker wrong exit"
 fi
-if "$CODEX" read "$TMP/coreproj/core/CORE.md" codexcoregatesid >/tmp/codex_core_gate.out 2>/tmp/codex_core_gate.err \
-  && "$CODEX" write "$TMP/coreproj/adapters/codex/AGENTS.md" codexcoregatesid >/tmp/codex_core_gate.out 2>/tmp/codex_core_gate.err; then
+if "$CODEX" read "$TMP/coreproj/core/CORE.md" codexcoregatesid >"$TMP/logs/codex_core_gate.out" 2>"$TMP/logs/codex_core_gate.err" \
+  && "$CODEX" write "$TMP/coreproj/adapters/codex/AGENTS.md" codexcoregatesid >"$TMP/logs/codex_core_gate.out" 2>"$TMP/logs/codex_core_gate.err"; then
   ok "codex read+write wrapper passes core-first gate"
 else
   bad "codex read+write wrapper should pass core-first gate"
@@ -933,9 +940,9 @@ ln -s "$ROOT/adapters/claude/utilities" "$core_wrap_checkout/utilities"
 AGENT_HOME="$core_wrap_installed" timeout 10 sh \
   "$core_wrap_installed/hooks/core-first-guard.sh" \
   --file "$TMP/coreproj/adapters/codex/AGENTS.md" --session wrapsid \
-  >/tmp/core_wrap_installed.out 2>/tmp/core_wrap_installed.err
+  >"$TMP/logs/core_wrap_installed.out" 2>"$TMP/logs/core_wrap_installed.err"
 core_wrap_rc=$?
-if [ "$core_wrap_rc" -eq 2 ] && grep -q 'Core-first gate' /tmp/core_wrap_installed.err; then
+if [ "$core_wrap_rc" -eq 2 ] && grep -q 'Core-first gate' "$TMP/logs/core_wrap_installed.err"; then
   ok "adapter guard wrapper reaches a decision when the runtime projection resolves to itself"
 else
   bad "adapter guard wrapper should deny under an installed projection (rc=$core_wrap_rc)"
@@ -944,8 +951,8 @@ if printf '{"tool_name":"Write","tool_input":{"file_path":"%s"},"session_id":"wr
     "$TMP/coreproj/adapters/codex/AGENTS.md" \
   | AGENT_HOME="$core_wrap_installed" timeout 10 sh \
       "$core_wrap_installed/hooks/core-first-guard.sh" \
-      >/tmp/core_wrap_json.out 2>/tmp/core_wrap_json.err \
-  && grep -q '"permissionDecision":"deny"' /tmp/core_wrap_json.out; then
+      >"$TMP/logs/core_wrap_json.out" 2>"$TMP/logs/core_wrap_json.err" \
+  && grep -q '"permissionDecision":"deny"' "$TMP/logs/core_wrap_json.out"; then
   ok "adapter guard wrapper emits hook-protocol deny JSON under an installed projection"
 else
   bad "adapter guard wrapper should emit deny JSON under an installed projection"
@@ -953,12 +960,12 @@ fi
 if AGENT_HOME="$core_wrap_installed" timeout 10 sh \
      "$core_wrap_installed/hooks/core-read-marker.sh" \
      --file "$TMP/coreproj/core/CORE.md" --session wrapsid \
-     >/tmp/core_wrap_mark.out 2>/tmp/core_wrap_mark.err \
+     >"$TMP/logs/core_wrap_mark.out" 2>"$TMP/logs/core_wrap_mark.err" \
   && find "$core_wrap_installed/.core-grounding" -type f -name 'wrapsid__*' -print -quit | grep -q . \
   && AGENT_HOME="$core_wrap_installed" timeout 10 sh \
        "$core_wrap_installed/hooks/core-first-guard.sh" \
        --file "$TMP/coreproj/adapters/codex/AGENTS.md" --session wrapsid \
-       >/tmp/core_wrap_pass.out 2>/tmp/core_wrap_pass.err; then
+       >"$TMP/logs/core_wrap_pass.out" 2>"$TMP/logs/core_wrap_pass.err"; then
   ok "adapter marker wrapper writes the marker the paired guard reads under an installed projection"
 else
   bad "adapter wrapper pair should share one .core-grounding under an installed projection"
@@ -966,18 +973,18 @@ fi
 AGENT_HOME="$core_wrap_checkout" timeout 10 sh \
   "$ROOT/adapters/claude/hooks/core-first-guard.sh" \
   --file "$TMP/coreproj/adapters/codex/AGENTS.md" --session chkwrapsid \
-  >/tmp/core_wrap_chk.out 2>/tmp/core_wrap_chk.err
+  >"$TMP/logs/core_wrap_chk.out" 2>"$TMP/logs/core_wrap_chk.err"
 core_wrap_chk_rc=$?
 if [ "$core_wrap_chk_rc" -eq 2 ] \
   && AGENT_HOME="$core_wrap_checkout" timeout 10 sh \
        "$ROOT/adapters/claude/hooks/core-read-marker.sh" \
        --file "$TMP/coreproj/core/CORE.md" --session chkwrapsid \
-       >/tmp/core_wrap_chk.out 2>/tmp/core_wrap_chk.err \
+       >"$TMP/logs/core_wrap_chk.out" 2>"$TMP/logs/core_wrap_chk.err" \
   && find "$core_wrap_checkout/.core-grounding" -type f -name 'chkwrapsid__*' -print -quit | grep -q . \
   && AGENT_HOME="$core_wrap_checkout" timeout 10 sh \
        "$ROOT/adapters/claude/hooks/core-first-guard.sh" \
        --file "$TMP/coreproj/adapters/codex/AGENTS.md" --session chkwrapsid \
-       >/tmp/core_wrap_chk.out 2>/tmp/core_wrap_chk.err; then
+       >"$TMP/logs/core_wrap_chk.out" 2>"$TMP/logs/core_wrap_chk.err"; then
   ok "adapter wrappers keep delegating to the active root's portable guards in a checkout layout"
 else
   bad "checkout-layout delegation regressed (rc=$core_wrap_chk_rc)"
@@ -988,21 +995,21 @@ fi
 mkdir -p "$TMP/cxspec/.agent_reports/spec" "$TMP/cxspec/.agent_reports/research" "$TMP/cxspec/src"
 printf 'prd\n' > "$TMP/cxspec/.agent_reports/spec/prd.md"
 printf 'state: x\n' > "$TMP/cxspec/.agent_reports/spec/pipeline_state.yaml"
-if "$CODEX" write "$TMP/cxspec/.agent_reports/plans/c1/dev.md" cxwsid >/tmp/codex_wg.out 2>/tmp/codex_wg.err; then
+if "$CODEX" write "$TMP/cxspec/.agent_reports/plans/c1/dev.md" cxwsid >"$TMP/logs/codex_wg.out" 2>"$TMP/logs/codex_wg.err"; then
   bad "codex write guard should deny ungrounded spec-changing (plans) write"
 else
   [ "$?" -eq 2 ] && ok "codex write guard denies ungrounded spec-changing write" \
     || bad "codex write guard wrong exit on ungrounded spec write"
 fi
 "$CODEX" read "$TMP/cxspec/.agent_reports/spec/prd.md" cxwsid >/dev/null 2>&1
-if "$CODEX" write "$TMP/cxspec/.agent_reports/plans/c1/dev.md" cxwsid >/tmp/codex_wg.out 2>/tmp/codex_wg.err; then
+if "$CODEX" write "$TMP/cxspec/.agent_reports/plans/c1/dev.md" cxwsid >"$TMP/logs/codex_wg.out" 2>"$TMP/logs/codex_wg.err"; then
   bad "codex write guard should still require a route after prd read"
 else
-  [ "$?" -eq 2 ] && grep -q 'capability-artifact-route-required' /tmp/codex_wg.err \
+  [ "$?" -eq 2 ] && grep -q 'capability-artifact-route-required' "$TMP/logs/codex_wg.err" \
     && ok "codex write guard keeps route participation separate from prd grounding" \
     || bad "codex write guard returned the wrong post-grounding route failure"
 fi
-if "$CODEX" write "$TMP/cxspec/src/main.py" cxwsid2 >/tmp/codex_wg.out 2>/tmp/codex_wg.err; then
+if "$CODEX" write "$TMP/cxspec/src/main.py" cxwsid2 >"$TMP/logs/codex_wg.out" 2>"$TMP/logs/codex_wg.err"; then
   ok "codex write guard does not gate ordinary source files"
 else
   bad "codex write guard should not gate ordinary source files"
@@ -1010,14 +1017,14 @@ fi
 mkdir -p "$TMP/codex-route-home/core"
 printf 'fixture\n' > "$TMP/codex-route-home/core/CORE.md"
 AGENT_HOME="$TMP/codex-route-home" "$CODEX" read "$TMP/specproj/.agent_reports/spec/prd.md" testsid >/dev/null 2>&1
-if AGENT_HOME="$TMP/codex-route-home" "$CODEX" route autopilot-code "$TMP/specproj" testsid debug direct >/tmp/codex_route.out 2>/tmp/codex_route.err \
-  && grep -q '^runtime_surface=adapter-owned-harness-status$' /tmp/codex_route.out \
-  && grep -q '^git_dirty_tracked=' /tmp/codex_route.out \
-  && grep -q '^headless_open_jobs=' /tmp/codex_route.out \
-  && grep -q '^runtime_surface=codex-userprompt-hook-signal$' /tmp/codex_route.out \
-  && grep -q '^capability=autopilot-code$' /tmp/codex_route.out \
-  && grep -q '^compat_reference=not-projected$' /tmp/codex_route.out \
-  && grep -q '^pipeline_contract=code-plan>code-execute>code-test>code-report$' /tmp/codex_route.out \
+if AGENT_HOME="$TMP/codex-route-home" "$CODEX" route autopilot-code "$TMP/specproj" testsid debug direct >"$TMP/logs/codex_route.out" 2>"$TMP/logs/codex_route.err" \
+  && grep -q '^runtime_surface=adapter-owned-harness-status$' "$TMP/logs/codex_route.out" \
+  && grep -q '^git_dirty_tracked=' "$TMP/logs/codex_route.out" \
+  && grep -q '^headless_open_jobs=' "$TMP/logs/codex_route.out" \
+  && grep -q '^runtime_surface=codex-userprompt-hook-signal$' "$TMP/logs/codex_route.out" \
+  && grep -q '^capability=autopilot-code$' "$TMP/logs/codex_route.out" \
+  && grep -q '^compat_reference=not-projected$' "$TMP/logs/codex_route.out" \
+  && grep -q '^pipeline_contract=code-plan>code-execute>code-test>code-report$' "$TMP/logs/codex_route.out" \
   && grep -q '^capability=autopilot-code$' "$TMP/codex-route-home/.capability-grounding/testsid" \
   && grep -q '^mode=debug$' "$TMP/codex-route-home/.capability-grounding/testsid" \
   && grep -q '^intensity=direct$' "$TMP/codex-route-home/.capability-grounding/testsid"; then
@@ -1027,19 +1034,19 @@ else
 fi
 AGENT_HOME="$TMP/codex-route-home" "$CODEX" read "$TMP/specproj/.agent_reports/spec/prd.md" worker-testsid >/dev/null 2>&1
 if AGENT_HOME="$TMP/codex-route-home" AGENT_SESSION_ROLE=worker \
-  "$CODEX" route autopilot-code "$TMP/specproj" worker-testsid debug direct >/tmp/codex_worker_route.out 2>/tmp/codex_worker_route.err \
+  "$CODEX" route autopilot-code "$TMP/specproj" worker-testsid debug direct >"$TMP/logs/codex_worker_route.out" 2>"$TMP/logs/codex_worker_route.err" \
   && [ ! -e "$TMP/codex-route-home/.capability-grounding/worker-testsid" ]; then
   ok "codex worker route does not create inline main capability grounding"
 else
   bad "codex worker route should not create inline main capability grounding"
 fi
-if "$CODEX" capability nope-capability "$TMP/specproj" testsid >/tmp/codex_bad_capability_gate.out 2>/tmp/codex_bad_capability_gate.err; then
+if "$CODEX" capability nope-capability "$TMP/specproj" testsid >"$TMP/logs/codex_bad_capability_gate.out" 2>"$TMP/logs/codex_bad_capability_gate.err"; then
   bad "codex capability wrapper should reject unknown capabilities"
 else
   rc=$?
   if [ "$rc" -eq 64 ] \
-    && grep -q '^check=failed$' /tmp/codex_bad_capability_gate.out \
-    && grep -q '^reason=unknown-capability$' /tmp/codex_bad_capability_gate.out; then
+    && grep -q '^check=failed$' "$TMP/logs/codex_bad_capability_gate.out" \
+    && grep -q '^reason=unknown-capability$' "$TMP/logs/codex_bad_capability_gate.out"; then
     ok "codex capability wrapper rejects unknown capabilities"
   else
     bad "codex capability wrapper unknown capability output wrong"
@@ -1049,45 +1056,45 @@ fi
 echo "== workflow lifecycle CLI =="
 mkdir -p "$TMP/flowproj/.agent_reports"
 mkdir -p "$TMP/codex-artifact/.agent_reports/spec"
-if "$CODEX" write "$TMP/codex-artifact/.agent_reports/spec/prd.md" testsid >/tmp/codex-artifact.out 2>/tmp/codex-artifact.err; then
+if "$CODEX" write "$TMP/codex-artifact/.agent_reports/spec/prd.md" testsid >"$TMP/logs/codex-artifact.out" 2>"$TMP/logs/codex-artifact.err"; then
   bad "codex write wrapper should require a verified capability route for spec output"
 else
-  grep -q 'capability-artifact-route-required' /tmp/codex-artifact.err \
+  grep -q 'capability-artifact-route-required' "$TMP/logs/codex-artifact.err" \
     && ok "codex write wrapper requires a verified capability route for spec output" \
     || bad "codex write wrapper returned the wrong route failure for spec output"
 fi
-if "$CODEX" memory "$TMP/flowproj" >/tmp/mem_inject.out 2>/tmp/mem_inject.err; then
+if "$CODEX" memory "$TMP/flowproj" >"$TMP/logs/mem_inject.out" 2>"$TMP/logs/mem_inject.err"; then
   ok "codex memory wrapper exits cleanly"
 else
   bad "codex memory wrapper should exit cleanly"
 fi
-if MEM_STORE="$TMP/codex_launcher_store" "$ROOT/adapters/codex/tools/memory/mem.py" stats >/tmp/codex_mem_launcher.out 2>/tmp/codex_mem_launcher.err \
-  && grep -q '^# store stats$' /tmp/codex_mem_launcher.out; then
+if MEM_STORE="$TMP/codex_launcher_store" "$ROOT/adapters/codex/tools/memory/mem.py" stats >"$TMP/logs/codex_mem_launcher.out" 2>"$TMP/logs/codex_mem_launcher.err" \
+  && grep -q '^# store stats$' "$TMP/logs/codex_mem_launcher.out"; then
   ok "codex memory launcher ignores invalid non-harness AGENT_HOME"
 else
   bad "codex memory launcher should fall back from invalid AGENT_HOME"
 fi
 if MEM_PY="$ROOT/tools/memory/mem.py" MEM_STORE="$TMP/empty-recall-store" \
   "$RECALL" --prompt "일반 질문" --cwd "$TMP/flowproj" --session-id portable-zero-hit \
-    --turn-id turn-zero --format text >/tmp/recall.out 2>/tmp/recall.err \
-  && [ ! -s /tmp/recall.out ] \
+    --turn-id turn-zero --format text >"$TMP/logs/recall.out" 2>"$TMP/logs/recall.err" \
+  && [ ! -s "$TMP/logs/recall.out" ] \
   && find "$MEM_RECALL_RECEIPTS" -type f -name '*.json' -print -quit | grep -q .; then
   ok "candidate bridge keeps a valid zero-hit prompt silent and publishes opportunity"
 else
   bad "candidate bridge should keep zero-hit output silent while publishing opportunity"
 fi
-if "$CODEX" recall "전에 결정한 내용 뭐였지" "$TMP/flowproj" >/tmp/recall.out 2>/tmp/recall.err; then
+if "$CODEX" recall "전에 결정한 내용 뭐였지" "$TMP/flowproj" >"$TMP/logs/recall.out" 2>"$TMP/logs/recall.err"; then
   ok "codex recall wrapper exits cleanly"
 else
   bad "codex recall wrapper should exit cleanly"
 fi
-if bash "$BRIEF" --cwd "$TMP/flowproj" --format text >/tmp/brief.out 2>/tmp/brief.err \
-  && [ ! -s /tmp/brief.out ]; then
+if bash "$BRIEF" --cwd "$TMP/flowproj" --format text >"$TMP/logs/brief.out" 2>"$TMP/logs/brief.err" \
+  && [ ! -s "$TMP/logs/brief.out" ]; then
   ok "briefing wrapper no-ops outside agent desk"
 else
   bad "briefing wrapper should no-op outside agent desk"
 fi
-if "$CODEX" briefing "$TMP/flowproj" >/tmp/brief.out 2>/tmp/brief.err; then
+if "$CODEX" briefing "$TMP/flowproj" >"$TMP/logs/brief.out" 2>"$TMP/logs/brief.err"; then
   ok "codex briefing wrapper exits cleanly"
 else
   bad "codex briefing wrapper should exit cleanly"
@@ -1096,37 +1103,37 @@ mkdir -p "$TMP/notes/cards" "$TMP/notes/_layer2/notes" "$TMP/board/.cache" "$TMP
 printf 'card\n' > "$TMP/notes/cards/demo.md"
 printf 'note\n' > "$TMP/notes/_layer2/notes/demo.md"
 if AGENT_NOTES_ROOT="$TMP/notes" CAIRN_APP="$TMP/board" CAIRN_WT="$TMP/board-wt" \
-  "$CODEX" worklog "$TMP/flowproj" >/tmp/worklog.out 2>/tmp/worklog.err \
-  && grep -q "^agent-notes-root=$TMP/notes$" /tmp/worklog.out \
-  && grep -q "^worklog-board-app=$TMP/board$" /tmp/worklog.out \
-  && grep -q '^notes.cards.files=1$' /tmp/worklog.out \
-  && grep -q '^notes._layer2/notes.files=1$' /tmp/worklog.out \
-  && grep -q '^note=read-only inventory;' /tmp/worklog.out; then
+  "$CODEX" worklog "$TMP/flowproj" >"$TMP/logs/worklog.out" 2>"$TMP/logs/worklog.err" \
+  && grep -q "^agent-notes-root=$TMP/notes$" "$TMP/logs/worklog.out" \
+  && grep -q "^worklog-board-app=$TMP/board$" "$TMP/logs/worklog.out" \
+  && grep -q '^notes.cards.files=1$' "$TMP/logs/worklog.out" \
+  && grep -q '^notes._layer2/notes.files=1$' "$TMP/logs/worklog.out" \
+  && grep -q '^note=read-only inventory;' "$TMP/logs/worklog.out"; then
   ok "codex worklog wrapper reports read-only state"
 else
   bad "codex worklog wrapper should report read-only state"
 fi
 if env -u AGENT_NOTES_ROOT -u WORKLOG_NOTES_ROOT -u CAIRN_APP -u CAIRN_WT -u WORKLOG_BOARD_APP -u WORKLOG_BOARD_WT \
-  "$CODEX" worklog "$TMP/flowproj" >/tmp/worklog-default.out 2>/tmp/worklog-default.err \
-  && grep -q '^agent-notes-root=unset$' /tmp/worklog-default.out \
-  && grep -q '^worklog-board-app=unset$' /tmp/worklog-default.out \
-  && grep -q '^worklog-board-wt=unset$' /tmp/worklog-default.out \
-  && ! grep -q '/.claude/worklog-board' /tmp/worklog-default.out; then
+  "$CODEX" worklog "$TMP/flowproj" >"$TMP/logs/worklog-default.out" 2>"$TMP/logs/worklog-default.err" \
+  && grep -q '^agent-notes-root=unset$' "$TMP/logs/worklog-default.out" \
+  && grep -q '^worklog-board-app=unset$' "$TMP/logs/worklog-default.out" \
+  && grep -q '^worklog-board-wt=unset$' "$TMP/logs/worklog-default.out" \
+  && ! grep -q '/.claude/worklog-board' "$TMP/logs/worklog-default.out"; then
   ok "codex worklog wrapper has no Claude runtime defaults"
 else
   bad "codex worklog wrapper should not default to Claude runtime paths"
 fi
 printf 'T\topen\t/r\t/r-wt/a\tjob-a\tcap\nT\tdone\t/r\t/r-wt/b\tjob-b\tcap\n' > "$TMP/status_jobs.log"
 if AGENT_NOTES_ROOT="$TMP/notes" CAIRN_APP="$TMP/board" CAIRN_WT="$TMP/board-wt" AGENT_DISPATCH_JOBS="$TMP/status_jobs.log" \
-  "$CODEX" status "$TMP/flowproj" testsid >/tmp/codex_status.out 2>/tmp/codex_status.err \
-  && grep -q '^adapter=codex$' /tmp/codex_status.out \
-  && grep -q '^headless_open_jobs=1$' /tmp/codex_status.out \
-  && grep -q '^headless_open_slugs=job-a$' /tmp/codex_status.out \
-  && grep -q '^runtime_surface=adapter-owned-harness-status$' /tmp/codex_status.out \
-  && grep -q '^artifact_root_exists=1$' /tmp/codex_status.out \
-  && grep -q '^git_repo=0$' /tmp/codex_status.out \
-  && grep -q "^agent_notes_root=$TMP/notes$" /tmp/codex_status.out \
-  && grep -q '^note=read-only snapshot;' /tmp/codex_status.out; then
+  "$CODEX" status "$TMP/flowproj" testsid >"$TMP/logs/codex_status.out" 2>"$TMP/logs/codex_status.err" \
+  && grep -q '^adapter=codex$' "$TMP/logs/codex_status.out" \
+  && grep -q '^headless_open_jobs=1$' "$TMP/logs/codex_status.out" \
+  && grep -q '^headless_open_slugs=job-a$' "$TMP/logs/codex_status.out" \
+  && grep -q '^runtime_surface=adapter-owned-harness-status$' "$TMP/logs/codex_status.out" \
+  && grep -q '^artifact_root_exists=1$' "$TMP/logs/codex_status.out" \
+  && grep -q '^git_repo=0$' "$TMP/logs/codex_status.out" \
+  && grep -q "^agent_notes_root=$TMP/notes$" "$TMP/logs/codex_status.out" \
+  && grep -q '^note=read-only snapshot;' "$TMP/logs/codex_status.out"; then
   ok "codex status wrapper reports harness snapshot"
 else
   bad "codex status wrapper should report harness snapshot"
@@ -1139,10 +1146,10 @@ git -C "$TMP/donebranch" checkout -q -b main
 echo x > "$TMP/donebranch/f"; git -C "$TMP/donebranch" add f; git -C "$TMP/donebranch" commit -q -m x
 git -C "$TMP/donebranch" checkout -q -b topic
 git -C "$TMP/donebranch" branch -q --set-upstream-to=main topic 2>/dev/null
-if "$CODEX" status "$TMP/donebranch" testsid >/tmp/codex_done.out 2>/tmp/codex_done.err \
-  && grep -q '^git_upstream=main$' /tmp/codex_done.out \
-  && grep -q '^git_ahead=0$' /tmp/codex_done.out \
-  && grep -q '^git_branch_done=1$' /tmp/codex_done.out; then
+if "$CODEX" status "$TMP/donebranch" testsid >"$TMP/logs/codex_done.out" 2>"$TMP/logs/codex_done.err" \
+  && grep -q '^git_upstream=main$' "$TMP/logs/codex_done.out" \
+  && grep -q '^git_ahead=0$' "$TMP/logs/codex_done.out" \
+  && grep -q '^git_branch_done=1$' "$TMP/logs/codex_done.out"; then
   ok "codex status flags a merged dead branch (DONE-BRANCH risk)"
 else
   bad "codex status should flag a merged dead branch"
@@ -1158,71 +1165,71 @@ git -C "$TMP/dirtyrepo" commit -q -m clean
 git -C "$TMP/dirtyrepo" worktree add -q -b wtbranch "$TMP/dirtyrepo-wt/extra"
 echo changed > "$TMP/dirtyrepo/f"
 echo new > "$TMP/dirtyrepo/newfile"
-if "$CODEX" status "$TMP/dirtyrepo" testsid >/tmp/codex_dirty_status.out 2>/tmp/codex_dirty_status.err \
-  && grep -q '^git_dirty=1$' /tmp/codex_dirty_status.out \
-  && grep -q '^git_dirty_tracked=1$' /tmp/codex_dirty_status.out \
-  && grep -q '^git_untracked=1$' /tmp/codex_dirty_status.out \
-  && grep -q '^git_dirty_total=2$' /tmp/codex_dirty_status.out \
-  && grep -q '^git_worktree_count=2$' /tmp/codex_dirty_status.out \
-  && grep -q '^git_extra_worktrees=1$' /tmp/codex_dirty_status.out; then
+if "$CODEX" status "$TMP/dirtyrepo" testsid >"$TMP/logs/codex_dirty_status.out" 2>"$TMP/logs/codex_dirty_status.err" \
+  && grep -q '^git_dirty=1$' "$TMP/logs/codex_dirty_status.out" \
+  && grep -q '^git_dirty_tracked=1$' "$TMP/logs/codex_dirty_status.out" \
+  && grep -q '^git_untracked=1$' "$TMP/logs/codex_dirty_status.out" \
+  && grep -q '^git_dirty_total=2$' "$TMP/logs/codex_dirty_status.out" \
+  && grep -q '^git_worktree_count=2$' "$TMP/logs/codex_dirty_status.out" \
+  && grep -q '^git_extra_worktrees=1$' "$TMP/logs/codex_dirty_status.out"; then
   ok "codex status distinguishes tracked dirty, untracked files, and sibling worktrees"
 else
   bad "codex status should distinguish tracked dirty, untracked files, and sibling worktrees"
 fi
-if "$CODEX" prompt-signal "$TMP/flowproj" testsid >/tmp/codex_prompt_signal_tracked.out 2>/tmp/codex_prompt_signal_tracked.err \
-  && grep -q '^autopilot_route=autopilot-required-for-spec-and-nontrivial-work$' /tmp/codex_prompt_signal_tracked.out \
-  && grep -q '^routing_contract=core/WORKFLOW.md$' /tmp/codex_prompt_signal_tracked.out \
-  && grep -q '^routing_action=read-workflow-and-select-codex-skill$' /tmp/codex_prompt_signal_tracked.out \
-  && grep -q '^capability_entrypoints=codex-native-skills$' /tmp/codex_prompt_signal_tracked.out \
-  && grep -q '^hook_event=UserPromptSubmit$' /tmp/codex_prompt_signal_tracked.out \
-  && grep -q '^hook_scope=runtime-hook$' /tmp/codex_prompt_signal_tracked.out \
-  && grep -q '^hook_boundary=shell-read-write-targeted-detection-explicit-preflight-fallback$' /tmp/codex_prompt_signal_tracked.out; then
+if "$CODEX" prompt-signal "$TMP/flowproj" testsid >"$TMP/logs/codex_prompt_signal_tracked.out" 2>"$TMP/logs/codex_prompt_signal_tracked.err" \
+  && grep -q '^autopilot_route=autopilot-required-for-spec-and-nontrivial-work$' "$TMP/logs/codex_prompt_signal_tracked.out" \
+  && grep -q '^routing_contract=core/WORKFLOW.md$' "$TMP/logs/codex_prompt_signal_tracked.out" \
+  && grep -q '^routing_action=read-workflow-and-select-codex-skill$' "$TMP/logs/codex_prompt_signal_tracked.out" \
+  && grep -q '^capability_entrypoints=codex-native-skills$' "$TMP/logs/codex_prompt_signal_tracked.out" \
+  && grep -q '^hook_event=UserPromptSubmit$' "$TMP/logs/codex_prompt_signal_tracked.out" \
+  && grep -q '^hook_scope=runtime-hook$' "$TMP/logs/codex_prompt_signal_tracked.out" \
+  && grep -q '^hook_boundary=shell-read-write-targeted-detection-explicit-preflight-fallback$' "$TMP/logs/codex_prompt_signal_tracked.out"; then
   ok "codex prompt signal carries the autopilot routing contract"
 else
   bad "codex prompt signal should carry the autopilot routing contract"
 fi
-if "$CODEX" prompt-signal "$TMP/dirtyrepo" testsid >/tmp/codex_prompt_signal_dirty.out 2>/tmp/codex_prompt_signal_dirty.err \
-  && grep -q '^git_dirty_tracked=1$' /tmp/codex_prompt_signal_dirty.out \
-  && grep -q '^git_untracked=1$' /tmp/codex_prompt_signal_dirty.out \
-  && grep -q '^git_extra_worktrees=1$' /tmp/codex_prompt_signal_dirty.out \
-  && "$CODEX" prompt-signal "$TMP/donebranch" testsid >/tmp/codex_prompt_signal_done.out 2>/tmp/codex_prompt_signal_done.err \
-  && grep -q '^git_branch_done=1$' /tmp/codex_prompt_signal_done.out; then
+if "$CODEX" prompt-signal "$TMP/dirtyrepo" testsid >"$TMP/logs/codex_prompt_signal_dirty.out" 2>"$TMP/logs/codex_prompt_signal_dirty.err" \
+  && grep -q '^git_dirty_tracked=1$' "$TMP/logs/codex_prompt_signal_dirty.out" \
+  && grep -q '^git_untracked=1$' "$TMP/logs/codex_prompt_signal_dirty.out" \
+  && grep -q '^git_extra_worktrees=1$' "$TMP/logs/codex_prompt_signal_dirty.out" \
+  && "$CODEX" prompt-signal "$TMP/donebranch" testsid >"$TMP/logs/codex_prompt_signal_done.out" 2>"$TMP/logs/codex_prompt_signal_done.err" \
+  && grep -q '^git_branch_done=1$' "$TMP/logs/codex_prompt_signal_done.out"; then
   ok "codex prompt signal carries git dirty, worktree, and dead-branch risks"
 else
   bad "codex prompt signal should carry git dirty, worktree, and dead-branch risks"
 fi
-if "$CODEX" permissions >/tmp/codex_permissions.out 2>/tmp/codex_permissions.err \
-  && grep -q '^adapter=codex$' /tmp/codex_permissions.out \
-  && grep -q '^runtime_surface=codex-native-approval-sandbox$' /tmp/codex_permissions.out \
-  && grep -q '^permission_model=approval-policy+sandbox$' /tmp/codex_permissions.out \
-  && grep -q '^claude_allowed_tools=unsupported$' /tmp/codex_permissions.out \
-  && grep -q '^guard_contract=preflight-write-hooks-and-explicit-tool-contracts$' /tmp/codex_permissions.out \
-  && grep -q '^structured_write_hooks=Write,Edit,MultiEdit,apply_patch,functions.apply_patch$' /tmp/codex_permissions.out \
-  && grep -q '^targeted_shell_hooks=Bash,Shell,functions.exec_command$' /tmp/codex_permissions.out \
-  && grep -q '^shell_read_write_hooks=targeted-detection$' /tmp/codex_permissions.out; then
+if "$CODEX" permissions >"$TMP/logs/codex_permissions.out" 2>"$TMP/logs/codex_permissions.err" \
+  && grep -q '^adapter=codex$' "$TMP/logs/codex_permissions.out" \
+  && grep -q '^runtime_surface=codex-native-approval-sandbox$' "$TMP/logs/codex_permissions.out" \
+  && grep -q '^permission_model=approval-policy+sandbox$' "$TMP/logs/codex_permissions.out" \
+  && grep -q '^claude_allowed_tools=unsupported$' "$TMP/logs/codex_permissions.out" \
+  && grep -q '^guard_contract=preflight-write-hooks-and-explicit-tool-contracts$' "$TMP/logs/codex_permissions.out" \
+  && grep -q '^structured_write_hooks=Write,Edit,MultiEdit,apply_patch,functions.apply_patch$' "$TMP/logs/codex_permissions.out" \
+  && grep -q '^targeted_shell_hooks=Bash,Shell,functions.exec_command$' "$TMP/logs/codex_permissions.out" \
+  && grep -q '^shell_read_write_hooks=targeted-detection$' "$TMP/logs/codex_permissions.out"; then
   ok "codex permissions wrapper reports native approval/sandbox contract"
 else
   bad "codex permissions wrapper should report native approval/sandbox contract"
 fi
-if "$CODEX" headless >/tmp/codex_headless.out 2>/tmp/codex_headless.err \
-  && grep -q '^adapter=codex$' /tmp/codex_headless.out \
-  && grep -q '^runtime_surface=codex-exec-headless$' /tmp/codex_headless.out \
-  && grep -q '^tool_contract=headless-dispatch$' /tmp/codex_headless.out \
-  && grep -q '^strict_tool_contract_check=adapters/codex/bin/preflight.sh headless --check --require-hook-trust <worktree>$' /tmp/codex_headless.out \
-  && grep -q '^runtime_projection_requires=hearting,AGENTS.md,hooks.json,native-skills,native-agents,native-modes$' /tmp/codex_headless.out \
-  && grep -q '^runtime_projection_strict_requires=complete-codex-hook-trust$' /tmp/codex_headless.out \
-  && grep -q '^model_selection_policy=main-orchestrator-must-select-per-job$' /tmp/codex_headless.out \
-  && grep -q '^model_selection_surface=--model-profile <deep|balanced-deep|light|mini> \[--model-role <portable-role>\]|--model-role <portable-role>|--model <model> --reasoning <effort>|--inherit-model-settings$' /tmp/codex_headless.out \
-  && grep -q '^claude_headless=unsupported$' /tmp/codex_headless.out \
-  && grep -q '^liveness_surface=codex-session-jsonl-mtime$' /tmp/codex_headless.out \
-  && grep -q '^liveness_check=adapters/codex/bin/preflight.sh liveness \[jobs.log\]$' /tmp/codex_headless.out \
-  && grep -q '^dispatch_prompt_contract=portable-typed-worker-bootstrap$' /tmp/codex_headless.out \
-  && grep -q '^dispatch_input_validation=capability-info,capability-mode-catalog,optional-worker-mode-info,owner-mode-axis-consistency,qa-level,intensity-dispatch_depth-parent$' /tmp/codex_headless.out \
-  && grep -q '^worker_startup_signal=wrapper-validated-metadata-or-immutable-route$' /tmp/codex_headless.out \
-  && grep -q '^worker_startup_signal_contract=dispatch-wrapper-validates-before-materializing-prompt; worker rechecks only for safety$' /tmp/codex_headless.out \
-  && grep -q '^broker_lifecycle=retired-status-stop-only$' /tmp/codex_headless.out \
-  && grep -q '^launch_authority=conductor$' /tmp/codex_headless.out \
-  && grep -q '^constraints=main-or-owner-dispatched,max-dispatch-depth-2-for-standard-plus-owner,register-open-job,headless-owner-supervisor-or-managed-gateway-or-interactive-poll-fallback,explicit-capability-mode-qa-intensity-dispatch_depth-parent-parent_sid,transcript-liveness-required$' /tmp/codex_headless.out; then
+if "$CODEX" headless >"$TMP/logs/codex_headless.out" 2>"$TMP/logs/codex_headless.err" \
+  && grep -q '^adapter=codex$' "$TMP/logs/codex_headless.out" \
+  && grep -q '^runtime_surface=codex-exec-headless$' "$TMP/logs/codex_headless.out" \
+  && grep -q '^tool_contract=headless-dispatch$' "$TMP/logs/codex_headless.out" \
+  && grep -q '^strict_tool_contract_check=adapters/codex/bin/preflight.sh headless --check --require-hook-trust <worktree>$' "$TMP/logs/codex_headless.out" \
+  && grep -q '^runtime_projection_requires=hearting,AGENTS.md,hooks.json,native-skills,native-agents,native-modes$' "$TMP/logs/codex_headless.out" \
+  && grep -q '^runtime_projection_strict_requires=complete-codex-hook-trust$' "$TMP/logs/codex_headless.out" \
+  && grep -q '^model_selection_policy=main-orchestrator-must-select-per-job$' "$TMP/logs/codex_headless.out" \
+  && grep -q '^model_selection_surface=--model-profile <deep|balanced-deep|light|mini> \[--model-role <portable-role>\]|--model-role <portable-role>|--model <model> --reasoning <effort>|--inherit-model-settings$' "$TMP/logs/codex_headless.out" \
+  && grep -q '^claude_headless=unsupported$' "$TMP/logs/codex_headless.out" \
+  && grep -q '^liveness_surface=codex-session-jsonl-mtime$' "$TMP/logs/codex_headless.out" \
+  && grep -q '^liveness_check=adapters/codex/bin/preflight.sh liveness \[jobs.log\]$' "$TMP/logs/codex_headless.out" \
+  && grep -q '^dispatch_prompt_contract=portable-typed-worker-bootstrap$' "$TMP/logs/codex_headless.out" \
+  && grep -q '^dispatch_input_validation=capability-info,capability-mode-catalog,optional-worker-mode-info,owner-mode-axis-consistency,qa-level,intensity-dispatch_depth-parent$' "$TMP/logs/codex_headless.out" \
+  && grep -q '^worker_startup_signal=wrapper-validated-metadata-or-immutable-route$' "$TMP/logs/codex_headless.out" \
+  && grep -q '^worker_startup_signal_contract=dispatch-wrapper-validates-before-materializing-prompt; worker rechecks only for safety$' "$TMP/logs/codex_headless.out" \
+  && grep -q '^broker_lifecycle=retired-status-stop-only$' "$TMP/logs/codex_headless.out" \
+  && grep -q '^launch_authority=conductor$' "$TMP/logs/codex_headless.out" \
+  && grep -q '^constraints=main-or-owner-dispatched,max-dispatch-depth-2-for-standard-plus-owner,register-open-job,headless-owner-supervisor-or-managed-gateway-or-interactive-poll-fallback,explicit-capability-mode-qa-intensity-dispatch_depth-parent-parent_sid,transcript-liveness-required$' "$TMP/logs/codex_headless.out"; then
   ok "codex headless wrapper reports dispatch contract"
 else
   bad "codex headless wrapper should report dispatch contract"
@@ -1235,30 +1242,30 @@ if grep -q 'adapters/codex/bin/preflight.sh liveness \[jobs.log\]' "$ROOT/core/O
 else
   bad "portable operations should route headless liveness through adapter wrappers"
 fi
-if "$CODEX" headless --check "$TMP/missing-worktree" >/tmp/codex_headless_missing.out 2>/tmp/codex_headless_missing.err; then
+if "$CODEX" headless --check "$TMP/missing-worktree" >"$TMP/logs/codex_headless_missing.out" 2>"$TMP/logs/codex_headless_missing.err"; then
   bad "codex headless wrapper should fail missing worktree"
 else
   rc=$?
   if [ "$rc" -eq 66 ] \
-    && grep -q '^reason=worktree-not-found$' /tmp/codex_headless_missing.out; then
+    && grep -q '^reason=worktree-not-found$' "$TMP/logs/codex_headless_missing.out"; then
     ok "codex headless wrapper reports missing worktree"
   else
     bad "codex headless wrapper should report missing worktree"
   fi
 fi
-if AGENT_HOME="$ROOT" CODEX_HOME="$TMP/codex_headless_home" "$ROOT/adapters/codex/bin/install-runtime-projection.sh" >/tmp/codex_headless_install.out 2>/tmp/codex_headless_install.err \
-  && AGENT_HOME="$ROOT" CODEX_HOME="$TMP/codex_headless_home" CODEX_DISPATCH_SANDBOX_FORCE=danger-full-access "$CODEX" headless --check "$TMP/repo" >/tmp/codex_headless_check.out 2>/tmp/codex_headless_check.err \
-  && grep -q '^runtime_projection=ok$' /tmp/codex_headless_check.out \
-  && grep -q '^check=hook-trust:skipped reason=authoritative-current-hash-check-not-requested' /tmp/codex_headless_check.out \
-  && grep -q '^check=ok$' /tmp/codex_headless_check.out; then
+if AGENT_HOME="$ROOT" CODEX_HOME="$TMP/codex_headless_home" "$ROOT/adapters/codex/bin/install-runtime-projection.sh" >"$TMP/logs/codex_headless_install.out" 2>"$TMP/logs/codex_headless_install.err" \
+  && AGENT_HOME="$ROOT" CODEX_HOME="$TMP/codex_headless_home" CODEX_DISPATCH_SANDBOX_FORCE=danger-full-access "$CODEX" headless --check "$TMP/repo" >"$TMP/logs/codex_headless_check.out" 2>"$TMP/logs/codex_headless_check.err" \
+  && grep -q '^runtime_projection=ok$' "$TMP/logs/codex_headless_check.out" \
+  && grep -q '^check=hook-trust:skipped reason=authoritative-current-hash-check-not-requested' "$TMP/logs/codex_headless_check.out" \
+  && grep -q '^check=ok$' "$TMP/logs/codex_headless_check.out"; then
   ok "codex headless check validates runtime projection"
 else
   bad "codex headless check should validate runtime projection"
 fi
-if AGENT_HOME="$ROOT" CODEX_HOME="$TMP/codex_headless_home" CODEX_DISPATCH_SANDBOX_FORCE=danger-full-access "$CODEX" headless --check --require-hook-trust "$TMP/repo" >/tmp/codex_headless_strict.out 2>/tmp/codex_headless_strict.err; then
+if AGENT_HOME="$ROOT" CODEX_HOME="$TMP/codex_headless_home" CODEX_DISPATCH_SANDBOX_FORCE=danger-full-access "$CODEX" headless --check --require-hook-trust "$TMP/repo" >"$TMP/logs/codex_headless_strict.out" 2>"$TMP/logs/codex_headless_strict.err"; then
   bad "codex headless strict check should fail when hook trust is incomplete"
 else
-  grep -q '^check=hook-trust:review-needed' /tmp/codex_headless_strict.out && ok "codex headless strict check requires complete hook trust" || bad "codex headless strict check missing trust output wrong"
+  grep -q '^check=hook-trust:review-needed' "$TMP/logs/codex_headless_strict.out" && ok "codex headless strict check requires complete hook trust" || bad "codex headless strict check missing trust output wrong"
 fi
 # SD-48 sandbox-init probe (installer-probes-dispatch-fixes plan item 3): a
 # stub `bwrap` proves the probe's own outcome host-independently, separate
@@ -1272,14 +1279,14 @@ echo "stub bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted" >&2
 exit 1
 EOF
 chmod +x "$codex_sandbox_probe_bin/bwrap"
-if PATH="$codex_sandbox_probe_bin:$PATH" AGENT_HOME="$ROOT" CODEX_HOME="$TMP/codex_headless_home" "$CODEX" headless --check "$TMP/repo" >/tmp/codex_sandbox_probe_fail.out 2>/tmp/codex_sandbox_probe_fail.err; then
+if PATH="$codex_sandbox_probe_bin:$PATH" AGENT_HOME="$ROOT" CODEX_HOME="$TMP/codex_headless_home" "$CODEX" headless --check "$TMP/repo" >"$TMP/logs/codex_sandbox_probe_fail.out" 2>"$TMP/logs/codex_sandbox_probe_fail.err"; then
   bad "codex headless check refuses a host whose sandbox userns is unavailable"
 else
   rc=$?
   if [ "$rc" -eq 69 ] \
-    && grep -q '^reason=sandbox-userns-unavailable$' /tmp/codex_sandbox_probe_fail.out \
-    && grep -q '^failure_scope=runtime-global$' /tmp/codex_sandbox_probe_fail.out \
-    && grep -q '^retry_on_isolated_worktree=0$' /tmp/codex_sandbox_probe_fail.out; then
+    && grep -q '^reason=sandbox-userns-unavailable$' "$TMP/logs/codex_sandbox_probe_fail.out" \
+    && grep -q '^failure_scope=runtime-global$' "$TMP/logs/codex_sandbox_probe_fail.out" \
+    && grep -q '^retry_on_isolated_worktree=0$' "$TMP/logs/codex_sandbox_probe_fail.out"; then
     ok "codex headless check refuses a host whose sandbox userns is unavailable"
   else
     bad "codex headless check refuses a host whose sandbox userns is unavailable"
@@ -1290,84 +1297,84 @@ cat >"$codex_sandbox_probe_bin/bwrap" <<'EOF'
 exit 0
 EOF
 chmod +x "$codex_sandbox_probe_bin/bwrap"
-if PATH="$codex_sandbox_probe_bin:$PATH" AGENT_HOME="$ROOT" CODEX_HOME="$TMP/codex_headless_home" "$CODEX" headless --check "$TMP/repo" >/tmp/codex_sandbox_probe_pass.out 2>/tmp/codex_sandbox_probe_pass.err \
-  && grep -q '^check=ok$' /tmp/codex_sandbox_probe_pass.out; then
+if PATH="$codex_sandbox_probe_bin:$PATH" AGENT_HOME="$ROOT" CODEX_HOME="$TMP/codex_headless_home" "$CODEX" headless --check "$TMP/repo" >"$TMP/logs/codex_sandbox_probe_pass.out" 2>"$TMP/logs/codex_sandbox_probe_pass.err" \
+  && grep -q '^check=ok$' "$TMP/logs/codex_sandbox_probe_pass.out"; then
   ok "codex headless check still passes when the sandbox probe succeeds"
 else
   bad "codex headless check still passes when the sandbox probe succeeds"
 fi
 FIXTURE_INVALID_AGENT_HOME="$AGENT_HOME"
 export AGENT_HOME="$ROOT"
-if "$CODEX" dispatch --dry-run --worktree "$TMP/repo" --slug codex-missing-model --capability autopilot-code --mode dev --qa standard --prompt-text "do work" --jobs "$TMP/codex-missing-model.log" >/tmp/codex_missing_model.out 2>/tmp/codex_missing_model.err; then
+if "$CODEX" dispatch --dry-run --worktree "$TMP/repo" --slug codex-missing-model --capability autopilot-code --mode dev --qa standard --prompt-text "do work" --jobs "$TMP/codex-missing-model.log" >"$TMP/logs/codex_missing_model.out" 2>"$TMP/logs/codex_missing_model.err"; then
   bad "codex dispatch wrapper should require main-selected model settings"
 else
   rc=$?
   if [ "$rc" -eq 64 ] \
-    && grep -q '^reason=missing-dispatch-model-selection$' /tmp/codex_missing_model.out \
+    && grep -q '^reason=missing-dispatch-model-selection$' "$TMP/logs/codex_missing_model.out" \
     && [ ! -e "$TMP/codex-missing-model.log" ]; then
     ok "codex dispatch wrapper requires main-selected model settings"
   else
     bad "codex dispatch wrapper should fail cleanly without model selection"
   fi
 fi
-if "$CODEX" dispatch --dry-run --worktree "$TMP/repo" --slug codex-dispatch --capability autopilot-code --mode dev --qa standard --prompt-text "do work" --model gpt-test --reasoning low --jobs "$TMP/codex-dispatch.log" >/tmp/codex_dispatch.out 2>/tmp/codex_dispatch.err \
-  && grep -q '^adapter=codex$' /tmp/codex_dispatch.out \
-  && grep -q '^status=dry-run$' /tmp/codex_dispatch.out \
-  && grep -q '^registered=0$' /tmp/codex_dispatch.out \
-  && grep -q '^started=0$' /tmp/codex_dispatch.out \
-  && grep -q '^model_source=explicit$' /tmp/codex_dispatch.out \
-  && grep -q '^model_role=-$' /tmp/codex_dispatch.out \
-  && grep -q '^model=gpt-test$' /tmp/codex_dispatch.out \
-  && grep -q '^reasoning=low$' /tmp/codex_dispatch.out \
-  && grep -q '^approval=never$' /tmp/codex_dispatch.out \
-  && grep -q '^completion_delivery=app-server-supervised$' /tmp/codex_dispatch.out \
-  && grep -q '^command=.*/codex-app-server-supervisor.py ' /tmp/codex_dispatch.out \
-  && grep -q -- '--model gpt-test' /tmp/codex_dispatch.out \
-  && grep -q -- '--reasoning low' /tmp/codex_dispatch.out \
-  && grep -q -- '--approval never' /tmp/codex_dispatch.out \
-  && ! grep -q -- '--ask-for-approval' /tmp/codex_dispatch.out \
+if "$CODEX" dispatch --dry-run --worktree "$TMP/repo" --slug codex-dispatch --capability autopilot-code --mode dev --qa standard --prompt-text "do work" --model gpt-test --reasoning low --jobs "$TMP/codex-dispatch.log" >"$TMP/logs/codex_dispatch.out" 2>"$TMP/logs/codex_dispatch.err" \
+  && grep -q '^adapter=codex$' "$TMP/logs/codex_dispatch.out" \
+  && grep -q '^status=dry-run$' "$TMP/logs/codex_dispatch.out" \
+  && grep -q '^registered=0$' "$TMP/logs/codex_dispatch.out" \
+  && grep -q '^started=0$' "$TMP/logs/codex_dispatch.out" \
+  && grep -q '^model_source=explicit$' "$TMP/logs/codex_dispatch.out" \
+  && grep -q '^model_role=-$' "$TMP/logs/codex_dispatch.out" \
+  && grep -q '^model=gpt-test$' "$TMP/logs/codex_dispatch.out" \
+  && grep -q '^reasoning=low$' "$TMP/logs/codex_dispatch.out" \
+  && grep -q '^approval=never$' "$TMP/logs/codex_dispatch.out" \
+  && grep -q '^completion_delivery=app-server-supervised$' "$TMP/logs/codex_dispatch.out" \
+  && grep -q '^command=.*/codex-app-server-supervisor.py ' "$TMP/logs/codex_dispatch.out" \
+  && grep -q -- '--model gpt-test' "$TMP/logs/codex_dispatch.out" \
+  && grep -q -- '--reasoning low' "$TMP/logs/codex_dispatch.out" \
+  && grep -q -- '--approval never' "$TMP/logs/codex_dispatch.out" \
+  && ! grep -q -- '--ask-for-approval' "$TMP/logs/codex_dispatch.out" \
   && [ ! -e "$TMP/codex-dispatch.log" ]; then
   ok "codex dispatch wrapper dry-runs headless command with main-selected model settings"
 else
   bad "codex dispatch wrapper should dry-run headless command with main-selected model settings"
 fi
-if "$CODEX" dispatch --dry-run --worktree "$TMP/repo" --slug codex-custom-model --capability autopilot-code --mode dev --qa standard --prompt-text "do work" --model gpt-test --reasoning low --approval inherit --jobs "$TMP/codex-custom-model.log" >/tmp/codex_custom_model.out 2>/tmp/codex_custom_model.err \
-  && grep -q '^model_source=explicit$' /tmp/codex_custom_model.out \
-  && grep -q '^model_role=-$' /tmp/codex_custom_model.out \
-  && grep -q '^model=gpt-test$' /tmp/codex_custom_model.out \
-  && grep -q '^reasoning=low$' /tmp/codex_custom_model.out \
-  && grep -q '^approval=inherit$' /tmp/codex_custom_model.out \
-  && grep -q -- '--model gpt-test' /tmp/codex_custom_model.out \
-  && ! grep -q -- 'approval_policy=' /tmp/codex_custom_model.out \
+if "$CODEX" dispatch --dry-run --worktree "$TMP/repo" --slug codex-custom-model --capability autopilot-code --mode dev --qa standard --prompt-text "do work" --model gpt-test --reasoning low --approval inherit --jobs "$TMP/codex-custom-model.log" >"$TMP/logs/codex_custom_model.out" 2>"$TMP/logs/codex_custom_model.err" \
+  && grep -q '^model_source=explicit$' "$TMP/logs/codex_custom_model.out" \
+  && grep -q '^model_role=-$' "$TMP/logs/codex_custom_model.out" \
+  && grep -q '^model=gpt-test$' "$TMP/logs/codex_custom_model.out" \
+  && grep -q '^reasoning=low$' "$TMP/logs/codex_custom_model.out" \
+  && grep -q '^approval=inherit$' "$TMP/logs/codex_custom_model.out" \
+  && grep -q -- '--model gpt-test' "$TMP/logs/codex_custom_model.out" \
+  && ! grep -q -- 'approval_policy=' "$TMP/logs/codex_custom_model.out" \
   && [ ! -e "$TMP/codex-custom-model.log" ]; then
   ok "codex dispatch wrapper supports explicit model/reasoning overrides"
 else
   bad "codex dispatch wrapper should support explicit model/reasoning overrides"
 fi
 if CODEX_DISPATCH_SANDBOX=danger-full-access \
-  "$CODEX" dispatch --dry-run --worktree "$TMP/repo" --slug codex-env-sandbox --capability autopilot-code --mode dev --qa standard --prompt-text "do work" --model gpt-test --reasoning low --jobs "$TMP/codex-env-sandbox.log" >/tmp/codex_env_sandbox.out 2>/tmp/codex_env_sandbox.err \
-  && grep -q -- '--sandbox danger-full-access' /tmp/codex_env_sandbox.out \
+  "$CODEX" dispatch --dry-run --worktree "$TMP/repo" --slug codex-env-sandbox --capability autopilot-code --mode dev --qa standard --prompt-text "do work" --model gpt-test --reasoning low --jobs "$TMP/codex-env-sandbox.log" >"$TMP/logs/codex_env_sandbox.out" 2>"$TMP/logs/codex_env_sandbox.err" \
+  && grep -q -- '--sandbox danger-full-access' "$TMP/logs/codex_env_sandbox.out" \
   && [ ! -e "$TMP/codex-env-sandbox.log" ]; then
   ok "codex dispatch wrapper inherits an explicit sandbox environment override"
 else
   bad "codex dispatch wrapper should inherit an explicit sandbox environment override"
 fi
 if CODEX_DISPATCH_SANDBOX=workspace-write CODEX_DISPATCH_SANDBOX_FORCE=danger-full-access \
-  "$CODEX" dispatch --dry-run --worktree "$TMP/repo" --slug codex-forced-sandbox --capability autopilot-code --mode dev --qa standard --prompt-text "do work" --model gpt-test --reasoning low --sandbox workspace-write --jobs "$TMP/codex-forced-sandbox.log" >/tmp/codex_forced_sandbox.out 2>/tmp/codex_forced_sandbox.err \
-  && grep -q -- '--sandbox danger-full-access' /tmp/codex_forced_sandbox.out \
+  "$CODEX" dispatch --dry-run --worktree "$TMP/repo" --slug codex-forced-sandbox --capability autopilot-code --mode dev --qa standard --prompt-text "do work" --model gpt-test --reasoning low --sandbox workspace-write --jobs "$TMP/codex-forced-sandbox.log" >"$TMP/logs/codex_forced_sandbox.out" 2>"$TMP/logs/codex_forced_sandbox.err" \
+  && grep -q -- '--sandbox danger-full-access' "$TMP/logs/codex_forced_sandbox.out" \
   && [ ! -e "$TMP/codex-forced-sandbox.log" ]; then
   ok "codex dispatch wrapper preserves a forced nested sandbox invariant"
 else
   bad "codex dispatch wrapper should preserve a forced nested sandbox invariant"
 fi
 if CODEX_THREAD_ID=codex-unmanaged-parent \
-  "$CODEX" dispatch --register --worktree "$TMP/repo" --slug codex-unmanaged-parent --capability autopilot-code --mode dev --qa standard --prompt-text "do work" --model gpt-test --reasoning low --dispatch-depth 1 --jobs "$TMP/codex-unmanaged-parent.log" --log-dir "$TMP/unmanaged-parent-logs" >/tmp/codex_unmanaged_parent.out 2>/tmp/codex_unmanaged_parent.err; then
+  "$CODEX" dispatch --register --worktree "$TMP/repo" --slug codex-unmanaged-parent --capability autopilot-code --mode dev --qa standard --prompt-text "do work" --model gpt-test --reasoning low --dispatch-depth 1 --jobs "$TMP/codex-unmanaged-parent.log" --log-dir "$TMP/unmanaged-parent-logs" >"$TMP/logs/codex_unmanaged_parent.out" 2>"$TMP/logs/codex_unmanaged_parent.err"; then
   bad "codex dispatch wrapper should reject an unmanaged interactive parent"
 else
   rc=$?
   if [ "$rc" -eq 69 ] \
-    && grep -q '^reason=managed-entry-required$' /tmp/codex_unmanaged_parent.out \
-    && grep -q '^child_spawned=0$' /tmp/codex_unmanaged_parent.out \
+    && grep -q '^reason=managed-entry-required$' "$TMP/logs/codex_unmanaged_parent.out" \
+    && grep -q '^child_spawned=0$' "$TMP/logs/codex_unmanaged_parent.out" \
     && [ ! -e "$TMP/codex-unmanaged-parent.log" ]; then
     ok "codex dispatch wrapper rejects unmanaged interactive parents before registry mutation"
   else
@@ -1375,9 +1382,9 @@ else
   fi
 fi
 if CODEX_THREAD_ID=codex-current-thread CODEX_DISPATCH_PARENT_CURRENT_FORCE=1 \
-  "$CODEX" dispatch --register --allow-unmanaged-parent-poll --worktree "$TMP/repo" --slug codex-current-parent --capability autopilot-code --mode dev --qa standard --prompt-text "do work" --model gpt-test --reasoning low --dispatch-depth 1 --parent invented-parent --parent-session-id invented-session --jobs "$TMP/codex-current-parent.log" --log-dir "$TMP/current-parent-logs" >/tmp/codex_current_parent.out 2>/tmp/codex_current_parent.err \
-  && grep -q '^parent_session_id=codex-current-thread$' /tmp/codex_current_parent.out \
-  && codex_current_parent_prompt=$(sed -n 's/^prompt_file=//p' /tmp/codex_current_parent.out) \
+  "$CODEX" dispatch --register --allow-unmanaged-parent-poll --worktree "$TMP/repo" --slug codex-current-parent --capability autopilot-code --mode dev --qa standard --prompt-text "do work" --model gpt-test --reasoning low --dispatch-depth 1 --parent invented-parent --parent-session-id invented-session --jobs "$TMP/codex-current-parent.log" --log-dir "$TMP/current-parent-logs" >"$TMP/logs/codex_current_parent.out" 2>"$TMP/logs/codex_current_parent.err" \
+  && grep -q '^parent_session_id=codex-current-thread$' "$TMP/logs/codex_current_parent.out" \
+  && codex_current_parent_prompt=$(sed -n 's/^prompt_file=//p' "$TMP/logs/codex_current_parent.out") \
   && [ -f "$codex_current_parent_prompt" ] \
   && grep -q -- '- parent: -' "$codex_current_parent_prompt" \
   && grep -q -- '- parent_session_id: codex-current-thread' "$codex_current_parent_prompt" \
@@ -1388,112 +1395,112 @@ else
   bad "codex drill dispatch ancestry should follow the current runtime thread"
 fi
 if AGENT_DISPATCH_JOBS="$TMP/codex-env-jobs.log" \
-  "$CODEX" dispatch --register --worktree "$TMP/repo" --slug codex-env-jobs --capability autopilot-code --mode dev --qa standard --prompt-text "do work" --model gpt-test --reasoning low >/tmp/codex_env_jobs.out 2>/tmp/codex_env_jobs.err \
+  "$CODEX" dispatch --register --worktree "$TMP/repo" --slug codex-env-jobs --capability autopilot-code --mode dev --qa standard --prompt-text "do work" --model gpt-test --reasoning low >"$TMP/logs/codex_env_jobs.out" 2>"$TMP/logs/codex_env_jobs.err" \
   && grep -q "codex-env-jobs" "$TMP/codex-env-jobs.log" \
-  && grep -q "^job_registry=$TMP/codex-env-jobs.log$" /tmp/codex_env_jobs.out; then
+  && grep -q "^job_registry=$TMP/codex-env-jobs.log$" "$TMP/logs/codex_env_jobs.out"; then
   ok "codex dispatch wrapper keeps nested jobs in the selected shared registry"
 else
   bad "codex dispatch wrapper should keep nested jobs in the selected shared registry"
 fi
 if AGENT_DISPATCH_JOBS="$TMP/codex-env-jobs.log" \
-  "$CODEX" harvest --slug codex-env-jobs --mark-done >/tmp/codex_env_harvest.out 2>/tmp/codex_env_harvest.err \
-  && grep -q "^job_registry=$TMP/codex-env-jobs.log$" /tmp/codex_env_harvest.out \
-  && grep -q '^marked_done=1$' /tmp/codex_env_harvest.out \
-  && AGENT_DISPATCH_JOBS="$TMP/codex-env-jobs.log" "$CODEX" liveness >/tmp/codex_env_liveness.out 2>/tmp/codex_env_liveness.err \
-  && grep -q '^open 0 ; alive 0 ; suspect/dead 0$' /tmp/codex_env_liveness.out; then
+  "$CODEX" harvest --slug codex-env-jobs --mark-done >"$TMP/logs/codex_env_harvest.out" 2>"$TMP/logs/codex_env_harvest.err" \
+  && grep -q "^job_registry=$TMP/codex-env-jobs.log$" "$TMP/logs/codex_env_harvest.out" \
+  && grep -q '^marked_done=1$' "$TMP/logs/codex_env_harvest.out" \
+  && AGENT_DISPATCH_JOBS="$TMP/codex-env-jobs.log" "$CODEX" liveness >"$TMP/logs/codex_env_liveness.out" 2>"$TMP/logs/codex_env_liveness.err" \
+  && grep -q '^open 0 ; alive 0 ; suspect/dead 0$' "$TMP/logs/codex_env_liveness.out"; then
   ok "codex harvest and liveness keep using the selected shared registry"
 else
   bad "codex harvest and liveness should keep using the selected shared registry"
 fi
-if "$CODEX" dispatch --dry-run --worktree "$TMP/repo" --slug codex-inherit-model --capability autopilot-code --mode dev --qa standard --prompt-text "do work" --inherit-model-settings --jobs "$TMP/codex-inherit-model.log" >/tmp/codex_inherit_model.out 2>/tmp/codex_inherit_model.err \
-  && grep -q '^model_source=inherit$' /tmp/codex_inherit_model.out \
-  && grep -q '^model_role=inherit$' /tmp/codex_inherit_model.out \
-  && grep -q '^model=inherit$' /tmp/codex_inherit_model.out \
-  && grep -q '^reasoning=inherit$' /tmp/codex_inherit_model.out \
-  && ! grep -q -- '--model ' /tmp/codex_inherit_model.out \
+if "$CODEX" dispatch --dry-run --worktree "$TMP/repo" --slug codex-inherit-model --capability autopilot-code --mode dev --qa standard --prompt-text "do work" --inherit-model-settings --jobs "$TMP/codex-inherit-model.log" >"$TMP/logs/codex_inherit_model.out" 2>"$TMP/logs/codex_inherit_model.err" \
+  && grep -q '^model_source=inherit$' "$TMP/logs/codex_inherit_model.out" \
+  && grep -q '^model_role=inherit$' "$TMP/logs/codex_inherit_model.out" \
+  && grep -q '^model=inherit$' "$TMP/logs/codex_inherit_model.out" \
+  && grep -q '^reasoning=inherit$' "$TMP/logs/codex_inherit_model.out" \
+  && ! grep -q -- '--model ' "$TMP/logs/codex_inherit_model.out" \
   && [ ! -e "$TMP/codex-inherit-model.log" ]; then
   ok "codex dispatch wrapper can explicitly inherit model settings"
 else
   bad "codex dispatch wrapper should explicitly inherit model settings only on request"
 fi
-if "$CODEX" dispatch --dry-run --worktree "$TMP/repo" --slug codex-bad-cap --capability nope-capability --mode dev --qa standard --prompt-text "do work" --jobs "$TMP/codex-bad-cap.log" >/tmp/codex_bad_cap.out 2>/tmp/codex_bad_cap.err; then
+if "$CODEX" dispatch --dry-run --worktree "$TMP/repo" --slug codex-bad-cap --capability nope-capability --mode dev --qa standard --prompt-text "do work" --jobs "$TMP/codex-bad-cap.log" >"$TMP/logs/codex_bad_cap.out" 2>"$TMP/logs/codex_bad_cap.err"; then
   bad "codex dispatch wrapper should fail invalid capability"
 else
   rc=$?
   if [ "$rc" -eq 64 ] \
-    && grep -q '^reason=invalid-dispatch-capability$' /tmp/codex_bad_cap.out \
-    && grep -q '^capability=nope-capability$' /tmp/codex_bad_cap.out \
+    && grep -q '^reason=invalid-dispatch-capability$' "$TMP/logs/codex_bad_cap.out" \
+    && grep -q '^capability=nope-capability$' "$TMP/logs/codex_bad_cap.out" \
     && [ ! -e "$TMP/codex-bad-cap.log" ]; then
     ok "codex dispatch wrapper validates capability before registry write"
   else
     bad "codex dispatch wrapper should validate capability before registry write"
   fi
 fi
-if "$CODEX" dispatch --dry-run --worktree "$TMP/repo" --slug codex-bad-mode --capability autopilot-code --capability-mode dev --worker-mode dev/nope --worker-type stage --unit dev/nope --qa standard --prompt-text "do work" --jobs "$TMP/codex-bad-mode.log" >/tmp/codex_bad_mode.out 2>/tmp/codex_bad_mode.err; then
+if "$CODEX" dispatch --dry-run --worktree "$TMP/repo" --slug codex-bad-mode --capability autopilot-code --capability-mode dev --worker-mode dev/nope --worker-type stage --unit dev/nope --qa standard --prompt-text "do work" --jobs "$TMP/codex-bad-mode.log" >"$TMP/logs/codex_bad_mode.out" 2>"$TMP/logs/codex_bad_mode.err"; then
   bad "codex dispatch wrapper should fail invalid mode"
 else
   rc=$?
   if [ "$rc" -eq 64 ] \
-    && grep -q '^reason=invalid-dispatch-worker-mode$' /tmp/codex_bad_mode.out \
-    && grep -q '^worker_mode=dev/nope$' /tmp/codex_bad_mode.out \
+    && grep -q '^reason=invalid-dispatch-worker-mode$' "$TMP/logs/codex_bad_mode.out" \
+    && grep -q '^worker_mode=dev/nope$' "$TMP/logs/codex_bad_mode.out" \
     && [ ! -e "$TMP/codex-bad-mode.log" ]; then
     ok "codex dispatch wrapper validates mode before registry write"
   else
     bad "codex dispatch wrapper should validate mode before registry write"
   fi
 fi
-if "$CODEX" dispatch --dry-run --worktree "$TMP/repo" --slug codex-bad-qa --capability autopilot-code --mode dev --qa extreme --prompt-text "do work" --jobs "$TMP/codex-bad-qa.log" >/tmp/codex_bad_qa.out 2>/tmp/codex_bad_qa.err; then
+if "$CODEX" dispatch --dry-run --worktree "$TMP/repo" --slug codex-bad-qa --capability autopilot-code --mode dev --qa extreme --prompt-text "do work" --jobs "$TMP/codex-bad-qa.log" >"$TMP/logs/codex_bad_qa.out" 2>"$TMP/logs/codex_bad_qa.err"; then
   bad "codex dispatch wrapper should fail invalid QA level"
 else
   rc=$?
   if [ "$rc" -eq 64 ] \
-    && grep -q '^reason=invalid-dispatch-qa$' /tmp/codex_bad_qa.out \
-    && grep -q '^qa=extreme$' /tmp/codex_bad_qa.out \
-    && grep -q '^allowed_qa=quick,light,standard,thorough,adversarial$' /tmp/codex_bad_qa.out \
+    && grep -q '^reason=invalid-dispatch-qa$' "$TMP/logs/codex_bad_qa.out" \
+    && grep -q '^qa=extreme$' "$TMP/logs/codex_bad_qa.out" \
+    && grep -q '^allowed_qa=quick,light,standard,thorough,adversarial$' "$TMP/logs/codex_bad_qa.out" \
     && [ ! -e "$TMP/codex-bad-qa.log" ]; then
     ok "codex dispatch wrapper validates QA level before registry write"
   else
     bad "codex dispatch wrapper should validate QA level before registry write"
   fi
 fi
-if AGENT_HOME="$TMP/not-agent-home" HOME="$DISPATCH_RESOLVER_HOME" XDG_DATA_HOME="$DISPATCH_RESOLVER_XDG" CODEX_DISPATCH_SANDBOX_FORCE=danger-full-access \
-  "$CODEX" dispatch --dry-run --worktree "$TMP/repo" --slug codex-default-home --capability autopilot-code --mode dev --qa standard --prompt-text "do work" --model gpt-test --reasoning low >/tmp/codex_dispatch_default.out 2>/tmp/codex_dispatch_default.err \
-  && grep -Fxq "job_registry=$DISPATCH_RESOLVER_STATE/jobs.log" /tmp/codex_dispatch_default.out \
-  && grep -Fxq "prompt_file=$DISPATCH_RESOLVER_STATE/logs/codex-default-home.codex.prompt.txt" /tmp/codex_dispatch_default.out \
+if env -u XDG_STATE_HOME -u HARNESS_STATE_ROOT AGENT_HOME="$TMP/not-agent-home" HOME="$DISPATCH_RESOLVER_HOME" XDG_DATA_HOME="$DISPATCH_RESOLVER_XDG" CODEX_DISPATCH_SANDBOX_FORCE=danger-full-access \
+  "$CODEX" dispatch --dry-run --worktree "$TMP/repo" --slug codex-default-home --capability autopilot-code --mode dev --qa standard --prompt-text "do work" --model gpt-test --reasoning low >"$TMP/logs/codex_dispatch_default.out" 2>"$TMP/logs/codex_dispatch_default.err" \
+  && grep -Fxq "job_registry=$DISPATCH_RESOLVER_STATE/jobs.log" "$TMP/logs/codex_dispatch_default.out" \
+  && grep -Fxq "prompt_file=$DISPATCH_RESOLVER_STATE/logs/codex-default-home.codex.prompt.txt" "$TMP/logs/codex_dispatch_default.out" \
   && [ ! -e "$TMP/not-agent-home/.dispatch/jobs.log" ]; then
   ok "codex dispatch wrapper defaults to validated harness root"
 else
   bad "codex dispatch wrapper should not trust invalid AGENT_HOME for default registry"
 fi
-if AGENT_HOME="$TMP/not-agent-home" HOME="$DISPATCH_RESOLVER_HOME" XDG_DATA_HOME="$DISPATCH_RESOLVER_XDG" CODEX_DISPATCH_SANDBOX_FORCE=danger-full-access \
-  python3 "$ROOT/adapters/codex/bin/dispatch-headless.py" --dry-run --worktree "$TMP/repo" --slug codex-direct-home --capability autopilot-code --mode dev --qa standard --prompt-text "do work" --model gpt-test --reasoning low >/tmp/codex_dispatch_direct.out 2>/tmp/codex_dispatch_direct.err \
-  && grep -Fxq "job_registry=$DISPATCH_RESOLVER_STATE/jobs.log" /tmp/codex_dispatch_direct.out \
-  && grep -Fxq "prompt_file=$DISPATCH_RESOLVER_STATE/logs/codex-direct-home.codex.prompt.txt" /tmp/codex_dispatch_direct.out; then
+if env -u XDG_STATE_HOME -u HARNESS_STATE_ROOT AGENT_HOME="$TMP/not-agent-home" HOME="$DISPATCH_RESOLVER_HOME" XDG_DATA_HOME="$DISPATCH_RESOLVER_XDG" CODEX_DISPATCH_SANDBOX_FORCE=danger-full-access \
+  python3 "$ROOT/adapters/codex/bin/dispatch-headless.py" --dry-run --worktree "$TMP/repo" --slug codex-direct-home --capability autopilot-code --mode dev --qa standard --prompt-text "do work" --model gpt-test --reasoning low >"$TMP/logs/codex_dispatch_direct.out" 2>"$TMP/logs/codex_dispatch_direct.err" \
+  && grep -Fxq "job_registry=$DISPATCH_RESOLVER_STATE/jobs.log" "$TMP/logs/codex_dispatch_direct.out" \
+  && grep -Fxq "prompt_file=$DISPATCH_RESOLVER_STATE/logs/codex-direct-home.codex.prompt.txt" "$TMP/logs/codex_dispatch_direct.out"; then
   ok "codex dispatch script ignores invalid AGENT_HOME"
 else
   bad "codex dispatch script should validate AGENT_HOME"
 fi
-if "$CODEX" dispatch --register --worktree "$TMP/repo" --slug codex-quick-depth1 --capability autopilot-code --mode dev --intensity quick --dispatch-depth 1 --parent-session-id test-parent --owner-harness codex --prompt-text "quick work" --model gpt-test --reasoning low --jobs "$TMP/codex-quick-depth1.log" >/tmp/codex_quick_depth1.out 2>/tmp/codex_quick_depth1.err; then
+if "$CODEX" dispatch --register --worktree "$TMP/repo" --slug codex-quick-depth1 --capability autopilot-code --mode dev --intensity quick --dispatch-depth 1 --parent-session-id test-parent --owner-harness codex --prompt-text "quick work" --model gpt-test --reasoning low --jobs "$TMP/codex-quick-depth1.log" >"$TMP/logs/codex_quick_depth1.out" 2>"$TMP/logs/codex_quick_depth1.err"; then
   bad "codex dispatch wrapper should reject route-unbound quick jobs"
 else
   rc=$?
   if [ "$rc" -eq 65 ] \
-    && grep -q '^reason=quick-headless-unavailable$' /tmp/codex_quick_depth1.out \
-    && grep -q '^child_spawned=0$' /tmp/codex_quick_depth1.out \
+    && grep -q '^reason=quick-headless-unavailable$' "$TMP/logs/codex_quick_depth1.out" \
+    && grep -q '^child_spawned=0$' "$TMP/logs/codex_quick_depth1.out" \
     && [ ! -e "$TMP/codex-quick-depth1.log" ]; then
     ok "codex dispatch wrapper rejects route-unbound quick jobs"
   else
     bad "codex dispatch wrapper should fail closed for route-unbound quick jobs"
   fi
 fi
-if "$CODEX" dispatch --dry-run --worktree "$TMP/repo" --slug codex-quick-depth2 --capability autopilot-code --capability-mode dev --worker-mode dev/backend --worker-type stage --unit dev/backend --intensity quick --dispatch-depth 2 --parent codex-parent --prompt-text "quick work" --model gpt-test --reasoning low >/tmp/codex_quick_depth2.out 2>/tmp/codex_quick_depth2.err; then
+if "$CODEX" dispatch --dry-run --worktree "$TMP/repo" --slug codex-quick-depth2 --capability autopilot-code --capability-mode dev --worker-mode dev/backend --worker-type stage --unit dev/backend --intensity quick --dispatch-depth 2 --parent codex-parent --prompt-text "quick work" --model gpt-test --reasoning low >"$TMP/logs/codex_quick_depth2.out" 2>"$TMP/logs/codex_quick_depth2.err"; then
   bad "codex dispatch wrapper should reject quick dispatch-depth-2 jobs"
 else
   rc=$?
   if [ "$rc" -eq 64 ] \
-    && grep -q '^reason=invalid-depth-two-intensity$' /tmp/codex_quick_depth2.out \
-    && grep -q '^dispatch_depth=2$' /tmp/codex_quick_depth2.out \
-    && grep -q '^intensity=quick$' /tmp/codex_quick_depth2.out \
+    && grep -q '^reason=invalid-depth-two-intensity$' "$TMP/logs/codex_quick_depth2.out" \
+    && grep -q '^dispatch_depth=2$' "$TMP/logs/codex_quick_depth2.out" \
+    && grep -q '^intensity=quick$' "$TMP/logs/codex_quick_depth2.out" \
     && [ ! -e "$TMP/codex-quick-depth2.log" ]; then
     ok "codex dispatch wrapper rejects quick dispatch-depth-2 jobs"
   else
@@ -1508,12 +1515,12 @@ printf '%s\n' "$*" > "$CODEX_STUB_ARGV"
 EOF
 chmod +x "$TMP/codex-stubbin/codex"
 if PATH="$TMP/codex-stubbin:$PATH" AGENT_HOME="$ROOT" CODEX_HOME="$TMP/codex_headless_home" CODEX_STUB_ARGV="$TMP/codex-start.argv" CODEX_DISPATCH_SANDBOX_FORCE=danger-full-access \
-  "$CODEX" dispatch --start --completion-delivery poll --worktree "$TMP/repo" --slug nested/codex-start --capability autopilot-code --mode dev --qa standard --prompt-text "nested work" --model gpt-test --reasoning low --jobs "$TMP/codex-start.log" --log-dir "$TMP/codex-logs" >/tmp/codex_dispatch_start.out 2>/tmp/codex_dispatch_start.err \
-  && grep -q '^status=start$' /tmp/codex_dispatch_start.out \
-  && grep -q '^started=1$' /tmp/codex_dispatch_start.out \
+  "$CODEX" dispatch --start --completion-delivery poll --worktree "$TMP/repo" --slug nested/codex-start --capability autopilot-code --mode dev --qa standard --prompt-text "nested work" --model gpt-test --reasoning low --jobs "$TMP/codex-start.log" --log-dir "$TMP/codex-logs" >"$TMP/logs/codex_dispatch_start.out" 2>"$TMP/logs/codex_dispatch_start.err" \
+  && grep -q '^status=start$' "$TMP/logs/codex_dispatch_start.out" \
+  && grep -q '^started=1$' "$TMP/logs/codex_dispatch_start.out" \
   && [ "$(readlink "$TMP/repo/.dispatch/codex-home")" = "$TMP/codex_headless_home" ] \
-  && grep -Fxq "runtime_home_projection=$TMP/repo/.dispatch/codex-home" /tmp/codex_dispatch_start.out \
-  && codex_start_prompt=$(sed -n 's/^prompt_file=//p' /tmp/codex_dispatch_start.out) \
+  && grep -Fxq "runtime_home_projection=$TMP/repo/.dispatch/codex-home" "$TMP/logs/codex_dispatch_start.out" \
+  && codex_start_prompt=$(sed -n 's/^prompt_file=//p' "$TMP/logs/codex_dispatch_start.out") \
   && [ -f "$codex_start_prompt" ] \
   && grep -q '^# Portable Worker Kernel$' "$codex_start_prompt" \
   && grep -q '^# Worker Type: Owner$' "$codex_start_prompt" \
@@ -1543,10 +1550,10 @@ else
   bad "codex dispatch wrapper should start nested slug after runtime projection check"
 fi
 if PATH="$TMP/codex-stubbin:$PATH" AGENT_HOME="$ROOT" CODEX_HOME="$TMP/codex_headless_home" CODEX_STUB_ARGV="$TMP/codex-strict-start.argv" CODEX_DISPATCH_SANDBOX_FORCE=danger-full-access \
-  "$CODEX" dispatch --start --require-hook-trust --worktree "$TMP/repo" --slug codex-strict-start --capability autopilot-code --mode dev --qa standard --prompt-text "strict work" --model gpt-test --reasoning low --jobs "$TMP/codex-strict-start.log" --log-dir "$TMP/codex-strict-logs" >/tmp/codex_dispatch_strict_start.out 2>/tmp/codex_dispatch_strict_start.err; then
+  "$CODEX" dispatch --start --require-hook-trust --worktree "$TMP/repo" --slug codex-strict-start --capability autopilot-code --mode dev --qa standard --prompt-text "strict work" --model gpt-test --reasoning low --jobs "$TMP/codex-strict-start.log" --log-dir "$TMP/codex-strict-logs" >"$TMP/logs/codex_dispatch_strict_start.out" 2>"$TMP/logs/codex_dispatch_strict_start.err"; then
   bad "codex dispatch strict start should fail when hook trust is incomplete"
 else
-  if grep -q '^check=hook-trust:review-needed' /tmp/codex_dispatch_strict_start.out \
+  if grep -q '^check=hook-trust:review-needed' "$TMP/logs/codex_dispatch_strict_start.out" \
     && [ ! -e "$TMP/codex-strict-start.log" ] \
     && [ ! -e "$TMP/codex-strict-logs/codex-strict-start.codex.prompt.txt" ]; then
     ok "codex dispatch strict start fails before registry writes when hook trust is incomplete"
@@ -1554,13 +1561,13 @@ else
     bad "codex dispatch strict start should fail before registry writes"
   fi
 fi
-if "$CODEX" dispatch --register --worktree "$TMP/repo" --slug codex-dispatch --capability autopilot-code --mode dev --qa standard --prompt-text "do work" --model gpt-test --reasoning low --jobs "$TMP/codex-dispatch.log" --log-dir "$TMP/codex-register-logs" >/tmp/codex_dispatch.out 2>/tmp/codex_dispatch.err \
-  && grep -q '^status=register$' /tmp/codex_dispatch.out \
-  && grep -q '^registered=1$' /tmp/codex_dispatch.out \
-  && grep -q '^started=0$' /tmp/codex_dispatch.out \
-  && grep -q '^registry_lock=.*/codex-dispatch.log.lock$' /tmp/codex_dispatch.out \
-  && grep -Eq '^prompt_file=.*/codex-register-logs/codex-dispatch\.att-[A-Za-z0-9._-]+\.codex\.prompt\.txt$' /tmp/codex_dispatch.out \
-  && codex_dispatch_prompt=$(sed -n 's/^prompt_file=//p' /tmp/codex_dispatch.out) \
+if "$CODEX" dispatch --register --worktree "$TMP/repo" --slug codex-dispatch --capability autopilot-code --mode dev --qa standard --prompt-text "do work" --model gpt-test --reasoning low --jobs "$TMP/codex-dispatch.log" --log-dir "$TMP/codex-register-logs" >"$TMP/logs/codex_dispatch.out" 2>"$TMP/logs/codex_dispatch.err" \
+  && grep -q '^status=register$' "$TMP/logs/codex_dispatch.out" \
+  && grep -q '^registered=1$' "$TMP/logs/codex_dispatch.out" \
+  && grep -q '^started=0$' "$TMP/logs/codex_dispatch.out" \
+  && grep -q '^registry_lock=.*/codex-dispatch.log.lock$' "$TMP/logs/codex_dispatch.out" \
+  && grep -Eq '^prompt_file=.*/codex-register-logs/codex-dispatch\.att-[A-Za-z0-9._-]+\.codex\.prompt\.txt$' "$TMP/logs/codex_dispatch.out" \
+  && codex_dispatch_prompt=$(sed -n 's/^prompt_file=//p' "$TMP/logs/codex_dispatch.out") \
   && [ -f "$TMP/codex-dispatch.log.lock" ] \
   && [ -f "$codex_dispatch_prompt" ] \
   && grep -q '^# Worker Type: Owner$' "$codex_dispatch_prompt" \
@@ -1573,21 +1580,21 @@ if "$CODEX" dispatch --register --worktree "$TMP/repo" --slug codex-dispatch --c
 else
   bad "codex dispatch wrapper should register open headless job"
 fi
-if "$CODEX" harvest --jobs "$TMP/codex-dispatch.log" --slug codex-dispatch >/tmp/codex_harvest.out 2>/tmp/codex_harvest.err \
-  && grep -q '^adapter=codex$' /tmp/codex_harvest.out \
-  && grep -q '^runtime_surface=codex-dispatch-harvest$' /tmp/codex_harvest.out \
-  && grep -q '^registry_lock=.*/codex-dispatch.log.lock$' /tmp/codex_harvest.out \
-  && grep -q '^matched=1$' /tmp/codex_harvest.out \
-  && grep -q '^marked_done=0$' /tmp/codex_harvest.out \
-  && grep -q '^job_status=open$' /tmp/codex_harvest.out \
-  && grep -q '^merge_action=unsupported$' /tmp/codex_harvest.out; then
+if "$CODEX" harvest --jobs "$TMP/codex-dispatch.log" --slug codex-dispatch >"$TMP/logs/codex_harvest.out" 2>"$TMP/logs/codex_harvest.err" \
+  && grep -q '^adapter=codex$' "$TMP/logs/codex_harvest.out" \
+  && grep -q '^runtime_surface=codex-dispatch-harvest$' "$TMP/logs/codex_harvest.out" \
+  && grep -q '^registry_lock=.*/codex-dispatch.log.lock$' "$TMP/logs/codex_harvest.out" \
+  && grep -q '^matched=1$' "$TMP/logs/codex_harvest.out" \
+  && grep -q '^marked_done=0$' "$TMP/logs/codex_harvest.out" \
+  && grep -q '^job_status=open$' "$TMP/logs/codex_harvest.out" \
+  && grep -q '^merge_action=unsupported$' "$TMP/logs/codex_harvest.out"; then
   ok "codex harvest wrapper reports open registry jobs"
 else
   bad "codex harvest wrapper should report open registry jobs"
 fi
-if "$CODEX" harvest --jobs "$TMP/codex-dispatch.log" --slug codex-dispatch --mark-done >/tmp/codex_harvest_done.out 2>/tmp/codex_harvest_done.err \
-  && grep -q '^marked_done=1$' /tmp/codex_harvest_done.out \
-  && grep -q '^registry_lock=.*/codex-dispatch.log.lock$' /tmp/codex_harvest_done.out \
+if "$CODEX" harvest --jobs "$TMP/codex-dispatch.log" --slug codex-dispatch --mark-done >"$TMP/logs/codex_harvest_done.out" 2>"$TMP/logs/codex_harvest_done.err" \
+  && grep -q '^marked_done=1$' "$TMP/logs/codex_harvest_done.out" \
+  && grep -q '^registry_lock=.*/codex-dispatch.log.lock$' "$TMP/logs/codex_harvest_done.out" \
   && awk -F '\t' '$2 == "done" && $5 == "codex-dispatch" { found=1 } END { exit !found }' "$TMP/codex-dispatch.log" \
   && grep -q 'worker_type=owner' "$TMP/codex-dispatch.log" \
   && grep -q 'assigned_contract=autopilot-code' "$TMP/codex-dispatch.log"; then
@@ -1595,12 +1602,12 @@ if "$CODEX" harvest --jobs "$TMP/codex-dispatch.log" --slug codex-dispatch --mar
 else
   bad "codex harvest wrapper should mark selected jobs done"
 fi
-if python3 "$ROOT/adapters/claude/bin/dispatch-headless.py" --dry-run --worktree "$TMP/repo" --slug claude-missing-model --capability autopilot-code --mode dev --qa standard --prompt-text "do work" --jobs "$TMP/claude-missing-model.log" >/tmp/claude_missing_model.out 2>/tmp/claude_missing_model.err; then
+if python3 "$ROOT/adapters/claude/bin/dispatch-headless.py" --dry-run --worktree "$TMP/repo" --slug claude-missing-model --capability autopilot-code --mode dev --qa standard --prompt-text "do work" --jobs "$TMP/claude-missing-model.log" >"$TMP/logs/claude_missing_model.out" 2>"$TMP/logs/claude_missing_model.err"; then
   bad "claude dispatch wrapper should require main-selected model settings"
 else
   rc=$?
   if [ "$rc" -eq 64 ] \
-    && grep -q '^reason=missing-dispatch-model-selection$' /tmp/claude_missing_model.out \
+    && grep -q '^reason=missing-dispatch-model-selection$' "$TMP/logs/claude_missing_model.out" \
     && [ ! -e "$TMP/claude-missing-model.log" ]; then
     ok "claude dispatch wrapper requires main-selected model settings"
   else
@@ -1611,36 +1618,36 @@ fi
 # restating them as literals here re-creates the drift the SoT removed.
 claude_light_model=$(. "$ROOT/adapters/claude/config/models.conf" && printf '%s' "$CFG_TIER_LIGHT_MODEL")
 claude_light_effort=$(. "$ROOT/adapters/claude/config/models.conf" && printf '%s' "$CFG_TIER_LIGHT_EFFORT")
-if python3 "$ROOT/adapters/claude/bin/dispatch-headless.py" --dry-run --worktree "$TMP/repo" --slug claude-role-model --capability autopilot-code --mode dev --qa standard --prompt-text "do work" --model-role "fast implementer" --jobs "$TMP/claude-role-model.log" >/tmp/claude_role_model.out 2>/tmp/claude_role_model.err \
-  && grep -q '^adapter=claude$' /tmp/claude_role_model.out \
-  && grep -q '^model_source=role$' /tmp/claude_role_model.out \
-  && grep -q '^model_role=fast implementer$' /tmp/claude_role_model.out \
-  && grep -q "^model=${claude_light_model}\$" /tmp/claude_role_model.out \
-  && grep -q "^effort=${claude_light_effort}\$" /tmp/claude_role_model.out \
-  && grep -q -- "--model ${claude_light_model}" /tmp/claude_role_model.out \
-  && grep -q -- "--effort ${claude_light_effort}" /tmp/claude_role_model.out \
+if python3 "$ROOT/adapters/claude/bin/dispatch-headless.py" --dry-run --worktree "$TMP/repo" --slug claude-role-model --capability autopilot-code --mode dev --qa standard --prompt-text "do work" --model-role "fast implementer" --jobs "$TMP/claude-role-model.log" >"$TMP/logs/claude_role_model.out" 2>"$TMP/logs/claude_role_model.err" \
+  && grep -q '^adapter=claude$' "$TMP/logs/claude_role_model.out" \
+  && grep -q '^model_source=role$' "$TMP/logs/claude_role_model.out" \
+  && grep -q '^model_role=fast implementer$' "$TMP/logs/claude_role_model.out" \
+  && grep -q "^model=${claude_light_model}\$" "$TMP/logs/claude_role_model.out" \
+  && grep -q "^effort=${claude_light_effort}\$" "$TMP/logs/claude_role_model.out" \
+  && grep -q -- "--model ${claude_light_model}" "$TMP/logs/claude_role_model.out" \
+  && grep -q -- "--effort ${claude_light_effort}" "$TMP/logs/claude_role_model.out" \
   && [ ! -e "$TMP/claude-role-model.log" ]; then
   ok "claude dispatch wrapper supports main-selected model roles"
 else
   bad "claude dispatch wrapper should support main-selected model roles"
 fi
-if python3 "$ROOT/adapters/claude/bin/dispatch-headless.py" --dry-run --worktree "$TMP/repo" --slug claude-explicit-model --capability autopilot-code --mode dev --qa standard --prompt-text "do work" --model claude-test --effort low --jobs "$TMP/claude-explicit-model.log" >/tmp/claude_explicit_model.out 2>/tmp/claude_explicit_model.err \
-  && grep -q '^model_source=explicit$' /tmp/claude_explicit_model.out \
-  && grep -q '^model=claude-test$' /tmp/claude_explicit_model.out \
-  && grep -q '^effort=low$' /tmp/claude_explicit_model.out \
-  && grep -q -- '--model claude-test' /tmp/claude_explicit_model.out \
-  && grep -q -- '--effort low' /tmp/claude_explicit_model.out \
+if python3 "$ROOT/adapters/claude/bin/dispatch-headless.py" --dry-run --worktree "$TMP/repo" --slug claude-explicit-model --capability autopilot-code --mode dev --qa standard --prompt-text "do work" --model claude-test --effort low --jobs "$TMP/claude-explicit-model.log" >"$TMP/logs/claude_explicit_model.out" 2>"$TMP/logs/claude_explicit_model.err" \
+  && grep -q '^model_source=explicit$' "$TMP/logs/claude_explicit_model.out" \
+  && grep -q '^model=claude-test$' "$TMP/logs/claude_explicit_model.out" \
+  && grep -q '^effort=low$' "$TMP/logs/claude_explicit_model.out" \
+  && grep -q -- '--model claude-test' "$TMP/logs/claude_explicit_model.out" \
+  && grep -q -- '--effort low' "$TMP/logs/claude_explicit_model.out" \
   && [ ! -e "$TMP/claude-explicit-model.log" ]; then
   ok "claude dispatch wrapper supports explicit model/effort selection"
 else
   bad "claude dispatch wrapper should support explicit model/effort selection"
 fi
-if python3 "$ROOT/adapters/claude/bin/dispatch-headless.py" --dry-run --worktree "$TMP/repo" --slug claude-inherit-model --capability autopilot-code --capability-mode dev --qa standard --prompt-text "do work" --inherit-model-settings --jobs "$TMP/claude-inherit-model.log" >/tmp/claude_inherit_model.out 2>/tmp/claude_inherit_model.err; then
+if python3 "$ROOT/adapters/claude/bin/dispatch-headless.py" --dry-run --worktree "$TMP/repo" --slug claude-inherit-model --capability autopilot-code --capability-mode dev --qa standard --prompt-text "do work" --inherit-model-settings --jobs "$TMP/claude-inherit-model.log" >"$TMP/logs/claude_inherit_model.out" 2>"$TMP/logs/claude_inherit_model.err"; then
   bad "claude dispatch wrapper should reject unprovable model inheritance"
 else
   rc=$?
   if [ "$rc" -eq 64 ] \
-    && grep -q '^reason=headless-model-inheritance-ineligible$' /tmp/claude_inherit_model.out \
+    && grep -q '^reason=headless-model-inheritance-ineligible$' "$TMP/logs/claude_inherit_model.out" \
     && [ ! -e "$TMP/claude-inherit-model.log" ]; then
     ok "claude dispatch wrapper rejects unprovable model inheritance"
   else
@@ -1648,20 +1655,20 @@ else
   fi
 fi
 if AGENT_DISPATCH_JOBS="$TMP/claude-env-jobs.log" \
-  python3 "$ROOT/adapters/claude/bin/dispatch-headless.py" --register --worktree "$TMP/repo" --slug claude-env-jobs --capability autopilot-code --capability-mode dev --qa standard --prompt-text "do work" --model-role "fast implementer" --log-dir "$TMP/claude-env-logs" >/tmp/claude_env_jobs.out 2>/tmp/claude_env_jobs.err \
-  && grep -q "^job_registry=$TMP/claude-env-jobs.log$" /tmp/claude_env_jobs.out \
+  python3 "$ROOT/adapters/claude/bin/dispatch-headless.py" --register --worktree "$TMP/repo" --slug claude-env-jobs --capability autopilot-code --capability-mode dev --qa standard --prompt-text "do work" --model-role "fast implementer" --log-dir "$TMP/claude-env-logs" >"$TMP/logs/claude_env_jobs.out" 2>"$TMP/logs/claude_env_jobs.err" \
+  && grep -q "^job_registry=$TMP/claude-env-jobs.log$" "$TMP/logs/claude_env_jobs.out" \
   && awk -F '\t' '$2 == "open" && $5 == "claude-env-jobs" { found=1 } END { exit !found }' "$TMP/claude-env-jobs.log"; then
   ok "claude dispatch wrapper uses the selected shared registry"
 else
   bad "claude dispatch wrapper should use the selected shared registry"
 fi
-if CODEX_THREAD_ID=codex-parent python3 "$ROOT/adapters/claude/bin/dispatch-headless.py" --register --allow-unmanaged-parent-poll --worktree "$TMP/repo" --slug claude-owned --capability autopilot-code --capability-mode audit --qa standard --intensity thorough --dispatch-depth 1 --worker-type owner --unit _kernel/owner --assigned-contract autopilot-code --worker-role verifier --owner autopilot-code --model-role "fast reviewer" --prompt-text "verify" --jobs "$TMP/claude-owned.log" --log-dir "$TMP/claude-owned-logs" >/tmp/claude_owned.out 2>/tmp/claude_owned.err \
-  && grep -q '^intensity=thorough$' /tmp/claude_owned.out \
-  && grep -q '^dispatch_depth=1$' /tmp/claude_owned.out \
-  && grep -q '^parent_session_id=codex-parent$' /tmp/claude_owned.out \
-  && grep -q '^worker_role=verifier$' /tmp/claude_owned.out \
-  && grep -q '^owner=autopilot-code$' /tmp/claude_owned.out \
-  && grep -q '^owner_harness=codex$' /tmp/claude_owned.out \
+if CODEX_THREAD_ID=codex-parent python3 "$ROOT/adapters/claude/bin/dispatch-headless.py" --register --allow-unmanaged-parent-poll --worktree "$TMP/repo" --slug claude-owned --capability autopilot-code --capability-mode audit --qa standard --intensity thorough --dispatch-depth 1 --worker-type owner --unit _kernel/owner --assigned-contract autopilot-code --worker-role verifier --owner autopilot-code --model-role "fast reviewer" --prompt-text "verify" --jobs "$TMP/claude-owned.log" --log-dir "$TMP/claude-owned-logs" >"$TMP/logs/claude_owned.out" 2>"$TMP/logs/claude_owned.err" \
+  && grep -q '^intensity=thorough$' "$TMP/logs/claude_owned.out" \
+  && grep -q '^dispatch_depth=1$' "$TMP/logs/claude_owned.out" \
+  && grep -q '^parent_session_id=codex-parent$' "$TMP/logs/claude_owned.out" \
+  && grep -q '^worker_role=verifier$' "$TMP/logs/claude_owned.out" \
+  && grep -q '^owner=autopilot-code$' "$TMP/logs/claude_owned.out" \
+  && grep -q '^owner_harness=codex$' "$TMP/logs/claude_owned.out" \
   && awk -F '\t' '$2 == "open" && $5 == "claude-owned" { found=1 } END { exit !found }' "$TMP/claude-owned.log" \
   && grep -q 'worker_role=verifier' "$TMP/claude-owned.log" \
   && grep -q 'worker_type=owner' "$TMP/claude-owned.log" \
@@ -1672,11 +1679,11 @@ if CODEX_THREAD_ID=codex-parent python3 "$ROOT/adapters/claude/bin/dispatch-head
 else
   bad "claude dispatch wrapper should record cross-harness ownership metadata"
 fi
-if python3 "$ROOT/adapters/claude/bin/dispatch-headless.py" --dry-run --worktree "$TMP/repo" --slug claude-bad-depth --capability autopilot-code --capability-mode audit --worker-mode qa/test --worker-type review --unit qa/test --assigned-contract code-test --qa standard --intensity standard --dispatch-depth 2 --model-role "fast reviewer" --prompt-text "verify" --jobs "$TMP/claude-bad-depth.log" >/tmp/claude_bad_depth.out 2>/tmp/claude_bad_depth.err; then
+if python3 "$ROOT/adapters/claude/bin/dispatch-headless.py" --dry-run --worktree "$TMP/repo" --slug claude-bad-depth --capability autopilot-code --capability-mode audit --worker-mode qa/test --worker-type review --unit qa/test --assigned-contract code-test --qa standard --intensity standard --dispatch-depth 2 --model-role "fast reviewer" --prompt-text "verify" --jobs "$TMP/claude-bad-depth.log" >"$TMP/logs/claude_bad_depth.out" 2>"$TMP/logs/claude_bad_depth.err"; then
   bad "claude dispatch wrapper should reject dispatch-depth-2 without parent"
 else
   rc=$?
-  if [ "$rc" -eq 64 ] && grep -q '^reason=missing-dispatch-parent$' /tmp/claude_bad_depth.out; then
+  if [ "$rc" -eq 64 ] && grep -q '^reason=missing-dispatch-parent$' "$TMP/logs/claude_bad_depth.out"; then
     ok "claude dispatch wrapper validates dispatch-depth-2 parent metadata"
   else
     bad "claude dispatch wrapper should fail cleanly for invalid dispatch-depth-2 metadata"
@@ -1688,21 +1695,21 @@ cat > "$TMP/codex-live-sessions/2026/06/30/rollout-live-codex.jsonl" <<EOF
 EOF
 touch "$TMP/codex-live-sessions/2026/06/30/rollout-live-codex.jsonl"
 printf '2026-06-30T00:00:00Z\topen\t%s\t%s\tlive-codex\t-\n' "$TMP/repo" "$TMP/flowproj" > "$TMP/codex-jobs.log"
-if CODEX_SESSIONS="$TMP/codex-live-sessions" DISPATCH_STALE_MIN=60 "$CODEX" liveness "$TMP/codex-jobs.log" >/tmp/codex_liveness.out 2>/tmp/codex_liveness.err \
-  && grep -q '^ALIVE    live-codex ' /tmp/codex_liveness.out \
-  && grep -q '^open 1 ; alive 1 ; suspect/dead 0$' /tmp/codex_liveness.out; then
+if CODEX_SESSIONS="$TMP/codex-live-sessions" DISPATCH_STALE_MIN=60 "$CODEX" liveness "$TMP/codex-jobs.log" >"$TMP/logs/codex_liveness.out" 2>"$TMP/logs/codex_liveness.err" \
+  && grep -q '^ALIVE    live-codex ' "$TMP/logs/codex_liveness.out" \
+  && grep -q '^open 1 ; alive 1 ; suspect/dead 0$' "$TMP/logs/codex_liveness.out"; then
   ok "codex liveness wrapper matches worktree to session transcript"
 else
   bad "codex liveness wrapper should match worktree to session transcript"
 fi
 printf '2026-06-30T00:00:00Z\topen\t%s\t%s\tdead-codex\t-\n' "$TMP/repo" "$TMP/missing-live-wt" > "$TMP/codex-dead-jobs.log"
-if CODEX_SESSIONS="$TMP/codex-live-sessions" "$CODEX" liveness "$TMP/codex-dead-jobs.log" >/tmp/codex_liveness_dead.out 2>/tmp/codex_liveness_dead.err; then
+if CODEX_SESSIONS="$TMP/codex-live-sessions" "$CODEX" liveness "$TMP/codex-dead-jobs.log" >"$TMP/logs/codex_liveness_dead.out" 2>"$TMP/logs/codex_liveness_dead.err"; then
   bad "codex liveness wrapper should fail dead jobs"
 else
   rc=$?
   if [ "$rc" -eq 3 ] \
-    && grep -q '^DEAD     dead-codex ' /tmp/codex_liveness_dead.out \
-    && grep -q '^open 1 ; alive 0 ; suspect/dead 1$' /tmp/codex_liveness_dead.out; then
+    && grep -q '^DEAD     dead-codex ' "$TMP/logs/codex_liveness_dead.out" \
+    && grep -q '^open 1 ; alive 0 ; suspect/dead 1$' "$TMP/logs/codex_liveness_dead.out"; then
     ok "codex liveness wrapper reports dead jobs"
   else
     bad "codex liveness wrapper should report dead jobs"
@@ -1720,34 +1727,34 @@ sh_enc=$(printf '%s' "$sh_wt" | sed 's#[/._]#-#g')
 mkdir -p "$AGENT_HOME/projects/$sh_enc"
 printf '2026-07-01T00:00:00Z\topen\t%s\t%s\tsh-live\t-\n' "$TMP/repo" "$sh_wt" > "$TMP/sh-liveness-jobs.log"
 touch "$AGENT_HOME/projects/$sh_enc/s.jsonl"
-if DISPATCH_RUNTIME_ROOT="$AGENT_HOME" "$ROOT/utilities/dispatch-liveness.sh" "$TMP/sh-liveness-jobs.log" >/tmp/sh_liveness_alive.out 2>/tmp/sh_liveness_alive.err \
-  && grep -q '^ALIVE      sh-live  ' /tmp/sh_liveness_alive.out \
-  && grep -q '^— open 1 · alive 1 · suspect/dead/exited 0$' /tmp/sh_liveness_alive.out; then
+if DISPATCH_RUNTIME_ROOT="$AGENT_HOME" "$ROOT/utilities/dispatch-liveness.sh" "$TMP/sh-liveness-jobs.log" >"$TMP/logs/sh_liveness_alive.out" 2>"$TMP/logs/sh_liveness_alive.err" \
+  && grep -q '^ALIVE      sh-live  ' "$TMP/logs/sh_liveness_alive.out" \
+  && grep -q '^— open 1 · alive 1 · suspect/dead/exited 0$' "$TMP/logs/sh_liveness_alive.out"; then
   ok "dispatch-liveness.sh reports fresh transcript ALIVE"
 else
   bad "dispatch-liveness.sh should report fresh transcript ALIVE"
 fi
 touch -d '20 minutes ago' "$AGENT_HOME/projects/$sh_enc/s.jsonl"
-if DISPATCH_RUNTIME_ROOT="$AGENT_HOME" "$ROOT/utilities/dispatch-liveness.sh" "$TMP/sh-liveness-jobs.log" >/tmp/sh_liveness_suspect.out 2>/tmp/sh_liveness_suspect.err; then
+if DISPATCH_RUNTIME_ROOT="$AGENT_HOME" "$ROOT/utilities/dispatch-liveness.sh" "$TMP/sh-liveness-jobs.log" >"$TMP/logs/sh_liveness_suspect.out" 2>"$TMP/logs/sh_liveness_suspect.err"; then
   bad "dispatch-liveness.sh should exit non-zero when transcript goes SUSPECT"
 else
   rc=$?
   if [ "$rc" -eq 3 ] \
-    && grep -q 'SUSPECT  sh-live  ' /tmp/sh_liveness_suspect.out \
-    && grep -q '^— open 1 · alive 0 · suspect/dead/exited 1$' /tmp/sh_liveness_suspect.out; then
+    && grep -q 'SUSPECT  sh-live  ' "$TMP/logs/sh_liveness_suspect.out" \
+    && grep -q '^— open 1 · alive 0 · suspect/dead/exited 1$' "$TMP/logs/sh_liveness_suspect.out"; then
     ok "dispatch-liveness.sh reports stale transcript SUSPECT"
   else
     bad "dispatch-liveness.sh should report stale transcript SUSPECT"
   fi
 fi
 rm -f "$AGENT_HOME/projects/$sh_enc/s.jsonl"
-if DISPATCH_RUNTIME_ROOT="$AGENT_HOME" "$ROOT/utilities/dispatch-liveness.sh" "$TMP/sh-liveness-jobs.log" >/tmp/sh_liveness_dead.out 2>/tmp/sh_liveness_dead.err; then
+if DISPATCH_RUNTIME_ROOT="$AGENT_HOME" "$ROOT/utilities/dispatch-liveness.sh" "$TMP/sh-liveness-jobs.log" >"$TMP/logs/sh_liveness_dead.out" 2>"$TMP/logs/sh_liveness_dead.err"; then
   bad "dispatch-liveness.sh should exit non-zero when transcript is missing"
 else
   rc=$?
   if [ "$rc" -eq 3 ] \
-    && grep -q 'DEAD     sh-live  ' /tmp/sh_liveness_dead.out \
-    && grep -q '^— open 1 · alive 0 · suspect/dead/exited 1$' /tmp/sh_liveness_dead.out; then
+    && grep -q 'DEAD     sh-live  ' "$TMP/logs/sh_liveness_dead.out" \
+    && grep -q '^— open 1 · alive 0 · suspect/dead/exited 1$' "$TMP/logs/sh_liveness_dead.out"; then
     ok "dispatch-liveness.sh reports missing transcript DEAD"
   else
     bad "dispatch-liveness.sh should report missing transcript DEAD"
@@ -1759,34 +1766,34 @@ py_wt="$TMP/py-live-wt"
 mkdir -p "$py_wt" "$TMP/py-liveness-sessions"
 printf '{"payload":{"cwd":"%s"}}\n' "$py_wt" > "$TMP/py-liveness-sessions/s.jsonl"
 printf '2026-07-01T00:00:00Z\topen\t%s\t%s\tpy-live\t-\n' "$TMP/repo" "$py_wt" > "$TMP/py-liveness-jobs.log"
-if CODEX_SESSIONS="$TMP/py-liveness-sessions" "$ROOT/adapters/codex/bin/dispatch-liveness.py" "$TMP/py-liveness-jobs.log" >/tmp/py_liveness_alive.out 2>/tmp/py_liveness_alive.err \
-  && grep -q '^ALIVE    py-live ' /tmp/py_liveness_alive.out \
-  && grep -q '^open 1 ; alive 1 ; suspect/dead 0$' /tmp/py_liveness_alive.out; then
+if CODEX_SESSIONS="$TMP/py-liveness-sessions" "$ROOT/adapters/codex/bin/dispatch-liveness.py" "$TMP/py-liveness-jobs.log" >"$TMP/logs/py_liveness_alive.out" 2>"$TMP/logs/py_liveness_alive.err" \
+  && grep -q '^ALIVE    py-live ' "$TMP/logs/py_liveness_alive.out" \
+  && grep -q '^open 1 ; alive 1 ; suspect/dead 0$' "$TMP/logs/py_liveness_alive.out"; then
   ok "dispatch-liveness.py reports fresh transcript ALIVE"
 else
   bad "dispatch-liveness.py should report fresh transcript ALIVE"
 fi
 touch -d '20 minutes ago' "$TMP/py-liveness-sessions/s.jsonl"
-if CODEX_SESSIONS="$TMP/py-liveness-sessions" "$ROOT/adapters/codex/bin/dispatch-liveness.py" "$TMP/py-liveness-jobs.log" >/tmp/py_liveness_suspect.out 2>/tmp/py_liveness_suspect.err; then
+if CODEX_SESSIONS="$TMP/py-liveness-sessions" "$ROOT/adapters/codex/bin/dispatch-liveness.py" "$TMP/py-liveness-jobs.log" >"$TMP/logs/py_liveness_suspect.out" 2>"$TMP/logs/py_liveness_suspect.err"; then
   bad "dispatch-liveness.py should exit non-zero when transcript goes SUSPECT"
 else
   rc=$?
   if [ "$rc" -eq 3 ] \
-    && grep -q '^SUSPECT  py-live ' /tmp/py_liveness_suspect.out \
-    && grep -q '^open 1 ; alive 0 ; suspect/dead 1$' /tmp/py_liveness_suspect.out; then
+    && grep -q '^SUSPECT  py-live ' "$TMP/logs/py_liveness_suspect.out" \
+    && grep -q '^open 1 ; alive 0 ; suspect/dead 1$' "$TMP/logs/py_liveness_suspect.out"; then
     ok "dispatch-liveness.py reports stale transcript SUSPECT"
   else
     bad "dispatch-liveness.py should report stale transcript SUSPECT"
   fi
 fi
 rm -f "$TMP/py-liveness-sessions/s.jsonl"
-if CODEX_SESSIONS="$TMP/py-liveness-sessions" "$ROOT/adapters/codex/bin/dispatch-liveness.py" "$TMP/py-liveness-jobs.log" >/tmp/py_liveness_dead.out 2>/tmp/py_liveness_dead.err; then
+if CODEX_SESSIONS="$TMP/py-liveness-sessions" "$ROOT/adapters/codex/bin/dispatch-liveness.py" "$TMP/py-liveness-jobs.log" >"$TMP/logs/py_liveness_dead.out" 2>"$TMP/logs/py_liveness_dead.err"; then
   bad "dispatch-liveness.py should exit non-zero when transcript is missing"
 else
   rc=$?
   if [ "$rc" -eq 3 ] \
-    && grep -q '^DEAD     py-live ' /tmp/py_liveness_dead.out \
-    && grep -q '^open 1 ; alive 0 ; suspect/dead 1$' /tmp/py_liveness_dead.out; then
+    && grep -q '^DEAD     py-live ' "$TMP/logs/py_liveness_dead.out" \
+    && grep -q '^open 1 ; alive 0 ; suspect/dead 1$' "$TMP/logs/py_liveness_dead.out"; then
     ok "dispatch-liveness.py reports missing transcript DEAD"
   else
     bad "dispatch-liveness.py should report missing transcript DEAD"
@@ -1800,8 +1807,8 @@ parity_sh_enc=$(printf '%s' "$parity_sh_wt" | sed 's#[/._]#-#g')
 mkdir -p "$AGENT_HOME/projects/$parity_sh_enc"
 printf '2026-07-01T00:00:00Z\topen\t%s\t%s\tparity-sh\t-\n' "$TMP/repo" "$parity_sh_wt" > "$TMP/parity-sh-jobs.log"
 touch -d '10 minutes ago' "$AGENT_HOME/projects/$parity_sh_enc/s.jsonl"
-if DISPATCH_RUNTIME_ROOT="$AGENT_HOME" "$ROOT/utilities/dispatch-liveness.sh" "$TMP/parity-sh-jobs.log" >/tmp/parity_sh_10m.out 2>/tmp/parity_sh_10m.err \
-  && grep -q '^ALIVE      parity-sh ' /tmp/parity_sh_10m.out; then
+if DISPATCH_RUNTIME_ROOT="$AGENT_HOME" "$ROOT/utilities/dispatch-liveness.sh" "$TMP/parity-sh-jobs.log" >"$TMP/logs/parity_sh_10m.out" 2>"$TMP/logs/parity_sh_10m.err" \
+  && grep -q '^ALIVE      parity-sh ' "$TMP/logs/parity_sh_10m.out"; then
   ok "dispatch-liveness.sh: ~10m transcript is ALIVE under default STALE_MIN=15"
 else
   bad "dispatch-liveness.sh should report ~10m transcript ALIVE under default STALE_MIN=15"
@@ -1812,19 +1819,19 @@ mkdir -p "$parity_py_wt" "$TMP/parity-py-sessions"
 printf '{"payload":{"cwd":"%s"}}\n' "$parity_py_wt" > "$TMP/parity-py-sessions/s.jsonl"
 touch -d '10 minutes ago' "$TMP/parity-py-sessions/s.jsonl"
 printf '2026-07-01T00:00:00Z\topen\t%s\t%s\tparity-py\t-\n' "$TMP/repo" "$parity_py_wt" > "$TMP/parity-py-jobs.log"
-if CODEX_SESSIONS="$TMP/parity-py-sessions" "$ROOT/adapters/codex/bin/dispatch-liveness.py" "$TMP/parity-py-jobs.log" >/tmp/parity_py_10m.out 2>/tmp/parity_py_10m.err \
-  && grep -q '^ALIVE    parity-py ' /tmp/parity_py_10m.out; then
+if CODEX_SESSIONS="$TMP/parity-py-sessions" "$ROOT/adapters/codex/bin/dispatch-liveness.py" "$TMP/parity-py-jobs.log" >"$TMP/logs/parity_py_10m.out" 2>"$TMP/logs/parity_py_10m.err" \
+  && grep -q '^ALIVE    parity-py ' "$TMP/logs/parity_py_10m.out"; then
   ok "dispatch-liveness.py: ~10m transcript is ALIVE under default STALE_MIN=15"
 else
   bad "dispatch-liveness.py should report ~10m transcript ALIVE under default STALE_MIN=15"
 fi
 
 touch -d '20 minutes ago' "$AGENT_HOME/projects/$parity_sh_enc/s.jsonl"
-if DISPATCH_RUNTIME_ROOT="$AGENT_HOME" "$ROOT/utilities/dispatch-liveness.sh" "$TMP/parity-sh-jobs.log" >/tmp/parity_sh_20m.out 2>/tmp/parity_sh_20m.err; then
+if DISPATCH_RUNTIME_ROOT="$AGENT_HOME" "$ROOT/utilities/dispatch-liveness.sh" "$TMP/parity-sh-jobs.log" >"$TMP/logs/parity_sh_20m.out" 2>"$TMP/logs/parity_sh_20m.err"; then
   bad "dispatch-liveness.sh should exit non-zero for a ~20m transcript under default STALE_MIN=15"
 else
   rc=$?
-  if [ "$rc" -eq 3 ] && grep -q 'SUSPECT  parity-sh  ' /tmp/parity_sh_20m.out; then
+  if [ "$rc" -eq 3 ] && grep -q 'SUSPECT  parity-sh  ' "$TMP/logs/parity_sh_20m.out"; then
     ok "dispatch-liveness.sh: ~20m transcript is SUSPECT under default STALE_MIN=15"
   else
     bad "dispatch-liveness.sh should report ~20m transcript SUSPECT under default STALE_MIN=15"
@@ -1832,54 +1839,54 @@ else
 fi
 
 touch -d '20 minutes ago' "$TMP/parity-py-sessions/s.jsonl"
-if CODEX_SESSIONS="$TMP/parity-py-sessions" "$ROOT/adapters/codex/bin/dispatch-liveness.py" "$TMP/parity-py-jobs.log" >/tmp/parity_py_20m.out 2>/tmp/parity_py_20m.err; then
+if CODEX_SESSIONS="$TMP/parity-py-sessions" "$ROOT/adapters/codex/bin/dispatch-liveness.py" "$TMP/parity-py-jobs.log" >"$TMP/logs/parity_py_20m.out" 2>"$TMP/logs/parity_py_20m.err"; then
   bad "dispatch-liveness.py should exit non-zero for a ~20m transcript under default STALE_MIN=15"
 else
   rc=$?
-  if [ "$rc" -eq 3 ] && grep -q '^SUSPECT  parity-py ' /tmp/parity_py_20m.out; then
+  if [ "$rc" -eq 3 ] && grep -q '^SUSPECT  parity-py ' "$TMP/logs/parity_py_20m.out"; then
     ok "dispatch-liveness.py: ~20m transcript is SUSPECT under default STALE_MIN=15"
   else
     bad "dispatch-liveness.py should report ~20m transcript SUSPECT under default STALE_MIN=15"
   fi
 fi
-if "$CODEX" mcp >/tmp/codex_mcp.out 2>/tmp/codex_mcp.err \
-  && grep -q '^adapter=codex$' /tmp/codex_mcp.out \
-  && grep -q '^runtime_surface=codex-native-mcp$' /tmp/codex_mcp.out \
-  && grep -q '^mcp_surface=codex mcp$' /tmp/codex_mcp.out \
-  && grep -q '^design_mcp_projection=policy-not-adopted-approval-gated$' /tmp/codex_mcp.out \
-  && grep -q '^design_mcp_registration=stdio-mcp_servers.design-node-server.js$' /tmp/codex_mcp.out \
-  && grep -q '^claude_settings_mcp=unsupported$' /tmp/codex_mcp.out; then
+if "$CODEX" mcp >"$TMP/logs/codex_mcp.out" 2>"$TMP/logs/codex_mcp.err" \
+  && grep -q '^adapter=codex$' "$TMP/logs/codex_mcp.out" \
+  && grep -q '^runtime_surface=codex-native-mcp$' "$TMP/logs/codex_mcp.out" \
+  && grep -q '^mcp_surface=codex mcp$' "$TMP/logs/codex_mcp.out" \
+  && grep -q '^design_mcp_projection=policy-not-adopted-approval-gated$' "$TMP/logs/codex_mcp.out" \
+  && grep -q '^design_mcp_registration=stdio-mcp_servers.design-node-server.js$' "$TMP/logs/codex_mcp.out" \
+  && grep -q '^claude_settings_mcp=unsupported$' "$TMP/logs/codex_mcp.out"; then
   ok "codex mcp wrapper reports native MCP contract"
 else
   bad "codex mcp wrapper should report native MCP contract"
 fi
-if "$CODEX" mcp --check >/tmp/codex_mcp_check.out 2>/tmp/codex_mcp_check.err \
-  && grep -q '^check=ok$' /tmp/codex_mcp_check.out; then
+if "$CODEX" mcp --check >"$TMP/logs/codex_mcp_check.out" 2>"$TMP/logs/codex_mcp_check.err" \
+  && grep -q '^check=ok$' "$TMP/logs/codex_mcp_check.out"; then
   ok "codex mcp wrapper checks native MCP CLI"
 else
   bad "codex mcp wrapper should check native MCP CLI"
 fi
-if "$CODEX" ui-info >/tmp/codex_ui.out 2>/tmp/codex_ui.err \
-  && grep -q '^adapter=codex$' /tmp/codex_ui.out \
-  && grep -q '^runtime_surface=codex-native-ui-boundary$' /tmp/codex_ui.out \
-  && grep -q '^statusline_surface=codex-native-footer-config$' /tmp/codex_ui.out \
-  && grep -q '^statusline_custom_dynamic_fields=unsupported$' /tmp/codex_ui.out \
-  && grep -q '^statusline_fragment=codex_setting/codex-config/tui-statusline.toml$' /tmp/codex_ui.out \
-  && grep -q '^harness_status_surface=adapter-owned-preflight-status$' /tmp/codex_ui.out \
-  && grep -q '^autopilot_entrypoints=codex-native-skills$' /tmp/codex_ui.out \
-  && grep -q '^autopilot_auto_routing=instruction-guided-not-claude-slash-router$' /tmp/codex_ui.out \
-  && grep -q '^subagent_auto_spawn=explicit-or-main-dispatched$' /tmp/codex_ui.out \
-  && grep -q '^subagent_feature_check=adapters/codex/bin/preflight.sh subagent-info --check$' /tmp/codex_ui.out; then
+if "$CODEX" ui-info >"$TMP/logs/codex_ui.out" 2>"$TMP/logs/codex_ui.err" \
+  && grep -q '^adapter=codex$' "$TMP/logs/codex_ui.out" \
+  && grep -q '^runtime_surface=codex-native-ui-boundary$' "$TMP/logs/codex_ui.out" \
+  && grep -q '^statusline_surface=codex-native-footer-config$' "$TMP/logs/codex_ui.out" \
+  && grep -q '^statusline_custom_dynamic_fields=unsupported$' "$TMP/logs/codex_ui.out" \
+  && grep -q '^statusline_fragment=codex_setting/codex-config/tui-statusline.toml$' "$TMP/logs/codex_ui.out" \
+  && grep -q '^harness_status_surface=adapter-owned-preflight-status$' "$TMP/logs/codex_ui.out" \
+  && grep -q '^autopilot_entrypoints=codex-native-skills$' "$TMP/logs/codex_ui.out" \
+  && grep -q '^autopilot_auto_routing=instruction-guided-not-claude-slash-router$' "$TMP/logs/codex_ui.out" \
+  && grep -q '^subagent_auto_spawn=explicit-or-main-dispatched$' "$TMP/logs/codex_ui.out" \
+  && grep -q '^subagent_feature_check=adapters/codex/bin/preflight.sh subagent-info --check$' "$TMP/logs/codex_ui.out"; then
   ok "codex ui-info reports native UI and parity boundaries"
 else
   bad "codex ui-info should report native UI and parity boundaries"
 fi
-if "$CODEX" subagent-info >/tmp/codex_subagent_info.out 2>/tmp/codex_subagent_info.err \
-  && grep -q '^runtime_surface=codex-native-subagents$' /tmp/codex_subagent_info.out \
-  && grep -q '^feature=multi_agent$' /tmp/codex_subagent_info.out \
-  && grep -q '^trigger=explicit-user-request-or-main-dispatch$' /tmp/codex_subagent_info.out \
-  && grep -q '^auto_spawn=explicit-or-main-dispatched$' /tmp/codex_subagent_info.out \
-  && grep -q '^claude_subagent_frontmatter=unsupported$' /tmp/codex_subagent_info.out; then
+if "$CODEX" subagent-info >"$TMP/logs/codex_subagent_info.out" 2>"$TMP/logs/codex_subagent_info.err" \
+  && grep -q '^runtime_surface=codex-native-subagents$' "$TMP/logs/codex_subagent_info.out" \
+  && grep -q '^feature=multi_agent$' "$TMP/logs/codex_subagent_info.out" \
+  && grep -q '^trigger=explicit-user-request-or-main-dispatch$' "$TMP/logs/codex_subagent_info.out" \
+  && grep -q '^auto_spawn=explicit-or-main-dispatched$' "$TMP/logs/codex_subagent_info.out" \
+  && grep -q '^claude_subagent_frontmatter=unsupported$' "$TMP/logs/codex_subagent_info.out"; then
   ok "codex subagent-info reports native subagent contract"
 else
   bad "codex subagent-info should report native subagent contract"
@@ -1889,9 +1896,9 @@ if ! grep -q 'auto_spawn=explicit-only' "$CODEX"; then
 else
   bad "codex preflight should not report auto_spawn=explicit-only next to an explicit-or-main-dispatch trigger"
 fi
-if "$CODEX" subagent-info --check >/tmp/codex_subagent_check.out 2>/tmp/codex_subagent_check.err \
-  && grep -q '^check=ok$' /tmp/codex_subagent_check.out \
-  && grep -q '^feature=multi_agent$' /tmp/codex_subagent_check.out; then
+if "$CODEX" subagent-info --check >"$TMP/logs/codex_subagent_check.out" 2>"$TMP/logs/codex_subagent_check.err" \
+  && grep -q '^check=ok$' "$TMP/logs/codex_subagent_check.out" \
+  && grep -q '^feature=multi_agent$' "$TMP/logs/codex_subagent_check.out"; then
   ok "codex subagent-info checks native multi-agent feature"
 else
   bad "codex subagent-info should check native multi-agent feature"
@@ -1907,9 +1914,9 @@ status_line = ["old"]
 [hooks.state]
 "example" = "keep"
 EOF
-if AGENT_HOME="$ROOT" CODEX_HOME="$TUIHOME" "$CODEX" tui-config >/tmp/codex_tui.out 2>/tmp/codex_tui.err \
-  && grep -q '^status=ok$' /tmp/codex_tui.out \
-  && grep -q '^changed=yes$' /tmp/codex_tui.out \
+if AGENT_HOME="$ROOT" CODEX_HOME="$TUIHOME" "$CODEX" tui-config >"$TMP/logs/codex_tui.out" 2>"$TMP/logs/codex_tui.err" \
+  && grep -q '^status=ok$' "$TMP/logs/codex_tui.out" \
+  && grep -q '^changed=yes$' "$TMP/logs/codex_tui.out" \
   && grep -Fq 'status_line = ["project-name", "git-branch", "context-used", "current-dir", "model-with-reasoning", "five-hour-limit", "weekly-limit"]' "$TUIHOME/config.toml" \
   && grep -Fq 'status_line_use_colors = true' "$TUIHOME/config.toml" \
   && grep -Fq 'model = "keep-me"' "$TUIHOME/config.toml" \
@@ -1919,228 +1926,228 @@ if AGENT_HOME="$ROOT" CODEX_HOME="$TUIHOME" "$CODEX" tui-config >/tmp/codex_tui.
 else
   bad "codex tui-config should apply only harness statusline keys"
 fi
-if AGENT_HOME="$ROOT" CODEX_HOME="$TUIHOME" "$CODEX" tui-config >/tmp/codex_tui2.out 2>/tmp/codex_tui2.err \
-  && grep -q '^changed=no$' /tmp/codex_tui2.out; then
+if AGENT_HOME="$ROOT" CODEX_HOME="$TUIHOME" "$CODEX" tui-config >"$TMP/logs/codex_tui2.out" 2>"$TMP/logs/codex_tui2.err" \
+  && grep -q '^changed=no$' "$TMP/logs/codex_tui2.out"; then
   ok "codex tui-config is idempotent"
 else
   bad "codex tui-config should be idempotent"
 fi
-if "$CODEX" loop-info oncall >/tmp/codex_loop_oncall.out 2>/tmp/codex_loop_oncall.err \
-  && grep -q '^adapter=codex$' /tmp/codex_loop_oncall.out \
-  && grep -q '^loop=oncall$' /tmp/codex_loop_oncall.out \
-  && grep -q '^source=loops/oncall.md$' /tmp/codex_loop_oncall.out \
-  && grep -q '^status=manual-contract$' /tmp/codex_loop_oncall.out \
-  && grep -q '^runtime_surface=codex-loop-guidance$' /tmp/codex_loop_oncall.out \
-  && grep -q '^executable_projection=unsupported-runtime-script$' /tmp/codex_loop_oncall.out; then
+if "$CODEX" loop-info oncall >"$TMP/logs/codex_loop_oncall.out" 2>"$TMP/logs/codex_loop_oncall.err" \
+  && grep -q '^adapter=codex$' "$TMP/logs/codex_loop_oncall.out" \
+  && grep -q '^loop=oncall$' "$TMP/logs/codex_loop_oncall.out" \
+  && grep -q '^source=loops/oncall.md$' "$TMP/logs/codex_loop_oncall.out" \
+  && grep -q '^status=manual-contract$' "$TMP/logs/codex_loop_oncall.out" \
+  && grep -q '^runtime_surface=codex-loop-guidance$' "$TMP/logs/codex_loop_oncall.out" \
+  && grep -q '^executable_projection=unsupported-runtime-script$' "$TMP/logs/codex_loop_oncall.out"; then
   ok "codex loop wrapper reports oncall manual contract"
 else
   bad "codex loop wrapper should report oncall manual contract"
 fi
-if "$CODEX" loop-info drill >/tmp/codex_loop_drill.out 2>/tmp/codex_loop_drill.err \
-  && grep -q '^source=loops/drill/README.md$' /tmp/codex_loop_drill.out \
-  && grep -q '^status=manual-contract$' /tmp/codex_loop_drill.out \
-  && grep -q '^trigger=manual-only$' /tmp/codex_loop_drill.out \
-  && grep -q '^auto_run=unsupported$' /tmp/codex_loop_drill.out \
-  && grep -q '^fallback=report-drill-would-be-useful$' /tmp/codex_loop_drill.out; then
+if "$CODEX" loop-info drill >"$TMP/logs/codex_loop_drill.out" 2>"$TMP/logs/codex_loop_drill.err" \
+  && grep -q '^source=loops/drill/README.md$' "$TMP/logs/codex_loop_drill.out" \
+  && grep -q '^status=manual-contract$' "$TMP/logs/codex_loop_drill.out" \
+  && grep -q '^trigger=manual-only$' "$TMP/logs/codex_loop_drill.out" \
+  && grep -q '^auto_run=unsupported$' "$TMP/logs/codex_loop_drill.out" \
+  && grep -q '^fallback=report-drill-would-be-useful$' "$TMP/logs/codex_loop_drill.out"; then
   ok "codex loop wrapper prevents automatic drill execution"
 else
   bad "codex loop wrapper should prevent automatic drill execution"
 fi
-if "$CODEX" loop-info study >/tmp/codex_loop_study.out 2>/tmp/codex_loop_study.err \
-  && grep -q '^source=loops/study.md$' /tmp/codex_loop_study.out \
-  && grep -q '^status=manual-contract$' /tmp/codex_loop_study.out \
-  && grep -q '^action=proposal-report-only$' /tmp/codex_loop_study.out \
-  && grep -q '^fallback=read-source-and-draft-proposal-in-main-session$' /tmp/codex_loop_study.out; then
+if "$CODEX" loop-info study >"$TMP/logs/codex_loop_study.out" 2>"$TMP/logs/codex_loop_study.err" \
+  && grep -q '^source=loops/study.md$' "$TMP/logs/codex_loop_study.out" \
+  && grep -q '^status=manual-contract$' "$TMP/logs/codex_loop_study.out" \
+  && grep -q '^action=proposal-report-only$' "$TMP/logs/codex_loop_study.out" \
+  && grep -q '^fallback=read-source-and-draft-proposal-in-main-session$' "$TMP/logs/codex_loop_study.out"; then
   ok "codex loop wrapper reports study proposal contract"
 else
   bad "codex loop wrapper should report study proposal contract"
 fi
-if "$CODEX" loop-info note >/tmp/codex_loop_note.out 2>/tmp/codex_loop_note.err \
-  && grep -q '^loop=note$' /tmp/codex_loop_note.out \
-  && grep -q '^status=unsupported$' /tmp/codex_loop_note.out \
-  && grep -q '^runtime_surface=missing-native-loop$' /tmp/codex_loop_note.out \
-  && grep -q '^related_extension=artifact-sink$' /tmp/codex_loop_note.out \
-  && grep -q '^native_extension_surface=application-owned-plugin$' /tmp/codex_loop_note.out \
-  && grep -q '^scheduler_surface=external-application$' /tmp/codex_loop_note.out \
-  && grep -q '^fallback=extension-unavailable-or-application-scheduler$' /tmp/codex_loop_note.out; then
+if "$CODEX" loop-info note >"$TMP/logs/codex_loop_note.out" 2>"$TMP/logs/codex_loop_note.err" \
+  && grep -q '^loop=note$' "$TMP/logs/codex_loop_note.out" \
+  && grep -q '^status=unsupported$' "$TMP/logs/codex_loop_note.out" \
+  && grep -q '^runtime_surface=missing-native-loop$' "$TMP/logs/codex_loop_note.out" \
+  && grep -q '^related_extension=artifact-sink$' "$TMP/logs/codex_loop_note.out" \
+  && grep -q '^native_extension_surface=application-owned-plugin$' "$TMP/logs/codex_loop_note.out" \
+  && grep -q '^scheduler_surface=external-application$' "$TMP/logs/codex_loop_note.out" \
+  && grep -q '^fallback=extension-unavailable-or-application-scheduler$' "$TMP/logs/codex_loop_note.out"; then
   ok "codex loop wrapper marks missing note loop unsupported"
 else
   bad "codex loop wrapper should mark missing note loop unsupported"
 fi
-if AGENT_MODEL_FAST=fast-model AGENT_REASONING_FAST=low "$CODEX" role fast reviewer >/tmp/role.out 2>/tmp/role.err \
-  && grep -q '^family=fast$' /tmp/role.out \
-  && grep -q '^adapter=codex$' /tmp/role.out \
-  && grep -q '^source=roles/README.md$' /tmp/role.out \
-  && grep -q '^model=fast-model$' /tmp/role.out \
-  && grep -q '^reasoning=low$' /tmp/role.out; then
+if AGENT_MODEL_FAST=fast-model AGENT_REASONING_FAST=low "$CODEX" role fast reviewer >"$TMP/logs/role.out" 2>"$TMP/logs/role.err" \
+  && grep -q '^family=fast$' "$TMP/logs/role.out" \
+  && grep -q '^adapter=codex$' "$TMP/logs/role.out" \
+  && grep -q '^source=roles/README.md$' "$TMP/logs/role.out" \
+  && grep -q '^model=fast-model$' "$TMP/logs/role.out" \
+  && grep -q '^reasoning=low$' "$TMP/logs/role.out"; then
   ok "codex role wrapper maps fast portable role"
 else
   bad "codex role wrapper should map fast portable role"
 fi
 # 재홈 2026-07-22 (CONVENTIONS §2.3): pipeline-stage aliases resolve deterministically to
 # portable ROLES with unit-catalog guidance; retired team profiles/paths must not reappear.
-if "$CODEX" role planning >/tmp/codex_role_planning.out 2>/tmp/codex_role_planning.err \
-  && grep -q '^pipeline_stage=planning$' /tmp/codex_role_planning.out \
-  && grep -q '^portable_model_role=deep maker$' /tmp/codex_role_planning.out \
-  && grep -q '^unit_catalog=roles/units/$' /tmp/codex_role_planning.out \
-  && ! grep -q '^role_profile=' /tmp/codex_role_planning.out \
-  && ! grep -q '^native_agent_path=' /tmp/codex_role_planning.out \
-  && ! grep -q 'team' /tmp/codex_role_planning.out \
-  && "$CODEX" role implementation >/tmp/codex_role_impl.out 2>/tmp/codex_role_impl.err \
-  && grep -q '^pipeline_stage=implementation$' /tmp/codex_role_impl.out \
-  && grep -q '^portable_model_role=fast implementer$' /tmp/codex_role_impl.out \
-  && "$CODEX" role verification >/tmp/codex_role_verify.out 2>/tmp/codex_role_verify.err \
-  && grep -q '^pipeline_stage=verification$' /tmp/codex_role_verify.out \
-  && grep -q '^portable_model_role=variable reviewer$' /tmp/codex_role_verify.out \
-  && grep -q '^role_set=fast reviewer,deep reviewer,external adversary$' /tmp/codex_role_verify.out \
-  && "$CODEX" role report >/tmp/codex_role_report.out 2>/tmp/codex_role_report.err \
-  && grep -q '^pipeline_stage=report$' /tmp/codex_role_report.out \
-  && grep -q '^portable_model_role=fast writer$' /tmp/codex_role_report.out; then
+if "$CODEX" role planning >"$TMP/logs/codex_role_planning.out" 2>"$TMP/logs/codex_role_planning.err" \
+  && grep -q '^pipeline_stage=planning$' "$TMP/logs/codex_role_planning.out" \
+  && grep -q '^portable_model_role=deep maker$' "$TMP/logs/codex_role_planning.out" \
+  && grep -q '^unit_catalog=roles/units/$' "$TMP/logs/codex_role_planning.out" \
+  && ! grep -q '^role_profile=' "$TMP/logs/codex_role_planning.out" \
+  && ! grep -q '^native_agent_path=' "$TMP/logs/codex_role_planning.out" \
+  && ! grep -q 'team' "$TMP/logs/codex_role_planning.out" \
+  && "$CODEX" role implementation >"$TMP/logs/codex_role_impl.out" 2>"$TMP/logs/codex_role_impl.err" \
+  && grep -q '^pipeline_stage=implementation$' "$TMP/logs/codex_role_impl.out" \
+  && grep -q '^portable_model_role=fast implementer$' "$TMP/logs/codex_role_impl.out" \
+  && "$CODEX" role verification >"$TMP/logs/codex_role_verify.out" 2>"$TMP/logs/codex_role_verify.err" \
+  && grep -q '^pipeline_stage=verification$' "$TMP/logs/codex_role_verify.out" \
+  && grep -q '^portable_model_role=variable reviewer$' "$TMP/logs/codex_role_verify.out" \
+  && grep -q '^role_set=fast reviewer,deep reviewer,external adversary$' "$TMP/logs/codex_role_verify.out" \
+  && "$CODEX" role report >"$TMP/logs/codex_role_report.out" 2>"$TMP/logs/codex_role_report.err" \
+  && grep -q '^pipeline_stage=report$' "$TMP/logs/codex_role_report.out" \
+  && grep -q '^portable_model_role=fast writer$' "$TMP/logs/codex_role_report.out"; then
   ok "codex role wrapper maps pipeline stages to portable unit-catalog roles"
 else
   bad "codex role wrapper should map pipeline stages to portable unit-catalog roles"
 fi
-if "$CODEX" role plan team >/tmp/codex_role_retired.out 2>/tmp/codex_role_retired.err; then
+if "$CODEX" role plan team >"$TMP/logs/codex_role_retired.out" 2>"$TMP/logs/codex_role_retired.err"; then
   bad "codex role wrapper should reject the retired 'plan team' profile alias"
 else
   ok "codex role wrapper rejects the retired 'plan team' profile alias"
 fi
-if "$CODEX" role variable reviewer >/tmp/role_set.out 2>/tmp/role_set.err \
-  && grep -q '^role=variable reviewer$' /tmp/role_set.out \
-  && grep -q '^family=role-set$' /tmp/role_set.out \
-  && grep -q '^role_set=fast reviewer,deep reviewer,external adversary$' /tmp/role_set.out \
-  && grep -q '^reasoning=select-by-mode$' /tmp/role_set.out \
-  && "$CODEX" role 'deep maker plus fast tool worker' >/tmp/role_set_material.out 2>/tmp/role_set_material.err \
-  && grep -q '^role_set=deep maker,fast tool worker$' /tmp/role_set_material.out; then
+if "$CODEX" role variable reviewer >"$TMP/logs/role_set.out" 2>"$TMP/logs/role_set.err" \
+  && grep -q '^role=variable reviewer$' "$TMP/logs/role_set.out" \
+  && grep -q '^family=role-set$' "$TMP/logs/role_set.out" \
+  && grep -q '^role_set=fast reviewer,deep reviewer,external adversary$' "$TMP/logs/role_set.out" \
+  && grep -q '^reasoning=select-by-mode$' "$TMP/logs/role_set.out" \
+  && "$CODEX" role 'deep maker plus fast tool worker' >"$TMP/logs/role_set_material.out" 2>"$TMP/logs/role_set_material.err" \
+  && grep -q '^role_set=deep maker,fast tool worker$' "$TMP/logs/role_set_material.out"; then
   ok "codex role wrapper reports mixed role sets"
 else
   bad "codex role wrapper should report mixed role sets"
 fi
-if AGENT_MODEL_ORCHESTRATOR=orchestrator-model AGENT_REASONING_ORCHESTRATOR=medium "$CODEX" role external adversary orchestrator >/tmp/role.out 2>/tmp/role.err \
-  && grep -q '^family=balanced$' /tmp/role.out \
-  && grep -q '^adapter=codex$' /tmp/role.out \
-  && grep -q '^model=orchestrator-model$' /tmp/role.out \
-  && grep -q '^reasoning=medium$' /tmp/role.out \
-  && grep -q '^available=1$' /tmp/role.out \
-  && grep -q '^status=configured$' /tmp/role.out; then
+if AGENT_MODEL_ORCHESTRATOR=orchestrator-model AGENT_REASONING_ORCHESTRATOR=medium "$CODEX" role external adversary orchestrator >"$TMP/logs/role.out" 2>"$TMP/logs/role.err" \
+  && grep -q '^family=balanced$' "$TMP/logs/role.out" \
+  && grep -q '^adapter=codex$' "$TMP/logs/role.out" \
+  && grep -q '^model=orchestrator-model$' "$TMP/logs/role.out" \
+  && grep -q '^reasoning=medium$' "$TMP/logs/role.out" \
+  && grep -q '^available=1$' "$TMP/logs/role.out" \
+  && grep -q '^status=configured$' "$TMP/logs/role.out"; then
   ok "codex role wrapper maps external adversary orchestrator role"
 else
   bad "codex role wrapper should map external adversary orchestrator role"
 fi
-if "$CODEX" role external adversary >/tmp/role.out 2>/tmp/role.err \
-  && grep -q '^available=0$' /tmp/role.out \
-  && grep -q '^status=unavailable$' /tmp/role.out \
-  && grep -q '^reason=set AGENT_MODEL_EXTERNAL or AGENT_EXTERNAL_CMD for an independent external adversary$' /tmp/role.out; then
+if "$CODEX" role external adversary >"$TMP/logs/role.out" 2>"$TMP/logs/role.err" \
+  && grep -q '^available=0$' "$TMP/logs/role.out" \
+  && grep -q '^status=unavailable$' "$TMP/logs/role.out" \
+  && grep -q '^reason=set AGENT_MODEL_EXTERNAL or AGENT_EXTERNAL_CMD for an independent external adversary$' "$TMP/logs/role.out"; then
   ok "codex role wrapper marks external adversary unavailable by default"
 else
   bad "codex role wrapper should mark external adversary unavailable by default"
 fi
-if AGENT_MODEL_EXTERNAL=external-model AGENT_REASONING_EXTERNAL=high "$CODEX" role external adversary >/tmp/role.out 2>/tmp/role.err \
-  && grep -q '^family=external$' /tmp/role.out \
-  && grep -q '^available=1$' /tmp/role.out \
-  && grep -q '^status=configured$' /tmp/role.out \
-  && grep -q '^model=external-model$' /tmp/role.out \
-  && grep -q '^reasoning=high$' /tmp/role.out; then
+if AGENT_MODEL_EXTERNAL=external-model AGENT_REASONING_EXTERNAL=high "$CODEX" role external adversary >"$TMP/logs/role.out" 2>"$TMP/logs/role.err" \
+  && grep -q '^family=external$' "$TMP/logs/role.out" \
+  && grep -q '^available=1$' "$TMP/logs/role.out" \
+  && grep -q '^status=configured$' "$TMP/logs/role.out" \
+  && grep -q '^model=external-model$' "$TMP/logs/role.out" \
+  && grep -q '^reasoning=high$' "$TMP/logs/role.out"; then
   ok "codex role wrapper maps configured external adversary model"
 else
   bad "codex role wrapper should map configured external adversary model"
 fi
-if AGENT_EXTERNAL_CMD="sh -c" "$CODEX" role external adversary >/tmp/role.out 2>/tmp/role.err \
-  && grep -q '^available=1$' /tmp/role.out \
-  && grep -q '^status=configured$' /tmp/role.out \
-  && grep -q '^model=external-command$' /tmp/role.out \
-  && grep -q '^external_command=sh -c$' /tmp/role.out; then
+if AGENT_EXTERNAL_CMD="sh -c" "$CODEX" role external adversary >"$TMP/logs/role.out" 2>"$TMP/logs/role.err" \
+  && grep -q '^available=1$' "$TMP/logs/role.out" \
+  && grep -q '^status=configured$' "$TMP/logs/role.out" \
+  && grep -q '^model=external-command$' "$TMP/logs/role.out" \
+  && grep -q '^external_command=sh -c$' "$TMP/logs/role.out"; then
   ok "codex role wrapper accepts external adversary command with args"
 else
   bad "codex role wrapper should accept external adversary command with args"
 fi
-if AGENT_EXTERNAL_CMD="missing-external-adversary-command --review" "$CODEX" role external adversary >/tmp/role.out 2>/tmp/role.err \
-  && grep -q '^available=0$' /tmp/role.out \
-  && grep -q '^status=unavailable$' /tmp/role.out \
-  && grep -q '^reason=AGENT_EXTERNAL_CMD not found: missing-external-adversary-command$' /tmp/role.out; then
+if AGENT_EXTERNAL_CMD="missing-external-adversary-command --review" "$CODEX" role external adversary >"$TMP/logs/role.out" 2>"$TMP/logs/role.err" \
+  && grep -q '^available=0$' "$TMP/logs/role.out" \
+  && grep -q '^status=unavailable$' "$TMP/logs/role.out" \
+  && grep -q '^reason=AGENT_EXTERNAL_CMD not found: missing-external-adversary-command$' "$TMP/logs/role.out"; then
   ok "codex role wrapper reports missing external adversary command"
 else
   bad "codex role wrapper should report missing external adversary command"
 fi
-if "$CODEX" qa-policy adversarial code >/tmp/codex_qa_policy.out 2>/tmp/codex_qa_policy.err \
-  && grep -q '^runtime_surface=codex-qa-policy$' /tmp/codex_qa_policy.out \
-  && grep -q '^source=core/CONVENTIONS.md$' /tmp/codex_qa_policy.out \
-  && grep -q '^qa_level=adversarial$' /tmp/codex_qa_policy.out \
-  && grep -q '^qa_track=code$' /tmp/codex_qa_policy.out \
-  && grep -q '^fact_checker=skip-code-track$' /tmp/codex_qa_policy.out \
-  && grep -q '^external_adversary=1x-external-adversary$' /tmp/codex_qa_policy.out \
-  && grep -q '^codex_role_checks=.*preflight.sh role external adversary' /tmp/codex_qa_policy.out \
-  && grep -q '^independent_delegation_policy=claim-only-if-separate-codex-agent-headless-or-external-pass-ran$' /tmp/codex_qa_policy.out; then
+if "$CODEX" qa-policy adversarial code >"$TMP/logs/codex_qa_policy.out" 2>"$TMP/logs/codex_qa_policy.err" \
+  && grep -q '^runtime_surface=codex-qa-policy$' "$TMP/logs/codex_qa_policy.out" \
+  && grep -q '^source=core/CONVENTIONS.md$' "$TMP/logs/codex_qa_policy.out" \
+  && grep -q '^qa_level=adversarial$' "$TMP/logs/codex_qa_policy.out" \
+  && grep -q '^qa_track=code$' "$TMP/logs/codex_qa_policy.out" \
+  && grep -q '^fact_checker=skip-code-track$' "$TMP/logs/codex_qa_policy.out" \
+  && grep -q '^external_adversary=1x-external-adversary$' "$TMP/logs/codex_qa_policy.out" \
+  && grep -q '^codex_role_checks=.*preflight.sh role external adversary' "$TMP/logs/codex_qa_policy.out" \
+  && grep -q '^independent_delegation_policy=claim-only-if-separate-codex-agent-headless-or-external-pass-ran$' "$TMP/logs/codex_qa_policy.out"; then
   ok "codex qa-policy maps QA level to reviewer and fallback contract"
 else
   bad "codex qa-policy should map QA level to reviewer and fallback contract"
 fi
-if "$OPENCODE" qa-policy adversarial code >/tmp/opencode_qa_policy.out 2>/tmp/opencode_qa_policy.err \
-  && grep -q '^runtime_surface=opencode-qa-policy$' /tmp/opencode_qa_policy.out \
-  && grep -q '^source=core/CONVENTIONS.md$' /tmp/opencode_qa_policy.out \
-  && grep -q '^qa_level=adversarial$' /tmp/opencode_qa_policy.out \
-  && grep -q '^qa_track=code$' /tmp/opencode_qa_policy.out \
-  && grep -q '^fact_checker=skip-code-track$' /tmp/opencode_qa_policy.out \
-  && grep -q '^external_adversary=1x-external-adversary$' /tmp/opencode_qa_policy.out \
-  && grep -q '^opencode_role_checks=.*preflight.sh role external adversary' /tmp/opencode_qa_policy.out \
-  && grep -q '^stage_graph_selector=intensity-not-qa$' /tmp/opencode_qa_policy.out \
-  && grep -q '^independent_delegation_policy=claim-only-if-separate-opencode-agent-headless-or-external-pass-ran$' /tmp/opencode_qa_policy.out; then
+if "$OPENCODE" qa-policy adversarial code >"$TMP/logs/opencode_qa_policy.out" 2>"$TMP/logs/opencode_qa_policy.err" \
+  && grep -q '^runtime_surface=opencode-qa-policy$' "$TMP/logs/opencode_qa_policy.out" \
+  && grep -q '^source=core/CONVENTIONS.md$' "$TMP/logs/opencode_qa_policy.out" \
+  && grep -q '^qa_level=adversarial$' "$TMP/logs/opencode_qa_policy.out" \
+  && grep -q '^qa_track=code$' "$TMP/logs/opencode_qa_policy.out" \
+  && grep -q '^fact_checker=skip-code-track$' "$TMP/logs/opencode_qa_policy.out" \
+  && grep -q '^external_adversary=1x-external-adversary$' "$TMP/logs/opencode_qa_policy.out" \
+  && grep -q '^opencode_role_checks=.*preflight.sh role external adversary' "$TMP/logs/opencode_qa_policy.out" \
+  && grep -q '^stage_graph_selector=intensity-not-qa$' "$TMP/logs/opencode_qa_policy.out" \
+  && grep -q '^independent_delegation_policy=claim-only-if-separate-opencode-agent-headless-or-external-pass-ran$' "$TMP/logs/opencode_qa_policy.out"; then
   ok "opencode qa-policy maps QA level to reviewer and fallback contract"
 else
   bad "opencode qa-policy should map QA level to reviewer and fallback contract"
 fi
-if "$CODEX" capability-info autopilot-code >/tmp/cap.out 2>/tmp/cap.err \
-  && grep -q '^capability=autopilot-code$' /tmp/cap.out \
-  && grep -q '^adapter=codex$' /tmp/cap.out \
-  && grep -q '^native_skill=1$' /tmp/cap.out \
-  && grep -q '^native_skill_path=adapters/codex/skills/autopilot-code/SKILL.md$' /tmp/cap.out \
-  && grep -q '^realization=codex-native-skill$' /tmp/cap.out \
-  && grep -q '^compat_reference=not-projected$' /tmp/cap.out \
-  && ! grep -q '^compat_reference=skills/' /tmp/cap.out \
-  && grep -q '^status=instruction-only$' /tmp/cap.out \
-  && grep -q '^pipeline_contract=code-plan>code-execute>code-test>code-report$' /tmp/cap.out \
-  && grep -q '^optional_pipeline_step=code-refine$' /tmp/cap.out \
-  && grep -q '^artifact_contract=plans/<date>_<slug>:plan.md,checklist.md,pipeline_summary.md,dev_logs/,test_logs/$' /tmp/cap.out \
-  && grep -q '^role_contract=planning=plan/plan-author,plan-check=qa/plan-review,implementation=dev/\*,impl-review=qa/code-review,verification=qa/test,report=editorial/report$' /tmp/cap.out \
-  && grep -Fq 'dispatch_contract=preflight.sh dispatch --capability autopilot-code --capability-mode <mode> [--worker-mode <family/mode>] --qa <level> --intensity <level> --dispatch-depth 1|2 [--parent <slug>]' /tmp/cap.out; then
+if "$CODEX" capability-info autopilot-code >"$TMP/logs/cap.out" 2>"$TMP/logs/cap.err" \
+  && grep -q '^capability=autopilot-code$' "$TMP/logs/cap.out" \
+  && grep -q '^adapter=codex$' "$TMP/logs/cap.out" \
+  && grep -q '^native_skill=1$' "$TMP/logs/cap.out" \
+  && grep -q '^native_skill_path=adapters/codex/skills/autopilot-code/SKILL.md$' "$TMP/logs/cap.out" \
+  && grep -q '^realization=codex-native-skill$' "$TMP/logs/cap.out" \
+  && grep -q '^compat_reference=not-projected$' "$TMP/logs/cap.out" \
+  && ! grep -q '^compat_reference=skills/' "$TMP/logs/cap.out" \
+  && grep -q '^status=instruction-only$' "$TMP/logs/cap.out" \
+  && grep -q '^pipeline_contract=code-plan>code-execute>code-test>code-report$' "$TMP/logs/cap.out" \
+  && grep -q '^optional_pipeline_step=code-refine$' "$TMP/logs/cap.out" \
+  && grep -q '^artifact_contract=plans/<date>_<slug>:plan.md,checklist.md,pipeline_summary.md,dev_logs/,test_logs/$' "$TMP/logs/cap.out" \
+  && grep -q '^role_contract=planning=plan/plan-author,plan-check=qa/plan-review,implementation=dev/\*,impl-review=qa/code-review,verification=qa/test,report=editorial/report$' "$TMP/logs/cap.out" \
+  && grep -Fq 'dispatch_contract=preflight.sh dispatch --capability autopilot-code --capability-mode <mode> [--worker-mode <family/mode>] --qa <level> --intensity <level> --dispatch-depth 1|2 [--parent <slug>]' "$TMP/logs/cap.out"; then
   ok "codex capability wrapper reports native skill realization"
 else
   bad "codex capability wrapper should report native skill realization"
 fi
-if "$CODEX" capability-info code-test >/tmp/cap_code_test.out 2>/tmp/cap_code_test.err \
-  && grep -q '^capability=code-test$' /tmp/cap_code_test.out \
-  && grep -q '^native_skill=1$' /tmp/cap_code_test.out \
-  && grep -q '^status=tool-contract$' /tmp/cap_code_test.out \
-  && grep -q '^tool_contract=verification-runner$' /tmp/cap_code_test.out \
-  && grep -q '^tool_contract_check=adapters/codex/bin/preflight.sh verification-runner --check -- <command>$' /tmp/cap_code_test.out \
-  && grep -q '^runtime_surface=adapter-owned-verification-runner$' /tmp/cap_code_test.out \
-  && grep -q '^artifact_contract=plans/<date>_<slug>:test_logs/,_internal/test_reviews/;handoff=code-report$' /tmp/cap_code_test.out \
+if "$CODEX" capability-info code-test >"$TMP/logs/cap_code_test.out" 2>"$TMP/logs/cap_code_test.err" \
+  && grep -q '^capability=code-test$' "$TMP/logs/cap_code_test.out" \
+  && grep -q '^native_skill=1$' "$TMP/logs/cap_code_test.out" \
+  && grep -q '^status=tool-contract$' "$TMP/logs/cap_code_test.out" \
+  && grep -q '^tool_contract=verification-runner$' "$TMP/logs/cap_code_test.out" \
+  && grep -q '^tool_contract_check=adapters/codex/bin/preflight.sh verification-runner --check -- <command>$' "$TMP/logs/cap_code_test.out" \
+  && grep -q '^runtime_surface=adapter-owned-verification-runner$' "$TMP/logs/cap_code_test.out" \
+  && grep -q '^artifact_contract=plans/<date>_<slug>:test_logs/,_internal/test_reviews/;handoff=code-report$' "$TMP/logs/cap_code_test.out" \
   && grep -Fq '`code-report` alone updates `pipeline_summary.md`' "$ROOT/capabilities/code-test.md" \
-  && grep -q '^role_contract=verification=qa/test,review=qa/code-review$' /tmp/cap_code_test.out \
+  && grep -q '^role_contract=verification=qa/test,review=qa/code-review$' "$TMP/logs/cap_code_test.out" \
   && grep -q 'graduated verification' "$ROOT/adapters/codex/skills/code-test/SKILL.md"; then
   ok "codex code-test capability reports verification-runner contract"
 else
   bad "codex code-test capability should report verification-runner contract"
 fi
-if "$CODEX" capability-info design-review >/tmp/cap.out 2>/tmp/cap.err \
-  && grep -q '^capability=design-review$' /tmp/cap.out \
-  && grep -q '^native_skill=1$' /tmp/cap.out \
-  && grep -q '^realization=codex-native-skill$' /tmp/cap.out \
-  && grep -q '^status=tool-contract$' /tmp/cap.out \
-  && grep -q '^tool_contract=visual-harness$' /tmp/cap.out \
-  && grep -q '^tool_contract_check=adapters/codex/bin/preflight.sh visual-harness <file.html>$' /tmp/cap.out \
-  && grep -q '^runtime_surface=adapter-owned-visual-harness$' /tmp/cap.out \
-  && grep -q '^fallback=preflight.sh visual-harness <file.html>$' /tmp/cap.out; then
+if "$CODEX" capability-info design-review >"$TMP/logs/cap.out" 2>"$TMP/logs/cap.err" \
+  && grep -q '^capability=design-review$' "$TMP/logs/cap.out" \
+  && grep -q '^native_skill=1$' "$TMP/logs/cap.out" \
+  && grep -q '^realization=codex-native-skill$' "$TMP/logs/cap.out" \
+  && grep -q '^status=tool-contract$' "$TMP/logs/cap.out" \
+  && grep -q '^tool_contract=visual-harness$' "$TMP/logs/cap.out" \
+  && grep -q '^tool_contract_check=adapters/codex/bin/preflight.sh visual-harness <file.html>$' "$TMP/logs/cap.out" \
+  && grep -q '^runtime_surface=adapter-owned-visual-harness$' "$TMP/logs/cap.out" \
+  && grep -q '^fallback=preflight.sh visual-harness <file.html>$' "$TMP/logs/cap.out"; then
   ok "codex design capability reports visual harness contract"
 else
   bad "codex design capability should report visual harness contract"
 fi
-if "$CODEX" visual-harness >/tmp/codex_visual.out 2>/tmp/codex_visual.err; then
-  if grep -q '^adapter=codex$' /tmp/codex_visual.out \
-    && grep -q '^status=tool-contract$' /tmp/codex_visual.out \
-    && grep -q '^tool_contract=visual-harness$' /tmp/codex_visual.out \
-    && grep -q '^runtime_surface=adapter-owned-visual-harness$' /tmp/codex_visual.out \
-    && ! grep -q 'adapters/claude\|claude_setting\|settings.json\|statusline.sh' /tmp/codex_visual.out; then
+if "$CODEX" visual-harness >"$TMP/logs/codex_visual.out" 2>"$TMP/logs/codex_visual.err"; then
+  if grep -q '^adapter=codex$' "$TMP/logs/codex_visual.out" \
+    && grep -q '^status=tool-contract$' "$TMP/logs/codex_visual.out" \
+    && grep -q '^tool_contract=visual-harness$' "$TMP/logs/codex_visual.out" \
+    && grep -q '^runtime_surface=adapter-owned-visual-harness$' "$TMP/logs/codex_visual.out" \
+    && ! grep -q 'adapters/claude\|claude_setting\|settings.json\|statusline.sh' "$TMP/logs/codex_visual.out"; then
     ok "codex visual harness reports adapter-native tool-contract"
   else
     bad "codex visual harness should report adapter-native tool-contract"
@@ -2151,11 +2158,11 @@ fi
 cat >"$TMP/codex-preview.html" <<'EOF'
 <!doctype html><html><body><h1>Codex visual harness</h1></body></html>
 EOF
-if "$CODEX" visual-harness "$TMP/codex-preview.html" --out "$TMP/codex-visual" >/tmp/codex_visual_file.out 2>/tmp/codex_visual_file.err; then
-  if grep -q '^adapter=codex$' /tmp/codex_visual_file.out \
-    && grep -q '^runtime_surface=adapter-owned-visual-harness$' /tmp/codex_visual_file.out \
-    && grep -q '^status=ok$' /tmp/codex_visual_file.out \
-    && grep -q '^console_errors=0$' /tmp/codex_visual_file.out \
+if "$CODEX" visual-harness "$TMP/codex-preview.html" --out "$TMP/codex-visual" >"$TMP/logs/codex_visual_file.out" 2>"$TMP/logs/codex_visual_file.err"; then
+  if grep -q '^adapter=codex$' "$TMP/logs/codex_visual_file.out" \
+    && grep -q '^runtime_surface=adapter-owned-visual-harness$' "$TMP/logs/codex_visual_file.out" \
+    && grep -q '^status=ok$' "$TMP/logs/codex_visual_file.out" \
+    && grep -q '^console_errors=0$' "$TMP/logs/codex_visual_file.out" \
     && [ -f "$TMP/codex-visual/codex-preview-html.png" ]; then
     ok "codex visual harness renders HTML when checker dependencies exist"
   else
@@ -2164,10 +2171,10 @@ if "$CODEX" visual-harness "$TMP/codex-preview.html" --out "$TMP/codex-visual" >
 else
   rc=$?
   if [ "$rc" -eq 69 ] \
-    && grep -q '^adapter=codex$' /tmp/codex_visual_file.out \
-    && grep -q '^runtime_surface=adapter-owned-visual-harness$' /tmp/codex_visual_file.out \
-    && grep -q '^status=tool-contract$' /tmp/codex_visual_file.out \
-    && grep -q '^reason=playwright-unavailable$' /tmp/codex_visual_file.out; then
+    && grep -q '^adapter=codex$' "$TMP/logs/codex_visual_file.out" \
+    && grep -q '^runtime_surface=adapter-owned-visual-harness$' "$TMP/logs/codex_visual_file.out" \
+    && grep -q '^status=tool-contract$' "$TMP/logs/codex_visual_file.out" \
+    && grep -q '^reason=playwright-unavailable$' "$TMP/logs/codex_visual_file.out"; then
     ok "codex visual harness reports unavailable checker dependency"
   else
     bad "codex visual harness should render or report unavailable checker dependency"
@@ -2179,137 +2186,137 @@ import sys
 print("rows=3")
 print("args=" + ",".join(sys.argv[1:]))
 EOF
-if "$CODEX" data-script --check "$TMP/codex-data-script.py" >/tmp/codex_data_script.out 2>/tmp/codex_data_script.err \
-  && grep -q '^adapter=codex$' /tmp/codex_data_script.out \
-  && grep -q '^tool_contract=data-script$' /tmp/codex_data_script.out \
-  && grep -q '^runtime_surface=adapter-owned-data-script$' /tmp/codex_data_script.out \
-  && grep -q '^check=python-compile$' /tmp/codex_data_script.out \
-  && grep -q '^status=ok$' /tmp/codex_data_script.out; then
+if "$CODEX" data-script --check "$TMP/codex-data-script.py" >"$TMP/logs/codex_data_script.out" 2>"$TMP/logs/codex_data_script.err" \
+  && grep -q '^adapter=codex$' "$TMP/logs/codex_data_script.out" \
+  && grep -q '^tool_contract=data-script$' "$TMP/logs/codex_data_script.out" \
+  && grep -q '^runtime_surface=adapter-owned-data-script$' "$TMP/logs/codex_data_script.out" \
+  && grep -q '^check=python-compile$' "$TMP/logs/codex_data_script.out" \
+  && grep -q '^status=ok$' "$TMP/logs/codex_data_script.out"; then
   ok "codex data-script wrapper checks Python analysis scripts"
 else
   bad "codex data-script wrapper should check Python analysis scripts"
 fi
-if "$CODEX" claim-verify >/tmp/codex_claim_verify.out 2>/tmp/codex_claim_verify.err \
-  && grep -q '^adapter=codex$' /tmp/codex_claim_verify.out \
-  && grep -q '^tool_contract=external-claim-verification$' /tmp/codex_claim_verify.out \
-  && grep -q '^runtime_surface=adapter-owned-claim-verify$' /tmp/codex_claim_verify.out \
-  && grep -q '^status=tool-contract$' /tmp/codex_claim_verify.out; then
+if "$CODEX" claim-verify >"$TMP/logs/codex_claim_verify.out" 2>"$TMP/logs/codex_claim_verify.err" \
+  && grep -q '^adapter=codex$' "$TMP/logs/codex_claim_verify.out" \
+  && grep -q '^tool_contract=external-claim-verification$' "$TMP/logs/codex_claim_verify.out" \
+  && grep -q '^runtime_surface=adapter-owned-claim-verify$' "$TMP/logs/codex_claim_verify.out" \
+  && grep -q '^status=tool-contract$' "$TMP/logs/codex_claim_verify.out"; then
   ok "codex claim-verify wrapper reports tool contract"
 else
   bad "codex claim-verify wrapper should report tool contract"
 fi
-if "$CODEX" claim-verify --check "model X is state of the art" >/tmp/codex_claim_unavailable.out 2>/tmp/codex_claim_unavailable.err; then
+if "$CODEX" claim-verify --check "model X is state of the art" >"$TMP/logs/codex_claim_unavailable.out" 2>"$TMP/logs/codex_claim_unavailable.err"; then
   bad "codex claim-verify wrapper should report unavailable provider by default"
 else
   rc=$?
   if [ "$rc" -eq 69 ] \
-    && grep -q '^adapter=codex$' /tmp/codex_claim_unavailable.out \
-    && grep -q '^reason=claim-verify-provider-unavailable$' /tmp/codex_claim_unavailable.out; then
+    && grep -q '^adapter=codex$' "$TMP/logs/codex_claim_unavailable.out" \
+    && grep -q '^reason=claim-verify-provider-unavailable$' "$TMP/logs/codex_claim_unavailable.out"; then
     ok "codex claim-verify wrapper reports unavailable provider"
   else
     bad "codex claim-verify wrapper should report unavailable provider"
   fi
 fi
-if "$CODEX" figure-gen >/tmp/codex_figure_gen.out 2>/tmp/codex_figure_gen.err \
-  && grep -q '^adapter=codex$' /tmp/codex_figure_gen.out \
-  && grep -q '^tool_contract=figure-gen$' /tmp/codex_figure_gen.out \
-  && grep -q '^runtime_surface=adapter-owned-figure-gen$' /tmp/codex_figure_gen.out \
-  && grep -q '^status=tool-contract$' /tmp/codex_figure_gen.out; then
+if "$CODEX" figure-gen >"$TMP/logs/codex_figure_gen.out" 2>"$TMP/logs/codex_figure_gen.err" \
+  && grep -q '^adapter=codex$' "$TMP/logs/codex_figure_gen.out" \
+  && grep -q '^tool_contract=figure-gen$' "$TMP/logs/codex_figure_gen.out" \
+  && grep -q '^runtime_surface=adapter-owned-figure-gen$' "$TMP/logs/codex_figure_gen.out" \
+  && grep -q '^status=tool-contract$' "$TMP/logs/codex_figure_gen.out"; then
   ok "codex figure-gen wrapper reports tool contract"
 else
   bad "codex figure-gen wrapper should report tool contract"
 fi
-if "$CODEX" figure-gen --check "$TMP/missing-figure.py" >/tmp/codex_figure_missing.out 2>/tmp/codex_figure_missing.err; then
+if "$CODEX" figure-gen --check "$TMP/missing-figure.py" >"$TMP/logs/codex_figure_missing.out" 2>"$TMP/logs/codex_figure_missing.err"; then
   bad "codex figure-gen wrapper should fail missing script"
 else
   rc=$?
   if [ "$rc" -eq 66 ] \
-    && grep -q '^adapter=codex$' /tmp/codex_figure_missing.out \
-    && grep -q '^reason=file-not-found$' /tmp/codex_figure_missing.out; then
+    && grep -q '^adapter=codex$' "$TMP/logs/codex_figure_missing.out" \
+    && grep -q '^reason=file-not-found$' "$TMP/logs/codex_figure_missing.out"; then
     ok "codex figure-gen wrapper reports missing script"
   else
     bad "codex figure-gen wrapper should report missing script"
   fi
 fi
-if "$CODEX" browser-fetch >/tmp/codex_browser_fetch.out 2>/tmp/codex_browser_fetch.err \
-  && grep -q '^adapter=codex$' /tmp/codex_browser_fetch.out \
-  && grep -q '^tool_contract=browser-fetch$' /tmp/codex_browser_fetch.out \
-  && grep -q '^runtime_surface=adapter-owned-browser-fetch$' /tmp/codex_browser_fetch.out \
-  && grep -q '^status=tool-contract$' /tmp/codex_browser_fetch.out; then
+if "$CODEX" browser-fetch >"$TMP/logs/codex_browser_fetch.out" 2>"$TMP/logs/codex_browser_fetch.err" \
+  && grep -q '^adapter=codex$' "$TMP/logs/codex_browser_fetch.out" \
+  && grep -q '^tool_contract=browser-fetch$' "$TMP/logs/codex_browser_fetch.out" \
+  && grep -q '^runtime_surface=adapter-owned-browser-fetch$' "$TMP/logs/codex_browser_fetch.out" \
+  && grep -q '^status=tool-contract$' "$TMP/logs/codex_browser_fetch.out"; then
   ok "codex browser-fetch wrapper reports tool contract"
 else
   bad "codex browser-fetch wrapper should report tool contract"
 fi
-if "$CODEX" browser-fetch --check not-a-url >/tmp/codex_browser_bad_url.out 2>/tmp/codex_browser_bad_url.err; then
+if "$CODEX" browser-fetch --check not-a-url >"$TMP/logs/codex_browser_bad_url.out" 2>"$TMP/logs/codex_browser_bad_url.err"; then
   bad "codex browser-fetch wrapper should fail bad URL"
 else
   rc=$?
   if [ "$rc" -eq 65 ] \
-    && grep -q '^adapter=codex$' /tmp/codex_browser_bad_url.out \
-    && grep -q '^reason=bad-url$' /tmp/codex_browser_bad_url.out; then
+    && grep -q '^adapter=codex$' "$TMP/logs/codex_browser_bad_url.out" \
+    && grep -q '^reason=bad-url$' "$TMP/logs/codex_browser_bad_url.out"; then
     ok "codex browser-fetch wrapper reports bad URL"
   else
     bad "codex browser-fetch wrapper should report bad URL"
   fi
 fi
-if "$CODEX" pdf-extract >/tmp/codex_pdf_extract.out 2>/tmp/codex_pdf_extract.err \
-  && grep -q '^adapter=codex$' /tmp/codex_pdf_extract.out \
-  && grep -q '^tool_contract=pdf-extract$' /tmp/codex_pdf_extract.out \
-  && grep -q '^runtime_surface=adapter-owned-pdf-extract$' /tmp/codex_pdf_extract.out \
-  && grep -q '^status=tool-contract$' /tmp/codex_pdf_extract.out; then
+if "$CODEX" pdf-extract >"$TMP/logs/codex_pdf_extract.out" 2>"$TMP/logs/codex_pdf_extract.err" \
+  && grep -q '^adapter=codex$' "$TMP/logs/codex_pdf_extract.out" \
+  && grep -q '^tool_contract=pdf-extract$' "$TMP/logs/codex_pdf_extract.out" \
+  && grep -q '^runtime_surface=adapter-owned-pdf-extract$' "$TMP/logs/codex_pdf_extract.out" \
+  && grep -q '^status=tool-contract$' "$TMP/logs/codex_pdf_extract.out"; then
   ok "codex pdf-extract wrapper reports tool contract"
 else
   bad "codex pdf-extract wrapper should report tool contract"
 fi
-if "$CODEX" pdf-extract --check "$TMP/missing.pdf" >/tmp/codex_pdf_missing.out 2>/tmp/codex_pdf_missing.err; then
+if "$CODEX" pdf-extract --check "$TMP/missing.pdf" >"$TMP/logs/codex_pdf_missing.out" 2>"$TMP/logs/codex_pdf_missing.err"; then
   bad "codex pdf-extract wrapper should fail missing PDF"
 else
   rc=$?
   if [ "$rc" -eq 66 ] \
-    && grep -q '^adapter=codex$' /tmp/codex_pdf_missing.out \
-    && grep -q '^reason=file-not-found$' /tmp/codex_pdf_missing.out; then
+    && grep -q '^adapter=codex$' "$TMP/logs/codex_pdf_missing.out" \
+    && grep -q '^reason=file-not-found$' "$TMP/logs/codex_pdf_missing.out"; then
     ok "codex pdf-extract wrapper reports missing PDF"
   else
     bad "codex pdf-extract wrapper should report missing PDF"
   fi
 fi
-if "$CODEX" web-image-search >/tmp/codex_web_image.out 2>/tmp/codex_web_image.err \
-  && grep -q '^adapter=codex$' /tmp/codex_web_image.out \
-  && grep -q '^tool_contract=web-image-search$' /tmp/codex_web_image.out \
-  && grep -q '^runtime_surface=adapter-owned-web-image-search$' /tmp/codex_web_image.out \
-  && grep -q '^status=tool-contract$' /tmp/codex_web_image.out; then
+if "$CODEX" web-image-search >"$TMP/logs/codex_web_image.out" 2>"$TMP/logs/codex_web_image.err" \
+  && grep -q '^adapter=codex$' "$TMP/logs/codex_web_image.out" \
+  && grep -q '^tool_contract=web-image-search$' "$TMP/logs/codex_web_image.out" \
+  && grep -q '^runtime_surface=adapter-owned-web-image-search$' "$TMP/logs/codex_web_image.out" \
+  && grep -q '^status=tool-contract$' "$TMP/logs/codex_web_image.out"; then
   ok "codex web-image-search wrapper reports tool contract"
 else
   bad "codex web-image-search wrapper should report tool contract"
 fi
-if "$CODEX" web-image-search --check "speech enhancement timeline" >/tmp/codex_web_image_unavailable.out 2>/tmp/codex_web_image_unavailable.err; then
+if "$CODEX" web-image-search --check "speech enhancement timeline" >"$TMP/logs/codex_web_image_unavailable.out" 2>"$TMP/logs/codex_web_image_unavailable.err"; then
   bad "codex web-image-search wrapper should report unavailable provider by default"
 else
   rc=$?
   if [ "$rc" -eq 69 ] \
-    && grep -q '^adapter=codex$' /tmp/codex_web_image_unavailable.out \
-    && grep -q '^reason=web-image-search-provider-unavailable$' /tmp/codex_web_image_unavailable.out; then
+    && grep -q '^adapter=codex$' "$TMP/logs/codex_web_image_unavailable.out" \
+    && grep -q '^reason=web-image-search-provider-unavailable$' "$TMP/logs/codex_web_image_unavailable.out"; then
     ok "codex web-image-search wrapper reports unavailable provider"
   else
     bad "codex web-image-search wrapper should report unavailable provider"
   fi
 fi
-if "$CODEX" verification-runner --check -- python3 >/tmp/codex_verify_check.out 2>/tmp/codex_verify_check.err \
-  && grep -q '^adapter=codex$' /tmp/codex_verify_check.out \
-  && grep -q '^tool_contract=verification-runner$' /tmp/codex_verify_check.out \
-  && grep -q '^runtime_surface=adapter-owned-verification-runner$' /tmp/codex_verify_check.out \
-  && grep -q '^check=command-available$' /tmp/codex_verify_check.out \
-  && grep -q '^status=ok$' /tmp/codex_verify_check.out; then
+if "$CODEX" verification-runner --check -- python3 >"$TMP/logs/codex_verify_check.out" 2>"$TMP/logs/codex_verify_check.err" \
+  && grep -q '^adapter=codex$' "$TMP/logs/codex_verify_check.out" \
+  && grep -q '^tool_contract=verification-runner$' "$TMP/logs/codex_verify_check.out" \
+  && grep -q '^runtime_surface=adapter-owned-verification-runner$' "$TMP/logs/codex_verify_check.out" \
+  && grep -q '^check=command-available$' "$TMP/logs/codex_verify_check.out" \
+  && grep -q '^status=ok$' "$TMP/logs/codex_verify_check.out"; then
   ok "codex verification runner checks explicit commands"
 else
   bad "codex verification runner should check explicit commands"
 fi
-if "$CODEX" verification-runner --timeout 5 -- python3 -c 'print("verify-ok")' >/tmp/codex_verify_run.out 2>/tmp/codex_verify_run.err \
-  && grep -q '^adapter=codex$' /tmp/codex_verify_run.out \
-  && grep -q '^runtime_surface=adapter-owned-verification-runner$' /tmp/codex_verify_run.out \
-  && grep -q '^status=ok$' /tmp/codex_verify_run.out \
-  && grep -q '^exit_code=0$' /tmp/codex_verify_run.out \
-  && grep -q 'verify-ok' /tmp/codex_verify_run.out; then
+if "$CODEX" verification-runner --timeout 5 -- python3 -c 'print("verify-ok")' >"$TMP/logs/codex_verify_run.out" 2>"$TMP/logs/codex_verify_run.err" \
+  && grep -q '^adapter=codex$' "$TMP/logs/codex_verify_run.out" \
+  && grep -q '^runtime_surface=adapter-owned-verification-runner$' "$TMP/logs/codex_verify_run.out" \
+  && grep -q '^status=ok$' "$TMP/logs/codex_verify_run.out" \
+  && grep -q '^exit_code=0$' "$TMP/logs/codex_verify_run.out" \
+  && grep -q 'verify-ok' "$TMP/logs/codex_verify_run.out"; then
   ok "codex verification runner executes explicit commands"
 else
   bad "codex verification runner should execute explicit commands"
@@ -2336,11 +2343,11 @@ fi
 if command -v codex >/dev/null 2>&1; then
   mkdir -p "$TMP/codex_bootstrap_home"
   ln -s "$ROOT/codex_setting/AGENTS.md" "$TMP/codex_bootstrap_home/AGENTS.md"
-  if CODEX_HOME="$TMP/codex_bootstrap_home" codex debug prompt-input 'bootstrap check' >/tmp/codex_bootstrap.out 2>/tmp/codex_bootstrap.err \
-    && grep -q 'AGENTS.md — Codex Adapter Bootstrap' /tmp/codex_bootstrap.out \
-    && grep -q 'adapters/codex/bin/preflight.sh capability-info' /tmp/codex_bootstrap.out \
-    && grep -q 'codex_setting/codex-hooks' /tmp/codex_bootstrap.out \
-    && ! grep -q 'adapters/claude/CLAUDE.md.*portable bootstrap' /tmp/codex_bootstrap.out; then
+  if CODEX_HOME="$TMP/codex_bootstrap_home" codex debug prompt-input 'bootstrap check' >"$TMP/logs/codex_bootstrap.out" 2>"$TMP/logs/codex_bootstrap.err" \
+    && grep -q 'AGENTS.md — Codex Adapter Bootstrap' "$TMP/logs/codex_bootstrap.out" \
+    && grep -q 'adapters/codex/bin/preflight.sh capability-info' "$TMP/logs/codex_bootstrap.out" \
+    && grep -q 'codex_setting/codex-hooks' "$TMP/logs/codex_bootstrap.out" \
+    && ! grep -q 'adapters/claude/CLAUDE.md.*portable bootstrap' "$TMP/logs/codex_bootstrap.out"; then
     ok "codex bootstrap projection is discoverable without Claude bootstrap"
   else
     bad "codex bootstrap projection should be discoverable without Claude bootstrap"
@@ -2354,10 +2361,10 @@ if command -v codex >/dev/null 2>&1; then
     [ -d "$d" ] || continue
     ln -s "$d" "$TMP/codex_home/skills/$(basename "$d")"
   done
-  if CODEX_HOME="$TMP/codex_home" codex debug prompt-input 'autopilot-code' >/tmp/codex_skills.out 2>/tmp/codex_skills.err \
-    && grep -q -- '- autopilot-code:' /tmp/codex_skills.out \
-    && grep -q 'Use when source code must be implemented' /tmp/codex_skills.out \
-    && ! grep -q '/.claude/skills' /tmp/codex_skills.out; then
+  if CODEX_HOME="$TMP/codex_home" codex debug prompt-input 'autopilot-code' >"$TMP/logs/codex_skills.out" 2>"$TMP/logs/codex_skills.err" \
+    && grep -q -- '- autopilot-code:' "$TMP/logs/codex_skills.out" \
+    && grep -q 'Use when source code must be implemented' "$TMP/logs/codex_skills.out" \
+    && ! grep -q '/.claude/skills' "$TMP/logs/codex_skills.out"; then
     ok "codex native skill projection is discoverable without Claude skill paths"
   else
     bad "codex native skill projection should be discoverable without Claude skill paths"
@@ -2371,13 +2378,13 @@ if command -v codex >/dev/null 2>&1; then
     && [ -L "$ROOT/codex_setting/codex-plugin-marketplace/plugins/hearting-codex" ] \
     && [ ! -e "$ROOT/codex_setting/codex-plugin-marketplace/bin" ] \
     && [ ! -e "$ROOT/codex_setting/codex-plugin-marketplace/hooks" ] \
-    && CODEX_HOME="$TMP/codex_plugin_home" codex plugin marketplace add "$ROOT/codex_setting/codex-plugin-marketplace" --json >/tmp/codex_plugin_marketplace.out 2>/tmp/codex_plugin_marketplace.err \
-    && CODEX_HOME="$TMP/codex_plugin_home" codex plugin list --available --json >/tmp/codex_plugin_list.out 2>/tmp/codex_plugin_list.err \
-    && grep -q '"pluginId": "hearting-codex@hearting"' /tmp/codex_plugin_list.out \
-    && CODEX_HOME="$TMP/codex_plugin_home" codex plugin add hearting-codex@hearting --json >/tmp/codex_plugin_add.out 2>/tmp/codex_plugin_add.err \
-    && CODEX_HOME="$TMP/codex_plugin_home" codex debug prompt-input 'autopilot-code' >/tmp/codex_plugin_prompt.out 2>/tmp/codex_plugin_prompt.err \
-    && grep -q -- '- hearting-codex:autopilot-code:' /tmp/codex_plugin_prompt.out \
-    && ! grep -q 'adapters/claude/skills' /tmp/codex_plugin_prompt.out; then
+    && CODEX_HOME="$TMP/codex_plugin_home" codex plugin marketplace add "$ROOT/codex_setting/codex-plugin-marketplace" --json >"$TMP/logs/codex_plugin_marketplace.out" 2>"$TMP/logs/codex_plugin_marketplace.err" \
+    && CODEX_HOME="$TMP/codex_plugin_home" codex plugin list --available --json >"$TMP/logs/codex_plugin_list.out" 2>"$TMP/logs/codex_plugin_list.err" \
+    && grep -q '"pluginId": "hearting-codex@hearting"' "$TMP/logs/codex_plugin_list.out" \
+    && CODEX_HOME="$TMP/codex_plugin_home" codex plugin add hearting-codex@hearting --json >"$TMP/logs/codex_plugin_add.out" 2>"$TMP/logs/codex_plugin_add.err" \
+    && CODEX_HOME="$TMP/codex_plugin_home" codex debug prompt-input 'autopilot-code' >"$TMP/logs/codex_plugin_prompt.out" 2>"$TMP/logs/codex_plugin_prompt.err" \
+    && grep -q -- '- hearting-codex:autopilot-code:' "$TMP/logs/codex_plugin_prompt.out" \
+    && ! grep -q 'adapters/claude/skills' "$TMP/logs/codex_plugin_prompt.out"; then
     ok "codex native plugin projection is installable and discovers generated skills"
   else
     bad "codex native plugin projection should be installable and discover generated skills"
@@ -2390,7 +2397,7 @@ for f in "$ROOT"/codex_setting/codex-agents/*.toml; do
   [ -f "$f" ] || continue
   ln -s "$f" "$TMP/codex_agent_home/agents/$(basename "$f")"
 done
-if python3 - "$TMP/codex_agent_home/agents" >/tmp/codex_agents.out 2>/tmp/codex_agents.err <<'PY'
+if python3 - "$TMP/codex_agent_home/agents" >"$TMP/logs/codex_agents.out" 2>"$TMP/logs/codex_agents.err" <<'PY'
 import re
 import sys
 from pathlib import Path
@@ -2424,7 +2431,7 @@ fi
 # 재홈 2026-07-22: per-team TOML boundaries retired — role-specific runtime boundaries now
 # live in unit-catalog frontmatter enforced by tools/check-unit-config.py; the kernel
 # memory-scout TOML stays read-only and team TOMLs must not reappear in the projection.
-if python3 "$ROOT/tools/check-unit-config.py" >/tmp/codex_unit_config.out 2>/tmp/codex_unit_config.err \
+if python3 "$ROOT/tools/check-unit-config.py" >"$TMP/logs/codex_unit_config.out" 2>"$TMP/logs/codex_unit_config.err" \
   && grep -q '^read_only: true$' "$ROOT/roles/units/qa/test.md" \
   && grep -q '^worker_type: review$' "$ROOT/roles/units/qa/test.md" \
   && grep -q '^read_only: true$' "$ROOT/roles/units/qa/security-review.md" \
@@ -2461,8 +2468,8 @@ else
 fi
 if [ -L "$ROOT/codex_setting/codex-modes" ] \
   && [ "$(readlink "$ROOT/codex_setting/codex-modes")" = "../adapters/codex/modes" ] \
-  && "$ROOT/adapters/codex/bin/sync-native-modes.py" --check >/tmp/codex_modes_sync.out 2>/tmp/codex_modes_sync.err \
-  && python3 - "$ROOT" >/tmp/codex_modes.out 2>/tmp/codex_modes.err <<'PY'
+  && "$ROOT/adapters/codex/bin/sync-native-modes.py" --check >"$TMP/logs/codex_modes_sync.out" 2>"$TMP/logs/codex_modes_sync.err" \
+  && python3 - "$ROOT" >"$TMP/logs/codex_modes.out" 2>"$TMP/logs/codex_modes.err" <<'PY'
 import sys
 from pathlib import Path
 
@@ -2536,26 +2543,26 @@ fi
 mkdir -p "$TMP/codex_hook_home/.codex"
 ln -s "$ROOT" "$TMP/codex_hook_home/.codex/hearting"
 ln -s "$ROOT/codex_setting/codex-hooks/hooks.json" "$TMP/codex_hook_home/.codex/hooks.json"
-if python3 -m json.tool "$TMP/codex_hook_home/.codex/hooks.json" >/tmp/codex_hook_json.out 2>/tmp/codex_hook_json.err \
-  && grep -q 'sessionstart-lifecycle.py' /tmp/codex_hook_json.out \
-  && grep -q 'sessionend-lifecycle.py' /tmp/codex_hook_json.out \
-  && grep -q '"Stop"' /tmp/codex_hook_json.out \
-  && grep -q 'userprompt-lifecycle.py' /tmp/codex_hook_json.out \
-  && grep -q 'permissionrequest-lifecycle.py' /tmp/codex_hook_json.out \
-  && grep -q 'pretooluse-write-guard.py' /tmp/codex_hook_json.out \
-  && grep -q 'posttooluse-read-marker.py' /tmp/codex_hook_json.out \
-  && grep -q 'posttooluse-design-check.py' /tmp/codex_hook_json.out \
+if python3 -m json.tool "$TMP/codex_hook_home/.codex/hooks.json" >"$TMP/logs/codex_hook_json.out" 2>"$TMP/logs/codex_hook_json.err" \
+  && grep -q 'sessionstart-lifecycle.py' "$TMP/logs/codex_hook_json.out" \
+  && grep -q 'sessionend-lifecycle.py' "$TMP/logs/codex_hook_json.out" \
+  && grep -q '"Stop"' "$TMP/logs/codex_hook_json.out" \
+  && grep -q 'userprompt-lifecycle.py' "$TMP/logs/codex_hook_json.out" \
+  && grep -q 'permissionrequest-lifecycle.py' "$TMP/logs/codex_hook_json.out" \
+  && grep -q 'pretooluse-write-guard.py' "$TMP/logs/codex_hook_json.out" \
+  && grep -q 'posttooluse-read-marker.py' "$TMP/logs/codex_hook_json.out" \
+  && grep -q 'posttooluse-design-check.py' "$TMP/logs/codex_hook_json.out" \
   && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); h=d["hooks"]["PreToolUse"]; assert len(h)==1; assert h[0]["matcher"]==r"Write|Edit|MultiEdit|apply_patch|functions\.apply_patch|Bash|Shell|functions\.exec_command"; assert "AGENT_PARENT_PARK_ONLY=1" not in h[0]["hooks"][0]["command"]; assert "stop-lifecycle.py" in d["hooks"]["Stop"][0]["hooks"][0]["command"]' "$TMP/codex_hook_home/.codex/hooks.json" \
   && printf '{"tool_name":"Write","tool_input":{"file_path":"%s"},"session_id":"testsid","cwd":"%s"}\n' "$TMP/repo/f" "$TMP/repo" \
-    | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >/tmp/codex_hook.out 2>/tmp/codex_hook.err \
-  && [ ! -s /tmp/codex_hook.out ]; then
+    | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/logs/codex_hook.out" 2>"$TMP/logs/codex_hook.err" \
+  && [ ! -s "$TMP/logs/codex_hook.out" ]; then
   ok "codex native hook projection bridges clean writes to preflight"
 else
   bad "codex native hook projection should bridge clean writes to preflight"
 fi
 if printf '{"tool_name":"Bash","tool_input":{"command":"printf x > %s"},"session_id":"shellwritesid","cwd":"%s"}\n' "$TMP/runtime/projects/abc/memory/SHELL.md" "$TMP/runtime" \
-  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >/tmp/codex_shell_write_hook.out 2>/tmp/codex_shell_write_hook.err \
-  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["decision"]=="block"; assert "memory" in d["reason"].lower() or "기억" in d["reason"]' /tmp/codex_shell_write_hook.out; then
+  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/logs/codex_shell_write_hook.out" 2>"$TMP/logs/codex_shell_write_hook.err" \
+  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["decision"]=="block"; assert "memory" in d["reason"].lower() or "기억" in d["reason"]' "$TMP/logs/codex_shell_write_hook.out"; then
   ok "codex native hook projection blocks obvious shell write targets"
 else
   bad "codex native hook projection should block obvious shell write targets"
@@ -2563,18 +2570,18 @@ fi
 
 # A3: the Codex shell PreToolUse bridge runs worktree-path before material-route.
 if printf '{"tool_name":"Bash","tool_input":{"command":"git worktree add /tmp/somewhere-else/slug"},"session_id":"codex-worktree-deny","cwd":"%s"}\n' "$TMP/repo" \
-  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >/tmp/codex_worktree_deny.out 2>/tmp/codex_worktree_deny.err \
-  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["decision"]=="block"' /tmp/codex_worktree_deny.out; then
+  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/logs/codex_worktree_deny.out" 2>"$TMP/logs/codex_worktree_deny.err" \
+  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["decision"]=="block"' "$TMP/logs/codex_worktree_deny.out"; then
   ok "codex native hook projection denies git worktree add outside <repo>-wt/"
 else
   bad "codex native hook projection should deny git worktree add outside <repo>-wt/"
 fi
 if printf '{"tool_name":"Bash","tool_input":{"command":"git worktree add %s-wt/slug -b slug HEAD"},"session_id":"codex-worktree-pass","cwd":"%s"}\n' "$TMP/repo" "$TMP/repo" \
-  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >/tmp/codex_worktree_pass.out 2>/tmp/codex_worktree_pass.err \
-  && [ ! -s /tmp/codex_worktree_pass.out ]; then
+  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/logs/codex_worktree_pass.out" 2>"$TMP/logs/codex_worktree_pass.err" \
+  && [ ! -s "$TMP/logs/codex_worktree_pass.out" ]; then
   ok "codex native hook projection passes canonical <repo>-wt/ worktree add"
 else
-  bad "codex native hook projection should pass canonical <repo>-wt/ worktree add [out=$(cat /tmp/codex_worktree_pass.out)]"
+  bad "codex native hook projection should pass canonical <repo>-wt/ worktree add [out=$(cat "$TMP/logs/codex_worktree_pass.out")]"
 fi
 
 # Material-route Codex projection fixtures: denial must be native JSON, while a
@@ -2642,8 +2649,8 @@ fi
 codex_bind_marker_hash=$(python3 -c 'import hashlib,sys; print(hashlib.sha256(b"material-route-session-v1\0" + sys.argv[1].encode()).hexdigest())' "$codex_bind_session")
 codex_bind_marker="$ROOT/.route-grounding/$codex_bind_marker_hash.json"
 printf '{"hook_event_name":"Stop","session_id":"%s","cwd":"%s"}\n' "$codex_bind_session" "$TMP/repo" \
-  | MEM_STORE="$TMP/codex_hook_mem_stop" AGENT_HOME="$ROOT" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/stop-lifecycle.py" >/tmp/codex_stop_retention.out 2>/tmp/codex_stop_retention.err || true
-if [ -f "$codex_bind_marker" ] && [ ! -s /tmp/codex_stop_retention.out ] && [ ! -s /tmp/codex_stop_retention.err ]; then
+  | MEM_STORE="$TMP/codex_hook_mem_stop" AGENT_HOME="$ROOT" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/stop-lifecycle.py" >"$TMP/logs/codex_stop_retention.out" 2>"$TMP/logs/codex_stop_retention.err" || true
+if [ -f "$codex_bind_marker" ] && [ ! -s "$TMP/logs/codex_stop_retention.out" ] && [ ! -s "$TMP/logs/codex_stop_retention.err" ]; then
   ok "Codex Stop is a silent no-op and retains material route marker"
 else
   bad "Codex Stop should be a silent no-op that retains material route marker"
@@ -2658,56 +2665,56 @@ else
   bad "Codex SessionEnd should clear the exact material marker without clear-path output [marker=$(test -e "$codex_bind_marker" && echo present || echo absent) out=$(cat "$TMP/codex_sessionend.out") err=$(cat "$TMP/codex_sessionend.err")]"
 fi
 if printf '{"tool_name":"Write","tool_input":{"file_path":"%s"},"session_id":"parked","cwd":"%s"}\n' "$codex_source" "$TMP/repo" \
-  | AGENT_PARENT_PARK_ONLY=1 HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >/tmp/codex_parent_park_only.out 2>/tmp/codex_parent_park_only.err \
-  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["decision"]=="block"; assert "route" in d["reason"]' /tmp/codex_parent_park_only.out \
-  && [ ! -s /tmp/codex_parent_park_only.err ]; then
+  | AGENT_PARENT_PARK_ONLY=1 HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/logs/codex_parent_park_only.out" 2>"$TMP/logs/codex_parent_park_only.err" \
+  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["decision"]=="block"; assert "route" in d["reason"]' "$TMP/logs/codex_parent_park_only.out" \
+  && [ ! -s "$TMP/logs/codex_parent_park_only.err" ]; then
   ok "retired parent-park-only marker cannot bypass the material guard"
 else
   bad "retired parent-park-only marker must not bypass the material guard"
 fi
 if printf '{"tool_name":"Bash","tool_input":{"command":"printf x | tee %s"},"session_id":"shellteesid","cwd":"%s"}\n' "$TMP/runtime/projects/abc/memory/TEE.md" "$TMP/runtime" \
-  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >/tmp/codex_shell_tee_hook.out 2>/tmp/codex_shell_tee_hook.err \
-  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["decision"]=="block"; assert "memory" in d["reason"].lower() or "기억" in d["reason"]' /tmp/codex_shell_tee_hook.out \
+  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/logs/codex_shell_tee_hook.out" 2>"$TMP/logs/codex_shell_tee_hook.err" \
+  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["decision"]=="block"; assert "memory" in d["reason"].lower() or "기억" in d["reason"]' "$TMP/logs/codex_shell_tee_hook.out" \
   && printf '{"tool_name":"Bash","tool_input":{"command":"rm %s"},"session_id":"shellrmsid","cwd":"%s"}\n' "$TMP/runtime/projects/abc/memory/RM.md" "$TMP/runtime" \
-    | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >/tmp/codex_shell_rm_hook.out 2>/tmp/codex_shell_rm_hook.err \
-  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["decision"]=="block"; assert "memory" in d["reason"].lower() or "기억" in d["reason"]' /tmp/codex_shell_rm_hook.out; then
+    | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/logs/codex_shell_rm_hook.out" 2>"$TMP/logs/codex_shell_rm_hook.err" \
+  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["decision"]=="block"; assert "memory" in d["reason"].lower() or "기억" in d["reason"]' "$TMP/logs/codex_shell_rm_hook.out"; then
   ok "codex native hook projection blocks common shell mutation targets"
 else
   bad "codex native hook projection should block common shell mutation targets"
 fi
 if printf '{"tool_name":"Bash","tool_input":{"command":"cp %s %s"},"session_id":"shellcpsourcesid","cwd":"%s"}\n' "$TMP/runtime/projects/abc/memory/SOURCE.md" "$TMP/repo/copied-source.md" "$TMP/runtime" \
-  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >/tmp/codex_shell_cp_source_hook.out 2>/tmp/codex_shell_cp_source_hook.err \
-  && [ ! -s /tmp/codex_shell_cp_source_hook.out ] \
+  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/logs/codex_shell_cp_source_hook.out" 2>"$TMP/logs/codex_shell_cp_source_hook.err" \
+  && [ ! -s "$TMP/logs/codex_shell_cp_source_hook.out" ] \
   && printf '{"tool_name":"Bash","tool_input":{"command":"cp %s %s"},"session_id":"shellcpdestsid","cwd":"%s"}\n' "$TMP/repo/source.md" "$TMP/runtime/projects/abc/memory/COPIED.md" "$TMP/runtime" \
-    | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >/tmp/codex_shell_cp_dest_hook.out 2>/tmp/codex_shell_cp_dest_hook.err \
-  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["decision"]=="block"; assert "memory" in d["reason"].lower() or "기억" in d["reason"]' /tmp/codex_shell_cp_dest_hook.out; then
+    | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/logs/codex_shell_cp_dest_hook.out" 2>"$TMP/logs/codex_shell_cp_dest_hook.err" \
+  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["decision"]=="block"; assert "memory" in d["reason"].lower() or "기억" in d["reason"]' "$TMP/logs/codex_shell_cp_dest_hook.out"; then
   ok "codex native hook projection treats cp destination as the shell write target"
 else
   bad "codex native hook projection should treat cp destination as the shell write target"
 fi
 if printf '{"tool_name":"Bash","tool_input":{"command":"install %s %s"},"session_id":"shellinstallsid","cwd":"%s"}\n' "$TMP/repo/source.md" "$TMP/runtime/projects/abc/memory/INSTALLED.md" "$TMP/runtime" \
-  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >/tmp/codex_shell_install_hook.out 2>/tmp/codex_shell_install_hook.err \
-  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["decision"]=="block"; assert "memory" in d["reason"].lower() or "기억" in d["reason"]' /tmp/codex_shell_install_hook.out \
+  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/logs/codex_shell_install_hook.out" 2>"$TMP/logs/codex_shell_install_hook.err" \
+  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["decision"]=="block"; assert "memory" in d["reason"].lower() or "기억" in d["reason"]' "$TMP/logs/codex_shell_install_hook.out" \
   && printf '{"tool_name":"Bash","tool_input":{"command":"rsync %s %s"},"session_id":"shellrsyncsid","cwd":"%s"}\n' "$TMP/repo/source.md" "$TMP/runtime/projects/abc/memory/RSYNCED.md" "$TMP/runtime" \
-    | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >/tmp/codex_shell_rsync_hook.out 2>/tmp/codex_shell_rsync_hook.err \
-  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["decision"]=="block"; assert "memory" in d["reason"].lower() or "기억" in d["reason"]' /tmp/codex_shell_rsync_hook.out; then
+    | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/logs/codex_shell_rsync_hook.out" 2>"$TMP/logs/codex_shell_rsync_hook.err" \
+  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["decision"]=="block"; assert "memory" in d["reason"].lower() or "기억" in d["reason"]' "$TMP/logs/codex_shell_rsync_hook.out"; then
   ok "codex native hook projection blocks install and rsync destinations"
 else
   bad "codex native hook projection should block install and rsync destinations"
 fi
 if printf '{"tool_name":"Bash","tool_input":{"command":"dd if=%s of=%s"},"session_id":"shellddsid","cwd":"%s"}\n' "$TMP/repo/source.md" "$TMP/runtime/projects/abc/memory/DD.md" "$TMP/runtime" \
-  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >/tmp/codex_shell_dd_hook.out 2>/tmp/codex_shell_dd_hook.err \
-  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["decision"]=="block"; assert "memory" in d["reason"].lower() or "기억" in d["reason"]' /tmp/codex_shell_dd_hook.out \
+  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/logs/codex_shell_dd_hook.out" 2>"$TMP/logs/codex_shell_dd_hook.err" \
+  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["decision"]=="block"; assert "memory" in d["reason"].lower() or "기억" in d["reason"]' "$TMP/logs/codex_shell_dd_hook.out" \
   && printf '{"tool_name":"Bash","tool_input":{"command":"sed -i s/a/b/ %s"},"session_id":"shellsedisid","cwd":"%s"}\n' "$TMP/runtime/projects/abc/memory/SED.md" "$TMP/runtime" \
-    | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >/tmp/codex_shell_sedi_hook.out 2>/tmp/codex_shell_sedi_hook.err \
-  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["decision"]=="block"; assert "memory" in d["reason"].lower() or "기억" in d["reason"]' /tmp/codex_shell_sedi_hook.out; then
+    | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/logs/codex_shell_sedi_hook.out" 2>"$TMP/logs/codex_shell_sedi_hook.err" \
+  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["decision"]=="block"; assert "memory" in d["reason"].lower() or "기억" in d["reason"]' "$TMP/logs/codex_shell_sedi_hook.out"; then
   ok "codex native hook projection blocks dd output and sed inline edits"
 else
   bad "codex native hook projection should block dd output and sed inline edits"
 fi
 if printf '{"tool":"Write","input":{"path":"%s"},"session_id":"nestedpayloadsid","cwd":"%s"}\n' "$TMP/repo/nested-f" "$TMP/repo" \
-  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >/tmp/codex_hook_nested.out 2>/tmp/codex_hook_nested.err \
-  && [ ! -s /tmp/codex_hook_nested.out ]; then
+  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/logs/codex_hook_nested.out" 2>"$TMP/logs/codex_hook_nested.err" \
+  && [ ! -s "$TMP/logs/codex_hook_nested.out" ]; then
   ok "codex native hook projection accepts string-tool nested input payloads"
 else
   bad "codex native hook projection should accept string-tool nested input payloads"
@@ -2721,40 +2728,40 @@ print(data["hooks"]["PreToolUse"][0]["hooks"][0]["command"])
 PY
 )
 if printf '{"tool_name":"Write","tool_input":{"file_path":"%s"},"session_id":"testsid","cwd":"%s"}\n' "$TMP/repo/f" "$TMP/repo" \
-  | AGENT_HOME="$ROOT" HOME="$TMP/no-codex-home" sh -c "$codex_hook_command" >/tmp/codex_hook_agent_home.out 2>/tmp/codex_hook_agent_home.err \
-  && [ ! -s /tmp/codex_hook_agent_home.out ]; then
+  | AGENT_HOME="$ROOT" HOME="$TMP/no-codex-home" sh -c "$codex_hook_command" >"$TMP/logs/codex_hook_agent_home.out" 2>"$TMP/logs/codex_hook_agent_home.err" \
+  && [ ! -s "$TMP/logs/codex_hook_agent_home.out" ]; then
   ok "codex hook command resolves harness through AGENT_HOME"
 else
   bad "codex hook command should resolve harness through AGENT_HOME"
 fi
 if printf '{"tool_name":"Write","tool_input":{"file_path":"%s"},"session_id":"testsid","cwd":"%s"}\n' "$TMP/repo/f" "$TMP/repo" \
-  | AGENT_HOME="$TMP/not-agent-home" HOME="$TMP/codex_hook_home" sh -c "$codex_hook_command" >/tmp/codex_hook_invalid_agent_home.out 2>/tmp/codex_hook_invalid_agent_home.err \
-  && [ ! -s /tmp/codex_hook_invalid_agent_home.out ]; then
+  | AGENT_HOME="$TMP/not-agent-home" HOME="$TMP/codex_hook_home" sh -c "$codex_hook_command" >"$TMP/logs/codex_hook_invalid_agent_home.out" 2>"$TMP/logs/codex_hook_invalid_agent_home.err" \
+  && [ ! -s "$TMP/logs/codex_hook_invalid_agent_home.out" ]; then
   ok "codex hook command ignores invalid AGENT_HOME"
 else
   bad "codex hook command should ignore invalid AGENT_HOME"
 fi
-if (cd "$TMP/repo" && HOME="$TMP/codex_hook_home" MEM_STORE="$TMP/codex_hook_mem" python3 "$ROOT/tools/memory/mem.py" add durable thread "세션 시작 기억 주입 확인: Codex SessionStart bridge는 mem inject 결과를 hookSpecificOutput additionalContext로 전달해야 한다" >/tmp/codex_session_seed.out 2>/tmp/codex_session_seed.err) \
+if (cd "$TMP/repo" && HOME="$TMP/codex_hook_home" MEM_STORE="$TMP/codex_hook_mem" python3 "$ROOT/tools/memory/mem.py" add durable thread "세션 시작 기억 주입 확인: Codex SessionStart bridge는 mem inject 결과를 hookSpecificOutput additionalContext로 전달해야 한다" >"$TMP/logs/codex_session_seed.out" 2>"$TMP/logs/codex_session_seed.err") \
   && printf '{"session_id":"testsid","cwd":"%s"}\n' "$TMP/repo" \
-  | MEM_STORE="$TMP/codex_hook_mem" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/sessionstart-lifecycle.py" >/tmp/codex_session_hook_default.out 2>/tmp/codex_session_hook_default.err \
-  && [ ! -s /tmp/codex_session_hook_default.out ] \
-  && ! grep -q 'adapters/claude\|claude_setting\|statusline.sh' /tmp/codex_session_hook_default.out /tmp/codex_session_hook_default.err; then
+  | MEM_STORE="$TMP/codex_hook_mem" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/sessionstart-lifecycle.py" >"$TMP/logs/codex_session_hook_default.out" 2>"$TMP/logs/codex_session_hook_default.err" \
+  && [ ! -s "$TMP/logs/codex_session_hook_default.out" ] \
+  && ! grep -q 'adapters/claude\|claude_setting\|statusline.sh' "$TMP/logs/codex_session_hook_default.out" "$TMP/logs/codex_session_hook_default.err"; then
   ok "codex native hook projection keeps session start context silent by default"
 else
   bad "codex native hook projection should keep session start context silent by default"
 fi
 if printf '{"session_id":"testsid","cwd":"%s"}\n' "$TMP/repo" \
-  | CODEX_SESSION_MEMORY_INJECT=1 MEM_STORE="$TMP/codex_hook_mem" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/sessionstart-lifecycle.py" >/tmp/codex_session_hook.out 2>/tmp/codex_session_hook.err \
-  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); out=d["hookSpecificOutput"]; assert out["hookEventName"]=="SessionStart"; assert "세션 시작 기억 주입 확인" in out["additionalContext"]' /tmp/codex_session_hook.out \
-  && ! grep -q 'adapters/claude\|claude_setting\|statusline.sh' /tmp/codex_session_hook.out /tmp/codex_session_hook.err; then
+  | CODEX_SESSION_MEMORY_INJECT=1 MEM_STORE="$TMP/codex_hook_mem" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/sessionstart-lifecycle.py" >"$TMP/logs/codex_session_hook.out" 2>"$TMP/logs/codex_session_hook.err" \
+  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); out=d["hookSpecificOutput"]; assert out["hookEventName"]=="SessionStart"; assert "세션 시작 기억 주입 확인" in out["additionalContext"]' "$TMP/logs/codex_session_hook.out" \
+  && ! grep -q 'adapters/claude\|claude_setting\|statusline.sh' "$TMP/logs/codex_session_hook.out" "$TMP/logs/codex_session_hook.err"; then
   ok "codex native hook projection can opt into session start memory context"
 else
   bad "codex native hook projection should opt into session start memory context"
 fi
 if printf '{"session_id":"testsid","cwd":"%s"}\n' "$TMP/repo" \
-  | MEM_STORE="$TMP/codex_hook_mem" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/sessionend-lifecycle.py" >/tmp/codex_session_end_hook.out 2>/tmp/codex_session_end_hook.err \
-  && [ ! -s /tmp/codex_session_end_hook.out ] \
-  && ! grep -q 'adapters/claude\|claude_setting\|statusline.sh' /tmp/codex_session_end_hook.out /tmp/codex_session_end_hook.err; then
+  | MEM_STORE="$TMP/codex_hook_mem" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/sessionend-lifecycle.py" >"$TMP/logs/codex_session_end_hook.out" 2>"$TMP/logs/codex_session_end_hook.err" \
+  && [ ! -s "$TMP/logs/codex_session_end_hook.out" ] \
+  && ! grep -q 'adapters/claude\|claude_setting\|statusline.sh' "$TMP/logs/codex_session_end_hook.out" "$TMP/logs/codex_session_end_hook.err"; then
   ok "codex native hook projection bridges session end lifecycle with silent success output"
 else
   bad "codex native hook projection should bridge session end lifecycle with silent success output"
@@ -2768,22 +2775,22 @@ print(data["hooks"]["Stop"][0]["hooks"][0]["command"])
 PY
 )
 if printf '{"session_id":"stopsid","cwd":"%s"}\n' "$TMP/repo" \
-  | MEM_STORE="$TMP/codex_hook_mem_stop" HOME="$TMP/codex_hook_home" sh -c "$codex_stop_command" >/tmp/codex_stop_hook.out 2>/tmp/codex_stop_hook.err \
-  && [ ! -s /tmp/codex_stop_hook.out ] \
-  && ! grep -q 'adapters/claude\|claude_setting\|statusline.sh' /tmp/codex_stop_hook.out /tmp/codex_stop_hook.err; then
+  | MEM_STORE="$TMP/codex_hook_mem_stop" HOME="$TMP/codex_hook_home" sh -c "$codex_stop_command" >"$TMP/logs/codex_stop_hook.out" 2>"$TMP/logs/codex_stop_hook.err" \
+  && [ ! -s "$TMP/logs/codex_stop_hook.out" ] \
+  && ! grep -q 'adapters/claude\|claude_setting\|statusline.sh' "$TMP/logs/codex_stop_hook.out" "$TMP/logs/codex_stop_hook.err"; then
   ok "codex native hook projection detaches Stop session end lifecycle with silent success output"
 else
   bad "codex native hook projection should detach Stop session end lifecycle with silent success output"
 fi
-if git check-ignore -q "$ROOT/adapters/claude/loops/oncall.log"; then
+if git -C "$ROOT" check-ignore -q "$ROOT/adapters/claude/loops/oncall.log"; then
   ok "adapter loop runtime logs are ignored"
 else
   bad "adapter loop runtime logs should be ignored"
 fi
 if printf '{"prompt":"plain prompt","session_id":"promptlifecyclesid","cwd":"%s"}\n' "$TMP/flowproj" \
-  | MEM_NUDGE_INTERVAL=100 MEM_STORE="$TMP/codex_hook_mem" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/userprompt-lifecycle.py" >/tmp/codex_prompt_hook_tracked.out 2>/tmp/codex_prompt_hook_tracked.err \
-  && [ ! -s /tmp/codex_prompt_hook_tracked.out ] \
-  && ! grep -q 'adapters/claude\|claude_setting\|statusline.sh' /tmp/codex_prompt_hook_tracked.out /tmp/codex_prompt_hook_tracked.err; then
+  | MEM_NUDGE_INTERVAL=100 MEM_STORE="$TMP/codex_hook_mem" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/userprompt-lifecycle.py" >"$TMP/logs/codex_prompt_hook_tracked.out" 2>"$TMP/logs/codex_prompt_hook_tracked.err" \
+  && [ ! -s "$TMP/logs/codex_prompt_hook_tracked.out" ] \
+  && ! grep -q 'adapters/claude\|claude_setting\|statusline.sh' "$TMP/logs/codex_prompt_hook_tracked.out" "$TMP/logs/codex_prompt_hook_tracked.err"; then
   ok "codex native hook projection injects no workflow-mode banner (retired)"
 else
   bad "codex native hook projection should not inject a workflow-mode banner"
@@ -2793,21 +2800,21 @@ budget_rollout="$TMP/codex_hook_home/.codex/sessions/2026/07/13/rollout-test-$bu
 mkdir -p "$(dirname "$budget_rollout")" "$TMP/codex_budget_state"
 printf '%s\n' '{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":82000},"total_token_usage":{"input_tokens":120000,"cached_input_tokens":70000,"output_tokens":20000,"reasoning_output_tokens":10000,"total_tokens":150000},"model_context_window":112000}}}' > "$budget_rollout"
 budget_preflight="$TMP/codex_hook_home/.codex/hearting/adapters/codex/bin/preflight.sh"
-if CODEX_HOME="$TMP/codex_hook_home/.codex" "$budget_preflight" token-budget "$TMP/flowproj" "$budget_sid" kv >/tmp/codex_budget_kv.out 2>/tmp/codex_budget_kv.err \
-  && grep -q '^active_context_tokens=82000$' /tmp/codex_budget_kv.out \
-  && grep -q '^session_total_tokens=150000$' /tmp/codex_budget_kv.out \
-  && grep -q '^policy_state=tight$' /tmp/codex_budget_kv.out; then
+if CODEX_HOME="$TMP/codex_hook_home/.codex" "$budget_preflight" token-budget "$TMP/flowproj" "$budget_sid" kv >"$TMP/logs/codex_budget_kv.out" 2>"$TMP/logs/codex_budget_kv.err" \
+  && grep -q '^active_context_tokens=82000$' "$TMP/logs/codex_budget_kv.out" \
+  && grep -q '^session_total_tokens=150000$' "$TMP/logs/codex_budget_kv.out" \
+  && grep -q '^policy_state=tight$' "$TMP/logs/codex_budget_kv.out"; then
   ok "codex token-budget preflight separates active context and cumulative session counters"
 else
   bad "codex token-budget preflight should expose exact-session telemetry"
 fi
 if printf '{"prompt":"plain prompt","session_id":"%s","cwd":"%s"}\n' "$budget_sid" "$TMP/flowproj" \
-  | CODEX_HOME="$TMP/codex_hook_home/.codex" XDG_STATE_HOME="$TMP/codex_budget_state" MEM_NUDGE_INTERVAL=100 MEM_STORE="$TMP/codex_hook_mem" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/userprompt-lifecycle.py" >/tmp/codex_budget_hook_first.out 2>/tmp/codex_budget_hook_first.err \
-  && grep -q 'TOKEN_BUDGET=tight' /tmp/codex_budget_hook_first.out \
-  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); out=d["hookSpecificOutput"]; assert out["hookEventName"]=="UserPromptSubmit"; ctx=out["additionalContext"]; line=[x for x in ctx.splitlines() if x.startswith("TOKEN_BUDGET=")]; assert len(line)==1; assert len((line[0]+"\n").encode()) <= 240; assert "required work" in line[0] and "tests" in line[0] and "input context unchanged" in line[0]' /tmp/codex_budget_hook_first.out \
+  | CODEX_HOME="$TMP/codex_hook_home/.codex" XDG_STATE_HOME="$TMP/codex_budget_state" MEM_NUDGE_INTERVAL=100 MEM_STORE="$TMP/codex_hook_mem" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/userprompt-lifecycle.py" >"$TMP/logs/codex_budget_hook_first.out" 2>"$TMP/logs/codex_budget_hook_first.err" \
+  && grep -q 'TOKEN_BUDGET=tight' "$TMP/logs/codex_budget_hook_first.out" \
+  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); out=d["hookSpecificOutput"]; assert out["hookEventName"]=="UserPromptSubmit"; ctx=out["additionalContext"]; line=[x for x in ctx.splitlines() if x.startswith("TOKEN_BUDGET=")]; assert len(line)==1; assert len((line[0]+"\n").encode()) <= 240; assert "required work" in line[0] and "tests" in line[0] and "input context unchanged" in line[0]' "$TMP/logs/codex_budget_hook_first.out" \
   && printf '{"prompt":"plain prompt","session_id":"%s","cwd":"%s"}\n' "$budget_sid" "$TMP/flowproj" \
-  | CODEX_HOME="$TMP/codex_hook_home/.codex" XDG_STATE_HOME="$TMP/codex_budget_state" MEM_NUDGE_INTERVAL=100 MEM_STORE="$TMP/codex_hook_mem" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/userprompt-lifecycle.py" >/tmp/codex_budget_hook_repeat.out 2>/tmp/codex_budget_hook_repeat.err \
-  && [ ! -s /tmp/codex_budget_hook_repeat.out ]; then
+  | CODEX_HOME="$TMP/codex_hook_home/.codex" XDG_STATE_HOME="$TMP/codex_budget_state" MEM_NUDGE_INTERVAL=100 MEM_STORE="$TMP/codex_hook_mem" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/userprompt-lifecycle.py" >"$TMP/logs/codex_budget_hook_repeat.out" 2>"$TMP/logs/codex_budget_hook_repeat.err" \
+  && [ ! -s "$TMP/logs/codex_budget_hook_repeat.out" ]; then
   ok "codex prompt hook injects token budget only on pressure-band transition"
 else
   bad "codex prompt hook should keep same-band token budget reinjection at zero bytes"
@@ -2842,41 +2849,41 @@ else
   bad "codex prompt hook should record bounded exact accounting without diagnostic reinjection"
 fi
 if printf '{"prompt":"remember this project context","session_id":"promptlifecyclesid","cwd":"%s"}\n' "$TMP/flowproj" \
-  | MEM_NUDGE_INTERVAL=1 MEM_STORE="$TMP/codex_hook_mem" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/userprompt-lifecycle.py" >/tmp/codex_prompt_hook.out 2>/tmp/codex_prompt_hook.err \
-  && [ ! -s /tmp/codex_prompt_hook.out ] \
+  | MEM_NUDGE_INTERVAL=1 MEM_STORE="$TMP/codex_hook_mem" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/userprompt-lifecycle.py" >"$TMP/logs/codex_prompt_hook.out" 2>"$TMP/logs/codex_prompt_hook.err" \
+  && [ ! -s "$TMP/logs/codex_prompt_hook.out" ] \
   && grep -q '^0$' "$TMP/codex_hook_mem/.codex-turn-state-promptlifecyclesid" \
-  && ! grep -q 'adapters/claude\|claude_setting\|statusline.sh' /tmp/codex_prompt_hook.out /tmp/codex_prompt_hook.err; then
+  && ! grep -q 'adapters/claude\|claude_setting\|statusline.sh' "$TMP/logs/codex_prompt_hook.out" "$TMP/logs/codex_prompt_hook.err"; then
   ok "codex native hook projection resets the turn-nudge counter on every prompt"
 else
   bad "codex native hook projection should reset the turn-nudge counter on every prompt"
 fi
 if printf '{"context":{"cwd":"%s","session_id":"permissionsid"}}\n' "$TMP/flowproj" \
-  | FLEET_INTERACTION_STATE_DIR="$TMP/codex-interactions" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/permissionrequest-lifecycle.py" >/tmp/codex_permission_hook.out 2>/tmp/codex_permission_hook.err \
-  && [ ! -s /tmp/codex_permission_hook.out ] \
+  | FLEET_INTERACTION_STATE_DIR="$TMP/codex-interactions" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/permissionrequest-lifecycle.py" >"$TMP/logs/codex_permission_hook.out" 2>"$TMP/logs/codex_permission_hook.err" \
+  && [ ! -s "$TMP/logs/codex_permission_hook.out" ] \
   && [ -f "$TMP/codex-interactions/codex/permissionsid.json" ] \
   && grep -q '"session_id":"permissionsid"' "$TMP/codex-interactions/codex/permissionsid.json" \
   && grep -q '"kind":"approval"' "$TMP/codex-interactions/codex/permissionsid.json" \
   && grep -q '"source":"codex-permissionrequest"' "$TMP/codex-interactions/codex/permissionsid.json" \
-  && ! grep -q 'adapters/claude\|claude_setting\|statusline.sh' /tmp/codex_permission_hook.out /tmp/codex_permission_hook.err; then
+  && ! grep -q 'adapters/claude\|claude_setting\|statusline.sh' "$TMP/logs/codex_permission_hook.out" "$TMP/logs/codex_permission_hook.err"; then
   ok "codex native hook projection publishes a silent privacy-minimal approval wait"
 else
   bad "codex native hook projection should publish a silent exact-session approval wait"
 fi
-if (cd "$TMP/flowproj" && HOME="$TMP/codex_hook_home" MEM_STORE="$TMP/codex_hook_mem" python3 "$ROOT/tools/memory/mem.py" add durable thread "지난번 결정론 우선 설계가 핵심이라고 배웠다" >/tmp/codex_nested_prompt_seed.out 2>/tmp/codex_nested_prompt_seed.err) \
+if (cd "$TMP/flowproj" && HOME="$TMP/codex_hook_home" MEM_STORE="$TMP/codex_hook_mem" python3 "$ROOT/tools/memory/mem.py" add durable thread "지난번 결정론 우선 설계가 핵심이라고 배웠다" >"$TMP/logs/codex_nested_prompt_seed.out" 2>"$TMP/logs/codex_nested_prompt_seed.err") \
   && printf '{"input":{"messages":[{"role":"user","content":[{"type":"text","text":"지난번 결정론 내용을 다시 확인"}]}]},"session_id":"nestedpromptsid","cwd":"%s"}\n' "$TMP/flowproj" \
-  | MEM_NUDGE_INTERVAL=100 MEM_STORE="$TMP/codex_hook_mem" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/userprompt-lifecycle.py" >/tmp/codex_nested_prompt_hook.out 2>/tmp/codex_nested_prompt_hook.err \
-  && ! grep -q '우선 설계가 핵심' /tmp/codex_nested_prompt_hook.out; then
+  | MEM_NUDGE_INTERVAL=100 MEM_STORE="$TMP/codex_hook_mem" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/userprompt-lifecycle.py" >"$TMP/logs/codex_nested_prompt_hook.out" 2>"$TMP/logs/codex_nested_prompt_hook.err" \
+  && ! grep -q '우선 설계가 핵심' "$TMP/logs/codex_nested_prompt_hook.out"; then
   ok "codex native prompt hook does not classify nested message content for recall"
 else
   bad "codex native prompt hook should leave semantic recall to the agent"
 fi
 if (cd "$TMP/flowproj" && HOME="$TMP/codex_hook_home" MEM_STORE="$TMP/codex_hook_mem" python3 "$ROOT/tools/memory/mem.py" add durable decision \
   "This durable record keeps direct-body-marker outside prompt context" \
-  --headline "Deterministic recall capsule" --alias "deterministic recall" >/tmp/codex_direct_prompt_seed.out 2>/tmp/codex_direct_prompt_seed.err) \
+  --headline "Deterministic recall capsule" --alias "deterministic recall" >"$TMP/logs/codex_direct_prompt_seed.out" 2>"$TMP/logs/codex_direct_prompt_seed.err") \
   && printf '{"prompt":"deterministic recall","session_id":"directpromptsid","turn_id":"directturnid","cwd":"%s"}\n' "$TMP/flowproj" \
-  | MEM_NUDGE_INTERVAL=100 MEM_STORE="$TMP/codex_hook_mem" MEM_RECALL_RECEIPTS="$MEM_RECALL_RECEIPTS" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/userprompt-lifecycle.py" >/tmp/codex_direct_prompt_hook.out 2>/tmp/codex_direct_prompt_hook.err \
-  && grep -q 'Deterministic recall capsule' /tmp/codex_direct_prompt_hook.out \
-  && ! grep -q 'direct-body-marker' /tmp/codex_direct_prompt_hook.out; then
+  | MEM_NUDGE_INTERVAL=100 MEM_STORE="$TMP/codex_hook_mem" MEM_RECALL_RECEIPTS="$MEM_RECALL_RECEIPTS" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/userprompt-lifecycle.py" >"$TMP/logs/codex_direct_prompt_hook.out" 2>"$TMP/logs/codex_direct_prompt_hook.err" \
+  && grep -q 'Deterministic recall capsule' "$TMP/logs/codex_direct_prompt_hook.out" \
+  && ! grep -q 'direct-body-marker' "$TMP/logs/codex_direct_prompt_hook.out"; then
   ok "codex native prompt hook exposes bounded capsule candidates without record bodies"
 else
   bad "codex native prompt hook should expose capsule candidates and keep bodies private"
@@ -2884,15 +2891,15 @@ fi
 mkdir -p "$TMP/repo/.agent_reports/spec" "$TMP/codex_marker_home"
 printf 'prd\n' > "$TMP/repo/.agent_reports/spec/prd.md"
 if printf '{"tool_name":"Read","tool_input":{"file_path":"%s"},"session_id":"testsid","cwd":"%s"}\n' "$TMP/repo/.agent_reports/spec/prd.md" "$TMP/repo" \
-  | AGENT_HOME="$TMP/codex_marker_home" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/posttooluse-read-marker.py" >/tmp/codex_read_hook.out 2>/tmp/codex_read_hook.err \
+  | AGENT_HOME="$TMP/codex_marker_home" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/posttooluse-read-marker.py" >"$TMP/logs/codex_read_hook.out" 2>"$TMP/logs/codex_read_hook.err" \
   && find "$TMP/codex_marker_home/.spec-grounding" -type f -name 'testsid__*' -print -quit | grep -q . \
-  && ! grep -q 'adapters/claude\|claude_setting\|statusline.sh' /tmp/codex_read_hook.out /tmp/codex_read_hook.err; then
+  && ! grep -q 'adapters/claude\|claude_setting\|statusline.sh' "$TMP/logs/codex_read_hook.out" "$TMP/logs/codex_read_hook.err"; then
   ok "codex native hook projection records spec read markers"
 else
   bad "codex native hook projection should record spec read markers"
 fi
 if printf '{"tool_name":"Bash","tool_input":{"command":"cat .agent_reports/spec/prd.md"},"session_id":"shellreadsid","cwd":"%s"}\n' "$TMP/repo" \
-  | AGENT_HOME="$TMP/codex_marker_home" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/posttooluse-read-marker.py" >/tmp/codex_shell_read_hook.out 2>/tmp/codex_shell_read_hook.err \
+  | AGENT_HOME="$TMP/codex_marker_home" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/posttooluse-read-marker.py" >"$TMP/logs/codex_shell_read_hook.out" 2>"$TMP/logs/codex_shell_read_hook.err" \
   && find "$TMP/codex_marker_home/.spec-grounding" -type f -name 'shellreadsid__*' -print -quit | grep -q .; then
   ok "codex native read hook marks obvious shell spec reads"
 else
@@ -2901,53 +2908,53 @@ fi
 mkdir -p "$TMP/repo/core"
 printf 'core\n' > "$TMP/repo/core/MEMORY.md"
 if printf '{"tool_name":"Read","tool_input":{"file_path":"%s"},"session_id":"corereadsid","cwd":"%s"}\n' "$TMP/repo/core/MEMORY.md" "$TMP/repo" \
-  | AGENT_HOME="$TMP/codex_marker_home" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/posttooluse-read-marker.py" >/tmp/codex_core_read_hook.out 2>/tmp/codex_core_read_hook.err \
+  | AGENT_HOME="$TMP/codex_marker_home" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/posttooluse-read-marker.py" >"$TMP/logs/codex_core_read_hook.out" 2>"$TMP/logs/codex_core_read_hook.err" \
   && find "$TMP/codex_marker_home/.core-grounding" -type f -name 'corereadsid__*' -print -quit | grep -q .; then
   ok "codex native hook projection records core read markers"
 else
   bad "codex native hook projection should record core read markers"
 fi
 if printf '{"tool_name":"Bash","tool_input":{"command":"cat core/MEMORY.md"},"session_id":"shellcorereadsid","cwd":"%s"}\n' "$TMP/repo" \
-  | AGENT_HOME="$TMP/codex_marker_home" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/posttooluse-read-marker.py" >/tmp/codex_shell_core_read_hook.out 2>/tmp/codex_shell_core_read_hook.err \
+  | AGENT_HOME="$TMP/codex_marker_home" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/posttooluse-read-marker.py" >"$TMP/logs/codex_shell_core_read_hook.out" 2>"$TMP/logs/codex_shell_core_read_hook.err" \
   && find "$TMP/codex_marker_home/.core-grounding" -type f -name 'shellcorereadsid__*' -print -quit | grep -q .; then
   ok "codex native read hook marks obvious shell core reads"
 else
   bad "codex native read hook should mark obvious shell core reads"
 fi
 if printf '{"tool":{"name":"Read","input":{"path":"%s"}},"session_id":"nestedreadsid","cwd":"%s"}\n' "$TMP/repo/.agent_reports/spec/prd.md" "$TMP/repo" \
-  | AGENT_HOME="$TMP/codex_marker_home" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/posttooluse-read-marker.py" >/tmp/codex_read_hook_nested.out 2>/tmp/codex_read_hook_nested.err \
+  | AGENT_HOME="$TMP/codex_marker_home" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/posttooluse-read-marker.py" >"$TMP/logs/codex_read_hook_nested.out" 2>"$TMP/logs/codex_read_hook_nested.err" \
   && find "$TMP/codex_marker_home/.spec-grounding" -type f -name 'nestedreadsid__*' -print -quit | grep -q .; then
   ok "codex native read hook accepts nested tool input payloads"
 else
   bad "codex native read hook should accept nested tool input payloads"
 fi
 if printf '{"tool_name":"Read","tool_input":{"file_path":".agent_reports/spec/prd.md"},"session":{"id":"nestedctxreadsid"},"workspace":{"cwd":"%s"}}\n' "$TMP/repo" \
-  | AGENT_HOME="$TMP/codex_marker_home" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/posttooluse-read-marker.py" >/tmp/codex_read_hook_nested_context.out 2>/tmp/codex_read_hook_nested_context.err \
+  | AGENT_HOME="$TMP/codex_marker_home" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/posttooluse-read-marker.py" >"$TMP/logs/codex_read_hook_nested_context.out" 2>"$TMP/logs/codex_read_hook_nested_context.err" \
   && find "$TMP/codex_marker_home/.spec-grounding" -type f -name 'nestedctxreadsid__*' -print -quit | grep -q .; then
   ok "codex native read hook resolves nested cwd/session payloads"
 else
   bad "codex native read hook should resolve nested cwd/session payloads"
 fi
 if printf '{"tool_name":"Write","tool_input":{"file_path":"%s"},"session_id":"testsid","cwd":"%s"}\n' "$TMP/runtime/projects/abc/memory/MEMORY.md" "$TMP/runtime" \
-  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >/tmp/codex_hook_block.out 2>/tmp/codex_hook_block.err \
-  && grep -q '"decision": "block"' /tmp/codex_hook_block.out \
-  && grep -q 'memory' /tmp/codex_hook_block.out; then
+  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/logs/codex_hook_block.out" 2>"$TMP/logs/codex_hook_block.err" \
+  && grep -q '"decision": "block"' "$TMP/logs/codex_hook_block.out" \
+  && grep -q 'memory' "$TMP/logs/codex_hook_block.out"; then
   ok "codex native hook projection blocks guarded writes"
 else
   bad "codex native hook projection should block guarded writes"
 fi
 if printf '{"tool_name":"Write","tool_input":{"file_path":"projects/abc/memory/NESTED.md"},"session":{"id":"nestedcontextsid"},"context":{"cwd":"%s"}}\n' "$TMP/runtime" \
-  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >/tmp/codex_nested_context_block.out 2>/tmp/codex_nested_context_block.err \
-  && grep -q '"decision": "block"' /tmp/codex_nested_context_block.out \
-  && grep -q 'memory' /tmp/codex_nested_context_block.out; then
+  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/logs/codex_nested_context_block.out" 2>"$TMP/logs/codex_nested_context_block.err" \
+  && grep -q '"decision": "block"' "$TMP/logs/codex_nested_context_block.out" \
+  && grep -q 'memory' "$TMP/logs/codex_nested_context_block.out"; then
   ok "codex native write hook resolves nested cwd/session payloads"
 else
   bad "codex native write hook should resolve nested cwd/session payloads"
 fi
 if printf '{"tool_name":"MultiEdit","tool_input":{"file_path":"%s","edits":[]},"session_id":"testsid","cwd":"%s"}\n' "$TMP/runtime/projects/abc/memory/MEMORY.md" "$TMP/runtime" \
-  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >/tmp/codex_multiedit_block.out 2>/tmp/codex_multiedit_block.err \
-  && grep -q '"decision": "block"' /tmp/codex_multiedit_block.out \
-  && grep -q 'memory' /tmp/codex_multiedit_block.out; then
+  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/logs/codex_multiedit_block.out" 2>"$TMP/logs/codex_multiedit_block.err" \
+  && grep -q '"decision": "block"' "$TMP/logs/codex_multiedit_block.out" \
+  && grep -q 'memory' "$TMP/logs/codex_multiedit_block.out"; then
   ok "codex native hook projection blocks guarded MultiEdit writes"
 else
   bad "codex native hook projection should block guarded MultiEdit writes"
@@ -2965,9 +2972,9 @@ print(json.dumps({
 PY
 )
 if printf '%s\n' "$codex_qualified_patch_payload" \
-  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >/tmp/codex_qualified_patch_block.out 2>/tmp/codex_qualified_patch_block.err \
-  && grep -q '"decision": "block"' /tmp/codex_qualified_patch_block.out \
-  && grep -q 'memory' /tmp/codex_qualified_patch_block.out; then
+  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/logs/codex_qualified_patch_block.out" 2>"$TMP/logs/codex_qualified_patch_block.err" \
+  && grep -q '"decision": "block"' "$TMP/logs/codex_qualified_patch_block.out" \
+  && grep -q 'memory' "$TMP/logs/codex_qualified_patch_block.out"; then
   ok "codex native hook projection blocks qualified apply_patch writes"
 else
   bad "codex native hook projection should block qualified apply_patch writes"
@@ -2985,9 +2992,9 @@ print(json.dumps({
 PY
 )
 if printf '%s\n' "$codex_freeform_patch_payload" \
-  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >/tmp/codex_freeform_patch_block.out 2>/tmp/codex_freeform_patch_block.err \
-  && grep -q '"decision": "block"' /tmp/codex_freeform_patch_block.out \
-  && grep -q 'memory' /tmp/codex_freeform_patch_block.out; then
+  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/logs/codex_freeform_patch_block.out" 2>"$TMP/logs/codex_freeform_patch_block.err" \
+  && grep -q '"decision": "block"' "$TMP/logs/codex_freeform_patch_block.out" \
+  && grep -q 'memory' "$TMP/logs/codex_freeform_patch_block.out"; then
   ok "codex native hook projection parses freeform tool_input strings"
 else
   bad "codex native hook projection should parse freeform apply_patch input"
@@ -2995,33 +3002,33 @@ fi
 mkdir -p "$TMP/repo/spec/design"
 printf '<!doctype html><title>ok</title>\n' > "$TMP/repo/spec/design/preview.html"
 if printf '{"tool_name":"Write","tool_input":{"file_path":"%s"},"session_id":"testsid","cwd":"%s"}\n' "$TMP/repo/spec/design/preview.html" "$TMP/repo" \
-  | DESIGN_POSTWRITE_HOOK=0 HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/posttooluse-design-check.py" >/tmp/codex_design_hook.out 2>/tmp/codex_design_hook.err \
-  && [ ! -s /tmp/codex_design_hook.out ] \
-  && [ ! -s /tmp/codex_design_hook.err ]; then
+  | DESIGN_POSTWRITE_HOOK=0 HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/posttooluse-design-check.py" >"$TMP/logs/codex_design_hook.out" 2>"$TMP/logs/codex_design_hook.err" \
+  && [ ! -s "$TMP/logs/codex_design_hook.out" ] \
+  && [ ! -s "$TMP/logs/codex_design_hook.err" ]; then
   ok "codex native hook projection bridges design post-write checks"
 else
   bad "codex native hook projection should bridge design post-write checks"
 fi
 if printf '{"toolUse":{"name":"Write","input":{"path":"%s"}},"session_id":"testsid","cwd":"%s"}\n' "$TMP/repo/spec/design/preview.html" "$TMP/repo" \
-  | DESIGN_POSTWRITE_HOOK=0 HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/posttooluse-design-check.py" >/tmp/codex_design_hook_nested.out 2>/tmp/codex_design_hook_nested.err \
-  && [ ! -s /tmp/codex_design_hook_nested.out ] \
-  && [ ! -s /tmp/codex_design_hook_nested.err ]; then
+  | DESIGN_POSTWRITE_HOOK=0 HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/posttooluse-design-check.py" >"$TMP/logs/codex_design_hook_nested.out" 2>"$TMP/logs/codex_design_hook_nested.err" \
+  && [ ! -s "$TMP/logs/codex_design_hook_nested.out" ] \
+  && [ ! -s "$TMP/logs/codex_design_hook_nested.err" ]; then
   ok "codex native design hook accepts toolUse input payloads"
 else
   bad "codex native design hook should accept toolUse input payloads"
 fi
 if printf '{"tool_name":"MultiEdit","tool_input":{"file_path":"%s","edits":[]},"session_id":"testsid","cwd":"%s"}\n' "$TMP/repo/spec/design/preview.html" "$TMP/repo" \
-  | DESIGN_POSTWRITE_HOOK=0 HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/posttooluse-design-check.py" >/tmp/codex_design_hook_multiedit.out 2>/tmp/codex_design_hook_multiedit.err \
-  && [ ! -s /tmp/codex_design_hook_multiedit.out ] \
-  && [ ! -s /tmp/codex_design_hook_multiedit.err ]; then
+  | DESIGN_POSTWRITE_HOOK=0 HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/posttooluse-design-check.py" >"$TMP/logs/codex_design_hook_multiedit.out" 2>"$TMP/logs/codex_design_hook_multiedit.err" \
+  && [ ! -s "$TMP/logs/codex_design_hook_multiedit.out" ] \
+  && [ ! -s "$TMP/logs/codex_design_hook_multiedit.err" ]; then
   ok "codex native design hook accepts MultiEdit payloads"
 else
   bad "codex native design hook should accept MultiEdit payloads"
 fi
 if printf '{"tool_name":"Bash","tool_input":{"command":"printf %s > spec/design/preview.html"},"session_id":"testsid","cwd":"%s"}\n' "'<!doctype html><title>ok</title>'" "$TMP/repo" \
-  | DESIGN_POSTWRITE_HOOK=0 HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/posttooluse-design-check.py" >/tmp/codex_design_hook_shell.out 2>/tmp/codex_design_hook_shell.err \
-  && [ ! -s /tmp/codex_design_hook_shell.out ] \
-  && [ ! -s /tmp/codex_design_hook_shell.err ] \
+  | DESIGN_POSTWRITE_HOOK=0 HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/posttooluse-design-check.py" >"$TMP/logs/codex_design_hook_shell.out" 2>"$TMP/logs/codex_design_hook_shell.err" \
+  && [ ! -s "$TMP/logs/codex_design_hook_shell.out" ] \
+  && [ ! -s "$TMP/logs/codex_design_hook_shell.err" ] \
   && python3 - "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/posttooluse-design-check.py" "$TMP/repo" <<'PY'
 import sys
 
@@ -3067,25 +3074,25 @@ print(json.dumps({
 PY
 )
 if printf '%s\n' "$codex_design_patch_payload" \
-  | DESIGN_POSTWRITE_HOOK=0 HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/posttooluse-design-check.py" >/tmp/codex_design_hook_qualified_patch.out 2>/tmp/codex_design_hook_qualified_patch.err \
-  && [ ! -s /tmp/codex_design_hook_qualified_patch.out ] \
-  && [ ! -s /tmp/codex_design_hook_qualified_patch.err ]; then
+  | DESIGN_POSTWRITE_HOOK=0 HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/posttooluse-design-check.py" >"$TMP/logs/codex_design_hook_qualified_patch.out" 2>"$TMP/logs/codex_design_hook_qualified_patch.err" \
+  && [ ! -s "$TMP/logs/codex_design_hook_qualified_patch.out" ] \
+  && [ ! -s "$TMP/logs/codex_design_hook_qualified_patch.err" ]; then
   ok "codex native design hook accepts qualified apply_patch payloads"
 else
   bad "codex native design hook should accept qualified apply_patch payloads"
 fi
-if "$CODEX" mode-info dev/backend >/tmp/mode.out 2>/tmp/mode.err \
-  && grep -q '^status=portable$' /tmp/mode.out \
-  && grep -q '^realization=portable-persona$' /tmp/mode.out; then
+if "$CODEX" mode-info dev/backend >"$TMP/logs/mode.out" 2>"$TMP/logs/mode.err" \
+  && grep -q '^status=portable$' "$TMP/logs/mode.out" \
+  && grep -q '^realization=portable-persona$' "$TMP/logs/mode.out"; then
   ok "codex mode wrapper maps portable mode"
 else
   bad "codex mode wrapper should map portable mode"
 fi
-if "$CODEX" mode-info qa/security-review >/tmp/mode.out 2>/tmp/mode.err \
-  && grep -q '^status=portable$' /tmp/mode.out \
-  && grep -q '^realization=portable-persona$' /tmp/mode.out \
-  && grep -q 'read-only security review with Codex file and git diff tools' /tmp/mode.out \
-  && ! grep -q '^tool_contract=' /tmp/mode.out; then
+if "$CODEX" mode-info qa/security-review >"$TMP/logs/mode.out" 2>"$TMP/logs/mode.err" \
+  && grep -q '^status=portable$' "$TMP/logs/mode.out" \
+  && grep -q '^realization=portable-persona$' "$TMP/logs/mode.out" \
+  && grep -q 'read-only security review with Codex file and git diff tools' "$TMP/logs/mode.out" \
+  && ! grep -q '^tool_contract=' "$TMP/logs/mode.out"; then
   ok "codex mode wrapper treats security-review as portable read-only guidance"
 else
   bad "codex mode wrapper should treat security-review as portable read-only guidance"
@@ -3097,14 +3104,14 @@ for mode_file in "$ROOT"/roles/units/design/*.md; do
   mode_name=$(basename "$mode_file" .md)
   case "$mode_name" in _*) continue ;; esac
   mode="design/$mode_name"
-  if ! "$CODEX" mode-info "$mode" >/tmp/mode.out 2>/tmp/mode.err \
-    || ! grep -q '^status=tool-contract$' /tmp/mode.out \
-    || ! grep -q '^realization=codex-native-mode-with-tool-contract$' /tmp/mode.out \
-    || ! grep -q '^tool_contract=visual-harness$' /tmp/mode.out \
-    || ! grep -q '^tool_contract_check=adapters/codex/bin/preflight.sh visual-harness <file.html>$' /tmp/mode.out \
-    || ! grep -q '^runtime_surface=adapter-owned-visual-harness$' /tmp/mode.out \
-    || ! grep -q "^native_mode_path=adapters/codex/modes/design/$mode_name.md$" /tmp/mode.out \
-    || ! grep -q '^fallback=satisfy-tool-contract-or-report-unavailable$' /tmp/mode.out; then
+  if ! "$CODEX" mode-info "$mode" >"$TMP/logs/mode.out" 2>"$TMP/logs/mode.err" \
+    || ! grep -q '^status=tool-contract$' "$TMP/logs/mode.out" \
+    || ! grep -q '^realization=codex-native-mode-with-tool-contract$' "$TMP/logs/mode.out" \
+    || ! grep -q '^tool_contract=visual-harness$' "$TMP/logs/mode.out" \
+    || ! grep -q '^tool_contract_check=adapters/codex/bin/preflight.sh visual-harness <file.html>$' "$TMP/logs/mode.out" \
+    || ! grep -q '^runtime_surface=adapter-owned-visual-harness$' "$TMP/logs/mode.out" \
+    || ! grep -q "^native_mode_path=adapters/codex/modes/design/$mode_name.md$" "$TMP/logs/mode.out" \
+    || ! grep -q '^fallback=satisfy-tool-contract-or-report-unavailable$' "$TMP/logs/mode.out"; then
     codex_design_modes_ok=0
     break
   fi
@@ -3114,77 +3121,77 @@ if [ "$codex_design_modes_ok" -eq 1 ]; then
 else
   bad "codex mode wrapper should map design modes to native visual-harness contract"
 fi
-if "$CODEX" mode-info material/data-script >/tmp/mode.out 2>/tmp/mode.err \
-  && grep -q '^status=tool-contract$' /tmp/mode.out \
-  && grep -q '^realization=portable-with-tool-contract$' /tmp/mode.out \
-  && grep -q '^tool_contract=data-script$' /tmp/mode.out \
-  && grep -q '^tool_contract_check=adapters/codex/bin/preflight.sh data-script --check <script.py>$' /tmp/mode.out \
-  && grep -q '^runtime_surface=adapter-owned-data-script$' /tmp/mode.out \
-  && grep -q '^fallback=satisfy-tool-contract-or-report-unavailable$' /tmp/mode.out; then
+if "$CODEX" mode-info material/data-script >"$TMP/logs/mode.out" 2>"$TMP/logs/mode.err" \
+  && grep -q '^status=tool-contract$' "$TMP/logs/mode.out" \
+  && grep -q '^realization=portable-with-tool-contract$' "$TMP/logs/mode.out" \
+  && grep -q '^tool_contract=data-script$' "$TMP/logs/mode.out" \
+  && grep -q '^tool_contract_check=adapters/codex/bin/preflight.sh data-script --check <script.py>$' "$TMP/logs/mode.out" \
+  && grep -q '^runtime_surface=adapter-owned-data-script$' "$TMP/logs/mode.out" \
+  && grep -q '^fallback=satisfy-tool-contract-or-report-unavailable$' "$TMP/logs/mode.out"; then
   ok "codex mode wrapper reports material data-script contract surface"
 else
   bad "codex mode wrapper should report material data-script contract surface"
 fi
-if "$CODEX" mode-info material/figure-gen >/tmp/mode.out 2>/tmp/mode.err \
-  && grep -q '^status=tool-contract$' /tmp/mode.out \
-  && grep -q '^realization=portable-with-tool-contract$' /tmp/mode.out \
-  && grep -q '^tool_contract=figure-gen$' /tmp/mode.out \
-  && grep -q '^tool_contract_check=adapters/codex/bin/preflight.sh figure-gen --check <script.py>$' /tmp/mode.out \
-  && grep -q '^runtime_surface=adapter-owned-figure-gen$' /tmp/mode.out \
-  && grep -q '^fallback=satisfy-tool-contract-or-report-unavailable$' /tmp/mode.out; then
+if "$CODEX" mode-info material/figure-gen >"$TMP/logs/mode.out" 2>"$TMP/logs/mode.err" \
+  && grep -q '^status=tool-contract$' "$TMP/logs/mode.out" \
+  && grep -q '^realization=portable-with-tool-contract$' "$TMP/logs/mode.out" \
+  && grep -q '^tool_contract=figure-gen$' "$TMP/logs/mode.out" \
+  && grep -q '^tool_contract_check=adapters/codex/bin/preflight.sh figure-gen --check <script.py>$' "$TMP/logs/mode.out" \
+  && grep -q '^runtime_surface=adapter-owned-figure-gen$' "$TMP/logs/mode.out" \
+  && grep -q '^fallback=satisfy-tool-contract-or-report-unavailable$' "$TMP/logs/mode.out"; then
   ok "codex mode wrapper reports material figure-gen contract surface"
 else
   bad "codex mode wrapper should report material figure-gen contract surface"
 fi
-if "$CODEX" mode-info material/pdf-extract >/tmp/mode.out 2>/tmp/mode.err \
-  && grep -q '^status=tool-contract$' /tmp/mode.out \
-  && grep -q '^realization=portable-with-tool-contract$' /tmp/mode.out \
-  && grep -q '^tool_contract=pdf-extract$' /tmp/mode.out \
-  && grep -q '^tool_contract_check=adapters/codex/bin/preflight.sh pdf-extract --check <file.pdf>$' /tmp/mode.out \
-  && grep -q '^runtime_surface=adapter-owned-pdf-extract$' /tmp/mode.out \
-  && grep -q '^fallback=satisfy-tool-contract-or-report-unavailable$' /tmp/mode.out; then
+if "$CODEX" mode-info material/pdf-extract >"$TMP/logs/mode.out" 2>"$TMP/logs/mode.err" \
+  && grep -q '^status=tool-contract$' "$TMP/logs/mode.out" \
+  && grep -q '^realization=portable-with-tool-contract$' "$TMP/logs/mode.out" \
+  && grep -q '^tool_contract=pdf-extract$' "$TMP/logs/mode.out" \
+  && grep -q '^tool_contract_check=adapters/codex/bin/preflight.sh pdf-extract --check <file.pdf>$' "$TMP/logs/mode.out" \
+  && grep -q '^runtime_surface=adapter-owned-pdf-extract$' "$TMP/logs/mode.out" \
+  && grep -q '^fallback=satisfy-tool-contract-or-report-unavailable$' "$TMP/logs/mode.out"; then
   ok "codex mode wrapper reports material pdf-extract contract surface"
 else
   bad "codex mode wrapper should report material pdf-extract contract surface"
 fi
-if "$CODEX" mode-info qa/test >/tmp/mode.out 2>/tmp/mode.err \
-  && grep -q '^status=tool-contract$' /tmp/mode.out \
-  && grep -q '^realization=portable-with-tool-contract$' /tmp/mode.out \
-  && grep -q '^tool_contract=verification-runner$' /tmp/mode.out \
-  && grep -q '^tool_contract_check=adapters/codex/bin/preflight.sh verification-runner --check -- <command>$' /tmp/mode.out \
-  && grep -q '^runtime_surface=adapter-owned-verification-runner$' /tmp/mode.out \
-  && grep -q '^fallback=satisfy-tool-contract-or-report-unavailable$' /tmp/mode.out; then
+if "$CODEX" mode-info qa/test >"$TMP/logs/mode.out" 2>"$TMP/logs/mode.err" \
+  && grep -q '^status=tool-contract$' "$TMP/logs/mode.out" \
+  && grep -q '^realization=portable-with-tool-contract$' "$TMP/logs/mode.out" \
+  && grep -q '^tool_contract=verification-runner$' "$TMP/logs/mode.out" \
+  && grep -q '^tool_contract_check=adapters/codex/bin/preflight.sh verification-runner --check -- <command>$' "$TMP/logs/mode.out" \
+  && grep -q '^runtime_surface=adapter-owned-verification-runner$' "$TMP/logs/mode.out" \
+  && grep -q '^fallback=satisfy-tool-contract-or-report-unavailable$' "$TMP/logs/mode.out"; then
   ok "codex mode wrapper reports qa test verification runner surface"
 else
   bad "codex mode wrapper should report qa test verification runner surface"
 fi
-if "$CODEX" mode-info material/browser-fetch >/tmp/mode.out 2>/tmp/mode.err \
-  && grep -q '^status=tool-contract$' /tmp/mode.out \
-  && grep -q '^realization=portable-with-tool-contract$' /tmp/mode.out \
-  && grep -q '^tool_contract=browser-fetch$' /tmp/mode.out \
-  && grep -q '^tool_contract_check=adapters/codex/bin/preflight.sh browser-fetch --check <url>$' /tmp/mode.out \
-  && grep -q '^runtime_surface=adapter-owned-browser-fetch$' /tmp/mode.out \
-  && grep -q '^fallback=satisfy-tool-contract-or-report-unavailable$' /tmp/mode.out; then
+if "$CODEX" mode-info material/browser-fetch >"$TMP/logs/mode.out" 2>"$TMP/logs/mode.err" \
+  && grep -q '^status=tool-contract$' "$TMP/logs/mode.out" \
+  && grep -q '^realization=portable-with-tool-contract$' "$TMP/logs/mode.out" \
+  && grep -q '^tool_contract=browser-fetch$' "$TMP/logs/mode.out" \
+  && grep -q '^tool_contract_check=adapters/codex/bin/preflight.sh browser-fetch --check <url>$' "$TMP/logs/mode.out" \
+  && grep -q '^runtime_surface=adapter-owned-browser-fetch$' "$TMP/logs/mode.out" \
+  && grep -q '^fallback=satisfy-tool-contract-or-report-unavailable$' "$TMP/logs/mode.out"; then
   ok "codex mode wrapper reports material browser-fetch contract surface"
 else
   bad "codex mode wrapper should report material browser-fetch contract surface"
 fi
-if "$CODEX" mode-info material/web-image-search >/tmp/mode.out 2>/tmp/mode.err \
-  && grep -q '^status=tool-contract$' /tmp/mode.out \
-  && grep -q '^realization=portable-with-tool-contract$' /tmp/mode.out \
-  && grep -q '^tool_contract=web-image-search$' /tmp/mode.out \
-  && grep -q '^tool_contract_check=adapters/codex/bin/preflight.sh web-image-search --check <query>$' /tmp/mode.out \
-  && grep -q '^runtime_surface=adapter-owned-web-image-search$' /tmp/mode.out \
-  && grep -q '^fallback=satisfy-tool-contract-or-report-unavailable$' /tmp/mode.out; then
+if "$CODEX" mode-info material/web-image-search >"$TMP/logs/mode.out" 2>"$TMP/logs/mode.err" \
+  && grep -q '^status=tool-contract$' "$TMP/logs/mode.out" \
+  && grep -q '^realization=portable-with-tool-contract$' "$TMP/logs/mode.out" \
+  && grep -q '^tool_contract=web-image-search$' "$TMP/logs/mode.out" \
+  && grep -q '^tool_contract_check=adapters/codex/bin/preflight.sh web-image-search --check <query>$' "$TMP/logs/mode.out" \
+  && grep -q '^runtime_surface=adapter-owned-web-image-search$' "$TMP/logs/mode.out" \
+  && grep -q '^fallback=satisfy-tool-contract-or-report-unavailable$' "$TMP/logs/mode.out"; then
   ok "codex mode wrapper reports material web-image-search contract surface"
 else
   bad "codex mode wrapper should report material web-image-search contract surface"
 fi
-if "$CODEX" mode-info research/claim-verify >/tmp/mode.out 2>/tmp/mode.err \
-  && grep -q '^status=tool-contract$' /tmp/mode.out \
-  && grep -q '^tool_contract=external-claim-verification$' /tmp/mode.out \
-  && grep -q '^tool_contract_check=adapters/codex/bin/preflight.sh claim-verify --check <claim>$' /tmp/mode.out \
-  && grep -q '^runtime_surface=adapter-owned-claim-verify$' /tmp/mode.out; then
+if "$CODEX" mode-info research/claim-verify >"$TMP/logs/mode.out" 2>"$TMP/logs/mode.err" \
+  && grep -q '^status=tool-contract$' "$TMP/logs/mode.out" \
+  && grep -q '^tool_contract=external-claim-verification$' "$TMP/logs/mode.out" \
+  && grep -q '^tool_contract_check=adapters/codex/bin/preflight.sh claim-verify --check <claim>$' "$TMP/logs/mode.out" \
+  && grep -q '^runtime_surface=adapter-owned-claim-verify$' "$TMP/logs/mode.out"; then
   ok "codex mode wrapper reports named claim verification contract"
 else
   bad "codex mode wrapper should report named claim verification contract"
@@ -3195,27 +3202,27 @@ cat > "$TMP/codex_sessions/2026/06/29/rollout-2026-06-29T00-00-00-codexsid.jsonl
 {"timestamp":"2026-06-29T00:00:01.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"world"}]}}
 {"timestamp":"2026-06-29T00:00:02.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call_1"}}
 EOF
-if CODEX_SESSIONS="$TMP/codex_sessions" python3 "$ROOT/tools/memory/mem.py" distill codexsid --source codex >/tmp/codex_delta.out 2>/tmp/codex_delta.err \
-  && grep -q '^\[user\] hello' /tmp/codex_delta.out \
-  && grep -q '^\[assistant\] world' /tmp/codex_delta.out \
-  && grep -q '^\[assistant\] \[tool:exec_command\]' /tmp/codex_delta.out; then
+if CODEX_SESSIONS="$TMP/codex_sessions" python3 "$ROOT/tools/memory/mem.py" distill codexsid --source codex >"$TMP/logs/codex_delta.out" 2>"$TMP/logs/codex_delta.err" \
+  && grep -q '^\[user\] hello' "$TMP/logs/codex_delta.out" \
+  && grep -q '^\[assistant\] world' "$TMP/logs/codex_delta.out" \
+  && grep -q '^\[assistant\] \[tool:exec_command\]' "$TMP/logs/codex_delta.out"; then
   ok "codex session source distills transcript"
 else
   bad "codex session source should distill transcript"
 fi
-if "$CODEX_DISTILL" codexsid "$TMP/flowproj" >/tmp/codex_distill.out 2>/tmp/codex_distill.err \
-  && [ ! -s /tmp/codex_distill.out ]; then
+if "$CODEX_DISTILL" codexsid "$TMP/flowproj" >"$TMP/logs/codex_distill.out" 2>"$TMP/logs/codex_distill.err" \
+  && [ ! -s "$TMP/logs/codex_distill.out" ]; then
   ok "codex distill worker is disabled by default"
 else
   bad "codex distill worker should no-op unless enabled"
 fi
-if "$CODEX" distill-propose codexsid "$TMP/flowproj" >/tmp/codex_distill.out 2>/tmp/codex_distill.err; then
+if "$CODEX" distill-propose codexsid "$TMP/flowproj" >"$TMP/logs/codex_distill.out" 2>"$TMP/logs/codex_distill.err"; then
   bad "codex distill-propose should report tool-contract until explicitly enabled"
 else
   if [ "$?" -eq 69 ] \
-    && grep -q '^status=tool-contract$' /tmp/codex_distill.out \
-    && grep -q '^reason=distill-proposal-disabled$' /tmp/codex_distill.out \
-    && grep -q '^enable=CODEX_DISTILL_ENABLE=1$' /tmp/codex_distill.out; then
+    && grep -q '^status=tool-contract$' "$TMP/logs/codex_distill.out" \
+    && grep -q '^reason=distill-proposal-disabled$' "$TMP/logs/codex_distill.out" \
+    && grep -q '^enable=CODEX_DISTILL_ENABLE=1$' "$TMP/logs/codex_distill.out"; then
     ok "codex distill-propose reports disabled tool-contract by default"
   else
     bad "codex distill-propose should exit 69 with disabled tool-contract"
@@ -3237,30 +3244,30 @@ EOF
 chmod +x "$TMP/stubbin/codex"
 if CODEX_DISTILL_ENABLE=1 CODEX_SESSIONS="$TMP/codex_sessions" MEM_STORE="$TMP/store" \
   PATH="$TMP/stubbin:$PATH" CODEX_STUB_ARGV="$TMP/codex_argv" \
-  "$CODEX" distill-propose codexsid "$TMP/flowproj" >/tmp/codex_distill.out 2>/tmp/codex_distill.err \
+  "$CODEX" distill-propose codexsid "$TMP/flowproj" >"$TMP/logs/codex_distill.out" 2>"$TMP/logs/codex_distill.err" \
   && grep -q -- '--sandbox' "$TMP/codex_argv" \
   && grep -q -- 'read-only' "$TMP/codex_argv" \
   && ! grep -q -- '--ask-for-approval' "$TMP/codex_argv" \
   && grep -q -- '--ephemeral' "$TMP/codex_argv" \
   && grep -q -- '--ignore-rules' "$TMP/codex_argv" \
   && grep -q -- '--skip-git-repo-check' "$TMP/codex_argv" \
-  && grep -q '"action":"add"' /tmp/codex_distill.out; then
+  && grep -q '"action":"add"' "$TMP/logs/codex_distill.out"; then
   ok "codex distill proposal uses constrained exec"
 else
   bad "codex distill proposal should use constrained exec"
 fi
 if CODEX_DISTILL_ENABLE=1 CODEX_DISTILL_APPLY=1 CODEX_SESSIONS="$TMP/codex_sessions" MEM_STORE="$TMP/store_apply_blocked" \
   PATH="$TMP/stubbin:$PATH" CODEX_STUB_ARGV="$TMP/codex_argv_apply" \
-  "$CODEX" distill-propose codexsid "$TMP/flowproj" >/tmp/codex_distill_apply.out 2>/tmp/codex_distill_apply.err; then
+  "$CODEX" distill-propose codexsid "$TMP/flowproj" >"$TMP/logs/codex_distill_apply.out" 2>"$TMP/logs/codex_distill_apply.err"; then
   bad "codex distill apply should require accepted no-tools/action contract"
 else
   [ "$?" -eq 69 ] && ok "codex distill apply requires accepted no-tools/action contract" || bad "codex distill apply wrong exit"
 fi
 if CODEX_DISTILL_ENABLE=1 CODEX_DISTILL_APPLY=1 CODEX_DISTILL_CONTRACT_ACCEPTED=1 CODEX_SESSIONS="$TMP/codex_sessions" MEM_STORE="$TMP/store_apply" \
   PATH="$TMP/stubbin:$PATH" CODEX_STUB_ARGV="$TMP/codex_argv_apply_accepted" \
-  "$CODEX" distill-propose codexsid "$TMP/flowproj" >/tmp/codex_distill_apply.out 2>/tmp/codex_distill_apply.err \
-  && MEM_STORE="$TMP/store_apply" python3 "$ROOT/tools/memory/mem.py" stats >/tmp/codex_stats.out 2>/tmp/codex_stats.err \
-  && grep -q 'total: 1' /tmp/codex_stats.out; then
+  "$CODEX" distill-propose codexsid "$TMP/flowproj" >"$TMP/logs/codex_distill_apply.out" 2>"$TMP/logs/codex_distill_apply.err" \
+  && MEM_STORE="$TMP/store_apply" python3 "$ROOT/tools/memory/mem.py" stats >"$TMP/logs/codex_stats.out" 2>"$TMP/logs/codex_stats.err" \
+  && grep -q 'total: 1' "$TMP/logs/codex_stats.out"; then
   ok "codex distill explicit apply works after accepted contract"
 else
   bad "codex distill explicit apply should require and obey accepted contract"
@@ -3271,7 +3278,7 @@ fi
 # separately instead of treating sync success as proof of distillation.
 CODEX_SESSIONS="$TMP/codex_sessions" MEM_STORE="$TMP/store_session_end" \
   PATH="$TMP/stubbin:$PATH" CODEX_STUB_ARGV="$TMP/codex_argv_se" \
-  "$CODEX" session-end "$TMP/flowproj" codexsid >/tmp/codex_se.out 2>/tmp/codex_se.err
+  "$CODEX" session-end "$TMP/flowproj" codexsid >"$TMP/logs/codex_se.out" 2>"$TMP/logs/codex_se.err"
 codex_se_status=$?
 if { [ "$codex_se_status" -eq 0 ] || [ "$codex_se_status" -eq 2 ]; } \
   && MEM_STORE="$TMP/store_session_end" python3 "$ROOT/tools/memory/mem.py" stats 2>/dev/null \
@@ -3283,7 +3290,7 @@ fi
 # recursion guard: MEM_DISTILL=1 makes the whole session-end pipeline a no-op
 if MEM_DISTILL=1 CODEX_SESSIONS="$TMP/codex_sessions" MEM_STORE="$TMP/store_session_end_guard" \
   PATH="$TMP/stubbin:$PATH" CODEX_STUB_ARGV="$TMP/codex_argv_se_guard" \
-  "$CODEX" session-end "$TMP/flowproj" codexsid >/tmp/codex_se_guard.out 2>/tmp/codex_se_guard.err \
+  "$CODEX" session-end "$TMP/flowproj" codexsid >"$TMP/logs/codex_se_guard.out" 2>"$TMP/logs/codex_se_guard.err" \
   && ! { MEM_STORE="$TMP/store_session_end_guard" python3 "$ROOT/tools/memory/mem.py" stats 2>/dev/null | grep -q 'total: 1'; }; then
   ok "codex session-end no-ops under MEM_DISTILL=1 recursion guard"
 else
@@ -3293,7 +3300,7 @@ fi
 # preflight defense and the native SessionEnd/UserPrompt/SessionStart bridges.
 if AGENT_SESSION_ROLE=worker CODEX_SESSIONS="$TMP/codex_sessions" MEM_STORE="$TMP/store_session_end_worker" \
   PATH="$TMP/stubbin:$PATH" CODEX_STUB_ARGV="$TMP/codex_argv_se_worker" \
-  "$CODEX" session-end "$TMP/flowproj" codexsid >/tmp/codex_se_worker.out 2>/tmp/codex_se_worker.err \
+  "$CODEX" session-end "$TMP/flowproj" codexsid >"$TMP/logs/codex_se_worker.out" 2>"$TMP/logs/codex_se_worker.err" \
   && [ ! -e "$TMP/store_session_end_worker" ] \
   && [ ! -e "$TMP/codex_argv_se_worker" ]; then
   ok "codex preflight session-end no-ops before state/model work for workers"
@@ -3310,7 +3317,7 @@ else
 fi
 codex_worker_prompt_out="$(printf '{"hook_event_name":"UserPromptSubmit","session_id":"codex-worker-prompt","cwd":"%s"}\n' "$TMP/flowproj" \
   | AGENT_SESSION_ROLE=worker MEM_STORE="$TMP/store_prompt_worker" \
-    python3 "$ROOT/adapters/codex/hooks/userprompt-lifecycle.py" 2>/tmp/codex_worker_prompt.err)"
+    python3 "$ROOT/adapters/codex/hooks/userprompt-lifecycle.py" 2>"$TMP/logs/codex_worker_prompt.err")"
 if [ -z "$codex_worker_prompt_out" ] && [ ! -e "$TMP/store_prompt_worker" ]; then
   ok "codex native UserPromptSubmit bridge injects no main context for workers"
 else
@@ -3318,7 +3325,7 @@ else
 fi
 codex_worker_start_out="$(printf '{"hook_event_name":"SessionStart","session_id":"codex-worker-start","cwd":"%s"}\n' "$TMP/flowproj" \
   | AGENT_SESSION_ROLE=worker CODEX_SESSION_MEMORY_INJECT=1 MEM_STORE="$TMP/store_start_worker" \
-    python3 "$ROOT/adapters/codex/hooks/sessionstart-lifecycle.py" 2>/tmp/codex_worker_start.err)"
+    python3 "$ROOT/adapters/codex/hooks/sessionstart-lifecycle.py" 2>"$TMP/logs/codex_worker_start.err")"
 if [ -z "$codex_worker_start_out" ]; then
   ok "codex native SessionStart skips opt-in memory context for workers"
 else
@@ -3528,6 +3535,7 @@ if AGENT_HOME="$ROOT" CODEX_HOME="$RPHOME" CODEX_RUNTIME_PROJECTION_CLI_TIMEOUT=
   ok "codex doctor --runtime includes runtime projection validation"
 else
   bad "codex doctor --runtime should include runtime projection validation"
+  cat "$TMP/codex_doctor_runtime.out" "$TMP/codex_doctor_runtime.err"
 fi
 if AGENT_HOME="$ROOT" CODEX_HOME="$RPHOME" CODEX_RUNTIME_PROJECTION_CLI_TIMEOUT=2 "$CODEX" doctor --runtime-strict >"$TMP/codex_doctor_runtime_strict.out" 2>"$TMP/codex_doctor_runtime_strict.err"; then
   bad "codex doctor --runtime-strict should fail closed on stale hook trust"
@@ -3555,39 +3563,39 @@ fi
 
 echo "== opencode preflight wrapper =="
 git -C "$TMP/repo" switch -q -c opencode-work
-if "$OPENCODE" write "$TMP/repo/f" opencodesid >/tmp/opencode.out 2>/tmp/opencode.err; then
+if "$OPENCODE" write "$TMP/repo/f" opencodesid >"$TMP/logs/opencode.out" 2>"$TMP/logs/opencode.err"; then
   ok "opencode preflight passes clean write"
 else
   bad "opencode preflight should pass clean write"
 fi
-if "$OPENCODE" write "$TMP/runtime/projects/abc/memory/MEMORY.md" opencodesid >/tmp/opencode.out 2>/tmp/opencode.err; then
+if "$OPENCODE" write "$TMP/runtime/projects/abc/memory/MEMORY.md" opencodesid >"$TMP/logs/opencode.out" 2>"$TMP/logs/opencode.err"; then
   bad "opencode preflight should block memory file write"
 else
   [ "$?" -eq 2 ] && ok "opencode preflight blocks memory file write" || bad "opencode preflight memory wrong exit"
 fi
-if AGENT_HOME="$ROOT" bash "$DESIGN" --file "$TMP/not-design.txt" >/tmp/design.out 2>/tmp/design.err \
-  && "$OPENCODE" design "$TMP/not-design.txt" >/tmp/design.out 2>/tmp/design.err; then
+if AGENT_HOME="$ROOT" bash "$DESIGN" --file "$TMP/not-design.txt" >"$TMP/logs/design.out" 2>"$TMP/logs/design.err" \
+  && "$OPENCODE" design "$TMP/not-design.txt" >"$TMP/logs/design.out" 2>"$TMP/logs/design.err"; then
   ok "opencode design postwrite wrappers no-op on non-html"
 else
   bad "opencode design postwrite wrappers should no-op on non-html"
 fi
-if "$OPENCODE_PROJECTION" capability-info audit >/tmp/opencode_projection.out 2>/tmp/opencode_projection.err \
-  && grep -q '^capability=audit$' /tmp/opencode_projection.out \
-  && grep -q '^adapter=opencode$' /tmp/opencode_projection.out; then
+if "$OPENCODE_PROJECTION" capability-info audit >"$TMP/logs/opencode_projection.out" 2>"$TMP/logs/opencode_projection.err" \
+  && grep -q '^capability=audit$' "$TMP/logs/opencode_projection.out" \
+  && grep -q '^adapter=opencode$' "$TMP/logs/opencode_projection.out"; then
   ok "opencode projection preflight resolves harness root"
 else
   bad "opencode projection preflight should resolve harness root"
 fi
 mkdir -p "$TMP/opencode_pointer_home/.config/opencode"
 ln -s "$ROOT" "$TMP/opencode_pointer_home/.config/opencode/hearting"
-if env -u AGENT_HOME HOME="$TMP/opencode_pointer_home" "$ROOT/adapters/opencode/utilities/agent-home.sh" >/tmp/opencode_agent_home.out 2>/tmp/opencode_agent_home.err \
-  && grep -q "^$TMP/opencode_pointer_home/.config/opencode/hearting$" /tmp/opencode_agent_home.out; then
+if env -u AGENT_HOME HOME="$TMP/opencode_pointer_home" "$ROOT/adapters/opencode/utilities/agent-home.sh" >"$TMP/logs/opencode_agent_home.out" 2>"$TMP/logs/opencode_agent_home.err" \
+  && grep -q "^$TMP/opencode_pointer_home/.config/opencode/hearting$" "$TMP/logs/opencode_agent_home.out"; then
   ok "opencode agent-home wrapper resolves runtime pointer"
 else
   bad "opencode agent-home wrapper should resolve runtime pointer"
 fi
-if AGENT_HOME="$TMP/not-agent-home" HOME="$TMP/opencode_pointer_home" "$ROOT/adapters/opencode/utilities/agent-home.sh" >/tmp/opencode_agent_home_invalid.out 2>/tmp/opencode_agent_home_invalid.err \
-  && grep -q "^$TMP/opencode_pointer_home/.config/opencode/hearting$" /tmp/opencode_agent_home_invalid.out; then
+if AGENT_HOME="$TMP/not-agent-home" HOME="$TMP/opencode_pointer_home" "$ROOT/adapters/opencode/utilities/agent-home.sh" >"$TMP/logs/opencode_agent_home_invalid.out" 2>"$TMP/logs/opencode_agent_home_invalid.err" \
+  && grep -q "^$TMP/opencode_pointer_home/.config/opencode/hearting$" "$TMP/logs/opencode_agent_home_invalid.out"; then
   ok "opencode agent-home wrapper ignores invalid AGENT_HOME"
 else
   bad "opencode agent-home wrapper should ignore invalid AGENT_HOME"
@@ -3595,15 +3603,15 @@ fi
 mkdir -p "$TMP/opencode_linked_home/hearting/core" "$TMP/opencode_linked_home/agent_setting/core"
 printf 'core\n' > "$TMP/opencode_linked_home/hearting/core/CORE.md"
 printf 'legacy\n' > "$TMP/opencode_linked_home/agent_setting/core/CORE.md"
-if env -u AGENT_HOME HOME="$TMP/opencode_linked_home" "$ROOT/adapters/opencode/utilities/agent-home.sh" >/tmp/opencode_agent_home_linked.out 2>/tmp/opencode_agent_home_linked.err \
-  && grep -q "^$TMP/opencode_linked_home/hearting$" /tmp/opencode_agent_home_linked.out; then
+if env -u AGENT_HOME HOME="$TMP/opencode_linked_home" "$ROOT/adapters/opencode/utilities/agent-home.sh" >"$TMP/logs/opencode_agent_home_linked.out" 2>"$TMP/logs/opencode_agent_home_linked.err" \
+  && grep -q "^$TMP/opencode_linked_home/hearting$" "$TMP/logs/opencode_agent_home_linked.out"; then
   ok "opencode agent-home wrapper prefers canonical hearting checkout"
 else
   bad "opencode agent-home wrapper must prefer canonical hearting checkout"
 fi
 rm -rf "$TMP/opencode_linked_home/hearting"
-if env -u AGENT_HOME HOME="$TMP/opencode_linked_home" "$ROOT/adapters/opencode/utilities/agent-home.sh" >/tmp/opencode_agent_home_legacy.out 2>/tmp/opencode_agent_home_legacy.err \
-  && grep -q "^$TMP/opencode_linked_home/agent_setting$" /tmp/opencode_agent_home_legacy.out; then
+if env -u AGENT_HOME HOME="$TMP/opencode_linked_home" "$ROOT/adapters/opencode/utilities/agent-home.sh" >"$TMP/logs/opencode_agent_home_legacy.out" 2>"$TMP/logs/opencode_agent_home_legacy.err" \
+  && grep -q "^$TMP/opencode_linked_home/agent_setting$" "$TMP/logs/opencode_agent_home_legacy.out"; then
   ok "opencode agent-home wrapper retains legacy agent_setting fallback"
 else
   bad "opencode agent-home wrapper must retain legacy agent_setting fallback"
@@ -3613,19 +3621,19 @@ echo "== opencode material-route + worktree-path wrapper =="
 opencode_source="$TMP/repo/opencode_source.py"
 printf 'print(1)\n' > "$opencode_source"
 git -C "$TMP/repo" add "$opencode_source"
-if "$OPENCODE" material-route check --tool Write --file "$opencode_source" --cwd "$TMP/repo" --session opencode-no-route >/tmp/opencode_mr.out 2>/tmp/opencode_mr.err; then
+if "$OPENCODE" material-route check --tool Write --file "$opencode_source" --cwd "$TMP/repo" --session opencode-no-route >"$TMP/logs/opencode_mr.out" 2>"$TMP/logs/opencode_mr.err"; then
   bad "opencode material-route check should block a route-less material Write"
 else
   [ "$?" -eq 2 ] && ok "opencode material-route check blocks a route-less material Write" \
     || bad "opencode material-route check wrong exit for route-less material Write"
 fi
-if "$OPENCODE" worktree-path --tool Bash --command 'git worktree add .claude/worktrees/foo -b foo' --cwd "$TMP/repo" --session opencode-wtg >/tmp/opencode_wtp.out 2>/tmp/opencode_wtp.err; then
+if "$OPENCODE" worktree-path --tool Bash --command 'git worktree add .claude/worktrees/foo -b foo' --cwd "$TMP/repo" --session opencode-wtg >"$TMP/logs/opencode_wtp.out" 2>"$TMP/logs/opencode_wtp.err"; then
   bad "opencode worktree-path should deny non -wt/ worktree add"
 else
   [ "$?" -eq 2 ] && ok "opencode worktree-path denies non -wt/ worktree add" \
     || bad "opencode worktree-path wrong exit on non -wt/ worktree add"
 fi
-if "$OPENCODE" worktree-path --tool Bash --command 'git worktree add /home/x/repo-wt/slug -b slug main' --cwd "$TMP/repo" --session opencode-wtg >/tmp/opencode_wtp.out 2>/tmp/opencode_wtp.err; then
+if "$OPENCODE" worktree-path --tool Bash --command 'git worktree add /home/x/repo-wt/slug -b slug main' --cwd "$TMP/repo" --session opencode-wtg >"$TMP/logs/opencode_wtp.out" 2>"$TMP/logs/opencode_wtp.err"; then
   ok "opencode worktree-path passes canonical <repo>-wt/ add"
 else
   bad "opencode worktree-path should pass canonical <repo>-wt/ add"
@@ -3642,14 +3650,14 @@ opencode_route_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1
 opencode_route="$TMP/repo/.agent_reports/.runtime/routes/$opencode_route_id.json"
 recall_opportunity "$TMP/repo" opencode-bind
 if OPENCODE_SESSION_ID=opencode-bind AGENT_HOME="$ROOT" AGENT_DISPATCH_JOBS="$MATERIAL_ROUTE_JOBS" \
-  "$OPENCODE" route $opencode_route_args --output "$opencode_route" >/tmp/opencode_route.out 2>/tmp/opencode_route.err \
+  "$OPENCODE" route $opencode_route_args --output "$opencode_route" >"$TMP/logs/opencode_route.out" 2>"$TMP/logs/opencode_route.err" \
   && [ -f "$opencode_route" ] \
-  && "$OPENCODE" material-route check --tool Write --file "$opencode_source" --cwd "$TMP/repo" --session opencode-bind >/tmp/opencode_bind_allow.out 2>/tmp/opencode_bind_allow.err; then
+  && "$OPENCODE" material-route check --tool Write --file "$opencode_source" --cwd "$TMP/repo" --session opencode-bind >"$TMP/logs/opencode_bind_allow.out" 2>"$TMP/logs/opencode_bind_allow.err"; then
   ok "opencode route wrapper binds on successful compile and allows same-sid/cwd Write"
 else
   bad "opencode route wrapper should bind on successful compile and allow same-sid/cwd Write [route=$(test -f "$opencode_route" && echo yes || echo no)]"
 fi
-if "$OPENCODE" material-route check --tool Write --file "$opencode_source" --cwd "$TMP/repo" --session opencode-foreign >/tmp/opencode_foreign.out 2>/tmp/opencode_foreign.err; then
+if "$OPENCODE" material-route check --tool Write --file "$opencode_source" --cwd "$TMP/repo" --session opencode-foreign >"$TMP/logs/opencode_foreign.out" 2>"$TMP/logs/opencode_foreign.err"; then
   bad "foreign session should not reuse the opencode material route marker"
 else
   [ "$?" -eq 2 ] && ok "foreign session cannot reuse opencode material route marker" \
@@ -3658,9 +3666,9 @@ fi
 opencode_route_nooutput="$TMP/repo/.agent_reports/.runtime/routes/opencode-route-nooutput.json"
 rm -f "$opencode_route_nooutput"
 if OPENCODE_SESSION_ID=opencode-neg-nooutput AGENT_HOME="$ROOT" AGENT_DISPATCH_JOBS="$MATERIAL_ROUTE_JOBS" \
-  "$OPENCODE" route $opencode_route_args >/tmp/opencode_neg_nooutput.out 2>/tmp/opencode_neg_nooutput.err \
+  "$OPENCODE" route $opencode_route_args >"$TMP/logs/opencode_neg_nooutput.out" 2>"$TMP/logs/opencode_neg_nooutput.err" \
   && [ ! -f "$opencode_route_nooutput" ] \
-  && "$OPENCODE" material-route check --tool Write --file "$opencode_source" --cwd "$TMP/repo" --session opencode-neg-nooutput >/tmp/opencode_neg_nooutput_check.out 2>/tmp/opencode_neg_nooutput_check.err; then
+  && "$OPENCODE" material-route check --tool Write --file "$opencode_source" --cwd "$TMP/repo" --session opencode-neg-nooutput >"$TMP/logs/opencode_neg_nooutput_check.out" 2>"$TMP/logs/opencode_neg_nooutput_check.err"; then
   bad "opencode route wrapper without --output should stay unbound"
 else
   [ ! -f "$opencode_route_nooutput" ] && ok "opencode route wrapper: no --output compiles unbound, creates no marker" \
@@ -3676,10 +3684,10 @@ opencode_route_multi_a="$opencode_route_multi_root/.runtime/routes/$opencode_rou
 opencode_route_multi_b="$opencode_route_multi_root/.runtime/routes/alias-$opencode_route_multi_id.json"
 rm -f "$opencode_route_multi_a" "$opencode_route_multi_b"
 if OPENCODE_SESSION_ID=opencode-neg-multi AGENT_HOME="$ROOT" AGENT_DISPATCH_JOBS="$MATERIAL_ROUTE_JOBS" \
-  "$OPENCODE" route $opencode_route_multi_args --output "$opencode_route_multi_a" --output "$opencode_route_multi_b" >/tmp/opencode_neg_multi.out 2>/tmp/opencode_neg_multi.err; then
+  "$OPENCODE" route $opencode_route_multi_args --output "$opencode_route_multi_a" --output "$opencode_route_multi_b" >"$TMP/logs/opencode_neg_multi.out" 2>"$TMP/logs/opencode_neg_multi.err"; then
   :
 fi
-if "$OPENCODE" material-route check --tool Write --file "$opencode_source" --cwd "$TMP/repo" --session opencode-neg-multi >/tmp/opencode_neg_multi_check.out 2>/tmp/opencode_neg_multi_check.err; then
+if "$OPENCODE" material-route check --tool Write --file "$opencode_source" --cwd "$TMP/repo" --session opencode-neg-multi >"$TMP/logs/opencode_neg_multi_check.out" 2>"$TMP/logs/opencode_neg_multi_check.err"; then
   bad "opencode route wrapper with more than one --output should stay unbound"
 else
   [ "$?" -eq 2 ] && [ ! -f "$opencode_route_multi_a" ] && [ ! -f "$opencode_route_multi_b" ] \
@@ -3695,9 +3703,9 @@ opencode_route_nosid_id=$(python3 -c 'import json,sys; print(json.load(open(sys.
 opencode_route_nosid="$opencode_route_nosid_root/.runtime/routes/$opencode_route_nosid_id.json"
 rm -f "$opencode_route_nosid"
 if env -u OPENCODE_SESSION_ID AGENT_HOME="$ROOT" AGENT_DISPATCH_JOBS="$MATERIAL_ROUTE_JOBS" \
-  "$OPENCODE" route $opencode_route_nosid_args --output "$opencode_route_nosid" >/tmp/opencode_neg_nosid.out 2>/tmp/opencode_neg_nosid.err \
+  "$OPENCODE" route $opencode_route_nosid_args --output "$opencode_route_nosid" >"$TMP/logs/opencode_neg_nosid.out" 2>"$TMP/logs/opencode_neg_nosid.err" \
   && [ -f "$opencode_route_nosid" ] \
-  && "$OPENCODE" material-route check --tool Write --file "$opencode_source" --cwd "$TMP/repo" --session opencode-neg-nosid >/tmp/opencode_neg_nosid_check.out 2>/tmp/opencode_neg_nosid_check.err; then
+  && "$OPENCODE" material-route check --tool Write --file "$opencode_source" --cwd "$TMP/repo" --session opencode-neg-nosid >"$TMP/logs/opencode_neg_nosid_check.out" 2>"$TMP/logs/opencode_neg_nosid_check.err"; then
   bad "opencode route wrapper without OPENCODE_SESSION_ID should stay unbound"
 else
   [ -f "$opencode_route_nosid" ] && ok "opencode route wrapper: missing sid compiles unbound, creates no marker" \
@@ -3705,21 +3713,21 @@ else
 fi
 
 echo "== opencode spec read gate =="
-if "$OPENCODE" read "$TMP/specproj/.agent_reports/spec/prd.md" opencodesid >/tmp/opencode.out 2>/tmp/opencode.err \
-  && "$OPENCODE" capability autopilot-code "$TMP/specproj" opencodesid >/tmp/opencode.out 2>/tmp/opencode.err; then
+if "$OPENCODE" read "$TMP/specproj/.agent_reports/spec/prd.md" opencodesid >"$TMP/logs/opencode.out" 2>"$TMP/logs/opencode.err" \
+  && "$OPENCODE" capability autopilot-code "$TMP/specproj" opencodesid >"$TMP/logs/opencode.out" 2>"$TMP/logs/opencode.err"; then
   ok "opencode read+capability wrapper passes spec gate"
 else
   bad "opencode read+capability wrapper should pass spec gate"
 fi
 # ungrounded spec-governed capability is hard-denied (fresh session, no prd read)
-if "$OPENCODE" capability autopilot-code "$TMP/specproj" opencode-ungrounded >/tmp/opencode.out 2>/tmp/opencode.err; then
+if "$OPENCODE" capability autopilot-code "$TMP/specproj" opencode-ungrounded >"$TMP/logs/opencode.out" 2>"$TMP/logs/opencode.err"; then
   bad "opencode capability should deny autopilot-code without prd read"
 else
   [ "$?" -eq 2 ] && ok "opencode capability denies spec capability without prd read" \
     || bad "opencode capability wrong exit without prd read"
 fi
 # non-spec-governed capability passes even ungrounded
-if "$OPENCODE" capability autopilot-research "$TMP/specproj" opencode-ungrounded >/tmp/opencode.out 2>/tmp/opencode.err; then
+if "$OPENCODE" capability autopilot-research "$TMP/specproj" opencode-ungrounded >"$TMP/logs/opencode.out" 2>"$TMP/logs/opencode.err"; then
   ok "opencode capability allows non-spec-governed capability ungrounded"
 else
   bad "opencode capability should allow non-spec-governed capability ungrounded"
@@ -3747,14 +3755,14 @@ const nonspec = !(await throws(() => hooks["command.execute.before"]({command:"a
 process.stdout.write(JSON.stringify({denied,passed,nonspec}))
 MJS
 if command -v node >/dev/null 2>&1; then
-  if node "$TMP/bridge.mjs" >/tmp/opencode_bridge.out 2>/tmp/opencode_bridge.err; then
-    grep -q '"denied":true' /tmp/opencode_bridge.out \
+  if node "$TMP/bridge.mjs" >"$TMP/logs/opencode_bridge.out" 2>"$TMP/logs/opencode_bridge.err"; then
+    grep -q '"denied":true' "$TMP/logs/opencode_bridge.out" \
       && ok "opencode plugin command.execute.before blocks ungrounded spec capability" \
       || bad "opencode plugin should block ungrounded spec capability"
-    grep -q '"passed":true' /tmp/opencode_bridge.out \
+    grep -q '"passed":true' "$TMP/logs/opencode_bridge.out" \
       && ok "opencode plugin tool.execute.after marks prd read so gate passes" \
       || bad "opencode plugin read marker should let gate pass"
-    grep -q '"nonspec":true' /tmp/opencode_bridge.out \
+    grep -q '"nonspec":true' "$TMP/logs/opencode_bridge.out" \
       && ok "opencode plugin command.execute.before ignores non-spec capability" \
       || bad "opencode plugin should ignore non-spec capability"
   else
@@ -3768,94 +3776,94 @@ fi
 
 echo "== opencode workflow lifecycle CLI =="
 mkdir -p "$TMP/opencode-artifact/.agent_reports/spec"
-if "$OPENCODE" write "$TMP/opencode-artifact/.agent_reports/spec/prd.md" opencodesid >/tmp/opencode_artifact.out 2>/tmp/opencode_artifact.err; then
+if "$OPENCODE" write "$TMP/opencode-artifact/.agent_reports/spec/prd.md" opencodesid >"$TMP/logs/opencode_artifact.out" 2>"$TMP/logs/opencode_artifact.err"; then
   bad "opencode write wrapper should require a verified capability route for spec output"
 else
-  grep -q 'capability-artifact-route-required' /tmp/opencode_artifact.err \
+  grep -q 'capability-artifact-route-required' "$TMP/logs/opencode_artifact.err" \
     && ok "opencode write wrapper requires a verified capability route for spec output" \
     || bad "opencode write wrapper returned the wrong route failure for spec output"
 fi
-if "$OPENCODE" memory "$TMP/flowproj" >/tmp/opencode_mem.out 2>/tmp/opencode_mem.err; then
+if "$OPENCODE" memory "$TMP/flowproj" >"$TMP/logs/opencode_mem.out" 2>"$TMP/logs/opencode_mem.err"; then
   ok "opencode memory wrapper exits cleanly"
 else
   bad "opencode memory wrapper should exit cleanly"
 fi
-if MEM_STORE="$TMP/opencode_launcher_store" "$ROOT/adapters/opencode/tools/memory/mem.py" stats >/tmp/opencode_mem_launcher.out 2>/tmp/opencode_mem_launcher.err \
-  && grep -q '^# store stats$' /tmp/opencode_mem_launcher.out; then
+if MEM_STORE="$TMP/opencode_launcher_store" "$ROOT/adapters/opencode/tools/memory/mem.py" stats >"$TMP/logs/opencode_mem_launcher.out" 2>"$TMP/logs/opencode_mem_launcher.err" \
+  && grep -q '^# store stats$' "$TMP/logs/opencode_mem_launcher.out"; then
   ok "opencode memory launcher ignores invalid non-harness AGENT_HOME"
 else
   bad "opencode memory launcher should fall back from invalid AGENT_HOME"
 fi
-if "$OPENCODE" recall "전에 결정한 내용 뭐였지" "$TMP/flowproj" >/tmp/opencode_recall.out 2>/tmp/opencode_recall.err; then
+if "$OPENCODE" recall "전에 결정한 내용 뭐였지" "$TMP/flowproj" >"$TMP/logs/opencode_recall.out" 2>"$TMP/logs/opencode_recall.err"; then
   ok "opencode recall wrapper exits cleanly"
 else
   bad "opencode recall wrapper should exit cleanly"
 fi
-if "$OPENCODE" briefing "$TMP/flowproj" >/tmp/opencode_brief.out 2>/tmp/opencode_brief.err; then
+if "$OPENCODE" briefing "$TMP/flowproj" >"$TMP/logs/opencode_brief.out" 2>"$TMP/logs/opencode_brief.err"; then
   ok "opencode briefing wrapper exits cleanly"
 else
   bad "opencode briefing wrapper should exit cleanly"
 fi
 if AGENT_NOTES_ROOT="$TMP/notes" CAIRN_APP="$TMP/board" CAIRN_WT="$TMP/board-wt" \
-  "$OPENCODE" worklog "$TMP/flowproj" >/tmp/opencode_worklog.out 2>/tmp/opencode_worklog.err \
-  && grep -q "^agent-notes-root=$TMP/notes$" /tmp/opencode_worklog.out \
-  && grep -q '^note=read-only inventory;' /tmp/opencode_worklog.out; then
+  "$OPENCODE" worklog "$TMP/flowproj" >"$TMP/logs/opencode_worklog.out" 2>"$TMP/logs/opencode_worklog.err" \
+  && grep -q "^agent-notes-root=$TMP/notes$" "$TMP/logs/opencode_worklog.out" \
+  && grep -q '^note=read-only inventory;' "$TMP/logs/opencode_worklog.out"; then
   ok "opencode worklog wrapper reports read-only state"
 else
   bad "opencode worklog wrapper should report read-only state"
 fi
 if env -u AGENT_NOTES_ROOT -u WORKLOG_NOTES_ROOT -u CAIRN_APP -u CAIRN_WT -u WORKLOG_BOARD_APP -u WORKLOG_BOARD_WT \
-  "$OPENCODE" worklog "$TMP/flowproj" >/tmp/opencode_worklog_default.out 2>/tmp/opencode_worklog_default.err \
-  && grep -q '^agent-notes-root=unset$' /tmp/opencode_worklog_default.out \
-  && ! grep -q '/.claude/worklog-board' /tmp/opencode_worklog_default.out; then
+  "$OPENCODE" worklog "$TMP/flowproj" >"$TMP/logs/opencode_worklog_default.out" 2>"$TMP/logs/opencode_worklog_default.err" \
+  && grep -q '^agent-notes-root=unset$' "$TMP/logs/opencode_worklog_default.out" \
+  && ! grep -q '/.claude/worklog-board' "$TMP/logs/opencode_worklog_default.out"; then
   ok "opencode worklog wrapper has no Claude runtime defaults"
 else
   bad "opencode worklog wrapper should not default to Claude runtime paths"
 fi
 if AGENT_NOTES_ROOT="$TMP/notes" CAIRN_APP="$TMP/board" CAIRN_WT="$TMP/board-wt" \
-  "$OPENCODE" status "$TMP/flowproj" opencodesid >/tmp/opencode_status.out 2>/tmp/opencode_status.err \
-  && grep -q '^adapter=opencode$' /tmp/opencode_status.out \
-  && grep -q '^runtime_surface=adapter-owned-harness-status$' /tmp/opencode_status.out \
-  && grep -q '^artifact_root_exists=1$' /tmp/opencode_status.out \
-  && grep -q '^git_repo=0$' /tmp/opencode_status.out \
-  && grep -q "^agent_notes_root=$TMP/notes$" /tmp/opencode_status.out \
-  && grep -q '^note=read-only snapshot;' /tmp/opencode_status.out; then
+  "$OPENCODE" status "$TMP/flowproj" opencodesid >"$TMP/logs/opencode_status.out" 2>"$TMP/logs/opencode_status.err" \
+  && grep -q '^adapter=opencode$' "$TMP/logs/opencode_status.out" \
+  && grep -q '^runtime_surface=adapter-owned-harness-status$' "$TMP/logs/opencode_status.out" \
+  && grep -q '^artifact_root_exists=1$' "$TMP/logs/opencode_status.out" \
+  && grep -q '^git_repo=0$' "$TMP/logs/opencode_status.out" \
+  && grep -q "^agent_notes_root=$TMP/notes$" "$TMP/logs/opencode_status.out" \
+  && grep -q '^note=read-only snapshot;' "$TMP/logs/opencode_status.out"; then
   ok "opencode status wrapper reports harness snapshot"
 else
   bad "opencode status wrapper should report harness snapshot"
 fi
-if "$OPENCODE" permissions >/tmp/opencode_permissions.out 2>/tmp/opencode_permissions.err \
-  && grep -q '^adapter=opencode$' /tmp/opencode_permissions.out \
-  && grep -q '^runtime_surface=opencode-native-permission-config$' /tmp/opencode_permissions.out \
-  && grep -q '^permission_model=permission-allow-ask-deny$' /tmp/opencode_permissions.out \
-  && grep -q '^claude_allowed_tools=unsupported$' /tmp/opencode_permissions.out \
-  && grep -q '^guard_contract=preflight-write-plugin-and-explicit-tool-contracts$' /tmp/opencode_permissions.out; then
+if "$OPENCODE" permissions >"$TMP/logs/opencode_permissions.out" 2>"$TMP/logs/opencode_permissions.err" \
+  && grep -q '^adapter=opencode$' "$TMP/logs/opencode_permissions.out" \
+  && grep -q '^runtime_surface=opencode-native-permission-config$' "$TMP/logs/opencode_permissions.out" \
+  && grep -q '^permission_model=permission-allow-ask-deny$' "$TMP/logs/opencode_permissions.out" \
+  && grep -q '^claude_allowed_tools=unsupported$' "$TMP/logs/opencode_permissions.out" \
+  && grep -q '^guard_contract=preflight-write-plugin-and-explicit-tool-contracts$' "$TMP/logs/opencode_permissions.out"; then
   ok "opencode permissions wrapper reports native permission contract"
 else
   bad "opencode permissions wrapper should report native permission contract"
 fi
-if "$OPENCODE" headless >/tmp/opencode_headless.out 2>/tmp/opencode_headless.err \
-  && grep -q '^adapter=opencode$' /tmp/opencode_headless.out \
-  && grep -q '^runtime_surface=opencode-run-headless$' /tmp/opencode_headless.out \
-  && grep -q '^tool_contract=headless-dispatch$' /tmp/opencode_headless.out \
-  && grep -q '^model_selection_policy=main-orchestrator-must-select-per-job$' /tmp/opencode_headless.out \
-  && grep -q '^model_selection_surface=--model-profile <deep|balanced-deep|light|mini> \[--model-role <portable-role>\]|--model-role <portable-role>|--model <model> --variant <variant>|--inherit-model-settings$' /tmp/opencode_headless.out \
-  && grep -q '^claude_headless=unsupported$' /tmp/opencode_headless.out \
-  && grep -q '^liveness_surface=opencode-sqlite-session-mtime+plugin-heartbeat$' /tmp/opencode_headless.out \
-  && grep -q '^liveness_heartbeat=<agent-home>/.dispatch/logs/<slug>.heartbeat$' /tmp/opencode_headless.out \
-  && grep -q '^liveness_plugin_load_marker=<agent-home>/.dispatch/plugin-load.<slug>.mark$' /tmp/opencode_headless.out \
-  && grep -q '^liveness_check=adapters/opencode/bin/preflight.sh liveness \[jobs.log\]$' /tmp/opencode_headless.out \
-  && grep -q '^constraints=main-or-owner-dispatched,max-dispatch-depth-2-for-standard-plus-owner,register-open-job,explicit-capability-mode-qa-intensity-dispatch_depth-parent-parent_sid,transcript-liveness-required$' /tmp/opencode_headless.out; then
+if "$OPENCODE" headless >"$TMP/logs/opencode_headless.out" 2>"$TMP/logs/opencode_headless.err" \
+  && grep -q '^adapter=opencode$' "$TMP/logs/opencode_headless.out" \
+  && grep -q '^runtime_surface=opencode-run-headless$' "$TMP/logs/opencode_headless.out" \
+  && grep -q '^tool_contract=headless-dispatch$' "$TMP/logs/opencode_headless.out" \
+  && grep -q '^model_selection_policy=main-orchestrator-must-select-per-job$' "$TMP/logs/opencode_headless.out" \
+  && grep -q '^model_selection_surface=--model-profile <deep|balanced-deep|light|mini> \[--model-role <portable-role>\]|--model-role <portable-role>|--model <model> --variant <variant>|--inherit-model-settings$' "$TMP/logs/opencode_headless.out" \
+  && grep -q '^claude_headless=unsupported$' "$TMP/logs/opencode_headless.out" \
+  && grep -q '^liveness_surface=opencode-sqlite-session-mtime+plugin-heartbeat$' "$TMP/logs/opencode_headless.out" \
+  && grep -q '^liveness_heartbeat=<agent-home>/.dispatch/logs/<slug>.heartbeat$' "$TMP/logs/opencode_headless.out" \
+  && grep -q '^liveness_plugin_load_marker=<agent-home>/.dispatch/plugin-load.<slug>.mark$' "$TMP/logs/opencode_headless.out" \
+  && grep -q '^liveness_check=adapters/opencode/bin/preflight.sh liveness \[jobs.log\]$' "$TMP/logs/opencode_headless.out" \
+  && grep -q '^constraints=main-or-owner-dispatched,max-dispatch-depth-2-for-standard-plus-owner,register-open-job,explicit-capability-mode-qa-intensity-dispatch_depth-parent-parent_sid,transcript-liveness-required$' "$TMP/logs/opencode_headless.out"; then
   ok "opencode headless wrapper reports dispatch contract"
 else
   bad "opencode headless wrapper should report dispatch contract"
 fi
-if "$OPENCODE" headless --check "$TMP/missing-worktree" >/tmp/opencode_headless_missing.out 2>/tmp/opencode_headless_missing.err; then
+if "$OPENCODE" headless --check "$TMP/missing-worktree" >"$TMP/logs/opencode_headless_missing.out" 2>"$TMP/logs/opencode_headless_missing.err"; then
   bad "opencode headless wrapper should fail missing worktree"
 else
   rc=$?
   if [ "$rc" -eq 66 ] \
-    && grep -q '^reason=worktree-not-found$' /tmp/opencode_headless_missing.out; then
+    && grep -q '^reason=worktree-not-found$' "$TMP/logs/opencode_headless_missing.out"; then
     ok "opencode headless wrapper reports missing worktree"
   else
     bad "opencode headless wrapper should report missing worktree"
@@ -3873,11 +3881,11 @@ ln -s "$ROOT/opencode_setting/opencode-agents/memory-scout" "$TMP/opencode_headl
 ln -s "$ROOT/opencode_setting/opencode-commands/autopilot-code.md" "$TMP/opencode_headless_home/.config/opencode/commands/autopilot-code.md"
 ln -s "$ROOT/opencode_setting/opencode-plugins/hearting-guards.js" "$TMP/opencode_headless_home/.config/opencode/plugins/hearting-guards.js"
 if HOME="$TMP/opencode_headless_home" XDG_CONFIG_HOME="$TMP/opencode_headless_home/.config" \
-  "$OPENCODE" headless --check "$TMP/repo" >/tmp/opencode_headless_check.out 2>/tmp/opencode_headless_check.err \
-  && grep -q '^runtime_projection=ok$' /tmp/opencode_headless_check.out \
-  && grep -q '/agents/memory-scout/memory-scout.md$' /tmp/opencode_headless_check.out \
-  && grep -q '/commands/autopilot-code.md$' /tmp/opencode_headless_check.out \
-  && grep -q '^check=ok$' /tmp/opencode_headless_check.out; then
+  "$OPENCODE" headless --check "$TMP/repo" >"$TMP/logs/opencode_headless_check.out" 2>"$TMP/logs/opencode_headless_check.err" \
+  && grep -q '^runtime_projection=ok$' "$TMP/logs/opencode_headless_check.out" \
+  && grep -q '/agents/memory-scout/memory-scout.md$' "$TMP/logs/opencode_headless_check.out" \
+  && grep -q '/commands/autopilot-code.md$' "$TMP/logs/opencode_headless_check.out" \
+  && grep -q '^check=ok$' "$TMP/logs/opencode_headless_check.out"; then
   ok "opencode headless check validates plural native runtime projection"
 else
   bad "opencode headless check should validate plural native runtime projection"
@@ -3892,40 +3900,40 @@ ln -s "$ROOT/opencode_setting/opencode-commands/autopilot-code.md" "$TMP/opencod
 ln -s "$ROOT/opencode_setting/opencode-plugins/hearting-guards.js" "$TMP/opencode_headless_config_home/.config/opencode/plugins/hearting-guards.js"
 if OPENCODE_CONFIG_CONTENT='{"skills":{"paths":["/tmp/opencode-\u0073kills"]}}' \
   HOME="$TMP/opencode_headless_config_home" XDG_CONFIG_HOME="$TMP/opencode_headless_config_home/.config" \
-  "$OPENCODE" headless --check "$TMP/repo" >/tmp/opencode_headless_config_check.out 2>/tmp/opencode_headless_config_check.err \
-  && grep -q '^runtime_projection=ok$' /tmp/opencode_headless_config_check.out \
-  && grep -q '^check=ok$' /tmp/opencode_headless_config_check.out; then
+  "$OPENCODE" headless --check "$TMP/repo" >"$TMP/logs/opencode_headless_config_check.out" 2>"$TMP/logs/opencode_headless_config_check.err" \
+  && grep -q '^runtime_projection=ok$' "$TMP/logs/opencode_headless_config_check.out" \
+  && grep -q '^check=ok$' "$TMP/logs/opencode_headless_config_check.out"; then
   ok "opencode headless check accepts JSON-configured native skills path"
 else
   bad "opencode headless check should accept JSON-configured native skills path"
 fi
 export AGENT_HOME="$ROOT"
-if "$OPENCODE" dispatch --dry-run --worktree "$TMP/repo" --slug opencode-missing-model --capability autopilot-code --mode dev --qa standard --prompt-text "do work" --jobs "$TMP/opencode-missing-model.log" >/tmp/opencode_missing_model.out 2>/tmp/opencode_missing_model.err; then
+if "$OPENCODE" dispatch --dry-run --worktree "$TMP/repo" --slug opencode-missing-model --capability autopilot-code --mode dev --qa standard --prompt-text "do work" --jobs "$TMP/opencode-missing-model.log" >"$TMP/logs/opencode_missing_model.out" 2>"$TMP/logs/opencode_missing_model.err"; then
   bad "opencode dispatch wrapper should require main-selected model settings"
 else
   rc=$?
   if [ "$rc" -eq 64 ] \
-    && grep -q '^reason=missing-dispatch-model-selection$' /tmp/opencode_missing_model.out \
+    && grep -q '^reason=missing-dispatch-model-selection$' "$TMP/logs/opencode_missing_model.out" \
     && [ ! -e "$TMP/opencode-missing-model.log" ]; then
     ok "opencode dispatch wrapper requires main-selected model settings"
   else
     bad "opencode dispatch wrapper should fail cleanly without model selection"
   fi
 fi
-if "$OPENCODE" dispatch --dry-run --worktree "$TMP/repo" --slug opencode-dispatch --capability autopilot-code --mode dev --qa standard --prompt-text "do work" --model provider/test --variant low --jobs "$TMP/opencode-dispatch.log" >/tmp/opencode_dispatch.out 2>/tmp/opencode_dispatch.err \
-  && grep -q '^adapter=opencode$' /tmp/opencode_dispatch.out \
-  && grep -q '^status=dry-run$' /tmp/opencode_dispatch.out \
-  && grep -q '^registered=0$' /tmp/opencode_dispatch.out \
-  && grep -q '^started=0$' /tmp/opencode_dispatch.out \
-  && grep -q '^model_source=explicit$' /tmp/opencode_dispatch.out \
-  && grep -q '^model=provider/test$' /tmp/opencode_dispatch.out \
-  && grep -q '^variant=low$' /tmp/opencode_dispatch.out \
-  && grep -q '^command=opencode run ' /tmp/opencode_dispatch.out \
-  && grep -q -- '--model provider/test' /tmp/opencode_dispatch.out \
-  && grep -q -- '--variant low' /tmp/opencode_dispatch.out \
-  && grep -q 'opencode-dispatch.opencode.prompt.txt' /tmp/opencode_dispatch.out \
-  && grep -q 'cat -- ' /tmp/opencode_dispatch.out \
-  && ! grep -q 'do work' /tmp/opencode_dispatch.out \
+if "$OPENCODE" dispatch --dry-run --worktree "$TMP/repo" --slug opencode-dispatch --capability autopilot-code --mode dev --qa standard --prompt-text "do work" --model provider/test --variant low --jobs "$TMP/opencode-dispatch.log" >"$TMP/logs/opencode_dispatch.out" 2>"$TMP/logs/opencode_dispatch.err" \
+  && grep -q '^adapter=opencode$' "$TMP/logs/opencode_dispatch.out" \
+  && grep -q '^status=dry-run$' "$TMP/logs/opencode_dispatch.out" \
+  && grep -q '^registered=0$' "$TMP/logs/opencode_dispatch.out" \
+  && grep -q '^started=0$' "$TMP/logs/opencode_dispatch.out" \
+  && grep -q '^model_source=explicit$' "$TMP/logs/opencode_dispatch.out" \
+  && grep -q '^model=provider/test$' "$TMP/logs/opencode_dispatch.out" \
+  && grep -q '^variant=low$' "$TMP/logs/opencode_dispatch.out" \
+  && grep -q '^command=opencode run ' "$TMP/logs/opencode_dispatch.out" \
+  && grep -q -- '--model provider/test' "$TMP/logs/opencode_dispatch.out" \
+  && grep -q -- '--variant low' "$TMP/logs/opencode_dispatch.out" \
+  && grep -q 'opencode-dispatch.opencode.prompt.txt' "$TMP/logs/opencode_dispatch.out" \
+  && grep -q 'cat -- ' "$TMP/logs/opencode_dispatch.out" \
+  && ! grep -q 'do work' "$TMP/logs/opencode_dispatch.out" \
   && [ ! -e "$TMP/opencode-dispatch.log" ]; then
   ok "opencode dispatch wrapper dry-runs headless command with main-selected model settings"
 else
@@ -3939,11 +3947,11 @@ EOF
 chmod +x "$TMP/opencode-stubbin/opencode"
 if PATH="$TMP/opencode-stubbin:$PATH" OPENCODE_STUB_ARGV="$TMP/opencode-start.argv" \
   HOME="$TMP/opencode_headless_home" XDG_CONFIG_HOME="$TMP/opencode_headless_home/.config" \
-  "$OPENCODE" dispatch --start --worktree "$TMP/repo" --slug nested/opencode-start --capability autopilot-code --mode dev --qa standard --prompt-text "nested work" --model provider/test --variant low --jobs "$TMP/opencode-start.log" --log-dir "$TMP/opencode-logs" >/tmp/opencode_dispatch_start.out 2>/tmp/opencode_dispatch_start.err \
-  && grep -q '^status=start$' /tmp/opencode_dispatch_start.out \
-  && grep -q '^started=1$' /tmp/opencode_dispatch_start.out \
-  && grep -q 'cat -- ' /tmp/opencode_dispatch_start.out \
-  && opencode_start_prompt=$(sed -n 's/^prompt_file=//p' /tmp/opencode_dispatch_start.out) \
+  "$OPENCODE" dispatch --start --worktree "$TMP/repo" --slug nested/opencode-start --capability autopilot-code --mode dev --qa standard --prompt-text "nested work" --model provider/test --variant low --jobs "$TMP/opencode-start.log" --log-dir "$TMP/opencode-logs" >"$TMP/logs/opencode_dispatch_start.out" 2>"$TMP/logs/opencode_dispatch_start.err" \
+  && grep -q '^status=start$' "$TMP/logs/opencode_dispatch_start.out" \
+  && grep -q '^started=1$' "$TMP/logs/opencode_dispatch_start.out" \
+  && grep -q 'cat -- ' "$TMP/logs/opencode_dispatch_start.out" \
+  && opencode_start_prompt=$(sed -n 's/^prompt_file=//p' "$TMP/logs/opencode_dispatch_start.out") \
   && [ -f "$opencode_start_prompt" ]; then
   for _ in $(seq 1 20); do
     [ -f "$TMP/opencode-start.argv" ] && break
@@ -3966,63 +3974,63 @@ fi
 # checkout-relative $OPENCODE_WRAPPED_DISPATCH_HOME/.dispatch default.
 opencode_default_home="$TMP/opencode_default_home"
 opencode_default_stable="$(readlink -f "$opencode_default_home")/.local/state/hearting/dispatch"
-if env -u XDG_STATE_HOME -u HARNESS_STATE_ROOT HOME="$opencode_default_home" "$OPENCODE" dispatch --dry-run --worktree "$TMP/repo" --slug opencode-default-home --capability autopilot-code --mode dev --qa standard --prompt-text "do work" --model provider/test --variant low >/tmp/opencode_dispatch_default.out 2>/tmp/opencode_dispatch_default.err \
-  && grep -Fxq "job_registry=$opencode_default_stable/jobs.log" /tmp/opencode_dispatch_default.out \
-  && grep -Fxq "prompt_file=$opencode_default_stable/logs/opencode-default-home.opencode.prompt.txt" /tmp/opencode_dispatch_default.out \
+if env -u XDG_STATE_HOME -u HARNESS_STATE_ROOT HOME="$opencode_default_home" "$OPENCODE" dispatch --dry-run --worktree "$TMP/repo" --slug opencode-default-home --capability autopilot-code --mode dev --qa standard --prompt-text "do work" --model provider/test --variant low >"$TMP/logs/opencode_dispatch_default.out" 2>"$TMP/logs/opencode_dispatch_default.err" \
+  && grep -Fxq "job_registry=$opencode_default_stable/jobs.log" "$TMP/logs/opencode_dispatch_default.out" \
+  && grep -Fxq "prompt_file=$opencode_default_stable/logs/opencode-default-home.opencode.prompt.txt" "$TMP/logs/opencode_dispatch_default.out" \
   && [ ! -e "$AGENT_HOME/.dispatch/jobs.log" ]; then
   ok "opencode dispatch wrapper defaults to the canonical stable-root registry"
 else
   bad "opencode dispatch wrapper should not trust invalid AGENT_HOME for default registry"
 fi
-if AGENT_HOME="$TMP/not-agent-home" HOME="$DISPATCH_RESOLVER_HOME" XDG_DATA_HOME="$DISPATCH_RESOLVER_XDG" \
-  python3 "$ROOT/adapters/opencode/bin/dispatch-headless.py" --dry-run --worktree "$TMP/repo" --slug opencode-direct-home --capability autopilot-code --mode dev --qa standard --prompt-text "do work" --model provider/test --variant low >/tmp/opencode_dispatch_direct.out 2>/tmp/opencode_dispatch_direct.err \
-  && grep -Fxq "job_registry=$DISPATCH_RESOLVER_STATE/jobs.log" /tmp/opencode_dispatch_direct.out \
-  && grep -Fxq "prompt_file=$DISPATCH_RESOLVER_STATE/logs/opencode-direct-home.opencode.prompt.txt" /tmp/opencode_dispatch_direct.out; then
+if env -u XDG_STATE_HOME -u HARNESS_STATE_ROOT AGENT_HOME="$TMP/not-agent-home" HOME="$DISPATCH_RESOLVER_HOME" XDG_DATA_HOME="$DISPATCH_RESOLVER_XDG" \
+  python3 "$ROOT/adapters/opencode/bin/dispatch-headless.py" --dry-run --worktree "$TMP/repo" --slug opencode-direct-home --capability autopilot-code --mode dev --qa standard --prompt-text "do work" --model provider/test --variant low >"$TMP/logs/opencode_dispatch_direct.out" 2>"$TMP/logs/opencode_dispatch_direct.err" \
+  && grep -Fxq "job_registry=$DISPATCH_RESOLVER_STATE/jobs.log" "$TMP/logs/opencode_dispatch_direct.out" \
+  && grep -Fxq "prompt_file=$DISPATCH_RESOLVER_STATE/logs/opencode-direct-home.opencode.prompt.txt" "$TMP/logs/opencode_dispatch_direct.out"; then
   ok "opencode dispatch script ignores invalid AGENT_HOME"
 else
   bad "opencode dispatch script should validate AGENT_HOME"
 fi
 if AGENT_DISPATCH_JOBS="$TMP/opencode-env-jobs.log" \
-  "$OPENCODE" dispatch --register --worktree "$TMP/repo" --slug opencode-env-jobs --capability autopilot-code --mode dev --qa standard --prompt-text "do work" --model provider/test --variant low >/tmp/opencode_env_jobs.out 2>/tmp/opencode_env_jobs.err \
-  && grep -q "^job_registry=$TMP/opencode-env-jobs.log$" /tmp/opencode_env_jobs.out \
-  && AGENT_DISPATCH_JOBS="$TMP/opencode-env-jobs.log" "$OPENCODE" harvest --slug opencode-env-jobs --mark-done >/tmp/opencode_env_harvest.out 2>/tmp/opencode_env_harvest.err \
-  && grep -q "^job_registry=$TMP/opencode-env-jobs.log$" /tmp/opencode_env_harvest.out \
-  && grep -q '^marked_done=1$' /tmp/opencode_env_harvest.out; then
+  "$OPENCODE" dispatch --register --worktree "$TMP/repo" --slug opencode-env-jobs --capability autopilot-code --mode dev --qa standard --prompt-text "do work" --model provider/test --variant low >"$TMP/logs/opencode_env_jobs.out" 2>"$TMP/logs/opencode_env_jobs.err" \
+  && grep -q "^job_registry=$TMP/opencode-env-jobs.log$" "$TMP/logs/opencode_env_jobs.out" \
+  && AGENT_DISPATCH_JOBS="$TMP/opencode-env-jobs.log" "$OPENCODE" harvest --slug opencode-env-jobs --mark-done >"$TMP/logs/opencode_env_harvest.out" 2>"$TMP/logs/opencode_env_harvest.err" \
+  && grep -q "^job_registry=$TMP/opencode-env-jobs.log$" "$TMP/logs/opencode_env_harvest.out" \
+  && grep -q '^marked_done=1$' "$TMP/logs/opencode_env_harvest.out"; then
   ok "opencode dispatch and harvest use the selected shared registry"
 else
   bad "opencode dispatch and harvest should use the selected shared registry"
 fi
-if "$OPENCODE" dispatch --register --worktree "$TMP/repo" --slug opencode-quick-depth1 --capability autopilot-code --mode dev --intensity quick --dispatch-depth 1 --parent-session-id test-parent --owner-harness opencode --prompt-text "quick work" --model provider/test --variant low --jobs "$TMP/opencode-quick-depth1.log" >/tmp/opencode_quick_depth1.out 2>/tmp/opencode_quick_depth1.err; then
+if "$OPENCODE" dispatch --register --worktree "$TMP/repo" --slug opencode-quick-depth1 --capability autopilot-code --mode dev --intensity quick --dispatch-depth 1 --parent-session-id test-parent --owner-harness opencode --prompt-text "quick work" --model provider/test --variant low --jobs "$TMP/opencode-quick-depth1.log" >"$TMP/logs/opencode_quick_depth1.out" 2>"$TMP/logs/opencode_quick_depth1.err"; then
   bad "opencode dispatch wrapper should reject route-unbound quick jobs"
 else
   rc=$?
   if [ "$rc" -eq 65 ] \
-    && grep -q '^reason=quick-headless-unavailable$' /tmp/opencode_quick_depth1.out \
-    && grep -q '^child_spawned=0$' /tmp/opencode_quick_depth1.out \
+    && grep -q '^reason=quick-headless-unavailable$' "$TMP/logs/opencode_quick_depth1.out" \
+    && grep -q '^child_spawned=0$' "$TMP/logs/opencode_quick_depth1.out" \
     && [ ! -e "$TMP/opencode-quick-depth1.log" ]; then
     ok "opencode dispatch wrapper rejects route-unbound quick jobs"
   else
     bad "opencode dispatch wrapper should fail closed for route-unbound quick jobs"
   fi
 fi
-if "$OPENCODE" dispatch --dry-run --worktree "$TMP/repo" --slug opencode-quick-depth2 --capability autopilot-code --capability-mode dev --worker-mode dev/backend --worker-type stage --unit dev/backend --intensity quick --dispatch-depth 2 --parent opencode-parent --prompt-text "quick work" --model provider/test --variant low >/tmp/opencode_quick_depth2.out 2>/tmp/opencode_quick_depth2.err; then
+if "$OPENCODE" dispatch --dry-run --worktree "$TMP/repo" --slug opencode-quick-depth2 --capability autopilot-code --capability-mode dev --worker-mode dev/backend --worker-type stage --unit dev/backend --intensity quick --dispatch-depth 2 --parent opencode-parent --prompt-text "quick work" --model provider/test --variant low >"$TMP/logs/opencode_quick_depth2.out" 2>"$TMP/logs/opencode_quick_depth2.err"; then
   bad "opencode dispatch wrapper should reject quick dispatch-depth-2 jobs"
 else
   rc=$?
   if [ "$rc" -eq 64 ] \
-    && grep -q '^reason=invalid-depth-two-intensity$' /tmp/opencode_quick_depth2.out \
-    && grep -q '^dispatch_depth=2$' /tmp/opencode_quick_depth2.out \
-    && grep -q '^intensity=quick$' /tmp/opencode_quick_depth2.out \
+    && grep -q '^reason=invalid-depth-two-intensity$' "$TMP/logs/opencode_quick_depth2.out" \
+    && grep -q '^dispatch_depth=2$' "$TMP/logs/opencode_quick_depth2.out" \
+    && grep -q '^intensity=quick$' "$TMP/logs/opencode_quick_depth2.out" \
     && [ ! -e "$TMP/opencode-quick-depth2.log" ]; then
     ok "opencode dispatch wrapper rejects quick dispatch-depth-2 jobs"
   else
     bad "opencode dispatch wrapper should reject quick dispatch-depth-2 jobs"
   fi
 fi
-if "$OPENCODE" dispatch --register --worktree "$TMP/repo" --slug opencode-dispatch --capability autopilot-code --mode dev --qa standard --prompt-text "do work" --model provider/test --variant low --jobs "$TMP/opencode-dispatch.log" >/tmp/opencode_dispatch.out 2>/tmp/opencode_dispatch.err \
-  && grep -q '^status=register$' /tmp/opencode_dispatch.out \
-  && grep -q '^registered=1$' /tmp/opencode_dispatch.out \
-  && grep -q '^started=0$' /tmp/opencode_dispatch.out \
+if "$OPENCODE" dispatch --register --worktree "$TMP/repo" --slug opencode-dispatch --capability autopilot-code --mode dev --qa standard --prompt-text "do work" --model provider/test --variant low --jobs "$TMP/opencode-dispatch.log" >"$TMP/logs/opencode_dispatch.out" 2>"$TMP/logs/opencode_dispatch.err" \
+  && grep -q '^status=register$' "$TMP/logs/opencode_dispatch.out" \
+  && grep -q '^registered=1$' "$TMP/logs/opencode_dispatch.out" \
+  && grep -q '^started=0$' "$TMP/logs/opencode_dispatch.out" \
   && awk -F '\t' '$2 == "open" && $5 == "opencode-dispatch" { found=1 } END { exit !found }' "$TMP/opencode-dispatch.log" \
   && grep -q 'capability_mode=dev' "$TMP/opencode-dispatch.log" \
   && ! grep -q ',mode=' "$TMP/opencode-dispatch.log" \
@@ -4032,11 +4040,11 @@ if "$OPENCODE" dispatch --register --worktree "$TMP/repo" --slug opencode-dispat
 else
   bad "opencode dispatch wrapper should register open headless job"
 fi
-if "$OPENCODE" dispatch --register --worktree "$TMP/repo" --slug opencode-generated --capability autopilot-code --mode dev --qa thorough --intensity thorough --model provider/test --variant low --jobs "$TMP/opencode-generated.log" --log-dir "$TMP/opencode-generated-logs" >/tmp/opencode_generated_dispatch.out 2>/tmp/opencode_generated_dispatch.err \
-  && grep -q '^status=register$' /tmp/opencode_generated_dispatch.out \
-  && grep -q '^registered=1$' /tmp/opencode_generated_dispatch.out \
-  && grep -q '^prompt_source=generated$' /tmp/opencode_generated_dispatch.out \
-  && opencode_generated_prompt=$(sed -n 's/^prompt_file=//p' /tmp/opencode_generated_dispatch.out) \
+if "$OPENCODE" dispatch --register --worktree "$TMP/repo" --slug opencode-generated --capability autopilot-code --mode dev --qa thorough --intensity thorough --model provider/test --variant low --jobs "$TMP/opencode-generated.log" --log-dir "$TMP/opencode-generated-logs" >"$TMP/logs/opencode_generated_dispatch.out" 2>"$TMP/logs/opencode_generated_dispatch.err" \
+  && grep -q '^status=register$' "$TMP/logs/opencode_generated_dispatch.out" \
+  && grep -q '^registered=1$' "$TMP/logs/opencode_generated_dispatch.out" \
+  && grep -q '^prompt_source=generated$' "$TMP/logs/opencode_generated_dispatch.out" \
+  && opencode_generated_prompt=$(sed -n 's/^prompt_file=//p' "$TMP/logs/opencode_generated_dispatch.out") \
   && [ -f "$opencode_generated_prompt" ] \
   && grep -q 'qa-policy thorough code' "$opencode_generated_prompt" \
   && grep -q '^# Portable Worker Kernel$' "$opencode_generated_prompt" \
@@ -4047,19 +4055,19 @@ if "$OPENCODE" dispatch --register --worktree "$TMP/repo" --slug opencode-genera
 else
   bad "opencode dispatch wrapper should materialize generated register prompt with QA policy"
 fi
-if "$OPENCODE" harvest --jobs "$TMP/opencode-dispatch.log" --slug opencode-dispatch >/tmp/opencode_harvest.out 2>/tmp/opencode_harvest.err \
-  && grep -q '^adapter=opencode$' /tmp/opencode_harvest.out \
-  && grep -q '^runtime_surface=opencode-dispatch-harvest$' /tmp/opencode_harvest.out \
-  && grep -q '^matched=1$' /tmp/opencode_harvest.out \
-  && grep -q '^marked_done=0$' /tmp/opencode_harvest.out \
-  && grep -q '^job_status=open$' /tmp/opencode_harvest.out \
-  && grep -q '^merge_action=unsupported$' /tmp/opencode_harvest.out; then
+if "$OPENCODE" harvest --jobs "$TMP/opencode-dispatch.log" --slug opencode-dispatch >"$TMP/logs/opencode_harvest.out" 2>"$TMP/logs/opencode_harvest.err" \
+  && grep -q '^adapter=opencode$' "$TMP/logs/opencode_harvest.out" \
+  && grep -q '^runtime_surface=opencode-dispatch-harvest$' "$TMP/logs/opencode_harvest.out" \
+  && grep -q '^matched=1$' "$TMP/logs/opencode_harvest.out" \
+  && grep -q '^marked_done=0$' "$TMP/logs/opencode_harvest.out" \
+  && grep -q '^job_status=open$' "$TMP/logs/opencode_harvest.out" \
+  && grep -q '^merge_action=unsupported$' "$TMP/logs/opencode_harvest.out"; then
   ok "opencode harvest wrapper reports open registry jobs"
 else
   bad "opencode harvest wrapper should report open registry jobs"
 fi
-if "$OPENCODE" harvest --jobs "$TMP/opencode-dispatch.log" --slug opencode-dispatch --mark-done >/tmp/opencode_harvest_done.out 2>/tmp/opencode_harvest_done.err \
-  && grep -q '^marked_done=1$' /tmp/opencode_harvest_done.out \
+if "$OPENCODE" harvest --jobs "$TMP/opencode-dispatch.log" --slug opencode-dispatch --mark-done >"$TMP/logs/opencode_harvest_done.out" 2>"$TMP/logs/opencode_harvest_done.err" \
+  && grep -q '^marked_done=1$' "$TMP/logs/opencode_harvest_done.out" \
   && awk -F '\t' '$2 == "done" && $5 == "opencode-dispatch" { found=1 } END { exit !found }' "$TMP/opencode-dispatch.log" \
   && grep -q 'worker_type=owner' "$TMP/opencode-dispatch.log" \
   && grep -q 'assigned_contract=autopilot-code' "$TMP/opencode-dispatch.log"; then
@@ -4083,80 +4091,80 @@ con.execute("INSERT INTO message (id, session_id, time_created, time_updated, da
 con.commit()
 EOF
 printf '2026-06-30T00:00:00Z\topen\t%s\t%s\tlive-opencode\t-\n' "$TMP/repo" "$TMP/flowproj" > "$TMP/opencode-jobs.log"
-if OPENCODE_DB="$TMP/opencode.db" DISPATCH_STALE_MIN=60 "$OPENCODE" liveness "$TMP/opencode-jobs.log" >/tmp/opencode_liveness.out 2>/tmp/opencode_liveness.err \
-  && grep -q '^ALIVE    live-opencode ' /tmp/opencode_liveness.out \
-  && grep -q '^open 1 ; alive 1 ; suspect/dead 0$' /tmp/opencode_liveness.out; then
+if OPENCODE_DB="$TMP/opencode.db" DISPATCH_STALE_MIN=60 "$OPENCODE" liveness "$TMP/opencode-jobs.log" >"$TMP/logs/opencode_liveness.out" 2>"$TMP/logs/opencode_liveness.err" \
+  && grep -q '^ALIVE    live-opencode ' "$TMP/logs/opencode_liveness.out" \
+  && grep -q '^open 1 ; alive 1 ; suspect/dead 0$' "$TMP/logs/opencode_liveness.out"; then
   ok "opencode liveness wrapper matches worktree to session DB"
 else
   bad "opencode liveness wrapper should match worktree to session DB"
 fi
 printf '2026-06-30T00:00:00Z\topen\t%s\t%s\tdead-opencode\t-\n' "$TMP/repo" "$TMP/missing-opencode-wt" > "$TMP/opencode-dead-jobs.log"
-if OPENCODE_DB="$TMP/opencode.db" "$OPENCODE" liveness "$TMP/opencode-dead-jobs.log" >/tmp/opencode_liveness_dead.out 2>/tmp/opencode_liveness_dead.err; then
+if OPENCODE_DB="$TMP/opencode.db" "$OPENCODE" liveness "$TMP/opencode-dead-jobs.log" >"$TMP/logs/opencode_liveness_dead.out" 2>"$TMP/logs/opencode_liveness_dead.err"; then
   bad "opencode liveness wrapper should fail dead jobs"
 else
   rc=$?
   if [ "$rc" -eq 3 ] \
-    && grep -q '^DEAD     dead-opencode ' /tmp/opencode_liveness_dead.out \
-    && grep -q '^open 1 ; alive 0 ; suspect/dead 1$' /tmp/opencode_liveness_dead.out; then
+    && grep -q '^DEAD     dead-opencode ' "$TMP/logs/opencode_liveness_dead.out" \
+    && grep -q '^open 1 ; alive 0 ; suspect/dead 1$' "$TMP/logs/opencode_liveness_dead.out"; then
     ok "opencode liveness wrapper reports dead jobs"
   else
     bad "opencode liveness wrapper should report dead jobs"
   fi
 fi
-if "$OPENCODE" mcp >/tmp/opencode_mcp.out 2>/tmp/opencode_mcp.err \
-  && grep -q '^adapter=opencode$' /tmp/opencode_mcp.out \
-  && grep -q '^runtime_surface=opencode-native-mcp$' /tmp/opencode_mcp.out \
-  && grep -q '^mcp_surface=opencode mcp$' /tmp/opencode_mcp.out \
-  && grep -q '^design_mcp_projection=unsupported$' /tmp/opencode_mcp.out \
-  && grep -q '^claude_settings_mcp=unsupported$' /tmp/opencode_mcp.out; then
+if "$OPENCODE" mcp >"$TMP/logs/opencode_mcp.out" 2>"$TMP/logs/opencode_mcp.err" \
+  && grep -q '^adapter=opencode$' "$TMP/logs/opencode_mcp.out" \
+  && grep -q '^runtime_surface=opencode-native-mcp$' "$TMP/logs/opencode_mcp.out" \
+  && grep -q '^mcp_surface=opencode mcp$' "$TMP/logs/opencode_mcp.out" \
+  && grep -q '^design_mcp_projection=unsupported$' "$TMP/logs/opencode_mcp.out" \
+  && grep -q '^claude_settings_mcp=unsupported$' "$TMP/logs/opencode_mcp.out"; then
   ok "opencode mcp wrapper reports native MCP contract"
 else
   bad "opencode mcp wrapper should report native MCP contract"
 fi
-if "$OPENCODE" mcp --check >/tmp/opencode_mcp_check.out 2>/tmp/opencode_mcp_check.err \
-  && grep -q '^check=ok$' /tmp/opencode_mcp_check.out; then
+if "$OPENCODE" mcp --check >"$TMP/logs/opencode_mcp_check.out" 2>"$TMP/logs/opencode_mcp_check.err" \
+  && grep -q '^check=ok$' "$TMP/logs/opencode_mcp_check.out"; then
   ok "opencode mcp wrapper checks native MCP CLI"
 else
   bad "opencode mcp wrapper should check native MCP CLI"
 fi
-if "$OPENCODE" loop-info oncall >/tmp/opencode_loop_oncall.out 2>/tmp/opencode_loop_oncall.err \
-  && grep -q '^adapter=opencode$' /tmp/opencode_loop_oncall.out \
-  && grep -q '^loop=oncall$' /tmp/opencode_loop_oncall.out \
-  && grep -q '^source=loops/oncall.md$' /tmp/opencode_loop_oncall.out \
-  && grep -q '^status=manual-contract$' /tmp/opencode_loop_oncall.out \
-  && grep -q '^runtime_surface=opencode-loop-guidance$' /tmp/opencode_loop_oncall.out \
-  && grep -q '^executable_projection=unsupported-runtime-script$' /tmp/opencode_loop_oncall.out; then
+if "$OPENCODE" loop-info oncall >"$TMP/logs/opencode_loop_oncall.out" 2>"$TMP/logs/opencode_loop_oncall.err" \
+  && grep -q '^adapter=opencode$' "$TMP/logs/opencode_loop_oncall.out" \
+  && grep -q '^loop=oncall$' "$TMP/logs/opencode_loop_oncall.out" \
+  && grep -q '^source=loops/oncall.md$' "$TMP/logs/opencode_loop_oncall.out" \
+  && grep -q '^status=manual-contract$' "$TMP/logs/opencode_loop_oncall.out" \
+  && grep -q '^runtime_surface=opencode-loop-guidance$' "$TMP/logs/opencode_loop_oncall.out" \
+  && grep -q '^executable_projection=unsupported-runtime-script$' "$TMP/logs/opencode_loop_oncall.out"; then
   ok "opencode loop wrapper reports oncall manual contract"
 else
   bad "opencode loop wrapper should report oncall manual contract"
 fi
-if "$OPENCODE" loop-info drill >/tmp/opencode_loop_drill.out 2>/tmp/opencode_loop_drill.err \
-  && grep -q '^source=loops/drill/README.md$' /tmp/opencode_loop_drill.out \
-  && grep -q '^status=manual-contract$' /tmp/opencode_loop_drill.out \
-  && grep -q '^trigger=manual-only$' /tmp/opencode_loop_drill.out \
-  && grep -q '^auto_run=unsupported$' /tmp/opencode_loop_drill.out \
-  && grep -q '^fallback=report-drill-would-be-useful$' /tmp/opencode_loop_drill.out; then
+if "$OPENCODE" loop-info drill >"$TMP/logs/opencode_loop_drill.out" 2>"$TMP/logs/opencode_loop_drill.err" \
+  && grep -q '^source=loops/drill/README.md$' "$TMP/logs/opencode_loop_drill.out" \
+  && grep -q '^status=manual-contract$' "$TMP/logs/opencode_loop_drill.out" \
+  && grep -q '^trigger=manual-only$' "$TMP/logs/opencode_loop_drill.out" \
+  && grep -q '^auto_run=unsupported$' "$TMP/logs/opencode_loop_drill.out" \
+  && grep -q '^fallback=report-drill-would-be-useful$' "$TMP/logs/opencode_loop_drill.out"; then
   ok "opencode loop wrapper prevents automatic drill execution"
 else
   bad "opencode loop wrapper should prevent automatic drill execution"
 fi
-if "$OPENCODE" loop-info study >/tmp/opencode_loop_study.out 2>/tmp/opencode_loop_study.err \
-  && grep -q '^source=loops/study.md$' /tmp/opencode_loop_study.out \
-  && grep -q '^status=manual-contract$' /tmp/opencode_loop_study.out \
-  && grep -q '^action=proposal-report-only$' /tmp/opencode_loop_study.out \
-  && grep -q '^fallback=read-source-and-draft-proposal-in-main-session$' /tmp/opencode_loop_study.out; then
+if "$OPENCODE" loop-info study >"$TMP/logs/opencode_loop_study.out" 2>"$TMP/logs/opencode_loop_study.err" \
+  && grep -q '^source=loops/study.md$' "$TMP/logs/opencode_loop_study.out" \
+  && grep -q '^status=manual-contract$' "$TMP/logs/opencode_loop_study.out" \
+  && grep -q '^action=proposal-report-only$' "$TMP/logs/opencode_loop_study.out" \
+  && grep -q '^fallback=read-source-and-draft-proposal-in-main-session$' "$TMP/logs/opencode_loop_study.out"; then
   ok "opencode loop wrapper reports study proposal contract"
 else
   bad "opencode loop wrapper should report study proposal contract"
 fi
-if "$OPENCODE" loop-info note >/tmp/opencode_loop_note.out 2>/tmp/opencode_loop_note.err \
-  && grep -q '^loop=note$' /tmp/opencode_loop_note.out \
-  && grep -q '^status=unsupported$' /tmp/opencode_loop_note.out \
-  && grep -q '^runtime_surface=missing-native-loop$' /tmp/opencode_loop_note.out \
-  && grep -q '^related_extension=artifact-sink$' /tmp/opencode_loop_note.out \
-  && grep -q '^native_extension_surface=application-owned-plugin$' /tmp/opencode_loop_note.out \
-  && grep -q '^scheduler_surface=external-application$' /tmp/opencode_loop_note.out \
-  && grep -q '^fallback=extension-unavailable-or-application-scheduler$' /tmp/opencode_loop_note.out; then
+if "$OPENCODE" loop-info note >"$TMP/logs/opencode_loop_note.out" 2>"$TMP/logs/opencode_loop_note.err" \
+  && grep -q '^loop=note$' "$TMP/logs/opencode_loop_note.out" \
+  && grep -q '^status=unsupported$' "$TMP/logs/opencode_loop_note.out" \
+  && grep -q '^runtime_surface=missing-native-loop$' "$TMP/logs/opencode_loop_note.out" \
+  && grep -q '^related_extension=artifact-sink$' "$TMP/logs/opencode_loop_note.out" \
+  && grep -q '^native_extension_surface=application-owned-plugin$' "$TMP/logs/opencode_loop_note.out" \
+  && grep -q '^scheduler_surface=external-application$' "$TMP/logs/opencode_loop_note.out" \
+  && grep -q '^fallback=extension-unavailable-or-application-scheduler$' "$TMP/logs/opencode_loop_note.out"; then
   ok "opencode loop wrapper marks missing note loop unsupported"
 else
   bad "opencode loop wrapper should mark missing note loop unsupported"
@@ -4164,57 +4172,57 @@ fi
 
 export AGENT_HOME="$FIXTURE_INVALID_AGENT_HOME"
 echo "== opencode role mapping =="
-if AGENT_MODEL_FAST=fast-model AGENT_VARIANT_FAST=low "$OPENCODE" role fast reviewer >/tmp/opencode_role.out 2>/tmp/opencode_role.err \
-  && grep -q '^family=fast$' /tmp/opencode_role.out \
-  && grep -q '^adapter=opencode$' /tmp/opencode_role.out \
-  && grep -q '^source=roles/README.md$' /tmp/opencode_role.out \
-  && grep -q '^model=fast-model$' /tmp/opencode_role.out \
-  && grep -q '^variant=low$' /tmp/opencode_role.out; then
+if AGENT_MODEL_FAST=fast-model AGENT_VARIANT_FAST=low "$OPENCODE" role fast reviewer >"$TMP/logs/opencode_role.out" 2>"$TMP/logs/opencode_role.err" \
+  && grep -q '^family=fast$' "$TMP/logs/opencode_role.out" \
+  && grep -q '^adapter=opencode$' "$TMP/logs/opencode_role.out" \
+  && grep -q '^source=roles/README.md$' "$TMP/logs/opencode_role.out" \
+  && grep -q '^model=fast-model$' "$TMP/logs/opencode_role.out" \
+  && grep -q '^variant=low$' "$TMP/logs/opencode_role.out"; then
   ok "opencode role wrapper maps fast portable role"
 else
   bad "opencode role wrapper should map fast portable role"
 fi
-if AGENT_MODEL_ORCHESTRATOR=provider/orchestrator-model AGENT_VARIANT_ORCHESTRATOR=medium "$OPENCODE" role external adversary orchestrator >/tmp/opencode_role.out 2>/tmp/opencode_role.err \
-  && grep -q '^family=balanced$' /tmp/opencode_role.out \
-  && grep -q '^adapter=opencode$' /tmp/opencode_role.out \
-  && grep -q '^model=provider/orchestrator-model$' /tmp/opencode_role.out \
-  && grep -q '^variant=medium$' /tmp/opencode_role.out \
-  && grep -q '^available=1$' /tmp/opencode_role.out \
-  && grep -q '^status=configured$' /tmp/opencode_role.out; then
+if AGENT_MODEL_ORCHESTRATOR=provider/orchestrator-model AGENT_VARIANT_ORCHESTRATOR=medium "$OPENCODE" role external adversary orchestrator >"$TMP/logs/opencode_role.out" 2>"$TMP/logs/opencode_role.err" \
+  && grep -q '^family=balanced$' "$TMP/logs/opencode_role.out" \
+  && grep -q '^adapter=opencode$' "$TMP/logs/opencode_role.out" \
+  && grep -q '^model=provider/orchestrator-model$' "$TMP/logs/opencode_role.out" \
+  && grep -q '^variant=medium$' "$TMP/logs/opencode_role.out" \
+  && grep -q '^available=1$' "$TMP/logs/opencode_role.out" \
+  && grep -q '^status=configured$' "$TMP/logs/opencode_role.out"; then
   ok "opencode role wrapper maps external adversary orchestrator role"
 else
   bad "opencode role wrapper should map external adversary orchestrator role"
 fi
-if "$OPENCODE" role external adversary >/tmp/opencode_role.out 2>/tmp/opencode_role.err \
-  && grep -q '^available=0$' /tmp/opencode_role.out \
-  && grep -q '^status=unavailable$' /tmp/opencode_role.out; then
+if "$OPENCODE" role external adversary >"$TMP/logs/opencode_role.out" 2>"$TMP/logs/opencode_role.err" \
+  && grep -q '^available=0$' "$TMP/logs/opencode_role.out" \
+  && grep -q '^status=unavailable$' "$TMP/logs/opencode_role.out"; then
   ok "opencode role wrapper marks external adversary unavailable by default"
 else
   bad "opencode role wrapper should mark external adversary unavailable by default"
 fi
-if AGENT_MODEL_EXTERNAL=provider/external-model AGENT_VARIANT_EXTERNAL=high "$OPENCODE" role external adversary >/tmp/opencode_role.out 2>/tmp/opencode_role.err \
-  && grep -q '^family=external$' /tmp/opencode_role.out \
-  && grep -q '^available=1$' /tmp/opencode_role.out \
-  && grep -q '^status=configured$' /tmp/opencode_role.out \
-  && grep -q '^model=provider/external-model$' /tmp/opencode_role.out \
-  && grep -q '^variant=high$' /tmp/opencode_role.out; then
+if AGENT_MODEL_EXTERNAL=provider/external-model AGENT_VARIANT_EXTERNAL=high "$OPENCODE" role external adversary >"$TMP/logs/opencode_role.out" 2>"$TMP/logs/opencode_role.err" \
+  && grep -q '^family=external$' "$TMP/logs/opencode_role.out" \
+  && grep -q '^available=1$' "$TMP/logs/opencode_role.out" \
+  && grep -q '^status=configured$' "$TMP/logs/opencode_role.out" \
+  && grep -q '^model=provider/external-model$' "$TMP/logs/opencode_role.out" \
+  && grep -q '^variant=high$' "$TMP/logs/opencode_role.out"; then
   ok "opencode role wrapper maps configured external adversary model"
 else
   bad "opencode role wrapper should map configured external adversary model"
 fi
-if AGENT_EXTERNAL_CMD="sh -c" "$OPENCODE" role external adversary >/tmp/opencode_role.out 2>/tmp/opencode_role.err \
-  && grep -q '^available=1$' /tmp/opencode_role.out \
-  && grep -q '^status=configured$' /tmp/opencode_role.out \
-  && grep -q '^model=external-command$' /tmp/opencode_role.out \
-  && grep -q '^external_command=sh -c$' /tmp/opencode_role.out; then
+if AGENT_EXTERNAL_CMD="sh -c" "$OPENCODE" role external adversary >"$TMP/logs/opencode_role.out" 2>"$TMP/logs/opencode_role.err" \
+  && grep -q '^available=1$' "$TMP/logs/opencode_role.out" \
+  && grep -q '^status=configured$' "$TMP/logs/opencode_role.out" \
+  && grep -q '^model=external-command$' "$TMP/logs/opencode_role.out" \
+  && grep -q '^external_command=sh -c$' "$TMP/logs/opencode_role.out"; then
   ok "opencode role wrapper accepts external adversary command with args"
 else
   bad "opencode role wrapper should accept external adversary command with args"
 fi
-if AGENT_EXTERNAL_CMD="missing-external-adversary-command --review" "$OPENCODE" role external adversary >/tmp/opencode_role.out 2>/tmp/opencode_role.err \
-  && grep -q '^available=0$' /tmp/opencode_role.out \
-  && grep -q '^status=unavailable$' /tmp/opencode_role.out \
-  && grep -q '^reason=AGENT_EXTERNAL_CMD not found: missing-external-adversary-command$' /tmp/opencode_role.out; then
+if AGENT_EXTERNAL_CMD="missing-external-adversary-command --review" "$OPENCODE" role external adversary >"$TMP/logs/opencode_role.out" 2>"$TMP/logs/opencode_role.err" \
+  && grep -q '^available=0$' "$TMP/logs/opencode_role.out" \
+  && grep -q '^status=unavailable$' "$TMP/logs/opencode_role.out" \
+  && grep -q '^reason=AGENT_EXTERNAL_CMD not found: missing-external-adversary-command$' "$TMP/logs/opencode_role.out"; then
   ok "opencode role wrapper reports missing external adversary command"
 else
   bad "opencode role wrapper should report missing external adversary command"
@@ -4222,9 +4230,9 @@ fi
 # Unconfigured fast roles fall back to the config-declared mini tier (models.conf
 # SoT retired the old `opencode-default` placeholder); derive the expectation.
 opencode_mini_model=$(. "$ROOT/adapters/opencode/config/models.conf" && printf '%s' "$CFG_TIER_MINI_MODEL")
-if "$OPENCODE" role fast reviewer >/tmp/opencode_role.out 2>/tmp/opencode_role.err \
-  && grep -q "^model=${opencode_mini_model}\$" /tmp/opencode_role.out \
-  && grep -q '^variant=runtime-default$' /tmp/opencode_role.out; then
+if "$OPENCODE" role fast reviewer >"$TMP/logs/opencode_role.out" 2>"$TMP/logs/opencode_role.err" \
+  && grep -q "^model=${opencode_mini_model}\$" "$TMP/logs/opencode_role.out" \
+  && grep -q '^variant=runtime-default$' "$TMP/logs/opencode_role.out"; then
   ok "opencode role wrapper falls back to the config mini tier when unconfigured"
 else
   bad "opencode role wrapper should fall back to the config mini tier when unconfigured"
@@ -4233,10 +4241,10 @@ if command -v opencode >/dev/null 2>&1; then
   mkdir -p "$TMP/opencode_bootstrap_home/.config/opencode" "$TMP/opencode_bootstrap_home/.local/share"
   if OPENCODE_CONFIG_CONTENT="{\"instructions\":[\"$ROOT/opencode_setting/AGENTS.md\"],\"skills\":{\"paths\":[\"$ROOT/opencode_setting/opencode-skills\"]}}" \
     HOME="$TMP/opencode_bootstrap_home" XDG_CONFIG_HOME="$TMP/opencode_bootstrap_home/.config" XDG_DATA_HOME="$TMP/opencode_bootstrap_home/.local/share" \
-    opencode debug config --pure >/tmp/opencode_bootstrap.out 2>/tmp/opencode_bootstrap.err \
-    && grep -q "$ROOT/opencode_setting/AGENTS.md" /tmp/opencode_bootstrap.out \
-    && grep -q "$ROOT/opencode_setting/opencode-skills" /tmp/opencode_bootstrap.out \
-    && ! grep -q '/.claude/' /tmp/opencode_bootstrap.out; then
+    opencode debug config --pure >"$TMP/logs/opencode_bootstrap.out" 2>"$TMP/logs/opencode_bootstrap.err" \
+    && grep -q "$ROOT/opencode_setting/AGENTS.md" "$TMP/logs/opencode_bootstrap.out" \
+    && grep -q "$ROOT/opencode_setting/opencode-skills" "$TMP/logs/opencode_bootstrap.out" \
+    && ! grep -q '/.claude/' "$TMP/logs/opencode_bootstrap.out"; then
     ok "opencode bootstrap config projects instructions and skills without Claude paths"
   else
     bad "opencode bootstrap config should project instructions and skills without Claude paths"
@@ -4253,10 +4261,10 @@ if command -v opencode >/dev/null 2>&1; then
   # 재홈 2026-07-22: team profiles retired — the discoverable native agent is the kernel
   # helper memory-scout, which declares its portable source (core/MEMORY.md §7.4).
   if HOME="$TMP/opencode_home" XDG_CONFIG_HOME="$TMP/opencode_home/.config" XDG_DATA_HOME="$TMP/opencode_home/.local/share" \
-    opencode debug agent memory-scout --pure >/tmp/opencode_agent.out 2>/tmp/opencode_agent.err \
-    && grep -q '"description": "Read-only memory scout for agent-initiated deep memory reconnaissance."' /tmp/opencode_agent.out \
-    && grep -q 'core/MEMORY.md' /tmp/opencode_agent.out \
-    && ! grep -q '/.claude/' /tmp/opencode_agent.out; then
+    opencode debug agent memory-scout --pure >"$TMP/logs/opencode_agent.out" 2>"$TMP/logs/opencode_agent.err" \
+    && grep -q '"description": "Read-only memory scout for agent-initiated deep memory reconnaissance."' "$TMP/logs/opencode_agent.out" \
+    && grep -q 'core/MEMORY.md' "$TMP/logs/opencode_agent.out" \
+    && ! grep -q '/.claude/' "$TMP/logs/opencode_agent.out"; then
     ok "opencode native agent projection is discoverable without Claude paths"
   else
     bad "opencode native agent projection should be discoverable without Claude paths"
@@ -4264,8 +4272,8 @@ if command -v opencode >/dev/null 2>&1; then
   # 재홈 2026-07-22: qa-team projection retired — read-only/depth-one runtime enforcement
   # is preserved on the kernel memory-scout projection (edit/write/task off + deny rules).
   if HOME="$TMP/opencode_home" XDG_CONFIG_HOME="$TMP/opencode_home/.config" XDG_DATA_HOME="$TMP/opencode_home/.local/share" \
-    opencode debug agent memory-scout --pure >/tmp/opencode_agent_qa.out 2>/tmp/opencode_agent_qa.err \
-    && python3 - /tmp/opencode_agent_qa.out <<'PY'
+    opencode debug agent memory-scout --pure >"$TMP/logs/opencode_agent_qa.out" 2>"$TMP/logs/opencode_agent_qa.err" \
+    && python3 - "$TMP/logs/opencode_agent_qa.out" <<'PY'
 import json
 import sys
 
@@ -4293,10 +4301,10 @@ if command -v opencode >/dev/null 2>&1; then
     ln -s "$f" "$TMP/opencode_command_home/.config/opencode/command/$(basename "$f")"
   done
   if HOME="$TMP/opencode_command_home" XDG_CONFIG_HOME="$TMP/opencode_command_home/.config" XDG_DATA_HOME="$TMP/opencode_command_home/.local/share" \
-    opencode debug config --pure >/tmp/opencode_command.out 2>/tmp/opencode_command.err \
-    && grep -q '"autopilot-code": {' /tmp/opencode_command.out \
-    && grep -q '"description": "Run the portable autopilot-code capability through the OpenCode adapter' /tmp/opencode_command.out \
-    && ! grep -q '/.claude/' /tmp/opencode_command.out; then
+    opencode debug config --pure >"$TMP/logs/opencode_command.out" 2>"$TMP/logs/opencode_command.err" \
+    && grep -q '"autopilot-code": {' "$TMP/logs/opencode_command.out" \
+    && grep -q '"description": "Run the portable autopilot-code capability through the OpenCode adapter' "$TMP/logs/opencode_command.out" \
+    && ! grep -q '/.claude/' "$TMP/logs/opencode_command.out"; then
     ok "opencode native command projection is discoverable without Claude paths"
   else
     bad "opencode native command projection should be discoverable without Claude paths"
@@ -4310,9 +4318,9 @@ if command -v opencode >/dev/null 2>&1; then
   if (
     cd "$TMP/opencode_plugin_project" || exit 1
     HOME="$TMP/opencode_plugin_home" XDG_CONFIG_HOME="$TMP/opencode_plugin_home/.config" XDG_DATA_HOME="$TMP/opencode_plugin_home/.local/share" \
-      opencode debug config >/tmp/opencode_plugin.out 2>/tmp/opencode_plugin.err
-  ) && grep -q 'hearting-guards.js' /tmp/opencode_plugin.out \
-    && ! grep -q 'adapters/claude/hooks' /tmp/opencode_plugin.out; then
+      opencode debug config >"$TMP/logs/opencode_plugin.out" 2>"$TMP/logs/opencode_plugin.err"
+  ) && grep -q 'hearting-guards.js' "$TMP/logs/opencode_plugin.out" \
+    && ! grep -q 'adapters/claude/hooks' "$TMP/logs/opencode_plugin.out"; then
     ok "opencode native plugin projection is discoverable without Claude hooks"
   else
     bad "opencode native plugin projection should be discoverable without Claude hooks"
@@ -4320,7 +4328,7 @@ if command -v opencode >/dev/null 2>&1; then
 else
   ok "opencode native plugin runtime discovery skipped (opencode not installed)"
 fi
-if node --input-type=module >/tmp/opencode_plugin_hook.out 2>/tmp/opencode_plugin_hook.err <<EOF
+if node --input-type=module >"$TMP/logs/opencode_plugin_hook.out" 2>"$TMP/logs/opencode_plugin_hook.err" <<EOF
 import { AgentHarnessGuards } from "$ROOT/opencode_setting/opencode-plugins/hearting-guards.js"
 const plugin = await AgentHarnessGuards({ directory: "$TMP/repo", worktree: "$TMP/repo" })
 await plugin["tool.execute.before"]({ tool: "write", sessionID: "testsid" }, { args: { filePath: "$TMP/repo/f" } })
@@ -4336,7 +4344,7 @@ cat > "$TMP/fake_agent_home/adapters/opencode/bin/preflight.sh" <<'EOF'
 exit 77
 EOF
 chmod +x "$TMP/fake_agent_home/adapters/opencode/bin/preflight.sh"
-if node --input-type=module >/tmp/opencode_plugin_invalid_home.out 2>/tmp/opencode_plugin_invalid_home.err <<EOF
+if node --input-type=module >"$TMP/logs/opencode_plugin_invalid_home.out" 2>"$TMP/logs/opencode_plugin_invalid_home.err" <<EOF
 process.env.AGENT_HOME = "$TMP/fake_agent_home"
 const mod = await import("$ROOT/opencode_setting/opencode-plugins/hearting-guards.js")
 const plugin = await mod.AgentHarnessGuards({ directory: "$TMP/repo", worktree: "$TMP/repo" })
@@ -4349,7 +4357,7 @@ else
 fi
 mkdir -p "$TMP/opencode_copied_plugin"
 cp "$ROOT/opencode_setting/opencode-plugins/hearting-guards.js" "$TMP/opencode_copied_plugin/hearting-guards.js"
-if node --input-type=module >/tmp/opencode_plugin_copy.out 2>/tmp/opencode_plugin_copy.err <<EOF
+if node --input-type=module >"$TMP/logs/opencode_plugin_copy.out" 2>"$TMP/logs/opencode_plugin_copy.err" <<EOF
 process.env.AGENT_HOME = "$ROOT"
 const mod = await import("$TMP/opencode_copied_plugin/hearting-guards.js")
 const plugin = await mod.AgentHarnessGuards({ directory: "$TMP/repo", worktree: "$TMP/repo" })
@@ -4360,7 +4368,7 @@ then
 else
   bad "opencode native plugin copy should resolve harness through AGENT_HOME"
 fi
-if node --input-type=module >/tmp/opencode_plugin_lifecycle.out 2>/tmp/opencode_plugin_lifecycle.err <<EOF
+if node --input-type=module >"$TMP/logs/opencode_plugin_lifecycle.out" 2>"$TMP/logs/opencode_plugin_lifecycle.err" <<EOF
 import { AgentHarnessGuards } from "$ROOT/opencode_setting/opencode-plugins/hearting-guards.js"
 const plugin = await AgentHarnessGuards({ directory: "$TMP/flowproj", worktree: "$TMP/flowproj" })
 if (!plugin["chat.message"]) process.exit(1)
@@ -4388,7 +4396,7 @@ esac
 EOF
 chmod +x "$OPENCODE_WORKER_ROOT/adapters/opencode/bin/preflight.sh"
 if AGENT_HOME="$OPENCODE_WORKER_ROOT" AGENT_SESSION_ROLE=worker \
-  node --input-type=module >/tmp/opencode_plugin_worker.out 2>/tmp/opencode_plugin_worker.err <<EOF
+  node --input-type=module >"$TMP/logs/opencode_plugin_worker.out" 2>"$TMP/logs/opencode_plugin_worker.err" <<EOF
 import { AgentHarnessGuards } from "$ROOT/opencode_setting/opencode-plugins/hearting-guards.js"
 const plugin = await AgentHarnessGuards({ directory: "$TMP/flowproj", worktree: "$TMP/flowproj" })
 const output = { system: [] }
@@ -4410,7 +4418,7 @@ then
 else
   bad "opencode worker plugin must separate lifecycle from safety guards"
 fi
-if node --input-type=module >/tmp/opencode_plugin_hook_block.out 2>/tmp/opencode_plugin_hook_block.err <<EOF
+if node --input-type=module >"$TMP/logs/opencode_plugin_hook_block.out" 2>"$TMP/logs/opencode_plugin_hook_block.err" <<EOF
 import { AgentHarnessGuards } from "$ROOT/opencode_setting/opencode-plugins/hearting-guards.js"
 const plugin = await AgentHarnessGuards({ directory: "$TMP/runtime", worktree: "$TMP/runtime" })
 try {
@@ -4425,7 +4433,7 @@ then
 else
   bad "opencode native plugin write hook should block guarded writes"
 fi
-if DESIGN_POSTWRITE_HOOK=0 node --input-type=module >/tmp/opencode_plugin_design_hook.out 2>/tmp/opencode_plugin_design_hook.err <<EOF
+if DESIGN_POSTWRITE_HOOK=0 node --input-type=module >"$TMP/logs/opencode_plugin_design_hook.out" 2>"$TMP/logs/opencode_plugin_design_hook.err" <<EOF
 import { AgentHarnessGuards } from "$ROOT/opencode_setting/opencode-plugins/hearting-guards.js"
 const plugin = await AgentHarnessGuards({ directory: "$TMP/repo", worktree: "$TMP/repo" })
 await plugin["tool.execute.after"]({ tool: "write", sessionID: "testsid", args: { filePath: "$TMP/repo/spec/design/preview.html" } }, {})
@@ -4442,7 +4450,7 @@ fi
 opencode_plugin_source="$TMP/repo/opencode_plugin_source.py"
 printf 'print(1)\n' > "$opencode_plugin_source"
 git -C "$TMP/repo" add "$opencode_plugin_source"
-if node --input-type=module >/tmp/opencode_plugin_write_route.out 2>/tmp/opencode_plugin_write_route.err <<EOF
+if node --input-type=module >"$TMP/logs/opencode_plugin_write_route.out" 2>"$TMP/logs/opencode_plugin_write_route.err" <<EOF
 import { AgentHarnessGuards } from "$ROOT/opencode_setting/opencode-plugins/hearting-guards.js"
 const plugin = await AgentHarnessGuards({ directory: "$TMP/repo", worktree: "$TMP/repo" })
 try {
@@ -4457,7 +4465,7 @@ then
 else
   bad "opencode plugin tool.execute.before should deny a route-less material write end-to-end"
 fi
-if node --input-type=module >/tmp/opencode_plugin_bash_commit.out 2>/tmp/opencode_plugin_bash_commit.err <<EOF
+if node --input-type=module >"$TMP/logs/opencode_plugin_bash_commit.out" 2>"$TMP/logs/opencode_plugin_bash_commit.err" <<EOF
 import { AgentHarnessGuards } from "$ROOT/opencode_setting/opencode-plugins/hearting-guards.js"
 const plugin = await AgentHarnessGuards({ directory: "$TMP/repo", worktree: "$TMP/repo" })
 try {
@@ -4470,7 +4478,7 @@ then
 else
   bad "opencode plugin bash git commit of material content should be denied"
 fi
-if node --input-type=module >/tmp/opencode_plugin_bash_wt_deny.out 2>/tmp/opencode_plugin_bash_wt_deny.err <<EOF
+if node --input-type=module >"$TMP/logs/opencode_plugin_bash_wt_deny.out" 2>"$TMP/logs/opencode_plugin_bash_wt_deny.err" <<EOF
 import { AgentHarnessGuards } from "$ROOT/opencode_setting/opencode-plugins/hearting-guards.js"
 const plugin = await AgentHarnessGuards({ directory: "$TMP/repo", worktree: "$TMP/repo" })
 try {
@@ -4483,7 +4491,7 @@ then
 else
   bad "opencode plugin bash git worktree add outside -wt/ should be denied"
 fi
-if node --input-type=module >/tmp/opencode_plugin_bash_wt_pass.out 2>/tmp/opencode_plugin_bash_wt_pass.err <<EOF
+if node --input-type=module >"$TMP/logs/opencode_plugin_bash_wt_pass.out" 2>"$TMP/logs/opencode_plugin_bash_wt_pass.err" <<EOF
 import { AgentHarnessGuards } from "$ROOT/opencode_setting/opencode-plugins/hearting-guards.js"
 const plugin = await AgentHarnessGuards({ directory: "$TMP/repo", worktree: "$TMP/repo" })
 await plugin["tool.execute.before"]({ tool: "bash", sessionID: "opencode-plugin-bash-wt-pass" }, { args: { command: "git worktree add /home/x/repo-wt/slug -b slug main" } })
@@ -4493,7 +4501,7 @@ then
 else
   bad "opencode plugin should pass canonical <repo>-wt/ worktree add"
 fi
-if node --input-type=module >/tmp/opencode_plugin_bash_neutral.out 2>/tmp/opencode_plugin_bash_neutral.err <<EOF
+if node --input-type=module >"$TMP/logs/opencode_plugin_bash_neutral.out" 2>"$TMP/logs/opencode_plugin_bash_neutral.err" <<EOF
 import { AgentHarnessGuards } from "$ROOT/opencode_setting/opencode-plugins/hearting-guards.js"
 const plugin = await AgentHarnessGuards({ directory: "$TMP/repo", worktree: "$TMP/repo" })
 await plugin["tool.execute.before"]({ tool: "bash", sessionID: "opencode-plugin-bash-neutral" }, { args: { command: "git worktree remove /home/x/repo-wt/slug" } })
@@ -4504,7 +4512,7 @@ then
 else
   bad "opencode plugin should leave non-add worktree subcommands and neutral commands alone"
 fi
-if node --input-type=module >/tmp/opencode_plugin_bash_verbatim.out 2>/tmp/opencode_plugin_bash_verbatim.err <<EOF
+if node --input-type=module >"$TMP/logs/opencode_plugin_bash_verbatim.out" 2>"$TMP/logs/opencode_plugin_bash_verbatim.err" <<EOF
 import { AgentHarnessGuards } from "$ROOT/opencode_setting/opencode-plugins/hearting-guards.js"
 const plugin = await AgentHarnessGuards({ directory: "$TMP/repo", worktree: "$TMP/repo" })
 // Irregular internal spacing would break a token-rejoining classifier but not
@@ -4521,7 +4529,7 @@ then
 else
   bad "opencode plugin should pass the raw bash command through verbatim as one argv element"
 fi
-if node --input-type=module >/tmp/opencode_plugin_shell_env.out 2>/tmp/opencode_plugin_shell_env.err <<EOF
+if node --input-type=module >"$TMP/logs/opencode_plugin_shell_env.out" 2>"$TMP/logs/opencode_plugin_shell_env.err" <<EOF
 import { AgentHarnessGuards } from "$ROOT/opencode_setting/opencode-plugins/hearting-guards.js"
 const plugin = await AgentHarnessGuards({ directory: "$TMP/repo", worktree: "$TMP/repo" })
 const withSid = { env: {} }
@@ -4538,17 +4546,17 @@ else
 fi
 
 echo "== opencode capability mapping =="
-if "$OPENCODE" capability-info autopilot-code >/tmp/opencode_cap.out 2>/tmp/opencode_cap.err \
-  && grep -q '^capability=autopilot-code$' /tmp/opencode_cap.out \
-  && grep -q '^adapter=opencode$' /tmp/opencode_cap.out \
-  && grep -q '^native_skill=1$' /tmp/opencode_cap.out \
-  && grep -q '^native_skill_path=adapters/opencode/skills/autopilot-code/SKILL.md$' /tmp/opencode_cap.out \
-  && grep -q '^native_command=1$' /tmp/opencode_cap.out \
-  && grep -q '^native_command_path=adapters/opencode/commands/autopilot-code.md$' /tmp/opencode_cap.out \
-  && grep -q '^realization=opencode-native-skill-command$' /tmp/opencode_cap.out \
-  && grep -q '^compat_reference=not-projected$' /tmp/opencode_cap.out \
-  && ! grep -q '^compat_reference=skills/' /tmp/opencode_cap.out \
-  && grep -q '^status=instruction-only$' /tmp/opencode_cap.out; then
+if "$OPENCODE" capability-info autopilot-code >"$TMP/logs/opencode_cap.out" 2>"$TMP/logs/opencode_cap.err" \
+  && grep -q '^capability=autopilot-code$' "$TMP/logs/opencode_cap.out" \
+  && grep -q '^adapter=opencode$' "$TMP/logs/opencode_cap.out" \
+  && grep -q '^native_skill=1$' "$TMP/logs/opencode_cap.out" \
+  && grep -q '^native_skill_path=adapters/opencode/skills/autopilot-code/SKILL.md$' "$TMP/logs/opencode_cap.out" \
+  && grep -q '^native_command=1$' "$TMP/logs/opencode_cap.out" \
+  && grep -q '^native_command_path=adapters/opencode/commands/autopilot-code.md$' "$TMP/logs/opencode_cap.out" \
+  && grep -q '^realization=opencode-native-skill-command$' "$TMP/logs/opencode_cap.out" \
+  && grep -q '^compat_reference=not-projected$' "$TMP/logs/opencode_cap.out" \
+  && ! grep -q '^compat_reference=skills/' "$TMP/logs/opencode_cap.out" \
+  && grep -q '^status=instruction-only$' "$TMP/logs/opencode_cap.out"; then
   ok "opencode capability wrapper reports native skill and command realization"
 else
   bad "opencode capability wrapper should report native skill and command realization"
@@ -4561,35 +4569,35 @@ cat >"$tmp_map_root/capabilities/README.md" <<'EOF'
 |---|---|
 | `autopilot-code` | test |
 EOF
-if "$tmp_map_root/adapters/opencode/bin/capability-map.sh" autopilot-code >/tmp/opencode_cap_missing.out 2>/tmp/opencode_cap_missing.err \
-  && grep -q '^native_skill=0$' /tmp/opencode_cap_missing.out \
-  && grep -q '^native_command=0$' /tmp/opencode_cap_missing.out \
-  && grep -q '^realization=portable-instructions$' /tmp/opencode_cap_missing.out \
-  && grep -q '^note=OpenCode has no native Skill/command realization' /tmp/opencode_cap_missing.out; then
+if "$tmp_map_root/adapters/opencode/bin/capability-map.sh" autopilot-code >"$TMP/logs/opencode_cap_missing.out" 2>"$TMP/logs/opencode_cap_missing.err" \
+  && grep -q '^native_skill=0$' "$TMP/logs/opencode_cap_missing.out" \
+  && grep -q '^native_command=0$' "$TMP/logs/opencode_cap_missing.out" \
+  && grep -q '^realization=portable-instructions$' "$TMP/logs/opencode_cap_missing.out" \
+  && grep -q '^note=OpenCode has no native Skill/command realization' "$TMP/logs/opencode_cap_missing.out"; then
   ok "opencode capability wrapper downgrades note when native projections are missing"
 else
   bad "opencode capability wrapper should not claim missing native projections"
 fi
-if "$OPENCODE" capability-info design-review >/tmp/opencode_cap.out 2>/tmp/opencode_cap.err \
-  && grep -q '^capability=design-review$' /tmp/opencode_cap.out \
-  && grep -q '^native_skill=1$' /tmp/opencode_cap.out \
-  && grep -q '^native_command=1$' /tmp/opencode_cap.out \
-  && grep -q '^realization=opencode-native-skill-command$' /tmp/opencode_cap.out \
-  && grep -q '^status=tool-contract$' /tmp/opencode_cap.out \
-  && grep -q '^tool_contract=visual-harness$' /tmp/opencode_cap.out \
-  && grep -q '^tool_contract_check=adapters/opencode/bin/preflight.sh visual-harness <file.html>$' /tmp/opencode_cap.out \
-  && grep -q '^runtime_surface=adapter-owned-visual-harness$' /tmp/opencode_cap.out \
-  && grep -q '^fallback=preflight.sh visual-harness <file.html>$' /tmp/opencode_cap.out; then
+if "$OPENCODE" capability-info design-review >"$TMP/logs/opencode_cap.out" 2>"$TMP/logs/opencode_cap.err" \
+  && grep -q '^capability=design-review$' "$TMP/logs/opencode_cap.out" \
+  && grep -q '^native_skill=1$' "$TMP/logs/opencode_cap.out" \
+  && grep -q '^native_command=1$' "$TMP/logs/opencode_cap.out" \
+  && grep -q '^realization=opencode-native-skill-command$' "$TMP/logs/opencode_cap.out" \
+  && grep -q '^status=tool-contract$' "$TMP/logs/opencode_cap.out" \
+  && grep -q '^tool_contract=visual-harness$' "$TMP/logs/opencode_cap.out" \
+  && grep -q '^tool_contract_check=adapters/opencode/bin/preflight.sh visual-harness <file.html>$' "$TMP/logs/opencode_cap.out" \
+  && grep -q '^runtime_surface=adapter-owned-visual-harness$' "$TMP/logs/opencode_cap.out" \
+  && grep -q '^fallback=preflight.sh visual-harness <file.html>$' "$TMP/logs/opencode_cap.out"; then
   ok "opencode design capability reports visual harness contract"
 else
   bad "opencode design capability should report visual harness contract"
 fi
-if "$OPENCODE" visual-harness >/tmp/opencode_visual.out 2>/tmp/opencode_visual.err; then
-  if grep -q '^adapter=opencode$' /tmp/opencode_visual.out \
-    && grep -q '^status=tool-contract$' /tmp/opencode_visual.out \
-    && grep -q '^tool_contract=visual-harness$' /tmp/opencode_visual.out \
-    && grep -q '^runtime_surface=adapter-owned-visual-harness$' /tmp/opencode_visual.out \
-    && ! grep -q 'adapters/claude\|claude_setting\|settings.json\|statusline.sh' /tmp/opencode_visual.out; then
+if "$OPENCODE" visual-harness >"$TMP/logs/opencode_visual.out" 2>"$TMP/logs/opencode_visual.err"; then
+  if grep -q '^adapter=opencode$' "$TMP/logs/opencode_visual.out" \
+    && grep -q '^status=tool-contract$' "$TMP/logs/opencode_visual.out" \
+    && grep -q '^tool_contract=visual-harness$' "$TMP/logs/opencode_visual.out" \
+    && grep -q '^runtime_surface=adapter-owned-visual-harness$' "$TMP/logs/opencode_visual.out" \
+    && ! grep -q 'adapters/claude\|claude_setting\|settings.json\|statusline.sh' "$TMP/logs/opencode_visual.out"; then
     ok "opencode visual harness reports adapter-native tool-contract"
   else
     bad "opencode visual harness should report adapter-native tool-contract"
@@ -4600,11 +4608,11 @@ fi
 cat >"$TMP/opencode-preview.html" <<'EOF'
 <!doctype html><html><body><h1>OpenCode visual harness</h1></body></html>
 EOF
-if "$OPENCODE" visual-harness "$TMP/opencode-preview.html" --out "$TMP/opencode-visual" >/tmp/opencode_visual_file.out 2>/tmp/opencode_visual_file.err; then
-  if grep -q '^adapter=opencode$' /tmp/opencode_visual_file.out \
-    && grep -q '^runtime_surface=adapter-owned-visual-harness$' /tmp/opencode_visual_file.out \
-    && grep -q '^status=ok$' /tmp/opencode_visual_file.out \
-    && grep -q '^console_errors=0$' /tmp/opencode_visual_file.out \
+if "$OPENCODE" visual-harness "$TMP/opencode-preview.html" --out "$TMP/opencode-visual" >"$TMP/logs/opencode_visual_file.out" 2>"$TMP/logs/opencode_visual_file.err"; then
+  if grep -q '^adapter=opencode$' "$TMP/logs/opencode_visual_file.out" \
+    && grep -q '^runtime_surface=adapter-owned-visual-harness$' "$TMP/logs/opencode_visual_file.out" \
+    && grep -q '^status=ok$' "$TMP/logs/opencode_visual_file.out" \
+    && grep -q '^console_errors=0$' "$TMP/logs/opencode_visual_file.out" \
     && [ -f "$TMP/opencode-visual/opencode-preview-html.png" ]; then
     ok "opencode visual harness renders HTML when checker dependencies exist"
   else
@@ -4613,10 +4621,10 @@ if "$OPENCODE" visual-harness "$TMP/opencode-preview.html" --out "$TMP/opencode-
 else
   rc=$?
   if [ "$rc" -eq 69 ] \
-    && grep -q '^adapter=opencode$' /tmp/opencode_visual_file.out \
-    && grep -q '^runtime_surface=adapter-owned-visual-harness$' /tmp/opencode_visual_file.out \
-    && grep -q '^status=tool-contract$' /tmp/opencode_visual_file.out \
-    && grep -q '^reason=playwright-unavailable$' /tmp/opencode_visual_file.out; then
+    && grep -q '^adapter=opencode$' "$TMP/logs/opencode_visual_file.out" \
+    && grep -q '^runtime_surface=adapter-owned-visual-harness$' "$TMP/logs/opencode_visual_file.out" \
+    && grep -q '^status=tool-contract$' "$TMP/logs/opencode_visual_file.out" \
+    && grep -q '^reason=playwright-unavailable$' "$TMP/logs/opencode_visual_file.out"; then
     ok "opencode visual harness reports unavailable checker dependency"
   else
     bad "opencode visual harness should render or report unavailable checker dependency"
@@ -4628,137 +4636,137 @@ import sys
 print("rows=3")
 print("args=" + ",".join(sys.argv[1:]))
 EOF
-if "$OPENCODE" data-script --check "$TMP/opencode-data-script.py" >/tmp/opencode_data_script.out 2>/tmp/opencode_data_script.err \
-  && grep -q '^adapter=opencode$' /tmp/opencode_data_script.out \
-  && grep -q '^tool_contract=data-script$' /tmp/opencode_data_script.out \
-  && grep -q '^runtime_surface=adapter-owned-data-script$' /tmp/opencode_data_script.out \
-  && grep -q '^check=python-compile$' /tmp/opencode_data_script.out \
-  && grep -q '^status=ok$' /tmp/opencode_data_script.out; then
+if "$OPENCODE" data-script --check "$TMP/opencode-data-script.py" >"$TMP/logs/opencode_data_script.out" 2>"$TMP/logs/opencode_data_script.err" \
+  && grep -q '^adapter=opencode$' "$TMP/logs/opencode_data_script.out" \
+  && grep -q '^tool_contract=data-script$' "$TMP/logs/opencode_data_script.out" \
+  && grep -q '^runtime_surface=adapter-owned-data-script$' "$TMP/logs/opencode_data_script.out" \
+  && grep -q '^check=python-compile$' "$TMP/logs/opencode_data_script.out" \
+  && grep -q '^status=ok$' "$TMP/logs/opencode_data_script.out"; then
   ok "opencode data-script wrapper checks Python analysis scripts"
 else
   bad "opencode data-script wrapper should check Python analysis scripts"
 fi
-if "$OPENCODE" claim-verify >/tmp/opencode_claim_verify.out 2>/tmp/opencode_claim_verify.err \
-  && grep -q '^adapter=opencode$' /tmp/opencode_claim_verify.out \
-  && grep -q '^tool_contract=external-claim-verification$' /tmp/opencode_claim_verify.out \
-  && grep -q '^runtime_surface=adapter-owned-claim-verify$' /tmp/opencode_claim_verify.out \
-  && grep -q '^status=tool-contract$' /tmp/opencode_claim_verify.out; then
+if "$OPENCODE" claim-verify >"$TMP/logs/opencode_claim_verify.out" 2>"$TMP/logs/opencode_claim_verify.err" \
+  && grep -q '^adapter=opencode$' "$TMP/logs/opencode_claim_verify.out" \
+  && grep -q '^tool_contract=external-claim-verification$' "$TMP/logs/opencode_claim_verify.out" \
+  && grep -q '^runtime_surface=adapter-owned-claim-verify$' "$TMP/logs/opencode_claim_verify.out" \
+  && grep -q '^status=tool-contract$' "$TMP/logs/opencode_claim_verify.out"; then
   ok "opencode claim-verify wrapper reports tool contract"
 else
   bad "opencode claim-verify wrapper should report tool contract"
 fi
-if "$OPENCODE" claim-verify --check "model X is state of the art" >/tmp/opencode_claim_unavailable.out 2>/tmp/opencode_claim_unavailable.err; then
+if "$OPENCODE" claim-verify --check "model X is state of the art" >"$TMP/logs/opencode_claim_unavailable.out" 2>"$TMP/logs/opencode_claim_unavailable.err"; then
   bad "opencode claim-verify wrapper should report unavailable provider by default"
 else
   rc=$?
   if [ "$rc" -eq 69 ] \
-    && grep -q '^adapter=opencode$' /tmp/opencode_claim_unavailable.out \
-    && grep -q '^reason=claim-verify-provider-unavailable$' /tmp/opencode_claim_unavailable.out; then
+    && grep -q '^adapter=opencode$' "$TMP/logs/opencode_claim_unavailable.out" \
+    && grep -q '^reason=claim-verify-provider-unavailable$' "$TMP/logs/opencode_claim_unavailable.out"; then
     ok "opencode claim-verify wrapper reports unavailable provider"
   else
     bad "opencode claim-verify wrapper should report unavailable provider"
   fi
 fi
-if "$OPENCODE" figure-gen >/tmp/opencode_figure_gen.out 2>/tmp/opencode_figure_gen.err \
-  && grep -q '^adapter=opencode$' /tmp/opencode_figure_gen.out \
-  && grep -q '^tool_contract=figure-gen$' /tmp/opencode_figure_gen.out \
-  && grep -q '^runtime_surface=adapter-owned-figure-gen$' /tmp/opencode_figure_gen.out \
-  && grep -q '^status=tool-contract$' /tmp/opencode_figure_gen.out; then
+if "$OPENCODE" figure-gen >"$TMP/logs/opencode_figure_gen.out" 2>"$TMP/logs/opencode_figure_gen.err" \
+  && grep -q '^adapter=opencode$' "$TMP/logs/opencode_figure_gen.out" \
+  && grep -q '^tool_contract=figure-gen$' "$TMP/logs/opencode_figure_gen.out" \
+  && grep -q '^runtime_surface=adapter-owned-figure-gen$' "$TMP/logs/opencode_figure_gen.out" \
+  && grep -q '^status=tool-contract$' "$TMP/logs/opencode_figure_gen.out"; then
   ok "opencode figure-gen wrapper reports tool contract"
 else
   bad "opencode figure-gen wrapper should report tool contract"
 fi
-if "$OPENCODE" figure-gen --check "$TMP/missing-figure.py" >/tmp/opencode_figure_missing.out 2>/tmp/opencode_figure_missing.err; then
+if "$OPENCODE" figure-gen --check "$TMP/missing-figure.py" >"$TMP/logs/opencode_figure_missing.out" 2>"$TMP/logs/opencode_figure_missing.err"; then
   bad "opencode figure-gen wrapper should fail missing script"
 else
   rc=$?
   if [ "$rc" -eq 66 ] \
-    && grep -q '^adapter=opencode$' /tmp/opencode_figure_missing.out \
-    && grep -q '^reason=file-not-found$' /tmp/opencode_figure_missing.out; then
+    && grep -q '^adapter=opencode$' "$TMP/logs/opencode_figure_missing.out" \
+    && grep -q '^reason=file-not-found$' "$TMP/logs/opencode_figure_missing.out"; then
     ok "opencode figure-gen wrapper reports missing script"
   else
     bad "opencode figure-gen wrapper should report missing script"
   fi
 fi
-if "$OPENCODE" browser-fetch >/tmp/opencode_browser_fetch.out 2>/tmp/opencode_browser_fetch.err \
-  && grep -q '^adapter=opencode$' /tmp/opencode_browser_fetch.out \
-  && grep -q '^tool_contract=browser-fetch$' /tmp/opencode_browser_fetch.out \
-  && grep -q '^runtime_surface=adapter-owned-browser-fetch$' /tmp/opencode_browser_fetch.out \
-  && grep -q '^status=tool-contract$' /tmp/opencode_browser_fetch.out; then
+if "$OPENCODE" browser-fetch >"$TMP/logs/opencode_browser_fetch.out" 2>"$TMP/logs/opencode_browser_fetch.err" \
+  && grep -q '^adapter=opencode$' "$TMP/logs/opencode_browser_fetch.out" \
+  && grep -q '^tool_contract=browser-fetch$' "$TMP/logs/opencode_browser_fetch.out" \
+  && grep -q '^runtime_surface=adapter-owned-browser-fetch$' "$TMP/logs/opencode_browser_fetch.out" \
+  && grep -q '^status=tool-contract$' "$TMP/logs/opencode_browser_fetch.out"; then
   ok "opencode browser-fetch wrapper reports tool contract"
 else
   bad "opencode browser-fetch wrapper should report tool contract"
 fi
-if "$OPENCODE" browser-fetch --check not-a-url >/tmp/opencode_browser_bad_url.out 2>/tmp/opencode_browser_bad_url.err; then
+if "$OPENCODE" browser-fetch --check not-a-url >"$TMP/logs/opencode_browser_bad_url.out" 2>"$TMP/logs/opencode_browser_bad_url.err"; then
   bad "opencode browser-fetch wrapper should fail bad URL"
 else
   rc=$?
   if [ "$rc" -eq 65 ] \
-    && grep -q '^adapter=opencode$' /tmp/opencode_browser_bad_url.out \
-    && grep -q '^reason=bad-url$' /tmp/opencode_browser_bad_url.out; then
+    && grep -q '^adapter=opencode$' "$TMP/logs/opencode_browser_bad_url.out" \
+    && grep -q '^reason=bad-url$' "$TMP/logs/opencode_browser_bad_url.out"; then
     ok "opencode browser-fetch wrapper reports bad URL"
   else
     bad "opencode browser-fetch wrapper should report bad URL"
   fi
 fi
-if "$OPENCODE" pdf-extract >/tmp/opencode_pdf_extract.out 2>/tmp/opencode_pdf_extract.err \
-  && grep -q '^adapter=opencode$' /tmp/opencode_pdf_extract.out \
-  && grep -q '^tool_contract=pdf-extract$' /tmp/opencode_pdf_extract.out \
-  && grep -q '^runtime_surface=adapter-owned-pdf-extract$' /tmp/opencode_pdf_extract.out \
-  && grep -q '^status=tool-contract$' /tmp/opencode_pdf_extract.out; then
+if "$OPENCODE" pdf-extract >"$TMP/logs/opencode_pdf_extract.out" 2>"$TMP/logs/opencode_pdf_extract.err" \
+  && grep -q '^adapter=opencode$' "$TMP/logs/opencode_pdf_extract.out" \
+  && grep -q '^tool_contract=pdf-extract$' "$TMP/logs/opencode_pdf_extract.out" \
+  && grep -q '^runtime_surface=adapter-owned-pdf-extract$' "$TMP/logs/opencode_pdf_extract.out" \
+  && grep -q '^status=tool-contract$' "$TMP/logs/opencode_pdf_extract.out"; then
   ok "opencode pdf-extract wrapper reports tool contract"
 else
   bad "opencode pdf-extract wrapper should report tool contract"
 fi
-if "$OPENCODE" pdf-extract --check "$TMP/missing.pdf" >/tmp/opencode_pdf_missing.out 2>/tmp/opencode_pdf_missing.err; then
+if "$OPENCODE" pdf-extract --check "$TMP/missing.pdf" >"$TMP/logs/opencode_pdf_missing.out" 2>"$TMP/logs/opencode_pdf_missing.err"; then
   bad "opencode pdf-extract wrapper should fail missing PDF"
 else
   rc=$?
   if [ "$rc" -eq 66 ] \
-    && grep -q '^adapter=opencode$' /tmp/opencode_pdf_missing.out \
-    && grep -q '^reason=file-not-found$' /tmp/opencode_pdf_missing.out; then
+    && grep -q '^adapter=opencode$' "$TMP/logs/opencode_pdf_missing.out" \
+    && grep -q '^reason=file-not-found$' "$TMP/logs/opencode_pdf_missing.out"; then
     ok "opencode pdf-extract wrapper reports missing PDF"
   else
     bad "opencode pdf-extract wrapper should report missing PDF"
   fi
 fi
-if "$OPENCODE" web-image-search >/tmp/opencode_web_image.out 2>/tmp/opencode_web_image.err \
-  && grep -q '^adapter=opencode$' /tmp/opencode_web_image.out \
-  && grep -q '^tool_contract=web-image-search$' /tmp/opencode_web_image.out \
-  && grep -q '^runtime_surface=adapter-owned-web-image-search$' /tmp/opencode_web_image.out \
-  && grep -q '^status=tool-contract$' /tmp/opencode_web_image.out; then
+if "$OPENCODE" web-image-search >"$TMP/logs/opencode_web_image.out" 2>"$TMP/logs/opencode_web_image.err" \
+  && grep -q '^adapter=opencode$' "$TMP/logs/opencode_web_image.out" \
+  && grep -q '^tool_contract=web-image-search$' "$TMP/logs/opencode_web_image.out" \
+  && grep -q '^runtime_surface=adapter-owned-web-image-search$' "$TMP/logs/opencode_web_image.out" \
+  && grep -q '^status=tool-contract$' "$TMP/logs/opencode_web_image.out"; then
   ok "opencode web-image-search wrapper reports tool contract"
 else
   bad "opencode web-image-search wrapper should report tool contract"
 fi
-if "$OPENCODE" web-image-search --check "speech enhancement timeline" >/tmp/opencode_web_image_unavailable.out 2>/tmp/opencode_web_image_unavailable.err; then
+if "$OPENCODE" web-image-search --check "speech enhancement timeline" >"$TMP/logs/opencode_web_image_unavailable.out" 2>"$TMP/logs/opencode_web_image_unavailable.err"; then
   bad "opencode web-image-search wrapper should report unavailable provider by default"
 else
   rc=$?
   if [ "$rc" -eq 69 ] \
-    && grep -q '^adapter=opencode$' /tmp/opencode_web_image_unavailable.out \
-    && grep -q '^reason=web-image-search-provider-unavailable$' /tmp/opencode_web_image_unavailable.out; then
+    && grep -q '^adapter=opencode$' "$TMP/logs/opencode_web_image_unavailable.out" \
+    && grep -q '^reason=web-image-search-provider-unavailable$' "$TMP/logs/opencode_web_image_unavailable.out"; then
     ok "opencode web-image-search wrapper reports unavailable provider"
   else
     bad "opencode web-image-search wrapper should report unavailable provider"
   fi
 fi
-if "$OPENCODE" verification-runner --check -- python3 >/tmp/opencode_verify_check.out 2>/tmp/opencode_verify_check.err \
-  && grep -q '^adapter=opencode$' /tmp/opencode_verify_check.out \
-  && grep -q '^tool_contract=verification-runner$' /tmp/opencode_verify_check.out \
-  && grep -q '^runtime_surface=adapter-owned-verification-runner$' /tmp/opencode_verify_check.out \
-  && grep -q '^check=command-available$' /tmp/opencode_verify_check.out \
-  && grep -q '^status=ok$' /tmp/opencode_verify_check.out; then
+if "$OPENCODE" verification-runner --check -- python3 >"$TMP/logs/opencode_verify_check.out" 2>"$TMP/logs/opencode_verify_check.err" \
+  && grep -q '^adapter=opencode$' "$TMP/logs/opencode_verify_check.out" \
+  && grep -q '^tool_contract=verification-runner$' "$TMP/logs/opencode_verify_check.out" \
+  && grep -q '^runtime_surface=adapter-owned-verification-runner$' "$TMP/logs/opencode_verify_check.out" \
+  && grep -q '^check=command-available$' "$TMP/logs/opencode_verify_check.out" \
+  && grep -q '^status=ok$' "$TMP/logs/opencode_verify_check.out"; then
   ok "opencode verification runner checks explicit commands"
 else
   bad "opencode verification runner should check explicit commands"
 fi
-if "$OPENCODE" verification-runner --timeout 5 -- python3 -c 'print("verify-ok")' >/tmp/opencode_verify_run.out 2>/tmp/opencode_verify_run.err \
-  && grep -q '^adapter=opencode$' /tmp/opencode_verify_run.out \
-  && grep -q '^runtime_surface=adapter-owned-verification-runner$' /tmp/opencode_verify_run.out \
-  && grep -q '^status=ok$' /tmp/opencode_verify_run.out \
-  && grep -q '^exit_code=0$' /tmp/opencode_verify_run.out \
-  && grep -q 'verify-ok' /tmp/opencode_verify_run.out; then
+if "$OPENCODE" verification-runner --timeout 5 -- python3 -c 'print("verify-ok")' >"$TMP/logs/opencode_verify_run.out" 2>"$TMP/logs/opencode_verify_run.err" \
+  && grep -q '^adapter=opencode$' "$TMP/logs/opencode_verify_run.out" \
+  && grep -q '^runtime_surface=adapter-owned-verification-runner$' "$TMP/logs/opencode_verify_run.out" \
+  && grep -q '^status=ok$' "$TMP/logs/opencode_verify_run.out" \
+  && grep -q '^exit_code=0$' "$TMP/logs/opencode_verify_run.out" \
+  && grep -q 'verify-ok' "$TMP/logs/opencode_verify_run.out"; then
   ok "opencode verification runner executes explicit commands"
 else
   bad "opencode verification runner should execute explicit commands"
@@ -4766,10 +4774,10 @@ fi
 if command -v opencode >/dev/null 2>&1; then
   if OPENCODE_DISABLE_CLAUDE_CODE_SKILLS=1 \
     OPENCODE_CONFIG_CONTENT="{\"skills\":{\"paths\":[\"$ROOT/opencode_setting/opencode-skills\"]}}" \
-    opencode debug skill --pure >/tmp/opencode_skills.out 2>/tmp/opencode_skills.err; then
-    if grep -q '"name": "autopilot-code"' /tmp/opencode_skills.out \
-      && grep -q "$ROOT/opencode_setting/opencode-skills/autopilot-code/SKILL.md" /tmp/opencode_skills.out \
-      && ! grep -q '"location": ".*/\\.claude/skills' /tmp/opencode_skills.out; then
+    opencode debug skill --pure >"$TMP/logs/opencode_skills.out" 2>"$TMP/logs/opencode_skills.err"; then
+    if grep -q '"name": "autopilot-code"' "$TMP/logs/opencode_skills.out" \
+      && grep -q "$ROOT/opencode_setting/opencode-skills/autopilot-code/SKILL.md" "$TMP/logs/opencode_skills.out" \
+      && ! grep -q '"location": ".*/\\.claude/skills' "$TMP/logs/opencode_skills.out"; then
       ok "opencode native skill projection is discoverable without Claude compat autoload"
     else
       bad "opencode native skill projection should be discoverable without Claude compat autoload"
@@ -4782,18 +4790,18 @@ else
 fi
 
 echo "== opencode mode mapping =="
-if "$OPENCODE" mode-info dev/backend >/tmp/opencode_mode.out 2>/tmp/opencode_mode.err \
-  && grep -q '^status=portable$' /tmp/opencode_mode.out \
-  && grep -q '^realization=portable-persona$' /tmp/opencode_mode.out; then
+if "$OPENCODE" mode-info dev/backend >"$TMP/logs/opencode_mode.out" 2>"$TMP/logs/opencode_mode.err" \
+  && grep -q '^status=portable$' "$TMP/logs/opencode_mode.out" \
+  && grep -q '^realization=portable-persona$' "$TMP/logs/opencode_mode.out"; then
   ok "opencode mode wrapper maps portable mode"
 else
   bad "opencode mode wrapper should map portable mode"
 fi
-if "$OPENCODE" mode-info qa/security-review >/tmp/opencode_mode.out 2>/tmp/opencode_mode.err \
-  && grep -q '^status=portable$' /tmp/opencode_mode.out \
-  && grep -q '^realization=portable-persona$' /tmp/opencode_mode.out \
-  && grep -q 'read-only security review with OpenCode file and git diff tools' /tmp/opencode_mode.out \
-  && ! grep -q '^tool_contract=' /tmp/opencode_mode.out; then
+if "$OPENCODE" mode-info qa/security-review >"$TMP/logs/opencode_mode.out" 2>"$TMP/logs/opencode_mode.err" \
+  && grep -q '^status=portable$' "$TMP/logs/opencode_mode.out" \
+  && grep -q '^realization=portable-persona$' "$TMP/logs/opencode_mode.out" \
+  && grep -q 'read-only security review with OpenCode file and git diff tools' "$TMP/logs/opencode_mode.out" \
+  && ! grep -q '^tool_contract=' "$TMP/logs/opencode_mode.out"; then
   ok "opencode mode wrapper treats security-review as portable read-only guidance"
 else
   bad "opencode mode wrapper should treat security-review as portable read-only guidance"
@@ -4805,13 +4813,13 @@ for mode_file in "$ROOT"/roles/units/design/*.md; do
   mode_name=$(basename "$mode_file" .md)
   case "$mode_name" in _*) continue ;; esac
   mode="design/$mode_name"
-  if ! "$OPENCODE" mode-info "$mode" >/tmp/opencode_mode.out 2>/tmp/opencode_mode.err \
-    || ! grep -q '^status=unsupported$' /tmp/opencode_mode.out \
-    || ! grep -q '^realization=adapter-coupled$' /tmp/opencode_mode.out \
-    || ! grep -q '^tool_contract=visual-harness$' /tmp/opencode_mode.out \
-    || ! grep -q '^tool_contract_check=adapters/opencode/bin/preflight.sh visual-harness <file.html>$' /tmp/opencode_mode.out \
-    || ! grep -q '^runtime_surface=adapter-owned-visual-harness$' /tmp/opencode_mode.out \
-    || ! grep -q '^fallback=reference-only$' /tmp/opencode_mode.out; then
+  if ! "$OPENCODE" mode-info "$mode" >"$TMP/logs/opencode_mode.out" 2>"$TMP/logs/opencode_mode.err" \
+    || ! grep -q '^status=unsupported$' "$TMP/logs/opencode_mode.out" \
+    || ! grep -q '^realization=adapter-coupled$' "$TMP/logs/opencode_mode.out" \
+    || ! grep -q '^tool_contract=visual-harness$' "$TMP/logs/opencode_mode.out" \
+    || ! grep -q '^tool_contract_check=adapters/opencode/bin/preflight.sh visual-harness <file.html>$' "$TMP/logs/opencode_mode.out" \
+    || ! grep -q '^runtime_surface=adapter-owned-visual-harness$' "$TMP/logs/opencode_mode.out" \
+    || ! grep -q '^fallback=reference-only$' "$TMP/logs/opencode_mode.out"; then
     opencode_design_modes_ok=0
     break
   fi
@@ -4821,77 +4829,77 @@ if [ "$opencode_design_modes_ok" -eq 1 ]; then
 else
   bad "opencode mode wrapper should mark every adapter-coupled design mode unsupported"
 fi
-if "$OPENCODE" mode-info material/data-script >/tmp/opencode_mode.out 2>/tmp/opencode_mode.err \
-  && grep -q '^status=tool-contract$' /tmp/opencode_mode.out \
-  && grep -q '^realization=portable-with-tool-contract$' /tmp/opencode_mode.out \
-  && grep -q '^tool_contract=data-script$' /tmp/opencode_mode.out \
-  && grep -q '^tool_contract_check=adapters/opencode/bin/preflight.sh data-script --check <script.py>$' /tmp/opencode_mode.out \
-  && grep -q '^runtime_surface=adapter-owned-data-script$' /tmp/opencode_mode.out \
-  && grep -q '^fallback=satisfy-tool-contract-or-report-unavailable$' /tmp/opencode_mode.out; then
+if "$OPENCODE" mode-info material/data-script >"$TMP/logs/opencode_mode.out" 2>"$TMP/logs/opencode_mode.err" \
+  && grep -q '^status=tool-contract$' "$TMP/logs/opencode_mode.out" \
+  && grep -q '^realization=portable-with-tool-contract$' "$TMP/logs/opencode_mode.out" \
+  && grep -q '^tool_contract=data-script$' "$TMP/logs/opencode_mode.out" \
+  && grep -q '^tool_contract_check=adapters/opencode/bin/preflight.sh data-script --check <script.py>$' "$TMP/logs/opencode_mode.out" \
+  && grep -q '^runtime_surface=adapter-owned-data-script$' "$TMP/logs/opencode_mode.out" \
+  && grep -q '^fallback=satisfy-tool-contract-or-report-unavailable$' "$TMP/logs/opencode_mode.out"; then
   ok "opencode mode wrapper reports material data-script contract surface"
 else
   bad "opencode mode wrapper should report material data-script contract surface"
 fi
-if "$OPENCODE" mode-info material/figure-gen >/tmp/opencode_mode.out 2>/tmp/opencode_mode.err \
-  && grep -q '^status=tool-contract$' /tmp/opencode_mode.out \
-  && grep -q '^realization=portable-with-tool-contract$' /tmp/opencode_mode.out \
-  && grep -q '^tool_contract=figure-gen$' /tmp/opencode_mode.out \
-  && grep -q '^tool_contract_check=adapters/opencode/bin/preflight.sh figure-gen --check <script.py>$' /tmp/opencode_mode.out \
-  && grep -q '^runtime_surface=adapter-owned-figure-gen$' /tmp/opencode_mode.out \
-  && grep -q '^fallback=satisfy-tool-contract-or-report-unavailable$' /tmp/opencode_mode.out; then
+if "$OPENCODE" mode-info material/figure-gen >"$TMP/logs/opencode_mode.out" 2>"$TMP/logs/opencode_mode.err" \
+  && grep -q '^status=tool-contract$' "$TMP/logs/opencode_mode.out" \
+  && grep -q '^realization=portable-with-tool-contract$' "$TMP/logs/opencode_mode.out" \
+  && grep -q '^tool_contract=figure-gen$' "$TMP/logs/opencode_mode.out" \
+  && grep -q '^tool_contract_check=adapters/opencode/bin/preflight.sh figure-gen --check <script.py>$' "$TMP/logs/opencode_mode.out" \
+  && grep -q '^runtime_surface=adapter-owned-figure-gen$' "$TMP/logs/opencode_mode.out" \
+  && grep -q '^fallback=satisfy-tool-contract-or-report-unavailable$' "$TMP/logs/opencode_mode.out"; then
   ok "opencode mode wrapper reports material figure-gen contract surface"
 else
   bad "opencode mode wrapper should report material figure-gen contract surface"
 fi
-if "$OPENCODE" mode-info material/pdf-extract >/tmp/opencode_mode.out 2>/tmp/opencode_mode.err \
-  && grep -q '^status=tool-contract$' /tmp/opencode_mode.out \
-  && grep -q '^realization=portable-with-tool-contract$' /tmp/opencode_mode.out \
-  && grep -q '^tool_contract=pdf-extract$' /tmp/opencode_mode.out \
-  && grep -q '^tool_contract_check=adapters/opencode/bin/preflight.sh pdf-extract --check <file.pdf>$' /tmp/opencode_mode.out \
-  && grep -q '^runtime_surface=adapter-owned-pdf-extract$' /tmp/opencode_mode.out \
-  && grep -q '^fallback=satisfy-tool-contract-or-report-unavailable$' /tmp/opencode_mode.out; then
+if "$OPENCODE" mode-info material/pdf-extract >"$TMP/logs/opencode_mode.out" 2>"$TMP/logs/opencode_mode.err" \
+  && grep -q '^status=tool-contract$' "$TMP/logs/opencode_mode.out" \
+  && grep -q '^realization=portable-with-tool-contract$' "$TMP/logs/opencode_mode.out" \
+  && grep -q '^tool_contract=pdf-extract$' "$TMP/logs/opencode_mode.out" \
+  && grep -q '^tool_contract_check=adapters/opencode/bin/preflight.sh pdf-extract --check <file.pdf>$' "$TMP/logs/opencode_mode.out" \
+  && grep -q '^runtime_surface=adapter-owned-pdf-extract$' "$TMP/logs/opencode_mode.out" \
+  && grep -q '^fallback=satisfy-tool-contract-or-report-unavailable$' "$TMP/logs/opencode_mode.out"; then
   ok "opencode mode wrapper reports material pdf-extract contract surface"
 else
   bad "opencode mode wrapper should report material pdf-extract contract surface"
 fi
-if "$OPENCODE" mode-info qa/test >/tmp/opencode_mode.out 2>/tmp/opencode_mode.err \
-  && grep -q '^status=tool-contract$' /tmp/opencode_mode.out \
-  && grep -q '^realization=portable-with-tool-contract$' /tmp/opencode_mode.out \
-  && grep -q '^tool_contract=verification-runner$' /tmp/opencode_mode.out \
-  && grep -q '^tool_contract_check=adapters/opencode/bin/preflight.sh verification-runner --check -- <command>$' /tmp/opencode_mode.out \
-  && grep -q '^runtime_surface=adapter-owned-verification-runner$' /tmp/opencode_mode.out \
-  && grep -q '^fallback=satisfy-tool-contract-or-report-unavailable$' /tmp/opencode_mode.out; then
+if "$OPENCODE" mode-info qa/test >"$TMP/logs/opencode_mode.out" 2>"$TMP/logs/opencode_mode.err" \
+  && grep -q '^status=tool-contract$' "$TMP/logs/opencode_mode.out" \
+  && grep -q '^realization=portable-with-tool-contract$' "$TMP/logs/opencode_mode.out" \
+  && grep -q '^tool_contract=verification-runner$' "$TMP/logs/opencode_mode.out" \
+  && grep -q '^tool_contract_check=adapters/opencode/bin/preflight.sh verification-runner --check -- <command>$' "$TMP/logs/opencode_mode.out" \
+  && grep -q '^runtime_surface=adapter-owned-verification-runner$' "$TMP/logs/opencode_mode.out" \
+  && grep -q '^fallback=satisfy-tool-contract-or-report-unavailable$' "$TMP/logs/opencode_mode.out"; then
   ok "opencode mode wrapper reports qa test verification runner surface"
 else
   bad "opencode mode wrapper should report qa test verification runner surface"
 fi
-if "$OPENCODE" mode-info material/browser-fetch >/tmp/opencode_mode.out 2>/tmp/opencode_mode.err \
-  && grep -q '^status=tool-contract$' /tmp/opencode_mode.out \
-  && grep -q '^realization=portable-with-tool-contract$' /tmp/opencode_mode.out \
-  && grep -q '^tool_contract=browser-fetch$' /tmp/opencode_mode.out \
-  && grep -q '^tool_contract_check=adapters/opencode/bin/preflight.sh browser-fetch --check <url>$' /tmp/opencode_mode.out \
-  && grep -q '^runtime_surface=adapter-owned-browser-fetch$' /tmp/opencode_mode.out \
-  && grep -q '^fallback=satisfy-tool-contract-or-report-unavailable$' /tmp/opencode_mode.out; then
+if "$OPENCODE" mode-info material/browser-fetch >"$TMP/logs/opencode_mode.out" 2>"$TMP/logs/opencode_mode.err" \
+  && grep -q '^status=tool-contract$' "$TMP/logs/opencode_mode.out" \
+  && grep -q '^realization=portable-with-tool-contract$' "$TMP/logs/opencode_mode.out" \
+  && grep -q '^tool_contract=browser-fetch$' "$TMP/logs/opencode_mode.out" \
+  && grep -q '^tool_contract_check=adapters/opencode/bin/preflight.sh browser-fetch --check <url>$' "$TMP/logs/opencode_mode.out" \
+  && grep -q '^runtime_surface=adapter-owned-browser-fetch$' "$TMP/logs/opencode_mode.out" \
+  && grep -q '^fallback=satisfy-tool-contract-or-report-unavailable$' "$TMP/logs/opencode_mode.out"; then
   ok "opencode mode wrapper reports material browser-fetch contract surface"
 else
   bad "opencode mode wrapper should report material browser-fetch contract surface"
 fi
-if "$OPENCODE" mode-info material/web-image-search >/tmp/opencode_mode.out 2>/tmp/opencode_mode.err \
-  && grep -q '^status=tool-contract$' /tmp/opencode_mode.out \
-  && grep -q '^realization=portable-with-tool-contract$' /tmp/opencode_mode.out \
-  && grep -q '^tool_contract=web-image-search$' /tmp/opencode_mode.out \
-  && grep -q '^tool_contract_check=adapters/opencode/bin/preflight.sh web-image-search --check <query>$' /tmp/opencode_mode.out \
-  && grep -q '^runtime_surface=adapter-owned-web-image-search$' /tmp/opencode_mode.out \
-  && grep -q '^fallback=satisfy-tool-contract-or-report-unavailable$' /tmp/opencode_mode.out; then
+if "$OPENCODE" mode-info material/web-image-search >"$TMP/logs/opencode_mode.out" 2>"$TMP/logs/opencode_mode.err" \
+  && grep -q '^status=tool-contract$' "$TMP/logs/opencode_mode.out" \
+  && grep -q '^realization=portable-with-tool-contract$' "$TMP/logs/opencode_mode.out" \
+  && grep -q '^tool_contract=web-image-search$' "$TMP/logs/opencode_mode.out" \
+  && grep -q '^tool_contract_check=adapters/opencode/bin/preflight.sh web-image-search --check <query>$' "$TMP/logs/opencode_mode.out" \
+  && grep -q '^runtime_surface=adapter-owned-web-image-search$' "$TMP/logs/opencode_mode.out" \
+  && grep -q '^fallback=satisfy-tool-contract-or-report-unavailable$' "$TMP/logs/opencode_mode.out"; then
   ok "opencode mode wrapper reports material web-image-search contract surface"
 else
   bad "opencode mode wrapper should report material web-image-search contract surface"
 fi
-if "$OPENCODE" mode-info research/claim-verify >/tmp/opencode_mode.out 2>/tmp/opencode_mode.err \
-  && grep -q '^status=tool-contract$' /tmp/opencode_mode.out \
-  && grep -q '^tool_contract=external-claim-verification$' /tmp/opencode_mode.out \
-  && grep -q '^tool_contract_check=adapters/opencode/bin/preflight.sh claim-verify --check <claim>$' /tmp/opencode_mode.out \
-  && grep -q '^runtime_surface=adapter-owned-claim-verify$' /tmp/opencode_mode.out; then
+if "$OPENCODE" mode-info research/claim-verify >"$TMP/logs/opencode_mode.out" 2>"$TMP/logs/opencode_mode.err" \
+  && grep -q '^status=tool-contract$' "$TMP/logs/opencode_mode.out" \
+  && grep -q '^tool_contract=external-claim-verification$' "$TMP/logs/opencode_mode.out" \
+  && grep -q '^tool_contract_check=adapters/opencode/bin/preflight.sh claim-verify --check <claim>$' "$TMP/logs/opencode_mode.out" \
+  && grep -q '^runtime_surface=adapter-owned-claim-verify$' "$TMP/logs/opencode_mode.out"; then
   ok "opencode mode wrapper reports named claim verification contract"
 else
   bad "opencode mode wrapper should report named claim verification contract"
@@ -4905,10 +4913,10 @@ cat > "$TMP/opencode-export.json" <<'EOF'
   {"id":"ot1","type":"tool_call","name":"bash","time":"2026-06-29T00:00:02.000Z"}
 ]}
 EOF
-if OPENCODE_EXPORT_FILE="$TMP/opencode-export.json" "$OPENCODE" distill-delta opencodesid >/tmp/opencode_delta.out 2>/tmp/opencode_delta.err \
-  && grep -q '^\[user\] open hello' /tmp/opencode_delta.out \
-  && grep -q '^\[assistant\] open world' /tmp/opencode_delta.out \
-  && grep -q '^\[assistant\] \[tool:bash\]' /tmp/opencode_delta.out; then
+if OPENCODE_EXPORT_FILE="$TMP/opencode-export.json" "$OPENCODE" distill-delta opencodesid >"$TMP/logs/opencode_delta.out" 2>"$TMP/logs/opencode_delta.err" \
+  && grep -q '^\[user\] open hello' "$TMP/logs/opencode_delta.out" \
+  && grep -q '^\[assistant\] open world' "$TMP/logs/opencode_delta.out" \
+  && grep -q '^\[assistant\] \[tool:bash\]' "$TMP/logs/opencode_delta.out"; then
   ok "opencode export source distills transcript"
 else
   bad "opencode export source should distill transcript"
@@ -4916,20 +4924,20 @@ fi
 # distill worker: no-tools opencode-run worker is implemented (gap closed). The
 # deterministic guards below avoid a live model call.
 # (1) disabled by default for direct calls → no-op exit 0
-if "$OPENCODE_DISTILL" opencodesid "$TMP/flowproj" >/tmp/opencode_distill.out 2>/tmp/opencode_distill.err; then
+if "$OPENCODE_DISTILL" opencodesid "$TMP/flowproj" >"$TMP/logs/opencode_distill.out" 2>"$TMP/logs/opencode_distill.err"; then
   ok "opencode distill worker no-ops when OPENCODE_DISTILL_ENABLE unset"
 else
   bad "opencode distill worker should no-op (exit 0) when disabled"
 fi
 # (2) recursion guard: MEM_DISTILL=1 → no-op even when enabled
-if MEM_DISTILL=1 OPENCODE_DISTILL_ENABLE=1 "$OPENCODE_DISTILL" opencodesid "$TMP/flowproj" >/tmp/opencode_distill.out 2>/tmp/opencode_distill.err; then
+if MEM_DISTILL=1 OPENCODE_DISTILL_ENABLE=1 "$OPENCODE_DISTILL" opencodesid "$TMP/flowproj" >"$TMP/logs/opencode_distill.out" 2>"$TMP/logs/opencode_distill.err"; then
   ok "opencode distill worker recursion guard no-ops under MEM_DISTILL=1"
 else
   bad "opencode distill worker should no-op under MEM_DISTILL=1"
 fi
 # (3) enabled but opencode runtime unavailable → exit 69 (no hang, no model call)
 if HOME="$TMP/no-oc-home" OPENCODE_DISTILL_ENABLE=1 OPENCODE_BIN="$TMP/no-such-opencode" \
-   "$OPENCODE_DISTILL" opencodesid "$TMP/flowproj" >/tmp/opencode_distill.out 2>/tmp/opencode_distill.err; then
+   "$OPENCODE_DISTILL" opencodesid "$TMP/flowproj" >"$TMP/logs/opencode_distill.out" 2>"$TMP/logs/opencode_distill.err"; then
   bad "opencode distill worker should exit 69 when opencode runtime unavailable"
 else
   [ "$?" -eq 69 ] && ok "opencode distill worker exits 69 when opencode runtime unavailable" \
@@ -4958,12 +4966,12 @@ fi
 # session-end selects curate: preflight.sh session-end passes "curate" as the
 # distill-worker's third positional argument (:756); distill-propose stays
 # increment. Both are asserted against the source, not a live model call.
-if grep -q 'distill-worker.sh" "\$sid" "\$cwd" curate' adapters/opencode/bin/preflight.sh; then
+if grep -q 'distill-worker.sh" "\$sid" "\$cwd" curate' "$ROOT/adapters/opencode/bin/preflight.sh"; then
   ok "opencode preflight session-end selects curate mode"
 else
   bad "opencode preflight session-end should select curate mode"
 fi
-if awk '/distill-propose\)/{flag=1} flag{print} flag && /;;/{exit}' adapters/opencode/bin/preflight.sh \
+if awk '/distill-propose\)/{flag=1} flag{print} flag && /;;/{exit}' "$ROOT/adapters/opencode/bin/preflight.sh" \
   | grep -q 'distill-worker.sh" "\$sid" "\$cwd"$'; then
   ok "opencode preflight distill-propose stays default increment"
 else
@@ -4992,7 +5000,7 @@ OC_CAPTURE_CURATE="$TMP/opencode-curate-capture.txt"
 OC_STORE_CURATE="$TMP/oc-store-curate"
 if OPENCODE_EXPORT_FILE="$TMP/opencode-export.json" OPENCODE_DISTILL_ENABLE=1 OPENCODE_BIN="$OC_STUB/opencode" \
    OPENCODE_STUB_CAPTURE="$OC_CAPTURE_CURATE" MEM_STORE="$OC_STORE_CURATE" \
-   "$OPENCODE_DISTILL" oc-curate-sid "$TMP/flowproj" curate >/tmp/opencode_curate.out 2>/tmp/opencode_curate.err \
+   "$OPENCODE_DISTILL" oc-curate-sid "$TMP/flowproj" curate >"$TMP/logs/opencode_curate.out" 2>"$TMP/logs/opencode_curate.err" \
    && grep -q 'no-tools session memory curator' "$OC_CAPTURE_CURATE"; then
   ok "opencode distill worker curate mode builds the curator prompt"
 else
@@ -5002,7 +5010,7 @@ OC_CAPTURE_INCREMENT="$TMP/opencode-increment-capture.txt"
 OC_STORE_INCREMENT="$TMP/oc-store-increment"
 if OPENCODE_EXPORT_FILE="$TMP/opencode-export.json" OPENCODE_DISTILL_ENABLE=1 OPENCODE_BIN="$OC_STUB/opencode" \
    OPENCODE_STUB_CAPTURE="$OC_CAPTURE_INCREMENT" MEM_STORE="$OC_STORE_INCREMENT" \
-   "$OPENCODE_DISTILL" oc-increment-sid "$TMP/flowproj" >/tmp/opencode_increment_mode.out 2>/tmp/opencode_increment_mode.err \
+   "$OPENCODE_DISTILL" oc-increment-sid "$TMP/flowproj" >"$TMP/logs/opencode_increment_mode.out" 2>"$TMP/logs/opencode_increment_mode.err" \
    && grep -q 'You are a memory distillation worker' "$OC_CAPTURE_INCREMENT" \
    && ! grep -q 'no-tools session memory curator' "$OC_CAPTURE_INCREMENT"; then
   ok "opencode distill worker defaults to increment mode and builds the increment prompt"
@@ -5012,8 +5020,8 @@ fi
 OC_STORE_LOCK="$TMP/oc-store-lock"
 mkdir -p "$OC_STORE_LOCK/.opencode-distill-lock-oc-locksid"
 if OPENCODE_EXPORT_FILE="$TMP/opencode-export.json" OPENCODE_DISTILL_ENABLE=1 OPENCODE_BIN="$OC_STUB/opencode" MEM_STORE="$OC_STORE_LOCK" \
-   "$OPENCODE_DISTILL" oc-locksid "$TMP/flowproj" increment >/tmp/opencode_lock.out 2>/tmp/opencode_lock.err \
-   && grep -q 'another distill in progress' /tmp/opencode_lock.err; then
+   "$OPENCODE_DISTILL" oc-locksid "$TMP/flowproj" increment >"$TMP/logs/opencode_lock.out" 2>"$TMP/logs/opencode_lock.err" \
+   && grep -q 'another distill in progress' "$TMP/logs/opencode_lock.err"; then
   ok "opencode distill worker skips when the same-sid lock is already held"
 else
   bad "opencode distill worker should skip when the same-sid lock is already held"
@@ -5022,30 +5030,30 @@ rmdir "$OC_STORE_LOCK/.opencode-distill-lock-oc-locksid" 2>/dev/null || true
 
 OC_STORE_ADV="$TMP/oc-store-adv"
 if OPENCODE_EXPORT_FILE="$TMP/opencode-export.json" OPENCODE_DISTILL_ENABLE=1 OPENCODE_DISTILL_APPLY=1 OPENCODE_BIN="$OC_STUB/opencode" MEM_STORE="$OC_STORE_ADV" \
-   "$OPENCODE_DISTILL" oc-adv-sid "$TMP/flowproj" increment >/tmp/opencode_adv.out 2>/tmp/opencode_adv.err \
+   "$OPENCODE_DISTILL" oc-adv-sid "$TMP/flowproj" increment >"$TMP/logs/opencode_adv.out" 2>"$TMP/logs/opencode_adv.err" \
    && AGENT_HOME="$ROOT" MEM_STORE="$OC_STORE_ADV" OPENCODE_EXPORT_FILE="$TMP/opencode-export.json" \
-      python3 "$ROOT/tools/memory/mem.py" distill oc-adv-sid --source opencode >/tmp/opencode_adv_check.out 2>/tmp/opencode_adv_check.err \
-   && [ ! -s /tmp/opencode_adv_check.out ]; then
+      python3 "$ROOT/tools/memory/mem.py" distill oc-adv-sid --source opencode >"$TMP/logs/opencode_adv_check.out" 2>"$TMP/logs/opencode_adv_check.err" \
+   && [ ! -s "$TMP/logs/opencode_adv_check.out" ]; then
   ok "opencode distill worker advances the marker after a successful exec in apply mode"
 else
   bad "opencode distill worker should advance the marker after a successful exec in apply mode"
 fi
 OC_STORE_NOADV="$TMP/oc-store-noadv"
 OPENCODE_EXPORT_FILE="$TMP/opencode-export.json" OPENCODE_DISTILL_ENABLE=1 OPENCODE_DISTILL_APPLY=1 OPENCODE_BIN="$OC_STUB_FAIL/opencode" OPENCODE_DISTILL_TIMEOUT=5 MEM_STORE="$OC_STORE_NOADV" \
-  "$OPENCODE_DISTILL" oc-noadv-sid "$TMP/flowproj" increment >/tmp/opencode_noadv.out 2>/tmp/opencode_noadv.err
+  "$OPENCODE_DISTILL" oc-noadv-sid "$TMP/flowproj" increment >"$TMP/logs/opencode_noadv.out" 2>"$TMP/logs/opencode_noadv.err"
 if AGENT_HOME="$ROOT" MEM_STORE="$OC_STORE_NOADV" OPENCODE_EXPORT_FILE="$TMP/opencode-export.json" \
-   python3 "$ROOT/tools/memory/mem.py" distill oc-noadv-sid --source opencode >/tmp/opencode_noadv_check.out 2>/tmp/opencode_noadv_check.err \
-   && [ -s /tmp/opencode_noadv_check.out ]; then
+   python3 "$ROOT/tools/memory/mem.py" distill oc-noadv-sid --source opencode >"$TMP/logs/opencode_noadv_check.out" 2>"$TMP/logs/opencode_noadv_check.err" \
+   && [ -s "$TMP/logs/opencode_noadv_check.out" ]; then
   ok "opencode distill worker does not advance the marker on a failed exec"
 else
   bad "opencode distill worker should not advance the marker on a failed exec"
 fi
 OC_STORE_PREVIEW="$TMP/oc-store-preview"
 OPENCODE_EXPORT_FILE="$TMP/opencode-export.json" OPENCODE_DISTILL_ENABLE=1 OPENCODE_BIN="$OC_STUB/opencode" MEM_STORE="$OC_STORE_PREVIEW" \
-  "$OPENCODE_DISTILL" oc-preview-sid "$TMP/flowproj" increment >/tmp/opencode_preview.out 2>/tmp/opencode_preview.err
+  "$OPENCODE_DISTILL" oc-preview-sid "$TMP/flowproj" increment >"$TMP/logs/opencode_preview.out" 2>"$TMP/logs/opencode_preview.err"
 if AGENT_HOME="$ROOT" MEM_STORE="$OC_STORE_PREVIEW" OPENCODE_EXPORT_FILE="$TMP/opencode-export.json" \
-   python3 "$ROOT/tools/memory/mem.py" distill oc-preview-sid --source opencode >/tmp/opencode_preview_check.out 2>/tmp/opencode_preview_check.err \
-   && [ -s /tmp/opencode_preview_check.out ]; then
+   python3 "$ROOT/tools/memory/mem.py" distill oc-preview-sid --source opencode >"$TMP/logs/opencode_preview_check.out" 2>"$TMP/logs/opencode_preview_check.err" \
+   && [ -s "$TMP/logs/opencode_preview_check.out" ]; then
   ok "opencode distill worker does not advance the marker on a preview-only (non-apply) run"
 else
   bad "opencode distill worker should not advance the marker on a preview-only run"
@@ -5302,25 +5310,30 @@ dispatch_scan_prod=$(cd "$ROOT" && rg -n --glob '!**/*test*' --glob '!**/tests/*
 #    an explicit home-relative candidate before calling the resolver) and
 #    _jobs_path's except-fallback (used only when the resolver itself cannot
 #    resolve a stable root in a minimal/packaged environment).
+#  - read-only candidate-release inventory: distribution.py checks legacy
+#    registry references and reads forced-prune timestamp bounds (2901); its
+#    gap ledger writes go through stable_state_root, never candidate jobs.log.
+#    migration-manifest.py reads inventory metadata, not active authority.
 #  - non-executing description strings: docstrings/comments/help text/docs.
 dispatch_scan_allowed='
-tools/install/distribution.py:1856:
-tools/install/distribution.py:1859:
-tools/install/distribution.py:1863:
-tools/install/distribution.py:1868:
+tools/install/distribution.py:2265:
+tools/install/distribution.py:2268:
+tools/install/distribution.py:2272:
+tools/install/distribution.py:2277:
+tools/install/distribution.py:2901:
 tools/migration-manifest.py:229:
 tools/migration-manifest.py:236:
 tools/fleet/collectors/dispatch.py:8:
-tools/fleet/collectors/dispatch.py:487:
-tools/fleet/collectors/dispatch.py:930:
-tools/fleet/collectors/dispatch.py:952:
-tools/fleet/collectors/dispatch.py:966:
-tools/fleet/collectors/dispatch.py:1013:
+tools/fleet/collectors/dispatch.py:488:
+tools/fleet/collectors/dispatch.py:931:
+tools/fleet/collectors/dispatch.py:953:
+tools/fleet/collectors/dispatch.py:967:
+tools/fleet/collectors/dispatch.py:1014:
 tools/fleet/collectors/__init__.py:196:
 tools/render-landing.py:860:
 adapters/codex/AGENTS.md:83:
-adapters/codex/bin/preflight.sh:681:
-adapters/opencode/bin/preflight.sh:460:
+adapters/codex/bin/preflight.sh:734:
+adapters/opencode/bin/preflight.sh:466:
 adapters/claude/skills/autopilot-code/references/dev-pipeline.md:91:
 adapters/claude/plugin-marketplace/plugins/hearting-claude/skills/autopilot-code/references/dev-pipeline.md:91:
 '
@@ -5359,9 +5372,10 @@ done
 # --- A50-1: core/OPERATIONS.md §5.14 realizes the six SD-122 steps, the kind
 # vocabulary, the ledger schema, the realization table, and the probe-first rule.
 sec5_14=$(python3 -c "
+import re
 t = open('$ROOT/core/OPERATIONS.md', encoding='utf-8').read()
-i = t.find('### §5.14')
-print(t[i:i+4000] if i >= 0 else '')
+m = re.search(r'(?ms)^### §5\.14\b.*?(?=^#{1,3} |\Z)', t)
+print(m.group(0) if m else '')
 ")
 if [ -z "$sec5_14" ]; then
   bad "core/OPERATIONS.md is missing ### §5.14 (SD-122 peer-session steering)"
@@ -5398,7 +5412,7 @@ else
   for kind in watch steer handoff gate-relay notice; do
     printf '%s' "$sec5_14" | grep -q "$kind" || s_missing="$s_missing $kind"
   done
-  if printf '%s' "$sec5_14" | grep -q '| Runtime | Realization |'; then
+  if printf '%s' "$sec5_14" | grep -Fq '| Runtime | Watched side (wait target) | Steward side (wake) |'; then
     ok "§5.14 carries the per-adapter realization table"
   else
     bad "§5.14 is missing the per-adapter realization table"
@@ -5408,25 +5422,28 @@ else
   else
     bad "§5.14 is missing the probe receipt path"
   fi
-  p_missing=""
-  for tok in "P-1" "P-2" "P-3" "P-4" "P-5"; do
-    printf '%s' "$sec5_14" | grep -qF "$tok" || p_missing="$p_missing $tok"
-  done
-  if [ -z "$p_missing" ]; then
-    ok "§5.14 names probes P-1 through P-5"
+  if printf '%s' "$sec5_14" | grep -Fq 'Probe P-1 through P-5' \
+    && printf '%s' "$sec5_14" | grep -Fq 'closed-by-decision' \
+    && printf '%s' "$sec5_14" | grep -Fq 'P-6' \
+    && printf '%s' "$sec5_14" | grep -Fq 'P-7'; then
+    ok "§5.14 closes P-1 through P-5 by decision and retains P-6/P-7"
   else
-    bad "§5.14 is missing probe reference(s):$p_missing"
+    bad "§5.14 is missing retired or remaining probe status"
   fi
-  if printf '%s' "$sec5_14" | grep -q 'Codex | .unknown.' \
-       && printf '%s' "$sec5_14" | grep -q 'OpenCode | .unknown.'; then
-    ok "§5.14 Codex/OpenCode rows are unknown"
+  codex_wake=$(printf '%s' "$sec5_14" | awk -F'|' '$2 ~ /^ *Codex *$/ {print $4}')
+  opencode_wake=$(printf '%s' "$sec5_14" | awk -F'|' '$2 ~ /^ *OpenCode *$/ {print $4}')
+  if printf '%s' "$codex_wake" | grep -q 'unknown' \
+    && printf '%s' "$codex_wake" | grep -q 'no wake carrier' \
+    && printf '%s' "$codex_wake" | grep -q 'P-7' \
+    && printf '%s' "$opencode_wake" | grep -q 'unknown'; then
+    ok "§5.14 Codex/OpenCode steward wake remains unknown"
   else
-    bad "§5.14 Codex/OpenCode rows should read unknown pending probe"
+    bad "§5.14 Codex/OpenCode wake cells should retain their unverified status"
   fi
-  if printf '%s' "$sec5_14" | grep -A2 'Codex |' | grep -qi 'supported'; then
-    bad "§5.14 Codex row asserts a capability ('supported') ahead of its probe (A50-6)"
+  if printf '%s\n%s' "$codex_wake" "$opencode_wake" | grep -qi 'supported'; then
+    bad "§5.14 steward wake asserts support ahead of its probe (A50-6)"
   else
-    ok "§5.14 Codex row makes no premature capability claim"
+    ok "§5.14 steward wake makes no premature capability claim"
   fi
 fi
 for f in core/WORKFLOW.md core/CONVENTIONS.md core/ADAPTATION.md; do
@@ -5477,82 +5494,82 @@ msc_env() {
 # Codex turn-nudge: conflict exits 0 (fail-open lifecycle hook), no state file.
 rm -rf "$MSC_HOME/hearting/.codex-turn-state-msc-conflict"
 if msc_env "$CODEX" turn-nudge "$TMP/flowproj" msc-conflict-sid \
-    >/tmp/codex_tn_conflict.out 2>/tmp/codex_tn_conflict.err; then
+    >"$TMP/logs/codex_tn_conflict.out" 2>"$TMP/logs/codex_tn_conflict.err"; then
   codex_tn_conflict_rc=0
 else
   codex_tn_conflict_rc=$?
 fi
 if [ "$codex_tn_conflict_rc" -eq 0 ] \
-  && [ ! -s /tmp/codex_tn_conflict.out ] \
-  && grep -q 'memory store resolution error' /tmp/codex_tn_conflict.err \
+  && [ ! -s "$TMP/logs/codex_tn_conflict.out" ] \
+  && grep -q 'memory store resolution error' "$TMP/logs/codex_tn_conflict.err" \
   && [ ! -e "$MSC_HOME/.claude/memory/.codex-turn-state-msc-conflict-sid" ] \
   && [ ! -e "$MSC_HOME/hearting/memory/.codex-turn-state-msc-conflict-sid" ]; then
   ok "codex turn-nudge leaves no counter on a store conflict"
 else
-  bad "codex turn-nudge conflict handling: rc=$codex_tn_conflict_rc out=$(cat /tmp/codex_tn_conflict.out) err=$(cat /tmp/codex_tn_conflict.err)"
+  bad "codex turn-nudge conflict handling: rc=$codex_tn_conflict_rc out=$(cat "$TMP/logs/codex_tn_conflict.out") err=$(cat "$TMP/logs/codex_tn_conflict.err")"
 fi
 
 # OpenCode session-end: conflict exits 0, no debounce stamp.
 if msc_env "$OPENCODE" session-end "$TMP/flowproj" msc-conflict-sid \
-    >/tmp/opencode_se_conflict.out 2>/tmp/opencode_se_conflict.err; then
+    >"$TMP/logs/opencode_se_conflict.out" 2>"$TMP/logs/opencode_se_conflict.err"; then
   opencode_se_conflict_rc=0
 else
   opencode_se_conflict_rc=$?
 fi
 if [ "$opencode_se_conflict_rc" -eq 0 ] \
-  && [ ! -s /tmp/opencode_se_conflict.out ] \
-  && grep -q 'memory store resolution error' /tmp/opencode_se_conflict.err \
+  && [ ! -s "$TMP/logs/opencode_se_conflict.out" ] \
+  && grep -q 'memory store resolution error' "$TMP/logs/opencode_se_conflict.err" \
   && [ ! -e "$MSC_HOME/.claude/memory/.opencode-distill-stamp-msc-conflict-sid" ] \
   && [ ! -e "$MSC_HOME/hearting/memory/.opencode-distill-stamp-msc-conflict-sid" ]; then
   ok "opencode session-end leaves no debounce stamp on a store conflict"
 else
-  bad "opencode session-end conflict handling: rc=$opencode_se_conflict_rc out=$(cat /tmp/opencode_se_conflict.out) err=$(cat /tmp/opencode_se_conflict.err)"
+  bad "opencode session-end conflict handling: rc=$opencode_se_conflict_rc out=$(cat "$TMP/logs/opencode_se_conflict.out") err=$(cat "$TMP/logs/opencode_se_conflict.err")"
 fi
 
 # Codex distill-worker: conflict exits 69 before delta/lock/model work.
 if msc_env env CODEX_DISTILL_ENABLE=1 CODEX_DISTILL_CONTRACT_ACCEPTED=1 \
     PATH="$TMP/stubbin:$PATH" CODEX_STUB_ARGV="$TMP/codex_argv_msc_conflict" \
     "$CODEX_DISTILL" msc-conflict-sid "$TMP/flowproj" increment \
-    >/tmp/codex_distill_conflict.out 2>/tmp/codex_distill_conflict.err; then
+    >"$TMP/logs/codex_distill_conflict.out" 2>"$TMP/logs/codex_distill_conflict.err"; then
   codex_distill_conflict_rc=0
 else
   codex_distill_conflict_rc=$?
 fi
 if [ "$codex_distill_conflict_rc" -eq 69 ] \
-  && [ ! -s /tmp/codex_distill_conflict.out ] \
-  && grep -q 'memory store resolution error' /tmp/codex_distill_conflict.err \
+  && [ ! -s "$TMP/logs/codex_distill_conflict.out" ] \
+  && grep -q 'memory store resolution error' "$TMP/logs/codex_distill_conflict.err" \
   && [ ! -e "$TMP/codex_argv_msc_conflict" ] \
   && [ ! -e "$MSC_HOME/.claude/memory/.codex-distill-lock-msc-conflict-sid" ] \
   && [ ! -e "$MSC_HOME/hearting/memory/.codex-distill-lock-msc-conflict-sid" ]; then
   ok "codex distill-worker exits 69 before delta/lock/model work on a store conflict"
 else
-  bad "codex distill-worker conflict handling: rc=$codex_distill_conflict_rc out=$(cat /tmp/codex_distill_conflict.out) err=$(cat /tmp/codex_distill_conflict.err)"
+  bad "codex distill-worker conflict handling: rc=$codex_distill_conflict_rc out=$(cat "$TMP/logs/codex_distill_conflict.out") err=$(cat "$TMP/logs/codex_distill_conflict.err")"
 fi
 
 # OpenCode distill-worker: conflict exits 69 before delta/lock/model work.
 if msc_env env OPENCODE_DISTILL_ENABLE=1 OPENCODE_BIN="$TMP/opencode-stubbin/opencode" \
     "$OPENCODE_DISTILL" msc-conflict-sid "$TMP/flowproj" curate \
-    >/tmp/opencode_distill_conflict.out 2>/tmp/opencode_distill_conflict.err; then
+    >"$TMP/logs/opencode_distill_conflict.out" 2>"$TMP/logs/opencode_distill_conflict.err"; then
   opencode_distill_conflict_rc=0
 else
   opencode_distill_conflict_rc=$?
 fi
 if [ "$opencode_distill_conflict_rc" -eq 69 ] \
-  && [ ! -s /tmp/opencode_distill_conflict.out ] \
-  && grep -q 'memory store resolution error' /tmp/opencode_distill_conflict.err \
+  && [ ! -s "$TMP/logs/opencode_distill_conflict.out" ] \
+  && grep -q 'memory store resolution error' "$TMP/logs/opencode_distill_conflict.err" \
   && [ ! -e "$MSC_HOME/.claude/memory/.opencode-distill-lock-msc-conflict-sid" ] \
   && [ ! -e "$MSC_HOME/hearting/memory/.opencode-distill-lock-msc-conflict-sid" ]; then
   ok "opencode distill-worker exits 69 before delta/lock/model work on a store conflict"
 else
-  bad "opencode distill-worker conflict handling: rc=$opencode_distill_conflict_rc out=$(cat /tmp/opencode_distill_conflict.out) err=$(cat /tmp/opencode_distill_conflict.err)"
+  bad "opencode distill-worker conflict handling: rc=$opencode_distill_conflict_rc out=$(cat "$TMP/logs/opencode_distill_conflict.out") err=$(cat "$TMP/logs/opencode_distill_conflict.err")"
 fi
 
 # D-42 still returns before resolution: a worker-role turn-nudge no-ops even
 # under a conflicting store, proving the D-42 gate is checked first.
 if AGENT_SESSION_ROLE=worker msc_env "$CODEX" turn-nudge "$TMP/flowproj" msc-conflict-sid \
-    >/tmp/codex_tn_worker_conflict.out 2>/tmp/codex_tn_worker_conflict.err \
-  && [ ! -s /tmp/codex_tn_worker_conflict.out ] \
-  && [ ! -s /tmp/codex_tn_worker_conflict.err ]; then
+    >"$TMP/logs/codex_tn_worker_conflict.out" 2>"$TMP/logs/codex_tn_worker_conflict.err" \
+  && [ ! -s "$TMP/logs/codex_tn_worker_conflict.out" ] \
+  && [ ! -s "$TMP/logs/codex_tn_worker_conflict.err" ]; then
   ok "codex turn-nudge D-42 worker gate returns before store resolution"
 else
   bad "codex turn-nudge D-42 gate must precede store resolution"
@@ -5562,7 +5579,7 @@ fi
 # elsewhere on the same host (R0 short-circuits before the candidate scan).
 if msc_env env MEM_STORE="$TMP/msc_explicit_store" \
     "$CODEX" turn-nudge "$TMP/flowproj" msc-explicit-sid \
-    >/tmp/codex_tn_explicit.out 2>/tmp/codex_tn_explicit.err \
+    >"$TMP/logs/codex_tn_explicit.out" 2>"$TMP/logs/codex_tn_explicit.err" \
   && [ -e "$TMP/msc_explicit_store/.codex-turn-state-msc-explicit-sid" ]; then
   ok "codex turn-nudge explicit MEM_STORE unaffected by an unrelated conflict"
 else
