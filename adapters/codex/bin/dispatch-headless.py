@@ -1039,6 +1039,23 @@ def _spec_grounding_dir(args: argparse.Namespace) -> Path:
     return Path(args.agent_home) / ".spec-grounding"
 
 
+def spec_read_marker_required(args: argparse.Namespace) -> bool:
+    """The portable worker kernel requires a witnessed governing-PRD read
+    before spec-backed output, including workers without a route binding.
+    Registration carries that obligation; a review persona or network grant
+    does not. Preserve legacy route/owner grants and expose only the marker
+    directory for newly covered registered workers, never agent home.
+    """
+    return bool(
+        getattr(args, "route_id", None)
+        or getattr(args, "nested_headless_network", False)
+        or (
+            getattr(args, "execution_surface", None) == "registered-headless"
+            and getattr(args, "registered_worker", 0) == 1
+        )
+    )
+
+
 def _core_grounding_dir(args: argparse.Namespace) -> Path:
     return Path(args.agent_home) / ".core-grounding"
 
@@ -1151,10 +1168,11 @@ def ensure_owner_writable_dirs(args: argparse.Namespace) -> None:
     to_create = list(progress_writable_dirs(args))
     if getattr(args, "nested_headless_network", False):
         to_create.append(owner_root())
+    if spec_read_marker_required(args):
+        to_create.append(_spec_grounding_dir(args))
     if getattr(args, "route_id", None) or getattr(
         args, "nested_headless_network", False
     ):
-        to_create.append(_spec_grounding_dir(args))
         to_create.append(_core_grounding_dir(args))
     for path in to_create:
         try:
@@ -1313,7 +1331,7 @@ def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -
                 command += ["--writable-root", str(progress_dir)]
         for writable_dir in nested_owner_writable_dirs(args):
             command += ["--writable-root", str(writable_dir)]
-        if args.route_id or args.nested_headless_network:
+        if spec_read_marker_required(args):
             command += ["--writable-root", str(_spec_grounding_dir(args))]
         for writable_dir in route_bound_worker_writable_dirs(args):
             command += ["--writable-root", str(writable_dir)]
@@ -1366,11 +1384,8 @@ def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -
         # Core read markers and Claude's Bash pre-exec snapshot are the only
         # home-scoped writes needed by a recursive standard+ Codex owner.
         cmd += ["--add-dir", str(writable_dir)]
-    if args.route_id or args.nested_headless_network:
-        # SD-69: a route-bound worker needs the exact primary spec-grounding
-        # marker directory writable (and SD-72 grants a standard+ owner the
-        # same directory unconditionally, route or not — review F-3).
-        # Intentionally narrow — never all of agent home.
+    if spec_read_marker_required(args):
+        # The same read obligation and exact grant as the supervisor builder.
         cmd += ["--add-dir", str(_spec_grounding_dir(args))]
     for writable_dir in route_bound_worker_writable_dirs(args):
         # SD-72: an ordinary route-bound depth-2 worker also runs the portable
@@ -2512,7 +2527,7 @@ def main(argv: list[str]) -> int:
             linked_worktree_git_writable_dirs(args),
             (
                 (_spec_grounding_dir(args),)
-                if args.route_id or args.nested_headless_network
+                if spec_read_marker_required(args)
                 else ()
             ),
             (
