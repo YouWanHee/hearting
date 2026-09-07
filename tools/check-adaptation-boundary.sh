@@ -2003,7 +2003,12 @@ check_codex_native_hook_projection() {
     fail_msg "Codex apply_patch matcher/payload projection and material-route bridge must remain explicit"
   fi
   if ! grep -Fq 'material-route' adapters/codex/bin/preflight.sh \
-    || ! grep -Fq '"$0" material-route check --tool Write --file "$file" --cwd "$(dirname "$file")" --session "$sid"' adapters/codex/bin/preflight.sh \
+    || ! grep -Fq 'material_tool=Write' adapters/codex/bin/preflight.sh \
+    || ! grep -Fq '[ -n "${AGENT_REVIEW_OUTPUT:-}" ] && material_tool=ArtifactWrite' adapters/codex/bin/preflight.sh \
+    || ! grep -Fq '"$0" material-route check --tool "$material_tool" --file "$file" --cwd "$(dirname "$file")" --session "$sid"' adapters/codex/bin/preflight.sh \
+    || ! grep -Fq 'material_tool=Write' adapters/opencode/bin/preflight.sh \
+    || ! grep -Fq '[ -n "${AGENT_REVIEW_OUTPUT:-}" ] && material_tool=ArtifactWrite' adapters/opencode/bin/preflight.sh \
+    || ! grep -Fq '"$0" material-route check --tool "$material_tool" --file "$file" --cwd "$(dirname "$file")" --session "$sid"' adapters/opencode/bin/preflight.sh \
     || ! grep -Fq 'material-route", "check", "--tool", "Bash"' "$pre_bridge" \
     || ! grep -Fq 'material-route", "bind", "--route"' "$read_bridge" \
     || grep -Fq 'AGENT_PARENT_PARK_ONLY' "$pre_bridge" \

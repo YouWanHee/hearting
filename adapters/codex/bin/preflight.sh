@@ -344,8 +344,14 @@ case "$cmd" in
     esac
     ;;
   write)
-    [ "$#" -ge 2 ] || { echo "codex preflight: write requires a file path" >&2; exit 64; }
+    if [ "${2:-}" = "-h" ] || [ "${2:-}" = "--help" ]; then
+      [ "$#" -eq 2 ] || { echo "codex preflight: write help accepts no extra arguments" >&2; exit 64; }
+      printf '%s\n' 'usage: preflight.sh write <file> [session-id] [turn-id]'
+      exit 0
+    fi
+    [ "$#" -ge 2 ] && [ "$#" -le 4 ] || { echo "codex preflight: write expects <file> [session-id] [turn-id]" >&2; exit 64; }
     file=$2
+    case "$file" in -*) echo "codex preflight: write file must be absolute or ./-prefixed" >&2; exit 64;; esac
     sid=${3:-${AGENT_DISPATCH_ATTEMPT_ID:-codex}}
     guard_identity_hard_fail_if_worker "$sid"
     turn=${4:-}
@@ -398,10 +404,12 @@ case "$cmd" in
              esac ;;
         esac ;;
     esac
+    material_tool=Write
+    [ -n "${AGENT_REVIEW_OUTPUT:-}" ] && material_tool=ArtifactWrite
     if [ -n "$turn" ]; then
-      "$0" material-route check --tool Write --file "$file" --cwd "$(dirname "$file")" --session "$sid" --turn "$turn"
+      "$0" material-route check --tool "$material_tool" --file "$file" --cwd "$(dirname "$file")" --session "$sid" --turn "$turn"
     else
-      "$0" material-route check --tool Write --file "$file" --cwd "$(dirname "$file")" --session "$sid"
+      "$0" material-route check --tool "$material_tool" --file "$file" --cwd "$(dirname "$file")" --session "$sid"
     fi
     ;;
   read)

@@ -109,7 +109,13 @@ class DispatchOwnerTests(unittest.TestCase):
             "--model-profile", model_profile, "--jobs", str(self.jobs), "--log-dir", str(log_dir),
             *extra,
         ]
-        env = os.environ.copy()
+        env = {
+            key: value for key, value in os.environ.items()
+            if not key.startswith("AGENT_DISPATCH_")
+            and not key.startswith("AGENT_OWNER_ROUTE_")
+            and not key.startswith("AGENT_ROUTE_")
+            and not key.startswith("AGENT_ARTIFACT_")
+        }
         env.update({
             "AGENT_HOME": str(self.home / "agent-home"),
             "HOME": str(self.home),

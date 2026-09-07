@@ -51,11 +51,27 @@ class AdapterV11Test(unittest.TestCase):
      self.assertIn("child_spawned=0",output)
      self.assertFalse(jobs.exists(),output)
 
- def setUp(self): self.parent_procs=[]
+ def setUp(self):
+  self.parent_procs=[]
+  self.ambient_worker_env={
+   key:value for key,value in os.environ.items()
+   if key.startswith("AGENT_DISPATCH_")
+   or key.startswith("AGENT_OWNER_ROUTE_")
+   or key.startswith("AGENT_ROUTE_")
+   or key.startswith("AGENT_ARTIFACT_")
+   or key in {"AGENT_MODEL_GOVERNOR_ROOT", "AGENT_MODEL_GOVERNOR_RESERVATION_TOKEN"}
+  }
+  for key in self.ambient_worker_env: os.environ.pop(key,None)
  def tearDown(self):
   for proc in self.parent_procs:
    if proc.poll() is None: proc.kill()
    proc.wait()
+  for key in list(os.environ):
+   if (key.startswith("AGENT_DISPATCH_") or key.startswith("AGENT_OWNER_ROUTE_")
+       or key.startswith("AGENT_ROUTE_") or key.startswith("AGENT_ARTIFACT_")
+       or key in {"AGENT_MODEL_GOVERNOR_ROOT", "AGENT_MODEL_GOVERNOR_RESERVATION_TOKEN"}):
+    os.environ.pop(key,None)
+  os.environ.update(self.ambient_worker_env)
  def seed_parent(self,jobs,repo,attempt="att-parent-fixture",harness="codex",sandbox="fixture"):
   proc=subprocess.Popen(["sleep","60"]);self.parent_procs.append(proc)
   start=(Path("/proc")/str(proc.pid)/"stat").read_text().split()[21]

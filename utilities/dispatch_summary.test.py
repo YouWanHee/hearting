@@ -6,6 +6,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import warnings
 from unittest import mock
@@ -14,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / "utilities"), str(ROOT / "tools")]
 
 import dispatch_summary as S  # noqa: E402
+import dispatch_contract as D  # noqa: E402
 from fleet import titles  # noqa: E402
 
 warnings.filterwarnings("ignore", category=ResourceWarning)
@@ -389,10 +391,58 @@ class DispatchSummaryTest(unittest.TestCase):
         for harness in ("claude", "codex", "opencode"):
             source = (ROOT / "adapters" / harness / "bin" / "dispatch-headless.py").read_text()
             self.assertIn("from dispatch_summary import launch_summary_owner", source)
-            self.assertIn("pre_release=lambda identity: launch_summary_owner", source)
+            self.assertIn("pre_release=lambda identity: attach_summary_owner", source)
             self.assertIn(f'harness="{harness}"', source)
         opencode = (ROOT / "adapters" / "opencode" / "bin" / "dispatch-headless.py").read_text()
         self.assertIn("args.command_attempt_id = args.attempt_id", opencode)
+
+    def test_review_flock_spans_exact_target_lifetime_across_processes(self):
+        attempt = "att-review-governed"
+        cycle = "cyc-review-governed"
+        nonce = "b" * 64
+        root = Path(self.tmp.name) / ".agent_reports"
+        root.mkdir()
+        log = Path(self.tmp.name) / f"review.{attempt}.codex.jsonl"
+        log.write_text("", encoding="utf-8")
+        target = subprocess.Popen(["sleep", "0.5"], start_new_session=True)
+        owner_pid = None
+        try:
+            start = S.process_observation(target.pid)[1]
+            receipt = S.launch_summary_owner(
+                attempt_id=attempt, harness="codex", transcript=log,
+                target_pid=target.pid, target_start=start,
+                review_artifact_root=root, review_cycle_id=cycle,
+                review_lease_nonce=nonce,
+            )
+            owner_pid = int(receipt["summary_owner_pid"])
+            metadata = {
+                "attempt_id": attempt, "review_cycle_id": cycle,
+                "review_governed_lease": D.REVIEW_GOVERNED_LEASE_KIND,
+                "review_governed_lease_nonce": nonce,
+            }
+            self.assertTrue(D.review_governed_lease_is_held(root, metadata))
+            target.wait(timeout=5)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if not D.review_governed_lease_is_held(root, metadata):
+                    break
+                time.sleep(0.05)
+            self.assertFalse(D.review_governed_lease_is_held(root, metadata))
+            os.waitpid(owner_pid, 0)
+            owner_pid = None
+        finally:
+            if target.poll() is None:
+                os.killpg(target.pid, 15)
+                target.wait(timeout=5)
+            if owner_pid is not None:
+                try:
+                    os.killpg(owner_pid, 15)
+                except ProcessLookupError:
+                    pass
+                try:
+                    os.waitpid(owner_pid, 0)
+                except ChildProcessError:
+                    pass
 
 
 if __name__ == "__main__":

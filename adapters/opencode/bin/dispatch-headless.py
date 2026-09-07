@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import signal
 import shutil
 import shlex
@@ -65,6 +66,11 @@ from dispatch_contract import (  # noqa: E402
     wait_governor_reservation_claim,
 )
 from dispatch_summary import launch_summary_owner  # noqa: E402
+from artifact_producer import (  # noqa: E402
+    ProducerError,
+    prepare_review_output_binding,
+    review_lease_acquire,
+)
 from dispatch_completion_join import materialize_after_terminal_close  # noqa: E402
 from dispatch_lifecycle import (  # noqa: E402
     DETACHED,
@@ -232,6 +238,7 @@ def parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--worker-role", help="legacy compatibility metadata; not bootstrap identity")
     p.add_argument("--worker-type", choices=("owner", "stage", "review", "support"))
+    p.add_argument("--review-output", help="exact durable report path for a route-free review worker")
     p.add_argument("--unit", default="", help="catalog unit ref for the assigned route node (roles/units/<unit>.md)")
     p.add_argument("--assigned-contract")
     p.add_argument("--owner", dest="capability_owner")
@@ -764,6 +771,63 @@ def _route_node_leg_fields(args):
     return "-", "-"
 
 
+def prepare_review_output_request(args) -> None:
+    args.review_output_binding = None
+    args.review_governed_lease_nonce = ""
+    if not args.review_output:
+        return
+    if (
+        args.dispatch_depth != 1
+        or args.worker_type != "review"
+        or args.unit != "qa/code-review"
+        or args.capability != "autopilot-code"
+        or args.execution_surface != "registered-headless"
+        or not args.registered_worker
+        or args.route_file
+        or getattr(args, "owner_route_binding", None)
+    ):
+        raise ProducerError("review-output-tuple-invalid")
+    cycle_id = os.environ.get("AGENT_ARTIFACT_CYCLE_ID", "")
+    producer_id = os.environ.get("AGENT_ARTIFACT_PRODUCER_ID", "")
+    if not cycle_id or not producer_id:
+        raise ProducerError("review-output-cycle-binding-missing")
+    args.review_output_binding = prepare_review_output_binding(
+        Path(args.artifact_root), cycle_id=cycle_id,
+        producer_id=producer_id, attempt_id=args.attempt_id,
+        review_output=args.review_output, capability=args.capability,
+        unit=args.unit, worktree=args.worktree,
+    )
+    args.review_governed_lease_nonce = secrets.token_hex(32)
+
+
+def acquire_review_lease_after_claim(
+    args, jobs: Path, identity: dict[str, str]
+) -> dict[str, str]:
+    if not args.review_output:
+        return {}
+    binding = args.review_output_binding
+    result = review_lease_acquire(
+        Path(args.artifact_root), cycle_id=binding["cycle_id"],
+        attempt_id=args.attempt_id, review_output=binding["output_path"],
+        binding=binding, governed_identity=identity, jobs=jobs,
+    )
+    return dict(result.get("registry_metadata") or {})
+
+
+def attach_summary_owner(args, log_path: Path, prompt_path: Path, identity):
+    review = args.review_output_binding
+    return launch_summary_owner(
+        attempt_id=args.attempt_id,
+        harness="opencode",
+        transcript=log_path,
+        prompt_path=prompt_path,
+        target_pid=int(identity["pid"]),
+        target_start=identity["pid_start"],
+        review_artifact_root=review["artifact_root"] if review else None,
+        review_cycle_id=review["cycle_id"] if review else None,
+        review_lease_nonce=args.review_governed_lease_nonce if review else None,
+    )
+
 def append_job(jobs: Path, args: argparse.Namespace) -> bool:
     jobs.parent.mkdir(parents=True, exist_ok=True)
     repo = subprocess.check_output(["git", "-C", args.worktree, "rev-parse", "--show-toplevel"], text=True).strip()
@@ -809,6 +873,15 @@ def append_job(jobs: Path, args: argparse.Namespace) -> bool:
     pipe += f",assigned_contract={args.assigned_contract}"
     if args.unit:
         pipe += f",unit={args.unit}"
+    if args.review_output:
+        binding = args.review_output_binding
+        pipe += (
+            f",review_cycle_id={binding['cycle_id']}"
+            f",review_producer_id={binding['producer_id']}"
+            f",review_output_locator_b64={binding['locator_b64']}"
+            f",review_output_digest={binding['digest']}"
+        )
+
     if args.capability_owner:
         pipe += f",owner={args.capability_owner}"
     if args.owner_harness:
@@ -1462,6 +1535,13 @@ def main(argv: list[str]) -> int:
     except DispatchContractError as e:
         return fail(e.reason, 73, detail=e.detail, child_spawned="0")
     try:
+        prepare_review_output_request(args)
+    except ProducerError as exc:
+        return fail(
+            exc.code, 65, detail=exc.detail, registry_mutation="0",
+            child_spawned="0",
+        )
+    try:
         bind_stage_session(args, artifact_root=args.artifact_root, action=action)
     except DispatchContractError as e:
         return fail(e.reason, 65, detail=e.detail, child_spawned="0")
@@ -1493,7 +1573,9 @@ def main(argv: list[str]) -> int:
             )
             args.parent_attempt_id = args.parent_binding.attempt_id
         except (DispatchContractError, subprocess.SubprocessError) as e:
-            reason = e.reason if isinstance(e, DispatchContractError) else "parent-repo-unreadable"
+            reason = ("live-parent-not-found" if isinstance(e, DispatchContractError)
+                      and e.reason == "parent-attempt-not-found" else
+                      e.reason if isinstance(e, DispatchContractError) else "parent-repo-unreadable")
             detail = e.detail if isinstance(e, DispatchContractError) else str(e)
             return fail(reason, 73, detail=detail, child_spawned="0")
     if action == "start" and args.replica_batch_expectation is not None:
@@ -1651,6 +1733,22 @@ def main(argv: list[str]) -> int:
             "AGENT_DISPATCH_OWNER": args.capability_owner or "",
             "AGENT_DISPATCH_OWNER_HARNESS": args.owner_harness or "",
             "AGENT_ARTIFACT_ROOT": args.artifact_root,
+            "AGENT_DISPATCH_WORKTREE": (
+                args.review_output_binding["worktree"]
+                if args.review_output_binding else args.worktree
+            ),
+            "AGENT_REVIEW_OUTPUT": (
+                args.review_output_binding["output_path"]
+                if args.review_output_binding else ""
+            ),
+            "AGENT_REVIEW_CYCLE_ID": (
+                args.review_output_binding["cycle_id"]
+                if args.review_output_binding else ""
+            ),
+            "AGENT_REVIEW_PRODUCER_ID": (
+                args.review_output_binding["producer_id"]
+                if args.review_output_binding else ""
+            ),
             # W7C producer lifecycle: the owner's open cycle (issued by
             # `artifact_producer.py begin` before the first write) is passed
             # through unchanged so stage workers write into the same
@@ -1745,14 +1843,10 @@ def main(argv: list[str]) -> int:
                 spawn=spawn_worker,
                 launch_metadata=launch_metadata,
                 preclaim=getattr(args, "launch_preclaim", None),
-                pre_release=lambda identity: launch_summary_owner(
-                    attempt_id=args.attempt_id,
-                    harness="opencode",
-                    transcript=log_path,
-                    prompt_path=prompt_path,
-                    target_pid=int(identity["pid"]),
-                    target_start=identity["pid_start"],
+                pre_release=lambda identity: attach_summary_owner(
+                    args, log_path, prompt_path, identity
                 ),
+                post_claim=lambda identity: acquire_review_lease_after_claim(args, jobs, identity),
             )
         except DispatchContractError as exc:
             for fd in (fence_failure_read_fd, fence_failure_write_fd):
