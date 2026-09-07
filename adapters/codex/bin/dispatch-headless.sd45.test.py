@@ -9,6 +9,16 @@ S=importlib.util.spec_from_file_location("route",ROOT/"utilities/capability-rout
 WH_S=importlib.util.spec_from_file_location("codex_dispatch_headless",Path(__file__).with_name("dispatch-headless.py")); WH=importlib.util.module_from_spec(WH_S); WH_S.loader.exec_module(WH)
 
 
+def isolated_dispatch_env(**updates):
+    inherited = {
+        key: value for key, value in os.environ.items()
+        if key not in {"AGENT_DISPATCH_JOBS", "AGENT_DISPATCH_ATTEMPT_ID", "AGENT_MODEL_GOVERNOR_ROOT"}
+        and not key.startswith(("AGENT_ROUTE_", "AGENT_OWNER_ROUTE_"))
+    }
+    inherited.update(updates)
+    return inherited
+
+
 def probe_args(**overrides):
     base = dict(
         dispatch_depth=2, action="start", nested_eligibility="unknown", eligibility_source="",
@@ -443,7 +453,7 @@ class CodexSD45(unittest.TestCase):
    path=base/"route.json"; path.write_text(json.dumps(route)); node=next(x for x in route["nodes"] if x["id"]=="execute")
    parent=subprocess.Popen(["sleep","60"]);self.addCleanup(parent.wait);self.addCleanup(parent.kill);parent_start=(Path("/proc")/str(parent.pid)/"stat").read_text().split()[21];jobs.write_text(f"2026-07-23T00:00:00Z\topen\t{repo}\t{repo}\towner\tattempt_schema_version=2,dispatch_depth=1,transport=headless,execution_surface=registered-headless,registered_worker=1,fallback_hop=same-harness-headless,worker_type=owner,harness=codex,runtime_sandbox=workspace-write,attempt_id=att-sd45-parent,pid={parent.pid},pid_start={parent_start}\n")
    args=[sys.executable,str(ROOT/"adapters/codex/bin/dispatch-headless.py"),"--register","--worktree",str(repo),"--slug","codex-sd45","--capability","autopilot-code","--capability-mode","dev","--worker-mode",node["unit"],"--qa","standard","--intensity","strong","--dispatch-depth","2","--parent","owner","--parent-harness","codex","--parent-transport","headless","--parent-sandbox","workspace-write","--nested-eligibility","supported","--eligibility-source","codex-fixture","--fallback-ordinal","1","--route-file",str(path),"--route-id",route["route_id"],"--route-hash",route["route_hash"],"--route-node","execute","--unit",node["unit"],"--registry-digest",route["registry_digest"],"--write-scope",";".join(node["write_scope"]),"--completion-gate",node["completion_gate"],"--model-role",node["role"],"--model-profile",node["model_profile"],"--jobs",str(jobs),"--log-dir",str(logs)]
-   env={**os.environ,"AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(art),"AGENT_DISPATCH_JOBS":str(jobs),"AGENT_DISPATCH_ATTEMPT_ID":"att-sd45-parent"}; ok=subprocess.run(args,text=True,capture_output=True,env=env); self.assertEqual(ok.returncode,0,ok.stdout+ok.stderr); prompt=next(logs.glob("codex-sd45*.codex.prompt.txt")).read_text(); self.assertIn("consume the assigned route only",prompt); self.assertNotIn("preflight.sh route autopilot-code",prompt); self.assertIn(f"unit={node['unit']}",jobs.read_text()); self.assertIn(f"unit={node['unit']}",ok.stdout)
+   env=isolated_dispatch_env(AGENT_HOME=str(ROOT),AGENT_ARTIFACT_ROOT=str(art),AGENT_DISPATCH_JOBS=str(jobs),AGENT_DISPATCH_ATTEMPT_ID="att-sd45-parent"); ok=subprocess.run(args,text=True,capture_output=True,env=env); self.assertEqual(ok.returncode,0,ok.stdout+ok.stderr); prompt=next(logs.glob("codex-sd45*.codex.prompt.txt")).read_text(); self.assertIn("consume the assigned route only",prompt); self.assertNotIn("preflight.sh route autopilot-code",prompt); self.assertIn(f"unit={node['unit']}",jobs.read_text()); self.assertIn(f"unit={node['unit']}",ok.stdout)
    bad=args.copy(); bad[bad.index(";".join(node["write_scope"]))]="spec/**"; denied=subprocess.run(bad,text=True,capture_output=True,env=env); self.assertEqual(denied.returncode,65); self.assertIn("route-node-scope-mismatch",denied.stderr)
    legacy=[sys.executable,str(ROOT/"adapters/codex/bin/dispatch-headless.py"),"--dry-run","--worktree",str(repo),"--slug","codex-legacy-scope","--capability","autopilot-code","--mode","dev","--qa","standard","--write-scope","source/**","--model","gpt-test","--reasoning","low","--sandbox","danger-full-access"]
    compatible=subprocess.run(legacy,text=True,capture_output=True,env=env); self.assertEqual(compatible.returncode,0,compatible.stdout+compatible.stderr); self.assertIn("status=dry-run",compatible.stdout)

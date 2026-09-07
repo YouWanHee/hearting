@@ -36,7 +36,10 @@ from typing import Any, Iterable, NamedTuple
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
-from dispatch_contract import resolve_agent_home as _resolve_agent_home  # noqa: E402
+from dispatch_contract import (  # noqa: E402
+    resolve_agent_home as _resolve_agent_home,
+)
+from artifact_producer import review_output_write_authorized_from_cycle  # noqa: E402
 
 STATE_DIR_NAME = ".route-grounding"
 MARKER_SCHEMA = 1
@@ -1277,6 +1280,34 @@ def commit_has_material(
     return False
 
 
+def _review_output_authorized(target: Path, accepted: set[str]) -> bool:
+    """Check the route-free review exception against registry and lease state."""
+    if "autopilot-code" not in accepted:
+        return False
+    attempt = os.environ.get("AGENT_DISPATCH_ATTEMPT_ID", "")
+    jobs = os.environ.get("AGENT_DISPATCH_JOBS", "")
+    cycle = os.environ.get("AGENT_REVIEW_CYCLE_ID", "")
+    output = os.environ.get("AGENT_REVIEW_OUTPUT", "")
+    if not all((attempt, jobs, cycle, output)):
+        return False
+    try:
+        exact_target = target.resolve(strict=False)
+        if exact_target != Path(output).resolve(strict=False):
+            return False
+        roots = [
+            parent for parent in (exact_target, *exact_target.parents)
+            if parent.name in {".agent_reports", ".claude_reports"}
+        ]
+        if len(roots) != 1:
+            return False
+        return review_output_write_authorized_from_cycle(
+            roots[0].resolve(strict=False), jobs=jobs, attempt_id=attempt,
+            cycle_id=cycle, review_output=exact_target,
+        )
+    except (OSError, ValueError, TypeError):
+        return False
+
+
 def check_action(
     tool: str,
     cwd: Path,
@@ -1292,13 +1323,20 @@ def check_action(
             return
         target = _resolve_path(cwd, file_path)
         accepted = capability_artifact_caps(target)
+        if os.environ.get("AGENT_REVIEW_OUTPUT") or os.environ.get(
+            "AGENT_REVIEW_CYCLE_ID"
+        ):
+            if accepted and _review_output_authorized(target, accepted):
+                return
+            raise RouteError("review-output-not-authorized")
         if not accepted:
             return
-        route, is_worker, sealed_root = artifact_active_route(
-            session_id,
-            agent_home,
-            accepted_capabilities=accepted,
-        )
+        try:
+            route, is_worker, sealed_root = artifact_active_route(
+                session_id, agent_home, accepted_capabilities=accepted,
+            )
+        except RouteError:
+            raise
         artifact_root = Path(str(route.get("artifact_root", ""))).resolve(
             strict=False
         )

@@ -5,10 +5,12 @@ Every fixture uses an isolated temporary artifact root and `AGENT_HOME`; the
 real canonical root, registry, and routes directory are never touched.
 """
 import importlib.util
+import fcntl
 import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -20,6 +22,7 @@ import artifact_identity as idm  # noqa: E402
 import artifact_lifecycle as L  # noqa: E402
 import artifact_manifest as m  # noqa: E402
 import artifact_producer as P  # noqa: E402
+import dispatch_contract as D  # noqa: E402
 
 _P = Path(__file__).with_name("capability-route.py")
 _S = importlib.util.spec_from_file_location("route_for_producer_test", _P)
@@ -88,13 +91,16 @@ class ProducerTestBase(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name) / "artifact-root"
         self.root.mkdir(parents=True, exist_ok=True)
+        self.jobs = Path(self._tmp.name) / "jobs.log"
+        self.jobs.write_text("", encoding="utf-8")
         home = Path(self._tmp.name) / "agent-home"
         (home / "core").mkdir(parents=True, exist_ok=True)
         (home / "core" / "CORE.md").write_text("fixture\n", encoding="utf-8")
         self._env = {k: os.environ.get(k) for k in (
             "AGENT_HOME", "AGENT_DISPATCH_JOBS", "AGENT_ARTIFACT_CYCLE_DIR", "AGENT_ARTIFACT_ROOT")}
         os.environ["AGENT_HOME"] = str(home)
-        for key in ("AGENT_DISPATCH_JOBS", "AGENT_ARTIFACT_CYCLE_DIR", "AGENT_ARTIFACT_ROOT"):
+        os.environ["AGENT_DISPATCH_JOBS"] = str(self.jobs)
+        for key in ("AGENT_ARTIFACT_CYCLE_DIR", "AGENT_ARTIFACT_ROOT"):
             os.environ.pop(key, None)
         self.addCleanup(self._restore)
 
@@ -1289,6 +1295,74 @@ class ReviewPublicationLeaseTest(ProducerTestBase):
         release2 = P.review_lease_release(self.root, cycle_id=cycle_id, attempt_id="att-r")
         self.assertEqual(release1["status"], "released")
         self.assertEqual(release2["status"], "already-released")
+
+    def test_mixed_v1_corruption_cannot_hide_live_v2_and_v2_exit_unblocks(self):
+        self.activate()
+        _route, _route_file, result = self.begin()
+        cycle_id = result["cycle_id"]
+        lease_dir = P._review_lease_dir(self.root, cycle_id)
+        lease_dir.mkdir(parents=True, exist_ok=True)
+        corrupt = lease_dir / "a-v1.json"
+        corrupt.write_text("{broken", encoding="utf-8")
+        attempt = "att-z-live-v2"
+        nonce = "c" * 64
+        now = time.time()
+        record = {
+            "schema_version": 2, "cycle_id": cycle_id,
+            "attempt_id": attempt, "acquired_at": P._rfc3339(now - 1),
+            "deadline": P._rfc3339(now + 300), "released_at": None,
+            "expired": False,
+            "review_governed_lease": D.REVIEW_GOVERNED_LEASE_KIND,
+            "review_governed_lease_nonce": nonce,
+        }
+        v2 = lease_dir / f"{attempt}.json"
+        v2.write_text(json.dumps(record), encoding="utf-8")
+        governed = D.review_governed_lease_path(self.root, cycle_id, attempt)
+        governed.parent.mkdir(parents=True)
+        governed.write_bytes(D.review_governed_lease_payload(attempt, cycle_id, nonce))
+        with governed.open("r+b") as held:
+            fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertEqual(P._live_review_lease(self.root, cycle_id), v2)
+            record["released_at"] = P._rfc3339(now)
+            v2.write_text(json.dumps(record), encoding="utf-8")
+            self.assertEqual(P._live_review_lease(self.root, cycle_id), corrupt)
+            record["released_at"] = None
+            record["deadline"] = P._rfc3339(now - 2)
+            v2.write_text(json.dumps(record), encoding="utf-8")
+            self.assertEqual(P._live_review_lease(self.root, cycle_id), corrupt)
+            record["deadline"] = P._rfc3339(now + 300)
+            v2.write_text(json.dumps(record), encoding="utf-8")
+        corrupt.unlink()
+        self.assertIsNone(P._live_review_lease(self.root, cycle_id))
+
+    def test_completed_finalize_is_fenced_until_governed_v2_process_exits(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        self.write_output(result)
+        self.close(route, route_file)
+        cycle_id = result["cycle_id"]
+        attempt = "att-finalize-race-v2"
+        nonce = "d" * 64
+        now = time.time()
+        lease_dir = P._review_lease_dir(self.root, cycle_id)
+        lease_dir.mkdir(parents=True, exist_ok=True)
+        (lease_dir / f"{attempt}.json").write_text(json.dumps({
+            "schema_version": 2, "cycle_id": cycle_id,
+            "attempt_id": attempt, "acquired_at": P._rfc3339(now - 1),
+            "deadline": P._rfc3339(now + 300), "released_at": None,
+            "expired": False,
+            "review_governed_lease": D.REVIEW_GOVERNED_LEASE_KIND,
+            "review_governed_lease_nonce": nonce,
+        }), encoding="utf-8")
+        governed = D.review_governed_lease_path(self.root, cycle_id, attempt)
+        governed.parent.mkdir(parents=True)
+        governed.write_bytes(D.review_governed_lease_payload(attempt, cycle_id, nonce))
+        with governed.open("r+b") as held:
+            fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaises(P.ProducerError) as caught:
+                P.finalize(self.root, cycle_id=cycle_id)
+            self.assertEqual(caught.exception.code, "cycle-finalize-blocked-live-review")
+        self.assertEqual(P.finalize(self.root, cycle_id=cycle_id)["status"], "sealed")
 
 
 class AbandonReasonTest(ProducerTestBase):

@@ -1679,6 +1679,9 @@ class DispatchContractTest(unittest.TestCase):
      pass_fds=(gate_fd,),start_new_session=True)
    def attach(identity):
     self.assertFalse(marker.exists())
+    with Path(f"{jobs}.lock").open("a") as contender:
+     with self.assertRaises(BlockingIOError):
+      fcntl.flock(contender.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
     observed.append(dict(identity))
     return {"summary_owner":"dispatch-v1","summary_owner_pid":"777"}
    proc,identity=D.spawn_claimed_attempt(
@@ -1691,6 +1694,72 @@ class DispatchContractTest(unittest.TestCase):
    self.assertEqual(meta["summary_owner_pid"],"777")
    self.assertEqual(meta["launch_claimed"],"1")
    self.assertEqual(identity["summary_owner"],"dispatch-v1")
+
+ def test_post_claim_runs_unlocked_then_rejects_terminal_row_race(self):
+  with tempfile.TemporaryDirectory() as td:
+   base=Path(td);jobs=base/"jobs.log";marker=base/"must-not-run";children=[]
+   attempt="att-post-claim-status-race"
+   row=(f"2026-07-23T00:00:01Z\topen\t/repo\t/wt\tchild\t{CURRENT},"
+        f"attempt_id={attempt}")
+   self.assertTrue(D.claim_attempt_row(jobs,attempt,row,launch=False))
+   def spawn(gate_fd):
+    proc=subprocess.Popen(
+     [sys.executable,str(Path(__file__).with_name("launch-fence.py")),
+      "--parent-pid",str(os.getpid()),"--gate-fd",str(gate_fd),"--",
+      sys.executable,"-c",f"from pathlib import Path;Path({str(marker)!r}).write_text('bad')"],
+     pass_fds=(gate_fd,),start_new_session=True)
+    children.append(proc);return proc
+   def mutate(_identity):
+    with Path(f"{jobs}.lock").open("a") as contender:
+     fcntl.flock(contender.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
+     fields=jobs.read_text().strip().split("\t")
+     fields[1]="done"
+     jobs.write_text("\t".join(fields)+"\n")
+    return {"review_lease_deadline":"2099-01-01T00:00:00Z"}
+   with self.assertRaises(D.DispatchContractError) as caught:
+    D.spawn_claimed_attempt(
+     jobs,attempt,parent_binding=None,spawn=spawn,post_claim=mutate)
+   self.assertEqual(caught.exception.reason,"attempt-post-claim-identity-changed")
+   self.assertFalse(marker.exists())
+   self.assertIsNotNone(children[0].poll())
+
+ def test_post_claim_rechecks_parent_liveness_before_fence_release(self):
+  with tempfile.TemporaryDirectory() as td:
+   base=Path(td);jobs=base/"jobs.log";marker=base/"must-not-run"
+   parent=subprocess.Popen(["sleep","60"]);children=[]
+   try:
+    start=D.process_start_ticks(parent.pid)
+    jobs.write_text(self.owner_row("att-parent-post-claim",parent.pid,start)+"\n")
+    binding=D.resolve_live_parent_attempt(
+     jobs,parent_slug="owner",repo="/repo",worktree="/wt",
+     expected_attempt_id="att-parent-post-claim")
+    attempt="att-child-post-claim"
+    row=(f"2026-07-23T00:00:01Z\topen\t/repo\t/wt\tchild\t{CURRENT},"
+         "worker_type=stage,parent=owner,parent_attempt_id=att-parent-post-claim,"
+         f"attempt_id={attempt}")
+    self.assertTrue(D.claim_attempt_row(jobs,attempt,row,launch=False))
+    def spawn(gate_fd):
+     proc=subprocess.Popen(
+      [sys.executable,str(Path(__file__).with_name("launch-fence.py")),
+       "--parent-pid",str(os.getpid()),"--gate-fd",str(gate_fd),"--",
+       sys.executable,"-c",f"from pathlib import Path;Path({str(marker)!r}).write_text('bad')"],
+      pass_fds=(gate_fd,),start_new_session=True)
+     children.append(proc);return proc
+    def kill_parent(_identity):
+     parent.kill();parent.wait()
+     return {}
+    with self.assertRaises(D.DispatchContractError) as caught:
+     D.spawn_claimed_attempt(
+      jobs,attempt,parent_binding=binding,spawn=spawn,post_claim=kill_parent)
+    self.assertEqual(caught.exception.reason,"parent-attempt-not-live-after-post-claim")
+    self.assertFalse(marker.exists())
+    self.assertIsNotNone(children[0].poll())
+   finally:
+    if parent.poll() is None:parent.kill()
+    parent.wait()
+    for proc in children:
+     if proc.poll() is None:proc.kill()
+     proc.wait()
 
  def test_pre_release_failure_aborts_fenced_payload_and_leaves_claim_retryable(self):
   with tempfile.TemporaryDirectory() as td:
@@ -4038,7 +4107,12 @@ class ActualRowAssemblyLaunchHomeTest(unittest.TestCase):
                     "--jobs", str(jobs), "--attempt-id", f"att-{harness}-append-job-fx",
                 ] + self.MODEL_ARGS[harness]
                 env = {
-                    **os.environ,
+                    **{
+                        key: value for key, value in os.environ.items()
+                        if not key.startswith("AGENT_DISPATCH_")
+                        and not key.startswith("AGENT_OWNER_ROUTE_")
+                        and not key.startswith("AGENT_ROUTE_")
+                    },
                     "AGENT_HOME": str(current),
                     "AGENT_ARTIFACT_ROOT": str(artifact_root),
                     "HOME": str(root / "home"),
@@ -4046,6 +4120,7 @@ class ActualRowAssemblyLaunchHomeTest(unittest.TestCase):
                 for stale in (
                     "AGENT_DISPATCH_JOBS", "AGENT_MODEL_GOVERNOR_ROOT",
                     "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID",
+                    "CODEX_SESSION_ID",
                     # A fixture that drives a wrapper must not inherit the
                     # ambient session's route binding: run from inside a
                     # dispatch owner, these make the wrapper refuse with
@@ -4055,10 +4130,26 @@ class ActualRowAssemblyLaunchHomeTest(unittest.TestCase):
                     "AGENT_OWNER_ROUTE_FILE", "AGENT_OWNER_ROUTE_ID",
                     "AGENT_OWNER_ROUTE_HASH", "AGENT_ROUTE_FILE",
                     "AGENT_ROUTE_ID", "AGENT_ROUTE_NODE",
+                    "AGENT_DISPATCH_PARENT_SESSION_ID",
+                    "AGENT_DISPATCH_PARENT_ATTEMPT_ID",
+                    "AGENT_DISPATCH_PARENT_SLUG", "AGENT_DISPATCH_CHILD",
+                    "AGENT_DISPATCH_CURRENT_HARNESS",
+                    "AGENT_DISPATCH_CURRENT_TRANSPORT",
+                    "AGENT_DISPATCH_CURRENT_SANDBOX",
                 ):
                     env.pop(stale, None)
                 with mock.patch.dict(os.environ, env, clear=True):
-                    rc = wrapper.main(argv)
+                    if harness == "claude":
+                        with mock.patch.object(
+                            wrapper, "probe_claude_session_resume",
+                            return_value=wrapper.ClaudeResumeProbe(
+                                "supported", "fixture", 0, 20000,
+                                ("--resume", "--session-id"), "fixture",
+                            ),
+                        ):
+                            rc = wrapper.main(argv)
+                    else:
+                        rc = wrapper.main(argv)
                 self.assertEqual(rc, 0, harness)
                 self.assertTrue(jobs.is_file(), harness)
                 row = jobs.read_text(encoding="utf-8").strip()

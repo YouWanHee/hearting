@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -33,11 +34,15 @@ if str(Path(__file__).resolve().parent) not in sys.path:
 from dispatch_contract import (  # noqa: E402
     DispatchContractError,
     PID_HOST_NAMESPACE_PROOF,
+    REVIEW_GOVERNED_LEASE_KIND,
+    REVIEW_GOVERNED_LEASE_NONCE_RE,
     annotate_attempt_row_if,
     parse_registry_metadata,
     process_launch_identity,
     process_namespace_identity,
     process_observation,
+    review_governed_lease_path,
+    review_governed_lease_payload,
 )
 
 
@@ -196,6 +201,9 @@ def _owner_env() -> dict[str, str]:
 def launch_summary_owner(
     *, attempt_id: str, harness: str, transcript: str | Path,
     target_pid: int, target_start: str, prompt_path: str | Path | None = None,
+    review_artifact_root: str | Path | None = None,
+    review_cycle_id: str | None = None,
+    review_lease_nonce: str | None = None,
 ) -> dict[str, str]:
     """Launch and prove one exact-attempt supervisor; return registry metadata."""
 
@@ -203,6 +211,15 @@ def launch_summary_owner(
     prompt = _validate_prompt(prompt_path, log_path)
     if target_pid <= 0 or not target_start:
         raise ValueError("exact target identity required")
+    review_values = (review_artifact_root, review_cycle_id, review_lease_nonce)
+    if any(value is not None for value in review_values):
+        if not all(value is not None for value in review_values):
+            raise ValueError("review governed lease tuple is incomplete")
+        if REVIEW_GOVERNED_LEASE_NONCE_RE.fullmatch(str(review_lease_nonce)) is None:
+            raise ValueError("review governed lease nonce is invalid")
+        review_governed_lease_path(
+            str(review_artifact_root), str(review_cycle_id), attempt_id
+        )
     live, reason = _proc_live(target_pid, target_start)
     if not live:
         raise ValueError(f"target identity is not live: {reason}")
@@ -218,6 +235,12 @@ def launch_summary_owner(
     ]
     if prompt is not None:
         argv += ["--prompt", str(prompt)]
+    if review_artifact_root is not None:
+        argv += [
+            "--review-artifact-root", str(review_artifact_root),
+            "--review-cycle-id", str(review_cycle_id),
+            "--review-lease-nonce", str(review_lease_nonce),
+        ]
     process = subprocess.Popen(
         argv,
         cwd=str(ROOT),
@@ -262,6 +285,11 @@ def launch_summary_owner(
         value = owner_identity.get(key)
         if value:
             metadata["summary_owner_" + key] = value
+    if review_artifact_root is not None:
+        metadata.update({
+            "review_governed_lease": REVIEW_GOVERNED_LEASE_KIND,
+            "review_governed_lease_nonce": str(review_lease_nonce),
+        })
     return metadata
 
 
@@ -408,6 +436,9 @@ def supervise(
     periodic_debounce: int = DEFAULT_PERIODIC_DEBOUNCE,
     final_grace: float = DEFAULT_FINAL_GRACE,
     log_quiet: float = DEFAULT_LOG_QUIET,
+    review_artifact_root: str | Path | None = None,
+    review_cycle_id: str | None = None,
+    review_lease_nonce: str | None = None,
 ) -> int:
     """Follow one governed process and maintain its attempt-scoped summary."""
 
@@ -418,11 +449,40 @@ def supervise(
     state_path = owner_state_path(harness, attempt_id)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     lock = lock_path.open("a+", encoding="utf-8")
+    review_fd: int | None = None
     try:
         try:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return 0
+        review_values = (review_artifact_root, review_cycle_id, review_lease_nonce)
+        if any(value is not None for value in review_values):
+            if not all(value is not None for value in review_values):
+                raise ValueError("review governed lease tuple is incomplete")
+            nonce = str(review_lease_nonce)
+            if REVIEW_GOVERNED_LEASE_NONCE_RE.fullmatch(nonce) is None:
+                raise ValueError("review governed lease nonce is invalid")
+            review_path = review_governed_lease_path(
+                str(review_artifact_root), str(review_cycle_id), attempt_id
+            )
+            review_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            flags = (
+                os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            review_fd = os.open(review_path, flags, 0o600)
+            if not os.path.isfile(review_path) or not stat.S_ISREG(os.fstat(review_fd).st_mode):
+                raise ValueError("review governed lease is not regular")
+            try:
+                fcntl.flock(review_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise ValueError("review governed lease is already held") from exc
+            payload = review_governed_lease_payload(
+                attempt_id, str(review_cycle_id), nonce
+            )
+            os.ftruncate(review_fd, 0)
+            os.pwrite(review_fd, payload, 0)
+            os.fsync(review_fd)
         _, self_start, _ = process_observation(os.getpid())
         started_at = time.time()
         state: dict[str, Any] = {
@@ -441,6 +501,11 @@ def supervise(
             "started_at": started_at,
             "last_refresh_phase": None,
         }
+        if review_fd is not None:
+            state.update(
+                review_governed_lease=REVIEW_GOVERNED_LEASE_KIND,
+                review_cycle_id=str(review_cycle_id),
+            )
         _atomic_write(state_path, state)
 
         first_eligible = time.monotonic() + max(0.0, initial_delay)
@@ -517,6 +582,11 @@ def supervise(
         _atomic_write(state_path, state)
         return 0
     finally:
+        if review_fd is not None:
+            try:
+                fcntl.flock(review_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(review_fd)
         try:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
         finally:
@@ -632,6 +702,9 @@ def main(argv: list[str] | None = None) -> int:
     supervise_parser.add_argument("--periodic-debounce", type=int, default=DEFAULT_PERIODIC_DEBOUNCE)
     supervise_parser.add_argument("--final-grace", type=float, default=DEFAULT_FINAL_GRACE)
     supervise_parser.add_argument("--log-quiet", type=float, default=DEFAULT_LOG_QUIET)
+    supervise_parser.add_argument("--review-artifact-root")
+    supervise_parser.add_argument("--review-cycle-id")
+    supervise_parser.add_argument("--review-lease-nonce")
     ensure_parser = commands.add_parser("ensure")
     ensure_parser.add_argument("--jobs", required=True)
     ensure_parser.add_argument("--attempt-id", required=True)
@@ -652,6 +725,9 @@ def main(argv: list[str] | None = None) -> int:
         periodic_debounce=args.periodic_debounce,
         final_grace=args.final_grace,
         log_quiet=args.log_quiet,
+        review_artifact_root=args.review_artifact_root,
+        review_cycle_id=args.review_cycle_id,
+        review_lease_nonce=args.review_lease_nonce,
     )
 
 

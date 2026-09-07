@@ -20,7 +20,7 @@ import sys
 import tempfile
 import time
 import uuid
-from typing import Callable, Iterator, NamedTuple
+from typing import Callable, Iterator, Mapping, NamedTuple
 
 from route_identity import registered_node_identity
 from dispatch_pending_delivery import RECIPIENT_KINDS
@@ -899,6 +899,371 @@ def parse_registry_metadata(pipe: str) -> dict[str, str]:
     """Parse the stable six-column registry's comma-delimited metadata."""
 
     return dict(part.split("=", 1) for part in pipe.split(",") if "=" in part)
+
+
+def _parse_review_metadata(pipe: str) -> dict[str, str]:
+    """Parse the path-safe subset used by the report authorization tuple."""
+    result: dict[str, str] = {}
+    for part in pipe.split(","):
+        if not part or "=" not in part:
+            raise DispatchContractError("review-metadata-encoding-invalid", part)
+        key, value = part.split("=", 1)
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_:-]{0,63}", key):
+            raise DispatchContractError("review-metadata-key-invalid", key)
+        if not value or any(char in value for char in ",\t\r\n"):
+            raise DispatchContractError("review-metadata-value-invalid", key)
+        if key in result:
+            raise DispatchContractError("review-metadata-duplicate", key)
+        result[key] = value
+    return result
+
+
+REVIEW_OUTPUT_BINDING_SCHEMA_VERSION = 2
+REVIEW_GOVERNED_LEASE_KIND = "summary-flock-v1"
+REVIEW_GOVERNED_LEASE_NONCE_RE = re.compile(r"[0-9a-f]{64}")
+REVIEW_POST_CLAIM_METADATA_KEYS = frozenset({
+    "review_lease_acquired_at",
+    "review_lease_deadline",
+    "review_lease_record_digest",
+})
+
+
+def encode_review_output_locator(locator: str) -> str:
+    """Encode an artifact-root relative path for comma-delimited metadata."""
+
+    if not locator or "\x00" in locator:
+        raise DispatchContractError("review-output-locator-invalid", locator)
+    encoded = base64.urlsafe_b64encode(locator.encode("utf-8")).decode("ascii")
+    return encoded.rstrip("=")
+
+
+def decode_review_output_locator(encoded: str) -> str:
+    """Decode only the canonical unpadded URL-safe locator representation."""
+
+    if not encoded or re.fullmatch(r"[A-Za-z0-9_-]+", encoded) is None:
+        raise DispatchContractError("review-output-locator-invalid", encoded)
+    try:
+        padding = "=" * (-len(encoded) % 4)
+        locator = base64.b64decode(
+            encoded + padding, altchars=b"-_", validate=True
+        ).decode("utf-8")
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise DispatchContractError("review-output-locator-invalid", encoded) from exc
+    if encode_review_output_locator(locator) != encoded:
+        raise DispatchContractError("review-output-locator-invalid", encoded)
+    return locator
+
+
+def review_governed_lease_path(
+    artifact_root: str | Path, cycle_id: str, attempt_id: str
+) -> Path:
+    """Return the derived namespace-independent worker-lifetime lease path."""
+
+    root_input = Path(artifact_root)
+    root = root_input.resolve(strict=False)
+    if not root_input.is_absolute() or str(root_input) != str(root):
+        raise DispatchContractError(
+            "review-governed-lease-root-noncanonical", str(artifact_root)
+        )
+    safe = re.compile(r"[A-Za-z0-9._-]{4,240}")
+    if safe.fullmatch(cycle_id or "") is None or safe.fullmatch(attempt_id or "") is None:
+        raise DispatchContractError(
+            "review-governed-lease-identity-invalid", f"{cycle_id}:{attempt_id}"
+        )
+    return (
+        root / ".runtime" / "artifact-producer" / "v1" /
+        "review-governed-leases" / cycle_id / f"{attempt_id}.lease"
+    )
+
+
+def review_governed_lease_payload(
+    attempt_id: str, cycle_id: str, nonce: str
+) -> bytes:
+    return (
+        f"kind={REVIEW_GOVERNED_LEASE_KIND}\n"
+        f"attempt_id={attempt_id}\n"
+        f"cycle_id={cycle_id}\n"
+        f"nonce={nonce}\n"
+    ).encode("ascii")
+
+
+def review_governed_lease_is_held(
+    artifact_root: str | Path, metadata: Mapping[str, object]
+) -> bool:
+    """Probe the exact summary-owned worker lease across PID namespaces."""
+
+    attempt_id = str(metadata.get("attempt_id", ""))
+    cycle_id = str(metadata.get("review_cycle_id", ""))
+    nonce = str(metadata.get("review_governed_lease_nonce", ""))
+    if (
+        metadata.get("review_governed_lease") != REVIEW_GOVERNED_LEASE_KIND
+        or REVIEW_GOVERNED_LEASE_NONCE_RE.fullmatch(nonce) is None
+    ):
+        return False
+    try:
+        path = review_governed_lease_path(artifact_root, cycle_id, attempt_id)
+        if path.is_symlink() or path.parent.is_symlink():
+            return False
+        flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags)
+    except (DispatchContractError, OSError):
+        return False
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return False
+        expected = review_governed_lease_payload(attempt_id, cycle_id, nonce)
+        if os.pread(fd, len(expected) + 1, 0) != expected:
+            return False
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        except OSError:
+            return False
+        else:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return False
+    finally:
+        os.close(fd)
+
+
+def review_output_binding_digest(binding: Mapping[str, object]) -> str:
+    """Digest the closed, path-safe identity tuple of a reviewer report."""
+    fields = (
+        "schema_version", "attempt_id", "cycle_id", "producer_id",
+        "worktree", "artifact_root", "capability", "unit", "output_path",
+    )
+    payload = {key: binding.get(key, "") for key in fields}
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                         separators=(",", ":")).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def review_lease_record_digest(record: Mapping[str, object]) -> str:
+    """Seal every persisted lease field; the digest itself lives in jobs."""
+
+    encoded = json.dumps(
+        dict(record), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def validate_review_output_binding(
+    jobs: str | Path,
+    *,
+    attempt_id: str,
+    output_path: str | Path,
+    cycle_id: str,
+    producer_id: str,
+    capability: str,
+    unit: str,
+    worktree: str | Path,
+    artifact_root: str | Path,
+) -> dict[str, object]:
+    """Validate one route-free registered review and its exact report target.
+
+    This is deliberately separate from ``validate_attempt_metadata``: the
+    latter validates generic dispatch rows and must not grant artifact rights.
+    A report binding is authorization evidence only when the canonical jobs
+    file contains one exact, open registered review row with every axis bound.
+    """
+    registry_input = Path(jobs)
+    registry = registry_input.resolve(strict=False)
+    if (not registry_input.is_absolute() or str(registry_input) != str(registry)
+            or registry.is_symlink() or not registry.is_file()):
+        raise DispatchContractError("review-jobs-path-not-canonical", str(jobs))
+    worktree_input = Path(worktree)
+    root_input = Path(artifact_root)
+    expected_worktree = str(worktree_input.resolve(strict=False))
+    expected_root = str(root_input.resolve(strict=False))
+    if (not worktree_input.is_absolute() or str(worktree_input) != expected_worktree
+            or not root_input.is_absolute() or str(root_input) != expected_root):
+        raise DispatchContractError("review-binding-root-not-canonical", str(artifact_root))
+    if not attempt_id or not cycle_id or not producer_id or not capability or not unit:
+        raise DispatchContractError("review-binding-tuple-incomplete", attempt_id)
+    target = Path(output_path)
+    if not target.is_absolute():
+        raise DispatchContractError("review-output-not-absolute", str(target))
+    target = target.resolve(strict=False)
+    if str(target) != str(Path(output_path)):
+        raise DispatchContractError("review-output-path-not-canonical", str(output_path))
+    try:
+        target.relative_to(Path(expected_root))
+    except ValueError as exc:
+        raise DispatchContractError("review-output-outside-artifact-root", str(target)) from exc
+    if target.name in {"", ".", ".."} or target.is_dir() or target.exists() and not target.is_file():
+        raise DispatchContractError("review-output-target-invalid", str(target))
+    current = target
+    while current != Path(expected_root):
+        if current.is_symlink():
+            raise DispatchContractError("review-output-symlink", str(current))
+        current = current.parent
+        if current == current.parent and current != Path(expected_root):
+            raise DispatchContractError("review-output-outside-artifact-root", str(target))
+    matches: list[tuple[list[str], dict[str, str]]] = []
+    malformed_matches: list[str] = []
+    try:
+        lines = registry.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as exc:
+        raise DispatchContractError("review-jobs-unreadable", str(registry)) from exc
+    for line in lines:
+        fields = line.split("\t")
+        attempt_token = f"attempt_id={attempt_id}"
+        if len(fields) != 6:
+            tokens = re.split(r"[,\t]", line)
+            if attempt_token in tokens:
+                malformed_matches.append("review-row-columns-invalid")
+            continue
+        attempt_hints = [
+            part.split("=", 1)[1]
+            for part in fields[5].split(",")
+            if part.startswith("attempt_id=")
+        ]
+        try:
+            metadata = _parse_review_metadata(fields[5])
+        except DispatchContractError as exc:
+            if attempt_id in attempt_hints:
+                malformed_matches.append(exc.reason)
+            continue
+        if metadata.get("attempt_id") == attempt_id:
+            matches.append((fields, metadata))
+    if malformed_matches:
+        raise DispatchContractError(
+            "review-attempt-row-malformed",
+            f"{attempt_id}:{','.join(malformed_matches)}",
+        )
+    if len(matches) != 1:
+        raise DispatchContractError("review-attempt-not-unique", f"{attempt_id}:{len(matches)}")
+    fields, metadata = matches[0]
+    if fields[1] not in {"open", "running"}:
+        raise DispatchContractError("review-attempt-not-open", attempt_id)
+    if metadata.get("review_output_path") or metadata.get("review_output"):
+        raise DispatchContractError("review-output-path-in-jobs-metadata", attempt_id)
+    expected = {
+        "attempt_schema_version": "2", "dispatch_depth": "1",
+        "transport": "headless", "execution_surface": "registered-headless",
+        "registered_worker": "1", "worker_type": "review",
+        "unit": unit, "capability": capability,
+    }
+    for key, value in expected.items():
+        if metadata.get(key) != value:
+            raise DispatchContractError("review-binding-axis-mismatch", key)
+    route_keys = {
+        "route_file", "route_id", "route_hash", "route_node", "registry_digest",
+        "write_scope", "completion_gate", "owner_route_file", "owner_route_id",
+        "owner_route_hash",
+    }
+    if any(metadata.get(key) for key in route_keys):
+        raise DispatchContractError("review-attempt-route-bound", attempt_id)
+    if (
+        fields[3] != expected_worktree
+        or metadata.get("worktree", expected_worktree) != expected_worktree
+        or str(Path(fields[2]).resolve(strict=False)) != expected_worktree
+    ):
+        raise DispatchContractError("review-binding-worktree-mismatch", attempt_id)
+    if metadata.get("artifact_root") != expected_root:
+        raise DispatchContractError("review-binding-artifact-root-mismatch", attempt_id)
+    if metadata.get("review_cycle_id") != cycle_id:
+        raise DispatchContractError("review-binding-cycle-mismatch", cycle_id)
+    if metadata.get("review_producer_id") != producer_id:
+        raise DispatchContractError("review-binding-producer-mismatch", producer_id)
+    try:
+        locator = target.relative_to(Path(expected_root)).as_posix()
+    except ValueError as exc:
+        raise DispatchContractError("review-output-outside-artifact-root", str(target)) from exc
+    encoded_locator = metadata.get("review_output_locator_b64", "")
+    try:
+        mirrored_locator = decode_review_output_locator(encoded_locator)
+    except DispatchContractError as exc:
+        raise DispatchContractError("review-binding-locator-mismatch", attempt_id) from exc
+    if metadata.get("review_output_locator") or mirrored_locator != locator:
+        raise DispatchContractError("review-binding-locator-mismatch", attempt_id)
+    binding: dict[str, object] = {
+        "schema_version": REVIEW_OUTPUT_BINDING_SCHEMA_VERSION,
+        "attempt_id": attempt_id, "cycle_id": cycle_id,
+        "producer_id": producer_id, "worktree": expected_worktree,
+        "artifact_root": expected_root, "capability": capability,
+        "unit": unit, "output_path": str(target),
+    }
+    binding["digest"] = review_output_binding_digest(binding)
+    mirrored = metadata.get("review_output_digest")
+    if mirrored != binding["digest"]:
+        raise DispatchContractError("review-binding-digest-mismatch", attempt_id)
+    binding["_registry_metadata"] = metadata
+    binding["_registry_status"] = fields[1]
+    return binding
+
+
+def review_output_write_authorized(
+    jobs: str | Path, *, output_path: str | Path, attempt_id: str,
+    cycle_id: str, producer_id: str, capability: str, unit: str,
+    worktree: str | Path, artifact_root: str | Path,
+    lease_record: Mapping[str, object] | None,
+) -> bool:
+    """Read-only hook predicate for one exact live v2 report lease."""
+    try:
+        binding = validate_review_output_binding(
+            jobs, attempt_id=attempt_id, output_path=output_path,
+            cycle_id=cycle_id, producer_id=producer_id, capability=capability,
+            unit=unit, worktree=worktree, artifact_root=artifact_root,
+        )
+        if not isinstance(lease_record, Mapping) or lease_record.get("schema_version") != 2:
+            return False
+        for key, value in {
+            "attempt_id": attempt_id, "cycle_id": cycle_id,
+            "producer_id": producer_id, "worktree": binding["worktree"],
+            "artifact_root": binding["artifact_root"], "capability": capability,
+            "unit": unit, "review_output_path": binding["output_path"],
+            "review_output_digest": binding["digest"],
+        }.items():
+            if lease_record.get(key) != value:
+                return False
+        if (
+            lease_record.get("released_at") is not None
+            or lease_record.get("expired") is not False
+        ):
+            return False
+        acquired_at = lease_record.get("acquired_at")
+        deadline = lease_record.get("deadline")
+        if not isinstance(acquired_at, str) or not isinstance(deadline, str):
+            return False
+        try:
+            acquired_epoch = time.mktime(time.strptime(acquired_at, "%Y-%m-%dT%H:%M:%SZ")) - time.timezone
+            deadline_epoch = time.mktime(time.strptime(deadline, "%Y-%m-%dT%H:%M:%SZ")) - time.timezone
+        except (TypeError, ValueError, OverflowError):
+            return False
+        now = time.time()
+        if acquired_epoch > now or deadline_epoch < now or deadline_epoch <= acquired_epoch:
+            return False
+        metadata = binding.get("_registry_metadata")
+        if not isinstance(metadata, Mapping):
+            return False
+        required_identity = ("pid", "pid_start", "pgid", "pid_ns", "pid_observer_ns")
+        if not all(str(metadata.get(key, "")) for key in required_identity):
+            return False
+        for key in _PROCESS_IDENTITY_METADATA_KEYS:
+            observed = str(metadata.get(key, ""))
+            persisted = str(lease_record.get(key, ""))
+            if observed != persisted:
+                return False
+        for key in ("review_governed_lease", "review_governed_lease_nonce"):
+            if str(metadata.get(key, "")) != str(lease_record.get(key, "")):
+                return False
+        if (
+            acquired_at != metadata.get("review_lease_acquired_at")
+            or deadline != metadata.get("review_lease_deadline")
+        ):
+            return False
+        record_for_digest = {
+            key: value for key, value in lease_record.items()
+            if key != "review_lease_record_digest"
+        }
+        record_digest = review_lease_record_digest(record_for_digest)
+        if record_digest != metadata.get("review_lease_record_digest"):
+            return False
+        return review_governed_lease_is_held(binding["artifact_root"], metadata)
+    except (DispatchContractError, OSError, TypeError, ValueError):
+        return False
 
 
 def canonical_repository_identity(path: str | Path) -> str:
@@ -3189,6 +3554,7 @@ def spawn_claimed_attempt(
     launch_metadata: dict[str, str] | None = None,
     preclaim: Callable[[list[str]], None] | None = None,
     pre_release: Callable[[dict[str, str]], dict[str, str] | None] | None = None,
+    post_claim: Callable[[dict[str, str]], dict[str, str] | None] | None = None,
 ) -> tuple[subprocess.Popen, dict[str, str]]:
     """Claim one registered attempt while publishing its fenced process.
 
@@ -3199,6 +3565,9 @@ def spawn_claimed_attempt(
     fence or a fully attributable process group. ``pre_release`` may attach a
     bounded observer to that exact identity; its metadata is committed in the
     same replacement and any failure aborts the still-fenced worker.
+    ``post_claim`` is the narrow jobs-unlocked producer-admission seam. Its
+    bounded receipt is committed only after the exact row, identity, status,
+    and parent are revalidated under the jobs lock.
     """
 
     if not attempt_id:
@@ -3391,6 +3760,124 @@ def spawn_claimed_attempt(
                 ),
                 parent_binding.attempt_id,
             )
+        if post_claim is not None:
+            # Drop the jobs lock only for launches that actually need producer
+            # admission. Ordinary launches retain their historical lock/fence
+            # boundary unchanged.
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            try:
+                post_metadata = {
+                    key: str(value)
+                    for key, value in (post_claim(dict(identity)) or {}).items()
+                    if value not in (None, "")
+                }
+            except BaseException as exc:
+                cleanup_verified = _abort_fenced_launch(
+                    proc, gate_write, identity["pid_start"]
+                )
+                raise DispatchContractError(
+                    "attempt-post-claim-callback-failed"
+                    if cleanup_verified else "attempt-launch-cleanup-unverified",
+                    str(exc),
+                ) from exc
+            invalid_keys = sorted(
+                set(post_metadata) - REVIEW_POST_CLAIM_METADATA_KEYS
+            )
+            invalid_values = sorted(
+                key for key, value in post_metadata.items()
+                if any(char in value for char in ",\t\r\n")
+            )
+            if invalid_keys or invalid_values:
+                cleanup_verified = _abort_fenced_launch(
+                    proc, gate_write, identity["pid_start"]
+                )
+                raise DispatchContractError(
+                    "attempt-post-claim-metadata-invalid"
+                    if cleanup_verified else "attempt-launch-cleanup-unverified",
+                    ",".join(invalid_keys or invalid_values),
+                )
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                fresh_lines = jobs.read_text(
+                    encoding="utf-8", errors="replace"
+                ).splitlines()
+                fresh_matches: list[tuple[int, list[str], dict[str, str]]] = []
+                for index, line in enumerate(fresh_lines):
+                    fields = line.split("\t")
+                    if len(fields) != 6 or not row_has_attempt(fields[5], attempt_id):
+                        continue
+                    fresh_matches.append(
+                        (index, fields, parse_registry_metadata(fields[5]))
+                    )
+                if len(fresh_matches) != 1:
+                    raise DispatchContractError(
+                        "attempt-post-claim-row-not-unique", attempt_id
+                    )
+                fresh_index, fresh_fields, fresh_meta = fresh_matches[0]
+                validate_attempt_metadata(fresh_meta)
+                if (
+                    fresh_fields[1] not in {"open", "running"}
+                    or fresh_fields[2:5] != child_fields[2:5]
+                    or fresh_meta.get("launch_claimed") != "1"
+                    or any(
+                        fresh_meta.get(key) != str(value)
+                        for key, value in identity.items()
+                    )
+                ):
+                    raise DispatchContractError(
+                        "attempt-post-claim-identity-changed", attempt_id
+                    )
+                if parent_binding is not None:
+                    fresh_parents: list[dict[str, str]] = []
+                    for line in fresh_lines:
+                        fields = line.split("\t")
+                        if len(fields) != 6 or fields[1] not in {"open", "running"}:
+                            continue
+                        metadata = parse_registry_metadata(fields[5])
+                        if metadata.get("attempt_id") == parent_binding.attempt_id:
+                            fresh_parents.append(metadata)
+                    if (
+                        len(fresh_parents) != 1
+                        or not _parent_binding_is_live_from_metadata(
+                            jobs, fresh_parents[0], parent_binding
+                        )
+                    ):
+                        raise DispatchContractError(
+                            "parent-attempt-not-live-after-post-claim",
+                            parent_binding.attempt_id,
+                        )
+                collisions = sorted(
+                    key for key, value in post_metadata.items()
+                    if fresh_meta.get(key) not in (None, value)
+                )
+                if collisions:
+                    raise DispatchContractError(
+                        "attempt-post-claim-metadata-conflict",
+                        ",".join(collisions),
+                    )
+                parts = [
+                    part for part in fresh_fields[5].split(",")
+                    if part.split("=", 1)[0] not in post_metadata
+                ]
+                parts.extend(
+                    f"{key}={value}" for key, value in sorted(post_metadata.items())
+                )
+                fresh_fields[5] = ",".join(parts)
+                fresh_lines[fresh_index] = "\t".join(fresh_fields)
+                _atomic_registry_replace(jobs, fresh_lines)
+                identity.update(post_metadata)
+            except (DispatchContractError, OSError) as exc:
+                cleanup_verified = _abort_fenced_launch(
+                    proc, gate_write, identity["pid_start"]
+                )
+                if isinstance(exc, DispatchContractError):
+                    reason, detail = exc.reason, exc.detail
+                else:
+                    reason, detail = "attempt-post-claim-record-failed", str(exc)
+                raise DispatchContractError(
+                    reason if cleanup_verified else "attempt-launch-cleanup-unverified",
+                    detail,
+                ) from exc
         try:
             os.write(gate_write, b"1")
         except OSError as exc:

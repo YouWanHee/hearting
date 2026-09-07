@@ -290,8 +290,14 @@ case "$cmd" in
     doctor
     ;;
   write)
-    [ "$#" -ge 2 ] || { echo "opencode preflight: write requires a file path" >&2; exit 64; }
+    if [ "${2:-}" = "-h" ] || [ "${2:-}" = "--help" ]; then
+      [ "$#" -eq 2 ] || { echo "opencode preflight: write help accepts no extra arguments" >&2; exit 64; }
+      printf '%s\n' 'usage: preflight.sh write <file> [session-id] [turn-id]'
+      exit 0
+    fi
+    [ "$#" -ge 2 ] && [ "$#" -le 4 ] || { echo "opencode preflight: write expects <file> [session-id] [turn-id]" >&2; exit 64; }
     file=$2
+    case "$file" in -*) echo "opencode preflight: write file must be absolute or ./-prefixed" >&2; exit 64;; esac
     sid=${3:-opencode}
     turn=${4:-}
     if [ "${AGENT_DISPATCH_STAGE_AUTHORITY:-1}" = "0" ]; then
@@ -306,10 +312,12 @@ case "$cmd" in
     run_guard hooks/core-first-guard.sh --file "$file" --session "$sid"
     run_guard hooks/artifact-guard.sh --file "$file" --session "$sid"
     run_guard hooks/builtin-memory-guard.sh --file "$file"
+    material_tool=Write
+    [ -n "${AGENT_REVIEW_OUTPUT:-}" ] && material_tool=ArtifactWrite
     if [ -n "$turn" ]; then
-      "$0" material-route check --tool Write --file "$file" --cwd "$(dirname "$file")" --session "$sid" --turn "$turn"
+      "$0" material-route check --tool "$material_tool" --file "$file" --cwd "$(dirname "$file")" --session "$sid" --turn "$turn"
     else
-      "$0" material-route check --tool Write --file "$file" --cwd "$(dirname "$file")" --session "$sid"
+      "$0" material-route check --tool "$material_tool" --file "$file" --cwd "$(dirname "$file")" --session "$sid"
     fi
     ;;
   material-route)

@@ -35,9 +35,29 @@ SPEC.loader.exec_module(MATERIAL_GUARD)
 
 
 class MaterialRouteGuardTest(unittest.TestCase):
+    @staticmethod
+    def isolated_env() -> dict[str, str]:
+        return {
+            key: value for key, value in os.environ.items()
+            if not key.startswith("AGENT_DISPATCH_")
+            and not key.startswith("AGENT_OWNER_ROUTE_")
+            and not key.startswith("AGENT_ROUTE_")
+            and not key.startswith("AGENT_ARTIFACT_")
+        }
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
+        self._ambient_worker_env = {
+            key: value for key, value in os.environ.items()
+            if key.startswith("AGENT_DISPATCH_")
+            or key.startswith("AGENT_OWNER_ROUTE_")
+            or key.startswith("AGENT_ROUTE_")
+            or key.startswith("AGENT_ARTIFACT_")
+        }
+        for key in self._ambient_worker_env:
+            os.environ.pop(key, None)
+        self.addCleanup(self._restore_worker_env)
         self._original_agent_home = os.environ.get("AGENT_HOME")
         os.environ["AGENT_HOME"] = str(ROOT)
         self.addCleanup(self._restore_agent_home)
@@ -92,9 +112,8 @@ class MaterialRouteGuardTest(unittest.TestCase):
             "--workflow-mode", "untracked",
             "--artifact-guard", "preflight-passed",
         ]
-        compile_env = os.environ.copy()
+        compile_env = self.isolated_env()
         compile_env["AGENT_HOME"] = str(ROOT)
-        compile_env.pop("AGENT_DISPATCH_JOBS", None)
         return subprocess.run(command, text=True, capture_output=True, env=compile_env)
 
     def _restore_agent_home(self) -> None:
@@ -102,6 +121,17 @@ class MaterialRouteGuardTest(unittest.TestCase):
             os.environ.pop("AGENT_HOME", None)
         else:
             os.environ["AGENT_HOME"] = self._original_agent_home
+
+    def _restore_worker_env(self) -> None:
+        for key in list(os.environ):
+            if (
+                key.startswith("AGENT_DISPATCH_")
+                or key.startswith("AGENT_OWNER_ROUTE_")
+                or key.startswith("AGENT_ROUTE_")
+                or key.startswith("AGENT_ARTIFACT_")
+            ):
+                os.environ.pop(key, None)
+        os.environ.update(self._ambient_worker_env)
 
     def opportunity(
         self, session: str = "session-a", *, turn: str = "", cwd: Path | None = None,
@@ -135,8 +165,7 @@ class MaterialRouteGuardTest(unittest.TestCase):
                 turn = args[index + 1]
         if opportunity:
             self.opportunity(session, turn=turn)
-        clean = {key: value for key, value in os.environ.items()
-                 if key not in {"AGENT_ROUTE_FILE", "AGENT_ROUTE_ID", "AGENT_ROUTE_NODE"}}
+        clean = self.isolated_env()
         return subprocess.run(
             [
                 sys.executable, str(GUARD), "--agent-home", str(self.home),
@@ -171,6 +200,7 @@ class MaterialRouteGuardTest(unittest.TestCase):
             ],
             text=True,
             capture_output=True,
+            env=self.isolated_env(),
         )
 
     def reset(self) -> None:
