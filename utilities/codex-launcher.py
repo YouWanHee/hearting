@@ -92,14 +92,74 @@ class LauncherError(RuntimeError):
     """Installed launcher state is unsafe or incomplete."""
 
 
+_LOCK_OPEN_RETRIES = 5
+
+
 def _launcher_lock(home: Path):
-    path = home / ".harness" / "codex-launcher.lock"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    handle = path.open("a+b")
-    os.chmod(path, 0o600)
-    if fcntl is not None:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-    return handle
+    """Acquire a shared read-only lock on the installer-managed lock file.
+
+    Never creates, writes to, chmods, or unlinks the lock; a missing or unsafe
+    lock is a hard failure (fail-closed), not something this reader repairs.
+    Only a *replaced* pathname (the installer republishes the lock atomically
+    during install/repair) is retried, bounded by `_LOCK_OPEN_RETRIES`, so a
+    stale descriptor can never be mistaken for the live lock; every other
+    unsafe condition raises immediately rather than looping. Blocking on
+    `LOCK_SH` (rather than failing fast while the installer holds `LOCK_EX`)
+    is acceptable here: the installer's own write window is short and bounded,
+    and a launch that cannot read a consistent binding should wait for it
+    rather than race an in-progress install/repair.
+    """
+    if home.is_symlink() or not home.is_dir():
+        raise LauncherError(f"managed CODEX_HOME is unsafe: {home}")
+    harness_dir = home / ".harness"
+    if harness_dir.is_symlink() or not harness_dir.is_dir():
+        raise LauncherError(f"managed launcher state directory is unsafe: {harness_dir}")
+    if fcntl is None:
+        raise LauncherError("Codex launcher lock support (fcntl) is unavailable")
+    path = harness_dir / "codex-launcher.lock"
+    # O_NONBLOCK is required at open time: without it, opening a FIFO planted
+    # at the lock path for O_RDONLY blocks the launcher indefinitely waiting
+    # for a writer, turning a rejection case into a hang. It is cleared again
+    # once the descriptor is confirmed to be a regular file (regular-file
+    # reads are unaffected by O_NONBLOCK either way, but callers should not
+    # observe nonblocking semantics on the returned handle).
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+    for _ in range(_LOCK_OPEN_RETRIES):
+        try:
+            fd = os.open(path, flags)
+        except OSError as exc:
+            raise LauncherError(f"Codex launcher lock is unavailable: {path}") from exc
+        handle = os.fdopen(fd, "rb", buffering=0)
+        valid = False
+        try:
+            opened = os.fstat(handle.fileno())
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_uid != os.geteuid()
+                or opened.st_mode & 0o077
+            ):
+                raise LauncherError(f"Codex launcher lock is unsafe: {path}")
+            current_status_flags = fcntl.fcntl(handle.fileno(), fcntl.F_GETFL)
+            fcntl.fcntl(handle.fileno(), fcntl.F_SETFL, current_status_flags & ~os.O_NONBLOCK)
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+            try:
+                current = os.stat(path, follow_symlinks=False)
+            except OSError:
+                current = None
+            if (
+                current is not None
+                and stat.S_ISREG(current.st_mode)
+                and (opened.st_dev, opened.st_ino) == (current.st_dev, current.st_ino)
+            ):
+                valid = True
+                return handle
+            # Pathname was replaced (or unlinked) between open and flock: this
+            # descriptor is stale. Release and retry against the current name.
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            if not valid:
+                handle.close()
+    raise LauncherError(f"Codex launcher lock could not be safely acquired: {path}")
 
 
 def _unlock(handle) -> None:

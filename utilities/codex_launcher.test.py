@@ -8,7 +8,9 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -19,9 +21,13 @@ assert SPEC is not None and SPEC.loader is not None
 launcher = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(launcher)
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools" / "install"))
+import codex_launcher as installer_launcher  # noqa: E402
+import fixture_env  # noqa: E402
+
 
 class CodexLauncherRuntimeTest(unittest.TestCase):
-    def _state_fixture(self, root: Path, real: Path) -> Path:
+    def _state_fixture(self, root: Path, real: Path, *, lock_mode: int | None = 0o600) -> Path:
         home = root / ".codex"
         harness = home / ".harness"
         harness.mkdir(parents=True)
@@ -35,6 +41,10 @@ class CodexLauncherRuntimeTest(unittest.TestCase):
             "ingress_path": str(ingress), "wrapper_path": str(ingress),
         }), encoding="utf-8")
         (harness / "codex-launcher.json").chmod(0o600)
+        if lock_mode is not None:
+            lock = harness / "codex-launcher.lock"
+            lock.write_bytes(b"")
+            lock.chmod(lock_mode)
         return home
 
     def test_all_passthrough_commands_preserve_argv_after_vendor_replacement(self) -> None:
@@ -305,6 +315,459 @@ class CodexLauncherRuntimeTest(unittest.TestCase):
             private_state.write_text("{}\n", encoding="utf-8")
             with mock.patch.object(launcher.Path, "home", return_value=root):
                 self.assertEqual(launcher.launcher_state_home(private_home), private_home)
+
+    def test_reader_never_mutates_state_for_managed_invocations(self) -> None:
+        """The alternative framing's write-trace falsifier, without a live home:
+
+        exec/admin/--version must invoke the real CLI with byte-exact argv while
+        every mutating filesystem primitive (`os.mkdir`, write-capable `open`,
+        `os.chmod`, `os.unlink`, `Path.mkdir`) raises if the reader ever calls it,
+        and `os.open` is only ever asked for a read-only, non-creating descriptor.
+        """
+        forms = [
+            ["exec", "task with spaces", "", "--flag=\"quoted\"", "héllo"],
+            ["plugin", "list"],
+            ["--version"],
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            real = root / "vendor" / "codex"
+            real.parent.mkdir()
+            real.write_text("#!/bin/sh\n", encoding="utf-8")
+            real.chmod(0o755)
+            home = self._state_fixture(root, real)
+            lock = home / ".harness" / "codex-launcher.lock"
+            before_bytes = lock.read_bytes()
+            before_mode = lock.stat().st_mode & 0o777
+            observed_flags: list[int] = []
+            real_os_open = os.open
+            real_path_open = launcher.Path.open
+
+            def spy_os_open(path, flags, *args, **kwargs):
+                observed_flags.append(flags)
+                return real_os_open(path, flags, *args, **kwargs)
+
+            def guarded_path_open(self_path, mode="r", *args, **kwargs):
+                if any(char in mode for char in "wax+"):
+                    raise AssertionError(f"unexpected write-capable open: {self_path} mode={mode!r}")
+                return real_path_open(self_path, mode, *args, **kwargs)
+
+            for args in forms:
+                with self.subTest(args=args), mock.patch.dict(
+                    os.environ, {"CODEX_HOME": str(home), "HOME": str(root)}, clear=False
+                ), mock.patch.object(launcher.os, "execv") as execv, mock.patch.object(
+                    launcher.os, "mkdir", side_effect=AssertionError("unexpected os.mkdir")
+                ), mock.patch.object(
+                    launcher.os, "chmod", side_effect=AssertionError("unexpected os.chmod")
+                ), mock.patch.object(
+                    launcher.os, "unlink", side_effect=AssertionError("unexpected os.unlink")
+                ), mock.patch.object(
+                    launcher.Path, "mkdir", side_effect=AssertionError("unexpected Path.mkdir")
+                ), mock.patch.object(
+                    launcher.Path, "open", guarded_path_open
+                ), mock.patch.object(launcher.os, "open", side_effect=spy_os_open):
+                    launcher.sys.argv = ["codex-launcher.py", *args]
+                    self.assertIsNone(launcher.main())
+                    execv.assert_called_once_with(str(real), [str(real), *args])
+            self.assertTrue(observed_flags)
+            for flags in observed_flags:
+                self.assertFalse(flags & os.O_CREAT)
+                self.assertFalse(flags & os.O_WRONLY)
+                self.assertFalse(flags & os.O_RDWR)
+                self.assertFalse(flags & os.O_TRUNC)
+                self.assertFalse(flags & os.O_APPEND)
+            self.assertEqual(lock.read_bytes(), before_bytes)
+            self.assertEqual(lock.stat().st_mode & 0o777, before_mode)
+
+    def test_private_codex_home_reads_seeded_global_binding_without_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            real = root / "vendor" / "codex"
+            real.parent.mkdir()
+            real.write_text("#!/bin/sh\n", encoding="utf-8")
+            real.chmod(0o755)
+            global_home = self._state_fixture(root, real)
+            private_home = root / "private-codex"
+            private_home.mkdir()
+            with mock.patch.object(launcher.Path, "home", return_value=root), mock.patch.dict(
+                os.environ, {"CODEX_HOME": str(private_home)}, clear=False
+            ), mock.patch.object(launcher.os, "execv") as execv:
+                launcher.sys.argv = ["codex-launcher.py", "exec", "task"]
+                self.assertIsNone(launcher.main())
+                execv.assert_called_once_with(str(real), [str(real), "exec", "task"])
+            self.assertFalse((private_home / ".harness").exists())
+            self.assertFalse((global_home / ".harness" / "managed-sessions").exists())
+
+
+class LauncherLockReaderTest(unittest.TestCase):
+    """Direct coverage of `_launcher_lock`'s safety and rejection surface."""
+
+    def _harness(self, root: Path) -> Path:
+        home = root / ".codex"
+        harness = home / ".harness"
+        harness.mkdir(parents=True)
+        home.chmod(0o700)
+        return home
+
+    def _lock(self, home: Path, mode: int, *, content: bytes = b"") -> Path:
+        lock = home / ".harness" / "codex-launcher.lock"
+        lock.write_bytes(content)
+        lock.chmod(mode)
+        return lock
+
+    def test_accepts_0600_and_0400_seeded_locks(self) -> None:
+        for mode in (0o600, 0o400):
+            with self.subTest(mode=oct(mode)):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    home = self._harness(root)
+                    self._lock(home, mode)
+                    handle = launcher._launcher_lock(home)
+                    try:
+                        self.assertFalse(handle.closed)
+                    finally:
+                        launcher._unlock(handle)
+
+    def test_rejects_group_or_other_permissions(self) -> None:
+        for mode in (0o640, 0o604, 0o660, 0o666, 0o460):
+            with self.subTest(mode=oct(mode)):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    home = self._harness(root)
+                    self._lock(home, mode)
+                    with self.assertRaises(launcher.LauncherError):
+                        launcher._launcher_lock(home)
+
+    def test_rejects_wrong_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = self._harness(root)
+            self._lock(home, 0o600)
+            with mock.patch.object(launcher.os, "geteuid", return_value=os.geteuid() + 1):
+                with self.assertRaises(launcher.LauncherError):
+                    launcher._launcher_lock(home)
+
+    def test_rejects_nonregular_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = self._harness(root)
+            lock = home / ".harness" / "codex-launcher.lock"
+            os.mkfifo(lock)
+            os.chmod(lock, 0o600)
+            with self.assertRaises(launcher.LauncherError):
+                launcher._launcher_lock(home)
+
+    def test_rejects_unsafe_parent_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / ".codex"
+            home.mkdir()
+            harness = home / ".harness"
+            real_harness = root / "elsewhere-harness"
+            real_harness.mkdir()
+            harness.symlink_to(real_harness, target_is_directory=True)
+            with self.assertRaises(launcher.LauncherError):
+                launcher._launcher_lock(home)
+
+    def test_rejects_symlink_lock_without_touching_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = self._harness(root)
+            target = root / "target-lock"
+            target.write_bytes(b"original")
+            target.chmod(0o600)
+            lock = home / ".harness" / "codex-launcher.lock"
+            lock.symlink_to(target)
+            with self.assertRaises(launcher.LauncherError):
+                launcher._launcher_lock(home)
+            self.assertEqual(target.read_bytes(), b"original")
+            self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+
+    def test_rejects_missing_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = self._harness(root)
+            with self.assertRaises(launcher.LauncherError):
+                launcher._launcher_lock(home)
+
+    def test_missing_lock_makes_main_exit_69_without_exec_or_lock_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            real = root / "vendor" / "codex"
+            real.parent.mkdir()
+            real.write_text("#!/bin/sh\n", encoding="utf-8")
+            harness = CodexLauncherRuntimeTest()
+            home = harness._state_fixture(root, real, lock_mode=None)
+            lock = home / ".harness" / "codex-launcher.lock"
+            self.assertFalse(lock.exists())
+            with mock.patch.dict(
+                os.environ, {"CODEX_HOME": str(home), "HOME": str(root)}, clear=False
+            ), mock.patch.object(launcher.os, "execv") as execv:
+                launcher.sys.argv = ["codex-launcher.py", "exec", "task"]
+                self.assertEqual(launcher.main(), 69)
+                execv.assert_not_called()
+            self.assertFalse(lock.exists())
+
+    def test_transient_pathname_replacement_is_retried_then_valid(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = self._harness(root)
+            path = self._lock(home, 0o600, content=b"stale")
+
+            real_flock = launcher.fcntl.flock
+            calls = {"n": 0}
+
+            def replace_then_flock(fd, operation):
+                calls["n"] += 1
+                if calls["n"] == 1 and operation == launcher.fcntl.LOCK_SH:
+                    path.unlink()
+                    path.write_bytes(b"successor")
+                    path.chmod(0o600)
+                return real_flock(fd, operation)
+
+            with mock.patch.object(launcher.fcntl, "flock", side_effect=replace_then_flock):
+                handle = launcher._launcher_lock(home)
+            try:
+                self.assertEqual(handle.read(), b"successor")
+            finally:
+                launcher._unlock(handle)
+            self.assertGreaterEqual(calls["n"], 3)
+
+    def test_persistent_pathname_replacement_exhausts_retries_and_closes_descriptors(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = self._harness(root)
+            path = self._lock(home, 0o600, content=b"v0")
+
+            real_flock = launcher.fcntl.flock
+            generation = {"n": 0}
+
+            def replace_every_time(fd, operation):
+                if operation == launcher.fcntl.LOCK_SH:
+                    generation["n"] += 1
+                    path.unlink()
+                    path.write_bytes(f"v{generation['n']}".encode())
+                    path.chmod(0o600)
+                return real_flock(fd, operation)
+
+            open_fds: list[int] = []
+            real_os_open = launcher.os.open
+
+            def spy_open(p, flags, *a, **kw):
+                fd = real_os_open(p, flags, *a, **kw)
+                open_fds.append(fd)
+                return fd
+
+            with mock.patch.object(
+                launcher.fcntl, "flock", side_effect=replace_every_time
+            ), mock.patch.object(launcher.os, "open", side_effect=spy_open):
+                with self.assertRaises(launcher.LauncherError):
+                    launcher._launcher_lock(home)
+            self.assertEqual(len(open_fds), launcher._LOCK_OPEN_RETRIES)
+            for fd in open_fds:
+                with self.assertRaises(OSError):
+                    os.fstat(fd)
+
+    def test_symlink_replacement_rejects_without_touching_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = self._harness(root)
+            path = self._lock(home, 0o600, content=b"v0")
+            foreign = root / "foreign-lock"
+            foreign.write_bytes(b"foreign")
+            foreign.chmod(0o600)
+
+            real_flock = launcher.fcntl.flock
+
+            def replace_with_symlink(fd, operation):
+                if operation == launcher.fcntl.LOCK_SH:
+                    path.unlink()
+                    path.symlink_to(foreign)
+                return real_flock(fd, operation)
+
+            with mock.patch.object(launcher.fcntl, "flock", side_effect=replace_with_symlink):
+                with self.assertRaises(launcher.LauncherError):
+                    launcher._launcher_lock(home)
+            self.assertEqual(foreign.read_bytes(), b"foreign")
+
+
+class LauncherLockConcurrencyTest(unittest.TestCase):
+    """Real installer `_LauncherLock` vs. this reader's `_launcher_lock`.
+
+    Blocking `LOCK_SH` is intentional (see `_launcher_lock`'s docstring): a
+    reader behind a held `LOCK_EX` waits rather than failing fast. Every wait
+    below is bounded by an explicit timeout and every spawned thread is always
+    joined — on the happy path and on a stalled reader/writer alike — so a
+    stuck lock fails this test loudly instead of hanging the suite.
+    """
+
+    _WATCHDOG_SECONDS = 10.0
+
+    def test_reader_blocks_behind_a_held_exclusive_lock_then_succeeds(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / ".codex"
+            (home / ".harness").mkdir(parents=True)
+            home.chmod(0o700)
+            path = installer_launcher.lock_path(home)
+            path.write_bytes(b"")
+            path.chmod(0o600)
+
+            writer_holds = threading.Event()
+            release_writer = threading.Event()
+            writer_done = threading.Event()
+
+            def hold_writer() -> None:
+                lock = installer_launcher._LauncherLock(path)
+                lock.__enter__()
+                writer_holds.set()
+                release_writer.wait(timeout=self._WATCHDOG_SECONDS)
+                lock.__exit__(None, None, None)
+                writer_done.set()
+
+            writer = threading.Thread(target=hold_writer, daemon=True)
+            writer.start()
+            try:
+                self.assertTrue(
+                    writer_holds.wait(timeout=self._WATCHDOG_SECONDS), "writer never acquired LOCK_EX"
+                )
+
+                reader_started = threading.Event()
+                reader_done = threading.Event()
+                reader_result: dict[str, object] = {}
+
+                def read_while_locked() -> None:
+                    reader_started.set()
+                    try:
+                        reader_result["handle"] = launcher._launcher_lock(home)
+                    except BaseException as exc:  # noqa: BLE001 - surfaced on the main thread
+                        reader_result["error"] = exc
+                    finally:
+                        reader_done.set()
+
+                reader_thread = threading.Thread(target=read_while_locked, daemon=True)
+                reader_thread.start()
+                try:
+                    self.assertTrue(reader_started.wait(timeout=self._WATCHDOG_SECONDS))
+                    # The reader must still be blocked on LOCK_SH: it cannot finish
+                    # while the writer holds LOCK_EX.
+                    self.assertFalse(reader_done.wait(timeout=0.3))
+                    release_writer.set()
+                    self.assertTrue(writer_done.wait(timeout=self._WATCHDOG_SECONDS))
+                    self.assertTrue(
+                        reader_done.wait(timeout=self._WATCHDOG_SECONDS), "reader never unblocked"
+                    )
+                finally:
+                    reader_thread.join(timeout=self._WATCHDOG_SECONDS)
+                    self.assertFalse(reader_thread.is_alive(), "reader thread did not join")
+            finally:
+                release_writer.set()
+                writer.join(timeout=self._WATCHDOG_SECONDS)
+                self.assertFalse(writer.is_alive(), "writer thread did not join")
+
+            self.assertNotIn("error", reader_result)
+            launcher._unlock(reader_result["handle"])
+
+    def test_two_shared_readers_coexist(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / ".codex"
+            (home / ".harness").mkdir(parents=True)
+            home.chmod(0o700)
+            lock = home / ".harness" / "codex-launcher.lock"
+            lock.write_bytes(b"")
+            lock.chmod(0o600)
+
+            both_open = threading.Barrier(2, timeout=self._WATCHDOG_SECONDS)
+            handles: list = []
+            errors: list[BaseException] = []
+
+            def reader() -> None:
+                try:
+                    handle = launcher._launcher_lock(home)
+                    handles.append(handle)
+                    both_open.wait()
+                except BaseException as exc:  # noqa: BLE001 - surfaced on the main thread
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=reader, daemon=True) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=self._WATCHDOG_SECONDS)
+                self.assertFalse(thread.is_alive(), "shared reader stalled")
+
+            self.assertEqual(errors, [])
+            self.assertEqual(len(handles), 2)
+            for handle in handles:
+                launcher._unlock(handle)
+
+
+class InstallerLifecycleLockInvariantTest(unittest.TestCase):
+    """`state exists ⇒ lock exists`, exercised through the real installer lifecycle.
+
+    This does not edit installer production code or its own test file; it only
+    drives the installer's public `install`/`uninstall` through this reader's
+    module to prove the invariant the reader now depends on.
+    """
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.home = self.root / "home"
+        self.codex_home = self.home / ".codex"
+        self.bin_dir = self.home / ".local" / "bin"
+        self.real = self.root / "runtime" / "codex-real"
+        self.real.parent.mkdir(parents=True)
+        self.real.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        self.real.chmod(0o755)
+        self.codex_home.mkdir(parents=True)
+        self.codex_home.chmod(0o775)
+        self.bin_dir.mkdir(parents=True)
+        self.target = self.bin_dir / "codex"
+        self.target.symlink_to(self.real)
+        hermetic = fixture_env.build_environment(
+            self.root,
+            Path(__file__).resolve().parents[1],
+            base={"PATH": os.environ.get("PATH", "")},
+        )
+        hermetic.update(
+            {
+                "CODEX_HOME": str(self.codex_home),
+                "HARNESS_BIN_DIR": str(self.bin_dir),
+                "PATH": str(self.bin_dir),
+                "SHELL": "/bin/codex-launcher-test-unsupported-shell",
+            }
+        )
+        fixture_env.prepare_environment(hermetic)
+        self.environment = mock.patch.dict(os.environ, hermetic, clear=True)
+        self.environment.start()
+        self.addCleanup(self.environment.stop)
+
+    def test_state_exists_implies_lock_exists_across_install_repair_and_this_reader(self) -> None:
+        created = installer_launcher.install(codex_home=self.codex_home, bin_dir=self.bin_dir)
+        self.assertEqual(created["status"], "created")
+        self.assertTrue(installer_launcher.state_path(self.codex_home).is_file())
+        self.assertTrue(installer_launcher.lock_path(self.codex_home).is_file())
+
+        # This reader must be able to consume the lock the installer just published.
+        handle = launcher._launcher_lock(self.codex_home)
+        launcher._unlock(handle)
+
+        self.target.unlink()
+        self.target.symlink_to(self.real)
+        repaired = installer_launcher.install(codex_home=self.codex_home, bin_dir=self.bin_dir)
+        self.assertEqual(repaired["status"], "repaired")
+        self.assertTrue(installer_launcher.state_path(self.codex_home).is_file())
+        self.assertTrue(installer_launcher.lock_path(self.codex_home).is_file())
+
+        restored = installer_launcher.uninstall(codex_home=self.codex_home, bin_dir=self.bin_dir)
+        self.assertEqual(restored["status"], "restored")
+        self.assertFalse(installer_launcher.state_path(self.codex_home).is_file())
+        self.assertFalse(installer_launcher.lock_path(self.codex_home).exists())
+        with self.assertRaises(launcher.LauncherError):
+            launcher._launcher_lock(self.codex_home)
 
 
 class InteractivePermissionModeTest(unittest.TestCase):
