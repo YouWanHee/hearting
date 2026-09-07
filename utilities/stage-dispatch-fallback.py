@@ -1182,35 +1182,104 @@ def launch_confirm_deadline_seconds(args) -> float:
     return min(budget, confirm)
 
 
+def live_attempt_row(jobs: Path, route_id: str, node_id: str, attempt_id: str):
+    """The exact open/running row of this attempt whose governed process is
+    live right now, else None."""
+
+    row = next(
+        (
+            item for item in registry_rows(jobs, route_id, node_id)
+            if item.get("attempt_id") == attempt_id
+            and item.get("_status") in {"open", "running"}
+        ),
+        None,
+    )
+    if row is None:
+        return None
+    return row if attempt_process_quiescence(row).state == "live" else None
+
+
+def progress_tool_failure_verdict(args, route, node, attempt_id, tool, fields):
+    """SD-OPEN-38 (#9): a progress TOOL failure is evidence about the tool,
+    not about the child.
+
+    Measured (cairn W15a/W15b, 2026-09-07, six stages): `--start` returned
+    `progress-watchdog-fail-closed` / `watchdog_action=unknown` while the
+    registry row stayed open and the child finished normally. The verdict is
+    therefore cross-checked against the child itself before it may fail the
+    launch: an authoritative terminal row wins as before; a live exact process
+    on an open row demotes the tool failure to an advisory carried on the
+    launch receipt (`watchdog_verdict=advisory`); only a child that is neither
+    provably alive nor terminal keeps the fail-closed verdict.
+    """
+
+    terminal = terminal_attempt_state(args.jobs, route["route_id"], node["id"], attempt_id)
+    if terminal is not None and terminal[0] != "fail-closed":
+        return terminal
+    if live_attempt_row(args.jobs, route["route_id"], node["id"], attempt_id) is not None:
+        reason = fields.get("reason") or f"{tool}-exit"
+        return "observed", {
+            **{key: value for key, value in fields.items() if key not in {"check"}},
+            "action": "observed",
+            "watchdog_verdict": "advisory",
+            "watchdog_advisory_tool": tool,
+            "watchdog_advisory_reason": reason,
+            "watchdog_advisory_detail": fields.get("detail", "-"),
+        }
+    return "fail-closed", fields
+
+
 def watch_launched_attempt(args, route, node, attempt_id, launch_fields):
     """Synchronously observe one exact attempt for a bounded launch-confirm window."""
     progress = ROOT / "utilities/dispatch-progress.py"
     common = [sys.executable, str(progress), "--attempt-id", attempt_id,
               "--route-id", route["route_id"], "--route-node", node["id"],
               "--jobs", str(args.jobs)]
+    # `--if-absent`: the wrapper already seeded `launch` at spawn and the worker
+    # may have heartbeated past it by now; this seed is a floor, never a
+    # regression (SD-OPEN-38 root cause: `progress-phase-regression` from this
+    # very call was reported as `progress-watchdog-fail-closed`).
+    advisory: dict[str, str] = {}
     seed = subprocess.run(common[:2] + ["heartbeat"] + common[2:] +
-        ["--phase", "launch", "--kind", "registry",
+        ["--phase", "launch", "--kind", "registry", "--if-absent",
          "--evidence", f"pid={launch_fields.get('child_pid', '-')};start={launch_fields.get('child_pid_start', '-')}"],
         cwd=ROOT, text=True, capture_output=True, check=False, env=direct_env())
     if seed.returncode:
-        # A foreground-scoped wrapper returns only after the worker exits. The
-        # worker can therefore close its exact row before this late launch
-        # heartbeat is attempted. Preserve fail-closed behavior for every
-        # other seed failure, but let the authoritative terminal row win this
-        # completion race.
-        terminal = terminal_attempt_state(
-            args.jobs, route["route_id"], node["id"], attempt_id
-        )
-        if terminal is not None and terminal[0] != "fail-closed":
-            return terminal
-        return "fail-closed", output_fields(seed.stdout + seed.stderr)
+        seed_fields = output_fields(seed.stdout + seed.stderr)
+        if seed_fields.get("reason") == "progress-phase-regression":
+            # Cannot happen with --if-absent unless an older progress tool is
+            # installed; still not a launch failure, but it rides on the
+            # receipt as an advisory (review finding 9).
+            advisory.update({
+                "watchdog_verdict": "advisory",
+                "watchdog_advisory_tool": "heartbeat-seed",
+                "watchdog_advisory_reason": "progress-phase-regression",
+                "watchdog_advisory_detail": seed_fields.get("detail", "-"),
+            })
+        else:
+            # A foreground-scoped wrapper returns only after the worker exits.
+            # The worker can therefore close its exact row before this late
+            # launch heartbeat is attempted; the authoritative terminal row
+            # wins that race, a live child demotes the tool failure to an
+            # advisory, and anything else stays fail-closed.
+            verdict = progress_tool_failure_verdict(
+                args, route, node, attempt_id, "heartbeat-seed", seed_fields)
+            if verdict[0] != "observed":
+                return verdict
+            advisory.update(verdict[1])
     def observe():
         result = subprocess.run(common[:2] + ["watchdog"] + common[2:] +
             ["--progress-window-seconds", str(args.progress_window_seconds),
              "--watchdog-max-windows", "2", "--apply"], cwd=ROOT, text=True,
             capture_output=True, check=False, env=direct_env())
         last = output_fields(result.stdout + result.stderr)
-        if result.returncode or last.get("action", "").startswith("fail-closed"):
+        if result.returncode:
+            verdict = progress_tool_failure_verdict(
+                args, route, node, attempt_id, "watchdog", last)
+            if verdict[0] == "observed":
+                advisory.update(verdict[1])
+            return verdict
+        if last.get("action", "").startswith("fail-closed"):
             return "fail-closed", last
         if last.get("terminal_action") == "dead-capacity":
             return "capacity", last
@@ -1245,6 +1314,11 @@ def watch_launched_attempt(args, route, node, attempt_id, launch_fields):
         state, last = observe()
         if state != "observed":
             return state, last
+    if advisory:
+        # A tool failure seen during the window rides on the receipt even when
+        # a later observe succeeded: the owner reads it as advisory, not verdict.
+        last = {**last, **{key: value for key, value in advisory.items()
+                           if key.startswith("watchdog_")}}
     return "observed", last
 
 
@@ -1745,6 +1819,12 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                             # is reported as such, not swallowed as a plain start.
                             print(f"terminal_note={watch_fields.get('note', REVIEW_BLOCKING_NOTE)}")
                             print(f"review_verdict={watch_fields['review_verdict']}")
+                        if watch_fields.get("watchdog_verdict") == "advisory":
+                            # SD-OPEN-38 (#9): the progress tool failed while the
+                            # child was verified alive -- advisory, not a verdict.
+                            for key in ("watchdog_verdict", "watchdog_advisory_tool",
+                                        "watchdog_advisory_reason", "watchdog_advisory_detail"):
+                                print(f"{key}={watch_fields.get(key, '-')}")
                         print(f"job_registry={args.jobs}")
                         print("attempt_trace=" + "|".join(attempts))
                         print("prior_attempt_ids=" + ",".join(x for values in prior_failures.values() for x in values))

@@ -1750,6 +1750,7 @@ def _run_subdivision_batch_admission(args: argparse.Namespace, route: dict[str, 
         admission = SUBDIVISION_ADMISSION.admit_batch(
             route=route, node=node, manifest_path=args.subdivision_manifest,
             governor=governor, governor_root=governor_root, reserve=reserve_batch,
+            jobs=args.jobs,
         )
     except SUBDIVISION_ADMISSION.SubdivisionAdmissionError as exc:
         print(json.dumps({
@@ -1905,7 +1906,7 @@ def main(argv: list[str] | None = None) -> int:
                 # at admission. Record it here, keyed by manifest hash, so a
                 # resumed admission recovers the original start state.
                 ROUTE_MODULE.record_subdivision_baseline(
-                    route, str(node["id"]), _manifest
+                    route, str(node["id"]), _manifest, jobs=args.jobs
                 )
         parent_identity = DISPATCH_NODE.current_parent_identity()
         if parent_identity is None:

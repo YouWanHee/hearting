@@ -29,7 +29,7 @@ def emit(event, events=None):
         with open(events,"a",encoding="utf-8") as fh: fh.write(line+"\n")
 
 
-def seed_cycle_spec(spec_base: Path, artifact: Path):
+def seed_cycle_spec(spec_base: Path, artifact: Path, spec_root: Path | None = None):
     """W7C cycle layout: a fresh cycle's `artifacts/spec` is empty, so the
     transaction would see no pre-image and write no `_internal/versions/vN`
     snapshot -- which is why operators copied the previous version by hand
@@ -37,20 +37,41 @@ def seed_cycle_spec(spec_base: Path, artifact: Path):
     (every component, D-87) plus the `_internal/versions/v*` history of every
     earlier revision of that reference, so the pre-image, the version counter
     and the snapshot all come from the tool. Returns an event dict."""
-    if any(p.is_file() for p in spec_base.rglob("*")):
-        has_prd=(spec_base/"prd.md").is_file() or any(p.name=="prd.md" and p.parent.parent==spec_base for p in spec_base.rglob("prd.md"))
-        return {"status":"seed-skipped","reason":"spec-base-not-empty","prd_present":has_prd,"spec_base":str(spec_base)}
+    # SD-OPEN-50 (H1): the seed predicate is "no prd.md", not "no file". A
+    # transactional standard+ owner's worker writes `_internal/research/**`
+    # under the route's spec write scope BEFORE the transaction runs, so the
+    # old any-file test skipped the seed on a bucket that held research notes
+    # and no PRD: no pre-image, `next_version=1`, no snapshot (cairn v173,
+    # 2026-09-07 -- the owner worked around it by mv -> staging -> restore).
+    # Worker residue is preserved: seeding never overwrites an existing file.
+    # `prd_present` is judged where the transaction writes (`spec_root`: the
+    # component subtree for a scoped transaction, else the bucket top), and it
+    # is an event label, not an early return: the copy loop always runs and
+    # `kept_existing` keeps it idempotent, so a half-seeded bucket (crash
+    # mid-seed) or a bucket where only another component holds a prd.md is
+    # completed on the next run (review finding 6).
+    scope=spec_root if spec_root is not None else spec_base
+    has_prd=(scope/"prd.md").is_file() or (spec_root is None and any(p.name=="prd.md" and p.parent.parent==spec_base for p in spec_base.rglob("prd.md")))
+    preexisting=sum(1 for p in spec_base.rglob("*") if p.is_file()) if spec_base.is_dir() else 0
     revision=CUTOVER.latest_shared_revision(artifact,"spec")
     if revision is None:
-        return {"status":"seed-skipped","reason":"no-shared-revision","spec_base":str(spec_base)}
-    copied=0
+        return {"status":"seed-skipped","reason":"prd-present" if has_prd else "no-shared-revision","prd_present":has_prd,"preexisting_files":preexisting,"spec_base":str(spec_base)}
+    copied=0; kept=0; kept_paths=[]
     for src in sorted(revision.rglob("*")):
         if not src.is_file() or src.is_symlink():
             continue
         rel=src.relative_to(revision)
         if rel.as_posix()=="revision.json":
             continue
-        dst=spec_base/rel; dst.parent.mkdir(parents=True,exist_ok=True)
+        dst=spec_base/rel
+        if dst.exists():
+            # A worker copy of a file the shared revision also carries wins
+            # silently only in count; the names ride on the event so an owner
+            # can diff them before admit (review finding 8).
+            kept+=1
+            if len(kept_paths)<20: kept_paths.append(rel.as_posix())
+            continue
+        dst.parent.mkdir(parents=True,exist_ok=True)
         dst.write_bytes(src.read_bytes()); copied+=1
     history=0
     revisions_dir=revision.parent
@@ -68,7 +89,11 @@ def seed_cycle_spec(spec_base: Path, artifact: Path):
                 if dst.exists() or src.is_symlink() or not src.is_file():
                     continue
                 dst.parent.mkdir(parents=True,exist_ok=True); dst.write_bytes(src.read_bytes()); history+=1
-    return {"status":"seeded","source":str(revision),"files":copied,"history_versions":history,"spec_base":str(spec_base)}
+    if has_prd and copied==0 and history==0:
+        return {"status":"seed-skipped","reason":"prd-present","prd_present":True,"preexisting_files":preexisting,
+                "kept_existing":kept,"kept_existing_paths":kept_paths,"source":str(revision),"spec_base":str(spec_base)}
+    return {"status":"seeded","source":str(revision),"files":copied,"history_versions":history,"prd_present":has_prd,
+            "preexisting_files":preexisting,"kept_existing":kept,"kept_existing_paths":kept_paths,"spec_base":str(spec_base)}
 
 
 def legacy_spec_state(artifact: Path):
@@ -327,7 +352,7 @@ def main():
             # Seed only once the route contract passed and the spec lock is ours:
             # a refused run must leave no admittable content behind, and two
             # transactions on one cycle must not interleave a half copy.
-            seeded=seed_cycle_spec(spec_base,artifact)
+            seeded=seed_cycle_spec(spec_base,artifact,spec_root if spec_root!=spec_base else None)
             emit({**seeded,"route_id":route["route_id"]},args.events)
         if spec_layout=="cycle" and version==1 and (spec_root/"prd.md").is_file():
             # A pre-image with no history in ANY tree of this spec's chain

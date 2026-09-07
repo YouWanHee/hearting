@@ -3620,6 +3620,8 @@ class TestValidationBasis(unittest.TestCase):
    msg=str(exc)
    self.assertIn(skewed["registry_digest"],msg)
    self.assertIn(R.TOPO.registry_digest(R.TOPO.load_registry()),msg)
+   # SD-OPEN-47 (H7-d): the operator is told which root to re-run through.
+   self.assertIn("re-run via the tooling under /tmp/b2-fixture-other-registry-root",msg)
    self.assertIn("/tmp/b2-fixture-other-registry-root",msg)
    self.assertIn(str(R.TOPO.ROOT),msg)
   skewed=json.loads(json.dumps(route))

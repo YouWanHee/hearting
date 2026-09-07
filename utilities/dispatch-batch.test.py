@@ -220,6 +220,12 @@ class DispatchBatchTest(unittest.TestCase):
         self.route_path = self.base / "route.json"
         self.route_path.write_text("{}", encoding="utf-8")
         self.jobs = self.base / "jobs.log"
+        # SD-OPEN-49 / H8: every state-root derivation that does not take the
+        # explicit `--jobs` reads `AGENT_DISPATCH_JOBS`, and unset means the
+        # per-user default -- the live root. Pin it to the fixture registry.
+        state_env = mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(self.jobs)})
+        state_env.start()
+        self.addCleanup(state_env.stop)
         self.route = {
             "route_id": "rt-fixture",
             "route_hash": "sha256:fixture",

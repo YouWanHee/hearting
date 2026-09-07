@@ -109,9 +109,13 @@ never retro-fitted; do not attempt to apply this gate to an already-open route.
    `answers`; exit 3 (`revise`) returns to `frame` under the `code-refine`
    retry boundary and the gate is raised again afterwards; exit 4 (`stop`)
    cancels the route with `abandon_reason=operator-decision`. Never release
-   your own gate (`release`/`gate --release`) to move on: a registered owner's
-   release is recorded `released_by=headless-owner` and the plan it unblocks
-   was never confirmed by anyone. Never sleep, never write an ad-hoc polling
+   your own gate (`release`/`gate --release`) to move on: the frame gate is
+   sealed `release_authority=depth-0` at the raise, so a registered owner's
+   release is refused typed (`gate-release-authority-refused`) and would
+   otherwise unblock a plan nobody confirmed. Write the interview in the
+   `frame_interview_v1` shape only: an artifact that calls itself an
+   interview under another schema is refused at the raise
+   (`interview-schema-unsupported`). Never sleep, never write an ad-hoc polling
    loop, and never spawn `plan` while `await-release` has not returned 0 —
    every launch surface refuses a `plan` start whose entry gate is not
    released (`human-gate-unreleased` / `human-gate-not-raised`, defect M).

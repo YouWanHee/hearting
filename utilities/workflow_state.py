@@ -469,7 +469,7 @@ def human_gate_resolution(entries: list, gate: str) -> dict:
         "gate": gate, "status": "not-raised", "epoch": 0,
         "raised_at": None, "resolved_at": None, "released_by": None,
         "actor_kind": None, "artifact": None, "delivery": None, "answers": None,
-        "interview": False, "questions": 0,
+        "interview": False, "questions": 0, "release_authority": None,
     }
     for entry in entries:
         if not isinstance(entry, dict):
@@ -488,6 +488,10 @@ def human_gate_resolution(entries: list, gate: str) -> dict:
                 # round 1, B2).
                 "interview": bool(evidence.get("interview")),
                 "questions": int(evidence.get("questions") or 0),
+                # SD-OPEN-48: who may release, sealed at the raise. A raise
+                # that predates the field reads as None; the release resolves
+                # that against the route binding.
+                "release_authority": evidence.get("release_authority") or None,
             })
             continue
         if result["status"] != "blocked":
