@@ -9,6 +9,24 @@ import resource_run_registry as registry
 
 
 class ResourceRegistryTest(unittest.TestCase):
+    def test_normalize_preserves_additive_artifact_attribution_fields(self):
+        raw = {
+            "status": "succeeded",
+            "artifact_root": "/artifacts",
+            "route": "/artifacts/.runtime/routes/rt-a.json",
+            "route_file": "/artifacts/.runtime/routes/rt-a.json",
+            "route_id": "rt-a",
+            "route_hash": "sha256:" + "a" * 64,
+            "node": "test",
+            "route_node": "test",
+        }
+        row = registry.normalize_run(
+            "run-a", raw, Path("/registry.json"), identity_reader=lambda _pid: None,
+        )
+        for key in ("artifact_root", "route", "route_file", "route_id", "route_hash",
+                    "node", "route_node"):
+            self.assertEqual(row[key], raw[key])
+
     def test_missing_registry_is_typed_skip_with_valid_neighbor(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td); index = base / "index.json"

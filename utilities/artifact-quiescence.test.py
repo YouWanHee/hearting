@@ -20,6 +20,420 @@ class QuiescenceTest(unittest.TestCase):
         Path(config["resource_index"]).write_text(json.dumps({"schema_version": 1,
             "registries": {str(i): {"path": str(p)} for i, p in enumerate(paths)}}))
 
+    def artifact_root(self, base: Path, name: str) -> Path:
+        root = base / name
+        (root / ".runtime" / "routes").mkdir(parents=True)
+        return root
+
+    def sealed_route(self, root: Path, node: str = "test") -> tuple[dict, Path]:
+        quick = node == "one-shot"
+        cwd = str(root.parent)
+        candidate = {"harness": "codex", "surface": "registered-headless",
+                     "transport": "headless", "status": "supported",
+                     "probe_source": "hermetic-fixture", "probe_time": "2026-09-07T00:00:00Z"}
+        evidence = {"tuples": [{"parent_harness": "codex", "parent_transport": "headless",
+            "parent_sandbox": "workspace-write", "child_harness": "codex",
+            "launch_authority": "conductor", "status": "supported", "failure_class": "",
+            "probe_source": "hermetic-fixture", "probe_time": "2026-09-07T00:00:00Z",
+            "checked_worktree": cwd, "codex_command": "ok", "failure_scope": "none",
+            "retry_on_isolated_worktree": 0}], "native_subagent": []}
+        if node == "eval-run":
+            route = Q.ROUTES.compile_route(
+                capability="autopilot-lab", capability_mode="eval", requested_intensity="standard",
+                cwd=cwd, artifact_root=str(root), slug="fixture", transport="headless",
+                dispatch_evidence=evidence, tracked_gate_evidence={
+                    "spec_read": {"satisfied": True, "source": "hermetic-fixture"},
+                    "drift_verdict": "within-spec", "workflow_mode": "tracked",
+                    "artifact_guard": {"satisfied": True, "source": "hermetic-fixture"}})
+        else:
+            route = Q.ROUTES.compose_route(
+                capability="autopilot-code",
+                capability_mode="debug", slug="fixture",
+                shape="solo" if quick else "staged", graph=None if quick else node,
+                intensity="quick" if quick else "standard", cwd=cwd, artifact_root=str(root),
+                spec_read="hermetic-fixture", drift_verdict="hermetic-fixture",
+                dispatch_evidence=None if quick else evidence,
+                registered_headless_evidence={"candidates": [candidate]} if quick else None)
+        Q.ROUTES.verify_route(route, allow_stale_registry=True)
+        path = root / ".runtime" / "routes" / f"{route['route_id']}.json"
+        path.write_text(json.dumps(route), encoding="utf-8")
+        return route, path
+
+    def dispatch_row(self, *, slug: str, attempt: str, metadata: dict,
+                     status: str = "open") -> str:
+        base = {
+            "attempt_schema_version": "2",
+            "dispatch_depth": "2",
+            "transport": "headless",
+            "execution_surface": "registered-headless",
+            "registered_worker": "1",
+            "fallback_hop": "same-harness-headless",
+            "attempt_id": attempt,
+        }
+        base.update({key: str(value) for key, value in metadata.items()})
+        pipe = ",".join(f"{key}={value}" for key, value in base.items())
+        return f"2026-09-07T00:00:00Z\t{status}\t/repo\t/worktree\t{slug}\t{pipe}\n"
+
+    def write_resource_runs(self, config: dict, base: Path, runs: dict) -> Path:
+        registry = base / "resource.json"
+        registry.write_text(json.dumps({"schema_version": 1, "runs": runs}), encoding="utf-8")
+        self.indexed(config, registry)
+        return registry
+
+    def test_review_quick_owner_route_tuple_is_attributable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory); config = self.fixture(base)
+            root = Path(config["artifact_root"])
+            route, path = self.sealed_route(root, "one-shot")
+            Path(config["dispatch_jobs"]).write_text(self.dispatch_row(
+                slug="quick", attempt="att-quick", metadata={
+                    "dispatch_depth": "1", "worker_type": "owner", "unit": "_kernel/owner",
+                    "artifact_root": root, "route_file": path, "route_id": route["route_id"],
+                    "route_hash": route["route_hash"], "route_node": "one-shot"}))
+            value = Q.collect(config)
+            self.assertTrue(value["observation_valid"], value.get("source_diagnostics"))
+            self.assertEqual(value["open_dispatch_attempts"], 1)
+
+    def test_review_duplicate_dispatch_identity_is_not_silently_external(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory); config = self.fixture(base)
+            other = self.artifact_root(base, "external")
+            row = self.dispatch_row(slug="dup", attempt="att-dup",
+                                    metadata={"artifact_root": config["artifact_root"]})
+            Path(config["dispatch_jobs"]).write_text(row.rstrip()+f",artifact_root={other}\n")
+            value = Q.publish(str(base / "evidence.json"), config)
+            self.assertFalse(value["observation_valid"])
+            self.assertEqual(value["unattributable_open_items"], 1)
+
+    def test_review_resource_alias_and_json_duplicate_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory); config = self.fixture(base)
+            route, path = self.sealed_route(Path(config["artifact_root"]))
+            registry = self.write_resource_runs(config, base, {"run": {
+                "status": "running", "route": str(path), "node": "test", "route_node": "wrong"}})
+            value = Q.publish(str(base / "aliases.json"), config)
+            self.assertFalse(value["observation_valid"])
+            registry.write_text('{"schema_version":1,"runs":{"run":{"status":"running",'
+                '"artifact_root":"/unknown","artifact_root":'+json.dumps(config["artifact_root"])+'}}}')
+            value = Q.publish(str(base / "duplicate.json"), config)
+            self.assertFalse(value["observation_valid"])
+
+    def test_review_incomplete_route_is_not_external_proof(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory); config = self.fixture(base)
+            root = self.artifact_root(base, "external")
+            route = {"schema_version": 2, "artifact_root": str(root),
+                     "cwd": str(base), "nodes": [{"id": "test"}]}
+            route["route_hash"] = Q.ROUTES.route_hash(route)
+            route["route_id"] = "rt-" + route["route_hash"].split(":")[1][:16]
+            path = root / ".runtime/routes" / (route["route_id"] + ".json")
+            path.write_text(json.dumps(route))
+            self.write_resource_runs(config, base, {"run": {
+                "status": "running", "route": str(path), "node": "test"}})
+            value = Q.publish(str(base / "evidence.json"), config)
+            self.assertFalse(value["observation_valid"])
+            self.assertEqual(value["unattributable_open_items"], 1)
+
+    def test_review_route_semantics_and_digest_share_one_read(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.artifact_root(Path(directory), "artifacts")
+            route, path = self.sealed_route(root)
+            first = path.read_bytes()
+            original = Q._file_row
+            def replace_before_second_read(file):
+                path.write_bytes(first + b" ")
+                return original(file)
+            with patch.object(Q, "_file_row", replace_before_second_read):
+                proof = Q._sealed_route(str(path), expected_node="test")
+            self.assertEqual(proof["file"]["sha256"], Q._digest_bytes(first))
+
+    def test_review_stale_route_graph_and_unknown_basis_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.artifact_root(Path(directory), "artifacts")
+            route, path = self.sealed_route(root)
+            route["registry_digest"] = "sha256:" + "0" * 64
+            def seal(value):
+                value["route_hash"] = Q.ROUTES.route_hash(value)
+                value["route_id"] = "rt-" + value["route_hash"].split(":")[1][:16]
+                target = path.with_name(value["route_id"] + ".json")
+                target.write_text(json.dumps(value))
+                return target
+            self.assertEqual(Q._sealed_route(str(seal(route)))["artifact_root"]["resolved_path"], str(root))
+            bad = json.loads(json.dumps(route)); bad["nodes"][0]["depends_on"] = ["test"]
+            with self.assertRaises(ValueError):
+                Q._sealed_route(str(seal(bad)))
+            bad = json.loads(json.dumps(route)); bad["validation_basis"]["basis_version"] = 999
+            with self.assertRaises(ValueError):
+                Q._sealed_route(str(seal(bad)))
+
+    def test_review_stale_workflow_contract_must_be_complete(self):
+        for mutation in ("terminal-gate", "terminal-resource", "duplicate-gate", "continuation", "workflow-map"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                base = Path(directory); config = self.fixture(base)
+                root = self.artifact_root(base, "external")
+                route, path = self.sealed_route(root)
+                route["registry_digest"] = "sha256:" + "0" * 64
+                node = route["nodes"][0]
+                if mutation == "terminal-gate": node.pop("terminal_gate")
+                elif mutation == "terminal-resource": node["kind"] = "resource-runner"
+                elif mutation in ("duplicate-gate", "continuation"):
+                    extra = json.loads(json.dumps(node)); extra["id"] = "extra"
+                    if mutation == "continuation": extra["terminal"] = False
+                    route["nodes"].append(extra)
+                    route["workflow_contract"]["terminal_nodes"] = sorted(n["id"] for n in route["nodes"] if n.get("terminal"))
+                else: route["workflow_contract"]["continuations"] = {"test": "supervised"}
+                route["route_hash"] = Q.ROUTES.route_hash(route)
+                route["route_id"] = "rt-" + route["route_hash"].split(":")[1][:16]
+                path = path.with_name(route["route_id"] + ".json"); path.write_text(json.dumps(route))
+                self.write_resource_runs(config, base, {"run": {"status": "running", "route": str(path), "node": "test"}})
+                value = Q.publish(str(base / "bad-workflow.json"), config)
+                self.assertFalse(value["observation_valid"])
+                self.assertEqual(value["unattributable_open_items"], 1)
+
+    def test_review_real_resource_route_remains_attributable_when_stale(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory); config = self.fixture(base)
+            root = self.artifact_root(base, "external")
+            route, path = self.sealed_route(root, "eval-run")
+            for stale in (False, True):
+                with self.subTest(stale=stale):
+                    if stale:
+                        route["registry_digest"] = "sha256:" + "0" * 64
+                        route["route_hash"] = Q.ROUTES.route_hash(route)
+                        route["route_id"] = "rt-" + route["route_hash"].split(":")[1][:16]
+                        path = path.with_name(route["route_id"] + ".json"); path.write_text(json.dumps(route))
+                    self.write_resource_runs(config, base, {"run": {"status": "running", "route": str(path), "node": "eval-run"}})
+                    value = Q.publish(str(base / f"resource-{stale}.json"), config)
+                    self.assertTrue(value["proven"], value)
+                    self.assertEqual(value["sources"]["attribution"]["summary"]["external"]["resource"], 1)
+
+    def test_review_route_read_rejects_file_and_ancestor_races(self):
+        for mutation in ("replace", "content", "ancestor"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                base = Path(directory); root = self.artifact_root(base, "artifacts")
+                _, path = self.sealed_route(root)
+                alias = base / "alias"; alias.symlink_to(root, target_is_directory=True)
+                selected = alias / path.relative_to(root) if mutation == "ancestor" else path
+                original = Q.RESOURCES.os.fstat
+                calls = 0
+                def raced(fd):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 2:
+                        if mutation == "replace":
+                            replacement = path.with_suffix(".new")
+                            replacement.write_bytes(path.read_bytes()); replacement.replace(path)
+                        elif mutation == "content":
+                            with path.open("ab") as stream: stream.write(b" ")
+                        else:
+                            other = self.artifact_root(base, "external")
+                            alias.unlink(); alias.symlink_to(other, target_is_directory=True)
+                    return original(fd)
+                with patch.object(Q.RESOURCES.os, "fstat", side_effect=raced), self.assertRaises((ValueError, OSError)):
+                    Q._sealed_route(str(selected))
+
+    def test_scopes_mixed_owner_stage_and_resource_rows_by_physical_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory); config = self.fixture(base)
+            target = Path(config["artifact_root"])
+            external = self.artifact_root(base, "external-artifacts")
+            target_route, target_route_path = self.sealed_route(target)
+            external_route, external_route_path = self.sealed_route(external)
+            owner = {
+                "dispatch_depth": "1", "worker_type": "owner", "unit": "_kernel/owner",
+                "owner_route_file": target_route_path,
+                "owner_route_id": target_route["route_id"],
+                "owner_route_hash": target_route["route_hash"],
+                "artifact_root": target,
+            }
+            external_stage = {
+                "route_file": external_route_path, "route_id": external_route["route_id"],
+                "route_hash": external_route["route_hash"], "route_node": "test",
+                "artifact_root": external,
+            }
+            Path(config["dispatch_jobs"]).write_text(
+                self.dispatch_row(slug="target-owner", attempt="att-target-owner", metadata=owner)
+                + self.dispatch_row(slug="external-stage", attempt="att-external-stage",
+                                    metadata=external_stage)
+                + self.dispatch_row(slug="target-adhoc", attempt="att-target-adhoc",
+                                    metadata={"artifact_root": target})
+                + self.dispatch_row(slug="external-adhoc", attempt="att-external-adhoc",
+                                    metadata={"artifact_root": external}),
+                encoding="utf-8",
+            )
+            identity = Q.RESOURCES.proc_identity(os.getpid())
+            self.write_resource_runs(config, base, {
+                "target-route": {**identity, "status": "running", "route": str(target_route_path),
+                                 "node": "test"},
+                "external-route": {**identity, "status": "running", "route": str(external_route_path),
+                                   "node": "test"},
+                "target-explicit": {**identity, "status": "running", "artifact_root": str(target)},
+            })
+            value = Q.publish(str(base / "mixed.json"), config)
+            self.assertTrue(value["observation_valid"], value)
+            self.assertEqual(value["open_routes"], 1)
+            self.assertEqual(value["open_dispatch_attempts"], 2)
+            self.assertEqual(value["open_jobs"], 2)
+            self.assertEqual(value["unattributable_open_items"], 0)
+            summary = value["sources"]["attribution"]["summary"]
+            self.assertEqual(summary["external"]["dispatch"], 2)
+            self.assertEqual(summary["external"]["resource"], 1)
+            self.assertEqual(summary["target"]["dispatch"], 2)
+            self.assertEqual(summary["target"]["resource"], 2)
+
+    def test_open_unattributable_fails_closed_but_closed_historical_is_ignored(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory); config = self.fixture(base)
+            missing = self.dispatch_row(
+                slug="unknown", attempt="att-unknown", metadata={})
+            Path(config["dispatch_jobs"]).write_text(missing, encoding="utf-8")
+            opened = Q.publish(str(base / "open.json"), config)
+            self.assertFalse(opened["observation_valid"], opened)
+            self.assertEqual(opened["reason"], "open-item-unattributable")
+            self.assertEqual(opened["unattributable_open_items"], 1)
+            self.assertEqual(opened["pending"], 1)
+
+            Path(config["dispatch_jobs"]).write_text(
+                self.dispatch_row(slug="unknown", attempt="att-unknown", metadata={}, status="done"),
+                encoding="utf-8",
+            )
+            closed = Q.publish(str(base / "closed.json"), config)
+            self.assertTrue(closed["observation_valid"], closed)
+            self.assertTrue(closed["proven"], closed)
+            self.assertEqual(closed["sources"]["attribution"]["summary"]["historical"]["dispatch"], 1)
+
+    def test_route_conflict_tamper_missing_and_relative_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory); config = self.fixture(base)
+            target = Path(config["artifact_root"])
+            external = self.artifact_root(base, "external")
+            route, route_path = self.sealed_route(external)
+            cases = {
+                "root-conflict": {
+                    "artifact_root": target, "route_file": route_path,
+                    "route_id": route["route_id"], "route_hash": route["route_hash"],
+                    "route_node": "test",
+                },
+                "missing": {
+                    "route_file": external / ".runtime/routes/absent.json",
+                    "route_id": route["route_id"], "route_hash": route["route_hash"],
+                    "route_node": "test",
+                },
+                "relative": {
+                    "route_file": "relative-route.json", "route_id": route["route_id"],
+                    "route_hash": route["route_hash"], "route_node": "test",
+                },
+                "hash-mismatch": {
+                    "route_file": route_path, "route_id": route["route_id"],
+                    "route_hash": "sha256:" + "0" * 64, "route_node": "test",
+                },
+                "node-mismatch": {
+                    "route_file": route_path, "route_id": route["route_id"],
+                    "route_hash": route["route_hash"], "route_node": "absent-node",
+                },
+                "relative-root": {"artifact_root": "relative-artifacts"},
+            }
+            for name, metadata in cases.items():
+                with self.subTest(name=name):
+                    Path(config["dispatch_jobs"]).write_text(
+                        self.dispatch_row(slug=name, attempt=f"att-{name}", metadata=metadata),
+                        encoding="utf-8",
+                    )
+                    value = Q.publish(str(base / f"{name}.json"), config)
+                    self.assertFalse(value["observation_valid"], value)
+                    self.assertEqual(value["unattributable_open_items"], 1)
+            route["tampered"] = True
+            route_path.write_text(json.dumps(route), encoding="utf-8")
+            Path(config["dispatch_jobs"]).write_text(
+                self.dispatch_row(slug="tampered", attempt="att-tampered", metadata={
+                    "route_file": route_path, "route_id": route["route_id"],
+                    "route_hash": route["route_hash"], "route_node": "test",
+                }), encoding="utf-8")
+            tampered = Q.publish(str(base / "tampered.json"), config)
+            self.assertFalse(tampered["observation_valid"], tampered)
+            self.assertEqual(tampered["unattributable_open_items"], 1)
+
+    def test_external_route_dependency_is_sealed_and_revalidated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory); config = self.fixture(base)
+            external = self.artifact_root(base, "external")
+            route, route_path = self.sealed_route(external)
+            Path(config["dispatch_jobs"]).write_text(
+                self.dispatch_row(slug="external", attempt="att-external", metadata={
+                    "route_file": route_path, "route_id": route["route_id"],
+                    "route_hash": route["route_hash"], "route_node": "test",
+                }), encoding="utf-8")
+            evidence = base / "external.json"
+            self.assertTrue(Q.publish(str(evidence), config)["proven"])
+            replacement = base / "same-route.json"
+            replacement.write_bytes(route_path.read_bytes())
+            replacement.replace(route_path)
+            checked = Q.validate(str(evidence), allow_fixture=True)
+            self.assertFalse(checked["proven"], checked)
+
+    def test_explicit_root_symlink_alias_is_physical_and_retarget_invalidates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory); config = self.fixture(base)
+            target = Path(config["artifact_root"])
+            external = self.artifact_root(base, "external")
+            alias = base / "root-alias"
+            alias.symlink_to(external, target_is_directory=True)
+            Path(config["dispatch_jobs"]).write_text(
+                self.dispatch_row(slug="alias", attempt="att-alias",
+                                  metadata={"artifact_root": alias}), encoding="utf-8")
+            evidence = base / "alias.json"
+            value = Q.publish(str(evidence), config)
+            self.assertTrue(value["proven"], value)
+            alias.unlink(); alias.symlink_to(target, target_is_directory=True)
+            self.assertFalse(Q.validate(str(evidence), allow_fixture=True)["proven"])
+
+    def test_root_retarget_during_observation_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory); config = self.fixture(base)
+            target = Path(config["artifact_root"])
+            external = self.artifact_root(base, "external")
+            alias = base / "root-alias"
+            alias.symlink_to(external, target_is_directory=True)
+            Path(config["dispatch_jobs"]).write_text(
+                self.dispatch_row(slug="alias", attempt="att-alias",
+                                  metadata={"artifact_root": alias}), encoding="utf-8")
+            original = Q._attribution_snapshot
+            calls = [0]
+
+            def retarget(*args, **kwargs):
+                value = original(*args, **kwargs)
+                calls[0] += 1
+                if calls[0] == 1:
+                    alias.unlink(); alias.symlink_to(target, target_is_directory=True)
+                return value
+
+            with patch.object(Q, "_attribution_snapshot", side_effect=retarget):
+                value = Q.publish(str(base / "retarget.json"), config)
+            self.assertFalse(value["observation_valid"], value)
+            self.assertEqual(value["reason"], "source-changed-during-observation")
+
+    def test_live_cwd_target_ignores_ambient_artifact_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            target = self.artifact_root(base, "target")
+            ambient = self.artifact_root(base, "ambient")
+            jobs = base / "jobs.log"; jobs.write_text("")
+            index = base / "resource-runs.index.json"
+            index.write_text('{"schema_version":1,"registries":{}}')
+
+            def resolve(_argv, **kwargs):
+                self.assertNotIn("AGENT_ARTIFACT_ROOT", kwargs["env"])
+                return str(target) + "\n"
+
+            env = {"AGENT_ARTIFACT_ROOT": str(ambient), "AGENT_DISPATCH_JOBS": str(jobs),
+                   "AGENT_RESOURCE_RUN_INDEX": str(index), "HOME": str(base)}
+            with patch.dict(os.environ, env, clear=True), \
+                    patch.object(Q.subprocess, "check_output", side_effect=resolve), \
+                    patch.object(Q.RESOURCES, "agent_home", return_value=base / "agent"):
+                live = Q.live_config(str(base))
+            self.assertEqual(live["artifact_root"], str(target))
+            self.assertEqual(live["cwd"], str(base.resolve()))
+
     def test_missing_registry_is_sealed_skip_and_preserves_live_neighbor(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory); config = self.fixture(base)
@@ -36,7 +450,8 @@ class QuiescenceTest(unittest.TestCase):
             self.assertFalse(Q.validate(str(evidence), allow_fixture=True)["proven"])
             identity = Q.RESOURCES.proc_identity(os.getpid())
             missing.write_text(json.dumps({"schema_version": 1, "runs": {
-                "active": {**identity, "status": "running"}}}))
+                "active": {**identity, "status": "running",
+                           "artifact_root": config["artifact_root"]}}}))
             self.indexed(config, missing, base / "another-missing.json")
             live = Q.publish(str(base / "live.json"), config)
             self.assertTrue(live["observation_valid"], live)
@@ -294,7 +709,8 @@ class QuiescenceTest(unittest.TestCase):
             identity = Q.RESOURCES.proc_identity(os.getpid())
             registry = base / "resource.json"
             registry.write_text(json.dumps({"schema_version": 1, "runs": {
-                "unrelated": {**identity, "status": "running", "started_at": now.timestamp()}
+                "unrelated": {**identity, "status": "running", "started_at": now.timestamp(),
+                              "artifact_root": config["artifact_root"]}
             }}), encoding="utf-8")
             Path(config["resource_index"]).write_text(json.dumps({"schema_version": 1, "registries": {
                 "fixture": {"path": str(registry), "registered_at": now.timestamp(), "updated_at": now.timestamp()}
@@ -308,8 +724,9 @@ class QuiescenceTest(unittest.TestCase):
                 "2026-08-21T00:00:00Z\topen\t/repo\t/worktree\tfixture\t"
                 "attempt_schema_version=2,dispatch_depth=2,transport=headless,"
                 "execution_surface=registered-headless,registered_worker=1,"
-                "fallback_hop=same-harness-headless,route_id=rt-fixture,route_node=test,"
-                "attempt_id=att-fixture-open\n", encoding="utf-8")
+                "fallback_hop=same-harness-headless,"
+                f"attempt_id=att-fixture-open,artifact_root={config['artifact_root']}\n",
+                encoding="utf-8")
             dispatch_payload = Q.publish(str(base / "dispatch.json"), config, now)
             self.assertEqual(dispatch_payload["open_dispatch_attempts"], 1, dispatch_payload)
             self.assertFalse(dispatch_payload["proven"])
@@ -324,6 +741,7 @@ class QuiescenceTest(unittest.TestCase):
             self.assertTrue(Q.validate(str(evidence), now=now, allow_fixture=True)["proven"])
 
             cases = []
+            legacy = dict(original); legacy["schema_version"] = 3; cases.append(legacy)
             malformed = dict(original); malformed["schema_version"] = 999; cases.append(malformed)
             stale = dict(original); stale["observed_at"] = (now - timedelta(hours=1)).isoformat(); cases.append(stale)
             future = dict(original); future["observed_at"] = (now + timedelta(minutes=2)).isoformat(); cases.append(future)

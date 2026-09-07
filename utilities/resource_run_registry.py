@@ -135,11 +135,23 @@ def register_registry(registry, index_path=None, require_existing=True) -> dict:
     return payload["registries"][key]
 
 
+def strict_json_loads(data):
+    """Reject ambiguous object keys before any identity can be overwritten."""
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate-json-key:{key}")
+            result[key] = value
+        return result
+    return json.loads(data, object_pairs_hook=unique)
+
+
 def indexed_paths(index_path=None) -> tuple[list[Path], list[dict]]:
     index = Path(index_path or default_index_path())
     diagnostics = []
     try:
-        payload = json.loads(index.read_text(encoding="utf-8"))
+        payload = strict_json_loads(index.read_text(encoding="utf-8"))
         records = payload.get("registries") if isinstance(payload, dict) else None
         if payload.get("schema_version") != INDEX_SCHEMA or not isinstance(records, dict):
             raise ValueError("invalid-index-schema")
@@ -205,6 +217,17 @@ def read_registry_source(path: Path) -> tuple[dict, bytes | None]:
     signature = lambda value: (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
     if signature(first) != signature(last) or signature(last) != signature(resolved.stat()):
         raise ValueError(f"registry-changed-during-read:{path}")
+    # The logical path and each ancestor must still name the object just read.
+    for observed in [*parents, entry]:
+        current_path = Path(observed["path"])
+        current_info = current_path.lstat()
+        if (current_info.st_dev, current_info.st_ino) != (observed["device"], observed["inode"]):
+            raise ValueError(f"registry-path-changed-during-read:{path}")
+        if "link" in observed and (os.readlink(current_path) != observed["link"]
+                or str(current_path.resolve(strict=True)) != observed["target"]):
+            raise ValueError(f"registry-link-changed-during-read:{path}")
+    if path.resolve(strict=True) != resolved:
+        raise ValueError(f"registry-path-changed-during-read:{path}")
     return {"kind": "file", "path": str(path), "resolved_path": str(resolved),
             "device": last.st_dev, "inode": last.st_ino, "ancestors": parents,
             "leaf": entry, "sha256": "sha256:" + hashlib.sha256(data).hexdigest(),
@@ -257,6 +280,13 @@ def normalize_run(run_id: str, run: dict, registry: Path, identity_reader=proc_i
         "registry_status": run.get("status"), "registry_path": str(registry),
         "log_path": log_path, "log_updated_at": log_updated_at,
         "route": run.get("route"), "node": run.get("node"),
+        # Root-scoped quiescence consumes these as additive attribution inputs.
+        # Existing resource-runner rows carry only route/node; newer ad-hoc
+        # registrars may carry an explicit root or the route's expected identity.
+        "artifact_root": run.get("artifact_root"),
+        "route_file": run.get("route_file"),
+        "route_id": run.get("route_id"), "route_hash": run.get("route_hash"),
+        "route_node": run.get("route_node"),
         "config_ref": run.get("config_ref"), "config_sha256": run.get("config_sha256"),
         "source_commit": run.get("source_commit"), "source_dirty": run.get("source_dirty"),
         "source_git_state": run.get("source_git_state"), "started_at": started_at,
@@ -285,7 +315,7 @@ def scan(index_path=None, identity_reader=proc_identity, now=None,
                 diagnostics.append({"kind": "missing-registry", "path": str(registry),
                                     "reason": "registered-path-absent", "blocking": False})
                 continue
-            payload = json.loads(data)
+            payload = strict_json_loads(data)
             runs = payload.get("runs") if isinstance(payload, dict) else None
             if payload.get("schema_version") != REGISTRY_SCHEMA or not isinstance(runs, dict):
                 raise ValueError("invalid-registry-schema")
