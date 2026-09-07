@@ -963,6 +963,24 @@ class DispatchContractTest(unittest.TestCase):
    finally:
     fcntl.flock(holder.fileno(),fcntl.LOCK_UN);holder.close()
 
+ def test_parent_refusal_reports_process_reason_and_observer_namespaces(self):
+  with tempfile.TemporaryDirectory() as td:
+   jobs=Path(td)/"jobs.log"
+   jobs.write_text(self.owner_row("att-parent-diagnostic",437,"20",extra=
+    ",pid_observer_ns=pid:[outer],pid_ns=pid:[outer]")+"\n")
+   for reason in ("local-pid-reused","process-namespace-unverifiable"):
+    with self.subTest(reason=reason), \
+         mock.patch.object(D,"_parent_liveness_evidence",return_value=(False,reason,None)), \
+         mock.patch.object(D,"process_namespace_identity",return_value="pid:[inner]"):
+     with self.assertRaises(D.DispatchContractError) as caught:
+      D.resolve_live_parent_attempt(jobs,parent_slug="owner",repo="/repo",worktree="/wt",
+       expected_attempt_id="att-parent-diagnostic")
+     self.assertEqual(caught.exception.reason,"parent-attempt-not-live")
+     detail=json.loads(caught.exception.detail)
+     self.assertEqual(detail,{"attempt_id":"att-parent-diagnostic","liveness_reason":reason,
+      "pid":"437","pid_start":"20","recorded_observer_ns":"pid:[outer]",
+      "observer_ns":"pid:[inner]"})
+
  def test_supervisor_lease_file_is_preserved_for_recovery_exception(self):
   with tempfile.TemporaryDirectory() as td:
    base=Path(td);jobs=base/"jobs.log";attempt="att-parent-recovery"

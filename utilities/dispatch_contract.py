@@ -3486,7 +3486,18 @@ def resolve_live_parent_attempt(
         host_pid = int(raw_host) if raw_host.isdigit() else None
         live, liveness_source, observed = _parent_liveness_evidence(jobs, metadata)
         if not live:
-            raise DispatchContractError("parent-attempt-not-live", attempt_id)
+            # A host PID absent inside a worker namespace is not proof of death.
+            # Preserve the actual authority verdict and both observer identities
+            # so operators can distinguish it from positive PID reuse/death.
+            detail = json.dumps({
+                "attempt_id": attempt_id,
+                "liveness_reason": liveness_source,
+                "pid": raw_pid,
+                "pid_start": pid_start,
+                "recorded_observer_ns": metadata.get("pid_observer_ns", ""),
+                "observer_ns": process_namespace_identity() or "",
+            }, sort_keys=True)
+            raise DispatchContractError("parent-attempt-not-live", detail)
         return ParentAttemptBinding(
             attempt_id=attempt_id,
             pid=pid,
