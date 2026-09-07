@@ -63,6 +63,43 @@ class LaunchFenceTest(unittest.TestCase):
                 if failure_write >= 0:
                     os.close(failure_write)
 
+    def test_malformed_runtime_root_preserves_failure_receipt_and_zero_exec(self):
+        for runtime in (7, [], None, {"path": 7}, {"path": []}, {"path": "relative/root"}):
+            with self.subTest(runtime=runtime), tempfile.TemporaryDirectory() as td:
+                route = {"launch_compatibility_tuple": {"runtime_root": runtime}}
+                route_path = Path(td, "route.json")
+                route_path.write_text(json.dumps(route), encoding="utf-8")
+                gate_read, gate_write = os.pipe()
+                os.write(gate_write, b"1")
+                os.close(gate_write)
+                failure_read, failure_write = os.pipe()
+                try:
+                    with mock.patch.object(L, "set_parent_death_signal"), \
+                         mock.patch.object(L.os, "getppid", return_value=123), \
+                         mock.patch.object(L.ROUTE, "verify_route", return_value=route), \
+                         mock.patch.object(L.ROUTE, "revalidate_launch_compatibility",
+                                           return_value=(False, {"runtime_root": {"expected": runtime}})), \
+                         mock.patch.object(L, "mark_attempt_launch_started") as mark, \
+                         mock.patch.object(L.os, "execvpe") as payload:
+                        result = L.cli([
+                            "--parent-pid", "123", "--gate-fd", str(gate_read),
+                            "--failure-fd", str(failure_write), "--jobs", str(Path(td, "jobs.log")),
+                            "--attempt-id", "att-malformed-root", "--route-file", str(route_path),
+                            "--launch-phase", "start", "--", "payload",
+                        ])
+                    failure_write = -1
+                    self.assertEqual(result, 70)
+                    failure = json.loads(os.read(failure_read, 16384))
+                    self.assertEqual(failure["reason"], "launch-runtime-root-mismatch")
+                    detail = json.loads(failure["detail"].split(" ", 1)[1])
+                    self.assertIn("hearting/current", detail["recovery"])
+                    mark.assert_not_called()
+                    payload.assert_not_called()
+                finally:
+                    os.close(failure_read)
+                    if failure_write >= 0:
+                        os.close(failure_write)
+
     def test_launch_tuple_absent_and_incompatible_never_commit_or_exec(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             route_path = Path(temp_dir, "route.json")

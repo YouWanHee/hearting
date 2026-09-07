@@ -44,6 +44,18 @@ class WorkerRouteGuardTest(unittest.TestCase):
      self.assertIn(route["launch_compatibility_tuple"]["runtime_root"]["path"],detail["recovery"])
      self.assertIn("AGENT_HOME=",detail["recovery"])
      self.assertIn("runtime projection",detail["recovery"])
+ def test_malformed_runtime_root_preserves_typed_refusal(self):
+  for runtime in (7,[],None,{"path":7},{"path":[]},{"path":"relative/root"}):
+   with self.subTest(runtime=runtime), tempfile.TemporaryDirectory() as td:
+    route=self.route(); route["launch_compatibility_tuple"]["runtime_root"]=runtime
+    self.reseal(route); path=Path(td)/"route.json"; path.write_text(json.dumps(route))
+    with self.assertRaises(G.WorkerRouteError) as caught:
+     G.validate_route_contract(path,"execute",ROOT,ROOT,launch_phase="start")
+    self.assertEqual(caught.exception.reason,"launch-runtime-root-mismatch")
+    detail=json.loads(str(caught.exception))
+    self.assertIn("runtime_root",detail["mismatches"])
+    self.assertIn("hearting/current",detail["recovery"])
+    self.assertIn("AGENT_HOME=",detail["recovery"])
  def test_valid_and_scope_bound(self):
   with tempfile.TemporaryDirectory() as td:
    path=Path(td)/"route.json"; route=self.route(); path.write_text(json.dumps(route))

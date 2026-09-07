@@ -89,9 +89,12 @@ _LAUNCH_CONTENT_DIGEST_CACHE = {}
 _LAUNCH_SOURCE_REVISION_CACHE = {}
 _RUNTIME_ACTIVATION = None
 def runtime_root_hint(route=None):
-    sealed = (route or {}).get("launch_compatibility_tuple") or {}
-    runtime = sealed.get("runtime_root") or {}
-    expected = runtime.get("path") or str(
+    # A refused tuple is untrusted input even when its route hash is valid.
+    # Recovery formatting must not replace the typed refusal with an exception.
+    sealed = route.get("launch_compatibility_tuple") if isinstance(route, dict) else None
+    runtime = sealed.get("runtime_root") if isinstance(sealed, dict) else None
+    path = runtime.get("path") if isinstance(runtime, dict) else None
+    expected = path if isinstance(path, str) and Path(path).is_absolute() else str(
         Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local/share"))) / "hearting/current"
     )
     return (
