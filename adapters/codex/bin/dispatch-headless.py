@@ -1113,6 +1113,35 @@ def progress_writable_dirs(args: argparse.Namespace) -> tuple[Path, ...]:
     return (root / "heartbeats", root / "watchdog")
 
 
+def registry_writable_launch(args: argparse.Namespace) -> bool:
+    """SD-OPEN-64: whether this launch needs the whole dispatch state root
+    (registry, `jobs.log`, `completion/<route_id>`), not just the two progress
+    directories above.
+
+    The prior condition (`nested_headless_network` or exactly
+    `dispatch_depth == 2`) was keyed on *dispatching-ness* -- whether this
+    launch spawns a child -- not on whether it closes its own registry row. A
+    quick standard+ depth-1 owner (`att-bccaa2f32dcf4bdb89c5ef48a7fcaa0f`,
+    `route_id=rt-1c3127a326589075`, SD-OPEN-44) is a registered route-bound
+    attempt that must run `capability-route.py complete` on itself, exactly
+    like a depth-2 worker does, but matched neither branch and lost the whole
+    state root. `write_completion_marker`'s `completion/<route_id>` mkdir hit
+    `[Errno 30] Read-only file system` first; a bwrap fixture granting only
+    that one directory (this cycle's SD-64 P-6 measurement) still hits a
+    second EROFS on `jobs.log`/`jobs.log.lock` right after, so a directory-only
+    grant can never be narrower than the state root for any attempt that
+    genuinely completes and closes its own row. The fix keys on *closes its
+    own row*: any attempt bound to a route with a real attempt id, depth
+    irrelevant -- the same scope a depth-2 worker already had, now shared by
+    a depth-1 route-bound owner too.
+    """
+
+    return bool(
+        getattr(args, "nested_headless_network", False)
+        or (getattr(args, "route_id", None) and getattr(args, "command_attempt_id", None))
+    )
+
+
 def ensure_owner_writable_dirs(args: argparse.Namespace) -> None:
     """Create every directory this launch will grant sandbox write access to,
     once, before the child command is built. A query function (above) never
@@ -1271,9 +1300,7 @@ def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -
             ]
         if getattr(args, "max_continuations", None) is not None:
             command += ["--max-continuations", str(args.max_continuations)]
-        if args.nested_headless_network or (
-            args.dispatch_depth == 2 and args.route_id and getattr(args, "command_attempt_id", None)
-        ):
+        if registry_writable_launch(args):
             command += [
                 "--writable-root",
                 str(dispatch_state_root(args.jobs_path)),
@@ -1318,11 +1345,12 @@ def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -
     ]
     if getattr(args, "report_bundle_root", None) is not None:
         cmd += ["--add-dir", str(args.report_bundle_root)]
-    if args.nested_headless_network or (args.dispatch_depth == 2 and args.route_id and getattr(args, "command_attempt_id", None)):
+    if registry_writable_launch(args):
         # A dispatch-depth-1 conductor must update the canonical attempt registry and
         # materialize child prompt/transcript files under the canonical dispatch
-        # state root. A route-bound dispatch-depth-2 stage needs the same narrow
-        # writable root for its own SD-58 heartbeat. Network remains owner-only below.
+        # state root. A route-bound worker (depth-1 quick owner or depth-2 stage)
+        # needs the same root for its own `complete`/close (SD-OPEN-64). Network
+        # remains owner-only below.
         cmd += [
             "--add-dir",
             str(dispatch_state_root(args.jobs_path)),
