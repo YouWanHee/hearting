@@ -179,7 +179,21 @@ class TestRoute(unittest.TestCase):
   self.assertEqual(a["human_gate_bindings"],[])
  def test_quick_missing_eligibility_fails_closed(self):
   with self.assertRaisesRegex(ValueError,"quick-headless-unavailable"):
+   R.compile_route(**self.args(predicates=[],transport=None,inline_reason=None,requested_intensity="quick"))
+ def test_h6_explicit_direct_predicate_gap_refusal_names_missing(self):
+  # H6: `--intensity direct` whose 7 predicates do not all hold used to be
+  # silently promoted to quick and died as an opaque
+  # `quick-headless-unavailable`. The no-evidence refusal must name the
+  # missing predicates; with checked quick evidence the compile still
+  # promotes (`test_ambiguous_quick`), and a true quick request keeps the
+  # quick eligibility enum.
+  partial=[p for p in ALL if p!="no-shared-contract"]
+  with self.assertRaisesRegex(ValueError,"direct-predicate-gap:no-shared-contract"):
+   R.compile_route(**self.args(predicates=partial,transport=None,inline_reason=None))
+  with self.assertRaisesRegex(ValueError,"direct-predicate-gap:"):
    R.compile_route(**self.args(predicates=[],transport=None,inline_reason=None))
+  with self.assertRaisesRegex(ValueError,"quick-headless-unavailable"):
+   R.compile_route(**self.args(predicates=[],transport=None,inline_reason=None,requested_intensity="quick"))
  def test_quick_invalid_transport_fails_closed(self):
   with self.assertRaisesRegex(ValueError,"invalid quick transport"):
    R.compile_route(**self.args(predicates=[],transport="interactive",inline_reason=None,registered_headless_evidence=self.registered_headless()))

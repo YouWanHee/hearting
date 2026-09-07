@@ -2251,6 +2251,17 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
     elif effective=="quick":
         if transport not in (None, "headless"):
             raise ValueError(f"invalid quick transport: {transport!r}")
+        if (requested=="direct" and set(predicates)!=known_pred
+                and registered_headless_evidence is None):
+            # H6: an explicit direct request whose predicates do not all hold
+            # used to be silently promoted to quick and died as an opaque
+            # `quick-headless-unavailable`. Refuse instead and name the gap.
+            # With checked quick evidence the promotion still compiles
+            # (`test_ambiguous_quick`); the gaps stay recorded in
+            # selection_basis either way.
+            raise ValueError(
+                "direct-predicate-gap:"
+                +",".join(sorted(known_pred-set(predicates))))
         registered_headless_candidates=_validate_registered_headless_evidence(
             registered_headless_evidence
         )
