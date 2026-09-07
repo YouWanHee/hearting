@@ -1471,6 +1471,31 @@ class TestRoute(unittest.TestCase):
    self.assertFalse(rows["open-route.json"]["closed"]); self.assertTrue(rows["closed-route.json"]["closed"])
    self.assertFalse(rows["closed-route.json"]["stale_closure"])
    self.assertEqual(rows["closed-route.json"]["head_commit"],"2"*40)
+ def test_sd_open_54_gate_ledger_and_foreign_basenames_in_the_canonical_dir_are_not_routes(self):
+  # #15 (hearting root rt-5d862a3d/rt-94b7f5a5..., cairn W15d): `rt-*.gate-release.json`
+  # (workflow-supervisor ledger) was read as a route -> route-malformed -> the
+  # quiescence observation failed closed. Only `rt-<16 hex>.json` is a route
+  # candidate in the canonical directory; typed sidecars are never candidates.
+  route=R.compile_route(**self.args())
+  with tempfile.TemporaryDirectory() as tmp:
+   root=Path(tmp); canonical=root/".runtime"/"routes"; canonical.mkdir(parents=True)
+   route=dict(route); route["artifact_root"]=str(root); rid=route["route_id"]
+   (canonical/f"{rid}.json").write_text(json.dumps(route),encoding="utf-8")
+   (canonical/f"{rid}.gate-release.json").write_text(json.dumps({"schema_version":1,"route_id":rid,"gate_releases":[]}),encoding="utf-8")
+   (canonical/f"{rid}.superseded-20260907T000000Z.outcome.json").write_text("{}",encoding="utf-8")
+   (canonical/"notes.json").write_text(json.dumps({"kind":"not-a-route"}),encoding="utf-8")
+   diagnostics=[]
+   rows=R.route_status(root,diagnostics=diagnostics)
+   self.assertEqual([Path(r["route_file"]).name for r in rows],[f"{rid}.json"])
+   self.assertEqual(R.route_sidecar_kind(canonical/f"{rid}.gate-release.json"),"gate-release")
+   self.assertEqual(R.route_sidecar_kind(canonical/f"{rid}.superseded-20260907T000000Z.outcome.json"),"outcome")
+   self.assertIsNone(R.route_sidecar_kind(canonical/f"{rid}.json"))
+   self.assertEqual([(Path(d["path"]).name,d["reason"],d["blocking"]) for d in diagnostics],
+                    [("notes.json","route-candidate-foreign-basename",False)])
+   # a truly malformed route record still blocks, as before
+   (canonical/"rt-0123456789abcdef.json").write_text("{",encoding="utf-8")
+   diagnostics=[]; R.route_status(root,diagnostics=diagnostics)
+   self.assertTrue(any(d["reason"].startswith("route-unreadable") and d.get("blocking",True) for d in diagnostics))
  def test_status_flags_a_closure_left_behind_by_a_recompiled_route(self):
   first=R.compile_route(**self.args())
   second=R.compile_route(**self.args(artifact_root=R.ROOT/"other"))
