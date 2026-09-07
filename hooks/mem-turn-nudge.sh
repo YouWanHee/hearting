@@ -40,6 +40,8 @@ if ! STORE=$(sh "$HOOK_DIR/../utilities/memory-store.sh"); then
   echo "mem-turn-nudge: skipping (memory store resolution failed)" >&2
   exit 0
 fi
+# Command substitution trims trailing LF; R0 must retain the raw override.
+STORE="${MEM_STORE:-$STORE}"
 DB="$STORE/memory.db"
 STATE="$STORE/.turn-state-$SID"
 

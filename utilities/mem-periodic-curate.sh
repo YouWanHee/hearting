@@ -55,6 +55,8 @@ if ! STORE=$(sh "$HOOK_DIR/../utilities/memory-store.sh"); then
   echo "mem-periodic-curate: skipping (memory store resolution failed)" >&2
   exit 0
 fi
+# Command substitution trims trailing LF; R0 must retain the raw override.
+STORE="${MEM_STORE:-$STORE}"
 PROJECTS_ROOT="${MEM_PROJECTS:-$HOME/.claude/projects}"
 
 case "${MEM_PERIODIC_CURATE_MAX_PROJECTS:-8}" in

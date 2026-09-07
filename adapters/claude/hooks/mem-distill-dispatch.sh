@@ -81,6 +81,8 @@ if ! STORE=$(sh "$HOOK_DIR/../utilities/memory-store.sh"); then
   echo "mem-distill-dispatch (claude): skipping (memory store resolution failed)" >&2
   exit 0
 fi
+# Command substitution trims trailing LF; R0 must retain the raw override.
+STORE="${MEM_STORE:-$STORE}"
 # MEM_PY is a test-only override for a worktree-local mem.py.
 MEM="${MEM_PY:-$AGENT_HOME/tools/memory/mem.py}"
 mkdir -p "$STORE" 2>/dev/null || true

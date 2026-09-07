@@ -867,7 +867,7 @@ EOF
     # 7.0 R0-R5). The explicit if/else preserves the resolver's stderr
     # diagnostic and stops `set -e` from bypassing this fail-open branch.
     if store=$(AGENT_HOME="$AGENT_ROOT" sh "$ROOT/utilities/memory-store.sh"); then
-      :
+      store="${MEM_STORE:-$store}" # Retain R0 trailing LF lost by substitution.
     else
       echo "session-end: skipping (memory store resolution failed)" >&2
       exit 0
