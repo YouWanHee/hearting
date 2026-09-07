@@ -1021,27 +1021,22 @@ class SubsessionChainSealTest(unittest.TestCase):
             printed,
         )
 
-    def test_parallel_admission_is_still_fail_closed(self):
-        # F3 requires a sealed manifest, and only `stage-session-chain.py`
-        # persists one. `subdivision_batch_admission.py` builds slice starts too
-        # and never persists -- so the day parallel admission is enabled, every
-        # parallel slice would be refused by the gate above for a reason that
-        # would look nothing like its cause.
-        #
-        # This test pins the assumption that makes F3 safe today. When parallel
-        # admission stops being fail-closed, this test fails, and the fix is to
-        # persist the chain manifest before starting a slice -- not to weaken the
-        # gate.
+    def test_parallel_admission_persists_before_start(self):
+        # SD-103 (routing-flex): parallel admission is reachable for
+        # worktree-base slices and seals the chain manifest at the pointer this
+        # gate reads BEFORE the first slice start. If either half regresses,
+        # every parallel slice is refused here for a reason that looks nothing
+        # like its cause.
         import subdivision_batch_admission as SBA
-        with self.assertRaises(SBA.SubdivisionAdmissionError):
-            SBA.raise_if_parallel_entry_fail_closed()
+        import dispatch_subsession_advance as SUBSESSION
+        self.assertIsNone(SBA.raise_if_parallel_entry_fail_closed())
         source = (Path(N.ROOT) / "utilities" / "subdivision_batch_admission.py").read_text(
             encoding="utf-8"
         )
-        self.assertNotIn(
-            "persist_chain_manifest", source,
-            "parallel admission now persists a manifest: re-verify F3 against it "
-            "and delete this guard",
+        self.assertIn("persist_chain_manifest(Path(jobs), admission.manifest)", source)
+        self.assertEqual(
+            SBA.chain_manifest_pointer_path(Path("/x/jobs.log"), "ssc-a"),
+            SUBSESSION.chain_manifest_pointer_path(Path("/x/jobs.log"), "ssc-a"),
         )
 
 if __name__ == "__main__":

@@ -180,7 +180,7 @@ def _empty_relayout_fields() -> Dict[str, Any]:
 
 def _empty_residue_fields() -> Dict[str, Any]:
     return {"legacy_top_level": None, "legacy_top_level_files": None, "residue_deferred": None,
-            "residue_trash_pending": None, "residue_hold": None}
+            "residue_rejoin_pending": None, "residue_trash_pending": None, "residue_hold": None}
 
 
 def _residue_fields(root: Path) -> Dict[str, Any]:
@@ -190,6 +190,9 @@ def _residue_fields(root: Path) -> Dict[str, Any]:
         "legacy_top_level": view["legacy_top_level"],
         "legacy_top_level_files": view["legacy_top_level_files"],
         "residue_deferred": len(view["deferred"]),
+        # A live symlink whose siblings migrated is residue (`legacy_top_level`
+        # = `residue`) until `apply` rejoins it; the count says why.
+        "residue_rejoin_pending": view.get("rejoin_pending", 0),
         "residue_trash_pending": view["trash_pending"],
         "residue_hold": view["residue_hold"],
     }

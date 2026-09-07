@@ -895,3 +895,19 @@ eligibility here; it only means this supervisor's own resume/terminal
 handling for a route that is NOT advanced continues exactly as it did before
 this cycle, without a comparable terminal shortcut. No SD-110 code path was
 added or held back to compensate for this asymmetry.
+
+## Execution access request
+
+`dispatch-headless.py --execution-access-file <execution_access_v1.json>` (or
+`AGENT_DISPATCH_EXECUTION_ACCESS_FILE`) adds only validated exact roots. The
+one-shot `codex exec` builder emits them as repeated `--add-dir`; the App Server
+supervisor builder emits repeated `--writable-root`. Existing grants and the
+standard+ owner network predicate are unchanged when the option is absent.
+Codex network access is a boolean OS-sandbox grant, not host allowlist
+enforcement, so an `enforcement_required=any` request with `network.hosts` is
+recorded as `granted-unenforced`; `os-sandbox` host enforcement is refused.
+A writable-root request under an effective non-writable Codex sandbox, a child
+request with no proven parent grant, and any request the current role cannot
+enforce fail before registration/model spawn.
+Owner-to-worker propagation and continuation hash binding remain a separate
+unimplemented slice.

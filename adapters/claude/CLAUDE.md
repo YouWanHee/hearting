@@ -30,19 +30,30 @@ another adapter.
 - Run deterministic guards directly when hook execution is unavailable or untrusted.
 - Task-specific detail is progressively disclosed through the selected Skill and adapter README/ADAPTATION docs; do not preload unrelated procedures.
 - Call the six runtime-root-sensitive utilities (`capability-route`, `artifact_producer`, `spec-transaction`, `dispatch-owner`, `dispatch-batch`, `dispatch-node`) through the installed `$AGENT_HOME`; a checkout-relative call to one of them is allowed only under dev activation (`AGENT_HOME` is that checkout itself), enforced by `hooks/runtime-root-guard.sh`.
-- Peer-session steering (`OPERATIONS §5.14`): watch a peer depth-0 session with the checked `utilities/peer-steward.py watch` — a detached watcher writes a disk receipt and the `PostToolUse(Bash)` `asyncRewake` carrier wakes this session once (`join`/`status`/`rearm`/`ack` read it; the next prompt sweeps anything un-acked). After the armed line, end the turn: do not launch Background Bash, `Monitor`, liveness, or `dispatch-wait` for that watch and do not emit periodic recaps — the carrier wakes this session exactly once. `wait` stays a bounded foreground surface and must never be backgrounded; `peer-steward.py start` defaults a launched child session to `bypass` permissions (`dispatch-defaults.yaml` `steward.child_permission_mode`, opt-out is `inherit`).
+- Peer-session steering (`OPERATIONS §5.14`): watch a peer depth-0 session with the checked `utilities/peer-steward.py watch` — a detached watcher writes a disk receipt and the `PostToolUse(Bash)` `asyncRewake` carrier wakes this session once (`join`/`status`/`rearm`/`ack` read it; the next prompt sweeps anything un-acked). After the armed line, end the turn: do not launch Background Bash, `Monitor`, liveness, or `dispatch-wait` for that watch and do not emit periodic recaps — the carrier wakes this session exactly once. `wait` stays a bounded foreground surface and must never be backgrounded; `peer-steward.py start` defaults a launched child session to `bypass` permissions (`dispatch-defaults.yaml` `steward.child_permission_mode`, opt-out is `inherit`). `peer-steward.py prompt` reports `prompted=true` only after the submission was observed (state flip, target transcript, or a prompt box herdr actually read); `failed`/`queued`/`unverified` are typed verdicts (a `blocked` target or an open form is never typed into), and a dim `❯ …` line in an *empty* target input is Claude Code's prompt suggestion, not an unsubmitted prompt. Every pane prompt goes through that wrapper (never `herdr agent prompt`/`pane send-text` directly): its ledger row (`to.pane`, caller session, digest, verdict receipt) is the only attribution herdr's own log lacks.
 
 ## Routing and Execution
 
-Route by `core/WORKFLOW.md §0.2`: when a request matches one manifest
-`entry-router` trigger and no exclusion, that entry is the primary route
-and `direct` sets intensity, not routing. Apply §0.3 and present the
-five-field card in §0.4 before material work unless scope and route are
-already approved — deliver it through `AskUserQuestion` (five fields as the
-question body, options 진행(권장)/수정/중단; plain-text card only as fallback) —
-and close material work with the five-field completion card
-in §0.5. Load full capability detail only in the acting owner or worker; spec
-work also requires the spec-read gate.
+Route by `core/WORKFLOW.md §0.2`: the semantic precedence names the
+capability that owns the artifacts; §0.2.1 then picks the **shape** of the
+work before any preset. `direct`, `solo`, and `staged` go through
+`utilities/capability-route.py compose` (one command — cwd, artifact root,
+tracking, drift verdict, spec-read gate, and both eligibility probes default
+from the checkout; a staged `--graph execute,test,report` is your own stage
+subgraph of the owning capability). Use the preset recipe
+(`capability-route.py compile`) only when the request names the entry's full
+loop or a promotion signal or spec-backed flow requires it; never bend a
+loosely matching request into the nearest preset graph. Apply §0.3. For
+`direct`/`solo` routes the sealed `small_work_confirmation` (`notice`, the
+default) replaces the blocking card with the one `[경로]` line `compose`
+prints plus one clause of scope, unless the work is destructive or
+external-facing; otherwise present the five-field card in §0.4 before
+material work unless scope and route are already approved — deliver it
+through `AskUserQuestion` (five fields as the question body, options
+진행(권장)/수정/중단; plain-text card only as fallback) — and close material
+work with the five-field completion card in §0.5. Load full capability detail
+only in the acting owner or worker; spec work also requires the spec-read
+gate.
 
 For `autopilot-code`, `direct` is inline, `quick` is one registered dispatch-depth-1
 owner, and `standard+` follows `code-plan -> code-execute -> code-test ->

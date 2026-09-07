@@ -444,6 +444,11 @@ case "$cmd" in
     "$ROOT/hooks/core-read-marker.sh" --file "$file" --session "$sid"
     "$ROOT/hooks/spec-read-marker.sh" --file "$file" --session "$sid"
     ;;
+  compose)
+    # SD-135: preset-free work route (shape/subgraph); same compiler, same bind.
+    shift
+    AGENT_HOME="$AGENT_ROOT" exec python3 "$ROOT/utilities/capability-route.py" compose "$@"
+    ;;
   route)
     if [ "${2:-}" = "--capability" ]; then
       shift

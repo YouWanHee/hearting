@@ -1616,6 +1616,41 @@ class TestGateSubjectNotCaller(WorkflowFixture):
                       "--jobs", str(jobs), "--artifact", "a.json"])
         self.assertTrue(json.loads(buf.getvalue())["delivery_created"])
 
+    def _retire_held_record(self, carrier_state):
+        """A record the asyncRewake hook claimed moments ago (lease unexpired)
+        must still be acked by the release: the release supersedes the record
+        whoever holds its lease. Before the fix `reclaim` refused
+        `lease-not-expired`, retirement fell through, the record stayed
+        `claimed`/`sent-ambiguous` and the next prompt sweep re-announced the
+        closed gate (rt-94b7f5a5, 2026-09-06)."""
+        route, path = self.two_stage_route(human_gate="frame-review")
+        jobs, session, _attempt = self.owner_registry(route_id="rt-fixture0000000")
+        root = Path(jobs).resolve(strict=False).parent
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            SUP.main(["gate", "--route", str(path), "--gate", "frame-review",
+                      "--block", "--jobs", str(jobs), "--artifact", "a.json"])
+        delivery_id = json.loads(
+            Path(json.loads(out.getvalue())["delivery"]).read_text("utf-8")
+        )["delivery_id"]
+        PENDING.claim(root, session, delivery_id, claim_owner="hook:fixture",
+                      lease_seconds=300.0)
+        if carrier_state == "sent-ambiguous":
+            PENDING.mark_sent_ambiguous(root, session, delivery_id,
+                                        claim_owner="hook:fixture")
+        self.assertEqual(PENDING.read(root, session, delivery_id)["state"], carrier_state)
+        self.assertEqual(
+            SUP.retire_gate_delivery(route, "frame-review", str(jobs)), "acked")
+        after = PENDING.read(root, session, delivery_id)
+        self.assertEqual(after["state"], "acked")
+        self.assertEqual(after["acked_by"], "gate-released:frame-review")
+
+    def test_release_retires_a_record_the_hook_still_holds_claimed(self):
+        self._retire_held_record("claimed")
+
+    def test_release_retires_a_record_the_hook_still_holds_sent_ambiguous(self):
+        self._retire_held_record("sent-ambiguous")
+
     def test_release_retirement_survives_a_ledger_failure(self):
         """Review New-2: `ledger_for`/`gate_raise_epoch` sat outside the try, so a
         non-OSError there aborted the CLI after the release had already been
@@ -1956,6 +1991,131 @@ class TestGateSubjectNotCaller(WorkflowFixture):
         finally:
             os.chdir(previous)
         self.assertEqual(SUP.ledger_for(route).read_only_state()["workflow_state"], "BLOCKED_HUMAN_GATE")
+
+    def test_sd_open_48_headless_owner_may_not_release_an_interview_gate(self):
+        """#11 (cairn W15b, rt-bf75754935faf8de, 2026-09-06): the owner released
+        its own frame-review gate as `headless-owner`; the plan it unblocked was
+        confirmed by nobody, and the depth-0 release was then refused."""
+        _route, path = self.two_stage_route(
+            human_gate="frame-review",
+            continuation={"kind": "human-gate", "gate": "frame-review"})
+        jobs, _session, _attempt = self.owner_registry()
+        interview, value = self._interview()
+        code, payload = self._block_with(path, jobs, interview)
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["release_authority"], "depth-0")
+        answers, _ = self._answers(value)
+        env = {"AGENT_DISPATCH_REGISTERED_WORKER": "1"}
+        with mock.patch.dict(os.environ, env):
+            with self.assertRaisesRegex(SUP.SupervisorError, "gate-release-authority-refused"):
+                SUP.main(["release", "--route", str(path), "--gate", "frame-review",
+                          "--decision", "proceed", "--answers", str(answers), "--jobs", str(jobs)])
+            with self.assertRaisesRegex(SUP.SupervisorError, "gate-release-authority-refused"):
+                SUP.main(["gate", "--route", str(path), "--gate", "frame-review", "--release",
+                          "--jobs", str(jobs)])
+        code, waited = self._await(path)
+        self.assertEqual(waited["status"], "blocked", "the owner's refused release changed nothing")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = SUP.main(["release", "--route", str(path), "--gate", "frame-review",
+                             "--decision", "proceed", "--answers", str(answers), "--jobs", str(jobs)])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(buf.getvalue())["released_by"], "user")
+        # review finding 13: a release refused as already released prints one
+        # typed JSON line the depth-0 carrier can arm from.
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            with self.assertRaisesRegex(SUP.SupervisorError, "not blocked on a human gate"):
+                SUP.main(["release", "--route", str(path), "--gate", "frame-review",
+                          "--decision", "proceed", "--answers", str(answers), "--jobs", str(jobs)])
+        refusal = json.loads(buf.getvalue().strip().splitlines()[-1])
+        self.assertEqual((refusal["refusal"], refusal["route_id"], refusal["gate"]),
+                         ("gate-not-blocked", "rt-fixture0000000", "frame-review"))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            with self.assertRaisesRegex(SUP.SupervisorError, "not blocked on a human gate"):
+                SUP.main(["gate", "--route", str(path), "--gate", "frame-review", "--release",
+                          "--jobs", str(jobs)])
+        self.assertEqual(json.loads(buf.getvalue().strip().splitlines()[-1])["refusal"], "gate-not-blocked")
+
+    def test_sd_open_48_legacy_interview_raise_without_authority_still_binds_the_owner(self):
+        """review finding 4: a raise that predates `release_authority` but
+        recorded an interview is depth-0 -- the flag was sealed at the raise."""
+        legacy = {"gate": "frame-review", "status": "blocked", "interview": True, "questions": 5,
+                  "release_authority": None}
+        with self.assertRaisesRegex(SUP.SupervisorError, "gate-release-authority-refused"):
+            SUP.assert_release_authority("headless-owner", legacy, {"gate": "frame-review"}, "frame-review")
+        plain = dict(legacy, interview=False, questions=0)
+        SUP.assert_release_authority("headless-owner", plain, {"gate": "frame-review"}, "frame-review")
+        declared = {"gate": "frame-review", "release_authority": "depth-0"}
+        with self.assertRaisesRegex(SUP.SupervisorError, "gate-release-authority-refused"):
+            SUP.assert_release_authority("headless-owner", plain, declared, "frame-review")
+        SUP.assert_release_authority("user", legacy, declared, "frame-review")
+
+    def test_sd_open_48_artifact_declaring_depth0_authority_binds_its_owner(self):
+        """The cairn owner's own artifact said `release_authority: depth-0`."""
+        _route, path = self.two_stage_route(
+            human_gate="frame-review",
+            continuation={"kind": "human-gate", "gate": "frame-review"})
+        jobs, _session, _attempt = self.owner_registry()
+        artifact = self.base / "shards" / "frame" / "frame-summary.json"
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_text(json.dumps({"schema": "frame_summary_v1", "release_authority": "depth-0",
+                                        "restatement": "plain"}), encoding="utf-8")
+        code, payload = self._block_with(path, jobs, artifact)
+        self.assertEqual(code, 0)
+        self.assertFalse(payload["interview"])
+        self.assertEqual(payload["release_authority"], "depth-0")
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_REGISTERED_WORKER": "1"}):
+            with self.assertRaisesRegex(SUP.SupervisorError, "gate-release-authority-refused"):
+                SUP.main(["release", "--route", str(path), "--gate", "frame-review",
+                          "--decision", "proceed", "--jobs", str(jobs)])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(SUP.main(["release", "--route", str(path), "--gate", "frame-review",
+                                       "--decision", "proceed", "--jobs", str(jobs)]), 0)
+
+    def test_sd_open_48_plain_gate_keeps_the_owner_allowance_unless_the_binding_says_otherwise(self):
+        for declared in (None, "depth-0"):
+            with self.subTest(binding_release_authority=declared):
+                route, path = self.two_stage_route(
+                    human_gate="frame-review",
+                    continuation={"kind": "human-gate", "gate": "frame-review"})
+                if declared:
+                    route["human_gate_bindings"][0]["release_authority"] = declared
+                    path.write_text(json.dumps(route, indent=2), encoding="utf-8")
+                jobs, _session, _attempt = self.owner_registry()
+                code, payload = self._block_with(path, jobs, "shards/frame/frame-summary.md")
+                self.assertEqual(code, 0)
+                self.assertEqual(payload["release_authority"], declared or "any")
+                with mock.patch.dict(os.environ, {"AGENT_DISPATCH_REGISTERED_WORKER": "1"}):
+                    buf = io.StringIO()
+                    if declared:
+                        with self.assertRaisesRegex(SUP.SupervisorError, "gate-release-authority-refused"):
+                            SUP.main(["release", "--route", str(path), "--gate", "frame-review",
+                                      "--decision", "proceed", "--jobs", str(jobs)])
+                    else:
+                        with contextlib.redirect_stdout(buf):
+                            code = SUP.main(["release", "--route", str(path), "--gate", "frame-review",
+                                             "--decision", "proceed", "--jobs", str(jobs)])
+                        self.assertEqual(code, 0)
+                        self.assertEqual(json.loads(buf.getvalue())["released_by"], "headless-owner")
+
+    def test_sd_open_48_foreign_interview_schema_is_refused_at_the_raise(self):
+        """#12: `cairn-frame-interview/v1` passed as "not an interview", so the
+        gate owed no answers and validate-answers later refused every answer."""
+        _route, path = self.two_stage_route(
+            human_gate="frame-review",
+            continuation={"kind": "human-gate", "gate": "frame-review"})
+        jobs, _session, _attempt = self.owner_registry()
+        artifact = self.base / "shards" / "frame" / "interview.json"
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_text(json.dumps({"schema": "cairn-frame-interview/v1", "route_id": "rt-fixture0000000",
+                                        "release_authority": "depth-0", "open_decisions_for_user": []}),
+                            encoding="utf-8")
+        with self.assertRaisesRegex(SUP.SupervisorError, "interview-schema-unsupported.*cairn-frame-interview/v1"):
+            SUP.main(["gate", "--route", str(path), "--gate", "frame-review", "--block",
+                      "--jobs", str(jobs), "--artifact", str(artifact)])
 
     def test_legacy_gate_release_refuses_an_interview_gate(self):
         """review round 1, M3."""

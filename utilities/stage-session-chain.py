@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -164,14 +166,14 @@ def _run_parallel_subdivision(
     governor = ROOT / "utilities" / "model-worker-governor.py"
     governor_root = resolve_model_governor_root(artifact_root)
     try:
-        # F-3 (impl-review round 1): fail-closed until R5's artifact-base
-        # fence lands -- see the docstring on `raise_if_parallel_entry_
-        # fail_closed` in subdivision_batch_admission.py.
-        SUBDIVISION_ADMISSION.raise_if_parallel_entry_fail_closed()
+        # F-3 narrowed by SD-103: only a non-worktree-base slice is refused
+        # here -- see `raise_if_parallel_entry_fail_closed` in
+        # subdivision_batch_admission.py.
+        SUBDIVISION_ADMISSION.raise_if_parallel_entry_fail_closed(args.manifest)
         admission = SUBDIVISION_ADMISSION.admit_batch(
             route=route_record, node=node, manifest_path=args.manifest,
             governor=governor, governor_root=governor_root,
-            reserve=DISPATCH_BATCH.reserve_batch,
+            reserve=DISPATCH_BATCH.reserve_batch, jobs=jobs,
         )
     except SUBDIVISION_ADMISSION.SubdivisionAdmissionError as exc:
         print(json.dumps({
@@ -210,13 +212,162 @@ def _run_parallel_subdivision(
     return 0 if all(row.get("started") for row in results) else 1
 
 
+
+# ---------------------------------------------------------------------------
+# SD-103 cheap path: the owner judges that the plan has 2..4 independent parts
+# and runs ONE command; the machine mints the ids, writes the briefs, and
+# proves the fence with the same `load_manifest` the admission re-proves.
+# ---------------------------------------------------------------------------
+_SLICE_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
+
+
+def plan_slices(
+    *, route_path: Path, node_id: str, slices_path: Path,
+    output_path: Path, worktree: Path | None = None, default_adapter: str = "claude",
+) -> dict:
+    """Build and prove a parallel sub-session manifest from a slice list.
+
+    `slices_path` is JSON: a list (or `{"slices": [...]}`) of
+    `{"id", "fixed_files": [...], "brief", "narrow_verify",
+    "expected_round_trips"?, "adapter"?}` -- the plan's `slice` blocks
+    transcribed. Ids are minted deterministically from the route, node and
+    file sets, one phase-brief file is written per slice beside the manifest,
+    and the manifest is written only after `load_manifest` has proven exact
+    files, worktree and write-scope containment and pairwise disjointness. A
+    typed `StageSessionError` is the answer "run this stage as one session".
+    """
+    route_path = Path(route_path).resolve()
+    route = json.loads(route_path.read_text(encoding="utf-8"))
+    route["_route_file"] = str(route_path)
+    node = node_for(route, node_id)
+    permission = node.get("subdivision")
+    if not isinstance(permission, dict) or permission.get("disjointness") != "exact-fixed-files":
+        raise StageSessionError("parallel-subdivision-not-permitted")
+    raw = json.loads(Path(slices_path).read_text(encoding="utf-8"))
+    slices = raw.get("slices") if isinstance(raw, dict) else raw
+    if not isinstance(slices, list):
+        raise StageSessionError("plan-slices-invalid")
+    cap = permission.get("max_slices", 4)
+    if not 2 <= len(slices) <= cap:
+        raise StageSessionError(f"parallel-session-count-invalid:2:{cap}")
+    sealed_cwd = route.get("cwd")
+    if not isinstance(sealed_cwd, str) or not sealed_cwd:
+        raise StageSessionError("plan-slices-route-cwd-missing")
+    sealed_cwd = Path(sealed_cwd).resolve()
+    worktree = Path(worktree).resolve() if worktree is not None else sealed_cwd
+    if worktree != sealed_cwd:
+        # The manifest's `worktree` becomes every slice's `--cwd`; a manifest
+        # that names any tree but the route's sealed cwd would dispatch real
+        # work outside the route while every identity field still matches
+        # (canary review round 1, B2).
+        raise StageSessionError(f"plan-slices-worktree-mismatch:{worktree}:{sealed_cwd}")
+    output_path = Path(output_path).resolve()
+    seed = json.dumps(
+        [route.get("route_id"), node_id, [sorted(map(str, s.get("fixed_files") or [])) for s in slices]],
+        sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    digest = hashlib.sha256(seed).hexdigest()[:12]
+    chain_id = f"ssc-{node_id}-{digest}"
+    sessions = []
+    briefs = []
+    seen = set()
+    for index, item in enumerate(slices, 1):
+        if not isinstance(item, dict):
+            raise StageSessionError(f"plan-slice-invalid:{index}")
+        slice_id = str(item.get("id") or f"s{index}")
+        if not _SLICE_ID.fullmatch(slice_id) or slice_id in seen:
+            raise StageSessionError(f"plan-slice-id-invalid:{slice_id}")
+        seen.add(slice_id)
+        brief_text = item.get("brief")
+        if not isinstance(brief_text, str) or not brief_text.strip():
+            raise StageSessionError(f"plan-slice-brief-missing:{slice_id}")
+        narrow_verify = item.get("narrow_verify")
+        if not isinstance(narrow_verify, str) or not narrow_verify.strip() or "\n" in narrow_verify:
+            raise StageSessionError(f"narrow-verify-invalid:{slice_id}")
+        rounds = item.get("expected_round_trips", 2)
+        adapter = item.get("adapter") or default_adapter
+        fixed = item.get("fixed_files")
+        if not isinstance(fixed, list) or not fixed:
+            raise StageSessionError(f"fixed-files-missing:{slice_id}")
+        brief_path = output_path.parent / f"{chain_id}-{slice_id}.brief.md"
+        briefs.append((brief_path, (
+            f"# {node_id} slice {index}/{len(slices)} — {slice_id}\n\n"
+            f"chain: {chain_id}\nfixed_files (exhaustive; touch nothing else, commit nothing):\n"
+            + "".join(f"- {f}\n" for f in fixed)
+            + f"narrow_verify: {narrow_verify.strip()}\n\n{brief_text.strip()}\n"
+        )))
+        sessions.append({
+            "subsession_id": f"ss-{chain_id[4:]}-{slice_id}",
+            "attempt_id": f"att-{chain_id[4:]}-{slice_id}",
+            "adapter": adapter,
+            "slug": f"{node_id}-{slice_id}",
+            "phase_brief": str(brief_path),
+            "fixed_files": [str(f) for f in fixed],
+            "narrow_verify": narrow_verify.strip(),
+            "expected_round_trips": rounds,
+            "node": f"{node_id}-slice-{index}",
+        })
+    manifest = {
+        "schema_version": 1,
+        "kind": "stage-session-chain",
+        "chain_id": chain_id,
+        "mode": "parallel",
+        "worktree": str(worktree),
+        "route_file": str(route_path),
+        "route_id": route.get("route_id"),
+        "route_hash": route.get("route_hash"),
+        "route_node": node_id,
+        "completion_gate": node.get("completion_gate"),
+        "sessions": sessions,
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    for brief_path, text in briefs:
+        brief_path.write_text(text, encoding="utf-8")
+    output_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    try:
+        proven = load_manifest(output_path, route=route, node=node)
+    except StageSessionError:
+        output_path.unlink(missing_ok=True)
+        for brief_path, _text in briefs:
+            brief_path.unlink(missing_ok=True)
+        raise
+    return {
+        "planned": "ok", "chain_id": chain_id, "manifest": str(output_path),
+        "sessions": len(proven["sessions"]),
+        "fixed_files": sum(len(s["fixed_files"]) for s in proven["sessions"]),
+        "manifest_sha256": proven["_manifest_sha256"],
+    }
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("action", choices=("check", "census", "register", "start"))
-    p.add_argument("--manifest", required=True)
-    p.add_argument("--parent", required=True)
+    p.add_argument("action", choices=("check", "census", "register", "start", "plan-slices"))
+    p.add_argument("--manifest", help="chain manifest (check/census/register/start)")
+    p.add_argument("--parent", help="owner slug (register/start)")
     p.add_argument("--jobs")
+    p.add_argument("--route", help="plan-slices: compiled route file")
+    p.add_argument("--node", default="execute", help="plan-slices: subdivision-permitted node id")
+    p.add_argument("--worktree", help="plan-slices: must equal the route's sealed cwd (default: the route's cwd)")
+    p.add_argument("--slices", help="plan-slices: JSON slice list transcribed from the plan")
+    p.add_argument("--output", help="plan-slices: manifest path to write (briefs are written beside it)")
+    p.add_argument("--adapter", default="claude", choices=("claude", "codex", "opencode"))
     args = p.parse_args()
+    if args.action == "plan-slices":
+        missing = [name for name in ("route", "slices", "output") if not getattr(args, name)]
+        if missing:
+            p.error("plan-slices requires --" + ", --".join(missing))
+        try:
+            print(json.dumps(plan_slices(
+                route_path=Path(args.route), node_id=args.node,
+                worktree=Path(args.worktree) if args.worktree else None,
+                slices_path=Path(args.slices), output_path=Path(args.output), default_adapter=args.adapter,
+            ), sort_keys=True))
+        except StageSessionError as exc:
+            print(json.dumps({"planned": "refused", "reason": str(exc),
+                              "fallback": "single-session-required"}, sort_keys=True))
+            return 65
+        return 0
+    if not args.manifest or not args.parent:
+        p.error(f"{args.action} requires --manifest and --parent")
     try:
         envelope = json.loads(Path(args.manifest).resolve().read_text(encoding="utf-8"))
         route_path = Path(envelope.get("route_file", "")).resolve()

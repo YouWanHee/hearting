@@ -1,12 +1,18 @@
 """F-100c — steward (depth −1) flag projection, read-only.
 
-The ledger tool (`utilities/peer-message.py`) writes one marker per SENDING session
-under `<dispatch-state-root>/peer-steward/<harness>/<sid>.json` whenever a
-steer/handoff/gate-relay/watch record is recorded — by the steward wrapper, by the
-Claude SendMessage hook, or by hand — so every send path raises the same flag and
-`peer-message release` clears it. This collector joins those markers onto live
-sessions by exact (harness, session_id); nothing here writes, and a missing or
-unreadable marker root leaves every session's default (`steward=False`).
+The ledger tool (`utilities/peer-message.py`) keeps one marker per session under
+`<dispatch-state-root>/peer-steward/<harness>/<sid>.json`. Since 2026-09-06 the flag
+is a ROLE: a marker entry is evidence only when its `source` is `explicit`
+(`peer-steward.py steward on`), `watch` (`peer-steward.py wait`/`watch` observed a
+real target) or `start` (`peer-steward.py start` launched the target). No `record`
+path raises it — not a steer/handoff/gate-relay send and not a SendMessage with
+`notify_when_idle` (recorded as `kind=watch`) — under the old rule every worker that
+handed off to its steward wore the steward tag. This collector joins markers onto live sessions by exact
+(harness, session_id) and asks the ledger tool's `steward_evidence_targets` — the
+one definition of the rule — which entries count; a marker with none (an old
+handoff-only leftover) is treated as absent, so `steward_targets` holds evidence
+entries only. Nothing here writes, and a missing or unreadable marker root (or an
+unavailable ledger module) leaves every session's default (`steward=False`).
 """
 import importlib.util
 import sys
@@ -50,14 +56,23 @@ def enrich(sessions, markers=None):
         markers = read_markers()
     if not markers:
         return
+    mod = _peer_message_module()
+    evidence = getattr(mod, "steward_evidence_targets", None) if mod is not None else None
+    if evidence is None:
+        return  # no rule available → no steward claims (fail-soft, never a guess)
     for s in sessions:
         sid = getattr(s, "session_id", None)
         harness = str(getattr(s, "harness", "") or "").lower()
         marker = markers.get((harness, sid)) if sid else None
         if not marker:
             continue
-        targets = marker.get("targets")
+        try:
+            targets = evidence(marker)
+        except Exception:
+            targets = []
+        if not targets:
+            continue
         s.steward = True
-        # Stable source order is required by the renderer's front-preserving +N fold.
-        s.steward_targets = (sorted(targets.values(), key=lambda t: t.get("ts") or "")
-                             if isinstance(targets, dict) else [])
+        # `steward_evidence_targets` returns oldest-first — the stable order the
+        # renderer's front-preserving +N fold relies on.
+        s.steward_targets = list(targets)

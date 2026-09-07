@@ -74,7 +74,7 @@ ALLOWED_CHILD_KEYS = {
     "delivery_classification",
 }
 ALLOWED_REASONS = {
-    "registry-closed", "terminal-observed", "row-advanced",
+    "registry-closed", "registry-closed-marker", "terminal-observed", "row-advanced",
     "terminal-failure-or-unclosed",
 }
 REQUIRED_ACTIONS = {

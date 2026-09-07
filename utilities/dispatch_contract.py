@@ -121,6 +121,10 @@ ATTEMPT_MUTABLE_METADATA = {
     "group_reap_pgid",
     "attempt_descendant_proof",
     "attempt_descendant_observer_ns",
+    "attempt_descendant_residue",
+    "attempt_descendant_residue_count",
+    "attempt_descendant_residue_basis",
+    "attempt_descendant_residue_at",
     "reap_watch",
     "reap_watch_pid",
     "launch_lifecycle",
@@ -226,6 +230,19 @@ ATTEMPT_TERMINAL_EVIDENCE_KEYS = {
     # through `_updated_attempt_metadata(..., terminal=True)` so the operator-
     # chosen evidence path is sanitized like every other terminal value.
     "gate_closure",
+    # SD-OPEN-41(b): verdict provenance for a `review-worker` node's completion.
+    # `reviewer_kind` is one of capability-route's REVIEWER_KINDS,
+    # `review_independence` is independent|degraded|owner-overridden, and the
+    # last two are present only on the corresponding close. Written once, beside
+    # `note=completed-marker`, at the row's one close -- but like `gate_closure`
+    # and every other member of this set except `launch_outcome` and the
+    # delivery-intent keys, that is a property of the only writer, NOT enforced
+    # by `_updated_attempt_metadata`: a later `terminal=True` write can still
+    # change them. Do not cite this list as a write-once guarantee.
+    "reviewer_kind",
+    "review_independence",
+    "reviewer_downgrade_reason",
+    "review_gate_closure",
     "owner_closure",
 }
 _MODULE_ROOT = Path(__file__).resolve().parents[1]
@@ -1662,6 +1679,15 @@ def process_group_members(pgid: int) -> tuple[tuple[int, str, str], ...]:
 
 ATTEMPT_DESCENDANT_ENV = "AGENT_DISPATCH_ATTEMPT_ID"
 ATTEMPT_DESCENDANT_PROOF = "attempt-tagged-empty-v1"
+# SD-OPEN-47 (H7): the detached drain observer seals this instead of the
+# empty proof when the governed leader and its process group are gone, the
+# attempt already holds semantic terminal evidence (terminal row status or a
+# final runtime envelope), and tagged residue -- a worker-spawned background
+# shell, a `herdr agent wait`, anything that inherited the tag and outlived
+# the worker -- still survives past the residue grace. The residue pids are
+# recorded beside it; they are leftovers of a finished worker, never the
+# worker, so they must not veto quiescence forever.
+ATTEMPT_DESCENDANT_RESIDUE_PROOF = "attempt-tagged-residue-v1"
 # Operator-sealed substitute for a post-exit receipt that can never be issued.
 # `dispatch-registry.py reconcile --seal-artifact-proof-receipt` writes it only
 # after re-deriving the whole evidence chain; nothing issues it automatically.
@@ -1677,6 +1703,35 @@ PRELAUNCH_PROCESS_BLOCK_REASONS = (
     "prior-attempt-still-live",
     "prior-attempt-unverifiable",
 )
+
+
+def _parent_leader_pids(metadata: dict[str, str]) -> set[int]:
+    """The recorded parent leader as an exact identity, else nothing.
+
+    `parent_pid` counts only when `parent_pid_start` matches the live start
+    ticks of that pid in this observer's namespace. `parent_pid_host` is a
+    host-namespace number recorded only when the parent lives in another
+    namespace, so it is comparable here only when the row's own namespace is
+    the observer's and the parent is host-visible.
+    """
+
+    excluded: set[int] = set()
+    raw = str(metadata.get("parent_pid", ""))
+    start = str(metadata.get("parent_pid_start", ""))
+    if raw.isdigit() and start and process_start_ticks(int(raw)) == start:
+        excluded.add(int(raw))
+    raw_host = str(metadata.get("parent_pid_host", ""))
+    host_start = str(metadata.get("parent_pid_host_start", "") or start)
+    if (
+        raw_host.isdigit()
+        and host_start
+        and metadata.get("parent_pid_scope") == "host-visible"
+        and metadata.get("pid_ns")
+        and metadata.get("pid_ns") == metadata.get("pid_observer_ns")
+        and process_start_ticks(int(raw_host)) == host_start
+    ):
+        excluded.add(int(raw_host))
+    return excluded
 
 
 def attempt_tagged_descendants(metadata: dict[str, str]) -> ProcessGroupObservation:
@@ -1699,6 +1754,13 @@ def attempt_tagged_descendants(metadata: dict[str, str]) -> ProcessGroupObservat
     if not attempt_id:
         return ProcessGroupObservation("unverifiable", reason="attempt-id-missing")
     tag = f"{ATTEMPT_DESCENDANT_ENV}={attempt_id}".encode()
+    # SD-OPEN-47 (H7-b): a child's liveness is its own process set. The
+    # recorded parent leader (the owner's governed process) is an ancestor,
+    # never a descendant, so it is excluded before any tag match -- but only
+    # by the repository's process identity (pid + start ticks, same
+    # namespace as the observer), never by pid number alone: a reused or
+    # cross-namespace number is a different process (review finding 2).
+    excluded_pids = _parent_leader_pids(metadata)
     members: list[tuple[int, str, str]] = []
     incomplete_reason = ""
     try:
@@ -1726,6 +1788,8 @@ def attempt_tagged_descendants(metadata: dict[str, str]) -> ProcessGroupObservat
             continue
         except (IndexError, ValueError):
             incomplete_reason = f"procfs-member:{entry.name}:malformed"
+            continue
+        if int(entry.name) in excluded_pids:
             continue
         if tag in environ.split(b"\0"):
             members.append((int(entry.name), start, state))
@@ -1774,9 +1838,43 @@ def _detached_group_drain_receipt(metadata: dict[str, str]) -> bool:
         and metadata.get("launch_outcome") == "governed-process-group-drained"
         and metadata.get("group_reap_proof") == GROUP_REAP_PROOF
         and metadata.get("group_reap_pgid") == raw_group
-        and metadata.get("attempt_descendant_proof") == ATTEMPT_DESCENDANT_PROOF
+        and (
+            metadata.get("attempt_descendant_proof") == ATTEMPT_DESCENDANT_PROOF
+            or _tagged_residue_receipt(metadata)
+        )
         and metadata.get("attempt_descendant_observer_ns") == observer_namespace
     )
+
+
+def _tagged_residue_receipt(metadata: dict[str, str]) -> bool:
+    """Did the detached drain observer seal a typed tagged-residue receipt?
+
+    SD-OPEN-47 (H7): `dispatch-reap-watch.py` writes this only after the exact
+    leader exited, its process group drained, the attempt already carried
+    semantic terminal evidence, and tagged survivors outlived the residue grace.
+    The pids it names are residue of a finished worker; every quiescence
+    consumer treats them exactly like the operator-sealed artifact proof.
+    """
+
+    observer_namespace = metadata.get("pid_observer_ns", "")
+    return bool(
+        observer_namespace
+        and metadata.get("pid_ns", "") == observer_namespace
+        and metadata.get("launch_lifecycle") == "detached"
+        and metadata.get("launch_outcome") == "governed-process-group-drained"
+        and metadata.get("attempt_descendant_proof")
+        == ATTEMPT_DESCENDANT_RESIDUE_PROOF
+        and metadata.get("attempt_descendant_observer_ns") == observer_namespace
+        and bool(metadata.get("attempt_descendant_residue"))
+        and metadata.get("attempt_descendant_residue_basis")
+        in {"registry-terminal", "terminal-envelope"}
+    )
+
+
+def tagged_residue_receipt(metadata: dict[str, str]) -> bool:
+    """Public read-only view of ``_tagged_residue_receipt``."""
+
+    return _tagged_residue_receipt(metadata)
 
 
 _CANCELLATION_QUIESCENCE_BINDING_KEYS = (
@@ -2088,6 +2186,13 @@ def attempt_process_quiescence(
         # gate, and only with the operator-sealed proof -- an unsealed row keeps
         # the veto.
         if terminal_receipt and _artifact_proof_receipt(metadata):
+            return result
+        # SD-OPEN-47 (H7): the drain observer already proved, after terminal
+        # evidence and the residue grace, that these tagged survivors are
+        # leftovers of a finished worker. They never veto again, at any gate:
+        # the alternative is a child row no join, reconcile, or successor
+        # gate can ever close while the residue lives.
+        if _tagged_residue_receipt(metadata):
             return result
         return ProcessQuiescence(
             "live", "attempt-descendant-live", probe.members[0][0]

@@ -802,12 +802,19 @@ def _map_rows(root: Path, plan: Mapping[str, Any]) -> Tuple[List[Dict[str, Any]]
                     new_target = new_dir + target[len(old_dir):]
                     sha = by_target.get(new_target)
                     candidate = root / new_target
-                    if sha is None:
-                        sha = _sha_file(candidate) if candidate.is_file() else _sha_bytes(new_target.encode())
-                    rows.append({"schema_version": C.MAP_SCHEMA,
-                                 "kind": "file" if candidate.is_file() else "directory",
+                    if candidate.is_symlink():
+                        # A W7H-rejoined link inside the moved cycle: its row
+                        # stays `kind: symlink` with the link-text digest
+                        # (never the target's bytes -- a corpus wav is not ours).
+                        kind, sha = "symlink", _sha_bytes(os.readlink(candidate).encode("utf-8"))
+                    else:
+                        kind = "file" if candidate.is_file() else "directory"
+                        if sha is None:
+                            sha = _sha_file(candidate) if candidate.is_file() else _sha_bytes(new_target.encode())
+                    rows.append({"schema_version": C.MAP_SCHEMA, "kind": kind,
                                  "source_locator": source, "target_locator": new_target,
-                                 "sha256": sha, "identity_refs": []})
+                                 "sha256": sha, "identity_refs": [],
+                                 **({"link_target": os.readlink(candidate)} if kind == "symlink" else {})})
                     retargeted += 1
                     hit = True
                     break

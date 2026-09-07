@@ -118,6 +118,13 @@ from codex_managed_dispatch import (  # noqa: E402
     probe_managed_codex_parent,
     registered_parent_delivery,
 )
+from execution_access import (  # noqa: E402
+    AccessContext,
+    ExecutionAccessError,
+    adapter_default_roots,
+    bind_request as bind_execution_access_request,
+    receipt_fragment as execution_access_receipt_fragment,
+)
 QA_LEVELS = {"quick", "light", "standard", "thorough", "adversarial"}
 INTENSITY_LEVELS = {"direct", "quick", "standard", "strong", "thorough", "adversarial"}
 # Verification rigor is derived from intensity — CONVENTIONS §1.1 mapping table (SoT).
@@ -237,6 +244,7 @@ def parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--prompt-file")
     p.add_argument("--prompt-text")
+    p.add_argument("--execution-access-file")
     p.add_argument("--jobs")
     p.add_argument("--attempt-id")
     p.add_argument("--broker-request-id")
@@ -1157,6 +1165,9 @@ def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -
         ]
         if getattr(args, "report_bundle_root", None) is not None:
             command += ["--add-dir", str(args.report_bundle_root)]
+        if getattr(args, "execution_access_grant", None) is not None:
+            for writable_dir in args.execution_access_grant.additional_writable_roots:
+                command += ["--add-dir", str(writable_dir)]
         if getattr(args, "owner_route_binding", None):
             command += [
                 "--route-file", args.owner_route_binding.route_file,
@@ -1190,6 +1201,9 @@ def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -
     ]
     if getattr(args, "report_bundle_root", None) is not None:
         cmd += ["--add-dir", str(args.report_bundle_root)]
+    if getattr(args, "execution_access_grant", None) is not None:
+        for writable_dir in args.execution_access_grant.additional_writable_roots:
+            cmd += ["--add-dir", str(writable_dir)]
     if args.resolved_model_settings["source"] != "inherit":
         cmd += [
             "--model",
@@ -1313,6 +1327,9 @@ def append_job(jobs: Path, args: argparse.Namespace) -> bool:
     if args.worker_mode:
         pipe += f",worker_mode={args.worker_mode}"
     pipe += f",worker_type={args.worker_type},runtime_sandbox=adapter-default"
+    pipe += execution_access_receipt_fragment(
+        getattr(args, "execution_access_grant", None)
+    )
     for key, value in sorted(args.launch_lifecycle_resolution.metadata().items()):
         pipe += f",{key}={value}"
     pipe += f",assigned_contract={args.assigned_contract}"
@@ -2040,6 +2057,28 @@ def main(argv: list[str]) -> int:
             completion_lease_path(args)
     except DispatchContractError as e:
         return fail(e.reason, 69, detail=e.detail, child_spawned="0")
+    try:
+        args.execution_access_grant = bind_execution_access_request(
+            args.execution_access_file,
+            environ=os.environ,
+            context=AccessContext.build(
+                worktree=args.worktree,
+                artifact_root=args.artifact_root,
+                dispatch_state_root=dispatch_state_root(args.jobs_path),
+                agent_home=args.agent_home,
+                environ=os.environ,
+            ),
+            is_child=args.dispatch_depth >= 2,
+            parent=None,
+            runtime=(
+                "claude-supervisor"
+                if args.resolved_completion_delivery == "session-resume-supervised"
+                else "claude-cli"
+            ),
+            default_writable_roots=adapter_default_roots(args),
+        )
+    except ExecutionAccessError as exc:
+        return fail(exc.reason, 64, detail=exc.detail, child_spawned="0")
     log_dir = (
         Path(args.log_dir)
         if args.log_dir

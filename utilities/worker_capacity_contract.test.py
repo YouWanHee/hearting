@@ -371,7 +371,11 @@ class WorkerCapacityContractTest(unittest.TestCase):
             os.environ["AGENT_DISPATCH_JOBS"] = str(jobs)
             try:
                 self.assertTrue(WORKER_ROUTE._qualifying_subsession_lineage("rt", "execute", "att-current"))
-                self.assertFalse(WORKER_ROUTE._qualifying_retry_evidence("rt", "execute", "att-current"))
+                # SD-133: the evidence lookup takes the route record, not an id,
+                # because it reads the record's sealed lineage. A route with no
+                # lineage fields is exactly this single-route case.
+                self.assertFalse(WORKER_ROUTE._qualifying_retry_evidence(
+                    {"route_id": "rt"}, "execute", "att-current"))
             finally:
                 if prior is None:
                     os.environ.pop("AGENT_DISPATCH_JOBS", None)

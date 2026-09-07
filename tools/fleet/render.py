@@ -167,7 +167,7 @@ _HUE_OF = {
     # F-100a: the `[46]` session-tag badge — brackets dim, the tag itself in the same soft
     # white as `herdr_on` (user 2026-09-03: white, so it separates from the harness hue).
     "tag": ("w", 0), "tag_dim": ("d", _A_D),
-    # F-100c: a STEWARD session (depth −1, it has sent steer/handoff/watch records) wears
+    # F-100c: a STEWARD session (depth −1: `steward on`, or it watched/started a session) wears
     # its tag in bold yellow — the one status hue not already claimed by a liveness
     # state on the identity column (user 2026-09-03: "id에 노란색이나 눈에 띄는 색").
     "tag_steward": ("y", _A_B),

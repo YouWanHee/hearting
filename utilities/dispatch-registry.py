@@ -70,6 +70,7 @@ from dispatch_completion_join import (  # noqa: E402
     reconcile_pending_delivery,
 )
 from dispatch_summary import ensure_attempt_owner  # noqa: E402
+import dispatch_pending_delivery as pending_delivery  # noqa: E402
 _cleanup_spec = importlib.util.spec_from_file_location("worktree_cleanup", ROOT / "utilities/worktree-cleanup.py")
 cleanup = importlib.util.module_from_spec(_cleanup_spec)
 sys.modules[_cleanup_spec.name] = cleanup
@@ -904,7 +905,21 @@ def reconcile(rows, args):
         # bounded-cadence "dispatch reconcile path" -- the materialize
         # backstop and the single declared expiry actor share its cadence
         # rather than introducing a new driver process.
-        record["pending_delivery"] = reconcile_pending_delivery(args.jobs)
+        record["pending_delivery"] = {"applied": reconcile_pending_delivery(args.jobs)}
+    else:
+        # Dry-run surface for the SD-111 §(7) v67 retention prune: the plan
+        # counts only (the `dispatch_pending_delivery.py prune` CLI prints the
+        # per-record table); nothing is transitioned or unlinked here. The key
+        # is nested (`plan` vs `applied`) so its shape never depends on a flag.
+        try:
+            plan = pending_delivery.prune_plan(args.jobs.resolve(strict=False).parent)
+            record["pending_delivery"] = {"plan": {
+                "prune_candidates": len(plan["records"]),
+                "orphan_lock_candidates": len(plan["orphan_locks"]),
+                "kept_open": plan["kept_open"],
+            }}
+        except Exception:  # noqa: BLE001 -- a report must not fail on the plan
+            record["pending_delivery"] = {"plan": None}
     if args.audit:
         cleanup.append_audit(args.audit, record)
     print(json.dumps(record, sort_keys=True)); return 0

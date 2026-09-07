@@ -490,14 +490,11 @@ def main():
   # supervisor advance of indexes 2..N reads that same sealed pointer much
   # later.
   #
-  # PRECONDITION FOR PARALLEL SUBDIVISION. `subdivision_batch_admission.py`
-  # builds slice starts too and never calls `persist_chain_manifest` -- the only
-  # call in the repo is `stage-session-chain.py:293`. That path is unreachable
-  # today (`raise_if_parallel_entry_fail_closed` raises unconditionally, SD-119
-  # R4), so this gate refuses nothing live. Whoever lands parallel admission
-  # must persist the manifest before starting a slice, or every parallel slice
-  # will be refused here. `SubsessionChainSealTest.test_parallel_admission_is_
-  # still_fail_closed` fails the moment that assumption stops holding.
+  # PARALLEL SUBDIVISION (SD-103, routing-flex): `subdivision_batch_admission.
+  # start_admitted_batch` seals the manifest at the same pointer after every
+  # slice registered and before the first start, so a parallel slice passes
+  # this gate for the same reason a serial one does. `SubsessionChainSealTest.
+  # test_parallel_admission_persists_before_start` pins that.
   manifest=SUBSESSION.load_chain_manifest(registry.path,a.session_chain_id)
   pointer=SUBSESSION.chain_manifest_pointer_path(registry.path,a.session_chain_id)
   sealed=None

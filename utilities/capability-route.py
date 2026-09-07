@@ -16,6 +16,7 @@ import route_identity as ROUTE_IDENTITY
 import review_round_cap as REVIEW_ROUND_CAP
 from dispatch_continuation_budget import COMPATIBILITY_FLOOR, TERMINAL_RESERVE_DEFAULT
 from dispatch_contract import (
+    row_is_subsession,
     CANONICAL_PARENT_TRANSPORTS,
     DispatchContractError,
     EXECUTION_SURFACES,
@@ -921,7 +922,7 @@ def build_continuation_route(
         "tracked_gate_evidence","spec_touch","cwd","source_commit",
         "registry_digest","dispatch_defaults_digest","dispatch_allocation",
         "owner_harness_policy","selection","human_gates","human_gate_bindings",
-        "confirmation_mode",
+        "confirmation_mode","small_work_confirmation",
         "resume_retry_boundaries","dispatch_evidence","dispatch_contract_version",
         "dispatch_evidence_scope_version","registered_headless_candidates",
         "registered_headless_policy","unit_catalog_digest","validation_basis",
@@ -1114,15 +1115,24 @@ def _stage_fallback():
         _STAGE_FALLBACK=module
     return _STAGE_FALLBACK
 
-def _continuation_lineage_route_ids(source_route):
+def continuation_lineage_route_ids(source_route):
     """Every route id in this continuation's lineage, nearest ancestor first.
 
-    A declined continuation records no attempts of its own -- the guard refuses
-    its whole pre-mutation prefix -- so asking the registry only about the
-    immediate predecessor finds a clean slate one generation later, and the
-    decline evaporates (review round 3, B1). The lineage is already carried:
-    `source_route_id` names the predecessor and `supersession_edges` accumulates
-    every earlier `from_route_id`.
+    Shared with `worker-route-guard.py`, which asks the same question from the
+    other side: the builder needs it to decide whether to keep a pin, the guard
+    needs it to find the retry evidence that pin implies (SD-133). One
+    definition, so the two can never disagree about what an ancestor is.
+
+    A declined continuation records no attempts of its own, so asking the
+    registry only about the immediate predecessor finds a clean slate one
+    generation later and the decline evaporates (SD-128 review round 3, B1).
+    The lineage is already carried: `source_route_id` names the predecessor and
+    `supersession_edges` accumulates every earlier `from_route_id`.
+
+    `source_route_id` and the first edge name the same route, so for a
+    first-generation continuation they are redundant. They stop being redundant
+    at the second generation, where a grandparent is reachable **only** through
+    an inherited edge -- and that is the common shape, not the exception.
     """
     ids=[]
     candidates=[source_route.get("route_id"),source_route.get("source_route_id")]
@@ -1188,7 +1198,7 @@ def _prior_registry_attempt(source_route, node_id):
     jobs=_authoritative_lineage_registry(source_route)
     if jobs is None:
         return True
-    lineage=_continuation_lineage_route_ids(source_route)
+    lineage=continuation_lineage_route_ids(source_route)
     if not lineage:
         return True
     try:
@@ -1804,6 +1814,19 @@ def _seal_confirmation_mode():
         return DEFAULTS.DEFAULT_CONFIRMATION_MODE
     return DEFAULTS.query_confirmation_mode(cfg)
 
+def _seal_small_work_confirmation():
+    """SD-136: seal `confirmation.small_work` (notice|card) the same way as
+    `_seal_confirmation_mode`: absent/corrupt config -> the shipped default,
+    never None."""
+    config_path = DEFAULTS.default_config_path()
+    if not os.path.exists(config_path):
+        return DEFAULTS.DEFAULT_SMALL_WORK_CONFIRMATION
+    try:
+        cfg = DEFAULTS.load_and_validate(config_path, DEFAULTS.default_topology_path())
+    except (DEFAULTS.DefaultsConfigError, OSError, json.JSONDecodeError):
+        return DEFAULTS.DEFAULT_SMALL_WORK_CONFIRMATION
+    return DEFAULTS.query_small_work_confirmation(cfg)
+
 
 _AUTONOMOUS_REMOVABLE_GATE = "frame-review"
 _AUTONOMOUS_REMOVABLE_CAPABILITY = "autopilot-code"
@@ -1889,7 +1912,8 @@ def compile_route(capability, capability_mode, requested_intensity, cwd, artifac
                   predicates=(), signals=(), transport=None,
                   transport_evidence="caller-selected", inline_reason=None,
                   tracking="tracked", tracked_gate_evidence=None, dispatch_evidence=None,
-                  registered_headless_evidence=None, slug=None):
+                  registered_headless_evidence=None, slug=None,
+                  route_origin="preset", shape=None):
     registry=TOPO.load_registry(); TOPO.validate_registry(registry)
     recipe=TOPO.resolve_recipe(registry, capability, capability_mode)
     return _compile_from_recipe(
@@ -1898,7 +1922,317 @@ def compile_route(capability, capability_mode, requested_intensity, cwd, artifac
         transport_evidence=transport_evidence, inline_reason=inline_reason,
         tracking=tracking, tracked_gate_evidence=tracked_gate_evidence,
         dispatch_evidence=dispatch_evidence,
-        registered_headless_evidence=registered_headless_evidence, slug=slug)
+        registered_headless_evidence=registered_headless_evidence, slug=slug,
+        route_origin=route_origin, shape=shape)
+
+# ---------------------------------------------------------------------------
+# compose: the preset-free work route (SD-135).
+#
+# `compile` asks the caller to pick a registry recipe by entry-router trigger
+# and to restate ~15 flags plus evidence files by hand. `compose` inverts that:
+# the caller names the *shape* of the work (direct / solo / staged) and, for a
+# staged shape, the stage subgraph it actually wants; every other flag and both
+# evidence probes default from the checkout and the registry. The result goes
+# through the SAME validator, sealer, verifier and guards as a preset route --
+# composition changes route shape only (WORKFLOW §7 compose-on-demand).
+# ---------------------------------------------------------------------------
+COMPOSE_SHAPES = ("direct", "solo", "staged")
+SHAPE_INTENSITY = {"direct": "direct", "solo": "quick", "staged": "standard"}
+INTENSITY_SHAPE = {"direct": "direct", "quick": "solo"}
+ROUTE_ORIGINS = ("preset", "compose")
+COMPOSE_DEFAULT_CAPABILITY = "autopilot-code"
+COMPOSE_DEFAULT_CHILDREN = ("claude", "codex")
+COMPOSE_SPEC_CANDIDATES = ("spec/prd.md",)
+
+
+def shape_for_intensity(effective):
+    return INTENSITY_SHAPE.get(effective, "staged")
+
+
+def parse_graph_spec(text):
+    """`execute,test,report` or `execute:dev/refactor,test` -> [(id, unit|None)]."""
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("compose-graph-empty")
+    rows = []
+    for raw in text.split(","):
+        item = raw.strip()
+        if not item:
+            raise ValueError("compose-graph-empty-node")
+        node_id, _, unit = item.partition(":")
+        node_id = node_id.strip()
+        if not re.fullmatch(r"[a-z][a-z0-9-]*", node_id):
+            raise ValueError(f"compose-graph-node-invalid:{node_id}")
+        rows.append((node_id, unit.strip() or None))
+    ids = [row[0] for row in rows]
+    if len(ids) != len(set(ids)):
+        raise ValueError("compose-graph-duplicate-node")
+    return rows
+
+
+def _compose_inputs(base_nodes, base_node, kept):
+    """Keep the base node's declared inputs wherever they can still exist.
+
+    An input stays when it is not produced by any recipe node (an external
+    literal such as `task`/`spec`/`source`), when its producer is a kept
+    node, or when it is a semantic token of the tree (`source-diff`, …) that
+    no node has to author. An input whose only producer was dropped is
+    removed -- the stage brief (`dispatch_stage_advance.render_stage_brief`)
+    prints `inputs` verbatim, so a dropped node's file must not be promised.
+    Nothing is added: the chain edge lives in `depends_on`, and a full-graph
+    compose must yield exactly the preset's inputs. (Canary review round 1
+    B1, round 2 M2.)
+    """
+    producers = {}
+    for candidate in base_nodes.values():
+        for output in candidate.get("outputs") or []:
+            producers.setdefault(output, set()).add(candidate["id"])
+    inputs = []
+    for item in base_node.get("inputs") or []:
+        owners = producers.get(item)
+        if owners is None or owners & kept or TOPO._is_semantic_output(item):
+            if item not in inputs:
+                inputs.append(item)
+    return inputs or ["task"]
+
+
+def compose_subgraph_recipe(registry, base_recipe, graph_spec):
+    """Cut the caller's stage subgraph out of the capability's own recipe.
+
+    The nodes keep their unit, kind, gate, write scope, profile and permissions;
+    only the edges change: the subgraph is re-linked in the caller's order, the
+    last node becomes the terminal, a human gate a kept node raised is rebound
+    to the entry of the node that now follows it (dropped when nothing
+    follows), and a parallel group survives only when its anchor is kept and is
+    not the new terminal (G6). Validation stays with `_validate_recipe` --
+    this function never re-implements a rule, it only assembles.
+    """
+    base_nodes = {node["id"]: node for node in base_recipe["standard_plus"]["nodes"]}
+    ids = [node_id for node_id, _ in graph_spec]
+    unknown = [node_id for node_id in ids if node_id not in base_nodes]
+    if unknown:
+        raise ValueError(
+            "compose-graph-unknown-node:" + ",".join(unknown)
+            + " (available: " + ",".join(base_nodes) + ")"
+        )
+    nodes = []
+    overrides = {}
+    for index, (node_id, unit) in enumerate(graph_spec):
+        node = json.loads(json.dumps(base_nodes[node_id]))
+        if unit:
+            choices = node.get("unit_choices")
+            if choices is not None and unit not in choices:
+                raise ValueError(
+                    f"compose-unit-not-in-choices:{node_id}:{unit} (choices: {','.join(choices)})"
+                )
+            if node.get("kind") in ("capability-owner", "resource-runner"):
+                raise ValueError(f"compose-unit-override-reserved:{node_id}")
+            node["unit"] = unit
+            node["role"] = TOPO._unit_frontmatter(unit)["role"]
+            overrides[node_id] = unit
+        previous = nodes[-1] if nodes else None
+        node["depends_on"] = [previous["id"]] if previous else []
+        node["inputs"] = _compose_inputs(base_nodes, base_nodes[node_id], set(ids))
+        node.pop("terminal", None)
+        node.pop("terminal_gate", None)
+        node.pop("continuation", None)
+        node.pop("parallel_group", None)
+        nodes.append(node)
+    terminal = nodes[-1]
+    terminal["terminal"] = True
+    terminal["terminal_gate"] = terminal["completion_gate"]
+    if terminal.get("advance_class") != "model-required":
+        terminal["advance_class"] = "model-required"
+        terminal["model_required_reason"] = "terminal-report"
+    # Human gates: a base node whose continuation was `human-gate G` keeps G
+    # only when a graph node follows it; G is rebound to that node's entry.
+    bindings, gates = [], []
+    for index, node in enumerate(nodes[:-1]):
+        base = base_nodes[node["id"]]
+        continuation = base.get("continuation") or {}
+        if continuation.get("kind") == "human-gate":
+            gate = continuation["gate"]
+            bindings.append({"gate": gate, "node": nodes[index + 1]["id"], "position": "entry"})
+            gates.append(gate)
+            node["continuation"] = {"kind": "human-gate", "gate": gate}
+        elif node.get("kind") == "resource-runner":
+            node["continuation"] = {"kind": "supervised"}
+        else:
+            node["continuation"] = {"kind": "inline-next"}
+    # A gate declared on the entry of a base SOURCE node (no predecessor raises
+    # it, e.g. autopilot-spec `intent-confirmation` on `research`) is kept
+    # verbatim when that node is kept: it is parent-owned, not a continuation.
+    kept_ids = set(ids)
+    for row in base_recipe.get("human_gate_bindings") or []:
+        node_id = row.get("node")
+        if (row.get("position") == "entry" and node_id in kept_ids
+                and not (base_nodes[node_id].get("depends_on") or [])
+                and row.get("gate") not in gates):
+            bindings.append({"gate": row["gate"], "node": node_id, "position": "entry"})
+            gates.append(row["gate"])
+    groups = [
+        json.loads(json.dumps(group))
+        for group in base_recipe["standard_plus"].get("parallel_groups") or []
+        if group["node"] in kept_ids and group["node"] != terminal["id"]
+    ]
+    extensions = [
+        json.loads(json.dumps(row))
+        for row in base_recipe.get("conditional_extensions") or []
+        if set(row.get("after") or []) <= kept_ids
+        and {ref.get("node") for ref in row.get("source_outputs") or []} <= kept_ids
+    ]
+    recipe = {
+        "capability": base_recipe["capability"],
+        "modes": list(base_recipe["modes"]),
+        "topology_class": base_recipe["topology_class"],
+        "direct_predicates": list(base_recipe["direct_predicates"]),
+        "promotion_signals": list(base_recipe["promotion_signals"]),
+        "artifact_scope": json.loads(json.dumps(base_recipe["artifact_scope"])),
+        "quick": json.loads(json.dumps(base_recipe["quick"])),
+        "standard_plus": {
+            "topology": base_recipe["standard_plus"].get("topology", base_recipe["topology_class"]),
+            "owner_dispatch_depth": base_recipe["standard_plus"]["owner_dispatch_depth"],
+            "max_dispatch_depth": max(
+                (node.get("dispatch_depth", 0) for node in nodes if node.get("kind") != "resource-runner"),
+                default=0,
+            ),
+            "nodes": nodes,
+        },
+        "conditional_extensions": extensions,
+        "completion_gates": sorted({node["completion_gate"] for node in nodes}),
+        "human_gates": sorted(set(gates)),
+        "human_gate_bindings": bindings,
+        "resume_retry_boundaries": list(ids),
+        "compose": {"origin": "compose", "shape": "staged", "graph": list(ids),
+                    "unit_overrides": overrides, "base_capability": base_recipe["capability"]},
+    }
+    if groups:
+        recipe["standard_plus"]["parallel_groups"] = groups
+    return recipe
+
+
+def _compose_default_jobs():
+    inherited = os.environ.get("AGENT_DISPATCH_JOBS")
+    if inherited:
+        return Path(inherited)
+    return stable_state_root(os.environ) / "jobs.log"
+
+
+def _compose_readiness(cwd, jobs, parent_harness, children):
+    spec = importlib.util.spec_from_file_location(
+        "hearting_dispatch_readiness", ROOT / "utilities" / "dispatch-readiness.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    try:
+        return module.generate(
+            worktree=Path(cwd), jobs=Path(jobs),
+            owner_harnesses=[parent_harness], child_harnesses=list(children),
+        )
+    except module.ReadinessError as exc:
+        raise ValueError(f"compose-readiness-unavailable:{exc}") from exc
+
+
+def compose_spec_read(cwd, artifact_root, explicit):
+    """`auto` is honest, not permissive: with no spec candidate it records the
+    absence; with one present it refuses and names the file the caller must
+    read and assert (`--spec-read <source>`). The spec-read gate is a real
+    invariant (WORKFLOW §7.0); compose only removes the boilerplate case."""
+    if explicit not in (None, "", "auto"):
+        return {"satisfied": explicit.lower() not in ("0", "false", "no"), "source": explicit}
+    present = []
+    for root in (Path(cwd), Path(artifact_root)):
+        for rel in COMPOSE_SPEC_CANDIDATES:
+            candidate = root / rel
+            if candidate.is_file():
+                present.append(str(candidate))
+    if present:
+        raise ValueError("compose-spec-read-required:" + ",".join(sorted(set(present))))
+    return {"satisfied": True, "source": "compose-auto: no spec/prd.md under cwd or artifact root"}
+
+
+def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artifact_root,
+                  intensity=None, signals=(), spec_read=None, drift_verdict=None,
+                  tracking=None, artifact_guard=None, children=None, parent_harness="claude",
+                  dispatch_evidence=None, registered_headless_evidence=None,
+                  transport_evidence="compose-default", jobs=None):
+    """Resolve every default, then compile through the ordinary sealer."""
+    if shape not in COMPOSE_SHAPES:
+        raise ValueError(f"compose-shape-invalid:{shape}")
+    if shape != "staged" and graph:
+        raise ValueError(f"compose-graph-only-staged:{shape}")
+    if shape == "staged" and not graph:
+        raise ValueError("compose-graph-required")
+    registry = TOPO.load_registry()
+    base = next((r for r in registry["recipes"] if r["capability"] == capability), None)
+    if base is None:
+        raise ValueError(f"compose-capability-unknown:{capability}")
+    if capability_mode is None:
+        capability_mode = "dev" if "dev" in base["modes"] else sorted(base["modes"])[0]
+    if capability_mode not in base["modes"]:
+        raise ValueError(f"compose-mode-unknown:{capability_mode} (modes: {','.join(sorted(base['modes']))})")
+    requested = intensity or SHAPE_INTENSITY[shape]
+    if requested not in ORDER:
+        raise ValueError("invalid intensity")
+    if shape == "direct" and requested != "direct":
+        raise ValueError("compose-shape-intensity-mismatch:direct")
+    if shape == "solo" and requested != "quick":
+        raise ValueError("compose-shape-intensity-mismatch:solo")
+    if shape == "staged" and ORDER[requested] < ORDER["standard"]:
+        raise ValueError("compose-shape-intensity-mismatch:staged")
+    cwd = str(Path(cwd).resolve(strict=True))
+    artifact_root = str(Path(artifact_root).resolve())
+    if tracking is None:
+        tracking = "tracked" if shape == "staged" else "untracked"
+    gate = {
+        "spec_read": compose_spec_read(cwd, artifact_root, spec_read),
+        "drift_verdict": drift_verdict or "no-spec-impact: compose default (caller asserted no spec-significant change)",
+        "workflow_mode": tracking,
+        "artifact_guard": {"satisfied": True, "source": artifact_guard or "compose-prechecked"},
+    }
+    predicates = list(base["direct_predicates"]) if shape == "direct" else []
+    signals = sorted(set(signals or ()))
+    if shape == "direct" and signals:
+        raise ValueError("compose-direct-signals-conflict")
+    readiness = None
+    if shape == "staged" and dispatch_evidence is None:
+        readiness = _compose_readiness(cwd, jobs or _compose_default_jobs(), parent_harness,
+                                       children or COMPOSE_DEFAULT_CHILDREN)
+        dispatch_evidence = {"tuples": readiness["tuples"], "native_subagent": []}
+    if shape == "solo" and registered_headless_evidence is None:
+        readiness = readiness or _compose_readiness(cwd, jobs or _compose_default_jobs(),
+                                                    parent_harness, children or COMPOSE_DEFAULT_CHILDREN)
+        registered_headless_evidence = {"candidates": readiness["candidates"]}
+    common = dict(
+        signals=signals, transport=None, transport_evidence=transport_evidence,
+        tracking=tracking, tracked_gate_evidence=gate, slug=slug,
+        dispatch_evidence=dispatch_evidence,
+        registered_headless_evidence=registered_headless_evidence,
+        route_origin="compose", shape=shape,
+    )
+    if shape == "staged":
+        recipe = compose_subgraph_recipe(registry, base, parse_graph_spec(graph))
+        route = compile_composed_route(
+            recipe, capability_mode, requested, cwd, artifact_root,
+            predicates=predicates, inline_reason=None, **common)
+    else:
+        route = compile_route(
+            capability, capability_mode, requested, cwd, artifact_root,
+            predicates=predicates, inline_reason="atomic-direct" if shape == "direct" else None,
+            **common)
+    return route
+
+
+def compose_card(route):
+    """One-line `[경로]` notice the acting session pastes instead of a card."""
+    shape = route.get("selection", {}).get("shape") or shape_for_intensity(route["effective_intensity"])
+    ids = [node["id"] for node in route["nodes"]]
+    graph = "→".join(ids) if route.get("composed") else (ids[0] if ids else "-")
+    gates = ",".join(sorted({row["gate"] for row in route.get("human_gate_bindings") or []})) or "없음"
+    return (
+        f"[경로] {route['capability']} · {shape}({route['effective_intensity']}) {graph}"
+        f" · route {route['route_id']} · origin compose · 사람 게이트 {gates}\n"
+        f"  cwd {route['cwd']} · slug {route.get('slug', '-')}"
+    )
+
 
 def compile_composed_route(composed_recipe, capability_mode, requested_intensity, cwd, artifact_root,
                            **kwargs):
@@ -1922,7 +2256,9 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
                          cwd, artifact_root, predicates=(), signals=(), transport=None,
                          transport_evidence="caller-selected", inline_reason=None,
                          tracking="tracked", tracked_gate_evidence=None, dispatch_evidence=None,
-                         registered_headless_evidence=None, slug=None, composed=False):
+                         registered_headless_evidence=None, slug=None, composed=False,
+                  route_origin="preset", shape=None):
+    if route_origin not in ROUTE_ORIGINS: raise ValueError("invalid route origin")
     cwd=Path(cwd).resolve(strict=True); artifact=Path(artifact_root).resolve()
     if not cwd.is_absolute() or not artifact.is_absolute(): raise ValueError("cwd and artifact root must be absolute")
     slug_fields={}
@@ -2049,10 +2385,12 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
       "dispatch_allocation":dispatch_allocation,
       "owner_harness_policy":owner_harness_policy,
       "confirmation_mode":sealed_confirmation_mode,
+      "small_work_confirmation":_seal_small_work_confirmation(),
       "selection":{"direct_predicates":predicates,"promotion_signals":[{"signal":s,"source":"caller"} for s in signals],
                    "selection_basis":selection_basis,
                    "escalation_basis":[{"signal":s,"source":"caller"} for s in signals],
-                   "transport":transport,"transport_evidence":transport_evidence,"inline_reason":inline_reason},
+                   "transport":transport,"transport_evidence":transport_evidence,"inline_reason":inline_reason,
+                   "route_origin":route_origin,"shape":shape or shape_for_intensity(effective)},
       "continuation_budget":continuation_budget,
       "nodes":nodes,"parallel_groups":_realized_parallel_groups(nodes),
       "conditional_extensions":_realize_conditional_extensions(recipe, effective),
@@ -2152,7 +2490,8 @@ def classify_validation_basis(route, *, registry_digest_now, units_digest_now,
             "verdict": "skew",
             "message": (
                 f"{skew_reason}(compiled={sealed_digest}@{sealed_root}, "
-                f"validator={own_digest}@{own_root})"
+                f"validator={own_digest}@{own_root}); re-run via the tooling "
+                f"under {sealed_root} (the root that created the row)"
             ),
         }
     verdict, message = "current", None
@@ -2797,8 +3136,60 @@ def close_route(route, route_file, commit=None, summary=None, publication=None, 
     if publication is not None: outcome["publication"]=publication
     releases=_gate_releases(route_file)
     if releases: outcome["gate_releases"]=releases
+    reviews=review_independence_observation(route)
+    if reviews:
+        outcome["review_independence"]=reviews
+        # `owner-overridden` belongs here with `degraded`: both mean "this gate
+        # was not closed by an independent reviewer's PASS", and the §0.5 card
+        # rule reads this one list.
+        degraded=sorted(
+            node_id for node_id,row in reviews.items()
+            if row.get("review_independence") in ("degraded","owner-overridden")
+        )
+        if degraded: outcome["review_independence_degraded"]=degraded
     atomic_write(target,outcome)
     return outcome, True
+
+def review_independence_observation(route):
+    """Per review-class node: who produced the verdict, read live from the markers.
+
+    SD-OPEN-41(b) requirement (2) -- an owner-inline review does not block the
+    route, but the route's own closed outcome has to say the gate was not
+    independently reviewed, so a later reader is never left inferring
+    independence from the fact that the route closed.
+
+    Computed at close time from the markers on disk, exactly like
+    `terminal_gate_observation`: a route closed once is never reopened to
+    recompute it. A review node completed before this field existed has no
+    provenance in its marker and is reported `unrecorded` rather than being
+    guessed at.
+    """
+
+    rows={}
+    for node in route.get("nodes",[]):
+        if node.get("kind")!="review-worker":
+            continue
+        node_id=node.get("id")
+        path=completion_dir(route["route_id"])/f"{node_id}.json"
+        try:
+            marker=json.loads(path.read_text(encoding="utf-8"))
+        except (OSError,ValueError):
+            rows[node_id]={"review_independence":"unrecorded","reason":"marker-unreadable"}
+            continue
+        if not isinstance(marker,dict) or not marker.get("review_independence"):
+            rows[node_id]={"review_independence":"unrecorded","reason":"marker-predates-provenance"}
+            continue
+        row={
+            "review_independence":marker["review_independence"],
+            "reviewer_kind":marker.get("reviewer_kind"),
+            "reviewer_identity":marker.get("reviewer_identity"),
+        }
+        if marker.get("reviewer_downgrade_reason"):
+            row["reviewer_downgrade_reason"]=marker["reviewer_downgrade_reason"]
+        if marker.get("review_gate_closure"):
+            row["review_gate_closure"]=marker["review_gate_closure"]
+        rows[node_id]=row
+    return rows
 
 def _gate_releases(route_file):
     """SD-123 (8)(d): fold the gate-release sidecar into the closed outcome.
@@ -2928,6 +3319,178 @@ def _marker_attempt_axes(node, attempt_id, attempt_metadata):
         "fallback_hop":str(attempt_metadata.get("fallback_hop") or "") or None,
     }
 
+# SD-OPEN-41(b): the three ways a review-class node's verdict can be produced.
+# `registered-worker` and `native-subagent` are independent review; `owner-inline`
+# is the owner ruling on its own work and is recorded as a degraded gate, never
+# refused -- refusing would deadlock every route whose review node seals
+# `native-subagent` and `inline` as its last two fallback hops (SD-132's mistake).
+REVIEWER_KINDS = ("registered-worker", "native-subagent", "owner-inline")
+
+
+def resolve_review_identity(
+    node, axes, attempt_metadata, *,
+    claim=None, jobs=None, route_id=None, node_id=None,
+    owner_override=False, owner_chain=False,
+):
+    """Name who actually reviewed, for a `review-worker` node's completion marker.
+
+    Returns `{}` for every other node kind, so no non-review marker changes shape.
+
+    Measured 2026-09-06 over canonical markers under the dispatch state root's
+    `completion/` (excluding `*.attempt.json` and `<node>.<seq>.json` history
+    siblings). The total depends entirely on the predicate -- 67 for markers
+    whose route record still declares `kind=review-worker` (most route records
+    were pruned), 2,911 for markers whose node id merely contains "review" --
+    so the count is quoted with its predicate or not at all. What is stable
+    across both scopes is the shape: the axes already separate registered from
+    inline, and **12** are inline (not the same 12 -- 10 overlap; one predicate
+    misses `plan-check`, the other misses pruned routes). Among those inline
+    ones nothing distinguished "the owner reviewed its own work" from "a native
+    subagent reviewed it", and the user's rule counts the second as independent.
+    Nothing bound a *registered* completer to `worker_type=review` either, so
+    `registered_worker=true` was not proof that a review worker produced the
+    verdict.
+
+    A claim is adjudicated against evidence, never taken on its word:
+
+    * `registered-worker` names another attempt; the row must exist in `jobs`
+      and carry `worker_type=review`.
+    * `native-subagent` names a transcript; it must be a readable regular file,
+      and its sha256 is recorded so the identity is checkable later.
+    * no claim: the completing attempt is the reviewer, which is independent
+      only when its own row says `worker_type=review`.
+
+    Every failed claim **downgrades** to `owner-inline` carrying a typed
+    `reviewer_downgrade_reason`. Downgrade and not refusal is the whole point:
+    the next node still proceeds, and the route's own outcome carries the fact
+    that this gate was not independently reviewed.
+
+    `owner_override` is the SD-94 owner-closure path: the owner ruled over a
+    review that returned FAIL. That row genuinely is a review worker's, so the
+    plain rules below would call it `independent` -- which is precisely
+    backwards, because it is the one case where the owner overrode a real
+    reviewer. It gets its own verdict.
+    """
+
+    if node.get("kind") != "review-worker":
+        return {}
+
+    if owner_override:
+        return {
+            "reviewer_kind": "registered-worker",
+            "review_independence": "owner-overridden",
+            "reviewer_identity": axes.get("attempt_id") or "-",
+            "review_gate_closure": "owner-closure",
+        }
+
+    def degraded(reason):
+        return {
+            "reviewer_kind": "owner-inline",
+            "review_independence": "degraded",
+            "reviewer_identity": axes.get("attempt_id") or "-",
+            "reviewer_downgrade_reason": reason,
+        }
+
+    if claim and claim.get("kind") == "registered-worker":
+        reviewer_attempt = claim.get("attempt_id") or ""
+        if not jobs:
+            return degraded("reviewer-claim-unverifiable-no-registry")
+        try:
+            row = _find_attempt_row_metadata(Path(jobs), reviewer_attempt)
+        except OSError:
+            return degraded("reviewer-registry-unreadable")
+        if row is None:
+            return degraded("reviewer-attempt-row-absent")
+        if row.get("worker_type") != "review":
+            return degraded("reviewer-attempt-not-review-worker")
+        # A sub-session slice "must not create, claim, or satisfy the route
+        # stage's completion marker" (SD-96 / OPERATIONS §5.10), and
+        # `_complete_node_locked` already refuses one as the *completer*. It
+        # cannot be the evidence that the marker is independent either.
+        if row_is_subsession(row):
+            return degraded("reviewer-attempt-subsession")
+        # The job title is not the assignment. A row bound to a route must be
+        # bound to THIS route and node; otherwise any review worker anywhere in
+        # the registry -- or a stale id pasted from a previous cycle -- would
+        # certify this gate. An SD-OPEN-40 ad-hoc reviewer is deliberately
+        # route-less, and stays admissible.
+        claimed_route = row.get("route_id")
+        if claimed_route and (
+            claimed_route != route_id or row.get("route_node") != node_id
+        ):
+            return degraded("reviewer-attempt-foreign-route-node")
+        # A reviewer that was launched and died produced no verdict. `done` plus
+        # a non-`dead-*` note is the contract's own definition of "this attempt
+        # finished its work"; `completed-review-blocking` stays admissible
+        # because a FAIL verdict is a produced verdict.
+        note = str(row.get("note") or "")
+        if row.get("_status") != "done" or note.startswith("dead-"):
+            return degraded("reviewer-attempt-no-terminal-verdict")
+        return {
+            "reviewer_kind": "registered-worker",
+            "review_independence": "independent",
+            "reviewer_identity": reviewer_attempt,
+        }
+
+    if claim and claim.get("kind") == "native-subagent":
+        transcript = Path(claim.get("transcript") or "")
+        try:
+            readable = transcript.is_file()
+            digest = (
+                hashlib.sha256(transcript.read_bytes()).hexdigest() if readable else None
+            )
+        except OSError:
+            return degraded("reviewer-transcript-unreadable")
+        if not readable or digest is None:
+            return degraded("reviewer-transcript-unreadable")
+        return {
+            "reviewer_kind": "native-subagent",
+            "review_independence": "independent",
+            "reviewer_identity": str(transcript.resolve(strict=False)),
+            "reviewer_identity_sha256": digest,
+        }
+
+    worker_type = (attempt_metadata or {}).get("worker_type")
+    if axes.get("registered_worker") and worker_type == "review":
+        return {
+            "reviewer_kind": "registered-worker",
+            "review_independence": "independent",
+            "reviewer_identity": axes.get("attempt_id") or "-",
+        }
+    if axes.get("registered_worker"):
+        return degraded("completer-not-review-worker")
+    if owner_chain:
+        # An owner-chain aggregation carries no per-slice `worker_type`, so the
+        # slices' own review status cannot be inherited today. Conservative and
+        # named: `review-completed-inline` would misdescribe the mechanism.
+        return degraded("review-completed-owner-chain")
+    return degraded("review-completed-inline")
+
+
+def _notify_reviewer_claim_ignored(route, node_id, existing, resolved, review_claim):
+    """Say so when a replay drops a reviewer claim the caller just supplied.
+
+    The replay path has TWO entrances -- `write_completion_marker`'s own
+    `_completion_marker_replay`, and `_publish_completion_locked`'s
+    existing-attempt-link branch, which reads the marker off disk and never
+    calls the writer at all. The first version of this notice lived at one of
+    them, so an inline re-`complete` with a valid `--reviewer-subagent`
+    silently dropped the claim and printed nothing. One definition, both doors.
+    """
+
+    if not review_claim:
+        return
+    if all(existing.get(key) == value for key, value in resolved.items()):
+        return
+    print(
+        "capability-route: reviewer-claim-ignored-on-replay "
+        f"route_id={route['route_id']} node={node_id} "
+        f"recorded={existing.get('reviewer_kind','-')} "
+        f"claimed={resolved.get('reviewer_kind','-')}",
+        file=sys.stderr,
+    )
+
+
 def _next_marker_sequence(directory, node_id):
     maximum=0
     if directory.is_dir():
@@ -3035,14 +3598,31 @@ def evidence_digest(evidence):
             raise ValueError(f"evidence-member-not-regular:{child}")
     return digest.hexdigest()
 
-def write_completion_marker(route, node, node_id, evidence, *, attempt_id=None, attempt_metadata=None):
+def write_completion_marker(
+    route, node, node_id, evidence, *,
+    attempt_id=None, attempt_metadata=None, review_claim=None, jobs=None,
+    owner_override=False, owner_chain=False,
+):
     _migrate_completion_dir_forward(route["route_id"])
     directory=completion_dir(route["route_id"])
     canonical_path=directory/f"{node_id}.json"
     sha=evidence_digest(evidence)
     axes=_marker_attempt_axes(node, attempt_id, attempt_metadata)
+    review_identity=resolve_review_identity(
+        node, axes, attempt_metadata,
+        claim=review_claim, jobs=jobs,
+        route_id=route["route_id"], node_id=node_id,
+        owner_override=owner_override, owner_chain=owner_chain,
+    )
     replayed=_completion_marker_replay(route,node,node_id,evidence,axes,directory)
     if replayed is not None:
+        # A replay is the same completion, so provenance is deliberately not in
+        # marker identity -- but a caller that named a reviewer this time and
+        # gets the old marker back deserves to be told the claim was dropped,
+        # rather than reading exit 0 as "recorded".
+        _notify_reviewer_claim_ignored(
+            route,node_id,replayed,review_identity,review_claim,
+        )
         return replayed
     sequence=_next_marker_sequence(directory,node_id)
     marker={
@@ -3050,6 +3630,12 @@ def write_completion_marker(route, node, node_id, evidence, *, attempt_id=None, 
         "route_id":route["route_id"],"route_hash":route["route_hash"],
         "registry_digest":route["registry_digest"],"node_id":node_id,
         **axes,
+        # SD-OPEN-41(b). Deliberately NOT part of marker identity
+        # (`_completion_marker_replay` compares `axes` + evidence): who reviewed
+        # is a fact recorded about a completion, not a second thing that has to
+        # match for a replay to be the same completion. Empty for every node
+        # kind but `review-worker`.
+        **review_identity,
         "completion_gate":node["completion_gate"],
         "evidence":{"path":str(evidence),"sha256":sha},
         "sequence":sequence,
@@ -3503,6 +4089,10 @@ def _publish_completion_locked(
     attempt_id,
     attempt_metadata,
     require_existing_link=False,
+    review_claim=None,
+    jobs=None,
+    owner_override=False,
+    owner_chain=False,
 ):
     """Publish marker history, exact-attempt link, and canonical marker under one node lock."""
 
@@ -3570,6 +4160,16 @@ def _publish_completion_locked(
         }
         if actual_static!=marker_static:
             raise ValueError("immutable attempt completion route identity differs from link")
+        _notify_reviewer_claim_ignored(
+            route,node_id,marker,
+            resolve_review_identity(
+                node,axes,attempt_metadata,
+                claim=review_claim,jobs=jobs,
+                route_id=route["route_id"],node_id=node_id,
+                owner_override=owner_override,owner_chain=owner_chain,
+            ),
+            review_claim,
+        )
     elif require_existing_link:
         raise ValueError("completed attempt row lacks immutable completion link")
 
@@ -3578,6 +4178,10 @@ def _publish_completion_locked(
             route,node,node_id,evidence,
             attempt_id=attempt_id,
             attempt_metadata=attempt_metadata,
+            review_claim=review_claim,
+            jobs=jobs,
+            owner_override=owner_override,
+            owner_chain=owner_chain,
         )
     if not attempt_id:
         return marker
@@ -3636,6 +4240,7 @@ def complete_node(
     jobs=None,
     attempt_id=None,
     explicit_attempt_metadata=None,
+    review_claim=None,
 ):
     """Atomically publish one exact-attempt completion and close only its row.
 
@@ -3651,6 +4256,7 @@ def complete_node(
         route, node, node_id, evidence,
         jobs=jobs, attempt_id=attempt_id,
         explicit_attempt_metadata=explicit_attempt_metadata,
+        review_claim=review_claim,
     )
     if jobs and attempt_id and isinstance(row, dict) and row.get("status") == "closed":
         try:
@@ -3840,7 +4446,10 @@ def _complete_node_locked(
     jobs=None,
     attempt_id=None,
     explicit_attempt_metadata=None,
+    review_claim=None,
 ):
+    if review_claim and node.get("kind")!="review-worker":
+        raise ValueError("reviewer-claim-on-non-review-node")
     if jobs and not attempt_id:
         raise ValueError("registered completion requires --attempt-id")
     if not jobs and attempt_id and explicit_attempt_metadata is None:
@@ -3857,6 +4466,7 @@ def _complete_node_locked(
                 route,node,node_id,evidence,
                 attempt_id=attempt_id,
                 attempt_metadata=explicit_attempt_metadata,
+                review_claim=review_claim,
             )
             status="unregistered-complete" if attempt_id else None
             return marker, ({"attempt_id":attempt_id,"status":status} if status else None)
@@ -3869,6 +4479,8 @@ def _complete_node_locked(
                     route,node,node_id,evidence,
                     attempt_id=attempt_id,
                     attempt_metadata=explicit_attempt_metadata,
+                    review_claim=review_claim,
+                    jobs=jobs_path,
                 )
             raise ValueError(f"row-close-failed:{exc.reason}") from exc
         with _exclusive_lock(Path(f"{jobs_path}.lock")):
@@ -3890,6 +4502,8 @@ def _complete_node_locked(
                         route,node,node_id,evidence,
                         attempt_id=attempt_id,
                         attempt_metadata=explicit_attempt_metadata,
+                        review_claim=review_claim,
+                        jobs=jobs_path,
                     )
                 raise ValueError(
                     f"attempt-row-absent:{attempt_id}; exact fallback attempt metadata required"
@@ -3970,6 +4584,13 @@ def _complete_node_locked(
                 attempt_id=attempt_id,
                 attempt_metadata=attempt_metadata,
                 require_existing_link=already_closed and not marker_eligible,
+                review_claim=review_claim,
+                jobs=jobs_path,
+                # SD-94 owner-closure: the row IS a review worker's, so the
+                # ordinary rules would call this gate `independent` -- the exact
+                # inversion of what happened, which is that the owner ruled over
+                # a review that returned FAIL.
+                owner_override=owner_closure is not None,
             )
             if already_closed and not marker_eligible:
                 return marker, {"attempt_id":attempt_id,"status":"already-closed"}
@@ -3991,6 +4612,21 @@ def _complete_node_locked(
                 f",note=completed-marker,completion_marker={canonical_marker_path}"
                 f",completion_marker_history={history_marker_path}"
             )
+            # SD-OPEN-41(b): the row carries the same verdict-provenance axes the
+            # marker does, so a consumer reading the registry alone (Fleet, the
+            # reconcile carrier, a report) sees a degraded review without opening
+            # the marker. Only the short enum tokens travel here -- the reviewer's
+            # path-shaped identity stays in the marker, out of a comma-delimited
+            # field. `note` is deliberately still `completed-marker`: two gates
+            # read that exact literal to mean "this row terminated with a marker"
+            # (`dispatch_contract.marker_attempt_readiness` and this function's
+            # own already-closed branch), so spelling the degradation into `note`
+            # would make an idempotent second `complete` refuse the very row it
+            # had just closed.
+            for key in ("reviewer_kind","review_independence",
+                        "reviewer_downgrade_reason","review_gate_closure"):
+                if marker.get(key):
+                    row_fields[5] += f",{key}={marker[key]}"
             # DR-1: seal the pass verdict alongside the marker so partial-continuation
             # peer checks see immutable terminal success without re-deriving it.
             if owner_closure is None and row_metadata.get("failure_class") in (None,"","-"):
@@ -4144,22 +4780,28 @@ def _git_committed_files(worktree, ancestor, head):
 SUBDIVISION_BASELINE_SCHEMA_VERSION = 1
 
 
-def subdivision_baseline_path(route_id, node_id, manifest_sha256):
+def subdivision_baseline_path(route_id, node_id, manifest_sha256, *, jobs=None):
     """Keyed by the manifest hash so a resumed admission finds its own baseline.
 
     Kept in its own subdirectory: the completion directory's own filenames are
     read back by `<node_id>.*.json` globs, and a sibling file matching that
     shape would be counted as marker history by any reader less careful than
     `_next_marker_sequence`.
+
+    `jobs` pins the state root to the registry the caller already holds
+    (SD-OPEN-49 / H8): without it the path fell back to the inherited
+    `AGENT_DISPATCH_JOBS` or the per-user default, so a `dispatch-batch --jobs
+    <fixture>` run wrote 220 `rt-fixture` baselines into the live
+    `~/.local/state/hearting/dispatch/completion/`.
     """
     return (
-        completion_dir(route_id)
+        completion_dir(route_id, jobs=jobs)
         / "subdivision"
         / f"{node_id}.{str(manifest_sha256)[:32]}.json"
     )
 
 
-def record_subdivision_baseline(route, node_id, manifest):
+def record_subdivision_baseline(route, node_id, manifest, *, jobs=None):
     """Snapshot the worktree at subdivision admission (anchor M3 / AC 30).
 
     The post-hoc diff-scope audit is a statement about what the SLICES changed,
@@ -4179,7 +4821,7 @@ def record_subdivision_baseline(route, node_id, manifest):
     """
     digest = manifest["_manifest_sha256"]
     worktree = Path(manifest["worktree"])
-    path = subdivision_baseline_path(route["route_id"], node_id, digest)
+    path = subdivision_baseline_path(route["route_id"], node_id, digest, jobs=jobs)
     identity = {
         "schema_version": SUBDIVISION_BASELINE_SCHEMA_VERSION,
         "route_id": route["route_id"],
@@ -4220,7 +4862,7 @@ def record_subdivision_baseline(route, node_id, manifest):
     return record
 
 
-def load_subdivision_baseline(route, node_id, manifest):
+def load_subdivision_baseline(route, node_id, manifest, *, jobs=None):
     """Resume the admission-time baseline by manifest hash; None when absent.
 
     Read across every dispatch state root, the same order completion markers use.
@@ -4230,10 +4872,10 @@ def load_subdivision_baseline(route, node_id, manifest):
     permanent `subdivision-baseline-missing`. The writer still uses one root.
     """
     digest = manifest["_manifest_sha256"]
-    canonical = subdivision_baseline_path(route["route_id"], node_id, digest)
+    canonical = subdivision_baseline_path(route["route_id"], node_id, digest, jobs=jobs)
     candidates = [canonical] + [
         root / "completion" / route["route_id"] / "subdivision" / canonical.name
-        for root in dispatch_state_roots(resolve_agent_home())
+        for root in dispatch_state_roots(resolve_agent_home(), jobs)
     ]
     path = next((item for item in candidates if item.is_file()), canonical)
     try:
@@ -4304,7 +4946,7 @@ def complete_subsession_stage(route, node, node_id, evidence, manifest_path, job
     # attribution at all, so its absence fails closed rather than silently
     # widening the audit back to the whole worktree.
     worktree = Path(manifest["worktree"])
-    baseline = load_subdivision_baseline(route, node_id, manifest)
+    baseline = load_subdivision_baseline(route, node_id, manifest, jobs=jobs)
     digest = manifest["_manifest_sha256"]
     attempt_id = "att-stage-" + digest[:32]
     metadata = {
@@ -4426,8 +5068,71 @@ def complete_subsession_stage(route, node, node_id, evidence, manifest_path, job
         marker=write_completion_marker(
             route,node,node_id,evidence,
             attempt_id=attempt_id,attempt_metadata=metadata,
+            owner_chain=True,
         )
     return marker,{"status":"stage-gate-aggregated","sessions":len(manifest["sessions"])}
+
+def _compose_artifact_root(cwd):
+    script=ROOT/"utilities"/"artifact-root.sh"
+    result=subprocess.run(["sh",str(script),str(cwd)],text=True,capture_output=True,check=False)
+    root=(result.stdout or "").strip().splitlines()[-1] if (result.stdout or "").strip() else ""
+    if result.returncode!=0 or not root:
+        raise ValueError("compose-artifact-root-unresolved:"+(result.stderr or "").strip()[:200])
+    return root
+
+
+def _emit_compiled_route(a,route,artifact_root,output=None):
+    """Shared tail of compile/compose: runtime-root check, canonical write-once, owner binding, prints."""
+    output=output if output is not None else getattr(a,"output",None)
+    vbasis=route.get("validation_basis") or {}
+    if vbasis.get("runtime_root_match") is False:
+        launch_tuple=route.get("launch_compatibility_tuple") or {}
+        expected=launch_tuple.get("registry_root")
+        observed=launch_tuple.get("runtime_root")
+        print("route_file_written=0 registered=0 started=0 child_spawned=0",file=sys.stderr)
+        print(_RUNTIME_ROOT_HINT,file=sys.stderr)
+        raise ValueError(
+            "launch-runtime-root-mismatch "
+            f"expected={canonical(expected).decode()} observed={canonical(observed).decode()}"
+        )
+    expected_output=canonical_route_path(artifact_root,route["route_id"])
+    if output:
+        output_path=Path(output)
+        if classify_route_location(output_path,artifact_root) != "canonical":
+            raise ValueError("route-output-outside-canonical")
+        if not route_path_is_exact(output_path,artifact_root,route["route_id"]):
+            raise ValueError("route-output-alias-basename")
+    else:
+        output_path=expected_output
+    write_once(output_path,route)
+    retired=retire_stale_closure(output_path)
+    if retired is not None:
+        print(f"route_closure_retired={retired}",file=sys.stderr)
+    # A registered depth-1 owner can compile its first route only after it
+    # has started.  Attach those immutable bytes to the exact active owner
+    # attempt; non-owner and ordinary interactive compiles remain no-ops.
+    try:
+        from owner_route_binding import (
+            OwnerRouteBindingError,
+            publish_owner_route_attachment_from_environment,
+        )
+        route_for_binding = dict(route)
+        route_for_binding["route_file"] = str(output_path.resolve())
+        attachment = publish_owner_route_attachment_from_environment(
+            os.environ.get("AGENT_DISPATCH_JOBS", ""),
+            target_route=route_for_binding,
+            environ=os.environ,
+        ) if os.environ.get("AGENT_DISPATCH_ATTEMPT_ID") else None
+    except OwnerRouteBindingError as exc:
+        print(
+            f"route_file_written=1 owner_route_binding_written=0 reason={exc}",
+            file=sys.stderr,
+        )
+        raise ValueError(str(exc)) from exc
+    if attachment is not None:
+        print("owner_route_binding_written=1", file=sys.stderr)
+    print(f"route_file={output_path.resolve()}",file=sys.stderr)
+    print(json.dumps(route,sort_keys=True))
 
 def main():
     p=argparse.ArgumentParser(); sub=p.add_subparsers(dest="command",required=True)
@@ -4443,6 +5148,25 @@ def main():
     c.add_argument("--spec-read",required=True); c.add_argument("--drift-verdict",required=True)
     c.add_argument("--workflow-mode",choices=sorted(TRACKING),required=True); c.add_argument("--artifact-guard",required=True)
     c.add_argument("--output")
+    cp=sub.add_parser("compose",help="preset-free work route: name the shape (and stage subgraph), defaults fill the rest")
+    cp.add_argument("--slug",required=True)
+    cp.add_argument("--shape",choices=COMPOSE_SHAPES,default=None,help="direct (inline) | solo (one registered depth-1 owner) | staged (owner + your stage subgraph); default staged when --graph is given, else direct")
+    cp.add_argument("--graph",default=None,help="comma list of the capability's stage ids in your order, optional :unit override, e.g. execute,test,report or execute:dev/refactor,test")
+    cp.add_argument("--capability",default=COMPOSE_DEFAULT_CAPABILITY); cp.add_argument("--capability-mode",default=None)
+    cp.add_argument("--intensity",default=None,help="default by shape: direct/quick/standard; staged accepts strong+")
+    cp.add_argument("--cwd",default=None,help="default: current directory"); cp.add_argument("--artifact-root",default=None,help="default: utilities/artifact-root.sh for cwd")
+    cp.add_argument("--signal",action="append",default=[])
+    cp.add_argument("--spec-read",default="auto",help="auto: refuse when a spec/prd.md exists unless you name it here")
+    cp.add_argument("--drift-verdict",default=None); cp.add_argument("--tracking",choices=sorted(TRACKING),default=None)
+    cp.add_argument("--artifact-guard",default=None)
+    cp.add_argument("--children",default=None,help="comma list of child harnesses to probe for staged/solo (default claude,codex)")
+    cp.add_argument("--parent-harness",default="claude",choices=("claude","codex","opencode"))
+    cp.add_argument("--jobs",default=None,help="registry for the readiness probe (default AGENT_DISPATCH_JOBS or the stable state root)")
+    cp.add_argument("--dispatch-evidence",help="checked evidence JSON (skips the live probe)")
+    cp.add_argument("--registered-headless-evidence",help="checked quick candidates JSON (skips the live probe)")
+    cp.add_argument("--transport-evidence",default="compose-default")
+    cp.add_argument("--explain",action="store_true",help="print the [경로] card and the sealed graph without writing the route")
+    cp.add_argument("--output")
     co=sub.add_parser("continuation")
     co.add_argument("--source-route",required=True)
     co.add_argument("--resume-from-node",required=True)
@@ -4472,6 +5196,13 @@ def main():
     d.add_argument("--registered-worker",choices=("0","1","false","true"))
     d.add_argument("--fallback-hop")
     d.add_argument("--subsession-manifest",help="aggregate declared sub-sessions into this one stage gate")
+    d.add_argument("--reviewer-attempt",
+                   help="review-worker node only: the registered review attempt that produced the verdict; "
+                        "verified against --jobs and downgraded to owner-inline when the row is absent "
+                        "or is not worker_type=review")
+    d.add_argument("--reviewer-subagent",
+                   help="review-worker node only: transcript path of the native subagent that produced "
+                        "the verdict; recorded with its sha256 and counted as independent review")
     ar=sub.add_parser("arbitrate"); ar.add_argument("--route",required=True)
     ar.add_argument("--group",required=True,help="realized auxiliary-bearing parallel group id")
     ar.add_argument("--evidence",required=True,help="owner merge record carrying auxiliary_findings_considered")
@@ -4484,6 +5215,36 @@ def main():
     st=sub.add_parser("status"); st.add_argument("--artifact-root",required=True)
     st.add_argument("--open-only",action="store_true",help="list only routes with no recorded outcome")
     a=p.parse_args()
+    if a.command=="compose":
+        shape=a.shape or ("staged" if a.graph else "direct")
+        cwd=a.cwd or os.getcwd()
+        artifact_root=a.artifact_root or _compose_artifact_root(cwd)
+        route=compose_route(
+            capability=a.capability,capability_mode=a.capability_mode,shape=shape,graph=a.graph,
+            slug=a.slug,cwd=cwd,artifact_root=artifact_root,intensity=a.intensity,signals=a.signal,
+            spec_read=a.spec_read,drift_verdict=a.drift_verdict,tracking=a.tracking,
+            artifact_guard=a.artifact_guard,
+            children=[c.strip() for c in a.children.split(",") if c.strip()] if a.children else None,
+            parent_harness=a.parent_harness,
+            dispatch_evidence=json.loads(Path(a.dispatch_evidence).read_text()) if a.dispatch_evidence else None,
+            registered_headless_evidence=(json.loads(Path(a.registered_headless_evidence).read_text())
+                                          if a.registered_headless_evidence else None),
+            transport_evidence=a.transport_evidence,jobs=a.jobs,
+        )
+        print(compose_card(route),file=sys.stderr)
+        if a.explain:
+            print("route_file_written=0 explain=1",file=sys.stderr)
+            print(json.dumps({"route_id":route["route_id"],"capability":route["capability"],
+                              "effective_intensity":route["effective_intensity"],"shape":shape,
+                              "composed":bool(route.get("composed")),
+                              "nodes":[{"id":n["id"],"unit":n.get("unit"),"dispatch_depth":n.get("dispatch_depth"),
+                                        "completion_gate":n.get("completion_gate"),"terminal":n.get("terminal") is True}
+                                       for n in route["nodes"]],
+                              "human_gates":route.get("human_gates"),"parallel_groups":route.get("parallel_groups"),
+                              "tracked_gate_evidence":route.get("tracked_gate_evidence")},sort_keys=True))
+            return 0
+        _emit_compiled_route(a,route,artifact_root)
+        return 0
     if a.command=="compile":
         gate={"spec_read":{"satisfied":a.spec_read.lower() not in ("0","false","no"),"source":a.spec_read},
               "drift_verdict":a.drift_verdict,"workflow_mode":a.workflow_mode,
@@ -4513,55 +5274,7 @@ def main():
                 a.tracking,gate,dispatch_evidence,registered_headless_evidence,
                 slug=a.slug,
             )
-        vbasis=route.get("validation_basis") or {}
-        if vbasis.get("runtime_root_match") is False:
-            launch_tuple=route.get("launch_compatibility_tuple") or {}
-            expected=launch_tuple.get("registry_root")
-            observed=launch_tuple.get("runtime_root")
-            print("route_file_written=0 registered=0 started=0 child_spawned=0",file=sys.stderr)
-            print(_RUNTIME_ROOT_HINT,file=sys.stderr)
-            raise ValueError(
-                "launch-runtime-root-mismatch "
-                f"expected={canonical(expected).decode()} observed={canonical(observed).decode()}"
-            )
-        expected_output=canonical_route_path(a.artifact_root,route["route_id"])
-        if a.output:
-            output_path=Path(a.output)
-            if classify_route_location(output_path,a.artifact_root) != "canonical":
-                raise ValueError("route-output-outside-canonical")
-            if not route_path_is_exact(output_path,a.artifact_root,route["route_id"]):
-                raise ValueError("route-output-alias-basename")
-        else:
-            output_path=expected_output
-        write_once(output_path,route)
-        retired=retire_stale_closure(output_path)
-        if retired is not None:
-            print(f"route_closure_retired={retired}",file=sys.stderr)
-        # A registered depth-1 owner can compile its first route only after it
-        # has started.  Attach those immutable bytes to the exact active owner
-        # attempt; non-owner and ordinary interactive compiles remain no-ops.
-        try:
-            from owner_route_binding import (
-                OwnerRouteBindingError,
-                publish_owner_route_attachment_from_environment,
-            )
-            route_for_binding = dict(route)
-            route_for_binding["route_file"] = str(output_path.resolve())
-            attachment = publish_owner_route_attachment_from_environment(
-                os.environ.get("AGENT_DISPATCH_JOBS", ""),
-                target_route=route_for_binding,
-                environ=os.environ,
-            ) if os.environ.get("AGENT_DISPATCH_ATTEMPT_ID") else None
-        except OwnerRouteBindingError as exc:
-            print(
-                f"route_file_written=1 owner_route_binding_written=0 reason={exc}",
-                file=sys.stderr,
-            )
-            raise ValueError(str(exc)) from exc
-        if attachment is not None:
-            print("owner_route_binding_written=1", file=sys.stderr)
-        print(f"route_file={output_path.resolve()}",file=sys.stderr)
-        print(json.dumps(route,sort_keys=True))
+        _emit_compiled_route(a,route,a.artifact_root)
     elif a.command=="continuation":
         source_path=Path(a.source_route).resolve(strict=True)
         source=verify_route(json.loads(source_path.read_text(encoding="utf-8")))
@@ -4708,6 +5421,14 @@ def main():
             outcome,created=close_route(route,a.route,a.commit,a.summary,allow_unproven=a.allow_unproven)
             print(json.dumps(outcome,sort_keys=True))
             if not created: print("capability-route: route already closed",file=sys.stderr)
+            if outcome.get("review_independence_degraded"):
+                print(
+                    "capability-route: completed-review-degraded "
+                    f"route_id={outcome['route_id']} "
+                    f"nodes={','.join(outcome['review_independence_degraded'])} "
+                    "-- these gates were not independently reviewed",
+                    file=sys.stderr,
+                )
             if outcome.get("terminal_gate_proven") is False:
                 reasons={node_id:row.get("reason") for node_id,row in
                          (outcome.get("terminal_gates") or {}).items() if not row.get("passed")}
@@ -4728,6 +5449,13 @@ def main():
                 # completion marker written behind a refused copy.
                 if a.output and Path(a.output).exists():
                     raise ValueError("completion-output-exists")
+                if a.reviewer_attempt and a.reviewer_subagent:
+                    raise ValueError("reviewer-claim-conflict")
+                review_claim=None
+                if a.reviewer_attempt:
+                    review_claim={"kind":"registered-worker","attempt_id":a.reviewer_attempt}
+                elif a.reviewer_subagent:
+                    review_claim={"kind":"native-subagent","transcript":a.reviewer_subagent}
                 raw_axes=(a.dispatch_depth,a.transport,a.execution_surface,a.registered_worker,a.fallback_hop)
                 explicit_attempt_metadata=None
                 if any(value is not None for value in raw_axes):
@@ -4740,6 +5468,8 @@ def main():
                         "fallback_hop":a.fallback_hop,
                     }
                 if a.subsession_manifest:
+                    if review_claim:
+                        raise ValueError("reviewer-claim-unsupported-on-subsession-gate")
                     if not a.jobs or a.attempt_id or explicit_attempt_metadata is not None:
                         raise ValueError("subsession completion requires --jobs and forbids attempt axes")
                     route["_route_file"]=str(Path(a.route).resolve())
@@ -4752,10 +5482,25 @@ def main():
                         jobs=a.jobs,
                         attempt_id=a.attempt_id,
                         explicit_attempt_metadata=explicit_attempt_metadata,
+                        review_claim=review_claim,
                     )
                 if a.output: atomic_write(a.output, marker)
                 print(json.dumps(marker,sort_keys=True))
                 if row: print(json.dumps(row,sort_keys=True))
+                if marker.get("review_independence") in ("degraded","owner-overridden"):
+                    # Typed and on stderr, so an owner that closed its own review
+                    # node cannot finish the stage without being told -- and so
+                    # the §0.5 completion card has something to quote.
+                    reason=(marker.get("reviewer_downgrade_reason")
+                            or marker.get("review_gate_closure") or "-")
+                    print(
+                        "capability-route: completed-review-degraded "
+                        f"route_id={route['route_id']} node={a.node} "
+                        f"independence={marker['review_independence']} "
+                        f"reviewer_kind={marker['reviewer_kind']} "
+                        f"reason={reason}",
+                        file=sys.stderr,
+                    )
 
 if __name__=="__main__":
     try: main()

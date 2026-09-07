@@ -463,3 +463,16 @@ historical v1/v2 broker routes are read-only.
 - **Parity boundary:** a native Claude helper is allowed only inside its parent
   slice, returns a bounded summary, mutates serially, and never owns the stage
   gate. The registered-headless chain remains the checked fallback.
+
+## Execution access request
+
+`dispatch-headless.py --execution-access-file <execution_access_v1.json>` (or
+`AGENT_DISPATCH_EXECUTION_ACCESS_FILE`) projects validated writable roots as
+repeated `--add-dir` on both the direct CLI and session-supervisor builders.
+That is current tool visibility, graded `tool-permission`; it is not an OS
+filesystem boundary. Current network enforcement is `none`, so `any` network
+requests are recorded `granted-unenforced` and `os-sandbox` requests are typed
+refusals. The adapter does not auto-select `bypassPermissions`, disable a
+sandbox, or edit user settings to satisfy access. Claude `sandbox.*` wiring,
+dependency fail-closed policy, and owner-to-worker propagation remain
+unimplemented follow-up work.

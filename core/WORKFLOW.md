@@ -171,6 +171,46 @@ Added after a 2026-07-14 incident where a checkpoint reevaluation with report
 regeneration was routed to `autopilot-refine` as primary from its surface
 artifact and the entire evaluation ran inline in the main session.
 
+### 0.2.1. Shape Before Preset (SD-135)
+
+The precedence above decides which capability **owns the artifacts** of a
+request. It does not oblige the session to run that entry's whole recipe.
+Before proposing a route, choose the **shape** of the work from its size; the
+enumerated preset graph is one explicit choice among four, never the default
+a loosely matching request is bent into:
+
+| Shape | When | Route |
+|---|---|---|
+| `direct` | one atomic, reversible change the session makes and checks inline | `capability-route.py compose --slug <slug>` — the inline node, dispatch depth 0 |
+| `solo` | one bounded piece of work that deserves its own registered session but no separate stages | `compose --shape solo` — one registered dispatch-depth-1 owner, no dispatch depth 2 |
+| `staged` | separable stages the session names itself | `compose --graph <stage,…>` — a dispatch-depth-1 owner plus the named stage subgraph of the owning capability, `standard+` |
+| preset | the request names the entry's full loop, or a promotion signal or spec-backed flow requires the enumerated recipe | `capability-route.py compile` with the registry recipe |
+
+`compose` fills every other flag from the checkout: cwd, artifact root
+(`utilities/artifact-root.sh`), tracking and workflow mode by shape, a
+default drift verdict, the spec-read gate (it refuses with
+`compose-spec-read-required` when a `spec/prd.md` exists under the cwd or the
+artifact root and the caller has not named what was read), and both
+eligibility probes (`dispatch-readiness`). The result is sealed, verified,
+bound, and guarded exactly like a recipe route: `selection.route_origin`
+records `compose` or `preset`, `selection.shape` records the shape, a staged
+route is `composed: true` with its recipe embedded, and every staged node
+keeps its unit, gate, write scope, model profile, and permissions from the
+owning capability's recipe. A stage id may name a unit from the node's
+declared `unit_choices` (`execute:dev/refactor`); a human gate a kept node
+raises is rebound to the entry of the node that now follows it and dropped
+when nothing follows; a declared parallel group survives only when its anchor
+is kept and is not the new terminal. Composition changes route *shape* only —
+the write, spec, and core gates, the dispatch-depth-3 ban, and every
+completion gate are unchanged, and a preset-free route is still a route the
+§0.4 gate and the route-participation invariant apply to.
+
+`compose` runs the same probe an owner launch re-checks, so it is called from
+the dispatch-depth-0 session in the final worktree; inside a registered owner
+(`AGENT_DISPATCH_DEPTH` ≠ 0) it needs `--dispatch-evidence` or
+`--registered-headless-evidence` from the parent, exactly like `compile`.
+The `[경로]` line it prints on stderr is the notice §0.4 uses for small work.
+
 ### 0.3. Pre-Execution Gate for Long-Running Work
 
 Before starting a long-running command, GPU or checkpoint evaluation, bulk
@@ -239,7 +279,20 @@ answers are exempt. Card exemption is not evidence exemption: an explanatory
 or factual answer still follows `roles/response-policy.md` "Local evidence
 before recall" when the repository holds covering research or document
 artifacts. `direct` is an explicit route shown in the card with its
-reason, not a silent no-route decision. A current or immediately preceding user
+reason, not a silent no-route decision.
+
+**Small-work notice (SD-136).** When the compiled route is `direct` or `solo`
+(`quick`) and its sealed `small_work_confirmation` is `notice` — the shipped
+default, `profiles/dispatch-defaults.yaml` `confirmation.small_work` — the
+blocking card above is replaced by one non-blocking line: the `[경로]` line
+`compose` prints (capability · shape · route id · human gates) plus one clause
+of scope, and the work proceeds in the same turn. The card stays blocking,
+whatever the sealed value, when the work is destructive (data, history, or
+worktree loss), mutates an external system, deploys, or the user asked to be
+asked. `card` restores the blocking card for every small route. The
+route-participation invariant below is unchanged: notice or card, source work
+still needs the bound route, and the 0–1 / 1–3 inline questions of the frame
+interview (below) are asked only when they exist. A current or immediately preceding user
 instruction that already approves the same route and scope satisfies the gate;
 do not repeat the card. After approval, capability-owned stages, validation,
 records, commits, dispatch, and handoffs proceed without further confirmation.
@@ -374,6 +427,14 @@ Keep each value to one line. `결과` names the honest outcome status —
 completed, partial, failed, or blocked, localized for the audience — and must
 not present partial, failed, or blocked work as completed. Use `없음` (or its
 audience-language equivalent) when there is no artifact or remaining item.
+
+If any review gate of the work closed without an independent reviewer's PASS —
+the route outcome's `review_independence_degraded`, or a
+`completed-review-degraded` line from `complete` — `검증` must say so and name
+the node. That list covers both `degraded` (the owner reviewed its own work) and
+`owner-overridden` (the owner ruled over a review that returned FAIL). Either is
+a real result and neither blocks the route, but reporting it as review would
+make "reviewed" mean nothing (`OPERATIONS §5.10`, SD-OPEN-41(b)).
 
 For dispatched or long-running work, main emits this card only after it has
 synchronously waited or polled for terminal state, harvested the result and
@@ -628,9 +689,16 @@ Every entry capability resolves through `capabilities/topologies.json`, the mach
 The route compiler is **enforced** (promoted from report-only, 2026-07-22): every node
 references a unit in `roles/units/`, and routing happens at entry only — a
 dispatch-depth-2 worker never routes and never selects another worker. Enumerated
-recipes are curated fast paths. For a request no recipe enumerates, the entry composes a
-node graph from the same unit catalog (**compose-on-demand**): the composed graph passes
-the same validator, is hash-sealed exactly like a recipe route, is marked
-`composed: true`, and still requires the §0.4 route card. Composition changes route
-*shape only* — it never bypasses the §0.1 spec/artifact-order gates, never grants
-dispatch depth 3, and never substitutes for a capability's own completion gates.
+recipes are curated fast paths, not the default. For a request no recipe fits, the
+entry composes its own route from the same catalog (**compose-on-demand**, §0.2.1):
+`capability-route.py compose` seals a `direct`, `solo`, or `staged` shape, and a staged
+`--graph` is the session's own subgraph of the owning capability's stage nodes; the
+composed graph passes the same validator, is hash-sealed exactly like a recipe route,
+is marked `composed: true` with its recipe embedded, and is confirmed under §0.4 (a
+`[경로]` notice for small work, the card or the SD-123 pair otherwise). Until SD-135
+the composed path was `standard+`-only, every composed node was dispatch depth 2 with
+no source write, and the assembly helper was not recognized by the route-binding
+guard — 18 of 635 routes were composed and every one sat under a preset entry.
+Composition changes route *shape only* — it never bypasses the §0.1
+spec/artifact-order gates, never grants dispatch depth 3, and never substitutes for a
+capability's own completion gates.

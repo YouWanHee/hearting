@@ -342,6 +342,26 @@ class DispatchDefaultsV4Tests(unittest.TestCase):
         self.assertNotIn("steward", config)
         self.assertEqual(D.query_confirmation_mode(config), "autonomous")
         self.assertEqual(D.query_steward_child_permission_mode(config), "bypass")
+        self.assertEqual(D.query_small_work_confirmation(config), "notice")
+
+    def test_small_work_confirmation_is_validated_and_queried(self):
+        """SD-136: `confirmation.small_work` (notice|card) rides the v4 block."""
+        config = self.v4_config()
+        config["confirmation"] = {"mode": "hybrid", "small_work": "card"}
+        self.assertEqual(D.validate(config, self.capmap), [])
+        self.assertEqual(D.query_small_work_confirmation(config), "card")
+        config["confirmation"] = {"small_work": "notice"}
+        self.assertEqual(D.validate(config, self.capmap), [])
+        self.assertEqual(D.query_confirmation_mode(config), "autonomous")
+        self.assertEqual(D.query_small_work_confirmation(config), "notice")
+        config["confirmation"] = {"small_work": "never"}
+        errors = D.validate(config, self.capmap)
+        self.assertTrue(any("confirmation.small_work must be one of" in e for e in errors), errors)
+        self.assertEqual(D.query_small_work_confirmation(config), "notice")
+        shipped = D.parse_yaml_subset(
+            (Path(D.__file__).resolve().parents[1] / "profiles" / "dispatch-defaults.yaml").read_text(encoding="utf-8")
+        )
+        self.assertEqual(D.query_small_work_confirmation(shipped), "notice")
 
     def test_absent_config_defaults(self):
         self.assertEqual(D.query_confirmation_mode({}), "autonomous")

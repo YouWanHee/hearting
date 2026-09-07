@@ -117,6 +117,10 @@ headless:
 # files.
 confirmation:
   mode: autonomous
+  # SD-136: `direct`/`solo`(quick) routes are confirmed by one `[경로]` line
+  # (`notice`) instead of the blocking five-field card; `card` restores the
+  # card. Destructive or external-facing work keeps the card either way.
+  small_work: notice
 
 # SD-122 (9): default permission mode `peer-steward.py start` applies to a
 # newly started child session. `bypass` prepends the per-runtime bypass flag

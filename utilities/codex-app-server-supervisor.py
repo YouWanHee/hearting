@@ -336,6 +336,7 @@ def _typed_receipt(
     allowed_readiness = {"ready", "pending"}
     allowed_reasons = {
         "registry-closed",
+        "registry-closed-marker",  # SD-OPEN-47 (H7-c)
         "terminal-observed",
         "process-alive",
         "process-unverifiable",

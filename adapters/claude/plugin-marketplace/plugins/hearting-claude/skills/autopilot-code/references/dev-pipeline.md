@@ -139,6 +139,103 @@ re-isolate/re-probe stop and never reaches this list. For case 3, record reasoni
 Still parallelize separable census or disjoint file groups. Dispatch-infrastructure
 self-modification requires the explicit `STAGE_DISPATCH_INLINE_OK` opt-out.
 
+**An inline stage still owes its marker, and the same command writes it.** A stage run
+in-session has no registry row, so the `--jobs --attempt-id` recipe above cannot apply — but
+`complete` does not require one. State the axes the run actually had instead:
+
+```bash
+python3 <agent-home>/utilities/capability-route.py complete \
+  --route <route-file> --node <node-id> --evidence <stage terminal artifact> \
+  --attempt-id <stable id for this inline run> \
+  --dispatch-depth <the node's own dispatch_depth> \
+  --transport headless --execution-surface inline \
+  --registered-worker 0 --fallback-hop inline
+```
+
+No `--jobs`. The marker this publishes is current and opens the dependency gate for the next
+stage exactly like a dispatched one; `registered_worker=0` is what tells the readiness check
+there is no process to verify. Skipping this is the single most expensive mistake available
+here: the next stage is refused for the missing dependency, its fallback descends to inline,
+that run publishes no marker either, and **one marker-less stage forces the whole remainder of
+the route inline** — measured on route `rt-b2d68cbf14d31c62`, eight nodes and zero markers.
+
+`--execution-surface inline` with `dispatch_depth > 0` requires `--fallback-hop inline`; the
+contract refuses the mismatched combination rather than recording a surface the run did not have.
+
+#### A Review Node Says Who Reviewed
+
+A `review-worker` node's completion has one extra obligation: name the reviewer.
+The marker records `reviewer_kind`, `review_independence`, and the reviewer's
+identity, and none of it is taken on the caller's word.
+
+When a *different* registered attempt produced the verdict, name it — the row is
+looked up in `--jobs` and must carry `worker_type=review`:
+
+```bash
+python3 <agent-home>/utilities/capability-route.py complete \
+  --route <route-file> --node <review-node-id> --evidence <review artifact> \
+  --jobs <canonical-jobs.log> --attempt-id <the completing attempt> \
+  --reviewer-attempt <the review worker's attempt id>
+```
+
+When a native subagent reviewed, name its transcript instead. A subagent with a
+recorded identity counts as independent review; the digest is what keeps that
+claim checkable later:
+
+```bash
+python3 <agent-home>/utilities/capability-route.py complete \
+  --route <route-file> --node <review-node-id> --evidence <review artifact> \
+  --jobs <canonical-jobs.log> --attempt-id <the completing attempt> \
+  --reviewer-subagent <transcript path>
+```
+
+A named reviewer attempt must have reviewed *this* gate, not merely hold the
+job title: the row must not be a sub-session slice, must — if it is bound to a
+route at all — be bound to this route and node, and must have reached a terminal
+verdict (`done`, and not a `dead-*` note; `completed-review-blocking` counts,
+because a FAIL is a produced verdict). An ad-hoc SD-OPEN-40 reviewer carries no
+route binding and stays admissible.
+
+Name nothing and the completing attempt is the reviewer, which is independent
+only when its own registry row says `worker_type=review`. Everything else — no
+claim on an inline completion, a claimed row that is absent, foreign, a
+sub-session, not a review worker, or never produced a verdict; an unreadable
+transcript; no `--jobs` to adjudicate with — **is recorded as
+`reviewer_kind=owner-inline`, `review_independence=degraded`, with a typed
+`reviewer_downgrade_reason`. It is never refused.** The node completes, the next
+one proceeds, and the degradation travels: `complete` prints
+`completed-review-degraded` on stderr, the row carries the same axes, the closed
+outcome lists the node under `review_independence_degraded`, and the §0.5
+completion card has to say that gate was not independently reviewed.
+
+The SD-94 owner-closure path — the owner ruling over a review that returned
+FAIL — is recorded `review_independence=owner-overridden` with
+`review_gate_closure=owner-closure`, and is listed alongside the degraded ones.
+It is the most literal case of "reviewed" meaning "the owner decided", and the
+row it closes genuinely belongs to a review worker, so without this it would
+have read as independent.
+
+Naming a reviewer *after* the node completed is a no-op: provenance is not part
+of marker identity, so the call replays the existing marker and prints
+`reviewer-claim-ignored-on-replay` rather than recording the late claim.
+
+To make the degraded path an exception rather than the norm, launch the reviewer
+as a registered review worker instead of an owner:
+
+```bash
+python3 <agent-home>/utilities/dispatch-owner.py --adapter <harness> --start \
+  --worktree <worktree> --slug <slug> \
+  --capability autopilot-code --capability-mode debug --qa standard \
+  --intensity standard --dispatch-depth 1 --worker-type review \
+  --unit qa/code-review --model-role qa/code-review \
+  --assigned-contract autopilot-code --owner <slug> --model-profile deep \
+  --prompt-file <review brief>
+```
+
+`--unit` is required for a review tuple and may not be a `_kernel/*` unit;
+`--route-evidence` is refused, because a review node that belongs to a route is
+launched by stage dispatch with its node binding.
+
 #### Usage-Aware Cross-Harness Routing
 
 Before dispatch, run `sh <agent-home>/utilities/usage-check.sh`. It reports per-harness `ok`, `limited(<reset>)`, or `unknown`; `ok` means no known block, not guaranteed capacity. Avoid limited runtimes. An automatic/model-selected recovery also requires known positive capacity; unknown capacity is not positive availability. A user's explicit `--adapter` override may retain its separately audited unknown-capacity path when route evidence and hard eligibility still permit it. Otherwise default to the free cross-harness posture (OPERATIONS §5.10 SD-16, 2026-07-24): with two or more eligible harnesses, spread consecutive stage nodes across model families rather than homing to the conductor's harness, always place test or review on a different family than implementation, and record a task-fit or limit reason when a run intentionally keeps every node on one harness. Preserve `dispatch_depth`, `parent`, `worker_type`, `assigned_contract`, `model_role`, `harness`, `owner_harness`, and `parent_sid` metadata across runtimes.
@@ -149,7 +246,7 @@ If a stage dies immediately from usage, session, or authentication limits, the w
 
 ### Optional Material Delegation
 
-When implementation or reporting requires result plots, experiment-log visualization, or result tables, the code-execute or code-report worker records the need in its artifact. The enumerated autopilot-code recipe compiles no `material/*` node, so the owner satisfies the need per the WORKFLOW compose-on-demand doctrine: a composed route extension node bound to the matching `material/*` unit (e.g. `material/figure-gen`, `material/data-script`) that passes the same validator and hash-seal as a recipe route — or, for narrow throwaway scaffolding only, an ephemeral native helper with no unit semantics. Training and experiment execution remain in autopilot-code; the material units own postprocessing. Record generated asset paths in the relevant dev log.
+When implementation or reporting requires result plots, experiment-log visualization, or result tables, the code-execute or code-report worker records the need in its artifact. The enumerated autopilot-code recipe compiles no `material/*` node, so the owner satisfies the need per the WORKFLOW compose-on-demand doctrine (§0.2.1, `capability-route.py compose`; an autopilot-code graph carries no `material/*` stage id, so a material node is composed through `utilities/compose-route.py` with an explicit unit): a composed route extension node bound to the matching `material/*` unit (e.g. `material/figure-gen`, `material/data-script`) that passes the same validator and hash-seal as a recipe route — or, for narrow throwaway scaffolding only, an ephemeral native helper with no unit semantics. Training and experiment execution remain in autopilot-code; the material units own postprocessing. Record generated asset paths in the relevant dev log.
 
 ### Higher-Intensity Perspective Extensions
 
@@ -276,20 +373,29 @@ to in-session only under the closed rules above.
 
 **Subdivision check (SD-103) — perform it explicitly before the single-session dispatch.**
 `execute` is the one node that carries a sealed `subdivision` permission
-(`min_intensity: strong`, `max_slices: 4`, `disjointness: exact-fixed-files`). When the
-route's effective intensity is `strong+` AND `plan.md` partitions the work into 2–4
-packages whose file ownership is exactly disjoint, do not default to one long serial
-session: build the slice manifest from the plan's declared `fixed_files` per package and
-admit the parallel slices with one `dispatch-batch.py --parallel-group execute --route
-<route-file> --parent <owner slug> --slug-prefix <prefix> --subdivision-manifest
-<chain.json> --start` call, then close the single stage gate with `capability-route.py
-complete --route <route-file> --node execute --evidence <stage evidence> --jobs <registry>
---subsession-manifest <chain.json>`. Slices are
-no-commit workers; close the gate first, commit after. A typed `single-session-required`
-receipt means "run this stage as one ordinary session" — proceed single-session and record
-the reason; it is not a failure. At `standard` intensity, or when the plan's packages share
-files, subdivision is unavailable by contract — a declared serial sub-session split under
-the same route node is then the sanctioned way to bound session length. Record which of the
+(`min_intensity: standard`, `max_slices: 4`, `disjointness: exact-fixed-files` — `standard`
+since SD-103's routing-flex correction: the permission sat at `strong` while 100/100 execute
+rows ran at `standard`, so it never fired). The firing condition is the owner's judgment,
+not a rule: when `plan.md` partitions the work into 2–4 packages whose file ownership is
+exactly disjoint and that can finish independently, do not default to one long serial
+session. Transcribe the plan's `slice` blocks into one JSON list
+(`[{"id","fixed_files":[…],"brief","narrow_verify","expected_round_trips"}]`) and run
+`python3 utilities/stage-session-chain.py plan-slices --route <route-file> --node execute
+--worktree <cwd> --slices <slices.json> --output <chain.json>`: it mints the chain and slice
+ids, writes one phase brief per slice beside the manifest, and proves exact files, worktree
+and write-scope containment and pairwise disjointness with the same `load_manifest` the
+admission re-proves. Then admit the slices with one `dispatch-batch.py --parallel-group
+execute --route <route-file> --parent <owner slug> --slug-prefix <prefix>
+--subdivision-manifest <chain.json> --action start` call, and close the single stage gate
+with `capability-route.py complete --route <route-file> --node execute --evidence <stage
+evidence> --jobs <registry> --subsession-manifest <chain.json>`. Slices are no-commit
+workers; close the gate first, commit after. A typed refusal from `plan-slices`
+(`planned: refused`, exit 65) or a `single-session-required` receipt means "run this stage
+as one ordinary session" — proceed single-session and record the reason; it is not a
+failure. A slice that declares a non-worktree `base` is still refused (`scope-unproven`,
+SD-119 R5 unlanded). When the plan's packages share files, subdivision is unavailable by
+contract — a declared serial sub-session split under the same route node is then the
+sanctioned way to bound session length. Record which of the
 three shapes (parallel slices / serial split / single session) was chosen and why in the
 dev log. `core/OPERATIONS.md §5.10` owns the manifest, baseline, and refusal vocabulary.
 
@@ -326,7 +432,7 @@ completion from `test_logs/test_report.md`. code-test is read-only and never hot
 quick reports verify-lite failure without retry. Other graphs may open at most one pipeline-level retry:
 
 1. Record the verdict; detailed context remains in `test_logs/test_report.md` and `_internal/test_reviews/` for code-refine.
-2. Same-route in-place retry (SD-67): do not restore or roll back source and never run `git reset --hard`. Redispatch code-execute in place on the unchanged route with a new attempt identity (the prior attempt row is the lineage evidence); `worker-route-guard.py` accepts the resulting moved `HEAD` only when the node is declared in the route's `resume_retry_boundaries`, the bound canonical global registry holds a different prior attempt for the same route/node, and `HEAD` is a first-parent descendant of the route's `source_commit`. Never recompile or re-pin the route to manufacture this evidence. That covers this same-route retry; an SD-104 continuation is a new successor route and pins the resume-time `HEAD` as its own `source_commit` (SD-128), but it declines that re-pin — keeping the inherited pin — whenever any node it will re-run mutates the worktree and already has an attempt anywhere in the route's continuation lineage, and it declines whenever that evidence cannot be proved absent (a registry it cannot prove is the lineage's own, or one holding no rows for that lineage). A decline keeps the inherited pin for the whole route, so the guard refuses every node at or before the mutation node and the continuation cannot start — it does not run up to code-execute and stop there. Run an SD-67 retry in place here rather than through a continuation.
+2. Same-route in-place retry (SD-67): do not restore or roll back source and never run `git reset --hard`. Redispatch code-execute in place on the unchanged route with a new attempt identity (the prior attempt row is the lineage evidence); `worker-route-guard.py` accepts the resulting moved `HEAD` only when the node is declared in the route's `resume_retry_boundaries`, the bound canonical global registry holds a different prior attempt for the same route/node, and `HEAD` is a first-parent descendant of the route's `source_commit`. Never recompile or re-pin the route to manufacture this evidence. That covers this same-route retry; an SD-104 continuation is a new successor route and pins the resume-time `HEAD` as its own `source_commit` (SD-128), but it declines that re-pin — keeping the inherited pin — whenever any node it will re-run mutates the worktree and already has an attempt anywhere in the route's continuation lineage, and it declines whenever that evidence cannot be proved absent (a registry it cannot prove is the lineage's own, or one holding no rows for that lineage). A decline keeps the inherited pin for the whole route, so every node at or before the mutation node meets a moved `HEAD` against an unchanged pin. Since SD-133 the guard reads retry evidence across the route's whole lineage, so an ancestor's attempt on that node is found and SD-67's conditions decide the launch — a continuation can carry an SD-67 retry. In-place re-dispatch on the original route remains available and is still the simpler move when the route is still yours to re-run.
 3. Append the preserved compatibility memo literal at affected steps:
 
    ```html

@@ -116,6 +116,31 @@ class AdmissionGateTest(AdmissionFixture):
         self.assertEqual(len(result.sessions), 2)
         self.assertEqual(recorded, [("execute", result.manifest_digest)])
 
+    def test_sd_open_53_default_baseline_follows_the_admission_jobs(self):
+        """SD-OPEN-53 (v77 review c1): the default `record_baseline` inside
+        `admit_batch` wrote to the inherited/default state root while the audit
+        read the caller's `jobs` root."""
+        import os
+        from unittest import mock
+        pinned = self.base / "pinned" / "jobs.log"
+        inherited = self.base / "inherited" / "jobs.log"
+        for path in (pinned, inherited):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(inherited)}):
+            result = SUBDIV.admit_batch(
+                route=self.route, node=self.node, manifest_path=self._manifest(2),
+                governor=Path("governor"), governor_root=Path("governor-root"),
+                reserve=lambda *a, **k: ["a" * 32, "b" * 32], jobs=pinned,
+            )
+            baseline = SUBDIV.ROUTE_MODULE.subdivision_baseline_path(
+                self.route["route_id"], "execute", result.manifest_digest, jobs=pinned)
+            self.assertTrue(baseline.is_file())
+            self.assertEqual(baseline.parent.parent.parent, pinned.parent / "completion")
+            self.assertFalse((inherited.parent / "completion").exists())
+            self.assertIsNotNone(SUBDIV.ROUTE_MODULE.load_subdivision_baseline(
+                self.route, "execute", result.manifest, jobs=pinned))
+
     def test_dispatch_batch_parallel_group_path_unused(self):
         # A-1: the whole point is that `parallel_nodes` (2..4-member cardinality)
         # is never reached for a node with zero route-leg membership. F-3
@@ -131,9 +156,13 @@ class AdmissionGateTest(AdmissionFixture):
                 BATCH, "parallel_nodes",
                 side_effect=AssertionError("parallel_nodes must not be called for subdivision admission"),
             ))
+            # SD-103 narrowing: a worktree-base manifest now REACHES admission on
+            # the dispatch-batch path; the typed verdict admit_batch returns is
+            # what the receipt carries. `parallel_nodes` (route-leg expansion)
+            # must still never be consulted for a subdivision manifest.
             stack.enter_context(mock.patch.object(
                 BATCH.SUBDIVISION_ADMISSION, "admit_batch",
-                side_effect=AssertionError("admit_batch must not be reached while F-3 fail-closed gate holds"),
+                side_effect=SUBDIV.SubdivisionAdmissionError("disjointness-unproven", "fixture"),
             ))
             stack.enter_context(mock.patch.object(BATCH, "resolve_agent_home", return_value=self.base))
             stack.enter_context(mock.patch.object(
@@ -155,7 +184,7 @@ class AdmissionGateTest(AdmissionFixture):
         self.assertEqual(rc, 0, output.getvalue())
         receipt = json.loads(output.getvalue())
         self.assertEqual(receipt["state"], "subdivision-batch-refused")
-        self.assertEqual(receipt["reason"], "scope-unproven")
+        self.assertEqual(receipt["reason"], "disjointness-unproven")
         self.assertEqual(receipt["admitted_rows"], 0)
         self.assertEqual(receipt["admitted_models"], 0)
 
@@ -268,14 +297,25 @@ class ParallelEntryFailClosedTest(unittest.TestCase):
     `scope-unproven` before `admit_batch()` is ever reached, and neither
     writes a registry row or spawns a model process, until R5 lands."""
 
-    def test_stage_session_chain_parallel_branch_refuses_before_admit_batch(self):
+    def _manifest(self, td, base=None):
+        path = Path(td) / "chain.json"
+        session = {"subsession_id": "ss-x1", "fixed_files": ["a.py"]}
+        if base is not None:
+            session["base"] = base
+        path.write_text(json.dumps({"sessions": [session]}), encoding="utf-8")
+        return path
+
+    def test_stage_session_chain_parallel_branch_refuses_artifact_base_before_admit_batch(self):
+        """SD-103 narrowing: the gate still refuses -- before admit_batch and
+        before any row -- exactly the slice R5 is for (a non-worktree base)."""
         with tempfile.TemporaryDirectory() as td:
             jobs = Path(td) / "jobs.registry"
             jobs.touch()
-            args = type("Args", (), {"action": "register", "manifest": "unused", "parent": "owner"})()
+            manifest = self._manifest(td, base={"base": "artifact", "path": "plans/x"})
+            args = type("Args", (), {"action": "register", "manifest": str(manifest), "parent": "owner"})()
             with mock.patch.object(
                 CHAIN.SUBDIVISION_ADMISSION, "admit_batch",
-                side_effect=AssertionError("admit_batch must not be reached while F-3 fail-closed gate holds"),
+                side_effect=AssertionError("admit_batch must not be reached for an artifact-base slice"),
             ):
                 output = io.StringIO()
                 with contextlib.redirect_stdout(output):
@@ -289,10 +329,67 @@ class ParallelEntryFailClosedTest(unittest.TestCase):
             # No child row: the fixture's jobs registry stays exactly empty.
             self.assertEqual(jobs.read_text(encoding="utf-8"), "")
 
-    def test_raise_if_parallel_entry_fail_closed_reason_is_scope_unproven(self):
-        with self.assertRaises(SUBDIV.SubdivisionAdmissionError) as caught:
-            SUBDIV.raise_if_parallel_entry_fail_closed()
-        self.assertEqual(caught.exception.reason, "scope-unproven")
+    def test_gate_refuses_only_non_worktree_base(self):
+        with tempfile.TemporaryDirectory() as td:
+            with self.assertRaises(SUBDIV.SubdivisionAdmissionError) as caught:
+                SUBDIV.raise_if_parallel_entry_fail_closed(self._manifest(td, base="artifact"))
+            self.assertEqual(caught.exception.reason, "scope-unproven")
+            self.assertIn("ss-x1", caught.exception.detail)
+            # worktree-base, unspecified base, unreadable manifest and no manifest
+            # all pass here; admit_batch types everything else.
+            self.assertIsNone(SUBDIV.raise_if_parallel_entry_fail_closed(self._manifest(td, base="worktree")))
+            self.assertIsNone(SUBDIV.raise_if_parallel_entry_fail_closed(self._manifest(td, base={"base": "worktree"})))
+            self.assertIsNone(SUBDIV.raise_if_parallel_entry_fail_closed(self._manifest(td)))
+            self.assertIsNone(SUBDIV.raise_if_parallel_entry_fail_closed(Path(td) / "missing.json"))
+            self.assertIsNone(SUBDIV.raise_if_parallel_entry_fail_closed())
+
+    def test_worktree_base_manifest_reaches_admit_batch(self):
+        """The live parallel branch now reaches admission for worktree slices;
+        admit_batch's own typed verdict is what the caller sees."""
+        with tempfile.TemporaryDirectory() as td:
+            jobs = Path(td) / "jobs.registry"
+            jobs.touch()
+            manifest = self._manifest(td)
+            args = type("Args", (), {"action": "register", "manifest": str(manifest), "parent": "owner"})()
+            reached = []
+            def _admit(**kwargs):
+                reached.append(kwargs["manifest_path"])
+                raise SUBDIV.SubdivisionAdmissionError("disjointness-unproven", "fixture")
+            with mock.patch.object(CHAIN.SUBDIVISION_ADMISSION, "admit_batch", side_effect=_admit):
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    rc = CHAIN._run_parallel_subdivision({}, {}, args, jobs=jobs)
+            self.assertEqual(reached, [str(manifest)])
+            self.assertEqual(rc, 65)
+            self.assertEqual(json.loads(output.getvalue())["reason"], "disjointness-unproven")
+
+    def test_start_admitted_batch_persists_manifest_before_first_start(self):
+        """F3 precondition: the sealed pointer exists before any slice start."""
+        with tempfile.TemporaryDirectory() as td:
+            jobs = Path(td) / "dispatch" / "jobs.log"
+            jobs.parent.mkdir()
+            jobs.touch()
+            manifest = {"chain_id": "ssc-persist-1", "sessions": [
+                {"subsession_id": "ss-p1", "attempt_id": "att-persist-0001", "index": 1},
+                {"subsession_id": "ss-p2", "attempt_id": "att-persist-0002", "index": 2},
+            ]}
+            admission = SUBDIV.AdmissionResult(
+                tokens=["t1", "t2"], manifest=manifest, manifest_digest="sha256:0",
+                sessions=manifest["sessions"], node_id="execute", reservation_identity="r",
+            )
+            seen = []
+            def _run(cmd, env):
+                pointer = jobs.parent / "session_chains" / "ssc-persist-1.json"
+                seen.append((cmd[cmd.index("--action") + 1] if "--action" in cmd else "?", pointer.is_file()))
+                return mock.Mock(returncode=0, stdout="", stderr="")
+            with mock.patch.object(SUBDIV, "dispatch_command", side_effect=lambda m, s, action, parent, j: ["x", "--action", action]):
+                results = SUBDIV.start_admitted_batch(
+                    admission, parent="owner", jobs=jobs, governor_reservation_env="TOKEN", run=_run,
+                )
+            self.assertEqual([r["started"] for r in results], [1, 1])
+            self.assertEqual(seen, [("register", False), ("register", False), ("start", True), ("start", True)])
+            sealed = json.loads((jobs.parent / "session_chains" / "ssc-persist-1.json").read_text())
+            self.assertEqual(sealed["chain_id"], "ssc-persist-1")
 
 
 class StartAdmittedBatchPartialFailureTest(AdmissionFixture):

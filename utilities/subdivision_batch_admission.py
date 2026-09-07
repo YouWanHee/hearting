@@ -28,6 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
 
 from stage_session_contract import StageSessionError, load_manifest  # noqa: E402
+from dispatch_subsession_advance import chain_manifest_pointer_path  # noqa: E402
 from dispatch_contract import DispatchContractError, close_attempt_row  # noqa: E402
 
 # Route-leg cardinality tier order, duplicated from `capability-route.py:41` --
@@ -57,31 +58,56 @@ class SubdivisionAdmissionError(RuntimeError):
         self.detail = detail
 
 
-# SD-119 impl-review round 1 (F-3): a TEMPORARY fail-closed gate for the two
-# LIVE parallel entry points -- `stage-session-chain.py`'s `mode == "parallel"`
-# branch and `dispatch-batch.py`'s subdivision-manifest-without-route-leg
-# branch. `admit_batch()` below proves permission, full-N reservation, and
-# exact-fixed-file scope (A-1/A-2), but not the R5 artifact-base fence: a
-# per-slice `{"base": "worktree"|"artifact", "path": ...}` declaration, the
-# producer-output ∩ write_scope intersection, a content-digest baseline/scan
-# root, and an ownership receipt (SD §13.35.1-(7)/(8)). None of that exists
-# yet (R5 is not landed), so a live call reaching `admit_batch()` today would
-# reserve full-N governor slots and start real children with only the
-# worktree fence proven -- not what SD §13.35.5's rollout note calls safe:
-# "R4의 fail-closed 게이트가 열리기 전에는 parallel spawn 0이므로 R1~R3만
-# 착지해도 회귀 위험 없이 serial 사장 원인이 닫힌다". `admit_batch()` itself
-# and its 8 existing unit tests are deliberately NOT gated here -- A-1/A-2
-# keep proving admission safety at unit level (impl-review round 1 explicit
-# instruction: do not delete or gate `admit_batch()`). Delete this function
-# and its two call sites, and only those, once R5 (artifact-base fence +
-# baseline/delta audit + ownership receipt) lands and the two live entry
-# points can prove it before calling `admit_batch()`.
-def raise_if_parallel_entry_fail_closed() -> None:
-    raise SubdivisionAdmissionError(
-        "scope-unproven",
-        "R5 artifact-base fence/baseline/ownership-receipt not yet landed; "
-        "parallel sub-session batch admission stays fail-closed (SD-119 R4)",
-    )
+# SD-119 impl-review round 1 (F-3) narrowed by SD-103 (routing-flex,
+# 2026-09-07). The original gate refused EVERY live parallel entry
+# unconditionally, "until R5's artifact-base fence lands". What R5 adds is the
+# per-slice `{"base": "worktree"|"artifact", ...}` fence, the producer-output
+# ∩ write_scope intersection, a content-digest baseline/scan root, and an
+# ownership receipt -- all of which concern slices that write ARTIFACT-base
+# paths. A slice whose files live under the worktree is fenced today by
+# `stage_session_contract.load_manifest` (exact files, no globs, worktree
+# containment, write-scope containment, pairwise disjointness) and audited at
+# the gate by `capability-route.py complete --subsession-manifest`
+# (baseline-subtracted diff-scope audit, `subdivision-scope-violation`).
+# Measured effect of the blanket gate: 0 subdivision rows against 100 execute
+# rows in the canonical registry (2026-08-28..09-07), i.e. SD-103 never fired.
+# The gate now refuses exactly the case the unlanded fence is for: a slice that
+# declares a non-worktree `base`. An unreadable manifest is left to
+# `admit_batch`, which types that refusal itself.
+def raise_if_parallel_entry_fail_closed(manifest_path: str | Path | None = None) -> None:
+    if manifest_path is None:
+        return
+    try:
+        raw = json.loads(Path(manifest_path).resolve().read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return
+    sessions = raw.get("sessions") if isinstance(raw, dict) else None
+    for offset, session in enumerate(sessions if isinstance(sessions, list) else [], 1):
+        if not isinstance(session, dict):
+            continue
+        base = session.get("base")
+        if isinstance(base, dict):
+            base = base.get("base")
+        if base in (None, "worktree"):
+            continue
+        raise SubdivisionAdmissionError(
+            "scope-unproven",
+            f"slice {session.get('subsession_id') or offset} declares base={base!r}; "
+            "R5 artifact-base fence/baseline/ownership-receipt not yet landed, only "
+            "worktree-base slices are admitted (SD-119 R4, narrowed by SD-103)",
+        )
+
+
+def persist_chain_manifest(jobs: Path, manifest: dict[str, Any]) -> Path:
+    """Seal the admitted manifest at the chain-id-keyed pointer BEFORE any
+    slice starts: `dispatch-node.py` refuses a slice start whose chain has no
+    sealed manifest (`subsession-chain-manifest-unsealed`, defect F3), and the
+    supervisor advance reads the same pointer. Same location and bytes as
+    `stage-session-chain.py`'s serial-path persist."""
+    path = chain_manifest_pointer_path(Path(jobs), manifest["chain_id"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(manifest, sort_keys=True, default=str) + "\n", encoding="utf-8")
+    return path
 
 
 def has_route_leg_group(route: dict[str, Any], group: str) -> bool:
@@ -207,6 +233,7 @@ def admit_batch(
     governor_root: Path,
     reserve: Callable[..., list[str]] | None = None,
     record_baseline: Callable[[dict[str, Any], str, dict[str, Any]], None] | None = None,
+    jobs: str | Path | None = None,
 ) -> AdmissionResult:
     """Run all four admission checkpoints in order; any failure is row 0 / model 0.
 
@@ -227,7 +254,13 @@ def admit_batch(
         governor, governor_root, manifest["sessions"],
         route=route, node_id=node_id, manifest_digest=manifest_digest, reserve=reserve,
     )
-    (record_baseline or ROUTE_MODULE.record_subdivision_baseline)(route, node_id, manifest)
+    if record_baseline is None:
+        # SD-OPEN-53: the admission-time baseline lands in the state root of
+        # the registry the caller holds (`jobs`), the same root the audit
+        # later reads it back from -- never the inherited/default root.
+        def record_baseline(route, node_id, manifest):
+            return ROUTE_MODULE.record_subdivision_baseline(route, node_id, manifest, jobs=jobs)
+    record_baseline(route, node_id, manifest)
     return AdmissionResult(
         tokens=tokens,
         manifest=manifest,
@@ -307,14 +340,12 @@ def start_admitted_batch(
     means zero slices start, including ones that themselves registered
     cleanly -- their reservation token is simply never consumed by a start
     call, and their row is cancel-marked so the returned receipt's
-    `registered: 0` is true of the registry too (F-4, round 2). This
-    function is presently unreachable from either live entry
-    point (F-3's fail-closed gate), so no test exercises it against a real
-    governor reservation lifecycle; a future R5 landing that reopens the
-    live path should also decide whether an unconsumed token needs explicit
-    `model-worker-governor.release` (not implemented here -- no existing
-    caller of this function threads a `governor_root` through to release
-    with)."""
+    `registered: 0` is true of the registry too (F-4, round 2). Since the
+    SD-103 narrowing of F-3 this function IS reachable for worktree-base
+    slices; no test yet exercises it against a real governor reservation
+    lifecycle (first live parallel execute is an owed canary), and an
+    unconsumed token still has no explicit `model-worker-governor.release`
+    (no caller threads a `governor_root` through to release with)."""
 
     runner = run or (lambda cmd, env: subprocess.run(cmd, cwd=ROOT, text=True, capture_output=True, env=env, check=False))
     registrations: list[tuple[dict[str, Any], subprocess.CompletedProcess[str]]] = []
@@ -360,6 +391,9 @@ def start_admitted_batch(
             })
         return results
 
+    # Every slice registered: seal the manifest once, before the first start
+    # (F3 precondition; see `persist_chain_manifest`).
+    persist_chain_manifest(Path(jobs), admission.manifest)
     results = []
     for session, token in zip(admission.sessions, admission.tokens):
         env = os.environ.copy()

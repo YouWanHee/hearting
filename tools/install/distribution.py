@@ -2379,7 +2379,154 @@ def _open_route_artifact_roots(
     return roots, route_files, ""
 
 
-def _route_record_launch_home(path: Path):
+# Mirror of `dispatch_subsession_advance.TERMINAL_STATUSES` /
+# `dispatch_contract.PARENT_EXTINCTION_TERMINAL_STATUSES`. An **allowlist**, not
+# the complement of the live states: a status word this reader does not
+# recognise -- a partially written field, a hand-repaired row, a word a future
+# cycle adds the way `killed`/`cancelled` were added before anything wrote them
+# -- is an unknown, and every unknown must keep the pin. Written as a denylist
+# first, which read `queued` as "this route is over" (review 🔴2).
+_ROUTE_TERMINAL_ROW_STATES = frozenset({"done", "killed", "cancelled"})
+
+
+def _route_registry_index(text: str) -> dict:
+    """One pass over a registry: which routes are named, and which are still live.
+
+    `{"malformed": bool, "seen": set[route_id], "live": set[route_id]}`.
+
+    Built once per registry file rather than re-scanned per route record: the
+    text cache alone left the work `O(open_records x registry_bytes)`, measured
+    at 3.6 s for 2,000 records naming one 2.2 MB registry (review 🟡4). Today
+    only four open-shaped records name one registry, so this is about the
+    ceiling (`_ROUTE_SCAN_MAX_FILES`), not about now.
+
+    **A depth-1 owner is not a route node**: its row carries `owner_route_id`
+    and no `route_id` (`dispatch-progress.py`, `workflow-supervisor.py`,
+    `dispatch_completion_join.py` all match on both keys). Matching only
+    `route_id=` made a live owner invisible, so a route whose node rows were all
+    terminal -- the normal state between two serial stages, and the whole of
+    `code-report` -- read as finished and dropped its pin while its owner was
+    still running. Measured on the live registry: 77 rows carry
+    `owner_route_id=` and no `route_id=`, 49 of 96 routes have both an owner row
+    and node rows, and 0 rows carry both keys (review 🔴1).
+    """
+
+    index: dict = {"malformed": False, "seen": set(), "live": set()}
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        fields = line.split("\t")
+        if len(fields) < 6:
+            index["malformed"] = True
+            return index
+        terminal = fields[1] in _ROUTE_TERMINAL_ROW_STATES
+        for item in fields[5].split(","):
+            key, _, value = item.partition("=")
+            if key not in ("route_id", "owner_route_id") or not value:
+                continue
+            index["seen"].add(value)
+            if not terminal:
+                index["live"].add(value)
+    return index
+
+
+def _read_route_registry_index(jobs_path: str, cache: dict):
+    """Cached `_route_registry_index` for one registry path, or `None`.
+
+    Keyed on `realpath` so two spellings of one file are one read and therefore
+    one snapshot -- a registry appended to mid-scan otherwise reads in two
+    states within a single pass. The whole file is read, unbounded, exactly as
+    `_release_in_use` reads its reference registries; the 1 MiB
+    `_ROUTE_RECORD_MAX_BYTES` two functions above caps a *route record*, and
+    deliberately does not apply here (the live registry is already 2.2 MB). If a
+    cap is ever added it must yield `None` -- undecidable -- never `True`.
+    """
+
+    try:
+        key = os.path.realpath(jobs_path)
+    except OSError:
+        key = jobs_path
+    if key not in cache:
+        try:
+            cache[key] = _route_registry_index(
+                Path(jobs_path).read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeDecodeError):
+            cache[key] = None
+    return cache[key]
+
+
+def _route_attempts_finished(route_id: str, raw: dict, cache: dict, environ: dict):
+    """Is every registry attempt of this route terminal? `None` = cannot tell.
+
+    P2, mirroring the registry reference source. A release is pinned by a route
+    record until that route is closed -- and a route whose only attempt *died*
+    is never closed, because nobody runs `close` on a route that failed to
+    launch. Measured 2026-09-06: `rt-0319e7bd` (v2.107.0,
+    `dead-launch-runtime-root-mismatch`) and `rt-1ccafd47` (v2.109.1,
+    `dead-invalid-envelope`) each held a release with a single `done` row, no
+    completion marker, no live process, and no other reference source. The
+    registry source had already released them; only this one had not.
+
+    `route_id` is the caller's identity (the record's *filename stem*), which
+    `_open_route_launch_homes` documents as authoritative. If the body disagrees
+    the answer is `None`: two sources for one value is the shape that has bitten
+    this repo repeatedly, and 83 records on disk already have stem != body.
+
+    Finished is decided by the route's OWN sealed `jobs_path` -- a registry this
+    route never wrote to cannot certify it (defect C, B2). Any OTHER registry may
+    still veto: a live row anywhere keeps the pin. That asymmetry closes the
+    `_jobs_path_alias_relieves_mismatch` hole (review 🟡6) without needing alias
+    resolution the installer cannot import -- it can only ever be more
+    conservative, never release something the sealed registry would have held.
+
+    `None` -- no sealed jobs path, unreadable, a malformed row, or **no rows at
+    all** -- keeps the release pinned. Absence of evidence is the one direction
+    that deletes data: a route compiled but not yet launched has no rows, and so
+    does a route whose rows were pruned out from under it.
+    """
+
+    body_id = raw.get("route_id")
+    if not isinstance(route_id, str) or not route_id:
+        return None
+    if isinstance(body_id, str) and body_id and body_id != route_id:
+        return None
+    tuple_ = raw.get("launch_compatibility_tuple")
+    jobs = (tuple_ or {}).get("jobs_path") if isinstance(tuple_, dict) else None
+    jobs_path = jobs.get("path") if isinstance(jobs, dict) else None
+    if not isinstance(jobs_path, str) or not jobs_path:
+        return None
+    index = _read_route_registry_index(jobs_path, cache)
+    if index is None or index["malformed"]:
+        return None
+    # Veto pass: any other registry that still shows this route live keeps the
+    # pin, even though only the sealed one may declare it finished.
+    for other in _veto_registry_paths(environ):
+        veto = _read_route_registry_index(other, cache)
+        if veto is not None and not veto["malformed"] and route_id in veto["live"]:
+            return False
+    if route_id in index["live"]:
+        return False
+    return True if route_id in index["seen"] else None
+
+
+def _veto_registry_paths(environ: dict) -> list[str]:
+    """Registries that may only ever KEEP a pin, never release one."""
+
+    paths: list[str] = []
+    try:
+        paths.append(str(stable_state_root(environ) / "jobs.log"))
+    except (DistributionError, OSError):
+        pass
+    ambient = environ.get("AGENT_DISPATCH_JOBS")
+    if ambient:
+        paths.append(ambient)
+    return paths
+
+
+def _route_record_launch_home(
+    path: Path, registry_cache: dict | None = None, environ: dict | None = None
+):
     """`launch_compatibility_tuple.launch_home.path` from one route record.
 
     Returns `None` if the route is **closed** -- an `.outcome.json` sibling
@@ -2389,6 +2536,11 @@ def _route_record_launch_home(path: Path):
     corrupt *closed* route record is likewise ignored: one rotten record
     among hundreds of closed ones must not block prune forever (over-eager
     fail-closed is its own bug).
+
+    Also `None` when the route is unclosed but every one of its registry
+    attempts is terminal (`_route_attempts_finished`) -- the P2 mirror of the
+    registry source's `open`-only rule. "Unclosed" and "still working" are not
+    the same thing, and a route that died at launch is never closed by anyone.
 
     Returns `_UNDECIDABLE` if the record looks open (no outcome sibling) but
     cannot be trusted: oversized, unreadable, unparsable, or missing the
@@ -2414,7 +2566,50 @@ def _route_record_launch_home(path: Path):
     value = launch_home.get("path") if isinstance(launch_home, dict) else None
     if not isinstance(value, str) or not value:
         return _UNDECIDABLE
+    # Checked only after the record parses and names a launch_home: an
+    # undecidable record must stay undecidable, never be released by a
+    # terminality answer derived from a body we could not trust.
+    if _route_attempts_finished(
+        path.stem, raw,
+        registry_cache if registry_cache is not None else {},
+        environ if environ is not None else os.environ,
+    ) is True:
+        return None
     return value
+
+
+# `capability-route.py` names every route record exactly `{route_id}.json`, and
+# a route id is `"rt-" + route_hash[:16]` (16 lowercase hex).
+_CANONICAL_ROUTE_NAME_RE = re.compile(r"^rt-[0-9a-f]{16}\.json$")
+
+
+def _unrecognised_open_route_record(path: Path) -> bool:
+    """Does this non-canonically-named file still look like an OPEN route record?
+
+    The discriminator is content, not name: a real record carries `nodes` or a
+    `launch_compatibility_tuple`; a sidecar (`.gate-release.json`, and whatever
+    is invented next) carries neither. A closed record -- one with an
+    `.outcome.json` sibling for its own stem, the same rule
+    `_route_record_launch_home` applies -- is irrelevant either way.
+
+    Unreadable or oversized reads as "yes": we cannot prove it is safe to skip,
+    and the cost of over-retaining is disk, while the cost of skipping a real
+    record is deleting a release out from under it.
+    """
+
+    if path.with_name(path.stem + ".outcome.json").exists():
+        return False
+    try:
+        if path.stat().st_size > _ROUTE_RECORD_MAX_BYTES:
+            return True
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError):
+        return True
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(record, dict):
+        return False
+    return "nodes" in record or "launch_compatibility_tuple" in record
 
 
 def _open_route_launch_homes(environ: dict[str, str]) -> tuple[list[tuple[str, str]], str]:
@@ -2460,7 +2655,29 @@ def _open_route_launch_homes(environ: dict[str, str]) -> tuple[list[tuple[str, s
         except OSError:
             return [], f"route-discovery-unreliable:{routes_dir}"
         for entry in entries:
-            if entry.name.endswith(".outcome.json"):
+            if not _CANONICAL_ROUTE_NAME_RE.fullmatch(entry.name):
+                # Select route records by the name `canonical_route_path()`
+                # actually writes, rather than skipping the sidecar shapes we
+                # happen to know about. This used to exclude `.outcome.json`
+                # only, so the later `.gate-release.json` sidecar was read as a
+                # route record, came back undecidable, and made the whole scan
+                # unreliable -- which marks EVERY release in use and disables
+                # release pruning entirely. Measured 2026-09-06: 20 releases,
+                # 606 MB, zero open attempts, all retained by one 354-byte
+                # sidecar. A denylist of sidecars is a list that silently grows
+                # stale.
+                #
+                # But a name this reader does not recognise must never be
+                # skipped SILENTLY: skipping a real route record removes a
+                # release's protection, and that is the one direction that
+                # deletes data. So the name selects, and content adjudicates the
+                # exceptions -- anything that still looks like an open route
+                # record under an unexpected name fails the scan closed, exactly
+                # as an unparsable canonical record does. 79 legacy
+                # alias-basename records exist on this machine from before the
+                # `rt-` generator; every one is closed, so they cost nothing.
+                if _unrecognised_open_route_record(entry):
+                    return [], f"route-record-unrecognised-name:{entry}"
                 continue
             scanned += 1
             if scanned > _ROUTE_SCAN_MAX_FILES:
@@ -2474,16 +2691,88 @@ def _open_route_launch_homes(environ: dict[str, str]) -> tuple[list[tuple[str, s
         candidates[str(path.resolve(strict=False))] = path
 
     results: list[tuple[str, str]] = []
+    registry_cache: dict = {}
+    environ = environ or {}
     for path in candidates.values():
         if not path.is_file():
             continue
-        launch_home = _route_record_launch_home(path)
+        launch_home = _route_record_launch_home(path, registry_cache, environ)
         if launch_home is None:
             continue
         if launch_home is _UNDECIDABLE:
             return [], f"route-record-unparsable:{path}"
         results.append((path.stem, launch_home))
     return results, ""
+
+
+def _release_held_by_live_process(candidate: Path) -> tuple[bool, str]:
+    """Is any live process running out of this release right now?
+
+    The fifth reference source, and the only one that sees an *unregistered
+    interactive* session. Measured 2026-09-06: three managed codex sessions had
+    `AGENT_HOME=<releases/v2.110.1>` and had been alive for two days, while
+    `jobs.log` held only two `done` rows for that release and no activation
+    named it. Every existing source -- registry, stable registry, route records,
+    activation -- looked straight past them, so restoring release pruning would
+    have deleted the tree those processes resolve `adapters/.../preflight.sh`
+    from at request time. The bug this fix repairs had been accidentally
+    shielding them since 2026-09-04.
+
+    Reads `/proc/<pid>/environ` and `cmdline` only. A `/proc` that cannot be
+    enumerated returns in-use: undecidable is in use, like every other source
+    here. A pid that disappears mid-scan is skipped -- that one is decidable
+    (it is gone).
+    """
+
+    real = os.path.realpath(candidate)
+    prefix = real.rstrip("/") + "/"
+    proc = Path("/proc")
+    try:
+        entries = [entry for entry in proc.iterdir() if entry.name.isdigit()]
+    except OSError:
+        return True, "proc-unreadable"
+    uid = os.getuid()
+    opaque = 0
+    for entry in entries:
+        try:
+            if entry.stat().st_uid != uid:
+                # Noise reduction, not a correctness gate: another user's
+                # process cannot be running out of this user's
+                # `~/.local/share` release tree, and skipping them keeps the
+                # opaque-process count below from naming hundreds of foreign
+                # pids. Because unreadable processes are skipped rather than
+                # treated as undecidable, removing this filter changes no
+                # verdict -- so no test claims otherwise.
+                continue
+        except OSError:
+            continue
+        readable = False
+        for name, separator in (("environ", "\0"), ("cmdline", "\0")):
+            try:
+                blob = (entry / name).read_text(encoding="utf-8", errors="replace")
+            except (OSError, UnicodeDecodeError):
+                continue
+            readable = True
+            for field in blob.split(separator):
+                if not field:
+                    continue
+                value = field.split("=", 1)[1] if name == "environ" and "=" in field else field
+                if value == real or value.startswith(prefix):
+                    return True, f"live-process:{entry.name}"
+        if not readable:
+            opaque += 1
+    if opaque:
+        # Honest limit, stated rather than hidden: a handful of our own
+        # processes (`(sd-pam)` and friends) deny `/proc` reads entirely, and
+        # they are never harness processes. Failing closed on them would mark
+        # every release in use -- the exact bug this change repairs -- so they
+        # are skipped, and the count is printed so the skip is not silent.
+        print(
+            f"harness release: {opaque} own process(es) could not be inspected while "
+            f"checking {candidate}; they were not treated as holding it",
+            file=sys.stderr,
+        )
+    return False, ""
 
 
 def _release_in_use(
@@ -2720,6 +3009,14 @@ def _cleanup_releases(keep: set[Path], *, force_prune_unproven: bool = False) ->
         # routes, so it covers a release pinned by an OPEN attempt (SD-115 axis 4)
         # and not one pinned by an idle activation -- an update that skips a
         # runtime as `foreign` leaves exactly that shape behind.
+        held, why_held = _release_held_by_live_process(candidate)
+        if held:
+            print(
+                f"harness release: {candidate} is still in use by a live process "
+                f"({why_held}); keeping it instead of deleting it",
+                file=sys.stderr,
+            )
+            continue
         if _release_projection_referenced(candidate):
             print(
                 f"harness release: {candidate} is still the activation source of a "

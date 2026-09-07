@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """F-100c (user 2026-09-03) — steward flag on the board, three harnesses alike.
 
-The ledger tool writes a marker for every SENDING session whose record is a
-steer/handoff/gate-relay/watch; the Fleet steward collector joins it by exact
-(harness, session_id); the tag badge then wears bold yellow (`[46]`) and an
-untagged steward still gets `[*]`, with a legend entry.
+The ledger tool keeps a marker per session; since 2026-09-06 only role evidence
+counts — `steward on` (source=explicit), a SENT `watch` (source=watch) or a `start`
+that launched the target (source=start) — and a steer/handoff/gate-relay send is
+just a message. The Fleet steward collector joins markers by exact
+(harness, session_id) and asks the ledger tool which entries are evidence; the tag
+badge then wears bold yellow (`[46]`) and an untagged steward still gets `[*]`,
+with a legend entry.
 """
 import json
 import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 _TOOLS_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _TOOLS_DIR not in sys.path:
@@ -108,12 +112,54 @@ class StewardCollectorTest(unittest.TestCase):
                     Session(harness="claude", pid=3, session_id="sid-b"),
                     Session(harness="claude", pid=4)]
         markers = {("claude", "sid-a"): {"session_id": "sid-a", "targets": {
-            "x": {"harness": "codex", "session_id": "x", "name": "w", "kind": "steer", "ts": "2"},
-            "y": {"harness": "claude", "session_id": "y", "name": "v", "kind": "watch", "ts": "1"}}}}
+            "x": {"harness": "codex", "session_id": "x", "name": "w", "kind": "start", "ts": "2",
+                  "source": "start"},
+            "y": {"harness": "claude", "session_id": "y", "name": "v", "kind": "watch", "ts": "1",
+                  "source": "watch"}}}}
         steward.enrich(sessions, markers=markers)
         self.assertEqual([s.steward for s in sessions], [True, False, False, False])
         self.assertEqual([t["session_id"] for t in sessions[0].steward_targets], ["y", "x"])
         self.assertIsNone(sessions[1].steward_targets)
+
+    def test_handoff_only_and_legacy_markers_do_not_make_a_steward(self):
+        """Role ≠ communication (user 2026-09-06: "통신만 하면 죄다 d=-1"). A marker whose
+        entries are steer/handoff/gate-relay sends — new (source absent, kind=handoff) or
+        old (no source at all) — leaves steward=False; a mixed marker keeps only the
+        evidence entries in `steward_targets`."""
+        sessions = [Session(harness="claude", pid=1, session_id="worker"),
+                    Session(harness="claude", pid=2, session_id="legacy-steward"),
+                    Session(harness="claude", pid=3, session_id="mixed"),
+                    Session(harness="opencode", pid=4, session_id="empty")]
+        markers = {
+            ("claude", "worker"): {"session_id": "worker", "targets": {
+                "w1:p15": {"harness": "claude", "session_id": "steward", "name": "hearting-b0",
+                           "kind": "handoff", "ts": "2"},
+                "z": {"harness": "codex", "session_id": "z", "name": "z", "kind": "steer", "ts": "1",
+                      "source": "steer"}}},
+            ("claude", "legacy-steward"): {"session_id": "legacy-steward", "targets": {
+                "c": {"harness": "codex", "session_id": "c", "name": "c", "kind": "watch", "ts": "1"}}},
+            ("claude", "mixed"): {"session_id": "mixed", "targets": {
+                "h": {"harness": "codex", "session_id": "h", "name": "h", "kind": "handoff", "ts": "3"},
+                "s": {"harness": "claude", "session_id": "s", "name": "s", "kind": "start", "ts": "2",
+                      "source": "start"},
+                "-": {"harness": "unknown", "session_id": None, "name": "-", "kind": "explicit",
+                      "ts": "1", "source": "explicit"}}},
+            ("opencode", "empty"): {"session_id": "empty", "targets": {}},
+        }
+        steward.enrich(sessions, markers=markers)
+        self.assertEqual([s.steward for s in sessions], [False, True, True, False])
+        self.assertIsNone(sessions[0].steward_targets)
+        self.assertEqual([t["session_id"] for t in sessions[1].steward_targets], ["c"])
+        self.assertEqual([t["session_id"] for t in sessions[2].steward_targets], [None, "s"])
+        self.assertIsNone(sessions[3].steward_targets)
+
+    def test_without_the_ledger_module_nothing_is_claimed(self):
+        sessions = [Session(harness="claude", pid=1, session_id="sid-a")]
+        markers = {("claude", "sid-a"): {"session_id": "sid-a", "targets": {
+            "y": {"harness": "claude", "session_id": "y", "kind": "watch", "ts": "1", "source": "watch"}}}}
+        with mock.patch.object(steward, "_peer_message_module", return_value=None):
+            steward.enrich(sessions, markers=markers)
+        self.assertFalse(sessions[0].steward)
 
     def test_markers_round_trip_through_the_ledger_tool(self):
         """The writer (`peer-message record`) and the reader agree on the path layout."""
@@ -131,15 +177,23 @@ class StewardCollectorTest(unittest.TestCase):
                 ns = pm.argparse.Namespace(
                     from_harness="claude", from_session_id="sid-a", from_project="p",
                     from_name="hearting-46", to_harness="codex", to_session_id="sid-c",
-                    to_name="child", kind="steer", surface="herdr", status="sent",
+                    to_name="child", kind="handoff", surface="herdr", status="sent",
                     receipt=None, ref=[], body_file=None, body_stdin=False)
                 self.assertEqual(pm.cmd_record(ns), 0)
+                self.assertNotIn(("claude", "sid-a"), steward.read_markers())   # a handoff is not the role
+                ns.kind = "watch"
+                self.assertEqual(pm.cmd_record(ns), 0)                          # neither is a watch ROW
+                self.assertNotIn(("claude", "sid-a"), steward.read_markers())
+                self.assertTrue(pm.mark_steward("claude", "sid-a", {"harness": "codex", "session_id": "sid-c",
+                                                                    "name": "child"}, "watch",
+                                                "2026-09-06T00:00:00Z", source="watch"))
                 markers = steward.read_markers()
                 self.assertIn(("claude", "sid-a"), markers)
                 sessions = [Session(harness="claude", pid=1, session_id="sid-a")]
                 steward.enrich(sessions, markers=markers)
                 self.assertTrue(sessions[0].steward)
                 self.assertEqual(sessions[0].steward_targets[0]["session_id"], "sid-c")
+                self.assertEqual(sessions[0].steward_targets[0]["source"], "watch")
                 self.assertEqual(pm.cmd_release(pm.argparse.Namespace(
                     harness="claude", session_id="sid-a")), 0)
                 self.assertNotIn(("claude", "sid-a"), steward.read_markers())
@@ -189,7 +243,8 @@ class RuntimeLedgerRootsTest(unittest.TestCase):
             for root, upd in ((a, "2026-09-03T01:00:00Z"), (b, "2026-09-03T02:00:00Z")):
                 d = os.path.join(root, "peer-steward", "codex"); os.makedirs(d)
                 with open(os.path.join(d, "t1.json"), "w") as fh:
-                    json.dump({"session_id": "t1", "updated": upd, "targets": {"x": {"ts": upd}}}, fh)
+                    json.dump({"session_id": "t1", "updated": upd,
+                               "targets": {"x": {"ts": upd, "kind": "watch", "source": "watch"}}}, fh)
             markers = pm.read_steward_markers([a, b])
             self.assertEqual(markers[("codex", "t1")]["updated"], "2026-09-03T02:00:00Z")
             self.assertEqual(pm.read_steward_markers([os.path.join(tmp, "missing")]), {})
