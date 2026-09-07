@@ -1621,6 +1621,76 @@ class FinalizeStateConflictTest(ProducerTestBase):
             self.assertIn(f"cycle-structure type={type(bad_cycle).__name__}", caught.exception.detail)
             manifest_path.write_bytes(manifest_bytes)
 
+    def test_manifest_non_regular_entries_fail_closed_instead_of_cache_fallback(self):
+        import errno
+        from unittest import mock
+
+        self.activate()
+        route, route_file, result = self.begin()
+        self.write_output(result)
+        self.close(route, route_file)
+        cycle_id = result["cycle_id"]
+        P.finalize(self.root, cycle_id=cycle_id)
+        manifest_path = Path(result["cycle_dir"]) / "manifest.json"
+        record = P.read_cycle_record(self.root, cycle_id)
+        self.assertEqual(record["cycle_state"], "completed")
+
+        # A directory is present, not absent, and must not be hidden by the
+        # valid record cache.
+        manifest_bytes = manifest_path.read_bytes()
+        manifest_path.unlink()
+        manifest_path.mkdir()
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id)
+        self.assertEqual(caught.exception.code, "sealed-cycle-state-unreadable")
+        self.assertIn("entry-kind=non-regular", caught.exception.detail)
+        manifest_path.rmdir()
+        manifest_path.write_bytes(manifest_bytes)
+
+        # Both a live and dangling symlink are non-regular entries. The
+        # lstat gate rejects them before JSON I/O can follow or classify them.
+        target = manifest_path.with_name("manifest-target.json")
+        target.write_bytes(manifest_bytes)
+        manifest_path.unlink()
+        manifest_path.symlink_to(target.name)
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id)
+        self.assertEqual(caught.exception.code, "sealed-cycle-state-unreadable")
+        manifest_path.unlink()
+        target.unlink()
+        manifest_path.symlink_to("missing-manifest.json")
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id)
+        self.assertEqual(caught.exception.code, "sealed-cycle-state-unreadable")
+        manifest_path.unlink()
+        manifest_path.write_bytes(manifest_bytes)
+
+        # FIFO is rejected from its mode without attempting a blocking read.
+        fifo_supported = hasattr(os, "mkfifo")
+        if fifo_supported:
+            manifest_path.unlink()
+            os.mkfifo(manifest_path)
+            with self.assertRaises(P.ProducerError) as caught:
+                P.finalize(self.root, cycle_id=cycle_id)
+            self.assertEqual(caught.exception.code, "sealed-cycle-state-unreadable")
+            manifest_path.unlink()
+            manifest_path.write_bytes(manifest_bytes)
+
+        # Lookup failures are not absence. Mocking lstat keeps this portable
+        # when the test process has permission to inspect the fixture.
+        with mock.patch.object(P, "cycle_dir", return_value=manifest_path.parent), \
+             mock.patch.object(Path, "lstat", side_effect=PermissionError("denied")):
+            with self.assertRaises(P.ProducerError) as caught:
+                P._published_cycle_state(self.root, record)
+        self.assertEqual(caught.exception.code, "sealed-cycle-state-unreadable")
+        self.assertIn("lookup-error=PermissionError", caught.exception.detail)
+        with mock.patch.object(P, "cycle_dir", return_value=manifest_path.parent), \
+             mock.patch.object(Path, "lstat", side_effect=OSError(errno.ENOTDIR, "not a directory")):
+            with self.assertRaises(P.ProducerError) as caught:
+                P._published_cycle_state(self.root, record)
+        self.assertEqual(caught.exception.code, "sealed-cycle-state-unreadable")
+        self.assertIn("lookup-error=NotADirectoryError", caught.exception.detail)
+
     def test_recovery_roll_forward_before_sealed_branch_is_judged_on_published_state(self):
         self.activate()
         route, route_file, result = self.begin()

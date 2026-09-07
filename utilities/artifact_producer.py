@@ -38,6 +38,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import sys
 import time
 from pathlib import Path
@@ -1623,14 +1624,27 @@ def _published_cycle_state(root: Path, record: Mapping[str, Any]) -> str:
         manifest_path = _record_cycle_manifest_path(root, record)
     except (ProducerError, OSError, KeyError, TypeError):
         manifest_path = _record_cycle_manifest_path(root, record)
-    if manifest_path is None or not (manifest_path.is_file() or manifest_path.is_symlink()):
+    if manifest_path is None:
+        raise ProducerError("sealed-cycle-state-unreadable", f"{cycle_id}: manifest=path-unresolved")
+    try:
+        manifest_stat = manifest_path.lstat()
+    except FileNotFoundError:
         # Canonical source absent is the *only* case that falls back to the
         # cache (compatibility for W7G/W7I/W7H relocation roots carrying
-        # legacy sealed records).
+        # legacy sealed records). A directory, special node, or symlink is
+        # present-but-invalid and must never be mistaken for absence.
         if record_state is not None:
             return record_state
         shown = "missing" if cached is None else repr(cached)
         raise ProducerError("sealed-cycle-state-unknown", f"{cycle_id}: manifest=absent record={shown}")
+    except OSError as exc:
+        raise ProducerError(
+            "sealed-cycle-state-unreadable", f"{cycle_id}: manifest={manifest_path} lookup-error={exc.__class__.__name__}:{exc}"
+        ) from exc
+    if not stat.S_ISREG(manifest_stat.st_mode):
+        raise ProducerError(
+            "sealed-cycle-state-unreadable", f"{cycle_id}: manifest={manifest_path} entry-kind=non-regular"
+        )
     document = _read_json(manifest_path)
     if document is None:  # unparsable JSON, symlink, or encoding error
         raise ProducerError("sealed-cycle-state-unreadable", f"{cycle_id}: manifest={manifest_path} unparsable")
