@@ -933,6 +933,11 @@ def build_continuation_route(
         "resume_retry_boundaries","dispatch_evidence","dispatch_contract_version",
         "dispatch_evidence_scope_version","registered_headless_candidates",
         "registered_headless_policy","unit_catalog_digest","validation_basis",
+        # SD-OPEN-46: a composed source's composition fields must ride the
+        # suffix, or the continuation presents itself as a preset route and the
+        # embedded composed_recipe loses its hash seal. (`route_origin`/`shape`
+        # live inside `selection`, inherited above.)
+        "composed","composed_recipe",
     )
     route={key:json.loads(json.dumps(source_route[key]))
            for key in inherited_keys if key in source_route}
@@ -2253,6 +2258,17 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
     elif effective=="quick":
         if transport not in (None, "headless"):
             raise ValueError(f"invalid quick transport: {transport!r}")
+        if (requested=="direct" and set(predicates)!=known_pred
+                and registered_headless_evidence is None):
+            # H6: an explicit direct request whose predicates do not all hold
+            # used to be silently promoted to quick and died as an opaque
+            # `quick-headless-unavailable`. Refuse instead and name the gap.
+            # With checked quick evidence the promotion still compiles
+            # (`test_ambiguous_quick`); the gaps stay recorded in
+            # selection_basis either way.
+            raise ValueError(
+                "direct-predicate-gap:"
+                +",".join(sorted(known_pred-set(predicates))))
         registered_headless_candidates=_validate_registered_headless_evidence(
             registered_headless_evidence
         )
