@@ -126,7 +126,9 @@ def check_file(path: Path, expected: str, stale: list[str]) -> None:
     if not path.exists() or path.read_text(encoding="utf-8") != expected:
         stale.append(str(path.relative_to(ROOT)))
         return
-    if stat.S_IMODE(path.stat().st_mode) != JSON_MODE:
+    # Git preserves the executable bit for regular files, not group/other
+    # write bits selected by the checkout umask or filesystem mount.
+    if stat.S_IMODE(path.stat().st_mode) & 0o111:
         stale.append(str(path.relative_to(ROOT)) + " (mode)")
 
 

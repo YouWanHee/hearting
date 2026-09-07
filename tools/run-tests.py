@@ -1098,9 +1098,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--census", action="store_true")
     p.add_argument("--select", action="append", default=[])
     p.add_argument("--exclude", action="append", default=[])
-    p.add_argument("--jobs", type=int, default=DEFAULT_JOBS)
+    p.add_argument(
+        "--jobs", type=int, default=DEFAULT_JOBS,
+        help="parallel suite count (full repository runs are capped at 4)",
+    )
     p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
-    p.add_argument("--retries", type=int, default=0, help="extra attempts for flaky-timing baseline suites")
+    p.add_argument(
+        "--retries", type=int, default=0,
+        help="extra attempts for flaky-timing baseline suites; full repository runs require at least 1",
+    )
     p.add_argument(
         "--retry-budget", type=int, default=None,
         help="total seconds the serial retry pass may spend (default: --timeout)",
@@ -1110,7 +1116,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=ISOLATION_PROFILES,
         default="isolated",
         help="Explicit single-profile override (used by Phase 5 narrow_verify commands). "
-        "Without this flag the per-suite profile is decided by tools/test-isolation.tsv.",
+        "Without this flag the per-suite profile is decided by tools/test-isolation.tsv. "
+        "ci-like is diagnostic-only, requires --select, and is not a local pre-CI gate.",
     )
     p.add_argument("--report-only", action="store_true")
     p.add_argument(
@@ -1142,6 +1149,37 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--base-report", type=Path)
     p.add_argument("--head-report", type=Path)
     return p
+
+
+def execution_policy_errors(args: argparse.Namespace, root: Path) -> list[str]:
+    """Reject expensive runner shapes that invalidate the measured policy.
+
+    Fixture repositories used by this module's own tests are intentionally not
+    treated as the Hearting full corpus.  The full-run requirements apply only
+    when the canonical repository root is selected without a narrowing glob.
+    """
+    if args.census:
+        return []
+    errors = []
+    if args.jobs < 1:
+        errors.append("--jobs must be positive")
+    if args.retries < 0:
+        errors.append("--retries must be non-negative")
+    if args.isolation == "ci-like" and not args.select:
+        errors.append(
+            "--isolation=ci-like is diagnostic-only and requires --select; "
+            "it is not a supported local pre-CI gate"
+        )
+    full_repository_run = root == ROOT.resolve() and not args.select
+    if full_repository_run:
+        if args.retries < 1:
+            errors.append("full repository runs require --retries 1 or greater")
+        if args.jobs > DEFAULT_JOBS:
+            errors.append(
+                f"full repository runs require --jobs <= {DEFAULT_JOBS}; "
+                "parallel owners share runner capacity"
+            )
+    return errors
 
 
 def cmd_census(suites: list[Path], root: Path) -> int:
@@ -1242,6 +1280,17 @@ def main(argv: list[str]) -> int:
         return 0
 
     root = args.root.resolve()
+    policy_errors = execution_policy_errors(args, root)
+    if policy_errors:
+        for error in policy_errors:
+            print(error, file=sys.stderr)
+        return 64
+    if args.isolation == "ci-like":
+        print(
+            "NOTICE: --isolation=ci-like is a selected-suite diagnostic profile, "
+            "not a supported local pre-CI gate.",
+            file=sys.stderr,
+        )
     suites = collect_suites(root)
 
     relpaths = [suite_relpath(root, s) for s in suites]
@@ -1337,9 +1386,6 @@ def main(argv: list[str]) -> int:
 
     # Retries are deliberately limited to baseline rows explicitly marked as
     # flaky-timing. Every attempt receives a fresh isolated environment.
-    if args.retries < 0:
-        print("--retries must be non-negative", file=sys.stderr)
-        return 64
     retry_budget_exhausted: set[str] = set()
     if args.retries:
         # The retry pass re-runs flaky suites serially after the main run, and

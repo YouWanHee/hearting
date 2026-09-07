@@ -43,12 +43,15 @@ set -u
 REPO_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 
 TMP=$(mktemp -d)
-ARTIFACT_SCRATCH=""
 cleanup() {
   rm -rf "$TMP"
-  if [ -n "$ARTIFACT_SCRATCH" ]; then rm -rf "$ARTIFACT_SCRATCH"; fi
 }
 trap cleanup EXIT
+
+# The installed code resolves back to the checkout, but fixture state must
+# never follow it into the operator's canonical artifact root (mega-audit,
+# 2026-09-07). Isolate runtime homes as well as terminal artifacts.
+eval "$(python3 "$REPO_ROOT/tools/install/fixture_env.py" shell "$TMP" "$REPO_ROOT")"
 
 fail() { printf 'FAIL - %s\n' "$1"; exit 1; }
 
@@ -77,15 +80,17 @@ mkdir -p "$TMP/jobs"
 JOBS="$TMP/jobs/jobs.log"
 : > "$JOBS"
 
-# --- real canonical artifact root scratch space (artifact-root.sh resolves to
-# the PRIMARY git worktree of this repo, not $TMP -- the terminal-envelope
-# artifact must live there to read as "readable"/in-root). Cleaned up in the
-# same trap as $TMP. -----------------------------------------------------
-REAL_ARTIFACT_ROOT=$(env -u AGENT_ARTIFACT_ROOT "$REPO_ROOT/utilities/artifact-root.sh" "$REPO_ROOT" 2>/dev/null)
+# --- real resolver with an explicit, fixture-owned canonical artifact root.
+# Envelope readers and the route share this root, preserving real in-root
+# validation without writing into the live checkout.
+REAL_ARTIFACT_ROOT=$("$REPO_ROOT/utilities/artifact-root.sh" "$REPO_ROOT" 2>/dev/null)
 if [ -z "$REAL_ARTIFACT_ROOT" ]; then
   fail "artifact-root.sh could not resolve a root for $REPO_ROOT"
 fi
-ARTIFACT_SCRATCH="$REAL_ARTIFACT_ROOT/tmp/sd110-installed-layout-$$"
+if [ "$REAL_ARTIFACT_ROOT" != "$TMP/artifacts" ]; then
+  fail "artifact-root.sh escaped the fixture: $REAL_ARTIFACT_ROOT"
+fi
+ARTIFACT_SCRATCH="$REAL_ARTIFACT_ROOT/sd110-installed-layout"
 mkdir -p "$ARTIFACT_SCRATCH"
 ARTIFACT_PATH="$ARTIFACT_SCRATCH/apply-artifact.md"
 printf '# fixture artifact\n' > "$ARTIFACT_PATH"
@@ -130,7 +135,7 @@ env -u AGENT_HOME -u CLAUDE_HOME HOME="$RUNENV_HOME" AGENT_DISPATCH_JOBS="$JOBS"
   python3 "$WORKTREE/utilities/capability-route.py" compile \
   --slug stage-advance-fixture \
   --capability autopilot-apply --capability-mode default --intensity standard \
-  --cwd "$WORKTREE" --artifact-root "$TMP/route-artifact-root" \
+  --cwd "$WORKTREE" --artifact-root "$REAL_ARTIFACT_ROOT" \
   --tracking tracked --spec-read true --drift-verdict within-spec \
   --workflow-mode tracked --artifact-guard true \
   --dispatch-evidence "$DISPATCH_EVIDENCE" \

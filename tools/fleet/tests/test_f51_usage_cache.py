@@ -100,15 +100,38 @@ class F51UsageCacheTest(unittest.TestCase):
 
     def test_eight_concurrent_refresh_requests_have_one_fetch(self):
         calls = []
-        usage_cache.FETCHERS["claude"] = lambda: (calls.append(1) or {"rl_5h": 9})
-        threads = [threading.Thread(target=usage_cache.request_refresh, args=("claude", 1000))
-                   for _ in range(8)]
-        for thread in threads: thread.start()
-        for thread in threads: thread.join()
+        fetch_started = threading.Event()
+        release_fetch = threading.Event()
+        results = []
+
+        def fetch():
+            calls.append(1)
+            fetch_started.set()
+            if not release_fetch.wait(timeout=5):
+                raise RuntimeError("concurrency fixture did not release fetch")
+            return {"rl_5h": 9}
+
+        usage_cache.FETCHERS["claude"] = fetch
+        threads = [
+            threading.Thread(
+                target=lambda: results.append(usage_cache.request_refresh("claude"))
+            )
+            for _ in range(8)
+        ]
+        try:
+            for thread in threads:
+                thread.start()
+            self.assertTrue(fetch_started.wait(timeout=5), "refresh worker did not start")
+            for thread in threads:
+                thread.join(timeout=5)
+                self.assertFalse(thread.is_alive(), "request thread did not finish")
+        finally:
+            release_fetch.set()
         worker = usage_cache._THREADS.get("claude")
         if worker is not None:
             worker.join(timeout=5)
             self.assertFalse(worker.is_alive(), "worker thread did not finish within timeout")
+        self.assertEqual(results.count(True), 1)
         self.assertEqual(len(calls), 1)
         self.assertEqual(len([x for x in os.listdir(self.tmp.name) if x.startswith(".claude.lease")]), 0)
 

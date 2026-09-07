@@ -20,6 +20,33 @@ fails=0
 ok()  { printf 'ok   - %s\n' "$1"; }
 bad() { printf 'FAIL - %s\n' "$1"; fails=$((fails + 1)); }
 
+# Argument parsing must finish before any generated output is opened. Content
+# hashes cannot detect a same-content rewrite, so assert the nanosecond mtime.
+manifest_mtime() {
+  python3 -c 'import os, sys; print(os.stat(sys.argv[1]).st_mtime_ns)' manifest.json
+}
+before_manifest_mtime=$(manifest_mtime)
+help_out=$(python3 "$BM" --help 2>&1); help_rc=$?
+after_help_mtime=$(manifest_mtime)
+if [ "$help_rc" -eq 0 ] \
+  && printf '%s' "$help_out" | grep -q '^usage:' \
+  && [ "$before_manifest_mtime" = "$after_help_mtime" ]; then
+  ok "build-manifest --help is read-only"
+else
+  bad "build-manifest --help must print usage without writing manifest.json"
+fi
+
+before_unknown_mtime=$(manifest_mtime)
+unknown_out=$(python3 "$BM" --definitely-unknown 2>&1); unknown_rc=$?
+after_unknown_mtime=$(manifest_mtime)
+if [ "$unknown_rc" -ne 0 ] \
+  && printf '%s' "$unknown_out" | grep -q 'unrecognized arguments' \
+  && [ "$before_unknown_mtime" = "$after_unknown_mtime" ]; then
+  ok "build-manifest rejects unknown options before writes"
+else
+  bad "build-manifest unknown option must fail before writing manifest.json"
+fi
+
 TMP=$(mktemp -d)
 CREATED=""      # 정리할 임시 생성 파일들
 # 변형 전 baseline: 미커밋 Phase 2 편집·untracked 파일은 정상이므로 기준선에 포함해 비교한다.
