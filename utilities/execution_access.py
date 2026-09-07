@@ -25,6 +25,7 @@ MAX_ROOTS = 16
 MAX_PATH_LENGTH = 4096
 MAX_HOSTS = 32
 MAX_TEXT_LENGTH = 500
+MAX_JSON_DEPTH = 64
 
 _TOP_LEVEL_FIELDS = frozenset(
     {
@@ -167,11 +168,42 @@ def _pairs_no_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return result
 
 
+def _json_depth_is_bounded(raw: bytes) -> bool:
+    depth = 0
+    in_string = False
+    escaped = False
+    for byte in raw:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif byte == ord("\\"):
+                escaped = True
+            elif byte == ord('"'):
+                in_string = False
+            continue
+        if byte == ord('"'):
+            in_string = True
+        elif byte in (ord("["), ord("{")):
+            depth += 1
+            if depth > MAX_JSON_DEPTH:
+                return False
+        elif byte in (ord("]"), ord("}")):
+            depth = max(0, depth - 1)
+    return True
+
+
 def _read_request(path: Path) -> object:
     descriptor: int | None = None
     try:
         before = path.lstat()
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode):
+            raise OSError("request must be a non-symlink regular file")
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
         descriptor = os.open(path, flags)
         info = os.fstat(descriptor)
         if (
@@ -193,18 +225,26 @@ def _read_request(path: Path) -> object:
         raw = b"".join(chunks)
         if len(raw) > MAX_REQUEST_BYTES:
             raise OSError(f"request exceeds {MAX_REQUEST_BYTES} bytes")
-    except OSError as exc:
+    except (OSError, RuntimeError, ValueError) as exc:
         raise ExecutionAccessError(
             "execution-access-unreadable", f"request file is not safely readable: {exc}"
         ) from exc
     finally:
         if descriptor is not None:
-            os.close(descriptor)
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+    if not _json_depth_is_bounded(raw):
+        raise ExecutionAccessError(
+            "execution-access-invalid-json",
+            f"request JSON exceeds maximum nesting depth {MAX_JSON_DEPTH}",
+        )
     try:
         return json.loads(raw.decode("utf-8"), object_pairs_hook=_pairs_no_duplicates)
     except ExecutionAccessError:
         raise
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
         raise ExecutionAccessError(
             "execution-access-invalid-json", "request file is not valid UTF-8 JSON"
         ) from exc
@@ -290,7 +330,14 @@ def _resolve_paths(raw: list[Path]) -> list[tuple[Path, Path]]:
         # and broad-root checks.  ``strict=False`` deliberately catches links
         # through existing prefixes while permitting an exact future leaf.
         _validate_path_text(str(literal))
-        resolved = literal.resolve(strict=False)
+        try:
+            resolved = literal.resolve(strict=False)
+        except (OSError, RuntimeError, ValueError) as exc:
+            _reject(
+                "execution-access-path-invalid",
+                literal,
+                f"path cannot be resolved safely: {type(exc).__name__}",
+            )
         _validate_path_text(str(resolved))
         resolved_by_literal.append((literal, resolved))
 
@@ -330,7 +377,7 @@ def _normalize_host(value: object) -> str:
     if any(ord(ch) < 33 or ord(ch) == 127 for ch in value) or "," in value or "=" in value:
         _field_error("network.hosts", "host contains an unsafe delimiter")
     host = value
-    port = ""
+    port_text: str | None = None
     if value.startswith("["):
         match = re.fullmatch(r"\[([0-9A-Fa-f:]+)\](?::([0-9]{1,5}))?", value)
         if not match:
@@ -339,11 +386,10 @@ def _normalize_host(value: object) -> str:
             host = f"[{ipaddress.IPv6Address(match.group(1)).compressed}]"
         except ipaddress.AddressValueError:
             _field_error("network.hosts", "invalid bracketed IPv6 host")
-        port = match.group(2) or ""
+        port_text = match.group(2)
     elif value.count(":") <= 1:
-        host, separator, port = value.partition(":")
-        if not separator:
-            port = ""
+        host, separator, candidate_port = value.partition(":")
+        port_text = candidate_port if separator else None
         dotted = re.fullmatch(r"[0-9]{1,3}(?:\.[0-9]{1,3}){3}", host)
         if dotted:
             try:
@@ -355,9 +401,15 @@ def _normalize_host(value: object) -> str:
         host = host.lower().rstrip(".")
     else:
         _field_error("network.hosts", "IPv6 hosts must be bracketed")
-    if port and not (1 <= int(port) <= 65535):
-        _field_error("network.hosts", "invalid port")
-    return host + (f":{port}" if port else "")
+    canonical_port = ""
+    if port_text is not None:
+        if not re.fullmatch(r"[0-9]{1,5}", port_text):
+            _field_error("network.hosts", "port must use ASCII decimal digits")
+        port_number = int(port_text, 10)
+        if not 1 <= port_number <= 65535:
+            _field_error("network.hosts", "invalid port")
+        canonical_port = str(port_number)
+    return host + (f":{canonical_port}" if canonical_port else "")
 
 
 def load_request(path: str | Path, *, context: AccessContext) -> ExecutionAccessRequest:
@@ -446,7 +498,14 @@ def load_request(path: str | Path, *, context: AccessContext) -> ExecutionAccess
     declared = set(writable) | set(read)
     justification: dict[str, str] = {}
     for raw_path, text in justification_raw:
-        resolved = raw_path.resolve(strict=False)
+        try:
+            resolved = raw_path.resolve(strict=False)
+        except (OSError, RuntimeError, ValueError) as exc:
+            _reject(
+                "execution-access-path-invalid",
+                raw_path,
+                f"justification path cannot be resolved safely: {type(exc).__name__}",
+            )
         if resolved not in declared:
             _field_error("justification", "justification key is not a declared root")
         justification[str(resolved)] = text
@@ -462,6 +521,13 @@ def load_request(path: str | Path, *, context: AccessContext) -> ExecutionAccess
     digest = hashlib.sha256(
         json.dumps(normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     ).hexdigest()
+    try:
+        source_path = source.resolve(strict=False)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ExecutionAccessError(
+            "execution-access-unreadable",
+            f"request path cannot be resolved safely: {type(exc).__name__}",
+        ) from exc
     return ExecutionAccessRequest(
         writable_roots=writable,
         read_roots=read,
@@ -471,7 +537,7 @@ def load_request(path: str | Path, *, context: AccessContext) -> ExecutionAccess
         enforcement_required=enforcement,
         justification=tuple(sorted(justification.items())),
         request_sha256=digest,
-        source_path=source.resolve(strict=False),
+        source_path=source_path,
     )
 
 
@@ -544,6 +610,16 @@ def build_grant(
         file_grade = network_grade = "none"
 
     unmet: list[str] = []
+    if request.writable_roots and runtime.startswith("codex") and file_grade == "none":
+        sandbox_subject = (
+            "codex-read-only"
+            if effective_sandbox == "read-only"
+            else "codex-file-sandbox"
+        )
+        raise ExecutionAccessError(
+            f"execution-access-enforcement-unavailable:{sandbox_subject}",
+            "the effective Codex sandbox cannot project requested writable roots",
+        )
     if request.read_roots:
         unmet.append("read-roots-unprojected")
     if request.writable_roots and file_grade == "none":
@@ -557,6 +633,11 @@ def build_grant(
                     "network is outside the current Codex launch policy; change the top-level launch request/role",
                 )
             if request.network_hosts:
+                if request.enforcement_required == "os-sandbox":
+                    raise ExecutionAccessError(
+                        "execution-access-enforcement-unavailable:codex-network-hosts",
+                        "Codex boolean network access cannot enforce the requested host allowlist",
+                    )
                 network = "granted-unenforced"
                 unmet.append("network-hosts-unenforced")
             else:

@@ -6,10 +6,12 @@ from __future__ import annotations
 import argparse
 import errno as errno_module
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import socket
 import sys
+import time
 import uuid
 from typing import Iterable, Mapping
 
@@ -30,6 +32,31 @@ CLASSIFICATIONS = frozenset(
 
 _TCP_ERRNOS = {"ECONNREFUSED", "ETIMEDOUT", "EPERM", "ENETUNREACH", "EHOSTUNREACH"}
 _AUTH_STATUSES = {401, 403}
+_PHASES = {"connect", "dns", "file", "filesystem", "network", "read", "tcp", "write"}
+_ERRNO_NAMES = frozenset(errno_module.errorcode.values())
+_EAI_NAMES = frozenset(
+    name
+    for name, value in vars(socket).items()
+    if name.startswith("EAI_") and isinstance(value, int)
+)
+_EAI_BY_CODE = {
+    getattr(socket, name): name
+    for name in (
+        "EAI_NONAME",
+        "EAI_AGAIN",
+        "EAI_FAIL",
+        "EAI_FAMILY",
+        "EAI_SOCKTYPE",
+        "EAI_SERVICE",
+        "EAI_MEMORY",
+        "EAI_SYSTEM",
+        "EAI_OVERFLOW",
+        "EAI_BADFLAGS",
+        "EAI_ADDRFAMILY",
+        "EAI_NODATA",
+    )
+    if hasattr(socket, name)
+}
 _ONE_CHANGE = {
     "launcher-runtime-state-unwritable": "Make the launcher's exact private state directory writable at the parent launch boundary.",
     "mount-read-only": "Change the mount or outer sandbox grant for the exact failed path.",
@@ -52,16 +79,67 @@ def _within(path: Path, root: Path) -> bool:
     try:
         path.resolve(strict=False).relative_to(root.resolve(strict=False))
         return True
-    except ValueError:
+    except (OSError, RuntimeError, ValueError):
         return False
 
 
 def _errno_name(value: object) -> str:
-    if isinstance(value, int):
+    if type(value) is int:
         return errno_module.errorcode.get(value, str(value))
     if isinstance(value, str):
-        return value.upper()
+        candidate = value.upper()
+        if candidate in _ERRNO_NAMES or candidate in _EAI_NAMES:
+            return candidate
     return ""
+
+
+def _phase_name(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    candidate = value.lower()
+    return candidate if candidate in _PHASES else ""
+
+
+def _evidence_path(value: object) -> Path | None:
+    if (
+        not isinstance(value, str)
+        or not value.startswith("/")
+        or len(value) > 4096
+        or any(ord(char) < 32 or ord(char) == 127 for char in value)
+    ):
+        return None
+    return Path(value)
+
+
+def _validate_evidence_types(evidence: Mapping[str, object]) -> None:
+    integer_fields = ("exit_code", "http_status")
+    boolean_fields = (
+        "dns_failed",
+        "mount_writable",
+        "network_all_hosts_failed",
+        "read_succeeded",
+        "remote_auth_rejected",
+        "sandbox_network_enabled",
+        "write_failed",
+    )
+    for field in integer_fields:
+        value = evidence.get(field)
+        if field in evidence and value is not None and type(value) is not int:
+            raise DiagnosisError("diagnosis-evidence-insufficient")
+    for field in boolean_fields:
+        value = evidence.get(field)
+        if field in evidence and value is not None and type(value) is not bool:
+            raise DiagnosisError("diagnosis-evidence-insufficient")
+    if "errno" in evidence and evidence.get("errno") is not None:
+        if not _errno_name(evidence.get("errno")):
+            raise DiagnosisError("diagnosis-evidence-insufficient")
+    if "phase" in evidence and evidence.get("phase") is not None:
+        if not _phase_name(evidence.get("phase")):
+            raise DiagnosisError("diagnosis-evidence-insufficient")
+    for field in ("home", "path"):
+        value = evidence.get(field)
+        if field in evidence and value is not None and _evidence_path(value) is None:
+            raise DiagnosisError("diagnosis-evidence-insufficient")
 
 
 def diagnose(
@@ -69,14 +147,18 @@ def diagnose(
 ) -> dict[str, object]:
     """Classify prepared evidence without performing a probe or echoing errors."""
 
-    path_value = evidence.get("path")
-    path = Path(path_value) if isinstance(path_value, str) and path_value.startswith("/") else None
+    if not isinstance(evidence, Mapping):
+        raise DiagnosisError("diagnosis-evidence-insufficient")
+    _validate_evidence_types(evidence)
+    path = _evidence_path(evidence.get("path"))
     private_roots = [Path(root) for root in launcher_state_roots]
     home = evidence.get("home")
     if isinstance(home, str) and home.startswith("/"):
         private_roots.append(Path(home) / ".codex" / ".harness")
     err = _errno_name(evidence.get("errno"))
-    phase = str(evidence.get("phase") or "").lower()
+    phase = _phase_name(evidence.get("phase"))
+    status_value = evidence.get("http_status")
+    status = status_value if type(status_value) is int else None
     state_write_failed = (
         phase in {"write", "file", "filesystem"}
         and (err in {"EROFS", "EACCES", "EPERM"} or evidence.get("write_failed") is True)
@@ -88,7 +170,6 @@ def diagnose(
     ):
         classification = "launcher-runtime-state-unwritable"
     else:
-        status = evidence.get("http_status")
         if status in _AUTH_STATUSES or evidence.get("remote_auth_rejected") is True:
             classification = "remote-auth-rejected"
         elif (
@@ -123,14 +204,10 @@ def diagnose(
         "evidence": {
             "errno": _errno_name(evidence.get("errno")) or None,
             "exit_code": evidence.get("exit_code")
-            if isinstance(evidence.get("exit_code"), int)
+            if type(evidence.get("exit_code")) is int
             else None,
-            "http_status": evidence.get("http_status")
-            if evidence.get("http_status") in _AUTH_STATUSES
-            else None,
-            "phase": str(evidence.get("phase"))[:32]
-            if isinstance(evidence.get("phase"), str)
-            else None,
+            "http_status": status if status in _AUTH_STATUSES else None,
+            "phase": phase or None,
             "path": str(path) if path is not None else None,
         },
         "one_change": _ONE_CHANGE[classification],
@@ -190,45 +267,177 @@ def _request(args: argparse.Namespace):
     return load_request(args.request_file, context=context)
 
 
+def _mount_writable(root: Path) -> bool | None:
+    try:
+        flags = os.statvfs(root).f_flag
+    except OSError:
+        return None
+    return not bool(flags & getattr(os, "ST_RDONLY", 1))
+
+
 def _probe_write(root: Path) -> dict[str, object]:
     probe = root / f".execution-access-probe-{uuid.uuid4().hex}"
     descriptor: int | None = None
     created = False
+    result: dict[str, object]
     try:
         descriptor = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         created = True
-        return {"kind": "write", "target": str(root), "result": "ok"}
+        result = {"kind": "write", "target": str(root), "result": "ok"}
     except OSError as exc:
-        return {
+        result = {
             "kind": "write",
             "target": str(root),
             "result": "failed",
             "errno": errno_module.errorcode.get(exc.errno or 0, "UNKNOWN"),
+            "mount_writable": _mount_writable(root),
         }
     finally:
         if descriptor is not None:
-            os.close(descriptor)
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
         if created:
             try:
                 probe.unlink(missing_ok=True)
-            except OSError:
-                pass
+            except OSError as exc:
+                result = {
+                    "kind": "write",
+                    "target": str(root),
+                    "result": "cleanup-failed",
+                    "errno": errno_module.errorcode.get(exc.errno or 0, "UNKNOWN"),
+                    "residual_path": str(probe),
+                }
+    return result
+
+
+def _socket_error_name(exc: OSError) -> str:
+    if isinstance(exc, socket.gaierror):
+        return _EAI_BY_CODE.get(exc.errno, "EAI_UNKNOWN")
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return "ETIMEDOUT"
+    return errno_module.errorcode.get(exc.errno or 0, "UNKNOWN")
+
+
+def _connect_probe_worker(sender: object, host: str, port: int, timeout: float) -> None:
+    """Resolve and connect inside one killable process and one elapsed deadline."""
+
+    deadline = time.monotonic() + timeout
+    result: dict[str, object] = {"result": "failed", "errno": "ETIMEDOUT"}
+    try:
+        addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        last_error = "EHOSTUNREACH"
+        for family, socktype, protocol, _canonical, address in addresses:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                last_error = "ETIMEDOUT"
+                break
+            connection = socket.socket(family, socktype, protocol)
+            try:
+                connection.settimeout(remaining)
+                connection.connect(address)
+                result = {"result": "ok"}
+                break
+            except OSError as exc:
+                last_error = _socket_error_name(exc)
+            finally:
+                connection.close()
+        else:
+            result = {"result": "failed", "errno": last_error}
+        if result.get("result") != "ok":
+            result = {"result": "failed", "errno": last_error}
+    except OSError as exc:
+        result = {"result": "failed", "errno": _socket_error_name(exc)}
+    except Exception:
+        result = {"result": "failed", "errno": "PROBE_INTERNAL"}
+    try:
+        sender.send(result)  # type: ignore[attr-defined]
+    except (BrokenPipeError, EOFError, OSError):
+        pass
+    finally:
+        sender.close()  # type: ignore[attr-defined]
+
+
+def _stop_probe_process(process: multiprocessing.Process) -> None:
+    if not process.is_alive():
+        process.join()
+        return
+    if hasattr(process, "kill"):
+        process.kill()
+    else:  # pragma: no cover - supported POSIX runtimes expose kill
+        process.terminate()
+    process.join()
 
 
 def _probe_connect(target: str, timeout: float) -> dict[str, object]:
     host, separator, port_text = target.rpartition(":")
-    if not separator or not host or not port_text.isdigit():
+    if (
+        not separator
+        or not host
+        or not port_text.isascii()
+        or not port_text.isdecimal()
+    ):
         raise DiagnosisError("probe-target-invalid", "connect target must be host:port")
+    port = int(port_text, 10)
+    if not 1 <= port <= 65535:
+        raise DiagnosisError("probe-target-invalid", "connect port is outside 1..65535")
     try:
-        with socket.create_connection((host.strip("[]"), int(port_text)), timeout=timeout):
-            return {"kind": "connect", "target": target, "result": "ok"}
-    except OSError as exc:
-        return {
-            "kind": "connect",
-            "target": target,
-            "result": "failed",
-            "errno": errno_module.errorcode.get(exc.errno or 0, "UNKNOWN"),
-        }
+        context = multiprocessing.get_context("fork")
+    except ValueError as exc:
+        raise DiagnosisError(
+            "probe-isolation-unavailable",
+            "bounded resolver isolation is unavailable on this runtime",
+        ) from exc
+    receiver, sender = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_connect_probe_worker,
+        args=(sender, host.strip("[]"), port, timeout),
+    )
+    process.daemon = True
+    deadline = time.monotonic() + timeout
+    try:
+        process.start()
+        sender.close()
+        remaining = max(0.0, deadline - time.monotonic())
+        if not receiver.poll(remaining):
+            _stop_probe_process(process)
+            return {
+                "kind": "connect",
+                "target": target,
+                "result": "failed",
+                "errno": "ETIMEDOUT",
+            }
+        try:
+            worker_result = receiver.recv()
+        except EOFError:
+            worker_result = {"result": "failed", "errno": "PROBE_INTERNAL"}
+        _stop_probe_process(process)
+    except (OSError, RuntimeError) as exc:
+        if process.pid is not None:
+            _stop_probe_process(process)
+        raise DiagnosisError(
+            "probe-isolation-unavailable",
+            f"bounded resolver process failed: {type(exc).__name__}",
+        ) from exc
+    finally:
+        receiver.close()
+        try:
+            sender.close()
+        except OSError:
+            pass
+    if not isinstance(worker_result, dict):
+        worker_result = {"result": "failed", "errno": "PROBE_INTERNAL"}
+    return {
+        "kind": "connect",
+        "target": target,
+        "result": "ok" if worker_result.get("result") == "ok" else "failed",
+        **(
+            {}
+            if worker_result.get("result") == "ok"
+            else {"errno": _errno_name(worker_result.get("errno")) or "UNKNOWN"}
+        ),
+    }
 
 
 def parser() -> argparse.ArgumentParser:
@@ -271,6 +480,25 @@ def main(argv: list[str] | None = None) -> int:
                     raise DiagnosisError("probe-host-outside-declared-hosts")
                 probes.append(_probe_connect(args.probe_connect, args.probe_timeout))
 
+        cleanup_failure = next(
+            (item for item in probes if item.get("result") == "cleanup-failed"),
+            None,
+        )
+        if cleanup_failure is not None:
+            print(
+                json.dumps(
+                    {
+                        "reason": "probe-cleanup-failed",
+                        "residual_path": cleanup_failure.get("residual_path"),
+                        "probes": probes,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                file=sys.stderr,
+            )
+            return 64
+
         if args.evidence_file:
             evidence = json.loads(args.evidence_file.read_text(encoding="utf-8"))
             if not isinstance(evidence, dict):
@@ -286,7 +514,8 @@ def main(argv: list[str] | None = None) -> int:
                 "errno": failed.get("errno"),
                 "phase": "write" if failed["kind"] == "write" else "connect",
                 "path": failed.get("target") if failed["kind"] == "write" else None,
-                "mount_writable": True,
+                "write_failed": failed["kind"] == "write",
+                "mount_writable": failed.get("mount_writable"),
             }
         else:
             raise DiagnosisError("diagnosis-evidence-insufficient")
@@ -298,7 +527,7 @@ def main(argv: list[str] | None = None) -> int:
     except ExecutionAccessError as exc:
         print(json.dumps({"reason": exc.reason}), file=sys.stderr)
         return 64
-    except (DiagnosisError, OSError, json.JSONDecodeError) as exc:
+    except (DiagnosisError, OSError, json.JSONDecodeError, RecursionError) as exc:
         reason = exc.reason if isinstance(exc, DiagnosisError) else "diagnosis-evidence-insufficient"
         print(json.dumps({"reason": reason}), file=sys.stderr)
         return 64 if reason.startswith("probe-") else 65

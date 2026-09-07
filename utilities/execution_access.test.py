@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from execution_access import (
     AccessContext,
@@ -84,6 +85,58 @@ class ExecutionAccessTest(unittest.TestCase):
         self.assertEqual(first.request_sha256, second.request_sha256)
         self.assertEqual(64, len(first.request_sha256))
 
+    def test_host_ports_are_typed_and_hash_canonical(self) -> None:
+        first = self.request(
+            read_roots=[],
+            network={
+                "required": True,
+                "reason": "bounded connect",
+                "hosts": ["CNN.example:00022", "[2001:0DB8::1]:00443"],
+            },
+            justification={},
+        )
+        second = self.request(
+            read_roots=[],
+            network={
+                "required": True,
+                "reason": "bounded connect",
+                "hosts": ["cnn.example:22", "[2001:db8::1]:443"],
+            },
+            justification={},
+        )
+        self.assertEqual(
+            ("[2001:db8::1]:443", "cnn.example:22"), first.network_hosts
+        )
+        self.assertEqual(first.request_sha256, second.request_sha256)
+
+        for host in (
+            "cnn.example:ssh",
+            "cnn.example:",
+            "cnn.example:+22",
+            "cnn.example:-22",
+            "cnn.example:０２２",
+            "cnn.example:0",
+            "cnn.example:65536",
+            ":22",
+            "[2001:db8::1]:",
+            "[2001:db8::1]:ssh",
+        ):
+            with self.subTest(host=host):
+                with self.assertRaises(ExecutionAccessError) as raised:
+                    self.request(
+                        read_roots=[],
+                        network={
+                            "required": True,
+                            "reason": "bounded connect",
+                            "hosts": [host],
+                        },
+                        justification={},
+                    )
+                self.assertEqual(
+                    "execution-access-field-invalid:network.hosts",
+                    raised.exception.reason,
+                )
+
     def test_schema_and_fields_are_strict(self) -> None:
         self.assert_reason("execution-access-schema-unsupported:v2", schema_version=2)
         self.assert_reason(
@@ -121,6 +174,60 @@ class ExecutionAccessTest(unittest.TestCase):
         with self.assertRaises(ExecutionAccessError) as raised:
             load_request(self.request_file, context=self.context)
         self.assertEqual("execution-access-unreadable", raised.exception.reason)
+
+    def test_special_request_file_is_rejected_before_nonblocking_open(self) -> None:
+        fifo = self.root / "request.fifo"
+        os.mkfifo(fifo)
+        with mock.patch("execution_access.os.open") as opened:
+            with self.assertRaises(ExecutionAccessError) as raised:
+                load_request(fifo, context=self.context)
+        self.assertEqual("execution-access-unreadable", raised.exception.reason)
+        opened.assert_not_called()
+
+        with self.assertRaises(ExecutionAccessError) as raised:
+            load_request(Path(str(self.root / "request") + "\0.json"), context=self.context)
+        self.assertEqual("execution-access-unreadable", raised.exception.reason)
+
+        self.request(read_roots=[], justification={})
+        real_open = os.open
+        with mock.patch("execution_access.os.open", wraps=real_open) as opened:
+            load_request(self.request_file, context=self.context)
+        request_open = next(
+            call for call in opened.call_args_list if Path(call.args[0]) == self.request_file
+        )
+        self.assertTrue(request_open.args[1] & getattr(os, "O_NONBLOCK", 0))
+
+    def test_resolve_failures_and_deep_json_are_typed(self) -> None:
+        loop_a = self.root / "loop-a"
+        loop_b = self.root / "loop-b"
+        loop_a.symlink_to(loop_b)
+        loop_b.symlink_to(loop_a)
+        with self.assertRaises(ExecutionAccessError) as raised:
+            self.request(writable_roots=[str(loop_a)], read_roots=[], justification={})
+        self.assertTrue(
+            raised.exception.reason.startswith("execution-access-path-invalid:")
+        )
+
+        valid = {
+            "schema_version": 1,
+            "writable_roots": [str(self.root / "scoped")],
+            "read_roots": [],
+            "network": {"required": False, "reason": "", "hosts": []},
+            "enforcement_required": "any",
+            "justification": {},
+        }
+        self.request_file.write_text(json.dumps(valid), encoding="utf-8")
+        with mock.patch.object(Path, "resolve", side_effect=OSError("resolver failed")):
+            with self.assertRaises(ExecutionAccessError) as raised:
+                load_request(self.request_file, context=self.context)
+        self.assertTrue(
+            raised.exception.reason.startswith("execution-access-path-invalid:")
+        )
+
+        self.request_file.write_text("[" * 2000 + "0" + "]" * 2000, encoding="utf-8")
+        with self.assertRaises(ExecutionAccessError) as raised:
+            load_request(self.request_file, context=self.context)
+        self.assertEqual("execution-access-invalid-json", raised.exception.reason)
 
     def test_request_surface_cli_wins_and_environment_is_fallback(self) -> None:
         cli = self.root / "cli.json"
@@ -330,6 +437,40 @@ class ExecutionAccessTest(unittest.TestCase):
             build_grant(os_required, runtime="opencode")
         self.assertEqual(
             "execution-access-enforcement-unavailable:opencode",
+            raised.exception.reason,
+        )
+
+    def test_codex_unprojectable_writes_and_strict_hosts_are_refused(self) -> None:
+        writable = self.request(read_roots=[], justification={})
+        with self.assertRaises(ExecutionAccessError) as raised:
+            build_grant(
+                writable,
+                runtime="codex-exec",
+                effective_sandbox="read-only",
+            )
+        self.assertEqual(
+            "execution-access-enforcement-unavailable:codex-read-only",
+            raised.exception.reason,
+        )
+
+        strict_hosts = self.request(
+            read_roots=[],
+            network={
+                "required": True,
+                "reason": "strict destination",
+                "hosts": ["example.com:443"],
+            },
+            enforcement_required="os-sandbox",
+            justification={},
+        )
+        with self.assertRaises(ExecutionAccessError) as raised:
+            build_grant(
+                strict_hosts,
+                runtime="codex-app-server",
+                network_available=True,
+            )
+        self.assertEqual(
+            "execution-access-enforcement-unavailable:codex-network-hosts",
             raised.exception.reason,
         )
 

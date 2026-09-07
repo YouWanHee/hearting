@@ -889,8 +889,10 @@ one-shot `codex exec` builder emits them as repeated `--add-dir`; the App Server
 supervisor builder emits repeated `--writable-root`. Existing grants and the
 standard+ owner network predicate are unchanged when the option is absent.
 Codex network access is a boolean OS-sandbox grant, not host allowlist
-enforcement, so a request with `network.hosts` is recorded as
-`granted-unenforced`. A child request with no proven parent grant and any
-request the current role cannot enforce fail before registration/model spawn.
+enforcement, so an `enforcement_required=any` request with `network.hosts` is
+recorded as `granted-unenforced`; `os-sandbox` host enforcement is refused.
+A writable-root request under an effective non-writable Codex sandbox, a child
+request with no proven parent grant, and any request the current role cannot
+enforce fail before registration/model spawn.
 Owner-to-worker propagation and continuation hash binding remain a separate
 unimplemented slice.

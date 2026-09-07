@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import errno
 import io
 import json
 import os
 from pathlib import Path
 import socket
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -101,6 +103,38 @@ class ExecutionAccessDiagnoseTest(unittest.TestCase):
                 }
             )
 
+    def test_malformed_evidence_is_typed_and_never_echoed(self) -> None:
+        malformed = {
+            "http_status": ["Bearer secret-token"],
+            "errno": "EROFS",
+            "phase": "write",
+        }
+        with self.assertRaises(diagnose_module.DiagnosisError) as raised:
+            diagnose_module.diagnose(malformed)
+        self.assertEqual("diagnosis-evidence-insufficient", raised.exception.reason)
+
+        evidence = self.root / "malformed-evidence.json"
+        evidence.write_text(json.dumps(malformed), encoding="utf-8")
+        stderr = io.StringIO()
+        with mock.patch("sys.stderr", stderr):
+            rc = diagnose_module.main(["--evidence-file", str(evidence)])
+        self.assertEqual(65, rc)
+        self.assertEqual(
+            {"reason": "diagnosis-evidence-insufficient"},
+            json.loads(stderr.getvalue()),
+        )
+        self.assertNotIn("secret-token", stderr.getvalue())
+
+        for field, value in (
+            ("errno", {"credential": "password=hunter2"}),
+            ("phase", ["connect"]),
+            ("path", ["/tmp/value"]),
+            ("mount_writable", "yes"),
+        ):
+            with self.subTest(field=field):
+                with self.assertRaises(diagnose_module.DiagnosisError):
+                    diagnose_module.diagnose({field: value})
+
     def test_default_cli_creates_no_file_or_socket_and_redacts_raw_error(self) -> None:
         evidence = self.root / "evidence.json"
         evidence.write_text(
@@ -116,8 +150,10 @@ class ExecutionAccessDiagnoseTest(unittest.TestCase):
         before = sorted(str(path.relative_to(self.root)) for path in self.root.rglob("*"))
         stdout = io.StringIO()
         with mock.patch("os.open", side_effect=AssertionError("write probe called")), mock.patch(
-            "socket.create_connection", side_effect=AssertionError("network probe called")
-        ), mock.patch("sys.stdout", stdout):
+            "socket.getaddrinfo", side_effect=AssertionError("network probe called")
+        ), mock.patch("socket.socket", side_effect=AssertionError("network probe called")), mock.patch(
+            "sys.stdout", stdout
+        ):
             rc = diagnose_module.main(["--evidence-file", str(evidence)])
         after = sorted(str(path.relative_to(self.root)) for path in self.root.rglob("*"))
         self.assertEqual(0, rc)
@@ -229,15 +265,84 @@ class ExecutionAccessDiagnoseTest(unittest.TestCase):
         self.assertEqual(0, rc)
         self.assertEqual([], list(descendant.iterdir()))
 
+    def test_write_probe_uses_statvfs_or_unknown_after_failure(self) -> None:
+        writable = self.root / "scoped" / "write"
+        writable.mkdir(parents=True)
+        statvfs = os.statvfs(writable)
+        writable_stat = mock.Mock(f_flag=statvfs.f_flag & ~getattr(os, "ST_RDONLY", 1))
+        with mock.patch(
+            "execution_access_diagnose.os.open",
+            side_effect=PermissionError(errno.EACCES, "secret credential"),
+        ), mock.patch("execution_access_diagnose.os.statvfs", return_value=writable_stat):
+            result = diagnose_module._probe_write(writable)
+        self.assertEqual("failed", result["result"])
+        self.assertIs(True, result["mount_writable"])
+        self.assertNotIn("secret", json.dumps(result))
+
+        with mock.patch(
+            "execution_access_diagnose.os.open",
+            side_effect=PermissionError(errno.EACCES, "secret credential"),
+        ), mock.patch(
+            "execution_access_diagnose.os.statvfs",
+            side_effect=OSError(errno.EIO, "unavailable"),
+        ):
+            result = diagnose_module._probe_write(writable)
+        self.assertIsNone(result["mount_writable"])
+
+    def test_write_probe_cleanup_failure_reports_exact_residual(self) -> None:
+        writable = self.root / "scoped" / "write"
+        writable.mkdir(parents=True)
+        with mock.patch.object(
+            Path,
+            "unlink",
+            side_effect=PermissionError(errno.EACCES, "cleanup blocked"),
+        ):
+            result = diagnose_module._probe_write(writable)
+        self.assertEqual("cleanup-failed", result["result"])
+        residual = Path(str(result["residual_path"]))
+        self.assertEqual(writable, residual.parent)
+        self.assertTrue(residual.exists())
+        residual.unlink()
+
+        request = self.request_file(writable)
+        residual = writable / ".execution-access-probe-fixed"
+        stderr = io.StringIO()
+        with mock.patch(
+            "execution_access_diagnose._probe_write",
+            return_value={
+                "kind": "write",
+                "target": str(writable),
+                "result": "cleanup-failed",
+                "errno": "EACCES",
+                "residual_path": str(residual),
+            },
+        ), mock.patch("sys.stderr", stderr):
+            rc = diagnose_module.main(
+                [
+                    "--request-file",
+                    str(request),
+                    "--allow-probe",
+                    "--probe-write",
+                    str(writable),
+                    *self.context_args(),
+                ]
+            )
+        self.assertEqual(64, rc)
+        rendered = json.loads(stderr.getvalue())
+        self.assertEqual("probe-cleanup-failed", rendered["reason"])
+        self.assertEqual(str(residual), rendered["residual_path"])
+
     def test_connect_probe_is_bounded_and_exact(self) -> None:
         writable = self.root / "scoped" / "write"
         writable.mkdir(parents=True)
         request = self.request_file(writable)
         fake_socket = mock.MagicMock()
-        fake_socket.__enter__.return_value = fake_socket
-        with mock.patch("socket.create_connection", return_value=fake_socket) as connect, mock.patch(
-            "sys.stdout", io.StringIO()
-        ):
+        addresses = [
+            (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("192.0.2.1", 443))
+        ]
+        with mock.patch("socket.getaddrinfo", return_value=addresses), mock.patch(
+            "socket.socket", return_value=fake_socket
+        ), mock.patch("sys.stdout", io.StringIO()):
             rc = diagnose_module.main(
                 [
                     "--request-file",
@@ -251,7 +356,28 @@ class ExecutionAccessDiagnoseTest(unittest.TestCase):
                 ]
             )
         self.assertEqual(0, rc)
-        connect.assert_called_once_with(("example.com", 443), timeout=2.0)
+
+    def test_connect_probe_deadline_and_dns_code_are_process_bounded(self) -> None:
+        def slow_resolver(*_args: object, **_kwargs: object):
+            time.sleep(1.0)
+            return []
+
+        started = time.monotonic()
+        with mock.patch("socket.getaddrinfo", side_effect=slow_resolver):
+            result = diagnose_module._probe_connect("example.com:443", 0.1)
+        elapsed = time.monotonic() - started
+        self.assertEqual("failed", result["result"])
+        self.assertEqual("ETIMEDOUT", result["errno"])
+        self.assertLess(elapsed, 0.75)
+
+        with mock.patch(
+            "socket.getaddrinfo",
+            side_effect=socket.gaierror(socket.EAI_NONAME, "secret resolver detail"),
+        ):
+            result = diagnose_module._probe_connect("example.com:443", 1.0)
+        self.assertEqual("failed", result["result"])
+        self.assertEqual("EAI_NONAME", result["errno"])
+        self.assertNotIn("secret", json.dumps(result))
 
 
 if __name__ == "__main__":

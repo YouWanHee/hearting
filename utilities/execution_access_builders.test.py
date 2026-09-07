@@ -223,6 +223,25 @@ class ExecutionAccessBuilderTest(unittest.TestCase):
             ",execution_access_network=enforced", receipt_fragment(app_grant)
         )
 
+    def test_codex_read_only_refuses_before_writable_argv_projection(self) -> None:
+        args = self.codex_args("one-shot")
+        args.sandbox = "read-only"
+        self.assertEqual("read-only", self.codex.effective_runtime_sandbox(args))
+        with self.assertRaises(ExecutionAccessError) as raised:
+            bind_request(
+                str(self.request_file),
+                environ=self.env,
+                context=self.context,
+                is_child=False,
+                parent=None,
+                runtime="codex-exec",
+                effective_sandbox=self.codex.effective_runtime_sandbox(args),
+            )
+        self.assertEqual(
+            "execution-access-enforcement-unavailable:codex-read-only",
+            raised.exception.reason,
+        )
+
     def test_claude_and_opencode_project_without_os_claim(self) -> None:
         prompt = self.root / "prompt.txt"
         log = self.root / "log.jsonl"
