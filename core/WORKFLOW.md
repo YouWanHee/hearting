@@ -324,7 +324,9 @@ blocking card — the same five fields, in order, plus one closing line "frame
 뒤 방향 확인 예정" — and route compile/bind/producer-begin proceed immediately
 after it (frame never touches source, so the route-participation invariant
 above still holds). A second, blocking `[방향 확인]` card follows the frame
-group join, before `plan` starts:
+group join, before the compiled bound successor starts (read from
+`human_gate_bindings` and the graph's actual successor node, `plan` in the
+common graph but not always):
 
 ```text
 [방향 확인]
@@ -344,9 +346,10 @@ card. `confirmation.mode` (`profiles/dispatch-defaults.yaml`) governs
 the pair and has four values: `autonomous` (the shipped default as of O3 —
 resolved whenever a config's `confirmation` block or `mode` key is absent, for
 any schema version, and whenever no config file exists at all) drops both the
-post-frame `[방향 확인]` block and its `frame-review` human gate for routine,
-already-authorized `autopilot-code` work — `frame`'s continuation realizes as
-`inline-next` and `plan` starts immediately; `hybrid` is the two-card shape
+post-frame `[방향 확인]` block and its `frame-review` human gate, but only for
+a non-composed route doing routine, already-authorized `autopilot-code`
+work — `frame`'s continuation realizes as `inline-next` and the compiled
+bound successor starts immediately; `hybrid` is the two-card shape
 above; `both` restores a blocking start card; `post-frame-only` drops the
 start notify entirely but keeps the post-frame gate. Explicit user-declared,
 composed-recipe, deploy, destructive, and other-capability gates are untouched by `autonomous`
@@ -361,11 +364,11 @@ the shipped default change is not migrated into existing config files.
 helper both compile and verify call to realize this, so the two paths cannot
 disagree.
 
-**The frame interview (SD-129).** On a `standard+`, non-composed
-`autopilot-code` route whose compiled graph actually retains the
-`frame-review` binding — an explicitly declared `hybrid`, `both`, or
-`post-frame-only` `confirmation.mode`, and equally any composed recipe that
-declares the gate — the `[방향 확인]` card is not the whole gate. The gate
+**The frame interview (SD-129).** On a `standard+` `autopilot-code` route
+whose compiled graph actually retains the `frame-review` binding — an
+explicitly declared `hybrid`, `both`, or `post-frame-only` `confirmation.mode`
+on a non-composed route, or equally any composed recipe that declares the
+gate — the `[방향 확인]` card is not the whole gate. The gate
 record names `shards/frame/interview.json`: the owner's
 one-sentence restatement of what the user wants, a plain-language brief, and
 the few decisions the frame legs could not settle without the user. The
@@ -392,13 +395,18 @@ the plain-language rules before it reaches anyone (the `standard+` cap and
 the wording rules are machine-checked at the raise; steps 1–3 above and the
 `direct`/`quick` caps are obligations on the acting session that nothing
 checks mechanically). `direct`/`quick` have no `frame` node: the acting
-session asks its 0–1 / 1–3 questions of the same kind inline, inside the
-blocking §0.4 card step, and records the answers in the plan or the work log.
+session asks its 0–1 / 0–3 questions — concerning only decisions the request
+and recovered context leave unresolved — of the same kind inline, inside the
+§0.4 confirmation step (the blocking card, or the non-blocking `[경로]` line
+when the sealed `small_work_confirmation` is `notice`), and records the
+answers in the plan or the work log.
 The recorded answers become `shards/frame/intent.md` (owner-rendered), the
-brief `plan` reads first; `plan-author` is told to cite each decision by its
-question id and to report one it cannot honor as a blocker — a prompt
-contract, not a gate check. An interview gate may be raised at most twice
-per route (`round` ≤ 2).
+brief the compiled bound successor reads first; when that successor is
+`plan`, `plan-author` is told to cite each decision by its question id and to
+report one it cannot honor as a blocker — a prompt contract, not a gate
+check. Any other successor receives the same recorded intent through its own
+normal handoff, not an invented plan node. An interview gate may be raised at
+most twice per route (`round` ≤ 2).
 
 Entry routers therefore have two deterministic load phases: manifest-owned
 metadata before approval, then the selected portable owner contract after

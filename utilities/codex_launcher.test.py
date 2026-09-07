@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import errno
 import json
 import os
 from pathlib import Path
@@ -709,6 +710,153 @@ class LauncherLockReaderTest(unittest.TestCase):
                 thread.join(timeout=10.0)
                 self.assertFalse(thread.is_alive(), "swapper thread did not join")
 
+    def test_directory_swap_never_returns_foreign_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            genuine = root / "vendor" / "genuine-codex"
+            foreign = root / "vendor" / "foreign-codex"
+            genuine.parent.mkdir()
+            for command in (genuine, foreign):
+                command.write_text("#!/bin/sh\n", encoding="utf-8")
+                command.chmod(0o755)
+            home = self._harness(root)
+            original = home / ".harness"
+            lock = self._lock(home, 0o600)
+            ingress = original / "bin" / "codex"
+            ingress.parent.mkdir()
+            ingress.write_bytes(b"#!/bin/sh\n")
+            ingress.chmod(0o755)
+            state = original / "codex-launcher.json"
+            state.write_bytes(json.dumps({
+                "schema": 2, "phase": "installed", "real_command": str(genuine),
+                "ingress_path": str(ingress), "wrapper_path": str(ingress),
+            }).encode())
+            state.chmod(0o600)
+            original_lock_identity = (lock.stat().st_dev, lock.stat().st_ino)
+            real_state = launcher._state
+            swapped = False
+
+            def racy_state(home_arg, *, dirfd=None):
+                nonlocal swapped
+                if not swapped:
+                    swapped = True
+                    replacement = home / ".harness-replacement"
+                    original.rename(replacement)
+                    new_harness = home / ".harness"
+                    new_harness.mkdir()
+                    new_ingress = new_harness / "codex"
+                    new_ingress.write_bytes(b"#!/bin/sh\n")
+                    new_ingress.chmod(0o755)
+                    (new_harness / "codex-launcher.json").write_bytes(json.dumps({
+                        "schema": 2, "phase": "installed", "real_command": str(foreign),
+                        "ingress_path": str(new_ingress), "wrapper_path": str(new_ingress),
+                    }).encode())
+                    (new_harness / "codex-launcher.json").chmod(0o600)
+                    os.link(replacement / "codex-launcher.lock", new_harness / "codex-launcher.lock")
+                return real_state(home_arg) if dirfd is None else real_state(home_arg, dirfd=dirfd)
+
+            replacement_lock = home / ".harness" / "codex-launcher.lock"
+            with mock.patch.object(launcher, "_state", side_effect=racy_state):
+                try:
+                    value = launcher._read_state_locked(home)
+                except launcher.LauncherError:
+                    return
+            self.assertEqual(str(genuine), value["real_command"])
+            self.assertNotEqual(str(foreign), value["real_command"])
+            self.assertEqual(original_lock_identity, (replacement_lock.stat().st_dev, replacement_lock.stat().st_ino))
+
+    def test_lock_fdopen_failure_closes_owned_fds(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = self._harness(Path(temporary))
+            self._lock(home, 0o600)
+            opened: list[int] = []
+            real_open = launcher.os.open
+
+            def capture_open(*args, **kwargs):
+                fd = real_open(*args, **kwargs)
+                opened.append(fd)
+                return fd
+
+            with mock.patch.object(launcher.os, "open", side_effect=capture_open), mock.patch.object(
+                launcher.os, "fdopen", side_effect=KeyboardInterrupt("injected fdopen failure")
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    launcher._launcher_lock(home)
+            self.assertGreaterEqual(len(opened), 2)
+            for fd in opened:
+                with self.assertRaises(OSError) as raised:
+                    os.fstat(fd)
+                self.assertEqual(errno.EBADF, raised.exception.errno)
+
+    def test_unlock_failure_closes_handle(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = self._harness(Path(temporary))
+            self._lock(home, 0o600)
+            handle = launcher._launcher_lock(home)
+            fd = handle.fileno()
+            real_flock = launcher.fcntl.flock
+
+            def fail_unlock(number, operation):
+                if operation == launcher.fcntl.LOCK_UN:
+                    raise KeyboardInterrupt("injected unlock failure")
+                return real_flock(number, operation)
+
+            with mock.patch.object(launcher.fcntl, "flock", side_effect=fail_unlock):
+                with self.assertRaises(KeyboardInterrupt):
+                    launcher._unlock(handle)
+            self.assertTrue(handle.closed)
+            with self.assertRaises(OSError) as raised:
+                os.fstat(fd)
+            self.assertEqual(errno.EBADF, raised.exception.errno)
+
+    def test_state_post_fstat_growth_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            real = root / "vendor" / "codex"
+            real.parent.mkdir()
+            real.write_text("#!/bin/sh\n", encoding="utf-8")
+            real.chmod(0o755)
+            home = CodexLauncherRuntimeTest()._state_fixture(root, real)
+            state = home / ".harness" / "codex-launcher.json"
+            original_size = state.stat().st_size
+            real_fstat = launcher.os.fstat
+            grew = False
+
+            def grow_after_stat(fd):
+                nonlocal grew
+                info = real_fstat(fd)
+                try:
+                    if Path(os.readlink(f"/proc/self/fd/{fd}")) == state and not grew:
+                        with state.open("ab") as stream:
+                            stream.write(b" " * (32769 - original_size))
+                        grew = True
+                except OSError:
+                    pass
+                return info
+
+            with mock.patch.object(launcher.os, "fstat", side_effect=grow_after_stat):
+                with self.assertRaises(launcher.LauncherError):
+                    launcher._state(home)
+            self.assertTrue(grew)
+            self.assertGreater(state.stat().st_size, 32768)
+
+    def test_borrowed_dirfd_survives_launcher_lock_and_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            real = root / "vendor" / "codex"
+            real.parent.mkdir()
+            real.write_text("#!/bin/sh\n", encoding="utf-8")
+            real.chmod(0o755)
+            home = CodexLauncherRuntimeTest()._state_fixture(root, real)
+            borrowed = os.open(home / ".harness", os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                handle = launcher._launcher_lock(home, dirfd=borrowed)
+                launcher._unlock(handle)
+                launcher._state(home, dirfd=borrowed)
+                os.fstat(borrowed)
+            finally:
+                os.close(borrowed)
+
     def test_read_state_locked_retries_when_lock_replaced_during_read(self) -> None:
         """A genuine background thread replaces the lock file after
         `_state` has already read from it but before `_read_state_locked`'s
@@ -751,9 +899,9 @@ class LauncherLockReaderTest(unittest.TestCase):
             real_state = launcher._state
             call_count = {"n": 0}
 
-            def racy_state(home_arg):
+            def racy_state(home_arg, *, dirfd=None):
                 call_count["n"] += 1
-                value = real_state(home_arg)
+                value = real_state(home_arg) if dirfd is None else real_state(home_arg, dirfd=dirfd)
                 if not replaced_once.is_set():
                     replaced = threading.Event()
 

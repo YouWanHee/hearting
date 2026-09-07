@@ -9,6 +9,7 @@ Server ``--writable-root``).
 from __future__ import annotations
 
 from dataclasses import dataclass
+import errno
 import hashlib
 import ipaddress
 import json
@@ -337,6 +338,26 @@ def _resolve_paths(raw: list[Path]) -> list[tuple[Path, Path]]:
                 "execution-access-path-invalid",
                 literal,
                 f"path cannot be resolved safely: {type(exc).__name__}",
+            )
+        # Python 3.13's non-strict resolve() silently tolerates a symlink
+        # loop instead of raising, so a strict probe of the same literal is
+        # required to catch it. A strict-probe ENOENT (a legitimate future
+        # leaf that does not exist yet) is not itself unsafe and must not
+        # replace the already-accepted non-strict result.
+        try:
+            literal.resolve(strict=True)
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                _reject(
+                    "execution-access-path-invalid",
+                    literal,
+                    "path resolution loops through a symlink cycle",
+                )
+        except RuntimeError:
+            _reject(
+                "execution-access-path-invalid",
+                literal,
+                "path resolution loops through a symlink cycle",
             )
         _validate_path_text(str(resolved))
         resolved_by_literal.append((literal, resolved))

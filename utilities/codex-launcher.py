@@ -115,7 +115,7 @@ def _open_harness_dirfd(home: Path) -> int:
         raise LauncherError(f"managed launcher state directory is unsafe: {harness_dir}") from exc
     try:
         info = os.fstat(dirfd)
-    except OSError:
+    except BaseException:
         os.close(dirfd)
         raise
     if not stat.S_ISDIR(info.st_mode):
@@ -132,7 +132,7 @@ def _lock_identity(dirfd: int):
         return None
 
 
-def _launcher_lock(home: Path):
+def _launcher_lock(home: Path, *, dirfd: int | None = None):
     """Acquire a shared read-only lock on the installer-managed lock file.
 
     Never creates, writes to, chmods, or unlinks the lock; a missing or unsafe
@@ -156,7 +156,9 @@ def _launcher_lock(home: Path):
         raise LauncherError(f"managed CODEX_HOME is unsafe: {home}")
     if fcntl is None:
         raise LauncherError("Codex launcher lock support (fcntl) is unavailable")
-    dirfd = _open_harness_dirfd(home)
+    owns_dirfd = dirfd is None
+    if owns_dirfd:
+        dirfd = _open_harness_dirfd(home)
     try:
         path = home / ".harness" / "codex-launcher.lock"
         # O_NONBLOCK is required at open time: without it, opening a FIFO
@@ -172,7 +174,11 @@ def _launcher_lock(home: Path):
                 fd = os.open("codex-launcher.lock", flags, dir_fd=dirfd)
             except OSError as exc:
                 raise LauncherError(f"Codex launcher lock is unavailable: {path}") from exc
-            handle = os.fdopen(fd, "rb", buffering=0)
+            try:
+                handle = os.fdopen(fd, "rb", buffering=0)
+            except BaseException:
+                os.close(fd)
+                raise
             valid = False
             try:
                 opened = os.fstat(handle.fileno())
@@ -202,13 +208,16 @@ def _launcher_lock(home: Path):
                     handle.close()
         raise LauncherError(f"Codex launcher lock could not be safely acquired: {path}")
     finally:
-        os.close(dirfd)
+        if owns_dirfd:
+            os.close(dirfd)
 
 
 def _unlock(handle) -> None:
-    if fcntl is not None:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-    handle.close()
+    try:
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
 
 
 def _read_state_locked(home: Path) -> dict:
@@ -224,25 +233,30 @@ def _read_state_locked(home: Path) -> dict:
     the same bounded `_LOCK_OPEN_RETRIES` budget rather than trusting a read
     that raced a live install/repair.
     """
-    for _ in range(_LOCK_OPEN_RETRIES):
-        handle = _launcher_lock(home)
-        try:
-            pre = os.fstat(handle.fileno())
-            value = _state(home)
+    if home.is_symlink() or not home.is_dir():
+        raise LauncherError(f"managed CODEX_HOME is unsafe: {home}")
+    dirfd = _open_harness_dirfd(home)
+    try:
+        for _ in range(_LOCK_OPEN_RETRIES):
+            handle = None
             try:
-                post = os.stat(home / ".harness" / "codex-launcher.lock", follow_symlinks=False)
-            except OSError:
-                post = None
-            if (
-                post is not None
-                and stat.S_ISREG(post.st_mode)
-                and (pre.st_dev, pre.st_ino) == (post.st_dev, post.st_ino)
-            ):
-                return value
-            # Replaced during the read window: the state we just read cannot
-            # be trusted as bound to the lock we held. Retry from scratch.
-        finally:
-            _unlock(handle)
+                handle = _launcher_lock(home, dirfd=dirfd)
+                pre = os.fstat(handle.fileno())
+                value = _state(home, dirfd=dirfd)
+                post = _lock_identity(dirfd)
+                if (
+                    post is not None
+                    and stat.S_ISREG(post.st_mode)
+                    and (pre.st_dev, pre.st_ino) == (post.st_dev, post.st_ino)
+                ):
+                    return value
+                # Replaced during the read window: the state we just read cannot
+                # be trusted as bound to the lock we held. Retry from scratch.
+            finally:
+                if handle is not None:
+                    _unlock(handle)
+    finally:
+        os.close(dirfd)
     raise LauncherError(f"managed launcher state could not be safely read: {home}")
 
 
@@ -265,22 +279,64 @@ def launcher_state_home(runtime_home: Path) -> Path:
     return runtime_home
 
 
-def _state(home: Path) -> dict:
+def _state(home: Path, *, dirfd: int | None = None) -> dict:
     if home.is_symlink() or not home.is_dir():
         raise LauncherError(f"managed CODEX_HOME is unsafe: {home}")
     harness_state = home / ".harness"
-    if harness_state.is_symlink() or not harness_state.is_dir():
-        raise LauncherError(f"managed launcher state directory is unsafe: {harness_state}")
-    path = home / ".harness" / "codex-launcher.json"
-    if path.is_symlink() or not path.is_file() or path.stat().st_size > 32_768:
-        raise LauncherError(f"managed launcher state is unavailable: {path}")
-    info = path.stat()
-    if info.st_uid != os.geteuid() or info.st_mode & 0o077:
-        raise LauncherError(f"managed launcher state permissions are unsafe: {path}")
+    owns_dirfd = dirfd is None
+    if owns_dirfd:
+        if harness_state.is_symlink() or not harness_state.is_dir():
+            raise LauncherError(f"managed launcher state directory is unsafe: {harness_state}")
+        dirfd = _open_harness_dirfd(home)
+    path = harness_state / "codex-launcher.json"
+    fd = None
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise LauncherError(f"managed launcher state is invalid: {path}") from exc
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+        try:
+            fd = os.open("codex-launcher.json", flags, dir_fd=dirfd)
+        except OSError as exc:
+            raise LauncherError(f"managed launcher state is unavailable: {path}") from exc
+        try:
+            info = os.fstat(fd)
+        except OSError as exc:
+            raise LauncherError(f"managed launcher state is unavailable: {path}") from exc
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or info.st_mode & 0o077
+            or info.st_size > 32_768
+        ):
+            raise LauncherError(f"managed launcher state is unavailable: {path}")
+        try:
+            handle = os.fdopen(fd, "rb", buffering=0)
+        except BaseException:
+            os.close(fd)
+            fd = None
+            raise
+        fd = None
+        try:
+            raw = bytearray()
+            while len(raw) <= 32_768:
+                chunk = handle.read(32_769 - len(raw))
+                if not chunk:
+                    break
+                raw.extend(chunk)
+            if len(raw) > 32_768:
+                raise LauncherError(f"managed launcher state is unavailable: {path}")
+            value = json.loads(bytes(raw).decode("utf-8"))
+        except LauncherError:
+            raise
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise LauncherError(f"managed launcher state is invalid: {path}") from exc
+        finally:
+            handle.close()
+    except BaseException:
+        if fd is not None:
+            os.close(fd)
+        raise
+    finally:
+        if owns_dirfd:
+            os.close(dirfd)
     if not isinstance(value, dict) or value.get("schema") not in {1, 2} or value.get("phase") != "installed":
         raise LauncherError(f"managed launcher state is incomplete: {path}")
     real = Path(str(value.get("real_command") or value.get("vendor_binding", {}).get("command_path", "")))
@@ -297,7 +353,7 @@ def _state(home: Path) -> dict:
     try:
         if ingress.resolve(strict=False).parent == home.resolve(strict=False) / ".harness" / "bin":
             pass
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:
         raise LauncherError("managed launcher ingress path is invalid") from exc
     return value
 

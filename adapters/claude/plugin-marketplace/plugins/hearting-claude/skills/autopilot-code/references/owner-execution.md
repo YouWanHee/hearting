@@ -67,17 +67,25 @@ This gate is mode-conditional, not universal. `standard+` `autopilot-code` route
 compiled under an explicit `hybrid`/`both`/`post-frame-only` `confirmation.mode`
 seal `human_gates: ["frame-review"]` and the `frame` node's (and any frame
 parallel-group clone's) continuation as `{"kind": "human-gate", "gate":
-"frame-review"}` — steps 1-5 below apply to those routes. A route compiled
-under the shipped `autonomous` default (O3) instead realizes that same
+"frame-review"}` — steps 1-5 below apply to those routes. A non-composed route
+compiled under the shipped `autonomous` default (O3) instead realizes that same
 continuation as `{"kind": "inline-next"}` and seals an empty
-`human_gate_bindings` for this gate: `plan` starts immediately after `frame`
-joins and steps 1-4 below do not apply. A route sealed before `confirmation_mode`
-existed at all keeps whatever the recipe declared at compile time and is never
-retro-fitted onto either shape; do not attempt to apply this gate to an
-already-open route regardless of which shape it sealed.
+`human_gate_bindings` for this gate: whatever node the compiled graph actually
+places after `frame` (`plan` in the common graph, but `execute` in a graph like
+`frame,execute,test` that has no `plan` node) starts immediately and steps 1-4
+below do not apply. An explicit composed recipe keeps every gate it declares
+regardless of the default confirmation mode, exactly like the explicit-mode
+routes above. Whether this gate binds at all, and what it binds to, is always
+the compiled `human_gate_bindings` and the graph's actual successor node —
+never inferred from the mode name or a hardcoded node id. A route sealed before
+`confirmation_mode` existed at all keeps whatever the recipe declared at compile
+time and is never retro-fitted onto either shape; do not attempt to apply this
+gate to an already-open route regardless of which shape it sealed.
 
 1. After `frame` (and, at `standard`, `frame-alternative`) completes, before
-   dispatching `plan`: build `shards/frame/frame-summary.json` from
+   dispatching the compiled bound successor (read from `human_gate_bindings`
+   and the graph's actual successor node — `plan` in the common graph, but
+   not always): build `shards/frame/frame-summary.json` from
    `shards/frame/direction-brief.md` — exactly the five fields 방향 (direction),
    대안 (alternatives), 위험 (risk), 범위 변경 (scope change), 비용 (cost), total
    size ≤1KB. Reference it by **path** when raising attention; never embed the
@@ -124,14 +132,14 @@ already-open route regardless of which shape it sealed.
    `frame_interview_v1` shape only: an artifact that calls itself an
    interview under another schema is refused at the raise
    (`interview-schema-unsupported`). Never sleep, never write an ad-hoc polling
-   loop, and never spawn `plan` while `await-release` has not returned 0 —
-   every launch surface refuses a `plan` start whose entry gate is not
-   released (`human-gate-unreleased` / `human-gate-not-raised`, defect M).
-   The person records the answer from the depth-0 session with
+   loop, and never spawn the bound successor while `await-release` has not
+   returned 0 — every launch surface refuses a successor start whose entry
+   gate is not released (`human-gate-unreleased` / `human-gate-not-raised`,
+   defect M). The person records the answer from the depth-0 session with
    `workflow-supervisor.py release --route <route file> --gate frame-review
    --decision proceed|revise|stop --actor <actor> --answers <answers file>`.
-   `proceed` claims and reports the `plan` successor atomically (never spawn
-   `plan` a second time on retry); `revise` returns to `frame` under the
+   `proceed` claims and reports the bound successor atomically (never spawn
+   it a second time on retry); `revise` returns to `frame` under the
    `code-refine` retry boundary; `stop` cancels the route with
    `abandon_reason=operator-decision`. Pass `--answers-out
    shards/frame/interview-answers.json` to `await-release` so the recorded
@@ -139,21 +147,25 @@ already-open route regardless of which shape it sealed.
 4. On `proceed`, render the agreed intent before anything else:
    `python3 <agent-home>/utilities/frame_interview.py render-intent --interview
    shards/frame/interview.json --answers shards/frame/interview-answers.json
-   --out shards/frame/intent.md`. `intent.md` is the brief `plan` reads first
-   (pass its absolute path in the plan prompt as `Intent:`); a plan that
-   contradicts a recorded decision is a plan-check blocker. When the user
+   --out shards/frame/intent.md`. `intent.md` is the brief the bound successor
+   reads first. When `successor == plan`, pass its absolute path in the plan
+   prompt as `Intent:`; a plan that contradicts a recorded decision is a
+   plan-check blocker. Any other successor receives the recorded intent
+   through its own normal handoff, not an invented plan node. When the user
    corrected your understanding (`status: agreed-with-correction`), fold the
-   correction into the plan prompt verbatim. If the answers open a genuinely
-   new decision, you may raise the gate once more with a round-2 interview
-   (`round: 2`, same caps). A third interview raise is refused by the
-   validator (`round` ≤ 2); remaining doubts go to the plan's risk section,
-   and a third raise, if a route ever needs one, carries the frame summary
-   alone.
+   correction into the successor's prompt/handoff verbatim. If the answers
+   open a genuinely new decision, you may raise the gate once more with a
+   round-2 interview (`round: 2`, same caps). A third interview raise is
+   refused by the validator (`round` ≤ 2); remaining doubts go to the plan's
+   risk section when `successor == plan`, and a third raise, if a route ever
+   needs one, carries the frame summary alone.
 5. `confirmation.mode` (`profiles/dispatch-defaults.yaml` /
    `utilities/dispatch-defaults.py`, default `autonomous`) governs this gate
-   and has four values: `autonomous` removes this binding entirely for
-   routine, already-authorized `autopilot-code` work (`frame`'s continuation
-   realizes as `inline-next`, steps 1-4 above do not apply); `post-frame-only`
+   and has four values: `autonomous` removes this binding entirely, but only
+   for a non-composed route doing routine, already-authorized `autopilot-code`
+   work (`frame`'s continuation realizes as `inline-next`, steps 1-4 above do
+   not apply); an explicit composed recipe keeps every gate it declares
+   regardless of `confirmation.mode`. `post-frame-only`
    makes this gate the sole confirmation point; `hybrid` layers it onto the
    existing pre-plan notify; `both` makes both stages always explicit — read
    it via `query_confirmation_mode`, never hardcode a mode.

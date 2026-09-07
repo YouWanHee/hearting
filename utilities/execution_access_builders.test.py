@@ -17,6 +17,7 @@ from execution_access import (
     AccessContext,
     ExecutionAccessError,
     ParentGrant,
+    _resolve_paths,
     bind_request,
     build_grant,
     load_request,
@@ -334,6 +335,23 @@ class ExecutionAccessBuilderTest(unittest.TestCase):
         except ExecutionAccessError as exc:
             self.assertEqual("execution-access-invalid-json", exc.reason)
         self.assertEqual(0, spawn_count)
+
+    def test_strict_probe_runtime_error_is_rejected(self) -> None:
+        literal = self.scoped
+        real_resolve = Path.resolve
+
+        def fake_resolve(self: Path, strict: bool = False) -> Path:
+            if self == literal and strict:
+                raise RuntimeError(f"Symlink loop from {self}")
+            return real_resolve(self, strict=strict)
+
+        with mock.patch.object(Path, "resolve", fake_resolve):
+            try:
+                _resolve_paths([literal])
+            except ExecutionAccessError as exc:
+                self.assertTrue(exc.reason.startswith("execution-access-path-invalid:"))
+            else:
+                self.fail("ExecutionAccessError not raised")
 
     def test_all_adapter_parsers_accept_only_the_file_surface(self) -> None:
         required = [
