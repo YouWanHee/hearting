@@ -2,6 +2,7 @@
 """Isolated native-deadline tests; the model executable is synthetic."""
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import io
 import json
@@ -38,7 +39,9 @@ class SessionEndTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.addCleanup(self.cleanup_children)
         self.sid = "synthetic-end-" + self.base.name
-        self.nonce = "HRTEND" + self.base.name.rsplit("-", 1)[-1]
+        # tempfile suffixes can contain underscores, which split recall tokens
+        # and make an absent new nonce match the prior record's shared prefix.
+        self.nonce = "HRTEND" + hashlib.sha256(self.base.name.encode()).hexdigest()[:24]
         self.project = self.base / "project"
         self.project.mkdir()
         # An allowlist prevents inherited route, model, session, and remote-sync
@@ -72,15 +75,19 @@ class SessionEndTests(unittest.TestCase):
         fake.write_text("#!" + sys.executable + "\n" + '''import json, os, pathlib, sys, time
 args = sys.argv[1:]
 prompt = sys.stdin.read()
+nonce = os.environ["SYNTHETIC_NONCE"]
+proc_fields = pathlib.Path(f"/proc/{os.getpid()}/stat").read_text().rsplit(")", 1)[1].split()
+identity = {"pid": os.getpid(), "start_ticks": int(proc_fields[19]),
+    "boot_id": pathlib.Path("/proc/sys/kernel/random/boot_id").read_text().strip()}
 with open(os.environ["SYNTHETIC_INVOCATIONS"], "a") as out:
-    out.write(json.dumps({"args": args, "pid":os.getpid(), "role": os.environ.get("AGENT_SESSION_ROLE"),
+    out.write(json.dumps({"args": args, "pid":os.getpid(), "identity":identity, "nonce":nonce,
+        "role": os.environ.get("AGENT_SESSION_ROLE"),
         "distill": os.environ.get("MEM_DISTILL"), "completion": os.environ.get("MEM_SESSION_COMPLETION"),
         "has_curate_contract": '"action":"add"' in prompt}) + "\\n")
 time.sleep(float(os.environ["SYNTHETIC_DELAY"]))
 if int(os.environ["SYNTHETIC_EXIT"]):
     sys.stderr.write("synthetic private error must not enter receipt\\n")
     sys.exit(int(os.environ["SYNTHETIC_EXIT"]))
-nonce = os.environ["SYNTHETIC_NONCE"]
 action = {"action":"add", "tier":"durable", "type":"user-correction",
     "body":nonce + " approved deployment region is ap-northeast-2.",
     "headline":nonce + " deployment correction", "aliases":[nonce, "deployment correction"],
@@ -107,6 +114,68 @@ pathlib.Path(args[args.index("--output-last-message") + 1]).write_text(json.dump
                     os.killpg(identity["pid"], signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+        # A broken timeout wrapper may have moved the synthetic model out of
+        # the command group. Kill only the exact fixture PID/start/boot tuple;
+        # neither a reused PID nor any other runtime/model process is eligible.
+        for invocation in self.invocations():
+            identity = invocation.get("identity")
+            if identity and completion.identity_alive(identity):
+                try:
+                    os.kill(identity["pid"], signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    def invocations(self):
+        try:
+            lines = Path(self.env["SYNTHETIC_INVOCATIONS"]).read_text().splitlines()
+        except FileNotFoundError:
+            return []
+        result = []
+        for line in lines:
+            try:
+                result.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass  # The fixture may still be appending its last line.
+        return result
+
+    def wait_invocations(self, count, timeout=8):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            result = self.invocations()
+            if len(result) >= count:
+                return result
+            time.sleep(0.025)
+        self.fail("synthetic model invocation did not start")
+
+    def assert_model_dead(self, identity):
+        self.assertTrue(completion._valid_identity(identity))
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            if completion.identity_state(identity) == "dead":
+                return
+            try:
+                state = Path(f"/proc/{identity['pid']}/stat").read_text().rsplit(")", 1)[1].split()[0]
+            except FileNotFoundError:
+                return
+            if state == "Z":
+                return  # Host init may not yet have reaped the killed orphan.
+            time.sleep(0.01)
+        self.fail("synthetic model survived completion process-group timeout")
+
+    def wait_lease_release(self):
+        key = completion._key("codex", self.sid)
+        lock = os.open(Path(self.env["MEM_SESSION_COMPLETION_RECEIPTS"]) / (key + ".lock"), os.O_RDWR)
+        try:
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                try:
+                    completion.fcntl.flock(lock, completion.fcntl.LOCK_EX | completion.fcntl.LOCK_NB)
+                    return
+                except BlockingIOError:
+                    time.sleep(0.01)
+            self.fail("synthetic completion did not release its lease")
+        finally:
+            os.close(lock)
 
     def mem(self, *args):
         result = subprocess.run([sys.executable, str(MEM), *args], cwd=self.project,
@@ -176,6 +245,56 @@ pathlib.Path(args[args.index("--output-last-message") + 1]).write_text(json.dump
         self.assertEqual((Path(self.env["MEM_STORE"]) / (".distill-state-" + self.sid)).read_text().strip(), "synthetic-u2")
         self.assert_stored(next_nonce)
         self.assertEqual(len(Path(self.env["SYNTHETIC_INVOCATIONS"]).read_text().splitlines()), 2)
+
+    def test_real_timeout_kills_model_and_preserves_unapplied_delta(self):
+        self.env.update(SYNTHETIC_DELAY="60", MEM_SESSION_COMPLETION_TIMEOUT="30",
+                        CODEX_DISTILL_TIMEOUT_CURATE="60")
+        started = time.monotonic()
+        self.invoke()  # Real bridge/preflight/GNU timeout, native 3s deadline.
+        call = self.wait_invocations(1)[0]
+        receipt = self.terminal(timeout=35)
+        self.assertLess(time.monotonic() - started, 35)
+        self.assertEqual((receipt["state"], receipt["reason"]), ("failed", "timeout"), receipt)
+        self.assertEqual(receipt["memory_apply"], "not-asserted")
+        self.assert_model_dead(call["identity"])
+        marker = Path(self.env["MEM_STORE"]) / (".distill-state-" + self.sid)
+        self.assertFalse(marker.exists())
+        self.assertIn(self.nonce, self.mem("distill", self.sid, "--source", "codex"))
+        self.assertIn("(no store matches)", self.mem("recall", self.nonce, "--full"))
+        self.assertEqual(len(self.invocations()), 1)
+
+    def test_active_new_generation_preserves_frontier_and_retries_delta(self):
+        self.invoke()
+        first_call = self.wait_invocations(1)[0]
+        self.assertEqual(first_call["nonce"], self.nonce)
+        next_nonce = self.nonce + "PENDING"
+        with self.transcript.open("a") as out:
+            out.write(json.dumps({"type":"event_msg", "timestamp":"2026-09-07T12:00:00Z",
+                "payload":{"type":"user_message", "id":"synthetic-u2",
+                           "message":next_nonce + " correction: approved deployment region is ap-northeast-2."}}) + "\n")
+        # The first child captured the old environment at spawn. Only the
+        # deferred/retried invocation sees the next synthetic memory action.
+        self.env.update(SYNTHETIC_NONCE=next_nonce, SYNTHETIC_DELAY="0.1")
+        deferred = self.invoke()
+        self.assertEqual(deferred.stderr, "codex memory completion: active-input-generation\n")
+        first_terminal = self.terminal()
+        self.assertEqual(first_terminal["state"], "completed", first_terminal)
+        marker = Path(self.env["MEM_STORE"]) / (".distill-state-" + self.sid)
+        self.assertEqual(marker.read_text().strip(), "synthetic-u1")
+        self.assert_stored(self.nonce)
+        self.assertIn(next_nonce, self.mem("distill", self.sid, "--source", "codex"))
+        self.assertIn("(no store matches)", self.mem("recall", next_nonce, "--full"))
+        self.assertEqual(len(self.invocations()), 1)
+        self.wait_lease_release()
+        self.invoke()  # Same SID and unchanged pending generation are retried.
+        second_terminal = self.terminal()
+        self.assertEqual(second_terminal["state"], "completed", second_terminal)
+        self.assertNotEqual(first_terminal["input_generation"], second_terminal["input_generation"])
+        self.assert_stored(next_nonce)
+        self.assertEqual(marker.read_text().strip(), "synthetic-u2")
+        self.assertEqual(self.mem("distill", self.sid, "--source", "codex").strip(), "")
+        calls = self.invocations()
+        self.assertEqual([call["nonce"] for call in calls], [self.nonce, next_nonce])
 
     def test_missing_generation_is_explicit_and_does_not_read_content(self):
         bridge = load_bridge()
