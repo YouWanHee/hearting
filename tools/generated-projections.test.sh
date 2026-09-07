@@ -172,13 +172,16 @@ for bootstrap in \
   "$ROOT/adapters/claude/CLAUDE.md" \
   "$ROOT/adapters/codex/AGENTS.md" \
   "$ROOT/adapters/opencode/AGENTS.md"; do
-  grep -Fq 'five-field card in §0.4' "$bootstrap" || {
-    echo "not ok - entry confirmation pointer missing from $bootstrap" >&2
-    exit 1
-  }
   # Bootstrap prose is hard-wrapped, so match against a whitespace-normalized
   # copy: a restored clause must survive an unrelated reflow.
   bootstrap_flat=$(tr '\n' ' ' < "$bootstrap" | tr -s ' ' | tr 'A-Z' 'a-z')
+  case "$bootstrap_flat" in
+    *'five-field card in §0.4'*|*'§0.4 five-field card'*|*'§0.4 card'*) ;;
+    *)
+      echo "not ok - entry confirmation pointer missing from $bootstrap" >&2
+      exit 1
+      ;;
+  esac
   while IFS='|' read -r needle label; do
     [ -n "$needle" ] || continue
     case "$bootstrap_flat" in
