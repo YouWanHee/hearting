@@ -872,7 +872,8 @@ EOF
       echo "session-end: skipping (memory store resolution failed)" >&2
       exit 0
     fi
-    export MEM_STORE="$store"
+    # Keep caller overrides intact; a derived path grants no permission to
+    # initialize an empty store. Child mem.py resolves under the same env.
     mkdir -p "$store" 2>/dev/null || true
     # Debounce: the OpenCode plugin fires this on session.idle, which occurs after
     # every turn. Rate-limit per session so a long TUI session triggers at most

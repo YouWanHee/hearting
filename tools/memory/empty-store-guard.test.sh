@@ -50,4 +50,103 @@ test -f "$TMP/fresh-data/hearting/memory/memory.db" \
 MEM_STORE="$TMP/store2" python3 "$MEM" stats >/dev/null 2>&1 \
   || fail "primary store profile read broke"
 
+# 5. Empty MEM_STORE is unset for both path selection and creation authority.
+if hearting_test_derived_env env MEM_STORE= XDG_DATA_HOME="$TMP/empty-data" \
+    python3 "$MEM" index >"$TMP/empty-out" 2>"$TMP/empty-err"; then
+  fail "empty MEM_STORE granted initialization authority"
+fi
+grep -q 'refusing to create' "$TMP/empty-err" || fail "empty override refusal missing"
+test ! -e "$TMP/empty-data/hearting/memory/memory.db" || fail "empty override created a DB"
+
+# 6. Actual OpenCode SessionEnd plus bounded worker-environment probes. All
+# model boundaries are stubs; the workers' child index command uses real mem.py.
+python3 - "$ROOT" "$TMP" <<'PYTEST'
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+root, fixture = map(Path, sys.argv[1:])
+mem = root / 'tools/memory/mem.py'
+
+def environment(name):
+    base = fixture / name
+    base.mkdir()
+    home = base / 'home'; home.mkdir()
+    project = base / 'project'; project.mkdir()
+    agent = base / 'agent'; (agent / 'core').mkdir(parents=True)
+    (agent / 'core/CORE.md').write_text('# Isolated agent-home fixture\n')
+    env = {
+        'PATH': os.defpath, 'HOME': str(home), 'AGENT_HOME': str(agent),
+        'XDG_DATA_HOME': str(base / 'data'),
+        'XDG_CONFIG_HOME': str(base / 'config'),
+        'XDG_STATE_HOME': str(base / 'state'),
+        'MEM_PROJECTS': str(base / 'projects'),
+        'MEM_WRITE_EVENTS': str(base / 'state/write.jsonl'),
+        'MEM_RECALL_EVENTS': str(base / 'state/recall.jsonl'),
+        'MEM_RECALL_RECEIPTS': str(base / 'state/receipts'),
+        'AGENT_MODEL_GOVERNOR_ROOT': str(base / 'governor'),
+        'AGENT_ARTIFACT_ROOT': str(project / '.agent_reports'),
+    }
+    return base, project, env
+
+for value in [None, '', 'explicit', 'init']:
+    base, project, env = environment('session-end-' + str(value))
+    env['OPENCODE_DISTILL_ENABLE'] = '0'
+    if value in ['', 'explicit']:
+        env['MEM_STORE'] = str(base / 'explicit') if value else ''
+    if value == 'init':
+        env['MEM_INIT'] = '1'
+    command = ['sh', str(root / 'adapters/opencode/bin/preflight.sh'),
+               'session-end', str(project), 'empty-store-fixture']
+    result = subprocess.run(command, env=env, cwd=project, text=True,
+                            capture_output=True, timeout=15)
+    assert result.returncode == 0, (command, result.stderr)
+    assert not result.stdout, result.stdout
+    db = (base / 'explicit' if value == 'explicit' else base / 'data/hearting/memory') / 'memory.db'
+    if value in ['explicit', 'init']:
+        assert db.is_file(), ('authorized initialization lost', value, result.stderr)
+    else:
+        assert not db.exists(), ('derived initialization bypass', value)
+        assert 'refusing to create' in result.stderr, result.stderr
+
+for runtime in ['codex', 'opencode']:
+    for value in [None, '', 'explicit']:
+        base, project, env = environment(runtime + '-' + str(value))
+        bin_dir = base / 'bin'; bin_dir.mkdir()
+        probe = base / 'child-probe.json'
+        # Intercept only the transcript boundary. Probe actual mem.py index
+        # under exactly the worker-provided environment, then report no delta.
+        wrapper = bin_dir / 'python3'
+        wrapper.write_text('#!' + sys.executable + '\n' +
+            'import json, os, subprocess, sys\n'
+            'from pathlib import Path\n'
+            'if len(sys.argv) > 2 and sys.argv[1].endswith("/tools/memory/mem.py") and sys.argv[2] == "distill":\n'
+            ' r = subprocess.run([' + repr(sys.executable) + ', sys.argv[1], "index"], capture_output=True, text=True)\n'
+            ' Path(' + repr(str(probe)) + ').write_text(json.dumps({"override": os.environ.get("MEM_STORE"), "rc": r.returncode, "err": r.stderr}))\n'
+            ' sys.exit(0)\n'
+            'os.execv(' + repr(sys.executable) + ', [' + repr(sys.executable) + '] + sys.argv[1:])\n')
+        wrapper.chmod(0o755)
+        model = bin_dir / runtime
+        model.write_text('#!/bin/sh\nexit 88\n'); model.chmod(0o755)
+        env['PATH'] = str(bin_dir) + os.pathsep + os.defpath
+        env[runtime.upper() + '_DISTILL_ENABLE'] = '1'
+        if value is not None:
+            env['MEM_STORE'] = str(base / 'explicit') if value else ''
+        command = ['sh', str(root / 'adapters' / runtime / 'bin/distill-worker.sh'),
+                   'empty-store-fixture', str(project)]
+        result = subprocess.run(command, env=env, cwd=project, text=True,
+                                capture_output=True, timeout=15)
+        assert result.returncode == 0, (command, result.stderr)
+        evidence = json.loads(probe.read_text())
+        assert evidence['override'] == env.get('MEM_STORE'), evidence
+        expected = 0 if value == 'explicit' else 2
+        assert evidence['rc'] == expected, evidence
+        db = (base / 'explicit' if value == 'explicit' else base / 'data/hearting/memory') / 'memory.db'
+        assert db.exists() == (value == 'explicit'), (value, evidence)
+print('OpenCode SessionEnd: 4 actual isolated guard cases passed')
+print('Codex/OpenCode workers: 6 mocked transcript-boundary / real mem.py guard cases passed')
+PYTEST
+
 echo "empty-store-guard: PASS"

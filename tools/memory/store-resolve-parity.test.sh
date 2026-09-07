@@ -1,149 +1,233 @@
 #!/usr/bin/env sh
-# Parity between tools/memory/store_resolve.py and utilities/memory-store.sh.
-# Both must agree on stdout, exit status, and (for failures) a path-only
-# stderr diagnostic for every R0-R5 case. Never touches a live store.
-set -u
+# Exact status, path and diagnostic parity over synthetic filesystem layouts.
+set -eu
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
-# Every R0-R5 case below runs its own `env -i HOME=... XDG_DATA_HOME=...`
-# per-case environment, which is already a stricter isolation than the shared
-# fixture root; test-isolation.sh is sourced to satisfy the repo-wide "every
-# tools/memory/*.test.sh sources it" contract (test-isolation-contract.test.sh).
 . "$ROOT/tools/memory/test-isolation.sh"
-PY="$ROOT/tools/memory/store_resolve.py"
-SH="$ROOT/utilities/memory-store.sh"
-PYTHON3=$(command -v python3)
-SH_BIN=$(command -v sh)
-
-PASS=0
-FAIL=0
-ok()  { PASS=$((PASS + 1)); }
-bad() { FAIL=$((FAIL + 1)); printf 'not ok - %s\n' "$1" >&2; }
-
-# run_case <label> <env-args...>  -- env-args passed to `env`
-run_case() {
-  label=$1; shift
-  py_out=$(env -i "$@" "$PYTHON3" "$PY" 2>/tmp/parity_py_err.$$); py_rc=$?
-  sh_out=$(env -i "$@" "$SH_BIN" "$SH" 2>/tmp/parity_sh_err.$$); sh_rc=$?
-  py_err=$(cat /tmp/parity_py_err.$$); rm -f /tmp/parity_py_err.$$
-  sh_err=$(cat /tmp/parity_sh_err.$$); rm -f /tmp/parity_sh_err.$$
-
-  if [ "$py_rc" != "$sh_rc" ]; then
-    bad "$label: exit mismatch py=$py_rc sh=$sh_rc"; return
-  fi
-  if [ "$py_rc" = "0" ]; then
-    if [ "$py_out" != "$sh_out" ]; then
-      bad "$label: stdout mismatch py=[$py_out] sh=[$sh_out]"; return
-    fi
-    if [ -n "$py_err" ] || [ -n "$sh_err" ]; then
-      bad "$label: unexpected stderr on success py=[$py_err] sh=[$sh_err]"; return
-    fi
-  else
-    if [ -n "$py_out" ] || [ -n "$sh_out" ]; then
-      bad "$label: stdout on failure py=[$py_out] sh=[$sh_out]"; return
-    fi
-    if [ -z "$py_err" ] || [ -z "$sh_err" ]; then
-      bad "$label: missing diagnostic py=[$py_err] sh=[$sh_err]"; return
-    fi
-  fi
-  ok
-}
-
 T=$(mktemp -d "${TMPDIR:-/tmp}/mem-store-parity.XXXXXX")
 trap 'rm -rf "$T"' EXIT HUP INT TERM
-mkdir -p "$T/home" "$T/data"
+hearting_test_isolate "$T"
+python3 - "$ROOT" "$T" <<'PY'
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
 
-populate() { mkdir -p "$(dirname "$1")"; : > "$1"; }
+ROOT, FIXTURE = map(Path, sys.argv[1:])
 
-# 1. Explicit override, nonexistent path.
-run_case "explicit-nonexistent" HOME="$T/home" MEM_STORE="$T/does-not-exist"
+class StoreParity(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(dir=FIXTURE)
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        self.home = self.base / 'home'
+        self.home.mkdir()
+        self.data = self.base / 'data'
+        self.canonical = self.data / 'hearting/memory'
+        self.legacy = self.home / '.claude/memory'
+        self.agent = self.base / 'agent'
+        self.managed = self.data / 'hearting/current/memory'
+        self.env = {
+            'HOME': str(self.home), 'PATH': os.defpath,
+            'XDG_DATA_HOME': str(self.data),
+            'XDG_CONFIG_HOME': str(self.base / 'config'),
+            'XDG_STATE_HOME': str(self.base / 'state'),
+            'MEM_WRITE_EVENTS': str(self.base / 'state/write.jsonl'),
+            'MEM_RECALL_EVENTS': str(self.base / 'state/recall.jsonl'),
+            'MEM_RECALL_RECEIPTS': str(self.base / 'state/receipts'),
+            'MEM_PROJECTS': str(self.base / 'projects'),
+        }
 
-# 2. Empty override treated as unset (falls through to no-database R5).
-run_case "explicit-empty" HOME="$T/home" XDG_DATA_HOME="$T/data" MEM_STORE=
+    def populate(self, store):
+        store.mkdir(parents=True, exist_ok=True)
+        (store / 'memory.db').write_bytes(b'synthetic path-probe fixture; never opened')
 
-# 3. Bundle AGENT_HOME (empty) plus populated ~/.claude.
-rm -rf "$T"/*; mkdir -p "$T/home" "$T/data" "$T/bundle/memory"
-populate "$T/home/.claude/memory/memory.db"
-run_case "bundle-empty-legacy-populated" HOME="$T/home" XDG_DATA_HOME="$T/data" AGENT_HOME="$T/bundle"
+    def check(self, expected, *, rc=0, error='', **env):
+        before = self.snapshot()
+        for name, argv in [
+            ('python', [sys.executable, str(ROOT / 'tools/memory/store_resolve.py')]),
+            ('shell', ['sh', str(ROOT / 'utilities/memory-store.sh')]),
+        ]:
+            with self.subTest(implementation=name):
+                got = subprocess.run(argv, env={**self.env, **env}, text=True,
+                                     capture_output=True, timeout=5)
+                self.assertEqual(got.returncode, rc, got.stderr)
+                self.assertEqual(got.stdout, str(expected) + '\n' if rc == 0 else '')
+                self.assertEqual(got.stderr, error + '\n' if error else '')
+        self.assertEqual(self.snapshot(), before, 'resolver mutated the fixture')
 
-# 4. Empty early directory (AGENT_HOME/memory exists empty) + populated later store.
-rm -rf "$T"/*; mkdir -p "$T/home" "$T/data" "$T/bundle/memory"
-populate "$T/data/hearting/memory/memory.db"
-run_case "empty-early-populated-late" HOME="$T/home" XDG_DATA_HOME="$T/data" AGENT_HOME="$T/bundle"
+    def snapshot(self):
+        # lstat only; never follows a self-loop fixture or opens a database.
+        return sorted((str(p.relative_to(self.base)), p.lstat().st_mode,
+                       p.lstat().st_size, p.lstat().st_mtime_ns)
+                      for p in self.base.rglob('*'))
 
-# 5. Two distinct populated databases -> conflict.
-rm -rf "$T"/*; mkdir -p "$T/home"
-populate "$T/home/.claude/memory/memory.db"
-populate "$T/home/hearting/memory/memory.db"
-run_case "conflict-distinct" HOME="$T/home" XDG_DATA_HOME="$T/data"
+    def conflict(self, *stores, **env):
+        self.check('', rc=3, error='memory store resolution error: multiple memory databases found: '
+                   + ', '.join(map(str, stores)) + '; set MEM_STORE to one of them', **env)
 
-# 6. Same database through a symlink alias -- not a conflict.
-rm -rf "$T"/*; mkdir -p "$T/home/.claude/memory" "$T/data/hearting"
-populate "$T/home/.claude/memory/memory.db"
-ln -s "$T/home/.claude/memory" "$T/data/hearting/memory"
-run_case "symlink-alias-no-conflict" HOME="$T/home" XDG_DATA_HOME="$T/data"
+    def error(self, store, **env):
+        self.check('', rc=3, error=f'memory store resolution error: {store}', **env)
 
-# 7. No database, no existing compatibility directory -> canonical XDG default.
-rm -rf "$T"/*; mkdir -p "$T/home" "$T/data"
-run_case "no-database-no-compat-dir" HOME="$T/home" XDG_DATA_HOME="$T/data"
+    def test_explicit_nonexistent(self):
+        self.check(self.base / 'nonexistent', MEM_STORE=str(self.base / 'nonexistent'))
 
-# 8. No database, existing compatibility directory present (non-managed-current).
-rm -rf "$T"/*; mkdir -p "$T/home/.claude/memory" "$T/data"
-run_case "no-database-existing-compat-dir" HOME="$T/home" XDG_DATA_HOME="$T/data"
+    def test_explicit_relative_and_unusual_characters(self):
+        for path in ['relative/store path', str(self.base / 'pipe|colon:tab\tline\nstore')]:
+            self.check(path, MEM_STORE=path)
 
-# 9. No database, only an *empty* managed-current directory exists -> excluded,
-#    falls through to canonical XDG rather than the empty release-adjacent dir.
-rm -rf "$T"/*; mkdir -p "$T/home" "$T/data/hearting/current/memory"
-run_case "managed-current-empty-excluded" HOME="$T/home" XDG_DATA_HOME="$T/data"
+    def test_empty_override_is_unset(self):
+        self.check(self.canonical, MEM_STORE='')
 
-# 10. Managed-current populated: reconnects, participates in conflict checks.
-rm -rf "$T"/*; mkdir -p "$T/home" "$T/data/hearting/current/memory"
-populate "$T/data/hearting/current/memory/memory.db"
-run_case "managed-current-populated" HOME="$T/home" XDG_DATA_HOME="$T/data"
+    def test_bundle_empty_legacy_populated(self):
+        (self.agent / 'memory').mkdir(parents=True)
+        self.populate(self.legacy)
+        self.check(self.legacy, AGENT_HOME=str(self.agent))
 
-# 11. Managed-current populated + another populated candidate -> conflict.
-rm -rf "$T"/*; mkdir -p "$T/home/.claude/memory" "$T/data/hearting/current/memory"
-populate "$T/home/.claude/memory/memory.db"
-populate "$T/data/hearting/current/memory/memory.db"
-run_case "managed-current-conflict" HOME="$T/home" XDG_DATA_HOME="$T/data"
+    def test_empty_early_populated_late(self):
+        (self.agent / 'memory').mkdir(parents=True)
+        self.populate(self.canonical)
+        self.check(self.canonical, AGENT_HOME=str(self.agent))
 
-# 12. Each home-precedence source individually populated.
-rm -rf "$T"/*; mkdir -p "$T/home"
-populate "$T/agent-home/memory/memory.db"
-run_case "precedence-AGENT_HOME" HOME="$T/home" XDG_DATA_HOME="$T/data" AGENT_HOME="$T/agent-home"
+    def test_conflict(self):
+        first = self.home / 'hearting/memory'
+        self.populate(first); self.populate(self.legacy)
+        self.conflict(first, self.legacy)
 
-rm -rf "$T"/*; mkdir -p "$T/home"
-populate "$T/claude-home/memory/memory.db"
-run_case "precedence-CLAUDE_HOME" HOME="$T/home" XDG_DATA_HOME="$T/data" CLAUDE_HOME="$T/claude-home"
+    def test_directory_symlink_alias(self):
+        self.populate(self.legacy)
+        self.canonical.parent.mkdir(parents=True)
+        self.canonical.symlink_to(self.legacy, target_is_directory=True)
+        self.check(self.legacy)
 
-rm -rf "$T"/*; mkdir -p "$T/home"
-populate "$T/home/hearting/memory/memory.db"
-run_case "precedence-HOME-hearting" HOME="$T/home" XDG_DATA_HOME="$T/data"
+    def test_file_symlink_alias(self):
+        first = self.agent / 'memory'
+        self.populate(first)
+        self.legacy.mkdir(parents=True)
+        (self.legacy / 'memory.db').symlink_to(first / 'memory.db')
+        self.check(first, AGENT_HOME=str(self.agent))
 
-rm -rf "$T"/*; mkdir -p "$T/home"
-populate "$T/home/agent_setting/memory/memory.db"
-run_case "precedence-HOME-agent_setting" HOME="$T/home" XDG_DATA_HOME="$T/data"
+    def test_relative_file_symlink_alias(self):
+        first = self.agent / 'memory'
+        self.populate(first)
+        self.legacy.mkdir(parents=True)
+        target = os.path.relpath(first / 'memory.db', self.legacy)
+        (self.legacy / 'memory.db').symlink_to(target)
+        self.check(first, AGENT_HOME=str(self.agent))
 
-# 13. Relative and space-containing explicit paths (R0 preserves them verbatim).
-rm -rf "$T"/*; mkdir -p "$T/home"
-run_case "explicit-relative" HOME="$T/home" MEM_STORE="relative/store path"
-run_case "explicit-space" HOME="$T/home" MEM_STORE="$T/space store/dir"
+    def test_pipe_and_whitespace_candidate(self):
+        unusual = self.base / 'agent|part :\tline\n'
+        self.populate(unusual / 'memory')
+        self.check(unusual / 'memory', AGENT_HOME=str(unusual))
 
-# 14. memory.db as a directory (R2 wrong type) -- not populated, no error.
-rm -rf "$T"/*; mkdir -p "$T/home/.claude/memory/memory.db" "$T/data"
-run_case "memory-db-is-directory" HOME="$T/home" XDG_DATA_HOME="$T/data"
+    def test_pipe_candidates_still_conflict(self):
+        unusual = self.base / 'agent|part'
+        self.populate(unusual / 'memory'); self.populate(self.legacy)
+        self.conflict(unusual / 'memory', self.legacy, AGENT_HOME=str(unusual))
 
-# 15. Dangling symlink -- not populated, no error.
-rm -rf "$T"/*; mkdir -p "$T/home/.claude/memory" "$T/data"
-ln -s "$T/home/.claude/memory/nonexistent-target" "$T/home/.claude/memory/memory.db"
-run_case "dangling-symlink" HOME="$T/home" XDG_DATA_HOME="$T/data"
+    def test_no_database_no_compat_directory(self):
+        self.check(self.canonical)
 
-# 16. Valid database symlink (not an alias of another candidate).
-rm -rf "$T"/*; mkdir -p "$T/home/.claude/memory" "$T/real-target"
-populate "$T/real-target/memory.db"
-ln -s "$T/real-target/memory.db" "$T/home/.claude/memory/memory.db"
-run_case "valid-database-symlink" HOME="$T/home" XDG_DATA_HOME="$T/data"
+    def test_no_database_existing_compat_directory(self):
+        self.legacy.mkdir(parents=True)
+        self.check(self.legacy)
 
-rm -rf "$T"/*
+    def test_empty_managed_current_excluded(self):
+        self.managed.mkdir(parents=True)
+        self.check(self.canonical)
 
-printf 'store-resolve-parity: PASS=%s FAIL=%s\n' "$PASS" "$FAIL"
-[ "$FAIL" -eq 0 ]
+    def test_populated_managed_current(self):
+        self.populate(self.managed)
+        self.check(self.managed)
+
+    def test_managed_current_conflict(self):
+        self.populate(self.legacy); self.populate(self.managed)
+        self.conflict(self.legacy, self.managed)
+
+    def test_each_precedence_source(self):
+        for key, value in [('AGENT_HOME', self.agent), ('CLAUDE_HOME', self.base / 'claude')]:
+            with self.subTest(source=key):
+                self.populate(value / 'memory')
+                self.check(value / 'memory', **{key: str(value)})
+                (value / 'memory/memory.db').unlink()
+        for name in ['hearting', 'agent_setting']:
+            store = self.home / name / 'memory'
+            self.populate(store); self.check(store)
+            (store / 'memory.db').unlink()
+
+    def test_directory_named_memory_db(self):
+        (self.legacy / 'memory.db').mkdir(parents=True)
+        self.check(self.legacy)
+
+    def test_wrong_type_parent_is_absence(self):
+        self.agent.mkdir()
+        (self.agent / 'memory').write_text('not a directory')
+        self.check(self.canonical, AGENT_HOME=str(self.agent))
+
+    def test_dangling_database_symlink(self):
+        self.legacy.mkdir(parents=True)
+        (self.legacy / 'memory.db').symlink_to('missing')
+        self.check(self.legacy)
+
+    def test_dangling_candidate_directory_is_not_fallback(self):
+        self.agent.mkdir()
+        (self.agent / 'memory').symlink_to('missing')
+        self.check(self.canonical, AGENT_HOME=str(self.agent))
+
+    def test_valid_external_database_symlink(self):
+        target = self.base / 'external'
+        self.populate(target)
+        self.legacy.mkdir(parents=True)
+        (self.legacy / 'memory.db').symlink_to(target / 'memory.db')
+        self.check(self.legacy)
+
+    def test_self_loop_before_later_database(self):
+        first = self.agent / 'memory'
+        first.mkdir(parents=True)
+        (first / 'memory.db').symlink_to('memory.db')
+        self.populate(self.legacy)
+        self.error(first, AGENT_HOME=str(self.agent))
+
+    def test_parent_loop_before_later_database(self):
+        self.agent.mkdir()
+        (self.agent / 'memory').symlink_to('memory')
+        self.populate(self.legacy)
+        self.error(self.agent / 'memory', AGENT_HOME=str(self.agent))
+
+    def test_two_link_cycle(self):
+        first = self.agent / 'memory'
+        first.mkdir(parents=True)
+        (first / 'memory.db').symlink_to('other')
+        (first / 'other').symlink_to('memory.db')
+        self.error(first, AGENT_HOME=str(self.agent))
+
+    @unittest.skipIf(os.geteuid() == 0, 'root bypasses filesystem permission denial')
+    def test_inaccessible_parent_before_later_database(self):
+        self.populate(self.agent / 'memory'); self.populate(self.legacy)
+        self.agent.chmod(0)
+        try:
+            self.error(self.agent / 'memory', AGENT_HOME=str(self.agent))
+        finally:
+            self.agent.chmod(0o700)
+
+    def test_first_error_wins_over_earlier_population(self):
+        self.populate(self.agent / 'memory')
+        self.legacy.mkdir(parents=True)
+        (self.legacy / 'memory.db').symlink_to('memory.db')
+        self.error(self.legacy, AGENT_HOME=str(self.agent))
+
+    def test_explicit_override_does_not_probe_loop(self):
+        self.agent.mkdir()
+        (self.agent / 'memory').symlink_to('memory')
+        self.check('explicit path', AGENT_HOME=str(self.agent), MEM_STORE='explicit path')
+
+    def test_symlink_target_trailing_slash_requires_directory(self):
+        target = self.base / 'external'
+        self.populate(target)
+        self.legacy.mkdir(parents=True)
+        (self.legacy / 'memory.db').symlink_to(str(target / 'memory.db') + '/')
+        self.check(self.legacy)
+
+unittest.main(argv=[sys.argv[0]], verbosity=1)
+PY

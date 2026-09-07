@@ -14,6 +14,7 @@ against the shell realization by invoking each as a subprocess and diffing
 stdout/exit status/stderr.
 """
 import os
+import stat
 import sys
 from pathlib import Path
 
@@ -84,14 +85,11 @@ def _probe_populated(candidate):
     """
     db = candidate / "memory.db"
     try:
-        if db.is_symlink():
-            if not db.exists():
-                return False  # dangling symlink: not populated, not an error
-            resolved = db.resolve(strict=True)
-            return resolved.is_file()
-        if not db.exists():
-            return False
-        return db.is_file()
+        # Boolean pathlib probes suppress ELOOP on supported Python versions.
+        # stat preserves real errors in either the parents or the DB symlink.
+        return stat.S_ISREG(db.stat().st_mode)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
     except OSError as exc:
         raise _diagnostic(candidate) from exc
 
@@ -100,7 +98,7 @@ def _resolved_identity(candidate):
     db = candidate / "memory.db"
     try:
         return str(db.resolve(strict=True))
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:
         raise _diagnostic(candidate) from exc
 
 
@@ -143,7 +141,9 @@ def resolve_store(env=None, home=None):
         if is_managed_current:
             continue
         try:
-            exists = candidate.exists() or candidate.is_symlink()
+            exists = stat.S_ISDIR(candidate.stat().st_mode)
+        except (FileNotFoundError, NotADirectoryError):
+            continue
         except OSError as exc:
             raise _diagnostic(candidate) from exc
         if exists:

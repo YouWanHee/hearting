@@ -1371,7 +1371,7 @@ def get_con():
     # silently fabricating an empty store — a worktree/mis-resolved AGENT_HOME would
     # otherwise report "knowledge does not exist" with full confidence. Explicit
     # MEM_STORE (tests, isolated envs) or MEM_INIT=1 (genuine first install) may create.
-    if (not DB.exists()) and "MEM_STORE" not in os.environ \
+    if (not DB.exists()) and not os.environ.get("MEM_STORE") \
             and os.environ.get("MEM_INIT") != "1":
         sys.stderr.write(
             "mem: refusing to create a NEW empty store at a derived path.\n"

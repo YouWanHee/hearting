@@ -99,7 +99,8 @@ else
   echo "codex distill worker: skipping (memory store resolution failed)" >&2
   exit 69
 fi
-export MEM_STORE="$store"
+# Keep caller overrides intact; a derived path grants no permission to
+# initialize an empty store. Child mem.py resolves under the same env.
 mkdir -p "$store"
 
 # Entry stale-GC: SIGKILL/OOM/reboot can orphan a lock or a transient capture file
@@ -260,10 +261,28 @@ if [ "$mode" = "curate" ]; then
 else
   timeout_s=${CODEX_DISTILL_TIMEOUT:-300}
 fi
-if command -v timeout >/dev/null 2>&1; then
-  timeout_cmd="timeout $timeout_s"
+if [ "${MEM_SESSION_COMPLETION:-}" = "1" ]; then
+  # The detached completion runner owns one process group, including every
+  # model descendant. GNU timeout's normal setpgid would escape that cleanup.
+  # Keep the group and retain a finite TERM-to-KILL escalation; fail closed
+  # before the model/apply/advance boundary if this timeout mode is unavailable.
+  case "$timeout_s" in
+    ''|*[!0-9.]*|.*|*.|*.*.*) echo "codex distill worker: completion-timeout-unavailable" >&2; exit 69 ;;
+  esac
+  case "$timeout_s" in
+    *[1-9]*) ;;
+    *) echo "codex distill worker: completion-timeout-unavailable" >&2; exit 69 ;;
+  esac
+  if ! command -v timeout >/dev/null 2>&1 || \
+      ! timeout --foreground --kill-after=2 "$timeout_s" true >/dev/null 2>&1; then
+    echo "codex distill worker: completion-timeout-unavailable" >&2
+    exit 69
+  fi
+  set -- timeout --foreground --kill-after=2 "$timeout_s"
+elif command -v timeout >/dev/null 2>&1; then
+  set -- timeout "$timeout_s"
 else
-  timeout_cmd=""
+  set --
 fi
 
 # no-tools worker: read-only sandbox physically denies every write mechanism (shell or
@@ -273,7 +292,7 @@ fi
 # Wrapped in `if` (not bare, set -e) so a timeout/kill doesn't crash session-end — a
 # failed exec skips apply+advance, leaving the delta for the next session (no data loss).
 if AGENT_SESSION_ROLE=worker MEM_DISTILL=1 python3 "$ROOT/utilities/model-worker-governor.py" \
-  run --class distill -- $timeout_cmd codex exec \
+  run --class distill -- "$@" codex exec \
   --cd "$cwd" \
   --sandbox read-only \
   --ephemeral \
