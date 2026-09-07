@@ -139,6 +139,49 @@ class KindMismatchFixture(RunTestsFixtureBase):
         self.assertEqual(verdicts, {"KIND-MISMATCH"})
 
 
+class FailureKindClassifierTest(unittest.TestCase):
+    def setUp(self):
+        self.mod = load_runner_module()
+
+    def result(self, stderr: str, *, timed_out: bool = False):
+        return self.mod.SuiteResult(
+            "fixture.test.py", 124 if timed_out else 1, timed_out,
+            "", stderr, 0.1, "isolated",
+        )
+
+    def test_timeout_wins_over_reporter_text(self):
+        result = self.result("AssertionError: late\nFAILED (failures=1)\n", timed_out=True)
+        self.assertEqual(self.mod.classify_kind(result), "timeout")
+
+    def test_error_only_unittest_run_is_error(self):
+        result = self.result(
+            "ERROR: test_exchange (module.ExchangeTest.test_exchange)\n"
+            "RuntimeError: runner failed\nFAILED (errors=1)\n"
+        )
+        self.assertEqual(self.mod.classify_kind(result), "error")
+
+    def test_mixed_failure_and_error_is_error(self):
+        result = self.result(
+            "FAIL: test_assertion (module.MixedTest.test_assertion)\n"
+            "AssertionError: mismatch\n"
+            "ERROR: test_runner (module.MixedTest.test_runner)\n"
+            "RuntimeError: setup failed\n"
+            "FAILED (failures=1, errors=1)\n"
+        )
+        self.assertEqual(self.mod.classify_kind(result), "error")
+
+    def test_failed_word_without_unittest_structure_is_exit_nonzero(self):
+        result = self.result("worker FAILED to acquire an optional probe\n")
+        self.assertEqual(self.mod.classify_kind(result), "exit-nonzero")
+
+    def test_assertion_only_unittest_run_is_assertion(self):
+        result = self.result(
+            "FAIL: test_value (module.ValueTest.test_value)\n"
+            "AssertionError: values differ\nFAILED (failures=1)\n"
+        )
+        self.assertEqual(self.mod.classify_kind(result), "assertion")
+
+
 class XPassFixture(RunTestsFixtureBase):
     def test_xpass_is_hard_failure_not_silent_shrink(self):
         write_suite(self.root, "now_passes.test.py", "import sys\nsys.exit(0)\n")
@@ -581,6 +624,40 @@ class RetryFixture(RunTestsFixtureBase):
         result, rows = self.run_fixture(self.baseline(), extra_args=["--retries", "1"])
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(rows[0]["detail"], "attempts=2; outcomes=known-fail,pass; policy=flaky-timing")
+
+    def test_diagnostics_preserve_every_retry_attempt(self):
+        write_suite(self.root, "retry.test.py", """
+            from pathlib import Path
+            import sys
+            p = Path('attempts.txt')
+            n = int(p.read_text()) + 1 if p.exists() else 1
+            p.write_text(str(n))
+            print(f'run stdout attempt {n}')
+            print(f'run stderr attempt {n}', file=sys.stderr)
+            if n == 1:
+                sys.exit(1)
+        """)
+        diagnostics = self.root / "diagnostics"
+        result, rows = self.run_fixture(
+            self.baseline(),
+            extra_args=["--retries", "1", "--diagnostics-dir", str(diagnostics)],
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(rows[0]["verdict"], "FLAKY-KNOWN-FAIL")
+        lines = (diagnostics / "index.tsv").read_text(encoding="utf-8").splitlines()
+        header = lines[0].split("\t")
+        attempts = [dict(zip(header, line.split("\t"))) for line in lines[1:]]
+        self.assertEqual([row["attempt"] for row in attempts], ["1", "2"])
+        self.assertEqual([row["kind"] for row in attempts], ["exit-nonzero", ""])
+        for number, row in enumerate(attempts, start=1):
+            self.assertIn(
+                f"run stdout attempt {number}",
+                (diagnostics / row["stdout_path"]).read_text(encoding="utf-8"),
+            )
+            self.assertIn(
+                f"run stderr attempt {number}",
+                (diagnostics / row["stderr_path"]).read_text(encoding="utf-8"),
+            )
 
 
 class CiLikeProfileFixture(unittest.TestCase):

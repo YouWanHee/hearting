@@ -698,12 +698,23 @@ def last_nonempty_line(text: str) -> str:
 def classify_kind(result: SuiteResult) -> str:
     if result.timed_out:
         return "timeout"
-    stderr_tail = (result.stderr or "")
-    if "AssertionError" in stderr_tail or re.search(r"\bFAILED\b", stderr_tail):
-        return "assertion"
+    stderr_tail = result.stderr or ""
     if re.search(r"(command not found|No such file or directory).*\b(binary|executable)?\b", stderr_tail, re.IGNORECASE) or \
        re.search(r": command not found$", last_nonempty_line(stderr_tail)):
         return "missing-binary"
+    # unittest ends both failures and errors with the word "FAILED".  That
+    # summary word alone carries no failure kind: ERROR headers/errors=N mean
+    # the test did not complete normally, while FAIL headers/failures=N and an
+    # AssertionError identify a completed assertion failure.  Error wins for a
+    # mixed run so a runner/setup error cannot hide behind a peer assertion.
+    if re.search(r"^ERROR:\s+", stderr_tail, re.MULTILINE) or re.search(
+        r"\bFAILED\s*\([^)]*\berrors?=\d+", stderr_tail
+    ):
+        return "error"
+    if "AssertionError" in stderr_tail or re.search(
+        r"^FAIL:\s+", stderr_tail, re.MULTILINE
+    ) or re.search(r"\bFAILED\s*\([^)]*\bfailures?=\d+", stderr_tail):
+        return "assertion"
     if re.search(r"(Traceback|ImportError|ModuleNotFoundError|SyntaxError|CollectionError)", stderr_tail):
         return "error"
     return "exit-nonzero"
@@ -987,6 +998,70 @@ def write_report(path: Path, rows: list[dict[str, str]]) -> None:
             fh.write("\t".join(str(row.get(c, "")) for c in REPORT_COLUMNS) + "\n")
 
 
+DIAGNOSTIC_INDEX_COLUMNS = [
+    "suite_path",
+    "attempt",
+    "returncode",
+    "timed_out",
+    "kind",
+    "isolation_profile",
+    "duration_s",
+    "stdout_path",
+    "stderr_path",
+]
+
+
+def write_failure_diagnostics(
+    path: Path, results_by_suite: dict[str, list[SuiteResult]]
+) -> tuple[int, int]:
+    """Persist every attempt for suites with at least one failed attempt.
+
+    A digest-prefixed directory keeps arbitrary suite names from becoming
+    paths while the index retains the exact repository-relative name.  Passing
+    retries are intentionally retained beside their failed peer: without them
+    a flaky aggregate cannot be reconstructed from the CI artifact.
+    """
+    path.mkdir(parents=True, exist_ok=True)
+    rows: list[dict[str, str]] = []
+    failing_suites = 0
+    for suite_path in sorted(results_by_suite):
+        attempts = results_by_suite[suite_path]
+        if not any(not attempt.passed for attempt in attempts):
+            continue
+        failing_suites += 1
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", Path(suite_path).name)[:80]
+        digest = hashlib.sha256(suite_path.encode("utf-8")).hexdigest()[:12]
+        suite_dir = path / f"{digest}-{safe_name or 'suite'}"
+        suite_dir.mkdir(parents=True, exist_ok=True)
+        for attempt_number, result in enumerate(attempts, start=1):
+            prefix = f"attempt-{attempt_number:03d}"
+            stdout_path = suite_dir / f"{prefix}.stdout.txt"
+            stderr_path = suite_dir / f"{prefix}.stderr.txt"
+            stdout_path.write_text(result.stdout or "", encoding="utf-8")
+            stderr_path.write_text(result.stderr or "", encoding="utf-8")
+            rows.append(
+                {
+                    "suite_path": suite_path,
+                    "attempt": str(attempt_number),
+                    "returncode": str(result.returncode),
+                    "timed_out": "1" if result.timed_out else "0",
+                    "kind": classify_kind(result) if not result.passed else "",
+                    "isolation_profile": result.profile,
+                    "duration_s": f"{result.duration_s:.2f}",
+                    "stdout_path": str(stdout_path.relative_to(path)),
+                    "stderr_path": str(stderr_path.relative_to(path)),
+                }
+            )
+    index = path / "index.tsv"
+    with index.open("w", encoding="utf-8") as handle:
+        handle.write("\t".join(DIAGNOSTIC_INDEX_COLUMNS) + "\n")
+        for row in rows:
+            handle.write(
+                "\t".join(row[column] for column in DIAGNOSTIC_INDEX_COLUMNS) + "\n"
+            )
+    return failing_suites, len(rows)
+
+
 SEED_VERDICTS = {"FAIL", "TIMEOUT", "ERROR", "EXPIRED", "KIND-MISMATCH"}
 
 
@@ -1126,6 +1201,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
              "for environments that did not seed the baseline (MA-W1-011)",
     )
     p.add_argument("--report", type=Path, default=None)
+    p.add_argument(
+        "--diagnostics-dir",
+        type=Path,
+        default=None,
+        help="write stdout/stderr for every attempt of each failing suite",
+    )
     p.add_argument("--root", type=Path, default=ROOT)
     p.add_argument("--baseline", type=Path, default=ROOT / "tools" / "test-baseline.tsv")
     p.add_argument("--isolation-tsv", type=Path, default=ROOT / "tools" / "test-isolation.tsv")
@@ -1699,6 +1780,22 @@ def main(argv: list[str]) -> int:
                     "__live_state_unattributed__::-", "ERROR", "internal",
                     f"{len(unattributed_new)} new live-state path(s) with no positive own or foreign evidence",
                 ))
+
+    if args.diagnostics_dir:
+        try:
+            diagnostic_suites, diagnostic_attempts = write_failure_diagnostics(
+                args.diagnostics_dir, results_by_suite
+            )
+            print(
+                f"diagnostics={args.diagnostics_dir} "
+                f"failing_suites={diagnostic_suites} attempts={diagnostic_attempts}"
+            )
+        except OSError as exc:
+            detail = f"{exc.__class__.__name__}: {exc}"
+            print(f"FATAL: diagnostics write failed: {detail}", file=sys.stderr)
+            hard_failures.append(
+                ("__diagnostics_write__::-", "ERROR", "internal", detail)
+            )
 
     if args.report:
         write_report(args.report, report_rows)
