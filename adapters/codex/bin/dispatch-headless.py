@@ -2517,12 +2517,7 @@ def main(argv: list[str]) -> int:
             ),
             (
                 (dispatch_state_root(args.jobs_path),)
-                if args.nested_headless_network
-                or (
-                    args.dispatch_depth == 2
-                    and args.route_id
-                    and getattr(args, "command_attempt_id", None)
-                )
+                if registry_writable_launch(args)
                 else ()
             ),
         )

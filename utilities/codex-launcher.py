@@ -92,20 +92,106 @@ class LauncherError(RuntimeError):
     """Installed launcher state is unsafe or incomplete."""
 
 
-def _launcher_lock(home: Path):
-    path = home / ".harness" / "codex-launcher.lock"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    handle = path.open("a+b")
-    os.chmod(path, 0o600)
-    if fcntl is not None:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-    return handle
+LOCK_NAME = "codex-launcher.lock"
+# A nested sandbox may read the installed lock without modifying its directory.
+# Lock acquisition failures remain refusals; per-file atomic reads do not replace
+# the installer's multi-file transaction lock.
+_READ_FLAGS = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
 
 
-def _unlock(handle) -> None:
-    if fcntl is not None:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-    handle.close()
+def _open_lock_descriptor(path: Path) -> int:
+    try:
+        return os.open(path, _READ_FLAGS)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise LauncherError(f"unsafe Codex launcher lock: {path}") from exc
+    create = (
+        os.O_RDWR | os.O_CREAT | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return os.open(path, create, 0o600)
+    except FileExistsError:
+        # Join the winner's lock; a failed reopen must not bypass synchronization.
+        try:
+            return os.open(path, _READ_FLAGS)
+        except OSError as exc:
+            raise LauncherError(f"unsafe Codex launcher lock: {path}") from exc
+    except OSError as exc:
+        raise LauncherError(f"Codex launcher lock unavailable: {path}") from exc
+
+
+def _launcher_lock(home: Path) -> int:
+    """Join the installer's lock protocol as a reader, without writing to it.
+
+    `tools/install/codex_launcher.py` holds this lock `LOCK_EX` for the whole
+    install transaction, so a reader still has to take it -- otherwise it can
+    read a `codex-launcher.json` whose recorded ingress and vendor binary are
+    only half in place. But the launcher never mutates that state, so it needs
+    the reader half: a shared flock on a descriptor opened read-only.
+
+    Taking it exclusively (`open("a+b")` plus an unconditional `chmod`) is what
+    made every managed `codex` invocation exit 69 with `[Errno 30] Read-only
+    file system` under a nested sandboxed reviewer, including pass-through
+    commands such as `codex exec` that read nothing but the recorded command.
+
+    A missing lock may be created only if the directory permits it. Otherwise
+    refuse, as before: an unlocked read cannot preserve the install transaction.
+    """
+    path = home / ".harness" / LOCK_NAME
+    descriptor = _open_lock_descriptor(path)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+            raise LauncherError(f"unsafe Codex launcher lock: {path}")
+        if fcntl is not None:
+            fcntl.flock(descriptor, fcntl.LOCK_SH)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _unlock(descriptor: int | None) -> None:
+    if descriptor is None:
+        return
+    try:
+        if fcntl is not None:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
+def _read_private_file(path: Path, limit: int, unavailable: str, unsafe: str) -> str:
+    """Read one owner-private launcher file through a single descriptor.
+
+    Type, size, owner, and mode are all checked with `fstat` on the descriptor
+    the bytes come from, so an installer's atomic replace can never pair one
+    inode's permissions with another inode's content. `O_NOFOLLOW` rejects a
+    symlinked pathname the same way the previous `is_symlink()` check did.
+    """
+    try:
+        descriptor = os.open(path, _READ_FLAGS)
+    except OSError as exc:
+        raise LauncherError(unavailable) from exc
+    try:
+        with os.fdopen(descriptor, "rb") as handle:
+            info = os.fstat(handle.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+                raise LauncherError(unavailable)
+            if info.st_uid != os.geteuid() or info.st_mode & 0o077:
+                raise LauncherError(unsafe)
+            payload = handle.read(limit + 1)
+    except OSError as exc:
+        raise LauncherError(unavailable) from exc
+    if len(payload) > limit:
+        raise LauncherError(unavailable)
+    try:
+        return payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise LauncherError(unavailable) from exc
 
 
 def _codex_home() -> Path:
@@ -134,14 +220,15 @@ def _state(home: Path) -> dict:
     if harness_state.is_symlink() or not harness_state.is_dir():
         raise LauncherError(f"managed launcher state directory is unsafe: {harness_state}")
     path = home / ".harness" / "codex-launcher.json"
-    if path.is_symlink() or not path.is_file() or path.stat().st_size > 32_768:
-        raise LauncherError(f"managed launcher state is unavailable: {path}")
-    info = path.stat()
-    if info.st_uid != os.geteuid() or info.st_mode & 0o077:
-        raise LauncherError(f"managed launcher state permissions are unsafe: {path}")
+    raw = _read_private_file(
+        path,
+        32_768,
+        f"managed launcher state is unavailable: {path}",
+        f"managed launcher state permissions are unsafe: {path}",
+    )
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
         raise LauncherError(f"managed launcher state is invalid: {path}") from exc
     if not isinstance(value, dict) or value.get("schema") not in {1, 2} or value.get("phase") != "installed":
         raise LauncherError(f"managed launcher state is incomplete: {path}")
@@ -168,14 +255,15 @@ def pinned_runtime(home: Path) -> dict:
     """Resolve one activation root once for the lifetime of a new session."""
 
     path = home / ".harness" / "activation.json"
-    if path.is_symlink() or not path.is_file() or path.stat().st_size > 2_000_000:
-        raise LauncherError(f"runtime activation state is unavailable: {path}")
-    info = path.stat()
-    if info.st_uid != os.geteuid() or info.st_mode & 0o077:
-        raise LauncherError(f"runtime activation state permissions are unsafe: {path}")
+    raw = _read_private_file(
+        path,
+        2_000_000,
+        f"runtime activation state is unavailable: {path}",
+        f"runtime activation state permissions are unsafe: {path}",
+    )
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
         raise LauncherError(f"runtime activation state is invalid: {path}") from exc
     if (
         not isinstance(value, dict)
