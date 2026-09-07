@@ -1130,30 +1130,24 @@ class ClaudeResumeProbe:
 def probe_claude_session_resume() -> ClaudeResumeProbe:
     if shutil.which("claude") is None:
         return ClaudeResumeProbe("indeterminate", "binary-absent", None, 0, (), "help-file")
-    fd, raw_path = tempfile.mkstemp(suffix=".claude-help.txt")
-    os.close(fd)
-    help_path = Path(raw_path)
     try:
-        try:
-            with open(help_path, "wb") as sink:
-                result = subprocess.run(
-                    ["claude", "--help"],
-                    stdin=subprocess.DEVNULL,
-                    stdout=sink,
-                    stderr=subprocess.STDOUT,
-                    timeout=10,
-                    check=False,
-                )
-        except subprocess.TimeoutExpired:
-            return ClaudeResumeProbe("indeterminate", "timeout", None, 0, (), "help-file")
-        except OSError:
-            return ClaudeResumeProbe("indeterminate", "probe-error", None, 0, (), "help-file")
-        raw = help_path.read_bytes()
-    finally:
-        try:
-            help_path.unlink()
-        except OSError:
-            pass
+        # An anonymous regular file preserves truncation-resistant capture and
+        # closes storage creation/read errors inside the same typed probe path.
+        with tempfile.TemporaryFile(mode="w+b") as sink:
+            result = subprocess.run(
+                ["claude", "--help"],
+                stdin=subprocess.DEVNULL,
+                stdout=sink,
+                stderr=subprocess.STDOUT,
+                timeout=10,
+                check=False,
+            )
+            sink.seek(0)
+            raw = sink.read()
+    except subprocess.TimeoutExpired:
+        return ClaudeResumeProbe("indeterminate", "timeout", None, 0, (), "help-file")
+    except OSError:
+        return ClaudeResumeProbe("indeterminate", "probe-error", None, 0, (), "help-file")
     stdout_bytes = len(raw)
     if result.returncode != 0:
         return ClaudeResumeProbe(

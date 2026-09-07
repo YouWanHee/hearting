@@ -110,6 +110,17 @@ class SD63TruncationProbe(unittest.TestCase):
         os.environ["PATH"] = self._old_path
         self._tmp.cleanup()
 
+    def test_unavailable_probe_storage_is_typed_indeterminate(self):
+        _write_fake_claude(self.bindir, _complete_help_source(True, True))
+        # Both named and anonymous regular-file capture must handle a missing
+        # temporary directory as an uncertain probe, before spawning the CLI.
+        with unittest.mock.patch.object(WH.tempfile, "tempdir", str(self.bindir / "absent")):
+            probe = WH.probe_claude_session_resume()
+            self.assertEqual((probe.status, probe.reason), ("indeterminate", "probe-error"))
+            with self.assertRaises(WH.DispatchContractError) as caught:
+                WH.resolve_completion_delivery(_owner_args())
+            self.assertEqual(caught.exception.reason, "claude-session-resume-indeterminate")
+
     # A: complete help, both flags present -> supported
     def test_a_complete_help_both_flags_is_supported(self):
         _write_fake_claude(self.bindir, _complete_help_source(True, True))
