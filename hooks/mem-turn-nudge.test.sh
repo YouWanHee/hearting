@@ -223,5 +223,85 @@ for conflict_hook in "$HOOK" "$BRIEFING"; do
     bad "conflict: $conflict_hook did not fail open without side effects"
   fi
 done
+
+echo "== R0: explicit trailing-LF store paths survive shell consumers =="
+if python3 - "$ROOT" "$HEARTING_TEST_ROOT" <<'PY'
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+repo, outer = map(Path, sys.argv[1:])
+env = {key: os.environ[key] for key in (
+    'PATH', 'HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME',
+    'MEM_PROJECTS', 'MEM_WRITE_EVENTS', 'MEM_RECALL_EVENTS',
+    'MEM_RECALL_RECEIPTS', 'GIT_CONFIG_GLOBAL', 'TMPDIR',
+)}
+env.update(AGENT_HOME=str(repo), CODEX_HOME=str(outer / 'codex-home'),
+           CLAUDE_CONFIG_DIR=str(outer / 'claude-config'),
+           GIT_CONFIG_NOSYSTEM='1', PYTHONDONTWRITEBYTECODE='1',
+           PYTHONNOUSERSITE='1', MEM_NUDGE_INTERVAL='100',
+           MEM_DISTILL_ENABLE='0', CODEX_DISTILL_ENABLE='0')
+for adapter in ('shared', 'codex'):
+    for label, suffix in (('one LF', '\n'), ('two LFs', '\n\n'), ('LF only', None)):
+        with tempfile.TemporaryDirectory(prefix='trailing-lf-', dir=outer) as temporary:
+            cwd = Path(temporary)
+            raw_store = '\n' if suffix is None else str(cwd / 'store') + suffix
+            sid = cwd.name + '-' + adapter
+            marker = ('.turn-state-' if adapter == 'shared' else '.codex-turn-state-') + sid
+            expected = cwd / Path(raw_store) / marker
+            case_env = dict(env, MEM_STORE=raw_store)
+            stripped = None if suffix is None else Path(raw_store.rstrip('\n')) / marker
+            if suffix is None:
+                # A lost LF-only override would make the marker root-relative.
+                # Observe the actual shell variable and stop before the next
+                # command if it is empty; never probe that escaped path.
+                guard = cwd / 'empty-store-guard.sh'
+                guard.write_text('''_r0_fixture_guard() {
+  case "$1" in STORE=*|store=*) return 0 ;; esac
+  if { [ "${STORE+x}" = x ] && [ -z "${STORE:-}" ]; } ||
+     { [ "${store+x}" = x ] && [ -z "${store:-}" ]; }; then
+    printf 'R0 fixture blocked empty store before filesystem access\\n' >&2
+    exit 97
+  fi
+  return 0
+}
+trap '_r0_fixture_guard "$BASH_COMMAND"' DEBUG
+''')
+                case_env['BASH_ENV'] = str(guard)
+                sentinel = cwd / 'blocked-write'
+                probe = subprocess.run(
+                    ['bash', '-c', 'STORE=; : > "$R0_FIXTURE_SENTINEL"'],
+                    cwd=cwd, env=dict(case_env, R0_FIXTURE_SENTINEL=str(sentinel)),
+                    capture_output=True, timeout=5,
+                )
+                assert probe.returncode == 97 and not sentinel.exists(), 'empty-store fixture guard failed'
+            else:
+                assert not stripped.exists(), (adapter, label, 'unexpected pre-existing marker')
+            command = (["bash", str(repo / 'hooks/mem-turn-nudge.sh')]
+                       if adapter == 'shared' else
+                       [str(repo / 'adapters/codex/bin/preflight.sh'), 'turn-nudge', str(cwd), sid])
+            if suffix is None and adapter == 'codex':
+                command.insert(0, 'bash')  # DEBUG guard surrounds the actual POSIX preflight source.
+            result = subprocess.run(
+                command, cwd=cwd, env=case_env,
+                input=json.dumps({'hook_event_name': 'UserPromptSubmit', 'session_id': sid}).encode(),
+                capture_output=True, timeout=10,
+            )
+            assert (result.returncode, result.stdout, result.stderr) == (0, b'', b''), (
+                adapter, label, result.returncode, result.stdout, result.stderr)
+            assert expected.is_file() and expected.read_bytes() == b'1\n', (
+                adapter, label, 'counter missing from exact MEM_STORE path', str(expected))
+            if stripped is not None:
+                assert not stripped.exists(), (adapter, label, 'counter created in stripped path')
+            print(f'  R0 consumer: {adapter}, {label}: exact marker only')
+PY
+then
+  ok "R0: shared and Codex nudge preserve 1 LF, 2 LFs, and LF-only relative overrides (6 cases)"
+else
+  bad "R0: a nudge consumer changed the explicit MEM_STORE path"
+fi
 echo "RESULT: PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" = "0" ]

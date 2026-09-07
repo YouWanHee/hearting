@@ -104,6 +104,8 @@ if ! STORE=$(sh "$HOOK_DIR/../utilities/memory-store.sh"); then
   echo "mem-briefing-inject: skipping (memory store resolution failed)" >&2
   exit 0
 fi
+# Command substitution trims trailing LF; R0 must retain the raw override.
+STORE="${MEM_STORE:-$STORE}"
 STATE="$STORE/.briefing-$TODAY"
 
 [ -f "$ONCALL" ] || exit 0      # No report yet: skip.

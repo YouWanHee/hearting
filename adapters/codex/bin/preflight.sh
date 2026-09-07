@@ -581,7 +581,7 @@ case "$cmd" in
     # the resolver's stderr diagnostic intact and stops `set -e` from
     # bypassing this fail-open branch on a conflict/error exit.
     if store=$(AGENT_HOME="$AGENT_ROOT" sh "$ROOT/utilities/memory-store.sh"); then
-      :
+      store="${MEM_STORE:-$store}" # Retain R0 trailing LF lost by substitution.
     else
       echo "turn-nudge: skipping (memory store resolution failed)" >&2
       exit 0

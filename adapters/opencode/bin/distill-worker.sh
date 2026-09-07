@@ -107,7 +107,7 @@ fi
 # and swallowed stderr, so a real store conflict was silently misread as an
 # empty delta instead of failing closed.
 if store=$(AGENT_HOME="$AGENT_ROOT" sh "$ROOT/utilities/memory-store.sh"); then
-  :
+  store="${MEM_STORE:-$store}" # Retain R0 trailing LF lost by substitution.
 else
   echo "opencode distill worker: skipping (memory store resolution failed)" >&2
   exit 69
