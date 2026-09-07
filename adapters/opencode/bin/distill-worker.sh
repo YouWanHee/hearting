@@ -223,13 +223,20 @@ $snapshot
 $artifacts
 === END ARTIFACTS ===
 
-Decide contextually whether any memory action is useful. Storing, reinforcing,
-merging, pruning, graduating, and reattributing are semantic judgments for you,
-not decisions made by fixed categories, keywords, scores, or thresholds.
+Decide contextually whether any memory action is useful. The storage purpose is
+limited to canonical decisions, user corrections, unresolved obligations, and
+artifact pointers. Never copy content already preserved in an artifact.
 Snapshot signals and artifact state are evidence, not automatic commands.
 
+Capsule fields support retrieval:
+- aliases: 2-4 synonyms, including the other language when the body is bilingual.
+- entities: file paths, commit hashes, module names, and IDs that appear in the body.
+- topics: 1-3 broad subject tags.
+Copy the shapes below, not the literal example values; emit [] only when the field
+has no member.
+
 Output contract: stdout contains JSON objects only, one per line. Allowed shapes:
-  {"action":"add","tier":"working|durable","type":"<descriptive type>","body":"<summary>"}
+  {"action":"add","tier":"working|durable","type":"decision|user-correction|unresolved-obligation|artifact-pointer","body":"<minimal canonical content>","headline":"<retrieval headline>","aliases":["bounded retry","바운디드 재시도"],"entities":["hooks/mem-distill-dispatch.sh","D-41","a7c01b7d"],"topics":["memory-pipeline","dispatch"],"artifact_refs":[]}
   {"action":"reinforce","id":"<snapshot id>"}
   {"action":"merge","ids":["<id>","<id>"],"canonical":"<id>"}
   {"action":"prune","id":"<snapshot id>"}
@@ -238,7 +245,8 @@ Output contract: stdout contains JSON objects only, one per line. Allowed shapes
 
 Mechanical boundaries:
 - Choose the tier from its lifecycle: working is finite-lived; durable persists.
-  Type is a descriptive label, not a semantic gate.
+- artifact-pointer requires artifact_refs and its body records only why/when to
+  retrieve the artifact, never a duplicate summary.
 - Do not add an existing snapshot record again.
 - PROTECTED PENDING records are excluded from destructive IDS and remain
   untouched until explicit consumption.
