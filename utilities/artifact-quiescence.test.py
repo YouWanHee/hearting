@@ -7,6 +7,7 @@ from pathlib import Path
 import tempfile
 import unittest
 import fcntl
+from unittest.mock import patch
 
 P = Path(__file__).with_name("artifact-quiescence.py")
 S = importlib.util.spec_from_file_location("artifact_quiescence_tested", P)
@@ -15,6 +16,91 @@ S.loader.exec_module(Q)
 
 
 class QuiescenceTest(unittest.TestCase):
+    def indexed(self, config, *paths):
+        Path(config["resource_index"]).write_text(json.dumps({"schema_version": 1,
+            "registries": {str(i): {"path": str(p)} for i, p in enumerate(paths)}}))
+
+    def test_missing_registry_is_sealed_skip_and_preserves_live_neighbor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory); config = self.fixture(base)
+            missing = base / "gone" / "registry.json"
+            self.indexed(config, missing)
+            evidence = base / "missing.json"
+            value = Q.publish(str(evidence), config)
+            self.assertTrue(value["proven"], value)
+            self.assertIn(str(missing), [r["path"] for r in value["sources"]["jobs"]["files"]
+                                        if r["kind"] == "missing"])
+            self.assertEqual(value["sources"]["jobs"]["diagnostics"][0]["kind"], "missing-registry")
+            self.assertTrue(Q.validate(str(evidence), allow_fixture=True)["proven"])
+            missing.parent.mkdir(); missing.write_text('{"schema_version":1,"runs":{}}')
+            self.assertFalse(Q.validate(str(evidence), allow_fixture=True)["proven"])
+            identity = Q.RESOURCES.proc_identity(os.getpid())
+            missing.write_text(json.dumps({"schema_version": 1, "runs": {
+                "active": {**identity, "status": "running"}}}))
+            self.indexed(config, missing, base / "another-missing.json")
+            live = Q.publish(str(base / "live.json"), config)
+            self.assertTrue(live["observation_valid"], live)
+            self.assertEqual(live["open_jobs"], 1)
+            self.assertFalse(live["proven"])
+
+    def test_dangling_registry_is_not_missing_skip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory); config = self.fixture(base)
+            link = base / "link"; link.symlink_to(base / "absent")
+            for path in (link, link / "child.json"):
+                self.indexed(config, path)
+                self.assertFalse(Q.publish(str(base / "bad.json"), config)["observation_valid"])
+
+    def test_registry_seen_only_by_scan_cannot_disappear_between_bookends(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory); config = self.fixture(base)
+            source = base / "transient.json"; self.indexed(config, source)
+            original = Q.RESOURCES.scan
+            def transient(*args, **kwargs):
+                source.write_text('{"schema_version":1,"runs":{}}')
+                try:
+                    return original(*args, **kwargs)
+                finally:
+                    source.unlink()
+            with patch.object(Q.RESOURCES, "scan", transient):
+                value = Q.publish(str(base / "transient-evidence.json"), config)
+            self.assertFalse(value["observation_valid"], value)
+            self.assertEqual(value["reason"], "source-changed-during-observation")
+
+    def test_registry_permission_corruption_and_fifo_fail_closed_with_attribution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory); config = self.fixture(base)
+            source = base / "source.json"; self.indexed(config, source)
+            for text in ('{', '[]', '{"schema_version":99,"runs":{}}'):
+                source.write_text(text)
+                value = Q.publish(str(base / "bad.json"), config)
+                self.assertFalse(value["observation_valid"], value)
+                self.assertEqual(value["source_diagnostics"][0]["path"], str(source))
+            original = os.open
+            def denied(path, *args, **kwargs):
+                if Path(path) == source:
+                    raise PermissionError("fixture denied")
+                return original(path, *args, **kwargs)
+            with patch.object(os, "open", denied):
+                value = Q.publish(str(base / "denied.json"), config)
+            self.assertFalse(value["proven"])
+            self.assertEqual(value["source_diagnostics"][0]["path"], str(source))
+            source.unlink(); os.mkfifo(source)
+            value = Q.publish(str(base / "fifo.json"), config)
+            self.assertFalse(value["proven"])
+
+    def test_valid_registry_symlink_is_sealed_and_retargeting_invalidates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory); config = self.fixture(base)
+            a = base / "a.json"; b = base / "b.json"
+            for p in (a, b):
+                p.write_text('{"schema_version":1,"runs":{}}')
+            link = base / "link.json"; link.symlink_to(a); self.indexed(config, link)
+            evidence = base / "evidence.json"
+            self.assertTrue(Q.publish(str(evidence), config)["proven"])
+            link.unlink(); link.symlink_to(b)
+            self.assertFalse(Q.validate(str(evidence), allow_fixture=True)["proven"])
+
     def fixture(self, base: Path):
         artifact_root = base / "artifacts"
         (artifact_root / ".runtime" / "routes").mkdir(parents=True)

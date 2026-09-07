@@ -37,6 +37,12 @@ RESOURCES = _load("artifact_quiescence_resources", "resource_run_registry.py")
 DISPATCH = _load("artifact_quiescence_dispatch", "dispatch-registry.py")
 
 
+class SourceError(ValueError):
+    def __init__(self, reason: str, diagnostics: list[dict]):
+        super().__init__(reason)
+        self.diagnostics = diagnostics
+
+
 def _digest_bytes(value: bytes) -> str:
     return "sha256:" + hashlib.sha256(value).hexdigest()
 
@@ -86,7 +92,15 @@ def _resource_snapshot(index_path: Path) -> dict:
     paths, diagnostics = RESOURCES.indexed_paths(index_path)
     if diagnostics:
         raise ValueError("resource-index-unverifiable")
-    return _snapshot([_file_row(index_path), *(_file_row(path) for path in paths)])
+    rows = [_file_row(index_path)]
+    for path in paths:
+        try:
+            source, _ = RESOURCES.read_registry_source(path)
+            rows.append(source)
+        except Exception as exc:
+            raise SourceError("resource-source-unverifiable", [
+                {"path": str(path), "kind": "unverifiable-registry", "error": str(exc)}]) from exc
+    return _snapshot(rows)
 
 
 def _dispatch_snapshot(jobs: Path) -> dict:
@@ -169,9 +183,14 @@ def collect(config: dict, now: datetime | None = None) -> dict:
         and (Path(row.get("path", "")).parent == canonical_routes
              or "route" in Path(row.get("path", "")).name.lower())
     ]
-    resource_rows, resource_diagnostics = RESOURCES.scan(index_path=config["resource_index"])
-    if resource_diagnostics:
-        raise ValueError("resource-source-unverifiable")
+    scanned_sources: list[dict] = []
+    resource_rows, resource_diagnostics = RESOURCES.scan(
+        index_path=config["resource_index"], observed_sources=scanned_sources)
+    if any(row.get("kind") != "missing-registry" for row in resource_diagnostics):
+        raise SourceError("resource-source-unverifiable", resource_diagnostics)
+    scanned = _snapshot([_file_row(Path(config["resource_index"])), *scanned_sources])
+    if scanned != before["jobs"]:
+        raise ValueError("source-changed-during-observation")
     dispatch_rows = _dispatch_rows(Path(config["dispatch_jobs"]))
     after = _source_snapshots(config)
     if before != after:
@@ -193,7 +212,7 @@ def collect(config: dict, now: datetime | None = None) -> dict:
     stamp = _observed_at(now)
     sources = {
         "routes": {"reader": "capability-route.py:route_status", "count": counts["open_routes"], **after["routes"]},
-        "jobs": {"reader": "resource_run_registry.py:scan", "count": counts["open_jobs"], **after["jobs"]},
+        "jobs": {"reader": "resource_run_registry.py:scan", "count": counts["open_jobs"], "diagnostics": resource_diagnostics, **after["jobs"]},
         "dispatch": {"reader": "dispatch-registry.py:current(read_rows)", "count": counts["open_dispatch_attempts"], **after["dispatch"]},
         "lock": {"reader": "flock(LOCK_EX|LOCK_NB)", "count": int(lock_present), **after["lock"]},
     }
@@ -294,6 +313,8 @@ def publish(output: str, config: dict, now: datetime | None = None) -> dict:
             "sources": {},
             "reason": str(exc).replace("\n", " ")[:160],
         }
+        if isinstance(exc, SourceError):
+            payload["source_diagnostics"] = exc.diagnostics
     _atomic(Path(output), payload)
     return payload
 
