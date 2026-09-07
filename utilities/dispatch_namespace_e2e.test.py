@@ -59,7 +59,10 @@ INHERITED_DISPATCH_KEYS = (
 
 def base_environ() -> dict:
     """os.environ minus any inherited dispatch/route identity."""
-    return {k: v for k, v in os.environ.items() if k not in INHERITED_DISPATCH_KEYS}
+    return {k: v for k, v in os.environ.items()
+            if k not in INHERITED_DISPATCH_KEYS and not k.startswith(
+                ("AGENT_ARTIFACT_", "AGENT_PRODUCER_", "AGENT_ROUTE_",
+                 "AGENT_OWNER_ROUTE_", "AGENT_DISPATCH_", "REPORT_BUNDLE_"))}
 
 
 # Fake harness executables. Both print the harness's real terminal envelope
@@ -607,6 +610,10 @@ class NamespaceE2E(unittest.TestCase):
                 "execution_surface=registered-headless,registered_worker=1,"
                 f"fallback_hop=same-harness-headless,worker_type=owner,harness={harness},"
                 f"runtime_sandbox={config['parent_sandbox']},attempt_id=att-parent-pidns,"
+                f"parent_sid=pidns-fixture,owner_route_id={route['route_id']},"
+                # A fixture-only depth-0 recipient on the supported human-gate
+                # carrier; independent of the mock child's harness below.
+                "parent_completion_delivery=claude-parent-runtime,"
                 f"pid={parent.pid},pid_start={parent_start}\n",
                 encoding="utf-8",
             )
@@ -677,6 +684,24 @@ class NamespaceE2E(unittest.TestCase):
                 "XDG_STATE_HOME": str(base / "state"),
             }
             env.pop("PYTHONPATH", None)
+
+            # The real launch fence must reject an entry gate that has never
+            # been raised. Prepare it through the supervisor, not a forged
+            # release sidecar, before testing the live namespace lifecycle.
+            refused = self.run_packaged(package_root, wrapper_path, argv, env)
+            self.assertEqual(refused["code"], 65, refused)
+            self.assertIn("reason=human-gate-not-raised", refused["wrapper_output"])
+            self.assertIn("child_spawned=0", refused["wrapper_output"])
+            gate_artifact = artifact_root / "frame-review.md"
+            gate_artifact.write_text("PID namespace fixture review\n", encoding="utf-8")
+            for action in ("--block", "--release"):
+                gate = subprocess.run(
+                    [sys.executable, str(package_root / "utilities" / "workflow-supervisor.py"),
+                     "gate", "--route", str(route_path), "--gate", "frame-review",
+                     "--jobs", str(jobs), "--artifact", str(gate_artifact), action],
+                    env=fixture_env, text=True, capture_output=True,
+                )
+                self.assertEqual(gate.returncode, 0, gate.stdout + gate.stderr)
 
             sentinel = Path(env["FAKE_SENTINEL"])
             fake_pid_file = Path(env["FAKE_PID_FILE"])
