@@ -433,17 +433,20 @@ class ProgressTest(unittest.TestCase):
         self.assertEqual(meta.get("failure_class"), "fail")          # verdict axis untouched
         self.assertEqual(meta.get("detected_by"), "progress-terminal-handoff")
 
-    def test_m2_watchdog_dead_path_keeps_dead_worker_fail_for_stage_or_artifactless_review(self):
-        for worker_type, artifact in (("stage", True), ("review", False)):
-            with self.subTest(worker_type=worker_type, artifact=artifact):
-                self.setUp()
-                try:
-                    state, meta = self._dead_path_note(worker_type=worker_type, artifact=artifact)
-                    self.assertEqual(state["terminal_action"], "dead-worker-fail")
-                    self.assertEqual(meta.get("note"), "dead-worker-fail")
-                    self.assertNotIn("review_artifact_b64", meta)
-                finally:
-                    self.tearDown()
+    def test_m2_watchdog_dead_path_keeps_dead_worker_fail_for_stage(self):
+        # Do not call setUp()/tearDown() manually inside one unittest method.
+        # Doing so overwrote self.proc/self.tmp and leaked the original 60 s
+        # process, which made later process-signal fixtures timing-dependent.
+        state, meta = self._dead_path_note(worker_type="stage", artifact=True)
+        self.assertEqual(state["terminal_action"], "dead-worker-fail")
+        self.assertEqual(meta.get("note"), "dead-worker-fail")
+        self.assertNotIn("review_artifact_b64", meta)
+
+    def test_m2_watchdog_dead_path_keeps_artifactless_review_failed(self):
+        state, meta = self._dead_path_note(worker_type="review", artifact=False)
+        self.assertEqual(state["terminal_action"], "dead-worker-fail")
+        self.assertEqual(meta.get("note"), "dead-worker-fail")
+        self.assertNotIn("review_artifact_b64", meta)
 
     def test_codex_preflight_projects_stage_heartbeat(self):
         command=[str(ROOT/"adapters/codex/bin/preflight.sh"),"stage-heartbeat",
