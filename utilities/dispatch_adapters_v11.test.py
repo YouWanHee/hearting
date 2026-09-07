@@ -323,19 +323,50 @@ class AdapterV11Test(unittest.TestCase):
     self.assertIn("replica_batch_expectation",source)
     self.assertIn("expected_reservation=args.replica_batch_expectation",source)
  def test_nested_codex_home_links_auth_but_keeps_mutable_state_local(self):
+  # `prepare_nested_codex_home` runs the *installed* runtime's projection
+  # installer on purpose: the nested home's identity must follow the canonical
+  # AGENT_HOME, not the source worktree holding the wrapper. So the fixture has
+  # to name a projection root of its own. Without one this test read whatever
+  # release the developer happened to have installed -- runtime-owned state as a
+  # fixture -- and any environment without one (the isolated suite profile,
+  # CI) resolved `$XDG_DATA_HOME/hearting/current` and died on the missing
+  # installer. This checkout is a valid harness root, so pin AGENT_HOME to it
+  # and keep HOME/CODEX_HOME inside the tempdir.
+  #
+  # The env is an EXPLICIT minimal dict, not `{**os.environ, ...}`: with a
+  # `{**os.environ}` base, `clear=True` clears nothing and the ambient shell
+  # rides through. That matters concretely -- install-runtime-projection.sh
+  # skips the managed launcher for a non-default CODEX_HOME only *while*
+  # HARNESS_BIN_DIR is unset, so an ambient HARNESS_BIN_DIR would make this
+  # test install a launcher into the developer's real bin directory. PATH is
+  # named because the script shells out to python3; nothing else is inherited.
   with tempfile.TemporaryDirectory() as td:
    root=Path(td); source=root/"source"; source.mkdir(); worktree=root/"worktree"; worktree.mkdir()
    (source/"auth.json").write_text("{}\n",encoding="utf-8")
    (source/"config.toml").write_text("model = \"fixture\"\n",encoding="utf-8")
+   fixture_home=root/"home"; fixture_home.mkdir()
    spec=importlib.util.spec_from_file_location("codex_dispatch_home",ROOT/"adapters/codex/bin/dispatch-headless.py")
    wrapper=importlib.util.module_from_spec(spec); spec.loader.exec_module(wrapper)
-   home=wrapper.prepare_nested_codex_home(worktree,source)
+   env={"PATH":os.environ.get("PATH",""),"HOME":str(fixture_home),
+        "AGENT_HOME":str(ROOT),"CODEX_HOME":str(source),
+        "PYTHONDONTWRITEBYTECODE":"1"}
+   with mock.patch.dict(os.environ,env,clear=True):
+    home=wrapper.prepare_nested_codex_home(worktree,source)
+    agent_home=wrapper.resolve_agent_home().resolve()
+   self.assertEqual(agent_home,ROOT.resolve())
    self.assertTrue((home/"auth.json").is_symlink())
    self.assertEqual((home/"auth.json").resolve(),(source/"auth.json").resolve())
    self.assertTrue((home/"config.toml").is_symlink())
    self.assertTrue((home/"hearting").is_symlink())
-   self.assertEqual((home/"hearting").resolve(),wrapper.resolve_agent_home().resolve())
+   self.assertEqual((home/"hearting").resolve(),agent_home)
    self.assertEqual(home.parent,worktree/".dispatch")
+   # Mutable runtime state stays inside the worktree: the credential is a link
+   # out, never a copy, nothing was written into the source home, and the
+   # fixture HOME is still empty -- the launcher branch really was skipped.
+   self.assertFalse((home/"auth.json").resolve().is_relative_to(worktree))
+   self.assertEqual(
+    sorted(p.name for p in source.iterdir()),["auth.json","config.toml"])
+   self.assertEqual(sorted(p.name for p in fixture_home.iterdir()),[])
  def test_detached_selection_is_promoted_before_launch_without_failure_exposure(self):
   for harness in ("codex","claude"):
    for repetition in range(4):

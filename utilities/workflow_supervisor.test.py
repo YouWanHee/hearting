@@ -983,9 +983,13 @@ class TestCapabilityIntegration(WorkflowFixture):
             {"id": "act", "unit": "dev/backend", "depends_on": ["observe"],
              "write_scope": ["source/**"], "outputs": ["source-diff"],
              "gate": "code-execute"},
+            # F3: a node's path-shaped outputs must land inside that node's own
+            # write_scope. `reviews/monitor-verdict.json` is a sibling of
+            # `reviews/monitor/`, not a member of it, so the composed recipe
+            # declared an output the verify node could not write.
             {"id": "verify", "unit": "qa/test", "depends_on": ["act"],
              "write_scope": ["reviews/monitor/**"],
-             "outputs": ["reviews/monitor-verdict.json"], "gate": "code-test"},
+             "outputs": ["reviews/monitor/verdict.json"], "gate": "code-test"},
         ]
         recipe = compose.build_recipe(
             "autopilot-code", "dev", units, topology_class="staged",

@@ -43,6 +43,19 @@ def make_fallback(claude=None, codex=None, opencode=None):
     return fallback
 
 
+def fixture_state_environ(tmpdir):
+    """The minimum env a scrubbed (`clear=True`) run still has to declare.
+
+    `state_root()` reads only the mapping it is handed and fail-closes when none
+    of HARNESS_STATE_ROOT/XDG_STATE_HOME/HOME is set (SD-112 §13.33.2-(1)), so a
+    literal `{}` is not "an isolated environment", it is an unresolvable one. A
+    fixture-owned HARNESS_STATE_ROOT keeps the isolation these tests are about --
+    nothing ambient leaks in, no real user home is touched -- while giving the
+    registry/completion derivation a resolvable root inside the test's tempdir.
+    """
+    return {"HARNESS_STATE_ROOT": str(Path(tmpdir) / "state")}
+
+
 def make_node(depth=2, dispatch_fallback=None):
     return {
         "id": "execute",
@@ -375,9 +388,10 @@ class DryRunCompletionMarkerPathTest(unittest.TestCase):
                 "--node", "execute", "--adapter", "claude", "--slug", "dry-marker",
                 "--action", "dry-run",
             ]
+            environ = fixture_state_environ(td)
             captured_stdout = io.StringIO()
             with mock.patch.object(sys, "argv", full_argv), \
-                 mock.patch.dict(N.os.environ, {}, clear=True), \
+                 mock.patch.dict(N.os.environ, environ, clear=True), \
                  mock.patch.object(N.subprocess, "run", return_value=mock.Mock(returncode=0)), \
                  contextlib.redirect_stdout(captured_stdout):
                 try:
@@ -385,7 +399,7 @@ class DryRunCompletionMarkerPathTest(unittest.TestCase):
                 except SystemExit:
                     pass
                 jobs = N.resolve_global_registry(
-                    N.ROOT, None, 1, "dry-run", {}
+                    N.ROOT, None, 1, "dry-run", environ
                 ).path
                 expected = str(
                     N.ROUTE.completion_dir(route["route_id"], jobs=jobs)
@@ -414,7 +428,11 @@ class MainMaterializationTest(unittest.TestCase):
             route_path.write_text(json.dumps(route))
             full_argv = ["dispatch-node.py", "--route", str(route_path)] + argv
             with mock.patch.object(sys, "argv", full_argv), \
-                 mock.patch.dict(N.os.environ, environ or {}, clear=True), \
+                 mock.patch.dict(
+                     N.os.environ,
+                     {**fixture_state_environ(td), **(environ or {})},
+                     clear=True,
+                 ), \
                  mock.patch.object(N.subprocess, "run", side_effect=fake_run):
                 try:
                     N.main()

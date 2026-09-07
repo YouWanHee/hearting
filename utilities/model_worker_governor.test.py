@@ -439,6 +439,13 @@ class GovernorTest(unittest.TestCase):
                     "execution_surface=registered-headless,registered_worker=1,"
                     f"fallback_hop={member['fallback_hop']},harness={member['harness']},"
                     f"child_harness={member['harness']},route_id=rt-governor,"
+                    # A modern route is identified by (route_id, route_hash,
+                    # route_node) at every depth: `completion_attempt_readiness`
+                    # refuses a row whose hash does not match the route it is
+                    # asked about. Only a hash-less legacy row may omit it, so a
+                    # fixture row without it is not "a peer row", it is an
+                    # unverifiable one.
+                    "route_hash=sha256:source-route,"
                     f"route_node={member['route_node']},"
                     "parent_attempt_id=att-parent-governor,"
                     f"fallback_ordinal={member['fallback_ordinal']},"
