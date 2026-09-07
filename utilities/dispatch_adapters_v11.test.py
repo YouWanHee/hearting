@@ -15,6 +15,42 @@ ADAPTERS={
 }
 
 class AdapterV11Test(unittest.TestCase):
+ def test_owner_binding_tuple_refusal_details_reach_all_wrappers(self):
+  for harness in ADAPTERS:
+   for depth,worker,raw in ((2,"stage",False),(1,"stage",False),(1,"owner",True),(2,"stage",True)):
+    with self.subTest(harness=harness,depth=depth,worker=worker,raw=raw), tempfile.TemporaryDirectory() as td:
+     root=Path(td); repo,art=self.fixture(root); jobs=root/"jobs.log"; logs=root/"logs"
+     wrapper=self.load_wrapper(harness)
+     argv=["dispatch-headless.py","--register","--worktree",str(repo),"--slug","binding-detail",
+           "--capability","autopilot-code","--capability-mode","dev","--intensity","standard",
+           "--dispatch-depth",str(depth),"--worker-type",worker,"--owner","autopilot-code",
+           "--assigned-contract","autopilot-code" if worker=="owner" else "code-execute",
+           "--jobs",str(jobs),"--log-dir",str(logs),*ADAPTERS[harness][1]]
+     if worker=="stage": argv.extend(["--worker-mode","dev/backend","--unit","dev/backend"])
+     if depth==2:
+      argv.extend(["--parent","owner","--parent-harness",harness,"--parent-transport","headless",
+                   "--parent-sandbox","fixture","--nested-eligibility","supported","--eligibility-source","fixture"])
+     if raw: argv.extend(["--route-file",str(root/"raw-route.json")])
+     env={"PATH":os.environ.get("PATH",""),"HOME":str(root),"AGENT_HOME":str(ROOT),
+          "AGENT_ARTIFACT_ROOT":str(art),"AGENT_DISPATCH_JOBS":str(jobs),
+          "OPENCODE_CONFIG_CONTENT":"{}","XDG_STATE_HOME":str(root/"state")}
+     stream=io.StringIO()
+     with mock.patch.dict(os.environ,env,clear=True), \
+          mock.patch.object(wrapper,"binding_from_environment",return_value=object()), \
+          redirect_stdout(stream):
+      result=wrapper.main(argv)
+     output=stream.getvalue()
+     self.assertEqual(result,65,output)
+     self.assertIn("reason=owner-route-binding-tuple-invalid",output)
+     self.assertIn(f"invalid_dispatch_depth={int(depth!=1)}",output)
+     self.assertIn(f"invalid_worker_type={int(worker!='owner')}",output)
+     self.assertIn(f"invalid_route_file_present={int(raw)}",output)
+     self.assertIn("stage-dispatch-fallback.py",output)
+     self.assertIn("--parallel-group",output)
+     self.assertIn("--action start",output)
+     self.assertIn("child_spawned=0",output)
+     self.assertFalse(jobs.exists(),output)
+
  def setUp(self): self.parent_procs=[]
  def tearDown(self):
   for proc in self.parent_procs:

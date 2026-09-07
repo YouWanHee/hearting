@@ -9,8 +9,35 @@ import resource_run_registry as registry
 
 
 class ResourceRegistryTest(unittest.TestCase):
+    def test_missing_registry_is_typed_skip_with_valid_neighbor(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); index = base / "index.json"
+            good = base / "good.json"; missing = base / "gone" / "registry.json"
+            good.write_text(json.dumps({"schema_version": 1, "runs": {"good": {"pid": 7}}}))
+            index.write_text(json.dumps({"schema_version": 1, "registries": {
+                "good": {"path": str(good)}, "gone": {"path": str(missing)}}}))
+            rows, diagnostics = registry.scan(index)
+            self.assertEqual([r["run_id"] for r in rows], ["good"])
+            self.assertEqual(diagnostics[0]["kind"], "missing-registry")
+            self.assertEqual(diagnostics[0]["path"], str(missing))
+            self.assertEqual(registry.counts(index)["malformed"], 0)
+            self.assertEqual(registry.counts(index)["missing"], 1)
+
+    def test_dangling_link_retains_registered_path_and_blocks(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); link = base / "link"; link.symlink_to(base / "absent")
+            index = base / "index.json"
+            for source in (link, link / "registry.json"):
+                index.write_text(json.dumps({"schema_version": 1,
+                    "registries": {"bad": {"path": str(source)}}}))
+                paths, _ = registry.indexed_paths(index)
+                self.assertEqual(paths, [source])
+                _, diagnostics = registry.scan(index)
+                self.assertNotEqual(diagnostics[0]["kind"], "missing-registry")
+                self.assertEqual(diagnostics[0]["path"], str(source))
+
     def test_live_exited_and_pid_reuse(self):
-        row = {"pid": 7, "starttime": "11", "command_hash": "abc"}
+        row = {"pid": 2147483647, "starttime": "11", "command_hash": "abc"}
         exact = lambda pid: {"pid": pid, "starttime": "11", "command_hash": "abc"}
         reused = lambda pid: {"pid": pid, "starttime": "12", "command_hash": "def"}
         self.assertEqual(registry.classify_identity(row, exact)[0], "working")

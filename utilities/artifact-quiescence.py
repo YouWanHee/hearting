@@ -35,6 +35,14 @@ def _load(name: str, filename: str):
 ROUTES = _load("artifact_quiescence_routes", "capability-route.py")
 RESOURCES = _load("artifact_quiescence_resources", "resource_run_registry.py")
 DISPATCH = _load("artifact_quiescence_dispatch", "dispatch-registry.py")
+CONTRACT = _load("artifact_quiescence_contract", "dispatch_contract.py")
+
+
+class SourceError(ValueError):
+    def __init__(self, reason: str, diagnostics: list[dict], sources: dict | None = None):
+        super().__init__(reason)
+        self.diagnostics = diagnostics
+        self.sources = sources or {}
 
 
 def _digest_bytes(value: bytes) -> str:
@@ -86,7 +94,15 @@ def _resource_snapshot(index_path: Path) -> dict:
     paths, diagnostics = RESOURCES.indexed_paths(index_path)
     if diagnostics:
         raise ValueError("resource-index-unverifiable")
-    return _snapshot([_file_row(index_path), *(_file_row(path) for path in paths)])
+    rows = [_file_row(index_path)]
+    for path in paths:
+        try:
+            source, _ = RESOURCES.read_registry_source(path)
+            rows.append(source)
+        except Exception as exc:
+            raise SourceError("resource-source-unverifiable", [
+                {"path": str(path), "kind": "unverifiable-registry", "error": str(exc)}]) from exc
+    return _snapshot(rows)
 
 
 def _dispatch_snapshot(jobs: Path) -> dict:
@@ -128,8 +144,68 @@ def _lock_probe(lock_path: Path) -> dict:
             os.close(fd)
 
 
+def _authority_roots(paths) -> list[str]:
+    if not isinstance(paths, (list, tuple)) or not paths:
+        raise ValueError("observation-authority-roots-missing")
+    result = set()
+    for value in paths:
+        if not isinstance(value, (str, Path)):
+            raise ValueError("observation-authority-root-invalid")
+        path = Path(value).expanduser()
+        if not path.is_absolute() or ".." in path.parts:
+            raise ValueError("observation-authority-root-invalid")
+        result.add(str(path))
+    return sorted(result)
+
+
+def _authority_snapshot(config: dict) -> dict:
+    """Observation only: never select a new launch registry or merge ledgers.
+
+    The additive v1 authority seal is mandatory when revalidating schema-3
+    evidence. Older evidence without it fails source comparison/config checks.
+    Missing exploratory candidates are negative facts, not lost authorities.
+    """
+    roots = _authority_roots(config.get("authority_roots"))
+    selected = {"dispatch": config["dispatch_jobs"], "resource": config["resource_index"]}
+    rows = []
+    divergence = []
+    for role, basename in (("dispatch", "jobs.log"), ("resource", "resource-runs.index.json")):
+        paths = sorted({str(Path(root) / basename) for root in roots} | {selected[role]})
+        identities = {}
+        for path in paths:
+            try:
+                source, _ = RESOURCES.read_registry_source(Path(path))
+            except Exception as exc:
+                raise SourceError("observation-authority-unverifiable", [
+                    {"kind": "authority-unverifiable", "ledger": role,
+                     "path": path, "error": str(exc)}],
+                    {"authority": {"roots_read": roots, "files": rows}}) from exc
+            source = {**source, "ledger": role}
+            rows.append(source)
+            if source["kind"] == "missing":
+                source["reason"] = "authority-candidate-absent"
+                if path == selected[role]:
+                    raise SourceError("observation-authority-source-missing", [
+                        {"kind": "selected-authority-missing", "ledger": role, "path": path}],
+                        {"authority": {"roots_read": roots, "files": rows}})
+            else:
+                identity = (source["device"], source["inode"])
+                identities.setdefault(identity, set()).add(source["resolved_path"])
+        if len(identities) > 1:
+            divergence.append({"kind": "authority-mismatch", "ledger": role,
+                               "paths": sorted({p for paths in identities.values() for p in paths})})
+    snapshot = {"authority_version": 1, "scope": config["scope"], "roots_read": roots,
+                "selected_sources": selected,
+                "authority_reason": "multiple-physical-authorities" if divergence else "single-physical-authority",
+                **_snapshot(rows)}
+    if divergence:
+        raise SourceError("observation-authority-mismatch", divergence, {"authority": snapshot})
+    return snapshot
+
+
 def _source_snapshots(config: dict) -> dict:
     return {
+        "authority": _authority_snapshot(config),
         "routes": _route_snapshot(Path(config["artifact_root"])),
         "jobs": _resource_snapshot(Path(config["resource_index"])),
         "dispatch": _dispatch_snapshot(Path(config["dispatch_jobs"])),
@@ -169,9 +245,14 @@ def collect(config: dict, now: datetime | None = None) -> dict:
         and (Path(row.get("path", "")).parent == canonical_routes
              or "route" in Path(row.get("path", "")).name.lower())
     ]
-    resource_rows, resource_diagnostics = RESOURCES.scan(index_path=config["resource_index"])
-    if resource_diagnostics:
-        raise ValueError("resource-source-unverifiable")
+    scanned_sources: list[dict] = []
+    resource_rows, resource_diagnostics = RESOURCES.scan(
+        index_path=config["resource_index"], observed_sources=scanned_sources)
+    if any(row.get("kind") != "missing-registry" for row in resource_diagnostics):
+        raise SourceError("resource-source-unverifiable", resource_diagnostics)
+    scanned = _snapshot([_file_row(Path(config["resource_index"])), *scanned_sources])
+    if scanned != before["jobs"]:
+        raise ValueError("source-changed-during-observation")
     dispatch_rows = _dispatch_rows(Path(config["dispatch_jobs"]))
     after = _source_snapshots(config)
     if before != after:
@@ -192,8 +273,9 @@ def collect(config: dict, now: datetime | None = None) -> dict:
     lock_present = bool(after["lock"].get("held"))
     stamp = _observed_at(now)
     sources = {
+        "authority": after["authority"],
         "routes": {"reader": "capability-route.py:route_status", "count": counts["open_routes"], **after["routes"]},
-        "jobs": {"reader": "resource_run_registry.py:scan", "count": counts["open_jobs"], **after["jobs"]},
+        "jobs": {"reader": "resource_run_registry.py:scan", "count": counts["open_jobs"], "diagnostics": resource_diagnostics, **after["jobs"]},
         "dispatch": {"reader": "dispatch-registry.py:current(read_rows)", "count": counts["open_dispatch_attempts"], **after["dispatch"]},
         "lock": {"reader": "flock(LOCK_EX|LOCK_NB)", "count": int(lock_present), **after["lock"]},
     }
@@ -249,6 +331,8 @@ def _atomic(path: Path, payload: dict) -> None:
 def fixture_config(artifact_root: str, resource_index: str, dispatch_jobs: str) -> dict:
     return {
         "scope": "fixture",
+        "authority_roots": _authority_roots([Path(resource_index).expanduser().absolute().parent,
+                                              Path(dispatch_jobs).expanduser().absolute().parent]),
         "artifact_root": str(Path(artifact_root).expanduser().resolve(strict=False)),
         "resource_index": str(Path(resource_index).expanduser().resolve(strict=False)),
         "dispatch_jobs": str(Path(dispatch_jobs).expanduser().resolve(strict=False)),
@@ -264,10 +348,17 @@ def live_config(cwd: str | None = None) -> dict:
     jobs = os.environ.get("AGENT_DISPATCH_JOBS")
     if not jobs:
         raise ValueError("canonical-dispatch-registry-unavailable")
+    index = RESOURCES.default_index_path()
+    user_home = Path(os.environ.get("HOME", str(Path.home())))
+    roots = [*CONTRACT.dispatch_state_roots(RESOURCES.agent_home(), jobs, environ=os.environ),
+             user_home / ".codex" / ".harness" / "dispatch",
+             Path(os.environ.get("CODEX_HOME", str(user_home / ".codex"))) / ".harness" / "dispatch",
+             Path(jobs).expanduser().absolute().parent, index.parent]
     return {
         "scope": "live",
+        "authority_roots": _authority_roots(roots),
         "artifact_root": str(Path(artifact_root).resolve(strict=False)),
-        "resource_index": str(RESOURCES.default_index_path()),
+        "resource_index": str(index),
         "dispatch_jobs": str(Path(jobs).expanduser().resolve(strict=False)),
         "lock_path": str((Path(artifact_root) / ".pipeline-lock").resolve(strict=False)),
     }
@@ -294,6 +385,9 @@ def publish(output: str, config: dict, now: datetime | None = None) -> dict:
             "sources": {},
             "reason": str(exc).replace("\n", " ")[:160],
         }
+        if isinstance(exc, SourceError):
+            payload["source_diagnostics"] = exc.diagnostics
+            payload["sources"] = exc.sources
     _atomic(Path(output), payload)
     return payload
 
@@ -340,7 +434,7 @@ def validate(path: str, max_age: int = 300, now: datetime | None = None,
         if payload.get("proven") is not (payload["pending"] == 0):
             raise ValueError("published-proof-invalid")
         config = payload.get("config")
-        if not isinstance(config, dict):
+        if not isinstance(config, dict) or config.get("scope") != scope:
             raise ValueError("source-config-missing")
         if scope == "live" and config != live_config():
             raise ValueError("live-source-config-changed")
