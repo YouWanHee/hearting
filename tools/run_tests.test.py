@@ -634,6 +634,7 @@ class CiLikeProfileFixture(unittest.TestCase):
             ]
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("not a supported local pre-CI gate", result.stderr)
         rows = []
         lines = report_path.read_text(encoding="utf-8").splitlines()
         header = None
@@ -647,6 +648,45 @@ class CiLikeProfileFixture(unittest.TestCase):
             rows.append(dict(zip(header, cols)))
         profiles = {r["isolation_profile"] for r in rows if r["suite_path"] == "needs_installed.test.py"}
         self.assertEqual(profiles, {"ci-like"})
+
+
+class ExecutionPolicyFixture(unittest.TestCase):
+    """The real full corpus stays within the measured retry/capacity envelope."""
+
+    def setUp(self):
+        self.mod = load_runner_module()
+
+    def args(self, *extra):
+        return self.mod.build_arg_parser().parse_args(list(extra))
+
+    def test_full_repository_requires_retry_and_caps_jobs(self):
+        errors = self.mod.execution_policy_errors(
+            self.args("--jobs", "5"), self.mod.ROOT.resolve()
+        )
+        self.assertIn("full repository runs require --retries 1 or greater", errors)
+        self.assertTrue(any("--jobs <= 4" in error for error in errors), errors)
+
+    def test_selected_run_keeps_narrow_diagnostic_freedom(self):
+        errors = self.mod.execution_policy_errors(
+            self.args("--select", "utilities/example.test.py", "--jobs", "8"),
+            self.mod.ROOT.resolve(),
+        )
+        self.assertEqual(errors, [])
+
+    def test_ci_like_refuses_an_unnarrowed_run(self):
+        errors = self.mod.execution_policy_errors(
+            self.args("--isolation=ci-like", "--retries", "1"),
+            self.mod.ROOT.resolve(),
+        )
+        self.assertTrue(any("diagnostic-only" in error for error in errors), errors)
+
+    def test_invalid_counts_are_rejected_before_any_suite_runs(self):
+        errors = self.mod.execution_policy_errors(
+            self.args("--select", "x", "--jobs", "0", "--retries", "-1"),
+            self.mod.ROOT.resolve(),
+        )
+        self.assertIn("--jobs must be positive", errors)
+        self.assertIn("--retries must be non-negative", errors)
 
 
 class RetryBudgetFixture(RunTestsFixtureBase):
