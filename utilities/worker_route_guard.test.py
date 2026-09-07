@@ -50,6 +50,19 @@ class WorkerRouteGuardTest(unittest.TestCase):
    _,node,_=G.validate_route_contract(path,"execute",ROOT,ROOT,"autopilot-code","strong",";".join(next(x for x in route["nodes"] if x["id"]=="execute")["write_scope"]),route["route_id"],route["route_hash"],route["registry_digest"])
    self.assertEqual(node["id"],"execute")
    self.assertRaisesRegex(G.WorkerRouteError,"expected=",G.validate_route_contract,path,"execute",ROOT,ROOT,"autopilot-code","strong","spec/**")
+ def test_detached_spec_worktree_reports_safe_branch_recovery(self):
+  with tempfile.TemporaryDirectory() as td:
+   repo=Path(td)/"spec worktree"; repo.mkdir()
+   def git(*args):
+    return subprocess.run(["git","-C",str(repo),*args],check=True,capture_output=True,text=True)
+   git("init","-q"); git("-c","user.name=Fixture","-c","user.email=fixture@example.com","commit","--allow-empty","-qm","base")
+   git("checkout","--detach","-q")
+   with self.assertRaises(G.WorkerRouteError) as caught: G._git_state(repo)
+   self.assertEqual(caught.exception.reason,"unsafe-git-state")
+   self.assertIn("git switch -c <new-branch>",str(caught.exception))
+   self.assertIn("spec",str(caught.exception))
+   git("switch","-c","spec-recovered")
+   self.assertEqual(G._git_state(repo)["branch"],"spec-recovered")
  def test_hash_and_reselection_rejected(self):
   with tempfile.TemporaryDirectory() as td:
    path=Path(td)/"route.json"; route=self.route(); route["cwd"]="/tmp"; path.write_text(json.dumps(route))

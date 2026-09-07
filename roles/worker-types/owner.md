@@ -10,6 +10,11 @@ reported polling fallback waits synchronously in the current turn. Harvest the e
 artifact verdict and close each registry row. Synthesize one owner artifact. Do not
 merge, push, clean worktrees, or create dispatch depth 3.
 
+Use a branch-backed route worktree, including for spec-only work. A detached
+HEAD cannot launch children; create a new branch at the existing HEAD with
+`git switch -c <new-branch>` before compiling or dispatching. Do not reset or
+discard the worktree to repair this state.
+
 Only a registered attempt mints a receipt. Unregistered background work — a shell
 job started with `&`, a detached helper, a cross-harness CLI launched in the
 background — mints none, and ending the turn ends the session together with every
