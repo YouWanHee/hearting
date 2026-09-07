@@ -1733,8 +1733,45 @@ class FinalizeStateConflictTest(ProducerTestBase):
         }
         with self.assertRaises(P.ProducerError) as caught:
             P.finalize(self.root, cycle_id=cycle_id, state="completed")
-        self.assertEqual(caught.exception.code, "sealed-cycle-state-ambiguous")
+        self.assertEqual(caught.exception.code, "sealed-cycle-state-unknown")
+        self.assertIn("locator-cycle-binding-invalid", caught.exception.detail)
         self.assertEqual(manifest_path.read_bytes(), before["manifest"])
+        self.assertEqual(P.cycle_record_path(self.root, cycle_id).read_bytes(), before["record"])
+        self.assertEqual((self.root / "campaigns" / "INDEX.json").read_bytes(), before["index_json"])
+        self.assertEqual((self.root / "campaigns" / "INDEX.md").read_bytes(), before["index_md"])
+
+    def test_record_locator_cannot_substitute_another_cycle_directory(self):
+        import shutil
+
+        self.activate()
+        route, route_file, result = self.begin()
+        self.write_output(result)
+        self.close(route, route_file)
+        cycle_id = result["cycle_id"]
+        P.finalize(self.root, cycle_id=cycle_id)
+        cycle_dir = Path(result["cycle_dir"])
+        decoy = cycle_dir.parent / f"{cycle_dir.name}-decoy"
+        shutil.copytree(cycle_dir, decoy)
+        binding_path = decoy / P.artifact_locator.CYCLE_BINDING
+        binding = json.loads(binding_path.read_text(encoding="utf-8"))
+        binding["cycle_id"] = "cyc_" + "9" * 32
+        binding_path.write_text(json.dumps(binding), encoding="utf-8")
+        record = P.read_cycle_record(self.root, cycle_id)
+        record["locator"] = decoy.name
+        P._write_cycle_record(self.root, record, exclusive=False)
+        with self.assertRaises(P.artifact_locator.LocatorError) as locator:
+            P.artifact_locator.scan_index(self.root)
+        self.assertEqual(locator.exception.code, "locator-cycle-binding-id-mismatch")
+        before = {
+            "manifest": (decoy / "manifest.json").read_bytes(),
+            "record": P.cycle_record_path(self.root, cycle_id).read_bytes(),
+            "index_json": (self.root / "campaigns" / "INDEX.json").read_bytes(),
+            "index_md": (self.root / "campaigns" / "INDEX.md").read_bytes(),
+        }
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id, state="completed")
+        self.assertEqual(caught.exception.code, "sealed-cycle-state-unknown")
+        self.assertEqual((decoy / "manifest.json").read_bytes(), before["manifest"])
         self.assertEqual(P.cycle_record_path(self.root, cycle_id).read_bytes(), before["record"])
         self.assertEqual((self.root / "campaigns" / "INDEX.json").read_bytes(), before["index_json"])
         self.assertEqual((self.root / "campaigns" / "INDEX.md").read_bytes(), before["index_md"])

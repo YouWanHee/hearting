@@ -1569,12 +1569,31 @@ def _record_cycle_manifest_path(root: Path, record: Mapping[str, Any]) -> Path:
     try:
         if locator:
             cycle_path = artifact_locator.safe_child(root, parent, locator)
+            binding = artifact_locator.read_cycle_binding(cycle_path)
+            if binding is None:
+                raise ProducerError(
+                    "sealed-cycle-state-unknown",
+                    f"{cycle_id}: cycle-binding=missing",
+                )
         else:
             cycle_path = artifact_locator.safe_child(
                 root, artifact_locator.safe_child(root, parent, "cycles"), cycle_id
             )
+            # Legacy ``cycles/<cycle_id>`` directories predate cycle bindings.
+            # If one is present it must still agree with the record; absence is
+            # allowed only because the stable ID is the legacy path component.
+            binding = artifact_locator.read_cycle_binding(cycle_path)
     except artifact_locator.LocatorError as exc:
-        raise ProducerError("sealed-cycle-state-unknown", exc.detail or exc.code) from exc
+        detail = exc.code if not exc.detail else f"{exc.code}: {exc.detail}"
+        raise ProducerError("sealed-cycle-state-unknown", detail) from exc
+    if binding is not None and (
+        binding.get("campaign_id") != campaign_id
+        or binding.get("cycle_id") != cycle_id
+    ):
+        raise ProducerError(
+            "sealed-cycle-state-unknown",
+            f"{cycle_id}: cycle-binding-identity-mismatch",
+        )
     return cycle_path / "manifest.json"
 
 
