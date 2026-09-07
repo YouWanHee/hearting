@@ -101,6 +101,19 @@ if ! command -v "$OPENCODE_BIN" >/dev/null 2>&1; then
   fi
 fi
 
+# Resolve before store creation, transcript delta, lock, or model invocation
+# (core/MEMORY.md 7.0 R0-R5). This must precede the `mem.py distill` call
+# below: that call previously ran first with its own unsynchronized default
+# and swallowed stderr, so a real store conflict was silently misread as an
+# empty delta instead of failing closed.
+if store=$(AGENT_HOME="$AGENT_ROOT" sh "$ROOT/utilities/memory-store.sh"); then
+  :
+else
+  echo "opencode distill worker: skipping (memory store resolution failed)" >&2
+  exit 69
+fi
+export MEM_STORE="$store"
+
 delta=$(
   AGENT_HOME="$AGENT_ROOT" \
   python3 "$ROOT/tools/memory/mem.py" distill "$sid" --source opencode 2>/dev/null || true
@@ -110,10 +123,6 @@ if [ -z "$(printf '%s' "$delta" | tr -d '[:space:]')" ]; then
   exit 0
 fi
 
-default_store="$AGENT_ROOT/memory"
-[ -e "$default_store" ] || [ -L "$default_store" ] \
-  || default_store="${XDG_DATA_HOME:-$HOME/.local/share}/hearting/memory"
-store=${MEM_STORE:-$default_store}
 mkdir -p "$store"
 
 # Entry stale-GC (N7/N8): SIGKILL/OOM/reboot can orphan a lock or a transient

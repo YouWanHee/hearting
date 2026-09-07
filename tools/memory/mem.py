@@ -25,9 +25,13 @@ import git_exchange_v2
 import migration_v2
 import protocol_v2
 import sync_v2
+from store_resolve import StoreResolutionError, resolve_store
 
 HOME = Path.home()
 def default_agent_home() -> Path:
+    # Independent of store resolution: this still serves profile, project,
+    # and diagnostic paths even though the store itself resolves through
+    # store_resolve.resolve_store() below.
     if os.environ.get("AGENT_HOME"):
         return Path(os.environ["AGENT_HOME"])
     if os.environ.get("CLAUDE_HOME"):
@@ -39,15 +43,11 @@ def default_agent_home() -> Path:
 
 
 AGENT_HOME = default_agent_home()
-def default_store() -> Path:
-    legacy = AGENT_HOME / "memory"
-    if legacy.exists() or legacy.is_symlink():
-        return legacy
-    data_home = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local" / "share"))
-    return data_home / "hearting" / "memory"
-
-
-STORE = Path(os.environ["MEM_STORE"]) if os.environ.get("MEM_STORE") else default_store()
+try:
+    STORE = resolve_store()
+except StoreResolutionError as _store_resolution_exc:
+    print(str(_store_resolution_exc), file=sys.stderr)
+    sys.exit(3)
 DB = STORE / "memory.db"
 DUMP = STORE / "dump.jsonl"
 # ``projects`` is Claude's runtime session store. AGENT_HOME is the repository
@@ -102,12 +102,12 @@ CANDIDATE_MAX_FTS_TERMS = 32
 RECALL_RECEIPT_SCHEMA = 1
 RECALL_RECEIPT_MAX_AGE_SECONDS = 14 * 24 * 60 * 60
 # D-37 write-event journal mirrors recall telemetry location and rotation but is
-# local observational data, not part of dump synchronization. Prefer an explicit
-# path, then a sidecar beside an overridden store, then XDG state.
-if "MEM_WRITE_EVENTS" in os.environ:
+# local observational data, not part of dump synchronization. Precedence is
+# closed and two-level: a non-empty explicit path, else the runtime-independent
+# XDG state journal. MEM_STORE has no telemetry effect -- a database-location
+# override must not implicitly relocate the journal (core/MEMORY.md Section 7.0).
+if os.environ.get("MEM_WRITE_EVENTS"):
     WRITE_EVENTS = Path(os.environ["MEM_WRITE_EVENTS"])
-elif "MEM_STORE" in os.environ:
-    WRITE_EVENTS = STORE / "write-events.jsonl"
 else:
     WRITE_EVENTS = (
         Path(os.environ.get("XDG_STATE_HOME", HOME / ".local" / "state"))
@@ -5159,12 +5159,15 @@ def doctor(json_output=False):
     silent = sorted(
         p for p in active_projects
         if p not in last_worker_ts or last_worker_ts[p] < stale_deadline_ts)
+    journal_desc = (f"journal={WRITE_EVENTS} exists={WRITE_EVENTS.exists()} "
+                    f"events={len(events)}")
     if not silent:
         _doctor_check(results, "worker-health", "OK",
-                      f"{len(active_projects)} active projects; none silent")
+                      f"{len(active_projects)} active projects; none silent; {journal_desc}")
     else:
         _doctor_check(results, "worker-health", "WARN",
-                      f"{len(silent)} silent-death candidates: " + ",".join(silent[:10]))
+                      f"{len(silent)} silent-death candidates: " + ",".join(silent[:10])
+                      + f"; {journal_desc}")
 
     sync_level = int(sync_snapshot.get("exit_code", 2))
     _doctor_check(

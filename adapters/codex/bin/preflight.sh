@@ -576,10 +576,16 @@ case "$cmd" in
     interval=${MEM_NUDGE_INTERVAL:-10}
     case "$interval" in (*[!0-9]*|"") interval=10 ;; esac
     [ "$interval" -gt 0 ] || interval=10
-    default_store="$AGENT_ROOT/memory"
-    [ -e "$default_store" ] || [ -L "$default_store" ] \
-      || default_store="${XDG_DATA_HOME:-$HOME/.local/share}/hearting/memory"
-    store=${MEM_STORE:-$default_store}
+    # Resolve before any directory, counter, or stamp write (core/MEMORY.md
+    # 7.0 R0-R5). An explicit if/else around the command substitution keeps
+    # the resolver's stderr diagnostic intact and stops `set -e` from
+    # bypassing this fail-open branch on a conflict/error exit.
+    if store=$(AGENT_HOME="$AGENT_ROOT" sh "$ROOT/utilities/memory-store.sh"); then
+      :
+    else
+      echo "turn-nudge: skipping (memory store resolution failed)" >&2
+      exit 0
+    fi
     mkdir -p "$store" 2>/dev/null || true
     state="$store/.codex-turn-state-$sid"
     counter=0

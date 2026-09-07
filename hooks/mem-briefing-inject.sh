@@ -97,7 +97,13 @@ AGENT_LOOP_ENV="${AGENT_LOOP_ENV:-${HOME:-}/.config/hearting/loops.env}"
 [ -f "$AGENT_LOOP_ENV" ] && . "$AGENT_LOOP_ENV"
 AGENT_NOTES_ROOT="${AGENT_NOTES_ROOT:-${HOME:-}/agent-notes}"
 ONCALL="${MEM_BRIEFING_ONCALL:-$AGENT_NOTES_ROOT/oncall/$TODAY.md}"
-STORE=$(sh "$HOOK_DIR/../utilities/memory-store.sh")
+# Fail open on a store conflict/error (core/MEMORY.md 7.0 R4): the explicit
+# if/else keeps the resolver's stderr diagnostic intact and stops `set -e`
+# from turning a safe conflict into a hook failure.
+if ! STORE=$(sh "$HOOK_DIR/../utilities/memory-store.sh"); then
+  echo "mem-briefing-inject: skipping (memory store resolution failed)" >&2
+  exit 0
+fi
 STATE="$STORE/.briefing-$TODAY"
 
 [ -f "$ONCALL" ] || exit 0      # No report yet: skip.

@@ -400,17 +400,42 @@ grep -q '\[WARN\] worker-health' /tmp/doctor_worker.out \
   && ok "doctor: 활성 프로젝트 + 저널 무소식 → worker-health WARN" \
   || bad "doctor worker-health 미검출: $(cat /tmp/doctor_worker.out)"
 
-# ⑩ 저널 경로 격리 — MEM_STORE override + MEM_WRITE_EVENTS 미설정 → 저널은 그 store 옆으로
-# (fixture DB 테스트가 실 XDG 저널을 오염시키지 않는 계약 — 2026-07-11 실유출 회귀 고정)
+# ⑩ 저널 경로 정책 — MEM_STORE override + MEM_WRITE_EVENTS 미설정 → 저널은 store
+# 옆이 아니라 fixture XDG state journal 로 (core/MEMORY.md 7.0: MEM_STORE는
+# telemetry를 이동시키지 않는다). 명시적 MEM_WRITE_EVENTS는 계속 우선한다.
 ISO_STORE="$(mktemp -d)"
+ISO_XDG_JOURNAL="$XDG_STATE_HOME/agent-memory/write-events.jsonl"
+rm -f "$ISO_XDG_JOURNAL"
 env -u MEM_WRITE_EVENTS MEM_STORE="$ISO_STORE" MEM_PROJECTS="$BASE_PROJ" \
   python3 "$MEM" add working hint "journal isolation probe" >/dev/null 2>&1
-if [ -f "$ISO_STORE/write-events.jsonl" ] && grep -q "journal isolation probe" "$ISO_STORE/write-events.jsonl"; then
-  ok "저널 격리: MEM_STORE override 시 write-events 가 store 옆에 생성"
+if [ ! -f "$ISO_STORE/write-events.jsonl" ] \
+    && [ -f "$ISO_XDG_JOURNAL" ] && grep -q "journal isolation probe" "$ISO_XDG_JOURNAL"; then
+  ok "저널 정책: MEM_STORE override 시에도 write-events 는 fixture XDG state journal 로"
 else
-  bad "저널 격리 실패: $ISO_STORE/write-events.jsonl 부재 또는 미기록"
+  bad "저널 정책 실패: store 옆=$([ -f "$ISO_STORE/write-events.jsonl" ] && echo present || echo absent) XDG=$ISO_XDG_JOURNAL"
 fi
-rm -rf "$ISO_STORE"
+
+ISO_EXPLICIT_JOURNAL="$(mktemp -d)/explicit-write-events.jsonl"
+rm -f "$ISO_XDG_JOURNAL"
+env MEM_WRITE_EVENTS="$ISO_EXPLICIT_JOURNAL" MEM_STORE="$ISO_STORE" MEM_PROJECTS="$BASE_PROJ" \
+  python3 "$MEM" add working hint "explicit journal override probe" >/dev/null 2>&1
+if [ -f "$ISO_EXPLICIT_JOURNAL" ] && grep -q "explicit journal override probe" "$ISO_EXPLICIT_JOURNAL" \
+    && { [ ! -f "$ISO_XDG_JOURNAL" ] || ! grep -q "explicit journal override probe" "$ISO_XDG_JOURNAL"; }; then
+  ok "저널 정책: 명시적 MEM_WRITE_EVENTS 는 XDG 기본값을 이긴다"
+else
+  bad "저널 정책 실패: explicit MEM_WRITE_EVENTS 가 우선되지 않음"
+fi
+
+# doctor worker-health 메시지가 journal 경로/존재/count 를 포함하는지 확인
+: > "$MEM_WRITE_EVENTS"
+seed viol_journal working project thread "$PKEY" 1 "$TODAY" "journal doctor body"
+DOCTOR_JOURNAL_OUT="$(python3 "$MEM" doctor)"
+if printf '%s' "$DOCTOR_JOURNAL_OUT" | grep -q "journal=$MEM_WRITE_EVENTS"; then
+  ok "doctor: worker-health 메시지가 journal 경로를 보고"
+else
+  bad "doctor worker-health journal 경로 미보고: $DOCTOR_JOURNAL_OUT"
+fi
+rm -rf "$ISO_STORE" "$(dirname "$ISO_EXPLICIT_JOURNAL")"
 
 # =====================================================================
 echo "== D-37: sync/migrate prospective absorption attribution =="

@@ -5455,5 +5455,119 @@ else
   bad "found d1/d2 depth text tokens in tools/fleet/render.py [$d1d2]"
 fi
 
+# --- memory store resolution conflict regressions (core/MEMORY.md 7.0 R4).
+# Every consumer below must resolve before any counter/stamp write, exit its
+# specified status with no side effect, and leave the resolver's stderr
+# diagnostic intact. Ordinary explicit-store paths must keep working.
+MSC_HOME="$TMP/msc_home"
+mkdir -p "$MSC_HOME/.claude/memory" "$MSC_HOME/hearting/memory"
+: > "$MSC_HOME/.claude/memory/memory.db"
+: > "$MSC_HOME/hearting/memory/memory.db"
+
+msc_env() {
+  # AGENT_HOME points at the real worktree ($ROOT), not the MSC_HOME fixture:
+  # each adapter's own agent_home()/resolve_source_root() needs a real
+  # core/CORE.md checkout to find its sibling scripts (utilities/memory-store.sh
+  # etc.). The store-resolution candidates under test come from HOME=$MSC_HOME
+  # (R1's $HOME/hearting/memory and $HOME/.claude/memory), independent of which
+  # checkout is running the adapter script.
+  env -u MEM_STORE HOME="$MSC_HOME" AGENT_HOME="$ROOT" "$@"
+}
+
+# Codex turn-nudge: conflict exits 0 (fail-open lifecycle hook), no state file.
+rm -rf "$MSC_HOME/hearting/.codex-turn-state-msc-conflict"
+if msc_env "$CODEX" turn-nudge "$TMP/flowproj" msc-conflict-sid \
+    >/tmp/codex_tn_conflict.out 2>/tmp/codex_tn_conflict.err; then
+  codex_tn_conflict_rc=0
+else
+  codex_tn_conflict_rc=$?
+fi
+if [ "$codex_tn_conflict_rc" -eq 0 ] \
+  && [ ! -s /tmp/codex_tn_conflict.out ] \
+  && grep -q 'memory store resolution error' /tmp/codex_tn_conflict.err \
+  && [ ! -e "$MSC_HOME/.claude/memory/.codex-turn-state-msc-conflict-sid" ] \
+  && [ ! -e "$MSC_HOME/hearting/memory/.codex-turn-state-msc-conflict-sid" ]; then
+  ok "codex turn-nudge leaves no counter on a store conflict"
+else
+  bad "codex turn-nudge conflict handling: rc=$codex_tn_conflict_rc out=$(cat /tmp/codex_tn_conflict.out) err=$(cat /tmp/codex_tn_conflict.err)"
+fi
+
+# OpenCode session-end: conflict exits 0, no debounce stamp.
+if msc_env "$OPENCODE" session-end "$TMP/flowproj" msc-conflict-sid \
+    >/tmp/opencode_se_conflict.out 2>/tmp/opencode_se_conflict.err; then
+  opencode_se_conflict_rc=0
+else
+  opencode_se_conflict_rc=$?
+fi
+if [ "$opencode_se_conflict_rc" -eq 0 ] \
+  && [ ! -s /tmp/opencode_se_conflict.out ] \
+  && grep -q 'memory store resolution error' /tmp/opencode_se_conflict.err \
+  && [ ! -e "$MSC_HOME/.claude/memory/.opencode-distill-stamp-msc-conflict-sid" ] \
+  && [ ! -e "$MSC_HOME/hearting/memory/.opencode-distill-stamp-msc-conflict-sid" ]; then
+  ok "opencode session-end leaves no debounce stamp on a store conflict"
+else
+  bad "opencode session-end conflict handling: rc=$opencode_se_conflict_rc out=$(cat /tmp/opencode_se_conflict.out) err=$(cat /tmp/opencode_se_conflict.err)"
+fi
+
+# Codex distill-worker: conflict exits 69 before delta/lock/model work.
+if msc_env env CODEX_DISTILL_ENABLE=1 CODEX_DISTILL_CONTRACT_ACCEPTED=1 \
+    PATH="$TMP/stubbin:$PATH" CODEX_STUB_ARGV="$TMP/codex_argv_msc_conflict" \
+    "$CODEX_DISTILL" msc-conflict-sid "$TMP/flowproj" increment \
+    >/tmp/codex_distill_conflict.out 2>/tmp/codex_distill_conflict.err; then
+  codex_distill_conflict_rc=0
+else
+  codex_distill_conflict_rc=$?
+fi
+if [ "$codex_distill_conflict_rc" -eq 69 ] \
+  && [ ! -s /tmp/codex_distill_conflict.out ] \
+  && grep -q 'memory store resolution error' /tmp/codex_distill_conflict.err \
+  && [ ! -e "$TMP/codex_argv_msc_conflict" ] \
+  && [ ! -e "$MSC_HOME/.claude/memory/.codex-distill-lock-msc-conflict-sid" ] \
+  && [ ! -e "$MSC_HOME/hearting/memory/.codex-distill-lock-msc-conflict-sid" ]; then
+  ok "codex distill-worker exits 69 before delta/lock/model work on a store conflict"
+else
+  bad "codex distill-worker conflict handling: rc=$codex_distill_conflict_rc out=$(cat /tmp/codex_distill_conflict.out) err=$(cat /tmp/codex_distill_conflict.err)"
+fi
+
+# OpenCode distill-worker: conflict exits 69 before delta/lock/model work.
+if msc_env env OPENCODE_DISTILL_ENABLE=1 OPENCODE_BIN="$TMP/opencode-stubbin/opencode" \
+    "$OPENCODE_DISTILL" msc-conflict-sid "$TMP/flowproj" curate \
+    >/tmp/opencode_distill_conflict.out 2>/tmp/opencode_distill_conflict.err; then
+  opencode_distill_conflict_rc=0
+else
+  opencode_distill_conflict_rc=$?
+fi
+if [ "$opencode_distill_conflict_rc" -eq 69 ] \
+  && [ ! -s /tmp/opencode_distill_conflict.out ] \
+  && grep -q 'memory store resolution error' /tmp/opencode_distill_conflict.err \
+  && [ ! -e "$MSC_HOME/.claude/memory/.opencode-distill-lock-msc-conflict-sid" ] \
+  && [ ! -e "$MSC_HOME/hearting/memory/.opencode-distill-lock-msc-conflict-sid" ]; then
+  ok "opencode distill-worker exits 69 before delta/lock/model work on a store conflict"
+else
+  bad "opencode distill-worker conflict handling: rc=$opencode_distill_conflict_rc out=$(cat /tmp/opencode_distill_conflict.out) err=$(cat /tmp/opencode_distill_conflict.err)"
+fi
+
+# D-42 still returns before resolution: a worker-role turn-nudge no-ops even
+# under a conflicting store, proving the D-42 gate is checked first.
+if AGENT_SESSION_ROLE=worker msc_env "$CODEX" turn-nudge "$TMP/flowproj" msc-conflict-sid \
+    >/tmp/codex_tn_worker_conflict.out 2>/tmp/codex_tn_worker_conflict.err \
+  && [ ! -s /tmp/codex_tn_worker_conflict.out ] \
+  && [ ! -s /tmp/codex_tn_worker_conflict.err ]; then
+  ok "codex turn-nudge D-42 worker gate returns before store resolution"
+else
+  bad "codex turn-nudge D-42 gate must precede store resolution"
+fi
+
+# Ordinary explicit-store paths retain current behavior alongside a conflict
+# elsewhere on the same host (R0 short-circuits before the candidate scan).
+if msc_env env MEM_STORE="$TMP/msc_explicit_store" \
+    "$CODEX" turn-nudge "$TMP/flowproj" msc-explicit-sid \
+    >/tmp/codex_tn_explicit.out 2>/tmp/codex_tn_explicit.err \
+  && [ -e "$TMP/msc_explicit_store/.codex-turn-state-msc-explicit-sid" ]; then
+  ok "codex turn-nudge explicit MEM_STORE unaffected by an unrelated conflict"
+else
+  bad "codex turn-nudge explicit MEM_STORE path regressed"
+fi
+
 printf 'PASS=%s FAIL=%s\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

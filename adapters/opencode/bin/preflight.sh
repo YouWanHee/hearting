@@ -863,14 +863,20 @@ EOF
     # D-42 defense in depth: workers never create a debounce stamp, sync, or
     # start another distiller from session.idle/session-end.
     is_worker_session && exit 0
+    # Resolve before any directory, counter, or stamp write (core/MEMORY.md
+    # 7.0 R0-R5). The explicit if/else preserves the resolver's stderr
+    # diagnostic and stops `set -e` from bypassing this fail-open branch.
+    if store=$(AGENT_HOME="$AGENT_ROOT" sh "$ROOT/utilities/memory-store.sh"); then
+      :
+    else
+      echo "session-end: skipping (memory store resolution failed)" >&2
+      exit 0
+    fi
+    export MEM_STORE="$store"
+    mkdir -p "$store" 2>/dev/null || true
     # Debounce: the OpenCode plugin fires this on session.idle, which occurs after
     # every turn. Rate-limit per session so a long TUI session triggers at most
     # one worker per OPENCODE_DISTILL_MIN_INTERVAL seconds (default 600).
-    default_store="$AGENT_ROOT/memory"
-    [ -e "$default_store" ] || [ -L "$default_store" ] \
-      || default_store="${XDG_DATA_HOME:-$HOME/.local/share}/hearting/memory"
-    store=${MEM_STORE:-$default_store}
-    mkdir -p "$store" 2>/dev/null || true
     stamp="$store/.opencode-distill-stamp-$sid"
     interval=${OPENCODE_DISTILL_MIN_INTERVAL:-600}
     now=$(date +%s 2>/dev/null || echo 0)
