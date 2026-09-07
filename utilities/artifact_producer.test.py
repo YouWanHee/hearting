@@ -1179,6 +1179,39 @@ class CliTest(ProducerTestBase):
         self.assertEqual(lines["AGENT_ARTIFACT_CYCLE_ID"], payload["cycle_id"])
         self.assertEqual(lines["AGENT_ARTIFACT_CYCLE_DIR"], payload["cycle_dir"])
 
+    def test_finalize_state_conflict_exits_blocked_with_requested_and_actual_state(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        self.write_output(result)
+        cycle_id = result["cycle_id"]
+        P.finalize(self.root, cycle_id=cycle_id, allow_open_route=True)
+        code, payload = self.run_cli(
+            "finalize", "--artifact-root", str(self.root), "--cycle", cycle_id,
+            "--state", "abandoned", "--abandon-reason", "operator-decision",
+        )
+        self.assertEqual(code, P.BLOCKED)
+        self.assertEqual(payload["status"], "blocked")
+        self.assertEqual(payload["reason"], "finalize-state-conflict")
+        self.assertIn("requested=abandoned", payload["detail"])
+        self.assertIn("published_cycle_state=active", payload["detail"])
+
+    def test_malformed_manifest_cycle_state_exits_blocked_not_traceback(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        self.write_output(result)
+        self.close(route, route_file)
+        cycle_id = result["cycle_id"]
+        P.finalize(self.root, cycle_id=cycle_id)
+        manifest_path = Path(result["cycle_dir"]) / "manifest.json"
+        document = json.loads(manifest_path.read_text(encoding="utf-8"))
+        document["cycle"]["state"] = ["active"]
+        manifest_path.write_text(json.dumps(document), encoding="utf-8")
+        code, payload = self.run_cli("finalize", "--artifact-root", str(self.root), "--cycle", cycle_id)
+        self.assertEqual(code, P.BLOCKED)
+        self.assertEqual(payload["status"], "blocked")
+        self.assertEqual(payload["reason"], "sealed-cycle-state-unreadable")
+        self.assertIn("cycle_state=['active']", payload["detail"])
+
 
 class ReviewPublicationLeaseTest(ProducerTestBase):
     """SD-117 §13.34.5-(2): L1 review-publication-lease enforcement."""
@@ -1225,11 +1258,12 @@ class ReviewPublicationLeaseTest(ProducerTestBase):
             abandon_reason="lease-expired-no-publisher", allow_open_route=True,
         )
         self.assertEqual(outcome["status"], "sealed")
-        # Pre-existing behavior (unchanged by SD-117): a sealed cycle's
-        # `finalize()` short-circuits idempotently before the `state`
-        # argument is even inspected.
-        again = P.finalize(self.root, cycle_id=cycle_id, state="completed")
-        self.assertEqual(again["status"], "already-sealed")
+        # Storage sealing is not task completion (D-10): the published cycle
+        # state is `abandoned`, so a later `completed` request is a typed
+        # conflict, not a silent idempotent short-circuit.
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id, state="completed")
+        self.assertEqual(caught.exception.code, "finalize-state-conflict")
 
     def test_corrupt_lease_record_blocks_abandon(self):
         self.activate()
@@ -1267,17 +1301,19 @@ class AbandonReasonTest(ProducerTestBase):
         self.assertEqual(outcome["status"], "no-lineage")
         self.assertFalse(Path(result["cycle_dir"]).exists())
 
-    def test_cycle_completed_injected_into_abandoned_stream_is_refused_by_unchanged_code(self):
+    def test_cycle_completed_injected_into_abandoned_stream_is_refused_by_typed_conflict(self):
         self.activate()
         route, route_file, result = self.begin()
         self.write_output(result)
         cycle_id = result["cycle_id"]
         P.finalize(self.root, cycle_id=cycle_id, state="abandoned", abandon_reason="operator-decision",
                   allow_open_route=True)
-        # Pre-existing behavior (unchanged by SD-117, E47-6): re-finalizing a
-        # sealed cycle short-circuits idempotently regardless of `state`.
-        again = P.finalize(self.root, cycle_id=cycle_id, state="completed")
-        self.assertEqual(again["status"], "already-sealed")
+        # The published cycle state is `abandoned`; injecting a `completed`
+        # request against it is a typed conflict, not an idempotent
+        # short-circuit that ignores `state` (D-8/D-10).
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id, state="completed")
+        self.assertEqual(caught.exception.code, "finalize-state-conflict")
 
     def test_every_cycle_abandoned_event_carries_closed_enum_reason_disjoint_from_review_verdicts(self):
         self.activate()
@@ -1329,6 +1365,323 @@ class AbandonReasonTest(ProducerTestBase):
         document = json.loads((Path(result["cycle_dir"]) / "manifest.json").read_text())
         abandoned_events = [e for e in document["events"] if e["event_type"] == "cycle.abandoned"]
         self.assertEqual(abandoned_events[0]["payload"]["abandon_reason"], "operator-override-live-review")
+
+
+class FinalizeStateConflictTest(ProducerTestBase):
+    """Sealed storage is not task completion: a request whose `state` does not
+    match the *published* `manifest.json` cycle state is a typed conflict,
+    never a silent `already-sealed`."""
+
+    def test_active_snapshot_refuses_abandon_request_and_leaves_manifest_untouched(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        self.write_output(result)
+        cycle_id = result["cycle_id"]
+        sealed = P.finalize(self.root, cycle_id=cycle_id, allow_open_route=True)
+        self.assertEqual(sealed["cycle_state"], "active")
+        R.close_route(route, route_file, commit="a" * 40, summary="fixture")
+        manifest_path = Path(result["cycle_dir"]) / "manifest.json"
+        manifest_bytes = manifest_path.read_bytes()
+        record_before = P.read_cycle_record(self.root, cycle_id)
+        index_before = adm.load_index(self.root)
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id, state="abandoned", abandon_reason="operator-decision")
+        self.assertEqual(caught.exception.code, "finalize-state-conflict")
+        self.assertIn("requested=abandoned", caught.exception.detail)
+        self.assertIn("published_cycle_state=active", caught.exception.detail)
+        self.assertIn("storage_state=sealed", caught.exception.detail)
+        self.assertEqual(manifest_path.read_bytes(), manifest_bytes)
+        self.assertEqual(P.read_cycle_record(self.root, cycle_id), record_before)
+        self.assertEqual(adm.load_index(self.root), index_before)
+
+    def test_conflict_precedes_abandon_reason_validation(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        self.write_output(result)
+        cycle_id = result["cycle_id"]
+        P.finalize(self.root, cycle_id=cycle_id, allow_open_route=True)
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id, state="abandoned")
+        self.assertEqual(caught.exception.code, "finalize-state-conflict")
+
+    def test_same_terminal_state_retry_stays_idempotent(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        self.write_output(result)
+        self.close(route, route_file)
+        cycle_id = result["cycle_id"]
+        P.finalize(self.root, cycle_id=cycle_id)
+        again = P.finalize(self.root, cycle_id=cycle_id)
+        self.assertEqual(again["status"], "already-sealed")
+        self.assertEqual(again["storage_state"], "sealed")
+        self.assertEqual(again["cycle_state"], "completed")
+
+        route2, route_file2 = self.route(gate_source="fixture-2")
+        result2 = P.begin(self.root, route_file=route_file2, capability="autopilot-code", intensity="direct")
+        self.write_output(result2)
+        R.close_route(route2, route_file2, commit="a" * 40, summary="abandoned fixture")
+        cycle_id2 = result2["cycle_id"]
+        P.finalize(self.root, cycle_id=cycle_id2, state="abandoned", abandon_reason="operator-decision")
+        again2 = P.finalize(self.root, cycle_id=cycle_id2, state="abandoned", abandon_reason="operator-decision")
+        self.assertEqual(again2["status"], "already-sealed")
+        self.assertEqual(again2["storage_state"], "sealed")
+        self.assertEqual(again2["cycle_state"], "abandoned")
+
+    def test_allow_open_first_publication_succeeds_but_identical_retry_now_conflicts(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        self.write_output(result)
+        cycle_id = result["cycle_id"]
+        sealed = P.finalize(self.root, cycle_id=cycle_id, allow_open_route=True)
+        self.assertEqual(sealed["status"], "sealed")
+        self.assertEqual(sealed["cycle_state"], "active")
+        manifest_path = Path(result["cycle_dir"]) / "manifest.json"
+        manifest_bytes = manifest_path.read_bytes()
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id, state="completed", allow_open_route=True)
+        self.assertEqual(caught.exception.code, "finalize-state-conflict")
+        self.assertIn("requested=completed", caught.exception.detail)
+        self.assertIn("published_cycle_state=active", caught.exception.detail)
+        self.assertEqual(manifest_path.read_bytes(), manifest_bytes)
+
+    def test_allow_open_retry_after_route_close_conflicts_and_does_not_promote(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        self.write_output(result)
+        cycle_id = result["cycle_id"]
+        P.finalize(self.root, cycle_id=cycle_id, allow_open_route=True)
+        manifest_path = Path(result["cycle_dir"]) / "manifest.json"
+        manifest_bytes = manifest_path.read_bytes()
+        self.close(route, route_file)
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id, state="completed", allow_open_route=True)
+        self.assertEqual(caught.exception.code, "finalize-state-conflict")
+        self.assertEqual(manifest_path.read_bytes(), manifest_bytes)
+        record = P.read_cycle_record(self.root, cycle_id)
+        self.assertEqual(record["cycle_state"], "active")
+
+    def test_completed_snapshot_refuses_abandon_and_abandoned_refuses_completed(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        self.write_output(result)
+        self.close(route, route_file)
+        cycle_id = result["cycle_id"]
+        P.finalize(self.root, cycle_id=cycle_id)
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id, state="abandoned", abandon_reason="operator-decision")
+        self.assertEqual(caught.exception.code, "finalize-state-conflict")
+
+        route2, route_file2 = self.route(gate_source="fixture-2")
+        result2 = P.begin(self.root, route_file=route_file2, capability="autopilot-code", intensity="direct")
+        self.write_output(result2)
+        R.close_route(route2, route_file2, commit="a" * 40, summary="abandoned fixture")
+        cycle_id2 = result2["cycle_id"]
+        P.finalize(self.root, cycle_id=cycle_id2, state="abandoned", abandon_reason="operator-decision")
+        with self.assertRaises(P.ProducerError) as caught2:
+            P.finalize(self.root, cycle_id=cycle_id2, state="completed")
+        self.assertEqual(caught2.exception.code, "finalize-state-conflict")
+
+    def test_sealed_cycle_state_source_is_manifest_with_absent_only_fallback(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        self.write_output(result)
+        self.close(route, route_file)
+        cycle_id = result["cycle_id"]
+        P.finalize(self.root, cycle_id=cycle_id)
+        manifest_path = Path(result["cycle_dir"]) / "manifest.json"
+        manifest_bytes = manifest_path.read_bytes()
+
+        # (1) record cache dropped -> manifest (the canonical source) still judges correctly.
+        record = P.read_cycle_record(self.root, cycle_id)
+        del record["cycle_state"]
+        P._write_cycle_record(self.root, record, exclusive=False)
+        again = P.finalize(self.root, cycle_id=cycle_id)
+        self.assertEqual(again["status"], "already-sealed")
+        self.assertEqual(again["cycle_state"], "completed")
+
+        # (2) record cache disagrees with manifest -> ambiguous, hard refusal.
+        record = P.read_cycle_record(self.root, cycle_id)
+        record["cycle_state"] = "abandoned"
+        P._write_cycle_record(self.root, record, exclusive=False)
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id)
+        self.assertEqual(caught.exception.code, "sealed-cycle-state-ambiguous")
+        self.assertIn("manifest=completed", caught.exception.detail)
+        self.assertIn("record=abandoned", caught.exception.detail)
+
+        # restore the cache before mangling the canonical source.
+        record = P.read_cycle_record(self.root, cycle_id)
+        record["cycle_state"] = "completed"
+        P._write_cycle_record(self.root, record, exclusive=False)
+
+        # (3) manifest absent and record cache absent -> unknown, no false success.
+        record = P.read_cycle_record(self.root, cycle_id)
+        del record["cycle_state"]
+        P._write_cycle_record(self.root, record, exclusive=False)
+        manifest_path.unlink()
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id)
+        self.assertEqual(caught.exception.code, "sealed-cycle-state-unknown")
+        self.assertIn("manifest=absent", caught.exception.detail)
+
+        # (4) manifest absent, record cache valid -> compatibility fallback judges correctly.
+        record = P.read_cycle_record(self.root, cycle_id)
+        record["cycle_state"] = "completed"
+        P._write_cycle_record(self.root, record, exclusive=False)
+        again = P.finalize(self.root, cycle_id=cycle_id)
+        self.assertEqual(again["status"], "already-sealed")
+        self.assertEqual(again["cycle_state"], "completed")
+
+        # (5) manifest absent, record cache non-string -> unknown (not TypeError).
+        record = P.read_cycle_record(self.root, cycle_id)
+        record["cycle_state"] = 123
+        P._write_cycle_record(self.root, record, exclusive=False)
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id)
+        self.assertEqual(caught.exception.code, "sealed-cycle-state-unknown")
+        self.assertIn("record=123", caught.exception.detail)
+
+        # manifest present but record cache non-string -> the canonical source wins.
+        manifest_path.write_bytes(manifest_bytes)
+        again = P.finalize(self.root, cycle_id=cycle_id)
+        self.assertEqual(again["status"], "already-sealed")
+        self.assertEqual(again["cycle_state"], "completed")
+
+    def test_unreadable_manifest_fails_closed_instead_of_trusting_record_cache(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        self.write_output(result)
+        self.close(route, route_file)
+        cycle_id = result["cycle_id"]
+        P.finalize(self.root, cycle_id=cycle_id)
+        manifest_path = Path(result["cycle_dir"]) / "manifest.json"
+        manifest_bytes = manifest_path.read_bytes()
+        record = P.read_cycle_record(self.root, cycle_id)
+        self.assertEqual(record["cycle_state"], "completed")  # valid cache throughout: it must not save a success.
+
+        # (1) unparsable JSON.
+        manifest_path.write_text("{not json", encoding="utf-8")
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id)
+        self.assertEqual(caught.exception.code, "sealed-cycle-state-unreadable")
+        self.assertIn("unparsable", caught.exception.detail)
+        manifest_path.write_bytes(manifest_bytes)
+
+        # (2) cycle_id mismatch. The `.cycle.json` binding is removed first so
+        # the locator's own global scan (a stricter, unrelated invariant that
+        # cross-checks manifest cycle_id against the binding for every
+        # readable-layout cycle dir) does not intercept this before
+        # `_published_cycle_state` gets to judge it; `cycle_dir` still
+        # resolves the path through the record's `locator` field.
+        other_cycle_id = "cyc_" + "9" * 32
+        binding_path = Path(result["cycle_dir"]) / ".cycle.json"
+        binding_bytes = binding_path.read_bytes()
+        binding_path.unlink()
+        mutated = json.loads(manifest_bytes)
+        mutated["cycle"]["cycle_id"] = other_cycle_id
+        manifest_path.write_text(json.dumps(mutated), encoding="utf-8")
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id)
+        self.assertEqual(caught.exception.code, "sealed-cycle-state-unreadable")
+        self.assertIn(cycle_id, caught.exception.detail)
+        self.assertIn(other_cycle_id, caught.exception.detail)
+        manifest_path.write_bytes(manifest_bytes)
+        binding_path.write_bytes(binding_bytes)
+
+        # (3) cycle.state outside the enum.
+        mutated = json.loads(manifest_bytes)
+        mutated["cycle"]["state"] = "weird"
+        manifest_path.write_text(json.dumps(mutated), encoding="utf-8")
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id)
+        self.assertEqual(caught.exception.code, "sealed-cycle-state-unreadable")
+        self.assertIn("cycle_state='weird'", caught.exception.detail)
+        manifest_path.write_bytes(manifest_bytes)
+
+        # (4) cycle.state is a non-string JSON value (list, dict) -- must not reach
+        # `in _SEALED_CYCLE_STATES` unhashable.
+        for bad_state in (["active"], {"value": "active"}):
+            mutated = json.loads(manifest_bytes)
+            mutated["cycle"]["state"] = bad_state
+            manifest_path.write_text(json.dumps(mutated), encoding="utf-8")
+            with self.assertRaises(P.ProducerError) as caught:
+                P.finalize(self.root, cycle_id=cycle_id)
+            self.assertEqual(caught.exception.code, "sealed-cycle-state-unreadable")
+            self.assertIn(f"cycle_state={bad_state!r}", caught.exception.detail)
+            manifest_path.write_bytes(manifest_bytes)
+
+        # (5) cycle itself is not a mapping.
+        for bad_cycle in ("active", ["active"]):
+            mutated = json.loads(manifest_bytes)
+            mutated["cycle"] = bad_cycle
+            manifest_path.write_text(json.dumps(mutated), encoding="utf-8")
+            with self.assertRaises(P.ProducerError) as caught:
+                P.finalize(self.root, cycle_id=cycle_id)
+            self.assertEqual(caught.exception.code, "sealed-cycle-state-unreadable")
+            self.assertIn(f"cycle-structure type={type(bad_cycle).__name__}", caught.exception.detail)
+            manifest_path.write_bytes(manifest_bytes)
+
+    def test_recovery_roll_forward_before_sealed_branch_is_judged_on_published_state(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        self.write_output(result)
+        cycle_id = result["cycle_id"]
+        with self.assertRaises(adm.AdmissionRecoveryRequired):
+            P.finalize(self.root, cycle_id=cycle_id, allow_open_route=True, crash_after_manifest=True)
+        # before: recovery has not run yet.
+        self.assertEqual(P.read_cycle_record(self.root, cycle_id)["state"], "open")
+        self.assertIn(cycle_id, P.status(self.root)["pending_journals"])
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id, state="abandoned", abandon_reason="operator-decision")
+        self.assertEqual(caught.exception.code, "finalize-state-conflict")
+        # after: `_recover_locked` rolled the manifest forward before the sealed
+        # branch ever ran its judgment, so the conflict is against `active`.
+        record = P.read_cycle_record(self.root, cycle_id)
+        self.assertEqual(record["state"], "sealed")
+        self.assertEqual(record["cycle_state"], "active")
+        self.assertFalse(P.journal_path(self.root, cycle_id).exists())
+        self.assertIn(cycle_id, adm.load_index(self.root).manifests)
+
+    def test_non_sealed_record_states_still_fall_to_cycle_not_open(self):
+        import shutil
+
+        self.activate()
+        # (1) zero-row cycle seals to `no-lineage`, not `sealed`.
+        route, route_file, result = self.begin()
+        outcome = P.finalize(self.root, cycle_id=result["cycle_id"])
+        self.assertEqual(outcome["status"], "no-lineage")
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=result["cycle_id"])
+        self.assertEqual(caught.exception.code, "cycle-not-open")
+
+        # (2) zero-row abandon seals record state to `abandoned`, not `sealed`.
+        route2, route_file2 = self.route(gate_source="fixture-2")
+        result2 = P.begin(self.root, route_file=route_file2, capability="autopilot-code", intensity="direct")
+        P.finalize(self.root, cycle_id=result2["cycle_id"], state="abandoned", abandon_reason="operator-decision")
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=result2["cycle_id"], state="abandoned", abandon_reason="operator-decision")
+        self.assertEqual(caught.exception.code, "cycle-not-open")
+
+        # (3) a recovery-dropped cycle record is `dropped`, not `sealed`.
+        route3, route_file3 = self.route(gate_source="fixture-3")
+        result3 = P.begin(self.root, route_file=route_file3, capability="autopilot-code", intensity="direct")
+        shutil.rmtree(result3["cycle_dir"])
+        P.recover(self.root)
+        self.assertEqual(P.read_cycle_record(self.root, result3["cycle_id"])["state"], "dropped")
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=result3["cycle_id"])
+        self.assertEqual(caught.exception.code, "cycle-not-open")
+
+    def test_force_abandon_ignoring_lease_on_sealed_active_conflicts_before_lease_checks(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        self.write_output(result)
+        cycle_id = result["cycle_id"]
+        P.finalize(self.root, cycle_id=cycle_id, allow_open_route=True)
+        P.review_lease_acquire(self.root, cycle_id=cycle_id, attempt_id="att-reviewer")
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id, state="abandoned", force_abandon_ignoring_lease=True)
+        self.assertEqual(caught.exception.code, "finalize-state-conflict")
 
 
 class SharedReferencePinAndRelatedTest(ProducerTestBase):
