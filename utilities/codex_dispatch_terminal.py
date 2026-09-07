@@ -47,6 +47,20 @@ _SANDBOX_INIT_RE = re.compile(
     r"[^\n]*Unable to mount source on destination: No such file or directory",
     re.I,
 )
+# The only row the codex app-server supervisor can physically emit between a
+# turn's final `agent_message` and that turn's `turn.completed`. Producer:
+# `utilities/codex-app-server-supervisor.py` `run_turn`, the
+# `thread/tokenUsage/updated` branch -- it emits after the `item/completed`
+# that set `final_text`, so a valid handoff sits two rows before the terminal
+# instead of one. Every other `dispatch.supervisor.*` emit on that path
+# (`owner-boundary`, `launch-settled`, `parked`, `reparked`, `resumed`,
+# `redelivery-suppressed`, `reconciled`, `join-observed`) is followed by a
+# `continue` that starts a new turn, and `delivery-timing` is emitted after
+# `turn.completed`; none of them can land inside this window. Keep this an
+# exact allowlist rather than a `dispatch.supervisor.` prefix rule: a prefix
+# would also skip a future observation row that is emitted for a reason we have
+# not checked, and hide a real work item behind it.
+_TERMINAL_TELEMETRY_TYPES = frozenset({"dispatch.supervisor.token_usage"})
 _MAX_TAIL_BYTES = 1024 * 1024
 _DETAIL_LIMIT = 512
 
@@ -118,6 +132,34 @@ def _tail_lines(path: Path) -> list[str]:
     if start and lines:
         lines = lines[1:]
     return [line.decode("utf-8", "strict") for line in lines]
+
+
+def _codex_final_agent_message(
+    rows: list[dict], terminal_index: int
+) -> str | None:
+    """Walk back from `turn.completed` to this turn's final `agent_message`.
+
+    Only `_TERMINAL_TELEMETRY_TYPES` rows are stepped over. Anything else stops
+    the walk fail-closed -- a real work item (`item.started`/`item.completed`
+    for a command or tool) means the message was not final, a
+    `dispatch.supervisor.turn.started` is the previous turn's boundary, and an
+    unknown, malformed, or text-less row is unread evidence. Stopping at the
+    first such row is what keeps an older turn's stale handoff from standing in
+    for a missing final one.
+    """
+
+    for index in range(terminal_index - 1, -1, -1):
+        row = rows[index]
+        if row.get("type") in _TERMINAL_TELEMETRY_TYPES:
+            continue
+        if row.get("type") != "item.completed":
+            return None
+        item = row.get("item")
+        if not isinstance(item, dict) or item.get("type") != "agent_message":
+            return None
+        text = item.get("text")
+        return text if isinstance(text, str) else None
+    return None
 
 
 def _read_terminal(path: str | Path | None) -> dict[str, object]:
@@ -192,12 +234,7 @@ def _read_terminal(path: str | Path | None) -> dict[str, object]:
     elif terminal_event == "step_finish":
         final_message = opencode_final_message
     else:
-        final_row = rows[terminal_index - 1] if terminal_index > 0 else None
-        if isinstance(final_row, dict) and final_row.get("type") == "item.completed":
-            item = final_row.get("item")
-            if isinstance(item, dict) and item.get("type") == "agent_message":
-                text = item.get("text")
-                final_message = text if isinstance(text, str) else None
+        final_message = _codex_final_agent_message(rows, terminal_index)
     if final_message is None:
         return _result(
             3,

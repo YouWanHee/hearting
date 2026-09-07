@@ -46,6 +46,7 @@ class CodexDispatchTerminalTest(unittest.TestCase):
         suffix=None,
         diagnostic=None,
         prefix=None,
+        between=None,
     ):
         path = self.base / f"attempt-{len(list(self.base.glob('attempt-*.jsonl')))}.jsonl"
         rows = [{"type": "turn.started"}]
@@ -72,6 +73,8 @@ class CodexDispatchTerminalTest(unittest.TestCase):
             "type": "item.completed",
             "item": {"type": "agent_message", "text": text},
         })
+        if between:
+            rows.extend(between)
         if completed:
             rows.append({"type": "turn.completed"})
         if suffix:
@@ -303,6 +306,105 @@ class CodexDispatchTerminalTest(unittest.TestCase):
         rejected = self.inspect(interposed)
         self.assertEqual(rejected["reason"], "missing-final-agent-message")
         self.assertNotIn("INTERPOSED_RAW_SENTINEL", repr(rejected))
+
+    # Supervisor observation rows between the final message and the terminal --
+    # measured live: 25 of 60 owner logs put `agent_message` directly before
+    # `turn.completed`, 10 put `dispatch.supervisor.token_usage` in between,
+    # and a valid handoff already existed in every one of those 10.
+    def test_supervisor_token_usage_between_final_message_and_terminal_is_read(self):
+        report = self.root / "telemetry_report.md"
+        report.write_text("# report\n", encoding="utf-8")
+        usage = {
+            "type": "dispatch.supervisor.token_usage",
+            "thread_id": "th1",
+            "turn_id": "t1",
+            "token_usage": {"input_tokens": 11, "output_tokens": 7},
+        }
+        single = self.inspect(
+            self.write_log(
+                verdict="PASS", blocker="none", artifact=str(report),
+                sandbox=False, between=[usage],
+            )
+        )
+        self.assertEqual(single["reason"], "none")
+        self.assertEqual(
+            (single["exit_code"], single["verdict"], single["artifact_state"]),
+            (0, "PASS", "readable"),
+        )
+        repeated = self.inspect(
+            self.write_log(
+                verdict="FAIL", blocker="one blocking finding", artifact=str(report),
+                sandbox=False, between=[usage, dict(usage, turn_id="t1b"), usage],
+            )
+        )
+        self.assertEqual(repeated["reason"], "none")
+        # a worker-reported FAIL with a readable artifact is a legal wire row
+        self.assertEqual(
+            (repeated["exit_code"], repeated["verdict"], repeated["blocker_reason"]),
+            (0, "FAIL", "worker-reported"),
+        )
+
+    def test_terminal_walkback_stops_at_work_items_boundaries_and_unknown_rows(self):
+        report = self.root / "walkback_report.md"
+        report.write_text("# report\n", encoding="utf-8")
+        usage = {"type": "dispatch.supervisor.token_usage", "token_usage": {}}
+        blockers = {
+            # a real tool item after the message: the message was not final
+            "command-item-completed": [{
+                "type": "item.completed",
+                "item": {"type": "command_execution", "exit_code": 0,
+                         "aggregated_output": "WALKBACK_RAW_SENTINEL"},
+            }],
+            "command-item-started": [{
+                "type": "item.started",
+                "item": {"type": "command_execution"},
+            }],
+            # never skip a turn boundary back onto an older turn's handoff
+            "previous-turn-boundary": [
+                {"type": "dispatch.supervisor.turn.started", "turn_id": "t2"}
+            ],
+            # an unknown supervisor/observation row is not silently skipped
+            "unknown-supervisor-row": [
+                {"type": "dispatch.supervisor.owner-boundary", "new_count": 1}
+            ],
+            "unknown-event": [{"type": "some.future.event"}],
+            # malformed rows fail closed rather than walking further back
+            "malformed-item": [{"type": "item.completed", "item": "not-a-dict"}],
+            "telemetry-then-work-item": [
+                usage,
+                {"type": "item.completed",
+                 "item": {"type": "command_execution", "exit_code": 0}},
+            ],
+        }
+        for name, between in blockers.items():
+            with self.subTest(interposed=name):
+                rejected = self.inspect(
+                    self.write_log(
+                        verdict="PASS", blocker="none", artifact=str(report),
+                        sandbox=False, between=between,
+                    )
+                )
+                self.assertEqual(rejected["reason"], "missing-final-agent-message")
+                self.assertEqual(rejected["exit_code"], 3)
+                self.assertNotIn("WALKBACK_RAW_SENTINEL", repr(rejected))
+
+    def test_walkback_never_promotes_an_older_agent_message(self):
+        stale = {
+            "type": "item.completed",
+            "item": {"type": "agent_message",
+                     "text": "artifact: -\nverdict: PASS\nblocker: none"},
+        }
+        # the newest agent_message has no text: fail closed on it rather than
+        # letting the previous turn's stale handoff pass the gate
+        textless = self.write_log(
+            verdict="FAIL", blocker="real", sandbox=False, prefix=[stale],
+            between=[{"type": "dispatch.supervisor.token_usage", "token_usage": {}}],
+        )
+        rows = [json.loads(line) for line in textless.read_text().splitlines()]
+        rows[-3] = {"type": "item.completed", "item": {"type": "agent_message"}}
+        textless.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+        rejected = self.inspect(textless)
+        self.assertEqual(rejected["reason"], "missing-final-agent-message")
 
     def test_artifact_missing_and_symlink_escape_fail_closed(self):
         missing = self.inspect(
