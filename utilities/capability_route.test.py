@@ -4952,4 +4952,64 @@ class ComposeRouteTest(TestRoute):
   self.assertEqual(R.shape_for_intensity("quick"),"solo"); self.assertEqual(R.shape_for_intensity("thorough"),"staged")
   with self.assertRaisesRegex(ValueError,"invalid route origin"): R.compile_route(**self.args(route_origin="guess"))
 
+class OwnerRegisteredCompletionTest(unittest.TestCase):
+ """노드 키가 없는 실제 depth-1 오너 행도 등록 완료로 결속한다."""
+ setUp=InlineStageCompletionRecipeTest.setUp
+ _restore=InlineStageCompletionRecipeTest._restore
+
+ def fixture(self, **overrides):
+  t=TestRoute()
+  route=R.compile_route(**t.args(capability="autopilot-spec",capability_mode="update",
+   artifact_root=self.base/"artifacts",requested_intensity="standard",predicates=[],
+   signals=["shared-contract"],transport="headless",inline_reason=None,
+   dispatch_evidence=t.dispatch(t.nested())))
+  node=next(n for n in route["nodes"] if n["id"]=="prd-transaction")
+  path=Path(route["artifact_root"])/".runtime"/"routes"/(route["route_id"]+".json")
+  path.parent.mkdir(parents=True); path.write_text(json.dumps(route))
+  evidence=self.base/"artifacts"/"report.md"; evidence.write_text("검증 완료\n")
+  meta={"attempt_schema_version":"2","dispatch_depth":"1","transport":"headless",
+   "execution_surface":"registered-headless","registered_worker":"1",
+   "fallback_hop":"same-harness-headless","attempt_id":"att-terminal-owner",
+   "worker_type":"owner","unit":"_kernel/owner",
+   "owner_route_id":route["route_id"],"owner_route_hash":route["route_hash"],
+   "owner_route_file":str(path),"pid":"2147483647","pid_start":"1"}
+  meta.update(overrides)
+  self.jobs.write_text("\t".join(["2026-09-07T00:00:00Z","open","repo","worktree","owner",
+   ",".join(k+"="+v for k,v in meta.items())])+"\n")
+  return route,node,path,evidence
+
+ def test_owner_complete_cli_uses_registered_row_and_replays(self):
+  route,node,path,evidence=self.fixture()
+  command=[str(P),"complete","--route",str(path),"--node",node["id"],
+   "--evidence",str(evidence),"--jobs",str(self.jobs),"--attempt-id","att-terminal-owner"]
+  for status in ("closed","already-closed"):
+   output=io.StringIO()
+   with mock.patch.object(sys,"argv",command),contextlib.redirect_stdout(output):
+    R.main()
+   marker,row=map(json.loads,output.getvalue().splitlines())
+   self.assertEqual(row["status"],status)
+   self.assertTrue(marker["registered_worker"])
+   self.assertEqual(marker["attempt_id"],"att-terminal-owner")
+   self.assertTrue(D.completion_marker_is_current(route,node,
+    R.completion_dir(route["route_id"])/"prd-transaction.json"))
+   # Identity lookup and the real registry writer are exercised; OS liveness
+   # is isolated so this fixture never claims anything about host processes.
+   for process,state in ((D.ProcessQuiescence("quiescent","fixture"),"ready"),
+                         (D.ProcessQuiescence("live","fixture"),"draining")):
+    with mock.patch.object(D,"attempt_process_quiescence",return_value=process) as probe:
+     self.assertEqual(D.completion_attempt_readiness(route,node,marker,self.jobs).state,state)
+     probe.assert_called_once()
+  metadata=D.parse_registry_metadata(self.jobs.read_text().split("\t")[5])
+  self.assertNotIn("route_id",metadata,"읽는 쪽 수정이며 등록 신원 재작성은 금지")
+  self.assertEqual(metadata["owner_route_id"],route["route_id"])
+
+ def test_foreign_owner_identity_cannot_publish_or_close(self):
+  route,node,path,evidence=self.fixture(owner_route_hash="sha256:"+"f"*64)
+  before=self.jobs.read_bytes()
+  with self.assertRaisesRegex(ValueError,"route identity"):
+   R.complete_node(route,node,node["id"],evidence,jobs=self.jobs,attempt_id="att-terminal-owner")
+  self.assertEqual(self.jobs.read_bytes(),before)
+  self.assertFalse((R.completion_dir(route["route_id"])/"prd-transaction.json").exists())
+
+
 if __name__=="__main__": unittest.main()

@@ -4500,10 +4500,8 @@ def _complete_node_locked(
                 raise ValueError(f"row-contract-invalid:{exc.reason}") from exc
             if row_metadata.get("subsession_id") or str(row_metadata.get("stage_authority", "1")).lower() in {"0", "false"}:
                 raise ValueError("subsession-has-no-stage-gate-authority")
-            if (
-                row_metadata.get("route_id") != route["route_id"]
-                or row_metadata.get("route_hash") != route["route_hash"]
-                or row_metadata.get("route_node") != node_id
+            if ROUTE_IDENTITY.registered_node_identity(row_metadata, node) != (
+                route["route_id"], route["route_hash"], node_id
             ):
                 raise ValueError("attempt row route identity mismatch")
             if explicit_attempt_metadata is not None:

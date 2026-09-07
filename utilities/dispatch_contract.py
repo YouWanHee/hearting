@@ -22,6 +22,7 @@ import time
 import uuid
 from typing import Callable, Iterator, NamedTuple
 
+from route_identity import registered_node_identity
 from dispatch_pending_delivery import RECIPIENT_KINDS
 from replica_batch_contract import (
     DIGEST,
@@ -5056,10 +5057,20 @@ def completion_attempt_readiness(
         if len(fields) != 6:
             continue
         metadata = parse_registry_metadata(fields[5])
-        if (
-            metadata.get("route_id") != route.get("route_id")
-            or metadata.get("route_node") != node.get("id")
-        ):
+        try:
+            row_route, row_hash, row_node = registered_node_identity(metadata, node)
+        except ValueError as exc:
+            if metadata.get("attempt_id") == attempt_id:
+                return AttemptReadiness("unverifiable", str(exc), attempt_id)
+            continue
+        if row_route != route.get("route_id") or row_node != node.get("id"):
+            continue
+        # Only a hash-less route and hash-less legacy row share the old
+        # read window. A modern route always requires its exact hash, at every
+        # depth, just as registered complete does.
+        if row_hash != str(route.get("route_hash") or ""):
+            if metadata.get("attempt_id") == attempt_id:
+                return AttemptReadiness("unverifiable", "attempt-route-hash-mismatch", attempt_id)
             continue
         if metadata.get("attempt_id") == attempt_id:
             exact.append((fields, metadata))

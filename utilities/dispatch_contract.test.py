@@ -1550,6 +1550,29 @@ class DispatchContractTest(unittest.TestCase):
      jobs,"att-mutation-test",{"launch_outcome":"governed-process-reaped"})
    self.assertEqual(caught.exception.reason,"attempt-launch-outcome-conflict")
 
+ def test_depth_two_readiness_binds_hash_and_preserves_only_hashless_route_legacy(self):
+  node={"id":"execute","kind":"pipeline-stage","dispatch_depth":2}
+  marker={"attempt_id":"att-hash-readiness","registered_worker":True}
+  for route_hash,row_hash,state in (("sha256:expected","sha256:foreign","unverifiable"),
+                                    ("sha256:expected",None,"unverifiable"),
+                                    ("sha256:expected","sha256:expected","ready"),
+                                    (None,None,"ready")):
+   with self.subTest(route_hash=route_hash,row_hash=row_hash):
+    route={"route_id":"rt-hash-readiness"}
+    if route_hash is not None:route["route_hash"]=route_hash
+    meta={"route_id":route["route_id"],"route_node":node["id"],
+          "attempt_id":marker["attempt_id"],"note":"completed-marker"}
+    if row_hash is not None:meta["route_hash"]=row_hash
+    lines=[attempt_row(meta,status="done")]
+    with mock.patch.object(D,"attempt_process_quiescence",
+                           return_value=D.ProcessQuiescence("quiescent","fixture")) as probe:
+     actual=D.completion_attempt_readiness(route,node,marker,Path("unused"),registry_lines=lines)
+     self.assertEqual(actual.state,state)
+     if state=="unverifiable":
+      self.assertEqual(actual.reason,"attempt-route-hash-mismatch")
+      probe.assert_not_called()
+     else:probe.assert_called_once()
+
  def test_semantic_completion_readiness_blocks_live_process_and_conflicting_retry(self):
   with tempfile.TemporaryDirectory() as td:
    jobs=Path(td)/"jobs.log"
