@@ -251,14 +251,19 @@ class ClaudeSD78CompletionDelivery(unittest.TestCase):
             WH.completion_state_path(args)
 
     def test_auto_prefers_resume_and_forced_unavailable_fails_closed(self):
+        # SD-OPEN-63: renamed claude_session_resume_available() -> probe_claude_session_resume(),
+        # which now returns a ClaudeResumeProbe record instead of a bare bool.
         args = argparse.Namespace(
             completion_delivery="auto", dispatch_depth=1, worker_type="owner",
             intensity="strong",
         )
-        with mock.patch.object(WH, "claude_session_resume_available", return_value=True):
+        supported = WH.ClaudeResumeProbe("supported", "ok", 0, 21504, ("--resume", "--session-id"), "help-file")
+        with mock.patch.object(WH, "probe_claude_session_resume", return_value=supported):
             self.assertEqual(WH.resolve_completion_delivery(args), "session-resume-supervised")
         args.completion_delivery = "supervised"
-        with mock.patch.object(WH, "claude_session_resume_available", return_value=False):
+        args.completion_probe = None
+        unsupported = WH.ClaudeResumeProbe("unsupported", "flags-absent-in-complete-help", 0, 21504, (), "help-file")
+        with mock.patch.object(WH, "probe_claude_session_resume", return_value=unsupported):
             with self.assertRaises(WH.DispatchContractError):
                 WH.resolve_completion_delivery(args)
 

@@ -17,6 +17,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1094,25 +1095,100 @@ def _completion_owner(args: argparse.Namespace) -> bool:
     )
 
 
-def claude_session_resume_available() -> bool:
+# SD-OPEN-63: `claude --help` piped through a PIPE truncates at a buffer boundary
+# (8192/16384 bytes measured) before `--session-id` appears, even though the
+# vendor docs both document the flag and state help does not enumerate every
+# flag. A PIPE-truncated substring match therefore reported "unsupported" for a
+# runtime that supports resume. Capturing help into a regular file removes the
+# PIPE buffer limit; the completeness sentinel below still guards against any
+# other source of a short/partial capture (timeout, non-zero exit, vendor
+# output change) before a flag absence is trusted as a real "unsupported".
+_CLAUDE_HELP_COMPLETENESS_SENTINEL = "update|upgrade"
+_CLAUDE_HELP_MIN_COMPLETE_BYTES = 20000
+
+
+class ClaudeResumeProbe:
+    """Result of probing `claude --help` for `--resume`/`--session-id` support.
+
+    `status` is one of `supported`/`unsupported`/`indeterminate`. `unsupported`
+    is only returned when the captured help is provably complete (sentinel +
+    minimum size) -- an incomplete or failed capture is always
+    `indeterminate`, never treated as evidence of non-support.
+    """
+
+    __slots__ = ("status", "reason", "exit_code", "stdout_bytes", "flags_seen", "source")
+
+    def __init__(self, status, reason, exit_code, stdout_bytes, flags_seen, source):
+        self.status = status
+        self.reason = reason
+        self.exit_code = exit_code
+        self.stdout_bytes = stdout_bytes
+        self.flags_seen = flags_seen
+        self.source = source
+
+
+def probe_claude_session_resume() -> ClaudeResumeProbe:
     if shutil.which("claude") is None:
-        return False
+        return ClaudeResumeProbe("indeterminate", "binary-absent", None, 0, (), "help-file")
+    fd, raw_path = tempfile.mkstemp(suffix=".claude-help.txt")
+    os.close(fd)
+    help_path = Path(raw_path)
     try:
-        result = subprocess.run(
-            ["claude", "--help"],
-            text=True,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=10,
-            check=False,
+        try:
+            with open(help_path, "wb") as sink:
+                result = subprocess.run(
+                    ["claude", "--help"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=sink,
+                    stderr=subprocess.STDOUT,
+                    timeout=10,
+                    check=False,
+                )
+        except subprocess.TimeoutExpired:
+            return ClaudeResumeProbe("indeterminate", "timeout", None, 0, (), "help-file")
+        except OSError:
+            return ClaudeResumeProbe("indeterminate", "probe-error", None, 0, (), "help-file")
+        raw = help_path.read_bytes()
+    finally:
+        try:
+            help_path.unlink()
+        except OSError:
+            pass
+    stdout_bytes = len(raw)
+    if result.returncode != 0:
+        return ClaudeResumeProbe(
+            "indeterminate", "nonzero-exit", result.returncode, stdout_bytes, (), "help-file"
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return result.returncode == 0 and "--resume" in result.stdout and "--session-id" in result.stdout
+    text = raw.decode("utf-8", errors="replace")
+    flags_seen = tuple(flag for flag in ("--resume", "--session-id") if flag in text)
+    complete = (
+        stdout_bytes >= _CLAUDE_HELP_MIN_COMPLETE_BYTES
+        and _CLAUDE_HELP_COMPLETENESS_SENTINEL in text
+    )
+    if not complete:
+        return ClaudeResumeProbe(
+            "indeterminate", "help-truncated", result.returncode, stdout_bytes, flags_seen, "help-file"
+        )
+    if "--resume" in flags_seen and "--session-id" in flags_seen:
+        return ClaudeResumeProbe(
+            "supported", "ok", result.returncode, stdout_bytes, flags_seen, "help-file"
+        )
+    return ClaudeResumeProbe(
+        "unsupported",
+        "flags-absent-in-complete-help",
+        result.returncode,
+        stdout_bytes,
+        flags_seen,
+        "help-file",
+    )
 
 
 def resolve_completion_delivery(args: argparse.Namespace) -> str:
+    """SD-OPEN-63 (D-2): a probe result of `indeterminate` never silently
+    degrades to `poll-fallback` -- it is a typed refusal so a `standard+` auto
+    owner never loses supervision without a preserved reason. Only a provably
+    complete negative probe (`unsupported`) or an explicit operator `poll`
+    request produces `poll-fallback`."""
     requested = args.completion_delivery
     if not _completion_owner(args):
         if requested == "supervised":
@@ -1123,14 +1199,25 @@ def resolve_completion_delivery(args: argparse.Namespace) -> str:
         return "one-shot"
     if requested == "poll":
         return "poll-fallback"
-    if claude_session_resume_available():
+    probe = getattr(args, "completion_probe", None)
+    if probe is None:
+        probe = probe_claude_session_resume()
+        args.completion_probe = probe
+    if probe.status == "supported":
+        args.completion_delivery_reason = "ok"
         return "session-resume-supervised"
-    if requested == "supervised":
-        raise DispatchContractError(
-            "claude-session-resume-unavailable",
-            "claude --help did not expose --session-id and --resume; no owner was launched",
-        )
-    return "poll-fallback"
+    if probe.status == "unsupported":
+        args.completion_delivery_reason = "claude-session-resume-unsupported"
+        if requested == "supervised":
+            raise DispatchContractError(
+                "claude-session-resume-unavailable",
+                "claude --help did not expose --session-id and --resume; no owner was launched",
+            )
+        return "poll-fallback"
+    raise DispatchContractError(
+        "claude-session-resume-indeterminate",
+        f"claude --help probe was indeterminate ({probe.reason}); refusing to silently fall back",
+    )
 
 
 def completion_state_path(args: argparse.Namespace) -> Path:
@@ -1371,7 +1458,10 @@ def append_job(jobs: Path, args: argparse.Namespace) -> bool:
         f",permission_mode={posture['mode']},permission_mode_reason={posture['reason']}"
         f",permission_inherited_mode={posture['inherited_default_mode']}"
     )
-    pipe += f",completion_delivery={args.resolved_completion_delivery}"
+    pipe += (
+        f",completion_delivery={args.resolved_completion_delivery}"
+        f",completion_delivery_reason={args.completion_delivery_reason}"
+    )
     if args.resolved_completion_delivery == "session-resume-supervised":
         pipe += (
             f",supervisor_lease={SUPERVISOR_LEASE_KIND}"
@@ -2052,6 +2142,7 @@ def main(argv: list[str]) -> int:
         profile_type=profile_worker_type(ROOT, args.profile),
     )
     args.jobs_path = jobs
+    args.completion_delivery_reason = "not-applicable"
     try:
         args.resolved_completion_delivery = resolve_completion_delivery(args)
         if args.resolved_completion_delivery == "session-resume-supervised":
@@ -2634,6 +2725,7 @@ def main(argv: list[str]) -> int:
     print("adapter=claude")
     print("runtime_surface=claude-print-headless")
     print(f"completion_delivery={args.resolved_completion_delivery}")
+    print(f"completion_delivery_reason={args.completion_delivery_reason}")
     print(f"parent_completion_delivery={args.parent_completion_delivery}")
     print(f"parent_completion_reason={args.parent_completion_reason}")
     print(f"parent_completion_reason_class={getattr(args, 'parent_completion_reason_class', '-')}")

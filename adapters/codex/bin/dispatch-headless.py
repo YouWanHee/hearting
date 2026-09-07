@@ -1198,6 +1198,11 @@ def codex_app_server_available() -> bool:
 
 
 def resolve_completion_delivery(args: argparse.Namespace) -> str:
+    """SD-OPEN-63 (3.1): Codex's `codex_app_server_available()` is already an
+    exit-code feature probe, not a help-string substring match, so its
+    judgment mechanism is unchanged. Only the reason is now sealed onto
+    `args.completion_delivery_reason` so an auto degrade to `poll-fallback`
+    carries the same preserved-evidence contract as the Claude adapter."""
     requested = args.completion_delivery
     if not _completion_owner(args):
         if requested == "supervised":
@@ -1209,12 +1214,14 @@ def resolve_completion_delivery(args: argparse.Namespace) -> str:
     if requested == "poll":
         return "poll-fallback"
     if codex_app_server_available():
+        args.completion_delivery_reason = "ok"
         return "app-server-supervised"
     if requested == "supervised":
         raise DispatchContractError(
             "codex-app-server-unavailable",
             "codex app-server --help did not pass; no owner attempt was launched",
         )
+    args.completion_delivery_reason = "codex-app-server-unavailable"
     return "poll-fallback"
 
 
@@ -1520,6 +1527,7 @@ def append_job(jobs: Path, args: argparse.Namespace) -> bool:
         f"registered_worker={int(bool(args.registered_worker))},"
         f"fallback_hop={args.fallback_hop},harness=codex,"
         f"completion_delivery={args.resolved_completion_delivery},"
+        f"completion_delivery_reason={getattr(args, 'completion_delivery_reason', 'not-applicable')},"
         f"parent_completion_delivery={args.parent_completion_delivery},"
         f"parent_completion_reason={getattr(args, 'parent_completion_reason', 'unspecified')}"
     )
@@ -2433,6 +2441,7 @@ def main(argv: list[str]) -> int:
         profile_type=profile_worker_type(ROOT, args.profile),
     )
     args.jobs_path = jobs
+    args.completion_delivery_reason = "not-applicable"
     try:
         args.resolved_completion_delivery = resolve_completion_delivery(args)
         if args.resolved_completion_delivery == "app-server-supervised":
@@ -3072,6 +3081,7 @@ def main(argv: list[str]) -> int:
     print("adapter=codex")
     print("runtime_surface=codex-exec-headless")
     print(f"completion_delivery={args.resolved_completion_delivery}")
+    print(f"completion_delivery_reason={getattr(args, 'completion_delivery_reason', 'not-applicable')}")
     print(f"parent_completion_delivery={args.parent_completion_delivery}")
     print(f"parent_completion_reason={getattr(args, 'parent_completion_reason', 'unspecified')}")
     print(f"parent_completion_reason_class={getattr(args, 'parent_completion_reason_class', '-')}")
