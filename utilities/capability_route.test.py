@@ -179,7 +179,21 @@ class TestRoute(unittest.TestCase):
   self.assertEqual(a["human_gate_bindings"],[])
  def test_quick_missing_eligibility_fails_closed(self):
   with self.assertRaisesRegex(ValueError,"quick-headless-unavailable"):
+   R.compile_route(**self.args(predicates=[],transport=None,inline_reason=None,requested_intensity="quick"))
+ def test_h6_explicit_direct_predicate_gap_refusal_names_missing(self):
+  # H6: `--intensity direct` whose 7 predicates do not all hold used to be
+  # silently promoted to quick and died as an opaque
+  # `quick-headless-unavailable`. The no-evidence refusal must name the
+  # missing predicates; with checked quick evidence the compile still
+  # promotes (`test_ambiguous_quick`), and a true quick request keeps the
+  # quick eligibility enum.
+  partial=[p for p in ALL if p!="no-shared-contract"]
+  with self.assertRaisesRegex(ValueError,"direct-predicate-gap:no-shared-contract"):
+   R.compile_route(**self.args(predicates=partial,transport=None,inline_reason=None))
+  with self.assertRaisesRegex(ValueError,"direct-predicate-gap:"):
    R.compile_route(**self.args(predicates=[],transport=None,inline_reason=None))
+  with self.assertRaisesRegex(ValueError,"quick-headless-unavailable"):
+   R.compile_route(**self.args(predicates=[],transport=None,inline_reason=None,requested_intensity="quick"))
  def test_quick_invalid_transport_fails_closed(self):
   with self.assertRaisesRegex(ValueError,"invalid quick transport"):
    R.compile_route(**self.args(predicates=[],transport="interactive",inline_reason=None,registered_headless_evidence=self.registered_headless()))
@@ -2104,6 +2118,41 @@ class TestContinuation(unittest.TestCase):
    self._complete_prefix(source,"test",Path(tmp)/"evidence")
    continuation=self._build(source)
    self.assertEqual(continuation["confirmation_mode"],"hybrid")
+
+ def test_sd_open_46_composed_route_continuation_inherits_composition(self):
+  # SD-OPEN-46: a continuation of a composed (compose-on-demand) route must
+  # carry the source's composition fields. Without `composed`/`composed_recipe`
+  # in inherited_keys the suffix looks like a preset route to every consumer
+  # (`compose_card`, CLI status, guards) and the embedded recipe loses its
+  # tamper seal. `route_origin`/`shape` ride `selection`, which is inherited
+  # wholesale -- asserted here so a future refactor cannot drop them.
+  with tempfile.TemporaryDirectory() as tmp:
+   artifact=Path(tmp)/"artifacts"
+   recipe=json.loads(json.dumps(
+    R.TOPO.resolve_recipe(R.TOPO.load_registry(),"autopilot-code","dev")))
+   recipe["modes"]=["composed-fixture"]
+   gate={
+    "spec_read":{"satisfied":True,"source":"canonical-prd-sha256"},
+    "drift_verdict":"within-spec","workflow_mode":"tracked",
+    "artifact_guard":{"satisfied":True,"source":"conductor-prechecked"},
+   }
+   source=R.compile_composed_route(
+    recipe,"composed-fixture","strong",R.ROOT,artifact,
+    predicates=[],signals=["shared-contract"],transport="headless",
+    tracking="tracked",tracked_gate_evidence=gate,
+    dispatch_evidence=self._dispatch(),
+    route_origin="compose",shape="staged",
+   )
+   self.assertIs(source["composed"],True)
+   self.assertEqual(source["selection"]["route_origin"],"compose")
+   self.assertEqual(source["selection"]["shape"],"staged")
+   self._complete_prefix(source,"test",Path(tmp)/"evidence")
+   continuation=self._build(source)
+   self.assertIs(continuation["composed"],True)
+   self.assertEqual(continuation["composed_recipe"],source["composed_recipe"])
+   self.assertEqual(continuation["selection"]["route_origin"],"compose")
+   self.assertEqual(continuation["selection"]["shape"],"staged")
+   R.verify_route(continuation,R.ROOT)
 
  def test_at2_boundary_and_first_runnable_blockers_are_disjoint(self):
   with tempfile.TemporaryDirectory() as tmp:
