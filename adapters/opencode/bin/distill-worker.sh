@@ -115,10 +115,15 @@ fi
 # Keep caller overrides intact; a derived path grants no permission to
 # initialize an empty store. Child mem.py resolves under the same env.
 
-delta=$(
+# Delta and frontier come from the same source read. A later prompt can append
+# messages while the model runs; completion must never acknowledge that tail.
+capture=$(
   AGENT_HOME="$AGENT_ROOT" \
-  python3 "$ROOT/tools/memory/mem.py" distill "$sid" --source opencode 2>/dev/null || true
-)
+  python3 "$ROOT/tools/memory/mem.py" distill "$sid" --source opencode --capture
+) || exit 69
+delta=$(printf '%s' "$capture" | python3 -c 'import json,sys; sys.stdout.write(json.load(sys.stdin)["delta"])') || exit 69
+frontier=$(printf '%s' "$capture" | python3 -c 'import json,sys; print(json.load(sys.stdin)["frontier"])') || exit 69
+unset capture
 
 if [ -z "$(printf '%s' "$delta" | tr -d '[:space:]')" ]; then
   exit 0
@@ -318,7 +323,7 @@ if [ "${OPENCODE_DISTILL_APPLY:-}" = "1" ]; then
   # forever; a preview-only (non-apply) run or a failed/timed-out exec keeps
   # the delta for a later real distill.
   if [ "$exec_ok" = "1" ]; then
-    AGENT_HOME="$AGENT_ROOT" python3 "$ROOT/tools/memory/mem.py" distill "$sid" --source opencode --advance >/dev/null 2>&1 || true
+    AGENT_HOME="$AGENT_ROOT" python3 "$ROOT/tools/memory/mem.py" distill "$sid" --source opencode --advance-capture "$frontier" >/dev/null 2>&1 || true
   fi
 fi
 

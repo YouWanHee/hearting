@@ -125,6 +125,7 @@ for runtime in ['codex', 'opencode']:
             'if len(sys.argv) > 2 and sys.argv[1].endswith("/tools/memory/mem.py") and sys.argv[2] == "distill":\n'
             ' r = subprocess.run([' + repr(sys.executable) + ', sys.argv[1], "index"], capture_output=True, text=True)\n'
             ' Path(' + repr(str(probe)) + ').write_text(json.dumps({"override": os.environ.get("MEM_STORE"), "rc": r.returncode, "err": r.stderr}))\n'
+            ' print(json.dumps({"delta": "", "frontier": "fixture-empty"}))\n'
             ' sys.exit(0)\n'
             'os.execv(' + repr(sys.executable) + ', [' + repr(sys.executable) + '] + sys.argv[1:])\n')
         wrapper.chmod(0o755)
