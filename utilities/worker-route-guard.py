@@ -42,7 +42,11 @@ def _git_state(cwd: Path) -> dict[str, str]:
     head_probe = subprocess.run(["git", "-C", str(cwd), "rev-parse", "HEAD"], text=True, capture_output=True)
     head = head_probe.stdout.strip() if head_probe.returncode == 0 else "unversioned"
     if operation != "none": raise _fail("unsafe-git-operation", operation)
-    if branch == "DETACHED": raise _fail("unsafe-git-state", "detached HEAD")
+    if branch == "DETACHED":
+        raise _fail("unsafe-git-state",
+                    f"detached HEAD in {cwd}; route worktrees, including spec-only work, require a branch. "
+                    "Run git switch -c <new-branch> in that worktree to preserve HEAD and existing changes, "
+                    "then retry dispatch")
     if not head: raise _fail("unsafe-git-state", "HEAD cannot be resolved")
     return {"repository": "git", "operation": operation, "branch": branch, "head": head}
 
@@ -204,7 +208,8 @@ def validate_route_contract(route_path: str | Path, node_id: str, cwd: str | Pat
         if not compatible:
             raise _fail(
                 "launch-runtime-root-mismatch",
-                json.dumps({"phase": launch_phase, "mismatches": mismatches}, sort_keys=True),
+                json.dumps({"phase": launch_phase, "mismatches": mismatches,
+                            "recovery": ROUTE.runtime_root_hint(route)}, sort_keys=True),
                 rid,
             )
     actual_cwd = Path(cwd)

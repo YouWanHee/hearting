@@ -176,7 +176,15 @@ class QuiescenceTest(unittest.TestCase):
             valid = Q.publish(str(base / "valid.json"), config)
             self.assertTrue(valid["observation_valid"], valid)
             self.assertTrue(valid["proven"], valid)
-            (artifact_root / ".runtime" / "routes" / "broken.json").write_text('{', encoding="utf-8")
+            # SD-OPEN-54 (#15): the gate ledger beside a route record is a typed
+            # sidecar, and a stray non-route basename is non-blocking evidence.
+            (artifact_root / ".runtime" / "routes" / "rt-0123456789abcdef.gate-release.json").write_text(
+                '{"schema_version":1,"route_id":"rt-0123456789abcdef","gate_releases":[]}', encoding="utf-8")
+            (artifact_root / ".runtime" / "routes" / "notes.json").write_text('{"kind":"note"}', encoding="utf-8")
+            still_valid = Q.publish(str(base / "still-valid.json"), config)
+            self.assertTrue(still_valid["observation_valid"], still_valid)
+            self.assertTrue(still_valid["proven"], still_valid)
+            (artifact_root / ".runtime" / "routes" / "rt-fedcba9876543210.json").write_text('{', encoding="utf-8")
             invalid = Q.publish(str(base / "invalid.json"), config)
             self.assertFalse(invalid["observation_valid"], invalid)
             self.assertFalse(invalid["proven"], invalid)

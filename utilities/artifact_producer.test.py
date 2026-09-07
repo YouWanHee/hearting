@@ -905,6 +905,8 @@ class FinalizeTest(ProducerTestBase):
         with self.assertRaises(P.ProducerError) as ctx:
             P.finalize(self.root, cycle_id=result["cycle_id"])
         self.assertEqual(ctx.exception.code, "route-not-closed")
+        self.assertIn("complete -> close -> finalize -> admit-shared", str(ctx.exception))
+        self.assertIn(route["route_id"], str(ctx.exception))
         sealed = P.finalize(self.root, cycle_id=result["cycle_id"], allow_open_route=True)
         self.assertEqual(sealed["status"], "sealed")
         document = json.loads((Path(result["cycle_dir"]) / "manifest.json").read_text())

@@ -759,6 +759,34 @@ def artifact_bucket_caps(rel_parts: tuple[str, ...]) -> set[str] | None:
     return CAPABILITY_ARTIFACT_CAPS.get(top)
 
 
+def _same_git_repository(a: Path, b: Path) -> bool:
+    """True when both paths live in the same git repository family.
+
+    The per-turn recall probe runs in the runtime session directory, but
+    material work legitimately proceeds in a linked worktree with the route
+    bound there (OpenCode has no per-turn cd; Claude/Codex probes follow the
+    session cwd the same way). A linked worktree shares the main checkout's
+    common dir and memory is project-scoped, so a receipt from the same
+    repository family is the same-project proof this check exists for. Exact
+    path equality stays the primary condition; unrelated repositories still
+    refuse.
+    """
+    try:
+        a_resolved = a.resolve(strict=False)
+        b_resolved = b.resolve(strict=False)
+    except OSError:
+        return False
+    if a_resolved == b_resolved:
+        return True
+    common_a = _git_common_dir(a_resolved)
+    common_b = _git_common_dir(b_resolved)
+    return (
+        common_a is not None
+        and common_b is not None
+        and common_a == common_b
+    )
+
+
 def require_recall_opportunity(session_id: str, turn_id: str, root: Path) -> None:
     path = recall_receipt_path(session_id)
     try:
@@ -773,7 +801,8 @@ def require_recall_opportunity(session_id: str, turn_id: str, root: Path) -> Non
         raise RouteError("recall-opportunity-invalid")
     if receipt.get("session_digest") != recall_session_key(session_id):
         raise RouteError("recall-opportunity-foreign")
-    if Path(str(receipt.get("cwd", ""))).resolve(strict=False) != root.resolve():
+    receipt_cwd = Path(str(receipt.get("cwd", ""))).resolve(strict=False)
+    if receipt_cwd != root.resolve() and not _same_git_repository(receipt_cwd, root):
         raise RouteError("recall-opportunity-cwd-mismatch")
     created_at_ns = receipt.get("created_at_ns")
     if not isinstance(created_at_ns, int) or isinstance(created_at_ns, bool):

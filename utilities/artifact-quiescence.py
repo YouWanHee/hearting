@@ -165,8 +165,9 @@ def collect(config: dict, now: datetime | None = None) -> dict:
     canonical_routes = Path(config["artifact_root"]) / ".runtime" / "routes"
     blocking_route_diagnostics = [
         row for row in route_diagnostics
-        if Path(row.get("path", "")).parent == canonical_routes
-        or "route" in Path(row.get("path", "")).name.lower()
+        if row.get("blocking", True)
+        and (Path(row.get("path", "")).parent == canonical_routes
+             or "route" in Path(row.get("path", "")).name.lower())
     ]
     resource_rows, resource_diagnostics = RESOURCES.scan(index_path=config["resource_index"])
     if resource_diagnostics:

@@ -22,7 +22,10 @@ another adapter.
 
 ## Runtime Router
 
-- Treat `AGENT_HOME` as the installed harness root.
+- Treat `AGENT_HOME` as the installed harness root: for a managed release use
+  `${XDG_DATA_HOME:-$HOME/.local/share}/hearting/current`, or an existing route's
+  sealed release root. `$HOME/.claude` is the runtime projection, even when its
+  harness files are symlinks; do not use it as the managed `AGENT_HOME`.
 - Resolve the canonical artifact root with `utilities/artifact-root.sh`; linked worktrees write the primary checkout's `.agent_reports/`, and legacy `.claude_reports/` is only a fallback.
 - Use portable model roles, never vendor model names, in shared artifacts.
 - Repo-root `skills/` is the canonical Skill authoring tree; `tools/sync-entry-skill-layer.py` projects it into `adapters/claude/skills/` (generated — do not hand-edit the projection). Claude-native hooks, commands, settings, and kernel helper agents live under `adapters/claude/`; behavior personas live in the portable unit catalog `roles/units/`.

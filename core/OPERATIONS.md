@@ -53,6 +53,13 @@ replacing a tracked directory with a symlink.
 
 The §5.8 lock protects only artifact writes. It does not detect an active merge or rebase, dirty files, detached HEAD, or the same branch in another worktree. A code-mutating capability, canonically `autopilot-code`, checks once before editing and again before every commit or write-back.
 
+Every worktree used to dispatch a route must have a branch, including spec-only
+routes whose artifacts live outside the checkout. Create it with
+`git worktree add -b <new-branch> <path> <base>`. For an existing detached task
+worktree, `git switch -c <new-branch>` inside that worktree preserves its current
+HEAD and uncommitted work. Owner briefs must check this before compiling or
+dispatching; detached HEAD remains an `unsafe-git-state` refusal.
+
 ```bash
 # Run before code edits and every commit. On STOP, halt and report.
 GD=$(git rev-parse --git-dir 2>/dev/null) || { echo "OK non-git"; return 0 2>/dev/null||exit 0; }
