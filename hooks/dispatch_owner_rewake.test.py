@@ -1846,30 +1846,34 @@ class ReleaseRearmTest(unittest.TestCase):
         gate, the depth-0 release was refused "RUNNING, not blocked", nothing
         armed, and the owner's completion sat in pending-delivery until the
         next prompt sweep."""
-        refusal = "workflow-supervisor: workflow is RUNNING, not blocked on a human gate"
+        prose = "workflow-supervisor: workflow is RUNNING, not blocked on a human gate"
+        typed = json.dumps({"gate": "frame-review", "route_id": "rt-gate",
+                            "refusal": "gate-not-blocked", "workflow_state": "RUNNING"})
         literal = (f"python3 utilities/workflow-supervisor.py release --route {self.route} "
                    f"--gate frame-review --decision proceed --jobs {self.jobs}")
-        payload = self.payload(command=literal, stdout="")
-        payload["tool_response"]["stderr"] = refusal
+        payload = self.payload(command=literal, stdout=typed)
+        payload["tool_response"]["stderr"] = prose
         launch = rewake.release_launch(payload)
         self.assertIsNotNone(launch)
         self.assertEqual((launch.attempt_id, launch.armed), ("att-gate-owner", "release-refused"))
-        # the route id comes from the route FILE, never from the literal
-        self.route.write_text(json.dumps({"route_id": "rt-other", "nodes": []}), encoding="utf-8")
-        self.assertIsNone(rewake.release_launch(payload))
-        # a shell-variable literal, an unreadable file, or any other refusal arms nothing
-        self.assertIsNone(rewake.release_launch(self.payload(stdout=refusal)))
-        missing = literal.replace(str(self.route), str(self.root / "nope.json"))
-        self.assertIsNone(rewake.release_launch(self.payload(command=missing, stdout=refusal)))
-        self.route.write_text(json.dumps({"route_id": "rt-gate", "nodes": []}), encoding="utf-8")
-        other = self.payload(command=literal, stdout="workflow-supervisor: interview-answers-required: ...")
-        self.assertIsNone(rewake.release_launch(other))
+        # review finding 13: the route id comes from the supervisor's typed
+        # refusal line -- prose alone, a literal, or another refusal arms nothing
+        prose_only = self.payload(command=literal, stdout="")
+        prose_only["tool_response"]["stderr"] = prose
+        self.assertIsNone(rewake.release_launch(prose_only))
+        other = json.dumps({"gate": "frame-review", "route_id": "rt-gate", "refusal": "gate-undeclared"})
+        self.assertIsNone(rewake.release_launch(self.payload(command=literal, stdout=other)))
+        foreign_gate = json.dumps({"gate": "plan-review", "route_id": "rt-gate", "refusal": "gate-not-blocked"})
+        self.assertIsNone(rewake.release_launch(self.payload(command=literal, stdout=foreign_gate)))
         # refused-as-released with no started open owner says so once
         self.write_rows([("att-gate-owner", "done", "session-gate", "rt-gate")])
         self.assertIsNone(rewake.release_launch(payload))
         with mock.patch.object(sys, "stdout", io.StringIO()) as out:
             self.assertEqual(rewake.release_no_arm_notice(payload), 0)
         self.assertIn("state=not-armed surface=release-refused", json.loads(out.getvalue())["systemMessage"])
+        with mock.patch.object(sys, "stdout", io.StringIO()) as out:
+            self.assertEqual(rewake.release_no_arm_notice(prose_only), 0)
+        self.assertEqual(out.getvalue(), "")
 
     def test_a_registered_but_never_started_owner_never_arms(self):
         """review round 1, M2: the row the fence leaves behind (registered, refused

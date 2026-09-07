@@ -115,7 +115,10 @@ def residue_terminal_basis(fields: list[str], metadata: dict[str, str]) -> str:
     or the worker's own final runtime envelope both mean the worker declared
     itself finished; anything still carrying its tag afterwards is a leftover.
     Without either, survivors keep their veto -- the worker may still be
-    writing its output.
+    writing its output. Sealing additionally requires the governed process
+    group to be empty or to hold only tagged survivors: an untagged live
+    member of the governed group is not residue and keeps the drain waiting
+    (at the backed-off interval).
     """
 
     if fields[1] not in {"open", "running"}:
@@ -163,14 +166,26 @@ def watch(args: argparse.Namespace) -> int:
             return 69
         if group.state == "empty" and descendants.state == "empty":
             break
-        if group.state == "empty" and descendants.state == "populated":
+        tagged_pids = {pid for pid, _start, _state in descendants.members}
+        group_live = {pid for pid, _start, state in group.members if state != "Z"}
+        # Residue may also sit inside the governed group (`nohup cmd &` without
+        # setsid); it is residue all the same when every live group member
+        # carries the tag (review finding 11).
+        group_is_residue = group.state == "empty" or (
+            group.state == "populated" and group_live <= tagged_pids
+        )
+        if group_is_residue and descendants.state == "populated":
             basis = residue_terminal_basis(fields, metadata)
             if basis and time.monotonic() - drain_started >= args.residue_grace:
+                members = list(descendants.members)
                 descendant_proof = {
                     "attempt_descendant_proof": ATTEMPT_DESCENDANT_RESIDUE_PROOF,
+                    # Bounded: the row is re-read by every registry parser
+                    # (review finding 10); the count carries the rest.
                     "attempt_descendant_residue": ";".join(
-                        f"{pid}:{start}" for pid, start, _state in descendants.members
+                        f"{pid}:{start}" for pid, start, _state in members[:16]
                     ),
+                    "attempt_descendant_residue_count": str(len(members)),
                     "attempt_descendant_residue_basis": basis,
                     "attempt_descendant_residue_at": datetime.now(timezone.utc)
                     .isoformat()

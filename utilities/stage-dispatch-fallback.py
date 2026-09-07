@@ -1239,23 +1239,34 @@ def watch_launched_attempt(args, route, node, attempt_id, launch_fields):
     # may have heartbeated past it by now; this seed is a floor, never a
     # regression (SD-OPEN-38 root cause: `progress-phase-regression` from this
     # very call was reported as `progress-watchdog-fail-closed`).
+    advisory: dict[str, str] = {}
     seed = subprocess.run(common[:2] + ["heartbeat"] + common[2:] +
         ["--phase", "launch", "--kind", "registry", "--if-absent",
          "--evidence", f"pid={launch_fields.get('child_pid', '-')};start={launch_fields.get('child_pid_start', '-')}"],
         cwd=ROOT, text=True, capture_output=True, check=False, env=direct_env())
     if seed.returncode:
         seed_fields = output_fields(seed.stdout + seed.stderr)
-        if seed_fields.get("reason") != "progress-phase-regression":
+        if seed_fields.get("reason") == "progress-phase-regression":
+            # Cannot happen with --if-absent unless an older progress tool is
+            # installed; still not a launch failure, but it rides on the
+            # receipt as an advisory (review finding 9).
+            advisory.update({
+                "watchdog_verdict": "advisory",
+                "watchdog_advisory_tool": "heartbeat-seed",
+                "watchdog_advisory_reason": "progress-phase-regression",
+                "watchdog_advisory_detail": seed_fields.get("detail", "-"),
+            })
+        else:
             # A foreground-scoped wrapper returns only after the worker exits.
             # The worker can therefore close its exact row before this late
             # launch heartbeat is attempted; the authoritative terminal row
             # wins that race, a live child demotes the tool failure to an
             # advisory, and anything else stays fail-closed.
             verdict = progress_tool_failure_verdict(
-                args, route, node, attempt_id, "heartbeat", seed_fields)
+                args, route, node, attempt_id, "heartbeat-seed", seed_fields)
             if verdict[0] != "observed":
                 return verdict
-    advisory: dict[str, str] = {}
+            advisory.update(verdict[1])
     def observe():
         result = subprocess.run(common[:2] + ["watchdog"] + common[2:] +
             ["--progress-window-seconds", str(args.progress_window_seconds),

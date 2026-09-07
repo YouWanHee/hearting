@@ -227,7 +227,10 @@ class AnswersTest(unittest.TestCase):
         self.assertTrue(errors[0].startswith("interview.schema: expected 'frame_interview_v1'"))
         self.assertNotIn("no such question", errors[0])
         self.assertEqual(FI.foreign_interview_schema(foreign), "cairn-frame-interview/v1")
-        self.assertEqual(FI.foreign_interview_schema({"schema": "x/v1", "questions": []}), "x/v1")
+        # review finding 5: only something that calls itself an interview is
+        # foreign -- a frame summary or plan with a `questions` list is not.
+        self.assertIsNone(FI.foreign_interview_schema({"schema": "x/v1", "questions": []}))
+        self.assertIsNone(FI.foreign_interview_schema({"schema": "frame_summary_v1", "questions": ["open q1"]}))
         self.assertIsNone(FI.foreign_interview_schema({"schema": "frame_summary_v1"}))
         self.assertIsNone(FI.foreign_interview_schema(good_interview()))
         with tempfile.TemporaryDirectory() as td:

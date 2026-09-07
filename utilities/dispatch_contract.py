@@ -122,6 +122,7 @@ ATTEMPT_MUTABLE_METADATA = {
     "attempt_descendant_proof",
     "attempt_descendant_observer_ns",
     "attempt_descendant_residue",
+    "attempt_descendant_residue_count",
     "attempt_descendant_residue_basis",
     "attempt_descendant_residue_at",
     "reap_watch",
@@ -1704,6 +1705,35 @@ PRELAUNCH_PROCESS_BLOCK_REASONS = (
 )
 
 
+def _parent_leader_pids(metadata: dict[str, str]) -> set[int]:
+    """The recorded parent leader as an exact identity, else nothing.
+
+    `parent_pid` counts only when `parent_pid_start` matches the live start
+    ticks of that pid in this observer's namespace. `parent_pid_host` is a
+    host-namespace number recorded only when the parent lives in another
+    namespace, so it is comparable here only when the row's own namespace is
+    the observer's and the parent is host-visible.
+    """
+
+    excluded: set[int] = set()
+    raw = str(metadata.get("parent_pid", ""))
+    start = str(metadata.get("parent_pid_start", ""))
+    if raw.isdigit() and start and process_start_ticks(int(raw)) == start:
+        excluded.add(int(raw))
+    raw_host = str(metadata.get("parent_pid_host", ""))
+    host_start = str(metadata.get("parent_pid_host_start", "") or start)
+    if (
+        raw_host.isdigit()
+        and host_start
+        and metadata.get("parent_pid_scope") == "host-visible"
+        and metadata.get("pid_ns")
+        and metadata.get("pid_ns") == metadata.get("pid_observer_ns")
+        and process_start_ticks(int(raw_host)) == host_start
+    ):
+        excluded.add(int(raw_host))
+    return excluded
+
+
 def attempt_tagged_descendants(metadata: dict[str, str]) -> ProcessGroupObservation:
     """Find live processes still tagged with this attempt, whatever group they left.
 
@@ -1726,13 +1756,11 @@ def attempt_tagged_descendants(metadata: dict[str, str]) -> ProcessGroupObservat
     tag = f"{ATTEMPT_DESCENDANT_ENV}={attempt_id}".encode()
     # SD-OPEN-47 (H7-b): a child's liveness is its own process set. The
     # recorded parent leader (the owner's governed process) is an ancestor,
-    # never a descendant, so it is excluded by identity before any tag match;
-    # the owner living on must not keep the child row open.
-    excluded_pids = {
-        int(metadata.get(key, ""))
-        for key in ("parent_pid", "parent_pid_host")
-        if str(metadata.get(key, "")).isdigit()
-    }
+    # never a descendant, so it is excluded before any tag match -- but only
+    # by the repository's process identity (pid + start ticks, same
+    # namespace as the observer), never by pid number alone: a reused or
+    # cross-namespace number is a different process (review finding 2).
+    excluded_pids = _parent_leader_pids(metadata)
     members: list[tuple[int, str, str]] = []
     incomplete_reason = ""
     try:

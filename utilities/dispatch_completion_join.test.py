@@ -476,6 +476,41 @@ class DispatchCompletionJoinTest(unittest.TestCase):
         )
         self.assertEqual(receipt["state"], "ready", receipt)
         self.assertEqual(receipt["children"][0]["reason"], "registry-closed-marker")
+        # review finding 1: the receipt must pass the owner supervisors' closed
+        # reason allowlists, or the owner dies at its first join instead of
+        # waiting -- validate it with the real consumers.
+        import importlib.util
+        for name, attr in (("claude-session-supervisor.py", "typed_receipt"),
+                           ("codex-app-server-supervisor.py", "_typed_receipt")):
+            spec = importlib.util.spec_from_file_location(name.replace("-", "_").replace(".py", ""),
+                                                          Path(__file__).resolve().parent / name)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            validated = getattr(module, attr)(receipt, "att-parent", {attempt})
+            self.assertEqual(validated["children"][0]["reason"], "registry-closed-marker", name)
+        # review finding 3: a live exact leader is not residue -- the marker
+        # chain alone never makes the row ready while the leader runs.
+        leader_alive = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                                        start_new_session=True)
+        self.addCleanup(lambda: (leader_alive.kill(), leader_alive.wait(timeout=5)))
+        alive_identity = D.process_launch_identity(leader_alive.pid)
+        alive_fields = list(fields)
+        alive_fields[5] = (
+            fields[5].split(",parent_attempt_id=")[0]
+            + ",parent_attempt_id=att-parent,launch_lifecycle=detached,"
+            + ",".join(f"{k}={v}" for k, v in alive_identity.items())
+        )
+        self.jobs.write_text("\t".join(alive_fields) + "\n", encoding="utf-8")
+        held_leader = JOIN.join_batch(
+            jobs=self.jobs,
+            parent_attempt_id="att-parent",
+            interval=0.02,
+            timeout=0.1,
+            liveness_command=[str(self.live)],
+        )
+        self.assertEqual(held_leader["state"], "timeout")
+        self.assertEqual(held_leader["children"][0]["reason"], "process-alive")
+        self.jobs.write_text("\t".join(fields) + "\n", encoding="utf-8")
         # Without the marker chain the residue still holds the join, as before.
         (self.root / f"execute.{attempt}.attempt.json").unlink()
         held = JOIN.join_batch(

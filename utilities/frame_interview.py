@@ -134,8 +134,6 @@ def foreign_interview_schema(value) -> str | None:
     schema = value.get("schema")
     if isinstance(schema, str) and "interview" in schema.lower():
         return schema
-    if "questions" in value and isinstance(schema, str):
-        return schema
     return None
 
 

@@ -363,7 +363,9 @@ class FallbackTest(unittest.TestCase):
   with mock.patch.object(F.subprocess,"run",side_effect=[regressed]+[alive]*50) as run:
    state,fields=F.watch_launched_attempt(args,route,node,"att-seed",{"child_pid":"1","child_pid_start":"2"})
   self.assertEqual(state,"observed")
-  self.assertNotIn("watchdog_verdict",fields)
+  # review finding 9: the demoted seed rides on the receipt as an advisory
+  self.assertEqual((fields["watchdog_verdict"],fields["watchdog_advisory_tool"],fields["watchdog_advisory_reason"]),
+                   ("advisory","heartbeat-seed","progress-phase-regression"))
   seed_argv=run.call_args_list[0].args[0]
   self.assertIn("--if-absent",seed_argv)
   self.assertEqual(seed_argv[seed_argv.index("--phase")+1],"launch")
@@ -386,6 +388,7 @@ class FallbackTest(unittest.TestCase):
   with mock.patch.object(F.subprocess,"run",side_effect=[seed_crash]+[alive]*50):
    state,fields=F.watch_launched_attempt(args,route,node,"att-tool",{"child_pid":str(proc.pid),"child_pid_start":"2"})
   self.assertEqual(state,"observed")
+  self.assertEqual((fields["watchdog_verdict"],fields["watchdog_advisory_tool"]),("advisory","heartbeat-seed"))
   # a genuine watchdog verdict (tool ran, action=fail-closed-*) is still a verdict
   identity=mock.Mock(returncode=0,stdout="check=ok\naction=fail-closed-identity\n",stderr="")
   with mock.patch.object(F.subprocess,"run",side_effect=[seed,identity]):

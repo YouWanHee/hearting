@@ -413,6 +413,9 @@ def typed_receipt(
             or readiness not in {"ready", "pending"}
             or reason not in {
                 "registry-closed",
+                # SD-OPEN-47 (H7-c): a done row proved by its marker chain
+                # while tagged residue still lives (review finding 1).
+                "registry-closed-marker",
                 "terminal-observed",
                 "process-alive",
                 "process-unverifiable",

@@ -293,8 +293,31 @@ class CycleLayoutTest(unittest.TestCase):
   result=self._run(cycle2,code,events2)
   self.assertEqual(result.returncode,0,result.stdout+result.stderr)
   rows=[json.loads(l) for l in events2.read_text().splitlines()]
-  skipped=[r for r in rows if r["status"]=="seed-skipped"]
-  self.assertEqual([(r["reason"],r["prd_present"]) for r in skipped],[("spec-base-not-empty",True)])
+  # review finding 6: a present prd.md is a label, not an early return -- the
+  # copy loop still fills what the bucket lacks (here pipeline_state.yaml) and
+  # keeps the bucket's own prd.md and history untouched.
+  seeded=[r for r in rows if r["status"]=="seeded"]
+  self.assertEqual([(r["prd_present"],r["files"],r["kept_existing"],sorted(r["kept_existing_paths"])) for r in seeded],
+                   [(True,1,2,["_internal/versions/v1/prd.md","prd.md"])])
+  # the v{N} chain spans cycle buckets: the first cycle snapshotted v2, so this one is v3
+  self.assertEqual((spec2/"prd.md").read_text(),"v3\n"); self.assertEqual((spec2/"_internal"/"versions"/"v3"/"prd.md").read_text(),"v1\n")
+
+ def test_sd_open_50_partial_seed_is_completed_and_component_scope_judges_its_own_prd(self):
+  # review finding 6: the predicate is a label, not an early return -- a bucket
+  # that holds only prd.md (crash mid-seed) or another component's prd.md is
+  # completed by the copy loop, and `kept_existing` keeps it idempotent.
+  self._shared_v1()
+  with tempfile.TemporaryDirectory() as td:
+   base=Path(td)/"partial"; base.mkdir(); (base/"prd.md").write_text("v1\n")
+   first=TX.seed_cycle_spec(base,self.artifact)
+   self.assertEqual((first["status"],first["prd_present"],first["kept_existing"],first["kept_existing_paths"]),("seeded",True,1,["prd.md"]))
+   self.assertTrue((base/"pipeline_state.yaml").is_file()); self.assertTrue((base/"_internal"/"versions"/"v1"/"prd.md").is_file())
+   again=TX.seed_cycle_spec(base,self.artifact)
+   self.assertEqual((again["status"],again["reason"],again["kept_existing"]),("seed-skipped","prd-present",3))
+   scoped=Path(td)/"scoped"; (scoped/"componentB").mkdir(parents=True); (scoped/"componentB"/"prd.md").write_text("b\n")
+   result=TX.seed_cycle_spec(scoped,self.artifact,spec_root=scoped/"componentA")
+   self.assertEqual((result["status"],result["prd_present"],result["files"]),("seeded",False,3))
+   self.assertEqual((scoped/"componentB"/"prd.md").read_text(),"b\n")
 
  def test_seed_unions_version_history_across_revisions(self):
   # Latest revision carries the PRD but no history (cairn's rrev_511a shape);
@@ -331,7 +354,7 @@ class CycleLayoutTest(unittest.TestCase):
   result=self._run(cycle_dir,code,events)
   self.assertEqual(result.returncode,0,result.stdout+result.stderr)
   rows=[json.loads(l) for l in events.read_text().splitlines()]
-  self.assertEqual([r["reason"] for r in rows if r["status"]=="seed-skipped"],["spec-base-not-empty"])
+  self.assertEqual([r["reason"] for r in rows if r["status"]=="seed-skipped"],["prd-present"])
   self.assertEqual([r["next_version"] for r in rows if r["status"]=="acquired"],[169])
   self.assertFalse(any(r["status"]=="version-history-absent" for r in rows),rows)
   self.assertEqual((spec/"_internal"/"versions"/"v169"/"prd.md").read_text(),"v168 body\n")

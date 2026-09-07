@@ -231,6 +231,7 @@ class DispatchReapWatchTest(unittest.TestCase):
                 meta["attempt_descendant_proof"], D.ATTEMPT_DESCENDANT_RESIDUE_PROOF
             )
             self.assertEqual(meta["attempt_descendant_residue_basis"], "registry-terminal")
+            self.assertEqual(meta["attempt_descendant_residue_count"], "1")
             residue_pids = {
                 int(item.split(":")[0]) for item in meta["attempt_descendant_residue"].split(";")
             }
@@ -247,6 +248,62 @@ class DispatchReapWatchTest(unittest.TestCase):
             self.assertEqual(D.attempt_process_quiescence(meta).state, "quiescent")
             observed = D.observed_attempt_liveness("done", meta)
             self.assertEqual((observed.state, observed.reason), ("terminal", "registry-closed"))
+
+    def test_sd_open_47_residue_inside_the_governed_group_is_sealed_too(self):
+        """review finding 11: `nohup cmd &` without setsid keeps the governed
+        pgid; when every live group member carries the tag it is residue."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            jobs = base / "jobs.log"
+            attempt = "att-tagged-residue-ingroup"
+            script = (
+                "import os,subprocess,sys,time\n"
+                "env=dict(os.environ,AGENT_DISPATCH_ATTEMPT_ID=sys.argv[1])\n"
+                "subprocess.Popen(['sleep','30'],env=env)\n"   # same session and group
+                "time.sleep(0.04)\n"
+            )
+            worker = subprocess.Popen(
+                [sys.executable, "-c", script, attempt],
+                env=dict(os.environ, AGENT_DISPATCH_ATTEMPT_ID=attempt),
+                start_new_session=True,
+            )
+            identity = D.process_launch_identity(worker.pid)
+            worker.wait(timeout=5)
+
+            def reap_residue():
+                for pid, _s, _st in D.attempt_tagged_descendants({"attempt_id": attempt, **identity}).members:
+                    try:
+                        os.kill(pid, 9)
+                    except OSError:
+                        pass
+
+            self.addCleanup(reap_residue)
+            metadata = ",".join(
+                f"{key}={value}"
+                for key, value in {**identity, "attempt_id": attempt, "launch_lifecycle": "detached"}.items()
+            )
+            jobs.write_text(
+                "2026-08-09T00:00:00Z\tdone\t/repo\t/wt\tworker\t"
+                f"{CURRENT},{metadata},note=completed-marker\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(D.process_group_observation(int(identity["pgid"])).state, "populated")
+            watcher = subprocess.Popen(
+                [
+                    sys.executable, str(WATCH),
+                    "--jobs", str(jobs),
+                    "--attempt-id", attempt,
+                    "--pid", identity["pid"],
+                    "--pid-start", identity["pid_start"],
+                    "--pgid", identity["pgid"],
+                    "--interval", "0.02",
+                    "--residue-grace", "0.3",
+                ]
+            )
+            self.assertEqual(watcher.wait(timeout=10), 0)
+            meta = D.parse_registry_metadata(jobs.read_text(encoding="utf-8").strip().split("\t")[5])
+            self.assertEqual(meta["attempt_descendant_proof"], D.ATTEMPT_DESCENDANT_RESIDUE_PROOF)
+            self.assertTrue(D.tagged_residue_receipt(meta))
 
     def test_sd_open_47_tagged_residue_without_terminal_evidence_keeps_the_veto(self):
         with tempfile.TemporaryDirectory() as td:

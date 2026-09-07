@@ -2267,9 +2267,22 @@ class DispatchContractTest(unittest.TestCase):
    time.sleep(0.1)
   self.assertEqual(probe.state,"populated",probe.reason)
   self.assertEqual([pid for pid,_s,_st in probe.members],[owner.pid])
-  excluded=dict(identity,parent_pid=str(owner.pid))
+  owner_start=D.process_start_ticks(owner.pid)
+  excluded=dict(identity,parent_pid=str(owner.pid),parent_pid_start=owner_start)
   self.assertEqual(D.attempt_tagged_descendants(excluded).state,"empty")
   self.assertEqual(D.attempt_process_quiescence(excluded).state,"quiescent")
+  # review finding 2: a pid number alone is not an identity -- a reused or
+  # mismatched start keeps the tagged process as a descendant
+  stale=dict(identity,parent_pid=str(owner.pid),parent_pid_start="1")
+  self.assertEqual(D.attempt_tagged_descendants(stale).state,"populated")
+  number_only=dict(identity,parent_pid=str(owner.pid))
+  self.assertEqual(D.attempt_tagged_descendants(number_only).state,"populated")
+  # a host-namespace number is comparable only for a host-visible parent in the observer namespace
+  host=dict(identity,parent_pid_host=str(owner.pid),parent_pid_host_start=owner_start,
+            parent_pid_scope="host-visible")
+  self.assertEqual(D.attempt_tagged_descendants(host).state,"empty")
+  foreign=dict(host,pid_ns="pid:[1]")
+  self.assertEqual(D.attempt_tagged_descendants(foreign).state,"populated")
 
  # SD-OPEN-47 (H7): a sidecar-sealed residue receipt names the survivors as
  # leftovers of a finished worker; they never veto quiescence again.

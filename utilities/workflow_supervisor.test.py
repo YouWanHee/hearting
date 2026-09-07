@@ -2021,6 +2021,36 @@ class TestGateSubjectNotCaller(WorkflowFixture):
                              "--decision", "proceed", "--answers", str(answers), "--jobs", str(jobs)])
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(buf.getvalue())["released_by"], "user")
+        # review finding 13: a release refused as already released prints one
+        # typed JSON line the depth-0 carrier can arm from.
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            with self.assertRaisesRegex(SUP.SupervisorError, "not blocked on a human gate"):
+                SUP.main(["release", "--route", str(path), "--gate", "frame-review",
+                          "--decision", "proceed", "--answers", str(answers), "--jobs", str(jobs)])
+        refusal = json.loads(buf.getvalue().strip().splitlines()[-1])
+        self.assertEqual((refusal["refusal"], refusal["route_id"], refusal["gate"]),
+                         ("gate-not-blocked", "rt-fixture0000000", "frame-review"))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            with self.assertRaisesRegex(SUP.SupervisorError, "not blocked on a human gate"):
+                SUP.main(["gate", "--route", str(path), "--gate", "frame-review", "--release",
+                          "--jobs", str(jobs)])
+        self.assertEqual(json.loads(buf.getvalue().strip().splitlines()[-1])["refusal"], "gate-not-blocked")
+
+    def test_sd_open_48_legacy_interview_raise_without_authority_still_binds_the_owner(self):
+        """review finding 4: a raise that predates `release_authority` but
+        recorded an interview is depth-0 -- the flag was sealed at the raise."""
+        legacy = {"gate": "frame-review", "status": "blocked", "interview": True, "questions": 5,
+                  "release_authority": None}
+        with self.assertRaisesRegex(SUP.SupervisorError, "gate-release-authority-refused"):
+            SUP.assert_release_authority("headless-owner", legacy, {"gate": "frame-review"}, "frame-review")
+        plain = dict(legacy, interview=False, questions=0)
+        SUP.assert_release_authority("headless-owner", plain, {"gate": "frame-review"}, "frame-review")
+        declared = {"gate": "frame-review", "release_authority": "depth-0"}
+        with self.assertRaisesRegex(SUP.SupervisorError, "gate-release-authority-refused"):
+            SUP.assert_release_authority("headless-owner", plain, declared, "frame-review")
+        SUP.assert_release_authority("user", legacy, declared, "frame-review")
 
     def test_sd_open_48_artifact_declaring_depth0_authority_binds_its_owner(self):
         """The cairn owner's own artifact said `release_authority: depth-0`."""

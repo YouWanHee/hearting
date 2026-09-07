@@ -419,11 +419,11 @@ def release_launch(payload: object) -> Launch | None:
     registry names that route's one open depth-1 owner bound to this session,
     and the new hook process waits on it exactly as the start did. A failed
     release (no JSON payload naming the route -- review round 1, M1: the
-    `--route` literal is NOT a fallback for the route id; the one exception,
-    SD-OPEN-48 (#13), is a release refused as already released -- "not blocked
-    on a human gate" -- whose `--route` literal names a readable route file:
-    the owner is running towards a completion that still owes this session a
-    wake, so the file's own `route_id` arms it), a route with no started open owner (the owner
+    `--route` literal is never a fallback for the route id; the one refusal
+    that still arms, SD-OPEN-48 (#13), is the supervisor's typed
+    `refusal=gate-not-blocked` line -- the gate was already released and the
+    owner is running towards a completion that still owes this session a
+    wake), a route with no started open owner (the owner
     ended at the gate -- contract (c); or a row that was registered and
     refused at start), or an ambiguous set of owner rows arms nothing and
     says so once (`release_no_arm_notice`); the SD-111 sweep still delivers
@@ -447,6 +447,7 @@ def release_launch(payload: object) -> Launch | None:
         return None
     stdout = _stdout(payload.get("tool_response"))
     route_id: str | None = None
+    armed = "release"
     for line in reversed(stdout.splitlines()):
         line = line.strip()
         if not line.startswith("{"):
@@ -458,23 +459,23 @@ def release_launch(payload: object) -> Launch | None:
         if isinstance(rendered, dict) and rendered.get("gate") == gate:
             value = rendered.get("route_id")
             route_id = value if isinstance(value, str) and value else None
+            if rendered.get("refusal") == GATE_NOT_BLOCKED_REFUSAL:
+                # SD-OPEN-48 (#13): the supervisor refused this release as
+                # already released (on 2026-09-07 by the headless owner itself,
+                # cairn W15b rt-bf75754935faf8de) and the owner is RUNNING
+                # towards its completion. That completion still owes this
+                # session a wake, and the start-armed hook already spent its
+                # one wake on the gate, so arming nothing here is exactly the
+                # lost wake SD-111 exists to prevent. The route id comes from
+                # the supervisor's typed refusal line, never from the prose
+                # and never from the `--route` literal; every other refusal
+                # prints no JSON and arms nothing.
+                armed = "release-refused"
+            elif rendered.get("refusal"):
+                route_id = None
         break
-    armed = "release"
     if not isinstance(route_id, str) or not route_id:
-        # SD-OPEN-48 (#13): a release refused with "not blocked on a human
-        # gate" means somebody else already released it -- on 2026-09-07 the
-        # headless owner itself (cairn W15b, rt-bf75754935faf8de) -- and the
-        # owner is RUNNING towards its completion. That completion still owes
-        # this session a wake, and the start-armed hook already spent its one
-        # wake on the gate, so arming nothing here is exactly the lost wake
-        # SD-111 exists to prevent. The route id comes from the route FILE the
-        # `--route` literal names (read and parsed), never from the literal
-        # itself; any other refusal (undeclared gate, unreadable route, answers
-        # required) still arms nothing.
-        route_id = _refused_release_route_id(payload, route_literal)
-        if route_id is None:
-            return None
-        armed = "release-refused"
+        return None
     jobs = (
         _validated_jobs(_command_jobs(command))
         or _validated_jobs(os.environ.get("AGENT_DISPATCH_JOBS"))
@@ -509,33 +510,30 @@ def release_launch(payload: object) -> Launch | None:
     return Launch(attempt_id=candidates[0], jobs=jobs, session_id=session, armed=armed)
 
 
-NOT_BLOCKED_REFUSAL = "not blocked on a human gate"
+# One definition, shared with `workflow-supervisor.py`'s refusal line: the
+# supervisor prints `{"gate", "route_id", "refusal": "gate-not-blocked", ...}`
+# on stdout before its prose refusal (review finding 13).
+GATE_NOT_BLOCKED_REFUSAL = "gate-not-blocked"
 
 
-def _refused_release_route_id(payload: dict, route_literal: str | None) -> str | None:
-    """The `route_id` inside the route file a refused-as-already-released
-    release named, or None when the refusal was anything else or the literal
-    does not resolve to a readable route record."""
+def _refused_release_route_id(payload: dict) -> str | None:
+    """The `route_id` of a release the supervisor refused as already released
+    (typed `refusal=gate-not-blocked` line), else None."""
 
-    response = payload.get("tool_response")
-    text = _stdout(response)
-    if isinstance(response, dict):
-        stderr = response.get("stderr")
-        if isinstance(stderr, str):
-            text = text + "\n" + stderr
-    if NOT_BLOCKED_REFUSAL not in text:
+    stdout = _stdout(payload.get("tool_response"))
+    for line in reversed(stdout.splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            rendered = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(rendered, dict) and rendered.get("refusal") == GATE_NOT_BLOCKED_REFUSAL:
+            value = rendered.get("route_id")
+            return value if isinstance(value, str) and value else None
         return None
-    if not isinstance(route_literal, str) or not route_literal or "$" in route_literal:
-        return None
-    path = Path(route_literal).expanduser()
-    if not path.is_absolute() or path.suffix != ".json" or not path.is_file():
-        return None
-    try:
-        route = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    route_id = route.get("route_id") if isinstance(route, dict) else None
-    return route_id if isinstance(route_id, str) and route_id else None
+    return None
 
 
 def release_no_arm_notice(payload: object) -> int:
@@ -543,8 +541,8 @@ def release_no_arm_notice(payload: object) -> int:
     1, M2): the session was told the release re-arms the wait, so a silent
     non-arm would be the lost wake SD-111 exists to prevent. A refused release
     (no JSON payload) stays silent -- its own stderr already told the story --
-    except one refused as already released (SD-OPEN-48), which names the route
-    file and so was expected to arm."""
+    except one refused as already released (SD-OPEN-48), whose typed refusal
+    line names the route and so was expected to arm."""
 
     if not isinstance(payload, dict):
         return 0
@@ -553,9 +551,7 @@ def release_no_arm_notice(payload: object) -> int:
     if not isinstance(command, str) or _release_command(command) is None:
         return 0
     stdout = _stdout(payload.get("tool_response"))
-    if not any(line.strip().startswith("{") and '"route_id"' in line for line in stdout.splitlines()):
-        if _refused_release_route_id(payload, _release_command(command)[1]) is None:
-            return 0
+    if _refused_release_route_id(payload) is not None:
         # SD-OPEN-48 (#13): refused as already released, but no single started
         # open owner of that route is bound to this session -- say so once.
         message = (
@@ -567,6 +563,8 @@ def release_no_arm_notice(payload: object) -> int:
             "dispatch-wait, or a polling loop."
         )
         print(json.dumps({"systemMessage": message}, ensure_ascii=False, separators=(",", ":")))
+        return 0
+    if not any(line.strip().startswith("{") and '"route_id"' in line for line in stdout.splitlines()):
         return 0
     message = (
         "[dispatch-owner-rewake] schema=2 state=not-armed surface=release — this release recorded, "

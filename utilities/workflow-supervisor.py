@@ -539,7 +539,7 @@ def cmd_gate(args):
         if args.release:
             state = ledger.state()["workflow_state"]
             if state != "BLOCKED_HUMAN_GATE":
-                raise SupervisorError(f"workflow is {state}, not blocked on a human gate")
+                refuse_gate_not_blocked(route, args.gate, state)
             actor_kind = release_actor_kind()
             released_by = resolved_released_by(actor_kind, args.by)
             resolution = WS.human_gate_resolution(ledger.journal(), args.gate)
@@ -965,6 +965,21 @@ def resolved_released_by(actor_kind, requested):
 
 
 RELEASE_AUTHORITIES = ("depth-0", "any")
+GATE_NOT_BLOCKED_REFUSAL = "gate-not-blocked"
+
+
+def refuse_gate_not_blocked(route, gate, state):
+    """One typed JSON line on stdout, then the usual prose refusal.
+
+    SD-OPEN-48 (#13): the depth-0 carrier (`hooks/dispatch-owner-rewake.py`)
+    re-arms its wait on this route's running owner from this line's
+    `route_id` + `refusal` token -- never from the prose, never from the
+    `--route` literal (review finding 13).
+    """
+    print(json.dumps({"gate": gate, "route_id": route["route_id"],
+                      "refusal": GATE_NOT_BLOCKED_REFUSAL, "workflow_state": state},
+                     sort_keys=True))
+    raise SupervisorError(f"workflow is {state}, not blocked on a human gate")
 
 
 def gate_release_authority_at_raise(binding, interview, artifact):
@@ -1022,6 +1037,11 @@ def assert_release_authority(actor_kind, resolution, binding, gate):
     if actor_kind != "headless-owner":
         return
     authority = str((resolution or {}).get("release_authority") or "").strip()
+    if not authority and (resolution or {}).get("interview"):
+        # A raise that predates the field but recorded an interview: the
+        # interview flag is itself sealed at the raise, so this is not a
+        # re-read of the artifact (review finding 4).
+        authority = "depth-0"
     if not authority:
         authority = str((binding or {}).get("release_authority") or "any").strip()
     if authority == "depth-0":
@@ -1209,7 +1229,7 @@ def cmd_release(args):
     with ledger.lock():
         state = ledger.state()["workflow_state"]
         if state != "BLOCKED_HUMAN_GATE":
-            raise SupervisorError(f"workflow is {state}, not blocked on a human gate")
+            refuse_gate_not_blocked(route, args.gate, state)
         assert_release_authority(
             actor_kind, WS.human_gate_resolution(ledger.journal(), args.gate),
             gates[args.gate], args.gate)

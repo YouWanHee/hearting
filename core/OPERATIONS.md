@@ -448,9 +448,10 @@ decision, never two independently toggled ones.
   registry's one started open depth-1 owner bound to this session, a new hook
   process waits on the owner's completion exactly as the start did. A refused
   release arms nothing silently, with one exception (SD-OPEN-48): a release
-  refused as already released (`not blocked on a human gate`) whose `--route`
-  literal names a readable route file arms that file's own `route_id` — the
-  owner is running towards a completion that still owes the session a wake;
+  the supervisor refused as already released prints one typed JSON line
+  (`refusal: gate-not-blocked` with the `route_id`) and that line arms the
+  route's running owner — it is heading for a completion that still owes the
+  session a wake; the prose and the `--route` literal never arm;
   a recorded release with no started open owner (the owner ended at the gate,
   or was refused at start) or an ambiguous owner set arms nothing and emits
   one typed `not-armed surface=release` (or `surface=release-refused`)

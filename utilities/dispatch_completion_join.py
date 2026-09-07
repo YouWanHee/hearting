@@ -2820,15 +2820,21 @@ def _join_snapshot(
             if row.status == "done":
                 if observed.state == "terminal":
                     readiness, reason = "ready", "registry-closed"
-                elif _marker_bound_prepare_marker_proof(
-                    row.metadata, row.attempt_id
-                ) is not None:
-                    # SD-OPEN-47 (H7-c): a done row whose completion marker
-                    # chain already proves this exact attempt is semantically
-                    # finished. Process residue that inherited the worker's
-                    # tag (a background shell, a detached wait) must not hold
-                    # the owner in `runtime_wait: registered-children` until
-                    # the join times out and reparks forever.
+                elif (
+                    observed.process_reason == "attempt-descendant-live"
+                    and _marker_bound_prepare_marker_proof(
+                        row.metadata, row.attempt_id
+                    ) is not None
+                ):
+                    # SD-OPEN-47 (H7-c): the exact leader is gone and the row
+                    # is live only through tagged residue (a background shell,
+                    # a detached wait), while the completion marker chain
+                    # already proves this attempt finished. That residue must
+                    # not hold the owner in `runtime_wait: registered-children`
+                    # until the join times out and reparks forever. A live
+                    # exact leader (`*-pid-live`) or a missing post-exit
+                    # receipt keeps the SD-79/80/89 gate as before (review
+                    # finding 3).
                     readiness, reason = "ready", "registry-closed-marker"
                 else:
                     readiness = "pending"
