@@ -338,6 +338,40 @@ class CodexRouteBoundWorkerGrant(unittest.TestCase):
             granted = WH.route_bound_worker_writable_dirs(args)
         self.assertEqual(granted, (args.agent_home.resolve() / ".core-grounding",))
 
+    def test_routeless_registered_workers_can_record_required_spec_reads(self):
+        # Cairn att-4726c1b6: depth-1 review without route/network widening.
+        # The portable kernel's read obligation is not review-only.
+        for worker_type in ("review", "stage", "support", "owner"):
+            for delivery, flag in (("one-shot", "--add-dir"),
+                                   ("app-server-supervised", "--writable-root")):
+                with self.subTest(worker_type=worker_type, delivery=delivery):
+                    with tempfile.TemporaryDirectory() as tmp:
+                        args = self._depth2_args(tmp)
+                        args.dispatch_depth = 1
+                        args.route_id = None
+                        args.worker_type = worker_type
+                        args.registered_worker = 1
+                        args.execution_surface = "registered-headless"
+                        args.resolved_completion_delivery = delivery
+                        WH.ensure_owner_writable_dirs(args)
+                        command = WH.shell_command(args, Path(tmp)/"p", Path(tmp)/"log")
+                        marker_dir = args.agent_home / ".spec-grounding"
+                        self.assertIn(f"{flag} {marker_dir}", command)
+                        self.assertTrue(marker_dir.is_dir())
+                        self.assertNotIn(f"{flag} {args.agent_home} ", command)
+                        self.assertFalse((args.agent_home / ".core-grounding").exists())
+
+    def test_unregistered_routeless_launch_does_not_gain_spec_write_access(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self._depth2_args(tmp)
+            args.route_id = None
+            args.registered_worker = 0
+            args.execution_surface = "registered-headless"
+            WH.ensure_owner_writable_dirs(args)
+            command = WH.shell_command(args, Path(tmp)/"p", Path(tmp)/"log")
+            self.assertNotIn(str(args.agent_home / ".spec-grounding"), command)
+            self.assertFalse((args.agent_home / ".spec-grounding").exists())
+
     def test_ordinary_depth2_worker_add_dir_list_includes_core_grounding(self):
         # The direct verification requirement (c): build the args for a plain
         # dispatch_depth=2 worker (not owner, no nested_headless_network) and

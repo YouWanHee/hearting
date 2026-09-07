@@ -325,8 +325,8 @@ case "$cmd" in
     [ "$#" -ge 2 ] || { echo "opencode preflight: read requires a file path" >&2; exit 64; }
     file=$2
     sid=${3:-opencode}
-    "$ROOT/hooks/core-read-marker.sh" --file "$file" --session "$sid"
-    "$ROOT/hooks/spec-read-marker.sh" --file "$file" --session "$sid"
+    "$ROOT/hooks/core-read-marker.sh" --file "$file" --session "$sid" || exit $?
+    "$ROOT/hooks/spec-read-marker.sh" --file "$file" --session "$sid" || exit $?
     ;;
   capability|skill)
     [ "$#" -ge 2 ] || { echo "opencode preflight: $cmd requires a capability name" >&2; exit 64; }

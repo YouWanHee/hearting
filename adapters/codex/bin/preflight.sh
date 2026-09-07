@@ -409,8 +409,8 @@ case "$cmd" in
     file=$2
     sid=${3:-${AGENT_DISPATCH_ATTEMPT_ID:-codex}}
     guard_identity_hard_fail_if_worker "$sid"
-    "$ROOT/hooks/core-read-marker.sh" --file "$file" --session "$sid"
-    "$ROOT/hooks/spec-read-marker.sh" --file "$file" --session "$sid"
+    "$ROOT/hooks/core-read-marker.sh" --file "$file" --session "$sid" || exit $?
+    "$ROOT/hooks/spec-read-marker.sh" --file "$file" --session "$sid" || exit $?
     ;;
   compose)
     # SD-135: preset-free work route (shape/subgraph); same compiler, same bind.

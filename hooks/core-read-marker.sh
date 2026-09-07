@@ -35,8 +35,14 @@ mark_read() {
   doc=$(printf '%s' "$rel" | sed 's#[/ ]#_#g')
   mtime=$(stat -c %Y "$fp" 2>/dev/null || echo 0)
 
-  mkdir -p "$AGENT_HOME/.core-grounding"
-  printf 'repo=%s\nfile=%s\nmtime=%s\n' "$repo" "$rel" "$mtime" > "$AGENT_HOME/.core-grounding/${sid}__${key}__${doc}"
+  if ! mkdir -p "$AGENT_HOME/.core-grounding"; then
+    echo "core-read-marker: marker-write-failed (directory creation)" >&2
+    return 1
+  fi
+  if ! printf 'repo=%s\nfile=%s\nmtime=%s\n' "$repo" "$rel" "$mtime" > "$AGENT_HOME/.core-grounding/${sid}__${key}__${doc}"; then
+    echo "core-read-marker: marker-write-failed (read not recorded)" >&2
+    return 1
+  fi
 }
 
 if [ "$#" -gt 0 ]; then
@@ -72,7 +78,7 @@ if [ "$#" -gt 0 ]; then
   done
   [ -n "$fp" ] || { echo "core-read-marker: --file is required" >&2; exit 64; }
   mark_read "$fp" "$sid"
-  exit 0
+  exit $?
 fi
 
 input=$(cat 2>/dev/null)
@@ -82,5 +88,7 @@ fp=$(printf '%s' "$input" | grep -o '"file_path"[[:space:]]*:[[:space:]]*"[^"]*"
 sid=$(printf '%s' "$input" | grep -o '"session_id"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"session_id"[[:space:]]*:[[:space:]]*"//; s/"$//')
 [ -z "$sid" ] && sid="nosession"
 
-mark_read "$fp" "$sid"
+# PostToolUse is observational: retain diagnostics without blocking the read.
+# The CLI branch above is the failure-propagating interface.
+mark_read "$fp" "$sid" || :
 exit 0
