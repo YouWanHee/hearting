@@ -321,8 +321,9 @@ class CodexLauncherRuntimeTest(unittest.TestCase):
 
         exec/admin/--version must invoke the real CLI with byte-exact argv while
         every mutating filesystem primitive (`os.mkdir`, write-capable `open`,
-        `os.chmod`, `os.unlink`, `Path.mkdir`) raises if the reader ever calls it,
-        and `os.open` is only ever asked for a read-only, non-creating descriptor.
+        `os.chmod`, `os.unlink`, `Path.mkdir`, write-capable `os.fdopen`) raises
+        if the reader ever calls it, and `os.open` is only ever asked for a
+        read-only, non-creating descriptor.
         """
         forms = [
             ["exec", "task with spaces", "", "--flag=\"quoted\"", "héllo"],
@@ -342,6 +343,7 @@ class CodexLauncherRuntimeTest(unittest.TestCase):
             observed_flags: list[int] = []
             real_os_open = os.open
             real_path_open = launcher.Path.open
+            real_os_fdopen = os.fdopen
 
             def spy_os_open(path, flags, *args, **kwargs):
                 observed_flags.append(flags)
@@ -351,6 +353,11 @@ class CodexLauncherRuntimeTest(unittest.TestCase):
                 if any(char in mode for char in "wax+"):
                     raise AssertionError(f"unexpected write-capable open: {self_path} mode={mode!r}")
                 return real_path_open(self_path, mode, *args, **kwargs)
+
+            def guarded_os_fdopen(fd, mode="r", *args, **kwargs):
+                if any(char in mode for char in "wax+"):
+                    raise AssertionError(f"unexpected write-capable os.fdopen mode={mode!r}")
+                return real_os_fdopen(fd, mode, *args, **kwargs)
 
             for args in forms:
                 with self.subTest(args=args), mock.patch.dict(
@@ -365,6 +372,8 @@ class CodexLauncherRuntimeTest(unittest.TestCase):
                     launcher.Path, "mkdir", side_effect=AssertionError("unexpected Path.mkdir")
                 ), mock.patch.object(
                     launcher.Path, "open", guarded_path_open
+                ), mock.patch.object(
+                    launcher.os, "fdopen", side_effect=guarded_os_fdopen
                 ), mock.patch.object(launcher.os, "open", side_effect=spy_os_open):
                     launcher.sys.argv = ["codex-launcher.py", *args]
                     self.assertIsNone(launcher.main())
@@ -563,7 +572,9 @@ class LauncherLockReaderTest(unittest.TestCase):
             ), mock.patch.object(launcher.os, "open", side_effect=spy_open):
                 with self.assertRaises(launcher.LauncherError):
                     launcher._launcher_lock(home)
-            self.assertEqual(len(open_fds), launcher._LOCK_OPEN_RETRIES)
+            # One directory descriptor for `.harness` (opened once, held for
+            # the whole call) plus one lock open per retry.
+            self.assertEqual(len(open_fds), launcher._LOCK_OPEN_RETRIES + 1)
             for fd in open_fds:
                 with self.assertRaises(OSError):
                     os.fstat(fd)
@@ -589,6 +600,181 @@ class LauncherLockReaderTest(unittest.TestCase):
                 with self.assertRaises(launcher.LauncherError):
                     launcher._launcher_lock(home)
             self.assertEqual(foreign.read_bytes(), b"foreign")
+
+    def test_fcntl_unavailable_is_a_documented_fail_closed_hard_failure(self) -> None:
+        """`fcntl` import failure (e.g. an unsupported platform) fails closed
+        rather than silently skipping the lock. This is a defensible policy
+        for a lock-dependent reader -- no grant or argv behavior changes --
+        but the branch had no direct test before this.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = self._harness(root)
+            self._lock(home, 0o600)
+            with mock.patch.object(launcher, "fcntl", None):
+                with self.assertRaises(launcher.LauncherError):
+                    launcher._launcher_lock(home)
+
+    def test_real_concurrent_thread_replaces_lock_during_acquire(self) -> None:
+        """A genuine background thread renames the lock file mid-acquire.
+
+        Unlike `test_transient_pathname_replacement_is_retried_then_valid`
+        (which replaces the file synchronously inside a mocked `flock`, on
+        the same thread), this drives the replacement from an actual second
+        thread performing real filesystem operations concurrently, so the
+        race is a real concurrent event rather than a single-threaded
+        stand-in.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = self._harness(root)
+            path = self._lock(home, 0o600, content=b"v0")
+
+            about_to_flock = threading.Event()
+            replaced = threading.Event()
+            real_flock = launcher.fcntl.flock
+
+            def wait_then_flock(fd, operation):
+                if operation == launcher.fcntl.LOCK_SH:
+                    about_to_flock.set()
+                    self.assertTrue(replaced.wait(timeout=10.0), "replacer thread never ran")
+                return real_flock(fd, operation)
+
+            def replacer() -> None:
+                self.assertTrue(about_to_flock.wait(timeout=10.0), "flock never attempted")
+                path.unlink()
+                path.write_bytes(b"v1-from-thread")
+                path.chmod(0o600)
+                replaced.set()
+
+            thread = threading.Thread(target=replacer, daemon=True)
+            thread.start()
+            try:
+                with mock.patch.object(launcher.fcntl, "flock", side_effect=wait_then_flock):
+                    handle = launcher._launcher_lock(home)
+                try:
+                    self.assertEqual(handle.read(), b"v1-from-thread")
+                finally:
+                    launcher._unlock(handle)
+            finally:
+                thread.join(timeout=10.0)
+                self.assertFalse(thread.is_alive(), "replacer thread did not join")
+
+    def test_directory_replacement_does_not_redirect_to_a_foreign_lock(self) -> None:
+        """A genuine background thread swaps `.harness` for a replacement
+        directory holding a different lock, timed to land only after
+        `_open_harness_dirfd` already opened and validated the original
+        directory. The held descriptor must keep resolving the lock inside
+        the originally-validated directory, proving the directory-level
+        replacement window (finding (a)) is closed.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = self._harness(root)
+            self._lock(home, 0o600, content=b"genuine")
+
+            dirfd_opened = threading.Event()
+            swapped = threading.Event()
+            real_open_harness_dirfd = launcher._open_harness_dirfd
+
+            def spy_open_harness_dirfd(home_arg):
+                dirfd = real_open_harness_dirfd(home_arg)
+                dirfd_opened.set()
+                self.assertTrue(swapped.wait(timeout=10.0), "swapper thread never ran")
+                return dirfd
+
+            def swapper() -> None:
+                self.assertTrue(dirfd_opened.wait(timeout=10.0), "dirfd never opened")
+                hijacked = home / ".harness-hijacked"
+                (home / ".harness").rename(hijacked)
+                replacement = home / ".harness"
+                replacement.mkdir()
+                foreign = replacement / "codex-launcher.lock"
+                foreign.write_bytes(b"foreign")
+                foreign.chmod(0o600)
+                swapped.set()
+
+            thread = threading.Thread(target=swapper, daemon=True)
+            thread.start()
+            try:
+                with mock.patch.object(
+                    launcher, "_open_harness_dirfd", side_effect=spy_open_harness_dirfd
+                ):
+                    handle = launcher._launcher_lock(home)
+                try:
+                    self.assertEqual(handle.read(), b"genuine")
+                finally:
+                    launcher._unlock(handle)
+            finally:
+                thread.join(timeout=10.0)
+                self.assertFalse(thread.is_alive(), "swapper thread did not join")
+
+    def test_read_state_locked_retries_when_lock_replaced_during_read(self) -> None:
+        """A genuine background thread replaces the lock file after
+        `_state` has already read from it but before `_read_state_locked`'s
+        post-read identity check runs, proving the acquire-and-read
+        acceptance window (finding (b)) is closed by a retry rather than
+        trusting a read that raced a live replacement.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            real = root / "vendor" / "codex"
+            real.parent.mkdir()
+            real.write_text("#!/bin/sh\n", encoding="utf-8")
+            real.chmod(0o755)
+            home = root / ".codex"
+            harness = home / ".harness"
+            harness.mkdir(parents=True)
+            home.chmod(0o700)
+            ingress = harness / "bin" / "codex"
+            ingress.parent.mkdir()
+            ingress.write_bytes(b"#!/bin/sh\n")
+            ingress.chmod(0o755)
+            (harness / "codex-launcher.json").write_text(
+                json.dumps(
+                    {
+                        "schema": 2,
+                        "phase": "installed",
+                        "real_command": str(real),
+                        "ingress_path": str(ingress),
+                        "wrapper_path": str(ingress),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (harness / "codex-launcher.json").chmod(0o600)
+            lock = harness / "codex-launcher.lock"
+            lock.write_bytes(b"v0")
+            lock.chmod(0o600)
+
+            replaced_once = threading.Event()
+            real_state = launcher._state
+            call_count = {"n": 0}
+
+            def racy_state(home_arg):
+                call_count["n"] += 1
+                value = real_state(home_arg)
+                if not replaced_once.is_set():
+                    replaced = threading.Event()
+
+                    def replacer() -> None:
+                        lock.unlink()
+                        lock.write_bytes(b"v1")
+                        lock.chmod(0o600)
+                        replaced.set()
+
+                    thread = threading.Thread(target=replacer, daemon=True)
+                    thread.start()
+                    self.assertTrue(replaced.wait(timeout=10.0), "replacer thread never ran")
+                    thread.join(timeout=10.0)
+                    self.assertFalse(thread.is_alive(), "replacer thread did not join")
+                    replaced_once.set()
+                return value
+
+            with mock.patch.object(launcher, "_state", side_effect=racy_state):
+                value = launcher._read_state_locked(home)
+            self.assertEqual(str(real), value["real_command"])
+            self.assertGreaterEqual(call_count["n"], 2)
 
 
 class LauncherLockConcurrencyTest(unittest.TestCase):
@@ -701,6 +887,72 @@ class LauncherLockConcurrencyTest(unittest.TestCase):
             self.assertEqual(len(handles), 2)
             for handle in handles:
                 launcher._unlock(handle)
+
+    def test_subprocess_reader_blocks_behind_a_held_exclusive_lock_then_succeeds(self) -> None:
+        """Cross-process serialization: the writer's `LOCK_EX` and the
+        reader's `LOCK_SH` in a genuinely separate reader process, not a
+        thread sharing this interpreter's GIL and file-descriptor table.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / ".codex"
+            (home / ".harness").mkdir(parents=True)
+            home.chmod(0o700)
+            path = installer_launcher.lock_path(home)
+            path.write_bytes(b"")
+            path.chmod(0o600)
+
+            writer_holds = threading.Event()
+            release_writer = threading.Event()
+            writer_done = threading.Event()
+
+            def hold_writer() -> None:
+                lock = installer_launcher._LauncherLock(path)
+                lock.__enter__()
+                writer_holds.set()
+                release_writer.wait(timeout=self._WATCHDOG_SECONDS)
+                lock.__exit__(None, None, None)
+                writer_done.set()
+
+            writer = threading.Thread(target=hold_writer, daemon=True)
+            writer.start()
+            reader_script = (
+                "import importlib.util, sys\n"
+                "spec = importlib.util.spec_from_file_location('codex_launcher_runtime', sys.argv[1])\n"
+                "mod = importlib.util.module_from_spec(spec)\n"
+                "spec.loader.exec_module(mod)\n"
+                "handle = mod._launcher_lock(mod.Path(sys.argv[2]))\n"
+                "print('ACQUIRED', flush=True)\n"
+                "mod._unlock(handle)\n"
+            )
+            proc = None
+            try:
+                self.assertTrue(
+                    writer_holds.wait(timeout=self._WATCHDOG_SECONDS), "writer never acquired LOCK_EX"
+                )
+                proc = subprocess.Popen(
+                    [sys.executable, "-c", reader_script, str(MODULE_PATH), str(home)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                # The reader process must still be blocked on LOCK_SH: no
+                # output yet while the writer holds LOCK_EX.
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    proc.communicate(timeout=0.5)
+                release_writer.set()
+                self.assertTrue(writer_done.wait(timeout=self._WATCHDOG_SECONDS))
+                out, err = proc.communicate(timeout=self._WATCHDOG_SECONDS)
+                self.assertEqual(0, proc.returncode, err)
+                self.assertIn("ACQUIRED", out)
+                proc = None
+            finally:
+                if proc is not None and proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=self._WATCHDOG_SECONDS)
+                release_writer.set()
+                writer.join(timeout=self._WATCHDOG_SECONDS)
+                self.assertFalse(writer.is_alive(), "writer thread did not join")
 
 
 class InstallerLifecycleLockInvariantTest(unittest.TestCase):

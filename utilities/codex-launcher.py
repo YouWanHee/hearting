@@ -95,6 +95,43 @@ class LauncherError(RuntimeError):
 _LOCK_OPEN_RETRIES = 5
 
 
+def _open_harness_dirfd(home: Path) -> int:
+    """Open `.harness` via a stable, no-follow directory descriptor.
+
+    `home` is already checked by the caller with path operations; opening
+    `.harness` itself as a descriptor (rather than a path string that a later
+    `os.open(lock_path, ...)` re-walks) means every subsequent lock operation
+    resolves against the exact directory validated here. `O_NOFOLLOW` alone
+    only protects the final pathname component *at that one open call* -- a
+    rename of `.harness` followed by a replacement directory or symlink
+    between this check and a later path-based open would otherwise let the
+    lock open land somewhere other than the directory that was checked.
+    """
+    harness_dir = home / ".harness"
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        dirfd = os.open(harness_dir, flags)
+    except OSError as exc:
+        raise LauncherError(f"managed launcher state directory is unsafe: {harness_dir}") from exc
+    try:
+        info = os.fstat(dirfd)
+    except OSError:
+        os.close(dirfd)
+        raise
+    if not stat.S_ISDIR(info.st_mode):
+        os.close(dirfd)
+        raise LauncherError(f"managed launcher state directory is unsafe: {harness_dir}")
+    return dirfd
+
+
+def _lock_identity(dirfd: int):
+    """`os.stat` the lock name relative to `dirfd`, or `None` if it is gone."""
+    try:
+        return os.stat("codex-launcher.lock", dir_fd=dirfd, follow_symlinks=False)
+    except OSError:
+        return None
+
+
 def _launcher_lock(home: Path):
     """Acquire a shared read-only lock on the installer-managed lock file.
 
@@ -108,64 +145,105 @@ def _launcher_lock(home: Path):
     is acceptable here: the installer's own write window is short and bounded,
     and a launch that cannot read a consistent binding should wait for it
     rather than race an in-progress install/repair.
+
+    The lock itself is opened and identity-checked relative to a single
+    `.harness` directory descriptor held for the whole call (see
+    `_open_harness_dirfd`), so a directory-level replacement cannot slip a
+    foreign lock in after the directory was validated; only the final lock
+    name is retried across replacement, never the directory.
     """
     if home.is_symlink() or not home.is_dir():
         raise LauncherError(f"managed CODEX_HOME is unsafe: {home}")
-    harness_dir = home / ".harness"
-    if harness_dir.is_symlink() or not harness_dir.is_dir():
-        raise LauncherError(f"managed launcher state directory is unsafe: {harness_dir}")
     if fcntl is None:
         raise LauncherError("Codex launcher lock support (fcntl) is unavailable")
-    path = harness_dir / "codex-launcher.lock"
-    # O_NONBLOCK is required at open time: without it, opening a FIFO planted
-    # at the lock path for O_RDONLY blocks the launcher indefinitely waiting
-    # for a writer, turning a rejection case into a hang. It is cleared again
-    # once the descriptor is confirmed to be a regular file (regular-file
-    # reads are unaffected by O_NONBLOCK either way, but callers should not
-    # observe nonblocking semantics on the returned handle).
-    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
-    for _ in range(_LOCK_OPEN_RETRIES):
-        try:
-            fd = os.open(path, flags)
-        except OSError as exc:
-            raise LauncherError(f"Codex launcher lock is unavailable: {path}") from exc
-        handle = os.fdopen(fd, "rb", buffering=0)
-        valid = False
-        try:
-            opened = os.fstat(handle.fileno())
-            if (
-                not stat.S_ISREG(opened.st_mode)
-                or opened.st_uid != os.geteuid()
-                or opened.st_mode & 0o077
-            ):
-                raise LauncherError(f"Codex launcher lock is unsafe: {path}")
-            current_status_flags = fcntl.fcntl(handle.fileno(), fcntl.F_GETFL)
-            fcntl.fcntl(handle.fileno(), fcntl.F_SETFL, current_status_flags & ~os.O_NONBLOCK)
-            fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+    dirfd = _open_harness_dirfd(home)
+    try:
+        path = home / ".harness" / "codex-launcher.lock"
+        # O_NONBLOCK is required at open time: without it, opening a FIFO
+        # planted at the lock path for O_RDONLY blocks the launcher
+        # indefinitely waiting for a writer, turning a rejection case into a
+        # hang. It is cleared again once the descriptor is confirmed to be a
+        # regular file (regular-file reads are unaffected by O_NONBLOCK
+        # either way, but callers should not observe nonblocking semantics on
+        # the returned handle).
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+        for _ in range(_LOCK_OPEN_RETRIES):
             try:
-                current = os.stat(path, follow_symlinks=False)
-            except OSError:
-                current = None
-            if (
-                current is not None
-                and stat.S_ISREG(current.st_mode)
-                and (opened.st_dev, opened.st_ino) == (current.st_dev, current.st_ino)
-            ):
-                valid = True
-                return handle
-            # Pathname was replaced (or unlinked) between open and flock: this
-            # descriptor is stale. Release and retry against the current name.
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        finally:
-            if not valid:
-                handle.close()
-    raise LauncherError(f"Codex launcher lock could not be safely acquired: {path}")
+                fd = os.open("codex-launcher.lock", flags, dir_fd=dirfd)
+            except OSError as exc:
+                raise LauncherError(f"Codex launcher lock is unavailable: {path}") from exc
+            handle = os.fdopen(fd, "rb", buffering=0)
+            valid = False
+            try:
+                opened = os.fstat(handle.fileno())
+                if (
+                    not stat.S_ISREG(opened.st_mode)
+                    or opened.st_uid != os.geteuid()
+                    or opened.st_mode & 0o077
+                ):
+                    raise LauncherError(f"Codex launcher lock is unsafe: {path}")
+                current_status_flags = fcntl.fcntl(handle.fileno(), fcntl.F_GETFL)
+                fcntl.fcntl(handle.fileno(), fcntl.F_SETFL, current_status_flags & ~os.O_NONBLOCK)
+                fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+                current = _lock_identity(dirfd)
+                if (
+                    current is not None
+                    and stat.S_ISREG(current.st_mode)
+                    and (opened.st_dev, opened.st_ino) == (current.st_dev, current.st_ino)
+                ):
+                    valid = True
+                    return handle
+                # Pathname was replaced (or unlinked) between open and flock: this
+                # descriptor is stale. Release and retry against the current name,
+                # still relative to the same validated `.harness` directory.
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                if not valid:
+                    handle.close()
+        raise LauncherError(f"Codex launcher lock could not be safely acquired: {path}")
+    finally:
+        os.close(dirfd)
 
 
 def _unlock(handle) -> None:
     if fcntl is not None:
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
     handle.close()
+
+
+def _read_state_locked(home: Path) -> dict:
+    """Acquire the shared lock and read launcher state while holding it.
+
+    `_launcher_lock` proves the lock identity at acquire time, but the
+    pathname can still be replaced between that return and the state read
+    below -- the reader would then hold a shared lock on a stale inode while
+    an installer serializes writers against the successor. Acceptance is
+    made to cover the read: identity is re-checked immediately after
+    `_state` returns, and any replacement retries the whole
+    acquire-and-read sequence (fresh directory descriptor, fresh lock) within
+    the same bounded `_LOCK_OPEN_RETRIES` budget rather than trusting a read
+    that raced a live install/repair.
+    """
+    for _ in range(_LOCK_OPEN_RETRIES):
+        handle = _launcher_lock(home)
+        try:
+            pre = os.fstat(handle.fileno())
+            value = _state(home)
+            try:
+                post = os.stat(home / ".harness" / "codex-launcher.lock", follow_symlinks=False)
+            except OSError:
+                post = None
+            if (
+                post is not None
+                and stat.S_ISREG(post.st_mode)
+                and (pre.st_dev, pre.st_ino) == (post.st_dev, post.st_ino)
+            ):
+                return value
+            # Replaced during the read window: the state we just read cannot
+            # be trusted as bound to the lock we held. Retry from scratch.
+        finally:
+            _unlock(handle)
+    raise LauncherError(f"managed launcher state could not be safely read: {home}")
 
 
 def _codex_home() -> Path:
@@ -495,11 +573,7 @@ def main() -> int:
             )
         os.environ["AGENT_CODEX_LAUNCHER_GUARD_PID"] = str(os.getpid())
         state_home = launcher_state_home(runtime_home)
-        lock = _launcher_lock(state_home)
-        try:
-            value = _state(state_home)
-        finally:
-            _unlock(lock)
+        value = _read_state_locked(state_home)
         real = Path(value["real_command"])
         # A global launcher may be used with a one-off CODEX_HOME for tests,
         # repair, or an administrative command. Its global binding remains
