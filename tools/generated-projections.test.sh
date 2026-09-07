@@ -168,17 +168,45 @@ if grep -Fq 'auto-proceed and report in one line' "$ROOT/roles/response-policy.m
   echo "not ok - one-line follow-up close contradicts the completion report card" >&2
   exit 1
 fi
+has_entry_confirmation() {
+  case "$1" in
+    *'present the five-field card in §0.4 before'*|*'present the §0.4 five-field card before'*|*'else the §0.4 card unless approved'*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 for bootstrap in \
   "$ROOT/adapters/claude/CLAUDE.md" \
   "$ROOT/adapters/codex/AGENTS.md" \
   "$ROOT/adapters/opencode/AGENTS.md"; do
-  grep -Fq 'five-field card in §0.4' "$bootstrap" || {
-    echo "not ok - entry confirmation pointer missing from $bootstrap" >&2
-    exit 1
-  }
   # Bootstrap prose is hard-wrapped, so match against a whitespace-normalized
   # copy: a restored clause must survive an unrelated reflow.
   bootstrap_flat=$(tr '\n' ' ' < "$bootstrap" | tr -s ' ' | tr 'A-Z' 'a-z')
+  has_entry_confirmation "$bootstrap_flat" || {
+    echo "not ok - entry confirmation pointer missing from $bootstrap" >&2
+    exit 1
+  }
+  # Removing the entry action must fail even with the evidence-check exemption
+  # elsewhere in each real bootstrap. Preserve the rest of the text verbatim.
+  without_entry=$(printf '%s' "$bootstrap_flat" | sed -E \
+    's/present the (five-field card in §0\.4|§0\.4 five-field card) before//g; s/else the §0\.4 card unless approved//g')
+  if has_entry_confirmation "$without_entry"; then
+    echo "not ok - entry confirmation check accepts a missing action in $bootstrap" >&2
+    exit 1
+  fi
+  case "$bootstrap_flat" in
+    *'five-field completion card in §0.5'*|*'§0.5 card'*|*'close with §0.5'*) ;;
+    *)
+      echo "not ok - WORKFLOW §0.5 completion report pointer missing from $bootstrap" >&2
+      exit 1
+      ;;
+  esac
+  case "$bootstrap_flat" in
+    *'continue low-risk reversible work autonomously'*|*'continue reversible in-flow work'*) ;;
+    *)
+      echo "not ok - structured-input autonomy threshold missing from $bootstrap" >&2
+      exit 1
+      ;;
+  esac
   while IFS='|' read -r needle label; do
     [ -n "$needle" ] || continue
     case "$bootstrap_flat" in
@@ -189,11 +217,9 @@ for bootstrap in \
         ;;
     esac
   done <<'BOOTSTRAP_PARITY_EOF'
-five-field completion card in §0.5|WORKFLOW §0.5 completion report pointer
 §5.11|OPERATIONS §5.11 same-turn commit/push policy
 dispatch depth 3 is forbidden|dispatch-depth-3 prohibition
 genuinely non-obvious|genuinely-non-obvious ask clause
-continue low-risk reversible work autonomously|structured-input autonomy threshold
 if structured input is unavailable|structured-input fallback clause
 legacy `.claude_reports/` is only a fallback|legacy artifact-root fallback qualifier
 depth, tests, safety, and validation on fallback|fallback preservation guarantee

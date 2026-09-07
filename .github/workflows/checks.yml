@@ -130,6 +130,7 @@ jobs:
           python3 tools/run-tests.py --retries 1 \
             --strict-leak-sweep \
             --report ${{ runner.temp }}/run-tests-report.tsv \
+            --diagnostics-dir ${{ runner.temp }}/run-tests-diagnostics \
             --seed-baseline ${{ runner.temp }}/run-tests-seed-baseline.tsv
 
       - name: Upload full-suite report and baseline seed
@@ -140,4 +141,5 @@ jobs:
           path: |
             ${{ runner.temp }}/run-tests-report.tsv
             ${{ runner.temp }}/run-tests-seed-baseline.tsv
+            ${{ runner.temp }}/run-tests-diagnostics
           if-no-files-found: ignore
