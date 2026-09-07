@@ -593,6 +593,96 @@ class MaterialRouteGuardTest(unittest.TestCase):
         self.assertEqual(denied.returncode, 2)
         self.assertIn("route-artifact-root-mismatch", denied.stderr)
 
+    def test_session_dir_probe_receipt_serves_linked_worktree_route(self) -> None:
+        # OpenCode parity: the per-turn candidate probe runs in the OpenCode
+        # session directory (the main checkout), while material work proceeds
+        # in a linked worktree with the route bound there. The receipt proves a
+        # recall opportunity for this project, but exact-cwd equality refused
+        # it and forced a manual `mem recall-gate` from the worktree before any
+        # Edit/Write would pass. A receipt from the same git repository family
+        # (shared `--git-common-dir`) is the same-project proof; an unrelated
+        # repository stays refused.
+        linked = self.base / "linked"
+        subprocess.run(
+            ["git", "-C", str(self.repo), "worktree", "add", "-q", str(linked), "HEAD"],
+            check=True,
+        )
+        artifact_root = self.repo / ".agent_reports"
+        command = [
+            sys.executable, str(ROUTER), "compile",
+            "--slug", "worktree-recall-fixture",
+            "--capability", "autopilot-code",
+            "--capability-mode", "dev",
+            "--intensity", "direct",
+            "--cwd", str(linked),
+            "--artifact-root", str(artifact_root),
+        ]
+        for predicate in PREDICATES:
+            command += ["--predicate", predicate]
+        command += [
+            "--transport", "interactive",
+            "--inline-reason", "atomic-direct",
+            "--tracking", "untracked",
+            "--spec-read", "not-applicable",
+            "--drift-verdict", "no-project-spec",
+            "--workflow-mode", "untracked",
+            "--artifact-guard", "preflight-passed",
+        ]
+        compiled = subprocess.run(command, text=True, capture_output=True)
+        self.assertEqual(compiled.returncode, 0, compiled.stderr)
+        route_id = json.loads(compiled.stdout)["route_id"]
+        route = artifact_root / ".runtime" / "routes" / f"{route_id}.json"
+        bound = subprocess.run(
+            [
+                sys.executable, str(GUARD), "--agent-home", str(self.home),
+                "bind", "--route", str(route), "--cwd", str(linked),
+                "--session", "session-a",
+            ],
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(bound.returncode, 0, bound.stderr)
+        # The OpenCode probe wrote its receipt from the session directory
+        # (main checkout), not from the worktree the route is bound to.
+        self.opportunity(turn="turn-a", cwd=self.repo)
+        allowed = subprocess.run(
+            [
+                sys.executable, str(GUARD), "--agent-home", str(self.home),
+                "check", "--tool", "Edit", "--file", str(linked / "app.py"),
+                "--cwd", str(linked), "--session", "session-a",
+                "--turn", "turn-a",
+            ],
+            text=True,
+            capture_output=True,
+            env={**os.environ, "MEM_RECALL_RECEIPTS": str(self.receipts)},
+        )
+        self.assertEqual(allowed.returncode, 0, allowed.stderr)
+
+        unrelated = self.base / "unrelated"
+        unrelated.mkdir()
+        subprocess.run(["git", "init", "-q", str(unrelated)], check=True)
+        (unrelated / "file.py").write_text("x\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(unrelated), "add", "."], check=True)
+        subprocess.run(
+            ["git", "-C", str(unrelated), "-c", "user.email=t@e.invalid",
+             "-c", "user.name=T", "commit", "-qm", "x"],
+            check=True,
+        )
+        self.opportunity(turn="turn-a", cwd=unrelated)
+        foreign = subprocess.run(
+            [
+                sys.executable, str(GUARD), "--agent-home", str(self.home),
+                "check", "--tool", "Edit", "--file", str(linked / "app.py"),
+                "--cwd", str(linked), "--session", "session-a",
+                "--turn", "turn-a",
+            ],
+            text=True,
+            capture_output=True,
+            env={**os.environ, "MEM_RECALL_RECEIPTS": str(self.receipts)},
+        )
+        self.assertEqual(foreign.returncode, 2)
+        self.assertIn("recall-opportunity-cwd-mismatch", foreign.stderr)
+
     def test_claude_transcript_turn_anchor_tracks_latest_real_user_uuid(self) -> None:
         transcript = self.base / "transcript.jsonl"
         transcript.write_text(
