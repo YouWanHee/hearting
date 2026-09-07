@@ -1750,6 +1750,7 @@ def _run_subdivision_batch_admission(args: argparse.Namespace, route: dict[str, 
         admission = SUBDIVISION_ADMISSION.admit_batch(
             route=route, node=node, manifest_path=args.subdivision_manifest,
             governor=governor, governor_root=governor_root, reserve=reserve_batch,
+            jobs=args.jobs,
         )
     except SUBDIVISION_ADMISSION.SubdivisionAdmissionError as exc:
         print(json.dumps({

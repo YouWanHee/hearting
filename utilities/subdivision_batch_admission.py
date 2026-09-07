@@ -233,6 +233,7 @@ def admit_batch(
     governor_root: Path,
     reserve: Callable[..., list[str]] | None = None,
     record_baseline: Callable[[dict[str, Any], str, dict[str, Any]], None] | None = None,
+    jobs: str | Path | None = None,
 ) -> AdmissionResult:
     """Run all four admission checkpoints in order; any failure is row 0 / model 0.
 
@@ -253,7 +254,13 @@ def admit_batch(
         governor, governor_root, manifest["sessions"],
         route=route, node_id=node_id, manifest_digest=manifest_digest, reserve=reserve,
     )
-    (record_baseline or ROUTE_MODULE.record_subdivision_baseline)(route, node_id, manifest)
+    if record_baseline is None:
+        # SD-OPEN-53: the admission-time baseline lands in the state root of
+        # the registry the caller holds (`jobs`), the same root the audit
+        # later reads it back from -- never the inherited/default root.
+        def record_baseline(route, node_id, manifest):
+            return ROUTE_MODULE.record_subdivision_baseline(route, node_id, manifest, jobs=jobs)
+    record_baseline(route, node_id, manifest)
     return AdmissionResult(
         tokens=tokens,
         manifest=manifest,
