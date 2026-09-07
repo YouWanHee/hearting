@@ -101,6 +101,102 @@ class QuiescenceTest(unittest.TestCase):
             link.unlink(); link.symlink_to(b)
             self.assertFalse(Q.validate(str(evidence), allow_fixture=True)["proven"])
 
+    def authority_fixture(self, base):
+        config = self.fixture(base)
+        peer = base / "peer"; peer.mkdir()
+        (peer / "jobs.log").write_text("")
+        (peer / "resource-runs.index.json").write_text('{"schema_version":1,"registries":{}}')
+        config["authority_roots"] = [str(base), str(peer)]
+        return config, peer
+
+    def test_both_harnesses_reject_distinct_authorities_even_when_empty(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory); config, peer = self.authority_fixture(base)
+            answers = []
+            for selected in (base, peer):
+                local = {**config, "dispatch_jobs": str(selected / "jobs.log"),
+                         "resource_index": str(selected / "resource-runs.index.json")}
+                value = Q.publish(str(base / (selected.name + "-evidence.json")), local)
+                self.assertFalse(value["proven"], value)
+                self.assertEqual(value["reason"], "observation-authority-mismatch")
+                self.assertTrue(value["sources"]["authority"]["roots_read"])
+                answers.append(value["source_diagnostics"])
+            self.assertEqual(answers[0], answers[1])
+            # A nonempty peer must not become invisible to the empty observer.
+            (peer / "jobs.log").write_text("malformed but not empty")
+            self.assertFalse(Q.publish(str(base / "nonempty.json"), config)["proven"])
+
+    def test_authority_alias_is_one_source_but_new_peer_invalidates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory); config = self.fixture(base)
+            alias = base / "alias"; alias.symlink_to(base, target_is_directory=True)
+            absent = base / "later"
+            config["authority_roots"] = [str(base), str(alias), str(absent)]
+            evidence = base / "proof.json"
+            self.assertTrue(Q.publish(str(evidence), config)["proven"])
+            self.assertTrue(Q.validate(str(evidence), allow_fixture=True)["proven"])
+            absent.mkdir(); (absent / "jobs.log").write_text("")
+            self.assertFalse(Q.validate(str(evidence), allow_fixture=True)["proven"])
+
+    def test_authority_equal_bytes_replacement_invalidates_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory); config = self.fixture(base)
+            evidence = base / "proof.json"
+            self.assertTrue(Q.publish(str(evidence), config)["proven"])
+            replacement = base / "replacement.log"; replacement.write_text("")
+            replacement.replace(config["dispatch_jobs"])
+            self.assertFalse(Q.validate(str(evidence), allow_fixture=True)["proven"])
+
+    def test_live_authority_candidates_include_both_harnesses_and_keep_jobs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory); config = self.fixture(base)
+            env = {"HOME": str(base / "user"), "CODEX_HOME": str(base / "private-codex"),
+                   "XDG_STATE_HOME": str(base / "state"),
+                   "AGENT_DISPATCH_JOBS": config["dispatch_jobs"],
+                   "AGENT_RESOURCE_RUN_INDEX": config["resource_index"]}
+            with patch.dict(os.environ, env, clear=True), \
+                    patch.object(Q.subprocess, "check_output", return_value=config["artifact_root"]), \
+                    patch.object(Q.RESOURCES, "agent_home", return_value=base / "agent"):
+                live = Q.live_config()
+                self.assertEqual(live["dispatch_jobs"], config["dispatch_jobs"])
+                roots = set(live["authority_roots"])
+                self.assertIn(str(base / "state" / "hearting" / "dispatch"), roots)
+                self.assertIn(str(base / "user" / ".codex" / ".harness" / "dispatch"), roots)
+                self.assertIn(str(base / "private-codex" / ".harness" / "dispatch"), roots)
+                self.assertEqual(os.environ["AGENT_DISPATCH_JOBS"], config["dispatch_jobs"])
+
+    def test_authority_unreadable_peer_and_malformed_roots_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory); config, peer = self.authority_fixture(base)
+            original = os.open
+            def denied(path, *args, **kwargs):
+                if Path(path) == peer / "jobs.log":
+                    raise PermissionError("fixture peer denied")
+                return original(path, *args, **kwargs)
+            with patch.object(os, "open", denied):
+                result = Q.publish(str(base / "denied.json"), config)
+            self.assertEqual(result["reason"], "observation-authority-unverifiable")
+            self.assertEqual(result["source_diagnostics"][0]["path"], str(peer / "jobs.log"))
+            for roots in ([], ["relative"], [str(base / "..")], "not-a-list"):
+                bad = {**config, "authority_roots": roots}
+                self.assertFalse(Q.publish(str(base / "bad.json"), bad)["proven"])
+
+    def test_authority_change_during_observation_and_scope_forgery_refuse(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory); config = self.fixture(base)
+            original = Q._dispatch_rows
+            def replace_after_read(jobs):
+                rows = original(jobs)
+                replacement = base / "replace.log"; replacement.write_text("")
+                replacement.replace(jobs)
+                return rows
+            with patch.object(Q, "_dispatch_rows", replace_after_read):
+                value = Q.publish(str(base / "changed.json"), config)
+            self.assertEqual(value["reason"], "source-changed-during-observation")
+            evidence = base / "proof.json"; value = Q.publish(str(evidence), config)
+            value["scope"] = "live"; evidence.write_text(json.dumps(value))
+            self.assertFalse(Q.validate(str(evidence), allow_fixture=True)["proven"])
+
     def fixture(self, base: Path):
         artifact_root = base / "artifacts"
         (artifact_root / ".runtime" / "routes").mkdir(parents=True)
