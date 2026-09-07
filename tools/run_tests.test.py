@@ -143,10 +143,10 @@ class FailureKindClassifierTest(unittest.TestCase):
     def setUp(self):
         self.mod = load_runner_module()
 
-    def result(self, stderr: str, *, timed_out: bool = False):
+    def result(self, stderr: str, *, stdout: str = "", timed_out: bool = False):
         return self.mod.SuiteResult(
             "fixture.test.py", 124 if timed_out else 1, timed_out,
-            "", stderr, 0.1, "isolated",
+            stdout, stderr, 0.1, "isolated",
         )
 
     def test_timeout_wins_over_reporter_text(self):
@@ -180,6 +180,24 @@ class FailureKindClassifierTest(unittest.TestCase):
             "AssertionError: values differ\nFAILED (failures=1)\n"
         )
         self.assertEqual(self.mod.classify_kind(result), "assertion")
+
+    def test_unittest_output_on_stdout_is_classified(self):
+        for text, expected in [
+            ("ERROR: test_x (module.C.test_x)\nFAILED (errors=1)\n", "error"),
+            ("FAIL: test_x (module.C.test_x)\nAssertionError: bad\nFAILED (failures=1)\n", "assertion"),
+        ]:
+            with self.subTest(expected=expected):
+                self.assertEqual(self.mod.classify_kind(self.result("", stdout=text)), expected)
+                self.assertEqual(self.mod.classify_kind(
+                    self.result("", stdout=text, timed_out=True)), "timeout")
+
+    def test_error_wins_across_capture_streams(self):
+        error = "ERROR: test_x (module.C.test_x)\nFAILED (errors=1)\n"
+        failure = "FAIL: test_y (module.C.test_y)\nAssertionError: bad\n"
+        for stderr, stdout in [(error, failure), (failure, error)]:
+            with self.subTest(stderr=stderr):
+                self.assertEqual(self.mod.classify_kind(
+                    self.result(stderr, stdout=stdout)), "error")
 
 
 class XPassFixture(RunTestsFixtureBase):
@@ -658,6 +676,51 @@ class RetryFixture(RunTestsFixtureBase):
                 f"run stderr attempt {number}",
                 (diagnostics / row["stderr_path"]).read_text(encoding="utf-8"),
             )
+
+
+class DiagnosticConfinementTest(RunTestsFixtureBase):
+    def test_symlinks_are_rejected_without_external_writes(self):
+        mod = load_runner_module()
+        result = mod.SuiteResult("fixture.test.py", 1, False, "stdout", "stderr", 0.1, "isolated")
+        for target in ("root", "suite", "stdout", "stderr", "index"):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp)
+                output = base / "diagnostics"
+                outside = base / "outside"
+                outside.mkdir()
+                sentinel = outside / "sentinel"
+                sentinel.write_text("unchanged")
+                if target == "root":
+                    output.symlink_to(outside, target_is_directory=True)
+                else:
+                    # First produce valid paths, then poison one path for reuse.
+                    mod.write_failure_diagnostics(output, {result.relpath: [result]})
+                    suite = next(p for p in output.iterdir() if p.is_dir())
+                    if target == "suite":
+                        import shutil
+                        shutil.rmtree(suite)
+                        suite.symlink_to(outside, target_is_directory=True)
+                    else:
+                        victim = output / "index.tsv" if target == "index" else suite / f"attempt-001.{target}.txt"
+                        victim.unlink()
+                        victim.symlink_to(sentinel)
+                with self.assertRaises(OSError):
+                    mod.write_failure_diagnostics(output, {result.relpath: [result]})
+                self.assertEqual(sentinel.read_text(), "unchanged")
+                self.assertEqual(sorted(p.name for p in outside.iterdir()), ["sentinel"])
+
+    def test_diagnostic_refusal_is_a_cli_hard_failure(self):
+        write_suite(self.root, "ok.test.py", "print('PASS')")
+        output = self.root / "diagnostics"
+        output.mkdir()
+        victim = self.root / "sentinel.txt"
+        victim.write_text("unchanged")
+        (output / "index.tsv").symlink_to(victim)
+        result, _ = self.run_fixture([], extra_args=["--diagnostics-dir", str(output)])
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("FATAL: diagnostics write failed", result.stderr)
+        self.assertIn("__diagnostics_write__::- verdict=ERROR kind=internal", result.stdout)
+        self.assertEqual(victim.read_text(), "unchanged")
 
 
 class CiLikeProfileFixture(unittest.TestCase):

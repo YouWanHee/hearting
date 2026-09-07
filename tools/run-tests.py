@@ -35,6 +35,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -698,24 +699,24 @@ def last_nonempty_line(text: str) -> str:
 def classify_kind(result: SuiteResult) -> str:
     if result.timed_out:
         return "timeout"
-    stderr_tail = result.stderr or ""
-    if re.search(r"(command not found|No such file or directory).*\b(binary|executable)?\b", stderr_tail, re.IGNORECASE) or \
-       re.search(r": command not found$", last_nonempty_line(stderr_tail)):
+    captured = "\n".join((result.stderr or "", result.stdout or ""))
+    if re.search(r"(command not found|No such file or directory).*\b(binary|executable)?\b", captured, re.IGNORECASE) or \
+       re.search(r": command not found$", last_nonempty_line(captured)):
         return "missing-binary"
     # unittest ends both failures and errors with the word "FAILED".  That
     # summary word alone carries no failure kind: ERROR headers/errors=N mean
     # the test did not complete normally, while FAIL headers/failures=N and an
     # AssertionError identify a completed assertion failure.  Error wins for a
     # mixed run so a runner/setup error cannot hide behind a peer assertion.
-    if re.search(r"^ERROR:\s+", stderr_tail, re.MULTILINE) or re.search(
-        r"\bFAILED\s*\([^)]*\berrors?=\d+", stderr_tail
+    if re.search(r"^ERROR:\s+", captured, re.MULTILINE) or re.search(
+        r"\bFAILED\s*\([^)]*\berrors?=\d+", captured
     ):
         return "error"
-    if "AssertionError" in stderr_tail or re.search(
-        r"^FAIL:\s+", stderr_tail, re.MULTILINE
-    ) or re.search(r"\bFAILED\s*\([^)]*\bfailures?=\d+", stderr_tail):
+    if "AssertionError" in captured or re.search(
+        r"^FAIL:\s+", captured, re.MULTILINE
+    ) or re.search(r"\bFAILED\s*\([^)]*\bfailures?=\d+", captured):
         return "assertion"
-    if re.search(r"(Traceback|ImportError|ModuleNotFoundError|SyntaxError|CollectionError)", stderr_tail):
+    if re.search(r"(Traceback|ImportError|ModuleNotFoundError|SyntaxError|CollectionError)", captured):
         return "error"
     return "exit-nonzero"
 
@@ -1011,6 +1012,24 @@ DIAGNOSTIC_INDEX_COLUMNS = [
 ]
 
 
+def _write_diagnostic_text(directory_fd: int, name: str, text: str) -> None:
+    # Open relative to a pinned directory; reject symlinks and special/hardlinked
+    # files before truncation. O_NONBLOCK also prevents a planted FIFO hanging CI.
+    fd = os.open(
+        name, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+        0o600, dir_fd=directory_fd,
+    )
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise OSError(f"diagnostic is not a private regular file: {name}")
+        os.ftruncate(fd, 0)
+        with os.fdopen(fd, "w", encoding="utf-8", closefd=False) as handle:
+            handle.write(text)
+    finally:
+        os.close(fd)
+
+
 def write_failure_diagnostics(
     path: Path, results_by_suite: dict[str, list[SuiteResult]]
 ) -> tuple[int, int]:
@@ -1022,43 +1041,56 @@ def write_failure_diagnostics(
     a flaky aggregate cannot be reconstructed from the CI artifact.
     """
     path.mkdir(parents=True, exist_ok=True)
+    root_fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     rows: list[dict[str, str]] = []
     failing_suites = 0
-    for suite_path in sorted(results_by_suite):
-        attempts = results_by_suite[suite_path]
-        if not any(not attempt.passed for attempt in attempts):
-            continue
-        failing_suites += 1
-        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", Path(suite_path).name)[:80]
-        digest = hashlib.sha256(suite_path.encode("utf-8")).hexdigest()[:12]
-        suite_dir = path / f"{digest}-{safe_name or 'suite'}"
-        suite_dir.mkdir(parents=True, exist_ok=True)
-        for attempt_number, result in enumerate(attempts, start=1):
-            prefix = f"attempt-{attempt_number:03d}"
-            stdout_path = suite_dir / f"{prefix}.stdout.txt"
-            stderr_path = suite_dir / f"{prefix}.stderr.txt"
-            stdout_path.write_text(result.stdout or "", encoding="utf-8")
-            stderr_path.write_text(result.stderr or "", encoding="utf-8")
-            rows.append(
-                {
-                    "suite_path": suite_path,
-                    "attempt": str(attempt_number),
-                    "returncode": str(result.returncode),
-                    "timed_out": "1" if result.timed_out else "0",
-                    "kind": classify_kind(result) if not result.passed else "",
-                    "isolation_profile": result.profile,
-                    "duration_s": f"{result.duration_s:.2f}",
-                    "stdout_path": str(stdout_path.relative_to(path)),
-                    "stderr_path": str(stderr_path.relative_to(path)),
-                }
+    try:
+        for suite_path in sorted(results_by_suite):
+            attempts = results_by_suite[suite_path]
+            if not any(not attempt.passed for attempt in attempts):
+                continue
+            failing_suites += 1
+            safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", Path(suite_path).name)[:80]
+            digest = hashlib.sha256(suite_path.encode("utf-8")).hexdigest()[:12]
+            suite_name = f"{digest}-{safe_name or 'suite'}"
+            try:
+                os.mkdir(suite_name, mode=0o700, dir_fd=root_fd)
+            except FileExistsError:
+                pass
+            suite_fd = os.open(
+                suite_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=root_fd,
             )
-    index = path / "index.tsv"
-    with index.open("w", encoding="utf-8") as handle:
-        handle.write("\t".join(DIAGNOSTIC_INDEX_COLUMNS) + "\n")
-        for row in rows:
-            handle.write(
-                "\t".join(row[column] for column in DIAGNOSTIC_INDEX_COLUMNS) + "\n"
-            )
+            try:
+                for attempt_number, result in enumerate(attempts, start=1):
+                    prefix = f"attempt-{attempt_number:03d}"
+                    stdout_name = f"{prefix}.stdout.txt"
+                    stderr_name = f"{prefix}.stderr.txt"
+                    _write_diagnostic_text(suite_fd, stdout_name, result.stdout or "")
+                    _write_diagnostic_text(suite_fd, stderr_name, result.stderr or "")
+                    rows.append(
+                        {
+                            "suite_path": suite_path,
+                            "attempt": str(attempt_number),
+                            "returncode": str(result.returncode),
+                            "timed_out": "1" if result.timed_out else "0",
+                            "kind": classify_kind(result) if not result.passed else "",
+                            "isolation_profile": result.profile,
+                            "duration_s": f"{result.duration_s:.2f}",
+                            "stdout_path": f"{suite_name}/{stdout_name}",
+                            "stderr_path": f"{suite_name}/{stderr_name}",
+                        }
+                    )
+            finally:
+                os.close(suite_fd)
+        index_text = "\t".join(DIAGNOSTIC_INDEX_COLUMNS) + "\n"
+        index_text += "".join(
+            "\t".join(row[column] for column in DIAGNOSTIC_INDEX_COLUMNS) + "\n"
+            for row in rows
+        )
+        _write_diagnostic_text(root_fd, "index.tsv", index_text)
+    finally:
+        os.close(root_fd)
     return failing_suites, len(rows)
 
 
