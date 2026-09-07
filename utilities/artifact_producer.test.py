@@ -1364,6 +1364,45 @@ class ReviewPublicationLeaseTest(ProducerTestBase):
             self.assertEqual(caught.exception.code, "cycle-finalize-blocked-live-review")
         self.assertEqual(P.finalize(self.root, cycle_id=cycle_id)["status"], "sealed")
 
+    def test_recovery_journal_roll_forward_is_fenced_by_live_v2_lease(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        self.write_output(result)
+        cycle_id = result["cycle_id"]
+        with self.assertRaises(adm.AdmissionRecoveryRequired):
+            P.finalize(self.root, cycle_id=cycle_id, allow_open_route=True,
+                       crash_after_manifest=True)
+        lease_path = P._review_lease_path(self.root, cycle_id, "att-recovery")
+        lease_path.parent.mkdir(parents=True, exist_ok=True)
+        lease_path.write_text(json.dumps({"schema_version": 2}), encoding="utf-8")
+        with mock.patch.object(P, "_live_review_lease", return_value=lease_path):
+            with self.assertRaises(P.ProducerError) as caught:
+                P.recover(self.root)
+        self.assertEqual(caught.exception.code, "cycle-finalize-blocked-live-review")
+        self.assertEqual(P.read_cycle_record(self.root, cycle_id)["state"], "open")
+        self.assertTrue(P.journal_path(self.root, cycle_id).exists())
+        with mock.patch.object(P, "_live_review_lease", return_value=None):
+            recovered = P.recover(self.root)
+        self.assertIn(cycle_id, recovered["producer"]["rolled_forward"])
+
+    def test_recovery_manifest_discovery_is_fenced_without_journal(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        self.write_output(result)
+        cycle_id = result["cycle_id"]
+        with self.assertRaises(adm.AdmissionRecoveryRequired):
+            P.finalize(self.root, cycle_id=cycle_id, allow_open_route=True,
+                       crash_after_manifest=True)
+        P.journal_path(self.root, cycle_id).unlink()
+        lease_path = P._review_lease_path(self.root, cycle_id, "att-recovery-no-journal")
+        lease_path.parent.mkdir(parents=True, exist_ok=True)
+        lease_path.write_text(json.dumps({"schema_version": 2}), encoding="utf-8")
+        with mock.patch.object(P, "_live_review_lease", return_value=lease_path):
+            with self.assertRaises(P.ProducerError) as caught:
+                P.recover(self.root)
+        self.assertEqual(caught.exception.code, "cycle-finalize-blocked-live-review")
+        self.assertEqual(P.read_cycle_record(self.root, cycle_id)["state"], "open")
+
 
 class AbandonReasonTest(ProducerTestBase):
     """SD-117 §13.34.5-(2): L3 `abandon_reason` closed enum."""

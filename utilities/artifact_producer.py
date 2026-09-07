@@ -1444,7 +1444,7 @@ def _lease_record_is_live(
     when = time.time() if now is None else now
     if when > deadline_ts:
         return False
-    if record.get("schema_version") == 2:
+    if _is_v2_review_lease(record):
         if record.get("expired") is not False:
             return True
         acquired_at = record.get("acquired_at")
@@ -1488,7 +1488,15 @@ def _lease_record_is_live(
     return actual_pgid == pgid
 
 
-def _live_review_lease(root: Path, cycle_id: str) -> Optional[Path]:
+def _is_v2_review_lease(record: object) -> bool:
+    """Identify the exact-output lease without changing the v1 union seam."""
+
+    return isinstance(record, Mapping) and record.get("schema_version") == 2
+
+
+def _live_review_lease(
+    root: Path, cycle_id: str, *, now: Optional[float] = None
+) -> Optional[Path]:
     lease_dir = _review_lease_dir(root, cycle_id)
     if not lease_dir.is_dir():
         return None
@@ -1502,15 +1510,67 @@ def _live_review_lease(root: Path, cycle_id: str) -> Optional[Path]:
             # means "no lease file at this specific path".
             conservative = conservative or path
             continue
-        if _lease_record_is_live(record, root=root):
+        if _lease_record_is_live(record, root=root, now=now):
             # Completed sealing cares about a live exact-report lease wherever
             # it appears in a mixed v1/v2 directory. Preserve the first
             # conservative v1/corrupt candidate for abandon semantics, but let
             # any live v2 report lease win this single union seam.
-            if record.get("schema_version") == 2:
+            if _is_v2_review_lease(record):
                 return path
             conservative = conservative or path
     return conservative
+
+
+def _raise_if_recovery_fenced(root: Path, cycle_id: str, *, now: Optional[float] = None) -> None:
+    """Keep recovery from sealing a cycle under a live v2 review lease.
+
+    Recovery is itself a publication path: both a journal roll-forward and
+    discovery of an already-published manifest call ``_commit_sealed``.  The
+    normal finalize fence therefore has to be repeated immediately before
+    that mutation.  Legacy v1 leases remain governed by their existing
+    abandon-only policy; only the exact v2 report lease blocks recovery.
+    """
+    lease_path = _live_review_lease(root, cycle_id, now=now)
+    if lease_path is None:
+        return
+    lease = _read_json(lease_path)
+    if _is_v2_review_lease(lease):
+        raise ProducerError("cycle-finalize-blocked-live-review", cycle_id)
+
+
+def _path_entry_present(path: Path) -> bool:
+    """Return false only for an absent directory entry.
+
+    Publication admission is fail-closed.  A dangling symlink, directory,
+    special node, unreadable regular file, or lookup error is still an entry;
+    none may be collapsed into the same state as ENOENT by ``exists`` or
+    ``is_file``.
+    """
+
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _raise_if_review_publication_started(
+    root: Path, record: Mapping[str, Any]
+) -> None:
+    """Refuse a new v2 lease once either publication commit path has begun."""
+
+    cycle_id = str(record.get("cycle_id", ""))
+    directory = cycle_dir(
+        root, str(record.get("campaign_id", "")), cycle_id, record,
+    )
+    for entry in (journal_path(root, cycle_id), directory / "manifest.json"):
+        if _path_entry_present(entry):
+            raise ProducerError(
+                "review-lease-admission-after-publication",
+                f"{cycle_id}: {entry}",
+            )
 
 
 def prepare_review_output_binding(
@@ -1535,6 +1595,9 @@ def prepare_review_output_binding(
         raise ProducerError("cycle-not-open", cycle_id)
     if record.get("producer_id") != producer_id:
         raise ProducerError("review-binding-producer-mismatch", producer_id)
+    # Fast preclaim refusal.  review_lease_acquire repeats this check while it
+    # owns the canonical admission lock, closing publication after prepare.
+    _raise_if_review_publication_started(canonical_root, record)
     route = load_route(canonical_root, Path(str(record.get("route_file", ""))))
     expected_capability = str(record.get("capability", ""))
     if (
@@ -1658,6 +1721,12 @@ def review_lease_acquire(
                 raise ProducerError("review-lease-binding-incomplete", cycle_id)
             if not isinstance(binding, Mapping):
                 raise ProducerError("review-lease-binding-invalid", attempt_id)
+            admission_record = read_cycle_record(root, cycle_id)
+            if admission_record is not None and admission_record.get("state") == "open":
+                # This is the authoritative race-closing check: the admission
+                # mutex above is still held and publication uses that same
+                # mutex.  No recovery or nested lock acquisition occurs here.
+                _raise_if_review_publication_started(root, admission_record)
             try:
                 canonical_binding = prepare_review_output_binding(
                     root, cycle_id=cycle_id,
@@ -2027,7 +2096,7 @@ def finalize(
         # Legacy v1 leases retain abandon protection only.  The exact report
         # write lease introduced by schema v2 is the sole completed-finalize
         # fence, so old leases cannot strand a cycle at completion.
-        live_v2 = isinstance(live_record, dict) and live_record.get("schema_version") == 2
+        live_v2 = _is_v2_review_lease(live_record)
         if state == "completed" and live_v2:
             raise ProducerError("cycle-finalize-blocked-live-review", cycle_id)
         if state == "abandoned":
@@ -2039,7 +2108,7 @@ def finalize(
             if not force_abandon_ignoring_lease and live_review is not None:
                 lease = live_record
                 reason = ("cycle-finalize-blocked-live-review"
-                          if isinstance(lease, dict) and lease.get("schema_version") == 2
+                          if _is_v2_review_lease(lease)
                           else "cycle-abandon-blocked-live-review")
                 raise ProducerError(reason, cycle_id)
             if force_abandon_ignoring_lease and abandon_reason not in (None, "operator-override-live-review"):
@@ -2189,6 +2258,7 @@ def _recover_locked(root: Path, *, now: Optional[float] = None) -> Dict[str, Lis
             manifest_path = root / str(journal.get("cycle_path", "")) / "manifest.json"
             document = _read_json(manifest_path)
             if document is not None and artifact_manifest.manifest_digest(document) == journal.get("manifest_digest"):
+                _raise_if_recovery_fenced(root, cycle_id, now=now)
                 _commit_sealed(root, record, document, journal["manifest_digest"], now=now)
                 result["rolled_forward"].append(cycle_id)
             elif document is None:
@@ -2213,6 +2283,7 @@ def _recover_locked(root: Path, *, now: Optional[float] = None) -> Dict[str, Lis
         if (directory / "manifest.json").is_file():
             document = _read_json(directory / "manifest.json")
             if document is not None:
+                _raise_if_recovery_fenced(root, record["cycle_id"], now=now)
                 _commit_sealed(root, record, document, artifact_manifest.manifest_digest(document), now=now)
                 result["rolled_forward"].append(record["cycle_id"])
                 continue
