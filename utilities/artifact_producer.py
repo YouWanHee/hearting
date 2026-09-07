@@ -1540,6 +1540,44 @@ def _valid_cycle_state(value: Any) -> bool:
     return isinstance(value, str) and value in _SEALED_CYCLE_STATES
 
 
+def _record_cycle_manifest_path(root: Path, record: Mapping[str, Any]) -> Path:
+    """Resolve this record's manifest without scanning other cycle bindings."""
+    root = Path(root).resolve()
+    campaign_id = record.get("campaign_id")
+    cycle_id = record.get("cycle_id")
+    if not artifact_identity.is_well_formed(campaign_id, "campaign") or not artifact_identity.is_well_formed(cycle_id, "cycle"):
+        raise ProducerError("sealed-cycle-state-unknown", f"{cycle_id}: record identity invalid")
+    try:
+        campaigns = artifact_locator.safe_child(root, root, "campaigns")
+    except artifact_locator.LocatorError as exc:
+        raise ProducerError("sealed-cycle-state-unknown", exc.detail or exc.code) from exc
+    matches = []
+    if campaigns.is_dir() and not campaigns.is_symlink():
+        for candidate in campaigns.iterdir():
+            if candidate.is_symlink() or not candidate.is_dir():
+                continue
+            campaign = _read_json(candidate / "campaign.json")
+            if campaign is not None and campaign.get("campaign_id") == campaign_id:
+                matches.append(candidate)
+    if len(matches) != 1:
+        raise ProducerError(
+            "sealed-cycle-state-unknown",
+            f"{cycle_id}: campaign-locator={'missing' if not matches else 'ambiguous'}",
+        )
+    parent = matches[0]
+    locator = record.get("locator")
+    try:
+        if locator:
+            cycle_path = artifact_locator.safe_child(root, parent, locator)
+        else:
+            cycle_path = artifact_locator.safe_child(
+                root, artifact_locator.safe_child(root, parent, "cycles"), cycle_id
+            )
+    except artifact_locator.LocatorError as exc:
+        raise ProducerError("sealed-cycle-state-unknown", exc.detail or exc.code) from exc
+    return cycle_path / "manifest.json"
+
+
 def _published_cycle_state(root: Path, record: Mapping[str, Any]) -> str:
     """Return the *work* state of a sealed cycle.
 
@@ -1559,15 +1597,13 @@ def _published_cycle_state(root: Path, record: Mapping[str, Any]) -> str:
     record_state = cached if _valid_cycle_state(cached) else None
     try:
         manifest_path = cycle_dir(root, record["campaign_id"], cycle_id, record) / "manifest.json"
-    except (ProducerError, artifact_locator.LocatorError, OSError, KeyError, TypeError):
-        # `LocatorError` is caught by name because it is a `ValueError`, not a
-        # `ProducerError`, and `cycle_dir` calls `find_path_by_id` outside its
-        # own try: `scan_index` walks the whole root, so a *different* cycle's
-        # broken `.cycle.json` binding raises here. That says nothing about
-        # the work state of the cycle being judged, so it is the same case as
-        # an absent canonical source -- fall back to the cache, and refuse
-        # with `sealed-cycle-state-unknown` when there is no usable cache.
-        manifest_path = None
+    except artifact_locator.LocatorError:
+        # The global index can fail because of an unrelated binding. Resolve
+        # this record through its own campaign/cycle locator before deciding
+        # that the canonical manifest is absent.
+        manifest_path = _record_cycle_manifest_path(root, record)
+    except (ProducerError, OSError, KeyError, TypeError):
+        manifest_path = _record_cycle_manifest_path(root, record)
     if manifest_path is None or not (manifest_path.is_file() or manifest_path.is_symlink()):
         # Canonical source absent is the *only* case that falls back to the
         # cache (compatibility for W7G/W7I/W7H relocation roots carrying

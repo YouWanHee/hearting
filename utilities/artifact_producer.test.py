@@ -1711,6 +1711,66 @@ class FinalizeStateConflictTest(ProducerTestBase):
             P.finalize(self.root, cycle_id=cycle_id, state="abandoned", abandon_reason="operator-decision")
         self.assertEqual(caught.exception.code, "finalize-state-conflict")
 
+    def test_current_broken_binding_does_not_mask_manifest_conflict(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        self.write_output(result)
+        self.close(route, route_file)
+        cycle_id = result["cycle_id"]
+        P.finalize(self.root, cycle_id=cycle_id)
+        cycle_dir = Path(result["cycle_dir"])
+        manifest_path = cycle_dir / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["cycle"]["state"] = "abandoned"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        binding_path = cycle_dir / ".cycle.json"
+        binding_path.write_text("{", encoding="utf-8")
+        before = {
+            "manifest": manifest_path.read_bytes(),
+            "record": P.cycle_record_path(self.root, cycle_id).read_bytes(),
+            "index_json": (self.root / "campaigns" / "INDEX.json").read_bytes(),
+            "index_md": (self.root / "campaigns" / "INDEX.md").read_bytes(),
+        }
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id, state="completed")
+        self.assertEqual(caught.exception.code, "sealed-cycle-state-ambiguous")
+        self.assertEqual(manifest_path.read_bytes(), before["manifest"])
+        self.assertEqual(P.cycle_record_path(self.root, cycle_id).read_bytes(), before["record"])
+        self.assertEqual((self.root / "campaigns" / "INDEX.json").read_bytes(), before["index_json"])
+        self.assertEqual((self.root / "campaigns" / "INDEX.md").read_bytes(), before["index_md"])
+
+    def test_unrelated_broken_binding_does_not_mask_unreadable_current_manifest(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        self.write_output(result)
+        self.close(route, route_file)
+        cycle_id = result["cycle_id"]
+        P.finalize(self.root, cycle_id=cycle_id)
+        cycle_dir = Path(result["cycle_dir"])
+        manifest_path = cycle_dir / "manifest.json"
+        manifest_before = manifest_path.read_bytes()
+        manifest_path.write_text("{not json", encoding="utf-8")
+        stranger = cycle_dir.parent / "2026-01-01_stranger"
+        stranger.mkdir()
+        (stranger / ".cycle.json").write_text(json.dumps({
+            "schema_version": 1, "kind": "artifact-cycle-binding",
+            "campaign_id": "camp_" + "0" * 32, "cycle_id": "cyc_" + "0" * 32,
+        }), encoding="utf-8")
+        before = {
+            "manifest": manifest_path.read_bytes(),
+            "record": P.cycle_record_path(self.root, cycle_id).read_bytes(),
+            "index_json": (self.root / "campaigns" / "INDEX.json").read_bytes(),
+            "index_md": (self.root / "campaigns" / "INDEX.md").read_bytes(),
+        }
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id, state="completed")
+        self.assertEqual(caught.exception.code, "sealed-cycle-state-unreadable")
+        self.assertEqual(manifest_path.read_bytes(), before["manifest"])
+        self.assertNotEqual(manifest_path.read_bytes(), manifest_before)
+        self.assertEqual(P.cycle_record_path(self.root, cycle_id).read_bytes(), before["record"])
+        self.assertEqual((self.root / "campaigns" / "INDEX.json").read_bytes(), before["index_json"])
+        self.assertEqual((self.root / "campaigns" / "INDEX.md").read_bytes(), before["index_md"])
+
 
 class SharedReferencePinAndRelatedTest(ProducerTestBase):
     def _admitted_spec_pin(self):
