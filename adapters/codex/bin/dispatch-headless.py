@@ -89,6 +89,7 @@ from dispatch_mode_contract import (  # noqa: E402
 from owner_route_binding import (  # noqa: E402
     OwnerRouteBindingError,
     binding_from_environment,
+    owner_binding_tuple_failure_fields,
     validate_runtime_requirements,
 )
 from worker_bootstrap import (  # noqa: E402
@@ -2246,10 +2247,11 @@ def main(argv: list[str]) -> int:
             intensity=args.intensity,
             harness="codex",
         )
-        if args.owner_route_binding and (
-            args.dispatch_depth != 1 or args.worker_type != "owner" or args.route_file
-        ):
-            raise OwnerRouteBindingError("owner-route-binding-tuple-invalid")
+        if args.owner_route_binding:
+            failure_fields = owner_binding_tuple_failure_fields(
+                dispatch_depth=args.dispatch_depth, worker_type=args.worker_type, route_file=args.route_file)
+            if failure_fields:
+                return fail("owner-route-binding-tuple-invalid", 65, child_spawned="0", **failure_fields)
     except OwnerRouteBindingError as exc:
         return fail(str(exc), 65, child_spawned="0")
     rc = validate_route_record(args)
