@@ -182,6 +182,20 @@ for bootstrap in \
       exit 1
       ;;
   esac
+  case "$bootstrap_flat" in
+    *'five-field completion card in §0.5'*|*'§0.5 card'*|*'close with §0.5'*) ;;
+    *)
+      echo "not ok - WORKFLOW §0.5 completion report pointer missing from $bootstrap" >&2
+      exit 1
+      ;;
+  esac
+  case "$bootstrap_flat" in
+    *'continue low-risk reversible work autonomously'*|*'continue reversible in-flow work'*) ;;
+    *)
+      echo "not ok - structured-input autonomy threshold missing from $bootstrap" >&2
+      exit 1
+      ;;
+  esac
   while IFS='|' read -r needle label; do
     [ -n "$needle" ] || continue
     case "$bootstrap_flat" in
@@ -192,11 +206,9 @@ for bootstrap in \
         ;;
     esac
   done <<'BOOTSTRAP_PARITY_EOF'
-five-field completion card in §0.5|WORKFLOW §0.5 completion report pointer
 §5.11|OPERATIONS §5.11 same-turn commit/push policy
 dispatch depth 3 is forbidden|dispatch-depth-3 prohibition
 genuinely non-obvious|genuinely-non-obvious ask clause
-continue low-risk reversible work autonomously|structured-input autonomy threshold
 if structured input is unavailable|structured-input fallback clause
 legacy `.claude_reports/` is only a fallback|legacy artifact-root fallback qualifier
 depth, tests, safety, and validation on fallback|fallback preservation guarantee
