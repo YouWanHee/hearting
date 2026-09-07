@@ -50,6 +50,14 @@ downloaded, and session reload or restart boundaries remain runtime-specific.
 
 Runtime homes should be adapter projections, not the source repository. Keep credentials, sessions, logs, SQLite state, caches, and other runtime-owned files in the runtime home. Expose the harness into each runtime home with symlinks or adapter-owned bootstrap files.
 
+For managed releases, set `AGENT_HOME` to
+`${XDG_DATA_HOME:-$HOME/.local/share}/hearting/current` (or the exact release
+root sealed by an existing route). A runtime home such as `$HOME/.claude`,
+even with symlinked harness files, is not that installed root: its tree identity
+does not match the sealed release identity. Launch mismatch diagnostics must
+name the expected root and how to invoke its tooling; never relax the identity
+check to accept a projection tree.
+
 Portable model profiles belong to core, while each adapter owns its shipped
 concrete model mapping. Installation seeds that mapping once as
 `<runtime-home>/agent-config/models.conf`. The seeded file is user-owned: it is

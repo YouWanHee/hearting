@@ -39,6 +39,11 @@ class WorkerRouteGuardTest(unittest.TestCase):
     with self.assertRaises(G.WorkerRouteError) as ctx:
      G.validate_route_contract(path,"execute",ROOT,ROOT,launch_phase="start")
     self.assertEqual(ctx.exception.reason,expected)
+    if case=="incompatible":
+     detail=json.loads(str(ctx.exception))
+     self.assertIn(route["launch_compatibility_tuple"]["runtime_root"]["path"],detail["recovery"])
+     self.assertIn("AGENT_HOME=",detail["recovery"])
+     self.assertIn("runtime projection",detail["recovery"])
  def test_valid_and_scope_bound(self):
   with tempfile.TemporaryDirectory() as td:
    path=Path(td)/"route.json"; route=self.route(); path.write_text(json.dumps(route))

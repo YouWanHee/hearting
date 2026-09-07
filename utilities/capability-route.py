@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compile, verify, and complete immutable capability routes."""
 from __future__ import annotations
-import argparse, base64, contextlib, fcntl, hashlib, importlib.util, json, os, re, shutil, subprocess, sys, uuid
+import argparse, base64, contextlib, fcntl, hashlib, importlib.util, json, os, re, shlex, shutil, subprocess, sys, uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -88,10 +88,17 @@ _LAUNCH_ROOT_IDENTITY_CACHE = {}
 _LAUNCH_CONTENT_DIGEST_CACHE = {}
 _LAUNCH_SOURCE_REVISION_CACHE = {}
 _RUNTIME_ACTIVATION = None
-_RUNTIME_ROOT_HINT = (
-    "hint: run the INSTALLED utility -- python3 \"$AGENT_HOME/utilities/<tool>.py\" -- "
-    "or export AGENT_HOME=<this checkout> to make this checkout the active runtime"
-)
+def runtime_root_hint(route=None):
+    sealed = (route or {}).get("launch_compatibility_tuple") or {}
+    runtime = sealed.get("runtime_root") or {}
+    expected = runtime.get("path") or str(
+        Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local/share"))) / "hearting/current"
+    )
+    return (
+        f"hint: use the sealed runtime root: AGENT_HOME={shlex.quote(expected)} "
+        f"python3 {shlex.quote(str(Path(expected) / 'utilities/<tool>.py'))}; "
+        "a runtime projection such as ~/.claude is not the managed release root"
+    )
 # Only dispatch-depth-2 nodes receive a checked `fallback_hops` chain, so they are
 # the sole consumers of `dispatch_evidence.tuples`.
 EVIDENCE_CONSUMER_DISPATCH_DEPTH = 2
@@ -5050,7 +5057,7 @@ def _emit_compiled_route(a,route,artifact_root,output=None):
         expected=launch_tuple.get("registry_root")
         observed=launch_tuple.get("runtime_root")
         print("route_file_written=0 registered=0 started=0 child_spawned=0",file=sys.stderr)
-        print(_RUNTIME_ROOT_HINT,file=sys.stderr)
+        print(runtime_root_hint(),file=sys.stderr)
         raise ValueError(
             "launch-runtime-root-mismatch "
             f"expected={canonical(expected).decode()} observed={canonical(observed).decode()}"
@@ -5302,7 +5309,7 @@ def main():
                 "route_file_written=0 predecessor_attempts=0 registered=0 "
                 "started=0 child_spawned=0",file=sys.stderr,
             )
-            print(_RUNTIME_ROOT_HINT,file=sys.stderr)
+            print(runtime_root_hint(),file=sys.stderr)
             raise ValueError("launch-runtime-root-mismatch")
         output_path=Path(a.output) if a.output else canonical_route_path(
             artifact,route["route_id"]
@@ -5365,7 +5372,7 @@ def main():
                         f"phase={a.launch_phase} mismatch={name}:"
                         f"expected={canonical(mismatch.get('expected',mismatch)).decode()}:"
                         f"actual={canonical(mismatch.get('actual',mismatch)).decode()}"
-                        " | " + _RUNTIME_ROOT_HINT,
+                        " | " + runtime_root_hint(route),
                         file=sys.stderr,
                     )
                     print("registered=0 started=0 child_spawned=0",file=sys.stderr)

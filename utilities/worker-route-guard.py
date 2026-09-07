@@ -204,7 +204,8 @@ def validate_route_contract(route_path: str | Path, node_id: str, cwd: str | Pat
         if not compatible:
             raise _fail(
                 "launch-runtime-root-mismatch",
-                json.dumps({"phase": launch_phase, "mismatches": mismatches}, sort_keys=True),
+                json.dumps({"phase": launch_phase, "mismatches": mismatches,
+                            "recovery": ROUTE.runtime_root_hint(route)}, sort_keys=True),
                 rid,
             )
     actual_cwd = Path(cwd)
