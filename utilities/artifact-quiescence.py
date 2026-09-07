@@ -317,6 +317,8 @@ def _attribute_open_item(kind: str, row: dict, target: dict) -> dict:
     if row.get("_attribution_error"):
         raise ValueError(row["_attribution_error"])
     values = row.get("meta", {}) if kind == "dispatch" else row
+    if kind == "dispatch" and not values.get("artifact_root"):
+        raise ValueError("dispatch-artifact-root-required")
     explicit = None
     if values.get("artifact_root"):
         explicit = _root_identity(values["artifact_root"], "row-artifact-root")

@@ -94,6 +94,50 @@ class QuiescenceTest(unittest.TestCase):
             self.assertTrue(value["observation_valid"], value.get("source_diagnostics"))
             self.assertEqual(value["open_dispatch_attempts"], 1)
 
+    def test_dispatch_requires_explicit_root_while_resource_accepts_sealed_route(self):
+        for binding in ("owner", "stage", "quick-owner"):
+            for root_value in (None, ""):
+                with self.subTest(binding=binding, root_value=root_value), tempfile.TemporaryDirectory() as directory:
+                    base = Path(directory); config = self.fixture(base)
+                    external = self.artifact_root(base, "external")
+                    node = "one-shot" if binding == "quick-owner" else "test"
+                    route, path = self.sealed_route(external, node)
+                    if binding == "owner":
+                        metadata = {
+                            "dispatch_depth": "1", "worker_type": "owner", "unit": "_kernel/owner",
+                            "owner_route_file": path, "owner_route_id": route["route_id"],
+                            "owner_route_hash": route["route_hash"],
+                        }
+                    else:
+                        metadata = {"route_file": path, "route_id": route["route_id"],
+                                    "route_hash": route["route_hash"], "route_node": node}
+                        if binding == "quick-owner":
+                            metadata.update(dispatch_depth="1", worker_type="owner", unit="_kernel/owner")
+                    if root_value is not None:
+                        metadata["artifact_root"] = root_value
+                    jobs = Path(config["dispatch_jobs"])
+                    jobs.write_text(self.dispatch_row(slug="route-only", attempt="att-route-only",
+                                                      metadata=metadata))
+                    evidence = base / "dispatch.json"
+                    value = Q.publish(str(evidence), config)
+                    self.assertFalse(value["observation_valid"], value)
+                    self.assertFalse(value["proven"], value)
+                    self.assertEqual(value["unattributable_open_items"], 1)
+                    self.assertEqual(value["pending"], 1)
+                    self.assertIn("dispatch-artifact-root-required", json.dumps(value["sources"]["attribution"]))
+                    self.assertFalse(Q.validate(str(evidence), allow_fixture=True)["proven"])
+
+                    metadata["artifact_root"] = external
+                    jobs.write_text(self.dispatch_row(slug="explicit", attempt="att-explicit",
+                                                      metadata=metadata))
+                    self.assertTrue(Q.publish(str(base / "explicit.json"), config)["proven"])
+                    jobs.write_text("")
+                    self.write_resource_runs(config, base, {"route-only": {
+                        "status": "running", "route": str(path), "node": node}})
+                    resource = Q.publish(str(base / "resource.json"), config)
+                    self.assertTrue(resource["proven"], resource)
+                    self.assertEqual(resource["sources"]["attribution"]["summary"]["external"]["resource"], 1)
+
     def test_review_duplicate_dispatch_identity_is_not_silently_external(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory); config = self.fixture(base)
@@ -315,19 +359,23 @@ class QuiescenceTest(unittest.TestCase):
                     "route_node": "test",
                 },
                 "missing": {
+                    "artifact_root": external,
                     "route_file": external / ".runtime/routes/absent.json",
                     "route_id": route["route_id"], "route_hash": route["route_hash"],
                     "route_node": "test",
                 },
                 "relative": {
+                    "artifact_root": external,
                     "route_file": "relative-route.json", "route_id": route["route_id"],
                     "route_hash": route["route_hash"], "route_node": "test",
                 },
                 "hash-mismatch": {
+                    "artifact_root": external,
                     "route_file": route_path, "route_id": route["route_id"],
                     "route_hash": "sha256:" + "0" * 64, "route_node": "test",
                 },
                 "node-mismatch": {
+                    "artifact_root": external,
                     "route_file": route_path, "route_id": route["route_id"],
                     "route_hash": route["route_hash"], "route_node": "absent-node",
                 },
@@ -346,6 +394,7 @@ class QuiescenceTest(unittest.TestCase):
             route_path.write_text(json.dumps(route), encoding="utf-8")
             Path(config["dispatch_jobs"]).write_text(
                 self.dispatch_row(slug="tampered", attempt="att-tampered", metadata={
+                    "artifact_root": external,
                     "route_file": route_path, "route_id": route["route_id"],
                     "route_hash": route["route_hash"], "route_node": "test",
                 }), encoding="utf-8")
@@ -360,6 +409,7 @@ class QuiescenceTest(unittest.TestCase):
             route, route_path = self.sealed_route(external)
             Path(config["dispatch_jobs"]).write_text(
                 self.dispatch_row(slug="external", attempt="att-external", metadata={
+                    "artifact_root": external,
                     "route_file": route_path, "route_id": route["route_id"],
                     "route_hash": route["route_hash"], "route_node": "test",
                 }), encoding="utf-8")
