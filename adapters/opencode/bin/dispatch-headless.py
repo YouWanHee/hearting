@@ -103,6 +103,13 @@ from model_profile import (  # noqa: E402
     resolve_runtime_profile,
     validate_registered_profile,
 )
+from execution_access import (  # noqa: E402
+    AccessContext,
+    ExecutionAccessError,
+    adapter_default_roots,
+    bind_request as bind_execution_access_request,
+    receipt_fragment as execution_access_receipt_fragment,
+)
 INTENSITY_LEVELS = {"direct", "quick", "standard", "strong", "thorough", "adversarial"}
 QA_LEVELS = {"quick", "light", "standard", "thorough", "adversarial"}
 # Verification rigor is derived from intensity — CONVENTIONS §1.1 mapping table (SoT).
@@ -251,6 +258,7 @@ def parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--prompt-file")
     p.add_argument("--prompt-text")
+    p.add_argument("--execution-access-file")
     p.add_argument("--jobs")
     p.add_argument("--attempt-id")
     p.add_argument("--broker-request-id")
@@ -517,7 +525,11 @@ def qa_track(capability: str) -> str:
     return "general"
 
 
-def scoped_external_directory_config(artifact_root: str, report_bundle_root: str | None = None) -> str:
+def scoped_external_directory_config(
+    artifact_root: str,
+    report_bundle_root: str | None = None,
+    execution_access_roots: tuple[Path, ...] = (),
+) -> str:
     raw = os.environ.get("OPENCODE_CONFIG_CONTENT", "").strip()
     try:
         config = json.loads(raw) if raw else {}
@@ -554,9 +566,10 @@ def scoped_external_directory_config(artifact_root: str, report_bundle_root: str
     else:
         raise ValueError("OpenCode external_directory permission must be a string or object")
 
-    for root in (artifact_root, report_bundle_root):
+    for root in (artifact_root, report_bundle_root, *execution_access_roots):
         if not root:
             continue
+        root = str(root)
         for pattern in (root, f"{root}/**"):
             rules.pop(pattern, None)
             rules[pattern] = "allow"
@@ -787,6 +800,9 @@ def append_job(jobs: Path, args: argparse.Namespace) -> bool:
     if args.worker_role:
         pipe += f",worker_role={args.worker_role}"
     pipe += f",worker_type={args.worker_type},runtime_sandbox=adapter-default"
+    pipe += execution_access_receipt_fragment(
+        getattr(args, "execution_access_grant", None)
+    )
     for key, value in sorted(args.launch_lifecycle_resolution.metadata().items()):
         pipe += f",{key}={value}"
     pipe += f",assigned_contract={args.assigned_contract}"
@@ -1492,6 +1508,39 @@ def main(argv: list[str]) -> int:
             )
         except DispatchContractError as exc:
             return fail(exc.reason, 65, detail=exc.detail, child_spawned="0")
+    try:
+        args.execution_access_grant = bind_execution_access_request(
+            args.execution_access_file,
+            environ=os.environ,
+            context=AccessContext.build(
+                worktree=args.worktree,
+                artifact_root=args.artifact_root,
+                dispatch_state_root=dispatch_state_root(args.jobs_path),
+                agent_home=args.agent_home,
+                environ=os.environ,
+            ),
+            is_child=args.dispatch_depth >= 2,
+            parent=None,
+            runtime="opencode",
+            default_writable_roots=adapter_default_roots(args),
+        )
+        if args.execution_access_grant is not None:
+            args.opencode_config_content = scoped_external_directory_config(
+                args.artifact_root,
+                str(args.report_bundle_root)
+                if args.report_bundle_root is not None
+                else None,
+                args.execution_access_grant.additional_writable_roots,
+            )
+    except ExecutionAccessError as exc:
+        return fail(exc.reason, 64, detail=exc.detail, child_spawned="0")
+    except ValueError as exc:
+        return fail(
+            "artifact-root-access-config-failed",
+            64,
+            detail=str(exc),
+            child_spawned="0",
+        )
     log_dir = (
         Path(args.log_dir)
         if args.log_dir
