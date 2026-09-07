@@ -10,6 +10,7 @@ does not depend on live auth.
 """
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -19,6 +20,18 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 COMPOSE = ROOT / "utilities" / "compose-route.py"
+
+
+def _cli_env():
+    """Pin the subprocess runtime root to this checkout.
+
+    The compile tail refuses a registry/runtime split (run the installed
+    utility or export AGENT_HOME). Without the pin, any host with an
+    installed harness made both CLI round-trip tests exit 64 with
+    launch-runtime-root-mismatch even though the fixture exercises only this
+    checkout's code.
+    """
+    return {**os.environ, "AGENT_HOME": str(ROOT)}
 
 
 def _load(name, filename):
@@ -82,7 +95,8 @@ class TestComposeRoute(unittest.TestCase):
                 command += ["--slug", slug]
             if output is not None:
                 command += ["--output", output]
-            result = subprocess.run(command, text=True, capture_output=True, check=False)
+            result = subprocess.run(
+                command, text=True, capture_output=True, check=False, env=_cli_env())
             return result
 
     # --- build_recipe: the assembly logic this tool owns ------------------
@@ -292,7 +306,8 @@ class TestComposeRoute(unittest.TestCase):
             ] + extra_args
             if output is not None:
                 command += ["--output", output]
-            return subprocess.run(command, text=True, capture_output=True, check=False)
+            return subprocess.run(
+                command, text=True, capture_output=True, check=False, env=_cli_env())
 
 
 if __name__ == "__main__":
