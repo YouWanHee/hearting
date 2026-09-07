@@ -120,8 +120,14 @@ mark_read() {
     marker_name="${sid}__${key}__${slug_key}"
   fi
 
-  mkdir -p "$AGENT_HOME/.spec-grounding"
-  printf '%s\n' "$mtime" > "$AGENT_HOME/.spec-grounding/${marker_name}"
+  if ! mkdir -p "$AGENT_HOME/.spec-grounding"; then
+    echo "spec-read-marker: marker-write-failed (directory creation)" >&2
+    return 1
+  fi
+  if ! printf '%s\n' "$mtime" > "$AGENT_HOME/.spec-grounding/${marker_name}"; then
+    echo "spec-read-marker: marker-write-failed (read not recorded)" >&2
+    return 1
+  fi
 }
 
 if [ "$#" -gt 0 ]; then
@@ -157,7 +163,7 @@ if [ "$#" -gt 0 ]; then
   done
   [ -n "$fp" ] || { echo "spec-read-marker: --file is required" >&2; exit 64; }
   mark_read "$fp" "$sid"
-  exit 0
+  exit $?
 fi
 
 input=$(cat 2>/dev/null)
@@ -167,5 +173,7 @@ fp=$(printf '%s' "$input" | grep -o '"file_path"[[:space:]]*:[[:space:]]*"[^"]*"
 sid=$(printf '%s' "$input" | grep -o '"session_id"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"session_id"[[:space:]]*:[[:space:]]*"//; s/"$//')
 [ -z "$sid" ] && sid="nosession"
 
-mark_read "$fp" "$sid"
+# PostToolUse must not block the completed read. mark_read diagnoses failures;
+# only the explicit CLI surface propagates them to its caller.
+mark_read "$fp" "$sid" || :
 exit 0
