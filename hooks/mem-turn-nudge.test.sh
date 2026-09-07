@@ -148,12 +148,13 @@ fi
 
 echo "== T10: packaged root without legacy memory uses the XDG persistent store =="
 packaged_root="$TMP/packaged-root"
+packaged_home="$TMP/packaged-home"
 xdg_data="$TMP/xdg-data"
 packaged_sid="packaged-root-nudge"
-mkdir -p "$packaged_root" "$xdg_data"
+mkdir -p "$packaged_root" "$packaged_home" "$xdg_data"
 printf '{"hook_event_name":"UserPromptSubmit","session_id":"%s","prompt":"x"}' "$packaged_sid" \
-  | env -u MEM_STORE AGENT_HOME="$packaged_root" XDG_DATA_HOME="$xdg_data" \
-      MEM_NUDGE_INTERVAL=100 bash "$HOOK" >/dev/null
+  | env -u MEM_STORE -u CLAUDE_HOME HOME="$packaged_home" AGENT_HOME="$packaged_root" \
+      XDG_DATA_HOME="$xdg_data" MEM_NUDGE_INTERVAL=100 bash "$HOOK" >/dev/null
 if [ -f "$xdg_data/hearting/memory/.turn-state-$packaged_sid" ] \
   && [ ! -e "$packaged_root/memory" ]; then
   ok "T10: immutable packaged root stays clean; counter uses XDG memory"
@@ -163,11 +164,12 @@ fi
 
 echo "== T11: packaged distill dispatcher uses the XDG persistent store =="
 distill_root="$TMP/packaged-distill-root"
+distill_home="$TMP/packaged-distill-home"
 distill_xdg="$TMP/distill-xdg"
-mkdir -p "$distill_root" "$distill_xdg"
+mkdir -p "$distill_root" "$distill_home" "$distill_xdg"
 printf '{"session_id":"packaged-distill","cwd":"%s"}' "$TMP" \
-  | env -u MEM_STORE AGENT_HOME="$distill_root" XDG_DATA_HOME="$distill_xdg" \
-      MEM_DISTILL_ENABLE=1 bash "$DISPATCH" >/dev/null
+  | env -u MEM_STORE -u CLAUDE_HOME HOME="$distill_home" AGENT_HOME="$distill_root" \
+      XDG_DATA_HOME="$distill_xdg" MEM_DISTILL_ENABLE=1 bash "$DISPATCH" >/dev/null
 if [ -d "$distill_xdg/hearting/memory" ] && [ ! -e "$distill_root/memory" ]; then
   ok "T11: packaged distill root stays clean; state uses XDG memory"
 else

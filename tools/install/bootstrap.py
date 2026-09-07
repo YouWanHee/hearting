@@ -6,6 +6,7 @@
 The helpers remain usable independently of installer command wiring.
 """
 
+import importlib.util
 import json
 import os
 import subprocess
@@ -15,27 +16,45 @@ import paths
 import safe_fs
 
 
+def _load_store_resolver():
+    """Dynamically import the installed source's shared resolver.
+
+    Loaded from ``paths.resolve_source(...)`` rather than a plain top-level
+    import so this proves the resolver ships with the installed source tree,
+    not merely with whatever ``sys.path`` happens to contain.
+    """
+    resolver_path = paths.resolve_source("tools/memory/store_resolve.py")
+    spec = importlib.util.spec_from_file_location(
+        "_bootstrap_store_resolve", resolver_path
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def restore_memory(mem_store=None):
     """Restore ``memory.db`` from ``dump.jsonl`` when the database is absent.
 
-    Args:
-        mem_store: Store directory. If omitted, use ``MEM_STORE``, an existing
-            legacy `paths.agent_home() / "memory"`, and then the local XDG data
-            store.
+    Truth table: a non-empty ``mem_store`` argument wins verbatim over
+    environment and defaults (including a non-empty but nonexistent path, to
+    preserve first-install import behavior). A ``None`` or empty argument
+    delegates to the shared store resolver, where a non-empty ``MEM_STORE``
+    wins and an empty ``MEM_STORE`` is treated as unset. An empty
+    argument/environment value is never turned into ``Path("")`` or allowed to
+    resolve to the current directory. A resolver conflict or error is reported
+    as skipped before any subprocess, dump probe, or directory creation.
 
     Returns:
         dict — {"action": "skipped"|"imported"|"failed", "detail": str}
     """
-    if mem_store is None:
-        mem_store = os.environ.get("MEM_STORE")
-    if mem_store is None:
-        legacy = paths.agent_home() / "memory"
-        if legacy.exists() or legacy.is_symlink():
-            mem_store = legacy
-        else:
-            data_home = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
-            mem_store = data_home / "hearting" / "memory"
-    mem_store = Path(mem_store)
+    if mem_store:
+        mem_store = Path(mem_store)
+    else:
+        resolver = _load_store_resolver()
+        try:
+            mem_store = resolver.resolve_store()
+        except resolver.StoreResolutionError as exc:
+            return {"action": "skipped", "detail": str(exc)}
 
     db_path = mem_store / "memory.db"
     dump_path = mem_store / "dump.jsonl"

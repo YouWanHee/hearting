@@ -33,7 +33,13 @@ EVENT="${EVENT:-}"; SID="${SID:-default}"
 [ "$EVENT" = "UserPromptSubmit" ] || exit 0
 
 N="${MEM_NUDGE_INTERVAL:-10}"
-STORE=$(sh "$HOOK_DIR/../utilities/memory-store.sh")
+# Fail open on a store conflict/error (core/MEMORY.md 7.0 R4): the explicit
+# if/else keeps the resolver's stderr diagnostic intact and stops `set -e`
+# from turning a safe conflict into a hook failure.
+if ! STORE=$(sh "$HOOK_DIR/../utilities/memory-store.sh"); then
+  echo "mem-turn-nudge: skipping (memory store resolution failed)" >&2
+  exit 0
+fi
 DB="$STORE/memory.db"
 STATE="$STORE/.turn-state-$SID"
 

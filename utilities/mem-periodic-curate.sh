@@ -48,7 +48,13 @@ if [ "${AGENT_SESSION_ROLE:-}" = "worker" ] \
   exit 0
 fi
 
-STORE=$(sh "$HOOK_DIR/../utilities/memory-store.sh")
+# Fail open on a store conflict/error (core/MEMORY.md 7.0 R4): the explicit
+# if/else keeps the resolver's stderr diagnostic intact and stops `set -e`
+# from turning a safe conflict into a hook failure.
+if ! STORE=$(sh "$HOOK_DIR/../utilities/memory-store.sh"); then
+  echo "mem-periodic-curate: skipping (memory store resolution failed)" >&2
+  exit 0
+fi
 PROJECTS_ROOT="${MEM_PROJECTS:-$HOME/.claude/projects}"
 
 case "${MEM_PERIODIC_CURATE_MAX_PROJECTS:-8}" in

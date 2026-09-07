@@ -71,7 +71,14 @@ fi
 # Opt-in gate: remain a no-op until explicitly enabled (see R1 above).
 [ "${MEM_DISTILL_ENABLE:-}" = "1" ] || exit 0
 
-STORE=$(sh "$HOOK_DIR/../utilities/memory-store.sh")
+# Fail open on a store conflict/error (core/MEMORY.md 7.0 R4), before
+# markers, locks, transcript reads, or worker work. The explicit if/else
+# keeps the resolver's stderr diagnostic intact and stops `set -e` from
+# turning a safe conflict into a hook failure.
+if ! STORE=$(sh "$HOOK_DIR/../utilities/memory-store.sh"); then
+  echo "mem-distill-dispatch: skipping (memory store resolution failed)" >&2
+  exit 0
+fi
 # MEM_PY is a test-only override for a worktree-local mem.py.
 MEM="${MEM_PY:-$AGENT_HOME/tools/memory/mem.py}"
 mkdir -p "$STORE" 2>/dev/null || true

@@ -26,6 +26,28 @@ source.
 | Compatibility projection | `<memory-store>/dump.jsonl` (one ID-sorted record per line) | optionally tracked for old readers | materialized v1-compatible view; never a routine v2 push/fold input and not a complete v2 recovery source |
 | Harness projection | `<agent-home>/projects/<cwd>/memory/` | ignored | compatibility surface for stray auto-memory writes absorbed by `mem sync`; `mem project` can rebuild the projection |
 
+### Store resolution
+
+`STORE` is resolved by `store_resolve.resolve_store()`, a stdlib-only,
+read-only module imported by `mem.py`; `utilities/memory-store.sh` is its
+POSIX-shell realization for every shell consumer (installer, adapter
+preflights, distill workers, hooks). Both implement the same closed R0-R5
+contract from `core/MEMORY.md` Section 7.0: a non-empty `MEM_STORE` wins
+verbatim (R0); otherwise an ordered candidate set spanning `AGENT_HOME`,
+`CLAUDE_HOME`, `$HOME/hearting`, `$HOME/agent_setting`, `$HOME/.claude`, and
+both XDG spellings is probed for an existing `memory.db` (R1-R2); one
+populated candidate is returned by its original spelling (R3); two or more
+distinct populated databases exit 3 with a path-only diagnostic (R4); and
+absent any database, resolution falls back to the first existing candidate
+directory, excluding the release-adjacent `hearting/current/memory`
+compatibility spelling (R5). Resolution never opens the database, moves,
+copies, or imports anything, and never changes a selected store's spelling.
+`tools/memory/store-resolve-parity.test.sh` runs both implementations over
+the full rule matrix and asserts identical stdout/exit/diagnostics; no other
+module may reimplement this resolution independently. `MEM_STORE` never
+relocates write-event telemetry -- see "Write telemetry and diagnostics"
+below.
+
 Keep `memory.db` on a local filesystem. `MEM_SYNC_DIR` may choose another
 absolute private exchange repository, but its real path must remain outside all
 synchronized project trees and the local configuration root. The transport
@@ -265,8 +287,12 @@ and confidence thresholds never substitute for that judgment.
 - Every mutation appends one bounded `write-events.jsonl` entry with
   `ts/action/id/tier/scope/type/actor/sid/cwd/snippet`. Rotation keeps at most the
   recent 500 lines within a 256 KiB bound. This local telemetry is not mirrored.
-- Journal precedence is `MEM_WRITE_EVENTS`, then a path beside an overridden
-  `MEM_STORE`, then `$XDG_STATE_HOME/agent-memory/write-events.jsonl`.
+- Journal precedence is closed and two-level: a non-empty `MEM_WRITE_EVENTS`
+  wins verbatim, otherwise `$XDG_STATE_HOME/agent-memory/write-events.jsonl`
+  (fallback `~/.local/state`). `MEM_STORE` has no telemetry effect -- a
+  database-location override never implicitly relocates the journal, so an
+  isolated test must set `MEM_WRITE_EVENTS` (or an isolated `XDG_STATE_HOME`)
+  explicitly rather than relying on `MEM_STORE` alone.
 - Telemetry is fail-open; a logging failure never blocks a mutation. Graveyard
   recovery remains fail-closed because it protects destructive actions.
 - Actor precedence is explicit `MEM_ACTOR`, distiller context, operation-specific

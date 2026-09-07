@@ -3,6 +3,7 @@
 
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -16,6 +17,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bootstrap  # noqa: E402
 import installer  # noqa: E402
 import distribution  # noqa: E402
+
+_REAL_RESOLVER = (
+    Path(__file__).resolve().parent.parent / "memory" / "store_resolve.py"
+)
 
 
 class LauncherMigrationTest(unittest.TestCase):
@@ -165,6 +170,135 @@ class InstallerCollisionExitTest(unittest.TestCase):
             result = installer.cmd_install(args)
         self.assertEqual(result["exit"], installer.EXIT_FAIL)
         self.assertFalse(result["checks"][-1]["ok"])
+
+
+class RestoreMemoryTest(unittest.TestCase):
+    """Synthetic-only: never touches a live store. See core/MEMORY.md 7.0."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.home = self.root / "home"
+        self.home.mkdir(parents=True)
+        # Fixture "installed source" tree: proves restore_memory loads the
+        # resolver through paths.resolve_source (the installed copy), not
+        # merely whatever happens to be importable on sys.path.
+        self.fixture_source = self.root / "fixture-source"
+        fixture_resolver = self.fixture_source / "tools/memory/store_resolve.py"
+        fixture_resolver.parent.mkdir(parents=True)
+        shutil.copyfile(_REAL_RESOLVER, fixture_resolver)
+        fixture_mem = self.fixture_source / "tools/memory/mem.py"
+        fixture_mem.write_text(
+            "#!/usr/bin/env python3\nimport sys\nsys.exit(1)\n", encoding="utf-8"
+        )
+
+        self.env_patch = mock.patch.dict(os.environ, {}, clear=True)
+        self.env_patch.start()
+        self.addCleanup(self.env_patch.stop)
+        os.environ["HOME"] = str(self.home)
+
+        self.resolve_patch = mock.patch.object(
+            bootstrap.paths,
+            "resolve_source",
+            side_effect=lambda relpath: self.fixture_source / relpath,
+        )
+        self.resolve_patch.start()
+        self.addCleanup(self.resolve_patch.stop)
+
+    def _populate(self, path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+
+    def test_non_empty_explicit_argument_wins_verbatim(self):
+        explicit = self.root / "explicit-store"
+        result = bootstrap.restore_memory(mem_store=str(explicit))
+        self.assertEqual(result["action"], "skipped")
+        self.assertIn("no dump.jsonl", result["detail"])
+        self.assertFalse(explicit.exists())
+
+    def test_explicit_nonexistent_argument_retains_first_install_import(self):
+        explicit = self.root / "fresh-install-store"
+        explicit.mkdir()
+        self._populate(explicit / "dump.jsonl")
+        with mock.patch.object(
+            bootstrap.subprocess, "run",
+            return_value=SimpleNamespace(returncode=0, stdout="", stderr=""),
+        ) as run:
+            result = bootstrap.restore_memory(mem_store=str(explicit))
+        self.assertEqual(result["action"], "imported")
+        run.assert_called_once()
+
+    def test_none_argument_delegates_to_resolver_populated_compat_recovery(self):
+        # Bundle AGENT_HOME/memory and XDG memory dir both exist but empty;
+        # the populated ~/.claude/memory compatibility store must still win.
+        (self.home / "bundle" / "memory").mkdir(parents=True)
+        os.environ["AGENT_HOME"] = str(self.home / "bundle")
+        legacy = self.home / ".claude" / "memory"
+        self._populate(legacy / "memory.db")
+        result = bootstrap.restore_memory(mem_store=None)
+        self.assertEqual(result["action"], "skipped")
+        self.assertIn("memory.db already present", result["detail"])
+
+    def test_empty_string_argument_delegates_like_none(self):
+        legacy = self.home / ".claude" / "memory"
+        self._populate(legacy / "memory.db")
+        result = bootstrap.restore_memory(mem_store="")
+        self.assertEqual(result["action"], "skipped")
+        self.assertIn("memory.db already present", result["detail"])
+
+    def test_empty_environment_mem_store_is_unset_not_current_directory(self):
+        os.environ["MEM_STORE"] = ""
+        cwd_sentinel = Path.cwd() / "memory.db"
+        self.assertFalse(cwd_sentinel.exists())
+        result = bootstrap.restore_memory(mem_store=None)
+        # No database anywhere -> falls to XDG default; must never inspect '.'
+        self.assertEqual(result["action"], "skipped")
+        self.assertFalse(cwd_sentinel.exists())
+
+    def test_empty_argument_plus_non_empty_environment_uses_environment(self):
+        env_store = self.root / "env-store"
+        self._populate(env_store / "dump.jsonl")
+        os.environ["MEM_STORE"] = str(env_store)
+        with mock.patch.object(
+            bootstrap.subprocess, "run",
+            return_value=SimpleNamespace(returncode=0, stdout="", stderr=""),
+        ):
+            result = bootstrap.restore_memory(mem_store="")
+        self.assertEqual(result["action"], "imported")
+
+    def test_xdg_selection_when_no_compat_directory_exists(self):
+        xdg = self.root / "xdg-data"
+        os.environ["XDG_DATA_HOME"] = str(xdg)
+        self._populate(xdg / "hearting" / "memory" / "dump.jsonl")
+        with mock.patch.object(
+            bootstrap.subprocess, "run",
+            return_value=SimpleNamespace(returncode=0, stdout="", stderr=""),
+        ):
+            result = bootstrap.restore_memory(mem_store=None)
+        self.assertEqual(result["action"], "imported")
+
+    def test_distinct_database_conflict_skips_before_any_side_effect(self):
+        self._populate(self.home / ".claude" / "memory" / "memory.db")
+        self._populate(self.home / "hearting" / "memory" / "memory.db")
+        with mock.patch.object(bootstrap.subprocess, "run") as run:
+            result = bootstrap.restore_memory(mem_store=None)
+        self.assertEqual(result["action"], "skipped")
+        self.assertIn("memory store resolution error", result["detail"])
+        run.assert_not_called()
+        # No target directory was created and no dump was probed/imported.
+        self.assertFalse((self.home / "hearting" / "current").exists())
+
+    def test_dump_only_first_install_behavior(self):
+        legacy = self.home / ".claude" / "memory"
+        self._populate(legacy / "dump.jsonl")
+        with mock.patch.object(
+            bootstrap.subprocess, "run",
+            return_value=SimpleNamespace(returncode=0, stdout="", stderr=""),
+        ) as run:
+            result = bootstrap.restore_memory(mem_store=None)
+        self.assertEqual(result["action"], "imported")
+        run.assert_called_once()
 
 
 if __name__ == "__main__":
