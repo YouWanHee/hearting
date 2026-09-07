@@ -3030,7 +3030,10 @@ def _abort_fenced_launch(
 def _parent_liveness_evidence(
     jobs: Path, metadata: dict[str, str]
 ) -> tuple[bool, str, AuthoritativeProcessIdentity | None]:
-    process = attempt_process_quiescence(metadata)
+    # Parent authority belongs to the governed process or its exact supervisor
+    # lease. A tagged descendant (including this guard) is neither that process
+    # nor evidence against the namespace-only lease fallback (SD-OPEN-61).
+    process = attempt_governed_process_quiescence(metadata)
     if process.state == "live" and process.identity is not None:
         return True, "process", process.identity
     if (
