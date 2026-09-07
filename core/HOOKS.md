@@ -94,6 +94,22 @@ writer that cannot persist the field must not claim.
 
 ## Adapter Rule
 
+### Native SessionEnd completion bridge
+
+The portable SessionEnd contract permits a deadline-limited bridge: it first
+excludes D-42 workers, clears independent route state on a bounded best-effort
+basis, and starts a finite detached memory-completion runner with stdin/stdout/
+stderr detached. The runner invokes the adapter's existing session-end command
+unchanged. Receipts contain only typed lifecycle evidence (including a stable
+hashed key and process identity); runner exit is distinct from extraction or
+memory-apply success. A bridge must keep native hook stdout empty and must not
+create an unbounded daemon or record conversation/error payloads.
+Deduplication distinguishes repeated completion of one transcript generation
+from a resumed session with new input. A newer generation blocked by an active
+lease remains deferred with its transcript delta intact; it is never reported
+as completed by the older runner. Missing generation evidence is a typed
+fallback, not permission to invent a timestamp or assume new input.
+
 Adapters may reuse scripts directly only when they can supply the expected input
 payload and consume the expected output decision. Otherwise, the invariant must
 be wrapped or reimplemented behind an adapter-native event bridge.

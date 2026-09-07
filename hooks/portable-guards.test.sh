@@ -30,10 +30,48 @@ ok() { PASS=$((PASS+1)); printf '  ok  %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  BAD %s\n' "$1"; }
 
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+# SessionEnd now outlives its foreground bridge. Join only this suite's
+# isolated receipts before deleting fixtures, including on assertion failure.
+cleanup() {
+  result=$?
+  python3 - "$ROOT" "$TMP/session-completion" <<'PY'
+import json, os, pathlib, signal, sys, time
+sys.path.insert(0, str(pathlib.Path(sys.argv[1]) / 'utilities'))
+from memory_session_completion import identity_alive
+root = pathlib.Path(sys.argv[2])
+deadline = time.monotonic() + 15
+while True:
+    pending = []
+    for path in root.glob('*.json'):
+        value = json.loads(path.read_text())
+        if value.get('state') == 'started':
+            pending.append(value)
+    if not pending:
+        break
+    if time.monotonic() >= deadline:
+        for value in pending:
+            for key in ('command', 'runner'):
+                ident = value.get(key)
+                if ident and identity_alive(ident):
+                    try:
+                        os.killpg(ident['pid'], signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+        raise SystemExit('isolated SessionEnd completion exceeded cleanup deadline')
+    time.sleep(0.05)
+PY
+  [ "$?" -eq 0 ] || result=1
+  rm -rf "$TMP"
+  exit "$result"
+}
+trap cleanup EXIT
 export AGENT_HOME="$TMP/agent_home"
 export AGENT_MODEL_GOVERNOR_ROOT="$TMP/repo/.agent_reports/.runtime/model-worker-governor"
 export MEM_RECALL_RECEIPTS="$TMP/recall-opportunities"
+export MEM_SESSION_COMPLETION_RECEIPTS="$TMP/session-completion"
+export MEM_WRITE_EVENTS="$TMP/write-events.jsonl"
+export MEM_RECALL_EVENTS="$TMP/recall-events.jsonl"
+export XDG_STATE_HOME="$TMP/xdg-state"
 
 recall_opportunity() {
   fixture_cwd=$1
@@ -51,7 +89,7 @@ unset CLAUDE_CODE_SESSION_ID CODEX_SESSION_ID \
   AGENT_ARTIFACT_ROOT AGENT_ROUTE_FILE AGENT_ROUTE_ID AGENT_ROUTE_NODE \
   AGENT_OWNER_ROUTE_FILE AGENT_OWNER_ROUTE_ID AGENT_OWNER_ROUTE_HASH \
   CLAUDE_CODE_CHILD_SESSION OPENCODE_DISPATCH_SLUG FLEET_TITLE_REFRESH \
-  MEM_DISTILL MEM_DISTILL_ENABLE CODEX_DISPATCH_SANDBOX_FORCE
+  MEM_DISTILL MEM_DISTILL_ENABLE MEM_SESSION_COMPLETION CODEX_DISPATCH_SANDBOX_FORCE
 DISPATCH_RESOLVER_HOME="$TMP/dispatch-resolver-home"
 DISPATCH_RESOLVER_XDG="$TMP/dispatch-resolver-xdg"
 DISPATCH_RESOLVER_STATE="$(readlink -f "$DISPATCH_RESOLVER_HOME")/.local/state/hearting/dispatch"
@@ -5453,6 +5491,17 @@ if [ -z "$d1d2" ]; then
   ok "no d1/d2 depth text tokens in tools/fleet/render.py"
 else
   bad "found d1/d2 depth text tokens in tools/fleet/render.py [$d1d2]"
+fi
+
+# SessionEnd completion bridge conformance: the native hook keeps worker
+# exclusion and empty stdout while the portable runner owns detached work.
+if grep -q 'memory_session_completion' "$ROOT/adapters/codex/hooks/sessionend-lifecycle.py" \
+  && grep -q 'start_new_session=True' "$ROOT/utilities/memory_session_completion.py" \
+  && grep -q 'stdout=subprocess.DEVNULL' "$ROOT/utilities/memory_session_completion.py" \
+  && grep -q 'MEM_SESSION_COMPLETION' "$ROOT/utilities/memory_session_completion.py"; then
+  ok "SessionEnd uses the bounded detached completion bridge"
+else
+  bad "SessionEnd completion bridge conformance is incomplete"
 fi
 
 printf 'PASS=%s FAIL=%s\n' "$PASS" "$FAIL"
