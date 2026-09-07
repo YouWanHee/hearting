@@ -434,6 +434,14 @@ python3 utilities/capability-route.py close --route <route.json> [--commit <sha>
 python3 utilities/capability-route.py status --artifact-root <dir> --open-only
 ```
 
+For producer-backed work, the terminal sequence is **complete → close → finalize
+→ admit-shared** (admission only for shared kinds). Complete the terminal node
+using its verified cycle-local artifact as evidence, then close the route. Only
+then finalize the cycle so its manifest binds the terminal evidence, and admit
+the sealed output. Owner briefs must spell out this order; admission is not a
+prerequisite for the terminal marker. `--allow-open-route` is not a repair for an
+out-of-order completion sequence.
+
 `close` writes an outcome sidecar beside the immutable route record — the record
 itself cannot carry the closure, because `route_hash` covers every other field.
 `status --open-only` then answers "what was started and never finished" directly.

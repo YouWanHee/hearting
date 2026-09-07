@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import select
 import signal
 import shutil
 import subprocess
@@ -59,7 +60,10 @@ INHERITED_DISPATCH_KEYS = (
 
 def base_environ() -> dict:
     """os.environ minus any inherited dispatch/route identity."""
-    return {k: v for k, v in os.environ.items() if k not in INHERITED_DISPATCH_KEYS}
+    return {k: v for k, v in os.environ.items()
+            if k not in INHERITED_DISPATCH_KEYS and not k.startswith(
+                ("AGENT_ARTIFACT_", "AGENT_PRODUCER_", "AGENT_ROUTE_",
+                 "AGENT_OWNER_ROUTE_", "AGENT_DISPATCH_", "REPORT_BUNDLE_"))}
 
 
 # Fake harness executables. Both print the harness's real terminal envelope
@@ -317,6 +321,86 @@ def build_package_root(base: Path) -> Path:
         if src.is_file():
             shutil.copy2(src, package_root / rel)
     return package_root
+
+
+# SD-OPEN-61 needs two real process tables: this supervisor holds the lease
+# outside bwrap and launches its tagged guard inside. No model CLI is involved.
+SD61_HOST_SUPERVISOR = """
+import fcntl, json, os, subprocess, sys
+from pathlib import Path
+
+lease = Path(sys.argv[1]).open("w+")
+lease.write(sys.argv[2])
+lease.flush()
+fcntl.flock(lease.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+stat = Path("/proc/self/stat").read_text()
+print(json.dumps({"pid": os.getpid(), "pid_start": stat[stat.rfind(")") + 2:].split()[19],
+                  "pid_ns": os.readlink("/proc/self/ns/pid")}), flush=True)
+for line in sys.stdin:
+    command = json.loads(line)
+    if command["action"] == "release":
+        fcntl.flock(lease.fileno(), fcntl.LOCK_UN)
+        print(json.dumps({"released": True}), flush=True)
+    elif command["action"] == "probe":
+        result = subprocess.run(command["argv"], text=True, capture_output=True,
+            env={**os.environ, "AGENT_DISPATCH_ATTEMPT_ID": command["attempt"]}, timeout=15)
+        print(json.dumps({"code": result.returncode, "stdout": result.stdout,
+                          "stderr": result.stderr}), flush=True)
+    elif command["action"] == "exit":
+        break
+lease.close()
+"""
+
+SD61_INNER_GUARD = """
+import fcntl, json, os, sys
+from pathlib import Path
+
+contract_root = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(contract_root / "utilities"))
+import dispatch_contract as D
+assert Path(D.__file__).resolve() == contract_root / "utilities/dispatch_contract.py"
+jobs = Path(sys.argv[2])
+fields = jobs.read_text().strip().split("\\t")
+metadata = D.parse_registry_metadata(fields[5])
+attempt = metadata["attempt_id"]
+assert os.environ["AGENT_DISPATCH_ATTEMPT_ID"] == attempt
+inner_ns = D.process_namespace_identity()
+assert inner_ns != metadata["pid_observer_ns"]
+host_pid_visible = (Path("/proc") / metadata["pid"]).exists()
+assert not host_pid_visible
+governed = D.attempt_governed_process_quiescence(metadata)
+assert (governed.state, governed.reason) == ("unverifiable", "process-namespace-unverifiable")
+descendants = D.attempt_tagged_descendants(metadata)
+assert descendants.state == "populated"
+assert os.getpid() in [member[0] for member in descendants.members]
+aggregate = D.attempt_process_quiescence(metadata)
+assert (aggregate.state, aggregate.reason) == ("live", "attempt-descendant-live")
+with Path(metadata["supervisor_lease_file"]).open("r+") as lease:
+    try:
+        fcntl.flock(lease.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raw_lease_locked = True
+    else:
+        raw_lease_locked = False
+        fcntl.flock(lease.fileno(), fcntl.LOCK_UN)
+result = {"module": str(Path(D.__file__).resolve()), "outer_pid": int(metadata["pid"]),
+          "inner_pid": os.getpid(), "outer_namespace": metadata["pid_observer_ns"],
+          "inner_namespace": inner_ns, "host_pid_visible": host_pid_visible,
+          "recorded_pid_scope": metadata["pid_scope"], "recorded_pgid": metadata["pgid"],
+          "governed_reason": governed.reason, "descendants": descendants.state,
+          "tagged_self": True, "raw_lease_locked": raw_lease_locked,
+          "exact_lease_held": D.supervisor_lease_is_held(jobs, metadata)}
+try:
+    binding = D.resolve_live_parent_attempt(jobs, parent_slug=fields[4], repo=fields[2],
+        worktree=fields[3], expected_attempt_id=attempt)
+except D.DispatchContractError as exc:
+    result.update(resolved=False, reason=exc.reason, detail=str(exc))
+else:
+    result.update(resolved=True, source=binding.liveness_source,
+                  observed_pid=binding.observed_pid,
+                  revalidated=D.parent_attempt_binding_is_live(jobs, binding))
+print(json.dumps(result, sort_keys=True))
+"""
 
 
 class NamespaceE2E(unittest.TestCase):
@@ -607,6 +691,10 @@ class NamespaceE2E(unittest.TestCase):
                 "execution_surface=registered-headless,registered_worker=1,"
                 f"fallback_hop=same-harness-headless,worker_type=owner,harness={harness},"
                 f"runtime_sandbox={config['parent_sandbox']},attempt_id=att-parent-pidns,"
+                f"parent_sid=pidns-fixture,owner_route_id={route['route_id']},"
+                # A fixture-only depth-0 recipient on the supported human-gate
+                # carrier; independent of the mock child's harness below.
+                "parent_completion_delivery=claude-parent-runtime,"
                 f"pid={parent.pid},pid_start={parent_start}\n",
                 encoding="utf-8",
             )
@@ -677,6 +765,24 @@ class NamespaceE2E(unittest.TestCase):
                 "XDG_STATE_HOME": str(base / "state"),
             }
             env.pop("PYTHONPATH", None)
+
+            # The real launch fence must reject an entry gate that has never
+            # been raised. Prepare it through the supervisor, not a forged
+            # release sidecar, before testing the live namespace lifecycle.
+            refused = self.run_packaged(package_root, wrapper_path, argv, env)
+            self.assertEqual(refused["code"], 65, refused)
+            self.assertIn("reason=human-gate-not-raised", refused["wrapper_output"])
+            self.assertIn("child_spawned=0", refused["wrapper_output"])
+            gate_artifact = artifact_root / "frame-review.md"
+            gate_artifact.write_text("PID namespace fixture review\n", encoding="utf-8")
+            for action in ("--block", "--release"):
+                gate = subprocess.run(
+                    [sys.executable, str(package_root / "utilities" / "workflow-supervisor.py"),
+                     "gate", "--route", str(route_path), "--gate", "frame-review",
+                     "--jobs", str(jobs), "--artifact", str(gate_artifact), action],
+                    env=fixture_env, text=True, capture_output=True,
+                )
+                self.assertEqual(gate.returncode, 0, gate.stdout + gate.stderr)
 
             sentinel = Path(env["FAKE_SENTINEL"])
             fake_pid_file = Path(env["FAKE_PID_FILE"])
@@ -868,6 +974,127 @@ class NamespaceE2E(unittest.TestCase):
             self.assertEqual(classifier["pid_reuse_with_populated_descendant"], "working", classifier)
             self.assertEqual(classifier["real_empty_scan"], "empty", classifier)
             self.assertEqual(classifier["real_foreign_scan"], "unverifiable", classifier)
+
+    def test_sd61_real_outer_supervisor_lease_survives_tagged_inner_guard(self) -> None:
+        bwrap = shutil.which("bwrap")
+        if not bwrap:
+            if os.environ.get("HEARTING_REQUIRE_PIDNS") == "1":
+                self.fail("bubblewrap is required for the SD-OPEN-61 regression")
+            self.skipTest("bubblewrap is unavailable")
+        # Override only the guard's import root for installed-vs-checkout
+        # reproduction. The loaded module path is asserted inside the namespace.
+        contract_root = Path(os.environ.get("HEARTING_SD61_CONTRACT_ROOT", ROOT)).resolve()
+        with tempfile.TemporaryDirectory(prefix="sd61-pidns-") as temp_dir:
+            base = Path(temp_dir).resolve()
+            jobs = base / "jobs.log"
+            attempt = "att-" + base.name
+            nonce = os.urandom(32).hex()
+            lease = dispatch_contract.supervisor_lease_path(jobs, attempt)
+            lease.parent.mkdir(parents=True)
+            runner = base / "inner_guard.py"
+            runner.write_text(SD61_INNER_GUARD, encoding="utf-8")
+            namespace = [
+                bwrap, "--die-with-parent", "--unshare-pid",
+                "--ro-bind", "/", "/", "--proc", "/proc", "--dev", "/dev",
+                "--tmpfs", "/tmp", "--bind", str(base), str(base),
+            ]
+            env = {**base_environ(), "TMPDIR": str(base),
+                   "XDG_STATE_HOME": str(base / "state"),
+                   "PYTHONDONTWRITEBYTECODE": "1"}
+            env.pop("PYTHONPATH", None)
+            available = subprocess.run([*namespace, "true"], env=env,
+                                       text=True, capture_output=True, timeout=10)
+            if available.returncode:
+                reason = "bubblewrap PID namespace unavailable: " + available.stderr.strip()
+                if os.environ.get("HEARTING_REQUIRE_PIDNS") == "1":
+                    self.fail(reason)
+                self.skipTest(reason)
+            payload = (f"kind={dispatch_contract.SUPERVISOR_LEASE_KIND}\n"
+                       f"attempt_id={attempt}\nnonce={nonce}\n")
+            host = subprocess.Popen(
+                [sys.executable, "-c", SD61_HOST_SUPERVISOR, str(lease), payload],
+                env=env, text=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, start_new_session=True,
+            )
+
+            def receive() -> dict:
+                ready, _, _ = select.select([host.stdout], [], [], 20)
+                self.assertTrue(ready, "host supervisor did not answer within 20 seconds")
+                line = host.stdout.readline()
+                self.assertTrue(line, f"host supervisor exited={host.poll()}")
+                return json.loads(line)
+
+            def send(command: dict) -> None:
+                host.stdin.write(json.dumps(command) + "\n")
+                host.stdin.flush()
+
+            try:
+                identity = receive()
+                self.assertEqual(identity["pid"], host.pid)
+                self.assertEqual(os.getpgid(host.pid), host.pid)
+                self.assertEqual(identity["pid_start"], dispatch_contract.process_start_ticks(host.pid))
+                self.assertEqual(identity["pid_ns"], dispatch_contract.process_namespace_identity())
+                metadata = {
+                    "attempt_schema_version": "2", "dispatch_depth": "1",
+                    "transport": "headless", "execution_surface": "registered-headless",
+                    "registered_worker": "1", "worker_type": "owner",
+                    "fallback_hop": "same-harness-headless", "attempt_id": attempt,
+                    "capability": "autopilot-code", "intensity": "standard", "harness": "codex",
+                    "runtime_sandbox": "workspace-write", "completion_delivery": "app-server-supervised",
+                    "pid": str(host.pid), "pid_start": identity["pid_start"], "pgid": str(host.pid),
+                    "pid_scope": "host-visible", "pid_ns": identity["pid_ns"],
+                    "pid_observer_ns": identity["pid_ns"],
+                    "supervisor_lease": dispatch_contract.SUPERVISOR_LEASE_KIND,
+                    "supervisor_lease_file": str(lease), "supervisor_lease_nonce": nonce,
+                }
+
+                def write_row() -> None:
+                    jobs.write_text(
+                        f"2026-09-07T00:00:00Z\topen\t{base}\t{base}\towner\t"
+                        + ",".join(f"{key}={value}" for key, value in metadata.items()) + "\n",
+                        encoding="utf-8",
+                    )
+
+                write_row()
+                self.assertTrue(dispatch_contract.supervisor_lease_is_held(jobs, metadata))
+                for case in ("held", "nonce-mismatch", "released"):
+                    with self.subTest(case=case):
+                        metadata["supervisor_lease_nonce"] = (
+                            "0" * 64 if case == "nonce-mismatch" else nonce
+                        )
+                        write_row()
+                        if case == "released":
+                            send({"action": "release"})
+                            self.assertEqual(receive(), {"released": True})
+                        send({"action": "probe", "attempt": attempt,
+                              "argv": [*namespace, sys.executable, str(runner),
+                                       str(contract_root), str(jobs)]})
+                        response = receive()
+                        self.assertEqual(response["code"], 0, response)
+                        result = json.loads(response["stdout"])
+                        # The real outer parent is still alive after its inner
+                        # guard exited, even when /proc inside cannot see it.
+                        self.assertIsNone(host.poll())
+                        self.assertTrue(dispatch_contract.process_identity_is_live(
+                            host.pid, identity["pid_start"]))
+                        result.update(case=case, outer_parent_alive=True, inner_exit=response["code"])
+                        print("SD61_PIDNS_OBSERVATION:" + json.dumps(result, sort_keys=True), flush=True)
+                        self.assertEqual(result["raw_lease_locked"], case != "released", result)
+                        self.assertEqual(result["exact_lease_held"], case == "held", result)
+                        self.assertEqual(result["resolved"], case == "held", result)
+                        if case == "held":
+                            self.assertEqual(result["source"], "supervisor-lease", result)
+                            self.assertIsNone(result["observed_pid"], result)
+                            self.assertTrue(result["revalidated"], result)
+                        else:
+                            self.assertEqual(result["reason"], "parent-attempt-not-live", result)
+                send({"action": "exit"})
+                stdout, stderr = host.communicate(timeout=5)
+                self.assertEqual(host.returncode, 0, stdout + stderr)
+            finally:
+                if host.poll() is None:
+                    host.terminate()
+                host.communicate(timeout=5)
 
     def test_codex_pass_receipt_marker_and_join_are_ordered(self) -> None:
         self._run_harness("codex")

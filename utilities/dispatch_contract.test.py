@@ -844,7 +844,15 @@ class DispatchContractTest(unittest.TestCase):
    self.assertEqual(caught.exception.reason,"parent-attempt-not-live")
 
  def test_supervised_lease_is_live_only_when_exact_held_and_pid_namespace_unverifiable(self):
-  with tempfile.TemporaryDirectory() as td:
+  for descendants in (D.ProcessGroupObservation("empty"),
+                      D.ProcessGroupObservation("populated",((901,"1"),)),
+                      D.ProcessGroupObservation("unverifiable",reason="foreign")):
+   with self.subTest(descendants=descendants.state):
+    self._check_supervised_lease_with_descendants(descendants)
+
+ def _check_supervised_lease_with_descendants(self,descendants):
+  with tempfile.TemporaryDirectory() as td, \
+       mock.patch.object(D,"attempt_tagged_descendants",return_value=descendants):
    base=Path(td);jobs=base/"jobs.log";attempt="att-parent-lease"
    parent=subprocess.Popen(["sleep","60"])
    lease=D.supervisor_lease_path(jobs,attempt)
@@ -868,6 +876,7 @@ class DispatchContractTest(unittest.TestCase):
      binding=D.resolve_live_parent_attempt(
       jobs,parent_slug="owner",repo="/repo",worktree="/wt",
       expected_attempt_id=attempt)
+     self.assertTrue(D.parent_attempt_binding_is_live(jobs,binding))
     self.assertEqual(binding.liveness_source,"supervisor-lease")
     self.assertIsNone(binding.observed_pid)
     self.assertTrue(D.parent_attempt_binding_is_live(jobs,binding))
@@ -939,8 +948,38 @@ class DispatchContractTest(unittest.TestCase):
        jobs,parent_slug="owner",repo="/repo",worktree="/wt",
        expected_attempt_id=attempt)
     self.assertEqual(caught.exception.reason,"parent-attempt-not-live")
+    # SD-OPEN-61: neither a dead/reused leader nor tagged survivors can make
+    # an exact held lease authoritative outside the namespace-only fallback.
+    for observation in (("present","different","S"),("missing",None,None)):
+     with self.subTest(observation=observation), \
+          mock.patch.object(D,"_proc_observation",return_value=observation), \
+          mock.patch.object(D,"attempt_tagged_descendants",return_value=
+                            D.ProcessGroupObservation("populated",((901,"1"),))):
+      with self.assertRaises(D.DispatchContractError) as rejected:
+       D.resolve_live_parent_attempt(
+        jobs,parent_slug="owner",repo="/repo",worktree="/wt",
+        expected_attempt_id=attempt)
+      self.assertEqual(rejected.exception.reason,"parent-attempt-not-live")
    finally:
     fcntl.flock(holder.fileno(),fcntl.LOCK_UN);holder.close()
+
+ def test_parent_refusal_reports_process_reason_and_observer_namespaces(self):
+  with tempfile.TemporaryDirectory() as td:
+   jobs=Path(td)/"jobs.log"
+   jobs.write_text(self.owner_row("att-parent-diagnostic",437,"20",extra=
+    ",pid_observer_ns=pid:[outer],pid_ns=pid:[outer]")+"\n")
+   for reason in ("local-pid-reused","process-namespace-unverifiable"):
+    with self.subTest(reason=reason), \
+         mock.patch.object(D,"_parent_liveness_evidence",return_value=(False,reason,None)), \
+         mock.patch.object(D,"process_namespace_identity",return_value="pid:[inner]"):
+     with self.assertRaises(D.DispatchContractError) as caught:
+      D.resolve_live_parent_attempt(jobs,parent_slug="owner",repo="/repo",worktree="/wt",
+       expected_attempt_id="att-parent-diagnostic")
+     self.assertEqual(caught.exception.reason,"parent-attempt-not-live")
+     detail=json.loads(caught.exception.detail)
+     self.assertEqual(detail,{"attempt_id":"att-parent-diagnostic","liveness_reason":reason,
+      "pid":"437","pid_start":"20","recorded_observer_ns":"pid:[outer]",
+      "observer_ns":"pid:[inner]"})
 
  def test_supervisor_lease_file_is_preserved_for_recovery_exception(self):
   with tempfile.TemporaryDirectory() as td:

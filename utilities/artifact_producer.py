@@ -1288,7 +1288,11 @@ def build_manifest(
     }
     closed = route_is_closed(root, route)
     if not closed and not allow_open_route:
-        raise ProducerError("route-not-closed", route["route_id"])
+        raise ProducerError(
+            "route-not-closed",
+            f"{route['route_id']}: required order: complete -> close -> finalize -> admit-shared; "
+            "complete the terminal node using verified cycle-local evidence, then close the route",
+        )
     # D-6: a `completed` cycle must bind a route.terminal.recorded event, which
     # only exists once the route is closed.  Sealing an open route therefore
     # records a provisional `active` cycle (lineage committed, completion not

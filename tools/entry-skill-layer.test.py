@@ -44,7 +44,16 @@ for bootstrap in (
     "adapters/opencode/AGENTS.md",
 ):
     text = (ROOT / bootstrap).read_text(encoding="utf-8")
-    assert "is the primary route" in text and "`direct` sets intensity, not routing" in text
+    routing = " ".join(text.split("Route by `core/WORKFLOW.md §0.2`", 1)[1].split())
+    compose = re.search(r"`(?:utilities/capability-route.py|preflight.sh) compose`", routing)
+    assert compose is not None, f"{bootstrap} lost the compose route surface"
+    shape_choice = routing[:compose.start()]
+    assert "§0.2.1" in shape_choice and "shape" in shape_choice, (
+        f"{bootstrap} must choose the work shape before the compose route"
+    )
+    assert all(f"`{shape}`" in shape_choice for shape in ("direct", "solo", "staged")), (
+        f"{bootstrap} must route direct, solo, and staged work through compose"
+    )
 
 
 def anchor(value: str) -> str:

@@ -90,7 +90,8 @@ def main(argv: list[str] | None = None) -> int:
         if not compatible:
             raise ValueError(
                 "launch-runtime-root-mismatch "
-                + json.dumps({"phase": args.launch_phase, "mismatches": mismatches}, sort_keys=True)
+                + json.dumps({"phase": args.launch_phase, "mismatches": mismatches,
+                              "recovery": ROUTE.runtime_root_hint(route)}, sort_keys=True)
             )
     # Detached fences must clear the short-lived launcher's PDEATHSIG before
     # committing launch_started; if the launcher disappears after this point,
