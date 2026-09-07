@@ -36,6 +36,7 @@ MAX_RESPONSE_BYTES = 16 * 1024
 MAX_RECEIPT_BYTES = 2048
 ALLOWED_REASONS = {
     "registry-closed",
+    "registry-closed-marker",  # SD-OPEN-47 (H7-c): marker-proved done row
     "terminal-observed",
     "row-advanced",
     "terminal-failure-or-unclosed",
@@ -205,7 +206,7 @@ def normalize_receipt(
             or child.get("readiness") != "ready"
             or reason not in ALLOWED_REASONS
             or required_action not in REQUIRED_ACTIONS
-            or (reason == "registry-closed" and status != "done")
+            or (reason in {"registry-closed", "registry-closed-marker"} and status != "done")
             or (reason == "terminal-observed" and status not in OPEN_STATES)
             or (
                 required_action == "complete-open"

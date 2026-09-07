@@ -52,6 +52,27 @@ class ProgressTest(unittest.TestCase):
                       watchdog_max_windows=2, apply=False)
         values.update(kw); return type("Args", (), values)()
 
+    def test_sd_open_38_launch_seed_behind_a_later_heartbeat_is_a_floor_not_a_regression(self):
+        """#9 root cause (cairn W15a/W15b, six stages): the wrapper seeds `launch`
+        at spawn, the worker heartbeats past it, then the launcher's own seed
+        `--phase launch` failed `progress-phase-regression` and that exit was
+        reported as `progress-watchdog-fail-closed`."""
+        P.heartbeat(self.args(phase="analysis", kind="tool", evidence="reading"), 5)
+        with self.assertRaises(D.DispatchContractError) as caught:
+            P.heartbeat(self.args(), 6)
+        self.assertEqual(caught.exception.reason, "progress-phase-regression")
+        kept = P.heartbeat(self.args(if_absent=True), 6)
+        self.assertEqual((kept["phase"], kept["evidence"]), ("analysis", "reading"))
+        # first seed on an empty state still writes launch
+        heartbeat_path = P.state_paths(D.dispatch_state_root(self.jobs), self.attempt)[0]
+        heartbeat_path.unlink()
+        seeded = P.heartbeat(self.args(if_absent=True), 7)
+        self.assertEqual(seeded["phase"], "launch")
+        code = P.main(["dispatch-progress.py", "heartbeat", "--attempt-id", self.attempt,
+                       "--route-id", "rt-1", "--route-node", "test", "--jobs", str(self.jobs),
+                       "--phase", "launch", "--kind", "registry", "--evidence", "x", "--if-absent"])
+        self.assertEqual(code, 0)
+
     def test_warning_then_exact_interrupt(self):
         P.heartbeat(self.args(), 0)
         first = P.watchdog(self.args(), 10)

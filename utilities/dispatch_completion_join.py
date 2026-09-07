@@ -29,6 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
 from dispatch_contract import (  # noqa: E402
     SUBSESSION_NOTE,
+    _marker_bound_prepare_marker_proof,
     SUCCESS_NOTES,
     DispatchContractError,
     ProcessQuiescence,
@@ -2819,6 +2820,22 @@ def _join_snapshot(
             if row.status == "done":
                 if observed.state == "terminal":
                     readiness, reason = "ready", "registry-closed"
+                elif (
+                    observed.process_reason == "attempt-descendant-live"
+                    and _marker_bound_prepare_marker_proof(
+                        row.metadata, row.attempt_id
+                    ) is not None
+                ):
+                    # SD-OPEN-47 (H7-c): the exact leader is gone and the row
+                    # is live only through tagged residue (a background shell,
+                    # a detached wait), while the completion marker chain
+                    # already proves this attempt finished. That residue must
+                    # not hold the owner in `runtime_wait: registered-children`
+                    # until the join times out and reparks forever. A live
+                    # exact leader (`*-pid-live`) or a missing post-exit
+                    # receipt keeps the SD-79/80/89 gate as before (review
+                    # finding 3).
+                    readiness, reason = "ready", "registry-closed-marker"
                 else:
                     readiness = "pending"
                     reason = (

@@ -2437,7 +2437,8 @@ def classify_validation_basis(route, *, registry_digest_now, units_digest_now,
             "verdict": "skew",
             "message": (
                 f"{skew_reason}(compiled={sealed_digest}@{sealed_root}, "
-                f"validator={own_digest}@{own_root})"
+                f"validator={own_digest}@{own_root}); re-run via the tooling "
+                f"under {sealed_root} (the root that created the row)"
             ),
         }
     verdict, message = "current", None
@@ -4710,22 +4711,28 @@ def _git_committed_files(worktree, ancestor, head):
 SUBDIVISION_BASELINE_SCHEMA_VERSION = 1
 
 
-def subdivision_baseline_path(route_id, node_id, manifest_sha256):
+def subdivision_baseline_path(route_id, node_id, manifest_sha256, *, jobs=None):
     """Keyed by the manifest hash so a resumed admission finds its own baseline.
 
     Kept in its own subdirectory: the completion directory's own filenames are
     read back by `<node_id>.*.json` globs, and a sibling file matching that
     shape would be counted as marker history by any reader less careful than
     `_next_marker_sequence`.
+
+    `jobs` pins the state root to the registry the caller already holds
+    (SD-OPEN-49 / H8): without it the path fell back to the inherited
+    `AGENT_DISPATCH_JOBS` or the per-user default, so a `dispatch-batch --jobs
+    <fixture>` run wrote 220 `rt-fixture` baselines into the live
+    `~/.local/state/hearting/dispatch/completion/`.
     """
     return (
-        completion_dir(route_id)
+        completion_dir(route_id, jobs=jobs)
         / "subdivision"
         / f"{node_id}.{str(manifest_sha256)[:32]}.json"
     )
 
 
-def record_subdivision_baseline(route, node_id, manifest):
+def record_subdivision_baseline(route, node_id, manifest, *, jobs=None):
     """Snapshot the worktree at subdivision admission (anchor M3 / AC 30).
 
     The post-hoc diff-scope audit is a statement about what the SLICES changed,
@@ -4745,7 +4752,7 @@ def record_subdivision_baseline(route, node_id, manifest):
     """
     digest = manifest["_manifest_sha256"]
     worktree = Path(manifest["worktree"])
-    path = subdivision_baseline_path(route["route_id"], node_id, digest)
+    path = subdivision_baseline_path(route["route_id"], node_id, digest, jobs=jobs)
     identity = {
         "schema_version": SUBDIVISION_BASELINE_SCHEMA_VERSION,
         "route_id": route["route_id"],
@@ -4786,7 +4793,7 @@ def record_subdivision_baseline(route, node_id, manifest):
     return record
 
 
-def load_subdivision_baseline(route, node_id, manifest):
+def load_subdivision_baseline(route, node_id, manifest, *, jobs=None):
     """Resume the admission-time baseline by manifest hash; None when absent.
 
     Read across every dispatch state root, the same order completion markers use.
@@ -4796,10 +4803,10 @@ def load_subdivision_baseline(route, node_id, manifest):
     permanent `subdivision-baseline-missing`. The writer still uses one root.
     """
     digest = manifest["_manifest_sha256"]
-    canonical = subdivision_baseline_path(route["route_id"], node_id, digest)
+    canonical = subdivision_baseline_path(route["route_id"], node_id, digest, jobs=jobs)
     candidates = [canonical] + [
         root / "completion" / route["route_id"] / "subdivision" / canonical.name
-        for root in dispatch_state_roots(resolve_agent_home())
+        for root in dispatch_state_roots(resolve_agent_home(), jobs)
     ]
     path = next((item for item in candidates if item.is_file()), canonical)
     try:
@@ -4870,7 +4877,7 @@ def complete_subsession_stage(route, node, node_id, evidence, manifest_path, job
     # attribution at all, so its absence fails closed rather than silently
     # widening the audit back to the whole worktree.
     worktree = Path(manifest["worktree"])
-    baseline = load_subdivision_baseline(route, node_id, manifest)
+    baseline = load_subdivision_baseline(route, node_id, manifest, jobs=jobs)
     digest = manifest["_manifest_sha256"]
     attempt_id = "att-stage-" + digest[:32]
     metadata = {

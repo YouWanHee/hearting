@@ -419,8 +419,11 @@ def release_launch(payload: object) -> Launch | None:
     registry names that route's one open depth-1 owner bound to this session,
     and the new hook process waits on it exactly as the start did. A failed
     release (no JSON payload naming the route -- review round 1, M1: the
-    `--route` literal is deliberately NOT a fallback, because every refused
-    release names one too), a route with no started open owner (the owner
+    `--route` literal is never a fallback for the route id; the one refusal
+    that still arms, SD-OPEN-48 (#13), is the supervisor's typed
+    `refusal=gate-not-blocked` line -- the gate was already released and the
+    owner is running towards a completion that still owes this session a
+    wake), a route with no started open owner (the owner
     ended at the gate -- contract (c); or a row that was registered and
     refused at start), or an ambiguous set of owner rows arms nothing and
     says so once (`release_no_arm_notice`); the SD-111 sweep still delivers
@@ -444,6 +447,7 @@ def release_launch(payload: object) -> Launch | None:
         return None
     stdout = _stdout(payload.get("tool_response"))
     route_id: str | None = None
+    armed = "release"
     for line in reversed(stdout.splitlines()):
         line = line.strip()
         if not line.startswith("{"):
@@ -455,6 +459,20 @@ def release_launch(payload: object) -> Launch | None:
         if isinstance(rendered, dict) and rendered.get("gate") == gate:
             value = rendered.get("route_id")
             route_id = value if isinstance(value, str) and value else None
+            if rendered.get("refusal") == GATE_NOT_BLOCKED_REFUSAL:
+                # SD-OPEN-48 (#13): the supervisor refused this release as
+                # already released (on 2026-09-07 by the headless owner itself,
+                # cairn W15b rt-bf75754935faf8de) and the owner is RUNNING
+                # towards its completion. That completion still owes this
+                # session a wake, and the start-armed hook already spent its
+                # one wake on the gate, so arming nothing here is exactly the
+                # lost wake SD-111 exists to prevent. The route id comes from
+                # the supervisor's typed refusal line, never from the prose
+                # and never from the `--route` literal; every other refusal
+                # prints no JSON and arms nothing.
+                armed = "release-refused"
+            elif rendered.get("refusal"):
+                route_id = None
         break
     if not isinstance(route_id, str) or not route_id:
         return None
@@ -489,14 +507,42 @@ def release_launch(payload: object) -> Launch | None:
     ]
     if len(candidates) != 1:
         return None
-    return Launch(attempt_id=candidates[0], jobs=jobs, session_id=session, armed="release")
+    return Launch(attempt_id=candidates[0], jobs=jobs, session_id=session, armed=armed)
+
+
+# One definition, shared with `workflow-supervisor.py`'s refusal line: the
+# supervisor prints `{"gate", "route_id", "refusal": "gate-not-blocked", ...}`
+# on stdout before its prose refusal (review finding 13).
+GATE_NOT_BLOCKED_REFUSAL = "gate-not-blocked"
+
+
+def _refused_release_route_id(payload: dict) -> str | None:
+    """The `route_id` of a release the supervisor refused as already released
+    (typed `refusal=gate-not-blocked` line), else None."""
+
+    stdout = _stdout(payload.get("tool_response"))
+    for line in reversed(stdout.splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            rendered = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(rendered, dict) and rendered.get("refusal") == GATE_NOT_BLOCKED_REFUSAL:
+            value = rendered.get("route_id")
+            return value if isinstance(value, str) and value else None
+        return None
+    return None
 
 
 def release_no_arm_notice(payload: object) -> int:
     """One typed exit-0 notice when a proven release armed nothing (review round
     1, M2): the session was told the release re-arms the wait, so a silent
     non-arm would be the lost wake SD-111 exists to prevent. A refused release
-    (no JSON payload) stays silent -- its own stderr already told the story."""
+    (no JSON payload) stays silent -- its own stderr already told the story --
+    except one refused as already released (SD-OPEN-48), whose typed refusal
+    line names the route and so was expected to arm."""
 
     if not isinstance(payload, dict):
         return 0
@@ -505,6 +551,19 @@ def release_no_arm_notice(payload: object) -> int:
     if not isinstance(command, str) or _release_command(command) is None:
         return 0
     stdout = _stdout(payload.get("tool_response"))
+    if _refused_release_route_id(payload) is not None:
+        # SD-OPEN-48 (#13): refused as already released, but no single started
+        # open owner of that route is bound to this session -- say so once.
+        message = (
+            "[dispatch-owner-rewake] schema=2 state=not-armed surface=release-refused — this gate "
+            "was already released (workflow not blocked), and no single started open depth-1 owner "
+            "of that route is bound to this session, so the owner's completion will not wake this "
+            "session from this command. If the owner is still running, its completion arrives "
+            "through the UserPromptSubmit sweep at your next prompt. Do not start Monitor, "
+            "dispatch-wait, or a polling loop."
+        )
+        print(json.dumps({"systemMessage": message}, ensure_ascii=False, separators=(",", ":")))
+        return 0
     if not any(line.strip().startswith("{") and '"route_id"' in line for line in stdout.splitlines()):
         return 0
     message = (

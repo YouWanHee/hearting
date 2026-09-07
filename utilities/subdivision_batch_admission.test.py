@@ -116,6 +116,31 @@ class AdmissionGateTest(AdmissionFixture):
         self.assertEqual(len(result.sessions), 2)
         self.assertEqual(recorded, [("execute", result.manifest_digest)])
 
+    def test_sd_open_53_default_baseline_follows_the_admission_jobs(self):
+        """SD-OPEN-53 (v77 review c1): the default `record_baseline` inside
+        `admit_batch` wrote to the inherited/default state root while the audit
+        read the caller's `jobs` root."""
+        import os
+        from unittest import mock
+        pinned = self.base / "pinned" / "jobs.log"
+        inherited = self.base / "inherited" / "jobs.log"
+        for path in (pinned, inherited):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(inherited)}):
+            result = SUBDIV.admit_batch(
+                route=self.route, node=self.node, manifest_path=self._manifest(2),
+                governor=Path("governor"), governor_root=Path("governor-root"),
+                reserve=lambda *a, **k: ["a" * 32, "b" * 32], jobs=pinned,
+            )
+            baseline = SUBDIV.ROUTE_MODULE.subdivision_baseline_path(
+                self.route["route_id"], "execute", result.manifest_digest, jobs=pinned)
+            self.assertTrue(baseline.is_file())
+            self.assertEqual(baseline.parent.parent.parent, pinned.parent / "completion")
+            self.assertFalse((inherited.parent / "completion").exists())
+            self.assertIsNotNone(SUBDIV.ROUTE_MODULE.load_subdivision_baseline(
+                self.route, "execute", result.manifest, jobs=pinned))
+
     def test_dispatch_batch_parallel_group_path_unused(self):
         # A-1: the whole point is that `parallel_nodes` (2..4-member cardinality)
         # is never reached for a node with zero route-leg membership. F-3

@@ -17,6 +17,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[3]
 PREFLIGHT = ROOT / "adapters" / "opencode" / "bin" / "preflight.sh"
@@ -37,6 +38,8 @@ class OpenCodeComposeBindTest(unittest.TestCase):
         (self.repo / "app.py").write_text("print('one')\n", encoding="utf-8")
         subprocess.run(["git", "-C", str(self.repo), "add", "."], check=True)
         subprocess.run(["git", "-C", str(self.repo), "commit", "-qm", "initial"], check=True)
+        self.artifact_root = self.repo / ".agent_reports"
+        self.artifact_root.mkdir()
         self.markers: list[Path] = []
         self.addCleanup(self._unlink_markers)
 
@@ -49,12 +52,38 @@ class OpenCodeComposeBindTest(unittest.TestCase):
         self.markers.append(GUARD.marker_path(ROOT, session))
         return session
 
-    def _run(self, *args: str, session: str | None) -> subprocess.CompletedProcess[str]:
-        env = {**os.environ, "AGENT_HOME": str(ROOT)}
+    def _env(self, session: str | None) -> dict[str, str]:
+        """A hermetic child environment (SD-OPEN-49 / H8).
+
+        This suite ran inside a registered test worker on 2026-09-07, whose
+        environment carried the real hearting `AGENT_ARTIFACT_ROOT` (and the
+        producer cycle, route, and dispatch variables). `compose` honours an
+        absolute `AGENT_ARTIFACT_ROOT` over `--cwd` by design (linked
+        worktrees write the primary checkout's root), so three fixture routes
+        (oc-nocwd/oc-noout/oc-nosid, cwd `/tmp/*/repo`) landed in the live
+        `.agent_reports/.runtime/routes/`. Unsetting is not isolation either
+        -- it selects the production default -- so the root is pinned to the
+        fixture repo explicitly.
+        """
+        env = {
+            key: value for key, value in os.environ.items()
+            if not key.startswith(("AGENT_ARTIFACT_", "AGENT_DISPATCH_", "AGENT_ROUTE_",
+                                   "AGENT_OWNER_ROUTE_", "AGENT_PRODUCER_", "REPORT_BUNDLE_"))
+        }
+        env["AGENT_HOME"] = str(ROOT)
+        env["AGENT_ARTIFACT_ROOT"] = str(self.artifact_root)
         env.pop("OPENCODE_SESSION_ID", None)
         if session:
             env["OPENCODE_SESSION_ID"] = session
-        return subprocess.run([str(PREFLIGHT), *args], text=True, capture_output=True, env=env)
+        return env
+
+    def _assert_isolated(self, route: dict) -> None:
+        self.assertEqual(Path(route["artifact_root"]).resolve(), self.artifact_root.resolve(),
+                         "fixture route escaped the isolated artifact root")
+
+    def _run(self, *args: str, session: str | None) -> subprocess.CompletedProcess[str]:
+        return subprocess.run([str(PREFLIGHT), *args], text=True, capture_output=True,
+                              env=self._env(session))
 
     def _marker(self, session: str) -> dict | None:
         path = GUARD.marker_path(ROOT, session)
@@ -66,6 +95,7 @@ class OpenCodeComposeBindTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         route = json.loads(result.stdout.strip().splitlines()[-1])
         self.assertEqual(route["selection"]["route_origin"], "compose")
+        self._assert_isolated(route)
         canonical = Path(route["artifact_root"]) / ".runtime" / "routes" / f"{route['route_id']}.json"
         self.assertTrue(canonical.is_file())
         marker = self._marker(session)
@@ -78,11 +108,11 @@ class OpenCodeComposeBindTest(unittest.TestCase):
 
     def test_compose_without_cwd_uses_the_sealed_cwd(self) -> None:
         session = self._session("nocwd")
-        env = {**os.environ, "AGENT_HOME": str(ROOT), "OPENCODE_SESSION_ID": session}
         result = subprocess.run([str(PREFLIGHT), "compose", "--slug", "oc-nocwd"], text=True,
-                                capture_output=True, env=env, cwd=str(self.repo))
+                                capture_output=True, env=self._env(session), cwd=str(self.repo))
         self.assertEqual(result.returncode, 0, result.stderr)
         route = json.loads(result.stdout.strip().splitlines()[-1])
+        self._assert_isolated(route)
         marker = self._marker(session)
         self.assertIsNotNone(marker)
         self.assertEqual(marker["route_id"], route["route_id"])
@@ -114,7 +144,25 @@ class OpenCodeComposeBindTest(unittest.TestCase):
         result = self._run("compose", "--slug", "oc-nosid", "--cwd", str(self.repo), session=None)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIsNone(self._marker(session))
-        self.assertTrue(json.loads(result.stdout.strip().splitlines()[-1])["route_id"].startswith("rt-"))
+        route = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertTrue(route["route_id"].startswith("rt-"))
+        self._assert_isolated(route)
+
+    def test_sd_open_49_an_inherited_live_artifact_root_never_receives_fixture_routes(self) -> None:
+        """H8: with the caller's AGENT_ARTIFACT_ROOT pointing at a foreign root
+        (as a registered worker's environment does), the suite must still
+        compose into the fixture repo."""
+        foreign = Path(self.tmp.name) / "foreign-root" / ".agent_reports"
+        foreign.mkdir(parents=True)
+        session = self._session("inherited")
+        with mock.patch.dict(os.environ, {"AGENT_ARTIFACT_ROOT": str(foreign),
+                                          "AGENT_DISPATCH_ATTEMPT_ID": "att-fixture-worker"}):
+            result = self._run("compose", "--slug", "oc-inherited", "--cwd", str(self.repo), session=session)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        route = json.loads(result.stdout.strip().splitlines()[-1])
+        self._assert_isolated(route)
+        self.assertFalse(list((foreign / ".runtime" / "routes").glob("*.json")) if (foreign / ".runtime" / "routes").is_dir() else [],
+                         "fixture route leaked into the inherited root")
 
 
 if __name__ == "__main__":

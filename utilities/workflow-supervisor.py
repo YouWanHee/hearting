@@ -539,10 +539,12 @@ def cmd_gate(args):
         if args.release:
             state = ledger.state()["workflow_state"]
             if state != "BLOCKED_HUMAN_GATE":
-                raise SupervisorError(f"workflow is {state}, not blocked on a human gate")
+                refuse_gate_not_blocked(route, args.gate, state)
             actor_kind = release_actor_kind()
             released_by = resolved_released_by(actor_kind, args.by)
-            if WS.human_gate_resolution(ledger.journal(), args.gate)["interview"]:
+            resolution = WS.human_gate_resolution(ledger.journal(), args.gate)
+            assert_release_authority(actor_kind, resolution, gates[args.gate], args.gate)
+            if resolution["interview"]:
                 # The legacy surface has no --answers, and an interview gate
                 # released without them is the guess the interview replaces
                 # (review round 1, M3).
@@ -622,6 +624,8 @@ def cmd_gate(args):
                 if interview.get("route_id") != route["route_id"]:
                     raise SupervisorError(
                         f"interview-route-mismatch: {interview.get('route_id')!r} is not this route")
+            release_authority = gate_release_authority_at_raise(
+                gates[args.gate], interview, args.artifact)
             record_path, created = create_gate_delivery(
                 route, args.gate, args.artifact, jobs_path, epoch,
             )
@@ -637,7 +641,8 @@ def cmd_gate(args):
                                                     "artifact": str(args.artifact),
                                                     "interview": interview is not None,
                                                     "questions": len(interview.get("questions") or [])
-                                                    if interview is not None else 0},
+                                                    if interview is not None else 0,
+                                                    "release_authority": release_authority},
                                           actor="gate")
             except BaseException:
                 if created:
@@ -646,6 +651,7 @@ def cmd_gate(args):
             payload.update({"delivery": str(record_path), "delivery_created": created,
                             "interview": interview is not None,
                             "questions": len(interview.get("questions") or []) if interview is not None else 0,
+                            "release_authority": release_authority,
                             "await_command": await_release_command(args.route, args.gate)})
             action = "blocked"
     payload.update({"action": action, "workflow_state": ledger.state()["workflow_state"]})
@@ -958,6 +964,94 @@ def resolved_released_by(actor_kind, requested):
     return requested or actor_kind
 
 
+RELEASE_AUTHORITIES = ("depth-0", "any")
+GATE_NOT_BLOCKED_REFUSAL = "gate-not-blocked"
+
+
+def refuse_gate_not_blocked(route, gate, state):
+    """One typed JSON line on stdout, then the usual prose refusal.
+
+    SD-OPEN-48 (#13): the depth-0 carrier (`hooks/dispatch-owner-rewake.py`)
+    re-arms its wait on this route's running owner from this line's
+    `route_id` + `refusal` token -- never from the prose, never from the
+    `--route` literal (review finding 13).
+    """
+    print(json.dumps({"gate": gate, "route_id": route["route_id"],
+                      "refusal": GATE_NOT_BLOCKED_REFUSAL, "workflow_state": state},
+                     sort_keys=True))
+    raise SupervisorError(f"workflow is {state}, not blocked on a human gate")
+
+
+def gate_release_authority_at_raise(binding, interview, artifact):
+    """Who may release this raise: sealed into the journal at the raise.
+
+    `depth-0` when the route binding declares it, when the artifact is an
+    interview (its answers are the user's -- SD-129), or when the artifact
+    itself declares `release_authority: depth-0` (the cairn W15b owner wrote
+    exactly that into its own artifact and then released the gate itself,
+    2026-09-06, rt-bf75754935faf8de). Otherwise `any`: the SD-123 (8)(d)
+    allowance for a headless owner to release a plain, non-interview gate
+    rather than die at it after 53 minutes stays as it was.
+    """
+    declared = str((binding or {}).get("release_authority") or "").strip()
+    if declared:
+        if declared not in RELEASE_AUTHORITIES:
+            raise SupervisorError(
+                f"gate-release-authority-invalid: binding declares {declared!r}; "
+                f"expected one of {list(RELEASE_AUTHORITIES)}")
+        return declared
+    if interview is not None:
+        return "depth-0"
+    if artifact_declares_depth0_authority(artifact):
+        return "depth-0"
+    return "any"
+
+
+def artifact_declares_depth0_authority(artifact):
+    """True when a JSON artifact says `release_authority: depth-0` about itself."""
+    if not artifact or artifact == "-":
+        return False
+    path = Path(str(artifact))
+    if not path.is_file() or path.suffix.lower() != ".json":
+        return False
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(value, dict) and str(value.get("release_authority") or "").strip() == "depth-0"
+
+
+def assert_release_authority(actor_kind, resolution, binding, gate):
+    """SD-OPEN-48: a registered headless owner may not release a gate whose
+    raise sealed `release_authority=depth-0`.
+
+    Contract (d) made an owner's release distinguishable; it did not make it
+    acceptable for a gate that exists so a person decides. An interview gate
+    released by its own owner records answers nobody gave, and the plan it
+    unblocks was never confirmed -- and the depth-0 session's later release
+    is then refused (`workflow is RUNNING, not blocked`), which is how the
+    completion wake was lost on 2026-09-07 (#13). Legacy raises that recorded
+    no authority keep the `any` allowance; a binding that declares `depth-0`
+    is honoured even when the raise predates this field.
+    """
+    if actor_kind != "headless-owner":
+        return
+    authority = str((resolution or {}).get("release_authority") or "").strip()
+    if not authority and (resolution or {}).get("interview"):
+        # A raise that predates the field but recorded an interview: the
+        # interview flag is itself sealed at the raise, so this is not a
+        # re-read of the artifact (review finding 4).
+        authority = "depth-0"
+    if not authority:
+        authority = str((binding or {}).get("release_authority") or "any").strip()
+    if authority == "depth-0":
+        raise SupervisorError(
+            f"gate-release-authority-refused: {gate!r} is released by the depth-0 "
+            "session (release_authority=depth-0), not by the registered owner that "
+            "raised it; keep waiting with `await-release` -- the person records the "
+            "decision with `release --decision proceed|revise|stop`")
+
+
 def retire_gate_delivery(route, gate, jobs):
     """Retire the pending gate record once the gate is released.
 
@@ -1135,7 +1229,10 @@ def cmd_release(args):
     with ledger.lock():
         state = ledger.state()["workflow_state"]
         if state != "BLOCKED_HUMAN_GATE":
-            raise SupervisorError(f"workflow is {state}, not blocked on a human gate")
+            refuse_gate_not_blocked(route, args.gate, state)
+        assert_release_authority(
+            actor_kind, WS.human_gate_resolution(ledger.journal(), args.gate),
+            gates[args.gate], args.gate)
         answers = release_answers(ledger, args.gate, args.decision, getattr(args, "answers", None))
         if args.decision == "proceed":
             ledger.set_workflow_state(
@@ -1225,6 +1322,18 @@ def load_interview_artifact(artifact):
     except (OSError, ValueError) as exc:
         raise SupervisorError(f"interview-unreadable: {path}: {exc}") from exc
     if not INTERVIEW.is_interview(value):
+        # SD-OPEN-48 (#12): an artifact that calls itself an interview under
+        # some other schema (`cairn-frame-interview/v1`, 2026-09-07) used to
+        # pass here as "not an interview", so the gate was raised without
+        # answers owed and `validate-answers` later refused every real answer
+        # with `no such question`. Refuse it where the owner can still fix it.
+        foreign = INTERVIEW.foreign_interview_schema(value)
+        if foreign is not None:
+            raise SupervisorError(
+                f"interview-schema-unsupported: {path} declares schema {foreign!r}; the frame "
+                f"gate accepts only {INTERVIEW.SCHEMA!r} (write it with the shape "
+                "`frame_interview.py answers-template` reads, then `frame_interview.py "
+                "validate`), or raise the gate with a plain non-interview artifact")
         return None
     value.setdefault("self_path", str(path))
     return value

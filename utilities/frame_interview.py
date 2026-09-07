@@ -125,6 +125,18 @@ def is_interview(value) -> bool:
     return isinstance(value, dict) and value.get("schema") == SCHEMA
 
 
+def foreign_interview_schema(value) -> str | None:
+    """The schema string of something that calls itself an interview but is not
+    `frame_interview_v1` (e.g. `cairn-frame-interview/v1`), else None. A frame
+    summary or any other artifact with an unrelated schema is not "foreign"."""
+    if not isinstance(value, dict) or is_interview(value):
+        return None
+    schema = value.get("schema")
+    if isinstance(schema, str) and "interview" in schema.lower():
+        return schema
+    return None
+
+
 def question_cap(intensity: str) -> int:
     return QUESTION_CAP.get(str(intensity or "").strip(), QUESTION_CAP["standard"])
 
@@ -265,6 +277,12 @@ def answers_template(interview: dict) -> dict:
 
 def validate_answers(interview: dict, answers: dict) -> list[str]:
     errors: list[str] = []
+    if not is_interview(interview):
+        # SD-OPEN-48 (#12): checked before the per-question walk, which used to
+        # report every real answer as `no such question` against a foreign
+        # interview schema.
+        return [f"interview.schema: expected {SCHEMA!r}, got "
+                f"{(interview or {}).get('schema') if isinstance(interview, dict) else None!r}"]
     if not isinstance(answers, dict) or answers.get("schema") != ANSWERS_SCHEMA:
         return [f"schema: expected {ANSWERS_SCHEMA!r}"]
     if answers.get("route_id") != interview.get("route_id"):
@@ -397,6 +415,12 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     interview = _load(args.interview)
     interview.setdefault("self_path", str(Path(args.interview).resolve()))
+    if args.command != "validate" and not is_interview(interview):
+        # `validate` reports the schema as a reason; the answer-side commands
+        # cannot do anything with a foreign interview, so they refuse typed.
+        raise InterviewError(
+            "interview-schema-unsupported",
+            f"{args.interview}: schema {interview.get('schema')!r}, expected {SCHEMA!r}")
     if args.command == "validate":
         errors = validate(interview, intensity=args.intensity)
         print(json.dumps({"valid": not errors, "errors": errors,

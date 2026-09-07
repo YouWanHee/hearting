@@ -447,11 +447,22 @@ decision, never two independently toggled ones.
   from the `--route` literal, which a refused release names too) and the
   registry's one started open depth-1 owner bound to this session, a new hook
   process waits on the owner's completion exactly as the start did. A refused
-  release arms nothing silently; a recorded release with no started open owner
-  (the owner ended at the gate, or was refused at start) or an ambiguous owner
-  set arms nothing and emits one typed `not-armed surface=release` notice; the
-  `UserPromptSubmit` sweep still delivers the pending record at the next
-  prompt. While waiting, an announced-but-unclaimable gate record never spins
+  release arms nothing silently, with one exception (SD-OPEN-48): a release
+  the supervisor refused as already released prints one typed JSON line
+  (`refusal: gate-not-blocked` with the `route_id`) and that line arms the
+  route's running owner — it is heading for a completion that still owes the
+  session a wake; the prose and the `--route` literal never arm;
+  a recorded release with no started open owner (the owner ended at the gate,
+  or was refused at start) or an ambiguous owner set arms nothing and emits
+  one typed `not-armed surface=release` (or `surface=release-refused`)
+  notice; the `UserPromptSubmit` sweep still delivers the pending record at
+  the next prompt. A raise seals `release_authority` (`depth-0` for an
+  interview gate, a binding that declares it, or an artifact that declares it
+  about itself; `any` otherwise): a registered headless owner's `release` /
+  `gate --release` of a `depth-0` gate is refused typed
+  (`gate-release-authority-refused`), and an artifact that calls itself an
+  interview under another schema is refused at the raise
+  (`interview-schema-unsupported`). While waiting, an announced-but-unclaimable gate record never spins
   the hook: the probe skips records whose reclaim budget is spent (the release
   expires such a record as `receipt-row-superseded`) and sleeps one interval
   after an empty announce, under the same overall deadline; it reads the
