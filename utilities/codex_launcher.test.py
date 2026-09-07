@@ -757,10 +757,7 @@ class LauncherLockReaderTest(unittest.TestCase):
 
             replacement_lock = home / ".harness" / "codex-launcher.lock"
             with mock.patch.object(launcher, "_state", side_effect=racy_state):
-                try:
-                    value = launcher._read_state_locked(home)
-                except launcher.LauncherError:
-                    return
+                value = launcher._read_state_locked(home)
             self.assertEqual(str(genuine), value["real_command"])
             self.assertNotEqual(str(foreign), value["real_command"])
             self.assertEqual(original_lock_identity, (replacement_lock.stat().st_dev, replacement_lock.stat().st_ino))

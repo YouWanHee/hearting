@@ -229,8 +229,8 @@ def _read_state_locked(home: Path) -> dict:
     an installer serializes writers against the successor. Acceptance is
     made to cover the read: identity is re-checked immediately after
     `_state` returns, and any replacement retries the whole
-    acquire-and-read sequence (fresh directory descriptor, fresh lock) within
-    the same bounded `_LOCK_OPEN_RETRIES` budget rather than trusting a read
+    acquire-and-read sequence (same validated directory, fresh lock) within
+    the bounded `_LOCK_OPEN_RETRIES` budget rather than trusting a read
     that raced a live install/repair.
     """
     if home.is_symlink() or not home.is_dir():

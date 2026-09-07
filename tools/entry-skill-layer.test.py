@@ -43,8 +43,16 @@ for bootstrap in (
     "adapters/codex/AGENTS.md",
     "adapters/opencode/AGENTS.md",
 ):
-    text = (ROOT / bootstrap).read_text(encoding="utf-8")
-    assert "is the primary route" in text and "`direct` sets intensity, not routing" in text
+    text = " ".join((ROOT / bootstrap).read_text(encoding="utf-8").split())
+    required = (
+        "core/WORKFLOW.md §0.2", "§0.2.1",
+        "`direct`", "`solo`", "`staged`",
+        "compose", "--graph",
+        "entry's full loop", "promotion signal",
+    )
+    assert all(phrase in text for phrase in required), (
+        f"{bootstrap} lost core-directed shape-before-preset routing"
+    )
 
 
 def anchor(value: str) -> str:
