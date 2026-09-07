@@ -1559,7 +1559,14 @@ def _published_cycle_state(root: Path, record: Mapping[str, Any]) -> str:
     record_state = cached if _valid_cycle_state(cached) else None
     try:
         manifest_path = cycle_dir(root, record["campaign_id"], cycle_id, record) / "manifest.json"
-    except (ProducerError, OSError, KeyError, TypeError):
+    except (ProducerError, artifact_locator.LocatorError, OSError, KeyError, TypeError):
+        # `LocatorError` is caught by name because it is a `ValueError`, not a
+        # `ProducerError`, and `cycle_dir` calls `find_path_by_id` outside its
+        # own try: `scan_index` walks the whole root, so a *different* cycle's
+        # broken `.cycle.json` binding raises here. That says nothing about
+        # the work state of the cycle being judged, so it is the same case as
+        # an absent canonical source -- fall back to the cache, and refuse
+        # with `sealed-cycle-state-unknown` when there is no usable cache.
         manifest_path = None
     if manifest_path is None or not (manifest_path.is_file() or manifest_path.is_symlink()):
         # Canonical source absent is the *only* case that falls back to the

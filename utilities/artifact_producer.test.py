@@ -1683,6 +1683,34 @@ class FinalizeStateConflictTest(ProducerTestBase):
             P.finalize(self.root, cycle_id=cycle_id, state="abandoned", force_abandon_ignoring_lease=True)
         self.assertEqual(caught.exception.code, "finalize-state-conflict")
 
+    def test_unrelated_broken_locator_binding_falls_back_instead_of_leaking(self):
+        # The sealed branch now reaches `cycle_dir`, whose `find_path_by_id`
+        # scans the whole root -- so *another* cycle's broken `.cycle.json`
+        # raises `LocatorError`, which is a `ValueError`, not a
+        # `ProducerError`. An unrelated cycle's damage says nothing about this
+        # cycle's work state, so it is the absent-canonical-source case: fall
+        # back to the record cache and keep judging.
+        self.activate()
+        route, route_file, result = self.begin()
+        self.write_output(result)
+        cycle_id = result["cycle_id"]
+        self.close(route, route_file)
+        P.finalize(self.root, cycle_id=cycle_id)
+        stranger = Path(result["cycle_dir"]).parent / "2026-01-01_stranger"
+        stranger.mkdir()
+        (stranger / ".cycle.json").write_text(json.dumps({
+            "schema_version": 1, "kind": "artifact-cycle-binding",
+            "campaign_id": "camp_" + "0" * 32, "cycle_id": "cyc_" + "0" * 32,
+        }), encoding="utf-8")
+        with self.assertRaises(P.artifact_locator.LocatorError):
+            P.artifact_locator.scan_index(self.root)
+        again = P.finalize(self.root, cycle_id=cycle_id)
+        self.assertEqual(again["status"], "already-sealed")
+        self.assertEqual(again["cycle_state"], "completed")
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id, state="abandoned", abandon_reason="operator-decision")
+        self.assertEqual(caught.exception.code, "finalize-state-conflict")
+
 
 class SharedReferencePinAndRelatedTest(ProducerTestBase):
     def _admitted_spec_pin(self):
