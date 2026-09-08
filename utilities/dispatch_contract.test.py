@@ -32,6 +32,68 @@ def attempt_row(metadata,status="open"):
  return f"2026-08-25T00:00:00Z\t{status}\t/r\t/w\texecute\t{pipe}"
 
 class DispatchContractTest(unittest.TestCase):
+ def test_cancel_closes_witness_only_on_cancelled_receipt(self):
+  with tempfile.TemporaryDirectory() as td:
+   root=Path(td)
+   handle=D.create_witness(root,"reservation")
+   token="cancel-receipt-token"
+   D._GOVERNOR_WITNESS_HANDLES[D._governor_witness_key(root,token)]=handle
+   with mock.patch.object(D,"_governor_json",return_value={"state":"unclaimed"}), \
+        mock.patch.object(D.subprocess,"run",return_value=subprocess.CompletedProcess([],0,stdout="reservation=absent\n",stderr="")):
+    D.cancel_governor_reservation(Path("governor"),root,token)
+   self.assertIn(D._governor_witness_key(root,token),D._GOVERNOR_WITNESS_HANDLES)
+   self.assertFalse(handle._closed)
+   D.close_witness(handle)
+   D._GOVERNOR_WITNESS_HANDLES.pop(D._governor_witness_key(root,token),None)
+
+ def test_reserve_receipt_validation_closes_unretained_witness(self):
+  with tempfile.TemporaryDirectory() as td:
+   root=Path(td)
+   handles=[]
+   real_create_witness=D.create_witness
+   def witness(*args,**kwargs):
+    handle=real_create_witness(root,"reservation")
+    handles.append(handle)
+    return handle
+   with mock.patch.object(D,"create_witness",side_effect=witness), \
+        mock.patch.object(D,"_governor_json",return_value={"tokens":[]}):
+    with self.assertRaises(D.DispatchContractError):
+     D.reserve_governor_token(Path("governor"),root,"dispatch")
+   self.assertEqual(len(handles),1)
+   self.assertTrue(handles[0]._closed)
+
+ def test_governor_witness_map_is_root_scoped_and_provided_token_is_not_owned(self):
+  with tempfile.TemporaryDirectory() as td:
+   a,b=Path(td)/"a",Path(td)/"b";token="a"*32
+   with mock.patch.object(D,"_governor_json",return_value={"tokens":[token]}):
+    D.reserve_governor_token(Path("governor"),a,"dispatch")
+    D.reserve_governor_token(Path("governor"),b,"dispatch")
+   ha=D._GOVERNOR_WITNESS_HANDLES[D._governor_witness_key(a,token)]
+   hb=D._GOVERNOR_WITNESS_HANDLES[D._governor_witness_key(b,token)]
+   try:
+    with mock.patch.object(D,"_governor_json",return_value={"state":"unclaimed"}), mock.patch.object(D.subprocess,"run",return_value=subprocess.CompletedProcess([],0,stdout="reservation=cancelled\n",stderr="")):
+     D.cancel_governor_reservation(Path("governor"),a,token)
+    self.assertTrue(ha._closed);self.assertFalse(hb._closed)
+    with mock.patch.object(D,"_governor_json",return_value={"state":"unclaimed"}), mock.patch.object(D,"create_witness",side_effect=AssertionError("provided token must not issue FD")):
+     self.assertEqual(D.reserve_governor_token(Path("governor"),b,"dispatch",provided_token=token)[0],token)
+    self.assertFalse(hb._closed)
+   finally:
+    D.close_witness(ha);D.close_witness(hb)
+    D._GOVERNOR_WITNESS_HANDLES.pop(D._governor_witness_key(a,token),None)
+    D._GOVERNOR_WITNESS_HANDLES.pop(D._governor_witness_key(b,token),None)
+
+ def test_cancel_claim_race_requires_exact_issuer_receipt_before_fd_return(self):
+  with tempfile.TemporaryDirectory() as td:
+   root=Path(td);token="b"*32;h=D.create_witness(root,"reservation")
+   key=D._governor_witness_key(root,token);D._GOVERNOR_WITNESS_HANDLES[key]=h
+   try:
+    with self.assertRaises(D.DispatchContractError):D._return_governor_witness(root,token,{"owner_witness":{}})
+    self.assertFalse(h._closed)
+    with mock.patch.object(D,"_governor_json",side_effect=[{"state":"unclaimed"},{"state":"claimed","owner_witness":h.binding()}]), mock.patch.object(D.subprocess,"run",return_value=subprocess.CompletedProcess([],75,stdout="",stderr="reservation already claimed")):
+     D.cancel_governor_reservation(Path("governor"),root,token)
+    self.assertTrue(h._closed);self.assertNotIn(key,D._GOVERNOR_WITNESS_HANDLES)
+   finally:D.close_witness(h);D._GOVERNOR_WITNESS_HANDLES.pop(key,None)
+
  def test_versioned_source_registry_fallback_matrix(self):
   with tempfile.TemporaryDirectory() as td:
    base=Path(td)
