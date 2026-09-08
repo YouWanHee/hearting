@@ -319,9 +319,9 @@ class F100cSenderAndStewardTest(unittest.TestCase):
 
     def test_trailer_round_trip_and_last_wins(self):
         t = peer_message.peer_trailer("claude", "sid-a", "hearting-46")
-        self.assertEqual(t, "(peer-from: claude sid-a hearting-46)")
+        self.assertIn("(peer-from: claude [?] hearting-46)", t)
         self.assertEqual(peer_message.parse_peer_trailer("body\n\n" + t),
-                         {"harness": "claude", "session_id": "sid-a", "name": "hearting-46"})
+                         {"harness": "claude", "session_id": None, "name": "hearting-46"})
         self.assertEqual(peer_message.parse_peer_trailer("(peer-from: codex 01a0)")["name"], None)
         two = "(peer-from: codex one)\nx\n(peer-from: claude two n)"
         self.assertEqual(peer_message.parse_peer_trailer(two)["session_id"], "two")
@@ -535,7 +535,7 @@ class UsableSessionIdTest(_TmpRootMixin, unittest.TestCase):
     def test_the_module_own_absent_marker_round_trips_as_absent(self):
         """`peer_trailer` writes `-` when it has no id; parsing it back must not mint one."""
         text = peer_message.peer_trailer("claude", None, "hearting-46")
-        self.assertIn("(peer-from: claude -", text)
+        self.assertIn("(peer-from: claude [?]", text)
         self.assertIsNone(peer_message.parse_peer_trailer(text)["session_id"])
 
     def test_unusable_sender_shards_to_unknown_not_to_a_junk_sibling(self):

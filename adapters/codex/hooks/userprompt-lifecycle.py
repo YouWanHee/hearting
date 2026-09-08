@@ -364,7 +364,7 @@ def peer_notice(payload: dict[str, Any], current_prompt: str, current_cwd: str) 
         spec = importlib.util.spec_from_file_location("_peer_message", str(tool))
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        trailer = mod.parse_peer_trailer(current_prompt)
+        trailer = mod.parse_peer_trailer(current_prompt, {"harness": "codex", "session_id": sid})
         if not trailer:
             return
         args = [
