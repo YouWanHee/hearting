@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import importlib.util, io, os, shutil, subprocess, sys, tempfile, threading, unittest
+import importlib.util, io, json, os, shutil, subprocess, sys, tempfile, threading, unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
@@ -15,7 +15,51 @@ ADAPTERS={
 }
 
 class AdapterV11Test(unittest.TestCase):
- def setUp(self): self.parent_procs=[]
+ def child_env(self,root):
+  # Model wrappers and their in-process helpers must see only this fixture's
+  # state. Inheriting os.environ leaks managed-thread identity, registry,
+  # reservation tokens, governor roots and enabled production memory policy.
+  root=Path(root)
+  dirs={"HOME":root/"home","CODEX_HOME":root/"home/.codex",
+        "CLAUDE_CONFIG_DIR":root/"home/.claude",
+        "XDG_CONFIG_HOME":root/"config","XDG_DATA_HOME":root/"data",
+        "XDG_STATE_HOME":root/"state","XDG_CACHE_HOME":root/"cache",
+        "XDG_RUNTIME_DIR":root/"runtime","TMPDIR":root/"tmp",
+        "MEM_STORE":root/"memory","MEM_STATE_DIR":root/"memory-state",
+        "MEM_TELEMETRY_ROOT":root/"memory-telemetry",
+        "MEM_RECALL_RECEIPTS":root/"memory-telemetry/recall-receipts",
+        "MEM_PROJECTS":root/"memory-projects","MEM_PROFILE":root/"memory-profile",
+        "CODEX_SESSIONS":root/"codex-sessions",
+        "OPENCODE_CONFIG_DIR":root/"config/opencode"}
+  for path in dirs.values(): path.mkdir(parents=True,exist_ok=True)
+  artifact=root/".agent_reports"
+  env={key:str(value) for key,value in dirs.items()}
+  env.update({"PATH":os.pathsep.join((str(Path(sys.executable).parent),os.defpath)),
+              "LANG":"C.UTF-8","LC_ALL":"C.UTF-8",
+              "PYTHONDONTWRITEBYTECODE":"1",
+              "AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(artifact),
+              "AGENT_DISPATCH_JOBS":str(root/"jobs.log"),
+              "AGENT_MODEL_GOVERNOR_ROOT":str(artifact/".runtime/model-worker-governor"),
+              "AGENT_SESSION_ROLE":"worker",
+              "OPENCODE_CONFIG_CONTENT":"{}",
+              "MEM_SYNC_REMOTE":"0","MEM_DUMP_PUSH":"0","MEM_DUMP_COMMIT":"0",
+              "MEM_DISTILL":"0","MEM_DISTILL_ENABLE":"0","MEM_PERIODIC_CURATE_ENABLE":"0",
+              "MEM_WRITE_EVENTS":str(root/"memory-telemetry/write-events.jsonl"),
+              "MEM_RECALL_EVENTS":str(root/"memory-telemetry/recall-events.jsonl"),
+              "MEM_RETRIEVAL_EVENTS":str(root/"memory-telemetry/retrieval-events.jsonl"),
+              "GIT_CONFIG_NOSYSTEM":"1","GIT_CONFIG_GLOBAL":"/dev/null"})
+  # This one explicit test recursion marker is needed inside bubblewrap.
+  if os.environ.get("HEARTING_BWRAP_PID_NS")=="1":
+   env["HEARTING_BWRAP_PID_NS"]="1"
+  return env
+ def setUp(self):
+  self.parent_procs=[]
+  # Only the unittest process is patched; the invoking agent's environment is
+  # never changed. Each command cell gets a further private child_env below.
+  self.isolated=tempfile.TemporaryDirectory(prefix="hearting-adapter-v11-")
+  self.addCleanup(self.isolated.cleanup)
+  patch=mock.patch.dict(os.environ,self.child_env(Path(self.isolated.name)),clear=True)
+  patch.start();self.addCleanup(patch.stop)
  def tearDown(self):
   for proc in self.parent_procs:
    if proc.poll() is None: proc.kill()
@@ -52,7 +96,7 @@ class AdapterV11Test(unittest.TestCase):
    wrapper=self.load_wrapper(harness)
    command=self.command(harness,"start",repo,jobs,logs)+["--foreground-timeout","5"]
    argv=["dispatch-headless.py",*command[2:]]
-   env={**os.environ,"PATH":str(fakebin)+os.pathsep+os.environ.get("PATH",""),
+   env={**self.child_env(root),"PATH":str(fakebin)+os.pathsep+os.environ.get("PATH",""),
         "AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(art),
         "AGENT_DISPATCH_JOBS":str(jobs),"AGENT_DISPATCH_CHILD":"1",
         "AGENT_DISPATCH_ATTEMPT_ID":"att-parent-fixture",
@@ -85,11 +129,38 @@ class AdapterV11Test(unittest.TestCase):
    finally:
     for patch in reversed(patches): patch.stop()
    return code,stream.getvalue(),jobs.read_text(encoding="utf-8"),len(calls)
+ def test_child_environment_excludes_ambient_runtime_and_memory_state(self):
+  with tempfile.TemporaryDirectory() as td:
+   root=Path(td)
+   leaked={"AGENT_CODEX_MANAGED_GATEWAY":"1",
+           "AGENT_DISPATCH_ATTEMPT_ID":"ambient-attempt",
+           "AGENT_MODEL_GOVERNOR_RESERVATION_TOKEN":"ambient-reservation",
+           "AGENT_MODEL_WORKERS_DISABLED":"1",
+           "CODEX_THREAD_ID":"ambient-thread",
+           "MEM_SYNC_REMOTE_URL":"https://invalid.example/ambient",
+           "MEM_SYNC_REMOTE":"1","MEM_DUMP_PUSH":"1","MEM_DUMP_COMMIT":"1"}
+   with mock.patch.dict(os.environ,leaked):
+    env=self.child_env(root)
+   for key in leaked:
+    if key in {"MEM_SYNC_REMOTE","MEM_DUMP_PUSH","MEM_DUMP_COMMIT"}:
+     self.assertEqual(env[key],"0")
+    else: self.assertNotIn(key,env)
+   private=("HOME","CODEX_HOME","CLAUDE_CONFIG_DIR","XDG_CONFIG_HOME",
+            "XDG_DATA_HOME","XDG_STATE_HOME","XDG_CACHE_HOME","MEM_STORE",
+            "MEM_STATE_DIR","MEM_TELEMETRY_ROOT","MEM_WRITE_EVENTS",
+            "MEM_RECALL_EVENTS","MEM_RECALL_RECEIPTS","AGENT_DISPATCH_JOBS",
+            "AGENT_MODEL_GOVERNOR_ROOT","AGENT_ARTIFACT_ROOT")
+   for key in private: self.assertTrue(Path(env[key]).is_relative_to(root),key)
+   observed=subprocess.run([sys.executable,"-c",
+    "import json,os; print(json.dumps(dict(os.environ)))"],
+    env=env,text=True,capture_output=True,check=True)
+   self.assertEqual(json.loads(observed.stdout),env)
+   self.assertEqual(env["AGENT_SESSION_ROLE"],"worker")
  def test_sibling_registry_rows_and_nested_refusal(self):
   for harness in ("codex", "claude", "opencode"):
    with self.subTest(harness=harness), tempfile.TemporaryDirectory() as td:
     root=Path(td); repo,art=self.fixture(root); jobs=root/"jobs.log"; logs=root/"logs"
-    env={**os.environ,"AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(art),
+    env={**self.child_env(root),"AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(art),
          "AGENT_DISPATCH_JOBS":str(jobs),"OPENCODE_CONFIG_CONTENT":"{}"}
     self.seed_parent(jobs,repo,harness=harness)
     env["AGENT_DISPATCH_ATTEMPT_ID"]="att-parent-fixture"
@@ -126,7 +197,7 @@ class AdapterV11Test(unittest.TestCase):
    with self.subTest(harness=harness), tempfile.TemporaryDirectory() as td:
     root=Path(td); repo,art=self.fixture(root); jobs=root/"jobs.log"; logs=root/"logs"
     current=root/"current"; current.symlink_to(ROOT)
-    env={**os.environ,"AGENT_HOME":str(current),"AGENT_ARTIFACT_ROOT":str(art),
+    env={**self.child_env(root),"AGENT_HOME":str(current),"AGENT_ARTIFACT_ROOT":str(art),
          "AGENT_DISPATCH_JOBS":str(jobs),"OPENCODE_CONFIG_CONTENT":"{}"}
     self.seed_parent(jobs,repo,harness=harness)
     env["AGENT_DISPATCH_ATTEMPT_ID"]="att-parent-fixture"
@@ -139,7 +210,7 @@ class AdapterV11Test(unittest.TestCase):
   for harness in ADAPTERS:
    with self.subTest(harness=harness), tempfile.TemporaryDirectory() as td:
     root=Path(td); repo,art=self.fixture(root); jobs=root/"jobs.log"; logs=root/"logs"
-    env={**os.environ,"AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(art),
+    env={**self.child_env(root),"AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(art),
          "AGENT_DISPATCH_JOBS":str(jobs),"OPENCODE_CONFIG_CONTENT":"{}"}
     self.seed_parent(jobs,repo,harness=harness)
     env["AGENT_DISPATCH_ATTEMPT_ID"]="att-parent-fixture"
@@ -162,7 +233,7 @@ class AdapterV11Test(unittest.TestCase):
   # exact-parent-binding and not something a unit fixture should fake.
   with tempfile.TemporaryDirectory() as td:
    root=Path(td); repo,art=self.fixture(root); jobs=root/"jobs.log"; logs=root/"logs"
-   env={**os.environ,"AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(art),
+   env={**self.child_env(root),"AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(art),
         "AGENT_DISPATCH_JOBS":str(jobs),"OPENCODE_CONFIG_CONTENT":"{}"}
    result=subprocess.run(self.command("opencode","register",repo,jobs,logs),
                          text=True,capture_output=True,env=env)
@@ -180,8 +251,15 @@ class AdapterV11Test(unittest.TestCase):
             "--unit","_kernel/owner","--assigned-contract","autopilot-code",
             "--model","gpt-test","--reasoning","low","--log-dir",str(logs),
             "--jobs",str(jobs)]
-   env={**os.environ,"AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(art),
-        "CLAUDE_CONFIG_DIR":str(claude_config),"AGENT_DISPATCH_JOBS":str(jobs)}
+   # This test verifies owner command construction, not an installed Codex
+   # binary. Its supported app-server probe must be explicit and isolated.
+   fakebin=root/"bin";fakebin.mkdir()
+   fake=fakebin/"codex"
+   fake.write_text('#!/bin/sh\n[ "$1" = app-server ] && [ "$2" = --help ] && exit 0\nexit 97\n')
+   fake.chmod(0o755)
+   env={**self.child_env(root),"AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(art),
+        "CLAUDE_CONFIG_DIR":str(claude_config),"AGENT_DISPATCH_JOBS":str(jobs),
+        "PATH":str(fakebin)+os.pathsep+os.environ["PATH"]}
    for runtime_key in (
     "CODEX_THREAD_ID", "CODEX_SESSION_ID", "CLAUDE_CODE_SESSION_ID",
     "OPENCODE_SESSION_ID", "AGENT_DISPATCH_CALLER_HARNESS",
@@ -221,7 +299,7 @@ class AdapterV11Test(unittest.TestCase):
   for harness in ("codex","claude"):
    with self.subTest(harness=harness),tempfile.TemporaryDirectory() as td:
     root=Path(td);repo,art=self.fixture(root);jobs=root/"jobs.log";logs=root/"logs"
-    env={**os.environ,"AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(art),
+    env={**self.child_env(root),"AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(art),
          "AGENT_DISPATCH_JOBS":str(jobs)}
     result=subprocess.run(self.command(harness,"register",repo,jobs,logs),
                           text=True,capture_output=True,env=env)
@@ -293,13 +371,59 @@ class AdapterV11Test(unittest.TestCase):
    (source/"config.toml").write_text("model = \"fixture\"\n",encoding="utf-8")
    spec=importlib.util.spec_from_file_location("codex_dispatch_home",ROOT/"adapters/codex/bin/dispatch-headless.py")
    wrapper=importlib.util.module_from_spec(spec); spec.loader.exec_module(wrapper)
-   home=wrapper.prepare_nested_codex_home(worktree,source)
+   # Nested model-config inheritance now resolves its projection root through
+   # resolve_agent_home(); pin it to this source checkout (which actually has
+   # tools/install/nested_model_config.py and adapters/codex/config/models.conf)
+   # instead of the real installed runtime home, which this test must not
+   # depend on or mutate.
+   with mock.patch.object(wrapper,"resolve_agent_home",return_value=ROOT):
+    home=wrapper.prepare_nested_codex_home(worktree,source)
    self.assertTrue((home/"auth.json").is_symlink())
    self.assertEqual((home/"auth.json").resolve(),(source/"auth.json").resolve())
    self.assertTrue((home/"config.toml").is_symlink())
    self.assertTrue((home/"hearting").is_symlink())
-   self.assertEqual((home/"hearting").resolve(),wrapper.resolve_agent_home().resolve())
+   self.assertEqual((home/"hearting").resolve(),ROOT.resolve())
    self.assertEqual(home.parent,worktree/".dispatch")
+   receipt=json.loads((home/".harness/nested-model-config/receipt.json").read_text(encoding="utf-8"))
+   self.assertEqual(receipt["projection"]["state"],"complete")
+   self.assertEqual(receipt["parent_home"],str(source.resolve()))
+   before={name:(home/name).lstat() for name in ("auth.json","config.toml")}
+   with mock.patch.object(wrapper,"resolve_agent_home",return_value=ROOT):
+    repeated=wrapper.prepare_nested_codex_home(worktree,source)
+   self.assertEqual(repeated,home)
+   for name,metadata in before.items():
+    # Correct links retain identity; unlink-and-recreate is not a safe no-op.
+    current=(home/name).lstat()
+    self.assertEqual((current.st_ino,current.st_ctime_ns),
+                     (metadata.st_ino,metadata.st_ctime_ns))
+    self.assertEqual((home/name).resolve(),(source/name).resolve())
+ def test_nested_codex_home_preserves_foreign_auth_and_config_collisions(self):
+  for name in ("auth.json","config.toml"):
+   for kind in ("symlink","file"):
+    with self.subTest(name=name,kind=kind),tempfile.TemporaryDirectory() as td:
+     root=Path(td);source=root/"source";source.mkdir()
+     worktree=root/"worktree";worktree.mkdir()
+     (source/"auth.json").write_text("{}\n")
+     (source/"config.toml").write_text('model = "fixture"\n')
+     wrapper=self.load_wrapper("codex")
+     with mock.patch.object(wrapper,"resolve_agent_home",return_value=ROOT):
+      home=wrapper.prepare_nested_codex_home(worktree,source)
+     target=root/"foreign";target.write_text("preserve fixture bytes\n")
+     link=home/name
+     link.unlink()  # Fixture-only simulation of an intervening user edit.
+     if kind=="symlink": link.symlink_to(target)
+     else: link.write_bytes(target.read_bytes())
+     metadata=link.lstat()
+     with mock.patch.object(wrapper,"resolve_agent_home",return_value=ROOT):
+      with self.assertRaises(wrapper.DispatchContractError) as caught:
+       wrapper.prepare_nested_codex_home(worktree,source)
+     self.assertEqual(caught.exception.reason,"nested-codex-home-collision")
+     after=link.lstat()
+     self.assertEqual((after.st_ino,after.st_ctime_ns),
+                      (metadata.st_ino,metadata.st_ctime_ns))
+     self.assertEqual(link.read_bytes(),b"preserve fixture bytes\n")
+     self.assertEqual(target.read_bytes(),b"preserve fixture bytes\n")
+     if kind=="symlink": self.assertEqual(link.resolve(),target.resolve())
  def test_detached_selection_is_promoted_before_launch_without_failure_exposure(self):
   for harness in ("codex","claude"):
    for repetition in range(4):
@@ -315,7 +439,7 @@ class AdapterV11Test(unittest.TestCase):
        "lifecycle_nspid_width":"1",
        "lifecycle_pid1_class":"non-system-init",
       })
-     env={**os.environ,"PATH":str(fakebin)+os.pathsep+os.environ.get("PATH",""),"AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(art),"AGENT_DISPATCH_JOBS":str(jobs),"AGENT_DISPATCH_CHILD":"1","AGENT_DISPATCH_ATTEMPT_ID":"att-parent-fixture","XDG_STATE_HOME":str(root/"state")}
+     env={**self.child_env(root),"PATH":str(fakebin)+os.pathsep+os.environ.get("PATH",""),"AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(art),"AGENT_DISPATCH_JOBS":str(jobs),"AGENT_DISPATCH_CHILD":"1","AGENT_DISPATCH_ATTEMPT_ID":"att-parent-fixture","XDG_STATE_HOME":str(root/"state")}
      stream=io.StringIO()
      patches=[mock.patch.dict(os.environ,env,clear=True),mock.patch.object(wrapper,"reconcile_launch_lifecycle",return_value=resolution)]
      if hasattr(wrapper,"check_runtime_projection"): patches.append(mock.patch.object(wrapper,"check_runtime_projection",return_value=0))
@@ -369,7 +493,7 @@ class AdapterV11Test(unittest.TestCase):
       "lifecycle_nspid_width":"1",
       "lifecycle_pid1_class":"non-system-init",
      })
-    env={**os.environ,"PATH":str(fakebin)+os.pathsep+os.environ.get("PATH",""),
+    env={**self.child_env(root),"PATH":str(fakebin)+os.pathsep+os.environ.get("PATH",""),
          "AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(art),
          "AGENT_DISPATCH_JOBS":str(jobs),"OPENCODE_CONFIG_CONTENT":"{}",
          "XDG_STATE_HOME":str(root/"state")}
@@ -458,7 +582,7 @@ class AdapterV11Test(unittest.TestCase):
    spec=importlib.util.spec_from_file_location("codex_dispatch_concurrency",ROOT/"adapters/codex/bin/dispatch-headless.py")
    wrapper=importlib.util.module_from_spec(spec); spec.loader.exec_module(wrapper)
    argv=["dispatch-headless.py",*command[2:]]
-   env={**os.environ,"PATH":str(fakebin)+os.pathsep+os.environ.get("PATH",""),
+   env={**self.child_env(root),"PATH":str(fakebin)+os.pathsep+os.environ.get("PATH",""),
         "AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(art),
         "AGENT_DISPATCH_JOBS":str(jobs),"AGENT_DISPATCH_CHILD":"1",
         "AGENT_DISPATCH_ATTEMPT_ID":"att-parent-fixture",
@@ -504,7 +628,7 @@ class AdapterV11Test(unittest.TestCase):
      wrapper.DETACHED,{"AGENT_DISPATCH_ALLOW_NAMESPACED_SPAWN":"1"},
      evidence={"lifecycle_selector_source":"pid1-class",
                "lifecycle_nspid_width":"1","lifecycle_pid1_class":"non-system-init"})
-    env={**os.environ,"PATH":str(fakebin)+os.pathsep+os.environ.get("PATH",""),
+    env={**self.child_env(root),"PATH":str(fakebin)+os.pathsep+os.environ.get("PATH",""),
          "AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(art),
          "AGENT_DISPATCH_JOBS":str(jobs),"AGENT_DISPATCH_CHILD":"1",
          "AGENT_DISPATCH_ATTEMPT_ID":"att-parent-fixture",
@@ -542,7 +666,7 @@ class AdapterV11Test(unittest.TestCase):
       "lifecycle_nspid_width":"1",
       "lifecycle_pid1_class":"non-system-init",
      })
-    env={**os.environ,"PATH":str(fakebin)+os.pathsep+os.environ.get("PATH",""),
+    env={**self.child_env(root),"PATH":str(fakebin)+os.pathsep+os.environ.get("PATH",""),
          "AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(art),
          "AGENT_DISPATCH_JOBS":str(jobs),"AGENT_DISPATCH_CHILD":"1",
          "AGENT_DISPATCH_ATTEMPT_ID":"att-parent-fixture",
@@ -594,7 +718,7 @@ class AdapterV11Test(unittest.TestCase):
       "lifecycle_nspid_width":"1",
       "lifecycle_pid1_class":"non-system-init",
      })
-    env={**os.environ,"PATH":str(fakebin)+os.pathsep+os.environ.get("PATH",""),
+    env={**self.child_env(root),"PATH":str(fakebin)+os.pathsep+os.environ.get("PATH",""),
          "AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(art),
          "AGENT_DISPATCH_JOBS":str(jobs),"XDG_STATE_HOME":str(root/"state"),
          **env_extra}
@@ -665,7 +789,7 @@ class AdapterV11Test(unittest.TestCase):
       "lifecycle_nspid_width":"1",
       "lifecycle_pid1_class":"non-system-init",
      })
-    env={**os.environ,"PATH":str(fakebin)+os.pathsep+os.environ.get("PATH",""),
+    env={**self.child_env(root),"PATH":str(fakebin)+os.pathsep+os.environ.get("PATH",""),
          "AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(art),
          "AGENT_DISPATCH_JOBS":str(jobs),"XDG_STATE_HOME":str(root/"state"),
          **env_extra}

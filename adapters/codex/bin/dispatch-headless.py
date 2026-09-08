@@ -1694,8 +1694,8 @@ def prepare_nested_codex_home(worktree: Path, source_home: Path | None = None) -
 
     source = (source_home or Path(os.environ.get("CODEX_HOME", "~/.codex"))).expanduser().resolve()
     destination = worktree / ".dispatch" / "nested-codex-home"
-    destination.mkdir(parents=True, exist_ok=True)
-    destination.chmod(0o700)
+    # The nested helper validates every destination component before creating
+    # or changing directories. Do not mkdir/chmod an unchecked symlink here.
 
     # Runtime projection identity follows the installed/canonical AGENT_HOME,
     # not the source-only task worktree containing this wrapper. Otherwise a
@@ -1703,21 +1703,31 @@ def prepare_nested_codex_home(worktree: Path, source_home: Path | None = None) -
     # the inherited canonical AGENT_HOME and rejects a valid recursive launch.
     projection_root = resolve_agent_home().resolve()
     installer = projection_root / "adapters" / "codex" / "bin" / "install-runtime-projection.sh"
-    env = {**os.environ, "AGENT_HOME": str(projection_root), "CODEX_HOME": str(destination)}
-    result = subprocess.run(
-        [str(installer), "--skills-mode", "native"],
-        cwd=ROOT,
-        env=env,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
-    if result.returncode != 0:
-        raise DispatchContractError(
-            "nested-codex-home-projection-failed",
-            (result.stderr or result.stdout).strip() or f"exit-{result.returncode}",
+
+    # Inherit the parent's whole effective model configuration into the
+    # nested home BEFORE the installer/native-agent rendering below, so the
+    # nested home does not silently fall back to the shipped default model
+    # tiers (core: harness-created derived execution home inheritance
+    # exception). One helper `prepare` call owns the whole transaction --
+    # snapshot decision, installer, and native payload verification -- under
+    # its own lock; this wrapper never holds that lock itself or spawns a
+    # separate seed/finish call.
+    nested_model_config_dir = projection_root / "tools" / "install"
+    if str(nested_model_config_dir) not in sys.path:
+        sys.path.insert(0, str(nested_model_config_dir))
+    import nested_model_config  # noqa: E402
+
+    try:
+        nested_model_config.prepare(
+            "codex",
+            source,
+            destination,
+            source_root=projection_root,
+            installer=installer,
+            installer_args=["--skills-mode", "native"],
         )
+    except nested_model_config.NestedModelConfigError as exc:
+        raise DispatchContractError("nested-codex-model-config-failed", str(exc)) from exc
 
     auth = source / "auth.json"
     if not auth.is_file():
@@ -1730,11 +1740,18 @@ def prepare_nested_codex_home(worktree: Path, source_home: Path | None = None) -
         if not target.is_file():
             continue
         link = destination / name
+        # Correct existing links need no mutation. A different link is not
+        # ownership evidence, and exclusive creation preserves racing edits.
         if link.is_symlink():
-            link.unlink()
-        elif link.exists():
+            if link.resolve() == target.resolve():
+                continue
             raise DispatchContractError("nested-codex-home-collision", str(link))
-        link.symlink_to(target)
+        if link.exists():
+            raise DispatchContractError("nested-codex-home-collision", str(link))
+        try:
+            link.symlink_to(target)
+        except FileExistsError as exc:
+            raise DispatchContractError("nested-codex-home-collision", str(link)) from exc
     return destination
 
 

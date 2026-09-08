@@ -242,22 +242,73 @@ fi
 
 # Per-mode model tier: use the complete user config or shipped fallback.
 # CODEX_DISTILL_MODEL is a global back-compat override; otherwise the mode's
-# lifecycle tier (curate=light, increment=nudge) resolves to that tier's model.
-eval "$("$ROOT/utilities/model-config.sh" --adapter codex --source-root "$ROOT")"
+# lifecycle tier (curate=light, increment=nudge) resolves to that tier's model
+# AND that same tier's reasoning effort -- a model-only override still leaves
+# the tier's own effort in force (overrides pick a model, never a cascade).
+# Assignment preserves the resolver status; eval alone would turn a failed
+# substitution with empty output into success and could reuse inherited CFG_.
+if distill_config=$("$ROOT/utilities/model-config.sh" --adapter codex --source-root "$ROOT"); then
+  :
+else
+  echo "codex distill worker: model-config-resolution-failed" >&2
+  exit 70
+fi
+# CFG_ values come only from this complete resolution. They are not runtime
+# overrides; keep the documented CODEX_DISTILL_MODEL* overrides untouched.
+unset CFG_LIFECYCLE_NUDGE CFG_LIFECYCLE_CURATE \
+  CFG_TIER_DEEP_MODEL CFG_TIER_DEEP_EFFORT \
+  CFG_TIER_LIGHT_MODEL CFG_TIER_LIGHT_EFFORT \
+  CFG_TIER_MINI_MODEL CFG_TIER_MINI_EFFORT
+eval "$distill_config"
+unset distill_config
 tier_model() {
   case "$1" in
-    deep) printf '%s' "$CFG_TIER_DEEP_MODEL" ;;
-    mini) printf '%s' "$CFG_TIER_MINI_MODEL" ;;
-    *) printf '%s' "$CFG_TIER_LIGHT_MODEL" ;;
+    deep) printf '%s' "${CFG_TIER_DEEP_MODEL:-}" ;;
+    mini) printf '%s' "${CFG_TIER_MINI_MODEL:-}" ;;
+    *) printf '%s' "${CFG_TIER_LIGHT_MODEL:-}" ;;
   esac
 }
+tier_effort() {
+  case "$1" in
+    deep) printf '%s' "${CFG_TIER_DEEP_EFFORT:-}" ;;
+    mini) printf '%s' "${CFG_TIER_MINI_EFFORT:-}" ;;
+    *) printf '%s' "${CFG_TIER_LIGHT_EFFORT:-}" ;;
+  esac
+}
+if [ "$mode" = "curate" ]; then
+  distill_tier="${CFG_LIFECYCLE_CURATE:-}"
+else
+  distill_tier="${CFG_LIFECYCLE_NUDGE:-}"
+fi
+if [ -z "$distill_tier" ]; then
+  echo "codex distill worker: lifecycle-tier-unresolved" >&2
+  exit 70
+fi
 if [ -n "${CODEX_DISTILL_MODEL:-}" ]; then
   model="$CODEX_DISTILL_MODEL"
 elif [ "$mode" = "curate" ]; then
-  model="${CODEX_DISTILL_MODEL_CURATE:-$(tier_model "$CFG_LIFECYCLE_CURATE")}"
+  model="${CODEX_DISTILL_MODEL_CURATE:-$(tier_model "$distill_tier")}"
 else
-  model="${CODEX_DISTILL_MODEL_INCREMENT:-$(tier_model "$CFG_LIFECYCLE_NUDGE")}"
+  model="${CODEX_DISTILL_MODEL_INCREMENT:-$(tier_model "$distill_tier")}"
 fi
+if [ -z "$model" ]; then
+  echo "codex distill worker: model-unresolved (tier=$distill_tier)" >&2
+  exit 70
+fi
+distill_effort="$(tier_effort "$distill_tier")"
+# Direct case-enum match, not a substring/regex test: rejects empty,
+# whitespace, multiword and typo values. The documented Codex reasoning-effort
+# values currently include minimal/low/medium/high/xhigh plus the
+# Subagents-page-documented max/ultra (see
+# _internal/official_effort_evidence.md) -- this is the adapter's current
+# checked value policy, not an exhaustive immutable protocol enum.
+case "$distill_effort" in
+  minimal|low|medium|high|xhigh|max|ultra) ;;
+  *)
+    echo "codex distill worker: reasoning-effort-invalid: '$distill_effort' (tier=$distill_tier)" >&2
+    exit 70
+    ;;
+esac
 
 # Hang guard: bound a silent `codex exec`. Curate receives delta, snapshot, and
 # artifact evidence on a deep model, so it gets a larger timeout budget.
@@ -305,10 +356,18 @@ if AGENT_SESSION_ROLE=worker MEM_DISTILL=1 python3 "$ROOT/utilities/model-worker
   --skip-git-repo-check \
   --output-last-message "$out_file" \
   -m "$model" \
+  -c "model_reasoning_effort=\"$distill_effort\"" \
   - < "$prompt_file" >/dev/null; then
-  exec_ok=1
+  exec_status=0
 else
-  exec_ok=0
+  exec_status=$?
+fi
+
+# Exit 0 without the promised output is not a completed capture. Preserve the
+# delta for another run; an existing empty file is the valid no-action result.
+if [ "$exec_status" -eq 0 ] && [ ! -f "$out_file" ]; then
+  echo "codex distill worker: model-output-missing" >&2
+  exec_status=1
 fi
 
 if [ "${CODEX_DISTILL_APPLY:-}" = "1" ]; then
@@ -316,7 +375,7 @@ if [ "${CODEX_DISTILL_APPLY:-}" = "1" ]; then
     echo "codex distill worker: tool-contract — no-tools/action contract not accepted; refusing CODEX_DISTILL_APPLY" >&2
     exit 69
   fi
-  if [ "$exec_ok" = "1" ] && [ -f "$out_file" ]; then
+  if [ "$exec_status" = "0" ] && [ -f "$out_file" ]; then
     # shared applier (shell=False, argv-only). --mode gates id-mutations: increment =
     # add-only enforced; curate = snapshot-id membership whitelist via --snapshot-ids.
     AGENT_HOME="$AGENT_ROOT" python3 "$ROOT/tools/memory/apply-distill-actions.py" \
@@ -327,11 +386,14 @@ if [ "${CODEX_DISTILL_APPLY:-}" = "1" ]; then
   # advance is gated on the exec, not per-record apply success — the same
   # always-advance-after-applier semantics as the portable dispatcher (a poison delta is
   # not reprocessed forever). A preview-only run (no APPLY) or a failed/timed-out exec
-  # (exec_ok=0) keeps the delta for a later real distill. Fixes the prior re-distill
+  # (exec_status!=0) keeps the delta for a later real distill. Fixes the prior re-distill
   # divergence (the old worker never advanced → reprocessed the same delta every run).
-  if [ "$exec_ok" = "1" ]; then
+  if [ "$exec_status" = "0" ]; then
     AGENT_HOME="$AGENT_ROOT" python3 "$ROOT/tools/memory/mem.py" distill "$sid" --source codex --advance-capture "$frontier" >/dev/null 2>&1 || true
   fi
 fi
 
+# A rejected model/effort remains an error even if the CLI created an output
+# file. Never emit a failed model's partial result or retry without its effort.
+[ "$exec_status" -eq 0 ] || exit "$exec_status"
 [ -f "$out_file" ] && cat "$out_file"

@@ -537,6 +537,36 @@ comments in `adapters/codex/config/models.conf`. It adds no new `CFG_*` key
 Claude default, and is not evidence of universal runtime/account availability
 for the selected model.
 
+### Nested-home model inheritance
+
+`dispatch-headless.py`'s `prepare_nested_codex_home` creates a writable
+sandboxed Codex home for recursive `codex exec`. Before it ran the regular
+installer there, the nested home always seeded the *shipped* default
+`models.conf` -- a complete, valid-looking user file that `resolve_config`
+happily selected, so the parent's actually-configured model tiers (and the
+native agents rendered from them) never reached the nested home. It now first
+calls `tools/install/nested_model_config.py prepare`, the one nested-only
+helper realizing the core exception above: it resolves the parent's whole
+effective config with the existing `model_config.resolve_config`, snapshots
+that exact selection into the nested home's own `agent-config/models.conf`
+under an ownership receipt (`<nested>/.harness/nested-model-config/receipt.json`,
+`hearting.nested-model-config/v1`), then runs the existing installer and
+`native_agent_payload` materialize/verify against what is now the nested
+home's own effective config -- all under one `safe_fs.TargetLock` held for the
+whole transaction. `seed`/`prepare`/`recover --apply` share that same lock; no
+call re-acquires it as a child. An unmarked, foreign, or user-edited
+destination is preserved and reported as a typed conflict, never silently
+overwritten. Explicit legacy recovery (`recover --dry-run`/`--apply`) is a
+separate, backed-up, hash-pinned, quiescence-gated operation intended for a
+human operator repairing an existing (pre-fix) nested home; it is never run
+implicitly by `prepare`. Global installer seed-once semantics for a normal
+user runtime home are unchanged. Recovery checks the private home owner's
+runtime processes plus every relevant registered attempt, using PID start time
+and namespace identity. Inaccessible relevant evidence refuses recovery. This
+proves quiescence within that user-runtime scope, not inactivity of privileged
+OS administrators. The installer defers native agent links only for this
+nested transaction; the helper installs them using ownership and CAS checks.
+
 Non-route role compatibility overrides remain explicit and config-derived:
 
 ```text
@@ -786,7 +816,21 @@ Two tiers + one manual surface:
    membership whitelist (`member()` in the shared applier). Per-mode model tiers
    (P-36) override with `CODEX_DISTILL_MODEL` (global) /
    `CODEX_DISTILL_MODEL_INCREMENT` / `CODEX_DISTILL_MODEL_CURATE` /
-   `AGENT_MODEL_FAST` / `AGENT_MODEL_DEEP`.
+   `AGENT_MODEL_FAST` / `AGENT_MODEL_DEEP`. The resolved lifecycle tier
+   (`CFG_LIFECYCLE_NUDGE`/`CFG_LIFECYCLE_CURATE`) is looked up once and used to
+   derive *both* the model and that same tier's `CFG_TIER_*_EFFORT`; a model
+   override picks a model only, it never drops or replaces the tier's effort.
+   The actual `codex exec` call passes `-m "$model" -c
+   'model_reasoning_effort="$effort"'`. The effort is validated with a direct
+   shell `case` enum (not a regex/substring test) against the currently
+   documented Codex reasoning-effort values -- `minimal`, `low`, `medium`,
+   `high`, `xhigh`, plus `max`/`ultra` in the official
+   [Subagents documentation](https://learn.chatgpt.com/docs/agent-configuration/subagents).
+   The general [configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference)
+   currently lists a shorter set. This is the adapter's current checked value policy, not an exhaustive
+   immutable protocol enum, and an unresolved/malformed/multiword effort fails
+   the worker with a truthful CLI error rather than silently dropping effort
+   or invoking the model cascade.
 4. `preflight.sh session-end` invokes the worker in `curate` mode and
    `turn-nudge` in `increment` mode, both enabled by default
    (`CODEX_DISTILL_ENABLE`/`CODEX_DISTILL_APPLY`/`CODEX_DISTILL_CONTRACT_ACCEPTED`

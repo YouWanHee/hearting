@@ -34,9 +34,14 @@ fi
 CODEX_HOME=${CODEX_HOME:-$HOME/.codex}
 
 install_plugin=0
+defer_native_agent_links=0
 skills_mode=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --defer-native-agent-links)
+      defer_native_agent_links=1
+      shift
+      ;;
     --install-plugin)
       install_plugin=1
       shift
@@ -56,6 +61,7 @@ usage: install-runtime-projection.sh [--install-plugin] [--skills-mode native|pl
 
 Wires \$CODEX_HOME (default \$HOME/.codex) to the harness projection in
 codex_setting/. Idempotent; never mutates Codex-owned runtime state.
+  --defer-native-agent-links  nested transaction owns checked agent-link writes
   --install-plugin             also run codex plugin marketplace add + plugin add
   --skills-mode native|plugin|both
                                choose Codex skill discovery surface. Default: native;
@@ -196,6 +202,7 @@ payload_result=$(python3 "$AGENT_HOME/tools/install/native_agent_payload.py" mat
 printf 'native_agent_payload=%s\n' "$payload_result"
 
 agents_linked=0
+if [ "$defer_native_agent_links" != "1" ]; then
 mkdir -p "$CODEX_HOME/agents"
 payload_links=$(python3 "$AGENT_HOME/tools/install/native_agent_payload.py" links \
   --runtime-home "$CODEX_HOME" --source-root "$AGENT_HOME") || {
@@ -210,6 +217,7 @@ while IFS="$(printf '\t')" read -r agent_name agent_path; do
 done <<EOF
 $payload_links
 EOF
+fi
 printf 'agents_linked=%s\n' "$agents_linked"
 
 if [ "$install_plugin" = "1" ]; then

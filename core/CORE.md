@@ -59,6 +59,26 @@ otherwise fall back to the shipped adapter default as one unit; they never merge
 the two. Native runtime settings and adapter fragments remain outside
 `agent-config`.
 
+A harness-created derived execution home (for example a nested dispatch-owned
+runtime home) may receive a regular snapshot of its parent's whole effective
+configuration before projection, so a recursive dispatch does not silently
+fall back to the shipped default. User-runtime seed-once semantics above are
+unchanged for every other case. A derived snapshot is tracked by an explicit
+parent/destination/exact-content provenance receipt, never merged or
+symlinked into place. Updating an owned snapshot requires matching ownership
+plus hash/CAS evidence; an unmarked, foreign, or user-modified destination is
+preserved as a typed conflict, never overwritten -- byte equality with the
+shipped default proves no ownership by itself. A full preparation (snapshot
+decision, installer, and native rendering) is one serialized transaction per
+destination; snapshot ownership and successful projection are separate facts,
+and a failure leaves a truthful incomplete/conflict state rather than a false
+complete claim. Legacy adoption of an unmarked derived home is explicit,
+backed up, hash-pinned, and permitted only with proved target quiescence;
+missing quiescence evidence refuses, and ordinary setup never adopts a derived
+home implicitly. Quiescence evidence names its runtime-process ownership and
+observer scope; missing evidence for a relevant process refuses recovery. It
+does not claim control over privileged operating-system administrators.
+
 Project-independent global runtime state (the dispatch attempt registry and
 similar cross-project bookkeeping) lives under `<agent-home>/.dispatch/` or an
 XDG state directory, never inside a project artifact root — this is the
