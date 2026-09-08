@@ -1,6 +1,7 @@
 """부모 비모델 보강: 실제 namespace와 공용 API, 임시 root만 변경. 생산 소스 변경 없음."""
 import os,sys,json,subprocess,tempfile,select,hashlib,importlib.util,time,ctypes,unittest,shutil
 from pathlib import Path
+from unittest import mock
 SOURCE=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(SOURCE/'utilities'))
 import governor_identity as G
@@ -21,6 +22,56 @@ def line(p):
  raw=p.stdout.readline()
  if not raw:raise RuntimeError('fixture-exit:'+str(p.poll()))
  return json.loads(raw)
+def finish_local_lease(root, token):
+ # The actor already owns this real issued lease/FD. Reuse only its acquisition
+ # result so gov.main runs the production child-wait/drain loop unchanged.
+ # Two deterministic incomplete observations prove retention, rather than
+ # increasing retries/timeouts until a noisy procfs scan happens to pass.
+ scans=[]; transitions=[]
+ original_scan=gov.process_group_observation; original_release=gov.release
+ def scan(pgid):
+  actual=original_scan(pgid)
+  injected=len(scans)<2
+  observed=actual._replace(reason="fixture-procfs-churn") if injected else actual
+  scans.append({'actual':actual._asdict(),'observed':observed._asdict(),'injected_incomplete':injected})
+  return observed
+ def acquire_existing(requested_root, worker_class):
+  assert Path(requested_root)==root and worker_class=='dispatch'
+  assert token in snap(root)['leases']
+  return token
+ def release_observed(requested_root, requested_token):
+  assert Path(requested_root)==root and requested_token==token
+  handle=gov._LEASE_WITNESSES[gov._witness_key(root,token)]
+  before=snap(root); witness_held=G.retained_witness_is_held(handle)
+  first_scan=len(scans); result=original_release(root,token); after=snap(root)
+  transitions.append({'observer':ident(),'witness_held':witness_held,'before':before,
+                      'result':result,'after':after,'scans':scans[first_scan:]})
+  return result
+ argv=[str(SOURCE/'utilities/model-worker-governor.py'),'--root',str(root),'run','--class','dispatch','--',sys.executable,'-c','pass']
+ assert gov.RESERVATION_ENV not in os.environ
+ with mock.patch.object(gov,'acquire',acquire_existing), mock.patch.object(gov,'release',release_observed), mock.patch.object(gov,'process_group_observation',scan), mock.patch.object(sys,'argv',argv):
+  exit_code=gov.main()
+ return {'root':str(root),'token':token,'exit':exit_code,'result':transitions[-1]['result'],
+         'state':snap(root),'transitions':transitions,'acquisition_seam':'existing-actor-issued-lease'}
+def local_drain_proven(returned):
+ steps=returned['transitions']; token=returned['token']
+ if len(steps)<3 or returned['exit']!=0:return False
+ for step in steps[:-1]:
+  result=step['result']
+  if not (result.get('status')=='blocked' and result.get('occupied') is True
+          and result.get('release_proven') is False
+          and result.get('reason') in {'group-observation-incomplete','group-descendants-live'}
+          and step['witness_held'] and token in step['after']['leases']
+          and step['before']['leases']==step['after']['leases']):return False
+ if not all(steps[i]['scans'][0]['injected_incomplete'] for i in (0,1)):return False
+ last=steps[-1]; result=last['result']; scans=last['scans']
+ if len(scans)!=1 or scans[0]['injected_incomplete']:return False
+ observed=scans[0]['observed']; pid=last['observer']['pid']
+ return (last['witness_held'] and not observed['reason'] and observed['state']!='unverifiable'
+         and any(p==pid and state!='Z' for p,state in observed['members'])
+         and all(p==pid or state=='Z' for p,state in observed['members'])
+         and result=={'status':'released','release_proven':True,'occupied':False}
+         and token not in last['after']['leases'] and not returned['state']['leases'])
 def actor():
  root=Path(sys.argv[2]);assert root.name.startswith('governor-supplement-') and str(root).startswith('/tmp/')
  if os.getpgrp()!=os.getpid():os.setsid()
@@ -41,7 +92,7 @@ def actor():
    elif cmd=='observe':out['observation']=G.observe_witness(d,r['binding']).__dict__
    elif cmd=='finish':
     for c in children:c.stdin.close();c.wait(timeout=10)
-    children.clear();out['returns']=[{'root':str(rd),'result':gov.release(rd,t),'state':snap(rd)} for rd,t in leases]
+    children.clear();out['returns']=[finish_local_lease(rd,t) for rd,t in leases]
    elif cmd=='ping':out['children']=[ident(c.pid) for c in children]
    print(json.dumps(out),flush=True)
  finally:
@@ -71,7 +122,7 @@ def run():
    held=owner.call(cmd='hold',case=name);rel=observer.call(cmd='release',case=name,token=held['token']);alive=owner.call(cmd='ping')
    record(name,{'lease_retained':True,'owner_alive':True,'descendant_alive':True},{'lease_retained':held['token'] in rel['after']['leases'],'owner_alive':'errno' not in alive['observer'],'descendant_alive':all('errno' not in x and x.get('state')!='Z' for x in alive['children'])},{'hold':held,'release':rel,'owner_after':alive})
   for a in (outer,inner):
-   result=a.call(cmd='finish');record('local-return-'+a.label,True,all(x['result']['release_proven'] and not x['state']['leases'] for x in result['returns']),result)
+   result=a.call(cmd='finish');record('local-return-'+a.label,True,all(local_drain_proven(x) for x in result['returns']),result)
   d=root/'wrapper-cancel';before=len(os.listdir('/proc/self/fd'));t,_=D.reserve_governor_token(SOURCE/'utilities/model-worker-governor.py',d,'dispatch');h=D._GOVERNOR_WITNESS_HANDLES[D._governor_witness_key(d,t)];during=len(os.listdir('/proc/self/fd'));state=snap(d);D.cancel_governor_reservation(SOURCE/'utilities/model-worker-governor.py',d,t);after=len(os.listdir('/proc/self/fd'))
   record('wrapper-cancel-real-FD',{'fd_delta_held':1,'fd_delta_after':0,'handles':0,'reservations':0},{'fd_delta_held':during-before,'fd_delta_after':after-before,'handles':len(D._GOVERNOR_WITNESS_HANDLES),'reservations':len(snap(d)['reservations'])},{'before_fd':before,'during_fd':during,'after_fd':after,'held_state':state,'final_state':snap(d),'witness_path_exists':h.path.exists()})
   d=root/'fork';h=G.create_witness(d,'reservation');rd,wr=os.pipe();pid=os.fork()
