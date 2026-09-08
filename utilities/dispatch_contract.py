@@ -23,6 +23,27 @@ import uuid
 from typing import Callable, Iterator, Mapping, NamedTuple
 
 from route_identity import registered_node_identity
+from governor_identity import close_witness, create_witness
+
+_GOVERNOR_WITNESS_HANDLES: dict[tuple[str, str], object] = {}
+
+
+def _governor_witness_key(root: Path, token: str) -> tuple[str, str]:
+    return str(root.resolve()), token
+
+
+def _return_governor_witness(root: Path, token: str, receipt: dict | None = None) -> None:
+    key = _governor_witness_key(root, token)
+    handle = _GOVERNOR_WITNESS_HANDLES.get(key)
+    if handle is None:
+        return  # Provided batch token: this wrapper owns no issuer FD.
+    if handle.creator_pid != os.getpid():
+        return
+    if receipt is not None and receipt.get("owner_witness") != handle.binding():
+        raise DispatchContractError("model-worker-reservation-claim-mismatch", "owner witness receipt differs")
+    _GOVERNOR_WITNESS_HANDLES.pop(key)
+    close_witness(handle)
+
 
 # SD-120/121 terminal claim primitive.  The caller must already own the
 # existing jobs.log.lock; this module never acquires another lock for a claim.
@@ -3301,8 +3322,11 @@ def reserve_governor_token(
             "parallel-group-batch-required",
             "parallel start requires an exact bound batch reservation",
         )
-    payload = _governor_json(
-        [
+    handle = create_witness(root, "reservation")
+    retained = False
+    try:
+        payload = _governor_json(
+            [
             sys.executable,
             str(governor),
             "--root",
@@ -3314,12 +3338,21 @@ def reserve_governor_token(
             "1",
             "--pid",
             str(os.getpid()),
-        ]
-    )
-    tokens = payload.get("tokens")
-    if not isinstance(tokens, list) or len(tokens) != 1 or not isinstance(tokens[0], str):
-        raise DispatchContractError("model-worker-reservation-invalid", "expected one token")
-    return tokens[0], {}
+            "--owner-witness",
+            json.dumps(handle.binding(), sort_keys=True, separators=(",", ":")),
+            ]
+        )
+        tokens = payload.get("tokens")
+        if (not isinstance(tokens, list) or len(tokens) != 1 or not isinstance(tokens[0], str)
+                or len(tokens[0]) != 32 or any(c not in "0123456789abcdef" for c in tokens[0])):
+            raise DispatchContractError("model-worker-reservation-invalid", "expected one token")
+        _GOVERNOR_WITNESS_HANDLES[_governor_witness_key(root, tokens[0])] = handle
+        retained = True
+        return tokens[0], {}
+    except BaseException:
+        if not retained:
+            close_witness(handle)
+        raise
 
 
 def cancel_governor_reservation(governor: Path, root: Path, token: str) -> None:
@@ -3339,11 +3372,16 @@ def cancel_governor_reservation(governor: Path, root: Path, token: str) -> None:
                 token,
             ]
         )
-    except DispatchContractError:
+    except DispatchContractError as exc:
+        print(f"model-worker-reservation-cancel-unverified: {exc.reason}", file=sys.stderr)
+        return
+    if payload.get("state") == "claimed":
+        _return_governor_witness(root, token, payload)
         return
     if payload.get("state") != "unclaimed":
+        print("model-worker-reservation-cancel-unverified: no exact return receipt", file=sys.stderr)
         return
-    subprocess.run(
+    completed = subprocess.run(
         [
             sys.executable,
             str(governor),
@@ -3354,10 +3392,20 @@ def cancel_governor_reservation(governor: Path, root: Path, token: str) -> None:
             token,
         ],
         stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
         check=False,
     )
+    if completed.returncode == 0 and completed.stdout.strip() == "reservation=cancelled":
+        _return_governor_witness(root, token)
+    elif completed.returncode != 0:
+        # Claim may have won after our unclaimed observation. Only its exact
+        # transfer receipt can return this issuer's FD; an error alone cannot.
+        payload = _governor_json([sys.executable, str(governor), "--root", str(root),
+                                  "reservation-check", "--token", token])
+        if payload.get("state") == "claimed":
+            _return_governor_witness(root, token, payload)
 
 
 RESERVATION_CLAIM_TIMEOUT_DEFAULT = 60.0
@@ -3425,6 +3473,7 @@ def wait_governor_reservation_claim(
                     "model-worker-reservation-claim-mismatch",
                     f"expected_pid={proc.pid} claimant_pid={payload.get('claimant_pid', '-')}",
                 )
+            _return_governor_witness(root, token, payload)
             return payload
         if payload.get("state") == "absent":
             raise DispatchContractError(
