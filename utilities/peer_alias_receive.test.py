@@ -185,7 +185,7 @@ class AliasReceive(unittest.TestCase):
                     self.assertIsNone(self.parse(text + "改", target))
                     self.assertIsNone(self.parse(text, dict(target, session_id="new-occupant")))
                     self._receive_actual(receiver_harness, text)
-                    path = receiver_root / "peer-messages" / time.strftime("%Y-%m") / (sender["session_id"] + ".jsonl")
+                    path = receiver_root / "peer-messages" / time.strftime("%Y-%m", time.gmtime()) / (sender["session_id"] + ".jsonl")
                     row = json.loads(path.read_text().splitlines()[-1])
                     self.assertEqual(row["from"]["session_id"], sender["session_id"])
                     self.assertEqual(row["to"]["session_id"], target["session_id"])
