@@ -662,7 +662,11 @@ def _registry_attribution_quiescent(nested_home: Path, jobs: Path | None) -> str
             # The portable parser is permissive; refuse ambiguous input before
             # using its supported exact-PID/namespace-aware liveness reader.
             fields = [field for field in pipe.split(",") if "=" in field]
-            keys = [field.split("=", 1)[0] for field in fields]
+            # Registry writers append repeatable note annotations; the portable
+            # parser retains the latest note. It is not process/attribution
+            # proof. Every other key must remain unambiguous.
+            keys = [field.split("=", 1)[0] for field in fields
+                    if field.split("=", 1)[0] != "note"]
             if len(set(keys)) != len(keys):
                 return "unknown"
             metadata = parse_registry_metadata(pipe)

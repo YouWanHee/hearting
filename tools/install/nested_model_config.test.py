@@ -915,6 +915,43 @@ class NestedModelConfigTestCase(unittest.TestCase):
             with self.assertRaises(nmc.ConflictError): self._recover_legacy(dest)
         self.assertEqual(nmc.receipt_path(self.nested).read_text(), '{"foreign":"successor"}\n')
 
+    def _closed_namespace_row(self):
+        return {"codex_home": str(self.nested), "attempt_id": "att-repeat-note-private-fixture",
+            "registered_worker": "1", "pid": "437", "pid_start": "42", "pgid": "437",
+            "pid_scope": "namespace-local", "pid_ns": "pid:[former-observer]", "pid_observer_ns": "pid:[former-observer]",
+            "launch_lifecycle": "detached", "launch_outcome": "governed-process-group-drained",
+            "group_reap_proof": "pgid-empty-v1", "group_reap_pgid": "437",
+            "attempt_descendant_proof": "attempt-tagged-empty-v1", "attempt_descendant_observer_ns": "pid:[former-observer]"}
+
+    def test_repeatable_registry_notes_preserve_closed_process_proof(self):
+        metadata = self._closed_namespace_row()
+        self._write_row("done", metadata)
+        ordinary = self.jobs.read_text()
+        self.jobs.write_text(ordinary.rstrip("\n") + ",note=completed,note=cleanup-merged\n")
+        before = self.jobs.read_bytes()
+        self.assertEqual(nmc._registry_attribution_quiescent(self.nested, self.jobs), "quiescent")
+        self.assertEqual(self.jobs.read_bytes(), before)
+        # An unrelated historical annotation must not obstruct this home's proof.
+        unrelated = before.decode().replace(str(self.nested), str(self.root / "unrelated-home"))
+        self.jobs.write_text(unrelated + ordinary)
+        before = self.jobs.read_bytes()
+        self.assertEqual(nmc._registry_attribution_quiescent(self.nested, self.jobs), "quiescent")
+        self.assertEqual(self.jobs.read_bytes(), before)
+
+    def test_repeat_notes_do_not_permit_duplicate_identity_or_home_keys(self):
+        metadata = self._closed_namespace_row()
+        for key in ("attempt_id", "codex_home", "pid", "pid_start", "pid_ns"):
+            for duplicate in (metadata[key], "foreign-successor"):
+                with self.subTest(key=key, duplicate=duplicate):
+                    self._write_row("done", metadata)
+                    original = self.jobs.read_text().rstrip("\n")
+                    self.jobs.write_text(original + f",note=old,note=new,{key}={duplicate}\n")
+                    before = self.jobs.read_bytes()
+                    with mock.patch.object(nmc, "observed_attempt_liveness", wraps=nmc.observed_attempt_liveness) as observe:
+                        self.assertEqual(nmc._registry_attribution_quiescent(self.nested, self.jobs), "unknown")
+                        observe.assert_not_called()
+                    self.assertEqual(self.jobs.read_bytes(), before)
+
 
 def _parse_config_bytes(raw: bytes) -> dict[str, str]:
     return nmc._parse_captured_buffer(raw)
