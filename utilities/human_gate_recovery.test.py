@@ -10,6 +10,7 @@ import importlib.util
 import io
 import json
 import os
+import socket
 import stat
 from pathlib import Path
 import sys
@@ -545,6 +546,228 @@ class M4LeaseRecovery(GatewayFixture):
         self.assertEqual(self.g._delivery_pending, {})
         self.assertEqual(self.g.ledger.get(self.did)["state"], "rejected")
         self.assertEqual(len(self.sink.sent), 0)
+
+
+    def test_m3d2_untyped_rejection_preserves_claim(self):
+        def untyped(socket, request):
+            if request["op"] == "status":
+                return self.transport(socket, request)
+            self.transport_calls += 1
+            return {"status": "rejected", "reason": "[Errno 13] Permission denied"}
+        self.one(untyped)
+        self.assertEqual(self.transport_calls, 1)
+        self.assertEqual(self.record()["state"], "claimed")
+        self.assertIn(self.path, self.watcher._candidate_paths(self.path.parent))
+        self.assertIn("gateway-rejection-untyped", self.watcher.errors[-1])
+
+    def test_m3d2_unconfirmed_rejection_is_not_terminal(self):
+        def unconfirmed(socket, request):
+            if request["op"] == "status":
+                return self.transport(socket, request)
+            return {"status": "rejected", "reason": "rejection-ledger-commit-failed",
+                    "ledger_commit": "unconfirmed"}
+        self.one(unconfirmed)
+        self.assertEqual(self.record()["state"], "claimed")
+
+    def test_m3d2_prepare_retryable_claim_recovers_after_expiry(self):
+        os.chmod(self.root, 0o500)
+        self.addCleanup(os.chmod, self.root, 0o700)
+        with self.assertRaises(PermissionError):
+            fd, path = tempfile.mkstemp(dir=self.root)
+            os.close(fd)
+            Path(path).unlink()
+        self.one()
+        self.assertEqual(self.transport_calls, 1)
+        self.assertEqual(self.record()["state"], "claimed")
+        os.chmod(self.root, 0o700)
+        self.clock += 31_000_000_000
+        self.state.steer_ready = True
+        self.one()
+        self.assertEqual(len(self.sink.sent), 1)
+        self.response({"result": {"turnId": "busy"}})
+        self.clock += 31_000_000_000
+        self.one()
+        self.assertEqual(self.record()["state"], "acked")
+        self.assertEqual(len(self.sink.sent), 1)
+
+
+class M3D2StorageFailure(GatewayFixture):
+    def readonly(self):
+        os.chmod(self.root, 0o500)
+        self.addCleanup(os.chmod, self.root, 0o700)
+        with self.assertRaises(PermissionError):
+            fd, path = tempfile.mkstemp(dir=self.root)
+            os.close(fd)
+            Path(path).unlink()
+
+    def call(self):
+        # Keep notification semantics real; only avoid a 120s timeout.
+        with mock.patch.object(threading.Event, "wait", lambda event, timeout=None: event.is_set()):
+            return self.g.deliver_human_gate(self.request)
+
+    def clean_pending(self):
+        self.assertEqual(self.g._delivery_pending, {})
+        self.assertEqual(self.g._internal, {})
+        self.assertEqual(self.state.queued, [])
+        self.assertEqual(self.state.idle_completions, [])
+        self.assertIsNone(self.state.pending_start_id)
+        self.assertEqual(self.state.pending_start_owner, "")
+
+    def test_s1_prepare_eacces_restores_retryable_identity(self):
+        self.readonly()
+        result = self.call()
+        self.assertEqual((result["status"], result["reason"]),
+                         ("retryable", "prepared-ledger-commit-failed"))
+        self.assertIsNone(self.g.ledger.get(self.did))
+        self.clean_pending()
+        self.assertEqual(self.sink.sent, [])
+        os.chmod(self.root, 0o700)
+        self.state.active_turn_id = ""
+        self.call()
+        self.assertEqual(len(self.sink.sent), 1)
+        self.response({"result": {"turn": {"id": "recovered"}}})
+        self.assertEqual(self.g.deliver_human_gate(self.request)["status"], "accepted")
+
+    def test_s2_sent_eacces_not_sent_cleans_and_retries(self):
+        self.call()  # Real validation and prepared queue.
+        pending = self.g._delivery_pending[self.did]
+        self.readonly()
+        self.state.steer_ready = True
+        with self.g._lock:
+            self.g._drain_queued_locked(self.state)
+        self.assertTrue(pending.event.is_set())
+        self.assertEqual((pending.outcome["status"], pending.outcome["reason"]),
+                         ("retryable", "sent-ledger-commit-failed"))
+        self.assertEqual(self.g.ledger.get(self.did)["state"], "prepared")
+        self.assertEqual(GF.DeliveryLedger(self.root / "gateway.json").get(self.did)["state"], "prepared")
+        self.clean_pending()
+        self.assertEqual(self.sink.sent, [])
+        os.chmod(self.root, 0o700)
+        self.call()
+        self.assertEqual(len(self.sink.sent), 1)
+
+    def test_s3_transport_failure_is_ambiguous_without_phantom_start(self):
+        self.state.active_turn_id = ""
+        with mock.patch.object(self.sink, "write_json", side_effect=OSError(errno.EPIPE, "broken pipe")) as send:
+            result = self.call()
+        self.assertEqual(send.call_count, 1)
+        self.assertEqual((result["status"], result["reason"]),
+                         ("sent-ambiguous", "human-gate-send-failed"))
+        self.clean_pending()
+        self.assertEqual(GF.DeliveryLedger(self.root / "gateway.json").get(self.did)["state"], "sent")
+        self.assertEqual(self.g.deliver_human_gate(self.request)["status"], "sent-ambiguous")
+        self.assertEqual(self.sink.sent, [])
+
+    def terminal_storage_failure(self, accepted):
+        self.state.active_turn_id = ""
+        self.call()
+        pending = self.g._delivery_pending[self.did]
+        self.readonly()
+        response = {"result": {"turn": {"id": "accepted-turn"}}} if accepted else {
+            "error": {"code": -1, "message": "boom"}}
+        self.response(response)
+        self.assertTrue(pending.event.is_set())
+        expected = "accepted-ledger-commit-failed" if accepted else "rejection-ledger-commit-failed"
+        self.assertEqual((pending.outcome["status"], pending.outcome["reason"]), ("sent-ambiguous", expected))
+        self.assertEqual(self.g.ledger.get(self.did)["state"], "sent")
+        self.assertEqual(GF.DeliveryLedger(self.root / "gateway.json").get(self.did)["state"], "sent")
+        self.clean_pending()
+        before = dict(pending.outcome)
+        self.g._disconnect_epoch(self.g._epoch, None, None)
+        self.assertEqual(pending.outcome, before)
+        self.assertEqual(len(self.sink.sent), 1)
+
+    def test_s4_accept_storage_failure_not_success_or_disconnect(self):
+        self.terminal_storage_failure(True)
+
+    def test_s5_reject_storage_failure_not_terminal_rejection(self):
+        self.terminal_storage_failure(False)
+
+    def test_s7_actual_control_socket_prepare_failure_is_typed_retryable(self):
+        self.readonly()
+        client, server = socket.socketpair()
+        self.addCleanup(client.close)
+        client.settimeout(2)
+        client.sendall((json.dumps(self.request) + "\n").encode())
+        self.g._handle_control(server)
+        result = json.loads(client.recv(16384))
+        self.assertEqual((result["status"], result["reason"]),
+                         ("retryable", "prepared-ledger-commit-failed"))
+        self.assertNotIn("[Errno", result["reason"])
+
+    def test_sent_post_replace_fsync_failure_never_resends(self):
+        self.call()
+        pending = self.g._delivery_pending[self.did]
+        self.state.steer_ready = True
+        fsync = GF.os.fsync
+        def fail_directory(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError(errno.EIO, "directory fsync failed")
+            return fsync(fd)
+        with mock.patch.object(GF.os, "fsync", side_effect=fail_directory):
+            with self.g._lock:
+                self.g._drain_queued_locked(self.state)
+        self.assertTrue(pending.event.is_set())
+        self.assertEqual(pending.outcome["status"], "sent-ambiguous")
+        self.clean_pending()
+        self.assertEqual(GF.DeliveryLedger(self.root / "gateway.json").get(self.did)["state"], "sent")
+        self.assertEqual(self.g.deliver_human_gate(self.request)["status"], "sent-ambiguous")
+        self.assertEqual(self.sink.sent, [])
+
+    def test_prepare_post_replace_fsync_failure_can_retry_before_any_send(self):
+        fsync = GF.os.fsync
+        def fail_directory(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError(errno.EIO, "directory fsync failed")
+            return fsync(fd)
+        with mock.patch.object(GF.os, "fsync", side_effect=fail_directory):
+            result = self.call()
+        self.assertEqual(result["status"], "retryable")
+        self.assertEqual(GF.DeliveryLedger(self.root / "gateway.json").get(self.did)["state"], "prepared")
+        self.clean_pending()
+        self.state.active_turn_id = ""
+        self.call()
+        self.assertEqual(len(self.sink.sent), 1)
+
+    def test_idle_sent_failure_clears_start_reservation(self):
+        self.state.active_turn_id = ""
+        write = self.g.ledger._write
+        calls = []
+        def fail_sent():
+            calls.append(self.g.ledger.get(self.did)["state"])
+            if calls[-1] == "sent":
+                self.readonly()
+            return write()
+        with mock.patch.object(self.g.ledger, "_write", side_effect=fail_sent):
+            result = self.call()
+        self.assertEqual(calls, ["prepared", "sent"])
+        self.assertEqual(result["status"], "retryable")
+        self.clean_pending()
+        os.chmod(self.root, 0o700)
+        self.call()
+        self.assertEqual(len(self.sink.sent), 1)
+
+    def test_transport_written_then_exception_is_never_resent(self):
+        self.state.active_turn_id = ""
+        write = self.sink.write_json
+        def partial(message):
+            write(message)
+            raise OSError(errno.EPIPE, "ack of send unavailable")
+        with mock.patch.object(self.sink, "write_json", side_effect=partial):
+            result = self.call()
+        self.assertEqual(result["status"], "sent-ambiguous")
+        self.clean_pending()
+        self.assertEqual(self.g.deliver_human_gate(self.request)["status"], "sent-ambiguous")
+        self.assertEqual(len(self.sink.sent), 1)
+
+    def test_control_oserror_uses_typed_retryable_result(self):
+        client, server = socket.socketpair()
+        self.addCleanup(client.close)
+        client.settimeout(2)
+        with mock.patch.object(self.g, "_read_control_line", side_effect=OSError(errno.EIO, "read failure")):
+            self.g._handle_control(server)
+        result = json.loads(client.recv(16384))
+        self.assertEqual((result["status"], result["reason"]), ("retryable", "control-io-failed"))
 
 
 if __name__ == "__main__":

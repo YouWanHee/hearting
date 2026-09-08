@@ -1371,7 +1371,13 @@ class ManagedGateway:
                 response = self.deliver_human_gate(value)
             else:
                 raise GatewayError("control-operation-invalid")
-        except (GatewayError, OSError) as exc:
+        except OSError as exc:
+            response = {
+                "schema_version": 1, "status": "retryable",
+                "reason": "control-io-failed",
+                "io_error": f"{type(exc).__name__}: {exc}",
+            }
+        except GatewayError as exc:
             response = {
                 "schema_version": 1,
                 "status": "rejected",
@@ -1731,7 +1737,8 @@ class ManagedGateway:
                     return {"schema_version": 1, "status": "sent-ambiguous", "delivery_id": delivery_id,
                             "reason": "accept-not-observed-no-resend"}
                 pending = self._delivery_pending[delivery_id]
-            elif existing and existing.get("state") == "prepared":
+            elif (existing and existing.get("state") == "prepared"
+                  and not existing.get("retryable_before_send")):
                 # A validation timeout or reconnect can leave a durable
                 # prepared row while the original requester is still waiting.
                 # Reuse that live object; never append a second queue entry for
@@ -1751,12 +1758,16 @@ class ManagedGateway:
                 if self._binding_thread_id != thread_id:
                     return {"schema_version": 1, "status": "rejected", "delivery_id": delivery_id,
                             "reason": "thread-not-owned-by-current-tui"}
-                if existing is None:
-                    self.ledger._transition(delivery_id, "prepared", **identity)
                 pending = PendingInternal(kind="human-gate-wait", thread_id=thread_id,
                                           delivery_id=delivery_id, identity=identity, receipt=receipt)
-                self._delivery_pending[delivery_id] = pending
                 state = self._threads.setdefault(thread_id, ThreadState())
+                try:
+                    self.ledger._transition(delivery_id, "prepared", **identity)
+                except (GatewayError, OSError) as exc:
+                    self._human_gate_storage_failure_locked(
+                        pending, state, existing, "prepared", exc)
+                    return pending.outcome
+                self._delivery_pending[delivery_id] = pending
                 if state.active_turn_id and state.steer_ready:
                     self._send_human_gate_locked(pending, state)
                 elif state.active_turn_id or state.pending_start_id is not None:
@@ -1768,6 +1779,63 @@ class ManagedGateway:
                     "reason": "accept-response-timeout-no-resend"}
         return pending.outcome or {"schema_version": 1, "status": "sent-ambiguous",
                                    "delivery_id": delivery_id, "reason": "delivery-outcome-missing"}
+
+    def _human_gate_storage_failure_locked(
+        self, pending: PendingInternal, state: ThreadState,
+        previous: dict[str, Any] | None, phase: str, error: Exception,
+    ) -> None:
+        """Retire local waiters without inventing a durable commit or a resend.
+
+        Only a failed, pre-transport transition whose disk row is still absent
+        or prepared can be retried. A post-replace failure may already have
+        sealed sent: that row and every transport attempt remain no-resend.
+        """
+        safe = False
+        durable = None
+        try:
+            if phase != "transport" and (previous or {}).get("state") not in {"sent", "accepted", "rejected"}:
+                durable = DeliveryLedger(self.ledger.path).get(pending.delivery_id)
+                safe = durable is None or (
+                    durable.get("state") == "prepared"
+                    and all(durable.get(k) == v for k, v in pending.identity.items()))
+        except (GatewayError, OSError):
+            pass  # Unreadable commit state never grants a second send.
+        outcome = {
+            "schema_version": 1,
+            "status": "retryable" if safe else "sent-ambiguous",
+            "delivery_id": pending.delivery_id,
+            "reason": "human-gate-send-failed" if phase == "transport" else f"{phase}-ledger-commit-failed",
+            "ledger_commit": "unconfirmed",
+            "ledger_error": f"{type(error).__name__}: {error}",
+        }
+        try:
+            if safe:
+                restored = durable or previous
+                if restored is None:
+                    self.ledger.value["deliveries"].pop(pending.delivery_id, None)
+                else:
+                    self.ledger.value["deliveries"][pending.delivery_id] = {
+                        **restored, "retryable_before_send": True,
+                        "storage_failure": dict(outcome),
+                    }
+            else:
+                row = self.ledger.get(pending.delivery_id)
+                if row is not None:
+                    row.pop("retryable_before_send", None)
+                    row["storage_failure"] = dict(outcome)
+                    self.ledger.value["deliveries"][pending.delivery_id] = row
+            state.queued[:] = [item for item in state.queued if item is not pending]
+            state.idle_completions[:] = [item for item in state.idle_completions if item is not pending]
+            self._delivery_pending.pop(pending.delivery_id, None)
+            key = request_key(pending.request_id) if pending.request_id else None
+            if key is not None:
+                self._internal.pop(key, None)
+                if state.pending_start_id == key:
+                    state.pending_start_id = None
+                    state.pending_start_owner = ""
+            pending.outcome = outcome
+        finally:
+            pending.event.set()
 
     def _send_human_gate_locked(self, pending: PendingInternal, state: ThreadState) -> None:
         current_thread = self._binding_thread_id
@@ -1828,9 +1896,17 @@ class ManagedGateway:
         else:
             state.pending_start_id = key
             state.pending_start_owner = "human-gate"
-        self.ledger._transition(pending.delivery_id, "sent", action="steer" if method == "turn/steer" else "start", **pending.identity)
-        self._upstream_required_locked().write_json({"jsonrpc": "2.0", "id": request_id,
-                                                     "method": method, "params": params})
+        previous = self.ledger.get(pending.delivery_id)
+        try:
+            self.ledger._transition(pending.delivery_id, "sent", action="steer" if method == "turn/steer" else "start", **pending.identity)
+        except (GatewayError, OSError) as exc:
+            self._human_gate_storage_failure_locked(pending, state, previous, "sent", exc)
+            return
+        try:
+            self._upstream_required_locked().write_json({"jsonrpc": "2.0", "id": request_id,
+                                                         "method": method, "params": params})
+        except (GatewayError, OSError) as exc:
+            self._human_gate_storage_failure_locked(pending, state, previous, "transport", exc)
 
     def deliver(self, request: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -2007,6 +2083,7 @@ class ManagedGateway:
     def _accept_delivery_locked(
         self, pending: PendingInternal, action: str
     ) -> None:
+        previous = self.ledger.get(pending.delivery_id)
         try:
             self.ledger._transition(
                 pending.delivery_id,
@@ -2021,13 +2098,18 @@ class ManagedGateway:
                 "action": action,
                 "replay": False,
             }
-        except GatewayError:
+        except (GatewayError, OSError) as exc:
             outcome = {
                 "schema_version": 1,
                 "status": "sent-ambiguous",
                 "delivery_id": pending.delivery_id,
                 "reason": "accepted-ledger-commit-failed",
+                "ledger_commit": "unconfirmed",
+                "ledger_error": f"{type(exc).__name__}: {exc}",
             }
+            if previous is not None:
+                self.ledger.value["deliveries"][pending.delivery_id] = {
+                    **previous, "storage_failure": dict(outcome)}
         self._delivery_pending.pop(pending.delivery_id, None)
         pending.outcome = outcome
         pending.event.set()
@@ -2042,6 +2124,8 @@ class ManagedGateway:
     def _reject_delivery_locked(
         self, pending: PendingInternal, reason: str
     ) -> None:
+        previous = self.ledger.get(pending.delivery_id)
+        failure = None
         try:
             self.ledger._transition(
                 pending.delivery_id,
@@ -2049,21 +2133,28 @@ class ManagedGateway:
                 reason=reason,
                 **pending.identity,
             )
-        except GatewayError:
+        except (GatewayError, OSError) as exc:
             reason = "rejection-ledger-commit-failed"
+            failure = {"ledger_commit": "unconfirmed",
+                       "ledger_error": f"{type(exc).__name__}: {exc}"}
         self._delivery_pending.pop(pending.delivery_id, None)
         pending.outcome = {
             "schema_version": 1,
-            "status": "rejected",
+            "status": "sent-ambiguous" if failure else "rejected",
             "delivery_id": pending.delivery_id,
             "reason": reason,
         }
+        if failure:
+            pending.outcome.update(failure)
+            if previous is not None:
+                self.ledger.value["deliveries"][pending.delivery_id] = {
+                    **previous, "storage_failure": dict(pending.outcome)}
         pending.event.set()
         self.trace(
             "completion-result",
             thread_id=pending.thread_id,
             delivery_id=pending.delivery_id,
-            status="rejected",
+            status=pending.outcome["status"],
             reason=reason,
         )
 

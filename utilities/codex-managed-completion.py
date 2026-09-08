@@ -8,6 +8,7 @@ from collections import Counter, deque
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shlex
 import socket
@@ -185,12 +186,23 @@ class HumanGateWatcher:
                     claim_owner=self.owner,
                 )
             elif result.get("status") == "retryable":
-                pending_delivery.reclaim(self.root, self.recipient, claimed["delivery_id"],
-                                         now_ns=time.monotonic_ns())
+                # Keep the current lease. The next scan may reclaim it only
+                # after its actual deadline; a transient storage error is
+                # neither permanent rejection nor evidence of a send.
+                self._record_error(str(result.get("reason") or "gateway-retryable"))
             elif result.get("status") == "rejected":
+                reason = result.get("reason")
+                if (result.get("ledger_commit") == "unconfirmed"
+                        or (isinstance(reason, str) and reason.endswith("-ledger-commit-failed"))):
+                    self._record_error("gateway-rejection-commit-unconfirmed")
+                    return
+                if (not isinstance(reason, str)
+                        or not re.fullmatch(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)+(?:[:].*)?", reason)):
+                    self._record_error("gateway-rejection-untyped")
+                    return
                 pending_delivery.reject_claimed(
                     self.root, self.recipient, claimed["delivery_id"],
-                    claim_owner=self.owner, reason=result.get("reason", "gateway-rejected"))
+                    claim_owner=self.owner, reason=reason)
         except Exception as exc:
             if sent:
                 try:
