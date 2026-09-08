@@ -6,6 +6,10 @@ inside an OPEN producer cycle (`--bundle-dir` under `.../artifacts/`).  Every ro
 of the C-P0 REPORT §11 table becomes one file; `handoff.json` indexes them with
 sha256 digests.  Only stable IDs, locators, digests, and counts are emitted —
 never note bodies or secrets.
+
+`--include-w16-namespace-delete` adds the optional namespace-delete boundary to
+a NEW bundle. D20 and W16 must consume bindings from that same final bundle;
+this option does not grant either approval. The default remains three stages.
 """
 from __future__ import annotations
 
@@ -134,7 +138,9 @@ def load_notes(path: Path):
 
 class Bundle:
     def __init__(self, root: Path, bundle_dir: Path, cycles, w7_evidence: Path, w7c_run: Path,
-                 retirement_run: Path, backup_tar: Path | None, census_runs, notes=None, notes_meta=None):
+                 retirement_run: Path, backup_tar: Path | None, census_runs, notes=None, notes_meta=None,
+                 include_w16_namespace_delete=False):
+        self.include_w16_namespace_delete = include_w16_namespace_delete
         self.notes = notes
         self.notes_meta = notes_meta or {}
         self.root = root
@@ -392,7 +398,7 @@ class Bundle:
     def approval_boundary(self, bundle_digest_seed):
         def aid(stage):
             return "apr_" + hashlib.sha256(f"{SCHEMA}\0{bundle_digest_seed}\0{stage}".encode()).hexdigest()[:32]
-        return {"schema": SCHEMA, "row": "approval boundary",
+        boundary = {"schema": SCHEMA, "row": "approval boundary",
                 "stages": [
                     {"stage": "W9-dry-run", "approval_id": aid("W9-dry-run"), "authorized": False, "mutates": "nothing (candidate digest only)"},
                     {"stage": "W10-D20-destructive-apply", "approval_id": aid("W10-D20"), "authorized": False,
@@ -402,6 +408,14 @@ class Bundle:
                      "invariant": "l2_notes INSERT/UPDATE/DELETE = 0; link rows only"},
                 ],
                 "note": "three separate approvals; none is granted by this bundle"}
+        if self.include_w16_namespace_delete:
+            boundary["stages"].append({
+                "stage": "W16-namespace-delete", "approval_id": aid("W16-namespace-delete"),
+                "authorized": False,
+                "invariant": "separately approved namespace allowlist only; active namespace, l2_notes, and source artifacts excluded",
+            })
+            boundary["note"] = "four separate approvals; none is granted by this bundle"
+        return boundary
 
     # -- run -----------------------------------------------------------------
     def build(self):
@@ -450,6 +464,8 @@ def main(argv=None):
     ap.add_argument("--backup-tar")
     ap.add_argument("--census", help="delta-census json to cite")
     ap.add_argument("--notes", help="Cairn body-free note export (cairn-w8-notes/v1) to seal as notes.json")
+    ap.add_argument("--include-w16-namespace-delete", action="store_true",
+                    help="add the optional, unauthorized W16 boundary to a new bundle; use this same bundle for D20 and W16")
     args = ap.parse_args(argv)
     notes = notes_meta = None
     if args.notes:
@@ -468,7 +484,8 @@ def main(argv=None):
         census = {"path": args.census, "sha256": sha_file(Path(args.census)), "runs": c.get("runs"), "stable": c.get("stable_across_runs"),
                   "unclassified_total": c.get("unclassified_total")}
     b = Bundle(root, bundle_dir, args.cycle, Path(args.w7_evidence), Path(args.w7c_run), Path(args.retirement_run),
-               Path(args.backup_tar).expanduser() if args.backup_tar else None, census, notes, notes_meta)
+               Path(args.backup_tar).expanduser() if args.backup_tar else None, census, notes, notes_meta,
+               include_w16_namespace_delete=args.include_w16_namespace_delete)
     index = b.build()
     print(json.dumps({"bundle_dir": str(bundle_dir), "bundle_digest": index["bundle_digest"],
                       "files": {k: v["sha256"] for k, v in index["files"].items()}}, indent=1))
