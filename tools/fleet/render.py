@@ -1811,6 +1811,11 @@ def _session_tag_chip(s, dim=False):
     tag = getattr(s, "session_tag", None)
     steward = bool(getattr(s, "steward", False))
     if not isinstance(tag, str) or not tag:
+        if getattr(s, "_session_tag_unpaired", False) and not steward:
+            # A Codex app-server row whose managed state dir paired with no tagged TUI
+            # client (collectors/codex.share_managed_tags): say so instead of a blank slot.
+            body = "--"[: _TAG_W - 3].ljust(_TAG_W - 3)
+            return [("[", "dim"), (body, "tag_dim"), ("]", "dim"), (" ", None)]
         if not steward:
             return [(" " * _TAG_W, None)]
         tag = "*"          # F-100c: an untagged steward (Codex/OpenCode today) still gets a badge

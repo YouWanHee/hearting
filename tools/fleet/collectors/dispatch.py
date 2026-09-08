@@ -41,6 +41,7 @@ from dispatch_contract import (  # noqa: E402
     observed_supervised_owner_liveness,
     resolve_parent_extinction,
     resolve_agent_home,
+    process_table_scan_scope,
 )
 from dispatch_completion_join import read_supervisor_phase_state  # noqa: E402
 from codex_dispatch_terminal import terminal_envelope_observed  # noqa: E402
@@ -3446,16 +3447,22 @@ def collect(jobs_path=None, harness_filter=None):
         codex_index = None
     # F-18a correlation merges proc evidence onto canonical registry rows BEFORE
     # classification, so every row is decided exactly once, by the single classifier.
-    jobs = _reconcile_drill_rows(jobs, now, codex_index=codex_index)
-    for j in jobs:
-        _enrich_claude_stream_session(j)
-        _enrich_codex_attempt_session(j)
-        _enrich_opencode_attempt_session(j)
-        _enrich_attempt_summary(j)
-    for j in jobs:
-        j.liveness = _dispatch_liveness(j, now, codex_index=codex_index)
-    jobs = _retain_dead_terminal_owners(jobs, now, jobs_path=jobs_path)
-    _annotate_orphan_conductors(jobs, now, jobs_path=jobs_path)
+    # One tick = one /proc walk: every liveness verdict below reaches both
+    # `dispatch_contract.process_group_observation` and `attempt_tagged_descendants`,
+    # each a full /proc walk per call (2026-09-08 audit: 187 rows x two walks = 20 s of
+    # a ~40 s tick). Inside this scope the rows share a single walk taken on entry; the
+    # scope ends with the tick.
+    with process_table_scan_scope():
+        jobs = _reconcile_drill_rows(jobs, now, codex_index=codex_index)
+        for j in jobs:
+            _enrich_claude_stream_session(j)
+            _enrich_codex_attempt_session(j)
+            _enrich_opencode_attempt_session(j)
+            _enrich_attempt_summary(j)
+        for j in jobs:
+            j.liveness = _dispatch_liveness(j, now, codex_index=codex_index)
+        jobs = _retain_dead_terminal_owners(jobs, now, jobs_path=jobs_path)
+        _annotate_orphan_conductors(jobs, now, jobs_path=jobs_path)
     # F-15c(a): a registry-only row (source="jobs") that turns out to be genuinely working
     # re-derives its breadcrumb from the real plan artifacts instead of the raw jobs.log
     # status word ("open"/"running") — otherwise a live job with real progress shows a

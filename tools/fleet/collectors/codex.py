@@ -881,6 +881,51 @@ def _transfer_managed_rollouts(sessions, paths):
     return donated
 
 
+def share_managed_tags(sessions):
+    """Give each managed app-server row the `[xx]` tag of its own TUI client.
+
+    A managed Codex session is two `codex` processes on one `--state-dir`: the
+    `--remote .../managed-tui.sock` client owns the rollout after
+    `_transfer_managed_rollouts` (so the thread id and the minted tag), while the
+    `app-server --listen` sibling holds no rollout of its own and leaves `enrich`
+    before `minted_tag` runs (2026-09-08 audit: 8 Codex rows with a blank badge).
+    The pairing key is the exact managed state dir carried in both argv lines --
+    never the thread id, never a session-id reverse lookup. Exactly one server
+    and exactly one tagged client per dir; anything else stays as it is. A row
+    that already has a tag is never changed. A Codex app-server row that ends
+    without a tag is marked unpaired so the badge can say so instead of staying
+    blank (render `_session_tag_chip`); the mark is ephemeral, never in --json.
+    """
+    servers, clients = {}, {}
+    for sess in sessions:
+        if getattr(sess, "harness", None) != "codex":
+            continue
+        managed_dir = getattr(sess, "managed_dir", None)
+        if not managed_dir:
+            continue
+        key = os.path.normpath(managed_dir)
+        bucket = servers if getattr(sess, "app_server", False) else clients
+        bucket.setdefault(key, []).append(sess)
+    for key, owners in servers.items():
+        tagged = [
+            c for c in clients.get(key, [])
+            if isinstance(getattr(c, "session_tag", None), str) and c.session_tag
+        ]
+        if len(owners) != 1 or len(tagged) != 1:
+            continue
+        server = owners[0]
+        if getattr(server, "session_tag", None):
+            continue
+        server.session_tag = tagged[0].session_tag
+    for sess in sessions:
+        if (
+            getattr(sess, "harness", None) == "codex"
+            and getattr(sess, "app_server", False)
+            and not getattr(sess, "session_tag", None)
+        ):
+            sess._session_tag_unpaired = True
+
+
 def prepare_tick(sessions):
     """Reserve proc-owned rollouts before any same-cwd fallback attribution.
 
