@@ -854,8 +854,15 @@ class MaterialRouteGuardTest(unittest.TestCase):
         record that was in fact correct (2026-08-04).
         """
         self.assertEqual(self.bind().returncode, 0)
+        # Shadow only the verifier. The normal fixture utilities directory is
+        # a source symlink; never truncate the candidate under parallel tests.
+        utilities = self.home / "utilities"
+        utilities.unlink()
+        utilities.mkdir()
+        for source in (ROOT / "utilities").iterdir():
+            if source.name != "capability-route.py":
+                (utilities / source.name).symlink_to(source)
         verifier = self.home / "utilities" / "capability-route.py"
-        intact = verifier.read_text()
         # A truncated module: imports fine, dies at run time — exactly the torn read.
         verifier.write_text("import sys\nraise NameError('torn read')\n", encoding="utf-8")
         try:
@@ -864,7 +871,10 @@ class MaterialRouteGuardTest(unittest.TestCase):
             self.assertIn("route-verifier-crashed", crashed.stderr)
             self.assertNotIn("route-record-verification-failed", crashed.stderr)
         finally:
-            verifier.write_text(intact, encoding="utf-8")
+            for entry in utilities.iterdir():
+                entry.unlink()
+            utilities.rmdir()
+            utilities.symlink_to(ROOT / "utilities", target_is_directory=True)
         # The same record verifies once the file is whole again — no retry poisoning.
         self.assertEqual(
             self.guard("--tool", "Edit", "--file", str(self.repo / "app.py")).returncode, 0)

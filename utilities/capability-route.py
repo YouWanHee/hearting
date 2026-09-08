@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compile, verify, and complete immutable capability routes."""
 from __future__ import annotations
-import argparse, base64, contextlib, fcntl, hashlib, importlib.util, json, os, re, shlex, shutil, subprocess, sys, uuid
+import argparse, base64, contextlib, fcntl, hashlib, importlib.util, json, os, re, shlex, shutil, subprocess, sys, tempfile, uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -13,6 +13,7 @@ VALID_AFFINITY = DEFAULTS.AFFINITY_VALUES | {"unspecified"}
 sys.path.insert(0, str(ROOT/"utilities"))
 import artifact_locator as ARTIFACT_LOCATOR
 import route_identity as ROUTE_IDENTITY
+import dispatch_terminal_commit
 import review_round_cap as REVIEW_ROUND_CAP
 from dispatch_continuation_budget import COMPATIBILITY_FLOOR, TERMINAL_RESERVE_DEFAULT
 from dispatch_contract import (
@@ -28,6 +29,9 @@ from dispatch_contract import (
     _atomic_registry_replace,
     _delivery_intent_values,
     _updated_attempt_metadata,
+    claim_terminal_route_locked,
+    ensure_terminal_claim_absent,
+    terminal_claim_observation,
     agent_home_equivalent,
     attempt_process_quiescence,
     completion_marker_is_current,
@@ -2224,6 +2228,7 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
                          tracking="tracked", tracked_gate_evidence=None, dispatch_evidence=None,
                          registered_headless_evidence=None, slug=None, composed=False,
                   route_origin="preset", shape=None):
+    dispatch_terminal_commit.require_current_cleanup("route-compile")
     if route_origin not in ROUTE_ORIGINS: raise ValueError("invalid route origin")
     cwd=Path(cwd).resolve(strict=True); artifact=Path(artifact_root).resolve()
     if not cwd.is_absolute() or not artifact.is_absolute(): raise ValueError("cwd and artifact root must be absolute")
@@ -2382,7 +2387,11 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
           "contract_version":LAUNCH_COMPATIBILITY_TUPLE_VERSION,
           **launch_compatibility_tuple(artifact_root=artifact,cwd=cwd),
       },
-      "advance_generation":0}
+      "advance_generation":0,
+      "runtime_support":{"terminal_commit":False,
+                         "terminal_commit_contract":"terminal_commit_v1",
+                         "terminal_handoff_contract":"terminal_handoff_claim_v1",
+                         "producer_binding_contract":"producer_binding_v1"}}
     payload.update(slug_fields)
     if checked_dispatch is not None:
         payload["dispatch_evidence_scope_version"]=DISPATCH_EVIDENCE_SCOPE_VERSION
@@ -2914,7 +2923,7 @@ def _migrate_completion_dir_forward(route_id, *, jobs=None):
 # route hash, node id, terminal-gate name, evidence readability, evidence hash), so it
 # lives once here and `workflow-supervisor.py` dynamically loads this module rather than
 # re-deriving it -- the dependency stays one-way (supervisor -> capability-route).
-def terminal_gate_observation(route):
+def terminal_gate_observation(route, *, jobs=None, exact_terminal=False):
     """Per declared-terminal-node completion-gate truth, verified fresh from disk.
 
     An owner-merge auxiliary-bearing group contributes one extra row keyed
@@ -2930,9 +2939,26 @@ def terminal_gate_observation(route):
     rows={}
     for node_id in terminal_ids:
         node=nodes[node_id]
-        rows[node_id]=_marker_identity_row(route,node,node_id,node.get("terminal_gate"))
+        rows[node_id]=_marker_identity_row(route,node,node_id,node.get("terminal_gate"), jobs=jobs,
+                                          exact_terminal=exact_terminal)
     for group_id,error in sorted(owner_merge_auxiliary_groups(route).items()):
-        rows[f"parallel_group:{group_id}"]=_arbitration_observation(route,group_id,error)
+        key=f"parallel_group:{group_id}"
+        row=_arbitration_observation(route,group_id,error)
+        if exact_terminal and row.get("passed"):
+            try:
+                raw=arbitration_path(route["route_id"],group_id).read_bytes()
+                record=json.loads(raw); anchor=nodes[record["anchor_node"]]
+                proof=_marker_identity_row(route,anchor,anchor["id"],anchor["completion_gate"],
+                                           jobs=jobs,exact_terminal=True)
+                if not proof.get("passed"):
+                    row=proof
+                else:
+                    row=dict(row,node_id=key,attempt_id=proof["attempt_id"],completion_gate="owner-merge",
+                             marker_digest=hashlib.sha256(raw).hexdigest(),
+                             evidence_digest=evidence_digest(Path(record["evidence"]["path"])))
+            except (OSError,ValueError,KeyError,TypeError):
+                row={"passed":False,"reason":"auxiliary-arbitration-identity-unverified"}
+        rows[key]=row
     return rows
 
 def terminal_gate_proven(gates):
@@ -2976,6 +3002,10 @@ def atomic_write(path, payload):
     fd=os.open(temp,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
     with os.fdopen(fd,"w",encoding="utf-8") as fh: fh.write(data); fh.flush(); os.fsync(fh.fileno())
     os.replace(temp,path)
+    try:
+        dfd=os.open(str(path.parent),os.O_RDONLY); os.fsync(dfd); os.close(dfd)
+    except OSError:
+        pass
 
 # v2 adds `registry_current`: a closure recorded against a registry that has since
 # changed is still a real closure, but it says so instead of implying currency.
@@ -3045,8 +3075,38 @@ def _head_commit(cwd):
 # itself: `route_hash` covers every field but the hash and id, so any added key makes
 # `verify_route` reject it. The closure lives in a sidecar and binds `route_hash`, so a
 # recompiled route leaves a detectably stale one rather than a silently wrong one.
-def close_route(route, route_file, commit=None, summary=None, publication=None, allow_unproven=True):
+def _outcome_replay_matches(existing, *, route_id, route_hash,
+                            terminal_commit_id=None, owner_attempt_id=None,
+                            producer_binding_digest=None,
+                            terminal_marker_digest=None):
+    if not isinstance(existing, dict):
+        return False
+    if existing.get("route_id") != route_id or existing.get("route_hash") != route_hash:
+        return False
+    if terminal_commit_id is None and owner_attempt_id is None and producer_binding_digest is None:
+        # Legacy callers retain the historical route/hash/optional-marker rule.
+        return (terminal_marker_digest is None
+                or existing.get("terminal_marker_digest") == terminal_marker_digest)
+    if terminal_commit_id is not None and existing.get("terminal_commit_id") == terminal_commit_id:
+        return True
+    return (owner_attempt_id is not None and producer_binding_digest is not None
+            and terminal_marker_digest is not None
+            and existing.get("terminal_owner_attempt_id") == owner_attempt_id
+            and existing.get("producer_binding_digest") == producer_binding_digest
+            and existing.get("terminal_marker_digest") == terminal_marker_digest)
+
+def close_route(route, route_file, commit=None, summary=None, publication=None,
+                allow_unproven=True, jobs=None, expected_terminal_marker_digest=None,
+                terminal_commit_id=None, expected_owner_attempt_id=None,
+                expected_producer_binding_digest=None):
     from datetime import datetime, timezone
+    cleanup_scope = dispatch_terminal_commit.require_current_cleanup(
+        "close-forward-recovery", target=Path(route_file), jobs=jobs)
+    if cleanup_scope is not None and (
+            not terminal_commit_id or terminal_commit_id != cleanup_scope.terminal_commit_id
+            or expected_owner_attempt_id != cleanup_scope.owner_attempt_id
+            or not expected_producer_binding_digest or allow_unproven):
+        raise ValueError("cleanup-scope-exact-terminal-close-required")
     # F7: D-2's single-storage-location contract has a compile-time entrance gate
     # (`route-output-outside-canonical`) but had no exit gate -- `close` would
     # happily write a sidecar next to a route file living anywhere at all. The
@@ -3068,12 +3128,18 @@ def close_route(route, route_file, commit=None, summary=None, publication=None, 
         raise ValueError("publication-unknown-result")
     target=outcome_path(route_file)
     if target.exists():
-        return json.loads(target.read_text(encoding="utf-8")), False
+        existing=json.loads(target.read_text(encoding="utf-8"))
+        if not _outcome_replay_matches(existing, route_id=route["route_id"], route_hash=route["route_hash"],
+                terminal_commit_id=terminal_commit_id, owner_attempt_id=expected_owner_attempt_id,
+                producer_binding_digest=expected_producer_binding_digest,
+                terminal_marker_digest=expected_terminal_marker_digest):
+            raise ValueError("route-close-outcome-conflict")
+        return existing, False
     # Live, not stored: every close computes gate truth fresh from the completion
     # markers on disk. A route closed once is never retroactively reopened to
     # recompute this, so the sidecar's `terminal_gate_proven` reflects gate state at
     # the moment of THIS close, not at any later inspection.
-    gates=terminal_gate_observation(route)
+    gates=terminal_gate_observation(route, jobs=jobs, exact_terminal=terminal_commit_id is not None)
     # C-25c: a `close` that lands before the terminal node's `complete` used to
     # seal `terminal_gate_proven=false` permanently -- finalize could never
     # prove the gate afterward even once `complete` actually ran. Refuse the
@@ -3090,6 +3156,16 @@ def close_route(route, route_file, commit=None, summary=None, publication=None, 
              "registry_current":route.get("_registry_current",True),
              "route_location":classify_route_location(route_file,route["artifact_root"]),
              "terminal_gate_proven":terminal_gate_proven(gates),"terminal_gates":gates}
+    if expected_terminal_marker_digest is not None:
+        outcome["terminal_marker_digest"]=expected_terminal_marker_digest
+    if terminal_commit_id is not None:
+        outcome["terminal_commit_id"] = terminal_commit_id
+    if expected_owner_attempt_id is not None:
+        outcome["terminal_owner_attempt_id"] = expected_owner_attempt_id
+    if expected_producer_binding_digest is not None:
+        outcome["producer_binding_digest"] = expected_producer_binding_digest
+    if not allow_unproven and outcome["terminal_gate_proven"] is not True:
+        raise ValueError("route-close-before-complete")
     if publication is not None: outcome["publication"]=publication
     releases=_gate_releases(route_file)
     if releases: outcome["gate_releases"]=releases
@@ -3104,7 +3180,31 @@ def close_route(route, route_file, commit=None, summary=None, publication=None, 
             if row.get("review_independence") in ("degraded","owner-overridden")
         )
         if degraded: outcome["review_independence_degraded"]=degraded
-    atomic_write(target,outcome)
+    # Outcome creation is write-once.  A concurrent creator is replayed only
+    # after the same identity/gate checks above; it is never overwritten.
+    data=json.dumps(outcome,indent=2,ensure_ascii=False)+"\n"
+    target.parent.mkdir(parents=True,exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".outcome-", dir=target.parent)
+    try:
+        with os.fdopen(fd,"w",encoding="utf-8") as fh:
+            fh.write(data); fh.flush(); os.fsync(fh.fileno())
+        try:
+            os.link(temporary, target)
+        except FileExistsError:
+            existing=json.loads(target.read_text(encoding="utf-8"))
+            if not _outcome_replay_matches(existing, route_id=route["route_id"], route_hash=route["route_hash"],
+                    terminal_commit_id=terminal_commit_id, owner_attempt_id=expected_owner_attempt_id,
+                    producer_binding_digest=expected_producer_binding_digest,
+                    terminal_marker_digest=expected_terminal_marker_digest):
+                raise ValueError("route-close-outcome-conflict")
+            return existing, False
+        dfd=os.open(str(target.parent),os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    finally:
+        os.unlink(temporary)
     return outcome, True
 
 def review_independence_observation(route):
@@ -3665,7 +3765,7 @@ def _exclusive_lock(path):
     with path.open("a",encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(),fcntl.LOCK_EX)
         try:
-            yield
+            yield handle
         finally:
             fcntl.flock(handle.fileno(),fcntl.LOCK_UN)
 
@@ -3906,11 +4006,12 @@ def arbitration_path(route_id, group_id):
     return completion_dir(route_id)/f"{_safe_group_id(group_id)}.arbitration.json"
 
 
-def _marker_identity_row(route, node, node_id, gate, *, jobs=None):
+def _marker_identity_row(route, node, node_id, gate, *, jobs=None, exact_terminal=False):
     """One completion marker's on-disk truth, in the shared gate vocabulary."""
     path = completion_dir(route["route_id"],jobs=jobs)/f"{node_id}.json"
     try:
-        marker = json.loads(path.read_text(encoding="utf-8"))
+        marker_bytes = path.read_bytes()
+        marker = json.loads(marker_bytes)
     except (OSError, ValueError):
         return {"passed": False, "reason": "completion-marker-absent"}
     if (marker.get("route_id") != route.get("route_id")
@@ -3925,8 +4026,36 @@ def _marker_identity_row(route, node, node_id, gate, *, jobs=None):
         return {"passed": False, "reason": "completion-evidence-unreadable"}
     if digest != evidence.get("sha256"):
         return {"passed": False, "reason": "completion-evidence-hash-mismatch"}
+    if exact_terminal:
+        if jobs is None or not completion_marker_is_current(route, node, path, marker):
+            return {"passed": False, "reason": "completion-marker-not-current"}
+        matches = []
+        for line in Path(jobs).read_text(encoding="utf-8").splitlines():
+            fields = line.split("\t")
+            if len(fields) != 6:
+                continue
+            meta = dict(part.split("=", 1) for part in fields[5].split(",") if "=" in part)
+            if meta.get("route_id") == route["route_id"] and meta.get("route_node") == node_id:
+                matches.append((fields, meta))
+        if (not matches or matches[-1][0][1] != "done"
+                or matches[-1][1].get("failure_class") != "pass"
+                or matches[-1][1].get("attempt_id") != marker.get("attempt_id")
+                or attempt_process_quiescence(matches[-1][1], terminal_receipt=True).state != "quiescent"):
+            return {"passed": False, "reason": "completion-attempt-not-current"}
+        return {"passed": True, "reason": "completion-marker-verified", "current": True,
+                "node_id": node_id, "attempt_id": marker["attempt_id"], "completion_gate": gate,
+                "marker_digest": hashlib.sha256(marker_bytes).hexdigest(), "evidence_digest": digest,
+                "evidence": evidence["path"], "attempt_readiness": "quiescent"}
+    # Gate currentness is the pre-A2a marker identity/evidence contract.  The
+    # jobs lock is used by mutation-time claim checks, not to reclassify an
+    # already valid marker or require a registry attempt row here.  This also
+    # preserves legacy inline markers whose attempt is intentionally absent.
+    if jobs is None:
+        return {"passed": True, "reason": "completion-marker-verified",
+                "evidence": evidence.get("path")}
     return {"passed": True, "reason": "completion-marker-verified",
-            "evidence": evidence.get("path")}
+            "evidence": evidence.get("path"), "current": True,
+            "attempt_readiness": "unchecked", "attempt_id": marker.get("attempt_id")}
 
 
 def _arbitration_observation(route, group_id, error=None, *, path=None):
@@ -4469,7 +4598,9 @@ def _complete_node_locked(
                     jobs=jobs_path,
                 )
             raise ValueError(f"row-close-failed:{exc.reason}") from exc
-        with _exclusive_lock(Path(f"{jobs_path}.lock")):
+        with _exclusive_lock(Path(f"{jobs_path}.lock")) as jobs_lock:
+            # Existing jobs lock is the sole terminal-claim serialization point.
+            ensure_terminal_claim_absent(jobs_path, route["route_id"], attempt_id)
             lines=jobs_path.read_text(encoding="utf-8",errors="replace").splitlines()
             row_index=None
             row_fields=None
@@ -5199,6 +5330,8 @@ def main():
     st=sub.add_parser("status"); st.add_argument("--artifact-root",required=True)
     st.add_argument("--open-only",action="store_true",help="list only routes with no recorded outcome")
     a=p.parse_args()
+    if a.command not in {"verify", "node", "status", "close"}:
+        dispatch_terminal_commit.require_current_cleanup("route-" + a.command)
     if a.command=="compose":
         shape=a.shape or ("staged" if a.graph else "direct")
         cwd=a.cwd or os.getcwd()

@@ -29,7 +29,11 @@ sys.path.insert(0, str(ROOT / "utilities"))
 
 from stage_session_contract import StageSessionError, load_manifest  # noqa: E402
 from dispatch_subsession_advance import chain_manifest_pointer_path  # noqa: E402
-from dispatch_contract import DispatchContractError, close_attempt_row  # noqa: E402
+from dispatch_contract import (  # noqa: E402
+    DispatchContractError,
+    close_attempt_row,
+    terminal_claim_observation,
+)
 
 # Route-leg cardinality tier order, duplicated from `capability-route.py:41` --
 # importing that module is safe (no cycle back into this one) but the tier map
@@ -350,6 +354,21 @@ def start_admitted_batch(
     runner = run or (lambda cmd, env: subprocess.run(cmd, cwd=ROOT, text=True, capture_output=True, env=env, check=False))
     registrations: list[tuple[dict[str, Any], subprocess.CompletedProcess[str]]] = []
     for session in admission.sessions:
+        # This is only a subprocess-boundary precheck.  The adapter's
+        # claim_attempt_row() owns the real jobs.log.lock fence; this function
+        # must not assume the lock survives the registration subprocess.
+        route_id = str(admission.manifest.get("route_id", ""))
+        owner_attempt_id = str(session.get("attempt_id", ""))
+        if (
+            re.fullmatch(r"[A-Za-z0-9._-]+", route_id)
+            and re.fullmatch(r"[A-Za-z0-9._-]+", owner_attempt_id)
+            and terminal_claim_observation(jobs, route_id, owner_attempt_id) is not None
+        ):
+            register = subprocess.CompletedProcess(
+                [], 65, "", "terminal-claim-conflict"
+            )
+            registrations.append((session, register))
+            break
         register = runner(
             dispatch_command(admission.manifest, session, "register", parent, jobs), os.environ.copy()
         )

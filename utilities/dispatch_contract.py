@@ -23,6 +23,139 @@ import uuid
 from typing import Callable, Iterator, Mapping, NamedTuple
 
 from route_identity import registered_node_identity
+
+# SD-120/121 terminal claim primitive.  The caller must already own the
+# existing jobs.log.lock; this module never acquires another lock for a claim.
+TERMINAL_CLAIM_CONTRACT = "terminal-claim/v1"
+
+
+def terminal_claim_path(jobs: str | Path, route_id: str, owner_attempt_id: str) -> Path:
+    """Derive the sole claim record below the dispatch state root."""
+    root = dispatch_state_root(jobs)
+    safe = lambda value: re.fullmatch(r"[A-Za-z0-9._-]+", str(value)) is not None
+    if not safe(route_id) or not safe(owner_attempt_id):
+        raise DispatchContractError("terminal-claim-identity-invalid", "unsafe component")
+    return root / "terminal-fences" / "v1" / str(route_id) / str(owner_attempt_id) / "claim.json"
+
+
+def _terminal_claim_lock_owned(lock_fd: object, jobs: str | Path | None = None) -> bool:
+    """Validate the explicit lock handle without trying to acquire a lock."""
+    try:
+        if not (isinstance(lock_fd, int) and lock_fd >= 0):
+            return False
+        info = os.fstat(lock_fd)
+        if not stat.S_ISREG(info.st_mode):
+            return False
+        try:
+            target = os.path.realpath(os.readlink(f"/proc/self/fd/{lock_fd}"))
+            if jobs is not None:
+                expected_path = str(Path(jobs).resolve()) + ".lock"
+                if target != expected_path:
+                    return False
+            elif not target.endswith("jobs.log.lock"):
+                return False
+            expected = os.stat(target)
+            held = Path(f"/proc/self/fdinfo/{lock_fd}").read_text()
+            owns_write_lock = any("FLOCK" in line.split() and "WRITE" in line.split()
+                                  for line in held.splitlines() if line.startswith("lock:"))
+            return owns_write_lock and (info.st_dev, info.st_ino) == (expected.st_dev, expected.st_ino)
+        except (OSError, ValueError):
+            return False
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def _terminal_claim_read(path: Path) -> dict | None:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(str(path), flags)
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    try:
+        with os.fdopen(fd, "rb") as handle:
+            value = json.loads(handle.read().decode("utf-8"))
+    except (OSError, UnicodeError, ValueError, TypeError) as exc:
+        raise DispatchContractError("terminal-claim-record-invalid", str(path)) from exc
+    if not isinstance(value, dict):
+        raise DispatchContractError("terminal-claim-record-invalid", str(path))
+    return value
+
+
+def terminal_claim_observation(jobs: str | Path, route_id: str, owner_attempt_id: str) -> dict | None:
+    """Non-blocking atomic single-read; callers use this inside their jobs lock."""
+    return _terminal_claim_read(terminal_claim_path(jobs, route_id, owner_attempt_id))
+
+
+def ensure_terminal_claim_absent(jobs: str | Path, route_id: str,
+                                 owner_attempt_id: str) -> None:
+    """Reject a registry mutation after the exact terminal claim is published.
+
+    This is deliberately only an atomic single-read.  The caller owns the
+    existing ``jobs.log.lock`` critical section; this helper never acquires a
+    lock and therefore cannot change the established lock order.
+    """
+    # A bounded cleanup may precede a terminal commit (e.g. failed markers).
+    # Its caller still cannot create a fresh route/child to escape the scope.
+    if os.environ.get("AGENT_DISPATCH_ATTEMPT_ID"):
+        from dispatch_terminal_commit import require_current_cleanup
+        require_current_cleanup("dispatch", jobs=jobs)
+    # Existing child/retry/marker writers carry a child attempt, whereas the
+    # fence belongs to its registered owner. Resolve that identity under the
+    # caller's jobs lock instead of probing a child-named fence that cannot exist.
+    identities = {owner_attempt_id}
+    for line in Path(jobs).read_text(encoding="utf-8").splitlines():
+        fields = line.split("\t")
+        if len(fields) != 6:
+            continue
+        metadata = parse_registry_metadata(fields[5])
+        if metadata.get("attempt_id") == owner_attempt_id and metadata.get("parent_attempt_id"):
+            identities.add(metadata["parent_attempt_id"])
+    if route_id and any(identity and terminal_claim_observation(jobs, route_id, identity) is not None
+                        for identity in identities):
+        raise DispatchContractError(
+            "terminal-claim-conflict",
+            f"route_id={route_id},owner_attempt_id={owner_attempt_id}",
+        )
+
+
+def claim_terminal_route_locked(jobs: str | Path, route_id: str, owner_attempt_id: str,
+                                *, lock_fd: int | None = None, proof: dict | None = None) -> dict:
+    """Publish an immutable claim while the caller's jobs lock is held.
+
+    ``lock_fd`` is the already-open jobs.log.lock descriptor.  The helper does
+    not acquire, flock, or release it; this preserves node -> jobs -> producer
+    lock ordering and makes subprocess lock ownership an explicit boundary.
+    """
+    if not _terminal_claim_lock_owned(lock_fd, jobs):
+        raise DispatchContractError("terminal-claim-requires-jobs-lock", "lock_fd")
+    path = terminal_claim_path(jobs, route_id, owner_attempt_id)
+    record = {"schema_version": 1, "contract": TERMINAL_CLAIM_CONTRACT,
+              "route_id": route_id, "owner_attempt_id": owner_attempt_id,
+              "proof": proof or {}}
+    data = json.dumps(record, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if path.exists():
+        existing = _terminal_claim_read(path)
+        if existing == record:
+            return existing
+        raise DispatchContractError("terminal-claim-conflict", str(path))
+    fd, temporary_name = tempfile.mkstemp(prefix=".claim-", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data); handle.flush(); os.fsync(handle.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            if _terminal_claim_read(path) != record:
+                raise DispatchContractError("terminal-claim-conflict", str(path))
+        dfd = os.open(str(path.parent), os.O_RDONLY)
+        try: os.fsync(dfd)
+        finally: os.close(dfd)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return record
+
 from dispatch_pending_delivery import RECIPIENT_KINDS
 from replica_batch_contract import (
     DIGEST,
@@ -5803,6 +5936,7 @@ def claim_recovery_retry(
     ensure_global_registry_writable(jobs)
     with Path(f"{jobs}.lock").open("a", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        ensure_terminal_claim_absent(jobs, source_route_id, original_attempt_id)
         lines = jobs.read_text(encoding="utf-8", errors="replace").splitlines()
         rows: list[tuple[int, list[str], dict[str, str]]] = []
         existing: list[dict[str, str]] = []
@@ -5982,6 +6116,7 @@ def claim_stage_advance(
     claim_path = claims_dir / f"{_stage_advance_claim_key_digest(claim_key)}.json"
     with Path(f"{jobs}.lock").open("a", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        ensure_terminal_claim_absent(jobs, source_route_id, predecessor_attempt_id)
         if claim_path.is_file():
             try:
                 existing = json.loads(claim_path.read_text(encoding="utf-8"))
@@ -6642,6 +6777,7 @@ def claim_attempt_row(
     terminal_attempt_limit: int | None = None,
     replacement_attempt_limit: int = 0,
     replacement_notes: frozenset[str] = frozenset(),
+    mutation_precheck: Callable[[list[str]], None] | None = None,
     preclaim: Callable[[list[str]], None] | None = None,
 ) -> bool:
     """Atomically register ``attempt_id`` and claim its launch at most once.
@@ -6665,6 +6801,20 @@ def claim_attempt_row(
     with lock_path.open("a", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         lines = jobs.read_text(encoding="utf-8", errors="replace").splitlines()
+        # Fence the portable admission boundary itself. Adapters and direct
+        # callers must not be able to omit the terminal check callback.
+        terminal_route_ids = {
+            value for key in ("route_id", "owner_route_id")
+            if (value := row_metadata.get(key)) not in (None, "", "-")
+        }
+        terminal_owner = row_metadata.get("parent_attempt_id")
+        if terminal_owner in (None, "", "-"):
+            terminal_owner = attempt_id
+        for terminal_route_id in sorted(terminal_route_ids):
+            ensure_terminal_claim_absent(jobs, terminal_route_id,
+                terminal_owner)
+        if mutation_precheck is not None:
+            mutation_precheck(lines)
         for index, existing in enumerate(lines):
             fields = existing.split("\t")
             if len(fields) == 6 and row_has_attempt(fields[5], attempt_id):

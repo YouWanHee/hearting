@@ -1439,6 +1439,41 @@ class TestRoute(unittest.TestCase):
                         capture_output=True,text=True,cwd=str(R.ROOT))
    self.assertEqual(again.returncode,0,again.stderr)
    self.assertEqual(R.outcome_path(route_path).read_bytes(),before)
+ def test_exact_terminal_identity_tracks_bytes_and_latest_attempt(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   root=Path(tmp); jobs=root/"jobs.log"; evidence=root/"result.md"
+   route=R.compile_route(**self.args(artifact_root=root, requested_intensity="quick", predicates=[],
+       inline_reason=None, registered_headless_evidence=self.registered_headless()))
+   self.assertIs(route["runtime_support"]["terminal_commit"],False)
+   node=route["nodes"][0]; attempt="att-terminal-current"
+   subprocess.run([sys.executable,"-c","pass"],check=True)
+   meta=dict(attempt_schema_version=2,dispatch_depth=1,transport="headless",
+       execution_surface="registered-headless",registered_worker="1",fallback_hop="same-harness-headless",
+       route_id=route["route_id"],route_hash=route["route_hash"],route_node=node["id"],
+       attempt_id=attempt,failure_class="pass",launch_outcome="reaped-before-publish")
+   def row(values):
+    return "2026-09-08T00:00:00Z\tdone\t/repo\t/wt\towner\t"+",".join(f"{k}={v}" for k,v in values.items())+"\n"
+   jobs.write_text(row(meta)); evidence.write_text("first")
+   with mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(jobs)}):
+    R._publish_completion_locked(route,node,node["id"],evidence,attempt_id=attempt,attempt_metadata=meta,jobs=jobs)
+    first=R.terminal_gate_observation(route,jobs=jobs,exact_terminal=True)[node["id"]]
+    self.assertTrue(first["passed"],first)
+    before=R.dispatch_terminal_commit.terminal_marker_digest([first])
+    evidence.write_text("replaced")
+    directory=R.completion_dir(route["route_id"],jobs=jobs)
+    for path in directory.glob(f"{node['id']}*.json"):
+     record=json.loads(path.read_text())
+     if "evidence" in record:record["evidence"]["sha256"]=R.evidence_digest(evidence)
+     if "evidence_sha256" in record:record["evidence_sha256"]=R.evidence_digest(evidence)
+     path.write_text(json.dumps(record))
+    second=R.terminal_gate_observation(route,jobs=jobs,exact_terminal=True)[node["id"]]
+    self.assertTrue(second["passed"],second)
+    self.assertNotEqual(before,R.dispatch_terminal_commit.terminal_marker_digest([second]))
+    jobs.write_text(row(meta)+row(dict(meta,attempt_id="att-terminal-replaced")))
+    stale=R.terminal_gate_observation(route,jobs=jobs,exact_terminal=True)[node["id"]]
+    self.assertFalse(stale["passed"])
+    self.assertEqual(stale["reason"],"completion-attempt-not-current")
+
  def test_close_records_true_for_verified_terminal_marker(self):
   # Red before P2: the outcome had no gate observation at all, so there was nothing to
   # assert `True` against.

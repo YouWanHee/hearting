@@ -39,6 +39,7 @@ sys.path.insert(0, str(ROOT / "utilities"))
 import dispatch_completion_join as join  # noqa: E402
 _SPEC = importlib.util.spec_from_file_location("claude_session_supervisor", SUPERVISOR)
 supervisor = importlib.util.module_from_spec(_SPEC)
+sys.modules[_SPEC.name] = supervisor
 assert _SPEC.loader is not None
 _SPEC.loader.exec_module(supervisor)
 
@@ -445,6 +446,119 @@ class ClaudeSessionSupervisorTest(unittest.TestCase):
         self.assertIn("failure_class=pass", registry)
         self.assertIn("reconcile_reason=exact-final-handoff", registry)
 
+    def test_main_checked_settlement_skips_reserved_prompt_after_exact_join(self):
+        # Exercise the real main loop and fake transport/join processes. The
+        # settlement adapter is stubbed; its authority proof has separate tests.
+        import io
+        import dispatch_terminal_commit as terminal
+        route = self.base / "checked-route.json"
+        route_value = dict(cwd=str(self.base), artifact_root=str(self.artifact_root),
+            nodes=[dict(id="report", terminal=True)],
+            workflow_contract=dict(terminal_nodes=["report"]),
+            runtime_support=dict(terminal_commit=True))
+        route_value["route_hash"] = supervisor.canonical_route_hash(route_value)
+        route_value["route_id"] = supervisor.route_id_from_hash(route_value["route_hash"])
+        route.write_text(json.dumps(route_value))
+        report = self.artifact_root / "report.md"; report.write_text("fixture evidence")
+        envelope = f"artifact: {report}\nverdict: PASS\nblocker: none\n"
+        slot = terminal.terminal_slot(self.artifact_root, route_value["route_id"], PARENT)
+        slot.mkdir(parents=True)
+        def settled_adapter(*unused):
+            (slot / "terminal-commit.json").write_text(json.dumps(dict(state="owner-envelope-sealed",
+                owner_attempt_id=PARENT, route_hash=route_value["route_hash"], terminal_commit_id="fixture-commit")))
+            return terminal.TerminalCommitResult("completed", None, None, ("report",), envelope)
+        self.jobs.write_text(owner_row(self.lease) + child_row())
+        events = []
+        args = self.command()[2:] + ["--route-file", str(route),
+            "--route-id", route_value["route_id"], "--route-hash", route_value["route_hash"],
+            "--enable-terminal-commit", "--max-continuations", "1"]
+        with mock.patch.dict(os.environ, self.child_env(FAKE_TRACE=str(self.trace))), \
+             mock.patch.object(supervisor.sys, "stdin", io.StringIO("initial assignment")), \
+             mock.patch.object(supervisor, "emit", events.append), \
+             mock.patch.object(supervisor, "terminal_commit_adapter", side_effect=settled_adapter), \
+             mock.patch.object(supervisor, "prepare_cleanup_handoff") as cleanup:
+            rc = supervisor.main(args)
+        self.assertEqual(rc, 0, events)
+        cleanup.assert_not_called()
+        trace = [json.loads(line) for line in self.trace.read_text().splitlines()]
+        self.assertEqual(sum(row["event"] == "turn-start" for row in trace), 1)
+        self.assertFalse(supervisor.budget_record.read_rows(self.base, PARENT))
+        saved = [event for event in events if event.get("continuation_saved")]
+        self.assertEqual(len(saved), 1, events)
+        self.assertEqual(events[-1]["result"], envelope)
+        self.assertIn("\tdone\t", self.jobs.read_text())
+        completed = list((self.base / "terminal-handoffs").glob("v1/*/*/completion.json"))
+        self.assertEqual(len(completed), 1)
+        self.assertEqual(json.loads(completed[0].read_text())["status"], "completed")
+        replay_events=[]
+        with mock.patch.dict(os.environ,self.child_env()), \
+             mock.patch.object(supervisor.sys,"stdin",io.StringIO("original assignment")), \
+             mock.patch.object(supervisor,"emit",replay_events.append), \
+             mock.patch.object(supervisor,"terminal_commit_adapter",side_effect=settled_adapter), \
+             mock.patch.object(supervisor,"run_turn") as duplicate_send:
+            self.assertEqual(supervisor.main(args),70,replay_events)
+        duplicate_send.assert_not_called()
+        self.assertEqual(replay_events[-1]["reason"],"supervisor-lease-attempt-not-open")
+        self.assertIn("failure_class=pass",self.jobs.read_text())
+
+    def test_main_restart_reconciles_three_submission_states_without_transport(self):
+        import io
+        import dispatch_terminal_commit as terminal
+        route=self.base/"restart-route.json"
+        value=dict(cwd=str(self.base),artifact_root=str(self.artifact_root),
+                   nodes=[dict(id="report",terminal=True)],runtime_support=dict(terminal_commit=True))
+        value["route_hash"]=supervisor.canonical_route_hash(value)
+        value["route_id"]=supervisor.route_id_from_hash(value["route_hash"])
+        route.write_text(json.dumps(value))
+        report=self.artifact_root/"restart-report.md"; report.write_text("verified fixture")
+        envelope=f"artifact: {report}\nverdict: PASS\nblocker: none\n"
+        slot=terminal.terminal_slot(self.artifact_root,value["route_id"],PARENT);slot.mkdir(parents=True)
+        (slot/"terminal-commit.json").write_text(json.dumps(dict(state="owner-envelope-sealed",
+            owner_attempt_id=PARENT,route_hash=value["route_hash"],terminal_commit_id="restart-commit")))
+        for status in ("submitted","not-submitted","submission-unknown","no-intent"):
+            with self.subTest(status=status):
+                state_root=self.base/status;state_root.mkdir();jobs=state_root/"jobs.log"
+                lease=state_root/"supervisor-state"/f"{PARENT}.lease"
+                jobs.write_text(owner_row(lease))
+                claim=supervisor.budget_record.claim_terminal_handoff(state_root,owner_attempt_id=PARENT,
+                    route_hash=value["route_hash"],child_attempt_ids=[])
+                if status != "no-intent":
+                    intent=supervisor.budget_record.convert_claim_to_prompt_intent(state_root,claim,
+                        prompt="cleanup",cleanup_scope=dict(owner_attempt_id=PARENT,route_id=value["route_id"],
+                        route_hash=value["route_hash"],artifact_root=str(self.artifact_root)))
+                    supervisor.budget_record.begin_submission(state_root,intent)
+                if status not in {"submission-unknown","no-intent"}:
+                    supervisor.budget_record.reconcile_submission(state_root,intent,
+                        evidence_kind="transport-receipt" if status=="submitted" else "pre-send-failure",
+                        evidence=dict(intent_id=intent["intent_id"],prompt_digest=intent["prompt_digest"]))
+                argv=self.command()[2:]
+                argv[argv.index("--jobs")+1]=str(jobs)
+                if "--lease-file" in argv:
+                    argv[argv.index("--lease-file")+1]=str(lease)
+                argv += ["--route-file",str(route),"--route-id",value["route_id"],
+                         "--route-hash",value["route_hash"],"--enable-terminal-commit"]
+                events=[]
+                with mock.patch.dict(os.environ,self.child_env()), \
+                     mock.patch.object(supervisor.sys,"stdin",io.StringIO("original assignment")), \
+                     mock.patch.object(supervisor,"emit",events.append), \
+                     mock.patch.object(supervisor,"run_turn") as send, \
+                     mock.patch.object(supervisor,"ClaudeStreamSession") as stream, \
+                     mock.patch.object(supervisor,"terminal_commit_adapter",return_value=
+                       terminal.TerminalCommitResult("completed",None,None,("report",),envelope)) as settle:
+                    rc=supervisor.main(argv)
+                send.assert_not_called();stream.assert_not_called()
+                self.assertEqual(rc,70 if status=="submission-unknown" else 0,events)
+                observed=[e for e in events if e.get("type")=="dispatch.supervisor.terminal-handoff-recovered"]
+                self.assertTrue(observed,events)
+                self.assertEqual(observed[0]["status"],"not-submitted" if status=="no-intent" else status)
+                if status=="submission-unknown":
+                    settle.assert_not_called();self.assertIn("\topen\t",jobs.read_text())
+                    self.assertIsNone(observed[0]["effective_reserved_charge"])
+                else:
+                    settle.assert_called_once()
+                    self.assertEqual(observed[0]["effective_reserved_charge"],int(status=="submitted"))
+                    self.assertEqual(sum(bool(e.get("continuation_saved")) for e in events),int(status in {"not-submitted","no-intent"}))
+
     def test_terminal_fast_path_rejects_mismatched_marker(self):
         route = self.base / "terminal-route.json"
         route_value = seal_route({
@@ -480,6 +594,93 @@ class ClaudeSessionSupervisorTest(unittest.TestCase):
             },
         )
         self.assertEqual(supervisor.terminal_route_completion(args, [row]), ())
+
+    def test_terminal_route_completion_uses_canonical_four_key_exclusion_not_legacy_two_key(self):
+        """A82-1/F-9: `route_identity.ROUTE_HASH_EXCLUDED_KEYS` is the four-key
+        canonical exclusion set (route_hash, route_id, owner_attempt_id,
+        route_family_key). A route compiled with `owner_attempt_id` and
+        `route_family_key` present must still verify under the supervisor's
+        hash check -- a legacy two-key (route_hash, route_id only) inline
+        recomputation would fold those two extra keys into the hash and
+        reject every such route (the exact F-9 regression)."""
+        sys.path.insert(0, str(ROOT / "utilities"))
+        import route_identity
+
+        route_value = {
+            "schema_version": 2,
+            "cwd": str(self.base),
+            "nodes": [{"id": "report", "terminal": True}],
+            "workflow_contract": {"terminal_nodes": ["report"]},
+            "resume_retry_boundaries": [],
+            "owner_attempt_id": "att-owner-xyz",
+            "route_family_key": "family-abc",
+        }
+        digest = route_identity.route_hash(route_value)
+        route_value["route_hash"] = digest
+        route_value["route_id"] = route_identity.route_id_from_hash(digest)
+        route = self.base / "canonical-exclusion-route.json"
+        route.write_text(json.dumps(route_value), encoding="utf-8")
+        marker = self.base / "report.json"
+        marker.write_text(json.dumps({
+            "schema_version": 2,
+            "route_id": route_value["route_id"],
+            "route_hash": route_value["route_hash"],
+            "node_id": "report",
+            "attempt_id": "att-child",
+        }), encoding="utf-8")
+        args = SimpleNamespace(
+            route_file=str(route),
+            route_id=route_value["route_id"],
+            route_hash=route_value["route_hash"],
+        )
+        row = SimpleNamespace(
+            status="done",
+            attempt_id="att-child",
+            metadata={
+                "failure_class": "pass",
+                "route_id": route_value["route_id"],
+                "route_hash": route_value["route_hash"],
+                "route_node": "report",
+                "completion_marker": str(marker),
+            },
+        )
+        self.assertEqual(
+            supervisor.terminal_route_completion(args, [row]), ("report",)
+        )
+        # And the legacy two-key recomputation this cycle removed would have
+        # produced a *different* digest for the same payload -- pin that gap
+        # explicitly so a future regression back to the inline form is caught
+        # even if this route happens not to carry the two extra keys.
+        legacy_bare = {
+            key: value for key, value in route_value.items()
+            if key not in {"route_hash", "route_id"}
+        }
+        legacy_digest = "sha256:" + hashlib.sha256(
+            json.dumps(legacy_bare, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        self.assertNotEqual(legacy_digest, digest)
+
+    def test_supervisor_source_has_no_second_inline_route_hash_expression(self):
+        """A82-1: supervisor must call the canonical helper exactly once and
+        must not carry its own inline sha256-over-bare-route expression."""
+        source = SUPERVISOR.read_text(encoding="utf-8")
+        self.assertNotIn('key not in {"route_hash", "route_id"}', source)
+        self.assertIn("canonical_route_hash(route)", source)
+
+    def test_hash_correctness_alone_does_not_enable_the_live_terminal_commit_fast_path(self):
+        """§13.53.2: hash correction landing is not sufficient by itself to
+        flip on the live (`terminal_commit_mode`) fast path -- that requires
+        the explicit checked support switch (`--enable-terminal-commit` or
+        `AGENT_DISPATCH_TERMINAL_COMMIT=1`), never route-hash agreement."""
+        args = SimpleNamespace(
+            route_file=str(self.base / "does-not-need-to-exist.json"),
+            route_id="rt-0000000000000000",
+            route_hash="sha256:" + ("0" * 64),
+            enable_terminal_commit=False,
+        )
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("AGENT_DISPATCH_TERMINAL_COMMIT", None)
+            self.assertFalse(supervisor.terminal_commit_enabled(args))
 
     def test_session_announcement_precedes_every_turn_and_leaks_nothing(self):
         """The receipt log must name the child session it never transcribes.
@@ -1984,6 +2185,194 @@ class TerminalReconcileRefusalRecordTest(unittest.TestCase):
             refusals = [e for e in entries if e["attempt_id"] == PARENT]
             self.assertEqual(len(refusals), 1)
             self.assertEqual(refusals[0]["reason"], emitted[0]["reason"])
+
+
+class PostJoinClaimTest(unittest.TestCase):
+    def test_reserve_boundary_with_open_child_claims_before_join_without_charge_or_prompt(self):
+        sys.path.insert(0, str(ROOT / "utilities"))
+        import dispatch_budget_record as budget_record
+        with tempfile.TemporaryDirectory() as home:
+            claim = budget_record.claim_terminal_handoff(home, owner_attempt_id="o", route_hash="h", child_attempt_ids=["c"], continuation_ordinal=1)
+            self.assertEqual(claim["status"], "prepared")
+
+
+
+class SubmitSettlementTest(unittest.TestCase):
+    """D6/§13.53.8: submit_turn's stdin and process transports must each
+    resolve to exactly one of the three TurnSubmission states, and a failure
+    that happens before any byte is attempted must be the only path to the
+    confirmed `not-submitted` state."""
+
+    def test_stdin_closed_before_send_is_confirmed_not_submitted(self):
+        transport = SimpleNamespace(stdin=None)
+        result = supervisor.submit_turn(transport, "hello")
+        self.assertEqual(result.status, "not-submitted")
+
+    def test_stdin_marked_closed_before_send_is_confirmed_not_submitted(self):
+        transport = SimpleNamespace(stdin=SimpleNamespace(closed=True))
+        result = supervisor.submit_turn(transport, "hello")
+        self.assertEqual(result.status, "not-submitted")
+
+    def test_stdin_write_failure_is_submission_unknown_not_not_submitted(self):
+        class FailingStdin:
+            closed = False
+
+            def write(self, payload):
+                raise OSError("write failed mid-stream")
+
+            def flush(self):
+                pass
+
+        transport = SimpleNamespace(stdin=FailingStdin())
+        result = supervisor.submit_turn(transport, "hello")
+        self.assertEqual(result.status, "submission-unknown")
+
+    def test_stdin_flush_failure_after_successful_write_is_submission_unknown(self):
+        class PartialWriteStdin:
+            closed = False
+
+            def write(self, payload):
+                return None
+
+            def flush(self):
+                raise BrokenPipeError("peer closed after partial consumption")
+
+        transport = SimpleNamespace(stdin=PartialWriteStdin())
+        result = supervisor.submit_turn(transport, "hello")
+        self.assertEqual(result.status, "submission-unknown")
+
+    def test_stdin_write_success_reaches_submitted(self):
+        class OkStdin:
+            closed = False
+            written = b""
+
+            def write(self, payload):
+                self.written += payload
+
+            def flush(self):
+                pass
+
+        transport = SimpleNamespace(stdin=OkStdin(), returncode=0,
+                                     read_result=lambda timeout: {"type": "result"})
+        result = supervisor.submit_turn(transport, "hello")
+        self.assertEqual(result.status, "submitted")
+        self.assertEqual(result.result, {"type": "result"})
+
+    def test_process_transport_oserror_reaches_seam_as_submission_unknown_not_supervisor_error(self):
+        # D6/§13.53.8(3): OSError raised inside a callable transport (the
+        # process transport's own subprocess.run call) must surface through
+        # submit_turn's seam as submission-unknown, not bypass the seam by
+        # propagating a raw exception.
+        def process_transport(prompt, *, timeout):
+            raise OSError("no such file or directory")
+
+        result = supervisor.submit_turn(process_transport, "hello")
+        self.assertEqual(result.status, "submission-unknown")
+
+    def test_process_transport_timeout_expired_reaches_seam_as_submission_unknown(self):
+        def process_transport(prompt, *, timeout):
+            raise subprocess.TimeoutExpired(cmd=["claude"], timeout=timeout)
+
+        result = supervisor.submit_turn(process_transport, "hello", timeout=1)
+        self.assertEqual(result.status, "submission-unknown")
+        self.assertEqual(result.rc, 124)
+
+    def test_process_creation_failure_is_confirmed_not_submitted(self):
+        # Regression: process_transport used to catch (OSError,
+        # subprocess.TimeoutExpired) and re-raise SupervisorError
+        # ("claude-turn-process-failed"), bypassing submit_turn's seam
+        # entirely. run_turn still raises SupervisorError for a non-submitted
+        # outcome (legacy caller contract), but the reason must now come
+        # from the seam's own status vocabulary, not the old wrapper string.
+        args = SimpleNamespace(turn_timeout=1, worktree=".", state_file=None,
+                                claude_command=None, add_dir=[], model=None,
+                                effort=None, disallowed_tool=[],
+                                permission_mode=None, allowed_tool=[])
+        with mock.patch.object(supervisor.subprocess, "Popen",
+                                side_effect=OSError("boom")):
+            with self.assertRaises(supervisor.SupervisorError) as ctx:
+                supervisor.run_turn(args, "sess", "hi", resume=False)
+        self.assertIn("not-submitted", str(ctx.exception))
+        self.assertNotIn("claude-turn-process-failed", str(ctx.exception))
+
+
+
+class DurableHandoffTransportTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.jobs = self.root / "jobs.log"
+        self.jobs.write_text("")
+        self.received = self.root / "received"
+        self.program = self.root / "transport.py"
+        self.program.write_text(
+            "import pathlib,sys,json,time\n"
+            f"p=pathlib.Path({str(self.received)!r})\n"
+            "with p.open('a') as f: f.write(sys.stdin.read()+'\\n')\n"
+            "print(json.dumps({'type':'result','subtype':'success','result':'partial'}))\n")
+        self.args = SimpleNamespace(jobs=str(self.jobs), parent_attempt_id="owner",
+            worktree=str(self.root), state_file=None, turn_timeout=1,
+            claude_command=shlex.join([sys.executable, str(self.program)]),
+            add_dir=[], model=None, effort=None, disallowed_tool=[], permission_mode=None, allowed_tool=[])
+        self.claim = supervisor.budget_record.claim_terminal_handoff(self.root,
+            owner_attempt_id="owner", route_hash="hash", child_attempt_ids=["child"])
+        self.intent = supervisor.budget_record.convert_claim_to_prompt_intent(self.root, self.claim,
+            prompt="cleanup", cleanup_scope={"route_id":"route", "owner_attempt_id":"owner"},
+            remaining={"gross_remaining":1, "stall_remaining":2, "reserved_remaining":1})
+
+    def send(self, **kwargs):
+        with mock.patch.object(supervisor, "emit"):
+            return supervisor.run_turn(self.args, "session", "cleanup", resume=True,
+                                       handoff_intent=self.intent, **kwargs)
+
+    def charge(self):
+        return supervisor.budget_record.read_effective_charge(self.root, self.intent)
+
+    def test_process_submission_charges_once_and_restart_never_resends(self):
+        self.assertEqual(self.send()[1], 0)
+        self.assertEqual(self.received.read_text(), "cleanup\n")
+        self.assertEqual(self.charge(), 1)
+        with self.assertRaisesRegex(supervisor.SupervisorError, "recovery-unavailable"):
+            self.send()
+        self.assertEqual(self.received.read_text(), "cleanup\n")
+        self.assertEqual(len(supervisor.budget_record.read_rows(self.root, "owner")), 1)
+
+    def test_pre_spawn_failure_has_zero_effective_charge_and_no_retry(self):
+        self.args.claude_command = str(self.root / "absent")
+        with self.assertRaisesRegex(supervisor.SupervisorError, "not-submitted"):
+            self.send()
+        self.assertEqual(self.charge(), 0)
+        with self.assertRaisesRegex(supervisor.SupervisorError, "recovery-unavailable"):
+            self.send()
+        self.assertFalse(self.received.exists())
+
+    def test_process_timeout_and_restart_preserve_unknown(self):
+        self.program.write_text("import time\ntime.sleep(10)\n")
+        self.args.turn_timeout = 0.05
+        with self.assertRaisesRegex(supervisor.SupervisorError, "submission-unknown"):
+            self.send()
+        self.assertIsNone(self.charge())
+        with self.assertRaisesRegex(supervisor.SupervisorError, "recovery-unavailable"):
+            self.send()
+        self.assertIsNone(self.charge())
+
+    def test_stream_partial_write_and_restart_preserve_unknown(self):
+        stream = SimpleNamespace(submit=mock.Mock(side_effect=BrokenPipeError("partial")))
+        with self.assertRaisesRegex(supervisor.SupervisorError, "submission-unknown"):
+            self.send(stream_session=stream)
+        self.assertIsNone(self.charge())
+        with self.assertRaisesRegex(supervisor.SupervisorError, "recovery-unavailable"):
+            self.send(stream_session=stream)
+        self.assertEqual(stream.submit.call_count, 1)
+
+    def test_prompt_drift_never_calls_transport(self):
+        stream = SimpleNamespace(submit=mock.Mock())
+        with self.assertRaisesRegex(supervisor.SupervisorError, "prompt-conflict"):
+            supervisor.run_turn(self.args, "session", "other", resume=True,
+                stream_session=stream, handoff_intent=self.intent)
+        stream.submit.assert_not_called()
+        self.assertIsNone(self.charge())
 
 
 if __name__ == "__main__":

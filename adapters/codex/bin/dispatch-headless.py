@@ -45,6 +45,7 @@ from dispatch_contract import (  # noqa: E402
     claim_attempt_row,
     close_attempt_row,
     completion_marker_gate,
+    ensure_terminal_claim_absent,
     PRELAUNCH_PROCESS_BLOCK_REASONS,
     codex_standard_owner_network_enabled,
     dispatch_state_root,
@@ -1784,6 +1785,9 @@ def append_job(jobs: Path, args: argparse.Namespace) -> bool:
             attempt_id=args.attempt_id,
         )
     args.launch_preclaim = preclaim
+    mutation_precheck = lambda lines: ensure_terminal_claim_absent(
+        jobs, args.route_id, args.parent_attempt_id or args.attempt_id
+    )
     return claim_attempt_row(
         jobs, args.attempt_id, row, launch=False,
         exclusive_metadata=exclusive,
@@ -1791,7 +1795,8 @@ def append_job(jobs: Path, args: argparse.Namespace) -> bool:
         terminal_attempt_limit=getattr(args, "quick_attempt_limit", None),
         replacement_attempt_limit=getattr(args, "replacement_attempt_limit", 0),
         replacement_notes=getattr(args, "replacement_notes", frozenset()),
-        preclaim=None,
+        mutation_precheck=mutation_precheck,
+        preclaim=preclaim,
     )
 
 
