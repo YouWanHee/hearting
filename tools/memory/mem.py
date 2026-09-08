@@ -6072,10 +6072,10 @@ def _sync_process_lock(timeout=30.0):
             os.close(fd)
 
 
-def sync(json_output=False):
+def sync(json_output=False, exchange_only=False):
     try:
         with _sync_process_lock():
-            return _sync_locked(json_output=json_output)
+            return _sync_locked(json_output=json_output, exchange_only=exchange_only)
     except _SyncLockBusy as exc:
         return _emit_sync({
             "status_schema": 1,
@@ -6100,8 +6100,8 @@ def sync(json_output=False):
         }, json_output)
 
 
-def _sync_locked(json_output=False):
-    """Run local maintenance and an optional, safety-gated immutable exchange."""
+def _sync_locked(json_output=False, exchange_only=False):
+    """Exchange immutable operations, optionally skipping local maintenance."""
     identity_con = get_con()
     try:
         identity_con.execute("BEGIN IMMEDIATE")
@@ -6128,32 +6128,36 @@ def _sync_locked(json_output=False):
         "remote-push": "pending",
         "remote-confirm": "pending",
     }
-    with contextlib.redirect_stdout(sink):
-        try:
-            n = migrate(apply=True)
-            phases["migrate"] = "ok"
-        except Exception as e:
-            phases["migrate"] = "failed"
-            sys.stderr.write(f"[sync] migrate failed; continuing: {e}\n")
-        try:
-            lifecycle(apply=True)
-            phases["lifecycle"] = "ok"
-        except Exception as e:
-            phases["lifecycle"] = "failed"
-            sys.stderr.write(f"[sync] lifecycle failed; continuing: {e}\n")
-        try:
-            index_build(rebuild=True)
-            phases["index"] = "ok"
-        except Exception as e:
-            phases["index"] = "failed"
-            sys.stderr.write(f"[sync] index failed: {e}\n")
-        try:
-            export_dump()
-            _commit_dump()
-            phases["compatibility-export"] = "ok"
-        except Exception as e:
-            phases["compatibility-export"] = "failed"
-            sys.stderr.write(f"[sync] compatibility export failed; continuing: {e}\n")
+    if exchange_only:
+        for phase in ("migrate", "lifecycle", "index", "compatibility-export"):
+            phases[phase] = "skipped"
+    else:
+        with contextlib.redirect_stdout(sink):
+            try:
+                n = migrate(apply=True)
+                phases["migrate"] = "ok"
+            except Exception as e:
+                phases["migrate"] = "failed"
+                sys.stderr.write(f"[sync] migrate failed; continuing: {e}\n")
+            try:
+                lifecycle(apply=True)
+                phases["lifecycle"] = "ok"
+            except Exception as e:
+                phases["lifecycle"] = "failed"
+                sys.stderr.write(f"[sync] lifecycle failed; continuing: {e}\n")
+            try:
+                index_build(rebuild=True)
+                phases["index"] = "ok"
+            except Exception as e:
+                phases["index"] = "failed"
+                sys.stderr.write(f"[sync] index failed: {e}\n")
+            try:
+                export_dump()
+                _commit_dump()
+                phases["compatibility-export"] = "ok"
+            except Exception as e:
+                phases["compatibility-export"] = "failed"
+                sys.stderr.write(f"[sync] compatibility export failed; continuing: {e}\n")
 
     con = get_con()
     try:
@@ -6163,7 +6167,8 @@ def _sync_locked(json_output=False):
         con.close()
     common = {"status_schema": 1,
               "warning": policy.get("warning"), "migration_count": n,
-              "transport": "v2", "dump_push": False, "phases": phases}
+              "transport": "v2", "dump_push": False, "phases": phases,
+              "exchange_only": exchange_only}
     if any(outcome == "failed" for outcome in phases.values()):
         for phase in phases:
             if phase.startswith("remote-") and phases[phase] == "pending":
@@ -6233,9 +6238,10 @@ def _sync_locked(json_output=False):
         phases["remote-fetch-validate"] = "ok"
         result = _ingest_and_fold_snapshot(snapshot, ref)
         phases["remote-fold"] = "ok"
-        with contextlib.redirect_stdout(sink):
-            export_dump()
-            _commit_dump()
+        if not exchange_only:
+            with contextlib.redirect_stdout(sink):
+                export_dump()
+                _commit_dump()
         if result.quarantined or result.deferred:
             for phase in ("remote-commit", "remote-push", "remote-confirm"):
                 phases[phase] = "blocked"
@@ -6289,9 +6295,10 @@ def _sync_locked(json_output=False):
             # and exported above, so refolding would only repeat that work.
             result = _ingest_and_fold_snapshot(final_snapshot, ref)
             phases["remote-fold"] = "ok"
-            with contextlib.redirect_stdout(sink):
-                export_dump()
-                _commit_dump()
+            if not exchange_only:
+                with contextlib.redirect_stdout(sink):
+                    export_dump()
+                    _commit_dump()
         if result.quarantined or result.deferred:
             con = get_con()
             try:
@@ -6988,9 +6995,10 @@ def _migration_graveyard_source(raw, snapshot_path):
     con = sqlite3.connect(backup.as_uri() + "?mode=ro&immutable=1", uri=True)
     try:
         live = {str(row[0]) for row in con.execute("SELECT id FROM records")}
-        # A record the snapshot already covers with v2 operations owns its own
-        # lineage: seeding a fresh root from the legacy deletion log would
-        # contradict that head. Its tombstone is verified, never re-created.
+        # Covered history normally owns its tombstone. A historical recency-only
+        # prior-evidence bug can leave an explicitly deleted row visible in the
+        # pure fold; narrowly verified recovery must descend that captured head,
+        # never introduce a competing root or infer deletion from absence.
         names = {str(row[0]) for row in con.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
         covered = set()
@@ -6999,6 +7007,25 @@ def _migration_graveyard_source(raw, snapshot_path):
             if table in names:
                 covered |= {str(row[0]) for row in con.execute(
                     f'SELECT record_id FROM "{table}"')}
+        captured = [{"op_id": str(op_id),
+                     "payload": protocol_v2.canonical_loads(bytes(raw))}
+                    for op_id, raw in con.execute(
+                        "SELECT op_id,payload_bytes FROM sync_objects ORDER BY op_id")] \
+            if "sync_objects" in names else []
+        _migration_validate_snapshot_graveyard(con, captured)
+        folded = protocol_v2.fold_operations(captured)
+        if folded.classification.hard_failures:
+            raise migration_v2.MigrationError("unseeded-graveyard-evidence")
+        captured_by_id = {item["op_id"]: item["payload"] for item in captured}
+        local_heads = {}
+        if "sync_frontier" in names:
+            for rid, op_id in con.execute("SELECT record_id,op_id FROM sync_frontier"):
+                local_heads.setdefault(str(rid), set()).add(str(op_id))
+        prior_evidence = {(str(op_id), str(rid)): bytes(raw)
+            for op_id, rid, raw in con.execute(
+                "SELECT destructive_op_id,record_id,prior_state_bytes "
+                "FROM sync_transactional_graveyard")} \
+            if "sync_transactional_graveyard" in names else {}
     finally:
         con.close()
     latest = {}
@@ -7016,7 +7043,9 @@ def _migration_graveyard_source(raw, snapshot_path):
         latest[record_id] = (source, line)
     entries = []
     for record_id, (source, line) in sorted(latest.items()):
-        if record_id in live or record_id in covered:
+        if record_id in live:
+            continue
+        if record_id in covered and record_id not in folded.records:
             continue
         prior = _canonical_record_state(
             _legacy_graveyard_defaults(
@@ -7026,6 +7055,29 @@ def _migration_graveyard_source(raw, snapshot_path):
             "prior_digest": hashlib.sha256(
                 protocol_v2.canonical_bytes(prior)).hexdigest(),
             "record_id": record_id}
+        if record_id in covered:
+            heads = folded.frontiers.get(record_id, ())
+            head = heads[0] if len(heads) == 1 else None
+            operation = captured_by_id.get(head, {})
+            mutations = operation.get("mutations", ())
+            observed = folded.records[record_id]
+            recorded_prior = prior_evidence.get((head, record_id))
+            # This is recovery of an already evidenced deletion, restricted to
+            # the old last_accessed bug. Other state drift, concurrency, or
+            # pending transitions require an explicit operator decision.
+            if (head is None or local_heads.get(record_id) != {head}
+                    or record_id in folded.conflicts
+                    or head not in folded.blocked
+                    or folded.blocked[head].code != "blocked-prior-evidence"
+                    or operation.get("kind") not in {"tombstone", "force-tombstone"}
+                    or len(mutations) != 1
+                    or mutations[0].get("tombstone") != tombstone
+                    or recorded_prior != protocol_v2.canonical_bytes(prior)
+                    or {key: value for key, value in observed.items()
+                        if key != "last_accessed"}
+                    != {key: value for key, value in prior.items()
+                        if key != "last_accessed"}):
+                raise migration_v2.MigrationError("graveyard-history-recovery-unsafe")
         payload = {"schema_version": 1, "record_id": record_id,
             "prior_state": prior, "tombstone": tombstone,
             "recovery_evidence_digest": hashlib.sha256(line).hexdigest()}
@@ -7302,8 +7354,44 @@ def _migration_require_exact_retry(epoch, expect, phase, inputs):
         raise migration_v2.MigrationError("stale-state")
 
 
+def _migration_snapshot_history(snapshot_path, snapshot):
+    """Bind copied history to the sealed snapshot's supported rotation chain."""
+    backup = Path(snapshot_path).resolve().parent / snapshot["backup"]["path"]
+    con = sqlite3.connect(backup.as_uri() + "?mode=ro&immutable=1", uri=True)
+    try:
+        replicas = {str(row[0]): row[1:] for row in con.execute(
+            "SELECT replica_id,active,retired_at,predecessor_replica_id "
+            "FROM sync_replica")}
+        current = str(snapshot["replica_id"])
+        if [replica for replica, row in replicas.items() if row[0]] != [current]:
+            raise migration_v2.MigrationError("snapshot-replica-chain-invalid")
+        chain, cursor = set(), current
+        while cursor is not None:
+            if cursor in chain or cursor not in replicas:
+                raise migration_v2.MigrationError("snapshot-replica-chain-invalid")
+            active, retired, predecessor = replicas[cursor]
+            if ((cursor == current and not active)
+                    or (cursor != current and (active or retired is None))):
+                raise migration_v2.MigrationError("snapshot-replica-chain-invalid")
+            chain.add(cursor)
+            cursor = predecessor
+        captured = {}
+        for op_id, raw in con.execute(
+                "SELECT op_id,payload_bytes FROM sync_objects ORDER BY op_id"):
+            raw = bytes(raw)
+            if hashlib.sha256(raw).hexdigest() != str(op_id):
+                raise migration_v2.MigrationError("snapshot-object-digest-mismatch")
+            payload = protocol_v2.canonical_loads(raw)
+            if payload.get("replica_id") not in chain:
+                raise migration_v2.MigrationError("seed-namespace-outside-membership")
+            captured[str(op_id)] = raw
+        return {"replica_id": current, "captured": captured}
+    finally:
+        con.close()
+
+
 def _migration_seed_operations(snapshot_path, snapshot, source, *, apply,
-                               membership=None):
+                               membership=None, history=None):
     """Build deterministic snapshot put operations; reserve only on apply."""
     backup = Path(snapshot_path).resolve().parent / snapshot["backup"]["path"]
     con = sqlite3.connect(backup.as_uri() + "?mode=ro&immutable=1", uri=True)
@@ -7374,10 +7462,12 @@ def _migration_seed_operations(snapshot_path, snapshot, source, *, apply,
         "kind": "snapshot", "snapshot_digest": snapshot["manifest_digest"],
         "source_digest": raw_source_digest,
         "graveyard_digest": graveyard["manifest_digest"]})
+    history = history or _migration_snapshot_history(snapshot_path, snapshot)
     allowed_namespaces = set(map(str, snapshot.get("logical_project_keys", ())))
     if any(_state_namespace(state) not in allowed_namespaces
            for state in states.values()) or any(
-               item["payload"].get("replica_id") != snapshot["replica_id"]
+               history["captured"].get(item["op_id"])
+               != protocol_v2.canonical_bytes(item["payload"])
                or item["payload"].get("project_key") not in allowed_namespaces
                for item in existing_operations):
         raise migration_v2.MigrationError("seed-namespace-outside-membership")
@@ -7412,7 +7502,7 @@ def _migration_seed_operations(snapshot_path, snapshot, source, *, apply,
                              "op_id": operation["op_id"]})
         if graveyard_identities:
             graveyard_seed = migration_v2.build_graveyard_seed_operations(
-                graveyard=graveyard_path,
+                graveyard=graveyard_path, parent_heads=frontier_by_record,
                 counter_mappings=[by_identity[identity]
                                   for identity in graveyard_identities])
             operations.extend(graveyard_seed["operations"])
@@ -7464,7 +7554,7 @@ def _migration_seed_operations(snapshot_path, snapshot, source, *, apply,
             # durable: validating after the commit left a refused seed's
             # operations, counters, and frontiers permanently in the store.
             if membership is not None:
-                _migration_validate_seed_namespaces(membership, operations)
+                _migration_validate_seed_namespaces(membership, operations, history=history)
             for rid, operation in seeded:
                 sync_v2.record_reserved_seed_operation(local, operation,
                     epoch_id=snapshot["epoch_id"], seed_kind="snapshot",
@@ -7484,8 +7574,8 @@ def _migration_seed_operations(snapshot_path, snapshot, source, *, apply,
     return source_digest, mappings, operations
 
 
-def _migration_validate_seed_namespaces(membership, operations):
-    """Keep every sealed operation inside its author replica's roster keys."""
+def _migration_validate_seed_namespaces(membership, operations, *, history=None):
+    """Allow exact captured predecessor bytes inside the successor's keys."""
     keys_by_replica = {
         str(member["replica_id"]): set(map(str, member["logical_project_keys"]))
         for member in membership["members"]
@@ -7495,6 +7585,10 @@ def _migration_validate_seed_namespaces(membership, operations):
         if not isinstance(payload, dict):
             raise migration_v2.MigrationError("seed-operation-invalid")
         allowed = keys_by_replica.get(str(payload.get("replica_id", "")))
+        if allowed is None and history is not None and (
+                history["captured"].get(operation.get("op_id"))
+                == protocol_v2.canonical_bytes(payload)):
+            allowed = keys_by_replica.get(history["replica_id"])
         if allowed is None or str(payload.get("project_key", "")) not in allowed:
             raise migration_v2.MigrationError("seed-namespace-outside-membership")
 
@@ -8087,23 +8181,25 @@ def _migration_command_locked(args):
             if current_capture != snapshot["snapshot_capture_seq"]:
                 raise migration_v2.MigrationError("snapshot-tail-before-seed")
             source = migration_v2.load_manifest(args.source)
+            history = _migration_snapshot_history(args.snapshot, snapshot)
             mappings, operations = source.get("mappings"), source.get("operations")
             if not mappings or not operations:
                 if args.kind != "snapshot":
                     raise migration_v2.MigrationError("delta-seed-source-incomplete")
                 source_digest, mappings, operations = _migration_seed_operations(
                     args.snapshot, snapshot, source, apply=args.apply,
-                    membership=membership)
+                    membership=membership, history=history)
             else:
                 source_digest = source.get("manifest_digest") \
                     or migration_v2.digest_json(source)
-            _migration_validate_seed_namespaces(membership, operations)
+            _migration_validate_seed_namespaces(membership, operations, history=history)
             artifact = migration_v2.build_seed_manifest(epoch_id=args.epoch,
                 membership_digest=membership["manifest_digest"],
                 snapshot_digest=snapshot["manifest_digest"],
                 source_digest=source_digest,
                 replica_id=snapshot["replica_id"], kind=args.kind,
                 mappings=mappings, operations=operations,
+                captured_op_ids=history["captured"],
                 out=args.out, apply=args.apply)
             def bind_seed(con, _receipt):
                 if not args.apply or source.get("mappings"):
@@ -8828,6 +8924,23 @@ def _migration_command_locked(args):
                     if recorded["equality_digest"] != equality_digest:
                         raise migration_v2.MigrationError(
                             "activation-equality-identity-mismatch")
+                    # Operational equality and the exchange bootstrap ledger
+                    # are one transaction, both sealed from DB-issued proof.
+                    roster = sorted(row["replica_id"] for row in membership["members"])
+                    epoch_row = con.execute(
+                        "SELECT roster_json FROM sync_migration_epoch WHERE epoch_id=?",
+                        (args.epoch,)).fetchone()
+                    if epoch_row is None:
+                        sync_v2.record_seed_epoch(con, args.epoch, roster)
+                    elif json.loads(epoch_row[0]) != roster:
+                        raise migration_v2.MigrationError("activation-bootstrap-roster-mismatch")
+                    proof = sync_v2.trusted_migration_evidence(
+                        con, args.epoch, kind="seed-seal")
+                    sync_v2.seal_seed_epoch(con, args.epoch,
+                        no_tail_digest=proof["no_tail_digest"],
+                        accepted_set_digest=proof["accepted_set_digest"],
+                        materialized_digest=proof["materialized_digest"],
+                        operator_authorized=True, evidence=proof)
                     _migration_register_artifact(con, epoch=args.epoch,
                         kind="equality", digest=equality["manifest_digest"],
                         path=args.equality, receipt=_receipt)
@@ -8845,6 +8958,16 @@ def _migration_command_locked(args):
                     return _migration_phase_receipt(args.epoch, local_replica,
                         "activate.v2-only", membership["manifest_digest"], receipt)
                 def record_activation(con, _receipt):
+                    proof = sync_v2.trusted_migration_evidence(
+                        con, args.epoch, kind="equality")
+                    readiness = sync_v2.activate_v2_only_fence(con, args.epoch,
+                        fence_proof=migration_v2.digest_json({
+                            "equality": equality["manifest_digest"],
+                            "fence_receipts": sorted(row["receipt_digest"]
+                                                     for row in fence_receipts)}),
+                        operator_authorized=True, evidence=proof)
+                    if not readiness["remote_allowed"]:
+                        raise migration_v2.MigrationError("activation-remote-readiness-incomplete")
                     phase_receipt = activation_phase_receipt(_receipt)
                     path = _migration_write_local_manifest(args.epoch,
                         "activation", local_replica, phase_receipt)
@@ -9032,6 +9155,8 @@ def main():
     sub.add_parser("stats", help="Show store statistics")
     sy = sub.add_parser("sync", help="Run local maintenance and optional immutable v2 exchange")
     sy.add_argument("--json", dest="json_output", action="store_true")
+    sy.add_argument("--exchange-only", action="store_true",
+                    help="Operator exchange without native import, lifecycle, index rebuild, or dump export")
 
     ij = sub.add_parser("inject", help="Build the SessionStart injection block")
     ij.add_argument("--hook", action="store_true", help="SessionStart additionalContext JSON")
@@ -9195,7 +9320,7 @@ def main():
     elif args.cmd == "stats":
         stats()
     elif args.cmd == "sync":
-        sys.exit(sync(json_output=args.json_output))
+        sys.exit(sync(json_output=args.json_output, exchange_only=args.exchange_only))
     elif args.cmd == "inject":
         inject(hook=args.hook)
     elif args.cmd == "register-postit":

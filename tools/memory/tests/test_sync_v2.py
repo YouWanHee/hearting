@@ -1045,6 +1045,13 @@ class MigrationStorageTest(unittest.TestCase):
             evidence=proof,
         )
         self.assertTrue(activated["remote_allowed"])
+        self.assertTrue(sync_v2.remote_policy({"MEM_SYNC_REMOTE": "1"}, self.connection)["allowed"])
+        self._transition("rollback-window", writer_mode="fenced")
+        readiness = sync_v2.remote_readiness(self.connection)
+        self.assertFalse(readiness["allowed"])
+        policy = sync_v2.remote_policy({"MEM_SYNC_REMOTE": "1"}, self.connection)
+        self.assertFalse(policy["allowed"])
+        self.assertEqual(policy["reason"], "operational-cutover-not-v2-only")
         self.connection.commit()
 
     def test_rollback_identity_is_tied_to_equality_and_closed_receipt(self):

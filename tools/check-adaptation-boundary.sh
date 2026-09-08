@@ -32,7 +32,9 @@ fail=0
 # reach those hooks at $ROOT/hooks/* (adapters/codex/bin/preflight.sh), where
 # $ROOT/utilities/memory-store.sh already resolves. A per-adapter copy would
 # assert a projection surface nothing loads.
-SHARED_UTILITY_DEFERRED="artifact-pointer-bridge.py artifact-quiescence.py artifact-relocation.py artifact-relocation-live.py artifact-knowledge-feed.py cairn-artifact-read.sh cairn-artifact-read.ts dispatch-readiness.py verification-background-lease.py memory-store.sh compute-hosts execution_access.py execution_access_diagnose.py execution-access-diagnose.py"
+# memory-post-curation-sync.py is likewise invoked from the canonical root by
+# each main completion controller; model workers never own this lifecycle.
+SHARED_UTILITY_DEFERRED="artifact-pointer-bridge.py artifact-quiescence.py artifact-relocation.py artifact-relocation-live.py artifact-knowledge-feed.py cairn-artifact-read.sh cairn-artifact-read.ts dispatch-readiness.py verification-background-lease.py memory-store.sh memory-post-curation-sync.py compute-hosts execution_access.py execution_access_diagnose.py execution-access-diagnose.py"
 
 say() {
   printf '%s\n' "$*"

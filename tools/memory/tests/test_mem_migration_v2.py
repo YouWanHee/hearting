@@ -34,7 +34,19 @@ class MigrationCliTest(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.store = self.root / "store"
         self.env = {
-            **os.environ,
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "LANG": "C.UTF-8", "PYTHONDONTWRITEBYTECODE": "1",
+            "HOME": str(self.root / "home"),
+            "XDG_CONFIG_HOME": str(self.root / "config"),
+            "XDG_DATA_HOME": str(self.root / "data"),
+            "XDG_CACHE_HOME": str(self.root / "cache"),
+            "MEM_WRITE_EVENTS": str(self.root / "state/write-events.jsonl"),
+            "MEM_RETRIEVAL_EVENTS": str(self.root / "state/retrieval-events.jsonl"),
+            "MEM_PROFILE": str(self.root / "profile"),
+            "AGENT_HOME": str(ROOT),
+            "MEM_SYNC_REMOTE": "0", "MEM_DUMP_PUSH": "0",
+            "MEM_DUMP_COMMIT": "0",
+            "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
             "MEM_STORE": str(self.store),
             "MEM_INIT": "1",
             "XDG_STATE_HOME": str(self.root / "state"),
@@ -67,7 +79,8 @@ class MigrationCliTest(unittest.TestCase):
     def next_expect(value):
         return value.get("state_digest") or value["extra"]["state_digest"]
 
-    def prepare_snapshot(self, record_id, logical_project_keys, *, prefix):
+    def prepare_snapshot(self, record_id, logical_project_keys, *, prefix,
+                         expected_error=None):
         capability = self.payload(self.run_mem(
             "migration", "capabilities", "--epoch", EPOCH))
         con = sqlite3.connect(self.db)
@@ -94,13 +107,20 @@ class MigrationCliTest(unittest.TestCase):
         expect = self.next_expect(receipt)
         snapshot_out = self.root / f"{prefix}-snapshot"
         for _ in range(2):
-            receipt = self.payload(self.run_mem(
+            result = self.run_mem(
                 "migration", "snapshot", "--epoch", EPOCH,
                 "--expect", expect,
                 "--membership", str(membership_out / "membership.json"),
                 "--replica", replica, "--store", str(self.store),
-                "--out", str(snapshot_out), "--apply"))
+                "--out", str(snapshot_out), "--apply")
+            if expected_error is not None and result.returncode:
+                self.assertEqual(result.returncode, 2, result.stderr + result.stdout)
+                self.assertEqual(self.payload(result)["reason"], expected_error)
+                return None
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            receipt = self.payload(result)
             expect = self.next_expect(receipt)
+        self.assertIsNone(expected_error, "unsafe snapshot unexpectedly succeeded")
         source_path = self.root / f"{prefix}-source.json"
         source_path.write_text(canonical({"source_identities": [record_id]}),
                                encoding="utf-8")
@@ -115,6 +135,161 @@ class MigrationCliTest(unittest.TestCase):
                 result[path.relative_to(self.store).as_posix()] = hashlib.sha256(
                     path.read_bytes()).hexdigest()
         return result
+
+    def _rotated_snapshot(self, *, invalid=None):
+        created = self.run_mem("add", "durable", "note", "rotation fixture",
+                               "--scope", "global", json_output=False)
+        self.assertEqual(created.returncode, 0, created.stderr)
+        pending = self.run_mem("note", "rotation pending fixture",
+                               "--requires-consume", json_output=False)
+        self.assertEqual(pending.returncode, 0, pending.stderr)
+        con = sqlite3.connect(self.db)
+        try:
+            before_records = con.execute("SELECT * FROM records ORDER BY id").fetchall()
+            before_ops = {row[0]: bytes(row[1]) for row in con.execute(
+                "SELECT op_id,payload_bytes FROM sync_objects")}
+            ids = [row[0] for row in con.execute("SELECT id FROM records ORDER BY id")]
+            keys = {"global"}
+            keys.update(row[0] for row in con.execute(
+                "SELECT cwd_origin FROM records WHERE scope='project'"))
+        finally:
+            con.close()
+        # More than one supported rotation proves traversal, not a one-hop alias.
+        for _ in range(2):
+            rotated = self.run_mem("replica", "rotate", "--reason",
+                                   "isolated migration rotation", json_output=False)
+            self.assertEqual(rotated.returncode, 0, rotated.stderr)
+        if invalid in {"unrelated", "cycle"}:
+            # Corrupt only this disposable fixture's rotation metadata; immutable
+            # operation bytes stay intact, including their original author.
+            con = sqlite3.connect(self.db)
+            try:
+                active, predecessor = con.execute(
+                    "SELECT replica_id,predecessor_replica_id FROM sync_replica "
+                    "WHERE active=1").fetchone()
+                if invalid == "unrelated":
+                    con.execute("UPDATE sync_replica SET predecessor_replica_id=NULL "
+                                "WHERE replica_id=?", (active,))
+                else:
+                    con.execute("UPDATE sync_replica SET predecessor_replica_id=? "
+                                "WHERE replica_id=?", (active, predecessor))
+                con.commit()
+            finally:
+                con.close()
+        if invalid == "namespace":
+            keys.remove("global")
+        prepared = self.prepare_snapshot(ids[0], sorted(keys), prefix="rotation")
+        prepared["source"].write_text(canonical({"source_identities": ids}))
+        return prepared, before_records, before_ops
+
+    def test_supported_rotation_seed_preserves_captured_authors_and_pending(self):
+        prepared, before_records, before_ops = self._rotated_snapshot()
+        seed_out = self.root / "rotated-seed"
+        args = ["migration", "seed", "build", "--epoch", EPOCH,
+                "--expect", prepared["expect"], "--membership", str(prepared["membership"]),
+                "--snapshot", str(prepared["snapshot"]), "--kind", "snapshot",
+                "--source", str(prepared["source"]), "--out", str(seed_out)]
+        planned = self.run_mem(*args)
+        self.assertEqual(planned.returncode, 0, planned.stderr + planned.stdout)
+        self.assertFalse(seed_out.exists())
+        applied = self.run_mem(*args, "--apply")
+        self.assertEqual(applied.returncode, 0, applied.stderr + applied.stdout)
+        verified = self.run_mem("migration", "seed", "verify", "--epoch", EPOCH,
+                                "--seed-manifest", str(seed_out / "seed.json"))
+        self.assertEqual(verified.returncode, 0, verified.stderr + verified.stdout)
+        seed = json.loads((seed_out / "seed.json").read_text())
+        mappings = {row["op_id"]: row for row in seed["mappings"]}
+        for row in seed["objects"]:
+            envelope = json.loads((seed_out / row["path"]).read_bytes())
+            if row["op_id"] in before_ops:
+                old = json.loads(before_ops[row["op_id"]])
+                self.assertEqual(envelope["payload"], old)
+                self.assertEqual(mappings[row["op_id"]]["replica_id"], old["replica_id"])
+                self.assertEqual(mappings[row["op_id"]]["counter"], old["counter"])
+            else:
+                self.assertEqual(envelope["payload"]["replica_id"], prepared["replica"])
+        self.assertTrue(set(before_ops) <= set(mappings))
+        con = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(con.execute("SELECT * FROM records ORDER BY id").fetchall(), before_records)
+            self.assertEqual(con.execute("SELECT COUNT(*) FROM records WHERE delivery_state='pending'").fetchone()[0], 1)
+            for op_id, raw in before_ops.items():
+                self.assertEqual(bytes(con.execute("SELECT payload_bytes FROM sync_objects WHERE op_id=?", (op_id,)).fetchone()[0]), raw)
+        finally:
+            con.close()
+
+    def _assert_rotation_seed_refused_without_reservation(self, invalid, reason):
+        prepared, _records, _ops = self._rotated_snapshot(invalid=invalid)
+        con = sqlite3.connect(self.db)
+        try:
+            before = [con.execute(query).fetchall() for query in (
+                "SELECT replica_id,counter FROM sync_replica ORDER BY replica_id",
+                "SELECT op_id,payload_bytes FROM sync_objects ORDER BY op_id",
+                "SELECT * FROM sync_migration_seed_reservations",
+                "SELECT * FROM sync_migration_seed_map")]
+        finally:
+            con.close()
+        seed_out = self.root / "refused-rotated-seed"
+        result = self.run_mem("migration", "seed", "build", "--epoch", EPOCH,
+            "--expect", prepared["expect"], "--membership", str(prepared["membership"]),
+            "--snapshot", str(prepared["snapshot"]), "--kind", "snapshot",
+            "--source", str(prepared["source"]), "--out", str(seed_out), "--apply")
+        self.assertEqual(result.returncode, 2, result.stderr + result.stdout)
+        self.assertEqual(self.payload(result)["reason"], reason)
+        self.assertFalse(seed_out.exists())
+        con = sqlite3.connect(self.db)
+        try:
+            after = [con.execute(query).fetchall() for query in (
+                "SELECT replica_id,counter FROM sync_replica ORDER BY replica_id",
+                "SELECT op_id,payload_bytes FROM sync_objects ORDER BY op_id",
+                "SELECT * FROM sync_migration_seed_reservations",
+                "SELECT * FROM sync_migration_seed_map")]
+        finally:
+            con.close()
+        self.assertEqual(after, before)
+
+    def test_rotated_seed_rejects_unrelated_author_before_reservation(self):
+        self._assert_rotation_seed_refused_without_reservation(
+            "unrelated", "seed-namespace-outside-membership")
+
+    def test_rotated_seed_rejects_namespace_before_reservation(self):
+        self._assert_rotation_seed_refused_without_reservation(
+            "namespace", "seed-namespace-outside-membership")
+
+    def test_rotated_seed_rejects_predecessor_cycle_before_reservation(self):
+        self._assert_rotation_seed_refused_without_reservation(
+            "cycle", "snapshot-replica-chain-invalid")
+
+    def test_snapshot_history_rejects_zero_multiple_or_missing_predecessor(self):
+        # These malformed sealed-snapshot shapes cannot be produced by the
+        # supported CLI; verify the read-only evidence parser also fails closed.
+        for variant in ("zero-active", "multiple-active", "missing-predecessor"):
+            with self.subTest(variant=variant):
+                directory = self.root / variant
+                directory.mkdir()
+                database = directory / "snapshot.db"
+                con = sqlite3.connect(database)
+                try:
+                    con.execute("CREATE TABLE sync_replica (replica_id TEXT, active INTEGER, retired_at TEXT, predecessor_replica_id TEXT)")
+                    con.execute("CREATE TABLE sync_objects (op_id TEXT, payload_bytes BLOB)")
+                    con.execute("INSERT INTO sync_replica VALUES ('a', ?, NULL, ?)",
+                                (0 if variant == "zero-active" else 1,
+                                 "missing" if variant == "missing-predecessor" else None))
+                    if variant == "multiple-active":
+                        con.execute("INSERT INTO sync_replica VALUES ('b', 1, NULL, NULL)")
+                    con.commit()
+                finally:
+                    con.close()
+                code = ("import sys,json;sys.path.insert(0,sys.argv[1]);import mem;"
+                        "snapshot={'replica_id':'a','backup':{'path':'snapshot.db'}};\n"
+                        "try: mem._migration_snapshot_history(sys.argv[2],snapshot)\n"
+                        "except mem.migration_v2.MigrationError as exc: print(exc.reason);sys.exit(2)\n"
+                        "sys.exit(0)")
+                result = subprocess.run([sys.executable, "-c", code,
+                    str(MEM.parent), str(directory / "snapshot.json")],
+                    env=self.env, text=True, capture_output=True)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stdout.strip(), "snapshot-replica-chain-invalid")
 
     def test_status_and_capabilities_are_read_only(self):
         before = self.file_inventory()
@@ -562,6 +737,102 @@ class MigrationCliTest(unittest.TestCase):
         self.assertEqual(len(folded.tombstones), len(deleted))
         kinds = {envelope["payload"]["kind"] for envelope in envelopes}
         self.assertIn("force-tombstone", kinds)
+
+
+    def _historical_deletion_fixture(self, *, drift="last_accessed", pending=False):
+        deleted_id, project_key = self._add_record(
+            "isolated historical deletion evidence",
+            delivery="pending" if pending else None)
+        pending_id, pending_key = self._add_record(
+            "isolated pending obligation must survive migration", delivery="pending")
+        # Reproduce the old capture bug solely inside this disposable store:
+        # an access touch changed the serving row, and the old capture path
+        # digested that row instead of the immutable lineage's recency value.
+        fixture = """
+import sys
+sys.path.insert(0, sys.argv[1])
+import mem
+rid, drift = sys.argv[2:]
+con = mem.get_con()
+try:
+    con.execute('BEGIN IMMEDIATE')
+    if drift == 'last_accessed':
+        con.execute('UPDATE records SET last_accessed=? WHERE id=?', ('1999-01-01', rid))
+    elif drift == 'strength':
+        con.execute('UPDATE records SET strength=strength+1 WHERE id=?', (rid,))
+    prior = mem._record_state(con, rid)
+    line = mem._graveyard_prepare(con, rid, action='prune')
+    mem._delete_rows(con, rid)
+    mem._lineage_access_times = lambda *_: {}
+    mem._capture_v2_operation(con, 'tombstone', tombstones={rid: 'prune'},
+        prior_states={rid: prior}, reason='historical-fixture')
+    con.commit()
+    assert mem._graveyard_flush((line,))
+finally:
+    con.close()
+"""
+        result = subprocess.run([sys.executable, "-c", fixture,
+            str(MEM.parent), deleted_id, drift], env=self.env,
+            text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        con = sqlite3.connect(self.db)
+        try:
+            original_ops = {row[0]: bytes(row[1]) for row in con.execute(
+                "SELECT op_id,payload_bytes FROM sync_objects")}
+            serving = con.execute("SELECT * FROM records ORDER BY id").fetchall()
+        finally:
+            con.close()
+        return deleted_id, pending_id, {project_key, pending_key}, original_ops, serving
+
+    def test_snapshot_recovers_only_evidenced_recency_deletion_without_resurrection(self):
+        deleted_id, pending_id, keys, original_ops, serving = self._historical_deletion_fixture()
+        protocol = __import__("protocol_v2")
+        original = [{"op_id": op_id, "payload": json.loads(raw)}
+                    for op_id, raw in original_ops.items()]
+        original_fold = protocol.fold_operations(original)
+        self.assertIn(deleted_id, original_fold.records)
+        self.assertEqual(len(original_fold.blocked), 1)
+        blocked_id = next(iter(original_fold.blocked))
+        self.assertEqual(original_fold.blocked[blocked_id].code, "blocked-prior-evidence")
+        prepared = self.prepare_snapshot(pending_id, keys, prefix="recency-recovery")
+        seed_out = self.root / "recency-recovery-seed"
+        result = self.run_mem("migration", "seed", "build", "--epoch", EPOCH,
+            "--expect", prepared["expect"], "--membership", str(prepared["membership"]),
+            "--snapshot", str(prepared["snapshot"]), "--kind", "snapshot",
+            "--source", str(prepared["source"]), "--out", str(seed_out), "--apply")
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        seed = migration_v2.verify_seed_manifest(seed_out / "seed.json")
+        envelopes = [json.loads((seed_out / row["path"]).read_bytes())
+                     for row in seed["objects"]]
+        folded = protocol.fold_operations(envelopes)
+        self.assertEqual(set(folded.records), {pending_id})
+        self.assertEqual(folded.records[pending_id]["delivery_state"], "pending")
+        self.assertIn(deleted_id, folded.tombstones)
+        self.assertEqual(folded.conflicts, {})
+        self.assertEqual(folded.deferred, {})
+        self.assertEqual(folded.quarantined, {})
+        self.assertEqual(folded.classification.hard_failures, ())
+        self.assertEqual(set(folded.blocked), {blocked_id})
+        self.assertEqual(set(protocol.resolved_blocked_by(folded)), {blocked_id})
+        retained = {item["op_id"]: protocol.canonical_bytes(item["payload"])
+                    for item in envelopes}
+        self.assertTrue(original_ops.items() <= retained.items())
+        con = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(con.execute("SELECT * FROM records ORDER BY id").fetchall(), serving)
+            self.assertEqual(con.execute("SELECT COUNT(*) FROM records WHERE delivery_state='pending'").fetchone()[0], 1)
+        finally:
+            con.close()
+
+    def test_snapshot_refuses_semantic_drift_recovery(self):
+        _deleted_id, pending_id, keys, _ops, _serving = self._historical_deletion_fixture(drift="strength")
+        self.prepare_snapshot(pending_id, keys, prefix="unsafe-semantic-drift",
+                              expected_error="graveyard-history-recovery-unsafe")
+
+    def test_snapshot_refuses_historical_ordinary_pending_deletion(self):
+        _deleted_id, pending_id, keys, _ops, _serving = self._historical_deletion_fixture(pending=True)
+        self.prepare_snapshot(pending_id, keys, prefix="unsafe-pending-deletion",
+                              expected_error="graveyard-history-recovery-unsafe")
 
     def test_refused_seed_namespace_leaves_no_operations(self):
         """A roster refusal must not leave the operations it refused behind."""
@@ -1032,6 +1303,43 @@ class MigrationCliTest(unittest.TestCase):
                 "AND effective=1", (deleted_id,)).fetchone()[0], 1)
         finally:
             con.close()
+
+        self.env["MEM_SYNC_REMOTE"] = "1"
+        synced = self.run_mem("sync")
+        self.assertEqual(synced.returncode, 0, synced.stderr + synced.stdout)
+        self.assertEqual(self.payload(synced)["status"], "remote-confirmed")
+        writer_env = self.env
+        reader_root = self.root / "fresh-reader"
+        self.env = {**writer_env,
+            "HOME": str(reader_root / "home"),
+            "MEM_STORE": str(reader_root / "store"),
+            "XDG_STATE_HOME": str(reader_root / "state"),
+            "XDG_CONFIG_HOME": str(reader_root / "config"),
+            "XDG_DATA_HOME": str(reader_root / "data"),
+            "XDG_CACHE_HOME": str(reader_root / "cache"),
+            "MEM_WRITE_EVENTS": str(reader_root / "state/write-events.jsonl"),
+            "MEM_RETRIEVAL_EVENTS": str(reader_root / "state/retrieval-events.jsonl"),
+            "MEM_SYNC_DIR": str(reader_root / "exchange"),
+        }
+        try:
+            joined = self.run_mem("migration", "join", "--apply")
+            self.assertEqual(joined.returncode, 0, joined.stderr + joined.stdout)
+            reader_synced = self.run_mem("sync")
+            self.assertEqual(reader_synced.returncode, 0,
+                             reader_synced.stderr + reader_synced.stdout)
+            writer = sqlite3.connect(self.db)
+            reader = sqlite3.connect(reader_root / "store/memory.db")
+            try:
+                self.assertEqual(reader.execute("SELECT id,body,delivery_state FROM records ORDER BY id").fetchall(),
+                                 writer.execute("SELECT id,body,delivery_state FROM records ORDER BY id").fetchall())
+                self.assertEqual(reader.execute("SELECT op_id,payload_bytes FROM sync_objects ORDER BY op_id").fetchall(),
+                                 writer.execute("SELECT op_id,payload_bytes FROM sync_objects ORDER BY op_id").fetchall())
+            finally:
+                writer.close(); reader.close()
+        finally:
+            self.env = writer_env
+        # Further synchronization is not part of rollback preparation.
+        self.env["MEM_SYNC_REMOTE"] = "0"
 
         rollback_out = self.root / "rollback"
         barrier_result = self.run_mem(

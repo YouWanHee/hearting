@@ -534,8 +534,15 @@ case "$cmd" in
       CODEX_DISTILL_APPLY="${CODEX_DISTILL_APPLY:-1}" \
       CODEX_DISTILL_CONTRACT_ACCEPTED="${CODEX_DISTILL_CONTRACT_ACCEPTED:-1}" \
       "$ROOT/adapters/codex/bin/distill-worker.sh" "$sid" "$cwd" curate || curator_status=$?
+    # Main completion owns final sync; worker/applier child flags do not leak.
+    post_sync_status=0
+    AGENT_HOME="$AGENT_ROOT" python3 "$ROOT/utilities/memory-post-curation-sync.py" "$cwd" codex "$sid" >/dev/null || post_sync_status=$?
+    if [ "$post_sync_status" -ne 0 ]; then
+      printf 'codex preflight: post-curation memory sync status=%s; local records retained\n' "$post_sync_status" >&2
+    fi
     [ "$sync_status" -eq 0 ] || exit "$sync_status"
-    exit "$curator_status"
+    [ "$curator_status" -eq 0 ] || exit "$curator_status"
+    exit "$post_sync_status"
     ;;
   prompt-signal)
     cwd=${2:-$PWD}

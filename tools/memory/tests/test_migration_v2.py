@@ -258,6 +258,48 @@ class ArtifactTest(unittest.TestCase):
             operations=[first, second], out=out, apply=True)
         self.assertFalse(retry["changed"])
 
+    def test_seed_manifest_preserves_proved_predecessor_dot(self):
+        prior = operation(REPLICA_A, 7)
+        current = operation(REPLICA_B, 1, [prior["op_id"]])
+        mappings = [{"source_identity": f"captured:{prior['op_id']}",
+                     "counter": 7, "op_id": prior["op_id"]},
+                    {"source_identity": "row:current", "counter": 1,
+                     "op_id": current["op_id"]}]
+        kwargs = dict(epoch_id=EPOCH, membership_digest=self.membership["manifest_digest"],
+            snapshot_digest=DIGEST_A, source_digest=DIGEST_B, replica_id=REPLICA_B,
+            kind="snapshot", mappings=mappings, operations=[prior, current])
+        with self.assertRaises(migration.MigrationError) as caught:
+            migration.build_seed_manifest(**kwargs)
+        self.assertEqual(caught.exception.reason, "seed-dot-invalid")
+        out = self.root / "predecessor-seed"
+        built = migration.build_seed_manifest(**kwargs,
+            captured_op_ids=[prior["op_id"]], out=out, apply=True)
+        mapping = next(row for row in built["mappings"] if row["op_id"] == prior["op_id"])
+        self.assertEqual((mapping["replica_id"], mapping["counter"]), (REPLICA_A, 7))
+        migration.verify_seed_manifest(out / "seed.json")
+        # Even a newly self-digested manifest cannot relabel immutable dots.
+        forged = dict(built); forged.pop("changed")
+        forged["mappings"] = [dict(row) for row in forged["mappings"]]
+        for row in forged["mappings"]:
+            if row["op_id"] == prior["op_id"]:
+                row["replica_id"] = REPLICA_B
+        forged.pop("manifest_digest")
+        forged["manifest_digest"] = migration.digest_json(forged)
+        with self.assertRaises(migration.MigrationError) as caught:
+            migration.verify_seed_manifest(forged, root=out)
+        self.assertEqual(caught.exception.reason, "seed-mapping-dot-invalid")
+
+    def test_seed_mapping_counter_must_match_its_exact_operation(self):
+        first, second = operation(REPLICA_A, 1), operation(REPLICA_A, 2)
+        with self.assertRaises(migration.MigrationError) as caught:
+            migration.build_seed_manifest(epoch_id=EPOCH,
+                membership_digest=self.membership["manifest_digest"],
+                snapshot_digest=DIGEST_A, source_digest=DIGEST_B,
+                replica_id=REPLICA_A, kind="snapshot", operations=[first, second],
+                mappings=[{"source_identity": "row:1", "counter": 2, "op_id": first["op_id"]},
+                          {"source_identity": "row:2", "counter": 1, "op_id": second["op_id"]}])
+        self.assertEqual(caught.exception.reason, "seed-mapping-dot-invalid")
+
     def test_seed_uses_protocol_v2_lf_canonical_operation_bytes(self):
         op = operation(REPLICA_A, 1)
         out = self.root / "protocol-seed"

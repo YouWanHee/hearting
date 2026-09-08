@@ -5370,7 +5370,7 @@ tools/fleet/collectors/dispatch.py:1014:
 tools/fleet/collectors/__init__.py:196:
 tools/render-landing.py:860:
 adapters/codex/AGENTS.md:83:
-adapters/codex/bin/preflight.sh:734:
+adapters/codex/bin/preflight.sh:741:
 adapters/opencode/bin/preflight.sh:466:
 adapters/claude/skills/autopilot-code/references/dev-pipeline.md:91:
 adapters/claude/plugin-marketplace/plugins/hearting-claude/skills/autopilot-code/references/dev-pipeline.md:91:

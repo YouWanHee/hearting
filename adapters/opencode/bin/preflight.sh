@@ -890,11 +890,26 @@ EOF
     # default (parity with the codex/claude session-end distillers); opt out with
     # OPENCODE_DISTILL_ENABLE=0. The worker is no-tools verified and timeout-
     # guarded, so a slow/unreachable model can never stall this path.
-    (cd "$cwd" && AGENT_HOME="$AGENT_ROOT" python3 "$ROOT/tools/memory/mem.py" sync --json >/dev/null) || true
-    AGENT_HOME="$AGENT_ROOT" \
+    sync_status=0
+    (cd "$cwd" && AGENT_HOME="$AGENT_ROOT" python3 "$ROOT/tools/memory/mem.py" sync --json >/dev/null) || sync_status=$?
+    if [ "$sync_status" -ne 0 ]; then
+      printf 'opencode preflight: session-end memory sync status=%s; continuing bounded curator fallback\n' "$sync_status" >&2
+    fi
+    curator_status=0
+    # Native plugin launch cwd is the installed source root. The curator's
+    # applier must inherit the actual project cwd, not just telemetry MEM_CWD.
+    (cd "$cwd" && AGENT_HOME="$AGENT_ROOT" \
       OPENCODE_DISTILL_ENABLE="${OPENCODE_DISTILL_ENABLE:-1}" \
       OPENCODE_DISTILL_APPLY="${OPENCODE_DISTILL_APPLY:-1}" \
-      "$ROOT/adapters/opencode/bin/distill-worker.sh" "$sid" "$cwd" curate
+      "$ROOT/adapters/opencode/bin/distill-worker.sh" "$sid" "$cwd" curate) || curator_status=$?
+    post_sync_status=0
+    AGENT_HOME="$AGENT_ROOT" python3 "$ROOT/utilities/memory-post-curation-sync.py" "$cwd" opencode "$sid" >/dev/null || post_sync_status=$?
+    if [ "$post_sync_status" -ne 0 ]; then
+      printf 'opencode preflight: post-curation memory sync status=%s; local records retained\n' "$post_sync_status" >&2
+    fi
+    [ "$sync_status" -eq 0 ] || exit "$sync_status"
+    [ "$curator_status" -eq 0 ] || exit "$curator_status"
+    exit "$post_sync_status"
     ;;
   role)
     [ "$#" -ge 2 ] || { echo "opencode preflight: role requires a portable role" >&2; exit 64; }

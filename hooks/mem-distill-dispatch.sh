@@ -453,6 +453,17 @@ fi
       python3 "$MEM" distill "$SID" --source "${MEM_SESSION_SOURCE:-claude}" --advance-capture "$frontier" >/dev/null 2>&1 || true
     fi
   fi
+  # This admitted main controller owns sync after its SessionEnd curator.
+  # Remote failure never rolls back local operations or the captured marker.
+  if [ "$MODE" = "curate" ]; then
+    post_sync_status=0
+    python3 "$AGENT_HOME/utilities/memory-post-curation-sync.py" "${CWD:-$PWD}" claude "$SID" \
+      >/dev/null 2>>"$ERRLOG" || post_sync_status=$?
+    if [ "$post_sync_status" -ne 0 ]; then
+      _distill_failure_log "$SID" "$MODE" "$post_sync_status" "post-curation-sync"
+    fi
+    _errlog_trim
+  fi
 # S5 (2026-07-09): detach the child file descriptors from the parent SessionEnd
 # hook. Otherwise the child retains harness pipe FDs while the worker runs, so
 # the harness cannot observe EOF and cancels the hook at its timeout. Redirecting

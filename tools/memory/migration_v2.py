@@ -1036,8 +1036,9 @@ def graveyard_source_identities(
 def build_graveyard_seed_operations(
         *, graveyard: str | os.PathLike[str],
         counter_mappings: Sequence[Mapping[str, Any]],
+        parent_heads: Mapping[str, Sequence[str]] | None = None,
 ) -> dict[str, Any]:
-    """Render one prior-state root plus its proven tombstone per graveyard row."""
+    """Render proven deletion evidence, retaining any captured causal heads."""
     manifest = verify_graveyard_source(graveyard)
     root = Path(graveyard).parent.resolve(strict=True)
     entries = _graveyard_entries(_read_file(_contained(root, "graveyard.jsonl")),
@@ -1061,11 +1062,12 @@ def build_graveyard_seed_operations(
             else prior["cwd_origin"]
         prior_identity = f"graveyard:{record_id}:prior"
         tombstone_identity = f"graveyard:{record_id}:tombstone"
+        heads = sorted(set((parent_heads or {}).get(record_id, ())))
         prior_op = protocol.build_operation({"protocol_major": 2,
             "schema_minor": 0, "replica_id": manifest["replica_id"],
-            "counter": by_identity[prior_identity], "parents": [],
+            "counter": by_identity[prior_identity], "parents": heads,
             "project_key": project_key, "kind": "put",
-            "frontiers": [{"record_id": record_id, "heads": []}],
+            "frontiers": [{"record_id": record_id, "heads": heads}],
             "mutations": [{"record_id": record_id, "mutation_ordinal": 0,
                            "post_state": prior}],
             "provenance": {"actor": "migration", "reason": "graveyard-prior",
@@ -1103,6 +1105,7 @@ def build_seed_manifest(*, epoch_id: str, membership_digest: str,
                         replica_id: str, kind: str,
                         mappings: Sequence[Mapping[str, Any]],
                         operations: Sequence[bytes | bytearray | Mapping[str, Any]],
+                        captured_op_ids: Iterable[str] = (),
                         out: str | os.PathLike[str] | None = None,
                         apply: bool = False) -> dict[str, Any]:
     _require_epoch(epoch_id); replica_id = _require_replica(replica_id)
@@ -1111,17 +1114,19 @@ def build_seed_manifest(*, epoch_id: str, membership_digest: str,
                           (source_digest, "source-digest-invalid")):
         _require_digest(value, reason)
     if kind not in {"snapshot", "delta"}: raise MigrationError("seed-kind-invalid")
-    raw_by_id, dots, object_rows = {}, set(), []
+    raw_by_id, dots, object_rows, dots_by_id = {}, set(), [], {}
+    captured = set(captured_op_ids)
     for value in operations:
         op_id, raw, payload = _operation(value)
         dot = (str(payload.get("replica_id", "")), payload.get("counter"))
-        if dot[0] != replica_id or not isinstance(dot[1], int) \
+        if (dot[0] != replica_id and op_id not in captured) \
+                or not isinstance(dot[1], int) \
                 or isinstance(dot[1], bool) or dot[1] <= 0:
             raise MigrationError("seed-dot-invalid")
         if dot in dots: raise MigrationError("seed-dot-duplicate")
         if op_id in raw_by_id and raw_by_id[op_id] != raw:
             raise MigrationError("seed-operation-equivocation")
-        dots.add(dot); raw_by_id[op_id] = raw
+        dots.add(dot); raw_by_id[op_id] = raw; dots_by_id[op_id] = dot
         object_rows.append({"op_id": op_id,
             "path": f"protocol/v2/ops/{op_id[:2]}/{op_id}.json",
             "sha256": digest_bytes(raw), "bytes": len(raw),
@@ -1134,11 +1139,15 @@ def build_seed_manifest(*, epoch_id: str, membership_digest: str,
             raise MigrationError("seed-source-identity-invalid")
         if op_id not in raw_by_id or op_id in mapped:
             raise MigrationError("seed-mapping-operation-invalid")
+        dot = dots_by_id[op_id]
         if not isinstance(counter, int) or isinstance(counter, bool) \
-                or (replica_id, counter) not in dots:
+                or counter != dot[1] \
+                or source.get("replica_id", dot[0]) != dot[0]:
             raise MigrationError("seed-mapping-dot-invalid")
+        if dot[0] != replica_id and identity != f"captured:{op_id}":
+            raise MigrationError("seed-captured-identity-invalid")
         source_ids.add(identity); mapped.add(op_id)
-        mapping_rows.append({"source_identity": identity, "replica_id": replica_id,
+        mapping_rows.append({"source_identity": identity, "replica_id": dot[0],
                              "counter": counter, "op_id": op_id})
     if mapped != set(raw_by_id): raise MigrationError("seed-mapping-incomplete")
     counters = [counter for _, counter in dots]
@@ -1203,6 +1212,20 @@ def verify_seed_manifest(value: Mapping[str, Any] | str | os.PathLike[str], *,
     if manifest.get("dispositions") != dispositions \
             or manifest.get("dispositions_digest") != digest_json(dispositions):
         raise MigrationError("seed-disposition-mismatch")
+    # Rebuild the mapping/object matrix. Historical authors are carried only
+    # by exact captured-ID rows; CLI construction separately proves those
+    # bytes against the sealed snapshot's inactive predecessor chain.
+    rebuilt = build_seed_manifest(epoch_id=manifest["epoch_id"],
+        membership_digest=manifest["membership_digest"],
+        snapshot_digest=manifest["snapshot_digest"],
+        source_digest=manifest["source_digest"], replica_id=manifest["replica_id"],
+        kind=manifest["kind"].removesuffix("-seed"),
+        mappings=manifest["mappings"], operations=list(raw_by_id.values()),
+        captured_op_ids=[row["op_id"] for row in manifest["mappings"]
+                        if row.get("source_identity") == f"captured:{row['op_id']}"])
+    rebuilt.pop("changed", None)
+    if rebuilt != manifest:
+        raise MigrationError("seed-mapping-matrix-mismatch")
     return manifest
 
 

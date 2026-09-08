@@ -37,7 +37,11 @@ const memoryBySession = new Map()
 const turnContextBySession = new Map()
 
 function baseDir(ctx) {
-  return ctx.worktree || ctx.directory || process.cwd()
+  // OpenCode v1.18.15 Project.fromDirectory uses "/" for the non-Git
+  // global project. That sentinel is not this session's working directory.
+  // Real Git roots (including "/") keep the native worktree mapping.
+  const globalRoot = ctx.worktree === "/" && ctx.project?.id === "global" && !ctx.project?.vcs
+  return (globalRoot ? ctx.directory : ctx.worktree) || ctx.directory || process.cwd()
 }
 
 // Headless dispatch liveness probe support.
