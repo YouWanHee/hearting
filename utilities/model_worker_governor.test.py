@@ -20,6 +20,30 @@ SPEC.loader.exec_module(GOVERNOR)
 from replica_batch_contract import build_manifest
 
 
+def _legacy_migration_return(root):
+    """Exercise the original non-group API in a real child, not a mocked PGID.
+
+    The isolated suite runner owns a process group. Its one-shot release may
+    conservatively retain a group lease on incomplete procfs observation;
+    legacy_run returning its own token cannot prove that earlier return.
+    Group drain remains covered by the actual run and namespace tests.
+    """
+    pid, pgid = os.getpid(), os.getpgrp()
+    if pid == pgid:
+        raise AssertionError("legacy contract actor must not own a process group")
+    checked = GOVERNOR.check(root, "dispatch", total=2, budget=2)
+    after_check = json.loads(Path(root, "state.json").read_text())
+    token = GOVERNOR.acquire(root, "dispatch", total=2, budget=2)
+    acquired = json.loads(Path(root, "state.json").read_text())["leases"][token]
+    returned = GOVERNOR.release(root, token)
+    after_return = json.loads(Path(root, "state.json").read_text())
+    return {
+        "pid": pid, "pgid": pgid, "checked": checked,
+        "after_check": after_check, "token": token, "acquired": acquired,
+        "returned": returned, "after_return": after_return,
+    }
+
+
 class GovernorTest(unittest.TestCase):
     def manifest(self, second_harness="claude"):
         return build_manifest(
@@ -767,9 +791,35 @@ print(json.dumps({"returncode": result.returncode, "stderr": result.stderr}))
             Path(temp_dir, "state.json").write_text(
                 json.dumps({"schema_version": 1, "leases": {}, "starts": []})
             )
-            GOVERNOR.check(temp_dir, "dispatch", total=2, budget=2)
-            token = GOVERNOR.acquire(temp_dir, "dispatch", total=2, budget=2)
-            GOVERNOR.release(temp_dir, token)
+            # Inherit this suite's group: the new PID is a non-leader even
+            # when tools/run-tests.py launched the suite with setsid().
+            actor = subprocess.run(
+                [
+                    sys.executable, "-c",
+                    "import json,runpy,sys; sys.path.insert(0,sys.argv[1]); "
+                    "module=runpy.run_path(sys.argv[2]); "
+                    "print(json.dumps(module['_legacy_migration_return'](sys.argv[3])))",
+                    str(PATH.parent), str(Path(__file__).resolve()), temp_dir,
+                ],
+                check=False, capture_output=True, text=True,
+            )
+            self.assertEqual(actor.returncode, 0, actor.stderr)
+            observed = json.loads(actor.stdout)
+            self.assertNotEqual(observed["pid"], observed["pgid"])
+            self.assertEqual(observed["pgid"], os.getpgrp())
+            self.assertIsNone(observed["checked"])
+            self.assertEqual(observed["after_check"]["schema_version"], 2)
+            self.assertEqual(observed["after_check"]["leases"], {})
+            self.assertEqual(observed["after_check"]["starts"], [])
+            self.assertRegex(observed["token"], r"^[0-9a-f]{32}$")
+            self.assertEqual(observed["acquired"]["pid"], observed["pid"])
+            self.assertNotIn("group_owned", observed["acquired"])
+            self.assertEqual(observed["returned"], {
+                "status": "released", "release_proven": True, "occupied": False,
+            })
+            self.assertNotIn(observed["token"], observed["after_return"]["leases"])
+            self.assertEqual(observed["after_return"]["leases"], {})
+            self.assertEqual(len(observed["after_return"]["starts"]), 1)
             legacy_run = subprocess.run(
                 [
                     sys.executable,
