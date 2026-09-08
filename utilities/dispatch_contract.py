@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import base64
 from contextlib import contextmanager
+import contextvars
 from dataclasses import dataclass
 import errno
 import fcntl
@@ -2158,6 +2159,11 @@ def process_group_observation(pgid: int) -> ProcessGroupObservation:
 
     if pgid <= 0:
         return ProcessGroupObservation("unverifiable", reason="invalid-pgid")
+    scan = _PROCESS_TABLE_SCAN.get()
+    if scan is not None:
+        # Batch observer pass (`process_table_scan_scope`): same verdict, one
+        # walk shared by every group of the pass instead of one per call.
+        return _process_group_from_scan(scan, pgid)
     members: list[tuple[int, str, str]] = []
     incomplete_reason = ""
     try:
@@ -2254,6 +2260,154 @@ def _parent_leader_pids(metadata: dict[str, str]) -> set[int]:
     return excluded
 
 
+@dataclass(frozen=True)
+class ProcessTableScan:
+    """One ``/proc`` walk, indexed by attempt tag and by process group.
+
+    Shared by every observation of one observer pass (`process_table_scan_scope`).
+    ``incomplete_reason`` follows `attempt_tagged_descendants`' rules for the
+    tag index; ``group_incomplete_reason`` follows `process_group_observation`'s
+    rules for the group index -- the two probes skip and report different
+    failures, so the walk keeps both verdicts side by side.
+    """
+
+    members_by_attempt: dict[str, tuple[tuple[int, str, str], ...]]
+    members_by_pgid: dict[int, tuple[tuple[int, str, str], ...]]
+    incomplete_reason: str = ""
+    group_incomplete_reason: str = ""
+    error: str = ""
+
+
+_PROCESS_TABLE_SCAN: contextvars.ContextVar = contextvars.ContextVar(
+    "dispatch_process_table_scan", default=None
+)
+
+
+def scan_process_table() -> ProcessTableScan:
+    """Walk ``/proc`` once and index live processes by attempt tag and by pgid.
+
+    Per-process reads, skips, and incomplete reasons are exactly those of the
+    two single-shot probes: the ``stat`` read follows `process_group_observation`
+    (a permission failure there is an incomplete group scan), the ``environ``
+    read follows `attempt_tagged_descendants` (a permission failure there is
+    another uid's process and is skipped). The tag value is recorded for every
+    process instead of being compared with one attempt id; parent-leader
+    exclusion is per attempt and is applied later, in
+    `_tagged_descendants_from_scan`.
+    """
+
+    prefix = f"{ATTEMPT_DESCENDANT_ENV}=".encode()
+    by_attempt: dict[str, list[tuple[int, str, str]]] = {}
+    by_pgid: dict[int, list[tuple[int, str, str]]] = {}
+    incomplete_reason = ""
+    group_incomplete_reason = ""
+    try:
+        entries = tuple(Path("/proc").iterdir())
+    except OSError as exc:
+        return ProcessTableScan({}, {}, error=f"procfs-enumeration:{exc.errno or 'error'}")
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            raw = (entry / "stat").read_text(encoding="utf-8")
+            tail = raw[raw.rfind(")") + 2 :].split()
+            state, start, pgid = tail[0], tail[19], int(tail[2])
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            if exc.errno in {errno.ENOENT, errno.ESRCH}:
+                continue
+            group_incomplete_reason = f"procfs-member:{entry.name}:{exc.errno or 'error'}"
+            if exc.errno not in {errno.EACCES, errno.EPERM}:
+                incomplete_reason = f"procfs-environ:{entry.name}:{exc.errno or 'error'}"
+            continue
+        except (IndexError, ValueError):
+            group_incomplete_reason = f"procfs-member:{entry.name}:malformed"
+            incomplete_reason = f"procfs-member:{entry.name}:malformed"
+            continue
+        pid = int(entry.name)
+        by_pgid.setdefault(pgid, []).append((pid, start, state))
+        if state == "Z":
+            continue
+        try:
+            environ = (entry / "environ").read_bytes()
+        except (FileNotFoundError, PermissionError):
+            continue
+        except OSError as exc:
+            if exc.errno in {errno.ENOENT, errno.ESRCH, errno.EACCES, errno.EPERM}:
+                continue
+            incomplete_reason = f"procfs-environ:{entry.name}:{exc.errno or 'error'}"
+            continue
+        for item in environ.split(b"\0"):
+            if item.startswith(prefix):
+                tag_value = item[len(prefix):].decode("utf-8", "replace")
+                by_attempt.setdefault(tag_value, []).append((pid, start, state))
+    return ProcessTableScan(
+        {tag: tuple(sorted(rows, key=lambda member: member[0])) for tag, rows in by_attempt.items()},
+        {pgid: tuple(sorted(rows, key=lambda member: member[0])) for pgid, rows in by_pgid.items()},
+        incomplete_reason,
+        group_incomplete_reason,
+    )
+
+
+@contextmanager
+def process_table_scan_scope():
+    """Fleet-only batch path: one ``/proc`` walk for every observation of one pass.
+
+    `attempt_tagged_descendants` and `process_group_observation` are single-shot
+    probes for the moment before a quiescence verdict and are never meant for a
+    hot path -- yet a monitor that classifies every registered attempt on every
+    tick reached both once per row (2026-09-08 audit: 187 rows, 20 s of a ~40 s
+    tick). Inside this scope every call answers from one walk taken on entry,
+    with the same populated / unverifiable / empty verdict per attempt or group;
+    the walk is dropped on exit, so the next pass reads ``/proc`` again. Only
+    observe-only passes may hold this scope: a caller that waits for a process
+    to disappear must stay outside it, which every existing quiescence caller
+    does. A nested scope joins the enclosing pass.
+    """
+
+    if _PROCESS_TABLE_SCAN.get() is not None:
+        yield
+        return
+    token = _PROCESS_TABLE_SCAN.set(scan_process_table())
+    try:
+        yield
+    finally:
+        _PROCESS_TABLE_SCAN.reset(token)
+
+
+def _tagged_descendants_from_scan(
+    scan: ProcessTableScan, metadata: dict[str, str], attempt_id: str
+) -> ProcessGroupObservation:
+    if scan.error:
+        return ProcessGroupObservation("unverifiable", reason=scan.error)
+    excluded_pids = _parent_leader_pids(metadata)
+    ordered = tuple(
+        member for member in scan.members_by_attempt.get(attempt_id, ())
+        if member[0] not in excluded_pids
+    )
+    if ordered:
+        return ProcessGroupObservation("populated", ordered, scan.incomplete_reason)
+    if scan.incomplete_reason:
+        return ProcessGroupObservation("unverifiable", (), scan.incomplete_reason)
+    if not attempt_scan_namespace_authority(metadata):
+        return ProcessGroupObservation(
+            "unverifiable", (), "observer-namespace-mismatch"
+        )
+    return ProcessGroupObservation("empty")
+
+
+def _process_group_from_scan(scan: ProcessTableScan, pgid: int) -> ProcessGroupObservation:
+    if scan.error:
+        return ProcessGroupObservation("unverifiable", reason=scan.error)
+    ordered = scan.members_by_pgid.get(pgid, ())
+    if any(state != "Z" for _pid, _start, state in ordered):
+        return ProcessGroupObservation("populated", ordered, scan.group_incomplete_reason)
+    if scan.group_incomplete_reason:
+        return ProcessGroupObservation("unverifiable", ordered, scan.group_incomplete_reason)
+    return ProcessGroupObservation("empty", ordered)
+
+
 def attempt_tagged_descendants(metadata: dict[str, str]) -> ProcessGroupObservation:
     """Find live processes still tagged with this attempt, whatever group they left.
 
@@ -2273,6 +2427,11 @@ def attempt_tagged_descendants(metadata: dict[str, str]) -> ProcessGroupObservat
     attempt_id = metadata.get("attempt_id", "")
     if not attempt_id:
         return ProcessGroupObservation("unverifiable", reason="attempt-id-missing")
+    scan = _PROCESS_TABLE_SCAN.get()
+    if scan is not None:
+        # Batch observer pass (`process_table_scan_scope`): same verdict, one
+        # walk shared by every attempt of the pass instead of one per call.
+        return _tagged_descendants_from_scan(scan, metadata, attempt_id)
     tag = f"{ATTEMPT_DESCENDANT_ENV}={attempt_id}".encode()
     # SD-OPEN-47 (H7-b): a child's liveness is its own process set. The
     # recorded parent leader (the owner's governed process) is an ancestor,

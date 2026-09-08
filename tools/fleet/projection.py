@@ -7,6 +7,7 @@ result.  It never starts a provider and never writes harness state.
 
 from __future__ import annotations
 
+import contextlib
 import glob
 import hashlib
 import json
@@ -1504,14 +1505,21 @@ def attach_projections(sessions: Iterable[Session], jobs: Iterable[DispatchJob],
     # marker is eligible only when this exact session is actively in autopilot-spec.
     for session in sessions:
         session.cap_grounding = _capability_grounding_for(session, cap_index, now=now)
-    for entity in all_entities:
-        entity.work_projection = resolve_work_projection(
-            entity, jobs=jobs, route_records=route_records,
-            node_evidence=node_evidence, artifact_root=artifact_root, now=now,
-            spec_markers=spec_markers,
-            cap_grounding=(entity.cap_grounding if isinstance(entity, Session) else None),
-            degradations=degradations)
-        entity.stage = entity.work_projection.stage_label if isinstance(entity, DispatchJob) else getattr(entity, "stage", None)
+    # One projection pass = one artifact-reader scope: `_artifact_candidates` asks the
+    # reader once per entity x root, and inside the scope those calls share one locator
+    # scan per root instead of re-walking the tree each time (2026-09-08 audit: 80 walks,
+    # 23.6 s per tick). The memo dies with this block, so the next tick scans records again.
+    reader = _artifact_reader()
+    read_scope = getattr(reader, "read_scope", None) if reader is not None else None
+    with (read_scope() if read_scope is not None else contextlib.nullcontext()):
+        for entity in all_entities:
+            entity.work_projection = resolve_work_projection(
+                entity, jobs=jobs, route_records=route_records,
+                node_evidence=node_evidence, artifact_root=artifact_root, now=now,
+                spec_markers=spec_markers,
+                cap_grounding=(entity.cap_grounding if isinstance(entity, Session) else None),
+                degradations=degradations)
+            entity.stage = entity.work_projection.stage_label if isinstance(entity, DispatchJob) else getattr(entity, "stage", None)
     return sessions, jobs
 
 

@@ -18,10 +18,12 @@ This module never writes under the artifact root.
 from __future__ import annotations
 
 import argparse
+import contextvars
 import fnmatch
 import json
 import os
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
@@ -47,14 +49,74 @@ def _cycle_state(cycle_dir: Path) -> str:
     return "sealed" if (cycle_dir / "manifest.json").is_file() else "open"
 
 
+class _ReadScope:
+    """Memo for ONE read pass (see `read_scope`); never outlives its `with` block."""
+
+    __slots__ = ("scan_index", "cycle_buckets")
+
+    def __init__(self) -> None:
+        self.scan_index: Dict[str, Tuple[Dict[str, str], Dict[str, Dict[str, str]]]] = {}
+        self.cycle_buckets: Dict[Tuple[str, str], List[Tuple[Path, Dict[str, str]]]] = {}
+
+
+_READ_SCOPE: contextvars.ContextVar = contextvars.ContextVar("artifact_reader_read_scope", default=None)
+
+
+@contextmanager
+def read_scope():
+    """Reuse locator scans inside one read pass, and only there.
+
+    Fleet's projection asks `glob_bucket` once per entity x root: dozens of
+    identical `artifact_locator.scan_index` walks of the same NFS tree in one
+    collector tick (2026-09-08 audit: 80 walks, 23.6 s of a ~40 s tick against
+    a 2 s refresh interval). Inside this scope the first scan of a root serves
+    every later call of the same pass. The memo exists only on the context
+    stack between entry and exit, so the next pass scans the records again:
+    sealed identity still comes from campaign/manifest/open-cycle records on
+    every pass, never from a persisted cache or the rebuildable INDEX files.
+    A nested scope joins the enclosing pass instead of starting a fresh memo.
+    """
+    if _READ_SCOPE.get() is not None:
+        yield
+        return
+    token = _READ_SCOPE.set(_ReadScope())
+    try:
+        yield
+    finally:
+        _READ_SCOPE.reset(token)
+
+
+def _scan_index(root: Path) -> Tuple[Dict[str, str], Dict[str, Dict[str, str]]]:
+    scope = _READ_SCOPE.get()
+    if scope is None:
+        return artifact_locator.scan_index(root)
+    key = str(Path(root).resolve())
+    hit = scope.scan_index.get(key)
+    if hit is None:
+        hit = scope.scan_index[key] = artifact_locator.scan_index(root)
+    return hit
+
+
 def cycle_bucket_dirs(root: Path, bucket: str) -> List[Tuple[Path, Dict[str, str]]]:
     """Every recorded cycle's artifact bucket, across new and legacy layouts."""
+    scope = _READ_SCOPE.get()
+    if scope is None:
+        return _cycle_bucket_dirs(root, bucket)
+    key = (str(Path(root).resolve()), str(bucket))
+    hit = scope.cycle_buckets.get(key)
+    if hit is None:
+        hit = scope.cycle_buckets[key] = _cycle_bucket_dirs(root, bucket)
+    # Callers extend the returned list (`bucket_dirs`), so the memo hands out copies.
+    return [(path, dict(meta)) for path, meta in hit]
+
+
+def _cycle_bucket_dirs(root: Path, bucket: str) -> List[Tuple[Path, Dict[str, str]]]:
     root = Path(root)
     out: List[Tuple[Path, Dict[str, str]]] = []
     # The rebuildable INDEX files are deliberately not consulted here. Stable
     # identity comes from campaign/manifest/open-cycle records on every scan;
     # locator basenames are display values and may be renamed after sealing.
-    mapping, _rows = artifact_locator.scan_index(root)
+    mapping, _rows = _scan_index(root)
     identities = {relative: identifier for identifier, relative in mapping.items()}
     for camp in artifact_locator.iter_campaign_dirs(root):
         campaign_rel = camp.resolve().relative_to(root.resolve()).as_posix()

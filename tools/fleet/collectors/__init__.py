@@ -228,6 +228,14 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only"):
                     fn(s)
             except Exception:
                 pass  # enrichment failure never removes the backbone row
+    # Managed Codex: the hidden app-server row shares the tag its TUI client minted,
+    # joined on the exact managed state dir (additive; never touches an existing tag).
+    try:
+        share_tags = getattr(modules.get("codex"), "share_managed_tags", None)
+        if share_tags and codex_tick is not None:
+            share_tags(sessions)
+    except Exception:
+        pass
 
     # Exact Fleet-owned decision/approval waits are additive enrichment. Run
     # after harness identity resolution and before the single liveness verdict.
