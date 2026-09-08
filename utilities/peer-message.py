@@ -107,6 +107,45 @@ def _transfer_path(ref):
     return _ledger_root() / "peer-messages" / "transfers" / f"{ref}.json"
 
 
+def _read_transfer_record(ref):
+    """Read Fleet's trusted ledger roots; a message never supplies a path.
+
+    Each writer keeps its canonical jobs root. Multiple records for one ref
+    are ambiguous, even when one of them would match the recipient.
+    """
+    own_path = _transfer_path(ref)  # Validate before querying any roots.
+    roots, _source = steward_marker_roots()
+    paths = [own_path, *(Path(root) / "peer-messages" / "transfers" / own_path.name for root in roots)]
+    record, found, seen = None, False, set()
+    for path in paths:
+        root = path.parent.parent.parent.resolve()
+        path = root / "peer-messages" / "transfers" / own_path.name
+        if path in seen:
+            continue
+        seen.add(path)
+        if path.parent.is_symlink() or path.parent.parent.is_symlink():
+            raise ValueError("peer-transfer-symlink")
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
+            continue
+        with os.fdopen(fd, encoding="utf-8") as fh:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+            data = fh.read(65537)
+            if len(data) > 65536 or found:
+                raise ValueError("peer-transfer-ambiguous-or-oversized")
+            record, found = json.loads(data), True
+    return record
+
+
+def _valid_transfer_endpoint(endpoint):
+    if not isinstance(endpoint, dict) or endpoint.get("harness") not in ("claude", "codex", "opencode"):
+        return False
+    sid, name = endpoint.get("session_id"), endpoint.get("name")
+    return (isinstance(sid, str) and bool(sid) and usable_session_id(sid) == sid
+            and (name is None or isinstance(name, str)))
+
+
 def prepare_peer_message(body, sender, recipient):
     """Seal a transmission intent before delivery (the receiver may run immediately).
 
@@ -181,22 +220,18 @@ def parse_peer_trailer(text, recipient=None):
         display_name, sep, ref = (match.group("name") or "").rpartition("; ref=")
         if sep:
             result["name"] = display_name.strip() or None
-        # Unknown tags, malformed metadata, wrong actual recipient and changed
-        # bodies remain notices without exact sender identity. No UUID fallback.
-        if not recipient or not re.fullmatch(r"\[[0-9a-f]{2}\]", match.group("sid")):
+        # A missing display tag does not decide identity. Malformed metadata,
+        # wrong actual recipient and changed bodies remain unattributed.
+        if not _valid_transfer_endpoint(recipient) or not re.fullmatch(r"\[(?:[0-9a-f]{2}|\?)\]", match.group("sid")):
             return result
         try:
-            path = _transfer_path(ref)
-            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-            with os.fdopen(fd, encoding="utf-8") as fh:
-                fcntl.flock(fh.fileno(), fcntl.LOCK_SH)
-                record = json.load(fh)
+            record = _read_transfer_record(ref)
             sender, target = record["from"], record["to"]
-            if (record.get("schema_version") != 1 or record.get("message_id") != ref
+            if (not _valid_transfer_endpoint(sender) or not _valid_transfer_endpoint(target)
+                    or type(record.get("schema_version")) is not int or record["schema_version"] != 1
+                    or record.get("message_id") != ref
                     or record.get("body_sha256") != hashlib.sha256(text.encode("utf-8")).hexdigest()
                     or sender.get("harness") != result["harness"]
-                    or not usable_session_id(sender.get("session_id"))
-                    or not usable_session_id(recipient.get("session_id"))
                     or any(target.get(k) != recipient.get(k) for k in ("harness", "session_id"))):
                 return result
             result.update(session_id=sender["session_id"], name=sender.get("name"))

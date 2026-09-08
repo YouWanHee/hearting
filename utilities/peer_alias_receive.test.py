@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -25,6 +26,12 @@ def module(name, path):
 pm = module("alias_peer_message", "utilities/peer-message.py")
 
 
+def pinned_source(path):
+    # HOME is isolated, so use command-local trust for this exact test checkout.
+    return subprocess.check_output(["git", "-c", f"safe.directory={ROOT}", "show", f"1c201125:{path}"],
+                                   cwd=ROOT, text=True, timeout=5)
+
+
 class AliasReceive(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -32,7 +39,8 @@ class AliasReceive(unittest.TestCase):
         self.state = Path(self.tmp.name)
         self.env = mock.patch.dict(os.environ, {
             "AGENT_DISPATCH_JOBS": str(self.state / "jobs.log"),
-            "AGENT_HOME": str(ROOT), "CLAUDE_CONFIG_DIR": str(self.state / "claude"),
+            "HOME": str(self.state / "home"), "CODEX_HOME": str(self.state / "home/.codex"),
+            "AGENT_HOME": str(ROOT), "CLAUDE_CONFIG_DIR": str(self.state / "home/.claude"),
             "XDG_STATE_HOME": str(self.state / "xdg"), "PYTHONDONTWRITEBYTECODE": "1"})
         self.env.start()
         self.addCleanup(self.env.stop)
@@ -109,7 +117,7 @@ class AliasReceive(unittest.TestCase):
         self.assertIsNone(self.parse("앞에 추가\n" + text))
         self.assertEqual(self.parse(text + "\n(peer-from: claude last-id last-name)"), "last-id")
         # Execute the actual pinned pre-change parser; no mock reinterpretation.
-        source = subprocess.check_output(["git", "show", "1c201125:utilities/peer-message.py"], cwd=ROOT, text=True)
+        source = pinned_source("utilities/peer-message.py")
         scope = {"__file__": str(ROOT / "utilities/peer-message.py"), "__name__": "pinned_peer"}
         exec(compile(source, "pinned-peer-message", "exec"), scope)
         old = scope["parse_peer_trailer"](text)
@@ -118,7 +126,7 @@ class AliasReceive(unittest.TestCase):
 
     def test_claude_derived_then_rename_remembered_tag(self):
         from fleet import titles
-        sessions = self.state / "claude/sessions"
+        sessions = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "sessions"
         sessions.mkdir(parents=True)
         path = sessions / "123.json"
         path.write_text(json.dumps({"sessionId": "claude-id", "name": "project-ab", "nameSource": "derived"}))
@@ -146,6 +154,113 @@ class AliasReceive(unittest.TestCase):
         path.rename(renamed)
         path.symlink_to(renamed)
         self.assertIsNone(self.parse(text))
+
+    def _receive_actual(self, harness, text, sid="recipient-a"):
+        if harness == "claude":
+            hook = module("alias_claude_hook", "hooks/peer-message-record.py")
+            hook.handle_prompt({"session_id": sid, "cwd": str(ROOT), "prompt": text})
+        elif harness == "codex":
+            hook = module("alias_codex_hook", "adapters/codex/hooks/userprompt-lifecycle.py")
+            hook.peer_notice({"session_id": sid}, text, str(ROOT))
+        else:
+            proc = subprocess.run([sys.executable, str(ROOT / "utilities/peer-message.py"), "receive",
+                                   "--to-harness", harness, "--to-session-id", sid],
+                                  input=text, text=True, capture_output=True, timeout=5)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_distinct_installed_runtime_roots_all_sender_receiver_pairs(self):
+        roots = {"claude": self.state / "xdg/hearting/dispatch",
+                 "codex": self.state / "home/.codex/.harness/dispatch",
+                 "opencode": self.state / "home/.config/opencode/.harness/dispatch"}
+        for sender_harness, sender_root in roots.items():
+            for receiver_harness, receiver_root in roots.items():
+                with self.subTest(sender=sender_harness, receiver=receiver_harness):
+                    sender = dict(self.sender, harness=sender_harness,
+                                  session_id=f"sender-{sender_harness}-{receiver_harness}")
+                    target = dict(self.recipient, harness=receiver_harness)
+                    os.environ["AGENT_DISPATCH_JOBS"] = str(sender_root / "jobs.log")
+                    text, ref = self.prepare(sender=sender, recipient=target)
+                    os.environ["AGENT_DISPATCH_JOBS"] = str(receiver_root / "jobs.log")
+                    self.assertEqual(self.parse(text, target), sender["session_id"])
+                    self.assertIsNone(self.parse(text + "改", target))
+                    self.assertIsNone(self.parse(text, dict(target, session_id="new-occupant")))
+                    self._receive_actual(receiver_harness, text)
+                    path = receiver_root / "peer-messages" / time.strftime("%Y-%m") / (sender["session_id"] + ".jsonl")
+                    row = json.loads(path.read_text().splitlines()[-1])
+                    self.assertEqual(row["from"]["session_id"], sender["session_id"])
+                    self.assertEqual(row["to"]["session_id"], target["session_id"])
+                    transfer = sender_root / "peer-messages/transfers" / (ref + ".json")
+                    transfer.rename(transfer.with_suffix(".missing"))
+                    self.assertIsNone(self.parse(text, target))
+
+    def test_metadata_types_fail_soft_in_all_receivers(self):
+        changes = [(side, field, value) for side in ("from", "to")
+                   for field, values in (("session_id", (123, True, [], None, " padded ")),
+                                         ("name", ([], {}))) for value in values]
+        changes += [(side, None, value) for side in ("from", "to") for value in ([], None)]
+        for harness in ("claude", "codex", "opencode"):
+            for side, field, value in changes:
+                with self.subTest(harness=harness, side=side, field=field, value=value):
+                    text, ref = self.prepare(recipient=dict(self.recipient, harness=harness))
+                    path = pm._transfer_path(ref)
+                    record = json.loads(path.read_text())
+                    if field:
+                        record[side][field] = value
+                    else:
+                        record[side] = value
+                    path.write_text(json.dumps(record))
+                    self._receive_actual(harness, text)
+        rows = self.rows()
+        self.assertEqual(len(rows), len(changes) * 3)
+        self.assertTrue(all(row["from"]["session_id"] == "" for row in rows))
+
+    def test_missing_claude_tag_does_not_remove_proven_identity(self):
+        sender = dict(self.sender, harness="claude", session_id="claude-unremembered")
+        text, ref = self.prepare(sender=sender)
+        self.assertIn("[?]", text)
+        self.assertEqual(self.parse(text), sender["session_id"])
+        self.assertIsNone(pm.parse_peer_trailer(text)["session_id"])
+        pm._transfer_path(ref).write_text("null")
+        self.assertIsNone(self.parse(text))
+
+    def test_duplicate_ref_across_trusted_roots_is_ambiguous(self):
+        text, ref = self.prepare()
+        other_root = self.state / "home/.codex/.harness/dispatch"
+        other = other_root / "peer-messages/transfers" / (ref + ".json")
+        other.parent.mkdir(parents=True)
+        other.write_bytes(pm._transfer_path(ref).read_bytes())
+        self.assertIsNone(self.parse(text))
+
+    def test_pinned_opencode_regex_and_writer_leave_new_sender_unattributed(self):
+        source = pinned_source("adapters/opencode/plugins/hearting-guards.js")
+        old_python = pinned_source("utilities/peer-message.py")
+        scope = {"__file__": str(ROOT / "utilities/peer-message.py"), "__name__": "pinned_peer"}
+        exec(compile(old_python, "pinned-peer-message", "exec"), scope)
+        js = r'''
+const fs = require('fs'), vm = require('vm'), path = require('path');
+const input = JSON.parse(fs.readFileSync(0, 'utf8'));
+const fn = input.source.slice(input.source.indexOf('const peerTrailerRe ='), input.source.indexOf('\nfunction promptText('));
+let result = {};
+vm.runInNewContext(fn + '\nspawnPeerNotice("recipient-a", prompt, root)', {
+  path, root: input.root, prompt: input.prompt, process: {env: {}},
+  spawn: (exe, args) => { result = {exe, args}; return {
+    on: () => {}, unref: () => {}, stdin: {end: body => {result.body = body;}}
+  }; }
+});
+process.stdout.write(JSON.stringify(result));
+'''
+        for harness in ("codex", "claude"):
+            text, _ = self.prepare(sender=dict(self.sender, harness=harness),
+                                   recipient={"harness": "opencode", "session_id": "recipient-a"})
+            proc = subprocess.run(["node", "-e", js],
+                                  input=json.dumps({"root": str(ROOT), "source": source, "prompt": text}),
+                                  text=True, capture_output=True, timeout=5)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            call = json.loads(proc.stdout)
+            with mock.patch.object(sys, "stdin", io.StringIO(call["body"])):
+                self.assertEqual(scope["main"](call["args"][1:]), 0)
+        self.assertEqual(len(self.rows()), 2)
+        self.assertTrue(all(row["from"]["session_id"] == "" for row in self.rows()))
 
     def test_python_receive_cli_exact_and_wrong_recipient(self):
         for sid in ("recipient-a", "new-occupant"):
