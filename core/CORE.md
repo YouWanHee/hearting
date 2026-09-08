@@ -191,6 +191,19 @@ excluded by name. Census never follows symlinks: a symlink is recorded as its ow
 row and produces no descendant rows, and a symlink whose target resolves outside
 the canonical root is not canonical content.
 
+**Sealed bytes maintenance.** `utilities/artifact_restore_sealed.py`의 명시적
+operator `apply`는 sealed manifest가 이미 선언한 부재 regular file의 exact
+SHA/size bytes만 no-follow dirfd·no-replace 게시로 복구한다. 전체 요청은
+lock·staging·기록 생성 전에 검증하며 source identity/bytes와 target을 게시
+전후 다시 검증한다. request digest는 입력 일치만 증명하며 사람 승인이나
+새 실행권을 발급하지 않는다. 일반 `check-write`, producer state/recovery와
+기존 manifest/map/receipt/marker는 변경하지 않는다. 별도 OPEN 작업 cycle의
+prepared 기록으로 결속한 자기 staging↔target의 일시 hardlink만 허용하고
+archive/foreign link는 거부한다. 기존 exact 파일은 보존하고, crash 재개는
+부재 파일만 이어가며 이전 성공을 덮어쓰거나 삭제하지 않는다. dry-run은
+같은 전체 검증을 쓰기 없이 수행한다. 결과는 실제 파일 관측과 새 작업
+기록이며 봉인 상태 승격이나 비협조 writer의 전역 원자성 보장이 아니다.
+
 **Runtime records.** The canonical route lifecycle record is
 `<artifact-root>/.runtime/routes/<route_id>.json`, with the sole terminal sidecar
 `<route_id>.outcome.json` beside it. No other location or basename is a valid
