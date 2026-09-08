@@ -437,3 +437,21 @@ Resource-runner startup requires a sealed route, exact detached resource node,
 and smoke attestation before launch state or a child process exists. Installing
 the projection and satisfying current-hash hook trust are separate operator
 actions; this source tree alone does not activate runtime enforcement.
+
+### SD-88 demand selection
+
+`preflight.sh compose --profile-demands demands.json` (Codex/OpenCode) and the
+portable `utilities/capability-route.py compile|compose` consume the same JSON map:
+keys are realized node IDs or `__owner__`, values are full schema-v1 demands with
+both axes, reasons and evidence references. `--explicit-profiles profiles.json`
+uses a matching map and cannot bypass the judgment floor. Custom unit recipes
+provide `profile_demand` on every ad-hoc unit. Missing fields fail closed.
+
+The five portable profiles are deep, balanced-deep, balanced, light and mini.
+Concrete defaults and generated native agents come from this adapter's
+`config/models.conf`; runtime loading selects the user's whole file first.
+A missing balanced row is derived only from that user's light row in memory;
+explicit settings win, and other missing required keys retain whole-file fallback.
+OpenCode reports collapsed-balanced-to-light and preserves its full light budget.
+No install/update/reapply/uninstall writes the normalization back. Source checks
+do not activate an installed release or change an in-flight sealed route.

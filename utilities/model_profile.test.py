@@ -50,6 +50,52 @@ def args(adapter: str, profile: str, **overrides):
 
 
 class ModelProfileTest(unittest.TestCase):
+    def demand(self, judgment="predetermined", scope="short-local", **extra):
+        value = {
+            "schema_version": 1,
+            "judgment_requirement": judgment,
+            "execution_scope": scope,
+            "judgment_reason": "approved judgment boundary",
+            "execution_reason": "bounded execution scope",
+            "evidence_refs": ["fixture:sd-88"],
+        }
+        value.update(extra)
+        return value
+
+    def test_two_axis_matrix_and_independent_floors(self):
+        expected = {
+            ("predetermined", "short-local"): "light",
+            ("predetermined", "extended-multistep"): "balanced",
+            ("important", "short-local"): "balanced-deep",
+            ("important", "extended-multistep"): "balanced-deep",
+            ("difficult-uncertain", "short-local"): "deep",
+            ("difficult-uncertain", "extended-multistep"): "deep",
+        }
+        for axes, profile in expected.items():
+            with self.subTest(axes=axes):
+                result = PROFILE.resolve_profile_demand(self.demand(*axes))
+                self.assertEqual(result["resolved_profile"], profile)
+                self.assertTrue(result["demand_digest"])
+        with self.assertRaises(PROFILE.ModelProfileError) as caught:
+            PROFILE.resolve_profile_demand(
+                self.demand("predetermined", "short-local"), explicit_profile="deep"
+            )
+        self.assertEqual(caught.exception.reason, "profile-floor-violation")
+        result = PROFILE.resolve_profile_demand(
+            self.demand("important"), explicit_profile="deep"
+        )
+        self.assertIn("additional", result["reason"])
+
+    def test_demand_reasons_and_axes_are_sealed(self):
+        base = PROFILE.resolve_profile_demand(self.demand("important"))
+        changed = PROFILE.resolve_profile_demand(
+            self.demand("important", judgment_reason="new approved reason")
+        )
+        self.assertNotEqual(base["demand_digest"], changed["demand_digest"])
+        for field, value in (("execution_scope", "unknown"), ("evidence_refs", [])):
+            with self.subTest(field=field), self.assertRaises(PROFILE.ModelProfileError):
+                PROFILE.resolve_profile_demand(self.demand("important", **{field: value}))
+
     def test_malformed_cfg_declarations_fail_loudly(self):
         cases = {
             "missing equals": "CFG_MODEL_PROFILE_GRANULARITY\n",
@@ -86,28 +132,29 @@ class ModelProfileTest(unittest.TestCase):
 
     def test_portable_profiles_resolve_to_declared_adapter_budgets(self):
         expected = {
-            # mini shares the light model at a lower effort — four profiles, four
-            # distinct operating points, three concrete models.
+            # Five profiles use the configured judgment and execution budgets;
+            # Claude keeps five operating points across three concrete models.
             "claude": {
-                "deep": ("opus", "xhigh"),
-                "balanced-deep": ("opus", "medium"),
+                "deep": ("fable", "high"),
+                "balanced-deep": ("opus", "high"),
+                "balanced": ("sonnet", "high"),
                 "light": ("sonnet", "medium"),
                 "mini": ("sonnet", "low"),
             },
             "codex": {
-                "deep": ("gpt-5.6-sol", "xhigh"),
-                "balanced-deep": ("gpt-5.6-sol", "medium"),
+                "deep": ("gpt-6-astra", "high"),
+                "balanced-deep": ("gpt-6-astra", "medium"),
+                "balanced": ("gpt-5.6-luna", "high"),
                 "light": ("gpt-5.6-luna", "medium"),
                 "mini": ("gpt-5.6-luna", "low"),
             },
-            # OpenCode's ladder is two operating points, not four: no effort axis
-            # collapses balanced-deep into deep, and this account's tier choice puts
-            # light and mini on the same model. `mini` is asserted here (unlike the
-            # other adapters, where the shared-model case cannot arise) precisely
-            # because that collapse must stay visible if someone re-splits the tiers.
+            # OpenCode has five profiles and three shipped operating points:
+            # balanced/light/mini share one model and runtime-default budget,
+            # while deep and balanced-deep use distinct configured models.
             "opencode": {
                 "deep": ("opencode-go/qwen3.8-max", "runtime-default"),
                 "balanced-deep": ("opencode-go/glm-5.3", "runtime-default"),
+                "balanced": ("opencode-go/glm-5.3-flash", "runtime-default"),
                 "light": ("opencode-go/glm-5.3-flash", "runtime-default"),
                 "mini": ("opencode-go/glm-5.3-flash", "runtime-default"),
             },
@@ -140,7 +187,7 @@ class ModelProfileTest(unittest.TestCase):
             user.parent.mkdir()
             user.write_text(
                 shipped.replace(
-                    "CFG_TIER_DEEP_MODEL=gpt-5.6-sol",
+                    "CFG_TIER_DEEP_MODEL=gpt-6-astra",
                     "CFG_TIER_DEEP_MODEL=user/deep",
                 )
             )

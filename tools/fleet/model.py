@@ -481,6 +481,11 @@ class DispatchJob:
     model_profile: Optional[str] = None  # route-sealed portable execution profile
     model_tier: Optional[str] = None     # adapter-resolved concrete tier
     profile_granularity: Optional[str] = None  # full | collapsed-balanced-deep | legacy
+    profile_selection_source: Optional[str] = None
+    profile_resolver_version: Optional[str] = None
+    profile_demand_digest: Optional[str] = None
+    profile_selection_digest: Optional[str] = None
+    profile_judgment_floor: Optional[str] = None
     parallel_group: Optional[str] = None
     replica_group: Optional[str] = None  # one-window registry compatibility alias
     perspective: Optional[str] = None

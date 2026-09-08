@@ -3082,6 +3082,11 @@ def replica_batch_expectation(
         "batch_parallel_leg_index": node.get("parallel_leg_index"),
         "_batch_route_nodes": sorted(str(member.get("id", "")) for member in members),
         "_batch_allowed_members": allowed_members,
+        "_batch_profile_selections": {
+            str(member["id"]): {key: member.get(key) for key in
+                                ("model_profile", "profile_demand", "profile_selection")}
+            for member in members if "profile_selection" in member
+        },
     }
     if assignment_sha256:
         if not DIGEST.fullmatch(assignment_sha256):
@@ -3146,6 +3151,11 @@ def _validate_replica_reservation(
         allowed = expected.get("_batch_allowed_members", {})
         for manifest_member in verified["members"]:
             member_node = str(manifest_member.get("route_node", ""))
+            profile_fields = expected.get("_batch_profile_selections", {}).get(member_node)
+            if profile_fields is not None:
+                for key, value in profile_fields.items():
+                    if manifest_member.get(key) != value:
+                        mismatches[f"manifest.member.{member_node}.{key}"] = (value, manifest_member.get(key))
             allowed_for_member = (
                 allowed.get(member_node, []) if isinstance(allowed, dict) else []
             )
@@ -3174,7 +3184,7 @@ def _validate_replica_reservation(
                 "fallback_hop": public_expected.get("batch_fallback_hop"),
                 "fallback_ordinal": public_expected.get("batch_fallback_ordinal"),
             }
-            if int(verified.get("schema_version", 1)) == 2:
+            if int(verified.get("schema_version", 1)) >= 2:
                 member_expected.update({
                     "model_profile": public_expected.get("batch_model_profile"),
                     "perspective": public_expected.get("batch_perspective"),

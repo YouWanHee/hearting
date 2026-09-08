@@ -368,7 +368,9 @@ for runtime_home in "$HOME/.claude" "$HOME/.codex" "$HOME/.config/opencode"; do
 done
 printf '%s\n' 'CFG_TIER_DEEP_MODEL=user-custom' \
   > "$HOME/.codex/agent-config/models.conf"
+MODEL_CONFIG_STAMP=$(stat -c '%y' "$HOME/.codex/agent-config/models.conf")
 harness runtime refresh --runtime codex --json >/dev/null
+test "$(stat -c '%y' "$HOME/.codex/agent-config/models.conf")" = "$MODEL_CONFIG_STAMP" || fail "model config refresh changed mtime"
 grep -q '^CFG_TIER_DEEP_MODEL=user-custom$' \
   "$HOME/.codex/agent-config/models.conf" \
   || fail "Codex refresh rewrote the user model config"
@@ -1132,6 +1134,7 @@ test ! -e "$HOME/.codex/AGENTS.md" && test ! -L "$HOME/.codex/AGENTS.md" \
 grep -q '^CFG_TIER_DEEP_MODEL=user-custom$' \
   "$HOME/.codex/agent-config/models.conf" \
   || fail "Codex uninstall removed or rewrote the user model config"
+test "$(stat -c '%y' "$HOME/.codex/agent-config/models.conf")" = "$MODEL_CONFIG_STAMP" || fail "model config lifecycle changed mtime"
 harness runtime status --runtime codex --json > "$TMP/uninstalled-codex.json" || true
 python3 - "$TMP/uninstalled-codex.json" <<'PY'
 import json, sys

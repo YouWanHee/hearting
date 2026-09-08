@@ -83,7 +83,7 @@ EXPECTED_MODES=$(echo "$EXPECT" | cut -d' ' -f3)
 # every runtime must expose the identical manifest-derived counts in either.
 assert_projection() {
   mode=$1
-  harness runtime activate --runtime all --mode "$mode" --source "$ROOT" --json > "$TMP/$mode-activate.json"
+  harness runtime activate --runtime all --mode "$mode" --source "$ROOT" --json > "$TMP/$mode-activate.json" || { cat "$TMP/$mode-activate.json" >&2; fail "$mode activation failed"; }
   python3 - "$TMP/$mode-activate.json" <<'PY'
 import json, sys
 data = json.load(open(sys.argv[1]))
@@ -168,9 +168,19 @@ sha256sum \
   "$HOME/.config/opencode/agent-config/models.conf" \
   > "$TMP/user-model-config.sha256"
 
+stat -c '%n %y' "$HOME/.claude/agent-config/models.conf" "$HOME/.codex/agent-config/models.conf" "$HOME/.config/opencode/agent-config/models.conf" > "$TMP/user-model-config.mtime"
 assert_projection packaged
+stat -c '%n %y' "$HOME/.claude/agent-config/models.conf" "$HOME/.codex/agent-config/models.conf" "$HOME/.config/opencode/agent-config/models.conf" > "$TMP/user-model-config.after-mtime"
+cmp "$TMP/user-model-config.mtime" "$TMP/user-model-config.after-mtime" || fail "packaged reapply changed model config mtime"
 sha256sum -c "$TMP/user-model-config.sha256" >/dev/null \
   || fail "packaged reactivation rewrote a user model config"
+# Checkout update/reapply may refresh tracked copy-once surfaces, but the
+# runtime's user model policy stays user-owned, including its modification time.
+harness update --reapply --json > "$TMP/reapply.json" || { cat "$TMP/reapply.json" >&2; fail "checkout reapply failed"; }
+sha256sum -c "$TMP/user-model-config.sha256" >/dev/null || fail "reapply rewrote user model config"
+stat -c '%n %y' "$HOME/.claude/agent-config/models.conf" "$HOME/.codex/agent-config/models.conf" "$HOME/.config/opencode/agent-config/models.conf" > "$TMP/user-model-config.reapply-mtime"
+cmp "$TMP/user-model-config.mtime" "$TMP/user-model-config.reapply-mtime" || fail "reapply changed model config mtime"
+
 
 # User-facing verify follows activation state instead of legacy projection checks.
 harness verify --json > "$TMP/verify.json"

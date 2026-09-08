@@ -2511,7 +2511,9 @@ def _dispatch_model_profile(j):
     if not profile or profile == "unsealed":
         return None
     reduced = getattr(j, "profile_granularity", None) not in {None, "", "full"}
-    label = "mp:" + str(profile) + ("~" if reduced else "")
+    source = getattr(j, "profile_selection_source", None)
+    provenance = {"matrix": ":m", "explicit": ":e", "legacy": ":l"}.get(source, "")
+    label = "mp:" + str(profile) + ("~" if reduced else "") + provenance
     return _compact_dispatch_name(label, _PROFILE_MAX)
 
 def _dispatch_stage_label(j):

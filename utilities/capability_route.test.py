@@ -91,6 +91,9 @@ class TestRoute(unittest.TestCase):
   # root ahead of agent-home-relative state (I-2 unification), preferring an
   # inherited AGENT_DISPATCH_JOBS over AGENT_HOME/.dispatch -- clear it too so
   # a developer/CI shell's real registry never leaks into these fixtures.
+  self._env_patch=mock.patch.dict(os.environ, {"XDG_STATE_HOME":self._tmp_home.name+"/state"})
+  self._env_patch.start()
+  self.addCleanup(self._env_patch.stop)
   self._previous_dispatch_jobs=os.environ.get("AGENT_DISPATCH_JOBS")
   os.environ.pop("AGENT_DISPATCH_JOBS",None)
   self.addCleanup(self._restore_agent_home)
@@ -278,6 +281,7 @@ class TestRoute(unittest.TestCase):
        expected,recipe["standard_plus"].get("parallel_groups"),intensity,
        recipe["capability"],
        auxiliary_check_units=registry.get("auxiliary_check_units"))
+      R._seal_profile_demands(expected, legacy=True)
       for node in expected: node.pop("fallback_hops",None)
       def stable(nodes):
        return [
@@ -295,7 +299,7 @@ class TestRoute(unittest.TestCase):
   quick["nodes"][0]["model_profile"]="light"
   quick["route_hash"]=R.route_hash(quick)
   quick["route_id"]="rt-"+quick["route_hash"].split(":",1)[1][:16]
-  with self.assertRaisesRegex(ValueError,"quick node axes mismatch"):
+  with self.assertRaisesRegex(ValueError,"sealed profile differs from selection"):
    R.verify_route(quick,R.ROOT)
   standard=R.compile_route(**self.args(
    capability="autopilot-spec",capability_mode="update",
@@ -305,12 +309,27 @@ class TestRoute(unittest.TestCase):
   owner["model_profile"]="balanced-deep"
   standard["route_hash"]=R.route_hash(standard)
   standard["route_id"]="rt-"+standard["route_hash"].split(":",1)[1][:16]
-  with self.assertRaisesRegex(ValueError,"semantic capability owner"):
+  with self.assertRaisesRegex(ValueError,"sealed profile differs from selection"):
    R.verify_route(standard,R.ROOT)
  def test_composed_verify_rejects_rehashed_semantic_owner_profile_drift(self):
   recipe=json.loads(json.dumps(
    R.TOPO.resolve_recipe(R.TOPO.load_registry(),"autopilot-spec","update")))
   recipe["modes"]=["composed-fixture"]
+  for node in recipe["standard_plus"]["nodes"]:
+   if node.get("kind") == "resource-runner": continue
+   profile=node["model_profile"]
+   node["profile_demand"]={"schema_version":1,
+    "judgment_requirement":"difficult-uncertain" if profile=="deep" else "important" if profile=="balanced-deep" else "predetermined",
+    "execution_scope":"extended-multistep" if profile=="balanced" else "short-local",
+    "judgment_reason":"Fixture preserves the declared judgment.",
+    "execution_reason":"Fixture performs its declared steps.","evidence_refs":["fixture.md"]}
+  for group in recipe["standard_plus"].get("parallel_groups",[]):
+   for leg in group.get("legs",[]):
+    profile=leg["model_profile"]
+    leg["profile_demand"]={"schema_version":1,
+     "judgment_requirement":"difficult-uncertain" if profile=="deep" else "important" if profile=="balanced-deep" else "predetermined",
+     "execution_scope":"short-local","judgment_reason":"Fixture declared judgment.",
+     "execution_reason":"Fixture bounded steps.","evidence_refs":["fixture.md"]}
   route=self._composed(recipe)
   route_owner=next(node for node in route["nodes"] if node["id"]=="prd-transaction")
   embedded_owner=next(
@@ -320,7 +339,7 @@ class TestRoute(unittest.TestCase):
   embedded_owner["model_profile"]="balanced-deep"
   route["route_hash"]=R.route_hash(route)
   route["route_id"]="rt-"+route["route_hash"].split(":",1)[1][:16]
-  with self.assertRaisesRegex(ValueError,"semantic capability owner"):
+  with self.assertRaisesRegex(ValueError,"sealed profile differs from selection"):
    R.verify_route(route,R.ROOT)
  def test_strong_expands_asymmetric_parallel_groups(self):
   evidence=self.dispatch(self.nested())
@@ -1308,6 +1327,22 @@ class TestRoute(unittest.TestCase):
  def _composed_recipe(self):
   recipe=json.loads(json.dumps(R.TOPO.resolve_recipe(R.TOPO.load_registry(),"autopilot-code","dev")))
   recipe["modes"]=["composed-fixture"]
+  # This copied/modified recipe is ad-hoc, so each stage supplies its demand.
+  for node in recipe["standard_plus"]["nodes"]:
+   if node.get("kind") == "resource-runner": continue
+   profile=node["model_profile"]
+   node["profile_demand"]={"schema_version":1,
+    "judgment_requirement":"difficult-uncertain" if profile=="deep" else "important" if profile=="balanced-deep" else "predetermined",
+    "execution_scope":"extended-multistep" if profile=="balanced" else "short-local",
+    "judgment_reason":"Fixture preserves the declared judgment.",
+    "execution_reason":"Fixture performs its declared steps.","evidence_refs":["fixture.md"]}
+  for group in recipe["standard_plus"].get("parallel_groups",[]):
+   for leg in group.get("legs",[]):
+    profile=leg["model_profile"]
+    leg["profile_demand"]={"schema_version":1,
+     "judgment_requirement":"difficult-uncertain" if profile=="deep" else "important" if profile=="balanced-deep" else "predetermined",
+     "execution_scope":"short-local","judgment_reason":"Fixture declared judgment.",
+     "execution_reason":"Fixture bounded steps.","evidence_refs":["fixture.md"]}
   return recipe
  def _composed(self,recipe=None):
   return R.compile_composed_route(
@@ -2191,6 +2226,21 @@ class TestContinuation(unittest.TestCase):
    recipe=json.loads(json.dumps(
     R.TOPO.resolve_recipe(R.TOPO.load_registry(),"autopilot-code","dev")))
    recipe["modes"]=["composed-fixture"]
+   for node in recipe["standard_plus"]["nodes"]:
+    if node.get("kind") == "resource-runner": continue
+    profile=node["model_profile"]
+    node["profile_demand"]={"schema_version":1,
+     "judgment_requirement":"difficult-uncertain" if profile=="deep" else "important" if profile=="balanced-deep" else "predetermined",
+     "execution_scope":"extended-multistep" if profile=="balanced" else "short-local",
+     "judgment_reason":"Fixture preserves the declared judgment.",
+     "execution_reason":"Fixture performs its declared steps.","evidence_refs":["fixture.md"]}
+   for group in recipe["standard_plus"].get("parallel_groups",[]):
+    for leg in group.get("legs",[]):
+     profile=leg["model_profile"]
+     leg["profile_demand"]={"schema_version":1,
+      "judgment_requirement":"difficult-uncertain" if profile=="deep" else "important" if profile=="balanced-deep" else "predetermined",
+      "execution_scope":"short-local","judgment_reason":"Fixture declared judgment.",
+      "execution_reason":"Fixture bounded steps.","evidence_refs":["fixture.md"]}
    gate={
     "spec_read":{"satisfied":True,"source":"canonical-prd-sha256"},
     "drift_verdict":"within-spec","workflow_mode":"tracked",
@@ -3159,6 +3209,9 @@ class TestContinuation(unittest.TestCase):
      % (R.ROOT, R.ROOT, source["artifact_root"], source_path, source["route_id"], source["route_hash"]), encoding="utf-8")
     env=os.environ.copy()
     for key in ("AGENT_DISPATCH_OWNER_HARNESS","AGENT_DISPATCH_CURRENT_HARNESS",
+                "AGENT_DISPATCH_WORKER_TYPE","AGENT_DISPATCH_DEPTH",
+                "AGENT_DISPATCH_ATTEMPT_SCHEMA_VERSION",
+                "AGENT_DISPATCH_EXECUTION_SURFACE","AGENT_DISPATCH_REGISTERED_WORKER",
                 "CODEX_THREAD_ID","CLAUDE_CODE_SESSION_ID","AGENT_DISPATCH_PARENT_SESSION_ID"):
      env.pop(key,None)
     env["AGENT_DISPATCH_ATTEMPT_ID"]="att-cli-owner"; env["AGENT_OWNER_ROUTE_FILE"]=str(source_path)
@@ -3224,6 +3277,9 @@ class TestContinuation(unittest.TestCase):
      % (R.ROOT, R.ROOT, source["artifact_root"], source_path, source["route_id"], source["route_hash"]), encoding="utf-8")
     env=os.environ.copy()
     for key in ("AGENT_DISPATCH_OWNER_HARNESS","AGENT_DISPATCH_CURRENT_HARNESS",
+                "AGENT_DISPATCH_WORKER_TYPE","AGENT_DISPATCH_DEPTH",
+                "AGENT_DISPATCH_ATTEMPT_SCHEMA_VERSION",
+                "AGENT_DISPATCH_EXECUTION_SURFACE","AGENT_DISPATCH_REGISTERED_WORKER",
                 "CODEX_THREAD_ID","CLAUDE_CODE_SESSION_ID","AGENT_DISPATCH_PARENT_SESSION_ID"):
      env.pop(key,None)
     env["AGENT_DISPATCH_ATTEMPT_ID"]="att-cli-replay"; env["AGENT_OWNER_ROUTE_FILE"]=str(source_path)

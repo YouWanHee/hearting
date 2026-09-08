@@ -297,7 +297,7 @@ def _parse(argv):
             raise OwnerError("review-output-must-be-absolute")
     if worker_type == "owner" and values.get("--review-output"):
         raise OwnerError("review-output-owner-forbidden")
-    if values["--model-profile"] not in {"deep", "balanced-deep", "light"}:
+    if values["--model-profile"] not in {"deep", "balanced-deep", "balanced", "light"}:
         raise OwnerError("invalid-model-profile")
     # Equal-form required options are forwarded unchanged; split-form options
     # were appended above.  Selector-only --adapter/--route-evidence never

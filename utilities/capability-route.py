@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT/"utilities"))
 import artifact_locator as ARTIFACT_LOCATOR
 import route_identity as ROUTE_IDENTITY
 import dispatch_terminal_commit
+import model_profile as PROFILE
 import review_round_cap as REVIEW_ROUND_CAP
 from dispatch_continuation_budget import COMPATIBILITY_FLOOR, TERMINAL_RESERVE_DEFAULT
 from dispatch_contract import (
@@ -940,6 +941,11 @@ def build_continuation_route(
         "resume_retry_boundaries","dispatch_evidence","dispatch_contract_version",
         "dispatch_evidence_scope_version","registered_headless_candidates",
         "registered_headless_policy","unit_catalog_digest","validation_basis",
+        # Profile-demand sealing is part of the route identity. Continuation
+        # suffixes must carry it forward so verification can replay the same
+        # resolver contract instead of treating an annotated source as legacy.
+        "profile_selection_contract_version","profile_demands","explicit_profiles",
+        "owner_profile_demand","owner_profile_selection",
         # SD-OPEN-46: a composed source's composition fields must ride the
         # suffix, or the continuation presents itself as a preset route and the
         # embedded composed_recipe loses its hash seal. (`route_origin`/`shape`
@@ -949,6 +955,10 @@ def build_continuation_route(
     route={key:json.loads(json.dumps(source_route[key]))
            for key in inherited_keys if key in source_route}
     route.update(result)
+    if route.get("profile_selection_contract_version") == 1:
+        retained = {node["id"] for node in route_nodes} | {"__owner__"}
+        for key in ("profile_demands", "explicit_profiles"):
+            route[key] = {k: v for k, v in route.get(key, {}).items() if k in retained}
     # Defect C: the pin must name the same commit the grounding tuple above sealed.
     source_commit,source_commit_rebind,rebind_declined=_continuation_source_commit(
         source_route,route_nodes,
@@ -1655,6 +1665,9 @@ def _expand_parallel_groups(nodes, parallel_groups, effective_intensity,
                     _parallel_path(path, suffix) for path in base["write_scope"]
                 ]
             leg["model_profile"] = leg_spec["model_profile"]
+            leg.pop("profile_demand", None)
+            if "profile_demand" in leg_spec:
+                leg["profile_demand"] = json.loads(json.dumps(leg_spec["profile_demand"]))
             leg["perspective"] = leg_spec["perspective"]
             leg["leg_class"] = leg_spec["leg_class"]
             if index:
@@ -1814,6 +1827,87 @@ def _seal_dispatch_defaults(nodes, capability, owner_profile=None):
         DEFAULTS.query_profile_policy(cfg, owner_profile) if owner_profile else None,
     )
 
+
+def _seal_profile_demands(nodes, profile_demands=None, explicit_profiles=None, *, legacy=False):
+    demands = profile_demands or {}
+    explicit_profiles = explicit_profiles or {}
+    for node in nodes:
+        if node.get("kind") == "resource-runner":
+            continue
+        node_id = node["id"]
+        demand = demands.get(node_id, node.get("profile_demand"))
+        supplied = node_id in demands or "profile_demand" in node
+        if supplied:
+            demand = PROFILE.normalize_profile_demand(demand)
+        explicit = explicit_profiles.get(node_id)
+        if node.get("profile_explicit") and node_id not in explicit_profiles:
+            explicit = node.get("model_profile")
+        if not supplied:
+            if node_id in explicit_profiles:
+                raise ValueError("profile-demand-required:" + node_id)
+            explicit = node.get("model_profile", "light")
+        selection = PROFILE.resolve_profile_demand(
+            demand, explicit_profile=explicit, legacy=legacy,
+            existing_versioned_stage=legacy,
+        )
+        node["profile_demand"] = demand
+        node["profile_selection"] = selection
+        node["model_profile"] = selection["resolved_profile"]
+    return nodes
+
+
+def _profile_input_maps(nodes, demands, explicit):
+    valid = {n["id"] for n in nodes if n.get("kind") != "resource-runner"} | {"__owner__"}
+    normalized = {}
+    for label, values in (("profile_demands", demands), ("explicit_profiles", explicit)):
+        if values is not None and (not isinstance(values, dict) or set(values) - valid):
+            raise ValueError("profile-input-unknown-node:" + label)
+    for key, value in (demands or {}).items():
+        normalized[key] = PROFILE.normalize_profile_demand(value)
+    for key, value in (explicit or {}).items():
+        if key not in normalized or value not in PROFILE.PORTABLE_PROFILES:
+            raise ValueError("profile-explicit-input-invalid:" + key)
+    return normalized, dict(explicit or {})
+
+
+def _verify_profile_contract(route):
+    version = route.get("profile_selection_contract_version")
+    if version is None:
+        # Exact sealed legacy routes contain no new semantic fields.
+        if route.get("owner_profile_selection") is not None or any(
+            "profile_selection" in n or "profile_demand" in n for n in route.get("nodes", [])):
+            raise ValueError("profile-selection-contract-missing")
+        return
+    if type(version) is not int or version != 1:
+        raise ValueError("profile-selection-version-unsupported")
+    demands, explicit = _profile_input_maps(route.get("nodes", []), route.get("profile_demands"), route.get("explicit_profiles"))
+    if route.get("owner_profile_demand") != demands.get("__owner__"):
+        raise ValueError("owner-profile-demand-map-mismatch")
+    owner_profile = route.get("owner_model_profile") or "light"
+    owner_expected = PROFILE.resolve_profile_demand(
+        demands.get("__owner__"), explicit_profile=(explicit.get("__owner__")
+            if "__owner__" in demands else owner_profile),
+        legacy=True, existing_versioned_stage=True)
+    if owner_expected != route.get("owner_profile_selection"):
+        raise ValueError("owner-profile-selection-map-mismatch")
+    for node in route.get("nodes", []):
+        node_id = node["id"]
+        if node_id in demands and node.get("profile_demand") != demands[node_id]:
+            raise ValueError("node-profile-demand-map-mismatch:" + node_id)
+        if node_id in explicit and (node.get("profile_selection", {}).get("source") != "explicit"
+                                   or node.get("model_profile") != explicit[node_id]):
+            raise ValueError("node-profile-explicit-map-mismatch:" + node_id)
+    PROFILE.validate_profile_selection(
+        route.get("owner_profile_selection"), route.get("owner_profile_demand"),
+        profile=route.get("owner_model_profile") or "light", existing_versioned_stage=True,
+    )
+    for node in route.get("nodes", []):
+        if node.get("kind") == "resource-runner":
+            continue
+        PROFILE.validate_profile_selection(node.get("profile_selection"), node.get("profile_demand"),
+                                           profile=node.get("model_profile"), existing_versioned_stage=True)
+
+
 def _seal_confirmation_mode():
     """SD-123: resolve the declared `confirmation.mode` to seal into the
     route, independent of `_seal_dispatch_defaults`'s return tuple.
@@ -1883,7 +1977,8 @@ def compile_route(capability, capability_mode, requested_intensity, cwd, artifac
                   transport_evidence="caller-selected", inline_reason=None,
                   tracking="tracked", tracked_gate_evidence=None, dispatch_evidence=None,
                   registered_headless_evidence=None, slug=None,
-                  route_origin="preset", shape=None):
+                         route_origin="preset", shape=None, profile_demands=None,
+                         explicit_profiles=None):
     registry=TOPO.load_registry(); TOPO.validate_registry(registry)
     recipe=TOPO.resolve_recipe(registry, capability, capability_mode)
     return _compile_from_recipe(
@@ -1893,7 +1988,8 @@ def compile_route(capability, capability_mode, requested_intensity, cwd, artifac
         tracking=tracking, tracked_gate_evidence=tracked_gate_evidence,
         dispatch_evidence=dispatch_evidence,
         registered_headless_evidence=registered_headless_evidence, slug=slug,
-        route_origin=route_origin, shape=shape)
+        route_origin=route_origin, shape=shape, profile_demands=profile_demands,
+        explicit_profiles=explicit_profiles)
 
 # ---------------------------------------------------------------------------
 # compose: the preset-free work route (SD-135).
@@ -2080,6 +2176,20 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec):
     return recipe
 
 
+def _versioned_subgraph(registry, recipe):
+    """Only an exact registry-derived subgraph may inherit legacy demands."""
+    meta = recipe.get("compose") or {}
+    if not isinstance(meta, dict) or not meta.get("base_capability"):
+        return False
+    try:
+        base = TOPO.resolve_recipe(registry, meta["base_capability"], recipe["modes"][0])
+        overrides = meta.get("unit_overrides", {})
+        graph = [(node_id, overrides.get(node_id)) for node_id in meta["graph"]]
+        return compose_subgraph_recipe(registry, base, graph) == recipe
+    except (ValueError, KeyError, TypeError, IndexError):
+        return False
+
+
 def _compose_default_jobs():
     inherited = os.environ.get("AGENT_DISPATCH_JOBS")
     if inherited:
@@ -2123,7 +2233,7 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
                   intensity=None, signals=(), spec_read=None, drift_verdict=None,
                   tracking=None, artifact_guard=None, children=None, parent_harness="claude",
                   dispatch_evidence=None, registered_headless_evidence=None,
-                  transport_evidence="compose-default", jobs=None):
+                  transport_evidence="compose-default", jobs=None, profile_demands=None, explicit_profiles=None):
     """Resolve every default, then compile through the ordinary sealer."""
     if shape not in COMPOSE_SHAPES:
         raise ValueError(f"compose-shape-invalid:{shape}")
@@ -2177,6 +2287,7 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
         dispatch_evidence=dispatch_evidence,
         registered_headless_evidence=registered_headless_evidence,
         route_origin="compose", shape=shape,
+        profile_demands=profile_demands, explicit_profiles=explicit_profiles,
     )
     if shape == "staged":
         recipe = compose_subgraph_recipe(registry, base, parse_graph_spec(graph))
@@ -2227,7 +2338,8 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
                          transport_evidence="caller-selected", inline_reason=None,
                          tracking="tracked", tracked_gate_evidence=None, dispatch_evidence=None,
                          registered_headless_evidence=None, slug=None, composed=False,
-                  route_origin="preset", shape=None):
+                  route_origin="preset", shape=None, profile_demands=None,
+                  explicit_profiles=None):
     dispatch_terminal_commit.require_current_cleanup("route-compile")
     if route_origin not in ROUTE_ORIGINS: raise ValueError("invalid route origin")
     cwd=Path(cwd).resolve(strict=True); artifact=Path(artifact_root).resolve()
@@ -2324,6 +2436,20 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
         for node in nodes:
             if node.get("dispatch_depth")==2:
                 node["fallback_hops"]=json.loads(json.dumps(chain))
+    profile_demands, explicit_profiles = _profile_input_maps(nodes, profile_demands, explicit_profiles)
+    owner_demand = profile_demands.get("__owner__")
+    owner_profile_selection = PROFILE.resolve_profile_demand(
+        owner_demand, explicit_profile=(explicit_profiles.get("__owner__") if owner_demand
+                                       else owner_model_profile or "light"),
+        legacy=True, existing_versioned_stage=True,
+    )
+    expected_owner = registry["owner_profile_by_intensity"].get(effective)
+    if expected_owner and owner_profile_selection["resolved_profile"] != expected_owner:
+        raise ValueError("owner-profile-eligibility-conflict")
+    if effective != "direct":
+        owner_model_profile = owner_profile_selection["resolved_profile"]
+    legacy_nodes = not composed or _versioned_subgraph(registry, recipe)
+    _seal_profile_demands(nodes, profile_demands, explicit_profiles, legacy=legacy_nodes)
     dispatch_defaults_digest,dispatch_allocation,owner_harness_policy=_seal_dispatch_defaults(
         nodes, capability, owner_model_profile
     )
@@ -2351,6 +2477,9 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
       "schema_version":ROUTE_SCHEMA_VERSION,"capability":capability,"capability_mode":capability_mode,
       "requested_intensity":requested_intensity,"effective_intensity":effective,
       "owner_model_profile":owner_model_profile,
+      "profile_selection_contract_version":1,
+      "profile_demands":profile_demands,"explicit_profiles":explicit_profiles,
+      "owner_profile_demand":owner_demand,"owner_profile_selection":owner_profile_selection,
       "execution_topology":("inline" if effective=="direct" else recipe["quick"]["topology"] if effective=="quick" else recipe["topology_class"]),
       "owner_dispatch_depth":0 if effective=="direct" else (recipe["quick"]["owner_dispatch_depth"] if effective=="quick" else recipe["standard_plus"]["owner_dispatch_depth"]),
       "max_dispatch_depth":recipe["quick"]["max_dispatch_depth"] if effective=="quick" else (0 if effective=="direct" else recipe["standard_plus"]["max_dispatch_depth"]),
@@ -2521,6 +2650,7 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
     if route.get("route_hash") != route_hash(route): raise ValueError("stale or modified route hash")
     if route.get("route_id") != "rt-"+route["route_hash"].split(":",1)[1][:16]: raise ValueError("invalid route id")
     if expected_cwd and Path(expected_cwd).resolve()!=Path(route["cwd"]): raise ValueError("route cwd mismatch")
+    _verify_profile_contract(route)
     basis=_check_validation_basis(route, allow_stale_registry=allow_stale_registry)
     if basis is _DEGRADE_VALIDATION_BASIS:
         # An unsupported basis_version is a legitimate newer harness's route;
@@ -2561,6 +2691,10 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
             expected_nodes, composed_recipe["standard_plus"].get("parallel_groups"),
             route.get("effective_intensity"), route.get("capability"),
             auxiliary_check_units=registry.get("auxiliary_check_units"))
+        if route.get("profile_selection_contract_version") == 1:
+            _seal_profile_demands(expected_nodes, route.get("profile_demands"),
+                                  route.get("explicit_profiles"),
+                                  legacy=_versioned_subgraph(registry, composed_recipe))
         if ([_node_identity(n) for n in route.get("nodes",[])]
                 != [_node_identity(n) for n in expected_nodes]):
             raise ValueError("composed route nodes differ from embedded composed recipe")
@@ -2575,6 +2709,16 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
                 expected_nodes, route_recipe["standard_plus"].get("parallel_groups"),
                 route.get("effective_intensity"), route.get("capability"),
                 auxiliary_check_units=registry.get("auxiliary_check_units"))
+            if route.get("profile_selection_contract_version") == 1:
+                _seal_profile_demands(expected_nodes, route.get("profile_demands"),
+                                      route.get("explicit_profiles"), legacy=True)
+                by_id = {n["id"]: n for n in expected_nodes}
+                for node in route.get("nodes", []):
+                    expected = by_id.get(node.get("id"))
+                    if expected and node.get("kind") != "resource-runner" and any(
+                        node.get(key) != expected.get(key)
+                        for key in ("profile_demand", "profile_selection", "model_profile")):
+                        raise ValueError("node-profile-declaration-mismatch:" + node["id"])
             # The remaining verifier owns field-level diagnostics.  This
             # census closes only the undeclared fanout hole: a rehashed route
             # may not add, remove, reorder, or rename recipe nodes.
@@ -5253,6 +5397,8 @@ def main():
     p=argparse.ArgumentParser(); sub=p.add_subparsers(dest="command",required=True)
     c=sub.add_parser("compile"); c.add_argument("--capability",required=True); c.add_argument("--capability-mode",default="default")
     c.add_argument("--slug",required=True)
+    c.add_argument("--profile-demands", help="JSON file mapping node ids and __owner__ to full SD-88 demands")
+    c.add_argument("--explicit-profiles", help="JSON file mapping demanded node ids to explicit profiles")
     c.add_argument("--intensity",default="auto"); c.add_argument("--cwd",required=True); c.add_argument("--artifact-root",required=True)
     c.add_argument("--predicate",action="append",default=[]); c.add_argument("--signal",action="append",default=[])
     c.add_argument("--transport",default=None); c.add_argument("--transport-evidence",default="caller-selected")
@@ -5265,6 +5411,8 @@ def main():
     c.add_argument("--output")
     cp=sub.add_parser("compose",help="preset-free work route: name the shape (and stage subgraph), defaults fill the rest")
     cp.add_argument("--slug",required=True)
+    cp.add_argument("--profile-demands", help="JSON file mapping node ids and __owner__ to full SD-88 demands")
+    cp.add_argument("--explicit-profiles", help="JSON file mapping demanded node ids to explicit profiles")
     cp.add_argument("--shape",choices=COMPOSE_SHAPES,default=None,help="direct (inline) | solo (one registered depth-1 owner) | staged (owner + your stage subgraph); default staged when --graph is given, else direct")
     cp.add_argument("--graph",default=None,help="comma list of the capability's stage ids in your order, optional :unit override, e.g. execute,test,report or execute:dev/refactor,test")
     cp.add_argument("--capability",default=COMPOSE_DEFAULT_CAPABILITY); cp.add_argument("--capability-mode",default=None)
@@ -5347,6 +5495,8 @@ def main():
             registered_headless_evidence=(json.loads(Path(a.registered_headless_evidence).read_text())
                                           if a.registered_headless_evidence else None),
             transport_evidence=a.transport_evidence,jobs=a.jobs,
+            profile_demands=json.loads(Path(a.profile_demands).read_text()) if a.profile_demands else None,
+            explicit_profiles=json.loads(Path(a.explicit_profiles).read_text()) if a.explicit_profiles else None,
         )
         print(compose_card(route),file=sys.stderr)
         if a.explain:
@@ -5383,6 +5533,8 @@ def main():
                 dispatch_evidence=dispatch_evidence,
                 registered_headless_evidence=registered_headless_evidence,
                 slug=a.slug,
+                profile_demands=json.loads(Path(a.profile_demands).read_text()) if a.profile_demands else None,
+                explicit_profiles=json.loads(Path(a.explicit_profiles).read_text()) if a.explicit_profiles else None,
             )
         else:
             route=compile_route(
@@ -5390,6 +5542,8 @@ def main():
                 a.predicate,a.signal,a.transport,a.transport_evidence,a.inline_reason,
                 a.tracking,gate,dispatch_evidence,registered_headless_evidence,
                 slug=a.slug,
+                profile_demands=json.loads(Path(a.profile_demands).read_text()) if a.profile_demands else None,
+                explicit_profiles=json.loads(Path(a.explicit_profiles).read_text()) if a.explicit_profiles else None,
             )
         _emit_compiled_route(a,route,a.artifact_root)
     elif a.command=="continuation":

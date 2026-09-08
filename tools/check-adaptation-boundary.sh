@@ -1775,8 +1775,8 @@ PY
     [ -f "$agent" ] || continue
     profile=$(basename "$agent" .toml)
     # memory-scout kernel helper + the generated native subagent type catalog
-    # (general-purpose/light/deep, CFG_NATIVE_AGENT_CATALOG).
-    case " memory-scout general-purpose light deep " in
+    # (balanced/general-purpose/light/deep, CFG_NATIVE_AGENT_CATALOG).
+    case " memory-scout balanced general-purpose light deep " in
       *" $profile "*) ;;
       *) fail_msg "$agent is not an approved Codex native agent projection" ;;
     esac
@@ -2654,7 +2654,7 @@ check_opencode_native_agent_projection() {
   for dir in adapters/opencode/agents/*; do
     [ -d "$dir" ] || continue
     profile=$(basename "$dir")
-    case " memory-scout general-purpose light deep " in
+    case " memory-scout balanced general-purpose light deep " in
       *" $profile "*) ;;
       *) fail_msg "$dir is not an approved OpenCode native agent projection" ;;
     esac

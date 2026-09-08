@@ -214,6 +214,12 @@ def build_recipe(
             node["unit_choices"] = list(spec["unit_choices"])
         if spec.get("guard_preconditions"):
             node["guard_preconditions"] = list(spec["guard_preconditions"])
+        if "profile_demand" not in spec:
+            raise ValueError("profile-demand-required:" + node_id)
+        if "profile_demand" in spec:
+            node["profile_demand"] = spec["profile_demand"]
+        if spec.get("profile_demand") is not None and spec.get("model_profile") is not None:
+            node["profile_explicit"] = True
         nodes.append(node)
 
     # A composed graph obeys the same continuation contract as an enumerated recipe:
@@ -405,6 +411,10 @@ def run_compile(args, recipe, evidence) -> str:
             "--artifact-guard", args.artifact_guard,
             "--transport-evidence", args.transport_evidence,
         ]
+        for field in ("profile_demands", "explicit_profiles"):
+            value = getattr(args, field, None)
+            if value:
+                command += ["--" + field.replace("_", "-"), value]
         for signal in args.signal:
             command += ["--signal", signal]
         for predicate in args.predicate:
@@ -431,6 +441,8 @@ def _parse_units(args) -> list:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--profile-demands", help="JSON file mapping realized nodes and __owner__ to SD-88 demands")
+    parser.add_argument("--explicit-profiles", help="JSON file mapping demanded node ids to explicit profiles")
     parser.add_argument("--capability", required=True)
     parser.add_argument("--capability-mode", required=True)
     parser.add_argument("--slug", required=True)
