@@ -148,7 +148,10 @@ class BundleBoundaryCLITest(producer_fixture.ProducerTestBase):
         self.assertEqual(new_boundary["stages"][:3], old_boundary["stages"])
         self.assertEqual(len(new_boundary["stages"]), 4)
         self.assertEqual(new_boundary["stages"][-1]["stage"], "W16-namespace-delete")
-        self.assertTrue(new_boundary["stages"][-1]["invariant"])
+        invariant = new_boundary["stages"][-1]["invariant"]
+        for namespace in ("fleet-fd8b0c7bc445", "w9-candidate-1d30600937a5",
+                          "w9-candidate-f2c03fff8030", "ap_cand_step7"):
+            self.assertIn(namespace, invariant)
         self.assertEqual(len({s["approval_id"] for s in new_boundary["stages"]}), 4)
         for bundle, boundary in ((old, old_boundary), (new, new_boundary)):
             self.assertTrue(all(s["authorized"] is False for s in boundary["stages"]))

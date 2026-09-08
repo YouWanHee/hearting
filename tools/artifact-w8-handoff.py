@@ -412,7 +412,10 @@ class Bundle:
             boundary["stages"].append({
                 "stage": "W16-namespace-delete", "approval_id": aid("W16-namespace-delete"),
                 "authorized": False,
-                "invariant": "separately approved namespace allowlist only; active namespace, l2_notes, and source artifacts excluded",
+                "invariant": ("separate approval required; namespace allowlist: fleet-fd8b0c7bc445, "
+                              "w9-candidate-1d30600937a5, w9-candidate-f2c03fff8030, ap_cand_step7; "
+                              "active namespace, l2_notes, and source artifacts excluded; "
+                              "Cairn executor validates targets and approval"),
             })
             boundary["note"] = "four separate approvals; none is granted by this bundle"
         return boundary
