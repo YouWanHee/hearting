@@ -41,7 +41,8 @@ class ClaudeDispatchModelEligibilityTest(unittest.TestCase):
     def test_deep_role_resolves_to_opus_and_not_main_only(self):
         result = WRAPPER.resolve_model_settings(selection(role="deep orchestrator"))
         self.assertEqual(result["model"], "opus")
-        self.assertEqual(result["effort"], "xhigh")
+        # Effort is the shipped deep-tier default (user-tunable), not a literal.
+        self.assertEqual(result["effort"], WRAPPER._model_policy()["CFG_TIER_DEEP_EFFORT"])
 
     def test_explicit_and_role_override_fable_are_rejected(self):
         with self.assertRaises(WRAPPER.ModelSelectionError) as explicit:

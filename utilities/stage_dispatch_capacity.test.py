@@ -111,7 +111,7 @@ class CapacityTest(unittest.TestCase):
   codex=F.capacity_cascade("codex")
   self.assertEqual(F.capacity_cascade_next("codex",codex[0][0]),codex[1])
   claude=F.capacity_cascade("claude")
-  self.assertEqual(claude[0],("opus","xhigh"))
+  self.assertEqual(claude[0][0],"opus")  # effort is the cascade's own declared pair
   self.assertEqual(F.capacity_cascade_next("claude","fable"),claude[0])
   self.assertEqual(F.capacity_cascade_next("claude","claude-fable-5"),claude[0])
   self.assertEqual(F.capacity_cascade_next("claude",claude[0][0]),claude[1])
@@ -127,10 +127,12 @@ class CapacityTest(unittest.TestCase):
   self.assertFalse(F.allowed_capacity_settings("claude","opus","not-a-real-effort"))
  def test_unset_capacity_model_derives_alternative_from_cascade(self):
   self.args.capacity_model=None  # no explicit alternative -> derive from config cascade
+  cascade=F.capacity_cascade("codex")  # the exhausted model is the cascade head, whatever it is
+  self.failed={**self.failed,"model":cascade[0][0]}
   with mock.patch.object(F,"wrapper_command",return_value=["fake"]),\
        mock.patch.object(F.subprocess,"run",side_effect=self.fake_retry()):
    state,fields,_=F.capacity_retry(self.args,self.route,self.node,self.row,1,self.failed,[])
-  self.assertEqual(state,"success");self.assertEqual(fields["model"],"gpt-5.6-luna")
+  self.assertEqual(state,"success");self.assertEqual(fields["model"],cascade[1][0])
  def test_legacy_fable_capacity_retry_launches_first_eligible_opus_candidate(self):
   self.args.capacity_model=None;self.args.capacity_effort=None
   self.row={**self.row,"child_harness":"claude"}
@@ -143,7 +145,7 @@ class CapacityTest(unittest.TestCase):
        mock.patch.object(F.subprocess,"run",return_value=completed):
    state,fields,_=F.capacity_retry(self.args,self.route,self.node,self.row,1,self.failed,[])
   self.assertEqual((state,fields["model"]),("success","opus"))
-  self.assertEqual(command.call_args.args[6],("opus","xhigh"))
+  self.assertEqual(command.call_args.args[6],F.capacity_cascade("claude")[0])
  def test_balanced_all_gated_stage_candidates_choose_maximum_headroom(self):
   import importlib.util
   spec=importlib.util.spec_from_file_location("capacity",ROOT/"utilities/harness-capacity.py")
