@@ -27,6 +27,7 @@ from dispatch_completion_join import (
     harvest_command_lines,
     log_delivery_refusal,
     materialize_after_terminal_close,
+    pending_action_projection,
     prepare_supervisor_outbox,
     refresh_supervisor_outbox_actions,
     reconcile_finished_children,
@@ -480,10 +481,11 @@ def completion_prompt(
     receipt: dict[str, Any], outbox: SupervisorOutbox | None = None, *, jobs: str = "",
     notice: str = "",
 ) -> str:
-    compact = json.dumps(receipt, separators=(",", ":"), sort_keys=True)
+    projected = pending_action_projection(receipt, outbox) if outbox is not None else receipt
+    compact = json.dumps(projected, separators=(",", ":"), sort_keys=True)
     jobs_argument = f"--jobs {shlex.quote(jobs)} " if jobs else ""
     commands: list[str] = []
-    for child in receipt["children"]:
+    for child in projected["children"]:
         attempt = shlex.quote(child["attempt_id"])
         action = child["required_action"]
         if action == "complete-open":

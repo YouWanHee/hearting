@@ -2,6 +2,7 @@
 """SD-56 fixtures: completion marker canonical write + start-time gate."""
 import contextlib
 import copy
+import hashlib
 import importlib.util
 import json
 import os
@@ -749,6 +750,12 @@ class CompletionMarkerTest(unittest.TestCase):
         latest_link = json.loads((directory / "plan.attempt.json").read_text())
         self.assertEqual(prior_link["attempt_id"], "att-prior-link")
         self.assertEqual(latest_link["attempt_id"], "att-later-link")
+        prior_history = json.loads(
+            Path(prior_link["completion_marker_history"]).read_text(encoding="utf-8")
+        )
+        plan_node = next(node for node in route["nodes"] if node["id"] == "plan")
+        self.assertTrue(D.completion_marker_is_current(route, plan_node, directory / "plan.json", prior_history))
+        self.assertTrue(D.completion_marker_is_current(route, plan_node, directory / "plan.json", json.loads((directory / "plan.2.json").read_text())))
 
         dead = "pid=999999995,pid_start=1"
         self.write_row(
@@ -773,6 +780,59 @@ class CompletionMarkerTest(unittest.TestCase):
         self.assertEqual(category, "marker-backed-stale")
         self.assertEqual(note, "completed-marker")
 
+
+    def test_owner_chain_latest_marker_cannot_prove_another_attempt(self):
+        route = self.compile_route()
+        route_path = self.write_route(route)
+        evidence = self.base / "plan.md"
+        evidence.write_text("plan evidence\n", encoding="utf-8")
+        attempt = "att-prior-ordinary"
+        self.write_row("open", "prior", attempt, extra=f"route_file={route_path}")
+        result = self.complete(route_path, "plan", evidence, jobs=self.jobs, attempt_id=attempt)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        _, metadata = self.read_row(attempt)
+        canonical = Path(metadata["completion_marker"])
+        prior = json.loads(canonical.read_text())
+        node = next(node for node in route["nodes"] if node["id"] == "plan")
+        manifest_path = self.base / "chain.json"
+        manifest = {
+            "schema_version": 1, "kind": "stage-session-chain",
+            "chain_id": "ssc-proof-fixture", "mode": "serial",
+            "worktree": str(self.repo), "route_file": str(route_path),
+            "route_id": route["route_id"], "route_hash": route["route_hash"],
+            "route_node": "plan", "completion_gate": node["completion_gate"],
+            "sessions": [{
+                "subsession_id": "ss-proof-fixture", "attempt_id": "att-proof-fixture",
+                "adapter": "codex", "slug": "proof", "phase_brief": str(evidence),
+                "fixed_files": [str(self.repo / "x")], "narrow_verify": "true",
+                "expected_round_trips": 1,
+            }],
+        }
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        manifest_digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        chain = {
+            **prior, "sequence": 2, "stage_authority": "owner-chain",
+            "attempt_id": "att-stage-" + manifest_digest[:32],
+            "subsession_manifest": str(manifest_path),
+            "subsession_manifest_sha256": manifest_digest,
+            "session_chain_id": manifest["chain_id"],
+            "transport": "headless", "execution_surface": "inline",
+            "registered_worker": False, "fallback_hop": "inline",
+        }
+        canonical.write_text(json.dumps(chain), encoding="utf-8")
+        (canonical.parent / "plan.2.json").write_text(json.dumps(chain), encoding="utf-8")
+        self.assertTrue(D.completion_marker_is_current(route, node, canonical, chain))
+        proof = D._marker_bound_prepare_marker_proof(metadata, attempt)
+        self.assertIsNotNone(proof)
+        self.assertEqual(proof.marker, prior)
+        self.assertEqual(D._marker_bound_current_marker(metadata, attempt, proof)[0], prior)
+
+        # The valid latest chain still cannot replace missing exact-attempt proof.
+        (canonical.parent / f"plan.{attempt}.attempt.json").unlink()
+        self.assertIsNone(D._marker_bound_prepare_marker_proof(metadata, attempt))
+        chain_proof = D._marker_bound_prepare_marker_proof(metadata, chain["attempt_id"])
+        self.assertIsNotNone(chain_proof)
+        self.assertEqual(chain_proof.marker, chain)
 
     # SD-94 fixtures -------------------------------------------------------
     # A `parent_completion_delivery=claude-parent-runtime` supervisor closes the exact row

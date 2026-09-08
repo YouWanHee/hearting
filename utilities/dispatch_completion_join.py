@@ -29,6 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
 from dispatch_contract import (  # noqa: E402
     SUBSESSION_NOTE,
+    _marker_bound_current_marker,
     _marker_bound_prepare_marker_proof,
     SUCCESS_NOTES,
     DispatchContractError,
@@ -584,8 +585,32 @@ def reconcile_pending_delivery(jobs: Path) -> dict[str, int]:
     return result
 
 
-def required_action_for_attempt(status: str, metadata: dict[str, str]) -> str:
+def required_action_for_attempt(
+    status: str, metadata: dict[str, str], *, jobs: Path | None = None
+) -> str:
     """Return the one typed follow-up that the exact registry row permits."""
+
+    # A marker-bearing row has a stronger source of truth than its mutable
+    # success metadata.  Harvest passes the isolated registry so a stale or
+    # foreign marker becomes an explicit diagnostic action instead of an
+    # advance action that the authoritative proof cannot satisfy.
+    if metadata.get("completion_marker"):
+        attempt_id = metadata.get("attempt_id", "")
+        if attempt_id:
+            if jobs is not None:
+                state = current_delivery_state(
+                    jobs,
+                    attempt_id,
+                    parent_attempt_id=attempt_id,
+                    advance=False,
+                )
+                return delivery_required_action(state)
+            proof = _marker_bound_prepare_marker_proof(metadata, attempt_id)
+            marker, _digest = _marker_bound_current_marker(metadata, attempt_id, proof)
+            if status == "done" and marker is not None:
+                return "advance-completed"
+            if status == "done":
+                return "inspect-done-failure"
 
     if status in OPEN_STATES:
         return "complete-open"
@@ -619,6 +644,47 @@ def harvest_command_lines(prompt: str) -> list[str]:
         ):
             lines.append(line)
     return lines
+
+
+def pending_action_projection(
+    receipt: dict[str, object], outbox: "SupervisorOutbox"
+) -> dict[str, object]:
+    """Project only executable children without changing the durable receipt.
+
+    The outbox remains the immutable source of receipt identity and the full
+    child set.  This copy is solely for prompt rendering after one or more
+    actions have already been consumed.
+    """
+
+    raw_children = receipt.get("children")
+    if not isinstance(raw_children, list) or not raw_children:
+        raise JoinContractError("supervisor-outbox-children-invalid")
+    if outbox.receipt is not None and receipt is not outbox.receipt:
+        # A resumed prompt may add observability fields, but it must still be
+        # the same immutable child payload as the committed outbox.
+        committed = outbox.receipt.get("children")
+        if committed != raw_children:
+            raise JoinContractError("supervisor-outbox-children-mismatch")
+    children: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for child in raw_children:
+        if not isinstance(child, dict):
+            raise JoinContractError("supervisor-outbox-child-invalid")
+        attempt = child.get("attempt_id")
+        if not isinstance(attempt, str) or not attempt:
+            raise JoinContractError("supervisor-outbox-child-identity-invalid")
+        if attempt in seen:
+            raise JoinContractError("supervisor-outbox-child-duplicate")
+        if attempt not in outbox.attempt_ids:
+            raise JoinContractError("supervisor-outbox-child-foreign")
+        seen.add(attempt)
+        if attempt not in outbox.consumed_attempt_ids:
+            children.append(dict(child))
+    if seen != set(outbox.attempt_ids):
+        raise JoinContractError("supervisor-outbox-child-set-mismatch")
+    projected = dict(receipt)
+    projected["children"] = children
+    return projected
 
 
 @dataclass(frozen=True)

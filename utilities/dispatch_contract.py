@@ -583,6 +583,7 @@ class MarkerBoundCompletionProof:
 
     marker: dict[str, object]
     marker_path: Path
+    history_path: Path
     marker_digest: str
     route_id: str
     route_hash: str
@@ -5740,24 +5741,23 @@ def _marker_bound_prepare_marker_proof(
     if not marker_path.is_absolute() or marker_path.is_symlink():
         return None
     try:
-        marker_bytes = marker_path.read_bytes()
+        canonical_marker_bytes = marker_path.read_bytes()
     except OSError:
         return None
-    if not marker_bytes or len(marker_bytes) > 65_536:
+    if not canonical_marker_bytes or len(canonical_marker_bytes) > 65_536:
         return None
     try:
-        marker = json.loads(marker_bytes.decode("utf-8"))
+        canonical_marker = json.loads(canonical_marker_bytes.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
         return None
-    if not isinstance(marker, dict):
+    if not isinstance(canonical_marker, dict):
         return None
     expected = {
         "route_id": metadata.get("route_id", ""),
         "route_hash": metadata.get("route_hash", ""),
         "node_id": metadata.get("route_node", ""),
-        "attempt_id": attempt_id,
     }
-    if any(not value or marker.get(key) != value for key, value in expected.items()):
+    if any(not value or canonical_marker.get(key) != value for key, value in expected.items()):
         return None
     route_path = Path(metadata.get("route_file", ""))
     if not route_path.is_absolute() or route_path.is_symlink():
@@ -5779,23 +5779,59 @@ def _marker_bound_prepare_marker_proof(
         for node in route["nodes"]
         if isinstance(node, dict) and node.get("id") == metadata.get("route_node")
     ]
-    evidence_record = marker.get("evidence")
-    if not isinstance(evidence_record, dict):
-        return None
-    evidence_path = Path(str(evidence_record.get("path", "")))
-    history_path = marker_path.parent / f"{metadata.get('route_node', '')}.{marker.get('sequence', 0)}.json"
-    dependency_paths = [route_path, evidence_path, history_path]
-    if marker.get("stage_authority") == "owner-chain":
-        dependency_paths.append(Path(str(marker.get("subsession_manifest", ""))))
-    elif nodes and nodes[0].get("kind") != "resource-runner":
+    selected_owner_chain = (
+        canonical_marker.get("stage_authority") == "owner-chain"
+        and canonical_marker.get("attempt_id") == attempt_id
+    )
+    exact_attempt = (
+        bool(nodes)
+        and nodes[0].get("kind") != "resource-runner"
+        and not selected_owner_chain
+    )
+    link_path: Path | None = None
+    if exact_attempt:
         safe_attempt = "".join(
-            character if character.isalnum() or character in "._-" else "_"
+            character if character.isalnum() or character in ".-_" else "_"
             for character in attempt_id
         )
-        dependency_paths.append(
-            marker_path.parent
-            / f"{metadata.get('route_node', '')}.{safe_attempt}.attempt.json"
-        )
+        link_path = marker_path.parent / f"{metadata.get('route_node', '')}.{safe_attempt}.attempt.json"
+        try:
+            link = json.loads(link_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, ValueError):
+            return None
+        if not isinstance(link, dict):
+            return None
+        history_value = link.get("completion_marker_history")
+        if not isinstance(history_value, str) or not Path(history_value).is_absolute():
+            return None
+        history_path = Path(history_value)
+        try:
+            history_bytes = history_path.read_bytes()
+            marker = json.loads(history_bytes.decode("utf-8"))
+        except (OSError, UnicodeDecodeError, ValueError):
+            return None
+        if not isinstance(marker, dict) or marker.get("attempt_id") != attempt_id:
+            return None
+    else:
+        marker = canonical_marker
+        if marker.get("attempt_id") != attempt_id:
+            return None
+        history_path = marker_path.parent / f"{metadata.get('route_node', '')}.{marker.get('sequence', 0)}.json"
+        try:
+            history_bytes = history_path.read_bytes()
+        except OSError:
+            return None
+    history_record = marker.get("evidence")
+    if not isinstance(history_record, dict):
+        return None
+    if marker.get("route_id") != metadata.get("route_id") or marker.get("route_hash") != metadata.get("route_hash"):
+        return None
+    evidence_path = Path(str(history_record.get("path", "")))
+    dependency_paths = [route_path, evidence_path, history_path]
+    if link_path is not None:
+        dependency_paths.append(link_path)
+    if marker.get("stage_authority") == "owner-chain":
+        dependency_paths.append(Path(str(marker.get("subsession_manifest", ""))))
     dependency_bytes: list[tuple[Path, bytes]] = []
     try:
         for dependency_path in dependency_paths:
@@ -5806,13 +5842,9 @@ def _marker_bound_prepare_marker_proof(
         return None
     if dependency_bytes[0][1] != route_bytes:
         return None
-    if len(nodes) != 1 or not completion_marker_is_current(
-        route, nodes[0], marker_path, marker
-    ):
+    if len(nodes) != 1 or not completion_marker_is_current(route, nodes[0], marker_path, marker):
         return None
     try:
-        if marker_path.read_bytes() != marker_bytes:
-            return None
         if any(path.read_bytes() != raw for path, raw in dependency_bytes):
             return None
     except OSError:
@@ -5820,7 +5852,8 @@ def _marker_bound_prepare_marker_proof(
     return MarkerBoundCompletionProof(
         marker=marker,
         marker_path=marker_path,
-        marker_digest=hashlib.sha256(marker_bytes).hexdigest(),
+        marker_digest=hashlib.sha256(history_bytes).hexdigest(),
+        history_path=history_path,
         route_id=metadata.get("route_id", ""),
         route_hash=metadata.get("route_hash", ""),
         node_id=metadata.get("route_node", ""),
@@ -5837,7 +5870,7 @@ def _marker_bound_current_marker(
     attempt_id: str,
     proof: MarkerBoundCompletionProof | None,
 ) -> tuple[dict[str, object] | None, str]:
-    """CAS only current marker bytes against a pre-lock immutable-chain proof."""
+    """CAS only the selected attempt's immutable history against its proof."""
 
     if proof is None or (
         metadata.get("completion_marker") != str(proof.marker_path)
@@ -5848,7 +5881,11 @@ def _marker_bound_current_marker(
     ):
         return None, ""
     try:
-        marker_bytes = proof.marker_path.read_bytes()
+        for raw_path, expected_digest in proof.immutable_file_digests:
+            observed = Path(raw_path).read_bytes()
+            if hashlib.sha256(observed).hexdigest() != expected_digest:
+                return None, ""
+        marker_bytes = proof.history_path.read_bytes()
     except OSError:
         return None, ""
     digest = hashlib.sha256(marker_bytes).hexdigest()

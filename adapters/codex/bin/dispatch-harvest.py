@@ -277,7 +277,7 @@ def main(argv: list[str]) -> int:
         if metadata.get("harness") not in (None, "", "codex", "claude"):
             continue
         try:
-            required_action = required_action_for_attempt(fields[1], metadata)
+            required_action = required_action_for_attempt(fields[1], metadata, jobs=jobs)
         except JoinContractError as exc:
             print("check=failed")
             print(f"reason={exc}")

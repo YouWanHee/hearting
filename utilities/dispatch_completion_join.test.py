@@ -10,6 +10,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import tempfile
 import threading
@@ -272,6 +273,255 @@ class DispatchCompletionJoinTest(unittest.TestCase):
         self.assertFalse(state.quiescent)
         self.assertEqual(state.status, "open")
         self.assertEqual(JOIN.delivery_classification(state), "attention")
+
+    def historical_marker_fixture(self, *, variant: str = "valid") -> str:
+        """Create two same-node attempts and leave attempt 1 as the target."""
+        route = self.root / "historical-route.json"
+        route_value = {
+            "route_id": "rt-historical",
+            "route_hash": "sha256:" + "7" * 64,
+            "registry_digest": "sha256:" + "8" * 64,
+            "nodes": [{"id": "execute", "completion_gate": "code-execute", "dispatch_depth": 2}],
+        }
+        route.write_text(json.dumps(route_value), encoding="utf-8")
+        evidence1 = self.root / "first.md"
+        evidence2 = self.root / "second.md"
+        evidence1.write_text("first evidence\n", encoding="utf-8")
+        evidence2.write_text("second evidence\n", encoding="utf-8")
+        directory = self.root / "completion"
+        directory.mkdir(exist_ok=True)
+        common = {
+            "schema_version": 2, "route_id": route_value["route_id"],
+            "route_hash": route_value["route_hash"],
+            "registry_digest": route_value["registry_digest"],
+            "node_id": "execute", "completion_gate": "code-execute",
+            "dispatch_depth": 2, "transport": "headless",
+            "execution_surface": "registered-headless", "registered_worker": True,
+            "fallback_hop": "same-harness-headless",
+        }
+        def marker(attempt: str, sequence: int, evidence: Path) -> dict[str, object]:
+            value = dict(common)
+            value.update({"sequence": sequence, "attempt_id": attempt,
+                          "evidence": {"path": str(evidence),
+                                        "sha256": hashlib.sha256(evidence.read_bytes()).hexdigest()}})
+            return value
+        first = marker("att-history-first", 1, evidence1)
+        second = marker("att-history-second", 2, evidence2)
+        (directory / "execute.1.json").write_text(json.dumps(first), encoding="utf-8")
+        (directory / "execute.2.json").write_text(json.dumps(second), encoding="utf-8")
+        canonical = directory / "execute.json"
+        canonical.write_text(json.dumps(second), encoding="utf-8")
+        def link(attempt: str, value: dict[str, object], history: Path) -> dict[str, object]:
+            return {"schema_version": 2, "route_id": route_value["route_id"],
+                    "node_id": "execute", "attempt_id": attempt,
+                    "dispatch_depth": 2, "transport": "headless",
+                    "execution_surface": "registered-headless", "registered_worker": True,
+                    "fallback_hop": "same-harness-headless",
+                    "evidence_sha256": value["evidence"]["sha256"],
+                    "completion_marker": str(canonical),
+                    "completion_marker_history": str(history)}
+        first_link = directory / "execute.att-history-first.attempt.json"
+        second_link = directory / "execute.att-history-second.attempt.json"
+        first_link.write_text(json.dumps(link("att-history-first", first, directory / "execute.1.json")), encoding="utf-8")
+        second_link.write_text(json.dumps(link("att-history-second", second, directory / "execute.2.json")), encoding="utf-8")
+        if variant == "missing-history":
+            (directory / "execute.1.json").unlink()
+        elif variant == "missing-link":
+            first_link.unlink()
+        elif variant == "tampered-history":
+            bad = dict(first); bad["attempt_id"] = "att-history-foreign"
+            (directory / "execute.1.json").write_text(json.dumps(bad), encoding="utf-8")
+        elif variant == "tampered-evidence":
+            evidence1.write_text("tampered evidence\n", encoding="utf-8")
+        elif variant == "foreign-link":
+            first_link.write_text(second_link.read_text(encoding="utf-8"), encoding="utf-8")
+        metadata = (
+            "attempt_schema_version=2,dispatch_depth=2,transport=headless,"
+            "execution_surface=registered-headless,registered_worker=1,"
+            "attempt_id=att-history-first,route_id=rt-historical,"
+            f"route_hash={'sha256:' + '7' * 64},route_node=execute,"
+            f"route_file={route},completion_marker={canonical},launch_outcome=never-launched"
+        )
+        self.jobs.write_text(f"2026-08-25T00:00:00Z\topen\t/r\t/w\texecute\t{metadata}\n", encoding="utf-8")
+        return "att-history-first"
+
+    def test_current_delivery_state_recovers_prior_attempt_from_immutable_history(self):
+        attempt = self.historical_marker_fixture()
+        with mock.patch.object(JOIN, "attempt_process_quiescence", return_value=JOIN.ProcessQuiescence("quiescent", "fixture")):
+            state = JOIN.current_delivery_state(self.jobs, attempt, parent_attempt_id=attempt)
+        self.assertTrue(state.advanced)
+        self.assertEqual(state.marker["attempt_id"], attempt)
+        self.assertEqual(state.marker_digest, hashlib.sha256((self.root / "completion/execute.1.json").read_bytes()).hexdigest())
+        self.assertIn("\tdone\t", self.jobs.read_text(encoding="utf-8"))
+
+    def test_historical_marker_linkage_fails_closed_for_missing_tampered_or_foreign_inputs(self):
+        for variant in ("missing-history", "missing-link", "tampered-history", "tampered-evidence", "foreign-link"):
+            with self.subTest(variant=variant):
+                attempt = self.historical_marker_fixture(variant=variant)
+                with mock.patch.object(JOIN, "attempt_process_quiescence", return_value=JOIN.ProcessQuiescence("quiescent", "fixture")):
+                    state = JOIN.current_delivery_state(self.jobs, attempt, parent_attempt_id=attempt)
+                self.assertFalse(state.advanced)
+                self.assertEqual(JOIN.delivery_classification(state), "attention")
+                self.assertIn("\topen\t", self.jobs.read_text(encoding="utf-8"))
+
+    def test_historical_action_contract_agrees_with_producers_and_guard_classifier(self):
+        for variant, expected in (("valid", "advance-completed"), ("tampered-history", "inspect-done-failure")):
+            with self.subTest(variant=variant):
+                attempt = self.historical_marker_fixture(variant=variant)
+                if variant == "valid":
+                    with mock.patch.object(
+                        JOIN,
+                        "attempt_process_quiescence",
+                        return_value=JOIN.ProcessQuiescence("quiescent", "fixture"),
+                    ):
+                        state = JOIN.current_delivery_state(
+                            self.jobs, attempt, parent_attempt_id=attempt
+                        )
+                    self.assertTrue(state.advanced)
+                    self.assertEqual(JOIN.delivery_required_action(state), expected)
+                else:
+                    # The proof is bad on an actual terminal metadata-success
+                    # row.  The harvester must diagnose that proof, rather
+                    # than borrowing the successor marker or advancing it.
+                    current = self.jobs.read_text(encoding="utf-8").rstrip("\n")
+                    self.jobs.write_text(current.replace("\topen\t", "\tdone\t") + "\n", encoding="utf-8")
+                metadata = D.parse_registry_metadata(self.jobs.read_text(encoding="utf-8").split("\t", 5)[5].strip())
+                status = self.jobs.read_text(encoding="utf-8").split("\t", 3)[1]
+                state = JOIN.current_delivery_state(
+                    self.jobs, attempt, parent_attempt_id=attempt, advance=False
+                )
+                action = JOIN.required_action_for_attempt(status, metadata, jobs=self.jobs)
+                self.assertEqual(action, expected)
+                self.assertEqual(JOIN.delivery_required_action(state), expected)
+                receipt = {"children": [{"attempt_id": metadata["attempt_id"], "required_action": action}]}
+                for supervisor in (load_supervisor("codex-app-server-supervisor"), load_supervisor("claude-session-supervisor")):
+                    prompt = supervisor.completion_prompt(receipt, jobs=str(self.jobs))
+                    commands = JOIN.harvest_command_lines(prompt)
+                    if expected == "inspect-done-failure":
+                        self.assertEqual(len(commands), 1)
+                        tokens = shlex.split(commands[0])
+                        classified = JOIN.classify_supervised_shell_command(
+                            base=JOIN.ROOT, command=commands[0],
+                            open_attempt_ids={metadata["attempt_id"]},
+                            parent_slug="execute", jobs=self.jobs,
+                        )
+                        self.assertIsNotNone(classified)
+                        self.assertTrue(classified.failure_detail)
+                        harvested = subprocess.run(
+                            tokens,
+                            text=True,
+                            capture_output=True,
+                            env={
+                                **os.environ,
+                                "AGENT_HOME": str(JOIN.ROOT),
+                                "CODEX_HOME": str(self.root / "codex-home"),
+                                "AGENT_DISPATCH_JOBS": str(self.jobs),
+                            },
+                        )
+                        self.assertEqual(
+                            harvested.returncode,
+                            0,
+                            harvested.stdout + harvested.stderr,
+                        )
+                        self.assertNotIn(
+                            "failure-detail-requires-terminal-failure",
+                            harvested.stdout,
+                        )
+                    else:
+                        self.assertEqual(commands, [])
+
+        # Plain metadata-only success remains an advance action and cannot be
+        # turned into a failure-detail command merely because it is terminal.
+        plain = row(
+            "done", "att-plain-success", "att-parent", "execute",
+            process_metadata={"failure_class": "pass", "note": "completed-supervisor"},
+        )
+        plain_jobs = self.root / "plain-success.jobs.log"
+        plain_jobs.write_text(plain, encoding="utf-8")
+        plain_meta = D.parse_registry_metadata(plain.split("\t", 5)[5].strip())
+        self.assertEqual(
+            JOIN.required_action_for_attempt("done", plain_meta, jobs=plain_jobs),
+            "advance-completed",
+        )
+
+    def _assert_parent_bound_marker_action_agrees(self, *, descendant: bool):
+        attempt = self.historical_marker_fixture()
+        parent = "att-history-parent"
+        selected = self.jobs.read_text(encoding="utf-8").rstrip("\n")
+        selected = selected.replace("\topen\t", "\tdone\t")
+        selected += f",parent_attempt_id={parent},failure_class=pass,note=completed-marker"
+        self.jobs.write_text(
+            selected + "\n"
+            + row("open", "att-history-other", attempt if descendant else parent, "other"),
+            encoding="utf-8",
+        )
+        metadata = D.parse_registry_metadata(selected.split("\t", 5)[5])
+        self.assertEqual(metadata["parent_attempt_id"], parent)
+        expected = "inspect-done-failure" if descendant else "advance-completed"
+        state = JOIN.current_delivery_state(
+            self.jobs, attempt, parent_attempt_id=attempt, advance=False
+        )
+        self.assertEqual(state.marker["attempt_id"], attempt)
+        self.assertEqual((state.status, state.verdict), ("done", "PASS"))
+        self.assertTrue(state.quiescent)
+        self.assertEqual(state.owned_children, int(descendant))
+        self.assertEqual(JOIN.delivery_required_action(state), expected)
+        # This is the harvester's actual entry point, including its registry.
+        self.assertEqual(
+            JOIN.required_action_for_attempt("done", metadata, jobs=self.jobs),
+            expected,
+        )
+        receipt = JOIN.receipt_with_current_actions(
+            {"schema_version": 2, "state": "ready", "children": [{"attempt_id": attempt}]},
+            [JOIN.current_attempt_row(self.jobs, attempt)],
+            jobs=self.jobs,
+        )
+        self.assertEqual(receipt["children"][0]["required_action"], expected)
+        for module_name in ("claude-session-supervisor", "codex-app-server-supervisor"):
+            with self.subTest(module=module_name):
+                supervisor = load_supervisor(module_name)
+                prompt = supervisor.completion_prompt(receipt, jobs=str(self.jobs))
+                delivered = json.loads(prompt.splitlines()[0].split(": ", 1)[1])
+                self.assertEqual(delivered["children"][0]["required_action"], expected)
+                commands = JOIN.harvest_command_lines(prompt)
+                if descendant:
+                    self.assertEqual(len(commands), 1)
+                    command = commands[0]
+                    action = JOIN.classify_supervised_shell_command(
+                        base=JOIN.ROOT, command=command,
+                        open_attempt_ids={attempt}, parent_slug="execute", jobs=self.jobs,
+                    )
+                    self.assertIsNotNone(action)
+                    self.assertTrue(action.failure_detail)
+                else:
+                    self.assertEqual(commands, [])
+                    command = (
+                        f"{supervisor.SHARED_HARVEST_SURFACE} harvest "
+                        f"--jobs {shlex.quote(str(self.jobs))} "
+                        f"--attempt-id {attempt} --status done --failure-detail"
+                    )
+                harvested = subprocess.run(
+                    shlex.split(command), text=True, capture_output=True,
+                    env={
+                        **os.environ,
+                        "AGENT_HOME": str(JOIN.ROOT),
+                        "CODEX_HOME": str(self.root / "codex-home"),
+                        "AGENT_DISPATCH_JOBS": str(self.jobs),
+                    },
+                )
+                if descendant:
+                    self.assertEqual(harvested.returncode, 0, harvested.stdout + harvested.stderr)
+                    self.assertIn("matched=1", harvested.stdout.splitlines())
+                    self.assertIn("marked_done=0", harvested.stdout.splitlines())
+                else:
+                    self.assertNotEqual(harvested.returncode, 0)
+                    self.assertIn("reason=failure-detail-requires-terminal-failure", harvested.stdout)
+
+    def test_marker_action_ignores_open_sibling_of_parent_bound_attempt(self):
+        self._assert_parent_bound_marker_action_agrees(descendant=False)
+
+    def test_marker_action_blocks_on_selected_parent_bound_attempts_open_descendant(self):
+        self._assert_parent_bound_marker_action_agrees(descendant=True)
 
     def test_delivery_timing_projection_is_complete_and_versioned(self):
         projected = JOIN.delivery_timing_fields(join_completed_ns=17)
@@ -1416,7 +1666,10 @@ class HarvestVocabularyTest(unittest.TestCase):
     def setUp(self):
         self.claude = load_supervisor("claude-session-supervisor")
         self.codex = load_supervisor("codex-app-server-supervisor")
-        self.jobs = "/fixture/jobs.log"
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.jobs = str(self.root / "jobs.log")
         self.base = {"attempt_id": "att-a"}
         self.open_ids = {"att-a"}
 
@@ -1520,6 +1773,146 @@ class HarvestVocabularyTest(unittest.TestCase):
             JOIN.supervisor_guarded_attempt_ids(rows, outbox),
             {"att-a", "att-b", "att-c"},
         )
+
+    def test_pending_projection_filters_consumed_children_and_rejects_foreign(self):
+        receipt = {
+            "schema_version": 2,
+            "children": [
+                {"attempt_id": "att-a", "required_action": "complete-open"},
+                {"attempt_id": "att-b", "required_action": "inspect-done-failure"},
+            ],
+        }
+        outbox = JOIN.SupervisorOutbox(
+            "receipt-1", "a" * 64, frozenset({"att-a", "att-b"}), (), receipt,
+            frozenset({"att-a"}),
+        )
+        projected = JOIN.pending_action_projection(receipt, outbox)
+        self.assertEqual([c["attempt_id"] for c in projected["children"]], ["att-b"])
+        self.assertEqual(receipt["children"][0]["attempt_id"], "att-a")
+        for malformed in (
+            [{"attempt_id": "att-a"}, {"attempt_id": "att-a"}],
+            [{"attempt_id": "att-a"}, {"attempt_id": "att-foreign"}],
+        ):
+            with self.subTest(malformed=malformed):
+                with self.assertRaises(JOIN.JoinContractError):
+                    JOIN.pending_action_projection(
+                        {"children": malformed}, outbox
+                    )
+
+    def test_both_supervisors_render_only_unconsumed_outbox_actions(self):
+        for module_name in ("claude-session-supervisor", "codex-app-server-supervisor"):
+            with self.subTest(module=module_name):
+                supervisor = load_supervisor(module_name)
+                # Each producer must actually harvest its own untouched batch.
+                root = self.root / module_name
+                root.mkdir()
+                jobs = root / "jobs.log"
+                state_path = root / "mixed-batch.json"
+                receipt = {
+                    "schema_version": 2,
+                    "state": "ready",
+                    "children": [
+                        {"attempt_id": "att-consumed", "status": "open", "required_action": "complete-open"},
+                        {"attempt_id": "att-open", "status": "open", "required_action": "complete-open"},
+                        {"attempt_id": "att-failure", "status": "done", "required_action": "inspect-done-failure"},
+                    ],
+                }
+                raw_rows = []
+                for slug, status, verdict in (
+                    ("consumed", "open", "PASS"),
+                    ("open", "open", "PASS"),
+                    ("failure", "done", "FAIL"),
+                ):
+                    log = root / f"{slug}.jsonl"
+                    blocker = "none" if verdict == "PASS" else "fixture failure"
+                    log.write_text(
+                        json.dumps({"type": "item.completed", "item": {
+                            "type": "agent_message",
+                            "text": f"artifact: -\nverdict: {verdict}\nblocker: {blocker}",
+                        }}) + "\n" + json.dumps({"type": "turn.completed"}) + "\n",
+                        encoding="utf-8",
+                    )
+                    raw_rows.append(row(
+                        status, f"att-{slug}", "att-parent", slug,
+                        process_metadata={
+                            **sealed_cancellation_metadata(),
+                            "fallback_hop": "same-harness-headless",
+                            "failure_class": "pass" if verdict == "PASS" else "contract",
+                            "log_file": str(log), "artifact_root": str(root),
+                        },
+                    ))
+                jobs.write_text("".join(raw_rows), encoding="utf-8")
+                all_ids = {"att-consumed", "att-open", "att-failure"}
+                children = JOIN.current_children(jobs, "att-parent", all_ids)
+                prepared = JOIN.prepare_supervisor_outbox(
+                    state_path, "att-parent", set(), receipt, children
+                )
+                self.assertIsNotNone(prepared.outbox)
+                env = {
+                    **os.environ,
+                    "AGENT_HOME": str(JOIN.ROOT),
+                    "CODEX_HOME": str(root / "codex-home"),
+                    "AGENT_DISPATCH_JOBS": str(jobs),
+                    "AGENT_DISPATCH_COMPLETION_STATE_FILE": str(state_path),
+                    "AGENT_DISPATCH_ATTEMPT_ID": "att-parent",
+                }
+
+                def assert_pending(expected_ids):
+                    state = JOIN.read_supervisor_phase_state(state_path, "att-parent")
+                    self.assertIsNotNone(state)
+                    self.assertIsNotNone(state.outbox)
+                    outbox = state.outbox
+                    self.assertEqual(outbox.receipt_id, prepared.outbox.receipt_id)
+                    self.assertEqual(outbox.receipt_digest, prepared.outbox.receipt_digest)
+                    self.assertEqual(outbox.receipt, receipt)
+                    self.assertEqual(outbox.attempt_ids, all_ids)
+                    self.assertEqual(outbox.consumed_attempt_ids, all_ids - expected_ids)
+                    current_rows = JOIN.current_children(jobs, "att-parent", all_ids)
+                    guarded = JOIN.supervisor_guarded_attempt_ids(current_rows, outbox)
+                    self.assertEqual(guarded, expected_ids)
+                    prompt = supervisor.completion_prompt(receipt, outbox, jobs=str(jobs))
+                    delivered = json.loads(prompt.splitlines()[0].split(": ", 1)[1])
+                    self.assertEqual(
+                        {child["attempt_id"] for child in delivered["children"]}, expected_ids
+                    )
+                    commands = JOIN.harvest_command_lines(prompt)
+                    self.assertEqual(len(commands), len(expected_ids))
+                    by_attempt = {}
+                    for command in commands:
+                        action = JOIN.classify_supervised_shell_command(
+                            base=JOIN.ROOT, command=command,
+                            open_attempt_ids=guarded, parent_slug="open", jobs=jobs,
+                        )
+                        self.assertIsNotNone(action, command)
+                        by_attempt[action.attempt_id] = command
+                    self.assertEqual(set(by_attempt), expected_ids)
+                    return by_attempt, guarded
+
+                def harvest(command, *, marked_done):
+                    result = subprocess.run(
+                        shlex.split(command), text=True, capture_output=True, env=env,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn("matched=1", result.stdout.splitlines())
+                    self.assertIn(f"marked_done={marked_done}", result.stdout.splitlines())
+
+                initial_commands, _guarded = assert_pending(all_ids)
+                consumed_command = initial_commands["att-consumed"]
+                self.assertIn("--status open --mark-done", consumed_command)
+                harvest(consumed_command, marked_done=1)
+                pending_commands, guarded = assert_pending({"att-open", "att-failure"})
+                self.assertIsNone(JOIN.classify_supervised_shell_command(
+                    base=JOIN.ROOT, command=consumed_command,
+                    open_attempt_ids=guarded, parent_slug="consumed", jobs=jobs,
+                ))
+                self.assertEqual(JOIN.current_attempt_row(jobs, "att-consumed").status, "done")
+                harvest(pending_commands["att-open"], marked_done=1)
+                final_commands, _guarded = assert_pending({"att-failure"})
+                harvest(final_commands["att-failure"], marked_done=0)
+                finished = JOIN.read_supervisor_phase_state(state_path, "att-parent")
+                self.assertIsNotNone(finished)
+                self.assertIsNone(finished.outbox)
+                self.assertEqual(finished.phase, "running-turn")
 
     def test_producer_guard_parity_no_hand_written_literals(self):
         # D-4: the durable guard against vocabulary drift. Every line either

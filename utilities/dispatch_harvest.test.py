@@ -840,6 +840,22 @@ class HarvestTest(unittest.TestCase):
         self.assertEqual(rejected.returncode, 64)
         self.assertIn("reason=failure-detail-requires-terminal-failure", rejected.stdout)
 
+    def test_invalid_marker_on_metadata_success_has_supported_failure_diagnostic(self):
+        attempt = "att-harvest-invalid-marker"
+        jobs = self.base / "invalid-marker.jobs.log"
+        row = self.terminal_row(attempt, "PASS", "none", status="done", name="invalid-marker.codex.jsonl")
+        row = row.rstrip("\n") + ",failure_class=pass,note=completed-marker,completion_marker=" + str(self.base / "missing-marker.json") + "\n"
+        jobs.write_text(row, encoding="utf-8")
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "adapters/codex/bin/dispatch-harvest.py"),
+             "--jobs", str(jobs), "--attempt-id", attempt, "--status", "done",
+             "--failure-detail"],
+            text=True, capture_output=True, env=self.env(),
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("failure-detail-requires-terminal-failure", result.stdout)
+        self.assertIn("handoff_state=valid", result.stdout)
+
     def test_done_registry_failures_without_handoffs_remain_inspectable(self):
         cases = (
             ("contract", "final-handoff-invalid", "final-handoff-invalid"),

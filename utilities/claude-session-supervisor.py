@@ -28,6 +28,7 @@ from dispatch_completion_join import (
     harvest_command_lines,
     log_delivery_refusal,
     materialize_after_terminal_close,
+    pending_action_projection,
     prepare_supervisor_outbox,
     refresh_supervisor_outbox_actions,
     reconcile_finished_children,
@@ -532,10 +533,11 @@ def completion_prompt(
     # round_1 finding 5). Do not silently revert that fallback — without it
     # this exact command is unsatisfiable for a route-bound row and the
     # delivered/harvest-only phase deadlocks (SD-70/78).
-    compact = json.dumps(receipt, separators=(",", ":"), sort_keys=True)
+    projected = pending_action_projection(receipt, outbox) if outbox is not None else receipt
+    compact = json.dumps(projected, separators=(",", ":"), sort_keys=True)
     jobs_argument = f"--jobs {shlex.quote(jobs)} " if jobs else ""
     commands: list[str] = []
-    for child in receipt["children"]:
+    for child in projected["children"]:
         attempt = shlex.quote(child["attempt_id"])
         if child["required_action"] == "complete-open":
             commands.append(
