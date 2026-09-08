@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import importlib.util
+import re
 from pathlib import Path
 import shlex
 import subprocess
@@ -58,6 +59,92 @@ class ModelConfigTest(unittest.TestCase):
         self.assertEqual(receipt.source, "user")
         self.assertEqual(receipt.reason, "user-valid")
         self.assertEqual(values["CFG_USER_EXTRA"], "literal")
+
+    def test_a_tier_the_adapter_wrappers_read_by_name_stays_required(self):
+        # Review R2-B1: the role mappers read CFG_TIER_DEEP_MODEL/EFFORT (and
+        # light/mini) directly after matching CFG_ROLES_*, so a copy that routes
+        # every profile through model/<id>:effort still needs them.
+        shipped = (
+            'CFG_MODEL_PROFILE_DEEP=deep:high\n'
+            'CFG_TIER_DEEP_MODEL=shipped-deep\n'
+            'CFG_TIER_DEEP_EFFORT=high\n'
+        )
+        root = self.make_root(shipped=shipped)
+        home = root / "home"
+        user = home / "agent-config" / "models.conf"
+        user.parent.mkdir(parents=True)
+        # Explicit-model profile: nothing in the file references the deep tier…
+        user.write_text('CFG_MODEL_PROFILE_DEEP=model/user-model:high\nCFG_TIER_DEEP_EFFORT=high\n', encoding="utf-8")
+        _values, receipt = config.resolve_config("claude", runtime=home, source_root=root)
+        self.assertEqual((receipt.source, receipt.reason), ("shipped", "user-incomplete"))
+        # …and the same copy is complete once it declares the key the mapper reads.
+        user.write_text('CFG_MODEL_PROFILE_DEEP=model/user-model:high\nCFG_TIER_DEEP_EFFORT=high\nCFG_TIER_DEEP_MODEL=user-deep\n', encoding="utf-8")
+        _values, receipt = config.resolve_config("claude", runtime=home, source_root=root)
+        self.assertEqual((receipt.source, receipt.reason), ("user", "user-valid"))
+
+    def test_declared_wrapper_tiers_cover_every_literal_key_the_wrappers_read(self):
+        """Drift guard for WRAPPER_REQUIRED_TIERS.
+
+        Scope (deliberately narrow, review R4-M1): it reads `.sh` and `.py` files
+        directly under each adapter's `bin/` and matches fully written key names.
+        A wrapper that assembles the key at runtime (`CFG_TIER_${tier}_MODEL`),
+        lives under another extension, or sits outside `bin/` is NOT covered —
+        such a consumer must be added to the table by hand. It also does not tell
+        a real read from a mention in a comment, which is the safe direction.
+        """
+        literal = re.compile(r"CFG_TIER_([A-Z0-9_]+)_(?:MODEL|EFFORT|VARIANT)\b")
+        for adapter, declared in config.WRAPPER_REQUIRED_TIERS.items():
+            with self.subTest(adapter=adapter):
+                found = set()
+                bin_dir = ROOT / "adapters" / adapter / "bin"
+                self.assertTrue(bin_dir.is_dir(), bin_dir)
+                for path in sorted(bin_dir.iterdir()):
+                    if path.is_file() and path.suffix in (".sh", ".py"):
+                        found.update(literal.findall(path.read_text(encoding="utf-8", errors="replace")))
+                self.assertEqual(found - declared, set(), f"{adapter} wrappers read an undeclared tier")
+                # Each declared tier must ship the exact keys a wrapper reads —
+                # a failover/cascade-only mention is not enough.
+                shipped = config.parse_config(config.shipped_path(adapter, source_root=ROOT))
+                budget = "VARIANT" if adapter == "opencode" else "EFFORT"
+                for tier in declared:
+                    required = {f"CFG_TIER_{tier}_MODEL", f"CFG_TIER_{tier}_{budget}"}
+                    self.assertLessEqual(required, shipped.keys(), f"{adapter} tier {tier} is incomplete")
+
+    def test_legacy_complete_user_copy_survives_a_shipped_tier_extension(self):
+        # A release adds a tier (balanced-deep) with two new CFG_TIER_* keys. An
+        # older user copy that never references that tier is still a complete
+        # policy and stays selected whole-file (its main-only list included).
+        shipped = (
+            BASE
+            + 'CFG_TIER_BALANCED_DEEP_MODEL=shipped-bd\n'
+            + 'CFG_TIER_BALANCED_DEEP_EFFORT=high\n'
+            + 'CFG_MODEL_PROFILE_BALANCED_DEEP=balanced-deep:high\n'
+            + 'CFG_MAIN_SESSION_ONLY_MODELS=" "\n'
+        )
+        legacy_user = BASE + 'CFG_MODEL_PROFILE_BALANCED_DEEP=deep:high\nCFG_MAIN_SESSION_ONLY_MODELS="fable"\n'
+        root = self.make_root(shipped=shipped)
+        home = root / "home"
+        user = home / "agent-config" / "models.conf"
+        user.parent.mkdir(parents=True)
+        user.write_text(legacy_user, encoding="utf-8")
+        values, receipt = config.resolve_config("claude", runtime=home, source_root=root)
+        self.assertEqual((receipt.source, receipt.reason), ("user", "user-valid"))
+        self.assertEqual(receipt.unreferenced_tier_keys, "CFG_TIER_BALANCED_DEEP_EFFORT,CFG_TIER_BALANCED_DEEP_MODEL")
+        self.assertEqual(values["CFG_MAIN_SESSION_ONLY_MODELS"], "fable")
+        self.assertNotIn("CFG_TIER_BALANCED_DEEP_MODEL", values)  # whole-file, never merged
+        # The same copy that *references* the new tier without declaring it is incomplete.
+        user.write_text(legacy_user.replace("balanced-deep:high", "balanced-deep:high").replace(
+            "CFG_MODEL_PROFILE_BALANCED_DEEP=deep:high", "CFG_MODEL_PROFILE_BALANCED_DEEP=balanced-deep:high"), encoding="utf-8")
+        values, receipt = config.resolve_config("claude", runtime=home, source_root=root)
+        self.assertEqual((receipt.source, receipt.reason), ("shipped", "user-incomplete"))
+        # A scalar tier selector counts as a reference too.
+        user.write_text(legacy_user + "CFG_TIER_DEEP_FAILOVER=balanced-deep\n", encoding="utf-8")
+        _values, receipt = config.resolve_config("claude", runtime=home, source_root=root)
+        self.assertEqual(receipt.reason, "user-incomplete")
+        # Missing non-tier keys are still incomplete (the exception is tier-shaped only).
+        user.write_text(legacy_user.replace("CFG_MODEL_PROFILE_DEEP=deep:xhigh\n", ""), encoding="utf-8")
+        _values, receipt = config.resolve_config("claude", runtime=home, source_root=root)
+        self.assertEqual(receipt.reason, "user-incomplete")
 
     def test_missing_incomplete_malformed_and_unsafe_user_files_fallback_whole_file(self):
         for text, reason in ((None, "user-missing"), ("CFG_TIER_DEEP_MODEL=user-only\n", "user-incomplete"),

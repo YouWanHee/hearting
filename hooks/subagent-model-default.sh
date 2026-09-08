@@ -160,7 +160,10 @@ def apply_policy(tool_input):
         target = override
     else:
         tier = conf.get("CFG_NATIVE_SUBAGENT", "").strip()
-        target = conf.get("CFG_TIER_%s_MODEL" % tier.upper(), "").strip() if tier else ""
+        # Tier ids are normalized the way model_profile does: `balanced-deep` names
+        # the CFG_TIER_BALANCED_DEEP_* keys.
+        tier_key = tier.upper().replace("-", "_")
+        target = conf.get("CFG_TIER_%s_MODEL" % tier_key, "").strip() if tier else ""
     if not target or restricted_model(target, restricted):
         deny("native-subagent-eligible-model-unavailable")
         return

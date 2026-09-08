@@ -130,17 +130,42 @@ class ModelProfileTest(unittest.TestCase):
         finally:
             Path(path).unlink()
 
+    @staticmethod
+    def _declared_point(config, profile):
+        """Independent derivation of a profile's operating point from the raw
+        CFG_ keys (tier -> CFG_TIER_<TIER>_MODEL / _EFFORT|_VARIANT), so the
+        expectation follows the shipped file instead of a literal table."""
+        tier, budget = config[f"CFG_MODEL_PROFILE_{profile.upper().replace('-', '_')}"].split(":", 1)
+        key = tier.upper().replace("-", "_")
+        return (config[f"CFG_TIER_{key}_MODEL"], budget)
+
+    def test_claude_shipped_default_is_the_user_profile_mapping(self):
+        # 2026-09-08 user rule: the shipped default equals the user's runtime
+        # mapping — deep rides Fable/high headless, balanced-deep rides its own
+        # opus/high tier, and no model is main-session-only (SD-85 superseded).
+        config = PROFILE.load_config(ROOT / "adapters" / "claude" / "config" / "models.conf")
+        self.assertEqual(config["CFG_MAIN_SESSION_ONLY_MODELS"].split(), [])
+        self.assertEqual(self._declared_point(config, "deep"), ("fable", "high"))
+        self.assertEqual(self._declared_point(config, "balanced-deep"), ("opus", "high"))
+        cascade = [entry.split(":", 1)[0] for entry in config["CFG_TIER_DEEP_FAILOVER_CASCADE"].split()]
+        self.assertEqual(cascade[:2], ["fable", "opus"])
+        self.assertEqual(cascade[0], config["CFG_TIER_DEEP_MODEL"])
+        self.assertEqual(config["CFG_TIER_DEEP_FAILOVER"], "balanced-deep")
+        points = {profile: self._declared_point(config, profile) for profile in ("deep", "balanced-deep", "balanced", "light", "mini")}
+        self.assertNotEqual(points["deep"], points["balanced-deep"])  # two distinct operating points
+        self.assertEqual(len(set(points.values())), 5)  # five distinct operating points
+
     def test_portable_profiles_resolve_to_declared_adapter_budgets(self):
+        claude_config = PROFILE.load_config(ROOT / "adapters" / "claude" / "config" / "models.conf")
         expected = {
-            # Five profiles use the configured judgment and execution budgets;
-            # Claude keeps four operating points across two dispatch-eligible
-            # models (Fable is depth-0 main-only, SD-85, so deep rides opus).
+            # Five profiles use the configured judgment and execution budgets.
+            # Claude expectations derive from the shipped config (the user's
+            # runtime mapping is the shipped default, 2026-09-08); the concrete
+            # contract itself is asserted in
+            # test_claude_shipped_default_is_the_user_profile_mapping.
             "claude": {
-                "deep": ("opus", "high"),
-                "balanced-deep": ("opus", "high"),
-                "balanced": ("sonnet", "high"),
-                "light": ("sonnet", "medium"),
-                "mini": ("sonnet", "low"),
+                profile: self._declared_point(claude_config, profile)
+                for profile in ("deep", "balanced-deep", "balanced", "light", "mini")
             },
             "codex": {
                 "deep": ("gpt-6-astra", "high"),

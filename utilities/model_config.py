@@ -38,9 +38,65 @@ class ModelConfigReceipt:
     user_path: str
     shipped_path: str
     balanced_provenance: str = "explicit"
+    # Shipped tier keys the user file lacks but never references (2026-09-08,
+    # SD-145): a complete legacy copy stays selected whole-file instead of being
+    # silently replaced by the shipped policy when a release adds a tier.
+    unreferenced_tier_keys: str = ""
 
     def as_dict(self) -> dict[str, str]:
         return asdict(self)
+
+
+TIER_KEY = re.compile(r"^CFG_TIER_([A-Z0-9_]+)_(MODEL|EFFORT|VARIANT)$")
+# Tiers each adapter's own wrappers read by literal key name, whatever the
+# profiles say: the role mappers (`adapters/<adapter>/bin/model-map.sh`,
+# `role-map.sh`) and the distill workers match a role in `CFG_ROLES_*` and then
+# read `CFG_TIER_DEEP_MODEL` and friends directly, so those keys are required
+# even when every profile routes through `model/<id>:effort` (review R2-B1).
+# This is a declared contract, not a runtime source scan: selecting the required
+# tiers reads no wrapper file (the config files themselves are still read on every
+# resolve). `model_config.test.py` guards it by scanning each adapter's `bin/*.sh`
+# and `*.py` for fully written tier keys, so a consumer that assembles the key at
+# runtime, uses another extension, or lives outside `bin/` must be added here by
+# hand (reviews R3-B1/R3-M1/R4-M1/R4-M2).
+WRAPPER_REQUIRED_TIERS: dict[str, frozenset[str]] = {
+    "claude": frozenset({"DEEP", "LIGHT", "MINI"}),
+    "codex": frozenset({"DEEP", "LIGHT", "MINI"}),
+    "opencode": frozenset({"BALANCED_DEEP", "LIGHT", "MINI"}),
+}
+
+
+TIER_REFERENCE_KEYS = ("CFG_TIER_DEEP_FAILOVER", "CFG_NATIVE_SUBAGENT", "CFG_LIFECYCLE_NUDGE", "CFG_LIFECYCLE_CURATE")
+
+
+def _referenced_tiers(values: Mapping[str, str]) -> set[str]:
+    """Tier ids a config file actually points at (profile `tier:budget` values and
+    the scalar tier selectors). Tier ids are normalized like model_profile does
+    (`balanced-deep` -> `BALANCED_DEEP`)."""
+    tiers: set[str] = set()
+    for key, value in values.items():
+        if key.startswith("CFG_MODEL_PROFILE_") and ":" in value and not value.startswith("model/"):
+            tiers.add(value.split(":", 1)[0].strip().upper().replace("-", "_"))
+        elif key in TIER_REFERENCE_KEYS:
+            tiers.add(value.strip().upper().replace("-", "_"))
+    return tiers
+
+
+def _unreferenced_tier_keys(missing: set[str], user_values: Mapping[str, str], adapter: str) -> set[str]:
+    """The subset of `missing` shipped keys that are tier keys of a tier nothing
+    in this configuration needs. A release that adds a tier (e.g. `balanced-deep`)
+    must not turn an older complete user copy into `user-incomplete` — that would
+    silently replace the user's explicit policy (main-only list, model tiers)
+    with the shipped one. A tier stays required when the user file references it
+    (a profile's `tier:budget`, or a scalar tier selector) or when this adapter's
+    wrappers read its keys by name (`WRAPPER_REQUIRED_TIERS`)."""
+    required = _referenced_tiers(user_values) | WRAPPER_REQUIRED_TIERS.get(adapter, frozenset())
+    optional: set[str] = set()
+    for key in missing:
+        match = TIER_KEY.fullmatch(key)
+        if match and match.group(1) not in required:
+            optional.add(key)
+    return optional
 
 
 def _derive_balanced_values(adapter: str, values: dict[str, str]) -> dict[str, str]:
@@ -214,7 +270,8 @@ def resolve_config(
             "CFG_MODEL_PROFILE_BALANCED", "CFG_MODEL_PROFILE_GRANULARITY_BALANCED",
         }
         missing = set(shipped_values) - set(user_values)
-        if missing - optional_balanced:
+        unreferenced_tier = _unreferenced_tier_keys(missing - optional_balanced, user_values, adapter)
+        if missing - optional_balanced - unreferenced_tier:
             reason = "user-incomplete"
         else:
             deriving = ("CFG_MODEL_PROFILE_BALANCED" in shipped_values
@@ -233,6 +290,7 @@ def resolve_config(
                     "user-valid-derived-balanced" if deriving else "user-valid",
                     str(selected_user), str(selected_user), str(shipped),
                     "derived-from-user-light" if deriving else "explicit",
+                    ",".join(sorted(unreferenced_tier)),
                 )
 
     return shipped_values, ModelConfigReceipt(
