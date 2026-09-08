@@ -508,6 +508,14 @@ any of these is rejected at route compile, and a launch bound to such a graph is
 rejected before the process starts** — the refusal is the point, because the
 alternative is silent abandonment.
 
+A continuation route projects this contract onto its suffix. It drops a gate
+whose gated entry node was cut, never rebinds a retained raising continuation to
+an arbitrary successor, and never treats a reused predecessor's completion as a
+human decision. If the suffix keeps the gated entry but cuts its raiser, the
+builder may remove the runtime gate only after sealing and revalidating the exact
+source route, gate, raise epoch, proceed decision, journal authority, and
+raise/release entry digests; otherwise continuation compilation fails closed.
+
 Grounded by the 2026-08-04 BC_ResNet_tf incident: training and its hard-negative
 loop finished, the wrapper contained no evaluation stage, the documentation
 named "separate eval" with no owner or trigger, the resource runner had no

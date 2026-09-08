@@ -74,7 +74,7 @@ _LEGACY_CLAIM_AUTHORITY_BY_RECIPIENT_KIND = {
 }
 _LEGACY_CLAIM_AUTHORITY_DEFAULT = "generation-proven"
 
-STATES = frozenset({"pending", "claimed", "sent-ambiguous", "acked", "expired"})
+STATES = frozenset({"pending", "claimed", "sent-ambiguous", "acked", "expired", "rejected"})
 OPEN_STATES = frozenset({"pending", "claimed", "sent-ambiguous"})
 
 EXPIRY_REASONS = frozenset({
@@ -90,7 +90,7 @@ EXPIRY_ACTOR = "dispatch-reconcile"
 # zero-byte tombstone (`<record>.json.pruned`, never deleted) so the
 # materialize backstop cannot resurrect it from the append-only jobs.log row
 # (review round 1, B1).
-TERMINAL_STATES = frozenset({"acked", "expired"})
+TERMINAL_STATES = frozenset({"acked", "expired", "rejected"})
 TERMINAL_RETENTION_SECONDS = 7 * 86400
 ORPHAN_LOCK_RETENTION_SECONDS = 24 * 3600
 TOMBSTONE_SUFFIX = ".pruned"
@@ -104,6 +104,7 @@ REQUIRED_FIELDS = (
     "claim_owner", "claim_deadline_ns", "claim_authority", "attempts",
     "last_attempt_at_ns", "acked_at_ns", "acked_by", "expiry_reason", "lineage",
 )
+RECOVERY_AUDIT_FIELDS = frozenset({"expiry_actor", "expiry_detail", "expired_at_ns"})
 IMMUTABLE_FIELDS = ("delivery_id", "recipient_digest", "attempt_ids", "receipt_digest")
 
 # Mirrors dispatch_completion_join.{CANONICAL_RECEIPT_KEYS,CANONICAL_CHILD_KEYS,
@@ -124,6 +125,11 @@ CANONICAL_CHILD_KEYS = frozenset({
 def _canonical_receipt_digest(receipt: dict) -> str:
     if not isinstance(receipt, dict):
         raise PendingDeliveryError("pending-delivery-identity-conflict", "receipt-not-dict")
+    if receipt.get("kind") == "human-gate":
+        encoded = json.dumps(
+            receipt, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
+        return "sha256:" + hashlib.sha256(encoded).hexdigest()
     canonical = {k: v for k, v in receipt.items() if k in CANONICAL_RECEIPT_KEYS}
     children = receipt.get("children")
     if isinstance(children, list):
@@ -165,7 +171,7 @@ def _validate_record(value: object) -> dict:
             value.get("recipient_kind"), _LEGACY_CLAIM_AUTHORITY_DEFAULT
         )
         keys = set(value)
-    if keys != set(REQUIRED_FIELDS):
+    if not set(REQUIRED_FIELDS) <= keys or keys - set(REQUIRED_FIELDS) - RECOVERY_AUDIT_FIELDS:
         raise PendingDeliveryError("delivery-persistence-refused", "record-shape-invalid")
     if value.get("schema_version") != SCHEMA_VERSION:
         raise PendingDeliveryError("delivery-persistence-refused", "schema-version-invalid")
@@ -182,6 +188,18 @@ def _validate_record(value: object) -> dict:
         and value.get("claim_authority") not in CLAIM_AUTHORITIES
     ):
         raise PendingDeliveryError("delivery-persistence-refused", "claim-authority-invalid")
+    audit_present = RECOVERY_AUDIT_FIELDS & keys
+    if audit_present and (
+        audit_present != RECOVERY_AUDIT_FIELDS
+        or value.get("state") != "expired"
+        or not isinstance(value.get("expiry_actor"), str)
+        or not value["expiry_actor"]
+        or not isinstance(value.get("expiry_detail"), str)
+        or not value["expiry_detail"]
+        or not isinstance(value.get("expired_at_ns"), int)
+        or value["expired_at_ns"] < 1
+    ):
+        raise PendingDeliveryError("delivery-persistence-refused", "recovery-audit-invalid")
     return value
 
 
@@ -472,6 +490,21 @@ def reclaim(root: Path, recipient_key: str, delivery_id: str, *, now_ns: int) ->
         return updated
 
 
+def reject_claimed(root: Path, recipient_key: str, delivery_id: str, *, claim_owner: str,
+                   reason: str) -> dict:
+    """Close a claimed delivery after a typed, permanent carrier refusal."""
+    path = record_path(root, recipient_key, delivery_id)
+    with _record_lock(path):
+        value = _read_unlocked(path)
+        if value is None or value.get("state") != "claimed" or value.get("claim_owner") != claim_owner:
+            raise PendingDeliveryError("pending-delivery-claim-refused", "claim-owner-or-state")
+        updated = dict(value)
+        updated["state"] = "rejected"
+        updated["expiry_reason"] = str(reason)[:1024] or "gateway-rejected"
+        _write_unlocked(path, updated)
+        return updated
+
+
 def expire_if_due(
     root: Path,
     recipient_key: str,
@@ -499,6 +532,57 @@ def expire_if_due(
         updated = dict(value)
         updated["state"] = "expired"
         updated["expiry_reason"] = reason
+        _write_unlocked(path, updated)
+        return updated
+
+
+def expire_recovery(
+    root: Path, recipient_key: str, delivery_id: str, *, expected: dict,
+    actor: str, reason: str, apply: bool = True,
+) -> dict:
+    """Atomically expire one exact, unreleasable delivery identity.
+
+    This operator surface intentionally accepts only ``pending`` and
+    ``sent-ambiguous``.  A claimed carrier lease is still live, and therefore
+    cannot be converted by recovery.  Replaying the same audit against an
+    already-expired record is idempotent; any different identity is refused.
+    """
+    if (
+        not isinstance(actor, str) or not isinstance(reason, str)
+        or not actor.strip() or not reason.strip()
+        or len(actor.encode("utf-8")) > 256
+        or len(reason.encode("utf-8")) > 1024
+        or any(ord(char) < 32 for char in actor + reason)
+    ):
+        raise PendingDeliveryError("pending-delivery-recovery-audit-invalid")
+    path = record_path(root, recipient_key, delivery_id)
+    with _record_lock(path):
+        value = _read_unlocked(path)
+        if value is None:
+            raise PendingDeliveryError("pending-delivery-identity-conflict", "record-missing")
+        checks = {
+            "delivery_id": delivery_id,
+            "recipient_digest": recipient_digest(recipient_key),
+            **expected,
+        }
+        for key, expected_value in checks.items():
+            if value.get(key) != expected_value:
+                raise PendingDeliveryError(
+                    "pending-delivery-identity-conflict", f"recovery-{key}"
+                )
+        if value.get("state") == "expired":
+            if (value.get("expiry_actor"), value.get("expiry_detail")) == (actor, reason):
+                return {**value, "idempotent": True}
+            raise PendingDeliveryError("pending-delivery-recovery-refused", "already-expired")
+        if value.get("state") not in {"pending", "sent-ambiguous"}:
+            raise PendingDeliveryError("pending-delivery-recovery-refused", f"state={value.get('state')}")
+        preview = {**value, "eligible": True, "idempotent": False}
+        if not apply:
+            return preview
+        updated = dict(value)
+        updated.update({"state": "expired", "expiry_reason": "operator-recovery",
+                        "expiry_actor": actor, "expiry_detail": reason,
+                        "expired_at_ns": time.time_ns()})
         _write_unlocked(path, updated)
         return updated
 

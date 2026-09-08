@@ -47,6 +47,7 @@ from dispatch_completion_join import (  # noqa: E402
     typed_stage_advance_block,
     validate_delivery_timing,
 )
+import human_gate_receipt  # noqa: E402
 
 
 MAX_FRAME_BYTES = 16 * 1024 * 1024
@@ -60,6 +61,8 @@ MAX_CONTEXT_BYTES = 8 * 1024
 MAX_JOB_REGISTRY_BYTES = 1024
 MAX_LEDGER_BYTES = 4 * 1024 * 1024
 MAX_DELIVERIES = 4096
+HUMAN_GATE_CAPABILITY = "human_gate_delivery"
+HUMAN_GATE_CAPABILITY_VERSION = 1
 MAX_THREAD_LINEAGE = 16
 INTERNAL_ID_PREFIX = "hearting-managed:"
 ID_PATTERN = re.compile(r"^[A-Za-z0-9._:@/+\-=]{1,256}$")
@@ -1127,6 +1130,50 @@ class ManagedGateway:
         self, pending: PendingInternal, message: dict[str, Any]
     ) -> None:
         state = self._threads.setdefault(pending.thread_id, ThreadState())
+        if pending.kind in {"human-gate-start", "human-gate-steer"}:
+            if "error" in message:
+                if pending.kind == "human-gate-steer":
+                    pending.kind = "human-gate-wait"
+                    pending.request_id = ""
+                    pending.deferred_after_steer = True
+                    state.idle_completions.append(pending)
+                    self._start_next_idle_completion_locked(state)
+                else:
+                    self._reject_delivery_locked(
+                        pending, "human-gate-upstream-rejected"
+                    )
+                    state.pending_start_id = None
+                    state.pending_start_owner = ""
+                return
+            if pending.kind == "human-gate-start":
+                state.pending_start_id = None
+                state.pending_start_owner = ""
+                turn_id = turn_id_from_message(message)
+                if not turn_id:
+                    self._reject_delivery_locked(
+                        pending, "human-gate-start-response-invalid"
+                    )
+                    self._fail_queued_locked(
+                        state, "human-gate-start-response-invalid"
+                    )
+                    return
+                state.active_turn_id = turn_id
+                state.active_turn = (
+                    turn_from_message(message) or self._minimal_turn(turn_id)
+                )
+            else:
+                response_turn = turn_id_from_message(message)
+                if response_turn and response_turn != state.active_turn_id:
+                    self._reject_delivery_locked(
+                        pending, "human-gate-steer-id-mismatch"
+                    )
+                    return
+            self._accept_delivery_locked(
+                pending, "steer" if pending.kind == "human-gate-steer" else "start"
+            )
+            if state.steer_ready:
+                self._drain_queued_locked(state)
+            return
         if pending.kind == "completion-start":
             state.pending_start_id = None
             state.pending_start_owner = ""
@@ -1222,6 +1269,8 @@ class ManagedGateway:
                 self._send_manual_steer_locked(
                     item.request_id, item.params, state
                 )
+            elif (item.receipt or {}).get("kind") == human_gate_receipt.KIND:
+                self._send_human_gate_locked(item, state)
             else:
                 self._send_completion_locked(item, state, "steer")
 
@@ -1235,7 +1284,10 @@ class ManagedGateway:
         ):
             return
         pending = state.idle_completions.pop(0)
-        self._send_completion_locked(pending, state, "start")
+        if (pending.receipt or {}).get("kind") == human_gate_receipt.KIND:
+            self._send_human_gate_locked(pending, state)
+        else:
+            self._send_completion_locked(pending, state, "start")
 
     def _fail_queued_locked(
         self, state: ThreadState, reason: str
@@ -1315,9 +1367,17 @@ class ManagedGateway:
                 response = self.status()
             elif value.get("op") == "deliver":
                 response = self.deliver(value)
+            elif value.get("op") == "deliver-human-gate":
+                response = self.deliver_human_gate(value)
             else:
                 raise GatewayError("control-operation-invalid")
-        except (GatewayError, OSError) as exc:
+        except OSError as exc:
+            response = {
+                "schema_version": 1, "status": "retryable",
+                "reason": "control-io-failed",
+                "io_error": f"{type(exc).__name__}: {exc}",
+            }
+        except GatewayError as exc:
             response = {
                 "schema_version": 1,
                 "status": "rejected",
@@ -1361,6 +1421,13 @@ class ManagedGateway:
                 "sibling_thread_ids": list(self._sibling_thread_ids),
                 "binding_source": self._binding_source,
                 "tui_connected": bool(self._tui),
+                "capabilities": {
+                    HUMAN_GATE_CAPABILITY: {
+                        "version": HUMAN_GATE_CAPABILITY_VERSION,
+                        "thread_id": self._binding_thread_id,
+                        "epoch": self._epoch,
+                    }
+                },
             }
 
     @staticmethod
@@ -1604,6 +1671,243 @@ class ManagedGateway:
             },
         }
 
+    def _human_gate_validation(
+        self, request: dict[str, Any]
+    ) -> tuple[str, str, str, dict[str, Any], str, str]:
+        receipt = request.get("receipt")
+        with self._lock:
+            expected_thread = self._binding_thread_id
+            expected_epoch = self._epoch
+        try:
+            normalized = human_gate_receipt.validate(
+                receipt, expected_thread=expected_thread,
+                expected_epoch=expected_epoch,
+            )
+            human_gate_receipt.validate_digest(
+                normalized, request.get("receipt_digest")
+            )
+        except human_gate_receipt.HumanGateReceiptError as exc:
+            raise GatewayError(str(exc)) from exc
+        parent = request.get("parent_attempt_id")
+        if parent != normalized["owner_attempt_id"]:
+            raise GatewayError("human-gate-parent-attempt-mismatch")
+        batch = request.get("sealed_batch_id")
+        if batch != normalized["sealed_batch_id"]:
+            raise GatewayError("human-gate-batch-mismatch")
+        try:
+            human_gate_receipt.validate_receipt(
+                normalized, jobs=Path(normalized["job_registry"]),
+                expected_thread_id=expected_thread, expected_epoch=expected_epoch,
+                expected_attempts={normalized["owner_attempt_id"]},
+                expected_sealed_batch_id=batch,
+                validate_live=True,
+            )
+        except (human_gate_receipt.HumanGateReceiptError, OSError) as exc:
+            raise GatewayError(str(exc)) from exc
+        supplied = request.get("delivery_id")
+        if not isinstance(supplied, str) or not supplied.startswith("hg-dlv-"):
+            raise GatewayError("human-gate-delivery-id-invalid")
+        delivery_id = human_gate_receipt.gateway_delivery_id(normalized)
+        if supplied != delivery_id:
+            raise GatewayError("human-gate-delivery-id-mismatch")
+        return normalized["recipient_thread_id"], parent, batch, normalized, request["receipt_digest"], delivery_id
+
+    def deliver_human_gate(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Deliver a live gate through its own ledger namespace and context key."""
+        try:
+            thread_id, parent, batch, receipt, receipt_digest, delivery_id = self._human_gate_validation(request)
+        except GatewayError as exc:
+            return {"schema_version": 1, "status": "rejected", "reason": str(exc)}
+        identity = {"thread_id": thread_id, "parent_attempt_id": parent,
+                    "sealed_batch_id": batch, "receipt_digest": receipt_digest}
+        with self._lock:
+            # Validation ran against a snapshot outside this mutation lock.
+            # Re-check both binding dimensions before consulting or creating
+            # durable state so reconnect/fork races cannot prepare old work.
+            if (self._binding_thread_id != thread_id
+                    or receipt.get("recipient_epoch") != self._epoch):
+                return {"schema_version": 1, "status": "rejected", "delivery_id": delivery_id,
+                        "reason": "recipient-epoch-mismatch"}
+            existing = self.ledger.get(delivery_id)
+            if existing and existing.get("state") == "accepted":
+                return {"schema_version": 1, "status": "accepted", "delivery_id": delivery_id,
+                        "action": existing.get("action"), "replay": True}
+            if existing and existing.get("state") == "sent":
+                if delivery_id not in self._delivery_pending:
+                    return {"schema_version": 1, "status": "sent-ambiguous", "delivery_id": delivery_id,
+                            "reason": "accept-not-observed-no-resend"}
+                pending = self._delivery_pending[delivery_id]
+            elif (existing and existing.get("state") == "prepared"
+                  and not existing.get("retryable_before_send")):
+                # A validation timeout or reconnect can leave a durable
+                # prepared row while the original requester is still waiting.
+                # Reuse that live object; never append a second queue entry for
+                # the same delivery identity.
+                pending = self._delivery_pending.get(delivery_id)
+                if pending is None:
+                    return {"schema_version": 1, "status": "retryable", "delivery_id": delivery_id,
+                            "reason": "prepared-pending-not-live"}
+            elif existing and existing.get("state") == "rejected":
+                return {"schema_version": 1, "status": "rejected",
+                        "delivery_id": delivery_id,
+                        "reason": existing.get("reason") or "prior-rejection"}
+            else:
+                if self._tui is None or self._upstream is None:
+                    return {"schema_version": 1, "status": "retryable", "delivery_id": delivery_id,
+                            "reason": "tui-not-connected"}
+                if self._binding_thread_id != thread_id:
+                    return {"schema_version": 1, "status": "rejected", "delivery_id": delivery_id,
+                            "reason": "thread-not-owned-by-current-tui"}
+                pending = PendingInternal(kind="human-gate-wait", thread_id=thread_id,
+                                          delivery_id=delivery_id, identity=identity, receipt=receipt)
+                state = self._threads.setdefault(thread_id, ThreadState())
+                try:
+                    self.ledger._transition(delivery_id, "prepared", **identity)
+                except (GatewayError, OSError) as exc:
+                    self._human_gate_storage_failure_locked(
+                        pending, state, existing, "prepared", exc)
+                    return pending.outcome
+                self._delivery_pending[delivery_id] = pending
+                if state.active_turn_id and state.steer_ready:
+                    self._send_human_gate_locked(pending, state)
+                elif state.active_turn_id or state.pending_start_id is not None:
+                    state.queued.append(pending)
+                else:
+                    self._send_human_gate_locked(pending, state)
+        if not pending.event.wait(120.0):
+            return {"schema_version": 1, "status": "sent-ambiguous", "delivery_id": delivery_id,
+                    "reason": "accept-response-timeout-no-resend"}
+        return pending.outcome or {"schema_version": 1, "status": "sent-ambiguous",
+                                   "delivery_id": delivery_id, "reason": "delivery-outcome-missing"}
+
+    def _human_gate_storage_failure_locked(
+        self, pending: PendingInternal, state: ThreadState,
+        previous: dict[str, Any] | None, phase: str, error: Exception,
+    ) -> None:
+        """Retire local waiters without inventing a durable commit or a resend.
+
+        Only a failed, pre-transport transition whose disk row is still absent
+        or prepared can be retried. A post-replace failure may already have
+        sealed sent: that row and every transport attempt remain no-resend.
+        """
+        safe = False
+        durable = None
+        try:
+            if phase != "transport" and (previous or {}).get("state") not in {"sent", "accepted", "rejected"}:
+                durable = DeliveryLedger(self.ledger.path).get(pending.delivery_id)
+                safe = durable is None or (
+                    durable.get("state") == "prepared"
+                    and all(durable.get(k) == v for k, v in pending.identity.items()))
+        except (GatewayError, OSError):
+            pass  # Unreadable commit state never grants a second send.
+        outcome = {
+            "schema_version": 1,
+            "status": "retryable" if safe else "sent-ambiguous",
+            "delivery_id": pending.delivery_id,
+            "reason": "human-gate-send-failed" if phase == "transport" else f"{phase}-ledger-commit-failed",
+            "ledger_commit": "unconfirmed",
+            "ledger_error": f"{type(error).__name__}: {error}",
+        }
+        try:
+            if safe:
+                restored = durable or previous
+                if restored is None:
+                    self.ledger.value["deliveries"].pop(pending.delivery_id, None)
+                else:
+                    self.ledger.value["deliveries"][pending.delivery_id] = {
+                        **restored, "retryable_before_send": True,
+                        "storage_failure": dict(outcome),
+                    }
+            else:
+                row = self.ledger.get(pending.delivery_id)
+                if row is not None:
+                    row.pop("retryable_before_send", None)
+                    row["storage_failure"] = dict(outcome)
+                    self.ledger.value["deliveries"][pending.delivery_id] = row
+            state.queued[:] = [item for item in state.queued if item is not pending]
+            state.idle_completions[:] = [item for item in state.idle_completions if item is not pending]
+            self._delivery_pending.pop(pending.delivery_id, None)
+            key = request_key(pending.request_id) if pending.request_id else None
+            if key is not None:
+                self._internal.pop(key, None)
+                if state.pending_start_id == key:
+                    state.pending_start_id = None
+                    state.pending_start_owner = ""
+            pending.outcome = outcome
+        finally:
+            pending.event.set()
+
+    def _send_human_gate_locked(self, pending: PendingInternal, state: ThreadState) -> None:
+        current_thread = self._binding_thread_id
+        current_epoch = self._epoch
+        if (current_thread != pending.thread_id
+                or pending.receipt.get("recipient_epoch") != current_epoch):
+            # Close every local projection of a prepared request.  The
+            # validation snapshot is deliberately outside the mutation lock;
+            # once the binding changes, the requester must receive one typed
+            # rejection and the stale queue/map/ledger identity must not stay
+            # live for a later retry.
+            pending.outcome = {"schema_version": 1, "status": "rejected",
+                               "delivery_id": pending.delivery_id,
+                               "reason": "recipient-epoch-mismatch"}
+            state.queued[:] = [item for item in state.queued if item is not pending]
+            self._delivery_pending.pop(pending.delivery_id, None)
+            if pending.request_id:
+                self._internal.pop(request_key(pending.request_id), None)
+            existing = self.ledger.get(pending.delivery_id)
+            try:
+                if existing and existing.get("state") == "prepared":
+                    self.ledger._transition(
+                        pending.delivery_id, "rejected", **pending.identity,
+                        reason="recipient-epoch-mismatch",
+                    )
+            except (GatewayError, OSError) as exc:
+                # _transition mutates memory before writing. Preserve the last
+                # confirmed state and an explicit failure, not a successful
+                # rejection. The write may already have replaced the file
+                # before fsync failed: this is NOT a claim of disk rollback.
+                pending.outcome = {
+                    "schema_version": 1, "status": "rejected",
+                    "delivery_id": pending.delivery_id,
+                    "reason": "rejection-ledger-commit-failed",
+                    "rejection_reason": "recipient-epoch-mismatch",
+                    "ledger_commit": "unconfirmed",
+                    "ledger_error": f"{type(exc).__name__}: {exc}",
+                }
+                self.ledger.value["deliveries"][pending.delivery_id] = {
+                    **existing, "rejection_commit_failure": dict(pending.outcome),
+                }
+            finally:
+                # The request is already detached from local maps. Even a
+                # failed ledger commit must wake its waiting caller exactly
+                # here; disconnect cannot find this pending object anymore.
+                pending.event.set()
+            return
+        request_id = self._new_internal_id()
+        pending.request_id = request_id
+        pending.kind = "human-gate-steer" if state.active_turn_id and state.steer_ready else "human-gate-start"
+        key = request_key(request_id)
+        assert key is not None
+        self._internal[key] = pending
+        params = human_gate_receipt.context(pending.receipt, pending.delivery_id)
+        method = "turn/steer" if pending.kind == "human-gate-steer" else "turn/start"
+        if method == "turn/steer":
+            params["expectedTurnId"] = state.active_turn_id
+        else:
+            state.pending_start_id = key
+            state.pending_start_owner = "human-gate"
+        previous = self.ledger.get(pending.delivery_id)
+        try:
+            self.ledger._transition(pending.delivery_id, "sent", action="steer" if method == "turn/steer" else "start", **pending.identity)
+        except (GatewayError, OSError) as exc:
+            self._human_gate_storage_failure_locked(pending, state, previous, "sent", exc)
+            return
+        try:
+            self._upstream_required_locked().write_json({"jsonrpc": "2.0", "id": request_id,
+                                                         "method": method, "params": params})
+        except (GatewayError, OSError) as exc:
+            self._human_gate_storage_failure_locked(pending, state, previous, "transport", exc)
+
     def deliver(self, request: dict[str, Any]) -> dict[str, Any]:
         try:
             (
@@ -1779,6 +2083,7 @@ class ManagedGateway:
     def _accept_delivery_locked(
         self, pending: PendingInternal, action: str
     ) -> None:
+        previous = self.ledger.get(pending.delivery_id)
         try:
             self.ledger._transition(
                 pending.delivery_id,
@@ -1793,13 +2098,18 @@ class ManagedGateway:
                 "action": action,
                 "replay": False,
             }
-        except GatewayError:
+        except (GatewayError, OSError) as exc:
             outcome = {
                 "schema_version": 1,
                 "status": "sent-ambiguous",
                 "delivery_id": pending.delivery_id,
                 "reason": "accepted-ledger-commit-failed",
+                "ledger_commit": "unconfirmed",
+                "ledger_error": f"{type(exc).__name__}: {exc}",
             }
+            if previous is not None:
+                self.ledger.value["deliveries"][pending.delivery_id] = {
+                    **previous, "storage_failure": dict(outcome)}
         self._delivery_pending.pop(pending.delivery_id, None)
         pending.outcome = outcome
         pending.event.set()
@@ -1814,6 +2124,8 @@ class ManagedGateway:
     def _reject_delivery_locked(
         self, pending: PendingInternal, reason: str
     ) -> None:
+        previous = self.ledger.get(pending.delivery_id)
+        failure = None
         try:
             self.ledger._transition(
                 pending.delivery_id,
@@ -1821,21 +2133,28 @@ class ManagedGateway:
                 reason=reason,
                 **pending.identity,
             )
-        except GatewayError:
+        except (GatewayError, OSError) as exc:
             reason = "rejection-ledger-commit-failed"
+            failure = {"ledger_commit": "unconfirmed",
+                       "ledger_error": f"{type(exc).__name__}: {exc}"}
         self._delivery_pending.pop(pending.delivery_id, None)
         pending.outcome = {
             "schema_version": 1,
-            "status": "rejected",
+            "status": "sent-ambiguous" if failure else "rejected",
             "delivery_id": pending.delivery_id,
             "reason": reason,
         }
+        if failure:
+            pending.outcome.update(failure)
+            if previous is not None:
+                self.ledger.value["deliveries"][pending.delivery_id] = {
+                    **previous, "storage_failure": dict(pending.outcome)}
         pending.event.set()
         self.trace(
             "completion-result",
             thread_id=pending.thread_id,
             delivery_id=pending.delivery_id,
-            status="rejected",
+            status=pending.outcome["status"],
             reason=reason,
         )
 

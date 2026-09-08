@@ -541,6 +541,93 @@ class ManagedGatewayTest(unittest.TestCase):
         self.assertEqual(status["thread_ancestors"], ["thread-1"])
         self.assertEqual(status["binding_source"], "fork")
 
+    def _human_gate_request(self) -> dict[str, Any]:
+        receipt_module = GATEWAY.human_gate_receipt
+        jobs = self.root / "state" / "jobs.log"
+        artifact = self.root / "artifacts" / "frame.json"
+        route_file = self.root / "routes" / "route.json"
+        jobs.parent.mkdir(parents=True)
+        artifact.parent.mkdir(parents=True)
+        route_file.parent.mkdir(parents=True)
+        jobs.write_text("fixture\n", encoding="utf-8")
+        artifact.write_text("{}\n", encoding="utf-8")
+        route = {
+            "schema_version": 2,
+            "artifact_root": str(artifact.parent),
+            "nodes": [
+                {"id": "frame", "continuation": {
+                    "kind": "human-gate", "gate": "frame-review"}},
+                {"id": "plan", "depends_on": ["frame"]},
+            ],
+            "human_gate_bindings": [
+                {"gate": "frame-review", "node": "plan", "position": "entry"}
+            ],
+        }
+        from route_identity import route_hash, route_id_from_hash
+        route["route_hash"] = route_hash(route)
+        route["route_id"] = route_id_from_hash(route["route_hash"])
+        route_file.write_text(json.dumps(route), encoding="utf-8")
+        jobs.write_text(
+            "2026-09-07T00:00:00Z\topen\t/repo\t/repo\towner\t"
+            "attempt_schema_version=2,dispatch_depth=1,transport=headless,"
+            "execution_surface=registered-headless,registered_worker=1,"
+            "worker_type=owner,unit=_kernel/owner,launch_started=1,"
+            "launch_claimed=1,parent_completion_delivery=codex-managed-gateway,"
+            "attempt_id=att-owner,parent_sid=thread-1,owner_route_id="
+            + route["route_id"] + ",owner_route_hash=" + route["route_hash"]
+            + ",owner_route_file=" + str(route_file)
+            + ",managed_sealed_batch_id=batch-owner\n",
+            encoding="utf-8",
+        )
+        journal = jobs.parent / "workflow" / route["route_id"] / "journal.jsonl"
+        journal.parent.mkdir(parents=True)
+        pending_id = "delivery-" + "a" * 32
+        pending_path = GATEWAY.human_gate_receipt.pending_delivery.record_path(
+            jobs.parent, "thread-1", pending_id
+        )
+        journal.write_text(json.dumps({
+            "workflow_state": "BLOCKED_HUMAN_GATE", "at": "2026-09-07T00:00:00Z",
+            "evidence": {"gate": "frame-review", "artifact": str(artifact),
+                         "delivery": str(pending_path), "interview": False,
+                         "questions": 0, "release_authority": "depth-0"},
+        }) + "\n", encoding="utf-8")
+        status = control(self.control, {"schema_version": 1, "op": "status"})
+        receipt = receipt_module.make_receipt(
+            route_file=route_file, route=route, route_node="frame",
+            gate="frame-review", gate_epoch=1, owner_attempt_id="att-owner",
+            sealed_batch_id="batch-owner", jobs=jobs,
+            recipient_thread_id="thread-1", recipient_epoch=status["epoch"],
+            artifact_path=artifact, release_authority="depth-0",
+            interview=False, questions=0, pending_delivery_id=pending_id,
+        )
+        return {
+            "schema_version": 1, "op": "deliver-human-gate",
+            "thread_id": "thread-1", "parent_attempt_id": "att-owner",
+            "sealed_batch_id": "batch-owner",
+            "delivery_id": receipt_module.gateway_delivery_id(receipt),
+            "receipt_digest": receipt_module.digest(receipt), "receipt": receipt,
+        }
+
+    def test_human_gate_capability_and_exact_delivery_are_distinct_and_idempotent(self) -> None:
+        status = control(self.control, {"schema_version": 1, "op": "status"})
+        self.assertEqual(status["capabilities"]["human_gate_delivery"], {
+            "version": 1, "thread_id": "thread-1", "epoch": status["epoch"],
+        })
+        request = self._human_gate_request()
+        first = control(self.control, request)
+        self.assertEqual(first["status"], "accepted")
+        self.assertTrue(first["delivery_id"].startswith("hg-dlv-"))
+        replay = control(self.control, request)
+        self.assertEqual((replay["status"], replay["replay"]), ("accepted", True))
+        tampered = dict(request, delivery_id="hg-dlv-" + "0" * 64)
+        rejected = control(self.control, tampered)
+        self.assertEqual(rejected["reason"], "human-gate-delivery-id-mismatch")
+        starts = [message for message in self.server.messages
+                  if message.get("method") == "turn/start"]
+        context = starts[-1]["params"]["additionalContext"]
+        self.assertIn("hearting-human-gate", context)
+        self.assertNotIn("hearting-completion", context)
+
     def test_sibling_thread_start_does_not_move_binding(self) -> None:
         self.server.next_start_id = "thread-sibling"
         self.client.request("thread/start", {})

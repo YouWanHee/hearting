@@ -455,8 +455,9 @@ decision, never two independently toggled ones.
 
 ### §5.10a. Completion Delivery Clarifications (SD-92/97)
 
-- **Human gate in flight (SD-123 (8), SD-129).** While the armed `asyncRewake`
-  hook waits on an open owner attempt it also watches, once per interval, for
+- **Human gate in flight (SD-123 (8), SD-129).** While the armed Claude
+  `asyncRewake` hook or the runtime-owned Codex completion sidecar waits on an
+  open owner attempt it also watches, once per interval, for
   a pending gate record addressed to this session and raised by that attempt;
   when one appears the hook spends its single wake immediately (exit 2,
   `owner=alive-waiting`), leaves the record `sent-ambiguous` (the wake is
@@ -497,6 +498,24 @@ decision, never two independently toggled ones.
   topology merely declares is not a mandatory step. The owner itself waits on `workflow-supervisor.py await-release`
   (bounded, read-only), and every launch surface refuses to start a node whose
   entry gate is not released (`human-gate-unreleased`/`human-gate-not-raised`).
+  A Codex delivery uses a distinct strict `human-gate` receipt and `hg-dlv-*`
+  gateway identity. It binds the route id/hash/file, gate raise epoch, exact
+  live owner attempt and sealed batch, immutable registry, recipient thread and
+  gateway epoch, artifact, journal, and release authority before claim; the
+  gateway validates the same receipt before one start/steer and never interprets
+  it as a completion receipt.
+  If a malformed historical route or terminal owner makes a `pending` or
+  `sent-ambiguous` record impossible to release, an operator may preview its
+  cancellation and then repeat with `--apply`:
+  `python3 utilities/workflow-supervisor.py recover-gate-delivery --route
+  <route.json> --gate <gate> --delivery-id <delivery-id> --recipient
+  <parent-session-id> --source-attempt-id <att-id> --raise-epoch <n> --actor
+  <operator-id> --reason <audit-reason> --jobs <canonical-jobs.log> [--apply]`.
+  Recovery accepts only that exact route/gate/epoch/delivery/recipient/source
+  tuple and a terminal registered owner; it rejects a claimed carrier, a live
+  owner or different live gate, records an audited `expired` state atomically,
+  and never writes a release, deletes the route/registry/marker/record, or turns
+  the source attempt into PASS.
 - The interactive Claude `asyncRewake` bridge recognizes both an exact
   `dispatch-owner --start` and the quick one-shot
   `dispatch-node --action start` surface. Neither command is wake authority by
@@ -552,6 +571,22 @@ graph, terminal nodes, and human gates in `capabilities/topologies.json`; it
 never reimplements continuation. The supervisor is a non-model process: it
 holds no model turn, opens no dispatch depth, and has no launch authority
 beyond the successor its sealed route already declares.
+
+**Registry selection is workflow-ledger authority.** When a supervisor command
+or any adapter launch fence receives an explicit `--jobs`, the ledger is always
+`<jobs-parent>/workflow/<route-id>` even if the raising and releasing actors
+inherit different `AGENT_WORKFLOW_ROOT` or `AGENT_DISPATCH_JOBS` values. Every
+explicit registry must already be an absolute, readable, regular, non-symlink
+file; an invalid authority is a typed refusal before any ledger directory is
+created. Every
+route-scoped JSON result reports `ledger_root`, `ledger_root_source`,
+`workflow_root`, and `jobs_path`. Without explicit jobs, the legacy explicit
+`AGENT_WORKFLOW_ROOT` remains authoritative, then inherited
+`AGENT_DISPATCH_JOBS`, then the installed agent-home fallback; callers may no
+longer mistake a silent `CREATED` result from another root for the route state.
+The strict Codex `gate --block` carrier is narrower: it must receive an explicit
+`--jobs` before it mutates the ledger or creates delivery; legacy Claude and
+read-only no-jobs status/await/release compatibility remains available.
 
 **Advance evidence is four-part and fail-closed.** Before a supervisor may
 start a successor it proves, for the predecessor: exact process identity
