@@ -541,6 +541,56 @@ class RestoreTest(B.ProducerTestBase):
         self.assertEqual([p.read_bytes() for p in self.files], [self.content[p] for p in self.files])
         self.unchanged()
 
+    def separate_request(self):
+        self.request_path = Path(self._tmp.name) / 'request-only/request.json'
+        self.request_path.parent.mkdir()
+        self.plan()
+
+    def dry_run_tree(self):
+        result = {}
+        for p in [self.root, *self.root.rglob('*'), self.request_path.parent, self.request_path]:
+            st = p.lstat()
+            data = p.read_bytes() if stat.S_ISREG(st.st_mode) else (
+                os.readlink(p) if stat.S_ISLNK(st.st_mode) else None)
+            result[str(p)] = (st.st_dev, st.st_ino, st.st_mode, st.st_mtime_ns, data)
+        return result
+
+    def separate_request_resume(self, driver):
+        self.separate_request()
+        r = self.apply(driver=driver)
+        self.assertEqual(r.returncode, 86, r.stderr.decode())
+        before = self.dry_run_tree()
+        present = {p: self.file_identity(p) for p in self.files if p.exists()}
+        r = self.apply(dry=True)
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        self.assertEqual(json.loads(r.stdout)['writes'], 0)
+        self.assertEqual(self.dry_run_tree(), before)
+        r = self.apply()
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        for p, expected in present.items():
+            self.assertEqual(self.file_identity(p), expected)
+        before = self.dry_run_tree()
+        r = self.apply(dry=True)
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        self.assertEqual(json.loads(r.stdout)['writes'], 0)
+        self.assertEqual(self.dry_run_tree(), before)
+        self.unchanged()
+
+    def test_request_drift_between_dry_run_snapshots(self):
+        self.separate_request()
+        r = self.apply(dry=True, driver='second-request-bytes')
+        self.assertEqual(r.returncode, 65, r.stderr.decode())
+        self.assertIn('input-drift', r.stderr.decode())
+        self.assertFalse(any(p.exists() for p in self.files))
+        self.unchanged()
+
+    def test_request_ancestor_replacement_between_dry_run_snapshots(self):
+        self.separate_request()
+        r = self.apply(dry=True, driver='second-request-ancestor')
+        self.assertEqual(r.returncode, 65, r.stderr.decode())
+        self.assertFalse(any(p.exists() for p in self.files))
+        self.unchanged()
+
 
 
 def driver(argv):
@@ -555,6 +605,22 @@ def driver(argv):
     Path(document['root']['path']).resolve().relative_to(fixture)
     Path(document['archive']['path']).resolve().relative_to(fixture)
     original_link = S._publish_link
+    original_snapshot_init = S.Snapshot.__init__
+    snapshot_count = 0
+    def snapshot_init(snapshot):
+        nonlocal snapshot_count
+        original_snapshot_init(snapshot)
+        snapshot_count += 1
+        if snapshot_count == 2 and name == 'second-request-bytes':
+            request.write_bytes(request.read_bytes() + b' ')
+        if snapshot_count == 2 and name == 'second-request-ancestor':
+            parent = request.parent
+            prior = request.read_bytes()
+            # destructive-ok: reason=inject ancestor replacement in private synthetic request; boundary=fixture request-only directory and its sibling
+            parent.rename(parent.with_name('request-only-moved'))
+            parent.mkdir()
+            request.write_bytes(prior)
+    S.Snapshot.__init__ = snapshot_init
     def link(a, b, c, d):
         if name == 'unsupported':
             raise OSError(errno.EXDEV, 'synthetic unsupported filesystem')
@@ -623,6 +689,12 @@ for _kind in ('request', 'prepared', 'observations', 'results'):
             self.assertEqual(self.file_identity(p), value)
         self.unchanged()
     setattr(RestoreTest, 'test_record_publication_crash_' + _kind, _record_test)
+
+for _driver in ('crash-after-prepared', 'crash-after-link', 'record-crash-request',
+                'record-crash-prepared', 'record-crash-observations', 'record-crash-results'):
+    def _separate_test(self, driver=_driver):
+        self.separate_request_resume(driver)
+    setattr(RestoreTest, 'test_separate_request_' + _driver.replace('-', '_'), _separate_test)
 
 
 if __name__ == '__main__':

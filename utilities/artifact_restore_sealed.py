@@ -1020,6 +1020,8 @@ def run(args):
             return dict(status='verified', files=states)
         if args.dry_run:
             with contextlib.closing(Snapshot()) as second:
+                second_raw, _ = second.source('request', absolute(args.request))
+                require(second_raw == raw, 'input-drift', 'request')
                 validate_request(document, second)
                 require(work_binding(document, args.work_cycle, second.tree) == binding,
                         'work-cycle-not-open', 'drift')
@@ -1033,6 +1035,8 @@ def run(args):
                        snapshot=initial, index=None)
         with admission_lock(initial.tree, document['root']['path']):
             with contextlib.closing(Snapshot()) as second:
+                second_raw, _ = second.source('request', absolute(args.request))
+                require(second_raw == raw, 'input-drift', 'request')
                 validate_request(document, second)
                 second.verify()
             initial.verify(); records.verify(); check_work(document, binding, initial.tree)
