@@ -92,6 +92,172 @@ class PickPrimaryTest(unittest.TestCase):
         self.assertTrue(w8.pick_primary(rows)["locator"].endswith("/x/a.md"))
 
 
+class HistoricalMappingTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.b = w8.Bundle.__new__(w8.Bundle)
+        self.b.root = self.root
+        self.b.dir = self.root / "output"
+        self.b.manifest_inputs = {}
+        self.b.w7_evidence = self.root / "w7"
+        self.b.w7c_run = self.root / "w7c"
+        self.b.retirement_run = self.root / "retirement"
+        self.b.backup_tar = None
+        for folder in (self.b.w7_evidence, self.b.w7c_run):
+            folder.mkdir()
+        self.population = []
+        for i, identity in enumerate(("manifest", "manifest", "shared-revision", "excluded")):
+            locator = f"current/{i}/report.md"
+            path = self.root / locator
+            path.parent.mkdir(parents=True)
+            path.write_text(f"immutable-{i}")
+            self.population.append({"locator": locator, "content_digest": w8.sha_file(path),
+                                    "byte_size": path.stat().st_size, "identity_class": identity,
+                                    "artifact_id": f"art_{i}" if identity == "manifest" else None,
+                                    "artifact_revision_id": f"arev_{i}" if identity == "manifest" else None,
+                                    "shared_reference_revision_id": "rrev_old" if identity == "shared-revision" else None,
+                                    **({"reason": "hidden-component"} if identity == "excluded" else {})})
+        self.w7 = [{"source_locator": "legacy/same", "target_locator": "historical/0", "kind": "file"}]
+        self.w7c = [{"source_locator": "legacy/same", "target_locator": "historical/1", "kind": "file",
+                     "sha256": self.population[1]["content_digest"][7:]}]
+        self.links = [{"source_locator": f"historical/{i}", "target_locator": row["locator"], "kind": "file"}
+                      for i, row in enumerate(self.population)]
+        # 최신 source 연결을 사용하면 두 역사 identity가 하나로 잘못 합쳐진다.
+        self.links.append({"source_locator": "legacy/same", "target_locator": self.population[1]["locator"], "kind": "file"})
+        (self.b.w7_evidence / "backup-seal.json").write_text("{}")
+        (self.b.w7_evidence / "apply-receipt.json").write_text("{}")
+        (self.b.w7_evidence / "applied-inverse.jsonl").write_text("")
+        self.seal_maps()
+
+    def seal_maps(self):
+        entries = []
+        for path, rows in ((self.b.w7_evidence / "compatibility-map.jsonl", self.w7),
+                           (self.b.w7c_run / "compatibility-map.jsonl", self.w7c),
+                           (self.root / "relayout.jsonl", self.links)):
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            entries.append({"path": str(path), "sha256": w8.sha_file(path)[7:], "rows": len(rows)})
+        compat = w8.C.compat_path(self.root)
+        compat.parent.mkdir(parents=True, exist_ok=True)
+        compat.write_text(json.dumps({"maps": entries}))
+        journal = [{**row, "sha256": self.population[int(row["target_locator"].split("/")[-1])]["content_digest"][7:]}
+                   for row in self.w7]
+        (self.b.w7_evidence / "applied-journal.jsonl").write_text("".join(json.dumps(row) + "\n" for row in journal))
+
+    def test_historical_targets_preserve_conflict_and_exact_identity(self):
+        self.b.prepare_mapping(self.population)
+        rows, conflicts = self.b.legacy_mapping(self.population)
+        self.assertEqual([r["target_locator"] for r in rows], [r["locator"] for r in self.population[:2]])
+        self.assertEqual([r["artifact_revision_id"] for r in rows], ["arev_0", "arev_1"])
+        self.assertEqual(conflicts, [{"legacy_locator": "legacy/same", "maps": ["w7-e2e3", "w7c-delta"]}])
+        handoff = self.b.relocation_handoff(self.population)
+        self.assertEqual(handoff["exceptions"]["map_targets_without_manifest_identity_count"], 0)
+        self.assertEqual(handoff["locator_snapshot"]["population_sha256"], self.b.population_digest)
+        for row in rows:
+            origin = next(m for m in handoff["maps"] if m["name"] == row["map"])
+            self.assertEqual(row["provenance"]["map_sha256"], origin["sha256"])
+            self.assertEqual(row["provenance"]["map_row"], 1)
+
+    def test_shared_and_excluded_keep_original_identities(self):
+        for i in (2, 3):
+            self.w7.append({"source_locator": f"legacy/{i}", "target_locator": f"historical/{i}", "kind": "file"})
+        self.seal_maps()
+        self.b.prepare_mapping(self.population)
+        rows = {r["legacy_locator"]: r for r in self.b.legacy_mapping(self.population)[0]}
+        self.assertEqual(rows["legacy/2"]["shared_reference_revision_id"], "rrev_old")
+        self.assertIsNone(rows["legacy/2"]["artifact_id"])
+        self.assertEqual(rows["legacy/3"]["state"], "excluded")
+
+    def test_all_350_conflicts_survive_even_with_conflicting_latest_source_rows(self):
+        self.w7 = [{**self.w7[0], "source_locator": f"legacy/{i}"} for i in range(350)]
+        self.w7c = [{**self.w7c[0], "source_locator": f"legacy/{i}"} for i in range(350)]
+        self.links.extend({"source_locator": "legacy/same", "target_locator": self.population[i]["locator"]}
+                          for i in (0, 1))
+        self.seal_maps()
+        self.b.prepare_mapping(self.population)
+        rows, conflicts = self.b.legacy_mapping(self.population)
+        self.assertEqual(len(rows), 700)
+        self.assertEqual(len(conflicts), 350)
+        self.assertTrue(all(r["maps"] == ["w7-e2e3", "w7c-delta"] for r in conflicts))
+        self.assertEqual({r["artifact_revision_id"] for r in rows}, {"arev_0", "arev_1"})
+
+    def test_mapping_outside_selected_population_refuses(self):
+        with self.assertRaisesRegex(ValueError, "mapping-target-outside-population"):
+            self.b.prepare_mapping(self.population[1:])
+
+    def test_snapshot_matches_official_exact_present_and_ancestor_lookup(self):
+        self.links.append({"source_locator": "ancestor", "target_locator": "current/0", "kind": "dir"})
+        self.seal_maps()
+        snap = w8.LocatorSnapshot(self.root)
+        for locator in ("historical/0", "historical/1", "current/2/report.md", "ancestor/report.md"):
+            expected = w8.C.resolve_legacy(self.root, locator)
+            target, provenance = snap.resolve(locator)
+            self.assertEqual((target, provenance["resolution"]), (expected["target"], expected["resolution"]))
+        self.assertEqual(w8.C.resolve_legacy(self.root, "missing")["resolution"], "unresolved")
+        with self.assertRaisesRegex(ValueError, "historical-target-unresolved"):
+            snap.resolve("missing")
+
+    def test_missing_manifest_member_refuses_before_any_output(self):
+        (self.root / self.population[1]["locator"]).unlink()
+        self.b.stable_population = lambda: self.population
+        with self.assertRaisesRegex(ValueError, "population-target-missing"):
+            self.b.build()
+        self.assertFalse(self.b.dir.exists())
+
+    def test_map_drift_and_unregistered_original_refuse(self):
+        path = self.root / "relayout.jsonl"
+        path.write_text(path.read_text() + "\n")
+        with self.assertRaisesRegex(ValueError, "compat-map-drift"):
+            self.b.prepare_mapping(self.population)
+        self.seal_maps()
+        w8.C.compat_path(self.root).write_text('{"maps": []}')
+        with self.assertRaisesRegex(ValueError, "original-map-not-in-compat"):
+            self.b.prepare_mapping(self.population)
+
+    def test_snapshot_and_population_changes_refuse(self):
+        self.b.prepare_mapping(self.population)
+        path = self.root / "relayout.jsonl"
+        path.write_text(path.read_text() + "\n")
+        with self.assertRaisesRegex(ValueError, "locator-snapshot-drift"):
+            self.b.mapping_snapshot.verify_unchanged()
+        self.population[0]["artifact_id"] = "wrong"
+        with self.assertRaisesRegex(ValueError, "mapping-population-changed"):
+            self.b.legacy_mapping(self.population)
+
+    def test_actual_and_historical_digest_drift_refuse(self):
+        path = self.root / self.population[0]["locator"]
+        path.write_text("changed")
+        with self.assertRaisesRegex(ValueError, "population-target-drift"):
+            self.b.prepare_mapping(self.population)
+        self.population[0].update(content_digest=w8.sha_file(path), byte_size=path.stat().st_size)
+        with self.assertRaisesRegex(ValueError, "historical-target-digest-mismatch"):
+            self.b.prepare_mapping(self.population)
+
+    def test_unsafe_and_ambiguous_map_targets_refuse(self):
+        self.links.append({"source_locator": "historical/0", "target_locator": "current/1/report.md"})
+        self.seal_maps()
+        with self.assertRaisesRegex(ValueError, "compat-map-ambiguous"):
+            self.b.prepare_mapping(self.population)
+        self.links[-1]["source_locator"] = "escape"
+        self.links[-1]["target_locator"] = "../outside"
+        self.seal_maps()
+        with self.assertRaisesRegex(ValueError, "locator-unsafe"):
+            self.b.prepare_mapping(self.population)
+
+    def test_target_symlink_or_ancestor_symlink_refuses(self):
+        path = self.root / self.population[0]["locator"]
+        path.unlink()
+        path.symlink_to(self.root / self.population[1]["locator"])
+        with self.assertRaisesRegex(ValueError, "locator-symlink"):
+            self.b.prepare_mapping(self.population)
+        path.unlink()
+        path.parent.rmdir()
+        path.parent.symlink_to(self.root / "current/1", target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "locator-symlink"):
+            self.b.prepare_mapping(self.population)
+
+
 # 발급 CLI는 실제 임시 producer cycle에만 쓴다. 운영 root/DB/원장은 사용하지 않는다.
 fixture_spec = importlib.util.spec_from_file_location(
     "w16_producer_fixture", ROOT / "utilities" / "artifact_producer.test.py")
@@ -168,6 +334,25 @@ class BundleBoundaryCLITest(producer_fixture.ProducerTestBase):
     def test_invalid_option_refuses_before_output(self):
         bundle, result = self.issue("invalid", "--include-w16-namespace-delete=true", success=False)
         self.assertEqual(result.returncode, 2)
+        self.assertFalse(bundle.exists())
+
+    def test_cli_refuses_missing_sealed_member_before_bundle_creation(self):
+        record = w8.P.read_cycle_record(self.root, self.source_cycle)
+        directory = w8.P.cycle_dir(self.root, record["campaign_id"], self.source_cycle)
+        doc = w8.read_json(directory / "manifest.json")
+        (directory / doc["artifact_revisions"][0]["locator"]["path"]).unlink()
+        bundle, result = self.issue("missing-target", success=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("population-target-missing", result.stderr)
+        self.assertFalse(bundle.exists())
+
+    def test_cli_refuses_manifest_raw_digest_drift(self):
+        record = w8.P.read_cycle_record(self.root, self.source_cycle)
+        path = w8.P.cycle_dir(self.root, record["campaign_id"], self.source_cycle) / "manifest.json"
+        path.write_bytes(path.read_bytes() + b"\n")
+        bundle, result = self.issue("manifest-drift", success=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("manifest-binding-mismatch", result.stderr)
         self.assertFalse(bundle.exists())
 
     def test_sealed_bundle_cannot_be_reissued_with_w16(self):
