@@ -975,21 +975,30 @@ class TestCapabilityIntegration(WorkflowFixture):
         """A composed observe → condition → approved-action → verify graph."""
         compose = _load("compose_route", "utilities/compose-route.py")
         topology = TOPO.load_registry()
+        # SD-88: composed ad-hoc stages must carry the two-axis demand; the
+        # fixture supplies it explicitly instead of a role-derived default.
+        demand = {"schema_version": 1, "judgment_requirement": "predetermined",
+                  "execution_scope": "short-local",
+                  "judgment_reason": "Monitor fixture with a fixed condition.",
+                  "execution_reason": "One bounded fixture action.",
+                  "evidence_refs": ["fixture:monitor-workflow"]}
         units = [
             {"id": "observe", "unit": "qa/data-curate", "kind": "map-worker",
              "write_scope": ["shards/observe/**"], "outputs": ["shards/observe/state.json"],
              "gate": "note-scan", "continuation": {"kind": "monitor",
-                                                   "monitor": "external-state-change"}},
+                                                   "monitor": "external-state-change"},
+             "profile_demand": demand},
             {"id": "act", "unit": "dev/backend", "depends_on": ["observe"],
              "write_scope": ["source/**"], "outputs": ["source-diff"],
-             "gate": "code-execute"},
+             "gate": "code-execute", "profile_demand": demand},
             # F3: a node's path-shaped outputs must land inside that node's own
             # write_scope. `reviews/monitor-verdict.json` is a sibling of
             # `reviews/monitor/`, not a member of it, so the composed recipe
             # declared an output the verify node could not write.
             {"id": "verify", "unit": "qa/test", "depends_on": ["act"],
              "write_scope": ["reviews/monitor/**"],
-             "outputs": ["reviews/monitor/verdict.json"], "gate": "code-test"},
+             "outputs": ["reviews/monitor/verdict.json"], "gate": "code-test",
+             "profile_demand": demand},
         ]
         recipe = compose.build_recipe(
             "autopilot-code", "dev", units, topology_class="staged",

@@ -133,9 +133,10 @@ class ModelProfileTest(unittest.TestCase):
     def test_portable_profiles_resolve_to_declared_adapter_budgets(self):
         expected = {
             # Five profiles use the configured judgment and execution budgets;
-            # Claude keeps five operating points across three concrete models.
+            # Claude keeps four operating points across two dispatch-eligible
+            # models (Fable is depth-0 main-only, SD-85, so deep rides opus).
             "claude": {
-                "deep": ("fable", "high"),
+                "deep": ("opus", "high"),
                 "balanced-deep": ("opus", "high"),
                 "balanced": ("sonnet", "high"),
                 "light": ("sonnet", "medium"),
