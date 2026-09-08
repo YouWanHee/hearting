@@ -2266,15 +2266,19 @@ class ProcessTableScan:
 
     Shared by every observation of one observer pass (`process_table_scan_scope`).
     ``incomplete_reason`` follows `attempt_tagged_descendants`' rules for the
-    tag index; ``group_incomplete_reason`` follows `process_group_observation`'s
-    rules for the group index -- the two probes skip and report different
-    failures, so the walk keeps both verdicts side by side.
+    tag index. ``group_errors`` follows `process_group_observation`'s rules: each
+    entry is ``(walk_order, pgid_or_None, reason)`` -- ``None`` for a failure the
+    single-shot probe hits before it can compare the group (unreadable ``stat``,
+    unparsable pgid), the pgid for one it hits only while collecting that group
+    (a parsed pgid whose start field is missing). A group query takes the last
+    entry in walk order that applies to it, exactly as the single-shot loop's
+    ``incomplete_reason`` is the last one it overwrote.
     """
 
     members_by_attempt: dict[str, tuple[tuple[int, str, str], ...]]
     members_by_pgid: dict[int, tuple[tuple[int, str, str], ...]]
     incomplete_reason: str = ""
-    group_incomplete_reason: str = ""
+    group_errors: tuple[tuple[int, int | None, str], ...] = ()
     error: str = ""
 
 
@@ -2287,46 +2291,59 @@ def scan_process_table() -> ProcessTableScan:
     """Walk ``/proc`` once and index live processes by attempt tag and by pgid.
 
     Per-process reads, skips, and incomplete reasons are exactly those of the
-    two single-shot probes: the ``stat`` read follows `process_group_observation`
-    (a permission failure there is an incomplete group scan), the ``environ``
-    read follows `attempt_tagged_descendants` (a permission failure there is
-    another uid's process and is skipped). The tag value is recorded for every
-    process instead of being compared with one attempt id; parent-leader
-    exclusion is per attempt and is applied later, in
-    `_tagged_descendants_from_scan`.
+    two single-shot probes, evaluated independently on the same raw ``stat``
+    line: the tag index needs ``tail[0]``/``tail[19]`` and then ``environ``
+    (a permission failure is another uid's process and is skipped); the group
+    index needs ``int(tail[2])`` first (a failure there is a group-wide
+    incomplete walk, like an unreadable ``stat``) and ``tail[19]`` only for the
+    group that pgid names. The tag value is recorded for every process instead
+    of being compared with one attempt id; parent-leader exclusion is per
+    attempt and is applied later, in `_tagged_descendants_from_scan`.
     """
 
     prefix = f"{ATTEMPT_DESCENDANT_ENV}=".encode()
     by_attempt: dict[str, list[tuple[int, str, str]]] = {}
     by_pgid: dict[int, list[tuple[int, str, str]]] = {}
     incomplete_reason = ""
-    group_incomplete_reason = ""
+    group_errors: list[tuple[int, int | None, str]] = []
     try:
         entries = tuple(Path("/proc").iterdir())
     except OSError as exc:
         return ProcessTableScan({}, {}, error=f"procfs-enumeration:{exc.errno or 'error'}")
-    for entry in entries:
+    for order, entry in enumerate(entries):
         if not entry.name.isdigit():
             continue
         try:
             raw = (entry / "stat").read_text(encoding="utf-8")
-            tail = raw[raw.rfind(")") + 2 :].split()
-            state, start, pgid = tail[0], tail[19], int(tail[2])
         except FileNotFoundError:
             continue
         except OSError as exc:
             if exc.errno in {errno.ENOENT, errno.ESRCH}:
                 continue
-            group_incomplete_reason = f"procfs-member:{entry.name}:{exc.errno or 'error'}"
+            group_errors.append((order, None, f"procfs-member:{entry.name}:{exc.errno or 'error'}"))
             if exc.errno not in {errno.EACCES, errno.EPERM}:
                 incomplete_reason = f"procfs-environ:{entry.name}:{exc.errno or 'error'}"
             continue
+        tail = raw[raw.rfind(")") + 2 :].split()
+        pid = int(entry.name)
+        # Group index: the single-shot probe compares `int(tail[2])` before it
+        # touches anything else, so a pgid it cannot parse is an incomplete walk
+        # for every group; a missing start field is seen only by that group.
+        try:
+            pgid = int(tail[2])
         except (IndexError, ValueError):
-            group_incomplete_reason = f"procfs-member:{entry.name}:malformed"
+            group_errors.append((order, None, f"procfs-member:{entry.name}:malformed"))
+        else:
+            try:
+                by_pgid.setdefault(pgid, []).append((pid, tail[19], tail[0]))
+            except IndexError:
+                group_errors.append((order, pgid, f"procfs-member:{entry.name}:malformed"))
+        # Tag index: state and start, zombie skip, then environ.
+        try:
+            state, start = tail[0], tail[19]
+        except IndexError:
             incomplete_reason = f"procfs-member:{entry.name}:malformed"
             continue
-        pid = int(entry.name)
-        by_pgid.setdefault(pgid, []).append((pid, start, state))
         if state == "Z":
             continue
         try:
@@ -2338,7 +2355,10 @@ def scan_process_table() -> ProcessTableScan:
                 continue
             incomplete_reason = f"procfs-environ:{entry.name}:{exc.errno or 'error'}"
             continue
-        for item in environ.split(b"\0"):
+        # `tag in environ.split(...)` names a process once however many times the
+        # same entry repeats; a process carrying two different tag values is
+        # found by either single-shot query, so it is indexed under both.
+        for item in dict.fromkeys(environ.split(b"\0")):
             if item.startswith(prefix):
                 tag_value = item[len(prefix):].decode("utf-8", "replace")
                 by_attempt.setdefault(tag_value, []).append((pid, start, state))
@@ -2346,7 +2366,7 @@ def scan_process_table() -> ProcessTableScan:
         {tag: tuple(sorted(rows, key=lambda member: member[0])) for tag, rows in by_attempt.items()},
         {pgid: tuple(sorted(rows, key=lambda member: member[0])) for pgid, rows in by_pgid.items()},
         incomplete_reason,
-        group_incomplete_reason,
+        tuple(group_errors),
     )
 
 
@@ -2401,10 +2421,14 @@ def _process_group_from_scan(scan: ProcessTableScan, pgid: int) -> ProcessGroupO
     if scan.error:
         return ProcessGroupObservation("unverifiable", reason=scan.error)
     ordered = scan.members_by_pgid.get(pgid, ())
+    incomplete_reason = ""
+    for _order, scope_pgid, reason in scan.group_errors:
+        if scope_pgid is None or scope_pgid == pgid:
+            incomplete_reason = reason          # last applicable entry in walk order wins
     if any(state != "Z" for _pid, _start, state in ordered):
-        return ProcessGroupObservation("populated", ordered, scan.group_incomplete_reason)
-    if scan.group_incomplete_reason:
-        return ProcessGroupObservation("unverifiable", ordered, scan.group_incomplete_reason)
+        return ProcessGroupObservation("populated", ordered, incomplete_reason)
+    if incomplete_reason:
+        return ProcessGroupObservation("unverifiable", ordered, incomplete_reason)
     return ProcessGroupObservation("empty", ordered)
 
 

@@ -118,6 +118,27 @@ class ReaderScopeTest(unittest.TestCase):
             self.assertEqual(len(again), 1)
             self.assertNotIn("poison", again[0][1])
 
+    def test_alias_spelling_of_one_root_keeps_its_own_paths(self):
+        """review 2026-09-08 minor 3: the memo is keyed by the physical root but must
+        return paths under the spelling each caller used, as the unmemoised call does."""
+        with tempfile.TemporaryDirectory() as tmp:
+            real = _build_root(Path(tmp) / "real")
+            alias = Path(tmp) / "alias"
+            alias.symlink_to(real, target_is_directory=True)
+            plain = reader.cycle_bucket_dirs(alias, "plans")
+            counter = _Counter(reader.artifact_locator.scan_index)
+            with mock.patch.object(reader.artifact_locator, "scan_index", counter):
+                with reader.read_scope():
+                    first = reader.cycle_bucket_dirs(real, "plans")
+                    second = reader.cycle_bucket_dirs(alias, "plans")
+                    self.assertEqual(reader.glob_bucket(alias, "plans", "*_hot-path"),
+                                     reader.glob_bucket(alias, "plans", "*_hot-path"))
+            self.assertEqual(counter.calls, 1)
+            self.assertEqual(second, plain)
+            self.assertTrue(str(first[0][0]).startswith(str(real)))
+            self.assertTrue(str(second[0][0]).startswith(str(alias)))
+            self.assertEqual(first[0][0].resolve(), second[0][0].resolve())
+
     def test_a_new_pass_sees_records_written_after_the_previous_pass(self):
         """No persisted cache: identity comes from the records on every pass.
 
@@ -247,7 +268,7 @@ class ProcessTableScanScopeTest(unittest.TestCase):
         partial = D.ProcessTableScan({"att-y": ((7, "1", "S"),)},
                                      {9: ((9, "1", "Z"),), 11: ((11, "1", "S"), (12, "1", "Z"))},
                                      incomplete_reason="procfs-member:9:malformed",
-                                     group_incomplete_reason="procfs-member:8:13")
+                                     group_errors=((0, None, "procfs-member:8:13"),))
         with mock.patch.object(D, "scan_process_table", return_value=partial):
             with D.process_table_scan_scope():
                 absent = D.attempt_tagged_descendants(metadata)
@@ -266,6 +287,18 @@ class ProcessTableScanScopeTest(unittest.TestCase):
                          ("unverifiable", "procfs-member:8:13"))
         self.assertEqual(D.attempt_tagged_descendants({}).reason, "attempt-id-missing")
 
+    def test_group_query_takes_the_last_applicable_error_in_walk_order(self):
+        scan = D.ProcessTableScan({}, {77: ((102, "1", "S"),)}, group_errors=(
+            (0, None, "procfs-member:101:13"),        # unreadable stat: every group
+            (1, 77, "procfs-member:102:malformed"),   # parsed pgid, no start: group 77 only
+        ))
+        with mock.patch.object(D, "scan_process_table", return_value=scan):
+            with D.process_table_scan_scope():
+                other = D.process_group_observation(99)
+                same = D.process_group_observation(77)
+        self.assertEqual((other.state, other.reason), ("unverifiable", "procfs-member:101:13"))
+        self.assertEqual((same.state, same.reason), ("populated", "procfs-member:102:malformed"))
+
     def test_collect_tick_takes_exactly_one_walk(self):
         counter = _Counter(D.scan_process_table)
         with tempfile.TemporaryDirectory() as tmp:
@@ -277,6 +310,130 @@ class ProcessTableScanScopeTest(unittest.TestCase):
                 dispatch_collector.collect(jobs_path=jobs_log)
         self.assertEqual(counter.calls, 1)
         self.assertIsNone(D._PROCESS_TABLE_SCAN.get())
+
+
+class _SortedPath(type(Path())):
+    """A Path whose directory walk is deterministic, so "last reason wins" is testable."""
+
+    def iterdir(self):
+        return iter(sorted(super().iterdir(), key=lambda p: p.name))
+
+
+def _proc_redirect(fake_proc):
+    real = Path
+
+    def factory(*args, **kwargs):
+        path = real(*args, **kwargs)
+        return _SortedPath(fake_proc) if str(path) == "/proc" else path
+    return factory
+
+
+_TAG = "AGENT_DISPATCH_ATTEMPT_ID="
+
+
+class FakeProcEquivalenceTest(unittest.TestCase):
+    """The scoped walk must answer exactly like the single-shot probes on the SAME
+    malformed / unreadable / duplicated procfs input (review 2026-09-08, major 1 +
+    minor 2). Both paths read the same fake `/proc`, in the same order."""
+
+    def _stat(self, pid, tail):
+        return "%d (x) %s\n" % (pid, " ".join(tail))
+
+    def _build(self, tmp, procs):
+        root = Path(tmp) / "proc"
+        root.mkdir()
+        (root / "cpuinfo").write_text("ignored\n", encoding="utf-8")
+        (root / "self").mkdir()
+        for pid, spec in procs.items():
+            d = root / str(pid)
+            d.mkdir()
+            if "tail" in spec:
+                (d / "stat").write_text(self._stat(pid, spec["tail"]), encoding="utf-8")
+            if spec.get("stat_unreadable"):
+                (d / "stat").write_text("0 (x) S\n", encoding="utf-8")
+                (d / "stat").chmod(0)
+            if "environ" in spec:
+                (d / "environ").write_bytes(spec["environ"])
+        return root
+
+    def _compare(self, root, tagged=(), groups=()):
+        expect = {}
+        with mock.patch.object(D, "Path", _proc_redirect(root)):
+            for tag in tagged:
+                expect[("tag", tag)] = D.attempt_tagged_descendants({"attempt_id": tag})
+            for pgid in groups:
+                expect[("group", pgid)] = D.process_group_observation(pgid)
+            with D.process_table_scan_scope():
+                for tag in tagged:
+                    got = D.attempt_tagged_descendants({"attempt_id": tag})
+                    self.assertEqual(got, expect[("tag", tag)], ("tag", tag))
+                for pgid in groups:
+                    got = D.process_group_observation(pgid)
+                    self.assertEqual(got, expect[("group", pgid)], ("group", pgid))
+        return expect
+
+    def _full_tail(self, state="S", pgid="77", start="123"):
+        return [state, "1", pgid] + ["0"] * 16 + [start]
+
+    def test_unparsable_pgid_breaks_only_the_group_probe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._build(tmp, {100: {"tail": self._full_tail(pgid="bad"),
+                                           "environ": (_TAG + "att-x\0PATH=/bin\0").encode()}})
+            got = self._compare(root, tagged=["att-x", "att-none"], groups=[77, 99])
+        self.assertEqual(got[("tag", "att-x")].state, "populated")
+        self.assertEqual(got[("tag", "att-x")].members, ((100, "123", "S"),))
+        self.assertEqual(got[("tag", "att-x")].reason, "")
+        for pgid in (77, 99):
+            self.assertEqual((got[("group", pgid)].state, got[("group", pgid)].reason),
+                             ("unverifiable", "procfs-member:100:malformed"))
+
+    def test_short_stat_line_is_seen_only_by_its_own_group(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._build(tmp, {100: {"tail": ["S", "1", "77"],
+                                           "environ": (_TAG + "att-x\0").encode()}})
+            got = self._compare(root, tagged=["att-x"], groups=[77, 99])
+        self.assertEqual((got[("tag", "att-x")].state, got[("tag", "att-x")].reason),
+                         ("unverifiable", "procfs-member:100:malformed"))
+        self.assertEqual((got[("group", 99)].state, got[("group", 99)].reason), ("empty", ""))
+        self.assertEqual((got[("group", 77)].state, got[("group", 77)].reason),
+                         ("unverifiable", "procfs-member:100:malformed"))
+
+    def test_last_applicable_reason_wins_across_unreadable_and_malformed_rows(self):
+        if os.geteuid() == 0:
+            self.skipTest("a root observer reads a mode-0 stat file")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._build(tmp, {101: {"stat_unreadable": True},
+                                     102: {"tail": ["S", "1", "77"]},
+                                     103: {"tail": self._full_tail(pgid="77"),
+                                           "environ": (_TAG + "att-x\0").encode()}})
+            got = self._compare(root, tagged=["att-x"], groups=[77, 99])
+        self.assertEqual((got[("group", 99)].state, got[("group", 99)].reason),
+                         ("unverifiable", "procfs-member:101:13"))
+        self.assertEqual((got[("group", 77)].state, got[("group", 77)].reason),
+                         ("populated", "procfs-member:102:malformed"))
+        # The tagged probe skips the unreadable stat silently and reports the short one.
+        self.assertEqual((got[("tag", "att-x")].state, got[("tag", "att-x")].reason),
+                         ("populated", "procfs-member:102:malformed"))
+
+    def test_duplicate_and_multiple_tag_entries_name_a_process_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._build(tmp, {100: {"tail": self._full_tail(),
+                                           "environ": (_TAG + "att-x\0" + _TAG + "att-x\0"
+                                                       + _TAG + "att-y\0").encode()}})
+            got = self._compare(root, tagged=["att-x", "att-y"], groups=[77])
+        for tag in ("att-x", "att-y"):
+            self.assertEqual(got[("tag", tag)].members, ((100, "123", "S"),))
+
+    def test_zombies_stay_in_the_group_and_out_of_the_tag_index(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._build(tmp, {100: {"tail": self._full_tail(state="Z"),
+                                           "environ": (_TAG + "att-x\0").encode()},
+                                     104: {"tail": self._full_tail(pgid="88", start="9")}})
+            got = self._compare(root, tagged=["att-x"], groups=[77, 88])
+        self.assertNotEqual(got[("tag", "att-x")].state, "populated")
+        self.assertEqual((got[("group", 77)].state, got[("group", 77)].members),
+                         ("empty", ((100, "123", "Z"),)))
+        self.assertEqual(got[("group", 88)].state, "populated")
 
 
 def _codex(pid, *, app_server=False, managed_dir=None, tag=None, harness="codex"):

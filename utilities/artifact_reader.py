@@ -102,12 +102,18 @@ def cycle_bucket_dirs(root: Path, bucket: str) -> List[Tuple[Path, Dict[str, str
     scope = _READ_SCOPE.get()
     if scope is None:
         return _cycle_bucket_dirs(root, bucket)
-    key = (str(Path(root).resolve()), str(bucket))
+    root = Path(root)
+    key = (str(root.resolve()), str(bucket))
     hit = scope.cycle_buckets.get(key)
     if hit is None:
-        hit = scope.cycle_buckets[key] = _cycle_bucket_dirs(root, bucket)
-    # Callers extend the returned list (`bucket_dirs`), so the memo hands out copies.
-    return [(path, dict(meta)) for path, meta in hit]
+        # Keyed by the physical root, stored relative to it: a second spelling of
+        # the same directory (a symlink alias) gets paths under ITS spelling, as
+        # the unmemoised call would return. Callers extend the returned list
+        # (`bucket_dirs`) and read the metadata dicts, so the memo hands out copies.
+        hit = scope.cycle_buckets[key] = [
+            (path.relative_to(root), meta) for path, meta in _cycle_bucket_dirs(root, bucket)
+        ]
+    return [(root / relative, dict(meta)) for relative, meta in hit]
 
 
 def _cycle_bucket_dirs(root: Path, bucket: str) -> List[Tuple[Path, Dict[str, str]]]:
