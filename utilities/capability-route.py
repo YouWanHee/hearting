@@ -836,10 +836,18 @@ def _continuation_gate_release_proof(source_route,gate):
             continue
         if raised is None or evidence.get("released_gate") != gate:
             continue
-        decision=evidence.get("decision") or "proceed"
-        if decision in {"proceed","revise"}:
+        # Resolve the latest epoch through the shared workflow-state reader.
+        # A CANCELLED entry intentionally has no decision and must never be
+        # interpreted as the legacy proceed release.
+        resolution = WS.human_gate_resolution(ledger.journal(), gate)
+        if resolution.get("epoch") != epoch:
+            continue
+        if resolution.get("status") in {"proceed", "revise"}:
             released=entry
     if raised is None or released is None:
+        raise ValueError("continuation-human-gate-release-unproven:"+str(gate))
+    resolution = WS.human_gate_resolution(ledger.journal(), gate)
+    if resolution.get("status") != "proceed" or resolution.get("epoch") != epoch:
         raise ValueError("continuation-human-gate-release-unproven:"+str(gate))
     evidence=released.get("evidence") or {}
     decision=evidence.get("decision") or "proceed"
@@ -858,6 +866,7 @@ def _continuation_gate_release_proof(source_route,gate):
     }
 
 def _verify_continuation_gate_release_proofs(route):
+    import workflow_state as WS
     proofs=route.get("reused_human_gate_releases") or []
     if not isinstance(proofs,list):
         raise ValueError("continuation-human-gate-release-proofs-invalid")
@@ -888,6 +897,9 @@ def _verify_continuation_gate_release_proofs(route):
                      if line.strip()]
         except (OSError,ValueError,UnicodeDecodeError) as exc:
             raise ValueError("continuation-human-gate-release-proof-unreadable") from exc
+        resolution = WS.human_gate_resolution(entries, gate)
+        if resolution.get("status") != "proceed" or resolution.get("epoch") != proof["epoch"]:
+            raise ValueError("continuation-human-gate-release-proof-drift")
         raise_count=0; matched_raise=False; matched_release=False
         for entry in entries:
             evidence=entry.get("evidence") if isinstance(entry,dict) else None

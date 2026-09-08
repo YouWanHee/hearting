@@ -544,7 +544,11 @@ def human_gate_resolution(entries: list, gate: str) -> dict:
                 # artifact from disk to learn whether answers are owed (review
                 # round 1, B2).
                 "interview": bool(evidence.get("interview")),
-                "questions": int(evidence.get("questions") or 0),
+                "questions": (
+                    len(evidence.get("questions"))
+                    if isinstance(evidence.get("questions"), (list, tuple))
+                    else int(evidence.get("questions") or 0)
+                ),
                 # SD-OPEN-48: who may release, sealed at the raise. A raise
                 # that predates the field reads as None; the release resolves
                 # that against the route binding.

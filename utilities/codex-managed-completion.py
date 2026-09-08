@@ -138,6 +138,21 @@ class HumanGateWatcher:
                 expected_attempts=self.attempts,
                 expected_sealed_batch_id=self.args.sealed_batch_id,
             )
+            # Reclaim only after checking the live monotonic deadline.  The
+            # old carrier's lease may still be valid, so a fresh watcher must
+            # preserve that claim; using deadline+1 here incorrectly steals a
+            # live lease. Sent-ambiguous is made eligible for the existing
+            # gateway lookup/no-resend path, not for a blind second send.
+            if record.get("state") in {"claimed", "sent-ambiguous"}:
+                deadline = record.get("claim_deadline_ns")
+                if not isinstance(deadline, int) or time.monotonic_ns() < deadline:
+                    raise pending_delivery.PendingDeliveryError(
+                        "pending-delivery-claim-refused", "lease-not-expired"
+                    )
+                record = pending_delivery.reclaim(
+                    self.root, self.recipient, record["delivery_id"],
+                    now_ns=time.monotonic_ns(),
+                )
             claimed = pending_delivery.claim(
                 self.root, self.recipient, record["delivery_id"],
                 claim_owner=self.owner, lease_seconds=30.0,
@@ -171,7 +186,7 @@ class HumanGateWatcher:
                 )
             elif result.get("status") == "retryable":
                 pending_delivery.reclaim(self.root, self.recipient, claimed["delivery_id"],
-                                         now_ns=claimed.get("claim_deadline_ns", 0) + 1)
+                                         now_ns=time.monotonic_ns())
             elif result.get("status") == "rejected":
                 pending_delivery.reject_claimed(
                     self.root, self.recipient, claimed["delivery_id"],
@@ -186,7 +201,7 @@ class HumanGateWatcher:
             elif "claimed" in locals():
                 try:
                     pending_delivery.reclaim(self.root, self.recipient, claimed["delivery_id"],
-                                             now_ns=claimed.get("claim_deadline_ns", 0) + 1)
+                                         now_ns=time.monotonic_ns())
                 except Exception:
                     pass
             self._record_error(str(exc))

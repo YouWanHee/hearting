@@ -1715,6 +1715,13 @@ class ManagedGateway:
         identity = {"thread_id": thread_id, "parent_attempt_id": parent,
                     "sealed_batch_id": batch, "receipt_digest": receipt_digest}
         with self._lock:
+            # Validation ran against a snapshot outside this mutation lock.
+            # Re-check both binding dimensions before consulting or creating
+            # durable state so reconnect/fork races cannot prepare old work.
+            if (self._binding_thread_id != thread_id
+                    or receipt.get("recipient_epoch") != self._epoch):
+                return {"schema_version": 1, "status": "rejected", "delivery_id": delivery_id,
+                        "reason": "recipient-epoch-mismatch"}
             existing = self.ledger.get(delivery_id)
             if existing and existing.get("state") == "accepted":
                 return {"schema_version": 1, "status": "accepted", "delivery_id": delivery_id,
@@ -1724,6 +1731,15 @@ class ManagedGateway:
                     return {"schema_version": 1, "status": "sent-ambiguous", "delivery_id": delivery_id,
                             "reason": "accept-not-observed-no-resend"}
                 pending = self._delivery_pending[delivery_id]
+            elif existing and existing.get("state") == "prepared":
+                # A validation timeout or reconnect can leave a durable
+                # prepared row while the original requester is still waiting.
+                # Reuse that live object; never append a second queue entry for
+                # the same delivery identity.
+                pending = self._delivery_pending.get(delivery_id)
+                if pending is None:
+                    return {"schema_version": 1, "status": "retryable", "delivery_id": delivery_id,
+                            "reason": "prepared-pending-not-live"}
             elif existing and existing.get("state") == "rejected":
                 return {"schema_version": 1, "status": "rejected",
                         "delivery_id": delivery_id,
@@ -1754,6 +1770,51 @@ class ManagedGateway:
                                    "delivery_id": delivery_id, "reason": "delivery-outcome-missing"}
 
     def _send_human_gate_locked(self, pending: PendingInternal, state: ThreadState) -> None:
+        current_thread = self._binding_thread_id
+        current_epoch = self._epoch
+        if (current_thread != pending.thread_id
+                or pending.receipt.get("recipient_epoch") != current_epoch):
+            # Close every local projection of a prepared request.  The
+            # validation snapshot is deliberately outside the mutation lock;
+            # once the binding changes, the requester must receive one typed
+            # rejection and the stale queue/map/ledger identity must not stay
+            # live for a later retry.
+            pending.outcome = {"schema_version": 1, "status": "rejected",
+                               "delivery_id": pending.delivery_id,
+                               "reason": "recipient-epoch-mismatch"}
+            state.queued[:] = [item for item in state.queued if item is not pending]
+            self._delivery_pending.pop(pending.delivery_id, None)
+            if pending.request_id:
+                self._internal.pop(request_key(pending.request_id), None)
+            existing = self.ledger.get(pending.delivery_id)
+            try:
+                if existing and existing.get("state") == "prepared":
+                    self.ledger._transition(
+                        pending.delivery_id, "rejected", **pending.identity,
+                        reason="recipient-epoch-mismatch",
+                    )
+            except (GatewayError, OSError) as exc:
+                # _transition mutates memory before writing. Preserve the last
+                # confirmed state and an explicit failure, not a successful
+                # rejection. The write may already have replaced the file
+                # before fsync failed: this is NOT a claim of disk rollback.
+                pending.outcome = {
+                    "schema_version": 1, "status": "rejected",
+                    "delivery_id": pending.delivery_id,
+                    "reason": "rejection-ledger-commit-failed",
+                    "rejection_reason": "recipient-epoch-mismatch",
+                    "ledger_commit": "unconfirmed",
+                    "ledger_error": f"{type(exc).__name__}: {exc}",
+                }
+                self.ledger.value["deliveries"][pending.delivery_id] = {
+                    **existing, "rejection_commit_failure": dict(pending.outcome),
+                }
+            finally:
+                # The request is already detached from local maps. Even a
+                # failed ledger commit must wake its waiting caller exactly
+                # here; disconnect cannot find this pending object anymore.
+                pending.event.set()
+            return
         request_id = self._new_internal_id()
         pending.request_id = request_id
         pending.kind = "human-gate-steer" if state.active_turn_id and state.steer_ready else "human-gate-start"
