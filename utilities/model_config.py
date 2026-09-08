@@ -48,9 +48,22 @@ class ModelConfigReceipt:
 
 
 TIER_KEY = re.compile(r"^CFG_TIER_([A-Z0-9_]+)_(MODEL|EFFORT|VARIANT)$")
+# Tiers each adapter's own wrappers read by literal key name, whatever the
+# profiles say: the role mappers (`adapters/<adapter>/bin/model-map.sh`,
+# `role-map.sh`) and the distill workers match a role in `CFG_ROLES_*` and then
+# read `CFG_TIER_DEEP_MODEL` and friends directly, so those keys are required
+# even when every profile routes through `model/<id>:effort` (review R2-B1).
+# This is a declared contract, not a runtime source scan: nothing here reads the
+# filesystem, and `model_config.test.py` fails if an adapter's wrappers name a
+# tier this table omits (review R3-B1/R3-M1).
+WRAPPER_REQUIRED_TIERS: dict[str, frozenset[str]] = {
+    "claude": frozenset({"DEEP", "LIGHT", "MINI"}),
+    "codex": frozenset({"DEEP", "LIGHT", "MINI"}),
+    "opencode": frozenset({"BALANCED_DEEP", "LIGHT", "MINI"}),
+}
+
+
 TIER_REFERENCE_KEYS = ("CFG_TIER_DEEP_FAILOVER", "CFG_NATIVE_SUBAGENT", "CFG_LIFECYCLE_NUDGE", "CFG_LIFECYCLE_CURATE")
-TIER_KEY_LITERAL = re.compile(r"CFG_TIER_([A-Z0-9_]+)_(?:MODEL|EFFORT|VARIANT)\b")
-_CONSUMER_TIER_CACHE: dict[tuple[str, str], frozenset[str] | None] = {}
 
 
 def _referenced_tiers(values: Mapping[str, str]) -> set[str]:
@@ -66,57 +79,15 @@ def _referenced_tiers(values: Mapping[str, str]) -> set[str]:
     return tiers
 
 
-def _consumer_required_tiers(adapter: str, source_root: str | Path | None) -> frozenset[str] | None:
-    """Tiers this adapter's own wrappers read by literal key name, whatever the
-    profiles say. The role mappers (`adapters/<adapter>/bin/model-map.sh`,
-    `role-map.sh`) and the distill workers reach `CFG_TIER_DEEP_MODEL` and
-    friends directly after matching a role in `CFG_ROLES_*`, so a user copy that
-    routes every profile through `model/<id>:effort` still needs those keys.
-
-    Returns None when the adapter's wrapper directory cannot be read: the caller
-    then requires every shipped tier key (fail closed) rather than admitting a
-    copy whose consumers may break."""
-    try:
-        bin_dir = shipped_path(adapter, source_root=source_root).parent.parent / "bin"
-        cache_key = (adapter, str(bin_dir))
-    except (ModelConfigError, ValueError):
-        return None
-    if cache_key in _CONSUMER_TIER_CACHE:
-        return _CONSUMER_TIER_CACHE[cache_key]
-    tiers: set[str] = set()
-    found_any = False
-    try:
-        for path in sorted(bin_dir.iterdir()):
-            if not path.is_file() or path.suffix not in (".sh", ".py"):
-                continue
-            try:
-                text = path.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                return _CONSUMER_TIER_CACHE.setdefault(cache_key, None)
-            found_any = True
-            tiers.update(TIER_KEY_LITERAL.findall(text))
-    except OSError:
-        return _CONSUMER_TIER_CACHE.setdefault(cache_key, None)
-    result = frozenset(tiers) if found_any else None
-    _CONSUMER_TIER_CACHE[cache_key] = result
-    return result
-
-
-def _unreferenced_tier_keys(
-    missing: set[str], user_values: Mapping[str, str], adapter: str,
-    source_root: str | Path | None,
-) -> set[str]:
+def _unreferenced_tier_keys(missing: set[str], user_values: Mapping[str, str], adapter: str) -> set[str]:
     """The subset of `missing` shipped keys that are tier keys of a tier nothing
     in this configuration needs. A release that adds a tier (e.g. `balanced-deep`)
     must not turn an older complete user copy into `user-incomplete` — that would
     silently replace the user's explicit policy (main-only list, model tiers)
     with the shipped one. A tier stays required when the user file references it
     (a profile's `tier:budget`, or a scalar tier selector) or when this adapter's
-    own wrappers read its keys by name (review R2-B1)."""
-    consumer = _consumer_required_tiers(adapter, source_root)
-    if consumer is None:
-        return set()
-    required = _referenced_tiers(user_values) | consumer
+    wrappers read its keys by name (`WRAPPER_REQUIRED_TIERS`)."""
+    required = _referenced_tiers(user_values) | WRAPPER_REQUIRED_TIERS.get(adapter, frozenset())
     optional: set[str] = set()
     for key in missing:
         match = TIER_KEY.fullmatch(key)
@@ -296,8 +267,7 @@ def resolve_config(
             "CFG_MODEL_PROFILE_BALANCED", "CFG_MODEL_PROFILE_GRANULARITY_BALANCED",
         }
         missing = set(shipped_values) - set(user_values)
-        unreferenced_tier = _unreferenced_tier_keys(
-            missing - optional_balanced, user_values, adapter, source_root)
+        unreferenced_tier = _unreferenced_tier_keys(missing - optional_balanced, user_values, adapter)
         if missing - optional_balanced - unreferenced_tier:
             reason = "user-incomplete"
         else:

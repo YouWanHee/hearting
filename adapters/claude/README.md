@@ -146,10 +146,14 @@ Concrete defaults and generated native agents come from this adapter's
 `config/models.conf`; runtime loading selects the user's whole file first.
 A missing balanced row is derived only from that user's light row in memory;
 explicit settings win, and other missing required keys retain whole-file fallback,
-except tier keys (`CFG_TIER_<tier>_MODEL/EFFORT`) of a tier the user copy never
-references: a release that adds a tier (2026-09-08 `balanced-deep`) leaves an older
-complete user copy selected whole-file, so its own main-only list and tiers keep
-applying (receipt `unreferenced_tier_keys`).
+except tier keys (`CFG_TIER_<tier>_MODEL/EFFORT`) of a tier that the user copy never
+references **and** this adapter's own wrappers never read by name: a release that adds
+a tier (2026-09-08 `balanced-deep`) leaves an older complete user copy selected
+whole-file, so its own main-only list and tiers keep applying (receipt
+`unreferenced_tier_keys`). The role mappers reach `CFG_TIER_DEEP_MODEL` and friends
+without a profile, so those keys stay required; the per-adapter list is declared in
+`utilities/model_config.py` (`WRAPPER_REQUIRED_TIERS`) and a test fails if a wrapper
+starts naming a tier the list omits.
 OpenCode reports collapsed-balanced-to-light and preserves its full light budget.
 No install/update/reapply/uninstall writes the normalization back. Source checks
 do not activate an installed release or change an in-flight sealed route.
