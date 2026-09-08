@@ -62,6 +62,17 @@ class ClaudeDispatchModelEligibilityTest(unittest.TestCase):
         patcher = mock.patch.object(WRAPPER, "_model_policy", side_effect=shipped_policy)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # The role mapper (model-map.sh) resolves its harness root from AGENT_HOME:
+        # pin it to this checkout so an installed release with another mapping
+        # cannot leak into the expected/actual comparison (review B2).
+        env = mock.patch.dict(os.environ, {
+            "AGENT_HOME": str(ROOT),
+            "CLAUDE_CONFIG_DIR": str(ROOT / "adapters" / "claude" / "no-such-runtime-home"),
+        })
+        env.start()
+        self.addCleanup(env.stop)
+        for key in ("CLAUDE_MODEL_DEEP", "CLAUDE_EFFORT_DEEP"):
+            os.environ.pop(key, None)
 
     def test_shipped_default_has_no_main_session_only_model(self):
         # 2026-09-08 user rule: shipped default == user runtime mapping. Fable is
@@ -73,8 +84,7 @@ class ClaudeDispatchModelEligibilityTest(unittest.TestCase):
 
     def test_deep_role_resolves_to_config_deep_tier_and_is_dispatch_eligible(self):
         policy = shipped_policy()
-        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(ROOT / "adapters" / "claude" / "no-such-runtime-home")}):
-            result = WRAPPER.resolve_model_settings(selection(role="deep orchestrator"))
+        result = WRAPPER.resolve_model_settings(selection(role="deep orchestrator"))
         # Model and effort are the shipped deep-tier defaults (user-tunable), not literals.
         self.assertEqual(result["model"], policy["CFG_TIER_DEEP_MODEL"])
         self.assertEqual(result["effort"], policy["CFG_TIER_DEEP_EFFORT"])
@@ -132,6 +142,31 @@ class ClaudeDispatchModelEligibilityTest(unittest.TestCase):
             },
         )
 
+    def test_legacy_complete_user_copy_keeps_its_main_only_policy(self):
+        # Review B1: a user copy seeded from the previous release (no balanced-deep
+        # tier keys, fable main-only) must stay selected whole-file after the
+        # upgrade instead of silently falling back to the shipped (empty) list.
+        legacy = SHIPPED_CONF.read_text(encoding="utf-8")
+        legacy = re.sub(r"^CFG_TIER_BALANCED_DEEP_(MODEL|EFFORT)=.*\n", "", legacy, flags=re.MULTILINE)
+        legacy = legacy.replace("CFG_MODEL_PROFILE_BALANCED_DEEP=balanced-deep:high", "CFG_MODEL_PROFILE_BALANCED_DEEP=deep:high")
+        legacy = legacy.replace("CFG_TIER_DEEP_FAILOVER=balanced-deep", "CFG_TIER_DEEP_FAILOVER=light")
+        legacy = re.sub(r"^CFG_MAIN_SESSION_ONLY_MODELS=.*$", 'CFG_MAIN_SESSION_ONLY_MODELS="fable"', legacy, count=1, flags=re.MULTILINE)
+        self.assertNotIn("CFG_TIER_BALANCED_DEEP_MODEL", legacy)
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime_home = Path(tmp) / "claude-home"
+            (runtime_home / "agent-config").mkdir(parents=True)
+            (runtime_home / "agent-config" / "models.conf").write_text(legacy, encoding="utf-8")
+            with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(runtime_home)}):
+                values, receipt = WRAPPER.resolve_config("claude", source_root=ROOT)
+                self.assertEqual((receipt.source, receipt.reason), ("user", "user-valid"))
+                self.assertEqual(receipt.unreferenced_tier_keys, "CFG_TIER_BALANCED_DEEP_EFFORT,CFG_TIER_BALANCED_DEEP_MODEL")
+                self.assertEqual(values["CFG_MAIN_SESSION_ONLY_MODELS"], "fable")
+                with mock.patch.object(WRAPPER, "_model_policy", side_effect=lambda: values):
+                    self.assertTrue(WRAPPER._main_session_only_model("claude-fable-5"))
+                    with self.assertRaises(WRAPPER.ModelSelectionError) as refused:
+                        WRAPPER.resolve_model_settings(selection(model="claude-fable-5", effort="high"))
+                    self.assertEqual(refused.exception.reason, "headless-main-session-only-model")
+
     def test_cli_rejects_a_main_only_model_before_registry_prompt_log_or_child(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -155,6 +190,7 @@ class ClaudeDispatchModelEligibilityTest(unittest.TestCase):
             logs = root / "logs"
             env = {key: value for key, value in os.environ.items() if key != "CLAUDE_MODEL_DEEP"}
             env["CLAUDE_CONFIG_DIR"] = str(runtime_home)
+            env["AGENT_HOME"] = str(ROOT)
             result = subprocess.run(
                 [
                     sys.executable,

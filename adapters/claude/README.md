@@ -145,7 +145,11 @@ The five portable profiles are deep, balanced-deep, balanced, light and mini.
 Concrete defaults and generated native agents come from this adapter's
 `config/models.conf`; runtime loading selects the user's whole file first.
 A missing balanced row is derived only from that user's light row in memory;
-explicit settings win, and other missing required keys retain whole-file fallback.
+explicit settings win, and other missing required keys retain whole-file fallback,
+except tier keys (`CFG_TIER_<tier>_MODEL/EFFORT`) of a tier the user copy never
+references: a release that adds a tier (2026-09-08 `balanced-deep`) leaves an older
+complete user copy selected whole-file, so its own main-only list and tiers keep
+applying (receipt `unreferenced_tier_keys`).
 OpenCode reports collapsed-balanced-to-light and preserves its full light budget.
 No install/update/reapply/uninstall writes the normalization back. Source checks
 do not activate an installed release or change an in-flight sealed route.

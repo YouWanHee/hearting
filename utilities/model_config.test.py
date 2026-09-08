@@ -59,6 +59,42 @@ class ModelConfigTest(unittest.TestCase):
         self.assertEqual(receipt.reason, "user-valid")
         self.assertEqual(values["CFG_USER_EXTRA"], "literal")
 
+    def test_legacy_complete_user_copy_survives_a_shipped_tier_extension(self):
+        # A release adds a tier (balanced-deep) with two new CFG_TIER_* keys. An
+        # older user copy that never references that tier is still a complete
+        # policy and stays selected whole-file (its main-only list included).
+        shipped = (
+            BASE
+            + 'CFG_TIER_BALANCED_DEEP_MODEL=shipped-bd\n'
+            + 'CFG_TIER_BALANCED_DEEP_EFFORT=high\n'
+            + 'CFG_MODEL_PROFILE_BALANCED_DEEP=balanced-deep:high\n'
+            + 'CFG_MAIN_SESSION_ONLY_MODELS=" "\n'
+        )
+        legacy_user = BASE + 'CFG_MODEL_PROFILE_BALANCED_DEEP=deep:high\nCFG_MAIN_SESSION_ONLY_MODELS="fable"\n'
+        root = self.make_root(shipped=shipped)
+        home = root / "home"
+        user = home / "agent-config" / "models.conf"
+        user.parent.mkdir(parents=True)
+        user.write_text(legacy_user, encoding="utf-8")
+        values, receipt = config.resolve_config("claude", runtime=home, source_root=root)
+        self.assertEqual((receipt.source, receipt.reason), ("user", "user-valid"))
+        self.assertEqual(receipt.unreferenced_tier_keys, "CFG_TIER_BALANCED_DEEP_EFFORT,CFG_TIER_BALANCED_DEEP_MODEL")
+        self.assertEqual(values["CFG_MAIN_SESSION_ONLY_MODELS"], "fable")
+        self.assertNotIn("CFG_TIER_BALANCED_DEEP_MODEL", values)  # whole-file, never merged
+        # The same copy that *references* the new tier without declaring it is incomplete.
+        user.write_text(legacy_user.replace("balanced-deep:high", "balanced-deep:high").replace(
+            "CFG_MODEL_PROFILE_BALANCED_DEEP=deep:high", "CFG_MODEL_PROFILE_BALANCED_DEEP=balanced-deep:high"), encoding="utf-8")
+        values, receipt = config.resolve_config("claude", runtime=home, source_root=root)
+        self.assertEqual((receipt.source, receipt.reason), ("shipped", "user-incomplete"))
+        # A scalar tier selector counts as a reference too.
+        user.write_text(legacy_user + "CFG_TIER_DEEP_FAILOVER=balanced-deep\n", encoding="utf-8")
+        _values, receipt = config.resolve_config("claude", runtime=home, source_root=root)
+        self.assertEqual(receipt.reason, "user-incomplete")
+        # Missing non-tier keys are still incomplete (the exception is tier-shaped only).
+        user.write_text(legacy_user.replace("CFG_MODEL_PROFILE_DEEP=deep:xhigh\n", ""), encoding="utf-8")
+        _values, receipt = config.resolve_config("claude", runtime=home, source_root=root)
+        self.assertEqual(receipt.reason, "user-incomplete")
+
     def test_missing_incomplete_malformed_and_unsafe_user_files_fallback_whole_file(self):
         for text, reason in ((None, "user-missing"), ("CFG_TIER_DEEP_MODEL=user-only\n", "user-incomplete"),
                              ("CFG_MODEL_PROFILE_DEEP=bad+syntax\n", "user-malformed"),

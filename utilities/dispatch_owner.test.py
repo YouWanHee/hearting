@@ -115,6 +115,9 @@ class DispatchOwnerTests(unittest.TestCase):
             and not key.startswith("AGENT_OWNER_ROUTE_")
             and not key.startswith("AGENT_ROUTE_")
             and not key.startswith("AGENT_ARTIFACT_")
+            # A registered worker inherits its own session markers; the selector
+            # under test must see one unambiguous caller harness.
+            and key not in ("CLAUDE_CODE_SESSION_ID", "OPENCODE_SESSION_ID")
         }
         env.update({
             "AGENT_HOME": str(self.home / "agent-home"),
