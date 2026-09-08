@@ -59,6 +59,40 @@ class ModelConfigTest(unittest.TestCase):
         self.assertEqual(receipt.reason, "user-valid")
         self.assertEqual(values["CFG_USER_EXTRA"], "literal")
 
+    def test_a_tier_the_adapter_wrappers_read_by_name_stays_required(self):
+        # Review R2-B1: the role mappers read CFG_TIER_DEEP_MODEL/EFFORT (and
+        # light/mini) directly after matching CFG_ROLES_*, so a copy that routes
+        # every profile through model/<id>:effort still needs them.
+        shipped = (
+            'CFG_MODEL_PROFILE_DEEP=deep:high\n'
+            'CFG_TIER_DEEP_MODEL=shipped-deep\n'
+            'CFG_TIER_DEEP_EFFORT=high\n'
+        )
+        root = self.make_root(shipped=shipped)
+        mapper = root / "adapters" / "claude" / "bin" / "model-map.sh"
+        mapper.parent.mkdir(parents=True)
+        mapper.write_text('model=${CLAUDE_MODEL_DEEP:-$CFG_TIER_DEEP_MODEL}\n', encoding="utf-8")
+        home = root / "home"
+        user = home / "agent-config" / "models.conf"
+        user.parent.mkdir(parents=True)
+        # Explicit-model profile: nothing in the file references the deep tier…
+        user.write_text('CFG_MODEL_PROFILE_DEEP=model/user-model:high\nCFG_TIER_DEEP_EFFORT=high\n', encoding="utf-8")
+        _values, receipt = config.resolve_config("claude", runtime=home, source_root=root)
+        self.assertEqual((receipt.source, receipt.reason), ("shipped", "user-incomplete"))
+        # …and the same copy is complete once it declares the key the mapper reads.
+        user.write_text('CFG_MODEL_PROFILE_DEEP=model/user-model:high\nCFG_TIER_DEEP_EFFORT=high\nCFG_TIER_DEEP_MODEL=user-deep\n', encoding="utf-8")
+        _values, receipt = config.resolve_config("claude", runtime=home, source_root=root)
+        self.assertEqual((receipt.source, receipt.reason), ("user", "user-valid"))
+        # An unreadable wrapper directory fails closed: every shipped tier key is required.
+        config._CONSUMER_TIER_CACHE.clear()
+        for entry in mapper.parent.iterdir():
+            entry.unlink()
+        mapper.parent.rmdir()
+        user.write_text('CFG_MODEL_PROFILE_DEEP=model/user-model:high\nCFG_TIER_DEEP_EFFORT=high\n', encoding="utf-8")
+        _values, receipt = config.resolve_config("claude", runtime=home, source_root=root)
+        self.assertEqual(receipt.reason, "user-incomplete")
+        config._CONSUMER_TIER_CACHE.clear()
+
     def test_legacy_complete_user_copy_survives_a_shipped_tier_extension(self):
         # A release adds a tier (balanced-deep) with two new CFG_TIER_* keys. An
         # older user copy that never references that tier is still a complete
@@ -72,6 +106,11 @@ class ModelConfigTest(unittest.TestCase):
         )
         legacy_user = BASE + 'CFG_MODEL_PROFILE_BALANCED_DEEP=deep:high\nCFG_MAIN_SESSION_ONLY_MODELS="fable"\n'
         root = self.make_root(shipped=shipped)
+        mapper = root / "adapters" / "claude" / "bin" / "model-map.sh"
+        mapper.parent.mkdir(parents=True)
+        mapper.write_text('model=$CFG_TIER_DEEP_MODEL; effort=$CFG_TIER_DEEP_EFFORT\n', encoding="utf-8")
+        config._CONSUMER_TIER_CACHE.clear()
+        self.addCleanup(config._CONSUMER_TIER_CACHE.clear)
         home = root / "home"
         user = home / "agent-config" / "models.conf"
         user.parent.mkdir(parents=True)
