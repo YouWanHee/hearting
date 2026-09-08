@@ -88,9 +88,9 @@ The Claude Code adapter maps portable roles from `core/CONVENTIONS.md §2` to co
 | `fast reviewer` | `sonnet` | Broad cost-efficient coverage, typo, style, cross-reference, structure, and verbatim checks |
 | `fast fact-checker` | `sonnet` | Narrow citation, venue, year, metric, and lineage checks against source artifacts |
 | `fast writer` | `sonnet` | Assemble verified artifacts into a final report |
-| `deep reviewer` | `opus` | methodology, domain expertise, completeness, safety/security, architecture risk |
-| `deep maker` | `opus` | Planning, research synthesis, and visual/editorial work requiring high judgment |
-| `deep orchestrator` | `opus` xhigh | Stage gates, failover, and evidence judgment for standard+ dispatch-depth-1 ownership |
+| `deep reviewer` | `fable` | methodology, domain expertise, completeness, safety/security, architecture risk |
+| `deep maker` | `fable` | Planning, research synthesis, and visual/editorial work requiring high judgment |
+| `deep orchestrator` | `fable` high | Stage gates, failover, and evidence judgment for standard+ dispatch-depth-1 ownership |
 | `fast implementer` | `sonnet` | Routine implementation and refactoring; escalate complex API/library design |
 | `orchestrator` | `sonnet` high | Balanced mechanical coordination of decided calls, paths, and states |
 | `external adversary` | Codex CLI via `codex-review-team` | Independent hostile review for the `adversarial` intensity pass. The same Codex engine may host a neutral cross-harness parallel leg, but that is a reviewer role, not this hostile role. |
@@ -100,10 +100,15 @@ Route-bound registered work uses a second, independent execution-budget axis:
 
 | Model profile | Claude realization | Registered topology use |
 |---|---|---|
-| `deep` | `opus` / `xhigh` | standard+ ownership, convergence, and highest-risk legs |
-| `balanced-deep` | `opus` / `medium` | quick one-shot conduction and subordinate deep-model judgment at lower coordination cost |
+| `deep` | `fable` / `high` | standard+ ownership, convergence, and highest-risk legs |
+| `balanced-deep` | `opus` / `high` | quick one-shot conduction and subordinate deep-model judgment at lower coordination cost |
+| `balanced` | `sonnet` / `high` | long multi-step execution after the decision is settled |
 | `light` | `sonnet` / `medium` | routine implementation, verification, reporting, and breadth legs |
-| `mini` | `haiku` / `medium` | lifecycle and micro-semantic helpers only; substantive dispatch-depth-1/2 work is rejected |
+| `mini` | `sonnet` / `low` | lifecycle and micro-semantic helpers only; substantive dispatch-depth-1/2 work is rejected |
+
+These are the shipped defaults and equal the user's runtime mapping (2026-09-08
+사용자 결정: a runtime value changed by instruction becomes the shipped default).
+The deep-tier capacity cascade is `fable -> opus -> sonnet`.
 
 The route compiler seals `model_profile`; the wrapper resolves it through the
 complete user copy at `$CLAUDE_CONFIG_DIR/agent-config/models.conf` (default
@@ -113,8 +118,9 @@ or removes it. The wrapper may also receive the independently sealed
 `model_role`. A dispatch-depth-1 `_kernel/owner` is valid with a profile and no
 stage `worker_mode`. Non-route jobs retain explicit role/concrete-model
 selection. Registered inheritance and config-declared interactive-main-only
-models are rejected before launch; `fable` therefore remains available only to
-the interactive main session, while its usage/status telemetry stays visible.
+models are rejected before launch. The shipped `CFG_MAIN_SESSION_ONLY_MODELS`
+list is empty (whitespace-only), so `fable` launches headless on the deep tier;
+a user copy that names a model there restores the typed refusal for it.
 
 Two `CONVENTIONS §1.1` properties are intensity-independent and this adapter honors them: every review the `품질관리팀` runs carries the refute-by-default adversarial stance (anchored in `CONVENTIONS §1.1` / `roles/MODES.md`; `agent-modes/qa/_review_rules.md` is the single source for the code-review, plan-review, and test modes that load it), and every declared independent group records its realized independence. Registry-v6 groups launch 2–4 blind dispatch-depth-2 siblings atomically, use at least two harness families when `cross-harness` is required, and add asymmetric model profiles and perspectives to reduce correlated error. The hostile `external adversary` pass stays reserved for `adversarial`. If an explicitly requested cross-harness axis cannot be realized, fail loudly; an auto-selected group may use typed same-family degradation while preserving and reporting profile/perspective diversity.
 
@@ -146,6 +152,6 @@ do not activate an installed release or change an in-flight sealed route.
 
 A profile value may name a tier (`deep:high`) or an explicit model
 (`model/<id>:high`). This keeps existing user tier keys intact when two profiles
-need different models. The shipped deep point uses the main-only model and is
-still rejected by delegated launch guards; balanced-deep uses the eligible deep
-tier. A user-selected legacy tier continues to override the shipped profile.
+need different models. The shipped deep point is the `deep` tier (`fable`/high,
+dispatch-eligible); balanced-deep rides its own `balanced-deep` tier
+(`opus`/high). A user-selected legacy tier continues to override the shipped profile.

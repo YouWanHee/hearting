@@ -13,7 +13,7 @@ from types import SimpleNamespace
 from datetime import datetime, timezone
 from unittest import mock
 
-from model_profile import resolve_profile
+from model_profile import load_config, resolve_profile
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -205,8 +205,12 @@ class DispatchOwnerTests(unittest.TestCase):
         return rc, stdout.getvalue(), wrapper_calls
 
     def assert_model_map(self, result, adapter):
-        expected = resolve_profile(adapter, ROOT / "adapters" / adapter / "config" / "models.conf", "deep")
-        if adapter == "claude" and expected["model"] == "fable":
+        conf = ROOT / "adapters" / adapter / "config" / "models.conf"
+        expected = resolve_profile(adapter, conf, "deep")
+        restricted = load_config(conf).get("CFG_MAIN_SESSION_ONLY_MODELS", "").split()
+        if adapter == "claude" and expected["model"] in restricted:
+            # Only a config that declares the deep model main-session-only is a
+            # typed pre-launch refusal; the shipped default (2026-09-08) declares none.
             self.assertEqual(result.returncode, 64, result.stdout + result.stderr)
             self.assertIn("reason=headless-main-session-only-model", result.stdout)
             self.assertIn("child_spawned=0", result.stdout)

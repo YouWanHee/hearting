@@ -3,7 +3,8 @@
 ## Dispatch model realization
 
 `deep maker`, `deep reviewer`, `deep editor`, and `deep orchestrator` map to
-`opus`/xhigh. Retained `orchestrator` is the balanced mechanical role and maps to
+`fable`/high (the shipped deep tier equals the user's runtime mapping, 2026-09-08;
+the capacity cascade is `fable -> opus -> sonnet`). Retained `orchestrator` is the balanced mechanical role and maps to
 `sonnet`/high; it is not an alias for the standard+ dispatch-depth-1 conductor. Fast
 portable roles map to `sonnet`/high. The adapter mapper normalizes case,
 hyphens, and underscores but accepts no undocumented role aliases.
@@ -207,7 +208,8 @@ main/orchestrator chooses per job and the wrapper only reflects that choice:
   registered dispatch-depth-1/2 work. A `_kernel/owner` may therefore be profile-only and
   never needs a stage `worker_mode`. Non-route jobs retain explicit role or
   concrete-model selection. Headless inheritance is rejected because it cannot
-  prove that interactive-main-only `fable` will not leak into a worker.
+  prove that a config-declared interactive-main-only model will not leak into a
+  worker; the shipped list is empty, so `fable` itself is headless-eligible.
 - Dispatch prompts and jobs.log rows must spell out capability, mode, QA,
   intensity, depth, parent slug/session, worker type, model role/profile,
   profile tier/granularity, owner capability, and owner harness. Route-declared
@@ -359,8 +361,8 @@ Claude Code maps portable roles as follows:
 | `fast fact-checker` | `sonnet` |
 | `fast writer` | `sonnet` |
 | `fast implementer` | `sonnet` |
-| `deep reviewer` | `opus` |
-| `deep maker` | `opus` |
+| `deep reviewer` | `fable` |
+| `deep maker` | `fable` |
 | `external adversary` | Codex CLI via `codex-review-team` when available |
 | `orchestrator` | `sonnet` unless a task explicitly requires deep judgment |
 
