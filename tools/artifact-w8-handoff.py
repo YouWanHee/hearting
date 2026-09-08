@@ -17,6 +17,7 @@ import argparse
 import hashlib
 import json
 import os
+import stat
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -71,6 +72,7 @@ class LocatorSnapshot:
         self.root = root.resolve()
         self.inputs = {}
         self.maps = []
+        self.population_targets = []
         compat = C.compat_path(root)
         doc = json.loads(self.read(compat)) if compat.is_file() else {}
         if not compat.is_file():
@@ -129,6 +131,39 @@ class LocatorSnapshot:
         for path, raw in self.inputs.items():
             if (path.read_bytes() if path.exists() else None) != raw:
                 raise ValueError(f"locator-snapshot-drift: {path}")
+        for locator, digest, size, identity in self.population_targets:
+            if self.observe_target(locator, digest, size) != identity:
+                raise ValueError(f"population-target-replaced: {locator}")
+
+    def observe_target(self, locator, digest, size):
+        """Verify one regular file through an fd; no-follow at the leaf.
+
+        This detects changes at our validation boundaries, not arbitrary
+        concurrent writes after the final observation or a root-wide lock.
+        """
+        path = self.path(locator)
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
+            raise ValueError(f"population-target-missing: {locator}") from None
+        try:
+            before = os.fstat(fd)
+            if not stat.S_ISREG(before.st_mode):
+                raise ValueError(f"population-target-kind: {locator}")
+            h = hashlib.sha256()
+            for chunk in iter(lambda: os.read(fd, 1 << 20), b""):
+                h.update(chunk)
+            after = os.fstat(fd)
+            stamp = lambda s: (s.st_dev, s.st_ino, s.st_mode, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+            if (stamp(before) != stamp(after) or after.st_size != size
+                    or "sha256:" + h.hexdigest() != digest):
+                raise ValueError(f"population-target-drift: {locator}")
+            current = self.path(locator).lstat()
+            if not stat.S_ISREG(current.st_mode) or stamp(current) != stamp(after):
+                raise ValueError(f"population-target-replaced: {locator}")
+            return after.st_dev, after.st_ino
+        finally:
+            os.close(fd)
 
 
 PRIMARY_NAMES = ("final_report.md", "report.md", "prd.md", "plan.md")
@@ -330,11 +365,8 @@ class Bundle:
             locator = row["locator"]
             if locator in by_locator:
                 raise ValueError(f"population-locator-ambiguous: {locator}")
-            path = snapshot.path(locator)
-            if not path.is_file():
-                raise ValueError(f"population-target-missing: {locator}")
-            if sha_file(path) != row["content_digest"] or path.stat().st_size != row["byte_size"]:
-                raise ValueError(f"population-target-drift: {locator}")
+            identity = snapshot.observe_target(locator, row["content_digest"], row["byte_size"])
+            snapshot.population_targets.append((locator, row["content_digest"], row["byte_size"], identity))
             by_locator[locator] = row
         journal_path = self.w7_evidence / "applied-journal.jsonl"
         journal_raw = snapshot.read(journal_path)
@@ -580,6 +612,9 @@ class Bundle:
                           **({"existing notes": "notes.json"} if self.notes is not None else {})},
                  "files": self.files}
         index["bundle_digest"] = sha_text(canonical(self.files))
+        # handoff.json is the success seal: recheck after every other payload
+        # has been produced. A failure leaves unsealed files, never success.
+        self.mapping_snapshot.verify_unchanged()
         self.write("handoff.json", index)
         return index
 

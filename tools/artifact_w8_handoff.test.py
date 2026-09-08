@@ -355,6 +355,55 @@ class BundleBoundaryCLITest(producer_fixture.ProducerTestBase):
         self.assertIn("manifest-binding-mismatch", result.stderr)
         self.assertFalse(bundle.exists())
 
+    def test_publication_refuses_population_changes_after_initial_validation(self):
+        # 감독의 실제 Bundle.build 반례: 최초 검사 후 relocation 반환에서 변경.
+        # 두 번째 경계는 나머지 payload 생성 중 변경도 seal 직전에 잡는지 확인.
+        for boundary in ("relocation_handoff", "approval_boundary"):
+            for action in ("remove", "change", "symlink", "ancestor-symlink", "replace-same-bytes", "directory"):
+                with self.subTest(boundary=boundary, action=action):
+                    fixture = BundleBoundaryCLITest("test_default_and_explicit_w16_are_sealed_but_unauthorized")
+                    fixture.setUp()
+                    try:
+                        b = w8.Bundle(fixture.root, fixture.output_dir / "changed", [fixture.source_cycle],
+                                      fixture.inputs, fixture.inputs, fixture.inputs, fixture.backup, None)
+                        population = b.stable_population()
+                        target = fixture.root / population[0]["locator"]
+                        original = getattr(b, boundary)
+
+                        def mutate(*args):
+                            result = original(*args)
+                            if action == "remove":
+                                target.unlink()
+                            elif action == "change":
+                                target.write_bytes(b"changed after initial population verification")
+                            elif action == "symlink":
+                                other = target.with_name("replacement")
+                                other.write_bytes(target.read_bytes())
+                                target.unlink()
+                                target.symlink_to(other)
+                            elif action == "ancestor-symlink":
+                                moved = target.parent.with_name(target.parent.name + "-moved")
+                                target.parent.rename(moved)
+                                target.parent.symlink_to(moved, target_is_directory=True)
+                            elif action == "replace-same-bytes":
+                                other = target.with_name("replacement")
+                                other.write_bytes(target.read_bytes())
+                                other.replace(target)
+                            else:
+                                target.unlink()
+                                target.mkdir()
+                            return result
+
+                        setattr(b, boundary, mutate)
+                        with self.assertRaises((ValueError, OSError)):
+                            b.build()
+                        self.assertFalse((b.dir / "handoff.json").exists())
+                        if boundary == "relocation_handoff":
+                            self.assertFalse(b.dir.exists())
+                    finally:
+                        fixture.tearDown()
+                        fixture.doCleanups()
+
     def test_sealed_bundle_cannot_be_reissued_with_w16(self):
         bundle, _ = self.issue()
         before = {p.name: p.read_bytes() for p in bundle.iterdir()}
