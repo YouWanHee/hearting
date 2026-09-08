@@ -13,6 +13,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
 from dispatch_contract import EXECUTION_SURFACES, FALLBACK_HOPS, WRAPPER_TRANSPORTS  # noqa: E402
 
+import model_profile as PROFILE
+
 REGISTRY = ROOT / "capabilities" / "topologies.json"
 MANIFEST = ROOT / "harness-manifest.json"
 UNITS = ROOT / "roles" / "units"
@@ -857,6 +859,8 @@ def _validate_recipe(recipe, registry, standard_plus_owner_profile):
         if node.get("kind") not in registry["worker_kinds"]:
             raise TopologyError(f"{recipe['capability']}:{node['id']}: invalid worker kind")
         _validate_unit_ref(recipe, node, registry)
+        if "profile_demand" in node:
+            PROFILE.resolve_profile_demand(node["profile_demand"])
         if node["kind"] == "resource-runner":
             if "model_profile" in node:
                 raise TopologyError(
@@ -1083,6 +1087,8 @@ def _validate_recipe(recipe, registry, standard_plus_owner_profile):
             peers_in_prefix, auxiliary_count = 0, 0
             auxiliary_kinds, saw_auxiliary = set(), False
             for leg in legs:
+                if isinstance(leg, dict) and "profile_demand" in leg:
+                    PROFILE.resolve_profile_demand(leg["profile_demand"])
                 # 1: leg_class missing is a distinct single-assertion rejection.
                 if not isinstance(leg, dict) or "leg_class" not in leg:
                     raise TopologyError(
@@ -1105,14 +1111,14 @@ def _validate_recipe(recipe, registry, standard_plus_owner_profile):
                         raise TopologyError(
                             f"{recipe['capability']}:{group_id}: peer leg must not carry auxiliary_check"
                         )
-                    if set(leg) != {"suffix", "perspective", "model_profile", "leg_class"}:
+                    if set(leg) - {"profile_demand"} != {"suffix", "perspective", "model_profile", "leg_class"}:
                         raise TopologyError(
                             f"{recipe['capability']}:{group_id}: peer legs require exactly "
                             "suffix, perspective, model_profile, leg_class"
                         )
                     peers_in_prefix += 1
                 else:
-                    if set(leg) != {"suffix", "perspective", "model_profile",
+                    if set(leg) - {"profile_demand"} != {"suffix", "perspective", "model_profile",
                                     "leg_class", "auxiliary_check"}:
                         raise TopologyError(
                             f"{recipe['capability']}:{group_id}: auxiliary legs require exactly "
@@ -1312,13 +1318,14 @@ def validate_registry(registry, manifest=None):
     _validate_activation_conditions(registry)
     _validate_workflow_vocabulary(registry)
     expected_profiles = {
-        "deep": {"rank": 4, "tier": "deep", "effort": "xhigh", "registered_topology": True},
-        "balanced-deep": {"rank": 3, "tier": "deep", "effort": "medium", "registered_topology": True},
-        "light": {"rank": 2, "tier": "light", "effort": "medium", "registered_topology": True},
-        "mini": {"rank": 1, "tier": "mini", "effort": "medium", "registered_topology": False},
+        "deep": {"tier": "deep", "effort": "high", "registered_topology": True},
+        "balanced-deep": {"tier": "deep", "effort": "medium", "registered_topology": True},
+        "balanced": {"tier": "balanced", "effort": "high", "registered_topology": True},
+        "light": {"tier": "light", "effort": "medium", "registered_topology": True},
+        "mini": {"tier": "mini", "effort": "low", "registered_topology": False},
     }
     if registry.get("model_profiles") != expected_profiles:
-        raise TopologyError("model_profiles must declare the four portable execution profiles")
+        raise TopologyError("model_profiles must declare the five portable execution profiles")
     owner_policy = registry.get("owner_profile_by_intensity", {})
     standard_plus_profiles = {
         owner_policy.get(intensity)

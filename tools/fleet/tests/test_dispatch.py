@@ -760,7 +760,7 @@ class RegistryHomeTest(unittest.TestCase):
             ), mock.patch("pathlib.Path.home", return_value=Path(home)):
                 self.assertEqual(dispatch._registry_home(), str(Path(home) / "agent_setting"))
 
-    def test_dot_claude_fallback_when_linked_checkouts_absent(self):
+    def test_projection_home_is_not_an_installed_source_root(self):
         with tempfile.TemporaryDirectory() as home:
             (Path(home) / ".claude" / "core").mkdir(parents=True)
             (Path(home) / ".claude" / "core" / "CORE.md").write_text("x")
@@ -769,7 +769,7 @@ class RegistryHomeTest(unittest.TestCase):
                 {"HOME": home, "XDG_DATA_HOME": str(Path(home) / ".local" / "share")},
                 clear=True,
             ), mock.patch("pathlib.Path.home", return_value=Path(home)):
-                self.assertEqual(dispatch._registry_home(), str(Path(home) / ".claude"))
+                self.assertEqual(dispatch._registry_home(), str(Path(home) / ".local/share/hearting/current"))
 
     def test_jobs_path_override_beats_everything(self):
         with mock.patch.dict(os.environ,

@@ -61,6 +61,11 @@ profiles:
     relief: []
     last_resort: [opencode]
     promote_relief_below: 0
+  balanced:
+    primary: [claude, codex]
+    relief: []
+    last_resort: [opencode]
+    promote_relief_below: 0
   light:
     primary: [claude, codex, opencode]
     relief: []

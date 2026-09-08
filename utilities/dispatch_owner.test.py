@@ -205,8 +205,13 @@ class DispatchOwnerTests(unittest.TestCase):
         return rc, stdout.getvalue(), wrapper_calls
 
     def assert_model_map(self, result, adapter):
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         expected = resolve_profile(adapter, ROOT / "adapters" / adapter / "config" / "models.conf", "deep")
+        if adapter == "claude" and expected["model"] == "fable":
+            self.assertEqual(result.returncode, 64, result.stdout + result.stderr)
+            self.assertIn("reason=headless-main-session-only-model", result.stdout)
+            self.assertIn("child_spawned=0", result.stdout)
+            return
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn(f"adapter={adapter}", result.stdout)
         self.assertIn(f"model={expected['model']}", result.stdout)
         budget_key = "reasoning" if expected["budget_kind"] == "effort" and adapter == "codex" else expected["budget_kind"]
@@ -232,7 +237,7 @@ class DispatchOwnerTests(unittest.TestCase):
         config = self.balanced_config()
         selected = []
         for index in range(6):
-            result = self.run_owner(config=config)
+            result = self.run_owner(config=config, model_profile="balanced-deep")
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             match = next(
                 line.split("=", 1)[1]
@@ -304,7 +309,8 @@ class DispatchOwnerTests(unittest.TestCase):
         light = self.run_owner(config=config, model_profile="light")
         self.assertEqual(light.returncode, 0, light.stdout + light.stderr)
         self.assertIn("adapter=claude", light.stdout)
-        deep = self.run_owner(config=config, model_profile="deep")
+        # Both judgment profiles use the primary peer band; use the delegated-eligible one.
+        deep = self.run_owner(config=config, model_profile="balanced-deep")
         self.assertEqual(deep.returncode, 0, deep.stdout + deep.stderr)
         self.assertIn("quality_band=primary", deep.stdout)
         self.assertNotIn("adapter=opencode", deep.stdout)

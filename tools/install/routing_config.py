@@ -118,8 +118,8 @@ def render(enabled) -> str:
         f"  enabled: {inline(enabled)}",
         "profiles:",
     ]
-    for profile in ("deep", "balanced-deep", "light", "mini"):
-        light = profile in {"light", "mini"}
+    for profile in ("deep", "balanced-deep", "balanced", "light", "mini"):
+        light = profile in {"balanced", "light", "mini"}
         lines += [
             f"  {profile}:",
             f"    primary: {inline(peers + opencode if light else peers)}",
