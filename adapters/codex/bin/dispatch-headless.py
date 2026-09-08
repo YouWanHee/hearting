@@ -3156,16 +3156,26 @@ def main(argv: list[str]) -> int:
                 if terminal.get("state") == "valid"
                 else ""
             )
-            if outcome.failure and terminal.get("state") == "valid" and not terminal_note:
-                terminal_note = "completed-terminal-handoff"
+            # SD-72: an envelope is a semantic observation, not an OS exit
+            # receipt. Preserve the actual failure even when the final text
+            # says PASS (or reports a completed blocking review).
+            if outcome.failure:
+                terminal_note = f"dead-{outcome.failure}"
             terminal_closed = False
             if terminal_note:
                 terminal_evidence = {
                     "detected_by": "foreground-terminal-handoff",
-                    "failure_class": terminal["failure_class"],
-                    "terminal_event": terminal["terminal_event"],
+                    "failure_class": terminal.get("failure_class", "runtime"),
+                    "terminal_event": terminal.get("terminal_event", "-"),
                     "log_file": str(log_path),
+                    "process_exit": str(outcome.exit_code),
                 }
+                if outcome.failure:
+                    terminal_evidence.update(
+                        detected_by="foreground-process-exit",
+                        failure_class="runtime",
+                        reconcile_reason=outcome.failure,
+                    )
                 if terminal_note == REVIEW_BLOCKING_NOTE and terminal.get("artifact_path_b64"):
                     # OPERATIONS §5.10: seal the named review artifact like the join does.
                     terminal_evidence["review_artifact_b64"] = str(terminal["artifact_path_b64"])
@@ -3177,7 +3187,7 @@ def main(argv: list[str]) -> int:
                 )
                 if terminal_closed:
                     materialize_after_terminal_close(jobs, args.attempt_id)
-                args.worker_failure = terminal_note
+                args.worker_failure = outcome.failure or terminal_note
             if outcome.failure and not terminal_closed:
                 close_job_row(
                     jobs, args.slug, args.worktree, outcome.failure, "", args.attempt_id
