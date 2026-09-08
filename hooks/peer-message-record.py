@@ -159,7 +159,7 @@ def handle_prompt(payload):
     # the same rule the Codex hook and the OpenCode plugin apply, so all three harnesses
     # write the same `notice` shape.
     mod = _peer_message_module()
-    trailer = mod.parse_peer_trailer(prompt) if mod is not None else None
+    trailer = mod.parse_peer_trailer(prompt, {"harness": "claude", "session_id": str(session_id)}) if mod is not None else None
     if not trailer:
         return
     args_list = [

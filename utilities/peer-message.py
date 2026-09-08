@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import sys
 import time
 from pathlib import Path
@@ -49,20 +50,86 @@ _STEWARD_TARGETS_MAX = 32
 
 # F-100c — the harness-neutral sender trailer a steward appends to a herdr prompt so the
 # RECEIVER (Claude UserPromptSubmit hook, Codex userprompt hook, OpenCode plugin) can write
-# its own `notice` record with an exact sender: `(peer-from: <harness> <session_id> <name>)`.
+# its own `notice` record with an exact sender. New trailers display [tag] and
+# an opaque transfer ref; legacy full-session-id trailers remain receive-only.
 # Native Claude SendMessage already wraps its delivery in <cross-session-message from=…>;
 # a herdr prompt has no envelope, so the trailer is the envelope.
 _PEER_TRAILER_RE = re.compile(
     r"\(peer-from:\s*(?P<harness>[A-Za-z0-9_-]+)\s+(?P<sid>[^\s)]+)(?:\s+(?P<name>[^)]*?))?\s*\)")
 
 
-def peer_trailer(harness, session_id, name=None):
-    """The trailer line a steward appends to a herdr prompt body."""
-    parts = [str(harness or "unknown"), str(session_id or "-")]
-    clean = " ".join(str(name or "").replace(")", " ").split())
+def peer_alias(harness, session_id):
+    """Fleet's display tag only; never resolve a tag/name/pane back to an id."""
+    if not usable_session_id(session_id):
+        return "[?]"
+    try:
+        tools = str(Path(__file__).resolve().parents[1] / "tools")
+        if tools not in sys.path:
+            sys.path.insert(0, tools)
+        from fleet.session_handle import minted_tag, derived_tag
+        from fleet.titles import read_tag
+        tag = None
+        if harness in ("codex", "opencode"):
+            tag = minted_tag(session_id)
+        elif harness == "claude":
+            home = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+            for path in (home / "sessions").glob("*.json"):
+                try:
+                    rec = json.loads(path.read_text(encoding="utf-8"))
+                    if rec.get("sessionId") == session_id and rec.get("nameSource") == "derived":
+                        tag = derived_tag(rec.get("name"))
+                        if tag:
+                            break
+                except (OSError, ValueError, AttributeError):
+                    continue
+            tag = tag or read_tag(session_id, harness="claude")
+        return f"[{tag}]" if isinstance(tag, str) and re.fullmatch(r"[0-9a-f]{2}", tag) else "[?]"
+    except Exception:
+        return "[?]"
+
+
+def peer_trailer(harness, session_id, name=None, *, transfer_ref=None):
+    """Human display; old receivers reject bracketed tags as session identities."""
+    parts = [str(harness or "unknown"), peer_alias(harness, session_id)]
+    clean = " ".join(str(name or "").replace(")", " ").replace(";", " ").split())
+    if session_id:
+        clean = clean.replace(str(session_id), parts[1])
     if clean:
         parts.append(clean)
-    return "(peer-from: %s)" % " ".join(parts)
+    suffix = f" ; ref={transfer_ref}" if transfer_ref else ""
+    return "(peer-from: %s%s)" % (" ".join(parts), suffix)
+
+
+def _transfer_path(ref):
+    # No caller-controlled paths, legacy ids, or arbitrary-length lookup keys.
+    if not isinstance(ref, str) or not re.fullmatch(r"[0-9a-f]{32}", ref):
+        raise ValueError("invalid-peer-transfer-ref")
+    return _ledger_root() / "peer-messages" / "transfers" / f"{ref}.json"
+
+
+def prepare_peer_message(body, sender, recipient):
+    """Seal a transmission intent before delivery (the receiver may run immediately).
+
+    This immutable record shares the ledger's local write trust boundary; it is
+    not an authorization token. The final ledger row refers to this message_id.
+    Full identities live here, never in the generated display trailer.
+    """
+    ref = secrets.token_hex(16)
+    text = body.rstrip("\n") + "\n\n" + peer_trailer(
+        sender.get("harness"), sender.get("session_id"), sender.get("name"), transfer_ref=ref)
+    record = {"schema_version": 1, "message_id": ref, "from": dict(sender),
+              "to": dict(recipient), "body_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()}
+    path = _transfer_path(ref)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Exclusive create prevents rebinding an existing transfer. Readers hold a
+    # shared lock, so a partially written intent never becomes attribution.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        json.dump(record, fh, ensure_ascii=False)
+        fh.flush()
+        os.fsync(fh.fileno())
+    return text, ref
 
 
 def usable_session_id(value):
@@ -91,12 +158,12 @@ def usable_session_id(value):
     return text
 
 
-def parse_peer_trailer(text):
+def parse_peer_trailer(text, recipient=None):
     """→ {harness, session_id, name} for the LAST trailer in ``text``, else ``None``.
 
-    ``session_id`` is ``None`` when the trailer carried no usable id (see
-    ``usable_session_id``); the caller records the message without an exact sender
-    rather than recording a placeholder as one.
+    New aliases require a sealed transfer and the actual recipient tuple. A
+    missing/mismatched record yields session_id=None. Legacy full-id trailers
+    retain the existing receive semantics, never a fallback for a bad alias.
     """
     if not isinstance(text, str) or "peer-from:" not in text:
         return None
@@ -105,11 +172,51 @@ def parse_peer_trailer(text):
         pass
     if match is None:
         return None
-    return {
+    result = {
         "harness": match.group("harness").lower(),
         "session_id": usable_session_id(match.group("sid")),
         "name": (match.group("name") or "").strip() or None,
     }
+    if match.group("sid").startswith("["):
+        display_name, sep, ref = (match.group("name") or "").rpartition("; ref=")
+        if sep:
+            result["name"] = display_name.strip() or None
+        # Unknown tags, malformed metadata, wrong actual recipient and changed
+        # bodies remain notices without exact sender identity. No UUID fallback.
+        if not recipient or not re.fullmatch(r"\[[0-9a-f]{2}\]", match.group("sid")):
+            return result
+        try:
+            path = _transfer_path(ref)
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(fd, encoding="utf-8") as fh:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_SH)
+                record = json.load(fh)
+            sender, target = record["from"], record["to"]
+            if (record.get("schema_version") != 1 or record.get("message_id") != ref
+                    or record.get("body_sha256") != hashlib.sha256(text.encode("utf-8")).hexdigest()
+                    or sender.get("harness") != result["harness"]
+                    or not usable_session_id(sender.get("session_id"))
+                    or not usable_session_id(recipient.get("session_id"))
+                    or any(target.get(k) != recipient.get(k) for k in ("harness", "session_id"))):
+                return result
+            result.update(session_id=sender["session_id"], name=sender.get("name"))
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            pass
+    return result
+
+
+def cmd_receive(args):
+    """Canonical receive boundary for adapters without an in-process parser."""
+    text = sys.stdin.read()
+    trailer = parse_peer_trailer(text, {"harness": args.to_harness, "session_id": args.to_session_id})
+    if not trailer or not usable_session_id(args.to_session_id):
+        return 0
+    return cmd_record(argparse.Namespace(
+        from_harness=trailer["harness"], from_session_id=trailer["session_id"],
+        from_name=trailer["name"], from_project=args.from_project,
+        to_harness=args.to_harness, to_session_id=args.to_session_id, to_name=None,
+        kind="notice", surface="herdr", status="received", receipt=None, ref=[],
+        body_file=None, body_stdin=False))
 
 
 def claude_session_name(session_id, config_dir=None):
@@ -391,6 +498,11 @@ def cmd_record(args):
             },
             "refs": list(args.ref or []),
         }
+        transfer_ref = getattr(args, "transfer_ref", None)
+        if transfer_ref:
+            _transfer_path(transfer_ref)
+            rec["message_id"] = transfer_ref
+            rec["transfer_ref"] = transfer_ref
         path = _ledger_path(args.from_session_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         line = json.dumps(rec, ensure_ascii=False) + "\n"
@@ -549,6 +661,12 @@ def cmd_status(args):
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="peer-message")
     sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_receive = sub.add_parser("receive")
+    p_receive.add_argument("--to-harness", required=True)
+    p_receive.add_argument("--to-session-id", required=True)
+    p_receive.add_argument("--from-project", default="")
+    p_receive.set_defaults(func=cmd_receive)
 
     p_record = sub.add_parser("record")
     p_record.add_argument("--from-harness", required=True)

@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 _UTILITIES_DIR = Path(__file__).resolve().parent
+_UNSET_NAME = object()
 
 _PM_SPEC = importlib.util.spec_from_file_location(
     "peer_message", str(_UTILITIES_DIR / "peer-message.py")
@@ -121,7 +122,7 @@ def _resolve_target(target):
 
 def _record(*, to_harness, to_name, kind, ref=None, summary_text=None,
             receipt=None, status="sent", from_identity=None, to_session_id=None,
-            to_pane=None):
+            to_pane=None, transfer_ref=None, from_name=_UNSET_NAME):
     """Write one peer_message_v1 row.
 
     `from_identity` exists for the detached watcher: `_current_session_identity`
@@ -147,7 +148,7 @@ def _record(*, to_harness, to_name, kind, ref=None, summary_text=None,
         from_harness=from_harness,
         from_session_id=from_sid,
         from_project=from_project,
-        from_name=_from_name(from_harness, from_sid),
+        from_name=_from_name(from_harness, from_sid) if from_name is _UNSET_NAME else from_name,
         to_harness=to_harness,
         to_session_id=to_session_id,
         to_name=to_name,
@@ -159,6 +160,7 @@ def _record(*, to_harness, to_name, kind, ref=None, summary_text=None,
         ref=list(ref or []),
         body_file=body_file,
         body_stdin=False,
+        transfer_ref=transfer_ref,
     )
     try:
         peer_message.cmd_record(ns)
@@ -1353,10 +1355,18 @@ def cmd_prompt(args):
         return 1
     from_sid, from_harness = _current_session_identity()
     text = body.rstrip("\n")
-    if not args.no_trailer:
-        text += "\n\n" + peer_message.peer_trailer(
-            from_harness, from_sid, _from_name(from_harness, from_sid))
+    from_identity = (from_sid, from_harness, _project_of(os.getcwd()))
+    from_name = _from_name(from_harness, from_sid)
     t_harness, t_sid, _t_name = _resolve_target(args.target)
+    transfer_ref = None
+    if not args.no_trailer:
+        try:
+            text, transfer_ref = peer_message.prepare_peer_message(
+                body, {"harness": from_harness, "session_id": from_sid, "name": from_name},
+                {"harness": t_harness, "session_id": t_sid, "name": _t_name})
+        except (OSError, ValueError):
+            print("prompted=false reason=peer-transfer-record-unavailable")
+            return 1
     first = body.strip().splitlines()[0] if body.strip() else ""
     kind = "steer"
     for prefix, k in (("[steer]", "steer"), ("[handoff]", "handoff"), ("[gate]", "gate-relay")):
@@ -1421,10 +1431,11 @@ def cmd_prompt(args):
                f"herdr_rc={'-' if rc is None else rc} ms={elapsed_ms}"
                + (f" reason={reason}" if reason else ""))
     _record(to_harness=t_harness or "unknown", to_name=args.target, kind=kind,
-            summary_text=body, to_session_id=t_sid, to_pane=target_pane,
-            ref=args.ref, status=ledger_status, receipt=receipt)
+            summary_text=text, to_session_id=t_sid, to_pane=target_pane,
+            ref=args.ref, status=ledger_status, receipt=receipt,
+            from_identity=from_identity, from_name=from_name, transfer_ref=transfer_ref)
     line = (f"prompted={outcome} target={args.target} "
-            f"to_harness={t_harness or '-'} to_session_id={t_sid or '-'} kind={kind} "
+            f"to_harness={t_harness or '-'} to_alias={peer_message.peer_alias(t_harness, t_sid)} kind={kind} "
             f"state_before={state_before} verify={verify} ms={elapsed_ms}")
     if reason:
         line += f" reason={reason}"
