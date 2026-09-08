@@ -349,6 +349,8 @@ class FakeProcEquivalenceTest(unittest.TestCase):
             d.mkdir()
             if "tail" in spec:
                 (d / "stat").write_text(self._stat(pid, spec["tail"]), encoding="utf-8")
+            if "stat_bytes" in spec:
+                (d / "stat").write_bytes(spec["stat_bytes"])
             if spec.get("stat_unreadable"):
                 (d / "stat").write_text("0 (x) S\n", encoding="utf-8")
                 (d / "stat").chmod(0)
@@ -414,6 +416,29 @@ class FakeProcEquivalenceTest(unittest.TestCase):
         # The tagged probe skips the unreadable stat silently and reports the short one.
         self.assertEqual((got[("tag", "att-x")].state, got[("tag", "att-x")].reason),
                          ("populated", "procfs-member:102:malformed"))
+
+    def test_non_utf8_comm_is_a_malformed_row_not_a_crashed_walk(self):
+        """review round 2, major 1: `read_text(encoding="utf-8")` raises
+        UnicodeDecodeError (a ValueError) for a comm that is not UTF-8; both single-shot
+        probes count that row as malformed and keep walking."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._build(tmp, {
+                100: {"stat_bytes": b"100 (bad\xff) S 1 77 " + b"0 " * 16 + b"123\n",
+                      "environ": (_TAG + "att-x\0").encode()},
+                104: {"tail": self._full_tail(pgid="88", start="9"),
+                      "environ": (_TAG + "att-y\0").encode()},
+            })
+            got = self._compare(root, tagged=["att-x", "att-y"], groups=[77, 88, 99])
+        self.assertEqual((got[("tag", "att-x")].state, got[("tag", "att-x")].reason),
+                         ("unverifiable", "procfs-member:100:malformed"))
+        self.assertEqual((got[("tag", "att-y")].state, got[("tag", "att-y")].members,
+                          got[("tag", "att-y")].reason),
+                         ("populated", ((104, "9", "S"),), "procfs-member:100:malformed"))
+        for pgid in (77, 99):
+            self.assertEqual((got[("group", pgid)].state, got[("group", pgid)].reason),
+                             ("unverifiable", "procfs-member:100:malformed"))
+        self.assertEqual((got[("group", 88)].state, got[("group", 88)].reason),
+                         ("populated", "procfs-member:100:malformed"))
 
     def test_duplicate_and_multiple_tag_entries_name_a_process_once(self):
         with tempfile.TemporaryDirectory() as tmp:

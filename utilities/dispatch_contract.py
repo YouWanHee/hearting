@@ -2324,6 +2324,14 @@ def scan_process_table() -> ProcessTableScan:
             if exc.errno not in {errno.EACCES, errno.EPERM}:
                 incomplete_reason = f"procfs-environ:{entry.name}:{exc.errno or 'error'}"
             continue
+        except ValueError:
+            # A comm that is not UTF-8 raises UnicodeDecodeError (a ValueError) out
+            # of the read itself; both single-shot probes count that row as
+            # malformed before any field is compared (review round 2, major 1).
+            reason = f"procfs-member:{entry.name}:malformed"
+            group_errors.append((order, None, reason))
+            incomplete_reason = reason
+            continue
         tail = raw[raw.rfind(")") + 2 :].split()
         pid = int(entry.name)
         # Group index: the single-shot probe compares `int(tail[2])` before it
