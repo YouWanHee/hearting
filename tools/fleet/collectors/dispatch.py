@@ -501,6 +501,15 @@ def _row_state_roots(job=None, agent_home=None):
     return candidates[:1]
 
 
+def _sealed_codex_home(job):
+    metadata = getattr(job, "_registry_metadata", None)
+    if isinstance(metadata, dict) and "codex_home" in metadata:
+        value = metadata["codex_home"]
+        # Invalid explicit bindings must not fall back to an unrelated home.
+        return value if isinstance(value, str) and os.path.isabs(value) else ""
+    return None
+
+
 def _codex_sessions_dirs_for_profile(profile, slug, job=None):
     return [
         os.path.join(root, "homes", "%s.%s" % (slug, profile), "sessions")
@@ -522,13 +531,19 @@ def _codex_sessions_dirs(cwd, profile=None, slug=None, job=None):
     so inspect the deterministic local projection before the Fleet process' own home.
     Profile jobs remain isolated to their explicit profile home.
     """
+    sealed = _sealed_codex_home(job)
+    if sealed is not None:
+        return [os.path.join(sealed, "sessions")] if sealed else []
     if profile and slug:
         return _codex_sessions_dirs_for_profile(profile, slug, job=job)
 
     candidates = []
     if cwd:
+        if job is not None:
+            candidates.append(os.path.join(cwd, ".dispatch", "nested-codex-home", "sessions"))
         candidates.append(os.path.join(cwd, ".dispatch", "codex-home", "sessions"))
-    candidates.append(_codex_sessions_dir())
+    if job is None or not cwd:
+        candidates.append(_codex_sessions_dir())
 
     result = []
     seen = set()
@@ -1535,6 +1550,10 @@ def _codex_attempt_rollout(job, thread_id):
         from . import codex as codex_collector
     except Exception:
         return None
+    sealed = _sealed_codex_home(job)
+    if sealed is not None:
+        return (codex_collector.exact_rollout_for_session_id(thread_id, homes=[sealed])
+                if sealed else None)
     homes = []
     cwd = getattr(job, "cwd", None)
     if isinstance(cwd, str) and cwd:
@@ -1543,10 +1562,11 @@ def _codex_attempt_rollout(job, thread_id):
             os.path.join(dispatch_dir, "nested-codex-home"),
             os.path.join(dispatch_dir, "codex-home"),
         ))
-    env_home = os.environ.get("CODEX_HOME")
-    if env_home:
-        homes.append(env_home)
-    homes.append(os.path.expanduser("~/.codex"))
+    # A legacy row with a worktree has only its deterministic legacy homes.
+    # Fleet's ambient home cannot acquire ownership of that row's thread.
+    if not homes:
+        env_home = os.environ.get("CODEX_HOME")
+        homes.append(env_home or os.path.expanduser("~/.codex"))
     return codex_collector.exact_rollout_for_session_id(thread_id, homes=homes)
 
 
@@ -2728,6 +2748,11 @@ def _scan_jobs_log(path, seen_slugs, seen_keys=None, registry_priority=0,
             model_role=meta.get("model_role"),
             model_profile=meta.get("model_profile"), model_tier=meta.get("model_tier"),
             profile_granularity=meta.get("profile_granularity"),
+            profile_selection_source=meta.get("profile_selection_source"),
+            profile_resolver_version=meta.get("profile_resolver_version"),
+            profile_demand_digest=meta.get("profile_demand_digest"),
+            profile_selection_digest=meta.get("profile_selection_digest"),
+            profile_judgment_floor=meta.get("profile_judgment_floor"),
             parallel_group=meta.get("parallel_group") or meta.get("replica_group"),
             replica_group=meta.get("replica_group"),
             perspective=meta.get("perspective") or meta.get("batch_perspective"),

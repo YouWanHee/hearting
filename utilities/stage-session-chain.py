@@ -186,6 +186,8 @@ def _run_parallel_subdivision(
         print(f"chain_id={admission.manifest['chain_id']}")
         print(f"registered_sessions={len(admission.sessions)}")
         return 0
+    # The batch helper can only precheck before crossing into the adapter
+    # subprocess; the adapter's jobs.log.lock critical section is the fence.
     results = SUBDIVISION_ADMISSION.start_admitted_batch(
         admission, parent=args.parent, jobs=jobs,
         governor_reservation_env=GOVERNOR_RESERVATION_ENV,
@@ -351,6 +353,8 @@ def main() -> int:
     p.add_argument("--output", help="plan-slices: manifest path to write (briefs are written beside it)")
     p.add_argument("--adapter", default="claude", choices=("claude", "codex", "opencode"))
     args = p.parse_args()
+    from dispatch_terminal_commit import require_current_cleanup
+    require_current_cleanup('chain')
     if args.action == "plan-slices":
         missing = [name for name in ("route", "slices", "output") if not getattr(args, name)]
         if missing:

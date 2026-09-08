@@ -164,8 +164,8 @@ usage: preflight.sh write <file> [session-id] [turn-id]
        preflight.sh nested-headless --parent-harness <h> --parent-transport <t> --parent-sandbox <s> --child-harness <h> --launch-authority <authority> --worktree <path> [--prospective-standard-owner --jobs <canonical-jobs.log>] [--user-disabled] [--json]
        preflight.sh dispatch-readiness --worktree <path> --jobs <canonical-jobs.log> --owner-harness <h>... --child-harness <h>... --output <evidence.json>
        preflight.sh broker <status|stop> --jobs <jobs.log> [--root <broker-root>]  # legacy drain only
-       preflight.sh dispatch [--dry-run|--register|--start] [--require-hook-trust] --worktree <path> --slug <slug> --capability <name> --capability-mode <mode> [--worker-mode <family/mode>] --qa <level> [--intensity <level>] [--dispatch-depth 1|2] [--parent <slug>] [--worker-type owner|stage|review|support] [--unit <unit>] [--assigned-contract <capability>] [--owner <capability>] (--model-profile <deep|balanced-deep|light|mini> [--model-role <role>]|--model-role <role>|--model <model> --reasoning <effort>|--inherit-model-settings) [--prompt-file <file>|--prompt-text <text>] [--jobs <jobs.log>]
-       preflight.sh dispatch-owner [--adapter <harness>] [--dry-run|--register|--start] --worktree <path> --slug <slug> --capability <name> --capability-mode <mode> --qa <level> --intensity <level> --dispatch-depth 1 --worker-type owner --assigned-contract <capability> --owner <capability> --model-profile <deep|balanced-deep|light> [--prompt-file <file>|--prompt-text <text>] [--jobs <jobs.log>]
+       preflight.sh dispatch [--dry-run|--register|--start] [--require-hook-trust] --worktree <path> --slug <slug> --capability <name> --capability-mode <mode> [--worker-mode <family/mode>] --qa <level> [--intensity <level>] [--dispatch-depth 1|2] [--parent <slug>] [--worker-type owner|stage|review|support] [--unit <unit>] [--assigned-contract <capability>] [--owner <capability>] (--model-profile <deep|balanced-deep|balanced|light|mini> [--model-role <role>]|--model-role <role>|--model <model> --reasoning <effort>|--inherit-model-settings) [--prompt-file <file>|--prompt-text <text>] [--jobs <jobs.log>]
+       preflight.sh dispatch-owner [--adapter <harness>] [--dry-run|--register|--start] --worktree <path> --slug <slug> --capability <name> --capability-mode <mode> --qa <level> --intensity <level> --dispatch-depth 1 --worker-type owner --assigned-contract <capability> --owner <capability> --model-profile <deep|balanced-deep|balanced|light> [--prompt-file <file>|--prompt-text <text>] [--jobs <jobs.log>]
        preflight.sh dispatch-chain --route <route.json> --node <id> --slug <slug> --parent <slug> [--capability-mode <mode>] [--worker-mode <family/mode>] [--model-role <role>] [--capacity-model <id> --capacity-reasoning|--capacity-effort|--capacity-variant <level>] [--progress-window-seconds N --watchdog-max-windows M] [--dry-run|--register|--start]
        preflight.sh dispatch-session-chain <check|register|start> --manifest <chain.json> --parent <slug> [--jobs <jobs.log>]
        preflight.sh dispatch-batch --route <route.json> --parallel-group <id> --slug-prefix <slug> --parent <slug> --action dry-run|start [--qa <level>] [--jobs <jobs.log>] [--prompt-text <text>] [--allow-degraded-independence]
@@ -376,8 +376,14 @@ case "$cmd" in
     esac
     ;;
   write)
-    [ "$#" -ge 2 ] || { echo "codex preflight: write requires a file path" >&2; exit 64; }
+    if [ "${2:-}" = "-h" ] || [ "${2:-}" = "--help" ]; then
+      [ "$#" -eq 2 ] || { echo "codex preflight: write help accepts no extra arguments" >&2; exit 64; }
+      printf '%s\n' 'usage: preflight.sh write <file> [session-id] [turn-id]'
+      exit 0
+    fi
+    [ "$#" -ge 2 ] && [ "$#" -le 4 ] || { echo "codex preflight: write expects <file> [session-id] [turn-id]" >&2; exit 64; }
     file=$2
+    case "$file" in -*) echo "codex preflight: write file must be absolute or ./-prefixed" >&2; exit 64;; esac
     sid=${3:-${AGENT_DISPATCH_ATTEMPT_ID:-codex}}
     guard_identity_hard_fail_if_worker "$sid"
     turn=${4:-}
@@ -430,10 +436,12 @@ case "$cmd" in
              esac ;;
         esac ;;
     esac
+    material_tool=Write
+    [ -n "${AGENT_REVIEW_OUTPUT:-}" ] && material_tool=ArtifactWrite
     if [ -n "$turn" ]; then
-      "$0" material-route check --tool Write --file "$file" --cwd "$(dirname "$file")" --session "$sid" --turn "$turn"
+      "$0" material-route check --tool "$material_tool" --file "$file" --cwd "$(dirname "$file")" --session "$sid" --turn "$turn"
     else
-      "$0" material-route check --tool Write --file "$file" --cwd "$(dirname "$file")" --session "$sid"
+      "$0" material-route check --tool "$material_tool" --file "$file" --cwd "$(dirname "$file")" --session "$sid"
     fi
     ;;
   read)
@@ -441,8 +449,8 @@ case "$cmd" in
     file=$2
     sid=${3:-${AGENT_DISPATCH_ATTEMPT_ID:-codex}}
     guard_identity_hard_fail_if_worker "$sid"
-    "$ROOT/hooks/core-read-marker.sh" --file "$file" --session "$sid"
-    "$ROOT/hooks/spec-read-marker.sh" --file "$file" --session "$sid"
+    "$ROOT/hooks/core-read-marker.sh" --file "$file" --session "$sid" || exit $?
+    "$ROOT/hooks/spec-read-marker.sh" --file "$file" --session "$sid" || exit $?
     ;;
   compose)
     # SD-135: preset-free work route (shape/subgraph); same compiler, same bind.
@@ -735,7 +743,7 @@ tool_contract_check=adapters/codex/bin/preflight.sh headless --check <worktree>
 strict_tool_contract_check=adapters/codex/bin/preflight.sh headless --check --require-hook-trust <worktree>
 command_template=codex exec --cd <worktree> --sandbox workspace-write (--model <main-selected-model> -c model_reasoning_effort=<main-selected-reasoning>|inherit) -c approval_policy=never --json -
 model_selection_policy=main-orchestrator-must-select-per-job
-model_selection_surface=--model-profile <deep|balanced-deep|light|mini> [--model-role <portable-role>]|--model-role <portable-role>|--model <model> --reasoning <effort>|--inherit-model-settings
+model_selection_surface=--model-profile <deep|balanced-deep|balanced|light|mini> [--model-role <portable-role>]|--model-role <portable-role>|--model <model> --reasoning <effort>|--inherit-model-settings
 runtime_projection_requires=hearting,AGENTS.md,hooks.json,native-skills,native-agents,native-modes
 runtime_projection_strict_requires=complete-codex-hook-trust
 job_registry=<agent-home>/.dispatch/jobs.log (immutable AGENT_DISPATCH_JOBS for descendants)

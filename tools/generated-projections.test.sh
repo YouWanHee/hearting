@@ -177,6 +177,12 @@ require_bootstrap_clause() {
       ;;
   esac
 }
+has_entry_confirmation() {
+  case "$1" in
+    *'present the five-field card in §0.4 before'*|*'present the §0.4 five-field card before'*|*'else the §0.4 card unless approved'*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 for bootstrap in \
   "$ROOT/adapters/claude/CLAUDE.md" \
   "$ROOT/adapters/codex/AGENTS.md" \
@@ -198,15 +204,37 @@ for bootstrap in \
       autonomy_clause='continue low-risk reversible work autonomously'
       ;;
   esac
-  grep -Fq "$entry_pointer" "$bootstrap" || {
-    echo "not ok - entry confirmation pointer missing from $bootstrap" >&2
-    exit 1
-  }
   # Bootstrap prose is hard-wrapped, so match against a whitespace-normalized
   # copy: a restored clause must survive an unrelated reflow.
   bootstrap_flat=$(tr '\n' ' ' < "$bootstrap" | tr -s ' ' | tr 'A-Z' 'a-z')
-  require_bootstrap_clause "$completion_pointer" 'WORKFLOW §0.5 completion report pointer'
-  require_bootstrap_clause "$autonomy_clause" 'structured-input autonomy threshold'
+  has_entry_confirmation "$bootstrap_flat" || {
+    echo "not ok - entry confirmation pointer missing from $bootstrap" >&2
+    exit 1
+  }
+  # Removing the entry action must fail even with the evidence-check exemption
+  # elsewhere in each real bootstrap. Preserve the rest of the text verbatim.
+  without_entry=$(printf '%s' "$bootstrap_flat" | sed -E \
+    's/present the (five-field card in §0\.4|§0\.4 five-field card) before//g; s/else the §0\.4 card unless approved//g')
+  if has_entry_confirmation "$without_entry"; then
+    echo "not ok - entry confirmation check accepts a missing action in $bootstrap" >&2
+    exit 1
+  fi
+  case "$bootstrap_flat" in
+    *'five-field completion card in §0.5'*|*'§0.5 card'*|*'close with §0.5'*) ;;
+    *)
+      echo "not ok - WORKFLOW §0.5 completion report pointer missing from $bootstrap" >&2
+      exit 1
+      ;;
+  esac
+  case "$bootstrap_flat" in
+    *'continue low-risk reversible work autonomously'*|*'continue reversible in-flow work'*) ;;
+    *)
+      echo "not ok - structured-input autonomy threshold missing from $bootstrap" >&2
+      exit 1
+      ;;
+  esac
+  require_bootstrap_clause "$completion_pointer" "WORKFLOW completion pointer"
+  require_bootstrap_clause "$autonomy_clause" "structured-input autonomy threshold"
   while IFS='|' read -r needle label; do
     [ -n "$needle" ] || continue
     require_bootstrap_clause "$needle" "$label"

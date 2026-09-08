@@ -802,6 +802,9 @@ def coordinate_stage_advance(
         if "registered" not in record["phases"]:
             cp("before-register")
             try:
+                # The concrete registry claim performs the terminal-claim
+                # single-read under jobs.log.lock; coordinator state locks do
+                # not cross the fallback subprocess boundary.
                 claim = services.claim(
                     request,
                     stage_advance_id=stage_advance_id,

@@ -36,7 +36,11 @@ from typing import Any, Iterable, NamedTuple
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
-from dispatch_contract import resolve_agent_home as _resolve_agent_home  # noqa: E402
+from dispatch_contract import (  # noqa: E402
+    resolve_agent_home as _resolve_agent_home,
+    resolve_dispatch_state_root,
+)
+from artifact_producer import review_output_write_authorized_from_cycle  # noqa: E402
 
 STATE_DIR_NAME = ".route-grounding"
 MARKER_SCHEMA = 1
@@ -759,6 +763,34 @@ def artifact_bucket_caps(rel_parts: tuple[str, ...]) -> set[str] | None:
     return CAPABILITY_ARTIFACT_CAPS.get(top)
 
 
+def _same_git_repository(a: Path, b: Path) -> bool:
+    """True when both paths live in the same git repository family.
+
+    The per-turn recall probe runs in the runtime session directory, but
+    material work legitimately proceeds in a linked worktree with the route
+    bound there (OpenCode has no per-turn cd; Claude/Codex probes follow the
+    session cwd the same way). A linked worktree shares the main checkout's
+    common dir and memory is project-scoped, so a receipt from the same
+    repository family is the same-project proof this check exists for. Exact
+    path equality stays the primary condition; unrelated repositories still
+    refuse.
+    """
+    try:
+        a_resolved = a.resolve(strict=False)
+        b_resolved = b.resolve(strict=False)
+    except OSError:
+        return False
+    if a_resolved == b_resolved:
+        return True
+    common_a = _git_common_dir(a_resolved)
+    common_b = _git_common_dir(b_resolved)
+    return (
+        common_a is not None
+        and common_b is not None
+        and common_a == common_b
+    )
+
+
 def require_recall_opportunity(session_id: str, turn_id: str, root: Path) -> None:
     path = recall_receipt_path(session_id)
     try:
@@ -773,7 +805,8 @@ def require_recall_opportunity(session_id: str, turn_id: str, root: Path) -> Non
         raise RouteError("recall-opportunity-invalid")
     if receipt.get("session_digest") != recall_session_key(session_id):
         raise RouteError("recall-opportunity-foreign")
-    if Path(str(receipt.get("cwd", ""))).resolve(strict=False) != root.resolve():
+    receipt_cwd = Path(str(receipt.get("cwd", ""))).resolve(strict=False)
+    if receipt_cwd != root.resolve() and not _same_git_repository(receipt_cwd, root):
         raise RouteError("recall-opportunity-cwd-mismatch")
     created_at_ns = receipt.get("created_at_ns")
     if not isinstance(created_at_ns, int) or isinstance(created_at_ns, bool):
@@ -1248,6 +1281,34 @@ def commit_has_material(
     return False
 
 
+def _review_output_authorized(target: Path, accepted: set[str]) -> bool:
+    """Check the route-free review exception against registry and lease state."""
+    if "autopilot-code" not in accepted:
+        return False
+    attempt = os.environ.get("AGENT_DISPATCH_ATTEMPT_ID", "")
+    jobs = os.environ.get("AGENT_DISPATCH_JOBS", "")
+    cycle = os.environ.get("AGENT_REVIEW_CYCLE_ID", "")
+    output = os.environ.get("AGENT_REVIEW_OUTPUT", "")
+    if not all((attempt, jobs, cycle, output)):
+        return False
+    try:
+        exact_target = target.resolve(strict=False)
+        if exact_target != Path(output).resolve(strict=False):
+            return False
+        roots = [
+            parent for parent in (exact_target, *exact_target.parents)
+            if parent.name in {".agent_reports", ".claude_reports"}
+        ]
+        if len(roots) != 1:
+            return False
+        return review_output_write_authorized_from_cycle(
+            roots[0].resolve(strict=False), jobs=jobs, attempt_id=attempt,
+            cycle_id=cycle, review_output=exact_target,
+        )
+    except (OSError, ValueError, TypeError):
+        return False
+
+
 def check_action(
     tool: str,
     cwd: Path,
@@ -1258,18 +1319,47 @@ def check_action(
     command: str = "",
     turn_id: str = "",
 ) -> None:
+    # Terminal cleanup is a narrower capability than the ordinary cycle route.
+    # Evaluate it first so a valid material route cannot widen an active
+    # cleanup scope (the hook and direct writers share this oracle).
+    owner = os.environ.get("AGENT_DISPATCH_ATTEMPT_ID", "")
+    if owner:
+        try:
+            import dispatch_terminal_commit
+            jobs = os.environ.get("AGENT_DISPATCH_JOBS")
+            state_root = Path(jobs).parent if jobs else resolve_dispatch_state_root(resolve_agent_home(agent_home))
+            scope = dispatch_terminal_commit.load_active_cleanup_scope(state_root, owner)
+            if scope is not None:
+                verdict = dispatch_terminal_commit.cleanup_tool_permission(
+                    scope, tool=tool, arguments={"file_path": file_path, "command": command},
+                    cwd=cwd, owner_attempt_id=owner, route_id=os.environ.get("AGENT_ROUTE_ID", ""))
+                if verdict.verdict != "allowed":
+                    raise RouteError("cleanup-scope-" + (verdict.detail or verdict.verdict))
+                return
+        except RouteError:
+            raise
+        except Exception as exc:
+            raise RouteError("cleanup-scope-unavailable") from exc
+
     if tool == "ArtifactWrite":
         if not file_path:
             return
         target = _resolve_path(cwd, file_path)
         accepted = capability_artifact_caps(target)
+        if os.environ.get("AGENT_REVIEW_OUTPUT") or os.environ.get(
+            "AGENT_REVIEW_CYCLE_ID"
+        ):
+            if accepted and _review_output_authorized(target, accepted):
+                return
+            raise RouteError("review-output-not-authorized")
         if not accepted:
             return
-        route, is_worker, sealed_root = artifact_active_route(
-            session_id,
-            agent_home,
-            accepted_capabilities=accepted,
-        )
+        try:
+            route, is_worker, sealed_root = artifact_active_route(
+                session_id, agent_home, accepted_capabilities=accepted,
+            )
+        except RouteError:
+            raise
         artifact_root = Path(str(route.get("artifact_root", ""))).resolve(
             strict=False
         )

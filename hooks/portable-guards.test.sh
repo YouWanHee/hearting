@@ -1257,7 +1257,7 @@ if "$CODEX" headless >"$TMP/logs/codex_headless.out" 2>"$TMP/logs/codex_headless
   && grep -q '^runtime_projection_requires=hearting,AGENTS.md,hooks.json,native-skills,native-agents,native-modes$' "$TMP/logs/codex_headless.out" \
   && grep -q '^runtime_projection_strict_requires=complete-codex-hook-trust$' "$TMP/logs/codex_headless.out" \
   && grep -q '^model_selection_policy=main-orchestrator-must-select-per-job$' "$TMP/logs/codex_headless.out" \
-  && grep -q '^model_selection_surface=--model-profile <deep|balanced-deep|light|mini> \[--model-role <portable-role>\]|--model-role <portable-role>|--model <model> --reasoning <effort>|--inherit-model-settings$' "$TMP/logs/codex_headless.out" \
+  && grep -q '^model_selection_surface=--model-profile <deep|balanced-deep|balanced|light|mini> \[--model-role <portable-role>\]|--model-role <portable-role>|--model <model> --reasoning <effort>|--inherit-model-settings$' "$TMP/logs/codex_headless.out" \
   && grep -q '^claude_headless=unsupported$' "$TMP/logs/codex_headless.out" \
   && grep -q '^liveness_surface=codex-session-jsonl-mtime$' "$TMP/logs/codex_headless.out" \
   && grep -q '^liveness_check=adapters/codex/bin/preflight.sh liveness \[jobs.log\]$' "$TMP/logs/codex_headless.out" \
@@ -2442,9 +2442,9 @@ from pathlib import Path
 
 root = Path(sys.argv[1])
 agents = sorted(root.glob("*.toml"))
-# The current native catalog carries the three general worker profiles plus the
+# The current native catalog carries the four general worker profiles plus the
 # kernel memory scout. Keep this list exact so stale or accidental agents fail.
-expected = ["deep.toml", "general-purpose.toml", "light.toml", "memory-scout.toml"]
+expected = ["balanced.toml", "deep.toml", "general-purpose.toml", "light.toml", "memory-scout.toml"]
 if [a.name for a in agents] != expected:
     raise SystemExit(f"expected {expected}, got {[a.name for a in agents]}")
 for agent in agents:
@@ -2943,6 +2943,17 @@ if printf '{"tool_name":"Bash","tool_input":{"command":"cat .agent_reports/spec/
 else
   bad "codex native read hook should mark obvious shell spec reads"
 fi
+shared_repo="$TMP/sharedrepo"
+shared_prd="$shared_repo/.agent_reports/shared/spec/ref_fixture/revisions/rrev_fixture/stage-dispatch/prd.md"
+mkdir -p "$(dirname "$shared_prd")"
+printf 'shared prd\n' > "$shared_prd"
+if printf '{"tool_name":"functions.exec_command","tool_input":{"cmd":"sed -n 1,120p %s"},"session_id":"shellsharedreadsid","cwd":"%s"}\n' "$shared_prd" "$shared_repo" \
+  | AGENT_HOME="$TMP/codex_marker_home" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/posttooluse-read-marker.py" >/tmp/codex_shared_read_hook.out 2>/tmp/codex_shared_read_hook.err \
+  && find "$TMP/codex_marker_home/.spec-grounding" -type f -name 'shellsharedreadsid__*' -print -quit | grep -q .; then
+  ok "codex native read hook marks shell reads of canonical shared spec revisions"
+else
+  bad "codex native read hook should mark canonical shared spec revision reads"
+fi
 mkdir -p "$TMP/repo/core"
 printf 'core\n' > "$TMP/repo/core/MEMORY.md"
 if printf '{"tool_name":"Read","tool_input":{"file_path":"%s"},"session_id":"corereadsid","cwd":"%s"}\n' "$TMP/repo/core/MEMORY.md" "$TMP/repo" \
@@ -3393,7 +3404,8 @@ fi
 # bootstrap/router/unit-catalog warning census. The count and representative
 # warnings keep an unrelated footprint regression from passing silently.
 # The four totals below are OBSERVED values re-pinned at the 88f93b130
-# integration merge (2026-09-06), produced by:
+# integration merge (2026-09-06); owner re-observed at 8321 after the incoming
+# steward contract integration (2026-09-08), produced by:
 #   python3 tools/context-footprint.py --root . --skip-runtime --skip-hooks
 # They are worker-bootstrap kernel + fragment sizes, which the contract
 # legitimately grows; growing them is a deliberate re-pin, never an automatic
@@ -3408,7 +3420,7 @@ if python3 "$ROOT/tools/context-footprint.py" --root "$ROOT" --skip-runtime --sk
   && ! grep -q '^surface=native-bootstrap-agent-modes' "$TMP/context_footprint.out" \
   && { grep -q '^status=ok' "$TMP/context_footprint.out" \
     || { grep -q '^status=warn warnings=19$' "$TMP/context_footprint.out" \
-      && grep -q 'owner worker bootstrap 8047 > 4096 bytes' "$TMP/context_footprint.out" \
+      && grep -q 'owner worker bootstrap 8321 > 4096 bytes' "$TMP/context_footprint.out" \
       && grep -q 'stage worker bootstrap 7072 > 4096 bytes' "$TMP/context_footprint.out" \
       && grep -q 'review worker bootstrap 6106 > 4096 bytes' "$TMP/context_footprint.out" \
       && grep -q 'support worker bootstrap 5735 > 4096 bytes' "$TMP/context_footprint.out" \
@@ -3885,7 +3897,7 @@ if "$OPENCODE" headless >"$TMP/logs/opencode_headless.out" 2>"$TMP/logs/opencode
   && grep -q '^runtime_surface=opencode-run-headless$' "$TMP/logs/opencode_headless.out" \
   && grep -q '^tool_contract=headless-dispatch$' "$TMP/logs/opencode_headless.out" \
   && grep -q '^model_selection_policy=main-orchestrator-must-select-per-job$' "$TMP/logs/opencode_headless.out" \
-  && grep -q '^model_selection_surface=--model-profile <deep|balanced-deep|light|mini> \[--model-role <portable-role>\]|--model-role <portable-role>|--model <model> --variant <variant>|--inherit-model-settings$' "$TMP/logs/opencode_headless.out" \
+  && grep -q '^model_selection_surface=--model-profile <deep|balanced-deep|balanced|light|mini> \[--model-role <portable-role>\]|--model-role <portable-role>|--model <model> --variant <variant>|--inherit-model-settings$' "$TMP/logs/opencode_headless.out" \
   && grep -q '^claude_headless=unsupported$' "$TMP/logs/opencode_headless.out" \
   && grep -q '^liveness_surface=opencode-sqlite-session-mtime+plugin-heartbeat$' "$TMP/logs/opencode_headless.out" \
   && grep -q '^liveness_heartbeat=<agent-home>/.dispatch/logs/<slug>.heartbeat$' "$TMP/logs/opencode_headless.out" \
@@ -5363,15 +5375,15 @@ tools/migration-manifest.py:229:
 tools/migration-manifest.py:236:
 tools/fleet/collectors/dispatch.py:8:
 tools/fleet/collectors/dispatch.py:488:
-tools/fleet/collectors/dispatch.py:931:
-tools/fleet/collectors/dispatch.py:953:
-tools/fleet/collectors/dispatch.py:967:
-tools/fleet/collectors/dispatch.py:1014:
+tools/fleet/collectors/dispatch.py:946:
+tools/fleet/collectors/dispatch.py:968:
+tools/fleet/collectors/dispatch.py:982:
+tools/fleet/collectors/dispatch.py:1029:
 tools/fleet/collectors/__init__.py:196:
 tools/render-landing.py:860:
 adapters/codex/AGENTS.md:83:
-adapters/codex/bin/preflight.sh:741:
-adapters/opencode/bin/preflight.sh:466:
+adapters/codex/bin/preflight.sh:749:
+adapters/opencode/bin/preflight.sh:474:
 adapters/claude/skills/autopilot-code/references/dev-pipeline.md:91:
 adapters/claude/plugin-marketplace/plugins/hearting-claude/skills/autopilot-code/references/dev-pipeline.md:91:
 '

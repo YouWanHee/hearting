@@ -20,6 +20,30 @@ SPEC.loader.exec_module(GOVERNOR)
 from replica_batch_contract import build_manifest
 
 
+def _legacy_migration_return(root):
+    """Exercise the original non-group API in a real child, not a mocked PGID.
+
+    The isolated suite runner owns a process group. Its one-shot release may
+    conservatively retain a group lease on incomplete procfs observation;
+    legacy_run returning its own token cannot prove that earlier return.
+    Group drain remains covered by the actual run and namespace tests.
+    """
+    pid, pgid = os.getpid(), os.getpgrp()
+    if pid == pgid:
+        raise AssertionError("legacy contract actor must not own a process group")
+    checked = GOVERNOR.check(root, "dispatch", total=2, budget=2)
+    after_check = json.loads(Path(root, "state.json").read_text())
+    token = GOVERNOR.acquire(root, "dispatch", total=2, budget=2)
+    acquired = json.loads(Path(root, "state.json").read_text())["leases"][token]
+    returned = GOVERNOR.release(root, token)
+    after_return = json.loads(Path(root, "state.json").read_text())
+    return {
+        "pid": pid, "pgid": pgid, "checked": checked,
+        "after_check": after_check, "token": token, "acquired": acquired,
+        "returned": returned, "after_return": after_return,
+    }
+
+
 class GovernorTest(unittest.TestCase):
     def manifest(self, second_harness="claude"):
         return build_manifest(
@@ -439,6 +463,13 @@ class GovernorTest(unittest.TestCase):
                     "execution_surface=registered-headless,registered_worker=1,"
                     f"fallback_hop={member['fallback_hop']},harness={member['harness']},"
                     f"child_harness={member['harness']},route_id=rt-governor,"
+                    # A modern route is identified by (route_id, route_hash,
+                    # route_node) at every depth: `completion_attempt_readiness`
+                    # refuses a row whose hash does not match the route it is
+                    # asked about. Only a hash-less legacy row may omit it, so a
+                    # fixture row without it is not "a peer row", it is an
+                    # unverifiable one.
+                    "route_hash=sha256:source-route,"
                     f"route_node={member['route_node']},"
                     "parent_attempt_id=att-parent-governor,"
                     f"fallback_ordinal={member['fallback_ordinal']},"
@@ -760,9 +791,35 @@ print(json.dumps({"returncode": result.returncode, "stderr": result.stderr}))
             Path(temp_dir, "state.json").write_text(
                 json.dumps({"schema_version": 1, "leases": {}, "starts": []})
             )
-            GOVERNOR.check(temp_dir, "dispatch", total=2, budget=2)
-            token = GOVERNOR.acquire(temp_dir, "dispatch", total=2, budget=2)
-            GOVERNOR.release(temp_dir, token)
+            # Inherit this suite's group: the new PID is a non-leader even
+            # when tools/run-tests.py launched the suite with setsid().
+            actor = subprocess.run(
+                [
+                    sys.executable, "-c",
+                    "import json,runpy,sys; sys.path.insert(0,sys.argv[1]); "
+                    "module=runpy.run_path(sys.argv[2]); "
+                    "print(json.dumps(module['_legacy_migration_return'](sys.argv[3])))",
+                    str(PATH.parent), str(Path(__file__).resolve()), temp_dir,
+                ],
+                check=False, capture_output=True, text=True,
+            )
+            self.assertEqual(actor.returncode, 0, actor.stderr)
+            observed = json.loads(actor.stdout)
+            self.assertNotEqual(observed["pid"], observed["pgid"])
+            self.assertEqual(observed["pgid"], os.getpgrp())
+            self.assertIsNone(observed["checked"])
+            self.assertEqual(observed["after_check"]["schema_version"], 2)
+            self.assertEqual(observed["after_check"]["leases"], {})
+            self.assertEqual(observed["after_check"]["starts"], [])
+            self.assertRegex(observed["token"], r"^[0-9a-f]{32}$")
+            self.assertEqual(observed["acquired"]["pid"], observed["pid"])
+            self.assertNotIn("group_owned", observed["acquired"])
+            self.assertEqual(observed["returned"], {
+                "status": "released", "release_proven": True, "occupied": False,
+            })
+            self.assertNotIn(observed["token"], observed["after_return"]["leases"])
+            self.assertEqual(observed["after_return"]["leases"], {})
+            self.assertEqual(len(observed["after_return"]["starts"]), 1)
             legacy_run = subprocess.run(
                 [
                     sys.executable,
@@ -789,7 +846,7 @@ print(json.dumps({"returncode": result.returncode, "stderr": result.stderr}))
             self.assertEqual(state["reservations"], {})
             self.assertEqual(len(state["starts"]), 2)
 
-    def test_stale_owner_pruning_releases_every_unclaimed_slot(self):
+    def test_stale_owner_reservation_remains_occupied_without_authorized_return(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             owner = subprocess.Popen(
                 [sys.executable, "-c", "import sys; sys.stdin.read()"],
@@ -803,17 +860,10 @@ print(json.dumps({"returncode": result.returncode, "stderr": result.stderr}))
                 owner.communicate(input=b"", timeout=5)
 
             for token in stale:
-                self.assertEqual(
-                    GOVERNOR.reservation_check(temp_dir, token)["state"], "absent"
-                )
-                with self.assertRaisesRegex(ValueError, "reservation unavailable"):
-                    GOVERNOR.claim_reservation(temp_dir, token, "dispatch")
-            fresh = GOVERNOR.reserve(
-                temp_dir, "dispatch", 3, total=3, budget=3
-            )
+                self.assertEqual(GOVERNOR.reservation_check(temp_dir, token)["state"], "unclaimed")
+            fresh = GOVERNOR.reserve(temp_dir, "dispatch", 1, total=3, budget=3)
             state = json.loads(Path(temp_dir, "state.json").read_text())
-            self.assertTrue(set(stale).isdisjoint(state["reservations"]))
-            self.assertEqual(set(fresh), set(state["reservations"]))
+            self.assertEqual(set(stale) | set(fresh), set(state["reservations"]))
 
     def test_run_claims_reservation_and_strips_bearer_from_model_child(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -907,9 +957,7 @@ print(json.dumps({"returncode": result.returncode, "stderr": result.stderr}))
                     owner.terminate()
                     owner.wait(timeout=5)
 
-            self.assertEqual(
-                GOVERNOR.reservation_check(temp_dir, token)["state"], "absent"
-            )
+            self.assertEqual(GOVERNOR.reservation_check(temp_dir, token)["state"], "claimed")
 
     def test_reservation_cli_is_bounded_json_and_checks_exact_owner(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -985,6 +1033,112 @@ print(json.dumps({"returncode": result.returncode, "stderr": result.stderr}))
                 GOVERNOR.default_root(),
                 Path(temp_dir) / ".runtime" / "model-worker-governor",
             )
+
+
+class GovernorIdentityRegressionTest(unittest.TestCase):
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory(); self.root=Path(self.temp.name)
+    def tearDown(self):
+        # Fixture-owned abandoned handles only, never an operational governor.
+        for key,h in list(GOVERNOR._LEASE_WITNESSES.items()):
+            if key[0]==str(self.root):
+                GOVERNOR.close_witness(h);GOVERNOR._LEASE_WITNESSES.pop(key,None)
+        self.temp.cleanup()
+    def state(self):
+        p=self.root/"state.json";return json.loads(p.read_text()) if p.exists() else {}
+
+    def test_owner_to_claimant_witness_transfer_and_proven_receipt_retention(self):
+        h=GOVERNOR.create_witness(self.root,"reservation")
+        try:
+            t=GOVERNOR.reserve(self.root,"dispatch",1,witness_binding=h.binding())[0]
+            GOVERNOR.claim_reservation(self.root,t,"dispatch")
+            row=self.state()["claims"][t]
+            self.assertEqual(row["owner_witness"],h.binding())
+            self.assertEqual(GOVERNOR.observe_witness(self.root,row["claimant_witness"]).state,"live")
+            self.assertTrue(GOVERNOR.release(self.root,t)["release_proven"])
+            state=self.state();self.assertTrue(state["claims"][t]["release_proven"])
+            self.assertEqual(state["leases"],{})
+            future=state["claims"][t]["released_at"]+GOVERNOR.CLAIM_RECEIPT_SECONDS+1
+            with mock.patch.object(GOVERNOR.time,"time",return_value=future):
+                self.assertEqual(GOVERNOR.reservation_check(self.root,t)["state"],"claimed")
+            GOVERNOR.close_witness(h)
+            with mock.patch.object(GOVERNOR.time,"time",return_value=future):
+                self.assertEqual(GOVERNOR.reservation_check(self.root,t)["state"],"absent")
+        finally:GOVERNOR.close_witness(h)
+
+    def test_claim_owner_conflict_and_capture_failure_commit_nothing(self):
+        h=GOVERNOR.create_witness(self.root,"reservation")
+        try:
+            t=GOVERNOR.reserve(self.root,"dispatch",1,witness_binding=h.binding())[0]
+            before=(self.root/"state.json").read_bytes();GOVERNOR.close_witness(h)
+            with self.assertRaisesRegex(ValueError,"owner witness conflict"):
+                GOVERNOR.claim_reservation(self.root,t,"dispatch")
+            self.assertEqual(before,(self.root/"state.json").read_bytes())
+            with mock.patch.object(GOVERNOR,"capture_local_identity",side_effect=GOVERNOR.IdentityCaptureError("capture-error: fixture")):
+                with self.assertRaises(GOVERNOR.IdentityCaptureError):GOVERNOR.acquire(self.root,"dispatch")
+            self.assertEqual(before,(self.root/"state.json").read_bytes())
+        finally:GOVERNOR.close_witness(h)
+
+    def test_invalid_new_owner_binding_refuses_before_admission(self):
+        with self.assertRaisesRegex(ValueError,"owner witness conflict"):
+            GOVERNOR.reserve(self.root,"dispatch",1,witness_binding={})
+        self.assertFalse((self.root/"state.json").exists())
+
+    def test_cancel_claim_race_has_one_winner_and_at_most_one_start(self):
+        import threading
+        for _ in range(8):
+            t=GOVERNOR.reserve(self.root,"dispatch",1)[0]
+            before=len(self.state()["starts"]);barrier=threading.Barrier(2);results=[]
+            def act(name):
+                barrier.wait()
+                try:
+                    result=GOVERNOR.cancel_reservation(self.root,t) if name=="cancel" else GOVERNOR.claim_reservation(self.root,t,"dispatch")
+                    results.append((name,result))
+                except ValueError:results.append((name,None))
+            threads=[threading.Thread(target=act,args=(x,)) for x in ("cancel","claim")]
+            for x in threads:x.start()
+            for x in threads:x.join(5);self.assertFalse(x.is_alive())
+            self.assertEqual(sum(v is not None for _,v in results),1)
+            st=self.state();won=t in st["leases"]
+            self.assertEqual(len(st["starts"])-before,int(won))
+            if won:
+                with self.assertRaisesRegex(ValueError,"already claimed"):GOVERNOR.claim_reservation(self.root,t,"dispatch")
+                self.assertEqual(len(self.state()["starts"]),len(st["starts"]))
+                self.assertTrue(GOVERNOR.release(self.root,t)["release_proven"])
+
+    def test_lost_fd_and_unproven_timestamp_never_return_capacity(self):
+        t=GOVERNOR.reserve(self.root,"dispatch",1)[0];GOVERNOR.claim_reservation(self.root,t,"dispatch")
+        h=GOVERNOR._LEASE_WITNESSES[GOVERNOR._witness_key(self.root,t)];os.close(h.fd);h._closed=True
+        result=GOVERNOR.release(self.root,t)
+        self.assertEqual(result["status"],"blocked");self.assertTrue(result["occupied"])
+        state=self.state();self.assertIsNone(state["claims"][t]["released_at"])
+        # Synthetic legacy timestamp fixture; this is not a live incident.
+        state["claims"][t]["released_at"]=1;state["claims"][t].pop("release_proven",None)
+        (self.root/"state.json").write_text(json.dumps(state))
+        with mock.patch.object(GOVERNOR.time,"time",return_value=time.time()+100000):
+            self.assertTrue(GOVERNOR.reservation_check(self.root,t)["lease_active"])
+        self.assertIn(t,self.state()["claims"])
+
+    def test_legacy_schema_return_and_missing_authority_limits(self):
+        for schema in (1,2):
+            token="a"*32;other="b"*32
+            state={"schema_version":schema,"leases":{token:{"class":"dispatch","pid":99999999,"starttime":"1"},other:{"class":"dispatch","pid":99999999,"starttime":"1","pgid":99999999,"group_owned":True}},"starts":[],"claims":{},"reservations":{}}
+            (self.root/"state.json").write_text(json.dumps(state))
+            self.assertTrue(GOVERNOR.release(self.root,token)["release_proven"])
+            result=GOVERNOR.release(self.root,other)
+            self.assertEqual(result["reason"],"legacy-identity-unverifiable")
+            self.assertTrue(result["occupied"])
+            self.assertIn(other,self.state()["leases"])
+
+    def test_incomplete_own_group_blocks_without_release_receipt(self):
+        t=GOVERNOR.reserve(self.root,"dispatch",1)[0]
+        with mock.patch.object(GOVERNOR,"_owned_group_metadata",return_value={"group_owned":True,"pgid":os.getpid()}):
+            GOVERNOR.claim_reservation(self.root,t,"dispatch")
+        with mock.patch.object(GOVERNOR.os,"getpgrp",return_value=os.getpid()), mock.patch.object(GOVERNOR,"capture_local_identity",return_value=self.state()["leases"][t]["claimant_identity"]), mock.patch.object(GOVERNOR,"process_group_observation",return_value=GOVERNOR.ProcessGroupObservation("unverifiable",reason="fixture-enumeration-race")):
+            result=GOVERNOR.release(self.root,t)
+        self.assertEqual(result["reason"],"group-observation-incomplete")
+        self.assertIsNone(self.state()["claims"][t]["released_at"])
+        self.assertNotIn("release_proven",self.state()["claims"][t])
 
 
 if __name__ == "__main__":

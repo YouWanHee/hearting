@@ -5,10 +5,13 @@ Every fixture uses an isolated temporary artifact root and `AGENT_HOME`; the
 real canonical root, registry, and routes directory are never touched.
 """
 import importlib.util
+import fcntl
 import json
 import os
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -20,6 +23,7 @@ import artifact_identity as idm  # noqa: E402
 import artifact_lifecycle as L  # noqa: E402
 import artifact_manifest as m  # noqa: E402
 import artifact_producer as P  # noqa: E402
+import dispatch_contract as D  # noqa: E402
 
 _P = Path(__file__).with_name("capability-route.py")
 _S = importlib.util.spec_from_file_location("route_for_producer_test", _P)
@@ -88,13 +92,16 @@ class ProducerTestBase(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name) / "artifact-root"
         self.root.mkdir(parents=True, exist_ok=True)
+        self.jobs = Path(self._tmp.name) / "jobs.log"
+        self.jobs.write_text("", encoding="utf-8")
         home = Path(self._tmp.name) / "agent-home"
         (home / "core").mkdir(parents=True, exist_ok=True)
         (home / "core" / "CORE.md").write_text("fixture\n", encoding="utf-8")
         self._env = {k: os.environ.get(k) for k in (
             "AGENT_HOME", "AGENT_DISPATCH_JOBS", "AGENT_ARTIFACT_CYCLE_DIR", "AGENT_ARTIFACT_ROOT")}
         os.environ["AGENT_HOME"] = str(home)
-        for key in ("AGENT_DISPATCH_JOBS", "AGENT_ARTIFACT_CYCLE_DIR", "AGENT_ARTIFACT_ROOT"):
+        os.environ["AGENT_DISPATCH_JOBS"] = str(self.jobs)
+        for key in ("AGENT_ARTIFACT_CYCLE_DIR", "AGENT_ARTIFACT_ROOT"):
             os.environ.pop(key, None)
         self.addCleanup(self._restore)
 
@@ -898,6 +905,26 @@ class FinalizeTest(ProducerTestBase):
         self.assertEqual(again["status"], "already-sealed")
         self.assertEqual(P.status(self.root)["cycle_counts"], {"sealed": 1})
 
+    def test_sealed_replay_requires_matching_index_row(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        self.write_output(result)
+        self.close(route, route_file)
+        sealed = P.finalize(self.root, cycle_id=result["cycle_id"])
+        index = adm.load_index(self.root)
+        adm._write_index(self.root, index.__class__(
+            schema_version=index.schema_version, artifact_root_id=index.artifact_root_id,
+            stable_ids=index.stable_ids, routes=index.routes, event_ids=index.event_ids,
+            streams=index.streams, manifests={}, cycles=index.cycles,
+        ))
+        before = (P.read_cycle_record(self.root, result["cycle_id"]),
+                  (Path(result["cycle_dir"]) / "manifest.json").read_bytes())
+        with self.assertRaises(P.ProducerError) as ctx:
+            P.finalize(self.root, cycle_id=result["cycle_id"])
+        self.assertEqual(ctx.exception.code, "already-sealed-mismatch")
+        self.assertEqual(before[0], P.read_cycle_record(self.root, result["cycle_id"]))
+        self.assertEqual(before[1], (Path(result["cycle_dir"]) / "manifest.json").read_bytes())
+
     def test_finalize_requires_closed_route_unless_allowed(self):
         self.activate()
         route, route_file, result = self.begin()
@@ -905,6 +932,8 @@ class FinalizeTest(ProducerTestBase):
         with self.assertRaises(P.ProducerError) as ctx:
             P.finalize(self.root, cycle_id=result["cycle_id"])
         self.assertEqual(ctx.exception.code, "route-not-closed")
+        self.assertIn("complete -> close -> finalize -> admit-shared", str(ctx.exception))
+        self.assertIn(route["route_id"], str(ctx.exception))
         sealed = P.finalize(self.root, cycle_id=result["cycle_id"], allow_open_route=True)
         self.assertEqual(sealed["status"], "sealed")
         document = json.loads((Path(result["cycle_dir"]) / "manifest.json").read_text())
@@ -1177,6 +1206,39 @@ class CliTest(ProducerTestBase):
         self.assertEqual(lines["AGENT_ARTIFACT_CYCLE_ID"], payload["cycle_id"])
         self.assertEqual(lines["AGENT_ARTIFACT_CYCLE_DIR"], payload["cycle_dir"])
 
+    def test_finalize_state_conflict_exits_blocked_with_requested_and_actual_state(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        self.write_output(result)
+        cycle_id = result["cycle_id"]
+        P.finalize(self.root, cycle_id=cycle_id, allow_open_route=True)
+        code, payload = self.run_cli(
+            "finalize", "--artifact-root", str(self.root), "--cycle", cycle_id,
+            "--state", "abandoned", "--abandon-reason", "operator-decision",
+        )
+        self.assertEqual(code, P.BLOCKED)
+        self.assertEqual(payload["status"], "blocked")
+        self.assertEqual(payload["reason"], "finalize-state-conflict")
+        self.assertIn("requested=abandoned", payload["detail"])
+        self.assertIn("published_cycle_state=active", payload["detail"])
+
+    def test_malformed_manifest_cycle_state_exits_blocked_not_traceback(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        self.write_output(result)
+        self.close(route, route_file)
+        cycle_id = result["cycle_id"]
+        P.finalize(self.root, cycle_id=cycle_id)
+        manifest_path = Path(result["cycle_dir"]) / "manifest.json"
+        document = json.loads(manifest_path.read_text(encoding="utf-8"))
+        document["cycle"]["state"] = ["active"]
+        manifest_path.write_text(json.dumps(document), encoding="utf-8")
+        code, payload = self.run_cli("finalize", "--artifact-root", str(self.root), "--cycle", cycle_id)
+        self.assertEqual(code, P.BLOCKED)
+        self.assertEqual(payload["status"], "blocked")
+        self.assertEqual(payload["reason"], "sealed-cycle-state-unreadable")
+        self.assertIn("cycle_state=['active']", payload["detail"])
+
 
 class ReviewPublicationLeaseTest(ProducerTestBase):
     """SD-117 §13.34.5-(2): L1 review-publication-lease enforcement."""
@@ -1223,11 +1285,12 @@ class ReviewPublicationLeaseTest(ProducerTestBase):
             abandon_reason="lease-expired-no-publisher", allow_open_route=True,
         )
         self.assertEqual(outcome["status"], "sealed")
-        # Pre-existing behavior (unchanged by SD-117): a sealed cycle's
-        # `finalize()` short-circuits idempotently before the `state`
-        # argument is even inspected.
-        again = P.finalize(self.root, cycle_id=cycle_id, state="completed")
-        self.assertEqual(again["status"], "already-sealed")
+        # Storage sealing is not task completion (D-10): the published cycle
+        # state is `abandoned`, so a later `completed` request is a typed
+        # conflict, not a silent idempotent short-circuit.
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id, state="completed")
+        self.assertEqual(caught.exception.code, "finalize-state-conflict")
 
     def test_corrupt_lease_record_blocks_abandon(self):
         self.activate()
@@ -1254,6 +1317,113 @@ class ReviewPublicationLeaseTest(ProducerTestBase):
         self.assertEqual(release1["status"], "released")
         self.assertEqual(release2["status"], "already-released")
 
+    def test_mixed_v1_corruption_cannot_hide_live_v2_and_v2_exit_unblocks(self):
+        self.activate()
+        _route, _route_file, result = self.begin()
+        cycle_id = result["cycle_id"]
+        lease_dir = P._review_lease_dir(self.root, cycle_id)
+        lease_dir.mkdir(parents=True, exist_ok=True)
+        corrupt = lease_dir / "a-v1.json"
+        corrupt.write_text("{broken", encoding="utf-8")
+        attempt = "att-z-live-v2"
+        nonce = "c" * 64
+        now = time.time()
+        record = {
+            "schema_version": 2, "cycle_id": cycle_id,
+            "attempt_id": attempt, "acquired_at": P._rfc3339(now - 1),
+            "deadline": P._rfc3339(now + 300), "released_at": None,
+            "expired": False,
+            "review_governed_lease": D.REVIEW_GOVERNED_LEASE_KIND,
+            "review_governed_lease_nonce": nonce,
+        }
+        v2 = lease_dir / f"{attempt}.json"
+        v2.write_text(json.dumps(record), encoding="utf-8")
+        governed = D.review_governed_lease_path(self.root, cycle_id, attempt)
+        governed.parent.mkdir(parents=True)
+        governed.write_bytes(D.review_governed_lease_payload(attempt, cycle_id, nonce))
+        with governed.open("r+b") as held:
+            fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertEqual(P._live_review_lease(self.root, cycle_id), v2)
+            record["released_at"] = P._rfc3339(now)
+            v2.write_text(json.dumps(record), encoding="utf-8")
+            self.assertEqual(P._live_review_lease(self.root, cycle_id), corrupt)
+            record["released_at"] = None
+            record["deadline"] = P._rfc3339(now - 2)
+            v2.write_text(json.dumps(record), encoding="utf-8")
+            self.assertEqual(P._live_review_lease(self.root, cycle_id), corrupt)
+            record["deadline"] = P._rfc3339(now + 300)
+            v2.write_text(json.dumps(record), encoding="utf-8")
+        corrupt.unlink()
+        self.assertIsNone(P._live_review_lease(self.root, cycle_id))
+
+    def test_completed_finalize_is_fenced_until_governed_v2_process_exits(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        self.write_output(result)
+        self.close(route, route_file)
+        cycle_id = result["cycle_id"]
+        attempt = "att-finalize-race-v2"
+        nonce = "d" * 64
+        now = time.time()
+        lease_dir = P._review_lease_dir(self.root, cycle_id)
+        lease_dir.mkdir(parents=True, exist_ok=True)
+        (lease_dir / f"{attempt}.json").write_text(json.dumps({
+            "schema_version": 2, "cycle_id": cycle_id,
+            "attempt_id": attempt, "acquired_at": P._rfc3339(now - 1),
+            "deadline": P._rfc3339(now + 300), "released_at": None,
+            "expired": False,
+            "review_governed_lease": D.REVIEW_GOVERNED_LEASE_KIND,
+            "review_governed_lease_nonce": nonce,
+        }), encoding="utf-8")
+        governed = D.review_governed_lease_path(self.root, cycle_id, attempt)
+        governed.parent.mkdir(parents=True)
+        governed.write_bytes(D.review_governed_lease_payload(attempt, cycle_id, nonce))
+        with governed.open("r+b") as held:
+            fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaises(P.ProducerError) as caught:
+                P.finalize(self.root, cycle_id=cycle_id)
+            self.assertEqual(caught.exception.code, "cycle-finalize-blocked-live-review")
+        self.assertEqual(P.finalize(self.root, cycle_id=cycle_id)["status"], "sealed")
+
+    def test_recovery_journal_roll_forward_is_fenced_by_live_v2_lease(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        self.write_output(result)
+        cycle_id = result["cycle_id"]
+        with self.assertRaises(adm.AdmissionRecoveryRequired):
+            P.finalize(self.root, cycle_id=cycle_id, allow_open_route=True,
+                       crash_after_manifest=True)
+        lease_path = P._review_lease_path(self.root, cycle_id, "att-recovery")
+        lease_path.parent.mkdir(parents=True, exist_ok=True)
+        lease_path.write_text(json.dumps({"schema_version": 2}), encoding="utf-8")
+        with mock.patch.object(P, "_live_review_lease", return_value=lease_path):
+            with self.assertRaises(P.ProducerError) as caught:
+                P.recover(self.root)
+        self.assertEqual(caught.exception.code, "cycle-finalize-blocked-live-review")
+        self.assertEqual(P.read_cycle_record(self.root, cycle_id)["state"], "open")
+        self.assertTrue(P.journal_path(self.root, cycle_id).exists())
+        with mock.patch.object(P, "_live_review_lease", return_value=None):
+            recovered = P.recover(self.root)
+        self.assertIn(cycle_id, recovered["producer"]["rolled_forward"])
+
+    def test_recovery_manifest_discovery_is_fenced_without_journal(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        self.write_output(result)
+        cycle_id = result["cycle_id"]
+        with self.assertRaises(adm.AdmissionRecoveryRequired):
+            P.finalize(self.root, cycle_id=cycle_id, allow_open_route=True,
+                       crash_after_manifest=True)
+        P.journal_path(self.root, cycle_id).unlink()
+        lease_path = P._review_lease_path(self.root, cycle_id, "att-recovery-no-journal")
+        lease_path.parent.mkdir(parents=True, exist_ok=True)
+        lease_path.write_text(json.dumps({"schema_version": 2}), encoding="utf-8")
+        with mock.patch.object(P, "_live_review_lease", return_value=lease_path):
+            with self.assertRaises(P.ProducerError) as caught:
+                P.recover(self.root)
+        self.assertEqual(caught.exception.code, "cycle-finalize-blocked-live-review")
+        self.assertEqual(P.read_cycle_record(self.root, cycle_id)["state"], "open")
+
 
 class AbandonReasonTest(ProducerTestBase):
     """SD-117 §13.34.5-(2): L3 `abandon_reason` closed enum."""
@@ -1265,17 +1435,19 @@ class AbandonReasonTest(ProducerTestBase):
         self.assertEqual(outcome["status"], "no-lineage")
         self.assertFalse(Path(result["cycle_dir"]).exists())
 
-    def test_cycle_completed_injected_into_abandoned_stream_is_refused_by_unchanged_code(self):
+    def test_cycle_completed_injected_into_abandoned_stream_is_refused_by_typed_conflict(self):
         self.activate()
         route, route_file, result = self.begin()
         self.write_output(result)
         cycle_id = result["cycle_id"]
         P.finalize(self.root, cycle_id=cycle_id, state="abandoned", abandon_reason="operator-decision",
                   allow_open_route=True)
-        # Pre-existing behavior (unchanged by SD-117, E47-6): re-finalizing a
-        # sealed cycle short-circuits idempotently regardless of `state`.
-        again = P.finalize(self.root, cycle_id=cycle_id, state="completed")
-        self.assertEqual(again["status"], "already-sealed")
+        # The published cycle state is `abandoned`; injecting a `completed`
+        # request against it is a typed conflict, not an idempotent
+        # short-circuit that ignores `state` (D-8/D-10).
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id, state="completed")
+        self.assertEqual(caught.exception.code, "finalize-state-conflict")
 
     def test_every_cycle_abandoned_event_carries_closed_enum_reason_disjoint_from_review_verdicts(self):
         self.activate()
@@ -1327,6 +1499,518 @@ class AbandonReasonTest(ProducerTestBase):
         document = json.loads((Path(result["cycle_dir"]) / "manifest.json").read_text())
         abandoned_events = [e for e in document["events"] if e["event_type"] == "cycle.abandoned"]
         self.assertEqual(abandoned_events[0]["payload"]["abandon_reason"], "operator-override-live-review")
+
+
+class FinalizeStateConflictTest(ProducerTestBase):
+    """Sealed storage is not task completion: a request whose `state` does not
+    match the *published* `manifest.json` cycle state is a typed conflict,
+    never a silent `already-sealed`."""
+
+    def test_active_snapshot_refuses_abandon_request_and_leaves_manifest_untouched(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        self.write_output(result)
+        cycle_id = result["cycle_id"]
+        sealed = P.finalize(self.root, cycle_id=cycle_id, allow_open_route=True)
+        self.assertEqual(sealed["cycle_state"], "active")
+        R.close_route(route, route_file, commit="a" * 40, summary="fixture")
+        manifest_path = Path(result["cycle_dir"]) / "manifest.json"
+        manifest_bytes = manifest_path.read_bytes()
+        record_before = P.read_cycle_record(self.root, cycle_id)
+        index_before = adm.load_index(self.root)
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id, state="abandoned", abandon_reason="operator-decision")
+        self.assertEqual(caught.exception.code, "finalize-state-conflict")
+        self.assertIn("requested=abandoned", caught.exception.detail)
+        self.assertIn("published_cycle_state=active", caught.exception.detail)
+        self.assertIn("storage_state=sealed", caught.exception.detail)
+        self.assertEqual(manifest_path.read_bytes(), manifest_bytes)
+        self.assertEqual(P.read_cycle_record(self.root, cycle_id), record_before)
+        self.assertEqual(adm.load_index(self.root), index_before)
+
+    def test_conflict_precedes_abandon_reason_validation(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        self.write_output(result)
+        cycle_id = result["cycle_id"]
+        P.finalize(self.root, cycle_id=cycle_id, allow_open_route=True)
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id, state="abandoned")
+        self.assertEqual(caught.exception.code, "finalize-state-conflict")
+
+    def test_same_terminal_state_retry_stays_idempotent(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        self.write_output(result)
+        self.close(route, route_file)
+        cycle_id = result["cycle_id"]
+        P.finalize(self.root, cycle_id=cycle_id)
+        again = P.finalize(self.root, cycle_id=cycle_id)
+        self.assertEqual(again["status"], "already-sealed")
+        self.assertEqual(again["storage_state"], "sealed")
+        self.assertEqual(again["cycle_state"], "completed")
+
+        route2, route_file2 = self.route(gate_source="fixture-2")
+        result2 = P.begin(self.root, route_file=route_file2, capability="autopilot-code", intensity="direct")
+        self.write_output(result2)
+        R.close_route(route2, route_file2, commit="a" * 40, summary="abandoned fixture")
+        cycle_id2 = result2["cycle_id"]
+        P.finalize(self.root, cycle_id=cycle_id2, state="abandoned", abandon_reason="operator-decision")
+        again2 = P.finalize(self.root, cycle_id=cycle_id2, state="abandoned", abandon_reason="operator-decision")
+        self.assertEqual(again2["status"], "already-sealed")
+        self.assertEqual(again2["storage_state"], "sealed")
+        self.assertEqual(again2["cycle_state"], "abandoned")
+
+    def test_allow_open_first_publication_succeeds_but_identical_retry_now_conflicts(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        self.write_output(result)
+        cycle_id = result["cycle_id"]
+        sealed = P.finalize(self.root, cycle_id=cycle_id, allow_open_route=True)
+        self.assertEqual(sealed["status"], "sealed")
+        self.assertEqual(sealed["cycle_state"], "active")
+        manifest_path = Path(result["cycle_dir"]) / "manifest.json"
+        manifest_bytes = manifest_path.read_bytes()
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id, state="completed", allow_open_route=True)
+        self.assertEqual(caught.exception.code, "finalize-state-conflict")
+        self.assertIn("requested=completed", caught.exception.detail)
+        self.assertIn("published_cycle_state=active", caught.exception.detail)
+        self.assertEqual(manifest_path.read_bytes(), manifest_bytes)
+
+    def test_allow_open_retry_after_route_close_conflicts_and_does_not_promote(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        self.write_output(result)
+        cycle_id = result["cycle_id"]
+        P.finalize(self.root, cycle_id=cycle_id, allow_open_route=True)
+        manifest_path = Path(result["cycle_dir"]) / "manifest.json"
+        manifest_bytes = manifest_path.read_bytes()
+        self.close(route, route_file)
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id, state="completed", allow_open_route=True)
+        self.assertEqual(caught.exception.code, "finalize-state-conflict")
+        self.assertEqual(manifest_path.read_bytes(), manifest_bytes)
+        record = P.read_cycle_record(self.root, cycle_id)
+        self.assertEqual(record["cycle_state"], "active")
+
+    def test_completed_snapshot_refuses_abandon_and_abandoned_refuses_completed(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        self.write_output(result)
+        self.close(route, route_file)
+        cycle_id = result["cycle_id"]
+        P.finalize(self.root, cycle_id=cycle_id)
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id, state="abandoned", abandon_reason="operator-decision")
+        self.assertEqual(caught.exception.code, "finalize-state-conflict")
+
+        route2, route_file2 = self.route(gate_source="fixture-2")
+        result2 = P.begin(self.root, route_file=route_file2, capability="autopilot-code", intensity="direct")
+        self.write_output(result2)
+        R.close_route(route2, route_file2, commit="a" * 40, summary="abandoned fixture")
+        cycle_id2 = result2["cycle_id"]
+        P.finalize(self.root, cycle_id=cycle_id2, state="abandoned", abandon_reason="operator-decision")
+        with self.assertRaises(P.ProducerError) as caught2:
+            P.finalize(self.root, cycle_id=cycle_id2, state="completed")
+        self.assertEqual(caught2.exception.code, "finalize-state-conflict")
+
+    def test_sealed_cycle_state_source_is_manifest_with_absent_only_fallback(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        self.write_output(result)
+        self.close(route, route_file)
+        cycle_id = result["cycle_id"]
+        P.finalize(self.root, cycle_id=cycle_id)
+        manifest_path = Path(result["cycle_dir"]) / "manifest.json"
+        manifest_bytes = manifest_path.read_bytes()
+
+        # (1) record cache dropped -> manifest (the canonical source) still judges correctly.
+        record = P.read_cycle_record(self.root, cycle_id)
+        del record["cycle_state"]
+        P._write_cycle_record(self.root, record, exclusive=False)
+        again = P.finalize(self.root, cycle_id=cycle_id)
+        self.assertEqual(again["status"], "already-sealed")
+        self.assertEqual(again["cycle_state"], "completed")
+
+        # (2) record cache disagrees with manifest -> ambiguous, hard refusal.
+        record = P.read_cycle_record(self.root, cycle_id)
+        record["cycle_state"] = "abandoned"
+        P._write_cycle_record(self.root, record, exclusive=False)
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id)
+        self.assertEqual(caught.exception.code, "sealed-cycle-state-ambiguous")
+        self.assertIn("manifest=completed", caught.exception.detail)
+        self.assertIn("record=abandoned", caught.exception.detail)
+
+        # restore the cache before mangling the canonical source.
+        record = P.read_cycle_record(self.root, cycle_id)
+        record["cycle_state"] = "completed"
+        P._write_cycle_record(self.root, record, exclusive=False)
+
+        # (3) manifest absent and record cache absent -> unknown, no false success.
+        record = P.read_cycle_record(self.root, cycle_id)
+        del record["cycle_state"]
+        P._write_cycle_record(self.root, record, exclusive=False)
+        manifest_path.unlink()
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id)
+        self.assertEqual(caught.exception.code, "sealed-cycle-state-unknown")
+        self.assertIn("manifest=absent", caught.exception.detail)
+
+        # (4) manifest absent, record cache valid -> compatibility fallback judges correctly.
+        record = P.read_cycle_record(self.root, cycle_id)
+        record["cycle_state"] = "completed"
+        P._write_cycle_record(self.root, record, exclusive=False)
+        again = P.finalize(self.root, cycle_id=cycle_id)
+        self.assertEqual(again["status"], "already-sealed")
+        self.assertEqual(again["cycle_state"], "completed")
+
+        # (5) manifest absent, record cache non-string -> unknown (not TypeError).
+        record = P.read_cycle_record(self.root, cycle_id)
+        record["cycle_state"] = 123
+        P._write_cycle_record(self.root, record, exclusive=False)
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id)
+        self.assertEqual(caught.exception.code, "sealed-cycle-state-unknown")
+        self.assertIn("record=123", caught.exception.detail)
+
+        # manifest present but record cache non-string -> the canonical source wins.
+        manifest_path.write_bytes(manifest_bytes)
+        again = P.finalize(self.root, cycle_id=cycle_id)
+        self.assertEqual(again["status"], "already-sealed")
+        self.assertEqual(again["cycle_state"], "completed")
+
+    def test_unreadable_manifest_fails_closed_instead_of_trusting_record_cache(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        self.write_output(result)
+        self.close(route, route_file)
+        cycle_id = result["cycle_id"]
+        P.finalize(self.root, cycle_id=cycle_id)
+        manifest_path = Path(result["cycle_dir"]) / "manifest.json"
+        manifest_bytes = manifest_path.read_bytes()
+        record = P.read_cycle_record(self.root, cycle_id)
+        self.assertEqual(record["cycle_state"], "completed")  # valid cache throughout: it must not save a success.
+
+        # (1) unparsable JSON.
+        manifest_path.write_text("{not json", encoding="utf-8")
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id)
+        self.assertEqual(caught.exception.code, "sealed-cycle-state-unreadable")
+        self.assertIn("unparsable", caught.exception.detail)
+        manifest_path.write_bytes(manifest_bytes)
+
+        # (2) cycle_id mismatch. The `.cycle.json` binding is removed first so
+        # the locator's own global scan (a stricter, unrelated invariant that
+        # cross-checks manifest cycle_id against the binding for every
+        # readable-layout cycle dir) does not intercept this before
+        # `_published_cycle_state` gets to judge it; `cycle_dir` still
+        # resolves the path through the record's `locator` field.
+        other_cycle_id = "cyc_" + "9" * 32
+        binding_path = Path(result["cycle_dir"]) / ".cycle.json"
+        binding_bytes = binding_path.read_bytes()
+        binding_path.unlink()
+        mutated = json.loads(manifest_bytes)
+        mutated["cycle"]["cycle_id"] = other_cycle_id
+        manifest_path.write_text(json.dumps(mutated), encoding="utf-8")
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id)
+        self.assertEqual(caught.exception.code, "sealed-cycle-state-unreadable")
+        self.assertIn(cycle_id, caught.exception.detail)
+        self.assertIn(other_cycle_id, caught.exception.detail)
+        manifest_path.write_bytes(manifest_bytes)
+        binding_path.write_bytes(binding_bytes)
+
+        # (3) cycle.state outside the enum.
+        mutated = json.loads(manifest_bytes)
+        mutated["cycle"]["state"] = "weird"
+        manifest_path.write_text(json.dumps(mutated), encoding="utf-8")
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id)
+        self.assertEqual(caught.exception.code, "sealed-cycle-state-unreadable")
+        self.assertIn("cycle_state='weird'", caught.exception.detail)
+        manifest_path.write_bytes(manifest_bytes)
+
+        # (4) cycle.state is a non-string JSON value (list, dict) -- must not reach
+        # `in _SEALED_CYCLE_STATES` unhashable.
+        for bad_state in (["active"], {"value": "active"}):
+            mutated = json.loads(manifest_bytes)
+            mutated["cycle"]["state"] = bad_state
+            manifest_path.write_text(json.dumps(mutated), encoding="utf-8")
+            with self.assertRaises(P.ProducerError) as caught:
+                P.finalize(self.root, cycle_id=cycle_id)
+            self.assertEqual(caught.exception.code, "sealed-cycle-state-unreadable")
+            self.assertIn(f"cycle_state={bad_state!r}", caught.exception.detail)
+            manifest_path.write_bytes(manifest_bytes)
+
+        # (5) cycle itself is not a mapping.
+        for bad_cycle in ("active", ["active"]):
+            mutated = json.loads(manifest_bytes)
+            mutated["cycle"] = bad_cycle
+            manifest_path.write_text(json.dumps(mutated), encoding="utf-8")
+            with self.assertRaises(P.ProducerError) as caught:
+                P.finalize(self.root, cycle_id=cycle_id)
+            self.assertEqual(caught.exception.code, "sealed-cycle-state-unreadable")
+            self.assertIn(f"cycle-structure type={type(bad_cycle).__name__}", caught.exception.detail)
+            manifest_path.write_bytes(manifest_bytes)
+
+    def test_manifest_non_regular_entries_fail_closed_instead_of_cache_fallback(self):
+        import errno
+        from unittest import mock
+
+        self.activate()
+        route, route_file, result = self.begin()
+        self.write_output(result)
+        self.close(route, route_file)
+        cycle_id = result["cycle_id"]
+        P.finalize(self.root, cycle_id=cycle_id)
+        manifest_path = Path(result["cycle_dir"]) / "manifest.json"
+        record = P.read_cycle_record(self.root, cycle_id)
+        self.assertEqual(record["cycle_state"], "completed")
+
+        # A directory is present, not absent, and must not be hidden by the
+        # valid record cache.
+        manifest_bytes = manifest_path.read_bytes()
+        manifest_path.unlink()
+        manifest_path.mkdir()
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id)
+        self.assertEqual(caught.exception.code, "sealed-cycle-state-unreadable")
+        self.assertIn("entry-kind=non-regular", caught.exception.detail)
+        manifest_path.rmdir()
+        manifest_path.write_bytes(manifest_bytes)
+
+        # Both a live and dangling symlink are non-regular entries. The
+        # lstat gate rejects them before JSON I/O can follow or classify them.
+        target = manifest_path.with_name("manifest-target.json")
+        target.write_bytes(manifest_bytes)
+        manifest_path.unlink()
+        manifest_path.symlink_to(target.name)
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id)
+        self.assertEqual(caught.exception.code, "sealed-cycle-state-unreadable")
+        manifest_path.unlink()
+        target.unlink()
+        manifest_path.symlink_to("missing-manifest.json")
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id)
+        self.assertEqual(caught.exception.code, "sealed-cycle-state-unreadable")
+        manifest_path.unlink()
+        manifest_path.write_bytes(manifest_bytes)
+
+        # FIFO is rejected from its mode without attempting a blocking read.
+        fifo_supported = hasattr(os, "mkfifo")
+        if fifo_supported:
+            manifest_path.unlink()
+            os.mkfifo(manifest_path)
+            with self.assertRaises(P.ProducerError) as caught:
+                P.finalize(self.root, cycle_id=cycle_id)
+            self.assertEqual(caught.exception.code, "sealed-cycle-state-unreadable")
+            manifest_path.unlink()
+            manifest_path.write_bytes(manifest_bytes)
+
+        # Lookup failures are not absence. Mocking lstat keeps this portable
+        # when the test process has permission to inspect the fixture.
+        with mock.patch.object(P, "cycle_dir", return_value=manifest_path.parent), \
+             mock.patch.object(Path, "lstat", side_effect=PermissionError("denied")):
+            with self.assertRaises(P.ProducerError) as caught:
+                P._published_cycle_state(self.root, record)
+        self.assertEqual(caught.exception.code, "sealed-cycle-state-unreadable")
+        self.assertIn("lookup-error=PermissionError", caught.exception.detail)
+        with mock.patch.object(P, "cycle_dir", return_value=manifest_path.parent), \
+             mock.patch.object(Path, "lstat", side_effect=OSError(errno.ENOTDIR, "not a directory")):
+            with self.assertRaises(P.ProducerError) as caught:
+                P._published_cycle_state(self.root, record)
+        self.assertEqual(caught.exception.code, "sealed-cycle-state-unreadable")
+        self.assertIn("lookup-error=NotADirectoryError", caught.exception.detail)
+
+    def test_recovery_roll_forward_before_sealed_branch_is_judged_on_published_state(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        self.write_output(result)
+        cycle_id = result["cycle_id"]
+        with self.assertRaises(adm.AdmissionRecoveryRequired):
+            P.finalize(self.root, cycle_id=cycle_id, allow_open_route=True, crash_after_manifest=True)
+        # before: recovery has not run yet.
+        self.assertEqual(P.read_cycle_record(self.root, cycle_id)["state"], "open")
+        self.assertIn(cycle_id, P.status(self.root)["pending_journals"])
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id, state="abandoned", abandon_reason="operator-decision")
+        self.assertEqual(caught.exception.code, "finalize-state-conflict")
+        # after: `_recover_locked` rolled the manifest forward before the sealed
+        # branch ever ran its judgment, so the conflict is against `active`.
+        record = P.read_cycle_record(self.root, cycle_id)
+        self.assertEqual(record["state"], "sealed")
+        self.assertEqual(record["cycle_state"], "active")
+        self.assertFalse(P.journal_path(self.root, cycle_id).exists())
+        self.assertIn(cycle_id, adm.load_index(self.root).manifests)
+
+    def test_non_sealed_record_states_still_fall_to_cycle_not_open(self):
+        import shutil
+
+        self.activate()
+        # (1) zero-row cycle seals to `no-lineage`, not `sealed`.
+        route, route_file, result = self.begin()
+        outcome = P.finalize(self.root, cycle_id=result["cycle_id"])
+        self.assertEqual(outcome["status"], "no-lineage")
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=result["cycle_id"])
+        self.assertEqual(caught.exception.code, "cycle-not-open")
+
+        # (2) zero-row abandon seals record state to `abandoned`, not `sealed`.
+        route2, route_file2 = self.route(gate_source="fixture-2")
+        result2 = P.begin(self.root, route_file=route_file2, capability="autopilot-code", intensity="direct")
+        P.finalize(self.root, cycle_id=result2["cycle_id"], state="abandoned", abandon_reason="operator-decision")
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=result2["cycle_id"], state="abandoned", abandon_reason="operator-decision")
+        self.assertEqual(caught.exception.code, "cycle-not-open")
+
+        # (3) a recovery-dropped cycle record is `dropped`, not `sealed`.
+        route3, route_file3 = self.route(gate_source="fixture-3")
+        result3 = P.begin(self.root, route_file=route_file3, capability="autopilot-code", intensity="direct")
+        shutil.rmtree(result3["cycle_dir"])
+        P.recover(self.root)
+        self.assertEqual(P.read_cycle_record(self.root, result3["cycle_id"])["state"], "dropped")
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=result3["cycle_id"])
+        self.assertEqual(caught.exception.code, "cycle-not-open")
+
+    def test_force_abandon_ignoring_lease_on_sealed_active_conflicts_before_lease_checks(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        self.write_output(result)
+        cycle_id = result["cycle_id"]
+        P.finalize(self.root, cycle_id=cycle_id, allow_open_route=True)
+        P.review_lease_acquire(self.root, cycle_id=cycle_id, attempt_id="att-reviewer")
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id, state="abandoned", force_abandon_ignoring_lease=True)
+        self.assertEqual(caught.exception.code, "finalize-state-conflict")
+
+    def test_unrelated_broken_locator_binding_falls_back_instead_of_leaking(self):
+        # The sealed branch now reaches `cycle_dir`, whose `find_path_by_id`
+        # scans the whole root -- so *another* cycle's broken `.cycle.json`
+        # raises `LocatorError`, which is a `ValueError`, not a
+        # `ProducerError`. An unrelated cycle's damage says nothing about this
+        # cycle's work state, so it is the absent-canonical-source case: fall
+        # back to the record cache and keep judging.
+        self.activate()
+        route, route_file, result = self.begin()
+        self.write_output(result)
+        cycle_id = result["cycle_id"]
+        self.close(route, route_file)
+        P.finalize(self.root, cycle_id=cycle_id)
+        stranger = Path(result["cycle_dir"]).parent / "2026-01-01_stranger"
+        stranger.mkdir()
+        (stranger / ".cycle.json").write_text(json.dumps({
+            "schema_version": 1, "kind": "artifact-cycle-binding",
+            "campaign_id": "camp_" + "0" * 32, "cycle_id": "cyc_" + "0" * 32,
+        }), encoding="utf-8")
+        with self.assertRaises(P.artifact_locator.LocatorError):
+            P.artifact_locator.scan_index(self.root)
+        again = P.finalize(self.root, cycle_id=cycle_id)
+        self.assertEqual(again["status"], "already-sealed")
+        self.assertEqual(again["cycle_state"], "completed")
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id, state="abandoned", abandon_reason="operator-decision")
+        self.assertEqual(caught.exception.code, "finalize-state-conflict")
+
+    def test_current_broken_binding_does_not_mask_manifest_conflict(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        self.write_output(result)
+        self.close(route, route_file)
+        cycle_id = result["cycle_id"]
+        P.finalize(self.root, cycle_id=cycle_id)
+        cycle_dir = Path(result["cycle_dir"])
+        manifest_path = cycle_dir / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["cycle"]["state"] = "abandoned"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        binding_path = cycle_dir / ".cycle.json"
+        binding_path.write_text("{", encoding="utf-8")
+        before = {
+            "manifest": manifest_path.read_bytes(),
+            "record": P.cycle_record_path(self.root, cycle_id).read_bytes(),
+            "index_json": (self.root / "campaigns" / "INDEX.json").read_bytes(),
+            "index_md": (self.root / "campaigns" / "INDEX.md").read_bytes(),
+        }
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id, state="completed")
+        self.assertEqual(caught.exception.code, "sealed-cycle-state-unknown")
+        self.assertIn("locator-cycle-binding-invalid", caught.exception.detail)
+        self.assertEqual(manifest_path.read_bytes(), before["manifest"])
+        self.assertEqual(P.cycle_record_path(self.root, cycle_id).read_bytes(), before["record"])
+        self.assertEqual((self.root / "campaigns" / "INDEX.json").read_bytes(), before["index_json"])
+        self.assertEqual((self.root / "campaigns" / "INDEX.md").read_bytes(), before["index_md"])
+
+    def test_record_locator_cannot_substitute_another_cycle_directory(self):
+        import shutil
+
+        self.activate()
+        route, route_file, result = self.begin()
+        self.write_output(result)
+        self.close(route, route_file)
+        cycle_id = result["cycle_id"]
+        P.finalize(self.root, cycle_id=cycle_id)
+        cycle_dir = Path(result["cycle_dir"])
+        decoy = cycle_dir.parent / f"{cycle_dir.name}-decoy"
+        shutil.copytree(cycle_dir, decoy)
+        binding_path = decoy / P.artifact_locator.CYCLE_BINDING
+        binding = json.loads(binding_path.read_text(encoding="utf-8"))
+        binding["cycle_id"] = "cyc_" + "9" * 32
+        binding_path.write_text(json.dumps(binding), encoding="utf-8")
+        record = P.read_cycle_record(self.root, cycle_id)
+        record["locator"] = decoy.name
+        P._write_cycle_record(self.root, record, exclusive=False)
+        with self.assertRaises(P.artifact_locator.LocatorError) as locator:
+            P.artifact_locator.scan_index(self.root)
+        self.assertEqual(locator.exception.code, "locator-cycle-binding-id-mismatch")
+        before = {
+            "manifest": (decoy / "manifest.json").read_bytes(),
+            "record": P.cycle_record_path(self.root, cycle_id).read_bytes(),
+            "index_json": (self.root / "campaigns" / "INDEX.json").read_bytes(),
+            "index_md": (self.root / "campaigns" / "INDEX.md").read_bytes(),
+        }
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id, state="completed")
+        self.assertEqual(caught.exception.code, "sealed-cycle-state-unknown")
+        self.assertEqual((decoy / "manifest.json").read_bytes(), before["manifest"])
+        self.assertEqual(P.cycle_record_path(self.root, cycle_id).read_bytes(), before["record"])
+        self.assertEqual((self.root / "campaigns" / "INDEX.json").read_bytes(), before["index_json"])
+        self.assertEqual((self.root / "campaigns" / "INDEX.md").read_bytes(), before["index_md"])
+
+    def test_unrelated_broken_binding_does_not_mask_unreadable_current_manifest(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        self.write_output(result)
+        self.close(route, route_file)
+        cycle_id = result["cycle_id"]
+        P.finalize(self.root, cycle_id=cycle_id)
+        cycle_dir = Path(result["cycle_dir"])
+        manifest_path = cycle_dir / "manifest.json"
+        manifest_before = manifest_path.read_bytes()
+        manifest_path.write_text("{not json", encoding="utf-8")
+        stranger = cycle_dir.parent / "2026-01-01_stranger"
+        stranger.mkdir()
+        (stranger / ".cycle.json").write_text(json.dumps({
+            "schema_version": 1, "kind": "artifact-cycle-binding",
+            "campaign_id": "camp_" + "0" * 32, "cycle_id": "cyc_" + "0" * 32,
+        }), encoding="utf-8")
+        before = {
+            "manifest": manifest_path.read_bytes(),
+            "record": P.cycle_record_path(self.root, cycle_id).read_bytes(),
+            "index_json": (self.root / "campaigns" / "INDEX.json").read_bytes(),
+            "index_md": (self.root / "campaigns" / "INDEX.md").read_bytes(),
+        }
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id, state="completed")
+        self.assertEqual(caught.exception.code, "sealed-cycle-state-unreadable")
+        self.assertEqual(manifest_path.read_bytes(), before["manifest"])
+        self.assertNotEqual(manifest_path.read_bytes(), manifest_before)
+        self.assertEqual(P.cycle_record_path(self.root, cycle_id).read_bytes(), before["record"])
+        self.assertEqual((self.root / "campaigns" / "INDEX.json").read_bytes(), before["index_json"])
+        self.assertEqual((self.root / "campaigns" / "INDEX.md").read_bytes(), before["index_md"])
 
 
 class SharedReferencePinAndRelatedTest(ProducerTestBase):
@@ -1707,6 +2391,266 @@ class ComponentSetCheckSurface(ProducerTestBase):
         P.check_component_sets(self.root, "spec", reference_id)
         after = {p: p.stat().st_mtime_ns for p in sorted(shared.rglob("*")) if p.is_file()}
         self.assertEqual(before, after)
+
+
+
+class TerminalExactRecoveryTest(ProducerTestBase):
+    def test_terminal_exact_rejects_each_index_identity_drift_without_mutation(self):
+        result, output, binding = self.prepared()
+        cycle_id = result["cycle_id"]
+        P.finalize_exact_cycle(self.root, cycle_id=cycle_id, expected_binding=binding)
+        original = P.artifact_index.to_payload(adm.load_index(self.root))
+        manifest = Path(result["cycle_dir"]) / "manifest.json"
+        record = P.cycle_record_path(self.root, cycle_id)
+        stable_bytes = (manifest.read_bytes(), record.read_bytes(), output.read_bytes())
+        cases = [(section, key) for section in ("manifests", "cycles")
+                 for key in [*original[section][cycle_id], None]]
+        cases.append(("artifact_root_id", None))
+        for section, key in cases:
+            with self.subTest(section=section, key=key):
+                payload = json.loads(json.dumps(original))
+                if section == "artifact_root_id":
+                    payload[section] = "aroot_" + "f" * 32
+                elif key is None:
+                    del payload[section][cycle_id]
+                else:
+                    payload[section][cycle_id][key] += "-foreign"
+                drifted = P.artifact_index.parse(payload)
+                adm._write_index(self.root, drifted)
+                for operation in (P.verify_finalized_cycle, P.finalize_exact_cycle):
+                    with self.assertRaisesRegex(P.ProducerError, "already-sealed-mismatch"):
+                        operation(self.root, cycle_id=cycle_id, expected_binding=binding)
+                    self.assertEqual(P.artifact_index.to_payload(adm.load_index(self.root)), payload)
+                    self.assertEqual((manifest.read_bytes(), record.read_bytes(), output.read_bytes()), stable_bytes)
+                    self.assertFalse(P.journal_path(self.root, cycle_id).exists())
+        adm._write_index(self.root, P.artifact_index.parse(original))
+        self.assertEqual(P.verify_finalized_cycle(self.root, cycle_id=cycle_id,
+                         expected_binding=binding)["status"], "already-sealed")
+
+    def test_general_absent_cache_compatibility_never_proves_terminal_exact(self):
+        result, output, binding = self.prepared()
+        cycle_id = result["cycle_id"]
+        P.finalize_exact_cycle(self.root, cycle_id=cycle_id, expected_binding=binding)
+        manifest = Path(result["cycle_dir"]) / "manifest.json"
+        manifest.unlink()  # isolated relocation-compatibility fixture only
+        before = P.read_cycle_record(self.root, cycle_id)
+        normal = P.finalize(self.root, cycle_id=cycle_id)
+        self.assertEqual(normal["status"], "already-sealed")
+        self.assertEqual(normal["cycle_state"], "completed")
+        for operation in (P.verify_finalized_cycle, P.finalize_exact_cycle):
+            with self.subTest(operation=operation.__name__):
+                with self.assertRaisesRegex(P.ProducerError, "already-sealed-mismatch"):
+                    operation(self.root, cycle_id=cycle_id, expected_binding=binding)
+        self.assertEqual(P.read_cycle_record(self.root, cycle_id), before)
+        self.assertFalse(manifest.exists())
+
+    def prepared(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        output = self.write_output(result, "plans/cycle/final_report.md", b"verified report\n")
+        self.close(route, route_file)
+        record = P.read_cycle_record(self.root, result["cycle_id"])
+        binding = {key: record[key] for key in ("campaign_id", "cycle_id", "producer_id", "route_hash")}
+        binding["cycle_record_digest"] = P.dispatch_terminal_commit.cycle_identity_digest(record)
+        return result, output, binding
+
+    def test_manifest_crash_recovers_only_exact_cycle_and_replay_proves_outputs(self):
+        result, output, binding = self.prepared()
+        other_route, other_file = self.route(slug="other-open-cycle")
+        other = P.begin(self.root, route_file=other_file, capability="autopilot-code", intensity="direct")
+        other_before = P.read_cycle_record(self.root, other["cycle_id"])
+        with self.assertRaises(adm.AdmissionRecoveryRequired):
+            P.finalize_exact_cycle(self.root, cycle_id=result["cycle_id"], expected_binding=binding,
+                                   crash_after_manifest=True)
+        manifest = Path(result["cycle_dir"]) / "manifest.json"
+        before = manifest.read_bytes()
+        with mock.patch.object(P, "_recover_locked", side_effect=AssertionError("root recovery forbidden")):
+            replay = P.finalize_exact_cycle(self.root, cycle_id=result["cycle_id"], expected_binding=binding)
+            self.assertEqual(replay["status"], "already-sealed")
+            P.verify_finalized_cycle(self.root, cycle_id=result["cycle_id"], expected_binding=binding)
+        self.assertEqual(manifest.read_bytes(), before)
+        self.assertEqual(P.read_cycle_record(self.root, other["cycle_id"]), other_before)
+        output.write_bytes(b"drift after sealing\n")
+        with self.assertRaisesRegex(P.ProducerError, "already-sealed-mismatch"):
+            P.verify_finalized_cycle(self.root, cycle_id=result["cycle_id"], expected_binding=binding)
+
+    def test_completed_finalize_live_lease_and_reentry_make_no_manifest(self):
+        result, output, binding = self.prepared()
+        P.review_lease_acquire(self.root, cycle_id=result["cycle_id"], attempt_id="att-review")
+        with self.assertRaisesRegex(P.ProducerError, "cycle-finalize-blocked-live-review"):
+            P.finalize_exact_cycle(self.root, cycle_id=result["cycle_id"], expected_binding=binding)
+        self.assertFalse((Path(result["cycle_dir"]) / "manifest.json").exists())
+        with self.assertRaisesRegex(P.ProducerError, "finalize-reentry-forbidden"):
+            P.finalize(self.root, cycle_id=result["cycle_id"], _admission_lock_fd=123)
+        self.assertEqual(P.read_cycle_record(self.root, result["cycle_id"])["state"], "open")
+
+
+class QuickOwnerBindingIntegrationTest(ProducerTestBase):
+    def test_registered_quick_begin_crash_resumes_same_binding_without_owner_route_fields(self):
+        self.activate()
+        route, route_file = self.route("quick")
+        node = route["nodes"][0]
+        jobs = Path(self._tmp.name) / "jobs.log"
+        owner = "att-quick-binding"
+        meta = dict(attempt_id=owner, worker_type="owner", dispatch_depth="1", registered_worker="1",
+            harness="codex", capability="autopilot-code", capability_mode="dev", intensity="quick",
+            route_file=str(route_file), route_id=route["route_id"], route_hash=route["route_hash"],
+            route_node=node["id"], registry_digest=route["registry_digest"],
+            completion_gate=node["completion_gate"], write_scope=";".join(node["write_scope"]))
+        jobs.write_text(f"2026-09-08T00:00:00Z\topen\t{R.ROOT}\t{R.ROOT}\tquick\t"
+                        + ",".join(f"{k}={v}" for k,v in meta.items()) + "\n")
+        kwargs = dict(route_file=route_file, capability="autopilot-code", intensity="quick",
+                      jobs=jobs, owner_attempt_id=owner)
+        with mock.patch.object(P.dispatch_terminal_commit, "publish_producer_binding", side_effect=RuntimeError("binding-crash")):
+            with self.assertRaisesRegex(RuntimeError, "binding-crash"):
+                P.begin(self.root, **kwargs)
+        records = P.list_cycle_records(self.root)
+        self.assertEqual(len(records), 1)
+        result = P.begin(self.root, **kwargs)
+        self.assertEqual(result["cycle_id"], records[0]["cycle_id"])
+        binding = P.dispatch_terminal_commit.load_producer_binding(artifact_root=self.root,
+                          route_id=route["route_id"], owner_attempt_id=owner)
+        self.assertEqual(binding.binding["cycle_id"], result["cycle_id"])
+        self.assertEqual(P.begin(self.root, **kwargs)["cycle_id"], result["cycle_id"])
+        self.assertEqual(len(P.list_cycle_records(self.root)), 1)
+
+
+class TerminalTransactionIntegrationTest(ProducerTestBase):
+    def _prepare_fixture(self):
+        import dispatch_terminal_commit as terminal
+        self.activate()
+        route=R.compile_route("autopilot-code","dev","standard",cwd=R.ROOT,artifact_root=self.root,
+            predicates=[],transport="headless",tracking="tracked",tracked_gate_evidence=gate_evidence(),
+            slug="terminal-transaction-fixture",dispatch_evidence={"tuples":[nested("claude","codex")]})
+        route_file=Path(L.admit_runtime_route(self.root,route).route_file)
+        jobs=Path(self._tmp.name)/"jobs.log"; owner="att-transaction-owner"; child="att-transaction-report"
+        owner_meta=dict(attempt_id=owner,worker_type="owner",dispatch_depth="1",registered_worker="1",
+            harness="claude",owner_route_file=str(route_file),owner_route_id=route["route_id"],
+            owner_route_hash=route["route_hash"])
+        def row(status,slug,metadata):
+            return f"2026-09-08T00:00:00Z\t{status}\t{R.ROOT}\t{R.ROOT}\t{slug}\t"+",".join(f"{k}={v}" for k,v in metadata.items())+"\n"
+        jobs.write_text(row("open","owner",owner_meta))
+        with mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(jobs)}):
+            result=P.begin(self.root,route_file=route_file,capability="autopilot-code",intensity="standard",
+                           jobs=jobs,owner_attempt_id=owner)
+            artifact=self.write_output(result,rel="plans/fixture/final_report.md",data=b"verified fixture report\n")
+            node=next(node for node in route["nodes"] if node.get("terminal"))
+            child_meta=dict(attempt_schema_version=2,attempt_id=child,parent_attempt_id=owner,
+                dispatch_depth=2,transport="headless",execution_surface="registered-headless",registered_worker="1",
+                fallback_hop="same-harness-headless",harness="codex",route_id=route["route_id"],
+                route_hash=route["route_hash"],route_node=node["id"],failure_class="pass",launch_outcome="reaped-before-publish")
+            subprocess.run([sys.executable,"-c","pass"],check=True)
+            jobs.write_text(row("open","owner",owner_meta)+row("done","report",child_meta))
+            R._publish_completion_locked(route,node,node["id"],artifact,attempt_id=child,attempt_metadata=child_meta,jobs=jobs)
+            request=terminal.TerminalCommitRequest(route_file,owner,jobs,self.root)
+            return route,route_file,jobs,owner,result,artifact,request
+
+    def test_default_services_close_finalize_envelope_and_replay(self):
+        import dispatch_terminal_commit as terminal
+        route,route_file,jobs,owner,result,artifact,request=self._prepare_fixture()
+        with mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(jobs)}):
+            proof=terminal.prove_terminal_authority(request)
+            self.assertEqual(proof.status,"proved",proof)
+            settled=terminal.settle_terminal_commit(request)
+            self.assertEqual(settled.result,"completed",settled)
+            self.assertIn(f"artifact: {artifact}",settled.envelope_text)
+            manifest=Path(result["cycle_dir"])/"manifest.json"
+            self.assertTrue(manifest.is_file())
+            self.assertEqual(P.read_cycle_record(self.root,result["cycle_id"])["state"],"sealed")
+            slot=terminal.terminal_slot(self.root,route["route_id"],owner)
+            paths=[R.outcome_path(route_file),manifest,slot/"owner-envelope.txt",slot/"owner-envelope.json"]
+            before={str(path):path.read_bytes() for path in paths}
+            replay=terminal.settle_terminal_commit(request)
+            self.assertEqual(replay.result,"completed",replay)
+            self.assertEqual(before,{str(path):path.read_bytes() for path in paths})
+            artifact.write_text("post-seal corruption")
+            self.assertNotEqual(terminal.settle_terminal_commit(request).result,"completed")
+
+    def test_default_services_recover_each_durable_boundary_without_duplicate_outputs(self):
+        import dispatch_terminal_commit as terminal
+        checkpoints=("claim-before","claim-after","close-after","manifest-after","finalize-after","envelope-after")
+        for checkpoint in checkpoints:
+            with self.subTest(checkpoint=checkpoint):
+                fixture=TerminalTransactionIntegrationTest()
+                fixture.setUp()
+                try:
+                    route,route_file,jobs,owner,result,artifact,request=fixture._prepare_fixture()
+                    if checkpoint=="claim-before":
+                        crash=mock.patch.object(terminal.dispatch_contract,"claim_terminal_route_locked",
+                                                side_effect=RuntimeError(checkpoint))
+                    elif checkpoint=="claim-after":
+                        original=terminal._atomic_json
+                        def write(path,value,**kw):
+                            if value.get("state")=="claimed":raise RuntimeError(checkpoint)
+                            return original(path,value,**kw)
+                        crash=mock.patch.object(terminal,"_atomic_json",side_effect=write)
+                    elif checkpoint=="manifest-after":
+                        crash=mock.patch.object(P,"_commit_sealed",side_effect=RuntimeError(checkpoint))
+                    else:
+                        next_state={"close-after":"route-closed","finalize-after":"producer-finalized",
+                                    "envelope-after":"owner-envelope-sealed"}[checkpoint]
+                        original=terminal._advance_state
+                        def advance(path,commit_id,expected,next_value,extra):
+                            if next_value==next_state:raise RuntimeError(checkpoint)
+                            return original(path,commit_id,expected,next_value,extra)
+                        crash=mock.patch.object(terminal,"_advance_state",side_effect=advance)
+                    with mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(jobs)}):
+                        with crash:
+                            interrupted=terminal.settle_terminal_commit(request)
+                        self.assertNotEqual(interrupted.result,"completed",interrupted)
+                        slot=terminal.terminal_slot(fixture.root,route["route_id"],owner)
+                        targets=[R.outcome_path(route_file),Path(result["cycle_dir"])/"manifest.json",slot/"owner-envelope.txt"]
+                        committed={str(path):path.read_bytes() for path in targets if path.is_file()}
+                        recovered=terminal.settle_terminal_commit(request)
+                        self.assertEqual(recovered.result,"completed",(checkpoint,recovered))
+                        for path in targets:
+                            self.assertTrue(path.is_file())
+                            if str(path) in committed:self.assertEqual(path.read_bytes(),committed[str(path)])
+                        sealed={str(path):path.read_bytes() for path in targets}
+                        self.assertEqual(terminal.settle_terminal_commit(request).result,"completed")
+                        self.assertEqual(sealed,{str(path):path.read_bytes() for path in targets})
+                        self.assertEqual(P.read_cycle_record(fixture.root,result["cycle_id"])["state"],"sealed")
+                finally:
+                    fixture.doCleanups()
+
+    def test_review_lease_between_close_and_finalize_is_typed_and_recoverable(self):
+        import dispatch_terminal_commit as terminal
+        route,route_file,jobs,owner,result,artifact,request=self._prepare_fixture()
+        original=terminal._advance_state
+        def acquire_after_close(path,commit_id,expected,next_value,extra):
+            state=original(path,commit_id,expected,next_value,extra)
+            if next_value=="route-closed":
+                P.review_lease_acquire(self.root,cycle_id=result["cycle_id"],attempt_id="att-late-review")
+            return state
+        with mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(jobs)}):
+            with mock.patch.object(terminal,"_advance_state",side_effect=acquire_after_close):
+                blocked=terminal.settle_terminal_commit(request)
+            self.assertEqual(blocked.result,"recoverable",blocked)
+            self.assertEqual(blocked.reason,"producer-finalize-failed")
+            self.assertIn("cycle-finalize-blocked-live-review",blocked.detail)
+            self.assertFalse((Path(result["cycle_dir"])/"manifest.json").exists())
+            self.assertEqual(P.read_cycle_record(self.root,result["cycle_id"])["state"],"open")
+            P.review_lease_release(self.root,cycle_id=result["cycle_id"],attempt_id="att-late-review")
+            self.assertEqual(terminal.settle_terminal_commit(request).result,"completed")
+
+    def test_real_completion_writer_observes_claim_before_marker_mutation(self):
+        import dispatch_terminal_commit as terminal
+        route,route_file,jobs,owner,result,artifact,request=self._prepare_fixture()
+        with mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(jobs)}):
+            first=terminal.settle_terminal_commit(request,
+                services=terminal.TerminalCommitServices(crash_after="claim-after"))
+            self.assertEqual(first.result,"recoverable",first)
+            node=next(node for node in route["nodes"] if node.get("terminal"))
+            directory=R.completion_dir(route["route_id"])
+            before={str(path):path.read_bytes() for path in directory.rglob("*.json")}
+            registry_before=jobs.read_bytes()
+            with self.assertRaises(terminal.dispatch_contract.DispatchContractError) as caught:
+                R._complete_node_locked(route,node,node["id"],artifact,jobs=jobs,
+                    attempt_id="att-transaction-report")
+            self.assertEqual(caught.exception.reason,"terminal-claim-conflict")
+            self.assertEqual(before,{str(path):path.read_bytes() for path in directory.rglob("*.json")})
+            self.assertEqual(registry_before,jobs.read_bytes())
+            self.assertEqual(terminal.settle_terminal_commit(request).result,"completed")
 
 
 if __name__ == "__main__":

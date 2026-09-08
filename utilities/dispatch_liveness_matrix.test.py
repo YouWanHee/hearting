@@ -198,6 +198,12 @@ class FallbackRuntimeWiringTest(unittest.TestCase):
             )
             args = type("Args", (), {
                 "slug": "s", "parent": "p", "jobs": jobs,
+                # Not an argparse flag: `_dispatch()` resolves the exact live
+                # parent generation into `args` before any candidate runs, so
+                # every real `capacity_retry()` call already carries it and the
+                # retry identity is bound to that generation. A fixture Args
+                # that omits it stops exercising the identity path at all.
+                "parent_attempt_id": "att-fallback-parent",
                 "capacity_model": "gpt-5.6-luna", "capacity_reasoning": "medium",
                 "capacity_effort": None, "capacity_variant": None, "direct_timeout": 2,
                 "action": "register", "progress_window_seconds": 0, "watchdog_max_windows": 2,

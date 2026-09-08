@@ -10,6 +10,7 @@ does not depend on live auth.
 """
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -19,6 +20,18 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 COMPOSE = ROOT / "utilities" / "compose-route.py"
+
+
+def _cli_env():
+    """Pin the subprocess runtime root to this checkout.
+
+    The compile tail refuses a registry/runtime split (run the installed
+    utility or export AGENT_HOME). Without the pin, any host with an
+    installed harness made both CLI round-trip tests exit 64 with
+    launch-runtime-root-mismatch even though the fixture exercises only this
+    checkout's code.
+    """
+    return {**{k:v for k,v in os.environ.items() if not k.startswith(("AGENT_DISPATCH_", "AGENT_OWNER_ROUTE_", "AGENT_ROUTE_", "AGENT_ARTIFACT_"))}, "AGENT_HOME": str(ROOT)}
 
 
 def _load(name, filename):
@@ -45,11 +58,19 @@ FIXTURE_EVIDENCE = {
 }
 # A two-node analyze-project compose: research survey feeding a claim reviewer.
 UNITS = [
-    {"id": "survey", "unit": "research/research-survey",
+    {"profile_demand": {"schema_version": 1, "judgment_requirement": "important", "execution_scope": "short-local", "judgment_reason": "Review fixture evidence.", "execution_reason": "One fixture artifact.", "evidence_refs": ["task.md"]}, "id": "survey", "unit": "research/research-survey",
      "write_scope": ["analysis_project/code/**"], "gate": "research-retrieval"},
-    {"id": "claim", "unit": "research/claim-verify", "depends_on": ["survey"],
+    {"profile_demand": {"schema_version": 1, "judgment_requirement": "important", "execution_scope": "short-local", "judgment_reason": "Review fixture evidence.", "execution_reason": "One fixture artifact.", "evidence_refs": ["task.md"]}, "id": "claim", "unit": "research/claim-verify", "depends_on": ["survey"],
      "write_scope": ["reviews/claims/**"], "gate": "research-claims"},
 ]
+
+
+# These are new ad-hoc research stages, so their fixture explicitly supplies
+# the judgment demand rather than relying on the old role-derived default.
+for unit in UNITS:
+    unit["profile_demand"] = {"schema_version": 1, "judgment_requirement": "important",
+        "execution_scope": "short-local", "judgment_reason": "Assess the evidence supporting the claim.",
+        "execution_reason": "One bounded fixture artifact.", "evidence_refs": ["fixture-task"]}
 
 
 class TestComposeRoute(unittest.TestCase):
@@ -82,7 +103,8 @@ class TestComposeRoute(unittest.TestCase):
                 command += ["--slug", slug]
             if output is not None:
                 command += ["--output", output]
-            result = subprocess.run(command, text=True, capture_output=True, check=False)
+            result = subprocess.run(
+                command, text=True, capture_output=True, check=False, env=_cli_env())
             return result
 
     # --- build_recipe: the assembly logic this tool owns ------------------
@@ -113,7 +135,7 @@ class TestComposeRoute(unittest.TestCase):
     def test_build_recipe_auto_derives_single_unit_io_gate(self):
         recipe = C.build_recipe(
             "analyze-project", "code",
-            [{"id": "review", "unit": "qa/plan-review", "write_scope": ["reviews/plan/**"]}],
+            [{"profile_demand": {"schema_version": 1, "judgment_requirement": "important", "execution_scope": "short-local", "judgment_reason": "Review fixture evidence.", "execution_reason": "One fixture artifact.", "evidence_refs": ["task.md"]}, "id": "review", "unit": "qa/plan-review", "write_scope": ["reviews/plan/**"]}],
             topology_class="staged", quick_write_scope=[],
             quick_model_profile="balanced-deep", gate_index=self._gate_index(),
             cycle_anchors=["analysis_project"], review_anchor="reviews",
@@ -162,27 +184,27 @@ class TestComposeRoute(unittest.TestCase):
 
     # --- fail-closed cases -----------------------------------------------
     def test_unknown_unit_fails_closed(self):
-        result = self._run([{"id": "x", "unit": "research/does-not-exist",
+        result = self._run([{"profile_demand": {"schema_version": 1, "judgment_requirement": "important", "execution_scope": "short-local", "judgment_reason": "Review fixture evidence.", "execution_reason": "One fixture artifact.", "evidence_refs": ["task.md"]}, "id": "x", "unit": "research/does-not-exist",
                              "write_scope": ["analysis_project/code/**"], "gate": "research-retrieval"}])
         self.assertEqual(result.returncode, 64)
         self.assertIn("unknown unit", result.stderr)
 
     def test_gate_without_contract_fails_closed(self):
-        result = self._run([{"id": "x", "unit": "research/research-survey",
+        result = self._run([{"profile_demand": {"schema_version": 1, "judgment_requirement": "important", "execution_scope": "short-local", "judgment_reason": "Review fixture evidence.", "execution_reason": "One fixture artifact.", "evidence_refs": ["task.md"]}, "id": "x", "unit": "research/research-survey",
                              "write_scope": ["analysis_project/code/**"], "gate": "no-such-gate"}])
         self.assertEqual(result.returncode, 64)
         self.assertIn("completion_gate_contracts", result.stderr)
 
     def test_gate_naming_wrong_unit_fails_closed_at_compile(self):
         # code-plan-check is a real unit-io gate, but it names qa/plan-review, not the node's unit.
-        result = self._run([{"id": "x", "unit": "research/research-survey",
+        result = self._run([{"profile_demand": {"schema_version": 1, "judgment_requirement": "important", "execution_scope": "short-local", "judgment_reason": "Review fixture evidence.", "execution_reason": "One fixture artifact.", "evidence_refs": ["task.md"]}, "id": "x", "unit": "research/research-survey",
                              "write_scope": ["analysis_project/code/**"], "gate": "code-plan-check"}])
         self.assertEqual(result.returncode, 64)
         self.assertIn("must name the carrying node's unit", result.stderr)
 
     def test_ambiguous_gate_auto_derive_fails_closed(self):
         # research/research-survey backs five unit-io gates, so auto-derive is refused.
-        result = self._run([{"id": "x", "unit": "research/research-survey",
+        result = self._run([{"profile_demand": {"schema_version": 1, "judgment_requirement": "important", "execution_scope": "short-local", "judgment_reason": "Review fixture evidence.", "execution_reason": "One fixture artifact.", "evidence_refs": ["task.md"]}, "id": "x", "unit": "research/research-survey",
                              "write_scope": ["analysis_project/code/**"]}])
         self.assertEqual(result.returncode, 64)
         self.assertIn("multiple gates", result.stderr)
@@ -210,7 +232,7 @@ class TestComposeRoute(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "map-worker node requires --map-anchor"):
             C.build_recipe(
                 "analyze-project", "code",
-                [{"id": "x", "unit": "material/web-image-search", "kind": "map-worker",
+                [{"profile_demand": {"schema_version": 1, "judgment_requirement": "important", "execution_scope": "short-local", "judgment_reason": "Review fixture evidence.", "execution_reason": "One fixture artifact.", "evidence_refs": ["task.md"]}, "id": "x", "unit": "material/web-image-search", "kind": "map-worker",
                   "write_scope": ["analysis_project/refs/**"], "gate": "design-refs"}],
                 topology_class="staged", quick_write_scope=[],
                 quick_model_profile="balanced-deep", gate_index=self._gate_index(),
@@ -252,9 +274,9 @@ class TestComposeRoute(unittest.TestCase):
         # recipe gets -- a scope that does not carry the declared literal
         # prefix must fail closed here, not silently pass as "implicit" bare.
         literal_units = [
-            {"id": "survey", "unit": "research/research-survey",
+            {"profile_demand": {"schema_version": 1, "judgment_requirement": "important", "execution_scope": "short-local", "judgment_reason": "Review fixture evidence.", "execution_reason": "One fixture artifact.", "evidence_refs": ["task.md"]}, "id": "survey", "unit": "research/research-survey",
              "write_scope": ["analysis_project/code/**"], "gate": "research-retrieval"},
-            {"id": "claim", "unit": "research/claim-verify", "depends_on": ["survey"],
+            {"profile_demand": {"schema_version": 1, "judgment_requirement": "important", "execution_scope": "short-local", "judgment_reason": "Review fixture evidence.", "execution_reason": "One fixture artifact.", "evidence_refs": ["task.md"]}, "id": "claim", "unit": "research/claim-verify", "depends_on": ["survey"],
              "write_scope": ["analysis_project/reviews/**"], "gate": "research-claims"},
         ]
         with tempfile.TemporaryDirectory() as out_dir:
@@ -263,9 +285,9 @@ class TestComposeRoute(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
 
         mismatched_units = [
-            {"id": "survey", "unit": "research/research-survey",
+            {"profile_demand": {"schema_version": 1, "judgment_requirement": "important", "execution_scope": "short-local", "judgment_reason": "Review fixture evidence.", "execution_reason": "One fixture artifact.", "evidence_refs": ["task.md"]}, "id": "survey", "unit": "research/research-survey",
              "write_scope": ["analysis_project/code/**"], "gate": "research-retrieval"},
-            {"id": "claim", "unit": "research/claim-verify", "depends_on": ["survey"],
+            {"profile_demand": {"schema_version": 1, "judgment_requirement": "important", "execution_scope": "short-local", "judgment_reason": "Review fixture evidence.", "execution_reason": "One fixture artifact.", "evidence_refs": ["task.md"]}, "id": "claim", "unit": "research/claim-verify", "depends_on": ["survey"],
              "write_scope": ["reviews/claims/**"], "gate": "research-claims"},
         ]
         with tempfile.TemporaryDirectory() as out_dir:
@@ -292,7 +314,8 @@ class TestComposeRoute(unittest.TestCase):
             ] + extra_args
             if output is not None:
                 command += ["--output", output]
-            return subprocess.run(command, text=True, capture_output=True, check=False)
+            return subprocess.run(
+                command, text=True, capture_output=True, check=False, env=_cli_env())
 
 
 if __name__ == "__main__":

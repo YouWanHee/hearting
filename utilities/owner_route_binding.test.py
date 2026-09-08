@@ -23,6 +23,16 @@ SPEC.loader.exec_module(M)
 
 
 class OwnerRouteBindingTest(unittest.TestCase):
+    def test_owner_tuple_failure_details(self):
+        self.assertEqual(M.owner_binding_tuple_failure_fields(
+            dispatch_depth=1, worker_type="owner", route_file=None), {})
+        for depth, worker, raw, expected in ((2,"owner",None,(1,0,0)),
+                (1,"stage",None,(0,1,0)), (1,"owner","route.json",(0,0,1))):
+            fields=M.owner_binding_tuple_failure_fields(
+                dispatch_depth=depth,worker_type=worker,route_file=raw)
+            self.assertEqual(tuple(fields["invalid_"+key] for key in
+                ("dispatch_depth","worker_type","route_file_present")), tuple(map(str,expected)))
+
     def route(self, cwd: str) -> dict:
         return {
             "schema_version": 2,

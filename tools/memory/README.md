@@ -376,3 +376,18 @@ store; `harness memory status` reports the recorded policy.
 `index-check.sh` remains a separate checker for the legacy
 `projects/*/memory/MEMORY.md` text index. Store search indexes are owned by
 `mem index` inside `memory.db`.
+
+### 전체 blocked 이력 진단
+
+`python3 tools/memory/mem.py sync status --blocked-details --json`은 기존 store를
+읽기 전용으로 조회한다. 일반 `sync status --json`의 ID 목록은 기존처럼 8개와
+8192-byte 상한을 유지한다. `blocked_details`는 전체 op_id, 원래 result/reason,
+active/resolved/historical-inert 분류, 레코드별 resolved_by, reader-local proof의
+가용성·검증 결과·경로·digest를 제공한다. `blocked_details_count`와
+`blocked_detail_counts`가 전체 개수를 나타낸다.
+
+Historical-inert는 검증된 sealed membership/evidence와 snapshot/seed가 있고,
+원본 snapshot의 exact operation 및 prior body/state 부재가 확인되는 reader에서만
+표시한다. 증거가 없는 새 reader와 불완전·손상 증거는 active로 남는다. 이 명령은
+raw operation, 본문, pending, 이력, 원래 blocked result 또는 기본 경고를 바꾸지
+않는다. `--blocked-details`는 실제 동기화를 수행하는 기본 `sync`에 사용할 수 없다.

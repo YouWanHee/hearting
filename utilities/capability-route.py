@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compile, verify, and complete immutable capability routes."""
 from __future__ import annotations
-import argparse, base64, contextlib, fcntl, hashlib, importlib.util, json, os, re, shutil, subprocess, sys, uuid
+import argparse, base64, contextlib, fcntl, hashlib, importlib.util, json, os, re, shlex, shutil, subprocess, sys, tempfile, uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -13,6 +13,8 @@ VALID_AFFINITY = DEFAULTS.AFFINITY_VALUES | {"unspecified"}
 sys.path.insert(0, str(ROOT/"utilities"))
 import artifact_locator as ARTIFACT_LOCATOR
 import route_identity as ROUTE_IDENTITY
+import dispatch_terminal_commit
+import model_profile as PROFILE
 import review_round_cap as REVIEW_ROUND_CAP
 from dispatch_continuation_budget import COMPATIBILITY_FLOOR, TERMINAL_RESERVE_DEFAULT
 from dispatch_contract import (
@@ -28,6 +30,9 @@ from dispatch_contract import (
     _atomic_registry_replace,
     _delivery_intent_values,
     _updated_attempt_metadata,
+    claim_terminal_route_locked,
+    ensure_terminal_claim_absent,
+    terminal_claim_observation,
     agent_home_equivalent,
     attempt_process_quiescence,
     completion_marker_is_current,
@@ -88,10 +93,20 @@ _LAUNCH_ROOT_IDENTITY_CACHE = {}
 _LAUNCH_CONTENT_DIGEST_CACHE = {}
 _LAUNCH_SOURCE_REVISION_CACHE = {}
 _RUNTIME_ACTIVATION = None
-_RUNTIME_ROOT_HINT = (
-    "hint: run the INSTALLED utility -- python3 \"$AGENT_HOME/utilities/<tool>.py\" -- "
-    "or export AGENT_HOME=<this checkout> to make this checkout the active runtime"
-)
+def runtime_root_hint(route=None):
+    # A refused tuple is untrusted input even when its route hash is valid.
+    # Recovery formatting must not replace the typed refusal with an exception.
+    sealed = route.get("launch_compatibility_tuple") if isinstance(route, dict) else None
+    runtime = sealed.get("runtime_root") if isinstance(sealed, dict) else None
+    path = runtime.get("path") if isinstance(runtime, dict) else None
+    expected = path if isinstance(path, str) and Path(path).is_absolute() else str(
+        Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local/share"))) / "hearting/current"
+    )
+    return (
+        f"hint: use the sealed runtime root: AGENT_HOME={shlex.quote(expected)} "
+        f"python3 {shlex.quote(str(Path(expected) / 'utilities/<tool>.py'))}; "
+        "a runtime projection such as ~/.claude is not the managed release root"
+    )
 # Only dispatch-depth-2 nodes receive a checked `fallback_hops` chain, so they are
 # the sole consumers of `dispatch_evidence.tuples`.
 EVIDENCE_CONSUMER_DISPATCH_DEPTH = 2
@@ -926,10 +941,24 @@ def build_continuation_route(
         "resume_retry_boundaries","dispatch_evidence","dispatch_contract_version",
         "dispatch_evidence_scope_version","registered_headless_candidates",
         "registered_headless_policy","unit_catalog_digest","validation_basis",
+        # Profile-demand sealing is part of the route identity. Continuation
+        # suffixes must carry it forward so verification can replay the same
+        # resolver contract instead of treating an annotated source as legacy.
+        "profile_selection_contract_version","profile_demands","explicit_profiles",
+        "owner_profile_demand","owner_profile_selection",
+        # SD-OPEN-46: a composed source's composition fields must ride the
+        # suffix, or the continuation presents itself as a preset route and the
+        # embedded composed_recipe loses its hash seal. (`route_origin`/`shape`
+        # live inside `selection`, inherited above.)
+        "composed","composed_recipe",
     )
     route={key:json.loads(json.dumps(source_route[key]))
            for key in inherited_keys if key in source_route}
     route.update(result)
+    if route.get("profile_selection_contract_version") == 1:
+        retained = {node["id"] for node in route_nodes} | {"__owner__"}
+        for key in ("profile_demands", "explicit_profiles"):
+            route[key] = {k: v for k, v in route.get(key, {}).items() if k in retained}
     # Defect C: the pin must name the same commit the grounding tuple above sealed.
     source_commit,source_commit_rebind,rebind_declined=_continuation_source_commit(
         source_route,route_nodes,
@@ -1636,6 +1665,9 @@ def _expand_parallel_groups(nodes, parallel_groups, effective_intensity,
                     _parallel_path(path, suffix) for path in base["write_scope"]
                 ]
             leg["model_profile"] = leg_spec["model_profile"]
+            leg.pop("profile_demand", None)
+            if "profile_demand" in leg_spec:
+                leg["profile_demand"] = json.loads(json.dumps(leg_spec["profile_demand"]))
             leg["perspective"] = leg_spec["perspective"]
             leg["leg_class"] = leg_spec["leg_class"]
             if index:
@@ -1795,6 +1827,87 @@ def _seal_dispatch_defaults(nodes, capability, owner_profile=None):
         DEFAULTS.query_profile_policy(cfg, owner_profile) if owner_profile else None,
     )
 
+
+def _seal_profile_demands(nodes, profile_demands=None, explicit_profiles=None, *, legacy=False):
+    demands = profile_demands or {}
+    explicit_profiles = explicit_profiles or {}
+    for node in nodes:
+        if node.get("kind") == "resource-runner":
+            continue
+        node_id = node["id"]
+        demand = demands.get(node_id, node.get("profile_demand"))
+        supplied = node_id in demands or "profile_demand" in node
+        if supplied:
+            demand = PROFILE.normalize_profile_demand(demand)
+        explicit = explicit_profiles.get(node_id)
+        if node.get("profile_explicit") and node_id not in explicit_profiles:
+            explicit = node.get("model_profile")
+        if not supplied:
+            if node_id in explicit_profiles:
+                raise ValueError("profile-demand-required:" + node_id)
+            explicit = node.get("model_profile", "light")
+        selection = PROFILE.resolve_profile_demand(
+            demand, explicit_profile=explicit, legacy=legacy,
+            existing_versioned_stage=legacy,
+        )
+        node["profile_demand"] = demand
+        node["profile_selection"] = selection
+        node["model_profile"] = selection["resolved_profile"]
+    return nodes
+
+
+def _profile_input_maps(nodes, demands, explicit):
+    valid = {n["id"] for n in nodes if n.get("kind") != "resource-runner"} | {"__owner__"}
+    normalized = {}
+    for label, values in (("profile_demands", demands), ("explicit_profiles", explicit)):
+        if values is not None and (not isinstance(values, dict) or set(values) - valid):
+            raise ValueError("profile-input-unknown-node:" + label)
+    for key, value in (demands or {}).items():
+        normalized[key] = PROFILE.normalize_profile_demand(value)
+    for key, value in (explicit or {}).items():
+        if key not in normalized or value not in PROFILE.PORTABLE_PROFILES:
+            raise ValueError("profile-explicit-input-invalid:" + key)
+    return normalized, dict(explicit or {})
+
+
+def _verify_profile_contract(route):
+    version = route.get("profile_selection_contract_version")
+    if version is None:
+        # Exact sealed legacy routes contain no new semantic fields.
+        if route.get("owner_profile_selection") is not None or any(
+            "profile_selection" in n or "profile_demand" in n for n in route.get("nodes", [])):
+            raise ValueError("profile-selection-contract-missing")
+        return
+    if type(version) is not int or version != 1:
+        raise ValueError("profile-selection-version-unsupported")
+    demands, explicit = _profile_input_maps(route.get("nodes", []), route.get("profile_demands"), route.get("explicit_profiles"))
+    if route.get("owner_profile_demand") != demands.get("__owner__"):
+        raise ValueError("owner-profile-demand-map-mismatch")
+    owner_profile = route.get("owner_model_profile") or "light"
+    owner_expected = PROFILE.resolve_profile_demand(
+        demands.get("__owner__"), explicit_profile=(explicit.get("__owner__")
+            if "__owner__" in demands else owner_profile),
+        legacy=True, existing_versioned_stage=True)
+    if owner_expected != route.get("owner_profile_selection"):
+        raise ValueError("owner-profile-selection-map-mismatch")
+    for node in route.get("nodes", []):
+        node_id = node["id"]
+        if node_id in demands and node.get("profile_demand") != demands[node_id]:
+            raise ValueError("node-profile-demand-map-mismatch:" + node_id)
+        if node_id in explicit and (node.get("profile_selection", {}).get("source") != "explicit"
+                                   or node.get("model_profile") != explicit[node_id]):
+            raise ValueError("node-profile-explicit-map-mismatch:" + node_id)
+    PROFILE.validate_profile_selection(
+        route.get("owner_profile_selection"), route.get("owner_profile_demand"),
+        profile=route.get("owner_model_profile") or "light", existing_versioned_stage=True,
+    )
+    for node in route.get("nodes", []):
+        if node.get("kind") == "resource-runner":
+            continue
+        PROFILE.validate_profile_selection(node.get("profile_selection"), node.get("profile_demand"),
+                                           profile=node.get("model_profile"), existing_versioned_stage=True)
+
+
 def _seal_confirmation_mode():
     """SD-123: resolve the declared `confirmation.mode` to seal into the
     route, independent of `_seal_dispatch_defaults`'s return tuple.
@@ -1913,7 +2026,8 @@ def compile_route(capability, capability_mode, requested_intensity, cwd, artifac
                   transport_evidence="caller-selected", inline_reason=None,
                   tracking="tracked", tracked_gate_evidence=None, dispatch_evidence=None,
                   registered_headless_evidence=None, slug=None,
-                  route_origin="preset", shape=None):
+                         route_origin="preset", shape=None, profile_demands=None,
+                         explicit_profiles=None):
     registry=TOPO.load_registry(); TOPO.validate_registry(registry)
     recipe=TOPO.resolve_recipe(registry, capability, capability_mode)
     return _compile_from_recipe(
@@ -1923,7 +2037,8 @@ def compile_route(capability, capability_mode, requested_intensity, cwd, artifac
         tracking=tracking, tracked_gate_evidence=tracked_gate_evidence,
         dispatch_evidence=dispatch_evidence,
         registered_headless_evidence=registered_headless_evidence, slug=slug,
-        route_origin=route_origin, shape=shape)
+        route_origin=route_origin, shape=shape, profile_demands=profile_demands,
+        explicit_profiles=explicit_profiles)
 
 # ---------------------------------------------------------------------------
 # compose: the preset-free work route (SD-135).
@@ -2110,6 +2225,20 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec):
     return recipe
 
 
+def _versioned_subgraph(registry, recipe):
+    """Only an exact registry-derived subgraph may inherit legacy demands."""
+    meta = recipe.get("compose") or {}
+    if not isinstance(meta, dict) or not meta.get("base_capability"):
+        return False
+    try:
+        base = TOPO.resolve_recipe(registry, meta["base_capability"], recipe["modes"][0])
+        overrides = meta.get("unit_overrides", {})
+        graph = [(node_id, overrides.get(node_id)) for node_id in meta["graph"]]
+        return compose_subgraph_recipe(registry, base, graph) == recipe
+    except (ValueError, KeyError, TypeError, IndexError):
+        return False
+
+
 def _compose_default_jobs():
     inherited = os.environ.get("AGENT_DISPATCH_JOBS")
     if inherited:
@@ -2153,7 +2282,7 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
                   intensity=None, signals=(), spec_read=None, drift_verdict=None,
                   tracking=None, artifact_guard=None, children=None, parent_harness="claude",
                   dispatch_evidence=None, registered_headless_evidence=None,
-                  transport_evidence="compose-default", jobs=None):
+                  transport_evidence="compose-default", jobs=None, profile_demands=None, explicit_profiles=None):
     """Resolve every default, then compile through the ordinary sealer."""
     if shape not in COMPOSE_SHAPES:
         raise ValueError(f"compose-shape-invalid:{shape}")
@@ -2207,6 +2336,7 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
         dispatch_evidence=dispatch_evidence,
         registered_headless_evidence=registered_headless_evidence,
         route_origin="compose", shape=shape,
+        profile_demands=profile_demands, explicit_profiles=explicit_profiles,
     )
     if shape == "staged":
         recipe = compose_subgraph_recipe(registry, base, parse_graph_spec(graph))
@@ -2257,7 +2387,9 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
                          transport_evidence="caller-selected", inline_reason=None,
                          tracking="tracked", tracked_gate_evidence=None, dispatch_evidence=None,
                          registered_headless_evidence=None, slug=None, composed=False,
-                  route_origin="preset", shape=None):
+                  route_origin="preset", shape=None, profile_demands=None,
+                  explicit_profiles=None):
+    dispatch_terminal_commit.require_current_cleanup("route-compile")
     if route_origin not in ROUTE_ORIGINS: raise ValueError("invalid route origin")
     cwd=Path(cwd).resolve(strict=True); artifact=Path(artifact_root).resolve()
     if not cwd.is_absolute() or not artifact.is_absolute(): raise ValueError("cwd and artifact root must be absolute")
@@ -2297,6 +2429,17 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
     elif effective=="quick":
         if transport not in (None, "headless"):
             raise ValueError(f"invalid quick transport: {transport!r}")
+        if (requested=="direct" and set(predicates)!=known_pred
+                and registered_headless_evidence is None):
+            # H6: an explicit direct request whose predicates do not all hold
+            # used to be silently promoted to quick and died as an opaque
+            # `quick-headless-unavailable`. Refuse instead and name the gap.
+            # With checked quick evidence the promotion still compiles
+            # (`test_ambiguous_quick`); the gaps stay recorded in
+            # selection_basis either way.
+            raise ValueError(
+                "direct-predicate-gap:"
+                +",".join(sorted(known_pred-set(predicates))))
         registered_headless_candidates=_validate_registered_headless_evidence(
             registered_headless_evidence
         )
@@ -2348,6 +2491,20 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
         for node in nodes:
             if node.get("dispatch_depth")==2:
                 node["fallback_hops"]=json.loads(json.dumps(chain))
+    profile_demands, explicit_profiles = _profile_input_maps(nodes, profile_demands, explicit_profiles)
+    owner_demand = profile_demands.get("__owner__")
+    owner_profile_selection = PROFILE.resolve_profile_demand(
+        owner_demand, explicit_profile=(explicit_profiles.get("__owner__") if owner_demand
+                                       else owner_model_profile or "light"),
+        legacy=True, existing_versioned_stage=True,
+    )
+    expected_owner = registry["owner_profile_by_intensity"].get(effective)
+    if expected_owner and owner_profile_selection["resolved_profile"] != expected_owner:
+        raise ValueError("owner-profile-eligibility-conflict")
+    if effective != "direct":
+        owner_model_profile = owner_profile_selection["resolved_profile"]
+    legacy_nodes = not composed or _versioned_subgraph(registry, recipe)
+    _seal_profile_demands(nodes, profile_demands, explicit_profiles, legacy=legacy_nodes)
     dispatch_defaults_digest,dispatch_allocation,owner_harness_policy=_seal_dispatch_defaults(
         nodes, capability, owner_model_profile
     )
@@ -2375,6 +2532,9 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
       "schema_version":ROUTE_SCHEMA_VERSION,"capability":capability,"capability_mode":capability_mode,
       "requested_intensity":requested_intensity,"effective_intensity":effective,
       "owner_model_profile":owner_model_profile,
+      "profile_selection_contract_version":1,
+      "profile_demands":profile_demands,"explicit_profiles":explicit_profiles,
+      "owner_profile_demand":owner_demand,"owner_profile_selection":owner_profile_selection,
       "execution_topology":("inline" if effective=="direct" else recipe["quick"]["topology"] if effective=="quick" else recipe["topology_class"]),
       "owner_dispatch_depth":0 if effective=="direct" else (recipe["quick"]["owner_dispatch_depth"] if effective=="quick" else recipe["standard_plus"]["owner_dispatch_depth"]),
       "max_dispatch_depth":recipe["quick"]["max_dispatch_depth"] if effective=="quick" else (0 if effective=="direct" else recipe["standard_plus"]["max_dispatch_depth"]),
@@ -2409,7 +2569,11 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
           "contract_version":LAUNCH_COMPATIBILITY_TUPLE_VERSION,
           **launch_compatibility_tuple(artifact_root=artifact,cwd=cwd),
       },
-      "advance_generation":0}
+      "advance_generation":0,
+      "runtime_support":{"terminal_commit":False,
+                         "terminal_commit_contract":"terminal_commit_v1",
+                         "terminal_handoff_contract":"terminal_handoff_claim_v1",
+                         "producer_binding_contract":"producer_binding_v1"}}
     payload.update(slug_fields)
     if checked_dispatch is not None:
         payload["dispatch_evidence_scope_version"]=DISPATCH_EVIDENCE_SCOPE_VERSION
@@ -2539,6 +2703,7 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
     if route.get("route_hash") != route_hash(route): raise ValueError("stale or modified route hash")
     if route.get("route_id") != "rt-"+route["route_hash"].split(":",1)[1][:16]: raise ValueError("invalid route id")
     if expected_cwd and Path(expected_cwd).resolve()!=Path(route["cwd"]): raise ValueError("route cwd mismatch")
+    _verify_profile_contract(route)
     basis=_check_validation_basis(route, allow_stale_registry=allow_stale_registry)
     if basis is _DEGRADE_VALIDATION_BASIS:
         # An unsupported basis_version is a legitimate newer harness's route;
@@ -2583,6 +2748,10 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
         expected_nodes,expected_bindings=_effective_confirmation_graph(
             expected_nodes, composed_recipe, route.get("effective_intensity"),
             route.get("capability"), route.get("confirmation_mode"), composed=True)
+        if route.get("profile_selection_contract_version") == 1:
+            _seal_profile_demands(expected_nodes, route.get("profile_demands"),
+                                  route.get("explicit_profiles"),
+                                  legacy=_versioned_subgraph(registry, composed_recipe))
         if ([_node_identity(n) for n in route.get("nodes",[])]
                 != [_node_identity(n) for n in expected_nodes]):
             raise ValueError("composed route nodes differ from embedded composed recipe")
@@ -2600,6 +2769,16 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
             expected_nodes,expected_bindings=_effective_confirmation_graph(
                 expected_nodes, route_recipe, route.get("effective_intensity"),
                 route.get("capability"), route.get("confirmation_mode"))
+            if route.get("profile_selection_contract_version") == 1:
+                _seal_profile_demands(expected_nodes, route.get("profile_demands"),
+                                      route.get("explicit_profiles"), legacy=True)
+                by_id = {n["id"]: n for n in expected_nodes}
+                for node in route.get("nodes", []):
+                    expected = by_id.get(node.get("id"))
+                    if expected and node.get("kind") != "resource-runner" and any(
+                        node.get(key) != expected.get(key)
+                        for key in ("profile_demand", "profile_selection", "model_profile")):
+                        raise ValueError("node-profile-declaration-mismatch:" + node["id"])
             # The remaining verifier owns field-level diagnostics.  This
             # census closes only the undeclared fanout hole: a rehashed route
             # may not add, remove, reorder, or rename recipe nodes.
@@ -2957,7 +3136,7 @@ def _migrate_completion_dir_forward(route_id, *, jobs=None):
 # route hash, node id, terminal-gate name, evidence readability, evidence hash), so it
 # lives once here and `workflow-supervisor.py` dynamically loads this module rather than
 # re-deriving it -- the dependency stays one-way (supervisor -> capability-route).
-def terminal_gate_observation(route):
+def terminal_gate_observation(route, *, jobs=None, exact_terminal=False):
     """Per declared-terminal-node completion-gate truth, verified fresh from disk.
 
     An owner-merge auxiliary-bearing group contributes one extra row keyed
@@ -2973,9 +3152,26 @@ def terminal_gate_observation(route):
     rows={}
     for node_id in terminal_ids:
         node=nodes[node_id]
-        rows[node_id]=_marker_identity_row(route,node,node_id,node.get("terminal_gate"))
+        rows[node_id]=_marker_identity_row(route,node,node_id,node.get("terminal_gate"), jobs=jobs,
+                                          exact_terminal=exact_terminal)
     for group_id,error in sorted(owner_merge_auxiliary_groups(route).items()):
-        rows[f"parallel_group:{group_id}"]=_arbitration_observation(route,group_id,error)
+        key=f"parallel_group:{group_id}"
+        row=_arbitration_observation(route,group_id,error)
+        if exact_terminal and row.get("passed"):
+            try:
+                raw=arbitration_path(route["route_id"],group_id).read_bytes()
+                record=json.loads(raw); anchor=nodes[record["anchor_node"]]
+                proof=_marker_identity_row(route,anchor,anchor["id"],anchor["completion_gate"],
+                                           jobs=jobs,exact_terminal=True)
+                if not proof.get("passed"):
+                    row=proof
+                else:
+                    row=dict(row,node_id=key,attempt_id=proof["attempt_id"],completion_gate="owner-merge",
+                             marker_digest=hashlib.sha256(raw).hexdigest(),
+                             evidence_digest=evidence_digest(Path(record["evidence"]["path"])))
+            except (OSError,ValueError,KeyError,TypeError):
+                row={"passed":False,"reason":"auxiliary-arbitration-identity-unverified"}
+        rows[key]=row
     return rows
 
 def terminal_gate_proven(gates):
@@ -3019,6 +3215,10 @@ def atomic_write(path, payload):
     fd=os.open(temp,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
     with os.fdopen(fd,"w",encoding="utf-8") as fh: fh.write(data); fh.flush(); os.fsync(fh.fileno())
     os.replace(temp,path)
+    try:
+        dfd=os.open(str(path.parent),os.O_RDONLY); os.fsync(dfd); os.close(dfd)
+    except OSError:
+        pass
 
 # v2 adds `registry_current`: a closure recorded against a registry that has since
 # changed is still a real closure, but it says so instead of implying currency.
@@ -3088,8 +3288,38 @@ def _head_commit(cwd):
 # itself: `route_hash` covers every field but the hash and id, so any added key makes
 # `verify_route` reject it. The closure lives in a sidecar and binds `route_hash`, so a
 # recompiled route leaves a detectably stale one rather than a silently wrong one.
-def close_route(route, route_file, commit=None, summary=None, publication=None, allow_unproven=True):
+def _outcome_replay_matches(existing, *, route_id, route_hash,
+                            terminal_commit_id=None, owner_attempt_id=None,
+                            producer_binding_digest=None,
+                            terminal_marker_digest=None):
+    if not isinstance(existing, dict):
+        return False
+    if existing.get("route_id") != route_id or existing.get("route_hash") != route_hash:
+        return False
+    if terminal_commit_id is None and owner_attempt_id is None and producer_binding_digest is None:
+        # Legacy callers retain the historical route/hash/optional-marker rule.
+        return (terminal_marker_digest is None
+                or existing.get("terminal_marker_digest") == terminal_marker_digest)
+    if terminal_commit_id is not None and existing.get("terminal_commit_id") == terminal_commit_id:
+        return True
+    return (owner_attempt_id is not None and producer_binding_digest is not None
+            and terminal_marker_digest is not None
+            and existing.get("terminal_owner_attempt_id") == owner_attempt_id
+            and existing.get("producer_binding_digest") == producer_binding_digest
+            and existing.get("terminal_marker_digest") == terminal_marker_digest)
+
+def close_route(route, route_file, commit=None, summary=None, publication=None,
+                allow_unproven=True, jobs=None, expected_terminal_marker_digest=None,
+                terminal_commit_id=None, expected_owner_attempt_id=None,
+                expected_producer_binding_digest=None):
     from datetime import datetime, timezone
+    cleanup_scope = dispatch_terminal_commit.require_current_cleanup(
+        "close-forward-recovery", target=Path(route_file), jobs=jobs)
+    if cleanup_scope is not None and (
+            not terminal_commit_id or terminal_commit_id != cleanup_scope.terminal_commit_id
+            or expected_owner_attempt_id != cleanup_scope.owner_attempt_id
+            or not expected_producer_binding_digest or allow_unproven):
+        raise ValueError("cleanup-scope-exact-terminal-close-required")
     # F7: D-2's single-storage-location contract has a compile-time entrance gate
     # (`route-output-outside-canonical`) but had no exit gate -- `close` would
     # happily write a sidecar next to a route file living anywhere at all. The
@@ -3111,12 +3341,18 @@ def close_route(route, route_file, commit=None, summary=None, publication=None, 
         raise ValueError("publication-unknown-result")
     target=outcome_path(route_file)
     if target.exists():
-        return json.loads(target.read_text(encoding="utf-8")), False
+        existing=json.loads(target.read_text(encoding="utf-8"))
+        if not _outcome_replay_matches(existing, route_id=route["route_id"], route_hash=route["route_hash"],
+                terminal_commit_id=terminal_commit_id, owner_attempt_id=expected_owner_attempt_id,
+                producer_binding_digest=expected_producer_binding_digest,
+                terminal_marker_digest=expected_terminal_marker_digest):
+            raise ValueError("route-close-outcome-conflict")
+        return existing, False
     # Live, not stored: every close computes gate truth fresh from the completion
     # markers on disk. A route closed once is never retroactively reopened to
     # recompute this, so the sidecar's `terminal_gate_proven` reflects gate state at
     # the moment of THIS close, not at any later inspection.
-    gates=terminal_gate_observation(route)
+    gates=terminal_gate_observation(route, jobs=jobs, exact_terminal=terminal_commit_id is not None)
     # C-25c: a `close` that lands before the terminal node's `complete` used to
     # seal `terminal_gate_proven=false` permanently -- finalize could never
     # prove the gate afterward even once `complete` actually ran. Refuse the
@@ -3133,6 +3369,16 @@ def close_route(route, route_file, commit=None, summary=None, publication=None, 
              "registry_current":route.get("_registry_current",True),
              "route_location":classify_route_location(route_file,route["artifact_root"]),
              "terminal_gate_proven":terminal_gate_proven(gates),"terminal_gates":gates}
+    if expected_terminal_marker_digest is not None:
+        outcome["terminal_marker_digest"]=expected_terminal_marker_digest
+    if terminal_commit_id is not None:
+        outcome["terminal_commit_id"] = terminal_commit_id
+    if expected_owner_attempt_id is not None:
+        outcome["terminal_owner_attempt_id"] = expected_owner_attempt_id
+    if expected_producer_binding_digest is not None:
+        outcome["producer_binding_digest"] = expected_producer_binding_digest
+    if not allow_unproven and outcome["terminal_gate_proven"] is not True:
+        raise ValueError("route-close-before-complete")
     if publication is not None: outcome["publication"]=publication
     releases=_gate_releases(route_file)
     if releases: outcome["gate_releases"]=releases
@@ -3147,7 +3393,31 @@ def close_route(route, route_file, commit=None, summary=None, publication=None, 
             if row.get("review_independence") in ("degraded","owner-overridden")
         )
         if degraded: outcome["review_independence_degraded"]=degraded
-    atomic_write(target,outcome)
+    # Outcome creation is write-once.  A concurrent creator is replayed only
+    # after the same identity/gate checks above; it is never overwritten.
+    data=json.dumps(outcome,indent=2,ensure_ascii=False)+"\n"
+    target.parent.mkdir(parents=True,exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".outcome-", dir=target.parent)
+    try:
+        with os.fdopen(fd,"w",encoding="utf-8") as fh:
+            fh.write(data); fh.flush(); os.fsync(fh.fileno())
+        try:
+            os.link(temporary, target)
+        except FileExistsError:
+            existing=json.loads(target.read_text(encoding="utf-8"))
+            if not _outcome_replay_matches(existing, route_id=route["route_id"], route_hash=route["route_hash"],
+                    terminal_commit_id=terminal_commit_id, owner_attempt_id=expected_owner_attempt_id,
+                    producer_binding_digest=expected_producer_binding_digest,
+                    terminal_marker_digest=expected_terminal_marker_digest):
+                raise ValueError("route-close-outcome-conflict")
+            return existing, False
+        dfd=os.open(str(target.parent),os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    finally:
+        os.unlink(temporary)
     return outcome, True
 
 def review_independence_observation(route):
@@ -3208,6 +3478,22 @@ def _gate_releases(route_file):
     if not isinstance(rows,list): return []
     return [row for row in rows if isinstance(row,dict) and row.get("gate")]
 
+# Canonical route record basename (`compile`/`compose` write `rt-<16 hex>.json`).
+ROUTE_RECORD_BASENAME=re.compile(r"rt-[0-9a-f]{16}\.json")
+# Typed sidecars that live beside a route record and are never route candidates
+# (SD-OPEN-54, #15): `.outcome.json` (closure), `.gate-release.json` (the
+# workflow-supervisor gate ledger), `.superseded-<stamp>.outcome.json`.
+_ROUTE_SIDECAR_SUFFIXES=((".gate-release.json","gate-release"),(".outcome.json","outcome"))
+
+
+def route_sidecar_kind(path):
+    """`outcome` / `gate-release` when `path` is a typed route sidecar, else None."""
+    name=Path(path).name
+    for suffix,kind in _ROUTE_SIDECAR_SUFFIXES:
+        if name.endswith(suffix): return kind
+    return None
+
+
 def route_status(artifact_root, *, diagnostics=None):
     """Report every compiled route under one artifact root and whether it is closed.
 
@@ -3223,25 +3509,38 @@ def route_status(artifact_root, *, diagnostics=None):
     unchanged; the scan itself never terminates on a malformed candidate either way.
     """
     root=Path(artifact_root)
-    search_dirs=[canonical_routes_dir(artifact_root),root,root/"routes",root/"_routes",root/".routes"]
+    canonical=canonical_routes_dir(artifact_root)
+    search_dirs=[canonical,root,root/"routes",root/"_routes",root/".routes"]
     by_route_id={}
     rows=[]
     for search_dir in search_dirs:
         if not search_dir.is_dir(): continue
         for path in sorted(search_dir.glob("*.json")):
-            if path.name.endswith(".outcome.json"): continue
+            # SD-OPEN-54 (#15): typed sidecars beside a route record (`.outcome.json`,
+            # `.gate-release.json` -- the workflow-supervisor gate ledger) are never
+            # route candidates; the ledger used to be read as a route, fail
+            # `route-malformed-missing-required-keys`, and turn every quiescence
+            # observation of the root fail-closed (hearting rt-5d862a3d..., cairn W15d).
+            if route_sidecar_kind(path) is not None: continue
+            # A canonical file that is not a route record by name (`rt-<16 hex>.json`)
+            # may still be an alias route (drift, reported below); when it does not
+            # parse as a route it is foreign evidence, not a malformed route, so its
+            # diagnostic is non-blocking.
+            record_named=(search_dir!=canonical) or bool(ROUTE_RECORD_BASENAME.fullmatch(path.name))
             try: raw=json.loads(path.read_text(encoding="utf-8"))
             except (OSError,json.JSONDecodeError,UnicodeDecodeError) as exc:
                 if diagnostics is not None:
                     diagnostics.append({"path":str(path),
                                          "location":classify_route_location(path,artifact_root),
-                                         "reason":f"route-unreadable:{exc}"})
+                                         "reason":f"route-unreadable:{exc}","blocking":record_named})
                 continue
             if not isinstance(raw,dict) or "route_id" not in raw or "nodes" not in raw:
                 if diagnostics is not None:
                     diagnostics.append({"path":str(path),
                                          "location":classify_route_location(path,artifact_root),
-                                         "reason":"route-malformed-missing-required-keys"})
+                                         "reason":("route-malformed-missing-required-keys" if record_named
+                                                   else "route-candidate-foreign-basename"),
+                                         "blocking":record_named})
                 continue
             location=classify_route_location(path,artifact_root)
             target=outcome_path(path)
@@ -3679,7 +3978,7 @@ def _exclusive_lock(path):
     with path.open("a",encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(),fcntl.LOCK_EX)
         try:
-            yield
+            yield handle
         finally:
             fcntl.flock(handle.fileno(),fcntl.LOCK_UN)
 
@@ -3920,11 +4219,12 @@ def arbitration_path(route_id, group_id):
     return completion_dir(route_id)/f"{_safe_group_id(group_id)}.arbitration.json"
 
 
-def _marker_identity_row(route, node, node_id, gate, *, jobs=None):
+def _marker_identity_row(route, node, node_id, gate, *, jobs=None, exact_terminal=False):
     """One completion marker's on-disk truth, in the shared gate vocabulary."""
     path = completion_dir(route["route_id"],jobs=jobs)/f"{node_id}.json"
     try:
-        marker = json.loads(path.read_text(encoding="utf-8"))
+        marker_bytes = path.read_bytes()
+        marker = json.loads(marker_bytes)
     except (OSError, ValueError):
         return {"passed": False, "reason": "completion-marker-absent"}
     if (marker.get("route_id") != route.get("route_id")
@@ -3939,8 +4239,36 @@ def _marker_identity_row(route, node, node_id, gate, *, jobs=None):
         return {"passed": False, "reason": "completion-evidence-unreadable"}
     if digest != evidence.get("sha256"):
         return {"passed": False, "reason": "completion-evidence-hash-mismatch"}
+    if exact_terminal:
+        if jobs is None or not completion_marker_is_current(route, node, path, marker):
+            return {"passed": False, "reason": "completion-marker-not-current"}
+        matches = []
+        for line in Path(jobs).read_text(encoding="utf-8").splitlines():
+            fields = line.split("\t")
+            if len(fields) != 6:
+                continue
+            meta = dict(part.split("=", 1) for part in fields[5].split(",") if "=" in part)
+            if meta.get("route_id") == route["route_id"] and meta.get("route_node") == node_id:
+                matches.append((fields, meta))
+        if (not matches or matches[-1][0][1] != "done"
+                or matches[-1][1].get("failure_class") != "pass"
+                or matches[-1][1].get("attempt_id") != marker.get("attempt_id")
+                or attempt_process_quiescence(matches[-1][1], terminal_receipt=True).state != "quiescent"):
+            return {"passed": False, "reason": "completion-attempt-not-current"}
+        return {"passed": True, "reason": "completion-marker-verified", "current": True,
+                "node_id": node_id, "attempt_id": marker["attempt_id"], "completion_gate": gate,
+                "marker_digest": hashlib.sha256(marker_bytes).hexdigest(), "evidence_digest": digest,
+                "evidence": evidence["path"], "attempt_readiness": "quiescent"}
+    # Gate currentness is the pre-A2a marker identity/evidence contract.  The
+    # jobs lock is used by mutation-time claim checks, not to reclassify an
+    # already valid marker or require a registry attempt row here.  This also
+    # preserves legacy inline markers whose attempt is intentionally absent.
+    if jobs is None:
+        return {"passed": True, "reason": "completion-marker-verified",
+                "evidence": evidence.get("path")}
     return {"passed": True, "reason": "completion-marker-verified",
-            "evidence": evidence.get("path")}
+            "evidence": evidence.get("path"), "current": True,
+            "attempt_readiness": "unchecked", "attempt_id": marker.get("attempt_id")}
 
 
 def _arbitration_observation(route, group_id, error=None, *, path=None):
@@ -4483,7 +4811,9 @@ def _complete_node_locked(
                     jobs=jobs_path,
                 )
             raise ValueError(f"row-close-failed:{exc.reason}") from exc
-        with _exclusive_lock(Path(f"{jobs_path}.lock")):
+        with _exclusive_lock(Path(f"{jobs_path}.lock")) as jobs_lock:
+            # Existing jobs lock is the sole terminal-claim serialization point.
+            ensure_terminal_claim_absent(jobs_path, route["route_id"], attempt_id)
             lines=jobs_path.read_text(encoding="utf-8",errors="replace").splitlines()
             row_index=None
             row_fields=None
@@ -4514,10 +4844,8 @@ def _complete_node_locked(
                 raise ValueError(f"row-contract-invalid:{exc.reason}") from exc
             if row_metadata.get("subsession_id") or str(row_metadata.get("stage_authority", "1")).lower() in {"0", "false"}:
                 raise ValueError("subsession-has-no-stage-gate-authority")
-            if (
-                row_metadata.get("route_id") != route["route_id"]
-                or row_metadata.get("route_hash") != route["route_hash"]
-                or row_metadata.get("route_node") != node_id
+            if ROUTE_IDENTITY.registered_node_identity(row_metadata, node) != (
+                route["route_id"], route["route_hash"], node_id
             ):
                 raise ValueError("attempt row route identity mismatch")
             if explicit_attempt_metadata is not None:
@@ -5090,7 +5418,7 @@ def _emit_compiled_route(a,route,artifact_root,output=None):
         expected=launch_tuple.get("registry_root")
         observed=launch_tuple.get("runtime_root")
         print("route_file_written=0 registered=0 started=0 child_spawned=0",file=sys.stderr)
-        print(_RUNTIME_ROOT_HINT,file=sys.stderr)
+        print(runtime_root_hint(),file=sys.stderr)
         raise ValueError(
             "launch-runtime-root-mismatch "
             f"expected={canonical(expected).decode()} observed={canonical(observed).decode()}"
@@ -5138,6 +5466,8 @@ def main():
     p=argparse.ArgumentParser(); sub=p.add_subparsers(dest="command",required=True)
     c=sub.add_parser("compile"); c.add_argument("--capability",required=True); c.add_argument("--capability-mode",default="default")
     c.add_argument("--slug",required=True)
+    c.add_argument("--profile-demands", help="JSON file mapping node ids and __owner__ to full SD-88 demands")
+    c.add_argument("--explicit-profiles", help="JSON file mapping demanded node ids to explicit profiles")
     c.add_argument("--intensity",default="auto"); c.add_argument("--cwd",required=True); c.add_argument("--artifact-root",required=True)
     c.add_argument("--predicate",action="append",default=[]); c.add_argument("--signal",action="append",default=[])
     c.add_argument("--transport",default=None); c.add_argument("--transport-evidence",default="caller-selected")
@@ -5150,6 +5480,8 @@ def main():
     c.add_argument("--output")
     cp=sub.add_parser("compose",help="preset-free work route: name the shape (and stage subgraph), defaults fill the rest")
     cp.add_argument("--slug",required=True)
+    cp.add_argument("--profile-demands", help="JSON file mapping node ids and __owner__ to full SD-88 demands")
+    cp.add_argument("--explicit-profiles", help="JSON file mapping demanded node ids to explicit profiles")
     cp.add_argument("--shape",choices=COMPOSE_SHAPES,default=None,help="direct (inline) | solo (one registered depth-1 owner) | staged (owner + your stage subgraph); default staged when --graph is given, else direct")
     cp.add_argument("--graph",default=None,help="comma list of the capability's stage ids in your order, optional :unit override, e.g. execute,test,report or execute:dev/refactor,test")
     cp.add_argument("--capability",default=COMPOSE_DEFAULT_CAPABILITY); cp.add_argument("--capability-mode",default=None)
@@ -5215,6 +5547,8 @@ def main():
     st=sub.add_parser("status"); st.add_argument("--artifact-root",required=True)
     st.add_argument("--open-only",action="store_true",help="list only routes with no recorded outcome")
     a=p.parse_args()
+    if a.command not in {"verify", "node", "status", "close"}:
+        dispatch_terminal_commit.require_current_cleanup("route-" + a.command)
     if a.command=="compose":
         shape=a.shape or ("staged" if a.graph else "direct")
         cwd=a.cwd or os.getcwd()
@@ -5230,6 +5564,8 @@ def main():
             registered_headless_evidence=(json.loads(Path(a.registered_headless_evidence).read_text())
                                           if a.registered_headless_evidence else None),
             transport_evidence=a.transport_evidence,jobs=a.jobs,
+            profile_demands=json.loads(Path(a.profile_demands).read_text()) if a.profile_demands else None,
+            explicit_profiles=json.loads(Path(a.explicit_profiles).read_text()) if a.explicit_profiles else None,
         )
         print(compose_card(route),file=sys.stderr)
         if a.explain:
@@ -5266,6 +5602,8 @@ def main():
                 dispatch_evidence=dispatch_evidence,
                 registered_headless_evidence=registered_headless_evidence,
                 slug=a.slug,
+                profile_demands=json.loads(Path(a.profile_demands).read_text()) if a.profile_demands else None,
+                explicit_profiles=json.loads(Path(a.explicit_profiles).read_text()) if a.explicit_profiles else None,
             )
         else:
             route=compile_route(
@@ -5273,6 +5611,8 @@ def main():
                 a.predicate,a.signal,a.transport,a.transport_evidence,a.inline_reason,
                 a.tracking,gate,dispatch_evidence,registered_headless_evidence,
                 slug=a.slug,
+                profile_demands=json.loads(Path(a.profile_demands).read_text()) if a.profile_demands else None,
+                explicit_profiles=json.loads(Path(a.explicit_profiles).read_text()) if a.explicit_profiles else None,
             )
         _emit_compiled_route(a,route,a.artifact_root)
     elif a.command=="continuation":
@@ -5342,7 +5682,7 @@ def main():
                 "route_file_written=0 predecessor_attempts=0 registered=0 "
                 "started=0 child_spawned=0",file=sys.stderr,
             )
-            print(_RUNTIME_ROOT_HINT,file=sys.stderr)
+            print(runtime_root_hint(),file=sys.stderr)
             raise ValueError("launch-runtime-root-mismatch")
         output_path=Path(a.output) if a.output else canonical_route_path(
             artifact,route["route_id"]
@@ -5405,7 +5745,7 @@ def main():
                         f"phase={a.launch_phase} mismatch={name}:"
                         f"expected={canonical(mismatch.get('expected',mismatch)).decode()}:"
                         f"actual={canonical(mismatch.get('actual',mismatch)).decode()}"
-                        " | " + _RUNTIME_ROOT_HINT,
+                        " | " + runtime_root_hint(route),
                         file=sys.stderr,
                     )
                     print("registered=0 started=0 child_spawned=0",file=sys.stderr)

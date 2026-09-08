@@ -58,6 +58,14 @@ EXTRA_AGENTS = KERNEL_AGENTS
 # OpenCode variant axis stays runtime-default, so only the model is pinned.
 # Instructions are adapter-owned output, not a non-OpenCode Agent copy.
 CATALOG_AGENTS = {
+    "balanced": {
+        "description": "Execute an approved decision across multiple steps on the balanced budget.",
+        "instructions": """Carry out the approved execution scope and cite its decision handoff.
+Stop and return new important choices or uncertainty to the judgment owner.
+Do not make architecture or policy decisions, widen scope, or spawn further agents.
+Report completed steps, verification and remaining gaps.
+""",
+    },
     "general-purpose": {
         "description": (
             "General-purpose delegated agent for research, code search, and "

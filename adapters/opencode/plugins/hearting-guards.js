@@ -266,24 +266,13 @@ function appendContext(output, text) {
 // `(peer-from: <harness> <sid> <name>)` to the prompt body; the receiver writes its
 // own `notice` peer_message_v1 under its exact session id (same record the Claude
 // hook and the Codex hook write). Detached, fail-soft, never blocks the turn.
-const peerTrailerRe = /\(peer-from:\s*([A-Za-z0-9_-]+)\s+([^\s)]+)(?:\s+([^)]*?))?\s*\)/g
-
 function spawnPeerNotice(sid, prompt, cwd) {
   if (!sid || !prompt || !prompt.includes("peer-from:")) return
-  let match = null
-  for (const m of prompt.matchAll(peerTrailerRe)) match = m
-  if (!match) return
-  const [, fromHarness, fromSid, fromName] = match
   const tool = path.join(root, "utilities", "peer-message.py")
-  const args = [tool, "record",
-    "--from-harness", String(fromHarness).toLowerCase(),
-    "--from-session-id", fromSid,
+  const args = [tool, "receive",
     "--from-project", path.basename(cwd || ""),
     "--to-harness", "opencode",
-    "--to-session-id", sid,
-    "--kind", "notice", "--surface", "herdr", "--status", "received",
-    "--body-stdin"]
-  if (fromName && fromName.trim()) args.push("--from-name", fromName.trim())
+    "--to-session-id", sid]
   try {
     const child = spawn("python3", args, {
       cwd: root,
@@ -292,7 +281,7 @@ function spawnPeerNotice(sid, prompt, cwd) {
       detached: true,
     })
     child.on("error", () => {})
-    child.stdin.end("herdr steer received")
+    child.stdin.end(prompt)
     child.unref()
   } catch {}
 }

@@ -30,7 +30,7 @@ def canonical(value):
 
 class MigrationCliTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(dir="/var/tmp")
+        self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.store = self.root / "store"
         self.env = {
@@ -814,6 +814,8 @@ finally:
         self.assertEqual(folded.classification.hard_failures, ())
         self.assertEqual(set(folded.blocked), {blocked_id})
         self.assertEqual(set(protocol.resolved_blocked_by(folded)), {blocked_id})
+        self.assertEqual(protocol.resolved_blocked_by(folded)[blocked_id],
+                         {deleted_id: folded.tombstones[deleted_id]})
         retained = {item["op_id"]: protocol.canonical_bytes(item["payload"])
                     for item in envelopes}
         self.assertTrue(original_ops.items() <= retained.items())

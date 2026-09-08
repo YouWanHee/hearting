@@ -450,7 +450,7 @@
               "dev/new-lib",
               "dev/refactor"
             ],
-            "model_profile": "light",
+            "model_profile": "balanced",
             "continuation": {
               "kind": "inline-next"
             },
@@ -460,7 +460,18 @@
               "disjointness": "exact-fixed-files"
             },
             "advance_class": "runtime-eligible",
-            "commit_expected": true
+            "commit_expected": true,
+            "profile_demand": {
+              "schema_version": 1,
+              "judgment_requirement": "predetermined",
+              "execution_scope": "extended-multistep",
+              "judgment_reason": "The accepted plan and completed checks fix the decisions; new judgment returns to the owner.",
+              "execution_reason": "Apply the approved plan across source and verification steps.",
+              "evidence_refs": [
+                "capabilities/autopilot-code.md#portable-procedure",
+                "plan.md"
+              ]
+            }
           },
           {
             "id": "impl-review",
@@ -566,12 +577,23 @@
               "inline"
             ],
             "unit": "editorial/report",
-            "model_profile": "light",
+            "model_profile": "balanced",
             "terminal": true,
             "terminal_gate": "code-report",
             "advance_class": "model-required",
             "model_required_reason": "terminal-report",
-            "commit_expected": false
+            "commit_expected": false,
+            "profile_demand": {
+              "schema_version": 1,
+              "judgment_requirement": "predetermined",
+              "execution_scope": "extended-multistep",
+              "judgment_reason": "The accepted plan and completed checks fix the decisions; new judgment returns to the owner.",
+              "execution_reason": "Assemble verified implementation and test artifacts into the final reports.",
+              "evidence_refs": [
+                "capabilities/autopilot-code.md#portable-procedure",
+                "test_logs/"
+              ]
+            }
           }
         ],
         "owner_dispatch_depth": 1,
@@ -3962,27 +3984,28 @@
   },
   "model_profiles": {
     "deep": {
-      "rank": 4,
       "tier": "deep",
-      "effort": "xhigh",
+      "effort": "high",
       "registered_topology": true
     },
     "balanced-deep": {
-      "rank": 3,
       "tier": "deep",
       "effort": "medium",
       "registered_topology": true
     },
+    "balanced": {
+      "tier": "balanced",
+      "effort": "high",
+      "registered_topology": true
+    },
     "light": {
-      "rank": 2,
       "tier": "light",
       "effort": "medium",
       "registered_topology": true
     },
     "mini": {
-      "rank": 1,
       "tier": "mini",
-      "effort": "medium",
+      "effort": "low",
       "registered_topology": false
     }
   },

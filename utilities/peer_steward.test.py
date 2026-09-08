@@ -982,7 +982,8 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual(rc, 0)
         prompt_call = next(c for c in calls if c[:3] == ["herdr", "agent", "prompt"])
         self.assertEqual(prompt_call[3], "child")
-        self.assertTrue(prompt_call[4].endswith("(peer-from: claude sid-steward hearting-46)"))
+        self.assertIn("(peer-from: claude [?] hearting-46 ; ref=", prompt_call[4])
+        self.assertNotIn("sid-steward", prompt_call[4])
         self.assertTrue(prompt_call[4].startswith("[handoff] do the thing\nline two"))
         rec = self._all_records()[-1]
         self.assertEqual(rec["kind"], "handoff")
@@ -991,10 +992,48 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual(rec["summary"], "[handoff] do the thing")
         line = print_mock.call_args[0][0]
         self.assertIn("prompted=true", line)
-        self.assertIn("to_session_id=thread-9", line)
+        self.assertIn("to_alias=", line)
+        self.assertNotIn("thread-9", line)
         # sending a handoff is a message, not a steward act: no marker (user 2026-09-06)
         self.assertEqual(peer_steward.peer_message.read_steward_markers(), {})
         self.assertFalse(peer_steward.peer_message.steward_marker_path("claude", "sid-steward").exists())
+
+    def test_consecutive_prompt_captures_sender_and_recipient_once(self):
+        calls = []
+        senders = [("sender-first", "codex"), ("sender-second", "opencode")]
+        targets = [("codex", "recipient-first", "same-name"),
+                   ("opencode", "recipient-second", "same-name")]
+
+        def sent(target, text, **kwargs):
+            calls.append(text)
+            # Ambient sender changes during submission cannot alter this send's ledger.
+            os.environ["CODEX_THREAD_ID"] = "unrelated-ambient"
+            return 0, {}
+
+        with mock.patch.object(peer_steward, "_herdr_missing", return_value=False), \
+             mock.patch.object(peer_steward, "_current_session_identity", side_effect=senders) as identity, \
+             mock.patch.object(peer_steward, "_resolve_target", side_effect=targets) as target, \
+             mock.patch.object(peer_steward, "_agent_state", return_value=("idle", "w1:p1")), \
+             mock.patch.object(peer_steward, "_herdr_prompt", side_effect=sent), \
+             mock.patch("builtins.print"):
+            for body in ("첫 전송", "둘째 전송"):
+                self.assertEqual(peer_steward.main(["prompt", "same-name", body, "--no-verify"]), 0)
+        self.assertEqual(identity.call_count, 2)
+        self.assertEqual(target.call_count, 2)
+        rows = {r["from"]["session_id"]: r for r in self._all_records()}
+        for i, text in enumerate(calls):
+            row = rows[senders[i][0]]
+            self.assertEqual(row["to"]["session_id"], targets[i][1])
+            self.assertEqual(row["body_sha256"], hashlib.sha256(text.encode()).hexdigest())
+            self.assertEqual(row["message_id"], row["transfer_ref"])
+            pm = peer_steward.peer_message
+            metadata = json.loads(pm._transfer_path(row["transfer_ref"]).read_text())
+            self.assertEqual(metadata["from"]["session_id"], row["from"]["session_id"])
+            self.assertEqual(metadata["to"]["session_id"], row["to"]["session_id"])
+            self.assertEqual(metadata["body_sha256"], row["body_sha256"])
+            actual = {"harness": targets[i][0], "session_id": targets[i][1]}
+            self.assertEqual(pm.parse_peer_trailer(text, actual)["session_id"], senders[i][0])
+            self.assertIsNone(pm.parse_peer_trailer(calls[1-i], actual)["session_id"])
 
     def test_prompt_without_trailer_flag_and_unresolvable_target(self):
         os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"

@@ -50,6 +50,29 @@ There is no deterministic promote/skip classifier. The acting agent judges wheth
 - Related records may use `[[name]]` links in the DB `links` column. FTS5 indexing happens mechanically on insert; `MEMORY.md` remains a legacy projection view.
 - Code may report capacity pressure and similarity candidates. The curator decides whether and how to consolidate them.
 
+### §7.2.1. Blocked-history diagnostics
+
+A blocked operation may have different final explicit put descendants for its
+records. Every affected record must have exactly one accepted, valid, unblocked,
+nonpending, nonconflicting final head covering that record and truly descending
+the blocked operation. One unsafe head leaves the whole operation active.
+Existing resolution by one valid final descendant covering every affected
+record remains supported, including an evidenced tombstone. Such a deletion
+must remain the effective tombstone for each deleted record; a blocked or
+unevidenced deletion never resolves an earlier diagnostic.
+
+A reader may label a blocked-prior-evidence tombstone historical-inert only when
+verified sealed migration membership/evidence, exact seed coverage, and verified
+snapshot contents prove no prior body/state for all affected records. Each record
+must have just that parentless, nonpending blocked tombstone as its sole operation
+and final head, with no later decision, pending state, or conflict. Missing,
+corrupt, incomplete or unsealed reader-local proof keeps it active/unsupported.
+This is read-only diagnosis, never deletion recovery or semantic resolution.
+Raw operations, original blocked reasons/counts, bodies, pending flags and history
+remain intact. The opt-in `mem sync status --blocked-details --json` returns all
+blocked/resolved details and proof availability; ordinary status retains its
+8-ID / 8192-byte bounded lists.
+
 ### §7.3. Agent-Backed Mutation Boundary
 
 Purely deterministic monitors may surface candidates but cannot promote, skip, merge, or prune based on semantic rules. A user-directed post-it flow or an agent-backed distiller or curator may perform the mutation. The script then enforces only the mechanical action contract and recovery boundary.

@@ -17,6 +17,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,6 +45,7 @@ from dispatch_contract import (  # noqa: E402
     claim_attempt_row,
     close_attempt_row,
     completion_marker_gate,
+    ensure_terminal_claim_absent,
     dispatch_state_root,
     PRELAUNCH_PROCESS_BLOCK_REASONS,
     SUPERVISOR_LEASE_KIND,
@@ -69,6 +71,11 @@ from dispatch_contract import (  # noqa: E402
     wait_governor_reservation_claim,
 )
 from dispatch_summary import launch_summary_owner  # noqa: E402
+from artifact_producer import (  # noqa: E402
+    ProducerError,
+    prepare_review_output_binding,
+    review_lease_acquire,
+)
 from dispatch_completion_join import materialize_after_terminal_close  # noqa: E402
 from dispatch_lifecycle import (  # noqa: E402
     DETACHED,
@@ -89,6 +96,7 @@ from dispatch_mode_contract import (  # noqa: E402
 from owner_route_binding import (  # noqa: E402
     OwnerRouteBindingError,
     binding_from_environment,
+    owner_binding_tuple_failure_fields,
     validate_runtime_requirements,
 )
 from worker_bootstrap import (  # noqa: E402
@@ -226,6 +234,7 @@ def parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--worker-role", help="legacy compatibility metadata; not bootstrap identity")
     p.add_argument("--worker-type", choices=("owner", "stage", "review", "support"))
+    p.add_argument("--review-output", help="exact durable report path for a route-free review worker")
     p.add_argument("--unit", default="", help="catalog unit ref for the assigned route node (roles/units/<unit>.md)")
     p.add_argument("--assigned-contract")
     p.add_argument("--owner", dest="capability_owner")
@@ -752,7 +761,6 @@ def resolve_parent_completion_delivery(args: argparse.Namespace) -> str:
         and args.execution_surface == "registered-headless"
         and bool(args.registered_worker)
         and bool(args.parent_session_id)
-        and os.environ.get("AGENT_DISPATCH_CHILD") != "1"
     )
     if (
         direct_registered
@@ -798,7 +806,6 @@ def validate_interactive_parent_launch(args: argparse.Namespace) -> None:
         and args.execution_surface == "registered-headless"
         and bool(args.registered_worker)
         and bool(args.parent_session_id)
-        and os.environ.get("AGENT_DISPATCH_CHILD") != "1"
     )
     if not (
         direct_registered
@@ -1048,7 +1055,7 @@ def resolve_permission_posture(args: argparse.Namespace) -> dict[str, object]:
     }
 
 
-def _foreground_terminal_evidence(terminal: dict, terminal_note: str, log_path) -> dict[str, str]:
+def _foreground_terminal_evidence(terminal: dict, terminal_note: str, log_path, outcome=None) -> dict[str, str]:
     """Evidence sealed on the row by the foreground tail close.
 
     A finished review (`completed-review-blocking`) also seals the in-root
@@ -1057,10 +1064,18 @@ def _foreground_terminal_evidence(terminal: dict, terminal_note: str, log_path) 
     """
     evidence = {
         "detected_by": "foreground-terminal-handoff",
-        "failure_class": terminal["failure_class"],
-        "terminal_event": terminal["terminal_event"],
+        "failure_class": terminal.get("failure_class", "runtime"),
+        "terminal_event": terminal.get("terminal_event", "-"),
         "log_file": str(log_path),
     }
+    if outcome is not None:
+        evidence["process_exit"] = str(outcome.exit_code)
+        if outcome.failure:
+            evidence.update(
+                detected_by="foreground-process-exit",
+                failure_class="runtime",
+                reconcile_reason=outcome.failure,
+            )
     if terminal_note == REVIEW_BLOCKING_NOTE and terminal.get("artifact_path_b64"):
         evidence["review_artifact_b64"] = str(terminal["artifact_path_b64"])
     return evidence
@@ -1093,25 +1108,92 @@ def _completion_owner(args: argparse.Namespace) -> bool:
     )
 
 
-def claude_session_resume_available() -> bool:
+# SD-OPEN-63: `claude --help` piped through a PIPE truncates at a buffer boundary
+# (8192/16384 bytes measured) before `--session-id` appears, even though the
+# vendor docs both document the flag and state help does not enumerate every
+# flag. A PIPE-truncated substring match therefore reported "unsupported" for a
+# runtime that supports resume. Capturing help into a regular file removes the
+# PIPE buffer limit; the completeness sentinel below still guards against any
+# other source of a short/partial capture (timeout, non-zero exit, vendor
+# output change) before a flag absence is trusted as a real "unsupported".
+_CLAUDE_HELP_COMPLETENESS_SENTINEL = "update|upgrade"
+
+
+class ClaudeResumeProbe:
+    """Result of probing `claude --help` for `--resume`/`--session-id` support.
+
+    `status` is one of `supported`/`unsupported`/`indeterminate`. `unsupported`
+    is only returned when the captured help is provably complete (sentinel
+    present) -- an incomplete or failed capture is always `indeterminate`,
+    never treated as evidence of non-support.
+    """
+
+    __slots__ = ("status", "reason", "exit_code", "stdout_bytes", "flags_seen", "source")
+
+    def __init__(self, status, reason, exit_code, stdout_bytes, flags_seen, source):
+        self.status = status
+        self.reason = reason
+        self.exit_code = exit_code
+        self.stdout_bytes = stdout_bytes
+        self.flags_seen = flags_seen
+        self.source = source
+
+
+def probe_claude_session_resume() -> ClaudeResumeProbe:
     if shutil.which("claude") is None:
-        return False
+        return ClaudeResumeProbe("indeterminate", "binary-absent", None, 0, (), "help-file")
     try:
-        result = subprocess.run(
-            ["claude", "--help"],
-            text=True,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=10,
-            check=False,
+        # An anonymous regular file preserves truncation-resistant capture and
+        # closes storage creation/read errors inside the same typed probe path.
+        with tempfile.TemporaryFile(mode="w+b") as sink:
+            result = subprocess.run(
+                ["claude", "--help"],
+                stdin=subprocess.DEVNULL,
+                stdout=sink,
+                stderr=subprocess.STDOUT,
+                timeout=10,
+                check=False,
+            )
+            sink.seek(0)
+            raw = sink.read()
+    except subprocess.TimeoutExpired:
+        return ClaudeResumeProbe("indeterminate", "timeout", None, 0, (), "help-file")
+    except OSError:
+        return ClaudeResumeProbe("indeterminate", "probe-error", None, 0, (), "help-file")
+    stdout_bytes = len(raw)
+    if result.returncode != 0:
+        return ClaudeResumeProbe(
+            "indeterminate", "nonzero-exit", result.returncode, stdout_bytes, (), "help-file"
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return result.returncode == 0 and "--resume" in result.stdout and "--session-id" in result.stdout
+    text = raw.decode("utf-8", errors="replace")
+    flags_seen = tuple(flag for flag in ("--resume", "--session-id") if flag in text)
+    # Successful help can be short; byte length is telemetry, not completeness
+    # evidence. Keep the existing end sentinel as the fail-closed boundary.
+    complete = _CLAUDE_HELP_COMPLETENESS_SENTINEL in text
+    if not complete:
+        return ClaudeResumeProbe(
+            "indeterminate", "help-truncated", result.returncode, stdout_bytes, flags_seen, "help-file"
+        )
+    if "--resume" in flags_seen and "--session-id" in flags_seen:
+        return ClaudeResumeProbe(
+            "supported", "ok", result.returncode, stdout_bytes, flags_seen, "help-file"
+        )
+    return ClaudeResumeProbe(
+        "unsupported",
+        "flags-absent-in-complete-help",
+        result.returncode,
+        stdout_bytes,
+        flags_seen,
+        "help-file",
+    )
 
 
 def resolve_completion_delivery(args: argparse.Namespace) -> str:
+    """SD-OPEN-63 (D-2): a probe result of `indeterminate` never silently
+    degrades to `poll-fallback` -- it is a typed refusal so a `standard+` auto
+    owner never loses supervision without a preserved reason. Only a provably
+    complete negative probe (`unsupported`) or an explicit operator `poll`
+    request produces `poll-fallback`."""
     requested = args.completion_delivery
     if not _completion_owner(args):
         if requested == "supervised":
@@ -1122,14 +1204,25 @@ def resolve_completion_delivery(args: argparse.Namespace) -> str:
         return "one-shot"
     if requested == "poll":
         return "poll-fallback"
-    if claude_session_resume_available():
+    probe = getattr(args, "completion_probe", None)
+    if probe is None:
+        probe = probe_claude_session_resume()
+        args.completion_probe = probe
+    if probe.status == "supported":
+        args.completion_delivery_reason = "ok"
         return "session-resume-supervised"
-    if requested == "supervised":
-        raise DispatchContractError(
-            "claude-session-resume-unavailable",
-            "claude --help did not expose --session-id and --resume; no owner was launched",
-        )
-    return "poll-fallback"
+    if probe.status == "unsupported":
+        args.completion_delivery_reason = "claude-session-resume-unsupported"
+        if requested == "supervised":
+            raise DispatchContractError(
+                "claude-session-resume-unavailable",
+                "claude --help did not expose --session-id and --resume; no owner was launched",
+            )
+        return "poll-fallback"
+    raise DispatchContractError(
+        "claude-session-resume-indeterminate",
+        f"claude --help probe was indeterminate ({probe.reason}); refusing to silently fall back",
+    )
 
 
 def completion_state_path(args: argparse.Namespace) -> Path:
@@ -1149,6 +1242,14 @@ def completion_lease_path(args: argparse.Namespace) -> Path:
     if not args.attempt_id:
         return dispatch_state_root(args.jobs_path) / "supervisor-state" / "preview-only.lease"
     return supervisor_lease_path(args.jobs_path, args.attempt_id)
+
+
+def _route_declares_terminal_commit_support(route_file: str) -> bool:
+    try:
+        route = json.loads(Path(route_file).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return False
+    return route.get("runtime_support", {}).get("terminal_commit") is True
 
 
 def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -> str:
@@ -1174,6 +1275,8 @@ def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -
                 "--route-id", args.owner_route_binding.route_id,
                 "--route-hash", args.owner_route_binding.route_hash,
             ]
+            if _route_declares_terminal_commit_support(args.owner_route_binding.route_file):
+                command += ["--enable-terminal-commit"]
         if getattr(args, "max_continuations", None) is not None:
             command += ["--max-continuations", str(args.max_continuations)]
         if args.resolved_model_settings["source"] != "inherit":
@@ -1291,6 +1394,63 @@ def _route_node_leg_fields(args):
     return "-", "-"
 
 
+def prepare_review_output_request(args) -> None:
+    args.review_output_binding = None
+    args.review_governed_lease_nonce = ""
+    if not args.review_output:
+        return
+    if (
+        args.dispatch_depth != 1
+        or args.worker_type != "review"
+        or args.unit != "qa/code-review"
+        or args.capability != "autopilot-code"
+        or args.execution_surface != "registered-headless"
+        or not args.registered_worker
+        or args.route_file
+        or getattr(args, "owner_route_binding", None)
+    ):
+        raise ProducerError("review-output-tuple-invalid")
+    cycle_id = os.environ.get("AGENT_ARTIFACT_CYCLE_ID", "")
+    producer_id = os.environ.get("AGENT_ARTIFACT_PRODUCER_ID", "")
+    if not cycle_id or not producer_id:
+        raise ProducerError("review-output-cycle-binding-missing")
+    args.review_output_binding = prepare_review_output_binding(
+        Path(args.artifact_root), cycle_id=cycle_id,
+        producer_id=producer_id, attempt_id=args.attempt_id,
+        review_output=args.review_output, capability=args.capability,
+        unit=args.unit, worktree=args.worktree,
+    )
+    args.review_governed_lease_nonce = secrets.token_hex(32)
+
+
+def acquire_review_lease_after_claim(
+    args, jobs: Path, identity: dict[str, str]
+) -> dict[str, str]:
+    if not args.review_output:
+        return {}
+    binding = args.review_output_binding
+    result = review_lease_acquire(
+        Path(args.artifact_root), cycle_id=binding["cycle_id"],
+        attempt_id=args.attempt_id, review_output=binding["output_path"],
+        binding=binding, governed_identity=identity, jobs=jobs,
+    )
+    return dict(result.get("registry_metadata") or {})
+
+
+def attach_summary_owner(args, log_path: Path, prompt_path: Path, identity):
+    review = args.review_output_binding
+    return launch_summary_owner(
+        attempt_id=args.attempt_id,
+        harness="claude",
+        transcript=log_path,
+        prompt_path=prompt_path,
+        target_pid=int(identity["pid"]),
+        target_start=identity["pid_start"],
+        review_artifact_root=review["artifact_root"] if review else None,
+        review_cycle_id=review["cycle_id"] if review else None,
+        review_lease_nonce=args.review_governed_lease_nonce if review else None,
+    )
+
 def append_job(jobs: Path, args: argparse.Namespace) -> bool:
     repo = subprocess.check_output(["git", "-C", args.worktree, "rev-parse", "--show-toplevel"], text=True).strip()
     pipe = (
@@ -1335,6 +1495,15 @@ def append_job(jobs: Path, args: argparse.Namespace) -> bool:
     pipe += f",assigned_contract={args.assigned_contract}"
     if args.unit:
         pipe += f",unit={args.unit}"
+    if args.review_output:
+        binding = args.review_output_binding
+        pipe += (
+            f",review_cycle_id={binding['cycle_id']}"
+            f",review_producer_id={binding['producer_id']}"
+            f",review_output_locator_b64={binding['locator_b64']}"
+            f",review_output_digest={binding['digest']}"
+        )
+
     if args.capability_owner:
         pipe += f",owner={args.capability_owner}"
     if args.owner_harness:
@@ -1358,6 +1527,8 @@ def append_job(jobs: Path, args: argparse.Namespace) -> bool:
             f",owner_route_hash={args.owner_route_binding.route_hash}"
         )
     settings = args.resolved_model_settings
+    for key, value in sorted(getattr(args, "profile_selection_receipt", {}).items()):
+        pipe += f",{key}={value}"
     pipe += (
         f",model_source={settings['source']},model_role={settings['role']}"
         f",model_profile={settings['profile']},model_tier={settings['tier']}"
@@ -1370,7 +1541,10 @@ def append_job(jobs: Path, args: argparse.Namespace) -> bool:
         f",permission_mode={posture['mode']},permission_mode_reason={posture['reason']}"
         f",permission_inherited_mode={posture['inherited_default_mode']}"
     )
-    pipe += f",completion_delivery={args.resolved_completion_delivery}"
+    pipe += (
+        f",completion_delivery={args.resolved_completion_delivery}"
+        f",completion_delivery_reason={args.completion_delivery_reason}"
+    )
     if args.resolved_completion_delivery == "session-resume-supervised":
         pipe += (
             f",supervisor_lease={SUPERVISOR_LEASE_KIND}"
@@ -1448,6 +1622,9 @@ def append_job(jobs: Path, args: argparse.Namespace) -> bool:
             attempt_id=args.attempt_id,
         )
     args.launch_preclaim = preclaim
+    mutation_precheck = lambda lines: ensure_terminal_claim_absent(
+        jobs, args.route_id, args.parent_attempt_id or args.attempt_id
+    )
     return claim_attempt_row(
         jobs, args.attempt_id, row, launch=False,
         exclusive_metadata=exclusive,
@@ -1455,7 +1632,8 @@ def append_job(jobs: Path, args: argparse.Namespace) -> bool:
         terminal_attempt_limit=getattr(args, "quick_attempt_limit", None),
         replacement_attempt_limit=getattr(args, "replacement_attempt_limit", 0),
         replacement_notes=getattr(args, "replacement_notes", frozenset()),
-        preclaim=None,
+        mutation_precheck=mutation_precheck,
+        preclaim=preclaim,
     )
 
 
@@ -1907,10 +2085,11 @@ def main(argv: list[str]) -> int:
             intensity=args.intensity,
             harness="claude",
         )
-        if args.owner_route_binding and (
-            args.dispatch_depth != 1 or args.worker_type != "owner" or args.route_file
-        ):
-            raise OwnerRouteBindingError("owner-route-binding-tuple-invalid")
+        if args.owner_route_binding:
+            failure_fields = owner_binding_tuple_failure_fields(
+                dispatch_depth=args.dispatch_depth, worker_type=args.worker_type, route_file=args.route_file)
+            if failure_fields:
+                return fail("owner-route-binding-tuple-invalid", 65, child_spawned="0", **failure_fields)
     except OwnerRouteBindingError as exc:
         return fail(str(exc), 65, child_spawned="0")
     rc=validate_route_record(args)
@@ -1964,6 +2143,11 @@ def main(argv: list[str]) -> int:
     args.replacement_notes = attempt_policy["replacement_notes"]
     try:
         args.resolved_model_settings = resolve_model_settings(args)
+        from model_profile import selection_receipt, ModelProfileError
+        try:
+            args.profile_selection_receipt = selection_receipt(args)
+        except (ModelProfileError, OSError, ValueError) as exc:
+            return fail(getattr(exc, "reason", "profile-selection-invalid"), 65, child_spawned="0")
     except ModelSelectionError as e:
         fields = {"detail": str(e), "child_spawned": "0"}
         if args.model_role:
@@ -1994,6 +2178,13 @@ def main(argv: list[str]) -> int:
             ensure_global_registry_writable(jobs)
     except DispatchContractError as e:
         return fail(e.reason, 73, detail=e.detail, child_spawned="0")
+    try:
+        prepare_review_output_request(args)
+    except ProducerError as exc:
+        return fail(
+            exc.code, 65, detail=exc.detail, registry_mutation="0",
+            child_spawned="0",
+        )
     try:
         bind_stage_session(args, artifact_root=args.artifact_root, action=action)
     except DispatchContractError as e:
@@ -2050,6 +2241,7 @@ def main(argv: list[str]) -> int:
         profile_type=profile_worker_type(ROOT, args.profile),
     )
     args.jobs_path = jobs
+    args.completion_delivery_reason = "not-applicable"
     try:
         args.resolved_completion_delivery = resolve_completion_delivery(args)
         if args.resolved_completion_delivery == "session-resume-supervised":
@@ -2236,6 +2428,22 @@ def main(argv: list[str]) -> int:
             "AGENT_DISPATCH_OWNER": args.capability_owner or "",
             "AGENT_DISPATCH_OWNER_HARNESS": args.owner_harness or "",
             "AGENT_ARTIFACT_ROOT": args.artifact_root,
+            "AGENT_DISPATCH_WORKTREE": (
+                args.review_output_binding["worktree"]
+                if args.review_output_binding else args.worktree
+            ),
+            "AGENT_REVIEW_OUTPUT": (
+                args.review_output_binding["output_path"]
+                if args.review_output_binding else ""
+            ),
+            "AGENT_REVIEW_CYCLE_ID": (
+                args.review_output_binding["cycle_id"]
+                if args.review_output_binding else ""
+            ),
+            "AGENT_REVIEW_PRODUCER_ID": (
+                args.review_output_binding["producer_id"]
+                if args.review_output_binding else ""
+            ),
             # W7C producer lifecycle: the owner's open cycle (issued by
             # `artifact_producer.py begin` before the first write) is passed
             # through unchanged so stage workers write into the same
@@ -2367,14 +2575,10 @@ def main(argv: list[str]) -> int:
                 spawn=spawn_worker,
                 launch_metadata=launch_metadata,
                 preclaim=getattr(args, "launch_preclaim", None),
-                pre_release=lambda identity: launch_summary_owner(
-                    attempt_id=args.attempt_id,
-                    harness="claude",
-                    transcript=log_path,
-                    prompt_path=prompt_path,
-                    target_pid=int(identity["pid"]),
-                    target_start=identity["pid_start"],
+                pre_release=lambda identity: attach_summary_owner(
+                    args, log_path, prompt_path, identity
                 ),
+                post_claim=lambda identity: acquire_review_lease_after_claim(args, jobs, identity),
             )
         except DispatchContractError as exc:
             for fd in (fence_failure_read_fd, fence_failure_write_fd):
@@ -2601,19 +2805,21 @@ def main(argv: list[str]) -> int:
                 if terminal.get("state") == "valid"
                 else ""
             )
-            if outcome.failure and terminal.get("state") == "valid" and not terminal_note:
-                terminal_note = "completed-terminal-handoff"
+            # SD-72: final text does not replace actual nonzero/signal/timeout
+            # or parent-termination evidence. Keep both observation axes.
+            if outcome.failure:
+                terminal_note = f"dead-{outcome.failure}"
             terminal_closed = False
             if terminal_note:
                 terminal_closed = close_attempt_row(
                     jobs,
                     args.attempt_id,
                     terminal_note,
-                    evidence=_foreground_terminal_evidence(terminal, terminal_note, log_path),
+                    evidence=_foreground_terminal_evidence(terminal, terminal_note, log_path, outcome),
                 )
                 if terminal_closed:
                     materialize_after_terminal_close(jobs, args.attempt_id)
-                args.worker_failure = terminal_note
+                args.worker_failure = outcome.failure or terminal_note
             if outcome.failure and not terminal_closed:
                 close_job_row(
                     jobs, args.slug, args.worktree, outcome.failure, "", args.attempt_id
@@ -2632,6 +2838,7 @@ def main(argv: list[str]) -> int:
     print("adapter=claude")
     print("runtime_surface=claude-print-headless")
     print(f"completion_delivery={args.resolved_completion_delivery}")
+    print(f"completion_delivery_reason={args.completion_delivery_reason}")
     print(f"parent_completion_delivery={args.parent_completion_delivery}")
     print(f"parent_completion_reason={args.parent_completion_reason}")
     print(f"parent_completion_reason_class={getattr(args, 'parent_completion_reason_class', '-')}")
@@ -2669,6 +2876,8 @@ def main(argv: list[str]) -> int:
     print(f"model_profile={settings['profile']}")
     print(f"model_tier={settings['tier']}")
     print(f"profile_granularity={settings['granularity']}")
+    for key, value in sorted(getattr(args, "profile_selection_receipt", {}).items()):
+        print(f"{key}={value}")
     print(f"model={settings['model']}")
     print(f"effort={settings['effort']}")
     posture = _permission_posture(args)

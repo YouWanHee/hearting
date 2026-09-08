@@ -33,10 +33,12 @@ class UserModelConfigTest(unittest.TestCase):
             self.assertEqual(created["status"], "created")
             destination = home / "agent-config" / "models.conf"
             destination.write_bytes(b"CFG_MODEL=custom\n")
-            source.write_bytes(b"CFG_MODEL=new-release\n")
+            before_mtime = destination.stat().st_mtime_ns
+            source.write_bytes(b"CFG_MODEL=new-release\nCFG_MODEL_PROFILE_BALANCED=light:high\n")
             unchanged = CONFIG.seed_model_config("claude", source, home)
             self.assertEqual(unchanged["status"], "unchanged")
             self.assertEqual(destination.read_bytes(), b"CFG_MODEL=custom\n")
+            self.assertEqual(destination.stat().st_mtime_ns, before_mtime)
 
     def test_codex_legacy_directory_link_migrates(self):
         temporary, root, source = self.fixture()

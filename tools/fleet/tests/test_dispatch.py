@@ -38,6 +38,32 @@ REAL = os.path.join(os.path.dirname(__file__), "fixtures", "route", "real_claude
 COMPOSED = os.path.join(os.path.dirname(__file__), "fixtures", "route", "synth_composed_survey.json")
 
 
+class SealedCodexHomeTest(unittest.TestCase):
+    def test_same_thread_in_old_and_new_homes_stays_exact(self):
+        from types import SimpleNamespace
+        sid = "019f78f9-c11c-7fb2-afed-ae3730e4d811"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            old = root / ".dispatch/nested-codex-home"
+            new = root / ".dispatch/nested-codex-home-v2"
+            paths = []
+            for home in (old, new):
+                path = home / "sessions" / f"rollout-fixture-{sid}.jsonl"
+                path.parent.mkdir(parents=True)
+                path.write_text(json.dumps({"type":"session_meta", "payload":{"id":sid}})+"\n")
+                paths.append(str(path))
+            for index, home in enumerate((old, new)):
+                job = SimpleNamespace(cwd=str(root), _registry_metadata={"codex_home":str(home)})
+                self.assertEqual(dispatch._codex_attempt_rollout(job, sid), paths[index])
+                self.assertEqual(dispatch._codex_sessions_dirs(str(root), job=job), [str(home / "sessions")])
+            legacy = SimpleNamespace(cwd=str(root), _registry_metadata={})
+            with mock.patch.dict(os.environ, {"CODEX_HOME":str(new)}), mock.patch.object(
+                dispatch.os.path, "expanduser", side_effect=lambda value:str(root / "unused") if value=="~/.codex" else value):
+                self.assertEqual(dispatch._codex_attempt_rollout(legacy, sid), paths[0])
+            job._registry_metadata = {"codex_home":str(root / "absent")}
+            self.assertIsNone(dispatch._codex_attempt_rollout(job, sid))
+
+
 class RuntimeRootSeparationTest(unittest.TestCase):
 
     def test_claude_credentials_ignore_harness_source_root(self):
@@ -760,7 +786,7 @@ class RegistryHomeTest(unittest.TestCase):
             ), mock.patch("pathlib.Path.home", return_value=Path(home)):
                 self.assertEqual(dispatch._registry_home(), str(Path(home) / "agent_setting"))
 
-    def test_dot_claude_fallback_when_linked_checkouts_absent(self):
+    def test_projection_home_is_not_an_installed_source_root(self):
         with tempfile.TemporaryDirectory() as home:
             (Path(home) / ".claude" / "core").mkdir(parents=True)
             (Path(home) / ".claude" / "core" / "CORE.md").write_text("x")
@@ -769,7 +795,7 @@ class RegistryHomeTest(unittest.TestCase):
                 {"HOME": home, "XDG_DATA_HOME": str(Path(home) / ".local" / "share")},
                 clear=True,
             ), mock.patch("pathlib.Path.home", return_value=Path(home)):
-                self.assertEqual(dispatch._registry_home(), str(Path(home) / ".claude"))
+                self.assertEqual(dispatch._registry_home(), str(Path(home) / ".local/share/hearting/current"))
 
     def test_jobs_path_override_beats_everything(self):
         with mock.patch.dict(os.environ,

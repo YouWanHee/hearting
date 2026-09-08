@@ -33,6 +33,8 @@ class RegisteredParentParkTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
+
+
         self.base = Path(self.temp.name)
         self.jobs = self.base / "jobs.log"
         self.state = self.base / "state.json"
@@ -153,6 +155,42 @@ class RegisteredParentParkTest(unittest.TestCase):
         self.assertEqual(output["hookEventName"], "PreToolUse")
         self.assertEqual(output["permissionDecision"], "deny")
         self.assertIn("runtime-supervised-parent", output["permissionDecisionReason"])
+
+    def test_no_children_still_enforces_durable_cleanup_intent(self):
+        import dispatch_budget_record as budget
+        import dispatch_terminal_commit as terminal
+        self.jobs.write_text("")
+        report = self.base / "partial.md"
+        claim = budget.claim_terminal_handoff(self.base, owner_attempt_id=PARENT,
+                    route_hash="hash", child_attempt_ids=[], continuation_ordinal=0)
+        intent = budget.convert_claim_to_prompt_intent(self.base, claim, prompt="cleanup",
+            cleanup_scope=dict(artifact_root=str(self.base), route_id=self.route_id,
+                route_hash="hash", owner_attempt_id=PARENT, terminal_commit_id="commit",
+                allowed_write_roots=[str(report)], allowed_read_roots=[str(self.base)],
+                allowed_operations=["partial-report", "read", "close-forward-recovery"],
+                allowed_recovery_targets=[str(self.route)]))
+        slot = budget.terminal_handoff_root(self.base, PARENT, 0)
+        # Intent is authoritative even if the process crashed before its sidecar.
+        (slot / "cleanup-scope.json").unlink()
+        helper = f"python3 {ROOT / 'utilities/dispatch_terminal_commit.py'} cleanup-recover"
+        self.assertIsNone(self.invoke("Bash", helper))
+        for command in ["git status; touch escaped", "python3 -c 'print(1)'", helper+" --force"]:
+            decision = self.invoke("Bash", command)
+            self.assertEqual(decision["hookSpecificOutput"]["permissionDecision"], "deny")
+            self.assertIn("cleanup-scope", decision["hookSpecificOutput"]["permissionDecisionReason"])
+        env = {**os.environ, "AGENT_DISPATCH_JOBS":str(self.jobs),
+               "AGENT_DISPATCH_ATTEMPT_ID":PARENT, "AGENT_ROUTE_ID":self.route_id}
+        result = subprocess.run([sys.executable, str(ROOT / "utilities/dispatch-registry.py"),
+                                 "--help"], env=env, capture_output=True, text=True)
+        # Parser help is read-only; the common mutation API itself refuses.
+        from unittest import mock
+        with mock.patch.dict(os.environ, env):
+            with self.assertRaises(terminal.TerminalCommitError):
+                terminal.require_current_cleanup("registry", jobs=self.jobs)
+        self.assertEqual(result.returncode, 0)
+        (slot / "prompt-intent.json").write_text("{")
+        decision = self.invoke("Bash", helper)
+        self.assertEqual(decision["hookSpecificOutput"]["permissionDecision"], "deny")
 
     def test_undelivered_batch_allows_only_another_exact_sibling_start(self) -> None:
         self.write_state([])
@@ -412,6 +450,29 @@ class RegisteredParentParkTest(unittest.TestCase):
             )
         )
         self.assert_denied("Bash", f"utilities/dispatch-wait.sh --attempt-id {CHILD} --max 600")
+
+
+class CleanupCapabilityTest(unittest.TestCase):
+    def _scope(self):
+        sys.path.insert(0, str(ROOT / "utilities"))
+        import dispatch_terminal_commit as D
+        return D, D.CleanupScope(artifact_root=ROOT, route_id="r", allowed_write_roots=(ROOT / "reports",), allowed_read_roots=(ROOT,))
+
+    def test_no_child_cleanup_scope_allows_only_bound_report_recovery_and_reads(self):
+        D, scope = self._scope()
+        self.assertEqual(D.authorize_cleanup_operation(scope, operation="read", target=ROOT, route_id="r", cycle_id=None).verdict, "allowed")
+
+    def test_hook_and_direct_writer_both_refuse_source_dispatch_recompile_registry_other_cycle(self):
+        D, scope = self._scope()
+        self.assertEqual(D.authorize_cleanup_operation(scope, operation="dispatch", target=ROOT, route_id="r", cycle_id=None).verdict, "denied-operation")
+
+    def test_arbitrary_python_and_shell_are_refused_under_active_scope(self):
+        D, scope = self._scope()
+        self.assertEqual(D.authorize_cleanup_operation(scope, operation="shell", target=ROOT, route_id="r", cycle_id=None).verdict, "denied-operation")
+
+    def test_hook_and_direct_writer_read_the_same_scope_digest(self):
+        D, scope = self._scope()
+        self.assertEqual(scope.scope_digest, "")
 
 
 if __name__ == "__main__":

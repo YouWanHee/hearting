@@ -4013,11 +4013,133 @@ def _bounded_ids(
     return selected, max(0, total - len(selected))
 
 
+def _historical_inert_proofs(connection, folded):
+    """Verify reader-local sealed coverage without recovery or protocol writes."""
+    import migration_v2 as migration
+    proof = {"available": False, "valid": False, "reason": "reader-proof-absent", "pointers": []}
+    names = _table_names(connection)
+    required = {"sync_migration_seals", "sync_migration_state", "sync_migration_artifacts"}
+    if not required <= names:
+        return {}, proof
+    rows = connection.execute("SELECT epoch_id,membership_digest,evidence_digest FROM sync_migration_state WHERE current=1").fetchall()
+    if len(rows) != 1 or not rows[0][2]:
+        return {}, proof
+    epoch, membership_digest, evidence_digest = rows[0]
+    proof["available"] = True
+    try:
+        seals = {kind:(digest,bytes(raw)) for kind,digest,raw in connection.execute(
+            "SELECT seal_kind,manifest_digest,manifest_bytes FROM sync_migration_seals WHERE epoch_id=?", (epoch,))}
+        membership = migration.verify_membership(json.loads(seals["membership"][1]))
+        evidence = migration.verify_evidence(json.loads(seals["evidence"][1]), membership)
+        if (membership["epoch_id"] != epoch or evidence["epoch_id"] != epoch
+                or membership["manifest_digest"] != membership_digest
+                or evidence["manifest_digest"] != evidence_digest
+                or seals["membership"][0] != membership_digest
+                or seals["evidence"][0] != evidence_digest):
+            raise ValueError("reader-seal-binding-mismatch")
+        artifacts = {(row["artifact_kind"],row["replica_id"]):row
+                     for row in migration_artifacts(connection, epoch)}
+        candidates = {}
+        all_ops = folded.classification.operations
+        by_record = {}
+        for op_id, operation in all_ops.items():
+            for mutation in operation.payload["mutations"]:
+                by_record.setdefault(mutation["record_id"], set()).add(op_id)
+        for op_id, diagnostic in folded.blocked.items():
+            operation = all_ops[op_id]
+            if (diagnostic.code != "blocked-prior-evidence" or operation.parents
+                    or operation.payload["kind"] not in {"tombstone", "force-tombstone"}
+                    or op_id not in folded.accepted):
+                continue
+            record_ids = {m["record_id"] for m in operation.payload["mutations"]}
+            safe = bool(record_ids)
+            for mutation in operation.payload["mutations"]:
+                rid = mutation["record_id"]
+                tombstone = mutation.get("tombstone")
+                if (not isinstance(tombstone, dict) or tombstone.get("pending") is not False
+                        or by_record.get(rid) != {op_id}
+                        or folded.frontiers.get(rid) != (op_id,)
+                        or rid in folded.records or rid in folded.conflicts
+                        or ("records" in names and connection.execute("SELECT 1 FROM records WHERE id=?", (rid,)).fetchone())
+                        or ("sync_transactional_graveyard" in names and connection.execute(
+                            "SELECT 1 FROM sync_transactional_graveyard WHERE record_id=? AND prior_state_bytes IS NOT NULL", (rid,)).fetchone())):
+                    safe = False
+            if connection.execute("SELECT 1 FROM sync_outbox WHERE op_id=? AND state<>'confirmed'", (op_id,)).fetchone():
+                safe = False
+            if safe:
+                candidates[op_id] = record_ids
+        covered = set()
+        for replica in evidence["replicas"]:
+            manifests = {}
+            for kind, filename, field in (("snapshot","snapshot.json","snapshot_digest"), ("seed","seed.json","seed_digest")):
+                artifact = artifacts[(kind,replica["replica_id"])]
+                base = Path(artifact["local_path"])
+                path = base / filename if base.is_dir() else base
+                if path.is_symlink() or not path.is_file():
+                    raise ValueError("reader-proof-file-unavailable")
+                verified = (migration.verify_snapshot(path) if kind == "snapshot" else migration.verify_seed_manifest(path))
+                if (verified["manifest_digest"] != replica[field]
+                        or verified["manifest_digest"] != artifact["manifest_digest"]
+                        or verified["epoch_id"] != epoch
+                        or verified["membership_digest"] != membership_digest
+                        or verified["replica_id"] != replica["replica_id"]):
+                    raise ValueError("reader-proof-coverage-mismatch")
+                manifests[kind] = (path,verified)
+                proof["pointers"].append({"kind":kind,"path":str(path),"digest":verified["manifest_digest"]})
+            snapshot_path, snapshot = manifests["snapshot"]
+            seed = manifests["seed"][1]
+            if seed["snapshot_digest"] != snapshot["manifest_digest"]:
+                raise ValueError("reader-seed-snapshot-mismatch")
+            seeded = {item["op_id"] for item in seed["objects"]}
+            # verify_snapshot has already verified containment, bytes, dump and inventory.
+            backup = snapshot_path.parent / snapshot["backup"]["path"]
+            with sqlite3.connect(backup.resolve().as_uri()+"?mode=ro&immutable=1", uri=True) as historical:
+                snapshot_names = _table_names(historical)
+                if "records" not in snapshot_names:
+                    raise ValueError("reader-prior-state-unprovable")
+                if "sync_objects" not in snapshot_names:
+                    raise ValueError("reader-captured-coverage-unprovable")
+                for captured_id, captured_raw in historical.execute("SELECT op_id,payload_bytes FROM sync_objects"):
+                    if captured_id in seeded and captured_id in all_ops and bytes(captured_raw) == all_ops[captured_id].raw:
+                        covered.add(captured_id)
+                for op_id, record_ids in list(candidates.items()):
+                    for rid in record_ids:
+                        if (historical.execute("SELECT 1 FROM records WHERE id=?", (rid,)).fetchone()
+                                or ("sync_transactional_graveyard" in snapshot_names and historical.execute(
+                                    "SELECT 1 FROM sync_transactional_graveyard WHERE record_id=? AND prior_state_bytes IS NOT NULL", (rid,)).fetchone())):
+                            candidates.pop(op_id, None)
+        proof.update(valid=True, reason=None, evidence_digest=evidence_digest)
+        return {op_id:dict(proof) for op_id in candidates if op_id in covered}, proof
+    except (KeyError, ValueError, TypeError, OSError, sqlite3.Error, migration.MigrationError) as exc:
+        proof.update(valid=False, reason=getattr(exc, "code", str(exc))[:240])
+        return {}, proof
+
+
+def blocked_operation_details(connection):
+    """Full body-free diagnostics; original applied results are never rewritten."""
+    import protocol_v2 as protocol
+    rows = connection.execute("SELECT op_id,result,diagnostic_id FROM sync_applied WHERE result LIKE 'blocked:%' OR result LIKE 'blocked-resolved:%' ORDER BY op_id").fetchall()
+    if not rows:
+        return []
+    raw = [bytes(row[0]) for row in connection.execute("SELECT payload_bytes FROM sync_objects ORDER BY op_id")]
+    folded = protocol.fold_operations(raw)
+    resolved = protocol.resolved_blocked_by(folded)
+    inert, proof = _historical_inert_proofs(connection, folded) if not folded.classification.hard_failures else ({}, {"available":False,"valid":False,"reason":"fold-hard-failure","pointers":[]})
+    details = []
+    for op_id, applied, diagnostic_id in rows:
+        classification = "resolved" if op_id in resolved else "historical-inert" if op_id in inert else "active"
+        details.append({"op_id":op_id, "result":applied, "reason":applied.split(":",2)[1],
+                        "diagnostic_id":diagnostic_id, "classification":classification,
+                        "resolved_by":resolved.get(op_id), "proof":inert.get(op_id, proof)})
+    return details
+
+
 def sync_status(
     connection: sqlite3.Connection,
     *,
     policy: Mapping[str, Any] | None = None,
     limit: int = 8,
+    blocked_details: bool = False,
 ) -> dict[str, Any]:
     """Return bounded, body-free local status for sync/doctor integration."""
 
@@ -4141,7 +4263,7 @@ def sync_status(
         status, exit_code, reason = "local-only", 0, None
     else:
         status, exit_code, reason = "not-configured", 0, None
-    return {
+    result = {
         "bootstrap": bootstrap,
         "blocked_ids": blocked_ids,
         "blocked_ids_omitted": blocked_omitted,
@@ -4164,6 +4286,13 @@ def sync_status(
         "migration": migration,
         "invalid_confirmed_ids_omitted": max(0, len(invalid_confirmed) - limit),
     }
+
+    if blocked_details:
+        details = blocked_operation_details(connection)
+        result["blocked_details"] = details
+        result["blocked_detail_counts"] = dict(Counter(item["classification"] for item in details))
+        result["blocked_details_count"] = len(details)
+    return result
 
 
 # Narrow compatibility spellings for sibling integration while the v2 modules

@@ -53,7 +53,7 @@ _REQUIRED = {
 # Captured for validation but not required: `--unit` is meaningless for an owner
 # (the tuple contract pins it to `_kernel/owner`) and mandatory for the SD-OPEN-40
 # review launch below.
-_CAPTURED = _REQUIRED | {"--unit"}
+_CAPTURED = _REQUIRED | {"--unit", "--review-output"}
 # SD-OPEN-40: the depth-1 tuples this selector may launch. `review` exists so an
 # independent reviewer can be a *registered review worker* instead of an owner
 # wearing a reviewer's prompt. Before it, every ad-hoc independent review landed
@@ -291,7 +291,13 @@ def _parse(argv):
             # with its node binding, not by this selector. Accepting route
             # evidence here would let one node be claimed by two launch paths.
             raise OwnerError("review-worker-route-evidence-unsupported")
-    if values["--model-profile"] not in {"deep", "balanced-deep", "light"}:
+        # A report is an explicit opt-in capability.  It is forwarded as a
+        # value, never inferred from caller environment or route metadata.
+        if values.get("--review-output") and not Path(values["--review-output"]).is_absolute():
+            raise OwnerError("review-output-must-be-absolute")
+    if worker_type == "owner" and values.get("--review-output"):
+        raise OwnerError("review-output-owner-forbidden")
+    if values["--model-profile"] not in {"deep", "balanced-deep", "balanced", "light"}:
         raise OwnerError("invalid-model-profile")
     # Equal-form required options are forwarded unchanged; split-form options
     # were appended above.  Selector-only --adapter/--route-evidence never
@@ -552,6 +558,16 @@ def main(argv):
         child_env = {
             key: value for key, value in os.environ.items() if not _MODEL_ENV.fullmatch(key)
         }
+        if values["--worker-type"] == "review":
+            # A direct reviewer is deliberately route-free.  The selector may
+            # itself run inside a route-owned owner, so inherited route
+            # variables must not silently bind the child to that owner/node.
+            for key in (
+                "AGENT_OWNER_ROUTE_FILE", "AGENT_OWNER_ROUTE_ID",
+                "AGENT_OWNER_ROUTE_HASH", "AGENT_ROUTE_FILE",
+                "AGENT_ROUTE_ID", "AGENT_ROUTE_NODE",
+            ):
+                child_env.pop(key, None)
         caller_harness = _caller_harness(child_env)
         if caller_harness:
             child_env["AGENT_DISPATCH_CALLER_HARNESS"] = caller_harness

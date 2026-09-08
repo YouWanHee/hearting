@@ -996,5 +996,90 @@ class EqualityRollbackTest(unittest.TestCase):
         migration.verify_v1_projection(out / "v1-export.json")
 
 
+class HistoricalDiagnosticsTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.con = sqlite3.connect(self.root / "reader.db")
+        self.addCleanup(self.con.close)
+        sync_v2.ensure_sync_schema(self.con)
+        self.con.execute("CREATE TABLE records(id TEXT PRIMARY KEY,body TEXT)")
+        self.con.execute("INSERT INTO sync_replica(replica_id,counter,active) VALUES(?, '1', 1)", (REPLICA_A,))
+        self.op = make_operation(replica_id=REPLICA_A, counter=1, record_id="inert-record",
+                                 body=None, kind="tombstone", project_key="project")
+        raw = protocol_v2.canonical_bytes(self.op)
+        self.con.execute("INSERT INTO sync_objects(op_id,replica_id,counter,project_key,kind,object_path,payload_bytes) VALUES(?,?,?,?,?,?,?)",
+            (self.op["op_id"],REPLICA_A,"1","project","tombstone",protocol_v2.operation_path(self.op["op_id"]),raw))
+        self.folded = protocol_v2.fold_operations([self.op])
+        self.assertIn(self.op["op_id"], self.folded.blocked)
+        self.con.execute("INSERT INTO sync_applied(op_id,result) VALUES(?,?)", (self.op["op_id"],"blocked:blocked-prior-evidence"))
+        self.con.commit()
+        membership = migration.seal_membership(epoch_id=EPOCH, member_manifests=[member(REPLICA_A)])
+        membership.pop("changed")
+        snapshot = migration.create_snapshot(db_path=self.root / "reader.db", epoch_id=EPOCH,
+            membership=membership, replica_id=REPLICA_A, out=self.root / "snapshot", apply=True,
+            capture_enabled=True, snapshot_capture_seq=0, outbox_counter=1)
+        seed = migration.build_seed_manifest(epoch_id=EPOCH, membership_digest=membership["manifest_digest"],
+            snapshot_digest=snapshot["manifest_digest"], source_digest=DIGEST_A, replica_id=REPLICA_A,
+            kind="snapshot", mappings=[{"source_identity":f"captured:{self.op['op_id']}","counter":1,"op_id":self.op["op_id"]}],
+            operations=[self.op], captured_op_ids=[self.op["op_id"]], out=self.root / "seed", apply=True)
+        evidence_row = {key:DIGEST_A for key in migration._EVIDENCE_FIELDS}
+        evidence_row.update(replica_id=REPLICA_A,membership_digest=membership["manifest_digest"],
+                            snapshot_digest=snapshot["manifest_digest"], seed_digest=seed["manifest_digest"])
+        evidence = migration.seal_evidence(epoch_id=EPOCH,membership=membership,replica_evidence=[evidence_row])
+        evidence.pop("changed")
+        self.con.execute("INSERT INTO sync_migration_state(epoch_id,phase,current,membership_digest,evidence_digest,state_digest) VALUES(?,?,?,?,?,?)",
+            (EPOCH,"evidence-sealed",1,membership["manifest_digest"],evidence["manifest_digest"],DIGEST_B))
+        for kind, manifest in (("membership",membership),("evidence",evidence)):
+            self.con.execute("INSERT INTO sync_migration_seals(epoch_id,seal_kind,membership_digest,manifest_digest,manifest_bytes,receipt_digest) VALUES(?,?,?,?,?,?)",
+                (EPOCH,kind,membership["manifest_digest"],manifest["manifest_digest"],migration.canonical_bytes(manifest),DIGEST_B))
+        for kind, manifest in (("snapshot",snapshot),("seed",seed)):
+            self.con.execute("INSERT INTO sync_migration_artifacts(epoch_id,artifact_kind,replica_id,manifest_digest,local_path) VALUES(?,?,?,?,?)",
+                (EPOCH,kind,REPLICA_A,manifest["manifest_digest"],str(self.root / kind)))
+        self.con.commit()
+
+    def test_proof_present_and_absent_readers_preserve_raw_history(self):
+        before = list(self.con.iterdump())
+        details = sync_v2.blocked_operation_details(self.con)
+        self.assertEqual(details[0]["classification"], "historical-inert", details)
+        self.assertTrue(details[0]["proof"]["valid"])
+        self.assertEqual(list(self.con.iterdump()), before)
+        self.con.execute("DELETE FROM sync_migration_seals")
+        absent = sync_v2.blocked_operation_details(self.con)
+        self.assertEqual(absent[0]["classification"], "active")
+        self.assertFalse(absent[0]["proof"]["valid"])
+        self.assertEqual(details[0]["result"], absent[0]["result"])
+
+    def test_bad_or_incomplete_sealed_proof_stays_active(self):
+        for change in ("corrupt", "unsealed", "incomplete"):
+            with self.subTest(change=change):
+                self.con.execute("SAVEPOINT negative")
+                if change == "corrupt":
+                    self.con.execute("UPDATE sync_migration_seals SET manifest_bytes='{}' WHERE seal_kind='evidence'")
+                elif change == "unsealed":
+                    self.con.execute("UPDATE sync_migration_state SET evidence_digest=NULL")
+                else:
+                    self.con.execute("DELETE FROM sync_migration_artifacts WHERE artifact_kind='seed'")
+                self.assertEqual(sync_v2.blocked_operation_details(self.con)[0]["classification"], "active")
+                self.con.execute("ROLLBACK TO negative"); self.con.execute("RELEASE negative")
+
+    def test_late_put_pending_conflict_and_additional_head_stay_active(self):
+        from dataclasses import replace
+        late = make_operation(replica_id=REPLICA_A, counter=2, record_id="inert-record",
+                              body="late",project_key="project")
+        folded_late = protocol_v2.fold_operations([self.op,late])
+        for name, folded in (("late",folded_late),
+                ("conflict",replace(self.folded,conflicts={"inert-record":object()})),
+                ("additional-head",replace(self.folded,frontiers={"inert-record":(self.op["op_id"],late["op_id"])}))):
+            with self.subTest(name=name):
+                proved, _ = sync_v2._historical_inert_proofs(self.con, folded)
+                self.assertNotIn(self.op["op_id"], proved)
+        pending = make_operation(replica_id=REPLICA_A,counter=3,record_id="pending-record",
+                                 body=None,kind="tombstone",pending=True,project_key="project")
+        proved,_ = sync_v2._historical_inert_proofs(self.con,protocol_v2.fold_operations([pending]))
+        self.assertEqual(proved,{})
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -7,6 +7,16 @@ S=importlib.util.spec_from_file_location("route",ROOT/"utilities/capability-rout
 WH_S=importlib.util.spec_from_file_location("opencode_dispatch_headless",Path(__file__).with_name("dispatch-headless.py")); WH=importlib.util.module_from_spec(WH_S); WH_S.loader.exec_module(WH)
 
 
+def isolated_dispatch_env(**updates):
+    inherited = {
+        key: value for key, value in os.environ.items()
+        if key not in {"AGENT_DISPATCH_JOBS", "AGENT_DISPATCH_ATTEMPT_ID", "AGENT_MODEL_GOVERNOR_ROOT"}
+        and not key.startswith(("AGENT_ROUTE_", "AGENT_OWNER_ROUTE_"))
+    }
+    inherited.update(updates)
+    return inherited
+
+
 def probe_args(**overrides):
     base = dict(
         dispatch_depth=2, action="start", nested_eligibility="unknown", eligibility_source="",
@@ -117,7 +127,7 @@ class OpenCodeSD45(unittest.TestCase):
     route=R.compile_route("autopilot-code","dev","strong",repo,art,signals=["shared-contract"],transport="headless",tracking="tracked",tracked_gate_evidence=gate,dispatch_evidence=dispatch)
    path=base/"route.json"; path.write_text(json.dumps(route)); node=next(x for x in route["nodes"] if x["id"]=="execute")
    args=[sys.executable,str(ROOT/"adapters/opencode/bin/dispatch-headless.py"),"--register","--worktree",str(repo),"--slug","opencode-sd45","--capability","autopilot-code","--capability-mode","dev","--worker-mode",node["unit"],"--qa","standard","--intensity","strong","--dispatch-depth","2","--parent","owner","--parent-harness","opencode","--parent-transport","headless","--parent-sandbox","adapter-default","--nested-eligibility","supported","--eligibility-source","opencode-fixture","--fallback-ordinal","1","--route-file",str(path),"--route-id",route["route_id"],"--route-hash",route["route_hash"],"--route-node","execute","--unit",node["unit"],"--registry-digest",route["registry_digest"],"--write-scope",";".join(node["write_scope"]),"--completion-gate",node["completion_gate"],"--model-role",node["role"],"--model-profile",node["model_profile"],"--jobs",str(jobs),"--log-dir",str(logs)]
-   env={**os.environ,"AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(art),"AGENT_DISPATCH_JOBS":str(jobs),"OPENCODE_CONFIG_CONTENT":"{}"}
+   env=isolated_dispatch_env(AGENT_HOME=str(ROOT),AGENT_ARTIFACT_ROOT=str(art),AGENT_DISPATCH_JOBS=str(jobs),OPENCODE_CONFIG_CONTENT="{}")
    dry=args.copy(); dry[dry.index("--register")]="--dry-run"; ok=subprocess.run(dry,text=True,capture_output=True,env=env); self.assertEqual(ok.returncode,0,ok.stderr); self.assertIn(f"unit={node['unit']}",ok.stdout)
    blocked=subprocess.run(args,text=True,capture_output=True,env=env); self.assertEqual(blocked.returncode,73); self.assertIn("reason=live-parent-not-found",blocked.stdout+blocked.stderr); self.assertFalse(jobs.exists() and jobs.read_text(encoding="utf-8").strip()); self.assertFalse(logs.exists())
    bad=dry.copy(); bad[bad.index("autopilot-code")]="autopilot-lab"; bad[bad.index("dev")]="eval"; denied=subprocess.run(bad,text=True,capture_output=True,env=env); self.assertEqual(denied.returncode,65); self.assertIn("route-capability-mode-mismatch",denied.stdout+denied.stderr)
@@ -197,14 +207,10 @@ class OpenCodeParentCompletionDelivery(unittest.TestCase):
             # real artifact root, not the tmp fixture root, and would fail
             # resolve_model_governor_root's split-brain check unrelated to
             # what this test is checking.
-            env = {
-                **{
-                    k: v for k, v in os.environ.items()
-                    if k not in {"AGENT_DISPATCH_JOBS", "AGENT_MODEL_GOVERNOR_ROOT"}
-                },
-                "AGENT_HOME": str(ROOT), "AGENT_ARTIFACT_ROOT": str(art),
-                "OPENCODE_CONFIG_CONTENT": "{}", "AGENT_DISPATCH_CURRENT_HARNESS": "claude",
-            }
+            env = isolated_dispatch_env(
+                AGENT_HOME=str(ROOT), AGENT_ARTIFACT_ROOT=str(art),
+                OPENCODE_CONFIG_CONTENT="{}", AGENT_DISPATCH_CURRENT_HARNESS="claude",
+            )
             result = subprocess.run(cmd, text=True, capture_output=True, env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("parent_completion_delivery=", result.stdout)
@@ -234,14 +240,10 @@ class OpenCodeParentBindingDryRun(unittest.TestCase):
                 "--write-scope", "source/**", "--model", "provider/test", "--variant", "low",
                 "--parent-attempt-id", "att-parent-fixture-1",
             ]
-            env = {
-                **{
-                    k: v for k, v in os.environ.items()
-                    if k not in {"AGENT_DISPATCH_JOBS", "AGENT_MODEL_GOVERNOR_ROOT"}
-                },
-                "AGENT_HOME": str(ROOT), "AGENT_ARTIFACT_ROOT": str(art),
-                "OPENCODE_CONFIG_CONTENT": "{}",
-            }
+            env = isolated_dispatch_env(
+                AGENT_HOME=str(ROOT), AGENT_ARTIFACT_ROOT=str(art),
+                OPENCODE_CONFIG_CONTENT="{}",
+            )
             result = subprocess.run(cmd, text=True, capture_output=True, env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
         # dispatch_depth defaults to 1 here, so no binding is attempted --

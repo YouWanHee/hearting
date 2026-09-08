@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import fcntl, hashlib, importlib.util, json, os, stat, subprocess, sys, tempfile, time, unittest
+import fcntl, hashlib, importlib.util, json, os, stat, subprocess, sys, tempfile, time, threading, unittest
 from unittest import mock
 from pathlib import Path
 
@@ -32,6 +32,68 @@ def attempt_row(metadata,status="open"):
  return f"2026-08-25T00:00:00Z\t{status}\t/r\t/w\texecute\t{pipe}"
 
 class DispatchContractTest(unittest.TestCase):
+ def test_cancel_closes_witness_only_on_cancelled_receipt(self):
+  with tempfile.TemporaryDirectory() as td:
+   root=Path(td)
+   handle=D.create_witness(root,"reservation")
+   token="cancel-receipt-token"
+   D._GOVERNOR_WITNESS_HANDLES[D._governor_witness_key(root,token)]=handle
+   with mock.patch.object(D,"_governor_json",return_value={"state":"unclaimed"}), \
+        mock.patch.object(D.subprocess,"run",return_value=subprocess.CompletedProcess([],0,stdout="reservation=absent\n",stderr="")):
+    D.cancel_governor_reservation(Path("governor"),root,token)
+   self.assertIn(D._governor_witness_key(root,token),D._GOVERNOR_WITNESS_HANDLES)
+   self.assertFalse(handle._closed)
+   D.close_witness(handle)
+   D._GOVERNOR_WITNESS_HANDLES.pop(D._governor_witness_key(root,token),None)
+
+ def test_reserve_receipt_validation_closes_unretained_witness(self):
+  with tempfile.TemporaryDirectory() as td:
+   root=Path(td)
+   handles=[]
+   real_create_witness=D.create_witness
+   def witness(*args,**kwargs):
+    handle=real_create_witness(root,"reservation")
+    handles.append(handle)
+    return handle
+   with mock.patch.object(D,"create_witness",side_effect=witness), \
+        mock.patch.object(D,"_governor_json",return_value={"tokens":[]}):
+    with self.assertRaises(D.DispatchContractError):
+     D.reserve_governor_token(Path("governor"),root,"dispatch")
+   self.assertEqual(len(handles),1)
+   self.assertTrue(handles[0]._closed)
+
+ def test_governor_witness_map_is_root_scoped_and_provided_token_is_not_owned(self):
+  with tempfile.TemporaryDirectory() as td:
+   a,b=Path(td)/"a",Path(td)/"b";token="a"*32
+   with mock.patch.object(D,"_governor_json",return_value={"tokens":[token]}):
+    D.reserve_governor_token(Path("governor"),a,"dispatch")
+    D.reserve_governor_token(Path("governor"),b,"dispatch")
+   ha=D._GOVERNOR_WITNESS_HANDLES[D._governor_witness_key(a,token)]
+   hb=D._GOVERNOR_WITNESS_HANDLES[D._governor_witness_key(b,token)]
+   try:
+    with mock.patch.object(D,"_governor_json",return_value={"state":"unclaimed"}), mock.patch.object(D.subprocess,"run",return_value=subprocess.CompletedProcess([],0,stdout="reservation=cancelled\n",stderr="")):
+     D.cancel_governor_reservation(Path("governor"),a,token)
+    self.assertTrue(ha._closed);self.assertFalse(hb._closed)
+    with mock.patch.object(D,"_governor_json",return_value={"state":"unclaimed"}), mock.patch.object(D,"create_witness",side_effect=AssertionError("provided token must not issue FD")):
+     self.assertEqual(D.reserve_governor_token(Path("governor"),b,"dispatch",provided_token=token)[0],token)
+    self.assertFalse(hb._closed)
+   finally:
+    D.close_witness(ha);D.close_witness(hb)
+    D._GOVERNOR_WITNESS_HANDLES.pop(D._governor_witness_key(a,token),None)
+    D._GOVERNOR_WITNESS_HANDLES.pop(D._governor_witness_key(b,token),None)
+
+ def test_cancel_claim_race_requires_exact_issuer_receipt_before_fd_return(self):
+  with tempfile.TemporaryDirectory() as td:
+   root=Path(td);token="b"*32;h=D.create_witness(root,"reservation")
+   key=D._governor_witness_key(root,token);D._GOVERNOR_WITNESS_HANDLES[key]=h
+   try:
+    with self.assertRaises(D.DispatchContractError):D._return_governor_witness(root,token,{"owner_witness":{}})
+    self.assertFalse(h._closed)
+    with mock.patch.object(D,"_governor_json",side_effect=[{"state":"unclaimed"},{"state":"claimed","owner_witness":h.binding()}]), mock.patch.object(D.subprocess,"run",return_value=subprocess.CompletedProcess([],75,stdout="",stderr="reservation already claimed")):
+     D.cancel_governor_reservation(Path("governor"),root,token)
+    self.assertTrue(h._closed);self.assertNotIn(key,D._GOVERNOR_WITNESS_HANDLES)
+   finally:D.close_witness(h);D._GOVERNOR_WITNESS_HANDLES.pop(key,None)
+
  def test_versioned_source_registry_fallback_matrix(self):
   with tempfile.TemporaryDirectory() as td:
    base=Path(td)
@@ -937,7 +999,15 @@ class DispatchContractTest(unittest.TestCase):
    self.assertEqual(caught.exception.reason,"parent-attempt-not-live")
 
  def test_supervised_lease_is_live_only_when_exact_held_and_pid_namespace_unverifiable(self):
-  with tempfile.TemporaryDirectory() as td:
+  for descendants in (D.ProcessGroupObservation("empty"),
+                      D.ProcessGroupObservation("populated",((901,"1"),)),
+                      D.ProcessGroupObservation("unverifiable",reason="foreign")):
+   with self.subTest(descendants=descendants.state):
+    self._check_supervised_lease_with_descendants(descendants)
+
+ def _check_supervised_lease_with_descendants(self,descendants):
+  with tempfile.TemporaryDirectory() as td, \
+       mock.patch.object(D,"attempt_tagged_descendants",return_value=descendants):
    base=Path(td);jobs=base/"jobs.log";attempt="att-parent-lease"
    parent=subprocess.Popen(["sleep","60"])
    lease=D.supervisor_lease_path(jobs,attempt)
@@ -961,6 +1031,7 @@ class DispatchContractTest(unittest.TestCase):
      binding=D.resolve_live_parent_attempt(
       jobs,parent_slug="owner",repo="/repo",worktree="/wt",
       expected_attempt_id=attempt)
+     self.assertTrue(D.parent_attempt_binding_is_live(jobs,binding))
     self.assertEqual(binding.liveness_source,"supervisor-lease")
     self.assertIsNone(binding.observed_pid)
     self.assertTrue(D.parent_attempt_binding_is_live(jobs,binding))
@@ -1099,8 +1170,38 @@ class DispatchContractTest(unittest.TestCase):
        jobs,parent_slug="owner",repo="/repo",worktree="/wt",
        expected_attempt_id=attempt)
     self.assertEqual(caught.exception.reason,"parent-attempt-not-live")
+    # SD-OPEN-61: neither a dead/reused leader nor tagged survivors can make
+    # an exact held lease authoritative outside the namespace-only fallback.
+    for observation in (("present","different","S"),("missing",None,None)):
+     with self.subTest(observation=observation), \
+          mock.patch.object(D,"_proc_observation",return_value=observation), \
+          mock.patch.object(D,"attempt_tagged_descendants",return_value=
+                            D.ProcessGroupObservation("populated",((901,"1"),))):
+      with self.assertRaises(D.DispatchContractError) as rejected:
+       D.resolve_live_parent_attempt(
+        jobs,parent_slug="owner",repo="/repo",worktree="/wt",
+        expected_attempt_id=attempt)
+      self.assertEqual(rejected.exception.reason,"parent-attempt-not-live")
    finally:
     fcntl.flock(holder.fileno(),fcntl.LOCK_UN);holder.close()
+
+ def test_parent_refusal_reports_process_reason_and_observer_namespaces(self):
+  with tempfile.TemporaryDirectory() as td:
+   jobs=Path(td)/"jobs.log"
+   jobs.write_text(self.owner_row("att-parent-diagnostic",437,"20",extra=
+    ",pid_observer_ns=pid:[outer],pid_ns=pid:[outer]")+"\n")
+   for reason in ("local-pid-reused","process-namespace-unverifiable"):
+    with self.subTest(reason=reason), \
+         mock.patch.object(D,"_parent_liveness_evidence",return_value=(False,reason,None)), \
+         mock.patch.object(D,"process_namespace_identity",return_value="pid:[inner]"):
+     with self.assertRaises(D.DispatchContractError) as caught:
+      D.resolve_live_parent_attempt(jobs,parent_slug="owner",repo="/repo",worktree="/wt",
+       expected_attempt_id="att-parent-diagnostic")
+     self.assertEqual(caught.exception.reason,"parent-attempt-not-live")
+     detail=json.loads(caught.exception.detail)
+     self.assertEqual(detail,{"attempt_id":"att-parent-diagnostic","liveness_reason":reason,
+      "pid":"437","pid_start":"20","recorded_observer_ns":"pid:[outer]",
+      "observer_ns":"pid:[inner]"})
 
  def test_supervisor_lease_file_is_preserved_for_recovery_exception(self):
   with tempfile.TemporaryDirectory() as td:
@@ -1671,6 +1772,29 @@ class DispatchContractTest(unittest.TestCase):
      jobs,"att-mutation-test",{"launch_outcome":"governed-process-reaped"})
    self.assertEqual(caught.exception.reason,"attempt-launch-outcome-conflict")
 
+ def test_depth_two_readiness_binds_hash_and_preserves_only_hashless_route_legacy(self):
+  node={"id":"execute","kind":"pipeline-stage","dispatch_depth":2}
+  marker={"attempt_id":"att-hash-readiness","registered_worker":True}
+  for route_hash,row_hash,state in (("sha256:expected","sha256:foreign","unverifiable"),
+                                    ("sha256:expected",None,"unverifiable"),
+                                    ("sha256:expected","sha256:expected","ready"),
+                                    (None,None,"ready")):
+   with self.subTest(route_hash=route_hash,row_hash=row_hash):
+    route={"route_id":"rt-hash-readiness"}
+    if route_hash is not None:route["route_hash"]=route_hash
+    meta={"route_id":route["route_id"],"route_node":node["id"],
+          "attempt_id":marker["attempt_id"],"note":"completed-marker"}
+    if row_hash is not None:meta["route_hash"]=row_hash
+    lines=[attempt_row(meta,status="done")]
+    with mock.patch.object(D,"attempt_process_quiescence",
+                           return_value=D.ProcessQuiescence("quiescent","fixture")) as probe:
+     actual=D.completion_attempt_readiness(route,node,marker,Path("unused"),registry_lines=lines)
+     self.assertEqual(actual.state,state)
+     if state=="unverifiable":
+      self.assertEqual(actual.reason,"attempt-route-hash-mismatch")
+      probe.assert_not_called()
+     else:probe.assert_called_once()
+
  def test_semantic_completion_readiness_blocks_live_process_and_conflicting_retry(self):
   with tempfile.TemporaryDirectory() as td:
    jobs=Path(td)/"jobs.log"
@@ -1777,6 +1901,9 @@ class DispatchContractTest(unittest.TestCase):
      pass_fds=(gate_fd,),start_new_session=True)
    def attach(identity):
     self.assertFalse(marker.exists())
+    with Path(f"{jobs}.lock").open("a") as contender:
+     with self.assertRaises(BlockingIOError):
+      fcntl.flock(contender.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
     observed.append(dict(identity))
     return {"summary_owner":"dispatch-v1","summary_owner_pid":"777"}
    proc,identity=D.spawn_claimed_attempt(
@@ -1789,6 +1916,72 @@ class DispatchContractTest(unittest.TestCase):
    self.assertEqual(meta["summary_owner_pid"],"777")
    self.assertEqual(meta["launch_claimed"],"1")
    self.assertEqual(identity["summary_owner"],"dispatch-v1")
+
+ def test_post_claim_runs_unlocked_then_rejects_terminal_row_race(self):
+  with tempfile.TemporaryDirectory() as td:
+   base=Path(td);jobs=base/"jobs.log";marker=base/"must-not-run";children=[]
+   attempt="att-post-claim-status-race"
+   row=(f"2026-07-23T00:00:01Z\topen\t/repo\t/wt\tchild\t{CURRENT},"
+        f"attempt_id={attempt}")
+   self.assertTrue(D.claim_attempt_row(jobs,attempt,row,launch=False))
+   def spawn(gate_fd):
+    proc=subprocess.Popen(
+     [sys.executable,str(Path(__file__).with_name("launch-fence.py")),
+      "--parent-pid",str(os.getpid()),"--gate-fd",str(gate_fd),"--",
+      sys.executable,"-c",f"from pathlib import Path;Path({str(marker)!r}).write_text('bad')"],
+     pass_fds=(gate_fd,),start_new_session=True)
+    children.append(proc);return proc
+   def mutate(_identity):
+    with Path(f"{jobs}.lock").open("a") as contender:
+     fcntl.flock(contender.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
+     fields=jobs.read_text().strip().split("\t")
+     fields[1]="done"
+     jobs.write_text("\t".join(fields)+"\n")
+    return {"review_lease_deadline":"2099-01-01T00:00:00Z"}
+   with self.assertRaises(D.DispatchContractError) as caught:
+    D.spawn_claimed_attempt(
+     jobs,attempt,parent_binding=None,spawn=spawn,post_claim=mutate)
+   self.assertEqual(caught.exception.reason,"attempt-post-claim-identity-changed")
+   self.assertFalse(marker.exists())
+   self.assertIsNotNone(children[0].poll())
+
+ def test_post_claim_rechecks_parent_liveness_before_fence_release(self):
+  with tempfile.TemporaryDirectory() as td:
+   base=Path(td);jobs=base/"jobs.log";marker=base/"must-not-run"
+   parent=subprocess.Popen(["sleep","60"]);children=[]
+   try:
+    start=D.process_start_ticks(parent.pid)
+    jobs.write_text(self.owner_row("att-parent-post-claim",parent.pid,start)+"\n")
+    binding=D.resolve_live_parent_attempt(
+     jobs,parent_slug="owner",repo="/repo",worktree="/wt",
+     expected_attempt_id="att-parent-post-claim")
+    attempt="att-child-post-claim"
+    row=(f"2026-07-23T00:00:01Z\topen\t/repo\t/wt\tchild\t{CURRENT},"
+         "worker_type=stage,parent=owner,parent_attempt_id=att-parent-post-claim,"
+         f"attempt_id={attempt}")
+    self.assertTrue(D.claim_attempt_row(jobs,attempt,row,launch=False))
+    def spawn(gate_fd):
+     proc=subprocess.Popen(
+      [sys.executable,str(Path(__file__).with_name("launch-fence.py")),
+       "--parent-pid",str(os.getpid()),"--gate-fd",str(gate_fd),"--",
+       sys.executable,"-c",f"from pathlib import Path;Path({str(marker)!r}).write_text('bad')"],
+      pass_fds=(gate_fd,),start_new_session=True)
+     children.append(proc);return proc
+    def kill_parent(_identity):
+     parent.kill();parent.wait()
+     return {}
+    with self.assertRaises(D.DispatchContractError) as caught:
+     D.spawn_claimed_attempt(
+      jobs,attempt,parent_binding=binding,spawn=spawn,post_claim=kill_parent)
+    self.assertEqual(caught.exception.reason,"parent-attempt-not-live-after-post-claim")
+    self.assertFalse(marker.exists())
+    self.assertIsNotNone(children[0].poll())
+   finally:
+    if parent.poll() is None:parent.kill()
+    parent.wait()
+    for proc in children:
+     if proc.poll() is None:proc.kill()
+     proc.wait()
 
  def test_pre_release_failure_aborts_fenced_payload_and_leaves_claim_retryable(self):
   with tempfile.TemporaryDirectory() as td:
@@ -2151,6 +2344,160 @@ class DispatchContractTest(unittest.TestCase):
    winners=[p.communicate(timeout=10)[0].strip() for p in procs]
    self.assertEqual(winners.count("1"),1,winners)
    self.assertEqual(len(jobs.read_text().splitlines()),1)
+ def test_terminal_claim_fence_blocks_mutation_inside_existing_jobs_lock(self):
+  with tempfile.TemporaryDirectory() as td:
+   jobs=Path(td)/"jobs.log"; attempt="att-terminal-fence01"; route="rt-terminal-fence"
+   row=f"2026-07-16T00:00:00Z\topen\t/repo\t/wt\tstage\t{CURRENT},route_id={route},route_node=execute,attempt_id={attempt}"
+   jobs.write_text(row+"\n")
+   with (Path(f"{jobs}.lock")).open("a") as lock:
+    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+    D.claim_terminal_route_locked(jobs, route, attempt, lock_fd=lock.fileno(), proof={"test":"marker"})
+   with self.assertRaises(D.DispatchContractError) as caught:
+    D.claim_attempt_row(jobs, attempt, row, launch=True,
+                        mutation_precheck=lambda lines: D.ensure_terminal_claim_absent(jobs, route, attempt))
+   self.assertEqual(caught.exception.reason,"terminal-claim-conflict")
+   self.assertIn("\topen\t",jobs.read_text())
+ def test_terminal_claim_requires_held_exact_registry_lock(self):
+  with tempfile.TemporaryDirectory() as td:
+   jobs=Path(td)/"jobs.log"; jobs.write_text("")
+   with Path(f"{jobs}.lock").open("a") as lock:
+    self.assertFalse(D._terminal_claim_lock_owned(lock.fileno(), jobs))
+    fcntl.flock(lock.fileno(),fcntl.LOCK_EX)
+    self.assertTrue(D._terminal_claim_lock_owned(lock.fileno(), jobs))
+    self.assertFalse(D._terminal_claim_lock_owned(lock.fileno(), Path(td)/"other.log"))
+
+ def test_portable_admission_without_adapter_callback_rejects_owner_fence(self):
+  with tempfile.TemporaryDirectory() as td:
+   jobs=Path(td)/"jobs.log"; route="rt-portable-fence"; owner="att-owner"
+   jobs.write_text("")
+   with Path(f"{jobs}.lock").open("a") as lock:
+    fcntl.flock(lock.fileno(),fcntl.LOCK_EX)
+    D.claim_terminal_route_locked(jobs,route,owner,lock_fd=lock.fileno(),proof={"current":True})
+   for harness in ("claude","codex","opencode"):
+    with self.subTest(harness=harness):
+     child="att-child-"+harness
+     metadata=CURRENT+",harness="+harness
+     row=f"2026-07-16T00:00:00Z\topen\t/repo\t/wt\tstage\t{metadata},route_id={route},attempt_id={child},parent_attempt_id={owner}"
+     with self.assertRaises(D.DispatchContractError) as caught:
+      D.claim_attempt_row(jobs,child,row,launch=True)
+     self.assertEqual(caught.exception.reason,"terminal-claim-conflict")
+     self.assertEqual(jobs.read_bytes(),b"")
+
+ def test_child_mutation_observes_owner_terminal_fence(self):
+  with tempfile.TemporaryDirectory() as td:
+   jobs=Path(td)/"jobs.log"; route="rt-parent-fence"; owner="att-owner"; child="att-child"
+   jobs.write_text(f"2026-07-16T00:00:00Z\topen\t/repo\t/wt\tstage\t{CURRENT},route_id={route},attempt_id={child},parent_attempt_id={owner}\n")
+   with Path(f"{jobs}.lock").open("a") as lock:
+    fcntl.flock(lock.fileno(),fcntl.LOCK_EX)
+    D.claim_terminal_route_locked(jobs,route,owner,lock_fd=lock.fileno(),proof={"current":True})
+    with self.assertRaises(D.DispatchContractError) as caught:
+     D.ensure_terminal_claim_absent(jobs,route,child)
+    self.assertEqual(caught.exception.reason,"terminal-claim-conflict")
+   D.terminal_claim_path(jobs,route,owner).write_text("{")
+   with self.assertRaises(D.DispatchContractError) as caught:
+    D.ensure_terminal_claim_absent(jobs,route,child)
+   self.assertEqual(caught.exception.reason,"terminal-claim-record-invalid")
+
+ def test_sentinel_or_other_route_cannot_hide_owner_route_admission_fence(self):
+  for route_value in ("-", "", "rt-other-route"):
+   for registered in (False,True):
+    for launch in (False,True):
+     with self.subTest(route_value=route_value,registered=registered,launch=launch), tempfile.TemporaryDirectory() as td:
+      jobs=Path(td)/"jobs.log"; route="rt-ownerroute-fence"; owner="att-ownerroute"; child="att-child"
+      row=f"2026-07-16T00:00:00Z\topen\t/repo\t/wt\tstage\t{CURRENT},route_id={route_value},owner_route_id={route},attempt_id={child},parent_attempt_id={owner}"
+      jobs.write_text(row+",launch_claimed=0\n" if registered else "")
+      before=jobs.read_bytes()
+      with Path(f"{jobs}.lock").open("a") as lock:
+       fcntl.flock(lock.fileno(),fcntl.LOCK_EX)
+       D.claim_terminal_route_locked(jobs,route,owner,lock_fd=lock.fileno(),proof={"current":True})
+      with self.assertRaises(D.DispatchContractError) as caught:
+       D.claim_attempt_row(jobs,child,row,launch=launch)
+      self.assertEqual(caught.exception.reason,"terminal-claim-conflict")
+      self.assertEqual(jobs.read_bytes(),before)
+
+ def _run_terminal_claim_race(self, marker_actor, terminal_actor):
+  """Run two real writers with a bounded join and return their typed outcomes."""
+  outcomes=[]; barrier=threading.Barrier(2)
+  def run(label, actor):
+   try:
+    barrier.wait(timeout=5)
+    actor()
+   except D.DispatchContractError as caught:
+    outcomes.append((label,"conflict",caught.reason))
+   except BaseException as caught:
+    outcomes.append((label,"error",repr(caught)))
+   else:
+    outcomes.append((label,"winner",None))
+  threads=[threading.Thread(target=run,args=("marker",marker_actor),daemon=True),
+           threading.Thread(target=run,args=("terminal",terminal_actor),daemon=True)]
+  for thread in threads: thread.start()
+  for thread in threads: thread.join(timeout=10)
+  self.assertTrue(all(not thread.is_alive() for thread in threads),outcomes)
+  self.assertEqual(len(outcomes),2,outcomes)
+  self.assertEqual([item[1] for item in outcomes].count("winner"),1,outcomes)
+  self.assertEqual([item[1] for item in outcomes].count("conflict"),1,outcomes)
+  self.assertEqual([item[2] for item in outcomes if item[1]=="conflict"],["terminal-claim-conflict"])
+  return outcomes
+
+ def test_competing_marker_publication_and_terminal_claim_have_one_typed_winner(self):
+  with tempfile.TemporaryDirectory() as td:
+   jobs=Path(td)/"jobs.log"; jobs.write_text("")
+   route="rt-marker-race"; attempt="att-marker-race"
+   def publish_marker():
+    with (Path(f"{jobs}.lock")).open("a") as lock:
+     fcntl.flock(lock.fileno(),fcntl.LOCK_EX)
+     return D.claim_terminal_route_locked(jobs,route,attempt,lock_fd=lock.fileno(),proof={"writer":"marker"})
+   def terminal_claim():
+    with (Path(f"{jobs}.lock")).open("a") as lock:
+     fcntl.flock(lock.fileno(),fcntl.LOCK_EX)
+     return D.claim_terminal_route_locked(jobs,route,attempt,lock_fd=lock.fileno(),proof={"writer":"terminal"})
+   self._run_terminal_claim_race(publish_marker,terminal_claim)
+   self.assertIsNotNone(D.terminal_claim_observation(jobs,route,attempt))
+
+ def test_start_precheck_can_pass_then_terminal_claim_fence_blocks_start(self):
+  with tempfile.TemporaryDirectory() as td:
+   jobs=Path(td)/"jobs.log"; route="rt-start-race"; attempt="att-start-race"
+   row=f"2026-07-16T00:00:00Z\topen\t/repo\t/wt\tstage\t{CURRENT},route_id={route},route_node=execute,attempt_id={attempt}"
+   jobs.write_text(row+"\n")
+   precheck_passed=threading.Event(); release_start=threading.Event()
+   def start_actor():
+    self.assertIsNone(D.terminal_claim_observation(jobs,route,attempt))
+    precheck_passed.set()
+    self.assertTrue(release_start.wait(timeout=5))
+    return D.claim_attempt_row(jobs,attempt,row,launch=True,
+      mutation_precheck=lambda _lines:D.ensure_terminal_claim_absent(jobs,route,attempt))
+   def terminal_actor():
+    self.assertTrue(precheck_passed.wait(timeout=5))
+    with (Path(f"{jobs}.lock")).open("a") as lock:
+     fcntl.flock(lock.fileno(),fcntl.LOCK_EX)
+     result=D.claim_terminal_route_locked(jobs,route,attempt,lock_fd=lock.fileno(),proof={"writer":"terminal"})
+    release_start.set()
+    return result
+   self._run_terminal_claim_race(start_actor,terminal_actor)
+   self.assertNotIn("launch_claimed=1",jobs.read_text())
+
+ def test_retry_precheck_can_pass_then_terminal_claim_fence_blocks_retry(self):
+  with tempfile.TemporaryDirectory() as td:
+   jobs=Path(td)/"jobs.log"; route="rt-retry-race"; attempt="att-retry-race"
+   metadata=cancellation_metadata(attempt)
+   metadata.update({"route_id":route,"route_hash":"sha256:"+"1"*64})
+   jobs.write_text(attempt_row(metadata)+"\n")
+   precheck_passed=threading.Event(); release_retry=threading.Event()
+   def retry_actor():
+    self.assertIsNone(D.terminal_claim_observation(jobs,route,attempt))
+    precheck_passed.set()
+    self.assertTrue(release_retry.wait(timeout=5))
+    return D.claim_recovery_retry(jobs,recovery_id="recovery-race",source_route_id=route,
+      source_route_hash=metadata["route_hash"],node_or_group_leg="execute",
+      original_attempt_id=attempt,remaining_cascade=1)
+   def terminal_actor():
+    self.assertTrue(precheck_passed.wait(timeout=5))
+    with (Path(f"{jobs}.lock")).open("a") as lock:
+     fcntl.flock(lock.fileno(),fcntl.LOCK_EX)
+     result=D.claim_terminal_route_locked(jobs,route,attempt,lock_fd=lock.fileno(),proof={"writer":"terminal"})
+    release_retry.set()
+    return result
+   self._run_terminal_claim_race(retry_actor,terminal_actor)
  def test_register_to_start_transition_is_crash_atomic(self):
   with tempfile.TemporaryDirectory() as td:
    jobs=Path(td)/"jobs.log"; attempt="att-crashatomic123"
@@ -4136,7 +4483,12 @@ class ActualRowAssemblyLaunchHomeTest(unittest.TestCase):
                     "--jobs", str(jobs), "--attempt-id", f"att-{harness}-append-job-fx",
                 ] + self.MODEL_ARGS[harness]
                 env = {
-                    **os.environ,
+                    **{
+                        key: value for key, value in os.environ.items()
+                        if not key.startswith("AGENT_DISPATCH_")
+                        and not key.startswith("AGENT_OWNER_ROUTE_")
+                        and not key.startswith("AGENT_ROUTE_")
+                    },
                     "AGENT_HOME": str(current),
                     "AGENT_ARTIFACT_ROOT": str(artifact_root),
                     "HOME": str(root / "home"),
@@ -4144,6 +4496,7 @@ class ActualRowAssemblyLaunchHomeTest(unittest.TestCase):
                 for stale in (
                     "AGENT_DISPATCH_JOBS", "AGENT_MODEL_GOVERNOR_ROOT",
                     "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID",
+                    "CODEX_SESSION_ID",
                     # A fixture that drives a wrapper must not inherit the
                     # ambient session's route binding: run from inside a
                     # dispatch owner, these make the wrapper refuse with
@@ -4153,10 +4506,26 @@ class ActualRowAssemblyLaunchHomeTest(unittest.TestCase):
                     "AGENT_OWNER_ROUTE_FILE", "AGENT_OWNER_ROUTE_ID",
                     "AGENT_OWNER_ROUTE_HASH", "AGENT_ROUTE_FILE",
                     "AGENT_ROUTE_ID", "AGENT_ROUTE_NODE",
+                    "AGENT_DISPATCH_PARENT_SESSION_ID",
+                    "AGENT_DISPATCH_PARENT_ATTEMPT_ID",
+                    "AGENT_DISPATCH_PARENT_SLUG", "AGENT_DISPATCH_CHILD",
+                    "AGENT_DISPATCH_CURRENT_HARNESS",
+                    "AGENT_DISPATCH_CURRENT_TRANSPORT",
+                    "AGENT_DISPATCH_CURRENT_SANDBOX",
                 ):
                     env.pop(stale, None)
                 with mock.patch.dict(os.environ, env, clear=True):
-                    rc = wrapper.main(argv)
+                    if harness == "claude":
+                        with mock.patch.object(
+                            wrapper, "probe_claude_session_resume",
+                            return_value=wrapper.ClaudeResumeProbe(
+                                "supported", "fixture", 0, 20000,
+                                ("--resume", "--session-id"), "fixture",
+                            ),
+                        ):
+                            rc = wrapper.main(argv)
+                    else:
+                        rc = wrapper.main(argv)
                 self.assertEqual(rc, 0, harness)
                 self.assertTrue(jobs.is_file(), harness)
                 row = jobs.read_text(encoding="utf-8").strip()

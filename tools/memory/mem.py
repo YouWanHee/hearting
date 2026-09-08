@@ -5782,7 +5782,7 @@ def _apply_fold(con, result, remote_tip, remote_ref, *, record_peer=True):
         diagnostic = result.blocked.get(op_id)
         resolved_by = resolved_blocked.get(op_id) if diagnostic else None
         applied_result = (
-            f"blocked-resolved:{diagnostic.code}:{resolved_by}"
+            f"blocked-resolved:{diagnostic.code}:" + json.dumps(resolved_by, sort_keys=True, separators=(",", ":"))
             if resolved_by else
             (f"blocked:{diagnostic.code}" if diagnostic else "folded")
         )
@@ -9154,6 +9154,8 @@ def main():
 
     sub.add_parser("stats", help="Show store statistics")
     sy = sub.add_parser("sync", help="Run local maintenance and optional immutable v2 exchange")
+    sy.add_argument("status", nargs="?", choices=["status"], help="Read-only local sync status")
+    sy.add_argument("--blocked-details", action="store_true", help="With status, include all blocked-history diagnostics")
     sy.add_argument("--json", dest="json_output", action="store_true")
     sy.add_argument("--exchange-only", action="store_true",
                     help="Operator exchange without native import, lifecycle, index rebuild, or dump export")
@@ -9320,6 +9322,19 @@ def main():
     elif args.cmd == "stats":
         stats()
     elif args.cmd == "sync":
+        if args.status == "status":
+            if args.exchange_only:
+                ap.error("sync status cannot use --exchange-only")
+            con = _migration_read_connection()
+            try:
+                result = sync_v2.sync_status(con,
+                    policy=sync_v2.remote_policy(_sync_environment(), connection=con),
+                    blocked_details=args.blocked_details)
+            finally:
+                con.close()
+            sys.exit(_emit_sync(result, args.json_output))
+        if args.blocked_details:
+            ap.error("--blocked-details requires sync status")
         sys.exit(sync(json_output=args.json_output, exchange_only=args.exchange_only))
     elif args.cmd == "inject":
         inject(hook=args.hook)

@@ -30,6 +30,27 @@ class OwnerRouteBindingError(ValueError):
     pass
 
 
+def owner_binding_tuple_failure_fields(*, dispatch_depth, worker_type, route_file) -> dict[str, str]:
+    """Explain the existing owner-only tuple refusal without changing admission."""
+    invalid = {"dispatch_depth": dispatch_depth != 1,
+               "worker_type": worker_type != "owner", "route_file_present": bool(route_file)}
+    if not any(invalid.values()):
+        return {}
+    return {
+        "dispatch_depth": str(dispatch_depth), "expected_dispatch_depth": "1",
+        "worker_type": str(worker_type), "expected_worker_type": "owner",
+        "route_file_present": str(int(bool(route_file))), "expected_route_file_present": "0",
+        **{f"invalid_{key}": str(int(value)) for key, value in invalid.items()},
+        "detail": "오너 바인딩 위반 조건: " + ", ".join(key for key, value in invalid.items() if value),
+        "recovery": "depth-2 자식은 stage-dispatch-fallback.py --route <route> --node <node> "
+                    "--slug <slug> --parent <owner> --start; 봉인 그룹은 dispatch-batch.py "
+                    "--route <route> --parallel-group <group> --slug-prefix <prefix> "
+                    "--parent <owner> --action start",
+        "caller_hint": "이 직접 wrapper 호출에 --route-file을 추가하거나 owner 환경을 수동 제거하지 마세요. "
+                       "정식 launcher가 자식 node 바인딩을 전달합니다.",
+    }
+
+
 OWNER_ROUTE_ATTACHMENT_SCHEMA_VERSION = 1
 OWNER_ROUTE_ATTACHMENT_DIR = "owner-route-bindings"
 OWNER_ROUTE_ADVANCE_SCHEMA_VERSION = 2

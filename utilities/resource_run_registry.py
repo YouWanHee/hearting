@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import sys
+import stat
 import tempfile
 import time
 from pathlib import Path
@@ -153,12 +154,61 @@ def indexed_paths(index_path=None) -> tuple[list[Path], list[dict]]:
         if not isinstance(raw, str) or not raw:
             diagnostics.append({"kind": "malformed-index-entry", "entry": str(key)})
             continue
-        path = Path(raw).expanduser().resolve(strict=False)
+        path = Path(raw).expanduser()
+        if not path.is_absolute() or ".." in path.parts:
+            diagnostics.append({"kind": "malformed-index-entry", "entry": str(key), "path": raw})
+            continue
         marker = str(path)
         if marker not in seen:
             seen.add(marker)
             paths.append(path)
     return paths, diagnostics
+
+
+def read_registry_source(path: Path) -> tuple[dict, bytes | None]:
+    """Read once with path identity; only ordinary ENOENT is a negative fact.
+
+    Inspect links before resolving so a dangling link cannot become a missing
+    ordinary target. Directory identity (not mtime) also detects ancestor swaps.
+    """
+    path = path.expanduser().absolute()
+    parents = []
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current = current / part
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            return {"kind": "missing", "path": str(path), "missing_at": str(current),
+                    "reason": "missing-registry", "ancestors": parents}, None
+        entry = {"path": str(current), "device": info.st_dev, "inode": info.st_ino}
+        if stat.S_ISLNK(info.st_mode):
+            entry["link"] = os.readlink(current)
+            try:
+                target = current.resolve(strict=True)
+            except (OSError, RuntimeError) as exc:
+                raise ValueError(f"registry-link-unverifiable:{current}") from exc
+            entry["target"] = str(target)
+        if current != path:
+            if not current.is_dir():
+                raise ValueError(f"registry-ancestor-not-directory:{current}")
+            parents.append(entry)
+    resolved = path.resolve(strict=True)
+    # NONBLOCK also prevents a raced FIFO replacement from hanging the scan.
+    fd = os.open(resolved, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as stream:
+        first = os.fstat(stream.fileno())
+        if not stat.S_ISREG(first.st_mode):
+            raise ValueError(f"registry-not-file:{path}")
+        data = stream.read()
+        last = os.fstat(stream.fileno())
+    signature = lambda value: (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+    if signature(first) != signature(last) or signature(last) != signature(resolved.stat()):
+        raise ValueError(f"registry-changed-during-read:{path}")
+    return {"kind": "file", "path": str(path), "resolved_path": str(resolved),
+            "device": last.st_dev, "inode": last.st_ino, "ancestors": parents,
+            "leaf": entry, "sha256": "sha256:" + hashlib.sha256(data).hexdigest(),
+            "size": len(data)}, data
 
 
 def _boot_epoch() -> float | None:
@@ -222,12 +272,20 @@ def normalize_run(run_id: str, run: dict, registry: Path, identity_reader=proc_i
     }
 
 
-def scan(index_path=None, identity_reader=proc_identity, now=None) -> tuple[list[dict], list[dict]]:
+def scan(index_path=None, identity_reader=proc_identity, now=None,
+         observed_sources: list[dict] | None = None) -> tuple[list[dict], list[dict]]:
     paths, diagnostics = indexed_paths(index_path)
     rows = []
     for registry in paths:
         try:
-            payload = json.loads(registry.read_text(encoding="utf-8"))
+            source, data = read_registry_source(registry)
+            if observed_sources is not None:
+                observed_sources.append(source)
+            if data is None:
+                diagnostics.append({"kind": "missing-registry", "path": str(registry),
+                                    "reason": "registered-path-absent", "blocking": False})
+                continue
+            payload = json.loads(data)
             runs = payload.get("runs") if isinstance(payload, dict) else None
             if payload.get("schema_version") != REGISTRY_SCHEMA or not isinstance(runs, dict):
                 raise ValueError("invalid-registry-schema")
@@ -248,7 +306,9 @@ def scan(index_path=None, identity_reader=proc_identity, now=None) -> tuple[list
 
 def counts(index_path=None) -> dict:
     rows, diagnostics = scan(index_path=index_path)
-    result = {"working": 0, "stale": 0, "exited": 0, "malformed": len(diagnostics)}
+    missing = sum(row.get("kind") == "missing-registry" for row in diagnostics)
+    result = {"working": 0, "stale": 0, "exited": 0,
+              "malformed": len(diagnostics) - missing, "missing": missing}
     for row in rows:
         if row["liveness"] in result:
             result[row["liveness"]] += 1

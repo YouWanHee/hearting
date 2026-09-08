@@ -9,6 +9,16 @@ S=importlib.util.spec_from_file_location("route",ROOT/"utilities/capability-rout
 WH_S=importlib.util.spec_from_file_location("codex_dispatch_headless",Path(__file__).with_name("dispatch-headless.py")); WH=importlib.util.module_from_spec(WH_S); WH_S.loader.exec_module(WH)
 
 
+def isolated_dispatch_env(**updates):
+    inherited = {
+        key: value for key, value in os.environ.items()
+        if key not in {"AGENT_DISPATCH_JOBS", "AGENT_DISPATCH_ATTEMPT_ID", "AGENT_MODEL_GOVERNOR_ROOT"}
+        and not key.startswith(("AGENT_ROUTE_", "AGENT_OWNER_ROUTE_"))
+    }
+    inherited.update(updates)
+    return inherited
+
+
 def probe_args(**overrides):
     base = dict(
         dispatch_depth=2, action="start", nested_eligibility="unknown", eligibility_source="",
@@ -338,6 +348,40 @@ class CodexRouteBoundWorkerGrant(unittest.TestCase):
             granted = WH.route_bound_worker_writable_dirs(args)
         self.assertEqual(granted, (args.agent_home.resolve() / ".core-grounding",))
 
+    def test_routeless_registered_workers_can_record_required_spec_reads(self):
+        # Cairn att-4726c1b6: depth-1 review without route/network widening.
+        # The portable kernel's read obligation is not review-only.
+        for worker_type in ("review", "stage", "support", "owner"):
+            for delivery, flag in (("one-shot", "--add-dir"),
+                                   ("app-server-supervised", "--writable-root")):
+                with self.subTest(worker_type=worker_type, delivery=delivery):
+                    with tempfile.TemporaryDirectory() as tmp:
+                        args = self._depth2_args(tmp)
+                        args.dispatch_depth = 1
+                        args.route_id = None
+                        args.worker_type = worker_type
+                        args.registered_worker = 1
+                        args.execution_surface = "registered-headless"
+                        args.resolved_completion_delivery = delivery
+                        WH.ensure_owner_writable_dirs(args)
+                        command = WH.shell_command(args, Path(tmp)/"p", Path(tmp)/"log")
+                        marker_dir = args.agent_home / ".spec-grounding"
+                        self.assertIn(f"{flag} {marker_dir}", command)
+                        self.assertTrue(marker_dir.is_dir())
+                        self.assertNotIn(f"{flag} {args.agent_home} ", command)
+                        self.assertFalse((args.agent_home / ".core-grounding").exists())
+
+    def test_unregistered_routeless_launch_does_not_gain_spec_write_access(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self._depth2_args(tmp)
+            args.route_id = None
+            args.registered_worker = 0
+            args.execution_surface = "registered-headless"
+            WH.ensure_owner_writable_dirs(args)
+            command = WH.shell_command(args, Path(tmp)/"p", Path(tmp)/"log")
+            self.assertNotIn(str(args.agent_home / ".spec-grounding"), command)
+            self.assertFalse((args.agent_home / ".spec-grounding").exists())
+
     def test_ordinary_depth2_worker_add_dir_list_includes_core_grounding(self):
         # The direct verification requirement (c): build the args for a plain
         # dispatch_depth=2 worker (not owner, no nested_headless_network) and
@@ -400,6 +444,7 @@ class CodexRouteBoundWorkerGrant(unittest.TestCase):
 
 class CodexSD45(unittest.TestCase):
  def test_route_consumer_and_scope_refusal(self):
+  [cache.clear() for cache in (R._LAUNCH_ROOT_IDENTITY_CACHE, R._LAUNCH_CONTENT_DIGEST_CACHE, R._LAUNCH_SOURCE_REVISION_CACHE)]
   with tempfile.TemporaryDirectory() as td:
    base=Path(td); repo=base/"repo"; repo.mkdir(); subprocess.run(["git","init","-q",str(repo)],check=True); subprocess.run(["git","-C",str(repo),"config","user.email","fixture@example.com"],check=True); subprocess.run(["git","-C",str(repo),"config","user.name","Fixture"],check=True); (repo/"x").write_text("x"); subprocess.run(["git","-C",str(repo),"add","x"],check=True); subprocess.run(["git","-C",str(repo),"commit","-qm","init"],check=True)
    art=base/".agent_reports"; art.mkdir(); jobs=base/"jobs.log"; logs=base/"logs"; gate={"spec_read":{"satisfied":True,"source":"codex-fixture"},"drift_verdict":"within-spec","workflow_mode":"tracked","artifact_guard":{"satisfied":True,"source":"codex-fixture"}}
@@ -409,8 +454,19 @@ class CodexSD45(unittest.TestCase):
    path=base/"route.json"; path.write_text(json.dumps(route)); node=next(x for x in route["nodes"] if x["id"]=="execute")
    parent=subprocess.Popen(["sleep","60"]);self.addCleanup(parent.wait);self.addCleanup(parent.kill);parent_start=(Path("/proc")/str(parent.pid)/"stat").read_text().split()[21];jobs.write_text(f"2026-07-23T00:00:00Z\topen\t{repo}\t{repo}\towner\tattempt_schema_version=2,dispatch_depth=1,transport=headless,execution_surface=registered-headless,registered_worker=1,fallback_hop=same-harness-headless,worker_type=owner,harness=codex,runtime_sandbox=workspace-write,attempt_id=att-sd45-parent,pid={parent.pid},pid_start={parent_start}\n")
    args=[sys.executable,str(ROOT/"adapters/codex/bin/dispatch-headless.py"),"--register","--worktree",str(repo),"--slug","codex-sd45","--capability","autopilot-code","--capability-mode","dev","--worker-mode",node["unit"],"--qa","standard","--intensity","strong","--dispatch-depth","2","--parent","owner","--parent-harness","codex","--parent-transport","headless","--parent-sandbox","workspace-write","--nested-eligibility","supported","--eligibility-source","codex-fixture","--fallback-ordinal","1","--route-file",str(path),"--route-id",route["route_id"],"--route-hash",route["route_hash"],"--route-node","execute","--unit",node["unit"],"--registry-digest",route["registry_digest"],"--write-scope",";".join(node["write_scope"]),"--completion-gate",node["completion_gate"],"--model-role",node["role"],"--model-profile",node["model_profile"],"--jobs",str(jobs),"--log-dir",str(logs)]
-   env={**os.environ,"AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(art),"AGENT_DISPATCH_JOBS":str(jobs),"AGENT_DISPATCH_ATTEMPT_ID":"att-sd45-parent"}; ok=subprocess.run(args,text=True,capture_output=True,env=env); self.assertEqual(ok.returncode,0,ok.stdout+ok.stderr); prompt=next(logs.glob("codex-sd45*.codex.prompt.txt")).read_text(); self.assertIn("consume the assigned route only",prompt); self.assertNotIn("preflight.sh route autopilot-code",prompt); self.assertIn(f"unit={node['unit']}",jobs.read_text()); self.assertIn(f"unit={node['unit']}",ok.stdout)
+   env=isolated_dispatch_env(AGENT_HOME=str(ROOT),AGENT_ARTIFACT_ROOT=str(art),AGENT_DISPATCH_JOBS=str(jobs),AGENT_DISPATCH_ATTEMPT_ID="att-sd45-parent"); ok=subprocess.run(args,text=True,capture_output=True,env=env); self.assertEqual(ok.returncode,0,ok.stdout+ok.stderr); prompt=next(logs.glob("codex-sd45*.codex.prompt.txt")).read_text(); self.assertIn("consume the assigned route only",prompt); self.assertNotIn("preflight.sh route autopilot-code",prompt); self.assertIn(f"unit={node['unit']}",jobs.read_text()); self.assertIn(f"unit={node['unit']}",ok.stdout)
    bad=args.copy(); bad[bad.index(";".join(node["write_scope"]))]="spec/**"; denied=subprocess.run(bad,text=True,capture_output=True,env=env); self.assertEqual(denied.returncode,65); self.assertIn("route-node-scope-mismatch",denied.stderr)
+   for field,value in (("resolver_version","unsupported"),("judgment_floor","forged")):
+    forged=json.loads(json.dumps(route));next(n for n in forged["nodes"] if n["id"]=="execute")["profile_selection"][field]=value
+    forged["route_hash"]=R.route_hash(forged);forged["route_id"]="rt-"+forged["route_hash"].split(":")[1][:16]
+    bad_path=base/(field+".json");bad_path.write_text(json.dumps(forged))
+    forged_args=args.copy();forged_args[forged_args.index("--register")]="--start"
+    for flag,new_value in (("--slug","tamper-"+field),("--route-file",str(bad_path)),("--route-id",forged["route_id"]),("--route-hash",forged["route_hash"])):
+     forged_args[forged_args.index(flag)+1]=new_value
+    before=jobs.read_bytes();denied=subprocess.run(forged_args,text=True,capture_output=True,env=env)
+    self.assertNotEqual(denied.returncode,0,denied.stdout+denied.stderr)
+    self.assertIn("child_spawned=0",denied.stdout+denied.stderr)
+    self.assertEqual(jobs.read_bytes(),before)
    legacy=[sys.executable,str(ROOT/"adapters/codex/bin/dispatch-headless.py"),"--dry-run","--worktree",str(repo),"--slug","codex-legacy-scope","--capability","autopilot-code","--mode","dev","--qa","standard","--write-scope","source/**","--model","gpt-test","--reasoning","low","--sandbox","danger-full-access"]
    compatible=subprocess.run(legacy,text=True,capture_output=True,env=env); self.assertEqual(compatible.returncode,0,compatible.stdout+compatible.stderr); self.assertIn("status=dry-run",compatible.stdout)
 

@@ -17,6 +17,86 @@ from pathlib import Path
 from typing import Any, Callable, NamedTuple
 
 from replica_batch_contract import ReplicaBatchContractError, verify_manifest
+from governor_identity import capture_local_identity, create_witness, close_witness, observe_witness, IdentityCaptureError, retained_witness_is_held
+
+
+# Only a handle issued in this process authorizes a new lease's local return.
+# Serialized PID/namespace/nonce values and a foreign live observation do not.
+_LEASE_WITNESSES: dict[tuple[str, str], Any] = {}
+
+
+def _witness_key(root: str | Path, token: str) -> tuple[str, str]:
+    return str(Path(root).resolve()), token
+
+
+def _identity_diagnostic(root: str | Path, record: dict[str, Any]) -> dict[str, Any]:
+    binding = record.get("claimant_witness") if "claimant_witness" in record else record.get("owner_witness")
+    if not isinstance(binding, dict):
+        return {"state": "unknown", "reason": (
+                    "identity-witness-unverifiable" if "claimant_witness" in record or "owner_witness" in record
+                    else "legacy-identity-unverifiable"),
+                "occupied": True, "required_evidence": "issued-token; group return requires original local runner"}
+    observation = observe_witness(root, binding)
+    return {"state": observation.state,
+            "reason": (observation.reason if observation.state == "live" else "identity-witness-unverifiable"),
+            "detail": observation.reason, "occupied": True,
+            "required_evidence": "issued-token and original claimant handle for local return"}
+
+
+def _validate_owner_witness(root: str | Path, binding: Any, pid: int, start: str) -> dict[str, Any]:
+    if not isinstance(binding, dict):
+        raise ValueError("identity-witness-unverifiable: invalid owner binding")
+    identity = binding.get("identity")
+    if (not isinstance(identity, dict) or identity.get("pid") != pid
+            or identity.get("starttime") != start
+            or not isinstance(identity.get("boot_id"), str) or not identity.get("boot_id")
+            or type(identity.get("pid_namespace")) is not int
+            or not isinstance(identity.get("NSpid"), list) or not identity.get("NSpid")
+            or identity["NSpid"][-1] != str(pid)
+            or not isinstance(identity.get("NSpgid"), list) or not identity.get("NSpgid")
+            or not all(isinstance(v, str) and v.isdecimal() for v in identity["NSpid"] + identity["NSpgid"])
+            or binding.get("phase") != "reservation"
+            or binding.get("kind") != "governor-flock-v1"
+            or observe_witness(root, binding).state != "live"):
+        raise ValueError("identity-witness-unverifiable: owner witness conflict")
+    return identity
+
+
+def _local_return_proof(root: str | Path, token: str, lease: dict[str, Any]) -> str | None:
+    binding = lease.get("claimant_witness")
+    handle = _LEASE_WITNESSES.get(_witness_key(root, token))
+    if not isinstance(binding, dict):
+        if "claimant_witness" in lease:
+            return "identity-witness-unverifiable: malformed claimant binding"
+        # Preserve the legacy opaque-token return API only for non-group leases.
+        # A legacy numeric PGID has no namespace-local proof and stays occupied.
+        return "legacy-identity-unverifiable" if lease.get("group_owned") is True else None
+    if (handle is None or handle._closed or handle.creator_pid != os.getpid()
+            or handle.binding() != binding):
+        return "identity-witness-unverifiable: original claimant handle required"
+    try:
+        if not retained_witness_is_held(handle):
+            return "identity-witness-unverifiable: original FD lost"
+        current = capture_local_identity()
+        if any(current.get(key) != handle.identity.get(key) for key in
+               ("pid", "starttime", "boot_id", "pid_namespace", "NSpid", "NSpgid")):
+            return "identity-witness-unverifiable: local identity changed"
+        if observe_witness(root, binding).state != "live":
+            return "identity-witness-unverifiable: witness not held"
+    except IdentityCaptureError as exc:
+        return str(exc)
+    if lease.get("group_owned") is True:
+        if lease.get("pid") != os.getpid() or lease.get("pgid") != os.getpgrp() or os.getpgrp() != os.getpid():
+            return "identity-witness-unverifiable: local group mismatch"
+        group = process_group_observation(os.getpid())
+        if group.reason or group.state == "unverifiable":
+            return "group-observation-incomplete"
+        if any(pid != os.getpid() and state != "Z" for pid, state in group.members):
+            return "group-descendants-live"
+        # The live runner itself must be observed, not merely an empty scan.
+        if (os.getpid(), "Z") in group.members or not any(pid == os.getpid() for pid, _ in group.members):
+            return "group-observation-incomplete"
+    return None
 
 
 # Per-class concurrency caps. A `standard+` cycle occupies its dispatch-depth-1
@@ -173,9 +253,10 @@ def process_group_observation(pgid: int) -> ProcessGroupObservation:
             if int(tail[2]) == pgid:
                 members.append((int(entry.name), tail[0]))
         except FileNotFoundError:
-            continue
+            incomplete = f"procfs-member:{entry.name}:disappeared"
         except OSError as exc:
             if exc.errno in {errno.ENOENT, errno.ESRCH}:
+                incomplete = f"procfs-member:{entry.name}:disappeared"
                 continue
             incomplete = f"procfs-member:{entry.name}:{exc.errno or 'error'}"
         except (IndexError, ValueError):
@@ -279,39 +360,25 @@ def _state_change(root: str | Path, fn: Callable[[dict[str, Any], float], Any]) 
 
         now = time.time()
         data["starts"] = [stamp for stamp in data.get("starts", []) if now - stamp < START_WINDOW_SECONDS]
-        data["leases"] = {
-            token: lease
-            for token, lease in data.get("leases", {}).items()
-            if lease_is_active(lease)
-        }
-        data["reservations"] = {
-            token: reservation
-            for token, reservation in data.get("reservations", {}).items()
-            if isinstance(reservation, dict)
-            and owner_identity_is_active(
-                int(reservation.get("owner_pid", -1)),
-                str(reservation.get("owner_starttime", "")),
-            )
-        }
+        # Process disappearance and namespace observations never authorize
+        # automatic capacity return.  Explicit cancel/release is required.
         # A short-lived runner may finish before its reserving wrapper observes
         # the transfer. Keep a bounded claim receipt while the claimant lease is
         # live, or until the live owner has had a full observation window.
-        data["claims"] = {
-            token: claim
-            for token, claim in data.get("claims", {}).items()
-            if isinstance(claim, dict)
-            and (
-                token in data["leases"]
-                or (
-                    owner_identity_is_active(
-                        int(claim.get("owner_pid", -1)),
-                        str(claim.get("owner_starttime", "")),
-                    )
-                    and now - float(claim.get("released_at") or claim.get("claimed_at", 0))
-                    < CLAIM_RECEIPT_SECONDS
-                )
-            )
-        }
+        # Claim receipts are evidence of a completed transfer.  Their
+        # retention is independent of lease/capacity reclamation.
+        # Expire completed transfer receipts only. This never removes capacity.
+        # A still-held owner witness protects a fast completion until observed.
+        for token, claim in list(data["claims"].items()):
+            if not isinstance(claim, dict):
+                raise ValueError("invalid governor state: malformed claim")
+            released = claim.get("released_at")
+            if (token not in data["leases"] and claim.get("release_proven") is True
+                    and isinstance(released, (int, float)) and not isinstance(released, bool)
+                    and now - released >= CLAIM_RECEIPT_SECONDS):
+                binding = claim.get("owner_witness")
+                if not isinstance(binding, dict) or observe_witness(root, binding).state != "live":
+                    del data["claims"][token]
         result = fn(data, now)
         tmp = root / "state.tmp"
         tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -366,6 +433,8 @@ def acquire(
     starttime = process_starttime(pid)
     if starttime is None:
         raise ValueError("requesting process identity unavailable")
+    identity = capture_local_identity() if pid == os.getpid() else None
+    handle = create_witness(root, "claimant", identity) if identity is not None else None
 
     def operation(data: dict[str, Any], now: float) -> str:
         if process_starttime(pid) != starttime:
@@ -377,12 +446,22 @@ def acquire(
             "pid": pid,
             "starttime": starttime,
             "acquired_at": now,
+            **({"owner_identity": identity} if identity is not None else {}),
+            **({"claimant_identity": identity, "claimant_witness": handle.binding()} if handle is not None else {}),
             **_owned_group_metadata(pid),
         }
         data["starts"].append(now)
         return token
 
-    return _state_change(root, operation)
+    try:
+        token = _state_change(root, operation)
+    except BaseException:
+        if handle is not None:
+            close_witness(handle)
+        raise
+    if handle is not None:
+        _LEASE_WITNESSES[_witness_key(root, token)] = handle
+    return token
 
 
 def _new_token(data: dict[str, Any]) -> str:
@@ -930,6 +1009,7 @@ def reserve(
     budget: int | None = None,
     batch: dict[str, Any] | None = None,
     batch_issuer: _BatchIssuerCapability | None = None,
+    witness_binding: dict[str, Any] | None = None,
 ) -> list[str]:
     """Atomically reserve ``count`` future leases for one live owner process."""
     total, budget = _limits(total, budget)
@@ -937,6 +1017,7 @@ def reserve(
     starttime = process_starttime(pid)
     if starttime is None:
         raise ValueError("reservation owner identity unavailable")
+    identity = capture_local_identity() if pid == os.getpid() else None
     members: list[dict[str, object]] = []
     batch_common: dict[str, Any] = {}
     if batch is not None:
@@ -1028,6 +1109,9 @@ def reserve(
     def operation(data: dict[str, Any], now: float) -> list[str]:
         if process_starttime(pid) != starttime:
             raise ValueError("reservation owner identity changed")
+        owner_identity = identity
+        if witness_binding is not None:
+            owner_identity = _validate_owner_witness(root, witness_binding, pid, starttime)
         _assert_available(root, data, worker_class, total, budget, count)
         tokens = []
         for index in range(count):
@@ -1037,6 +1121,8 @@ def reserve(
                 "owner_pid": pid,
                 "owner_starttime": starttime,
                 "reserved_at": now,
+                **({"owner_identity": owner_identity} if owner_identity is not None else {}),
+                **({"owner_witness": witness_binding} if witness_binding is not None else {}),
             }
             if members:
                 reservation.update(batch_common)
@@ -1102,6 +1188,8 @@ def reservation_check(
                 "state": "unclaimed",
             }
             result.update({key: reservation[key] for key in BATCH_RESERVATION_KEYS if key in reservation})
+            result["identity_observation"] = _identity_diagnostic(root, reservation)
+            result.update({key: reservation[key] for key in ("owner_identity", "owner_witness") if key in reservation})
             return result
         result = {
             "claimant_pid": int(claim["claimant_pid"]),
@@ -1113,6 +1201,9 @@ def reservation_check(
             "state": "claimed",
         }
         result.update({key: claim[key] for key in BATCH_RESERVATION_KEYS if key in claim})
+        result.update({key: claim[key] for key in ("owner_identity", "owner_witness", "claimant_identity", "claimant_witness", "release_proven") if key in claim})
+        if token in data["leases"]:
+            result["identity_observation"] = _identity_diagnostic(root, data["leases"][token])
         return result
 
     return _state_change(root, operation)
@@ -1125,6 +1216,8 @@ def claim_reservation(root: str | Path, token: str, worker_class: str) -> str:
     starttime = process_starttime(pid)
     if starttime is None:
         raise ValueError("requesting process identity unavailable")
+    identity = capture_local_identity()
+    handle = create_witness(root, "claimant", identity)
 
     def operation(data: dict[str, Any], now: float) -> str:
         reservation = data["reservations"].get(token)
@@ -1136,6 +1229,11 @@ def claim_reservation(root: str | Path, token: str, worker_class: str) -> str:
             raise ValueError("reservation class mismatch")
         if process_starttime(pid) != starttime:
             raise ValueError("requesting process identity changed")
+        owner_binding = reservation.get("owner_witness")
+        if owner_binding is not None:
+            _validate_owner_witness(root, owner_binding, int(reservation["owner_pid"]), str(reservation["owner_starttime"]))
+        if capture_local_identity() != identity:
+            raise ValueError("capture-error: claimant identity changed")
         del data["reservations"][token]
         claim = {
             "claimant_pid": pid,
@@ -1145,6 +1243,10 @@ def claim_reservation(root: str | Path, token: str, worker_class: str) -> str:
             "owner_pid": int(reservation["owner_pid"]),
             "owner_starttime": str(reservation["owner_starttime"]),
             "released_at": None,
+            "owner_identity": reservation.get("owner_identity"),
+            "owner_witness": owner_binding,
+            "claimant_identity": identity,
+            "claimant_witness": handle.binding(),
         }
         claim.update({key: reservation[key] for key in BATCH_RESERVATION_KEYS if key in reservation})
         data["claims"][token] = claim
@@ -1154,12 +1256,20 @@ def claim_reservation(root: str | Path, token: str, worker_class: str) -> str:
             "starttime": starttime,
             "acquired_at": now,
             "reserved_at": reservation["reserved_at"],
+            "claimant_identity": identity,
+            "claimant_witness": handle.binding(),
             **_owned_group_metadata(pid),
         }
         data["starts"].append(now)
         return token
 
-    return _state_change(root, operation)
+    try:
+        claimed = _state_change(root, operation)
+    except BaseException:
+        close_witness(handle)
+        raise
+    _LEASE_WITNESSES[_witness_key(root, claimed)] = handle
+    return claimed
 
 
 def cancel_reservation(root: str | Path, token: str) -> bool:
@@ -1174,31 +1284,29 @@ def cancel_reservation(root: str | Path, token: str) -> bool:
     return _state_change(root, operation)
 
 
-def release(root: str | Path, token: str) -> None:
-    def operation(data: dict[str, Any], now: float) -> None:
+def release(root: str | Path, token: str) -> dict[str, Any]:
+    _validate_reservation_token(token)
+    def operation(data: dict[str, Any], now: float) -> dict[str, Any]:
         lease = data["leases"].get(token)
-        release_safe = True
-        if isinstance(lease, dict) and lease.get("group_owned") is True:
-            pid = int(lease.get("pid", -1))
-            pgid = int(lease.get("pgid", -1))
-            group = process_group_observation(pgid)
-            live_descendants = any(
-                member_pid != pid and state != "Z"
-                for member_pid, state in group.members
-            )
-            release_safe = group.state == "empty" or (
-                group.state == "populated"
-                and not live_descendants
-                and not group.reason
-            )
-            if group.state == "unverifiable":
-                release_safe = False
-        if release_safe:
-            data["leases"].pop(token, None)
-        if token in data["claims"] and data["claims"][token].get("released_at") is None:
-            data["claims"][token]["released_at"] = now
-
-    _state_change(root, operation)
+        if lease is None:
+            return {"status": "absent", "release_proven": False}
+        if not isinstance(lease, dict):
+            raise ValueError("invalid governor state: malformed lease")
+        reason = _local_return_proof(root, token, lease)
+        if reason:
+            return {"status": "blocked", "reason": reason, "occupied": True,
+                    "release_proven": False,
+                    "required_evidence": "original local claimant handle and complete group drain"}
+        del data["leases"][token]
+        if token in data["claims"]:
+            data["claims"][token].update(released_at=now, release_proven=True)
+        return {"status": "released", "release_proven": True, "occupied": False}
+    result = _state_change(root, operation)
+    if result["status"] == "released":
+        handle = _LEASE_WITNESSES.pop(_witness_key(root, token), None)
+        if handle is not None:
+            close_witness(handle)
+    return result
 
 
 def main() -> int:
@@ -1224,6 +1332,7 @@ def main() -> int:
     reserve_parser.add_argument("--batch-source-manifest")
     reserve_parser.add_argument("--batch-continuation")
     reserve_parser.add_argument("--batch-replacement-seal")
+    reserve_parser.add_argument("--owner-witness")
     reservation_check_parser = commands.add_parser("reservation-check")
     reservation_check_parser.add_argument("--token", required=True)
     reservation_check_parser.add_argument("--class", dest="worker_class")
@@ -1320,6 +1429,7 @@ def main() -> int:
             args.pid,
             batch=batch,
             batch_issuer=batch_issuer,
+            witness_binding=(json.loads(args.owner_witness) if args.owner_witness else None),
         )
         receipt = {
             "class": args.worker_class,
@@ -1344,9 +1454,16 @@ def main() -> int:
         cancelled = cancel_reservation(args.root, args.token)
         print(f"reservation={'cancelled' if cancelled else 'absent'}")
     elif args.command == "release":
-        release(args.root, args.token)
+        result = release(args.root, args.token)
+        print(json.dumps(result, sort_keys=True))
+        if result["status"] == "blocked":
+            return 75
     elif args.command == "status":
-        print(json.dumps(_state_change(args.root, lambda data, now: data), sort_keys=True))
+        data = _state_change(args.root, lambda data, now: data)
+        diagnostics = [_identity_diagnostic(args.root, row) for row in
+                       [*data["reservations"].values(), *data["leases"].values()][:8]
+                       if isinstance(row, dict)]
+        print(json.dumps({**data, "identity_diagnostics": diagnostics}, sort_keys=True))
     else:
         command = args.command_argv[1:] if args.command_argv[:1] == ["--"] else args.command_argv
         if not command:
@@ -1361,31 +1478,37 @@ def main() -> int:
             token = acquire(args.root, args.worker_class)
         child_env = dict(os.environ)
         child_env.pop(RESERVATION_ENV, None)
+        returned = None
         try:
             child = subprocess.Popen(command, env=child_env)
             return_code = child.wait()
-            if os.getpgrp() == os.getpid():
-                while True:
-                    group = process_group_observation(os.getpid())
-                    if group.state == "empty" or (
-                        group.state == "populated"
-                        and not group.reason
-                        and not any(
-                            member_pid != os.getpid() and state != "Z"
-                            for member_pid, state in group.members
-                        )
-                    ):
-                        break
+            # Keep the existing group-drain wait, but make the single scan
+            # inside release's state lock authoritative. A second scan after
+            # the wait could race unrelated procfs churn and lose the return.
+            while True:
+                returned = release(args.root, token)
+                if returned["status"] == "released":
+                    return return_code
+                if os.getpgrp() == os.getpid() and returned.get("reason") in {
+                    "group-descendants-live", "group-observation-incomplete"
+                }:
                     time.sleep(0.05)
-            return return_code
+                    continue
+                print(json.dumps(returned, sort_keys=True), file=sys.stderr)
+                return 75
         finally:
-            release(args.root, token)
+            if returned is None:
+                # Exceptional unwinding never turns an undrained group into
+                # a successful return; retain its occupied typed blocker.
+                returned = release(args.root, token)
+                if returned["status"] == "blocked":
+                    print(json.dumps(returned, sort_keys=True), file=sys.stderr)
     return 0
 
 
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except ValueError as exc:
+    except (ValueError, IdentityCaptureError) as exc:
         print(f"model-worker-governor: {exc}", file=sys.stderr)
         raise SystemExit(75)

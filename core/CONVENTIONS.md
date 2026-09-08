@@ -136,18 +136,53 @@ subsequent updates preserve it.
 
 Every adapter maps portable roles and execution profiles to runtime models, tools, and prompt profiles as a quality-reproduction contract. A route-bound dispatch always carries both axes; wrappers do not infer the execution budget from role wording or silently inherit the interactive model. Update and read core before changing adapter maps or generated agents.
 
-The portable execution profiles are:
+The portable execution profiles are selected by the independent
+`judgment_requirement × execution_scope` demand resolver; profile names are not
+a scalar quality ranking:
 
-| Profile | Intent | Portable default | Registered topology |
+| Profile | Intent | Adapter budget | Registered topology |
 |---|---|---|---|
-| `deep` | Highest-confidence convergence, critical planning, failure-mode/security judgment | deep tier at `xhigh` | allowed |
-| `balanced-deep` | Deep-model judgment at a lower coordination budget | deep tier at `medium` | allowed |
-| `light` | Low-latency/cost production, structured checking, and broad exploration | light tier at `medium` | allowed |
-| `mini` | Lifecycle, classification, title, or explicitly micro-semantic help | mini tier at `low` | forbidden for substantive registered dispatch-depth-1/2 owner, stage, and review nodes |
+| `deep` | Difficult or uncertain judgment | configured deep budget | allowed |
+| `balanced-deep` | Important judgment requiring extra review headroom | configured important-judgment budget | allowed |
+| `balanced` | Predetermined work with an extended multi-step execution | light model with high execution budget | allowed |
+| `light` | Predetermined, short local execution | configured light budget | allowed |
+| `mini` | Lifecycle, classification, title, or explicitly micro-semantic help | configured micro budget | forbidden for substantive registered dispatch-depth-1/2 owner, stage, and review nodes |
 
-The `quick` one-shot conductor uses `balanced-deep`; every `standard|strong|thorough|adversarial` capability owner uses `deep`. A standard+ node that is both `kind=capability-owner` and `unit=_kernel/owner` carries that same owner budget because it owns a conductor transaction, handback, or synthesis gate. Node meaning and risk—not dispatch depth or role wording alone—select the profile, so ordinary makers, implementers, reviewers, resource runners, and parallel legs retain their task-appropriate budgets. `balanced-deep` remains the ordinary deep-judgment subordinate profile rather than collapsing into `deep`. Route compilation seals `owner_model_profile` and every node/parallel leg `model_profile`; a caller cannot replace a sealed profile with a trailing concrete model or effort. Capacity failover may choose a checked eligible substitute while preserving and reporting the profile intent. Claude and Codex must distinguish all four mappings. Distinctness is a property of the operating point, not of the model: two profiles may resolve to the same concrete model when their effort differs. An adapter without a verified effort/variant axis may collapse `balanced-deep` into `deep` and `mini` into `light` only while reporting which profiles its granularity metadata collapsed; it must not claim four-step parity.
+SD-88 v84 uses one pure resolver for compile and compose. `profile_demand`
+contains `schema_version: 1`, `judgment_requirement`, `execution_scope`, nonempty
+`judgment_reason` and `execution_reason`, and nonempty `evidence_refs`.
+Predetermined work selects light for short-local execution and balanced for
+extended-multistep execution. Important judgment selects balanced-deep at either
+length; difficult-uncertain judgment selects deep at either length. Length alone
+never selects a deep profile. Important explicit deep records additional judgment
+headroom; important permits only balanced-deep/deep, difficult-uncertain only deep,
+and predetermined explicit selection must match its exact cell.
 
-Effort labels are model-relative budgets, not portable performance scores. `deep/xhigh`, `balanced-deep/deep-medium`, `light/medium`, and `mini/light-low` are deliberate distinct operating points. `high|max` remain explicit checked overrides or fallback values, not hidden default tiers.
+The selection records schema/source/resolver_version/demand_digest/resolved_profile/
+judgment_floor/reason. `judgment_floor` is none, balanced-deep, or deep, independently
+of execution length. Compile and compose seal the normalized demand and selection
+for the owner and every realized node/leg; all launch surfaces consume that seal.
+Unknown/partial inputs, empty evidence, version mismatch, or tampering fail before
+spawn. Completely unannotated versioned stages keep their existing profile with
+source=legacy, demand_digest=null, judgment_floor=unknown and
+reason=unannotated-existing-stage. Existing sealed routes retain their original
+bytes/hash. New ad-hoc stages require full demand inputs.
+
+The unannotated quick owner=balanced-deep and standard+ owner=deep are compatibility
+values, never evidence of demand. Existing owner eligibility, QA, intensity, depth,
+peer authority and vendor constraints remain independent. A selected cell that
+conflicts with owner eligibility is a typed rejection, never a silent reassignment.
+Capacity substitution stays inside the sealed profile and eligible vendor band.
+Effort labels are adapter/model-relative operating points, never portable scores.
+OpenCode balanced preserves the selected light point and reports
+`collapsed-balanced-to-light`; explicit supported settings take precedence.
+
+Mixed work crosses an explicit judgment boundary: a judgment node supplies the
+chosen decision, evidence, approved execution scope and stop conditions. A following
+predetermined node references that handoff. New important decisions, out-of-scope
+choices or high uncertainty stop execution and require a newly sealed judgment
+node/route. Only a handoff with no unresolved judgment permits returning to the
+execution cell. Never mutate the existing sealed profile or waive QA on return.
 
 A tier is not obliged to reach for the smallest available model. `mini` names the cheapest *operating point*, and an adapter may realize it by lowering effort on the light-tier model instead of dropping to a smaller one — the right choice when the tier's output feeds later stages, where a weaker model costs more downstream than the effort step saves.
 

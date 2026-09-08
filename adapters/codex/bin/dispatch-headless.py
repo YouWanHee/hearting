@@ -45,6 +45,7 @@ from dispatch_contract import (  # noqa: E402
     claim_attempt_row,
     close_attempt_row,
     completion_marker_gate,
+    ensure_terminal_claim_absent,
     PRELAUNCH_PROCESS_BLOCK_REASONS,
     codex_standard_owner_network_enabled,
     dispatch_state_root,
@@ -70,6 +71,11 @@ from dispatch_contract import (  # noqa: E402
     wait_governor_reservation_claim,
 )
 from dispatch_summary import launch_summary_owner, owner_root  # noqa: E402
+from artifact_producer import (  # noqa: E402
+    ProducerError,
+    prepare_review_output_binding,
+    review_lease_acquire,
+)
 from dispatch_lifecycle import (  # noqa: E402
     DETACHED,
     FOREGROUND_SCOPED,
@@ -89,6 +95,7 @@ from dispatch_mode_contract import (  # noqa: E402
 from owner_route_binding import (  # noqa: E402
     OwnerRouteBindingError,
     binding_from_environment,
+    owner_binding_tuple_failure_fields,
     validate_runtime_requirements,
 )
 from worker_bootstrap import (  # noqa: E402
@@ -239,6 +246,7 @@ def parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--worker-role", help="legacy compatibility metadata; not bootstrap identity")
     p.add_argument("--worker-type", choices=("owner", "stage", "review", "support"))
+    p.add_argument("--review-output", help="exact durable report path for a route-free review worker")
     p.add_argument("--unit", default="", help="catalog unit ref for the assigned route node (roles/units/<unit>.md)")
     p.add_argument("--assigned-contract")
     p.add_argument("--owner", dest="capability_owner")
@@ -1038,6 +1046,23 @@ def _spec_grounding_dir(args: argparse.Namespace) -> Path:
     return Path(args.agent_home) / ".spec-grounding"
 
 
+def spec_read_marker_required(args: argparse.Namespace) -> bool:
+    """The portable worker kernel requires a witnessed governing-PRD read
+    before spec-backed output, including workers without a route binding.
+    Registration carries that obligation; a review persona or network grant
+    does not. Preserve legacy route/owner grants and expose only the marker
+    directory for newly covered registered workers, never agent home.
+    """
+    return bool(
+        getattr(args, "route_id", None)
+        or getattr(args, "nested_headless_network", False)
+        or (
+            getattr(args, "execution_surface", None) == "registered-headless"
+            and getattr(args, "registered_worker", 0) == 1
+        )
+    )
+
+
 def _core_grounding_dir(args: argparse.Namespace) -> Path:
     return Path(args.agent_home) / ".core-grounding"
 
@@ -1112,6 +1137,35 @@ def progress_writable_dirs(args: argparse.Namespace) -> tuple[Path, ...]:
     return (root / "heartbeats", root / "watchdog")
 
 
+def registry_writable_launch(args: argparse.Namespace) -> bool:
+    """SD-OPEN-64: whether this launch needs the whole dispatch state root
+    (registry, `jobs.log`, `completion/<route_id>`), not just the two progress
+    directories above.
+
+    The prior condition (`nested_headless_network` or exactly
+    `dispatch_depth == 2`) was keyed on *dispatching-ness* -- whether this
+    launch spawns a child -- not on whether it closes its own registry row. A
+    quick standard+ depth-1 owner (`att-bccaa2f32dcf4bdb89c5ef48a7fcaa0f`,
+    `route_id=rt-1c3127a326589075`, SD-OPEN-44) is a registered route-bound
+    attempt that must run `capability-route.py complete` on itself, exactly
+    like a depth-2 worker does, but matched neither branch and lost the whole
+    state root. `write_completion_marker`'s `completion/<route_id>` mkdir hit
+    `[Errno 30] Read-only file system` first; a bwrap fixture granting only
+    that one directory (this cycle's SD-64 P-6 measurement) still hits a
+    second EROFS on `jobs.log`/`jobs.log.lock` right after, so a directory-only
+    grant can never be narrower than the state root for any attempt that
+    genuinely completes and closes its own row. The fix keys on *closes its
+    own row*: any attempt bound to a route with a real attempt id, depth
+    irrelevant -- the same scope a depth-2 worker already had, now shared by
+    a depth-1 route-bound owner too.
+    """
+
+    return bool(
+        getattr(args, "nested_headless_network", False)
+        or (getattr(args, "route_id", None) and getattr(args, "command_attempt_id", None))
+    )
+
+
 def ensure_owner_writable_dirs(args: argparse.Namespace) -> None:
     """Create every directory this launch will grant sandbox write access to,
     once, before the child command is built. A query function (above) never
@@ -1121,10 +1175,11 @@ def ensure_owner_writable_dirs(args: argparse.Namespace) -> None:
     to_create = list(progress_writable_dirs(args))
     if getattr(args, "nested_headless_network", False):
         to_create.append(owner_root())
+    if spec_read_marker_required(args):
+        to_create.append(_spec_grounding_dir(args))
     if getattr(args, "route_id", None) or getattr(
         args, "nested_headless_network", False
     ):
-        to_create.append(_spec_grounding_dir(args))
         to_create.append(_core_grounding_dir(args))
     for path in to_create:
         try:
@@ -1197,6 +1252,11 @@ def codex_app_server_available() -> bool:
 
 
 def resolve_completion_delivery(args: argparse.Namespace) -> str:
+    """SD-OPEN-63 (3.1): Codex's `codex_app_server_available()` is already an
+    exit-code feature probe, not a help-string substring match, so its
+    judgment mechanism is unchanged. Only the reason is now sealed onto
+    `args.completion_delivery_reason` so an auto degrade to `poll-fallback`
+    carries the same preserved-evidence contract as the Claude adapter."""
     requested = args.completion_delivery
     if not _completion_owner(args):
         if requested == "supervised":
@@ -1208,12 +1268,14 @@ def resolve_completion_delivery(args: argparse.Namespace) -> str:
     if requested == "poll":
         return "poll-fallback"
     if codex_app_server_available():
+        args.completion_delivery_reason = "ok"
         return "app-server-supervised"
     if requested == "supervised":
         raise DispatchContractError(
             "codex-app-server-unavailable",
             "codex app-server --help did not pass; no owner attempt was launched",
         )
+    args.completion_delivery_reason = "codex-app-server-unavailable"
     return "poll-fallback"
 
 
@@ -1263,9 +1325,7 @@ def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -
             ]
         if getattr(args, "max_continuations", None) is not None:
             command += ["--max-continuations", str(args.max_continuations)]
-        if args.nested_headless_network or (
-            args.dispatch_depth == 2 and args.route_id and getattr(args, "command_attempt_id", None)
-        ):
+        if registry_writable_launch(args):
             command += [
                 "--writable-root",
                 str(dispatch_state_root(args.jobs_path)),
@@ -1278,7 +1338,7 @@ def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -
                 command += ["--writable-root", str(progress_dir)]
         for writable_dir in nested_owner_writable_dirs(args):
             command += ["--writable-root", str(writable_dir)]
-        if args.route_id or args.nested_headless_network:
+        if spec_read_marker_required(args):
             command += ["--writable-root", str(_spec_grounding_dir(args))]
         for writable_dir in route_bound_worker_writable_dirs(args):
             command += ["--writable-root", str(writable_dir)]
@@ -1310,11 +1370,12 @@ def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -
     ]
     if getattr(args, "report_bundle_root", None) is not None:
         cmd += ["--add-dir", str(args.report_bundle_root)]
-    if args.nested_headless_network or (args.dispatch_depth == 2 and args.route_id and getattr(args, "command_attempt_id", None)):
+    if registry_writable_launch(args):
         # A dispatch-depth-1 conductor must update the canonical attempt registry and
         # materialize child prompt/transcript files under the canonical dispatch
-        # state root. A route-bound dispatch-depth-2 stage needs the same narrow
-        # writable root for its own SD-58 heartbeat. Network remains owner-only below.
+        # state root. A route-bound worker (depth-1 quick owner or depth-2 stage)
+        # needs the same root for its own `complete`/close (SD-OPEN-64). Network
+        # remains owner-only below.
         cmd += [
             "--add-dir",
             str(dispatch_state_root(args.jobs_path)),
@@ -1330,11 +1391,8 @@ def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -
         # Core read markers and Claude's Bash pre-exec snapshot are the only
         # home-scoped writes needed by a recursive standard+ Codex owner.
         cmd += ["--add-dir", str(writable_dir)]
-    if args.route_id or args.nested_headless_network:
-        # SD-69: a route-bound worker needs the exact primary spec-grounding
-        # marker directory writable (and SD-72 grants a standard+ owner the
-        # same directory unconditionally, route or not — review F-3).
-        # Intentionally narrow — never all of agent home.
+    if spec_read_marker_required(args):
+        # The same read obligation and exact grant as the supervisor builder.
         cmd += ["--add-dir", str(_spec_grounding_dir(args))]
     for writable_dir in route_bound_worker_writable_dirs(args):
         # SD-72: an ordinary route-bound depth-2 worker also runs the portable
@@ -1509,6 +1567,63 @@ def _route_node_leg_fields(args):
     return "-", "-"
 
 
+def prepare_review_output_request(args) -> None:
+    args.review_output_binding = None
+    args.review_governed_lease_nonce = ""
+    if not args.review_output:
+        return
+    if (
+        args.dispatch_depth != 1
+        or args.worker_type != "review"
+        or args.unit != "qa/code-review"
+        or args.capability != "autopilot-code"
+        or args.execution_surface != "registered-headless"
+        or not args.registered_worker
+        or args.route_file
+        or getattr(args, "owner_route_binding", None)
+    ):
+        raise ProducerError("review-output-tuple-invalid")
+    cycle_id = os.environ.get("AGENT_ARTIFACT_CYCLE_ID", "")
+    producer_id = os.environ.get("AGENT_ARTIFACT_PRODUCER_ID", "")
+    if not cycle_id or not producer_id:
+        raise ProducerError("review-output-cycle-binding-missing")
+    args.review_output_binding = prepare_review_output_binding(
+        Path(args.artifact_root), cycle_id=cycle_id,
+        producer_id=producer_id, attempt_id=args.attempt_id,
+        review_output=args.review_output, capability=args.capability,
+        unit=args.unit, worktree=args.worktree,
+    )
+    args.review_governed_lease_nonce = secrets.token_hex(32)
+
+
+def acquire_review_lease_after_claim(
+    args, jobs: Path, identity: dict[str, str]
+) -> dict[str, str]:
+    if not args.review_output:
+        return {}
+    binding = args.review_output_binding
+    result = review_lease_acquire(
+        Path(args.artifact_root), cycle_id=binding["cycle_id"],
+        attempt_id=args.attempt_id, review_output=binding["output_path"],
+        binding=binding, governed_identity=identity, jobs=jobs,
+    )
+    return dict(result.get("registry_metadata") or {})
+
+
+def attach_summary_owner(args, log_path: Path, prompt_path: Path, identity):
+    review = args.review_output_binding
+    return launch_summary_owner(
+        attempt_id=args.attempt_id,
+        harness="codex",
+        transcript=log_path,
+        prompt_path=prompt_path,
+        target_pid=int(identity["pid"]),
+        target_start=identity["pid_start"],
+        review_artifact_root=review["artifact_root"] if review else None,
+        review_cycle_id=review["cycle_id"] if review else None,
+        review_lease_nonce=args.review_governed_lease_nonce if review else None,
+    )
+
 def append_job(jobs: Path, args: argparse.Namespace) -> bool:
     repo = subprocess.check_output(["git", "-C", args.worktree, "rev-parse", "--show-toplevel"], text=True).strip()
     pipe = (
@@ -1519,6 +1634,7 @@ def append_job(jobs: Path, args: argparse.Namespace) -> bool:
         f"registered_worker={int(bool(args.registered_worker))},"
         f"fallback_hop={args.fallback_hop},harness=codex,"
         f"completion_delivery={args.resolved_completion_delivery},"
+        f"completion_delivery_reason={getattr(args, 'completion_delivery_reason', 'not-applicable')},"
         f"parent_completion_delivery={args.parent_completion_delivery},"
         f"parent_completion_reason={getattr(args, 'parent_completion_reason', 'unspecified')}"
     )
@@ -1570,6 +1686,15 @@ def append_job(jobs: Path, args: argparse.Namespace) -> bool:
     pipe += f",assigned_contract={args.assigned_contract}"
     if args.unit:
         pipe += f",unit={args.unit}"
+    if args.review_output:
+        binding = args.review_output_binding
+        pipe += (
+            f",review_cycle_id={binding['cycle_id']}"
+            f",review_producer_id={binding['producer_id']}"
+            f",review_output_locator_b64={binding['locator_b64']}"
+            f",review_output_digest={binding['digest']}"
+        )
+
     if args.capability_owner:
         pipe += f",owner={args.capability_owner}"
     if args.owner_harness:
@@ -1599,6 +1724,8 @@ def append_job(jobs: Path, args: argparse.Namespace) -> bool:
             f",owner_route_hash={args.owner_route_binding.route_hash}"
         )
     settings = args.resolved_model_settings
+    for key, value in sorted(getattr(args, "profile_selection_receipt", {}).items()):
+        pipe += f",{key}={value}"
     pipe += (
         f",model_source={settings['source']},model_role={settings['role']}"
         f",model_profile={settings['profile']},model_tier={settings['tier']}"
@@ -1616,6 +1743,8 @@ def append_job(jobs: Path, args: argparse.Namespace) -> bool:
         f",artifact_root={args.artifact_root},log_file={args.log_path}"
         f",launch_home={sealed_launch_home(args.agent_home)}"
     )
+    if getattr(args, "codex_home", None) is not None and not getattr(args, "codex_home_legacy_unsealed", False):
+        pipe += f",codex_home={args.codex_home}"
     pipe += stage_session_metadata(args)
     if args.attempt_id:
         pipe += (
@@ -1660,6 +1789,9 @@ def append_job(jobs: Path, args: argparse.Namespace) -> bool:
             attempt_id=args.attempt_id,
         )
     args.launch_preclaim = preclaim
+    mutation_precheck = lambda lines: ensure_terminal_claim_absent(
+        jobs, args.route_id, args.parent_attempt_id or args.attempt_id
+    )
     return claim_attempt_row(
         jobs, args.attempt_id, row, launch=False,
         exclusive_metadata=exclusive,
@@ -1667,7 +1799,8 @@ def append_job(jobs: Path, args: argparse.Namespace) -> bool:
         terminal_attempt_limit=getattr(args, "quick_attempt_limit", None),
         replacement_attempt_limit=getattr(args, "replacement_attempt_limit", 0),
         replacement_notes=getattr(args, "replacement_notes", frozenset()),
-        preclaim=None,
+        mutation_precheck=mutation_precheck,
+        preclaim=preclaim,
     )
 
 
@@ -1682,18 +1815,68 @@ def nested_headless_network_enabled(args: argparse.Namespace) -> bool:
     )
 
 
-def prepare_nested_codex_home(worktree: Path, source_home: Path | None = None) -> Path:
+def _attempt_home_binding(jobs: Path, attempt_id: str | None):
+    """Read one exact binding; duplicate rows never grant home authority."""
+    if not attempt_id or not jobs.exists():
+        return None
+    matches = []
+    for line in jobs.read_text(encoding="utf-8").splitlines():
+        fields = line.split("\t")
+        if len(fields) != 6:
+            raise DispatchContractError("codex-home-registry-invalid", str(jobs))
+        metadata = parse_registry_metadata(fields[5])
+        if metadata.get("attempt_id") == attempt_id:
+            if sum(part.startswith("codex_home=") for part in fields[5].split(",")) > 1:
+                raise DispatchContractError("codex-home-binding-ambiguous", attempt_id)
+            matches.append((fields, metadata))
+    if len(matches) > 1:
+        raise DispatchContractError("codex-home-binding-ambiguous", attempt_id)
+    return matches[0] if matches else None
+
+
+def select_codex_home(args, worktree: Path, jobs: Path) -> Path:
+    """Select without writing; append_job's immutable identity seals the result."""
+    def checked(value):
+        if not value or not Path(value).is_absolute() or any(c in value for c in ",\t\n\r"):
+            raise DispatchContractError("codex-home-binding-invalid", str(value))
+        return Path(value)
+
+    existing = _attempt_home_binding(jobs, getattr(args, "attempt_id", None))
+    if existing:
+        fields, metadata = existing
+        args.codex_home_legacy_unsealed = "codex_home" not in metadata
+        if metadata.get("codex_home"):
+            return checked(metadata["codex_home"])
+        if args.nested_headless_network:
+            return checked(str(Path(fields[3]) / ".dispatch/nested-codex-home"))
+    if getattr(args, "dispatch_depth", 1) == 2 and getattr(args, "parent_harness", None) == "codex":
+        parent_id = getattr(args, "parent_attempt_id", None)
+        parent = _attempt_home_binding(jobs, parent_id)
+        if parent:
+            fields, metadata = parent
+            home = metadata.get("codex_home") or str(Path(fields[3]) / ".dispatch/nested-codex-home")
+            return checked(home)
+        if getattr(args, "action", None) != "dry-run":
+            raise DispatchContractError("codex-parent-home-binding-missing", str(parent_id))
+    if args.nested_headless_network:
+        return checked(str(worktree / ".dispatch/nested-codex-home-v2"))
+    if args.profile:
+        return checked(str(dispatch_state_root(jobs) / "homes" / f"{args.slug}.{args.profile}"))
+    return checked(str(Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser().absolute()))
+
+
+def prepare_nested_codex_home(worktree: Path, source_home: Path | None = None, *, destination: Path | None = None) -> Path:
     """Create a writable Codex home inside the owner's sandbox.
 
     Recursive ``codex exec`` needs to write session/app-server state. Pointing
     it at the user's normal CODEX_HOME fails under workspace-write even when
     network is enabled. The projection keeps mutable state inside the owner
-    worktree, links the existing credential/config read-only, and installs only
+    worktree, links the existing credential/config without modifying them, and installs only
     harness-owned runtime links. Credentials are never copied or modified.
     """
 
     source = (source_home or Path(os.environ.get("CODEX_HOME", "~/.codex"))).expanduser().resolve()
-    destination = worktree / ".dispatch" / "nested-codex-home"
+    destination = destination if destination is not None else worktree / ".dispatch" / "nested-codex-home-v2"
     # The nested helper validates every destination component before creating
     # or changing directories. Do not mkdir/chmod an unchecked symlink here.
 
@@ -1919,9 +2102,9 @@ def resolve_agent_home() -> Path:
     return _resolve_agent_home(runtime_pointer=Path.home() / ".codex" / "hearting")
 
 
-def ensure_runtime_home_projection(worktree: Path) -> Path | None:
+def ensure_runtime_home_projection(worktree: Path, runtime_home: Path | None = None) -> Path | None:
     """Expose the active Codex session store to Fleet without copying runtime state."""
-    runtime_home = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser().resolve()
+    runtime_home = runtime_home or Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser().resolve()
     link = worktree / ".dispatch" / "codex-home"
     try:
         link.parent.mkdir(parents=True, exist_ok=True)
@@ -2263,10 +2446,11 @@ def main(argv: list[str]) -> int:
             intensity=args.intensity,
             harness="codex",
         )
-        if args.owner_route_binding and (
-            args.dispatch_depth != 1 or args.worker_type != "owner" or args.route_file
-        ):
-            raise OwnerRouteBindingError("owner-route-binding-tuple-invalid")
+        if args.owner_route_binding:
+            failure_fields = owner_binding_tuple_failure_fields(
+                dispatch_depth=args.dispatch_depth, worker_type=args.worker_type, route_file=args.route_file)
+            if failure_fields:
+                return fail("owner-route-binding-tuple-invalid", 65, child_spawned="0", **failure_fields)
     except OwnerRouteBindingError as exc:
         return fail(str(exc), 65, child_spawned="0")
     rc = validate_route_record(args)
@@ -2321,6 +2505,11 @@ def main(argv: list[str]) -> int:
     args.replacement_notes = attempt_policy["replacement_notes"]
     try:
         args.resolved_model_settings = resolve_model_settings(args)
+        from model_profile import selection_receipt, ModelProfileError
+        try:
+            args.profile_selection_receipt = selection_receipt(args)
+        except (ModelProfileError, OSError, ValueError) as exc:
+            return fail(getattr(exc, "reason", "profile-selection-invalid"), 65, child_spawned="0")
     except ModelSelectionError as e:
         fields = {"detail": str(e)}
         if args.model_role:
@@ -2379,8 +2568,6 @@ def main(argv: list[str]) -> int:
             profile_home = home_root / f"{args.slug}.{args.profile}"
 
     runtime_home_projection = None
-    if args.start and profile_home is None:
-        runtime_home_projection = ensure_runtime_home_projection(worktree)
 
     agent_home = args.agent_home
     try:
@@ -2392,6 +2579,13 @@ def main(argv: list[str]) -> int:
             ensure_global_registry_writable(jobs)
     except DispatchContractError as e:
         return fail(e.reason, 73, detail=e.detail, child_spawned="0")
+    try:
+        prepare_review_output_request(args)
+    except ProducerError as exc:
+        return fail(
+            exc.code, 65, detail=exc.detail, registry_mutation="0",
+            child_spawned="0",
+        )
     try:
         bind_stage_session(args, artifact_root=args.artifact_root, action=action)
     except DispatchContractError as e:
@@ -2448,6 +2642,7 @@ def main(argv: list[str]) -> int:
         profile_type=profile_worker_type(ROOT, args.profile),
     )
     args.jobs_path = jobs
+    args.completion_delivery_reason = "not-applicable"
     try:
         args.resolved_completion_delivery = resolve_completion_delivery(args)
         if args.resolved_completion_delivery == "app-server-supervised":
@@ -2490,17 +2685,12 @@ def main(argv: list[str]) -> int:
             linked_worktree_git_writable_dirs(args),
             (
                 (_spec_grounding_dir(args),)
-                if args.route_id or args.nested_headless_network
+                if spec_read_marker_required(args)
                 else ()
             ),
             (
                 (dispatch_state_root(args.jobs_path),)
-                if args.nested_headless_network
-                or (
-                    args.dispatch_depth == 2
-                    and args.route_id
-                    and getattr(args, "command_attempt_id", None)
-                )
+                if registry_writable_launch(args)
                 else ()
             ),
         )
@@ -2532,13 +2722,17 @@ def main(argv: list[str]) -> int:
     except DispatchContractError as e:
         return fail(e.reason, 73, detail=e.detail, child_spawned="0")
     args.nested_codex_home = None
-    args.nested_codex_home_path = (
-        worktree / ".dispatch" / "nested-codex-home"
-        if args.nested_headless_network else None
-    )
+    try:
+        args.codex_home = select_codex_home(args, worktree, jobs)
+    except (DispatchContractError, OSError) as exc:
+        return fail(getattr(exc, "reason", "codex-home-binding-unreadable"), 73,
+                    detail=str(exc), child_spawned="0")
+    args.nested_codex_home_path = args.codex_home if args.nested_headless_network else None
+    if action == "start" and profile_home is None:
+        runtime_home_projection = ensure_runtime_home_projection(worktree, args.codex_home)
     if action == "start" and args.nested_headless_network:
         try:
-            args.nested_codex_home = prepare_nested_codex_home(worktree)
+            args.nested_codex_home = prepare_nested_codex_home(worktree, destination=args.codex_home)
         except DispatchContractError as e:
             return fail(e.reason, 73, detail=e.detail, child_spawned="0")
     prompt_name = (
@@ -2657,6 +2851,22 @@ def main(argv: list[str]) -> int:
             "AGENT_DISPATCH_OWNER": args.capability_owner or "",
             "AGENT_DISPATCH_OWNER_HARNESS": args.owner_harness or "",
             "AGENT_ARTIFACT_ROOT": args.artifact_root,
+            "AGENT_DISPATCH_WORKTREE": (
+                args.review_output_binding["worktree"]
+                if args.review_output_binding else args.worktree
+            ),
+            "AGENT_REVIEW_CYCLE_ID": (
+                args.review_output_binding["cycle_id"]
+                if args.review_output_binding else ""
+            ),
+            "AGENT_REVIEW_PRODUCER_ID": (
+                args.review_output_binding["producer_id"]
+                if args.review_output_binding else ""
+            ),
+            "AGENT_REVIEW_OUTPUT": (
+                args.review_output_binding["output_path"]
+                if args.review_output_binding else ""
+            ),
             # W7C producer lifecycle: the owner's open cycle (issued by
             # `artifact_producer.py begin` before the first write) is passed
             # through unchanged so stage workers write into the same
@@ -2716,10 +2926,7 @@ def main(argv: list[str]) -> int:
         else:
             dispatch_env.pop("AGENT_DISPATCH_COMPLETION_STATE_FILE", None)
             dispatch_env.pop("AGENT_DISPATCH_SUPERVISOR_LEASE_FILE", None)
-        if args.nested_codex_home is not None:
-            dispatch_env["CODEX_HOME"] = str(args.nested_codex_home)
-        elif profile_home is not None:
-            dispatch_env["CODEX_HOME"] = str(profile_home)
+        dispatch_env["CODEX_HOME"] = str(args.codex_home)
         launch_parent_completion_sidecar(args, jobs)
         if args.managed_sidecar_state == "launch-failed":
             annotate_attempt_row(
@@ -2797,14 +3004,10 @@ def main(argv: list[str]) -> int:
                 spawn=spawn_worker,
                 launch_metadata=launch_metadata,
                 preclaim=getattr(args, "launch_preclaim", None),
-                pre_release=lambda identity: launch_summary_owner(
-                    attempt_id=args.attempt_id,
-                    harness="codex",
-                    transcript=log_path,
-                    prompt_path=prompt_path,
-                    target_pid=int(identity["pid"]),
-                    target_start=identity["pid_start"],
+                pre_release=lambda identity: attach_summary_owner(
+                    args, log_path, prompt_path, identity
                 ),
+                post_claim=lambda identity: acquire_review_lease_after_claim(args, jobs, identity),
             )
         except DispatchContractError as exc:
             for fd in (fence_failure_read_fd, fence_failure_write_fd):
@@ -3028,16 +3231,26 @@ def main(argv: list[str]) -> int:
                 if terminal.get("state") == "valid"
                 else ""
             )
-            if outcome.failure and terminal.get("state") == "valid" and not terminal_note:
-                terminal_note = "completed-terminal-handoff"
+            # SD-72: an envelope is a semantic observation, not an OS exit
+            # receipt. Preserve the actual failure even when the final text
+            # says PASS (or reports a completed blocking review).
+            if outcome.failure:
+                terminal_note = f"dead-{outcome.failure}"
             terminal_closed = False
             if terminal_note:
                 terminal_evidence = {
                     "detected_by": "foreground-terminal-handoff",
-                    "failure_class": terminal["failure_class"],
-                    "terminal_event": terminal["terminal_event"],
+                    "failure_class": terminal.get("failure_class", "runtime"),
+                    "terminal_event": terminal.get("terminal_event", "-"),
                     "log_file": str(log_path),
+                    "process_exit": str(outcome.exit_code),
                 }
+                if outcome.failure:
+                    terminal_evidence.update(
+                        detected_by="foreground-process-exit",
+                        failure_class="runtime",
+                        reconcile_reason=outcome.failure,
+                    )
                 if terminal_note == REVIEW_BLOCKING_NOTE and terminal.get("artifact_path_b64"):
                     # OPERATIONS §5.10: seal the named review artifact like the join does.
                     terminal_evidence["review_artifact_b64"] = str(terminal["artifact_path_b64"])
@@ -3049,7 +3262,7 @@ def main(argv: list[str]) -> int:
                 )
                 if terminal_closed:
                     materialize_after_terminal_close(jobs, args.attempt_id)
-                args.worker_failure = terminal_note
+                args.worker_failure = outcome.failure or terminal_note
             if outcome.failure and not terminal_closed:
                 close_job_row(
                     jobs, args.slug, args.worktree, outcome.failure, "", args.attempt_id
@@ -3087,6 +3300,7 @@ def main(argv: list[str]) -> int:
     print("adapter=codex")
     print("runtime_surface=codex-exec-headless")
     print(f"completion_delivery={args.resolved_completion_delivery}")
+    print(f"completion_delivery_reason={getattr(args, 'completion_delivery_reason', 'not-applicable')}")
     print(f"parent_completion_delivery={args.parent_completion_delivery}")
     print(f"parent_completion_reason={getattr(args, 'parent_completion_reason', 'unspecified')}")
     print(f"parent_completion_reason_class={getattr(args, 'parent_completion_reason_class', '-')}")
@@ -3132,6 +3346,8 @@ def main(argv: list[str]) -> int:
     print(f"model_profile={settings['profile']}")
     print(f"model_tier={settings['tier']}")
     print(f"profile_granularity={settings['granularity']}")
+    for key, value in sorted(getattr(args, "profile_selection_receipt", {}).items()):
+        print(f"{key}={value}")
     print(f"model={settings['model']}")
     print(f"reasoning={settings['reasoning']}")
     print(f"approval={args.approval}")

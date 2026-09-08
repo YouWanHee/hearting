@@ -35,6 +35,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -434,22 +435,33 @@ def failure_signature(result: SuiteResult) -> str:
     return f"{classify_kind(result)}:{line}" if line else classify_kind(result)
 
 
-def extract_failing_test_ids(stdout: str, stderr: str) -> list[str]:
-    """Parse unittest-style 'FAIL: test_x (module.Class)' / 'ERROR: ...' lines
-    into `Class.test_method` ids. Falls back to no per-test ids (whole-file
-    granularity) when nothing recognizable is present — that is expected for
-    *.test.sh suites and any suite not using unittest's default reporter.
-    """
-    ids: list[str] = []
+def extract_failing_test_kinds(stdout: str, stderr: str) -> dict[str, str]:
+    """Keep each unittest row's FAIL/ERROR kind, including mixed suites."""
+    kinds: dict[str, str] = {}
     for blob in (stdout, stderr):
-        for m in _UNITTEST_FAIL_RE.finditer(blob or ""):
-            method, qualname = m.group(2), m.group(3)
-            # qualname is "module.Class.method" (or "module.method" for a
-            # bare function test) — the class is the second-to-last segment.
+        for match in _UNITTEST_FAIL_RE.finditer(blob or ""):
+            method, qualname = match.group(2), match.group(3)
             parts = qualname.split(".")
             cls = parts[-2] if len(parts) >= 2 else parts[-1]
-            ids.append(f"{cls}.{method}")
-    return sorted(set(ids))
+            test_id = f"{cls}.{method}"
+            kind = "error" if match.group(1) == "ERROR" else "assertion"
+            if kinds.get(test_id) != "error":
+                kinds[test_id] = kind
+    return kinds
+
+
+def extract_failing_test_ids(stdout: str, stderr: str) -> list[str]:
+    return sorted(extract_failing_test_kinds(stdout, stderr))
+
+
+def test_failure_kind(result: SuiteResult, test_id: str) -> str:
+    # A suite-wide timeout still wins. Whole-file rows retain the aggregate
+    # kind; named rows use their own reporter header, not a peer's exception.
+    if not result.timed_out and test_id != "-":
+        kind = extract_failing_test_kinds(result.stdout, result.stderr).get(test_id)
+        if kind:
+            return kind
+    return classify_kind(result)
 
 
 LIVE_STATE_ROOT = Path(os.path.expanduser("~")) / ".local" / "state" / "hearting"
@@ -698,13 +710,24 @@ def last_nonempty_line(text: str) -> str:
 def classify_kind(result: SuiteResult) -> str:
     if result.timed_out:
         return "timeout"
-    stderr_tail = (result.stderr or "")
-    if "AssertionError" in stderr_tail or re.search(r"\bFAILED\b", stderr_tail):
-        return "assertion"
-    if re.search(r"(command not found|No such file or directory).*\b(binary|executable)?\b", stderr_tail, re.IGNORECASE) or \
-       re.search(r": command not found$", last_nonempty_line(stderr_tail)):
+    captured = "\n".join((result.stderr or "", result.stdout or ""))
+    if re.search(r"(command not found|No such file or directory).*\b(binary|executable)?\b", captured, re.IGNORECASE) or \
+       re.search(r": command not found$", last_nonempty_line(captured)):
         return "missing-binary"
-    if re.search(r"(Traceback|ImportError|ModuleNotFoundError|SyntaxError|CollectionError)", stderr_tail):
+    # unittest ends both failures and errors with the word "FAILED".  That
+    # summary word alone carries no failure kind: ERROR headers/errors=N mean
+    # the test did not complete normally, while FAIL headers/failures=N and an
+    # AssertionError identify a completed assertion failure.  Error wins for a
+    # mixed run so a runner/setup error cannot hide behind a peer assertion.
+    if re.search(r"^ERROR:\s+", captured, re.MULTILINE) or re.search(
+        r"\bFAILED\s*\([^)]*\berrors?=\d+", captured
+    ):
+        return "error"
+    if "AssertionError" in captured or re.search(
+        r"^FAIL:\s+", captured, re.MULTILINE
+    ) or re.search(r"\bFAILED\s*\([^)]*\bfailures?=\d+", captured):
+        return "assertion"
+    if re.search(r"(Traceback|ImportError|ModuleNotFoundError|SyntaxError|CollectionError)", captured):
         return "error"
     return "exit-nonzero"
 
@@ -928,6 +951,7 @@ def classify_result(
 
     # Per-test failure ids available.
     for test_id in failing_ids:
+        kind = test_failure_kind(result, test_id)
         row = specific_entries.get(test_id) or whole_file_entry
         if row is None:
             was_foreign = test_id in foreign_specific or foreign_whole_file
@@ -985,6 +1009,101 @@ def write_report(path: Path, rows: list[dict[str, str]]) -> None:
         fh.write("\t".join(REPORT_COLUMNS) + "\n")
         for row in rows:
             fh.write("\t".join(str(row.get(c, "")) for c in REPORT_COLUMNS) + "\n")
+
+
+DIAGNOSTIC_INDEX_COLUMNS = [
+    "suite_path",
+    "attempt",
+    "returncode",
+    "timed_out",
+    "kind",
+    "isolation_profile",
+    "duration_s",
+    "stdout_path",
+    "stderr_path",
+]
+
+
+def _write_diagnostic_text(directory_fd: int, name: str, text: str) -> None:
+    # Open relative to a pinned directory; reject symlinks and special/hardlinked
+    # files before truncation. O_NONBLOCK also prevents a planted FIFO hanging CI.
+    fd = os.open(
+        name, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+        0o600, dir_fd=directory_fd,
+    )
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise OSError(f"diagnostic is not a private regular file: {name}")
+        os.ftruncate(fd, 0)
+        with os.fdopen(fd, "w", encoding="utf-8", closefd=False) as handle:
+            handle.write(text)
+    finally:
+        os.close(fd)
+
+
+def write_failure_diagnostics(
+    path: Path, results_by_suite: dict[str, list[SuiteResult]]
+) -> tuple[int, int]:
+    """Persist every attempt for suites with at least one failed attempt.
+
+    A digest-prefixed directory keeps arbitrary suite names from becoming
+    paths while the index retains the exact repository-relative name.  Passing
+    retries are intentionally retained beside their failed peer: without them
+    a flaky aggregate cannot be reconstructed from the CI artifact.
+    """
+    path.mkdir(parents=True, exist_ok=True)
+    root_fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    rows: list[dict[str, str]] = []
+    failing_suites = 0
+    try:
+        for suite_path in sorted(results_by_suite):
+            attempts = results_by_suite[suite_path]
+            if not any(not attempt.passed for attempt in attempts):
+                continue
+            failing_suites += 1
+            safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", Path(suite_path).name)[:80]
+            digest = hashlib.sha256(suite_path.encode("utf-8")).hexdigest()[:12]
+            suite_name = f"{digest}-{safe_name or 'suite'}"
+            try:
+                os.mkdir(suite_name, mode=0o700, dir_fd=root_fd)
+            except FileExistsError:
+                pass
+            suite_fd = os.open(
+                suite_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=root_fd,
+            )
+            try:
+                for attempt_number, result in enumerate(attempts, start=1):
+                    prefix = f"attempt-{attempt_number:03d}"
+                    stdout_name = f"{prefix}.stdout.txt"
+                    stderr_name = f"{prefix}.stderr.txt"
+                    _write_diagnostic_text(suite_fd, stdout_name, result.stdout or "")
+                    _write_diagnostic_text(suite_fd, stderr_name, result.stderr or "")
+                    rows.append(
+                        {
+                            "suite_path": suite_path,
+                            "attempt": str(attempt_number),
+                            "returncode": str(result.returncode),
+                            "timed_out": "1" if result.timed_out else "0",
+                            "kind": classify_kind(result) if not result.passed else "",
+                            "isolation_profile": result.profile,
+                            "duration_s": f"{result.duration_s:.2f}",
+                            "stdout_path": f"{suite_name}/{stdout_name}",
+                            "stderr_path": f"{suite_name}/{stderr_name}",
+                        }
+                    )
+            finally:
+                os.close(suite_fd)
+        index_text = "\t".join(DIAGNOSTIC_INDEX_COLUMNS) + "\n"
+        index_text += "".join(
+            "\t".join(row[column] for column in DIAGNOSTIC_INDEX_COLUMNS) + "\n"
+            for row in rows
+        )
+        _write_diagnostic_text(root_fd, "index.tsv", index_text)
+    finally:
+        os.close(root_fd)
+    return failing_suites, len(rows)
 
 
 SEED_VERDICTS = {"FAIL", "TIMEOUT", "ERROR", "EXPIRED", "KIND-MISMATCH"}
@@ -1098,9 +1217,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--census", action="store_true")
     p.add_argument("--select", action="append", default=[])
     p.add_argument("--exclude", action="append", default=[])
-    p.add_argument("--jobs", type=int, default=DEFAULT_JOBS)
+    p.add_argument(
+        "--jobs", type=int, default=DEFAULT_JOBS,
+        help="parallel suite count (full repository runs are capped at 4)",
+    )
     p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
-    p.add_argument("--retries", type=int, default=0, help="extra attempts for flaky-timing baseline suites")
+    p.add_argument(
+        "--retries", type=int, default=0,
+        help="extra attempts for flaky-timing baseline suites; full repository runs require at least 1",
+    )
     p.add_argument(
         "--retry-budget", type=int, default=None,
         help="total seconds the serial retry pass may spend (default: --timeout)",
@@ -1110,7 +1235,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=ISOLATION_PROFILES,
         default="isolated",
         help="Explicit single-profile override (used by Phase 5 narrow_verify commands). "
-        "Without this flag the per-suite profile is decided by tools/test-isolation.tsv.",
+        "Without this flag the per-suite profile is decided by tools/test-isolation.tsv. "
+        "ci-like is diagnostic-only, requires --select, and is not a local pre-CI gate.",
     )
     p.add_argument("--report-only", action="store_true")
     p.add_argument(
@@ -1119,6 +1245,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
              "for environments that did not seed the baseline (MA-W1-011)",
     )
     p.add_argument("--report", type=Path, default=None)
+    p.add_argument(
+        "--diagnostics-dir",
+        type=Path,
+        default=None,
+        help="write stdout/stderr for every attempt of each failing suite",
+    )
     p.add_argument("--root", type=Path, default=ROOT)
     p.add_argument("--baseline", type=Path, default=ROOT / "tools" / "test-baseline.tsv")
     p.add_argument("--isolation-tsv", type=Path, default=ROOT / "tools" / "test-isolation.tsv")
@@ -1142,6 +1274,37 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--base-report", type=Path)
     p.add_argument("--head-report", type=Path)
     return p
+
+
+def execution_policy_errors(args: argparse.Namespace, root: Path) -> list[str]:
+    """Reject expensive runner shapes that invalidate the measured policy.
+
+    Fixture repositories used by this module's own tests are intentionally not
+    treated as the Hearting full corpus.  The full-run requirements apply only
+    when the canonical repository root is selected without a narrowing glob.
+    """
+    if args.census:
+        return []
+    errors = []
+    if args.jobs < 1:
+        errors.append("--jobs must be positive")
+    if args.retries < 0:
+        errors.append("--retries must be non-negative")
+    if args.isolation == "ci-like" and not args.select:
+        errors.append(
+            "--isolation=ci-like is diagnostic-only and requires --select; "
+            "it is not a supported local pre-CI gate"
+        )
+    full_repository_run = root == ROOT.resolve() and not args.select
+    if full_repository_run:
+        if args.retries < 1:
+            errors.append("full repository runs require --retries 1 or greater")
+        if args.jobs > DEFAULT_JOBS:
+            errors.append(
+                f"full repository runs require --jobs <= {DEFAULT_JOBS}; "
+                "parallel owners share runner capacity"
+            )
+    return errors
 
 
 def cmd_census(suites: list[Path], root: Path) -> int:
@@ -1242,6 +1405,17 @@ def main(argv: list[str]) -> int:
         return 0
 
     root = args.root.resolve()
+    policy_errors = execution_policy_errors(args, root)
+    if policy_errors:
+        for error in policy_errors:
+            print(error, file=sys.stderr)
+        return 64
+    if args.isolation == "ci-like":
+        print(
+            "NOTICE: --isolation=ci-like is a selected-suite diagnostic profile, "
+            "not a supported local pre-CI gate.",
+            file=sys.stderr,
+        )
     suites = collect_suites(root)
 
     relpaths = [suite_relpath(root, s) for s in suites]
@@ -1337,9 +1511,6 @@ def main(argv: list[str]) -> int:
 
     # Retries are deliberately limited to baseline rows explicitly marked as
     # flaky-timing. Every attempt receives a fresh isolated environment.
-    if args.retries < 0:
-        print("--retries must be non-negative", file=sys.stderr)
-        return 64
     retry_budget_exhausted: set[str] = set()
     if args.retries:
         # The retry pass re-runs flaky suites serially after the main run, and
@@ -1514,7 +1685,7 @@ def main(argv: list[str]) -> int:
             verdicts = classify_result(result, baseline, today, run_fingerprint)
         for v in verdicts:
             verdict_counts[v.verdict] = verdict_counts.get(v.verdict, 0) + 1
-            result_kind = classify_kind(result) if not result.passed else ""
+            result_kind = test_failure_kind(result, v.test_id) if not result.passed else ""
             signature = failure_signature(result) if not result.passed else ""
             report_rows.append(
                 {
@@ -1653,6 +1824,22 @@ def main(argv: list[str]) -> int:
                     "__live_state_unattributed__::-", "ERROR", "internal",
                     f"{len(unattributed_new)} new live-state path(s) with no positive own or foreign evidence",
                 ))
+
+    if args.diagnostics_dir:
+        try:
+            diagnostic_suites, diagnostic_attempts = write_failure_diagnostics(
+                args.diagnostics_dir, results_by_suite
+            )
+            print(
+                f"diagnostics={args.diagnostics_dir} "
+                f"failing_suites={diagnostic_suites} attempts={diagnostic_attempts}"
+            )
+        except OSError as exc:
+            detail = f"{exc.__class__.__name__}: {exc}"
+            print(f"FATAL: diagnostics write failed: {detail}", file=sys.stderr)
+            hard_failures.append(
+                ("__diagnostics_write__::-", "ERROR", "internal", detail)
+            )
 
     if args.report:
         write_report(args.report, report_rows)

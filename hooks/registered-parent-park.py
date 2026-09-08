@@ -97,6 +97,19 @@ def main() -> int:
     # computed this set differently would report a command satisfiable that this
     # guard then denies (plan SS3.4 D2a, fixture D-6c).
     guarded_attempts = supervisor_guarded_attempt_ids(rows, state.outbox if state else None)
+    try:
+        import dispatch_terminal_commit
+        cleanup_scope = dispatch_terminal_commit.load_active_cleanup_scope(registry.parent, parent_attempt)
+        if cleanup_scope is not None:
+            verdict = dispatch_terminal_commit.cleanup_tool_permission(
+                cleanup_scope, tool=payload.get("tool_name"), arguments=mapping(payload.get("tool_input")),
+                cwd=payload.get("cwd") or os.getcwd(), owner_attempt_id=parent_attempt,
+                route_id=os.environ.get("AGENT_ROUTE_ID", ""))
+            if verdict.verdict != "allowed":
+                return deny(f"cleanup-scope: {verdict.verdict}: {verdict.detail}")
+            return 0
+    except Exception:
+        return deny("cleanup-scope: authority unavailable")
     if not guarded_attempts:
         return 0
     tool_name = payload.get("tool_name")

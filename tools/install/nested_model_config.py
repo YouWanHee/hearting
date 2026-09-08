@@ -203,6 +203,14 @@ def _parse_captured_buffer(raw: bytes) -> dict[str, str]:
     return values
 
 
+def _effective_captured_values(raw, receipt):
+    values = _parse_captured_buffer(raw)
+    if (receipt.reason == "user-valid-derived-balanced"
+            or receipt.balanced_provenance == "derived-from-user-light"):
+        return model_config._derive_balanced_values(receipt.adapter, values)
+    return values
+
+
 def capture_snapshot(
     adapter: str,
     parent_home: Path,
@@ -241,7 +249,7 @@ def capture_snapshot(
             last_detail = f"selected file unreadable during capture: {exc}"
             continue
         try:
-            reparsed = _parse_captured_buffer(raw)
+            reparsed = _effective_captured_values(raw, receipt)
         except model_config.ModelConfigError as exc:
             last_detail = f"captured bytes failed grammar validation: {exc}"
             continue
@@ -417,10 +425,10 @@ def _assert_inventory(inventory):
         _assert_snapshot(path, snapshot)
 
 
-def _verify_config(dest, destination, raw, values):
+def _verify_config(dest, destination, raw, values, receipt):
     _assert_snapshot(dest, destination)
     current = _capture(dest)
-    if current.state.payload != raw or _parse_captured_buffer(current.state.payload) != values:
+    if current.state.payload != raw or _effective_captured_values(current.state.payload, receipt) != values:
         raise ConflictError("destination no longer matches the full transaction snapshot")
 
 
@@ -461,7 +469,7 @@ def _prepare_locked(*, adapter, parent_home, nested_home, source_root, installer
             values, native_agent_payload._kernel_names(source_root))
         if plan.files != expected_files:
             raise ConflictError("native plan did not render the captured full mapping")
-        _verify_config(dest, destination, raw, values)
+        _verify_config(dest, destination, raw, values, cfg_receipt)
         inventory = _native_inventory(nested_home, plan.files)
         if predecessors is not None:
             prior_native = {p: state for p, state in predecessors.items()
@@ -475,7 +483,7 @@ def _prepare_locked(*, adapter, parent_home, nested_home, source_root, installer
                 raise NestedModelConfigError("installer-failed", detail)
         stage = "native-payload"
         _assert_inventory(inventory)
-        _verify_config(dest, destination, raw, values)
+        _verify_config(dest, destination, raw, values, cfg_receipt)
         _assert_snapshot(receipt_path(nested_home), receipt_state)
         materialized = native_agent_payload.materialize_payload(plan)
         _verify_projection(nested_home, source_root, plan, links=False)
@@ -492,16 +500,16 @@ def _prepare_locked(*, adapter, parent_home, nested_home, source_root, installer
                 continue
             safe_fs.atomic_write_symlink(_authority(link, nested_home, expected, link=True),
                                          target, expected=expected.state, create_parents=True)
-        _verify_config(dest, destination, raw, values)
+        _verify_config(dest, destination, raw, values, cfg_receipt)
         _verify_projection(nested_home, source_root, plan)
         if _source_fingerprint(source_root) != source_identity:
             raise ConflictError("projection source changed during preparation")
         _assert_snapshot(receipt_path(nested_home), receipt_state)
-        _verify_config(dest, destination, raw, values)
+        _verify_config(dest, destination, raw, values, cfg_receipt)
         complete = dict(pending, projection={"state": "complete", "payload_digest": plan.digest,
                         "source_fingerprint": source_identity, "failure_stage": None, "failure_detail": None})
         receipt_state = _write_receipt(nested_home, complete, expected=receipt_state)
-        _verify_config(dest, destination, raw, values)
+        _verify_config(dest, destination, raw, values, cfg_receipt)
         _verify_projection(nested_home, source_root, plan)
         if _source_fingerprint(source_root) != source_identity:
             raise ConflictError("projection source changed during completion publication")
@@ -672,9 +680,10 @@ def _registry_attribution_quiescent(nested_home: Path, jobs: Path | None) -> str
             metadata = parse_registry_metadata(pipe)
             attributed = metadata.get("codex_home")
             derived = str(Path(parts[3]) / ".dispatch/nested-codex-home")
-            if attributed != str(nested_home) and derived != str(nested_home):
+            selected = attributed if attributed else derived
+            if selected != str(nested_home):
                 # A mention in an unsupported field cannot prove non-use.
-                if str(nested_home) in pipe:
+                if not attributed and str(nested_home) in pipe:
                     return "unknown"
                 continue
             if status in {"open", "running"}:

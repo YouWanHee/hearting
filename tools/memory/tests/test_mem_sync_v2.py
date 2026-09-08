@@ -298,13 +298,37 @@ class MemTwoServerSyncTest(unittest.TestCase):
         self.assertGreaterEqual(resolved, 1)
         self.assertEqual(unresolved, 0)
 
+    def test_full_blocked_details_cli_is_read_only_and_not_truncated(self):
+        from helpers import make_operation, canonical_bytes, operation_path
+        connection = sqlite3.connect(self.stores["a"] / "memory.db")
+        for index in range(140):
+            op = make_operation(replica_id="7"*32,counter=index+1,record_id=f"blocked-{index}",
+                                body=None,kind="tombstone")
+            connection.execute("INSERT INTO sync_objects(op_id,replica_id,counter,project_key,kind,object_path,payload_bytes) VALUES(?,?,?,?,?,?,?)",
+                (op["op_id"],"7"*32,str(index+1),"project-alpha","tombstone",operation_path(op["op_id"]),canonical_bytes(op)))
+            connection.execute("INSERT INTO sync_applied(op_id,result) VALUES(?,?)",(op["op_id"],"blocked:blocked-prior-evidence"))
+        connection.commit(); before=list(connection.iterdump());connection.close()
+        bounded=self._mem("a","sync","status","--json")
+        self.assertEqual(bounded.returncode,1,bounded.stderr)
+        self.assertEqual(len(json.loads(bounded.stdout)["blocked_ids"]),8)
+        full=self._mem("a","sync","status","--blocked-details","--json")
+        self.assertEqual(full.returncode,1,full.stderr)
+        value=json.loads(full.stdout)
+        self.assertEqual(value["blocked_ids_omitted"],132)
+        self.assertEqual(value["blocked_details_count"],140)
+        self.assertEqual(value["blocked_detail_counts"],{"active":140})
+        self.assertGreater(len(json.dumps(value["blocked_details"])),8192)
+        self.assertTrue(all(item["reason"]=="blocked-prior-evidence" and not item["proof"]["valid"] for item in value["blocked_details"]))
+        connection=sqlite3.connect(self.stores["a"] / "memory.db")
+        self.assertEqual(list(connection.iterdump()),before);connection.close()
+
     def test_blocked_resolution_requires_every_final_maximal_head(self):
         mem = load_module("mem")
 
         def operation(parents):
             return SimpleNamespace(
                 parents=tuple(parents),
-                payload={"mutations": [{"record_id": "record-r"}]},
+                payload={"kind":"put", "mutations": [{"record_id": "record-r", "post_state":{"delivery_state":"ordinary"}}]},
             )
 
         operations = {
@@ -328,7 +352,7 @@ class MemTwoServerSyncTest(unittest.TestCase):
             blocked={"delete": object()},
             frontiers={"record-r": ("decision",)},
         )
-        self.assertEqual(mem._resolved_blocked_map(safe), {"delete": "decision"})
+        self.assertEqual(mem._resolved_blocked_map(safe), {"delete": {"record-r": "decision"}})
 
     def test_local_integration_fold_does_not_overstate_remote_peer_tip(self):
         mem = load_module("mem")

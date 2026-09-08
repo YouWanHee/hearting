@@ -125,3 +125,27 @@ Claude Code projects created before the neutral artifact root use `.claude_repor
 For shell code, use `utilities/artifact-root.sh`. In a linked task worktree it resolves the primary checkout, so a tracked local artifact snapshot is never a write target. Headless dispatch passes that exact path with Claude `--add-dir`.
 
 For harness-home paths, use `utilities/agent-home.sh` or the equivalent rule: prefer `AGENT_HOME`, then `CLAUDE_HOME`, then a managed release, `$HOME/hearting`, legacy `$HOME/agent_setting`, and finally `$HOME/.claude`.
+
+### SD-88 demand selection
+
+`preflight.sh compose --profile-demands demands.json` (Codex/OpenCode) and the
+portable `utilities/capability-route.py compile|compose` consume the same JSON map:
+keys are realized node IDs or `__owner__`, values are full schema-v1 demands with
+both axes, reasons and evidence references. `--explicit-profiles profiles.json`
+uses a matching map and cannot bypass the judgment floor. Custom unit recipes
+provide `profile_demand` on every ad-hoc unit. Missing fields fail closed.
+
+The five portable profiles are deep, balanced-deep, balanced, light and mini.
+Concrete defaults and generated native agents come from this adapter's
+`config/models.conf`; runtime loading selects the user's whole file first.
+A missing balanced row is derived only from that user's light row in memory;
+explicit settings win, and other missing required keys retain whole-file fallback.
+OpenCode reports collapsed-balanced-to-light and preserves its full light budget.
+No install/update/reapply/uninstall writes the normalization back. Source checks
+do not activate an installed release or change an in-flight sealed route.
+
+A profile value may name a tier (`deep:high`) or an explicit model
+(`model/<id>:high`). This keeps existing user tier keys intact when two profiles
+need different models. The shipped deep point uses the main-only model and is
+still rejected by delegated launch guards; balanced-deep uses the eligible deep
+tier. A user-selected legacy tier continues to override the shipped profile.

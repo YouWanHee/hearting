@@ -2511,7 +2511,9 @@ def _dispatch_model_profile(j):
     if not profile or profile == "unsealed":
         return None
     reduced = getattr(j, "profile_granularity", None) not in {None, "", "full"}
-    label = "mp:" + str(profile) + ("~" if reduced else "")
+    source = getattr(j, "profile_selection_source", None)
+    provenance = {"matrix": ":m", "explicit": ":e", "legacy": ":l"}.get(source, "")
+    label = "mp:" + str(profile) + ("~" if reduced else "") + provenance
     return _compact_dispatch_name(label, _PROFILE_MAX)
 
 def _dispatch_stage_label(j):
@@ -6014,7 +6016,12 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
             # NOW line, its own sub-agent strip). Descendants start here, so this index
             # is where the header divider goes once the frame is drawn.
             header_end = len(lines)
-            for sub in _sort_group_jobs(job_children.get(job.slug, [])):
+            # The map contains depth-2 workers keyed by their depth-1 owner's
+            # slug. A worker can reuse that slug (or another owner's), so looking
+            # it up from a leaf would revisit itself or a sibling tree forever.
+            # Only depth-1 owners expand children; depth-2 rows remain leaves.
+            descendants = job_children.get(job.slug, []) if depth == 1 else []
+            for sub in _sort_group_jobs(descendants):
                 # F-15b P0-2: only a completed stage is absorbed into the
                 # conductor breadcrumb. A registered queued/idle/unknown child
                 # is still execution identity and must keep its own row.

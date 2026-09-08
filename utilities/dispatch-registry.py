@@ -1464,6 +1464,8 @@ def recover_receiptless(rows, args):
     )
     remaining = budget.retry_slots
     try:
+        # The recovery helper owns and rechecks the jobs.log.lock fence; this
+        # CLI must not treat its outer reads as the terminal-claim guard.
         claim = claim_recovery_retry(
             args.jobs,
             recovery_id=recovery_identity,
@@ -2156,6 +2158,8 @@ def main(argv):
     p.add_argument("--from-ts"); p.add_argument("--to-ts")
     p.add_argument("--include-archive", action="store_true")
     args = p.parse_args(argv[1:]); args.agent_home = args.agent_home or resolve_agent_home()
+    from dispatch_terminal_commit import require_current_cleanup
+    require_current_cleanup('registry')
     if args.cascade_grace < 0 or args.cascade_kill_wait < 0 or args.cancellation_wait < 0:
         print("check=failed\nreason=invalid-cascade-timeout"); return 64
     if args.operation in ("archive-import", "inventory"):

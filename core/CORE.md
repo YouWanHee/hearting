@@ -50,13 +50,30 @@ downloaded, and session reload or restart boundaries remain runtime-specific.
 
 Runtime homes should be adapter projections, not the source repository. Keep credentials, sessions, logs, SQLite state, caches, and other runtime-owned files in the runtime home. Expose the harness into each runtime home with symlinks or adapter-owned bootstrap files.
 
+For managed releases, set `AGENT_HOME` to
+`${XDG_DATA_HOME:-$HOME/.local/share}/hearting/current` (or the exact release
+root sealed by an existing route). A runtime home such as `$HOME/.claude`,
+even with symlinked harness files, is not that installed root: its tree identity
+does not match the sealed release identity. Launch mismatch diagnostics must
+name the expected root and how to invoke its tooling; never relax the identity
+check to accept a projection tree.
+
 Portable model profiles belong to core, while each adapter owns its shipped
 concrete model mapping. Installation seeds that mapping once as
 `<runtime-home>/agent-config/models.conf`. The seeded file is user-owned: it is
 never symlinked, refreshed, reapplied, or removed by a harness update or
 uninstall. Runtime consumers select a valid, complete user file as one unit and
 otherwise fall back to the shipped adapter default as one unit; they never merge
-the two. Native runtime settings and adapter fragments remain outside
+the two. INST-D-20 permits one narrow, memory-only normalization: when only
+the new balanced profile and its optional granularity are absent, retain the
+entire selected user file and derive balanced from that user's light operating
+point (high effort on supported adapters; the complete existing light budget
+on a reduced-granularity adapter). Explicit balanced wins. Missing any other
+required key retains whole-file fallback. No loader or installer writes this
+normalization back, including on install/update/reapply/uninstall. The same
+rule derives a missing balanced dispatch policy from the user's entire light
+policy without enabling any disabled vendor.
+Native runtime settings and adapter fragments remain outside
 `agent-config`.
 
 A harness-created derived execution home (for example a nested dispatch-owned

@@ -15,6 +15,41 @@ ADAPTERS={
 }
 
 class AdapterV11Test(unittest.TestCase):
+ def test_owner_binding_tuple_refusal_details_reach_all_wrappers(self):
+  for harness in ADAPTERS:
+   for depth,worker,raw in ((2,"stage",False),(1,"stage",False),(1,"owner",True),(2,"stage",True)):
+    with self.subTest(harness=harness,depth=depth,worker=worker,raw=raw), tempfile.TemporaryDirectory() as td:
+     root=Path(td); repo,art=self.fixture(root); jobs=root/"jobs.log"; logs=root/"logs"
+     wrapper=self.load_wrapper(harness)
+     argv=["dispatch-headless.py","--register","--worktree",str(repo),"--slug","binding-detail",
+           "--capability","autopilot-code","--capability-mode","dev","--intensity","standard",
+           "--dispatch-depth",str(depth),"--worker-type",worker,"--owner","autopilot-code",
+           "--assigned-contract","autopilot-code" if worker=="owner" else "code-execute",
+           "--jobs",str(jobs),"--log-dir",str(logs),*ADAPTERS[harness][1]]
+     if worker=="stage": argv.extend(["--worker-mode","dev/backend","--unit","dev/backend"])
+     if depth==2:
+      argv.extend(["--parent","owner","--parent-harness",harness,"--parent-transport","headless",
+                   "--parent-sandbox","fixture","--nested-eligibility","supported","--eligibility-source","fixture"])
+     if raw: argv.extend(["--route-file",str(root/"raw-route.json")])
+     env=self.child_env(root)
+     env.update({"AGENT_ARTIFACT_ROOT":str(art),"AGENT_DISPATCH_JOBS":str(jobs)})
+     stream=io.StringIO()
+     with mock.patch.dict(os.environ,env,clear=True), \
+          mock.patch.object(wrapper,"binding_from_environment",return_value=object()), \
+          redirect_stdout(stream):
+      result=wrapper.main(argv)
+     output=stream.getvalue()
+     self.assertEqual(result,65,output)
+     self.assertIn("reason=owner-route-binding-tuple-invalid",output)
+     self.assertIn(f"invalid_dispatch_depth={int(depth!=1)}",output)
+     self.assertIn(f"invalid_worker_type={int(worker!='owner')}",output)
+     self.assertIn(f"invalid_route_file_present={int(raw)}",output)
+     self.assertIn("stage-dispatch-fallback.py",output)
+     self.assertIn("--parallel-group",output)
+     self.assertIn("--action start",output)
+     self.assertIn("child_spawned=0",output)
+     self.assertFalse(jobs.exists(),output)
+
  def child_env(self,root):
   # Model wrappers and their in-process helpers must see only this fixture's
   # state. Inheriting os.environ leaks managed-thread identity, registry,
@@ -64,6 +99,11 @@ class AdapterV11Test(unittest.TestCase):
   for proc in self.parent_procs:
    if proc.poll() is None: proc.kill()
    proc.wait()
+  for key in list(os.environ):
+   if (key.startswith("AGENT_DISPATCH_") or key.startswith("AGENT_OWNER_ROUTE_")
+       or key.startswith("AGENT_ROUTE_") or key.startswith("AGENT_ARTIFACT_")
+       or key in {"AGENT_MODEL_GOVERNOR_ROOT", "AGENT_MODEL_GOVERNOR_RESERVATION_TOKEN"}):
+    os.environ.pop(key,None)
  def seed_parent(self,jobs,repo,attempt="att-parent-fixture",harness="codex",sandbox="fixture"):
   proc=subprocess.Popen(["sleep","60"]);self.parent_procs.append(proc)
   start=(Path("/proc")/str(proc.pid)/"stat").read_text().split()[21]
@@ -282,7 +322,8 @@ class AdapterV11Test(unittest.TestCase):
     self.assertIn(f"--writable-root {ROOT / '.core-grounding'}",result.stdout)
    self.assertIn(f"--writable-root {claude_config / 'session-env'}",result.stdout)
    self.assertIn("nested_owner_writable_dirs=",result.stdout)
-   self.assertIn("nested_codex_home=",result.stdout)
+   self.assertIn(f"nested_codex_home={repo / '.dispatch/nested-codex-home-v2'}",result.stdout)
+   self.assertFalse((repo / ".dispatch/nested-codex-home-v2").exists())
    self.assertIn("broker_lifecycle=retired",result.stdout)
    self.assertIn("child_spawned=0",result.stdout)
    registered_command=command.copy()
@@ -294,6 +335,8 @@ class AdapterV11Test(unittest.TestCase):
    self.assertIn("child_spawned=0",registered.stdout)
    row=jobs.read_text(encoding="utf-8")
    self.assertIn("supervisor_lease=flock-v1",row)
+   self.assertIn(f"codex_home={repo / '.dispatch/nested-codex-home-v2'}",row)
+   self.assertFalse((repo / ".dispatch/nested-codex-home-v2").exists())
    self.assertRegex(row,r"supervisor_lease_nonce=[0-9a-f]{64}(?:,|$)")
  def test_codex_and_claude_refuse_depth_two_before_any_row_without_live_parent(self):
   for harness in ("codex","claude"):
@@ -364,11 +407,54 @@ class AdapterV11Test(unittest.TestCase):
     self.assertIn("REPLICA_RESERVATION_ROW_KEYS",source)
     self.assertIn("replica_batch_expectation",source)
     self.assertIn("expected_reservation=args.replica_batch_expectation",source)
+ def test_nested_home_selection_retry_and_exact_parent_inheritance(self):
+  from types import SimpleNamespace
+  with tempfile.TemporaryDirectory() as td:
+   root=Path(td);jobs=root/"jobs.log";worktree=root/"worktree";worktree.mkdir()
+   wrapper=self.load_wrapper("codex")
+   args=SimpleNamespace(attempt_id="new",nested_headless_network=True,dispatch_depth=1,
+                        parent_harness=None,profile=None,slug="owner",action="register")
+   old=worktree/".dispatch/nested-codex-home";old.mkdir(parents=True)
+   marker=old/"inventory";marker.write_bytes(b"legacy state")
+   before=(marker.stat().st_ino,marker.stat().st_ctime_ns,marker.read_bytes())
+   new=wrapper.select_codex_home(args,worktree,jobs)
+   self.assertEqual(new,old.with_name("nested-codex-home-v2"))
+   self.assertFalse(new.exists())
+   jobs.write_text(f"now\topen\trepo\t{worktree}\towner\tattempt_id=new,codex_home={new}\n")
+   self.assertEqual(wrapper.select_codex_home(args,worktree,jobs),new)
+   args.attempt_id="child";args.dispatch_depth=2;args.parent_harness="codex"
+   args.parent_attempt_id="new";args.nested_headless_network=False
+   self.assertEqual(wrapper.select_codex_home(args,worktree,jobs),new)
+   jobs.write_text(f"now\topen\trepo\t{worktree}\towner\tattempt_id=new\n")
+   self.assertEqual(wrapper.select_codex_home(args,worktree,jobs),old)
+   args.attempt_id="new";args.dispatch_depth=1;args.nested_headless_network=True
+   self.assertEqual(wrapper.select_codex_home(args,worktree,jobs),old)
+   self.assertTrue(args.codex_home_legacy_unsealed)
+   self.assertEqual(before,(marker.stat().st_ino,marker.stat().st_ctime_ns,marker.read_bytes()))
+
  def test_nested_codex_home_links_auth_but_keeps_mutable_state_local(self):
+  # `prepare_nested_codex_home` runs the *installed* runtime's projection
+  # installer on purpose: the nested home's identity must follow the canonical
+  # AGENT_HOME, not the source worktree holding the wrapper. So the fixture has
+  # to name a projection root of its own. Without one this test read whatever
+  # release the developer happened to have installed -- runtime-owned state as a
+  # fixture -- and any environment without one (the isolated suite profile,
+  # CI) resolved `$XDG_DATA_HOME/hearting/current` and died on the missing
+  # installer. This checkout is a valid harness root, so pin AGENT_HOME to it
+  # and keep HOME/CODEX_HOME inside the tempdir.
+  #
+  # The env is an EXPLICIT minimal dict, not `{**os.environ, ...}`: with a
+  # `{**os.environ}` base, `clear=True` clears nothing and the ambient shell
+  # rides through. That matters concretely -- install-runtime-projection.sh
+  # skips the managed launcher for a non-default CODEX_HOME only *while*
+  # HARNESS_BIN_DIR is unset, so an ambient HARNESS_BIN_DIR would make this
+  # test install a launcher into the developer's real bin directory. PATH is
+  # named because the script shells out to python3; nothing else is inherited.
   with tempfile.TemporaryDirectory() as td:
    root=Path(td); source=root/"source"; source.mkdir(); worktree=root/"worktree"; worktree.mkdir()
    (source/"auth.json").write_text("{}\n",encoding="utf-8")
    (source/"config.toml").write_text("model = \"fixture\"\n",encoding="utf-8")
+   fixture_home=root/"home"; fixture_home.mkdir()
    spec=importlib.util.spec_from_file_location("codex_dispatch_home",ROOT/"adapters/codex/bin/dispatch-headless.py")
    wrapper=importlib.util.module_from_spec(spec); spec.loader.exec_module(wrapper)
    # Nested model-config inheritance now resolves its projection root through
@@ -376,7 +462,9 @@ class AdapterV11Test(unittest.TestCase):
    # tools/install/nested_model_config.py and adapters/codex/config/models.conf)
    # instead of the real installed runtime home, which this test must not
    # depend on or mutate.
-   with mock.patch.object(wrapper,"resolve_agent_home",return_value=ROOT):
+   env=self.child_env(root/"nested-env")
+   env.update({"HOME":str(fixture_home),"CODEX_HOME":str(source)})
+   with mock.patch.dict(os.environ,env,clear=True), mock.patch.object(wrapper,"resolve_agent_home",return_value=ROOT):
     home=wrapper.prepare_nested_codex_home(worktree,source)
    self.assertTrue((home/"auth.json").is_symlink())
    self.assertEqual((home/"auth.json").resolve(),(source/"auth.json").resolve())
@@ -397,6 +485,13 @@ class AdapterV11Test(unittest.TestCase):
     self.assertEqual((current.st_ino,current.st_ctime_ns),
                      (metadata.st_ino,metadata.st_ctime_ns))
     self.assertEqual((home/name).resolve(),(source/name).resolve())
+   # Mutable runtime state stays inside the worktree: the credential is a link
+   # out, never a copy, nothing was written into the source home, and the
+   # fixture HOME is still empty -- the launcher branch really was skipped.
+   self.assertFalse((home/"auth.json").resolve().is_relative_to(worktree))
+   self.assertEqual(
+    sorted(p.name for p in source.iterdir()),["auth.json","config.toml"])
+   self.assertEqual(sorted(p.name for p in fixture_home.iterdir()),[])
  def test_nested_codex_home_preserves_foreign_auth_and_config_collisions(self):
   for name in ("auth.json","config.toml"):
    for kind in ("symlink","file"):

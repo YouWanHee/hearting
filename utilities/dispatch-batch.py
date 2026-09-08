@@ -892,6 +892,8 @@ def manifest_members(legs: list[dict[str, object]]) -> list[dict[str, object]]:
             "fallback_hop": str(leg["hop"]),
             "fallback_ordinal": int(leg["ordinal"]),
             "model_profile": str(leg["model_profile"]),
+            **({key: leg[key] for key in ("profile_demand", "profile_selection")}
+               if "profile_selection" in leg else {}),
             "perspective": str(leg["perspective"]),
             "parallel_leg_index": int(leg["parallel_leg_index"]),
             "leg_class": str(leg["leg_class"]),
@@ -1774,6 +1776,8 @@ def _run_subdivision_batch_admission(args: argparse.Namespace, route: dict[str, 
         }, separators=(",", ":"), sort_keys=True))
         return 0
     results = SUBDIVISION_ADMISSION.start_admitted_batch(
+        # start_admitted_batch performs only a subprocess-boundary precheck;
+        # the adapter owns the actual jobs.log.lock terminal-claim fence.
         admission, parent=args.parent, jobs=jobs,
         governor_reservation_env=GOVERNOR_RESERVATION_ENV,
     )
@@ -2071,6 +2075,8 @@ def main(argv: list[str] | None = None) -> int:
                 else None
             ),
         }
+        if "profile_selection" in node:
+            leg.update({key: node[key] for key in ("profile_demand", "profile_selection")})
         if manifest_sessions is not None:
             # G7: consume the validated SD-103 subdivision manifest instead of
             # discarding it -- each leg carries the exact sub-session identity

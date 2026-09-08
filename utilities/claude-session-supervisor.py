@@ -13,7 +13,7 @@ import shlex
 import subprocess
 import sys
 import time
-from typing import Any
+from typing import Any, NamedTuple
 import uuid
 
 from dispatch_completion_join import (
@@ -60,6 +60,7 @@ from dispatch_continuation_budget import (
 import dispatch_budget_record as budget_record
 import dispatch_stage_advance as stage_advance
 import dispatch_subsession_advance as subsession_advance
+from route_identity import route_hash as canonical_route_hash, route_id_from_hash
 from dispatch_supervisor_terminal import (
     SupervisorTerminal,
     classify_claude_result,
@@ -71,6 +72,224 @@ from dispatch_supervisor_terminal import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
+TERMINAL_COMMIT_GATE_DEFAULT = False
+
+
+def terminal_commit_enabled(args: argparse.Namespace) -> bool:
+    """Checked Claude-only opt-in; the default preserves the legacy path."""
+    requested = (bool(getattr(args, "enable_terminal_commit", False))
+                 or os.environ.get("AGENT_DISPATCH_TERMINAL_COMMIT") == "1"
+                 or TERMINAL_COMMIT_GATE_DEFAULT)
+    if not requested:
+        return False
+    try:
+        route = json.loads(Path(args.route_file).read_text())
+        return (route.get("runtime_support", {}).get("terminal_commit") is True
+                and route["route_hash"] == args.route_hash == canonical_route_hash(route)
+                and route["route_id"] == args.route_id == route_id_from_hash(args.route_hash))
+    except (AttributeError, OSError, ValueError, KeyError, TypeError):
+        return False
+
+
+class TurnSubmission(NamedTuple):
+    """Plain NamedTuple, not @dataclass: this module is loaded by file-spec
+    (no sys.modules registration), which breaks dataclasses' string-annotation
+    resolution (`_is_type` looks up `sys.modules[cls.__module__]`)."""
+
+    status: str
+    result: dict | None
+    rc: int
+
+
+class SubmissionNotStarted(OSError):
+    """The transport failed before creating a process or attempting a write."""
+
+
+def submit_turn(transport, prompt, *, session=None, args=None, timeout=60,
+                preserve_errors=False) -> TurnSubmission:
+    """Common stream/process submission seam with explicit ambiguity."""
+    try:
+        if hasattr(transport, "submit"):
+            value = transport.submit(prompt, timeout=timeout)
+            result, rc = value if isinstance(value, tuple) else (value, 0)
+            return TurnSubmission("submitted", result if isinstance(result, dict) else {}, rc)
+        if hasattr(transport, "run_turn"):
+            value = transport.run_turn(prompt, timeout)
+            result, rc = value if isinstance(value, tuple) else (value, 0)
+            return TurnSubmission("submitted", result if isinstance(result, dict) else {}, rc)
+        if hasattr(transport, "stdin"):
+            payload = (json.dumps({"type": "user", "message": {"role": "user",
+                "content": [{"type": "text", "text": prompt}]},
+                "parent_tool_use_id": None}, separators=(",", ":"), ensure_ascii=False) + "\n").encode()
+            stdin = transport.stdin
+            # Confirmed-before-send failure: nothing was attempted on the wire,
+            # so this is the only branch allowed to report `not-submitted`.
+            if stdin is None or getattr(stdin, "closed", False):
+                return TurnSubmission("not-submitted", None, 1)
+            try:
+                stdin.write(payload)
+                stdin.flush()
+            except OSError:
+                # Once write/flush has been attempted, a failure cannot prove
+                # the peer did not receive any bytes (partial pipe write,
+                # broken pipe after partial consumption). Ambiguous, not a
+                # confirmed non-submission.
+                return TurnSubmission("submission-unknown", None, 1)
+            result = transport.read_result(timeout)
+            return TurnSubmission("submitted", result, getattr(transport, "returncode", 0) or 0)
+        if callable(transport):
+            value = transport(prompt, timeout=timeout)
+            result, rc = value if isinstance(value, tuple) else (value, 0)
+            return TurnSubmission("submitted", result if isinstance(result, dict) else {}, rc)
+    except SubmissionNotStarted:
+        return TurnSubmission("not-submitted", None, 1)
+    except TimeoutError:
+        return TurnSubmission("submission-unknown", None, 124)
+    except subprocess.TimeoutExpired:
+        return TurnSubmission("submission-unknown", None, 124)
+    except OSError:
+        return TurnSubmission("submission-unknown", None, 1)
+    except SupervisorError:
+        # A missing result after a successful pipe write is not proof of
+        # non-submission. Keep its reservation fenced for reconciliation.
+        if preserve_errors:
+            raise
+        return TurnSubmission("submission-unknown", None, 1)
+    return TurnSubmission("not-submitted", None, 1)
+
+
+def terminal_commit_adapter(args: argparse.Namespace, rows: list[object]):
+    """Load the terminal transaction only after its checked support gate."""
+    import dispatch_terminal_commit
+    route = json.loads(Path(args.route_file).read_text(encoding="utf-8"))
+    request = dispatch_terminal_commit.TerminalCommitRequest(
+        route_file=Path(args.route_file),
+        owner_attempt_id=args.parent_attempt_id,
+        jobs=Path(args.jobs),
+        artifact_root=Path(route.get("artifact_root", args.worktree)),
+    )
+    return dispatch_terminal_commit.settle_terminal_commit(request)
+
+
+def prepare_cleanup_handoff(args, ledger, claim, rows):
+    """Prepare the only reserved prompt after exact terminal/quiescent join.
+
+    This helper performs no model submission. The durable intent is consumed
+    only by run_turn's transport fence, so restart cannot invent another turn.
+    """
+    import dispatch_contract
+    import dispatch_terminal_commit as terminal
+    if {row.attempt_id for row in rows} != set(claim["child_attempt_ids"]):
+        raise SupervisorError("terminal-handoff-join-mismatch")
+    for row in rows:
+        if row.status in {"open", "running"} or dispatch_contract.attempt_process_quiescence(
+            row.metadata, terminal_receipt=True
+        ).state != "quiescent":
+            raise SupervisorError("terminal-handoff-child-not-quiescent")
+    route = json.loads(Path(args.route_file).read_text())
+    if route.get("route_hash") != args.route_hash or canonical_route_hash(route) != args.route_hash:
+        raise SupervisorError("terminal-handoff-route-mismatch")
+    root = Path(route["artifact_root"])
+    slot = terminal.terminal_slot(root, args.route_id, args.parent_attempt_id)
+    # Kept outside sealed producer outputs: cleanup cannot rewrite a manifest
+    # member or turn a partial report into the terminal marker's PASS evidence.
+    report = slot / "cleanup" / "partial-report.md"
+    cycle_id = None
+    if terminal.producer_lifecycle_applies(route):
+        binding = terminal.load_producer_binding(artifact_root=root, route_id=args.route_id,
+                                                 owner_attempt_id=args.parent_attempt_id)
+        cycle_id = binding.binding["cycle_id"]
+    commit = {}
+    if (slot / "terminal-commit.json").is_file():
+        commit = json.loads((slot / "terminal-commit.json").read_text())
+    scope = dict(artifact_root=str(root), route_id=args.route_id, route_hash=args.route_hash,
+                 owner_attempt_id=args.parent_attempt_id, cycle_id=cycle_id,
+                 terminal_commit_id=commit.get("terminal_commit_id", ""),
+                 allowed_write_roots=[str(report)], allowed_read_roots=[str(slot)],
+                 allowed_recovery_targets=[str(Path(args.route_file).resolve()), str(root.resolve())],
+                 allowed_operations=["partial-report", "read", "verify", "close-forward-recovery",
+                                     "finalize-forward-recovery"], one_use=True,
+                 # Expiration is tied to a real bound submission lifetime.
+                 expires_at=time.time() + args.turn_timeout + 60)
+    prompt = (budget_record.render_notice("budget-exhausted", remaining=0,
+              threshold=args.continuation_warning_threshold)
+              + f"\nUse Write only for this partial report: {report}\n"
+              + "Read only the bound transaction evidence. New work and shell commands are denied. "
+              + "If forward settlement is needed, the sole shell command allowed is: "
+              + f"python3 {shlex.quote(str(ROOT / 'utilities/dispatch_terminal_commit.py'))} cleanup-recover\n"
+              + "Finish honestly with a partial/BLOCKED report if settlement cannot be proved.")
+    remaining = dict(gross_remaining=ledger.gross_remaining, stall_remaining=ledger.stall_remaining,
+                     reserved_remaining=ledger.reserved_remaining)
+    intent = budget_record.convert_claim_to_prompt_intent(
+        Path(args.jobs).parent, claim, prompt=prompt, cleanup_scope=scope, remaining=remaining)
+    return prompt, intent
+
+
+def complete_handoff_after_reconcile(args, claim):
+    if claim is None:
+        return
+    import dispatch_terminal_commit as terminal
+    route = json.loads(Path(args.route_file).read_text())
+    slot = terminal.terminal_slot(Path(route["artifact_root"]), args.route_id, args.parent_attempt_id)
+    state = json.loads((slot / "terminal-commit.json").read_text())
+    if (state.get("state") != "owner-envelope-sealed"
+            or state.get("owner_attempt_id") != args.parent_attempt_id
+            or state.get("route_hash") != args.route_hash):
+        raise SupervisorError("terminal-handoff-settlement-unproved")
+    budget_record.complete_terminal_handoff(Path(args.jobs).parent, claim,
+        jobs=Path(args.jobs), terminal_commit_id=state["terminal_commit_id"])
+
+
+def recover_cleanup_on_startup(args):
+    """Resume only durable settlement, never a model process or prompt."""
+    recovered = budget_record.recover_terminal_handoff(Path(args.jobs).parent, args.parent_attempt_id)
+    if recovered is None:
+        # A terminal transaction may have crossed its commit point before any
+        # cleanup intent existed. Duplicate wake must recover that transaction,
+        # including claim-after/close-after crashes, without another model turn.
+        import dispatch_terminal_commit as terminal
+        route = json.loads(Path(args.route_file).read_text())
+        slot = terminal.terminal_slot(Path(route["artifact_root"]), args.route_id, args.parent_attempt_id)
+        if not (slot / "terminal-commit.json").exists():
+            return None
+        claims = budget_record.terminal_handoff_root(Path(args.jobs).parent,args.parent_attempt_id,0).parent
+        candidates = [json.loads(path.read_text()) for path in claims.glob("*/claim.json")]
+        candidates = [row for row in candidates if row.get("route_hash") == args.route_hash]
+        if not candidates:
+            raise SupervisorError("terminal-handoff-claim-missing")
+        claim = max(candidates,key=lambda row:row["continuation_ordinal"])
+        recovered = dict(claim=claim,intent=dict(route_hash=args.route_hash,intent_id=None),
+                         status="not-submitted",effective_charge=0)
+    if recovered["intent"]["route_hash"] != args.route_hash:
+        raise SupervisorError("terminal-handoff-route-mismatch")
+    status, charge = recovered["status"], recovered["effective_charge"]
+    emit({"type": "dispatch.supervisor.terminal-handoff-recovered",
+          "parent_attempt_id": args.parent_attempt_id, "status": status,
+          "intent_id": recovered["intent"]["intent_id"], "effective_reserved_charge": charge})
+    if status == "submission-unknown":
+        # Preserve the open owner and its ambiguous evidence for the single
+        # reconciler. Closing it as failed would prevent exact forward recovery.
+        emit({"type": "dispatch.supervisor.error", "reason": "terminal-handoff-recovery-unavailable"})
+        return 70
+    settled = terminal_commit_adapter(args, [])
+    if settled.result == "completed":
+        result = dict(type="result", subtype="success", is_error=False, result=settled.envelope_text)
+        terminal = classify_claude_result(result, 0)
+        if not reconcile(args, terminal):
+            return 70
+        complete_handoff_after_reconcile(args, recovered["claim"])
+        if charge == 0:
+            emit({"type": "dispatch.supervisor.terminal-fast-path", "continuation_saved": True,
+                  "parent_attempt_id": args.parent_attempt_id, "terminal_nodes": list(settled.terminal_nodes)})
+        emit(result)
+        return 0 if terminal.failure_class == "pass" else 3
+    # A confirmed non-submission is free but is not successful work. A
+    # confirmed submission cannot buy a second cleanup if it failed to finish.
+    terminal = classify_supervisor_abandonment_terminal("claude", "terminal-handoff-incomplete")
+    if not reconcile(args, terminal):
+        return 70
+    emit({"type": "dispatch.supervisor.error", "reason": "terminal-handoff-incomplete"})
+    return 3
 # Deliberately UNRESOLVED. The parent session's park guard admits a contract
 # path only under a harness root it recognizes -- its own root, a valid
 # AGENT_HOME, or a cwd ancestor -- and it resolves both sides at check time.
@@ -119,20 +338,16 @@ def terminal_route_completion(
         return ()
     if not isinstance(route, dict) or route.get("schema_version") != 2:
         return ()
-    bare = {
-        key: value for key, value in route.items()
-        if key not in {"route_hash", "route_id"}
-    }
-    sealed_hash = "sha256:" + hashlib.sha256(
-        json.dumps(
-            bare, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        ).encode()
-    ).hexdigest()
+    # A82-1/§13.53.2: `route_identity` owns the one canonical hash
+    # derivation and its excluded-key set; this function must not repeat or
+    # re-derive that exclusion list (that duplication is exactly how F-9
+    # recurred -- see D0/D1 in dispatch_completion_join.test.py).
+    sealed_hash = canonical_route_hash(route)
     if (
         route.get("route_id") != args.route_id
         or route.get("route_hash") != args.route_hash
         or sealed_hash != args.route_hash
-        or args.route_id != "rt-" + sealed_hash.split(":", 1)[1][:16]
+        or args.route_id != route_id_from_hash(sealed_hash)
     ):
         return ()
     contract = route.get("workflow_contract")
@@ -937,7 +1152,7 @@ class ClaudeStreamSession:
 
     def run_turn(self, prompt: str, timeout: float) -> tuple[dict[str, Any], int]:
         if self.closed or self.process.stdin is None or self.process.stdout is None:
-            raise SupervisorError("claude-stream-closed")
+            raise SubmissionNotStarted("claude-stream-closed")
         payload = {
             "type": "user",
             "message": {
@@ -947,12 +1162,16 @@ class ClaudeStreamSession:
             "parent_tool_use_id": None,
         }
         try:
-            self.process.stdin.write(
-                (
+            data = (
                     json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
                     + "\n"
                 ).encode("utf-8")
-            )
+            written = 0
+            while written < len(data):
+                count = self.process.stdin.write(data[written:])
+                if not count:
+                    raise OSError("claude-stream-short-write")
+                written += count
             self.process.stdin.flush()
         except (BrokenPipeError, OSError) as exc:
             raise SupervisorError("claude-stream-write-failed") from exc
@@ -981,6 +1200,10 @@ class ClaudeStreamSession:
                     continue
                 if isinstance(value, dict) and value.get("type") == "result":
                     return value, self.process.poll() or 0
+
+    def submit(self, prompt: str, *, timeout: float = 60) -> tuple[dict[str, Any], int]:
+        """Expose the common submission seam for the stream transport."""
+        return self.run_turn(prompt, timeout)
 
     def close(self) -> None:
         if self.closed:
@@ -1020,11 +1243,44 @@ def run_turn(
     *,
     resume: bool,
     stream_session: ClaudeStreamSession | None = None,
+    handoff_intent: dict | None = None,
 ) -> tuple[dict[str, Any], int]:
+    def submit(transport):
+        if handoff_intent is not None:
+            state_root = Path(args.jobs).parent
+            if hashlib.sha256(prompt.encode()).hexdigest() != handoff_intent["prompt_digest"]:
+                raise SupervisorError("terminal-handoff-prompt-conflict")
+            if not budget_record.begin_submission(state_root, handoff_intent):
+                raise SupervisorError("terminal-handoff-recovery-unavailable")
+        submission = submit_turn(transport, prompt, session=session_id,
+                                 args=args, timeout=args.turn_timeout,
+                                 preserve_errors=handoff_intent is None)
+        if handoff_intent is not None:
+            if submission.status != "submission-unknown":
+                budget_record.reconcile_submission(
+                    state_root, handoff_intent,
+                    evidence_kind=("transport-receipt" if submission.status == "submitted"
+                                   else "pre-send-failure"),
+                    evidence={"intent_id": handoff_intent["intent_id"],
+                              "prompt_digest": handoff_intent["prompt_digest"]},
+                )
+            emit({"type": "dispatch.supervisor.terminal-handoff-submission",
+                  "parent_attempt_id": args.parent_attempt_id,
+                  "intent_id": handoff_intent["intent_id"], "status": submission.status,
+                  "effective_reserved_charge": budget_record.read_effective_charge(state_root, handoff_intent)})
+        return submission
     if stream_session is not None:
-        return stream_session.run_turn(prompt, args.turn_timeout)
-    try:
-        result = subprocess.run(
+        submission = submit(stream_session)
+        if submission.status != "submitted":
+            raise SupervisorError(f"turn-{submission.status}")
+        return submission.result or {}, submission.rc
+    def process_transport(_prompt: str, *, timeout: float):
+        # D6/§13.53.8(3): OSError and TimeoutExpired must reach submit_turn's
+        # seam unconverted so the process transport reports the same three
+        # values (submitted/not-submitted/submission-unknown) as the stream
+        # transport. Do not catch-and-rewrap them here.
+        try:
+            process = subprocess.Popen(
             claude_command(args, session_id, resume),
             cwd=args.worktree,
             env={
@@ -1035,28 +1291,34 @@ def run_turn(
                     else {}
                 ),
             },
-            input=prompt,
             text=True,
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=None,
-            timeout=args.turn_timeout,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise SupervisorError("claude-turn-process-failed") from exc
-    final: dict[str, Any] | None = None
-    for line in result.stdout.splitlines():
+            )
+        except OSError as exc:
+            raise SubmissionNotStarted("claude-process-not-started") from exc
         try:
-            value = json.loads(line)
-        except ValueError:
-            continue
-        if not isinstance(value, dict):
-            continue
-        if value.get("type") == "result":
-            final = value
-    if final is None:
-        raise SupervisorError("claude-result-missing")
-    return final, result.returncode
+            output, _ = process.communicate(_prompt, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+            raise
+        final: dict[str, Any] | None = None
+        for line in output.splitlines():
+            try:
+                value = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(value, dict) and value.get("type") == "result":
+                final = value
+        if final is None:
+            raise SupervisorError("claude-result-missing")
+        return final, process.returncode
+    submission = submit(process_transport)
+    if submission.status != "submitted":
+        raise SupervisorError(f"turn-{submission.status}")
+    return submission.result or {}, submission.rc
 
 
 def parser() -> argparse.ArgumentParser:
@@ -1108,6 +1370,7 @@ def parser() -> argparse.ArgumentParser:
             "nothing about existing delivery."
         ),
     )
+    value.add_argument("--enable-terminal-commit", action="store_true", default=False)
     return value
 
 
@@ -1173,6 +1436,8 @@ def main(argv: list[str] | None = None) -> int:
     # can flip it for the whole loop -- the reserve is spendable exactly once
     # per owner lifetime (D47-4's "gross_remaining == reserved boundary" case).
     terminal_handoff_issued = [False]
+    pending_handoff_intent = None
+    handoff_claim = None
     next_prompt = initial_prompt
     pending_notice = ""
     continuations = 0
@@ -1188,6 +1453,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         lease.__enter__()
         lease_acquired = True
+        if terminal_commit_enabled(args):
+            recovered_rc = recover_cleanup_on_startup(args)
+            if recovered_rc is not None:
+                return recovered_rc
         if turn_transport == "stream-json":
             stream_session = ClaudeStreamSession(args, session_id)
         recovered = read_supervisor_phase_state(
@@ -1234,7 +1503,7 @@ def main(argv: list[str] | None = None) -> int:
                     (active_outbox.receipt or {})["delivery_timing"]
                 )
         while True:
-            if active_outbox is not None and active_outbox.receipt is not None:
+            if pending_handoff_intent is None and active_outbox is not None and active_outbox.receipt is not None:
                 if delivery_timing["same_thread_resume_ns"] is None:
                     same_thread_resume_count += 1
                 delivery_timing = advance_delivery_timing(
@@ -1273,13 +1542,34 @@ def main(argv: list[str] | None = None) -> int:
                     "monotonic_ns": turn_started_ns,
                 }
             )
+            turn_kwargs = ({"handoff_intent": pending_handoff_intent}
+                           if pending_handoff_intent is not None else {})
             result, process_rc = run_turn(
                 args,
                 session_id,
                 next_prompt,
                 resume=resume,
                 stream_session=stream_session,
+                **turn_kwargs,
             )
+            if pending_handoff_intent is not None:
+                # A cleanup turn is terminal even when the model asks for
+                # another continuation. No second cleanup or new child.
+                settlement = terminal_commit_adapter(args, [])
+                if settlement.result == "completed":
+                    result = dict(result, result=settlement.envelope_text)
+                    terminal = classify_claude_result(result, process_rc)
+                else:
+                    terminal = classify_supervisor_abandonment_terminal(
+                        "claude", "terminal-handoff-incomplete")
+                    result = {"type": "result", "subtype": "error_during_execution",
+                              "is_error": True, "result": "terminal-handoff-incomplete"}
+                if not reconcile(args, terminal):
+                    return 70
+                if settlement.result == "completed":
+                    complete_handoff_after_reconcile(args, handoff_claim)
+                emit(result)
+                return 0 if terminal.failure_class == "pass" else 3
             pending_notice = ""
             turn_completed_ns = time.monotonic_ns()
             emit(
@@ -1491,12 +1781,21 @@ def main(argv: list[str] | None = None) -> int:
                 resume = True
                 continue
             if new_attempts:
+                terminal_commit_mode = terminal_commit_enabled(args)
+                if terminal_commit_mode:
+                    # Claim is zero-delta and deliberately precedes the reserve precheck.
+                    handoff_claim = budget_record.claim_terminal_handoff(
+                        budget_state_root,
+                        owner_attempt_id=args.parent_attempt_id,
+                        route_hash=args.route_hash,
+                        child_attempt_ids=sorted(new_attempts),
+                    )
                 # Cheap, non-mutating fail-fast: this round's real admission
                 # (and its single budget spend) is committed once, at the R2
                 # sealed site below, once the post-join purpose is knowable.
                 # This guard only skips the expensive park+join dance early
                 # when an ordinary admit could not possibly succeed anyway.
-                if not (ledger.gross_remaining > ledger.reserved_remaining):
+                if not (ledger.gross_remaining > ledger.reserved_remaining) and not terminal_commit_mode:
                     next_prompt = _seal_terminal_handoff_or_raise(
                         ledger, budget_state_root, args=args,
                         ordinal=continuations,
@@ -1561,6 +1860,14 @@ def main(argv: list[str] | None = None) -> int:
                     if next_id is None:
                         break
                     last_advanced_attempt_id = next_id
+                    if terminal_commit_mode:
+                        handoff_claim = budget_record.claim_terminal_handoff(
+                            budget_state_root,
+                            owner_attempt_id=args.parent_attempt_id,
+                            route_hash=args.route_hash,
+                            child_attempt_ids=[next_id],
+                            predecessor_claim_id=handoff_claim["claim_id"],
+                        )
                     new_attempts = {next_id}
                     receipt = run_join(args, new_attempts)
                     while receipt["state"] == "timeout":
@@ -1575,9 +1882,6 @@ def main(argv: list[str] | None = None) -> int:
                 # A-4 (F-2): the aggregate owner-resume delivery this round is
                 # about to receive, recorded exactly once regardless of how
                 # many internal advances the loop above just performed.
-                subsession_advance.record_owner_resume_if_chain(
-                    Path(args.jobs), joined_before_chain_advance, last_advanced_attempt_id,
-                )
                 if runtime_reconcile(args, joined, set(new_attempts)):
                     receipt = run_join(args, new_attempts)
                     joined_rows = current_children(
@@ -1601,16 +1905,27 @@ def main(argv: list[str] | None = None) -> int:
                     receipt,
                     stage_advance_record=advanced_record,
                 )
-                terminal_nodes = terminal_route_completion(args, current_rows)
+                # A49-13b: the support gate is evaluated before the legacy
+                # hash/state path.  In the default-off branch this call and
+                # its event sequence remain exactly the historical behavior.
+                terminal_commit_mode = terminal_commit_enabled(args)
+                sealed_envelope = None
+                if terminal_commit_mode:
+                    settled = terminal_commit_adapter(args, current_rows)
+                    terminal_nodes = settled.terminal_nodes if settled.result == "completed" else ()
+                    sealed_envelope = settled.envelope_text if settled.result == "completed" else None
+                else:
+                    terminal_nodes = terminal_route_completion(args, current_rows)
                 if terminal_nodes:
-                    emit(
-                        {
-                            "type": "dispatch.supervisor.terminal-fast-path",
-                            "parent_attempt_id": args.parent_attempt_id,
-                            "terminal_nodes": list(terminal_nodes),
-                            "continuation_saved": True,
-                        }
-                    )
+                    if not terminal_commit_mode:
+                        emit(
+                            {
+                                "type": "dispatch.supervisor.terminal-fast-path",
+                                "parent_attempt_id": args.parent_attempt_id,
+                                "terminal_nodes": list(terminal_nodes),
+                                "continuation_saved": True,
+                            }
+                        )
                     if stream_session is not None:
                         teardown_started_ns = time.monotonic_ns()
                         stream_session.close()
@@ -1629,15 +1944,27 @@ def main(argv: list[str] | None = None) -> int:
                                 ),
                             }
                         )
-                    final_result = terminal_handoff_result(
-                        result, current_rows, terminal_nodes
-                    )
+                    final_result = dict(result)
+                    if terminal_commit_mode and sealed_envelope is not None:
+                        final_result["result"] = sealed_envelope
+                    else:
+                        final_result = terminal_handoff_result(result, current_rows, terminal_nodes)
                     delivery_timing = advance_delivery_timing(
                         delivery_timing, "final_report_marker_ns"
                     )
                     terminal = classify_claude_result(final_result, process_rc)
                     if not reconcile(args, terminal):
                         return 70
+                    if terminal_commit_mode:
+                        complete_handoff_after_reconcile(args, handoff_claim)
+                        emit(
+                            {
+                                "type": "dispatch.supervisor.terminal-fast-path",
+                                "parent_attempt_id": args.parent_attempt_id,
+                                "terminal_nodes": list(terminal_nodes),
+                                "continuation_saved": True,
+                            }
+                        )
                     # F-1: flush strictly AFTER this attempt's own terminal row
                     # commits, so a legitimate handoff's mtime is never earlier
                     # than `classify_handoff`'s mtime-inversion stale check.
@@ -1678,6 +2005,14 @@ def main(argv: list[str] | None = None) -> int:
                 consumption_purpose = (
                     "terminal-handoff" if open_or_running == 0 and gross_exhausted else "ordinary"
                 )
+                if terminal_commit_mode and consumption_purpose == "terminal-handoff":
+                    next_prompt, pending_handoff_intent = prepare_cleanup_handoff(
+                        args, ledger, handoff_claim, joined_rows)
+                    terminal_handoff_issued[0] = True
+                    active_outbox = None
+                    continuations += 1
+                    resume = True
+                    continue
                 verdict, notice = _admit_continuation(
                     ledger, budget_state_root,
                     parent_attempt_id=args.parent_attempt_id,
@@ -1691,6 +2026,9 @@ def main(argv: list[str] | None = None) -> int:
                     # "terminal-handoff" whenever the reserve boundary was
                     # reached, so there is no further cleanup turn to grant.
                     raise SupervisorError("continuation-limit-exceeded")
+                subsession_advance.record_owner_resume_if_chain(
+                    Path(args.jobs), joined_before_chain_advance, last_advanced_attempt_id,
+                )
                 prepared = prepare_supervisor_outbox(
                     state_path,
                     args.parent_attempt_id,

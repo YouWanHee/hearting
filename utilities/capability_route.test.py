@@ -91,6 +91,9 @@ class TestRoute(unittest.TestCase):
   # root ahead of agent-home-relative state (I-2 unification), preferring an
   # inherited AGENT_DISPATCH_JOBS over AGENT_HOME/.dispatch -- clear it too so
   # a developer/CI shell's real registry never leaks into these fixtures.
+  self._env_patch=mock.patch.dict(os.environ, {"XDG_STATE_HOME":self._tmp_home.name+"/state"})
+  self._env_patch.start()
+  self.addCleanup(self._env_patch.stop)
   self._previous_dispatch_jobs=os.environ.get("AGENT_DISPATCH_JOBS")
   os.environ.pop("AGENT_DISPATCH_JOBS",None)
   self.addCleanup(self._restore_agent_home)
@@ -179,7 +182,21 @@ class TestRoute(unittest.TestCase):
   self.assertEqual(a["human_gate_bindings"],[])
  def test_quick_missing_eligibility_fails_closed(self):
   with self.assertRaisesRegex(ValueError,"quick-headless-unavailable"):
+   R.compile_route(**self.args(predicates=[],transport=None,inline_reason=None,requested_intensity="quick"))
+ def test_h6_explicit_direct_predicate_gap_refusal_names_missing(self):
+  # H6: `--intensity direct` whose 7 predicates do not all hold used to be
+  # silently promoted to quick and died as an opaque
+  # `quick-headless-unavailable`. The no-evidence refusal must name the
+  # missing predicates; with checked quick evidence the compile still
+  # promotes (`test_ambiguous_quick`), and a true quick request keeps the
+  # quick eligibility enum.
+  partial=[p for p in ALL if p!="no-shared-contract"]
+  with self.assertRaisesRegex(ValueError,"direct-predicate-gap:no-shared-contract"):
+   R.compile_route(**self.args(predicates=partial,transport=None,inline_reason=None))
+  with self.assertRaisesRegex(ValueError,"direct-predicate-gap:"):
    R.compile_route(**self.args(predicates=[],transport=None,inline_reason=None))
+  with self.assertRaisesRegex(ValueError,"quick-headless-unavailable"):
+   R.compile_route(**self.args(predicates=[],transport=None,inline_reason=None,requested_intensity="quick"))
  def test_quick_invalid_transport_fails_closed(self):
   with self.assertRaisesRegex(ValueError,"invalid quick transport"):
    R.compile_route(**self.args(predicates=[],transport="interactive",inline_reason=None,registered_headless_evidence=self.registered_headless()))
@@ -264,6 +281,7 @@ class TestRoute(unittest.TestCase):
        expected,recipe["standard_plus"].get("parallel_groups"),intensity,
        recipe["capability"],
        auxiliary_check_units=registry.get("auxiliary_check_units"))
+      R._seal_profile_demands(expected, legacy=True)
       for node in expected: node.pop("fallback_hops",None)
       # O3: the shipped default confirmation mode is now `autonomous`, which
       # realizes `autopilot-code`'s `frame` continuation as `inline-next`
@@ -288,7 +306,7 @@ class TestRoute(unittest.TestCase):
   quick["nodes"][0]["model_profile"]="light"
   quick["route_hash"]=R.route_hash(quick)
   quick["route_id"]="rt-"+quick["route_hash"].split(":",1)[1][:16]
-  with self.assertRaisesRegex(ValueError,"quick node axes mismatch"):
+  with self.assertRaisesRegex(ValueError,"sealed profile differs from selection"):
    R.verify_route(quick,R.ROOT)
   standard=R.compile_route(**self.args(
    capability="autopilot-spec",capability_mode="update",
@@ -298,12 +316,27 @@ class TestRoute(unittest.TestCase):
   owner["model_profile"]="balanced-deep"
   standard["route_hash"]=R.route_hash(standard)
   standard["route_id"]="rt-"+standard["route_hash"].split(":",1)[1][:16]
-  with self.assertRaisesRegex(ValueError,"semantic capability owner"):
+  with self.assertRaisesRegex(ValueError,"sealed profile differs from selection"):
    R.verify_route(standard,R.ROOT)
  def test_composed_verify_rejects_rehashed_semantic_owner_profile_drift(self):
   recipe=json.loads(json.dumps(
    R.TOPO.resolve_recipe(R.TOPO.load_registry(),"autopilot-spec","update")))
   recipe["modes"]=["composed-fixture"]
+  for node in recipe["standard_plus"]["nodes"]:
+   if node.get("kind") == "resource-runner": continue
+   profile=node["model_profile"]
+   node["profile_demand"]={"schema_version":1,
+    "judgment_requirement":"difficult-uncertain" if profile=="deep" else "important" if profile=="balanced-deep" else "predetermined",
+    "execution_scope":"extended-multistep" if profile=="balanced" else "short-local",
+    "judgment_reason":"Fixture preserves the declared judgment.",
+    "execution_reason":"Fixture performs its declared steps.","evidence_refs":["fixture.md"]}
+  for group in recipe["standard_plus"].get("parallel_groups",[]):
+   for leg in group.get("legs",[]):
+    profile=leg["model_profile"]
+    leg["profile_demand"]={"schema_version":1,
+     "judgment_requirement":"difficult-uncertain" if profile=="deep" else "important" if profile=="balanced-deep" else "predetermined",
+     "execution_scope":"short-local","judgment_reason":"Fixture declared judgment.",
+     "execution_reason":"Fixture bounded steps.","evidence_refs":["fixture.md"]}
   route=self._composed(recipe)
   route_owner=next(node for node in route["nodes"] if node["id"]=="prd-transaction")
   embedded_owner=next(
@@ -313,7 +346,7 @@ class TestRoute(unittest.TestCase):
   embedded_owner["model_profile"]="balanced-deep"
   route["route_hash"]=R.route_hash(route)
   route["route_id"]="rt-"+route["route_hash"].split(":",1)[1][:16]
-  with self.assertRaisesRegex(ValueError,"semantic capability owner"):
+  with self.assertRaisesRegex(ValueError,"sealed profile differs from selection"):
    R.verify_route(route,R.ROOT)
  def test_strong_expands_asymmetric_parallel_groups(self):
   evidence=self.dispatch(self.nested())
@@ -1503,6 +1536,22 @@ class TestRoute(unittest.TestCase):
  def _composed_recipe(self):
   recipe=json.loads(json.dumps(R.TOPO.resolve_recipe(R.TOPO.load_registry(),"autopilot-code","dev")))
   recipe["modes"]=["composed-fixture"]
+  # This copied/modified recipe is ad-hoc, so each stage supplies its demand.
+  for node in recipe["standard_plus"]["nodes"]:
+   if node.get("kind") == "resource-runner": continue
+   profile=node["model_profile"]
+   node["profile_demand"]={"schema_version":1,
+    "judgment_requirement":"difficult-uncertain" if profile=="deep" else "important" if profile=="balanced-deep" else "predetermined",
+    "execution_scope":"extended-multistep" if profile=="balanced" else "short-local",
+    "judgment_reason":"Fixture preserves the declared judgment.",
+    "execution_reason":"Fixture performs its declared steps.","evidence_refs":["fixture.md"]}
+  for group in recipe["standard_plus"].get("parallel_groups",[]):
+   for leg in group.get("legs",[]):
+    profile=leg["model_profile"]
+    leg["profile_demand"]={"schema_version":1,
+     "judgment_requirement":"difficult-uncertain" if profile=="deep" else "important" if profile=="balanced-deep" else "predetermined",
+     "execution_scope":"short-local","judgment_reason":"Fixture declared judgment.",
+     "execution_reason":"Fixture bounded steps.","evidence_refs":["fixture.md"]}
   return recipe
  def _composed(self,recipe=None):
   return R.compile_composed_route(
@@ -1659,6 +1708,41 @@ class TestRoute(unittest.TestCase):
                         capture_output=True,text=True,cwd=str(R.ROOT))
    self.assertEqual(again.returncode,0,again.stderr)
    self.assertEqual(R.outcome_path(route_path).read_bytes(),before)
+ def test_exact_terminal_identity_tracks_bytes_and_latest_attempt(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   root=Path(tmp); jobs=root/"jobs.log"; evidence=root/"result.md"
+   route=R.compile_route(**self.args(artifact_root=root, requested_intensity="quick", predicates=[],
+       inline_reason=None, registered_headless_evidence=self.registered_headless()))
+   self.assertIs(route["runtime_support"]["terminal_commit"],False)
+   node=route["nodes"][0]; attempt="att-terminal-current"
+   subprocess.run([sys.executable,"-c","pass"],check=True)
+   meta=dict(attempt_schema_version=2,dispatch_depth=1,transport="headless",
+       execution_surface="registered-headless",registered_worker="1",fallback_hop="same-harness-headless",
+       route_id=route["route_id"],route_hash=route["route_hash"],route_node=node["id"],
+       attempt_id=attempt,failure_class="pass",launch_outcome="reaped-before-publish")
+   def row(values):
+    return "2026-09-08T00:00:00Z\tdone\t/repo\t/wt\towner\t"+",".join(f"{k}={v}" for k,v in values.items())+"\n"
+   jobs.write_text(row(meta)); evidence.write_text("first")
+   with mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(jobs)}):
+    R._publish_completion_locked(route,node,node["id"],evidence,attempt_id=attempt,attempt_metadata=meta,jobs=jobs)
+    first=R.terminal_gate_observation(route,jobs=jobs,exact_terminal=True)[node["id"]]
+    self.assertTrue(first["passed"],first)
+    before=R.dispatch_terminal_commit.terminal_marker_digest([first])
+    evidence.write_text("replaced")
+    directory=R.completion_dir(route["route_id"],jobs=jobs)
+    for path in directory.glob(f"{node['id']}*.json"):
+     record=json.loads(path.read_text())
+     if "evidence" in record:record["evidence"]["sha256"]=R.evidence_digest(evidence)
+     if "evidence_sha256" in record:record["evidence_sha256"]=R.evidence_digest(evidence)
+     path.write_text(json.dumps(record))
+    second=R.terminal_gate_observation(route,jobs=jobs,exact_terminal=True)[node["id"]]
+    self.assertTrue(second["passed"],second)
+    self.assertNotEqual(before,R.dispatch_terminal_commit.terminal_marker_digest([second]))
+    jobs.write_text(row(meta)+row(dict(meta,attempt_id="att-terminal-replaced")))
+    stale=R.terminal_gate_observation(route,jobs=jobs,exact_terminal=True)[node["id"]]
+    self.assertFalse(stale["passed"])
+    self.assertEqual(stale["reason"],"completion-attempt-not-current")
+
  def test_close_records_true_for_verified_terminal_marker(self):
   # Red before P2: the outcome had no gate observation at all, so there was nothing to
   # assert `True` against.
@@ -1705,6 +1789,31 @@ class TestRoute(unittest.TestCase):
    self.assertFalse(rows["open-route.json"]["closed"]); self.assertTrue(rows["closed-route.json"]["closed"])
    self.assertFalse(rows["closed-route.json"]["stale_closure"])
    self.assertEqual(rows["closed-route.json"]["head_commit"],"2"*40)
+ def test_sd_open_54_gate_ledger_and_foreign_basenames_in_the_canonical_dir_are_not_routes(self):
+  # #15 (hearting root rt-5d862a3d/rt-94b7f5a5..., cairn W15d): `rt-*.gate-release.json`
+  # (workflow-supervisor ledger) was read as a route -> route-malformed -> the
+  # quiescence observation failed closed. Only `rt-<16 hex>.json` is a route
+  # candidate in the canonical directory; typed sidecars are never candidates.
+  route=R.compile_route(**self.args())
+  with tempfile.TemporaryDirectory() as tmp:
+   root=Path(tmp); canonical=root/".runtime"/"routes"; canonical.mkdir(parents=True)
+   route=dict(route); route["artifact_root"]=str(root); rid=route["route_id"]
+   (canonical/f"{rid}.json").write_text(json.dumps(route),encoding="utf-8")
+   (canonical/f"{rid}.gate-release.json").write_text(json.dumps({"schema_version":1,"route_id":rid,"gate_releases":[]}),encoding="utf-8")
+   (canonical/f"{rid}.superseded-20260907T000000Z.outcome.json").write_text("{}",encoding="utf-8")
+   (canonical/"notes.json").write_text(json.dumps({"kind":"not-a-route"}),encoding="utf-8")
+   diagnostics=[]
+   rows=R.route_status(root,diagnostics=diagnostics)
+   self.assertEqual([Path(r["route_file"]).name for r in rows],[f"{rid}.json"])
+   self.assertEqual(R.route_sidecar_kind(canonical/f"{rid}.gate-release.json"),"gate-release")
+   self.assertEqual(R.route_sidecar_kind(canonical/f"{rid}.superseded-20260907T000000Z.outcome.json"),"outcome")
+   self.assertIsNone(R.route_sidecar_kind(canonical/f"{rid}.json"))
+   self.assertEqual([(Path(d["path"]).name,d["reason"],d["blocking"]) for d in diagnostics],
+                    [("notes.json","route-candidate-foreign-basename",False)])
+   # a truly malformed route record still blocks, as before
+   (canonical/"rt-0123456789abcdef.json").write_text("{",encoding="utf-8")
+   diagnostics=[]; R.route_status(root,diagnostics=diagnostics)
+   self.assertTrue(any(d["reason"].startswith("route-unreadable") and d.get("blocking",True) for d in diagnostics))
  def test_status_flags_a_closure_left_behind_by_a_recompiled_route(self):
   first=R.compile_route(**self.args())
   second=R.compile_route(**self.args(artifact_root=R.ROOT/"other"))
@@ -2338,6 +2447,56 @@ class TestContinuation(unittest.TestCase):
    self._complete_prefix(source,"test",Path(tmp)/"evidence")
    continuation=self._build(source)
    self.assertEqual(continuation["confirmation_mode"],"autonomous")
+
+ def test_sd_open_46_composed_route_continuation_inherits_composition(self):
+  # SD-OPEN-46: a continuation of a composed (compose-on-demand) route must
+  # carry the source's composition fields. Without `composed`/`composed_recipe`
+  # in inherited_keys the suffix looks like a preset route to every consumer
+  # (`compose_card`, CLI status, guards) and the embedded recipe loses its
+  # tamper seal. `route_origin`/`shape` ride `selection`, which is inherited
+  # wholesale -- asserted here so a future refactor cannot drop them.
+  with tempfile.TemporaryDirectory() as tmp:
+   artifact=Path(tmp)/"artifacts"
+   recipe=json.loads(json.dumps(
+    R.TOPO.resolve_recipe(R.TOPO.load_registry(),"autopilot-code","dev")))
+   recipe["modes"]=["composed-fixture"]
+   for node in recipe["standard_plus"]["nodes"]:
+    if node.get("kind") == "resource-runner": continue
+    profile=node["model_profile"]
+    node["profile_demand"]={"schema_version":1,
+     "judgment_requirement":"difficult-uncertain" if profile=="deep" else "important" if profile=="balanced-deep" else "predetermined",
+     "execution_scope":"extended-multistep" if profile=="balanced" else "short-local",
+     "judgment_reason":"Fixture preserves the declared judgment.",
+     "execution_reason":"Fixture performs its declared steps.","evidence_refs":["fixture.md"]}
+   for group in recipe["standard_plus"].get("parallel_groups",[]):
+    for leg in group.get("legs",[]):
+     profile=leg["model_profile"]
+     leg["profile_demand"]={"schema_version":1,
+      "judgment_requirement":"difficult-uncertain" if profile=="deep" else "important" if profile=="balanced-deep" else "predetermined",
+      "execution_scope":"short-local","judgment_reason":"Fixture declared judgment.",
+      "execution_reason":"Fixture bounded steps.","evidence_refs":["fixture.md"]}
+   gate={
+    "spec_read":{"satisfied":True,"source":"canonical-prd-sha256"},
+    "drift_verdict":"within-spec","workflow_mode":"tracked",
+    "artifact_guard":{"satisfied":True,"source":"conductor-prechecked"},
+   }
+   source=R.compile_composed_route(
+    recipe,"composed-fixture","strong",R.ROOT,artifact,
+    predicates=[],signals=["shared-contract"],transport="headless",
+    tracking="tracked",tracked_gate_evidence=gate,
+    dispatch_evidence=self._dispatch(),
+    route_origin="compose",shape="staged",
+   )
+   self.assertIs(source["composed"],True)
+   self.assertEqual(source["selection"]["route_origin"],"compose")
+   self.assertEqual(source["selection"]["shape"],"staged")
+   self._complete_prefix(source,"test",Path(tmp)/"evidence")
+   continuation=self._build(source)
+   self.assertIs(continuation["composed"],True)
+   self.assertEqual(continuation["composed_recipe"],source["composed_recipe"])
+   self.assertEqual(continuation["selection"]["route_origin"],"compose")
+   self.assertEqual(continuation["selection"]["shape"],"staged")
+   R.verify_route(continuation,R.ROOT)
 
  def test_at2_boundary_and_first_runnable_blockers_are_disjoint(self):
   with tempfile.TemporaryDirectory() as tmp:
@@ -3284,6 +3443,9 @@ class TestContinuation(unittest.TestCase):
      % (R.ROOT, R.ROOT, source["artifact_root"], source_path, source["route_id"], source["route_hash"]), encoding="utf-8")
     env=os.environ.copy()
     for key in ("AGENT_DISPATCH_OWNER_HARNESS","AGENT_DISPATCH_CURRENT_HARNESS",
+                "AGENT_DISPATCH_WORKER_TYPE","AGENT_DISPATCH_DEPTH",
+                "AGENT_DISPATCH_ATTEMPT_SCHEMA_VERSION",
+                "AGENT_DISPATCH_EXECUTION_SURFACE","AGENT_DISPATCH_REGISTERED_WORKER",
                 "CODEX_THREAD_ID","CLAUDE_CODE_SESSION_ID","AGENT_DISPATCH_PARENT_SESSION_ID"):
      env.pop(key,None)
     env["AGENT_DISPATCH_ATTEMPT_ID"]="att-cli-owner"; env["AGENT_OWNER_ROUTE_FILE"]=str(source_path)
@@ -3349,6 +3511,9 @@ class TestContinuation(unittest.TestCase):
      % (R.ROOT, R.ROOT, source["artifact_root"], source_path, source["route_id"], source["route_hash"]), encoding="utf-8")
     env=os.environ.copy()
     for key in ("AGENT_DISPATCH_OWNER_HARNESS","AGENT_DISPATCH_CURRENT_HARNESS",
+                "AGENT_DISPATCH_WORKER_TYPE","AGENT_DISPATCH_DEPTH",
+                "AGENT_DISPATCH_ATTEMPT_SCHEMA_VERSION",
+                "AGENT_DISPATCH_EXECUTION_SURFACE","AGENT_DISPATCH_REGISTERED_WORKER",
                 "CODEX_THREAD_ID","CLAUDE_CODE_SESSION_ID","AGENT_DISPATCH_PARENT_SESSION_ID"):
      env.pop(key,None)
     env["AGENT_DISPATCH_ATTEMPT_ID"]="att-cli-replay"; env["AGENT_OWNER_ROUTE_FILE"]=str(source_path)
@@ -3763,6 +3928,43 @@ class TestValidationBasis(unittest.TestCase):
    self.assertEqual(launch.returncode,64,launch.stderr)
    self.assertIn("launch-runtime-root-mismatch phase=start mismatch=runtime_root",launch.stderr)
    self.assertIn("registered=0 started=0 child_spawned=0",launch.stderr)
+ def test_malformed_runtime_root_keeps_typed_launch_refusal(self):
+  roots=(7,[],None,{"path":7},{"path":[]},{"path":"relative/root"})
+  with tempfile.TemporaryDirectory() as tmp:
+   fixed_cwd=Path(tmp)/"cwd"; fixed_root=Path(tmp)/"artifacts"
+   fixed_cwd.mkdir(); fixed_root.mkdir()
+   original=R.compile_route(**self.args(cwd=fixed_cwd,artifact_root=fixed_root))
+   env=os.environ.copy(); env["AGENT_HOME"]=self._tmp_home.name
+   env.pop("AGENT_DISPATCH_JOBS",None)
+   expected=str(Path(env.get("XDG_DATA_HOME",str(Path.home()/".local/share")))/"hearting/current")
+   for runtime in roots:
+    with self.subTest(runtime=runtime):
+     route=json.loads(json.dumps(original))
+     route["launch_compatibility_tuple"]["runtime_root"]=runtime
+     route=self._reseal(route)
+     R.verify_route(route,fixed_cwd)
+     compatible,mismatches=R.revalidate_launch_compatibility(route)
+     self.assertFalse(compatible); self.assertIn("runtime_root",mismatches)
+     route_path=Path(tmp)/"route.json"; route_path.write_text(json.dumps(route))
+     result=subprocess.run(
+      [sys.executable,str(P),"verify","--route",str(route_path),"--cwd",str(fixed_cwd),
+       "--launch-phase","start"],capture_output=True,text=True,cwd=str(R.ROOT),env=env,
+     )
+     self.assertEqual(result.returncode,64,result.stderr)
+     self.assertIn("launch-runtime-root-mismatch",result.stderr)
+     self.assertIn("registered=0 started=0 child_spawned=0",result.stderr)
+     self.assertIn(expected,result.stderr)
+     self.assertNotIn("Traceback",result.stderr)
+ def test_runtime_root_hint_is_total_for_json_shapes(self):
+  for value in (None,7,True,"scalar",[],{}, {"path":7},{"path":[]},{"path":"relative"}):
+   with self.subTest(value=value):
+    for route in (value,{"launch_compatibility_tuple":value},
+                  {"launch_compatibility_tuple":{"runtime_root":value}}):
+     hint=R.runtime_root_hint(route)
+     self.assertIn("hearting/current",hint)
+     self.assertIn("AGENT_HOME=",hint)
+  hint=R.runtime_root_hint({"launch_compatibility_tuple":{"runtime_root":{"path":"/sealed root"}}})
+  self.assertIn("AGENT_HOME='/sealed root'",hint)
  def test_legacy_tuple_absence_is_read_only_compatible(self):
   import subprocess,sys
   route=R.compile_route(**self.args())
@@ -5074,5 +5276,65 @@ class ComposeRouteTest(TestRoute):
   self.assertEqual(route["selection"]["route_origin"],"preset"); self.assertEqual(route["selection"]["shape"],"direct")
   self.assertEqual(R.shape_for_intensity("quick"),"solo"); self.assertEqual(R.shape_for_intensity("thorough"),"staged")
   with self.assertRaisesRegex(ValueError,"invalid route origin"): R.compile_route(**self.args(route_origin="guess"))
+
+class OwnerRegisteredCompletionTest(unittest.TestCase):
+ """노드 키가 없는 실제 depth-1 오너 행도 등록 완료로 결속한다."""
+ setUp=InlineStageCompletionRecipeTest.setUp
+ _restore=InlineStageCompletionRecipeTest._restore
+
+ def fixture(self, **overrides):
+  t=TestRoute()
+  route=R.compile_route(**t.args(capability="autopilot-spec",capability_mode="update",
+   artifact_root=self.base/"artifacts",requested_intensity="standard",predicates=[],
+   signals=["shared-contract"],transport="headless",inline_reason=None,
+   dispatch_evidence=t.dispatch(t.nested())))
+  node=next(n for n in route["nodes"] if n["id"]=="prd-transaction")
+  path=Path(route["artifact_root"])/".runtime"/"routes"/(route["route_id"]+".json")
+  path.parent.mkdir(parents=True); path.write_text(json.dumps(route))
+  evidence=self.base/"artifacts"/"report.md"; evidence.write_text("검증 완료\n")
+  meta={"attempt_schema_version":"2","dispatch_depth":"1","transport":"headless",
+   "execution_surface":"registered-headless","registered_worker":"1",
+   "fallback_hop":"same-harness-headless","attempt_id":"att-terminal-owner",
+   "worker_type":"owner","unit":"_kernel/owner",
+   "owner_route_id":route["route_id"],"owner_route_hash":route["route_hash"],
+   "owner_route_file":str(path),"pid":"2147483647","pid_start":"1"}
+  meta.update(overrides)
+  self.jobs.write_text("\t".join(["2026-09-07T00:00:00Z","open","repo","worktree","owner",
+   ",".join(k+"="+v for k,v in meta.items())])+"\n")
+  return route,node,path,evidence
+
+ def test_owner_complete_cli_uses_registered_row_and_replays(self):
+  route,node,path,evidence=self.fixture()
+  command=[str(P),"complete","--route",str(path),"--node",node["id"],
+   "--evidence",str(evidence),"--jobs",str(self.jobs),"--attempt-id","att-terminal-owner"]
+  for status in ("closed","already-closed"):
+   output=io.StringIO()
+   with mock.patch.object(sys,"argv",command),contextlib.redirect_stdout(output):
+    R.main()
+   marker,row=map(json.loads,output.getvalue().splitlines())
+   self.assertEqual(row["status"],status)
+   self.assertTrue(marker["registered_worker"])
+   self.assertEqual(marker["attempt_id"],"att-terminal-owner")
+   self.assertTrue(D.completion_marker_is_current(route,node,
+    R.completion_dir(route["route_id"])/"prd-transaction.json"))
+   # Identity lookup and the real registry writer are exercised; OS liveness
+   # is isolated so this fixture never claims anything about host processes.
+   for process,state in ((D.ProcessQuiescence("quiescent","fixture"),"ready"),
+                         (D.ProcessQuiescence("live","fixture"),"draining")):
+    with mock.patch.object(D,"attempt_process_quiescence",return_value=process) as probe:
+     self.assertEqual(D.completion_attempt_readiness(route,node,marker,self.jobs).state,state)
+     probe.assert_called_once()
+  metadata=D.parse_registry_metadata(self.jobs.read_text().split("\t")[5])
+  self.assertNotIn("route_id",metadata,"읽는 쪽 수정이며 등록 신원 재작성은 금지")
+  self.assertEqual(metadata["owner_route_id"],route["route_id"])
+
+ def test_foreign_owner_identity_cannot_publish_or_close(self):
+  route,node,path,evidence=self.fixture(owner_route_hash="sha256:"+"f"*64)
+  before=self.jobs.read_bytes()
+  with self.assertRaisesRegex(ValueError,"route identity"):
+   R.complete_node(route,node,node["id"],evidence,jobs=self.jobs,attempt_id="att-terminal-owner")
+  self.assertEqual(self.jobs.read_bytes(),before)
+  self.assertFalse((R.completion_dir(route["route_id"])/"prd-transaction.json").exists())
+
 
 if __name__=="__main__": unittest.main()

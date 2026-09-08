@@ -8,6 +8,7 @@ import errno
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -27,7 +28,34 @@ import codex_launcher as installer_launcher  # noqa: E402
 import fixture_env  # noqa: E402
 
 
-class CodexLauncherRuntimeTest(unittest.TestCase):
+# Every AGENT_* switch this launcher reads. A dispatched worker runs with these set
+# in its real environment, and every fixture below patches os.environ with
+# `clear=False`, so without this scrub an ambient value silently decides
+# `should_manage`, the interactive posture default, or the re-entry guard.
+AMBIENT_LAUNCHER_ENV = (
+    "AGENT_CODEX_LAUNCHER_BYPASS",
+    "AGENT_CODEX_LAUNCHER_GUARD_PID",
+    "AGENT_CODEX_INTERACTIVE_PERMISSION_MODE",
+    "AGENT_HOME",
+    "AGENT_RUNTIME_ROOT",
+    "AGENT_RUNTIME_IDENTITY",
+    "AGENT_RUNTIME_ACTIVATION_MODE",
+    "CODEX_HOME",
+)
+
+
+class LauncherTestCase(unittest.TestCase):
+    """Run every case against a known environment, not the worker's ambient one."""
+
+    def setUp(self) -> None:
+        scrubbed = mock.patch.dict(os.environ, {}, clear=False)
+        scrubbed.start()
+        for name in AMBIENT_LAUNCHER_ENV:
+            os.environ.pop(name, None)
+        self.addCleanup(scrubbed.stop)
+
+
+class CodexLauncherRuntimeTest(LauncherTestCase):
     def _state_fixture(self, root: Path, real: Path, *, lock_mode: int | None = 0o600) -> Path:
         home = root / ".codex"
         harness = home / ".harness"
@@ -1167,7 +1195,7 @@ class InstallerLifecycleLockInvariantTest(unittest.TestCase):
             launcher._launcher_lock(self.codex_home)
 
 
-class InteractivePermissionModeTest(unittest.TestCase):
+class InteractivePermissionModeTest(LauncherTestCase):
     """User decision 2026-09-03 — a managed interactive Codex session starts in bypass."""
 
     def _mode_env(self, value=None):
@@ -1278,6 +1306,284 @@ class InteractivePermissionModeTest(unittest.TestCase):
             command = launcher.managed_command(applied, home, Path("/usr/bin/codex"), binding)
             trailing = command[command.index("--") + 1:]
             self.assertEqual(trailing, [launcher.BYPASS_FLAG, "resume", "--last"])
+
+
+REAL_CODEX_STUB = """#!/bin/sh
+echo "REAL-CODEX $*"
+"""
+
+
+def _bubblewrap() -> str | None:
+    binary = shutil.which("bwrap")
+    if binary is None:
+        return None
+    result = subprocess.run([binary, "--unshare-user", "--dev-bind", "/", "/",
+                             "--", "/bin/true"], capture_output=True, timeout=10)
+    return binary if result.returncode == 0 else None
+
+
+class ReadOnlyLauncherStateTest(LauncherTestCase):
+    """SD-64: a nested reviewer sees CODEX_HOME through a read-only mount.
+
+    The parent Codex process runs sandboxed; `~/.codex/.harness/dispatch` is a
+    granted writable root but `~/.codex/.harness/codex-launcher.lock` is its
+    sibling and is not. Every one of these cases exercises the installed state
+    layout and the real operating system: only the *recorded Codex command* is a
+    stub, so the launcher's state validation, lock protocol, and the filesystem's
+    own read-only enforcement are the things under test.
+    """
+
+    def _installed_home(self, root: Path, *, lock: bool) -> Path:
+        home = root / ".codex"
+        harness = home / ".harness"
+        harness.mkdir(parents=True)
+        home.chmod(0o700)
+        harness.chmod(0o700)
+        real = root / "vendor" / "codex"
+        real.parent.mkdir()
+        real.write_text(REAL_CODEX_STUB, encoding="utf-8")
+        real.chmod(0o755)
+        ingress = harness / "bin" / "codex"
+        ingress.parent.mkdir()
+        ingress.write_bytes(b"#!/bin/sh\n# protected ingress\n")
+        ingress.chmod(0o755)
+        state = harness / "codex-launcher.json"
+        state.write_text(
+            json.dumps(
+                {
+                    "schema": 2,
+                    "phase": "installed",
+                    "real_command": str(real),
+                    "ingress_path": str(ingress),
+                    "wrapper_path": str(ingress),
+                }
+            ),
+            encoding="utf-8",
+        )
+        state.chmod(0o600)
+        if lock:
+            # What `tools/install/codex_launcher.py::_LauncherLock` leaves behind.
+            lock_file = harness / "codex-launcher.lock"
+            lock_file.write_bytes(b"")
+            lock_file.chmod(0o600)
+        return home
+
+    def _run(self, home: Path, args: list[str], *, readonly_root: Path | None):
+        command = []
+        if readonly_root is not None:
+            command += [
+                _bubblewrap(),
+                "--unshare-user",
+                "--dev-bind",
+                "/",
+                "/",
+                "--ro-bind",
+                str(readonly_root),
+                str(readonly_root),
+                "--",
+            ]
+        command += [sys.executable, str(MODULE_PATH), *args]
+        environment = {
+            **os.environ,
+            "CODEX_HOME": str(home),
+            "HOME": str(home.parent),
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+        for name in AMBIENT_LAUNCHER_ENV:
+            if name not in {"CODEX_HOME"}:
+                environment.pop(name, None)
+        return subprocess.run(
+            command,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+
+    @unittest.skipIf(_bubblewrap() is None, "bubblewrap user namespace is unavailable")
+    def test_passthrough_survives_a_read_only_codex_home(self) -> None:
+        # `codex exec` is exactly what the registered dispatch wrapper runs for a
+        # nested Codex reviewer, and it never touches managed state.
+        for lock in (True, False):
+            with self.subTest(lock_file_present=lock), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                home = self._installed_home(root, lock=lock)
+                result = self._run(home, ["exec", "--fixture"], readonly_root=root)
+                if lock:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("REAL-CODEX exec --fixture", result.stdout)
+                else:
+                    # Missing readonly lock retains the original refusal. There
+                    # must be no unlocked read of the install transaction.
+                    self.assertEqual(result.returncode, 69, result.stderr)
+                    self.assertIn("launcher lock is unavailable", result.stderr)
+                    self.assertNotIn("REAL-CODEX", result.stdout)
+
+    @unittest.skipIf(_bubblewrap() is None, "bubblewrap user namespace is unavailable")
+    def test_admin_surfaces_survive_a_read_only_codex_home(self) -> None:
+        for args in (["--version"], ["app-server", "--help"], ["login", "--device-auth"]):
+            with self.subTest(args=args), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                home = self._installed_home(root, lock=True)
+                result = self._run(home, args, readonly_root=root)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("REAL-CODEX " + " ".join(args), result.stdout)
+
+    @unittest.skipIf(_bubblewrap() is None, "bubblewrap user namespace is unavailable")
+    def test_a_read_only_home_still_refuses_unsafe_recorded_state(self) -> None:
+        # Read-only tolerance must not become "skip the checks".
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = self._installed_home(root, lock=True)
+            state = home / ".harness" / "codex-launcher.json"
+            state.chmod(0o644)
+            result = self._run(home, ["exec", "--fixture"], readonly_root=root)
+            self.assertEqual(result.returncode, 69)
+            self.assertIn("state is unavailable", result.stderr)
+
+    def test_a_writable_home_behaves_identically(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = self._installed_home(root, lock=True)
+            result = self._run(home, ["exec", "--fixture"], readonly_root=None)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("REAL-CODEX exec --fixture", result.stdout)
+
+    def test_reading_installed_state_writes_nothing(self) -> None:
+        """The read path must not mutate the state tree even where it could.
+
+        This is the root cause the read-only mount only made visible: the reader
+        opened the lock for write and re-chmodded it on every single invocation.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = self._installed_home(root, lock=True)
+            harness = home / ".harness"
+            before = {
+                path.name: path.stat()
+                for path in sorted(harness.iterdir())
+                if path.is_file()
+            }
+            result = self._run(home, ["exec", "--fixture"], readonly_root=None)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            after = {
+                path.name: path.stat()
+                for path in sorted(harness.iterdir())
+                if path.is_file()
+            }
+            self.assertEqual(sorted(before), sorted(after))
+            for name, info in before.items():
+                self.assertEqual(info.st_ctime_ns, after[name].st_ctime_ns, name)
+                self.assertEqual(info.st_mtime_ns, after[name].st_mtime_ns, name)
+                self.assertEqual(info.st_mode, after[name].st_mode, name)
+
+    def test_the_reader_lock_is_shared_and_still_excludes_an_installer(self) -> None:
+        """`tools/install/codex_launcher.py` takes LOCK_EX for its transaction.
+
+        flock conflicts are per open file description, so a second descriptor in
+        this same process is a faithful stand-in for the installer.
+        """
+        if launcher.fcntl is None:  # pragma: no cover - POSIX only
+            self.skipTest("fcntl is unavailable")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = self._installed_home(root, lock=True)
+            held = launcher._launcher_lock(home)
+            self.assertIsNotNone(held)
+            try:
+                with (home / ".harness" / "codex-launcher.lock").open("r+b") as installer:
+                    with self.assertRaises(BlockingIOError):
+                        launcher.fcntl.flock(
+                            installer.fileno(),
+                            launcher.fcntl.LOCK_EX | launcher.fcntl.LOCK_NB,
+                        )
+                    # A second concurrent launcher must not be serialized.
+                    launcher.fcntl.flock(
+                        installer.fileno(),
+                        launcher.fcntl.LOCK_SH | launcher.fcntl.LOCK_NB,
+                    )
+                    launcher.fcntl.flock(installer.fileno(), launcher.fcntl.LOCK_UN)
+            finally:
+                launcher._unlock(held)
+            with (home / ".harness" / "codex-launcher.lock").open("r+b") as installer:
+                launcher.fcntl.flock(
+                    installer.fileno(), launcher.fcntl.LOCK_EX | launcher.fcntl.LOCK_NB
+                )
+                launcher.fcntl.flock(installer.fileno(), launcher.fcntl.LOCK_UN)
+
+    def test_missing_lock_is_refused_even_in_a_writable_home(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = self._installed_home(Path(temporary), lock=False)
+            with self.assertRaises(launcher.LauncherError):
+                launcher._launcher_lock(home)
+            self.assertFalse((home / ".harness/codex-launcher.lock").exists())
+
+    def test_lock_open_errors_never_remove_installer_synchronization(self) -> None:
+        import errno
+        with tempfile.TemporaryDirectory() as temporary:
+            home = self._installed_home(Path(temporary), lock=True)
+            lock = home / ".harness/codex-launcher.lock"
+            before = lock.stat()
+            for error in (errno.EACCES, errno.EPERM, errno.ENOSPC, errno.EDQUOT,
+                          errno.ELOOP, errno.ENOENT, errno.EROFS):
+                with self.subTest(error=error), mock.patch.object(
+                    launcher.os, "open", side_effect=OSError(error, "blocked")
+                ), self.assertRaises(launcher.LauncherError):
+                    launcher._launcher_lock(home)
+                after = lock.stat()
+                self.assertEqual((before.st_ino, before.st_ctime_ns),
+                                 (after.st_ino, after.st_ctime_ns))
+
+    def test_a_symlinked_or_replaced_lock_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = self._installed_home(root, lock=False)
+            path = home / ".harness" / "codex-launcher.lock"
+            elsewhere = root / "elsewhere"
+            elsewhere.write_bytes(b"")
+            path.symlink_to(elsewhere)
+            with self.assertRaises(launcher.LauncherError):
+                launcher._launcher_lock(home)
+            path.unlink()
+            path.mkdir()
+            with self.assertRaises(launcher.LauncherError):
+                launcher._launcher_lock(home)
+
+    def test_state_metadata_and_bytes_come_from_one_descriptor(self) -> None:
+        """A concurrent installer replaces the pathname atomically.
+
+        Checking the pathname and then reading it again could pair the old
+        inode's permissions with the new inode's bytes; both must come from the
+        descriptor the content is read from.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = self._installed_home(root, lock=True)
+            state = home / ".harness" / "codex-launcher.json"
+            self.assertEqual(
+                launcher._state(home)["real_command"], str(root / "vendor" / "codex")
+            )
+            opened: list[int] = []
+            real_open = launcher.os.open
+
+            def counting_open(path, flags, *rest, **kwargs):
+                descriptor = real_open(path, flags, *rest, **kwargs)
+                if str(path) == str(state) or (str(path) == state.name and "dir_fd" in kwargs):
+                    opened.append(descriptor)
+                return descriptor
+
+            with mock.patch.object(launcher.os, "open", counting_open):
+                launcher._state(home)
+            self.assertEqual(len(opened), 1)
+            replacement = home / ".harness" / "replacement.json"
+            replacement.write_text("{}\n", encoding="utf-8")
+            replacement.chmod(0o644)
+            os.replace(replacement, state)
+            with self.assertRaises(launcher.LauncherError) as caught:
+                launcher._state(home)
+            self.assertIn("state is unavailable", str(caught.exception))
 
 
 if __name__ == "__main__":

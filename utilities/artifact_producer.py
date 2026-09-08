@@ -38,6 +38,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import sys
 import time
 from pathlib import Path
@@ -52,7 +53,19 @@ import artifact_lifecycle  # noqa: E402
 import artifact_locator  # noqa: E402
 import artifact_manifest  # noqa: E402
 import route_identity  # noqa: E402
-from dispatch_contract import process_start_ticks  # noqa: E402
+import dispatch_terminal_commit  # noqa: E402
+from dispatch_contract import (  # noqa: E402
+    _PROCESS_IDENTITY_METADATA_KEYS,
+    encode_review_output_locator,
+    review_governed_lease_is_held,
+    review_lease_record_digest,
+    process_start_ticks,
+    resolve_dispatch_state_root,
+    resolve_agent_home,
+    review_output_binding_digest,
+    review_output_write_authorized,
+    validate_review_output_binding,
+)
 
 PRODUCER_REL = ".runtime/artifact-producer/v1"
 CONTRACT = "artifact-producer/v1"
@@ -881,7 +894,10 @@ def begin(
     shared_reference_pins: Optional[Sequence[Mapping[str, Any]]] = None,
     allocator: Optional[artifact_identity.IdAllocator] = None,
     now: Optional[float] = None,
+    jobs: Optional[Path] = None,
+    owner_attempt_id: Optional[str] = None,
 ) -> Dict[str, Any]:
+    dispatch_terminal_commit.require_current_cleanup("producer-begin", jobs=jobs)
     root = Path(root).resolve()
     if capability not in ENTRY_CAPABILITIES + STAGE_CAPABILITIES:
         raise ProducerError("capability-unknown", capability)
@@ -929,6 +945,33 @@ def begin(
     identity = artifact_lifecycle.read_root_identity(root)
     if identity is None:
         raise ProducerError("root-identity-missing")
+    # SD-120 A1: only registered owner/worker contexts participate.  The
+    # canonical jobs path and attempt identity come from the runtime; callers
+    # do not get a route/owner override surface.
+    binding_jobs = Path(jobs or os.environ.get("AGENT_DISPATCH_JOBS", ""))
+    if not binding_jobs.is_absolute() or not binding_jobs.is_file():
+        binding_jobs = None  # type: ignore[assignment]
+    binding_owner = owner_attempt_id or os.environ.get("AGENT_DISPATCH_ATTEMPT_ID", "")
+    if node_id is not None:
+        binding_owner = os.environ.get("AGENT_DISPATCH_PARENT_ATTEMPT_ID", binding_owner)
+    owner_begin = node_id is None
+    if binding_jobs is not None and binding_owner:
+        try:
+            owner_binding = dispatch_terminal_commit.validate_owner_route(
+                jobs=binding_jobs, route_file=resolved_route_file, owner_attempt_id=binding_owner)
+            existing_open = next((row for row in list_cycle_records(root)
+                                  if row.get("route_id") == route["route_id"] and row.get("state") == "open"), None)
+            binding_path = dispatch_terminal_commit.producer_binding_path(
+                root, owner_binding.route_id, binding_owner)
+            if binding_path.exists():
+                loaded = dispatch_terminal_commit.load_producer_binding(
+                    artifact_root=root, route_id=owner_binding.route_id, owner_attempt_id=binding_owner)
+                if existing_open is None or loaded.binding.get("cycle_id") != existing_open.get("cycle_id"):
+                    raise dispatch_terminal_commit.TerminalCommitError("transaction-conflict", str(binding_path))
+            elif not owner_begin and existing_open is None:
+                raise dispatch_terminal_commit.TerminalCommitError("producer-binding-required", str(binding_path))
+        except dispatch_terminal_commit.TerminalCommitError as exc:
+            raise ProducerError(exc.code, exc.detail) from exc
     lock_fd = artifact_admission._acquire_lock(root, artifact_admission.LOCK_TIMEOUT_DEFAULT, now=now)
     try:
         # W7G owns a root-wide resplit from R2 through R3.  Check its atomic
@@ -944,6 +987,14 @@ def begin(
             if record.get("route_id") == route["route_id"] and record.get("state") == "open":
                 if record.get("route_hash") != route["route_hash"]:
                     raise ProducerError("route-hash-drift", record["cycle_id"])
+                if binding_jobs is not None and binding_owner:
+                    try:
+                        dispatch_terminal_commit.publish_producer_binding(
+                            artifact_root=root, jobs=binding_jobs, route_file=resolved_route_file,
+                            owner_attempt_id=binding_owner, cycle_id=record["cycle_id"],
+                            owner_begin=owner_begin)
+                    except dispatch_terminal_commit.TerminalCommitError as exc:
+                        raise ProducerError(exc.code, exc.detail) from exc
                 return {
                     "status": "resumed", "layout": "cycle", "campaign_id": record["campaign_id"],
                     "cycle_id": record["cycle_id"], "producer_id": record["producer_id"],
@@ -1059,6 +1110,14 @@ def begin(
         campaign["cycles"] = list(campaign.get("cycles", [])) + [new_cycle_id]
         _write_campaign(root, campaign, exclusive=False)
         _write_cycle_binding(target, campaign["campaign_id"], new_cycle_id)
+        if binding_jobs is not None and binding_owner:
+            try:
+                dispatch_terminal_commit.publish_producer_binding(
+                    artifact_root=root, jobs=binding_jobs, route_file=resolved_route_file,
+                    owner_attempt_id=binding_owner, cycle_id=new_cycle_id,
+                    owner_begin=owner_begin)
+            except dispatch_terminal_commit.TerminalCommitError as exc:
+                raise ProducerError(exc.code, exc.detail) from exc
         artifact_locator.rebuild_indexes(root)
         return {
             "status": "begun", "layout": "cycle", "campaign_id": campaign["campaign_id"],
@@ -1288,7 +1347,11 @@ def build_manifest(
     }
     closed = route_is_closed(root, route)
     if not closed and not allow_open_route:
-        raise ProducerError("route-not-closed", route["route_id"])
+        raise ProducerError(
+            "route-not-closed",
+            f"{route['route_id']}: required order: complete -> close -> finalize -> admit-shared; "
+            "complete the terminal node using verified cycle-local evidence, then close the route",
+        )
     # D-6: a `completed` cycle must bind a route.terminal.recorded event, which
     # only exists once the route is closed.  Sealing an open route therefore
     # records a provisional `active` cycle (lineage committed, completion not
@@ -1406,7 +1469,10 @@ def _rfc3339_to_epoch(value: str) -> float:
     return time.mktime(time.strptime(value, "%Y-%m-%dT%H:%M:%SZ")) - time.timezone
 
 
-def _lease_record_is_live(record: Optional[Dict[str, Any]], *, now: Optional[float] = None) -> bool:
+def _lease_record_is_live(
+    record: Optional[Dict[str, Any]], *, root: Optional[Path] = None,
+    now: Optional[float] = None,
+) -> bool:
     """SD-105/SD-90 evidence hierarchy, cited not redefined (plan.md §6.2):
     exact PID/start/PGID identity, a finite deadline, and judgment-impossible
     inputs (corrupt record, unreadable /proc, clock anomaly, missing field)
@@ -1427,6 +1493,33 @@ def _lease_record_is_live(record: Optional[Dict[str, Any]], *, now: Optional[flo
     when = time.time() if now is None else now
     if when > deadline_ts:
         return False
+    if _is_v2_review_lease(record):
+        if record.get("expired") is not False:
+            return True
+        acquired_at = record.get("acquired_at")
+        try:
+            acquired_ts = (
+                _rfc3339_to_epoch(acquired_at)
+                if isinstance(acquired_at, str) else None
+            )
+        except (ValueError, OverflowError):
+            return True
+        nonce = record.get("review_governed_lease_nonce")
+        if (
+            root is None or acquired_ts is None or acquired_ts > when
+            or deadline_ts <= acquired_ts
+            or not isinstance(record.get("attempt_id"), str)
+            or not isinstance(record.get("cycle_id"), str)
+            or record.get("review_governed_lease") is None
+            or not isinstance(nonce, str)
+        ):
+            return True
+        return review_governed_lease_is_held(root, {
+            "attempt_id": record["attempt_id"],
+            "review_cycle_id": record["cycle_id"],
+            "review_governed_lease": record["review_governed_lease"],
+            "review_governed_lease_nonce": nonce,
+        })
     pid = record.get("pid")
     pid_start = record.get("pid_start")
     pgid = record.get("pgid")
@@ -1444,10 +1537,19 @@ def _lease_record_is_live(record: Optional[Dict[str, Any]], *, now: Optional[flo
     return actual_pgid == pgid
 
 
-def _live_review_lease(root: Path, cycle_id: str) -> Optional[Path]:
+def _is_v2_review_lease(record: object) -> bool:
+    """Identify the exact-output lease without changing the v1 union seam."""
+
+    return isinstance(record, Mapping) and record.get("schema_version") == 2
+
+
+def _live_review_lease(
+    root: Path, cycle_id: str, *, now: Optional[float] = None
+) -> Optional[Path]:
     lease_dir = _review_lease_dir(root, cycle_id)
     if not lease_dir.is_dir():
         return None
+    conservative: Optional[Path] = None
     for path in sorted(lease_dir.glob("*.json")):
         record = _read_json(path)
         if record is None:
@@ -1455,37 +1557,347 @@ def _live_review_lease(root: Path, cycle_id: str) -> Optional[Path]:
             # read here is corruption, not absence -- conservative live
             # (E47-4), unlike `_lease_record_is_live(None)` below which
             # means "no lease file at this specific path".
-            return path
-        if _lease_record_is_live(record):
-            return path
-    return None
+            conservative = conservative or path
+            continue
+        if _lease_record_is_live(record, root=root, now=now):
+            # Completed sealing cares about a live exact-report lease wherever
+            # it appears in a mixed v1/v2 directory. Preserve the first
+            # conservative v1/corrupt candidate for abandon semantics, but let
+            # any live v2 report lease win this single union seam.
+            if _is_v2_review_lease(record):
+                return path
+            conservative = conservative or path
+    return conservative
+
+
+def _raise_if_recovery_fenced(root: Path, cycle_id: str, *, now: Optional[float] = None) -> None:
+    """Keep recovery from sealing a cycle under a live v2 review lease.
+
+    Recovery is itself a publication path: both a journal roll-forward and
+    discovery of an already-published manifest call ``_commit_sealed``.  The
+    normal finalize fence therefore has to be repeated immediately before
+    that mutation.  Legacy v1 leases remain governed by their existing
+    abandon-only policy; only the exact v2 report lease blocks recovery.
+    """
+    lease_path = _live_review_lease(root, cycle_id, now=now)
+    if lease_path is None:
+        return
+    lease = _read_json(lease_path)
+    if _is_v2_review_lease(lease):
+        raise ProducerError("cycle-finalize-blocked-live-review", cycle_id)
+
+
+def _path_entry_present(path: Path) -> bool:
+    """Return false only for an absent directory entry.
+
+    Publication admission is fail-closed.  A dangling symlink, directory,
+    special node, unreadable regular file, or lookup error is still an entry;
+    none may be collapsed into the same state as ENOENT by ``exists`` or
+    ``is_file``.
+    """
+
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _raise_if_review_publication_started(
+    root: Path, record: Mapping[str, Any]
+) -> None:
+    """Refuse a new v2 lease once either publication commit path has begun."""
+
+    cycle_id = str(record.get("cycle_id", ""))
+    directory = cycle_dir(
+        root, str(record.get("campaign_id", "")), cycle_id, record,
+    )
+    for entry in (journal_path(root, cycle_id), directory / "manifest.json"):
+        if _path_entry_present(entry):
+            raise ProducerError(
+                "review-lease-admission-after-publication",
+                f"{cycle_id}: {entry}",
+            )
+
+
+def prepare_review_output_binding(
+    root: Path, *, cycle_id: str, producer_id: str, attempt_id: str,
+    review_output: str | Path, capability: str, unit: str,
+    worktree: str | Path,
+) -> Dict[str, Any]:
+    """Validate the immutable cycle/route side before registry mutation."""
+
+    root_input = Path(root)
+    canonical_root = root_input.resolve(strict=False)
+    worktree_input = Path(worktree)
+    canonical_worktree = worktree_input.resolve(strict=False)
+    if (
+        not root_input.is_absolute() or str(root_input) != str(canonical_root)
+        or not worktree_input.is_absolute()
+        or str(worktree_input) != str(canonical_worktree)
+    ):
+        raise ProducerError("review-binding-root-not-canonical", str(root))
+    record = read_cycle_record(canonical_root, cycle_id)
+    if record is None or record.get("state") != "open":
+        raise ProducerError("cycle-not-open", cycle_id)
+    if record.get("producer_id") != producer_id:
+        raise ProducerError("review-binding-producer-mismatch", producer_id)
+    # Fast preclaim refusal.  review_lease_acquire repeats this check while it
+    # owns the canonical admission lock, closing publication after prepare.
+    _raise_if_review_publication_started(canonical_root, record)
+    route = load_route(canonical_root, Path(str(record.get("route_file", ""))))
+    expected_capability = str(record.get("capability", ""))
+    if (
+        capability != expected_capability
+        or route.get("capability") != expected_capability
+        or route.get("route_id") != record.get("route_id")
+        or route.get("route_hash") != record.get("route_hash")
+    ):
+        raise ProducerError("review-binding-capability-mismatch", capability)
+    if unit != "qa/code-review":
+        raise ProducerError("review-binding-unit-mismatch", unit)
+    if Path(str(route.get("cwd", ""))).resolve(strict=False) != canonical_worktree:
+        raise ProducerError("review-binding-worktree-mismatch", str(worktree))
+    if Path(str(route.get("artifact_root", ""))).resolve(strict=False) != canonical_root:
+        raise ProducerError("review-binding-artifact-root-mismatch", str(root))
+    output_input = Path(review_output)
+    output = output_input.resolve(strict=False)
+    if not output_input.is_absolute() or str(output_input) != str(output):
+        raise ProducerError("review-output-path-not-canonical", str(review_output))
+    artifacts = (
+        cycle_dir(canonical_root, record["campaign_id"], cycle_id, record)
+        / "artifacts"
+    ).resolve(strict=False)
+    try:
+        locator = output.relative_to(canonical_root).as_posix()
+        cycle_locator = output.relative_to(artifacts)
+    except ValueError as exc:
+        raise ProducerError("review-output-outside-cycle", str(output)) from exc
+    if not cycle_locator.parts or cycle_locator.parts[0] != "plans":
+        raise ProducerError("review-output-bucket-forbidden", str(output))
+    if output.is_dir() or output.exists() and not output.is_file():
+        raise ProducerError("review-output-target-invalid", str(output))
+    current = output
+    while current != artifacts:
+        if current.is_symlink():
+            raise ProducerError("review-output-symlink", str(current))
+        current = current.parent
+    binding: Dict[str, Any] = {
+        "schema_version": 2,
+        "attempt_id": attempt_id,
+        "cycle_id": cycle_id,
+        "producer_id": producer_id,
+        "worktree": str(canonical_worktree),
+        "artifact_root": str(canonical_root),
+        "capability": capability,
+        "unit": unit,
+        "output_path": str(output),
+    }
+    binding["digest"] = review_output_binding_digest(binding)
+    binding["locator_b64"] = encode_review_output_locator(locator)
+    return binding
+
+
+def review_output_write_authorized_from_cycle(
+    root: Path, *, jobs: str | Path, attempt_id: str, cycle_id: str,
+    review_output: str | Path,
+) -> bool:
+    """Authorize one report using cycle/route/registry facts, never env axes."""
+
+    root_input = Path(root)
+    canonical_root = root_input.resolve(strict=False)
+    if not root_input.is_absolute() or str(root_input) != str(canonical_root):
+        return False
+    try:
+        record = read_cycle_record(canonical_root, cycle_id)
+        if record is None or record.get("state") != "open":
+            return False
+        route = load_route(
+            canonical_root, Path(str(record.get("route_file", "")))
+        )
+        producer_id = str(record.get("producer_id", ""))
+        capability = str(record.get("capability", ""))
+        worktree = str(Path(str(route.get("cwd", ""))).resolve(strict=False))
+        binding = prepare_review_output_binding(
+            canonical_root, cycle_id=cycle_id, producer_id=producer_id,
+            attempt_id=attempt_id, review_output=review_output,
+            capability=capability, unit="qa/code-review", worktree=worktree,
+        )
+        lease_record = _read_json(
+            _review_lease_path(canonical_root, cycle_id, attempt_id)
+        )
+        return review_output_write_authorized(
+            jobs, output_path=binding["output_path"], attempt_id=attempt_id,
+            cycle_id=cycle_id, producer_id=producer_id,
+            capability=capability, unit="qa/code-review", worktree=worktree,
+            artifact_root=canonical_root, lease_record=lease_record,
+        )
+    except (ProducerError, OSError, TypeError, ValueError):
+        return False
 
 
 def review_lease_acquire(
     root: Path, *, cycle_id: str, attempt_id: str, deadline_seconds: float = 900.0,
-    now: Optional[float] = None,
+    now: Optional[float] = None, review_output: Optional[str | Path] = None,
+    binding: Optional[Mapping[str, Any]] = None,
+    governed_identity: Optional[Mapping[str, Any]] = None,
+    jobs: Optional[str | Path] = None,
 ) -> Dict[str, Any]:
     root = Path(root).resolve()
     lock_fd = artifact_admission._acquire_lock(root, artifact_admission.LOCK_TIMEOUT_DEFAULT, now=now)
     try:
         path = _review_lease_path(root, cycle_id, attempt_id)
+        try:
+            path.lstat()
+            existing_path = True
+        except FileNotFoundError:
+            existing_path = False
         existing = _read_json(path)
         when = time.time() if now is None else now
+        v2_requested = review_output is not None or binding is not None
         # E47-9: the same (cycle, attempt) re-acquiring its own still-live
         # lease is an idempotent no-op -- zero state change.
-        if existing is not None and _lease_record_is_live(existing, now=when):
+        existing_live = existing is not None and _lease_record_is_live(
+            existing, root=root, now=when
+        )
+        schema_version = 1
+        exact_output = None
+        registry_metadata: Mapping[str, object] = {}
+        if v2_requested:
+            if review_output is None or binding is None or jobs is None:
+                raise ProducerError("review-lease-binding-incomplete", cycle_id)
+            if not isinstance(binding, Mapping):
+                raise ProducerError("review-lease-binding-invalid", attempt_id)
+            admission_record = read_cycle_record(root, cycle_id)
+            if admission_record is not None and admission_record.get("state") == "open":
+                # This is the authoritative race-closing check: the admission
+                # mutex above is still held and publication uses that same
+                # mutex.  No recovery or nested lock acquisition occurs here.
+                _raise_if_review_publication_started(root, admission_record)
+            try:
+                canonical_binding = prepare_review_output_binding(
+                    root, cycle_id=cycle_id,
+                    producer_id=str(binding.get("producer_id", "")),
+                    attempt_id=attempt_id, review_output=review_output,
+                    capability=str(binding.get("capability", "")),
+                    unit=str(binding.get("unit", "")),
+                    worktree=str(binding.get("worktree", "")),
+                )
+                checked_binding = validate_review_output_binding(
+                    jobs, attempt_id=attempt_id, output_path=review_output,
+                    cycle_id=cycle_id,
+                    producer_id=str(canonical_binding["producer_id"]),
+                    capability=str(canonical_binding["capability"]),
+                    unit=str(canonical_binding["unit"]),
+                    worktree=str(canonical_binding["worktree"]),
+                    artifact_root=str(canonical_binding["artifact_root"]),
+                )
+            except Exception as exc:
+                if isinstance(exc, (OSError, ValueError, TypeError)):
+                    raise ProducerError("review-lease-binding-invalid", attempt_id) from exc
+                raise ProducerError(getattr(exc, "reason", "review-lease-binding-invalid"), attempt_id) from exc
+            exact_output = Path(checked_binding["output_path"])
+            closed_fields = (
+                "schema_version", "attempt_id", "cycle_id", "producer_id",
+                "worktree", "artifact_root", "capability", "unit",
+                "output_path", "digest", "locator_b64",
+            )
+            if any(binding.get(key) != canonical_binding.get(key) for key in closed_fields):
+                raise ProducerError("review-lease-binding-mismatch", attempt_id)
+            if checked_binding["digest"] != canonical_binding["digest"]:
+                raise ProducerError("review-binding-digest-mismatch", attempt_id)
+            identity = dict(governed_identity or {})
+            required_identity = ("pid", "pid_start", "pgid", "pid_ns", "pid_observer_ns")
+            if not all(identity.get(key) not in (None, "") for key in required_identity):
+                raise ProducerError("review-governed-identity-incomplete", cycle_id)
+            if not str(identity.get("pid")).isdigit() or not str(identity.get("pgid")).isdigit():
+                raise ProducerError("review-governed-identity-invalid", cycle_id)
+            registry_metadata = checked_binding.get("_registry_metadata", {})
+            if not isinstance(registry_metadata, Mapping):
+                raise ProducerError("review-lease-binding-invalid", attempt_id)
+            if any(
+                str(registry_metadata.get(key, "")) != str(identity.get(key, ""))
+                for key in _PROCESS_IDENTITY_METADATA_KEYS
+            ):
+                raise ProducerError("review-lease-identity-mismatch", attempt_id)
+            if not review_governed_lease_is_held(root, registry_metadata):
+                raise ProducerError("review-governed-lease-not-held", attempt_id)
+            if not isinstance(deadline_seconds, (int, float)) or not 1.0 <= float(deadline_seconds) <= 900.0:
+                raise ProducerError("review-lease-deadline-invalid", str(deadline_seconds))
+            schema_version = 2
+            binding_digest = str(canonical_binding["digest"])
+        else:
+            identity = {}
+            binding_digest = None
+        if existing_live:
+            if schema_version == 2:
+                expected_existing = {
+                    "schema_version": 2, "cycle_id": cycle_id,
+                    "attempt_id": attempt_id, "producer_id": canonical_binding["producer_id"],
+                    "worktree": canonical_binding["worktree"],
+                    "artifact_root": canonical_binding["artifact_root"],
+                    "capability": canonical_binding["capability"],
+                    "unit": canonical_binding["unit"],
+                    "review_output_path": str(exact_output),
+                    "review_output_digest": binding_digest,
+                    "review_governed_lease": registry_metadata.get("review_governed_lease"),
+                    "review_governed_lease_nonce": registry_metadata.get("review_governed_lease_nonce"),
+                }
+                if any(existing.get(key) != value for key, value in expected_existing.items()):
+                    raise ProducerError("review-lease-binding-mismatch", attempt_id)
+                for key in _PROCESS_IDENTITY_METADATA_KEYS:
+                    if str(existing.get(key, "")) != str(identity.get(key, "")):
+                        raise ProducerError("review-lease-identity-mismatch", attempt_id)
+                digest = review_lease_record_digest(existing)
+                return {
+                    "status": "already-held", "cycle_id": cycle_id,
+                    "attempt_id": attempt_id,
+                    "registry_metadata": {
+                        "review_lease_acquired_at": existing.get("acquired_at", ""),
+                        "review_lease_deadline": existing.get("deadline", ""),
+                        "review_lease_record_digest": digest,
+                    },
+                }
             return {"status": "already-held", "cycle_id": cycle_id, "attempt_id": attempt_id}
-        pid = os.getpid()
+        if schema_version == 2 and existing_path:
+            raise ProducerError("review-lease-existing-invalid", attempt_id)
+        pid = int(identity.get("pid", os.getpid()))
+        pid_start = str(identity.get("pid_start", process_start_ticks(pid) or ""))
+        pgid = int(identity.get("pgid", os.getpgid(pid)))
         record = {
-            "schema_version": 1, "cycle_id": cycle_id, "attempt_id": attempt_id,
-            "pid": pid, "pid_start": process_start_ticks(pid) or "",
-            "pgid": os.getpgrp(), "acquired_at": _rfc3339(when),
+            "schema_version": schema_version, "cycle_id": cycle_id, "attempt_id": attempt_id,
+            "pid": pid, "pid_start": pid_start,
+            "pgid": pgid, "acquired_at": _rfc3339(when),
             "deadline": _rfc3339(when + max(1.0, deadline_seconds)),
-            "released_at": None,
+            "released_at": None, "expired": False,
         }
+        if schema_version == 2:
+            record.update({
+                "review_output_path": str(exact_output),
+                "review_output_digest": binding_digest,
+                "worktree": canonical_binding["worktree"],
+                "artifact_root": canonical_binding["artifact_root"],
+                "capability": canonical_binding["capability"],
+                "unit": canonical_binding["unit"],
+                "producer_id": canonical_binding["producer_id"],
+                "review_governed_lease": registry_metadata.get("review_governed_lease"),
+                "review_governed_lease_nonce": registry_metadata.get("review_governed_lease_nonce"),
+            })
+            for key in _PROCESS_IDENTITY_METADATA_KEYS:
+                if key in identity:
+                    record[key] = identity[key]
         path.parent.mkdir(parents=True, exist_ok=True)
         _write_atomic(path, _json_bytes(record), 0o600)
-        return {"status": "acquired", "cycle_id": cycle_id, "attempt_id": attempt_id}
+        result = {"status": "acquired", "cycle_id": cycle_id, "attempt_id": attempt_id}
+        if schema_version == 2:
+            result["registry_metadata"] = {
+                "review_lease_acquired_at": record["acquired_at"],
+                "review_lease_deadline": record["deadline"],
+                "review_lease_record_digest": review_lease_record_digest(record),
+            }
+        return result
     finally:
         artifact_admission._release_lock(root, lock_fd)
 
@@ -1513,9 +1925,177 @@ def review_lease_status(root: Path, *, cycle_id: str, attempt_id: Optional[str] 
     root = Path(root).resolve()
     if attempt_id is not None:
         record = _read_json(_review_lease_path(root, cycle_id, attempt_id))
-        return {"cycle_id": cycle_id, "attempt_id": attempt_id, "live": _lease_record_is_live(record)}
+        return {
+            "cycle_id": cycle_id, "attempt_id": attempt_id,
+            "live": _lease_record_is_live(record, root=root),
+        }
     live_path = _live_review_lease(root, cycle_id)
     return {"cycle_id": cycle_id, "live": live_path is not None}
+
+
+_SEALED_CYCLE_STATES = {"active", "completed", "abandoned"}
+
+
+def _valid_cycle_state(value: Any) -> bool:
+    """`value` is a genuine member of the cycle work-state enum only if it is a
+    *string* member of it.
+
+    The type check has to live inside this predicate: JSON can put a list or
+    dict in this slot, and a bare `value in _SEALED_CYCLE_STATES` raises
+    `TypeError: unhashable type` for either -- an exception that is not a
+    `ProducerError` and so is not caught by `main()`'s `except ProducerError
+    as exc:` arm. Every state comparison, manifest side or record-cache side,
+    goes through this one function; nowhere else tests set membership
+    directly.
+    """
+    return isinstance(value, str) and value in _SEALED_CYCLE_STATES
+
+
+def _record_cycle_manifest_path(root: Path, record: Mapping[str, Any]) -> Path:
+    """Resolve this record's manifest without scanning other cycle bindings."""
+    root = Path(root).resolve()
+    campaign_id = record.get("campaign_id")
+    cycle_id = record.get("cycle_id")
+    if not artifact_identity.is_well_formed(campaign_id, "campaign") or not artifact_identity.is_well_formed(cycle_id, "cycle"):
+        raise ProducerError("sealed-cycle-state-unknown", f"{cycle_id}: record identity invalid")
+    try:
+        campaigns = artifact_locator.safe_child(root, root, "campaigns")
+    except artifact_locator.LocatorError as exc:
+        raise ProducerError("sealed-cycle-state-unknown", exc.detail or exc.code) from exc
+    matches = []
+    if campaigns.is_dir() and not campaigns.is_symlink():
+        for candidate in campaigns.iterdir():
+            if candidate.is_symlink() or not candidate.is_dir():
+                continue
+            campaign = _read_json(candidate / "campaign.json")
+            if campaign is not None and campaign.get("campaign_id") == campaign_id:
+                matches.append(candidate)
+    if len(matches) != 1:
+        raise ProducerError(
+            "sealed-cycle-state-unknown",
+            f"{cycle_id}: campaign-locator={'missing' if not matches else 'ambiguous'}",
+        )
+    parent = matches[0]
+    locator = record.get("locator")
+    try:
+        if locator:
+            cycle_path = artifact_locator.safe_child(root, parent, locator)
+            binding = artifact_locator.read_cycle_binding(cycle_path)
+            if binding is None:
+                raise ProducerError(
+                    "sealed-cycle-state-unknown",
+                    f"{cycle_id}: cycle-binding=missing",
+                )
+        else:
+            cycle_path = artifact_locator.safe_child(
+                root, artifact_locator.safe_child(root, parent, "cycles"), cycle_id
+            )
+            # Legacy ``cycles/<cycle_id>`` directories predate cycle bindings.
+            # If one is present it must still agree with the record; absence is
+            # allowed only because the stable ID is the legacy path component.
+            binding = artifact_locator.read_cycle_binding(cycle_path)
+    except artifact_locator.LocatorError as exc:
+        detail = exc.code if not exc.detail else f"{exc.code}: {exc.detail}"
+        raise ProducerError("sealed-cycle-state-unknown", detail) from exc
+    if binding is not None and (
+        binding.get("campaign_id") != campaign_id
+        or binding.get("cycle_id") != cycle_id
+    ):
+        raise ProducerError(
+            "sealed-cycle-state-unknown",
+            f"{cycle_id}: cycle-binding-identity-mismatch",
+        )
+    return cycle_path / "manifest.json"
+
+
+def _published_cycle_state(root: Path, record: Mapping[str, Any]) -> str:
+    """Return the *work* state of a sealed cycle.
+
+    `record["state"] == "sealed"` is a storage fact -- it means an immutable
+    snapshot exists, not that the work is done (D-10: the four completion
+    results are independent). The work state is the published manifest's
+    `cycle.state` (the D-6 folded state); `record["cycle_state"]` is a cache
+    `_commit_sealed` copied from that same document. The cache is only a
+    fallback when the canonical source is entirely absent. If the canonical
+    source exists but cannot be trusted -- unreadable, wrong shape, naming a
+    different cycle, or holding a value outside the enum -- this raises a
+    typed refusal instead of ever returning a false success. The only
+    exception this function can raise is `ProducerError`.
+    """
+    cycle_id = str(record.get("cycle_id", "?"))
+    cached = record.get("cycle_state")
+    record_state = cached if _valid_cycle_state(cached) else None
+    try:
+        manifest_path = cycle_dir(root, record["campaign_id"], cycle_id, record) / "manifest.json"
+    except artifact_locator.LocatorError:
+        # The global index can fail because of an unrelated binding. Resolve
+        # this record through its own campaign/cycle locator before deciding
+        # that the canonical manifest is absent.
+        manifest_path = _record_cycle_manifest_path(root, record)
+    except (ProducerError, OSError, KeyError, TypeError):
+        manifest_path = _record_cycle_manifest_path(root, record)
+    if manifest_path is None:
+        raise ProducerError("sealed-cycle-state-unreadable", f"{cycle_id}: manifest=path-unresolved")
+    try:
+        manifest_stat = manifest_path.lstat()
+    except FileNotFoundError:
+        # Canonical source absent is the *only* case that falls back to the
+        # cache (compatibility for W7G/W7I/W7H relocation roots carrying
+        # legacy sealed records). A directory, special node, or symlink is
+        # present-but-invalid and must never be mistaken for absence.
+        if record_state is not None:
+            return record_state
+        shown = "missing" if cached is None else repr(cached)
+        raise ProducerError("sealed-cycle-state-unknown", f"{cycle_id}: manifest=absent record={shown}")
+    except OSError as exc:
+        raise ProducerError(
+            "sealed-cycle-state-unreadable", f"{cycle_id}: manifest={manifest_path} lookup-error={exc.__class__.__name__}:{exc}"
+        ) from exc
+    if not stat.S_ISREG(manifest_stat.st_mode):
+        raise ProducerError(
+            "sealed-cycle-state-unreadable", f"{cycle_id}: manifest={manifest_path} entry-kind=non-regular"
+        )
+    document = _read_json(manifest_path)
+    if document is None:  # unparsable JSON, symlink, or encoding error
+        raise ProducerError("sealed-cycle-state-unreadable", f"{cycle_id}: manifest={manifest_path} unparsable")
+    # Structure checks come before any field access. `_read_json:168` already
+    # guarantees a dict, but the invariant is pinned here too so it keeps
+    # holding even if `_read_json` is loosened later.
+    if not isinstance(document, Mapping):
+        raise ProducerError(
+            "sealed-cycle-state-unreadable",
+            f"{cycle_id}: manifest={manifest_path} document-structure type={type(document).__name__}",
+        )
+    cycle = document.get("cycle")
+    if not isinstance(cycle, Mapping):
+        raise ProducerError(
+            "sealed-cycle-state-unreadable",
+            f"{cycle_id}: manifest={manifest_path} cycle-structure type={type(cycle).__name__}",
+        )
+    manifest_cycle_id = cycle.get("cycle_id")  # `!=` is safe against any type
+    if manifest_cycle_id != record.get("cycle_id"):
+        raise ProducerError(
+            "sealed-cycle-state-unreadable",
+            f"{cycle_id}: manifest={manifest_path} manifest_cycle_id={manifest_cycle_id!r} "
+            f"record_cycle_id={record.get('cycle_id')!r}",
+        )
+    manifest_state = cycle.get("state")
+    if not _valid_cycle_state(manifest_state):  # non-string and out-of-enum share one gate
+        raise ProducerError(
+            "sealed-cycle-state-unreadable", f"{cycle_id}: manifest={manifest_path} cycle_state={manifest_state!r}"
+        )
+    if record_state is not None and record_state != manifest_state:
+        raise ProducerError("sealed-cycle-state-ambiguous", f"{cycle_id}: manifest={manifest_state} record={record_state}")
+    # A damaged cache (non-string, out-of-enum, or absent) does not block
+    # success once the canonical source is valid -- the canonical source wins.
+    return manifest_state
+
+
+def _authorize_active_cleanup(root: Path, operation: str, target: Path, cycle_id: Optional[str]) -> None:
+    try:
+        dispatch_terminal_commit.require_current_cleanup(operation, target=target, cycle_id=cycle_id)
+    except dispatch_terminal_commit.TerminalCommitError as exc:
+        raise ProducerError("cleanup-scope-violation", exc.detail) from exc
 
 
 def finalize(
@@ -1534,37 +2114,87 @@ def finalize(
     abandon_reason: Optional[str] = None,
     force_abandon_ignoring_lease: bool = False,
     support_locators: Sequence[str] = (),
+    expected_binding: Optional[Mapping[str, Any]] = None,
+    _admission_lock_fd: Optional[int] = None,
+    _recovery_scope: str = "root",
 ) -> Dict[str, Any]:
     root = Path(root).resolve()
+    if _recovery_scope != "exact":
+        dispatch_terminal_commit.require_current_cleanup("producer-finalize")
+    _authorize_active_cleanup(root, "finalize-forward-recovery", root, cycle_id)
     if state not in {"completed", "abandoned"}:
         raise ProducerError("finalize-state-invalid", state)
+    if _admission_lock_fd is not None:
+        raise ProducerError("finalize-reentry-forbidden", cycle_id)
     alloc = allocator or artifact_identity.IdAllocator()
-    lock_fd = artifact_admission._acquire_lock(root, artifact_admission.LOCK_TIMEOUT_DEFAULT, now=now)
+    lock_fd = _admission_lock_fd
+    owns_lock = lock_fd is None
+    if owns_lock:
+        lock_fd = artifact_admission._acquire_lock(root, artifact_admission.LOCK_TIMEOUT_DEFAULT, now=now)
     try:
-        _recover_locked(root)
+        if _recovery_scope == "root":
+            _recover_locked(root, now=now)
+        elif _recovery_scope == "exact":
+            _recover_exact_cycle_locked(root, cycle_id, expected_binding, now=now)
+        else:
+            raise ProducerError("recovery-scope-invalid", _recovery_scope)
         record = read_cycle_record(root, cycle_id)
         if record is None:
             raise ProducerError("cycle-unknown", cycle_id)
         if record.get("state") == "sealed":
+            # Storage sealing is not task completion: the manifest commit is an
+            # immutable snapshot, and the *published* cycle state
+            # (`_published_cycle_state`) is the only thing a re-finalize
+            # request can be judged against. Any request whose `state` does
+            # not match that published state is a conflict -- no flag makes
+            # it idempotent, because the storage schema does not persist the
+            # request fingerprint needed to prove "same retry" (D-8).
+            published = _published_cycle_state(root, record)
+            if published != state:
+                raise ProducerError(
+                    "finalize-state-conflict",
+                    f"{cycle_id}: requested={state} published_cycle_state={published} storage_state=sealed",
+                )
+            # General relocation compatibility may judge an absent manifest
+            # from its state cache. Terminal exact callers still require every
+            # durable proof; an already-sealed status is never that proof.
+            manifest_path = _record_cycle_manifest_path(root, record)
+            if expected_binding is not None or _path_entry_present(manifest_path):
+                verified = _verify_sealed_cycle_locked(root, record, expected_binding)
+                return {**verified, "storage_state": "sealed", "cycle_state": published}
             return {"status": "already-sealed", "cycle_id": cycle_id,
-                    "manifest_digest": record.get("manifest_digest")}
+                    "manifest_digest": record.get("manifest_digest"),
+                    "storage_state": "sealed", "cycle_state": published}
         if record.get("state") != "open":
             raise ProducerError("cycle-not-open", record.get("state", "?"))
+        # A live review lease protects the report's exact write window from
+        # both terminal outcomes.  The check remains under the producer
+        # admission lock and happens before any terminal mutation.
+        live_review = _live_review_lease(root, cycle_id, now=now)
+        live_record = _read_json(live_review) if live_review is not None else None
         if state == "abandoned":
             # SD-117 L1 before L3 (plan-check C-2): live-lease enforcement
             # comes first -- a live registered review lease refuses the
             # abandon outright, zero events, zero record-state change
             # (E47-2), before the abandon_reason vocabulary is even
             # consulted.
-            if not force_abandon_ignoring_lease:
-                if _live_review_lease(root, cycle_id) is not None:
-                    raise ProducerError("cycle-abandon-blocked-live-review", cycle_id)
-            elif abandon_reason not in (None, "operator-override-live-review"):
+            if not force_abandon_ignoring_lease and live_review is not None:
+                lease = live_record
+                reason = ("cycle-finalize-blocked-live-review"
+                          if _is_v2_review_lease(lease)
+                          else "cycle-abandon-blocked-live-review")
+                raise ProducerError(reason, cycle_id)
+            if force_abandon_ignoring_lease and abandon_reason not in (None, "operator-override-live-review"):
                 raise ProducerError("abandon-reason-required", str(abandon_reason))
             if force_abandon_ignoring_lease:
                 abandon_reason = "operator-override-live-review"
             if abandon_reason not in ABANDON_REASONS:
                 raise ProducerError("abandon-reason-required", str(abandon_reason))
+        elif live_review is not None:
+            # SD-120 completed settlement consumes the v1/v2 union. Keep the
+            # legacy abandon override above and the v2-only root recovery
+            # policy separate from this completed publication boundary.
+            raise ProducerError("cycle-finalize-blocked-live-review", cycle_id)
         directory = cycle_dir(root, record["campaign_id"], cycle_id, record)
         route = load_route(root, Path(record["route_file"]))
         if route["route_hash"] != record["route_hash"]:
@@ -1654,7 +2284,141 @@ def finalize(
             "status": "sealed", "cycle_id": cycle_id, "campaign_id": record["campaign_id"],
             "manifest_digest": digest, "manifest_path": str(manifest_path),
             "artifact_count": len(rows), "lineage_committed": True, "cycle_state": document["cycle"]["state"],
+            "storage_state": "sealed",
         }
+    finally:
+        if owns_lock:
+            artifact_admission._release_lock(root, lock_fd)
+
+
+def _recover_exact_cycle_locked(root: Path, cycle_id: str, expected_binding: Optional[Mapping[str, Any]] = None,
+                                *, now: Optional[float] = None) -> Dict[str, Any]:
+    """Recover only one cycle journal while the admission lock is held."""
+    journal_path = producer_dir(root) / "journal" / f"{cycle_id}.json"
+    journal = _read_json(journal_path)
+    if _path_entry_present(journal_path) and journal is None:
+        raise ProducerError("cycle-journal-invalid", cycle_id)
+    if journal and journal.get("cycle_id", cycle_id) != cycle_id:
+        raise ProducerError("cycle-journal-identity-mismatch", cycle_id)
+    if journal and expected_binding and journal.get("manifest_digest") != expected_binding.get("manifest_digest", journal.get("manifest_digest")):
+        raise ProducerError("cycle-journal-binding-mismatch", cycle_id)
+    if expected_binding:
+        record = read_cycle_record(root, cycle_id)
+        for key in ("campaign_id", "cycle_id", "producer_id"):
+            expected = expected_binding.get(key)
+            if expected is not None and (record is None or record.get(key) != expected):
+                raise ProducerError("cycle-journal-binding-mismatch", key)
+    record = read_cycle_record(root, cycle_id)
+    if record is None:
+        raise ProducerError("cycle-unknown", cycle_id)
+    if _live_review_lease(root, cycle_id, now=now) is not None:
+        raise ProducerError("cycle-finalize-blocked-live-review", cycle_id)
+    if record.get("state") == "sealed":
+        return _verify_sealed_cycle_locked(root, record, expected_binding)
+    if record.get("state") != "open":
+        raise ProducerError("cycle-not-open", cycle_id)
+    directory = cycle_dir(root, record["campaign_id"], cycle_id, record)
+    path = directory / "manifest.json"
+    if _path_entry_present(path):
+        document = _read_json(path)
+        if (journal is None or document is None
+                or (root / str(journal.get("cycle_path", ""))).resolve() != directory.resolve()
+                or artifact_manifest.manifest_digest(document) != journal.get("manifest_digest")):
+            raise ProducerError("cycle-journal-manifest-mismatch", cycle_id)
+        identity = artifact_lifecycle.read_root_identity(root)
+        completion = artifact_lifecycle.evaluate_cycle_completion(
+            document, content_root=directory, route_file=Path(record["route_file"]),
+            expected_root_id=identity.artifact_root_id if identity else None)
+        if not completion.ok:
+            raise ProducerError("completion-rejected", ";".join(v.code for v in completion.reasons))
+        _commit_sealed(root, record, document, journal["manifest_digest"], now=now)
+        return _verify_sealed_cycle_locked(root, read_cycle_record(root, cycle_id), expected_binding)
+    if journal is not None:
+        # Nothing crossed the manifest commit point; the same cycle can
+        # re-enter finalize. No other journal or cycle is read or changed.
+        _remove_journal(root, cycle_id)
+    return {"status": "open", "cycle_id": cycle_id}
+
+
+def _verify_sealed_cycle_locked(root: Path, record: Mapping[str, Any],
+                                expected_binding: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+    """Verify every immutable component before accepting an already-sealed replay."""
+    if record.get("state") != "sealed" or not record.get("sealed_on"):
+        raise ProducerError("already-sealed-mismatch", "cycle-record")
+    if expected_binding is not None:
+        for key in ("campaign_id", "cycle_id", "producer_id"):
+            expected = expected_binding.get(key)
+            if expected is not None and record.get(key) != expected:
+                raise ProducerError("already-sealed-mismatch", key)
+        if (expected_binding.get("cycle_record_digest")
+                and dispatch_terminal_commit.cycle_identity_digest(record) != expected_binding["cycle_record_digest"]):
+            raise ProducerError("already-sealed-mismatch", "cycle-identity")
+    manifest_path = _record_cycle_manifest_path(root, record)
+    directory = manifest_path.parent
+    try:
+        raw = manifest_path.read_bytes()
+        document = json.loads(raw.decode("utf-8"))
+    except (OSError, ValueError, UnicodeError) as exc:
+        raise ProducerError("already-sealed-mismatch", str(manifest_path)) from exc
+    canonical = artifact_manifest.canonical_bytes(document)
+    digest = artifact_manifest.manifest_digest(document)
+    if raw != canonical or digest != record.get("manifest_digest"):
+        raise ProducerError("already-sealed-mismatch", "manifest")
+    identity = artifact_lifecycle.read_root_identity(root)
+    index = artifact_admission.load_index(root)
+    row = index.manifests.get(record["cycle_id"]) if hasattr(index, "manifests") else None
+    if not isinstance(row, dict) or row.get("manifest_digest") != digest:
+        raise ProducerError("already-sealed-mismatch", "index")
+    if expected_binding is not None:
+        cycle_id = record["cycle_id"]
+        cycle = document.get("cycle", {})
+        if (identity is None or index.artifact_root_id != identity.artifact_root_id
+                or document.get("artifact_root_id") != identity.artifact_root_id
+                or cycle.get("cycle_id") != cycle_id
+                or cycle.get("campaign_id") != record["campaign_id"]
+                or document.get("producer", {}).get("producer_id") != record["producer_id"]):
+            raise ProducerError("already-sealed-mismatch", "index-identity")
+        # Use the canonical writer's projection, scoped to this exact cycle.
+        # Root-wide rebuild/repair could touch unrelated open cycles and is
+        # not evidence that this transaction's two index rows were applied.
+        expected_index = artifact_index.apply(
+            artifact_index.empty(identity.artifact_root_id), document,
+            cycle_path=os.path.relpath(str(directory), str(root)),
+            manifest_digest=digest, idempotency_key=cycle_id,
+        )
+        if (row != expected_index.manifests[cycle_id]
+                or index.cycles.get(cycle_id) != expected_index.cycles[cycle_id]):
+            raise ProducerError("already-sealed-mismatch", "index-projection")
+        completion = artifact_lifecycle.evaluate_cycle_completion(
+            document, content_root=directory, route_file=Path(record["route_file"]),
+            expected_root_id=identity.artifact_root_id if identity else None)
+        if not completion.ok:
+            raise ProducerError("already-sealed-mismatch", "completion-evidence")
+    return {"status": "already-sealed", "cycle_id": record["cycle_id"], "manifest_digest": digest}
+
+
+def finalize_exact_cycle(root: Path, *, cycle_id: str, expected_binding: Mapping[str, Any],
+                         state: str = "completed", **kwargs: Any) -> Dict[str, Any]:
+    """Finalize one bound cycle under one admission lock, without root recovery."""
+    root = Path(root).resolve()
+    _authorize_active_cleanup(root, "finalize-forward-recovery", root, cycle_id)
+    # Enter public finalize with no lock held. It owns the one admission
+    # boundary encompassing exact recovery, lease check and manifest commit.
+    return finalize(root, cycle_id=cycle_id, state=state,
+                    expected_binding=expected_binding, _recovery_scope="exact", **kwargs)
+
+
+def verify_finalized_cycle(root: Path, *, cycle_id: str, expected_binding: Mapping[str, Any]):
+    """Read-only proof under admission lock; never repairs an unsealed cycle."""
+    root = Path(root).resolve()
+    lock_fd = artifact_admission._acquire_lock(root, artifact_admission.LOCK_TIMEOUT_DEFAULT)
+    try:
+        if _live_review_lease(root, cycle_id) is not None:
+            raise ProducerError("cycle-finalize-blocked-live-review", cycle_id)
+        record = read_cycle_record(root, cycle_id)
+        if record is None:
+            raise ProducerError("cycle-unknown", cycle_id)
+        return _verify_sealed_cycle_locked(root, record, expected_binding)
     finally:
         artifact_admission._release_lock(root, lock_fd)
 
@@ -1705,6 +2469,7 @@ def _recover_locked(root: Path, *, now: Optional[float] = None) -> Dict[str, Lis
             manifest_path = root / str(journal.get("cycle_path", "")) / "manifest.json"
             document = _read_json(manifest_path)
             if document is not None and artifact_manifest.manifest_digest(document) == journal.get("manifest_digest"):
+                _raise_if_recovery_fenced(root, cycle_id, now=now)
                 _commit_sealed(root, record, document, journal["manifest_digest"], now=now)
                 result["rolled_forward"].append(cycle_id)
             elif document is None:
@@ -1729,6 +2494,7 @@ def _recover_locked(root: Path, *, now: Optional[float] = None) -> Dict[str, Lis
         if (directory / "manifest.json").is_file():
             document = _read_json(directory / "manifest.json")
             if document is not None:
+                _raise_if_recovery_fenced(root, record["cycle_id"], now=now)
                 _commit_sealed(root, record, document, artifact_manifest.manifest_digest(document), now=now)
                 result["rolled_forward"].append(record["cycle_id"])
                 continue
@@ -1756,6 +2522,7 @@ def _recover_locked(root: Path, *, now: Optional[float] = None) -> Dict[str, Lis
 
 
 def recover(root: Path, *, now: Optional[float] = None) -> Dict[str, Any]:
+    dispatch_terminal_commit.require_current_cleanup("root-recover")
     root = Path(root).resolve()
     lock_fd = artifact_admission._acquire_lock(root, artifact_admission.LOCK_TIMEOUT_DEFAULT, now=now)
     try:
@@ -2305,6 +3072,10 @@ def check_write(root: Path, target: Path) -> Dict[str, Any]:
     rel = _relative(root, Path(target))
     active = is_active(root)
     base = {"cutover": "active" if active else "inactive", "target": str(target)}
+    try:
+        _authorize_active_cleanup(root, "partial-report", Path(target), None)
+    except ProducerError as exc:
+        return {**base, "verdict": "deny", "reason": exc.code, "layout": "cleanup"}
     if rel is None:
         return {**base, "verdict": "allow", "reason": "outside-artifact-root", "layout": None}
     parts = rel.split("/")
@@ -2404,6 +3175,7 @@ def cycle_bucket(root: Path, target: Path) -> Optional[Tuple[str, str]]:
 def resolve_output_dir(root: Path, bucket: str, *, cycle_dir_hint: Optional[str] = None) -> Tuple[Path, str]:
     """Where a writer must place `<bucket>/...` output: cycle layout or legacy."""
     root = Path(root).resolve()
+    _authorize_active_cleanup(root, "partial-report", root, os.environ.get("AGENT_ARTIFACT_CYCLE_ID"))
     hint = cycle_dir_hint or os.environ.get("AGENT_ARTIFACT_CYCLE_DIR")
     if hint:
         directory = Path(hint)
@@ -2525,6 +3297,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     args = parser.parse_args(argv)
     try:
+        if args.command not in {"check-write"}:
+            dispatch_terminal_commit.require_current_cleanup("producer-" + args.command)
         root = Path(args.artifact_root)
         if args.command == "activate":
             w7: Dict[str, Any] = {}

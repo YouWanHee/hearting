@@ -37,9 +37,35 @@ class ModelConfigReceipt:
     selected_path: str
     user_path: str
     shipped_path: str
+    balanced_provenance: str = "explicit"
 
     def as_dict(self) -> dict[str, str]:
         return asdict(self)
+
+
+def _derive_balanced_values(adapter: str, values: dict[str, str]) -> dict[str, str]:
+    """Derive only the optional balanced extension in memory.
+
+    The user file remains the selected whole file; this is deliberately not a
+    merge with shipped values and never writes back to the runtime home.
+    """
+    if "CFG_MODEL_PROFILE_BALANCED" in values:
+        return values
+    light = values.get("CFG_MODEL_PROFILE_LIGHT")
+    if not light or ":" not in light:
+        raise ModelConfigError("light profile is required to derive balanced")
+    light_tier, light_budget = light.split(":", 1)
+    from model_profile import resolve_profile_values
+    try:
+        resolve_profile_values(adapter, values, "light")
+    except ValueError as exc:
+        raise ModelConfigError("light tier is incomplete for balanced derivation") from exc
+    values = dict(values)
+    values["CFG_MODEL_PROFILE_BALANCED"] = f"{light_tier}:" + (light_budget if adapter == "opencode" else "high")
+    values["CFG_MODEL_PROFILE_GRANULARITY_BALANCED"] = (
+        "collapsed-balanced-to-light" if adapter == "opencode" else "full"
+    )
+    return values
 
 
 def repository_root() -> Path:
@@ -184,18 +210,31 @@ def resolve_config(
         else:
             reason = "user-malformed"
     else:
-        if set(shipped_values) - set(user_values):
+        optional_balanced = {
+            "CFG_MODEL_PROFILE_BALANCED", "CFG_MODEL_PROFILE_GRANULARITY_BALANCED",
+        }
+        missing = set(shipped_values) - set(user_values)
+        if missing - optional_balanced:
             reason = "user-incomplete"
         else:
-            return user_values, ModelConfigReceipt(
-                "hearting.model-config/v1",
-                adapter,
-                "user",
-                "user-valid",
-                str(selected_user),
-                str(selected_user),
-                str(shipped),
-            )
+            deriving = ("CFG_MODEL_PROFILE_BALANCED" in shipped_values
+                        and "CFG_MODEL_PROFILE_BALANCED" not in user_values)
+            try:
+                selected = _derive_balanced_values(adapter, user_values) if deriving else user_values
+                # Validate the extension when present; old unrelated config validation stays unchanged.
+                if "CFG_MODEL_PROFILE_BALANCED" in selected:
+                    from model_profile import resolve_profile_values
+                    resolve_profile_values(adapter, selected, "balanced")
+            except ValueError:
+                reason = "user-incomplete"
+            else:
+                return selected, ModelConfigReceipt(
+                    "hearting.model-config/v1", adapter, "user",
+                    "user-valid-derived-balanced" if deriving else "user-valid",
+                    str(selected_user), str(selected_user), str(shipped),
+                    "derived-from-user-light" if deriving else "explicit",
+                )
+
     return shipped_values, ModelConfigReceipt(
         "hearting.model-config/v1",
         adapter,

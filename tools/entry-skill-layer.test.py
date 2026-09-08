@@ -43,15 +43,17 @@ for bootstrap in (
     "adapters/codex/AGENTS.md",
     "adapters/opencode/AGENTS.md",
 ):
-    text = " ".join((ROOT / bootstrap).read_text(encoding="utf-8").split())
-    required = (
-        "core/WORKFLOW.md §0.2", "§0.2.1",
-        "`direct`", "`solo`", "`staged`",
-        "compose", "--graph",
-        "entry's full loop", "promotion signal",
+    text = (ROOT / bootstrap).read_text(encoding="utf-8")
+    routing = " ".join(text.split("Route by `core/WORKFLOW.md §0.2`", 1)[1].split())
+    compose = re.search(r"`(?:utilities/capability-route.py|preflight.sh) compose`", routing)
+    assert compose is not None, f"{bootstrap} lost the compose route surface"
+    assert all(phrase in routing for phrase in ("--graph", "entry's full loop", "promotion signal"))
+    shape_choice = routing[:compose.start()]
+    assert "§0.2.1" in shape_choice and "shape" in shape_choice, (
+        f"{bootstrap} must choose the work shape before the compose route"
     )
-    assert all(phrase in text for phrase in required), (
-        f"{bootstrap} lost core-directed shape-before-preset routing"
+    assert all(f"`{shape}`" in shape_choice for shape in ("direct", "solo", "staged")), (
+        f"{bootstrap} must route direct, solo, and staged work through compose"
     )
 
 

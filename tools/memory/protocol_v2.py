@@ -1621,8 +1621,8 @@ def fold_operations(operations: Iterable[Any] | Mapping[str, Any] |
 
 def resolved_blocked_by(
     result: Any, *, work_limit: int = MAX_RESOLUTION_WORK
-) -> dict[str, str]:
-    """Map blocked ops to final explicit descendants using one DAG index."""
+) -> dict[str, dict[str, str]]:
+    """Map blocked ops to a safe shared decision or per-record final puts."""
     classification = result.classification
     if getattr(classification, "hard_failures", ()):
         return {}
@@ -1643,35 +1643,55 @@ def resolved_blocked_by(
         if error.code == "fold-work-limit":
             return {}
         raise
-    resolved: dict[str, str] = {}
+    resolved: dict[str, dict[str, str]] = {}
     for blocked_op_id in sorted(blocked_ids):
         blocked_op = operations[blocked_op_id]
         record_ids = {
             mutation["record_id"] for mutation in blocked_op.payload["mutations"]
         }
         head_sets = [result.frontiers.get(rid, ()) for rid in record_ids]
-        if not head_sets or any(len(heads) != 1 for heads in head_sets):
-            continue
-        candidate_ids = {heads[0] for heads in head_sets}
-        if len(candidate_ids) != 1:
-            continue
-        candidate_id = next(iter(candidate_ids))
-        if candidate_id in blocked_ids or candidate_id not in operations:
-            continue
-        candidate_records = {
-            mutation["record_id"]
-            for mutation in operations[candidate_id].payload["mutations"]
-        }
-        if not record_ids <= candidate_records:
-            continue
+        shared_decision = (
+            bool(head_sets) and all(len(heads) == 1 for heads in head_sets)
+            and len({heads[0] for heads in head_sets}) == 1
+        )
+        decisions = {}
         try:
-            descends = ancestry.is_ancestor(blocked_op_id, candidate_id)
+            for rid in sorted(record_ids):
+                heads = result.frontiers.get(rid, ())
+                if len(heads) != 1 or rid in getattr(result, "conflicts", {}):
+                    break
+                candidate_id = heads[0]
+                if candidate_id in blocked_ids or candidate_id not in operations:
+                    break
+                candidate = operations[candidate_id]
+                mutations = [m for m in candidate.payload["mutations"] if m["record_id"] == rid]
+                if len(mutations) != 1 or (
+                    not shared_decision and candidate.payload.get("kind") != "put"
+                ):
+                    break
+                state = mutations[0].get("post_state")
+                safe_post = (
+                    isinstance(state, Mapping) and "tombstone" not in mutations[0]
+                    and not _pending_state(state)
+                )
+                # Preserve already-evidenced deletion recovery. A shared final
+                # tombstone must actually be effective in this fold, not merely
+                # appear in an accepted operation's payload.
+                safe_deletion = (
+                    shared_decision and "tombstone" in mutations[0]
+                    and getattr(result, "tombstones", {}).get(rid) == candidate_id
+                    and rid not in getattr(result, "records", {})
+                )
+                if (not (safe_post or safe_deletion)
+                        or not ancestry.is_ancestor(blocked_op_id, candidate_id)):
+                    break
+                decisions[rid] = candidate_id
         except ProtocolError as error:
             if error.code == "fold-work-limit":
                 break
             raise
-        if descends:
-            resolved[blocked_op_id] = candidate_id
+        if decisions and set(decisions) == record_ids:
+            resolved[blocked_op_id] = decisions
     return resolved
 
 

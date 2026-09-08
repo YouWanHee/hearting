@@ -72,6 +72,36 @@ class NestedModelConfigTestCase(unittest.TestCase):
         with mock.patch.object(nmc, "_scoped_live_use", return_value="quiescent"):
             return nmc.recover(*args, **kwargs)
 
+    def test_legacy_balanced_derivation_preserves_exact_snapshot_bytes(self):
+        values = _write_parent_config(self.parent)
+        values.pop("CFG_MODEL_PROFILE_BALANCED", None)
+        values.pop("CFG_MODEL_PROFILE_GRANULARITY_BALANCED", None)
+        path = model_config.user_path("codex", runtime=self.parent)
+        raw = model_config.assignments(values).encode()
+        path.write_bytes(raw)
+        selected, receipt, captured = nmc.capture_snapshot("codex", self.parent, source_root=REPO_ROOT)
+        self.assertEqual(receipt.balanced_provenance, "derived-from-user-light")
+        self.assertEqual(selected, model_config._derive_balanced_values("codex", values))
+        self.assertEqual(captured, raw)
+        nmc.prepare("codex", self.parent, self.nested, source_root=REPO_ROOT, installer=self.installer)
+        self.assertEqual(model_config.user_path("codex", runtime=self.nested).read_bytes(), raw)
+        self.assertEqual(path.read_bytes(), raw)
+
+    def test_explicit_balanced_override_is_not_derived(self):
+        values = _write_parent_config(self.parent, {"CFG_MODEL_PROFILE_BALANCED": "light:low"})
+        selected, receipt, raw = nmc.capture_snapshot("codex", self.parent, source_root=REPO_ROOT)
+        self.assertEqual(selected, values)
+        self.assertEqual(receipt.balanced_provenance, "explicit")
+        nmc.prepare("codex", self.parent, self.nested, source_root=REPO_ROOT, installer=self.installer)
+        self.assertEqual(model_config.user_path("codex", runtime=self.nested).read_bytes(), raw)
+
+    def test_explicit_new_home_row_does_not_block_old_home_attribution(self):
+        old = self.root / "worktree/.dispatch/nested-codex-home"
+        new = old.with_name("nested-codex-home-v2")
+        self.jobs.write_text(f"now\topen\trepo\t{self.root / 'worktree'}\tjob\tattempt_id=fixture,codex_home={new}\n")
+        self.assertEqual(nmc._registry_attribution_quiescent(old, self.jobs), "quiescent")
+        self.assertEqual(nmc._registry_attribution_quiescent(new, self.jobs), "in-use")
+
     # -- fresh snapshot ----------------------------------------------------
 
     def test_fresh_prepare_produces_full_cfg_equality_and_native_payload(self) -> None:

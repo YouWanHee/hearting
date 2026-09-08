@@ -16,7 +16,7 @@ LEGACY_NORMAL_HARNESSES = {"claude", "codex"}
 DISPATCHABLE_HARNESSES = {"claude", "codex", "opencode"}
 KNOWN_HARNESSES = DISPATCHABLE_HARNESSES
 AFFINITY_VALUES = {"claude", "codex", "opencode", "diverse"}
-MODEL_PROFILES = ("deep", "balanced-deep", "light", "mini")
+MODEL_PROFILES = ("deep", "balanced-deep", "balanced", "light", "mini")
 QUALITY_BANDS = ("primary", "relief", "last_resort")
 ALLOCATION_STRATEGIES = {"least-recent-attempts", "capacity-aware", "balanced"}
 DEFAULT_USAGE_GATE_USED_PERCENT = 90
@@ -309,7 +309,12 @@ def validate(config, capmap):
         else:
             for name in sorted(set(profiles) - set(MODEL_PROFILES)):
                 errors.append(f"unknown model profile: {name!r}")
+            # `balanced` is the SD-88 extension. Old v3/v4 user files are
+            # complete policies without it and inherit their light policy at
+            # read time; all pre-extension profiles remain required.
             for name in MODEL_PROFILES:
+                if name == "balanced" and name not in profiles:
+                    continue
                 policy = profiles.get(name)
                 if not isinstance(policy, dict):
                     errors.append(f"profiles.{name} must be a mapping")
@@ -568,7 +573,14 @@ def query_profile_policy(config, profile):
             "last_resort": [],
             "promote_relief_below": 0,
         }
-    policy = config["profiles"][profile]
+    policy = config["profiles"].get(profile)
+    if profile == "balanced" and profile not in config["profiles"]:
+        light = config["profiles"].get("light")
+        if not isinstance(light, dict):
+            raise DefaultsConfigError("profiles.light is required to derive balanced")
+        policy = dict(light)
+    if not isinstance(policy, dict):
+        raise DefaultsConfigError(f"profiles.{profile} must be a mapping")
     result = {
         band: list(policy[band]) for band in QUALITY_BANDS
     }
@@ -756,6 +768,15 @@ def main(argv):
         return 0
     if op == "owners":
         print(",".join(query_owners(config)))
+        return 0
+    if op == "policy-receipt":
+        profile = _arg(rest, "--profile", "light")
+        policy = query_profile_policy(config, profile)
+        source = ("legacy-schema" if config.get("schema_version", 1) < 3 else
+                  "derived-from-user-light" if profile == "balanced" and profile not in config["profiles"]
+                  else "explicit")
+        print(json.dumps({"config_path": config_path, "profile": profile,
+                          "source": source, "policy": policy}, sort_keys=True))
         return 0
     if op == "policy":
         policy = query_profile_policy(config, _arg(rest, "--profile", "light"))

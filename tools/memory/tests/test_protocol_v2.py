@@ -762,6 +762,58 @@ class AggregateFoldLimitsTest(unittest.TestCase):
             )
         )
 
+    def test_blocked_resolution_allows_distinct_safe_per_record_puts(self):
+        import protocol_v2
+        def operation(parents, *rids, pending=False, kind="put"):
+            return SimpleNamespace(parents=parents, payload={"kind":kind,"mutations":[
+                {"record_id":rid,"post_state":{"delivery_state":"pending" if pending else "ordinary"}}
+                for rid in rids]})
+        operations = {"blocked":operation((),"a","b",kind="supersede"),
+                      "a-final":operation(("blocked",),"a"),
+                      "b-final":operation(("blocked",),"b")}
+        result = SimpleNamespace(classification=SimpleNamespace(operations=operations,hard_failures=()),
+            accepted=tuple(operations),blocked={"blocked":object()},frontiers={"a":("a-final",),"b":("b-final",)},conflicts={})
+        self.assertEqual(protocol_v2.resolved_blocked_by(result),{"blocked":{"a":"a-final","b":"b-final"}})
+        for unsafe in (operation(("blocked",),"b",pending=True), operation((),"b"),
+                       operation(("blocked",),"other"), operation(("blocked",),"b",kind="tombstone")):
+            operations["b-final"] = unsafe
+            self.assertEqual(protocol_v2.resolved_blocked_by(result),{})
+        operations["b-final"] = operation(("blocked",),"b")
+        result.accepted = ("blocked","a-final")
+        self.assertEqual(protocol_v2.resolved_blocked_by(result),{})
+        result.accepted = tuple(operations);result.conflicts={"b":object()}
+        self.assertEqual(protocol_v2.resolved_blocked_by(result),{})
+
+    def test_blocked_resolution_preserves_effective_shared_tombstone(self):
+        import protocol_v2
+
+        operations = {
+            "blocked": SimpleNamespace(parents=(), payload={"mutations": [
+                {"record_id": rid} for rid in ("a", "b")]}),
+            "deleted": SimpleNamespace(parents=("blocked",), payload={
+                "kind": "tombstone", "mutations": [
+                    {"record_id": rid, "tombstone": {}} for rid in ("a", "b")]}),
+        }
+        result = SimpleNamespace(
+            classification=SimpleNamespace(operations=operations, hard_failures=()),
+            accepted=tuple(operations), blocked={"blocked": object()},
+            frontiers={"a": ("deleted",), "b": ("deleted",)}, conflicts={},
+            records={}, tombstones={"a": "deleted", "b": "deleted"},
+        )
+        self.assertEqual(protocol_v2.resolved_blocked_by(result),
+                         {"blocked": {"a": "deleted", "b": "deleted"}})
+        result.tombstones["b"] = "earlier-deletion"
+        self.assertEqual(protocol_v2.resolved_blocked_by(result), {})
+        result.tombstones["b"] = "deleted"
+        result.records["b"] = {"delivery_state": "pending"}
+        self.assertEqual(protocol_v2.resolved_blocked_by(result), {})
+        result.records.clear()
+        result.blocked["deleted"] = object()
+        self.assertEqual(protocol_v2.resolved_blocked_by(result), {})
+        result.blocked.pop("deleted")
+        operations["deleted"].parents = ()
+        self.assertEqual(protocol_v2.resolved_blocked_by(result), {})
+
     def test_resolved_blocked_helper_indexes_shared_chain_once(self):
         import protocol_v2
 
@@ -778,7 +830,7 @@ class AggregateFoldLimitsTest(unittest.TestCase):
             operations[op_id] = SimpleNamespace(
                 parents=() if parent is None else (parent,),
                 key=(index, b"shared-chain", op_id),
-                payload={"mutations": [{"record_id": record_id}]},
+                payload={"kind":"put", "mutations": [{"record_id": record_id, "post_state":{"delivery_state":"ordinary"}}]},
             )
             if index < blocked_count:
                 blocked[op_id] = object()
@@ -799,7 +851,7 @@ class AggregateFoldLimitsTest(unittest.TestCase):
         self.assertEqual(len(resolved), blocked_count)
         for index, blocked_op_id in enumerate(blocked_ids):
             self.assertEqual(
-                resolved[blocked_op_id], f"{blocked_count + index + 1:064x}"
+                resolved[blocked_op_id], {f"record-blocked-{index:05d}": f"{blocked_count + index + 1:064x}"}
             )
 
     def test_resolved_blocked_two_parent_dag_is_bounded_and_conservative(self):
@@ -815,7 +867,7 @@ class AggregateFoldLimitsTest(unittest.TestCase):
             operations[op_id] = SimpleNamespace(
                 parents=tuple(parents),
                 key=(index, b"two-parent", op_id),
-                payload={"mutations": [{"record_id": record_id}]},
+                payload={"kind":"put", "mutations": [{"record_id": record_id, "post_state":{"delivery_state":"ordinary"}}]},
             )
 
         for index in range(pair_count):

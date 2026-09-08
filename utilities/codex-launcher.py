@@ -175,6 +175,8 @@ def _launcher_lock(home: Path, *, dirfd: int | None = None):
             except OSError as exc:
                 raise LauncherError(f"Codex launcher lock is unavailable: {path}") from exc
             try:
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    raise LauncherError(f"Codex launcher lock is unsafe: {path}")
                 handle = os.fdopen(fd, "rb", buffering=0)
             except BaseException:
                 os.close(fd)
@@ -358,18 +360,47 @@ def _state(home: Path, *, dirfd: int | None = None) -> dict:
     return value
 
 
+def _read_private_file(path: Path, limit: int, unavailable: str, unsafe: str) -> str:
+    """Read activation metadata and bytes from one nonblocking descriptor."""
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise LauncherError(unavailable) from exc
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+            raise LauncherError(unavailable)
+        if info.st_uid != os.geteuid() or info.st_mode & 0o077:
+            raise LauncherError(unsafe)
+        raw = bytearray()
+        while len(raw) <= limit:
+            chunk = os.read(fd, limit + 1 - len(raw))
+            if not chunk:
+                break
+            raw.extend(chunk)
+        if len(raw) > limit:
+            raise LauncherError(unavailable)
+        return raw.decode("utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise LauncherError(unavailable) from exc
+    finally:
+        os.close(fd)
+
+
 def pinned_runtime(home: Path) -> dict:
     """Resolve one activation root once for the lifetime of a new session."""
 
     path = home / ".harness" / "activation.json"
-    if path.is_symlink() or not path.is_file() or path.stat().st_size > 2_000_000:
-        raise LauncherError(f"runtime activation state is unavailable: {path}")
-    info = path.stat()
-    if info.st_uid != os.geteuid() or info.st_mode & 0o077:
-        raise LauncherError(f"runtime activation state permissions are unsafe: {path}")
+    raw = _read_private_file(
+        path,
+        2_000_000,
+        f"runtime activation state is unavailable: {path}",
+        f"runtime activation state permissions are unsafe: {path}",
+    )
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
         raise LauncherError(f"runtime activation state is invalid: {path}") from exc
     if (
         not isinstance(value, dict)

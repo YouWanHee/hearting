@@ -1943,7 +1943,9 @@ def build_parser():
     gate.add_argument("--jobs", help="canonical registry path (default: dispatch state root)")
     gate.add_argument("--artifact", default="-",
                       help="path to the artifact a person reviews at this gate; "
-                           "carried in the delivery record, never its contents")
+                           "carried in the delivery record, never its contents. "
+                           "Required with --block, and \"-\" is not accepted "
+                           "there; --release ignores it")
     group = gate.add_mutually_exclusive_group(required=True)
     group.add_argument("--release", action="store_true")
     group.add_argument("--block", action="store_true")

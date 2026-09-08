@@ -2730,6 +2730,14 @@ class DispatchBatchIntegrationTest(unittest.TestCase):
             " try: os.write(fd,(payload+'\\n').encode())\n"
             " finally: os.close(fd)\n"
             "emit('start')\n"
+            "group=node.split('-')[0]\n"
+            "expected=3 if group=='frame' else 2\n"
+            "deadline=time.monotonic()+60\n"
+            "while time.monotonic()<deadline:\n"
+            " with open(events) as stream: rows=[json.loads(line) for line in stream if line.strip()]\n"
+            " if sum(r['event']=='start' and r['node'].split('-')[0]==group for r in rows)>=expected: break\n"
+            " time.sleep(.05)\n"
+            "else: raise SystemExit('fixture batch start barrier expired')\n"
             "time.sleep(3.0)\n"
             "print('{}',flush=True)\n"
             "emit('end')\n",
@@ -2820,7 +2828,7 @@ class DispatchBatchIntegrationTest(unittest.TestCase):
                 check=False,
                 env={
                     **{key: value for key, value in os.environ.items()
-                       if key != "AGENT_ARTIFACT_ROOT"},
+                       if not key.startswith(("AGENT_DISPATCH_", "AGENT_OWNER_ROUTE_", "AGENT_ROUTE_", "AGENT_ARTIFACT_"))},
                     "AGENT_HOME": str(ROOT),
                     "AGENT_DISPATCH_JOBS": str(jobs),
                 },
@@ -2880,6 +2888,12 @@ class DispatchBatchIntegrationTest(unittest.TestCase):
             self._write_fake_runtime(fake_bin / "claude", "claude")
             claude_home = base / "claude-home"
             claude_home.mkdir()
+            # This integration tests cross-harness joining with a user-selected
+            # delegated-eligible deep model, independently of the shipped main-only default.
+            user_models = claude_home / "agent-config" / "models.conf"
+            user_models.parent.mkdir()
+            user_models.write_text((ROOT / "adapters/claude/config/models.conf").read_text().replace(
+                "CFG_MODEL_PROFILE_DEEP=model/fable:high", "CFG_MODEL_PROFILE_DEEP=deep:high"))
             parent_attempt = "att-integration-parent"
             raw = Path(f"/proc/{os.getpid()}/stat").read_text(encoding="utf-8")
             parent_start = raw[raw.rfind(")") + 2 :].split()[19]
@@ -2890,12 +2904,21 @@ class DispatchBatchIntegrationTest(unittest.TestCase):
                 "fallback_hop=same-harness-headless,worker_type=owner,"
                 "capability=autopilot-code,intensity=strong,harness=codex,"
                 "runtime_sandbox=workspace-write,"
+                f"owner_route_id={route['route_id']},parent_sid=integration-parent-session,"
+                # Fixture-only depth-0 recipient on the supported human-gate
+                # carrier; this does not select either mock child's harness.
+                "parent_completion_delivery=claude-parent-runtime,"
                 f"attempt_id={parent_attempt},pid={os.getpid()},pid_start={parent_start}\n",
                 encoding="utf-8",
             )
             governor_root = artifact_root / ".runtime" / "model-worker-governor"
+            # A standalone fixture must not inherit the registered worker's
+            # owner/stage identity from the test runner; the fixture below
+            # declares its own parent tuple explicitly.
             env = {
-                **os.environ,
+                **{key: value for key, value in os.environ.items()
+                   if not key.startswith(("AGENT_DISPATCH_", "AGENT_OWNER_ROUTE_",
+                                          "AGENT_ROUTE_", "AGENT_ARTIFACT_"))},
                 "PATH": str(fake_bin) + os.pathsep + os.environ.get("PATH", ""),
                 "AGENT_HOME": str(ROOT),
                 "AGENT_ARTIFACT_ROOT": str(artifact_root),
@@ -2937,7 +2960,7 @@ class DispatchBatchIntegrationTest(unittest.TestCase):
             process = launch_group("frame")
             stdout = stderr = ""
             try:
-                deadline = time.monotonic() + 20
+                deadline = time.monotonic() + 60
                 while time.monotonic() < deadline:
                     events = self._events(events_path)
                     if sum(
@@ -3037,10 +3060,40 @@ class DispatchBatchIntegrationTest(unittest.TestCase):
                     completed.returncode, 0, completed.stdout + completed.stderr
                 )
 
+            # Completing the frame legs does not raise or release their human
+            # review gate. Exercise the real fence before preparing the fixture
+            # through the supervisor's public block/release commands.
+            refused_plan = launch_group("plan")
+            refused_stdout, refused_stderr = refused_plan.communicate(timeout=10)
+            self.assertEqual(refused_plan.returncode, 65, refused_stdout + refused_stderr)
+            self.assertIn("human-gate-not-raised", refused_stdout + refused_stderr)
+            self.assertFalse(any(
+                row.get("event") == "start" and row.get("node") in plan_nodes
+                for row in self._events(events_path)
+            ))
+            gate_artifact = base / "frame-review.md"
+            gate_artifact.write_text("Batch integration fixture review\n", encoding="utf-8")
+            # Model the fixture's depth-0 reviewer, independently of whether
+            # the test runner itself is a registered headless worker.
+            reviewer_env = {key: value for key, value in env.items()
+                            if key != "AGENT_DISPATCH_REGISTERED_WORKER"}
+            for action in (
+                ["gate", "--block", "--artifact", str(gate_artifact)],
+                ["release", "--decision", "proceed"],
+            ):
+                gate = subprocess.run(
+                    [sys.executable, str(ROOT / "utilities" / "workflow-supervisor.py"),
+                     *action, "--route", str(route_path), "--gate", "frame-review",
+                     "--jobs", str(jobs)],
+                    cwd=ROOT, env=reviewer_env, text=True, capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(gate.returncode, 0, gate.stdout + gate.stderr)
+
             plan_process = launch_group("plan")
             plan_stdout = plan_stderr = ""
             try:
-                deadline = time.monotonic() + 20
+                deadline = time.monotonic() + 60
                 while time.monotonic() < deadline:
                     plan_starts = [
                         row for row in self._events(events_path)
@@ -3049,9 +3102,12 @@ class DispatchBatchIntegrationTest(unittest.TestCase):
                     if len(plan_starts) == 2 or plan_process.poll() is not None:
                         break
                     time.sleep(0.05)
+                if len(plan_starts) != 2 and plan_process.poll() is not None:
+                    plan_stdout, plan_stderr = plan_process.communicate(timeout=5)
                 self.assertEqual(
                     len(plan_starts), 2,
-                    f"plan batch exited={plan_process.poll()} jobs={jobs.read_text()}",
+                    f"plan batch exited={plan_process.poll()} "
+                    f"stdout={plan_stdout} stderr={plan_stderr} jobs={jobs.read_text()}",
                 )
                 self.assertFalse(any(
                     row.get("event") == "end" and row.get("node") in plan_nodes

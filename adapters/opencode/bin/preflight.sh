@@ -142,7 +142,7 @@ usage: preflight.sh write <file> [session-id] [turn-id]
        preflight.sh nested-headless --parent-harness <h> --parent-transport <t> --parent-sandbox <s> --child-harness <h> --launch-authority <authority> --worktree <path> [--json]
        preflight.sh dispatch-readiness --worktree <path> --jobs <canonical-jobs.log> --owner-harness <h>... --child-harness <h>... --output <evidence.json>
        preflight.sh broker <status|stop> --jobs <jobs.log> [--root <broker-root>]  # legacy drain only
-       preflight.sh dispatch [--dry-run|--register|--start] --worktree <path> --slug <slug> --capability <name> --capability-mode <mode> [--worker-mode <family/mode>] --qa <level> [--intensity <level>] [--dispatch-depth 1|2] [--parent <slug>] [--worker-type owner|stage|review|support] [--unit <unit>] [--assigned-contract <capability>] [--owner <capability>] [--agent <agent>] (--model-profile <deep|balanced-deep|light|mini> [--model-role <role>]|--model-role <role>|--model <model> --variant <variant>|--inherit-model-settings) [--prompt-file <file>|--prompt-text <text>] [--jobs <jobs.log>] [--log-dir <dir>]
+       preflight.sh dispatch [--dry-run|--register|--start] --worktree <path> --slug <slug> --capability <name> --capability-mode <mode> [--worker-mode <family/mode>] --qa <level> [--intensity <level>] [--dispatch-depth 1|2] [--parent <slug>] [--worker-type owner|stage|review|support] [--unit <unit>] [--assigned-contract <capability>] [--owner <capability>] [--agent <agent>] (--model-profile <deep|balanced-deep|balanced|light|mini> [--model-role <role>]|--model-role <role>|--model <model> --variant <variant>|--inherit-model-settings) [--prompt-file <file>|--prompt-text <text>] [--jobs <jobs.log>] [--log-dir <dir>]
        preflight.sh dispatch-chain --route <route.json> --node <id> --slug <slug> --parent <slug> [--capability-mode <mode>] [--worker-mode <family/mode>] [--model-role <role>] [--dry-run|--register|--start]
        preflight.sh dispatch-session-chain <check|register|start> --manifest <chain.json> --parent <slug> [--jobs <jobs.log>]
        preflight.sh stage-heartbeat --attempt-id <id> --route-id <id> --route-node <id> --jobs <jobs.log> --phase <phase> --kind <kind> --evidence <ref>
@@ -290,8 +290,14 @@ case "$cmd" in
     doctor
     ;;
   write)
-    [ "$#" -ge 2 ] || { echo "opencode preflight: write requires a file path" >&2; exit 64; }
+    if [ "${2:-}" = "-h" ] || [ "${2:-}" = "--help" ]; then
+      [ "$#" -eq 2 ] || { echo "opencode preflight: write help accepts no extra arguments" >&2; exit 64; }
+      printf '%s\n' 'usage: preflight.sh write <file> [session-id] [turn-id]'
+      exit 0
+    fi
+    [ "$#" -ge 2 ] && [ "$#" -le 4 ] || { echo "opencode preflight: write expects <file> [session-id] [turn-id]" >&2; exit 64; }
     file=$2
+    case "$file" in -*) echo "opencode preflight: write file must be absolute or ./-prefixed" >&2; exit 64;; esac
     sid=${3:-opencode}
     turn=${4:-}
     if [ "${AGENT_DISPATCH_STAGE_AUTHORITY:-1}" = "0" ]; then
@@ -306,10 +312,12 @@ case "$cmd" in
     run_guard hooks/core-first-guard.sh --file "$file" --session "$sid"
     run_guard hooks/artifact-guard.sh --file "$file" --session "$sid"
     run_guard hooks/builtin-memory-guard.sh --file "$file"
+    material_tool=Write
+    [ -n "${AGENT_REVIEW_OUTPUT:-}" ] && material_tool=ArtifactWrite
     if [ -n "$turn" ]; then
-      "$0" material-route check --tool Write --file "$file" --cwd "$(dirname "$file")" --session "$sid" --turn "$turn"
+      "$0" material-route check --tool "$material_tool" --file "$file" --cwd "$(dirname "$file")" --session "$sid" --turn "$turn"
     else
-      "$0" material-route check --tool Write --file "$file" --cwd "$(dirname "$file")" --session "$sid"
+      "$0" material-route check --tool "$material_tool" --file "$file" --cwd "$(dirname "$file")" --session "$sid"
     fi
     ;;
   material-route)
@@ -325,8 +333,8 @@ case "$cmd" in
     [ "$#" -ge 2 ] || { echo "opencode preflight: read requires a file path" >&2; exit 64; }
     file=$2
     sid=${3:-opencode}
-    "$ROOT/hooks/core-read-marker.sh" --file "$file" --session "$sid"
-    "$ROOT/hooks/spec-read-marker.sh" --file "$file" --session "$sid"
+    "$ROOT/hooks/core-read-marker.sh" --file "$file" --session "$sid" || exit $?
+    "$ROOT/hooks/spec-read-marker.sh" --file "$file" --session "$sid" || exit $?
     ;;
   capability|skill)
     [ "$#" -ge 2 ] || { echo "opencode preflight: $cmd requires a capability name" >&2; exit 64; }
@@ -462,7 +470,7 @@ tool_contract=headless-dispatch
 tool_contract_check=adapters/opencode/bin/preflight.sh headless --check <worktree>
 command_template=opencode run --dir <worktree> --format json --agent <agent> (--model <main-selected-model> --variant <main-selected-variant>|inherit) "$(cat -- <prompt-file>)"
 model_selection_policy=main-orchestrator-must-select-per-job
-model_selection_surface=--model-profile <deep|balanced-deep|light|mini> [--model-role <portable-role>]|--model-role <portable-role>|--model <model> --variant <variant>|--inherit-model-settings
+model_selection_surface=--model-profile <deep|balanced-deep|balanced|light|mini> [--model-role <portable-role>]|--model-role <portable-role>|--model <model> --variant <variant>|--inherit-model-settings
 job_registry=<agent-home>/.dispatch/jobs.log (immutable AGENT_DISPATCH_JOBS for descendants)
 nested_eligibility_check=adapters/opencode/bin/preflight.sh nested-headless --parent-harness <h> --parent-transport <t> --parent-sandbox <s> --child-harness <h> --launch-authority <a> --worktree <path>
 fallback_chain=same-harness-headless,cross-harness-headless,native-subagent,inline

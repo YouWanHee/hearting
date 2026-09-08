@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import fcntl
 import json
@@ -34,28 +33,49 @@ MAX_AUDIT_BYTES = 1024 * 1024
 KEEP_AUDIT_BYTES = 512 * 1024
 
 
-@dataclass
+# Plain mutable classes, not @dataclass: this module is hyphenated (loaded
+# elsewhere by file-spec without guaranteed sys.modules registration), and a
+# module-level @dataclass under `from __future__ import annotations` breaks
+# CPython's string-annotation resolution in that load mode (see D0 in
+# claude-session-supervisor.py / dispatch_completion_join.test.py). Both
+# classes here are mutated field-by-field after construction, so a NamedTuple
+# is not a drop-in replacement.
 class WorktreeEntry:
-    path: Path
-    head: str = ""
-    branch: str = ""
-    locked: bool = False
+    def __init__(self, path: Path, head: str = "", branch: str = "", locked: bool = False):
+        self.path = path
+        self.head = head
+        self.branch = branch
+        self.locked = locked
 
 
-@dataclass
 class Verdict:
-    path: Path
-    primary: Path
-    integration_ref: str
-    eligible: bool = False
-    reasons: list[str] = field(default_factory=list)
-    head: str = ""
-    branch: str = ""
-    upstream: str = "none"
-    stale_rows: int = 0
-    active_pids: list[int] = field(default_factory=list)
-    process_scan: str = "unknown"
-    repository_mode: str = "remote"
+    def __init__(
+        self,
+        path: Path,
+        primary: Path,
+        integration_ref: str,
+        eligible: bool = False,
+        reasons: list[str] | None = None,
+        head: str = "",
+        branch: str = "",
+        upstream: str = "none",
+        stale_rows: int = 0,
+        active_pids: list[int] | None = None,
+        process_scan: str = "unknown",
+        repository_mode: str = "remote",
+    ):
+        self.path = path
+        self.primary = primary
+        self.integration_ref = integration_ref
+        self.eligible = eligible
+        self.reasons = reasons if reasons is not None else []
+        self.head = head
+        self.branch = branch
+        self.upstream = upstream
+        self.stale_rows = stale_rows
+        self.active_pids = active_pids if active_pids is not None else []
+        self.process_scan = process_scan
+        self.repository_mode = repository_mode
 
 
 def run(
@@ -494,6 +514,8 @@ def parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str]) -> int:
     args = parser().parse_args(argv[1:])
+    from dispatch_terminal_commit import require_current_cleanup
+    require_current_cleanup('worktree-cleanup')
     apply = bool(args.apply)
     agent_home = resolve_agent_home()
     jobs = normalize(

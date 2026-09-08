@@ -6,6 +6,10 @@ inside an OPEN producer cycle (`--bundle-dir` under `.../artifacts/`).  Every ro
 of the C-P0 REPORT §11 table becomes one file; `handoff.json` indexes them with
 sha256 digests.  Only stable IDs, locators, digests, and counts are emitted —
 never note bodies or secrets.
+
+`--include-w16-namespace-delete` adds the optional namespace-delete boundary to
+a NEW bundle. D20 and W16 must consume bindings from that same final bundle;
+this option does not grant either approval. The default remains three stages.
 """
 from __future__ import annotations
 
@@ -13,6 +17,7 @@ import argparse
 import hashlib
 import json
 import os
+import stat
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -20,6 +25,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
 import artifact_admission as adm  # noqa: E402
+import artifact_cutover as C  # noqa: E402
 import artifact_lifecycle as L  # noqa: E402
 import artifact_producer as P  # noqa: E402
 
@@ -53,6 +59,111 @@ def read_jsonl(path: Path):
 
 def canonical(obj) -> str:
     return json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
+class LocatorSnapshot:
+    """One checked compat chain for both handoff rows; never repairs inputs.
+
+    Lookup order matches artifact_cutover.resolve_legacy (present, latest exact,
+    longest ancestor). Its public API reloads all maps per lookup, so this issuer
+    holds their verified bytes locally. Parity is exercised against that API.
+    """
+    def __init__(self, root):
+        self.root = root.resolve()
+        self.inputs = {}
+        self.maps = []
+        self.population_targets = []
+        compat = C.compat_path(root)
+        doc = json.loads(self.read(compat)) if compat.is_file() else {}
+        if not compat.is_file():
+            self.inputs[compat] = None
+        for entry in doc.get("maps", []):
+            path = Path(entry["path"])
+            raw = self.read(path)
+            digest = hashlib.sha256(raw).hexdigest()
+            if digest != entry.get("sha256"):
+                raise ValueError(f"compat-map-drift: {path}")
+            rows = [json.loads(line) for line in raw.splitlines() if line.strip()]
+            table = {}
+            for row in rows:
+                source, target = row["source_locator"], row["target_locator"]
+                self.path(source, inspect=False)
+                self.path(target, inspect=False)
+                # Relayout preserves conflicting legacy sources from W7/W7C.
+                # They are not lookup keys here: each historical target is.
+                table.setdefault(source, set()).add(target)
+            self.maps.append(({"path": str(path), "sha256": "sha256:" + digest,
+                               "rows": len(rows)}, table))
+
+    def read(self, path):
+        path = Path(path)
+        if path not in self.inputs:
+            self.inputs[path] = path.read_bytes()
+        return self.inputs[path]
+
+    def path(self, locator, inspect=True):
+        if (not isinstance(locator, str) or not locator or locator.startswith("/")
+                or any(p in ("", ".", "..") for p in locator.split("/"))):
+            raise ValueError(f"locator-unsafe: {locator}")
+        path = self.root
+        for part in locator.split("/"):
+            path = path / part
+            if inspect and path.is_symlink():
+                raise ValueError(f"locator-symlink: {locator}")
+        return path
+
+    def resolve(self, historical):
+        if self.path(historical).exists():
+            return historical, {"resolution": "present"}
+        parts = historical.split("/")
+        for depth in range(len(parts), 0, -1):
+            key, tail = "/".join(parts[:depth]), "/".join(parts[depth:])
+            for provenance, table in reversed(self.maps):
+                if key in table:
+                    if len(table[key]) != 1:
+                        raise ValueError(f"compat-map-ambiguous: {key}")
+                    target = next(iter(table[key])) + ("/" + tail if tail else "")
+                    if self.path(target).exists():
+                        return target, {**provenance, "resolution": "mapped-ancestor" if tail else "mapped"}
+        raise ValueError(f"historical-target-unresolved: {historical}")
+
+    def verify_unchanged(self):
+        for path, raw in self.inputs.items():
+            if (path.read_bytes() if path.exists() else None) != raw:
+                raise ValueError(f"locator-snapshot-drift: {path}")
+        for locator, digest, size, identity in self.population_targets:
+            if self.observe_target(locator, digest, size) != identity:
+                raise ValueError(f"population-target-replaced: {locator}")
+
+    def observe_target(self, locator, digest, size):
+        """Verify one regular file through an fd; no-follow at the leaf.
+
+        This detects changes at our validation boundaries, not arbitrary
+        concurrent writes after the final observation or a root-wide lock.
+        """
+        path = self.path(locator)
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
+            raise ValueError(f"population-target-missing: {locator}") from None
+        try:
+            before = os.fstat(fd)
+            if not stat.S_ISREG(before.st_mode):
+                raise ValueError(f"population-target-kind: {locator}")
+            h = hashlib.sha256()
+            for chunk in iter(lambda: os.read(fd, 1 << 20), b""):
+                h.update(chunk)
+            after = os.fstat(fd)
+            stamp = lambda s: (s.st_dev, s.st_ino, s.st_mode, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+            if (stamp(before) != stamp(after) or after.st_size != size
+                    or "sha256:" + h.hexdigest() != digest):
+                raise ValueError(f"population-target-drift: {locator}")
+            current = self.path(locator).lstat()
+            if not stat.S_ISREG(current.st_mode) or stamp(current) != stamp(after):
+                raise ValueError(f"population-target-replaced: {locator}")
+            return after.st_dev, after.st_ino
+        finally:
+            os.close(fd)
 
 
 PRIMARY_NAMES = ("final_report.md", "report.md", "prd.md", "plan.md")
@@ -134,14 +245,16 @@ def load_notes(path: Path):
 
 class Bundle:
     def __init__(self, root: Path, bundle_dir: Path, cycles, w7_evidence: Path, w7c_run: Path,
-                 retirement_run: Path, backup_tar: Path | None, census_runs, notes=None, notes_meta=None):
+                 retirement_run: Path, backup_tar: Path | None, census_runs, notes=None, notes_meta=None,
+                 include_w16_namespace_delete=False):
+        self.include_w16_namespace_delete = include_w16_namespace_delete
         self.notes = notes
         self.notes_meta = notes_meta or {}
         self.root = root
         self.dir = bundle_dir
         self.cycle_ids = cycles
-        self.w7_evidence = w7_evidence
-        self.w7c_run = w7c_run
+        self.w7_evidence = w7_evidence.resolve()
+        self.w7c_run = w7c_run.resolve()
         self.retirement_run = retirement_run
         self.backup_tar = backup_tar
         self.census_runs = census_runs
@@ -149,11 +262,20 @@ class Bundle:
         self.index = adm.load_index(root)
         self.files = {}
         self.manifests = {}
+        self.manifest_inputs = {}
+        self.cycle_dirs = {}
         for cyc in cycles:
             record = P.read_cycle_record(root, cyc)
             if record is None or record.get("state") != "sealed":
                 raise SystemExit(f"cycle not sealed: {cyc}")
-            doc = read_json(P.cycle_dir(root, record["campaign_id"], cyc) / "manifest.json")
+            path = P.cycle_dir(root, record["campaign_id"], cyc) / "manifest.json"
+            self.cycle_dirs[cyc] = path.parent
+            raw = path.read_bytes()
+            doc = json.loads(raw)
+            if (doc.get("cycle", {}).get("cycle_id") != cyc or
+                    "sha256:" + hashlib.sha256(raw).hexdigest() != record.get("manifest_digest")):
+                raise ValueError(f"manifest-binding-mismatch: {cyc}")
+            self.manifest_inputs[path] = raw
             self.manifests[cyc] = (record, doc)
         self.shared = self._shared_revisions()
 
@@ -203,11 +325,11 @@ class Bundle:
         rows = []
         root_id = self.identity.artifact_root_id
         for cyc, (record, doc) in self.manifests.items():
+            cycle_rel = os.path.relpath(self.cycle_dirs[cyc], self.root)
             by_artifact = {a["artifact_id"]: a for a in doc["artifacts"]}
             for rev in doc["artifact_revisions"]:
                 art = by_artifact[rev["artifact_id"]]
                 locator = rev["locator"]["path"]
-                cycle_rel = os.path.relpath(P.cycle_dir(self.root, record["campaign_id"], cyc), self.root)
                 rows.append({"artifact_root_id": root_id, "repository_id": self.identity.repository_id,
                              "campaign_id": record["campaign_id"], "cycle_id": cyc,
                              "artifact_id": rev["artifact_id"], "artifact_revision_id": rev["artifact_revision_id"],
@@ -221,7 +343,7 @@ class Bundle:
                 rows.append({"artifact_root_id": root_id, "repository_id": self.identity.repository_id,
                              "campaign_id": record["campaign_id"], "cycle_id": cyc, "artifact_id": None,
                              "artifact_revision_id": None, "content_digest": "sha256:" + row["sha256"], "byte_size": row["byte_size"],
-                             "locator": f"{os.path.relpath(P.cycle_dir(self.root, record['campaign_id'], cyc), self.root)}/{row['path']}",
+                             "locator": f"{cycle_rel}/{row['path']}",
                              "disposition": "C-LEG(runtime-residue)" if row["reason"] == "hidden-component" else "C-LEG(unmanifestable)",
                              "identity_class": "excluded", "reason": row["reason"]})
         for rev in self.shared:
@@ -234,17 +356,68 @@ class Bundle:
         rows.sort(key=lambda r: r["locator"])
         return rows
 
+    def prepare_mapping(self, population):
+        """Fail before any output, including for missing manifest-only members."""
+        snapshot = LocatorSnapshot(self.root)
+        snapshot.inputs.update(self.manifest_inputs)
+        by_locator = {}
+        for row in population:
+            locator = row["locator"]
+            if locator in by_locator:
+                raise ValueError(f"population-locator-ambiguous: {locator}")
+            identity = snapshot.observe_target(locator, row["content_digest"], row["byte_size"])
+            snapshot.population_targets.append((locator, row["content_digest"], row["byte_size"], identity))
+            by_locator[locator] = row
+        journal_path = self.w7_evidence / "applied-journal.jsonl"
+        journal_raw = snapshot.read(journal_path)
+        journal = {}
+        for row in (json.loads(line) for line in journal_raw.splitlines() if line.strip()):
+            if row.get("kind") == "file":
+                key = (row["source_locator"], row["target_locator"])
+                if key in journal and journal[key] != row.get("sha256"):
+                    raise ValueError(f"applied-journal-ambiguous: {key}")
+                journal[key] = row.get("sha256")
+        mapping, maps = [], []
+        for name, path in (("w7-e2e3", self.w7_evidence / "compatibility-map.jsonl"),
+                           ("w7c-delta", self.w7c_run / "compatibility-map.jsonl")):
+            raw = snapshot.read(path)
+            digest = "sha256:" + hashlib.sha256(raw).hexdigest()
+            original = [json.loads(line) for line in raw.splitlines() if line.strip()]
+            if original and not any(p["path"] == str(path) and p["sha256"] == digest for p, _ in snapshot.maps):
+                raise ValueError(f"original-map-not-in-compat: {path}")
+            maps.append({"name": name, "path": os.path.relpath(path, self.root), "sha256": digest, "rows": len(original)})
+            for ordinal, row in enumerate(original, 1):
+                if row.get("kind") != "file":
+                    continue
+                historical = row["target_locator"]
+                locator, resolution = snapshot.resolve(historical)
+                target = by_locator.get(locator)
+                if target is None:
+                    raise ValueError(f"mapping-target-outside-population: {locator}")
+                expected = (journal.get((row["source_locator"], historical)) if name == "w7-e2e3" else row.get("sha256"))
+                if not expected or "sha256:" + expected.removeprefix("sha256:") != target["content_digest"]:
+                    raise ValueError(f"historical-target-digest-mismatch: {historical}")
+                mapping.append({"legacy_locator": row["source_locator"], "historical_target_locator": historical,
+                                "target_locator": locator, "map": name,
+                                "artifact_id": target.get("artifact_id"), "artifact_revision_id": target.get("artifact_revision_id"),
+                                "shared_reference_revision_id": target.get("shared_reference_revision_id"),
+                                "state": "excluded" if target["identity_class"] == "excluded" else "resolved",
+                                "provenance": {"map_sha256": digest, "map_row": ordinal,
+                                               "content_digest": target["content_digest"], "byte_size": target["byte_size"],
+                                               "resolution": resolution}})
+        snapshot.verify_unchanged()
+        self.mapping_snapshot = snapshot
+        self.prepared_mapping = mapping
+        self.original_maps = maps
+        self.population_digest = sha_text("".join(canonical(row) + "\n" for row in population))
+
+    def _check_population(self, population):
+        if self.population_digest != sha_text("".join(canonical(row) + "\n" for row in population)):
+            raise ValueError("mapping-population-changed")
+
     def relocation_handoff(self, population):
-        w7_map = self.w7_evidence / "compatibility-map.jsonl"
-        w7c_map = self.w7c_run / "compatibility-map.jsonl"
-        w7_rows = read_jsonl(w7_map)
-        w7c_rows = read_jsonl(w7c_map)
-        by_locator = {r["locator"]: r for r in population}
-        unresolved = []
-        for r in w7_rows + w7c_rows:
-            t = r.get("target_locator")
-            if r.get("kind") == "file" and t not in by_locator:
-                unresolved.append(t)
+        self._check_population(population)
+        unresolved = [r["historical_target_locator"] for r in self.prepared_mapping if r["state"] == "unresolved"]
         retire_journal = self.retirement_run / "journal.jsonl"
         retired = read_jsonl(retire_journal) if retire_journal.is_file() else []
         tombstones = [{"tombstone_kind": "source-removed", "source_locator": r.get("path") or r.get("source_locator"),
@@ -255,10 +428,9 @@ class Bundle:
         backup_seal = read_json(self.w7_evidence / "backup-seal.json")
         return {
             "schema": SCHEMA, "row": "relocation handoff",
-            "maps": [
-                {"name": "w7-e2e3", "path": os.path.relpath(w7_map, self.root), "sha256": sha_file(w7_map), "rows": len(w7_rows)},
-                {"name": "w7c-delta", "path": os.path.relpath(w7c_map, self.root), "sha256": sha_file(w7c_map), "rows": len(w7c_rows)},
-            ],
+            "maps": self.original_maps,
+            "locator_snapshot": {"compat_maps": [p for p, _ in self.mapping_snapshot.maps],
+                                 "population_sha256": self.population_digest},
             "applied_journal": {"path": os.path.relpath(self.w7_evidence / "applied-journal.jsonl", self.root),
                                 "sha256": sha_file(self.w7_evidence / "applied-journal.jsonl")},
             "inverse_journal": {"path": os.path.relpath(self.w7_evidence / "applied-inverse.jsonl", self.root),
@@ -295,21 +467,12 @@ class Bundle:
                 "note": "digests verify bytes; identity is the artifact_id/artifact_revision_id in stable-population.jsonl"}
 
     def legacy_mapping(self, population):
-        by_locator = {r["locator"]: r for r in population}
-        rows = []
+        self._check_population(population)
+        rows = list(self.prepared_mapping)
         conflicts = []
         seen = defaultdict(list)
-        for name, path in (("w7-e2e3", self.w7_evidence / "compatibility-map.jsonl"), ("w7c-delta", self.w7c_run / "compatibility-map.jsonl")):
-            for r in read_jsonl(path):
-                if r.get("kind") != "file":
-                    continue
-                target = by_locator.get(r["target_locator"])
-                row = {"legacy_locator": r["source_locator"], "target_locator": r["target_locator"], "map": name,
-                       "artifact_id": (target or {}).get("artifact_id"), "artifact_revision_id": (target or {}).get("artifact_revision_id"),
-                       "shared_reference_revision_id": (target or {}).get("shared_reference_revision_id"),
-                       "state": "resolved" if target and target["identity_class"] != "excluded" else ("excluded" if target else "unresolved")}
-                rows.append(row)
-                seen[r["source_locator"]].append(name)
+        for row in rows:
+            seen[row["legacy_locator"]].append(row["map"])
         for src, maps in seen.items():
             if len(maps) > 1:
                 conflicts.append({"legacy_locator": src, "maps": maps})
@@ -392,7 +555,7 @@ class Bundle:
     def approval_boundary(self, bundle_digest_seed):
         def aid(stage):
             return "apr_" + hashlib.sha256(f"{SCHEMA}\0{bundle_digest_seed}\0{stage}".encode()).hexdigest()[:32]
-        return {"schema": SCHEMA, "row": "approval boundary",
+        boundary = {"schema": SCHEMA, "row": "approval boundary",
                 "stages": [
                     {"stage": "W9-dry-run", "approval_id": aid("W9-dry-run"), "authorized": False, "mutates": "nothing (candidate digest only)"},
                     {"stage": "W10-D20-destructive-apply", "approval_id": aid("W10-D20"), "authorized": False,
@@ -402,18 +565,32 @@ class Bundle:
                      "invariant": "l2_notes INSERT/UPDATE/DELETE = 0; link rows only"},
                 ],
                 "note": "three separate approvals; none is granted by this bundle"}
+        if self.include_w16_namespace_delete:
+            boundary["stages"].append({
+                "stage": "W16-namespace-delete", "approval_id": aid("W16-namespace-delete"),
+                "authorized": False,
+                "invariant": ("separate approval required; namespace allowlist: fleet-fd8b0c7bc445, "
+                              "w9-candidate-1d30600937a5, w9-candidate-f2c03fff8030, ap_cand_step7; "
+                              "active namespace, l2_notes, and source artifacts excluded; "
+                              "Cairn executor validates targets and approval"),
+            })
+            boundary["note"] = "four separate approvals; none is granted by this bundle"
+        return boundary
 
     # -- run -----------------------------------------------------------------
     def build(self):
-        self.dir.mkdir(parents=True, exist_ok=True)
         population = self.stable_population()
-        self.write("stable-population.jsonl", population, jsonl=True)
-        self.write("relocation-handoff.json", self.relocation_handoff(population))
-        self.write("integrity-census.json", self.integrity_census())
+        self.prepare_mapping(population)
         mapping, conflicts = self.legacy_mapping(population)
+        relocation = self.relocation_handoff(population)
+        self.mapping_snapshot.verify_unchanged()
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.write("stable-population.jsonl", population, jsonl=True)
+        self.write("relocation-handoff.json", relocation)
+        self.write("integrity-census.json", self.integrity_census())
         self.write("legacy-mapping.jsonl", mapping, jsonl=True)
         self.write("legacy-mapping-conflicts.json", {"schema": SCHEMA, "conflicts": conflicts,
-                                                     "resolution_rule": "a legacy locator present in both maps resolves through the latest map (W7C delta) first — artifact_cutover.resolve_legacy; both targets are listed in legacy-mapping.jsonl",
+                                                     "resolution_rule": "each original historical target resolves independently through the verified compat chain; duplicate legacy sources remain conflicts, never collapsed by latest-map-wins",
                                                      "mapping_digest": self.files["legacy-mapping.jsonl"]["sha256"],
                                                      "provenance": ["w7-e2e3 compatibility-map.jsonl", "w7c-delta compatibility-map.jsonl"]})
         self.write("publication-evidence.json", self.publication_evidence())
@@ -435,6 +612,9 @@ class Bundle:
                           **({"existing notes": "notes.json"} if self.notes is not None else {})},
                  "files": self.files}
         index["bundle_digest"] = sha_text(canonical(self.files))
+        # handoff.json is the success seal: recheck after every other payload
+        # has been produced. A failure leaves unsealed files, never success.
+        self.mapping_snapshot.verify_unchanged()
         self.write("handoff.json", index)
         return index
 
@@ -450,6 +630,8 @@ def main(argv=None):
     ap.add_argument("--backup-tar")
     ap.add_argument("--census", help="delta-census json to cite")
     ap.add_argument("--notes", help="Cairn body-free note export (cairn-w8-notes/v1) to seal as notes.json")
+    ap.add_argument("--include-w16-namespace-delete", action="store_true",
+                    help="add the optional, unauthorized W16 boundary to a new bundle; use this same bundle for D20 and W16")
     args = ap.parse_args(argv)
     notes = notes_meta = None
     if args.notes:
@@ -468,7 +650,8 @@ def main(argv=None):
         census = {"path": args.census, "sha256": sha_file(Path(args.census)), "runs": c.get("runs"), "stable": c.get("stable_across_runs"),
                   "unclassified_total": c.get("unclassified_total")}
     b = Bundle(root, bundle_dir, args.cycle, Path(args.w7_evidence), Path(args.w7c_run), Path(args.retirement_run),
-               Path(args.backup_tar).expanduser() if args.backup_tar else None, census, notes, notes_meta)
+               Path(args.backup_tar).expanduser() if args.backup_tar else None, census, notes, notes_meta,
+               include_w16_namespace_delete=args.include_w16_namespace_delete)
     index = b.build()
     print(json.dumps({"bundle_dir": str(bundle_dir), "bundle_digest": index["bundle_digest"],
                       "files": {k: v["sha256"] for k, v in index["files"].items()}}, indent=1))

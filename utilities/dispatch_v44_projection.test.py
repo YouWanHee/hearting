@@ -324,8 +324,12 @@ class DispatchV44ProjectionTest(unittest.TestCase):
                 "retry_attempt_id", "state", "reason", "start_permitted",
             },
         )
+        # RecoveryResult is a NamedTuple, not a @dataclass (D0: a hyphenated
+        # CLI module under `from __future__ import annotations` cannot carry
+        # a module-level @dataclass -- see dispatch-recovery.py), so it is
+        # introspected via `_fields` rather than `dataclasses.fields`.
         self.assertEqual(
-            {field.name for field in fields(RECOVERY.RecoveryResult)},
+            set(RECOVERY.RecoveryResult._fields),
             {
                 "recovery_id", "phase", "state", "reason", "retry_attempt_id",
                 "child_spawned", "record_path",

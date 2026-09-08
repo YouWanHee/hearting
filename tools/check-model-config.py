@@ -39,6 +39,8 @@ EXEMPT_SUBSTRINGS = (
     # the ONLY agents exemptions.
     "/agents/general-purpose.",
     "/agents/general-purpose/",
+    "/agents/balanced.",
+    "/agents/balanced/",
     "/agents/light.",
     "/agents/light/",
     "/agents/deep.",

@@ -146,7 +146,7 @@ Portable docs use role names, not vendor model names:
 | `external adversary` | Independent reviewer with different model/runtime/process assumptions |
 | `orchestrator` | Balanced mechanical coordination of already-decided tooling, paths, and report assembly; not a deep-conductor alias |
 
-Adapters map two independent portable axes: `model_role` describes behavior, while `model_profile` (`deep|balanced-deep|light|mini`) describes the execution budget. Each adapter declares concrete models, effort/variant projections, profile granularity, and interactive-main-only families in `adapters/<adapter>/config/models.conf`; every resolver, wrapper, generated agent, lifecycle worker, and documentation table derives from that single source. A route-bound job carries both sealed axes and rejects trailing model/effort replacement. `mini` is unavailable to substantive registered dispatch-depth-1/2 owners, stages, and reviewers. A profile may share another profile's concrete model as long as the resulting execution points stay distinct; the ladder is a set of operating points, not a set of models. An adapter lacking a verified effort/variant distinction may collapse `balanced-deep` into `deep` and `mini` into `light` only with explicit reduced-granularity metadata naming which profiles collapsed. Non-route surfaces may retain checked explicit selection or inheritance when the resulting model is execution-surface eligible; main-only or unprovable inheritance is a typed deny.
+Adapters map two independent portable axes: `model_role` describes behavior, while `model_profile` (`deep|balanced-deep|balanced|light|mini`) is the sealed result of the judgment-demand × execution-scope resolver. Each adapter declares concrete models, effort/variant projections, profile granularity, and interactive-main-only families in `adapters/<adapter>/config/models.conf`; every resolver, wrapper, generated agent, lifecycle worker, and documentation table derives from that single source. A route-bound job carries both sealed axes and rejects trailing model/effort replacement. `mini` is unavailable to substantive registered dispatch-depth-1/2 owners, stages, and reviewers. A profile may share another profile's concrete model as long as the resulting execution points stay distinct; the ladder is a set of operating points, not a set of models. An adapter lacking a verified effort/variant distinction may collapse only the explicitly documented operating point (OpenCode balanced to light) with reduced-granularity metadata. Non-route surfaces may retain checked explicit selection or inheritance when the resulting model is execution-surface eligible; main-only or unprovable inheritance is a typed deny.
 
 O2 (Astra guide alignment): a single tier's execution budget is not one value. A deep-capable tier carries at least three independently-configured settings that must stay coherent by convention, not by a shared cell: the tier's own default effort (`CFG_TIER_<TIER>_EFFORT`), the `deep`-profile route budget that a route-bound job actually receives (`CFG_MODEL_PROFILE_DEEP`'s `tier:budget`), and the first step of that tier's capacity-failover cascade (`CFG_TIER_DEEP_FAILOVER_CASCADE`). A read-only diagnostic (`utilities/model_config.py --diagnose`, exposed per-adapter through the runtime surface, e.g. Codex's `preflight.sh model-config`) must report all three explicitly and flag — never silently equate or rewrite — a mismatch between them; treating them as one value hides exactly the "configured but not applied" drift class this alignment closes. An opt-in that changes only existing keys in a copied complete user file is the only supported customization path; no new required `CFG_*` key is introduced (the shipped baseline is selected whole-file, so a new required key would make every existing user file incomplete and discard it).
 
@@ -174,6 +174,25 @@ Adapter and projection edits are derived core-first: change the portable invaria
 `core/` first, read that governing core document in the current session, then update
 the adapter realization and generated projection. A runtime marker proves the read
 gate only; it does not replace this source-order review.
+
+### 3.1. Derived Codex execution-home generations
+
+New nested Codex owner attempts select the fixed worktree-local generation
+`.dispatch/nested-codex-home-v2`. Existing attempts keep their original home;
+ordinary preparation never adopts or rewrites a legacy or foreign destination.
+The registration seals the actual absolute `codex_home`. Retry identity includes
+that field and Codex depth-2 children inherit their exact Codex parent's sealed
+home. Unsealed legacy rows use only their original deterministic inference.
+An explicit home never adds a second legacy lookup candidate, including Fleet
+session attribution and recovery quiescence checks.
+
+Dry-run selects a path without mutation; registration publishes metadata only;
+start prepares the owned nested snapshot and projection. Preparation retains
+whole-parent selection, exact raw bytes, ownership, CAS, ABA, process-quiescence,
+and link-preservation checks. When the selection receipt declares derived
+balanced values, both captured-buffer comparison and destination revalidation
+reuse the model resolver's same pure balanced normalization. This changes only
+the compared maps, never the stored bytes or user configuration.
 
 ## 4. Capability Model
 
