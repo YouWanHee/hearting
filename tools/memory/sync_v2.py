@@ -4016,6 +4016,7 @@ def _bounded_ids(
 def _historical_inert_proofs(connection, folded):
     """Verify reader-local sealed coverage without recovery or protocol writes."""
     import migration_v2 as migration
+    import protocol_v2 as protocol
     proof = {"available": False, "valid": False, "reason": "reader-proof-absent", "pointers": []}
     names = _table_names(connection)
     required = {"sync_migration_seals", "sync_migration_state", "sync_migration_artifacts"}
@@ -4071,26 +4072,34 @@ def _historical_inert_proofs(connection, folded):
         covered = set()
         for replica in evidence["replicas"]:
             manifests = {}
-            for kind, filename, field in (("snapshot","snapshot.json","snapshot_digest"), ("seed","seed.json","seed_digest")):
-                artifact = artifacts[(kind,replica["replica_id"])]
+            for kind, filename in (("snapshot", "snapshot.json"),
+                                   ("snapshot-seed", "seed.json"),
+                                   ("delta-seed", "seed.json")):
+                artifact = artifacts[(kind, replica["replica_id"])]
                 base = Path(artifact["local_path"])
                 path = base / filename if base.is_dir() else base
                 if path.is_symlink() or not path.is_file():
                     raise ValueError("reader-proof-file-unavailable")
-                verified = (migration.verify_snapshot(path) if kind == "snapshot" else migration.verify_seed_manifest(path))
-                if (verified["manifest_digest"] != replica[field]
-                        or verified["manifest_digest"] != artifact["manifest_digest"]
+                verified = (migration.verify_snapshot(path) if kind == "snapshot"
+                            else migration.verify_seed_manifest(path))
+                if (verified["manifest_digest"] != artifact["manifest_digest"]
+                        or verified["kind"] != kind
                         or verified["epoch_id"] != epoch
                         or verified["membership_digest"] != membership_digest
                         or verified["replica_id"] != replica["replica_id"]):
                     raise ValueError("reader-proof-coverage-mismatch")
-                manifests[kind] = (path,verified)
-                proof["pointers"].append({"kind":kind,"path":str(path),"digest":verified["manifest_digest"]})
+                manifests[kind] = (path, verified)
+                proof["pointers"].append({"kind": kind, "path": str(path),
+                                          "digest": verified["manifest_digest"]})
             snapshot_path, snapshot = manifests["snapshot"]
-            seed = manifests["seed"][1]
-            if seed["snapshot_digest"] != snapshot["manifest_digest"]:
+            seeds = [manifests[kind][1] for kind in ("snapshot-seed", "delta-seed")]
+            if (snapshot["manifest_digest"] != replica["snapshot_digest"]
+                    or snapshot["backup"]["sha256"] != replica["backup_digest"]
+                    or migration.rollback_seed_set_digest(seeds) != replica["seed_digest"]):
+                raise ValueError("reader-proof-coverage-mismatch")
+            if any(seed["snapshot_digest"] != snapshot["manifest_digest"] for seed in seeds):
                 raise ValueError("reader-seed-snapshot-mismatch")
-            seeded = {item["op_id"] for item in seed["objects"]}
+            seeded = {item["op_id"] for seed in seeds for item in seed["objects"]}
             # verify_snapshot has already verified containment, bytes, dump and inventory.
             backup = snapshot_path.parent / snapshot["backup"]["path"]
             with sqlite3.connect(backup.resolve().as_uri()+"?mode=ro&immutable=1", uri=True) as historical:
@@ -4100,7 +4109,7 @@ def _historical_inert_proofs(connection, folded):
                 if "sync_objects" not in snapshot_names:
                     raise ValueError("reader-captured-coverage-unprovable")
                 for captured_id, captured_raw in historical.execute("SELECT op_id,payload_bytes FROM sync_objects"):
-                    if captured_id in seeded and captured_id in all_ops and bytes(captured_raw) == all_ops[captured_id].raw:
+                    if captured_id in seeded and captured_id in all_ops and bytes(captured_raw) == protocol.canonical_bytes(all_ops[captured_id].payload):
                         covered.add(captured_id)
                 for op_id, record_ids in list(candidates.items()):
                     for rid in record_ids:
@@ -4121,7 +4130,10 @@ def blocked_operation_details(connection):
     rows = connection.execute("SELECT op_id,result,diagnostic_id FROM sync_applied WHERE result LIKE 'blocked:%' OR result LIKE 'blocked-resolved:%' ORDER BY op_id").fetchall()
     if not rows:
         return []
-    raw = [bytes(row[0]) for row in connection.execute("SELECT payload_bytes FROM sync_objects ORDER BY op_id")]
+    # SQLite stores canonical payload bytes; the fold validates full envelopes.
+    raw = [{"op_id": op_id, "payload": protocol.canonical_loads(bytes(payload))}
+           for op_id, payload in connection.execute(
+               "SELECT op_id,payload_bytes FROM sync_objects ORDER BY op_id")]
     folded = protocol.fold_operations(raw)
     resolved = protocol.resolved_blocked_by(folded)
     inert, proof = _historical_inert_proofs(connection, folded) if not folded.classification.hard_failures else ({}, {"available":False,"valid":False,"reason":"fold-hard-failure","pointers":[]})

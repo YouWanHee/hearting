@@ -50,7 +50,13 @@ class MemTwoServerSyncTest(unittest.TestCase):
             if not key.startswith("MEM_")
         }
         env.update({
+            "HOME": str(self.root / f"home-{name}"),
+            "XDG_CONFIG_HOME": str(self.root / f"config-{name}"),
+            "XDG_DATA_HOME": str(self.root / f"data-{name}"),
             "AGENT_HOME": str(self.root / "agent-home"),
+            "MEM_SYNC_REMOTE": "0",
+            "MEM_DUMP_PUSH": "0",
+            "MEM_PROFILE": str(self.root / f"profiles-{name}"),
             "CODEX_SESSIONS": str(self.root / "codex-sessions"),
             "MEM_DUMP_COMMIT": "0",
             "MEM_PROJECTS": str(self.projects_source),
@@ -297,6 +303,11 @@ class MemTwoServerSyncTest(unittest.TestCase):
             connection.close()
         self.assertGreaterEqual(resolved, 1)
         self.assertEqual(unresolved, 0)
+        detailed = self._mem("b", "sync", "status", "--blocked-details", "--json")
+        self.assertEqual(detailed.returncode, 0, detailed.stderr)
+        details = json.loads(detailed.stdout)["blocked_details"]
+        self.assertEqual(len(details), resolved)
+        self.assertTrue(all(item["classification"] == "resolved" for item in details))
 
     def test_full_blocked_details_cli_is_read_only_and_not_truncated(self):
         from helpers import make_operation, canonical_bytes, operation_path
@@ -305,7 +316,7 @@ class MemTwoServerSyncTest(unittest.TestCase):
             op = make_operation(replica_id="7"*32,counter=index+1,record_id=f"blocked-{index}",
                                 body=None,kind="tombstone")
             connection.execute("INSERT INTO sync_objects(op_id,replica_id,counter,project_key,kind,object_path,payload_bytes) VALUES(?,?,?,?,?,?,?)",
-                (op["op_id"],"7"*32,str(index+1),"project-alpha","tombstone",operation_path(op["op_id"]),canonical_bytes(op)))
+                (op["op_id"],"7"*32,str(index+1),"project-alpha","tombstone",operation_path(op["op_id"]),canonical_bytes(op["payload"])))
             connection.execute("INSERT INTO sync_applied(op_id,result) VALUES(?,?)",(op["op_id"],"blocked:blocked-prior-evidence"))
         connection.commit(); before=list(connection.iterdump());connection.close()
         bounded=self._mem("a","sync","status","--json")
@@ -318,6 +329,8 @@ class MemTwoServerSyncTest(unittest.TestCase):
         self.assertEqual(value["blocked_details_count"],140)
         self.assertEqual(value["blocked_detail_counts"],{"active":140})
         self.assertGreater(len(json.dumps(value["blocked_details"])),8192)
+        self.assertTrue(all(item["proof"]["reason"] == "reader-proof-absent"
+                            for item in value["blocked_details"]))
         self.assertTrue(all(item["reason"]=="blocked-prior-evidence" and not item["proof"]["valid"] for item in value["blocked_details"]))
         connection=sqlite3.connect(self.stores["a"] / "memory.db")
         self.assertEqual(list(connection.iterdump()),before);connection.close()
