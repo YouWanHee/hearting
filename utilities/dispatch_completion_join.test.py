@@ -3159,5 +3159,49 @@ class RefusalWriterOwnFailureStaysSilentTest(unittest.TestCase):
             self.assertFalse(log_dir.exists())
 
 
+class HyphenModuleNoDataclassInvariantTest(unittest.TestCase):
+    """D0: a hyphenated CLI module (e.g. claude-session-supervisor.py) is
+    loaded here via file-spec without `sys.modules` registration (see SPEC
+    above, which explicitly opts back in). A module-level `@dataclass` in
+    such a module dies at import: CPython's `_is_type` resolves string
+    annotations (from `from __future__ import annotations`) via
+    `sys.modules.get(cls.__module__).__dict__`, which is `None` when the
+    module was never registered. Ban the decorator mechanically instead of
+    relying on every future file-spec load site to remember."""
+
+    def test_no_hyphenated_utility_module_combines_future_annotations_with_a_module_level_dataclass(self):
+        # The precise defect condition (reproduced above by hand for
+        # claude-session-supervisor.py): `from __future__ import annotations`
+        # makes every annotation a string, and a module-level `@dataclass`
+        # then forces CPython to resolve those strings via
+        # `sys.modules[cls.__module__]`, which is unset for an unregistered
+        # file-spec load. A hyphenated module without future annotations does
+        # not hit this path, so it is not flagged here.
+        import ast
+
+        offenders = []
+        for path in sorted(HERE.glob("*-*.py")):
+            if path.name.endswith(".test.py"):
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            has_future_annotations = any(
+                isinstance(node, ast.ImportFrom)
+                and node.module == "__future__"
+                and any(alias.name == "annotations" for alias in node.names)
+                for node in tree.body
+            )
+            if not has_future_annotations:
+                continue
+            for node in tree.body:
+                if not isinstance(node, ast.ClassDef):
+                    continue
+                for deco in node.decorator_list:
+                    target = deco.func if isinstance(deco, ast.Call) else deco
+                    name = getattr(target, "id", None) or getattr(target, "attr", None)
+                    if name == "dataclass":
+                        offenders.append(f"{path.name}:{node.name}")
+        self.assertEqual(offenders, [], offenders)
+
+
 if __name__ == "__main__":
     unittest.main()

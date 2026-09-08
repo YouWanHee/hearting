@@ -8,6 +8,7 @@ import importlib.util
 import fcntl
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -903,6 +904,26 @@ class FinalizeTest(ProducerTestBase):
         again = P.finalize(self.root, cycle_id=result["cycle_id"])
         self.assertEqual(again["status"], "already-sealed")
         self.assertEqual(P.status(self.root)["cycle_counts"], {"sealed": 1})
+
+    def test_sealed_replay_requires_matching_index_row(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        self.write_output(result)
+        self.close(route, route_file)
+        sealed = P.finalize(self.root, cycle_id=result["cycle_id"])
+        index = adm.load_index(self.root)
+        adm._write_index(self.root, index.__class__(
+            schema_version=index.schema_version, artifact_root_id=index.artifact_root_id,
+            stable_ids=index.stable_ids, routes=index.routes, event_ids=index.event_ids,
+            streams=index.streams, manifests={}, cycles=index.cycles,
+        ))
+        before = (P.read_cycle_record(self.root, result["cycle_id"]),
+                  (Path(result["cycle_dir"]) / "manifest.json").read_bytes())
+        with self.assertRaises(P.ProducerError) as ctx:
+            P.finalize(self.root, cycle_id=result["cycle_id"])
+        self.assertEqual(ctx.exception.code, "already-sealed-mismatch")
+        self.assertEqual(before[0], P.read_cycle_record(self.root, result["cycle_id"]))
+        self.assertEqual(before[1], (Path(result["cycle_dir"]) / "manifest.json").read_bytes())
 
     def test_finalize_requires_closed_route_unless_allowed(self):
         self.activate()
@@ -2370,6 +2391,266 @@ class ComponentSetCheckSurface(ProducerTestBase):
         P.check_component_sets(self.root, "spec", reference_id)
         after = {p: p.stat().st_mtime_ns for p in sorted(shared.rglob("*")) if p.is_file()}
         self.assertEqual(before, after)
+
+
+
+class TerminalExactRecoveryTest(ProducerTestBase):
+    def test_terminal_exact_rejects_each_index_identity_drift_without_mutation(self):
+        result, output, binding = self.prepared()
+        cycle_id = result["cycle_id"]
+        P.finalize_exact_cycle(self.root, cycle_id=cycle_id, expected_binding=binding)
+        original = P.artifact_index.to_payload(adm.load_index(self.root))
+        manifest = Path(result["cycle_dir"]) / "manifest.json"
+        record = P.cycle_record_path(self.root, cycle_id)
+        stable_bytes = (manifest.read_bytes(), record.read_bytes(), output.read_bytes())
+        cases = [(section, key) for section in ("manifests", "cycles")
+                 for key in [*original[section][cycle_id], None]]
+        cases.append(("artifact_root_id", None))
+        for section, key in cases:
+            with self.subTest(section=section, key=key):
+                payload = json.loads(json.dumps(original))
+                if section == "artifact_root_id":
+                    payload[section] = "aroot_" + "f" * 32
+                elif key is None:
+                    del payload[section][cycle_id]
+                else:
+                    payload[section][cycle_id][key] += "-foreign"
+                drifted = P.artifact_index.parse(payload)
+                adm._write_index(self.root, drifted)
+                for operation in (P.verify_finalized_cycle, P.finalize_exact_cycle):
+                    with self.assertRaisesRegex(P.ProducerError, "already-sealed-mismatch"):
+                        operation(self.root, cycle_id=cycle_id, expected_binding=binding)
+                    self.assertEqual(P.artifact_index.to_payload(adm.load_index(self.root)), payload)
+                    self.assertEqual((manifest.read_bytes(), record.read_bytes(), output.read_bytes()), stable_bytes)
+                    self.assertFalse(P.journal_path(self.root, cycle_id).exists())
+        adm._write_index(self.root, P.artifact_index.parse(original))
+        self.assertEqual(P.verify_finalized_cycle(self.root, cycle_id=cycle_id,
+                         expected_binding=binding)["status"], "already-sealed")
+
+    def test_general_absent_cache_compatibility_never_proves_terminal_exact(self):
+        result, output, binding = self.prepared()
+        cycle_id = result["cycle_id"]
+        P.finalize_exact_cycle(self.root, cycle_id=cycle_id, expected_binding=binding)
+        manifest = Path(result["cycle_dir"]) / "manifest.json"
+        manifest.unlink()  # isolated relocation-compatibility fixture only
+        before = P.read_cycle_record(self.root, cycle_id)
+        normal = P.finalize(self.root, cycle_id=cycle_id)
+        self.assertEqual(normal["status"], "already-sealed")
+        self.assertEqual(normal["cycle_state"], "completed")
+        for operation in (P.verify_finalized_cycle, P.finalize_exact_cycle):
+            with self.subTest(operation=operation.__name__):
+                with self.assertRaisesRegex(P.ProducerError, "already-sealed-mismatch"):
+                    operation(self.root, cycle_id=cycle_id, expected_binding=binding)
+        self.assertEqual(P.read_cycle_record(self.root, cycle_id), before)
+        self.assertFalse(manifest.exists())
+
+    def prepared(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        output = self.write_output(result, "plans/cycle/final_report.md", b"verified report\n")
+        self.close(route, route_file)
+        record = P.read_cycle_record(self.root, result["cycle_id"])
+        binding = {key: record[key] for key in ("campaign_id", "cycle_id", "producer_id", "route_hash")}
+        binding["cycle_record_digest"] = P.dispatch_terminal_commit.cycle_identity_digest(record)
+        return result, output, binding
+
+    def test_manifest_crash_recovers_only_exact_cycle_and_replay_proves_outputs(self):
+        result, output, binding = self.prepared()
+        other_route, other_file = self.route(slug="other-open-cycle")
+        other = P.begin(self.root, route_file=other_file, capability="autopilot-code", intensity="direct")
+        other_before = P.read_cycle_record(self.root, other["cycle_id"])
+        with self.assertRaises(adm.AdmissionRecoveryRequired):
+            P.finalize_exact_cycle(self.root, cycle_id=result["cycle_id"], expected_binding=binding,
+                                   crash_after_manifest=True)
+        manifest = Path(result["cycle_dir"]) / "manifest.json"
+        before = manifest.read_bytes()
+        with mock.patch.object(P, "_recover_locked", side_effect=AssertionError("root recovery forbidden")):
+            replay = P.finalize_exact_cycle(self.root, cycle_id=result["cycle_id"], expected_binding=binding)
+            self.assertEqual(replay["status"], "already-sealed")
+            P.verify_finalized_cycle(self.root, cycle_id=result["cycle_id"], expected_binding=binding)
+        self.assertEqual(manifest.read_bytes(), before)
+        self.assertEqual(P.read_cycle_record(self.root, other["cycle_id"]), other_before)
+        output.write_bytes(b"drift after sealing\n")
+        with self.assertRaisesRegex(P.ProducerError, "already-sealed-mismatch"):
+            P.verify_finalized_cycle(self.root, cycle_id=result["cycle_id"], expected_binding=binding)
+
+    def test_completed_finalize_live_lease_and_reentry_make_no_manifest(self):
+        result, output, binding = self.prepared()
+        P.review_lease_acquire(self.root, cycle_id=result["cycle_id"], attempt_id="att-review")
+        with self.assertRaisesRegex(P.ProducerError, "cycle-finalize-blocked-live-review"):
+            P.finalize_exact_cycle(self.root, cycle_id=result["cycle_id"], expected_binding=binding)
+        self.assertFalse((Path(result["cycle_dir"]) / "manifest.json").exists())
+        with self.assertRaisesRegex(P.ProducerError, "finalize-reentry-forbidden"):
+            P.finalize(self.root, cycle_id=result["cycle_id"], _admission_lock_fd=123)
+        self.assertEqual(P.read_cycle_record(self.root, result["cycle_id"])["state"], "open")
+
+
+class QuickOwnerBindingIntegrationTest(ProducerTestBase):
+    def test_registered_quick_begin_crash_resumes_same_binding_without_owner_route_fields(self):
+        self.activate()
+        route, route_file = self.route("quick")
+        node = route["nodes"][0]
+        jobs = Path(self._tmp.name) / "jobs.log"
+        owner = "att-quick-binding"
+        meta = dict(attempt_id=owner, worker_type="owner", dispatch_depth="1", registered_worker="1",
+            harness="codex", capability="autopilot-code", capability_mode="dev", intensity="quick",
+            route_file=str(route_file), route_id=route["route_id"], route_hash=route["route_hash"],
+            route_node=node["id"], registry_digest=route["registry_digest"],
+            completion_gate=node["completion_gate"], write_scope=";".join(node["write_scope"]))
+        jobs.write_text(f"2026-09-08T00:00:00Z\topen\t{R.ROOT}\t{R.ROOT}\tquick\t"
+                        + ",".join(f"{k}={v}" for k,v in meta.items()) + "\n")
+        kwargs = dict(route_file=route_file, capability="autopilot-code", intensity="quick",
+                      jobs=jobs, owner_attempt_id=owner)
+        with mock.patch.object(P.dispatch_terminal_commit, "publish_producer_binding", side_effect=RuntimeError("binding-crash")):
+            with self.assertRaisesRegex(RuntimeError, "binding-crash"):
+                P.begin(self.root, **kwargs)
+        records = P.list_cycle_records(self.root)
+        self.assertEqual(len(records), 1)
+        result = P.begin(self.root, **kwargs)
+        self.assertEqual(result["cycle_id"], records[0]["cycle_id"])
+        binding = P.dispatch_terminal_commit.load_producer_binding(artifact_root=self.root,
+                          route_id=route["route_id"], owner_attempt_id=owner)
+        self.assertEqual(binding.binding["cycle_id"], result["cycle_id"])
+        self.assertEqual(P.begin(self.root, **kwargs)["cycle_id"], result["cycle_id"])
+        self.assertEqual(len(P.list_cycle_records(self.root)), 1)
+
+
+class TerminalTransactionIntegrationTest(ProducerTestBase):
+    def _prepare_fixture(self):
+        import dispatch_terminal_commit as terminal
+        self.activate()
+        route=R.compile_route("autopilot-code","dev","standard",cwd=R.ROOT,artifact_root=self.root,
+            predicates=[],transport="headless",tracking="tracked",tracked_gate_evidence=gate_evidence(),
+            slug="terminal-transaction-fixture",dispatch_evidence={"tuples":[nested("claude","codex")]})
+        route_file=Path(L.admit_runtime_route(self.root,route).route_file)
+        jobs=Path(self._tmp.name)/"jobs.log"; owner="att-transaction-owner"; child="att-transaction-report"
+        owner_meta=dict(attempt_id=owner,worker_type="owner",dispatch_depth="1",registered_worker="1",
+            harness="claude",owner_route_file=str(route_file),owner_route_id=route["route_id"],
+            owner_route_hash=route["route_hash"])
+        def row(status,slug,metadata):
+            return f"2026-09-08T00:00:00Z\t{status}\t{R.ROOT}\t{R.ROOT}\t{slug}\t"+",".join(f"{k}={v}" for k,v in metadata.items())+"\n"
+        jobs.write_text(row("open","owner",owner_meta))
+        with mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(jobs)}):
+            result=P.begin(self.root,route_file=route_file,capability="autopilot-code",intensity="standard",
+                           jobs=jobs,owner_attempt_id=owner)
+            artifact=self.write_output(result,rel="plans/fixture/final_report.md",data=b"verified fixture report\n")
+            node=next(node for node in route["nodes"] if node.get("terminal"))
+            child_meta=dict(attempt_schema_version=2,attempt_id=child,parent_attempt_id=owner,
+                dispatch_depth=2,transport="headless",execution_surface="registered-headless",registered_worker="1",
+                fallback_hop="same-harness-headless",harness="codex",route_id=route["route_id"],
+                route_hash=route["route_hash"],route_node=node["id"],failure_class="pass",launch_outcome="reaped-before-publish")
+            subprocess.run([sys.executable,"-c","pass"],check=True)
+            jobs.write_text(row("open","owner",owner_meta)+row("done","report",child_meta))
+            R._publish_completion_locked(route,node,node["id"],artifact,attempt_id=child,attempt_metadata=child_meta,jobs=jobs)
+            request=terminal.TerminalCommitRequest(route_file,owner,jobs,self.root)
+            return route,route_file,jobs,owner,result,artifact,request
+
+    def test_default_services_close_finalize_envelope_and_replay(self):
+        import dispatch_terminal_commit as terminal
+        route,route_file,jobs,owner,result,artifact,request=self._prepare_fixture()
+        with mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(jobs)}):
+            proof=terminal.prove_terminal_authority(request)
+            self.assertEqual(proof.status,"proved",proof)
+            settled=terminal.settle_terminal_commit(request)
+            self.assertEqual(settled.result,"completed",settled)
+            self.assertIn(f"artifact: {artifact}",settled.envelope_text)
+            manifest=Path(result["cycle_dir"])/"manifest.json"
+            self.assertTrue(manifest.is_file())
+            self.assertEqual(P.read_cycle_record(self.root,result["cycle_id"])["state"],"sealed")
+            slot=terminal.terminal_slot(self.root,route["route_id"],owner)
+            paths=[R.outcome_path(route_file),manifest,slot/"owner-envelope.txt",slot/"owner-envelope.json"]
+            before={str(path):path.read_bytes() for path in paths}
+            replay=terminal.settle_terminal_commit(request)
+            self.assertEqual(replay.result,"completed",replay)
+            self.assertEqual(before,{str(path):path.read_bytes() for path in paths})
+            artifact.write_text("post-seal corruption")
+            self.assertNotEqual(terminal.settle_terminal_commit(request).result,"completed")
+
+    def test_default_services_recover_each_durable_boundary_without_duplicate_outputs(self):
+        import dispatch_terminal_commit as terminal
+        checkpoints=("claim-before","claim-after","close-after","manifest-after","finalize-after","envelope-after")
+        for checkpoint in checkpoints:
+            with self.subTest(checkpoint=checkpoint):
+                fixture=TerminalTransactionIntegrationTest()
+                fixture.setUp()
+                try:
+                    route,route_file,jobs,owner,result,artifact,request=fixture._prepare_fixture()
+                    if checkpoint=="claim-before":
+                        crash=mock.patch.object(terminal.dispatch_contract,"claim_terminal_route_locked",
+                                                side_effect=RuntimeError(checkpoint))
+                    elif checkpoint=="claim-after":
+                        original=terminal._atomic_json
+                        def write(path,value,**kw):
+                            if value.get("state")=="claimed":raise RuntimeError(checkpoint)
+                            return original(path,value,**kw)
+                        crash=mock.patch.object(terminal,"_atomic_json",side_effect=write)
+                    elif checkpoint=="manifest-after":
+                        crash=mock.patch.object(P,"_commit_sealed",side_effect=RuntimeError(checkpoint))
+                    else:
+                        next_state={"close-after":"route-closed","finalize-after":"producer-finalized",
+                                    "envelope-after":"owner-envelope-sealed"}[checkpoint]
+                        original=terminal._advance_state
+                        def advance(path,commit_id,expected,next_value,extra):
+                            if next_value==next_state:raise RuntimeError(checkpoint)
+                            return original(path,commit_id,expected,next_value,extra)
+                        crash=mock.patch.object(terminal,"_advance_state",side_effect=advance)
+                    with mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(jobs)}):
+                        with crash:
+                            interrupted=terminal.settle_terminal_commit(request)
+                        self.assertNotEqual(interrupted.result,"completed",interrupted)
+                        slot=terminal.terminal_slot(fixture.root,route["route_id"],owner)
+                        targets=[R.outcome_path(route_file),Path(result["cycle_dir"])/"manifest.json",slot/"owner-envelope.txt"]
+                        committed={str(path):path.read_bytes() for path in targets if path.is_file()}
+                        recovered=terminal.settle_terminal_commit(request)
+                        self.assertEqual(recovered.result,"completed",(checkpoint,recovered))
+                        for path in targets:
+                            self.assertTrue(path.is_file())
+                            if str(path) in committed:self.assertEqual(path.read_bytes(),committed[str(path)])
+                        sealed={str(path):path.read_bytes() for path in targets}
+                        self.assertEqual(terminal.settle_terminal_commit(request).result,"completed")
+                        self.assertEqual(sealed,{str(path):path.read_bytes() for path in targets})
+                        self.assertEqual(P.read_cycle_record(fixture.root,result["cycle_id"])["state"],"sealed")
+                finally:
+                    fixture.doCleanups()
+
+    def test_review_lease_between_close_and_finalize_is_typed_and_recoverable(self):
+        import dispatch_terminal_commit as terminal
+        route,route_file,jobs,owner,result,artifact,request=self._prepare_fixture()
+        original=terminal._advance_state
+        def acquire_after_close(path,commit_id,expected,next_value,extra):
+            state=original(path,commit_id,expected,next_value,extra)
+            if next_value=="route-closed":
+                P.review_lease_acquire(self.root,cycle_id=result["cycle_id"],attempt_id="att-late-review")
+            return state
+        with mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(jobs)}):
+            with mock.patch.object(terminal,"_advance_state",side_effect=acquire_after_close):
+                blocked=terminal.settle_terminal_commit(request)
+            self.assertEqual(blocked.result,"recoverable",blocked)
+            self.assertEqual(blocked.reason,"producer-finalize-failed")
+            self.assertIn("cycle-finalize-blocked-live-review",blocked.detail)
+            self.assertFalse((Path(result["cycle_dir"])/"manifest.json").exists())
+            self.assertEqual(P.read_cycle_record(self.root,result["cycle_id"])["state"],"open")
+            P.review_lease_release(self.root,cycle_id=result["cycle_id"],attempt_id="att-late-review")
+            self.assertEqual(terminal.settle_terminal_commit(request).result,"completed")
+
+    def test_real_completion_writer_observes_claim_before_marker_mutation(self):
+        import dispatch_terminal_commit as terminal
+        route,route_file,jobs,owner,result,artifact,request=self._prepare_fixture()
+        with mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(jobs)}):
+            first=terminal.settle_terminal_commit(request,
+                services=terminal.TerminalCommitServices(crash_after="claim-after"))
+            self.assertEqual(first.result,"recoverable",first)
+            node=next(node for node in route["nodes"] if node.get("terminal"))
+            directory=R.completion_dir(route["route_id"])
+            before={str(path):path.read_bytes() for path in directory.rglob("*.json")}
+            registry_before=jobs.read_bytes()
+            with self.assertRaises(terminal.dispatch_contract.DispatchContractError) as caught:
+                R._complete_node_locked(route,node,node["id"],artifact,jobs=jobs,
+                    attempt_id="att-transaction-report")
+            self.assertEqual(caught.exception.reason,"terminal-claim-conflict")
+            self.assertEqual(before,{str(path):path.read_bytes() for path in directory.rglob("*.json")})
+            self.assertEqual(registry_before,jobs.read_bytes())
+            self.assertEqual(terminal.settle_terminal_commit(request).result,"completed")
 
 
 if __name__ == "__main__":

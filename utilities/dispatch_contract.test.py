@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import fcntl, hashlib, importlib.util, json, os, stat, subprocess, sys, tempfile, time, unittest
+import fcntl, hashlib, importlib.util, json, os, stat, subprocess, sys, tempfile, time, threading, unittest
 from unittest import mock
 from pathlib import Path
 
@@ -2122,6 +2122,160 @@ class DispatchContractTest(unittest.TestCase):
    winners=[p.communicate(timeout=10)[0].strip() for p in procs]
    self.assertEqual(winners.count("1"),1,winners)
    self.assertEqual(len(jobs.read_text().splitlines()),1)
+ def test_terminal_claim_fence_blocks_mutation_inside_existing_jobs_lock(self):
+  with tempfile.TemporaryDirectory() as td:
+   jobs=Path(td)/"jobs.log"; attempt="att-terminal-fence01"; route="rt-terminal-fence"
+   row=f"2026-07-16T00:00:00Z\topen\t/repo\t/wt\tstage\t{CURRENT},route_id={route},route_node=execute,attempt_id={attempt}"
+   jobs.write_text(row+"\n")
+   with (Path(f"{jobs}.lock")).open("a") as lock:
+    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+    D.claim_terminal_route_locked(jobs, route, attempt, lock_fd=lock.fileno(), proof={"test":"marker"})
+   with self.assertRaises(D.DispatchContractError) as caught:
+    D.claim_attempt_row(jobs, attempt, row, launch=True,
+                        mutation_precheck=lambda lines: D.ensure_terminal_claim_absent(jobs, route, attempt))
+   self.assertEqual(caught.exception.reason,"terminal-claim-conflict")
+   self.assertIn("\topen\t",jobs.read_text())
+ def test_terminal_claim_requires_held_exact_registry_lock(self):
+  with tempfile.TemporaryDirectory() as td:
+   jobs=Path(td)/"jobs.log"; jobs.write_text("")
+   with Path(f"{jobs}.lock").open("a") as lock:
+    self.assertFalse(D._terminal_claim_lock_owned(lock.fileno(), jobs))
+    fcntl.flock(lock.fileno(),fcntl.LOCK_EX)
+    self.assertTrue(D._terminal_claim_lock_owned(lock.fileno(), jobs))
+    self.assertFalse(D._terminal_claim_lock_owned(lock.fileno(), Path(td)/"other.log"))
+
+ def test_portable_admission_without_adapter_callback_rejects_owner_fence(self):
+  with tempfile.TemporaryDirectory() as td:
+   jobs=Path(td)/"jobs.log"; route="rt-portable-fence"; owner="att-owner"
+   jobs.write_text("")
+   with Path(f"{jobs}.lock").open("a") as lock:
+    fcntl.flock(lock.fileno(),fcntl.LOCK_EX)
+    D.claim_terminal_route_locked(jobs,route,owner,lock_fd=lock.fileno(),proof={"current":True})
+   for harness in ("claude","codex","opencode"):
+    with self.subTest(harness=harness):
+     child="att-child-"+harness
+     metadata=CURRENT+",harness="+harness
+     row=f"2026-07-16T00:00:00Z\topen\t/repo\t/wt\tstage\t{metadata},route_id={route},attempt_id={child},parent_attempt_id={owner}"
+     with self.assertRaises(D.DispatchContractError) as caught:
+      D.claim_attempt_row(jobs,child,row,launch=True)
+     self.assertEqual(caught.exception.reason,"terminal-claim-conflict")
+     self.assertEqual(jobs.read_bytes(),b"")
+
+ def test_child_mutation_observes_owner_terminal_fence(self):
+  with tempfile.TemporaryDirectory() as td:
+   jobs=Path(td)/"jobs.log"; route="rt-parent-fence"; owner="att-owner"; child="att-child"
+   jobs.write_text(f"2026-07-16T00:00:00Z\topen\t/repo\t/wt\tstage\t{CURRENT},route_id={route},attempt_id={child},parent_attempt_id={owner}\n")
+   with Path(f"{jobs}.lock").open("a") as lock:
+    fcntl.flock(lock.fileno(),fcntl.LOCK_EX)
+    D.claim_terminal_route_locked(jobs,route,owner,lock_fd=lock.fileno(),proof={"current":True})
+    with self.assertRaises(D.DispatchContractError) as caught:
+     D.ensure_terminal_claim_absent(jobs,route,child)
+    self.assertEqual(caught.exception.reason,"terminal-claim-conflict")
+   D.terminal_claim_path(jobs,route,owner).write_text("{")
+   with self.assertRaises(D.DispatchContractError) as caught:
+    D.ensure_terminal_claim_absent(jobs,route,child)
+   self.assertEqual(caught.exception.reason,"terminal-claim-record-invalid")
+
+ def test_sentinel_or_other_route_cannot_hide_owner_route_admission_fence(self):
+  for route_value in ("-", "", "rt-other-route"):
+   for registered in (False,True):
+    for launch in (False,True):
+     with self.subTest(route_value=route_value,registered=registered,launch=launch), tempfile.TemporaryDirectory() as td:
+      jobs=Path(td)/"jobs.log"; route="rt-ownerroute-fence"; owner="att-ownerroute"; child="att-child"
+      row=f"2026-07-16T00:00:00Z\topen\t/repo\t/wt\tstage\t{CURRENT},route_id={route_value},owner_route_id={route},attempt_id={child},parent_attempt_id={owner}"
+      jobs.write_text(row+",launch_claimed=0\n" if registered else "")
+      before=jobs.read_bytes()
+      with Path(f"{jobs}.lock").open("a") as lock:
+       fcntl.flock(lock.fileno(),fcntl.LOCK_EX)
+       D.claim_terminal_route_locked(jobs,route,owner,lock_fd=lock.fileno(),proof={"current":True})
+      with self.assertRaises(D.DispatchContractError) as caught:
+       D.claim_attempt_row(jobs,child,row,launch=launch)
+      self.assertEqual(caught.exception.reason,"terminal-claim-conflict")
+      self.assertEqual(jobs.read_bytes(),before)
+
+ def _run_terminal_claim_race(self, marker_actor, terminal_actor):
+  """Run two real writers with a bounded join and return their typed outcomes."""
+  outcomes=[]; barrier=threading.Barrier(2)
+  def run(label, actor):
+   try:
+    barrier.wait(timeout=5)
+    actor()
+   except D.DispatchContractError as caught:
+    outcomes.append((label,"conflict",caught.reason))
+   except BaseException as caught:
+    outcomes.append((label,"error",repr(caught)))
+   else:
+    outcomes.append((label,"winner",None))
+  threads=[threading.Thread(target=run,args=("marker",marker_actor),daemon=True),
+           threading.Thread(target=run,args=("terminal",terminal_actor),daemon=True)]
+  for thread in threads: thread.start()
+  for thread in threads: thread.join(timeout=10)
+  self.assertTrue(all(not thread.is_alive() for thread in threads),outcomes)
+  self.assertEqual(len(outcomes),2,outcomes)
+  self.assertEqual([item[1] for item in outcomes].count("winner"),1,outcomes)
+  self.assertEqual([item[1] for item in outcomes].count("conflict"),1,outcomes)
+  self.assertEqual([item[2] for item in outcomes if item[1]=="conflict"],["terminal-claim-conflict"])
+  return outcomes
+
+ def test_competing_marker_publication_and_terminal_claim_have_one_typed_winner(self):
+  with tempfile.TemporaryDirectory() as td:
+   jobs=Path(td)/"jobs.log"; jobs.write_text("")
+   route="rt-marker-race"; attempt="att-marker-race"
+   def publish_marker():
+    with (Path(f"{jobs}.lock")).open("a") as lock:
+     fcntl.flock(lock.fileno(),fcntl.LOCK_EX)
+     return D.claim_terminal_route_locked(jobs,route,attempt,lock_fd=lock.fileno(),proof={"writer":"marker"})
+   def terminal_claim():
+    with (Path(f"{jobs}.lock")).open("a") as lock:
+     fcntl.flock(lock.fileno(),fcntl.LOCK_EX)
+     return D.claim_terminal_route_locked(jobs,route,attempt,lock_fd=lock.fileno(),proof={"writer":"terminal"})
+   self._run_terminal_claim_race(publish_marker,terminal_claim)
+   self.assertIsNotNone(D.terminal_claim_observation(jobs,route,attempt))
+
+ def test_start_precheck_can_pass_then_terminal_claim_fence_blocks_start(self):
+  with tempfile.TemporaryDirectory() as td:
+   jobs=Path(td)/"jobs.log"; route="rt-start-race"; attempt="att-start-race"
+   row=f"2026-07-16T00:00:00Z\topen\t/repo\t/wt\tstage\t{CURRENT},route_id={route},route_node=execute,attempt_id={attempt}"
+   jobs.write_text(row+"\n")
+   precheck_passed=threading.Event(); release_start=threading.Event()
+   def start_actor():
+    self.assertIsNone(D.terminal_claim_observation(jobs,route,attempt))
+    precheck_passed.set()
+    self.assertTrue(release_start.wait(timeout=5))
+    return D.claim_attempt_row(jobs,attempt,row,launch=True,
+      mutation_precheck=lambda _lines:D.ensure_terminal_claim_absent(jobs,route,attempt))
+   def terminal_actor():
+    self.assertTrue(precheck_passed.wait(timeout=5))
+    with (Path(f"{jobs}.lock")).open("a") as lock:
+     fcntl.flock(lock.fileno(),fcntl.LOCK_EX)
+     result=D.claim_terminal_route_locked(jobs,route,attempt,lock_fd=lock.fileno(),proof={"writer":"terminal"})
+    release_start.set()
+    return result
+   self._run_terminal_claim_race(start_actor,terminal_actor)
+   self.assertNotIn("launch_claimed=1",jobs.read_text())
+
+ def test_retry_precheck_can_pass_then_terminal_claim_fence_blocks_retry(self):
+  with tempfile.TemporaryDirectory() as td:
+   jobs=Path(td)/"jobs.log"; route="rt-retry-race"; attempt="att-retry-race"
+   metadata=cancellation_metadata(attempt)
+   metadata.update({"route_id":route,"route_hash":"sha256:"+"1"*64})
+   jobs.write_text(attempt_row(metadata)+"\n")
+   precheck_passed=threading.Event(); release_retry=threading.Event()
+   def retry_actor():
+    self.assertIsNone(D.terminal_claim_observation(jobs,route,attempt))
+    precheck_passed.set()
+    self.assertTrue(release_retry.wait(timeout=5))
+    return D.claim_recovery_retry(jobs,recovery_id="recovery-race",source_route_id=route,
+      source_route_hash=metadata["route_hash"],node_or_group_leg="execute",
+      original_attempt_id=attempt,remaining_cascade=1)
+   def terminal_actor():
+    self.assertTrue(precheck_passed.wait(timeout=5))
+    with (Path(f"{jobs}.lock")).open("a") as lock:
+     fcntl.flock(lock.fileno(),fcntl.LOCK_EX)
+     result=D.claim_terminal_route_locked(jobs,route,attempt,lock_fd=lock.fileno(),proof={"writer":"terminal"})
+    release_retry.set()
+    return result
+   self._run_terminal_claim_race(retry_actor,terminal_actor)
  def test_register_to_start_transition_is_crash_atomic(self):
   with tempfile.TemporaryDirectory() as td:
    jobs=Path(td)/"jobs.log"; attempt="att-crashatomic123"

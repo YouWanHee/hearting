@@ -38,6 +38,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
 from dispatch_contract import (  # noqa: E402
     resolve_agent_home as _resolve_agent_home,
+    resolve_dispatch_state_root,
 )
 from artifact_producer import review_output_write_authorized_from_cycle  # noqa: E402
 
@@ -1318,6 +1319,28 @@ def check_action(
     command: str = "",
     turn_id: str = "",
 ) -> None:
+    # Terminal cleanup is a narrower capability than the ordinary cycle route.
+    # Evaluate it first so a valid material route cannot widen an active
+    # cleanup scope (the hook and direct writers share this oracle).
+    owner = os.environ.get("AGENT_DISPATCH_ATTEMPT_ID", "")
+    if owner:
+        try:
+            import dispatch_terminal_commit
+            jobs = os.environ.get("AGENT_DISPATCH_JOBS")
+            state_root = Path(jobs).parent if jobs else resolve_dispatch_state_root(resolve_agent_home(agent_home))
+            scope = dispatch_terminal_commit.load_active_cleanup_scope(state_root, owner)
+            if scope is not None:
+                verdict = dispatch_terminal_commit.cleanup_tool_permission(
+                    scope, tool=tool, arguments={"file_path": file_path, "command": command},
+                    cwd=cwd, owner_attempt_id=owner, route_id=os.environ.get("AGENT_ROUTE_ID", ""))
+                if verdict.verdict != "allowed":
+                    raise RouteError("cleanup-scope-" + (verdict.detail or verdict.verdict))
+                return
+        except RouteError:
+            raise
+        except Exception as exc:
+            raise RouteError("cleanup-scope-unavailable") from exc
+
     if tool == "ArtifactWrite":
         if not file_path:
             return

@@ -472,6 +472,9 @@ def main():
    print(f"parallel_group={group}")
    print("child_spawned=0")
    raise SystemExit(65)
+ # This route-process check is advisory only: the adapter is a subprocess and
+ # does not inherit a jobs.log.lock held here.  The registration fence lives in
+ # the adapter's claim_attempt_row critical section.
  if node["kind"]=="resource-runner": print("resource_runner="+str(ROOT/"utilities/resource-runner.py")+"\nroute_node="+a.node); return
  try:
   registry=resolve_global_registry(

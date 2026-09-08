@@ -53,12 +53,15 @@ import artifact_lifecycle  # noqa: E402
 import artifact_locator  # noqa: E402
 import artifact_manifest  # noqa: E402
 import route_identity  # noqa: E402
+import dispatch_terminal_commit  # noqa: E402
 from dispatch_contract import (  # noqa: E402
     _PROCESS_IDENTITY_METADATA_KEYS,
     encode_review_output_locator,
     review_governed_lease_is_held,
     review_lease_record_digest,
     process_start_ticks,
+    resolve_dispatch_state_root,
+    resolve_agent_home,
     review_output_binding_digest,
     review_output_write_authorized,
     validate_review_output_binding,
@@ -891,7 +894,10 @@ def begin(
     shared_reference_pins: Optional[Sequence[Mapping[str, Any]]] = None,
     allocator: Optional[artifact_identity.IdAllocator] = None,
     now: Optional[float] = None,
+    jobs: Optional[Path] = None,
+    owner_attempt_id: Optional[str] = None,
 ) -> Dict[str, Any]:
+    dispatch_terminal_commit.require_current_cleanup("producer-begin", jobs=jobs)
     root = Path(root).resolve()
     if capability not in ENTRY_CAPABILITIES + STAGE_CAPABILITIES:
         raise ProducerError("capability-unknown", capability)
@@ -939,6 +945,33 @@ def begin(
     identity = artifact_lifecycle.read_root_identity(root)
     if identity is None:
         raise ProducerError("root-identity-missing")
+    # SD-120 A1: only registered owner/worker contexts participate.  The
+    # canonical jobs path and attempt identity come from the runtime; callers
+    # do not get a route/owner override surface.
+    binding_jobs = Path(jobs or os.environ.get("AGENT_DISPATCH_JOBS", ""))
+    if not binding_jobs.is_absolute() or not binding_jobs.is_file():
+        binding_jobs = None  # type: ignore[assignment]
+    binding_owner = owner_attempt_id or os.environ.get("AGENT_DISPATCH_ATTEMPT_ID", "")
+    if node_id is not None:
+        binding_owner = os.environ.get("AGENT_DISPATCH_PARENT_ATTEMPT_ID", binding_owner)
+    owner_begin = node_id is None
+    if binding_jobs is not None and binding_owner:
+        try:
+            owner_binding = dispatch_terminal_commit.validate_owner_route(
+                jobs=binding_jobs, route_file=resolved_route_file, owner_attempt_id=binding_owner)
+            existing_open = next((row for row in list_cycle_records(root)
+                                  if row.get("route_id") == route["route_id"] and row.get("state") == "open"), None)
+            binding_path = dispatch_terminal_commit.producer_binding_path(
+                root, owner_binding.route_id, binding_owner)
+            if binding_path.exists():
+                loaded = dispatch_terminal_commit.load_producer_binding(
+                    artifact_root=root, route_id=owner_binding.route_id, owner_attempt_id=binding_owner)
+                if existing_open is None or loaded.binding.get("cycle_id") != existing_open.get("cycle_id"):
+                    raise dispatch_terminal_commit.TerminalCommitError("transaction-conflict", str(binding_path))
+            elif not owner_begin and existing_open is None:
+                raise dispatch_terminal_commit.TerminalCommitError("producer-binding-required", str(binding_path))
+        except dispatch_terminal_commit.TerminalCommitError as exc:
+            raise ProducerError(exc.code, exc.detail) from exc
     lock_fd = artifact_admission._acquire_lock(root, artifact_admission.LOCK_TIMEOUT_DEFAULT, now=now)
     try:
         # W7G owns a root-wide resplit from R2 through R3.  Check its atomic
@@ -954,6 +987,14 @@ def begin(
             if record.get("route_id") == route["route_id"] and record.get("state") == "open":
                 if record.get("route_hash") != route["route_hash"]:
                     raise ProducerError("route-hash-drift", record["cycle_id"])
+                if binding_jobs is not None and binding_owner:
+                    try:
+                        dispatch_terminal_commit.publish_producer_binding(
+                            artifact_root=root, jobs=binding_jobs, route_file=resolved_route_file,
+                            owner_attempt_id=binding_owner, cycle_id=record["cycle_id"],
+                            owner_begin=owner_begin)
+                    except dispatch_terminal_commit.TerminalCommitError as exc:
+                        raise ProducerError(exc.code, exc.detail) from exc
                 return {
                     "status": "resumed", "layout": "cycle", "campaign_id": record["campaign_id"],
                     "cycle_id": record["cycle_id"], "producer_id": record["producer_id"],
@@ -1069,6 +1110,14 @@ def begin(
         campaign["cycles"] = list(campaign.get("cycles", [])) + [new_cycle_id]
         _write_campaign(root, campaign, exclusive=False)
         _write_cycle_binding(target, campaign["campaign_id"], new_cycle_id)
+        if binding_jobs is not None and binding_owner:
+            try:
+                dispatch_terminal_commit.publish_producer_binding(
+                    artifact_root=root, jobs=binding_jobs, route_file=resolved_route_file,
+                    owner_attempt_id=binding_owner, cycle_id=new_cycle_id,
+                    owner_begin=owner_begin)
+            except dispatch_terminal_commit.TerminalCommitError as exc:
+                raise ProducerError(exc.code, exc.detail) from exc
         artifact_locator.rebuild_indexes(root)
         return {
             "status": "begun", "layout": "cycle", "campaign_id": campaign["campaign_id"],
@@ -2042,6 +2091,13 @@ def _published_cycle_state(root: Path, record: Mapping[str, Any]) -> str:
     return manifest_state
 
 
+def _authorize_active_cleanup(root: Path, operation: str, target: Path, cycle_id: Optional[str]) -> None:
+    try:
+        dispatch_terminal_commit.require_current_cleanup(operation, target=target, cycle_id=cycle_id)
+    except dispatch_terminal_commit.TerminalCommitError as exc:
+        raise ProducerError("cleanup-scope-violation", exc.detail) from exc
+
+
 def finalize(
     root: Path,
     *,
@@ -2058,14 +2114,30 @@ def finalize(
     abandon_reason: Optional[str] = None,
     force_abandon_ignoring_lease: bool = False,
     support_locators: Sequence[str] = (),
+    expected_binding: Optional[Mapping[str, Any]] = None,
+    _admission_lock_fd: Optional[int] = None,
+    _recovery_scope: str = "root",
 ) -> Dict[str, Any]:
     root = Path(root).resolve()
+    if _recovery_scope != "exact":
+        dispatch_terminal_commit.require_current_cleanup("producer-finalize")
+    _authorize_active_cleanup(root, "finalize-forward-recovery", root, cycle_id)
     if state not in {"completed", "abandoned"}:
         raise ProducerError("finalize-state-invalid", state)
+    if _admission_lock_fd is not None:
+        raise ProducerError("finalize-reentry-forbidden", cycle_id)
     alloc = allocator or artifact_identity.IdAllocator()
-    lock_fd = artifact_admission._acquire_lock(root, artifact_admission.LOCK_TIMEOUT_DEFAULT, now=now)
+    lock_fd = _admission_lock_fd
+    owns_lock = lock_fd is None
+    if owns_lock:
+        lock_fd = artifact_admission._acquire_lock(root, artifact_admission.LOCK_TIMEOUT_DEFAULT, now=now)
     try:
-        _recover_locked(root)
+        if _recovery_scope == "root":
+            _recover_locked(root, now=now)
+        elif _recovery_scope == "exact":
+            _recover_exact_cycle_locked(root, cycle_id, expected_binding, now=now)
+        else:
+            raise ProducerError("recovery-scope-invalid", _recovery_scope)
         record = read_cycle_record(root, cycle_id)
         if record is None:
             raise ProducerError("cycle-unknown", cycle_id)
@@ -2083,6 +2155,13 @@ def finalize(
                     "finalize-state-conflict",
                     f"{cycle_id}: requested={state} published_cycle_state={published} storage_state=sealed",
                 )
+            # General relocation compatibility may judge an absent manifest
+            # from its state cache. Terminal exact callers still require every
+            # durable proof; an already-sealed status is never that proof.
+            manifest_path = _record_cycle_manifest_path(root, record)
+            if expected_binding is not None or _path_entry_present(manifest_path):
+                verified = _verify_sealed_cycle_locked(root, record, expected_binding)
+                return {**verified, "storage_state": "sealed", "cycle_state": published}
             return {"status": "already-sealed", "cycle_id": cycle_id,
                     "manifest_digest": record.get("manifest_digest"),
                     "storage_state": "sealed", "cycle_state": published}
@@ -2091,14 +2170,8 @@ def finalize(
         # A live review lease protects the report's exact write window from
         # both terminal outcomes.  The check remains under the producer
         # admission lock and happens before any terminal mutation.
-        live_review = _live_review_lease(root, cycle_id)
+        live_review = _live_review_lease(root, cycle_id, now=now)
         live_record = _read_json(live_review) if live_review is not None else None
-        # Legacy v1 leases retain abandon protection only.  The exact report
-        # write lease introduced by schema v2 is the sole completed-finalize
-        # fence, so old leases cannot strand a cycle at completion.
-        live_v2 = _is_v2_review_lease(live_record)
-        if state == "completed" and live_v2:
-            raise ProducerError("cycle-finalize-blocked-live-review", cycle_id)
         if state == "abandoned":
             # SD-117 L1 before L3 (plan-check C-2): live-lease enforcement
             # comes first -- a live registered review lease refuses the
@@ -2117,6 +2190,11 @@ def finalize(
                 abandon_reason = "operator-override-live-review"
             if abandon_reason not in ABANDON_REASONS:
                 raise ProducerError("abandon-reason-required", str(abandon_reason))
+        elif live_review is not None:
+            # SD-120 completed settlement consumes the v1/v2 union. Keep the
+            # legacy abandon override above and the v2-only root recovery
+            # policy separate from this completed publication boundary.
+            raise ProducerError("cycle-finalize-blocked-live-review", cycle_id)
         directory = cycle_dir(root, record["campaign_id"], cycle_id, record)
         route = load_route(root, Path(record["route_file"]))
         if route["route_hash"] != record["route_hash"]:
@@ -2208,6 +2286,139 @@ def finalize(
             "artifact_count": len(rows), "lineage_committed": True, "cycle_state": document["cycle"]["state"],
             "storage_state": "sealed",
         }
+    finally:
+        if owns_lock:
+            artifact_admission._release_lock(root, lock_fd)
+
+
+def _recover_exact_cycle_locked(root: Path, cycle_id: str, expected_binding: Optional[Mapping[str, Any]] = None,
+                                *, now: Optional[float] = None) -> Dict[str, Any]:
+    """Recover only one cycle journal while the admission lock is held."""
+    journal_path = producer_dir(root) / "journal" / f"{cycle_id}.json"
+    journal = _read_json(journal_path)
+    if _path_entry_present(journal_path) and journal is None:
+        raise ProducerError("cycle-journal-invalid", cycle_id)
+    if journal and journal.get("cycle_id", cycle_id) != cycle_id:
+        raise ProducerError("cycle-journal-identity-mismatch", cycle_id)
+    if journal and expected_binding and journal.get("manifest_digest") != expected_binding.get("manifest_digest", journal.get("manifest_digest")):
+        raise ProducerError("cycle-journal-binding-mismatch", cycle_id)
+    if expected_binding:
+        record = read_cycle_record(root, cycle_id)
+        for key in ("campaign_id", "cycle_id", "producer_id"):
+            expected = expected_binding.get(key)
+            if expected is not None and (record is None or record.get(key) != expected):
+                raise ProducerError("cycle-journal-binding-mismatch", key)
+    record = read_cycle_record(root, cycle_id)
+    if record is None:
+        raise ProducerError("cycle-unknown", cycle_id)
+    if _live_review_lease(root, cycle_id, now=now) is not None:
+        raise ProducerError("cycle-finalize-blocked-live-review", cycle_id)
+    if record.get("state") == "sealed":
+        return _verify_sealed_cycle_locked(root, record, expected_binding)
+    if record.get("state") != "open":
+        raise ProducerError("cycle-not-open", cycle_id)
+    directory = cycle_dir(root, record["campaign_id"], cycle_id, record)
+    path = directory / "manifest.json"
+    if _path_entry_present(path):
+        document = _read_json(path)
+        if (journal is None or document is None
+                or (root / str(journal.get("cycle_path", ""))).resolve() != directory.resolve()
+                or artifact_manifest.manifest_digest(document) != journal.get("manifest_digest")):
+            raise ProducerError("cycle-journal-manifest-mismatch", cycle_id)
+        identity = artifact_lifecycle.read_root_identity(root)
+        completion = artifact_lifecycle.evaluate_cycle_completion(
+            document, content_root=directory, route_file=Path(record["route_file"]),
+            expected_root_id=identity.artifact_root_id if identity else None)
+        if not completion.ok:
+            raise ProducerError("completion-rejected", ";".join(v.code for v in completion.reasons))
+        _commit_sealed(root, record, document, journal["manifest_digest"], now=now)
+        return _verify_sealed_cycle_locked(root, read_cycle_record(root, cycle_id), expected_binding)
+    if journal is not None:
+        # Nothing crossed the manifest commit point; the same cycle can
+        # re-enter finalize. No other journal or cycle is read or changed.
+        _remove_journal(root, cycle_id)
+    return {"status": "open", "cycle_id": cycle_id}
+
+
+def _verify_sealed_cycle_locked(root: Path, record: Mapping[str, Any],
+                                expected_binding: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+    """Verify every immutable component before accepting an already-sealed replay."""
+    if record.get("state") != "sealed" or not record.get("sealed_on"):
+        raise ProducerError("already-sealed-mismatch", "cycle-record")
+    if expected_binding is not None:
+        for key in ("campaign_id", "cycle_id", "producer_id"):
+            expected = expected_binding.get(key)
+            if expected is not None and record.get(key) != expected:
+                raise ProducerError("already-sealed-mismatch", key)
+        if (expected_binding.get("cycle_record_digest")
+                and dispatch_terminal_commit.cycle_identity_digest(record) != expected_binding["cycle_record_digest"]):
+            raise ProducerError("already-sealed-mismatch", "cycle-identity")
+    manifest_path = _record_cycle_manifest_path(root, record)
+    directory = manifest_path.parent
+    try:
+        raw = manifest_path.read_bytes()
+        document = json.loads(raw.decode("utf-8"))
+    except (OSError, ValueError, UnicodeError) as exc:
+        raise ProducerError("already-sealed-mismatch", str(manifest_path)) from exc
+    canonical = artifact_manifest.canonical_bytes(document)
+    digest = artifact_manifest.manifest_digest(document)
+    if raw != canonical or digest != record.get("manifest_digest"):
+        raise ProducerError("already-sealed-mismatch", "manifest")
+    identity = artifact_lifecycle.read_root_identity(root)
+    index = artifact_admission.load_index(root)
+    row = index.manifests.get(record["cycle_id"]) if hasattr(index, "manifests") else None
+    if not isinstance(row, dict) or row.get("manifest_digest") != digest:
+        raise ProducerError("already-sealed-mismatch", "index")
+    if expected_binding is not None:
+        cycle_id = record["cycle_id"]
+        cycle = document.get("cycle", {})
+        if (identity is None or index.artifact_root_id != identity.artifact_root_id
+                or document.get("artifact_root_id") != identity.artifact_root_id
+                or cycle.get("cycle_id") != cycle_id
+                or cycle.get("campaign_id") != record["campaign_id"]
+                or document.get("producer", {}).get("producer_id") != record["producer_id"]):
+            raise ProducerError("already-sealed-mismatch", "index-identity")
+        # Use the canonical writer's projection, scoped to this exact cycle.
+        # Root-wide rebuild/repair could touch unrelated open cycles and is
+        # not evidence that this transaction's two index rows were applied.
+        expected_index = artifact_index.apply(
+            artifact_index.empty(identity.artifact_root_id), document,
+            cycle_path=os.path.relpath(str(directory), str(root)),
+            manifest_digest=digest, idempotency_key=cycle_id,
+        )
+        if (row != expected_index.manifests[cycle_id]
+                or index.cycles.get(cycle_id) != expected_index.cycles[cycle_id]):
+            raise ProducerError("already-sealed-mismatch", "index-projection")
+        completion = artifact_lifecycle.evaluate_cycle_completion(
+            document, content_root=directory, route_file=Path(record["route_file"]),
+            expected_root_id=identity.artifact_root_id if identity else None)
+        if not completion.ok:
+            raise ProducerError("already-sealed-mismatch", "completion-evidence")
+    return {"status": "already-sealed", "cycle_id": record["cycle_id"], "manifest_digest": digest}
+
+
+def finalize_exact_cycle(root: Path, *, cycle_id: str, expected_binding: Mapping[str, Any],
+                         state: str = "completed", **kwargs: Any) -> Dict[str, Any]:
+    """Finalize one bound cycle under one admission lock, without root recovery."""
+    root = Path(root).resolve()
+    _authorize_active_cleanup(root, "finalize-forward-recovery", root, cycle_id)
+    # Enter public finalize with no lock held. It owns the one admission
+    # boundary encompassing exact recovery, lease check and manifest commit.
+    return finalize(root, cycle_id=cycle_id, state=state,
+                    expected_binding=expected_binding, _recovery_scope="exact", **kwargs)
+
+
+def verify_finalized_cycle(root: Path, *, cycle_id: str, expected_binding: Mapping[str, Any]):
+    """Read-only proof under admission lock; never repairs an unsealed cycle."""
+    root = Path(root).resolve()
+    lock_fd = artifact_admission._acquire_lock(root, artifact_admission.LOCK_TIMEOUT_DEFAULT)
+    try:
+        if _live_review_lease(root, cycle_id) is not None:
+            raise ProducerError("cycle-finalize-blocked-live-review", cycle_id)
+        record = read_cycle_record(root, cycle_id)
+        if record is None:
+            raise ProducerError("cycle-unknown", cycle_id)
+        return _verify_sealed_cycle_locked(root, record, expected_binding)
     finally:
         artifact_admission._release_lock(root, lock_fd)
 
@@ -2311,6 +2522,7 @@ def _recover_locked(root: Path, *, now: Optional[float] = None) -> Dict[str, Lis
 
 
 def recover(root: Path, *, now: Optional[float] = None) -> Dict[str, Any]:
+    dispatch_terminal_commit.require_current_cleanup("root-recover")
     root = Path(root).resolve()
     lock_fd = artifact_admission._acquire_lock(root, artifact_admission.LOCK_TIMEOUT_DEFAULT, now=now)
     try:
@@ -2860,6 +3072,10 @@ def check_write(root: Path, target: Path) -> Dict[str, Any]:
     rel = _relative(root, Path(target))
     active = is_active(root)
     base = {"cutover": "active" if active else "inactive", "target": str(target)}
+    try:
+        _authorize_active_cleanup(root, "partial-report", Path(target), None)
+    except ProducerError as exc:
+        return {**base, "verdict": "deny", "reason": exc.code, "layout": "cleanup"}
     if rel is None:
         return {**base, "verdict": "allow", "reason": "outside-artifact-root", "layout": None}
     parts = rel.split("/")
@@ -2959,6 +3175,7 @@ def cycle_bucket(root: Path, target: Path) -> Optional[Tuple[str, str]]:
 def resolve_output_dir(root: Path, bucket: str, *, cycle_dir_hint: Optional[str] = None) -> Tuple[Path, str]:
     """Where a writer must place `<bucket>/...` output: cycle layout or legacy."""
     root = Path(root).resolve()
+    _authorize_active_cleanup(root, "partial-report", root, os.environ.get("AGENT_ARTIFACT_CYCLE_ID"))
     hint = cycle_dir_hint or os.environ.get("AGENT_ARTIFACT_CYCLE_DIR")
     if hint:
         directory = Path(hint)
@@ -3080,6 +3297,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     args = parser.parse_args(argv)
     try:
+        if args.command not in {"check-write"}:
+            dispatch_terminal_commit.require_current_cleanup("producer-" + args.command)
         root = Path(args.artifact_root)
         if args.command == "activate":
             w7: Dict[str, Any] = {}

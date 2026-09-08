@@ -18,7 +18,6 @@ from __future__ import annotations
 import argparse
 import base64
 import copy
-from dataclasses import dataclass, field
 import hashlib
 import json
 import os
@@ -509,35 +508,62 @@ class DeliveryLedger:
                 pass
 
 
-@dataclass
+# Plain mutable classes, not @dataclass: this module is hyphenated (loaded
+# elsewhere by file-spec without guaranteed sys.modules registration), and a
+# module-level @dataclass under `from __future__ import annotations` breaks
+# CPython's string-annotation resolution in that load mode (see D0 in
+# claude-session-supervisor.py / dispatch_completion_join.test.py). All three
+# classes here are mutated field-by-field after construction.
 class PendingInternal:
-    kind: str
-    thread_id: str
-    request_id: str = ""
-    delivery_id: str = ""
-    identity: dict[str, str] = field(default_factory=dict)
-    receipt: dict[str, Any] | None = None
-    tui_request_id: Any = None
-    deferred_after_steer: bool = False
-    event: threading.Event = field(default_factory=threading.Event)
-    outcome: dict[str, Any] | None = None
+    def __init__(
+        self,
+        kind: str,
+        thread_id: str,
+        request_id: str = "",
+        delivery_id: str = "",
+        identity: dict[str, str] | None = None,
+        receipt: dict[str, Any] | None = None,
+        tui_request_id: Any = None,
+        deferred_after_steer: bool = False,
+        event: threading.Event | None = None,
+        outcome: dict[str, Any] | None = None,
+    ):
+        self.kind = kind
+        self.thread_id = thread_id
+        self.request_id = request_id
+        self.delivery_id = delivery_id
+        self.identity = identity if identity is not None else {}
+        self.receipt = receipt
+        self.tui_request_id = tui_request_id
+        self.deferred_after_steer = deferred_after_steer
+        self.event = event if event is not None else threading.Event()
+        self.outcome = outcome
 
 
-@dataclass
 class QueuedManual:
-    request_id: Any
-    params: dict[str, Any]
+    def __init__(self, request_id: Any, params: dict[str, Any]):
+        self.request_id = request_id
+        self.params = params
 
 
-@dataclass
 class ThreadState:
-    active_turn_id: str = ""
-    active_turn: dict[str, Any] | None = None
-    steer_ready: bool = False
-    pending_start_id: tuple[str, Any] | None = None
-    pending_start_owner: str = ""
-    queued: list[PendingInternal | QueuedManual] = field(default_factory=list)
-    idle_completions: list[PendingInternal] = field(default_factory=list)
+    def __init__(
+        self,
+        active_turn_id: str = "",
+        active_turn: dict[str, Any] | None = None,
+        steer_ready: bool = False,
+        pending_start_id: tuple[str, Any] | None = None,
+        pending_start_owner: str = "",
+        queued: list[PendingInternal | QueuedManual] | None = None,
+        idle_completions: list[PendingInternal] | None = None,
+    ):
+        self.active_turn_id = active_turn_id
+        self.active_turn = active_turn
+        self.steer_ready = steer_ready
+        self.pending_start_id = pending_start_id
+        self.pending_start_owner = pending_start_owner
+        self.queued = queued if queued is not None else []
+        self.idle_completions = idle_completions if idle_completions is not None else []
 
 
 class ManagedGateway:

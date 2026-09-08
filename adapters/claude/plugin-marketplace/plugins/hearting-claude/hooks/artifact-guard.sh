@@ -167,6 +167,32 @@ root=$local_project
 [ -z "$root" ] && exit 0
 cr=$canonical
 
+# Active terminal cleanup is a strict overlay on the normal cycle route. Keep
+# this check in the shell hook as well as material-route-guard.py so direct
+# writers and hook payloads consult the same persisted scope digest/oracle.
+if [ -n "${AGENT_DISPATCH_ATTEMPT_ID:-}" ]; then
+  if ! PYTHONPATH="$SCRIPT_DIR/../utilities${PYTHONPATH:+:$PYTHONPATH}" python3 - "$cr" "$fp" "${AGENT_DISPATCH_ATTEMPT_ID}" "${AGENT_ROUTE_ID:-unknown}" "${AGENT_ARTIFACT_CYCLE_ID:-}" <<'PY'
+import os, sys
+from pathlib import Path
+try:
+    import dispatch_terminal_commit as d
+except Exception:
+    # Cleanup is an optional overlay; an unavailable oracle must not alter the
+    # ordinary artifact-route decision below.
+    raise SystemExit(0)
+root, target, owner, route_id, cycle_id = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5]
+try:
+    d.require_current_cleanup("partial-report", target=target, cycle_id=cycle_id or None)
+except d.TerminalCommitError as exc:
+    print(str(exc), file=sys.stderr)
+    raise SystemExit(2)
+PY
+  then
+    route_failure "cleanup-scope-denied"
+    exit 2
+  fi
+fi
+
 # ---- W7C write-cutover oracle ----
 # `artifact_producer.py check-write` is the single allow/deny oracle for new
 # artifact writes: legacy top-level buckets stay writable only while the

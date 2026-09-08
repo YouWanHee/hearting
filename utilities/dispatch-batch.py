@@ -1774,6 +1774,8 @@ def _run_subdivision_batch_admission(args: argparse.Namespace, route: dict[str, 
         }, separators=(",", ":"), sort_keys=True))
         return 0
     results = SUBDIVISION_ADMISSION.start_admitted_batch(
+        # start_admitted_batch performs only a subprocess-boundary precheck;
+        # the adapter owns the actual jobs.log.lock terminal-claim fence.
         admission, parent=args.parent, jobs=jobs,
         governor_reservation_env=GOVERNOR_RESERVATION_ENV,
     )

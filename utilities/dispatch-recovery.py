@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, dataclass
 import fcntl
 import hashlib
 import importlib.util
@@ -15,7 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Callable
+from typing import Callable, NamedTuple
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / "utilities")]
@@ -65,8 +64,12 @@ class InjectedRecoveryCrash(RuntimeError):
     """Test-only crash raised by an injected phase-boundary callback."""
 
 
-@dataclass(frozen=True)
-class RecoveryRequest:
+# NamedTuple, not @dataclass: this module is hyphenated (loaded elsewhere by
+# file-spec without guaranteed sys.modules registration), and a module-level
+# @dataclass under `from __future__ import annotations` breaks CPython's
+# string-annotation resolution in that load mode (see D0 in
+# claude-session-supervisor.py / dispatch_completion_join.test.py).
+class RecoveryRequest(NamedTuple):
     jobs: Path
     original_attempt_id: str
     route_file: Path
@@ -76,8 +79,7 @@ class RecoveryRequest:
     cancellation_wait: float = 2.0
 
 
-@dataclass(frozen=True)
-class AttemptSnapshot:
+class AttemptSnapshot(NamedTuple):
     status: str
     repo: str
     worktree: str
@@ -86,8 +88,7 @@ class AttemptSnapshot:
     row_digest: str
 
 
-@dataclass(frozen=True)
-class RecoveryResult:
+class RecoveryResult(NamedTuple):
     recovery_id: str
     phase: str
     state: str
@@ -97,11 +98,10 @@ class RecoveryResult:
     record_path: str = ""
 
     def as_json(self) -> dict[str, object]:
-        return asdict(self)
+        return self._asdict()
 
 
-@dataclass(frozen=True)
-class SourceBatchContext:
+class SourceBatchContext(NamedTuple):
     route: dict[str, object]
     source_route_digest: str
     artifact_root: Path
@@ -900,6 +900,9 @@ def coordinate_recovery(
                 request, source, recovery_identity
             )
             try:
+                # claim_recovery_retry rechecks the terminal claim while it
+                # owns jobs.log.lock; this coordinator's attempt lock is not
+                # a substitute for that registry fence.
                 claim = claim_recovery_retry(
                     request.jobs,
                     recovery_id=recovery_identity,
@@ -1524,6 +1527,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--reason", default="receipt-unavailable-recovery")
     parser.add_argument("--cancellation-wait", type=float, default=2.0)
     args = parser.parse_args(argv)
+    from dispatch_terminal_commit import require_current_cleanup
+    require_current_cleanup('retry')
     request = RecoveryRequest(
         args.jobs,
         args.attempt_id,

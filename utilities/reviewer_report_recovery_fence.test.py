@@ -49,7 +49,8 @@ class ReviewerReportRecoveryFenceTest(FIXTURE.ProducerTestBase):
         super().setUp()
         self._cycle_ordinal = 0
         source = subprocess.run(
-            ["git", "show", f"{BASELINE_SHA}:utilities/artifact_producer.py"],
+            ["git", "-c", f"safe.directory={PROJECT_ROOT}", "show",
+             f"{BASELINE_SHA}:utilities/artifact_producer.py"],
             cwd=PROJECT_ROOT, text=True, capture_output=True, check=True,
         ).stdout
         baseline_path = Path(self._tmp.name) / "artifact_producer_9db757bb.py"
@@ -242,6 +243,36 @@ class ReviewerReportRecoveryFenceTest(FIXTURE.ProducerTestBase):
 
     def test_journal_same_finalize_preserves_pending_cycle(self):
         self._recovery_case("same-finalize", journal=True)
+
+    def test_pending_v2_blocks_terminal_exact_recovery_and_verification(self):
+        for journal in (True, False):
+            with self.subTest(journal=journal):
+                fixture = ReviewerReportRecoveryFenceTest()
+                fixture.setUp()
+                try:
+                    with fixture._baseline_pending_live_v2(journal=journal) as (result, evidence, lease, _):
+                        cycle_id = result["cycle_id"]
+                        record = P.read_cycle_record(fixture.root, cycle_id)
+                        binding = {key: record[key] for key in
+                                   ("campaign_id", "cycle_id", "producer_id", "route_hash")}
+                        binding["cycle_record_digest"] = P.dispatch_terminal_commit.cycle_identity_digest(record)
+                        before = fixture._snapshot(result, evidence)
+                        for operation in (P.finalize_exact_cycle, P.verify_finalized_cycle):
+                            with self.assertRaises(P.ProducerError) as caught:
+                                operation(fixture.root, cycle_id=cycle_id, expected_binding=binding)
+                            self.assertEqual(caught.exception.code, "cycle-finalize-blocked-live-review")
+                            fixture._assert_snapshot(result, evidence, before)
+                        P.review_lease_release(fixture.root, cycle_id=cycle_id, attempt_id=lease["attempt_id"])
+                        if journal:
+                            P.finalize_exact_cycle(fixture.root, cycle_id=cycle_id, expected_binding=binding)
+                        else:
+                            # Manifest-only compatibility repair remains the
+                            # normal recovery authority, then exact verifies it.
+                            P.recover(fixture.root)
+                        self.assertEqual(P.verify_finalized_cycle(fixture.root,
+                            cycle_id=cycle_id, expected_binding=binding)["status"], "already-sealed")
+                finally:
+                    fixture.doCleanups()
 
     def test_journal_other_finalize_preserves_pending_cycle(self):
         self._recovery_case("other-finalize", journal=True)
