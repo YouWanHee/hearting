@@ -21,6 +21,78 @@ def write_json(path: Path, value: dict) -> None:
 
 
 class LiveRelocationTest(unittest.TestCase):
+    def quiescence_fixture(self, base):
+        spec = importlib.util.spec_from_file_location("quiescence_fixture_helpers",
+            Path(__file__).with_name("artifact-quiescence.test.py"))
+        module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+        helper = module.QuiescenceTest(); config = helper.fixture(base)
+        root = Path(config["artifact_root"])
+        other = helper.artifact_root(base, "external")
+        registry = root / "runtime-resource.json"
+        registry.write_text(json.dumps({"schema_version": 1, "runs": {
+            "external": {"status": "running", "artifact_root": str(other)}}}))
+        helper.indexed(config, registry)
+        Path(config["dispatch_jobs"]).write_text("".join(
+            helper.dispatch_row(slug=str(i), attempt=f"att-{i}",
+                                metadata={"artifact_root": other}) for i in range(2)))
+        source = base / "raw.json"
+        value = module.Q.publish(str(source), config)
+        self.assertTrue(value["proven"], value)
+        return module.Q, root, source, value
+
+    def test_scoped_quiescence_consumes_sealed_attribution_not_registry_location(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory); _, root, source, _ = self.quiescence_fixture(base)
+            output = base / "scoped.json"
+            args = argparse.Namespace(input=str(source), artifact_root=str(root), output=str(output), allow_fixture=True)
+            # Fixture opt-in is an internal test parameter, never inferred from the input.
+            status = M.scoped_quiescence(args)
+            result = json.loads(output.read_text())
+            self.assertEqual(status, M.OK)
+            self.assertEqual(result["status"], "pass")
+            self.assertEqual(result["scoped_open_jobs"], 0)
+            self.assertEqual(result["external_open_jobs"], 1)
+            self.assertEqual(result["external_open_dispatch_attempts"], 2)
+
+    def test_review_valid_open_route_requires_transactional_override(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory); validator, root, source, initial = self.quiescence_fixture(base)
+            spec = importlib.util.spec_from_file_location("quiescence_open_route_fixture",
+                Path(__file__).with_name("artifact-quiescence.test.py"))
+            module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+            module.QuiescenceTest().sealed_route(root)
+            value = validator.publish(str(source), initial["config"])
+            self.assertTrue(value["observation_valid"])
+            self.assertEqual(value["open_routes"], 1)
+            self.assertFalse(value["proven"])
+            output = base / "open-route-scoped.json"
+            args = argparse.Namespace(input=str(source), artifact_root=str(root), output=str(output), allow_fixture=True)
+            self.assertEqual(M.scoped_quiescence(args), M.OK)
+            scoped = json.loads(output.read_text())
+            self.assertFalse(scoped["strict_a13_quiescence"])
+            self.assertTrue(scoped["transactional_override_required"])
+            self.assertFalse(validator.validate(str(source), allow_fixture=True)["proven"])
+
+    def test_review_consumer_rejects_invalid_evidence(self):
+        from datetime import datetime, timedelta, timezone
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory); _, root, source, original = self.quiescence_fixture(base)
+            now = datetime.now(timezone.utc)
+            mutations = [
+                {"pending": 1}, {"proven": False}, {"observation_valid": False},
+                {"observed_at": (now - timedelta(seconds=400)).isoformat()},
+                {"observed_at": (now + timedelta(seconds=100)).isoformat()},
+                {"schema_version": 3}, {"sources": {}},
+            ]
+            for ordinal, mutation in enumerate(mutations):
+                with self.subTest(mutation=mutation):
+                    value = json.loads(json.dumps(original)); value.update(mutation)
+                    write_json(source, value)
+                    args = argparse.Namespace(input=str(source), artifact_root=str(root),
+                                              output=str(base / f"bad-scoped-{ordinal}.json"), allow_fixture=True)
+                    with self.assertRaises(ValueError):
+                        M.scoped_quiescence(args)
+
     def fixture(self, base: Path):
         root = base / "artifacts"
         root.mkdir()
