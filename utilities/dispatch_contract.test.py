@@ -580,6 +580,99 @@ class DispatchContractTest(unittest.TestCase):
    self.assertTrue(result.advanced)
    self.assertEqual((result.status,result.verdict),("done","PASS"))
 
+ def marker_proof_fixture(self,base):
+  jobs=base/"jobs.log";attempt="att-marker-full"
+  route_path=base/"route.json";marker_path=base/"execute.json"
+  evidence=base/"evidence.md";evidence.write_text("verified\n")
+  route={
+   "route_id":"rt-delivery","route_hash":"sha256:"+"5"*64,
+   "registry_digest":"sha256:"+"6"*64,
+   "nodes":[{"id":"execute","completion_gate":"code-execute","dispatch_depth":2}],
+  }
+  route_path.write_text(json.dumps(route))
+  marker={
+   "schema_version":2,"sequence":1,"route_id":route["route_id"],
+   "route_hash":route["route_hash"],"registry_digest":route["registry_digest"],
+   "node_id":"execute","completion_gate":"code-execute","attempt_id":attempt,
+   "dispatch_depth":2,"transport":"headless",
+   "execution_surface":"registered-headless","registered_worker":True,
+   "fallback_hop":"same-harness-headless",
+   "evidence":{"path":str(evidence),"sha256":hashlib.sha256(evidence.read_bytes()).hexdigest()},
+  }
+  marker_path.write_text(json.dumps(marker))
+  history=base/"execute.1.json";history.write_text(json.dumps(marker))
+  link=base/f"execute.{attempt}.attempt.json"
+  link.write_text(json.dumps({
+   "schema_version":2,"route_id":route["route_id"],"node_id":"execute",
+   "attempt_id":attempt,"dispatch_depth":2,"transport":"headless",
+   "execution_surface":"registered-headless","registered_worker":True,
+   "fallback_hop":"same-harness-headless",
+   "evidence_sha256":marker["evidence"]["sha256"],
+   "completion_marker":str(marker_path),"completion_marker_history":str(history),
+  }))
+  metadata=(f"{CURRENT},attempt_id={attempt},route_id={route['route_id']},"
+            f"route_hash={route['route_hash']},route_node=execute,"
+            f"route_file={route_path},completion_marker={marker_path},"
+            "launch_outcome=never-launched")
+  raw=f"2026-08-25T00:00:00Z\topen\t/r\t/w\texecute\t{metadata}"
+  jobs.write_text(raw+"\n")
+  return jobs,attempt,D.parse_registry_metadata(metadata),raw,{
+   "route":route_path,"evidence":evidence,"history":history,"link":link,"canonical":marker_path}
+
+ def test_marker_proof_cas_rejects_changed_identity_without_content_io(self):
+  for name in ("route","evidence","history","link"):
+   for mutation in ("rewrite-restored-mtime","replace-inode","delete","symlink"):
+    with self.subTest(dependency=name,mutation=mutation), tempfile.TemporaryDirectory() as td:
+     jobs,attempt,metadata,raw,paths=self.marker_proof_fixture(Path(td))
+     proof=D._marker_bound_prepare_marker_proof(metadata,attempt)
+     self.assertIsNotNone(proof)
+     target=paths[name];old=target.read_bytes();before_stat=target.stat()
+     if mutation=="rewrite-restored-mtime":
+      target.write_bytes(bytes([old[0]^1])+old[1:])
+      os.utime(target,ns=(before_stat.st_atime_ns,before_stat.st_mtime_ns))
+      self.assertEqual(target.stat().st_mtime_ns,before_stat.st_mtime_ns)
+      self.assertNotEqual(target.stat().st_ctime_ns,before_stat.st_ctime_ns)
+     elif mutation=="replace-inode":
+      replacement=target.with_name(target.name+".replacement")
+      replacement.write_bytes(old);replacement.replace(target)
+     elif mutation=="delete":
+      target.unlink()
+     else:
+      replacement=target.with_name(target.name+".foreign")
+      replacement.write_bytes(old);target.unlink();target.symlink_to(replacement)
+     with Path(f"{jobs}.lock").open("a") as lock:
+      fcntl.flock(lock.fileno(),fcntl.LOCK_EX)
+      with mock.patch.object(Path,"read_bytes",side_effect=AssertionError("content I/O under jobs lock")), \
+           mock.patch.object(Path,"read_text",side_effect=AssertionError("content I/O under jobs lock")):
+       self.assertEqual(D._marker_bound_current_marker(metadata,attempt,proof),(None,""))
+     self.assertEqual(jobs.read_text().strip(),raw)
+
+ def test_marker_proof_rejects_validator_race_but_allows_new_canonical(self):
+  with tempfile.TemporaryDirectory() as td:
+   jobs,attempt,metadata,raw,paths=self.marker_proof_fixture(Path(td))
+   real_validate=D.completion_marker_is_current
+   def changed_after_validation(*args,**kwargs):
+    valid=real_validate(*args,**kwargs)
+    self.assertTrue(valid)
+    target=paths["evidence"];before_stat=target.stat();data=target.read_bytes()
+    target.write_bytes(bytes([data[0]^1])+data[1:])
+    os.utime(target,ns=(before_stat.st_atime_ns,before_stat.st_mtime_ns))
+    return valid
+   with mock.patch.object(D,"completion_marker_is_current",side_effect=changed_after_validation):
+    self.assertIsNone(D._marker_bound_prepare_marker_proof(metadata,attempt))
+  with tempfile.TemporaryDirectory() as td:
+   jobs,attempt,metadata,raw,paths=self.marker_proof_fixture(Path(td))
+   proof=D._marker_bound_prepare_marker_proof(metadata,attempt)
+   self.assertIsNotNone(proof)
+   latest=json.loads(paths["canonical"].read_text())
+   latest["attempt_id"]="att-successor";latest["sequence"]=2
+   paths["canonical"].write_text(json.dumps(latest))
+   with Path(f"{jobs}.lock").open("a") as lock:
+    fcntl.flock(lock.fileno(),fcntl.LOCK_EX)
+    with mock.patch.object(Path,"read_bytes",side_effect=AssertionError("content I/O under jobs lock")), \
+         mock.patch.object(Path,"read_text",side_effect=AssertionError("content I/O under jobs lock")):
+     self.assertEqual(D._marker_bound_current_marker(metadata,attempt,proof),(proof.marker,proof.marker_digest))
+
  def test_marker_bound_delivery_revision_drift_refuses_false_pass(self):
   with tempfile.TemporaryDirectory() as td:
    base=Path(td);jobs=base/"jobs.log";attempt="att-marker-drift"

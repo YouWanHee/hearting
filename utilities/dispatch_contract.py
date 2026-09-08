@@ -590,6 +590,7 @@ class MarkerBoundCompletionProof:
     node_id: str
     attempt_id: str
     immutable_file_digests: tuple[tuple[str, str], ...]
+    immutable_file_identities: tuple[tuple[str, tuple[int, ...]], ...]
 
 
 @dataclass(frozen=True)
@@ -5729,6 +5730,18 @@ def _marker_bound_row_verdict(metadata: dict[str, str]) -> str:
     return ""
 
 
+def _marker_bound_file_identity(path: Path) -> tuple[int, ...]:
+    """Bound a verified regular file without reading content under jobs.lock."""
+
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode):
+        raise OSError(f"marker dependency is not a regular file: {path}")
+    return (
+        info.st_dev, info.st_ino, info.st_mode, info.st_size,
+        info.st_mtime_ns, info.st_ctime_ns,
+    )
+
+
 def _marker_bound_prepare_marker_proof(
     metadata: dict[str, str], attempt_id: str
 ) -> MarkerBoundCompletionProof | None:
@@ -5833,19 +5846,30 @@ def _marker_bound_prepare_marker_proof(
     if marker.get("stage_authority") == "owner-chain":
         dependency_paths.append(Path(str(marker.get("subsession_manifest", ""))))
     dependency_bytes: list[tuple[Path, bytes]] = []
+    dependency_identities: list[tuple[str, tuple[int, ...]]] = []
     try:
         for dependency_path in dependency_paths:
             if not dependency_path.is_absolute():
                 return None
-            dependency_bytes.append((dependency_path, dependency_path.read_bytes()))
+            identity = _marker_bound_file_identity(dependency_path)
+            raw = dependency_path.read_bytes()
+            if _marker_bound_file_identity(dependency_path) != identity:
+                return None
+            dependency_bytes.append((dependency_path, raw))
+            dependency_identities.append((str(dependency_path), identity))
     except OSError:
         return None
-    if dependency_bytes[0][1] != route_bytes:
+    if dependency_bytes[0][1] != route_bytes or dependency_bytes[2][1] != history_bytes:
         return None
     if len(nodes) != 1 or not completion_marker_is_current(route, nodes[0], marker_path, marker):
         return None
     try:
         if any(path.read_bytes() != raw for path, raw in dependency_bytes):
+            return None
+        if any(
+            _marker_bound_file_identity(Path(path)) != identity
+            for path, identity in dependency_identities
+        ):
             return None
     except OSError:
         return None
@@ -5862,6 +5886,7 @@ def _marker_bound_prepare_marker_proof(
             (str(path), hashlib.sha256(raw).hexdigest())
             for path, raw in dependency_bytes
         ),
+        immutable_file_identities=tuple(dependency_identities),
     )
 
 
@@ -5870,7 +5895,7 @@ def _marker_bound_current_marker(
     attempt_id: str,
     proof: MarkerBoundCompletionProof | None,
 ) -> tuple[dict[str, object] | None, str]:
-    """CAS only the selected attempt's immutable history against its proof."""
+    """CAS pre-proved file identities; never hash evidence under jobs.lock."""
 
     if proof is None or (
         metadata.get("completion_marker") != str(proof.marker_path)
@@ -5880,24 +5905,15 @@ def _marker_bound_current_marker(
         or attempt_id != proof.attempt_id
     ):
         return None, ""
+    if not proof.immutable_file_identities:
+        return None, ""
     try:
-        for raw_path, expected_digest in proof.immutable_file_digests:
-            observed = Path(raw_path).read_bytes()
-            if hashlib.sha256(observed).hexdigest() != expected_digest:
+        for raw_path, expected_identity in proof.immutable_file_identities:
+            if _marker_bound_file_identity(Path(raw_path)) != expected_identity:
                 return None, ""
-        marker_bytes = proof.history_path.read_bytes()
     except OSError:
         return None, ""
-    digest = hashlib.sha256(marker_bytes).hexdigest()
-    if digest != proof.marker_digest:
-        return None, ""
-    try:
-        marker = json.loads(marker_bytes.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError):
-        return None, ""
-    if marker != proof.marker:
-        return None, ""
-    return marker, digest
+    return proof.marker, proof.marker_digest
 
 
 def _marker_bound_latest_rows(lines: list[str]) -> dict[str, tuple[int, list[str], str]]:
@@ -5930,8 +5946,9 @@ def marker_bound_delivery_transaction(
 
     Process inspection belongs to the caller.  This transaction compares that
     pre-lock observation with the exact row generation and process identity,
-    reads only the canonical registry and its immutable marker while locked,
-    and performs at most one in-process registry replacement.
+    reads only the canonical registry and bounded file identities while locked,
+    and performs at most one in-process registry replacement. Full marker-chain
+    content validation remains outside the shared lock.
     """
 
     if not attempt_id or not parent_attempt_id:
