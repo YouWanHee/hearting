@@ -2888,8 +2888,8 @@ class DispatchBatchIntegrationTest(unittest.TestCase):
             self._write_fake_runtime(fake_bin / "claude", "claude")
             claude_home = base / "claude-home"
             claude_home.mkdir()
-            # This integration tests cross-harness joining with a user-selected
-            # delegated-eligible deep model, independently of the shipped main-only default.
+            # This integration tests cross-harness joining with the shipped Claude
+            # config: its deep profile rides the dispatch-eligible opus tier (SD-85).
             user_models = claude_home / "agent-config" / "models.conf"
             user_models.parent.mkdir()
             user_models.write_text((ROOT / "adapters/claude/config/models.conf").read_text())
