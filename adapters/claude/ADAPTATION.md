@@ -5,8 +5,9 @@
 `deep maker`, `deep reviewer`, `deep editor`, and `deep orchestrator` map to
 `fable`/high (the shipped deep tier equals the user's runtime mapping, 2026-09-08;
 the capacity cascade is `fable -> opus -> sonnet`). Retained `orchestrator` is the balanced mechanical role and maps to
-`sonnet`/high; it is not an alias for the standard+ dispatch-depth-1 conductor. Fast
-portable roles map to `sonnet`/high. The adapter mapper normalizes case,
+`sonnet`/medium; it is not an alias for the standard+ dispatch-depth-1 conductor. Fast
+portable roles map to `sonnet`/medium. (Both follow `CFG_TIER_LIGHT_EFFORT`; the
+`balanced` profile's `sonnet`/high is the separate route-bound axis.) The adapter mapper normalizes case,
 hyphens, and underscores but accepts no undocumented role aliases.
 
 This adapter preserves the previous Claude Code setting behavior while moving

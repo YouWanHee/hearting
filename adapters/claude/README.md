@@ -92,7 +92,7 @@ The Claude Code adapter maps portable roles from `core/CONVENTIONS.md §2` to co
 | `deep maker` | `fable` | Planning, research synthesis, and visual/editorial work requiring high judgment |
 | `deep orchestrator` | `fable` high | Stage gates, failover, and evidence judgment for standard+ dispatch-depth-1 ownership |
 | `fast implementer` | `sonnet` | Routine implementation and refactoring; escalate complex API/library design |
-| `orchestrator` | `sonnet` high | Balanced mechanical coordination of decided calls, paths, and states |
+| `orchestrator` | `sonnet` medium | Balanced mechanical coordination of decided calls, paths, and states |
 | `external adversary` | Codex CLI via `codex-review-team` | Independent hostile review for the `adversarial` intensity pass. The same Codex engine may host a neutral cross-harness parallel leg, but that is a reviewer role, not this hostile role. |
 | `external adversary orchestrator` | `sonnet` wrapper | Invoke and summarize the external engine rather than perform the review |
 
