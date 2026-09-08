@@ -22,6 +22,7 @@ import fcntl
 import hashlib
 import json
 import os
+import stat
 import sys
 import time
 import uuid
@@ -144,6 +145,63 @@ def _atomic_write(path: Path, text: str) -> None:
             os.unlink(temp)
 
 
+def _validated_jobs_path(jobs, source: str) -> Path:
+    """Return one canonical registry path or fail before selecting its ledger.
+
+    A misspelled registry must not mint an empty sibling workflow directory and
+    make a route look freshly CREATED.  Symlinks are rejected because the
+    apparent registry parent would otherwise differ from the file authority
+    actually opened after a link swap.
+    """
+    path = Path(jobs).expanduser()
+    def invalid(reason):
+        raise WorkflowStateError(
+            f"jobs-authority-invalid:{source}:{reason}:{path}"
+        )
+    if not path.is_absolute():
+        invalid("not-absolute")
+    if path.is_symlink():
+        invalid("symlink")
+    try:
+        mode = path.stat().st_mode
+    except FileNotFoundError:
+        invalid("missing")
+    except OSError as exc:
+        invalid(f"stat-error-{exc.errno or 'unknown'}")
+    if not stat.S_ISREG(mode):
+        invalid("not-regular")
+    try:
+        with path.open("rb") as handle:
+            handle.read(0)
+    except OSError as exc:
+        invalid(f"unreadable-{exc.errno or 'unknown'}")
+    return path.resolve(strict=True)
+
+
+def ledger_root_for(jobs=None, environ=None) -> tuple[Path, str]:
+    """Resolve the workflow ledger beside the registry that owns the route.
+
+    An explicit CLI registry is authoritative even when a process inherited a
+    different ambient registry.  The legacy ``AGENT_WORKFLOW_ROOT`` override
+    remains valid only when no registry was supplied; this keeps old callers
+    compatible while preventing the supervisor's ``--jobs`` from being ignored.
+    """
+    env = os.environ if environ is None else environ
+    if jobs:
+        from dispatch_contract import dispatch_state_root
+        selected = _validated_jobs_path(jobs, "explicit-jobs")
+        return dispatch_state_root(selected) / "workflow", "explicit-jobs"
+    override = env.get("AGENT_WORKFLOW_ROOT")
+    if override:
+        return Path(override).expanduser(), "AGENT_WORKFLOW_ROOT"
+    inherited = env.get("AGENT_DISPATCH_JOBS")
+    if inherited:
+        from dispatch_contract import dispatch_state_root
+        selected = _validated_jobs_path(inherited, "AGENT_DISPATCH_JOBS")
+        return dispatch_state_root(selected) / "workflow", "AGENT_DISPATCH_JOBS"
+    return resolve_dispatch_state_root(resolve_agent_home()) / "workflow", "agent-home"
+
+
 def default_ledger_root() -> Path:
     """`AGENT_WORKFLOW_ROOT` stays the explicit override; otherwise the ledger root is
     the same validated agent-home every other dispatch-state writer/reader agrees on.
@@ -154,22 +212,21 @@ def default_ledger_root() -> Path:
     `workflow-supervisor.py status` reported `CREATED`/empty instead of the real
     `RUNNING` state recorded under the actual `AGENT_HOME`).
     """
-    override = os.environ.get("AGENT_WORKFLOW_ROOT")
-    if override:
-        return Path(override).expanduser()
-    return resolve_dispatch_state_root(resolve_agent_home()) / "workflow"
+    return ledger_root_for()[0]
 
 
 class WorkflowLedger:
     """Durable per-route workflow ledger: journal, derived cache, and claim set."""
 
-    def __init__(self, route_id: str, route_hash: str = "", root=None, registry_path=None):
+    def __init__(self, route_id: str, route_hash: str = "", root=None, registry_path=None,
+                 jobs=None):
         if not route_id or "/" in route_id or route_id.startswith("."):
             raise WorkflowStateError(f"unsafe route id: {route_id!r}")
         self.route_id = route_id
         self.route_hash = route_hash
         self.registry_path = registry_path
-        self.root = Path(root or default_ledger_root()).expanduser() / route_id
+        selected_root = root if root is not None else ledger_root_for(jobs)[0]
+        self.root = Path(selected_root).expanduser() / route_id
         self.journal_path = self.root / "journal.jsonl"
         self.state_path = self.root / "state.json"
         self.claims_dir = self.root / "claims"

@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from typing import Any
 
 
@@ -72,34 +73,41 @@ class ControlServer:
         self.thread.start()
 
     def _serve(self) -> None:
-        try:
-            connection, _ = self.listener.accept()
-        except OSError:
-            return
-        data = bytearray()
-        while b"\n" not in data:
-            chunk = connection.recv(4096)
-            if not chunk:
-                break
-            data.extend(chunk)
-        self.request = json.loads(bytes(data).split(b"\n", 1)[0])
-        self.called.set()
-        connection.sendall(
-            (
-                json.dumps(
-                    {
-                        "schema_version": 1,
-                        "status": "accepted",
-                        "delivery_id": "dlv-fixture",
-                        "action": "start",
-                        "replay": False,
-                    },
-                    separators=(",", ":"),
-                )
-                + "\n"
-            ).encode()
-        )
-        connection.close()
+        while True:
+            try:
+                connection, _ = self.listener.accept()
+            except OSError:
+                return
+            data = bytearray()
+            while b"\n" not in data:
+                chunk = connection.recv(4096)
+                if not chunk:
+                    break
+                data.extend(chunk)
+            request = json.loads(bytes(data).split(b"\n", 1)[0])
+            if request.get("op") == "status":
+                response = {
+                    "schema_version": 1, "status": "ready",
+                    "capabilities": {"human_gate_delivery": {
+                        "version": 1, "thread_id": SESSION, "epoch": 1,
+                    }},
+                }
+            else:
+                self.request = request
+                self.called.set()
+                response = {
+                    "schema_version": 1,
+                    "status": "accepted",
+                    "delivery_id": "dlv-fixture",
+                    "action": "start",
+                    "replay": False,
+                }
+            connection.sendall(
+                (json.dumps(response, separators=(",", ":")) + "\n").encode()
+            )
+            connection.close()
+            if request.get("op") != "status":
+                return
 
     def close(self) -> None:
         self.listener.close()
@@ -220,6 +228,56 @@ raise SystemExit(3 if state == 'timeout' else 0)
         for attempt in attempts:
             command += ["--attempt-id", attempt]
         return command
+
+    def test_human_gate_watcher_rechecks_exact_batch_and_uses_gateway_identity(self) -> None:
+        module = load_completion_module()
+        self.jobs.write_text("fixture\n", encoding="utf-8")
+        record_path = self.base / "delivery.json"
+        receipt = {
+            "kind": "human-gate", "owner_attempt_id": "att-owner",
+            "sealed_batch_id": "batch-session",
+        }
+        record = {"delivery_id": "delivery-pending", "receipt_digest": "sha256:x",
+                  "receipt": receipt}
+        record_path.write_text(json.dumps(record), encoding="utf-8")
+        args = type("Args", (), {
+            "jobs": self.jobs, "parent_session_id": SESSION,
+            "sealed_batch_id": "batch-session", "control_socket": self.control_path,
+            "interval": 0.01,
+        })()
+        watcher = module.HumanGateWatcher(
+            args, {"att-owner"}, {"epoch": 9}
+        )
+        claimed = dict(record)
+        with mock.patch.object(module.human_gate_receipt, "validate_pending_record") as validate, \
+             mock.patch.object(module.human_gate_receipt, "gateway_delivery_id",
+                               return_value="hg-dlv-exact"), \
+             mock.patch.object(module.pending_delivery, "claim", return_value=claimed), \
+             mock.patch.object(module.pending_delivery, "ack") as ack, \
+             mock.patch.object(module, "gateway_request",
+                               return_value={"schema_version": 1, "status": "accepted"}) as send:
+            watcher._one(record_path)
+        self.assertEqual(validate.call_count, 2)
+        for call in validate.call_args_list:
+            self.assertEqual(call.kwargs["expected_attempts"], {"att-owner"})
+            self.assertEqual(call.kwargs["expected_epoch"], 9)
+            self.assertEqual(call.kwargs["expected_sealed_batch_id"], "batch-session")
+        self.assertEqual(send.call_args.args[1]["delivery_id"], "hg-dlv-exact")
+        ack.assert_called_once_with(
+            self.jobs.parent, SESSION, "delivery-pending", acked_by=watcher.owner
+        )
+
+    def test_watcher_error_diagnostics_are_bounded(self) -> None:
+        module = load_completion_module()
+        args = type("Args", (), {"jobs": self.jobs, "parent_session_id": SESSION,
+                                  "interval": 0.01})()
+        watcher = module.HumanGateWatcher(args, {PARENT}, {"epoch": 1})
+        for index in range(100):
+            watcher._record_error(f"malformed-{index}")
+        self.assertLessEqual(len(watcher.errors), 32)
+        self.assertEqual(watcher.error_count_total, 100)
+        self.assertLessEqual(len(watcher.error_counts), 64)
+        self.assertEqual(sum(watcher.error_counts.values()), 100)
 
     def test_codex_and_claude_children_share_one_bounded_receipt(self) -> None:
         attempts = ["att-codex", "att-claude"]

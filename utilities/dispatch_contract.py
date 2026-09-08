@@ -5220,7 +5220,9 @@ def validate_nested_eligibility(
 FENCED_HUMAN_GATES = frozenset({"frame-review"})
 
 
-def _human_gate_entry_fence(route: dict, node: dict) -> None:
+def _human_gate_entry_fence(
+    route: dict, node: dict, jobs: Path | None = None
+) -> None:
     """Refuse to start a node whose entry human gate is not released (SD-129).
 
     Defect M, measured 2026-09-04 on route rt-da62cded: the owner raised
@@ -5232,12 +5234,11 @@ def _human_gate_entry_fence(route: dict, node: dict) -> None:
 
     The answer comes from `workflow_state.human_gate_resolution`, the same rule
     the owner's `await-release` and the carriers read, and from the same ledger
-    root the supervisor writes (`workflow_state.default_ledger_root()`); the
-    reader never derives its own root from the wrapper's `--jobs`, because the
-    writer does not either. Both "never raised" and "raised, not released" are
-    refusals: a route sealed with the binding must pass through the gate, or a
-    self-approving owner is back to the two 2026-09-03 cycles that pressed
-    their own gate. `revise` and `stop` leave the gate unreleased too.
+    root the supervisor writes. An explicit wrapper `--jobs` is the authority
+    for both sides; ambient roots are used only when no registry was supplied.
+    Both "never raised" and "raised, not released" are refusals: a route sealed
+    with the binding must pass through the gate. `revise` and `stop` leave the
+    gate unreleased too.
     """
 
     # Two conditions, both required (review rounds 1 and 2, B1):
@@ -5271,9 +5272,20 @@ def _human_gate_entry_fence(route: dict, node: dict) -> None:
         return
     import workflow_state as WS  # noqa: WPS433 -- workflow_state imports this module
 
-    ledger = WS.WorkflowLedger(str(route["route_id"]), str(route.get("route_hash", "")))
-    entries = ledger.journal()
-    where = f"route {route['route_id']} ledger {ledger.root}"
+    try:
+        ledger = WS.WorkflowLedger(
+            str(route["route_id"]), str(route.get("route_hash", "")), jobs=jobs
+        )
+        entries = ledger.journal()
+        _root, source = WS.ledger_root_for(jobs)
+    except WS.WorkflowStateError as exc:
+        raise DispatchContractError(
+            "workflow-ledger-authority-invalid", str(exc)
+        ) from exc
+    where = (
+        f"route {route['route_id']} ledger {ledger.root} "
+        f"ledger_root_source={source}"
+    )
     for binding in bindings:
         gate = str(binding["gate"])
         resolution = WS.human_gate_resolution(entries, gate)
@@ -5372,7 +5384,7 @@ def completion_marker_gate(
             blocked.append((dep, readiness))
     if missing:
         raise DispatchContractError("completion-marker-missing", ",".join(missing))
-    _human_gate_entry_fence(route, node)
+    _human_gate_entry_fence(route, node, jobs)
     _auxiliary_arbitration_gate(route, node, agent_home, jobs)
     if blocked:
         reason = (

@@ -795,6 +795,124 @@ def partial_group_continuation(
 def _continuation_id(payload):
     return "cont-"+hashlib.sha256(canonical(payload)).hexdigest()[:32]
 
+def _continuation_release_authority(raise_entry, release_entry, binding):
+    """Return authority while conservatively interpreting legacy interviews."""
+    raise_evidence=raise_entry.get("evidence") if isinstance(raise_entry,dict) else {}
+    raise_evidence=raise_evidence if isinstance(raise_evidence,dict) else {}
+    release_evidence=release_entry.get("evidence") if isinstance(release_entry,dict) else {}
+    release_evidence=release_evidence if isinstance(release_evidence,dict) else {}
+    legacy_interview=bool(raise_evidence.get("interview") or
+                          raise_evidence.get("questions"))
+    authority=(release_evidence.get("release_authority") or
+               binding.get("release_authority") or
+               ("depth-0" if legacy_interview else "any"))
+    if authority != "any" and (
+            release_evidence.get("actor_kind") != "user"
+            or not isinstance(release_evidence.get("released_by"), str)
+            or not release_evidence.get("released_by", "").strip()):
+        raise ValueError("continuation-human-gate-release-unauthorized:"+
+                         str(raise_evidence.get("gate") or "unknown"))
+    return authority
+
+def _continuation_gate_release_proof(source_route,gate):
+    """Seal the exact source raise/release pair before dropping a runtime gate."""
+    import workflow_state as WS
+
+    jobs=((source_route.get("launch_compatibility_tuple") or {})
+          .get("jobs_path") or {}).get("path")
+    if not isinstance(jobs,str) or not Path(jobs).is_absolute():
+        raise ValueError("continuation-human-gate-release-unproven:"+str(gate))
+    ledger=WS.WorkflowLedger(
+        str(source_route.get("route_id") or ""),
+        str(source_route.get("route_hash") or ""),jobs=jobs,
+    )
+    epoch=0; raised=None; released=None
+    for entry in ledger.journal():
+        evidence=entry.get("evidence") if isinstance(entry,dict) else None
+        evidence=evidence if isinstance(evidence,dict) else {}
+        if entry.get("workflow_state") == "BLOCKED_HUMAN_GATE" \
+                and evidence.get("gate") == gate:
+            epoch+=1; raised=entry; released=None
+            continue
+        if raised is None or evidence.get("released_gate") != gate:
+            continue
+        decision=evidence.get("decision") or "proceed"
+        if decision in {"proceed","revise"}:
+            released=entry
+    if raised is None or released is None:
+        raise ValueError("continuation-human-gate-release-unproven:"+str(gate))
+    evidence=released.get("evidence") or {}
+    decision=evidence.get("decision") or "proceed"
+    if decision != "proceed":
+        raise ValueError("continuation-human-gate-release-unproven:"+str(gate))
+    binding = next((item for item in source_route.get("human_gate_bindings", [])
+                    if isinstance(item, dict) and item.get("gate") == gate), {})
+    authority = _continuation_release_authority(raised, released, binding)
+    return {
+        "gate":str(gate),"source_route_id":str(source_route["route_id"]),
+        "source_route_hash":str(source_route["route_hash"]),"epoch":epoch,
+        "decision":"proceed","jobs_path":str(Path(jobs).resolve(strict=False)),
+        "journal_path":str(ledger.journal_path.resolve(strict=False)),
+        "raise_entry_digest":_sha256_record(raised),
+        "release_entry_digest":_sha256_record(released),
+    }
+
+def _verify_continuation_gate_release_proofs(route):
+    proofs=route.get("reused_human_gate_releases") or []
+    if not isinstance(proofs,list):
+        raise ValueError("continuation-human-gate-release-proofs-invalid")
+    seen=set()
+    for proof in proofs:
+        if not isinstance(proof,dict) or set(proof)!={
+            "gate","source_route_id","source_route_hash","epoch","decision",
+            "jobs_path","journal_path","raise_entry_digest","release_entry_digest",
+        }:
+            raise ValueError("continuation-human-gate-release-proof-invalid")
+        gate=proof.get("gate")
+        if (
+            not isinstance(gate,str) or not gate or gate in seen
+            or proof.get("source_route_id")!=route.get("source_route_id")
+            or proof.get("source_route_hash")!=route.get("source_route_hash")
+            or proof.get("decision")!="proceed"
+            or not isinstance(proof.get("epoch"),int) or proof["epoch"]<1
+        ):
+            raise ValueError("continuation-human-gate-release-proof-invalid")
+        seen.add(gate)
+        jobs=Path(str(proof.get("jobs_path") or ""))
+        journal=Path(str(proof.get("journal_path") or ""))
+        expected=jobs.resolve(strict=False).parent/"workflow"/proof["source_route_id"]/"journal.jsonl"
+        if not jobs.is_absolute() or not journal.is_absolute() or journal.resolve(strict=False)!=expected:
+            raise ValueError("continuation-human-gate-release-proof-authority-invalid")
+        try:
+            entries=[json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines()
+                     if line.strip()]
+        except (OSError,ValueError,UnicodeDecodeError) as exc:
+            raise ValueError("continuation-human-gate-release-proof-unreadable") from exc
+        raise_count=0; matched_raise=False; matched_release=False
+        for entry in entries:
+            evidence=entry.get("evidence") if isinstance(entry,dict) else None
+            evidence=evidence if isinstance(evidence,dict) else {}
+            if entry.get("workflow_state")=="BLOCKED_HUMAN_GATE" and evidence.get("gate")==gate:
+                raise_count+=1
+                matched_raise=(raise_count==proof["epoch"] and
+                               _sha256_record(entry)==proof["raise_entry_digest"])
+                matched_release=False
+                continue
+            if matched_raise and evidence.get("released_gate")==gate \
+                    and (evidence.get("decision") or "proceed")=="proceed" \
+                    and _sha256_record(entry)==proof["release_entry_digest"]:
+                binding = next((item for item in route.get("human_gate_bindings", [])
+                                if isinstance(item, dict) and item.get("gate") == gate), {})
+                _continuation_release_authority(
+                    next(item for item in entries
+                         if _sha256_record(item)==proof["raise_entry_digest"]),
+                    entry, binding,
+                )
+                matched_release=True
+        if not matched_raise or not matched_release:
+            raise ValueError("continuation-human-gate-release-proof-drift")
+    return proofs
+
 def build_continuation_route(
     source_route,*,resume_from_node,requested_boundary,reason,
     artifact_root,lineage_operation="resume",thread_id=None,new_thread_id=None,
@@ -964,6 +1082,35 @@ def build_continuation_route(
         _assert_pin_matches_grounding(route.get("source_commit"),launch)
     route["artifact_root"]=str(Path(artifact_root).resolve(strict=False))
     route["nodes"]=route_nodes
+    # A continuation is a suffix, not a copy of the source graph. An entry gate
+    # whose target was cut is gone. A raised gate whose raiser was cut but target
+    # remains may disappear only with the exact source proceed evidence sealed.
+    suffix_ids={str(node["id"]) for node in route_nodes}
+    source_raisers={
+        str((node.get("continuation") or {}).get("gate")):str(node.get("id"))
+        for node in source_nodes
+        if (node.get("continuation") or {}).get("kind")=="human-gate"
+    }
+    projected_bindings=[]; release_proofs=[]
+    for row in (source_route.get("human_gate_bindings") or []):
+        if str(row.get("node")) not in suffix_ids:
+            continue
+        gate=str(row.get("gate"))
+        raiser=source_raisers.get(gate)
+        if raiser is not None and raiser not in suffix_ids:
+            release_proofs.append(_continuation_gate_release_proof(source_route,gate))
+            continue
+        projected_bindings.append(json.loads(json.dumps(row)))
+    route["human_gate_bindings"]=projected_bindings
+    route["human_gates"]=sorted({str(row["gate"]) for row in projected_bindings})
+    route["reused_human_gate_releases"]=release_proofs
+    registry=TOPO.load_registry()
+    try:
+        TOPO._validate_continuations(
+            route,registry,route_nodes,{str(node["id"]):node for node in route_nodes},
+        )
+    except TOPO.TopologyError as exc:
+        raise ValueError("continuation-human-gate-unrepresentable:"+str(exc)) from exc
     route["parallel_groups"]=_realized_parallel_groups(route_nodes)
     route["conditional_extensions"]=[]
     route["completion_gates"]=sorted({
@@ -1015,6 +1162,7 @@ def _verify_continuation_route(route):
         raise ValueError("continuation-node-sets-invalid")
     if route.get("source_evidence_digest") != _sha256_record(reused):
         raise ValueError("continuation-source-evidence-digest-invalid")
+    _verify_continuation_gate_release_proofs(route)
     reused_ids=[row.get("node_id") for row in reused if isinstance(row,dict)]
     new_ids=[row.get("node_id") for row in new if isinstance(row,dict)]
     route_ids=[node.get("id") for node in route.get("nodes",[]) if isinstance(node,dict)]

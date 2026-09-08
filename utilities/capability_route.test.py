@@ -91,14 +91,24 @@ class TestRoute(unittest.TestCase):
   # root ahead of agent-home-relative state (I-2 unification), preferring an
   # inherited AGENT_DISPATCH_JOBS over AGENT_HOME/.dispatch -- clear it too so
   # a developer/CI shell's real registry never leaks into these fixtures.
-  self._previous_dispatch_jobs=os.environ.get("AGENT_DISPATCH_JOBS")
-  os.environ.pop("AGENT_DISPATCH_JOBS",None)
+  self._guard_env={key:os.environ.get(key) for key in (
+   "AGENT_DISPATCH_JOBS","AGENT_DISPATCH_ATTEMPT_ID",
+   "AGENT_DISPATCH_REGISTERED_WORKER","AGENT_DISPATCH_DEPTH",
+   "AGENT_OWNER_ROUTE_FILE","AGENT_OWNER_ROUTE_ID","AGENT_OWNER_ROUTE_HASH",
+   "AGENT_WORKFLOW_ROOT",
+  )}
+  for key in self._guard_env: os.environ.pop(key,None)
+  self._fixture_jobs=Path(self._tmp_home.name)/"state"/"jobs.log"
+  self._fixture_jobs.parent.mkdir(parents=True,exist_ok=True)
+  self._fixture_jobs.write_text("",encoding="utf-8")
+  os.environ["AGENT_DISPATCH_JOBS"]=str(self._fixture_jobs)
   self.addCleanup(self._restore_agent_home)
  def _restore_agent_home(self):
   if self._previous_agent_home is None: os.environ.pop("AGENT_HOME",None)
   else: os.environ["AGENT_HOME"]=self._previous_agent_home
-  if self._previous_dispatch_jobs is None: os.environ.pop("AGENT_DISPATCH_JOBS",None)
-  else: os.environ["AGENT_DISPATCH_JOBS"]=self._previous_dispatch_jobs
+  for key,value in self._guard_env.items():
+   if value is None: os.environ.pop(key,None)
+   else: os.environ[key]=value
   self._tmp_home.cleanup()
  def dispatch(self,*rows):
   return {"tuples":list(rows),"native_subagent":[{
@@ -1891,8 +1901,13 @@ class TestContinuation(unittest.TestCase):
   (Path(self._tmp_home.name)/"core").mkdir(parents=True)
   (Path(self._tmp_home.name)/"core"/"CORE.md").write_text(
    "continuation fixture\n",encoding="utf-8")
-  self._previous_agent_home=os.environ.get("AGENT_HOME")
-  self._previous_dispatch_jobs=os.environ.get("AGENT_DISPATCH_JOBS")
+  self._guard_env={key:os.environ.get(key) for key in (
+   "AGENT_HOME","AGENT_DISPATCH_JOBS","AGENT_DISPATCH_ATTEMPT_ID",
+   "AGENT_DISPATCH_REGISTERED_WORKER","AGENT_DISPATCH_DEPTH",
+   "AGENT_OWNER_ROUTE_FILE","AGENT_OWNER_ROUTE_ID","AGENT_OWNER_ROUTE_HASH",
+   "AGENT_WORKFLOW_ROOT",
+  )}
+  for key in self._guard_env: os.environ.pop(key,None)
   os.environ["AGENT_HOME"]=self._tmp_home.name
   # Not popped: with no AGENT_DISPATCH_JOBS the state root resolves from
   # XDG_STATE_HOME/HOME, not from AGENT_HOME, so every fixture route sealed the
@@ -1904,10 +1919,9 @@ class TestContinuation(unittest.TestCase):
   os.environ["AGENT_DISPATCH_JOBS"]=str(self._jobs)
   self.addCleanup(self._restore)
  def _restore(self):
-  if self._previous_agent_home is None: os.environ.pop("AGENT_HOME",None)
-  else: os.environ["AGENT_HOME"]=self._previous_agent_home
-  if self._previous_dispatch_jobs is None: os.environ.pop("AGENT_DISPATCH_JOBS",None)
-  else: os.environ["AGENT_DISPATCH_JOBS"]=self._previous_dispatch_jobs
+  for key,value in self._guard_env.items():
+   if value is None: os.environ.pop(key,None)
+   else: os.environ[key]=value
   self._tmp_home.cleanup()
  def _dispatch(self,worktree=None):
   row={
@@ -1982,6 +1996,27 @@ class TestContinuation(unittest.TestCase):
   )]:
    if node["id"] in skip: continue
    evidence[node["id"]]=self._complete_node(route,node,evidence_root)
+  # A reused human-gate predecessor proves more than source completion. Seal a
+  # real raise+proceed pair in the fixture ledger, matching production.
+  prefix_ids={node["id"] for node in route["nodes"][:next(
+      index for index,row in enumerate(route["nodes"]) if row["id"]==resume_from
+  )]}
+  import workflow_state as WS
+  jobs=Path(route["launch_compatibility_tuple"]["jobs_path"]["path"])
+  ledger=WS.WorkflowLedger(route["route_id"],route["route_hash"],jobs=jobs)
+  for node in route["nodes"]:
+   continuation=node.get("continuation") or {}
+   if node["id"] not in prefix_ids or continuation.get("kind")!="human-gate": continue
+   gate=continuation["gate"]
+   if WS.human_gate_resolution(ledger.journal(),gate)["status"]!="not-raised": continue
+   with ledger.lock():
+    if ledger.state()["workflow_state"]=="CREATED":
+     ledger.set_workflow_state("READY",evidence={},actor="fixture")
+    ledger.set_workflow_state("BLOCKED_HUMAN_GATE",
+     evidence={"gate":gate,"artifact":str(evidence_root)},actor="fixture")
+    ledger.set_workflow_state("RUNNING",evidence={"released_gate":gate,
+     "decision":"proceed","released_by":"fixture-user","actor_kind":"user"},
+     actor="fixture")
   return evidence
  def _build(self,source,**overrides):
   args={
@@ -2168,6 +2203,93 @@ class TestContinuation(unittest.TestCase):
    R.publish_continuation_route(continuation,source,output)
    self.assertTrue(output.is_file())
    self.assertFalse(R.completion_dir(continuation["route_id"]).exists())
+ def test_continuation_drops_a_binding_whose_entry_node_was_cut(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   source=self._source(Path(tmp)/"artifacts")
+   source["human_gates"].append("intent-confirmation")
+   source["human_gate_bindings"].append({
+    "gate":"intent-confirmation","node":"frame","position":"entry"})
+   source["route_hash"]=R.route_hash(source)
+   source["route_id"]="rt-"+source["route_hash"].split(":",1)[1][:16]
+   self._complete_prefix(source,"test",Path(tmp)/"evidence")
+   built=self._build(source)
+   self.assertNotIn("intent-confirmation",built["human_gates"])
+   self.assertFalse(any(row["gate"]=="intent-confirmation"
+                        for row in built["human_gate_bindings"]))
+ def test_cut_raiser_requires_exact_source_release_not_source_completion(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   source=self._source(Path(tmp)/"artifacts")
+   plan_index=next(i for i,node in enumerate(source["nodes"]) if node["id"]=="plan")
+   for node in source["nodes"][:plan_index]:
+    self._complete_node(source,node,Path(tmp)/"evidence")
+   with self.assertRaisesRegex(ValueError,"continuation-human-gate-release-unproven"):
+    self._build(source,resume_from_node="plan",requested_boundary="plan")
+ def test_cut_raiser_seals_and_revalidates_exact_proceed_evidence(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   source=self._source(Path(tmp)/"artifacts")
+   self._complete_prefix(source,"plan",Path(tmp)/"evidence")
+   built=self._build(source,resume_from_node="plan",requested_boundary="plan")
+   proof=built["reused_human_gate_releases"][0]
+   self.assertEqual((proof["gate"],proof["decision"],proof["epoch"]),
+                    ("frame-review","proceed",1))
+   self.assertNotIn("frame-review",built["human_gates"])
+   R._verify_continuation_route(built)
+   tampered=json.loads(json.dumps(built))
+   tampered["reused_human_gate_releases"][0]["decision"]="revise"
+   with self.assertRaisesRegex(ValueError,"release-proof-invalid"):
+    R._verify_continuation_route(tampered)
+
+ def test_legacy_interview_release_requires_user_in_builder_and_verifier(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   root=Path(tmp); jobs=root/"jobs.log"; jobs.write_text("fixture\n")
+   source={"route_id":"rt-legacy","route_hash":"sha256:"+"a"*64,
+           "launch_compatibility_tuple":{"jobs_path":{"path":str(jobs)}},
+           "human_gate_bindings":[{"gate":"review","node":"plan"}]}
+   ledger_dir=jobs.parent/"workflow"/source["route_id"]; ledger_dir.mkdir(parents=True)
+   raised={"workflow_state":"BLOCKED_HUMAN_GATE",
+           "evidence":{"gate":"review","interview":True,"questions":["q"]}}
+   def pair(actor_kind, released_by):
+    released={"workflow_state":"RUNNING",
+              "evidence":{"released_gate":"review","decision":"proceed",
+                          "actor_kind":actor_kind,"released_by":released_by}}
+    journal=ledger_dir/"journal.jsonl"
+    journal.write_text("\n".join(json.dumps(v) for v in (raised,released))+"\n")
+    proof=R._continuation_gate_release_proof(source,"review")
+    route={"source_route_id":source["route_id"],
+           "source_route_hash":source["route_hash"],
+           "human_gate_bindings":source["human_gate_bindings"],
+           "reused_human_gate_releases":[proof]}
+    return route
+   with self.assertRaisesRegex(ValueError,"release-unauthorized"):
+    pair("headless-owner", "owner")
+   R._verify_continuation_gate_release_proofs(pair("user", "operator"))
+
+ def test_plain_non_interview_any_headless_release_remains_allowed(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   root=Path(tmp); jobs=root/"jobs.log"; jobs.write_text("fixture\n")
+   source={"route_id":"rt-plain","route_hash":"sha256:"+"b"*64,
+           "launch_compatibility_tuple":{"jobs_path":{"path":str(jobs)}},
+           "human_gate_bindings":[{"gate":"review","node":"plan"}]}
+   directory=jobs.parent/"workflow"/source["route_id"]; directory.mkdir(parents=True)
+   entries=[{"workflow_state":"BLOCKED_HUMAN_GATE",
+             "evidence":{"gate":"review","interview":False,"questions":0}},
+            {"workflow_state":"RUNNING",
+             "evidence":{"released_gate":"review","decision":"proceed",
+                         "actor_kind":"headless-owner","released_by":"owner"}}]
+   (directory/"journal.jsonl").write_text("\n".join(json.dumps(v) for v in entries)+"\n")
+   proof=R._continuation_gate_release_proof(source,"review")
+   route={"source_route_id":source["route_id"],"source_route_hash":source["route_hash"],
+          "human_gate_bindings":source["human_gate_bindings"],
+          "reused_human_gate_releases":[proof]}
+   R._verify_continuation_gate_release_proofs(route)
+ def test_retained_human_gate_continuation_without_binding_fails_closed(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   source=self._source(Path(tmp)/"artifacts")
+   source["human_gates"]=[]; source["human_gate_bindings"]=[]
+   source["route_hash"]=R.route_hash(source)
+   source["route_id"]="rt-"+source["route_hash"].split(":",1)[1][:16]
+   with self.assertRaisesRegex(ValueError,"continuation-human-gate-unrepresentable"):
+    self._build(source,resume_from_node="frame",requested_boundary="frame")
  def test_confirmation_mode_survives_continuation(self):
   # T-5: confirmation_mode must ride inherited_keys, or a continuation route
   # silently drops it and the A5 drift check sees None after the first advance.
@@ -3164,6 +3286,11 @@ class TestContinuation(unittest.TestCase):
     env["AGENT_DISPATCH_ATTEMPT_ID"]="att-cli-owner"; env["AGENT_OWNER_ROUTE_FILE"]=str(source_path)
     env["AGENT_OWNER_ROUTE_ID"]=source["route_id"]
     env["AGENT_OWNER_ROUTE_HASH"]=source["route_hash"]
+    env["AGENT_DISPATCH_DEPTH"]="1"
+    env["AGENT_DISPATCH_REGISTERED_WORKER"]="1"
+    env["AGENT_DISPATCH_WORKER_TYPE"]="owner"
+    env["AGENT_DISPATCH_ATTEMPT_SCHEMA_VERSION"]="2"
+    env["AGENT_DISPATCH_EXECUTION_SURFACE"]="registered-headless"
     command=[sys.executable,str(P),"continuation","--source-route",str(source_path),"--resume-from-node","test",
              "--requested-boundary","test","--reason","cli-owner","--artifact-root",str(artifact)]
     result=subprocess.run(command,capture_output=True,text=True,cwd=str(R.ROOT),env=env)
@@ -3186,9 +3313,13 @@ class TestContinuation(unittest.TestCase):
     source_path=Path(tmp)/"source-route.json"; source_path.write_text(json.dumps(source),encoding="utf-8")
     jobs.parent.mkdir(parents=True, exist_ok=True); jobs.write_text(
      "2099-01-01T00:00:00Z\topen\trepo\t%s\tstage\t"
-     "attempt_schema_version=2,worker_type=stage,unit=dev/backend,attempt_id=att-cli-stage\n" % R.ROOT,
+     "attempt_schema_version=2,dispatch_depth=2,registered_worker=1,"
+     "worker_type=stage,unit=dev/backend,attempt_id=att-cli-stage\n" % R.ROOT,
      encoding="utf-8")
     env=os.environ.copy(); env["AGENT_DISPATCH_ATTEMPT_ID"]="att-cli-stage"
+    env["AGENT_DISPATCH_DEPTH"]="2"
+    env["AGENT_DISPATCH_REGISTERED_WORKER"]="1"
+    env["AGENT_DISPATCH_WORKER_TYPE"]="stage"
     for key in ("AGENT_OWNER_ROUTE_FILE", "AGENT_OWNER_ROUTE_ID", "AGENT_OWNER_ROUTE_HASH"):
      env.pop(key, None)
     command=[sys.executable,str(P),"continuation","--source-route",str(source_path),"--resume-from-node","test",
@@ -3229,6 +3360,11 @@ class TestContinuation(unittest.TestCase):
     env["AGENT_DISPATCH_ATTEMPT_ID"]="att-cli-replay"; env["AGENT_OWNER_ROUTE_FILE"]=str(source_path)
     env["AGENT_OWNER_ROUTE_ID"]=source["route_id"]
     env["AGENT_OWNER_ROUTE_HASH"]=source["route_hash"]
+    env["AGENT_DISPATCH_DEPTH"]="1"
+    env["AGENT_DISPATCH_REGISTERED_WORKER"]="1"
+    env["AGENT_DISPATCH_WORKER_TYPE"]="owner"
+    env["AGENT_DISPATCH_ATTEMPT_SCHEMA_VERSION"]="2"
+    env["AGENT_DISPATCH_EXECUTION_SURFACE"]="registered-headless"
     command=[sys.executable,str(P),"continuation","--source-route",str(source_path),"--resume-from-node","test",
              "--requested-boundary","test","--reason","cli-replay","--artifact-root",str(artifact)]
     first=subprocess.run(command,capture_output=True,text=True,cwd=str(R.ROOT),env=env)
