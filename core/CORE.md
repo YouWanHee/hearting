@@ -64,7 +64,16 @@ concrete model mapping. Installation seeds that mapping once as
 never symlinked, refreshed, reapplied, or removed by a harness update or
 uninstall. Runtime consumers select a valid, complete user file as one unit and
 otherwise fall back to the shipped adapter default as one unit; they never merge
-the two. Native runtime settings and adapter fragments remain outside
+the two. INST-D-20 permits one narrow, memory-only normalization: when only
+the new balanced profile and its optional granularity are absent, retain the
+entire selected user file and derive balanced from that user's light operating
+point (high effort on supported adapters; the complete existing light budget
+on a reduced-granularity adapter). Explicit balanced wins. Missing any other
+required key retains whole-file fallback. No loader or installer writes this
+normalization back, including on install/update/reapply/uninstall. The same
+rule derives a missing balanced dispatch policy from the user's entire light
+policy without enabling any disabled vendor.
+Native runtime settings and adapter fragments remain outside
 `agent-config`.
 
 Project-independent global runtime state (the dispatch attempt registry and

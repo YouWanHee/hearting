@@ -905,6 +905,8 @@ def append_job(jobs: Path, args: argparse.Namespace) -> bool:
             f",owner_route_hash={args.owner_route_binding.route_hash}"
         )
     settings = args.resolved_model_settings
+    for key, value in sorted(getattr(args, "profile_selection_receipt", {}).items()):
+        pipe += f",{key}={value}"
     pipe += (
         f",model_source={settings['source']},model_role={settings['role']}"
         f",model_profile={settings['profile']},model_tier={settings['tier']}"
@@ -1511,6 +1513,11 @@ def main(argv: list[str]) -> int:
     bind_parent_completion_delivery(args)
     try:
         args.resolved_model_settings = resolve_model_settings(args)
+        from model_profile import selection_receipt, ModelProfileError
+        try:
+            args.profile_selection_receipt = selection_receipt(args)
+        except (ModelProfileError, OSError, ValueError) as exc:
+            return fail(getattr(exc, "reason", "profile-selection-invalid"), 65, child_spawned="0")
     except ModelSelectionError as e:
         fields = {"detail": str(e)}
         if args.model_role:
@@ -2095,6 +2102,8 @@ def main(argv: list[str]) -> int:
     print(f"model_profile={settings['profile']}")
     print(f"model_tier={settings['tier']}")
     print(f"profile_granularity={settings['granularity']}")
+    for key, value in sorted(getattr(args, "profile_selection_receipt", {}).items()):
+        print(f"{key}={value}")
     print(f"model={settings['model']}")
     print(f"variant={settings['variant']}")
     leg_class, auxiliary_check = _route_node_leg_fields(args)

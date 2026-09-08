@@ -1055,7 +1055,7 @@ def resolve_permission_posture(args: argparse.Namespace) -> dict[str, object]:
     }
 
 
-def _foreground_terminal_evidence(terminal: dict, terminal_note: str, log_path) -> dict[str, str]:
+def _foreground_terminal_evidence(terminal: dict, terminal_note: str, log_path, outcome=None) -> dict[str, str]:
     """Evidence sealed on the row by the foreground tail close.
 
     A finished review (`completed-review-blocking`) also seals the in-root
@@ -1064,10 +1064,18 @@ def _foreground_terminal_evidence(terminal: dict, terminal_note: str, log_path) 
     """
     evidence = {
         "detected_by": "foreground-terminal-handoff",
-        "failure_class": terminal["failure_class"],
-        "terminal_event": terminal["terminal_event"],
+        "failure_class": terminal.get("failure_class", "runtime"),
+        "terminal_event": terminal.get("terminal_event", "-"),
         "log_file": str(log_path),
     }
+    if outcome is not None:
+        evidence["process_exit"] = str(outcome.exit_code)
+        if outcome.failure:
+            evidence.update(
+                detected_by="foreground-process-exit",
+                failure_class="runtime",
+                reconcile_reason=outcome.failure,
+            )
     if terminal_note == REVIEW_BLOCKING_NOTE and terminal.get("artifact_path_b64"):
         evidence["review_artifact_b64"] = str(terminal["artifact_path_b64"])
     return evidence
@@ -1521,6 +1529,8 @@ def append_job(jobs: Path, args: argparse.Namespace) -> bool:
             f",owner_route_hash={args.owner_route_binding.route_hash}"
         )
     settings = args.resolved_model_settings
+    for key, value in sorted(getattr(args, "profile_selection_receipt", {}).items()):
+        pipe += f",{key}={value}"
     pipe += (
         f",model_source={settings['source']},model_role={settings['role']}"
         f",model_profile={settings['profile']},model_tier={settings['tier']}"
@@ -2135,6 +2145,11 @@ def main(argv: list[str]) -> int:
     args.replacement_notes = attempt_policy["replacement_notes"]
     try:
         args.resolved_model_settings = resolve_model_settings(args)
+        from model_profile import selection_receipt, ModelProfileError
+        try:
+            args.profile_selection_receipt = selection_receipt(args)
+        except (ModelProfileError, OSError, ValueError) as exc:
+            return fail(getattr(exc, "reason", "profile-selection-invalid"), 65, child_spawned="0")
     except ModelSelectionError as e:
         fields = {"detail": str(e), "child_spawned": "0"}
         if args.model_role:
@@ -2792,19 +2807,21 @@ def main(argv: list[str]) -> int:
                 if terminal.get("state") == "valid"
                 else ""
             )
-            if outcome.failure and terminal.get("state") == "valid" and not terminal_note:
-                terminal_note = "completed-terminal-handoff"
+            # SD-72: final text does not replace actual nonzero/signal/timeout
+            # or parent-termination evidence. Keep both observation axes.
+            if outcome.failure:
+                terminal_note = f"dead-{outcome.failure}"
             terminal_closed = False
             if terminal_note:
                 terminal_closed = close_attempt_row(
                     jobs,
                     args.attempt_id,
                     terminal_note,
-                    evidence=_foreground_terminal_evidence(terminal, terminal_note, log_path),
+                    evidence=_foreground_terminal_evidence(terminal, terminal_note, log_path, outcome),
                 )
                 if terminal_closed:
                     materialize_after_terminal_close(jobs, args.attempt_id)
-                args.worker_failure = terminal_note
+                args.worker_failure = outcome.failure or terminal_note
             if outcome.failure and not terminal_closed:
                 close_job_row(
                     jobs, args.slug, args.worktree, outcome.failure, "", args.attempt_id
@@ -2861,6 +2878,8 @@ def main(argv: list[str]) -> int:
     print(f"model_profile={settings['profile']}")
     print(f"model_tier={settings['tier']}")
     print(f"profile_granularity={settings['granularity']}")
+    for key, value in sorted(getattr(args, "profile_selection_receipt", {}).items()):
+        print(f"{key}={value}")
     print(f"model={settings['model']}")
     print(f"effort={settings['effort']}")
     posture = _permission_posture(args)

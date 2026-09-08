@@ -18,7 +18,7 @@ DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 SUPPORTED_HARNESSES = frozenset({"claude", "codex", "opencode"})
 SUPPORTED_INDEPENDENCE = frozenset({"cross-harness", "degraded-same-harness"})
 SUPPORTED_AXES = frozenset({"cross-harness", "model-profile", "perspective"})
-SUPPORTED_PROFILES = frozenset({"deep", "balanced-deep", "light"})
+SUPPORTED_PROFILES = frozenset({"deep", "balanced-deep", "balanced", "light"})
 MIN_WIDTH = 2
 MAX_WIDTH = 4
 
@@ -85,6 +85,14 @@ def build_manifest(
             required_member | {"auxiliary_check"}
             if leg_class == "auxiliary" else required_member
         )
+        if "profile_selection" in raw or "profile_demand" in raw:
+            from model_profile import validate_profile_selection
+            expected_shape |= {"profile_demand", "profile_selection"}
+            try:
+                validate_profile_selection(raw.get("profile_selection"), raw.get("profile_demand"),
+                                           profile=raw.get("model_profile"), existing_versioned_stage=True)
+            except ValueError as exc:
+                raise ReplicaBatchContractError(str(exc)) from exc
         if set(raw) != expected_shape:
             raise ReplicaBatchContractError("invalid parallel batch member shape")
         for key in (
