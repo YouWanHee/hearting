@@ -83,9 +83,15 @@ class ModelConfigTest(unittest.TestCase):
         self.assertEqual((receipt.source, receipt.reason), ("user", "user-valid"))
 
     def test_declared_wrapper_tiers_cover_every_literal_key_the_wrappers_read(self):
-        """Drift guard for WRAPPER_REQUIRED_TIERS: resolve_config must not consult
-        the filesystem, so the table is checked here instead. Any adapter wrapper
-        that names a tier key literally must have that tier declared."""
+        """Drift guard for WRAPPER_REQUIRED_TIERS.
+
+        Scope (deliberately narrow, review R4-M1): it reads `.sh` and `.py` files
+        directly under each adapter's `bin/` and matches fully written key names.
+        A wrapper that assembles the key at runtime (`CFG_TIER_${tier}_MODEL`),
+        lives under another extension, or sits outside `bin/` is NOT covered —
+        such a consumer must be added to the table by hand. It also does not tell
+        a real read from a mention in a comment, which is the safe direction.
+        """
         literal = re.compile(r"CFG_TIER_([A-Z0-9_]+)_(?:MODEL|EFFORT|VARIANT)\b")
         for adapter, declared in config.WRAPPER_REQUIRED_TIERS.items():
             with self.subTest(adapter=adapter):
@@ -96,13 +102,13 @@ class ModelConfigTest(unittest.TestCase):
                     if path.is_file() and path.suffix in (".sh", ".py"):
                         found.update(literal.findall(path.read_text(encoding="utf-8", errors="replace")))
                 self.assertEqual(found - declared, set(), f"{adapter} wrappers read an undeclared tier")
-                # Every declared tier must exist in that adapter's shipped config.
+                # Each declared tier must ship the exact keys a wrapper reads —
+                # a failover/cascade-only mention is not enough.
                 shipped = config.parse_config(config.shipped_path(adapter, source_root=ROOT))
+                budget = "VARIANT" if adapter == "opencode" else "EFFORT"
                 for tier in declared:
-                    self.assertTrue(
-                        any(key.startswith(f"CFG_TIER_{tier}_") for key in shipped),
-                        f"{adapter} declares tier {tier} with no shipped keys",
-                    )
+                    required = {f"CFG_TIER_{tier}_MODEL", f"CFG_TIER_{tier}_{budget}"}
+                    self.assertLessEqual(required, shipped.keys(), f"{adapter} tier {tier} is incomplete")
 
     def test_legacy_complete_user_copy_survives_a_shipped_tier_extension(self):
         # A release adds a tier (balanced-deep) with two new CFG_TIER_* keys. An

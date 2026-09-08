@@ -53,9 +53,12 @@ TIER_KEY = re.compile(r"^CFG_TIER_([A-Z0-9_]+)_(MODEL|EFFORT|VARIANT)$")
 # `role-map.sh`) and the distill workers match a role in `CFG_ROLES_*` and then
 # read `CFG_TIER_DEEP_MODEL` and friends directly, so those keys are required
 # even when every profile routes through `model/<id>:effort` (review R2-B1).
-# This is a declared contract, not a runtime source scan: nothing here reads the
-# filesystem, and `model_config.test.py` fails if an adapter's wrappers name a
-# tier this table omits (review R3-B1/R3-M1).
+# This is a declared contract, not a runtime source scan: selecting the required
+# tiers reads no wrapper file (the config files themselves are still read on every
+# resolve). `model_config.test.py` guards it by scanning each adapter's `bin/*.sh`
+# and `*.py` for fully written tier keys, so a consumer that assembles the key at
+# runtime, uses another extension, or lives outside `bin/` must be added here by
+# hand (reviews R3-B1/R3-M1/R4-M1/R4-M2).
 WRAPPER_REQUIRED_TIERS: dict[str, frozenset[str]] = {
     "claude": frozenset({"DEEP", "LIGHT", "MINI"}),
     "codex": frozenset({"DEEP", "LIGHT", "MINI"}),

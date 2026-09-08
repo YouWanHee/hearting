@@ -152,8 +152,9 @@ a tier (2026-09-08 `balanced-deep`) leaves an older complete user copy selected
 whole-file, so its own main-only list and tiers keep applying (receipt
 `unreferenced_tier_keys`). The role mappers reach `CFG_TIER_DEEP_MODEL` and friends
 without a profile, so those keys stay required; the per-adapter list is declared in
-`utilities/model_config.py` (`WRAPPER_REQUIRED_TIERS`) and a test fails if a wrapper
-starts naming a tier the list omits.
+`utilities/model_config.py` (`WRAPPER_REQUIRED_TIERS`). A test fails if a wrapper
+under `adapters/<adapter>/bin` starts naming a tier the list omits; a consumer that
+builds the key name at runtime or lives elsewhere has to be added to the list by hand.
 OpenCode reports collapsed-balanced-to-light and preserves its full light budget.
 No install/update/reapply/uninstall writes the normalization back. Source checks
 do not activate an installed release or change an in-flight sealed route.
