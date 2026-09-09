@@ -192,6 +192,8 @@ elif len(args) == 3 and args[:2] == ["debug", "prompt-input"]:
     print_prompt_input()
 elif args and args[0] == "plugin":
     plugin_command(args[1:])
+elif args == ["app-server", "--help"]:
+    print("fixture app-server: --listen stdio://")
 elif args == ["app-server", "--listen", "stdio://"]:
     app_server()
 else:
@@ -1524,7 +1526,9 @@ else
     bad "codex dispatch wrapper should fail cleanly without model selection"
   fi
 fi
-if "$CODEX" dispatch --dry-run --worktree "$TMP/repo" --slug codex-dispatch --capability autopilot-code --mode dev --qa standard --prompt-text "do work" --model gpt-test --reasoning low --jobs "$TMP/codex-dispatch.log" >"$TMP/logs/codex_dispatch.out" 2>"$TMP/logs/codex_dispatch.err" \
+# This dry-run tests adapter command construction against a synthetic CLI
+# capability probe; it does not establish installed App Server support.
+if PATH="$CODEX_NATIVE_FIXTURE_PATH" "$CODEX" dispatch --dry-run --worktree "$TMP/repo" --slug codex-dispatch --capability autopilot-code --mode dev --qa standard --prompt-text "do work" --model gpt-test --reasoning low --jobs "$TMP/codex-dispatch.log" >"$TMP/logs/codex_dispatch.out" 2>"$TMP/logs/codex_dispatch.err" \
   && grep -q '^adapter=codex$' "$TMP/logs/codex_dispatch.out" \
   && grep -q '^status=dry-run$' "$TMP/logs/codex_dispatch.out" \
   && grep -q '^registered=0$' "$TMP/logs/codex_dispatch.out" \
@@ -1541,9 +1545,9 @@ if "$CODEX" dispatch --dry-run --worktree "$TMP/repo" --slug codex-dispatch --ca
   && grep -q -- '--approval never' "$TMP/logs/codex_dispatch.out" \
   && ! grep -q -- '--ask-for-approval' "$TMP/logs/codex_dispatch.out" \
   && [ ! -e "$TMP/codex-dispatch.log" ]; then
-  ok "codex dispatch wrapper dry-runs headless command with main-selected model settings"
+  ok "codex fixture: dispatch wrapper dry-runs headless command with main-selected model settings"
 else
-  bad "codex dispatch wrapper should dry-run headless command with main-selected model settings"
+  bad "codex fixture: dispatch wrapper should dry-run headless command with main-selected model settings"
   {
     printf '%s\n' '--- codex dispatch dry-run stdout ---'
     cat "$TMP/logs/codex_dispatch.out"
