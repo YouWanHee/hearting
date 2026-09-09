@@ -104,45 +104,176 @@ def _validated_jobs(raw: str | None) -> Path | None:
     return jobs
 
 
+_START_NAMES = {"dispatch-owner", "dispatch-owner.py", "dispatch-node", "dispatch-node.py"}
+_RELEASE_NAMES = {"workflow-supervisor", "workflow-supervisor.py"}
+
+
+def _shell_segments(command: str) -> list[list[str]]:
+    """Split a Bash command line into simple commands, each as shlex tokens.
+
+    Control operators (`;`, `&&`, `||`, `|`, `&`, newline) end a segment only
+    outside quotes, backslash escapes, `$( … )` and backticks; `arg;` with no
+    whitespace is still a boundary (codex R6, 2026-09-09). `&` that belongs
+    to a redirection (`2>&1`, `&>`, `<&`) is not an operator (codex R7 M1),
+    and a command substitution's own `;` stays inside its word (R7 M2). A
+    segment that does not tokenize is dropped, never merged into a neighbour."""
+
+    segments: list[str] = []
+    current: list[str] = []
+    in_single = in_double = in_backtick = escaped = False
+    subst_depth = 0
+    i = 0
+    n = len(command)
+    while i < n:
+        ch = command[i]
+        nxt = command[i + 1] if i + 1 < n else ""
+        prev = command[i - 1] if i else ""
+        if escaped:
+            current.append(ch)
+            escaped = False
+        elif ch == "\\" and not in_single:
+            current.append(ch)
+            escaped = True
+        elif ch == "'" and not in_double and not in_backtick:
+            in_single = not in_single
+            current.append(ch)
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+            current.append(ch)
+        elif in_single:
+            current.append(ch)
+        elif ch == "`":
+            in_backtick = not in_backtick
+            current.append(ch)
+        elif ch == "$" and nxt == "(":
+            subst_depth += 1
+            current.append("$(")
+            i += 1
+        elif ch == ")" and subst_depth:
+            subst_depth -= 1
+            current.append(ch)
+        elif in_double or in_backtick or subst_depth:
+            current.append(ch)
+        elif ch in ";|\n" or (ch == "&" and not (nxt == ">" or prev in "<>")):
+            segments.append("".join(current))
+            current = []
+            if ch in "|&" and nxt == ch:
+                i += 1
+        else:
+            current.append(ch)
+        i += 1
+    segments.append("".join(current))
+    tokens: list[list[str]] = []
+    for raw in segments:
+        try:
+            parts = shlex.split(raw)
+        except ValueError:
+            continue
+        if parts:
+            tokens.append(parts)
+    return tokens
+
+
+_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_REDIRECTION = re.compile(r"^(?:\d*[<>]{1,2}&?\d*|&>>?)")
+
+
+def _command_position(parts: list[str]) -> int | None:
+    """Index of the simple command's actual command word.
+
+    Leading `NAME=value` assignments, `env` with its assignments, and bare
+    redirection words are prefixes; the next word is the command. Anything
+    else (echo, printf, ...) is a foreign command and a utility name appearing
+    later is one of *its* arguments (codex R7 B1: `echo python3 … --start`
+    was recognized as an owner start and armed a prior attempt)."""
+
+    index = 0
+    while index < len(parts) and (_ASSIGNMENT.match(parts[index]) or _REDIRECTION.match(parts[index])):
+        index += 1
+    if index < len(parts) and Path(parts[index]).name == "env":
+        index += 1
+        while index < len(parts) and (_ASSIGNMENT.match(parts[index]) or parts[index].startswith("-")):
+            if parts[index] in {"-u", "--unset", "-C", "--chdir"}:
+                index += 1
+            index += 1
+    return index if index < len(parts) else None
+
+
+def _launched_by(parts: list[str], index: int) -> bool:
+    """The recognized utility must *be* the segment's command, or the first
+    argument of a python / preflight.sh command — never a word inside some
+    other command's argument list."""
+
+    command_at = _command_position(parts)
+    if command_at is None:
+        return False
+    if index == command_at:
+        return True
+    if index != command_at + 1:
+        return False
+    launcher = Path(parts[command_at]).name
+    # `preflight.sh dispatch-owner --start` is the adapters' documented
+    # launch surface; recognizing only a python launcher left every such
+    # owner unarmed (observed 2026-08-27, cairn att-092eb89f/att-5da8bc24).
+    return re.fullmatch(r"python(?:3(?:\.\d+)?)?", launcher) is not None or launcher == "preflight.sh"
+
+
+def _recognized_start(command: str) -> tuple[str, list[str]] | None:
+    """`(surface, arguments)` of the first owner-start segment, else None.
+
+    One parser feeds both the surface decision and every option reader, so
+    they can never disagree about which segment launched the owner."""
+
+    for parts in _shell_segments(command):
+        for index, token in enumerate(parts):
+            name = Path(token).name
+            if name not in _START_NAMES or not _launched_by(parts, index):
+                continue
+            arguments = parts[index + 1 :]
+            if name in {"dispatch-owner", "dispatch-owner.py"}:
+                if "--start" in arguments:
+                    return "dispatch-owner", arguments
+                continue
+            if "--action=start" in arguments or any(
+                value == "--action" and arguments[offset + 1] == "start"
+                for offset, value in enumerate(arguments[:-1])
+            ):
+                return "dispatch-node", arguments
+    return None
+
+
+def _recognized_release(command: str) -> list[str] | None:
+    """Arguments of the first `workflow-supervisor.py release` /
+    `gate … --release` segment, else None."""
+
+    for parts in _shell_segments(command):
+        for index, token in enumerate(parts):
+            if Path(token).name not in _RELEASE_NAMES or not _launched_by(parts, index):
+                continue
+            arguments = parts[index + 1 :]
+            if arguments and (arguments[0] == "release" or (arguments[0] == "gate" and "--release" in arguments)):
+                return arguments
+    return None
+
+
 def _start_surface(command: str) -> str | None:
     """Recognize only the two typed depth-1 owner start command surfaces."""
 
-    try:
-        parts = shlex.split(command)
-    except ValueError:
-        return None
-    separators = {"|", "||", "&&", ";"}
-    for index, token in enumerate(parts):
-        name = Path(token).name
-        if name not in {
-            "dispatch-owner", "dispatch-owner.py", "dispatch-node", "dispatch-node.py"
-        }:
-            continue
-        if index:
-            launcher = Path(parts[index - 1]).name
-            # `preflight.sh dispatch-owner --start` is the adapters' documented
-            # launch surface; recognizing only a python launcher left every such
-            # owner unarmed (observed 2026-08-27, cairn att-092eb89f/att-5da8bc24).
-            if (
-                re.fullmatch(r"python(?:3(?:\.\d+)?)?", launcher) is None
-                and launcher != "preflight.sh"
-            ):
-                continue
-        end = index + 1
-        while end < len(parts) and parts[end] not in separators:
-            end += 1
-        arguments = parts[index + 1 : end]
-        if name in {"dispatch-owner", "dispatch-owner.py"}:
-            if "--start" in arguments:
-                return "dispatch-owner"
-            continue
-        if "--action=start" in arguments:
-            return "dispatch-node"
-        for offset, value in enumerate(arguments[:-1]):
-            if value == "--action" and arguments[offset + 1] == "start":
-                return "dispatch-node"
-        continue
-    return None
+    recognized = _recognized_start(command)
+    return recognized[0] if recognized else None
+
+
+def _start_segment(command: str) -> str | None:
+    """The recognized owner-start segment's arguments, re-quoted for the
+    option readers — the same tokens `_start_surface` decided on."""
+
+    recognized = _recognized_start(command)
+    return " ".join(shlex.quote(a) for a in recognized[1]) if recognized else None
+
+
+def _release_segment(command: str) -> str | None:
+    arguments = _recognized_release(command)
+    return " ".join(shlex.quote(a) for a in arguments) if arguments is not None else None
 
 
 def _owner_start_command(payload: object) -> tuple[dict[str, Any], str] | None:
@@ -195,44 +326,26 @@ def parse_launch(payload: object) -> Launch | None:
 
 
 def _command_literal_option(command: str, name: str) -> str | None:
-    """Read one `--name value` / `--name=value` literal from the launch command.
+    """Read one `--name value` / `--name=value` literal from a command segment.
 
-    Only a plain literal counts: a value carrying `$` is an unexpanded shell
-    variable in the recorded command text and must not be matched against
-    registry rows (the same trap that leaves `--jobs "$J"` unusable)."""
+    The *last* occurrence wins, as the selector's `_parse` and the wrappers'
+    argparse `store` read a repeated flag (codex R5 / OpenCode cross-check,
+    2026-09-09); any occurrence carrying `$` (an unexpanded shell variable)
+    or an empty value disqualifies the option entirely — never fall back to
+    an earlier literal the launch did not honour."""
 
-    try:
-        parts = shlex.split(command)
-    except ValueError:
-        return None
-    flag = f"--{name}"
-    for index, part in enumerate(parts):
-        value: str | None = None
-        if part == flag and index + 1 < len(parts):
-            value = parts[index + 1]
-        elif part.startswith(flag + "="):
-            value = part[len(flag) + 1 :]
-        if value is None:
-            continue
-        if "$" in value or not value:
-            return None
-        return value
-    return None
+    return _command_literal_option_last(command, name)
 
 
 def _command_jobs(command: str) -> str | None:
-    """Read the inherited registry path the launch command itself declared."""
+    """Read the inherited registry path the launch segment itself declared.
 
-    try:
-        parts = shlex.split(command)
-    except ValueError:
-        return None
-    for index, part in enumerate(parts):
-        if part == "--jobs" and index + 1 < len(parts):
-            return parts[index + 1]
-        if part.startswith("--jobs="):
-            return part[len("--jobs=") :]
-    return None
+    Last occurrence wins (the selector and every wrapper store the last
+    `--jobs`); an unexpanded variable or empty value anywhere disqualifies
+    the option so the hook never arms from a registry the launch did not use
+    (codex R5 B1, 2026-09-09)."""
+
+    return _command_literal_option_last(command, "jobs")
 
 
 def _registry_metadata(pipe: str) -> dict[str, str]:
@@ -276,6 +389,71 @@ def _canonical_jobs() -> str | None:
         return None
 
 
+def _route_evidence_literals(command: str) -> dict[str, str]:
+    """`slug`/`worktree` a short route-backed start command implies.
+
+    `dispatch-owner --start --route-evidence <file> --prompt-file <brief>`
+    carries no `--slug`/`--worktree` literal: the selector fills both from the
+    route (2026-09-09). The route file is the same exact evidence the selector
+    read, so its `slug` and `cwd` narrow a wave the way the literals do. Only
+    a plain absolute regular-file path counts; anything else narrows nothing."""
+
+    literal = _command_literal_option_last(command, "route-evidence")
+    if literal is None:
+        return {}
+    path = Path(literal)
+    if not path.is_absolute() or path.is_symlink() or not path.is_file():
+        return {}
+    try:
+        route = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(route, dict):
+        return {}
+    found: dict[str, str] = {}
+    slug = route.get("slug")
+    if isinstance(slug, str) and slug:
+        found["slug"] = slug
+    cwd = route.get("cwd")
+    if isinstance(cwd, str) and cwd:
+        found["worktree"] = cwd
+    return found
+
+
+def _command_option_present(command: str, name: str) -> bool:
+    """Whether `--name value` / `--name=value` appears at all, literal or not."""
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return False
+    flag = f"--{name}"
+    return any(part == flag or part.startswith(flag + "=") for part in parts)
+
+
+def _command_literal_option_last(command: str, name: str) -> str | None:
+    """Like `_command_literal_option`, but the *last* occurrence wins — the
+    selector's `_parse` overwrites `--route-evidence` on repeat, so the hook
+    must read the same file it read. Any non-literal occurrence disqualifies."""
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return None
+    flag = f"--{name}"
+    found: str | None = None
+    for index, part in enumerate(parts):
+        value: str | None = None
+        if part == flag and index + 1 < len(parts):
+            value = parts[index + 1]
+        elif part.startswith(flag + "="):
+            value = part[len(flag) + 1 :]
+        if value is None:
+            continue
+        if "$" in value or not value:
+            return None
+        found = value
+    return found
+
+
 def registry_launch(payload: object) -> Launch | None:
     """Arm from the wrapper-written registry when stdout was filtered away.
 
@@ -298,19 +476,43 @@ def registry_launch(payload: object) -> Launch | None:
     command, session, jobs, candidates = resolved
     if len(candidates) > 1:
         # A wave of same-session owner starts is legitimate; the command this
-        # exact hook invocation observed names which one it launched.  Narrow
-        # by its literal `--slug`, then `--worktree`.  A literal that matches
-        # nothing narrows nothing (it may name a not-yet-visible row), and a
-        # set still ambiguous after narrowing arms nothing, exactly as before.
+        # exact hook invocation observed names which one it launched.
+        # Narrow by every axis the command states, then by what the route file
+        # it names implies for the axes it leaves out — and only then decide.
+        # Safety properties (codex R3 + Fable cross-check, 2026-09-09):
+        #   1. an explicit option whose value is not a literal (unexpanded
+        #      variable, empty) fails closed for the whole narrowing — the
+        #      selector honoured that value, so no other axis may pick a row;
+        #   2. an explicit literal that matches no candidate fails closed —
+        #      the launch this hook observed did not make any of these rows;
+        #   3. no early exit: every explicit axis is checked before a single
+        #      survivor may arm, so one axis cannot bypass another.
+        # A route-implied value that matches nothing narrows nothing (the row
+        # may not be visible yet); ambiguity after all axes arms nothing.
+        # Last occurrence wins, exactly as the selector's `_parse` and the
+        # three wrappers' argparse `store` read a repeated flag (OpenCode
+        # cross-check 2026-09-09: first-wins armed the previous attempt).
+        segment = _start_segment(command)
+        if segment is None:
+            return None
+        explicit: dict[str, str] = {}
+        for option in ("slug", "worktree"):
+            if _command_option_present(segment, option):
+                value = _command_literal_option_last(segment, option)
+                if value is None:
+                    return None
+                explicit[option] = value
+        implied = _route_evidence_literals(segment) if len(explicit) < 2 else {}
         for option, position in (("slug", 2), ("worktree", 1)):
-            literal = _command_literal_option(command, option)
+            literal = explicit.get(option, implied.get(option))
             if literal is None:
                 continue
             narrowed = [row for row in candidates if row[position] == literal]
-            if narrowed:
-                candidates = narrowed
-            if len(candidates) == 1:
-                break
+            if not narrowed:
+                if option in explicit:
+                    return None
+                continue
+            candidates = narrowed
     if len(candidates) != 1:
         return None
     return Launch(
@@ -337,7 +539,7 @@ def _registry_start_candidates(
     fields = _fields(_stdout(payload.get("tool_response")))
     jobs = (
         _validated_jobs(_single(fields, "job_registry"))
-        or _validated_jobs(_command_jobs(command))
+        or _validated_jobs(_command_jobs(_start_segment(command) or ""))
         or _validated_jobs(os.environ.get("AGENT_DISPATCH_JOBS"))
         or _validated_jobs(_canonical_jobs())
     )
@@ -382,30 +584,15 @@ def _release_command(command: str) -> tuple[str, str | None] | None:
 
     Returns `(gate, route_literal_or_None)`; anything else is None. Only the
     typed supervisor surface counts -- the same discipline `_start_surface`
-    applies to owner starts."""
+    applies to owner starts, from the same segment parser."""
 
-    try:
-        parts = shlex.split(command)
-    except ValueError:
+    segment = _release_segment(command)
+    if segment is None:
         return None
-    separators = {"|", "||", "&&", ";"}
-    for index, token in enumerate(parts):
-        if Path(token).name not in {"workflow-supervisor", "workflow-supervisor.py"}:
-            continue
-        end = index + 1
-        while end < len(parts) and parts[end] not in separators:
-            end += 1
-        arguments = parts[index + 1 : end]
-        if not arguments:
-            continue
-        verb = arguments[0]
-        if verb == "release" or (verb == "gate" and "--release" in arguments):
-            segment = " ".join(shlex.quote(a) for a in arguments)
-            gate = _command_literal_option(segment, "gate")
-            if gate is None:
-                return None
-            return gate, _command_literal_option(segment, "route")
-    return None
+    gate = _command_literal_option(segment, "gate")
+    if gate is None:
+        return None
+    return gate, _command_literal_option(segment, "route")
 
 
 def release_launch(payload: object) -> Launch | None:
@@ -477,7 +664,7 @@ def release_launch(payload: object) -> Launch | None:
     if not isinstance(route_id, str) or not route_id:
         return None
     jobs = (
-        _validated_jobs(_command_jobs(command))
+        _validated_jobs(_command_jobs(_release_segment(command) or ""))
         or _validated_jobs(os.environ.get("AGENT_DISPATCH_JOBS"))
         or _validated_jobs(_canonical_jobs())
     )
