@@ -51,7 +51,7 @@ and `ADAPTATION.md`; command output is authoritative for current support.
 | token/UI | `preflight.sh token-budget`, `preflight.sh ui-info`, `preflight.sh tui-config` |
 | delegation/QA | `preflight.sh subagent-info --check`, `preflight.sh qa-policy <level> [code|research|doc|general]` |
 | readiness/loops | `preflight.sh doctor [--runtime]`, `preflight.sh loop-info <oncall|note|study|drill|runtime-watch>` |
-| dispatch control | `preflight.sh dispatch-wait --attempt-id <id> --max 300..600` (operator recovery only — never a model route; a supervised parent ends its turn and the gateway injects completion), `preflight.sh liveness`, `preflight.sh harvest`, `preflight.sh dispatch-reconcile` |
+| dispatch control | `preflight.sh dispatch-wait --attempt-id <id> --max 300..600` (operator recovery only), `preflight.sh liveness`, `preflight.sh harvest`, `preflight.sh dispatch-reconcile` |
 | dispatch readiness | `preflight.sh dispatch-readiness --worktree <path> --jobs <jobs.log> --owner-harness <h>... --child-harness <h>... --output <evidence.json>` |
 | managed Codex | `preflight.sh managed-entry [--check] --codex-home <private-dir> --state-dir <private-dir> --workspace <dir> [--jobs <jobs.log>]` |
 | install | `install-runtime-projection.sh [--install-plugin] [--skills-mode native|plugin|both]`, `check-runtime-projection.sh`, `preflight.sh runtime-projection --require-hook-trust` |
@@ -141,8 +141,7 @@ create new parent Stop state, or park the model/tool loop. Keep the parent
 conversational. Obey the receipt: `parent_next=end-turn` yields with no wait
 or poll; `parent_next=bounded-wait` runs its printed `parent_next_command` once —
 never an in-model `sleep`/liveness loop. An absent directive is not `end-turn`:
-never filter stdout. `--allow-unmanaged-parent-poll` stays operator-only, and
-recovery waits with `preflight.sh dispatch-wait --attempt-id <id>`.
+never filter stdout. `--allow-unmanaged-parent-poll` stays operator-only.
 Legacy stamped Stop state is recovery-only and permits one exact terminal
 `--status all --attempt-id` harvest, never raw output or a broad selector.
 Conductors use `dispatch-chain` for ordinary checked dispatch-depth-2 nodes. A sealed
