@@ -95,13 +95,20 @@ class CodexDispatchModelEligibilityTest(unittest.TestCase):
             WRAPPER.resolve_model_settings(selection(profile="top", route_file=route, dispatch_depth=2, worker_type="stage"))
         self.assertEqual(depth.exception.reason, "invalid-dispatch-model-profile")
 
-    def test_a_registered_worker_may_not_inherit_the_interactive_model(self):
-        # top review M1: this machine's interactive default is Astra
-        with self.assertRaises(WRAPPER.ModelSelectionError) as refused:
-            WRAPPER.resolve_model_settings(selection(inherit=True))
-        self.assertEqual(refused.exception.reason, "headless-model-inheritance-ineligible")
-        result = WRAPPER.resolve_model_settings(selection(inherit=True, registered_worker=0))
-        self.assertEqual(result["source"], "inherit")
+    def test_no_headless_launch_may_inherit_the_interactive_model(self):
+        # top review M1 + combined review B1: this machine's interactive
+        # default is Astra, and no headless launch -- registered or not --
+        # can prove otherwise, so inheritance is refused outright (parity
+        # with the Claude adapter, which never accepted it).
+        for registered in (1, 0):
+            with self.subTest(registered_worker=registered), \
+                 self.assertRaises(WRAPPER.ModelSelectionError) as refused:
+                WRAPPER.resolve_model_settings(selection(inherit=True, registered_worker=registered))
+            self.assertEqual(refused.exception.reason, "headless-model-inheritance-ineligible")
+        # the exclusivity check still comes first
+        with self.assertRaises(WRAPPER.ModelSelectionError) as combined:
+            WRAPPER.resolve_model_settings(selection(inherit=True, profile="deep"))
+        self.assertEqual(combined.exception.reason, "invalid-dispatch-model-selection")
 
     def test_a_user_copy_without_the_key_carries_no_restriction(self):
         without = {k: v for k, v in shipped_policy().items() if k != "CFG_MAIN_SESSION_ONLY_MODELS"}

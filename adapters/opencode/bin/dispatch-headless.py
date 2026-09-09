@@ -439,6 +439,14 @@ def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
                 "model-profile-override-forbidden",
                 "a route-sealed model profile may use a concrete override only on a checked capacity retry",
             )
+        if args.model_profile == TOP_PROFILE and args.model:
+            # No cascade in or out, on every adapter (combined review m5):
+            # nothing runs under the `top` label but the top model itself,
+            # even where `top` collapses onto the deep tier.
+            raise ModelSelectionError(
+                "profile-top-override-forbidden",
+                "the top exception profile admits no concrete --model override, capacity retry included",
+            )
         try:
             resolved, _receipt = resolve_runtime_profile(
                 "opencode", args.model_profile, source_root=ROOT
@@ -2125,8 +2133,9 @@ def main(argv: list[str]) -> int:
     print(f"model_role={settings['role']}")
     print(f"model_profile={settings['profile']}")
     print(f"model_tier={settings['tier']}")
-    print(f"model_config_source={_model_config_state()[0]}")
-    print(f"model_config_reason={_model_config_state()[1]}")
+    _config_source, _config_reason = _model_config_state()
+    print(f"model_config_source={_config_source}")
+    print(f"model_config_reason={_config_reason}")
     print(f"profile_granularity={settings['granularity']}")
     for key, value in sorted(getattr(args, "profile_selection_receipt", {}).items()):
         print(f"{key}={value}")

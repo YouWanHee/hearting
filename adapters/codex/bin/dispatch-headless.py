@@ -782,19 +782,17 @@ def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
                 "invalid-dispatch-model-selection",
                 "--inherit-model-settings is mutually exclusive with --model-profile, --model-role, --model, and --reasoning",
             )
-        if args.registered_worker:
-            # Parity with the Claude adapter (top review M1): a registered
-            # headless worker cannot prove the interactive defaults exclude a
-            # main-session-only model (this machine's interactive default IS
-            # the top model), so it may not inherit them.
-            raise ModelSelectionError(
-                "headless-model-inheritance-ineligible",
-                "registered headless Codex dispatch cannot prove that inherited interactive settings exclude a main-only model; select --model-profile, --model-role, or --model with --reasoning",
-            )
-        return {
-            "source": "inherit", "role": "inherit", "profile": "unsealed",
-            "tier": "inherit", "granularity": "legacy", "model": "inherit", "reasoning": "inherit",
-        }
+        # Parity with the Claude adapter (top review M1, combined review B1):
+        # no headless Codex launch can prove the inherited interactive
+        # settings exclude a main-session-only model -- on this machine the
+        # interactive default IS the top model -- so inheritance is refused
+        # outright and the flag is off the documented surface. It stays in
+        # argparse so an old caller gets this typed reason instead of an
+        # unknown-argument error.
+        raise ModelSelectionError(
+            "headless-model-inheritance-ineligible",
+            "registered headless Codex dispatch cannot prove that inherited interactive settings exclude a main-only model; select --model-profile, --model-role, or --model with --reasoning",
+        )
     if args.model_profile:
         if not args.model_role and args.worker_type != "owner":
             raise ModelSelectionError(
@@ -3368,8 +3366,9 @@ def main(argv: list[str]) -> int:
     print(f"model_role={settings['role']}")
     print(f"model_profile={settings['profile']}")
     print(f"model_tier={settings['tier']}")
-    print(f"model_config_source={_model_config_state()[0]}")
-    print(f"model_config_reason={_model_config_state()[1]}")
+    _config_source, _config_reason = _model_config_state()
+    print(f"model_config_source={_config_source}")
+    print(f"model_config_reason={_config_reason}")
     print(f"profile_granularity={settings['granularity']}")
     print(f"main_session_only_policy={_main_session_only_policy_state()}")
     for key, value in sorted(getattr(args, "profile_selection_receipt", {}).items()):

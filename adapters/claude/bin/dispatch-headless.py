@@ -2912,8 +2912,9 @@ def main(argv: list[str]) -> int:
     print(f"model_role={settings['role']}")
     print(f"model_profile={settings['profile']}")
     print(f"model_tier={settings['tier']}")
-    print(f"model_config_source={_model_config_state()[0]}")
-    print(f"model_config_reason={_model_config_state()[1]}")
+    _config_source, _config_reason = _model_config_state()
+    print(f"model_config_source={_config_source}")
+    print(f"model_config_reason={_config_reason}")
     print(f"profile_granularity={settings['granularity']}")
     for key, value in sorted(getattr(args, "profile_selection_receipt", {}).items()):
         print(f"{key}={value}")

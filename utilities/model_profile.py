@@ -13,8 +13,9 @@ from typing import Mapping
 PORTABLE_PROFILES = ("deep", "balanced-deep", "balanced", "light", "mini")
 # The exception profile above `deep` (2026-09-09 사용자 결정): each harness's top
 # model -- the one CFG_MAIN_SESSION_ONLY_MODELS reserves for the session the
-# user talks to -- reached only by an explicit `top` selection on a dispatch-
-# depth-1 owner or review worker with a full demand. It is not portable in the
+# user talks to -- reached only through a route that sealed an explicit `top`
+# selection, with a full demand, for its dispatch-depth-1 owner (see
+# `TOP_WORKER_TYPES` and `require_top_route`). It is not portable in the
 # five-profile sense: no matrix cell resolves to it, no policy band names it,
 # no capacity cascade enters or leaves it, and a runtime config that does not
 # declare CFG_MODEL_PROFILE_TOP refuses it typed instead of deriving a model.
