@@ -256,6 +256,22 @@ class ResealTest(_FixtureMixin):
         self.assertEqual(rc, 1)
         self.assertIn("over-ceiling", out)
 
+    def test_reseal_repairs_a_stale_ceiling_echo(self) -> None:
+        # Lowering TOTAL_BYTE_CEILING in code leaves the JSON echo behind;
+        # check() must refuse it and reseal() must be the way out (measured
+        # 2026-09-09: the first version refused both, so no reseal was possible).
+        data = self._budget()
+        data["ceiling_bytes"] = csb.TOTAL_BYTE_CEILING + 5
+        self._write_budget(data)
+        rc, out = _run(root=self.tmp)
+        self.assertEqual(rc, 1)
+        self.assertIn("ceiling_bytes", out)
+        rc, out = _run("--reseal", root=self.tmp)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self._budget()["ceiling_bytes"], csb.TOTAL_BYTE_CEILING)
+        rc, out = _run(root=self.tmp)
+        self.assertEqual(rc, 0, out)
+
     def test_reseal_refuses_when_a_surface_is_missing(self) -> None:
         (self.tmp / "core/HOOKS.md").unlink()
         rc, out = _run("--reseal", root=self.tmp)

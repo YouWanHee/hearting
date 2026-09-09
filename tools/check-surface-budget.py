@@ -36,10 +36,11 @@ from pathlib import Path
 
 SCHEMA = 1
 BUDGET_FILE = "tools/surface-budget.json"
-# Sealed 2026-09-09 at 9c666bc2: the measured 9-document total at kickoff.
-# Lower it in the same commit that lands a real reduction; never raise it
+# Lower it only in the commit that lands a measured reduction; never raise it
 # without a reviewed rationale in that commit.
-TOTAL_BYTE_CEILING = 420_908
+#   2026-09-09 9c666bc2  420,908  kickoff seal
+#   2026-09-09 (this)    397,795  completion-delivery carriers moved to ADAPTATION §7
+TOTAL_BYTE_CEILING = 397_795
 SURFACES: tuple[str, ...] = (
     "core/CORE.md",
     "core/WORKFLOW.md",
@@ -120,7 +121,7 @@ def measure(root: Path) -> dict[str, dict[str, int] | None]:
     return out
 
 
-def load_budget(path: Path) -> dict:
+def load_budget(path: Path, *, strict_ceiling: bool = True) -> dict:
     data = json.loads(path.read_text(encoding="utf-8"))
     if data.get("schema") != SCHEMA:
         raise ValueError(f"budget schema must be {SCHEMA}")
@@ -136,7 +137,7 @@ def load_budget(path: Path) -> dict:
         raise ValueError("budget must carry an integer total_bytes cap")
     # The ceiling is a code constant; the file only echoes it for readers, and
     # an echo that disagrees with the code is a second source of truth.
-    if data.get("ceiling_bytes") != TOTAL_BYTE_CEILING:
+    if strict_ceiling and data.get("ceiling_bytes") != TOTAL_BYTE_CEILING:
         raise ValueError(
             f"ceiling_bytes {data.get('ceiling_bytes')!r} != code ceiling {TOTAL_BYTE_CEILING}; reseal"
         )
@@ -210,7 +211,9 @@ def reseal(root: Path, budget_path: Path, *, reason: str | None, commit: str | N
     previous: dict = {}
     if budget_path.is_file():
         try:
-            previous = load_budget(budget_path)
+            # A lowered code ceiling leaves a stale echo behind; reseal is the
+            # one path that rewrites it, so it must not refuse on that alone.
+            previous = load_budget(budget_path, strict_ceiling=False)
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             return [f"budget-unreadable {budget_path}: {exc}"]
     old_surfaces = previous.get("surfaces", {})
