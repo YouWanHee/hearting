@@ -494,5 +494,15 @@ class ShippedBaselineMergeTests(unittest.TestCase):
                 D.load_and_validate(str(path), D.default_topology_path())
 
 
+
+class TopExceptionPolicyTest(DispatchDefaultsV3Tests):
+    def test_top_borrows_the_deep_bands_and_never_has_its_own_section(self):
+        config = self.config()
+        self.assertEqual(D.query_profile_policy(config, "top"), D.query_profile_policy(config, "deep"))
+        self.assertNotIn("top", D.MODEL_PROFILES)
+        config["profiles"]["top"] = dict(config["profiles"]["deep"])
+        errors = D.validate(config, D.load_topology_capabilities(D.default_topology_path()))
+        self.assertTrue(any("top" in str(e) for e in errors), errors)
+
 if __name__ == "__main__":
     unittest.main()

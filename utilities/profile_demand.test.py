@@ -290,5 +290,27 @@ class RouteDemand(unittest.TestCase):
             fixture.doCleanups()
 
 
+
+class TopExceptionRoute(unittest.TestCase):
+    """The `top` exception profile at the route layer: owner-only, explicit-only."""
+
+    def nodes(self):
+        return [{"id": "execute", "kind": "pipeline-stage", "dispatch_depth": 2, "model_profile": "light"}]
+
+    def test_explicit_top_is_accepted_for_the_owner_only(self):
+        demands = {"__owner__": demand("important"), "execute": demand("important")}
+        normalized, explicit = R._profile_input_maps(self.nodes(), demands, {"__owner__": "top"})
+        self.assertEqual(explicit, {"__owner__": "top"})
+        with self.assertRaises(ValueError) as refused:
+            R._profile_input_maps(self.nodes(), demands, {"execute": "top"})
+        self.assertEqual(str(refused.exception), "profile-explicit-top-owner-only:execute")
+        with self.assertRaises(ValueError):
+            R._profile_input_maps(self.nodes(), demands, {"__owner__": "summit"})
+
+    def test_top_owner_selection_seals_the_exception_reason(self):
+        row = P.resolve_profile_demand(demand("difficult-uncertain"), explicit_profile="top")
+        self.assertEqual((row["resolved_profile"], row["reason"]), ("top", "explicit-top-exception"))
+        P.validate_profile_selection(row, demand("difficult-uncertain"), profile="top")
+
 if __name__ == "__main__":
     unittest.main()

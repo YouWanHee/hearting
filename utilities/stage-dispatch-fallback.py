@@ -1001,8 +1001,9 @@ def capacity_cascade_next(harness: str, failed_model: str) -> tuple[str, str] | 
 
 
 def _restricted_model(model: str, restricted: list[str]) -> bool:
-    tokens = set(re.split(r"[^a-z0-9]+", model.lower()))
-    return any(alias.lower() in tokens for alias in restricted)
+    from model_config import restricted_model  # one matcher for every consumer
+
+    return restricted_model(model, restricted)
 
 
 def _declared_model_matches(declared: str, actual: str) -> bool:
@@ -1353,6 +1354,13 @@ def capacity_retry(
 
     harness = row["child_harness"]
     failed_model = failed.get("model", "")
+    if node.get("model_profile") == "top":
+        # The top exception profile has no cascade in either direction: the
+        # person who asked for the top model decides what happens when it is
+        # rate-limited. A silent step down to the deep tier would hand them a
+        # review they did not ask for under the name they did.
+        attempts.append(f"{ordinal}:{tuple_key(row)}:capacity-alternative-top-profile")
+        return "descend", {}, "capacity-alternative-top-profile"
     # The alternative comes from an explicit --capacity-model, else the adapter
     # config capacity cascade (SD-59): a rate-limited model is switched, not
     # re-tried at lower effort. Opus exhausted -> sonnet, SOL -> LUNA, etc.

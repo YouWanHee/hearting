@@ -203,5 +203,43 @@ class ModelConfigTest(unittest.TestCase):
         self.assertFalse((root / "sentinel").exists())
 
 
+class TopProfileOptionalityTest(unittest.TestCase):
+    def make_root(self, adapter="claude", shipped=BASE):
+        root = Path(tempfile.mkdtemp())
+        shipped_path = root / "adapters" / adapter / "config" / "models.conf"
+        shipped_path.parent.mkdir(parents=True)
+        shipped_path.write_text(shipped, encoding="utf-8")
+        return root
+
+    def test_a_user_copy_without_the_top_profile_stays_valid_and_has_no_top(self):
+        shipped = (BASE + 'CFG_TIER_TOP_MODEL=shipped-top\nCFG_TIER_TOP_EFFORT=max\n'
+                   'CFG_MODEL_PROFILE_TOP=top:max\nCFG_MODEL_PROFILE_GRANULARITY_TOP=full\n'
+                   'CFG_MAIN_SESSION_ONLY_MODELS="shipped-top"\n')
+        legacy_user = BASE + 'CFG_MAIN_SESSION_ONLY_MODELS="fable"\n'
+        root = self.make_root(shipped=shipped)
+        home = root / "home"
+        user = home / "agent-config" / "models.conf"
+        user.parent.mkdir(parents=True)
+        user.write_text(legacy_user, encoding="utf-8")
+        values, receipt = config.resolve_config("claude", runtime=home, source_root=root)
+        self.assertEqual((receipt.source, receipt.reason), ("user", "user-valid"))
+        self.assertEqual(receipt.unreferenced_tier_keys, "CFG_TIER_TOP_EFFORT,CFG_TIER_TOP_MODEL")
+        self.assertNotIn("CFG_MODEL_PROFILE_TOP", values)  # never derived
+        # a copy that opts in without declaring the tier is incomplete
+        user.write_text(legacy_user + "CFG_MODEL_PROFILE_TOP=top:max\n", encoding="utf-8")
+        _values, receipt = config.resolve_config("claude", runtime=home, source_root=root)
+        self.assertEqual(receipt.reason, "user-incomplete")
+
+    def test_restricted_model_matches_whole_ids_and_alias_tokens(self):
+        self.assertTrue(config.restricted_model("claude-fable-5-1", "fable"))
+        self.assertTrue(config.restricted_model("fable", ["fable"]))
+        self.assertTrue(config.restricted_model("gpt-6-astra", "gpt-6-astra"))
+        self.assertTrue(config.restricted_model("GPT-6-Astra", ["gpt-6-astra"]))
+        self.assertFalse(config.restricted_model("gpt-6-astra-mini", "gpt-6-astra"))  # whole id only
+        self.assertFalse(config.restricted_model("gpt-5.6-sol", "gpt-6-astra"))
+        self.assertFalse(config.restricted_model("opus", " "))
+        self.assertFalse(config.restricted_model("claude-opus-5", ["fable"]))
+
+
 if __name__ == "__main__":
     unittest.main()

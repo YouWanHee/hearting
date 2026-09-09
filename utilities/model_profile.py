@@ -11,6 +11,17 @@ from typing import Mapping
 
 
 PORTABLE_PROFILES = ("deep", "balanced-deep", "balanced", "light", "mini")
+# The exception profile above `deep` (2026-09-09 사용자 결정): each harness's top
+# model -- the one CFG_MAIN_SESSION_ONLY_MODELS reserves for the session the
+# user talks to -- reached only by an explicit `top` selection on a dispatch-
+# depth-1 owner or review worker with a full demand. It is not portable in the
+# five-profile sense: no matrix cell resolves to it, no policy band names it,
+# no capacity cascade enters or leaves it, and a runtime config that does not
+# declare CFG_MODEL_PROFILE_TOP refuses it typed instead of deriving a model.
+TOP_PROFILE = "top"
+EXCEPTION_PROFILES = (TOP_PROFILE,)
+KNOWN_PROFILES = PORTABLE_PROFILES + EXCEPTION_PROFILES
+TOP_WORKER_TYPES = frozenset({"owner", "review"})
 RESOLVER_VERSION = "profile-demand/v1"
 DEMAND_SCHEMA_VERSION = 1
 DEMAND_JUDGMENTS = ("predetermined", "important", "difficult-uncertain")
@@ -108,9 +119,17 @@ def resolve_profile_demand(
         source = "matrix"
         reason = "matrix-cell"
     else:
-        if explicit_profile not in PORTABLE_PROFILES:
+        if explicit_profile not in KNOWN_PROFILES:
             raise ModelProfileError("unknown explicit profile", "profile-explicit-unknown")
-        allowed = JUDGMENT_FLOORS[judgment]
+        if explicit_profile == TOP_PROFILE:
+            # Above every floor, but never for predetermined work: the top
+            # model is an exception spent on judgment, not on execution length.
+            if judgment == "predetermined":
+                raise ModelProfileError("the top exception profile needs important or "
+                                        "difficult-uncertain judgment", "profile-top-predetermined")
+            allowed = (TOP_PROFILE,)
+        else:
+            allowed = JUDGMENT_FLOORS[judgment]
         if explicit_profile not in allowed:
             raise ModelProfileError("explicit profile is below the judgment floor",
                                     "profile-floor-violation")
@@ -119,7 +138,8 @@ def resolve_profile_demand(
                                     "profile-explicit-cell-mismatch")
         resolved = explicit_profile
         source = "explicit"
-        reason = ("important-explicit-deep-additional-judgment-headroom"
+        reason = ("explicit-top-exception" if explicit_profile == TOP_PROFILE
+                  else "important-explicit-deep-additional-judgment-headroom"
                   if judgment == "important" and explicit_profile == "deep"
                   else "explicit-within-floor")
     return {
@@ -199,12 +219,18 @@ def load_config(path: str | Path) -> dict[str, str]:
 def resolve_profile_values(
     adapter: str, config: Mapping[str, str], profile: str
 ) -> dict[str, str]:
-    if profile not in PORTABLE_PROFILES:
+    if profile not in KNOWN_PROFILES:
         raise ModelProfileError(f"unknown portable model profile: {profile!r}")
     if adapter not in {"claude", "codex", "opencode"}:
         raise ModelProfileError(f"unknown adapter: {adapter!r}")
     profile_key = "CFG_MODEL_PROFILE_" + profile.upper().replace("-", "_")
     spec = config.get(profile_key)
+    if profile == TOP_PROFILE and not spec:
+        # Opt-in only: the selected runtime file (the user's whole-file copy or
+        # the shipped default) must say what `top` is; nothing is derived.
+        raise ModelProfileError(
+            "the selected runtime model config does not declare CFG_MODEL_PROFILE_TOP; "
+            "the top exception profile is opt-in", "profile-top-undeclared")
     if not spec or spec.count(":") != 1:
         raise ModelProfileError(f"{profile_key} must declare tier:effort-or-variant")
     tier, budget = spec.split(":", 1)
@@ -266,8 +292,14 @@ def validate_registered_profile(
 ) -> None:
     if profile is None:
         return
-    if profile not in PORTABLE_PROFILES:
+    if profile not in KNOWN_PROFILES:
         raise ModelProfileError(f"unknown portable model profile: {profile!r}")
+    if profile == TOP_PROFILE and not (
+        registered_worker and dispatch_depth == 1 and worker_type in TOP_WORKER_TYPES
+    ):
+        raise ModelProfileError(
+            "the top exception profile is limited to a registered dispatch-depth-1 "
+            "owner or review worker", "profile-top-depth-forbidden")
     if (
         profile == "mini"
         and registered_worker

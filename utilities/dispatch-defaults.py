@@ -17,6 +17,10 @@ DISPATCHABLE_HARNESSES = {"claude", "codex", "opencode"}
 KNOWN_HARNESSES = DISPATCHABLE_HARNESSES
 AFFINITY_VALUES = {"claude", "codex", "opencode", "diverse"}
 MODEL_PROFILES = ("deep", "balanced-deep", "balanced", "light", "mini")
+# The `top` exception profile never has its own policy section: a route that
+# seals it borrows the quality-peer bands of `deep` (claude/codex only). A
+# `profiles.top` mapping in the user file stays an unknown-profile error.
+EXCEPTION_PROFILE_POLICY = {"top": "deep"}
 QUALITY_BANDS = ("primary", "relief", "last_resort")
 ALLOCATION_STRATEGIES = {"least-recent-attempts", "capacity-aware", "balanced"}
 DEFAULT_USAGE_GATE_USED_PERCENT = 90
@@ -590,6 +594,7 @@ def query_profile_policy(config, profile):
     Legacy schemas have one symmetric primary band.  This preserves their exact
     selector behavior while letting v3 keep OpenCode outside the quality-peer set.
     """
+    profile = EXCEPTION_PROFILE_POLICY.get(profile, profile)
     if profile not in MODEL_PROFILES:
         raise DefaultsConfigError(f"unknown model profile: {profile!r}")
     if config.get("schema_version") not in {3, 4}:

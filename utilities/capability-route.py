@@ -2026,8 +2026,12 @@ def _profile_input_maps(nodes, demands, explicit):
     for key, value in (demands or {}).items():
         normalized[key] = PROFILE.normalize_profile_demand(value)
     for key, value in (explicit or {}).items():
-        if key not in normalized or value not in PROFILE.PORTABLE_PROFILES:
+        if key not in normalized or value not in PROFILE.KNOWN_PROFILES:
             raise ValueError("profile-explicit-input-invalid:" + key)
+        if value == PROFILE.TOP_PROFILE and key != "__owner__":
+            # The top exception profile is a dispatch-depth-1 decision: a
+            # stage node or parallel leg never spends the main-session model.
+            raise ValueError("profile-explicit-top-owner-only:" + key)
     return normalized, dict(explicit or {})
 
 
@@ -2641,10 +2645,16 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
         legacy=True, existing_versioned_stage=True,
     )
     expected_owner = registry["owner_profile_by_intensity"].get(effective)
-    if expected_owner and owner_profile_selection["resolved_profile"] != expected_owner:
+    resolved_owner_profile = owner_profile_selection["resolved_profile"]
+    if resolved_owner_profile == PROFILE.TOP_PROFILE and effective == "direct":
+        # direct runs inline in the main session, which already IS the top
+        # model's home; there is no owner to give the profile to.
+        raise ValueError("owner-profile-top-requires-owner")
+    if (expected_owner and resolved_owner_profile != expected_owner
+            and resolved_owner_profile != PROFILE.TOP_PROFILE):
         raise ValueError("owner-profile-eligibility-conflict")
     if effective != "direct":
-        owner_model_profile = owner_profile_selection["resolved_profile"]
+        owner_model_profile = resolved_owner_profile
     legacy_nodes = not composed or _versioned_subgraph(registry, recipe)
     _seal_profile_demands(nodes, profile_demands, explicit_profiles, legacy=legacy_nodes)
     dispatch_defaults_digest,dispatch_allocation,owner_harness_policy=_seal_dispatch_defaults(

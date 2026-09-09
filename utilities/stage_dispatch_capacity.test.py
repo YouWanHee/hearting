@@ -196,4 +196,17 @@ class CapacityTest(unittest.TestCase):
    {"claude":0,"codex":0,"opencode":0}, ["claude","codex","opencode"],
    {"claude":9,"codex":4,"opencode":1}, strategy="balanced")
   self.assertEqual((chosen,band),("claude","primary"))
+ def test_top_profile_never_fails_over_and_astra_never_enters_capacity_settings(self):
+  # SD-59 keeps the top exception profile out of the cascade in both directions.
+  self.args.capacity_model=None;self.args.capacity_reasoning=None
+  node={**self.node,"model_profile":"top"};attempts=[]
+  with mock.patch.object(F,"wrapper_command",return_value=["fake"]) as launched:
+   state,fields,reason=F.capacity_retry(self.args,self.route,node,self.row,1,self.failed,attempts)
+  self.assertEqual((state,fields,reason),("descend",{},"capacity-alternative-top-profile"))
+  self.assertTrue(attempts and attempts[0].endswith("capacity-alternative-top-profile"));launched.assert_not_called()
+  # the codex key (parity, 2026-09-10) keeps a hyphenated top model out of every capacity setting
+  conf=self.shipped_conf("codex");self.assertEqual(conf["CFG_MAIN_SESSION_ONLY_MODELS"].split(),["gpt-6-astra"])
+  self.assertNotIn("gpt-6-astra",[m for m,_ in F.capacity_cascade("codex")])
+  self.assertFalse(F.allowed_capacity_settings("codex","gpt-6-astra","xhigh"))
+  self.assertEqual(F.capacity_cascade_next("codex","gpt-6-astra"),F.capacity_cascade("codex")[0])
 if __name__=="__main__":unittest.main()

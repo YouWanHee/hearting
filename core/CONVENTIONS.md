@@ -147,6 +147,7 @@ a scalar quality ranking:
 | `balanced` | Predetermined work with an extended multi-step execution | light model with high execution budget | allowed |
 | `light` | Predetermined, short local execution | configured light budget | allowed |
 | `mini` | Lifecycle, classification, title, or explicitly micro-semantic help | configured micro budget | forbidden for substantive registered dispatch-depth-1/2 owner, stage, and review nodes |
+| `top` | Exception above deep: the harness's main-session-only model, only by explicit selection under important or difficult-uncertain judgment | configured top budget, opt-in (a harness without one collapses to deep, typed) | dispatch-depth-1 owner or review worker only; not a stage node, leg, matrix cell, policy band, or capacity cascade |
 
 SD-88 v84 uses one pure resolver for compile and compose. `profile_demand`
 contains `schema_version: 1`, `judgment_requirement`, `execution_scope`, nonempty
@@ -183,8 +184,6 @@ predetermined node references that handoff. New important decisions, out-of-scop
 choices or high uncertainty stop execution and require a newly sealed judgment
 node/route. Only a handoff with no unresolved judgment permits returning to the
 execution cell. Never mutate the existing sealed profile or waive QA on return.
-
-A tier is not obliged to reach for the smallest available model. `mini` names the cheapest *operating point*, and an adapter may realize it by lowering effort on the light-tier model instead of dropping to a smaller one — the right choice when the tier's output feeds later stages, where a weaker model costs more downstream than the effort step saves.
 
 ### §2.3. Unit Catalog and Role Binding
 

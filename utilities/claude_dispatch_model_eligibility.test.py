@@ -248,5 +248,38 @@ class ClaudeDispatchModelEligibilityTest(unittest.TestCase):
             self.assertFalse(logs.exists())
 
 
+
+class TopExceptionProfileTest(ClaudeDispatchModelEligibilityTest):
+    def test_the_sealed_top_profile_is_the_one_door_to_the_main_only_model(self):
+        policy = shipped_policy()
+        result = WRAPPER.resolve_model_settings(selection(profile="top"))
+        self.assertEqual((result["model"], result["effort"], result["source"], result["tier"]),
+                         (policy["CFG_TIER_TOP_MODEL"], policy["CFG_TIER_TOP_EFFORT"], "profile-top", "top"))
+        self.assertTrue(WRAPPER._main_session_only_model(result["model"]))
+
+    def test_a_capacity_override_under_top_still_faces_the_gate(self):
+        with self.assertRaises(WRAPPER.ModelSelectionError) as refused:
+            WRAPPER.resolve_model_settings(selection(profile="top", model="claude-fable-5", effort="max", capacity_retry=1))
+        self.assertEqual(refused.exception.reason, "headless-main-session-only-model")
+        # an eligible override on a checked retry keeps working, and is not "profile-top"
+        result = WRAPPER.resolve_model_settings(selection(profile="top", model="opus", effort="xhigh", capacity_retry=1))
+        self.assertEqual((result["model"], result["source"]), ("opus", "profile+capacity"))
+
+    def test_top_is_refused_below_dispatch_depth_one(self):
+        for kwargs in (dict(dispatch_depth=2, worker_type="stage"), dict(dispatch_depth=2, worker_type="review"),
+                       dict(worker_type="support")):
+            with self.subTest(**kwargs), self.assertRaises(WRAPPER.ModelSelectionError) as refused:
+                WRAPPER.resolve_model_settings(selection(profile="top", **kwargs))
+            self.assertEqual(refused.exception.reason, "invalid-dispatch-model-profile")
+
+    def test_explicit_and_role_selection_of_the_top_model_stay_refused(self):
+        with self.assertRaises(WRAPPER.ModelSelectionError) as explicit:
+            WRAPPER.resolve_model_settings(selection(model="fable", effort="max"))
+        self.assertEqual(explicit.exception.reason, "headless-main-session-only-model")
+        with mock.patch.dict(os.environ, {"CLAUDE_MODEL_DEEP": "fable"}):
+            with self.assertRaises(WRAPPER.ModelSelectionError) as mapped:
+                WRAPPER.resolve_model_settings(selection(role="deep maker"))
+        self.assertEqual(mapped.exception.reason, "headless-main-session-only-model")
+
 if __name__ == "__main__":
     unittest.main()

@@ -105,6 +105,7 @@ Route-bound registered work uses a second, independent execution-budget axis:
 | `balanced` | `sonnet` / `high` | long multi-step execution after the decision is settled |
 | `light` | `sonnet` / `medium` | routine implementation, verification, reporting, and breadth legs |
 | `mini` | `sonnet` / `low` | lifecycle and micro-semantic helpers only; substantive dispatch-depth-1/2 work is rejected |
+| `top` | `fable` / `max` | exception above deep: the main-session-only model, reachable only from a route that seals the explicit `top` profile on a dispatch-depth-1 owner or review worker (`model_source=profile-top`); no cascade in or out |
 
 These are the shipped defaults and equal the user's runtime mapping (2026-09-09
 사용자 결정: a runtime value changed by instruction becomes the shipped default).
@@ -171,4 +172,6 @@ A profile value may name a tier (`deep:high`) or an explicit model
 (`model/<id>:high`). This keeps existing user tier keys intact when two profiles
 need different models. The shipped deep point is the `deep` tier (`opus`/xhigh);
 balanced-deep rides its own `balanced-deep` tier (`opus`/medium), so the two
-deep-side profiles currently share a model and differ only in effort. A user-selected legacy tier continues to override the shipped profile.
+deep-side profiles currently share a model and differ only in effort. The `top`
+tier (`fable`/max) is the one exception to `CFG_MAIN_SESSION_ONLY_MODELS`, and
+only through the sealed `top` profile. A user-selected legacy tier continues to override the shipped profile.

@@ -1093,5 +1093,32 @@ class RouteDefaultsReceiptTest(unittest.TestCase):
         self.assertRegex(buf.getvalue(), r"(?m)^route_defaults=none$")
 
 
+
+class TopProfileOwnerTupleTest(unittest.TestCase):
+    def _route(self, **override):
+        payload = {
+            "effective_intensity": "quick", "slug": "review-top", "capability": "autopilot-code",
+            "capability_mode": "audit", "cwd": "/w/tree", "owner_model_profile": "top",
+            "registered_headless_candidates": [{"harness": "codex", "status": "supported"}],
+        }
+        payload.update(override)
+        path = Path(tempfile.mkdtemp()) / "route.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return str(path)
+
+    def test_a_route_sealed_top_profile_reaches_the_wrapper(self):
+        _, values, forwarded, _, derived = OWNER._parse(
+            ["--start", "--route-evidence", self._route(), "--prompt-file", "/p.md"])
+        self.assertEqual(values["--model-profile"], "top")
+        self.assertIn("--model-profile", derived)
+        self.assertEqual(forwarded[forwarded.index("--model-profile") + 1], "top")
+
+    def test_an_unknown_profile_is_still_refused_and_the_hint_names_top(self):
+        with self.assertRaises(OWNER.OwnerError) as refused:
+            OWNER._parse(["--start", "--route-evidence", self._route(owner_model_profile="summit"),
+                          "--prompt-file", "/p.md"])
+        self.assertEqual(str(refused.exception), "invalid-model-profile")
+        self.assertIn("top", OWNER.hint_for("invalid-model-profile"))
+
 if __name__ == "__main__":
     unittest.main()
