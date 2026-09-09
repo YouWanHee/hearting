@@ -381,8 +381,9 @@ route additionally seals one of these profiles from the single
 |---|---|---|
 | `deep` | configured deep tier / `xhigh` | standard+ ownership, convergence, and highest-risk legs |
 | `balanced-deep` | configured deep tier / `medium` | quick one-shot conduction and subordinate deep-model judgment at a lower coordination budget |
+| `balanced` | configured light tier / `high` | long multi-step execution after the decision is settled |
 | `light` | configured light tier / `medium` | routine implementation, verification, reporting, and breadth legs |
-| `mini` | configured mini tier / `medium` | lifecycle and micro-semantic helpers only; substantive dispatch-depth-1/2 work is rejected |
+| `mini` | configured mini tier / `low` | lifecycle and micro-semantic helpers only; substantive dispatch-depth-1/2 work is rejected |
 
 Non-route role compatibility overrides remain explicit and config-derived:
 

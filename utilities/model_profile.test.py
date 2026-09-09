@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 from pathlib import Path
+import re
 import sys
 import tempfile
 import unittest
@@ -139,40 +140,100 @@ class ModelProfileTest(unittest.TestCase):
         key = tier.upper().replace("-", "_")
         return (config[f"CFG_TIER_{key}_MODEL"], budget)
 
+    @staticmethod
+    def _reachable_models(adapter, config):
+        """Every concrete model this config can put in front of a worker: the declared
+        tier models plus each of the five profiles' resolved model. A profile may name a
+        model directly (`model/<id>:budget`), so scanning `CFG_TIER_*_MODEL` alone leaves
+        a hole an edit can walk through (review MA-2a). Resolution goes through the values
+        already parsed here, not through a second read of the file — one value, one source.
+        """
+        models = {value for key, value in config.items() if key.endswith("_MODEL")}
+        for profile in ("deep", "balanced-deep", "balanced", "light", "mini"):
+            models.add(PROFILE.resolve_profile_values(adapter, config, profile)["model"])
+        return models
+
+    @staticmethod
+    def _restricted(model, aliases):
+        """The predicate every launch surface actually uses: tokenize the id and test
+        alias membership (`dispatch-headless.py`, `stage-dispatch-fallback.py`,
+        `hooks/subagent-model-default.sh` all do exactly this). Exact string equality
+        would see `model/fable:...` but not `model/claude-fable-5-1:...`, which the
+        wrapper still refuses at launch (review r2-1)."""
+        tokens = set(re.split(r"[^a-z0-9]+", model.lower()))
+        return any(alias.lower() in tokens for alias in aliases)
+
     def test_claude_shipped_default_is_the_user_profile_mapping(self):
-        # 2026-09-08 user rule: the shipped default equals the user's runtime
-        # mapping — deep rides Fable/high headless, balanced-deep rides its own
-        # opus/high tier, and no model is main-session-only (SD-85 superseded).
+        # 2026-09-09 user rule: the shipped default equals the user's runtime
+        # mapping — the top model (Fable) is reserved for the main session, so
+        # both deep-side profiles ride opus and separate by effort only.
         config = PROFILE.load_config(ROOT / "adapters" / "claude" / "config" / "models.conf")
-        self.assertEqual(config["CFG_MAIN_SESSION_ONLY_MODELS"].split(), [])
-        self.assertEqual(self._declared_point(config, "deep"), ("fable", "high"))
-        self.assertEqual(self._declared_point(config, "balanced-deep"), ("opus", "high"))
+        main_only = config["CFG_MAIN_SESSION_ONLY_MODELS"].split()
+        self.assertEqual(main_only, ["fable"])
+        self.assertEqual(self._declared_point(config, "deep"), ("opus", "xhigh"))
+        self.assertEqual(self._declared_point(config, "balanced-deep"), ("opus", "medium"))
         cascade = [entry.split(":", 1)[0] for entry in config["CFG_TIER_DEEP_FAILOVER_CASCADE"].split()]
-        self.assertEqual(cascade[:2], ["fable", "opus"])
+        self.assertEqual(cascade, ["opus", "sonnet"])
         self.assertEqual(cascade[0], config["CFG_TIER_DEEP_MODEL"])
-        self.assertEqual(config["CFG_TIER_DEEP_FAILOVER"], "balanced-deep")
+        # The role mappers read CFG_TIER_DEEP_EFFORT directly while route-bound work
+        # reads the profile's budget; a config where the two disagree silently makes
+        # the README's `deep reviewer` row false, so pin them equal (review MI-4).
+        self.assertEqual(config["CFG_TIER_DEEP_EFFORT"], "xhigh")
+        self.assertEqual(config["CFG_TIER_DEEP_EFFORT"], self._declared_point(config, "deep")[1])
+        # A main-session-only model may never appear in a dispatch-eligible tier, in the
+        # cascade the fallback walks, or as ANY profile's resolved model — the last of
+        # which is the `model/<id>:budget` profile form a tier-key scan cannot see
+        # (review MA-2a).
+        self.assertNotIn(config["CFG_TIER_DEEP_MODEL"], main_only)
+        self.assertEqual([model for model in cascade if model in main_only], [])
+        self.assertEqual(
+            [m for m in self._reachable_models("claude", config) if self._restricted(m, main_only)],
+            [],
+        )
+        self.assertEqual(config["CFG_TIER_DEEP_FAILOVER"], "light")
         points = {profile: self._declared_point(config, profile) for profile in ("deep", "balanced-deep", "balanced", "light", "mini")}
         self.assertNotEqual(points["deep"], points["balanced-deep"])  # two distinct operating points
         self.assertEqual(len(set(points.values())), 5)  # five distinct operating points
 
+    def test_codex_shipped_default_is_the_user_profile_mapping(self):
+        # Same 2026-09-09 rule on the Codex adapter: Astra is the top model and
+        # stays with the main session, so the deep tier is Sol at its maximum
+        # effort and balanced-deep is the same model at medium. This adapter has
+        # no main-session-only KEY — the restriction is carried by never naming
+        # Astra in a tier or cascade, which is what this test pins.
+        config = PROFILE.load_config(ROOT / "adapters" / "codex" / "config" / "models.conf")
+        self.assertEqual(self._declared_point(config, "deep"), ("gpt-5.6-sol", "xhigh"))
+        self.assertEqual(self._declared_point(config, "balanced-deep"), ("gpt-5.6-sol", "medium"))
+        cascade = [entry.split(":", 1)[0] for entry in config["CFG_TIER_DEEP_FAILOVER_CASCADE"].split()]
+        self.assertEqual(cascade[0], config["CFG_TIER_DEEP_MODEL"])
+        self.assertEqual(config["CFG_TIER_DEEP_EFFORT"], "xhigh")  # review MI-4, as above
+        self.assertEqual(config["CFG_TIER_DEEP_EFFORT"], self._declared_point(config, "deep")[1])
+        # Every way a model can be reached — tier keys, the cascade, and each profile's
+        # RESOLVED model (which covers the `model/<id>:budget` form a key scan misses,
+        # review MA-2a). `tools/check-model-config.py` separately refuses the literal
+        # anywhere outside this file.
+        reachable = set(cascade) | self._reachable_models("codex", config)
+        self.assertEqual([m for m in reachable if self._restricted(m, ["astra"])], [])
+
     def test_portable_profiles_resolve_to_declared_adapter_budgets(self):
         claude_config = PROFILE.load_config(ROOT / "adapters" / "claude" / "config" / "models.conf")
+        codex_config = PROFILE.load_config(ROOT / "adapters" / "codex" / "config" / "models.conf")
         expected = {
             # Five profiles use the configured judgment and execution budgets.
             # Claude expectations derive from the shipped config (the user's
-            # runtime mapping is the shipped default, 2026-09-08); the concrete
+            # runtime mapping is the shipped default, 2026-09-09); the concrete
             # contract itself is asserted in
             # test_claude_shipped_default_is_the_user_profile_mapping.
             "claude": {
                 profile: self._declared_point(claude_config, profile)
                 for profile in ("deep", "balanced-deep", "balanced", "light", "mini")
             },
+            # Codex expectations derive from its shipped config for the same
+            # reason as Claude's; the concrete contract is asserted in
+            # test_codex_shipped_default_is_the_user_profile_mapping.
             "codex": {
-                "deep": ("gpt-6-astra", "high"),
-                "balanced-deep": ("gpt-6-astra", "medium"),
-                "balanced": ("gpt-5.6-luna", "high"),
-                "light": ("gpt-5.6-luna", "medium"),
-                "mini": ("gpt-5.6-luna", "low"),
+                profile: self._declared_point(codex_config, profile)
+                for profile in ("deep", "balanced-deep", "balanced", "light", "mini")
             },
             # OpenCode has five profiles and three shipped operating points:
             # balanced/light/mini share one model and runtime-default budget,
@@ -213,7 +274,7 @@ class ModelProfileTest(unittest.TestCase):
             user.parent.mkdir()
             user.write_text(
                 shipped.replace(
-                    "CFG_TIER_DEEP_MODEL=gpt-6-astra",
+                    "CFG_TIER_DEEP_MODEL=gpt-5.6-sol",
                     "CFG_TIER_DEEP_MODEL=user/deep",
                 )
             )

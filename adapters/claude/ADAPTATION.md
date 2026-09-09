@@ -3,8 +3,8 @@
 ## Dispatch model realization
 
 `deep maker`, `deep reviewer`, `deep editor`, and `deep orchestrator` map to
-`fable`/high (the shipped deep tier equals the user's runtime mapping, 2026-09-08;
-the capacity cascade is `fable -> opus -> sonnet`). Retained `orchestrator` is the balanced mechanical role and maps to
+`opus`/xhigh (the shipped deep tier equals the user's runtime mapping, 2026-09-09;
+`fable` is main-session-only and the capacity cascade is `opus -> sonnet`). Retained `orchestrator` is the balanced mechanical role and maps to
 `sonnet`/medium; it is not an alias for the standard+ dispatch-depth-1 conductor. Fast
 portable roles map to `sonnet`/medium. (Both follow `CFG_TIER_LIGHT_EFFORT`; the
 `balanced` profile's `sonnet`/high is the separate route-bound axis.) The adapter mapper normalizes case,
@@ -210,7 +210,7 @@ main/orchestrator chooses per job and the wrapper only reflects that choice:
   never needs a stage `worker_mode`. Non-route jobs retain explicit role or
   concrete-model selection. Headless inheritance is rejected because it cannot
   prove that a config-declared interactive-main-only model will not leak into a
-  worker; the shipped list is empty, so `fable` itself is headless-eligible.
+  worker; the shipped list names `fable`, so a headless Fable launch is refused.
 - Dispatch prompts and jobs.log rows must spell out capability, mode, QA,
   intensity, depth, parent slug/session, worker type, model role/profile,
   profile tier/granularity, owner capability, and owner harness. Route-declared
@@ -362,8 +362,8 @@ Claude Code maps portable roles as follows:
 | `fast fact-checker` | `sonnet` |
 | `fast writer` | `sonnet` |
 | `fast implementer` | `sonnet` |
-| `deep reviewer` | `fable` |
-| `deep maker` | `fable` |
+| `deep reviewer` | `opus` |
+| `deep maker` | `opus` |
 | `external adversary` | Codex CLI via `codex-review-team` when available |
 | `orchestrator` | `sonnet` unless a task explicitly requires deep judgment |
 
@@ -375,8 +375,11 @@ Behavior personas live in the portable unit catalog `roles/units/` and carry
 portable role names only — they have no Claude `model:` frontmatter. The former
 per-team agent files (plan-team, dev-team, qa-team, and the other five) were
 removed in the unit-catalog migration. The only kernel helper agent under
-`adapters/claude/agents/` is `memory-scout`, whose frontmatter pins the mini
-tier (haiku) as an explicit `check-model-config.py` exemption. Every other
+`adapters/claude/agents/` is `memory-scout`. Unlike the Codex kernel helper (derived
+from `CFG_PROFILE_MEMORY_SCOUT`), this one is hand-authored and pins `haiku` — a model
+**no tier in `config/models.conf` declares**, since the mini tier moved to `sonnet` on
+2026-08-07. It rides a whole-file `check-model-config.py` exemption, so retuning every
+tier leaves it where it is. Read it as an explicit pin, not as "the mini tier". Every other
 native subagent spawn resolves its model through the native-subagent default
 below.
 

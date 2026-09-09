@@ -480,7 +480,7 @@ class DispatchJob:
     model_role: Optional[str] = None    # Portable model role from pipe model_role=.
     model_profile: Optional[str] = None  # route-sealed portable execution profile
     model_tier: Optional[str] = None     # adapter-resolved concrete tier
-    profile_granularity: Optional[str] = None  # full | collapsed-balanced-deep | legacy
+    profile_granularity: Optional[str] = None  # full | collapsed-mini | legacy (free text; no adapter emits collapsed-balanced-deep any more)
     profile_selection_source: Optional[str] = None
     profile_resolver_version: Optional[str] = None
     profile_demand_digest: Optional[str] = None
