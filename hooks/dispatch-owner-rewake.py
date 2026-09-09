@@ -159,6 +159,7 @@ class ArmRefusal:
 ARM_RETENTION_ENDED_SECONDS = 7 * 86_400
 ARM_RETENTION_ANY_SECONDS = 30 * 86_400
 ARM_PRUNE_SCAN_LIMIT = 256
+ARM_PRUNE_CURSOR = ".prune-cursor"
 
 
 def _bash_call(payload: object) -> tuple[dict[str, Any], str] | None:
@@ -268,10 +269,16 @@ def _canonical_jobs() -> str | None:
 
 def _trusted_jobs() -> Path | None:
     """The one registry this session trusts: the inherited `AGENT_DISPATCH_JOBS`
-    (immutable for the session, OPERATIONS §5.10), else the installed
-    harness's canonical registry. Nothing a Bash call prints can replace it."""
+    (immutable for the session, OPERATIONS §5.10) when the variable is set --
+    an unusable value (symlink, missing, not a regular file) trusts nothing,
+    never the canonical registry in its place (review R3 B1) -- and the
+    installed harness's canonical registry only when the variable is absent.
+    Nothing a Bash call prints can replace it."""
 
-    return _validated_jobs(os.environ.get("AGENT_DISPATCH_JOBS")) or _validated_jobs(_canonical_jobs())
+    inherited = os.environ.get("AGENT_DISPATCH_JOBS")
+    if inherited is not None:
+        return _validated_jobs(inherited)
+    return _validated_jobs(_canonical_jobs())
 
 
 def _resolved_jobs(payload: dict[str, Any]) -> Path | None:
@@ -497,10 +504,28 @@ def _prune_arm_directory(directory: Path, now: float) -> None:
     entries are examined per claim; the lock file itself is never removed."""
 
     try:
-        entries = sorted(directory.glob("att-*.json"))[:ARM_PRUNE_SCAN_LIMIT]
+        names = sorted(entry.name for entry in directory.glob("att-*.json"))
     except OSError:
         return
-    for entry in entries:
+    if not names:
+        return
+    # A rotating cursor (review R3 M2): a run scans the window that follows
+    # the last scanned name and records where it stopped, so a prefix of
+    # preserved live-holder records cannot starve the expired records behind
+    # it. The cursor file is best-effort; a missing or stale one restarts at
+    # the beginning, never skips deletion of anything.
+    cursor = directory / ARM_PRUNE_CURSOR
+    try:
+        last = cursor.read_text(encoding="utf-8").strip()
+    except OSError:
+        last = ""
+    start = next((index for index, name in enumerate(names) if name > last), 0)
+    window = (names[start:] + names[:start])[:ARM_PRUNE_SCAN_LIMIT]
+    try:
+        cursor.write_text(window[-1], encoding="utf-8")
+    except OSError:
+        pass
+    for entry in (directory / name for name in window):
         try:
             age = now - entry.stat().st_mtime
             if age < ARM_RETENTION_ENDED_SECONDS:

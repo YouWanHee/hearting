@@ -373,8 +373,10 @@ stamp path in `core/HOOKS.md`.
   depth-1 `worker_type=owner` rows stamped
   `parent_completion_delivery=claude-parent-runtime` and bound to this
   session — a receipt-named attempt is re-proven by that row, and only the
-  trusted registry (inherited `AGENT_DISPATCH_JOBS`, else the canonical one)
-  is read. An arm ledger under the registry's state root
+  trusted registry is read: the inherited `AGENT_DISPATCH_JOBS` when set (an
+  unusable value trusts nothing), else the canonical one; the owner selector
+  refuses an explicit `--jobs` elsewhere before spawn
+  (`explicit-jobs-outside-parent-registry`). An arm ledger under the registry's state root
   (`rewake-arms/<attempt_id>.json`: flock, holder process identity, state
   `waiting`/`gate-wake-sent`/`lapsed`/`ended` sealed only after the receipt
   went out, at most eight arms; `ended` records are pruned after seven days

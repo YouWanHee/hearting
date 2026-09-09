@@ -1003,6 +1003,22 @@ class RegistryConfirmArmTest(unittest.TestCase):
         assert launch is not None
         self.assertEqual((launch.attempt_id, launch.jobs), ("att-forged", self.jobs))
 
+    def test_an_unusable_inherited_registry_trusts_nothing(self) -> None:
+        # Review R3 B1: when AGENT_DISPATCH_JOBS is set but unusable, the hook
+        # must not quietly trust the canonical registry in its place.
+        link = self.root / "inherited-link.log"
+        link.symlink_to(self.jobs)
+        for bad in (str(link), str(self.root / "absent.log"), ""):
+            with self.subTest(inherited=bad), \
+                 mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": bad}), \
+                 mock.patch.object(rewake, "_canonical_jobs", return_value=str(self.jobs)):
+                self.assertIsNone(rewake._trusted_jobs())
+                self.assertIsNone(rewake.parse_launch(self.payload(stdout=f"check=ok\njob_registry={self.jobs}")))
+                self.assertIsNone(self.arm())
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch.object(rewake, "_canonical_jobs", return_value=str(self.jobs)):
+            self.assertEqual(rewake._trusted_jobs(), self.jobs)  # absent variable: canonical
+
     def test_ended_is_sealed_only_after_the_receipt_went_out(self) -> None:
         # Review R2 B2: a crash between classification and emission must leave
         # the claim re-armable, or the wake is lost forever.
@@ -1060,6 +1076,28 @@ class RegistryConfirmArmTest(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertEqual((directory / f"{name}.json").exists(), kept)
         self.assertTrue(lock.exists())
+
+    def test_a_preserved_prefix_cannot_starve_expired_records_behind_it(self) -> None:
+        # Review R3 M2: the scan window rotates, so a full window of live
+        # holders in front does not keep an expired record behind it forever.
+        directory = rewake.arm_directory(self.jobs)
+        directory.mkdir(parents=True, exist_ok=True)
+        now = time.time()
+        live = list(rewake._process_identity(os.getpid()))
+        for index in range(rewake.ARM_PRUNE_SCAN_LIMIT):
+            path = directory / f"att-a{index:04d}.json"
+            path.write_text(json.dumps({"schema": 1, "attempt_id": path.stem, "session_id": "session-1",
+                                        "holder": live, "state": "waiting", "arms": 1}), encoding="utf-8")
+            os.utime(path, (now - 31 * 86_400,) * 2)
+        expired = directory / "att-zzz-lapsed.json"
+        expired.write_text(json.dumps({"schema": 1, "attempt_id": "att-zzz-lapsed", "session_id": "session-1",
+                                       "holder": DEAD_HOLDER, "state": "lapsed", "arms": 1}), encoding="utf-8")
+        os.utime(expired, (now - 31 * 86_400,) * 2)
+        rewake._prune_arm_directory(directory, now)   # first window: the live prefix only
+        self.assertTrue(expired.exists())
+        rewake._prune_arm_directory(directory, now)   # next window starts after the cursor
+        self.assertFalse(expired.exists())
+        self.assertEqual(len(list(directory.glob("att-a*.json"))), rewake.ARM_PRUNE_SCAN_LIMIT)
 
     def test_settle_records_the_outcome_only_for_the_holder(self) -> None:
         claim = rewake.claim_arm(self.jobs, "att-owner-1", "session-1", fresh=True)

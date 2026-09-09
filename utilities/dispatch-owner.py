@@ -96,6 +96,9 @@ _HINTS = {
     "review-worker-unit-required": "--worker-type review needs --unit <catalog persona from roles/units/>",
     "review-worker-route-evidence-unsupported": "a route node's reviewer is launched by stage dispatch; drop --route-evidence for an ad-hoc review worker",
     "forbidden-flag": "model, reasoning, effort, variant and completion-delivery are sealed by the profile and route; remove the flag",
+    "explicit-jobs-outside-parent-registry": "drop --jobs: an interactive Claude parent's completion hook trusts only the inherited "
+                                             "AGENT_DISPATCH_JOBS (or the installed canonical registry), so an owner started into another "
+                                             "registry could never wake this session",
 }
 
 
@@ -441,7 +444,27 @@ def _authoritative_jobs(values, env):
         if explicit and _resolved_path(explicit) != _resolved_path(inherited):
             raise OwnerError("managed-parent-registry-immutable")
         return inherited
+    if explicit and _caller_harness(env) == "claude":
+        # An interactive Claude parent's asyncRewake hook trusts exactly one
+        # registry -- the inherited `AGENT_DISPATCH_JOBS`, else the installed
+        # canonical one -- and never a file a receipt names. An owner started
+        # into any other registry would be sealed `claude-parent-runtime` and
+        # then never wake its parent (rewake review R3 M1), so the selector
+        # refuses before spawn instead of the hook refusing after it.
+        trusted = inherited if "AGENT_DISPATCH_JOBS" in env else _canonical_jobs()
+        if not trusted or _resolved_path(explicit) != _resolved_path(trusted):
+            raise OwnerError("explicit-jobs-outside-parent-registry")
     return explicit or inherited
+
+
+def _canonical_jobs():
+    """The installed harness's own registry path, or "" when it cannot be
+    resolved (the caller then refuses rather than guessing)."""
+    try:
+        from dispatch_contract import resolve_agent_home, resolve_dispatch_state_root
+        return str(resolve_dispatch_state_root(resolve_agent_home(), None) / "jobs.log")
+    except Exception:  # noqa: BLE001 -- absence beats a guessed registry
+        return ""
 
 
 def _audit(

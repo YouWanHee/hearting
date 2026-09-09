@@ -573,6 +573,31 @@ class DispatchOwnerTests(unittest.TestCase):
         )
         self.assertEqual(selected, str(canonical))
 
+    def test_interactive_claude_parent_may_not_start_into_another_registry(self):
+        # rewake review R3 M1: the parent's asyncRewake hook trusts one registry;
+        # an explicit --jobs elsewhere is refused before spawn, typed and hinted.
+        canonical = self.home / "canonical" / "jobs.log"
+        canonical.parent.mkdir(exist_ok=True)
+        canonical.touch()
+        other = self.home / "elsewhere.log"
+        other.touch()
+        claude = {"AGENT_DISPATCH_CALLER_HARNESS": "claude", "AGENT_DISPATCH_JOBS": str(canonical)}
+        self.assertEqual(OWNER._authoritative_jobs({"--jobs": str(canonical)}, claude), str(canonical))
+        self.assertEqual(OWNER._authoritative_jobs({}, claude), str(canonical))
+        with self.assertRaises(OWNER.OwnerError) as refused:
+            OWNER._authoritative_jobs({"--jobs": str(other)}, claude)
+        self.assertEqual(str(refused.exception), "explicit-jobs-outside-parent-registry")
+        self.assertIn("AGENT_DISPATCH_JOBS", OWNER.hint_for("explicit-jobs-outside-parent-registry"))
+        # no inherited registry: only the installed canonical one is accepted
+        with mock.patch.object(OWNER, "_canonical_jobs", return_value=str(canonical)):
+            self.assertEqual(OWNER._authoritative_jobs({"--jobs": str(canonical)},
+                                                       {"AGENT_DISPATCH_CALLER_HARNESS": "claude"}), str(canonical))
+            with self.assertRaises(OWNER.OwnerError):
+                OWNER._authoritative_jobs({"--jobs": str(other)}, {"AGENT_DISPATCH_CALLER_HARNESS": "claude"})
+        # an unmanaged codex caller keeps the previous behaviour
+        self.assertEqual(OWNER._authoritative_jobs({"--jobs": str(other)},
+                                                   {"AGENT_DISPATCH_CALLER_HARNESS": "codex"}), str(other))
+
     def test_no_eligible_candidate_fails_without_wrapper_or_process(self):
         stamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         self.jobs.write_text(
