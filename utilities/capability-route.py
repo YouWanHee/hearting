@@ -13,6 +13,7 @@ VALID_AFFINITY = DEFAULTS.AFFINITY_VALUES | {"unspecified"}
 sys.path.insert(0, str(ROOT/"utilities"))
 import artifact_locator as ARTIFACT_LOCATOR
 import route_identity as ROUTE_IDENTITY
+import dispatch_runtime_support as RUNTIME_SUPPORT
 import dispatch_terminal_commit
 import model_profile as PROFILE
 import review_round_cap as REVIEW_ROUND_CAP
@@ -2101,6 +2102,42 @@ def _seal_small_work_confirmation():
     return DEFAULTS.query_small_work_confirmation(cfg)
 
 
+def _seal_terminal_commit_support(validation_basis):
+    """PRD §13.53.2: seal SD-120/121 activation as *checked support*.
+
+    Activation is never an owner-remembered switch. The route declares support
+    only when the runtime root it is bound to actually publishes the whole
+    contract -- producer binding, terminal transaction, claim fence, exact
+    finalize, the supervisor gate, and the registered lock-order table -- and
+    the operator has not disabled it. Hash agreement alone can never open it,
+    which is exactly the D-2 regression §13.36.6 rejected.
+
+    Fail-closed: any unreadable root, missing surface, unparsable config or
+    unexpected error yields `False`. The Claude adapter remains the only
+    consumer of the flag, so declaring support claims nothing about Codex or
+    OpenCode parity (§13.36.4).
+    """
+    try:
+        config_path = DEFAULTS.default_config_path()
+        if os.path.exists(config_path):
+            try:
+                config = DEFAULTS.load_and_validate(config_path, DEFAULTS.default_topology_path())
+            except (DEFAULTS.DefaultsConfigError, OSError, json.JSONDecodeError):
+                # A config that exists but does not validate is *not* the same
+                # as no config. Falling back to `None` here would discard an
+                # operator's `off` whenever some unrelated key in the same file
+                # was stale or misspelled -- the switch would be ignored exactly
+                # when the file is damaged, which is when it is most likely to
+                # have been reached for. Refuse instead.
+                return False
+        else:
+            config = None
+        verdict = RUNTIME_SUPPORT.terminal_commit_support(
+            (validation_basis or {}).get("runtime_root"), config)
+        return bool(verdict.get("supported"))
+    except Exception:
+        return False
+
 def _validation_basis():
     """Seal which install root produced `registry_digest`/`unit_catalog_digest`.
 
@@ -2633,6 +2670,7 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
       "ordinary":_continuation_ordinary,
       "limit":_continuation_ordinary+TERMINAL_RESERVE_DEFAULT,
     }
+    validation_basis=_validation_basis()
     payload={
       "schema_version":ROUTE_SCHEMA_VERSION,"capability":capability,"capability_mode":capability_mode,
       "requested_intensity":requested_intensity,"effective_intensity":effective,
@@ -2671,16 +2709,16 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
       "registered_headless_candidates":registered_headless_candidates,
       "registered_headless_policy":"serial-attempt" if effective=="quick" else None,
       "unit_catalog_digest":unit_catalog_digest(),
-      "validation_basis":_validation_basis(),
+      "validation_basis":validation_basis,
       "launch_compatibility_tuple":{
           "contract_version":LAUNCH_COMPATIBILITY_TUPLE_VERSION,
           **launch_compatibility_tuple(artifact_root=artifact,cwd=cwd),
       },
       "advance_generation":0,
-      "runtime_support":{"terminal_commit":False,
-                         "terminal_commit_contract":"terminal_commit_v1",
-                         "terminal_handoff_contract":"terminal_handoff_claim_v1",
-                         "producer_binding_contract":"producer_binding_v1"}}
+      "runtime_support":{"terminal_commit":_seal_terminal_commit_support(validation_basis),
+                         "terminal_commit_contract":RUNTIME_SUPPORT.TERMINAL_COMMIT_CONTRACT,
+                         "terminal_handoff_contract":RUNTIME_SUPPORT.TERMINAL_HANDOFF_CONTRACT,
+                         "producer_binding_contract":RUNTIME_SUPPORT.PRODUCER_BINDING_CONTRACT}}
     payload.update(slug_fields)
     if checked_dispatch is not None:
         payload["dispatch_evidence_scope_version"]=DISPATCH_EVIDENCE_SCOPE_VERSION

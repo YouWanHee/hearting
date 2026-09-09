@@ -23,6 +23,7 @@ import time
 import artifact_identity as I
 import artifact_manifest as M
 import artifact_producer as P
+import dispatch_lock_order
 
 MAX_BYTES = 16 * 1024 * 1024
 MAX_JSON = 64 * 1024 * 1024
@@ -843,8 +844,14 @@ def admission_lock(tree, root):
                 os.close(candidate)
         require(time.monotonic() < deadline, 'admission-busy', code=75)
         time.sleep(0.05)
+    # This is the *same* lock file as `artifact_admission._acquire_lock`
+    # (`.runtime/artifact-admission/v1/lock.flock`), so it declares the same
+    # rank against the canonical lock-order table -- otherwise the table would
+    # constrain only the writers that opted in, and this path could take the
+    # producer mutex out of order without anything noticing.
     try:
-        yield
+        with dispatch_lock_order.acquired("producer-admission"):
+            yield
     finally:
         try:
             # 같은 inode만 지운다. successor/경로 drift는 보존한다.
