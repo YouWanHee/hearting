@@ -116,6 +116,12 @@ def parse_catalog(cfg: dict[str, str]) -> list[tuple[str, str]]:
         if token.count(":") != 1:
             raise SystemExit(f"malformed CFG_NATIVE_AGENT_CATALOG entry: {token!r}")
         name, profile = token.split(":", 1)
+        if profile == "top":
+            # A native subagent can never run the main-session-only model
+            # (the admission hook refuses it at every spawn), so a catalog
+            # entry pinning it would only generate a definition that always
+            # fails (top review m4).
+            raise SystemExit(f"CFG_NATIVE_AGENT_CATALOG entry {token!r}: top is not a native agent profile")
         entries.append((name, profile))
     if not entries:
         raise SystemExit("CFG_NATIVE_AGENT_CATALOG is empty or missing")

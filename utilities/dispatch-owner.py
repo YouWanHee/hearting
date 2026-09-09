@@ -92,7 +92,10 @@ _HINTS = {
                              "(see eligibility.* and capacity_headroom.* above; utilities/usage-check.sh --harness all)",
     "exactly-one-action-required": "pass exactly one of --dry-run | --register | --start",
     "owner-tuple-required": "the launchable tuple is --dispatch-depth 1 --worker-type owner|review",
-    "invalid-model-profile": "--model-profile deep|balanced-deep|balanced|light|top",
+    "invalid-model-profile": "--model-profile deep|balanced-deep|balanced|light (top only from a route that seals it)",
+    "profile-top-route-required": "drop --model-profile top: the top exception profile is sealed by a route "
+                                  "(compose/compile --profile-demands '{\"__owner__\": …}' --explicit-profiles "
+                                  "'{\"__owner__\": \"top\"}') and reaches the owner through --route-evidence only",
     "review-worker-unit-required": "--worker-type review needs --unit <catalog persona from roles/units/>",
     "review-worker-route-evidence-unsupported": "a route node's reviewer is launched by stage dispatch; drop --route-evidence for an ad-hoc review worker",
     "forbidden-flag": "model, reasoning, effort, variant and completion-delivery are sealed by the profile and route; remove the flag",
@@ -394,6 +397,11 @@ def _parse(argv):
         raise OwnerError("review-output-owner-forbidden")
     if values["--model-profile"] not in {"deep", "balanced-deep", "balanced", "light", "top"}:
         raise OwnerError("invalid-model-profile")
+    if values["--model-profile"] == "top" and (not route_evidence or "--model-profile" not in derived):
+        # The exception profile is a route's decision (a full demand sealed by
+        # compose/compile), never a flag's: an explicit `--model-profile top`
+        # -- with or without a route -- is refused (top review B1).
+        raise OwnerError("profile-top-route-required")
     # Equal-form required options are forwarded unchanged; split-form options
     # were appended above.  Selector-only --adapter/--route-evidence never
     # cross the boundary.

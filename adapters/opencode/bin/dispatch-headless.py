@@ -106,8 +106,11 @@ from stage_session_runtime import (  # noqa: E402
     metadata as stage_session_metadata,
     prompt_fragment as stage_session_prompt,
 )
+from model_config import ModelConfigError, resolve_config  # noqa: E402
 from model_profile import (  # noqa: E402
+    TOP_PROFILE,
     ModelProfileError,
+    require_top_route,
     resolve_runtime_profile,
     validate_registered_profile,
 )
@@ -380,6 +383,18 @@ def role_map(role: str) -> dict[str, str]:
     return fields
 
 
+def _model_config_state() -> tuple[str, str]:
+    """Which models.conf this launch resolved (`user` or `shipped`) and why --
+    on the receipt so a user copy silently replaced by the shipped file is
+    visible (top review B2)."""
+
+    try:
+        _values, receipt = resolve_config("opencode", source_root=ROOT)
+    except ModelConfigError as exc:
+        return "unavailable", str(exc)[:80]
+    return receipt.source, receipt.reason
+
+
 def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
     try:
         validate_registered_profile(
@@ -390,6 +405,14 @@ def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
         )
     except ModelProfileError as exc:
         raise ModelSelectionError("invalid-dispatch-model-profile", str(exc)) from exc
+    try:
+        binding = getattr(args, "owner_route_binding", None)
+        require_top_route(
+            getattr(args, "route_file", None) or getattr(binding, "route_file", None),
+            profile=args.model_profile or "",
+        )
+    except ModelProfileError as exc:
+        raise ModelSelectionError(exc.reason, str(exc)) from exc
     if args.inherit_model_settings:
         if args.model_profile or args.model_role or args.model or args.variant:
             raise ModelSelectionError(
@@ -2102,6 +2125,8 @@ def main(argv: list[str]) -> int:
     print(f"model_role={settings['role']}")
     print(f"model_profile={settings['profile']}")
     print(f"model_tier={settings['tier']}")
+    print(f"model_config_source={_model_config_state()[0]}")
+    print(f"model_config_reason={_model_config_state()[1]}")
     print(f"profile_granularity={settings['granularity']}")
     for key, value in sorted(getattr(args, "profile_selection_receipt", {}).items()):
         print(f"{key}={value}")

@@ -4,8 +4,8 @@
 
 `deep maker`, `deep reviewer`, `deep editor`, and `deep orchestrator` map to
 `opus`/xhigh (the shipped deep tier equals the user's runtime mapping, 2026-09-09;
-`fable` is main-session-only — reachable from registered dispatch only through the
-sealed `top` exception profile on a dispatch-depth-1 owner or review worker — and
+`fable` is main-session-only — reachable from registered dispatch only through a
+route that sealed the `top` exception profile for its dispatch-depth-1 owner — and
 the capacity cascade is `opus -> sonnet`, which `top` never enters). Retained `orchestrator` is the balanced mechanical role and maps to
 `sonnet`/medium; it is not an alias for the standard+ dispatch-depth-1 conductor. Fast
 portable roles map to `sonnet`/medium. (Both follow `CFG_TIER_LIGHT_EFFORT`; the

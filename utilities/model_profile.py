@@ -21,7 +21,11 @@ PORTABLE_PROFILES = ("deep", "balanced-deep", "balanced", "light", "mini")
 TOP_PROFILE = "top"
 EXCEPTION_PROFILES = (TOP_PROFILE,)
 KNOWN_PROFILES = PORTABLE_PROFILES + EXCEPTION_PROFILES
-TOP_WORKER_TYPES = frozenset({"owner", "review"})
+# Only an owner can carry `top`: it is the one worker a route seals a profile
+# for. A review worker has no route (a route node's reviewer is a depth-2
+# stage worker, where `top` is refused), so it cannot carry the judgment
+# record the exception requires (top review B1).
+TOP_WORKER_TYPES = frozenset({"owner"})
 RESOLVER_VERSION = "profile-demand/v1"
 DEMAND_SCHEMA_VERSION = 1
 DEMAND_JUDGMENTS = ("predetermined", "important", "difficult-uncertain")
@@ -304,7 +308,7 @@ def validate_registered_profile(
     ):
         raise ModelProfileError(
             "the top exception profile is limited to a registered dispatch-depth-1 "
-            "owner or review worker", "profile-top-depth-forbidden")
+            "owner", "profile-top-depth-forbidden")
     if (
         profile == "mini"
         and registered_worker
@@ -314,6 +318,27 @@ def validate_registered_profile(
         raise ModelProfileError(
             "mini is reserved for lifecycle or explicitly micro-semantic helpers"
         )
+
+
+def require_top_route(route_file, *, profile: str) -> None:
+    """The exception profile is a route's decision: a wrapper resolving `top`
+    must hold the route that sealed it (`owner_model_profile == "top"`).
+    Refuses typed when there is no route or the route sealed something else
+    (top review B1: without this, `--model-profile top` on a route-less
+    depth-1 owner resolved the top model with no demand recorded anywhere)."""
+
+    if profile != TOP_PROFILE:
+        return
+    if not route_file:
+        raise ModelProfileError(
+            "the top exception profile requires the route that sealed it", "profile-top-route-required")
+    try:
+        route = json.loads(Path(route_file).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ModelProfileError(f"top route unreadable: {exc}", "profile-top-route-required") from exc
+    if not isinstance(route, dict) or route.get("owner_model_profile") != TOP_PROFILE:
+        raise ModelProfileError(
+            "the route did not seal the top exception profile for its owner", "profile-top-route-mismatch")
 
 
 def selection_receipt(args):

@@ -37,7 +37,14 @@ def selection(**values):
         dispatch_depth=values.get("dispatch_depth", 1),
         worker_type=values.get("worker_type", "owner"),
         capacity_retry=values.get("capacity_retry", 0),
+        route_file=values.get("route_file"),
     )
+
+
+def top_route(tmp: Path, owner_profile: str = "top") -> str:
+    path = tmp / f"route-{owner_profile}.json"
+    path.write_text('{"route_id": "rt-top-fixture", "owner_model_profile": "%s", "nodes": []}' % owner_profile, encoding="utf-8")
+    return str(path)
 
 
 SHIPPED_CONF = ROOT / "adapters" / "claude" / "config" / "models.conf"
@@ -250,26 +257,46 @@ class ClaudeDispatchModelEligibilityTest(unittest.TestCase):
 
 
 class TopExceptionProfileTest(ClaudeDispatchModelEligibilityTest):
+    def setUp(self):
+        super().setUp()
+        self.tmp = Path(tempfile.mkdtemp())
+        self.route = top_route(self.tmp)
+
     def test_the_sealed_top_profile_is_the_one_door_to_the_main_only_model(self):
         policy = shipped_policy()
-        result = WRAPPER.resolve_model_settings(selection(profile="top"))
+        result = WRAPPER.resolve_model_settings(selection(profile="top", route_file=self.route))
         self.assertEqual((result["model"], result["effort"], result["source"], result["tier"]),
                          (policy["CFG_TIER_TOP_MODEL"], policy["CFG_TIER_TOP_EFFORT"], "profile-top", "top"))
         self.assertTrue(WRAPPER._main_session_only_model(result["model"]))
 
-    def test_a_capacity_override_under_top_still_faces_the_gate(self):
+    def test_top_requires_the_route_that_sealed_it(self):
+        # top review B1: a route-less depth-1 owner resolved fable/max with no
+        # demand recorded anywhere; the wrapper now requires the sealing route.
         with self.assertRaises(WRAPPER.ModelSelectionError) as refused:
-            WRAPPER.resolve_model_settings(selection(profile="top", model="claude-fable-5", effort="max", capacity_retry=1))
-        self.assertEqual(refused.exception.reason, "headless-main-session-only-model")
-        # an eligible override on a checked retry keeps working, and is not "profile-top"
-        result = WRAPPER.resolve_model_settings(selection(profile="top", model="opus", effort="xhigh", capacity_retry=1))
-        self.assertEqual((result["model"], result["source"]), ("opus", "profile+capacity"))
+            WRAPPER.resolve_model_settings(selection(profile="top"))
+        self.assertEqual(refused.exception.reason, "profile-top-route-required")
+        with self.assertRaises(WRAPPER.ModelSelectionError) as mismatch:
+            WRAPPER.resolve_model_settings(selection(profile="top", route_file=top_route(self.tmp, "balanced-deep")))
+        self.assertEqual(mismatch.exception.reason, "profile-top-route-mismatch")
+        # the owner route binding (standard+) counts as the route too
+        binding = SimpleNamespace(route_file=self.route)
+        args = selection(profile="top"); args.owner_route_binding = binding
+        self.assertEqual(WRAPPER.resolve_model_settings(args)["source"], "profile-top")
+        # other profiles need no route
+        self.assertEqual(WRAPPER.resolve_model_settings(selection(profile="deep"))["source"], "profile")
 
-    def test_top_is_refused_below_dispatch_depth_one(self):
+    def test_no_model_override_runs_under_the_top_label(self):
+        # top review m1: no cascade in or out, capacity retry included
+        for model, effort in (("claude-fable-5", "max"), ("opus", "xhigh")):
+            with self.subTest(model=model), self.assertRaises(WRAPPER.ModelSelectionError) as refused:
+                WRAPPER.resolve_model_settings(selection(profile="top", route_file=self.route, model=model, effort=effort, capacity_retry=1))
+            self.assertEqual(refused.exception.reason, "profile-top-override-forbidden")
+
+    def test_top_is_refused_below_dispatch_depth_one_and_for_review_workers(self):
         for kwargs in (dict(dispatch_depth=2, worker_type="stage"), dict(dispatch_depth=2, worker_type="review"),
-                       dict(worker_type="support")):
+                       dict(worker_type="support"), dict(worker_type="review")):
             with self.subTest(**kwargs), self.assertRaises(WRAPPER.ModelSelectionError) as refused:
-                WRAPPER.resolve_model_settings(selection(profile="top", **kwargs))
+                WRAPPER.resolve_model_settings(selection(profile="top", route_file=self.route, **kwargs))
             self.assertEqual(refused.exception.reason, "invalid-dispatch-model-profile")
 
     def test_explicit_and_role_selection_of_the_top_model_stay_refused(self):

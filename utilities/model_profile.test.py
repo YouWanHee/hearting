@@ -445,16 +445,34 @@ class TopExceptionProfileTest(unittest.TestCase):
         with self.assertRaises(PROFILE.ModelProfileError):
             PROFILE.resolve_profile_demand(None, explicit_profile="top", legacy=True, existing_versioned_stage=True)
 
-    def test_top_is_limited_to_registered_depth_one_owner_or_review(self):
-        for worker_type in ("owner", "review"):
-            PROFILE.validate_registered_profile("top", registered_worker=True, dispatch_depth=1, worker_type=worker_type)
+    def test_top_is_limited_to_a_registered_depth_one_owner(self):
+        PROFILE.validate_registered_profile("top", registered_worker=True, dispatch_depth=1, worker_type="owner")
         for kwargs in (dict(registered_worker=True, dispatch_depth=2, worker_type="stage"),
                        dict(registered_worker=True, dispatch_depth=2, worker_type="review"),
+                       dict(registered_worker=True, dispatch_depth=1, worker_type="review"),
                        dict(registered_worker=False, dispatch_depth=1, worker_type="owner"),
                        dict(registered_worker=True, dispatch_depth=1, worker_type="support")):
             with self.subTest(**kwargs), self.assertRaises(PROFILE.ModelProfileError) as refused:
                 PROFILE.validate_registered_profile("top", **kwargs)
             self.assertEqual(refused.exception.reason, "profile-top-depth-forbidden")
+
+    def test_top_requires_the_route_that_sealed_it(self):
+        import tempfile
+        tmp = Path(tempfile.mkdtemp())
+        PROFILE.require_top_route(None, profile="deep")  # other profiles need no route
+        with self.assertRaises(PROFILE.ModelProfileError) as refused:
+            PROFILE.require_top_route(None, profile="top")
+        self.assertEqual(refused.exception.reason, "profile-top-route-required")
+        route = tmp / "route.json"
+        route.write_text('{"owner_model_profile": "balanced-deep"}', encoding="utf-8")
+        with self.assertRaises(PROFILE.ModelProfileError) as mismatch:
+            PROFILE.require_top_route(str(route), profile="top")
+        self.assertEqual(mismatch.exception.reason, "profile-top-route-mismatch")
+        route.write_text('{"owner_model_profile": "top"}', encoding="utf-8")
+        PROFILE.require_top_route(str(route), profile="top")
+        with self.assertRaises(PROFILE.ModelProfileError) as unreadable:
+            PROFILE.require_top_route(str(tmp / "absent.json"), profile="top")
+        self.assertEqual(unreadable.exception.reason, "profile-top-route-required")
 
 
 if __name__ == "__main__":

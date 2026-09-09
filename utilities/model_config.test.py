@@ -225,10 +225,37 @@ class TopProfileOptionalityTest(unittest.TestCase):
         self.assertEqual((receipt.source, receipt.reason), ("user", "user-valid"))
         self.assertEqual(receipt.unreferenced_tier_keys, "CFG_TIER_TOP_EFFORT,CFG_TIER_TOP_MODEL")
         self.assertNotIn("CFG_MODEL_PROFILE_TOP", values)  # never derived
-        # a copy that opts in without declaring the tier is incomplete
+        # a copy that opts in without declaring the tier stays selected whole-file,
+        # and resolving `top` on it refuses typed instead (top review B2 (iii))
         user.write_text(legacy_user + "CFG_MODEL_PROFILE_TOP=top:max\n", encoding="utf-8")
-        _values, receipt = config.resolve_config("claude", runtime=home, source_root=root)
-        self.assertEqual(receipt.reason, "user-incomplete")
+        values, receipt = config.resolve_config("claude", runtime=home, source_root=root)
+        self.assertEqual((receipt.source, receipt.reason), ("user", "user-valid"))
+        from model_profile import ModelProfileError, resolve_profile_values
+        with self.assertRaises(ModelProfileError) as refused:
+            resolve_profile_values("claude", values, "top")
+        self.assertEqual(refused.exception.reason, "profile-top-undeclared")
+
+    def test_a_codex_copy_without_the_main_only_key_stays_selected_whole_file(self):
+        # top review B2: a policy key a release added must not turn an older
+        # complete codex copy into `user-incomplete` (a silent whole-file
+        # replacement of the user's policy).
+        shipped = BASE + 'CFG_MAIN_SESSION_ONLY_MODELS="shipped-top"\n'
+        legacy_user = BASE.replace("CFG_TIER_DEEP_MODEL=", "CFG_TIER_DEEP_MODEL=user-custom-") if "CFG_TIER_DEEP_MODEL=" in BASE else BASE
+        root = self.make_root(adapter="codex", shipped=shipped)
+        home = root / "home"
+        user = home / "agent-config" / "models.conf"
+        user.parent.mkdir(parents=True)
+        user.write_text(legacy_user, encoding="utf-8")
+        values, receipt = config.resolve_config("codex", runtime=home, source_root=root)
+        self.assertEqual((receipt.source, receipt.reason), ("user", "user-valid"))
+        self.assertNotIn("CFG_MAIN_SESSION_ONLY_MODELS", values)   # absent, never merged
+        # the same omission on claude is still incomplete (the key is required there)
+        root2 = self.make_root(adapter="claude", shipped=shipped)
+        home2 = root2 / "home"
+        (home2 / "agent-config").mkdir(parents=True)
+        (home2 / "agent-config" / "models.conf").write_text(legacy_user, encoding="utf-8")
+        _v, receipt2 = config.resolve_config("claude", runtime=home2, source_root=root2)
+        self.assertEqual(receipt2.reason, "user-incomplete")
 
     def test_restricted_model_matches_whole_ids_and_alias_tokens(self):
         self.assertTrue(config.restricted_model("claude-fable-5-1", "fable"))

@@ -1174,6 +1174,22 @@ class TopProfileOwnerTupleTest(unittest.TestCase):
         path.write_text(json.dumps(payload), encoding="utf-8")
         return str(path)
 
+    def test_top_reaches_the_wrapper_only_as_the_routes_derivation(self):
+        # top review B1: the flag is never the door
+        _, values, forwarded, _, derived = OWNER._parse(
+            ["--start", "--route-evidence", self._route(), "--prompt-file", "/p.md"])
+        self.assertEqual(values["--model-profile"], "top")
+        self.assertIn("--model-profile", derived)
+        for argv in (["--start", "--route-evidence", self._route(), "--model-profile", "top", "--prompt-file", "/p.md"],
+                     ["--start", "--worktree", "/w", "--slug", "s", "--capability", "autopilot-code",
+                      "--capability-mode", "audit", "--qa", "standard", "--intensity", "standard",
+                      "--dispatch-depth", "1", "--worker-type", "owner", "--owner", "autopilot-code",
+                      "--assigned-contract", "autopilot-code", "--model-profile", "top", "--prompt-file", "/p.md"]):
+            with self.subTest(argv=argv[:4]), self.assertRaises(OWNER.OwnerError) as refused:
+                OWNER._parse(argv)
+            self.assertEqual(str(refused.exception), "profile-top-route-required")
+        self.assertIn("--route-evidence", OWNER.hint_for("profile-top-route-required"))
+
     def test_an_unknown_profile_is_still_refused_and_the_hint_names_top(self):
         with self.assertRaises(OWNER.OwnerError) as refused:
             OWNER._parse(["--start", "--route-evidence", self._route(owner_model_profile="summit"),
