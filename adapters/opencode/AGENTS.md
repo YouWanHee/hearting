@@ -91,6 +91,10 @@ tuple in `core/OPERATIONS.md`. Keep `capability_mode` separate from a non-owner
 `_kernel/owner` with no worker mode. `worker_role` and legacy `mode` are
 read-only metadata, not bootstrap identity. Monitor
 `preflight.sh liveness [jobs.log]`; harvest via `preflight.sh harvest`.
+For an attempt you launched, the receipt outranks that general monitoring:
+`parent_next=end-turn` yields with no wait, poll, or liveness loop for it, and
+`parent_next=bounded-wait` runs its printed `parent_next_command` once. An
+absent directive is not `end-turn`: never filter launch stdout.
 Conductors use `dispatch-chain` for ordinary checked dispatch-depth-2 nodes. A sealed
 2–4-way `parallel_group` uses one `dispatch-batch --parallel-group` call;
 OpenCode is eligible for that registered standard+ dispatch-depth-2 path —

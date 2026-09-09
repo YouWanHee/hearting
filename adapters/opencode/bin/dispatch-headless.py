@@ -65,6 +65,7 @@ from dispatch_contract import (  # noqa: E402
     validate_nested_eligibility,
     wait_governor_reservation_claim,
 )
+from parent_next_directive import receipt_lines as parent_next_receipt_lines  # noqa: E402
 from dispatch_summary import launch_summary_owner  # noqa: E402
 from artifact_producer import (  # noqa: E402
     ProducerError,
@@ -2134,16 +2135,21 @@ def main(argv: list[str]) -> int:
     )
     print(f"registered={1 if args.attempt_claimed else 0}")
     print(f"started={1 if action == 'start' and args.attempt_claimed else 0}")
-    print(
-        "child_spawned="
-        + str(
-            int(
-                action == "start"
-                and bool(args.attempt_claimed)
-                and bool(getattr(args, "child_pid", None))
-            )
-        )
+    spawned_child = int(
+        action == "start"
+        and bool(args.attempt_claimed)
+        and bool(getattr(args, "child_pid", None))
     )
+    print(f"child_spawned={spawned_child}")
+    if spawned_child:
+        # The receipt states the parent's next action itself, so a parent does
+        # not have to carry the completion-delivery taxonomy in its own
+        # instructions (`utilities/parent_next_directive.py`).
+        for directive_line in parent_next_receipt_lines(
+            getattr(args, "parent_completion_delivery", ""), args.attempt_id,
+            agent_home=args.agent_home,
+        ):
+            print(directive_line)
     print(f"child_pid={getattr(args, 'child_pid', None) or '-'}")
     print(f"child_pid_start={getattr(args, 'child_pid_start', None) or '-'}")
     print(f"launch_heartbeat={getattr(args, 'launch_heartbeat', 'not-started')}")

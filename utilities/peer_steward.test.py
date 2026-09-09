@@ -500,6 +500,19 @@ class _WatchMixin(_TmpRootMixin):
                 out[key] = value
         return out
 
+    def _directive(self, stdout):
+        """The `parent_next*` fields, read from the directive line only.
+
+        `parent_next_command` holds spaces, so it is the rest of its own line.
+        """
+        for line in stdout.splitlines():
+            if line.startswith("parent_next="):
+                head, _, command = line.partition("parent_next_command=")
+                fields = self._fields(head)
+                fields["parent_next_command"] = command.strip()
+                return fields
+        return {}
+
     def _release(self):
         with open(self.fifo, "w") as fh:
             fh.write("go")
@@ -533,6 +546,54 @@ class _WatchMixin(_TmpRootMixin):
 
 class WatchArmTest(_WatchMixin, unittest.TestCase):
     """A56-1."""
+
+    def test_a_hook_armed_watch_tells_the_caller_to_end_the_turn(self):
+        """Review round 2/3, M-B: the contract function was locked, its wiring
+        was not -- reverting either call site passed every suite."""
+        proc = self._run("watch", "peer-a", "--wake", "hook", env=self._env("idle"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        directive = self._directive(proc.stdout)
+        self.assertEqual(directive.get("parent_next"), "end-turn", proc.stdout)
+        self.assertEqual(directive.get("parent_next_reason"), "carrier-steward-watch")
+        self.assertEqual(directive.get("parent_next_command"), "-")
+
+    def test_a_watch_with_no_carrier_tells_the_caller_to_wait_with_a_bound(self):
+        proc = self._run("watch", "peer-a", "--wake", "none", env=self._env("idle"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        directive = self._directive(proc.stdout)
+        self.assertEqual(directive.get("parent_next"), "bounded-wait", proc.stdout)
+        self.assertEqual(directive.get("parent_next_reason"), "steward-wake-none")
+        command = directive.get("parent_next_command", "")
+        self.assertIn("peer-steward.py join ", command)
+        self.assertIn("--timeout ", command)
+        self.assertNotIn("dispatch-wait", command)
+
+    def test_no_line_the_hook_cannot_arm_from_ever_says_end_turn(self):
+        """The dedupe hit and `rearm` both print from the session, not `watch`.
+
+        Answering `end-turn` there is worst exactly when it is reached: a caller
+        re-runs `watch`/`rearm` *because* it doubts the first arm carried.
+        """
+        first = self._run("watch", "peer-a", "--wake", "hook", env=self._env("held"))
+        self.assertEqual(first.returncode, 0, first.stderr)
+        watch_id = self._fields(first.stdout.splitlines()[0])["watch_id"]
+        self._wait_for_lock(watch_id)
+        for argv in (
+            ("watch", "peer-a", "--wake", "hook"),  # dedupe -> already-armed
+            ("rearm", watch_id),                    # live watcher -> alive
+        ):
+            with self.subTest(argv=argv):
+                proc = self._run(*argv, env=self._env("held"))
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                state = self._fields(proc.stdout.splitlines()[0]).get("state")
+                self.assertIn(state, {"already-armed", "alive"}, proc.stdout)
+                directive = self._directive(proc.stdout)
+                self.assertEqual(
+                    directive.get("parent_next"), "bounded-wait", proc.stdout
+                )
+                self.assertIn("--timeout ", directive.get("parent_next_command", ""))
+        self._release()
+        self._wait_for_receipt(watch_id)
 
     def test_arm_emits_typed_line_immutable_record_and_one_ledger_row(self):
         proc = self._run("watch", "peer-a", "--wake", "hook", env=self._env("held"))
@@ -807,6 +868,33 @@ class StatusRearmTest(_WatchMixin, unittest.TestCase):
         ack = json.loads((self.watch_root / f"{fields['watch_id']}.ack.json").read_text())
         self.assertEqual(ack["carrier"], "claude-async-rewake")
         self.assertEqual(ack["session_id"], "steward-1")
+
+    def test_a_restarted_watch_line_does_not_claim_the_hook_either(self):
+        """`state=rearmed` — the branch B1-a was originally raised about.
+
+        Review round 4 found the code correct here and nothing asserting it:
+        flipping this branch back to `arms_hook=True` passed all 68 tests.
+        """
+        dead = self._arm(target="peer-dead", mode="held")
+        os.kill(int(dead["pid"]), signal.SIGKILL)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and peer_steward._pid_identity_ok(
+            int(dead["pid"]), dead["pid_start"]
+        ):
+            time.sleep(0.02)
+        proc = self._run("rearm", dead["watch_id"], env=self._env("held"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        head = self._fields(proc.stdout.splitlines()[0])
+        self.assertEqual(head["state"], "rearmed", proc.stdout)
+        directive = self._directive(proc.stdout)
+        self.assertEqual(directive.get("parent_next"), "bounded-wait", proc.stdout)
+        self.assertEqual(
+            directive.get("parent_next_reason"), "steward-line-does-not-arm", proc.stdout
+        )
+        # The wait must join *the new watch*, never the dead one it replaced.
+        self.assertIn(f"join {head['watch_id']}", directive.get("parent_next_command", ""))
+        self.assertNotIn(dead["watch_id"], directive.get("parent_next_command", ""))
+        self._release()
 
     def test_rearm_only_replaces_a_dead_unreceipted_watch(self):
         done = self._arm(mode="idle")
