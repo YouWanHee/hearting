@@ -74,13 +74,14 @@ class ClaudeDispatchModelEligibilityTest(unittest.TestCase):
         for key in ("CLAUDE_MODEL_DEEP", "CLAUDE_EFFORT_DEEP"):
             os.environ.pop(key, None)
 
-    def test_shipped_default_has_no_main_session_only_model(self):
-        # 2026-09-08 user rule: shipped default == user runtime mapping. Fable is
-        # headless-eligible for the deep tier; nothing is main-session-only.
+    def test_shipped_default_reserves_the_top_model_for_the_main_session(self):
+        # 2026-09-09 user rule: shipped default == user runtime mapping. Fable is
+        # main-session-only; the deep tier runs the next model down at max effort.
         policy = shipped_policy()
-        self.assertEqual(policy["CFG_MAIN_SESSION_ONLY_MODELS"].split(), [])
-        self.assertEqual(policy["CFG_TIER_DEEP_MODEL"], "fable")
-        self.assertFalse(WRAPPER._main_session_only_model("claude-fable-5"))
+        self.assertEqual(policy["CFG_MAIN_SESSION_ONLY_MODELS"].split(), ["fable"])
+        self.assertEqual(policy["CFG_TIER_DEEP_MODEL"], "opus")
+        self.assertTrue(WRAPPER._main_session_only_model("claude-fable-5"))
+        self.assertFalse(WRAPPER._main_session_only_model(policy["CFG_TIER_DEEP_MODEL"]))
 
     def test_deep_role_resolves_to_config_deep_tier_and_is_dispatch_eligible(self):
         policy = shipped_policy()
@@ -90,13 +91,16 @@ class ClaudeDispatchModelEligibilityTest(unittest.TestCase):
         self.assertEqual(result["effort"], policy["CFG_TIER_DEEP_EFFORT"])
         self.assertFalse(WRAPPER._main_session_only_model(result["model"]))
 
-    def test_shipped_default_admits_explicit_fable_headless(self):
-        result = WRAPPER.resolve_model_settings(selection(model="claude-fable-5", effort="high"))
-        self.assertEqual((result["source"], result["model"], result["effort"]), ("explicit", "claude-fable-5", "high"))
+    def test_shipped_default_refuses_explicit_fable_headless(self):
+        with self.assertRaises(WRAPPER.ModelSelectionError) as refused:
+            WRAPPER.resolve_model_settings(selection(model="claude-fable-5", effort="high"))
+        self.assertEqual(refused.exception.reason, "headless-main-session-only-model")
 
     def test_explicit_and_role_override_of_a_main_only_model_are_rejected(self):
         # The rejection path stays live for any config that declares a main-only
-        # model, independent of the shipped default's (empty) list.
+        # model. The shipped default now names fable itself, so the second block
+        # below pins a different alias: the refusal follows the declared list, not
+        # a hardcoded model name.
         with mock.patch.object(WRAPPER, "_model_policy", side_effect=lambda: restricted_policy("fable")):
             with self.assertRaises(WRAPPER.ModelSelectionError) as explicit:
                 WRAPPER.resolve_model_settings(selection(model="claude-fable-5", effort="xhigh"))
@@ -105,6 +109,10 @@ class ClaudeDispatchModelEligibilityTest(unittest.TestCase):
                 with self.assertRaises(WRAPPER.ModelSelectionError) as mapped:
                     WRAPPER.resolve_model_settings(selection(role="deep maker"))
             self.assertEqual(mapped.exception.reason, "headless-main-session-only-model")
+        with mock.patch.object(WRAPPER, "_model_policy", side_effect=lambda: restricted_policy("sonnet")):
+            with self.assertRaises(WRAPPER.ModelSelectionError) as other_alias:
+                WRAPPER.resolve_model_settings(selection(model="sonnet", effort="high"))
+            self.assertEqual(other_alias.exception.reason, "headless-main-session-only-model")
 
     def test_inherited_headless_model_is_rejected_before_launch(self):
         with self.assertRaises(WRAPPER.ModelSelectionError) as inherited:
@@ -143,14 +151,20 @@ class ClaudeDispatchModelEligibilityTest(unittest.TestCase):
         )
 
     def test_legacy_complete_user_copy_keeps_its_main_only_policy(self):
-        # Review B1: a user copy seeded from the previous release (no balanced-deep
-        # tier keys, fable main-only) must stay selected whole-file after the
-        # upgrade instead of silently falling back to the shipped (empty) list.
+        # Review B1: a user copy seeded from a release before the balanced-deep
+        # tier existed must stay selected whole-file after the upgrade instead of
+        # falling back to the shipped file. Every rewrite below is counted, so a
+        # later shipped edit turns this fixture into a failure rather than a
+        # silent no-op that stops building a legacy file at all.
         legacy = SHIPPED_CONF.read_text(encoding="utf-8")
-        legacy = re.sub(r"^CFG_TIER_BALANCED_DEEP_(MODEL|EFFORT)=.*\n", "", legacy, flags=re.MULTILINE)
-        legacy = legacy.replace("CFG_MODEL_PROFILE_BALANCED_DEEP=balanced-deep:high", "CFG_MODEL_PROFILE_BALANCED_DEEP=deep:high")
-        legacy = legacy.replace("CFG_TIER_DEEP_FAILOVER=balanced-deep", "CFG_TIER_DEEP_FAILOVER=light")
-        legacy = re.sub(r"^CFG_MAIN_SESSION_ONLY_MODELS=.*$", 'CFG_MAIN_SESSION_ONLY_MODELS="fable"', legacy, count=1, flags=re.MULTILINE)
+        legacy, dropped = re.subn(r"^CFG_TIER_BALANCED_DEEP_(MODEL|EFFORT)=.*\n", "", legacy, flags=re.MULTILINE)
+        self.assertEqual(dropped, 2)
+        legacy, retargeted = re.subn(r"^CFG_MODEL_PROFILE_BALANCED_DEEP=.*$", "CFG_MODEL_PROFILE_BALANCED_DEEP=deep:high", legacy, count=1, flags=re.MULTILINE)
+        self.assertEqual(retargeted, 1)
+        legacy, failover = re.subn(r"^CFG_TIER_DEEP_FAILOVER=.*$", "CFG_TIER_DEEP_FAILOVER=light", legacy, count=1, flags=re.MULTILINE)
+        self.assertEqual(failover, 1)
+        legacy, main_only = re.subn(r"^CFG_MAIN_SESSION_ONLY_MODELS=.*$", 'CFG_MAIN_SESSION_ONLY_MODELS="fable"', legacy, count=1, flags=re.MULTILINE)
+        self.assertEqual(main_only, 1)
         self.assertNotIn("CFG_TIER_BALANCED_DEEP_MODEL", legacy)
         with tempfile.TemporaryDirectory() as tmp:
             runtime_home = Path(tmp) / "claude-home"
@@ -175,13 +189,15 @@ class ClaudeDispatchModelEligibilityTest(unittest.TestCase):
             subprocess.run(
                 ["git", "init", "-q", str(worktree)], check=True
             )
-            # A user runtime copy that declares fable main-only (selected whole-file
-            # over the shipped default): the CLI must still reject before any side effect.
+            # A user runtime copy that declares a model the SHIPPED file does not
+            # restrict (selected whole-file over the shipped default): rejecting
+            # that model proves the CLI reads the user copy, and it must reject
+            # before any side effect.
             runtime_home = root / "claude-home"
             (runtime_home / "agent-config").mkdir(parents=True)
             shipped_text = SHIPPED_CONF.read_text(encoding="utf-8")
             restricted_text = re.sub(
-                r'^CFG_MAIN_SESSION_ONLY_MODELS=.*$', 'CFG_MAIN_SESSION_ONLY_MODELS="fable"',
+                r'^CFG_MAIN_SESSION_ONLY_MODELS=.*$', 'CFG_MAIN_SESSION_ONLY_MODELS="fable sonnet"',
                 shipped_text, count=1, flags=re.MULTILINE,
             )
             self.assertNotEqual(restricted_text, shipped_text)
@@ -203,7 +219,7 @@ class ClaudeDispatchModelEligibilityTest(unittest.TestCase):
                     "--capability", "autopilot-code",
                     "--capability-mode", "dev",
                     "--qa", "standard",
-                    "--model", "claude-fable-5",
+                    "--model", "sonnet",
                     "--effort", "xhigh",
                     "--prompt-text", "must not launch",
                 ],

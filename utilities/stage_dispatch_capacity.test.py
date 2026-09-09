@@ -125,10 +125,10 @@ class CapacityTest(unittest.TestCase):
   claude=F.capacity_cascade("claude")
   self.assertEqual(claude,[d for d in declared if d[0] not in restricted])
   self.assertGreaterEqual(len(claude),2)
-  # 2026-09-08 shipped default == user runtime: the cascade head is the deep tier
-  # model itself (fable), nothing is main-session-only, and the walk is fable->opus->sonnet.
-  self.assertEqual(claude[0][0],conf["CFG_TIER_DEEP_MODEL"]);self.assertEqual(restricted,[])
-  self.assertEqual([m for m,_ in claude],["fable","opus","sonnet"])
+  # 2026-09-09 shipped default == user runtime: fable is main-session-only, so the
+  # cascade head is the deep tier model (opus) and the walk is opus->sonnet.
+  self.assertEqual(claude[0][0],conf["CFG_TIER_DEEP_MODEL"]);self.assertEqual(restricted,["fable"])
+  self.assertEqual([m for m,_ in claude],["opus","sonnet"])
   for i,(model,paired) in enumerate(claude):
    nxt=claude[i+1] if i+1<len(claude) else None
    self.assertEqual(F.capacity_cascade_next("claude",model),nxt)
@@ -137,8 +137,9 @@ class CapacityTest(unittest.TestCase):
    self.assertTrue(F.allowed_capacity_settings("claude",model,paired))
    self.assertFalse(F.allowed_capacity_settings("claude",model,"not-a-real-effort"))
  def test_main_only_model_never_enters_cascade_or_capacity_settings(self):
-  # A config that declares a main-only model keeps it out of the cascade and
-  # out of every capacity setting, whatever the shipped default says.
+  # A config that declares a main-only model keeps it out of the cascade and out
+  # of every capacity setting. The shipped default declares fable too, so the
+  # second block pins another alias: the filter reads the config, not a name.
   conf={**self.shipped_conf("claude"),"CFG_MAIN_SESSION_ONLY_MODELS":"fable"};self.pin_conf(conf)
   claude=F.capacity_cascade("claude");models=[m for m,_ in claude]
   self.assertNotIn("fable",models);self.assertEqual(models,["opus","sonnet"])
@@ -147,6 +148,10 @@ class CapacityTest(unittest.TestCase):
   self.assertFalse(F.allowed_capacity_settings("claude","fable","xhigh"))
   self.assertFalse(F.allowed_capacity_settings("claude","claude-fable-5","xhigh"))
   self.assertTrue(F.allowed_capacity_settings("claude",*claude[0]))
+  self.pin_conf({**self.shipped_conf("claude"),"CFG_MAIN_SESSION_ONLY_MODELS":"fable opus"})
+  narrowed=F.capacity_cascade("claude")
+  self.assertEqual([m for m,_ in narrowed],["sonnet"])
+  self.assertFalse(F.allowed_capacity_settings("claude","opus","xhigh"))
  def test_unset_capacity_model_derives_alternative_from_cascade(self):
   self.args.capacity_model=None  # no explicit alternative -> derive from config cascade
   cascade=F.capacity_cascade("codex")  # the exhausted model is the cascade head, whatever it is
@@ -155,12 +160,12 @@ class CapacityTest(unittest.TestCase):
        mock.patch.object(F.subprocess,"run",side_effect=self.fake_retry()):
    state,fields,_=F.capacity_retry(self.args,self.route,self.node,self.row,1,self.failed,[])
   self.assertEqual(state,"success");self.assertEqual(fields["model"],cascade[1][0])
- def fable_capacity_retry(self,expected):
+ def capacity_retry_from(self,failed_model,expected):
   self.args.capacity_model=None;self.args.capacity_effort=None
   self.row={**self.row,"child_harness":"claude"}
-  self.failed={"attempt_id":"att-initial0001","model":"claude-fable-5"}
+  self.failed={"attempt_id":"att-initial0001","model":failed_model}
   self.jobs.write_text("2026-07-16T00:00:00Z\tdone\t/r\t/w\ts\t"
-   "route_id=r,route_node=test,attempt_id=att-initial0001,model=claude-fable-5,"
+   f"route_id=r,route_node=test,attempt_id=att-initial0001,model={failed_model},"
    "child_harness=claude,note=dead-capacity\n")
   completed=subprocess.CompletedProcess([],0,stdout=f"check=ok\nmodel={expected[0]}\nearly_death=-\nduplicate_attempt=0\n",stderr="")
   with mock.patch.object(F,"wrapper_command",return_value=["fake"]) as command,\
@@ -168,17 +173,19 @@ class CapacityTest(unittest.TestCase):
    state,fields,_=F.capacity_retry(self.args,self.route,self.node,self.row,1,self.failed,[])
   self.assertEqual((state,fields["model"]),("success",expected[0]))
   self.assertEqual(command.call_args.args[6],expected)
- def test_fable_capacity_death_retries_on_the_next_cascade_model(self):
-  # shipped default: fable heads the cascade, so a fable capacity death walks to opus.
-  self.pin_conf(self.shipped_conf("claude"))
-  cascade=F.capacity_cascade("claude");self.assertEqual(cascade[0][0],"fable")
-  self.fable_capacity_retry(cascade[1])
+ def test_deep_tier_capacity_death_retries_on_the_next_cascade_model(self):
+  # shipped default: the deep tier model heads the cascade, so its capacity death
+  # walks one model down (opus -> sonnet), never up into a main-only model.
+  conf=self.shipped_conf("claude");self.pin_conf(conf)
+  cascade=F.capacity_cascade("claude")
+  self.assertEqual(cascade[0][0],conf["CFG_TIER_DEEP_MODEL"])
+  self.capacity_retry_from(f"claude-{cascade[0][0]}-5",cascade[1])
  def test_legacy_main_only_fable_retry_launches_first_eligible_candidate(self):
   # migration-only: a row recorded under a main-only policy resumes at the first
   # eligible cascade member without admitting fable into the cascade.
   self.pin_conf({**self.shipped_conf("claude"),"CFG_MAIN_SESSION_ONLY_MODELS":"fable"})
   cascade=F.capacity_cascade("claude");self.assertNotIn("fable",[m for m,_ in cascade])
-  self.fable_capacity_retry(cascade[0])
+  self.capacity_retry_from("claude-fable-5",cascade[0])
  def test_balanced_all_gated_stage_candidates_choose_maximum_headroom(self):
   import importlib.util
   spec=importlib.util.spec_from_file_location("capacity",ROOT/"utilities/harness-capacity.py")
