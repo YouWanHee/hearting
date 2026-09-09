@@ -148,7 +148,8 @@ class ModelProfileTest(unittest.TestCase):
         a hole an edit can walk through (review MA-2a). Resolution goes through the values
         already parsed here, not through a second read of the file — one value, one source.
         """
-        models = {value for key, value in config.items() if key.endswith("_MODEL")}
+        models = {value for key, value in config.items()
+                  if key.endswith("_MODEL") and key != "CFG_TIER_TOP_MODEL"}
         for profile in ("deep", "balanced-deep", "balanced", "light", "mini"):
             models.add(PROFILE.resolve_profile_values(adapter, config, profile)["model"])
         return models
@@ -190,6 +191,12 @@ class ModelProfileTest(unittest.TestCase):
             [m for m in self._reachable_models("claude", config) if self._restricted(m, main_only)],
             [],
         )
+        # The one sanctioned exception (2026-09-09 decision, second half): the
+        # `top` profile resolves to the main-only model on purpose, at the CLI's
+        # highest effort, and nothing else reaches it.
+        top = PROFILE.resolve_profile_values("claude", config, "top")
+        self.assertEqual((top["model"], top["budget"], top["tier"]), ("fable", "max", "top"))
+        self.assertTrue(self._restricted(top["model"], main_only))
         self.assertEqual(config["CFG_TIER_DEEP_FAILOVER"], "light")
         points = {profile: self._declared_point(config, profile) for profile in ("deep", "balanced-deep", "balanced", "light", "mini")}
         self.assertNotEqual(points["deep"], points["balanced-deep"])  # two distinct operating points
@@ -214,6 +221,11 @@ class ModelProfileTest(unittest.TestCase):
         # anywhere outside this file.
         reachable = set(cascade) | self._reachable_models("codex", config)
         self.assertEqual([m for m in reachable if self._restricted(m, ["astra"])], [])
+        # Since 2026-09-10 the codex adapter declares the key too (parity), and
+        # the `top` exception profile is the one door to Astra.
+        self.assertEqual(config["CFG_MAIN_SESSION_ONLY_MODELS"].split(), ["gpt-6-astra"])
+        top = PROFILE.resolve_profile_values("codex", config, "top")
+        self.assertEqual((top["model"], top["budget"], top["tier"]), ("gpt-6-astra", "xhigh", "top"))
 
     def test_portable_profiles_resolve_to_declared_adapter_budgets(self):
         claude_config = PROFILE.load_config(ROOT / "adapters" / "claude" / "config" / "models.conf")
@@ -387,6 +399,62 @@ class ModelProfileTest(unittest.TestCase):
             )
         self.assertIn("--model", command)
         self.assertNotIn("--variant", command)
+
+
+class TopExceptionProfileTest(unittest.TestCase):
+    """The `top` exception profile (2026-09-09 사용자 결정): one door above deep."""
+
+    def demand(self, judgment):
+        return {"schema_version": 1, "judgment_requirement": judgment, "execution_scope": "short-local",
+                "judgment_reason": "final review of a structural hook change", "execution_reason": "one review",
+                "evidence_refs": ["DESIGN.md"]}
+
+    def test_top_is_known_but_not_portable(self):
+        self.assertNotIn("top", PROFILE.PORTABLE_PROFILES)
+        self.assertIn("top", PROFILE.KNOWN_PROFILES)
+        self.assertEqual(PROFILE.EXCEPTION_PROFILES, ("top",))
+
+    def test_each_adapter_declares_top_and_opencode_collapses_typed(self):
+        expected = {"claude": ("fable", "max", "top", "full"),
+                    "codex": ("gpt-6-astra", "xhigh", "top", "full"),
+                    "opencode": ("opencode-go/qwen3.8-max", "runtime-default", "deep", "collapsed-top-to-deep")}
+        for adapter, point in expected.items():
+            with self.subTest(adapter=adapter):
+                resolved = PROFILE.resolve_profile(
+                    adapter, ROOT / "adapters" / adapter / "config" / "models.conf", "top")
+                self.assertEqual((resolved["model"], resolved["budget"], resolved["tier"], resolved["granularity"]), point)
+
+    def test_an_undeclared_top_profile_is_refused_typed_never_derived(self):
+        config = PROFILE.load_config(ROOT / "adapters" / "claude" / "config" / "models.conf")
+        without = {k: v for k, v in config.items() if not k.endswith("_TOP")}
+        with self.assertRaises(PROFILE.ModelProfileError) as refused:
+            PROFILE.resolve_profile_values("claude", without, "top")
+        self.assertEqual(refused.exception.reason, "profile-top-undeclared")
+
+    def test_explicit_top_needs_judgment_and_never_comes_from_the_matrix(self):
+        for judgment in ("important", "difficult-uncertain"):
+            row = PROFILE.resolve_profile_demand(self.demand(judgment), explicit_profile="top")
+            self.assertEqual((row["resolved_profile"], row["source"], row["reason"]),
+                             ("top", "explicit", "explicit-top-exception"))
+            PROFILE.validate_profile_selection(row, self.demand(judgment), profile="top")
+            self.assertNotEqual(PROFILE.resolve_profile_demand(self.demand(judgment))["resolved_profile"], "top")
+        with self.assertRaises(PROFILE.ModelProfileError) as refused:
+            PROFILE.resolve_profile_demand(self.demand("predetermined"), explicit_profile="top")
+        self.assertEqual(refused.exception.reason, "profile-top-predetermined")
+        # a legacy (demand-less) stage may not be lifted to top without a demand
+        with self.assertRaises(PROFILE.ModelProfileError):
+            PROFILE.resolve_profile_demand(None, explicit_profile="top", legacy=True, existing_versioned_stage=True)
+
+    def test_top_is_limited_to_registered_depth_one_owner_or_review(self):
+        for worker_type in ("owner", "review"):
+            PROFILE.validate_registered_profile("top", registered_worker=True, dispatch_depth=1, worker_type=worker_type)
+        for kwargs in (dict(registered_worker=True, dispatch_depth=2, worker_type="stage"),
+                       dict(registered_worker=True, dispatch_depth=2, worker_type="review"),
+                       dict(registered_worker=False, dispatch_depth=1, worker_type="owner"),
+                       dict(registered_worker=True, dispatch_depth=1, worker_type="support")):
+            with self.subTest(**kwargs), self.assertRaises(PROFILE.ModelProfileError) as refused:
+                PROFILE.validate_registered_profile("top", **kwargs)
+            self.assertEqual(refused.exception.reason, "profile-top-depth-forbidden")
 
 
 if __name__ == "__main__":

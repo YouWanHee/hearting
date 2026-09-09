@@ -114,11 +114,12 @@ from stage_session_runtime import (  # noqa: E402
     prompt_fragment as stage_session_prompt,
 )
 from model_profile import (  # noqa: E402
+    TOP_PROFILE,
     ModelProfileError,
     resolve_runtime_profile,
     validate_registered_profile,
 )
-from model_config import ModelConfigError, resolve_config  # noqa: E402
+from model_config import ModelConfigError, resolve_config, restricted_model  # noqa: E402
 from codex_dispatch_terminal import REVIEW_BLOCKING_NOTE, inspect_terminal_attempt  # noqa: E402
 from codex_managed_dispatch import (  # noqa: E402
     MANAGED_PARENT_DELIVERY,
@@ -408,15 +409,13 @@ def _model_policy() -> dict[str, str]:
 
 
 def _main_session_only_model(model: str) -> bool:
-    tokens = set(re.split(r"[^a-z0-9]+", model.lower()))
     policy = _model_policy()
     if "CFG_MAIN_SESSION_ONLY_MODELS" not in policy:
         raise ModelSelectionError(
             "dispatch-model-policy-unavailable",
             "CFG_MAIN_SESSION_ONLY_MODELS is not declared",
         )
-    restricted = policy["CFG_MAIN_SESSION_ONLY_MODELS"].split()
-    return any(alias.lower() in tokens for alias in restricted)
+    return restricted_model(model, policy["CFG_MAIN_SESSION_ONLY_MODELS"])
 
 
 def _require_headless_model(model: str, source: str) -> None:
@@ -470,9 +469,17 @@ def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
         except ModelProfileError as exc:
             raise ModelSelectionError("invalid-dispatch-model-profile", str(exc)) from exc
         model = args.model or resolved["model"]
-        _require_headless_model(model, f"profile:{args.model_profile}")
+        if resolved["profile"] == TOP_PROFILE and not args.model:
+            # The one door: a route-sealed `top` profile resolves to the
+            # main-session-only model on purpose (2026-09-09 사용자 결정). The
+            # waiver covers exactly that resolved model; a capacity override
+            # under `top` still faces the gate below, so no retry can name it.
+            source = "profile-top"
+        else:
+            _require_headless_model(model, f"profile:{args.model_profile}")
+            source = "profile+capacity" if args.model else "profile"
         return {
-            "source": "profile+capacity" if args.model else "profile",
+            "source": source,
             "role": args.model_role or "_kernel/owner",
             "profile": resolved["profile"],
             "tier": resolved["tier"],

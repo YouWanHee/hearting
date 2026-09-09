@@ -113,10 +113,12 @@ from stage_session_runtime import (  # noqa: E402
     prompt_fragment as stage_session_prompt,
 )
 from model_profile import (  # noqa: E402
+    TOP_PROFILE,
     ModelProfileError,
     resolve_runtime_profile,
     validate_registered_profile,
 )
+from model_config import ModelConfigError, resolve_config, restricted_model  # noqa: E402
 from codex_dispatch_terminal import REVIEW_BLOCKING_NOTE, inspect_terminal_attempt  # noqa: E402
 from dispatch_completion_join import (  # noqa: E402
     JoinContractError,
@@ -703,6 +705,46 @@ class ModelSelectionError(ValueError):
         self.reason = reason
 
 
+def _model_policy() -> dict[str, str]:
+    try:
+        values, _receipt = resolve_config("codex", source_root=ROOT)
+    except ModelConfigError as exc:
+        raise ModelSelectionError(
+            "dispatch-model-policy-unavailable", str(exc)
+        ) from exc
+    return values
+
+
+def _main_session_only_model(model: str) -> bool:
+    """Parity with the Claude adapter (2026-09-10): CFG_MAIN_SESSION_ONLY_MODELS
+    names the models a registered headless codex launch may not select. A
+    selected user copy that omits the key -- every copy written before this
+    date -- carries no restriction: failing closed there would have stopped
+    every codex dispatch until the copy was edited, and the shipped default
+    declares the key."""
+
+    policy = _model_policy()
+    return restricted_model(model, policy.get("CFG_MAIN_SESSION_ONLY_MODELS", ""))
+
+
+def _main_session_only_policy_state() -> str:
+    """`declared` or `absent` (review R1 M3): a selected user copy without the
+    key is unrestricted, and that fact must be visible on the receipt."""
+
+    try:
+        return "declared" if "CFG_MAIN_SESSION_ONLY_MODELS" in _model_policy() else "absent"
+    except ModelSelectionError:
+        return "unavailable"
+
+
+def _require_headless_model(model: str, source: str) -> None:
+    if _main_session_only_model(model):
+        raise ModelSelectionError(
+            "headless-main-session-only-model",
+            f"model selected by {source} is interactive dispatch-depth-0 main-session only",
+        )
+
+
 def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
     try:
         validate_registered_profile(
@@ -745,13 +787,23 @@ def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
             )
         except ModelProfileError as exc:
             raise ModelSelectionError("invalid-dispatch-model-profile", str(exc)) from exc
+        model = args.model or resolved["model"]
+        if resolved["profile"] == TOP_PROFILE and not args.model:
+            # The one door to the main-session-only model from registered
+            # dispatch: a route-sealed `top` profile (2026-09-09 사용자 결정).
+            # The waiver covers exactly the resolved model; a capacity
+            # override under `top` still faces the gate.
+            source = "profile-top"
+        else:
+            _require_headless_model(model, f"profile:{args.model_profile}")
+            source = "profile+capacity" if args.model else "profile"
         return {
-            "source": "profile+capacity" if args.model else "profile",
+            "source": source,
             "role": args.model_role or "_kernel/owner",
             "profile": resolved["profile"],
             "tier": resolved["tier"],
             "granularity": resolved["granularity"],
-            "model": args.model or resolved["model"],
+            "model": model,
             "reasoning": args.reasoning or resolved["budget"],
         }
     if args.model_role and args.model:
@@ -777,6 +829,7 @@ def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
                 "invalid-dispatch-model-role",
                 f"model role {args.model_role!r} resolved to non-runnable model={model}",
             )
+        _require_headless_model(model, f"role:{args.model_role}")
         # 역할 티어 고정 + 상황별 reasoning 오버라이드 (2026-07-22 사용자 원칙).
         if args.reasoning:
             if args.model_role.startswith("deep ") and args.reasoning in ("medium", "low"):
@@ -804,6 +857,7 @@ def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
             "invalid-dispatch-model-selection",
             "--model and --reasoning must be provided together",
         )
+    _require_headless_model(args.model, "explicit")
     return {
         "source": "explicit", "role": "-", "profile": "unsealed",
         "tier": "explicit", "granularity": "legacy", "model": args.model, "reasoning": args.reasoning,
@@ -3279,6 +3333,7 @@ def main(argv: list[str]) -> int:
     print(f"model_profile={settings['profile']}")
     print(f"model_tier={settings['tier']}")
     print(f"profile_granularity={settings['granularity']}")
+    print(f"main_session_only_policy={_main_session_only_policy_state()}")
     for key, value in sorted(getattr(args, "profile_selection_receipt", {}).items()):
         print(f"{key}={value}")
     print(f"model={settings['model']}")

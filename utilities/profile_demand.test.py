@@ -290,5 +290,126 @@ class RouteDemand(unittest.TestCase):
             fixture.doCleanups()
 
 
+
+class TopExceptionRoute(unittest.TestCase):
+    """The `top` exception profile at the route layer, on real routes: the same
+    compile -> verify_route -> compose -> verify_route round trip the portable
+    profiles take (review R1 M2), for both shapes that can carry an owner."""
+
+    args = F.TestRoute.args
+    registered_headless = F.TestRoute.registered_headless
+    dispatch = F.TestRoute.dispatch
+    nested = F.TestRoute.nested
+    TOP = {"__owner__": "top"}
+
+    def owner_demand(self, judgment="difficult-uncertain"):
+        return {"__owner__": demand(judgment)}
+
+    def quick(self, **kw):
+        return R.compile_route(**self.args(predicates=[], transport=None, inline_reason=None,
+            registered_headless_evidence=self.registered_headless(), **kw))
+
+    def staged(self, **kw):
+        return R.compile_route(**self.args(requested_intensity="standard", predicates=[],
+            signals=["shared-contract"], transport="headless", inline_reason=None,
+            dispatch_evidence=self.dispatch(self.nested()), **kw))
+
+    def assert_top_owner(self, route):
+        self.assertEqual(route["owner_model_profile"], "top")
+        selection = route["owner_profile_selection"]
+        self.assertEqual((selection["source"], selection["resolved_profile"], selection["reason"]),
+                         ("explicit", "top", "explicit-top-exception"))
+        R.verify_route(route, R.ROOT)
+
+    def test_quick_route_seals_top_on_owner_and_node_and_verifies(self):
+        route = self.quick(profile_demands=self.owner_demand(), explicit_profiles=self.TOP)
+        self.assert_top_owner(route)
+        node = next(n for n in route["nodes"] if n["id"] == "one-shot")
+        self.assertEqual(node["model_profile"], "top")
+        self.assertEqual(node["profile_selection"], route["owner_profile_selection"])
+        # a plain quick route is untouched
+        plain = self.quick()
+        self.assertEqual(plain["owner_model_profile"], "balanced-deep")
+        self.assertEqual(next(n for n in plain["nodes"] if n["id"] == "one-shot")["model_profile"], "balanced-deep")
+        R.verify_route(plain, R.ROOT)
+        # a route that claims top for the owner but not the node is refused by verify
+        forged = json.loads(json.dumps(route))
+        next(n for n in forged["nodes"] if n["id"] == "one-shot")["model_profile"] = "balanced-deep"
+        forged["route_hash"] = R.route_hash(forged)  # re-sealed, so the hash check is not what refuses
+        forged["route_id"] = "rt-" + forged["route_hash"].split(":", 1)[1][:16]
+        # the profile-contract check (selection vs node) is muted so the
+        # owner-node equality check is the one under test (review R2 M1)
+        with mock.patch.object(R, "_verify_profile_contract"), \
+             self.assertRaisesRegex(ValueError, "owner node one-shot profile differs from owner_model_profile"):
+            R.verify_route(forged, R.ROOT)
+
+    def test_staged_route_seals_top_on_the_owner_only_and_verifies(self):
+        route = self.staged(profile_demands=self.owner_demand("important"), explicit_profiles=self.TOP)
+        self.assert_top_owner(route)
+        self.assertNotIn("top", {n["model_profile"] for n in route["nodes"]})
+        plain = self.staged()
+        self.assertEqual(plain["owner_model_profile"], "deep")
+        R.verify_route(plain, R.ROOT)
+
+    def test_a_recipe_with_depth_one_stage_nodes_keeps_them_off_top(self):
+        # Review R2 B1: autopilot-spec's `prd-transaction` (and refine's
+        # `transaction`, apply's `handback`, ...) are depth-1 `_kernel/owner`
+        # STAGE nodes, not the owner. A `top` owner must not spread onto
+        # them, and the route must still verify.
+        for capability, mode, stage in (("autopilot-spec", "app", "prd-transaction"),
+                                        ("autopilot-refine", "default", "transaction"),
+                                        ("autopilot-apply", "default", "handback")):
+            with self.subTest(capability=capability):
+                route = self.staged(capability=capability, capability_mode=mode,
+                                    profile_demands=self.owner_demand(), explicit_profiles=self.TOP)
+                self.assert_top_owner(route)
+                node = next(n for n in route["nodes"] if n["id"] == stage)
+                self.assertEqual((node["dispatch_depth"], node["unit"]), (1, "_kernel/owner"))
+                plain = self.staged(capability=capability, capability_mode=mode)
+                self.assertEqual(node["model_profile"],
+                                 next(n for n in plain["nodes"] if n["id"] == stage)["model_profile"])
+                self.assertNotEqual(node["model_profile"], "top")
+
+    def test_compose_takes_the_same_round_trip(self):
+        composed = R.compose_route(capability="autopilot-code", capability_mode="dev", shape="solo",
+            graph=None, slug="top-solo", cwd=R.ROOT, artifact_root=R.ROOT, spec_read="fixture",
+            profile_demands=self.owner_demand(), explicit_profiles=self.TOP,
+            registered_headless_evidence=self.registered_headless())
+        self.assert_top_owner(composed)
+        self.assertEqual(next(n for n in composed["nodes"] if n["id"] == "one-shot")["model_profile"], "top")
+        with self.assertRaises(ValueError) as refused:
+            R.compose_route(capability="autopilot-code", capability_mode="dev", shape="direct",
+                graph=None, slug="top-direct", cwd=R.ROOT, artifact_root=R.ROOT, spec_read="fixture",
+                profile_demands=self.owner_demand(), explicit_profiles=self.TOP)
+        self.assertEqual(str(refused.exception), "owner-profile-top-requires-owner")
+
+    def test_the_owner_selector_reads_top_from_a_real_route_file(self):
+        route = self.quick(profile_demands=self.owner_demand(), explicit_profiles=self.TOP)
+        O = load("owner_under_test", "dispatch-owner.py")
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "route.json"
+            path.write_text(json.dumps(route), encoding="utf-8")
+            # the fixture route carries no slug; an explicit flag wins and the route fills the rest
+            _, values, forwarded, _, derived = O._parse(["--start", "--route-evidence", str(path),
+                                                        "--slug", "top-review", "--prompt-file", "/p.md"])
+        self.assertEqual(values["--model-profile"], "top")
+        self.assertEqual(values["--intensity"], "quick")
+        self.assertIn("--model-profile", derived)
+        self.assertEqual(forwarded[forwarded.index("--model-profile") + 1], "top")
+
+    def test_explicit_top_is_accepted_for_the_owner_only(self):
+        nodes = [{"id": "execute", "kind": "pipeline-stage", "dispatch_depth": 2, "model_profile": "light"}]
+        demands = {"__owner__": demand("important"), "execute": demand("important")}
+        _, explicit = R._profile_input_maps(nodes, demands, self.TOP)
+        self.assertEqual(explicit, self.TOP)
+        with self.assertRaises(ValueError) as refused:
+            R._profile_input_maps(nodes, demands, {"execute": "top"})
+        self.assertEqual(str(refused.exception), "profile-explicit-top-owner-only:execute")
+        with self.assertRaises(ValueError):
+            self.staged(profile_demands=self.owner_demand("predetermined"), explicit_profiles=self.TOP)
+        with self.assertRaisesRegex(ValueError, "profile-explicit-input-invalid:__owner__"):
+            R._profile_input_maps(nodes, demands, {"__owner__": "summit"})
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -79,7 +79,7 @@ _HINTS = {
     "missing-required": "with --route-evidence <route.json> pass only --prompt-file <file> (or --prompt-text); "
                         "without it: --worktree --slug --capability --capability-mode --qa <level> --intensity --dispatch-depth 1 "
                         "--worker-type owner --owner <capability> --assigned-contract <capability> "
-                        "--model-profile deep|balanced-deep|balanced|light",
+                        "--model-profile deep|balanced-deep|balanced|light (top only from a route that seals it)",
     "route-evidence-arg-mismatch": "omit that flag or pass the route's own value; the route seals it",
     "route-evidence-direct-route-has-no-owner": "a direct route runs inline; compose --shape solo (quick) or staged to get an owner",
     "route-evidence-unreadable": "pass the route *file* printed by compose as route_file=, not the route id",
@@ -92,7 +92,7 @@ _HINTS = {
                              "(see eligibility.* and capacity_headroom.* above; utilities/usage-check.sh --harness all)",
     "exactly-one-action-required": "pass exactly one of --dry-run | --register | --start",
     "owner-tuple-required": "the launchable tuple is --dispatch-depth 1 --worker-type owner|review",
-    "invalid-model-profile": "--model-profile deep|balanced-deep|balanced|light",
+    "invalid-model-profile": "--model-profile deep|balanced-deep|balanced|light|top",
     "review-worker-unit-required": "--worker-type review needs --unit <catalog persona from roles/units/>",
     "review-worker-route-evidence-unsupported": "a route node's reviewer is launched by stage dispatch; drop --route-evidence for an ad-hoc review worker",
     "forbidden-flag": "model, reasoning, effort, variant and completion-delivery are sealed by the profile and route; remove the flag",
@@ -389,7 +389,7 @@ def _parse(argv):
             raise OwnerError("review-output-must-be-absolute")
     if worker_type == "owner" and values.get("--review-output"):
         raise OwnerError("review-output-owner-forbidden")
-    if values["--model-profile"] not in {"deep", "balanced-deep", "balanced", "light"}:
+    if values["--model-profile"] not in {"deep", "balanced-deep", "balanced", "light", "top"}:
         raise OwnerError("invalid-model-profile")
     # Equal-form required options are forwarded unchanged; split-form options
     # were appended above.  Selector-only --adapter/--route-evidence never

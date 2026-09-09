@@ -28,7 +28,7 @@ cat > "$TMP/config/models.conf" <<'EOF'
 CFG_TIER_LIGHT_MODEL=sonnet
 CFG_TIER_LIGHT_EFFORT=high
 CFG_NATIVE_SUBAGENT=light   # tier reference, not a concrete ID
-CFG_MAIN_SESSION_ONLY_MODELS="fable"
+CFG_MAIN_SESSION_ONLY_MODELS="fable top-model-x1"
 EOF
 cat > "$TMP/nopolicy/config/models.conf" <<'EOF'
 CFG_TIER_LIGHT_MODEL=sonnet
@@ -208,6 +208,16 @@ printf '%s' '{"tool_name":"Agent","tool_input":{"description":"x","prompt":"y"}}
   && assert_denied "$TMP/m.out" native-subagent-model-policy-unavailable \
   && ok "missing eligibility declaration fails closed" \
   || bad "missing eligibility declaration did not fail closed"
+
+# (n) a hyphenated whole-id entry is matched as a whole id (review R2 M3: the
+#     hook carries a hand-mirrored copy of utilities/model_config.py's matcher,
+#     and the token-only form it replaced could never match this)
+printf '%s' '{"tool_name":"Agent","tool_input":{"description":"x","prompt":"y","model":"top-model-x1"}}' \
+  | run_hook "$TMP/n.out" "$TMP/n.err"
+[ $? = 0 ] && [ ! -s "$TMP/n.err" ] \
+  && assert_denied "$TMP/n.out" native-subagent-main-session-only-model \
+  && ok "hyphenated main-session-only id is denied as a whole id" \
+  || bad "hyphenated main-session-only id was not denied"
 
 echo
 echo "RESULT: PASS=$PASS FAIL=$FAIL"

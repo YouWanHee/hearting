@@ -1147,5 +1147,28 @@ class RouteDefaultsReceiptTest(unittest.TestCase):
         self.assertRegex(buf.getvalue(), r"(?m)^route_defaults=none$")
 
 
+
+class TopProfileOwnerTupleTest(unittest.TestCase):
+    """Field-level refusal only; the accepted path is exercised on a real
+    compiled route in utilities/profile_demand.test.py (review R1 M2)."""
+
+    def _route(self, **override):
+        payload = {
+            "effective_intensity": "quick", "slug": "review-top", "capability": "autopilot-code",
+            "capability_mode": "audit", "cwd": "/w/tree", "owner_model_profile": "top",
+            "registered_headless_candidates": [{"harness": "codex", "status": "supported"}],
+        }
+        payload.update(override)
+        path = Path(tempfile.mkdtemp()) / "route.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return str(path)
+
+    def test_an_unknown_profile_is_still_refused_and_the_hint_names_top(self):
+        with self.assertRaises(OWNER.OwnerError) as refused:
+            OWNER._parse(["--start", "--route-evidence", self._route(owner_model_profile="summit"),
+                          "--prompt-file", "/p.md"])
+        self.assertEqual(str(refused.exception), "invalid-model-profile")
+        self.assertIn("top", OWNER.hint_for("invalid-model-profile"))
+
 if __name__ == "__main__":
     unittest.main()

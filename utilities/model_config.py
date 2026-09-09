@@ -67,6 +67,37 @@ WRAPPER_REQUIRED_TIERS: dict[str, frozenset[str]] = {
 
 
 TIER_REFERENCE_KEYS = ("CFG_TIER_DEEP_FAILOVER", "CFG_NATIVE_SUBAGENT", "CFG_LIFECYCLE_NUDGE", "CFG_LIFECYCLE_CURATE")
+# Profile keys a complete user copy may omit. `balanced` is derived from light
+# in memory (below); `top` is never derived -- a copy without it simply has no
+# top exception profile, and its TOP tier keys become unreferenced like any
+# other tier a release added (SD-145). Nothing here writes to the user file.
+OPTIONAL_PROFILE_KEYS = frozenset({
+    "CFG_MODEL_PROFILE_BALANCED", "CFG_MODEL_PROFILE_GRANULARITY_BALANCED",
+    "CFG_MODEL_PROFILE_TOP", "CFG_MODEL_PROFILE_GRANULARITY_TOP",
+})
+
+
+def restricted_model(model: str, restricted: list[str] | tuple[str, ...] | str) -> bool:
+    """Whether `model` names a CFG_MAIN_SESSION_ONLY_MODELS entry.
+
+    An entry matches as a whole identifier (a hyphenated vendor id) or, when it
+    is a bare alphanumeric alias, as one token of the model id (the alias inside
+    a versioned full id).
+    One definition for the Claude and Codex wrappers and the capacity
+    cascade, so a hyphenated top model id cannot pass one gate and fail
+    another. `hooks/subagent-model-default.sh` (embedded Python, no imports)
+    carries a hand-mirrored copy that must be kept identical."""
+
+    entries = restricted.split() if isinstance(restricted, str) else list(restricted)
+    tokens = set(re.split(r"[^a-z0-9]+", model.lower()))
+    lowered = model.lower()
+    for entry in entries:
+        alias = entry.lower()
+        if not alias:
+            continue
+        if alias == lowered or (re.fullmatch(r"[a-z0-9]+", alias) and alias in tokens):
+            return True
+    return False
 
 
 def _referenced_tiers(values: Mapping[str, str]) -> set[str]:
@@ -266,9 +297,7 @@ def resolve_config(
         else:
             reason = "user-malformed"
     else:
-        optional_balanced = {
-            "CFG_MODEL_PROFILE_BALANCED", "CFG_MODEL_PROFILE_GRANULARITY_BALANCED",
-        }
+        optional_balanced = set(OPTIONAL_PROFILE_KEYS)
         missing = set(shipped_values) - set(user_values)
         unreferenced_tier = _unreferenced_tier_keys(missing - optional_balanced, user_values, adapter)
         if missing - optional_balanced - unreferenced_tier:
