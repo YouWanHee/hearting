@@ -30,6 +30,175 @@ ok() { PASS=$((PASS+1)); printf '  ok  %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  BAD %s\n' "$1"; }
 
 TMP="$(mktemp -d)"
+# Native Codex discovery is a local runtime contract, but this portable suite
+# runs under a deliberately empty HOME/XDG state.  Bind those checks to one
+# synthetic CLI for protocol and checker assertions. Installed-layout tests
+# own live CLI parity; these fixture results never establish native parity.
+CODEX_NATIVE_FIXTURE_BIN="$TMP/codex-native-fixture-bin"
+mkdir -p "$CODEX_NATIVE_FIXTURE_BIN"
+cat > "$CODEX_NATIVE_FIXTURE_BIN/codex" <<'PY'
+#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import re
+import sys
+
+
+def fail(message):
+    print(f"fixture-codex: {message}", file=sys.stderr)
+    raise SystemExit(64)
+
+
+def codex_home():
+    raw = os.environ.get("CODEX_HOME")
+    if raw:
+        return Path(raw)
+    home = os.environ.get("HOME")
+    if not home:
+        fail("HOME and CODEX_HOME are both unset")
+    return Path(home) / ".codex"
+
+
+def state_dir():
+    root = codex_home() / ".harness" / "portable-guards-codex-fixture"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def skill_description(path):
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    match = re.search(r"(?m)^description:\s*(.+?)\s*$", text)
+    return match.group(1).strip('"\'') if match else ""
+
+
+def print_prompt_input():
+    home = codex_home()
+    agents = home / "AGENTS.md"
+    if agents.is_file():
+        print(agents.read_text(encoding="utf-8"), end="")
+    skills = home / "skills"
+    if skills.is_dir():
+        for skill in sorted(skills.glob("*/SKILL.md")):
+            print(f"- {skill.parent.name}: {skill_description(skill)}")
+    marker = state_dir() / "plugin-installed"
+    marketplace = state_dir() / "marketplace-path"
+    if marker.is_file() and marketplace.is_file():
+        source = Path(marketplace.read_text(encoding="utf-8").strip())
+        plugin = source / "plugins" / "hearting-codex" / "skills"
+        for skill in sorted(plugin.glob("*/SKILL.md")):
+            print(
+                f"- hearting-codex:{skill.parent.name}: "
+                f"{skill_description(skill)}"
+            )
+
+
+def plugin_command(args):
+    state = state_dir()
+    if len(args) >= 3 and args[:2] == ["marketplace", "add"]:
+        extras = [value for value in args[3:] if value != "--json"]
+        if extras:
+            fail("unsupported plugin marketplace add arguments")
+        source = Path(args[2]).resolve()
+        if not source.is_dir():
+            fail("plugin marketplace source is not a directory")
+        (state / "marketplace-path").write_text(str(source) + "\n", encoding="utf-8")
+        if "--json" in args:
+            print(json.dumps({"status": "ok"}))
+        return
+    if len(args) >= 2 and args[:2] == ["add", "hearting-codex@hearting"]:
+        extras = [value for value in args[2:] if value != "--json"]
+        if extras:
+            fail("unsupported plugin add arguments")
+        if not (state / "marketplace-path").is_file():
+            fail("plugin add requires the fixture marketplace")
+        (state / "plugin-installed").write_text("hearting-codex@hearting\n", encoding="utf-8")
+        if "--json" in args:
+            print(json.dumps({"status": "ok"}))
+        return
+    if args and args[0] == "list":
+        if any(value not in {"--json", "--available"} for value in args[1:]):
+            fail("unsupported plugin list arguments")
+        installed = (state / "plugin-installed").is_file()
+        available = (state / "marketplace-path").is_file()
+        value = {
+            "installed": ([{"pluginId": "hearting-codex@hearting"}] if installed else []),
+            "available": ([{"pluginId": "hearting-codex@hearting"}] if available else []),
+        }
+        print(json.dumps(value, indent=2))
+        return
+    fail("unsupported plugin command")
+
+
+def event_label(value):
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", value).lower()
+
+
+def app_server():
+    hooks_path = codex_home() / "hooks.json"
+    for raw in sys.stdin:
+        try:
+            request = json.loads(raw)
+        except json.JSONDecodeError:
+            fail("invalid app-server JSON")
+        request_id = request.get("id")
+        method = request.get("method")
+        if request_id is None:
+            if method != "initialized":
+                fail("unsupported app-server notification")
+            continue
+        if method == "initialize":
+            result = {}
+        elif method == "hooks/list":
+            try:
+                hooks = json.loads(hooks_path.read_text(encoding="utf-8"))["hooks"]
+            except (OSError, KeyError, json.JSONDecodeError, TypeError):
+                fail("projected hooks.json is unreadable")
+            rows = []
+            for event, groups in hooks.items():
+                for group in groups:
+                    for handler in group.get("hooks", []):
+                        if handler.get("type") == "command" and handler.get("command", "").strip():
+                            rows.append(
+                                {
+                                    "sourcePath": str(hooks_path),
+                                    "eventName": event_label(event),
+                                    "enabled": True,
+                                    "trustStatus": "modified",
+                                }
+                            )
+            cwds = request.get("params", {}).get("cwds", [])
+            result = {"data": [{"cwd": cwd, "hooks": rows} for cwd in cwds]}
+        else:
+            fail(f"unsupported app-server request: {method}")
+        print(
+            json.dumps(
+                {"jsonrpc": "2.0", "id": request_id, "result": result},
+                separators=(",", ":"),
+            ),
+            flush=True,
+        )
+
+
+args = sys.argv[1:]
+if args == ["mcp", "--help"]:
+    print("fixture Codex MCP help")
+elif args == ["features", "list"]:
+    print("multi_agent                              stable             true")
+elif len(args) == 3 and args[:2] == ["debug", "prompt-input"]:
+    print_prompt_input()
+elif args and args[0] == "plugin":
+    plugin_command(args[1:])
+elif args == ["app-server", "--listen", "stdio://"]:
+    app_server()
+else:
+    fail("unsupported command: " + " ".join(args))
+PY
+chmod +x "$CODEX_NATIVE_FIXTURE_BIN/codex"
+CODEX_NATIVE_FIXTURE_PATH="$CODEX_NATIVE_FIXTURE_BIN:$PATH"
 # SessionEnd now outlives its foreground bridge. Join only this suite's
 # isolated receipts before deleting fixtures, including on assertion failure.
 cleanup() {
@@ -1375,6 +1544,12 @@ if "$CODEX" dispatch --dry-run --worktree "$TMP/repo" --slug codex-dispatch --ca
   ok "codex dispatch wrapper dry-runs headless command with main-selected model settings"
 else
   bad "codex dispatch wrapper should dry-run headless command with main-selected model settings"
+  {
+    printf '%s\n' '--- codex dispatch dry-run stdout ---'
+    cat "$TMP/logs/codex_dispatch.out"
+    printf '%s\n' '--- codex dispatch dry-run stderr ---'
+    cat "$TMP/logs/codex_dispatch.err"
+  } >&2
 fi
 if "$CODEX" dispatch --dry-run --worktree "$TMP/repo" --slug codex-custom-model --capability autopilot-code --mode dev --qa standard --prompt-text "do work" --model gpt-test --reasoning low --approval inherit --jobs "$TMP/codex-custom-model.log" >"$TMP/logs/codex_custom_model.out" 2>"$TMP/logs/codex_custom_model.err" \
   && grep -q '^model_source=explicit$' "$TMP/logs/codex_custom_model.out" \
@@ -1898,11 +2073,11 @@ if "$CODEX" mcp >"$TMP/logs/codex_mcp.out" 2>"$TMP/logs/codex_mcp.err" \
 else
   bad "codex mcp wrapper should report native MCP contract"
 fi
-if "$CODEX" mcp --check >"$TMP/logs/codex_mcp_check.out" 2>"$TMP/logs/codex_mcp_check.err" \
+if PATH="$CODEX_NATIVE_FIXTURE_PATH" "$CODEX" mcp --check >"$TMP/logs/codex_mcp_check.out" 2>"$TMP/logs/codex_mcp_check.err" \
   && grep -q '^check=ok$' "$TMP/logs/codex_mcp_check.out"; then
-  ok "codex mcp wrapper checks native MCP CLI"
+  ok "codex mcp wrapper checks the synthetic MCP CLI fixture"
 else
-  bad "codex mcp wrapper should check native MCP CLI"
+  bad "codex mcp wrapper should check the synthetic MCP CLI fixture"
 fi
 if "$CODEX" ui-info >"$TMP/logs/codex_ui.out" 2>"$TMP/logs/codex_ui.err" \
   && grep -q '^adapter=codex$' "$TMP/logs/codex_ui.out" \
@@ -1934,12 +2109,12 @@ if ! grep -q 'auto_spawn=explicit-only' "$CODEX"; then
 else
   bad "codex preflight should not report auto_spawn=explicit-only next to an explicit-or-main-dispatch trigger"
 fi
-if "$CODEX" subagent-info --check >"$TMP/logs/codex_subagent_check.out" 2>"$TMP/logs/codex_subagent_check.err" \
+if PATH="$CODEX_NATIVE_FIXTURE_PATH" "$CODEX" subagent-info --check >"$TMP/logs/codex_subagent_check.out" 2>"$TMP/logs/codex_subagent_check.err" \
   && grep -q '^check=ok$' "$TMP/logs/codex_subagent_check.out" \
   && grep -q '^feature=multi_agent$' "$TMP/logs/codex_subagent_check.out"; then
-  ok "codex subagent-info checks native multi-agent feature"
+  ok "codex subagent-info checks the synthetic multi-agent CLI fixture"
 else
-  bad "codex subagent-info should check native multi-agent feature"
+  bad "codex subagent-info should check the synthetic multi-agent CLI fixture"
 fi
 TUIHOME="$TMP/codex-tui-home"
 rm -rf "$TUIHOME"; mkdir -p "$TUIHOME"
@@ -2378,57 +2553,57 @@ if grep -q 'core/WORKFLOW.md §0.2' "$ROOT/adapters/codex/skills/autopilot-code/
 else
   bad "codex native skill projection should carry portable autopilot-code procedure"
 fi
-if command -v codex >/dev/null 2>&1; then
+if [ -x "$CODEX_NATIVE_FIXTURE_BIN/codex" ]; then
   mkdir -p "$TMP/codex_bootstrap_home"
   ln -s "$ROOT/codex_setting/AGENTS.md" "$TMP/codex_bootstrap_home/AGENTS.md"
-  if CODEX_HOME="$TMP/codex_bootstrap_home" codex debug prompt-input 'bootstrap check' >"$TMP/logs/codex_bootstrap.out" 2>"$TMP/logs/codex_bootstrap.err" \
+  if PATH="$CODEX_NATIVE_FIXTURE_PATH" CODEX_HOME="$TMP/codex_bootstrap_home" codex debug prompt-input 'bootstrap check' >"$TMP/logs/codex_bootstrap.out" 2>"$TMP/logs/codex_bootstrap.err" \
     && grep -q 'AGENTS.md — Codex Adapter Bootstrap' "$TMP/logs/codex_bootstrap.out" \
     && grep -q 'adapters/codex/bin/preflight.sh capability-info' "$TMP/logs/codex_bootstrap.out" \
     && grep -q 'codex_setting/codex-hooks' "$TMP/logs/codex_bootstrap.out" \
     && ! grep -q 'adapters/claude/CLAUDE.md.*portable bootstrap' "$TMP/logs/codex_bootstrap.out"; then
-    ok "codex bootstrap projection is discoverable without Claude bootstrap"
+    ok "codex fixture: bootstrap projection is discoverable without Claude bootstrap"
   else
-    bad "codex bootstrap projection should be discoverable without Claude bootstrap"
+    bad "codex fixture: bootstrap projection should be discoverable without Claude bootstrap"
   fi
 else
-  ok "codex bootstrap runtime discovery skipped (codex not installed)"
+  bad "synthetic Codex CLI fixture is unavailable"
 fi
-if command -v codex >/dev/null 2>&1; then
+if [ -x "$CODEX_NATIVE_FIXTURE_BIN/codex" ]; then
   mkdir -p "$TMP/codex_home/skills"
   for d in "$ROOT"/codex_setting/codex-skills/*; do
     [ -d "$d" ] || continue
     ln -s "$d" "$TMP/codex_home/skills/$(basename "$d")"
   done
-  if CODEX_HOME="$TMP/codex_home" codex debug prompt-input 'autopilot-code' >"$TMP/logs/codex_skills.out" 2>"$TMP/logs/codex_skills.err" \
+  if PATH="$CODEX_NATIVE_FIXTURE_PATH" CODEX_HOME="$TMP/codex_home" codex debug prompt-input 'autopilot-code' >"$TMP/logs/codex_skills.out" 2>"$TMP/logs/codex_skills.err" \
     && grep -q -- '- autopilot-code:' "$TMP/logs/codex_skills.out" \
     && grep -q 'Use when source code must be implemented' "$TMP/logs/codex_skills.out" \
     && ! grep -q '/.claude/skills' "$TMP/logs/codex_skills.out"; then
-    ok "codex native skill projection is discoverable without Claude skill paths"
+    ok "codex fixture: native skill projection is discoverable without Claude skill paths"
   else
-    bad "codex native skill projection should be discoverable without Claude skill paths"
+    bad "codex fixture: native skill projection should be discoverable without Claude skill paths"
   fi
 else
-  ok "codex native skill runtime discovery skipped (codex not installed)"
+  bad "synthetic Codex CLI fixture is unavailable"
 fi
-if command -v codex >/dev/null 2>&1; then
+if [ -x "$CODEX_NATIVE_FIXTURE_BIN/codex" ]; then
   mkdir -p "$TMP/codex_plugin_home"
   if [ -f "$ROOT/codex_setting/codex-plugin-marketplace/.agents/plugins/marketplace.json" ] \
     && [ -L "$ROOT/codex_setting/codex-plugin-marketplace/plugins/hearting-codex" ] \
     && [ ! -e "$ROOT/codex_setting/codex-plugin-marketplace/bin" ] \
     && [ ! -e "$ROOT/codex_setting/codex-plugin-marketplace/hooks" ] \
-    && CODEX_HOME="$TMP/codex_plugin_home" codex plugin marketplace add "$ROOT/codex_setting/codex-plugin-marketplace" --json >"$TMP/logs/codex_plugin_marketplace.out" 2>"$TMP/logs/codex_plugin_marketplace.err" \
-    && CODEX_HOME="$TMP/codex_plugin_home" codex plugin list --available --json >"$TMP/logs/codex_plugin_list.out" 2>"$TMP/logs/codex_plugin_list.err" \
+    && PATH="$CODEX_NATIVE_FIXTURE_PATH" CODEX_HOME="$TMP/codex_plugin_home" codex plugin marketplace add "$ROOT/codex_setting/codex-plugin-marketplace" --json >"$TMP/logs/codex_plugin_marketplace.out" 2>"$TMP/logs/codex_plugin_marketplace.err" \
+    && PATH="$CODEX_NATIVE_FIXTURE_PATH" CODEX_HOME="$TMP/codex_plugin_home" codex plugin list --available --json >"$TMP/logs/codex_plugin_list.out" 2>"$TMP/logs/codex_plugin_list.err" \
     && grep -q '"pluginId": "hearting-codex@hearting"' "$TMP/logs/codex_plugin_list.out" \
-    && CODEX_HOME="$TMP/codex_plugin_home" codex plugin add hearting-codex@hearting --json >"$TMP/logs/codex_plugin_add.out" 2>"$TMP/logs/codex_plugin_add.err" \
-    && CODEX_HOME="$TMP/codex_plugin_home" codex debug prompt-input 'autopilot-code' >"$TMP/logs/codex_plugin_prompt.out" 2>"$TMP/logs/codex_plugin_prompt.err" \
+    && PATH="$CODEX_NATIVE_FIXTURE_PATH" CODEX_HOME="$TMP/codex_plugin_home" codex plugin add hearting-codex@hearting --json >"$TMP/logs/codex_plugin_add.out" 2>"$TMP/logs/codex_plugin_add.err" \
+    && PATH="$CODEX_NATIVE_FIXTURE_PATH" CODEX_HOME="$TMP/codex_plugin_home" codex debug prompt-input 'autopilot-code' >"$TMP/logs/codex_plugin_prompt.out" 2>"$TMP/logs/codex_plugin_prompt.err" \
     && grep -q -- '- hearting-codex:autopilot-code:' "$TMP/logs/codex_plugin_prompt.out" \
     && ! grep -q 'adapters/claude/skills' "$TMP/logs/codex_plugin_prompt.out"; then
-    ok "codex native plugin projection is installable and discovers generated skills"
+    ok "codex fixture: native plugin projection is installable and discovers generated skills"
   else
-    bad "codex native plugin projection should be installable and discover generated skills"
+    bad "codex fixture: native plugin projection should be installable and discover generated skills"
   fi
 else
-  ok "codex native plugin runtime discovery skipped (codex not installed)"
+  bad "synthetic Codex CLI fixture is unavailable"
 fi
 mkdir -p "$TMP/codex_agent_home/agents"
 for f in "$ROOT"/codex_setting/codex-agents/*.toml; do
@@ -3395,10 +3570,15 @@ else
 fi
 RPHOME="$TMP/codex-runtime-home"
 rm -rf "$RPHOME"; mkdir -p "$RPHOME"
+# Synthetic CLI protocol/checker evidence only; native runtime parity is
+# verified separately. In particular, hooks/list below always reports modified.
+PORTABLE_GUARDS_PATH_BEFORE_CODEX_FIXTURE=$PATH
+PATH=$CODEX_NATIVE_FIXTURE_PATH
+export PATH
 if AGENT_HOME="$ROOT" CODEX_HOME="$RPHOME" "$ROOT/adapters/codex/bin/check-runtime-projection.sh" >"$TMP/codex_rp0.out" 2>"$TMP/codex_rp0.err"; then
-  bad "codex check-runtime-projection should fail on an unwired home"
+  bad "codex fixture: check-runtime-projection should fail on an unwired home"
 else
-  grep -q '^status=failed' "$TMP/codex_rp0.out" && ok "codex check-runtime-projection reports an unwired home as failed" || bad "codex check-runtime-projection unwired output wrong"
+  grep -q '^status=failed' "$TMP/codex_rp0.out" && ok "codex fixture: check-runtime-projection reports an unwired home as failed" || bad "codex fixture: check-runtime-projection unwired output wrong"
 fi
 # Until the §6.1-owned baseline refresh lands, accept only the exact known
 # bootstrap/router/unit-catalog warning census. The count and representative
@@ -3463,9 +3643,9 @@ if AGENT_HOME="$ROOT" CODEX_HOME="$RPHOME" "$ROOT/adapters/codex/bin/install-run
   && grep -q '^check=agent-link:memory-scout.toml:ok' "$TMP/codex_rp2.out" \
   && grep -q '^check=agents-linked:ok' "$TMP/codex_rp2.out" \
   && grep -q '^status=ok' "$TMP/codex_rp2.out"; then
-  ok "codex install-runtime-projection wires the home and the checker passes"
+  ok "codex fixture: install-runtime-projection wires the home and the checker passes"
 else
-  bad "codex install-runtime-projection + checker should wire and validate the runtime home"
+  bad "codex fixture: install-runtime-projection + checker should wire and validate the runtime home"
 fi
 RPSELF="$TMP/codex-runtime-home-self"
 rm -rf "$RPSELF"; mkdir -p "$RPSELF"
@@ -3477,9 +3657,9 @@ if AGENT_HOME="$RPSELF/hearting" CODEX_HOME="$RPSELF" "$ROOT/adapters/codex/bin/
   && AGENT_HOME="$RPSELF/hearting" CODEX_HOME="$RPSELF" "$ROOT/adapters/codex/bin/check-runtime-projection.sh" >"$TMP/codex_rp_self.out" 2>"$TMP/codex_rp_self.err" \
   && grep -q '^check=hearting:ok' "$TMP/codex_rp_self.out" \
   && grep -q '^status=ok' "$TMP/codex_rp_self.out"; then
-  ok "codex install-runtime-projection resolves a projected AGENT_HOME before relinking"
+  ok "codex fixture: install-runtime-projection resolves a projected AGENT_HOME before relinking"
 else
-  bad "codex install-runtime-projection must not create a self-referential hearting link"
+  bad "codex fixture: install-runtime-projection must not create a self-referential hearting link"
 fi
 RPPLUGIN="$TMP/codex-runtime-home-plugin"
 rm -rf "$RPPLUGIN"; mkdir -p "$RPPLUGIN"
@@ -3493,9 +3673,9 @@ if AGENT_HOME="$ROOT" CODEX_HOME="$RPPLUGIN" "$ROOT/adapters/codex/bin/install-r
   && grep -q '^check=skills-linked:skipped reason=plugin-skill-discovery' "$TMP/codex_rp_plugin.out" \
   && grep -q '^check=plugin:ok' "$TMP/codex_rp_plugin.out" \
   && grep -q '^status=ok' "$TMP/codex_rp_plugin.out"; then
-  ok "codex install-runtime-projection supports plugin-only skill discovery"
+  ok "codex fixture: install-runtime-projection supports plugin-only skill discovery"
 else
-  bad "codex install-runtime-projection should support plugin-only skill discovery"
+  bad "codex fixture: install-runtime-projection should support plugin-only skill discovery"
 fi
 RPBAD="$TMP/codex-runtime-home-bad"
 rm -rf "$RPBAD"; mkdir -p "$RPBAD"
@@ -3506,18 +3686,18 @@ if AGENT_HOME="$ROOT" CODEX_HOME="$RPBAD" "$ROOT/adapters/codex/bin/install-runt
   && grep -q '^check=skill-link:autopilot-code:failed' "$TMP/codex_rp_bad.out" \
   && grep -q '^check=agent-link:memory-scout.toml:failed' "$TMP/codex_rp_bad.out" \
   && grep -q '^status=failed' "$TMP/codex_rp_bad.out"; then
-  ok "codex check-runtime-projection rejects miswired skill and agent links"
+  ok "codex fixture: check-runtime-projection rejects miswired skill and agent links"
 else
-  bad "codex check-runtime-projection should reject miswired skill and agent links"
+  bad "codex fixture: check-runtime-projection should reject miswired skill and agent links"
 fi
 if AGENT_HOME="$ROOT" CODEX_HOME="$RPHOME" CODEX_RUNTIME_PROJECTION_CLI_TIMEOUT=2 "$CODEX" runtime-projection >"$TMP/codex_rp3.out" 2>"$TMP/codex_rp3.err" \
   && grep -q '^check=agent-capabilities:ok' "$TMP/codex_rp3.out" \
   && grep -q '^check=agent-tools:ok' "$TMP/codex_rp3.out" \
   && grep -q '^check=agent-config:ok' "$TMP/codex_rp3.out" \
   && grep -q '^status=ok' "$TMP/codex_rp3.out"; then
-  ok "codex preflight runtime-projection validates installed runtime wiring"
+  ok "codex fixture: preflight runtime-projection validates installed runtime wiring"
 else
-  bad "codex preflight runtime-projection should validate installed runtime wiring"
+  bad "codex fixture: preflight runtime-projection should validate installed runtime wiring"
 fi
 cat > "$RPHOME/config.toml" <<EOF
 [hooks.state]
@@ -3539,19 +3719,19 @@ EOF
 if ! AGENT_HOME="$ROOT" CODEX_HOME="$RPHOME" CODEX_RUNTIME_PROJECTION_CLI_TIMEOUT=2 "$CODEX" runtime-projection --require-hook-trust >"$TMP/codex_rp_stop_trust.out" 2>"$TMP/codex_rp_stop_trust.err" \
   && grep -q '^check=hook-trust:review-needed reason=current-hash-not-trusted$' "$TMP/codex_rp_stop_trust.out" \
   && grep -q '^status=failed' "$TMP/codex_rp_stop_trust.out"; then
-  ok "codex strict runtime-projection rejects stale static hook metadata"
+  ok "codex fixture: strict runtime-projection rejects stale static hook metadata"
 else
-  bad "codex strict runtime-projection must use authoritative current-hash trust"
+  bad "codex fixture: strict runtime-projection must use authoritative current-hash trust"
 fi
 if AGENT_HOME="$ROOT" CODEX_HOME="$RPHOME" CODEX_RUNTIME_PROJECTION_CLI_TIMEOUT=2 "$CODEX" runtime-projection --require-hook-trust >"$TMP/codex_rp_strict_missing.out" 2>"$TMP/codex_rp_strict_missing.err"; then
-  bad "codex strict runtime-projection should fail when hook trust is missing"
+  bad "codex fixture: strict runtime-projection should fail when hook trust is missing"
 else
-  grep -q '^check=hook-trust:review-needed reason=current-hash-not-trusted$' "$TMP/codex_rp_strict_missing.out" && ok "codex strict runtime-projection requires complete current-hash trust" || bad "codex strict runtime-projection missing trust output wrong"
+  grep -q '^check=hook-trust:review-needed reason=current-hash-not-trusted$' "$TMP/codex_rp_strict_missing.out" && ok "codex fixture: strict runtime-projection requires complete current-hash trust" || bad "codex fixture: strict runtime-projection missing trust output wrong"
 fi
 if AGENT_HOME="$ROOT" CODEX_HOME="$RPHOME" CODEX_REQUIRE_HOOK_TRUST=1 CODEX_RUNTIME_PROJECTION_CLI_TIMEOUT=2 "$CODEX" runtime-projection >"$TMP/codex_rp_trust.out" 2>"$TMP/codex_rp_trust.err"; then
-  bad "codex runtime-projection should fail when hook trust is required but missing"
+  bad "codex fixture: runtime-projection should fail when hook trust is required but missing"
 else
-  grep -q '^check=hook-trust:review-needed' "$TMP/codex_rp_trust.out" && ok "codex runtime-projection can require hook trust" || bad "codex runtime-projection required hook trust output wrong"
+  grep -q '^check=hook-trust:review-needed' "$TMP/codex_rp_trust.out" && ok "codex fixture: runtime-projection can require hook trust" || bad "codex fixture: runtime-projection required hook trust output wrong"
 fi
 cat > "$RPHOME/config.toml" <<EOF
 [hooks.state]
@@ -3571,45 +3751,47 @@ trusted_hash = "sha256:test"
 trusted_hash = "sha256:test"
 EOF
 if AGENT_HOME="$ROOT" CODEX_HOME="$RPHOME" CODEX_RUNTIME_PROJECTION_CLI_TIMEOUT=2 "$CODEX" runtime-projection --require-hook-trust >"$TMP/codex_rp_stop_alias.out" 2>"$TMP/codex_rp_stop_alias.err"; then
-  bad "codex strict runtime-projection should not accept a static Stop alias"
+  bad "codex fixture: strict runtime-projection should not accept a static Stop alias"
 elif grep -q '^check=hook-trust:review-needed reason=current-hash-not-trusted$' "$TMP/codex_rp_stop_alias.out" \
   && ! grep -q 'session_end=stop-alias' "$TMP/codex_rp_stop_alias.out"; then
-  ok "codex runtime-projection does not alias Stop trust to SessionEnd"
+  ok "codex fixture: runtime-projection does not alias Stop trust to SessionEnd"
 else
-  bad "codex runtime-projection should reject Stop-as-SessionEnd alias metadata"
+  bad "codex fixture: runtime-projection should reject Stop-as-SessionEnd alias metadata"
 fi
 if AGENT_HOME="$ROOT" CODEX_HOME="$RPHOME" CODEX_RUNTIME_PROJECTION_CLI_TIMEOUT=2 "$CODEX" doctor --runtime >"$TMP/codex_doctor_runtime.out" 2>"$TMP/codex_doctor_runtime.err" \
   && grep -q '^check=runtime-projection:ok' "$TMP/codex_doctor_runtime.out" \
   && grep -q '^check=native-subagents:ok' "$TMP/codex_doctor_runtime.out" \
   && grep -q '^status=ok' "$TMP/codex_doctor_runtime.out"; then
-  ok "codex doctor --runtime includes runtime projection validation"
+  ok "codex fixture: doctor --runtime includes runtime projection validation"
 else
-  bad "codex doctor --runtime should include runtime projection validation"
+  bad "codex fixture: doctor --runtime should include runtime projection validation"
   cat "$TMP/codex_doctor_runtime.out" "$TMP/codex_doctor_runtime.err"
 fi
 if AGENT_HOME="$ROOT" CODEX_HOME="$RPHOME" CODEX_RUNTIME_PROJECTION_CLI_TIMEOUT=2 "$CODEX" doctor --runtime-strict >"$TMP/codex_doctor_runtime_strict.out" 2>"$TMP/codex_doctor_runtime_strict.err"; then
-  bad "codex doctor --runtime-strict should fail closed on stale hook trust"
+  bad "codex fixture: doctor --runtime-strict should fail closed on stale hook trust"
 elif grep -q '^check=runtime-projection:failed' "$TMP/codex_doctor_runtime_strict.out" \
   && grep -q '^check=native-subagents:ok' "$TMP/codex_doctor_runtime_strict.out" \
   && grep -q '^status=failed' "$TMP/codex_doctor_runtime_strict.out"; then
-  ok "codex doctor --runtime-strict fails closed without current-hash trust"
+  ok "codex fixture: doctor --runtime-strict fails closed without current-hash trust"
 else
-  bad "codex doctor --runtime-strict fail-closed result is incomplete"
+  bad "codex fixture: doctor --runtime-strict fail-closed result is incomplete"
 fi
 if AGENT_HOME="$ROOT" CODEX_HOME="$RPHOME" "$ROOT/adapters/codex/bin/install-runtime-projection.sh" >/dev/null 2>&1 \
   && AGENT_HOME="$ROOT" CODEX_HOME="$RPHOME" "$ROOT/adapters/codex/bin/check-runtime-projection.sh" >/dev/null 2>&1; then
-  ok "codex install-runtime-projection is idempotent"
+  ok "codex fixture: install-runtime-projection is idempotent"
 else
-  bad "codex install-runtime-projection should be idempotent"
+  bad "codex fixture: install-runtime-projection should be idempotent"
 fi
 RPHOME2="$TMP/codex-runtime-home2"
 rm -rf "$RPHOME2"; mkdir -p "$RPHOME2"; printf '{"old":1}\n' > "$RPHOME2/hooks.json"
 if AGENT_HOME="$ROOT" CODEX_HOME="$RPHOME2" "$ROOT/adapters/codex/bin/install-runtime-projection.sh" >/dev/null 2>&1 \
   && [ -f "$RPHOME2/hooks.json.pre-harness" ] && [ -L "$RPHOME2/hooks.json" ]; then
-  ok "codex install-runtime-projection backs up a pre-existing hooks.json"
+  ok "codex fixture: install-runtime-projection backs up a pre-existing hooks.json"
 else
-  bad "codex install-runtime-projection should back up a pre-existing hooks.json"
+  bad "codex fixture: install-runtime-projection should back up a pre-existing hooks.json"
 fi
+PATH=$PORTABLE_GUARDS_PATH_BEFORE_CODEX_FIXTURE
+export PATH
 
 echo "== opencode preflight wrapper =="
 git -C "$TMP/repo" switch -q -c opencode-work
