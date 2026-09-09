@@ -130,41 +130,46 @@ is_worker_session() {
 # silently pass is a worker session that lands on that shared default —
 # whether the variable was never exported or was exported empty. An
 # interactive, non-worker session legitimately keeps the `codex` default.
-# Distillation runs inside a hook, and a hook has a wall clock. A live curate
-# measured 21.9s against a 3s SessionEnd budget, so session-end distillation was
-# killed every time; the worker only advances its marker after a successful
-# exec, so the delta never moved and every session end failed the same way.
+# Memory lifecycle inside a hook, and a hook has a wall clock. Codex clamps the
+# SessionEnd hook to 3 seconds whatever hooks.json asks for, and it says so on
+# every session ("clamping SessionEnd hook timeout to 3s", measured 2026-09-09).
+# Nothing on this path fits that: a live curate measured 21.9s, and the `mem sync`
+# that runs BEFORE it measured 54.8s on the real store — so the sync was killed
+# every time and the curate behind it was never reached at all.
 #
-# Claude (`mem-distill-dispatch.sh`) and OpenCode (plugin `session.idle` →
-# detached `preflight session-end`) both already detach. Codex was the only
-# sibling running this synchronously, which is what made the hook budget bind.
-# A worker session still keeps the synchronous call — it must capture memory
-# before its process disappears, and its budget now fits inside the hook's (see
-# distill-worker.sh). An interactive session has no such race, so it detaches:
-# no wait for the user. setsid + nohup so the child outlives the reaped hook.
+# So the CALLER detaches, and it detaches the whole branch rather than its last
+# step: the hook returns in milliseconds and the work finishes outside the budget,
+# the same shape Claude (`mem-distill-dispatch.sh`) and OpenCode (plugin
+# `session.idle` → detached `preflight session-end`) already use. `detach_self`
+# re-enters this script with the marker set; setsid + nohup so the child outlives
+# the reaped hook.
+#
+# `run_distill` is therefore a plain synchronous runner. It used to branch on
+# `is_worker_session` and run synchronously for a worker — dead code from the
+# start, because BOTH call sites `exit 0` on a worker session several lines before
+# reaching it (D-42).
 #
 # The 2-tier contract, the shared curate-snapshot, and the whitelist applier are
-# untouched; only who waits for the worker changes.
+# untouched; only who waits changes.
+detach_self() {
+  # Re-run this same subcommand outside the hook's wall clock. `$CODEX_PREFLIGHT_DETACHED`
+  # is the recursion guard AND what the re-entered branch tests to know it may
+  # take its time.
+  CODEX_PREFLIGHT_DETACHED=1 setsid nohup "$ROOT/adapters/codex/bin/preflight.sh" "$@" \
+    >/dev/null 2>&1 &
+  return 0
+}
+
 run_distill() {
   distill_mode=$1
   distill_sid=$2
   distill_cwd=$3
-  if is_worker_session; then
-    AGENT_HOME="$AGENT_ROOT" \
-      CODEX_DISTILL_ENABLE="${CODEX_DISTILL_ENABLE:-1}" \
-      CODEX_DISTILL_APPLY="${CODEX_DISTILL_APPLY:-1}" \
-      CODEX_DISTILL_CONTRACT_ACCEPTED="${CODEX_DISTILL_CONTRACT_ACCEPTED:-1}" \
-      "$ROOT/adapters/codex/bin/distill-worker.sh" \
-        "$distill_sid" "$distill_cwd" "$distill_mode"
-    return $?
-  fi
   AGENT_HOME="$AGENT_ROOT" \
     CODEX_DISTILL_ENABLE="${CODEX_DISTILL_ENABLE:-1}" \
     CODEX_DISTILL_APPLY="${CODEX_DISTILL_APPLY:-1}" \
     CODEX_DISTILL_CONTRACT_ACCEPTED="${CODEX_DISTILL_CONTRACT_ACCEPTED:-1}" \
-    setsid nohup "$ROOT/adapters/codex/bin/distill-worker.sh" \
-      "$distill_sid" "$distill_cwd" "$distill_mode" >/dev/null 2>&1 &
-  return 0
+    "$ROOT/adapters/codex/bin/distill-worker.sh" \
+      "$distill_sid" "$distill_cwd" "$distill_mode"
 }
 
 guard_identity_hard_fail_if_worker() {
@@ -185,6 +190,7 @@ usage: preflight.sh write <file> [session-id] [turn-id]
        preflight.sh session-end [cwd] [session-id]
        preflight.sh prompt-signal [cwd] [session-id]
        preflight.sh turn-nudge [cwd] [session-id]
+       preflight.sh turn-nudge-distill [cwd] [session-id]   (internal: detached half)
        preflight.sh token-budget [cwd] [session-id] [kv|json|hook]
        preflight.sh memory [cwd]
        preflight.sh candidates <prompt> <cwd> <session-id> [turn-id]
@@ -525,6 +531,12 @@ case "$cmd" in
     sid=${3:-codex}
     # D-42 defense in depth: worker exit owns no sync/curator lifecycle.
     is_worker_session && exit 0
+    # Everything below is measured in tens of seconds against a 3-second hook (see
+    # `detach_self`), so the first thing this branch does is step outside the budget.
+    if [ "${CODEX_PREFLIGHT_DETACHED:-0}" != "1" ]; then
+      detach_self session-end "$cwd" "$sid"
+      exit 0
+    fi
     # SessionEnd sync contract (core/MEMORY.md §7): local sync is the default.
     # Pass the user's MEM_SYNC_REMOTE / deprecated MEM_DUMP_PUSH environment
     # unchanged; the adapter never opts the session into remote exchange and
@@ -540,8 +552,8 @@ case "$cmd" in
     # Boundary), so default the worker to apply mode. Opt out with
     # CODEX_DISTILL_ENABLE=0. session-end runs the *curate* (deep) tier —
     # snapshot-grounded prune/merge/graduate via the shared curate-snapshot +
-    # whitelist applier (D-30/D-32); turn-nudge runs increment. Synchronous so the
-    # headless codex exec captures memory before it exits (curate timeout-bounded).
+    # whitelist applier (D-30/D-32); turn-nudge runs increment. Synchronous here on
+    # purpose: this process is already detached, so it is the one that must wait.
     curator_status=0
     run_distill curate "$sid" "$cwd" || curator_status=$?
     [ "$sync_status" -eq 0 ] || exit "$sync_status"
@@ -600,10 +612,26 @@ case "$cmd" in
     counter=$((counter + 1))
     if [ "$counter" -ge "$interval" ]; then
       counter=0
-      run_distill increment "$sid" "$cwd" >/dev/null 2>/dev/null || true
+      # Detached for the same reason session-end is, and one more: this fires while
+      # the user is waiting for their own prompt to be accepted. Nobody waits 20s
+      # for a memory increment.
+      if [ "${CODEX_PREFLIGHT_DETACHED:-0}" = "1" ]; then
+        run_distill increment "$sid" "$cwd" >/dev/null 2>/dev/null || true
+      else
+        detach_self turn-nudge-distill "$cwd" "$sid"
+      fi
     fi
     printf '%s\n' "$counter" > "$state" 2>/dev/null || true
     find "$store" -maxdepth 1 -name '.codex-turn-state-*' -mmin +4320 -delete 2>/dev/null || true
+    ;;
+  turn-nudge-distill)
+    # Internal: the detached half of `turn-nudge`. Never a hook entry point — it does
+    # not touch the turn counter, only the distillation the counter asked for.
+    cwd=${2:-$PWD}
+    sid=${3:-codex}
+    is_worker_session && exit 0
+    run_distill increment "$sid" "$cwd" >/dev/null 2>/dev/null || true
+    exit 0
     ;;
   token-budget)
     cwd=${2:-$PWD}

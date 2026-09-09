@@ -330,14 +330,41 @@ def cmd_wait(args):
     return code
 
 
+# The harness flag that puts a launched session in a chosen directory. `herdr agent
+# start` has none of its own — the agent it starts inherits the PANE's shell cwd — so
+# `--cwd` used to move nothing but this CLI process: a session started with
+# `--cwd <hearting>` came up in `SR_CorrNet`, the pane's own directory (measured
+# 2026-09-10). Codex takes `-C/--cd`; Claude Code and OpenCode have no equivalent today,
+# so for those `--cwd` is REFUSED rather than silently ignored. Launching an agent
+# somewhere other than where the caller said is the failure this exists to prevent, and a
+# refusal the caller can read beats a session quietly working in the wrong repository.
+_CWD_FLAG = {"codex": "--cd"}
+
+
 def cmd_start(args):
     if _herdr_missing():
         return _unavailable("herdr-not-found")
 
+    pane_cwd = None
+    cwd_flag = []
+    if args.cwd:
+        flag = _CWD_FLAG.get(args.kind)
+        pane_cwd = os.path.realpath(os.path.expanduser(str(args.cwd)))
+        if not flag:
+            print(f"started=false reason=cwd-unsupported-by-{args.kind} "
+                  f"agent={args.kind} name={args.name} pane={args.pane} cwd={pane_cwd} "
+                  f"hint=start the pane in that directory, then start the agent")
+            return 1
+        if not os.path.isdir(pane_cwd):
+            print(f"started=false reason=cwd-not-a-directory agent={args.kind} "
+                  f"name={args.name} pane={args.pane} cwd={pane_cwd}")
+            return 1
+        cwd_flag = [flag, pane_cwd]
+
     mode = args.permission_mode or _default_permission_mode()
     agent_args = list(getattr(args, "agent_args", None) or [])
     prefix = list(_PERMISSION_FLAGS.get(args.kind, [])) if mode == "bypass" else []
-    full_agent_args = prefix + agent_args
+    full_agent_args = prefix + cwd_flag + agent_args
 
     # herdr `agent start <NAME> --kind --pane` — the display name is a required
     # positional (herdr 0.8+ prints `unknown option: <kind>` and starts nothing when
@@ -347,6 +374,9 @@ def cmd_start(args):
         cmd += ["--"] + full_agent_args
 
     try:
+        # `cwd=` here moves only this CLI process, never the launched agent — the agent
+        # is put in place by `_CWD_FLAG` above. Kept because herdr itself resolves some
+        # relative paths against its caller.
         proc = subprocess.run(cmd, capture_output=True, text=True, cwd=args.cwd or None)
     except (OSError, subprocess.SubprocessError):
         return _unavailable("herdr-invocation-failed")
@@ -384,9 +414,19 @@ def cmd_start(args):
             {"harness": args.kind, "session_id": started_sid, "name": args.name},
             "start", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), source="start",
         )
+    # `session_id=-` is the launch-time signal that this session will have no identity
+    # anywhere downstream: no ledger endpoint, no board badge, nothing to steer by name.
+    # It used to be visible only hours later as a nameless row (measured 2026-09-10: a
+    # codex session started here came up unmanaged because the pane's PATH had no
+    # hearting wrapper on it, so no tier-1 record was ever written). Saying it at the
+    # launch is the difference between a known gap and a mystery.
+    #
+    # `cwd=` only when one was asked for: it is the receipt that the flag was honored,
+    # and an unasked-for value would cost an extra herdr call on every start.
     print(
         f"started={str(started).lower()} agent={args.kind} name={args.name} "
-        f"pane={args.pane} permission_mode={mode}"
+        f"pane={args.pane} permission_mode={mode} session_id={started_sid or '-'}"
+        + (f" cwd={pane_cwd}" if pane_cwd else "")
     )
     return 0
 

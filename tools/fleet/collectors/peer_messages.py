@@ -230,7 +230,11 @@ def collect(state_roots=None):
             row["recv_1h"] += 1
         row["last_recv"] = {"from_name": _peer_name(frm, from_key),
                              "from_session_id": from_key[1] if from_key else None,
-                             "from_harness": from_key[0] if from_key else "",
+                             # An identity-less sender still has a harness, and the sent
+                             # side has always kept it. Dropping it here left the renderer
+                             # unable to look the peer up at all (measured 2026-09-10).
+                             "from_harness": (from_key[0] if from_key
+                                              else str(frm.get("harness") or "").lower()),
                              "kind": kind, "age_min": age_min}
 
     def _record_sent(from_key, kind, frm, to, to_key, age_min):
@@ -251,7 +255,11 @@ def collect(state_roots=None):
         row = _row(to_key)
         row["last_recv"] = {"from_name": _peer_name(frm, from_key),
                              "from_session_id": from_key[1] if from_key else None,
-                             "from_harness": from_key[0] if from_key else "",
+                             # An identity-less sender still has a harness, and the sent
+                             # side has always kept it. Dropping it here left the renderer
+                             # unable to look the peer up at all (measured 2026-09-10).
+                             "from_harness": (from_key[0] if from_key
+                                              else str(frm.get("harness") or "").lower()),
                              "kind": inherited, "age_min": age_min}
 
     # Correlation is bounded by the existing tail/window/max limits. A clipped sender

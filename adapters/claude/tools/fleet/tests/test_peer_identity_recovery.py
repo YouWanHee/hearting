@@ -1,0 +1,1 @@
+../../../../../tools/fleet/tests/test_peer_identity_recovery.py

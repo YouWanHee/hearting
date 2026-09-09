@@ -546,13 +546,14 @@ class UnpairedBadgeTest(unittest.TestCase):
         self.assertEqual(len(self._text(segs)), render._TAG_W)
         self.assertEqual(segs[1], ("--", "tag_dim"))
 
-    def test_other_untagged_rows_keep_the_blank_slot_and_stewards_keep_their_star(self):
+    def test_other_untagged_rows_keep_the_blank_slot_and_stewards_keep_their_mark(self):
         blank = _codex(100)
         self.assertEqual(self._text(render._session_tag_chip(blank)), " " * render._TAG_W)
         steward = _codex(100, app_server=True)
         steward.steward = True
         steward._session_tag_unpaired = True
-        self.assertEqual(self._text(render._session_tag_chip(steward)), "[* ] ")
+        self.assertEqual(self._text(render._session_tag_chip(steward)),
+                         "[%s ] " % render._ICON_STEWARD)
 
     def test_a_shared_tag_renders_exactly_like_a_minted_one(self):
         paired = _codex(100, app_server=True, managed_dir=_DIR_A, tag="9c")

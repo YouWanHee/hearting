@@ -42,12 +42,16 @@ class StewardChipTest(unittest.TestCase):
         self.assertEqual(sum(render._dw(t) for t, _k in segs), render._TAG_W)
         self.assertEqual(render._HUE_OF["tag_steward"], ("y", render._A_BOLD))
 
-    def test_untagged_steward_gets_a_star_badge(self):
+    def test_untagged_steward_wears_the_role_mark_not_a_pretend_id(self):
+        """The badge column holds session numbers, so `*` there read as an id the user
+        could not find (2026-09-09: "그 id 가 안뜨는 경우도 있는것 같은데?"). The steward
+        flag is the same glyph this session's relation line already uses."""
         for harness in ("codex", "opencode"):
             with self.subTest(harness=harness):
                 segs = render._session_tag_chip(self._s(harness=harness, steward=True))
-                self.assertEqual(segs[1], ("* ", "tag_steward"))
+                self.assertEqual(segs[1], (render._ICON_STEWARD + " ", "tag_steward"))
                 self.assertEqual(sum(render._dw(t) for t, _k in segs), render._TAG_W)
+                self.assertNotIn("*", "".join(t for t, _k in segs))
 
     def test_non_steward_rows_are_unchanged(self):
         self.assertEqual(render._session_tag_chip(self._s(session_tag="46"))[1], ("46", "tag"))

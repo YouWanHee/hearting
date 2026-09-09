@@ -136,6 +136,113 @@ def minted_tag(session_id: object) -> Optional[str]:
     return hashlib.sha256(session_id.strip().encode("utf-8")).hexdigest()[:2]
 
 
+_SOCKET_ADDRESS_RE = re.compile(r"^(?:uds|unix):/.*/(?P<pid>\d+)\.sock$")
+
+
+def _claude_sessions_dir(home: object = None) -> Optional[str]:
+    """The Claude Code session-registry directory, or ``None`` when none exists.
+
+    The env candidates are tried in order and the first one that actually HAS a
+    `sessions/` directory wins. `AGENT_HOME` is in the list for historical reasons and is
+    the harness root, not a Claude config dir — under a managed release it pointed at a
+    tree with no `sessions/` at all, and taking it on faith made every lookup here return
+    nothing while Fleet ran (measured 2026-09-10; `resolve_tag` only survived it because
+    it has a second source).
+    """
+    candidates = [str(home)] if home else [
+        os.environ.get("CLAUDE_CONFIG_DIR"),
+        os.environ.get("CLAUDE_HOME"),
+        os.environ.get("AGENT_HOME"),
+        os.path.expanduser("~/.claude"),
+    ]
+    for base in candidates:
+        if not base:
+            continue
+        path = os.path.join(base, "sessions")
+        if os.path.isdir(path):
+            return path
+    return None
+
+
+def session_id_for_address(address: object, *, config_dir: object = None) -> Optional[str]:
+    """``uds:/run/user/1002/cc-socks/284639.sock`` → that session's id, else ``None``.
+
+    Claude Code addresses a peer by its socket, and the socket is named after the peer
+    process's PID — the same PID the runtime writes ``<config>/sessions/<pid>.json`` for.
+    So the address IS an exact identity; the ledger simply could not read it and filed it
+    under ``name`` instead, where a socket path is (correctly) refused as a display name
+    and the board fell back to a bare ``claude``: 222 rows measured 2026-09-10.
+
+    One definition, two callers — the ledger writer resolves it once at record time so the
+    stored row is durable, and the board resolves it again for rows written before that.
+    A resumed session can leave a stale ``sessionId`` in its PID file, so this is best
+    evidence rather than proof; the PID inside the file must at least agree with the one
+    in the address.
+    """
+    if not isinstance(address, str):
+        return None
+    match = _SOCKET_ADDRESS_RE.match(address.strip())
+    if not match:
+        return None
+    pid = match.group("pid")
+    sessions = _claude_sessions_dir(config_dir)
+    if not sessions:
+        return None
+    try:
+        with open(os.path.join(sessions, pid + ".json"), encoding="utf-8") as fh:
+            record = json.load(fh)
+    except Exception:
+        return None
+    if not isinstance(record, dict) or str(record.get("pid") or pid) != pid:
+        return None
+    session_id = record.get("sessionId")
+    return session_id if isinstance(session_id, str) and session_id.strip() else None
+
+
+def session_id_for_derived_name(name: object, *, home: object = None) -> Optional[str]:
+    """A Claude derived session name (``bc-resnet-15``) → that session's id, else ``None``.
+
+    The inverse of the name the badge is read off. Older ledger rows carry a peer's name
+    but no id, and a name and a badge for the same peer are two shapes for one relation —
+    the inconsistency the user reported (2026-09-09). Only a record that still says
+    ``nameSource == "derived"`` counts, for the same reason `derived_tag` insists on it: a
+    user-set ``release-1a`` has the identical shape and is not a badge.
+
+    Ambiguity yields ``None``: a name reused by two records names neither.
+    """
+    if not isinstance(name, str) or not name.strip():
+        return None
+    wanted = name.strip()
+    if not derived_tag(wanted):
+        return None
+    sessions = _claude_sessions_dir(home)
+    if not sessions:
+        return None
+    found = None
+    try:
+        for entry in os.listdir(sessions):
+            if not entry.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(sessions, entry), encoding="utf-8") as fh:
+                    record = json.load(fh)
+            except Exception:
+                continue
+            if not isinstance(record, dict) or record.get("name") != wanted:
+                continue
+            if record.get("nameSource") != "derived":
+                continue
+            session_id = record.get("sessionId")
+            if not isinstance(session_id, str) or not session_id.strip():
+                continue
+            if found is not None and found != session_id:
+                return None
+            found = session_id
+    except Exception:
+        return None
+    return found
+
+
 def resolve_tag(harness: object, session_id: object, *, home: object = None) -> Optional[str]:
     """The one 2-hex badge rule, shared by every surface that draws `[xx]`.
 
@@ -157,16 +264,13 @@ def resolve_tag(harness: object, session_id: object, *, home: object = None) -> 
         return None
     # Claude: the derived `<basename>-<xx>` name is the only carrier, and only while the
     # record still says `derived` (a user-set `release-1a` has the same shape, F-100a).
-    base = str(home) if home else (os.environ.get("CLAUDE_CONFIG_DIR")
-                                   or os.environ.get("AGENT_HOME")
-                                   or os.environ.get("CLAUDE_HOME")
-                                   or os.path.expanduser("~/.claude"))
+    sessions = _claude_sessions_dir(home)
     try:
-        for entry in os.listdir(os.path.join(base, "sessions")):
+        for entry in os.listdir(sessions or ""):
             if not entry.endswith(".json"):
                 continue
             try:
-                with open(os.path.join(base, "sessions", entry), encoding="utf-8") as fh:
+                with open(os.path.join(sessions, entry), encoding="utf-8") as fh:
                     record = json.load(fh)
             except Exception:
                 continue
