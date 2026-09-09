@@ -719,8 +719,8 @@ attempts were killed by Claude Code interrupt/lifecycle handling (hearting-21,
 2026-09-02~03); v51's "measured" was a single observation with no durability. Completion
 detection is `watch`: the watcher outlives the session, the receipt outlives the watcher,
 and the wake is the adapter carrier's job. The registered owner attempt's `asyncRewake`
-rule is a different surface and still applies only to the exact owner attempt armed by
-`dispatch-owner --start`.
+rule is a different surface and still applies only to the exact owner attempt the
+registry binds to the session.
 
 **S4** observed evidence — a claim follows §5.12's standard: PID identity, sentinel/exit
 evidence, log mtime, and declared artifacts. Message text, a `ListAgents` status word, or

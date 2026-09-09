@@ -313,22 +313,19 @@ stamp path in `core/HOOKS.md`.
   speculative, so the next-prompt sweep can still re-deliver it once if the
   wake was lost; the release retires it either way), and tells the session to
   put the `[방향 확인]` card and interview questions to the user and record
-  the answer with `workflow-supervisor.py release`. That release command — the
-  typed `release` or legacy `gate --release` surface, run in the same session
-  — is the second arming event: from the `route_id` in its JSON output (never
-  from the `--route` literal, which a refused release names too) and the
-  registry's one started open depth-1 owner bound to this session, a new hook
-  process waits on the owner's completion exactly as the start did. A refused
-  release arms nothing silently, with one exception (SD-OPEN-48): a release
-  the supervisor refused as already released prints one typed JSON line
-  (`refusal: gate-not-blocked` with the `route_id`) and that line arms the
-  route's running owner — it is heading for a completion that still owes the
-  session a wake; the prose and the `--route` literal never arm;
-  a recorded release with no started open owner (the owner ended at the gate,
-  or was refused at start) or an ambiguous owner set arms nothing and emits
-  one typed `not-armed surface=release` (or `surface=release-refused`)
-  notice; the `UserPromptSubmit` sweep still delivers the pending record at
-  the next prompt. A raise seals `release_authority` (`depth-0` for an
+  the answer with `workflow-supervisor.py release`. The hook records which
+  gate record it spent that wake on (arm ledger, below), and the first Bash
+  call this session makes after that record closes — the `release` command
+  itself retires it (`retire_gate_delivery`); the next-prompt sweep acks it —
+  re-arms a new hook process on the owner's completion exactly as the start
+  did, whatever that command was. So the release is still the second arming
+  event, and a release from another pane, or one the supervisor refused as
+  already released (SD-OPEN-48: the owner released its own gate and is
+  running towards a completion that still owes the session a wake), re-arms
+  by the same rule; no command text or JSON output is read. A route with no
+  started open owner (the owner ended at the gate, or was refused at start)
+  arms nothing; the `UserPromptSubmit` sweep still delivers the pending
+  record at the next prompt. A raise seals `release_authority` (`depth-0` for an
   interview gate, a binding that declares it, or an artifact that declares it
   about itself; `any` otherwise): a registered headless owner's `release` /
   `gate --release` of a `depth-0` gate is refused typed
@@ -365,23 +362,27 @@ stamp path in `core/HOOKS.md`.
   owner or different live gate, records an audited `expired` state atomically,
   and never writes a release, deletes the route/registry/marker/record, or turns
   the source attempt into PASS.
-- The interactive Claude `asyncRewake` bridge recognizes both an exact
-  `dispatch-owner --start` and the quick one-shot
-  `dispatch-node --action start` surface. Neither command is wake authority by
-  itself: arming still requires exactly one recent, same-session,
-  claimed-and-started depth-1 `worker_type=owner` row stamped
-  `parent_completion_delivery=claude-parent-runtime`. When several such rows
-  share the window — a same-session wave of owner starts — the registry
-  fallback first narrows them by the exact `--slug`/`--worktree` literals of
-  the observed start command (unexpanded shell variables never match), and
-  only an exact single survivor arms; zero, still-ambiguous, stale, foreign,
-  or non-owner candidates arm nothing. A start whose receipt proves
-  `started=1` (or whose fully-hidden stdout leaves at least one same-session
-  registry candidate) but that armed neither path emits one typed
-  `not-armed` notice naming the explicit poll-fallback instead of staying
-  silent — grep-filtered start stdout is the recurring cause (2026-09-01,
-  five fleet owners; the notice never overrides fail-closed arming, it only
-  makes the loss loud).
+- The interactive Claude `asyncRewake` bridge never reads the Bash command
+  text (2026-09-09; six consecutive reviews had each found a new hole in the
+  shell parsing that decided which owner a command had started). It
+  identifies the owner from what the launch wrote: the start receipt's
+  `attempt_id` (`status=start`, `started=1`, `parent_session_id` = this
+  session, `job_registry`), else the registry's open, claimed-and-started
+  depth-1 `worker_type=owner` rows stamped
+  `parent_completion_delivery=claude-parent-runtime` and bound to this
+  session. An arm ledger under the registry's state root
+  (`rewake-arms/<attempt_id>.json`: flock, holder process identity, state
+  `waiting`/`gate-wake-sent`/`lapsed`/`ended`, at most eight arms) makes
+  arming exactly-once: every `PostToolUse(Bash)` of the session may take one
+  unclaimed fresh row (oldest first, started inside the arm window), so a
+  wave of starts arms one waiter per call, filtered stdout costs nothing,
+  any launcher prefix works, and a foreign command that merely mentions the
+  utility cannot re-arm an attempt already watched. A claim whose holder
+  died (session restart, `--resume`), lapsed (timeout, bridge error), or
+  spent its wake on a gate record that has since closed is re-taken
+  regardless of row age; `ended` never is. A start whose receipt proves
+  `started=1` but whose attempt no hook process holds emits one typed
+  `not-armed` notice naming the explicit poll-fallback.
 - Managed receipt schema v2 binds the one canonical absolute `job_registry`
   supplied by its completion sidecar. The gateway includes it in the delivery
   digest and names it with `--jobs` in every actionable harvest command, so
