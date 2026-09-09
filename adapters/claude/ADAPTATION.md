@@ -177,8 +177,9 @@ main/orchestrator chooses per job and the wrapper only reflects that choice:
   bound to the session (never from the command text) and arms one native
   `asyncRewake` hook for it, one waiter per attempt (and, since SD-122 v56, a second
   `asyncRewake` hook for an exact steward watch armed by `peer-steward.py watch`). The hook waits for terminal
-  quiescence outside the model and wakes once with an exact harvest command;
-  ordinary Bash calls are silent no-ops, and no Background Bash monitor,
+  quiescence outside the model and wakes once with an exact receipt (a harvest
+  command when one is required); an ordinary Bash call arms nothing unless a
+  fresh or re-armable row of this session is waiting, and no Background Bash monitor,
   `dispatch-wait`, progress recap, or periodic re-arm is created. Immediately
   before rendering, the hook re-reads the exact row and its sealed completion
   evidence: every terminal receipt, success or attention, exits two — Claude

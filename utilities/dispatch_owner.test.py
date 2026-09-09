@@ -622,6 +622,17 @@ class DispatchOwnerTests(unittest.TestCase):
             self.assertEqual(str(refused.exception), "inherited-registry-unusable")
         self.assertIn("AGENT_DISPATCH_JOBS", OWNER.hint_for("inherited-registry-unusable"))
         self.assertIn("SESSION", OWNER.hint_for("inherited-registry-unusable"))  # R5 m1: a per-command change cannot help
+        # top review M2: with no inherited variable, a canonical path that exists
+        # as a symlink is refused too; an absent canonical file (first run) is not
+        link_canonical = self.home / "canonical-link.log"
+        link_canonical.symlink_to(canonical)
+        with mock.patch.object(OWNER, "_canonical_jobs", return_value=str(link_canonical)):
+            with self.assertRaises(OWNER.OwnerError) as refused:
+                OWNER._authoritative_jobs({}, {"AGENT_DISPATCH_CALLER_HARNESS": "claude"})
+            self.assertEqual(str(refused.exception), "canonical-registry-unusable")
+        with mock.patch.object(OWNER, "_canonical_jobs", return_value=str(self.home / "not-yet" / "jobs.log")):
+            self.assertEqual(OWNER._authoritative_jobs({}, {"AGENT_DISPATCH_CALLER_HARNESS": "claude"}), "")
+        self.assertIn("symlink", OWNER.hint_for("canonical-registry-unusable"))
         # the same symlink is fine for an unmanaged codex caller, and a managed codex
         # parent still accepts its realpath alias
         self.assertEqual(OWNER._authoritative_jobs({}, {"AGENT_DISPATCH_CALLER_HARNESS": "codex",

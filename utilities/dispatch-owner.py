@@ -99,6 +99,9 @@ _HINTS = {
     "explicit-jobs-outside-parent-registry": "drop --jobs: an interactive Claude parent's completion hook trusts only the inherited "
                                              "AGENT_DISPATCH_JOBS (or the installed canonical registry), so an owner started into another "
                                              "registry could never wake this session",
+    "canonical-registry-unusable": "the installed canonical registry path exists but is not an absolute, non-symlink "
+                                   "regular file (a symlinked jobs.log?); the parent's completion hook will not read it. "
+                                   "Restore the real file at that path before starting an owner",
     "inherited-registry-unusable": "AGENT_DISPATCH_JOBS is set but is not an absolute, non-symlink regular file, and the "
                                    "parent's completion hook reads the SESSION's value, not this command's: changing or unsetting "
                                    "it for one Bash call starts an owner the parent can never wake. Fix the variable in the "
@@ -480,6 +483,15 @@ def _authoritative_jobs(values, env):
             trusted = inherited
         else:
             trusted = _canonical_jobs()
+            canonical = Path(trusted) if trusted else None
+            # The hook trusts the canonical file only as a regular file. A
+            # registry that does not exist yet is the ordinary first run (the
+            # wrapper creates it); one that exists as a symlink or a
+            # non-regular file would be written by the wrapper and never
+            # read by the hook (top review M2).
+            if canonical is not None and (canonical.is_symlink() or canonical.exists()) \
+                    and not _usable_registry(trusted):
+                raise OwnerError("canonical-registry-unusable")
         if explicit and (not trusted or _resolved_path(explicit) != _resolved_path(trusted)):
             raise OwnerError("explicit-jobs-outside-parent-registry")
     return explicit or inherited
