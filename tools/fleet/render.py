@@ -41,6 +41,9 @@ from .model import (fmt_min, dash, project_of, exec_child_is_wait,
 from . import gitinfo
 from .refresh import LiveSnapshot, RefreshPump, MAX_LEAKED_WORKERS
 from .session_handle import display_name as _display_name
+from .session_handle import _cell_width as _session_handle_cell_width
+from .session_handle import clip_cells as _clip_cells
+from .session_handle import resolve_tag as _resolve_session_tag
 
 # curses attribute constants — real values when curses is present, harmless 0 fallbacks
 # otherwise, so this module imports (and the plain --once path runs) with no curses at all.
@@ -3605,6 +3608,11 @@ _PEER_NAME_UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
 
 
+_PEER_NAME_PANE_RE = re.compile(r"^w[0-9A-Za-z]{1,3}:p[0-9A-Za-z]{1,3}$")
+_PEER_NAME_HEX_RE = re.compile(r"^[0-9a-f]{12,}$", re.I)
+_PEER_NAME_MAX_CELLS = 26
+
+
 def _peer_name_is_readable(name):
     """True when the ledger's `name` is something a person can act on.
 
@@ -3623,14 +3631,20 @@ def _peer_name_is_readable(name):
     text = name.strip()
     if not text:
         return False
-    if _PEER_NAME_UUID_RE.match(text):
-        return False                       # the raw session id pasted into the name slot
+    if _PEER_NAME_UUID_RE.match(text) or _PEER_NAME_HEX_RE.match(text):
+        return False                       # a raw id pasted into the name slot
+    if _PEER_NAME_PANE_RE.match(text):
+        return False                       # `wB:p5` — where it runs, not which session
     if text.startswith("/") or "://" in text:
         return False                       # a path or a URL
     scheme = text.split(":", 1)[0]
     if scheme and scheme.isascii() and scheme.isalpha() and ":/" in text:
         return False                       # uds:/…, unix:/…, and friends
-    return True
+    # Length is NOT a rejection: `fleet-stall-codex-parity-10` is a real name that happens
+    # to be long, and a clipped real name beats `claude:a8e66aa4`. Only prose gets dropped
+    # — a whole sentence in the name slot (a session title, from an older send path) is not
+    # a name and clipping it just yields a truncated sentence.
+    return " " not in text or _session_handle_cell_width(text) <= _PEER_NAME_MAX_CELLS
 
 
 def _peer_endpoint_segs(harness, session_id, name, tag_by_key):
@@ -3645,11 +3659,19 @@ def _peer_endpoint_segs(harness, session_id, name, tag_by_key):
     harness = str(harness or "").lower()
     sid = session_id if isinstance(session_id, str) and session_id else None
     tag = (tag_by_key or {}).get((harness, sid)) if sid else None
+    if not tag and sid:
+        # The badge is the whole point, so an off-board peer gets one too when the shared
+        # record can still produce it. Without this the same session reads `[67] claude`
+        # while it happens to be on screen and something else entirely once it scrolls off.
+        try:
+            tag = _resolve_session_tag(harness, sid)
+        except Exception:
+            tag = None
     if tag:
         return [("[", "dim"), (str(tag), "tag"), ("]", "dim"),
                 (" " + (harness or "peer"), "dim")]
     if _peer_name_is_readable(name):
-        return [(name.strip(), "dim")]
+        return [(_clip_cells(name.strip(), _PEER_NAME_MAX_CELLS), "dim")]
     if sid:
         return [("%s:%s" % (harness or "peer", sid[:8]), "dim")]
     return [(harness, "dim")] if harness else []

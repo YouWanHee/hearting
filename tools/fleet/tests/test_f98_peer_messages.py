@@ -449,15 +449,20 @@ class PeerEndpointLabelTest(unittest.TestCase):
     def test_real_session_names_still_pass(self):
         # Names here are free-form and often Korean prose, so the check has to be a small
         # denylist rather than a guess at what a name looks like.
+        # `wB:p3` is deliberately absent: a pane id says where a session runs, not which
+        # session it is, and the live board printed it in the name slot.
         for value in ("hearting-46", "bc-resnet-67", "케언 W15 사이클 이어받기",
-                      "q1-tts: v6 본생산", "wB:p3"):
+                      "q1-tts: v6 본생산"):
             with self.subTest(value=value):
                 self.assertTrue(render._peer_name_is_readable(value))
 
     def test_an_unusable_name_falls_through_to_the_short_id(self):
-        segs = render._peer_endpoint_segs(
-            "claude", "7a001534-ea46-4a67-971b-199c586889e2",
-            "uds:/run/user/1002/cc-socks/2952102.sock", {})
+        # Only when no tag can be resolved for the peer — a resolvable tag outranks both,
+        # which is what keeps one relation from changing shape between ticks.
+        with mock.patch.object(render, "_resolve_session_tag", return_value=None):
+            segs = render._peer_endpoint_segs(
+                "claude", "7a001534-ea46-4a67-971b-199c586889e2",
+                "uds:/run/user/1002/cc-socks/2952102.sock", {})
         self.assertEqual("".join(t for t, _ in segs), "claude:7a001534")
 
     def test_an_unusable_name_with_no_id_falls_back_to_the_harness(self):
@@ -469,6 +474,55 @@ class PeerEndpointLabelTest(unittest.TestCase):
             "claude", "7a001534-ea46-4a67-971b-199c586889e2", "/tmp/x.sock",
             {("claude", "7a001534-ea46-4a67-971b-199c586889e2"): "46"})
         self.assertEqual("".join(t for t, _ in segs), "[46] claude")
+
+
+class PeerEndpointOneShapeTest(unittest.TestCase):
+    """Every relation must read the same way, whoever else is on the board.
+
+    Measured on the live board before this: the same kind of line appeared as `[67] claude`,
+    `wB:p5`, `bc-resnet-67`, `a8e66aa4a25f5d807`, a full Korean session title, and a bare
+    `claude` — six shapes for one relation, which is the inconsistency the user reported.
+    """
+
+    def test_a_session_id_always_produces_the_badge_shape(self):
+        # Off-board peers resolve their own tag, so a session does not change shape when it
+        # scrolls off screen.
+        with mock.patch.object(render, "_resolve_session_tag", return_value="3a"):
+            for name in ("a8e66aa4a25f5d807", "wB:p5", "bc-resnet-67", None,
+                         "Claude Code 사용량 리셋 및 감독 인수인계"):
+                with self.subTest(name=name):
+                    segs = render._peer_endpoint_segs("codex", "sid-1", name, {})
+                    self.assertEqual("".join(t for t, _ in segs), "[3a] codex")
+
+    def test_an_on_board_badge_beats_the_resolver(self):
+        with mock.patch.object(render, "_resolve_session_tag", side_effect=AssertionError):
+            segs = render._peer_endpoint_segs("claude", "sid-1", "x", {("claude", "sid-1"): "67"})
+        self.assertEqual("".join(t for t, _ in segs), "[67] claude")
+
+    def test_a_resolver_failure_never_breaks_the_row(self):
+        with mock.patch.object(render, "_resolve_session_tag", side_effect=OSError("boom")):
+            segs = render._peer_endpoint_segs("claude", "sid-1", "bc-resnet-67", {})
+        self.assertEqual("".join(t for t, _ in segs), "bc-resnet-67")
+
+    def test_machine_values_are_never_shown_as_a_name(self):
+        with mock.patch.object(render, "_resolve_session_tag", return_value=None):
+            for name in ("a8e66aa4a25f5d807",                      # bare hex id
+                         "wB:p5",                                   # a pane, not a session
+                         "uds:/run/user/1002/cc-socks/2952102.sock",
+                         "01a084f7-63f2-7961-ae60-6fc2d8e60fc2",
+                         "Claude Code 사용량 리셋 및 감독 인수인계"):   # a title, not a name
+                with self.subTest(name=name):
+                    segs = render._peer_endpoint_segs("claude", None, name, {})
+                    self.assertEqual("".join(t for t, _ in segs), "claude")
+
+    def test_a_long_real_name_is_clipped_not_discarded(self):
+        # `fleet-stall-codex-parity-10` is a real name that happens to be long; a clipped
+        # real name beats falling through to `claude:a8e66aa4`.
+        with mock.patch.object(render, "_resolve_session_tag", return_value=None):
+            segs = render._peer_endpoint_segs("claude", None, "fleet-stall-codex-parity-10", {})
+        shown = "".join(t for t, _ in segs)
+        self.assertTrue(shown.startswith("fleet-stall-codex-parity"), shown)
+        self.assertNotEqual(shown, "claude")
 
 
 if __name__ == "__main__":
