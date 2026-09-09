@@ -170,9 +170,10 @@ main/orchestrator chooses per job and the wrapper only reflects that choice:
   ledger evidence, and the proven-fatal `--disallowedTools` deny still applies in both postures
   (`core/OPERATIONS.md §5.10` "Registered headless permission posture").
 - Direct registered child completion is selected by the parent runtime, not by
-  the child wrapper. An interactive Claude parent receives the successful exact
-  owner-start receipt through `PostToolUse(Bash)` and arms one native
-  `asyncRewake` hook for that owner attempt (and, since SD-122 v56, a second
+  the child wrapper. An interactive Claude parent's `PostToolUse(Bash)` hook
+  identifies the exact owner attempt from the start receipt or the registry row
+  bound to the session (never from the command text) and arms one native
+  `asyncRewake` hook for it, one waiter per attempt (and, since SD-122 v56, a second
   `asyncRewake` hook for an exact steward watch armed by `peer-steward.py watch`). The hook waits for terminal
   quiescence outside the model and wakes once with an exact harvest command;
   ordinary Bash calls are silent no-ops, and no Background Bash monitor,
