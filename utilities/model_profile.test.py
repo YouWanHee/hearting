@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 from pathlib import Path
+import re
 import sys
 import tempfile
 import unittest
@@ -140,22 +141,33 @@ class ModelProfileTest(unittest.TestCase):
         return (config[f"CFG_TIER_{key}_MODEL"], budget)
 
     @staticmethod
-    def _reachable_models(adapter, config, path):
+    def _reachable_models(adapter, config):
         """Every concrete model this config can put in front of a worker: the declared
         tier models plus each of the five profiles' resolved model. A profile may name a
         model directly (`model/<id>:budget`), so scanning `CFG_TIER_*_MODEL` alone leaves
-        a hole an edit can walk through (review MA-2a)."""
+        a hole an edit can walk through (review MA-2a). Resolution goes through the values
+        already parsed here, not through a second read of the file — one value, one source.
+        """
         models = {value for key, value in config.items() if key.endswith("_MODEL")}
         for profile in ("deep", "balanced-deep", "balanced", "light", "mini"):
-            models.add(PROFILE.resolve_profile(adapter, path, profile)["model"])
+            models.add(PROFILE.resolve_profile_values(adapter, config, profile)["model"])
         return models
+
+    @staticmethod
+    def _restricted(model, aliases):
+        """The predicate every launch surface actually uses: tokenize the id and test
+        alias membership (`dispatch-headless.py`, `stage-dispatch-fallback.py`,
+        `hooks/subagent-model-default.sh` all do exactly this). Exact string equality
+        would see `model/fable:...` but not `model/claude-fable-5-1:...`, which the
+        wrapper still refuses at launch (review r2-1)."""
+        tokens = set(re.split(r"[^a-z0-9]+", model.lower()))
+        return any(alias.lower() in tokens for alias in aliases)
 
     def test_claude_shipped_default_is_the_user_profile_mapping(self):
         # 2026-09-09 user rule: the shipped default equals the user's runtime
         # mapping — the top model (Fable) is reserved for the main session, so
         # both deep-side profiles ride opus and separate by effort only.
-        path = ROOT / "adapters" / "claude" / "config" / "models.conf"
-        config = PROFILE.load_config(path)
+        config = PROFILE.load_config(ROOT / "adapters" / "claude" / "config" / "models.conf")
         main_only = config["CFG_MAIN_SESSION_ONLY_MODELS"].split()
         self.assertEqual(main_only, ["fable"])
         self.assertEqual(self._declared_point(config, "deep"), ("opus", "xhigh"))
@@ -175,7 +187,8 @@ class ModelProfileTest(unittest.TestCase):
         self.assertNotIn(config["CFG_TIER_DEEP_MODEL"], main_only)
         self.assertEqual([model for model in cascade if model in main_only], [])
         self.assertEqual(
-            [m for m in self._reachable_models("claude", config, path) if m in main_only], []
+            [m for m in self._reachable_models("claude", config) if self._restricted(m, main_only)],
+            [],
         )
         self.assertEqual(config["CFG_TIER_DEEP_FAILOVER"], "light")
         points = {profile: self._declared_point(config, profile) for profile in ("deep", "balanced-deep", "balanced", "light", "mini")}
@@ -188,8 +201,7 @@ class ModelProfileTest(unittest.TestCase):
         # effort and balanced-deep is the same model at medium. This adapter has
         # no main-session-only KEY — the restriction is carried by never naming
         # Astra in a tier or cascade, which is what this test pins.
-        path = ROOT / "adapters" / "codex" / "config" / "models.conf"
-        config = PROFILE.load_config(path)
+        config = PROFILE.load_config(ROOT / "adapters" / "codex" / "config" / "models.conf")
         self.assertEqual(self._declared_point(config, "deep"), ("gpt-5.6-sol", "xhigh"))
         self.assertEqual(self._declared_point(config, "balanced-deep"), ("gpt-5.6-sol", "medium"))
         cascade = [entry.split(":", 1)[0] for entry in config["CFG_TIER_DEEP_FAILOVER_CASCADE"].split()]
@@ -200,7 +212,8 @@ class ModelProfileTest(unittest.TestCase):
         # RESOLVED model (which covers the `model/<id>:budget` form a key scan misses,
         # review MA-2a). `tools/check-model-config.py` separately refuses the literal
         # anywhere outside this file.
-        self.assertNotIn("gpt-6-astra", set(cascade) | self._reachable_models("codex", config, path))
+        reachable = set(cascade) | self._reachable_models("codex", config)
+        self.assertEqual([m for m in reachable if self._restricted(m, ["astra"])], [])
 
     def test_portable_profiles_resolve_to_declared_adapter_budgets(self):
         claude_config = PROFILE.load_config(ROOT / "adapters" / "claude" / "config" / "models.conf")

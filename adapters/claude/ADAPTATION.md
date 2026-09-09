@@ -375,8 +375,11 @@ Behavior personas live in the portable unit catalog `roles/units/` and carry
 portable role names only — they have no Claude `model:` frontmatter. The former
 per-team agent files (plan-team, dev-team, qa-team, and the other five) were
 removed in the unit-catalog migration. The only kernel helper agent under
-`adapters/claude/agents/` is `memory-scout`, whose frontmatter pins the mini
-tier (haiku) as an explicit `check-model-config.py` exemption. Every other
+`adapters/claude/agents/` is `memory-scout`. Unlike the Codex kernel helper (derived
+from `CFG_PROFILE_MEMORY_SCOUT`), this one is hand-authored and pins `haiku` — a model
+**no tier in `config/models.conf` declares**, since the mini tier moved to `sonnet` on
+2026-08-07. It rides a whole-file `check-model-config.py` exemption, so retuning every
+tier leaves it where it is. Read it as an explicit pin, not as "the mini tier". Every other
 native subagent spawn resolves its model through the native-subagent default
 below.
 

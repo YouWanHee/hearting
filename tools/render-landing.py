@@ -767,14 +767,16 @@ MEMORY_STEPS = [
      "merge, and delete fail closed against them."),
 ]
 
-# Tier · budget below is the PORTABLE operating point, not one adapter's numbers; each
-# adapter's own tiers live in its config/models.conf. Three rows were wrong until
-# 2026-09-09 (mini rode `medium` though every adapter ships `mini:low`, balanced-deep was
-# listed on the deep tier though Claude and OpenCode give it its own, and `balanced` was
-# missing entirely). `generate.py --check` only proves docs/ matches this list, so it
-# cannot catch drift here — keep it honest by hand when a profile changes.
+# Tier · budget below is "as CLAUDE realizes it", not a portable number. The tier column
+# is adapter-dependent and cannot be made portable: Claude and OpenCode give balanced-deep
+# its own tier, Codex rides the deep tier at a lower effort, and OpenCode has no effort
+# axis at all (every budget there is `runtime-default`). Each adapter's own tiers live in
+# its config/models.conf. Three rows were outright wrong until 2026-09-09 (mini rode
+# `medium` though every adapter ships `mini:low`, balanced-deep was on the deep tier, and
+# `balanced` was missing entirely). `generate.py --check` only proves docs/ matches this
+# list, so it cannot catch drift here — keep it honest by hand when a profile changes.
 MODEL_PROFILES = [
-    ("deep", "deep", "highest-confidence convergence, failure-mode and security judgment", "deep · xhigh"),
+    ("deep", "deep", "highest-confidence convergence, failure-mode and security judgment", "deep · xhigh"),  # claude
     ("balanced-deep", "bal", "deep-model judgment at a lower coordination budget", "balanced-deep · medium"),
     ("balanced", "bal", "long multi-step execution after the decision is settled", "light · high"),
     ("light", "light", "low-latency production, structured checking, broad exploration", "light · medium"),

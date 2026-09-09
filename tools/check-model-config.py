@@ -62,6 +62,12 @@ EXEMPT_SUBSTRINGS = (
     "/tools/fleet/projection.py",       # display projection of collected values
     "/tools/fleet/collectors/claude.py",  # /api/oauth/usage bucket keys + their labels
     "/tools/render-fleet-svg.py",       # static SVG mockup of the dashboard
+    # INERT today: `loops` is not in SCAN_DIRS, so this entry waives nothing. Kept as the
+    # waiver that would be needed if `loops` is ever scanned — but do not read this list as
+    # an inventory of what IS scanned. SCAN_DIRS above is that inventory; capabilities/,
+    # skills/, scaffolds/, loops/, docs/, the three *_setting/ trees and every top-level
+    # file are unscanned (surveyed 2026-09-09: only docs/fleet.svg, a generated mockup,
+    # would match).
     "/loops/drill/",                    # drill fixtures pin explicit models on purpose
     ".test.",                           # test fixtures
     "/tests/",
