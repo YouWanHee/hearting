@@ -30,6 +30,14 @@
 - **Curator commands under D-18:** `curate-snapshot` exposes active project records and a destructive allowlist. The existing guarded mutations remain, and `supersede` may relate two allowlisted active records without deleting history. Profile, pending-delivery, cross-scope, cross-project, nonexistent, and cyclic relations fail closed. The no-tools distiller emits action JSON only; scripts invoke validated argv with `shell=False`.
 - **Invariant D-18, D-35, D-40:** the acting agent—main, distiller, or curator—makes semantic memory decisions from available context. Scripts may validate action shape, visibility, identity, transaction safety, pending protection, graveyard recovery, and bounded lifecycle mechanics. They must not decide relevance through keyword lists, content categories, confidence thresholds, or fixed phrases. Unconsumed pending handoffs fail closed against destructive operations until an explicit `consume` transition.
 
+Prompt turn counters dispatch incremental extraction without waiting for the
+model inside the synchronous prompt hook. The main-owned finite completion
+controller retains worker exclusion, per-session concurrency control, model
+timeouts and process-group cleanup. A launch receipt proves dispatch only;
+it does not prove memory application or remote confirmation. Direct worker
+invocations remain synchronous, and SessionEnd retains its existing sync and
+curator lifecycle.
+
 Sections §7.1–§7.3 define the semantic/mechanical mutation boundary; §7.4 defines agent-initiated retrieval.
 
 ### §7.1. Semantic Decisions Belong to the Agent

@@ -519,6 +519,10 @@ case "$cmd" in
     sid=${3:-codex}
     # D-42 defense in depth: worker exit owns no sync/curator lifecycle.
     is_worker_session && exit 0
+    # Join earlier incremental extraction before sync/curation: its sid lock
+    # must not silently skip the final capture. The controller bounds this wait.
+    AGENT_HOME="$AGENT_ROOT" python3 "$ROOT/adapters/codex/bin/distill-nudge-launch.py" \
+      --wait "$sid" "$cwd" || exit $?
     # SessionEnd sync contract (core/MEMORY.md §7): local sync is the default.
     # Pass the user's MEM_SYNC_REMOTE / deprecated MEM_DUMP_PUSH environment
     # unchanged; the adapter never opts the session into remote exchange and
@@ -615,7 +619,7 @@ case "$cmd" in
         CODEX_DISTILL_ENABLE="${CODEX_DISTILL_ENABLE:-1}" \
         CODEX_DISTILL_APPLY="${CODEX_DISTILL_APPLY:-1}" \
         CODEX_DISTILL_CONTRACT_ACCEPTED="${CODEX_DISTILL_CONTRACT_ACCEPTED:-1}" \
-        "$ROOT/adapters/codex/bin/distill-worker.sh" "$sid" "$cwd" increment >/dev/null 2>/dev/null || true
+        python3 "$ROOT/adapters/codex/bin/distill-nudge-launch.py" "$sid" "$cwd" || true
     fi
     printf '%s\n' "$counter" > "$state" 2>/dev/null || true
     find "$store" -maxdepth 1 -name '.codex-turn-state-*' -mmin +4320 -delete 2>/dev/null || true
