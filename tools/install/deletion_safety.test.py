@@ -126,7 +126,6 @@ class DeletionSafetyTest(unittest.TestCase):
         canary.chmod(0o640)
         os.environ.update({"SHELL": "/bin/zsh", "ZDOTDIR": str(outside)})
 
-        lock_root = safe_fs._lock_root()
         invalid = (
             self._runtime_args(runtime=["invalid-runtime"]),
             self._runtime_args(mode="invalid-mode"),
@@ -137,8 +136,16 @@ class DeletionSafetyTest(unittest.TestCase):
             with self.subTest(args=vars(args)):
                 canary_before = _leaf_signature(canary)
                 fixture_before = _tree_signature(self.fixture)
-                locks_before = _tree_signature(lock_root)
                 with ExitStack() as stack:
+                    safe_lock_root = stack.enter_context(
+                        mock.patch.object(safe_fs, "_lock_root", wraps=safe_fs._lock_root)
+                    )
+                    standalone_lock_root = stack.enter_context(
+                        mock.patch.object(
+                            distribution, "_standalone_lock_root",
+                            wraps=distribution._standalone_lock_root,
+                        )
+                    )
                     launcher_capture = stack.enter_context(
                         mock.patch.object(
                             codex_launcher,
@@ -172,11 +179,12 @@ class DeletionSafetyTest(unittest.TestCase):
                 self.assertIn("invalid-before-mutation", json.dumps(result))
                 launcher_capture.assert_not_called()
                 runtime_capture.assert_not_called()
+                safe_lock_root.assert_not_called()
+                standalone_lock_root.assert_not_called()
                 for spy in mutation_spies:
                     spy.assert_not_called()
                 self.assertEqual(_leaf_signature(canary), canary_before)
                 self.assertEqual(_tree_signature(self.fixture), fixture_before)
-                self.assertEqual(_tree_signature(lock_root), locks_before)
 
     def _run_profile_race(self, *, existing: bool) -> None:
         race_root = self.fixture / ("file-preimage" if existing else "missing-preimage")

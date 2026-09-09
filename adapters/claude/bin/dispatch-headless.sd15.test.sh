@@ -44,6 +44,23 @@ command -v git >/dev/null || { echo "(git 없음 — skip launch cases)"; exit $
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 AH="$tmp/agent_setting"; mkdir -p "$AH/core"; : > "$AH/core/CORE.md"
 bin="$tmp/bin"; mkdir -p "$bin"
+export HOME="$tmp/home" XDG_STATE_HOME="$tmp/xdg-state"
+unset HARNESS_STATE_ROOT AGENT_DISPATCH_JOBS
+mkdir -p "$HOME" "$XDG_STATE_HOME"
+chmod 700 "$HOME" "$XDG_STATE_HOME"
+STATE=$(python3 - "$WRAP" "$AH" <<'PY'
+import importlib.util, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("dh", sys.argv[1])
+dh = importlib.util.module_from_spec(spec); spec.loader.exec_module(dh)
+print(dh.resolve_dispatch_state_root(Path(sys.argv[2])))
+PY
+)
+[ "$STATE" = "$XDG_STATE_HOME/hearting/dispatch" ] \
+  && ok "fixture resolves stable XDG dispatch state" \
+  || bad "unexpected fixture dispatch state: $STATE"
+mkdir -p "$STATE"
+chmod 700 "$STATE" "$(dirname -- "$STATE")"
 
 launch() { # $1=fake-claude-body $2=slug $3=watch
   printf '%s' "$1" > "$bin/claude"; chmod +x "$bin/claude"
@@ -52,10 +69,9 @@ launch() { # $1=fake-claude-body $2=slug $3=watch
   sleep 60 & parent_pid=$!
   parent_start=$(awk '{print $22}' "/proc/$parent_pid/stat")
   parent_attempt="att-parent-$2-fixture"
-  mkdir -p "$AH/.dispatch"
   printf '2026-07-23T00:00:00Z\topen\t%s\t%s\tcx\tattempt_schema_version=2,dispatch_depth=1,transport=headless,execution_surface=registered-headless,registered_worker=1,fallback_hop=same-harness-headless,worker_type=owner,harness=claude,runtime_sandbox=fixture,attempt_id=%s,pid=%s,pid_start=%s\n' \
-    "$wt" "$wt" "$parent_attempt" "$parent_pid" "$parent_start" >> "$AH/.dispatch/jobs.log"
-  AGENT_HOME="$AH" AGENT_DISPATCH_JOBS="$AH/.dispatch/jobs.log" \
+    "$wt" "$wt" "$parent_attempt" "$parent_pid" "$parent_start" >> "$STATE/jobs.log"
+  AGENT_HOME="$AH" AGENT_DISPATCH_JOBS="$STATE/jobs.log" \
     AGENT_DISPATCH_ATTEMPT_ID="$parent_attempt" PATH="$bin:$PATH" python3 "$WRAP" --start \
     --worktree "$wt" --slug "$2" --capability autopilot-code --capability-mode dev \
     --worker-mode dev/backend --unit dev/backend --qa standard \
@@ -75,19 +91,19 @@ out=$(launch "#!/bin/sh
 echo \"You've hit your session limit · resets 3pm\"
 exit 1" limit1 6)
 echo "$out" | grep -q 'early_death=session-limit' \
-  && grep -q $'\tdone\t.*note=dead-session-limit,reset=3pm' "$AH/.dispatch/jobs.log" \
+  && grep -q $'\tdone\t.*note=dead-session-limit,reset=3pm' "$STATE/jobs.log" \
   && ok "limit-death → row done,note=dead-session-limit,reset=3pm" \
-  || bad "limit-death row not closed. out=[$out] jobs=[$(cat "$AH/.dispatch/jobs.log")]"
-[ -f "$AH/.dispatch/usage-reset.claude" ] && ok "reset cache written" || bad "no reset cache"
+  || bad "limit-death row not closed. out=[$out] jobs=[$(cat "$STATE/jobs.log")]"
+[ -f "$STATE/usage-reset.claude" ] && ok "reset cache written" || bad "no reset cache"
 
 # --- Case: capacity is a distinct exact-row failure class and does not update usage reset.
-before_reset=$(cat "$AH/.dispatch/usage-reset.claude")
+before_reset=$(cat "$STATE/usage-reset.claude")
 out=$(launch "#!/bin/sh
 echo 'Selected model is at capacity'
 exit 1" capacity1 4)
 echo "$out" | grep -q 'early_death=capacity' \
-  && awk -F'\t' '$2=="done" && $5=="capacity1" && $6 ~ /(^|,)model=sonnet(,|$)/ && $6 ~ /(^|,)note=dead-capacity(,|$)/ && $6 ~ /(^|,)failure_class=capacity(,|$)/ { found=1 } END { exit !found }' "$AH/.dispatch/jobs.log" \
-  && [ "$(cat "$AH/.dispatch/usage-reset.claude")" = "$before_reset" ] \
+  && awk -F'\t' '$2=="done" && $5=="capacity1" && $6 ~ /(^|,)model=sonnet(,|$)/ && $6 ~ /(^|,)note=dead-capacity(,|$)/ && $6 ~ /(^|,)failure_class=capacity(,|$)/ { found=1 } END { exit !found }' "$STATE/jobs.log" \
+  && [ "$(cat "$STATE/usage-reset.claude")" = "$before_reset" ] \
   && ok "capacity death → exact row dead-capacity without usage-reset pollution" \
   || bad "capacity death contract failed. out=[$out]"
 
@@ -97,8 +113,8 @@ echo \"governor=\$AGENT_MODEL_GOVERNOR_ROOT\"
 echo ok done
 exit 0" clean1 4)
 echo "$out" | grep -q 'early_death=-' \
-  && awk -F'\t' '$5=="clean1"{print $2}' "$AH/.dispatch/jobs.log" | grep -qx open \
-  && grep -q '/.agent_reports/.runtime/model-worker-governor' "$AH/.dispatch/logs/clean1."*.claude.jsonl \
+  && awk -F'\t' '$5=="clean1"{print $2}' "$STATE/jobs.log" | grep -qx open \
+  && grep -q '/.agent_reports/.runtime/model-worker-governor' "$STATE/logs/clean1."*.claude.jsonl \
   && ok "clean fast exit → row stays open (normal harvest owns it)" \
   || bad "clean exit or inherited governor root invalid. out=[$out]"
 

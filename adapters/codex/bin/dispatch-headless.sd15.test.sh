@@ -80,17 +80,37 @@ echo "$parent" | grep -q '^D1=real-thread:-$' \
 
 command -v git >/dev/null || { echo "(git 없음 — skip launch cases)"; exit $fails; }
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
-AH="$tmp/agent_setting"; mkdir -p "$AH/.dispatch/logs"
+AH="$tmp/agent_setting"; mkdir -p "$AH"
+export HOME="$tmp/home" XDG_STATE_HOME="$tmp/xdg-state"
+unset HARNESS_STATE_ROOT
+mkdir -p "$HOME" "$XDG_STATE_HOME"
+chmod 700 "$HOME" "$XDG_STATE_HOME"
+STATE=$(python3 - "$WRAP" "$AH" <<'PY'
+import importlib.util, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("dh", sys.argv[1])
+dh = importlib.util.module_from_spec(spec); spec.loader.exec_module(dh)
+print(dh.dispatch_state_roots(Path(sys.argv[2]))[0])
+PY
+)
+[ "$STATE" = "$XDG_STATE_HOME/hearting/dispatch" ] \
+  && ok "fixture resolves stable XDG dispatch state" \
+  || bad "unexpected fixture dispatch state: $STATE"
+mkdir -p "$STATE/logs"
+chmod 700 "$STATE" "$STATE/logs" "$(dirname -- "$STATE")"
 
 # Drive the ported SD-15 start-block helpers exactly as main()'s --start path does.
-drive=$(python3 - "$WRAP" "$AH" <<'PY'
+drive=$(python3 - "$WRAP" "$AH" "$STATE" <<'PY'
 import importlib.util, subprocess, sys, time
 from pathlib import Path
 spec = importlib.util.spec_from_file_location("dh", sys.argv[1])
 dh = importlib.util.module_from_spec(spec); spec.loader.exec_module(dh)
 AH = Path(sys.argv[2])
-jobs = AH / ".dispatch" / "jobs.log"
-logs = AH / ".dispatch" / "logs"
+state = Path(sys.argv[3])
+if dh.dispatch_state_roots(AH)[0] != state:
+    raise RuntimeError("fixture-dispatch-state-drift")
+jobs = state / "jobs.log"
+logs = state / "logs"
 
 def row(slug, wt, attempt=""):
     pipe = f"capability=code-plan,mode=dev,qa=standard,intensity=standard,attempt_schema_version=2,dispatch_depth=2,transport=headless,execution_surface=registered-headless,registered_worker=1,fallback_hop=same-harness-headless,harness=codex,parent=cx,worker_role=code-plan,owner=autopilot-code,model=gpt-5.6-sol"
@@ -126,33 +146,34 @@ PY
 )
 
 echo "$drive" | grep -q 'early_death=session-limit:3pm' \
-  && grep -q $'\tdone\t.*note=dead-session-limit,reset=3pm' "$AH/.dispatch/jobs.log" \
+  && grep -q $'\tdone\t.*note=dead-session-limit,reset=3pm' "$STATE/jobs.log" \
   && ok "limit-death → row done,note=dead-session-limit,reset=3pm" \
-  || bad "limit-death row not closed. drive=[$drive] jobs=[$(cat "$AH/.dispatch/jobs.log")]"
-[ -f "$AH/.dispatch/usage-reset.codex" ] && ok "reset cache written" || bad "no reset cache"
+  || bad "limit-death row not closed. drive=[$drive] jobs=[$(cat "$STATE/jobs.log")]"
+[ -f "$STATE/usage-reset.codex" ] && ok "reset cache written" || bad "no reset cache"
 
 echo "$drive" | grep -q 'early_death=capacity:' \
-  && awk -F'\t' '$2=="done" && $5=="capacity1" && $6 ~ /(^|,)attempt_id=att-capacity0001(,|$)/ && $6 ~ /(^|,)note=dead-capacity(,|$)/ && $6 ~ /(^|,)failure_class=capacity(,|$)/ { found=1 } END { exit !found }' "$AH/.dispatch/jobs.log" \
+  && awk -F'\t' '$2=="done" && $5=="capacity1" && $6 ~ /(^|,)attempt_id=att-capacity0001(,|$)/ && $6 ~ /(^|,)note=dead-capacity(,|$)/ && $6 ~ /(^|,)failure_class=capacity(,|$)/ { found=1 } END { exit !found }' "$STATE/jobs.log" \
   && ok "capacity death closes the exact attempt as dead-capacity" \
-  || bad "capacity row not closed exactly. drive=[$drive] jobs=[$(cat "$AH/.dispatch/jobs.log")]"
+  || bad "capacity row not closed exactly. drive=[$drive] jobs=[$(cat "$STATE/jobs.log")]"
 
 echo "$drive" | grep -q 'PID_ANNOTATED' \
   && ok "Codex wrapper records pid and process start ticks on the open row (O1)" \
   || bad "Codex pid annotation missing. drive=[$drive]"
 
 echo "$drive" | grep -q 'early_death=-' \
-  && awk -F'\t' '$5=="clean1"{print $2}' "$AH/.dispatch/jobs.log" | grep -qx open \
+  && awk -F'\t' '$5=="clean1"{print $2}' "$STATE/jobs.log" | grep -qx open \
   && ok "clean fast exit → row stays open (normal harvest owns it)" \
   || bad "clean exit wrongly closed. drive=[$drive]"
 
 # Axis 6 (SD-15b): liveness log_shows_limit judges a limit log DEAD regardless of transcript.
 LIVE="$SCRIPT_DIR/dispatch-liveness.py"
-live=$(python3 - "$LIVE" "$AH" <<'PY'
+live=$(python3 - "$LIVE" "$AH" "$STATE" <<'PY'
 import importlib.util, sys
 from pathlib import Path
 spec = importlib.util.spec_from_file_location("lv", sys.argv[1])
 lv = importlib.util.module_from_spec(spec); spec.loader.exec_module(lv)
 AH = Path(sys.argv[2])
+state = Path(sys.argv[3])
 hit = lv.log_shows_limit(AH, "limit1")
 miss = lv.log_shows_limit(AH, "clean1")
 worktree = AH / "nested-worktree"
@@ -162,11 +183,12 @@ profile_stores = lv.sessions_dirs_for(
     "profile=lab", "nested", AH, AH / "default-sessions", str(worktree)
 )
 paths_ok = stores == [local_sessions, AH / "default-sessions"]
-profile_ok = profile_stores == [AH / ".dispatch" / "homes" / "nested.lab" / "sessions"]
+profile_ok = profile_stores == [state / "homes" / "nested.lab" / "sessions"]
+state_ok = lv.resolve_dispatch_state_root(AH) == state
 print(
     "LIVE_OK"
-    if (hit is not None and miss is None and paths_ok and profile_ok)
-    else f"LIVE_FAIL hit={hit} miss={miss} stores={stores} profile={profile_stores}"
+    if (hit is not None and miss is None and paths_ok and profile_ok and state_ok)
+    else f"LIVE_FAIL hit={hit} miss={miss} stores={stores} profile={profile_stores} state={state}"
 )
 PY
 )

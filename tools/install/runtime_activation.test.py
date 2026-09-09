@@ -50,8 +50,15 @@ class RuntimeSnapshotTest(unittest.TestCase):
             current.write_text("before\n", encoding="utf-8")
             socket_path = managed / "app-server.sock"
             listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            listener.bind(str(socket_path))
             try:
+                # Keep the same socket inode within AF_UNIX's address limit,
+                # even when the isolated runner uses a long temporary prefix.
+                previous_cwd = Path.cwd()
+                try:
+                    os.chdir(managed)
+                    listener.bind(socket_path.name)
+                finally:
+                    os.chdir(previous_cwd)
                 record = activation._copy_snapshot(
                     state, root / "backup", 0,
                     preserve_names=("managed-sessions",),

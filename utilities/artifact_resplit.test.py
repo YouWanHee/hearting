@@ -1842,8 +1842,9 @@ class DeviationAuditTests(Fixture):
 
 
 @unittest.skipUnless(
-    (HEARTING_CANARY_ROOT / ".runtime" / "artifact-producer" / "v1" / "migrations").is_dir(),
-    "hearting canary artifact root not present on this machine")
+    os.environ.get("HEARTING_LIVE_CANARY_TEST") == "1"
+    and (HEARTING_CANARY_ROOT / ".runtime" / "artifact-producer" / "v1" / "migrations").is_dir(),
+    "live NAS canary requires explicit HEARTING_LIVE_CANARY_TEST=1")
 class HeartingCanaryRegressionTests(unittest.TestCase):
     """The 2026-09-04 canary is a frozen read-only regression subject.
 

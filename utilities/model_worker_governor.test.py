@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import importlib.util
+import functools
 import json
 import os
 import subprocess
@@ -18,6 +19,25 @@ GOVERNOR = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(GOVERNOR)
 from replica_batch_contract import build_manifest
+
+
+def ordinary_caller(test):
+    """Exercise single-process release with a real non-group owner.
+
+    The isolated suite runner owns a process group. Group-drain proofs have
+    separate tests; do not fake procfs or PGID for this single-process API.
+    """
+    @functools.wraps(test)
+    def run(self):
+        if os.getpid() != os.getpgrp():
+            return test(self)
+        result = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()),
+             f"{type(self).__name__}.{test.__name__}"],
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+    return run
 
 
 def _legacy_migration_return(root):
@@ -104,6 +124,7 @@ class GovernorTest(unittest.TestCase):
         """
         return min(GOVERNOR.CLASS_LIMITS["dispatch"], GOVERNOR.DEFAULT_TOTAL_LIMIT)
 
+    @ordinary_caller
     def test_caps_release_and_kill_switch(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             cap = self._dispatch_cap()
@@ -1047,6 +1068,7 @@ class GovernorIdentityRegressionTest(unittest.TestCase):
     def state(self):
         p=self.root/"state.json";return json.loads(p.read_text()) if p.exists() else {}
 
+    @ordinary_caller
     def test_owner_to_claimant_witness_transfer_and_proven_receipt_retention(self):
         h=GOVERNOR.create_witness(self.root,"reservation")
         try:

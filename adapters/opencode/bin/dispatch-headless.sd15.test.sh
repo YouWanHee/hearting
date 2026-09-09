@@ -60,16 +60,36 @@ echo "$u" | grep -q SCAN_OK && ok "scan_death patterns (opencode provider-rate-l
 
 command -v git >/dev/null || { echo "(git 없음 — skip launch cases)"; exit $fails; }
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
-AH="$tmp/agent_setting"; mkdir -p "$AH/.dispatch/logs"
+AH="$tmp/agent_setting"; mkdir -p "$AH"
+export HOME="$tmp/home" XDG_STATE_HOME="$tmp/xdg-state"
+unset HARNESS_STATE_ROOT
+mkdir -p "$HOME" "$XDG_STATE_HOME"
+chmod 700 "$HOME" "$XDG_STATE_HOME"
+STATE=$(python3 - "$WRAP" "$AH" <<'PY'
+import importlib.util, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("dh", sys.argv[1])
+dh = importlib.util.module_from_spec(spec); spec.loader.exec_module(dh)
+print(dh.dispatch_state_roots(Path(sys.argv[2]))[0])
+PY
+)
+[ "$STATE" = "$XDG_STATE_HOME/hearting/dispatch" ] \
+  && ok "fixture resolves stable XDG dispatch state" \
+  || bad "unexpected fixture dispatch state: $STATE"
+mkdir -p "$STATE/logs"
+chmod 700 "$STATE" "$STATE/logs" "$(dirname -- "$STATE")"
 
-drive=$(python3 - "$WRAP" "$AH" <<'PY'
+drive=$(python3 - "$WRAP" "$AH" "$STATE" <<'PY'
 import importlib.util, subprocess, sys
 from pathlib import Path
 spec = importlib.util.spec_from_file_location("dh", sys.argv[1])
 dh = importlib.util.module_from_spec(spec); spec.loader.exec_module(dh)
 AH = Path(sys.argv[2])
-jobs = AH / ".dispatch" / "jobs.log"
-logs = AH / ".dispatch" / "logs"
+state = Path(sys.argv[3])
+if dh.dispatch_state_roots(AH)[0] != state:
+    raise RuntimeError("fixture-dispatch-state-drift")
+jobs = state / "jobs.log"
+logs = state / "logs"
 
 def row(slug, wt, attempt=""):
     pipe = "capability=code-plan,mode=dev,qa=standard,intensity=standard,attempt_schema_version=2,dispatch_depth=2,transport=headless,execution_surface=registered-headless,registered_worker=1,fallback_hop=same-harness-headless,harness=opencode,parent=oc,worker_role=code-plan,owner=autopilot-code,model=openai/gpt-5"
@@ -102,38 +122,40 @@ PY
 )
 
 echo "$drive" | grep -q 'early_death=session-limit:3pm' \
-  && grep -q $'\tdone\t.*note=dead-session-limit,reset=3pm' "$AH/.dispatch/jobs.log" \
+  && grep -q $'\tdone\t.*note=dead-session-limit,reset=3pm' "$STATE/jobs.log" \
   && ok "clean-exit limit-death → row done,note=dead-session-limit,reset=3pm" \
-  || bad "limit-death row not closed. drive=[$drive] jobs=[$(cat "$AH/.dispatch/jobs.log")]"
-[ -f "$AH/.dispatch/usage-reset.opencode" ] && ok "reset cache written" || bad "no reset cache"
+  || bad "limit-death row not closed. drive=[$drive] jobs=[$(cat "$STATE/jobs.log")]"
+[ -f "$STATE/usage-reset.opencode" ] && ok "reset cache written" || bad "no reset cache"
 
 echo "$drive" | grep -q 'early_death=capacity:' \
-  && awk -F'\t' '$2=="done" && $5=="capacity1" && $6 ~ /(^|,)attempt_id=att-capacity0001(,|$)/ && $6 ~ /(^|,)note=dead-capacity(,|$)/ && $6 ~ /(^|,)failure_class=capacity(,|$)/ { found=1 } END { exit !found }' "$AH/.dispatch/jobs.log" \
-  && awk -F'\t' '$2=="done" && $5=="capacityhang" && $6 ~ /(^|,)attempt_id=att-capacityhang1(,|$)/ && $6 ~ /(^|,)note=dead-capacity(,|$)/ && $6 ~ /(^|,)failure_class=capacity(,|$)/ { found=1 } END { exit !found }' "$AH/.dispatch/jobs.log" \
+  && awk -F'\t' '$2=="done" && $5=="capacity1" && $6 ~ /(^|,)attempt_id=att-capacity0001(,|$)/ && $6 ~ /(^|,)note=dead-capacity(,|$)/ && $6 ~ /(^|,)failure_class=capacity(,|$)/ { found=1 } END { exit !found }' "$STATE/jobs.log" \
+  && awk -F'\t' '$2=="done" && $5=="capacityhang" && $6 ~ /(^|,)attempt_id=att-capacityhang1(,|$)/ && $6 ~ /(^|,)note=dead-capacity(,|$)/ && $6 ~ /(^|,)failure_class=capacity(,|$)/ { found=1 } END { exit !found }' "$STATE/jobs.log" \
   && ok "capacity death closes the exact attempt as dead-capacity" \
-  || bad "capacity row not closed exactly. drive=[$drive] jobs=[$(cat "$AH/.dispatch/jobs.log")]"
+  || bad "capacity row not closed exactly. drive=[$drive] jobs=[$(cat "$STATE/jobs.log")]"
 
 echo "$drive" | grep -q 'early_death=-' \
-  && awk -F'\t' '$5=="clean1"{print $2}' "$AH/.dispatch/jobs.log" | grep -qx open \
+  && awk -F'\t' '$5=="clean1"{print $2}' "$STATE/jobs.log" | grep -qx open \
   && ok "clean fast exit → row stays open" \
   || bad "clean exit wrongly closed. drive=[$drive]"
 
 # ADAPTATION disclosure: hang-on-limit escapes the launch watch → row stays open.
 echo "$drive" | grep -q 'hang1=early_death=-' \
-  && awk -F'\t' '$5=="hang1"{print $2}' "$AH/.dispatch/jobs.log" | grep -qx open \
+  && awk -F'\t' '$5=="hang1"{print $2}' "$STATE/jobs.log" | grep -qx open \
   && ok "hang-on-limit (#8203) escapes launch watch → row open (liveness owns it)" \
   || bad "hang case unexpected. drive=[$drive]"
 
 # Axis 6 (SD-15b): liveness log_shows_limit catches that same hung log as DEAD.
-live=$(python3 - "$LIVE" "$AH" <<'PY'
+live=$(python3 - "$LIVE" "$AH" "$STATE" <<'PY'
 import importlib.util, sys
 from pathlib import Path
 spec = importlib.util.spec_from_file_location("lv", sys.argv[1])
 lv = importlib.util.module_from_spec(spec); spec.loader.exec_module(lv)
 AH = Path(sys.argv[2])
+state = Path(sys.argv[3])
 hit = lv.log_shows_limit(AH, "hang1")
 miss = lv.log_shows_limit(AH, "clean1")
-print("LIVE_OK" if (hit is not None and miss is None) else f"LIVE_FAIL hit={hit} miss={miss}")
+state_ok = lv.resolve_dispatch_state_root(AH) == state
+print("LIVE_OK" if (hit is not None and miss is None and state_ok) else f"LIVE_FAIL hit={hit} miss={miss} state={state}")
 PY
 )
 echo "$live" | grep -q LIVE_OK && ok "liveness log_shows_limit: hung limit log DEAD, clean log alive" || bad "liveness: $live"
