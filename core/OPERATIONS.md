@@ -917,7 +917,11 @@ directly); `SendMessage` is secondary.
 claim, checks the target once with `herdr agent get`, takes the watch lock, spawns one
 `setsid` watcher holding that same lock, writes an immutable arm record carrying the
 watcher's `{pid, pid_start}`, records `kind=watch … receipt=<watch_id>`, and returns a
-typed `state=armed` line without waiting. The watcher calls `herdr agent wait` exactly
+typed `state=armed` line without waiting. Every steward line reporting an armed watch
+carries the same `parent_next` directive a launch receipt does, and claims `end-turn` only
+when the hook arms from *that* line and the watch's wake is the hook; every other line —
+`wake=none`, a dedupe hit, a session-printed `rearm` — prints `bounded-wait` with a bounded
+`join <watch_id>`. The watcher calls `herdr agent wait` exactly
 once, writes `peer_watch_receipt_v1` atomically, records `kind=notice status=received`,
 and releases the lock only by exiting — the receipt rename strictly precedes exit. `join`
 waits on that lock (a kernel wait, never a poll), so it returns on the watcher's exit

@@ -138,12 +138,11 @@ Codex parent fails with `managed-entry-required` before registry mutation or
 spawn; `dispatch-owner` also forbids completion-policy and unmanaged-poll
 overrides. This parent-runtime selection does not force Stop/PreToolUse trust,
 create new parent Stop state, or park the model/tool loop. Keep the parent
-conversational. A human operator may use the low-level
-`--allow-unmanaged-parent-poll` recovery override and then wait finitely with
-`preflight.sh dispatch-wait --attempt-id <id> --max 300..600`; model routes must
-not select it. Existing open or legacy attempts may use that finite recovery;
-otherwise use external supervision and `preflight.sh harvest`, never an
-in-model `sleep`/liveness loop.
+conversational. Obey the receipt: `parent_next=end-turn` yields with no wait
+or poll; `parent_next=bounded-wait` runs its printed `parent_next_command` once —
+never an in-model `sleep`/liveness loop. An absent directive is not `end-turn`:
+never filter stdout. `--allow-unmanaged-parent-poll` stays operator-only, and
+recovery waits with `preflight.sh dispatch-wait --attempt-id <id>`.
 Legacy stamped Stop state is recovery-only and permits one exact terminal
 `--status all --attempt-id` harvest, never raw output or a broad selector.
 Conductors use `dispatch-chain` for ordinary checked dispatch-depth-2 nodes. A sealed

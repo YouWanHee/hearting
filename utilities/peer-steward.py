@@ -42,6 +42,7 @@ _PM_SPEC.loader.exec_module(peer_message)
 
 sys.path.insert(0, str(_UTILITIES_DIR))
 from dispatch_contract import process_start_ticks  # noqa: E402
+from parent_next_directive import steward_fields  # noqa: E402
 
 _DEFAULTS_SPEC = importlib.util.spec_from_file_location(
     "dispatch_defaults", str(_UTILITIES_DIR / "dispatch-defaults.py")
@@ -545,11 +546,19 @@ def _until_field(until):
 
 def _armed_line(arm, paths):
     watcher = arm.get("watcher") or {}
+    # The armed line states the caller's next action for the same reason a
+    # launch receipt does (`utilities/parent_next_directive.py`): the watcher
+    # carries this watch to one wake, so the caller yields instead of polling.
     return (
         f"watch_id={arm['watch_id']} state=armed target={arm['target']} "
         f"until={_until_field(arm.get('until'))} wake={arm.get('wake', 'none')} "
         f"pid={watcher.get('pid', '-')} pid_start={watcher.get('pid_start', '-')} "
-        f"receipt={paths.receipt}"
+        f"receipt={paths.receipt}\n"
+        + steward_fields(
+            arm.get("wake"), arm.get("watch_id"),
+            agent_home=Path(__file__).resolve().parents[1],
+            timeout_ms=arm.get("timeout"),
+        )
     )
 
 
@@ -777,7 +786,20 @@ def _already_armed_line(watch_id, arm, paths):
         target = until = wake = pid = pid_start = "-"
     return (
         f"watch_id={watch_id} state=already-armed target={target} until={until} "
-        f"wake={wake} pid={pid} pid_start={pid_start} receipt={paths.receipt}"
+        f"wake={wake} pid={pid} pid_start={pid_start} receipt={paths.receipt}\n"
+        # The hook arms only from a `watch` command printing `state=armed`.
+        # This line is `already-armed` (or `alive`, from `rearm`), so it arms
+        # nothing -- and it cannot prove the *earlier* arm succeeded either.
+        # That earlier arm failing is exactly why a caller re-runs `watch`, so
+        # answering `end-turn` here would hand back the most dangerous reply at
+        # the moment the caller is trying to recover. A redundant wake is
+        # absorbed by at-least-once ack; a missed one is lost work.
+        + steward_fields(
+            wake if wake != "-" else None, watch_id,
+            agent_home=Path(__file__).resolve().parents[1],
+            arms_hook=False,
+            timeout_ms=arm.get("timeout") if isinstance(arm, dict) else None,
+        )
     )
 
 
@@ -1055,7 +1077,26 @@ def cmd_rearm(args):
     if code != 0 or "state=armed" not in line:
         print(line)
         return code
-    print(line.replace("state=armed", f"state=rearmed rearmed_from={watch_id}"))
+    # B1-a: the hook arms only from a `watch` command printing `state=armed`
+    # (`hooks/peer-steward-rewake.py` `_is_watch_command`/`parse_arm`). This
+    # line is neither, so it must not inherit the fresh arm's `end-turn` --
+    # recompute the directive for a line that carries no carrier.
+    watch_line = line.splitlines()[0].replace(
+        "state=armed", f"state=rearmed rearmed_from={watch_id}"
+    )
+    print(watch_line)
+    new_watch_id = next(
+        (token.split("=", 1)[1] for token in watch_line.split()
+         if token.startswith("watch_id=")),
+        None,
+    )
+    print(
+        steward_fields(
+            ns.wake, new_watch_id,
+            agent_home=Path(__file__).resolve().parents[1],
+            arms_hook=False, timeout_ms=ns.timeout,
+        )
+    )
     return 0
 
 
