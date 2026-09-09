@@ -313,7 +313,7 @@ ${REATTR_RULE:+$REATTR_RULE
   not a curator action.
 - Merge only when the canonical record preserves every distinct obligation.
 - Emit no prose, Markdown, or code fences. When no action would improve memory,
-  emit nothing or the sole exact object {"action":"noop"}."
+  emit nothing or the sole exact object {\"action\":\"noop\"}."
 else
   # Increment mode uses the fast add-only, backward-compatible record shape.
   PROMPT="You are a no-tools session memory distiller.
@@ -344,7 +344,7 @@ Output contract: stdout contains JSON objects only, one per line:
 Choose the tier from its lifecycle: working is finite-lived; durable persists.
 artifact-pointer requires artifact_refs and records only why/when to retrieve
 the artifact. Emit no prose, Markdown, or code fences. When no addition is
-useful, emit nothing or the sole exact object {"action":"noop"}."
+useful, emit nothing or the sole exact object {\"action\":\"noop\"}."
 fi
 
 # detached spawn: adapter worker contract.

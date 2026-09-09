@@ -50,6 +50,7 @@ class Fixture:
         self.advance = base / ("advance-" + adapter)
         self.apply_trace = base / ("apply-" + adapter + ".jsonl")
         self.model_trace = base / ("model-" + adapter + ".json")
+        self.prompt_trace = base / ("prompt-" + adapter + ".txt")
         for path in (self.bin, self.home, self.project, self.root / "core",
                      self.root / "utilities", self.root / "tools/memory"):
             path.mkdir(parents=True, exist_ok=True)
@@ -128,6 +129,7 @@ raise SystemExit(2)
         self.advance.unlink(missing_ok=True)
         self.apply_trace.unlink(missing_ok=True)
         self.model_trace.unlink(missing_ok=True)
+        self.prompt_trace.unlink(missing_ok=True)
 
     def applied_args(self):
         if not self.apply_trace.exists():
@@ -284,6 +286,9 @@ raise SystemExit(int(os.environ.get('TEST_MODEL_RC', '0')))
         worker = case_base / "dispatch-worker"
         write_executable(worker, "#!" + sys.executable + "\n" + """
 import os, sys
+from pathlib import Path
+if os.environ.get('TEST_PROMPT_TRACE'):
+    Path(os.environ['TEST_PROMPT_TRACE']).write_text(Path(sys.argv[3]).read_text())
 sys.stdout.write(os.environ.get('TEST_MODEL_OUTPUT', ''))
 raise SystemExit(int(os.environ.get('TEST_MODEL_RC', '0')))
 """)
@@ -293,6 +298,7 @@ raise SystemExit(int(os.environ.get('TEST_MODEL_RC', '0')))
             "MEM_APPLIER": str(fixture.root / "tools/memory/apply-distill-actions.py"),
             "MODEL_WORKER_GOVERNOR": str(fixture.root / "utilities/model-worker-governor.py"),
             "MEM_DISTILL_MAX_CONCURRENT": "1", "MEM_DISTILL_MAX_STARTS": "1",
+            "TEST_PROMPT_TRACE": str(fixture.prompt_trace),
         })
         return fixture, dispatch
 
@@ -316,6 +322,34 @@ raise SystemExit(int(os.environ.get('TEST_MODEL_RC', '0')))
             time.sleep(0.05)
         self.assertFalse(lock.exists(), "detached Claude fixture did not finish")
         return fail_count
+
+    def test_dispatchers_render_exact_json_noop_example(self):
+        for dispatcher in ("portable", "claude"):
+            for mode in ("increment", "curate"):
+                with self.subTest(dispatcher=dispatcher, mode=mode):
+                    fixture, dispatch = self.make_dispatch(dispatcher)
+                    fixture.reset()
+                    sid = f"prompt-{mode}"
+                    env = {**fixture.env, "TEST_MODEL_OUTPUT": '{"action":"noop"}\n'}
+                    if mode == "increment":
+                        args = ["bash", str(dispatch), "distill", sid, str(fixture.project)]
+                        input_text = None
+                    else:
+                        args = ["bash", str(dispatch)]
+                        input_text = json.dumps({"session_id": sid, "cwd": str(fixture.project)})
+                    result = subprocess.run(
+                        args, input=input_text, env=env, cwd=fixture.project,
+                        capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+                    lock = fixture.store / (".distill-lock-" + sid)
+                    deadline = time.monotonic() + 8
+                    while lock.exists() and time.monotonic() < deadline:
+                        time.sleep(0.05)
+                    self.assertFalse(lock.exists(), "detached prompt fixture did not finish")
+                    prompt = fixture.prompt_trace.read_text()
+                    self.assertIn(
+                        'emit nothing or the sole exact object {"action":"noop"}.', prompt)
+                    self.assertNotIn('sole exact object {action:noop}', prompt)
 
     def test_dispatchers_preserve_frontier_and_strikes_on_strict_failure(self):
         for dispatcher in ("portable", "claude"):
