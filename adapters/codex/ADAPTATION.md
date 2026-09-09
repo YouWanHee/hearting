@@ -519,8 +519,9 @@ Behavioral roles resolve through `preflight.sh role`; registered route profiles 
 |---|---|
 | `deep` | configured deep tier / `xhigh` |
 | `balanced-deep` | configured deep tier / `medium` |
+| `balanced` | configured light tier / `high` |
 | `light` | configured light tier / `medium` |
-| `mini` | configured mini tier / `medium`, lifecycle/micro-only |
+| `mini` | configured mini tier / `low`, lifecycle/micro-only |
 
 Non-route role compatibility overrides remain explicit and config-derived:
 

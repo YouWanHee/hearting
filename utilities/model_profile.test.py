@@ -139,11 +139,23 @@ class ModelProfileTest(unittest.TestCase):
         key = tier.upper().replace("-", "_")
         return (config[f"CFG_TIER_{key}_MODEL"], budget)
 
+    @staticmethod
+    def _reachable_models(adapter, config, path):
+        """Every concrete model this config can put in front of a worker: the declared
+        tier models plus each of the five profiles' resolved model. A profile may name a
+        model directly (`model/<id>:budget`), so scanning `CFG_TIER_*_MODEL` alone leaves
+        a hole an edit can walk through (review MA-2a)."""
+        models = {value for key, value in config.items() if key.endswith("_MODEL")}
+        for profile in ("deep", "balanced-deep", "balanced", "light", "mini"):
+            models.add(PROFILE.resolve_profile(adapter, path, profile)["model"])
+        return models
+
     def test_claude_shipped_default_is_the_user_profile_mapping(self):
         # 2026-09-09 user rule: the shipped default equals the user's runtime
         # mapping — the top model (Fable) is reserved for the main session, so
         # both deep-side profiles ride opus and separate by effort only.
-        config = PROFILE.load_config(ROOT / "adapters" / "claude" / "config" / "models.conf")
+        path = ROOT / "adapters" / "claude" / "config" / "models.conf"
+        config = PROFILE.load_config(path)
         main_only = config["CFG_MAIN_SESSION_ONLY_MODELS"].split()
         self.assertEqual(main_only, ["fable"])
         self.assertEqual(self._declared_point(config, "deep"), ("opus", "xhigh"))
@@ -151,10 +163,20 @@ class ModelProfileTest(unittest.TestCase):
         cascade = [entry.split(":", 1)[0] for entry in config["CFG_TIER_DEEP_FAILOVER_CASCADE"].split()]
         self.assertEqual(cascade, ["opus", "sonnet"])
         self.assertEqual(cascade[0], config["CFG_TIER_DEEP_MODEL"])
-        # A main-session-only model may never appear in a dispatch-eligible tier
-        # or in the cascade the fallback walks.
+        # The role mappers read CFG_TIER_DEEP_EFFORT directly while route-bound work
+        # reads the profile's budget; a config where the two disagree silently makes
+        # the README's `deep reviewer` row false, so pin them equal (review MI-4).
+        self.assertEqual(config["CFG_TIER_DEEP_EFFORT"], "xhigh")
+        self.assertEqual(config["CFG_TIER_DEEP_EFFORT"], self._declared_point(config, "deep")[1])
+        # A main-session-only model may never appear in a dispatch-eligible tier, in the
+        # cascade the fallback walks, or as ANY profile's resolved model — the last of
+        # which is the `model/<id>:budget` profile form a tier-key scan cannot see
+        # (review MA-2a).
         self.assertNotIn(config["CFG_TIER_DEEP_MODEL"], main_only)
         self.assertEqual([model for model in cascade if model in main_only], [])
+        self.assertEqual(
+            [m for m in self._reachable_models("claude", config, path) if m in main_only], []
+        )
         self.assertEqual(config["CFG_TIER_DEEP_FAILOVER"], "light")
         points = {profile: self._declared_point(config, profile) for profile in ("deep", "balanced-deep", "balanced", "light", "mini")}
         self.assertNotEqual(points["deep"], points["balanced-deep"])  # two distinct operating points
@@ -166,13 +188,19 @@ class ModelProfileTest(unittest.TestCase):
         # effort and balanced-deep is the same model at medium. This adapter has
         # no main-session-only KEY — the restriction is carried by never naming
         # Astra in a tier or cascade, which is what this test pins.
-        config = PROFILE.load_config(ROOT / "adapters" / "codex" / "config" / "models.conf")
+        path = ROOT / "adapters" / "codex" / "config" / "models.conf"
+        config = PROFILE.load_config(path)
         self.assertEqual(self._declared_point(config, "deep"), ("gpt-5.6-sol", "xhigh"))
         self.assertEqual(self._declared_point(config, "balanced-deep"), ("gpt-5.6-sol", "medium"))
         cascade = [entry.split(":", 1)[0] for entry in config["CFG_TIER_DEEP_FAILOVER_CASCADE"].split()]
         self.assertEqual(cascade[0], config["CFG_TIER_DEEP_MODEL"])
-        named = set(cascade) | {value for key, value in config.items() if key.endswith("_MODEL")}
-        self.assertNotIn("gpt-6-astra", named)
+        self.assertEqual(config["CFG_TIER_DEEP_EFFORT"], "xhigh")  # review MI-4, as above
+        self.assertEqual(config["CFG_TIER_DEEP_EFFORT"], self._declared_point(config, "deep")[1])
+        # Every way a model can be reached — tier keys, the cascade, and each profile's
+        # RESOLVED model (which covers the `model/<id>:budget` form a key scan misses,
+        # review MA-2a). `tools/check-model-config.py` separately refuses the literal
+        # anywhere outside this file.
+        self.assertNotIn("gpt-6-astra", set(cascade) | self._reachable_models("codex", config, path))
 
     def test_portable_profiles_resolve_to_declared_adapter_budgets(self):
         claude_config = PROFILE.load_config(ROOT / "adapters" / "claude" / "config" / "models.conf")

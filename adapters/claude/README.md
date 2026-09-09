@@ -122,7 +122,13 @@ selection. Registered inheritance and config-declared interactive-main-only
 models are rejected before launch. The shipped `CFG_MAIN_SESSION_ONLY_MODELS`
 list names `fable`, so a registered headless or native delegated launch of Fable
 is refused with a typed reason instead of being silently remapped; the deep tier
-launches `opus` there. A user copy with a different list replaces this one whole.
+launches `opus` there. A user copy with a different list replaces this one whole —
+and that list is checked against the *generated* agent definitions, which are built
+from the **shipped** file. Restricting a model those definitions pin denies the
+matching subagent type outright (`native-subagent-main-session-only-model`), so a
+user copy naming `opus` today would deny `deep` and `general-purpose`. The same
+mismatch appears for one release cycle whenever the two files are changed and the
+new release is not yet installed.
 
 Two `CONVENTIONS §1.1` properties are intensity-independent and this adapter honors them: every review the `품질관리팀` runs carries the refute-by-default adversarial stance (anchored in `CONVENTIONS §1.1` / `roles/MODES.md`; `agent-modes/qa/_review_rules.md` is the single source for the code-review, plan-review, and test modes that load it), and every declared independent group records its realized independence. Registry-v6 groups launch 2–4 blind dispatch-depth-2 siblings atomically, use at least two harness families when `cross-harness` is required, and add asymmetric model profiles and perspectives to reduce correlated error. The hostile `external adversary` pass stays reserved for `adversarial`. If an explicitly requested cross-harness axis cannot be realized, fail loudly; an auto-selected group may use typed same-family degradation while preserving and reporting profile/perspective diversity.
 

@@ -153,19 +153,26 @@ class ClaudeDispatchModelEligibilityTest(unittest.TestCase):
     def test_legacy_complete_user_copy_keeps_its_main_only_policy(self):
         # Review B1: a user copy seeded from a release before the balanced-deep
         # tier existed must stay selected whole-file after the upgrade instead of
-        # falling back to the shipped file. Every rewrite below is counted, so a
-        # later shipped edit turns this fixture into a failure rather than a
-        # silent no-op that stops building a legacy file at all.
-        legacy = SHIPPED_CONF.read_text(encoding="utf-8")
-        legacy, dropped = re.subn(r"^CFG_TIER_BALANCED_DEEP_(MODEL|EFFORT)=.*\n", "", legacy, flags=re.MULTILINE)
+        # falling back to the shipped file.
+        #
+        # Every rewrite is counted AND the fixture's main-only list is deliberately a
+        # value the shipped file does not hold ("fable opus"), so the assertions below
+        # can only pass if the user copy actually won. Counting alone was not enough:
+        # rewriting a row to the value shipped already has returns count 1 while
+        # changing nothing, and the test would then pass identically under a shipped
+        # fallback (review MI-3).
+        shipped_text = SHIPPED_CONF.read_text(encoding="utf-8")
+        legacy, dropped = re.subn(r"^CFG_TIER_BALANCED_DEEP_(MODEL|EFFORT)=.*\n", "", shipped_text, flags=re.MULTILINE)
         self.assertEqual(dropped, 2)
         legacy, retargeted = re.subn(r"^CFG_MODEL_PROFILE_BALANCED_DEEP=.*$", "CFG_MODEL_PROFILE_BALANCED_DEEP=deep:high", legacy, count=1, flags=re.MULTILINE)
         self.assertEqual(retargeted, 1)
         legacy, failover = re.subn(r"^CFG_TIER_DEEP_FAILOVER=.*$", "CFG_TIER_DEEP_FAILOVER=light", legacy, count=1, flags=re.MULTILINE)
         self.assertEqual(failover, 1)
-        legacy, main_only = re.subn(r"^CFG_MAIN_SESSION_ONLY_MODELS=.*$", 'CFG_MAIN_SESSION_ONLY_MODELS="fable"', legacy, count=1, flags=re.MULTILINE)
+        legacy, main_only = re.subn(r"^CFG_MAIN_SESSION_ONLY_MODELS=.*$", 'CFG_MAIN_SESSION_ONLY_MODELS="fable opus"', legacy, count=1, flags=re.MULTILINE)
         self.assertEqual(main_only, 1)
         self.assertNotIn("CFG_TIER_BALANCED_DEEP_MODEL", legacy)
+        # The distinguishing value: shipped restricts fable only, this copy also opus.
+        self.assertNotIn("opus", shipped_policy()["CFG_MAIN_SESSION_ONLY_MODELS"].split())
         with tempfile.TemporaryDirectory() as tmp:
             runtime_home = Path(tmp) / "claude-home"
             (runtime_home / "agent-config").mkdir(parents=True)
@@ -174,12 +181,17 @@ class ClaudeDispatchModelEligibilityTest(unittest.TestCase):
                 values, receipt = WRAPPER.resolve_config("claude", source_root=ROOT)
                 self.assertEqual((receipt.source, receipt.reason), ("user", "user-valid"))
                 self.assertEqual(receipt.unreferenced_tier_keys, "CFG_TIER_BALANCED_DEEP_EFFORT,CFG_TIER_BALANCED_DEEP_MODEL")
-                self.assertEqual(values["CFG_MAIN_SESSION_ONLY_MODELS"], "fable")
+                self.assertEqual(values["CFG_MAIN_SESSION_ONLY_MODELS"], "fable opus")
                 with mock.patch.object(WRAPPER, "_model_policy", side_effect=lambda: values):
                     self.assertTrue(WRAPPER._main_session_only_model("claude-fable-5"))
-                    with self.assertRaises(WRAPPER.ModelSelectionError) as refused:
-                        WRAPPER.resolve_model_settings(selection(model="claude-fable-5", effort="high"))
-                    self.assertEqual(refused.exception.reason, "headless-main-session-only-model")
+                    # opus is refused ONLY because this user copy says so — under the
+                    # shipped policy it is the deep tier itself.
+                    self.assertTrue(WRAPPER._main_session_only_model("opus"))
+                    for alias in ("claude-fable-5", "opus"):
+                        with self.assertRaises(WRAPPER.ModelSelectionError) as refused:
+                            WRAPPER.resolve_model_settings(selection(model=alias, effort="high"))
+                        self.assertEqual(refused.exception.reason, "headless-main-session-only-model")
+                self.assertFalse(WRAPPER._main_session_only_model("opus"))  # shipped policy again
 
     def test_cli_rejects_a_main_only_model_before_registry_prompt_log_or_child(self):
         with tempfile.TemporaryDirectory() as tmp:

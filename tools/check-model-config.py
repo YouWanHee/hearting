@@ -19,7 +19,11 @@ ROOT = Path(__file__).resolve().parents[1]
 # `tools` is here because leaving it out is what actually hid the Fleet title worker's
 # `haiku` pin for a month: the blanket `/tools/fleet/` entry below reads like the reason,
 # but the canonical copy was never scanned at all — only its Claude mirror was.
-SCAN_DIRS = ["adapters", "core", "roles", "tools"]
+# `utilities` and `hooks` joined the list on 2026-09-09: they hold the model-selection
+# consumers themselves (the profile resolver, the capacity cascade, the native-subagent
+# admission hook), which is the last place a stray pin should be able to hide. Both were
+# already clean when they were added, so this widened the guard without a single waiver.
+SCAN_DIRS = ["adapters", "core", "roles", "tools", "utilities", "hooks"]
 
 # The single sources of truth (allowed to contain concrete model IDs).
 CONFIG_SUFFIX = "config/models.conf"
@@ -69,6 +73,11 @@ EXEMPT_SUBSTRINGS = (
 # Concrete model-ID patterns (unambiguous identifiers + alias-as-model-value).
 PATTERNS = [
     re.compile(r"gpt-5\.\d"),                                   # codex: gpt-5.6-sol, gpt-5.4-mini, ...
+    # codex: gpt-6-astra and any later gpt-<major>-<name>. The `gpt-5\.\d` pattern above
+    # only matches a dotted minor version, so it never saw Astra — and Astra is the codex
+    # adapter's interactive-main-only model, the one ID that most needs to stay inside
+    # models.conf. Reported by the 2026-09-09 registered review (MA-2b).
+    re.compile(r"\bgpt-\d+-[a-z]"),
     re.compile(r"claude-(?:opus|sonnet|haiku|fable)-\d"),       # claude versioned full ids
     re.compile(r"opencode-go/[a-z0-9]"),                        # opencode-go provider model-id
     re.compile(r"\bglm-\d"),                                    # opencode glm-5.2
