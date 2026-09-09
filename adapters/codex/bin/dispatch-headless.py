@@ -727,6 +727,16 @@ def _main_session_only_model(model: str) -> bool:
     return restricted_model(model, policy.get("CFG_MAIN_SESSION_ONLY_MODELS", ""))
 
 
+def _main_session_only_policy_state() -> str:
+    """`declared` or `absent` (review R1 M3): a selected user copy without the
+    key is unrestricted, and that fact must be visible on the receipt."""
+
+    try:
+        return "declared" if "CFG_MAIN_SESSION_ONLY_MODELS" in _model_policy() else "absent"
+    except ModelSelectionError:
+        return "unavailable"
+
+
 def _require_headless_model(model: str, source: str) -> None:
     if _main_session_only_model(model):
         raise ModelSelectionError(
@@ -3323,6 +3333,7 @@ def main(argv: list[str]) -> int:
     print(f"model_profile={settings['profile']}")
     print(f"model_tier={settings['tier']}")
     print(f"profile_granularity={settings['granularity']}")
+    print(f"main_session_only_policy={_main_session_only_policy_state()}")
     for key, value in sorted(getattr(args, "profile_selection_receipt", {}).items()):
         print(f"{key}={value}")
     print(f"model={settings['model']}")

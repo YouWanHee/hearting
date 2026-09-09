@@ -1095,6 +1095,9 @@ class RouteDefaultsReceiptTest(unittest.TestCase):
 
 
 class TopProfileOwnerTupleTest(unittest.TestCase):
+    """Field-level refusal only; the accepted path is exercised on a real
+    compiled route in utilities/profile_demand.test.py (review R1 M2)."""
+
     def _route(self, **override):
         payload = {
             "effective_intensity": "quick", "slug": "review-top", "capability": "autopilot-code",
@@ -1105,13 +1108,6 @@ class TopProfileOwnerTupleTest(unittest.TestCase):
         path = Path(tempfile.mkdtemp()) / "route.json"
         path.write_text(json.dumps(payload), encoding="utf-8")
         return str(path)
-
-    def test_a_route_sealed_top_profile_reaches_the_wrapper(self):
-        _, values, forwarded, _, derived = OWNER._parse(
-            ["--start", "--route-evidence", self._route(), "--prompt-file", "/p.md"])
-        self.assertEqual(values["--model-profile"], "top")
-        self.assertIn("--model-profile", derived)
-        self.assertEqual(forwarded[forwarded.index("--model-profile") + 1], "top")
 
     def test_an_unknown_profile_is_still_refused_and_the_hint_names_top(self):
         with self.assertRaises(OWNER.OwnerError) as refused:

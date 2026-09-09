@@ -220,7 +220,7 @@ def resolve_profile_values(
     adapter: str, config: Mapping[str, str], profile: str
 ) -> dict[str, str]:
     if profile not in KNOWN_PROFILES:
-        raise ModelProfileError(f"unknown portable model profile: {profile!r}")
+        raise ModelProfileError(f"unknown model profile: {profile!r}")
     if adapter not in {"claude", "codex", "opencode"}:
         raise ModelProfileError(f"unknown adapter: {adapter!r}")
     profile_key = "CFG_MODEL_PROFILE_" + profile.upper().replace("-", "_")
@@ -243,6 +243,11 @@ def resolve_profile_values(
         "CFG_MODEL_PROFILE_GRANULARITY", "unknown"
     )
     if not model or not declared_default:
+        if profile == TOP_PROFILE:
+            raise ModelProfileError(
+                f"{profile_key} names tier {tier!r} but CFG_TIER_{tier_key}_MODEL/"
+                f"{budget_suffix} is not declared; the top exception profile is opt-in",
+                "profile-top-undeclared")
         raise ModelProfileError(f"profile tier {tier!r} lacks model/{budget_suffix.lower()}")
     if not budget:
         raise ModelProfileError(f"profile {profile!r} has an empty execution budget")
@@ -293,7 +298,7 @@ def validate_registered_profile(
     if profile is None:
         return
     if profile not in KNOWN_PROFILES:
-        raise ModelProfileError(f"unknown portable model profile: {profile!r}")
+        raise ModelProfileError(f"unknown model profile: {profile!r}")
     if profile == TOP_PROFILE and not (
         registered_worker and dispatch_depth == 1 and worker_type in TOP_WORKER_TYPES
     ):

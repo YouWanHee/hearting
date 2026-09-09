@@ -292,25 +292,98 @@ class RouteDemand(unittest.TestCase):
 
 
 class TopExceptionRoute(unittest.TestCase):
-    """The `top` exception profile at the route layer: owner-only, explicit-only."""
+    """The `top` exception profile at the route layer, on real routes: the same
+    compile -> verify_route -> compose -> verify_route round trip the portable
+    profiles take (review R1 M2), for both shapes that can carry an owner."""
 
-    def nodes(self):
-        return [{"id": "execute", "kind": "pipeline-stage", "dispatch_depth": 2, "model_profile": "light"}]
+    args = F.TestRoute.args
+    registered_headless = F.TestRoute.registered_headless
+    dispatch = F.TestRoute.dispatch
+    nested = F.TestRoute.nested
+    TOP = {"__owner__": "top"}
+
+    def owner_demand(self, judgment="difficult-uncertain"):
+        return {"__owner__": demand(judgment)}
+
+    def quick(self, **kw):
+        return R.compile_route(**self.args(predicates=[], transport=None, inline_reason=None,
+            registered_headless_evidence=self.registered_headless(), **kw))
+
+    def staged(self, **kw):
+        return R.compile_route(**self.args(requested_intensity="standard", predicates=[],
+            signals=["shared-contract"], transport="headless", inline_reason=None,
+            dispatch_evidence=self.dispatch(self.nested()), **kw))
+
+    def assert_top_owner(self, route):
+        self.assertEqual(route["owner_model_profile"], "top")
+        selection = route["owner_profile_selection"]
+        self.assertEqual((selection["source"], selection["resolved_profile"], selection["reason"]),
+                         ("explicit", "top", "explicit-top-exception"))
+        R.verify_route(route, R.ROOT)
+
+    def test_quick_route_seals_top_on_owner_and_node_and_verifies(self):
+        route = self.quick(profile_demands=self.owner_demand(), explicit_profiles=self.TOP)
+        self.assert_top_owner(route)
+        node = next(n for n in route["nodes"] if n["id"] == "one-shot")
+        self.assertEqual(node["model_profile"], "top")
+        self.assertEqual(node["profile_selection"], route["owner_profile_selection"])
+        # a plain quick route is untouched
+        plain = self.quick()
+        self.assertEqual(plain["owner_model_profile"], "balanced-deep")
+        self.assertEqual(next(n for n in plain["nodes"] if n["id"] == "one-shot")["model_profile"], "balanced-deep")
+        R.verify_route(plain, R.ROOT)
+        # a route that claims top for the owner but not the node is refused by verify
+        forged = json.loads(json.dumps(route))
+        next(n for n in forged["nodes"] if n["id"] == "one-shot")["model_profile"] = "balanced-deep"
+        with self.assertRaises(ValueError):
+            R.verify_route(forged, R.ROOT)
+
+    def test_staged_route_seals_top_on_the_owner_only_and_verifies(self):
+        route = self.staged(profile_demands=self.owner_demand("important"), explicit_profiles=self.TOP)
+        self.assert_top_owner(route)
+        self.assertNotIn("top", {n["model_profile"] for n in route["nodes"]})
+        plain = self.staged()
+        self.assertEqual(plain["owner_model_profile"], "deep")
+        R.verify_route(plain, R.ROOT)
+
+    def test_compose_takes_the_same_round_trip(self):
+        composed = R.compose_route(capability="autopilot-code", capability_mode="dev", shape="solo",
+            graph=None, slug="top-solo", cwd=R.ROOT, artifact_root=R.ROOT, spec_read="fixture",
+            profile_demands=self.owner_demand(), explicit_profiles=self.TOP,
+            registered_headless_evidence=self.registered_headless())
+        self.assert_top_owner(composed)
+        self.assertEqual(next(n for n in composed["nodes"] if n["id"] == "one-shot")["model_profile"], "top")
+        with self.assertRaises(ValueError) as refused:
+            R.compose_route(capability="autopilot-code", capability_mode="dev", shape="direct",
+                graph=None, slug="top-direct", cwd=R.ROOT, artifact_root=R.ROOT, spec_read="fixture",
+                profile_demands=self.owner_demand(), explicit_profiles=self.TOP)
+        self.assertEqual(str(refused.exception), "owner-profile-top-requires-owner")
+
+    def test_the_owner_selector_reads_top_from_a_real_route_file(self):
+        route = self.quick(profile_demands=self.owner_demand(), explicit_profiles=self.TOP)
+        O = load("owner_under_test", "dispatch-owner.py")
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "route.json"
+            path.write_text(json.dumps(route), encoding="utf-8")
+            # the fixture route carries no slug; an explicit flag wins and the route fills the rest
+            _, values, forwarded, _, derived = O._parse(["--start", "--route-evidence", str(path),
+                                                        "--slug", "top-review", "--prompt-file", "/p.md"])
+        self.assertEqual(values["--model-profile"], "top")
+        self.assertEqual(values["--intensity"], "quick")
+        self.assertIn("--model-profile", derived)
+        self.assertEqual(forwarded[forwarded.index("--model-profile") + 1], "top")
 
     def test_explicit_top_is_accepted_for_the_owner_only(self):
+        nodes = [{"id": "execute", "kind": "pipeline-stage", "dispatch_depth": 2, "model_profile": "light"}]
         demands = {"__owner__": demand("important"), "execute": demand("important")}
-        normalized, explicit = R._profile_input_maps(self.nodes(), demands, {"__owner__": "top"})
-        self.assertEqual(explicit, {"__owner__": "top"})
+        _, explicit = R._profile_input_maps(nodes, demands, self.TOP)
+        self.assertEqual(explicit, self.TOP)
         with self.assertRaises(ValueError) as refused:
-            R._profile_input_maps(self.nodes(), demands, {"execute": "top"})
+            R._profile_input_maps(nodes, demands, {"execute": "top"})
         self.assertEqual(str(refused.exception), "profile-explicit-top-owner-only:execute")
         with self.assertRaises(ValueError):
-            R._profile_input_maps(self.nodes(), demands, {"__owner__": "summit"})
+            self.staged(profile_demands=self.owner_demand("predetermined"), explicit_profiles=self.TOP)
 
-    def test_top_owner_selection_seals_the_exception_reason(self):
-        row = P.resolve_profile_demand(demand("difficult-uncertain"), explicit_profile="top")
-        self.assertEqual((row["resolved_profile"], row["reason"]), ("top", "explicit-top-exception"))
-        P.validate_profile_selection(row, demand("difficult-uncertain"), profile="top")
 
 if __name__ == "__main__":
     unittest.main()

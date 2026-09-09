@@ -83,9 +83,10 @@ def restricted_model(model: str, restricted: list[str] | tuple[str, ...] | str) 
     An entry matches as a whole identifier (a hyphenated vendor id) or, when it
     is a bare alphanumeric alias, as one token of the model id (the alias inside
     a versioned full id).
-    One definition for every consumer -- the Claude and Codex wrappers, the
-    capacity cascade, the native-subagent hook mirror -- so a hyphenated top
-    model id cannot pass one gate and fail another."""
+    One definition for the Claude and Codex wrappers and the capacity
+    cascade, so a hyphenated top model id cannot pass one gate and fail
+    another. `hooks/subagent-model-default.sh` (embedded Python, no imports)
+    carries a hand-mirrored copy that must be kept identical."""
 
     entries = restricted.split() if isinstance(restricted, str) else list(restricted)
     tokens = set(re.split(r"[^a-z0-9]+", model.lower()))
