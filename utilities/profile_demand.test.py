@@ -335,7 +335,12 @@ class TopExceptionRoute(unittest.TestCase):
         # a route that claims top for the owner but not the node is refused by verify
         forged = json.loads(json.dumps(route))
         next(n for n in forged["nodes"] if n["id"] == "one-shot")["model_profile"] = "balanced-deep"
-        with self.assertRaises(ValueError):
+        forged["route_hash"] = R.route_hash(forged)  # re-sealed, so the hash check is not what refuses
+        forged["route_id"] = "rt-" + forged["route_hash"].split(":", 1)[1][:16]
+        # the profile-contract check (selection vs node) is muted so the
+        # owner-node equality check is the one under test (review R2 M1)
+        with mock.patch.object(R, "_verify_profile_contract"), \
+             self.assertRaisesRegex(ValueError, "owner node one-shot profile differs from owner_model_profile"):
             R.verify_route(forged, R.ROOT)
 
     def test_staged_route_seals_top_on_the_owner_only_and_verifies(self):
@@ -345,6 +350,25 @@ class TopExceptionRoute(unittest.TestCase):
         plain = self.staged()
         self.assertEqual(plain["owner_model_profile"], "deep")
         R.verify_route(plain, R.ROOT)
+
+    def test_a_recipe_with_depth_one_stage_nodes_keeps_them_off_top(self):
+        # Review R2 B1: autopilot-spec's `prd-transaction` (and refine's
+        # `transaction`, apply's `handback`, ...) are depth-1 `_kernel/owner`
+        # STAGE nodes, not the owner. A `top` owner must not spread onto
+        # them, and the route must still verify.
+        for capability, mode, stage in (("autopilot-spec", "app", "prd-transaction"),
+                                        ("autopilot-refine", "default", "transaction"),
+                                        ("autopilot-apply", "default", "handback")):
+            with self.subTest(capability=capability):
+                route = self.staged(capability=capability, capability_mode=mode,
+                                    profile_demands=self.owner_demand(), explicit_profiles=self.TOP)
+                self.assert_top_owner(route)
+                node = next(n for n in route["nodes"] if n["id"] == stage)
+                self.assertEqual((node["dispatch_depth"], node["unit"]), (1, "_kernel/owner"))
+                plain = self.staged(capability=capability, capability_mode=mode)
+                self.assertEqual(node["model_profile"],
+                                 next(n for n in plain["nodes"] if n["id"] == stage)["model_profile"])
+                self.assertNotEqual(node["model_profile"], "top")
 
     def test_compose_takes_the_same_round_trip(self):
         composed = R.compose_route(capability="autopilot-code", capability_mode="dev", shape="solo",
@@ -383,6 +407,8 @@ class TopExceptionRoute(unittest.TestCase):
         self.assertEqual(str(refused.exception), "profile-explicit-top-owner-only:execute")
         with self.assertRaises(ValueError):
             self.staged(profile_demands=self.owner_demand("predetermined"), explicit_profiles=self.TOP)
+        with self.assertRaisesRegex(ValueError, "profile-explicit-input-invalid:__owner__"):
+            R._profile_input_maps(nodes, demands, {"__owner__": "summit"})
 
 
 if __name__ == "__main__":

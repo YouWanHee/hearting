@@ -87,6 +87,15 @@ class CodexDispatchModelEligibilityTest(unittest.TestCase):
         with mock.patch.object(WRAPPER, "_model_policy", return_value=without):
             self.assertFalse(WRAPPER._main_session_only_model("gpt-6-astra"))
 
+    def test_the_receipt_reports_whether_the_key_is_declared(self):
+        self.assertEqual(WRAPPER._main_session_only_policy_state(), "declared")
+        without = {k: v for k, v in shipped_policy().items() if k != "CFG_MAIN_SESSION_ONLY_MODELS"}
+        with mock.patch.object(WRAPPER, "_model_policy", return_value=without):
+            self.assertEqual(WRAPPER._main_session_only_policy_state(), "absent")
+        with mock.patch.object(WRAPPER, "_model_policy",
+                               side_effect=WRAPPER.ModelSelectionError("dispatch-model-policy-unavailable", "x")):
+            self.assertEqual(WRAPPER._main_session_only_policy_state(), "unavailable")
+
     def test_deep_profile_and_ordinary_roles_are_unaffected(self):
         result = WRAPPER.resolve_model_settings(selection(profile="deep"))
         self.assertEqual((result["source"], result["model"]), ("profile", shipped_policy()["CFG_TIER_DEEP_MODEL"]))

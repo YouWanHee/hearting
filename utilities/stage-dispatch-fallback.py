@@ -195,8 +195,10 @@ def _usage_eligible(state: str) -> bool:
 def _policy_by_profile(route, node):
     """Collect sealed per-profile harness policies for the quality-peer derivation.
 
-    For the single-checker axis the owner policy (always deep for standard+
-    routes) plus every depth-2 node's sealed `harness_policy` keyed by its
+    For the single-checker axis the owner policy -- keyed under `deep`: the
+    standard+ owner profile is deep, and a `top` owner borrows deep's bands
+    (`dispatch-defaults.EXCEPTION_PROFILE_POLICY`), so the key names the
+    band, not the profile -- plus every depth-2 node's sealed `harness_policy` keyed by its
     model_profile reconstructs the config surface the quality-peer set is
     derived from (spec 13.30.2). Empty dict means no config-derived policy is
     present, which callers treat as not-applicable (D8-①).
