@@ -200,7 +200,9 @@ def parse_launch(payload: object) -> Launch | None:
     parent_session = _single(fields, "parent_session_id")
     if parent_session != payload_session or attempt_id is None or ATTEMPT.fullmatch(attempt_id) is None:
         return None
-    jobs = _validated_jobs(_single(fields, "job_registry"))
+    if _single(fields, "job_registry") is None:
+        return None
+    jobs = _resolved_jobs(payload)  # the receipt may name the trusted registry, never replace it
     if jobs is None:
         return None
     return Launch(attempt_id=attempt_id, jobs=jobs, session_id=payload_session, armed="stdout")
@@ -264,17 +266,30 @@ def _canonical_jobs() -> str | None:
         return None
 
 
-def _resolved_jobs(payload: dict[str, Any]) -> Path | None:
-    """The registry this call is bound to: the receipt's `job_registry`, the
-    session's `AGENT_DISPATCH_JOBS`, then the installed harness's canonical
-    registry. A `--jobs` literal in the command is deliberately not read."""
+def _trusted_jobs() -> Path | None:
+    """The one registry this session trusts: the inherited `AGENT_DISPATCH_JOBS`
+    (immutable for the session, OPERATIONS §5.10), else the installed
+    harness's canonical registry. Nothing a Bash call prints can replace it."""
 
-    fields = _fields(_stdout(payload.get("tool_response")))
-    return (
-        _validated_jobs(_single(fields, "job_registry"))
-        or _validated_jobs(os.environ.get("AGENT_DISPATCH_JOBS"))
-        or _validated_jobs(_canonical_jobs())
-    )
+    return _validated_jobs(os.environ.get("AGENT_DISPATCH_JOBS")) or _validated_jobs(_canonical_jobs())
+
+
+def _resolved_jobs(payload: dict[str, Any]) -> Path | None:
+    """The registry this call is bound to: the trusted registry, and only it.
+
+    A receipt's `job_registry` is accepted when it names that same file
+    (review R2 B1: a receipt that pointed at any writable regular file made
+    that file's self-described rows the identity proof, so receipt and row
+    were one attacker-controlled input); a receipt naming another file binds
+    nothing. A `--jobs` literal in the command is deliberately not read."""
+
+    trusted = _trusted_jobs()
+    raw = _single(_fields(_stdout(payload.get("tool_response"))), "job_registry")
+    if raw is not None:
+        named = _validated_jobs(raw)
+        if named is None or trusted is None or named.resolve(strict=False) != trusted.resolve(strict=False):
+            return None
+    return trusted
 
 
 ARM_ROW_STATUSES = frozenset({"open"})
@@ -328,7 +343,7 @@ def _arm_window() -> int:
     )
 
 
-def registry_launch(payload: object) -> tuple[Launch, ArmClaim] | None:
+def registry_launch(payload: object) -> tuple[Launch, ArmClaim] | ArmRefusal | None:
     """Arm from the wrapper-written registry: the first open depth-1 owner row
     bound to this session whose arm claim this hook process can take.
 
@@ -348,13 +363,19 @@ def registry_launch(payload: object) -> tuple[Launch, ArmClaim] | None:
     if jobs is None:
         return None
     window = _arm_window()
+    named = _single(_fields(_stdout(payload.get("tool_response"))), "attempt_id")
+    refusal: ArmRefusal | None = None
     for attempt_id, age in _session_owner_rows(jobs, session):
         claim = claim_arm(jobs, attempt_id, session, fresh=age <= window)
         if isinstance(claim, ArmRefusal):
+            # Keep the receipt-named attempt's reason above any other's
+            # (review R2 M2): the notice must say why *that* start did not arm.
+            if refusal is None or attempt_id == named:
+                refusal = claim
             continue
         armed = "registry" if claim.arms == 1 else "registry-rearm"
         return Launch(attempt_id=attempt_id, jobs=jobs, session_id=session, armed=armed), claim
-    return None
+    return refusal
 
 
 def _process_identity(pid: int) -> tuple[str, str, str] | None:
@@ -467,10 +488,13 @@ def _reclaimable(existing: dict[str, Any], jobs: Path, session: str) -> bool:
 
 def _prune_arm_directory(directory: Path, now: float) -> None:
     """Bounded retention for the ledger (review R1 M3), run under the ledger
-    lock by a process that just took a claim: an `ended` record older than
-    seven days, or any record older than thirty, is deleted. At most
-    `ARM_PRUNE_SCAN_LIMIT` entries are examined per claim so a large
-    directory cannot stall a hook; the lock file itself is never removed."""
+    lock by a process that just took a claim. An `ended` record older than
+    seven days is deleted; a record older than thirty days is deleted only
+    when it is `lapsed`, unreadable, or held by a provably dead process -- a
+    `waiting`/`gate-wake-sent` record whose holder is alive or unobservable
+    is never touched, however old (review R2 M1: the lock serialises file
+    access, it does not prove a holder dead). At most `ARM_PRUNE_SCAN_LIMIT`
+    entries are examined per claim; the lock file itself is never removed."""
 
     try:
         entries = sorted(directory.glob("att-*.json"))[:ARM_PRUNE_SCAN_LIMIT]
@@ -481,8 +505,13 @@ def _prune_arm_directory(directory: Path, now: float) -> None:
             age = now - entry.stat().st_mtime
             if age < ARM_RETENTION_ENDED_SECONDS:
                 continue
-            record = _read_arm(entry)
-            if age >= ARM_RETENTION_ANY_SECONDS or (record or {}).get("state") == "ended":
+            record = _read_arm(entry) or {}
+            state = record.get("state")
+            if state == "ended":
+                entry.unlink()
+            elif age >= ARM_RETENTION_ANY_SECONDS and (
+                state in {"lapsed", "unreadable"} or not _holder_alive(record.get("holder"))
+            ):
                 entry.unlink()
         except OSError:
             continue
@@ -1179,6 +1208,8 @@ def main() -> int:
             return 0 if claim.watched else no_arm_notice(payload, reason=claim.reason)
     else:
         resolved = registry_launch(payload)
+        if isinstance(resolved, ArmRefusal):
+            return 0 if resolved.watched else no_arm_notice(payload, reason=resolved.reason)
         if resolved is None:
             return no_arm_notice(payload)
         launch, claim = resolved
@@ -1220,10 +1251,12 @@ def main() -> int:
                 launch, attempt_only=True, settle="sent-ambiguous", announced=announced
             )
             if notices:
+                code = emit_receipt("attention", gate_wake_message(launch, notices), block=False)
                 settle_arm(claim, "gate-wake-sent", gate_delivery_id=announced[0])
-                return emit_receipt("attention", gate_wake_message(launch, notices), block=False)
+                return code
             time.sleep(interval)
-        settle_arm(claim, "ended" if wait_state in {"ready", "attention"} else "lapsed")
+        if wait_state not in {"ready", "attention"}:
+            settle_arm(claim, "lapsed")
         state, message = classified_receipt(launch, wait_state, wait_reason, root)
     # SD-123 (8)(b): an open gate rides this same wake. It also forces the
     # attention state -- a route whose next step is a human decision has not
@@ -1236,6 +1269,10 @@ def main() -> int:
             + " A human gate is open and awaiting your decision; it is answered, not harvested. "
             + " ".join(gates)
         )
+    # `ended` is sealed only once the receipt has actually gone out (review
+    # R2 B2): a crash between classification and emission leaves the claim
+    # `waiting` under a dead holder, so the next Bash call re-arms and the
+    # wake is delivered at least once instead of never.
     block = _attention_has_open_child(message)
     if block:
         # A live owned child is still open -- no delivery-owing terminal
@@ -1243,17 +1280,19 @@ def main() -> int:
         # open|running -> done), so there is nothing to claim. This keeps
         # Claude from stopping prematurely; SD-111's claim gate does not
         # apply to it.
-        return emit_receipt(state, message, block=True)
+        return _ended(claim, emit_receipt(state, message, block=True), terminal=state in TERMINAL_STATES)
     owing = _delivery_owing_row(launch)
     if owing is None:
         # Not (yet) a delivery-owing terminal completion -- still open/
         # running (timeout, bridge error) or a non-SD-111 row. Emit exactly
         # as before the claim gate existed; only a genuine delivery-owing
         # terminal notice is claim-gated.
-        return emit_receipt(state, message, block=False)
+        return _ended(claim, emit_receipt(state, message, block=False), terminal=state in TERMINAL_STATES)
     win = _carrier_one_claim(launch, owing)
     if win is None:
-        return 0
+        # Another carrier holds (or already acked) the durable record: the
+        # completion is delivered by it, so this attempt is finished here.
+        return _ended(claim, 0, terminal=True)
     exit_code = emit_receipt(state, message, block=False)
     try:
         pending_delivery.mark_sent_ambiguous(
@@ -1261,6 +1300,14 @@ def main() -> int:
         )
     except pending_delivery.PendingDeliveryError:
         pass
+    return _ended(claim, exit_code, terminal=True)
+
+
+def _ended(claim: ArmClaim, exit_code: int, *, terminal: bool) -> int:
+    """Seal the claim after the receipt is out: `ended` for a terminal wake,
+    `lapsed` for a non-terminal bridge state a later call may retry."""
+
+    settle_arm(claim, "ended" if terminal else "lapsed")
     return exit_code
 
 
