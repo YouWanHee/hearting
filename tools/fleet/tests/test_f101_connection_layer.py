@@ -89,15 +89,29 @@ class PeerEndpointLabelTest(unittest.TestCase):
     def test_visible_endpoint_uses_its_badge(self):
         self.assertIn("[3a] codex", self._label({("codex", self._SID): "3a"}))
 
+    # These two pin the fallback ladder BELOW the badge, so the resolver is stubbed out.
+    # Without the stub they read this machine's live session records: `_SID` is a real id,
+    # and once off-board peers learned to resolve their own tag both started returning
+    # `[3a] codex` here — a test failing on live state rather than on the behavior it names.
+
     def test_offscreen_endpoint_falls_back_to_the_ledger_name(self):
-        text = self._label({}, name="peer-test-codex")
+        with mock.patch.object(render, "_resolve_session_tag", return_value=None):
+            text = self._label({}, name="peer-test-codex")
         self.assertIn("peer-test-codex", text)
         self.assertNotIn(self._SID, text)
 
     def test_nameless_offscreen_endpoint_is_harness_and_short_prefix(self):
-        text = self._label({})
+        with mock.patch.object(render, "_resolve_session_tag", return_value=None):
+            text = self._label({})
         self.assertIn("codex:01a084f7", text)
         self.assertNotIn(self._SID, text)
+
+    def test_an_offscreen_endpoint_still_gets_its_badge_when_one_resolves(self):
+        # The point of resolving off-board: one session keeps one shape whether or not it
+        # happens to be on screen this tick.
+        with mock.patch.object(render, "_resolve_session_tag", return_value="3a"):
+            text = self._label({}, name="peer-test-codex")
+        self.assertIn("[3a] codex", text)
 
     def test_the_badge_wins_over_a_name(self):
         text = self._label({("codex", self._SID): "3a"}, name="peer-test-codex")
