@@ -5,7 +5,10 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sys
+from types import SimpleNamespace
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -55,9 +58,36 @@ class StopLifecycleTest(unittest.TestCase):
 
     def test_sessionend_has_no_stop_branch(self):
         source = SESSIONEND_PATH.read_text(encoding="utf-8")
-        self.assertIn('run_preflight("session-end"', source)
         self.assertNotIn("join_session_batch", source)
         self.assertNotIn('event == "stop"', source)
+        spec = importlib.util.spec_from_file_location("codex_sessionend_lifecycle", SESSIONEND_PATH)
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+        launch = mock.Mock(return_value={"state": "started"})
+        completion = SimpleNamespace(CompletionError=RuntimeError, launch=launch)
+        payload = {"cwd": "/fixture/project", "session_id": "fixture-session"}
+        # Exercise main's handoff without spawning any preflight, model, or
+        # memory process. Stop remains cleanup-only; SessionEnd owns completion.
+        with mock.patch.dict(sys.modules, {
+            "memory_session_completion": completion,
+            "fleet": SimpleNamespace(interaction=SimpleNamespace(clear_wait=mock.Mock())),
+            "session_summary_trigger": SimpleNamespace(launch_trigger=mock.Mock()),
+        }), mock.patch.object(module, "is_worker_session", return_value=False), \
+                mock.patch.object(module, "load_payload", return_value=payload), \
+                mock.patch.object(module, "input_generation", return_value="fixture-generation"), \
+                mock.patch.object(module, "run_preflight") as preflight:
+            self.assertEqual(module.main(), 0)
+        launch.assert_called_once()
+        self.assertEqual(launch.call_args.args, (
+            "codex", "fixture-session", "/fixture/project", str(module.PREFLIGHT),
+            ["session-end", "/fixture/project", "fixture-session"],
+        ))
+        self.assertEqual(launch.call_args.kwargs["input_generation"], "fixture-generation")
+        preflight.assert_called_once_with(
+            "material-route", "clear", "--session", "fixture-session",
+            quiet=True, timeout=mock.ANY,
+        )
 
 
 if __name__ == "__main__":

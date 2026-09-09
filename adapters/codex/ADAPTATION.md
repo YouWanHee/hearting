@@ -473,7 +473,7 @@ is observed.
 | local evidence exposure | Codex `UserPromptSubmit` also runs the portable `hooks/local-evidence-inject.sh` presence probe for the prompt cwd: research/documents/analysis bucket counts plus at most six newest entry paths from the canonical artifact root (2,400-UTF-8-byte bound, no body reads, no prompt classifier, silent when empty, worker-exempt, fail-open). `preflight.sh local-evidence [cwd]` is the manual path |
 | oncall briefing | Run `adapters/codex/bin/preflight.sh briefing [cwd]` before prompt handling on the dedicated agent desk |
 | loop guidance | Run `adapters/codex/bin/preflight.sh loop-info <oncall|note|study|drill|runtime-watch>` before following loop guides; Codex reports manual contracts, missing implementations, and drill auto-run restrictions without executing loop scripts. The `note` loop and note semantics are application-owned; the harness exposes only the optional app-neutral `artifact-sink` port |
-| memory distill | Transcript delta extraction exists via `adapters/codex/bin/preflight.sh distill-delta <session-id>`. The user-facing `distill-propose` stays an explicit opt-in preview (reports `status=tool-contract`, exits 69 until `CODEX_DISTILL_ENABLE=1`). The verified automatic distill worker remains owned by actual `SessionEnd` and `UserPromptSubmit` turn nudges: the `codex exec --sandbox read-only` worker is verified tool-free (see Distillation Boundary) and applies through `apply-distill-actions.py`; Stop has no distillation authority; opt out with `CODEX_DISTILL_ENABLE=0` |
+| memory distill | Transcript delta extraction exists via `adapters/codex/bin/preflight.sh distill-delta <session-id>`. The user-facing `distill-propose` stays an explicit opt-in preview (reports `status=tool-contract`, exits 69 until `CODEX_DISTILL_ENABLE=1`). The verified automatic distill worker remains owned by actual `SessionEnd` and `UserPromptSubmit` turn nudges: the `codex exec --sandbox read-only` worker uses the authorized restricted fallback with tools still available (see Distillation Boundary) and applies through `apply-distill-actions.py`; Stop has no distillation authority; opt out with `CODEX_DISTILL_ENABLE=0` |
 | worklog state signal | Run `adapters/codex/bin/preflight.sh worklog [cwd]` to inspect configured `<agent-notes-root>` / `<worklog-board-app>` paths read-only before Codex updates notes or diagnoses board state |
 | role profiles | Read `roles/README.md`, then run `adapters/codex/bin/preflight.sh role <portable-role|role-profile|pipeline-stage>` for behavioral-role or native-agent profile resolution. Registered routes separately seal `model_profile=deep|balanced-deep|light|mini`, resolved from the adapter config |
 | permission mapping | Run `adapters/codex/bin/preflight.sh permissions` to inspect the Codex approval/sandbox contract and confirm Claude `allowedTools` is unsupported |
@@ -786,11 +786,12 @@ claim.
 ## Distillation Boundary
 
 Claude's adapter runs a detached `claude -p` worker with tool use denied by
-runtime flags. Codex has no equivalent no-tools worker flag, but a
-`codex exec --sandbox read-only` worker is physically tool-free (every write
-mechanism, shell or `apply_patch`, hits the OS read-only wall), so the adapter
-realizes the **same portable 2-tier distillation contract**
-(`core/MEMORY.md` §7, D-30/D-32) rather than only an add-only subset.
+runtime flags. Codex has no verified per-invocation flag removing every tool.
+It uses the authorized `codex exec --sandbox read-only` restricted fallback:
+the sandbox limits project writes, while the shared strict action applier owns
+memory mutations. Read tools and CLI-owned metadata remain separate surfaces;
+this is not zero-tools parity. Increment and curate action semantics still follow
+`core/MEMORY.md` §7, D-30/D-32.
 
 The adapter reimplements the portable `hooks/mem-distill-dispatch.sh` pipeline
 **synchronously** in `adapters/codex/bin/distill-worker.sh` (the D-32
@@ -849,12 +850,11 @@ Two tiers + one manual surface:
    marker without applying.
 
 Verification (codex-cli 0.142.5):
-- Tool-free: an adversarial write probe under the exact worker flags
-  (`codex exec --sandbox read-only --ephemeral --ignore-rules`) proved tool-free
-  execution. Every model-attempted write — sentinel creation inside and outside
-  the working root, overwriting an existing file, and creating a new file —
-  failed with an OS-level `Read-only file system` error, so no write mechanism
-  (shell command or `apply_patch`) can mutate state.
+- Scoped write probe: under the tested worker flags
+  (`codex exec --sandbox read-only --ephemeral --ignore-rules`), attempted
+  sentinel creation and file edits failed with `Read-only file system`.
+  This historical observation establishes only those attempted writes, not
+  removal of tools or immutability of CLI-owned metadata/configuration.
 - No recursion: an isolated `CODEX_HOME` canary confirmed `codex exec` fires
   `SessionStart` but not `SessionEnd` hooks, so the worker's exec cannot
   re-trigger the session-end distill path. The `MEM_DISTILL=1` guard on the exec
@@ -866,8 +866,8 @@ Verification (codex-cli 0.142.5):
   `tools/memory/apply-distill-actions.py` unit coverage and
   `hooks/portable-guards.test.sh`.
 
-Automatic session-end (curate) and turn-nudge (increment) distillation is
-therefore enabled by default; opt out by exporting `CODEX_DISTILL_ENABLE=0`.
+Automatic session-end (curate) and turn-nudge (increment) distillation remains
+enabled under the existing restricted-fallback policy; opt out by exporting `CODEX_DISTILL_ENABLE=0`.
 
 ## Worklog Boundary
 

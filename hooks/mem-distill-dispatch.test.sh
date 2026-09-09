@@ -343,9 +343,9 @@ prompt_arg="$(printf '%s\n' "$argv" | tail -n1)"
 rmdir "$STORE/.distill-lock-$SID6" 2>/dev/null || true
 
 # ============================================================
-# test (a) — JSON-lines 파싱 (stub): 유효 2줄 + malformed 5줄 → row count == 2
+# test (a) — strict JSON-lines: mixed valid + malformed rejects the whole batch
 # ============================================================
-echo "== test(a): JSON-lines 파싱 — 유효 2줄 + malformed 5줄 → isolated DB row count == 2 =="
+echo "== test(a): strict JSON-lines — malformed member rejects whole batch, frontier preserved =="
 SIDa="dispatchsida"
 STOREa="$(mktemp -d)"; PROJa="$(mktemp -d)"
 STUBa="$(mktemp -d)"
@@ -377,23 +377,25 @@ chmod +x "$STUBa/claude"
 MEM_STORE="$STOREa" MEM_PROJECTS="$PROJa" MEM_DISTILL_ENABLE=1 PATH="$STUBa:$PATH" \
   bash "$DISPATCH" distill "$SIDa" "/tmp"
 
-# 폴링: detached child 가 mem add 완료할 때까지 row-count ≥ 1 또는 최대 5초 대기 (M5)
-# 유효 2줄 → row count == 2 기대, 하지만 quality_ok(≥15자) 이미 충족
+# Poll detached completion. Strict mode validates every nonempty line before
+# issuing the first memory command, so even the two valid rows must stay unapplied.
 for _ in $(seq 1 50); do
-  cnt_a="$(MEM_STORE="$STOREa" python3 "$MEM" stats 2>/dev/null | grep -E '^\s+total:' | awk '{print $2}')"
-  [ "${cnt_a:-0}" -ge 2 ] 2>/dev/null && break
+  [ ! -d "$STOREa/.distill-lock-$SIDa" ] && break
   sleep 0.1
 done
 cnt_a="$(MEM_STORE="$STOREa" python3 "$MEM" stats 2>/dev/null | grep -E '^\s+total:' | awk '{print $2}')"
-[ "${cnt_a:-0}" = "2" ] \
-  && ok "test(a): row count == 2 (유효 2줄만 저장, malformed 5줄 skip)" \
-  || bad "test(a): row count = ${cnt_a:-0}, 기대 2 (유효 2줄 저장 실패 or malformed 포함)"
+[ "${cnt_a:-0}" = "0" ] \
+  && [ ! -f "$STOREa/.distill-state-$SIDa" ] \
+  && [ ! -f "$STOREa/.distill-fail-$SIDa" ] \
+  && grep -q 'apply-invalid-output' "$STOREa/.distill-failures.log" 2>/dev/null \
+  && ok "test(a): strict invalid batch → zero writes, frontier and strike counter preserved" \
+  || bad "test(a): strict invalid batch changed writes/frontier/strikes (rows=${cnt_a:-0})"
 rmdir "$STOREa/.distill-lock-$SIDa" 2>/dev/null || true
 
 # ============================================================
-# test (M3) — code-fence 출력 → 레코드 정상 파싱
+# test (M3) — strict output rejects code fences before applying inner objects
 # ============================================================
-echo "== test(M3): code-fence 감싼 출력 → 내부 유효 줄만 레코드 생성 =="
+echo "== test(M3): strict output — code fence rejects whole batch, frontier preserved =="
 SIDm3="dispatchsidm3"
 STOREm3="$(mktemp -d)"; PROJm3="$(mktemp -d)"
 STUBm3="$(mktemp -d)"
@@ -418,16 +420,17 @@ chmod +x "$STUBm3/claude"
 MEM_STORE="$STOREm3" MEM_PROJECTS="$PROJm3" MEM_DISTILL_ENABLE=1 PATH="$STUBm3:$PATH" \
   bash "$DISPATCH" distill "$SIDm3" "/tmp"
 
-# 폴링: row count ≥ 1 대기 (내부 유효 2줄 기대)
+# Poll detached completion; fenced output is invalid in automatic strict mode.
 for _ in $(seq 1 50); do
-  cnt_m3="$(MEM_STORE="$STOREm3" python3 "$MEM" stats 2>/dev/null | grep -E '^\s+total:' | awk '{print $2}')"
-  [ "${cnt_m3:-0}" -ge 2 ] 2>/dev/null && break
+  [ ! -d "$STOREm3/.distill-lock-$SIDm3" ] && break
   sleep 0.1
 done
 cnt_m3="$(MEM_STORE="$STOREm3" python3 "$MEM" stats 2>/dev/null | grep -E '^\s+total:' | awk '{print $2}')"
-[ "${cnt_m3:-0}" = "2" ] \
-  && ok "test(M3): code-fence 감싼 출력 → 내부 유효 2줄 레코드 생성 (fence skip 정상)" \
-  || bad "test(M3): row count = ${cnt_m3:-0}, 기대 2 (fence skip 실패 또는 bare json.loads 회귀)"
+[ "${cnt_m3:-0}" = "0" ] \
+  && [ ! -f "$STOREm3/.distill-state-$SIDm3" ] \
+  && grep -q 'apply-invalid-output' "$STOREm3/.distill-failures.log" 2>/dev/null \
+  && ok "test(M3): code fence → zero writes and frontier preserved" \
+  || bad "test(M3): fenced invalid batch changed writes/frontier (rows=${cnt_m3:-0})"
 rmdir "$STOREm3/.distill-lock-$SIDm3" 2>/dev/null || true
 
 # ============================================================
@@ -615,8 +618,8 @@ out_i2="$(MEM_STORE="$STOREi2" python3 "$MEM" prune "x\"; touch $SENTINEL_I2; ec
   && ok "INJ-2: prune 실제 시도됨 — 전체 문자열 1개 id argv 로 게이트 거부(false-green 아님)" \
   || bad "INJ-2: prune 거부 미발생 (rc=$rc out=[$out_i2])"
 
-# action routing + S2b membership: in-snapshot prune 실행 / non-snapshot prune skip
-echo "== action routing + S2b membership: in-snapshot prune 실행 · non-snapshot skip =="
+# action routing + S2b membership: one outsider rejects the whole strict batch
+echo "== action routing + S2b membership: outsider rejects whole batch before in-snapshot prune =="
 SIDg5="dispatchsidg5"
 STOREg5="$(mktemp -d)"; PROJg5="$(mktemp -d)"; STUBg5="$(mktemp -d)"
 CLEANUP+=("$STOREg5" "$PROJg5" "$STUBg5")
@@ -650,10 +653,16 @@ c = sqlite3.connect(sys.argv[1])
 print(c.execute("SELECT COUNT(*) FROM records WHERE id=?", (sys.argv[2],)).fetchone()[0])
 PY
 )"
-[ -n "$RID5" ] && [ "$gone5" = 0 ] \
-  && ok "routing: in-snapshot prune action 실행됨 (RID 삭제)" || bad "routing: in-snapshot prune 미실행 (RID5=[$RID5] gone=$gone5)"
-[ -f "$STOREg5/deleted-records.jsonl" ] && grep -q "$RID5" "$STOREg5/deleted-records.jsonl" \
-  && ok "routing: prune graveyard 기록됨 (S2b in-snapshot 경로)" || bad "routing: graveyard 미기록"
+[ -n "$RID5" ] && [ "$gone5" = 1 ] \
+  && [ ! -f "$STOREg5/.distill-state-$SIDg5" ] \
+  && grep -q 'apply-invalid-output' "$STOREg5/.distill-failures.log" 2>/dev/null \
+  && ok "routing: outsider rejected whole batch before any in-snapshot prune" \
+  || bad "routing: strict allowlist batch was partially applied (RID5=[$RID5] remaining=$gone5)"
+if [ ! -f "$STOREg5/deleted-records.jsonl" ] || ! grep -q "$RID5" "$STOREg5/deleted-records.jsonl"; then
+  ok "routing: rejected strict batch authored no prune graveyard row"
+else
+  bad "routing: rejected strict batch still authored a prune graveyard row"
+fi
 rmdir "$STOREg5/.distill-lock-$SIDg5" 2>/dev/null || true
 
 # D-35 pending handoff boundary: mem.py exposes protected records in a separate

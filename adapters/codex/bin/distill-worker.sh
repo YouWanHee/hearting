@@ -41,9 +41,10 @@ adapter-owned session-end/turn-nudge dispatch may pass the verified enable/apply
 contract gates explicitly.
 
 Set CODEX_DISTILL_ENABLE=1 to run it.
-Set CODEX_DISTILL_CONTRACT_ACCEPTED=1 only after the Codex no-tools/action
-contract has been accepted. CODEX_DISTILL_APPLY=1 is ignored and exits 69
-until that acceptance gate is set.
+Set CODEX_DISTILL_CONTRACT_ACCEPTED=1 only after the checked restricted-sandbox
+and action contract has been accepted. This gate does not claim that Codex has
+a per-invocation zero-tools control. CODEX_DISTILL_APPLY=1 is ignored and exits
+69 until that acceptance gate is set.
 
 Per-mode model tier: increment=nudge tier, curate=light tier, resolved from
 the complete user model config or shipped adapter fallback. Override
@@ -191,6 +192,7 @@ Output contract: stdout contains JSON objects only, one per line. Allowed shapes
   {"action":"graduate","id":"<snapshot id>","to":"durable"}
   {"action":"reattribute","id":"<orphan id>"}
   {"action":"supersede","id":"<older snapshot id>","by":"<newer snapshot id>"}
+  {"action":"noop"} (only as the sole nonempty object)
 
 Mechanical boundaries:
 - Choose the tier from its lifecycle: working is finite-lived; durable persists.
@@ -202,8 +204,8 @@ Mechanical boundaries:
 - ID mutations may reference only destructive IDS from the snapshot. Delete is
   not a curator action.
 - Merge only when the canonical record preserves every distinct obligation.
-- Emit no prose, Markdown, or code fences. Emit nothing when you judge that no
-  action would improve memory.
+- Emit no prose, Markdown, or code fences. When no action would improve memory,
+  emit nothing or the sole exact object {"action":"noop"}.
 EOF
 else
   # increment (turn-nudge fast tier): add-only. The applier also enforces add-only in
@@ -232,11 +234,12 @@ genuinely has no member.
 
 Output contract: stdout contains JSON objects only, one per line:
   {"tier":"working|durable","type":"decision|user-correction|unresolved-obligation|artifact-pointer","body":"<minimal canonical content>","headline":"<retrieval headline>","aliases":["bounded retry","바운디드 재시도"],"entities":["hooks/mem-distill-dispatch.sh","D-41","a7c01b7d"],"topics":["memory-pipeline","dispatch"],"artifact_refs":[]}
+  {"action":"noop"} (only as the sole nonempty object)
 
 Choose the tier from its lifecycle: working is finite-lived; durable persists.
 artifact-pointer requires artifact_refs and records only why/when to retrieve
-the artifact. Emit no prose, Markdown, or code fences. Emit nothing when no
-addition is useful.
+the artifact. Emit no prose, Markdown, or code fences. When no addition is
+useful, emit nothing or the sole exact object {"action":"noop"}.
 EOF
 fi
 
@@ -341,10 +344,10 @@ else
   set --
 fi
 
-# no-tools worker: read-only sandbox physically denies every write mechanism (shell or
-# apply_patch), so the model can only emit JSON-lines. Same constrained flag set the
-# ADAPTATION Distillation Boundary verified tool-free. codex exec does not accept
-# --ask-for-approval (top-level flag only); the read-only sandbox alone is the contract.
+# Checked Codex fallback boundary: the prompt requests no tool use and the
+# read-only sandbox constrains project/memory mutation, but the CLI has no
+# verified per-invocation zero-tools control. codex exec does not accept
+# --ask-for-approval (top-level flag only); apply remains separately gated.
 # Wrapped in `if` (not bare, set -e) so a timeout/kill doesn't crash session-end — a
 # failed exec skips apply+advance, leaving the delta for the next session (no data loss).
 if AGENT_SESSION_ROLE=worker MEM_DISTILL=1 python3 "$ROOT/utilities/model-worker-governor.py" \
@@ -372,25 +375,23 @@ fi
 
 if [ "${CODEX_DISTILL_APPLY:-}" = "1" ]; then
   if [ "${CODEX_DISTILL_CONTRACT_ACCEPTED:-0}" != "1" ]; then
-    echo "codex distill worker: tool-contract — no-tools/action contract not accepted; refusing CODEX_DISTILL_APPLY" >&2
+    echo "codex distill worker: tool-contract — restricted-sandbox/action contract not accepted; refusing CODEX_DISTILL_APPLY" >&2
     exit 69
   fi
+  apply_status=0
   if [ "$exec_status" = "0" ] && [ -f "$out_file" ]; then
     # shared applier (shell=False, argv-only). --mode gates id-mutations: increment =
     # add-only enforced; curate = snapshot-id membership whitelist via --snapshot-ids.
     AGENT_HOME="$AGENT_ROOT" python3 "$ROOT/tools/memory/apply-distill-actions.py" \
-      "$out_file" "$ROOT/tools/memory/mem.py" --mode "$mode" --snapshot-ids "$snapids_file"
+      "$out_file" "$ROOT/tools/memory/mem.py" --mode "$mode" \
+      --snapshot-ids "$snapids_file" --strict-output || apply_status=$?
   fi
-  # Advance the distill marker after an APPLY-mode exec succeeds. The shared applier is
-  # best-effort per record (it returns 0 even if an individual `mem.py add` fails), so
-  # advance is gated on the exec, not per-record apply success — the same
-  # always-advance-after-applier semantics as the portable dispatcher (a poison delta is
-  # not reprocessed forever). A preview-only run (no APPLY) or a failed/timed-out exec
-  # (exec_status!=0) keeps the delta for a later real distill. Fixes the prior re-distill
-  # divergence (the old worker never advanced → reprocessed the same delta every run).
-  if [ "$exec_status" = "0" ]; then
+  # APPLY mode closes the capture only after strict validation and every
+  # requested mem mutation succeed. Other outcomes preserve the delta.
+  if [ "$exec_status" = "0" ] && [ "$apply_status" = "0" ]; then
     AGENT_HOME="$AGENT_ROOT" python3 "$ROOT/tools/memory/mem.py" distill "$sid" --source codex --advance-capture "$frontier" >/dev/null 2>&1 || true
   fi
+  [ "$apply_status" -eq 0 ] || exit "$apply_status"
 fi
 
 # A rejected model/effort remains an error even if the CLI created an output

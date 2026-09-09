@@ -533,9 +533,9 @@ case "$cmd" in
     if [ "$sync_status" -ne 0 ]; then
       printf 'codex preflight: session-end memory sync status=%s; continuing bounded curator fallback\n' "$sync_status" >&2
     fi
-    # Automatic session-end distillation is enabled: the codex exec read-only
-    # sandbox was verified tool-free (adapters/codex/ADAPTATION.md Distillation
-    # Boundary), so default the worker to apply mode. Opt out with
+    # Automatic session-end uses the authorized codex exec read-only fallback;
+    # it restricts project writes but does not remove tools (see ADAPTATION.md).
+    # Strict action/applier gates own memory mutations. Opt out with
     # CODEX_DISTILL_ENABLE=0. session-end runs the *curate* (deep) tier —
     # snapshot-grounded prune/merge/graduate via the shared curate-snapshot +
     # whitelist applier (D-30/D-32); turn-nudge runs increment. Synchronous so the
@@ -1281,6 +1281,8 @@ adapter=codex
 status=tool-contract
 tool_contract=no-tools-distill-worker
 runtime_surface=codex-exec-constrained-proposal
+runtime_tool_selection=unavailable
+parity_gap=tools-remain-available-in-read-only-sandbox
 reason=distill-proposal-disabled
 delta_surface=adapters/codex/bin/preflight.sh distill-delta <session-id>
 enable=CODEX_DISTILL_ENABLE=1

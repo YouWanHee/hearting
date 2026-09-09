@@ -285,7 +285,16 @@ nofollow, nonblocking and identity-bound, and publication rechecks that binding.
 New evidence uses exclusive owned staging and no-replace publication; existing
 files and receipts are reusable only for the exact validated immutable inventory.
 Changed inventories or foreign successors refuse, never overwrite or roll back
-another writer. Files, each new directory edge and receipt publication are
+another writer. This exact successor comparison governs archive creation and
+apply, including retries. Later retention checks instead prove that the entire
+current source inventory needing archival is still preserved by the immutable
+receipt and exact source/archive sizes and hashes. An archived entry's recorded
+successor hash is a historical observation: a later append does not invalidate
+the preserved original. The current successor must still match the freshly
+collected inventory's hash or absence through the same safe reader; changed
+source/archive/receipt, incomplete inventory, unsafe paths and read races refuse.
+Raw and semantic equality proofs and every other retention guard are unchanged.
+Files, each new directory edge and receipt publication are
 fsynced before approval. A failed durability step cannot leave a new accepted
 receipt, and a leftover staging/archive file is not approval. Release selectors
 must name exactly one canonical managed-release child.

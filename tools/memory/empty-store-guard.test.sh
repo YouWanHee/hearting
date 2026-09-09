@@ -102,7 +102,10 @@ for value in [None, '', 'explicit', 'init']:
                'session-end', str(project), 'empty-store-fixture']
     result = subprocess.run(command, env=env, cwd=project, text=True,
                             capture_output=True, timeout=15)
-    assert result.returncode == 0, (command, result.stderr)
+    # SessionEnd preserves the initial sync failure after the bounded
+    # curator/post-sync attempt. A refused derived store is exit 2, not success.
+    expected_status = 0 if value in ['explicit', 'init'] else 2
+    assert result.returncode == expected_status, (command, result.stderr)
     assert not result.stdout, result.stdout
     db = (base / 'explicit' if value == 'explicit' else base / 'data/hearting/memory') / 'memory.db'
     if value in ['explicit', 'init']:
@@ -110,6 +113,7 @@ for value in [None, '', 'explicit', 'init']:
     else:
         assert not db.exists(), ('derived initialization bypass', value)
         assert 'refusing to create' in result.stderr, result.stderr
+        assert 'session-end memory sync status=2' in result.stderr, result.stderr
 
 for runtime in ['codex', 'opencode']:
     for value in [None, '', 'explicit']:

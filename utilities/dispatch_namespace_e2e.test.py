@@ -602,8 +602,17 @@ class NamespaceE2E(unittest.TestCase):
             # closed as launch-runtime-root-mismatch.
             dispatch_path = base / "dispatch-evidence.json"
             dispatch_path.write_text(json.dumps(dispatch), encoding="utf-8")
+            # This fixture deliberately exercises an explicit frame-review
+            # gate; autonomous is the shipped default and removes that gate.
+            dispatch_config = base / "dispatch-defaults.yaml"
+            dispatch_config.write_text(
+                (ROOT / "profiles/dispatch-defaults.yaml").read_text().replace(
+                    "\n  mode: autonomous\n", "\n  mode: hybrid\n"
+                ), encoding="utf-8"
+            )
             route_env = {
                 **base_environ(),
+                "DISPATCH_DEFAULTS_CONFIG": str(dispatch_config),
                 "AGENT_HOME": str(agent_home),
                 "AGENT_ARTIFACT_ROOT": str(artifact_root),
                 "AGENT_DISPATCH_JOBS": str(jobs),
@@ -643,6 +652,7 @@ class NamespaceE2E(unittest.TestCase):
             node = next(item for item in route["nodes"] if item["id"] == "plan")
             fixture_env = {
                 **base_environ(),
+                "DISPATCH_DEFAULTS_CONFIG": str(dispatch_config),
                 "AGENT_HOME": str(agent_home),
                 "AGENT_ARTIFACT_ROOT": str(artifact_root),
                 "AGENT_MODEL_GOVERNOR_ROOT": str(model_governor_root),
@@ -750,6 +760,7 @@ class NamespaceE2E(unittest.TestCase):
                 )
             env = {
                 **base_environ(),
+                "DISPATCH_DEFAULTS_CONFIG": str(dispatch_config),
                 "PATH": str(fakebin) + os.pathsep + os.environ.get("PATH", ""),
                 "HOME": str(home),
                 "AGENT_HOME": str(agent_home),

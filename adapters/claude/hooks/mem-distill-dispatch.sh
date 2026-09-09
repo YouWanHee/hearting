@@ -298,6 +298,7 @@ Output contract: stdout contains JSON objects only, one per line. Allowed shapes
   {\"action\":\"prune\",\"id\":\"<snapshot id>\"}
   {\"action\":\"graduate\",\"id\":\"<snapshot id>\",\"to\":\"durable\"}
 ${REATTR_SHAPE}  {\"action\":\"supersede\",\"id\":\"<older snapshot id>\",\"by\":\"<newer snapshot id>\"}
+  {\"action\":\"noop\"} (only as the sole nonempty object)
 
 Mechanical boundaries:
 ${REATTR_RULE:+$REATTR_RULE
@@ -311,8 +312,8 @@ ${REATTR_RULE:+$REATTR_RULE
 - ID mutations may reference only destructive IDS from the snapshot. Delete is
   not a curator action.
 - Merge only when the canonical record preserves every distinct obligation.
-- Emit no prose, Markdown, or code fences. Emit nothing when you judge that no
-  action would improve memory."
+- Emit no prose, Markdown, or code fences. When no action would improve memory,
+  emit nothing or the sole exact object {"action":"noop"}."
 else
   # Increment mode uses the fast add-only, backward-compatible record shape.
   PROMPT="You are a no-tools session memory distiller.
@@ -338,11 +339,12 @@ genuinely has no member.
 
 Output contract: stdout contains JSON objects only, one per line:
   {\"tier\":\"working|durable\",\"type\":\"decision|user-correction|unresolved-obligation|artifact-pointer\",\"body\":\"<minimal canonical content>\",\"headline\":\"<retrieval headline>\",\"aliases\":[\"bounded retry\",\"바운디드 재시도\"],\"entities\":[\"hooks/mem-distill-dispatch.sh\",\"D-41\",\"a7c01b7d\"],\"topics\":[\"memory-pipeline\",\"dispatch\"],\"artifact_refs\":[]}
+  {\"action\":\"noop\"} (only as the sole nonempty object)
 
 Choose the tier from its lifecycle: working is finite-lived; durable persists.
 artifact-pointer requires artifact_refs and records only why/when to retrieve
-the artifact. Emit no prose, Markdown, or code fences. Emit nothing when no
-addition is useful."
+the artifact. Emit no prose, Markdown, or code fences. When no addition is
+useful, emit nothing or the sole exact object {"action":"noop"}."
 fi
 
 # detached spawn: adapter worker contract.
@@ -410,7 +412,7 @@ fi
   # Parse, validate, and apply action JSON with shell=False and argv-only values.
   # Untrusted stdout stays in a file; the applier passes bodies and IDs as argv
   # elements without sh -c/eval. Curate mutations are membership-limited by the
-  # snapshot ID file. Invalid actions skip without blocking marker advance.
+  # snapshot ID file. Strict validation failures preserve the captured frontier.
   # MEM_DISTILL=1 keeps D-37 actor attribution deterministic: without it the
   # applier's `mem add` journals every distilled record as actor=manual
   # (observed 2026-08-13 — recovery-drain output was indistinguishable from
@@ -420,20 +422,32 @@ fi
   # prompt — the worker output is untrusted model text.
   _deny_flag=""
   [ "$MODE" = "periodic-curate" ] && _deny_flag="--deny-reattribute"
-  MEM_DISTILL=1 python3 "$APPLIER" \
-    "$OUT" "$MEM" --mode "$WORKER_MODE" --snapshot-ids "$SNAPIDS_FILE" \
-    ${_deny_flag:+"$_deny_flag"} || true
+  apply_rc=0
+  # A failed worker may have emitted a partial stdout file. Never apply it.
+  # Strict mode also makes malformed/unsupported output and mem CLI failures
+  # visible to the frontier gate instead of treating them as no-action success.
+  if [ "$worker_rc" -eq 0 ]; then
+    MEM_DISTILL=1 python3 "$APPLIER" \
+      "$OUT" "$MEM" --mode "$WORKER_MODE" --snapshot-ids "$SNAPIDS_FILE" \
+      --strict-output ${_deny_flag:+"$_deny_flag"} || apply_rc=$?
+  fi
 
   if [ "$MODE" = "periodic-curate" ]; then
     # R-3: no delta window to close, so no marker advance and no R-2 strike
     # bookkeeping — this run is judged solely on SNAPSHOT/ARTIFACTS each cycle.
     :
-  # Bounded-retry (D, R-2): only the worker/governor exit code decides marker
-  # advance. Applier zero-output is not failure; it means the model judged there
-  # was nothing worth storing.
-  elif [ "$worker_rc" -eq 0 ]; then
+  # Empty/whitespace output and the exact noop object are strict successes.
+  elif [ "$worker_rc" -eq 0 ] && [ "$apply_rc" -eq 0 ]; then
     rm -f "$FAILC" 2>/dev/null || true
     python3 "$MEM" distill "$SID" --source "${MEM_SESSION_SOURCE:-claude}" --advance-capture "$frontier" >/dev/null 2>&1 || true
+  elif [ "$worker_rc" -eq 0 ]; then
+    # Invalid output (2) and mem/apply failure (1) preserve the frontier and
+    # the existing model-failure strike count. They never forced-advance.
+    case "$apply_rc" in
+      2) _apply_kind="apply-invalid-output" ;;
+      *) _apply_kind="apply-failed" ;;
+    esac
+    _distill_failure_log "$SID" "$MODE" "$apply_rc" "$_apply_kind"
   elif [ "$worker_rc" -eq 75 ]; then
     # Capacity denial (governor class cap / reservation admission, EX_TEMPFAIL).
     # Nothing is wrong with this delta — counting these toward the strike

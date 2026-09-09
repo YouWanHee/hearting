@@ -94,7 +94,7 @@ class PreflightDispatchOwnerTest(unittest.TestCase):
                     "--qa", "standard", "--intensity", "standard",
                     "--dispatch-depth", "1", "--worker-type", "owner",
                     "--assigned-contract", "autopilot-code", "--owner", "autopilot-code",
-                    "--model-profile", "deep", "--jobs", str(jobs), "--log-dir", str(log_dir),
+                    "--model-profile", "balanced-deep", "--jobs", str(jobs), "--log-dir", str(log_dir),
                 ]
                 env = {
                     **self.env,

@@ -156,14 +156,17 @@ transcript extraction. `CODEX_DISTILL_ENABLE=1 adapters/codex/bin/preflight.sh
 distill-propose <session-id> [cwd]` can generate a constrained proposal, but it
 is a manual preview surface and does not auto-apply unless the apply and
 contract-accepted env gates are explicit. Codex adapter-owned `session-end` and
-`turn-nudge` paths are the verified automatic realization: after the documented
-read-only `codex exec` tool-free proof, they default to automatic apply and opt
+`turn-nudge` paths use the checked restricted read-only `codex exec` fallback.
+The sandbox restricts project writes but does not remove tools from the model;
+strict action validation and the shared applier own memory mutations. Existing
+automatic enable/apply defaults remain operational policy, not proof of a
+zero-tools runtime. These paths default to automatic apply and opt
 out with `CODEX_DISTILL_ENABLE=0`. They run only for an interactive main;
 dispatch/title/distill/loop workers make both paths silent no-ops under D-42.
 Use `adapters/opencode/bin/preflight.sh distill-delta <session-id>` for
 OpenCode transcript extraction through `opencode export`. OpenCode's no-tools
-worker contract is verified (`opencode run --pure --agent <distiller>` with all
-tools disabled), so `distill-propose` runs the worker and the plugin
+worker uses `opencode run --pure --agent <distiller>` with wildcard tool
+removal and wildcard permission denial covering built-in, custom, and MCP tools, so `distill-propose` runs the worker and the plugin
 `event`/`session.idle` trigger auto-distills via `preflight.sh session-end`
 (debounced, enabled by default for main sessions; opt out
 `OPENCODE_DISTILL_ENABLE=0`). Worker sessions keep plugin write/read guards and

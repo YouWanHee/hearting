@@ -53,7 +53,13 @@ DEFAULT_JOBS = 4
 # fingerprint has produced both ``exit-nonzero`` and ``assertion`` failures).
 # Keep it in the full corpus and report, but run it only after the profile's
 # parallel batch has drained.
-SERIAL_SUITES = frozenset({"tools/install/projection-completeness.test.sh"})
+# These negative suites temporarily mutate and restore this source checkout.
+# They must also run exclusively, so concurrent readers cannot see fixture drift.
+SERIAL_SUITES = frozenset({
+    "tools/install/projection-completeness.test.sh",
+    "tools/adaptation-guard.test.sh",
+    "tools/generated-projections.test.sh",
+})
 
 PRUNE_DIRS = {".git", ".dispatch", "__pycache__", "node_modules",
     # Artifact roots are never test corpus: a stale repo copy under

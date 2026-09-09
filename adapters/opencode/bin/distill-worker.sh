@@ -37,13 +37,11 @@ Modes:
                         model knob (OPENCODE_DISTILL_MODEL) in this tranche,
                         unlike Codex's split per-tier models.
 
-No-tools contract (verified): the worker runs `opencode run --pure --agent
-<distiller>` where the distiller agent disables every built-in tool. With zero
-tools the model cannot execute or retry a tool, so an adversarial "run this
-shell command" prompt produces no execution and no hang (acceptance: a
-`date >> file` probe never wrote, run exited 0). `--pure` also disables external
-plugins so the worker's own session never re-triggers the guard plugin, and
-MEM_DISTILL=1 guards every lifecycle re-entry.
+No-tools contract: the generated distiller agent sets the legacy `tools` wildcard
+to false and the current `permission` wildcard to deny. OpenCode applies that
+permission wildcard to built-in, custom, and MCP tools. `--pure` also disables
+external plugins so the worker's own session never re-triggers the guard plugin,
+and MEM_DISTILL=1 guards every lifecycle re-entry.
 
 Gates:
 - MEM_DISTILL=1            -> no-op (recursion guard)
@@ -158,7 +156,10 @@ trap 'rmdir "$lock" 2>/dev/null || true; rm -f "$prompt_file" "$out_file" "$snap
 # Ephemeral no-tools worker agent. Materialized once in a throwaway git repo so
 # `opencode run --dir` discovers it; the worker needs no project files (it has no
 # tools), only the transcript delta passed on stdin.
-workdir="$store/.opencode-distill-workdir"
+# Version the derived agent identity whenever its closed tool contract changes.
+# Existing workdirs may contain the former finite deny list and are left intact;
+# selecting v2 guarantees this run discovers the wildcard-closed agent.
+workdir="$store/.opencode-distill-workdir-v2"
 agent_file="$workdir/.opencode/agent/distiller.md"
 if [ ! -f "$agent_file" ]; then
   mkdir -p "$workdir/.opencode/agent"
@@ -167,22 +168,9 @@ if [ ! -f "$agent_file" ]; then
 description: "No-tools memory distillation worker. Emits JSON-Lines actions only."
 mode: primary
 tools:
-  bash: false
-  edit: false
-  write: false
-  read: false
-  grep: false
-  glob: false
-  list: false
-  patch: false
-  webfetch: false
-  todowrite: false
-  todoread: false
-  task: false
+  "*": false
 permission:
-  bash: deny
-  edit: deny
-  webfetch: deny
+  "*": deny
 ---
 You are a no-tools memory distillation worker. Output JSON Lines only.
 AGENT
@@ -242,6 +230,7 @@ Output contract: stdout contains JSON objects only, one per line. Allowed shapes
   {"action":"prune","id":"<snapshot id>"}
   {"action":"graduate","id":"<snapshot id>","to":"durable"}
   {"action":"reattribute","id":"<orphan id>"}
+  {"action":"noop"} (only as the sole nonempty object)
 
 Mechanical boundaries:
 - Choose the tier from its lifecycle: working is finite-lived; durable persists.
@@ -253,8 +242,8 @@ Mechanical boundaries:
 - ID mutations may reference only destructive IDS from the snapshot. Delete is
   not a curator action.
 - Merge only when the canonical record preserves every distinct obligation.
-- Emit no prose, Markdown, or code fences. Emit nothing when you judge that no
-  action would improve memory.
+- Emit no prose, Markdown, or code fences. When no action would improve memory,
+  emit nothing or the sole exact object {"action":"noop"}.
 EOF
 else
 cat > "$prompt_file" <<EOF
@@ -276,7 +265,8 @@ Semantic boundary:
   artifact pointer. Never copy content already preserved in an artifact.
 - Choose the tier from its lifecycle: working is finite-lived; durable persists.
 - artifact-pointer requires artifact_refs and records only why/when to retrieve it.
-- Emit nothing when you judge that no addition is useful.
+- When no addition is useful, emit nothing or the sole exact object
+  {"action":"noop"}.
 
 Capsule fields are the retrieval index; an empty array makes the record unfindable.
 - aliases: 2-4 synonyms, including the other language when the body is bilingual.
@@ -287,6 +277,7 @@ genuinely has no member.
 
 Allowed action:
 - {"action":"add","tier":"working|durable","type":"decision|user-correction|unresolved-obligation|artifact-pointer","body":"<minimal canonical content>","headline":"<retrieval headline>","aliases":["bounded retry","바운디드 재시도"],"entities":["hooks/mem-distill-dispatch.sh","D-41","a7c01b7d"],"topics":["memory-pipeline","dispatch"],"artifact_refs":[]}
+- {"action":"noop"} (only as the sole nonempty object)
 
 Transcript delta:
 <<<DELTA
@@ -306,33 +297,45 @@ if [ -n "${OPENCODE_DISTILL_MODEL:-}" ]; then
     run --class distill -- timeout "$timeout_s" "$OPENCODE_BIN" run --pure \
     --dir "$workdir" --agent distiller --format default \
     -m "$OPENCODE_DISTILL_MODEL" < "$prompt_file" > "$out_file" 2>/dev/null; then
-    exec_ok=1
+    exec_status=0
   else
-    exec_ok=0
+    exec_status=$?
   fi
 else
   if AGENT_SESSION_ROLE=worker MEM_DISTILL=1 python3 "$ROOT/utilities/model-worker-governor.py" \
     run --class distill -- timeout "$timeout_s" "$OPENCODE_BIN" run --pure \
     --dir "$workdir" --agent distiller --format default \
     < "$prompt_file" > "$out_file" 2>/dev/null; then
-    exec_ok=1
+    exec_status=0
   else
-    exec_ok=0
+    exec_status=$?
   fi
 fi
 
+# A failed model may have emitted a partial stdout file. Preserve its exact
+# status and never apply or publish that partial result as a successful proposal.
+if [ "$exec_status" -ne 0 ]; then
+  exit "$exec_status"
+fi
+
+if [ ! -f "$out_file" ]; then
+  echo "opencode distill worker: model-output-missing" >&2
+  exit 1
+fi
+
 if [ "${OPENCODE_DISTILL_APPLY:-}" = "1" ]; then
-  if [ "$exec_ok" = "1" ] && [ -f "$out_file" ]; then
+  apply_status=0
+  if [ -f "$out_file" ]; then
     AGENT_HOME="$AGENT_ROOT" python3 "$ROOT/tools/memory/apply-distill-actions.py" \
-      "$out_file" "$ROOT/tools/memory/mem.py" --mode "$mode" --snapshot-ids "$snapids_file"
+      "$out_file" "$ROOT/tools/memory/mem.py" --mode "$mode" \
+      --snapshot-ids "$snapids_file" --strict-output || apply_status=$?
   fi
-  # Advance is gated on the exec, not on per-record applier success — mirrors
-  # Codex :275-284 exactly. A stricter gate would reprocess a poison delta
-  # forever; a preview-only (non-apply) run or a failed/timed-out exec keeps
-  # the delta for a later real distill.
-  if [ "$exec_ok" = "1" ]; then
+  # APPLY mode closes the capture only after strict validation and every
+  # requested mem mutation succeed. Other outcomes preserve the delta.
+  if [ "$apply_status" = "0" ]; then
     AGENT_HOME="$AGENT_ROOT" python3 "$ROOT/tools/memory/mem.py" distill "$sid" --source opencode --advance-capture "$frontier" >/dev/null 2>&1 || true
   fi
+  [ "$apply_status" -eq 0 ] || exit "$apply_status"
 fi
 
 [ -f "$out_file" ] && cat "$out_file"

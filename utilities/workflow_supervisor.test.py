@@ -991,6 +991,15 @@ class TestCapabilityIntegration(WorkflowFixture):
              "write_scope": ["reviews/monitor/**"],
              "outputs": ["reviews/monitor/verdict.json"], "gate": "code-test"},
         ]
+        # Every composed stage declares its own bounded judgment demand.
+        for unit in units:
+            unit["profile_demand"] = {
+                "schema_version": 1, "judgment_requirement": "important",
+                "execution_scope": "short-local",
+                "judgment_reason": "Verify this synthetic monitor transition.",
+                "execution_reason": "One temporary fixture artifact.",
+                "evidence_refs": ["monitor-fixture"],
+            }
         recipe = compose.build_recipe(
             "autopilot-code", "dev", units, topology_class="staged",
             quick_write_scope=["source/**"],

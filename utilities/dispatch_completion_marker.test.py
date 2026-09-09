@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -111,11 +112,14 @@ class CompletionMarkerTest(unittest.TestCase):
             "workflow_mode": "tracked",
             "artifact_guard": {"satisfied": True, "source": "fixture"},
         }
-        route = ROUTE.compile_route(
-            "autopilot-code", "dev", "strong", self.repo, self.artifact,
-            signals=["shared-contract"], transport="headless", tracking="tracked",
-            tracked_gate_evidence=gate, dispatch_evidence=evidence,
-        )
+        # Seal the same fixture runtime and state roots that wrapper children
+        # validate. An outer test runner's HOME/AGENT_HOME is not this fixture.
+        with mock.patch.dict(os.environ, self.base_env(), clear=True):
+            route = ROUTE.compile_route(
+                "autopilot-code", "dev", "strong", self.repo, self.artifact,
+                signals=["shared-contract"], transport="headless", tracking="tracked",
+                tracked_gate_evidence=gate, dispatch_evidence=evidence,
+            )
         self.current_route = route
         return route
 
@@ -341,6 +345,9 @@ class CompletionMarkerTest(unittest.TestCase):
             (ROOT / "utilities" / "dispatch_contract.py").resolve(),
             (ROOT / "utilities" / "dispatch_completion_marker.test.py").resolve(),
             (ROOT / "utilities" / "dispatch_state_root_rotation.test.py").resolve(),
+            # This regression asserts the opposite: earlier route validation
+            # errors must not be mislabeled as completion-marker-missing.
+            (ROOT / "utilities" / "capability_route.test.py").resolve(),
         }
         for adapter in ("claude", "codex", "opencode"):
             allow.add((ROOT / "adapters" / adapter / "bin" / "dispatch-headless.py").resolve())

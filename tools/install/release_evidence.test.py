@@ -16,6 +16,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -426,6 +427,11 @@ class SemanticReanchorEqualTest(unittest.TestCase):
 
 
 class MigrationDeletionPreconditionTest(HermeticCase):
+    def evidence_cli(self, *args):
+        return subprocess.run(
+            [sys.executable, "-B", distribution.__file__, "release-evidence", *args, "--json"],
+            env=dict(os.environ), cwd=self.root, text=True, capture_output=True, timeout=30)
+
     def test_20_exact_two_key_reanchor_is_prunable_via_carry_forward(self):
         self.promote()
         candidate = self.candidate()
@@ -546,10 +552,128 @@ class MigrationDeletionPreconditionTest(HermeticCase):
         self.assertFalse(ok)
         self.assertTrue(candidate.is_dir())
 
-    def test_24e_successor_changed_requires_new_proof(self):
+    def test_24e_successor_change_requires_fresh_observation_not_new_archive(self):
         candidate, unproven, receipt = self._archived_fixture()
-        (self.stable_root / "logs" / "grown.log").write_bytes(b"a completely new successor value")
+        successor = self.stable_root / "logs" / "grown.log"
+        successor.write_bytes(b"a completely new successor value")
+        # A verdict collected before a concurrent change must still fail.
         self.assertFalse(distribution._release_evidence_receipt_accepted(candidate, os.environ, unproven))
+        current = distribution._migration_delta_verdicts(candidate, os.environ)
+        self.assertTrue(distribution._release_evidence_receipt_accepted(candidate, os.environ, current))
+        # Absence is a current observation too; a later file appearance races it.
+        # destructive-ok: reason=simulate a mutable successor disappearing in an isolated fixture; boundary=one fixture successor log
+        successor.unlink()
+        missing = distribution._migration_delta_verdicts(candidate, os.environ)
+        self.assertEqual(missing[0]["verdict"], "missing-target")
+        self.assertTrue(distribution._release_evidence_receipt_accepted(candidate, os.environ, missing))
+        successor.write_bytes(b"appeared after observation")
+        self.assertFalse(distribution._release_evidence_receipt_accepted(candidate, os.environ, missing))
+        # Unsafe current targets are still blocked before any archive approval.
+        foreign = self.root / "foreign.log"
+        foreign.write_bytes(b"keep this foreign file")
+        successor.unlink()  # same owned fixture leaf as above
+        successor.symlink_to(foreign)
+        check = self.evidence_cli("reconcile", "--release", candidate.name)
+        self.assertEqual(check.returncode, 0, check.stderr)
+        result = json.loads(check.stdout)[candidate.name]
+        self.assertFalse(result["evidence_accepted"])
+        self.assertEqual(result["verdicts"][0]["verdict"], "blocked")
+        self.assertEqual(foreign.read_bytes(), b"keep this foreign file")
+
+    def test_23b_supported_archive_then_520_byte_append_keeps_original_proof(self):
+        self.promote()
+        candidate = self.candidate("v-archive-append")
+        relative = "logs/dispatch-session-sweep.log"
+        source = candidate / ".dispatch" / relative
+        source.parent.mkdir()
+        source.write_bytes(b"x" * 292)
+        successor = self.stable_root / relative
+        successor.parent.mkdir(parents=True, exist_ok=True)
+        successor.write_bytes(b"y" * 588282)
+        plan_path = self.root / "append-plan.json"
+        planned = self.evidence_cli("plan", "--release", candidate.name, "--out", str(plan_path))
+        self.assertEqual(planned.returncode, 0, planned.stderr)
+        plan = json.loads(planned.stdout)
+        self.assertEqual(len(plan["entries"]), 1)
+        applied = self.evidence_cli("apply", "--plan", str(plan_path),
+            "--expect", plan["plan_digest"], "--expect-receipt", "absent")
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        receipt = json.loads(applied.stdout)
+        archive = distribution._release_evidence_archive_root(os.environ, candidate)
+        before = ArchiveAdversarialTest.inventory(archive)
+        with successor.open("ab") as handle:
+            handle.write(b"z" * 520)
+        checked = self.evidence_cli("reconcile", "--release", candidate.name)
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        result = json.loads(checked.stdout)[candidate.name]
+        self.assertEqual(result["unproven_count"], 1)
+        self.assertTrue(result["evidence_accepted"])
+        self.assertTrue(result["prunable"])
+        self.assertEqual(source.read_bytes(), b"x" * 292)
+        self.assertEqual((archive / "files" / relative).read_bytes(), b"x" * 292)
+        self.assertEqual(successor.read_bytes(), b"y" * 588282 + b"z" * 520)
+        self.assertEqual(before, ArchiveAdversarialTest.inventory(archive))
+        self.assertEqual(receipt, json.loads((archive / "receipt.json").read_text()))
+        self.assertTrue(candidate.is_dir())  # evidence checking never prunes
+
+    def test_24g_plan_apply_successor_append_still_refuses_without_archive(self):
+        self.promote()
+        candidate = self.candidate("v-archive-stale")
+        source = candidate / ".dispatch/logs/old.log"
+        source.parent.mkdir()
+        source.write_bytes(b"original" * 10)
+        successor = self.stable_root / "logs/old.log"
+        successor.parent.mkdir(parents=True, exist_ok=True)
+        successor.write_bytes(b"successor before plan")
+        plan_path = self.root / "stale-plan.json"
+        planned = self.evidence_cli("plan", "--release", candidate.name, "--out", str(plan_path))
+        self.assertEqual(planned.returncode, 0, planned.stderr)
+        plan = json.loads(planned.stdout)
+        archive = distribution._release_evidence_archive_root(os.environ, candidate)
+        before = ArchiveAdversarialTest.inventory(archive.parent)
+        with successor.open("ab") as handle:
+            handle.write(b"a" * 520)
+        applied = self.evidence_cli("apply", "--plan", str(plan_path),
+            "--expect", plan["plan_digest"], "--expect-receipt", "absent")
+        self.assertNotEqual(applied.returncode, 0)
+        self.assertEqual(json.loads(applied.stdout)["status"], "failed")
+        self.assertIn("archive-successor-changed", json.loads(applied.stdout)["error"])
+        self.assertEqual(before, ArchiveAdversarialTest.inventory(archive.parent))
+        self.assertEqual(source.read_bytes(), b"original" * 10)
+        self.assertEqual(successor.read_bytes(), b"successor before plan" + b"a" * 520)
+
+    def test_24h_archive_identity_and_current_inventory_still_fail_closed(self):
+        candidate, unproven, receipt = self._archived_fixture()
+        archive = distribution._release_evidence_archive_root(os.environ, candidate)
+        entry = unproven[0]
+        for changed in ([entry, dict(entry)],
+                        [dict(entry, source_bytes=49)],
+                        [dict(entry, source_sha256="f" * 64)],
+                        [entry, dict(entry, relative="logs/new.log")]):
+            self.assertFalse(distribution._release_evidence_receipt_accepted(candidate, os.environ, changed))
+        for path in (candidate / ".dispatch/logs/grown.log", archive / "files/logs/grown.log"):
+            original = path.read_bytes()
+            try:
+                path.write_bytes(b"!" * len(original))  # equal length is not full-byte preservation
+                current = distribution._migration_delta_verdicts(candidate, os.environ)
+                self.assertFalse(distribution._release_evidence_receipt_accepted(candidate, os.environ, current))
+            finally:
+                path.write_bytes(original)
+        receipt_path = archive / "receipt.json"
+        original = receipt_path.read_bytes()
+        try:
+            tampered = json.loads(original)
+            tampered["entries"][0]["source_bytes"] = 49
+            tampered["inventory_digest"] = "sha256:" + hashlib.sha256(
+                distribution._canonical_json_bytes(tampered["entries"])).hexdigest()
+            receipt_path.write_text(json.dumps(tampered))
+            # Even a matching fabricated size in the caller's inventory
+            # cannot override the actual full source/archive byte lengths.
+            self.assertFalse(distribution._release_evidence_receipt_accepted(
+                candidate, os.environ, [dict(entry, source_bytes=49)]))
+        finally:
+            receipt_path.write_bytes(original)
+        self.assertTrue(distribution._release_evidence_receipt_accepted(candidate, os.environ, unproven))
 
     def test_24f_receipt_cas_conflict_writes_nothing_new(self):
         candidate, unproven, receipt = self._archived_fixture()

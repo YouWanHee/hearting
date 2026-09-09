@@ -5235,7 +5235,9 @@ python3 - "$predsock" "$predrecv" >/dev/null 2>&1 <<'PY' &
 import socket, sys, os
 path, out = sys.argv[1], sys.argv[2]
 srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-srv.bind(path); srv.listen(8); srv.settimeout(20)
+# Keep the Unix socket address short under nested fixture directories.
+os.chdir(os.path.dirname(path))
+srv.bind(os.path.basename(path)); srv.listen(8); srv.settimeout(20)
 try:
     while True:
         conn, _ = srv.accept()
@@ -5250,10 +5252,11 @@ PY
 predsrv=$!
 predwait=0
 while [ ! -S "$predsock" ] && [ "$predwait" -lt 50 ]; do predwait=$((predwait + 1)); sleep 0.1; done
-pred_herdr() { # $1=pane-id ; env assignments come from the caller
+pred_herdr() ( # $1=pane-id ; env assignments come from the caller
+  cd "$predtmp" || exit 1
   printf '{"hook_event_name":"PreToolUse","session_id":"pred-herdr"}' \
-    | HERDR_ENV=1 HERDR_SOCKET_PATH="$predsock" HERDR_PANE_ID="$1" sh "$HERDR" working >/dev/null 2>&1 || true
-}
+    | HERDR_ENV=1 HERDR_SOCKET_PATH=herdr.sock HERDR_PANE_ID="$1" sh "$HERDR" working >/dev/null 2>&1 || true
+)
 : > "$predrecv"
 CLAUDE_CODE_CHILD_SESSION=1 pred_herdr pane-teammate
 predwait=0
@@ -5263,8 +5266,9 @@ if grep -q 'pane-teammate' "$predrecv" 2>/dev/null; then
 else bad "herdr pane state must not treat CLAUDE_CODE_CHILD_SESSION as worker evidence"; fi
 : > "$predrecv"
 for assignment in AGENT_SESSION_ROLE=worker AGENT_DISPATCH_CHILD=1 AGENT_DISPATCH_DEPTH=2; do
-  env "$assignment" sh -c 'printf "{\"hook_event_name\":\"PreToolUse\",\"session_id\":\"pred-herdr\"}" \
-    | HERDR_ENV=1 HERDR_SOCKET_PATH="$1" HERDR_PANE_ID=pane-worker sh "$2" working >/dev/null 2>&1' _ "$predsock" "$HERDR" || true
+  env "$assignment" sh -c 'cd "$1" || exit 1
+    printf "{\"hook_event_name\":\"PreToolUse\",\"session_id\":\"pred-herdr\"}" \
+    | HERDR_ENV=1 HERDR_SOCKET_PATH=herdr.sock HERDR_PANE_ID=pane-worker sh "$2" working >/dev/null 2>&1' _ "$predtmp" "$HERDR" || true
 done
 sleep 0.3
 if ! grep -q 'pane-worker' "$predrecv" 2>/dev/null; then
@@ -5366,11 +5370,11 @@ dispatch_scan_prod=$(cd "$ROOT" && rg -n --glob '!**/*test*' --glob '!**/tests/*
 #    migration-manifest.py reads inventory metadata, not active authority.
 #  - non-executing description strings: docstrings/comments/help text/docs.
 dispatch_scan_allowed='
-tools/install/distribution.py:2265:
-tools/install/distribution.py:2268:
-tools/install/distribution.py:2272:
-tools/install/distribution.py:2277:
-tools/install/distribution.py:2901:
+tools/install/distribution.py:3044:
+tools/install/distribution.py:3047:
+tools/install/distribution.py:3051:
+tools/install/distribution.py:3056:
+tools/install/distribution.py:3680:
 tools/migration-manifest.py:229:
 tools/migration-manifest.py:236:
 tools/fleet/collectors/dispatch.py:8:
@@ -5382,7 +5386,7 @@ tools/fleet/collectors/dispatch.py:1029:
 tools/fleet/collectors/__init__.py:196:
 tools/render-landing.py:860:
 adapters/codex/AGENTS.md:83:
-adapters/codex/bin/preflight.sh:749:
+adapters/codex/bin/preflight.sh:753:
 adapters/opencode/bin/preflight.sh:474:
 adapters/claude/skills/autopilot-code/references/dev-pipeline.md:91:
 adapters/claude/plugin-marketplace/plugins/hearting-claude/skills/autopilot-code/references/dev-pipeline.md:91:

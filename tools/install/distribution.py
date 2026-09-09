@@ -2342,8 +2342,12 @@ def _archive_release_evidence(
 def _release_evidence_receipt_accepted(
     candidate: Path, environ: dict[str, str], current_unproven: list[dict],
 ) -> bool:
-    """§4.2 proof-acceptance: re-open and re-hash every archived/source/successor
-    file at each check -- a receipt is a list, never a cached verdict."""
+    """Revalidate lossless archival against the caller's complete fresh inventory.
+
+    Receipt target hashes seal the archive-creation observation. Mutable
+    successors are re-read against current verdicts, not historical hashes;
+    source/archive bytes and immutable receipt identity remain authoritative.
+    """
 
     archive_root = _release_evidence_archive_root(environ, candidate)
     receipt_path = archive_root / "receipt.json"
@@ -2366,6 +2370,18 @@ def _release_evidence_receipt_accepted(
     entries = receipt.get("entries")
     if not isinstance(entries, list) or not entries:
         return False
+    current = {}
+    for entry in current_unproven:
+        if not isinstance(entry, dict) or entry.get("verdict") not in ("missing-target", "differing"):
+            return False
+        relative = entry.get("relative")
+        try:
+            _safe_relative_components(relative)
+        except _DeltaVerdictError:
+            return False
+        if relative in current:
+            return False
+        current[relative] = entry
     seen: set[str] = set()
     for entry in entries:
         if not isinstance(entry, dict):
@@ -2381,39 +2397,50 @@ def _release_evidence_receipt_accepted(
         verdict = entry.get("verdict")
         if verdict not in ("missing-target", "differing"):
             return False
-        if verdict == "differing" and not entry.get("target_sha256"):
+        if verdict == "differing" and (
+                not isinstance(entry.get("target_sha256"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", entry["target_sha256"]) is None):
             return False
         if verdict == "missing-target" and entry.get("target_sha256") is not None:
+            return False
+        if type(entry.get("source_bytes")) is not int or entry["source_bytes"] < 0:
             return False
     recomputed = "sha256:" + hashlib.sha256(
         _canonical_json_bytes(sorted(entries, key=lambda item: item["relative"]))
     ).hexdigest()
     if recomputed != receipt.get("inventory_digest"):
         return False
-    if seen != {entry["relative"] for entry in current_unproven}:
+    if seen != set(current):
         return False
     files_root = archive_root / "files"
     for entry in entries:
         relative = entry["relative"]
-        try:
-            _, _, archived_sha = _read_contained_bytes(files_root, relative)
-        except _DeltaVerdictError:
-            return False
-        if archived_sha != entry.get("archived_sha256") or archived_sha != entry.get("source_sha256"):
+        observed = current[relative]
+        if (observed.get("source_sha256") != entry.get("source_sha256")
+                or observed.get("source_bytes") != entry["source_bytes"]):
             return False
         try:
-            _, _, source_sha = _read_contained_bytes(candidate / ".dispatch", relative)
+            archived_bytes, _, archived_sha = _read_contained_bytes(files_root, relative)
         except _DeltaVerdictError:
             return False
-        if source_sha != entry.get("source_sha256"):
+        if (archived_sha != entry.get("archived_sha256")
+                or archived_sha != entry.get("source_sha256")
+                or len(archived_bytes) != entry["source_bytes"]):
             return False
-        if entry["verdict"] == "differing":
-            try:
-                _, _, target_sha = _read_contained_bytes(stable_state_root(environ), relative)
-            except _DeltaVerdictError:
+        try:
+            source_bytes, _, source_sha = _read_contained_bytes(candidate / ".dispatch", relative)
+        except _DeltaVerdictError:
+            return False
+        if source_sha != entry.get("source_sha256") or len(source_bytes) != entry["source_bytes"]:
+            return False
+        try:
+            _, _, target_sha = _read_contained_bytes(stable_state_root(environ), relative)
+        except _DeltaVerdictError as exc:
+            if exc.code != "delta-absent" or observed["verdict"] != "missing-target":
                 return False
-            if target_sha != entry.get("target_sha256"):
-                return False
+            target_sha = None
+        if target_sha != observed.get("target_sha256"):
+            return False
     return True
 
 

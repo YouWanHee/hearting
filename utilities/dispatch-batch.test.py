@@ -2809,6 +2809,14 @@ class DispatchBatchIntegrationTest(unittest.TestCase):
                 }, sort_keys=True),
                 encoding="utf-8",
             )
+            # Retain the explicit gate this lifecycle fixture exercises;
+            # the shipped autonomous default intentionally removes it.
+            dispatch_config = base / "dispatch-defaults.yaml"
+            dispatch_config.write_text(
+                (ROOT / "profiles/dispatch-defaults.yaml").read_text().replace(
+                    "\n  mode: autonomous\n", "\n  mode: hybrid\n"
+                ), encoding="utf-8"
+            )
             compile_result = subprocess.run(
                 [
                     sys.executable, str(ROOT / "utilities" / "capability-route.py"),
@@ -2831,6 +2839,7 @@ class DispatchBatchIntegrationTest(unittest.TestCase):
                        if not key.startswith(("AGENT_DISPATCH_", "AGENT_OWNER_ROUTE_", "AGENT_ROUTE_", "AGENT_ARTIFACT_"))},
                     "AGENT_HOME": str(ROOT),
                     "AGENT_DISPATCH_JOBS": str(jobs),
+                    "DISPATCH_DEFAULTS_CONFIG": str(dispatch_config),
                 },
             )
             self.assertEqual(
@@ -2934,6 +2943,7 @@ class DispatchBatchIntegrationTest(unittest.TestCase):
                 "AGENT_DISPATCH_CHILD": "1",
                 "CODEX_HOME": str(codex_home),
                 "CLAUDE_CONFIG_DIR": str(claude_home),
+                "DISPATCH_DEFAULTS_CONFIG": str(dispatch_config),
                 "CODEX_DISPATCH_EARLY_EXIT_WATCH": "8",
                 "CLAUDE_DISPATCH_EARLY_EXIT_WATCH": "8",
                 "FLEET_BATCH_EVENTS": str(events_path),

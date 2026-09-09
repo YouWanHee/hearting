@@ -19,6 +19,24 @@ TYPES = {"decision", "user-correction", "unresolved-obligation", "artifact-point
 CAPSULE = {"headline", "aliases", "entities", "topics", "artifact_refs"}
 
 
+def frontmatter_mapping(text, section):
+    lines = text.split("---", 2)[1].splitlines()
+    active = False
+    result = {}
+    for line in lines:
+        if line == section + ":":
+            active = True
+            continue
+        if active and line and not line.startswith(" "):
+            break
+        if active and line.startswith("  "):
+            raw_key, raw_value = line.strip().split(":", 1)
+            key = json.loads(raw_key) if raw_key.startswith('"') else raw_key
+            value = raw_value.strip()
+            result[key] = False if value == "false" else value
+    return result
+
+
 class CurateContractTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="opencode-curate-contract-")
@@ -33,6 +51,10 @@ class CurateContractTests(unittest.TestCase):
         self.calls = self.base / "invocation.json"
         self.output = self.base / "actions.jsonl"
         self.sid = "synthetic-opencode-curate"
+        self.legacy_agent = self.store / ".opencode-distill-workdir/.opencode/agent/distiller.md"
+        self.legacy_agent.parent.mkdir(parents=True)
+        self.legacy_text = "---\ntools:\n  bash: false\n---\nlegacy finite deny\n"
+        self.legacy_agent.write_text(self.legacy_text)
         source = self.base / "export.json"
         source.write_text(json.dumps({"messages": [{
             "info": {"id": "synthetic-u1", "role": "user"},
@@ -78,7 +100,7 @@ sys.stdout.write(Path(os.environ["TEST_OUTPUT"]).read_text())
         self.assertEqual(result.returncode, 0, (args, result.stdout, result.stderr))
         return result.stdout
 
-    def run_worker(self, actions):
+    def run_worker(self, actions, expected_rc=0):
         self.output.write_text("".join(json.dumps(row) + "\n" for row in actions))
         proc = subprocess.Popen(["sh", str(ROOT / "adapters/opencode/bin/distill-worker.sh"),
                                  self.sid, str(self.project), "curate"], env=self.env,
@@ -86,7 +108,7 @@ sys.stdout.write(Path(os.environ["TEST_OUTPUT"]).read_text())
                                 stdin=subprocess.DEVNULL, text=True, start_new_session=True)
         try:
             out, err = proc.communicate(timeout=15)
-            self.assertEqual(proc.returncode, 0, (out, err))
+            self.assertEqual(proc.returncode, expected_rc, (out, err))
         finally:
             if proc.poll() is None:
                 os.killpg(proc.pid, signal.SIGKILL)
@@ -96,6 +118,12 @@ sys.stdout.write(Path(os.environ["TEST_OUTPUT"]).read_text())
         self.assertEqual(invocation["distill"], "1")
         self.assertIn("--pure", invocation["argv"])
         self.assertIn("distiller", invocation["argv"])
+        workdir = self.store / ".opencode-distill-workdir-v2"
+        self.assertEqual(Path(invocation["argv"][invocation["argv"].index("--dir") + 1]), workdir)
+        self.assertEqual(self.legacy_agent.read_text(), self.legacy_text)
+        agent = (workdir / ".opencode/agent/distiller.md").read_text()
+        self.assertIs(frontmatter_mapping(agent, "tools")["*"], False)
+        self.assertEqual(frontmatter_mapping(agent, "permission")["*"], "deny")
         # Parse the contract actually delivered to the CLI, not source text.
         schema = next(json.loads(line.strip()) for line in self.capture.read_text().splitlines()
                       if line.strip().startswith('{"action":"add"'))
@@ -135,20 +163,17 @@ sys.stdout.write(Path(os.environ["TEST_OUTPUT"]).read_text())
         events = [json.loads(line) for line in Path(self.env["MEM_WRITE_EVENTS"]).read_text().splitlines()]
         self.assertEqual(sum(row.get("actor") == "curator" for row in events), len(actions))
 
-    def test_invalid_type_and_missing_reference_are_rejected_but_valid_action_applies(self):
+    def test_invalid_output_rejects_the_whole_batch_before_apply(self):
         invalid = self.action("project-deployment-config", "CURATEREJECTED")
         no_reference = self.action("artifact-pointer", "CURATENOREFERENCE")
         valid = self.action("user-correction", "CURATEACCEPTED")
-        err = self.run_worker([invalid, no_reference, valid])
-        self.assertIn("skip unsupported automatic type", err)
-        self.assertIn("skip artifact-pointer without artifact_refs", err)
-        for token in ("CURATEREJECTED", "CURATENOREFERENCE"):
+        err = self.run_worker([invalid, no_reference, valid], expected_rc=2)
+        self.assertIn("invalid-output", err)
+        for token in ("CURATEREJECTED", "CURATENOREFERENCE", "CURATEACCEPTED"):
             rejected = json.loads(self.mem("recall", token, "--full", "--json"))["results"]
             self.assertEqual(rejected, [])
-        accepted = json.loads(self.mem("recall", "CURATEACCEPTED", "--full", "--json"))["results"]
-        self.assertEqual(len(accepted), 1)
-        self.assertEqual(accepted[0]["body"], valid["body"])
-        self.assertEqual(accepted[0]["type"], "user-correction")
+        self.assertFalse((self.store / (".distill-state-" + self.sid)).exists())
+        self.assertIn("SYNTHETICCURATE", self.mem("distill", self.sid, "--source", "opencode"))
 
 
 if __name__ == "__main__":

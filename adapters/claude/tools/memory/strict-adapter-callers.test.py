@@ -1,0 +1,1 @@
+../../../../tools/memory/strict-adapter-callers.test.py

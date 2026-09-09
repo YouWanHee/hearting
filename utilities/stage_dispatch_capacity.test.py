@@ -39,17 +39,18 @@ class CapacityTest(unittest.TestCase):
   self.assertFalse(F.allowed_capacity_settings("codex",cascade[1][0],"not-a-real-effort"))
   failed,alternative=cascade[0][0],cascade[1][0]
   self.assertEqual(int(alternative==failed),0)
- def fake_retry(self,early="-"):
+ def fake_retry(self,early="-",pair=("gpt-5.6-luna","medium")):
+  model,paired=pair
   def run(*_args,**_kwargs):
-   attempt=F.capacity_attempt_identity(self.args,self.route,self.node,self.row,1,"gpt-5.6-luna/medium")
+   attempt=F.capacity_attempt_identity(self.args,self.route,self.node,self.row,1,f"{model}/{paired}")
    status="done" if early=="capacity" else "open"
    note=",note=dead-capacity" if early=="capacity" else ""
    with self.jobs.open("a") as out:
     out.write(f"2026-07-16T00:00:01Z\t{status}\t/r\t/w\ts\t"
-     f"route_id=r,route_node=test,attempt_id={attempt},model=gpt-5.6-luna,"
-     "capacity_retry=1,prior_attempt_id=att-initial0001,cooled_model=gpt-5.6-sol,"
+     f"route_id=r,route_node=test,attempt_id={attempt},model={model},"
+     f"capacity_retry=1,prior_attempt_id=att-initial0001,cooled_model={self.failed['model']},"
      f"selection_source=orchestrator-explicit{note}\n")
-   return subprocess.CompletedProcess([],0,stdout=f"check=ok\nmodel=gpt-5.6-luna\nearly_death={early}\nattempt_id={attempt}\nduplicate_attempt=0\n",stderr="")
+   return subprocess.CompletedProcess([],0,stdout=f"check=ok\nmodel={model}\nearly_death={early}\nattempt_id={attempt}\nduplicate_attempt=0\n",stderr="")
   return run
  def test_one_different_model_retry_succeeds_and_is_persisted(self):
   trace=[]
@@ -111,7 +112,7 @@ class CapacityTest(unittest.TestCase):
   codex=F.capacity_cascade("codex")
   self.assertEqual(F.capacity_cascade_next("codex",codex[0][0]),codex[1])
   claude=F.capacity_cascade("claude")
-  self.assertEqual(claude[0],("opus","xhigh"))
+  self.assertEqual(claude[0],("opus","high"))
   self.assertEqual(F.capacity_cascade_next("claude","fable"),claude[0])
   self.assertEqual(F.capacity_cascade_next("claude","claude-fable-5"),claude[0])
   self.assertEqual(F.capacity_cascade_next("claude",claude[0][0]),claude[1])
@@ -127,10 +128,18 @@ class CapacityTest(unittest.TestCase):
   self.assertFalse(F.allowed_capacity_settings("claude","opus","not-a-real-effort"))
  def test_unset_capacity_model_derives_alternative_from_cascade(self):
   self.args.capacity_model=None  # no explicit alternative -> derive from config cascade
-  with mock.patch.object(F,"wrapper_command",return_value=["fake"]),\
-       mock.patch.object(F.subprocess,"run",side_effect=self.fake_retry()):
+  cascade=F.capacity_cascade("codex");self.assertGreaterEqual(len(cascade),2)
+  failed_model=cascade[0][0];expected_pair=cascade[1]
+  self.failed={**self.failed,"model":failed_model}
+  self.jobs.write_text(self.jobs.read_text().replace("model=gpt-5.6-sol,",f"model={failed_model},"))
+  with mock.patch.object(F,"wrapper_command",return_value=["fake"]) as command,\
+       mock.patch.object(F.subprocess,"run",side_effect=self.fake_retry(pair=expected_pair)):
    state,fields,_=F.capacity_retry(self.args,self.route,self.node,self.row,1,self.failed,[])
-  self.assertEqual(state,"success");self.assertEqual(fields["model"],"gpt-5.6-luna")
+  self.assertEqual(state,"success");self.assertEqual(fields["model"],expected_pair[0])
+  self.assertEqual(command.call_args.args[6],expected_pair)
+  rows=F.registry_rows(self.jobs,"r","test")
+  self.assertEqual(rows[-1]["model"],expected_pair[0])
+  self.assertEqual(rows[-1]["cooled_model"],failed_model)
  def test_legacy_fable_capacity_retry_launches_first_eligible_opus_candidate(self):
   self.args.capacity_model=None;self.args.capacity_effort=None
   self.row={**self.row,"child_harness":"claude"}
@@ -143,7 +152,7 @@ class CapacityTest(unittest.TestCase):
        mock.patch.object(F.subprocess,"run",return_value=completed):
    state,fields,_=F.capacity_retry(self.args,self.route,self.node,self.row,1,self.failed,[])
   self.assertEqual((state,fields["model"]),("success","opus"))
-  self.assertEqual(command.call_args.args[6],("opus","xhigh"))
+  self.assertEqual(command.call_args.args[6],("opus","high"))
  def test_balanced_all_gated_stage_candidates_choose_maximum_headroom(self):
   import importlib.util
   spec=importlib.util.spec_from_file_location("capacity",ROOT/"utilities/harness-capacity.py")

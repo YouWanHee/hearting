@@ -95,8 +95,8 @@ else
   timeout_cmd=()
 fi
 
-DISALLOW='Bash Read Write Edit Glob Grep Agent NotebookEdit WebFetch WebSearch Task'
-
 AGENT_SESSION_ROLE=worker MEM_DISTILL=1 setsid "${timeout_cmd[@]}" claude -p "$(cat "$prompt_file")" \
   --model "$model" \
-  --disallowedTools "$DISALLOW"
+  --tools '' \
+  --strict-mcp-config \
+  --mcp-config '{"mcpServers":{}}'
