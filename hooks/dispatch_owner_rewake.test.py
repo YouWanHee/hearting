@@ -1542,6 +1542,49 @@ class LosingCarrierLeavesGatesTest(CarrierOneClaimGateTest):
         later, _ = sweep_deliver(self.root, "claude-parent-runtime", "session-1")
         self.assertEqual([r["delivery_id"] for r in later], [gate_id])
 
+    def _run_main_patched(self, **patches):
+        """`_run_main` pins the wait to `ready`; these cases need the failure
+        states, so they drive `main` themselves."""
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(rewake.sys, "stdin", io.StringIO(json.dumps(self.payload()))), \
+             mock.patch.object(rewake.sys, "stdout", out), \
+             mock.patch.object(rewake.sys, "stderr", err), \
+             mock.patch.object(rewake, "runtime_ancestry_binding", return_value=self.ANCESTRY):
+            stack = [mock.patch.object(rewake, key, value) for key, value in patches.items()]
+            for patch in stack:
+                patch.start()
+            try:
+                code = rewake.main()
+            finally:
+                for patch in stack:
+                    patch.stop()
+        return code, out.getvalue(), err.getvalue()
+
+    def test_another_owners_gate_never_ends_a_non_terminal_wait(self):
+        # Top review R2-M1: a timeout or a missing readiness helper lapses the
+        # claim; folding in someone else's gate changes only what the receipt
+        # displays, never whether this owner finished.
+        for label, patches in (
+            ("timeout", {"wait_for_attempt": mock.Mock(return_value=("timeout", "owner-not-quiescent"))}),
+            ("no-helper", {"agent_home": mock.Mock(return_value=self.root / "no-such-home")}),
+        ):
+            with self.subTest(label=label):
+                self._open_row()                      # still open: the owner never finished
+                self._gate(f"delivery-foreign-{label}", owner="att-someone-else")
+                code, _out, err = self._run_main_patched(**patches)
+                self.assertEqual(code, 2)             # the gate is worth waking for
+                self.assertIn("human gate is open", err)
+                ledger = rewake._read_arm(rewake.arm_path(self.jobs, "att-owner-1"))
+                self.assertEqual(ledger["state"], "lapsed")   # not `ended`
+                rewake.arm_path(self.jobs, "att-owner-1").unlink()
+
+        # and with no foreign gate the same failures lapse exactly as before
+        self._open_row()
+        code, _out, _err = self._run_main_patched(
+            wait_for_attempt=mock.Mock(return_value=("timeout", "owner-not-quiescent")))
+        self.assertEqual(code, 0)
+        self.assertEqual(rewake._read_arm(rewake.arm_path(self.jobs, "att-owner-1"))["state"], "lapsed")
+
     def test_a_winning_carrier_acks_a_folded_gate_only_after_the_receipt_went_out(self):
         self._open_row()
         self._close_and_materialize()

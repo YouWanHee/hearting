@@ -336,8 +336,10 @@ def _session_owner_rows(
     paths share (review R1 B1): a receipt on stdout only *names* a candidate;
     the row proves it -- exists, `parent_sid` is this session, every
     `REGISTRY_OWNER_START` key matches. A receipt may name a row that already
-    ran to `done` (a short owner finishing before the hook ran); the registry
-    path arms open rows only."""
+    ran to `done` (a short owner finishing before the hook ran). The registry
+    path takes a *new* claim only on an open row; a row that ran to `done`
+    while this session already held its claim is still re-armable, because
+    the wake it owes was never delivered (top review M1)."""
 
     lines = _read_registry_lines(jobs)
     if lines is None:
@@ -1124,18 +1126,15 @@ def _gate_notices(
     that owner's hook's wake, and spending this process's single wake on it
     would lose this attempt's completion notice.
 
-    `settle` is how the announced record is left. The terminal wake acks
-    (A59-3: a gate folded into a terminal receipt is not re-announced). The
-    in-wait wake passes `sent-ambiguous` (review round 1, M6): whether an
-    exit-2 wake reaches the session is unmeasured (SD-OPEN-29/32), and an
-    acked record would have spent the sweep fallback the contract still
-    requires. The cost is bounded at-least-once: if the person has not
-    released by the next prompt the sweep shows the same gate once more.
-
-    Each record is claimed and then acked -- not left `sent-ambiguous`. A gate
-    record is a pointer; the gate itself is durable in the workflow ledger, so
-    the usual at-least-once argument does not apply, and re-delivery would put
-    the same gate in front of the user on every prompt (A59-3 forbids that).
+    `settle` is how the announced record is left, and both call sites pass
+    `sent-ambiguous` (review round 1, M6): whether an exit-2 wake reaches the
+    session is unmeasured (SD-OPEN-29/32), and an acked record would have
+    spent the sweep fallback the contract still requires. The terminal caller
+    (`_emit_with_gates`) acks separately once its receipt has actually gone
+    out, so a gate folded into a delivered terminal receipt is not
+    re-announced (A59-3) while one whose receipt never went out still is. The
+    cost is bounded at-least-once: if the person has not released by the next
+    prompt the sweep shows the same gate once more.
     """
 
     notices: list[str] = []
@@ -1368,6 +1367,12 @@ def _emit_with_gates(launch: Launch, claim: ArmClaim, state: str, message: str, 
     """Fold the recipient's open gates into the receipt about to go out, emit
     it, and only then ack them; seal the claim after the emit."""
 
+    # The owner's own outcome, read before any gate is folded in (top review
+    # R2-M1): a gate belongs to whoever raised it and only changes what this
+    # receipt *displays*. Letting it also decide this claim sealed a timed-out
+    # or helper-less wait as `ended`, so the owner -- still open -- could never
+    # be re-armed and its completion never woke the session again.
+    terminal = state in TERMINAL_STATES
     announced: list[str] = []
     gates = _gate_notices(launch, settle="sent-ambiguous", announced=announced)
     if gates:
@@ -1385,7 +1390,7 @@ def _emit_with_gates(launch: Launch, claim: ArmClaim, state: str, message: str, 
             pending_delivery.ack(root, recipient_key, delivery_id, acked_by=f"async-rewake:{launch.session_id}")
         except pending_delivery.PendingDeliveryError:
             pass
-    return _ended(claim, exit_code, terminal=state in TERMINAL_STATES)
+    return _ended(claim, exit_code, terminal=terminal)
 
 
 def _ended(claim: ArmClaim, exit_code: int, *, terminal: bool) -> int:
