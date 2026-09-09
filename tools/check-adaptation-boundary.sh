@@ -3341,14 +3341,17 @@ check_adaptation_inventory_native_surfaces() {
     || ! grep -Fq 'adapter liveness wrapper' core/OPERATIONS.md; then
     fail_msg "core/OPERATIONS.md must describe adapter-native liveness wrappers, not only the shared Claude-compatible dispatch-liveness helper"
   fi
-  if ! grep -Fq 'Codex and OpenCode expose `preflight.sh distill-propose` as a no-tools worker tool-contract by default' core/ADAPTATION_INVENTORY.md \
+  if ! grep -Fq 'Codex and OpenCode expose `preflight.sh distill-propose` under their distinct worker contracts' core/ADAPTATION_INVENTORY.md \
     || ! grep -Fq 'Codex exits 69 until `CODEX_DISTILL_ENABLE=1`' core/ADAPTATION_INVENTORY.md \
     || ! grep -Fq 'OpenCode exits 69 until `OPENCODE_DISTILL_ENABLE=1`' core/ADAPTATION_INVENTORY.md; then
     fail_msg "core/ADAPTATION_INVENTORY.md must describe adapter distill-propose tool-contract boundaries"
   fi
   if ! grep -Fq 'SessionEnd and turn-counter triggers may launch a no-tools distiller agent' core/MEMORY.md \
     || ! grep -Fq 'Codex adapter-owned `session-end` and' core/HOOKS.md \
-    || ! grep -Fq 'read-only `codex exec` tool-free proof' core/HOOKS.md \
+    || ! grep -Fq 'checked restricted read-only `codex exec` fallback' core/HOOKS.md \
+    || ! grep -Fq 'does not remove tools from the model' core/HOOKS.md \
+    || ! grep -Fq 'Codex has no verified per-invocation flag removing every tool' adapters/codex/ADAPTATION.md \
+    || ! grep -Fq 'this is not zero-tools parity' adapters/codex/ADAPTATION.md \
     || ! grep -Fq 'verified automatic distill worker' adapters/codex/ADAPTATION.md \
     || grep -Fq 'opt-in distill proposal worker' adapters/codex/ADAPTATION.md; then
     fail_msg "core memory/hooks docs and Codex adaptation docs must distinguish user-facing distill-propose preview from verified automatic lifecycle distillation"
