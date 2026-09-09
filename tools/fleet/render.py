@@ -7307,19 +7307,48 @@ def _highlight_row(stdscr, y, w):
         pass
 
 
+def _configure_input(curses_mod, env):
+    """Set up terminal input so nothing the terminal sends can hold the frame loop.
+
+    Split out of `_loop` only so it can be tested without a real screen — the freeze this
+    prevents is not reproducible in a unit test, so the settings themselves are what gets
+    asserted.
+
+    **Escape delay.** ncurses waits its 1000ms default for the rest of a sequence it has
+    only partly seen: ten dropped frames for one stray ESC, and the floor under the freeze
+    below.
+
+    **Mouse reporting is off unless `FLEET_MOUSE=1` asks for it.** Enabling it froze the
+    TUI in two different terminals — under herdr (2026-07-01) and in a VS Code terminal
+    (2026-09-09). The second was measured while stuck: 0 CPU, zero read and write syscalls,
+    one thread, sleeping on the tty, and the terminal's own output queue empty, so it was
+    waiting for input rather than blocked writing. The user reported that it freezes on
+    clicking away to another window and that any keypress advances it exactly one frame,
+    which is what a half-assembled mouse/focus escape sequence does: ncurses holds for bytes
+    that never arrive and the next keystroke terminates the parse.
+
+    Keyboard was always the primary path, so the only thing lost by default is
+    click-to-toggle — a far better trade than a dashboard that stops. This was already the
+    behavior under herdr; it makes the safe case the default everywhere.
+    """
+    if hasattr(curses_mod, "set_escdelay"):
+        try:
+            curses_mod.set_escdelay(25)
+        except Exception:
+            pass
+    if env.get("FLEET_MOUSE") == "1":
+        try:
+            curses_mod.mousemask(curses_mod.BUTTON1_CLICKED)
+        except Exception:
+            pass
+
+
 def _loop(stdscr, collect_all, hfilter, section, interval):
     global _OFFSET, _BLINK_ON
     curses.curs_set(0)
     _init_colors()
     live_order = _LiveOrderState()
-    # herdr (HERDR_ENV=1) grabs mouse events itself — enabling curses mouse reporting inside it
-    # deadlocks/freezes the pane (user-observed freeze 2026-07-01). Keyboard is the primary path,
-    # so skip mouse under herdr; mouse click-toggle stays available in a plain terminal.
-    if not os.environ.get("HERDR_ENV"):
-        try:
-            curses.mousemask(curses.BUTTON1_CLICKED)
-        except Exception:
-            pass
+    _configure_input(curses, os.environ)
 
     def collect_snapshot():
         sessions, jobs = collect_all(harness_filter=hfilter)
