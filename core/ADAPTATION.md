@@ -255,6 +255,18 @@ help loaded on demand.
   of carriers, not merely that some carrier exists.
 - A stored surface baseline rejects growth greater than five percent unless the
   same change records a reviewed rationale and updates the budget.
+- Model-visible surface budget: the nine documents an agent reads to route
+  and dispatch work (`core/{CORE,WORKFLOW,CONVENTIONS,OPERATIONS,HOOKS,MEMORY}.md`,
+  `adapters/claude/CLAUDE.md`, the `autopilot-code` `dev-pipeline` and
+  `owner-execution` references) carry sealed per-file byte and directive caps
+  in `tools/surface-budget.json` and a total ceiling in
+  `tools/check-surface-budget.py`. Caps are per file and independent: a
+  change that grows any one of them fails the boundary check even when
+  another shrinks. The only way to grow a file is to reseal in the same
+  change with a recorded `--reason`, and a reseal is refused outright when
+  the measured total would exceed the code ceiling. Reductions are locked in
+  by resealing downward. The ceiling is lowered only in a commit that lands a
+  measured reduction and is never raised by editing the budget file.
 - Ordinary, unknown, and repeated hook states inject zero bytes. A verified
   pressure-band transition may emit one compact directive of at most 240 UTF-8
   bytes.
