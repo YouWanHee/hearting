@@ -319,13 +319,15 @@ stamp path in `core/HOOKS.md`.
   itself retires it (`retire_gate_delivery`); the next-prompt sweep acks it —
   re-arms a new hook process on the owner's completion exactly as the start
   did, whatever that command was. So the release is still the second arming
-  event, and a release from another pane, or one the supervisor refused as
-  already released (SD-OPEN-48: the owner released its own gate and is
-  running towards a completion that still owes the session a wake), re-arms
-  by the same rule; no command text or JSON output is read. A route with no
-  started open owner (the owner ended at the gate, or was refused at start)
-  arms nothing; the `UserPromptSubmit` sweep still delivers the pending
-  record at the next prompt. A raise seals `release_authority` (`depth-0` for an
+  event. A record closed elsewhere — a release from another pane, one the
+  supervisor refused as already released (SD-OPEN-48: the owner released its
+  own gate and is running towards a completion that still owes the session a
+  wake), or the sweep's ack — re-arms only at the bound session's *next* Bash
+  call; a session that makes none is served by the next-prompt sweep, not by
+  a wake. No command text or JSON output is read. A route with no started
+  open owner (the owner ended at the gate, or was refused at start) arms
+  nothing; the `UserPromptSubmit` sweep still delivers the pending record at
+  the next prompt. A raise seals `release_authority` (`depth-0` for an
   interview gate, a binding that declares it, or an artifact that declares it
   about itself; `any` otherwise): a registered headless owner's `release` /
   `gate --release` of a `depth-0` gate is refused typed

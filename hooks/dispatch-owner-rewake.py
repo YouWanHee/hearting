@@ -140,6 +140,27 @@ class ArmClaim:
     holder: tuple[str, str, str]
 
 
+@dataclass(frozen=True)
+class ArmRefusal:
+    """Why `claim_arm` did not take the claim. `watched` reasons mean the
+    attempt's wake is already someone's job (a live holder, or a gate wake
+    spent on a record that is still open); every other reason means nothing
+    is watching -- the caller says so (review R1 M2)."""
+
+    reason: str
+
+    WATCHED = frozenset({"held-live", "gate-open", "ended"})
+
+    @property
+    def watched(self) -> bool:
+        return self.reason in self.WATCHED
+
+
+ARM_RETENTION_ENDED_SECONDS = 7 * 86_400
+ARM_RETENTION_ANY_SECONDS = 30 * 86_400
+ARM_PRUNE_SCAN_LIMIT = 256
+
+
 def _bash_call(payload: object) -> tuple[dict[str, Any], str] | None:
     """`(payload, session_id)` for a PostToolUse Bash call of a real session."""
 
@@ -183,6 +204,23 @@ def parse_launch(payload: object) -> Launch | None:
     if jobs is None:
         return None
     return Launch(attempt_id=attempt_id, jobs=jobs, session_id=payload_session, armed="stdout")
+
+
+def receipt_row_age(launch: Launch) -> float | None:
+    """The registry's own proof for a receipt-named attempt: its age when the
+    row exists, is bound to this session, and carries the owner-start stamps
+    (`open`, or `done` for an owner that finished before the hook ran); None
+    otherwise. Review R1 B1: without this, any Bash output shaped like a
+    start receipt could arm a foreign, depth-2, unstarted, or invented
+    attempt -- the command-surface check that used to stand in front of the
+    receipt is gone, so the row has to."""
+
+    for attempt_id, age in _session_owner_rows(
+        launch.jobs, launch.session_id, statuses=RECEIPT_ROW_STATUSES
+    ):
+        if attempt_id == launch.attempt_id:
+            return age
+    return None
 
 
 def _registry_metadata(pipe: str) -> dict[str, str]:
@@ -239,9 +277,21 @@ def _resolved_jobs(payload: dict[str, Any]) -> Path | None:
     )
 
 
-def _session_owner_rows(jobs: Path, session: str) -> list[tuple[str, float]]:
-    """Every open, claimed-and-started depth-1 owner row bound to `session`,
-    as ``(attempt_id, age_seconds)``, oldest first. Empty on any refusal."""
+ARM_ROW_STATUSES = frozenset({"open"})
+RECEIPT_ROW_STATUSES = frozenset({"open", "done"})
+
+
+def _session_owner_rows(
+    jobs: Path, session: str, *, statuses: frozenset[str] = ARM_ROW_STATUSES
+) -> list[tuple[str, float]]:
+    """Every claimed-and-started depth-1 owner row bound to `session` whose
+    latest status is in `statuses`, as ``(attempt_id, age_seconds)``, oldest
+    first. Empty on any refusal. This is the one identity check both arming
+    paths share (review R1 B1): a receipt on stdout only *names* a candidate;
+    the row proves it -- exists, `parent_sid` is this session, every
+    `REGISTRY_OWNER_START` key matches. A receipt may name a row that already
+    ran to `done` (a short owner finishing before the hook ran); the registry
+    path arms open rows only."""
 
     try:
         lines = jobs.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -260,7 +310,7 @@ def _session_owner_rows(jobs: Path, session: str) -> list[tuple[str, float]]:
     now = time.time()
     rows: list[tuple[str, float]] = []
     for attempt_id, (stamp, status, metadata) in latest.items():
-        if status != "open" or metadata.get("parent_sid") != session:
+        if status not in statuses or metadata.get("parent_sid") != session:
             continue
         if any(metadata.get(key) != value for key, value in REGISTRY_OWNER_START.items()):
             continue
@@ -300,7 +350,7 @@ def registry_launch(payload: object) -> tuple[Launch, ArmClaim] | None:
     window = _arm_window()
     for attempt_id, age in _session_owner_rows(jobs, session):
         claim = claim_arm(jobs, attempt_id, session, fresh=age <= window)
-        if claim is None:
+        if isinstance(claim, ArmRefusal):
             continue
         armed = "registry" if claim.arms == 1 else "registry-rearm"
         return Launch(attempt_id=attempt_id, jobs=jobs, session_id=session, armed=armed), claim
@@ -318,9 +368,14 @@ def _process_identity(pid: int) -> tuple[str, str, str] | None:
 
 
 def _holder_alive(holder: object) -> bool:
-    """Whether the recorded holder triple still names a live process. A
-    partial or unparsable record is treated as dead only when its pid is
-    provably gone; anything ambiguous counts as alive (fail closed)."""
+    """Whether the recorded holder triple still names a live process.
+
+    Dead means *provably* gone: the pid no longer exists, or it exists with a
+    different start time or pid namespace (pid reuse). A record that cannot
+    be parsed, or a live pid whose identity cannot be read right now
+    (a transient /proc failure -- review R1 M1), counts as alive: a duplicate
+    waiter is the failure mode arming exists to prevent, a missed re-arm is
+    what the next-prompt sweep exists to cover."""
 
     if not isinstance(holder, list) or len(holder) != 3 or not all(isinstance(v, str) and v for v in holder):
         return True
@@ -328,9 +383,11 @@ def _holder_alive(holder: object) -> bool:
         pid = int(holder[0])
     except ValueError:
         return True
+    if not Path(f"/proc/{pid}").exists():
+        return False
     observed = _process_identity(pid)
     if observed is None:
-        return False
+        return True
     return list(observed) == holder
 
 
@@ -359,8 +416,12 @@ def _write_arm(path: Path, record: dict[str, Any]) -> None:
 
 
 def _gate_record_open(jobs: Path, session: str, delivery_id: object) -> bool:
-    """Whether the gate record a spent wake announced is still open. An
-    unnamed or unreadable record counts as open (fail closed)."""
+    """Whether the gate record a spent wake announced is still open.
+
+    Only a record that was read and carries a closed state counts as closed.
+    An unnamed, unreadable, or *missing* record counts as open (review R1 B2:
+    `pending_delivery.read` returns None for a missing file, and treating
+    that as closed re-armed a waiter with no closing evidence)."""
 
     if not isinstance(delivery_id, str) or not delivery_id:
         return True
@@ -369,55 +430,96 @@ def _gate_record_open(jobs: Path, session: str, delivery_id: object) -> bool:
         record = pending_delivery.read(root, session, delivery_id)
     except pending_delivery.PendingDeliveryError:
         return True
-    return record is not None and record.get("state") in pending_delivery.OPEN_STATES
+    if not isinstance(record, dict):
+        return True
+    return record.get("state") in pending_delivery.OPEN_STATES
+
+
+def _reclaim_refusal(existing: dict[str, Any], jobs: Path, session: str) -> str | None:
+    """None when the existing record may be re-taken, else the typed reason."""
+
+    if existing.get("state") == "unreadable":
+        return "unreadable"
+    if existing.get("schema") != ARM_SCHEMA:
+        return "unreadable"
+    if existing.get("session_id") != session:
+        return "foreign-session"
+    arms = existing.get("arms")
+    if not isinstance(arms, int):
+        return "unreadable"
+    if arms >= ARM_LIMIT:
+        return "exhausted"
+    state = existing.get("state")
+    if state == "ended":
+        return "ended"
+    if state not in ARM_STATES:
+        return "unreadable"
+    if _holder_alive(existing.get("holder")):
+        return "held-live"
+    if state == "gate-wake-sent" and _gate_record_open(jobs, session, existing.get("gate_delivery_id")):
+        return "gate-open"
+    return None  # waiting with a dead holder, lapsed, or a gate that has closed
 
 
 def _reclaimable(existing: dict[str, Any], jobs: Path, session: str) -> bool:
-    if existing.get("schema") != ARM_SCHEMA or existing.get("session_id") != session:
-        return False
-    arms = existing.get("arms")
-    if not isinstance(arms, int) or arms >= ARM_LIMIT:
-        return False
-    state = existing.get("state")
-    if state == "ended" or state not in ARM_STATES:
-        return False
-    if _holder_alive(existing.get("holder")):
-        return False
-    if state == "gate-wake-sent":
-        return not _gate_record_open(jobs, session, existing.get("gate_delivery_id"))
-    return True  # waiting with a dead holder, or lapsed
+    return _reclaim_refusal(existing, jobs, session) is None
 
 
-def claim_arm(jobs: Path, attempt_id: str, session: str, *, fresh: bool) -> ArmClaim | None:
+def _prune_arm_directory(directory: Path, now: float) -> None:
+    """Bounded retention for the ledger (review R1 M3), run under the ledger
+    lock by a process that just took a claim: an `ended` record older than
+    seven days, or any record older than thirty, is deleted. At most
+    `ARM_PRUNE_SCAN_LIMIT` entries are examined per claim so a large
+    directory cannot stall a hook; the lock file itself is never removed."""
+
+    try:
+        entries = sorted(directory.glob("att-*.json"))[:ARM_PRUNE_SCAN_LIMIT]
+    except OSError:
+        return
+    for entry in entries:
+        try:
+            age = now - entry.stat().st_mtime
+            if age < ARM_RETENTION_ENDED_SECONDS:
+                continue
+            record = _read_arm(entry)
+            if age >= ARM_RETENTION_ANY_SECONDS or (record or {}).get("state") == "ended":
+                entry.unlink()
+        except OSError:
+            continue
+
+
+def claim_arm(jobs: Path, attempt_id: str, session: str, *, fresh: bool) -> ArmClaim | ArmRefusal:
     """Take the arm claim for `attempt_id` under the ledger lock.
 
     A missing record is created only for a `fresh` row (started inside the arm
-    window); an existing record is re-taken only under `_reclaimable`. Returns
-    None on every refusal -- another hook process holds the wait, the wake was
-    spent and its gate is still open, the attempt ended, or the budget is
-    spent -- and never raises."""
+    window); an existing record is re-taken only when `_reclaim_refusal` finds
+    no reason. Returns an `ArmRefusal` naming the reason otherwise -- another
+    hook process holds the wait, the wake was spent and its gate is still
+    open, the attempt ended, the budget is spent, or the ledger could not be
+    read or written -- and never raises."""
 
     identity = _process_identity(os.getpid())
     if identity is None:
-        return None
+        return ArmRefusal("identity-unavailable")
     path = arm_path(jobs, attempt_id)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         lock = os.open(path.parent / ".lock", os.O_RDWR | os.O_CREAT, 0o600)
     except OSError:
-        return None
+        return ArmRefusal("io-error")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
             existing = _read_arm(path)
             if existing is None:
                 if not fresh:
-                    return None
+                    return ArmRefusal("not-fresh")
                 arms = 1
-            elif _reclaimable(existing, jobs, session):
-                arms = int(existing["arms"]) + 1
             else:
-                return None
+                refusal = _reclaim_refusal(existing, jobs, session)
+                if refusal is not None:
+                    return ArmRefusal(refusal)
+                arms = int(existing["arms"]) + 1
             record = {
                 "schema": ARM_SCHEMA,
                 "attempt_id": attempt_id,
@@ -429,10 +531,11 @@ def claim_arm(jobs: Path, attempt_id: str, session: str, *, fresh: bool) -> ArmC
                 "armed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             }
             _write_arm(path, record)
+            _prune_arm_directory(path.parent, time.time())
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)
     except OSError:
-        return None
+        return ArmRefusal("io-error")
     finally:
         os.close(lock)
     return ArmClaim(path=path, attempt_id=attempt_id, session_id=session, arms=arms, holder=identity)
@@ -1013,7 +1116,7 @@ def gate_wake_message(launch: Launch, notices: list[str]) -> str:
     )
 
 
-def no_arm_notice(payload: object) -> int:
+def no_arm_notice(payload: object, *, reason: str | None = None) -> int:
     """One typed notice when a start receipt proves `started=1` for this
     session but no hook process holds the attempt's arm claim.
 
@@ -1033,20 +1136,25 @@ def no_arm_notice(payload: object) -> int:
     attempt_id = _single(fields, "attempt_id")
     if not started or attempt_id is None or _single(fields, "parent_session_id") != session:
         return 0
-    jobs = _resolved_jobs(inner)
-    if jobs is not None:
-        existing = _read_arm(arm_path(jobs, attempt_id))
-        if existing is not None and existing.get("state") != "unreadable" and (
-            existing.get("state") != "waiting" or _holder_alive(existing.get("holder"))
-        ):
-            return 0
+    if reason is None:
+        jobs = _resolved_jobs(inner)
+        if jobs is None:
+            reason = "no-registry"
+        else:
+            existing = _read_arm(arm_path(jobs, attempt_id))
+            if existing is None:
+                reason = "unclaimed"
+            else:
+                refusal = _reclaim_refusal(existing, jobs, session)
+                reason = refusal or "reclaimable"
+    if reason in ArmRefusal.WATCHED:
+        return 0
     message = (
         f"[dispatch-owner-rewake] schema=2 state=not-armed attempt_id={attempt_id} "
-        "— this owner start reported started=1 but the asyncRewake bridge did NOT arm "
-        "(no registry resolves for the attempt, or its arm claim could not be taken), so "
-        "its completion will not wake this session and no bridge is watching it. Watch "
-        "this exact attempt via the explicit poll-fallback (dispatch-wait --attempt-id "
-        "<id>); do not wait for a wake that cannot arrive."
+        f"reason={reason} — this owner start reported started=1 but the asyncRewake bridge "
+        "did NOT arm, so its completion will not wake this session and no bridge is "
+        "watching it. Watch this exact attempt via the explicit poll-fallback "
+        "(dispatch-wait --attempt-id <id>); do not wait for a wake that cannot arrive."
     )
     print(json.dumps({"systemMessage": message}, ensure_ascii=False, separators=(",", ":")))
     print(message, file=sys.stderr)
@@ -1058,14 +1166,17 @@ def main() -> int:
         payload: Any = json.load(sys.stdin)
     except (OSError, json.JSONDecodeError):
         return 0
-    claim: ArmClaim | None = None
     launch = parse_launch(payload)
     if launch is not None:
-        claim = claim_arm(launch.jobs, launch.attempt_id, launch.session_id, fresh=True)
-        if claim is None:
-            # Another hook process already holds this attempt's wait (a
-            # parallel tool call, or a registry arm from an earlier call).
-            return 0
+        # The receipt names a candidate; the registry row proves it (R1 B1).
+        age = receipt_row_age(launch)
+        if age is None:
+            return no_arm_notice(payload, reason="row-identity-mismatch")
+        claim = claim_arm(launch.jobs, launch.attempt_id, launch.session_id, fresh=age <= _arm_window())
+        if isinstance(claim, ArmRefusal):
+            # A watched attempt (live holder, spent gate wake, ended) is
+            # someone else's wake; anything else is a loss and says so.
+            return 0 if claim.watched else no_arm_notice(payload, reason=claim.reason)
     else:
         resolved = registry_launch(payload)
         if resolved is None:
@@ -1074,7 +1185,10 @@ def main() -> int:
     root = agent_home()
     readiness = root / "utilities" / "dispatch-attempt-ready.py"
     if not readiness.is_file():
-        settle_arm(claim, "ended")  # nothing a later call could do better
+        # A helper missing from *this* call's agent home (release rotation, a
+        # wrong AGENT_HOME) is a lapse, not an end: the next Bash call may
+        # see a whole home again (review R1 B3).
+        settle_arm(claim, "lapsed")
         state, message = classified_receipt(
             launch, "bridge-error", "readiness-helper-missing", root
         )
