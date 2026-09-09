@@ -2,9 +2,9 @@
  "schema": 1,
  "measurement": "UTF-8 bytes per surface; directives = matches of /\\b(?:must|never|always|shall|do not|don't)\\b|(?<![가-힣])반드시(?![가-힣])|(?<![가-힣])금지(?=[한된됨되함]|(?![가-힣]))|해야(?:만)? 한다/ (case-insensitive) outside fenced code blocks and inline code spans",
  "sealed_at": "2026-09-09",
- "sealed_commit": "296da9f0",
- "ceiling_bytes": 361173,
- "total_bytes": 361173,
+ "sealed_commit": "a471d445",
+ "ceiling_bytes": 362830,
+ "total_bytes": 362830,
  "surfaces": {
   "core/CORE.md": {
    "bytes": 25281,
@@ -19,7 +19,7 @@
    "directives": 72
   },
   "core/OPERATIONS.md": {
-   "bytes": 107477,
+   "bytes": 109134,
    "directives": 141
   },
   "core/HOOKS.md": {
@@ -43,5 +43,25 @@
    "directives": 23
   }
  },
- "history": []
+ "history": [
+  {
+   "on": "2026-09-09",
+   "commit": "a471d445",
+   "reason": "astra instruction-surface review (2026-09-09): four rule clauses missing from the §5.10 summaries restored byte-identical from ADAPTATION §8 (SD-67 absent-row/decline, SD-94 owner-closure (a)-(f), SD-64/71/77 evidence order, SD-69 commit boundary)",
+   "raised": [
+    {
+     "surface": "core/OPERATIONS.md",
+     "field": "bytes",
+     "from": 107477,
+     "to": 109134
+    },
+    {
+     "surface": "*",
+     "field": "total_bytes",
+     "from": 361173,
+     "to": 362830
+    }
+   ]
+  }
+ ]
 }
