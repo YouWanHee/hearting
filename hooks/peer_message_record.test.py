@@ -24,6 +24,11 @@ class _BaseTest(unittest.TestCase):
         self.jobs_path.touch()
         self.env = dict(os.environ)
         self.env["AGENT_DISPATCH_JOBS"] = str(self.jobs_path)
+        # C-1 moved the peer ledger's writer root off AGENT_DISPATCH_JOBS onto
+        # peer_state_root(); isolating only AGENT_DISPATCH_JOBS no longer keeps this
+        # fixture's records out of the real per-user ledger root. Point it at the
+        # same tmp_root the `_ledger_root()` helper below already expects.
+        self.env["AGENT_PEER_LEDGER_ROOT"] = str(self.tmp_root)
         self.env.pop("AGENT_HOME", None)
         for key in ("FLEET_TITLE_REFRESH", "MEM_DISTILL", "AGENT_SESSION_ROLE",
                     "AGENT_DISPATCH_DEPTH", "CLAUDE_CODE_CHILD_SESSION"):
@@ -120,6 +125,10 @@ class PostToolTest(_BaseTest):
         self.addCleanup(lambda: os.chmod(ro_root, 0o700))
         broken_env = dict(self.env)
         broken_env["AGENT_DISPATCH_JOBS"] = str(ro_root / "jobs.log")
+        # Keep the ledger root under the same read-only tree so the write still fails
+        # (see the AGENT_PEER_LEDGER_ROOT comment in setUp) — otherwise the writable
+        # tmp_root from self.env would mask the failure this test means to exercise.
+        broken_env["AGENT_PEER_LEDGER_ROOT"] = str(ro_root / "peer-state")
         proc = subprocess.run(
             [sys.executable, str(_HOOK), "post-tool"],
             input=json.dumps(self._sendmessage_payload()).encode("utf-8"),

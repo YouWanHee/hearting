@@ -7,6 +7,7 @@ import os
 import stat
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -26,6 +27,20 @@ class _TmpRootMixin:
         self.jobs_path.touch()
         self._old_environ = dict(os.environ)
         os.environ["AGENT_DISPATCH_JOBS"] = str(self.jobs_path)
+        os.environ["AGENT_PEER_LEDGER_ROOT"] = str(self.tmp_root / "peer-state")
+        # C-9 made `_iter_records` (list/status) read through `steward_marker_roots()`,
+        # whose "fleet-reader" branch always adds `stable_state_root(os.environ)`
+        # (dispatch_state_roots) AND every installed runtime's own root
+        # (_runtime_ledger_roots: ~/.codex, ~/.claude, ~/.config/opencode) as read
+        # candidates. Without isolating HOME too, those candidates fall through to
+        # this machine's real per-user roots and a list/status assertion here would
+        # see live records (CODEX_HOME/CLAUDE_CONFIG_DIR are unset in the real
+        # environment, so overriding HOME alone covers all three).
+        os.environ["HOME"] = str(self.tmp_root / "home")
+        os.environ.pop("XDG_STATE_HOME", None)
+        os.environ.pop("HARNESS_STATE_ROOT", None)
+        os.environ.pop("CODEX_HOME", None)
+        os.environ.pop("CLAUDE_CONFIG_DIR", None)
         os.environ.pop("AGENT_HOME", None)
         self.addCleanup(self._restore_environ)
 
@@ -152,7 +167,7 @@ class PeerMessageTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual(rc, 0)
 
     def test_unwritable_state_root_is_fail_soft(self):
-        root = peer_message._ledger_root() / "peer-messages"
+        root = peer_message.peer_state_root() / "peer-messages"
         root.mkdir(parents=True, exist_ok=True)
         os.chmod(root, stat.S_IREAD | stat.S_IEXEC)
         try:
@@ -278,6 +293,79 @@ class PeerMessageBodyFlagTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual(rec["summary"], "piped body")
 
 
+def _rec(sid, to_sid, summary, ts="2026-09-01T00:00:00Z"):
+    return {
+        "schema_version": 1, "message_id": summary, "ts": ts,
+        "from": {"harness": "claude", "session_id": sid, "project": "p"},
+        "to": {"harness": "claude", "session_id": to_sid}, "kind": "steer",
+        "summary": summary, "body_sha256": "x",
+        "delivery": {"surface": "herdr", "status": "sent", "receipt": None}, "refs": [],
+    }
+
+
+class IterRecordsMultiRootTest(_TmpRootMixin, unittest.TestCase):
+    """C-9 — `_iter_records` (the engine behind `list`/`status`) reads the SAME
+    root set every other peer-ledger consumer reads (`steward_marker_roots`), not
+    just the one root new writes land under. C-1 moves only where NEW records
+    land; it never migrates history, so a record still sitting under the old
+    dispatch-registry root must not silently disappear from `list`/`status`."""
+
+    def _write_shard(self, root, sid, rec):
+        month_dir = Path(root) / "peer-messages" / time.strftime("%Y-%m", time.gmtime())
+        month_dir.mkdir(parents=True, exist_ok=True)
+        with open(month_dir / ("%s.jsonl" % sid), "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec) + "\n")
+
+    def test_iter_records_reads_both_the_new_and_the_old_root(self):
+        old_root = peer_message._ledger_root()      # AGENT_DISPATCH_JOBS-derived (pre-C-1 root)
+        new_root = peer_message.peer_state_root()   # AGENT_PEER_LEDGER_ROOT (C-1 canonical root)
+        self.assertNotEqual(str(old_root), str(new_root))
+        self._write_shard(old_root, "sid-old", _rec("sid-old", "sid-x", "old-root"))
+        self._write_shard(new_root, "sid-new", _rec("sid-new", "sid-y", "new-root"))
+
+        recs = list(peer_message._iter_records())
+        self.assertEqual({r["summary"] for r in recs}, {"old-root", "new-root"})
+
+        # A root that appears twice in the resolver's list must not double its records.
+        with mock.patch.object(peer_message, "steward_marker_roots",
+                                return_value=([Path(new_root), Path(new_root)], "test")):
+            recs_dup = list(peer_message._iter_records())
+        self.assertEqual(len(recs_dup), 1)
+        self.assertEqual(recs_dup[0]["summary"], "new-root")
+
+        # cmd_list/cmd_status go through the same engine and see both records too.
+        recs_by_cmd = list(peer_message._iter_records(since_hours=None))
+        self.assertEqual(len(recs_by_cmd), 2)
+
+
+class ReadTransferRecordCrossRootTest(_TmpRootMixin, unittest.TestCase):
+    """C-4 — sender and receiver processes commonly run under different
+    per-runtime `AGENT_DISPATCH_JOBS` (§2.2: a Codex managed session inherits its
+    own dispatch tree). Before C-1, `_transfer_path` followed that same
+    per-process value, so a sender and receiver with different
+    `AGENT_DISPATCH_JOBS` wrote/read two different transfer-record roots. C-1
+    anchors `_transfer_path` to `peer_state_root()` instead, which both
+    processes resolve to the SAME value regardless of `AGENT_DISPATCH_JOBS` —
+    this is what actually lets the receiver's `parse_peer_trailer` recover the
+    sender's identity."""
+
+    def test_transfer_record_written_under_one_dispatch_root_is_read_under_another(self):
+        recipient = {"harness": "codex", "session_id": "recipient-a"}
+        sender = {"harness": "codex", "session_id": "sender-a", "name": "s"}
+        text, ref = peer_message.prepare_peer_message("body", sender, recipient)
+        own_path = peer_message._transfer_path(ref)
+        self.assertTrue(own_path.exists())
+        # Simulate a receiving process with a different AGENT_DISPATCH_JOBS (its own
+        # runtime's dispatch root) while AGENT_PEER_LEDGER_ROOT — the value that
+        # actually governs `_transfer_path` since C-1 — stays the same.
+        other_jobs = self.tmp_root / "other-runtime" / "jobs.log"
+        other_jobs.parent.mkdir(parents=True)
+        other_jobs.touch()
+        os.environ["AGENT_DISPATCH_JOBS"] = str(other_jobs)
+        self.assertEqual(peer_message._transfer_path(ref), own_path)
+        parsed = peer_message.parse_peer_trailer(text, recipient)
+        self.assertEqual(parsed["session_id"], sender["session_id"])
+
 
 class F100cSenderAndStewardTest(unittest.TestCase):
     """F-100c — from.name, the herdr sender trailer, and the steward marker."""
@@ -288,6 +376,14 @@ class F100cSenderAndStewardTest(unittest.TestCase):
         self.root = Path(self._tmp.name)
         self._old = dict(os.environ)
         os.environ["AGENT_DISPATCH_JOBS"] = str(self.root / "jobs.log")
+        os.environ["AGENT_PEER_LEDGER_ROOT"] = str(self.root)
+        # See `_TmpRootMixin.setUp` — isolates every read candidate
+        # `steward_marker_roots()`'s fleet-reader branch can add.
+        os.environ["HOME"] = str(self.root / "home")
+        os.environ.pop("XDG_STATE_HOME", None)
+        os.environ.pop("HARNESS_STATE_ROOT", None)
+        os.environ.pop("CODEX_HOME", None)
+        os.environ.pop("CLAUDE_CONFIG_DIR", None)
         (self.root / "jobs.log").touch()
         os.environ.pop("AGENT_HOME", None)
         self.addCleanup(self._restore)
@@ -306,7 +402,7 @@ class F100cSenderAndStewardTest(unittest.TestCase):
 
     def _records(self):
         out = []
-        for f in (peer_message._ledger_root() / "peer-messages").rglob("*.jsonl"):
+        for f in (peer_message.peer_state_root() / "peer-messages").rglob("*.jsonl"):
             out += [json.loads(l) for l in f.read_text().splitlines() if l.strip()]
         return out
 
@@ -333,7 +429,7 @@ class F100cSenderAndStewardTest(unittest.TestCase):
 
     def _marker_keys_on_disk(self):
         return {(h, d.get("session_id")) for h, _p, d in
-                peer_message._iter_marker_files(peer_message._ledger_root()) if d}
+                peer_message._iter_marker_files(peer_message.peer_state_root()) if d}
 
     def test_record_never_marks_the_sender_whatever_the_kind(self):
         """Role ≠ communication (user 2026-09-06: every session that talked showed d=−1).
@@ -345,7 +441,7 @@ class F100cSenderAndStewardTest(unittest.TestCase):
         self.assertEqual(peer_message.read_steward_markers(), {})
         self.assertEqual(self._marker_keys_on_disk(), set())
         self.assertFalse(peer_message.steward_marker_path("claude", "sid-a").exists())
-        self.assertFalse((peer_message._ledger_root() / "peer-steward").exists())
+        self.assertFalse((peer_message.peer_state_root() / "peer-steward").exists())
 
     def test_mark_steward_requires_an_evidence_source_and_release_clears(self):
         ts = "2026-09-06T00:00:00Z"
@@ -427,7 +523,7 @@ class F100cSenderAndStewardTest(unittest.TestCase):
     def test_prune_steward_markers_dry_run_lists_and_apply_removes_only_unevidenced(self):
         """Every run here names the temp root explicitly (`--root`): the default root set is
         the Fleet reader's, which includes the real per-user root."""
-        root = str(peer_message._ledger_root())
+        root = str(peer_message.peer_state_root())
         stale = self._write_marker("claude", "worker-1", {
             "s": {"harness": "claude", "session_id": "s", "name": "n", "kind": "handoff", "ts": "1"}})
         empty = self._write_marker("claude", "worker-2", {})
@@ -473,7 +569,7 @@ class F100cSenderAndStewardTest(unittest.TestCase):
     def test_prune_default_roots_are_the_fleet_readers_and_are_printed(self):
         roots, source = peer_message.steward_marker_roots()
         self.assertEqual(source, "fleet-reader")
-        self.assertEqual(roots[0], peer_message._ledger_root())     # chain index 0 = the writer's root
+        self.assertEqual(roots[0], peer_message.peer_state_root())     # chain index 0 = the writer's root
         fake = self.root / "fake-root"
         (fake / "peer-steward" / "codex").mkdir(parents=True)
         (fake / "peer-steward" / "codex" / "t.json").write_text(json.dumps(

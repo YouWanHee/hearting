@@ -89,12 +89,39 @@ def _default_permission_mode():
         return DEFAULTS.DEFAULT_STEWARD_CHILD_PERMISSION_MODE
 
 
+def _session_registry():
+    """Lazy-import `tools/fleet/session_registry.py` (B-1). Fleet's `tools/` tree
+    is not on `sys.path` by default here, so this inserts it the same way
+    `peer-message.py:412 steward_marker_roots` reaches `fleet.collectors.peer_messages`
+    — `Path(__file__).resolve().parent.parent / "tools"` — rather than at module
+    import time, so an install without the Fleet tree does not take down
+    peer-steward entirely. Any failure (missing tree, import error) yields None."""
+    try:
+        tools_dir = Path(__file__).resolve().parent.parent / "tools"
+        if tools_dir.is_dir() and str(tools_dir) not in sys.path:
+            sys.path.insert(0, str(tools_dir))
+        from fleet import session_registry
+        return session_registry
+    except Exception:
+        return None
+
+
 def _from_name(from_harness, from_sid):
-    """The sender's stable registry name for the ledger (`hearting-46`); Claude only
-    today — Codex/OpenCode mint no runtime name (F-100c keeps that gap honest: None)."""
+    """The sender's stable registry name for the ledger (`hearting-46`). Claude reads
+    its native session registry directly; Codex/OpenCode (C-3) read the hearting-owned
+    `session_registry` (B-1) the same way. Any other harness, or any failure along
+    either path, yields None — a name is never guessed (F-100c)."""
     if from_harness == "claude":
         try:
             return peer_message.claude_session_name(from_sid)
+        except Exception:
+            return None
+    if from_harness in ("codex", "opencode"):
+        registry = _session_registry()
+        if registry is None:
+            return None
+        try:
+            return registry.name_for_session_id(from_sid, from_harness)
         except Exception:
             return None
     return None
@@ -376,12 +403,12 @@ _JOIN_EXIT = {"timeout": 3, "agent-not-found": 2, "herdr-unavailable": 4}
 def _watch_root():
     """`peer-watches/` beside `peer-messages/`, under the one resolved state root.
 
-    Routed through `peer_message._ledger_root()` on purpose: resolving the
-    dispatch state root a second time here would let the ledger root and the
-    watch root diverge whenever the resolver's inputs differ, and a watch whose
-    receipt lives beside a different ledger is unfindable.
+    Routed through `peer_message.peer_state_root()` on purpose: resolving the
+    state root a second time here would let the ledger root and the watch root
+    diverge whenever the resolver's inputs differ, and a watch whose receipt
+    lives beside a different ledger is unfindable.
     """
-    return peer_message._ledger_root() / "peer-watches"
+    return peer_message.peer_state_root() / "peer-watches"
 
 
 @dataclass(frozen=True)

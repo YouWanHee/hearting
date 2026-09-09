@@ -16,6 +16,7 @@ import os
 import re
 
 from . import procscan
+from .. import session_registry
 from ..model import ContextEvidence, SubAgent
 
 
@@ -424,52 +425,22 @@ def read_registry(pid, home=None):
     source: it is the runtime declaring its own identity, name, and activity window.
     Tolerant by contract — a session file written milliseconds ago may not carry
     `status`/`updatedAt` yet, and a missing/corrupt file is simply silence (None).
+
+    F-26b: delegates to the harness-neutral ``session_registry`` module (Claude stays
+    the read-only "runtime-native" harness there). Behavior is unchanged — the returned
+    dict still answers every ``.get()`` call the same way, just normalized to the
+    shared field set instead of raw file contents.
     """
-    try:
-        with open(os.path.join(home or _home(), "sessions", "%d.json" % int(pid))) as f:
-            d = json.load(f)
-    except Exception:
-        return None
-    return d if isinstance(d, dict) else None
-
-
-def _ms_to_sec(v):
-    """registry epoch-ms → epoch-sec; anything non-numeric (or bool) → None."""
-    if isinstance(v, bool) or not isinstance(v, (int, float)):
-        return None
-    return v / 1000.0
+    return session_registry.read("claude", pid, home=home)
 
 
 def _apply_registry(sess, sj):
     """Load every tier-1 registry field onto the Session. Each key is independently
-    optional: a fresh row carrying only pid/sessionId must not lose the ones it has."""
-    sess.session_id = sj.get("sessionId") or sess.session_id
-    sess.status = sj.get("status")                # idle | shell | busy | (absent → None)
-    name = sj.get("name")
-    if name:
-        sess.slug = name                          # friendly name disambiguates same-cwd sessions
-        sess.registry_name = name                 # explicit link in the name chain (F-26)
-        # F-99a ① — the registry `name` is a runtime-exposed user-set name only when
-        # `nameSource` says the user actually set it (not the default derived label).
-        # This is the same rule statusline.sh applies via `resolve_display_inputs()`.
-        if sj.get("nameSource") != "derived":
-            sess.runtime_name = name
-        else:
-            # F-100a — the derived `<basename>-<xx>` name is the only carrier of the
-            # 2-hex tag; read it while the record still says "derived".
-            try:
-                from fleet.session_handle import derived_tag
-                sess.session_tag = derived_tag(name)
-            except Exception:
-                sess.session_tag = None
-    kind = sj.get("kind")
-    if isinstance(kind, str):
-        sess.kind = kind
-    ps = sj.get("procStart")
-    if ps is not None and not isinstance(ps, bool):
-        sess.registry_proc_start = str(ps)        # compared against /proc in the classifier
-    sess.started_at = _ms_to_sec(sj.get("startedAt"))
-    sess.updated_at = _ms_to_sec(sj.get("updatedAt"))
+    optional: a fresh row carrying only pid/sessionId must not lose the ones it has.
+
+    F-26b: delegates to ``session_registry.apply_to_session`` (the shared definition
+    every harness now uses)."""
+    session_registry.apply_to_session(sess, sj, "claude")
 
 
 def _tap_sid_by_pid(home, pid, proc_start):

@@ -17,6 +17,7 @@ import sqlite3
 import time
 
 from ..model import ContextEvidence, SubAgent
+from .. import session_registry
 from .. import titles
 
 _COLS = ("id, slug, agent, model, cost, tokens_input, tokens_output, tokens_reasoning, "
@@ -198,6 +199,16 @@ def _child_sessions(con, sid):
 
 
 def enrich(sess):
+    # B-5: no hearting-managed writer exists yet for OpenCode (`writer_support ==
+    # "not-implemented"`), so this always reads None today — the call is here so the
+    # harness-parity contract (D) and a future writer both have one call site, matching
+    # claude/codex's tier-1 read at the top of their own `enrich`.
+    try:
+        rec = session_registry.read("opencode", sess.pid)
+        if rec:
+            session_registry.apply_to_session(sess, rec, "opencode")
+    except Exception:
+        pass
     db = _db()
     if not sess.cwd or not os.path.exists(db):
         return

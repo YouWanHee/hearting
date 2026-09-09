@@ -39,6 +39,7 @@ class AliasReceive(unittest.TestCase):
         self.state = Path(self.tmp.name)
         self.env = mock.patch.dict(os.environ, {
             "AGENT_DISPATCH_JOBS": str(self.state / "jobs.log"),
+            "AGENT_PEER_LEDGER_ROOT": str(self.state),
             "HOME": str(self.state / "home"), "CODEX_HOME": str(self.state / "home/.codex"),
             "AGENT_HOME": str(ROOT), "CLAUDE_CONFIG_DIR": str(self.state / "home/.claude"),
             "XDG_STATE_HOME": str(self.state / "xdg"), "PYTHONDONTWRITEBYTECODE": "1"})
@@ -103,7 +104,7 @@ class AliasReceive(unittest.TestCase):
                 path.write_text(json.dumps(rec))
             self.assertIsNone(self.parse(text), damage)
         text, ref = self.prepare()
-        with mock.patch.object(pm, "_ledger_root", side_effect=AssertionError("no path lookup")):
+        with mock.patch.object(pm, "peer_state_root", side_effect=AssertionError("no path lookup")):
             self.assertIsNone(self.parse(text.replace(ref, "../../secret")))
         unknown, _ = self.prepare(sender={"harness": "unknown", "session_id": "known-id"})
         self.assertIn("[?]", unknown)
@@ -178,9 +179,9 @@ class AliasReceive(unittest.TestCase):
                     sender = dict(self.sender, harness=sender_harness,
                                   session_id=f"sender-{sender_harness}-{receiver_harness}")
                     target = dict(self.recipient, harness=receiver_harness)
-                    os.environ["AGENT_DISPATCH_JOBS"] = str(sender_root / "jobs.log")
+                    os.environ["AGENT_PEER_LEDGER_ROOT"] = str(sender_root)
                     text, ref = self.prepare(sender=sender, recipient=target)
-                    os.environ["AGENT_DISPATCH_JOBS"] = str(receiver_root / "jobs.log")
+                    os.environ["AGENT_PEER_LEDGER_ROOT"] = str(receiver_root)
                     self.assertEqual(self.parse(text, target), sender["session_id"])
                     self.assertIsNone(self.parse(text + "改", target))
                     self.assertIsNone(self.parse(text, dict(target, session_id="new-occupant")))

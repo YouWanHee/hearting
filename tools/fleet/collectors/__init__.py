@@ -236,6 +236,14 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only"):
             share_tags(sessions)
     except Exception:
         pass
+    # B-2c: server → client copy of tier-1 session_registry state (sessionId/status),
+    # the same managed_dir pairing as share_tags above but the opposite direction.
+    try:
+        share_registry_state = getattr(modules.get("codex"), "share_managed_registry_state", None)
+        if share_registry_state and codex_tick is not None:
+            share_registry_state(sessions)
+    except Exception:
+        pass
 
     # Exact Fleet-owned decision/approval waits are additive enrichment. Run
     # after harness identity resolution and before the single liveness verdict.
@@ -300,8 +308,10 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only"):
                     continue
                 for key in ("rl_5h", "rl_7d", "rl_ms"):
                     value = payload.get(key)
-                    if value is not None and value != []:
-                        setattr(s, key, value)
+                    # B-6/2: when the account snapshot lacks a key, the session field must
+                    # go to None too — a missing account value means "unknown", not
+                    # "keep whatever this session's stale rollout attribution left behind".
+                    setattr(s, key, value if value not in (None, []) else None)
                 if account_windows:
                     s.rl_windows = account_windows
                 elif harness == "codex" and (

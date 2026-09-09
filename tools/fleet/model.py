@@ -755,9 +755,23 @@ def session_parent_visible(session):
     calls the exact same function so ``--json`` and the screen consume one value (C6/C13b).
     Does not consult ``--all``/``_SHOW_ALL``: that toggle changes what is DISPLAYED, never
     attribution history, so it must never reach this predicate.
+
+    B-6/4: an app-server row whose managed TUI client has already died is not a
+    "hidden companion" — it IS the real session (title, summary, tier-1/2 lifecycle
+    and all), just without a living client process. `_managed_client_present` (set by
+    `collectors/codex.share_managed_tags`) is the exact managed_dir pairing evidence
+    that distinguishes that case from an ordinary paired app-server companion; only a
+    row that also carries a `session_id` is eligible, so a companion with no identity
+    at all still hides.
     """
-    return not (getattr(session, "liveness", None) in ("stale", "dead")
-                or getattr(session, "app_server", False))
+    app_server = getattr(session, "app_server", False)
+    if (
+        app_server
+        and getattr(session, "session_id", None)
+        and getattr(session, "_managed_client_present", None) is False
+    ):
+        app_server = False
+    return not (getattr(session, "liveness", None) in ("stale", "dead") or app_server)
 
 
 # Grace window for a dispatch job's parent-session edge (F-80), in ticks — not seconds.
