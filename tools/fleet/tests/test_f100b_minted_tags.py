@@ -105,9 +105,29 @@ class CollectorWiringCensusTest(unittest.TestCase):
                 self.assertRegex(source, r"sess\.session_tag\s*=\s*minted_tag\(")
 
     def test_claude_collector_keeps_reading_its_derived_name(self):
-        """F-100a is untouched: Claude never mints, it reads the runtime's own suffix."""
+        """F-100a is untouched: Claude never mints, it reads the runtime's own suffix.
+
+        F-26b (plan.md B-1) moved the `derived_tag(name)` call out of claude.py and
+        into `session_registry.apply_to_session` (both claude.py and codex.py now
+        delegate their registry reads there), so a source-text grep for the call site
+        no longer holds. Assert the behavior it protects instead: applying a claude
+        registry record whose name is `nameSource="derived"` still derives the 2-hex
+        `session_tag` from that name, and a codex record with the same shape does not
+        (minted_tag, not derived_tag, owns that branch for codex/opencode).
+        """
+        from fleet import session_registry
+        from fleet.model import Session
+
+        record = {field: None for field in session_registry.FIELDS}
+        record.update(name="hearting-46", nameSource="derived")
+        claude_sess = Session(harness="claude", pid=1)
+        codex_sess = Session(harness="codex", pid=2)
+        session_registry.apply_to_session(claude_sess, record, "claude")
+        session_registry.apply_to_session(codex_sess, record, "codex")
+        self.assertEqual(claude_sess.session_tag, derived_tag("hearting-46"))
+        self.assertIsNotNone(claude_sess.session_tag)
+        self.assertIsNone(codex_sess.session_tag)
         source = self._source("claude.py")
-        self.assertIn("derived_tag(name)", source)
         self.assertNotIn("minted_tag", source)
 
 

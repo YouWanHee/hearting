@@ -88,6 +88,11 @@ class _HookMixin:
     def _env(self, mode="idle", session_id=None):
         env = dict(os.environ)
         env["AGENT_DISPATCH_JOBS"] = str(self.jobs)
+        # C-1 moved the peer ledger (and _watch_root(), which watch/status read/write
+        # through) off the AGENT_DISPATCH_JOBS-anchored resolver onto peer_state_root();
+        # isolating only AGENT_DISPATCH_JOBS no longer keeps this fixture's watch
+        # records out of the real per-user ledger root.
+        env["AGENT_PEER_LEDGER_ROOT"] = str(self.root / "peer-state")
         env["FAKE_HERDR_MODE"] = mode
         env["FAKE_HERDR_FIFO"] = str(self.fifo)
         env["CLAUDE_CODE_SESSION_ID"] = session_id or self.session

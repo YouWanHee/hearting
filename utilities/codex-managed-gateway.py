@@ -36,6 +36,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tools.fleet import interaction as fleet_interaction
+from tools.fleet import session_registry
 from dispatch_completion_join import (  # noqa: E402
     DELIVERY_TIMING_POINTS,
     JoinContractError,
@@ -580,6 +581,7 @@ class ManagedGateway:
         trace_path: Path | None = None,
         fault: str = "none",
         accept_stage_advance: bool = False,
+        session_registry_pid: int | None = None,
     ) -> None:
         self.listen_path = listen_path
         self.upstream_path = upstream_path
@@ -615,6 +617,13 @@ class ManagedGateway:
         self._internal: dict[tuple[str, Any], PendingInternal] = {}
         self._delivery_pending: dict[str, PendingInternal] = {}
         self._next_internal_id = 1
+        # B-2b: the app-server pid whose session_registry record this gateway may
+        # update (None for an unmanaged/proof gateway run — writes are then skipped
+        # entirely). Field updates are merged here under `_lock`; the actual file I/O
+        # runs OUTSIDE the lock (see `_flush_registry_write`, R3) so a slow or failing
+        # write can never delay the JSON-RPC relay path.
+        self._session_registry_pid = session_registry_pid
+        self._pending_registry_fields: dict[str, Any] | None = None
 
     def trace(self, event: str, **fields: Any) -> None:
         if self.trace_path is None:
@@ -637,6 +646,30 @@ class ManagedGateway:
         value = f"{INTERNAL_ID_PREFIX}{self._next_internal_id}"
         self._next_internal_id += 1
         return value
+
+    def _merge_pending_registry_fields_locked(self, fields: dict[str, Any]) -> None:
+        """Record session_registry field updates; must be called with `_lock` held.
+        No file I/O here (R3) — `_upstream_loop` flushes after releasing the lock."""
+        if not self._session_registry_pid:
+            return
+        if self._pending_registry_fields is None:
+            self._pending_registry_fields = {}
+        self._pending_registry_fields.update(fields)
+
+    def _take_pending_registry_fields_locked(self) -> dict[str, Any] | None:
+        fields = self._pending_registry_fields
+        self._pending_registry_fields = None
+        return fields
+
+    def _flush_registry_write(self, fields: dict[str, Any] | None) -> None:
+        """Write outside `_lock`, fail-soft like `_publish_wait_locked` (:984) —
+        this must never be the reason a JSON-RPC message is delayed or dropped."""
+        if not fields or not self._session_registry_pid:
+            return
+        try:
+            session_registry.write("codex", self._session_registry_pid, fields)
+        except Exception:
+            pass
 
     @staticmethod
     def _bind_listener(path: Path) -> socket.socket:
@@ -724,10 +757,13 @@ class ManagedGateway:
         try:
             while not self._stop.is_set():
                 message = upstream.read_json()
+                pending_registry_fields = None
                 with self._lock:
                     if epoch != self._epoch or upstream is not self._upstream:
                         return
                     self._handle_upstream_locked(message)
+                    pending_registry_fields = self._take_pending_registry_fields_locked()
+                self._flush_registry_write(pending_registry_fields)
         except (EOFError, OSError, GatewayError) as exc:
             self.trace(
                 "upstream-disconnected", epoch=epoch, reason=type(exc).__name__
@@ -963,6 +999,14 @@ class ManagedGateway:
                 )
                 if state.pending_start_id is None and state.queued:
                     self._drain_queued_locked(state)
+                # B-2b: only the bound thread's activity describes THIS gateway's
+                # single session_registry row — an unrelated sibling/subagent thread
+                # turn must not flap its status.
+                if thread_id == self._binding_thread_id:
+                    now_ms = int(time.time() * 1000)
+                    self._merge_pending_registry_fields_locked(
+                        {"status": "busy", "statusUpdatedAt": now_ms, "updatedAt": now_ms}
+                    )
         elif method == "turn/completed":
             thread_id = thread_id_from_message(message)
             turn_id = turn_id_from_message(message)
@@ -979,6 +1023,11 @@ class ManagedGateway:
             self.trace(
                 "turn-completed", thread_id=thread_id, turn_id=turn_id
             )
+            if thread_id and thread_id == self._binding_thread_id:
+                now_ms = int(time.time() * 1000)
+                self._merge_pending_registry_fields_locked(
+                    {"status": "idle", "statusUpdatedAt": now_ms, "updatedAt": now_ms}
+                )
         self._send_tui_locked(message)
 
     def _publish_wait_locked(self, thread_id: str) -> None:
@@ -1086,11 +1135,16 @@ class ManagedGateway:
                     self._binding_source = "initial"
                     if is_witnessed_fork_of_binding:
                         self._thread_predecessors[thread_id] = predecessor
+                    # B-2b: the thread id IS the session_registry sessionId — this is
+                    # the gateway's one moment of proof for it (witnessed thread
+                    # start/resume/fork response, never a bare notification).
+                    self._merge_pending_registry_fields_locked({"sessionId": thread_id})
                 elif is_witnessed_fork_of_binding:
                     # Advance by fork: witnessed fork of the current binding.
                     self._thread_predecessors[thread_id] = predecessor
                     self._binding_thread_id = thread_id
                     self._binding_source = "fork"
+                    self._merge_pending_registry_fields_locked({"sessionId": thread_id})
                 elif (
                     method == "thread/resume"
                     and thread_id == self._binding_thread_id
@@ -2199,6 +2253,13 @@ def parse_args() -> argparse.Namespace:
         default="none",
         help="one-shot proof fault; never set in a managed session",
     )
+    parser.add_argument(
+        "--session-registry-pid",
+        type=int,
+        default=None,
+        help="app-server pid whose session_registry record this gateway may update "
+             "(B-2b); omitted for an unmanaged/proof gateway run",
+    )
     return parser.parse_args()
 
 
@@ -2211,6 +2272,7 @@ def main() -> int:
         ledger_path=args.ledger,
         trace_path=args.trace,
         fault=args.fault,
+        session_registry_pid=args.session_registry_pid,
     )
 
     def stop(_signum: int, _frame: Any) -> None:

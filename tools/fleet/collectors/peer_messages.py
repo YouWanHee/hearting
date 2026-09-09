@@ -6,8 +6,10 @@ feeds stays at its snapshot default so the rendered board is byte-identical to a
 pre-SD-122 board.
 """
 import glob
+import importlib.util
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -15,6 +17,53 @@ from pathlib import Path
 _TAIL_BYTES = 64 * 1024
 _WINDOW_SECONDS = 24 * 3600
 _MAX_RECORDS = 200
+
+# C-2 — a herdr sender trailer written 2026-09-08T02:54Z~11:18Z carried a trailing
+# " ; ref=<32hex>" transfer-ref suffix inside the display name (the writer
+# already separates them today; this is read-side tolerance for the records
+# still on disk from that window, display only — the ledger itself is untouched).
+_REF_TRAILER_RE = re.compile(r"\s*;\s*ref=[0-9a-f]{32}\s*$")
+
+_peer_message_module = None
+
+
+def _clean_from_name(name):
+    if not isinstance(name, str):
+        return name
+    return _REF_TRAILER_RE.sub("", name)
+
+
+def _load_peer_message():
+    """Lazy-load `utilities/peer-message.py` (hyphenated — not `import`able by
+    name) once, so `_state_roots()` can ask it for the peer ledger's canonical
+    root (C-8). Fail-soft and cached: a read-only collector must never raise,
+    and re-executing the module on every tick would be wasted work."""
+    global _peer_message_module
+    if _peer_message_module is not None:
+        return _peer_message_module
+    here = Path(__file__).resolve()
+    for candidate in here.parents:
+        pm_path = candidate / "utilities" / "peer-message.py"
+        if pm_path.is_file():
+            try:
+                spec = importlib.util.spec_from_file_location("peer_message", str(pm_path))
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+            except Exception:
+                return None
+            _peer_message_module = module
+            return module
+    return None
+
+
+def _peer_ledger_root():
+    module = _load_peer_message()
+    if module is None:
+        return None
+    try:
+        return str(module.peer_state_root())
+    except Exception:
+        return None
 
 
 def _agent_home():
@@ -45,7 +94,15 @@ def _state_roots():
     `.dispatch` and ignores an inherited `AGENT_DISPATCH_JOBS`). Modelled on
     `tools/fleet/route.py`'s `_dispatch_state_roots` — lazy import, tolerant of every
     failure (never raises out of a read-only collector). F-100c appends every installed
-    runtime's own dispatch root (`_runtime_ledger_roots`)."""
+    runtime's own dispatch root (`_runtime_ledger_roots`).
+
+    C-8 — index 0 is always the peer ledger's canonical root
+    (`peer-message.py::peer_state_root()`), promoting it to the front (never
+    duplicating it) when it is already present. This is the same list
+    `peer-message.py:412 steward_marker_roots` reads back through the
+    "fleet-reader" branch, and its "chain index 0 = the writer's root" contract
+    depends on this ordering. A resolver failure here is swallowed — the rest
+    of the roots still apply."""
     roots = []
     try:
         home = _agent_home()
@@ -71,6 +128,11 @@ def _state_roots():
                 roots.append(extra)
     except Exception:
         pass
+    peer_root = _peer_ledger_root()
+    if peer_root is not None:
+        peer_norm = os.path.normpath(peer_root)
+        roots = [r for r in roots if os.path.normpath(r) != peer_norm]
+        roots.insert(0, peer_root)
     return tuple(roots)
 
 
@@ -148,7 +210,7 @@ def collect(state_roots=None):
         if age_min <= 60:
             row["recv_1h"] += 1
         from_sid = from_key[1] if from_key else None
-        from_name = (frm.get("name") or from_sid or "")
+        from_name = (_clean_from_name(frm.get("name")) or from_sid or "")
         row["last_recv"] = {"from_name": from_name, "from_session_id": from_sid,
                              "from_harness": from_key[0] if from_key else "",
                              "kind": kind, "age_min": age_min}
@@ -162,7 +224,7 @@ def collect(state_roots=None):
         # logical message and must count once (F-101i).
         row = _row(to_key)
         from_sid = from_key[1] if from_key else None
-        from_name = (frm.get("name") or from_sid or "")
+        from_name = (_clean_from_name(frm.get("name")) or from_sid or "")
         row["last_recv"] = {"from_name": from_name, "from_session_id": from_sid,
                              "from_harness": from_key[0] if from_key else "",
                              "kind": inherited, "age_min": age_min}

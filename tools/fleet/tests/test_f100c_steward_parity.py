@@ -171,6 +171,11 @@ class StewardCollectorTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             old = dict(os.environ)
             os.environ["AGENT_DISPATCH_JOBS"] = os.path.join(tmp, "jobs.log")
+            # C-1 moved the peer ledger's writer root off AGENT_DISPATCH_JOBS onto
+            # peer_state_root(); isolating only AGENT_DISPATCH_JOBS leaked this
+            # fixture's records into the real per-user ledger root (reproduced during
+            # C's verification — see handoff-c-peer-ledger.md).
+            os.environ["AGENT_PEER_LEDGER_ROOT"] = os.path.join(tmp, "peer-state")
             os.environ.pop("AGENT_HOME", None)
             try:
                 open(os.environ["AGENT_DISPATCH_JOBS"], "w").close()

@@ -39,7 +39,7 @@ import time
 from .model import (fmt_min, dash, project_of, exec_child_is_wait,
                     session_parent_visible)
 from . import gitinfo
-from .refresh import LiveSnapshot, RefreshPump
+from .refresh import LiveSnapshot, RefreshPump, MAX_LEAKED_WORKERS
 from .session_handle import display_name as _display_name
 
 # curses attribute constants — real values when curses is present, harmless 0 fallbacks
@@ -4097,6 +4097,64 @@ def set_compute_hosts(value):
     _COMPUTE_HOSTS = dict(value) if isinstance(value, dict) else None
 
 
+# F-71b: the header's own honesty about the two RefreshPump workers (tools/fleet/refresh.py).
+# render never reads pump.running/pump.last_error directly — health() is the single surface.
+_REFRESH_HEALTH = {}   # {"snapshot": health-dict|None, "compute_hosts": health-dict|None}
+
+
+def set_refresh_health(snapshot=None, compute_hosts=None):
+    global _REFRESH_HEALTH
+    _REFRESH_HEALTH = {
+        "snapshot": dict(snapshot) if isinstance(snapshot, dict) else None,
+        "compute_hosts": dict(compute_hosts) if isinstance(compute_hosts, dict) else None,
+    }
+
+
+def _refresh_age_label(age):
+    if age is None:
+        return "—"
+    age = max(0.0, age)
+    if age < 60:
+        return "%ds" % int(age)
+    if age < 3600:
+        return "%dm" % int(age // 60)
+    return "%dh" % int(age // 3600)
+
+
+def _refresh_health_segments(narrow=False):
+    """Segments the header appends after the install-method word.
+
+    Degrade order under `narrow` (A-4, review minor 1): (1) the error string
+    shrinks from 40 to 20 chars, (2) the ` · gpu stalled` suffix is dropped
+    entirely. `refreshed <age>` and the state word are never dropped at any
+    width — final cell-accurate clipping is `_addline`'s job, not this
+    function's.
+    """
+    health = _REFRESH_HEALTH.get("snapshot") if isinstance(_REFRESH_HEALTH, dict) else None
+    if not health:
+        return []
+    segs = [(" · ", "dim"), ("refreshed " + _refresh_age_label(health.get("age")), "dim")]
+    state = health.get("state")
+    if state == "stalled":
+        text = " · stalled"
+        leaked = health.get("leaked_workers") or 0
+        if leaked >= MAX_LEAKED_WORKERS:
+            text += " (%d workers stuck)" % leaked
+        segs.append((text, "lvl_y"))
+    elif state == "failed":
+        error = health.get("last_error") or ""
+        limit = 20 if narrow else 40
+        segs.append((" · error: " + error[:limit], "lvl_y"))
+    compute_hosts = (_REFRESH_HEALTH.get("compute_hosts")
+                      if isinstance(_REFRESH_HEALTH, dict) else None)
+    # Segment importance, in survival order: ① refreshed <age> ② state word
+    # ③ error body ④ ` · gpu stalled`. The gpu suffix is the lowest-priority
+    # segment and the first one narrow width drops entirely.
+    if compute_hosts and compute_hosts.get("state") == "stalled" and not narrow:
+        segs.append((" · gpu stalled", "lvl_y"))
+    return segs
+
+
 _VERSION_RELEASE_RE = re.compile(r"^v?\d+(?:\.\d+)+(?:[-+][0-9A-Za-z.]+)?$")
 _VERSION_BUILD_RE = re.compile(r"-\d+-g[0-9a-fA-F]+$")
 
@@ -4130,7 +4188,7 @@ def _hearting_version_segments(version):
     return segments or [(version, "unknown")]
 
 
-def _hearting_header_row():
+def _hearting_header_row(narrow=False):
     value = _HEARTING or {}
     version = str(value.get("version") or "unknown")
     method = str(value.get("install_method") or "unmanaged")
@@ -4140,7 +4198,8 @@ def _hearting_header_row():
     # of the generic `head` grey; the version and install method stay quiet beside it.
     return ([("  ", None), ("hearting", "hearting_name"), (" ", None)]
             + _hearting_version_segments(version)
-            + [(" · ", "dim"), (method, "version_method")])
+            + [(" · ", "dim"), (method, "version_method")]
+            + _refresh_health_segments(narrow))
 
 
 def _gpu_safe_text(value):
@@ -4588,8 +4647,8 @@ def _compute_host_rows(term_width=None, sessions=None):
     return rows
 
 
-def _top_rows(term_width=None):
-    return [_hearting_header_row(), None]
+def _top_rows(term_width=None, narrow=False):
+    return [_hearting_header_row(narrow), None]
 
 
 # --- F-30 (v10, prd.md:304-310) — process view: pipeline-centric regrouping, `p` toggle ---
@@ -5522,7 +5581,7 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
             sessions, display_jobs, _route_views_by_id, malformed, memory,
             term_width, layout, node_evidence=_node_evidence, governor=governor)
         resource_lines = _resource_rows(resources, section)
-        return (_top_rows(term_width) + resource_lines
+        return (_top_rows(term_width, narrow) + resource_lines
                 + ([None] if resource_lines else []) + process_lines)
     # F-18b: mem-worker (distiller/curator/F-17 refresher) census — computed on the ORIGINAL
     # session list, before is_child/mem filtering, so folded/mem-only groups still surface a
@@ -5633,7 +5692,7 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
 
     # The product identity is a distinct, quiet title block. Keep one breathing row
     # before account usage begins instead of letting the two metadata zones touch.
-    lines = _top_rows(term_width)
+    lines = _top_rows(term_width, narrow)
     _seen_glyphs = set()
     # F-98b: the peer-message subtitle only makes sense between two sessions BOTH on
     # screen this tick — an off-screen peer still counts toward recv, but gets no line.
@@ -7309,6 +7368,10 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
     malformed = snapshot.malformed
     mem_snapshot = snapshot.memory
     governor_snapshot = snapshot.governor
+    set_refresh_health(
+        snapshot=pump.health(time.monotonic()),
+        compute_hosts=(compute_host_pump.health(time.monotonic())
+                       if compute_host_pump is not None else None))
     stdscr.timeout(200)                     # getch blocks ≤200ms → responsive keys
     _draw(stdscr, sessions, jobs, section, malformed, memory=mem_snapshot,
           live_order=live_order, resources=resources, usage_snapshots=usage_snapshots,
@@ -7321,9 +7384,14 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
             stdscr.timeout(max(20, min(100, int((_nb - time.time()) * 1000) + 1)))
             ch = stdscr.getch()
             now = time.time()
-            pump.request_due(now=time.monotonic())
+            now_mono = time.monotonic()
+            pump.request_due(now=now_mono)
             if compute_host_pump is not None:
-                compute_host_pump.request_due(now=time.monotonic())
+                compute_host_pump.request_due(now=now_mono)
+            set_refresh_health(
+                snapshot=pump.health(now_mono),
+                compute_hosts=(compute_host_pump.health(now_mono)
+                               if compute_host_pump is not None else None))
             update = pump.poll(generation)
             if update is not None:
                 generation, snapshot = update

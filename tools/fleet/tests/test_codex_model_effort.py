@@ -88,7 +88,11 @@ class CodexModelEffortTest(unittest.TestCase):
 
             self.assertEqual(codex._rollout_model_effort(path), ("gpt-session-2", "max"))
 
-    def test_config_is_fallback_when_rollout_has_no_turn_context(self):
+    def test_rollout_without_turn_context_leaves_model_and_effort_unset(self):
+        """B-6/3: `enrich()` no longer pre-seeds a session with the global
+        ~/.codex/config.toml model/effort. A row whose rollout carries no
+        turn_context must show None ("—"), not the global config's value
+        dressed up as its own attribution — even with config.toml present."""
         with tempfile.TemporaryDirectory() as home:
             with open(os.path.join(home, "config.toml"), "w", encoding="utf-8") as handle:
                 handle.write('model = "gpt-fallback"\nmodel_reasoning_effort = "medium"\n')
@@ -102,7 +106,7 @@ class CodexModelEffortTest(unittest.TestCase):
 
             codex.enrich(session, tick=tick)
 
-        self.assertEqual((session.model, session.effort), ("gpt-fallback", "medium"))
+        self.assertEqual((session.model, session.effort), (None, None))
 
     def test_malformed_newer_row_does_not_hide_latest_valid_context(self):
         with tempfile.TemporaryDirectory() as home:

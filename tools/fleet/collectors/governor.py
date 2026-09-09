@@ -54,7 +54,7 @@ def _default_root():
         try:
             resolved = subprocess.run(
                 [str(resolver), cwd or os.curdir], check=False,
-                capture_output=True, text=True,
+                capture_output=True, text=True, timeout=3.0,
             )
             if resolved.returncode == 0 and resolved.stdout.strip():
                 root = os.path.join(
@@ -62,7 +62,9 @@ def _default_root():
                 )
                 _ROOT_CACHE[cwd] = root
                 return root
-        except OSError:
+        except (OSError, subprocess.TimeoutExpired):
+            # Cache the fallback too, so a hung/missing resolver only ever
+            # costs one 3s wait per cwd instead of one every tick.
             pass
     root = os.path.join(str(Path.home()), ".agent-worker-governor")
     _ROOT_CACHE[cwd] = root

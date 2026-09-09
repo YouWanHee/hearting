@@ -34,6 +34,7 @@ import urllib.request
 from collections import OrderedDict
 from dataclasses import dataclass
 
+from fleet import session_registry
 from fleet.model import ContextEvidence, SESSION_WORK_SEC, SubAgent
 from fleet.token_budget import parse_codex_token_count
 
@@ -418,6 +419,12 @@ def _tick_subagents(tick, home):
 
 
 def _config_model_effort(home):
+    """Global ~/.codex/config.toml model/effort.
+
+    B-6/3: `enrich()` no longer calls this to pre-seed a session's model/effort — a
+    row whose rollout attribution fails must show None ("—"), not the global default
+    dressed up as its own value (F-26b "no guessing"). Definition kept for callers
+    that explicitly want the config fallback (currently none in this collector)."""
     now = time.time()
     if now - _CFG["ts"] < 10.0 and (_CFG["model"] or _CFG["effort"]):
         return _CFG["model"], _CFG["effort"]
@@ -918,12 +925,56 @@ def share_managed_tags(sessions):
             continue
         server.session_tag = tagged[0].session_tag
     for sess in sessions:
-        if (
-            getattr(sess, "harness", None) == "codex"
-            and getattr(sess, "app_server", False)
-            and not getattr(sess, "session_tag", None)
-        ):
+        if not (getattr(sess, "harness", None) == "codex" and getattr(sess, "app_server", False)):
+            continue
+        if not getattr(sess, "session_tag", None):
             sess._session_tag_unpaired = True
+        # B-6/4: mark whether this app-server row has a live TUI client in the same
+        # managed dir. `model.session_parent_visible` reads this to un-hide an
+        # app-server row that IS the real session (its client died first) instead of
+        # hiding every app-server row unconditionally. Ephemeral — never in --json.
+        managed_dir = getattr(sess, "managed_dir", None)
+        sess._managed_client_present = bool(
+            clients.get(os.path.normpath(managed_dir))
+        ) if managed_dir else False
+
+
+def share_managed_registry_state(sessions):
+    """Copy tier-1 session_registry state from a managed app-server to its TUI client.
+
+    B-2c: the gateway (B-2b) is the only observer of thread lifecycle, and it can only
+    write the app-server's registry record (it never learns the client's pid). The
+    client is the visible row, so its `session_id`/`status` must come from here. This
+    mirrors `share_managed_tags`' exact managed_dir pairing and guards — same bucket
+    build, same "exactly one server, exactly one client" gate, same "never overwrite
+    a row that already has a value" rule — but the copy direction is the OPPOSITE of
+    tags (server → client, not client → server), which is why it is a separate
+    function rather than folded into `share_managed_tags`.
+    """
+    servers, clients = {}, {}
+    for sess in sessions:
+        if getattr(sess, "harness", None) != "codex":
+            continue
+        managed_dir = getattr(sess, "managed_dir", None)
+        if not managed_dir:
+            continue
+        key = os.path.normpath(managed_dir)
+        bucket = servers if getattr(sess, "app_server", False) else clients
+        bucket.setdefault(key, []).append(sess)
+    for key, owners in servers.items():
+        peers = clients.get(key, [])
+        if len(owners) != 1 or len(peers) != 1:
+            continue
+        server, client = owners[0], peers[0]
+        session_id = getattr(server, "session_id", None)
+        if session_id and not getattr(client, "session_id", None):
+            client.session_id = session_id
+        status = getattr(server, "status", None)
+        if status and not getattr(client, "status", None):
+            client.status = status
+            server_updated = getattr(server, "updated_at", None)
+            if server_updated is not None:
+                client.updated_at = server_updated
 
 
 def prepare_tick(sessions):
@@ -1201,6 +1252,18 @@ def _duration_label(seconds):
     return "%ds" % seconds
 
 
+def _duration_label_from_minutes(minutes):
+    """Same label table as `_duration_label`, from a `window_minutes` payload field.
+
+    B-6/1: a live Codex payload can carry `window_minutes` (e.g. 10080 = 7 days)
+    instead of `limit_window_seconds`; without this, `_window_from_limit` fell
+    through to the legacy 5h/7d guess and mislabeled a 7-day window as "5h".
+    """
+    if not isinstance(minutes, (int, float)) or isinstance(minutes, bool) or minutes <= 0:
+        return None
+    return _duration_label(minutes * 60)
+
+
 def _legacy_window_key(label):
     if label == "5h":
         return "rl_5h"
@@ -1214,7 +1277,9 @@ def _window_from_limit(name, data, legacy_label):
     v = d.get("used_percent")
     if not isinstance(v, (int, float)):
         return None
-    label = _duration_label(d.get("limit_window_seconds")) or legacy_label
+    label = (_duration_label(d.get("limit_window_seconds"))
+             or _duration_label_from_minutes(d.get("window_minutes"))
+             or legacy_label)
     rs = d.get("reset_at")
     if not isinstance(rs, (int, float)):
         rs = d.get("resets_at")
@@ -1332,11 +1397,17 @@ def account_usage():
 
 def enrich(sess, tick=None):
     home = tick.default_home if tick is not None else _home()
-    model, effort = _config_model_effort(home)
-    if model:
-        sess.model = model
-    if effort:
-        sess.effort = effort
+    # B-3: tier-1 first. A hearting-managed session has a session_registry record
+    # (B-2) with the gateway's own observed sessionId/status — read it before any
+    # rollout-derived fallback so classify_session's `st is None` tier-2/3 branches
+    # (below, and codex-lifecycle at classify_session:1262) run only when this is
+    # absent, automatically and without touching that classifier.
+    try:
+        rec = session_registry.read("codex", sess.pid)
+        if rec:
+            session_registry.apply_to_session(sess, rec, "codex")
+    except Exception:
+        pass
     if not sess.cwd:
         return
     if tick is None:
@@ -1350,7 +1421,7 @@ def enrich(sess, tick=None):
         if not path and sess.pid not in tick.no_fallback_pids:
             path = _fallback_rollout(sess, home)
     if not path:
-        return                           # no rollout-specific telemetry; config fallback remains
+        return                           # no rollout-specific telemetry for this session
     rollout_model, rollout_effort = _rollout_model_effort(path)
     if rollout_model:
         sess.model = rollout_model
@@ -1361,7 +1432,9 @@ def enrich(sess, tick=None):
     # project cwd, so cwd-matched
     # A UUID comes only from an owned fd or a one-candidate fallback; one newest
     # cwd rollout must never be stamped on every live TUI sharing the repository.
-    sess.session_id = _sid(path)
+    # B-3: a tier-1 session_registry sessionId (set above) outranks the rollout's —
+    # preserve it instead of unconditionally overwriting with the rollout-derived id.
+    sess.session_id = sess.session_id or _sid(path)
     sess._transcript_path = path                 # ephemeral: live title scheduler, not --json
     sess._refresh_source = {"kind": "transcript", "harness": "codex",
                             "session_id": sess.session_id, "path": path,

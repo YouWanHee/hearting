@@ -29,6 +29,16 @@ class _TmpRootMixin:
         self.jobs_path.touch()
         self._old_environ = dict(os.environ)
         os.environ["AGENT_DISPATCH_JOBS"] = str(self.jobs_path)
+        os.environ["AGENT_PEER_LEDGER_ROOT"] = str(self.tmp_root)
+        # `steward_marker_roots()`'s fleet-reader branch also adds
+        # `stable_state_root(os.environ)` and every installed runtime's own root
+        # (~/.codex, ~/.claude, ~/.config/opencode) as read candidates; without
+        # isolating HOME too those fall through to this machine's real roots.
+        os.environ["HOME"] = str(self.tmp_root / "home")
+        os.environ.pop("XDG_STATE_HOME", None)
+        os.environ.pop("HARNESS_STATE_ROOT", None)
+        os.environ.pop("CODEX_HOME", None)
+        os.environ.pop("CLAUDE_CONFIG_DIR", None)
         os.environ.pop("AGENT_HOME", None)
         os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
         os.environ.pop("CODEX_THREAD_ID", None)
@@ -40,7 +50,7 @@ class _TmpRootMixin:
         os.environ.update(self._old_environ)
 
     def _all_records(self):
-        root = peer_steward.peer_message._ledger_root() / "peer-messages"
+        root = peer_steward.peer_message.peer_state_root() / "peer-messages"
         if not root.is_dir():
             return []
         recs = []
@@ -473,11 +483,12 @@ class _WatchMixin(_TmpRootMixin):
         self.calllog = self.tmp_root / "calls.log"
         self.fifo = self.tmp_root / "release.fifo"
         os.mkfifo(self.fifo)
-        self.watch_root = peer_steward.peer_message._ledger_root() / "peer-watches"
+        self.watch_root = peer_steward.peer_message.peer_state_root() / "peer-watches"
 
     def _env(self, mode="idle", session_id="steward-1", with_herdr=True):
         env = dict(os.environ)
         env["AGENT_DISPATCH_JOBS"] = str(self.jobs_path)
+        env["AGENT_PEER_LEDGER_ROOT"] = str(self.tmp_root)
         env["FAKE_HERDR_MODE"] = mode
         env["FAKE_HERDR_CALLLOG"] = str(self.calllog)
         env["FAKE_HERDR_FIFO"] = str(self.fifo)
@@ -1409,6 +1420,67 @@ class F100cStewardModeTest(_TmpRootMixin, unittest.TestCase):
         with mock.patch("builtins.print") as print_mock:
             self.assertEqual(peer_steward.main(["steward", "on"]), 1)
         self.assertIn("reason=no-session-identity", print_mock.call_args[0][0])
+
+
+class FromNameTest(_TmpRootMixin, unittest.TestCase):
+    """C-3 — `_from_name` reads Claude via `claude_session_name` (unchanged) and
+    Codex/OpenCode via `tools/fleet/session_registry.py` (B-1), the same lazy
+    `tools/` sys.path trick `peer-message.py:412 steward_marker_roots` uses for
+    non-Fleet consumers. Any other harness, or any failure along the way, is
+    `None` — a name is never guessed."""
+
+    def test_unknown_harness_and_missing_registry_record_are_none(self):
+        self.assertIsNone(peer_steward._from_name("unknown", "sid-1"))
+        with tempfile.TemporaryDirectory() as registry_dir:
+            os.environ["FLEET_SESSION_REGISTRY_DIR"] = registry_dir
+            self.assertIsNone(peer_steward._from_name("codex", "no-such-session"))
+            self.assertIsNone(peer_steward._from_name("opencode", "no-such-session"))
+
+    def test_codex_and_opencode_resolve_via_session_registry(self):
+        with tempfile.TemporaryDirectory() as registry_dir:
+            os.environ["FLEET_SESSION_REGISTRY_DIR"] = registry_dir
+            for harness, pid, sid, name in (
+                ("codex", 111, "codex-sess-1", "hearting-codex-1"),
+                ("opencode", 222, "oc-sess-1", "hearting-oc-1"),
+            ):
+                d = Path(registry_dir) / harness
+                d.mkdir(parents=True)
+                (d / ("%d.json" % pid)).write_text(json.dumps(
+                    {"pid": pid, "sessionId": sid, "name": name, "harness": harness}))
+                self.assertEqual(peer_steward._from_name(harness, sid), name)
+
+
+class FromNameBareSubprocessTest(unittest.TestCase):
+    """C-3 — the lazy `tools/` sys.path insert must work in the actual condition
+    a real herdr-launched `peer-steward.py` subprocess runs under: a cwd outside
+    the repository and no inherited `PYTHONPATH`. `test_importable_with_only_
+    tools_on_sys_path` (B-1) proves this for `session_registry` alone; this
+    proves the full `peer-steward.py::_from_name` codex path reaches it too."""
+
+    def test_from_name_resolves_a_codex_name_in_a_bare_subprocess(self):
+        with tempfile.TemporaryDirectory() as registry_dir, \
+             tempfile.TemporaryDirectory() as outside_cwd:
+            pid = 424242
+            record_dir = Path(registry_dir) / "codex"
+            record_dir.mkdir(parents=True)
+            (record_dir / ("%d.json" % pid)).write_text(json.dumps({
+                "pid": pid, "sessionId": "codex-sess-c3", "name": "hearting-codex-c3",
+                "harness": "codex",
+            }))
+            script = (
+                "import importlib.util\n"
+                "spec = importlib.util.spec_from_file_location('peer_steward', %r)\n"
+                "mod = importlib.util.module_from_spec(spec)\n"
+                "spec.loader.exec_module(mod)\n"
+                "print(mod._from_name('codex', 'codex-sess-c3') or '')\n"
+            ) % str(_HERE / "peer-steward.py")
+            env = dict(os.environ)
+            env.pop("PYTHONPATH", None)
+            env["FLEET_SESSION_REGISTRY_DIR"] = registry_dir
+            proc = subprocess.run([sys.executable, "-c", script], cwd=outside_cwd,
+                                  capture_output=True, text=True, env=env, timeout=10)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "hearting-codex-c3")
 
 
 if __name__ == "__main__":

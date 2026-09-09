@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """F-98 — read-only peer-message ledger projection (SD-122 §13.37.2)."""
+import importlib.util
 import json
 import os
 import sys
 import tempfile
 import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
 _TOOLS_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -15,6 +17,18 @@ if _TOOLS_DIR not in sys.path:
 from fleet import render  # noqa: E402
 from fleet.collectors import peer_messages  # noqa: E402
 from fleet.model import Session  # noqa: E402
+
+# `utilities/peer-message.py` is hyphenated (not `import`able by name); loaded the
+# same way its own test suite (utilities/peer_message.test.py) does.
+_REPO_ROOT = os.path.dirname(_TOOLS_DIR)
+_PM_SPEC = importlib.util.spec_from_file_location(
+    "peer_message_c6", os.path.join(_REPO_ROOT, "utilities", "peer-message.py"))
+peer_message = importlib.util.module_from_spec(_PM_SPEC)
+_PM_SPEC.loader.exec_module(peer_message)
+_PS_SPEC = importlib.util.spec_from_file_location(
+    "peer_steward_c6", os.path.join(_REPO_ROOT, "utilities", "peer-steward.py"))
+peer_steward = importlib.util.module_from_spec(_PS_SPEC)
+_PS_SPEC.loader.exec_module(peer_steward)
 
 
 def _write_ledger(root, from_sid, records):
@@ -210,6 +224,106 @@ class RenderByteIdenticalTest(unittest.TestCase):
                                     "kind": "steer", "age_min": 1})
         d = s.to_dict()
         self.assertNotIn("summary", json.dumps(d["peer_last_recv"]))
+
+
+class LedgerFormatTest(unittest.TestCase):
+    """C-6 — `AGENT_PEER_LEDGER_ROOT` round trip, `refs`/`transfer_ref` shape, and
+    legacy `ref=`-in-name display tolerance (C-2)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self._old = dict(os.environ)
+        os.environ["AGENT_PEER_LEDGER_ROOT"] = str(self.root)
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        os.environ.clear()
+        os.environ.update(self._old)
+
+    def _record_line(self, from_sid="sid-a"):
+        path = peer_message._ledger_path(from_sid)
+        return json.loads(path.read_text(encoding="utf-8").splitlines()[-1])
+
+    def test_agent_peer_ledger_root_round_trip_four_fields(self):
+        self.assertEqual(peer_message.peer_state_root(), self.root)
+        rc = peer_message.cmd_record(peer_message.argparse.Namespace(
+            from_harness="codex", from_session_id="sid-a", from_project="proj",
+            from_name="hearting-codex-1", to_harness="claude", to_session_id="sid-b",
+            to_name=None, kind="steer", surface="herdr", status="sent", receipt=None,
+            ref=[], body_file=None, body_stdin=False))
+        self.assertEqual(rc, 0)
+        rec = self._record_line()
+        self.assertEqual(rec["from"]["harness"], "codex")
+        self.assertEqual(rec["from"]["session_id"], "sid-a")
+        self.assertEqual(rec["from"]["project"], "proj")
+        self.assertEqual(rec["from"]["name"], "hearting-codex-1")
+
+    def test_refs_is_a_top_level_list_transfer_ref_is_a_separate_top_level_key(self):
+        transfer_ref = "0123456789abcdef0123456789abcdef"
+        rc = peer_message.cmd_record(peer_message.argparse.Namespace(
+            from_harness="codex", from_session_id="sid-a", from_project="proj",
+            from_name=None, to_harness="claude", to_session_id="sid-b", to_name=None,
+            kind="steer", surface="herdr", status="sent", receipt=None,
+            ref=["a", "b"], body_file=None, body_stdin=False, transfer_ref=transfer_ref))
+        self.assertEqual(rc, 0)
+        rec = self._record_line()
+        self.assertEqual(rec["refs"], ["a", "b"])
+        self.assertEqual(rec["transfer_ref"], transfer_ref)
+        self.assertEqual(rec["message_id"], transfer_ref)
+
+    def test_legacy_ref_suffix_in_name_displays_clean(self):
+        month_dir = self.root / "peer-messages" / time.strftime("%Y-%m", time.gmtime())
+        month_dir.mkdir(parents=True)
+        (month_dir / "sid-legacy.jsonl").write_text(json.dumps({
+            "schema_version": 1, "message_id": "legacy1",
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "from": {"harness": "codex", "session_id": "sid-legacy", "project": "p",
+                     "name": "hearting-a9 ; ref=0123456789abcdef0123456789abcdef"},
+            "to": {"harness": "claude", "session_id": "sid-b"}, "kind": "steer",
+            "summary": "hi", "body_sha256": "x",
+            "delivery": {"surface": "herdr", "status": "sent", "receipt": None}, "refs": [],
+        }) + "\n")
+        result = peer_messages.collect(state_roots=[str(self.root)])
+        last_recv = result["by_session"][("claude", "sid-b")]["last_recv"]
+        self.assertEqual(last_recv["from_name"], "hearting-a9")
+
+    def test_a_paths_all_land_under_the_same_root(self):
+        ref = "abcdef0123456789abcdef0123456789"
+        root = str(peer_message.peer_state_root())
+        self.assertTrue(str(peer_message._ledger_path("sid-a")).startswith(root))
+        self.assertTrue(str(peer_message._transfer_path(ref)).startswith(root))
+        self.assertTrue(str(peer_message.steward_marker_path("codex", "sid-a")).startswith(root))
+        self.assertTrue(str(peer_steward._watch_root()).startswith(root))
+
+
+class StateRootsPeerPromotionTest(unittest.TestCase):
+    """C-8 — `_state_roots()` always puts the peer ledger's canonical root at
+    index 0 (promoting, never duplicating, an already-present entry), and a
+    resolver failure never drops the rest of the roots."""
+
+    def test_promotes_peer_root_to_index_zero(self):
+        with mock.patch.object(peer_messages, "_peer_ledger_root", return_value="/tmp/peer-root-x"), \
+             mock.patch.object(peer_messages, "_runtime_ledger_roots", return_value=["/tmp/other"]), \
+             mock.patch.object(peer_messages, "_agent_home", side_effect=Exception("no home")):
+            roots = peer_messages._state_roots()
+        self.assertEqual(roots, ("/tmp/peer-root-x", "/tmp/other"))
+
+    def test_already_present_root_is_promoted_not_duplicated(self):
+        with mock.patch.object(peer_messages, "_peer_ledger_root", return_value="/tmp/same-root"), \
+             mock.patch.object(peer_messages, "_runtime_ledger_roots",
+                                return_value=["/tmp/same-root", "/tmp/other"]), \
+             mock.patch.object(peer_messages, "_agent_home", side_effect=Exception("no home")):
+            roots = peer_messages._state_roots()
+        self.assertEqual(roots, ("/tmp/same-root", "/tmp/other"))
+
+    def test_resolver_failure_preserves_the_rest(self):
+        with mock.patch.object(peer_messages, "_peer_ledger_root", return_value=None), \
+             mock.patch.object(peer_messages, "_runtime_ledger_roots", return_value=["/tmp/other"]), \
+             mock.patch.object(peer_messages, "_agent_home", side_effect=Exception("no home")):
+            roots = peer_messages._state_roots()
+        self.assertEqual(roots, ("/tmp/other",))
 
 
 if __name__ == "__main__":
