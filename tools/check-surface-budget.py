@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+"""Model-visible surface budget gate.
+
+The nine documents an agent reads to route and dispatch work are the surface
+the 2026-09-01 dispatch-complexity diagnosis said must shrink contractually.
+Between that diagnosis and 2026-09-09 they grew 23.3% (341,436 -> 420,908
+UTF-8 bytes) because nothing refused growth. This gate does.
+
+Contract (fail-closed):
+
+* every surface in ``SURFACES`` must exist, must have a sealed row in
+  ``tools/surface-budget.json``, and must stay at or under both its byte cap
+  and its directive-count cap;
+* the budget file may not list a path outside ``SURFACES`` (a stale row would
+  silently stop guarding a moved document);
+* the sum of sealed byte caps and the measured total may never exceed
+  ``TOTAL_BYTE_CEILING`` — the ceiling lives in code so raising it is a
+  reviewed code change, not a JSON edit;
+* ``--reseal`` lowers caps to the current measurement (locking in a
+  reduction) and refuses to raise any cap unless ``--reason`` is given, in
+  which case the raise is recorded in the file's ``history``.
+
+A directive is one match of ``DIRECTIVE_PATTERN`` outside fenced code blocks
+and inline code spans.
+The count is a footprint measure of rules the model must carry in memory, not
+a token or billing estimate (core/ADAPTATION.md §6.1).
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import json
+import re
+import sys
+from pathlib import Path
+
+SCHEMA = 1
+BUDGET_FILE = "tools/surface-budget.json"
+# Sealed 2026-09-09 at 9c666bc2: the measured 9-document total at kickoff.
+# Lower it in the same commit that lands a real reduction; never raise it
+# without a reviewed rationale in that commit.
+TOTAL_BYTE_CEILING = 420_908
+SURFACES: tuple[str, ...] = (
+    "core/CORE.md",
+    "core/WORKFLOW.md",
+    "core/CONVENTIONS.md",
+    "core/OPERATIONS.md",
+    "core/HOOKS.md",
+    "core/MEMORY.md",
+    "adapters/claude/CLAUDE.md",
+    "skills/autopilot-code/references/dev-pipeline.md",
+    "skills/autopilot-code/references/owner-execution.md",
+)
+# English imperatives plus the Korean forms the documents actually use.
+# Hangul lookarounds are the word boundary: 반드시 is an adverb (반드시성 is
+# not a directive); 금지 counts bare or conjugated (금지한다/금지된다/금지함)
+# but not as a compound noun head (금지어, 필수금지).
+DIRECTIVE_PATTERN = re.compile(
+    r"\b(?:must|never|always|shall|do not|don't)\b"
+    r"|(?<![가-힣])반드시(?![가-힣])"
+    r"|(?<![가-힣])금지(?=[한된됨되함]|(?![가-힣]))"
+    r"|해야(?:만)? 한다",
+    re.IGNORECASE,
+)
+_FENCE_OPEN = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+
+
+def strip_fenced_code(text: str) -> str:
+    """Drop fenced code blocks; an example of printed output is not a rule.
+
+    CommonMark rules: a fence closes only on the same character, at least as
+    long as the opener, with nothing but whitespace after it. A shorter fence
+    of the same character inside the block is content, not a closer.
+    """
+    kept: list[str] = []
+    fence: str | None = None
+    for line in text.splitlines():
+        match = _FENCE_OPEN.match(line)
+        if fence is None:
+            if match:
+                fence = match.group(1)
+                continue
+            kept.append(line)
+            continue
+        if (
+            match
+            and match.group(1)[0] == fence[0]
+            and len(match.group(1)) >= len(fence)
+            and not line[match.end():].strip()
+        ):
+            fence = None
+    return "\n".join(kept)
+
+
+_INLINE_CODE = re.compile(r"(`+)[^`\n]*?\1")
+
+
+def strip_inline_code(text: str) -> str:
+    """Drop `code spans`; `approval_policy=never` is a value, not a rule."""
+    return _INLINE_CODE.sub(" ", text)
+
+
+def count_directives(text: str) -> int:
+    return len(DIRECTIVE_PATTERN.findall(strip_inline_code(strip_fenced_code(text))))
+
+
+def measure(root: Path) -> dict[str, dict[str, int] | None]:
+    """Return {surface: {"bytes": n, "directives": n}} or None when missing."""
+    out: dict[str, dict[str, int] | None] = {}
+    for rel in SURFACES:
+        path = root / rel
+        if not path.is_file():
+            out[rel] = None
+            continue
+        raw = path.read_bytes()
+        out[rel] = {
+            "bytes": len(raw),
+            "directives": count_directives(raw.decode("utf-8", errors="replace")),
+        }
+    return out
+
+
+def load_budget(path: Path) -> dict:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if data.get("schema") != SCHEMA:
+        raise ValueError(f"budget schema must be {SCHEMA}")
+    surfaces = data.get("surfaces")
+    if not isinstance(surfaces, dict):
+        raise ValueError("budget must carry a surfaces object")
+    for rel, caps in surfaces.items():
+        if not isinstance(caps, dict) or not all(
+            isinstance(caps.get(k), int) and caps[k] >= 0 for k in ("bytes", "directives")
+        ):
+            raise ValueError(f"invalid caps for {rel}: {caps!r}")
+    if not isinstance(data.get("total_bytes"), int) or data["total_bytes"] < 0:
+        raise ValueError("budget must carry an integer total_bytes cap")
+    # The ceiling is a code constant; the file only echoes it for readers, and
+    # an echo that disagrees with the code is a second source of truth.
+    if data.get("ceiling_bytes") != TOTAL_BYTE_CEILING:
+        raise ValueError(
+            f"ceiling_bytes {data.get('ceiling_bytes')!r} != code ceiling {TOTAL_BYTE_CEILING}; reseal"
+        )
+    return data
+
+
+def check(root: Path, budget_path: Path, *, quiet: bool = False) -> list[str]:
+    """Return failure strings (empty == pass); print one row per surface."""
+    failures: list[str] = []
+    try:
+        budget = load_budget(budget_path)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return [f"budget-unreadable {budget_path}: {exc}"]
+    sealed = budget["surfaces"]
+    current = measure(root)
+
+    for rel in sorted(set(sealed) - set(SURFACES)):
+        failures.append(f"stale-budget-row {rel}: not a model-visible surface; remove it")
+
+    total_bytes = 0
+    cap_sum = 0
+    for rel in SURFACES:
+        caps = sealed.get(rel)
+        cur = current[rel]
+        if caps is None:
+            failures.append(f"unsealed-surface {rel}: add its row with --reseal")
+        if cur is None:
+            failures.append(f"missing-surface {rel}")
+            continue
+        total_bytes += cur["bytes"]
+        if caps is None:
+            continue
+        cap_sum += caps["bytes"]
+        status = "ok"
+        if cur["bytes"] > caps["bytes"]:
+            status = "over-bytes"
+            failures.append(
+                f"over-bytes {rel}: {cur['bytes']} > {caps['bytes']} "
+                f"(+{cur['bytes'] - caps['bytes']}); cut the same amount or more before adding"
+            )
+        if cur["directives"] > caps["directives"]:
+            status = "over-directives" if status == "ok" else status + "+directives"
+            failures.append(
+                f"over-directives {rel}: {cur['directives']} > {caps['directives']}; "
+                "move the rule into a machine check or retire one"
+            )
+        if not quiet:
+            print(
+                f"surface={rel} bytes={cur['bytes']}/{caps['bytes']} "
+                f"directives={cur['directives']}/{caps['directives']} status={status}"
+            )
+
+    total_cap = budget["total_bytes"]
+    if not quiet:
+        print(f"total bytes={total_bytes}/{total_cap} ceiling={TOTAL_BYTE_CEILING}")
+    if cap_sum > TOTAL_BYTE_CEILING:
+        failures.append(f"caps-exceed-ceiling {cap_sum} > {TOTAL_BYTE_CEILING}: per-surface caps were raised past the code ceiling")
+    if total_cap > TOTAL_BYTE_CEILING:
+        failures.append(f"total-cap-exceeds-ceiling {total_cap} > {TOTAL_BYTE_CEILING}")
+    if total_bytes > total_cap:
+        failures.append(f"over-total {total_bytes} > {total_cap}")
+    return failures
+
+
+def reseal(root: Path, budget_path: Path, *, reason: str | None, commit: str | None) -> list[str]:
+    """Rewrite caps to current measurements; raises need a reason."""
+    current = measure(root)
+    missing = [rel for rel, cur in current.items() if cur is None]
+    if missing:
+        return [f"missing-surface {rel}" for rel in missing]
+    previous: dict = {}
+    if budget_path.is_file():
+        try:
+            previous = load_budget(budget_path)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            return [f"budget-unreadable {budget_path}: {exc}"]
+    old_surfaces = previous.get("surfaces", {})
+    total = sum(cur["bytes"] for cur in current.values() if cur)
+    if total > TOTAL_BYTE_CEILING:
+        return [f"over-ceiling {total} > {TOTAL_BYTE_CEILING}: cannot seal a surface above the code ceiling"]
+
+    raises: list[dict] = []
+    for rel in SURFACES:
+        cur = current[rel]
+        old = old_surfaces.get(rel)
+        if old is None:
+            continue
+        for key in ("bytes", "directives"):
+            if cur[key] > old[key]:
+                raises.append({"surface": rel, "field": key, "from": old[key], "to": cur[key]})
+    old_total = previous.get("total_bytes")
+    if isinstance(old_total, int) and total > old_total:
+        raises.append({"surface": "*", "field": "total_bytes", "from": old_total, "to": total})
+    if raises and not reason:
+        return [
+            "raise-needs-reason " + ", ".join(f"{r['surface']}:{r['field']} {r['from']}->{r['to']}" for r in raises)
+            + "; pass --reason to record why the surface may grow"
+        ]
+
+    today = _dt.date.today().isoformat()
+    history = list(previous.get("history", []))
+    if raises:
+        history.append({"on": today, "commit": commit or "-", "reason": reason, "raised": raises})
+    data = {
+        "schema": SCHEMA,
+        "measurement": (
+            "UTF-8 bytes per surface; directives = matches of "
+            f"/{DIRECTIVE_PATTERN.pattern}/ (case-insensitive) outside fenced code blocks and inline code spans"
+        ),
+        "sealed_at": today,
+        "sealed_commit": commit or previous.get("sealed_commit", "-"),
+        "ceiling_bytes": TOTAL_BYTE_CEILING,
+        "total_bytes": total,
+        "surfaces": {rel: dict(current[rel]) for rel in SURFACES},  # type: ignore[arg-type]
+        "history": history,
+    }
+    budget_path.write_text(json.dumps(data, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
+    print(f"sealed surfaces={len(SURFACES)} total_bytes={total} raises={len(raises)} path={budget_path}")
+    return []
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--root", default=".", help="harness repository root")
+    parser.add_argument("--budget", default=BUDGET_FILE, help="budget file, relative to root by default")
+    parser.add_argument("--reseal", action="store_true", help="rewrite caps to the current measurement")
+    parser.add_argument("--reason", help="required when --reseal would raise any cap")
+    parser.add_argument("--commit", help="commit id to record with --reseal")
+    parser.add_argument("--quiet", action="store_true", help="print failures only")
+    args = parser.parse_args(argv)
+
+    root = Path(args.root).resolve()
+    budget_path = Path(args.budget)
+    if not budget_path.is_absolute():
+        budget_path = root / budget_path
+
+    if args.reseal:
+        failures = reseal(root, budget_path, reason=args.reason, commit=args.commit)
+    else:
+        failures = check(root, budget_path, quiet=args.quiet)
+    for line in failures:
+        print(f"FAIL: surface-budget {line}")
+    if not failures:
+        print("surface_budget=ok")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
