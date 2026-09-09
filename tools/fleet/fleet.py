@@ -175,8 +175,41 @@ def _collect_route(entities):
         return []
 
 
+def _arm_stall_dump():
+    """`kill -USR1 <fleet pid>` writes every thread's stack to a file.
+
+    When the TUI froze on 2026-09-09 there was no way to see where: this host sets
+    `ptrace_scope=1`, so strace and gdb cannot attach to a process that is not their own
+    child, and fleet had no way to answer for itself. Two freezes were diagnosed by
+    elimination instead of by reading the stack. This closes that gap for the next one.
+
+    The dump goes to a file rather than stderr because stderr is the curses screen.
+    Best-effort: a platform without SIGUSR1 simply gets no dump.
+    """
+    try:
+        import faulthandler
+        import signal
+        import tempfile
+    except ImportError:
+        return
+    if not hasattr(signal, "SIGUSR1"):
+        return
+    path = os.path.join(tempfile.gettempdir(), "fleet-stall-%d.txt" % os.getpid())
+    try:
+        # Held open for the process lifetime: the handler must not allocate or open
+        # anything while the process is wedged.
+        handle = open(path, "w", buffering=1)
+    except OSError:
+        return
+    try:
+        faulthandler.register(signal.SIGUSR1, file=handle, all_threads=True, chain=False)
+    except (OSError, RuntimeError, ValueError):
+        handle.close()
+
+
 def main(argv=None):
     args = parse_args(argv if argv is not None else sys.argv[1:])
+    _arm_stall_dump()
     hfilter = _harness_filter(args.harness)
     hearting = (installinfo.collect() if args.json or args.once
                 else installinfo.collect(fast_local=True))
