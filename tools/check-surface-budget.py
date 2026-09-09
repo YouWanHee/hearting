@@ -40,7 +40,7 @@ BUDGET_FILE = "tools/surface-budget.json"
 # without a reviewed rationale in that commit.
 #   2026-09-09 9c666bc2  420,908  kickoff seal
 #   2026-09-09 84215f45  397,795  completion-delivery carriers moved to ADAPTATION §7
-#   2026-09-09 (this)    361,173  §5.10 SD decision records moved to ADAPTATION §8
+#   2026-09-09 7271f92f  361,173  §5.10 SD decision records moved to ADAPTATION §8
 TOTAL_BYTE_CEILING = 361_173
 SURFACES: tuple[str, ...] = (
     "core/CORE.md",

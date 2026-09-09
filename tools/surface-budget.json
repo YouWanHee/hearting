@@ -2,9 +2,9 @@
  "schema": 1,
  "measurement": "UTF-8 bytes per surface; directives = matches of /\\b(?:must|never|always|shall|do not|don't)\\b|(?<![가-힣])반드시(?![가-힣])|(?<![가-힣])금지(?=[한된됨되함]|(?![가-힣]))|해야(?:만)? 한다/ (case-insensitive) outside fenced code blocks and inline code spans",
  "sealed_at": "2026-09-09",
- "sealed_commit": "296da9f0",
+ "sealed_commit": "7271f92f",
  "ceiling_bytes": 361173,
- "total_bytes": 361173,
+ "total_bytes": 361132,
  "surfaces": {
   "core/CORE.md": {
    "bytes": 25281,
@@ -19,7 +19,7 @@
    "directives": 72
   },
   "core/OPERATIONS.md": {
-   "bytes": 107477,
+   "bytes": 107440,
    "directives": 141
   },
   "core/HOOKS.md": {
@@ -35,8 +35,8 @@
    "directives": 26
   },
   "skills/autopilot-code/references/dev-pipeline.md": {
-   "bytes": 32990,
-   "directives": 39
+   "bytes": 32986,
+   "directives": 38
   },
   "skills/autopilot-code/references/owner-execution.md": {
    "bytes": 14832,

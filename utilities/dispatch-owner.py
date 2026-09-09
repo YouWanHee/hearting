@@ -65,8 +65,73 @@ _UNIT_REF = re.compile(r"^[a-z-]+/[a-z-]+$")
 _RESERVED_UNITS = {"_kernel/owner", "_kernel/resource"}
 
 
+# Everything the owner tuple needs that a sealed route already states. With
+# `--route-evidence` the caller passes only the prompt; an explicit flag still
+# wins, and one that contradicts a sealed field is refused typed rather than
+# forwarded to a wrapper that would refuse it later with less context.
+_ROUTE_FIELDS = {
+    "--worktree": "cwd", "--slug": "slug", "--capability": "capability",
+    "--capability-mode": "capability_mode", "--intensity": "effective_intensity",
+    "--model-profile": "owner_model_profile",
+}
+_ROUTE_SEALED = {"--worktree", "--capability", "--capability-mode", "--intensity"}
+_HINTS = {
+    "missing-required": "with --route-evidence <route.json> pass only --prompt-file <file> (or --prompt-text); "
+                        "without it: --worktree --slug --capability --capability-mode --qa <level> --intensity --dispatch-depth 1 "
+                        "--worker-type owner --owner <capability> --assigned-contract <capability> "
+                        "--model-profile deep|balanced-deep|balanced|light",
+    "route-evidence-arg-mismatch": "omit that flag or pass the route's own value; the route seals it",
+    "route-evidence-direct-route-has-no-owner": "a direct route runs inline; compose --shape solo (quick) or staged to get an owner",
+    "route-evidence-unreadable": "pass the route *file* printed by compose as route_file=, not the route id",
+    "explicit-adapter-outside-route-evidence": "drop --adapter; the route's sealed candidates decide. To change them, recompose: "
+                                               "solo/quick with --children <harness>, staged with --parent-harness <harness>",
+    "no-eligible-route-evidence-candidate": "no sealed candidate is usable: it is usage-limited, gated, or has no positive capacity score "
+                                            "(see eligibility.* and capacity_headroom.* above). Recompose the route for another harness "
+                                            "(solo/quick: --children <harness>; staged: --parent-harness <harness>) or wait for the reset",
+    "no-eligible-candidate": "no configured owner harness is usable: usage-limited, gated, or no positive capacity score "
+                             "(see eligibility.* and capacity_headroom.* above; utilities/usage-check.sh --harness all)",
+    "exactly-one-action-required": "pass exactly one of --dry-run | --register | --start",
+    "owner-tuple-required": "the launchable tuple is --dispatch-depth 1 --worker-type owner|review",
+    "invalid-model-profile": "--model-profile deep|balanced-deep|balanced|light",
+    "review-worker-unit-required": "--worker-type review needs --unit <catalog persona from roles/units/>",
+    "review-worker-route-evidence-unsupported": "a route node's reviewer is launched by stage dispatch; drop --route-evidence for an ad-hoc review worker",
+    "forbidden-flag": "model, reasoning, effort, variant and completion-delivery are sealed by the profile and route; remove the flag",
+}
+
+
+def hint_for(reason):
+    """One line that says what to type next; empty when no hint is known."""
+    key = str(reason).split(":", 1)[0]
+    return _HINTS.get(key, "")
+
+
 class OwnerError(ValueError):
     pass
+
+
+def _route_defaults(path):
+    """Owner-tuple values a sealed route states; None for fields it lacks."""
+    try:
+        route = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise OwnerError(f"route-evidence-unreadable:{exc}") from exc
+    if not isinstance(route, dict):
+        raise OwnerError("route-evidence-unreadable:not-an-object")
+    if route.get("effective_intensity") == "direct":
+        raise OwnerError("route-evidence-direct-route-has-no-owner")
+    capability = route.get("capability")
+    values = {flag: route.get(key) for flag, key in _ROUTE_FIELDS.items()}
+    values.update({
+        "--dispatch-depth": "1", "--worker-type": "owner",
+        "--owner": capability, "--assigned-contract": capability,
+    })
+    return {flag: (str(value) if value not in (None, "") else None) for flag, value in values.items()}
+
+
+def _same_value(flag, given, sealed):
+    if flag == "--worktree":
+        return _resolved_path(given) == _resolved_path(sealed)
+    return str(given) == str(sealed)
 
 
 def _sealed_owner_context(path):
@@ -258,7 +323,26 @@ def _parse(argv):
             continue
         forwarded.append(arg)
         i += 1
-    missing = sorted(flag for flag in _REQUIRED if not values.get(flag))
+    derived = []
+    required = set(_REQUIRED)
+    # Only a gap opens the route: a caller that spells out the whole tuple is
+    # parsed exactly as before and validated by the binding checks downstream.
+    gaps = [flag for flag in _REQUIRED if not values.get(flag)]
+    if route_evidence and gaps and values.get("--worker-type", "owner") == "owner":
+        for flag, sealed in _route_defaults(route_evidence).items():
+            if values.get(flag):
+                if flag in _ROUTE_SEALED and sealed is not None and not _same_value(flag, values[flag], sealed):
+                    raise OwnerError(f"route-evidence-arg-mismatch:{flag}")
+                continue
+            if sealed is None:
+                continue
+            values[flag] = sealed
+            forwarded.extend((flag, sealed))
+            derived.append(flag)
+        # The wrapper derives --qa from --intensity when it is absent
+        # (CONVENTIONS §1.1); a route-backed launch need not repeat it.
+        required.discard("--qa")
+    missing = sorted(flag for flag in required if not values.get(flag))
     if missing:
         raise OwnerError("missing-required:" + ",".join(missing))
     if len(actions) != 1:
@@ -302,7 +386,7 @@ def _parse(argv):
     # Equal-form required options are forwarded unchanged; split-form options
     # were appended above.  Selector-only --adapter/--route-evidence never
     # cross the boundary.
-    return explicit, values, forwarded, route_evidence
+    return explicit, values, forwarded, route_evidence, derived
 
 
 def _eligible(state):
@@ -408,13 +492,16 @@ def _audit(
 def _error(reason, configured=(), explicit=None, states=None):
     lines = _audit("unavailable", None, "none", configured, explicit, states or {})
     lines += [f"check=failed", f"reason={reason}", "child_spawned=0"]
+    hint = hint_for(reason)
+    if hint:
+        lines.append(f"hint={hint}")
     print("\n".join(lines))
     return 65
 
 
 def main(argv):
     try:
-        explicit, values, forwarded, route_evidence = _parse(argv)
+        explicit, values, forwarded, route_evidence, derived = _parse(argv)
         jobs = _authoritative_jobs(values, os.environ)
         profile = values["--model-profile"]
         sealed_context = _sealed_owner_context(route_evidence) if route_evidence else None
@@ -532,10 +619,8 @@ def main(argv):
                 allocation=allocation, counts=counts, rejected=rejected,
                 capacity=capacity, relief_promoted=relief_promoted,
             )))
-            print("check=failed\nreason=" + (
-                "no-eligible-route-evidence-candidate" if sealed is not None
-                else "no-eligible-candidate"
-            ) + "\nchild_spawned=0")
+            reason = "no-eligible-route-evidence-candidate" if sealed is not None else "no-eligible-candidate"
+            print(f"check=failed\nreason={reason}\nchild_spawned=0\nhint={hint_for(reason)}")
             return 65
         wrapper = ROOT / "adapters" / selected / "bin" / "dispatch-headless.py"
         if not os.access(wrapper, os.X_OK):
@@ -555,6 +640,7 @@ def main(argv):
                                   reason=reason, capacity=capacity,
                                   quality_band=quality_band,
                                   relief_promoted=relief_promoted)), flush=True)
+        print(f"route_defaults={','.join(derived) or 'none'}", flush=True)
         child_env = {
             key: value for key, value in os.environ.items() if not _MODEL_ENV.fullmatch(key)
         }

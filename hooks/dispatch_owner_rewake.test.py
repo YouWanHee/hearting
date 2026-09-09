@@ -799,6 +799,420 @@ class RegistryConfirmArmTest(unittest.TestCase):
         self.assertEqual(launch.attempt_id, "att-owner-b")
         self.assertEqual(launch.armed, "registry")
 
+    def _route_file(self, **fields) -> str:
+        import json as _json
+        path = self.root / f"route-{fields.get('slug', 'x')}.json"
+        path.write_text(_json.dumps({"slug": "cleanup-b", "cwd": "/repo", **fields}), encoding="utf-8")
+        return str(path)
+
+    def test_short_route_backed_start_narrows_a_wave_by_the_route_slug(self) -> None:
+        # Astra final review 2026-09-09 (M2): the two-flag launch carries no
+        # `--slug`/`--worktree` literal, so a filtered stdout plus a wave of
+        # same-session starts used to arm nothing. The route file the command
+        # names holds the same two values.
+        self.jobs.write_text(
+            self.row(attempt_id="att-owner-a", slug="cleanup-a")
+            + self.row(attempt_id="att-owner-b", slug="cleanup-b"),
+            encoding="utf-8",
+        )
+        route = self._route_file(slug="cleanup-b")
+        payload = self.payload()
+        payload["tool_input"] = {
+            "command": (
+                f"python3 utilities/dispatch-owner.py --start --route-evidence {route} "
+                "--prompt-file /tmp/brief.md | grep -E 'x'"
+            )
+        }
+        launch = rewake.registry_launch(payload)
+        self.assertIsNotNone(launch)
+        assert launch is not None
+        self.assertEqual(launch.attempt_id, "att-owner-b")
+        self.assertEqual(launch.armed, "registry")
+
+    def test_short_start_narrows_by_the_route_worktree_when_slugs_collide(self) -> None:
+        self.jobs.write_text(
+            self.row(attempt_id="att-owner-a", slug="same", worktree="/repo-a")
+            + self.row(attempt_id="att-owner-b", slug="same", worktree="/repo-b"),
+            encoding="utf-8",
+        )
+        route = self._route_file(slug="same", cwd="/repo-b")
+        payload = self.payload()
+        payload["tool_input"] = {
+            "command": f"python3 utilities/dispatch-owner.py --start --route-evidence {route} --prompt-file /b.md"
+        }
+        launch = rewake.registry_launch(payload)
+        assert launch is not None
+        self.assertEqual(launch.attempt_id, "att-owner-b")
+
+    def test_an_explicit_slug_literal_beats_the_route_slug(self) -> None:
+        self.jobs.write_text(
+            self.row(attempt_id="att-owner-a", slug="cleanup-a")
+            + self.row(attempt_id="att-owner-b", slug="cleanup-b"),
+            encoding="utf-8",
+        )
+        route = self._route_file(slug="cleanup-b")
+        payload = self.payload()
+        payload["tool_input"] = {
+            "command": (
+                f"python3 utilities/dispatch-owner.py --start --route-evidence {route} "
+                "--slug cleanup-a --prompt-file /b.md"
+            )
+        }
+        launch = rewake.registry_launch(payload)
+        assert launch is not None
+        self.assertEqual(launch.attempt_id, "att-owner-a")
+
+    def test_a_missing_variable_or_foreign_route_file_narrows_nothing(self) -> None:
+        self.jobs.write_text(
+            self.row(attempt_id="att-owner-a", slug="cleanup-a")
+            + self.row(attempt_id="att-owner-b", slug="cleanup-b"),
+            encoding="utf-8",
+        )
+        for evidence in (str(self.root / "absent.json"), '"$ROUTE_FILE"', "relative/route.json"):
+            with self.subTest(evidence=evidence):
+                payload = self.payload()
+                payload["tool_input"] = {
+                    "command": f"python3 utilities/dispatch-owner.py --start --route-evidence {evidence} --prompt-file /b.md"
+                }
+                self.assertIsNone(rewake.registry_launch(payload))
+        # a route naming a slug that matches no candidate stays ambiguous
+        route = self._route_file(slug="cleanup-z")
+        payload = self.payload()
+        payload["tool_input"] = {
+            "command": f"python3 utilities/dispatch-owner.py --start --route-evidence {route} --prompt-file /b.md"
+        }
+        self.assertIsNone(rewake.registry_launch(payload))
+
+    def test_an_explicit_but_non_literal_slug_is_never_replaced_by_the_route_slug(self) -> None:
+        # Fable cross-check B1: the selector honours an explicit --slug even
+        # when the hook sees it as "$SLUG2" or "", so the row this launch made
+        # does NOT carry the route's slug. Substituting the route slug here
+        # armed the *previous* attempt of the same route.
+        self.jobs.write_text(
+            self.row(attempt_id="att-first", slug="review-r1")
+            + self.row(attempt_id="att-second", slug="review-r2"),
+            encoding="utf-8",
+        )
+        route = self._route_file(slug="review-r1")
+        for explicit in ('--slug "$SLUG2"', "--slug=$SLUG2", '--slug ""'):
+            with self.subTest(explicit=explicit):
+                payload = self.payload()
+                payload["tool_input"] = {
+                    "command": (
+                        f"python3 utilities/dispatch-owner.py --start --route-evidence {route} "
+                        f"{explicit} --prompt-file /b.md | tail -3"
+                    )
+                }
+                self.assertIsNone(rewake.registry_launch(payload))
+
+    def test_a_repeated_route_evidence_reads_the_last_file_like_the_selector(self) -> None:
+        self.jobs.write_text(
+            self.row(attempt_id="att-first", slug="review-r1")
+            + self.row(attempt_id="att-second", slug="review-r2"),
+            encoding="utf-8",
+        )
+        first = self._route_file(slug="review-r1")
+        second = self._route_file(slug="review-r2")
+        payload = self.payload()
+        payload["tool_input"] = {
+            "command": (
+                f"python3 utilities/dispatch-owner.py --start --route-evidence {first} "
+                f"--route-evidence {second} --prompt-file /b.md"
+            )
+        }
+        launch = rewake.registry_launch(payload)
+        assert launch is not None
+        self.assertEqual(launch.attempt_id, "att-second")
+        # one non-literal occurrence disqualifies the whole option
+        payload["tool_input"] = {
+            "command": (
+                f"python3 utilities/dispatch-owner.py --start --route-evidence {first} "
+                '--route-evidence "$R2" --prompt-file /b.md'
+            )
+        }
+        self.assertIsNone(rewake.registry_launch(payload))
+
+    def test_one_explicit_axis_cannot_be_bypassed_by_a_route_implied_other_axis(self) -> None:
+        # codex R3 (2026-09-09): with the route's slug unique to an OLD row,
+        # an explicit --worktree that is a variable or mismatches, or an
+        # explicit --slug that is a variable or matches no row, used to let
+        # the route slug pick that old row and exit early.
+        self.jobs.write_text(
+            self.row(attempt_id="att-old", slug="review-r1", worktree="/repo-a")
+            + self.row(attempt_id="att-other", slug="other", worktree="/repo-b"),
+            encoding="utf-8",
+        )
+        route = self._route_file(slug="review-r1", cwd="/repo-a")
+        for explicit in ('--worktree "$WT2"', "--worktree /repo-b", '--slug "$SLUG2"', "--slug new-slug"):
+            with self.subTest(explicit=explicit):
+                payload = self.payload()
+                payload["tool_input"] = {
+                    "command": (
+                        f"python3 utilities/dispatch-owner.py --start --route-evidence {route} "
+                        f"{explicit} --prompt-file /b.md | tail -3"
+                    )
+                }
+                self.assertIsNone(rewake.registry_launch(payload))
+        # the plain short form still resolves to the row the route names
+        payload = self.payload()
+        payload["tool_input"] = {
+            "command": f"python3 utilities/dispatch-owner.py --start --route-evidence {route} --prompt-file /b.md | tail -3"
+        }
+        launch = rewake.registry_launch(payload)
+        assert launch is not None
+        self.assertEqual(launch.attempt_id, "att-old")
+
+    def test_three_candidates_and_a_route_launched_twice(self) -> None:
+        self.jobs.write_text(
+            self.row(attempt_id="att-a", slug="a", worktree="/repo-a")
+            + self.row(attempt_id="att-target", slug="t", worktree="/repo-t")
+            + self.row(attempt_id="att-b", slug="b", worktree="/repo-b"),
+            encoding="utf-8",
+        )
+        route = self._route_file(slug="t", cwd="/repo-t")
+        payload = self.payload()
+        payload["tool_input"] = {
+            "command": f"python3 utilities/dispatch-owner.py --start --route-evidence {route} --prompt-file /b.md"
+        }
+        launch = rewake.registry_launch(payload)
+        assert launch is not None
+        self.assertEqual(launch.attempt_id, "att-target")
+        # the same route started twice in the window stays ambiguous
+        self.jobs.write_text(
+            self.row(attempt_id="att-first", slug="t", worktree="/repo-t")
+            + self.row(attempt_id="att-second", slug="t", worktree="/repo-t"),
+            encoding="utf-8",
+        )
+        self.assertIsNone(rewake.registry_launch(payload))
+
+    def test_an_explicit_literal_that_matches_no_row_never_arms_another(self) -> None:
+        # property 2: even without a route file, a literal --slug naming no
+        # candidate must not fall through to a --worktree survivor.
+        self.jobs.write_text(
+            self.row(attempt_id="att-a", slug="a", worktree="/repo-x")
+            + self.row(attempt_id="att-b", slug="b", worktree="/repo-y"),
+            encoding="utf-8",
+        )
+        payload = self.payload()
+        payload["tool_input"] = {
+            "command": "python3 utilities/dispatch-owner.py --start --slug zzz --worktree /repo-x --prompt-file /b.md"
+        }
+        self.assertIsNone(rewake.registry_launch(payload))
+
+    def test_a_repeated_explicit_flag_is_read_last_wins_like_the_selector(self) -> None:
+        # OpenCode cross-check (2026-09-09): `--slug rev-a --slug rev-b` makes
+        # the selector and every wrapper launch `rev-b`; reading the first
+        # occurrence armed the previous attempt `rev-a`.
+        self.jobs.write_text(
+            self.row(attempt_id="att-old", slug="rev-a", worktree="/repo")
+            + self.row(attempt_id="att-true", slug="rev-b", worktree="/repo"),
+            encoding="utf-8",
+        )
+        route = self._route_file(slug="rev-b", cwd="/repo")
+        for tail in ("--slug rev-a --slug rev-b", "--slug=rev-a --slug=rev-b"):
+            with self.subTest(tail=tail):
+                payload = self.payload()
+                payload["tool_input"] = {
+                    "command": (
+                        f"python3 utilities/dispatch-owner.py --start --route-evidence {route} "
+                        f"--prompt-file /b.md {tail} | tail -3"
+                    )
+                }
+                launch = rewake.registry_launch(payload)
+                assert launch is not None
+                self.assertEqual(launch.attempt_id, "att-true")
+        # worktree axis, same rule
+        self.jobs.write_text(
+            self.row(attempt_id="att-old", slug="s", worktree="/repo-b")
+            + self.row(attempt_id="att-true", slug="s", worktree="/repo"),
+            encoding="utf-8",
+        )
+        payload = self.payload()
+        payload["tool_input"] = {
+            "command": "python3 utilities/dispatch-owner.py --start --slug s --worktree /repo-b --worktree /repo --prompt-file /b.md"
+        }
+        launch = rewake.registry_launch(payload)
+        assert launch is not None
+        self.assertEqual(launch.attempt_id, "att-true")
+        # one non-literal repeat disqualifies the axis and fails closed
+        payload["tool_input"] = {
+            "command": 'python3 utilities/dispatch-owner.py --start --slug s --worktree /repo --worktree "$WT" --prompt-file /b.md'
+        }
+        self.assertIsNone(rewake.registry_launch(payload))
+
+    def test_a_repeated_jobs_flag_arms_from_the_registry_the_launch_used(self) -> None:
+        # codex R5 B1 (2026-09-09): the selector and every wrapper store the
+        # last --jobs; the hook read the first and armed the previous
+        # attempt sitting in that other registry.
+        old = self.root / "old.log"; old.write_text(self.row(attempt_id="att-old", slug="true"), encoding="utf-8")
+        true = self.root / "true.log"; true.write_text(self.row(attempt_id="att-true", slug="true"), encoding="utf-8")
+        payload = self.payload()
+        payload["tool_input"] = {
+            "command": f"python3 utilities/dispatch-owner.py --start --jobs {old} --jobs {true} --slug true --worktree /repo | tail -3"
+        }
+        launch = rewake.registry_launch(payload)
+        assert launch is not None
+        self.assertEqual((launch.attempt_id, launch.jobs), ("att-true", true))
+        # one non-literal occurrence disqualifies the flag: no fallback to `old`
+        payload["tool_input"] = {
+            "command": f'python3 utilities/dispatch-owner.py --start --jobs {old} --jobs "$J" --slug true --worktree /repo'
+        }
+        launch = rewake.registry_launch(payload)
+        self.assertTrue(launch is None or launch.jobs != old)
+
+    def test_options_after_the_start_segment_never_narrow_it(self) -> None:
+        # codex R5 B2 (2026-09-09): `; echo --slug bait-b` after the start
+        # was read as the start's own --slug and armed the previous attempt.
+        self.jobs.write_text(
+            self.row(attempt_id="att-old", slug="bait-b", worktree="/repo")
+            + self.row(attempt_id="att-true", slug="true-a", worktree="/repo"),
+            encoding="utf-8",
+        )
+        route = self._route_file(slug="true-a", cwd="/repo")
+        base = f"python3 utilities/dispatch-owner.py --start --route-evidence {route} --prompt-file /b.md"
+        for tail in ("; echo --slug bait-b", "&& echo --slug bait-b", "|| echo --slug=bait-b",
+                     "| grep --worktree /elsewhere", "; echo --route-evidence /nowhere.json",
+                     f"; echo --jobs {self.root / 'absent.log'}"):
+            with self.subTest(tail=tail):
+                payload = self.payload()
+                payload["tool_input"] = {"command": f"{base} {tail}"}
+                launch = rewake.registry_launch(payload)
+                assert launch is not None, tail
+                self.assertEqual(launch.attempt_id, "att-true")
+        # a start after a foreign segment is still recognized on its own
+        payload = self.payload()
+        payload["tool_input"] = {"command": f"echo --slug bait-b ; {base}"}
+        launch = rewake.registry_launch(payload)
+        assert launch is not None
+        self.assertEqual(launch.attempt_id, "att-true")
+
+    def test_control_operators_without_whitespace_still_close_the_segment(self) -> None:
+        # codex R6 (2026-09-09): `... /b.md; echo --slug bait-b` left `/b.md;`
+        # as one shlex token, the segment never closed, and the next command's
+        # --slug armed the previous attempt.
+        self.jobs.write_text(
+            self.row(attempt_id="att-old", slug="bait-b", worktree="/repo")
+            + self.row(attempt_id="att-true", slug="true-a", worktree="/repo"),
+            encoding="utf-8",
+        )
+        route = self._route_file(slug="true-a", cwd="/repo")
+        base = f"python3 utilities/dispatch-owner.py --start --route-evidence {route} --prompt-file /b.md"
+        for tail in ("; echo --slug bait-b", ";echo --slug bait-b", "&&echo --slug bait-b",
+                     "||echo --slug=bait-b", "|grep --worktree /elsewhere", "&echo --slug bait-b",
+                     "\necho --slug bait-b"):
+            with self.subTest(tail=tail):
+                payload = self.payload()
+                payload["tool_input"] = {"command": f"{base}{tail}"}
+                launch = rewake.registry_launch(payload)
+                assert launch is not None, tail
+                self.assertEqual(launch.attempt_id, "att-true")
+        # a start that is the second segment, joined without whitespace
+        payload = self.payload()
+        payload["tool_input"] = {"command": f"echo --slug bait-b;{base}"}
+        launch = rewake.registry_launch(payload)
+        assert launch is not None
+        self.assertEqual(launch.attempt_id, "att-true")
+
+    def test_operators_inside_quotes_do_not_split_the_segment(self) -> None:
+        self.jobs.write_text(
+            self.row(attempt_id="att-old", slug="bait-b", worktree="/repo")
+            + self.row(attempt_id="att-true", slug="true-a", worktree="/repo"),
+            encoding="utf-8",
+        )
+        route = self._route_file(slug="true-a", cwd="/repo")
+        payload = self.payload()
+        payload["tool_input"] = {
+            "command": (
+                f"python3 utilities/dispatch-owner.py --start --route-evidence {route} "
+                "--prompt-text 'run a; b && c | d' --slug true-a"
+            )
+        }
+        launch = rewake.registry_launch(payload)
+        assert launch is not None
+        self.assertEqual(launch.attempt_id, "att-true")
+        # a quoted `; --slug bait-b` inside a value is content, not a segment
+        payload["tool_input"] = {
+            "command": (
+                f'python3 utilities/dispatch-owner.py --start --route-evidence {route} '
+                '--prompt-text "x; --slug bait-b" --slug true-a'
+            )
+        }
+        launch = rewake.registry_launch(payload)
+        assert launch is not None
+        self.assertEqual(launch.attempt_id, "att-true")
+
+    def test_jobs_followed_by_an_operator_without_whitespace_is_read_exactly(self) -> None:
+        old = self.root / "old.log"; old.write_text(self.row(attempt_id="att-oldjobs", slug="true"), encoding="utf-8")
+        true = self.root / "true.log"; true.write_text(self.row(attempt_id="att-true", slug="true"), encoding="utf-8")
+        payload = self.payload()
+        payload["tool_input"] = {
+            "command": f"python3 utilities/dispatch-owner.py --start --slug true --worktree /repo --jobs {true}; echo done"
+        }
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(old)}):
+            launch = rewake.registry_launch(payload)
+        assert launch is not None
+        self.assertEqual((launch.attempt_id, launch.jobs), ("att-true", true))
+
+    def test_a_utility_named_as_another_commands_argument_is_not_a_launch(self) -> None:
+        # codex R7 B1 (2026-09-09): `echo python3 …/dispatch-owner.py --start`
+        # runs only `echo`, yet the hook recognized a start and armed the
+        # session's prior open owner.
+        self.jobs.write_text(self.row(attempt_id="att-prior", slug="prior"), encoding="utf-8")
+        for command in (
+            f"echo python3 utilities/dispatch-owner.py --start --jobs {self.jobs}",
+            f"printf '%s' python3 utilities/dispatch-owner.py --start --jobs {self.jobs}",
+            f"cat utilities/dispatch-owner.py --start --slug prior",
+        ):
+            with self.subTest(command=command):
+                self.assertIsNone(rewake._recognized_start(command))
+                payload = self.payload()
+                payload["tool_input"] = {"command": command}
+                self.assertIsNone(rewake.registry_launch(payload))
+        # release: the supervisor named inside printf's arguments is no release
+        self.assertIsNone(rewake._recognized_release(
+            "printf '%s\\n' '{\"gate\":\"frame-review\"}' workflow-supervisor.py release --gate frame-review"))
+        self.assertIsNotNone(rewake._recognized_release(
+            "python3 utilities/workflow-supervisor.py release --gate frame-review --decision proceed"))
+
+    def test_assignment_and_env_prefixes_still_launch(self) -> None:
+        # the documented launch shape carries an assignment prefix
+        for command in (
+            "AGENT_ARTIFACT_ROOT=/r python3 utilities/dispatch-owner.py --start --slug s",
+            "A=1 B=2 python3 utilities/dispatch-owner.py --start --slug s",
+            "env A=1 python3 utilities/dispatch-owner.py --start --slug s",
+            "env -u X python3 utilities/dispatch-owner.py --start --slug s",
+            "2>/dev/null python3 utilities/dispatch-owner.py --start --slug s",
+            "python3 utilities/dispatch-owner.py --start --slug s",
+            "utilities/dispatch-owner.py --start --slug s",
+            "preflight.sh dispatch-owner --start --slug s",
+        ):
+            with self.subTest(command=command):
+                recognized = rewake._recognized_start(command)
+                assert recognized is not None, command
+                self.assertEqual(recognized[0], "dispatch-owner")
+                self.assertIn("--start", recognized[1])
+
+    def test_redirection_ampersands_and_substitutions_do_not_cut_the_start(self) -> None:
+        # codex R7 M1/M2: `2>&1`, `&>` and `$( ; )` / backticks are one word,
+        # not control operators; `cmd & echo` still is.
+        for command in (
+            "python3 utilities/dispatch-owner.py 2>&1 --start --slug s --prompt-file /b.md",
+            "python3 utilities/dispatch-owner.py &>/tmp/out --start --slug s --prompt-file /b.md",
+            "python3 utilities/dispatch-owner.py --start --slug s --prompt-file /b.md >/tmp/o 2>&1",
+            "python3 utilities/dispatch-owner.py --prompt-text $(echo x; echo y) --start --slug s",
+            "python3 utilities/dispatch-owner.py --prompt-text `echo x; echo y` --start --slug s",
+            "python3 utilities/dispatch-owner.py --prompt-text $(printf '%s' \"a && b\") --start --slug s",
+        ):
+            with self.subTest(command=command):
+                recognized = rewake._recognized_start(command)
+                assert recognized is not None, command
+                self.assertIn("--slug", recognized[1])
+                self.assertEqual(recognized[1][recognized[1].index("--slug") + 1], "s")
+        # a genuine background operator still separates
+        recognized = rewake._recognized_start("python3 utilities/dispatch-owner.py --start --slug s & echo --slug bait")
+        assert recognized is not None
+        self.assertNotIn("bait", recognized[1])
+
     def test_wave_narrowing_never_matches_an_unexpanded_variable_or_same_slug(self) -> None:
         rows = self.row(attempt_id="att-owner-a", slug="cleanup-a") + self.row(
             attempt_id="att-owner-b", slug="cleanup-a"
@@ -810,7 +1224,14 @@ class RegistryConfirmArmTest(unittest.TestCase):
             "command": "python3 utilities/dispatch-owner.py --start --slug cleanup-a"
         }
         self.assertIsNone(rewake.registry_launch(payload))
-        # An unexpanded shell variable is not a literal and narrows nothing.
+        # An unexpanded shell variable is not a literal and narrows nothing —
+        # also when a literal route file sits beside it (Fable B1 variant).
+        route = self._route_file(slug="cleanup-a")
+        payload = self.payload()
+        payload["tool_input"] = {
+            "command": f'python3 utilities/dispatch-owner.py --start --route-evidence {route} --slug "$SLUG"'
+        }
+        self.assertIsNone(rewake.registry_launch(payload))
         payload["tool_input"] = {
             "command": 'python3 utilities/dispatch-owner.py --start --slug "$SLUG"'
         }

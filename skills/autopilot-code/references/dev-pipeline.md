@@ -42,10 +42,9 @@ fallback, mutate the user's `.codex`, or weaken the sandbox. Only a
 always a registered-headless owner, so passing your own `interactive` transport is rejected at
 the probe, again at `capability-route.py compile`, and again at launch. `--parent-harness` must
 be the adapter the owner will actually run as; bind that decision by passing the compiled route
-to the launch, `dispatch-owner --route-evidence "$ROUTE_FILE" --start ...`, so the adapter
-cascade cannot select a harness the tuples never probed. Getting any of this wrong fails route
-compilation or owner selection before material work; it must never exhaust checked hops and then
-silently run the route inline.
+to the launch, `dispatch-owner --start --route-evidence <route_file> --prompt-file <brief>` (the
+route fills the rest), so the adapter cascade cannot select a harness the tuples never probed. Getting any of this wrong fails route
+compilation or owner selection before material work, never a silent inline run.
 For a Codex owner the generator automatically applies the prospective standard-owner network
 and exact registry check. A raw depth-0 `nested-headless` call without that context reports
 `prospective-owner-check-required`; it is not evidence that nested networking is unavailable.

@@ -116,8 +116,8 @@ entry's full loop or a promotion signal. Apply §0.3. `direct`/`solo`: one
 §0.4 card unless approved. Close with §0.5.
 
 An ordinary dispatch-depth-1 owner launches through `preflight.sh dispatch-owner
---dry-run|--register|--start`, a separate low-level surface from `preflight.sh
-dispatch` below: it delegates to the portable `utilities/dispatch-owner.py`
+--start --route-evidence <route.json> --prompt-file <brief>` (the route fills the
+owner tuple), a separate low-level surface from `preflight.sh dispatch` below: it delegates to the portable `utilities/dispatch-owner.py`
 selector, which prefers the user-owned
 `${XDG_CONFIG_HOME:-~/.config}/hearting/dispatch-defaults.yaml` and falls back
 to `profiles/dispatch-defaults.yaml`. The SD-22 cascade is explicit target,
