@@ -12,6 +12,7 @@ FLEET_S=importlib.util.spec_from_file_location("fleet_route",FLEET_P)
 FLEET_ROUTE=importlib.util.module_from_spec(FLEET_S); FLEET_S.loader.exec_module(FLEET_ROUTE)
 sys.path.insert(0,str(P.parent))
 import dispatch_contract as D
+import dispatch_runtime_support as RUNTIME_SUPPORT
 ALL=["atomic-outcome","known-scope","no-shared-contract","no-resource-run","no-artifact-handoff","no-independent-verifier","focused-verification"]
 
 DD_CONFIG_A="""schema_version: 1
@@ -1487,7 +1488,13 @@ class TestRoute(unittest.TestCase):
    root=Path(tmp); jobs=root/"jobs.log"; evidence=root/"result.md"
    route=R.compile_route(**self.args(artifact_root=root, requested_intensity="quick", predicates=[],
        inline_reason=None, registered_headless_evidence=self.registered_headless()))
-   self.assertIs(route["runtime_support"]["terminal_commit"],False)
+   # §13.53.2: the flag is no longer a hardcoded constant but a sealed verdict
+   # from the runtime-capability census. This test is about terminal identity,
+   # not the gate, so it only pins the type -- recomputing the value with the
+   # same helper would be a tautology, and comparing against a `config=None`
+   # probe would fail whenever an operator has set `runtime.terminal_commit`.
+   # The gate's real behavior is pinned in TerminalCommitSupportTests.
+   self.assertIsInstance(route["runtime_support"]["terminal_commit"],bool)
    node=route["nodes"][0]; attempt="att-terminal-current"
    subprocess.run([sys.executable,"-c","pass"],check=True)
    meta=dict(attempt_schema_version=2,dispatch_depth=1,transport="headless",
@@ -5235,6 +5242,122 @@ class OwnerRegisteredCompletionTest(unittest.TestCase):
    R.complete_node(route,node,node["id"],evidence,jobs=self.jobs,attempt_id="att-terminal-owner")
   self.assertEqual(self.jobs.read_bytes(),before)
   self.assertFalse((R.completion_dir(route["route_id"])/"prd-transaction.json").exists())
+
+
+
+class TerminalCommitSupportTests(unittest.TestCase):
+ """§13.53.2: activation is sealed as checked support, never a remembered switch.
+
+ The regression these pin: before this cycle the route emitted a hardcoded
+ `False` here, the Claude adapter only passes `--enable-terminal-commit` when
+ the route says `True`, and no surface could set it -- so the SD-120/121 fast
+ path was unreachable and A49-14 could not be run at all."""
+
+ def _compose(self,runtime_root,config_path="/nonexistent-dispatch-defaults"):
+  # Isolate from whatever the operator has configured on this machine: these
+  # fixtures assert what the *census* decides, so a real `runtime.terminal_commit`
+  # in the user's config must not reach them. Pointing at an absent path is the
+  # documented "no config" case.
+  with mock.patch.object(R.DEFAULTS,"default_config_path",return_value=config_path), \
+       mock.patch.object(R,"_validation_basis",
+                         return_value={"basis_version":R.VALIDATION_BASIS_VERSION,
+                                       "registry_root":str(R.TOPO.ROOT),
+                                       "unit_catalog_root":str(R.ROOT),
+                                       "runtime_root":str(runtime_root),
+                                       "runtime_root_validated":True,
+                                       "runtime_root_match":True}):
+   with tempfile.TemporaryDirectory() as artifacts:
+    return R.compose_route(slug="gate",capability="autopilot-code",capability_mode="dev",
+                           shape="direct",graph=None,cwd=str(R.ROOT),
+                           artifact_root=artifacts,spec_read="fixture",
+                           drift_verdict="fixture")
+
+ def test_a_runtime_publishing_the_whole_contract_opens_the_gate(self):
+  route=self._compose(R.ROOT)
+  self.assertIs(route["runtime_support"]["terminal_commit"],True)
+
+ def test_a_runtime_missing_the_lock_order_table_keeps_it_closed(self):
+  """§13.53.4(3): the fence contract may not be claimed before the table is
+  registered, so a runtime without it must not activate."""
+  with tempfile.TemporaryDirectory() as tmp:
+   root=Path(tmp)
+   for relative,_ in RUNTIME_SUPPORT.REQUIRED_SURFACES:
+    target=root/relative; target.parent.mkdir(parents=True,exist_ok=True)
+    shutil.copy2(R.ROOT/relative,target)
+   (root/"utilities/dispatch_lock_order.py").unlink()
+   self.assertIs(self._compose(root)["runtime_support"]["terminal_commit"],False)
+
+ def test_an_unreadable_runtime_root_fails_closed(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   self.assertIs(self._compose(Path(tmp)/"absent")["runtime_support"]["terminal_commit"],False)
+
+ def test_the_contract_names_come_from_one_source(self):
+  route=self._compose(R.ROOT)
+  support=route["runtime_support"]
+  self.assertEqual(support["terminal_commit_contract"],RUNTIME_SUPPORT.TERMINAL_COMMIT_CONTRACT)
+  self.assertEqual(support["terminal_handoff_contract"],RUNTIME_SUPPORT.TERMINAL_HANDOFF_CONTRACT)
+  self.assertEqual(support["producer_binding_contract"],RUNTIME_SUPPORT.PRODUCER_BINDING_CONTRACT)
+
+ def _compose_with_config(self,text):
+  with tempfile.TemporaryDirectory() as tmp:
+   path=Path(tmp)/"dispatch-defaults.yaml"; path.write_text(text,encoding="utf-8")
+   return self._compose(R.ROOT,config_path=str(path))
+
+ def _shipped_v4(self):
+  base=Path(R.ROOT/"profiles"/"dispatch-defaults.yaml").read_text(encoding="utf-8")
+  return base.replace("schema_version: 3","schema_version: 4",1)
+
+ def test_operator_off_closes_the_gate_on_a_complete_runtime(self):
+  route=self._compose_with_config(self._shipped_v4()+"\nruntime:\n  terminal_commit: off\n")
+  self.assertIs(route["runtime_support"]["terminal_commit"],False)
+
+ def _gate_never_opens(self,text,label):
+  """A damaged config must never produce an open gate.
+
+  Two refusals are acceptable and both are safe: `_seal_dispatch_defaults`
+  rejects the whole compile (no route exists at all), or the seal itself
+  returns `False`. What must never happen is a route sealed `True`."""
+  try:
+   route=self._compose_with_config(text)
+  except ValueError as exc:
+   self.assertIn("dispatch-defaults",str(exc),label)
+   return "refused-compile"
+  self.assertIs(route["runtime_support"]["terminal_commit"],False,label)
+  return "sealed-false"
+
+ def test_an_off_switch_survives_an_unrelated_invalid_key_in_the_same_file(self):
+  """B1 regression. A config that exists but fails validation must not be
+  treated as *no* config: falling back to the default would discard the
+  operator's `off` precisely when the file is damaged -- the one moment they
+  are most likely to have reached for the switch."""
+  self._gate_never_opens(
+      self._shipped_v4()+"\nruntime:\n  terminal_commit: off\nbogus_top_level: 1\n",
+      "off + unrelated invalid key")
+
+ def test_an_unrecognised_switch_value_closes_rather_than_opens(self):
+  """B1 regression, second shape."""
+  self._gate_never_opens(self._shipped_v4()+"\nruntime:\n  terminal_commit: bogus\n",
+                         "unrecognised switch value")
+
+ def test_an_unreadable_config_file_closes_the_gate(self):
+  self._gate_never_opens("schema_version: [\n","unparsable config")
+
+ def test_the_seal_helper_itself_is_fail_closed_on_an_invalid_config(self):
+  """The compile-level refusal above is one layer; pin the helper directly too,
+  since it is reachable independently of `_seal_dispatch_defaults`."""
+  with tempfile.TemporaryDirectory() as tmp:
+   path=Path(tmp)/"dispatch-defaults.yaml"
+   path.write_text(self._shipped_v4()+"\nruntime:\n  terminal_commit: bogus\n",encoding="utf-8")
+   with mock.patch.object(R.DEFAULTS,"default_config_path",return_value=str(path)):
+    self.assertFalse(R._seal_terminal_commit_support({"runtime_root":str(R.ROOT)}))
+
+ def test_the_gate_value_is_sealed_into_the_route_hash(self):
+  """A route whose declared support differs is a different route: the adapter
+  reads the flag from the file, so it must not be mutable after sealing."""
+  route=self._compose(R.ROOT)
+  self.assertEqual(route["route_hash"],R.route_hash(route))
+  forged=json.loads(json.dumps(route)); forged["runtime_support"]["terminal_commit"]=False
+  self.assertNotEqual(R.route_hash(forged),route["route_hash"])
 
 
 if __name__=="__main__": unittest.main()

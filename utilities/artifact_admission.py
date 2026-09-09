@@ -31,6 +31,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import artifact_index
 import artifact_locator
 import artifact_manifest
+import dispatch_lock_order
 from artifact_identity import IdAllocator, RootIdentity
 from artifact_manifest import Violation
 
@@ -221,6 +222,12 @@ def _acquire_lock(root: Path, timeout: float, now: Optional[float] = None) -> in
                     # The lock file stays empty and is unlinked on release: the
                     # flock is the exclusivity, and a rejected admission leaves
                     # every byte of the root unchanged.
+                    # PRD §13.53.4(3): declare the acquisition against the
+                    # canonical lock-order table. A re-entry or a reverse
+                    # acquisition is refused here, typed and immediately,
+                    # rather than blocking on `flock` until the admission
+                    # timeout turns a contract violation into a "busy" report.
+                    dispatch_lock_order.enter("producer-admission")
                     result_fd, fd = fd, -1  # ownership transferred to caller
                     return result_fd
         finally:
@@ -240,6 +247,7 @@ def _acquire_lock(root: Path, timeout: float, now: Optional[float] = None) -> in
 
 
 def _release_lock(root: Path, fd: int) -> None:
+    dispatch_lock_order.leave("producer-admission")
     # Unlink before unlocking, while exclusivity still holds; a waiter that
     # locked the old inode fails its path/inode verification and retries.
     # Unlink only when the path still names this holder's inode, so a release

@@ -53,6 +53,7 @@ import artifact_lifecycle  # noqa: E402
 import artifact_locator  # noqa: E402
 import artifact_manifest  # noqa: E402
 import route_identity  # noqa: E402
+import dispatch_lock_order  # noqa: E402
 import dispatch_terminal_commit  # noqa: E402
 from dispatch_contract import (  # noqa: E402
     _PROCESS_IDENTITY_METADATA_KEYS,
@@ -2126,6 +2127,15 @@ def finalize(
         raise ProducerError("finalize-state-invalid", state)
     if _admission_lock_fd is not None:
         raise ProducerError("finalize-reentry-forbidden", cycle_id)
+    # PRD §13.53.4(3) names the producer admission mutex as the lock that must
+    # be released before `finalize()` is entered. The check above only catches
+    # a caller that *passes* its fd; a caller holding the lock in its own
+    # variable would otherwise block on `flock` for the full admission timeout
+    # and surface as "busy". Refuse it here, typed, at the boundary.
+    try:
+        dispatch_lock_order.assert_not_held("producer-admission", "producer-finalize")
+    except dispatch_lock_order.LockOrderError as error:
+        raise ProducerError("finalize-reentry-forbidden", error.detail or cycle_id) from error
     alloc = allocator or artifact_identity.IdAllocator()
     lock_fd = _admission_lock_fd
     owns_lock = lock_fd is None

@@ -19,6 +19,7 @@ from contextlib import contextmanager
 import artifact_lifecycle
 import route_identity
 import dispatch_contract
+import dispatch_lock_order
 
 _TOPOLOGY = None
 
@@ -240,8 +241,12 @@ def _jobs_lock(jobs: Path):
     lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     with lock_path.open("a+") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        # PRD §13.53.4(3): rank 2 of the canonical table. Declaring it here is
+        # what makes "the producer lock is never held when the jobs lock is
+        # taken" a checked property rather than a comment.
         try:
-            yield handle
+            with dispatch_lock_order.acquired("jobs"):
+                yield handle
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
@@ -257,7 +262,11 @@ def _advance_state(path: Path, commit_id: str, expected_from: str, to_state: str
     with (path.parent / "state.lock").open("a+") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
-            return _advance_state_locked(path, commit_id, expected_from, to_state, receipts)
+            # Rank 4 of the canonical table: declaring it is what makes "this
+            # CAS is taken only after the producer lock was released" checkable
+            # rather than a comment two modules away.
+            with dispatch_lock_order.acquired("terminal-commit-state"):
+                return _advance_state_locked(path, commit_id, expected_from, to_state, receipts)
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
