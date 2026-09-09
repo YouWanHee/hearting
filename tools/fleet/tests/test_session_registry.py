@@ -503,5 +503,61 @@ class ManagedGatewayRegistryTest(unittest.TestCase):
             self.assertNotEqual(call.args[1], 90003)
 
 
+class ResumeAliasTest(unittest.TestCase):
+    """Prior session ids a resume/fork left behind, derived from the live process's own
+    argv. Measured 2026-09-09: pid 2979449 ran
+    `… --session-id 6044eb9f-… --fork-session --resume …/2b091520-….jsonl`, and the peer
+    ledger held that conversation's receipts under BOTH ids — the older one carrying the
+    sender identity the newer one lacked. Nothing on disk records the equivalence."""
+
+    _NEW = "6044eb9f-7983-4c41-9b86-0bb2b70638fa"
+    _OLD = "2b091520-0afd-4334-a04f-4511d4debf6e"
+
+    def test_resume_path_stem_becomes_an_alias(self):
+        argv = ["claude", "--session-id", self._NEW, "--fork-session",
+                "--resume", "/home/u/.claude/projects/-x/%s.jsonl" % self._OLD]
+        self.assertEqual(session_registry.session_aliases("claude", 1, argv=argv), [self._OLD])
+
+    def test_bare_resume_id_is_accepted_too(self):
+        argv = ["claude", "--resume", self._OLD, "--session-id", self._NEW]
+        self.assertEqual(session_registry.session_aliases("claude", 1, argv=argv), [self._OLD])
+
+    def test_a_session_is_never_its_own_alias(self):
+        argv = ["claude", "--session-id", self._NEW, "--resume", "%s.jsonl" % self._NEW]
+        self.assertEqual(session_registry.session_aliases("claude", 1, argv=argv), [])
+
+    def test_non_uuid_resume_values_are_ignored(self):
+        for value in ("--last", "/x/latest.jsonl", "../../etc/passwd", ""):
+            argv = ["claude", "--session-id", self._NEW, "--resume", value]
+            self.assertEqual(session_registry.session_aliases("claude", 1, argv=argv), [])
+
+    def test_alias_history_is_bounded(self):
+        argv = ["claude"]
+        for index in range(20):
+            argv += ["--resume", "%08x-0000-4000-8000-000000000000" % index]
+        aliases = session_registry.session_aliases("claude", 1, argv=argv)
+        self.assertEqual(len(aliases), session_registry._MAX_ALIASES)
+        self.assertEqual(len(set(aliases)), len(aliases))
+
+    def test_support_is_declared_per_harness_and_gates_derivation(self):
+        self.assertEqual(session_registry.alias_support("claude"), "proc-argv")
+        for harness in ("codex", "opencode"):
+            self.assertEqual(session_registry.alias_support(harness), "not-implemented")
+            argv = ["x", "--session-id", self._NEW, "--resume", "%s.jsonl" % self._OLD]
+            self.assertEqual(session_registry.session_aliases(harness, 1, argv=argv), [])
+        with self.assertRaises(ValueError):
+            session_registry.alias_support("nope")
+
+    def test_unreadable_process_is_silence_not_an_error(self):
+        self.assertEqual(session_registry.session_aliases("claude", 2 ** 30), [])
+        self.assertEqual(session_registry.session_aliases("claude", "not-a-pid"), [])
+
+    def test_claude_write_contract_is_untouched(self):
+        """Aliases are derived, never written — the runtime-native record stays read-only."""
+        self.assertEqual(session_registry.writer_support("claude"), "runtime-native")
+        with self.assertRaises(session_registry.RegistryWriteUnsupported):
+            session_registry.write("claude", 1, {"status": "idle"})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -8,6 +8,13 @@
 # Apply this fragment with `adapters/codex/bin/preflight.sh tui-config`, or
 # merge the two keys manually if you do not want a script to edit config.toml.
 
+# 2026-09-09 사용자 결정: 상태줄은 제목만 진다. 세션 식별(`[3a] codex`)과 감독 표식은
+# herdr pane 상단 제목이 소유한다 — 하네스마다 다른 내부 상태줄에서 억지로 신원을 맞추는
+# 대신, 세 하네스가 공유하는 바깥 표면 하나에 둔다. 그래서 pane 이 이미 말하는 위치 정보
+# (`project-name`, `current-dir`)를 빼고 `thread-title` 을 제목 자리로 둔다. 나머지는
+# Claude statusline 과 같은 운영 telemetry 집합(branch/context/model/limits)이다.
+# `thread-title` 은 설치본 codex 0.153.4 의 status_line 항목 enum 에 있다(실측).
+
 [tui]
-status_line = ["project-name", "git-branch", "context-used", "current-dir", "model-with-reasoning", "five-hour-limit", "weekly-limit"]
+status_line = ["thread-title", "git-branch", "context-used", "model-with-reasoning", "five-hour-limit", "weekly-limit"]
 status_line_use_colors = true

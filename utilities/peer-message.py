@@ -59,30 +59,20 @@ _PEER_TRAILER_RE = re.compile(
 
 
 def peer_alias(harness, session_id):
-    """Fleet's display tag only; never resolve a tag/name/pane back to an id."""
+    """Fleet's display tag only; never resolve a tag/name/pane back to an id.
+
+    The badge rule itself lives in ``fleet.session_handle.resolve_tag`` — the trailer and
+    the board have to agree on what `[46]` means, so there is one definition, not a copy
+    here that can drift away from the one Fleet draws.
+    """
     if not usable_session_id(session_id):
         return "[?]"
     try:
         tools = str(Path(__file__).resolve().parents[1] / "tools")
         if tools not in sys.path:
             sys.path.insert(0, tools)
-        from fleet.session_handle import minted_tag, derived_tag
-        from fleet.titles import read_tag
-        tag = None
-        if harness in ("codex", "opencode"):
-            tag = minted_tag(session_id)
-        elif harness == "claude":
-            home = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
-            for path in (home / "sessions").glob("*.json"):
-                try:
-                    rec = json.loads(path.read_text(encoding="utf-8"))
-                    if rec.get("sessionId") == session_id and rec.get("nameSource") == "derived":
-                        tag = derived_tag(rec.get("name"))
-                        if tag:
-                            break
-                except (OSError, ValueError, AttributeError):
-                    continue
-            tag = tag or read_tag(session_id, harness="claude")
+        from fleet.session_handle import resolve_tag
+        tag = resolve_tag(harness, session_id)
         return f"[{tag}]" if isinstance(tag, str) and re.fullmatch(r"[0-9a-f]{2}", tag) else "[?]"
     except Exception:
         return "[?]"
