@@ -3594,31 +3594,107 @@ def _subagent_strip(subs, depth=0, in_card=False, term_width=None):
                         lambda: build(False, False, False)], term_width)]
 
 
-def _peer_link_strip(last_recv, term_width=None, depth=0, in_card=False):
-    """F-101a/b peer relation strip; caller has already proved endpoint visibility.
+# The icon says WHAT the relation is, the arrow says which WAY it points. User decision
+# 2026-09-09 ("위 아래로 표시하면 앞뒤 화살표는 왜 있는거임?") — the two must not encode
+# the same thing twice, so no glyph ever varies by direction.
+_ICON_PEER = "✉"
+_ICON_STEWARD = "⚑"
 
-    Claude native envelopes can lack the sender id, so that path remains a counter-only
-    fail-soft projection rather than guessing an endpoint.
+
+_PEER_NAME_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
+
+def _peer_name_is_readable(name):
+    """True when the ledger's `name` is something a person can act on.
+
+    The name slot is whatever the sending side wrote, and older send paths put machine
+    addresses in it — the board printed `✉ → uds:/run/user/1002/cc-socks/2952102.sock`
+    from a real record. A transport address or a bare session id names nothing the user
+    can look up, so it is worse than the `claude:01a084f7` fallback: it is the same
+    non-information, but longer and pretending to be a name.
+
+    Deliberately a small denylist, not a guess at what a "real" name looks like: session
+    names here are free-form and often Korean prose, so anything not recognizably a
+    machine address has to pass.
     """
-    if not last_recv or not last_recv.get("from_session_id"):
+    if not isinstance(name, str):
+        return False
+    text = name.strip()
+    if not text:
+        return False
+    if _PEER_NAME_UUID_RE.match(text):
+        return False                       # the raw session id pasted into the name slot
+    if text.startswith("/") or "://" in text:
+        return False                       # a path or a URL
+    scheme = text.split(":", 1)[0]
+    if scheme and scheme.isascii() and scheme.isalpha() and ":/" in text:
+        return False                       # uds:/…, unix:/…, and friends
+    return True
+
+
+def _peer_endpoint_segs(harness, session_id, name, tag_by_key):
+    """Name the session at the other end of a relation, best evidence first.
+
+    `[46] claude` when that session is also a row on this board — the badge is the thing
+    the user can actually look up. Otherwise the ledger's own display name, and only then
+    `claude:01a084f7`. Never the full session id: `← 01a084f7-63f2-7961-ae60-6fc2d8e60fc2`
+    is what the board printed before this (the collector used to paste the raw id into the
+    name slot), and it names nothing a person can act on.
+    """
+    harness = str(harness or "").lower()
+    sid = session_id if isinstance(session_id, str) and session_id else None
+    tag = (tag_by_key or {}).get((harness, sid)) if sid else None
+    if tag:
+        return [("[", "dim"), (str(tag), "tag"), ("]", "dim"),
+                (" " + (harness or "peer"), "dim")]
+    if _peer_name_is_readable(name):
+        return [(name.strip(), "dim")]
+    if sid:
+        return [("%s:%s" % (harness or "peer", sid[:8]), "dim")]
+    return [(harness, "dim")] if harness else []
+
+
+def _peer_link_strip(entry, tag_by_key=None, term_width=None, depth=0, in_card=False,
+                     direction="recv"):
+    """One peer message as `✉ → …` (sent) or `✉ ← …` (received).
+
+    Drawn whenever the ledger has the relation — NOT only when the other endpoint also
+    happens to be rendered this tick. That visibility gate is what made the same received
+    message appear on one tick and vanish on the next (user 2026-09-09: "받는 세션도 좀
+    이상하긴하네 일관성이 없고"); the endpoint's presence now only decides how it is
+    LABELLED, never whether the relation exists. Exact `(harness, session_id)` remains the
+    ledger's own identity key — this is the display layer relaxing, not the contract.
+    """
+    if not entry:
         return []
+    if direction == "sent":
+        arrow, harness = "→", entry.get("to_harness")
+        sid, name = entry.get("to_session_id"), entry.get("to_name")
+    else:
+        arrow, harness = "←", entry.get("from_harness")
+        sid, name = entry.get("from_session_id"), entry.get("from_name")
+    endpoint = _peer_endpoint_segs(harness, sid, name, tag_by_key)
+    if not endpoint:
+        return []          # a record naming no endpoint at all is not a relation
     indent = _conn_indent(depth, in_card)
-    name = last_recv.get("from_name") or "peer"
-    kind = last_recv.get("kind") or ""
-    age = fmt_min(last_recv.get("age_min") or 0)
+    kind = entry.get("kind") or ""
+    age = fmt_min(entry.get("age_min") or 0)
+
     def build(include_kind=True, include_age=True):
-        bits = [indent, "←", " ", name]
+        segs = [(indent, None), (_ICON_PEER, "dim"), (" ", None), (arrow, "dim"), (" ", None)]
+        segs += list(endpoint)
         if include_kind and kind:
-            bits += [" · ", kind]
+            segs.append((" · " + kind, "dim"))
         if include_age:
-            bits += [" · ", age]
-        return [(bits[0], None)] + [(part, "dim") for part in bits[1:]]
+            segs.append((" · " + age, "dim"))
+        return segs
     return [_fit_strip([lambda: build(True, True), lambda: build(True, False),
                         lambda: build(False, False)], term_width)]
 
 
 def _steward_link_strip(targets, tag_by_key, term_width=None, depth=0, in_card=False):
-    """F-101d exact-join child tags with front-preserving bounded folding."""
+    """F-101d — `⚑ → [13] [90] [26]`: the sessions this steward watches."""
     tags = []
     for target in targets or []:
         sid = target.get("session_id")
@@ -3632,7 +3708,7 @@ def _steward_link_strip(targets, tag_by_key, term_width=None, depth=0, in_card=F
         return []
     indent = _conn_indent(depth, in_card)
     def build(count):
-        segs = [(indent, None), ("→", "dim")]
+        segs = [(indent, None), (_ICON_STEWARD, "dim"), (" ", None), ("→", "dim")]
         for tag in tags[:count]:
             segs.extend([(" [", "dim"), (tag, "tag"), ("]", "dim")])
         rest = len(tags) - count
@@ -3646,6 +3722,37 @@ def _steward_link_strip(targets, tag_by_key, term_width=None, depth=0, in_card=F
         if sum(_dw(text) for text, _key in segs) <= term_width:
             return [segs]
     return [_clip_segs(build(0), term_width)[0]]
+
+
+def _steward_parent_strip(parents, tag_by_key, term_width=None, depth=0, in_card=False):
+    """`⚑ ← [b0] claude`: the session watching THIS one.
+
+    The steward relation was recorded on one side only, so a watched session had no way
+    to show who was watching it (user 2026-09-09). The reverse index is derived from the
+    very same read-only markers, so this line can never claim a relation the steward's own
+    `⚑ →` line does not also show.
+    """
+    if not parents:
+        return []
+    indent = _conn_indent(depth, in_card)
+
+    def build(count):
+        segs = [(indent, None), (_ICON_STEWARD, "dim"), (" ", None), ("←", "dim")]
+        for parent in parents[:count]:
+            segs.append((" ", None))
+            segs += _peer_endpoint_segs(parent.get("harness"), parent.get("session_id"),
+                                        parent.get("name"), tag_by_key)
+        rest = len(parents) - count
+        if rest:
+            segs.append((" +%d" % rest, "dim"))
+        return segs
+    if not term_width:
+        return [build(len(parents))]
+    for count in range(len(parents), 0, -1):
+        segs = build(count)
+        if sum(_dw(text) for text, _key in segs) <= term_width:
+            return [segs]
+    return [_clip_segs(build(1), term_width)[0]]
 
 
 def _plugin_agent_row(job, orphan=False, term_width=None):
@@ -5678,24 +5785,26 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
 
     emission_by_group = {name: _group_emission(groups[name], show_sessions, show_jobs)
                          for name in order}
-    emitted_session_keys = set()
     tag_by_key = {}
     for emission in emission_by_group.values():
         for s in emission["shown"]:
             sid = getattr(s, "session_id", None)
             if not sid:
                 continue
-            key = (str(getattr(s, "harness", "") or "").lower(), sid)
-            emitted_session_keys.add(key)
-            if getattr(s, "session_tag", None):
-                tag_by_key[key] = s.session_tag
+            harness = str(getattr(s, "harness", "") or "").lower()
+            # A resumed session is one row wearing one badge, but the ledger may still
+            # address it by the id it had before the resume — so every alias points at
+            # the same badge and the relation is labelled instead of going anonymous.
+            for identity in [sid] + list(getattr(s, "session_aliases", None) or []):
+                if getattr(s, "session_tag", None):
+                    tag_by_key[(harness, identity)] = s.session_tag
 
     # The product identity is a distinct, quiet title block. Keep one breathing row
     # before account usage begins instead of letting the two metadata zones touch.
     lines = _top_rows(term_width, narrow)
     _seen_glyphs = set()
-    # F-98b: the peer-message subtitle only makes sense between two sessions BOTH on
-    # screen this tick — an off-screen peer still counts toward recv, but gets no line.
+    # F-98b's "both endpoints on screen" rule is retired (user 2026-09-09): an off-screen
+    # peer now gets the same line, labelled by name or `<harness>:<sid8>` instead of a tag.
     # F-12(c) legend glyph-appearance tracking — LOCAL to this call (never module/global state,
     # _OFFSET invariant R3): which of the conditional legend glyphs actually got emitted this
     # build. working/idle/dispatch/`~` stay unconditional (always relevant vocabulary); the
@@ -6260,14 +6369,19 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
             session_resources = _gpu_resources_for_session(s, gpu_resources)
             if session_resources:
                 lines.extend(_gpu_resource_strip(session_resources, term_width=term_width))
+            _peer_sent_entry = getattr(s, "peer_last_sent", None)
+            if _peer_sent_entry:
+                lines.extend(_peer_link_strip(_peer_sent_entry, tag_by_key,
+                                              term_width=term_width, direction="sent"))
             if _peer_last:
-                peer_key = (str(_peer_last.get("from_harness") or "").lower(),
-                            _peer_last.get("from_session_id"))
-                if _peer_last.get("from_session_id") and peer_key in emitted_session_keys:
-                    lines.extend(_peer_link_strip(_peer_last, term_width=term_width))
+                lines.extend(_peer_link_strip(_peer_last, tag_by_key,
+                                              term_width=term_width, direction="recv"))
             if getattr(s, "steward", False):
                 lines.extend(_steward_link_strip(getattr(s, "steward_targets", None) or [],
                                                  tag_by_key, term_width=term_width))
+            if getattr(s, "steward_parents", None):
+                lines.extend(_steward_parent_strip(s.steward_parents, tag_by_key,
+                                                   term_width=term_width))
             for plugin_job in plugin_kids:
                 lines.extend(_plugin_agent_row(plugin_job, term_width=term_width))
             for i, cj in enumerate(dispatch_kids):

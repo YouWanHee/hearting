@@ -330,6 +330,16 @@ class Session:
     peer_sent_1h: int = 0                 # F-98a snapshot-owned; render never reads the ledger
     peer_recv_1h: int = 0
     peer_last_recv: Optional[dict] = None # {from_name, from_session_id, from_harness, kind, age_min} — NO summary, NO body
+    # Symmetric send side of the same projection: the receive strip alone made the board
+    # say who talked to you but never who you talked to. Same shape, `to_*` keys.
+    peer_last_sent: Optional[dict] = None # {to_name, to_session_id, to_harness, kind, age_min}
+    # Prior session ids this same live process still answers to after a resume/fork
+    # (`session_registry.session_aliases`). DISPLAY JOIN ONLY — never a ledger address,
+    # a `report-agent-session` value, or a completion/wake recipient.
+    session_aliases: Optional[list] = None
+    # Reverse of `steward_targets`: the sessions whose steward marker names THIS session.
+    # Derived from the same read-only markers, so a target can finally show who watches it.
+    steward_parents: Optional[list] = None
     mem_worker: bool = False   # Memory worker or title refresher; summarized and hidden by default.
     # F-29 (v9, prd.md:290-295) — enrichment ONLY, never a session-existence signal (prd.md:291).
     # None = source absent/unconfirmed (honest gap, prd.md:292's "no guessing"); [] = source

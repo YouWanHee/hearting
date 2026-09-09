@@ -29,6 +29,7 @@ only for the Claude branch.
 """
 import json
 import os
+import re
 import stat
 import tempfile
 
@@ -40,6 +41,15 @@ STATUSES = ("idle", "busy", "shell", "exited")
 WRITER_SUPPORT = {"claude": "runtime-native",
                   "codex": "hearting-managed",
                   "opencode": "not-implemented"}
+# Where a resumed session's PRIOR ids can be read from, per harness. Claude Code keeps
+# both on the live process: `--session-id <new>` beside `--resume <…>/<old>.jsonl`, so the
+# pair is derivable with no state of our own. Codex interactive threads live behind one
+# shared `codex app-server` (no per-session process) and `codex-managed-entry.py` writes
+# its registry record before any thread id exists, so today there is nothing to read;
+# OpenCode has no writer at all. Both are declared gaps, not silent failures.
+ALIAS_SUPPORT = {"claude": "proc-argv",
+                 "codex": "not-implemented",
+                 "opencode": "not-implemented"}
 
 _MAX_BYTES = 64 * 1024
 
@@ -56,6 +66,79 @@ def _check_harness(harness):
 def writer_support(harness):
     _check_harness(harness)
     return WRITER_SUPPORT[harness]
+
+
+def alias_support(harness):
+    _check_harness(harness)
+    return ALIAS_SUPPORT[harness]
+
+
+_MAX_ALIASES = 8
+_SID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+                     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+
+def _proc_argv(pid):
+    try:
+        with open("/proc/%d/cmdline" % int(pid), "rb") as handle:
+            raw = handle.read(_MAX_BYTES)
+    except Exception:
+        return []
+    return [part.decode("utf-8", "replace") for part in raw.split(b"\0") if part]
+
+
+def session_aliases(harness, pid, *, argv=None):
+    """Session ids this live process ALSO answers to, newest-known first, or ``[]``.
+
+    A `/resume` or `--fork-session` mints a brand-new session id while the peer ledger,
+    a steward marker, or a pending completion may still address the conversation by the
+    id it had before. Nothing on disk records the equivalence — but the running process
+    still carries both halves in its own argv, so the mapping is derived, never stored.
+    That matters: an alias file would need a TTL, a PID-reuse guard, and a sweeper, and
+    would go stale exactly when the session it describes exits.
+
+    Display-join use only. An alias must never address a ledger write, a
+    `report-agent-session` call, or a completion/wake recipient — those stay exact.
+    """
+    _check_harness(harness)
+    if ALIAS_SUPPORT[harness] != "proc-argv":
+        return []
+    parts = _proc_argv(pid) if argv is None else list(argv)
+    if not parts:
+        return []
+    current = None
+    aliases = []
+    for index, part in enumerate(parts):
+        if part == "--session-id" and index + 1 < len(parts):
+            current = _SID_RE.fullmatch(parts[index + 1].strip())
+            current = current.group(0).lower() if current else None
+        elif part in ("--resume", "-r", "--continue-from") and index + 1 < len(parts):
+            value = parts[index + 1].strip()
+            # `--resume` takes either a bare id or a transcript path whose stem is one.
+            stem = value.rsplit("/", 1)[-1]
+            if stem.endswith(".jsonl"):
+                stem = stem[:-len(".jsonl")]
+            match = _SID_RE.fullmatch(stem)
+            if match:
+                aliases.append(match.group(0).lower())
+    # The process's own current id is not an alias of itself.
+    return [sid for sid in dict.fromkeys(aliases) if sid != current][:_MAX_ALIASES]
+
+
+def session_join_keys(sess):
+    """Every ``(harness, session_id)`` a rendered row answers to — its own id first, then
+    its resume aliases. The one definition: the peer ledger join, the steward marker join,
+    and the renderer's badge map must not each decide this for themselves, or they drift
+    into disagreeing about which row a relation belongs to."""
+    harness = str(getattr(sess, "harness", "") or "").lower()
+    keys = []
+    sid = getattr(sess, "session_id", None)
+    if sid:
+        keys.append((harness, sid))
+    for alias in (getattr(sess, "session_aliases", None) or []):
+        if alias and (harness, alias) not in keys:
+            keys.append((harness, alias))
+    return keys
 
 
 def state_root():

@@ -115,21 +115,14 @@ try:
     name = mod.display_name("claude", sid, runtime_name=inputs.get("runtime_name"),
                              registry_name=inputs.get("registry_name"),
                              title=session_name or None, slug=None, cwd=cwd)
-    # F-100 (user 2026-09-03 "식별번호가 statusline 같은 곳에 떠야"): the same `[46]`
-    # badge Fleet draws — the derived name's 2-hex tag while the record still says
-    # `derived`, else the tag Fleet snapshot for this sid (a rename keeps it).
-    tag = None
-    try:
-        tag = mod.derived_tag(inputs.get("registry_name")) if not inputs.get("runtime_name") else None
-        if not tag:
-            tspec = importlib.util.spec_from_file_location(
-                "fleet_titles", sys.argv[1].replace("session_handle.py", "titles.py"))
-            tmod = importlib.util.module_from_spec(tspec); tspec.loader.exec_module(tmod)
-            tag = tmod.read_tag(sid, harness="claude")
-    except Exception:
-        tag = None
-    shown = mod.clip_cells(name, 48)
-    print("[%s] %s" % (tag, shown) if tag else shown)
+    # 2026-09-09 사용자 결정: statusline 은 제목만 진다. `[46]` 식별 배지는 herdr pane
+    # 상단 제목(`[46] claude ⚑ <요약>`)이 소유한다 — 하네스마다 다른 내부 상태줄에서
+    # 억지로 신원을 맞추는 대신 세 하네스가 공유하는 바깥 표면 하나에 둔다.
+    # 제목이 없어 이름이 디렉토리로 떨어지면 왼쪽 `📁 <dir>` 세그먼트와 같은 말이 되므로
+    # 그 경우엔 아무것도 출력하지 않는다.
+    base = (cwd or "").rstrip("/").rsplit("/", 1)[-1]
+    if name and name != base:
+        print(mod.clip_cells(name, 48))
 except Exception:
     pass
 PY

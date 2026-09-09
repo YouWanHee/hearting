@@ -203,17 +203,43 @@ def collect(state_roots=None):
         return (str(block.get("harness") or "").lower(), sid) if sid else None
 
     def _row(key):
-        return by_session.setdefault(key, {"sent_1h": 0, "recv_1h": 0, "last_recv": None})
+        return by_session.setdefault(key, {"sent_1h": 0, "recv_1h": 0,
+                                           "last_recv": None, "last_sent": None})
+
+    def _peer_name(block, key):
+        """The ledger's own display name for an endpoint, or ``None``.
+
+        Never the raw session id. A codex→claude transfer record carries
+        ``from.name: null`` (measured 2026-09-09), and the old fallback pasted the
+        36-character id into the name slot, which is what put
+        `← 01a084f7-63f2-7961-ae60-6fc2d8e60fc2` on the board. Naming an unnamed peer
+        is the renderer's job — it can see the tag of a row the collector cannot.
+        """
+        name = _clean_from_name(block.get("name"))
+        if not isinstance(name, str):
+            return None
+        name = name.strip()
+        if not name:
+            return None
+        sid = key[1] if key else None
+        return None if sid and name == sid else name
 
     def _record_recv(to_key, kind, frm, to, from_key, age_min):
         row = _row(to_key)
         if age_min <= 60:
             row["recv_1h"] += 1
-        from_sid = from_key[1] if from_key else None
-        from_name = (_clean_from_name(frm.get("name")) or from_sid or "")
-        row["last_recv"] = {"from_name": from_name, "from_session_id": from_sid,
+        row["last_recv"] = {"from_name": _peer_name(frm, from_key),
+                             "from_session_id": from_key[1] if from_key else None,
                              "from_harness": from_key[0] if from_key else "",
                              "kind": kind, "age_min": age_min}
+
+    def _record_sent(from_key, kind, frm, to, to_key, age_min):
+        row = _row(from_key)
+        row["last_sent"] = {"to_name": _peer_name(to, to_key),
+                            "to_session_id": to_key[1] if to_key else None,
+                            "to_harness": (to_key[0] if to_key
+                                           else str(to.get("harness") or "").lower()),
+                            "kind": kind, "age_min": age_min}
 
     def _upgrade_recv(to_key, inherited, frm, to, from_key, age_min):
         # A correlated notice is, by construction, the newest successful receipt for
@@ -223,9 +249,8 @@ def collect(state_roots=None):
         # `recv_1h` is untouched here: the notice and its correlated sent record are one
         # logical message and must count once (F-101i).
         row = _row(to_key)
-        from_sid = from_key[1] if from_key else None
-        from_name = (_clean_from_name(frm.get("name")) or from_sid or "")
-        row["last_recv"] = {"from_name": from_name, "from_session_id": from_sid,
+        row["last_recv"] = {"from_name": _peer_name(frm, from_key),
+                             "from_session_id": from_key[1] if from_key else None,
                              "from_harness": from_key[0] if from_key else "",
                              "kind": inherited, "age_min": age_min}
 
@@ -240,14 +265,23 @@ def collect(state_roots=None):
         status = ((rec.get("delivery") or {}).get("status") or "").lower()
         deliverable = status != "failed"
         if from_key:
+            # The endpoint's row exists as soon as the ledger names it, but only a
+            # non-notice record is a SEND. F-101i, send side: a herdr message writes two
+            # records naming the same sender — its own `steer` and the receiver's `notice`
+            # receipt — so counting both made one sent message read `✉ 2/…` (measured
+            # 2026-09-09 on the codex↔claude test pair). `recv_1h` already counted such a
+            # pair once; this is the same rule on the other axis, and it agrees with
+            # `last_sent`, which was never set from a notice.
             row = _row(from_key)
-            if age_min <= 60:
+            if kind != "notice" and age_min <= 60:
                 row["sent_1h"] += 1
         if kind != "notice":
             if from_key and to_key and deliverable:
                 pending.setdefault((from_key, to_key), []).append(kind)
             if to_key and deliverable:
                 _record_recv(to_key, kind, frm, to, from_key, age_min)
+            if from_key and deliverable:
+                _record_sent(from_key, kind, frm, to, to_key, age_min)
         else:
             stack = pending.get((from_key, to_key)) if from_key and to_key else None
             if stack:

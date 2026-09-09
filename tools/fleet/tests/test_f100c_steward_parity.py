@@ -255,5 +255,55 @@ class RuntimeLedgerRootsTest(unittest.TestCase):
             self.assertEqual(pm.read_steward_markers([os.path.join(tmp, "missing")]), {})
 
 
+class StewardReverseIndexTest(unittest.TestCase):
+    """A steward marker records the relation on the STEWARD's side only, so before this
+    the watched session had no reverse field at all (measured 2026-09-09) and the board
+    could not answer "who is watching me". The reverse index is derived from the same
+    evidence entries, never from a second marker."""
+
+    def _enrich(self, sessions, marker_targets):
+        markers = {("claude", "sidP"): {"session_id": "sidP", "targets": marker_targets}}
+        with mock.patch.object(steward, "_peer_message_module") as module:
+            module.return_value.steward_evidence_targets.side_effect = (
+                lambda marker: [dict(entry, session_id=sid)
+                                for sid, entry in marker["targets"].items()])
+            steward.enrich(sessions, markers=markers)
+
+    def test_target_gets_its_supervisor_and_steward_keeps_its_targets(self):
+        parent = Session(harness="claude", pid=1, cwd="/x", slug="p", session_id="sidP")
+        target = Session(harness="codex", pid=2, cwd="/x", slug="t", session_id="sidT")
+        self._enrich([parent, target],
+                     {"sidT": {"harness": "codex", "kind": "watch", "source": "watch"}})
+        self.assertTrue(parent.steward)
+        self.assertEqual([t["session_id"] for t in parent.steward_targets], ["sidT"])
+        self.assertEqual(len(target.steward_parents), 1)
+        self.assertEqual(target.steward_parents[0]["session_id"], "sidP")
+        self.assertEqual(target.steward_parents[0]["harness"], "claude")
+        self.assertIsNone(parent.steward_parents)
+
+    def test_a_session_is_never_its_own_supervisor(self):
+        solo = Session(harness="claude", pid=1, cwd="/x", slug="p", session_id="sidP")
+        self._enrich([solo],
+                     {"sidP": {"harness": "claude", "kind": "watch", "source": "watch"}})
+        self.assertTrue(solo.steward)
+        self.assertIsNone(solo.steward_parents)
+
+    def test_a_resumed_target_still_joins_through_its_alias(self):
+        """The marker names the id the target had BEFORE it resumed; an exact-only join
+        silently drops the relation on both sides."""
+        parent = Session(harness="claude", pid=1, cwd="/x", slug="p", session_id="sidP")
+        target = Session(harness="codex", pid=2, cwd="/x", slug="t", session_id="sidNew",
+                         session_aliases=["sidOld"])
+        self._enrich([parent, target],
+                     {"sidOld": {"harness": "codex", "kind": "watch", "source": "watch"}})
+        self.assertEqual(target.steward_parents[0]["session_id"], "sidP")
+
+    def test_no_markers_leaves_every_field_at_its_default(self):
+        target = Session(harness="codex", pid=2, cwd="/x", slug="t", session_id="sidT")
+        steward.enrich([target], markers={})
+        self.assertFalse(target.steward)
+        self.assertIsNone(target.steward_parents)
+
+
 if __name__ == "__main__":
     unittest.main()

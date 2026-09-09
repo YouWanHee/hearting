@@ -136,6 +136,58 @@ def minted_tag(session_id: object) -> Optional[str]:
     return hashlib.sha256(session_id.strip().encode("utf-8")).hexdigest()[:2]
 
 
+def resolve_tag(harness: object, session_id: object, *, home: object = None) -> Optional[str]:
+    """The one 2-hex badge rule, shared by every surface that draws `[xx]`.
+
+    Fleet's collectors, `peer-message.py`'s trailer alias, and the Herdr pane title all
+    have to answer the same question — "which badge does this session wear?" — and the
+    rule differs per harness (Claude reads it off its own derived name, the other two
+    mint it from the id). Keeping three copies of that split is how the badge and the
+    trailer drift apart, so this is the single definition; callers add their own
+    brackets. I/O-bearing and fail-soft: any unreadable record yields the next source,
+    and an unresolvable session yields ``None`` rather than a guess.
+    """
+    harness_key = str(harness or "").lower()
+    sid = str(session_id or "").strip()
+    if not harness_key or not sid:
+        return None
+    if harness_key in ("codex", "opencode"):
+        return minted_tag(sid)
+    if harness_key != "claude":
+        return None
+    # Claude: the derived `<basename>-<xx>` name is the only carrier, and only while the
+    # record still says `derived` (a user-set `release-1a` has the same shape, F-100a).
+    base = str(home) if home else (os.environ.get("CLAUDE_CONFIG_DIR")
+                                   or os.environ.get("AGENT_HOME")
+                                   or os.environ.get("CLAUDE_HOME")
+                                   or os.path.expanduser("~/.claude"))
+    try:
+        for entry in os.listdir(os.path.join(base, "sessions")):
+            if not entry.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(base, "sessions", entry), encoding="utf-8") as fh:
+                    record = json.load(fh)
+            except Exception:
+                continue
+            if not isinstance(record, dict) or record.get("sessionId") != sid:
+                continue
+            if record.get("nameSource") != "derived":
+                break
+            tag = derived_tag(record.get("name"))
+            if tag:
+                return tag
+            break
+    except Exception:
+        pass
+    # Fleet's own snapshot of that tag survives a later rename (F-100a).
+    try:
+        from fleet.titles import read_tag
+        return read_tag(sid, harness="claude")
+    except Exception:
+        return None
+
+
 def _agent_home_for_state_root() -> str:
     """Same resolution chain as ``tools/fleet/route.py``'s ``_completion_home`` —
     ``AGENT_HOME``/``CLAUDE_HOME`` first, else the validated resolver found by

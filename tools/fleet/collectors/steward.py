@@ -51,6 +51,13 @@ def read_markers():
         return {}
 
 
+def _session_keys(sess):
+    """The shared join-key rule — a marker written before a resume still names the id the
+    session used to have, so an exact-only join silently drops the relation."""
+    from .. import session_registry
+    return session_registry.session_join_keys(sess)
+
+
 def enrich(sessions, markers=None):
     if markers is None:
         markers = read_markers()
@@ -60,10 +67,13 @@ def enrich(sessions, markers=None):
     evidence = getattr(mod, "steward_evidence_targets", None) if mod is not None else None
     if evidence is None:
         return  # no rule available → no steward claims (fail-soft, never a guess)
+    # target key → the stewards that named it. Built from the SAME evidence entries the
+    # forward projection uses, so "who watches me" can never claim a relation that the
+    # steward's own row does not also show.
+    parents_by_key = {}
     for s in sessions:
-        sid = getattr(s, "session_id", None)
-        harness = str(getattr(s, "harness", "") or "").lower()
-        marker = markers.get((harness, sid)) if sid else None
+        keys = _session_keys(s)
+        marker = next((markers[k] for k in keys if k in markers), None)
         if not marker:
             continue
         try:
@@ -76,3 +86,28 @@ def enrich(sessions, markers=None):
         # `steward_evidence_targets` returns oldest-first — the stable order the
         # renderer's front-preserving +N fold relies on.
         s.steward_targets = list(targets)
+        for target in targets:
+            target_sid = target.get("session_id")
+            if not target_sid:
+                continue
+            parent = {"harness": str(getattr(s, "harness", "") or "").lower(),
+                      "session_id": getattr(s, "session_id", None),
+                      "name": getattr(s, "runtime_name", None) or getattr(s, "slug", None),
+                      "source": target.get("source"), "ts": target.get("ts")}
+            key = (str(target.get("harness") or "").lower(), target_sid)
+            parents_by_key.setdefault(key, []).append(parent)
+    if not parents_by_key:
+        return
+    for s in sessions:
+        parents = []
+        seen = set()
+        for key in _session_keys(s):
+            for parent in parents_by_key.get(key, ()):
+                identity = (parent["harness"], parent["session_id"])
+                if identity in seen or identity == (str(getattr(s, "harness", "") or "").lower(),
+                                                    getattr(s, "session_id", None)):
+                    continue      # a session is never its own supervisor
+                seen.add(identity)
+                parents.append(parent)
+        if parents:
+            s.steward_parents = parents

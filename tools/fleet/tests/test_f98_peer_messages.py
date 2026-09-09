@@ -140,7 +140,50 @@ class CollectorTest(unittest.TestCase):
             result = peer_messages.collect(state_roots=[tmp])
         last_recv = result["by_session"][("claude", "sid-b")]["last_recv"]
         self.assertNotEqual(last_recv["from_name"], "sid-b-display")
-        self.assertEqual(last_recv["from_name"], "sid-a")
+        # The sender has no ledger name here, and an unnamed sender stays unnamed: the
+        # collector used to paste the raw session id into the display-name slot, which is
+        # how `← 01a084f7-63f2-7961-ae60-6fc2d8e60fc2` reached the board (2026-09-09).
+        # The exact id stays in its own field for the join; naming is the renderer's job.
+        self.assertIsNone(last_recv["from_name"])
+        self.assertEqual(last_recv["from_session_id"], "sid-a")
+
+    def test_last_sent_is_the_symmetric_send_side(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_ledger(tmp, "sid-a", [
+                _rec("sid-a", to_sid="sid-b", to_name="sid-b-display", kind="steer", minutes_ago=1)
+            ])
+            result = peer_messages.collect(state_roots=[tmp])
+        last_sent = result["by_session"][("claude", "sid-a")]["last_sent"]
+        self.assertEqual(last_sent["to_session_id"], "sid-b")
+        self.assertEqual(last_sent["to_name"], "sid-b-display")
+        self.assertEqual(last_sent["kind"], "steer")
+        # The receiver's own row records only what it received.
+        self.assertIsNone(result["by_session"][("claude", "sid-b")]["last_sent"])
+
+    def test_notice_receipt_is_not_counted_as_a_send(self):
+        """A `notice` is the RECEIVER's receipt for someone else's message. Treating it as
+        a send would make every received message also draw a `✉ →` on the wrong row."""
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_ledger(tmp, "sid-a", [
+                _rec("sid-a", to_sid="sid-b", kind="notice", minutes_ago=1)
+            ])
+            result = peer_messages.collect(state_roots=[tmp])
+        self.assertIsNone(result["by_session"][("claude", "sid-a")]["last_sent"])
+        self.assertEqual(result["by_session"][("claude", "sid-a")]["sent_1h"], 0)
+
+    def test_one_herdr_message_counts_once_on_both_axes(self):
+        """A herdr message writes TWO records naming the same sender — its own `steer` and
+        the receiver's `notice` receipt. Counting both made one sent message read `✉ 2/…`
+        (measured 2026-09-09 on the codex↔claude test pair)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_ledger(tmp, "sid-a", [
+                _rec("sid-a", to_sid="sid-b", kind="steer", minutes_ago=1),
+                _rec("sid-a", to_sid="sid-b", kind="notice", minutes_ago=1),
+            ])
+            result = peer_messages.collect(state_roots=[tmp])
+        self.assertEqual(result["by_session"][("claude", "sid-a")]["sent_1h"], 1)
+        self.assertEqual(result["by_session"][("claude", "sid-b")]["recv_1h"], 1)
+        self.assertEqual(result["by_session"][("claude", "sid-b")]["sent_1h"], 0)
 
     def test_join_is_exact_session_id_not_name(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -150,6 +193,65 @@ class CollectorTest(unittest.TestCase):
             result = peer_messages.collect(state_roots=[tmp])
         self.assertNotIn(("claude", "hearting-21 [f3e821]"), result["by_session"])
         self.assertEqual(result["by_session"][("claude", "sid-a")]["sent_1h"], 1)
+
+
+class ResumedSessionJoinTest(unittest.TestCase):
+    """A resumed session's receipts are split across the id it has now and the one it had
+    before, and only the older key carries the sender identity (measured 2026-09-09: the
+    newer key held a bare `notice` whose `from.session_id` was empty). Joining over both
+    is what lets the board name the sender instead of drawing nothing."""
+
+    def _session(self, **kwargs):
+        from fleet.model import Session
+        return Session(harness="claude", pid=1, cwd="/x", slug="s", **kwargs)
+
+    def test_counters_sum_and_the_freshest_entry_wins(self):
+        from fleet import collectors
+        s = self._session(session_id="new", session_aliases=["old"])
+        collectors.apply_peer_rows([s], {
+            ("claude", "old"): {"sent_1h": 1, "recv_1h": 2, "last_sent": None,
+                                "last_recv": {"from_name": "steward", "from_session_id": "p",
+                                              "from_harness": "claude", "kind": "steer",
+                                              "age_min": 5}},
+            ("claude", "new"): {"sent_1h": 3, "recv_1h": 1, "last_sent": None,
+                                "last_recv": {"from_name": None, "from_session_id": None,
+                                              "from_harness": "", "kind": "notice",
+                                              "age_min": 40}},
+        })
+        self.assertEqual((s.peer_sent_1h, s.peer_recv_1h), (4, 3))
+        self.assertEqual(s.peer_last_recv["from_name"], "steward")
+        self.assertEqual(s.peer_last_recv["from_session_id"], "p")
+
+    def test_a_malformed_age_never_wins_the_freshest_comparison(self):
+        from fleet import collectors
+        s = self._session(session_id="new", session_aliases=["old"])
+        collectors.apply_peer_rows([s], {
+            ("claude", "old"): {"sent_1h": 0, "recv_1h": 0, "last_sent": None,
+                                "last_recv": {"from_name": "real", "age_min": 5}},
+            ("claude", "new"): {"sent_1h": 0, "recv_1h": 0, "last_sent": None,
+                                "last_recv": {"from_name": "broken", "age_min": None}},
+        })
+        self.assertEqual(s.peer_last_recv["from_name"], "real")
+
+    def test_a_session_without_aliases_is_unchanged(self):
+        from fleet import collectors
+        s = self._session(session_id="new")
+        collectors.apply_peer_rows([s], {
+            ("claude", "old"): {"sent_1h": 9, "recv_1h": 9, "last_recv": None,
+                                "last_sent": None}})
+        self.assertEqual((s.peer_sent_1h, s.peer_recv_1h), (0, 0))
+
+    def test_a_still_live_id_is_never_adopted_as_an_alias(self):
+        """`--fork-session` leaves the parent running under its own row; adopting its id
+        would hand the parent's messages to the child."""
+        from fleet import collectors
+        parent_sid = "6044eb9f-7983-4c41-9b86-0bb2b70638fa"
+        child = self._session(session_id="01a084f7-63f2-7961-ae60-6fc2d8e60fc2")
+        parent = self._session(session_id=parent_sid)
+        parent.pid = 2
+        with mock.patch("fleet.session_registry.session_aliases", return_value=[parent_sid]):
+            collectors.apply_session_aliases([child, parent])
+        self.assertIsNone(child.session_aliases)
 
 
 class StableRootResolverTest(unittest.TestCase):
@@ -324,6 +426,49 @@ class StateRootsPeerPromotionTest(unittest.TestCase):
              mock.patch.object(peer_messages, "_agent_home", side_effect=Exception("no home")):
             roots = peer_messages._state_roots()
         self.assertEqual(roots, ("/tmp/other",))
+
+
+class PeerEndpointLabelTest(unittest.TestCase):
+    """The name slot holds whatever the sender wrote; the board must not print machine text.
+
+    Measured on the live board: `✉ → uds:/run/user/1002/cc-socks/2952102.sock` came from a
+    real ledger record whose `to.name` was a socket address. That names nothing a person can
+    look up — worse than the `claude:7a001534` fallback, because it is the same
+    non-information dressed as a name.
+    """
+
+    def test_machine_addresses_are_not_treated_as_names(self):
+        for value in ("uds:/run/user/1002/cc-socks/2952102.sock",
+                      "/tmp/whatever.sock",
+                      "http://example/x",
+                      "01a084f7-63f2-7961-ae60-6fc2d8e60fc2",  # raw session id in the name slot
+                      "", "   ", None, 42):
+            with self.subTest(value=value):
+                self.assertFalse(render._peer_name_is_readable(value))
+
+    def test_real_session_names_still_pass(self):
+        # Names here are free-form and often Korean prose, so the check has to be a small
+        # denylist rather than a guess at what a name looks like.
+        for value in ("hearting-46", "bc-resnet-67", "케언 W15 사이클 이어받기",
+                      "q1-tts: v6 본생산", "wB:p3"):
+            with self.subTest(value=value):
+                self.assertTrue(render._peer_name_is_readable(value))
+
+    def test_an_unusable_name_falls_through_to_the_short_id(self):
+        segs = render._peer_endpoint_segs(
+            "claude", "7a001534-ea46-4a67-971b-199c586889e2",
+            "uds:/run/user/1002/cc-socks/2952102.sock", {})
+        self.assertEqual("".join(t for t, _ in segs), "claude:7a001534")
+
+    def test_an_unusable_name_with_no_id_falls_back_to_the_harness(self):
+        segs = render._peer_endpoint_segs("claude", None, "/tmp/x.sock", {})
+        self.assertEqual("".join(t for t, _ in segs), "claude")
+
+    def test_an_on_screen_peer_still_wins_over_every_fallback(self):
+        segs = render._peer_endpoint_segs(
+            "claude", "7a001534-ea46-4a67-971b-199c586889e2", "/tmp/x.sock",
+            {("claude", "7a001534-ea46-4a67-971b-199c586889e2"): "46"})
+        self.assertEqual("".join(t for t, _ in segs), "[46] claude")
 
 
 if __name__ == "__main__":
