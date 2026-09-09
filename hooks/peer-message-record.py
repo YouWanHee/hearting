@@ -60,6 +60,16 @@ def _project_of(cwd):
     return os.path.basename(str(cwd).rstrip("/"))
 
 
+def _address_session_id(mod, address):
+    """A peer socket address → that session's id, fail-soft to ``None``."""
+    if mod is None or not address:
+        return None
+    try:
+        return mod.claude_session_id_for_address(str(address))
+    except Exception:
+        return None
+
+
 def _kind_for_body(body, notify_when_idle):
     if notify_when_idle:
         return "watch"
@@ -104,12 +114,20 @@ def handle_post_tool(payload):
     if from_name:
         args_list += ["--from-name", from_name]
     if isinstance(to, dict):
-        if to.get("session_id"):
-            args_list += ["--to-session-id", str(to["session_id"])]
-        if to.get("name"):
-            args_list += ["--to-name", str(to["name"])]
+        to_session_id = to.get("session_id")
+        to_name = to.get("name") or to.get("address")
     else:
-        args_list += ["--to-name", str(to)]
+        to_session_id, to_name = None, to
+    if not to_session_id:
+        # SendMessage addresses a peer by its socket, and the socket is named after that
+        # session's PID, so the address resolves to an exact id. Without this the ledger
+        # kept the address as a `name` and the board drew a bare `claude` — 222 rows
+        # measured 2026-09-10.
+        to_session_id = _address_session_id(mod, to_name)
+    if to_session_id:
+        args_list += ["--to-session-id", str(to_session_id)]
+    if to_name:
+        args_list += ["--to-name", str(to_name)]
 
     subprocess.run(
         [sys.executable, str(_PEER_MESSAGE_PY), "record"] + args_list,
@@ -131,15 +149,17 @@ def handle_prompt(payload):
         # source here. Without it we cannot claim an exact to.session_id, and
         # a name fallback would defeat F-98b's exact-session-id join contract.
         return
+    mod = _peer_message_module()
     match = _CROSS_SESSION_RE.search(prompt)
     if match:
         from_name = match.group(1)
         named = _CROSS_SESSION_NAME_RE.search(prompt)
         args_list = [
             "--from-harness", "claude",
-            # F-101h: Claude's native envelope carries neither sender session_id nor kind.
-            # Preserve the empty id; exact endpoint correlation therefore fails soft while
-            # the receive counter and notice record remain honest.
+            # F-101h: Claude's native envelope carries neither sender session_id nor
+            # kind. Filled in below from the sender's socket address when that resolves;
+            # otherwise it stays empty and exact correlation fails soft, while the receive
+            # counter and the notice record remain honest.
             "--from-session-id", "",
             "--from-project", _project_of(payload.get("cwd")),
             "--to-harness", "claude",
@@ -151,14 +171,23 @@ def handle_prompt(payload):
         ]
         if named and named.group(1):
             args_list += ["--from-name", named.group(1)]
-        if from_name:
-            args_list += ["--to-name", from_name]
+        # `from=` is the sender's socket address, which names the sender's PID and so its
+        # session. Claude's native envelope carries no sender id of its own, and this is
+        # the only thing in it that resolves to one.
+        sender_sid = _address_session_id(mod, from_name)
+        if sender_sid:
+            args_list[args_list.index("--from-session-id") + 1] = str(sender_sid)
+        # The RECEIVER's own name belongs in the `to` block. Until 2026-09-10 the sender's
+        # address was written here instead, which put one endpoint's identity under the
+        # other endpoint's key.
+        to_name = mod.claude_session_name(str(session_id)) if mod is not None else None
+        if to_name:
+            args_list += ["--to-name", str(to_name)]
         _record(args_list, "cross-session message received")
         return
     # F-100c: a herdr-delivered steer carries the sender trailer instead of an envelope —
     # the same rule the Codex hook and the OpenCode plugin apply, so all three harnesses
     # write the same `notice` shape.
-    mod = _peer_message_module()
     trailer = mod.parse_peer_trailer(prompt, {"harness": "claude", "session_id": str(session_id)}) if mod is not None else None
     if not trailer:
         return

@@ -749,15 +749,26 @@ mechanism, shell or `apply_patch`, hits the OS read-only wall), so the adapter
 realizes the **same portable 2-tier distillation contract**
 (`core/MEMORY.md` §7, D-30/D-32) rather than only an add-only subset.
 
-The adapter reimplements the portable `hooks/mem-distill-dispatch.sh` pipeline
-**synchronously** in `adapters/codex/bin/distill-worker.sh` (the D-32
-"reimplement + preserve" path) so a headless `codex exec` session captures memory
-before it exits — the portable dispatcher detaches into the background, which is
-right for interactive Claude but leaves a codex-exec teardown race. Crucially the
-**safety layers are the shared code, not a divergent copy**: `mem.py
+The adapter reimplements the portable `hooks/mem-distill-dispatch.sh` pipeline in
+`adapters/codex/bin/distill-worker.sh` (the D-32 "reimplement + preserve" path).
+Crucially the **safety layers are the shared code, not a divergent copy**: `mem.py
 curate-snapshot` / `curate-artifacts` (snapshot + `IDS:` membership) and
 `tools/memory/apply-distill-actions.py --mode/--snapshot-ids` (the whitelist
-gate). Only the synchronous orchestration shell and the prompts are Codex-owned.
+gate). Only the orchestration shell and the prompts are Codex-owned.
+
+**Who waits.** The worker itself runs synchronously; the hook-facing branch that
+calls it does not. Codex clamps the SessionEnd hook to 3 seconds whatever
+`hooks.json` declares — and says so at every session end — while a live curate
+measured 21.9s and the `mem sync` ahead of it measured 54.8s on the real store. So
+`preflight.sh session-end` and `turn-nudge` re-enter themselves through
+`detach_self` (`CODEX_PREFLIGHT_DETACHED=1 setsid nohup …`), return in milliseconds, and do
+the work outside the clock. Raising the declared timeout was tried in v2.128.0 and
+is inert.
+
+An earlier note here said the synchronous shape existed so a headless `codex exec`
+session could capture memory before exiting. It never did: both branches `exit 0`
+for a worker session several lines earlier (D-42 — a worker owns no sync/curator
+lifecycle), so that path was unreachable from the day it was written.
 
 Two tiers + one manual surface:
 

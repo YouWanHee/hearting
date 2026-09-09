@@ -58,6 +58,23 @@ _PEER_TRAILER_RE = re.compile(
     r"\(peer-from:\s*(?P<harness>[A-Za-z0-9_-]+)\s+(?P<sid>[^\s)]+)(?:\s+(?P<name>[^)]*?))?\s*\)")
 
 
+def _session_handle():
+    """``fleet.session_handle``, the one home of the shared identity rules, or ``None``.
+
+    Imported lazily and by path: this tool ships next to `tools/` in both the checkout and
+    an installed release, but it is a standalone script and never runs as part of that
+    package.
+    """
+    try:
+        tools = str(Path(__file__).resolve().parents[1] / "tools")
+        if tools not in sys.path:
+            sys.path.insert(0, tools)
+        from fleet import session_handle
+        return session_handle
+    except Exception:
+        return None
+
+
 def peer_alias(harness, session_id):
     """Fleet's display tag only; never resolve a tag/name/pane back to an id.
 
@@ -67,15 +84,14 @@ def peer_alias(harness, session_id):
     """
     if not usable_session_id(session_id):
         return "[?]"
+    handle = _session_handle()
+    if handle is None:
+        return "[?]"
     try:
-        tools = str(Path(__file__).resolve().parents[1] / "tools")
-        if tools not in sys.path:
-            sys.path.insert(0, tools)
-        from fleet.session_handle import resolve_tag
-        tag = resolve_tag(harness, session_id)
-        return f"[{tag}]" if isinstance(tag, str) and re.fullmatch(r"[0-9a-f]{2}", tag) else "[?]"
+        tag = handle.resolve_tag(harness, session_id)
     except Exception:
         return "[?]"
+    return f"[{tag}]" if isinstance(tag, str) and re.fullmatch(r"[0-9a-f]{2}", tag) else "[?]"
 
 
 def peer_trailer(harness, session_id, name=None, *, transfer_ref=None):
@@ -267,6 +283,19 @@ def claude_session_name(session_id, config_dir=None):
             name = rec.get("name")
             return name if isinstance(name, str) and name else None
     return None
+
+
+def claude_session_id_for_address(address, config_dir=None):
+    """A peer socket address → that session's id; the rule lives in
+    ``fleet.session_handle.session_id_for_address`` so the ledger writer and the board
+    cannot disagree about who a socket belongs to."""
+    handle = _session_handle()
+    if handle is None:
+        return None
+    try:
+        return usable_session_id(handle.session_id_for_address(address, config_dir=config_dir))
+    except Exception:
+        return None
 
 
 def _agent_home():

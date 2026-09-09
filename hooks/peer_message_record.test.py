@@ -426,8 +426,43 @@ class F100cTrailerAndNameTest(_BaseTest):
                              "prompt": '<cross-session-message from="uds:/x.sock" from-name="cairn-bc" from-mode="bypass">hi</cross-session-message>'})
         rec = self._all_records()[0]
         self.assertEqual(rec["from"]["name"], "cairn-bc")
-        self.assertEqual(rec["to"]["name"], "uds:/x.sock")
+        # The sender's address used to be written into the `to` block — one endpoint's
+        # identity filed under the other endpoint's key. `to` is this session.
+        self.assertNotIn("uds:/x.sock", json.dumps(rec["to"]))
         self.assertEqual(rec["delivery"]["surface"], "claude-native")
+
+    def test_a_native_sender_is_identified_by_its_socket(self):
+        """Claude's envelope carries no sender session id, but `from=` is the sender's
+        socket and the socket is named after its PID — which the runtime also writes a
+        session file for. Without this the ledger stored the address as a name and the
+        board drew a bare `claude` (222 rows measured 2026-09-10)."""
+        self._cfg_with("sid-recv", "receiver")
+        cfg = Path(self.env["CLAUDE_CONFIG_DIR"])
+        (cfg / "sessions" / "4242.json").write_text(json.dumps(
+            {"pid": 4242, "sessionId": "sid-sender", "name": "peer-a"}))
+        self._run("prompt", {"session_id": "sid-recv", "cwd": "/tmp/proj",
+                             "prompt": '<cross-session-message from="uds:/run/user/1002/cc-socks/4242.sock" from-name="peer-a">hi</cross-session-message>'})
+        rec = self._all_records()[0]
+        self.assertEqual(rec["from"]["session_id"], "sid-sender")
+        self.assertEqual(rec["to"]["session_id"], "sid-recv")
+
+    def test_an_unresolvable_address_still_records_an_honest_empty_id(self):
+        self._run("prompt", {"session_id": "sid-recv", "cwd": "/tmp/proj",
+                             "prompt": '<cross-session-message from="uds:/run/user/1002/cc-socks/999999.sock">hi</cross-session-message>'})
+        rec = self._all_records()[0]
+        self.assertEqual(rec["from"]["session_id"], "")
+
+    def test_a_sent_record_resolves_the_targets_socket_to_its_session_id(self):
+        self._cfg_with("sid-sender", "hearting-46")
+        cfg = Path(self.env["CLAUDE_CONFIG_DIR"])
+        (cfg / "sessions" / "4243.json").write_text(json.dumps(
+            {"pid": 4243, "sessionId": "sid-target", "name": "peer-b"}))
+        self._run("post-tool", {"session_id": "sid-sender", "cwd": "/tmp/proj",
+                                "tool_name": "SendMessage",
+                                "tool_input": {"to": "uds:/run/user/1002/cc-socks/4243.sock",
+                                               "message": "[steer] go"}})
+        rec = self._all_records()[0]
+        self.assertEqual(rec["to"]["session_id"], "sid-target")
 
     def test_sent_record_carries_the_senders_registry_name(self):
         self._cfg_with("sid-sender", "hearting-46")

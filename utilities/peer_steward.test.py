@@ -254,6 +254,70 @@ class StartTest(_TmpRootMixin, unittest.TestCase):
             argv += ["--"] + list(agent_args)
         return peer_steward.main(argv)
 
+    def test_cwd_reaches_the_agent_that_can_take_one(self):
+        """`herdr agent start` has no cwd option, so the launched agent inherits the
+        PANE's directory. `--cwd` used to be passed only to this CLI process: a session
+        started with `--cwd <hearting>` came up in `SR_CorrNet` (measured 2026-09-10)."""
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run",
+                                return_value=subprocess.CompletedProcess([], 0, stdout="", stderr="")) as run_mock:
+            rc = peer_steward.main(["start", "peer-c", "--kind", "codex",
+                                    "--pane", "w1:pM", "--cwd", str(self.tmp_root)])
+        self.assertEqual(rc, 0)
+        cmd = run_mock.call_args[0][0]
+        self.assertIn("--cd", cmd)
+        self.assertIn(os.path.realpath(str(self.tmp_root)), cmd)
+
+    def test_cwd_is_refused_where_the_harness_cannot_honor_it(self):
+        # Claude Code has no working-root flag. Refusing is the point: the alternative
+        # is a session quietly working in the wrong repository.
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run") as run_mock:
+            rc = peer_steward.main(["start", "peer-c", "--kind", "claude",
+                                    "--pane", "w1:pM", "--cwd", str(self.tmp_root)])
+        self.assertEqual(rc, 1)
+        run_mock.assert_not_called()
+
+    def test_a_cwd_that_is_not_a_directory_never_reaches_herdr(self):
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run") as run_mock:
+            rc = peer_steward.main(["start", "peer-c", "--kind", "codex",
+                                    "--pane", "w1:pM",
+                                    "--cwd", str(self.tmp_root / "nope")])
+        self.assertEqual(rc, 1)
+        run_mock.assert_not_called()
+
+    def test_no_cwd_leaves_the_launch_exactly_as_it_was(self):
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run",
+                                return_value=subprocess.CompletedProcess([], 0, stdout="", stderr="")) as run_mock:
+            peer_steward.main(["start", "peer-c", "--kind", "codex", "--pane", "w1:pM"])
+        self.assertNotIn("--cd", run_mock.call_args[0][0])
+
+    def test_the_receipt_says_when_the_launch_produced_no_identity(self):
+        """A session herdr cannot name has no ledger endpoint and no board badge. That
+        used to surface hours later as a nameless row; it belongs in the launch receipt."""
+        import io
+        import contextlib
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run",
+                                return_value=_herdr_json(_agent_json("codex", None, "peer-c"))):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                peer_steward.main(["start", "peer-c", "--kind", "codex", "--pane", "w1:pM"])
+        self.assertIn("session_id=-", out.getvalue())
+
+    def test_the_receipt_names_the_identity_when_there_is_one(self):
+        import io
+        import contextlib
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run",
+                                return_value=_herdr_json(_agent_json("codex", "thread-9", "peer-c"))):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                peer_steward.main(["start", "peer-c", "--kind", "codex", "--pane", "w1:pM"])
+        self.assertIn("session_id=thread-9", out.getvalue())
+
     def test_name_is_the_positional_right_after_start(self):
         """herdr `agent start <NAME> --kind --pane`: the name is a required positional.
         Without it herdr answers `unknown option: claude` and starts nothing, while the
