@@ -230,6 +230,15 @@ def check_file(path: Path, expected: str, stale: list[str]) -> None:
         stale.append(str(path.relative_to(ROOT)) + " (mode)")
 
 
+def _bytecode_cache(path: Path) -> bool:
+    """A `__pycache__` directory or `.pyc`/`.pyo` file that importing the
+    projected hooks/utilities (a local test run) leaves behind. Git ignores
+    it and a release is `git archive`, so it is never part of the projection
+    and never stale (2026-09-10: every suite run failed --check on it)."""
+
+    return path.name == "__pycache__" or path.suffix in {".pyc", ".pyo"}
+
+
 def check() -> int:
     stale: list[str] = []
 
@@ -286,7 +295,7 @@ def check() -> int:
     plugin_hooks_dir = PLUGIN_ROOT / "hooks"
     if plugin_hooks_dir.exists():
         for path in sorted(plugin_hooks_dir.glob("*")):
-            if path.name == "hooks.json":
+            if path.name == "hooks.json" or _bytecode_cache(path):
                 continue
             if path not in expected_hooks:
                 stale.append(str(path.relative_to(ROOT)))
@@ -301,6 +310,8 @@ def check() -> int:
     plugin_utils_dir = PLUGIN_ROOT / "utilities"
     if plugin_utils_dir.exists():
         for path in sorted(plugin_utils_dir.glob("*")):
+            if _bytecode_cache(path):
+                continue
             if path not in expected_utils:
                 stale.append(str(path.relative_to(ROOT)))
 
