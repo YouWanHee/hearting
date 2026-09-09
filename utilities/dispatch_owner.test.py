@@ -598,6 +598,34 @@ class DispatchOwnerTests(unittest.TestCase):
         self.assertEqual(OWNER._authoritative_jobs({"--jobs": str(other)},
                                                    {"AGENT_DISPATCH_CALLER_HARNESS": "codex"}), str(other))
 
+    def test_an_unusable_inherited_registry_refuses_the_claude_launch_before_spawn(self):
+        # rewake review R4 M1: the hook trusts nothing when AGENT_DISPATCH_JOBS is
+        # set but unusable (symlink, empty, absent, not regular), so the selector
+        # refuses the same states -- whether or not an explicit --jobs names the
+        # symlink's real file.
+        canonical = self.home / "canonical" / "jobs.log"
+        canonical.parent.mkdir(exist_ok=True)
+        canonical.touch()
+        alias = self.home / "alias.log"
+        alias.symlink_to(canonical)
+        for label, inherited, explicit in (
+            ("symlink + realpath explicit", str(alias), str(canonical)),
+            ("symlink, no explicit", str(alias), ""),
+            ("empty, no explicit", "", ""),
+            ("absent file", str(self.home / "absent.log"), ""),
+            ("directory", str(self.home), str(self.home)),
+        ):
+            values = {"--jobs": explicit} if explicit else {}
+            env = {"AGENT_DISPATCH_CALLER_HARNESS": "claude", "AGENT_DISPATCH_JOBS": inherited}
+            with self.subTest(label=label), self.assertRaises(OWNER.OwnerError) as refused:
+                OWNER._authoritative_jobs(values, env)
+            self.assertEqual(str(refused.exception), "inherited-registry-unusable")
+        self.assertIn("AGENT_DISPATCH_JOBS", OWNER.hint_for("inherited-registry-unusable"))
+        # the same symlink is fine for an unmanaged codex caller, and a managed codex
+        # parent still accepts its realpath alias
+        self.assertEqual(OWNER._authoritative_jobs({}, {"AGENT_DISPATCH_CALLER_HARNESS": "codex",
+                                                        "AGENT_DISPATCH_JOBS": str(alias)}), str(alias))
+
     def test_no_eligible_candidate_fails_without_wrapper_or_process(self):
         stamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         self.jobs.write_text(

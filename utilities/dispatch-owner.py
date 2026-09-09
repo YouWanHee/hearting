@@ -99,6 +99,9 @@ _HINTS = {
     "explicit-jobs-outside-parent-registry": "drop --jobs: an interactive Claude parent's completion hook trusts only the inherited "
                                              "AGENT_DISPATCH_JOBS (or the installed canonical registry), so an owner started into another "
                                              "registry could never wake this session",
+    "inherited-registry-unusable": "AGENT_DISPATCH_JOBS is set but is not an absolute, non-symlink regular file; the parent's "
+                                   "completion hook trusts nothing in that state, so unset it (canonical registry) or point it "
+                                   "at the real registry file before starting an owner",
 }
 
 
@@ -425,13 +428,37 @@ def _resolved_path(value):
     return Path(value).expanduser().resolve(strict=False)
 
 
-def _authoritative_jobs(values, env):
-    """Preserve the registry selected by a managed interactive parent.
+def _usable_registry(path):
+    """The hook's own registry predicate (`_validated_jobs`): an absolute,
+    non-symlink regular file. One definition of "usable" for the parent's hook
+    and the selector that starts owners into it (rewake review R4 M1)."""
 
-    A packaged activation root is immutable source, not runtime state.  The
-    managed launcher exports the enrolled registry once; accepting a different
-    depth-1 ``--jobs`` value would split the attempt graph before the selected
-    adapter gets a chance to validate it.
+    if not path:
+        return False
+    candidate = Path(path)
+    return candidate.is_absolute() and not candidate.is_symlink() and candidate.is_file()
+
+
+def _authoritative_jobs(values, env):
+    """The registry a depth-1 owner is started into, under two parent rules.
+
+    Managed interactive Codex parent: the launcher exported the enrolled
+    registry once (a packaged activation root is immutable source, not
+    runtime state); a different explicit ``--jobs`` would split the attempt
+    graph, so it is refused (`managed-parent-registry-immutable`) and a
+    realpath alias of the same file is accepted.
+
+    Interactive Claude parent: its asyncRewake hook trusts exactly one
+    registry -- the inherited `AGENT_DISPATCH_JOBS` when the variable is set
+    (and only if it is an absolute, non-symlink regular file: an unusable
+    value binds nothing there), else the installed canonical registry -- and
+    never a file a receipt names. So an unusable inherited value refuses the
+    launch (`inherited-registry-unusable`), and an explicit ``--jobs`` that is
+    not that trusted file refuses it (`explicit-jobs-outside-parent-registry`)
+    -- before spawn, typed and hinted, instead of the hook refusing after the
+    owner was sealed `claude-parent-runtime` (rewake reviews R3 M1, R4 M1).
+
+    Any other caller keeps the previous behaviour: explicit, else inherited.
     """
 
     explicit = values.get("--jobs", "")
@@ -444,15 +471,14 @@ def _authoritative_jobs(values, env):
         if explicit and _resolved_path(explicit) != _resolved_path(inherited):
             raise OwnerError("managed-parent-registry-immutable")
         return inherited
-    if explicit and _caller_harness(env) == "claude":
-        # An interactive Claude parent's asyncRewake hook trusts exactly one
-        # registry -- the inherited `AGENT_DISPATCH_JOBS`, else the installed
-        # canonical one -- and never a file a receipt names. An owner started
-        # into any other registry would be sealed `claude-parent-runtime` and
-        # then never wake its parent (rewake review R3 M1), so the selector
-        # refuses before spawn instead of the hook refusing after it.
-        trusted = inherited if "AGENT_DISPATCH_JOBS" in env else _canonical_jobs()
-        if not trusted or _resolved_path(explicit) != _resolved_path(trusted):
+    if _caller_harness(env) == "claude":
+        if "AGENT_DISPATCH_JOBS" in env:
+            if not _usable_registry(inherited):
+                raise OwnerError("inherited-registry-unusable")
+            trusted = inherited
+        else:
+            trusted = _canonical_jobs()
+        if explicit and (not trusted or _resolved_path(explicit) != _resolved_path(trusted)):
             raise OwnerError("explicit-jobs-outside-parent-registry")
     return explicit or inherited
 
