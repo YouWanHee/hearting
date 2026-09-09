@@ -99,9 +99,11 @@ _HINTS = {
     "explicit-jobs-outside-parent-registry": "drop --jobs: an interactive Claude parent's completion hook trusts only the inherited "
                                              "AGENT_DISPATCH_JOBS (or the installed canonical registry), so an owner started into another "
                                              "registry could never wake this session",
-    "inherited-registry-unusable": "AGENT_DISPATCH_JOBS is set but is not an absolute, non-symlink regular file; the parent's "
-                                   "completion hook trusts nothing in that state, so unset it (canonical registry) or point it "
-                                   "at the real registry file before starting an owner",
+    "inherited-registry-unusable": "AGENT_DISPATCH_JOBS is set but is not an absolute, non-symlink regular file, and the "
+                                   "parent's completion hook reads the SESSION's value, not this command's: changing or unsetting "
+                                   "it for one Bash call starts an owner the parent can never wake. Fix the variable in the "
+                                   "environment the interactive session was started with (or unset it there for the canonical "
+                                   "registry), then start a new session",
 }
 
 

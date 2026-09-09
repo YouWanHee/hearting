@@ -621,6 +621,7 @@ class DispatchOwnerTests(unittest.TestCase):
                 OWNER._authoritative_jobs(values, env)
             self.assertEqual(str(refused.exception), "inherited-registry-unusable")
         self.assertIn("AGENT_DISPATCH_JOBS", OWNER.hint_for("inherited-registry-unusable"))
+        self.assertIn("SESSION", OWNER.hint_for("inherited-registry-unusable"))  # R5 m1: a per-command change cannot help
         # the same symlink is fine for an unmanaged codex caller, and a managed codex
         # parent still accepts its realpath alias
         self.assertEqual(OWNER._authoritative_jobs({}, {"AGENT_DISPATCH_CALLER_HARNESS": "codex",
