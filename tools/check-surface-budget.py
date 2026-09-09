@@ -39,8 +39,9 @@ BUDGET_FILE = "tools/surface-budget.json"
 # Lower it only in the commit that lands a measured reduction; never raise it
 # without a reviewed rationale in that commit.
 #   2026-09-09 9c666bc2  420,908  kickoff seal
-#   2026-09-09 (this)    397,795  completion-delivery carriers moved to ADAPTATION §7
-TOTAL_BYTE_CEILING = 397_795
+#   2026-09-09 84215f45  397,795  completion-delivery carriers moved to ADAPTATION §7
+#   2026-09-09 (this)    361,173  §5.10 SD decision records moved to ADAPTATION §8
+TOTAL_BYTE_CEILING = 361_173
 SURFACES: tuple[str, ...] = (
     "core/CORE.md",
     "core/WORKFLOW.md",
