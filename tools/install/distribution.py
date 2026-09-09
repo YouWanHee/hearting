@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as dt
+import errno
 import hashlib
 import json
 import os
@@ -292,6 +293,25 @@ def _fsync_parent(path: Path) -> None:
         os.fsync(descriptor)
     except OSError:
         pass
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_dir_strict(path: Path) -> None:
+    """Fsync one directory, raising instead of swallowing failure.
+
+    Unlike ``_fsync_parent`` (a best-effort durability hint used elsewhere),
+    callers that gate a receipt approval or prune decision on crash-durable
+    archive state must know for certain the fsync actually happened."""
+    NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(str(path), os.O_RDONLY | os.O_DIRECTORY | NOFOLLOW)
+    except OSError as exc:
+        raise DistributionError(f"archive-fsync-failed: {path}") from exc
+    try:
+        os.fsync(descriptor)
+    except OSError as exc:
+        raise DistributionError(f"archive-fsync-failed: {path}") from exc
     finally:
         os.close(descriptor)
 
@@ -1666,6 +1686,737 @@ def _scoped_tree_digest(root: Path, relatives: list[str]) -> str:
     return digest.hexdigest()
 
 
+class _DeltaVerdictError(Exception):
+    """Internal typed control-flow error for the §4.0-4.2 comparison helpers.
+
+    Never escapes a public function; callers translate it into a typed
+    ``(bool, str)``/verdict-dict result. The ``code`` is one of the
+    ``delta-*``/``archive-*`` reason strings core/OPERATIONS.md's release
+    pruning contract names.
+    """
+
+    def __init__(self, code: str, detail: str = "") -> None:
+        self.code = code
+        self.detail = detail
+        super().__init__(f"{code}: {detail}" if detail else code)
+
+
+def _safe_relative_components(relative: str) -> list[str]:
+    """Reject any relative path that could escape or alias its root.
+
+    Empty components, ``.``/``..``, absolute paths, backslashes, and NUL are
+    all refused before any filesystem access -- this runs before archive
+    directory/file creation too (round 1 🔴5)."""
+
+    if not isinstance(relative, str) or not relative or "\\" in relative or "\x00" in relative:
+        raise _DeltaVerdictError("delta-unsafe-relative", str(relative))
+    if relative.startswith("/"):
+        raise _DeltaVerdictError("delta-unsafe-relative", relative)
+    parts = relative.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        raise _DeltaVerdictError("delta-unsafe-relative", relative)
+    return parts
+
+
+def _open_contained_regular(root: Path, relative: str) -> tuple[int, os.stat_result]:
+    """Component-wise ``dir_fd`` descent to an existing regular leaf file.
+
+    Every intermediate component (including the root) is opened
+    ``O_DIRECTORY|O_NOFOLLOW`` one at a time, so a symlinked parent anywhere
+    in the chain fails closed instead of being silently followed (round 1
+    🔴5 -- a single top-level ``O_NOFOLLOW`` only protects the last
+    component). The leaf is opened non-blocking with no-follow
+    preclassification (D5): ``O_NOFOLLOW`` governs link handling, not FIFO
+    semantics, so a plain blocking open of a writer-less FIFO hangs before
+    any typed verdict is possible. Kind is validated authoritatively
+    afterward via ``fstat`` on the already-open descriptor, and a confirmed
+    regular file has ``O_NONBLOCK`` cleared before being handed back so
+    ordinary buffered reads behave normally. Returns ``(fd, stat)`` -- the
+    caller owns closing ``fd``."""
+
+    NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+    NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+    parts = _safe_relative_components(relative)
+    absolute_root = Path(os.path.abspath(root))
+    parts = list(absolute_root.parts[1:]) + parts
+    try:
+        fd = os.open(absolute_root.anchor, os.O_RDONLY | os.O_DIRECTORY | NOFOLLOW)
+    except FileNotFoundError as exc:
+        raise _DeltaVerdictError("delta-absent", relative) from exc
+    except NotADirectoryError as exc:
+        raise _DeltaVerdictError("delta-unsafe-path", relative) from exc
+    except OSError as exc:
+        code = "delta-unsafe-path" if exc.errno == errno.ELOOP else "delta-unreadable"
+        raise _DeltaVerdictError(code, relative) from exc
+    try:
+        for component in parts[:-1]:
+            try:
+                next_fd = os.open(component, os.O_RDONLY | os.O_DIRECTORY | NOFOLLOW, dir_fd=fd)
+            except FileNotFoundError as exc:
+                raise _DeltaVerdictError("delta-absent", relative) from exc
+            except NotADirectoryError as exc:
+                raise _DeltaVerdictError("delta-unsafe-path", relative) from exc
+            except OSError as exc:
+                code = "delta-unsafe-path" if exc.errno == errno.ELOOP else "delta-unreadable"
+                raise _DeltaVerdictError(code, relative) from exc
+            os.close(fd)
+            fd = next_fd
+        leaf = parts[-1]
+        try:
+            leaf_fd = os.open(leaf, os.O_RDONLY | NOFOLLOW | NONBLOCK, dir_fd=fd)
+        except FileNotFoundError as exc:
+            raise _DeltaVerdictError("delta-absent", relative) from exc
+        except OSError as exc:
+            code = "delta-unsafe-path" if exc.errno == errno.ELOOP else "delta-unreadable"
+            raise _DeltaVerdictError(code, relative) from exc
+    finally:
+        os.close(fd)
+    try:
+        st = os.fstat(leaf_fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise _DeltaVerdictError("delta-kind-mismatch", relative)
+        if NONBLOCK:
+            try:
+                import fcntl
+
+                current_flags = fcntl.fcntl(leaf_fd, fcntl.F_GETFL)
+                fcntl.fcntl(leaf_fd, fcntl.F_SETFL, current_flags & ~NONBLOCK)
+            except ImportError:
+                pass
+        return leaf_fd, st
+    except BaseException:
+        os.close(leaf_fd)
+        raise
+
+
+def _read_contained_bytes(root: Path, relative: str) -> tuple[bytes, os.stat_result, str]:
+    """Read a contained regular file and bind its observed identity (round 1 🔴5).
+
+    After the full read, the descriptor is re-``fstat``-ed to catch an
+    in-place modification during the read (``delta-race``). The same path is
+    then re-opened from scratch to catch a rename/replace race: the freshly
+    opened file's ``(st_dev, st_ino)`` must match what was just read, which a
+    single fd-level re-stat cannot see."""
+
+    fd, before = _open_contained_regular(root, relative)
+    try:
+        chunks = []
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        data = b"".join(chunks)
+        after = os.fstat(fd)
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+            after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns,
+        ):
+            raise _DeltaVerdictError("delta-race", relative)
+    finally:
+        os.close(fd)
+    digest = hashlib.sha256(data).hexdigest()
+    reopened_fd, reopened_st = _open_contained_regular(root, relative)
+    try:
+        if (reopened_st.st_dev, reopened_st.st_ino, reopened_st.st_size,
+                reopened_st.st_mtime_ns, reopened_st.st_ctime_ns) != (
+                before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns):
+            raise _DeltaVerdictError("delta-race", relative)
+    finally:
+        os.close(reopened_fd)
+    return data, before, digest
+
+
+_ATTEMPT_SIDECAR_SCHEMA: dict[str, type] = {
+    "schema_version": int, "route_id": str, "node_id": str, "attempt_id": str,
+    "dispatch_depth": int, "transport": str, "execution_surface": str,
+    "registered_worker": bool, "fallback_hop": str, "evidence_sha256": str,
+    "completion_marker": str, "completion_marker_history": str,
+}
+# Mirrors the producer's own field order: capability-route.py's `attempt_link`
+# literal (:4519-4530), written verbatim by `write_once` (:3063-3070).
+# `_ATTEMPT_SIDECAR_SCHEMA` above was authored in that same order, so the
+# canonical order is derived from it rather than hand-copied a second time.
+_ATTEMPT_SIDECAR_CANONICAL_ORDER = tuple(_ATTEMPT_SIDECAR_SCHEMA)
+_ATTEMPT_SIDECAR_MARKER_KEYS = ("completion_marker", "completion_marker_history")
+_ATTEMPT_HISTORY_NAME_RE = re.compile(r"^(?P<node_id>.+)\.(?P<seq>[0-9]+)\.json$")
+
+
+def _is_owned_attempt_sidecar(relative: str) -> bool:
+    """``completion/<route_id>/<node_id>[.<safe_attempt>].attempt.json`` only."""
+
+    parts = relative.split("/")
+    if len(parts) != 3 or parts[0] != "completion" or not parts[1]:
+        return False
+    filename = parts[2]
+    if not filename.endswith(".attempt.json"):
+        return False
+    stem = filename[: -len(".attempt.json")]
+    return bool(stem) and "/" not in stem
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
+    seen: dict = {}
+    for key, value in pairs:
+        if key in seen:
+            raise _DeltaVerdictError("delta-duplicate-key", key)
+        seen[key] = value
+    return seen
+
+
+def _parse_sidecar_strict(raw: bytes) -> dict:
+    """Strict parse of an owned attempt sidecar: no duplicate keys, exact 12-field schema."""
+
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _DeltaVerdictError("delta-malformed-json") from exc
+    try:
+        data = json.loads(text, object_pairs_hook=_reject_duplicate_keys)
+    except _DeltaVerdictError:
+        raise
+    except ValueError as exc:
+        raise _DeltaVerdictError("delta-malformed-json") from exc
+    if not isinstance(data, dict):
+        raise _DeltaVerdictError("delta-malformed-json")
+    if set(data) != set(_ATTEMPT_SIDECAR_SCHEMA):
+        raise _DeltaVerdictError("delta-schema-unknown-field")
+    for key, expected in _ATTEMPT_SIDECAR_SCHEMA.items():
+        value = data[key]
+        if expected is bool:
+            ok = isinstance(value, bool)
+        elif expected is int:
+            ok = isinstance(value, int) and not isinstance(value, bool)
+        else:
+            ok = isinstance(value, str)
+        if not ok:
+            raise _DeltaVerdictError("delta-schema-type", key)
+    if data["schema_version"] != 2:
+        raise _DeltaVerdictError("delta-schema-type", "schema_version")
+    return data
+
+
+def _expected_marker_paths(link: dict, root: Path) -> tuple[str, Optional[str]]:
+    """Derive the two marker paths from the sidecar's own identity, never by
+    re-anchoring equivalence (round 1 🔴4)."""
+
+    route_id, node_id = link.get("route_id"), link.get("node_id")
+    marker = str(Path(root) / "completion" / str(route_id) / f"{node_id}.json")
+    history_value = link.get("completion_marker_history")
+    seq = None
+    if isinstance(history_value, str):
+        match = _ATTEMPT_HISTORY_NAME_RE.match(Path(history_value).name)
+        if match and match.group("node_id") == str(node_id):
+            seq = match.group("seq")
+    history = (str(Path(root) / "completion" / str(route_id) / f"{node_id}.{seq}.json")
+               if seq is not None else None)
+    return marker, history
+
+
+def _semantic_reanchor_equal(
+    src_bytes: bytes, tgt_bytes: bytes, stale_dispatch: Path, surviving_root: Path,
+    relative: str,
+) -> tuple[bool, str]:
+    """§4.1 six-step semantic-equality procedure for one owned attempt sidecar."""
+
+    def _dump(value: dict) -> bytes:
+        return (json.dumps(value, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+
+    try:
+        src = _parse_sidecar_strict(src_bytes)
+        tgt = _parse_sidecar_strict(tgt_bytes)
+        if src_bytes != _dump(src):
+            raise _DeltaVerdictError("delta-source-serialization", relative)
+        if tuple(src) != _ATTEMPT_SIDECAR_CANONICAL_ORDER:
+            raise _DeltaVerdictError("delta-source-key-order", relative)
+        for key in src:
+            if key in _ATTEMPT_SIDECAR_MARKER_KEYS:
+                continue
+            if src[key] != tgt.get(key):
+                raise _DeltaVerdictError("delta-content-change", key)
+        src_marker, src_history = _expected_marker_paths(src, stale_dispatch)
+        tgt_marker, tgt_history = _expected_marker_paths(tgt, surviving_root)
+        if src_history is None or tgt_history is None:
+            raise _DeltaVerdictError("delta-forged-reanchor", relative)
+        for candidate_root, value in (
+            (stale_dispatch, src_marker), (stale_dispatch, src_history),
+            (surviving_root, tgt_marker), (surviving_root, tgt_history),
+        ):
+            try:
+                _safe_relative_components(str(Path(value).relative_to(candidate_root)))
+            except ValueError:
+                raise _DeltaVerdictError("delta-unsafe-relative", value) from None
+        if src["completion_marker"] != src_marker:
+            raise _DeltaVerdictError("delta-source-unowned", "completion_marker")
+        if src["completion_marker_history"] != src_history:
+            raise _DeltaVerdictError("delta-source-unowned", "completion_marker_history")
+        if tgt["completion_marker"] != tgt_marker:
+            raise _DeltaVerdictError("delta-forged-reanchor", "completion_marker")
+        if tgt["completion_marker_history"] != tgt_history:
+            raise _DeltaVerdictError("delta-forged-reanchor", "completion_marker_history")
+        src_seq = _ATTEMPT_HISTORY_NAME_RE.match(Path(src_history).name).group("seq")
+        tgt_seq = _ATTEMPT_HISTORY_NAME_RE.match(Path(tgt_history).name).group("seq")
+        if src_seq != tgt_seq:
+            raise _DeltaVerdictError("delta-forged-reanchor", "sequence")
+        # Cross-file comparison (round 2 D4): reanchor `src` onto the target's
+        # own expected marker values and compare `tgt_bytes` directly against
+        # that dump. Because `copy` keeps `src`'s (now canonical-checked) key
+        # order, a `tgt` that carries the same content in a different key
+        # order fails here even though its raw bytes are internally
+        # self-consistent JSON. This subsumes the old same-file
+        # `tgt_bytes != _dump(tgt)` self-consistency check: any `tgt_bytes`
+        # that clears this comparison is, by construction, an exact byte match
+        # for the canonical dump of its own parsed content.
+        copy = dict(src)
+        copy["completion_marker"] = tgt_marker
+        copy["completion_marker_history"] = tgt_history
+        if tgt_bytes != _dump(copy):
+            raise _DeltaVerdictError("delta-serialization-mismatch", relative)
+    except _DeltaVerdictError as exc:
+        return False, exc.code
+    return True, "semantic-equal"
+
+
+def _migration_delta_verdicts(candidate: Path, environ: dict[str, str]) -> list[dict]:
+    """Per-file verdicts for `candidate`'s leftover `.dispatch` (§4.0/§4.1, CLI reuse)."""
+
+    if not _dispatch_migration_promoted(environ):
+        return []
+    stale_dispatch = candidate / ".dispatch"
+    if not stale_dispatch.is_dir():
+        return []
+    surviving_root = stable_state_root(environ)
+    verdicts: list[dict] = []
+    for relative in _migration_relative_files(stale_dispatch):
+        try:
+            src_bytes, _, src_sha = _read_contained_bytes(stale_dispatch, relative)
+        except _DeltaVerdictError as exc:
+            # Source was already confirmed a regular file during enumeration;
+            # any failure here is a race/replace on the candidate itself.
+            verdicts.append({"relative": relative, "verdict": "blocked", "code": exc.code})
+            continue
+        try:
+            tgt_bytes, _, tgt_sha = _read_contained_bytes(surviving_root, relative)
+        except _DeltaVerdictError as exc:
+            if exc.code == "delta-absent":
+                verdicts.append({
+                    "relative": relative, "verdict": "missing-target",
+                    "source_sha256": src_sha, "source_bytes": len(src_bytes),
+                    "target_sha256": None,
+                })
+            else:
+                # A non-regular/racing/unreadable target is never an archive
+                # candidate -- only genuine absence is (round 1 🔴5).
+                verdicts.append({"relative": relative, "verdict": "blocked", "code": exc.code})
+            continue
+        if src_sha == tgt_sha:
+            verdicts.append({"relative": relative, "verdict": "equal"})
+            continue
+        if _is_owned_attempt_sidecar(relative):
+            ok, code = _semantic_reanchor_equal(
+                src_bytes, tgt_bytes, stale_dispatch, surviving_root, relative
+            )
+            if ok:
+                verdicts.append({"relative": relative, "verdict": "semantic-equal"})
+                continue
+            verdicts.append({"relative": relative, "verdict": "blocked", "code": code})
+            continue
+        verdicts.append({
+            "relative": relative, "verdict": "differing",
+            "source_sha256": src_sha, "source_bytes": len(src_bytes),
+            "target_sha256": tgt_sha,
+        })
+    return verdicts
+
+
+def _release_evidence_archive_root(environ: dict[str, str], candidate: Path) -> Path:
+    return stable_state_root(environ).parent / "inventory" / "release-evidence" / candidate.name
+
+
+def _mkdir_components(root: Path, relative_dir: Path, *, mode: int) -> None:
+    """Component-wise directory creation under an open ``dir_fd`` chain.
+
+    ``O_EXCL`` alone does not protect against a symlinked parent; each
+    component is reopened ``O_DIRECTORY|O_NOFOLLOW`` immediately after
+    creation, so a symlink anywhere in the chain fails closed."""
+
+    if str(relative_dir) in ("", "."):
+        return
+    NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(str(root), os.O_RDONLY | os.O_DIRECTORY | NOFOLLOW)
+    try:
+        for part in relative_dir.parts:
+            try:
+                os.mkdir(part, mode, dir_fd=fd)
+            except FileExistsError:
+                pass
+            try:
+                next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | NOFOLLOW, dir_fd=fd)
+            except OSError as exc:
+                raise DistributionError(f"archive-unsafe-path: {part}") from exc
+            os.close(fd)
+            fd = next_fd
+    finally:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def _exclusive_flock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(str(path), flags, 0o600)
+    try:
+        import fcntl
+
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def _canonical_json_bytes(value: object) -> bytes:
+    return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def _utc_now() -> str:
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _evidence_read(path: Path):
+    """Optional regular-file observation through every nofollow component."""
+    absolute = Path(os.path.abspath(path))
+    try:
+        raw, st, digest = _read_contained_bytes(Path(absolute.anchor), absolute.as_posix()[1:])
+    except _DeltaVerdictError as exc:
+        if exc.code == "delta-absent":
+            return None
+        raise DistributionError(f"{exc.code}: {path}") from exc
+    identity = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+    return raw, identity, digest
+
+
+def _evidence_recheck(observations):
+    for path, identity in getattr(observations, "directories", {}).items():
+        with _evidence_parent(path) as (fd, _chain):
+            st = os.fstat(fd)
+            if (st.st_dev, st.st_ino) != identity:
+                raise DistributionError(f"archive-parent-raced: {path}")
+    for path, expected in observations.items():
+        if _evidence_read(path) != expected:
+            raise DistributionError(f"archive-identity-conflict: {path}")
+
+
+class _EvidenceObservations(dict):
+    def __init__(self):
+        super().__init__()
+        self.directories = {}
+
+
+@contextlib.contextmanager
+def _evidence_parent(path):
+    """Acquire every component without following links and retain its identity."""
+    absolute = Path(os.path.abspath(path))
+    fd = os.open(absolute.anchor, os.O_RDONLY | os.O_DIRECTORY)
+    chain = {}
+    current = Path(absolute.anchor)
+    try:
+        for part in absolute.parts[1:]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                            dir_fd=fd)
+            os.close(fd)
+            fd = child
+            current /= part
+            st = os.fstat(fd)
+            chain[current] = (st.st_dev, st.st_ino)
+        yield fd, chain
+    except OSError as exc:
+        raise DistributionError(f"archive-unsafe-path: {path}") from exc
+    finally:
+        os.close(fd)
+
+
+def _evidence_directories(path: Path, *, create=False, observations=None):
+    """Check the whole hierarchy before mutation; fsync every mkdir edge."""
+    absolute = Path(os.path.abspath(path))
+    fd = os.open(absolute.anchor, os.O_RDONLY | os.O_DIRECTORY)
+    current = Path(absolute.anchor)
+    try:
+        for part in absolute.parts[1:]:
+            if create:
+                try:
+                    os.mkdir(part, 0o700, dir_fd=fd)
+                    os.fsync(fd)
+                except FileExistsError:
+                    pass
+            try:
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                dir_fd=fd)
+            except FileNotFoundError:
+                return
+            except OSError as exc:
+                raise DistributionError(f"archive-unsafe-path: {path}") from exc
+            os.close(fd)
+            fd = child
+            current /= part
+            if observations is not None:
+                st = os.fstat(fd)
+                identity = (st.st_dev, st.st_ino)
+                if observations.directories.setdefault(current, identity) != identity:
+                    raise DistributionError(f"archive-parent-raced: {current}")
+        if create:
+            os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _evidence_owned_leaf(fd, name, owned, raw):
+    """Exact current-content ownership; an exclusive name alone is insufficient."""
+    try:
+        leaf = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+    except FileNotFoundError:
+        return "absent"
+    except OSError:
+        return "conflict"
+    try:
+        before = os.fstat(leaf)
+        if (not stat.S_ISREG(before.st_mode)
+                or (before.st_dev, before.st_ino) != (owned.st_dev, owned.st_ino)
+                or before.st_size != len(raw)):
+            return "conflict"
+        with os.fdopen(os.dup(leaf), "rb") as handle:
+            current = handle.read(len(raw) + 1)
+        after = os.fstat(leaf)
+        named = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        signature = lambda st: (st.st_dev, st.st_ino, st.st_mode, st.st_size,
+                                st.st_mtime_ns, st.st_ctime_ns)
+        if (signature(before) != signature(after) or signature(after) != signature(named)
+                or hashlib.sha256(current).digest() != hashlib.sha256(raw).digest()):
+            return "conflict"
+        return "owned"
+    except OSError:
+        return "conflict"
+    finally:
+        os.close(leaf)
+
+
+# destructive-ok: reason=remove only exact regular inode-and-content-owned temporary or failed new receipt; boundary=held parent descriptor and current leaf digest
+def _evidence_publish_new(path, raw, observations):
+    with _evidence_parent(path.parent) as (parent_fd, chain):
+        # Bind both the previously validated hierarchy and this acquisition at
+        # the write boundary, before even creating a temporary directory entry.
+        _evidence_recheck(observations)
+        with _evidence_parent(path.parent) as (_check_fd, current_chain):
+            if chain != current_chain:
+                raise DistributionError("archive-parent-raced")
+        fd = os.dup(parent_fd)
+    tmp = ".archive-" + uuid.uuid4().hex
+    owned = None
+    published = False
+    try:
+        out = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                      0o600, dir_fd=fd)
+        owned = os.fstat(out)
+        with os.fdopen(out, "wb") as handle:
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+        _evidence_recheck(observations)
+        with _evidence_parent(path.parent) as (_check_fd, current_chain):
+            if chain != current_chain:
+                raise DistributionError("archive-parent-raced")
+        if _evidence_owned_leaf(fd, tmp, owned, raw) != "owned":
+            raise DistributionError("archive-staging-ownership-conflict")
+        os.link(tmp, path.name, src_dir_fd=fd, dst_dir_fd=fd, follow_symlinks=False)
+        published = True
+        os.fsync(fd)
+    except BaseException:
+        # Never restore over a successor. Only retract our exact unpublished
+        # approval if durability failed; archived sources remain available.
+        if published and path.name == "receipt.json":
+            ownership = _evidence_owned_leaf(fd, path.name, owned, raw)
+            if ownership == "owned":
+                os.unlink(path.name, dir_fd=fd)
+                os.fsync(fd)
+            elif ownership == "conflict":
+                raise DistributionError("archive-receipt-ownership-conflict")
+        raise
+    finally:
+        try:
+            if owned is not None:
+                ownership = _evidence_owned_leaf(fd, tmp, owned, raw)
+                if ownership == "owned":
+                    os.unlink(tmp, dir_fd=fd)
+                elif ownership == "conflict":
+                    raise DistributionError("archive-staging-ownership-conflict")
+        finally:
+            os.close(fd)
+
+
+def _archive_release_evidence(
+    candidate: Path, environ: dict[str, str], entries: list[dict], *, expect: Optional[str],
+) -> dict:
+    """Validate the complete request before staging; publish immutable evidence."""
+    if _release_evidence_child(candidate.name) != candidate:
+        raise DistributionError("archive-release-not-canonical")
+    archive_root = _release_evidence_archive_root(environ, candidate)
+    receipt_path = archive_root / "receipt.json"
+    observations = _EvidenceObservations()
+    sealed_entries, contents, seen = [], {}, set()
+    _evidence_directories(archive_root / "files", observations=observations)
+    for entry in sorted(entries, key=lambda item: item["relative"]):
+        relative = entry["relative"]
+        _safe_relative_components(relative)
+        if relative in seen or entry.get("verdict") not in ("missing-target", "differing"):
+            raise DistributionError(f"archive-invalid-entry: {relative}")
+        seen.add(relative)
+        source = candidate / ".dispatch" / relative
+        successor = stable_state_root(environ) / relative
+        archived = archive_root / "files" / relative
+        _evidence_directories(archived.parent, observations=observations)
+        src = observations[source] = _evidence_read(source)
+        if src is None or src[2] != entry.get("source_sha256") or len(src[0]) != entry.get("source_bytes"):
+            raise DistributionError(f"archive-source-changed: {relative}")
+        tgt = observations[successor] = _evidence_read(successor)
+        if ((entry["verdict"] == "missing-target" and tgt is not None)
+                or (entry["verdict"] == "differing" and
+                    (tgt is None or tgt[2] != entry.get("target_sha256")))):
+            raise DistributionError(f"archive-successor-changed: {relative}")
+        old = observations[archived] = _evidence_read(archived)
+        if old is not None and old[2] != src[2]:
+            raise DistributionError(f"archive-conflict: {relative}")
+        contents[archived] = src[0]
+        sealed_entries.append({"relative": relative, "verdict": entry["verdict"],
+            "source_sha256": src[2], "source_bytes": len(src[0]),
+            "target_sha256": tgt[2] if tgt else None, "archived_sha256": src[2]})
+    inventory_digest = "sha256:" + hashlib.sha256(_canonical_json_bytes(sealed_entries)).hexdigest()
+    receipt = {"schema_version": 1, "release": candidate.name, "recorded_at": _utc_now(),
+        "surviving_root": str(stable_state_root(environ)), "entries": sealed_entries,
+        "inventory_digest": inventory_digest}
+    previous = observations[receipt_path] = _evidence_read(receipt_path)
+    current_digest = "absent"
+    if previous is not None:
+        try:
+            existing = json.loads(previous[0], object_pairs_hook=_reject_duplicate_keys)
+            current_digest = existing["inventory_digest"]
+            if (existing.get("schema_version") != 1 or existing.get("release") != candidate.name
+                    or existing.get("surviving_root") != receipt["surviving_root"]
+                    or existing.get("entries") != sealed_entries
+                    or current_digest != inventory_digest):
+                raise ValueError("receipt is not the exact immutable inventory")
+        except (ValueError, KeyError, TypeError, _DeltaVerdictError) as exc:
+            raise DistributionError("archive-receipt-conflict") from exc
+        receipt = existing
+    if expect is not None and expect != current_digest:
+        raise DistributionError("archive-receipt-conflict")
+    # Complete validation above includes absence, all source/successor bytes,
+    # archive conflicts, directory kinds and receipt CAS before lock creation.
+    _evidence_recheck(observations)
+    _evidence_directories(archive_root, create=True, observations=observations)
+    with _exclusive_flock(archive_root / ".archive.lock"):
+        _evidence_recheck(observations)
+        for path, raw in contents.items():
+            _evidence_directories(path.parent, create=True, observations=observations)
+            _evidence_recheck(observations)
+            if observations[path] is None:
+                _evidence_publish_new(path, raw, observations)
+                observations[path] = _evidence_read(path)
+            # A crash residue is reusable only after full revalidation AND
+            # re-establishing durable file and directory state in this attempt.
+            opened, _ = _open_contained_regular(Path(path.anchor), path.as_posix()[1:])
+            try:
+                os.fsync(opened)
+            finally:
+                os.close(opened)
+            _fsync_dir_strict(path.parent)
+        _evidence_recheck(observations)
+        _fsync_dir_strict(archive_root)
+        _fsync_dir_strict(archive_root.parent)
+        if previous is None:
+            raw = (json.dumps(receipt, indent=2, ensure_ascii=False, sort_keys=True) + "\n").encode()
+            _evidence_publish_new(receipt_path, raw, observations)
+    return receipt
+
+
+def _release_evidence_receipt_accepted(
+    candidate: Path, environ: dict[str, str], current_unproven: list[dict],
+) -> bool:
+    """§4.2 proof-acceptance: re-open and re-hash every archived/source/successor
+    file at each check -- a receipt is a list, never a cached verdict."""
+
+    archive_root = _release_evidence_archive_root(environ, candidate)
+    receipt_path = archive_root / "receipt.json"
+    if not receipt_path.is_file():
+        return False
+    try:
+        raw, _, _ = _read_contained_bytes(archive_root, "receipt.json")
+    except _DeltaVerdictError:
+        return False
+    try:
+        receipt = json.loads(raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
+    except (_DeltaVerdictError, ValueError, UnicodeDecodeError):
+        return False
+    if not isinstance(receipt, dict) or receipt.get("schema_version") != 1:
+        return False
+    if receipt.get("release") != candidate.name:
+        return False
+    if receipt.get("surviving_root") != str(stable_state_root(environ)):
+        return False
+    entries = receipt.get("entries")
+    if not isinstance(entries, list) or not entries:
+        return False
+    seen: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            return False
+        relative = entry.get("relative")
+        try:
+            _safe_relative_components(relative)
+        except _DeltaVerdictError:
+            return False
+        if relative in seen:
+            return False
+        seen.add(relative)
+        verdict = entry.get("verdict")
+        if verdict not in ("missing-target", "differing"):
+            return False
+        if verdict == "differing" and not entry.get("target_sha256"):
+            return False
+        if verdict == "missing-target" and entry.get("target_sha256") is not None:
+            return False
+    recomputed = "sha256:" + hashlib.sha256(
+        _canonical_json_bytes(sorted(entries, key=lambda item: item["relative"]))
+    ).hexdigest()
+    if recomputed != receipt.get("inventory_digest"):
+        return False
+    if seen != {entry["relative"] for entry in current_unproven}:
+        return False
+    files_root = archive_root / "files"
+    for entry in entries:
+        relative = entry["relative"]
+        try:
+            _, _, archived_sha = _read_contained_bytes(files_root, relative)
+        except _DeltaVerdictError:
+            return False
+        if archived_sha != entry.get("archived_sha256") or archived_sha != entry.get("source_sha256"):
+            return False
+        try:
+            _, _, source_sha = _read_contained_bytes(candidate / ".dispatch", relative)
+        except _DeltaVerdictError:
+            return False
+        if source_sha != entry.get("source_sha256"):
+            return False
+        if entry["verdict"] == "differing":
+            try:
+                _, _, target_sha = _read_contained_bytes(stable_state_root(environ), relative)
+            except _DeltaVerdictError:
+                return False
+            if target_sha != entry.get("target_sha256"):
+                return False
+    return True
+
+
 def _tree_total_bytes(root: Path) -> int:
     if not root.is_dir():
         return 0
@@ -2002,8 +2753,10 @@ def _migration_deletion_precondition(candidate: Path, environ: dict[str, str]) -
     (1) the journal is `completed` (implied by promotion), (2) its
     legacy-bound writers are quiescent/reconciled -- the caller's
     `_succeed_dispatch_state(candidate)` carry-forward already did that sweep
-    (M6) -- and (3) the final delta digest verifies clean here. Any
-    undecidable or failed state is a typed refusal
+    (M6) -- and (3) every file either matches, is a proven semantic
+    reanchor (core/OPERATIONS.md "Release pruning is evidence-bound"), or has
+    been preserved in a lossless archive under a sealed receipt. Any
+    undecidable, malformed, or unarchived state is a typed refusal
     (`dispatch-state-migration-blocked-live-attempt`), never a
     warn-and-continue; the retention floor in `_cleanup_releases` is a time
     delay, not evidence, and plays no part in this decision."""
@@ -2013,16 +2766,15 @@ def _migration_deletion_precondition(candidate: Path, environ: dict[str, str]) -
     stale_dispatch = candidate / ".dispatch"
     if not stale_dispatch.is_dir():
         return True, ""
-    stable_root = stable_state_root(environ)
-    for relative in _migration_relative_files(stale_dispatch):
-        target = stable_root / relative
-        if not target.is_file():
-            return False, "dispatch-state-migration-blocked-live-attempt:delta-unreconciled"
-        try:
-            if _sha256_file(stale_dispatch / relative) != _sha256_file(target):
-                return False, "dispatch-state-migration-blocked-live-attempt:delta-digest-mismatch"
-        except OSError:
-            return False, "dispatch-state-migration-blocked-live-attempt:delta-unreadable"
+    verdicts = _migration_delta_verdicts(candidate, environ)
+    for entry in verdicts:
+        if entry["verdict"] == "blocked":
+            return False, f"dispatch-state-migration-blocked-live-attempt:{entry['code']}"
+    unproven = [entry for entry in verdicts if entry["verdict"] in ("missing-target", "differing")]
+    if not unproven:
+        return True, ""
+    if not _release_evidence_receipt_accepted(candidate, environ, unproven):
+        return False, "dispatch-state-migration-blocked-live-attempt:evidence-unarchived"
     return True, ""
 
 
@@ -2971,7 +3723,10 @@ def _commit_forced_prune_gap_record(candidate: Path, environ: dict[str, str], re
 
 
 # destructive-ok: reason=prune only retention-proved version directories; boundary=canonical children of the managed releases root
-def _cleanup_releases(keep: set[Path], *, force_prune_unproven: bool = False) -> None:
+def _cleanup_releases(
+    keep: set[Path], *, force_prune_unproven: bool = False,
+    archive_unmigrated_evidence: bool = False,
+) -> None:
     releases = data_root() / "releases"
     if not releases.is_dir() or releases.is_symlink():
         return
@@ -3039,6 +3794,23 @@ def _cleanup_releases(keep: set[Path], *, force_prune_unproven: bool = False) ->
         # `_release_in_use`/`_succeed_dispatch_state` above are never
         # force-overridable: those guard live/unmigrated state, not proof.
         unproven_reasons = []
+        if archive_unmigrated_evidence:
+            # Opt-in only (core/OPERATIONS.md "Release pruning is
+            # evidence-bound"): §4.1 semantic equality already applies to
+            # every `update`, so this flag only extends coverage to
+            # genuinely differing/missing files by archiving them first.
+            # Best-effort -- a failed archive attempt here just leaves the
+            # candidate unproven, handled by the ordinary gate below.
+            verdicts = _migration_delta_verdicts(candidate, os.environ)
+            unproven_now = [v for v in verdicts if v["verdict"] in ("missing-target", "differing")]
+            if unproven_now and not any(v["verdict"] == "blocked" for v in verdicts):
+                try:
+                    _archive_release_evidence(candidate, os.environ, unproven_now, expect=None)
+                except DistributionError as exc:
+                    print(
+                        f"harness release: evidence archive failed for {candidate}: {exc}",
+                        file=sys.stderr,
+                    )
         migration_ok, migration_reason = _migration_deletion_precondition(candidate, os.environ)
         if not migration_ok:
             unproven_reasons.append(migration_reason)
@@ -3078,6 +3850,7 @@ def _install_or_update(
     channel: str,
     pinned_version: Optional[str],
     force_prune_unproven: bool = False,
+    archive_unmigrated_evidence: bool = False,
 ) -> dict:
     repository = _validate_repository(repository)
     if version != "latest":
@@ -3151,6 +3924,7 @@ def _install_or_update(
                 _cleanup_releases(
                     {Path(previous_state["release_root"])},
                     force_prune_unproven=True,
+                    archive_unmigrated_evidence=archive_unmigrated_evidence,
                 )
             return {
                 "status": "repaired" if repaired else "up-to-date",
@@ -3363,7 +4137,10 @@ def _install_or_update(
                     f"{old_root}; rotated state may be stranded until the next update",
                     file=sys.stderr,
                 )
-        _cleanup_releases(keep, force_prune_unproven=force_prune_unproven)
+        _cleanup_releases(
+            keep, force_prune_unproven=force_prune_unproven,
+            archive_unmigrated_evidence=archive_unmigrated_evidence,
+        )
         # M1-M6: migrate whatever legacy dispatch state just landed under the
         # newly-activated release into the stable root and, once verified,
         # promote it (M4). Unlike M0 above, a migration-internal failure here
@@ -3436,6 +4213,7 @@ def update(
     runtimes: Optional[Iterable[str]] = None,
     automatic: bool = False,
     force_prune_unproven: bool = False,
+    archive_unmigrated_evidence: bool = False,
 ) -> dict:
     state = _load_state()
     if not state:
@@ -3470,6 +4248,7 @@ def update(
         channel=channel,
         pinned_version=pinned_version,
         force_prune_unproven=force_prune_unproven,
+        archive_unmigrated_evidence=archive_unmigrated_evidence,
     )
 
 
@@ -3959,6 +4738,128 @@ def _print_result(result: dict, as_json: bool) -> None:
         print(f"PATH: ensure {result['path_hint']} is on PATH")
 
 
+def _release_evidence_targets(release_name: Optional[str]) -> list[Path]:
+    releases = data_root() / "releases"
+    if not releases.is_dir():
+        return []
+    all_dirs = sorted(
+        (path for path in releases.iterdir() if path.is_dir() and not path.is_symlink())
+    )
+    if release_name is None:
+        return all_dirs
+    matches = [path for path in all_dirs if path.name == release_name]
+    if not matches:
+        raise DistributionError(f"release not found: {release_name}")
+    return matches
+
+
+def _release_evidence_check(release_name: Optional[str]) -> dict:
+    out = {}
+    for candidate in _release_evidence_targets(release_name):
+        verdicts = _migration_delta_verdicts(candidate, os.environ)
+        unproven = [entry for entry in verdicts if entry["verdict"] in ("missing-target", "differing")]
+        blocked = [entry for entry in verdicts if entry["verdict"] == "blocked"]
+        accepted = (
+            False if blocked else
+            _release_evidence_receipt_accepted(candidate, os.environ, unproven) if unproven else True
+        )
+        out[candidate.name] = {
+            "verdicts": verdicts,
+            "unproven_count": len(unproven),
+            "evidence_accepted": accepted,
+            "prunable": not blocked and (not unproven or accepted),
+        }
+    return out
+
+
+def _release_evidence_plan(release_name: str, out_path: Path) -> dict:
+    targets = _release_evidence_targets(release_name)
+    if len(targets) != 1:
+        raise DistributionError("release-evidence plan requires exactly one --release target")
+    candidate = targets[0]
+    verdicts = _migration_delta_verdicts(candidate, os.environ)
+    if any(entry["verdict"] == "blocked" for entry in verdicts):
+        raise DistributionError("release-evidence plan: candidate has a blocked (typed-refusal) file")
+    unproven = sorted(
+        (entry for entry in verdicts if entry["verdict"] in ("missing-target", "differing")),
+        key=lambda item: item["relative"],
+    )
+    plan = {"schema_version": 1, "release": candidate.name, "entries": unproven}
+    plan["plan_digest"] = "sha256:" + hashlib.sha256(
+        _canonical_json_bytes({key: value for key, value in plan.items() if key != "plan_digest"})
+    ).hexdigest()
+    data = (json.dumps(plan, indent=2, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+    out_path = Path(os.path.abspath(out_path))
+    observations = {out_path: _evidence_read(out_path)}
+    if observations[out_path] is not None:
+        raise DistributionError("release-evidence-output-exists")
+    _evidence_directories(out_path.parent, create=True)
+    _evidence_publish_new(out_path, data, observations)
+    return plan
+
+
+def _release_evidence_child(release_name: object) -> Path:
+    """Resolve ``release_name`` to an exact, existing child of the canonical
+    managed releases root -- never a traversal or symlink alias (Repair B5).
+
+    The plan-digest check alone is not enough: an attacker who controls both
+    a hand-built ``plan.json`` and its own ``--expect`` argument can make any
+    ``plan["release"]`` value self-consistent, so this validates independently
+    of that digest. A single-component name is required (rejects ``/``,
+    ``..``, absolute paths), and the name is then opened
+    ``O_DIRECTORY|O_NOFOLLOW`` directly under the releases root's own open
+    directory descriptor, so a same-named symlink planted at that level is
+    refused rather than followed."""
+
+    if not isinstance(release_name, str) or not release_name:
+        raise DistributionError(f"release not found: {release_name!r}")
+    try:
+        parts = _safe_relative_components(release_name)
+    except _DeltaVerdictError as exc:
+        raise DistributionError(f"release not found: {release_name!r}") from exc
+    if len(parts) != 1:
+        raise DistributionError(f"release not found: {release_name!r}")
+    releases_root = data_root() / "releases"
+    _evidence_directories(releases_root)
+    NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+    try:
+        root_fd = os.open(str(releases_root), os.O_RDONLY | os.O_DIRECTORY | NOFOLLOW)
+    except OSError as exc:
+        raise DistributionError(f"release not found: {release_name!r}") from exc
+    try:
+        try:
+            child_fd = os.open(release_name, os.O_RDONLY | os.O_DIRECTORY | NOFOLLOW, dir_fd=root_fd)
+        except OSError as exc:
+            raise DistributionError(f"release not found: {release_name!r}") from exc
+        os.close(child_fd)
+    finally:
+        os.close(root_fd)
+    return releases_root / release_name
+
+
+def _release_evidence_apply(plan_path: Path, expect: str, expect_receipt: Optional[str]) -> dict:
+    observed = _evidence_read(plan_path)
+    if observed is None:
+        raise DistributionError("release-evidence-plan-absent")
+    try:
+        plan = json.loads(observed[0], object_pairs_hook=_reject_duplicate_keys)
+    except (ValueError, _DeltaVerdictError) as exc:
+        raise DistributionError("release-evidence-plan-invalid") from exc
+    if not isinstance(plan, dict) or not isinstance(plan.get("entries"), list):
+        raise DistributionError("release-evidence-plan-invalid")
+    computed = "sha256:" + hashlib.sha256(
+        _canonical_json_bytes({key: value for key, value in plan.items() if key != "plan_digest"})
+    ).hexdigest()
+    if computed != expect or plan.get("plan_digest") != expect:
+        raise DistributionError("release-evidence-plan-digest-mismatch")
+    candidate = _release_evidence_child(plan.get("release"))
+    return _archive_release_evidence(candidate, os.environ, plan["entries"], expect=expect_receipt)
+
+
+def _release_evidence_reconcile(release_name: Optional[str]) -> dict:
+    return _release_evidence_check(release_name)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="hearting-distribution")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -3987,10 +4888,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     update_parser.add_argument("--auto", action="store_true", help=argparse.SUPPRESS)
     update_parser.add_argument("--force-prune-unproven", action="store_true")
+    update_parser.add_argument("--archive-unmigrated-evidence", action="store_true")
     update_parser.add_argument("--json", action="store_true")
     auto_parser = sub.add_parser("auto-update")
     auto_parser.add_argument("operation", choices=["status", "enable", "disable"])
     auto_parser.add_argument("--json", action="store_true")
+
+    evidence_parser = sub.add_parser("release-evidence")
+    evidence_sub = evidence_parser.add_subparsers(dest="release_evidence_command", required=True)
+    evidence_check = evidence_sub.add_parser("check")
+    evidence_check.add_argument("--release")
+    evidence_check.add_argument("--json", action="store_true")
+    evidence_plan = evidence_sub.add_parser("plan")
+    evidence_plan.add_argument("--release", required=True)
+    evidence_plan.add_argument("--out", required=True)
+    evidence_plan.add_argument("--json", action="store_true")
+    evidence_apply = evidence_sub.add_parser("apply")
+    evidence_apply.add_argument("--plan", required=True)
+    evidence_apply.add_argument("--expect", required=True)
+    evidence_apply.add_argument("--expect-receipt")
+    evidence_apply.add_argument("--json", action="store_true")
+    evidence_reconcile = evidence_sub.add_parser("reconcile")
+    evidence_reconcile.add_argument("--release")
+    evidence_reconcile.add_argument("--json", action="store_true")
     return parser
 
 
@@ -4010,7 +4930,19 @@ def main(argv: Optional[list[str]] = None) -> int:
                 _runtime_values(args.runtime) if args.runtime else None,
                 args.auto,
                 args.force_prune_unproven,
+                args.archive_unmigrated_evidence,
             )
+        elif args.command == "release-evidence":
+            if args.release_evidence_command == "check":
+                result = _release_evidence_check(args.release)
+            elif args.release_evidence_command == "plan":
+                result = _release_evidence_plan(args.release, Path(args.out))
+            elif args.release_evidence_command == "apply":
+                result = _release_evidence_apply(
+                    Path(args.plan), args.expect, args.expect_receipt
+                )
+            else:
+                result = _release_evidence_reconcile(args.release)
         else:
             result = auto_update(args.operation)
         _print_result(result, args.json)

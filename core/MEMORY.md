@@ -67,7 +67,10 @@ the blocked operation. One unsafe head leaves the whole operation active.
 Existing resolution by one valid final descendant covering every affected
 record remains supported, including an evidenced tombstone. Such a deletion
 must remain the effective tombstone for each deleted record; a blocked or
-unevidenced deletion never resolves an earlier diagnostic.
+unevidenced deletion never resolves an earlier diagnostic. A record-specific
+final tombstone recovered per §7.2.2 is equally accepted, and different
+records of the same blocked operation may resolve through different final
+tombstones.
 
 A reader may label a blocked-prior-evidence tombstone historical-inert only when
 verified sealed migration membership/evidence, exact seed coverage, and verified
@@ -80,6 +83,77 @@ Raw operations, original blocked reasons/counts, bodies, pending flags and histo
 remain intact. The opt-in `mem sync status --blocked-details --json` returns all
 blocked/resolved details and proof availability; ordinary status retains its
 8-ID / 8192-byte bounded lists.
+
+### §7.2.2. Blocked-history operator recovery
+
+1. A parentless blocked tombstone is not a loss of deletion history but an
+   absence of lineage. When the transactional graveyard has preserved the
+   exact prior state, it may be recovered **per record** by exactly one new
+   immutable descendant pair: a prior-reaffirming put followed by a tombstone
+   reaffirming the original deletion intent. Modifying an existing operation's
+   parents, ID, or bytes, or inserting a fake ancestor, is never a recovery
+   mechanism.
+2. **One operation covers exactly one record.** Combining several records into
+   one tombstone lets a late concurrent change to a single record push that
+   whole tombstone into `blocked-concurrency`, while the accompanying put is
+   not concurrency-checked and survives — resurrecting an unrelated record
+   with no conflict. This isolation is a contract, not an implementation
+   choice.
+3. **Resolution judgment extension:** the original blocked op is reported
+   resolved only when every record it affected has, independently, an
+   accepted, valid, unblocked, nonpending, nonconflicting effective tombstone
+   (or an existing safe final put) that is that record's sole final head and a
+   true descendant of the original operation. Different records may resolve
+   through different final tombstones. If any record fails these conditions
+   the original operation is reported active in full, while other records'
+   already-safe deletions remain reported as such. This extension changes only
+   the reporting/diagnosis judgment: fold's blocked classification, the raw
+   blocked set, and the original blocked reasons/counts/bodies/pending
+   flags/history are all preserved unchanged.
+4. The operator surface is a read-only `plan` and an explicit `--plan` +
+   `--expect <plan_digest>` CAS `apply` pair. `plan` exposes only IDs, hashes,
+   and counts, and never emits a record body to stdout, stderr, or a file.
+   Neither leaf runs remote sync or invokes a model. A file output is strictly
+   new-only, outside the store and selected snapshot hierarchy, and published
+   through a nofollow, identity-bound parent; `--out -` is a read-only view.
+   Embedded, computed, and expected plan digests must agree, including retry.
+   Planning observes the actual serving rows and related local sync state in
+   one read transaction. Apply checks the same state under its writer
+   transaction and preserves pending rows; local access recency is never a
+   reason to rewrite prior evidence. Serving comparison permits order and
+   duplicate representation differences only in the six protocol set-list
+   fields, with strict string-array decoding; invalid JSON, wrong types, or
+   different items refuse. Apply preserves the existing raw rows and derived
+   indexes when only that representation differs. The plan still binds raw
+   rows and the full local state, so any later physical change invalidates it.
+   Both leaves require the supported active
+   v2 readiness proof, matching epoch/replica, and a completed cutover when a
+   cutover ledger exists; a snapshots-sealed/legacy-capture ledger refuses.
+   Both leaves validate evidence from the applicable producer before binding
+   it: fresh join seals the original empty store and protected ref. After a
+   supported replica rotation, both fresh seals must match the same member of
+   the current active replica's complete, valid predecessor chain; missing,
+   cyclic, malformed, foreign, or split-producer evidence refuses. The plan
+   remains bound to the current replica and preserved lineage for later CAS.
+   Snapshot activation seals verified equality and the roster's fence receipts. A
+   missing, forged, or merely digest-shaped fence proof refuses before plan
+   and again inside apply. The plan also binds this evidence for later CAS.
+   Staging cleanup requires the current regular file's device/inode and exact
+   content digest; a changed temporary remains with a typed ownership conflict
+   instead of being deleted on failure.
+5. `apply` takes the same lock as remote exchange and recomputes every
+   precondition inside one `BEGIN IMMEDIATE`, recording the whole pair set at
+   once. An intermediate state holding only puts is never committed or
+   published. This atomicity claim is scoped to the single union-outbox
+   publish path; it does not substitute for the concurrency isolation in (2).
+6. The full set of new operations must pass a pure fold precheck before it
+   reaches the writer funnel: records/pending/unrelated frontiers/history/
+   conflicts/outbox stay preserved, target records stay absent, every new
+   operation is unblocked, every targeted blocked op is resolved, and every
+   new operation is single-record.
+7. Under no circumstance is relaxing the fold blocked predicate, adding a new
+   wire kind, modifying a completed `sync_migration_*` phase, evidence, or
+   seed reservation, or flipping the writer fence a means of this recovery.
 
 ### §7.3. Agent-Backed Mutation Boundary
 

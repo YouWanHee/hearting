@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import itertools
 import json
 from types import SimpleNamespace
@@ -52,6 +53,86 @@ GOLDEN_PATH = (
     "protocol/v2/ops/8a/"
     "8ac6907978355d210d658f027ae6f8076168f957455283d6dac0637cc8f2b348.json"
 )
+
+
+
+def _baseline_resolution(result, *, work_limit=None):
+    """Frozen 7cb9818 classifier; independent compatibility oracle."""
+    from typing import Mapping
+    from protocol_v2 import MAX_RESOLUTION_WORK, _WorkBudget, _ancestry, _pending_state
+    if work_limit is None:
+        work_limit = MAX_RESOLUTION_WORK
+    classification = result.classification
+    if getattr(classification, "hard_failures", ()):
+        return {}
+    all_operations = classification.operations
+    accepted_ids = tuple(getattr(result, "accepted", tuple(all_operations)))
+    operations = {
+        op_id: all_operations[op_id]
+        for op_id in accepted_ids
+        if op_id in all_operations
+    }
+    blocked_ids = set(result.blocked) & set(operations)
+    if not blocked_ids:
+        return {}
+    budget = _WorkBudget(work_limit)
+    try:
+        ancestry = _ancestry(operations, budget)
+    except ProtocolError as error:
+        if error.code == "fold-work-limit":
+            return {}
+        raise
+    resolved: dict[str, dict[str, str]] = {}
+    for blocked_op_id in sorted(blocked_ids):
+        blocked_op = operations[blocked_op_id]
+        record_ids = {
+            mutation["record_id"] for mutation in blocked_op.payload["mutations"]
+        }
+        head_sets = [result.frontiers.get(rid, ()) for rid in record_ids]
+        shared_decision = (
+            bool(head_sets) and all(len(heads) == 1 for heads in head_sets)
+            and len({heads[0] for heads in head_sets}) == 1
+        )
+        decisions = {}
+        try:
+            for rid in sorted(record_ids):
+                heads = result.frontiers.get(rid, ())
+                if len(heads) != 1 or rid in getattr(result, "conflicts", {}):
+                    break
+                candidate_id = heads[0]
+                if candidate_id in blocked_ids or candidate_id not in operations:
+                    break
+                candidate = operations[candidate_id]
+                mutations = [m for m in candidate.payload["mutations"] if m["record_id"] == rid]
+                if len(mutations) != 1 or (
+                    not shared_decision and candidate.payload.get("kind") != "put"
+                ):
+                    break
+                state = mutations[0].get("post_state")
+                safe_post = (
+                    isinstance(state, Mapping) and "tombstone" not in mutations[0]
+                    and not _pending_state(state)
+                )
+                # Preserve already-evidenced deletion recovery. A shared final
+                # tombstone must actually be effective in this fold, not merely
+                # appear in an accepted operation's payload.
+                safe_deletion = (
+                    shared_decision and "tombstone" in mutations[0]
+                    and getattr(result, "tombstones", {}).get(rid) == candidate_id
+                    and rid not in getattr(result, "records", {})
+                )
+                if (not (safe_post or safe_deletion)
+                        or not ancestry.is_ancestor(blocked_op_id, candidate_id)):
+                    break
+                decisions[rid] = candidate_id
+        except ProtocolError as error:
+            if error.code == "fold-work-limit":
+                break
+            raise
+        if decisions and set(decisions) == record_ids:
+            resolved[blocked_op_id] = decisions
+    return resolved
+
 
 
 class CanonicalJsonTest(unittest.TestCase):
@@ -765,9 +846,18 @@ class AggregateFoldLimitsTest(unittest.TestCase):
     def test_blocked_resolution_allows_distinct_safe_per_record_puts(self):
         import protocol_v2
         def operation(parents, *rids, pending=False, kind="put"):
-            return SimpleNamespace(parents=parents, payload={"kind":kind,"mutations":[
-                {"record_id":rid,"post_state":{"delivery_state":"pending" if pending else "ordinary"}}
-                for rid in rids]})
+            # A real validated "tombstone"-kind mutation carries a `tombstone`
+            # field, never `post_state` (protocol_v2._validate_kind_mutations
+            # fixes the shape per kind) -- shape the fixture the same way so
+            # this stays a realistic input to resolved_blocked_by.
+            if kind == "tombstone":
+                mutations = [{"record_id": rid, "tombstone": {"pending": pending}}
+                            for rid in rids]
+            else:
+                mutations = [{"record_id": rid,
+                             "post_state": {"delivery_state": "pending" if pending else "ordinary"}}
+                            for rid in rids]
+            return SimpleNamespace(parents=parents, payload={"kind":kind,"mutations":mutations})
         operations = {"blocked":operation((),"a","b",kind="supersede"),
                       "a-final":operation(("blocked",),"a"),
                       "b-final":operation(("blocked",),"b")}
@@ -1694,6 +1784,254 @@ class PureFoldTest(unittest.TestCase):
         self.assertEqual(baseline_blocked[delete["op_id"]]["code"], "blocked-concurrency")
         self.assertEqual(baseline_blocked[stale_restore["op_id"]]["code"], "blocked-stale-restore")
         self.assertEqual(field(record_state(baseline, RECORD), "body"), "concurrent live")
+
+
+class BlockedHistoryRecoveryTest(unittest.TestCase):
+    """core/MEMORY.md §7.2.2: the additive non-shared per-record extension.
+
+    Every fixture here goes through real ``build_operation``/``fold_operations``
+    (never a raw mock), so a mutation shape that ``_validate_kind_mutations``
+    would reject can never slip past validation the way a hand-built
+    ``SimpleNamespace`` could.
+    """
+
+    REPLICA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    PROJECT = "project-alpha"
+
+    def _op(self, counter, kind, parents, mutations_by_record, *, replica=None,
+           provenance_extra=None):
+        import protocol_v2
+        replica = replica or self.REPLICA
+        parents = tuple(sorted(parents))
+        rids = sorted(mutations_by_record)
+        frontiers = [{"record_id": rid, "heads": list(parents)} for rid in rids]
+        mutations = [
+            {"record_id": rid, "mutation_ordinal": i, **mutations_by_record[rid]}
+            for i, rid in enumerate(rids)
+        ]
+        provenance = {"actor": "test", "reason": "fixture"}
+        if provenance_extra:
+            provenance.update(provenance_extra)
+        return protocol_v2.build_operation({
+            "protocol_major": 2,
+            "schema_minor": 0,
+            "replica_id": replica,
+            "counter": counter,
+            "parents": list(parents),
+            "project_key": self.PROJECT,
+            "kind": kind,
+            "frontiers": frontiers,
+            "mutations": mutations,
+            "provenance": provenance,
+        })
+
+    def _force_tombstone_provenance(self):
+        return {"authority": "test",
+               "graveyard_evidence": hashlib.sha256(b"evidence").hexdigest()}
+
+    def _blocked_tombstone(self, counter, record_ids):
+        """A parentless, multi-record tombstone -- always ``blocked-prior-evidence``."""
+        return self._op(counter, "tombstone", (), {
+            rid: {"tombstone": tombstone_evidence(rid, action="prune")}
+            for rid in record_ids
+        })
+
+    def _put_then_tombstone(self, base_counter, parent_id, record_id, *, body="reaffirmed"):
+        """One record's recovery pair: ``P_r`` reaffirms a state, ``T_r`` deletes it again."""
+        put_op = self._op(base_counter, "put", (parent_id,), {
+            record_id: {"post_state": record_post_state(record_id, body, project_key=self.PROJECT)},
+        })
+        prior = record_post_state(record_id, body, project_key=self.PROJECT)
+        tomb_op = self._op(base_counter + 1, "tombstone", (put_op["op_id"],), {
+            record_id: {"tombstone": tombstone_evidence(record_id, action="prune",
+                                                        prior_state=prior)},
+        })
+        return put_op, tomb_op
+
+    def test_1_distinct_final_tombstones_resolve_the_blocked_op(self):
+        import protocol_v2
+        blocked = self._blocked_tombstone(1, ("r1", "r2"))
+        p1, t1 = self._put_then_tombstone(2, blocked["op_id"], "r1", body="r1 body")
+        p2, t2 = self._put_then_tombstone(4, blocked["op_id"], "r2", body="r2 body")
+        result = fold_operations([blocked, p1, t1, p2, t2])
+        self.assertEqual(
+            protocol_v2.resolved_blocked_by(result),
+            {blocked["op_id"]: {"r1": t1["op_id"], "r2": t2["op_id"]}},
+        )
+        # Raw blocked classification is untouched by the reporting extension.
+        self.assertIn(blocked["op_id"], result.blocked)
+        self.assertEqual(result.blocked[blocked["op_id"]].code, "blocked-prior-evidence")
+
+    def test_2_one_unsafe_record_leaves_the_whole_op_active(self):
+        import protocol_v2
+        blocked = self._blocked_tombstone(1, ("r1", "r2"))
+        p1, t1 = self._put_then_tombstone(2, blocked["op_id"], "r1", body="r1 body")
+        # r2 gets two concurrent puts descending `blocked` -- a multi-head
+        # conflict, so r2 has no single safe final head.
+        p2a = self._op(4, "put", (blocked["op_id"],), {
+            "r2": {"post_state": record_post_state("r2", "variant a", project_key=self.PROJECT)},
+        })
+        p2b = self._op(5, "put", (blocked["op_id"],), {
+            "r2": {"post_state": record_post_state("r2", "variant b", project_key=self.PROJECT)},
+        })
+        result = fold_operations([blocked, p1, t1, p2a, p2b])
+        self.assertIn("r2", result.conflicts)
+        self.assertNotIn(blocked["op_id"], protocol_v2.resolved_blocked_by(result))
+        self.assertEqual(result.blocked[blocked["op_id"]].code, "blocked-prior-evidence")
+
+    def test_3_shared_kind_support_regression(self):
+        """The pre-existing shared-decision path resolves exactly as before (round 1 #1)."""
+        import protocol_v2
+        for kind in ("restore", "consume", "resolve", "tombstone", "force-tombstone"):
+            with self.subTest(kind=kind):
+                blocked = self._blocked_tombstone(1, ("r1",))
+                prior = record_post_state("r1", "reaffirmed", project_key=self.PROJECT)
+                put_op = self._op(2, "put", (blocked["op_id"],), {
+                    "r1": {"post_state": prior},
+                })
+                if kind == "restore":
+                    delete_op = self._op(3, "tombstone", (put_op["op_id"],), {
+                        "r1": {"tombstone": tombstone_evidence("r1", prior_state=prior)},
+                    })
+                    final = self._op(4, "restore", (delete_op["op_id"],), {
+                        "r1": {"post_state": prior, "target_op_id": delete_op["op_id"]},
+                    })
+                    ops = [blocked, put_op, delete_op, final]
+                elif kind == "consume":
+                    pending_prior = record_post_state("r1", "reaffirmed", pending=True,
+                                                       project_key=self.PROJECT)
+                    put_pending = self._op(2, "put", (blocked["op_id"],), {
+                        "r1": {"post_state": pending_prior},
+                    })
+                    consumed = dict(pending_prior, delivery_state="consumed")
+                    final = self._op(3, "consume", (put_pending["op_id"],), {
+                        "r1": {"post_state": consumed},
+                    })
+                    ops = [blocked, put_pending, final]
+                elif kind == "resolve":
+                    other = self._op(3, "put", (blocked["op_id"],), {
+                        "r1": {"post_state": dict(prior, body="variant b")},
+                    })
+                    final = self._op(4, "resolve", (put_op["op_id"], other["op_id"]), {
+                        "r1": {"post_state": prior},
+                    }, provenance_extra={"reason": "explicit-resolve"})
+                    ops = [blocked, put_op, other, final]
+                elif kind == "tombstone":
+                    final = self._op(3, "tombstone", (put_op["op_id"],), {
+                        "r1": {"tombstone": tombstone_evidence("r1", prior_state=prior)},
+                    })
+                    ops = [blocked, put_op, final]
+                else:  # force-tombstone
+                    final = self._op(3, "force-tombstone", (put_op["op_id"],), {
+                        "r1": {"tombstone": tombstone_evidence("r1", prior_state=prior)},
+                    }, provenance_extra=self._force_tombstone_provenance())
+                    ops = [blocked, put_op, final]
+                result = fold_operations(ops)
+                resolved = protocol_v2.resolved_blocked_by(result)
+                self.assertEqual(_baseline_resolution(result), resolved)
+                self.assertEqual(resolved, {blocked["op_id"]: {"r1": final["op_id"]}})
+
+        # Per-record final `put` (already supported pre-extension) still resolves.
+        blocked2 = self._blocked_tombstone(10, ("r1", "r2"))
+        p1 = self._op(11, "put", (blocked2["op_id"],), {
+            "r1": {"post_state": record_post_state("r1", "a", project_key=self.PROJECT)},
+        })
+        p2 = self._op(12, "put", (blocked2["op_id"],), {
+            "r2": {"post_state": record_post_state("r2", "b", project_key=self.PROJECT)},
+        })
+        result2 = fold_operations([blocked2, p1, p2])
+        self.assertEqual(
+            protocol_v2.resolved_blocked_by(result2),
+            {blocked2["op_id"]: {"r1": p1["op_id"], "r2": p2["op_id"]}},
+        )
+
+    def test_3b_mixed_final_put_and_tombstone_is_additive(self):
+        import protocol_v2
+        blocked = self._blocked_tombstone(1, ("r1", "r2"))
+        prior1 = record_post_state("r1", "one", project_key=self.PROJECT)
+        prior2 = record_post_state("r2", "two", project_key=self.PROJECT)
+        p1 = self._op(2, "put", (blocked["op_id"],), {"r1": {"post_state": prior1}})
+        p2 = self._op(3, "put", (blocked["op_id"],), {"r2": {"post_state": prior2}})
+        t2 = self._op(4, "tombstone", (p2["op_id"],), {
+            "r2": {"tombstone": tombstone_evidence("r2", prior_state=prior2)}})
+        for operations in ([blocked, p1, p2, t2], [t2, p2, p1, blocked, t2]):
+            result = fold_operations(operations)
+            self.assertEqual(_baseline_resolution(result), {})
+            self.assertEqual(protocol_v2.resolved_blocked_by(result), {
+                blocked["op_id"]: {"r1": p1["op_id"], "r2": t2["op_id"]}})
+            self.assertIn(blocked["op_id"], result.blocked)
+
+    def test_3c_non_shared_new_branch_stays_narrow(self):
+        """Only a non-shared, ordinary, nonpending final `tombstone` newly resolves."""
+        import protocol_v2
+        for kind in ("restore", "consume", "resolve", "force-tombstone"):
+            with self.subTest(kind=kind):
+                blocked = self._blocked_tombstone(1, ("r1", "r2"))
+                prior1 = record_post_state("r1", "one", project_key=self.PROJECT)
+                p1 = self._op(2, "put", (blocked["op_id"],), {"r1": {"post_state": prior1}})
+                # r2 gets a distinct (non-shared) final head of the kind under test.
+                prior2 = record_post_state("r2", "two", project_key=self.PROJECT)
+                p2 = self._op(3, "put", (blocked["op_id"],), {"r2": {"post_state": prior2}})
+                if kind == "restore":
+                    delete2 = self._op(4, "tombstone", (p2["op_id"],), {
+                        "r2": {"tombstone": tombstone_evidence("r2", prior_state=prior2)},
+                    })
+                    final2 = self._op(5, "restore", (delete2["op_id"],), {
+                        "r2": {"post_state": prior2, "target_op_id": delete2["op_id"]},
+                    })
+                    ops = [blocked, p1, p2, delete2, final2]
+                elif kind == "consume":
+                    pending2 = record_post_state("r2", "two", pending=True, project_key=self.PROJECT)
+                    p2 = self._op(3, "put", (blocked["op_id"],), {"r2": {"post_state": pending2}})
+                    consumed2 = dict(pending2, delivery_state="consumed")
+                    final2 = self._op(4, "consume", (p2["op_id"],), {"r2": {"post_state": consumed2}})
+                    ops = [blocked, p1, p2, final2]
+                elif kind == "resolve":
+                    other2 = self._op(4, "put", (blocked["op_id"],), {
+                        "r2": {"post_state": dict(prior2, body="variant")},
+                    })
+                    final2 = self._op(5, "resolve", (p2["op_id"], other2["op_id"]), {
+                        "r2": {"post_state": prior2},
+                    }, provenance_extra={"reason": "explicit-resolve"})
+                    ops = [blocked, p1, p2, other2, final2]
+                else:  # force-tombstone
+                    final2 = self._op(4, "force-tombstone", (p2["op_id"],), {
+                        "r2": {"tombstone": tombstone_evidence("r2", prior_state=prior2)},
+                    }, provenance_extra=self._force_tombstone_provenance())
+                    ops = [blocked, p1, p2, final2]
+                result = fold_operations(ops)
+                # r2's non-shared decision is not a `put` or ordinary `tombstone`,
+                # so it stays unsafe and B stays unresolved even though r1 is safe.
+                self.assertNotIn(blocked["op_id"], protocol_v2.resolved_blocked_by(result))
+
+        # A non-shared final tombstone over a pending prior is always itself
+        # `blocked-pending` (destructive kinds never accept a pending prior),
+        # so it can never reach the new per-record branch as a safe candidate.
+        blocked = self._blocked_tombstone(20, ("r1", "r2"))
+        prior1 = record_post_state("r1", "one", project_key=self.PROJECT)
+        p1 = self._op(21, "put", (blocked["op_id"],), {"r1": {"post_state": prior1}})
+        prior2 = record_post_state("r2", "two", pending=True, project_key=self.PROJECT)
+        p2 = self._op(22, "put", (blocked["op_id"],), {"r2": {"post_state": prior2}})
+        pending_tomb = self._op(23, "tombstone", (p2["op_id"],), {
+            "r2": {"tombstone": tombstone_evidence("r2", prior_state=prior2)},
+        })
+        result = fold_operations([blocked, p1, p2, pending_tomb])
+        self.assertEqual(result.blocked[pending_tomb["op_id"]].code, "blocked-pending")
+        self.assertNotIn(blocked["op_id"], protocol_v2.resolved_blocked_by(result))
+
+    def test_4_raw_blocked_set_is_unaffected_by_resolution_reporting(self):
+        import protocol_v2
+        blocked = self._blocked_tombstone(1, ("r1", "r2"))
+        p1, t1 = self._put_then_tombstone(2, blocked["op_id"], "r1")
+        p2, t2 = self._put_then_tombstone(4, blocked["op_id"], "r2")
+        before = fold_operations([blocked])
+        after = fold_operations([blocked, p1, t1, p2, t2])
+        self.assertEqual(set(before.blocked), set(after.blocked))
+        self.assertEqual(
+            before.blocked[blocked["op_id"]].code,
+            after.blocked[blocked["op_id"]].code,
+        )
+        self.assertIn(blocked["op_id"], protocol_v2.resolved_blocked_by(after))
 
 
 if __name__ == "__main__":

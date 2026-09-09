@@ -24,6 +24,7 @@ if str(MEM_MODULE_DIR) not in sys.path:
 import git_exchange_v2
 import migration_v2
 import protocol_v2
+import repair_v2
 import sync_v2
 from store_resolve import StoreResolutionError, resolve_store
 
@@ -1527,6 +1528,39 @@ def _canonical_record_state(state):
             key=protocol_v2.canonical_bytes,
         )
     return normalized
+
+
+
+def _record_params_equivalent(actual, expected, columns=RECORD_COLS):
+    """Compare serving values, allowing only protocol set-list representation.
+
+    The raw SQL tuples remain the plan's CAS evidence.  Local supported writes
+    retain list order while wire snapshots sort those six set-valued fields.
+    Parse them strictly here; the tolerant metadata decoder must not turn a
+    malformed value, wrong type, or different item into equivalent state.
+    """
+    if len(actual) != len(columns) or len(expected) != len(columns):
+        return False
+    for column, left, right in zip(columns, actual, expected):
+        if column in ("tags", "links", *CAPSULE_LIST_FIELDS):
+            if not isinstance(left, str) or not isinstance(right, str):
+                return False
+            try:
+                left_items, right_items = json.loads(left), json.loads(right)
+                if (not isinstance(left_items, list)
+                        or not isinstance(right_items, list)
+                        or not all(isinstance(item, str)
+                                   for item in left_items + right_items)):
+                    return False
+                left_items = sorted(set(left_items), key=protocol_v2.canonical_bytes)
+                right_items = sorted(set(right_items), key=protocol_v2.canonical_bytes)
+            except (ValueError, TypeError, UnicodeError, protocol_v2.ProtocolError):
+                return False
+            if left_items != right_items:
+                return False
+        elif left != right:
+            return False
+    return True
 
 
 def _record_state(con, rid):
@@ -5708,13 +5742,11 @@ def _materialize_fold_state(con, rid, source):
         state["last_accessed"] = existing[RECORD_COLS.index("last_accessed")]
     body = state.pop("body")
     params = _meta_to_params(state, body)
-    if existing is not None and tuple(existing) == params:
-        # Record-level fold fixpoint: the stored row already equals the fold
-        # state (local last_accessed preserved), and every derived retrieval
-        # row is a pure projection of this identical row, so delete-and-
-        # reinsert would repeat identical work. Any inequality — including a
-        # type or encoding round-trip difference — falls through to the full
-        # rewrite below.
+    if existing is not None and _record_params_equivalent(existing, params):
+        # Retain the actual row and its derived indexes when wire set-list
+        # order is its only representation difference (local recency is also
+        # preserved). Every other content/type difference keeps the rewrite
+        # path below. Raw serving tuples remain untouched for repair CAS.
         return
     _delete_rows(con, rid)
     con.execute(
@@ -6070,6 +6102,671 @@ def _sync_process_lock(timeout=30.0):
             fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
+
+
+# ---------- repair-blocked: blocked-history operator recovery (core/MEMORY.md §7.2.2) ----------
+
+def _repair_table_names(con):
+    return {row[0] for row in con.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+
+
+def _repair_readonly_preflight(db_path):
+    """Read-only, lock-free preflight. Never creates the store (§2.3.1)."""
+    path = Path(db_path)
+    if not path.exists() or not path.is_file():
+        raise repair_v2.RepairRefusal("store-absent")
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except sqlite3.OperationalError as exc:
+        raise repair_v2.RepairRefusal("store-absent", str(exc)) from exc
+    try:
+        con.execute("PRAGMA query_only=1")
+        try:
+            version = con.execute("PRAGMA user_version").fetchone()[0]
+            names = _repair_table_names(con)
+        except sqlite3.DatabaseError as exc:
+            raise repair_v2.RepairRefusal("store-schema-unsupported", str(exc)) from exc
+        required = {"sync_objects", "sync_frontier", "sync_replica",
+                    "sync_transactional_graveyard", "sync_outbox", "sync_applied"}
+        if version != SCHEMA_VERSION or not required.issubset(names):
+            raise repair_v2.RepairRefusal(
+                "store-schema-unsupported", f"user_version={version}")
+        integrity = con.execute("PRAGMA integrity_check").fetchone()[0]
+        if integrity != "ok":
+            raise repair_v2.RepairRefusal("db-integrity-failed", str(integrity))
+    finally:
+        con.close()
+
+
+def _repair_snapshot_manifest(path, expected_sha=None):
+    """Verify the migration_v2 snapshot manifest (§2.3.1); never trust raw hash alone."""
+    try:
+        manifest = migration_v2.verify_snapshot(path)
+    except migration_v2.MigrationError as exc:
+        raise repair_v2.RepairRefusal("snapshot-manifest-invalid", exc.reason) from exc
+    if expected_sha and manifest.get("backup", {}).get("sha256") != expected_sha:
+        raise repair_v2.RepairRefusal("snapshot-sha-mismatch")
+    return manifest
+
+
+def _repair_snapshot_connection(manifest, root):
+    """Reopen the verified backup read-only; verify_snapshot's own connection already closed."""
+    backup = migration_v2._contained(Path(root), manifest["backup"]["path"])
+    try:
+        con = sqlite3.connect(f"file:{backup}?mode=ro&immutable=1", uri=True)
+        con.execute("PRAGMA query_only=1")
+        con.execute("SELECT 1").fetchone()
+    except sqlite3.OperationalError as exc:
+        raise repair_v2.RepairRefusal("snapshot-not-readonly", str(exc)) from exc
+    return con
+
+
+def _repair_writer_connection(db_path):
+    """Open the writer DB without ``get_con()``'s init/migration side effects."""
+    con = sqlite3.connect(db_path)
+    sync_v2.register_writer_functions(con, protocol_major=2, cutover_authority=False)
+    con.execute("PRAGMA foreign_keys=ON")
+    con.execute("PRAGMA busy_timeout=5000")
+    version = con.execute("PRAGMA user_version").fetchone()[0]
+    if version != SCHEMA_VERSION:
+        con.close()
+        raise repair_v2.RepairRefusal("store-schema-unsupported", f"user_version={version}")
+    return con
+
+
+def _repair_validate_fence_evidence(con, epoch, replica):
+    """Validate the two supported producers without changing migration state.
+
+    Fresh-join proofs seal the original empty state, not today's populated
+    store. Snapshot activation instead binds sealed equality and the complete
+    membership's verified fence receipts. Digest shape and readiness flags do
+    not prove either producer ran.
+    """
+    try:
+        row = con.execute(
+            "SELECT seed_mode,no_tail_digest,accepted_set_digest,materialized_digest,"
+            "fence_proof,roster_json FROM sync_migration_epoch "
+            "WHERE current=1 AND epoch_id=?", (epoch,)).fetchone()
+        if row is None:
+            raise ValueError("current epoch evidence absent")
+        if row[0] == "fresh":
+            _root, _remote, ref, _dump = _sync_exchange_config()
+            empty = {"object_count": 0, "legacy_nonempty": False}
+            # Rotation preserves the original epoch proofs. Only the actual
+            # active replica's validated predecessor chain can identify their
+            # producer; an unrelated retired row grants no authority. Check
+            # the whole chain before matching, including below a valid seal.
+            active = con.execute(
+                "SELECT replica_id FROM sync_replica WHERE active=1").fetchall()
+            if active != [(replica,)]:
+                raise ValueError("fresh replica chain has no unique active head")
+            chain, cursor = set(), replica
+            while cursor is not None:
+                sync_v2._validate_replica_id(cursor)
+                if cursor in chain:
+                    raise ValueError("fresh replica predecessor chain is cyclic")
+                member = con.execute(
+                    "SELECT active,retired_at,predecessor_replica_id "
+                    "FROM sync_replica WHERE replica_id=?", (cursor,)).fetchone()
+                if member is None or (cursor == replica and
+                        (member[0] != 1 or member[1] is not None)) or (
+                        cursor != replica and (member[0] != 0 or not member[1])):
+                    raise ValueError("fresh replica predecessor chain is invalid")
+                chain.add(cursor)
+                cursor = member[2]
+            if not any(
+                row[1] == _migration_join_proof("fresh-store-join", epoch=epoch,
+                    replica=producer, ref=ref, state=empty)
+                and row[4] == _migration_join_proof("fresh-store-fence", epoch=epoch,
+                    replica=producer, ref=ref, state=empty)
+                for producer in chain
+            ):
+                raise ValueError("fresh join/fence proof disagrees with producer")
+        elif row[0] == "snapshot":
+            proof = sync_v2.trusted_migration_evidence(con, epoch, kind="equality")
+            if tuple(row[1:4]) != tuple(proof[key] for key in
+                    ("no_tail_digest", "accepted_set_digest", "materialized_digest")):
+                raise ValueError("snapshot seed differs from durable equality")
+            seal = con.execute("SELECT manifest_bytes FROM sync_migration_seals "
+                "WHERE epoch_id=? AND seal_kind='membership'", (epoch,)).fetchone()
+            membership = migration_v2.verify_membership(json.loads(bytes(seal[0])))
+            if (membership["epoch_id"] != epoch
+                    or membership["manifest_digest"] != proof["membership_digest"]
+                    or sorted(json.loads(row[5])) != sorted(
+                        member["replica_id"] for member in membership["members"])):
+                raise ValueError("snapshot membership differs from sealed roster")
+            artifacts = sync_v2.migration_artifacts(con, epoch,
+                artifact_kinds=("equality",))
+            equalities = [a for a in artifacts if a["artifact_kind"] == "equality"]
+            if len(equalities) != 1:
+                raise ValueError("equality artifact missing or ambiguous")
+            equality = migration_v2.verify_equality_report(equalities[0]["local_path"])
+            if equality["manifest_digest"] != equalities[0]["manifest_digest"]:
+                raise ValueError("equality artifact identity changed")
+            shared = equality["shared"]
+            identity = {
+                "accepted_set_digest": shared["accepted_operation_set_digest"],
+                "authoritative_ref_oid": equality["authoritative_ref_oid"],
+                "epoch_id": epoch, "evidence_digest": equality["evidence_digest"],
+                "materialized_digest": shared["materialized_digest"],
+                "operation_tree_digest": shared["operation_tree_digest"],
+                "report_set_digest": migration_v2.digest_json({"report_digests": sorted(
+                    r["report_digest"] for r in equality["replica_matrix"])}),
+            }
+            if (equality["epoch_id"] != epoch
+                    or equality["authoritative_ref"] != membership["protected_ref"]
+                    or equality["evidence_digest"] != proof["evidence_digest"]
+                    or migration_v2.digest_json(identity) != proof["equality_digest"]):
+                raise ValueError("equality artifact differs from durable identity")
+            # The global seal carries every replica's fence identity; the
+            # local artifact inventory need only hold this replica's files.
+            # Verify the entire seal against durable equality, rather than
+            # demanding extra remote receipt copies at repair time.
+            sealed = con.execute("SELECT manifest_bytes FROM sync_migration_seals "
+                "WHERE epoch_id=? AND seal_kind='evidence'", (epoch,)).fetchone()
+            evidence = migration_v2.verify_evidence(json.loads(bytes(sealed[0])), membership)
+            if evidence["manifest_digest"] != proof["evidence_digest"]:
+                raise ValueError("fence evidence seal differs from durable equality")
+            for member in evidence["replicas"]:
+                fields = {key: member[key] for key in (
+                    "replica_id", "membership_digest", "snapshot_digest", "seed_digest",
+                    "delta_digest", "fence_digest", "no_tail_digest", "backup_digest")}
+                if migration_v2.replica_equality_input_digest(epoch_id=epoch, **fields) \
+                        != member["equality_input_digest"]:
+                    raise ValueError("sealed replica equality input disagrees")
+            expected_fence = migration_v2.digest_json({
+                "equality": equality["manifest_digest"],
+                "fence_receipts": sorted(r["fence_digest"] for r in evidence["replicas"])})
+            if row[4] != expected_fence:
+                raise ValueError("snapshot fence proof differs from activation producer")
+        else:
+            raise ValueError("unsupported seed producer")
+    except (ValueError, TypeError, KeyError, IndexError, OSError, sqlite3.Error,
+            sync_v2.SyncError, migration_v2.MigrationError) as exc:
+        raise repair_v2.RepairRefusal("fence-evidence-invalid", str(exc)) from exc
+
+
+def _repair_store_identity(con):
+    """Use the supported readiness gate and seal its authoritative DB evidence."""
+    row = con.execute("SELECT replica_id FROM sync_replica WHERE active=1").fetchone()
+    replica_id = str(row[0]) if row else None
+    store_path_digest = "sha256:" + hashlib.sha256(
+        str(DB.resolve(strict=False)).encode("utf-8")).hexdigest()
+    state = sync_v2.remote_readiness(con)
+    if not state["allowed"] or not state["epoch_id"]:
+        raise repair_v2.RepairRefusal("epoch-not-active", str(state["reason"]))
+    sync_v2.require_writer_allowed(con, protocol_major=2)
+    _repair_validate_fence_evidence(con, state["epoch_id"], replica_id)
+    evidence = {}
+    names = _repair_table_names(con)
+    for table in sorted(names):
+        if table.startswith("sync_migration_"):
+            evidence[table] = sorted(con.execute(f'SELECT * FROM "{table}"').fetchall(), key=repr)
+    evidence["fence_triggers"] = con.execute(
+        "SELECT name,sql FROM sqlite_master WHERE type='trigger' ORDER BY name").fetchall()
+    authority_digest = hashlib.sha256(repr(evidence).encode()).hexdigest()
+
+    return {
+        "replica_id": replica_id,
+        "epoch_id": state["epoch_id"],
+        "store_path_digest": store_path_digest,
+        "fence_active": True,
+        "authority_digest": authority_digest,
+    }
+
+
+def _repair_target_payload(con, op_id):
+    row = con.execute(
+        "SELECT op_id, payload_bytes FROM sync_objects WHERE op_id=?", (op_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    return {"op_id": str(row[0]), "payload_bytes": bytes(row[1])}
+
+
+def _repair_graveyard_row(con, op_id, record_id):
+    row = con.execute(
+        "SELECT action, prior_state_bytes, evidence_digest FROM sync_transactional_graveyard "
+        "WHERE destructive_op_id=? AND record_id=?", (op_id, record_id)
+    ).fetchone()
+    if row is None:
+        return None
+    return {"action": str(row[0]), "prior_state_bytes": bytes(row[1]),
+            "evidence_digest": str(row[2])}
+
+
+_REPAIR_RECORD_CAS_COLS = tuple(c for c in RECORD_COLS if c != "last_accessed")
+
+
+def _repair_serving_snapshot(con, result):
+    """Compare the actual ``records`` table to the pure fold's own materialization.
+
+    ``result`` (from ``protocol_v2.fold_operations``) is only the append-only
+    operation log's logical view; nothing before this forced the live serving
+    table to actually agree with it. A direct write, a legacy-capture insert,
+    or any other bypass of the operation log leaves ``records`` holding rows
+    the fold knows nothing about, so a repair driven purely by fold state can
+    silently delete or leave stale data with no evidence trail. ``last_accessed``
+    is excluded because it is the one field intentionally allowed to drift
+    locally without going through an operation (see ``_materialize_fold_state``).
+    Returns ``(live, expected)`` keyed by record id for an exact-equality CAS.
+    """
+    cols_sql = ",".join(_REPAIR_RECORD_CAS_COLS)
+    live = {row[0]: tuple(row) for row in
+            con.execute(f"SELECT {cols_sql} FROM records").fetchall()}
+    expected = {}
+    for rid, state in result.records.items():
+        if rid in result.conflicts:
+            continue
+        params = _meta_to_params(dict(state), state["body"])
+        expected[rid] = tuple(
+            params[RECORD_COLS.index(col)] for col in _REPAIR_RECORD_CAS_COLS
+        )
+    return live, expected
+
+
+def _repair_snapshot_binding(manifest):
+    return {
+        "manifest_digest": manifest["manifest_digest"],
+        "epoch_id": manifest["epoch_id"],
+        "replica_id": manifest["replica_id"],
+        "membership_digest": manifest["membership_digest"],
+        "backup_sha256": manifest["backup"]["sha256"],
+        "backup_bytes": manifest["backup"]["bytes"],
+        "schema_user_version": manifest["schema_user_version"],
+    }
+
+
+def _repair_observation(con, snapshot_con, *, op_ids, snapshot_manifest=None):
+    """Assemble the pure observation mapping ``repair_v2`` validates and plans from."""
+    envelopes = _sync_envelopes(con)
+    result = protocol_v2.fold_operations(envelopes)
+    if result.classification.hard_failures:
+        raise repair_v2.RepairRefusal("hard-failure-present")
+    live_records, expected_records = _repair_serving_snapshot(con, result)
+    if (live_records.keys() != expected_records.keys()
+            or any(not _record_params_equivalent(live_records[rid], expected_records[rid],
+                                                  _REPAIR_RECORD_CAS_COLS)
+                   for rid in live_records)):
+        raise repair_v2.RepairRefusal("serving-state-drift")
+    operations = {
+        op_id: result.classification.operations[op_id].payload
+        for op_id in result.accepted
+    }
+    blocked = {op_id: diagnostic.code for op_id, diagnostic in result.blocked.items()}
+    by_record = {}
+    for op_id, payload in operations.items():
+        for mutation in payload["mutations"]:
+            by_record.setdefault(mutation["record_id"], []).append(op_id)
+    graveyard, snapshot_graveyard, snapshot_targets, live_targets = {}, {}, {}, {}
+    for bid in op_ids:
+        live_targets[bid] = _repair_target_payload(con, bid)
+        if snapshot_con is not None:
+            snapshot_targets[bid] = _repair_target_payload(snapshot_con, bid)
+        payload = operations.get(bid)
+        if payload is None:
+            continue
+        for mutation in payload["mutations"]:
+            rid = mutation["record_id"]
+            row = _repair_graveyard_row(con, bid, rid)
+            if row is not None:
+                graveyard[(bid, rid)] = row
+            if snapshot_con is not None:
+                srow = _repair_graveyard_row(snapshot_con, bid, rid)
+                if srow is not None:
+                    snapshot_graveyard[(bid, rid)] = srow["prior_state_bytes"]
+    pending_ids = {rid for rid, state in result.records.items()
+                   if state.get("delivery_state") == "pending"}
+    preserved = {
+        "actual_records": live_records,
+        "records": {rid: hashlib.sha256(protocol_v2.canonical_bytes(state)).hexdigest()
+                    for rid, state in result.records.items()},
+        "pending": sorted(pending_ids),
+        "graveyard": sorted(f"{k[0]}:{k[1]}:{v['evidence_digest']}"
+                            for k, v in graveyard.items()),
+    }
+    # Bind related serving/index and synchronization state, including local
+    # clocks and outbox rows, in this same read transaction. Receipt creation
+    # is deliberately excluded so a first apply can create its empty table.
+    tables = sorted(_repair_table_names(con) - {"sync_repair_receipts"})
+    local_state = {table: sorted(con.execute('SELECT * FROM "' + table.replace('"', '""') + '"').fetchall(), key=repr)
+                   for table in tables}
+    preserved["local_state_digest"] = hashlib.sha256(repr(local_state).encode()).hexdigest()
+    preserved_digest = hashlib.sha256(protocol_v2.canonical_bytes(preserved)).hexdigest()
+    return {
+        "result": result,
+        "operations": operations,
+        "blocked": blocked,
+        "by_record": by_record,
+        "graveyard": graveyard,
+        "snapshot_graveyard": snapshot_graveyard,
+        "snapshot_targets": snapshot_targets,
+        "live_targets": live_targets,
+        "store": _repair_store_identity(con),
+        "snapshot": _repair_snapshot_binding(snapshot_manifest) if snapshot_manifest else None,
+        "capture_frontier": sync_v2.capture_frontier(con),
+        "preserved_digest": preserved_digest,
+        "pending_ids": pending_ids,
+    }
+
+
+def _repair_ensure_schema(con):
+    """Additive-only receipt table for this command; not a schema migration."""
+    con.execute("""CREATE TABLE IF NOT EXISTS sync_repair_receipts(
+        plan_digest TEXT PRIMARY KEY,
+        schema INTEGER NOT NULL,
+        reason TEXT NOT NULL,
+        target_op_ids TEXT NOT NULL,
+        new_op_ids TEXT NOT NULL,
+        record_count INTEGER NOT NULL,
+        applied_at TEXT NOT NULL
+    )""")
+
+
+def _repair_receipt(con, plan, new_ids):
+    target_ids = sorted({unit["blocked_op_id"] for unit in plan["units"]})
+    con.execute(
+        "INSERT INTO sync_repair_receipts(plan_digest,schema,reason,target_op_ids,"
+        "new_op_ids,record_count,applied_at) VALUES(?,?,?,?,?,?,datetime('now'))",
+        (plan["plan_digest"], plan["schema"], plan["reason"],
+         json.dumps(target_ids, sort_keys=True), json.dumps(sorted(new_ids)),
+         len(plan["units"])),
+    )
+
+
+def _repair_receipt_satisfied(con, plan, obs):
+    """§2.4-7 exact operation evidence. A stray new ID is never a receipt."""
+    row = con.execute(
+        "SELECT schema, reason, target_op_ids, new_op_ids, record_count "
+        "FROM sync_repair_receipts WHERE plan_digest=?", (plan["plan_digest"],)
+    ).fetchone()
+    if row is None:
+        return False
+    schema, reason, target_json, new_json, record_count = row
+    expected_targets = {unit["blocked_op_id"] for unit in plan["units"]}
+    new_ids = json.loads(new_json)
+    if (schema != plan["schema"] or reason != plan["reason"]
+            or set(json.loads(target_json)) != expected_targets
+            or record_count != len(plan["units"])
+            or len(new_ids) != 2 * len(plan["units"])):
+        return False
+    result = obs["result"]
+    new_id_set = set(new_ids)
+    if new_id_set - set(result.accepted) or new_id_set & set(result.blocked):
+        return False
+    for unit in plan["units"]:
+        rid, bid = unit["record_id"], unit["blocked_op_id"]
+        t_r = result.tombstones.get(rid)
+        if t_r not in new_id_set or result.frontiers.get(rid) != (t_r,) or rid in result.records:
+            return False
+        t_op = result.classification.operations.get(t_r)
+        if t_op is None or len(t_op.parents) != 1 or t_op.parents[0] not in new_id_set:
+            return False
+        p_op = result.classification.operations.get(t_op.parents[0])
+        if p_op is None or tuple(p_op.parents) != (bid,):
+            return False
+        graveyard = obs["graveyard"].get((bid, rid))
+        if graveyard is None or graveyard["evidence_digest"] != unit["prior_digest"]:
+            return False
+    return True
+
+
+def _repair_owned_leaf(fd, name, owned, raw):
+    """Exact current-content ownership; an exclusive name alone is insufficient."""
+    import stat
+    try:
+        leaf = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+    except FileNotFoundError:
+        return "absent"
+    except OSError:
+        return "conflict"
+    try:
+        before = os.fstat(leaf)
+        if (not stat.S_ISREG(before.st_mode)
+                or (before.st_dev, before.st_ino) != (owned.st_dev, owned.st_ino)
+                or before.st_size != len(raw)):
+            return "conflict"
+        with os.fdopen(os.dup(leaf), "rb") as handle:
+            current = handle.read(len(raw) + 1)
+        after = os.fstat(leaf)
+        named = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        signature = lambda st: (st.st_dev, st.st_ino, st.st_mode, st.st_size,
+                                st.st_mtime_ns, st.st_ctime_ns)
+        if (signature(before) != signature(after) or signature(after) != signature(named)
+                or hashlib.sha256(current).digest() != hashlib.sha256(raw).digest()):
+            return "conflict"
+        return "owned"
+    except OSError:
+        return "conflict"
+    finally:
+        os.close(leaf)
+
+
+# destructive-ok: reason=remove only exact regular inode-and-content-owned private staging; boundary=held parent descriptor and current leaf digest
+def _repair_atomic_write(path, payload):
+    """New-only publication through an identity-bound, nofollow parent fd."""
+    path = Path(os.path.abspath(path))
+    fd = os.open(path.anchor, os.O_RDONLY | os.O_DIRECTORY)
+    raw = (json.dumps(payload, sort_keys=True, ensure_ascii=False,
+                      separators=(",", ":")) + "\n").encode()
+    tmp = ".repair-plan-" + os.urandom(16).hex()
+    owned = None
+    try:
+        for part in path.parent.parts[1:]:
+            next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                              dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+        try:
+            os.stat(path.name, dir_fd=fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise repair_v2.RepairRefusal("output-path-exists", str(path))
+        out = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                      0o600, dir_fd=fd)
+        owned = os.fstat(out)
+        with os.fdopen(out, "wb") as handle:
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+        parent = os.stat(path.parent, follow_symlinks=False)
+        opened = os.fstat(fd)
+        if (parent.st_dev, parent.st_ino) != (opened.st_dev, opened.st_ino):
+            raise repair_v2.RepairRefusal("output-path-raced")
+        if _repair_owned_leaf(fd, tmp, owned, raw) != "owned":
+            raise repair_v2.RepairRefusal("output-staging-ownership-conflict")
+        os.link(tmp, path.name, src_dir_fd=fd, dst_dir_fd=fd, follow_symlinks=False)
+        os.fsync(fd)
+    except FileExistsError as exc:
+        raise repair_v2.RepairRefusal("output-path-exists", str(path)) from exc
+    except OSError as exc:
+        raise repair_v2.RepairRefusal("output-path-unsafe", str(path)) from exc
+    finally:
+        try:
+            if owned is not None:
+                ownership = _repair_owned_leaf(fd, tmp, owned, raw)
+                if ownership == "owned":
+                    os.unlink(tmp, dir_fd=fd)
+                elif ownership == "conflict":
+                    raise repair_v2.RepairRefusal("output-staging-ownership-conflict")
+        finally:
+            os.close(fd)
+
+
+def repair_blocked_plan(args):
+    _repair_readonly_preflight(DB)
+    manifest = _repair_snapshot_manifest(args.snapshot, args.snapshot_sha256)
+    snapshot_con = _repair_snapshot_connection(manifest, root=Path(args.snapshot).resolve().parent)
+    try:
+        con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+        con.execute("PRAGMA query_only=1")
+        con.execute("BEGIN")
+        try:
+            if args.all_parentless_blocked:
+                probe_result = protocol_v2.fold_operations(_sync_envelopes(con))
+                op_ids = sorted(
+                    op_id for op_id, diagnostic in probe_result.blocked.items()
+                    if diagnostic.code == "blocked-prior-evidence"
+                    and not probe_result.classification.operations[op_id].payload["parents"]
+                )
+            else:
+                op_ids = list(dict.fromkeys(args.op_id or ()))
+            if not op_ids:
+                raise repair_v2.RepairRefusal("target-not-found", "no candidate blocked ops")
+            obs = repair_v2.normalize_observation(
+                _repair_observation(con, snapshot_con, op_ids=op_ids, snapshot_manifest=manifest)
+            )
+        finally:
+            con.close()
+        units = repair_v2.select_units(obs, op_ids)
+        repair_v2.validate_units(obs, units)
+        plan = repair_v2.build_plan(
+            obs, units, reason=args.reason,
+            created_utc=datetime.datetime.now(datetime.timezone.utc)
+                .strftime("%Y-%m-%dT%H:%M:%SZ"),
+        )
+    finally:
+        snapshot_con.close()
+    if args.out == "-":
+        print(json.dumps(plan, sort_keys=True, ensure_ascii=False))
+        return 0
+    output = Path(args.out).resolve(strict=False)
+    protected = (STORE.resolve(), Path(args.snapshot).resolve().parent)
+    if any(output == root or root in output.parents for root in protected):
+        raise repair_v2.RepairRefusal("output-path-protected", str(args.out))
+    _repair_atomic_write(args.out, plan)
+    summary = {"plan_digest": plan["plan_digest"], "counts": plan["counts"]}
+    if args.json_output:
+        print(json.dumps(summary, sort_keys=True, ensure_ascii=False))
+    else:
+        print(f"[repair-blocked plan] targets={plan['counts']['targets']} "
+              f"records={plan['counts']['records']} digest={plan['plan_digest']}")
+    return 0
+
+
+def repair_blocked_apply(args):
+    _repair_readonly_preflight(DB)
+    manifest = _repair_snapshot_manifest(args.snapshot)
+    snapshot_con = _repair_snapshot_connection(manifest, root=Path(args.snapshot).resolve().parent)
+    fp = _installation_fingerprint()
+    try:
+        plan = repair_v2.normalize_plan(Path(args.plan).read_bytes())
+        if repair_v2.plan_digest(plan) != args.expect:
+            raise repair_v2.RepairRefusal("plan-digest-mismatch")
+        with _sync_process_lock():
+            con = _repair_writer_connection(DB)
+            try:
+                con.execute("BEGIN IMMEDIATE")
+                _repair_ensure_schema(con)
+                target_ids = sorted({unit["blocked_op_id"] for unit in plan["units"]})
+                obs = repair_v2.normalize_observation(_repair_observation(
+                    con, snapshot_con, op_ids=target_ids, snapshot_manifest=manifest
+                ))
+
+                # 1) authenticate: plan self-digest, then plan<->store<->snapshot<->target binding
+                if repair_v2.plan_digest(plan) != args.expect:
+                    raise repair_v2.RepairRefusal("plan-digest-mismatch")
+                repair_v2.verify_plan_binding(obs, plan, manifest)
+
+                # 2) retry judgment BEFORE any staleness predicate
+                if _repair_receipt_satisfied(con, plan, obs):
+                    con.rollback()
+                    result = {"status": "already-applied", "plan_digest": plan["plan_digest"]}
+                    _emit_repair_result(result, args.json_output)
+                    return 0
+                if con.execute(
+                    "SELECT 1 FROM sync_repair_receipts WHERE plan_digest=?",
+                    (plan["plan_digest"],),
+                ).fetchone() is not None:
+                    raise repair_v2.RepairRefusal("receipt-evidence-incomplete")
+
+                # 3) pre-apply staleness predicates only for a genuinely unapplied plan
+                units = repair_v2.verify_plan_against(obs, plan)
+
+                # 4) writer readiness and the recorded pair set
+                try:
+                    sync_v2.require_writer_allowed(con, protocol_major=2)
+                except sync_v2.RemoteSafetyError as exc:
+                    raise repair_v2.RepairRefusal("fence-inactive", str(exc)) from exc
+                replica_id = sync_v2.ensure_replica_identity(con, installation_fingerprint=fp)
+                # Construct and fold the whole proposed set before the first
+                # counter reservation or operation write. BEGIN IMMEDIATE
+                # prevents another writer from taking these proposed dots.
+                counter = int(con.execute("SELECT counter FROM sync_replica WHERE active=1").fetchone()[0])
+                candidate_ops = []
+                pairs = []
+                for unit in units:
+                    put_counter, tombstone_counter = counter + 1, counter + 2
+                    if tombstone_counter > sync_v2.MAX_COUNTER:
+                        raise repair_v2.RepairRefusal("budget-overflow", "counter exhausted")
+                    put_op, tomb_op = repair_v2.build_operation_pair(
+                        unit, replica_id=replica_id, put_counter=put_counter,
+                        tombstone_counter=tombstone_counter,
+                        plan_digest=plan["plan_digest"],
+                        actor=str(os.environ.get("MEM_ACTOR") or "operator"),
+                    )
+                    pairs.append((unit, put_op, tomb_op))
+                    candidate_ops.extend((put_op, tomb_op))
+                    counter = tombstone_counter
+                new_ids = [op["op_id"] for op in candidate_ops]
+                proposed = protocol_v2.fold_operations(_sync_envelopes(con) + candidate_ops)
+                repair_v2.verify_fold(obs["result"], proposed, units, new_ids)
+                for unit, put_op, tomb_op in pairs:
+                    allocated = sync_v2.allocate_counter(con, replica_id, installation_fingerprint=fp)
+                    if allocated != int(put_op["payload"]["counter"]):
+                        raise repair_v2.RepairRefusal("counter-raced")
+                    sync_v2.record_local_operation(con, put_op, installation_fingerprint=fp)
+                    sync_v2.record_local_operation(con, tomb_op, installation_fingerprint=fp)
+                    sync_v2.record_graveyard_evidence(
+                        con, tomb_op["op_id"], unit.record_id, str(unit.tombstone["action"]),
+                        protocol_v2.canonical_bytes(unit.prior_state),
+                        protocol_v2.canonical_bytes(unit.tombstone),
+                    )
+
+                # Every new operation is durably queued (within this still-open
+                # transaction) before the pure post-fold precheck runs; a
+                # failure here still rolls back the entire transaction below,
+                # so nothing partial ever becomes visible or committed.
+                new_ids = [op["op_id"] for op in candidate_ops]
+                result = protocol_v2.fold_operations(_sync_envelopes(con))
+                repair_v2.verify_fold(obs["result"], result, units, new_ids)
+                before_serving = _repair_serving_snapshot(con, obs["result"])[0]
+                _apply_fold(con, result, None, "", record_peer=False)
+                if _repair_serving_snapshot(con, result)[0] != before_serving:
+                    raise repair_v2.RepairRefusal("serving-preservation-failed")
+                _repair_receipt(con, plan, new_ids)
+                con.commit()
+                result = {"status": "applied", "plan_digest": plan["plan_digest"],
+                          "new_op_ids": sorted(new_ids)}
+                _emit_repair_result(result, args.json_output)
+                return 0
+            except BaseException:
+                con.rollback()
+                raise
+            finally:
+                con.close()
+    finally:
+        snapshot_con.close()
+
+
+def _emit_repair_result(result, json_output):
+    if json_output:
+        print(json.dumps(result, sort_keys=True, ensure_ascii=False))
+    else:
+        print(f"[repair-blocked apply] {result['status']} digest={result['plan_digest']}")
+
+
+def repair_blocked_command(args):
+    try:
+        if args.repair_blocked_cmd == "plan":
+            return repair_blocked_plan(args)
+        return repair_blocked_apply(args)
+    except repair_v2.RepairRefusal as exc:
+        sys.stderr.write(f"[repair-blocked] refused: {exc.code}"
+                         + (f" ({exc.detail})" if exc.detail else "") + "\n")
+        return 2
 
 
 def sync(json_output=False, exchange_only=False):
@@ -9100,6 +9797,28 @@ def main():
 
     _configure_migration_parser(sub)
 
+    rb = sub.add_parser("repair-blocked",
+                        help="Recover per-record descendants for parentless blocked tombstones")
+    rb_sub = rb.add_subparsers(dest="repair_blocked_cmd", required=True)
+    rb_plan = rb_sub.add_parser("plan", help="Read-only: build a self-digested repair plan")
+    rb_plan.add_argument("--snapshot", required=True,
+                         help="Verified migration_v2 snapshot.json manifest path")
+    rb_plan.add_argument("--snapshot-sha256",
+                         help="Optional cross-check against the manifest's backup.sha256")
+    rb_target = rb_plan.add_mutually_exclusive_group(required=True)
+    rb_target.add_argument("--op-id", action="append", default=None,
+                           help="A parentless blocked-prior-evidence op ID (repeatable)")
+    rb_target.add_argument("--all-parentless-blocked", action="store_true")
+    rb_plan.add_argument("--reason", required=True)
+    rb_plan.add_argument("--out", required=True)
+    rb_plan.add_argument("--json", dest="json_output", action="store_true")
+    rb_apply = rb_sub.add_parser("apply", help="Apply a CAS-verified repair plan")
+    rb_apply.add_argument("--plan", required=True)
+    rb_apply.add_argument("--expect", required=True, help="Expected plan_digest (CAS)")
+    rb_apply.add_argument("--snapshot", required=True,
+                          help="Same verified migration_v2 snapshot.json manifest used to plan")
+    rb_apply.add_argument("--json", dest="json_output", action="store_true")
+
     rs = sub.add_parser("restore", help="Restore the latest graveyard entry for one record")
     rs.add_argument("id")
 
@@ -9283,6 +10002,8 @@ def main():
         sys.exit(0 if rotate_replica(args.reason) else 1)
     elif args.cmd == "migration":
         sys.exit(migration_command(args))
+    elif args.cmd == "repair-blocked":
+        sys.exit(repair_blocked_command(args))
     elif args.cmd == "restore":
         sys.exit(0 if restore(args.id) else 1)
     elif args.cmd == "index":

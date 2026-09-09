@@ -1622,7 +1622,26 @@ def fold_operations(operations: Iterable[Any] | Mapping[str, Any] |
 def resolved_blocked_by(
     result: Any, *, work_limit: int = MAX_RESOLUTION_WORK
 ) -> dict[str, dict[str, str]]:
-    """Map blocked ops to a safe shared decision or per-record final puts."""
+    """Map blocked ops to a safe resolving decision per affected record.
+
+    Two disjoint decision paths, both reporting-only (core/MEMORY.md §7.2.2):
+
+    (a) Shared decision (unchanged from before this extension): every
+        affected record's sole frontier head is the *same* accepted
+        operation. That candidate may be any kind; it resolves the blocked
+        op via a safe final ``put`` (``safe_post``) or a safe final shared
+        ``tombstone``/``force-tombstone`` (``safe_deletion_shared``).
+    (b) Non-shared, per-record: newly accepted here. Each record's sole
+        frontier head may independently be a ``put`` or an ordinary,
+        nonpending ``tombstone`` that is that record's effective tombstone
+        (``safe_deletion_per_record``). ``pending is False`` is enforced only
+        on this new branch; the shared branch's preexisting behavior is not
+        tightened.
+
+    If any affected record fails its applicable safety check, the whole
+    blocked op remains unresolved (reported active) even though other
+    records may have independently safe final heads.
+    """
     classification = result.classification
     if getattr(classification, "hard_failures", ()):
         return {}
@@ -1665,8 +1684,9 @@ def resolved_blocked_by(
                     break
                 candidate = operations[candidate_id]
                 mutations = [m for m in candidate.payload["mutations"] if m["record_id"] == rid]
+                kind = candidate.payload.get("kind")
                 if len(mutations) != 1 or (
-                    not shared_decision and candidate.payload.get("kind") != "put"
+                    not shared_decision and kind not in {"put", "tombstone"}
                 ):
                     break
                 state = mutations[0].get("post_state")
@@ -1674,15 +1694,28 @@ def resolved_blocked_by(
                     isinstance(state, Mapping) and "tombstone" not in mutations[0]
                     and not _pending_state(state)
                 )
-                # Preserve already-evidenced deletion recovery. A shared final
-                # tombstone must actually be effective in this fold, not merely
-                # appear in an accepted operation's payload.
-                safe_deletion = (
+                # Preserve already-evidenced shared deletion recovery exactly
+                # as before this extension. A shared final tombstone must
+                # actually be effective in this fold, not merely appear in an
+                # accepted operation's payload.
+                safe_deletion_shared = (
                     shared_decision and "tombstone" in mutations[0]
                     and getattr(result, "tombstones", {}).get(rid) == candidate_id
                     and rid not in getattr(result, "records", {})
                 )
-                if (not (safe_post or safe_deletion)
+                # New (§7.2.2): a strictly non-shared, ordinary, non-pending
+                # per-record final tombstone. Every existing guard above and
+                # below still applies; `pending is False` is enforced only on
+                # this new branch so the preexisting shared branch is not
+                # tightened.
+                safe_deletion_per_record = (
+                    not shared_decision and kind == "tombstone"
+                    and "tombstone" in mutations[0]
+                    and getattr(result, "tombstones", {}).get(rid) == candidate_id
+                    and rid not in getattr(result, "records", {})
+                    and mutations[0]["tombstone"].get("pending") is False
+                )
+                if (not (safe_post or safe_deletion_shared or safe_deletion_per_record)
                         or not ancestry.is_ancestor(blocked_op_id, candidate_id)):
                     break
                 decisions[rid] = candidate_id

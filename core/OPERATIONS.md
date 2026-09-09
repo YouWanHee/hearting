@@ -260,6 +260,44 @@ names the release, and live processes whose `AGENT_HOME` names it, still keep
 it. It is never selected automatically. Re-running the command when the
 requested release is already current still performs this checked prune pass.
 
+Carry-forward equality is judged semantically, not by raw digest. For a
+candidate's own attempt sidecar under `.dispatch`, a raw digest difference
+confined to exactly its `completion_marker`/`completion_marker_history`
+fields — where each value is precisely the re-anchored path the carry-forward
+step itself would produce, the two marker paths are validated by deriving
+them from the sidecar's own `route_id`/`node_id` rather than by re-anchoring
+equivalence, and the remaining fields are byte-identical under the sidecar's
+producer key order and `write_once` serialization — counts as proven equal
+only when replacing those two verified fields in the source and serializing
+that source copy produces the exact target bytes. Any other field change, unknown field, forged or unowned path, broken
+JSON, non-regular file kind, symlink, containment escape, or open/read race is
+a typed rejection, never a semantic match. A genuinely different or
+successor-absent file is provably deleted only after it is preserved in a
+lossless, hash-bound private archive with a sealed, compare-and-swap receipt;
+All source sizes/hashes, successor verdicts, existing archive identities and
+receipt CAS are validated before any archive mutation. Publication acquires the parent
+component by component with nofollow, binds the validated directory identities,
+and rechecks the hierarchy before creating or writing staging. Failed receipt
+rollback and temporary cleanup require current regular kind, device/inode, and
+exact content digest. A changed successor is preserved with a typed ownership
+conflict; private staging residue is not archive approval. Reads are component-wise
+nofollow, nonblocking and identity-bound, and publication rechecks that binding.
+New evidence uses exclusive owned staging and no-replace publication; existing
+files and receipts are reusable only for the exact validated immutable inventory.
+Changed inventories or foreign successors refuse, never overwrite or roll back
+another writer. Files, each new directory edge and receipt publication are
+fsynced before approval. A failed durability step cannot leave a new accepted
+receipt, and a leftover staging/archive file is not approval. Release selectors
+must name exactly one canonical managed-release child.
+`--force-prune-unproven` and a recorded loss gap remain a documented,
+operator-invoked exception and are never a substitute for that archive. Every
+existing guard — current/activation retention, `_release_in_use`,
+`_release_held_by_live_process`, `_release_projection_referenced`,
+`_succeed_dispatch_state`, `_retention_containment_precondition`, the retained
+floor, and the `keep` set — stays exactly as specified above; semantic
+equality and archival proof narrow what counts as "unproven," they never
+widen what may be deleted or replace any of these guards.
+
 Before delivery, the supervisor atomically commits the bounded receipt payload,
 deterministic receipt id and digest, exact attempt set, and row revisions. A
 restart reuses that committed payload and identity. The guard and prompt treat
