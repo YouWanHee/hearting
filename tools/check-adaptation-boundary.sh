@@ -1297,7 +1297,7 @@ check_codex_utility_projection() {
     fi
   done
 
-  extra=$(find adapters/codex/utilities -mindepth 1 -maxdepth 1 ! \( -name agent-home.sh -o -name artifact-root.sh -o -name agent-worklog-state.sh -o -name harness-status.sh -o -name worktree-cleanup.py -o -name dispatch-route.sh -o -name dispatch-defaults.py -o -name token-budget.py -o -name token-budget-experiment.py -o -name worker_bootstrap.py \) -print 2>/dev/null || true)
+  extra=$(find adapters/codex/utilities -mindepth 1 -maxdepth 1 ! -name __pycache__ ! -path '*/__pycache__/*' ! -name '*.py[co]' ! \( -name agent-home.sh -o -name artifact-root.sh -o -name agent-worklog-state.sh -o -name harness-status.sh -o -name worktree-cleanup.py -o -name dispatch-route.sh -o -name dispatch-defaults.py -o -name token-budget.py -o -name token-budget-experiment.py -o -name worker_bootstrap.py \) -print 2>/dev/null || true)
   if [ -n "$extra" ]; then
     fail_msg "adapters/codex/utilities contains unapproved entries:"
     printf '%s\n' "$extra"
@@ -1457,7 +1457,7 @@ check_codex_tool_projection() {
     :
   fi
 
-  extra=$(find adapters/codex/tools -mindepth 1 ! \( -path adapters/codex/tools/memory -o -path adapters/codex/tools/memory/mem.py -o -path adapters/codex/tools/memory/apply-distill-actions.py -o -path adapters/codex/tools/memory/recall.sh -o -path adapters/codex/tools/design -o -path adapters/codex/tools/design/visual-harness.sh -o -path adapters/codex/tools/design/convert-harness.sh -o -path adapters/codex/tools/material -o -path adapters/codex/tools/material/browser-fetch.sh -o -path adapters/codex/tools/material/data-script.sh -o -path adapters/codex/tools/material/figure-gen.sh -o -path adapters/codex/tools/material/pdf-extract.sh -o -path adapters/codex/tools/material/web-image-search.sh -o -path adapters/codex/tools/qa -o -path adapters/codex/tools/qa/verification-runner.sh -o -path adapters/codex/tools/research -o -path adapters/codex/tools/research/claim-verify.sh \) -print 2>/dev/null || true)
+  extra=$(find adapters/codex/tools -mindepth 1 ! -name __pycache__ ! -path '*/__pycache__/*' ! -name '*.py[co]' ! \( -path adapters/codex/tools/memory -o -path adapters/codex/tools/memory/mem.py -o -path adapters/codex/tools/memory/apply-distill-actions.py -o -path adapters/codex/tools/memory/recall.sh -o -path adapters/codex/tools/design -o -path adapters/codex/tools/design/visual-harness.sh -o -path adapters/codex/tools/design/convert-harness.sh -o -path adapters/codex/tools/material -o -path adapters/codex/tools/material/browser-fetch.sh -o -path adapters/codex/tools/material/data-script.sh -o -path adapters/codex/tools/material/figure-gen.sh -o -path adapters/codex/tools/material/pdf-extract.sh -o -path adapters/codex/tools/material/web-image-search.sh -o -path adapters/codex/tools/qa -o -path adapters/codex/tools/qa/verification-runner.sh -o -path adapters/codex/tools/research -o -path adapters/codex/tools/research/claim-verify.sh \) -print 2>/dev/null || true)
   if [ -n "$extra" ]; then
     fail_msg "adapters/codex/tools contains unapproved entries:"
     printf '%s\n' "$extra"
@@ -1475,7 +1475,7 @@ check_codex_tool_projection() {
   # completeness check and the denylist above are separate assertions and must not be conflated.
   TOOL_PROJECTED="memory material figure-semantic-manifest.schema.json figure-semantic-verify.py"
   TOOL_DEFERRED="__pycache__ integrations artifact-w8-handoff.py artifact_w8_handoff.test.py build-manifest.py render-hub.py render-landing.py render-fleet-svg.py generate.py harness_manifest.py sync-skill-invocation-policy.py sync-entry-skill-layer.py entry-skill-layer.test.py generated-projections.test.sh sync-missing-projections.sh sync-missing-projections.py figure-semantic-verify.test.py check-adaptation-boundary.sh check-model-config.py check-unit-config.py check-utility-census.py context-footprint.py context-footprint-baseline.json adaptation-exemptions.tsv adaptation-guard.test.sh routing-contract.test.sh design-mcp skill-conformance web-bundle fleet profile install improvement release capability_topology.py capability_topology.test.py report-manifest-verify.py report_manifest_verify.test.py report-bundle.py report_bundle_verify.test.py smoke-attestation.py smoke_attestation.test.py lab-config-provenance.py artifact-producer-canary.py artifact-delta-census.py artifact_delta_census.test.py lab_config_provenance.test.py browser-acceptance check-runtime-memory-boundary.py runtime_memory_boundary.test.py migration-manifest.py migration_manifest.test.py git-hooks check-scope-placeholders.py scope-placeholders.tsv scope_placeholders.test.py run-tests.py run_tests.test.py test-baseline.tsv test-isolation.tsv installed-layout-triggers.tsv check-installed-layout-trigger.py dispatch-discriminators.tsv"
-  TOOL_DEFERRED="$TOOL_DEFERRED check-sd-procedure-hooks.py check_sd_procedure_hooks.test.py sd-procedure-hooks.tsv stage-advance-census.py stage_advance_census.test.py dispatch-refusal-census.py dispatch_refusal_census.test.py check_ledger_invariant.py ledger_invariant.test.py check-surface-budget.py check_surface_budget.test.py surface-budget.json"
+  TOOL_DEFERRED="$TOOL_DEFERRED check-sd-procedure-hooks.py check_sd_procedure_hooks.test.py sd-procedure-hooks.tsv stage-advance-census.py stage_advance_census.test.py dispatch-refusal-census.py dispatch_refusal_census.test.py check_ledger_invariant.py ledger_invariant.test.py check-surface-budget.py check_surface_budget.test.py surface-budget.json bytecode-cache-tolerance.test.sh"
   tool_count=0
   for f in tools/*; do
     [ -e "$f" ] || continue
@@ -1644,7 +1644,7 @@ check_codex_native_plugin_projection() {
     cat /tmp/codex-sync-plugin.err
   fi
 
-  plugin_entries=$(find adapters/codex/plugins -mindepth 1 -maxdepth 1 -exec basename {} \; 2>/dev/null || true)
+  plugin_entries=$(find adapters/codex/plugins -mindepth 1 -maxdepth 1 ! -name __pycache__ -exec basename {} \; 2>/dev/null || true)
   for entry in $plugin_entries; do
     if [ "$entry" != "hearting-codex" ]; then
       fail_msg "adapters/codex/plugins/$entry is not an approved Codex plugin projection"
@@ -2364,7 +2364,7 @@ check_opencode_utility_projection() {
     fi
   done
 
-  extra=$(find adapters/opencode/utilities -mindepth 1 -maxdepth 1 ! \( -name agent-home.sh -o -name artifact-root.sh -o -name agent-worklog-state.sh -o -name harness-status.sh -o -name worktree-cleanup.py -o -name dispatch-route.sh -o -name dispatch-defaults.py -o -name worker_bootstrap.py \) -print 2>/dev/null || true)
+  extra=$(find adapters/opencode/utilities -mindepth 1 -maxdepth 1 ! -name __pycache__ ! -path '*/__pycache__/*' ! -name '*.py[co]' ! \( -name agent-home.sh -o -name artifact-root.sh -o -name agent-worklog-state.sh -o -name harness-status.sh -o -name worktree-cleanup.py -o -name dispatch-route.sh -o -name dispatch-defaults.py -o -name worker_bootstrap.py \) -print 2>/dev/null || true)
   if [ -n "$extra" ]; then
     fail_msg "adapters/opencode/utilities contains unapproved entries:"
     printf '%s\n' "$extra"
@@ -2515,7 +2515,7 @@ check_opencode_tool_projection() {
     :
   fi
 
-  extra=$(find adapters/opencode/tools -mindepth 1 ! \( -path adapters/opencode/tools/memory -o -path adapters/opencode/tools/memory/mem.py -o -path adapters/opencode/tools/memory/apply-distill-actions.py -o -path adapters/opencode/tools/memory/recall.sh -o -path adapters/opencode/tools/design -o -path adapters/opencode/tools/design/visual-harness.sh -o -path adapters/opencode/tools/material -o -path adapters/opencode/tools/material/browser-fetch.sh -o -path adapters/opencode/tools/material/data-script.sh -o -path adapters/opencode/tools/material/figure-gen.sh -o -path adapters/opencode/tools/material/pdf-extract.sh -o -path adapters/opencode/tools/material/web-image-search.sh -o -path adapters/opencode/tools/qa -o -path adapters/opencode/tools/qa/verification-runner.sh -o -path adapters/opencode/tools/research -o -path adapters/opencode/tools/research/claim-verify.sh \) -print 2>/dev/null || true)
+  extra=$(find adapters/opencode/tools -mindepth 1 ! -name __pycache__ ! -path '*/__pycache__/*' ! -name '*.py[co]' ! \( -path adapters/opencode/tools/memory -o -path adapters/opencode/tools/memory/mem.py -o -path adapters/opencode/tools/memory/apply-distill-actions.py -o -path adapters/opencode/tools/memory/recall.sh -o -path adapters/opencode/tools/design -o -path adapters/opencode/tools/design/visual-harness.sh -o -path adapters/opencode/tools/material -o -path adapters/opencode/tools/material/browser-fetch.sh -o -path adapters/opencode/tools/material/data-script.sh -o -path adapters/opencode/tools/material/figure-gen.sh -o -path adapters/opencode/tools/material/pdf-extract.sh -o -path adapters/opencode/tools/material/web-image-search.sh -o -path adapters/opencode/tools/qa -o -path adapters/opencode/tools/qa/verification-runner.sh -o -path adapters/opencode/tools/research -o -path adapters/opencode/tools/research/claim-verify.sh \) -print 2>/dev/null || true)
   if [ -n "$extra" ]; then
     fail_msg "adapters/opencode/tools contains unapproved entries:"
     printf '%s\n' "$extra"
@@ -2533,7 +2533,7 @@ check_opencode_tool_projection() {
   # completeness check and the denylist above are separate assertions and must not be conflated.
   TOOL_PROJECTED="memory material figure-semantic-manifest.schema.json figure-semantic-verify.py"
   TOOL_DEFERRED="__pycache__ integrations artifact-w8-handoff.py artifact_w8_handoff.test.py build-manifest.py render-hub.py render-landing.py render-fleet-svg.py generate.py harness_manifest.py sync-skill-invocation-policy.py sync-entry-skill-layer.py entry-skill-layer.test.py generated-projections.test.sh sync-missing-projections.sh sync-missing-projections.py figure-semantic-verify.test.py check-adaptation-boundary.sh check-model-config.py check-unit-config.py check-utility-census.py context-footprint.py context-footprint-baseline.json adaptation-exemptions.tsv adaptation-guard.test.sh routing-contract.test.sh design-mcp skill-conformance web-bundle fleet profile install improvement release capability_topology.py capability_topology.test.py report-manifest-verify.py report_manifest_verify.test.py report-bundle.py report_bundle_verify.test.py smoke-attestation.py smoke_attestation.test.py lab-config-provenance.py artifact-producer-canary.py artifact-delta-census.py artifact_delta_census.test.py lab_config_provenance.test.py browser-acceptance check-runtime-memory-boundary.py runtime_memory_boundary.test.py migration-manifest.py migration_manifest.test.py git-hooks check-scope-placeholders.py scope-placeholders.tsv scope_placeholders.test.py run-tests.py run_tests.test.py test-baseline.tsv test-isolation.tsv installed-layout-triggers.tsv check-installed-layout-trigger.py dispatch-discriminators.tsv"
-  TOOL_DEFERRED="$TOOL_DEFERRED check-sd-procedure-hooks.py check_sd_procedure_hooks.test.py sd-procedure-hooks.tsv stage-advance-census.py stage_advance_census.test.py dispatch-refusal-census.py dispatch_refusal_census.test.py check_ledger_invariant.py ledger_invariant.test.py check-surface-budget.py check_surface_budget.test.py surface-budget.json"
+  TOOL_DEFERRED="$TOOL_DEFERRED check-sd-procedure-hooks.py check_sd_procedure_hooks.test.py sd-procedure-hooks.tsv stage-advance-census.py stage_advance_census.test.py dispatch-refusal-census.py dispatch_refusal_census.test.py check_ledger_invariant.py ledger_invariant.test.py check-surface-budget.py check_surface_budget.test.py surface-budget.json bytecode-cache-tolerance.test.sh"
   tool_count=0
   for f in tools/*; do
     [ -e "$f" ] || continue
@@ -2766,7 +2766,7 @@ check_opencode_native_command_projection() {
 
 check_opencode_native_plugin_projection() {
   plugin="adapters/opencode/plugins/hearting-guards.js"
-  plugin_entries=$(find adapters/opencode/plugins -mindepth 1 -maxdepth 1 -exec basename {} \; 2>/dev/null || true)
+  plugin_entries=$(find adapters/opencode/plugins -mindepth 1 -maxdepth 1 ! -name __pycache__ -exec basename {} \; 2>/dev/null || true)
   for entry in $plugin_entries; do
     if [ "$entry" != "hearting-guards.js" ]; then
       fail_msg "adapters/opencode/plugins/$entry is not an approved OpenCode plugin projection"
