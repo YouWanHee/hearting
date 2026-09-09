@@ -130,6 +130,43 @@ is_worker_session() {
 # silently pass is a worker session that lands on that shared default —
 # whether the variable was never exported or was exported empty. An
 # interactive, non-worker session legitimately keeps the `codex` default.
+# Distillation runs inside a hook, and a hook has a wall clock. A live curate
+# measured 21.9s against a 3s SessionEnd budget, so session-end distillation was
+# killed every time; the worker only advances its marker after a successful
+# exec, so the delta never moved and every session end failed the same way.
+#
+# Claude (`mem-distill-dispatch.sh`) and OpenCode (plugin `session.idle` →
+# detached `preflight session-end`) both already detach. Codex was the only
+# sibling running this synchronously, which is what made the hook budget bind.
+# A worker session still keeps the synchronous call — it must capture memory
+# before its process disappears, and its budget now fits inside the hook's (see
+# distill-worker.sh). An interactive session has no such race, so it detaches:
+# no wait for the user. setsid + nohup so the child outlives the reaped hook.
+#
+# The 2-tier contract, the shared curate-snapshot, and the whitelist applier are
+# untouched; only who waits for the worker changes.
+run_distill() {
+  distill_mode=$1
+  distill_sid=$2
+  distill_cwd=$3
+  if is_worker_session; then
+    AGENT_HOME="$AGENT_ROOT" \
+      CODEX_DISTILL_ENABLE="${CODEX_DISTILL_ENABLE:-1}" \
+      CODEX_DISTILL_APPLY="${CODEX_DISTILL_APPLY:-1}" \
+      CODEX_DISTILL_CONTRACT_ACCEPTED="${CODEX_DISTILL_CONTRACT_ACCEPTED:-1}" \
+      "$ROOT/adapters/codex/bin/distill-worker.sh" \
+        "$distill_sid" "$distill_cwd" "$distill_mode"
+    return $?
+  fi
+  AGENT_HOME="$AGENT_ROOT" \
+    CODEX_DISTILL_ENABLE="${CODEX_DISTILL_ENABLE:-1}" \
+    CODEX_DISTILL_APPLY="${CODEX_DISTILL_APPLY:-1}" \
+    CODEX_DISTILL_CONTRACT_ACCEPTED="${CODEX_DISTILL_CONTRACT_ACCEPTED:-1}" \
+    setsid nohup "$ROOT/adapters/codex/bin/distill-worker.sh" \
+      "$distill_sid" "$distill_cwd" "$distill_mode" >/dev/null 2>&1 &
+  return 0
+}
+
 guard_identity_hard_fail_if_worker() {
   sid_value=$1
   if [ "$sid_value" = codex ] && is_worker_session; then
@@ -505,11 +542,7 @@ case "$cmd" in
     # whitelist applier (D-30/D-32); turn-nudge runs increment. Synchronous so the
     # headless codex exec captures memory before it exits (curate timeout-bounded).
     curator_status=0
-    AGENT_HOME="$AGENT_ROOT" \
-      CODEX_DISTILL_ENABLE="${CODEX_DISTILL_ENABLE:-1}" \
-      CODEX_DISTILL_APPLY="${CODEX_DISTILL_APPLY:-1}" \
-      CODEX_DISTILL_CONTRACT_ACCEPTED="${CODEX_DISTILL_CONTRACT_ACCEPTED:-1}" \
-      "$ROOT/adapters/codex/bin/distill-worker.sh" "$sid" "$cwd" curate || curator_status=$?
+    run_distill curate "$sid" "$cwd" || curator_status=$?
     [ "$sync_status" -eq 0 ] || exit "$sync_status"
     exit "$curator_status"
     ;;
@@ -566,11 +599,7 @@ case "$cmd" in
     counter=$((counter + 1))
     if [ "$counter" -ge "$interval" ]; then
       counter=0
-      AGENT_HOME="$AGENT_ROOT" \
-        CODEX_DISTILL_ENABLE="${CODEX_DISTILL_ENABLE:-1}" \
-        CODEX_DISTILL_APPLY="${CODEX_DISTILL_APPLY:-1}" \
-        CODEX_DISTILL_CONTRACT_ACCEPTED="${CODEX_DISTILL_CONTRACT_ACCEPTED:-1}" \
-        "$ROOT/adapters/codex/bin/distill-worker.sh" "$sid" "$cwd" increment >/dev/null 2>/dev/null || true
+      run_distill increment "$sid" "$cwd" >/dev/null 2>/dev/null || true
     fi
     printf '%s\n' "$counter" > "$state" 2>/dev/null || true
     find "$store" -maxdepth 1 -name '.codex-turn-state-*' -mmin +4320 -delete 2>/dev/null || true

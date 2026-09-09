@@ -249,10 +249,19 @@ fi
 
 # Hang guard: bound a silent `codex exec`. Curate receives delta, snapshot, and
 # artifact evidence on a deep model, so it gets a larger timeout budget.
+#
+# These budgets only bind a WORKER session, which still runs this synchronously
+# inside its hook (an interactive session detaches — see preflight.sh
+# run_distill). So each one must fit inside the enclosing hook's own timeout, or
+# the hook is reaped first and the work is thrown away with no marker advance.
+# That inversion is exactly what was measured: 600s of budget inside a 3s hook.
+# Curate: 90s < SessionEnd 120s. Increment: 20s < UserPromptSubmit 30s.
+# A live curate measured 21.9s, so 90s is roughly 4x headroom; going over keeps
+# the delta for the next run rather than losing it.
 if [ "$mode" = "curate" ]; then
-  timeout_s=${CODEX_DISTILL_TIMEOUT_CURATE:-600}
+  timeout_s=${CODEX_DISTILL_TIMEOUT_CURATE:-90}
 else
-  timeout_s=${CODEX_DISTILL_TIMEOUT:-300}
+  timeout_s=${CODEX_DISTILL_TIMEOUT:-20}
 fi
 if command -v timeout >/dev/null 2>&1; then
   timeout_cmd="timeout $timeout_s"
