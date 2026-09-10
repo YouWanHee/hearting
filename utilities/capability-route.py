@@ -2579,7 +2579,13 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
     if not cwd.is_absolute() or not artifact.is_absolute(): raise ValueError("cwd and artifact root must be absolute")
     slug_fields={}
     if slug is not None:
-        canonical_slug,slug_truncated=ARTIFACT_LOCATOR.slugify(slug)
+        # A caller-typed leading date is dropped once, here at the origin: every
+        # locator built from this slug prefixes the record's own date, so BC_ResNet
+        # 2026-09-10 accumulated names like `2026-09-10_2026-09-10-r5-...` and one
+        # `2026-09-09_2026-09-10-r4-...` whose two dates disagreed. Migration
+        # naming does not pass through here and keeps both dates by design.
+        canonical_slug,slug_truncated=ARTIFACT_LOCATOR.slugify(
+            ARTIFACT_LOCATOR.strip_leading_date(slug))
         slug_fields={"slug":canonical_slug,"slug_truncated":slug_truncated}
     known_pred=set(recipe["direct_predicates"]); predicates=sorted(set(predicates))
     unknown=set(predicates)-known_pred

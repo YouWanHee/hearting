@@ -690,6 +690,8 @@ When `spec/pipeline_state.yaml` exists, read it and activate every applicable ap
 
 **W7C cycle layout.** The output paths above are bucket-relative. While the producer cutover is inactive they resolve to the legacy top-level bucket; once active they resolve to `campaigns/<campaign-locator>/<cycle-locator>/artifacts/<bucket>/…` of the cycle issued by `utilities/artifact_producer.py begin`; the machine-managed `.cycle.json` beside `artifacts/` binds that renameable locator to its stable IDs (see `core/CORE.md §3` and `producer_lifecycle` in `capabilities/topologies.json`). Only `spec`, `analysis`, and explicitly promoted `research` reach the immutable `shared/` tree, via `admit-shared` from a sealed cycle.
 
+**Campaign or cycle.** A cycle is the deterministic D-23 unit of one route's work; a campaign is the agent's own proposal for the work stream that cycle belongs to. `begin` joins an existing active campaign only when the caller names one — `--campaign-key <stream>`, `--campaign`, or a sealed `--parent-cycle` — and otherwise opens a new campaign keyed `<capability>:<route_id>`, which is unique per route. So follow-up work composed as its own route lands in its own campaign unless it passes the stream's `--campaign-key`; measured on BC_ResNet 2026-09-10, keyless routes averaged 1.11 cycles per campaign against 1.71 for keyed ones. Name the stream, not the task, in a campaign key.
+
 ### §6.5-anchors. Anchor Resolution
 
 Every track's scopes above resolve against exactly one bucket domain:
