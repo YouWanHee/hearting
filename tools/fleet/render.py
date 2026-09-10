@@ -4169,114 +4169,6 @@ def _split_w_exact(text, max_width):
     return chunks
 
 
-def _stage_detail_rows(nodes, depth=0, term_width=None, indent=None):
-    """Render every sealed node once, wrapping instead of dropping route history.
-
-    ``|`` joins parallel same-level siblings; ``›`` advances a topological level.
-    Explicit parent sets keep asymmetric/partial joins dependency-exact.
-    """
-    nodes = list(nodes or ())
-    if not nodes:
-        return []
-    indent = (_SUBAGENT_IND + "  " * max(0, depth)) if indent is None else indent
-    label = "stage "
-    available = max(1, (term_width or _SUMMARY_FALLBACK_W) - _dw(indent) - _dw(label))
-    units = []
-    previous_level = None
-    for index, node in enumerate(nodes):
-        state = node.get("state") or "pending"
-        mark, key = {
-            "done": ("✓", "dim"),
-            "active": ("●", "g_work" if _BLINK_ON else "g_work_off"),
-            "reconciling": ("…", "lvl_y"),
-            "recovering": ("…", "lvl_y"),
-            "failed": ("✕", "lvl_r"),
-            "degraded": ("◐", "lvl_y"),
-            "pending": ("○", "dim"),
-        }.get(state, ("○", "dim"))
-        token = "%s %s" % (node.get("id") or "?", mark)
-        parents = [str(parent) for parent in (node.get("depends_on") or ())]
-        if parents:
-            token += " ←{%s}" % ",".join(parents)
-        progress = node.get("progress")
-        if isinstance(progress, dict) and progress.get("total") is not None:
-            token += " %s/%s" % (progress.get("done", 0), progress.get("total"))
-        if node.get("gate_passed"):
-            token += _GATE_MARK
-        level = node.get("level")
-        separator = "" if index == 0 else (" | " if level == previous_level else " › ")
-        units.append((separator, token, key))
-        previous_level = level
-
-    rows, current, used = [], [], 0
-
-    def flush():
-        nonlocal current, used
-        if not current:
-            return
-        prefix = label if not rows else " " * _dw(label)
-        rows.append([(indent, None), (prefix, "dim")] + current)
-        current, used = [], 0
-
-    for separator, token, key in units:
-        unit_width = _dw(separator) + _dw(token)
-        if current and used + unit_width > available:
-            flush()
-            separator = (separator.strip() + " ") if separator else ""
-            unit_width = _dw(separator) + _dw(token)
-        if unit_width <= available:
-            if separator:
-                current.append((separator, "dim"))
-            current.append((token, key))
-            used += unit_width
-            continue
-        # An opaque node/dependency token may itself be wider than the row. Keep
-        # every character by continuing it over as many rows as necessary.
-        flush()
-        combined = separator + token
-        for chunk in _split_w_exact(combined, available):
-            current = [(chunk, key)]
-            used = _dw(chunk)
-            flush()
-    flush()
-    return rows
-
-
-def _projection_stage_detail_rows(entity, depth=0, term_width=None):
-    """Dedicated full-route rows for one validated projection owner.
-
-    SESSION cards only since 2026-07-24 ("depth=1,2도 메인 세션처럼 두번째 줄에서는
-    로그 요약해서 띄우는걸로 통일") — dispatch cards keep their second line for the
-    live log summary and carry the pipeline on the row's own breadcrumb."""
-    if getattr(entity, "liveness", None) in ("stale", "dead"):
-        return []
-    projection = getattr(entity, "work_projection", None)
-    if not projection or getattr(projection, "ambiguity", None):
-        return []
-    source = getattr(projection, "source", None)
-    if source == "artifact-inferred":
-        # An INFERRED inline stage (low-confidence: a lone plan dir, no sealed route) rides the
-        # row's own `stage <x>` column ONLY — never a dedicated `plan › exec › test` detail row.
-        # A main session must not carry that breadcrumb line (user 2026-07-24 "main 세션에 여전히
-        # stage 뜨는 케이스"); this is the artifact-inferred case the route-exact suppression
-        # missed. Covers both code (plan/exec/test/report) and spec-grounding labels.
-        return []
-    if source != "route-exact":
-        return []
-    backing = getattr(projection, "_route_view", None) or {}
-    view = backing.get("view") or {}
-    nodes = _collapse_parallel_nodes(view.get("nodes") or ())
-    # A route with no open nodes needs no detail row on the owning session. Its whole
-    # DAG lingering below a long-lived main session is historical residue.
-    # live dispatcher session is noise (user 2026-07-24 "stage 설명 여전히 뜨는데 이거
-    # 없앴다매?"). The detail row's value is the IN-PROGRESS non-linear process view — a
-    # Failed is terminal here too: process view owns history, while this legacy multi-line
-    # stage surface is reserved for a route that still has open work.
-    if nodes and all(n.get("state") in {"done", "failed"} for n in nodes):
-        return []
-    return _stage_detail_rows(nodes, depth=depth, term_width=term_width)
-
-
 def set_show_all(v):
     global _SHOW_ALL
     _SHOW_ALL = bool(v)
@@ -6474,10 +6366,8 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
                 lines.extend(detail)
             # F-101a: relation strips follow the session detail rows, not the 44-column subtitle.
             _peer_last = getattr(s, "peer_last_recv", None)
-            stage_rows = ([] if suppress_session_stage else
-                          _projection_stage_detail_rows(s, term_width=term_width))
-            if stage_rows:
-                lines.extend(stage_rows)
+            # The session has no full-route detail surface. Route progress belongs
+            # to its owner card and process view, even when that card is absent.
             # F-29 (v9) — sub-agent rows, directly under the parent session's own row(s).
             # Active always shown; completed only surface with `a` (F-18b dim-row convention).
             shown_subs = [sa for sa in (getattr(s, "subagents", None) or [])
