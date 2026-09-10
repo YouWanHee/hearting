@@ -2653,5 +2653,65 @@ class TerminalTransactionIntegrationTest(ProducerTestBase):
             self.assertEqual(terminal.settle_terminal_commit(request).result,"completed")
 
 
+class LocatorDateDuplicationTest(ProducerTestBase):
+    """One date in a new work locator, two in a migration locator.
+
+    BC_ResNet 2026-09-10 carried six campaign directories named
+    ``<date>_<same date>-<slug>`` and one whose two dates disagreed, so the
+    directory sorted under one day and read as another.
+    """
+
+    def test_a_route_slug_that_already_carries_a_date_does_not_get_a_second_one(self):
+        self.activate()
+        route = compile_for("direct", self.root, slug="2026-09-10-r5-streaming-window-sim")
+        route_file = Path(L.admit_runtime_route(self.root, route).route_file)
+        result = P.begin(self.root, route_file=route_file, capability="autopilot-code",
+                         intensity="direct")
+        campaign = P.read_campaign(self.root, result["campaign_id"])
+        locator = campaign["locator"]
+        self.assertEqual(len(P.artifact_locator._DATE_PREFIX.findall(locator)), 1, locator)
+        self.assertTrue(locator.endswith("_r5-streaming-window-sim"), locator)
+        self.assertEqual(campaign["slug"], "r5-streaming-window-sim")
+        self.assertEqual(campaign["slug_source"], "route")
+        # The route sealed the normalised slug, so the cycle locator under it
+        # carries one date too.
+        self.assertEqual(route["slug"], "r5-streaming-window-sim")
+        cycle_locator = Path(result["cycle_dir"]).name
+        self.assertEqual(len(P.artifact_locator._DATE_PREFIX.findall(cycle_locator)), 1,
+                         cycle_locator)
+        self.assertIsNotNone(P.read_cycle_record(self.root, result["cycle_id"]))
+
+    def test_strip_leading_date_leaves_every_other_slug_intact(self):
+        cases = {
+            "2026-09-10-r5-window": "r5-window",
+            "2026-09-10_r5-window": "r5-window",
+            # A date that disagrees with the cycle's date is still dropped: the
+            # locator's own date is the authoritative one for new work.
+            "2026-09-09-r4-explicit": "r4-explicit",
+            "r6-endpoint-options": "r6-endpoint-options",
+            # A trailing number is part of the name, never a date.
+            "wwd-2026-04": "wwd-2026-04",
+            # A slug that is only a date keeps its own text rather than emptying.
+            "2026-09-10": "2026-09-10",
+        }
+        for slug, expected in cases.items():
+            with self.subTest(slug=slug):
+                self.assertEqual(P.artifact_locator.strip_leading_date(slug), expected)
+
+    def test_locator_base_keeps_both_dates_so_migration_provenance_survives(self):
+        """A migration locator dates the move, its slug dates the content.
+
+        `core/CORE.md`'s W7H relocation table records exactly this shape
+        (``2026-09-05_2026-08-24-artifact-knowledge-index-w7/``), and
+        relayout/residue/resplit all name through `locator_base`. Normalising
+        there would erase when the content was originally made.
+        """
+
+        self.assertEqual(
+            P.artifact_locator.locator_base("2026-09-05T00:00:00Z",
+                                            "2026-08-24-artifact-knowledge-index-w7"),
+            "2026-09-05_2026-08-24-artifact-knowledge-index-w7")
+
+
 if __name__ == "__main__":
     unittest.main()

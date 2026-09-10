@@ -3241,11 +3241,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--node", default=None)
     p.add_argument("--capability", required=True)
     p.add_argument("--intensity", required=True)
-    p.add_argument("--campaign")
-    p.add_argument("--campaign-key")
+    p.add_argument("--campaign", help="existing campaign id to add this cycle to")
+    p.add_argument("--campaign-key",
+                   help="the work stream this cycle belongs to; reuses the active "
+                        "campaign holding that key. Without it, and without "
+                        "--campaign/--parent-cycle, begin opens a NEW campaign keyed "
+                        "<capability>:<route_id>, which is unique per route -- so every "
+                        "follow-up composed as its own route becomes its own campaign")
     p.add_argument("--title")
     p.add_argument("--goal")
-    p.add_argument("--parent-cycle")
+    p.add_argument("--parent-cycle",
+                   help="sealed cycle this one continues; inherits its campaign")
     p.add_argument("--require-cycle", action="store_true")
     p.add_argument("--shared-reference", action="append", default=[],
                    help="<kind>:<ref>:<rrev>[:<content_digest>], repeatable")
