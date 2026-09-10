@@ -119,6 +119,45 @@ XDG_CACHE_HOME=/proc/nonexistent "$HOOK" --cwd "$TMP/project" --format text \
   | grep -q 'Local evidence present'
 rm -rf "$XDG_CACHE_HOME/hearting"
 
+# A busy bucket must not take every slot. A producer cycle also writes each
+# artifact twice — once under campaigns, once as a shared revision — and six
+# slots spent on four documents is a shorter list, not a fuller one.
+mkdir -p "$TMP/crowd/.agent_reports/research/bulk" \
+  "$TMP/crowd/.agent_reports/documents/brief" \
+  "$TMP/crowd/.agent_reports/shared/analysis/ref_z/revisions/rrev_z" \
+  "$TMP/crowd/.agent_reports/campaigns/camp_z/cycles/cyc_z/artifacts/analysis_project/doc"
+python3 - "$TMP/crowd/.agent_reports" <<'PY'
+import pathlib, sys
+root = pathlib.Path(sys.argv[1])
+# Research is both the newest and by far the largest bucket.
+for index in range(30):
+    (root / "research/bulk" / f"note-{index:02d}.md").write_text("r" * 100, encoding="utf-8")
+(root / "documents/brief/overview.md").write_text("d" * 100, encoding="utf-8")
+# The same artifact under both projections: identical name and size.
+body = "a" * 4096
+(root / "shared/analysis/ref_z/revisions/rrev_z/REPORT.md").write_text(body, encoding="utf-8")
+(root / "campaigns/camp_z/cycles/cyc_z/artifacts/analysis_project/doc/REPORT.md").write_text(
+    body, encoding="utf-8"
+)
+PY
+"$HOOK" --cwd "$TMP/crowd" --format text > "$TMP/crowd.out"
+# Every non-empty bucket is represented, however lopsided the counts.
+grep -q 'documents/brief/overview.md' "$TMP/crowd.out"
+grep -q 'research/bulk/' "$TMP/crowd.out"
+grep -qE 'REPORT\.md' "$TMP/crowd.out"
+# The repeated artifact takes one slot, not two.
+[ "$(grep -c 'REPORT\.md' "$TMP/crowd.out")" -eq 1 ]
+# Counts still report every file, deduplication is a display bound only.
+grep -q 'analysis: 2 file(s)' "$TMP/crowd.out"
+# Research cannot crowd the list out even though it holds 30 of the 32 files.
+[ "$(grep -c 'research/bulk/' "$TMP/crowd.out")" -lt 9 ]
+python3 - "$TMP/crowd.out" <<'PY'
+import sys
+lines = [l for l in open(sys.argv[1], encoding="utf-8").read().splitlines() if l.startswith("- ")]
+assert len(lines) == 9, lines
+PY
+rm -rf "$XDG_CACHE_HOME/hearting"
+
 # Worker sessions are exempt.
 printf '{"hook_event_name":"SessionStart","source":"startup","cwd":"%s"}\n' "$TMP/project" \
   | AGENT_SESSION_ROLE=worker "$HOOK" > "$TMP/worker.out"
