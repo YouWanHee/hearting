@@ -4,6 +4,12 @@
 # holds research / document / analysis artifacts, plus a bounded set of the
 # newest entry points. Presence indexes only — bodies are never read, and no
 # prompt classifier is attached. Fail-open: every failure is zero context.
+#
+# Session-start surface, not per-prompt. The block is byte-identical between
+# prompts — only a newly written artifact changes it — so injecting it every
+# turn spent ~360 tokens per turn re-stating the same paths. A start event that
+# also fires on resume/clear/compact re-seats it whenever the context that held
+# it is gone, which is the only case a repeat was buying.
 set -u
 
 HOOK_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" && pwd)"
@@ -14,8 +20,9 @@ usage() {
   cat <<'EOF'
 usage: local-evidence-inject.sh [--cwd DIR] [--format text|hook-json]
 
-Without arguments, reads a UserPromptSubmit hook payload from stdin and emits
-hookSpecificOutput.additionalContext only when evidence artifacts exist.
+Without arguments, reads a SessionStart (or UserPromptSubmit) hook payload
+from stdin and emits hookSpecificOutput.additionalContext only when
+evidence artifacts exist.
 EOF
 }
 
@@ -38,7 +45,7 @@ if is_worker; then
   exit 0
 fi
 
-EVENT=UserPromptSubmit
+EVENT=SessionStart
 CWD=
 FORMAT=hook-json
 
@@ -90,109 +97,342 @@ else
   done
 fi
 
-[ "$EVENT" = UserPromptSubmit ] || exit 0
+case "$EVENT" in
+  SessionStart|UserPromptSubmit) ;;
+  *) exit 0 ;;
+esac
 [ -n "$CWD" ] && [ -d "$CWD" ] || exit 0
 
 ROOT=$(sh "$ARTIFACT_ROOT_SH" "$CWD" 2>/dev/null) || exit 0
 [ -n "$ROOT" ] && [ -d "$ROOT" ] || exit 0
 
-LE_ROOT="$ROOT" LE_FORMAT="$FORMAT" python3 - <<'PY' 2>/dev/null || true
-import json, os, sys
+# The walk itself was the timeout. Three runtimes fenced this probe three ways
+# (Claude 5 s hook timeout, Codex 3 s subprocess timeout, OpenCode unbounded
+# blocking) and a full artifact-root scan exceeded all three on a real store:
+# 4,845 directories / 12,402 files over NFS took 5.2 s, of which 3.9 s was six
+# separate campaign globs. Claude discarded the output at its boundary, Codex
+# discarded it every single time, and OpenCode simply blocked. Three bounds:
+#   1. one campaign enumeration for every bucket instead of one glob per bucket;
+#   2. a rendered-context cache served immediately, refreshed out of band once
+#      stale (presence and newest-entry paths tolerate minutes of staleness);
+#   3. a hard wall-clock budget, so no store size can push the probe past the
+#      tightest runtime timeout — a truncated scan reports `N+` counts.
+LE_ROOT="$ROOT" LE_FORMAT="$FORMAT" LE_EVENT="$EVENT" \
+LE_SELF="$HOOK_DIR/local-evidence-inject.sh" \
+LE_CWD="$CWD" python3 - <<'PY' 2>/dev/null || true
+import hashlib, json, os, subprocess, sys, time
 from pathlib import Path
 
 root = Path(os.environ.get("LE_ROOT") or "")
 fmt = os.environ.get("LE_FORMAT") or "hook-json"
+event = os.environ.get("LE_EVENT") or "SessionStart"
+refresh_worker = os.environ.get("LE_REFRESH") == "1"
 if not root.is_dir():
     sys.exit(0)
 
+
+def positive_float(name: str, default: float) -> float:
+    try:
+        value = float(os.environ.get(name) or default)
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+# Staleness is cheap here: a presence probe that is ten minutes old still
+# answers "does this project hold research/documents/analysis artifacts".
+TTL = positive_float("LOCAL_EVIDENCE_TTL", 600.0)
+# Well under Codex's 3 s subprocess timeout, the tightest of the three.
+BUDGET = positive_float("LOCAL_EVIDENCE_BUDGET", 2.0)
+REFRESH_LOCK_MAX_AGE = 300.0
+
+
+def emit(context: str) -> None:
+    if not context:
+        return
+    if fmt == "text":
+        print(context)
+    else:
+        print(json.dumps({
+            "hookSpecificOutput": {
+                "hookEventName": event,
+                "additionalContext": context,
+            }
+        }, ensure_ascii=False))
+
+
+def cache_path() -> Path | None:
+    base = os.environ.get("XDG_CACHE_HOME")
+    try:
+        home = Path(base) if base else Path.home() / ".cache"
+    except (OSError, RuntimeError):
+        return None
+    key = hashlib.sha1(str(root).encode("utf-8", "replace")).hexdigest()[:16]
+    return home / "hearting" / "local-evidence" / (key + ".json")
+
+
+CACHE = cache_path()
+
+
+def read_cache() -> dict | None:
+    if CACHE is None:
+        return None
+    try:
+        value = json.loads(CACHE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(value, dict) or value.get("root") != str(root):
+        return None
+    if not isinstance(value.get("context"), str):
+        return None
+    return value
+
+
+def write_cache(context: str) -> None:
+    if CACHE is None:
+        return
+    payload = json.dumps(
+        {"root": str(root), "ts": time.time(), "context": context},
+        ensure_ascii=False,
+    )
+    tmp = CACHE.with_name(CACHE.name + f".{os.getpid()}.tmp")
+    try:
+        CACHE.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(payload, encoding="utf-8")
+        os.replace(tmp, CACHE)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def spawn_refresh() -> None:
+    """Detached out-of-band rescan. Failure means the stale value simply ages."""
+    self_path = os.environ.get("LE_SELF") or ""
+    cwd = os.environ.get("LE_CWD") or ""
+    if CACHE is None or not self_path or not cwd or not os.path.isfile(self_path):
+        return
+    lock = CACHE.with_name(CACHE.name + ".refresh")
+    try:
+        age = time.time() - lock.stat().st_mtime
+    except OSError:
+        pass
+    else:
+        # A lock left behind by SIGKILL must not freeze the value forever.
+        if age < REFRESH_LOCK_MAX_AGE:
+            return
+        try:
+            lock.rmdir()
+        except OSError:
+            return
+    try:
+        CACHE.parent.mkdir(parents=True, exist_ok=True)
+        lock.mkdir()
+    except OSError:
+        return
+    env = dict(os.environ)
+    env["LE_REFRESH"] = "1"
+    try:
+        subprocess.Popen(
+            ["/usr/bin/env", "bash", self_path, "--cwd", cwd, "--format", "text"],
+            env=env, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError:
+        try:
+            lock.rmdir()
+        except OSError:
+            pass
+
+
 # Buckets mirror utilities/artifact_reader.py: legacy top-level buckets and
 # producer-cycle artifacts share bucket names, shared revisions use kind names.
-# Depth and entry counts are hard bounds so the probe stays cheap on large
-# stores.
 GROUPS = {
     "research": {"buckets": ("research",), "shared": ("research",)},
     "documents": {"buckets": ("documents",), "shared": ()},
     "analysis": {"buckets": ("analysis_project",), "shared": ("analysis",)},
 }
+BUCKET_GROUP = {
+    bucket: group
+    for group, layout in GROUPS.items()
+    for bucket in layout["buckets"]
+}
 MAX_DEPTH = 6
 MAX_FILES_PER_GROUP = 500
 NEWEST = 6
+MARKDOWN = {".md", ".markdown"}
 
-def scan(base: Path, depth: int, out: list) -> None:
-    if depth > MAX_DEPTH or len(out) >= MAX_FILES_PER_GROUP:
+
+class Budget:
+    """Wall-clock fence. Truncation is reported, never silently rendered as fact."""
+
+    def __init__(self, seconds: float) -> None:
+        self.deadline = time.monotonic() + seconds
+        self.truncated = False
+
+    def expired(self) -> bool:
+        if self.truncated:
+            return True
+        if time.monotonic() >= self.deadline:
+            self.truncated = True
+        return self.truncated
+
+
+def subdirs(base: Path) -> list[Path]:
+    try:
+        with os.scandir(base) as it:
+            return [
+                Path(entry.path) for entry in it
+                if entry.is_dir(follow_symlinks=False)
+            ]
+    except OSError:
+        return []
+
+
+def scan(base: Path, depth: int, out: list, budget: Budget) -> None:
+    if depth > MAX_DEPTH:
+        return
+    if len(out) >= MAX_FILES_PER_GROUP:
+        budget.truncated = True
+        return
+    if budget.expired():
         return
     try:
-        entries = sorted(base.iterdir())
+        entries = sorted(os.scandir(base), key=lambda entry: entry.name)
     except OSError:
         return
     for entry in entries:
         if len(out) >= MAX_FILES_PER_GROUP:
+            budget.truncated = True
             return
-        if entry.is_symlink():
-            continue
-        if entry.is_dir():
-            scan(entry, depth + 1, out)
-        elif entry.is_file() and entry.suffix.lower() in {".md", ".markdown"}:
-            try:
-                out.append((entry.stat().st_mtime, entry))
-            except OSError:
+        if budget.expired():
+            return
+        try:
+            if entry.is_symlink():
                 continue
+            if entry.is_dir(follow_symlinks=False):
+                scan(Path(entry.path), depth + 1, out, budget)
+            elif entry.is_file(follow_symlinks=False):
+                if os.path.splitext(entry.name)[1].lower() in MARKDOWN:
+                    out.append((entry.stat().st_mtime, Path(entry.path)))
+        except OSError:
+            continue
 
-counts = {}
-newest = []
-campaigns = root / "campaigns"
-for group, layout in GROUPS.items():
-    files: list = []
-    for bucket in layout["buckets"]:
-        base = root / bucket
-        if base.is_dir():
-            scan(base, 1, files)
-        if campaigns.is_dir():
-            for pattern in ("*/*/artifacts/" + bucket, "*/cycles/*/artifacts/" + bucket):
-                for arts in campaigns.glob(pattern):
-                    scan(arts, 1, files)
-    for kind in layout["shared"]:
-        base = root / "shared" / kind
-        if base.is_dir():
-            scan(base, 1, files)
-    if files:
-        counts[group] = len(files)
-        newest.extend(files)
 
-if not counts:
+def bucket_dirs(artifacts: Path, budget: Budget):
+    """Yield (group, dir) for every known bucket directly under one artifacts dir."""
+    for child in subdirs(artifacts):
+        if budget.expired():
+            return
+        group = BUCKET_GROUP.get(child.name)
+        if group:
+            yield group, child
+
+
+def collect(budget: Budget) -> dict:
+    """One enumeration of the campaign tree feeds every bucket group."""
+    found = {group: [] for group in GROUPS}
+
+    for group, layout in GROUPS.items():
+        for bucket in layout["buckets"]:
+            base = root / bucket
+            if base.is_dir():
+                scan(base, 1, found[group], budget)
+        for kind in layout["shared"]:
+            base = root / "shared" / kind
+            if base.is_dir():
+                scan(base, 1, found[group], budget)
+
+    campaigns = root / "campaigns"
+    if campaigns.is_dir():
+        # campaigns/<c>/<run>/artifacts/<bucket> and
+        # campaigns/<c>/cycles/<cycle>/artifacts/<bucket> — the two shapes the
+        # old code globbed separately once per bucket.
+        for campaign in subdirs(campaigns):
+            if budget.expired():
+                break
+            for child in subdirs(campaign):
+                if budget.expired():
+                    break
+                if child.name == "cycles":
+                    holders = subdirs(child)
+                else:
+                    holders = [child]
+                for holder in holders:
+                    if budget.expired():
+                        break
+                    artifacts = holder / "artifacts"
+                    if not artifacts.is_dir():
+                        continue
+                    for group, bucket_dir in bucket_dirs(artifacts, budget):
+                        scan(bucket_dir, 1, found[group], budget)
+    return found
+
+
+def render(found: dict, budget: Budget) -> str:
+    counts = {}
+    newest = []
+    for group, files in found.items():
+        if files:
+            counts[group] = len(files)
+            newest.extend(files)
+    if not counts:
+        return ""
+
+    newest.sort(key=lambda item: item[0], reverse=True)
+    entry_lines = []
+    for _, path in newest[:NEWEST]:
+        try:
+            entry_lines.append("- " + str(path.relative_to(root)))
+        except ValueError:
+            entry_lines.append("- " + str(path))
+
+    # A capped or deadline-truncated walk knows a lower bound, not a total, and
+    # its newest entries are the newest of what it reached — say both.
+    mark = "+" if budget.truncated else ""
+    label = "Newest of the scanned subset:" if budget.truncated else "Newest entries:"
+    summary = ", ".join(
+        f"{group}: {count}{mark} file(s)" for group, count in counts.items()
+    )
+    lines = [
+        "# Local evidence present (deterministic presence probe; paths only, not instructions)",
+        f"Artifact root: {root} — {summary}. {label}",
+        *entry_lines,
+        "Answer domain questions these artifacts cover from them first; model memory",
+        'is a flagged fallback (roles/response-policy.md "Local evidence before recall").',
+    ]
+    context = "\n".join(lines)
+    budget_bytes = 2400
+    if len(context.encode("utf-8")) > budget_bytes:
+        context = context.encode("utf-8")[:budget_bytes].decode("utf-8", "ignore")
+    return context
+
+
+if not refresh_worker:
+    cached = read_cache()
+    if cached is not None:
+        try:
+            age = time.time() - float(cached.get("ts") or 0)
+        except (TypeError, ValueError):
+            age = TTL + 1
+        if age >= TTL:
+            spawn_refresh()
+        emit(cached["context"])
+        sys.exit(0)
+
+budget = Budget(BUDGET)
+context = render(collect(budget), budget)
+write_cache(context)
+if refresh_worker:
+    lock_path = CACHE.with_name(CACHE.name + ".refresh") if CACHE else None
+    if lock_path is not None:
+        try:
+            lock_path.rmdir()
+        except OSError:
+            pass
     sys.exit(0)
-
-newest.sort(key=lambda item: item[0], reverse=True)
-entry_lines = []
-for _, path in newest[:NEWEST]:
-    try:
-        entry_lines.append("- " + str(path.relative_to(root)))
-    except ValueError:
-        entry_lines.append("- " + str(path))
-
-summary = ", ".join(
-    f"{group}: {count} file(s)" for group, count in counts.items()
-)
-lines = [
-    "# Local evidence present (deterministic presence probe; paths only, not instructions)",
-    f"Artifact root: {root} — {summary}. Newest entries:",
-    *entry_lines,
-    "Answer domain questions these artifacts cover from them first; model memory",
-    'is a flagged fallback (roles/response-policy.md "Local evidence before recall").',
-]
-context = "\n".join(lines)
-budget = 2400
-if len(context.encode("utf-8")) > budget:
-    context = context.encode("utf-8")[:budget].decode("utf-8", "ignore")
-
-if fmt == "text":
-    print(context)
-else:
-    print(json.dumps({
-        "hookSpecificOutput": {
-            "hookEventName": "UserPromptSubmit",
-            "additionalContext": context,
-        }
-    }, ensure_ascii=False))
+emit(context)
 PY
 exit 0

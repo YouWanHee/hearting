@@ -1002,6 +1002,13 @@
       "hard_block": false
     },
     {
+      "slug": "hook__local-evidence-inject__SessionStart",
+      "name": "local-evidence-inject",
+      "mono": "local-evidence-inject",
+      "event": "SessionStart",
+      "hard_block": false
+    },
+    {
       "slug": "hook__fleet-interaction-state.py__Stop",
       "name": "fleet-interaction-state.py clear",
       "mono": "fleet-interaction-state.py",
@@ -1047,13 +1054,6 @@
       "slug": "hook__herdr-session-projection.py__UserPromptSubmit",
       "name": "herdr-session-projection.py",
       "mono": "herdr-session-projection.py",
-      "event": "UserPromptSubmit",
-      "hard_block": false
-    },
-    {
-      "slug": "hook__local-evidence-inject__UserPromptSubmit",
-      "name": "local-evidence-inject",
-      "mono": "local-evidence-inject",
       "event": "UserPromptSubmit",
       "hard_block": false
     },
