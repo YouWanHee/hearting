@@ -6,16 +6,17 @@ the 2026-09-01 dispatch-complexity diagnosis said must shrink contractually.
 Between that diagnosis and 2026-09-09 they grew 23.3% (341,436 -> 420,908
 UTF-8 bytes) because nothing refused growth. This gate does.
 
-Contract (fail-closed):
+Contract. Rules are fail-closed; bytes are advisory (2026-09-10, user: gates
+that force length can be relaxed a lot -- the reduction is about what an agent
+has to hold in mind, which is counted in rules, not kilobytes):
 
 * every surface in ``SURFACES`` must exist, must have a sealed row in
-  ``tools/surface-budget.json``, and must stay at or under both its byte cap
-  and its directive-count cap;
+  ``tools/surface-budget.json``, and must stay at or under its directive-count
+  cap; going over its byte cap prints an ``ADVISORY`` line and does not fail;
 * the budget file may not list a path outside ``SURFACES`` (a stale row would
   silently stop guarding a moved document);
-* the sum of sealed byte caps and the measured total may never exceed
-  ``TOTAL_BYTE_CEILING`` — the ceiling lives in code so raising it is a
-  reviewed code change, not a JSON edit;
+* the byte totals and ``TOTAL_BYTE_CEILING`` are reported the same way --
+  advisory; the rule totals and ``TOTAL_DIRECTIVE_CEILING`` still fail;
 * ``--reseal`` rewrites caps to the current measurement plus ``HEADROOM``,
   and refuses to raise the sealed *measurement* of any surface unless
   ``--reason`` is given, in which case the raise is recorded in the file's
@@ -218,9 +219,14 @@ def load_budget(path: Path, *, strict_ceiling: bool = True, legacy_ok: bool = Fa
     return data
 
 
-def check(root: Path, budget_path: Path, *, quiet: bool = False) -> list[str]:
-    """Return failure strings (empty == pass); print one row per surface."""
+def check(root: Path, budget_path: Path, *, quiet: bool = False,
+          advisories: list[str] | None = None) -> list[str]:
+    """Return failure strings (empty == pass); print one row per surface.
+
+    Byte findings go to ``advisories`` (when given) instead of failing."""
     failures: list[str] = []
+    if advisories is None:
+        advisories = []
     try:
         budget = load_budget(budget_path)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
@@ -251,10 +257,10 @@ def check(root: Path, budget_path: Path, *, quiet: bool = False) -> list[str]:
         directive_cap_sum += caps["directives"]
         status = "ok"
         if cur["bytes"] > caps["bytes"]:
-            status = "over-bytes"
-            failures.append(
+            status = "over-bytes(advisory)"
+            advisories.append(
                 f"over-bytes {rel}: {cur['bytes']} > {caps['bytes']} "
-                f"(+{cur['bytes'] - caps['bytes']}); cut the same amount or more before adding"
+                f"(+{cur['bytes'] - caps['bytes']}); reseal when the growth is deliberate"
             )
         if cur["directives"] > caps["directives"]:
             status = "over-directives" if status == "ok" else status + "+directives"
@@ -278,11 +284,11 @@ def check(root: Path, budget_path: Path, *, quiet: bool = False) -> list[str]:
         )
         print(f"total bytes={total_bytes}/{total_cap} ceiling={TOTAL_BYTE_CEILING}")
     if cap_sum > TOTAL_BYTE_CEILING:
-        failures.append(f"caps-exceed-ceiling {cap_sum} > {TOTAL_BYTE_CEILING}: per-surface caps were raised past the code ceiling")
+        advisories.append(f"caps-exceed-ceiling {cap_sum} > {TOTAL_BYTE_CEILING}: per-surface byte caps are past the code ceiling")
     if total_cap > TOTAL_BYTE_CEILING:
-        failures.append(f"total-cap-exceeds-ceiling {total_cap} > {TOTAL_BYTE_CEILING}")
+        advisories.append(f"total-cap-exceeds-ceiling {total_cap} > {TOTAL_BYTE_CEILING}")
     if total_bytes > total_cap:
-        failures.append(f"over-total {total_bytes} > {total_cap}")
+        advisories.append(f"over-total {total_bytes} > {total_cap}")
     if directive_cap_sum > TOTAL_DIRECTIVE_CEILING:
         failures.append(
             f"directive-caps-exceed-ceiling {directive_cap_sum} > {TOTAL_DIRECTIVE_CEILING}: "
@@ -318,7 +324,8 @@ def reseal(root: Path, budget_path: Path, *, reason: str | None, commit: str | N
     caps = {rel: with_headroom(current[rel]) for rel in SURFACES}  # type: ignore[arg-type]
     total = sum(cap["bytes"] for cap in caps.values())
     if total > TOTAL_BYTE_CEILING:
-        return [f"over-ceiling {total} > {TOTAL_BYTE_CEILING}: cannot seal a surface above the code ceiling"]
+        # Bytes are advisory: say so, but never refuse to seal the rule caps.
+        print(f"ADVISORY: surface-budget over-ceiling {total} > {TOTAL_BYTE_CEILING} (bytes are advisory)")
     directive_total = sum(cap["directives"] for cap in caps.values())
     if directive_total > TOTAL_DIRECTIVE_CEILING:
         return [
@@ -413,7 +420,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.reseal:
         failures = reseal(root, budget_path, reason=args.reason, commit=args.commit)
     else:
-        failures = check(root, budget_path, quiet=args.quiet)
+        advisories: list[str] = []
+        failures = check(root, budget_path, quiet=args.quiet, advisories=advisories)
+        for line in advisories:
+            print(f"ADVISORY: surface-budget {line}")
     for line in failures:
         print(f"FAIL: surface-budget {line}")
     if not failures:

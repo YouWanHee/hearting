@@ -174,12 +174,16 @@ class CheckTest(_FixtureMixin):
         self.assertEqual(self._budget()["surfaces"], first)
         self.assertEqual(self._budget()["history"], [])
 
-    def test_one_added_paragraph_fails_over_bytes(self) -> None:
+    def test_one_added_paragraph_is_an_advisory_not_a_failure(self) -> None:
+        # 2026-09-10: bytes are advisory. Growth is reported, never refused --
+        # the thing being reduced is rules, which still fail below.
         self._append("core/CORE.md", "\nOne more explanatory paragraph.\n")
         rc, out = _run(root=self.tmp)
-        self.assertEqual(rc, 1)
-        self.assertIn("FAIL: surface-budget over-bytes core/CORE.md", out)
-        self.assertIn("over-total", out)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("ADVISORY: surface-budget over-bytes core/CORE.md", out)
+        self.assertIn("ADVISORY: surface-budget over-total", out)
+        self.assertNotIn("FAIL:", out)
+        self.assertIn("surface_budget=ok", out)
 
     def test_added_rules_fail_over_directives_even_under_bytes(self) -> None:
         data = self._budget()
@@ -215,14 +219,14 @@ class CheckTest(_FixtureMixin):
         rc, out = _run(root=self.tmp)
         self.assertEqual(rc, 0, out)
 
-    def test_growth_paid_for_by_an_equal_cut_still_fails_per_file(self) -> None:
-        # Per-file caps are the contract; the total is a second guard, not a
-        # trading pool. Growing one surface fails even when another shrank.
+    def test_growth_paid_for_by_an_equal_cut_is_still_reported_per_file(self) -> None:
+        # Per-file reporting is independent: growing one surface is reported
+        # even when another shrank (advisory, not a trading pool).
         self._append("core/CORE.md", "\nA new paragraph.\n")
         (self.tmp / "core/MEMORY.md").write_text("# tiny\n", encoding="utf-8")
         rc, out = _run(root=self.tmp)
-        self.assertEqual(rc, 1)
-        self.assertIn("over-bytes core/CORE.md", out)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("ADVISORY: surface-budget over-bytes core/CORE.md", out)
         self.assertNotIn("over-total", out)
 
     def test_missing_surface_fails(self) -> None:
@@ -247,21 +251,21 @@ class CheckTest(_FixtureMixin):
         self.assertEqual(rc, 1)
         self.assertIn("FAIL: surface-budget stale-budget-row core/OLD.md", out)
 
-    def test_caps_edited_past_the_code_ceiling_fail(self) -> None:
+    def test_byte_caps_past_the_code_ceiling_are_advisory(self) -> None:
         data = self._budget()
         data["surfaces"]["core/OPERATIONS.md"]["bytes"] = csb.TOTAL_BYTE_CEILING + 1
         self._write_budget(data)
         rc, out = _run(root=self.tmp)
-        self.assertEqual(rc, 1)
-        self.assertIn("caps-exceed-ceiling", out)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("ADVISORY: surface-budget caps-exceed-ceiling", out)
 
-    def test_total_cap_edited_past_the_code_ceiling_fails(self) -> None:
+    def test_byte_total_cap_past_the_code_ceiling_is_advisory(self) -> None:
         data = self._budget()
         data["total_bytes"] = csb.TOTAL_BYTE_CEILING + 1
         self._write_budget(data)
         rc, out = _run(root=self.tmp)
-        self.assertEqual(rc, 1)
-        self.assertIn("total-cap-exceeds-ceiling", out)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("ADVISORY: surface-budget total-cap-exceeds-ceiling", out)
 
     def test_the_rule_total_is_the_headline_and_it_bites(self) -> None:
         # 2026-09-10: bytes were the proxy, rules are the thing. The rule
@@ -326,11 +330,13 @@ class CheckTest(_FixtureMixin):
         self.assertIn("budget-unreadable", out)
 
     def test_quiet_prints_failures_only(self) -> None:
-        self._append("core/CORE.md", "\nMore.\n")
+        # Rules are the failing signal now that bytes are advisory.
+        cap = self._budget()["surfaces"]["core/CORE.md"]["directives"]
+        self._append("core/CORE.md", "\nYou must also do this.\n" * (cap + 1))
         rc, out = _run("--quiet", root=self.tmp)
         self.assertEqual(rc, 1)
         self.assertNotIn("surface=", out)
-        self.assertIn("FAIL: surface-budget over-bytes", out)
+        self.assertIn("FAIL: surface-budget over-directives", out)
 
 
 class ResealTest(_FixtureMixin):
@@ -342,11 +348,18 @@ class ResealTest(_FixtureMixin):
         after = self._budget()
         self.assertLess(after["surfaces"]["core/CORE.md"]["bytes"], before)
         self.assertEqual(after["history"], [])
-        # restoring the old text is now growth, and growth fails
+        # restoring the old byte size is now growth: reported, not refused
         (self.tmp / "core/CORE.md").write_text("# " + "x" * before + "\n", encoding="utf-8")
         rc, out = _run(root=self.tmp)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("ADVISORY: surface-budget over-bytes core/CORE.md", out)
+        # ...while adding rules back past the resealed rule cap still fails
+        rule_cap = after["surfaces"]["core/CORE.md"]["directives"]
+        (self.tmp / "core/CORE.md").write_text(
+            "# small\n" + "You must do this.\n" * (rule_cap + 1), encoding="utf-8")
+        rc, out = _run(root=self.tmp)
         self.assertEqual(rc, 1)
-        self.assertIn("over-bytes core/CORE.md", out)
+        self.assertIn("over-directives core/CORE.md", out)
 
     def test_raise_without_reason_is_refused_and_leaves_budget_untouched(self) -> None:
         original = self.budget.read_text(encoding="utf-8")
@@ -374,11 +387,13 @@ class ResealTest(_FixtureMixin):
         rc, out = _run(root=self.tmp)
         self.assertEqual(rc, 0, out)
 
-    def test_reseal_never_seals_above_the_code_ceiling(self) -> None:
+    def test_reseal_over_the_byte_ceiling_is_advisory(self) -> None:
+        # Bytes never refuse a reseal; the rule ceiling still does (see the
+        # directive-ceiling tests).
         (self.tmp / "core/OPERATIONS.md").write_bytes(b"x" * (csb.TOTAL_BYTE_CEILING + 1))
         rc, out = _run("--reseal", "--reason", "big", root=self.tmp)
-        self.assertEqual(rc, 1)
-        self.assertIn("over-ceiling", out)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("ADVISORY: surface-budget over-ceiling", out)
 
     def test_reseal_repairs_a_stale_ceiling_echo(self) -> None:
         # Lowering TOTAL_BYTE_CEILING in code leaves the JSON echo behind;
@@ -443,12 +458,14 @@ class RepositorySealTest(unittest.TestCase):
         (tmp / "tools" / "check-surface-budget.py").symlink_to(TOOL)
         rc, out = _run("--reseal", root=tmp)
         self.assertEqual(rc, 0, out)
-        (tmp / "core/CORE.md").write_text("# doc\n\nOne more paragraph.\n", encoding="utf-8")
+        # Rules are the failing signal (bytes are advisory): the resealed
+        # "# doc" has zero rules, so its cap is the flat two-rule margin.
+        (tmp / "core/CORE.md").write_text("# doc\n" + "You must do this.\n" * 3, encoding="utf-8")
         script = tmp / "gate.sh"
         script.write_text(self._boundary_function_script(), encoding="utf-8")
         proc = subprocess.run(["bash", str(script)], cwd=tmp, text=True, capture_output=True, check=False)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn("FAIL: surface-budget over-bytes core/CORE.md", proc.stdout)
+        self.assertIn("FAIL: surface-budget over-directives core/CORE.md", proc.stdout)
         self.assertIn("FAIL: model-visible surface budget exceeded", proc.stdout)
         self.assertIn("fail=1", proc.stdout)
 
