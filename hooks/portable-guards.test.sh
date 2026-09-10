@@ -29,6 +29,32 @@ FAIL=0
 ok() { PASS=$((PASS+1)); printf '  ok  %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  BAD %s\n' "$1"; }
 
+# Every external tool this suite reaches for, checked once. A missing tool is
+# worse than a failure here: a case shaped `! tool -q <forbidden pattern>`
+# turns *green* when the tool is absent, so the leak it guards goes unseen.
+# (Measured 2026-09-10: three ripgrep-based scans were passing vacuously on a
+# machine with no ripgrep. They now use grep; this keeps the next one honest.)
+missing_tools=""
+for tool in git python3 grep awk sed find cmp mktemp; do
+  command -v "$tool" >/dev/null 2>&1 || missing_tools="$missing_tools $tool"
+done
+if [ -n "$missing_tools" ]; then
+  printf 'portable-guards: missing required tool(s):%s\n' "$missing_tools" >&2
+  exit 70
+fi
+
+# This suite writes scratch files at fixed /tmp paths, so two concurrent runs
+# read each other's output. Measured 2026-09-10: a reviewer's run and mine
+# overlapped and both reported failures neither tree had. Refuse instead.
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"${TMPDIR:-/tmp}/portable-guards.lock"
+  if ! flock -n 9; then
+    printf 'portable-guards: another run holds %s; refusing to share fixed /tmp scratch paths\n' \
+      "${TMPDIR:-/tmp}/portable-guards.lock" >&2
+    exit 75
+  fi
+fi
+
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 export AGENT_HOME="$TMP/agent_home"
@@ -1905,7 +1931,7 @@ EOF
 if AGENT_HOME="$ROOT" CODEX_HOME="$TUIHOME" "$CODEX" tui-config >/tmp/codex_tui.out 2>/tmp/codex_tui.err \
   && grep -q '^status=ok$' /tmp/codex_tui.out \
   && grep -q '^changed=yes$' /tmp/codex_tui.out \
-  && grep -Fq 'status_line = ["project-name", "git-branch", "context-used", "current-dir", "model-with-reasoning", "five-hour-limit", "weekly-limit"]' "$TUIHOME/config.toml" \
+  && grep -Fq "$(grep '^status_line = ' "$ROOT/adapters/codex/config/tui-statusline.toml")" "$TUIHOME/config.toml" \
   && grep -Fq 'status_line_use_colors = true' "$TUIHOME/config.toml" \
   && grep -Fq 'model = "keep-me"' "$TUIHOME/config.toml" \
   && grep -Fq '[hooks.state]' "$TUIHOME/config.toml" \
@@ -2394,7 +2420,7 @@ root = Path(sys.argv[1])
 agents = sorted(root.glob("*.toml"))
 # The current native catalog carries the three general worker profiles plus the
 # kernel memory scout. Keep this list exact so stale or accidental agents fail.
-expected = ["deep.toml", "general-purpose.toml", "light.toml", "memory-scout.toml"]
+expected = ["balanced.toml", "deep.toml", "general-purpose.toml", "light.toml", "memory-scout.toml"]
 if [a.name for a in agents] != expected:
     raise SystemExit(f"expected {expected}, got {[a.name for a in agents]}")
 for agent in agents:
@@ -2510,7 +2536,7 @@ if [ -L "$ROOT/codex_setting/scaffolds" ] \
   && [ -f "$ROOT/codex_setting/scaffolds/tweaks_panel/tweaks_panel.html" ] \
   && grep -q 'adapter visual harness' "$ROOT/codex_setting/scaffolds/deck_stage/deck_stage.html" \
   && cmp -s "$ROOT/scaffolds/tweaks_panel/tweaks_panel.html" "$ROOT/codex_setting/scaffolds/tweaks_panel/tweaks_panel.html" \
-  && ! rg -q 'adapters/claude|claude_setting|~/.claude|Design MCP|design-mcp' "$ROOT/codex_setting/scaffolds"; then
+  && ! grep -rqE 'adapters/claude|claude_setting|~/\.claude|Design MCP|design-mcp' "$ROOT/codex_setting/scaffolds"; then
   ok "codex scaffold projection exposes shared design assets without Claude runtime paths"
 else
   bad "codex scaffold projection should expose shared design assets without Claude runtime paths"
@@ -2770,7 +2796,7 @@ if printf '{"session_id":"stopsid","cwd":"%s"}\n' "$TMP/repo" \
 else
   bad "codex native hook projection should detach Stop session end lifecycle with silent success output"
 fi
-if git check-ignore -q "$ROOT/adapters/claude/loops/oncall.log"; then
+if git -C "$ROOT" check-ignore -q "$ROOT/adapters/claude/loops/oncall.log"; then
   ok "adapter loop runtime logs are ignored"
 else
   bad "adapter loop runtime logs should be ignored"
@@ -3275,7 +3301,19 @@ fi
 # A linked-worktree fixture can legitimately preserve the typed sync exit (2)
 # after the bounded curator has applied its record, so verify the two contracts
 # separately instead of treating sync success as proof of distillation.
-CODEX_SESSIONS="$TMP/codex_sessions" MEM_STORE="$TMP/store_session_end" \
+# 2026-09-09/10: session-end re-runs itself with CODEX_PREFLIGHT_DETACHED=1
+# and returns immediately, because the whole lifecycle is measured in tens of
+# seconds against a 3-second hook. Assert the two halves separately: the hook
+# call returns without doing the work, and the detached body distills.
+CODEX_SESSIONS="$TMP/codex_sessions" MEM_STORE="$TMP/store_session_end_hookcall" \
+  PATH="$TMP/stubbin:$PATH" CODEX_STUB_ARGV="$TMP/codex_argv_se_hookcall" \
+  "$CODEX" session-end "$TMP/flowproj" codexsid >/tmp/codex_se_hookcall.out 2>/tmp/codex_se_hookcall.err
+if [ "$?" -eq 0 ] && [ ! -s /tmp/codex_se_hookcall.out ]; then
+  ok "codex session-end returns inside the hook budget by detaching"
+else
+  bad "codex session-end should return inside the hook budget by detaching"
+fi
+CODEX_PREFLIGHT_DETACHED=1 CODEX_SESSIONS="$TMP/codex_sessions" MEM_STORE="$TMP/store_session_end" \
   PATH="$TMP/stubbin:$PATH" CODEX_STUB_ARGV="$TMP/codex_argv_se" \
   "$CODEX" session-end "$TMP/flowproj" codexsid >/tmp/codex_se.out 2>/tmp/codex_se.err
 codex_se_status=$?
@@ -3351,8 +3389,11 @@ else
   grep -q '^status=failed' "$TMP/codex_rp0.out" && ok "codex check-runtime-projection reports an unwired home as failed" || bad "codex check-runtime-projection unwired output wrong"
 fi
 # Until the §6.1-owned baseline refresh lands, accept only the exact known
-# bootstrap/router/unit-catalog warning census. The count and representative
-# warnings keep an unrelated footprint regression from passing silently.
+# bootstrap/router/unit-catalog warning census. The count and the warning
+# *identities* keep an unrelated footprint regression from passing silently;
+# the byte figures themselves are not asserted -- pinning them made this case
+# red on every legitimate bootstrap edit (a 7467 -> 8321 byte drift reddened
+# it while the census was unchanged), which is noise, not a regression signal.
 if python3 "$ROOT/tools/context-footprint.py" --root "$ROOT" --skip-runtime --skip-hooks >"$TMP/context_footprint.out" 2>"$TMP/context_footprint.err" \
   && grep -q '^context_footprint_report=1' "$TMP/context_footprint.out" \
   && grep -q '^surface=codex-plugin ' "$TMP/context_footprint.out" \
@@ -3363,10 +3404,10 @@ if python3 "$ROOT/tools/context-footprint.py" --root "$ROOT" --skip-runtime --sk
   && ! grep -q '^surface=native-bootstrap-agent-modes' "$TMP/context_footprint.out" \
   && { grep -q '^status=ok' "$TMP/context_footprint.out" \
     || { grep -q '^status=warn warnings=19$' "$TMP/context_footprint.out" \
-      && grep -q 'owner worker bootstrap 7467 > 4096 bytes' "$TMP/context_footprint.out" \
-      && grep -q 'stage worker bootstrap 6492 > 4096 bytes' "$TMP/context_footprint.out" \
-      && grep -q 'review worker bootstrap 5526 > 4096 bytes' "$TMP/context_footprint.out" \
-      && grep -q 'support worker bootstrap 5155 > 4096 bytes' "$TMP/context_footprint.out" \
+      && grep -Eq 'owner worker bootstrap [0-9]+ > 4096 bytes' "$TMP/context_footprint.out" \
+      && grep -Eq 'stage worker bootstrap [0-9]+ > 4096 bytes' "$TMP/context_footprint.out" \
+      && grep -Eq 'review worker bootstrap [0-9]+ > 4096 bytes' "$TMP/context_footprint.out" \
+      && grep -Eq 'support worker bootstrap [0-9]+ > 4096 bytes' "$TMP/context_footprint.out" \
       && grep -q 'bootstrap:claude footprint regression' "$TMP/context_footprint.out" \
       && grep -q 'bootstrap:codex footprint regression' "$TMP/context_footprint.out" \
       && grep -q 'bootstrap:opencode footprint regression' "$TMP/context_footprint.out" \
@@ -3613,7 +3654,7 @@ echo "== opencode material-route + worktree-path wrapper =="
 opencode_source="$TMP/repo/opencode_source.py"
 printf 'print(1)\n' > "$opencode_source"
 git -C "$TMP/repo" add "$opencode_source"
-if "$OPENCODE" material-route check --tool Write --file "$opencode_source" --cwd "$TMP/repo" --session opencode-no-route >/tmp/opencode_mr.out 2>/tmp/opencode_mr.err; then
+if AGENT_HOME="$ROOT" "$OPENCODE" material-route check --tool Write --file "$opencode_source" --cwd "$TMP/repo" --session opencode-no-route >/tmp/opencode_mr.out 2>/tmp/opencode_mr.err; then
   bad "opencode material-route check should block a route-less material Write"
 else
   [ "$?" -eq 2 ] && ok "opencode material-route check blocks a route-less material Write" \
@@ -3640,16 +3681,22 @@ env -u OPENCODE_SESSION_ID AGENT_HOME="$ROOT" AGENT_DISPATCH_JOBS="$MATERIAL_ROU
   "$OPENCODE" route $opencode_route_args >"$TMP/opencode_route_probe.json" 2>"$TMP/opencode_route_probe.err"
 opencode_route_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8"))["route_id"])' "$TMP/opencode_route_probe.json")
 opencode_route="$TMP/repo/.agent_reports/.runtime/routes/$opencode_route_id.json"
+# The route id is content-addressed over the sealed cwd digest, and the probe
+# compile's own route file is part of that cwd. Remove it before the one real
+# explicit-output compile, exactly as the Codex case above does -- otherwise
+# the second compile derives a different id and the compiler refuses the
+# --output as `route-output-alias-basename`, so no bind ever happens.
+rm -f "$opencode_route"
 recall_opportunity "$TMP/repo" opencode-bind
 if OPENCODE_SESSION_ID=opencode-bind AGENT_HOME="$ROOT" AGENT_DISPATCH_JOBS="$MATERIAL_ROUTE_JOBS" \
   "$OPENCODE" route $opencode_route_args --output "$opencode_route" >/tmp/opencode_route.out 2>/tmp/opencode_route.err \
   && [ -f "$opencode_route" ] \
-  && "$OPENCODE" material-route check --tool Write --file "$opencode_source" --cwd "$TMP/repo" --session opencode-bind >/tmp/opencode_bind_allow.out 2>/tmp/opencode_bind_allow.err; then
+  && AGENT_HOME="$ROOT" "$OPENCODE" material-route check --tool Write --file "$opencode_source" --cwd "$TMP/repo" --session opencode-bind >/tmp/opencode_bind_allow.out 2>/tmp/opencode_bind_allow.err; then
   ok "opencode route wrapper binds on successful compile and allows same-sid/cwd Write"
 else
   bad "opencode route wrapper should bind on successful compile and allow same-sid/cwd Write [route=$(test -f "$opencode_route" && echo yes || echo no)]"
 fi
-if "$OPENCODE" material-route check --tool Write --file "$opencode_source" --cwd "$TMP/repo" --session opencode-foreign >/tmp/opencode_foreign.out 2>/tmp/opencode_foreign.err; then
+if AGENT_HOME="$ROOT" "$OPENCODE" material-route check --tool Write --file "$opencode_source" --cwd "$TMP/repo" --session opencode-foreign >/tmp/opencode_foreign.out 2>/tmp/opencode_foreign.err; then
   bad "foreign session should not reuse the opencode material route marker"
 else
   [ "$?" -eq 2 ] && ok "foreign session cannot reuse opencode material route marker" \
@@ -4958,12 +5005,12 @@ fi
 # session-end selects curate: preflight.sh session-end passes "curate" as the
 # distill-worker's third positional argument (:756); distill-propose stays
 # increment. Both are asserted against the source, not a live model call.
-if grep -q 'distill-worker.sh" "\$sid" "\$cwd" curate' adapters/opencode/bin/preflight.sh; then
+if grep -q 'distill-worker.sh" "\$sid" "\$cwd" curate' "$OPENCODE"; then
   ok "opencode preflight session-end selects curate mode"
 else
   bad "opencode preflight session-end should select curate mode"
 fi
-if awk '/distill-propose\)/{flag=1} flag{print} flag && /;;/{exit}' adapters/opencode/bin/preflight.sh \
+if awk '/distill-propose\)/{flag=1} flag{print} flag && /;;/{exit}' "$OPENCODE" \
   | grep -q 'distill-worker.sh" "\$sid" "\$cwd"$'; then
   ok "opencode preflight distill-propose stays default increment"
 else
@@ -5285,11 +5332,19 @@ echo "== SD-112 direct .dispatch/jobs.log reconstruction scan (readers/Fleet/ada
 # production violation. Every production hit not in the allowlist below is a
 # direct reconstruction outside utilities/dispatch_contract.py's canonical
 # resolver and fails this test.
-dispatch_scan_prod=$(cd "$ROOT" && rg -n --glob '!**/*test*' --glob '!**/tests/**' \
+# grep, unlike the ripgrep this used to call, does not know about
+# .gitignore, so generated projections (the Claude plugin marketplace tree)
+# would count as production sources. Drop anything git ignores -- the same
+# rule the adaptation-boundary check uses for the same reason.
+dispatch_scan_prod=$(cd "$ROOT" && grep -rnE \
+  --exclude-dir='*test*' --exclude='*test*' --exclude-dir='__pycache__' --exclude='*.pyc' \
   -e '\.dispatch/jobs\.log' \
   -e "[\"']\\.dispatch[\"'][[:space:]]*/[[:space:]]*[\"']jobs\\.log[\"']" \
   -e "[\"']\\.dispatch[\"'][[:space:]]*,[[:space:]]*[\"']jobs\\.log[\"']" \
-  adapters hooks tools utilities 2>/dev/null)
+  adapters hooks tools utilities 2>/dev/null \
+  | while IFS= read -r hit; do
+      git -C "$ROOT" check-ignore -q "${hit%%:*}" || printf '%s\n' "$hit"
+    done)
 # Allowlist, each entry sealed with its reason (plan "9. 재구성 최종 목록"):
 #  - intentional executing source that only ever *feeds* the canonical
 #    resolver a legacy/explicit candidate path (never reconstructs authority
@@ -5303,47 +5358,57 @@ dispatch_scan_prod=$(cd "$ROOT" && rg -n --glob '!**/*test*' --glob '!**/tests/*
 #    _jobs_path's except-fallback (used only when the resolver itself cannot
 #    resolve a stable root in a minimal/packaged environment).
 #  - non-executing description strings: docstrings/comments/help text/docs.
+# Allowlist keyed by path and occurrence count, not by line number. The old
+# `path:line:` keys had drifted off every entry -- which nobody noticed,
+# because the scan itself never ran (it called ripgrep, absent here, so the
+# hit list was always empty and the case always passed). A count still fails
+# on a *new* occurrence inside an allowed file; it just survives an edit that
+# moves an existing one. Each entry is an intentional source that only ever
+# feeds the canonical resolver an explicit candidate path, or prose naming
+# the layout: distribution.py's release candidates and its forced-prune gap
+# reader, migration-manifest.py's non-executing inventory, the Fleet dispatch
+# collector's explicit legacy discovery, and the wrappers'/docs' description
+# of where a registry lives.
 dispatch_scan_allowed='
-tools/install/distribution.py:1856:
-tools/install/distribution.py:1859:
-tools/install/distribution.py:1863:
-tools/install/distribution.py:1868:
-tools/migration-manifest.py:229:
-tools/migration-manifest.py:236:
-tools/fleet/collectors/dispatch.py:8:
-tools/fleet/collectors/dispatch.py:487:
-tools/fleet/collectors/dispatch.py:930:
-tools/fleet/collectors/dispatch.py:952:
-tools/fleet/collectors/dispatch.py:966:
-tools/fleet/collectors/dispatch.py:1013:
-tools/fleet/collectors/__init__.py:196:
-tools/render-landing.py:860:
-adapters/codex/AGENTS.md:83:
-adapters/codex/bin/preflight.sh:681:
-adapters/opencode/bin/preflight.sh:460:
-adapters/claude/skills/autopilot-code/references/dev-pipeline.md:91:
-adapters/claude/plugin-marketplace/plugins/hearting-claude/skills/autopilot-code/references/dev-pipeline.md:91:
+tools/install/distribution.py 5
+tools/migration-manifest.py 2
+tools/fleet/collectors/dispatch.py 6
+tools/fleet/collectors/__init__.py 1
+tools/render-landing.py 1
+adapters/codex/AGENTS.md 1
+adapters/codex/bin/preflight.sh 1
+adapters/opencode/bin/preflight.sh 1
 '
-dispatch_scan_unallowed=$(printf '%s\n' "$dispatch_scan_prod" | while IFS= read -r line; do
-  [ -n "$line" ] || continue
-  key=$(printf '%s\n' "$line" | cut -d: -f1-2)
-  case "$dispatch_scan_allowed" in
-    *"
-$key:"*) ;;
-    *) printf '%s\n' "$line" ;;
-  esac
-done)
+dispatch_scan_unallowed=$(printf '%s\n' "$dispatch_scan_prod" \
+  | while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      printf '%s\n' "${line%%:*}"
+    done | sort | uniq -c \
+  | while read -r found file; do
+      allowed=$(printf '%s\n' "$dispatch_scan_allowed" | awk -v f="$file" '$1==f{print $2}')
+      [ -n "$allowed" ] || { printf 'unlisted file %s (%s hit(s))\n' "$file" "$found"; continue; }
+      [ "$found" -eq "$allowed" ] || printf 'count changed for %s: allowed %s, found %s\n' \
+        "$file" "$allowed" "$found"
+    done)
 if [ -z "$dispatch_scan_unallowed" ]; then
   ok "no unlisted direct .dispatch/jobs.log reconstruction in production surfaces"
 else
   bad "unlisted direct .dispatch/jobs.log reconstruction found [$dispatch_scan_unallowed]"
 fi
-dispatch_scan_fixture_count=$(cd "$ROOT" && rg -c --glob '**/*test*' --glob '**/tests/**' \
+dispatch_scan_fixture_count=$(cd "$ROOT" && grep -rlE \
+  --exclude-dir='__pycache__' --exclude='*.pyc' \
   -e '\.dispatch/jobs\.log' \
   -e "[\"']\\.dispatch[\"'][[:space:]]*/[[:space:]]*[\"']jobs\\.log[\"']" \
   -e "[\"']\\.dispatch[\"'][[:space:]]*,[[:space:]]*[\"']jobs\\.log[\"']" \
-  adapters hooks tools utilities 2>/dev/null | wc -l)
-if [ "$dispatch_scan_fixture_count" -ge 0 ]; then
+  adapters hooks tools utilities 2>/dev/null \
+  | grep -E '(^|/)[^/]*test[^/]*(/|$)' \
+  | while IFS= read -r hit; do
+      git -C "$ROOT" check-ignore -q "$hit" || printf '%s\n' "$hit"
+    done | wc -l)
+# `-ge 0` was true for every possible value, including the 0 an absent
+# scanner produced -- the case proved nothing. Fixtures do use the literal,
+# so require at least one.
+if [ "$dispatch_scan_fixture_count" -ge 1 ]; then
   ok "fixture-scope .dispatch/jobs.log literals stay separate from production allowlist ($dispatch_scan_fixture_count files)"
 else
   bad "fixture-scope scan command should run"
@@ -5358,10 +5423,15 @@ done
 
 # --- A50-1: core/OPERATIONS.md §5.14 realizes the six SD-122 steps, the kind
 # vocabulary, the ledger schema, the realization table, and the probe-first rule.
+# The section is ~13.7KB; a fixed 4000-character window cut off the
+# realization table, the probe roster, and the receipt path, so four
+# assertions below were asking about text they could never see. Cut at the
+# next heading instead.
 sec5_14=$(python3 -c "
 t = open('$ROOT/core/OPERATIONS.md', encoding='utf-8').read()
 i = t.find('### §5.14')
-print(t[i:i+4000] if i >= 0 else '')
+j = t.find('\n### §', i + 5) if i >= 0 else -1
+print((t[i:j] if j > 0 else t[i:]) if i >= 0 else '')
 ")
 if [ -z "$sec5_14" ]; then
   bad "core/OPERATIONS.md is missing ### §5.14 (SD-122 peer-session steering)"
@@ -5398,7 +5468,11 @@ else
   for kind in watch steer handoff gate-relay notice; do
     printf '%s' "$sec5_14" | grep -q "$kind" || s_missing="$s_missing $kind"
   done
-  if printf '%s' "$sec5_14" | grep -q '| Runtime | Realization |'; then
+  # The v51 rewrite replaced the two-column sketch with one column per side of
+  # the relation (`| Runtime | Watched side ... |`). Assert the header the
+  # document actually carries; the old `| Runtime | Realization |` string had
+  # been unsatisfiable since f5f3a467.
+  if printf '%s' "$sec5_14" | grep -q '| Runtime | Watched side (wait target) |'; then
     ok "§5.14 carries the per-adapter realization table"
   else
     bad "§5.14 is missing the per-adapter realization table"
@@ -5408,20 +5482,26 @@ else
   else
     bad "§5.14 is missing the probe receipt path"
   fi
+  # The five closed probes are cited as a range, not one token each, and the
+  # section now also has to name the one probe still open (P-6). Asserting
+  # the literal P-2/P-3/P-4 tokens demanded a phrasing the document never used.
   p_missing=""
-  for tok in "P-1" "P-2" "P-3" "P-4" "P-5"; do
-    printf '%s' "$sec5_14" | grep -qF "$tok" || p_missing="$p_missing $tok"
+  for tok in "P-1 through P-5" "P-6"; do
+    printf '%s' "$sec5_14" | grep -qF "$tok" || p_missing="$p_missing [$tok]"
   done
   if [ -z "$p_missing" ]; then
-    ok "§5.14 names probes P-1 through P-5"
+    ok "§5.14 names the closed probe range and the open probe"
   else
     bad "§5.14 is missing probe reference(s):$p_missing"
   fi
-  if printf '%s' "$sec5_14" | grep -q 'Codex | .unknown.' \
-       && printf '%s' "$sec5_14" | grep -q 'OpenCode | .unknown.'; then
-    ok "§5.14 Codex/OpenCode rows are unknown"
+  # Codex was measured on 2026-09-02, so demanding "unknown" of its row now
+  # asks the document to be wrong. What the invariant is actually for is the
+  # row whose probe has *not* run: OpenCode, still pending P-6. (A50-6 below
+  # keeps the no-premature-claim half of the rule for the Codex row.)
+  if printf '%s' "$sec5_14" | grep -q 'OpenCode | .*unknown (pending P-6)'; then
+    ok "§5.14 OpenCode row stays unknown pending its probe"
   else
-    bad "§5.14 Codex/OpenCode rows should read unknown pending probe"
+    bad "§5.14 OpenCode row should read unknown pending its probe"
   fi
   if printf '%s' "$sec5_14" | grep -A2 'Codex |' | grep -qi 'supported'; then
     bad "§5.14 Codex row asserts a capability ('supported') ahead of its probe (A50-6)"

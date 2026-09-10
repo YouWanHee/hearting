@@ -3141,6 +3141,10 @@ def route_completion_evidence(
         metadata.get("log_file"),
         worktree=worktree,
         artifact_root_metadata=metadata.get("artifact_root"),
+        # Passing the worker type only adds evidence here: the review note
+        # upgrade it enables applies to FAIL envelopes, which this predicate
+        # already refuses one line below.
+        worker_type=metadata.get("worker_type"),
     )
     if terminal.get("state") != "valid":
         return None, "evidence-not-valid"
@@ -3148,6 +3152,14 @@ def route_completion_evidence(
         return None, "evidence-not-pass"
     if terminal.get("artifact_state") != "readable":
         return None, "evidence-not-readable"
+    # P-4: a review whose own artifact declares FAIL/BLOCKED cannot complete
+    # its node on the strength of a PASS envelope. The envelope keeps its
+    # authority -- nothing here re-verdicts the round -- but completion is
+    # evidence, and contradictory evidence is not evidence. The row stays
+    # open with this reason, which is the state an owner can act on.
+    conflict = str(terminal.get("review_verdict_conflict") or "")
+    if conflict:
+        return None, f"evidence-review-verdict-conflict:{conflict}"
     encoded = str(terminal.get("artifact_path_b64") or "")
     try:
         artifact = base64.urlsafe_b64decode(
