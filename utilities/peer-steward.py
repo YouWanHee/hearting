@@ -42,6 +42,7 @@ _PM_SPEC.loader.exec_module(peer_message)
 
 sys.path.insert(0, str(_UTILITIES_DIR))
 from dispatch_contract import process_start_ticks  # noqa: E402
+from parent_next_directive import steward_fields  # noqa: E402
 
 _DEFAULTS_SPEC = importlib.util.spec_from_file_location(
     "dispatch_defaults", str(_UTILITIES_DIR / "dispatch-defaults.py")
@@ -88,12 +89,39 @@ def _default_permission_mode():
         return DEFAULTS.DEFAULT_STEWARD_CHILD_PERMISSION_MODE
 
 
+def _session_registry():
+    """Lazy-import `tools/fleet/session_registry.py` (B-1). Fleet's `tools/` tree
+    is not on `sys.path` by default here, so this inserts it the same way
+    `peer-message.py:412 steward_marker_roots` reaches `fleet.collectors.peer_messages`
+    — `Path(__file__).resolve().parent.parent / "tools"` — rather than at module
+    import time, so an install without the Fleet tree does not take down
+    peer-steward entirely. Any failure (missing tree, import error) yields None."""
+    try:
+        tools_dir = Path(__file__).resolve().parent.parent / "tools"
+        if tools_dir.is_dir() and str(tools_dir) not in sys.path:
+            sys.path.insert(0, str(tools_dir))
+        from fleet import session_registry
+        return session_registry
+    except Exception:
+        return None
+
+
 def _from_name(from_harness, from_sid):
-    """The sender's stable registry name for the ledger (`hearting-46`); Claude only
-    today — Codex/OpenCode mint no runtime name (F-100c keeps that gap honest: None)."""
+    """The sender's stable registry name for the ledger (`hearting-46`). Claude reads
+    its native session registry directly; Codex/OpenCode (C-3) read the hearting-owned
+    `session_registry` (B-1) the same way. Any other harness, or any failure along
+    either path, yields None — a name is never guessed (F-100c)."""
     if from_harness == "claude":
         try:
             return peer_message.claude_session_name(from_sid)
+        except Exception:
+            return None
+    if from_harness in ("codex", "opencode"):
+        registry = _session_registry()
+        if registry is None:
+            return None
+        try:
+            return registry.name_for_session_id(from_sid, from_harness)
         except Exception:
             return None
     return None
@@ -302,14 +330,172 @@ def cmd_wait(args):
     return code
 
 
+# Hearting installs a launcher wrapper for Codex at `$CODEX_HOME/.harness/bin/codex` and
+# puts that directory first on the shell PATH ("protected ingress"). Only that wrapper
+# reaches `codex-managed-entry.py`, and only the managed entry writes the tier-1 session
+# record — so a Codex started around the wrapper has no session id anywhere: no ledger
+# endpoint, no board badge, nothing to steer by name.
+#
+# A shell only reads its startup files once. A herdr pane opened BEFORE the ingress was
+# installed keeps the PATH it started with forever, and nothing can reach it afterwards —
+# the profile cannot touch a process that is already running. Measured 2026-09-10 on this
+# machine: `command -v codex` in a pane whose shell started 2026-08-24 answered
+# `~/.local/bin/codex` (the vendor binary), while a pane opened 2026-09-09 answered with
+# the wrapper. The install is correct; the old pane is simply older than it. Those panes
+# can live for weeks, and every Codex started in one is silently unmanaged.
+#
+# So the launch re-establishes the ingress in the PANE, on the line before the agent
+# starts. `herdr agent start` types a bare `codex …` into that same shell (measured: the
+# started process's argv is `codex`, not an absolute path), so the pane's own PATH is what
+# decides, and a terminal processes its input in order — the export is applied before the
+# next line runs, without waiting on a clock. It is idempotent: prepending a directory
+# that is already first changes nothing. Claude and OpenCode have no such wrapper and need
+# nothing here.
+_MANAGED_INGRESS = {"codex": ("CODEX_HOME", "~/.codex", ".harness/bin")}
+
+
+def _managed_ingress_dir(kind):
+    """The directory holding hearting's launcher wrapper for `kind`, or ``None``.
+
+    Existence-checked: a harness with no wrapper installed must not have a PATH entry
+    typed into someone's terminal on its behalf.
+    """
+    spec = _MANAGED_INGRESS.get(kind)
+    if not spec:
+        return None
+    env_name, default_home, suffix = spec
+    home = os.environ.get(env_name) or os.path.expanduser(default_home)
+    directory = os.path.join(home, suffix)
+    wrapper = os.path.join(directory, kind)
+    return directory if os.path.isfile(wrapper) and os.access(wrapper, os.X_OK) else None
+
+
+def _pane_has_agent(pane):
+    """True when herdr already sees an agent in this pane.
+
+    Typing into a pane that is running an agent would inject text into that agent's
+    prompt. `herdr agent start` requires a bare shell prompt for the same reason, so this
+    only declines to act where the start itself is going to refuse.
+    """
+    try:
+        proc = subprocess.run(["herdr", "pane", "get", pane], capture_output=True,
+                              text=True, timeout=5)
+        payload = json.loads(proc.stdout or "")
+    except Exception:
+        return True          # unreadable pane: assume occupied, type nothing
+    block = (payload.get("result") or {}).get("pane") if isinstance(payload, dict) else None
+    if not isinstance(block, dict):
+        return True
+    return bool(block.get("agent"))
+
+
+def _ensure_pane_ingress(pane, kind):
+    """Put hearting's launcher wrapper first on the PANE's PATH. Returns a typed reason.
+
+    ``None`` means nothing was needed or nothing was typed; any other value names why, and
+    is carried into the launch receipt so an unmanaged launch can never be silent.
+    """
+    directory = _managed_ingress_dir(kind)
+    if directory is None:
+        return None
+    if _pane_has_agent(pane):
+        return "pane-occupied"
+    line = 'export PATH="%s:$PATH"' % directory
+    try:
+        text = subprocess.run(["herdr", "pane", "send-text", pane, line],
+                              capture_output=True, text=True, timeout=5)
+        if text.returncode != 0:
+            return "ingress-send-failed"
+        enter = subprocess.run(["herdr", "pane", "send-keys", pane, "Enter"],
+                               capture_output=True, text=True, timeout=5)
+        if enter.returncode != 0:
+            return "ingress-send-failed"
+    except Exception:
+        return "ingress-send-failed"
+    return None
+
+
+_MANAGED_ENTRY_MARK = "codex-managed-entry"
+_MANAGED_ENV_MARK = "AGENT_CODEX_MANAGED_GATEWAY"
+
+
+def _pane_is_managed(pane):
+    """Did a hearting-managed entry actually run in this pane? Read, never inferred.
+
+    Two shapes, because the managed launch has two: the entry process itself is
+    `codex-managed-entry.py` in its own argv, and the app-server and TUI client it spawns
+    carry `AGENT_CODEX_MANAGED_GATEWAY` in their environment instead. The first version of
+    this check looked only for the env var on the foreground process and reported
+    `managed=false` for a launch that was, in fact, managed (measured 2026-09-10) — the
+    entry sets that variable for its CHILDREN, not for itself.
+    """
+    try:
+        proc = subprocess.run(["herdr", "pane", "process-info", "--pane", pane],
+                              capture_output=True, text=True, timeout=5)
+        payload = json.loads(proc.stdout or "")
+        info = (payload.get("result") or {}).get("process_info") or {}
+        processes = info.get("foreground_processes") or []
+    except Exception:
+        return None
+    for process in processes:
+        if not isinstance(process, dict):
+            continue
+        argv = " ".join(str(part) for part in (process.get("argv") or []))
+        if _MANAGED_ENTRY_MARK in argv or _MANAGED_ENTRY_MARK in str(process.get("cmdline") or ""):
+            return True
+        pid = process.get("pid")
+        if not pid:
+            continue
+        try:
+            with open("/proc/%d/environ" % int(pid), "rb") as fh:
+                raw = fh.read()
+        except Exception:
+            continue
+        if any(entry.startswith(_MANAGED_ENV_MARK.encode() + b"=")
+               for entry in raw.split(b"\0")):
+            return True
+    return False if processes else None
+
+
+# The harness flag that puts a launched session in a chosen directory. `herdr agent
+# start` has none of its own — the agent it starts inherits the PANE's shell cwd — so
+# `--cwd` used to move nothing but this CLI process: a session started with
+# `--cwd <hearting>` came up in `SR_CorrNet`, the pane's own directory (measured
+# 2026-09-10). Codex takes `-C/--cd`; Claude Code and OpenCode have no equivalent today,
+# so for those `--cwd` is REFUSED rather than silently ignored. Launching an agent
+# somewhere other than where the caller said is the failure this exists to prevent, and a
+# refusal the caller can read beats a session quietly working in the wrong repository.
+_CWD_FLAG = {"codex": "--cd"}
+
+
 def cmd_start(args):
     if _herdr_missing():
         return _unavailable("herdr-not-found")
 
+    pane_cwd = None
+    cwd_flag = []
+    if args.cwd:
+        flag = _CWD_FLAG.get(args.kind)
+        pane_cwd = os.path.realpath(os.path.expanduser(str(args.cwd)))
+        if not flag:
+            print(f"started=false reason=cwd-unsupported-by-{args.kind} "
+                  f"agent={args.kind} name={args.name} pane={args.pane} cwd={pane_cwd} "
+                  f"hint=start the pane in that directory, then start the agent")
+            return 1
+        if not os.path.isdir(pane_cwd):
+            print(f"started=false reason=cwd-not-a-directory agent={args.kind} "
+                  f"name={args.name} pane={args.pane} cwd={pane_cwd}")
+            return 1
+        cwd_flag = [flag, pane_cwd]
+
+    # Before the agent is started, not after: this is the line that decides whether the
+    # session that comes up is hearting-managed at all.
+    ingress_note = _ensure_pane_ingress(args.pane, args.kind)
+
     mode = args.permission_mode or _default_permission_mode()
     agent_args = list(getattr(args, "agent_args", None) or [])
     prefix = list(_PERMISSION_FLAGS.get(args.kind, [])) if mode == "bypass" else []
-    full_agent_args = prefix + agent_args
+    full_agent_args = prefix + cwd_flag + agent_args
 
     # herdr `agent start <NAME> --kind --pane` — the display name is a required
     # positional (herdr 0.8+ prints `unknown option: <kind>` and starts nothing when
@@ -319,6 +505,9 @@ def cmd_start(args):
         cmd += ["--"] + full_agent_args
 
     try:
+        # `cwd=` here moves only this CLI process, never the launched agent — the agent
+        # is put in place by `_CWD_FLAG` above. Kept because herdr itself resolves some
+        # relative paths against its caller.
         proc = subprocess.run(cmd, capture_output=True, text=True, cwd=args.cwd or None)
     except (OSError, subprocess.SubprocessError):
         return _unavailable("herdr-invocation-failed")
@@ -356,9 +545,29 @@ def cmd_start(args):
             {"harness": args.kind, "session_id": started_sid, "name": args.name},
             "start", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), source="start",
         )
+    # `session_id=-` is the launch-time signal that this session will have no identity
+    # anywhere downstream: no ledger endpoint, no board badge, nothing to steer by name.
+    # It used to be visible only hours later as a nameless row (measured 2026-09-10: a
+    # codex session started here came up unmanaged because the pane's PATH had no
+    # hearting wrapper on it, so no tier-1 record was ever written). Saying it at the
+    # launch is the difference between a known gap and a mystery.
+    #
+    # `cwd=` only when one was asked for: it is the receipt that the flag was honored,
+    # and an unasked-for value would cost an extra herdr call on every start.
+    # `managed=` is read off the started process, not inferred from how it was launched.
+    # An unmanaged Codex writes no session record, so it has no id, no badge and no way to
+    # be addressed later — that has to be visible at the launch, not discovered hours
+    # later as a nameless row on the board.
+    managed = "-"
+    if started and _MANAGED_INGRESS.get(args.kind):
+        verdict = _pane_is_managed(args.pane)
+        managed = "unknown" if verdict is None else str(verdict).lower()
     print(
         f"started={str(started).lower()} agent={args.kind} name={args.name} "
-        f"pane={args.pane} permission_mode={mode}"
+        f"pane={args.pane} permission_mode={mode} session_id={started_sid or '-'} "
+        f"managed={managed}"
+        + (f" ingress={ingress_note}" if ingress_note else "")
+        + (f" cwd={pane_cwd}" if pane_cwd else "")
     )
     return 0
 
@@ -375,12 +584,12 @@ _JOIN_EXIT = {"timeout": 3, "agent-not-found": 2, "herdr-unavailable": 4}
 def _watch_root():
     """`peer-watches/` beside `peer-messages/`, under the one resolved state root.
 
-    Routed through `peer_message._ledger_root()` on purpose: resolving the
-    dispatch state root a second time here would let the ledger root and the
-    watch root diverge whenever the resolver's inputs differ, and a watch whose
-    receipt lives beside a different ledger is unfindable.
+    Routed through `peer_message.peer_state_root()` on purpose: resolving the
+    state root a second time here would let the ledger root and the watch root
+    diverge whenever the resolver's inputs differ, and a watch whose receipt
+    lives beside a different ledger is unfindable.
     """
-    return peer_message._ledger_root() / "peer-watches"
+    return peer_message.peer_state_root() / "peer-watches"
 
 
 @dataclass(frozen=True)
@@ -545,11 +754,19 @@ def _until_field(until):
 
 def _armed_line(arm, paths):
     watcher = arm.get("watcher") or {}
+    # The armed line states the caller's next action for the same reason a
+    # launch receipt does (`utilities/parent_next_directive.py`): the watcher
+    # carries this watch to one wake, so the caller yields instead of polling.
     return (
         f"watch_id={arm['watch_id']} state=armed target={arm['target']} "
         f"until={_until_field(arm.get('until'))} wake={arm.get('wake', 'none')} "
         f"pid={watcher.get('pid', '-')} pid_start={watcher.get('pid_start', '-')} "
-        f"receipt={paths.receipt}"
+        f"receipt={paths.receipt}\n"
+        + steward_fields(
+            arm.get("wake"), arm.get("watch_id"),
+            agent_home=Path(__file__).resolve().parents[1],
+            timeout_ms=arm.get("timeout"),
+        )
     )
 
 
@@ -777,7 +994,20 @@ def _already_armed_line(watch_id, arm, paths):
         target = until = wake = pid = pid_start = "-"
     return (
         f"watch_id={watch_id} state=already-armed target={target} until={until} "
-        f"wake={wake} pid={pid} pid_start={pid_start} receipt={paths.receipt}"
+        f"wake={wake} pid={pid} pid_start={pid_start} receipt={paths.receipt}\n"
+        # The hook arms only from a `watch` command printing `state=armed`.
+        # This line is `already-armed` (or `alive`, from `rearm`), so it arms
+        # nothing -- and it cannot prove the *earlier* arm succeeded either.
+        # That earlier arm failing is exactly why a caller re-runs `watch`, so
+        # answering `end-turn` here would hand back the most dangerous reply at
+        # the moment the caller is trying to recover. A redundant wake is
+        # absorbed by at-least-once ack; a missed one is lost work.
+        + steward_fields(
+            wake if wake != "-" else None, watch_id,
+            agent_home=Path(__file__).resolve().parents[1],
+            arms_hook=False,
+            timeout_ms=arm.get("timeout") if isinstance(arm, dict) else None,
+        )
     )
 
 
@@ -1055,7 +1285,26 @@ def cmd_rearm(args):
     if code != 0 or "state=armed" not in line:
         print(line)
         return code
-    print(line.replace("state=armed", f"state=rearmed rearmed_from={watch_id}"))
+    # B1-a: the hook arms only from a `watch` command printing `state=armed`
+    # (`hooks/peer-steward-rewake.py` `_is_watch_command`/`parse_arm`). This
+    # line is neither, so it must not inherit the fresh arm's `end-turn` --
+    # recompute the directive for a line that carries no carrier.
+    watch_line = line.splitlines()[0].replace(
+        "state=armed", f"state=rearmed rearmed_from={watch_id}"
+    )
+    print(watch_line)
+    new_watch_id = next(
+        (token.split("=", 1)[1] for token in watch_line.split()
+         if token.startswith("watch_id=")),
+        None,
+    )
+    print(
+        steward_fields(
+            ns.wake, new_watch_id,
+            agent_home=Path(__file__).resolve().parents[1],
+            arms_hook=False, timeout_ms=ns.timeout,
+        )
+    )
     return 0
 
 

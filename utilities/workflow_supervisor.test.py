@@ -107,7 +107,7 @@ class WorkflowFixture(unittest.TestCase):
         self._previous_dispatch = {
             key: os.environ.get(key)
             for key in ("AGENT_DISPATCH_REGISTERED_WORKER", "AGENT_DISPATCH_ATTEMPT_ID",
-                        "AGENT_OWNER_ROUTE_FILE")
+                        "AGENT_OWNER_ROUTE_FILE", "AGENT_DISPATCH_JOBS")
         }
         for key in self._previous_dispatch:
             os.environ.pop(key, None)
@@ -195,8 +195,14 @@ class WorkflowFixture(unittest.TestCase):
                    route_id="rt-fixture0000000"):
         if jobs is None:
             jobs, _session, _attempt = self.owner_registry(route_id=route_id)
-        return jobs, SUP.main(["gate", "--route", str(path), "--gate", gate, "--block",
-                               "--jobs", str(jobs), "--artifact", artifact])
+        result = SUP.main(["gate", "--route", str(path), "--gate", gate, "--block",
+                           "--jobs", str(jobs), "--artifact", artifact])
+        # Legacy no-`--jobs` test calls intentionally exercise the documented
+        # AGENT_WORKFLOW_ROOT path after the explicit writer. Point that ambient
+        # authority at the same hermetic fixture ledger; production actors must
+        # pass `--jobs` to cross environments, covered separately below.
+        os.environ["AGENT_WORKFLOW_ROOT"] = str(Path(jobs).parent / "workflow")
+        return jobs, result
 
     def resource_registry(self, *, exit_code=0, pid=None, starttime=None,
                           command_hash=None, status="running", sentinel=True):
@@ -499,7 +505,8 @@ class TestGateRelease(WorkflowFixture):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             code = SUP.main(["release", "--route", str(path), "--gate", "frame-review",
-                             "--decision", "proceed", "--actor", "fixture-user"])
+                             "--decision", "proceed", "--actor", "fixture-user",
+                             "--jobs", str(self.jobs)])
         self.assertEqual(code, 0)
         payload = json.loads(buf.getvalue())
         self.assertEqual(payload["decision"], "proceed")
@@ -507,7 +514,7 @@ class TestGateRelease(WorkflowFixture):
         self.assertEqual(len(payload["successors"]), 1)
         self.assertEqual(payload["successors"][0]["successor"], "verify")
         self.assertTrue(payload["successors"][0]["created"])
-        ledger = SUP.ledger_for(route)
+        ledger = SUP.ledger_for(route, self.jobs)
         self.assertEqual(ledger.state()["workflow_state"], "RUNNING")
         self.assertEqual(len(ledger.claims()), 1)
         # A second release attempt is refused outright by the same state
@@ -516,7 +523,7 @@ class TestGateRelease(WorkflowFixture):
         # the claim key twice.
         with self.assertRaisesRegex(SUP.SupervisorError, "not blocked"):
             SUP.main(["release", "--route", str(path), "--gate", "frame-review",
-                     "--decision", "proceed"])
+                     "--decision", "proceed", "--jobs", str(self.jobs)])
         self.assertEqual(len(ledger.claims()), 1)
 
     def test_proceed_requires_a_blocked_workflow(self):
@@ -531,7 +538,237 @@ class TestGateRelease(WorkflowFixture):
         route, path = self._blocked()
         with self.assertRaisesRegex(SUP.SupervisorError, "no human gate"):
             SUP.main(["release", "--route", str(path), "--gate", "no-such-gate",
-                     "--decision", "proceed"])
+                     "--decision", "proceed", "--jobs", str(self.jobs)])
+
+    def test_explicit_jobs_is_one_ledger_across_two_actor_environments(self):
+        route, path = self.two_stage_route(
+            human_gate="frame-review",
+            continuation={"kind": "human-gate", "gate": "frame-review"},
+        )
+        jobs, _session, _attempt = self.owner_registry(route_id=route["route_id"])
+        with mock.patch.dict(
+            os.environ, {"AGENT_WORKFLOW_ROOT": str(self.base / "raise-root")}
+        ), contextlib.redirect_stdout(io.StringIO()):
+            SUP.main(["gate", "--route", str(path), "--gate", "frame-review",
+                      "--block", "--artifact", "a.json", "--jobs", str(jobs)])
+        status_out = io.StringIO()
+        with mock.patch.dict(
+            os.environ, {"AGENT_WORKFLOW_ROOT": str(self.base / "release-root")}
+        ), contextlib.redirect_stdout(status_out):
+            SUP.main(["status", "--route", str(path), "--jobs", str(jobs), "--json"])
+        status = json.loads(status_out.getvalue())
+        self.assertEqual(status["workflow_state"], "BLOCKED_HUMAN_GATE")
+        self.assertEqual(status["ledger_root_source"], "explicit-jobs")
+        self.assertEqual(Path(status["ledger_root"]),
+                         jobs.parent / "workflow" / route["route_id"])
+        self.assertFalse((self.base / "raise-root" / route["route_id"]).exists())
+        self.assertFalse((self.base / "release-root" / route["route_id"]).exists())
+
+    def test_explicit_jobs_authority_rejects_missing_directory_and_symlink(self):
+        missing = self.base / "missing-state" / "jobs.log"
+        with self.assertRaisesRegex(
+            WS.WorkflowStateError, "jobs-authority-invalid:explicit-jobs:missing"
+        ):
+            WS.ledger_root_for(missing, environ={})
+
+        directory = self.base / "jobs-dir"
+        directory.mkdir()
+        with self.assertRaisesRegex(
+            WS.WorkflowStateError, "jobs-authority-invalid:explicit-jobs:not-regular"
+        ):
+            WS.ledger_root_for(directory, environ={})
+
+        registry = self.base / "real-jobs.log"
+        registry.write_text("", encoding="utf-8")
+        link = self.base / "jobs-link.log"
+        link.symlink_to(registry)
+        with self.assertRaisesRegex(
+            WS.WorkflowStateError, "jobs-authority-invalid:explicit-jobs:symlink"
+        ):
+            WS.ledger_root_for(link, environ={})
+
+    def test_explicit_jobs_authority_rejects_before_status_can_report_created(self):
+        _route, path = self.two_stage_route()
+        missing = self.base / "typo" / "jobs.log"
+        with self.assertRaisesRegex(
+            WS.WorkflowStateError, "jobs-authority-invalid:explicit-jobs:missing"
+        ):
+            SUP.main(["status", "--route", str(path), "--jobs", str(missing), "--json"])
+        self.assertFalse((missing.parent / "workflow").exists())
+
+    def test_workflow_root_metadata_does_not_claim_an_unrelated_jobs_path(self):
+        route, _path = self.two_stage_route()
+        inherited = self.base / "ambient" / "jobs.log"
+        inherited.parent.mkdir()
+        inherited.write_text("", encoding="utf-8")
+        override = self.base / "operator-workflow"
+        with mock.patch.dict(
+            os.environ,
+            {"AGENT_WORKFLOW_ROOT": str(override),
+             "AGENT_DISPATCH_JOBS": str(inherited)},
+        ):
+            ledger = SUP.ledger_for(route)
+            payload = SUP.ledger_metadata(None, ledger)
+        self.assertEqual(payload["ledger_root_source"], "AGENT_WORKFLOW_ROOT")
+        self.assertEqual(payload["workflow_root"], str(override))
+        self.assertIsNone(payload["jobs_path"])
+
+    def test_codex_gate_record_is_strictly_bound_to_live_gateway_and_owner_batch(self):
+        route, path = self.two_stage_route(
+            human_gate="frame-review",
+            continuation={"kind": "human-gate", "gate": "frame-review"},
+        )
+        artifact_root = self.base / "artifacts"
+        artifact_root.mkdir()
+        artifact = artifact_root / "frame.json"
+        artifact.write_text("{}\n", encoding="utf-8")
+        route["artifact_root"] = str(artifact_root)
+        route["route_hash"] = ROUTE.route_hash(route)
+        route["route_id"] = "rt-" + route["route_hash"].split(":", 1)[1][:16]
+        path.write_text(json.dumps(route), encoding="utf-8")
+        jobs = self.base / "codex-state" / "jobs.log"
+        jobs.parent.mkdir()
+        attempt = "att-codex-owner"
+        session = "thread-codex-parent"
+        batch = "batch-owner"
+        metadata = ",".join([
+            "attempt_schema_version=2", "dispatch_depth=1", "transport=headless",
+            "execution_surface=registered-headless", "registered_worker=1",
+            "worker_type=owner", "unit=_kernel/owner", "launch_claimed=1",
+            "launch_started=1", f"attempt_id={attempt}", f"parent_sid={session}",
+            "parent_completion_delivery=codex-managed-gateway", "harness=codex",
+            f"owner_route_id={route['route_id']}",
+            f"owner_route_hash={route['route_hash']}", f"owner_route_file={path}",
+            f"managed_sealed_batch_id={batch}",
+        ])
+        jobs.write_text("\t".join([
+            "2026-09-07T00:00:00Z", "running", str(self.base), str(self.base),
+            "owner", metadata,
+        ]) + "\n", encoding="utf-8")
+        output = io.StringIO()
+        env = {"AGENT_CODEX_MANAGED_CONTROL_SOCKET": str(self.base / "control.sock")}
+        with mock.patch.dict(os.environ, env), \
+             mock.patch.object(SUP.HUMAN_GATE, "probe_consumer", return_value={
+                 "schema_version": 1, "thread_id": session, "epoch": 7,
+                 "recipient_kind": "codex-managed-gateway",
+             }), contextlib.redirect_stdout(output):
+            SUP.main(["gate", "--route", str(path), "--gate", "frame-review",
+                      "--block", "--artifact", str(artifact), "--jobs", str(jobs)])
+        payload = json.loads(output.getvalue())
+        record = PENDING.read(jobs.parent, session, Path(payload["delivery"]).stem)
+        self.assertEqual(record["receipt"]["kind"], "human-gate")
+        self.assertEqual(record["row_revisions"][attempt], "human-gate:frame-review:1")
+        normalized = SUP.HUMAN_GATE.validate_pending_record(
+            record, jobs=jobs, expected_thread_id=session, expected_epoch=7,
+            expected_attempts={attempt}, expected_sealed_batch_id=batch,
+        )
+        self.assertEqual(normalized["receipt"]["pending_delivery_id"],
+                         record["delivery_id"])
+
+    def _recovery_fixture(self, *, sent_ambiguous=False):
+        route, path = self.two_stage_route(
+            human_gate="frame-review",
+            continuation={"kind": "human-gate", "gate": "frame-review"},
+        )
+        jobs, session, attempt = self.owner_registry(route_id=route["route_id"])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            SUP.main(["gate", "--route", str(path), "--gate", "frame-review",
+                      "--block", "--artifact", "a.json", "--jobs", str(jobs)])
+        delivery_path = Path(json.loads(out.getvalue())["delivery"])
+        record = json.loads(delivery_path.read_text(encoding="utf-8"))
+        first = jobs.read_text(encoding="utf-8").rstrip("\n")
+        fields = first.split("\t")
+        fields[1] = "done"
+        jobs.write_text(first + "\n" + "\t".join(fields) + "\n", encoding="utf-8")
+        if sent_ambiguous:
+            PENDING.claim(jobs.parent, session, record["delivery_id"],
+                          claim_owner="fixture-carrier", lease_seconds=30)
+            PENDING.mark_sent_ambiguous(jobs.parent, session, record["delivery_id"],
+                                        claim_owner="fixture-carrier")
+        argv = [
+            "recover-gate-delivery", "--route", str(path),
+            "--gate", "frame-review", "--delivery-id", record["delivery_id"],
+            "--recipient", session, "--source-attempt-id", attempt,
+            "--raise-epoch", "1", "--actor", "operator-fixture",
+            "--reason", "owner terminated before gate could be released",
+            "--jobs", str(jobs),
+        ]
+        return route, path, jobs, session, attempt, delivery_path, argv
+
+    def test_recovery_preview_apply_and_replay_are_audited_and_idempotent(self):
+        _route, _path, _jobs, _session, _attempt, delivery_path, argv = \
+            self._recovery_fixture(sent_ambiguous=True)
+        preview_out = io.StringIO()
+        before = delivery_path.read_bytes()
+        with contextlib.redirect_stdout(preview_out):
+            SUP.main(argv)
+        preview = json.loads(preview_out.getvalue())
+        self.assertTrue(preview["eligible"])
+        self.assertFalse(preview["apply"])
+        self.assertEqual(delivery_path.read_bytes(), before)
+        applied_out = io.StringIO()
+        with contextlib.redirect_stdout(applied_out):
+            SUP.main([*argv, "--apply"])
+        applied = json.loads(applied_out.getvalue())
+        self.assertEqual(applied["state"], "expired")
+        self.assertEqual(applied["expiry_reason"], "operator-recovery")
+        self.assertEqual(applied["expiry_actor"], "operator-fixture")
+        replay_out = io.StringIO()
+        with contextlib.redirect_stdout(replay_out):
+            SUP.main([*argv, "--apply"])
+        self.assertTrue(json.loads(replay_out.getvalue())["idempotent"])
+
+    def test_recovery_rejects_claimed_foreign_and_live_owner_records(self):
+        route, _path, jobs, session, _attempt, _delivery_path, argv = \
+            self._recovery_fixture()
+        delivery_id = argv[argv.index("--delivery-id") + 1]
+        PENDING.claim(jobs.parent, session, delivery_id,
+                      claim_owner="live-carrier", lease_seconds=30)
+        with self.assertRaises(PENDING.PendingDeliveryError):
+            SUP.main([*argv, "--apply"])
+        PENDING.mark_sent_ambiguous(jobs.parent, session, delivery_id,
+                                    claim_owner="live-carrier")
+        foreign = list(argv)
+        foreign[foreign.index("--recipient") + 1] = "foreign-session"
+        with self.assertRaises(SUP.SupervisorError):
+            SUP.main(foreign)
+        metadata = ",".join([
+            "attempt_id=att-new-owner", "parent_sid=sess-new",
+            "parent_completion_delivery=claude-parent-runtime", "dispatch_depth=1",
+            "worker_type=owner", f"owner_route_id={route['route_id']}",
+            "harness=claude", "registered_worker=1",
+            "execution_surface=registered-headless",
+        ])
+        with jobs.open("a", encoding="utf-8") as stream:
+            stream.write("\t".join(["2026-09-07T00:00:02Z", "open", str(self.base),
+                                     str(self.base), "new-owner", metadata]) + "\n")
+        with self.assertRaisesRegex(SUP.SupervisorError, "route-owner-still-live"):
+            SUP.main(argv)
+
+    def test_recovery_write_failure_preserves_original_record(self):
+        _route, _path, _jobs, _session, _attempt, delivery_path, argv = \
+            self._recovery_fixture()
+        before = delivery_path.read_bytes()
+        with mock.patch.object(PENDING, "_write_unlocked", side_effect=OSError("fault")):
+            with self.assertRaises(OSError):
+                SUP.main([*argv, "--apply"])
+        self.assertEqual(delivery_path.read_bytes(), before)
+
+    def test_recovery_rejects_a_symlink_registry_before_read_or_write(self):
+        _route, _path, jobs, _session, _attempt, delivery_path, argv = \
+            self._recovery_fixture()
+        link = jobs.with_name("jobs-link.log")
+        link.symlink_to(jobs)
+        linked = list(argv)
+        linked[linked.index("--jobs") + 1] = str(link)
+        before = delivery_path.read_bytes()
+        with self.assertRaisesRegex(
+            SUP.SupervisorError,
+            "jobs-authority-invalid:explicit-jobs:symlink",
+        ):
+            SUP.main(linked)
+        self.assertEqual(delivery_path.read_bytes(), before)
 
     def test_revise_reaches_failed_retryable_via_the_declared_two_hop_path(self):
         # BLOCKED_HUMAN_GATE has no direct transition to FAILED_RETRYABLE in the
@@ -542,12 +779,13 @@ class TestGateRelease(WorkflowFixture):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             code = SUP.main(["release", "--route", str(path), "--gate", "frame-review",
-                             "--decision", "revise", "--actor", "fixture-user"])
+                             "--decision", "revise", "--actor", "fixture-user",
+                             "--jobs", str(self.jobs)])
         self.assertEqual(code, 0)
         payload = json.loads(buf.getvalue())
         self.assertEqual(payload["decision"], "revise")
         self.assertEqual(payload["retry_boundary"], "frame")
-        ledger = SUP.ledger_for(route)
+        ledger = SUP.ledger_for(route, self.jobs)
         self.assertEqual(ledger.state()["workflow_state"], "FAILED_RETRYABLE")
         self.assertEqual(ledger.claims(), {})
 
@@ -556,11 +794,12 @@ class TestGateRelease(WorkflowFixture):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             code = SUP.main(["release", "--route", str(path), "--gate", "frame-review",
-                             "--decision", "stop", "--actor", "fixture-user"])
+                             "--decision", "stop", "--actor", "fixture-user",
+                             "--jobs", str(self.jobs)])
         self.assertEqual(code, 0)
         payload = json.loads(buf.getvalue())
         self.assertEqual(payload["decision"], "stop")
-        ledger = SUP.ledger_for(route)
+        ledger = SUP.ledger_for(route, self.jobs)
         self.assertEqual(ledger.state()["workflow_state"], "CANCELLED")
         journal = ledger.journal()
         last = journal[-1]
@@ -975,21 +1214,30 @@ class TestCapabilityIntegration(WorkflowFixture):
         """A composed observe → condition → approved-action → verify graph."""
         compose = _load("compose_route", "utilities/compose-route.py")
         topology = TOPO.load_registry()
+        # SD-88: composed ad-hoc stages must carry the two-axis demand; the
+        # fixture supplies it explicitly instead of a role-derived default.
+        demand = {"schema_version": 1, "judgment_requirement": "predetermined",
+                  "execution_scope": "short-local",
+                  "judgment_reason": "Monitor fixture with a fixed condition.",
+                  "execution_reason": "One bounded fixture action.",
+                  "evidence_refs": ["fixture:monitor-workflow"]}
         units = [
             {"id": "observe", "unit": "qa/data-curate", "kind": "map-worker",
              "write_scope": ["shards/observe/**"], "outputs": ["shards/observe/state.json"],
              "gate": "note-scan", "continuation": {"kind": "monitor",
-                                                   "monitor": "external-state-change"}},
+                                                   "monitor": "external-state-change"},
+             "profile_demand": demand},
             {"id": "act", "unit": "dev/backend", "depends_on": ["observe"],
              "write_scope": ["source/**"], "outputs": ["source-diff"],
-             "gate": "code-execute"},
+             "gate": "code-execute", "profile_demand": demand},
             # F3: a node's path-shaped outputs must land inside that node's own
             # write_scope. `reviews/monitor-verdict.json` is a sibling of
             # `reviews/monitor/`, not a member of it, so the composed recipe
             # declared an output the verify node could not write.
             {"id": "verify", "unit": "qa/test", "depends_on": ["act"],
              "write_scope": ["reviews/monitor/**"],
-             "outputs": ["reviews/monitor/verdict.json"], "gate": "code-test"},
+             "outputs": ["reviews/monitor/verdict.json"], "gate": "code-test",
+             "profile_demand": demand},
         ]
         # Every composed stage declares its own bounded judgment demand.
         for unit in units:
@@ -1468,7 +1716,7 @@ class TestGateSubjectNotCaller(WorkflowFixture):
                 "gate", "--route", str(path), "--gate", "frame-review", "--block",
                 "--jobs", str(jobs), "--artifact", "shards/frame/frame-summary.json"]))
             SUP.main(["gate", "--route", str(path), "--gate", "frame-review",
-                      "--release"])
+                      "--release", "--jobs", str(jobs)])
             # A different attempt now owns the route and raises the same gate.
             second = ",".join([
                 "attempt_id=att-fixtureowner0002", "parent_sid=sess-fixture-depth0",
@@ -1510,7 +1758,7 @@ class TestGateSubjectNotCaller(WorkflowFixture):
         second = io.StringIO()
         with contextlib.redirect_stdout(io.StringIO()):
             SUP.main(["gate", "--route", str(path), "--gate", "frame-review",
-                      "--release"])
+                      "--release", "--jobs", str(jobs)])
         with contextlib.redirect_stdout(second):
             code = SUP.main(["gate", "--route", str(path), "--gate", "frame-review",
                              "--block", "--jobs", str(jobs), "--artifact", "a.json"])
@@ -1706,6 +1954,7 @@ class TestGateSubjectNotCaller(WorkflowFixture):
                              "--block", "--jobs", str(jobs), "--artifact",
                              "shards/frame/interview.json"])
         self.assertEqual(code, 0)
+        os.environ["AGENT_WORKFLOW_ROOT"] = str(Path(jobs).parent / "workflow")
         return json.loads(buf.getvalue())
 
     def _await(self, path, *, maximum="0.2"):
@@ -1883,6 +2132,7 @@ class TestGateSubjectNotCaller(WorkflowFixture):
         with contextlib.redirect_stdout(buf):
             code = SUP.main(["gate", "--route", str(path), "--gate", "frame-review", "--block",
                              "--jobs", str(jobs), "--artifact", str(artifact)])
+        os.environ["AGENT_WORKFLOW_ROOT"] = str(Path(jobs).parent / "workflow")
         return code, json.loads(buf.getvalue())
 
     def test_a_hard_to_read_interview_never_reaches_a_person(self):

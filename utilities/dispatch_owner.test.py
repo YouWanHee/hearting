@@ -13,7 +13,7 @@ from types import SimpleNamespace
 from datetime import datetime, timezone
 from unittest import mock
 
-from model_profile import resolve_profile
+from model_profile import load_config, resolve_profile
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -115,6 +115,9 @@ class DispatchOwnerTests(unittest.TestCase):
             and not key.startswith("AGENT_OWNER_ROUTE_")
             and not key.startswith("AGENT_ROUTE_")
             and not key.startswith("AGENT_ARTIFACT_")
+            # A registered worker inherits its own session markers; the selector
+            # under test must see one unambiguous caller harness.
+            and key not in ("CLAUDE_CODE_SESSION_ID", "OPENCODE_SESSION_ID")
         }
         env.update({
             "AGENT_HOME": str(self.home / "agent-home"),
@@ -205,8 +208,12 @@ class DispatchOwnerTests(unittest.TestCase):
         return rc, stdout.getvalue(), wrapper_calls
 
     def assert_model_map(self, result, adapter):
-        expected = resolve_profile(adapter, ROOT / "adapters" / adapter / "config" / "models.conf", "deep")
-        if adapter == "claude" and expected["model"] == "fable":
+        conf = ROOT / "adapters" / adapter / "config" / "models.conf"
+        expected = resolve_profile(adapter, conf, "deep")
+        restricted = load_config(conf).get("CFG_MAIN_SESSION_ONLY_MODELS", "").split()
+        if adapter == "claude" and expected["model"] in restricted:
+            # Only a config that declares the deep model main-session-only is a
+            # typed pre-launch refusal; the shipped default (2026-09-08) declares none.
             self.assertEqual(result.returncode, 64, result.stdout + result.stderr)
             self.assertIn("reason=headless-main-session-only-model", result.stdout)
             self.assertIn("child_spawned=0", result.stdout)
@@ -566,6 +573,71 @@ class DispatchOwnerTests(unittest.TestCase):
         )
         self.assertEqual(selected, str(canonical))
 
+    def test_interactive_claude_parent_may_not_start_into_another_registry(self):
+        # rewake review R3 M1: the parent's asyncRewake hook trusts one registry;
+        # an explicit --jobs elsewhere is refused before spawn, typed and hinted.
+        canonical = self.home / "canonical" / "jobs.log"
+        canonical.parent.mkdir(exist_ok=True)
+        canonical.touch()
+        other = self.home / "elsewhere.log"
+        other.touch()
+        claude = {"AGENT_DISPATCH_CALLER_HARNESS": "claude", "AGENT_DISPATCH_JOBS": str(canonical)}
+        self.assertEqual(OWNER._authoritative_jobs({"--jobs": str(canonical)}, claude), str(canonical))
+        self.assertEqual(OWNER._authoritative_jobs({}, claude), str(canonical))
+        with self.assertRaises(OWNER.OwnerError) as refused:
+            OWNER._authoritative_jobs({"--jobs": str(other)}, claude)
+        self.assertEqual(str(refused.exception), "explicit-jobs-outside-parent-registry")
+        self.assertIn("AGENT_DISPATCH_JOBS", OWNER.hint_for("explicit-jobs-outside-parent-registry"))
+        # no inherited registry: only the installed canonical one is accepted
+        with mock.patch.object(OWNER, "_canonical_jobs", return_value=str(canonical)):
+            self.assertEqual(OWNER._authoritative_jobs({"--jobs": str(canonical)},
+                                                       {"AGENT_DISPATCH_CALLER_HARNESS": "claude"}), str(canonical))
+            with self.assertRaises(OWNER.OwnerError):
+                OWNER._authoritative_jobs({"--jobs": str(other)}, {"AGENT_DISPATCH_CALLER_HARNESS": "claude"})
+        # an unmanaged codex caller keeps the previous behaviour
+        self.assertEqual(OWNER._authoritative_jobs({"--jobs": str(other)},
+                                                   {"AGENT_DISPATCH_CALLER_HARNESS": "codex"}), str(other))
+
+    def test_an_unusable_inherited_registry_refuses_the_claude_launch_before_spawn(self):
+        # rewake review R4 M1: the hook trusts nothing when AGENT_DISPATCH_JOBS is
+        # set but unusable (symlink, empty, absent, not regular), so the selector
+        # refuses the same states -- whether or not an explicit --jobs names the
+        # symlink's real file.
+        canonical = self.home / "canonical" / "jobs.log"
+        canonical.parent.mkdir(exist_ok=True)
+        canonical.touch()
+        alias = self.home / "alias.log"
+        alias.symlink_to(canonical)
+        for label, inherited, explicit in (
+            ("symlink + realpath explicit", str(alias), str(canonical)),
+            ("symlink, no explicit", str(alias), ""),
+            ("empty, no explicit", "", ""),
+            ("absent file", str(self.home / "absent.log"), ""),
+            ("directory", str(self.home), str(self.home)),
+        ):
+            values = {"--jobs": explicit} if explicit else {}
+            env = {"AGENT_DISPATCH_CALLER_HARNESS": "claude", "AGENT_DISPATCH_JOBS": inherited}
+            with self.subTest(label=label), self.assertRaises(OWNER.OwnerError) as refused:
+                OWNER._authoritative_jobs(values, env)
+            self.assertEqual(str(refused.exception), "inherited-registry-unusable")
+        self.assertIn("AGENT_DISPATCH_JOBS", OWNER.hint_for("inherited-registry-unusable"))
+        self.assertIn("SESSION", OWNER.hint_for("inherited-registry-unusable"))  # R5 m1: a per-command change cannot help
+        # top review M2: with no inherited variable, a canonical path that exists
+        # as a symlink is refused too; an absent canonical file (first run) is not
+        link_canonical = self.home / "canonical-link.log"
+        link_canonical.symlink_to(canonical)
+        with mock.patch.object(OWNER, "_canonical_jobs", return_value=str(link_canonical)):
+            with self.assertRaises(OWNER.OwnerError) as refused:
+                OWNER._authoritative_jobs({}, {"AGENT_DISPATCH_CALLER_HARNESS": "claude"})
+            self.assertEqual(str(refused.exception), "canonical-registry-unusable")
+        with mock.patch.object(OWNER, "_canonical_jobs", return_value=str(self.home / "not-yet" / "jobs.log")):
+            self.assertEqual(OWNER._authoritative_jobs({}, {"AGENT_DISPATCH_CALLER_HARNESS": "claude"}), "")
+        self.assertIn("symlink", OWNER.hint_for("canonical-registry-unusable"))
+        # the same symlink is fine for an unmanaged codex caller, and a managed codex
+        # parent still accepts its realpath alias
+        self.assertEqual(OWNER._authoritative_jobs({}, {"AGENT_DISPATCH_CALLER_HARNESS": "codex",
+                                                        "AGENT_DISPATCH_JOBS": str(alias)}), str(alias))
+
     def test_no_eligible_candidate_fails_without_wrapper_or_process(self):
         stamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         self.jobs.write_text(
@@ -693,7 +765,7 @@ class RouteEvidenceOwnerHarnessTest(unittest.TestCase):
         self.assertIn("export_owner_route_env(child_env, binding)", standard)
 
     def test_selector_only_option_never_reaches_the_wrapper(self):
-        _, _, forwarded, evidence = OWNER._parse([
+        _, _, forwarded, evidence, _ = OWNER._parse([
             "--route-evidence", "/tmp/r.json", "--worktree", "/w", "--slug", "s",
             "--capability", "autopilot-code", "--capability-mode", "dev", "--qa", "standard",
             "--intensity", "standard", "--dispatch-depth", "1", "--worker-type", "owner",
@@ -729,7 +801,7 @@ class RegisteredReviewerLaunchTest(unittest.TestCase):
         return OWNER._parse([*self._BASE, *extra])
 
     def test_a_review_tuple_launches_when_it_names_a_catalog_unit(self):
-        _, values, forwarded, _ = self._parse(
+        _, values, forwarded, _, _ = self._parse(
             "--worker-type", "review", "--unit", "qa/code-review")
         self.assertEqual(values["--worker-type"], "review")
         # The unit has to reach the wrapper: it is what selects the persona the
@@ -773,7 +845,7 @@ class RegisteredReviewerLaunchTest(unittest.TestCase):
                 self.assertIn("owner-tuple-required", str(caught.exception))
 
     def test_the_owner_tuple_is_unchanged(self):
-        _, values, _, _ = self._parse("--worker-type", "owner")
+        _, values, _, _, _ = self._parse("--worker-type", "owner")
         self.assertEqual(values["--worker-type"], "owner")
         with self.assertRaises(OWNER.OwnerError) as caught:
             self._parse("--worker-type", "owner", "--unit", "qa/code-review")
@@ -797,7 +869,7 @@ class RegisteredReviewerLaunchTest(unittest.TestCase):
             self._parse("--worker-type", "review", "--unit", "foo/bar")
         self.assertIn("unknown-review-worker-unit", str(caught.exception))
         # and a real one still passes
-        _, values, _, _ = self._parse(
+        _, values, _, _, _ = self._parse(
             "--worker-type", "review", "--unit", "qa/code-review")
         self.assertEqual(values["--unit"], "qa/code-review")
 
@@ -814,7 +886,7 @@ class RegisteredReviewerLaunchTest(unittest.TestCase):
             "--unit=qa/code-review", "--assigned-contract=autopilot-code",
             "--owner=autopilot-code", "--model-profile=deep", "--dry-run",
         ]
-        _, _, forwarded, _ = OWNER._parse(argv)
+        _, _, forwarded, _, _ = OWNER._parse(argv)
         flags = [a.split("=", 1)[0] for a in forwarded if a.startswith("--")]
         duplicates = sorted({f for f in flags if flags.count(f) > 1})
         self.assertEqual(duplicates, [], f"forwarded twice: {duplicates}")
@@ -827,12 +899,335 @@ class RegisteredReviewerLaunchTest(unittest.TestCase):
         # a value (`--capability` and `--assigned-contract` are both
         # `autopilot-code`, `--qa` and `--intensity` both `standard`), so a
         # token-level uniqueness assertion fails on correct output.
-        _, values, forwarded, _ = self._parse(
+        _, values, forwarded, _, _ = self._parse(
             "--worker-type", "review", "--unit", "qa/code-review")
         self.assertEqual(values["--worker-type"], "review")
         flags = [a.split("=", 1)[0] for a in forwarded if a.startswith("--")]
         duplicates = sorted({f for f in flags if flags.count(f) > 1})
         self.assertEqual(duplicates, [], f"forwarded twice: {duplicates}")
+
+
+
+class RouteDerivedOwnerTupleTest(unittest.TestCase):
+    """--route-evidence fills the owner tuple the route already states.
+
+    Measured 2026-09-09 (surface-reduction cycle, priority 4): launching one
+    review owner took a 14-flag command whose values were all readable from
+    the sealed route, and the selector refused 32 times in one session for
+    argument mistakes it could have resolved itself. A full explicit tuple is
+    still parsed as before; only a gap opens the route.
+    """
+
+    def _route(self, **override):
+        payload = {
+            "effective_intensity": "quick", "slug": "review-r1", "capability": "autopilot-code",
+            "capability_mode": "audit", "cwd": "/w/tree", "owner_model_profile": "balanced-deep",
+            "registered_headless_candidates": [{"harness": "codex", "status": "supported"}],
+        }
+        payload.update(override)
+        path = Path(tempfile.mkdtemp()) / "route.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return str(path)
+
+    def test_prompt_only_launch_derives_the_whole_owner_tuple(self):
+        path = self._route()
+        _, values, forwarded, evidence, derived = OWNER._parse(
+            ["--start", "--route-evidence", path, "--prompt-file", "/p.md"])
+        self.assertEqual(evidence, path)
+        self.assertEqual(values["--worktree"], "/w/tree")
+        self.assertEqual(values["--slug"], "review-r1")
+        self.assertEqual(values["--capability"], "autopilot-code")
+        self.assertEqual(values["--capability-mode"], "audit")
+        self.assertEqual(values["--intensity"], "quick")
+        self.assertEqual(values["--model-profile"], "balanced-deep")
+        self.assertEqual(values["--dispatch-depth"], "1")
+        self.assertEqual(values["--worker-type"], "owner")
+        self.assertEqual(values["--owner"], "autopilot-code")
+        self.assertEqual(values["--assigned-contract"], "autopilot-code")
+        self.assertEqual(sorted(derived), sorted(list(OWNER._ROUTE_FIELDS) + ["--assigned-contract", "--dispatch-depth", "--owner", "--worker-type"]))
+        # every derived value reaches the wrapper as a real flag pair
+        for flag in derived:
+            self.assertIn(flag, forwarded)
+            self.assertEqual(forwarded[forwarded.index(flag) + 1], values[flag])
+        self.assertNotIn("--route-evidence", forwarded)
+        self.assertNotIn("--qa", values)  # the wrapper derives it from --intensity
+
+    def test_explicit_flags_win_and_are_not_re_forwarded(self):
+        path = self._route()
+        _, values, forwarded, _, derived = OWNER._parse(
+            ["--start", "--route-evidence", path, "--slug", "my-name", "--model-profile", "deep", "--prompt-file", "/p.md"])
+        self.assertEqual(values["--slug"], "my-name")
+        self.assertEqual(values["--model-profile"], "deep")
+        self.assertNotIn("--slug", derived)
+        self.assertNotIn("--model-profile", derived)
+        self.assertEqual(forwarded.count("--slug"), 1)
+        self.assertEqual(forwarded.count("--model-profile"), 1)
+
+    def test_a_sealed_field_that_contradicts_the_route_is_refused_typed(self):
+        path = self._route()
+        for flag, wrong in (("--capability", "autopilot-research"), ("--capability-mode", "dev"),
+                            ("--intensity", "standard"), ("--worktree", "/elsewhere")):
+            with self.subTest(flag=flag):
+                with self.assertRaises(OWNER.OwnerError) as caught:
+                    OWNER._parse(["--start", "--route-evidence", path, flag, wrong, "--prompt-file", "/p.md"])
+                self.assertEqual(str(caught.exception), f"route-evidence-arg-mismatch:{flag}")
+
+    def test_the_same_worktree_spelled_differently_is_not_a_mismatch(self):
+        path = self._route()
+        _, values, _, _, _ = OWNER._parse(
+            ["--start", "--route-evidence", path, "--worktree", "/w/./tree/", "--prompt-file", "/p.md"])
+        self.assertEqual(values["--worktree"], "/w/./tree/")
+
+    def test_a_full_explicit_tuple_never_opens_the_route_file(self):
+        # Compatibility: the pure-parse callers pass a path that does not exist.
+        base = RegisteredReviewerLaunchTest._BASE
+        _, values, _, evidence, derived = OWNER._parse(
+            [*base, "--worker-type", "owner", "--route-evidence", "/nonexistent/route.json"])
+        self.assertEqual(evidence, "/nonexistent/route.json")
+        self.assertEqual(derived, [])
+        self.assertEqual(values["--qa"], "standard")
+
+    def test_a_direct_route_cannot_launch_an_owner(self):
+        path = self._route(effective_intensity="direct")
+        with self.assertRaises(OWNER.OwnerError) as caught:
+            OWNER._parse(["--start", "--route-evidence", path, "--prompt-file", "/p.md"])
+        self.assertEqual(str(caught.exception), "route-evidence-direct-route-has-no-owner")
+
+    def test_a_route_lacking_a_field_still_reports_exactly_that_gap(self):
+        path = self._route(owner_model_profile=None)
+        with self.assertRaises(OWNER.OwnerError) as caught:
+            OWNER._parse(["--start", "--route-evidence", path, "--prompt-file", "/p.md"])
+        self.assertEqual(str(caught.exception), "missing-required:--model-profile")
+
+    def test_an_unreadable_route_is_typed_not_a_traceback(self):
+        with self.assertRaises(OWNER.OwnerError) as caught:
+            OWNER._parse(["--start", "--route-evidence", "/nonexistent/route.json", "--prompt-file", "/p.md"])
+        self.assertTrue(str(caught.exception).startswith("route-evidence-unreadable:"))
+
+    def test_a_review_worker_does_not_borrow_the_owner_tuple_from_a_route(self):
+        path = self._route()
+        with self.assertRaises(OWNER.OwnerError) as caught:
+            OWNER._parse(["--start", "--route-evidence", path, "--worker-type", "review",
+                          "--unit", "qa/code-review", "--prompt-file", "/p.md"])
+        # nothing was derived: the very first refusal is the plain missing list
+        self.assertTrue(str(caught.exception).startswith("missing-required:"))
+
+    def test_without_route_evidence_the_full_tuple_is_still_required(self):
+        with self.assertRaises(OWNER.OwnerError) as caught:
+            OWNER._parse(["--start", "--prompt-file", "/p.md"])
+        self.assertTrue(str(caught.exception).startswith("missing-required:"))
+        self.assertIn("--qa", str(caught.exception))
+
+
+class RefusalHintTest(unittest.TestCase):
+    """Every typed refusal that has a known next step prints it as `hint=`."""
+
+    def _run(self, argv):
+        env = {k: v for k, v in os.environ.items() if not k.startswith("AGENT_DISPATCH_")}
+        proc = subprocess.run([sys.executable, str(SELECTOR), *argv], text=True,
+                              capture_output=True, env=env, check=False)
+        return proc.returncode, proc.stdout
+
+    def test_missing_required_prints_the_short_and_long_forms(self):
+        rc, out = self._run(["--start", "--prompt-file", "/p.md"])
+        self.assertEqual(rc, 65)
+        self.assertIn("reason=missing-required:", out)
+        self.assertRegex(out, r"(?m)^hint=with --route-evidence <route\.json> pass only --prompt-file")
+        self.assertIn("child_spawned=0", out)
+        # the hint follows the receipt so existing consumers see the same prefix
+        self.assertLess(out.index("child_spawned=0"), out.index("hint="))
+
+    def test_direct_route_hint_names_the_shapes_that_have_an_owner(self):
+        path = Path(tempfile.mkdtemp()) / "route.json"
+        path.write_text(json.dumps({"effective_intensity": "direct"}), encoding="utf-8")
+        rc, out = self._run(["--start", "--route-evidence", str(path), "--prompt-file", "/p.md"])
+        self.assertEqual(rc, 65)
+        self.assertIn("reason=route-evidence-direct-route-has-no-owner", out)
+        self.assertIn("hint=a direct route runs inline; compose --shape solo", out)
+
+    def test_a_route_sealed_for_an_excluded_harness_names_the_policy(self):
+        # 2026-09-10: a route sealed for a harness the user's policy omits was
+        # refused `no-eligible-route-evidence-candidate`, whose hint blames a
+        # usage limit, gating, or capacity -- while the same receipt printed
+        # `eligibility.<harness>=ok`. Name the real reason instead.
+        route = {
+            "effective_intensity": "quick", "slug": "policy-excluded",
+            "capability": "autopilot-code", "capability_mode": "audit",
+            "cwd": "/w/tree", "owner_model_profile": "balanced-deep",
+            "owner_harness_policy": {"primary": ["claude"], "relief": [],
+                                     "last_resort": [], "promote_relief_below": 0},
+            "dispatch_allocation": {"strategy": "balanced", "window": 30,
+                                    "harness_order": ["claude", "codex", "opencode"]},
+            "registered_headless_candidates": [{"harness": "opencode", "status": "supported"}],
+        }
+        path = Path(tempfile.mkdtemp()) / "route.json"
+        path.write_text(json.dumps(route), encoding="utf-8")
+        rc, out = self._run(["--start", "--route-evidence", str(path), "--prompt-file", "/p.md"])
+        self.assertEqual(rc, 65)
+        self.assertIn("reason=route-evidence-candidates-outside-policy", out)
+        self.assertIn("configured_candidates=\n", out + "\n")     # nothing was a candidate
+        self.assertRegex(out, r"(?m)^hint=the route sealed no harness this user's policy admits")
+        self.assertIn("enables claude for this model profile", out)  # the substitution ran
+        self.assertNotIn("<policy-harnesses>", out)
+        self.assertIn("child_spawned=0", out)
+        # a route sealed for a harness the policy *does* admit keeps the old
+        # verdict when that harness is merely unusable
+        route["registered_headless_candidates"] = [{"harness": "claude", "status": "supported"}]
+        path.write_text(json.dumps(route), encoding="utf-8")
+        rc2, out2 = self._run(["--start", "--route-evidence", str(path), "--prompt-file", "/p.md"])
+        self.assertNotIn("route-evidence-candidates-outside-policy", out2)
+
+    def test_every_hint_key_is_a_reason_the_selector_can_emit(self):
+        # Astra final review m2: searching the whole source was a tautology,
+        # because the keys appear in the _HINTS table itself. Search only the
+        # code outside that table.
+        src = Path(SELECTOR).read_text(encoding="utf-8")
+        head, _, rest = src.partition("_HINTS = {")
+        _, _, tail = rest.partition("\n}\n")
+        code = head + tail
+        for key in OWNER._HINTS:
+            self.assertIn(key, code, key)
+
+    def test_the_long_form_hint_lists_every_required_flag(self):
+        # Astra final review M1: the hint omitted --qa, so a caller who typed
+        # exactly what it said was refused again with the same hint.
+        hint = OWNER.hint_for("missing-required:--qa")
+        for flag in sorted(OWNER._REQUIRED):
+            self.assertIn(flag, hint, flag)
+        _, values, _, _, derived = OWNER._parse(
+            ["--dry-run", "--worktree", "/w", "--slug", "s", "--capability", "autopilot-code",
+             "--capability-mode", "dev", "--qa", "standard", "--intensity", "quick", "--dispatch-depth", "1",
+             "--worker-type", "owner", "--owner", "autopilot-code", "--assigned-contract", "autopilot-code",
+             "--model-profile", "balanced-deep"])
+        self.assertEqual(values["--qa"], "standard")
+        self.assertEqual(derived, [])
+
+    def test_unknown_reason_prints_no_hint_line(self):
+        self.assertEqual(OWNER.hint_for("something-new"), "")
+        self.assertTrue(OWNER.hint_for("missing-required:--qa"))
+
+
+def _isolated_env(extra):
+    """The parent runtime's session markers must not reach the selector under
+    test: with both Claude and Codex markers inherited it refuses
+    `caller-harness-ambiguous` (Astra final review m1)."""
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("AGENT_DISPATCH_", "AGENT_OWNER_ROUTE_", "AGENT_ROUTE_", "CODEX_DISPATCH_", "CLAUDE_DISPATCH_"))
+           and k not in ("CLAUDE_CODE_SESSION_ID", "OPENCODE_SESSION_ID", "CODEX_THREAD_ID", "CODEX_SESSION_ID")}
+    env.update(extra)
+    return env
+
+
+class RouteDefaultsReceiptTest(unittest.TestCase):
+    """The launch receipt names the flags the route supplied, before the wrapper runs."""
+
+    def _quick_route(self):
+        path = Path(tempfile.mkdtemp()) / "route.json"
+        path.write_text(json.dumps({
+            "effective_intensity": "quick", "slug": "probe", "capability": "autopilot-code",
+            "capability_mode": "audit", "cwd": str(ROOT), "owner_model_profile": "balanced-deep",
+            "registered_headless_candidates": [{"harness": "codex", "status": "supported"}],
+            "owner_harness_policy": {"primary": ["codex"], "relief": [], "last_resort": [], "promote_relief_below": 0},
+            "dispatch_allocation": {"strategy": "balanced", "window": 30, "harness_order": ["codex"],
+                                    "usage_gate_used_percent": 90},
+        }), encoding="utf-8")
+        return path
+
+    def test_receipt_prints_route_defaults_and_forwards_them_to_the_wrapper(self):
+        from unittest import mock
+        from contextlib import redirect_stdout
+        path = self._quick_route()
+        jobs = path.parent / "jobs.log"; jobs.touch()
+        calls = []
+        binding = SimpleNamespace(route_file=str(path), route_id="rt-x", route_hash="sha256:x",
+                                  route_node="one-shot", registry_digest="sha256:r",
+                                  write_scope="source-scoped", completion_gate="quick-complete")
+        buf = io.StringIO()
+        with mock.patch.object(OWNER.subprocess, "run", side_effect=lambda cmd, **kw: (calls.append(cmd), SimpleNamespace(returncode=0))[1]), \
+             mock.patch.object(OWNER, "_usage", return_value={"claude": "ok", "codex": "ok", "opencode": "ok"}), \
+             mock.patch.object(OWNER._capacity, "capacity_scores", return_value={"claude": 80.0, "codex": 80.0, "opencode": 80.0}), \
+             mock.patch.object(OWNER, "derive_quick_owner_binding", return_value=binding), \
+             mock.patch.dict(os.environ, _isolated_env({"AGENT_DISPATCH_JOBS": str(jobs)}), clear=True), \
+             redirect_stdout(buf):
+            rc = OWNER.main(["--dry-run", "--route-evidence", str(path), "--prompt-text", "probe"])
+        out = buf.getvalue()
+        self.assertEqual(rc, 0, out)
+        self.assertRegex(out, r"(?m)^route_defaults=--worktree,--slug,--capability,--capability-mode,--intensity,--model-profile,--dispatch-depth,--worker-type,--owner,--assigned-contract$")
+        self.assertLess(out.index("status=eligible"), out.index("route_defaults="))
+        self.assertEqual(len(calls), 1)
+        cmd = calls[0]
+        self.assertTrue(str(cmd[0]).endswith("adapters/codex/bin/dispatch-headless.py"))
+        for flag, value in (("--worktree", str(ROOT)), ("--slug", "probe"), ("--capability", "autopilot-code"),
+                            ("--capability-mode", "audit"), ("--intensity", "quick"), ("--model-profile", "balanced-deep"),
+                            ("--dispatch-depth", "1"), ("--worker-type", "owner"), ("--owner", "autopilot-code"),
+                            ("--assigned-contract", "autopilot-code"), ("--route-file", str(path))):
+            self.assertIn(flag, cmd, flag)
+            self.assertEqual(cmd[cmd.index(flag) + 1], value, flag)
+        self.assertNotIn("--qa", cmd)
+        self.assertNotIn("--route-evidence", cmd)
+
+    def test_receipt_says_none_when_the_caller_spelled_out_the_tuple(self):
+        from unittest import mock
+        from contextlib import redirect_stdout
+        path = self._quick_route()
+        jobs = path.parent / "jobs.log"; jobs.touch()
+        binding = SimpleNamespace(route_file=str(path), route_id="rt-x", route_hash="sha256:x",
+                                  route_node="one-shot", registry_digest="sha256:r",
+                                  write_scope="source-scoped", completion_gate="quick-complete")
+        buf = io.StringIO()
+        with mock.patch.object(OWNER.subprocess, "run", return_value=SimpleNamespace(returncode=0)), \
+             mock.patch.object(OWNER, "_usage", return_value={"claude": "ok", "codex": "ok", "opencode": "ok"}), \
+             mock.patch.object(OWNER._capacity, "capacity_scores", return_value={"claude": 80.0, "codex": 80.0, "opencode": 80.0}), \
+             mock.patch.object(OWNER, "derive_quick_owner_binding", return_value=binding), \
+             mock.patch.dict(os.environ, _isolated_env({"AGENT_DISPATCH_JOBS": str(jobs)}), clear=True), \
+             redirect_stdout(buf):
+            rc = OWNER.main(["--dry-run", "--route-evidence", str(path), "--worktree", str(ROOT), "--slug", "probe",
+                             "--capability", "autopilot-code", "--capability-mode", "audit", "--qa", "standard",
+                             "--intensity", "quick", "--dispatch-depth", "1", "--worker-type", "owner",
+                             "--owner", "autopilot-code", "--assigned-contract", "autopilot-code",
+                             "--model-profile", "balanced-deep", "--prompt-text", "probe"])
+        self.assertEqual(rc, 0, buf.getvalue())
+        self.assertRegex(buf.getvalue(), r"(?m)^route_defaults=none$")
+
+
+
+class TopProfileOwnerTupleTest(unittest.TestCase):
+    """Field-level refusal only; the accepted path is exercised on a real
+    compiled route in utilities/profile_demand.test.py (review R1 M2)."""
+
+    def _route(self, **override):
+        payload = {
+            "effective_intensity": "quick", "slug": "review-top", "capability": "autopilot-code",
+            "capability_mode": "audit", "cwd": "/w/tree", "owner_model_profile": "top",
+            "registered_headless_candidates": [{"harness": "codex", "status": "supported"}],
+        }
+        payload.update(override)
+        path = Path(tempfile.mkdtemp()) / "route.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return str(path)
+
+    def test_top_reaches_the_wrapper_only_as_the_routes_derivation(self):
+        # top review B1: the flag is never the door
+        _, values, forwarded, _, derived = OWNER._parse(
+            ["--start", "--route-evidence", self._route(), "--prompt-file", "/p.md"])
+        self.assertEqual(values["--model-profile"], "top")
+        self.assertIn("--model-profile", derived)
+        for argv in (["--start", "--route-evidence", self._route(), "--model-profile", "top", "--prompt-file", "/p.md"],
+                     ["--start", "--worktree", "/w", "--slug", "s", "--capability", "autopilot-code",
+                      "--capability-mode", "audit", "--qa", "standard", "--intensity", "standard",
+                      "--dispatch-depth", "1", "--worker-type", "owner", "--owner", "autopilot-code",
+                      "--assigned-contract", "autopilot-code", "--model-profile", "top", "--prompt-file", "/p.md"]):
+            with self.subTest(argv=argv[:4]), self.assertRaises(OWNER.OwnerError) as refused:
+                OWNER._parse(argv)
+            self.assertEqual(str(refused.exception), "profile-top-route-required")
+        self.assertIn("--route-evidence", OWNER.hint_for("profile-top-route-required"))
+
+    def test_an_unknown_profile_is_still_refused_and_the_hint_names_top(self):
+        with self.assertRaises(OWNER.OwnerError) as refused:
+            OWNER._parse(["--start", "--route-evidence", self._route(owner_model_profile="summit"),
+                          "--prompt-file", "/p.md"])
+        self.assertEqual(str(refused.exception), "invalid-model-profile")
+        self.assertIn("top", OWNER.hint_for("invalid-model-profile"))
 
 if __name__ == "__main__":
     unittest.main()

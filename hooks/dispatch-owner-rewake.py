@@ -5,11 +5,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import fcntl
 import json
 import os
 from pathlib import Path
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import time
@@ -18,6 +20,8 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "utilities"))
 from dispatch_contract import (  # noqa: E402
     DispatchContractError,
+    _runtime_ancestry_proc_stat as _proc_stat,
+    process_namespace_identity,
     resolve_agent_home as _resolve_agent_home,
     runtime_ancestry_binding,
 )
@@ -104,68 +108,84 @@ def _validated_jobs(raw: str | None) -> Path | None:
     return jobs
 
 
-def _start_surface(command: str) -> str | None:
-    """Recognize only the two typed depth-1 owner start command surfaces."""
+# ---------------------------------------------------------------------------
+# Attempt identity (2026-09-09). This hook never reads the Bash command text.
+# Six consecutive reviews of the previous cycle (codex R3/R5/R6/R7, Fable,
+# OpenCode) each found a new hole in the shell parsing that decided which
+# owner a command had started -- `echo … --start`, repeated flags, `arg;`
+# without whitespace, `2>&1`, `$( )`, `time`/`nohup`/`bash -c` prefixes.
+# Parsing shell is re-implementing shell. What the launch actually did is
+# on disk: the wrapper appends a claimed-and-started depth-1 owner row bound
+# to this session (`parent_sid`) before `dispatch-owner --start` returns, and
+# the start receipt names the same `attempt_id`. The hook identifies the
+# owner from those two, and an *arm ledger* -- one file per attempt under
+# the registry's state root -- makes arming exactly-once: a second hook
+# process (a later Bash call, a parallel tool call, a foreign command that
+# merely mentions the utility) finds the claim held and arms nothing.
+# ---------------------------------------------------------------------------
 
-    try:
-        parts = shlex.split(command)
-    except ValueError:
-        return None
-    separators = {"|", "||", "&&", ";"}
-    for index, token in enumerate(parts):
-        name = Path(token).name
-        if name not in {
-            "dispatch-owner", "dispatch-owner.py", "dispatch-node", "dispatch-node.py"
-        }:
-            continue
-        if index:
-            launcher = Path(parts[index - 1]).name
-            # `preflight.sh dispatch-owner --start` is the adapters' documented
-            # launch surface; recognizing only a python launcher left every such
-            # owner unarmed (observed 2026-08-27, cairn att-092eb89f/att-5da8bc24).
-            if (
-                re.fullmatch(r"python(?:3(?:\.\d+)?)?", launcher) is None
-                and launcher != "preflight.sh"
-            ):
-                continue
-        end = index + 1
-        while end < len(parts) and parts[end] not in separators:
-            end += 1
-        arguments = parts[index + 1 : end]
-        if name in {"dispatch-owner", "dispatch-owner.py"}:
-            if "--start" in arguments:
-                return "dispatch-owner"
-            continue
-        if "--action=start" in arguments:
-            return "dispatch-node"
-        for offset, value in enumerate(arguments[:-1]):
-            if value == "--action" and arguments[offset + 1] == "start":
-                return "dispatch-node"
-        continue
-    return None
+ARM_DIRECTORY = "rewake-arms"
+ARM_LIMIT = 8  # same finite discipline as dispatch_pending_delivery.RECLAIM_LIMIT
+ARM_SCHEMA = 1
+ARM_STATES = frozenset({"waiting", "gate-wake-sent", "lapsed", "ended"})
 
 
-def _owner_start_command(payload: object) -> tuple[dict[str, Any], str] | None:
+@dataclass(frozen=True)
+class ArmClaim:
+    """The arm-ledger record this hook process holds for one attempt."""
+
+    path: Path
+    attempt_id: str
+    session_id: str
+    arms: int
+    holder: tuple[str, str, str]
+
+
+@dataclass(frozen=True)
+class ArmRefusal:
+    """Why `claim_arm` did not take the claim. `watched` reasons mean the
+    attempt's wake is already someone's job (a live holder, or a gate wake
+    spent on a record that is still open); every other reason means nothing
+    is watching -- the caller says so (review R1 M2)."""
+
+    reason: str
+
+    WATCHED = frozenset({"held-live", "gate-open", "ended"})
+
+    @property
+    def watched(self) -> bool:
+        return self.reason in self.WATCHED
+
+
+ARM_RETENTION_ENDED_SECONDS = 7 * 86_400
+ARM_RETENTION_ANY_SECONDS = 30 * 86_400
+ARM_PRUNE_SCAN_LIMIT = 256
+ARM_PRUNE_CURSOR = ".prune-cursor"
+
+
+def _bash_call(payload: object) -> tuple[dict[str, Any], str] | None:
+    """`(payload, session_id)` for a PostToolUse Bash call of a real session."""
+
     if not isinstance(payload, dict):
         return None
     if payload.get("hook_event_name") != "PostToolUse" or payload.get("tool_name") != "Bash":
         return None
-    tool_input = payload.get("tool_input")
-    if not isinstance(tool_input, dict):
+    if not isinstance(payload.get("tool_input"), dict):
         return None
-    command = tool_input.get("command")
-    if not isinstance(command, str) or _start_surface(command) is None:
+    session = _payload_session(payload)
+    if session is None:
         return None
-    return payload, command
+    return payload, session
 
 
 def parse_launch(payload: object) -> Launch | None:
-    """Accept only a successful exact depth-1 owner start from this session."""
+    """The receipt fast path: a successful depth-1 owner start whose stdout
+    names the attempt, the registry, and this session as the parent."""
 
-    gate = _owner_start_command(payload)
+    gate = _bash_call(payload)
     if gate is None:
         return None
-    payload, command = gate
+    payload, payload_session = gate
     fields = _fields(_stdout(payload.get("tool_response")))
     required_memberships = {
         "check": "ok",
@@ -180,58 +200,30 @@ def parse_launch(payload: object) -> Launch | None:
         return None
     attempt_id = _single(fields, "attempt_id")
     parent_session = _single(fields, "parent_session_id")
-    payload_session = _payload_session(payload)
-    if (
-        payload_session is None
-        or parent_session != payload_session
-        or attempt_id is None
-        or ATTEMPT.fullmatch(attempt_id) is None
-    ):
+    if parent_session != payload_session or attempt_id is None or ATTEMPT.fullmatch(attempt_id) is None:
         return None
-    jobs = _validated_jobs(_single(fields, "job_registry"))
+    if _single(fields, "job_registry") is None:
+        return None
+    jobs = _resolved_jobs(payload)  # the receipt may name the trusted registry, never replace it
     if jobs is None:
         return None
     return Launch(attempt_id=attempt_id, jobs=jobs, session_id=payload_session, armed="stdout")
 
 
-def _command_literal_option(command: str, name: str) -> str | None:
-    """Read one `--name value` / `--name=value` literal from the launch command.
+def receipt_row_age(launch: Launch) -> float | None:
+    """The registry's own proof for a receipt-named attempt: its age when the
+    row exists, is bound to this session, and carries the owner-start stamps
+    (`open`, or `done` for an owner that finished before the hook ran); None
+    otherwise. Review R1 B1: without this, any Bash output shaped like a
+    start receipt could arm a foreign, depth-2, unstarted, or invented
+    attempt -- the command-surface check that used to stand in front of the
+    receipt is gone, so the row has to."""
 
-    Only a plain literal counts: a value carrying `$` is an unexpanded shell
-    variable in the recorded command text and must not be matched against
-    registry rows (the same trap that leaves `--jobs "$J"` unusable)."""
-
-    try:
-        parts = shlex.split(command)
-    except ValueError:
-        return None
-    flag = f"--{name}"
-    for index, part in enumerate(parts):
-        value: str | None = None
-        if part == flag and index + 1 < len(parts):
-            value = parts[index + 1]
-        elif part.startswith(flag + "="):
-            value = part[len(flag) + 1 :]
-        if value is None:
-            continue
-        if "$" in value or not value:
-            return None
-        return value
-    return None
-
-
-def _command_jobs(command: str) -> str | None:
-    """Read the inherited registry path the launch command itself declared."""
-
-    try:
-        parts = shlex.split(command)
-    except ValueError:
-        return None
-    for index, part in enumerate(parts):
-        if part == "--jobs" and index + 1 < len(parts):
-            return parts[index + 1]
-        if part.startswith("--jobs="):
-            return part[len("--jobs=") :]
+    for attempt_id, age in _session_owner_rows(
+        launch.jobs, launch.session_id, statuses=RECEIPT_ROW_STATUSES
+    ):
+        if attempt_id == launch.attempt_id:
+            return age
     return None
 
 
@@ -263,11 +255,11 @@ def _row_age(stamp: str, now: float) -> float | None:
 def _canonical_jobs() -> str | None:
     """The installed harness's own registry — the path every wrapper writes by default.
 
-    A launch command that spells `--jobs "$J"` hands this hook an unexpanded shell
-    variable, and the hook's own environment carries no `AGENT_DISPATCH_JOBS`; both
-    left a real, session-bound owner row unarmed (observed 2026-08-26, two owner
-    attempts in a row). The canonical root is deterministic from the agent home, so
-    it is the last resort before giving up — the row match itself stays exact."""
+    The hook's own environment may carry no `AGENT_DISPATCH_JOBS` and a filtered
+    stdout names no `job_registry`; both left a real, session-bound owner row
+    unarmed (observed 2026-08-26, two owner attempts in a row). The canonical root
+    is deterministic from the agent home, so it is the last resort before giving
+    up — the row match itself stays exact."""
     try:
         from dispatch_contract import resolve_dispatch_state_root  # noqa: WPS433
 
@@ -276,78 +268,83 @@ def _canonical_jobs() -> str | None:
         return None
 
 
-def registry_launch(payload: object) -> Launch | None:
-    """Arm from the wrapper-written registry when stdout was filtered away.
+def _trusted_jobs() -> Path | None:
+    """The one registry this session trusts: the inherited `AGENT_DISPATCH_JOBS`
+    (immutable for the session, OPERATIONS §5.10) when the variable is set --
+    an unusable value (symlink, missing, not a regular file) trusts nothing,
+    never the canonical registry in its place (review R3 B1) -- and the
+    installed harness's canonical registry only when the variable is absent.
+    Nothing a Bash call prints can replace it."""
 
-    A piped `dispatch-owner --start | tail` hands this hook a truncated stdout,
-    so the receipt fast path silently fails to arm.  The lock-written registry
-    row carries the same exactness — one open depth-1 owner attempt bound to
-    this Claude session, started inside the immediately preceding tool window —
-    and is harder to forge than tool output.  When several same-session rows
-    share the window (a wave of owner starts, 2026-09-01: five fleet cleanup
-    owners), the observed launch command's own `--slug`/`--worktree` literals
-    narrow them before the exactly-one gate; only an exact single survivor
-    arms.  Zero or still-ambiguous candidates stay an unarmed result: absence
-    beats misattribution.  (The caller turns that unarmed result into one typed
-    `not-armed` notice — see `no_arm_notice` — instead of a silent loss.)
-    """
-
-    resolved = _registry_start_candidates(payload)
-    if resolved is None:
-        return None
-    command, session, jobs, candidates = resolved
-    if len(candidates) > 1:
-        # A wave of same-session owner starts is legitimate; the command this
-        # exact hook invocation observed names which one it launched.  Narrow
-        # by its literal `--slug`, then `--worktree`.  A literal that matches
-        # nothing narrows nothing (it may name a not-yet-visible row), and a
-        # set still ambiguous after narrowing arms nothing, exactly as before.
-        for option, position in (("slug", 2), ("worktree", 1)):
-            literal = _command_literal_option(command, option)
-            if literal is None:
-                continue
-            narrowed = [row for row in candidates if row[position] == literal]
-            if narrowed:
-                candidates = narrowed
-            if len(candidates) == 1:
-                break
-    if len(candidates) != 1:
-        return None
-    return Launch(
-        attempt_id=candidates[0][0], jobs=jobs, session_id=session, armed="registry"
-    )
+    inherited = os.environ.get("AGENT_DISPATCH_JOBS")
+    if inherited is not None:
+        return _validated_jobs(inherited)
+    return _validated_jobs(_canonical_jobs())
 
 
-def _registry_start_candidates(
-    payload: object,
-) -> tuple[str, str, Path, list[tuple[str, str, str]]] | None:
-    """Same-session, recent, claimed-and-started owner rows for one observed
-    start command: ``(command, session, jobs, [(attempt_id, worktree, slug)])``.
+def _resolved_jobs(payload: dict[str, Any]) -> Path | None:
+    """The registry this call is bound to: the trusted registry, and only it.
 
-    ``None`` means the payload is not an owner-start Bash call or no registry
-    resolves; candidate absence is an empty list, never ``None``."""
+    A receipt's `job_registry` is accepted when it names that same file
+    (review R2 B1: a receipt that pointed at any writable regular file made
+    that file's self-described rows the identity proof, so receipt and row
+    were one attacker-controlled input); a receipt naming another file binds
+    nothing. A `--jobs` literal in the command is deliberately not read."""
 
-    gate = _owner_start_command(payload)
-    if gate is None:
-        return None
-    payload, command = gate
-    session = _payload_session(payload)
-    if session is None:
-        return None
-    fields = _fields(_stdout(payload.get("tool_response")))
-    jobs = (
-        _validated_jobs(_single(fields, "job_registry"))
-        or _validated_jobs(_command_jobs(command))
-        or _validated_jobs(os.environ.get("AGENT_DISPATCH_JOBS"))
-        or _validated_jobs(_canonical_jobs())
-    )
-    if jobs is None:
-        return None
+    trusted = _trusted_jobs()
+    raw = _single(_fields(_stdout(payload.get("tool_response"))), "job_registry")
+    if raw is not None:
+        named = _validated_jobs(raw)
+        if named is None or trusted is None or named.resolve(strict=False) != trusted.resolve(strict=False):
+            return None
+    return trusted
+
+
+ARM_ROW_STATUSES = frozenset({"open"})
+RECEIPT_ROW_STATUSES = frozenset({"open", "done"})
+
+
+def _read_registry_lines(jobs: Path) -> list[str] | None:
+    """Read the trusted registry without following a symlink placed at its
+    path after validation (top review N1): the descriptor is opened with
+    O_NOFOLLOW and must be a regular file, so a swapped-in link is refused
+    at read time rather than followed."""
+
     try:
-        lines = jobs.read_text(encoding="utf-8", errors="replace").splitlines()
+        fd = os.open(jobs, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
     except OSError:
         return None
-    latest: dict[str, tuple[str, str, str, str, dict[str, str]]] = {}
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as handle:
+            fd = -1
+            return handle.read().splitlines()
+    except OSError:
+        return None
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _session_owner_rows(
+    jobs: Path, session: str, *, statuses: frozenset[str] = ARM_ROW_STATUSES
+) -> list[tuple[str, float]]:
+    """Every claimed-and-started depth-1 owner row bound to `session` whose
+    latest status is in `statuses`, as ``(attempt_id, age_seconds)``, oldest
+    first. Empty on any refusal. This is the one identity check both arming
+    paths share (review R1 B1): a receipt on stdout only *names* a candidate;
+    the row proves it -- exists, `parent_sid` is this session, every
+    `REGISTRY_OWNER_START` key matches. A receipt may name a row that already
+    ran to `done` (a short owner finishing before the hook ran). The registry
+    path takes a *new* claim only on an open row; a row that ran to `done`
+    while this session already held its claim is still re-armable, because
+    the wake it owes was never delivered (top review M1)."""
+
+    lines = _read_registry_lines(jobs)
+    if lines is None:
+        return []
+    latest: dict[str, tuple[str, str, dict[str, str]]] = {}
     for line in lines:
         columns = line.split("\t")
         if len(columns) != 6:
@@ -356,226 +353,316 @@ def _registry_start_candidates(
         attempt_id = metadata.get("attempt_id", "")
         if ATTEMPT.fullmatch(attempt_id) is None:
             continue
-        latest[attempt_id] = (columns[0], columns[1], columns[3], columns[4], metadata)
-    window = _bounded_number(
-        "AGENT_CLAUDE_REWAKE_ARM_WINDOW_SECONDS", DEFAULT_ARM_WINDOW_SECONDS, 30, 86_400
-    )
+        latest[attempt_id] = (columns[0], columns[1], metadata)
     now = time.time()
-    candidates: list[tuple[str, str, str]] = []
-    for attempt_id, (stamp, status, worktree, slug, metadata) in latest.items():
-        if status != "open" or metadata.get("parent_sid") != session:
+    rows: list[tuple[str, float]] = []
+    for attempt_id, (stamp, status, metadata) in latest.items():
+        if status not in statuses or metadata.get("parent_sid") != session:
             continue
         if any(metadata.get(key) != value for key, value in REGISTRY_OWNER_START.items()):
             continue
         age = _row_age(stamp, now)
-        if age is None or age > window or age < -MAXIMUM_CLOCK_SKEW_SECONDS:
+        if age is None or age < -MAXIMUM_CLOCK_SKEW_SECONDS:
             continue
-        candidates.append((attempt_id, worktree, slug))
-    return command, session, jobs, candidates
+        rows.append((attempt_id, age))
+    rows.sort(key=lambda row: -row[1])
+    return rows
 
 
-RELEASE_OWNER_ROW = dict(REGISTRY_OWNER_START)  # the same row shape the start path arms on
-
-
-def _release_command(command: str) -> tuple[str, str | None] | None:
-    """Recognize `workflow-supervisor.py release …` and `gate … --release`.
-
-    Returns `(gate, route_literal_or_None)`; anything else is None. Only the
-    typed supervisor surface counts -- the same discipline `_start_surface`
-    applies to owner starts."""
-
-    try:
-        parts = shlex.split(command)
-    except ValueError:
-        return None
-    separators = {"|", "||", "&&", ";"}
-    for index, token in enumerate(parts):
-        if Path(token).name not in {"workflow-supervisor", "workflow-supervisor.py"}:
-            continue
-        end = index + 1
-        while end < len(parts) and parts[end] not in separators:
-            end += 1
-        arguments = parts[index + 1 : end]
-        if not arguments:
-            continue
-        verb = arguments[0]
-        if verb == "release" or (verb == "gate" and "--release" in arguments):
-            segment = " ".join(shlex.quote(a) for a in arguments)
-            gate = _command_literal_option(segment, "gate")
-            if gate is None:
-                return None
-            return gate, _command_literal_option(segment, "route")
-    return None
-
-
-def release_launch(payload: object) -> Launch | None:
-    """SD-129: a successful gate release re-arms the wait on that route's owner.
-
-    The in-wait gate wake (`wait_for_attempt` -> `gate`) spends this hook
-    process's one wake. The owner is still alive, waiting on `await-release`,
-    and its completion still owes the session a wake -- and the person's
-    release is itself a Bash call in this same session. So the release command
-    is the second arming event: the release output names the `route_id`, the
-    registry names that route's one open depth-1 owner bound to this session,
-    and the new hook process waits on it exactly as the start did. A failed
-    release (no JSON payload naming the route -- review round 1, M1: the
-    `--route` literal is never a fallback for the route id; the one refusal
-    that still arms, SD-OPEN-48 (#13), is the supervisor's typed
-    `refusal=gate-not-blocked` line -- the gate was already released and the
-    owner is running towards a completion that still owes this session a
-    wake), a route with no started open owner (the owner
-    ended at the gate -- contract (c); or a row that was registered and
-    refused at start), or an ambiguous set of owner rows arms nothing and
-    says so once (`release_no_arm_notice`); the SD-111 sweep still delivers
-    the completion at the next prompt.
-    """
-
-    if not isinstance(payload, dict):
-        return None
-    if payload.get("hook_event_name") != "PostToolUse" or payload.get("tool_name") != "Bash":
-        return None
-    tool_input = payload.get("tool_input")
-    command = tool_input.get("command") if isinstance(tool_input, dict) else None
-    if not isinstance(command, str):
-        return None
-    recognized = _release_command(command)
-    if recognized is None:
-        return None
-    gate, route_literal = recognized
-    session = _payload_session(payload)
-    if session is None:
-        return None
-    stdout = _stdout(payload.get("tool_response"))
-    route_id: str | None = None
-    armed = "release"
-    for line in reversed(stdout.splitlines()):
-        line = line.strip()
-        if not line.startswith("{"):
-            continue
-        try:
-            rendered = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(rendered, dict) and rendered.get("gate") == gate:
-            value = rendered.get("route_id")
-            route_id = value if isinstance(value, str) and value else None
-            if rendered.get("refusal") == GATE_NOT_BLOCKED_REFUSAL:
-                # SD-OPEN-48 (#13): the supervisor refused this release as
-                # already released (on 2026-09-07 by the headless owner itself,
-                # cairn W15b rt-bf75754935faf8de) and the owner is RUNNING
-                # towards its completion. That completion still owes this
-                # session a wake, and the start-armed hook already spent its
-                # one wake on the gate, so arming nothing here is exactly the
-                # lost wake SD-111 exists to prevent. The route id comes from
-                # the supervisor's typed refusal line, never from the prose
-                # and never from the `--route` literal; every other refusal
-                # prints no JSON and arms nothing.
-                armed = "release-refused"
-            elif rendered.get("refusal"):
-                route_id = None
-        break
-    if not isinstance(route_id, str) or not route_id:
-        return None
-    jobs = (
-        _validated_jobs(_command_jobs(command))
-        or _validated_jobs(os.environ.get("AGENT_DISPATCH_JOBS"))
-        or _validated_jobs(_canonical_jobs())
+def _arm_window() -> int:
+    return _bounded_number(
+        "AGENT_CLAUDE_REWAKE_ARM_WINDOW_SECONDS", DEFAULT_ARM_WINDOW_SECONDS, 30, 86_400
     )
+
+
+def registry_launch(payload: object) -> tuple[Launch, ArmClaim] | ArmRefusal | None:
+    """Arm from the wrapper-written registry: the first open depth-1 owner row
+    bound to this session whose arm claim this hook process can take.
+
+    A wave of same-session owner starts is legitimate: each Bash call's hook
+    takes one unclaimed row (oldest first), so five starts in five calls arm
+    five waiters, and a start whose stdout was filtered away is armed by its
+    own call or the next one. A row older than the arm window is a first-time
+    refusal (the next-prompt sweep owns stale completions); a row whose claim
+    lapsed -- its holder died with the session, or its gate wake was spent and
+    the gate has since closed -- is re-armed regardless of age."""
+
+    gate = _bash_call(payload)
+    if gate is None:
+        return None
+    payload, session = gate
+    jobs = _resolved_jobs(payload)
     if jobs is None:
         return None
+    window = _arm_window()
+    named = _single(_fields(_stdout(payload.get("tool_response"))), "attempt_id")
+    refusal: ArmRefusal | None = None
+    open_rows = {attempt_id for attempt_id, _age in _session_owner_rows(jobs, session)}
+    # A row that already ran to `done` is never a *new* claim (its completion
+    # is the sweep's), but one whose claim this session already holds -- a
+    # spent gate wake, a dead holder, a lapse -- is still owed its wake and
+    # may have finished between the release and this call (top review M1).
+    for attempt_id, age in _session_owner_rows(jobs, session, statuses=RECEIPT_ROW_STATUSES):
+        fresh = attempt_id in open_rows and age <= window
+        if attempt_id not in open_rows and not arm_path(jobs, attempt_id).exists():
+            continue
+        claim = claim_arm(jobs, attempt_id, session, fresh=fresh)
+        if isinstance(claim, ArmRefusal):
+            # Keep the receipt-named attempt's reason above any other's
+            # (review R2 M2): the notice must say why *that* start did not arm.
+            if refusal is None or attempt_id == named:
+                refusal = claim
+            continue
+        armed = "registry" if claim.arms == 1 else "registry-rearm"
+        return Launch(attempt_id=attempt_id, jobs=jobs, session_id=session, armed=armed), claim
+    return refusal
+
+
+def _process_identity(pid: int) -> tuple[str, str, str] | None:
+    """`(pid, start_ticks, pid_ns)` of one live process, or None."""
+
+    found = _proc_stat(pid)
+    namespace = process_namespace_identity(pid)
+    if found is None or not namespace:
+        return None
+    return (str(pid), str(found["start"]), namespace)
+
+
+def _holder_alive(holder: object) -> bool:
+    """Whether the recorded holder triple still names a live process.
+
+    Dead means *provably* gone: the pid no longer exists, or it exists with a
+    different start time or pid namespace (pid reuse). A record that cannot
+    be parsed, or a live pid whose identity cannot be read right now
+    (a transient /proc failure -- review R1 M1), counts as alive: a duplicate
+    waiter is the failure mode arming exists to prevent, a missed re-arm is
+    what the next-prompt sweep exists to cover."""
+
+    if not isinstance(holder, list) or len(holder) != 3 or not all(isinstance(v, str) and v for v in holder):
+        return True
     try:
-        lines = jobs.read_text(encoding="utf-8", errors="replace").splitlines()
+        pid = int(holder[0])
+    except ValueError:
+        return True
+    if holder[2] != process_namespace_identity(os.getpid()):
+        # The pid is a coordinate in the holder's own PID namespace; from
+        # another one the same number names someone else and its absence
+        # proves nothing (top review M3) -- unobservable counts as alive.
+        return True
+    if not Path(f"/proc/{pid}").exists():
+        return False
+    observed = _process_identity(pid)
+    if observed is None:
+        return True
+    return list(observed) == holder
+
+
+def arm_directory(jobs: Path) -> Path:
+    return jobs.resolve(strict=False).parent / ARM_DIRECTORY
+
+
+def arm_path(jobs: Path, attempt_id: str) -> Path:
+    return arm_directory(jobs) / f"{attempt_id}.json"
+
+
+def _read_arm(path: Path) -> dict[str, Any] | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        return {"state": "unreadable"}
+    return value if isinstance(value, dict) else {"state": "unreadable"}
+
+
+def _write_arm(path: Path, record: dict[str, Any]) -> None:
+    temporary = path.with_name(path.name + f".tmp-{os.getpid()}")
+    temporary.write_text(json.dumps(record, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def _gate_record_open(jobs: Path, session: str, delivery_id: object) -> bool:
+    """Whether the gate record a spent wake announced is still open.
+
+    Only a record that was read and carries a closed state counts as closed.
+    An unnamed, unreadable, or *missing* record counts as open (review R1 B2:
+    `pending_delivery.read` returns None for a missing file, and treating
+    that as closed re-armed a waiter with no closing evidence)."""
+
+    if not isinstance(delivery_id, str) or not delivery_id:
+        return True
+    root = jobs.resolve(strict=False).parent
+    try:
+        record = pending_delivery.read(root, session, delivery_id)
+    except pending_delivery.PendingDeliveryError:
+        return True
+    if not isinstance(record, dict):
+        return True
+    return record.get("state") in pending_delivery.OPEN_STATES
+
+
+def _reclaim_refusal(existing: dict[str, Any], jobs: Path, session: str) -> str | None:
+    """None when the existing record may be re-taken, else the typed reason."""
+
+    if existing.get("state") == "unreadable":
+        return "unreadable"
+    if existing.get("schema") != ARM_SCHEMA:
+        return "unreadable"
+    if existing.get("session_id") != session:
+        return "foreign-session"
+    arms = existing.get("arms")
+    if not isinstance(arms, int):
+        return "unreadable"
+    if arms >= ARM_LIMIT:
+        return "exhausted"
+    state = existing.get("state")
+    if state == "ended":
+        return "ended"
+    if state not in ARM_STATES:
+        return "unreadable"
+    if _holder_alive(existing.get("holder")):
+        return "held-live"
+    if state == "gate-wake-sent" and _gate_record_open(jobs, session, existing.get("gate_delivery_id")):
+        return "gate-open"
+    return None  # waiting with a dead holder, lapsed, or a gate that has closed
+
+
+def _reclaimable(existing: dict[str, Any], jobs: Path, session: str) -> bool:
+    return _reclaim_refusal(existing, jobs, session) is None
+
+
+def _prune_arm_directory(directory: Path, now: float) -> None:
+    """Bounded retention for the ledger (review R1 M3), run under the ledger
+    lock by a process that just took a claim. An `ended` record older than
+    seven days is deleted; a record older than thirty days is deleted only
+    when it is `lapsed`, unreadable, or held by a provably dead process -- a
+    `waiting`/`gate-wake-sent` record whose holder is alive or unobservable
+    is never touched, however old (review R2 M1: the lock serialises file
+    access, it does not prove a holder dead). At most `ARM_PRUNE_SCAN_LIMIT`
+    entries are examined per claim; the lock file itself is never removed."""
+
+    try:
+        names = sorted(entry.name for entry in directory.glob("att-*.json"))
     except OSError:
-        return None
-    latest: dict[str, tuple[str, dict[str, str]]] = {}
-    for line in lines:
-        columns = line.split("\t")
-        if len(columns) != 6:
-            continue
-        metadata = _registry_metadata(columns[5])
-        attempt_id = metadata.get("attempt_id", "")
-        if ATTEMPT.fullmatch(attempt_id) is None:
-            continue
-        latest[attempt_id] = (columns[1], metadata)
-    candidates = [
-        attempt_id
-        for attempt_id, (status, metadata) in latest.items()
-        if status == "open"
-        and metadata.get("parent_sid") == session
-        and all(metadata.get(key) == value for key, value in RELEASE_OWNER_ROW.items())
-        and route_id in (metadata.get("owner_route_id"), metadata.get("route_id"))
-    ]
-    if len(candidates) != 1:
-        return None
-    return Launch(attempt_id=candidates[0], jobs=jobs, session_id=session, armed=armed)
-
-
-# One definition, shared with `workflow-supervisor.py`'s refusal line: the
-# supervisor prints `{"gate", "route_id", "refusal": "gate-not-blocked", ...}`
-# on stdout before its prose refusal (review finding 13).
-GATE_NOT_BLOCKED_REFUSAL = "gate-not-blocked"
-
-
-def _refused_release_route_id(payload: dict) -> str | None:
-    """The `route_id` of a release the supervisor refused as already released
-    (typed `refusal=gate-not-blocked` line), else None."""
-
-    stdout = _stdout(payload.get("tool_response"))
-    for line in reversed(stdout.splitlines()):
-        line = line.strip()
-        if not line.startswith("{"):
-            continue
+        return
+    if not names:
+        return
+    # A rotating cursor (review R3 M2): a run scans the window that follows
+    # the last scanned name and records where it stopped, so a prefix of
+    # preserved live-holder records cannot starve the expired records behind
+    # it. The cursor file is best-effort; a missing or stale one restarts at
+    # the beginning, never skips deletion of anything.
+    cursor = directory / ARM_PRUNE_CURSOR
+    try:
+        last = cursor.read_text(encoding="utf-8").strip()
+    except OSError:
+        last = ""
+    start = next((index for index, name in enumerate(names) if name > last), 0)
+    window = (names[start:] + names[:start])[:ARM_PRUNE_SCAN_LIMIT]
+    try:
+        cursor.write_text(window[-1], encoding="utf-8")
+    except OSError:
+        pass
+    for entry in (directory / name for name in window):
         try:
-            rendered = json.loads(line)
-        except ValueError:
+            age = now - entry.stat().st_mtime
+            if age < ARM_RETENTION_ENDED_SECONDS:
+                continue
+            record = _read_arm(entry) or {}
+            state = record.get("state")
+            if state == "ended":
+                entry.unlink()
+            elif age >= ARM_RETENTION_ANY_SECONDS and (
+                state in {"lapsed", "unreadable"} or not _holder_alive(record.get("holder"))
+            ):
+                entry.unlink()
+        except OSError:
             continue
-        if isinstance(rendered, dict) and rendered.get("refusal") == GATE_NOT_BLOCKED_REFUSAL:
-            value = rendered.get("route_id")
-            return value if isinstance(value, str) and value else None
-        return None
-    return None
 
 
-def release_no_arm_notice(payload: object) -> int:
-    """One typed exit-0 notice when a proven release armed nothing (review round
-    1, M2): the session was told the release re-arms the wait, so a silent
-    non-arm would be the lost wake SD-111 exists to prevent. A refused release
-    (no JSON payload) stays silent -- its own stderr already told the story --
-    except one refused as already released (SD-OPEN-48), whose typed refusal
-    line names the route and so was expected to arm."""
+def claim_arm(jobs: Path, attempt_id: str, session: str, *, fresh: bool) -> ArmClaim | ArmRefusal:
+    """Take the arm claim for `attempt_id` under the ledger lock.
 
-    if not isinstance(payload, dict):
-        return 0
-    tool_input = payload.get("tool_input")
-    command = tool_input.get("command") if isinstance(tool_input, dict) else None
-    if not isinstance(command, str) or _release_command(command) is None:
-        return 0
-    stdout = _stdout(payload.get("tool_response"))
-    if _refused_release_route_id(payload) is not None:
-        # SD-OPEN-48 (#13): refused as already released, but no single started
-        # open owner of that route is bound to this session -- say so once.
-        message = (
-            "[dispatch-owner-rewake] schema=2 state=not-armed surface=release-refused — this gate "
-            "was already released (workflow not blocked), and no single started open depth-1 owner "
-            "of that route is bound to this session, so the owner's completion will not wake this "
-            "session from this command. If the owner is still running, its completion arrives "
-            "through the UserPromptSubmit sweep at your next prompt. Do not start Monitor, "
-            "dispatch-wait, or a polling loop."
-        )
-        print(json.dumps({"systemMessage": message}, ensure_ascii=False, separators=(",", ":")))
-        return 0
-    if not any(line.strip().startswith("{") and '"route_id"' in line for line in stdout.splitlines()):
-        return 0
-    message = (
-        "[dispatch-owner-rewake] schema=2 state=not-armed surface=release — this release recorded, "
-        "but no single started open depth-1 owner of that route is bound to this session, so the "
-        "owner's completion will not wake this session from this command. If the owner is still "
-        "running, its completion arrives through the UserPromptSubmit sweep at your next prompt; "
-        "if it ended at the gate, continue the route with a continuation owner. Do not start "
-        "Monitor, dispatch-wait, or a polling loop."
-    )
-    print(json.dumps({"systemMessage": message}, ensure_ascii=False, separators=(",", ":")))
-    return 0
+    A missing record is created only for a `fresh` row (started inside the arm
+    window); an existing record is re-taken only when `_reclaim_refusal` finds
+    no reason. Returns an `ArmRefusal` naming the reason otherwise -- another
+    hook process holds the wait, the wake was spent and its gate is still
+    open, the attempt ended, the budget is spent, or the ledger could not be
+    read or written -- and never raises."""
+
+    identity = _process_identity(os.getpid())
+    if identity is None:
+        return ArmRefusal("identity-unavailable")
+    path = arm_path(jobs, attempt_id)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lock = os.open(path.parent / ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        return ArmRefusal("io-error")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            existing = _read_arm(path)
+            if existing is None:
+                if not fresh:
+                    return ArmRefusal("not-fresh")
+                arms = 1
+            else:
+                refusal = _reclaim_refusal(existing, jobs, session)
+                if refusal is not None:
+                    return ArmRefusal(refusal)
+                arms = int(existing["arms"]) + 1
+            record = {
+                "schema": ARM_SCHEMA,
+                "attempt_id": attempt_id,
+                "session_id": session,
+                "holder": list(identity),
+                "state": "waiting",
+                "arms": arms,
+                "gate_delivery_id": None,
+                "armed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            }
+            _write_arm(path, record)
+            _prune_arm_directory(path.parent, time.time())
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+    except OSError:
+        return ArmRefusal("io-error")
+    finally:
+        os.close(lock)
+    return ArmClaim(path=path, attempt_id=attempt_id, session_id=session, arms=arms, holder=identity)
+
+
+def settle_arm(claim: ArmClaim, state: str, *, gate_delivery_id: str | None = None) -> bool:
+    """Record how this hook process's wait ended, if it still holds the claim.
+
+    `ended` is permanent (a terminal receipt was emitted); `gate-wake-sent`
+    names the gate record whose closing lets a later Bash call re-arm;
+    `lapsed` (timeout, bridge error) lets the next call re-arm at once."""
+
+    if state not in ARM_STATES:
+        return False
+    try:
+        lock = os.open(claim.path.parent / ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            existing = _read_arm(claim.path)
+            if existing is None or existing.get("holder") != list(claim.holder):
+                return False
+            existing["state"] = state
+            existing["gate_delivery_id"] = gate_delivery_id
+            existing["settled_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            _write_arm(claim.path, existing)
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+    except OSError:
+        return False
+    finally:
+        os.close(lock)
+    return True
 
 
 def agent_home() -> Path:
@@ -1025,7 +1112,10 @@ def _open_gate_pending(launch: Launch) -> bool:
     return False
 
 
-def _gate_notices(launch: Launch, *, attempt_only: bool = False, settle: str = "ack") -> list[str]:
+def _gate_notices(
+    launch: Launch, *, attempt_only: bool = False, settle: str = "ack",
+    announced: list[str] | None = None,
+) -> list[str]:
     """SD-123 (8)(b) carrier 1: fold every open gate record for this recipient
     into the wake this hook is about to emit.
 
@@ -1036,18 +1126,15 @@ def _gate_notices(launch: Launch, *, attempt_only: bool = False, settle: str = "
     that owner's hook's wake, and spending this process's single wake on it
     would lose this attempt's completion notice.
 
-    `settle` is how the announced record is left. The terminal wake acks
-    (A59-3: a gate folded into a terminal receipt is not re-announced). The
-    in-wait wake passes `sent-ambiguous` (review round 1, M6): whether an
-    exit-2 wake reaches the session is unmeasured (SD-OPEN-29/32), and an
-    acked record would have spent the sweep fallback the contract still
-    requires. The cost is bounded at-least-once: if the person has not
-    released by the next prompt the sweep shows the same gate once more.
-
-    Each record is claimed and then acked -- not left `sent-ambiguous`. A gate
-    record is a pointer; the gate itself is durable in the workflow ledger, so
-    the usual at-least-once argument does not apply, and re-delivery would put
-    the same gate in front of the user on every prompt (A59-3 forbids that).
+    `settle` is how the announced record is left, and both call sites pass
+    `sent-ambiguous` (review round 1, M6): whether an exit-2 wake reaches the
+    session is unmeasured (SD-OPEN-29/32), and an acked record would have
+    spent the sweep fallback the contract still requires. The terminal caller
+    (`_emit_with_gates`) acks separately once its receipt has actually gone
+    out, so a gate folded into a delivered terminal receipt is not
+    re-announced (A59-3) while one whose receipt never went out still is. The
+    cost is bounded at-least-once: if the person has not released by the next
+    prompt the sweep shows the same gate once more.
     """
 
     notices: list[str] = []
@@ -1081,6 +1168,8 @@ def _gate_notices(launch: Launch, *, attempt_only: bool = False, settle: str = "
         except pending_delivery.PendingDeliveryError:
             continue
         notices.append(_bounded_receipt_text(record))
+        if announced is not None:
+            announced.append(delivery_id)
         try:
             if settle == "sent-ambiguous":
                 pending_delivery.mark_sent_ambiguous(
@@ -1116,42 +1205,45 @@ def gate_wake_message(launch: Launch, notices: list[str]) -> str:
     )
 
 
-def no_arm_notice(payload: object) -> int:
-    """One typed notice when a successful start armed neither bridge path.
+def no_arm_notice(payload: object, *, reason: str | None = None) -> int:
+    """One typed notice when a start receipt proves `started=1` for this
+    session but no hook process holds the attempt's arm claim.
 
-    A grep-filtered `dispatch-owner --start` stdout plus an ambiguous
-    registry window loses the wake silently: the owner completes, nothing
-    wakes the parent, and the durable SD-111 record may also be refused for a
-    route-less owner (2026-09-01: five fleet cleanup owners, four unwatched
-    terminals).  Arming stays fail-closed — absence beats misattribution —
-    but the *loss* must be loud (fix candidate ③ of the 2026-08-24 quick-gap
-    record): tell the launching session immediately that completion will not
-    wake it, so it relaunches with unfiltered stdout or uses the explicit
-    poll-fallback.  A start whose own stdout already reports failure keeps
-    telling that story itself; this notice never fires for it."""
+    Arming stays fail-closed -- absence beats misattribution -- but the *loss*
+    must be loud (fix candidate ③ of the 2026-08-24 quick-gap record): tell
+    the launching session immediately that completion will not wake it. A
+    start whose own stdout already reports failure keeps telling that story
+    itself, and a filtered stdout that names no attempt cannot be judged
+    here -- its row is armed by this or the next Bash call from the registry."""
 
-    gate = _owner_start_command(payload)
+    gate = _bash_call(payload)
     if gate is None:
         return 0
-    inner, _command = gate
-    raw_stdout = _stdout(inner.get("tool_response"))
-    fields = _fields(raw_stdout)
+    inner, session = gate
+    fields = _fields(_stdout(inner.get("tool_response")))
     started = "start" in fields.get("status", []) and "1" in fields.get("started", [])
-    if raw_stdout.strip() and not started:
+    attempt_id = _single(fields, "attempt_id")
+    if not started or attempt_id is None or _single(fields, "parent_session_id") != session:
         return 0
-    if not raw_stdout.strip():
-        resolved = _registry_start_candidates(payload)
-        if resolved is None or not resolved[3]:
-            return 0
-    attempt_id = _single(fields, "attempt_id") or "unknown"
+    if reason is None:
+        jobs = _resolved_jobs(inner)
+        if jobs is None:
+            reason = "no-registry"
+        else:
+            existing = _read_arm(arm_path(jobs, attempt_id))
+            if existing is None:
+                reason = "unclaimed"
+            else:
+                refusal = _reclaim_refusal(existing, jobs, session)
+                reason = refusal or "reclaimable"
+    if reason in ArmRefusal.WATCHED:
+        return 0
     message = (
         f"[dispatch-owner-rewake] schema=2 state=not-armed attempt_id={attempt_id} "
-        "— this owner start reported started=1 but the asyncRewake bridge did NOT arm "
-        "(filtered stdout or an ambiguous recent-candidate window), so its completion "
-        "will not wake this session and no bridge is watching it. Relaunch future "
-        "starts with unfiltered stdout, or watch this exact attempt via the explicit "
-        "poll-fallback (dispatch-wait --attempt-id <id>); do not wait for a wake that "
-        "cannot arrive."
+        f"reason={reason} — this owner start reported started=1 but the asyncRewake bridge "
+        "did NOT arm, so its completion will not wake this session and no bridge is "
+        "watching it. Watch this exact attempt via the explicit poll-fallback "
+        "(dispatch-wait --attempt-id <id>); do not wait for a wake that cannot arrive."
     )
     print(json.dumps({"systemMessage": message}, ensure_ascii=False, separators=(",", ":")))
     print(message, file=sys.stderr)
@@ -1163,12 +1255,31 @@ def main() -> int:
         payload: Any = json.load(sys.stdin)
     except (OSError, json.JSONDecodeError):
         return 0
-    launch = parse_launch(payload) or registry_launch(payload) or release_launch(payload)
-    if launch is None:
-        return no_arm_notice(payload) or release_no_arm_notice(payload)
+    launch = parse_launch(payload)
+    if launch is not None:
+        # The receipt names a candidate; the registry row proves it (R1 B1).
+        age = receipt_row_age(launch)
+        if age is None:
+            return no_arm_notice(payload, reason="row-identity-mismatch")
+        claim = claim_arm(launch.jobs, launch.attempt_id, launch.session_id, fresh=age <= _arm_window())
+        if isinstance(claim, ArmRefusal):
+            # A watched attempt (live holder, spent gate wake, ended) is
+            # someone else's wake; anything else is a loss and says so.
+            return 0 if claim.watched else no_arm_notice(payload, reason=claim.reason)
+    else:
+        resolved = registry_launch(payload)
+        if isinstance(resolved, ArmRefusal):
+            return 0 if resolved.watched else no_arm_notice(payload, reason=resolved.reason)
+        if resolved is None:
+            return no_arm_notice(payload)
+        launch, claim = resolved
     root = agent_home()
     readiness = root / "utilities" / "dispatch-attempt-ready.py"
     if not readiness.is_file():
+        # A helper missing from *this* call's agent home (release rotation, a
+        # wrong AGENT_HOME) is a lapse, not an end: the next Bash call may
+        # see a whole home again (review R1 B3).
+        settle_arm(claim, "lapsed")
         state, message = classified_receipt(
             launch, "bridge-error", "readiness-helper-missing", root
         )
@@ -1188,26 +1299,39 @@ def main() -> int:
             if wait_state != "gate":
                 break
             # SD-129: the owner is alive at its gate. Wake the person now with
-            # this process's one wake; the release command re-arms the wait
-            # (`release_launch`). A probe that another carrier beat to the
-            # record (nothing left to announce) sleeps one interval and resumes
-            # waiting -- never a tight loop (review round 1, B3).
-            notices = _gate_notices(launch, attempt_only=True, settle="sent-ambiguous")
+            # this process's one wake and record which gate record it spent
+            # it on: once that record closes (the release retires it, or the
+            # next-prompt sweep acks it) the next Bash call in this session
+            # re-arms the wait (`registry_launch` -> `_reclaimable`). A probe
+            # that another carrier beat to the record (nothing left to
+            # announce) sleeps one interval and resumes waiting -- never a
+            # tight loop (review round 1, B3).
+            announced: list[str] = []
+            notices = _gate_notices(
+                launch, attempt_only=True, settle="sent-ambiguous", announced=announced
+            )
             if notices:
-                return emit_receipt("attention", gate_wake_message(launch, notices), block=False)
+                code = emit_receipt("attention", gate_wake_message(launch, notices), block=False)
+                settle_arm(claim, "gate-wake-sent", gate_delivery_id=announced[0])
+                return code
             time.sleep(interval)
+        if wait_state not in {"ready", "attention"}:
+            settle_arm(claim, "lapsed")
         state, message = classified_receipt(launch, wait_state, wait_reason, root)
-    # SD-123 (8)(b): an open gate rides this same wake. It also forces the
-    # attention state -- a route whose next step is a human decision has not
-    # succeeded, however cleanly the owner attempt ended.
-    gates = _gate_notices(launch)
-    if gates:
-        state = "attention"
-        message = (
-            message
-            + " A human gate is open and awaiting your decision; it is answered, not harvested. "
-            + " ".join(gates)
-        )
+    # `ended` is sealed only once the receipt has actually gone out (review
+    # R2 B2), or once another carrier owns the completion: a crash between
+    # classification and emission leaves the claim `waiting` under a dead
+    # holder, so the next Bash call re-arms and the wake is delivered at
+    # least once instead of never.
+    #
+    # Open gates ride the wake this process actually emits (SD-123 (8)(b))
+    # and force the attention state. They are folded in *after* the
+    # decision to emit (top review B1: a hook that lost the completion claim
+    # used to claim-and-ack every gate for the recipient on its way to a
+    # silent exit, so the gate was never announced by anyone), left
+    # `sent-ambiguous` while the receipt goes out, and acked only after it
+    # did (A59-3: a gate folded into a delivered terminal receipt is not
+    # re-announced; one that was not delivered still is).
     block = _attention_has_open_child(message)
     if block:
         # A live owned child is still open -- no delivery-owing terminal
@@ -1215,24 +1339,65 @@ def main() -> int:
         # open|running -> done), so there is nothing to claim. This keeps
         # Claude from stopping prematurely; SD-111's claim gate does not
         # apply to it.
-        return emit_receipt(state, message, block=True)
+        return _emit_with_gates(launch, claim, state, message, block=True)
     owing = _delivery_owing_row(launch)
     if owing is None:
         # Not (yet) a delivery-owing terminal completion -- still open/
         # running (timeout, bridge error) or a non-SD-111 row. Emit exactly
         # as before the claim gate existed; only a genuine delivery-owing
         # terminal notice is claim-gated.
-        return emit_receipt(state, message, block=False)
+        return _emit_with_gates(launch, claim, state, message, block=False)
     win = _carrier_one_claim(launch, owing)
     if win is None:
-        return 0
-    exit_code = emit_receipt(state, message, block=False)
+        # Another carrier holds (or already acked) the durable record: the
+        # completion is delivered by it, so this attempt is finished here --
+        # and the recipient's gates are that carrier's (or the sweep's) too.
+        return _ended(claim, 0, terminal=True)
+    exit_code = _emit_with_gates(launch, claim, state, message, block=False)
     try:
         pending_delivery.mark_sent_ambiguous(
             win.root, win.recipient_key, win.delivery_id, claim_owner=win.claim_owner,
         )
     except pending_delivery.PendingDeliveryError:
         pass
+    return exit_code
+
+
+def _emit_with_gates(launch: Launch, claim: ArmClaim, state: str, message: str, *, block: bool) -> int:
+    """Fold the recipient's open gates into the receipt about to go out, emit
+    it, and only then ack them; seal the claim after the emit."""
+
+    # The owner's own outcome, read before any gate is folded in (top review
+    # R2-M1): a gate belongs to whoever raised it and only changes what this
+    # receipt *displays*. Letting it also decide this claim sealed a timed-out
+    # or helper-less wait as `ended`, so the owner -- still open -- could never
+    # be re-armed and its completion never woke the session again.
+    terminal = state in TERMINAL_STATES
+    announced: list[str] = []
+    gates = _gate_notices(launch, settle="sent-ambiguous", announced=announced)
+    if gates:
+        state = "attention"
+        message = (
+            message
+            + " A human gate is open and awaiting your decision; it is answered, not harvested. "
+            + " ".join(gates)
+        )
+    exit_code = emit_receipt(state, message, block=block)
+    root = launch.jobs.resolve(strict=False).parent
+    recipient_key = _recipient_key(launch)
+    for delivery_id in announced:
+        try:
+            pending_delivery.ack(root, recipient_key, delivery_id, acked_by=f"async-rewake:{launch.session_id}")
+        except pending_delivery.PendingDeliveryError:
+            pass
+    return _ended(claim, exit_code, terminal=terminal)
+
+
+def _ended(claim: ArmClaim, exit_code: int, *, terminal: bool) -> int:
+    """Seal the claim after the receipt is out: `ended` for a terminal wake,
+    `lapsed` for a non-terminal bridge state a later call may retry."""
+
+    settle_arm(claim, "ended" if terminal else "lapsed")
     return exit_code
 
 

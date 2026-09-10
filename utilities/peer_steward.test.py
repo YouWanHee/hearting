@@ -29,6 +29,16 @@ class _TmpRootMixin:
         self.jobs_path.touch()
         self._old_environ = dict(os.environ)
         os.environ["AGENT_DISPATCH_JOBS"] = str(self.jobs_path)
+        os.environ["AGENT_PEER_LEDGER_ROOT"] = str(self.tmp_root)
+        # `steward_marker_roots()`'s fleet-reader branch also adds
+        # `stable_state_root(os.environ)` and every installed runtime's own root
+        # (~/.codex, ~/.claude, ~/.config/opencode) as read candidates; without
+        # isolating HOME too those fall through to this machine's real roots.
+        os.environ["HOME"] = str(self.tmp_root / "home")
+        os.environ.pop("XDG_STATE_HOME", None)
+        os.environ.pop("HARNESS_STATE_ROOT", None)
+        os.environ.pop("CODEX_HOME", None)
+        os.environ.pop("CLAUDE_CONFIG_DIR", None)
         os.environ.pop("AGENT_HOME", None)
         os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
         os.environ.pop("CODEX_THREAD_ID", None)
@@ -40,7 +50,7 @@ class _TmpRootMixin:
         os.environ.update(self._old_environ)
 
     def _all_records(self):
-        root = peer_steward.peer_message._ledger_root() / "peer-messages"
+        root = peer_steward.peer_message.peer_state_root() / "peer-messages"
         if not root.is_dir():
             return []
         recs = []
@@ -235,6 +245,21 @@ class WaitTest(_TmpRootMixin, unittest.TestCase):
         self.assertIn("fallback=poll-fallback", line)
 
 
+def _agent_start_cmd(run_mock):
+    """The `herdr agent start …` argv among every herdr call the wrapper makes.
+
+    `start` now also asks herdr about the pane and re-establishes the launcher ingress in
+    it, so "the last call" is no longer the launch. Selecting by what the call IS keeps
+    these assertions about the launch instead of about call ordering.
+    """
+    for call in run_mock.call_args_list:
+        argv = call[0][0]
+        if isinstance(argv, list) and argv[:3] == ["herdr", "agent", "start"]:
+            return argv
+    raise AssertionError("no `herdr agent start` call: %r"
+                         % [c[0][0] for c in run_mock.call_args_list])
+
+
 class StartTest(_TmpRootMixin, unittest.TestCase):
     def _start(self, name="peer-c", kind="claude", pane="w1:pM", permission_mode=None, agent_args=None):
         argv = ["start", name, "--kind", kind, "--pane", pane]
@@ -243,6 +268,184 @@ class StartTest(_TmpRootMixin, unittest.TestCase):
         if agent_args:
             argv += ["--"] + list(agent_args)
         return peer_steward.main(argv)
+
+    def _ingress(self, kind="codex"):
+        """A real wrapper on disk, so the existence check has something to find."""
+        bindir = self.tmp_root / "codex-home" / ".harness" / "bin"
+        bindir.mkdir(parents=True, exist_ok=True)
+        wrapper = bindir / kind
+        wrapper.write_text("#!/bin/sh\nexec true\n")
+        wrapper.chmod(0o755)
+        os.environ["CODEX_HOME"] = str(self.tmp_root / "codex-home")
+        self.addCleanup(os.environ.pop, "CODEX_HOME", None)
+        return str(bindir)
+
+    def test_the_launcher_ingress_is_re_established_in_the_pane_first(self):
+        """Only hearting's wrapper reaches the managed entry, and only the managed entry
+        writes the session record — so a pane whose PATH misses the wrapper produces a
+        session with no identity anywhere.
+
+        A shell reads its startup files once. Measured 2026-09-10: `command -v codex` in a
+        pane whose shell started 2026-08-24 — a week before the ingress was installed —
+        answered with the vendor binary, while a pane opened 2026-09-09 answered with the
+        wrapper. Nothing can reach the old pane afterwards; the profile cannot touch a
+        running process. The launch can.
+        """
+        bindir = self._ingress()
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run",
+                                return_value=_herdr_json({"result": {"pane": {}}})) as run_mock:
+            peer_steward.main(["start", "peer-c", "--kind", "codex", "--pane", "w1:pM"])
+        argvs = [c[0][0] for c in run_mock.call_args_list]
+        sends = [a for a in argvs if a[:3] == ["herdr", "pane", "send-text"]]
+        self.assertEqual(len(sends), 1, argvs)
+        self.assertIn(bindir, sends[0][-1])
+        self.assertTrue(sends[0][-1].startswith("export PATH="))
+        # ... and it has to be typed BEFORE the launch, or the launch resolves the old PATH.
+        self.assertLess(argvs.index(sends[0]),
+                        argvs.index(_agent_start_cmd(run_mock)))
+        self.assertIn(["herdr", "pane", "send-keys", "w1:pM", "Enter"], argvs)
+
+    def test_a_pane_already_running_an_agent_is_never_typed_into(self):
+        # Text sent to an occupied pane lands in that agent's prompt, not a shell.
+        self._ingress()
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run",
+                                return_value=_herdr_json({"result": {"pane": {"agent": "codex"}}})) as run_mock:
+            peer_steward.main(["start", "peer-c", "--kind", "codex", "--pane", "w1:pM"])
+        argvs = [c[0][0] for c in run_mock.call_args_list]
+        self.assertEqual([a for a in argvs if a[:3] == ["herdr", "pane", "send-text"]], [])
+
+    def test_a_harness_with_no_wrapper_gets_nothing_typed_on_its_behalf(self):
+        # Claude and OpenCode have no launcher wrapper; there is no PATH to fix.
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run",
+                                return_value=_herdr_json({"result": {"pane": {}}})) as run_mock:
+            peer_steward.main(["start", "peer-c", "--kind", "claude", "--pane", "w1:pM"])
+        argvs = [c[0][0] for c in run_mock.call_args_list]
+        self.assertEqual([a for a in argvs if a[:3] == ["herdr", "pane", "send-text"]], [])
+        self.assertEqual([a for a in argvs if a[:3] == ["herdr", "pane", "get"]], [])
+
+    def test_an_uninstalled_wrapper_is_not_put_on_anyones_path(self):
+        os.environ["CODEX_HOME"] = str(self.tmp_root / "no-such-home")
+        self.addCleanup(os.environ.pop, "CODEX_HOME", None)
+        self.assertIsNone(peer_steward._managed_ingress_dir("codex"))
+
+    def test_the_receipt_says_whether_the_session_came_up_managed(self):
+        import io
+        import contextlib
+        self._ingress()
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run",
+                                return_value=_herdr_json({"result": {"pane": {}}})), \
+             mock.patch.object(peer_steward, "_pane_is_managed", return_value=False):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                peer_steward.main(["start", "peer-c", "--kind", "codex", "--pane", "w1:pM"])
+        self.assertIn("managed=false", out.getvalue())
+
+    def test_a_managed_launch_says_so(self):
+        import io
+        import contextlib
+        self._ingress()
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run",
+                                return_value=_herdr_json({"result": {"pane": {}}})), \
+             mock.patch.object(peer_steward, "_pane_is_managed", return_value=True):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                peer_steward.main(["start", "peer-c", "--kind", "codex", "--pane", "w1:pM"])
+        self.assertIn("managed=true", out.getvalue())
+
+    def test_the_managed_check_reads_the_entry_process_not_only_its_children(self):
+        """`codex-managed-entry.py` sets `AGENT_CODEX_MANAGED_GATEWAY` for the app-server
+        and TUI client it spawns, NOT for itself. Looking only for that variable on the
+        pane's foreground process reported `managed=false` for a launch that really was
+        managed — caught end-to-end 2026-09-10, after the unit tests were already green."""
+        info = {"result": {"process_info": {"foreground_processes": [
+            {"pid": 1, "argv": ["/usr/bin/python3",
+                                "/x/utilities/codex-managed-entry.py", "--codex", "/y/codex"]}]}}}
+        with mock.patch.object(peer_steward.subprocess, "run",
+                               return_value=_herdr_json(info)):
+            self.assertIs(peer_steward._pane_is_managed("w1:pM"), True)
+
+    def test_a_plain_vendor_process_is_reported_unmanaged(self):
+        info = {"result": {"process_info": {"foreground_processes": [
+            {"pid": 999999999, "argv": ["codex", "--dangerously-bypass-approvals-and-sandbox"]}]}}}
+        with mock.patch.object(peer_steward.subprocess, "run",
+                               return_value=_herdr_json(info)):
+            self.assertIs(peer_steward._pane_is_managed("w1:pM"), False)
+
+    def test_an_unreadable_pane_is_unknown_not_a_verdict(self):
+        # Claiming "unmanaged" because herdr did not answer would be a guess wearing a
+        # receipt's clothes.
+        with mock.patch.object(peer_steward.subprocess, "run",
+                               side_effect=OSError("herdr gone")):
+            self.assertIsNone(peer_steward._pane_is_managed("w1:pM"))
+
+    def test_cwd_reaches_the_agent_that_can_take_one(self):
+        """`herdr agent start` has no cwd option, so the launched agent inherits the
+        PANE's directory. `--cwd` used to be passed only to this CLI process: a session
+        started with `--cwd <hearting>` came up in `SR_CorrNet` (measured 2026-09-10)."""
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run",
+                                return_value=subprocess.CompletedProcess([], 0, stdout="", stderr="")) as run_mock:
+            rc = peer_steward.main(["start", "peer-c", "--kind", "codex",
+                                    "--pane", "w1:pM", "--cwd", str(self.tmp_root)])
+        self.assertEqual(rc, 0)
+        cmd = _agent_start_cmd(run_mock)
+        self.assertIn("--cd", cmd)
+        self.assertIn(os.path.realpath(str(self.tmp_root)), cmd)
+
+    def test_cwd_is_refused_where_the_harness_cannot_honor_it(self):
+        # Claude Code has no working-root flag. Refusing is the point: the alternative
+        # is a session quietly working in the wrong repository.
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run") as run_mock:
+            rc = peer_steward.main(["start", "peer-c", "--kind", "claude",
+                                    "--pane", "w1:pM", "--cwd", str(self.tmp_root)])
+        self.assertEqual(rc, 1)
+        run_mock.assert_not_called()
+
+    def test_a_cwd_that_is_not_a_directory_never_reaches_herdr(self):
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run") as run_mock:
+            rc = peer_steward.main(["start", "peer-c", "--kind", "codex",
+                                    "--pane", "w1:pM",
+                                    "--cwd", str(self.tmp_root / "nope")])
+        self.assertEqual(rc, 1)
+        run_mock.assert_not_called()
+
+    def test_no_cwd_leaves_the_launch_exactly_as_it_was(self):
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run",
+                                return_value=subprocess.CompletedProcess([], 0, stdout="", stderr="")) as run_mock:
+            peer_steward.main(["start", "peer-c", "--kind", "codex", "--pane", "w1:pM"])
+        self.assertNotIn("--cd", _agent_start_cmd(run_mock))
+
+    def test_the_receipt_says_when_the_launch_produced_no_identity(self):
+        """A session herdr cannot name has no ledger endpoint and no board badge. That
+        used to surface hours later as a nameless row; it belongs in the launch receipt."""
+        import io
+        import contextlib
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run",
+                                return_value=_herdr_json(_agent_json("codex", None, "peer-c"))):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                peer_steward.main(["start", "peer-c", "--kind", "codex", "--pane", "w1:pM"])
+        self.assertIn("session_id=-", out.getvalue())
+
+    def test_the_receipt_names_the_identity_when_there_is_one(self):
+        import io
+        import contextlib
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run",
+                                return_value=_herdr_json(_agent_json("codex", "thread-9", "peer-c"))):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                peer_steward.main(["start", "peer-c", "--kind", "codex", "--pane", "w1:pM"])
+        self.assertIn("session_id=thread-9", out.getvalue())
 
     def test_name_is_the_positional_right_after_start(self):
         """herdr `agent start <NAME> --kind --pane`: the name is a required positional.
@@ -253,7 +456,7 @@ class StartTest(_TmpRootMixin, unittest.TestCase):
              mock.patch.object(peer_steward.subprocess, "run",
                                 return_value=subprocess.CompletedProcess([], 0, stdout="", stderr="")) as run_mock:
             self._start(name="peer-c", kind="claude", pane="w1:pM")
-        cmd = run_mock.call_args[0][0]
+        cmd = _agent_start_cmd(run_mock)
         self.assertEqual(cmd[:6], ["herdr", "agent", "start", "peer-c", "--kind", "claude"])
         self.assertEqual(cmd[6:8], ["--pane", "w1:pM"])
 
@@ -263,7 +466,7 @@ class StartTest(_TmpRootMixin, unittest.TestCase):
                                 return_value=subprocess.CompletedProcess([], 0, stdout="", stderr="")) as run_mock:
             rc = self._start(kind="claude")
         self.assertEqual(rc, 0)
-        cmd = run_mock.call_args[0][0]
+        cmd = _agent_start_cmd(run_mock)
         self.assertIn("--permission-mode", cmd)
         self.assertIn("bypassPermissions", cmd)
 
@@ -272,7 +475,7 @@ class StartTest(_TmpRootMixin, unittest.TestCase):
              mock.patch.object(peer_steward.subprocess, "run",
                                 return_value=subprocess.CompletedProcess([], 0, stdout="", stderr="")) as run_mock:
             self._start(kind="codex")
-        cmd = run_mock.call_args[0][0]
+        cmd = _agent_start_cmd(run_mock)
         self.assertIn("--dangerously-bypass-approvals-and-sandbox", cmd)
 
     def test_default_bypass_prepends_opencode_flag(self):
@@ -280,7 +483,7 @@ class StartTest(_TmpRootMixin, unittest.TestCase):
              mock.patch.object(peer_steward.subprocess, "run",
                                 return_value=subprocess.CompletedProcess([], 0, stdout="", stderr="")) as run_mock:
             self._start(kind="opencode")
-        cmd = run_mock.call_args[0][0]
+        cmd = _agent_start_cmd(run_mock)
         self.assertIn("--auto", cmd)
 
     def test_inherit_prepends_zero_flags(self):
@@ -288,7 +491,7 @@ class StartTest(_TmpRootMixin, unittest.TestCase):
              mock.patch.object(peer_steward.subprocess, "run",
                                 return_value=subprocess.CompletedProcess([], 0, stdout="", stderr="")) as run_mock:
             self._start(kind="claude", permission_mode="inherit")
-        cmd = run_mock.call_args[0][0]
+        cmd = _agent_start_cmd(run_mock)
         self.assertNotIn("bypassPermissions", cmd)
         self.assertNotIn("--permission-mode", cmd)
 
@@ -366,7 +569,7 @@ class StartTest(_TmpRootMixin, unittest.TestCase):
              mock.patch.object(peer_steward.subprocess, "run",
                                 return_value=subprocess.CompletedProcess([], 0, stdout="", stderr="")) as run_mock:
             self._start(kind="claude", agent_args=["--extra-flag"])
-        cmd = run_mock.call_args[0][0]
+        cmd = _agent_start_cmd(run_mock)
         self.assertIn("--extra-flag", cmd)
         self.assertLess(cmd.index("bypassPermissions"), cmd.index("--extra-flag"))
 
@@ -473,11 +676,12 @@ class _WatchMixin(_TmpRootMixin):
         self.calllog = self.tmp_root / "calls.log"
         self.fifo = self.tmp_root / "release.fifo"
         os.mkfifo(self.fifo)
-        self.watch_root = peer_steward.peer_message._ledger_root() / "peer-watches"
+        self.watch_root = peer_steward.peer_message.peer_state_root() / "peer-watches"
 
     def _env(self, mode="idle", session_id="steward-1", with_herdr=True):
         env = dict(os.environ)
         env["AGENT_DISPATCH_JOBS"] = str(self.jobs_path)
+        env["AGENT_PEER_LEDGER_ROOT"] = str(self.tmp_root)
         env["FAKE_HERDR_MODE"] = mode
         env["FAKE_HERDR_CALLLOG"] = str(self.calllog)
         env["FAKE_HERDR_FIFO"] = str(self.fifo)
@@ -499,6 +703,19 @@ class _WatchMixin(_TmpRootMixin):
             if sep:
                 out[key] = value
         return out
+
+    def _directive(self, stdout):
+        """The `parent_next*` fields, read from the directive line only.
+
+        `parent_next_command` holds spaces, so it is the rest of its own line.
+        """
+        for line in stdout.splitlines():
+            if line.startswith("parent_next="):
+                head, _, command = line.partition("parent_next_command=")
+                fields = self._fields(head)
+                fields["parent_next_command"] = command.strip()
+                return fields
+        return {}
 
     def _release(self):
         with open(self.fifo, "w") as fh:
@@ -533,6 +750,54 @@ class _WatchMixin(_TmpRootMixin):
 
 class WatchArmTest(_WatchMixin, unittest.TestCase):
     """A56-1."""
+
+    def test_a_hook_armed_watch_tells_the_caller_to_end_the_turn(self):
+        """Review round 2/3, M-B: the contract function was locked, its wiring
+        was not -- reverting either call site passed every suite."""
+        proc = self._run("watch", "peer-a", "--wake", "hook", env=self._env("idle"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        directive = self._directive(proc.stdout)
+        self.assertEqual(directive.get("parent_next"), "end-turn", proc.stdout)
+        self.assertEqual(directive.get("parent_next_reason"), "carrier-steward-watch")
+        self.assertEqual(directive.get("parent_next_command"), "-")
+
+    def test_a_watch_with_no_carrier_tells_the_caller_to_wait_with_a_bound(self):
+        proc = self._run("watch", "peer-a", "--wake", "none", env=self._env("idle"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        directive = self._directive(proc.stdout)
+        self.assertEqual(directive.get("parent_next"), "bounded-wait", proc.stdout)
+        self.assertEqual(directive.get("parent_next_reason"), "steward-wake-none")
+        command = directive.get("parent_next_command", "")
+        self.assertIn("peer-steward.py join ", command)
+        self.assertIn("--timeout ", command)
+        self.assertNotIn("dispatch-wait", command)
+
+    def test_no_line_the_hook_cannot_arm_from_ever_says_end_turn(self):
+        """The dedupe hit and `rearm` both print from the session, not `watch`.
+
+        Answering `end-turn` there is worst exactly when it is reached: a caller
+        re-runs `watch`/`rearm` *because* it doubts the first arm carried.
+        """
+        first = self._run("watch", "peer-a", "--wake", "hook", env=self._env("held"))
+        self.assertEqual(first.returncode, 0, first.stderr)
+        watch_id = self._fields(first.stdout.splitlines()[0])["watch_id"]
+        self._wait_for_lock(watch_id)
+        for argv in (
+            ("watch", "peer-a", "--wake", "hook"),  # dedupe -> already-armed
+            ("rearm", watch_id),                    # live watcher -> alive
+        ):
+            with self.subTest(argv=argv):
+                proc = self._run(*argv, env=self._env("held"))
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                state = self._fields(proc.stdout.splitlines()[0]).get("state")
+                self.assertIn(state, {"already-armed", "alive"}, proc.stdout)
+                directive = self._directive(proc.stdout)
+                self.assertEqual(
+                    directive.get("parent_next"), "bounded-wait", proc.stdout
+                )
+                self.assertIn("--timeout ", directive.get("parent_next_command", ""))
+        self._release()
+        self._wait_for_receipt(watch_id)
 
     def test_arm_emits_typed_line_immutable_record_and_one_ledger_row(self):
         proc = self._run("watch", "peer-a", "--wake", "hook", env=self._env("held"))
@@ -807,6 +1072,33 @@ class StatusRearmTest(_WatchMixin, unittest.TestCase):
         ack = json.loads((self.watch_root / f"{fields['watch_id']}.ack.json").read_text())
         self.assertEqual(ack["carrier"], "claude-async-rewake")
         self.assertEqual(ack["session_id"], "steward-1")
+
+    def test_a_restarted_watch_line_does_not_claim_the_hook_either(self):
+        """`state=rearmed` — the branch B1-a was originally raised about.
+
+        Review round 4 found the code correct here and nothing asserting it:
+        flipping this branch back to `arms_hook=True` passed all 68 tests.
+        """
+        dead = self._arm(target="peer-dead", mode="held")
+        os.kill(int(dead["pid"]), signal.SIGKILL)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and peer_steward._pid_identity_ok(
+            int(dead["pid"]), dead["pid_start"]
+        ):
+            time.sleep(0.02)
+        proc = self._run("rearm", dead["watch_id"], env=self._env("held"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        head = self._fields(proc.stdout.splitlines()[0])
+        self.assertEqual(head["state"], "rearmed", proc.stdout)
+        directive = self._directive(proc.stdout)
+        self.assertEqual(directive.get("parent_next"), "bounded-wait", proc.stdout)
+        self.assertEqual(
+            directive.get("parent_next_reason"), "steward-line-does-not-arm", proc.stdout
+        )
+        # The wait must join *the new watch*, never the dead one it replaced.
+        self.assertIn(f"join {head['watch_id']}", directive.get("parent_next_command", ""))
+        self.assertNotIn(dead["watch_id"], directive.get("parent_next_command", ""))
+        self._release()
 
     def test_rearm_only_replaces_a_dead_unreceipted_watch(self):
         done = self._arm(mode="idle")
@@ -1321,6 +1613,67 @@ class F100cStewardModeTest(_TmpRootMixin, unittest.TestCase):
         with mock.patch("builtins.print") as print_mock:
             self.assertEqual(peer_steward.main(["steward", "on"]), 1)
         self.assertIn("reason=no-session-identity", print_mock.call_args[0][0])
+
+
+class FromNameTest(_TmpRootMixin, unittest.TestCase):
+    """C-3 — `_from_name` reads Claude via `claude_session_name` (unchanged) and
+    Codex/OpenCode via `tools/fleet/session_registry.py` (B-1), the same lazy
+    `tools/` sys.path trick `peer-message.py:412 steward_marker_roots` uses for
+    non-Fleet consumers. Any other harness, or any failure along the way, is
+    `None` — a name is never guessed."""
+
+    def test_unknown_harness_and_missing_registry_record_are_none(self):
+        self.assertIsNone(peer_steward._from_name("unknown", "sid-1"))
+        with tempfile.TemporaryDirectory() as registry_dir:
+            os.environ["FLEET_SESSION_REGISTRY_DIR"] = registry_dir
+            self.assertIsNone(peer_steward._from_name("codex", "no-such-session"))
+            self.assertIsNone(peer_steward._from_name("opencode", "no-such-session"))
+
+    def test_codex_and_opencode_resolve_via_session_registry(self):
+        with tempfile.TemporaryDirectory() as registry_dir:
+            os.environ["FLEET_SESSION_REGISTRY_DIR"] = registry_dir
+            for harness, pid, sid, name in (
+                ("codex", 111, "codex-sess-1", "hearting-codex-1"),
+                ("opencode", 222, "oc-sess-1", "hearting-oc-1"),
+            ):
+                d = Path(registry_dir) / harness
+                d.mkdir(parents=True)
+                (d / ("%d.json" % pid)).write_text(json.dumps(
+                    {"pid": pid, "sessionId": sid, "name": name, "harness": harness}))
+                self.assertEqual(peer_steward._from_name(harness, sid), name)
+
+
+class FromNameBareSubprocessTest(unittest.TestCase):
+    """C-3 — the lazy `tools/` sys.path insert must work in the actual condition
+    a real herdr-launched `peer-steward.py` subprocess runs under: a cwd outside
+    the repository and no inherited `PYTHONPATH`. `test_importable_with_only_
+    tools_on_sys_path` (B-1) proves this for `session_registry` alone; this
+    proves the full `peer-steward.py::_from_name` codex path reaches it too."""
+
+    def test_from_name_resolves_a_codex_name_in_a_bare_subprocess(self):
+        with tempfile.TemporaryDirectory() as registry_dir, \
+             tempfile.TemporaryDirectory() as outside_cwd:
+            pid = 424242
+            record_dir = Path(registry_dir) / "codex"
+            record_dir.mkdir(parents=True)
+            (record_dir / ("%d.json" % pid)).write_text(json.dumps({
+                "pid": pid, "sessionId": "codex-sess-c3", "name": "hearting-codex-c3",
+                "harness": "codex",
+            }))
+            script = (
+                "import importlib.util\n"
+                "spec = importlib.util.spec_from_file_location('peer_steward', %r)\n"
+                "mod = importlib.util.module_from_spec(spec)\n"
+                "spec.loader.exec_module(mod)\n"
+                "print(mod._from_name('codex', 'codex-sess-c3') or '')\n"
+            ) % str(_HERE / "peer-steward.py")
+            env = dict(os.environ)
+            env.pop("PYTHONPATH", None)
+            env["FLEET_SESSION_REGISTRY_DIR"] = registry_dir
+            proc = subprocess.run([sys.executable, "-c", script], cwd=outside_cwd,
+                                  capture_output=True, text=True, env=env, timeout=10)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "hearting-codex-c3")
 
 
 if __name__ == "__main__":

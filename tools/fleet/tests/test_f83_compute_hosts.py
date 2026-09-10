@@ -460,6 +460,10 @@ class ComputeHostRenderTest(unittest.TestCase):
         self.assertIsNone(processes[2]["owner"])
 
     def test_live_input_is_not_blocked_by_first_gpu_probe(self):
+        # `_loop` publishes pump health into a module global that the hearting
+        # header reads, so this test must restore it or " · refreshed …" leaks
+        # into every later test in the process.
+        self.addCleanup(setattr, render, "_REFRESH_HEALTH", render._REFRESH_HEALTH)
         gpu_entered = threading.Event()
         release = threading.Event()
         getch_called = threading.Event()

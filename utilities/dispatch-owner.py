@@ -65,8 +65,92 @@ _UNIT_REF = re.compile(r"^[a-z-]+/[a-z-]+$")
 _RESERVED_UNITS = {"_kernel/owner", "_kernel/resource"}
 
 
+# Everything the owner tuple needs that a sealed route already states. With
+# `--route-evidence` the caller passes only the prompt; an explicit flag still
+# wins, and one that contradicts a sealed field is refused typed rather than
+# forwarded to a wrapper that would refuse it later with less context.
+_ROUTE_FIELDS = {
+    "--worktree": "cwd", "--slug": "slug", "--capability": "capability",
+    "--capability-mode": "capability_mode", "--intensity": "effective_intensity",
+    "--model-profile": "owner_model_profile",
+}
+_ROUTE_SEALED = {"--worktree", "--capability", "--capability-mode", "--intensity"}
+_HINTS = {
+    "missing-required": "with --route-evidence <route.json> pass only --prompt-file <file> (or --prompt-text); "
+                        "without it: --worktree --slug --capability --capability-mode --qa <level> --intensity --dispatch-depth 1 "
+                        "--worker-type owner --owner <capability> --assigned-contract <capability> "
+                        "--model-profile deep|balanced-deep|balanced|light (top only from a route that seals it)",
+    "route-evidence-arg-mismatch": "omit that flag or pass the route's own value; the route seals it",
+    "route-evidence-direct-route-has-no-owner": "a direct route runs inline; compose --shape solo (quick) or staged to get an owner",
+    "route-evidence-unreadable": "pass the route *file* printed by compose as route_file=, not the route id",
+    "explicit-adapter-outside-route-evidence": "drop --adapter; the route's sealed candidates decide. To change them, recompose: "
+                                               "solo/quick with --children <harness>, staged with --parent-harness <harness>",
+    "route-evidence-candidates-outside-policy": "the route sealed no harness this user's policy admits (configured_candidates= above is empty): "
+                                                "your dispatch-defaults.yaml enables <policy-harnesses> for this model profile. Recompose the route "
+                                                "for one of those (solo/quick: --children <harness>; staged: --parent-harness <harness>), or add the "
+                                                "harness to harnesses.enabled and this profile's quality bands first. This is not a usage limit -- "
+                                                "see eligibility.* above",
+    "no-eligible-route-evidence-candidate": "no sealed candidate is usable: it is usage-limited, gated, or has no positive capacity score "
+                                            "(see eligibility.* and capacity_headroom.* above). Recompose the route for another harness "
+                                            "(solo/quick: --children <harness>; staged: --parent-harness <harness>) or wait for the reset",
+    "no-eligible-candidate": "no configured owner harness is usable: usage-limited, gated, or no positive capacity score "
+                             "(see eligibility.* and capacity_headroom.* above; utilities/usage-check.sh --harness all)",
+    "exactly-one-action-required": "pass exactly one of --dry-run | --register | --start",
+    "owner-tuple-required": "the launchable tuple is --dispatch-depth 1 --worker-type owner|review",
+    "invalid-model-profile": "--model-profile deep|balanced-deep|balanced|light (top only from a route that seals it)",
+    "profile-top-route-required": "drop --model-profile top: the top exception profile is sealed by a route "
+                                  "(compose/compile --profile-demands '{\"__owner__\": …}' --explicit-profiles "
+                                  "'{\"__owner__\": \"top\"}') and reaches the owner through --route-evidence only",
+    "review-worker-unit-required": "--worker-type review needs --unit <catalog persona from roles/units/>",
+    "review-worker-route-evidence-unsupported": "a route node's reviewer is launched by stage dispatch; drop --route-evidence for an ad-hoc review worker",
+    "forbidden-flag": "model, reasoning, effort, variant and completion-delivery are sealed by the profile and route; remove the flag",
+    "explicit-jobs-outside-parent-registry": "drop --jobs: an interactive Claude parent's completion hook trusts only the inherited "
+                                             "AGENT_DISPATCH_JOBS (or the installed canonical registry), so an owner started into another "
+                                             "registry could never wake this session",
+    "canonical-registry-unusable": "the installed canonical registry path exists but is not an absolute, non-symlink "
+                                   "regular file (a symlinked jobs.log?); the parent's completion hook will not read it. "
+                                   "Restore the real file at that path before starting an owner",
+    "inherited-registry-unusable": "AGENT_DISPATCH_JOBS is set but is not an absolute, non-symlink regular file, and the "
+                                   "parent's completion hook reads the SESSION's value, not this command's: changing or unsetting "
+                                   "it for one Bash call starts an owner the parent can never wake. Fix the variable in the "
+                                   "environment the interactive session was started with (or unset it there for the canonical "
+                                   "registry), then start a new session",
+}
+
+
+def hint_for(reason):
+    """One line that says what to type next; empty when no hint is known."""
+    key = str(reason).split(":", 1)[0]
+    return _HINTS.get(key, "")
+
+
 class OwnerError(ValueError):
     pass
+
+
+def _route_defaults(path):
+    """Owner-tuple values a sealed route states; None for fields it lacks."""
+    try:
+        route = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise OwnerError(f"route-evidence-unreadable:{exc}") from exc
+    if not isinstance(route, dict):
+        raise OwnerError("route-evidence-unreadable:not-an-object")
+    if route.get("effective_intensity") == "direct":
+        raise OwnerError("route-evidence-direct-route-has-no-owner")
+    capability = route.get("capability")
+    values = {flag: route.get(key) for flag, key in _ROUTE_FIELDS.items()}
+    values.update({
+        "--dispatch-depth": "1", "--worker-type": "owner",
+        "--owner": capability, "--assigned-contract": capability,
+    })
+    return {flag: (str(value) if value not in (None, "") else None) for flag, value in values.items()}
+
+
+def _same_value(flag, given, sealed):
+    if flag == "--worktree":
+        return _resolved_path(given) == _resolved_path(sealed)
+    return str(given) == str(sealed)
 
 
 def _sealed_owner_context(path):
@@ -258,7 +342,26 @@ def _parse(argv):
             continue
         forwarded.append(arg)
         i += 1
-    missing = sorted(flag for flag in _REQUIRED if not values.get(flag))
+    derived = []
+    required = set(_REQUIRED)
+    # Only a gap opens the route: a caller that spells out the whole tuple is
+    # parsed exactly as before and validated by the binding checks downstream.
+    gaps = [flag for flag in _REQUIRED if not values.get(flag)]
+    if route_evidence and gaps and values.get("--worker-type", "owner") == "owner":
+        for flag, sealed in _route_defaults(route_evidence).items():
+            if values.get(flag):
+                if flag in _ROUTE_SEALED and sealed is not None and not _same_value(flag, values[flag], sealed):
+                    raise OwnerError(f"route-evidence-arg-mismatch:{flag}")
+                continue
+            if sealed is None:
+                continue
+            values[flag] = sealed
+            forwarded.extend((flag, sealed))
+            derived.append(flag)
+        # The wrapper derives --qa from --intensity when it is absent
+        # (CONVENTIONS §1.1); a route-backed launch need not repeat it.
+        required.discard("--qa")
+    missing = sorted(flag for flag in required if not values.get(flag))
     if missing:
         raise OwnerError("missing-required:" + ",".join(missing))
     if len(actions) != 1:
@@ -297,12 +400,17 @@ def _parse(argv):
             raise OwnerError("review-output-must-be-absolute")
     if worker_type == "owner" and values.get("--review-output"):
         raise OwnerError("review-output-owner-forbidden")
-    if values["--model-profile"] not in {"deep", "balanced-deep", "balanced", "light"}:
+    if values["--model-profile"] not in {"deep", "balanced-deep", "balanced", "light", "top"}:
         raise OwnerError("invalid-model-profile")
+    if values["--model-profile"] == "top" and (not route_evidence or "--model-profile" not in derived):
+        # The exception profile is a route's decision (a full demand sealed by
+        # compose/compile), never a flag's: an explicit `--model-profile top`
+        # -- with or without a route -- is refused (top review B1).
+        raise OwnerError("profile-top-route-required")
     # Equal-form required options are forwarded unchanged; split-form options
     # were appended above.  Selector-only --adapter/--route-evidence never
     # cross the boundary.
-    return explicit, values, forwarded, route_evidence
+    return explicit, values, forwarded, route_evidence, derived
 
 
 def _eligible(state):
@@ -338,13 +446,37 @@ def _resolved_path(value):
     return Path(value).expanduser().resolve(strict=False)
 
 
-def _authoritative_jobs(values, env):
-    """Preserve the registry selected by a managed interactive parent.
+def _usable_registry(path):
+    """The hook's own registry predicate (`_validated_jobs`): an absolute,
+    non-symlink regular file. One definition of "usable" for the parent's hook
+    and the selector that starts owners into it (rewake review R4 M1)."""
 
-    A packaged activation root is immutable source, not runtime state.  The
-    managed launcher exports the enrolled registry once; accepting a different
-    depth-1 ``--jobs`` value would split the attempt graph before the selected
-    adapter gets a chance to validate it.
+    if not path:
+        return False
+    candidate = Path(path)
+    return candidate.is_absolute() and not candidate.is_symlink() and candidate.is_file()
+
+
+def _authoritative_jobs(values, env):
+    """The registry a depth-1 owner is started into, under two parent rules.
+
+    Managed interactive Codex parent: the launcher exported the enrolled
+    registry once (a packaged activation root is immutable source, not
+    runtime state); a different explicit ``--jobs`` would split the attempt
+    graph, so it is refused (`managed-parent-registry-immutable`) and a
+    realpath alias of the same file is accepted.
+
+    Interactive Claude parent: its asyncRewake hook trusts exactly one
+    registry -- the inherited `AGENT_DISPATCH_JOBS` when the variable is set
+    (and only if it is an absolute, non-symlink regular file: an unusable
+    value binds nothing there), else the installed canonical registry -- and
+    never a file a receipt names. So an unusable inherited value refuses the
+    launch (`inherited-registry-unusable`), and an explicit ``--jobs`` that is
+    not that trusted file refuses it (`explicit-jobs-outside-parent-registry`)
+    -- before spawn, typed and hinted, instead of the hook refusing after the
+    owner was sealed `claude-parent-runtime` (rewake reviews R3 M1, R4 M1).
+
+    Any other caller keeps the previous behaviour: explicit, else inherited.
     """
 
     explicit = values.get("--jobs", "")
@@ -357,7 +489,35 @@ def _authoritative_jobs(values, env):
         if explicit and _resolved_path(explicit) != _resolved_path(inherited):
             raise OwnerError("managed-parent-registry-immutable")
         return inherited
+    if _caller_harness(env) == "claude":
+        if "AGENT_DISPATCH_JOBS" in env:
+            if not _usable_registry(inherited):
+                raise OwnerError("inherited-registry-unusable")
+            trusted = inherited
+        else:
+            trusted = _canonical_jobs()
+            canonical = Path(trusted) if trusted else None
+            # The hook trusts the canonical file only as a regular file. A
+            # registry that does not exist yet is the ordinary first run (the
+            # wrapper creates it); one that exists as a symlink or a
+            # non-regular file would be written by the wrapper and never
+            # read by the hook (top review M2).
+            if canonical is not None and (canonical.is_symlink() or canonical.exists()) \
+                    and not _usable_registry(trusted):
+                raise OwnerError("canonical-registry-unusable")
+        if explicit and (not trusted or _resolved_path(explicit) != _resolved_path(trusted)):
+            raise OwnerError("explicit-jobs-outside-parent-registry")
     return explicit or inherited
+
+
+def _canonical_jobs():
+    """The installed harness's own registry path, or "" when it cannot be
+    resolved (the caller then refuses rather than guessing)."""
+    try:
+        from dispatch_contract import resolve_agent_home, resolve_dispatch_state_root
+        return str(resolve_dispatch_state_root(resolve_agent_home(), None) / "jobs.log")
+    except Exception:  # noqa: BLE001 -- absence beats a guessed registry
+        return ""
 
 
 def _audit(
@@ -408,13 +568,16 @@ def _audit(
 def _error(reason, configured=(), explicit=None, states=None):
     lines = _audit("unavailable", None, "none", configured, explicit, states or {})
     lines += [f"check=failed", f"reason={reason}", "child_spawned=0"]
+    hint = hint_for(reason)
+    if hint:
+        lines.append(f"hint={hint}")
     print("\n".join(lines))
     return 65
 
 
 def main(argv):
     try:
-        explicit, values, forwarded, route_evidence = _parse(argv)
+        explicit, values, forwarded, route_evidence, derived = _parse(argv)
         jobs = _authoritative_jobs(values, os.environ)
         profile = values["--model-profile"]
         sealed_context = _sealed_owner_context(route_evidence) if route_evidence else None
@@ -440,6 +603,7 @@ def main(argv):
         ):
             raise OwnerError("explicit-adapter-disabled-by-user-policy")
         sealed = sealed_context["harnesses"] if sealed_context else None
+        policy_harnesses = list(configured)
         if sealed is not None:
             if explicit is not None and explicit not in sealed:
                 raise OwnerError("explicit-adapter-outside-route-evidence")
@@ -532,10 +696,24 @@ def main(argv):
                 allocation=allocation, counts=counts, rejected=rejected,
                 capacity=capacity, relief_promoted=relief_promoted,
             )))
-            print("check=failed\nreason=" + (
-                "no-eligible-route-evidence-candidate" if sealed is not None
-                else "no-eligible-candidate"
-            ) + "\nchild_spawned=0")
+            if sealed is not None and not configured:
+                # Nothing was even a candidate: every harness the route sealed
+                # sits outside this user's enabled set and quality bands. The
+                # old answer here was `no-eligible-route-evidence-candidate`,
+                # whose hint blames usage limits, gating, or capacity -- and
+                # the audit above prints `eligibility.<harness>=ok` right next
+                # to it, so the receipt contradicted itself (2026-09-10, a
+                # route sealed for a harness the policy excludes).
+                reason = "route-evidence-candidates-outside-policy"
+                detail = hint_for(reason).replace(
+                    "<policy-harnesses>", ",".join(policy_harnesses) or "none")
+            elif sealed is not None:
+                reason = "no-eligible-route-evidence-candidate"
+                detail = hint_for(reason)
+            else:
+                reason = "no-eligible-candidate"
+                detail = hint_for(reason)
+            print(f"check=failed\nreason={reason}\nchild_spawned=0\nhint={detail}")
             return 65
         wrapper = ROOT / "adapters" / selected / "bin" / "dispatch-headless.py"
         if not os.access(wrapper, os.X_OK):
@@ -555,6 +733,7 @@ def main(argv):
                                   reason=reason, capacity=capacity,
                                   quality_band=quality_band,
                                   relief_promoted=relief_promoted)), flush=True)
+        print(f"route_defaults={','.join(derived) or 'none'}", flush=True)
         child_env = {
             key: value for key, value in os.environ.items() if not _MODEL_ENV.fullmatch(key)
         }

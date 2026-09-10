@@ -42,12 +42,16 @@ class StewardChipTest(unittest.TestCase):
         self.assertEqual(sum(render._dw(t) for t, _k in segs), render._TAG_W)
         self.assertEqual(render._HUE_OF["tag_steward"], ("y", render._A_BOLD))
 
-    def test_untagged_steward_gets_a_star_badge(self):
+    def test_untagged_steward_wears_the_role_mark_not_a_pretend_id(self):
+        """The badge column holds session numbers, so `*` there read as an id the user
+        could not find (2026-09-09: "그 id 가 안뜨는 경우도 있는것 같은데?"). The steward
+        flag is the same glyph this session's relation line already uses."""
         for harness in ("codex", "opencode"):
             with self.subTest(harness=harness):
                 segs = render._session_tag_chip(self._s(harness=harness, steward=True))
-                self.assertEqual(segs[1], ("* ", "tag_steward"))
+                self.assertEqual(segs[1], (render._ICON_STEWARD + " ", "tag_steward"))
                 self.assertEqual(sum(render._dw(t) for t, _k in segs), render._TAG_W)
+                self.assertNotIn("*", "".join(t for t, _k in segs))
 
     def test_non_steward_rows_are_unchanged(self):
         self.assertEqual(render._session_tag_chip(self._s(session_tag="46"))[1], ("46", "tag"))
@@ -171,6 +175,11 @@ class StewardCollectorTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             old = dict(os.environ)
             os.environ["AGENT_DISPATCH_JOBS"] = os.path.join(tmp, "jobs.log")
+            # C-1 moved the peer ledger's writer root off AGENT_DISPATCH_JOBS onto
+            # peer_state_root(); isolating only AGENT_DISPATCH_JOBS leaked this
+            # fixture's records into the real per-user ledger root (reproduced during
+            # C's verification — see handoff-c-peer-ledger.md).
+            os.environ["AGENT_PEER_LEDGER_ROOT"] = os.path.join(tmp, "peer-state")
             os.environ.pop("AGENT_HOME", None)
             try:
                 open(os.environ["AGENT_DISPATCH_JOBS"], "w").close()
@@ -248,6 +257,56 @@ class RuntimeLedgerRootsTest(unittest.TestCase):
             markers = pm.read_steward_markers([a, b])
             self.assertEqual(markers[("codex", "t1")]["updated"], "2026-09-03T02:00:00Z")
             self.assertEqual(pm.read_steward_markers([os.path.join(tmp, "missing")]), {})
+
+
+class StewardReverseIndexTest(unittest.TestCase):
+    """A steward marker records the relation on the STEWARD's side only, so before this
+    the watched session had no reverse field at all (measured 2026-09-09) and the board
+    could not answer "who is watching me". The reverse index is derived from the same
+    evidence entries, never from a second marker."""
+
+    def _enrich(self, sessions, marker_targets):
+        markers = {("claude", "sidP"): {"session_id": "sidP", "targets": marker_targets}}
+        with mock.patch.object(steward, "_peer_message_module") as module:
+            module.return_value.steward_evidence_targets.side_effect = (
+                lambda marker: [dict(entry, session_id=sid)
+                                for sid, entry in marker["targets"].items()])
+            steward.enrich(sessions, markers=markers)
+
+    def test_target_gets_its_supervisor_and_steward_keeps_its_targets(self):
+        parent = Session(harness="claude", pid=1, cwd="/x", slug="p", session_id="sidP")
+        target = Session(harness="codex", pid=2, cwd="/x", slug="t", session_id="sidT")
+        self._enrich([parent, target],
+                     {"sidT": {"harness": "codex", "kind": "watch", "source": "watch"}})
+        self.assertTrue(parent.steward)
+        self.assertEqual([t["session_id"] for t in parent.steward_targets], ["sidT"])
+        self.assertEqual(len(target.steward_parents), 1)
+        self.assertEqual(target.steward_parents[0]["session_id"], "sidP")
+        self.assertEqual(target.steward_parents[0]["harness"], "claude")
+        self.assertIsNone(parent.steward_parents)
+
+    def test_a_session_is_never_its_own_supervisor(self):
+        solo = Session(harness="claude", pid=1, cwd="/x", slug="p", session_id="sidP")
+        self._enrich([solo],
+                     {"sidP": {"harness": "claude", "kind": "watch", "source": "watch"}})
+        self.assertTrue(solo.steward)
+        self.assertIsNone(solo.steward_parents)
+
+    def test_a_resumed_target_still_joins_through_its_alias(self):
+        """The marker names the id the target had BEFORE it resumed; an exact-only join
+        silently drops the relation on both sides."""
+        parent = Session(harness="claude", pid=1, cwd="/x", slug="p", session_id="sidP")
+        target = Session(harness="codex", pid=2, cwd="/x", slug="t", session_id="sidNew",
+                         session_aliases=["sidOld"])
+        self._enrich([parent, target],
+                     {"sidOld": {"harness": "codex", "kind": "watch", "source": "watch"}})
+        self.assertEqual(target.steward_parents[0]["session_id"], "sidP")
+
+    def test_no_markers_leaves_every_field_at_its_default(self):
+        target = Session(harness="codex", pid=2, cwd="/x", slug="t", session_id="sidT")
+        steward.enrich([target], markers={})
+        self.assertFalse(target.steward)
+        self.assertIsNone(target.steward_parents)
 
 
 if __name__ == "__main__":

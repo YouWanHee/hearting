@@ -3,9 +3,13 @@
 ## Dispatch model realization
 
 `deep maker`, `deep reviewer`, `deep editor`, and `deep orchestrator` map to
-`opus`/xhigh. Retained `orchestrator` is the balanced mechanical role and maps to
-`sonnet`/high; it is not an alias for the standard+ dispatch-depth-1 conductor. Fast
-portable roles map to `sonnet`/high. The adapter mapper normalizes case,
+`opus`/xhigh (the shipped deep tier equals the user's runtime mapping, 2026-09-09;
+`fable` is main-session-only — reachable from registered dispatch only through a
+route that sealed the `top` exception profile for its dispatch-depth-1 owner — and
+the capacity cascade is `opus -> sonnet`, which `top` never enters). Retained `orchestrator` is the balanced mechanical role and maps to
+`sonnet`/medium; it is not an alias for the standard+ dispatch-depth-1 conductor. Fast
+portable roles map to `sonnet`/medium. (Both follow `CFG_TIER_LIGHT_EFFORT`; the
+`balanced` profile's `sonnet`/high is the separate route-bound axis.) The adapter mapper normalizes case,
 hyphens, and underscores but accepts no undocumented role aliases.
 
 This adapter preserves the previous Claude Code setting behavior while moving
@@ -168,12 +172,14 @@ main/orchestrator chooses per job and the wrapper only reflects that choice:
   ledger evidence, and the proven-fatal `--disallowedTools` deny still applies in both postures
   (`core/OPERATIONS.md §5.10` "Registered headless permission posture").
 - Direct registered child completion is selected by the parent runtime, not by
-  the child wrapper. An interactive Claude parent receives the successful exact
-  owner-start receipt through `PostToolUse(Bash)` and arms one native
-  `asyncRewake` hook for that owner attempt (and, since SD-122 v56, a second
+  the child wrapper. An interactive Claude parent's `PostToolUse(Bash)` hook
+  identifies the exact owner attempt from the start receipt or the registry row
+  bound to the session (never from the command text) and arms one native
+  `asyncRewake` hook for it, one waiter per attempt (and, since SD-122 v56, a second
   `asyncRewake` hook for an exact steward watch armed by `peer-steward.py watch`). The hook waits for terminal
-  quiescence outside the model and wakes once with an exact harvest command;
-  ordinary Bash calls are silent no-ops, and no Background Bash monitor,
+  quiescence outside the model and wakes once with an exact receipt (a harvest
+  command when one is required); an ordinary Bash call arms nothing unless a
+  fresh or re-armable row of this session is waiting, and no Background Bash monitor,
   `dispatch-wait`, progress recap, or periodic re-arm is created. Immediately
   before rendering, the hook re-reads the exact row and its sealed completion
   evidence: every terminal receipt, success or attention, exits two — Claude
@@ -207,7 +213,8 @@ main/orchestrator chooses per job and the wrapper only reflects that choice:
   registered dispatch-depth-1/2 work. A `_kernel/owner` may therefore be profile-only and
   never needs a stage `worker_mode`. Non-route jobs retain explicit role or
   concrete-model selection. Headless inheritance is rejected because it cannot
-  prove that interactive-main-only `fable` will not leak into a worker.
+  prove that a config-declared interactive-main-only model will not leak into a
+  worker; the shipped list names `fable`, so a headless Fable launch is refused.
 - Dispatch prompts and jobs.log rows must spell out capability, mode, QA,
   intensity, depth, parent slug/session, worker type, model role/profile,
   profile tier/granularity, owner capability, and owner harness. Route-declared
@@ -372,8 +379,11 @@ Behavior personas live in the portable unit catalog `roles/units/` and carry
 portable role names only — they have no Claude `model:` frontmatter. The former
 per-team agent files (plan-team, dev-team, qa-team, and the other five) were
 removed in the unit-catalog migration. The only kernel helper agent under
-`adapters/claude/agents/` is `memory-scout`, whose frontmatter pins the mini
-tier (haiku) as an explicit `check-model-config.py` exemption. Every other
+`adapters/claude/agents/` is `memory-scout`. Unlike the Codex kernel helper (derived
+from `CFG_PROFILE_MEMORY_SCOUT`), this one is hand-authored and pins `haiku` — a model
+**no tier in `config/models.conf` declares**, since the mini tier moved to `sonnet` on
+2026-08-07. It rides a whole-file `check-model-config.py` exemption, so retuning every
+tier leaves it where it is. Read it as an explicit pin, not as "the mini tier". Every other
 native subagent spawn resolves its model through the native-subagent default
 below.
 

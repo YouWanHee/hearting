@@ -6,6 +6,8 @@ from unittest import mock
 ROOT=Path(__file__).resolve().parents[1]
 S=importlib.util.spec_from_file_location("fallback",ROOT/"utilities/stage-dispatch-fallback.py")
 F=importlib.util.module_from_spec(S);S.loader.exec_module(F)
+import sys;sys.path.insert(0,str(ROOT/"utilities"))
+from model_config import parse_config
 
 class CapacityTest(unittest.TestCase):
  def setUp(self):
@@ -106,26 +108,51 @@ class CapacityTest(unittest.TestCase):
     {"child_pid":"1","child_pid_start":"1"})
   self.assertEqual(state,"fail-closed")
   self.assertEqual(fields["reason"],"heartbeat-phase-regression")
+ @staticmethod
+ def shipped_conf(harness):
+  # The shipped adapter file itself, not the user's runtime copy.
+  return parse_config(ROOT/f"adapters/{harness}/config/models.conf")
+ def pin_conf(self,conf):
+  patcher=mock.patch.object(F,"_adapter_models_conf",side_effect=lambda harness:conf)
+  patcher.start();self.addCleanup(patcher.stop)
  def test_capacity_cascade_from_config_and_failover_model_proved(self):
   # config cascade is model-granularity: deep exhausted -> next declared model.
-  # Expectations derive from the cascade itself (efforts are user-tunable defaults).
+  # Expectations derive from the shipped cascade itself (efforts are user-tunable defaults).
   codex=F.capacity_cascade("codex")
   self.assertEqual(F.capacity_cascade_next("codex",codex[0][0]),codex[1])
+  conf=self.shipped_conf("claude");self.pin_conf(conf)
+  declared=[tuple(e.split(":",1)) for e in conf["CFG_TIER_DEEP_FAILOVER_CASCADE"].split()]
+  restricted=conf["CFG_MAIN_SESSION_ONLY_MODELS"].split()
   claude=F.capacity_cascade("claude")
-  self.assertEqual(claude[0],("opus","high"))
-  self.assertEqual(F.capacity_cascade_next("claude","fable"),claude[0])
+  self.assertEqual(claude,[d for d in declared if d[0] not in restricted])
+  self.assertGreaterEqual(len(claude),2)
+  # 2026-09-09 shipped default == user runtime: fable is main-session-only, so the
+  # cascade head is the deep tier model (opus) and the walk is opus->sonnet.
+  self.assertEqual(claude[0][0],conf["CFG_TIER_DEEP_MODEL"]);self.assertEqual(restricted,["fable"])
+  self.assertEqual([m for m,_ in claude],["opus","sonnet"])
+  for i,(model,paired) in enumerate(claude):
+   nxt=claude[i+1] if i+1<len(claude) else None
+   self.assertEqual(F.capacity_cascade_next("claude",model),nxt)
+   self.assertEqual(F.capacity_cascade_next("claude",f"claude-{model}-5"),nxt)  # concrete id form
+   # every declared cascade member is proved by declaration with its own paired effort
+   self.assertTrue(F.allowed_capacity_settings("claude",model,paired))
+   self.assertFalse(F.allowed_capacity_settings("claude",model,"not-a-real-effort"))
+ def test_main_only_model_never_enters_cascade_or_capacity_settings(self):
+  # A config that declares a main-only model keeps it out of the cascade and out
+  # of every capacity setting. The shipped default declares fable too, so the
+  # second block pins another alias: the filter reads the config, not a name.
+  conf={**self.shipped_conf("claude"),"CFG_MAIN_SESSION_ONLY_MODELS":"fable"};self.pin_conf(conf)
+  claude=F.capacity_cascade("claude");models=[m for m,_ in claude]
+  self.assertNotIn("fable",models);self.assertEqual(models,["opus","sonnet"])
+  self.assertEqual(F.capacity_cascade_next("claude","fable"),claude[0])  # legacy row: first eligible
   self.assertEqual(F.capacity_cascade_next("claude","claude-fable-5"),claude[0])
-  self.assertEqual(F.capacity_cascade_next("claude",claude[0][0]),claude[1])
-  self.assertEqual(F.capacity_cascade_next("claude","claude-opus-4-8"),claude[1])
-  self.assertIsNone(F.capacity_cascade_next("claude",claude[-1][0]))  # end of cascade
-  # failover-only model (opus) is proved by cascade declaration, not model-map.
-  models=[m for m,_ in claude]
-  self.assertIn("opus",models)
-  self.assertNotIn("fable",models)
-  self.assertTrue(F.allowed_capacity_settings("claude",*claude[models.index("opus")]))
   self.assertFalse(F.allowed_capacity_settings("claude","fable","xhigh"))
   self.assertFalse(F.allowed_capacity_settings("claude","claude-fable-5","xhigh"))
-  self.assertFalse(F.allowed_capacity_settings("claude","opus","not-a-real-effort"))
+  self.assertTrue(F.allowed_capacity_settings("claude",*claude[0]))
+  self.pin_conf({**self.shipped_conf("claude"),"CFG_MAIN_SESSION_ONLY_MODELS":"fable opus"})
+  narrowed=F.capacity_cascade("claude")
+  self.assertEqual([m for m,_ in narrowed],["sonnet"])
+  self.assertFalse(F.allowed_capacity_settings("claude","opus","xhigh"))
  def test_unset_capacity_model_derives_alternative_from_cascade(self):
   self.args.capacity_model=None  # no explicit alternative -> derive from config cascade
   cascade=F.capacity_cascade("codex");self.assertGreaterEqual(len(cascade),2)
@@ -140,19 +167,32 @@ class CapacityTest(unittest.TestCase):
   rows=F.registry_rows(self.jobs,"r","test")
   self.assertEqual(rows[-1]["model"],expected_pair[0])
   self.assertEqual(rows[-1]["cooled_model"],failed_model)
- def test_legacy_fable_capacity_retry_launches_first_eligible_opus_candidate(self):
+ def capacity_retry_from(self,failed_model,expected):
   self.args.capacity_model=None;self.args.capacity_effort=None
   self.row={**self.row,"child_harness":"claude"}
-  self.failed={"attempt_id":"att-initial0001","model":"claude-fable-5"}
+  self.failed={"attempt_id":"att-initial0001","model":failed_model}
   self.jobs.write_text("2026-07-16T00:00:00Z\tdone\t/r\t/w\ts\t"
-   "route_id=r,route_node=test,attempt_id=att-initial0001,model=claude-fable-5,"
+   f"route_id=r,route_node=test,attempt_id=att-initial0001,model={failed_model},"
    "child_harness=claude,note=dead-capacity\n")
-  completed=subprocess.CompletedProcess([],0,stdout="check=ok\nmodel=opus\nearly_death=-\nduplicate_attempt=0\n",stderr="")
+  completed=subprocess.CompletedProcess([],0,stdout=f"check=ok\nmodel={expected[0]}\nearly_death=-\nduplicate_attempt=0\n",stderr="")
   with mock.patch.object(F,"wrapper_command",return_value=["fake"]) as command,\
        mock.patch.object(F.subprocess,"run",return_value=completed):
    state,fields,_=F.capacity_retry(self.args,self.route,self.node,self.row,1,self.failed,[])
-  self.assertEqual((state,fields["model"]),("success","opus"))
-  self.assertEqual(command.call_args.args[6],("opus","high"))
+  self.assertEqual((state,fields["model"]),("success",expected[0]))
+  self.assertEqual(command.call_args.args[6],expected)
+ def test_deep_tier_capacity_death_retries_on_the_next_cascade_model(self):
+  # shipped default: the deep tier model heads the cascade, so its capacity death
+  # walks one model down (opus -> sonnet), never up into a main-only model.
+  conf=self.shipped_conf("claude");self.pin_conf(conf)
+  cascade=F.capacity_cascade("claude")
+  self.assertEqual(cascade[0][0],conf["CFG_TIER_DEEP_MODEL"])
+  self.capacity_retry_from(f"claude-{cascade[0][0]}-5",cascade[1])
+ def test_legacy_main_only_fable_retry_launches_first_eligible_candidate(self):
+  # migration-only: a row recorded under a main-only policy resumes at the first
+  # eligible cascade member without admitting fable into the cascade.
+  self.pin_conf({**self.shipped_conf("claude"),"CFG_MAIN_SESSION_ONLY_MODELS":"fable"})
+  cascade=F.capacity_cascade("claude");self.assertNotIn("fable",[m for m,_ in cascade])
+  self.capacity_retry_from("claude-fable-5",cascade[0])
  def test_balanced_all_gated_stage_candidates_choose_maximum_headroom(self):
   import importlib.util
   spec=importlib.util.spec_from_file_location("capacity",ROOT/"utilities/harness-capacity.py")
@@ -163,4 +203,17 @@ class CapacityTest(unittest.TestCase):
    {"claude":0,"codex":0,"opencode":0}, ["claude","codex","opencode"],
    {"claude":9,"codex":4,"opencode":1}, strategy="balanced")
   self.assertEqual((chosen,band),("claude","primary"))
+ def test_top_profile_never_fails_over_and_astra_never_enters_capacity_settings(self):
+  # SD-59 keeps the top exception profile out of the cascade in both directions.
+  self.args.capacity_model=None;self.args.capacity_reasoning=None
+  node={**self.node,"model_profile":"top"};attempts=[]
+  with mock.patch.object(F,"wrapper_command",return_value=["fake"]) as launched:
+   state,fields,reason=F.capacity_retry(self.args,self.route,node,self.row,1,self.failed,attempts)
+  self.assertEqual((state,fields,reason),("descend",{},"capacity-alternative-top-profile"))
+  self.assertTrue(attempts and attempts[0].endswith("capacity-alternative-top-profile"));launched.assert_not_called()
+  # the codex key (parity, 2026-09-10) keeps a hyphenated top model out of every capacity setting
+  conf=self.shipped_conf("codex");self.assertEqual(conf["CFG_MAIN_SESSION_ONLY_MODELS"].split(),["gpt-6-astra"])
+  self.assertNotIn("gpt-6-astra",[m for m,_ in F.capacity_cascade("codex")])
+  self.assertFalse(F.allowed_capacity_settings("codex","gpt-6-astra","xhigh"))
+  self.assertEqual(F.capacity_cascade_next("codex","gpt-6-astra"),F.capacity_cascade("codex")[0])
 if __name__=="__main__":unittest.main()

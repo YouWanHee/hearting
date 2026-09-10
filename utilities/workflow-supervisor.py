@@ -30,6 +30,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -44,6 +45,7 @@ import workflow_state as WS  # noqa: E402
 import resource_run_registry as RR  # noqa: E402
 import dispatch_pending_delivery as PENDING  # noqa: E402
 import frame_interview as INTERVIEW  # noqa: E402
+import human_gate_receipt as HUMAN_GATE  # noqa: E402
 
 ARMED_SCHEMA_VERSION = 1
 PREDECESSOR_KINDS = ("resource", "registered")
@@ -107,8 +109,21 @@ def load_route(path):
     return route
 
 
-def ledger_for(route):
-    return WS.WorkflowLedger(route["route_id"], route.get("route_hash", ""))
+def ledger_for(route, jobs=None):
+    return WS.WorkflowLedger(route["route_id"], route.get("route_hash", ""), jobs=jobs)
+
+
+def ledger_metadata(jobs=None, ledger=None):
+    root, source = WS.ledger_root_for(jobs)
+    selected = None
+    if source == "explicit-jobs":
+        selected = jobs
+    elif source == "AGENT_DISPATCH_JOBS":
+        selected = os.environ.get("AGENT_DISPATCH_JOBS")
+    return {"workflow_root": str(root),
+            "ledger_root": str(ledger.root) if ledger is not None else str(root),
+            "ledger_root_source": source,
+            "jobs_path": str(Path(selected).expanduser().resolve(strict=True)) if selected else None}
 
 
 def armed_dir(ledger):
@@ -337,7 +352,7 @@ def cmd_arm(args):
         "declared_outputs": list(node.get("outputs") or []),
         "armed_at": WS.now_iso(),
     }
-    ledger = ledger_for(route)
+    ledger = ledger_for(route, getattr(args, "jobs", None))
     with ledger.lock():
         armed_dir(ledger).mkdir(parents=True, exist_ok=True)
         target = armed_dir(ledger) / f"{args.node}.json"
@@ -352,7 +367,8 @@ def cmd_arm(args):
         # failure an illegal transition.
         if ledger.state()["workflow_state"] == "READY":
             ledger.set_workflow_state("RUNNING", evidence={"armed": args.node}, actor="arm")
-    print(json.dumps({"armed": args.node, "successors": successors,
+    print(json.dumps({"armed": args.node, **ledger_metadata(getattr(args, "jobs", None), ledger),
+                      "successors": successors,
                       "continuation": kind}, sort_keys=True))
     return 0
 
@@ -494,9 +510,9 @@ def poll_once(route, ledger):
 
 def cmd_poll(args):
     route = load_route(args.route)
-    ledger = ledger_for(route)
+    ledger = ledger_for(route, getattr(args, "jobs", None))
     results = poll_once(route, ledger)
-    print(json.dumps({"route_id": route["route_id"],
+    print(json.dumps({"route_id": route["route_id"], **ledger_metadata(getattr(args, "jobs", None), ledger),
                       "workflow_state": ledger.state()["workflow_state"],
                       "results": results}, sort_keys=True))
     return 0
@@ -504,7 +520,7 @@ def cmd_poll(args):
 
 def cmd_watch(args):
     route = load_route(args.route)
-    ledger = ledger_for(route)
+    ledger = ledger_for(route, getattr(args, "jobs", None))
     interval = max(1.0, float(args.interval))
     deadline = time.monotonic() + min(max(1.0, float(args.max)), MAX_WATCH_SECONDS)
     last = []
@@ -518,11 +534,15 @@ def cmd_watch(args):
                for row in last) and last:
             break
         if time.monotonic() >= deadline:
-            print(json.dumps({"route_id": route["route_id"], "timeout": True,
+            print(json.dumps({"route_id": route["route_id"],
+                              **ledger_metadata(getattr(args, "jobs", None), ledger),
+                              "timeout": True,
                               "workflow_state": state, "results": last}, sort_keys=True))
             return 3
         time.sleep(interval)
-    print(json.dumps({"route_id": route["route_id"], "timeout": False,
+    print(json.dumps({"route_id": route["route_id"],
+                      **ledger_metadata(getattr(args, "jobs", None), ledger),
+                      "timeout": False,
                       "workflow_state": ledger.state()["workflow_state"],
                       "results": last}, sort_keys=True))
     return 0
@@ -530,11 +550,18 @@ def cmd_watch(args):
 
 def cmd_gate(args):
     route = load_route(args.route)
-    ledger = ledger_for(route)
+    if args.block and not getattr(args, "jobs", None) \
+            and os.environ.get("AGENT_DISPATCH_REGISTERED_WORKER") == "1" \
+            and os.environ.get("AGENT_HARNESS", "codex").lower() == "codex":
+        raise SupervisorError(
+            "human-gate-jobs-required: Codex strict gate --block requires explicit --jobs"
+        )
+    ledger = ledger_for(route, getattr(args, "jobs", None))
     gates = {row["gate"]: row for row in (route.get("human_gate_bindings") or [])}
     if args.gate not in gates:
         raise SupervisorError(f"route declares no human gate {args.gate!r}")
-    payload = {"gate": args.gate}
+    payload = {"gate": args.gate,
+               **ledger_metadata(getattr(args, "jobs", None), ledger)}
     with ledger.lock():
         if args.release:
             state = ledger.state()["workflow_state"]
@@ -589,7 +616,7 @@ def cmd_gate(args):
                                 "interview": current["interview"],
                                 "questions": current["questions"],
                                 "artifact": current["artifact"],
-                                "await_command": await_release_command(args.route, args.gate),
+                                "await_command": await_release_command(args.route, args.gate, getattr(args, "jobs", None)),
                                 "workflow_state": ledger.state()["workflow_state"]})
                 print(json.dumps(payload, sort_keys=True))
                 return 0
@@ -628,6 +655,9 @@ def cmd_gate(args):
                 gates[args.gate], interview, args.artifact)
             record_path, created = create_gate_delivery(
                 route, args.gate, args.artifact, jobs_path, epoch,
+                route_path=args.route, release_authority=release_authority,
+                interview=interview is not None,
+                questions=len(interview.get("questions") or []) if interview is not None else 0,
             )
             try:
                 # `artifact` rides in the journal so every later reader -- the
@@ -652,7 +682,7 @@ def cmd_gate(args):
                             "interview": interview is not None,
                             "questions": len(interview.get("questions") or []) if interview is not None else 0,
                             "release_authority": release_authority,
-                            "await_command": await_release_command(args.route, args.gate)})
+                            "await_command": await_release_command(args.route, args.gate, getattr(args, "jobs", None))})
             action = "blocked"
     payload.update({"action": action, "workflow_state": ledger.state()["workflow_state"]})
     print(json.dumps(payload, sort_keys=True))
@@ -677,7 +707,9 @@ def cmd_gate(args):
 # The recipient kinds whose carriers were actually taught `human-gate:` (v59).
 # One kind, two carriers: asyncRewake and the UserPromptSubmit sweep both
 # deliver to a `claude-parent-runtime` recipient.
-GATE_CARRIER_KINDS = frozenset({"claude-parent-runtime"})
+GATE_CARRIER_KINDS = frozenset({
+    "claude-parent-runtime", "codex-managed-gateway",
+})
 
 GATE_SESSION_GENERATION = "unsupported"
 GATE_SESSION_GENERATION_SUPPORTED = "0"
@@ -742,13 +774,9 @@ def gate_recipient(route, jobs_path):
     if recipient_kind not in PENDING.RECIPIENT_KINDS:
         raise SupervisorError(f"gate-recipient-unresolved: recipient kind {recipient_kind!r}")
     if recipient_kind not in GATE_CARRIER_KINDS:
-        # Only the two Claude carriers learned the `human-gate:` vocabulary in
-        # v59. `utilities/codex-managed-gateway.py` rejects this receipt on three
-        # counts (readiness, required_action, reason), so writing the record for a
-        # Codex or OpenCode parent produces something that can never be delivered
-        # AND poisons that session's delivery pass. Refuse loudly instead, and
-        # keep the refusal typed so the caller can act on it. Extending the other
-        # two vocabularies is SD-OPEN-33; until then this is the honest boundary.
+        # A carrier may be selected only after its receipt vocabulary and live
+        # recipient proof exist. OpenCode and the legacy Codex stop hook still do
+        # not carry this contract and therefore fail closed here.
         raise SupervisorError(
             "gate-carrier-unsupported: no human-gate carrier for recipient kind "
             f"{recipient_kind!r} (SD-OPEN-33); supported: "
@@ -780,7 +808,7 @@ def existing_gate_delivery(route, gate, jobs):
     Reports `delivery_created: False` and never allocates a new raise epoch, so
     one raise keeps one record.
     """
-    ledger = ledger_for(route)
+    ledger = ledger_for(route, jobs)
     epoch = max(gate_raise_epoch(ledger, gate) - 1, 0)
     try:
         jobs_path = Path(jobs) if jobs else default_jobs_path()
@@ -870,7 +898,10 @@ def gate_receipt(*, attempt_id, jobs_path, gate, artifact, harness):
     }
 
 
-def create_gate_delivery(route, gate, artifact, jobs_path, epoch):
+def create_gate_delivery(
+    route, gate, artifact, jobs_path, epoch, *, route_path,
+    release_authority, interview, questions,
+):
     """Write the one durable record a gate transition owes its depth-0 session.
 
     Returns `(record_path, created)`. Raises `SupervisorError` on any refusal --
@@ -878,13 +909,55 @@ def create_gate_delivery(route, gate, artifact, jobs_path, epoch):
     without a way to reach a person.
     """
     recipient_key, recipient_kind, attempt_id, harness = gate_recipient(route, jobs_path)
-    receipt = gate_receipt(
-        attempt_id=attempt_id, jobs_path=jobs_path, gate=gate,
-        artifact=artifact, harness=harness,
-    )
     delivery_id = gate_delivery_id(
         recipient_key, route["route_id"], gate, attempt_id, epoch
     )
+    route_node = _gate_route_node(route, gate)
+    if recipient_kind == HUMAN_GATE.RECIPIENT_KIND:
+        control = os.environ.get("AGENT_CODEX_MANAGED_CONTROL_SOCKET")
+        if not control:
+            raise SupervisorError("gate-carrier-unavailable: managed control socket missing")
+        try:
+            capability = HUMAN_GATE.probe_consumer(
+                Path(control), expected_thread_id=recipient_key
+            )
+        except HUMAN_GATE.HumanGateReceiptError as exc:
+            raise SupervisorError(f"gate-carrier-unavailable: {exc}") from exc
+        owner = _owner_row(_registry_rows(jobs_path), route["route_id"])
+        metadata = owner["meta"] if owner is not None else {}
+        sealed_batch_id = metadata.get("managed_sealed_batch_id") or ""
+        if (
+            owner is None or owner["status"] not in {"open", "running"}
+            or metadata.get("attempt_id") != attempt_id
+            or not sealed_batch_id
+        ):
+            raise SupervisorError("gate-carrier-unavailable: live sealed owner missing")
+        try:
+            receipt = HUMAN_GATE.make_receipt(
+                route_file=Path(route_path).resolve(strict=False), route=route,
+                route_node=route_node, gate=gate, gate_epoch=epoch + 1,
+                owner_attempt_id=attempt_id, sealed_batch_id=sealed_batch_id,
+                jobs=Path(jobs_path).resolve(strict=False),
+                recipient_thread_id=recipient_key,
+                recipient_epoch=capability["epoch"], artifact_path=Path(artifact),
+                release_authority=release_authority, interview=bool(interview),
+                questions=int(questions), pending_delivery_id=delivery_id,
+            )
+        except HUMAN_GATE.HumanGateReceiptError as exc:
+            raise SupervisorError(f"gate-delivery-refused: {exc}") from exc
+        session_generation = str(capability["epoch"])
+        generation_supported = "1"
+        receipt_digest = HUMAN_GATE.digest(receipt)
+        row_revision = f"human-gate:{gate}:{epoch + 1}"
+    else:
+        receipt = gate_receipt(
+            attempt_id=attempt_id, jobs_path=jobs_path, gate=gate,
+            artifact=artifact, harness=harness,
+        )
+        session_generation = GATE_SESSION_GENERATION
+        generation_supported = GATE_SESSION_GENERATION_SUPPORTED
+        receipt_digest = PENDING._canonical_receipt_digest(receipt)
+        row_revision = f"human-gate:{gate}"
     root = Path(jobs_path).resolve(strict=False).parent
     path = PENDING.record_path(root, recipient_key, delivery_id)
     # Reading existence before `create` was a TOCTOU, and holding
@@ -905,15 +978,15 @@ def create_gate_delivery(route, gate, artifact, jobs_path, epoch):
             recipient_kind=recipient_kind,
             recipient_key=recipient_key,
             delivery_id=delivery_id,
-            session_generation=GATE_SESSION_GENERATION,
-            session_generation_supported=GATE_SESSION_GENERATION_SUPPORTED,
+            session_generation=session_generation,
+            session_generation_supported=generation_supported,
             attempt_ids=[attempt_id],
             parent_attempt_id=attempt_id,
             route_id=route["route_id"],
-            route_node=_gate_route_node(route, gate),
+            route_node=route_node,
             receipt=receipt,
-            receipt_digest=PENDING._canonical_receipt_digest(receipt),
-            row_revisions={attempt_id: f"human-gate:{gate}"},
+            receipt_digest=receipt_digest,
+            row_revisions={attempt_id: row_revision},
         )
     except PENDING.PendingDeliveryError as exc:
         raise SupervisorError(f"gate-delivery-refused: {exc}") from exc
@@ -1069,7 +1142,7 @@ def retire_gate_delivery(route, gate, jobs):
         # already committed by the time this runs, so a `WorkflowStateError` from
         # reading the ledger would abort the CLI with no payload and leave a retry
         # failing with "workflow is RUNNING". Retirement is best-effort by design.
-        ledger = ledger_for(route)
+        ledger = ledger_for(route, jobs)
         highest = gate_raise_epoch(ledger, gate)
     except Exception:
         return None
@@ -1211,7 +1284,7 @@ def cmd_release(args):
     performs both, atomically, inside one `ledger.lock()`.
     """
     route = load_route(args.route)
-    ledger = ledger_for(route)
+    ledger = ledger_for(route, getattr(args, "jobs", None))
     gates = {row["gate"]: row for row in (route.get("human_gate_bindings") or [])}
     if args.gate not in gates:
         raise SupervisorError(f"route declares no human gate {args.gate!r}")
@@ -1301,6 +1374,7 @@ def cmd_release(args):
         # re-arm its wait on this route's owner from the release output alone,
         # even when the command spelled the route through a shell variable.
         payload["route_id"] = route["route_id"]
+        payload.update(ledger_metadata(getattr(args, "jobs", None), ledger))
         record_gate_release(route, args.route, gate=args.gate, decision=args.decision,
                             released_by=actor, actor_kind=actor_kind, answers=answers)
         retire_gate_delivery(route, args.gate, args.jobs)
@@ -1396,9 +1470,12 @@ DEFAULT_AWAIT_MAX_SECONDS = 110.0   # one foreground Bash call in an owner turn
 MAX_AWAIT_SECONDS = 600.0
 
 
-def await_release_command(route_path, gate):
-    return (f"python3 <agent-home>/utilities/workflow-supervisor.py await-release "
-            f"--route {route_path} --gate {gate} --max {int(DEFAULT_AWAIT_MAX_SECONDS)}")
+def await_release_command(route_path, gate, jobs=None):
+    command = (f"python3 <agent-home>/utilities/workflow-supervisor.py await-release "
+               f"--route {shlex.quote(str(route_path))} --gate {shlex.quote(str(gate))}")
+    if jobs:
+        command += f" --jobs {shlex.quote(str(jobs))}"
+    return command + f" --max {int(DEFAULT_AWAIT_MAX_SECONDS)}"
 
 
 def cmd_await_release(args):
@@ -1408,13 +1485,14 @@ def cmd_await_release(args):
         print(json.dumps({"route": str(args.route), "gate": args.gate,
                           "status": "error", "reason": "route-unreadable"}, sort_keys=True))
         raise
-    ledger = ledger_for(route)
+    ledger = ledger_for(route, getattr(args, "jobs", None))
     gates = {row["gate"]: row for row in (route.get("human_gate_bindings") or [])}
     if args.gate not in gates:
         # Every refusal of this surface prints one typed JSON line on stdout
         # before the exit-64 prose (review round 1, minor 6): an owner script
         # branches on `reason`, not on the message.
         print(json.dumps({"route_id": route["route_id"], "gate": args.gate,
+                          **ledger_metadata(getattr(args, "jobs", None), ledger),
                           "status": "error", "reason": "gate-undeclared"}, sort_keys=True))
         raise SupervisorError(f"route declares no human gate {args.gate!r}")
     interval = max(1.0, float(args.interval))
@@ -1428,6 +1506,7 @@ def cmd_await_release(args):
         status = resolution["status"]
         if status == "not-raised":
             print(json.dumps({"route_id": route["route_id"], "gate": args.gate,
+                              **ledger_metadata(getattr(args, "jobs", None), ledger),
                               "status": "not-raised", "reason": "gate-never-raised"},
                              sort_keys=True))
             raise SupervisorError(
@@ -1439,6 +1518,7 @@ def cmd_await_release(args):
         time.sleep(min(interval, max(0.0, deadline - time.monotonic())))
     payload = {
         "route_id": route["route_id"], "gate": args.gate, "status": status,
+        **ledger_metadata(getattr(args, "jobs", None), ledger),
         "epoch": resolution["epoch"], "waited_seconds": round(time.monotonic() - started, 1),
         "released_by": resolution["released_by"], "actor_kind": resolution["actor_kind"],
         "artifact": resolution["artifact"], "answers": resolution["answers"],
@@ -1543,7 +1623,7 @@ def _stage_projection(route, node_states):
 
 def cmd_status(args):
     route = load_route(args.route)
-    ledger = ledger_for(route)
+    ledger = ledger_for(route, getattr(args, "jobs", None))
     state = ledger.state()
     armed = read_armed(ledger)
     terminal_nodes = WS.route_terminal_nodes(route)
@@ -1582,7 +1662,7 @@ def cmd_status(args):
                   for node, row in armed.items()},
         "claims": ledger.claims(),
         "resource_children": resource_children(route, ledger),
-        "ledger_root": str(ledger.root),
+        **ledger_metadata(getattr(args, "jobs", None), ledger),
     }
     if args.json:
         print(json.dumps(payload, sort_keys=True, indent=2))
@@ -1604,7 +1684,7 @@ def cmd_status(args):
 
 def cmd_complete(args):
     route = load_route(args.route)
-    ledger = ledger_for(route)
+    ledger = ledger_for(route, getattr(args, "jobs", None))
     terminal_nodes = WS.route_terminal_nodes(route)
     if not terminal_nodes:
         raise SupervisorError("route declares no terminal node")
@@ -1614,6 +1694,7 @@ def cmd_complete(args):
         state = ledger.state()
         if unproven:
             print(json.dumps({"complete": False, "reason": "terminal-gate-unproven",
+                              **ledger_metadata(getattr(args, "jobs", None), ledger),
                               "unproven": unproven,
                               "workflow_state": state["workflow_state"]}, sort_keys=True))
             return 3
@@ -1626,8 +1707,145 @@ def cmd_complete(args):
                                       actor="complete")
         ledger.set_workflow_state("COMPLETE", evidence={"terminal_gates": gates},
                                   actor="complete")
-    print(json.dumps({"complete": True, "terminal_nodes": terminal_nodes,
+    print(json.dumps({"complete": True, **ledger_metadata(getattr(args, "jobs", None), ledger),
+                      "terminal_nodes": terminal_nodes,
                       "workflow_state": ledger.state()["workflow_state"]}, sort_keys=True))
+    return 0
+
+
+def cmd_recover_gate_delivery(args):
+    """Preview, or explicitly apply, one exact unreleasable gate expiry."""
+    route = load_route(args.route)
+    raw_jobs_path = Path(args.jobs).expanduser()
+    try:
+        # Use the same authority validation as every workflow reader/writer;
+        # importantly, inspect the caller's spelling before resolving it so a
+        # symlink cannot disappear into an apparently regular target.
+        WS.ledger_root_for(raw_jobs_path)
+    except WS.WorkflowStateError as exc:
+        raise SupervisorError(
+            f"gate-delivery-recovery-refused: {exc}"
+        ) from exc
+    jobs_path = raw_jobs_path.resolve(strict=True)
+    if args.raise_epoch < 1:
+        raise SupervisorError("gate-delivery-recovery-refused: raise-epoch-invalid")
+    rows = _registry_rows(jobs_path)
+    latest = {}
+    for row in rows:
+        attempt_id = row["meta"].get("attempt_id")
+        if attempt_id:
+            latest[attempt_id] = row
+    owner = latest.get(args.source_attempt_id)
+    if owner is None:
+        raise SupervisorError("gate-delivery-recovery-refused: source-attempt-missing")
+    meta = owner["meta"]
+    if (
+        owner["status"] != "done" or meta.get("dispatch_depth") != "1"
+        or meta.get("worker_type") != "owner"
+        or meta.get("registered_worker") != "1"
+        or meta.get("execution_surface") != "registered-headless"
+    ):
+        raise SupervisorError("gate-delivery-recovery-refused: source-owner-not-terminal")
+    if route["route_id"] not in (meta.get("owner_route_id"), meta.get("route_id")):
+        raise SupervisorError("gate-delivery-recovery-refused: source-route-mismatch")
+    if meta.get("owner_route_hash") and meta["owner_route_hash"] != route.get("route_hash"):
+        raise SupervisorError("gate-delivery-recovery-refused: source-route-hash-mismatch")
+    if meta.get("owner_route_file") and Path(meta["owner_route_file"]).resolve(strict=False) \
+            != Path(args.route).resolve(strict=False):
+        raise SupervisorError("gate-delivery-recovery-refused: source-route-file-mismatch")
+    recipient_key = meta.get("parent_sid") or ""
+    kind = meta.get("parent_completion_delivery") or ""
+    if recipient_key != args.recipient or kind not in PENDING.RECIPIENT_KINDS:
+        raise SupervisorError("gate-delivery-recovery-refused: recipient-or-kind-mismatch")
+    for attempt_id, row in latest.items():
+        other = row["meta"]
+        if attempt_id == args.source_attempt_id or row["status"] == "done":
+            continue
+        if other.get("dispatch_depth") == "1" and route["route_id"] in (
+            other.get("owner_route_id"), other.get("route_id")
+        ):
+            raise SupervisorError("gate-delivery-recovery-refused: route-owner-still-live")
+    expected_id = gate_delivery_id(recipient_key, route["route_id"], args.gate,
+                                    args.source_attempt_id, args.raise_epoch - 1)
+    if expected_id != args.delivery_id:
+        raise SupervisorError("gate-delivery-recovery-refused: delivery-id-mismatch")
+    ledger = ledger_for(route, jobs_path)
+    resolution = WS.human_gate_resolution(ledger.journal(), args.gate)
+    if resolution["status"] == "not-raised" or resolution["epoch"] != args.raise_epoch:
+        raise SupervisorError("gate-delivery-recovery-refused: raise-epoch-mismatch")
+    current_gate = currently_blocked_gate(ledger)
+    if current_gate not in (None, args.gate):
+        raise SupervisorError("gate-delivery-recovery-refused: different-live-gate")
+    root = jobs_path.parent
+    record = PENDING.read(root, recipient_key, args.delivery_id)
+    if record is None:
+        raise SupervisorError("gate-delivery-recovery-refused: delivery-missing")
+    receipt = record.get("receipt")
+    if not isinstance(receipt, dict):
+        raise SupervisorError("gate-delivery-recovery-refused: receipt-invalid")
+    if receipt.get("kind") == HUMAN_GATE.KIND:
+        try:
+            normalized = HUMAN_GATE.validate_receipt(
+                receipt, jobs=jobs_path, expected_thread_id=recipient_key,
+                expected_epoch=int(record.get("session_generation") or 0),
+                expected_attempts={args.source_attempt_id},
+                expected_sealed_batch_id=(meta.get("managed_sealed_batch_id")
+                                          or receipt.get("sealed_batch_id")),
+                validate_live=False,
+            )
+            HUMAN_GATE.validate_digest(normalized, record.get("receipt_digest"))
+        except (HUMAN_GATE.HumanGateReceiptError, ValueError) as exc:
+            raise SupervisorError(
+                "gate-delivery-recovery-refused: strict-receipt-invalid"
+            ) from exc
+        if (
+            normalized.get("route_id") != route["route_id"]
+            or normalized.get("route_hash") != route.get("route_hash")
+            or normalized.get("gate") != args.gate
+            or normalized.get("gate_epoch") != args.raise_epoch
+            or normalized.get("owner_attempt_id") != args.source_attempt_id
+            or normalized.get("pending_delivery_id") != args.delivery_id
+            or normalized.get("job_registry") != str(jobs_path)
+            or normalized.get("route_node") != _gate_route_node(route, args.gate)
+        ):
+            raise SupervisorError("gate-delivery-recovery-refused: strict-receipt-identity")
+        expected_receipt_digest = HUMAN_GATE.digest(normalized)
+        expected_revision = f"human-gate:{args.gate}:{args.raise_epoch}"
+    else:
+        children = receipt.get("children")
+        child = children[0] if isinstance(children, list) and len(children) == 1 else {}
+        if (
+            receipt.get("parent_attempt_id") != args.source_attempt_id
+            or receipt.get("job_registry") != str(jobs_path)
+            or child.get("attempt_id") != args.source_attempt_id
+            or child.get("required_action") != f"human-gate:{args.gate}"
+        ):
+            raise SupervisorError("gate-delivery-recovery-refused: legacy-receipt-identity")
+        expected_receipt_digest = PENDING._canonical_receipt_digest(receipt)
+        expected_revision = f"human-gate:{args.gate}"
+    revision = (record.get("row_revisions") or {}).get(args.source_attempt_id)
+    if revision != expected_revision:
+        raise SupervisorError("gate-delivery-recovery-refused: receipt-row-mismatch")
+    expected = {
+        "recipient_kind": kind,
+        "attempt_ids": [args.source_attempt_id],
+        "parent_attempt_id": args.source_attempt_id,
+        "route_id": route["route_id"],
+            "route_node": _gate_route_node(route, args.gate),
+        "receipt_digest": expected_receipt_digest,
+        "row_revisions": {args.source_attempt_id: expected_revision},
+    }
+    result = PENDING.expire_recovery(
+        root, recipient_key, args.delivery_id, expected=expected,
+        actor=args.actor, reason=args.reason, apply=args.apply,
+    )
+    result.update({"eligible": True, "apply": bool(args.apply), "route_id": route["route_id"],
+                   "gate": args.gate, "delivery_id": args.delivery_id,
+                   "recipient": recipient_key, "recipient_kind": kind,
+                   "source_attempt_id": args.source_attempt_id,
+                   "raise_epoch": args.raise_epoch,
+                   **ledger_metadata(jobs_path, ledger)})
+    print(json.dumps(result, sort_keys=True, ensure_ascii=False))
     return 0
 
 
@@ -1739,7 +1957,7 @@ def _survey_route_row(route_row, stale_after_seconds, now):
     gates = route_module().terminal_gate_observation(route)
     proven = route_module().terminal_gate_proven(gates)
 
-    ledger = ledger_for(route)
+    ledger = ledger_for(route, None)
     ledger_state = ledger.read_only_state()
     entries = ledger.journal()
     armed = read_armed(ledger)
@@ -1930,9 +2148,11 @@ def build_parser():
 
     poll = sub.add_parser("poll", help="evaluate every armed watch once")
     poll.add_argument("--route", required=True)
+    poll.add_argument("--jobs")
 
     watch = sub.add_parser("watch", help="poll until terminal or the bounded deadline")
     watch.add_argument("--route", required=True)
+    watch.add_argument("--jobs")
     watch.add_argument("--max", type=float, default=3600.0)
     watch.add_argument("--interval", type=float, default=DEFAULT_POLL_INTERVAL)
 
@@ -1969,6 +2189,7 @@ def build_parser():
              "(exit 0 proceed, 2 still blocked, 3 revise, 4 stop)")
     await_release.add_argument("--route", required=True)
     await_release.add_argument("--gate", required=True)
+    await_release.add_argument("--jobs")
     await_release.add_argument("--max", type=float, default=DEFAULT_AWAIT_MAX_SECONDS,
                                help=f"seconds to wait before exit 2 (clamped to {int(MAX_AWAIT_SECONDS)})")
     await_release.add_argument("--interval", type=float, default=DEFAULT_POLL_INTERVAL)
@@ -1978,10 +2199,25 @@ def build_parser():
 
     status = sub.add_parser("status", help="portable workflow/stage/resource projection")
     status.add_argument("--route", required=True)
+    status.add_argument("--jobs")
     status.add_argument("--json", action="store_true")
 
     complete = sub.add_parser("complete", help="verify terminal gates, then close the workflow")
     complete.add_argument("--route", required=True)
+    complete.add_argument("--jobs")
+
+    recover = sub.add_parser("recover-gate-delivery",
+                             help="preview or atomically expire one unreleasable gate delivery")
+    recover.add_argument("--route", required=True)
+    recover.add_argument("--gate", required=True)
+    recover.add_argument("--delivery-id", required=True)
+    recover.add_argument("--recipient", required=True)
+    recover.add_argument("--source-attempt-id", required=True)
+    recover.add_argument("--raise-epoch", required=True, type=int)
+    recover.add_argument("--actor", required=True)
+    recover.add_argument("--reason", required=True)
+    recover.add_argument("--jobs", required=True)
+    recover.add_argument("--apply", action="store_true")
 
     survey = sub.add_parser("survey", help="read-only, root-scoped abandoned/stuck workflow report")
     survey.add_argument("--artifact-root", required=True)
@@ -1995,7 +2231,8 @@ def main(argv=None):
     handler = {
         "arm": cmd_arm, "poll": cmd_poll, "watch": cmd_watch, "gate": cmd_gate,
         "release": cmd_release, "await-release": cmd_await_release,
-        "status": cmd_status, "complete": cmd_complete, "survey": cmd_survey,
+        "status": cmd_status, "complete": cmd_complete, "recover-gate-delivery": cmd_recover_gate_delivery,
+        "survey": cmd_survey,
     }[args.command]
     return handler(args)
 

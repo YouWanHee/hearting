@@ -17,13 +17,31 @@ DISPATCHABLE_HARNESSES = {"claude", "codex", "opencode"}
 KNOWN_HARNESSES = DISPATCHABLE_HARNESSES
 AFFINITY_VALUES = {"claude", "codex", "opencode", "diverse"}
 MODEL_PROFILES = ("deep", "balanced-deep", "balanced", "light", "mini")
+# The `top` exception profile never has its own policy section: a route that
+# seals it borrows the quality-peer bands of `deep` (claude/codex only). A
+# `profiles.top` mapping in the user file stays an unknown-profile error.
+EXCEPTION_PROFILE_POLICY = {"top": "deep"}
 QUALITY_BANDS = ("primary", "relief", "last_resort")
 ALLOCATION_STRATEGIES = {"least-recent-attempts", "capacity-aware", "balanced"}
 DEFAULT_USAGE_GATE_USED_PERCENT = 90
 TOP_LEVEL_KEYS = {
     "schema_version", "depth1_owner", "opencode", "allocation", "capabilities",
-    "harnesses", "profiles", "headless", "confirmation", "steward",
+    "harnesses", "profiles", "headless", "confirmation", "steward", "runtime",
 }
+# PRD §13.53.2: the operator kill switch for the SD-120/121 terminal fast
+# path. `auto` lets the sealed runtime-capability census decide (the default,
+# and the only value that can ever open the gate); `off` keeps every route on
+# the legacy owner-driven close/finalize path regardless of what the runtime
+# publishes. This is deliberately *not* an on/true value: nothing an operator
+# writes here can force activation on a runtime that lacks the contract.
+# This module *validates* the key but deliberately does not read it: the one
+# reader is `dispatch_runtime_support.query_support_mode`. A second reader here
+# under the idiomatic `query_*` name is how a later caller silently gets the
+# opposite failure direction -- that reader fails closed on an unrecognised
+# value, and a `query_*` twin that fell back to `auto` would fail open.
+RUNTIME_KEYS = {"terminal_commit"}
+TERMINAL_COMMIT_SUPPORT_MODES = ("auto", "off")
+DEFAULT_TERMINAL_COMMIT_SUPPORT = "auto"
 # core/OPERATIONS.md §5.10 "Registered headless permission posture": the
 # Claude wrapper pins the starting permission mode of every registered
 # `claude -p` turn. `bypass` appends `--permission-mode bypassPermissions`;
@@ -427,6 +445,7 @@ def validate(config, capmap):
 
     confirmation = config.get("confirmation")
     steward = config.get("steward")
+    runtime = config.get("runtime")
     if version == 4:
         if confirmation is not None:
             if not isinstance(confirmation, dict):
@@ -457,11 +476,27 @@ def validate(config, capmap):
                         "steward.child_permission_mode must be one of "
                         f"{sorted(STEWARD_CHILD_PERMISSION_MODES)}"
                     )
+        if runtime is not None:
+            if not isinstance(runtime, dict):
+                errors.append("runtime must be a mapping")
+            else:
+                for key in sorted(set(runtime) - RUNTIME_KEYS):
+                    errors.append(f"unknown runtime key: {key!r}")
+                mode = runtime.get("terminal_commit", DEFAULT_TERMINAL_COMMIT_SUPPORT)
+                # `False` is accepted because YAML 1.1 resolves a bare `off`
+                # to boolean false; the reader treats both as disabled.
+                if mode not in TERMINAL_COMMIT_SUPPORT_MODES and mode is not False:
+                    errors.append(
+                        "runtime.terminal_commit must be one of "
+                        f"{sorted(TERMINAL_COMMIT_SUPPORT_MODES)}"
+                    )
     else:
         if confirmation is not None:
             errors.append("confirmation requires schema_version 4")
         if steward is not None:
             errors.append("steward requires schema_version 4")
+        if runtime is not None:
+            errors.append("runtime requires schema_version 4")
 
     headless = config.get("headless")
     if headless is not None:
@@ -564,6 +599,7 @@ def query_profile_policy(config, profile):
     Legacy schemas have one symmetric primary band.  This preserves their exact
     selector behavior while letting v3 keep OpenCode outside the quality-peer set.
     """
+    profile = EXCEPTION_PROFILE_POLICY.get(profile, profile)
     if profile not in MODEL_PROFILES:
         raise DefaultsConfigError(f"unknown model profile: {profile!r}")
     if config.get("schema_version") not in {3, 4}:

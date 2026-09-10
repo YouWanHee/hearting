@@ -523,19 +523,12 @@ fixed pin — read the diagnostic for the live mapping):
 
 | Model profile | Concrete realization (shipped default shown) |
 |---|---|
-| `deep` | configured deep tier / configured deep effort (shipped: `xhigh`) |
-| `balanced-deep` | configured deep tier / configured balanced-deep effort (shipped: `medium`) |
-| `light` | configured light tier / configured light effort (shipped: `medium`) |
-| `mini` | configured mini tier / configured mini effort (shipped: `low`, not `medium`), lifecycle/micro-only |
-
-An Astra Ultra opt-in changes only the existing `CFG_TIER_DEEP_MODEL`,
-`CFG_TIER_DEEP_EFFORT`, `CFG_MODEL_PROFILE_DEEP`, and first
-`CFG_TIER_DEEP_FAILOVER_CASCADE` step in a copied complete user file — see the
-comments in `adapters/codex/config/models.conf`. It adds no new `CFG_*` key
-(one would make every existing user file `user-incomplete`, per
-`utilities/model_config.py:158-207`), does not change any shipped Codex or
-Claude default, and is not evidence of universal runtime/account availability
-for the selected model.
+| `deep` | configured deep tier / `xhigh` |
+| `balanced-deep` | configured deep tier / `medium` |
+| `balanced` | configured light tier / `high` |
+| `light` | configured light tier / `medium` |
+| `mini` | configured mini tier / `low`, lifecycle/micro-only |
+| `top` | configured top tier / `xhigh`; the main-session-only model, only through a route that sealed `top` for its depth-1 owner |
 
 ### Nested-home model inheritance
 
@@ -793,15 +786,27 @@ memory mutations. Read tools and CLI-owned metadata remain separate surfaces;
 this is not zero-tools parity. Increment and curate action semantics still follow
 `core/MEMORY.md` §7, D-30/D-32.
 
-The adapter reimplements the portable `hooks/mem-distill-dispatch.sh` pipeline
-**synchronously** in `adapters/codex/bin/distill-worker.sh` (the D-32
-"reimplement + preserve" path) so a headless `codex exec` session captures memory
-before it exits — the portable dispatcher detaches into the background, which is
-right for interactive Claude but leaves a codex-exec teardown race. Crucially the
-**safety layers are the shared code, not a divergent copy**: `mem.py
+The adapter reimplements the portable `hooks/mem-distill-dispatch.sh` pipeline in
+`adapters/codex/bin/distill-worker.sh` (the D-32 "reimplement + preserve" path).
+Crucially the **safety layers are the shared code, not a divergent copy**: `mem.py
 curate-snapshot` / `curate-artifacts` (snapshot + `IDS:` membership) and
 `tools/memory/apply-distill-actions.py --mode/--snapshot-ids` (the whitelist
-gate). Only the synchronous orchestration shell and the prompts are Codex-owned.
+gate). Only the orchestration shell and the prompts are Codex-owned.
+
+**Who waits.** Codex gives the native SessionEnd hook at most three seconds.
+The registered `sessionend-lifecycle.py` bridge launches one finite receipt-owned
+completion controller and returns within that deadline. Its tracked
+`preflight.sh session-end` command stays synchronous: it joins an earlier
+increment, runs initial sync, attempts curation, then runs final sync. It never
+creates another detached child beneath that controller.
+
+`turn-nudge` hands due increments to `distill-nudge-launch.py`, which uses the
+same completion mechanism with a separate nudge receipt and generation. Repeated
+firings cannot double-spawn an active increment. The internal
+`turn-nudge-distill` compatibility alias uses that same launcher without changing
+the turn counter. D-42 workers own neither hook lifecycle. The finite 90-second
+curate and 20-second increment defaults bound model work outside the native hook
+budget; explicit timeout overrides and completion process-group cleanup remain.
 
 Two tiers + one manual surface:
 

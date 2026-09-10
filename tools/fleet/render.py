@@ -39,8 +39,13 @@ import time
 from .model import (fmt_min, dash, project_of, exec_child_is_wait,
                     session_parent_visible)
 from . import gitinfo
-from .refresh import LiveSnapshot, RefreshPump
+from .refresh import LiveSnapshot, RefreshPump, MAX_LEAKED_WORKERS
 from .session_handle import display_name as _display_name
+from .session_handle import _cell_width as _session_handle_cell_width
+from .session_handle import clip_cells as _clip_cells
+from .session_handle import resolve_tag as _resolve_session_tag
+from .session_handle import session_id_for_address as _session_id_for_address
+from .session_handle import session_id_for_derived_name as _session_id_for_derived_name
 
 # curses attribute constants — real values when curses is present, harmless 0 fallbacks
 # otherwise, so this module imports (and the plain --once path runs) with no curses at all.
@@ -1811,9 +1816,18 @@ def _session_tag_chip(s, dim=False):
     tag = getattr(s, "session_tag", None)
     steward = bool(getattr(s, "steward", False))
     if not isinstance(tag, str) or not tag:
+        if getattr(s, "_session_tag_unpaired", False) and not steward:
+            # A Codex app-server row whose managed state dir paired with no tagged TUI
+            # client (collectors/codex.share_managed_tags): say so instead of a blank slot.
+            body = "--"[: _TAG_W - 3].ljust(_TAG_W - 3)
+            return [("[", "dim"), (body, "tag_dim"), ("]", "dim"), (" ", None)]
         if not steward:
             return [(" " * _TAG_W, None)]
-        tag = "*"          # F-100c: an untagged steward (Codex/OpenCode today) still gets a badge
+        # F-100c: an untagged steward still gets a badge, but `*` sat in the column that
+        # everywhere else holds a session number, so it read as an id nobody could look up
+        # (user 2026-09-09: "그 id 가 안뜨는 경우도 있는것 같은데?"). The role's own mark
+        # says role, not number, and matches the `⚑` on this session's relation line.
+        tag = _ICON_STEWARD
     body = tag[: _TAG_W - 3].ljust(_TAG_W - 3)
     key = "tag_dim" if dim else ("tag_steward" if steward else "tag")
     return [("[", "dim"), (body, key), ("]", "dim"), (" ", None)]
@@ -3589,58 +3603,247 @@ def _subagent_strip(subs, depth=0, in_card=False, term_width=None):
                         lambda: build(False, False, False)], term_width)]
 
 
-def _peer_link_strip(last_recv, term_width=None, depth=0, in_card=False):
-    """F-101a/b peer relation strip; caller has already proved endpoint visibility.
+# The icon says WHAT the relation is, the arrow says which WAY it points. User decision
+# 2026-09-09 ("위 아래로 표시하면 앞뒤 화살표는 왜 있는거임?") — the two must not encode
+# the same thing twice, so no glyph ever varies by direction.
+_ICON_PEER = "✉"
+_ICON_STEWARD = "⚑"
 
-    Claude native envelopes can lack the sender id, so that path remains a counter-only
-    fail-soft projection rather than guessing an endpoint.
+
+_PEER_NAME_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
+
+_PEER_NAME_PANE_RE = re.compile(r"^w[0-9A-Za-z]{1,3}:p[0-9A-Za-z]{1,3}$")
+_PEER_NAME_HEX_RE = re.compile(r"^[0-9a-f]{12,}$", re.I)
+_PEER_NAME_MAX_CELLS = 26
+
+
+def _peer_name_is_readable(name):
+    """True when the ledger's `name` is something a person can act on.
+
+    The name slot is whatever the sending side wrote, and older send paths put machine
+    addresses in it — the board printed `✉ → uds:/run/user/1002/cc-socks/2952102.sock`
+    from a real record. A transport address or a bare session id names nothing the user
+    can look up, so it is worse than the `claude:01a084f7` fallback: it is the same
+    non-information, but longer and pretending to be a name.
+
+    Deliberately a small denylist, not a guess at what a "real" name looks like: session
+    names here are free-form and often Korean prose, so anything not recognizably a
+    machine address has to pass.
     """
-    if not last_recv or not last_recv.get("from_session_id"):
+    if not isinstance(name, str):
+        return False
+    text = name.strip()
+    if not text:
+        return False
+    if _PEER_NAME_UUID_RE.match(text) or _PEER_NAME_HEX_RE.match(text):
+        return False                       # a raw id pasted into the name slot
+    if _PEER_NAME_PANE_RE.match(text):
+        return False                       # `wB:p5` — where it runs, not which session
+    if text.startswith("/") or "://" in text:
+        return False                       # a path or a URL
+    scheme = text.split(":", 1)[0]
+    if scheme and scheme.isascii() and scheme.isalpha() and ":/" in text:
+        return False                       # uds:/…, unix:/…, and friends
+    # Length is NOT a rejection: `fleet-stall-codex-parity-10` is a real name that happens
+    # to be long, and a clipped real name beats `claude:a8e66aa4`. Only prose gets dropped
+    # — a whole sentence in the name slot (a session title, from an older send path) is not
+    # a name and clipping it just yields a truncated sentence.
+    return " " not in text or _session_handle_cell_width(text) <= _PEER_NAME_MAX_CELLS
+
+
+def _peer_endpoint_segs(harness, session_id, name, tag_by_key):
+    """Name the session at the other end of a relation, best evidence first.
+
+    `[46] claude` when that session is also a row on this board — the badge is the thing
+    the user can actually look up. Otherwise the ledger's own display name, and only then
+    `claude:01a084f7`. Never the full session id: `← 01a084f7-63f2-7961-ae60-6fc2d8e60fc2`
+    is what the board printed before this (the collector used to paste the raw id into the
+    name slot), and it names nothing a person can act on.
+    """
+    harness = str(harness or "").lower()
+    sid = session_id if isinstance(session_id, str) and session_id else None
+    if not sid:
+        # Rows written before the ledger learned to resolve it keep the peer's socket
+        # address in the name slot. The address names a PID, and the PID names a session,
+        # so the badge is recoverable for history too — 222 such rows were on the board.
+        try:
+            sid = _session_id_for_address(name) or _session_id_for_derived_name(name)
+        except Exception:
+            sid = None
+    tag = (tag_by_key or {}).get((harness, sid)) if sid else None
+    if not tag and sid:
+        # The badge is the whole point, so an off-board peer gets one too when the shared
+        # record can still produce it. Without this the same session reads `[67] claude`
+        # while it happens to be on screen and something else entirely once it scrolls off.
+        try:
+            tag = _resolve_session_tag(harness, sid)
+        except Exception:
+            tag = None
+    if tag:
+        return [("[", "dim"), (str(tag), "tag"), ("]", "dim"),
+                (" " + (harness or "peer"), "dim")]
+    if _peer_name_is_readable(name):
+        return [(_clip_cells(name.strip(), _PEER_NAME_MAX_CELLS), "dim")]
+    if sid:
+        return [("%s:%s" % (harness or "peer", sid[:8]), "dim")]
+    return [(harness, "dim")] if harness else []
+
+
+# The gap between the two halves of a relation line. Wide enough that `→ …  ← …` reads
+# as two facts, not one run-on: the board has horizontal room to spare, and the user
+# 2026-09-10 chose spending it over spending vertical lines.
+_RELATION_GAP = "   "
+
+
+def _peer_half_segs(entry, direction, tag_by_key, include_kind=True, include_age=True):
+    """One direction of peer messaging, without the leading icon."""
+    if not entry:
         return []
+    if direction == "sent":
+        arrow, harness = "→", entry.get("to_harness")
+        sid, name = entry.get("to_session_id"), entry.get("to_name")
+    else:
+        arrow, harness = "←", entry.get("from_harness")
+        sid, name = entry.get("from_session_id"), entry.get("from_name")
+    endpoint = _peer_endpoint_segs(harness, sid, name, tag_by_key)
+    if not endpoint:
+        return []          # a record naming no endpoint at all is not a relation
+    segs = [(arrow, "dim"), (" ", None)] + list(endpoint)
+    kind = entry.get("kind") or ""
+    if include_kind and kind:
+        segs.append((" · " + kind, "dim"))
+    if include_age:
+        segs.append((" · " + fmt_min(entry.get("age_min") or 0), "dim"))
+    return segs
+
+
+def _peer_link_strip(sent=None, recv=None, tag_by_key=None, term_width=None, depth=0,
+                     in_card=False):
+    """Both directions of peer messaging on ONE line: `✉ → [32] claude   ← [b0] codex`.
+
+    Drawn whenever the ledger has the relation — NOT only when the other endpoint also
+    happens to be rendered this tick. That visibility gate is what made the same received
+    message appear on one tick and vanish on the next (user 2026-09-09: "받는 세션도 좀
+    이상하긴하네 일관성이 없고"); the endpoint's presence now only decides how it is
+    LABELLED, never whether the relation exists. Exact `(harness, session_id)` remains the
+    ledger's own identity key — this is the display layer relaxing, not the contract.
+
+    One line, not two: sent and received are the same fact seen from two ends, and a
+    session with both used to spend two rows saying so (user 2026-09-10 — "2줄로 줄여
+    어차피 횡으로 여유 많은데"). The icon still says WHAT the relation is and each arrow
+    says which WAY that half points, so nothing is encoded twice.
+    """
     indent = _conn_indent(depth, in_card)
-    name = last_recv.get("from_name") or "peer"
-    kind = last_recv.get("kind") or ""
-    age = fmt_min(last_recv.get("age_min") or 0)
+
     def build(include_kind=True, include_age=True):
-        bits = [indent, "←", " ", name]
-        if include_kind and kind:
-            bits += [" · ", kind]
-        if include_age:
-            bits += [" · ", age]
-        return [(bits[0], None)] + [(part, "dim") for part in bits[1:]]
+        halves = [h for h in (_peer_half_segs(sent, "sent", tag_by_key,
+                                              include_kind, include_age),
+                              _peer_half_segs(recv, "recv", tag_by_key,
+                                              include_kind, include_age)) if h]
+        if not halves:
+            return []
+        segs = [(indent, None), (_ICON_PEER, "dim"), (" ", None)]
+        for i, half in enumerate(halves):
+            if i:
+                segs.append((_RELATION_GAP, None))
+            segs += half
+        return segs
+
+    if not build():
+        return []
     return [_fit_strip([lambda: build(True, True), lambda: build(True, False),
                         lambda: build(False, False)], term_width)]
 
 
-def _steward_link_strip(targets, tag_by_key, term_width=None, depth=0, in_card=False):
-    """F-101d exact-join child tags with front-preserving bounded folding."""
+def _steward_target_tags(targets, tag_by_key):
+    """The badges of the sessions a steward watches, in board order.
+
+    Resolved once and counted once: the fit ladder shrinks THIS list, so deriving its
+    length from `targets` instead would let `count` outrun it and print `+-2`.
+    """
     tags = []
     for target in targets or []:
         sid = target.get("session_id")
         if not sid:
             continue
-        key = (str(target.get("harness") or "").lower(), sid)
-        tag = tag_by_key.get(key)
+        tag = (tag_by_key or {}).get((str(target.get("harness") or "").lower(), sid))
         if tag:
             tags.append(str(tag))
+    return tags
+
+
+def _steward_target_segs(tags, count):
+    """F-101d — `→ [13] [90] [26]`: the sessions this steward watches."""
     if not tags:
         return []
+    segs = [("→", "dim")]
+    for tag in tags[:count]:
+        segs.extend([(" [", "dim"), (tag, "tag"), ("]", "dim")])
+    rest = len(tags) - count
+    if rest:
+        segs.append((" +%d" % rest, "dim"))
+    return segs
+
+
+def _steward_parent_segs(parents, tag_by_key, count):
+    """`← [b0] claude`: the session watching THIS one.
+
+    The steward relation was recorded on one side only, so a watched session had no way
+    to show who was watching it (user 2026-09-09). The reverse index is derived from the
+    very same read-only markers, so this half can never claim a relation the steward's
+    own `→` half does not also show.
+    """
+    if not parents:
+        return []
+    segs = [("←", "dim")]
+    for parent in parents[:count]:
+        segs.append((" ", None))
+        segs += _peer_endpoint_segs(parent.get("harness"), parent.get("session_id"),
+                                    parent.get("name"), tag_by_key)
+    rest = len(parents) - count
+    if rest:
+        segs.append((" +%d" % rest, "dim"))
+    return segs
+
+
+def _steward_link_strip(targets=None, parents=None, tag_by_key=None, term_width=None,
+                        depth=0, in_card=False):
+    """Both steward directions on ONE line: `⚑ → [13] [90]   ← [b0] claude`.
+
+    Same one-line rule as `_peer_link_strip`, for the same reason: watching and being
+    watched are one relation seen from two ends.
+    """
     indent = _conn_indent(depth, in_card)
-    def build(count):
-        segs = [(indent, None), ("→", "dim")]
-        for tag in tags[:count]:
-            segs.extend([(" [", "dim"), (tag, "tag"), ("]", "dim")])
-        rest = len(tags) - count
-        if rest:
-            segs.append((" +%d" % rest, "dim"))
+    tags = _steward_target_tags(targets, tag_by_key)
+    n_targets, n_parents = len(tags), len(parents or [])
+
+    def build(count_t, count_p):
+        halves = [h for h in (_steward_target_segs(tags, count_t),
+                              _steward_parent_segs(parents, tag_by_key, count_p)) if h]
+        if not halves:
+            return []
+        segs = [(indent, None), (_ICON_STEWARD, "dim"), (" ", None)]
+        for i, half in enumerate(halves):
+            if i:
+                segs.append((_RELATION_GAP, None))
+            segs += half
         return segs
+
+    if not build(n_targets, max(1, n_parents)):
+        return []
     if not term_width:
-        return [build(len(tags))]
-    for count in range(len(tags), -1, -1):
-        segs = build(count)
+        return [build(n_targets, n_parents)]
+    # Shrink the watch list first — it is the half that grows without bound — and only
+    # then the (normally single) watcher. Never below one watcher: `⚑ ← +1` names nobody.
+    plans = [(n, n_parents) for n in range(n_targets, -1, -1)]
+    plans += [(0, n) for n in range(n_parents - 1, 0, -1)]
+    for count_t, count_p in plans:
+        segs = build(count_t, count_p)
         if sum(_dw(text) for text, _key in segs) <= term_width:
             return [segs]
-    return [_clip_segs(build(0), term_width)[0]]
+    return [_clip_segs(build(0, min(1, n_parents)), term_width)[0]]
 
 
 def _plugin_agent_row(job, orphan=False, term_width=None):
@@ -4092,6 +4295,64 @@ def set_compute_hosts(value):
     _COMPUTE_HOSTS = dict(value) if isinstance(value, dict) else None
 
 
+# F-71b: the header's own honesty about the two RefreshPump workers (tools/fleet/refresh.py).
+# render never reads pump.running/pump.last_error directly — health() is the single surface.
+_REFRESH_HEALTH = {}   # {"snapshot": health-dict|None, "compute_hosts": health-dict|None}
+
+
+def set_refresh_health(snapshot=None, compute_hosts=None):
+    global _REFRESH_HEALTH
+    _REFRESH_HEALTH = {
+        "snapshot": dict(snapshot) if isinstance(snapshot, dict) else None,
+        "compute_hosts": dict(compute_hosts) if isinstance(compute_hosts, dict) else None,
+    }
+
+
+def _refresh_age_label(age):
+    if age is None:
+        return "—"
+    age = max(0.0, age)
+    if age < 60:
+        return "%ds" % int(age)
+    if age < 3600:
+        return "%dm" % int(age // 60)
+    return "%dh" % int(age // 3600)
+
+
+def _refresh_health_segments(narrow=False):
+    """Segments the header appends after the install-method word.
+
+    Degrade order under `narrow` (A-4, review minor 1): (1) the error string
+    shrinks from 40 to 20 chars, (2) the ` · gpu stalled` suffix is dropped
+    entirely. `refreshed <age>` and the state word are never dropped at any
+    width — final cell-accurate clipping is `_addline`'s job, not this
+    function's.
+    """
+    health = _REFRESH_HEALTH.get("snapshot") if isinstance(_REFRESH_HEALTH, dict) else None
+    if not health:
+        return []
+    segs = [(" · ", "dim"), ("refreshed " + _refresh_age_label(health.get("age")), "dim")]
+    state = health.get("state")
+    if state == "stalled":
+        text = " · stalled"
+        leaked = health.get("leaked_workers") or 0
+        if leaked >= MAX_LEAKED_WORKERS:
+            text += " (%d workers stuck)" % leaked
+        segs.append((text, "lvl_y"))
+    elif state == "failed":
+        error = health.get("last_error") or ""
+        limit = 20 if narrow else 40
+        segs.append((" · error: " + error[:limit], "lvl_y"))
+    compute_hosts = (_REFRESH_HEALTH.get("compute_hosts")
+                      if isinstance(_REFRESH_HEALTH, dict) else None)
+    # Segment importance, in survival order: ① refreshed <age> ② state word
+    # ③ error body ④ ` · gpu stalled`. The gpu suffix is the lowest-priority
+    # segment and the first one narrow width drops entirely.
+    if compute_hosts and compute_hosts.get("state") == "stalled" and not narrow:
+        segs.append((" · gpu stalled", "lvl_y"))
+    return segs
+
+
 _VERSION_RELEASE_RE = re.compile(r"^v?\d+(?:\.\d+)+(?:[-+][0-9A-Za-z.]+)?$")
 _VERSION_BUILD_RE = re.compile(r"-\d+-g[0-9a-fA-F]+$")
 
@@ -4125,7 +4386,7 @@ def _hearting_version_segments(version):
     return segments or [(version, "unknown")]
 
 
-def _hearting_header_row():
+def _hearting_header_row(narrow=False):
     value = _HEARTING or {}
     version = str(value.get("version") or "unknown")
     method = str(value.get("install_method") or "unmanaged")
@@ -4135,7 +4396,8 @@ def _hearting_header_row():
     # of the generic `head` grey; the version and install method stay quiet beside it.
     return ([("  ", None), ("hearting", "hearting_name"), (" ", None)]
             + _hearting_version_segments(version)
-            + [(" · ", "dim"), (method, "version_method")])
+            + [(" · ", "dim"), (method, "version_method")]
+            + _refresh_health_segments(narrow))
 
 
 def _gpu_safe_text(value):
@@ -4583,8 +4845,8 @@ def _compute_host_rows(term_width=None, sessions=None):
     return rows
 
 
-def _top_rows(term_width=None):
-    return [_hearting_header_row(), None]
+def _top_rows(term_width=None, narrow=False):
+    return [_hearting_header_row(narrow), None]
 
 
 # --- F-30 (v10, prd.md:304-310) — process view: pipeline-centric regrouping, `p` toggle ---
@@ -5517,7 +5779,7 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
             sessions, display_jobs, _route_views_by_id, malformed, memory,
             term_width, layout, node_evidence=_node_evidence, governor=governor)
         resource_lines = _resource_rows(resources, section)
-        return (_top_rows(term_width) + resource_lines
+        return (_top_rows(term_width, narrow) + resource_lines
                 + ([None] if resource_lines else []) + process_lines)
     # F-18b: mem-worker (distiller/curator/F-17 refresher) census — computed on the ORIGINAL
     # session list, before is_child/mem filtering, so folded/mem-only groups still surface a
@@ -5614,24 +5876,26 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
 
     emission_by_group = {name: _group_emission(groups[name], show_sessions, show_jobs)
                          for name in order}
-    emitted_session_keys = set()
     tag_by_key = {}
     for emission in emission_by_group.values():
         for s in emission["shown"]:
             sid = getattr(s, "session_id", None)
             if not sid:
                 continue
-            key = (str(getattr(s, "harness", "") or "").lower(), sid)
-            emitted_session_keys.add(key)
-            if getattr(s, "session_tag", None):
-                tag_by_key[key] = s.session_tag
+            harness = str(getattr(s, "harness", "") or "").lower()
+            # A resumed session is one row wearing one badge, but the ledger may still
+            # address it by the id it had before the resume — so every alias points at
+            # the same badge and the relation is labelled instead of going anonymous.
+            for identity in [sid] + list(getattr(s, "session_aliases", None) or []):
+                if getattr(s, "session_tag", None):
+                    tag_by_key[(harness, identity)] = s.session_tag
 
     # The product identity is a distinct, quiet title block. Keep one breathing row
     # before account usage begins instead of letting the two metadata zones touch.
-    lines = _top_rows(term_width)
+    lines = _top_rows(term_width, narrow)
     _seen_glyphs = set()
-    # F-98b: the peer-message subtitle only makes sense between two sessions BOTH on
-    # screen this tick — an off-screen peer still counts toward recv, but gets no line.
+    # F-98b's "both endpoints on screen" rule is retired (user 2026-09-09): an off-screen
+    # peer now gets the same line, labelled by name or `<harness>:<sid8>` instead of a tag.
     # F-12(c) legend glyph-appearance tracking — LOCAL to this call (never module/global state,
     # _OFFSET invariant R3): which of the conditional legend glyphs actually got emitted this
     # build. working/idle/dispatch/`~` stay unconditional (always relevant vocabulary); the
@@ -6196,14 +6460,15 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
             session_resources = _gpu_resources_for_session(s, gpu_resources)
             if session_resources:
                 lines.extend(_gpu_resource_strip(session_resources, term_width=term_width))
-            if _peer_last:
-                peer_key = (str(_peer_last.get("from_harness") or "").lower(),
-                            _peer_last.get("from_session_id"))
-                if _peer_last.get("from_session_id") and peer_key in emitted_session_keys:
-                    lines.extend(_peer_link_strip(_peer_last, term_width=term_width))
-            if getattr(s, "steward", False):
-                lines.extend(_steward_link_strip(getattr(s, "steward_targets", None) or [],
-                                                 tag_by_key, term_width=term_width))
+            # Two relation lines at most: one for messages, one for stewarding. Each
+            # carries both of its directions (user 2026-09-10).
+            lines.extend(_peer_link_strip(getattr(s, "peer_last_sent", None), _peer_last,
+                                          tag_by_key, term_width=term_width))
+            lines.extend(_steward_link_strip(
+                (getattr(s, "steward_targets", None) or []) if getattr(s, "steward", False)
+                else [],
+                getattr(s, "steward_parents", None) or [],
+                tag_by_key, term_width=term_width))
             for plugin_job in plugin_kids:
                 lines.extend(_plugin_agent_row(plugin_job, term_width=term_width))
             for i, cj in enumerate(dispatch_kids):
@@ -7243,19 +7508,48 @@ def _highlight_row(stdscr, y, w):
         pass
 
 
+def _configure_input(curses_mod, env):
+    """Set up terminal input so nothing the terminal sends can hold the frame loop.
+
+    Split out of `_loop` only so it can be tested without a real screen — the freeze this
+    prevents is not reproducible in a unit test, so the settings themselves are what gets
+    asserted.
+
+    **Escape delay.** ncurses waits its 1000ms default for the rest of a sequence it has
+    only partly seen: ten dropped frames for one stray ESC, and the floor under the freeze
+    below.
+
+    **Mouse reporting is off unless `FLEET_MOUSE=1` asks for it.** Enabling it froze the
+    TUI in two different terminals — under herdr (2026-07-01) and in a VS Code terminal
+    (2026-09-09). The second was measured while stuck: 0 CPU, zero read and write syscalls,
+    one thread, sleeping on the tty, and the terminal's own output queue empty, so it was
+    waiting for input rather than blocked writing. The user reported that it freezes on
+    clicking away to another window and that any keypress advances it exactly one frame,
+    which is what a half-assembled mouse/focus escape sequence does: ncurses holds for bytes
+    that never arrive and the next keystroke terminates the parse.
+
+    Keyboard was always the primary path, so the only thing lost by default is
+    click-to-toggle — a far better trade than a dashboard that stops. This was already the
+    behavior under herdr; it makes the safe case the default everywhere.
+    """
+    if hasattr(curses_mod, "set_escdelay"):
+        try:
+            curses_mod.set_escdelay(25)
+        except Exception:
+            pass
+    if env.get("FLEET_MOUSE") == "1":
+        try:
+            curses_mod.mousemask(curses_mod.BUTTON1_CLICKED)
+        except Exception:
+            pass
+
+
 def _loop(stdscr, collect_all, hfilter, section, interval):
     global _OFFSET, _BLINK_ON
     curses.curs_set(0)
     _init_colors()
     live_order = _LiveOrderState()
-    # herdr (HERDR_ENV=1) grabs mouse events itself — enabling curses mouse reporting inside it
-    # deadlocks/freezes the pane (user-observed freeze 2026-07-01). Keyboard is the primary path,
-    # so skip mouse under herdr; mouse click-toggle stays available in a plain terminal.
-    if not os.environ.get("HERDR_ENV"):
-        try:
-            curses.mousemask(curses.BUTTON1_CLICKED)
-        except Exception:
-            pass
+    _configure_input(curses, os.environ)
 
     def collect_snapshot():
         sessions, jobs = collect_all(harness_filter=hfilter)
@@ -7304,6 +7598,10 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
     malformed = snapshot.malformed
     mem_snapshot = snapshot.memory
     governor_snapshot = snapshot.governor
+    set_refresh_health(
+        snapshot=pump.health(time.monotonic()),
+        compute_hosts=(compute_host_pump.health(time.monotonic())
+                       if compute_host_pump is not None else None))
     stdscr.timeout(200)                     # getch blocks ≤200ms → responsive keys
     _draw(stdscr, sessions, jobs, section, malformed, memory=mem_snapshot,
           live_order=live_order, resources=resources, usage_snapshots=usage_snapshots,
@@ -7316,9 +7614,14 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
             stdscr.timeout(max(20, min(100, int((_nb - time.time()) * 1000) + 1)))
             ch = stdscr.getch()
             now = time.time()
-            pump.request_due(now=time.monotonic())
+            now_mono = time.monotonic()
+            pump.request_due(now=now_mono)
             if compute_host_pump is not None:
-                compute_host_pump.request_due(now=time.monotonic())
+                compute_host_pump.request_due(now=now_mono)
+            set_refresh_health(
+                snapshot=pump.health(now_mono),
+                compute_hosts=(compute_host_pump.health(now_mono)
+                               if compute_host_pump is not None else None))
             update = pump.poll(generation)
             if update is not None:
                 generation, snapshot = update

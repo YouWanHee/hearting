@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import importlib.util, io, json, os, shutil, subprocess, sys, tempfile, threading, unittest
+import contextlib, importlib.util, io, json, os, shutil, subprocess, sys, tempfile, threading, unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
@@ -665,6 +665,70 @@ class AdapterV11Test(unittest.TestCase):
     rows=jobs.read_text(encoding="utf-8").splitlines()
     self.assertIn("\tdone\t",rows[0]); self.assertIn("note=dead-timeout",rows[0])
     self.assertIn("\topen\t",rows[1]); self.assertNotIn("note=",rows[1])
+ def test_launch_receipt_states_the_parent_next_action(self):
+  # The parent's whole model-visible delivery contract is `parent_next`
+  # (`utilities/parent_next_directive.py`). Pin it at the wrapper, not just at
+  # the mapping: a receipt that stops printing it silently returns the rule to
+  # prose, which is the failure mode this replaced. Two wrappers actually
+  # launch here (review round 2, M-3): the mapping is shared, but "is it
+  # printed, with agent_home already resolved" is per wrapper.
+  for harness, fake_cli in (("codex","codex"),("opencode","opencode"),("claude","claude")):
+   with self.subTest(harness=harness):
+    self._assert_receipt_states_next(harness, fake_cli)
+
+ def _assert_receipt_states_next(self, harness, fake_cli):
+  with tempfile.TemporaryDirectory() as td:
+   root=Path(td); repo,art=self.fixture(root); jobs=root/"jobs.log"; logs=root/"logs"
+   fakebin=root/"bin"; fakebin.mkdir(); count=root/"child-count"
+   fake=fakebin/fake_cli
+   fake.write_text("#!/bin/sh\nprintf 'child\\n' >> \"$FAKE_CHILD_COUNT\"\n",encoding="utf-8")
+   fake.chmod(0o755)
+   command=self.command(harness,"start",repo,jobs,logs)
+   self.seed_parent(jobs,repo,harness=harness)
+   spec=importlib.util.spec_from_file_location(f"{harness}_dispatch_next",ROOT/f"adapters/{harness}/bin/dispatch-headless.py")
+   wrapper=importlib.util.module_from_spec(spec); spec.loader.exec_module(wrapper)
+   argv=["dispatch-headless.py",*command[2:]]
+   env={**os.environ,"PATH":str(fakebin)+os.pathsep+os.environ.get("PATH",""),
+        "AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(art),
+        "AGENT_DISPATCH_JOBS":str(jobs),"AGENT_DISPATCH_CHILD":"1",
+        "AGENT_DISPATCH_ATTEMPT_ID":"att-parent-fixture",
+        "AGENT_DISPATCH_ALLOW_NAMESPACED_SPAWN":"1",
+        "XDG_STATE_HOME":str(root/"state"),
+        "FAKE_CHILD_COUNT":str(count)}
+   resolution=wrapper.reconcile_launch_lifecycle(
+    wrapper.DETACHED,{"AGENT_DISPATCH_ALLOW_NAMESPACED_SPAWN":"1"},
+    evidence={"lifecycle_selector_source":"host-like"})
+   buffer=io.StringIO()
+   # Not every wrapper defines every projection helper (opencode has no
+   # `ensure_runtime_home_projection`): patch what exists, never invent one.
+   optional=[mock.patch.object(wrapper,name,return_value=value)
+             for name,value in (("check_runtime_projection",0),
+                                ("ensure_runtime_home_projection",None))
+             if hasattr(wrapper,name)]
+   with contextlib.ExitStack() as stack:
+    stack.enter_context(mock.patch.dict(os.environ,env,clear=True))
+    for patch in optional: stack.enter_context(patch)
+    stack.enter_context(mock.patch.object(wrapper,"reconcile_launch_lifecycle",return_value=resolution))
+    stack.enter_context(redirect_stdout(buffer))
+    code=wrapper.main(argv)
+   receipt=buffer.getvalue()
+   self.assertEqual(code,0,receipt)
+   self.assertIn("child_spawned=1",receipt)
+   fields=dict(line.split("=",1) for line in receipt.splitlines() if "=" in line)
+   sys.path.insert(0,str(ROOT/"utilities"))
+   import parent_next_directive as pnd
+   delivery=fields.get("parent_completion_delivery","")
+   # The delivery this launch actually resolved must be a classified one, and
+   # the three printed lines must be exactly what the shared contract renders
+   # for it -- an assertion that admits both actions would pass while a real
+   # carrier silently degraded to `delivery-unrecognized`.
+   self.assertIn(delivery,set(pnd.CARRIER_DELIVERIES)|set(pnd.WAIT_DELIVERIES),receipt)
+   expected=pnd.receipt_lines(delivery,fields.get("attempt_id"),agent_home=ROOT)
+   self.assertEqual(
+    [f"parent_next={fields.get('parent_next')}",
+     f"parent_next_reason={fields.get('parent_next_reason')}",
+     f"parent_next_command={fields.get('parent_next_command')}"],
+    expected,receipt)
  def test_concurrent_codex_start_launches_exactly_one_child(self):
   with tempfile.TemporaryDirectory() as td:
    root=Path(td); repo,art=self.fixture(root); jobs=root/"jobs.log"; logs=root/"logs"

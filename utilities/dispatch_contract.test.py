@@ -3059,11 +3059,13 @@ class DispatchContractTest(unittest.TestCase):
   return route,path
 
  def _fence_start(self,base,path,node="plan"):
+  jobs=base/"jobs.log"
+  jobs.write_text("",encoding="utf-8")
   ready=D.AttemptReadiness("ready","fixture-ready","att-frame")
   with mock.patch.object(D,"completion_marker_is_current",return_value=True), \
        mock.patch.object(D,"completion_attempt_readiness",return_value=ready), \
        mock.patch.object(D,"_sibling_attempt_gate"):
-   D.completion_marker_gate(str(path),node,"start",base,base/"jobs.log",
+   D.completion_marker_gate(str(path),node,"start",base,jobs,
                             registry_lines=[],attempt_id="att-plan-new")
 
  def _gate_ledger(self,base,route):
@@ -3080,6 +3082,22 @@ class DispatchContractTest(unittest.TestCase):
     self.assertIn("frame-review",caught.exception.detail)
     # the gated predecessor itself is not fenced by its own successor's gate
     self._fence_start(base,path,node="frame")
+
+ def test_a_missing_explicit_jobs_authority_is_refused_before_spawn(self):
+  with tempfile.TemporaryDirectory() as td:
+   base=Path(td); _route,path=self._gated_route(base)
+   ready=D.AttemptReadiness("ready","fixture-ready","att-frame")
+   with mock.patch.object(D,"completion_marker_is_current",return_value=True), \
+        mock.patch.object(D,"completion_attempt_readiness",return_value=ready), \
+        mock.patch.object(D,"_sibling_attempt_gate"):
+    with self.assertRaises(D.DispatchContractError) as caught:
+     D.completion_marker_gate(
+      str(path),"plan","start",base,base/"missing"/"jobs.log",
+      registry_lines=[],attempt_id="att-plan-new",
+     )
+   self.assertEqual(caught.exception.reason,"workflow-ledger-authority-invalid")
+   self.assertIn("jobs-authority-invalid:explicit-jobs:missing",caught.exception.detail)
+   self.assertFalse((base/"missing"/"workflow").exists())
 
  def test_a_raised_unreleased_gate_refuses_the_start(self):
   with tempfile.TemporaryDirectory() as td:
@@ -3120,23 +3138,31 @@ class DispatchContractTest(unittest.TestCase):
       self.assertEqual(caught.exception.reason,"human-gate-unreleased")
       self.assertIn(decision,caught.exception.detail)
 
- def test_the_fence_reads_the_supervisors_ledger_root_not_the_wrappers_jobs(self):
-  """The writer (`workflow-supervisor.py`) resolves its ledger root from the
-  environment; a reader deriving a different root from `--jobs` would report
-  `not-raised` for a gate that was released a second ago."""
+ def test_the_fence_and_supervisor_share_explicit_jobs_across_ambient_roots(self):
+  """Two actors with different ambient roots still read one explicit registry ledger."""
   with tempfile.TemporaryDirectory() as td:
    base=Path(td); route,path=self._gated_route(base)
-   elsewhere=base/"elsewhere"
-   with mock.patch.dict(os.environ,{"AGENT_WORKFLOW_ROOT":str(elsewhere)}):
+   jobs=base/"explicit-state"/"jobs.log"; jobs.parent.mkdir(parents=True)
+   jobs.write_text("",encoding="utf-8")
+   with mock.patch.dict(os.environ,{"AGENT_WORKFLOW_ROOT":str(base/"raise-ambient")}):
     import workflow_state as WS
-    ledger=WS.WorkflowLedger(route["route_id"],route["route_hash"])
-    self.assertEqual(ledger.root,elsewhere/route["route_id"])
+    ledger=WS.WorkflowLedger(route["route_id"],route["route_hash"],jobs=jobs)
+    self.assertEqual(ledger.root,jobs.parent/"workflow"/route["route_id"])
     with ledger.lock():
      ledger.set_workflow_state("READY",evidence={},actor="fixture")
      ledger.set_workflow_state("BLOCKED_HUMAN_GATE",evidence={"gate":"frame-review"},actor="gate")
      ledger.set_workflow_state("RUNNING",evidence={"released_gate":"frame-review",
       "decision":"proceed","released_by":"user"},actor="release")
-    self._fence_start(base,path)
+   with mock.patch.dict(os.environ,{"AGENT_WORKFLOW_ROOT":str(base/"release-ambient")}):
+    ready=D.AttemptReadiness("ready","fixture-ready","att-frame")
+    with mock.patch.object(D,"completion_marker_is_current",return_value=True), \
+         mock.patch.object(D,"completion_attempt_readiness",return_value=ready), \
+         mock.patch.object(D,"_sibling_attempt_gate"):
+     D.completion_marker_gate(str(path),"plan","start",base,jobs,
+                              registry_lines=[],attempt_id="att-plan-new")
+    foreign=WS.WorkflowLedger(route["route_id"],route["route_hash"],
+                              root=base/"release-ambient")
+    self.assertEqual(foreign.read_only_state()["workflow_state"],"CREATED")
 
  def test_a_binding_no_node_raises_is_not_fenced(self):
   """review round 1, B1: `intent-confirmation`, `direction-confirmation`,
@@ -3185,6 +3211,7 @@ class DispatchContractTest(unittest.TestCase):
             "nodes":[{k:v for k,v in n.items()} for n in nodes]}
      path=base/"route.json"; path.write_text(json.dumps(route),encoding="utf-8")
      marker_dir=base/".dispatch"/"completion"/route["route_id"]; marker_dir.mkdir(parents=True)
+     (base/"jobs.log").write_text("",encoding="utf-8")
      for n in nodes:
       (marker_dir/f"{n['id']}.json").write_text(json.dumps({"attempt_id":"att-"+n["id"],"registered_worker":True}),encoding="utf-8")
      ready=D.AttemptReadiness("ready","fixture-ready","att-dep")

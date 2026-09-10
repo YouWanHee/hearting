@@ -115,8 +115,13 @@ def build(
     if not VERSION_RE.fullmatch(version):
         raise SystemExit(f"release version must be SemVer with a v prefix: {version!r}")
     _run_git(root, "rev-parse", "--verify", f"{ref}^{{commit}}")
+    # Peel to the commit before asking for its timestamp. `git show -s --format=%ct`
+    # on an ANNOTATED tag prints the tag body instead of applying the format, so the
+    # int() below died on the release message — every annotated tag was unbuildable
+    # (measured 2026-09-10 on v2.134.0; v2.133.0 is annotated too).
     epoch = int(
-        _run_git(root, "show", "-s", "--format=%ct", ref).stdout.decode().strip()
+        _run_git(root, "show", "-s", "--format=%ct", f"{ref}^{{commit}}")
+        .stdout.decode().strip()
     )
     output.mkdir(parents=True, exist_ok=True)
     archive_path = output / ARCHIVE_NAME

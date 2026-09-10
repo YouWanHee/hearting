@@ -13,6 +13,7 @@ VALID_AFFINITY = DEFAULTS.AFFINITY_VALUES | {"unspecified"}
 sys.path.insert(0, str(ROOT/"utilities"))
 import artifact_locator as ARTIFACT_LOCATOR
 import route_identity as ROUTE_IDENTITY
+import dispatch_runtime_support as RUNTIME_SUPPORT
 import dispatch_terminal_commit
 import model_profile as PROFILE
 import review_round_cap as REVIEW_ROUND_CAP
@@ -796,6 +797,136 @@ def partial_group_continuation(
 def _continuation_id(payload):
     return "cont-"+hashlib.sha256(canonical(payload)).hexdigest()[:32]
 
+def _continuation_release_authority(raise_entry, release_entry, binding):
+    """Return authority while conservatively interpreting legacy interviews."""
+    raise_evidence=raise_entry.get("evidence") if isinstance(raise_entry,dict) else {}
+    raise_evidence=raise_evidence if isinstance(raise_evidence,dict) else {}
+    release_evidence=release_entry.get("evidence") if isinstance(release_entry,dict) else {}
+    release_evidence=release_evidence if isinstance(release_evidence,dict) else {}
+    legacy_interview=bool(raise_evidence.get("interview") or
+                          raise_evidence.get("questions"))
+    authority=(release_evidence.get("release_authority") or
+               binding.get("release_authority") or
+               ("depth-0" if legacy_interview else "any"))
+    if authority != "any" and (
+            release_evidence.get("actor_kind") != "user"
+            or not isinstance(release_evidence.get("released_by"), str)
+            or not release_evidence.get("released_by", "").strip()):
+        raise ValueError("continuation-human-gate-release-unauthorized:"+
+                         str(raise_evidence.get("gate") or "unknown"))
+    return authority
+
+def _continuation_gate_release_proof(source_route,gate):
+    """Seal the exact source raise/release pair before dropping a runtime gate."""
+    import workflow_state as WS
+
+    jobs=((source_route.get("launch_compatibility_tuple") or {})
+          .get("jobs_path") or {}).get("path")
+    if not isinstance(jobs,str) or not Path(jobs).is_absolute():
+        raise ValueError("continuation-human-gate-release-unproven:"+str(gate))
+    ledger=WS.WorkflowLedger(
+        str(source_route.get("route_id") or ""),
+        str(source_route.get("route_hash") or ""),jobs=jobs,
+    )
+    epoch=0; raised=None; released=None
+    for entry in ledger.journal():
+        evidence=entry.get("evidence") if isinstance(entry,dict) else None
+        evidence=evidence if isinstance(evidence,dict) else {}
+        if entry.get("workflow_state") == "BLOCKED_HUMAN_GATE" \
+                and evidence.get("gate") == gate:
+            epoch+=1; raised=entry; released=None
+            continue
+        if raised is None or evidence.get("released_gate") != gate:
+            continue
+        # Resolve the latest epoch through the shared workflow-state reader.
+        # A CANCELLED entry intentionally has no decision and must never be
+        # interpreted as the legacy proceed release.
+        resolution = WS.human_gate_resolution(ledger.journal(), gate)
+        if resolution.get("epoch") != epoch:
+            continue
+        if resolution.get("status") in {"proceed", "revise"}:
+            released=entry
+    if raised is None or released is None:
+        raise ValueError("continuation-human-gate-release-unproven:"+str(gate))
+    resolution = WS.human_gate_resolution(ledger.journal(), gate)
+    if resolution.get("status") != "proceed" or resolution.get("epoch") != epoch:
+        raise ValueError("continuation-human-gate-release-unproven:"+str(gate))
+    evidence=released.get("evidence") or {}
+    decision=evidence.get("decision") or "proceed"
+    if decision != "proceed":
+        raise ValueError("continuation-human-gate-release-unproven:"+str(gate))
+    binding = next((item for item in source_route.get("human_gate_bindings", [])
+                    if isinstance(item, dict) and item.get("gate") == gate), {})
+    authority = _continuation_release_authority(raised, released, binding)
+    return {
+        "gate":str(gate),"source_route_id":str(source_route["route_id"]),
+        "source_route_hash":str(source_route["route_hash"]),"epoch":epoch,
+        "decision":"proceed","jobs_path":str(Path(jobs).resolve(strict=False)),
+        "journal_path":str(ledger.journal_path.resolve(strict=False)),
+        "raise_entry_digest":_sha256_record(raised),
+        "release_entry_digest":_sha256_record(released),
+    }
+
+def _verify_continuation_gate_release_proofs(route):
+    import workflow_state as WS
+    proofs=route.get("reused_human_gate_releases") or []
+    if not isinstance(proofs,list):
+        raise ValueError("continuation-human-gate-release-proofs-invalid")
+    seen=set()
+    for proof in proofs:
+        if not isinstance(proof,dict) or set(proof)!={
+            "gate","source_route_id","source_route_hash","epoch","decision",
+            "jobs_path","journal_path","raise_entry_digest","release_entry_digest",
+        }:
+            raise ValueError("continuation-human-gate-release-proof-invalid")
+        gate=proof.get("gate")
+        if (
+            not isinstance(gate,str) or not gate or gate in seen
+            or proof.get("source_route_id")!=route.get("source_route_id")
+            or proof.get("source_route_hash")!=route.get("source_route_hash")
+            or proof.get("decision")!="proceed"
+            or not isinstance(proof.get("epoch"),int) or proof["epoch"]<1
+        ):
+            raise ValueError("continuation-human-gate-release-proof-invalid")
+        seen.add(gate)
+        jobs=Path(str(proof.get("jobs_path") or ""))
+        journal=Path(str(proof.get("journal_path") or ""))
+        expected=jobs.resolve(strict=False).parent/"workflow"/proof["source_route_id"]/"journal.jsonl"
+        if not jobs.is_absolute() or not journal.is_absolute() or journal.resolve(strict=False)!=expected:
+            raise ValueError("continuation-human-gate-release-proof-authority-invalid")
+        try:
+            entries=[json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines()
+                     if line.strip()]
+        except (OSError,ValueError,UnicodeDecodeError) as exc:
+            raise ValueError("continuation-human-gate-release-proof-unreadable") from exc
+        resolution = WS.human_gate_resolution(entries, gate)
+        if resolution.get("status") != "proceed" or resolution.get("epoch") != proof["epoch"]:
+            raise ValueError("continuation-human-gate-release-proof-drift")
+        raise_count=0; matched_raise=False; matched_release=False
+        for entry in entries:
+            evidence=entry.get("evidence") if isinstance(entry,dict) else None
+            evidence=evidence if isinstance(evidence,dict) else {}
+            if entry.get("workflow_state")=="BLOCKED_HUMAN_GATE" and evidence.get("gate")==gate:
+                raise_count+=1
+                matched_raise=(raise_count==proof["epoch"] and
+                               _sha256_record(entry)==proof["raise_entry_digest"])
+                matched_release=False
+                continue
+            if matched_raise and evidence.get("released_gate")==gate \
+                    and (evidence.get("decision") or "proceed")=="proceed" \
+                    and _sha256_record(entry)==proof["release_entry_digest"]:
+                binding = next((item for item in route.get("human_gate_bindings", [])
+                                if isinstance(item, dict) and item.get("gate") == gate), {})
+                _continuation_release_authority(
+                    next(item for item in entries
+                         if _sha256_record(item)==proof["raise_entry_digest"]),
+                    entry, binding,
+                )
+                matched_release=True
+        if not matched_raise or not matched_release:
+            raise ValueError("continuation-human-gate-release-proof-drift")
+    return proofs
+
 def build_continuation_route(
     source_route,*,resume_from_node,requested_boundary,reason,
     artifact_root,lineage_operation="resume",thread_id=None,new_thread_id=None,
@@ -974,6 +1105,35 @@ def build_continuation_route(
         _assert_pin_matches_grounding(route.get("source_commit"),launch)
     route["artifact_root"]=str(Path(artifact_root).resolve(strict=False))
     route["nodes"]=route_nodes
+    # A continuation is a suffix, not a copy of the source graph. An entry gate
+    # whose target was cut is gone. A raised gate whose raiser was cut but target
+    # remains may disappear only with the exact source proceed evidence sealed.
+    suffix_ids={str(node["id"]) for node in route_nodes}
+    source_raisers={
+        str((node.get("continuation") or {}).get("gate")):str(node.get("id"))
+        for node in source_nodes
+        if (node.get("continuation") or {}).get("kind")=="human-gate"
+    }
+    projected_bindings=[]; release_proofs=[]
+    for row in (source_route.get("human_gate_bindings") or []):
+        if str(row.get("node")) not in suffix_ids:
+            continue
+        gate=str(row.get("gate"))
+        raiser=source_raisers.get(gate)
+        if raiser is not None and raiser not in suffix_ids:
+            release_proofs.append(_continuation_gate_release_proof(source_route,gate))
+            continue
+        projected_bindings.append(json.loads(json.dumps(row)))
+    route["human_gate_bindings"]=projected_bindings
+    route["human_gates"]=sorted({str(row["gate"]) for row in projected_bindings})
+    route["reused_human_gate_releases"]=release_proofs
+    registry=TOPO.load_registry()
+    try:
+        TOPO._validate_continuations(
+            route,registry,route_nodes,{str(node["id"]):node for node in route_nodes},
+        )
+    except TOPO.TopologyError as exc:
+        raise ValueError("continuation-human-gate-unrepresentable:"+str(exc)) from exc
     route["parallel_groups"]=_realized_parallel_groups(route_nodes)
     route["conditional_extensions"]=[]
     route["completion_gates"]=sorted({
@@ -1025,6 +1185,7 @@ def _verify_continuation_route(route):
         raise ValueError("continuation-node-sets-invalid")
     if route.get("source_evidence_digest") != _sha256_record(reused):
         raise ValueError("continuation-source-evidence-digest-invalid")
+    _verify_continuation_gate_release_proofs(route)
     reused_ids=[row.get("node_id") for row in reused if isinstance(row,dict)]
     new_ids=[row.get("node_id") for row in new if isinstance(row,dict)]
     route_ids=[node.get("id") for node in route.get("nodes",[]) if isinstance(node,dict)]
@@ -1828,6 +1989,38 @@ def _seal_dispatch_defaults(nodes, capability, owner_profile=None):
     )
 
 
+def _owner_profile_policy_gap(owner_profile, effective, registry):
+    """None when `owner_profile` is what the portable intensity policy admits
+    for `effective`, else the typed gap: `top-requires-owner` (the exception
+    profile on a direct route, which has no owner) or `mismatch`. One rule
+    read by both the compiler and `verify_route` (review R1 B1: the compiler
+    admitted `top` above the intensity's expected owner profile while verify
+    still demanded equality, so every `top` route compiled and then could
+    not bind, launch, harvest, or close)."""
+
+    if effective == "direct":
+        if owner_profile == PROFILE.TOP_PROFILE:
+            return "top-requires-owner"
+        return None if owner_profile is None else "mismatch"
+    expected = registry["owner_profile_by_intensity"].get(effective)
+    if owner_profile == PROFILE.TOP_PROFILE:
+        return None
+    return None if not expected or owner_profile == expected else "mismatch"
+
+
+def _owner_node(node, effective):
+    """Whether `node` IS the route's owner: only the quick shape's `one-shot`
+    node (the owner and the node are one process there). A standard+ recipe's
+    depth-1 `_kernel/owner` *stage* nodes (prd-transaction, handback, deploy,
+    ...) are not the owner and never inherit its profile (review R2 B1: sealing
+    `top` onto them made compile and verify disagree again, and would have
+    spent the main-session model on stages nobody asked for). One predicate
+    for the compiler and every verify check."""
+
+    return (effective == "quick" and node.get("id") == "one-shot"
+            and node.get("dispatch_depth") == 1 and node.get("unit") == "_kernel/owner")
+
+
 def _seal_profile_demands(nodes, profile_demands=None, explicit_profiles=None, *, legacy=False):
     demands = profile_demands or {}
     explicit_profiles = explicit_profiles or {}
@@ -1865,8 +2058,12 @@ def _profile_input_maps(nodes, demands, explicit):
     for key, value in (demands or {}).items():
         normalized[key] = PROFILE.normalize_profile_demand(value)
     for key, value in (explicit or {}).items():
-        if key not in normalized or value not in PROFILE.PORTABLE_PROFILES:
+        if key not in normalized or value not in PROFILE.KNOWN_PROFILES:
             raise ValueError("profile-explicit-input-invalid:" + key)
+        if value == PROFILE.TOP_PROFILE and key != "__owner__":
+            # The top exception profile is a dispatch-depth-1 decision: a
+            # stage node or parallel leg never spends the main-session model.
+            raise ValueError("profile-explicit-top-owner-only:" + key)
     return normalized, dict(explicit or {})
 
 
@@ -1989,6 +2186,42 @@ def _effective_confirmation_graph(
             node["continuation"] = {"kind": "inline-next"}
     return nodes, bindings
 
+
+def _seal_terminal_commit_support(validation_basis):
+    """PRD §13.53.2: seal SD-120/121 activation as *checked support*.
+
+    Activation is never an owner-remembered switch. The route declares support
+    only when the runtime root it is bound to actually publishes the whole
+    contract -- producer binding, terminal transaction, claim fence, exact
+    finalize, the supervisor gate, and the registered lock-order table -- and
+    the operator has not disabled it. Hash agreement alone can never open it,
+    which is exactly the D-2 regression §13.36.6 rejected.
+
+    Fail-closed: any unreadable root, missing surface, unparsable config or
+    unexpected error yields `False`. The Claude adapter remains the only
+    consumer of the flag, so declaring support claims nothing about Codex or
+    OpenCode parity (§13.36.4).
+    """
+    try:
+        config_path = DEFAULTS.default_config_path()
+        if os.path.exists(config_path):
+            try:
+                config = DEFAULTS.load_and_validate(config_path, DEFAULTS.default_topology_path())
+            except (DEFAULTS.DefaultsConfigError, OSError, json.JSONDecodeError):
+                # A config that exists but does not validate is *not* the same
+                # as no config. Falling back to `None` here would discard an
+                # operator's `off` whenever some unrelated key in the same file
+                # was stale or misspelled -- the switch would be ignored exactly
+                # when the file is damaged, which is when it is most likely to
+                # have been reached for. Refuse instead.
+                return False
+        else:
+            config = None
+        verdict = RUNTIME_SUPPORT.terminal_commit_support(
+            (validation_basis or {}).get("runtime_root"), config)
+        return bool(verdict.get("supported"))
+    except Exception:
+        return False
 
 def _validation_basis():
     """Seal which install root produced `registry_digest`/`unit_catalog_digest`.
@@ -2498,11 +2731,29 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
                                        else owner_model_profile or "light"),
         legacy=True, existing_versioned_stage=True,
     )
-    expected_owner = registry["owner_profile_by_intensity"].get(effective)
-    if expected_owner and owner_profile_selection["resolved_profile"] != expected_owner:
+    resolved_owner_profile = owner_profile_selection["resolved_profile"]
+    # A direct route seals no owner profile; the one thing it must still
+    # refuse is an explicit `top` (direct runs inline in the main session,
+    # which already IS the top model's home -- there is no owner to give it to).
+    gap = _owner_profile_policy_gap(
+        resolved_owner_profile if effective != "direct" or resolved_owner_profile == PROFILE.TOP_PROFILE else None,
+        effective, registry)
+    if gap == "top-requires-owner":
+        raise ValueError("owner-profile-top-requires-owner")
+    if gap:
         raise ValueError("owner-profile-eligibility-conflict")
     if effective != "direct":
-        owner_model_profile = owner_profile_selection["resolved_profile"]
+        owner_model_profile = resolved_owner_profile
+    if resolved_owner_profile == PROFILE.TOP_PROFILE:
+        # Review R1 B2 / R2 B1: the owner's own node -- and only it -- seals
+        # the same explicit `top` selection the owner did; otherwise the route
+        # claims `top` while its node says `balanced-deep`, and the launched
+        # owner's route guard refuses the mismatch.
+        for node in nodes:
+            if _owner_node(node, effective):
+                node["model_profile"] = PROFILE.TOP_PROFILE
+                node["profile_explicit"] = True
+                node["profile_demand"] = owner_demand
     legacy_nodes = not composed or _versioned_subgraph(registry, recipe)
     _seal_profile_demands(nodes, profile_demands, explicit_profiles, legacy=legacy_nodes)
     dispatch_defaults_digest,dispatch_allocation,owner_harness_policy=_seal_dispatch_defaults(
@@ -2528,6 +2779,7 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
       "ordinary":_continuation_ordinary,
       "limit":_continuation_ordinary+TERMINAL_RESERVE_DEFAULT,
     }
+    validation_basis=_validation_basis()
     payload={
       "schema_version":ROUTE_SCHEMA_VERSION,"capability":capability,"capability_mode":capability_mode,
       "requested_intensity":requested_intensity,"effective_intensity":effective,
@@ -2564,16 +2816,16 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
       "registered_headless_candidates":registered_headless_candidates,
       "registered_headless_policy":"serial-attempt" if effective=="quick" else None,
       "unit_catalog_digest":unit_catalog_digest(),
-      "validation_basis":_validation_basis(),
+      "validation_basis":validation_basis,
       "launch_compatibility_tuple":{
           "contract_version":LAUNCH_COMPATIBILITY_TUPLE_VERSION,
           **launch_compatibility_tuple(artifact_root=artifact,cwd=cwd),
       },
       "advance_generation":0,
-      "runtime_support":{"terminal_commit":False,
-                         "terminal_commit_contract":"terminal_commit_v1",
-                         "terminal_handoff_contract":"terminal_handoff_claim_v1",
-                         "producer_binding_contract":"producer_binding_v1"}}
+      "runtime_support":{"terminal_commit":_seal_terminal_commit_support(validation_basis),
+                         "terminal_commit_contract":RUNTIME_SUPPORT.TERMINAL_COMMIT_CONTRACT,
+                         "terminal_handoff_contract":RUNTIME_SUPPORT.TERMINAL_HANDOFF_CONTRACT,
+                         "producer_binding_contract":RUNTIME_SUPPORT.PRODUCER_BINDING_CONTRACT}}
     payload.update(slug_fields)
     if checked_dispatch is not None:
         payload["dispatch_evidence_scope_version"]=DISPATCH_EVIDENCE_SCOPE_VERSION
@@ -2859,12 +3111,22 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
             raise ValueError("invalid dispatch_allocation harness order")
     observed_dispatch_depths = [route["owner_dispatch_depth"]]
     effective=route.get("effective_intensity")
-    expected_owner_profile=(
-        None if effective=="direct"
-        else registry["owner_profile_by_intensity"].get(effective)
-    )
-    if route.get("owner_model_profile") != expected_owner_profile:
+    gap=_owner_profile_policy_gap(route.get("owner_model_profile"), effective, registry)
+    if gap=="top-requires-owner":
+        raise ValueError("owner-profile-top-requires-owner")
+    if gap:
         raise ValueError("owner_model_profile differs from the portable intensity policy")
+    # The owner's own node (quick `one-shot`) must carry the profile the route
+    # sealed for the owner (the policy check above already admitted it, `top`
+    # included); a standard+ recipe's semantic owner node keeps the portable
+    # policy profile below.
+    owner_profile=route.get("owner_model_profile")
+    expected_owner_profile=(
+        None if effective=="direct" else registry["owner_profile_by_intensity"].get(effective)
+    )
+    for node in route.get("nodes",[]):
+        if _owner_node(node, effective) and node.get("model_profile")!=owner_profile:
+            raise ValueError(f"owner node {node.get('id')} profile differs from owner_model_profile")
     def validate_harness_policy(policy):
         if policy is None:
             return
@@ -2910,7 +3172,10 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
         if node.get("dispatch_depth") in {1, 2}:
             profile = node.get("model_profile")
             row = registry["model_profiles"].get(profile)
-            if not isinstance(row, dict) or row.get("registered_topology") is not True:
+            top_owner_node = profile == PROFILE.TOP_PROFILE and _owner_node(node, effective)
+            if not top_owner_node and (
+                not isinstance(row, dict) or row.get("registered_topology") is not True
+            ):
                 raise ValueError(f"node {node.get('id')} has invalid registered model_profile")
         if (
             effective not in ("direct", "quick")
@@ -3013,7 +3278,7 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
             node.get("id") != "one-shot"
             or node.get("dispatch_depth") != 1
             or node.get("unit") != "_kernel/owner"
-            or node.get("model_profile") != expected_owner_profile
+            or node.get("model_profile") != owner_profile
             or node.get("execution_surface") != "registered-headless"
             or node.get("registered_worker") is not True
             or node.get("fallback_hops")

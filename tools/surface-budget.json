@@ -1,0 +1,67 @@
+{
+ "schema": 1,
+ "measurement": "UTF-8 bytes per surface; directives = matches of /\\b(?:must|never|always|shall|do not|don't)\\b|(?<![가-힣])반드시(?![가-힣])|(?<![가-힣])금지(?=[한된됨되함]|(?![가-힣]))|해야(?:만)? 한다/ (case-insensitive) outside fenced code blocks and inline code spans",
+ "sealed_at": "2026-09-09",
+ "sealed_commit": "8bac145b",
+ "ceiling_bytes": 362830,
+ "total_bytes": 362789,
+ "surfaces": {
+  "core/CORE.md": {
+   "bytes": 25281,
+   "directives": 24
+  },
+  "core/WORKFLOW.md": {
+   "bytes": 50072,
+   "directives": 56
+  },
+  "core/CONVENTIONS.md": {
+   "bytes": 60338,
+   "directives": 72
+  },
+  "core/OPERATIONS.md": {
+   "bytes": 109097,
+   "directives": 141
+  },
+  "core/HOOKS.md": {
+   "bytes": 26393,
+   "directives": 35
+  },
+  "core/MEMORY.md": {
+   "bytes": 32809,
+   "directives": 31
+  },
+  "adapters/claude/CLAUDE.md": {
+   "bytes": 10981,
+   "directives": 26
+  },
+  "skills/autopilot-code/references/dev-pipeline.md": {
+   "bytes": 32986,
+   "directives": 38
+  },
+  "skills/autopilot-code/references/owner-execution.md": {
+   "bytes": 14832,
+   "directives": 23
+  }
+ },
+ "history": [
+  {
+   "on": "2026-09-09",
+   "commit": "a471d445",
+   "reason": "astra instruction-surface review (2026-09-09): four rule clauses missing from the §5.10 summaries restored byte-identical from ADAPTATION §8 (SD-67 absent-row/decline, SD-94 owner-closure (a)-(f), SD-64/71/77 evidence order, SD-69 commit boundary)",
+   "raised": [
+    {
+     "surface": "core/OPERATIONS.md",
+     "field": "bytes",
+     "from": 107477,
+     "to": 109134
+    },
+    {
+     "surface": "*",
+     "field": "total_bytes",
+     "from": 361173,
+     "to": 362830
+    }
+   ]
+  }
+ ]
+}

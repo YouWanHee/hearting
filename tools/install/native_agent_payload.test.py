@@ -39,6 +39,28 @@ class NativeAgentPayloadTest(unittest.TestCase):
         shipped_path.write_text(shipped, encoding="utf-8")
         return root
 
+    def test_top_catalog_is_rejected_by_generator_and_effective_payload(self):
+        import contextlib
+        import io
+        from unittest import mock
+        cfg = dict(NAP.model_config.parse_config(ROOT / "adapters/codex/config/models.conf"))
+        cfg["CFG_NATIVE_AGENT_CATALOG"] = "deep:top"
+        root = self.make_root(NAP.model_config.assignments(cfg))
+        home = root / "runtime"
+        with self.assertRaisesRegex(NAP.PayloadError,"top is not a native agent profile"):
+            NAP.plan_payload(home,source_root=root)
+        self.assertFalse(home.exists())
+        spec = importlib.util.spec_from_file_location("top_generator",ROOT/"adapters/codex/bin/sync-native-agents.py")
+        generator = importlib.util.module_from_spec(spec);spec.loader.exec_module(generator)
+        errors = io.StringIO()
+        with mock.patch.object(generator,"load_models_conf",return_value=cfg), \
+             mock.patch.object(sys,"argv",["sync-native-agents.py"]), \
+             mock.patch.object(Path,"write_text") as writes, contextlib.redirect_stderr(errors):
+            self.assertEqual(generator.main(),1)
+        writes.assert_not_called()
+        self.assertIn("top is not a native agent profile",errors.getvalue())
+        self.assertEqual(NAP.renderer.RENDERER_VERSION,"3")
+
     def test_plan_payload_is_deterministic_and_files_are_sorted(self):
         root = self.make_root()
         home = root / "home"

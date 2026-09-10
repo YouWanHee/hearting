@@ -87,6 +87,50 @@ class NestedModelConfigTestCase(unittest.TestCase):
         self.assertEqual(model_config.user_path("codex", runtime=self.nested).read_bytes(), raw)
         self.assertEqual(path.read_bytes(), raw)
 
+    def test_upgraded_shipped_policy_preserves_legacy_astra_bytes_and_native_output(self):
+        import tomllib
+        values = _write_parent_config(self.parent, {
+            "CFG_TIER_DEEP_MODEL":"gpt-6-astra", "CFG_TIER_DEEP_EFFORT":"ultra",
+            "CFG_MODEL_PROFILE_DEEP":"deep:ultra",
+            "CFG_MODEL_PROFILE_BALANCED_DEEP":"deep:high",
+            "CFG_TIER_DEEP_FAILOVER_CASCADE":"gpt-6-astra:ultra gpt-5.6-luna:medium",
+        })
+        for key in ("CFG_MAIN_SESSION_ONLY_MODELS", "CFG_TIER_TOP_MODEL", "CFG_TIER_TOP_EFFORT",
+                    "CFG_MODEL_PROFILE_TOP", "CFG_MODEL_PROFILE_GRANULARITY_TOP",
+                    "CFG_MODEL_PROFILE_BALANCED", "CFG_MODEL_PROFILE_GRANULARITY_BALANCED"):
+            values.pop(key, None)
+        path = model_config.user_path("codex", runtime=self.parent)
+        raw = ("# Legacy user choices; preserve these exact bytes.\n" + model_config.assignments(values)).encode()
+        path.write_bytes(raw)
+        selected, receipt, captured = nmc.capture_snapshot("codex", self.parent, source_root=REPO_ROOT)
+        self.assertEqual((receipt.source,receipt.reason), ("user","user-valid-derived-balanced"))
+        self.assertEqual(captured,raw)
+        self.assertEqual(receipt.unreferenced_tier_keys,"CFG_TIER_TOP_EFFORT,CFG_TIER_TOP_MODEL")
+        self.assertEqual(receipt.balanced_provenance,"derived-from-user-light")
+        self.assertNotIn("CFG_MAIN_SESSION_ONLY_MODELS",selected)
+        self.assertNotIn("CFG_MODEL_PROFILE_TOP",selected)
+        result = nmc.prepare("codex", self.parent, self.nested, source_root=REPO_ROOT, installer=self.installer)
+        self.assertEqual(result["status"],"prepared")
+        self.assertEqual(path.read_bytes(),raw)
+        self.assertEqual(model_config.user_path("codex",runtime=self.nested).read_bytes(),raw)
+        nested, nested_receipt = model_config.resolve_config("codex",runtime=self.nested,source_root=REPO_ROOT)
+        self.assertEqual(nested,selected)
+        self.assertEqual(nested_receipt.source,"user")
+        payload = nmc.native_agent_payload.check_payload(self.nested,source_root=REPO_ROOT)
+        self.assertTrue(payload["ok"],payload)
+        target = Path(payload["target_dir"])
+        for name, effort in (("deep.toml","ultra"),("general-purpose.toml","high")):
+            actual = tomllib.loads((target/name).read_text())
+            self.assertEqual((actual["model"],actual["model_reasoning_effort"]),("gpt-6-astra",effort))
+        # The wrapper's receipt must also report absent policy, not pretend the
+        # upgraded shipped main-only restriction entered this selected user file.
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("legacy_nested_wrapper",REPO_ROOT/"adapters/codex/bin/dispatch-headless.py")
+        wrapper = importlib.util.module_from_spec(spec);spec.loader.exec_module(wrapper)
+        with mock.patch.object(wrapper,"_model_policy",return_value=nested):
+            policy_receipt = wrapper._main_session_only_policy_state()
+        self.assertEqual(policy_receipt,"absent")
+
     def test_explicit_balanced_override_is_not_derived(self):
         values = _write_parent_config(self.parent, {"CFG_MODEL_PROFILE_BALANCED": "light:low"})
         selected, receipt, raw = nmc.capture_snapshot("codex", self.parent, source_root=REPO_ROOT)

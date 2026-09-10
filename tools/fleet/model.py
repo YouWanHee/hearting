@@ -330,6 +330,16 @@ class Session:
     peer_sent_1h: int = 0                 # F-98a snapshot-owned; render never reads the ledger
     peer_recv_1h: int = 0
     peer_last_recv: Optional[dict] = None # {from_name, from_session_id, from_harness, kind, age_min} — NO summary, NO body
+    # Symmetric send side of the same projection: the receive strip alone made the board
+    # say who talked to you but never who you talked to. Same shape, `to_*` keys.
+    peer_last_sent: Optional[dict] = None # {to_name, to_session_id, to_harness, kind, age_min}
+    # Prior session ids this same live process still answers to after a resume/fork
+    # (`session_registry.session_aliases`). DISPLAY JOIN ONLY — never a ledger address,
+    # a `report-agent-session` value, or a completion/wake recipient.
+    session_aliases: Optional[list] = None
+    # Reverse of `steward_targets`: the sessions whose steward marker names THIS session.
+    # Derived from the same read-only markers, so a target can finally show who watches it.
+    steward_parents: Optional[list] = None
     mem_worker: bool = False   # Memory worker or title refresher; summarized and hidden by default.
     # F-29 (v9, prd.md:290-295) — enrichment ONLY, never a session-existence signal (prd.md:291).
     # None = source absent/unconfirmed (honest gap, prd.md:292's "no guessing"); [] = source
@@ -480,7 +490,7 @@ class DispatchJob:
     model_role: Optional[str] = None    # Portable model role from pipe model_role=.
     model_profile: Optional[str] = None  # route-sealed portable execution profile
     model_tier: Optional[str] = None     # adapter-resolved concrete tier
-    profile_granularity: Optional[str] = None  # full | collapsed-balanced-deep | legacy
+    profile_granularity: Optional[str] = None  # full | collapsed-mini | legacy (free text; no adapter emits collapsed-balanced-deep any more)
     profile_selection_source: Optional[str] = None
     profile_resolver_version: Optional[str] = None
     profile_demand_digest: Optional[str] = None
@@ -755,9 +765,23 @@ def session_parent_visible(session):
     calls the exact same function so ``--json`` and the screen consume one value (C6/C13b).
     Does not consult ``--all``/``_SHOW_ALL``: that toggle changes what is DISPLAYED, never
     attribution history, so it must never reach this predicate.
+
+    B-6/4: an app-server row whose managed TUI client has already died is not a
+    "hidden companion" — it IS the real session (title, summary, tier-1/2 lifecycle
+    and all), just without a living client process. `_managed_client_present` (set by
+    `collectors/codex.share_managed_tags`) is the exact managed_dir pairing evidence
+    that distinguishes that case from an ordinary paired app-server companion; only a
+    row that also carries a `session_id` is eligible, so a companion with no identity
+    at all still hides.
     """
-    return not (getattr(session, "liveness", None) in ("stale", "dead")
-                or getattr(session, "app_server", False))
+    app_server = getattr(session, "app_server", False)
+    if (
+        app_server
+        and getattr(session, "session_id", None)
+        and getattr(session, "_managed_client_present", None) is False
+    ):
+        app_server = False
+    return not (getattr(session, "liveness", None) in ("stale", "dead") or app_server)
 
 
 # Grace window for a dispatch job's parent-session edge (F-80), in ticks — not seconds.

@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter, deque
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shlex
 import socket
@@ -30,6 +32,8 @@ from dispatch_completion_join import (  # noqa: E402
     receipt_with_stage_advance,
     validate_delivery_timing,
 )
+import dispatch_pending_delivery as pending_delivery  # noqa: E402
+import human_gate_receipt  # noqa: E402
 
 
 MAX_RESPONSE_BYTES = 16 * 1024
@@ -48,6 +52,190 @@ REQUIRED_ACTIONS = {
 
 class CompletionError(RuntimeError):
     """The exact batch or gateway control contract is invalid."""
+
+
+class HumanGateWatcher:
+    """Bounded observer/claimer for this session's live gate records."""
+
+    def __init__(
+        self, args: argparse.Namespace, attempts: set[str], capability: dict[str, Any]
+    ):
+        self.args = args
+        self.root = args.jobs.resolve(strict=False).parent
+        self.recipient = args.parent_session_id or ""
+        self.owner = f"codex-human-gate:{os.getpid()}"
+        self.attempts = set(attempts)
+        self.epoch = int(capability["epoch"])
+        self._scan_cursor = 0
+        self.stop = __import__("threading").Event()
+        self.thread = __import__("threading").Thread(target=self._run, daemon=True)
+        self.errors = deque(maxlen=32)
+        self.error_counts: Counter[str] = Counter()
+        self.error_count_total = 0
+
+    def _record_error(self, reason: str) -> None:
+        self.errors.append(reason)
+        self.error_count_total += 1
+        if reason in self.error_counts or len(self.error_counts) < 63:
+            self.error_counts[reason] += 1
+        else:
+            self.error_counts["other"] += 1
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def close(self) -> None:
+        self.stop.set()
+        self.thread.join(timeout=min(max(self.args.interval * 2, 0.2), 5.0))
+
+    def _run(self) -> None:
+        if not self.recipient:
+            return
+        directory = pending_delivery.record_directory(self.root, self.recipient)
+        while not self.stop.is_set():
+            try:
+                if directory.is_dir() and not directory.is_symlink():
+                    paths = self._candidate_paths(directory)
+                    for path in paths:
+                        self._one(path)
+            except (OSError, ValueError) as exc:
+                self._record_error(type(exc).__name__)
+            self.stop.wait(min(max(self.args.interval, 0.05), 2.0))
+
+    def _candidate_paths(self, directory: Path) -> list[Path]:
+        """Bound work while rotating eligible records to avoid lexical starvation."""
+        all_paths = sorted(directory.glob("delivery-*.json"))
+        eligible = []
+        for path in all_paths:
+            try:
+                value = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, UnicodeDecodeError):
+                continue
+            receipt = value.get("receipt") if isinstance(value, dict) else None
+            if (isinstance(receipt, dict) and receipt.get("kind") == "human-gate"
+                    and value.get("state") in {"pending", "claimed", "sent-ambiguous"}):
+                eligible.append(path)
+        if not eligible:
+            return []
+        start = self._scan_cursor % len(eligible)
+        selected = [eligible[(start + i) % len(eligible)] for i in range(min(16, len(eligible)))]
+        self._scan_cursor = (start + len(selected)) % len(eligible)
+        return selected
+
+    def _one(self, path: Path) -> None:
+        sent = False
+        try:
+            capability = negotiate_human_gate(self.args)
+            if capability is not None:
+                self.epoch = int(capability["epoch"])
+            record = json.loads(path.read_text(encoding="utf-8"))
+            receipt = record.get("receipt") if isinstance(record, dict) else None
+            if not isinstance(receipt, dict) or receipt.get("kind") != "human-gate":
+                return
+            human_gate_receipt.validate_pending_record(
+                record, jobs=self.args.jobs,
+                expected_thread_id=self.recipient,
+                expected_epoch=self.epoch,
+                expected_attempts=self.attempts,
+                expected_sealed_batch_id=self.args.sealed_batch_id,
+            )
+            # Reclaim only after checking the live monotonic deadline.  The
+            # old carrier's lease may still be valid, so a fresh watcher must
+            # preserve that claim; using deadline+1 here incorrectly steals a
+            # live lease. Sent-ambiguous is made eligible for the existing
+            # gateway lookup/no-resend path, not for a blind second send.
+            if record.get("state") in {"claimed", "sent-ambiguous"}:
+                deadline = record.get("claim_deadline_ns")
+                if not isinstance(deadline, int) or time.monotonic_ns() < deadline:
+                    raise pending_delivery.PendingDeliveryError(
+                        "pending-delivery-claim-refused", "lease-not-expired"
+                    )
+                record = pending_delivery.reclaim(
+                    self.root, self.recipient, record["delivery_id"],
+                    now_ns=time.monotonic_ns(),
+                )
+            claimed = pending_delivery.claim(
+                self.root, self.recipient, record["delivery_id"],
+                claim_owner=self.owner, lease_seconds=30.0,
+                require_generation_proof=True,
+            )
+            human_gate_receipt.validate_pending_record(
+                claimed, jobs=self.args.jobs,
+                expected_thread_id=self.recipient,
+                expected_epoch=self.epoch,
+                expected_attempts=self.attempts,
+                expected_sealed_batch_id=self.args.sealed_batch_id,
+            )
+            request = {"schema_version": 1, "op": "deliver-human-gate",
+                       "thread_id": self.recipient,
+                       "parent_attempt_id": receipt["owner_attempt_id"],
+                       "sealed_batch_id": receipt["sealed_batch_id"],
+                       "delivery_id": human_gate_receipt.gateway_delivery_id(receipt),
+                       "receipt_digest": claimed["receipt_digest"],
+                       "receipt": receipt}
+            result = gateway_request(self.args.control_socket, request)
+            sent = True
+            if result.get("status") == "accepted":
+                pending_delivery.ack(
+                    self.root, self.recipient, claimed["delivery_id"],
+                    acked_by=self.owner,
+                )
+            elif result.get("status") == "sent-ambiguous":
+                pending_delivery.mark_sent_ambiguous(
+                    self.root, self.recipient, claimed["delivery_id"],
+                    claim_owner=self.owner,
+                )
+            elif result.get("status") == "retryable":
+                # Keep the current lease. The next scan may reclaim it only
+                # after its actual deadline; a transient storage error is
+                # neither permanent rejection nor evidence of a send.
+                self._record_error(str(result.get("reason") or "gateway-retryable"))
+            elif result.get("status") == "rejected":
+                reason = result.get("reason")
+                if (result.get("ledger_commit") == "unconfirmed"
+                        or (isinstance(reason, str) and reason.endswith("-ledger-commit-failed"))):
+                    self._record_error("gateway-rejection-commit-unconfirmed")
+                    return
+                if (not isinstance(reason, str)
+                        or not re.fullmatch(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)+(?:[:].*)?", reason)):
+                    self._record_error("gateway-rejection-untyped")
+                    return
+                pending_delivery.reject_claimed(
+                    self.root, self.recipient, claimed["delivery_id"],
+                    claim_owner=self.owner, reason=reason)
+        except Exception as exc:
+            if sent:
+                try:
+                    pending_delivery.mark_sent_ambiguous(
+                        self.root, self.recipient, claimed["delivery_id"], claim_owner=self.owner)
+                except Exception:
+                    pass
+            elif "claimed" in locals():
+                try:
+                    pending_delivery.reclaim(self.root, self.recipient, claimed["delivery_id"],
+                                         now_ns=time.monotonic_ns())
+                except Exception:
+                    pass
+            self._record_error(str(exc))
+
+
+def negotiate_human_gate(args: argparse.Namespace) -> dict[str, Any] | None:
+    try:
+        result = gateway_request(args.control_socket, {
+            "schema_version": 1, "op": "status",
+        })
+    except CompletionError:
+        return None
+    capability = (result.get("capabilities") or {}).get("human_gate_delivery")
+    if not (
+        result.get("status") == "ready" and isinstance(capability, dict)
+        and capability.get("version") == 1
+        and capability.get("thread_id") == args.parent_session_id
+        and isinstance(capability.get("epoch"), int)
+        and capability["epoch"] >= 1
+    ):
+        return None
+    return dict(capability)
 
 
 def canonical(value: Any) -> str:
@@ -421,7 +609,18 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     ):
         raise CompletionError("attempt-set-invalid")
     wait_for_session_launch_claims(args, attempts)
-    receipt = run_join(args, attempts)
+    watcher: HumanGateWatcher | None = None
+    if args.parent_session_id:
+        # An old or disconnected gateway must never receive a gate claim.
+        capability = negotiate_human_gate(args)
+        if capability is not None:
+            watcher = HumanGateWatcher(args, attempts, capability)
+            watcher.start()
+    try:
+        receipt = run_join(args, attempts)
+    finally:
+        if watcher is not None:
+            watcher.close()
     delivery_parent = delivery_parent_id(args)
     if receipt.get("state") == "timeout":
         return (

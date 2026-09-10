@@ -23,7 +23,7 @@ from model_profile import resolve_profile_values  # noqa: E402
 # Bump when the rendered TOML shape or the specs below change, so
 # tools/install/native_agent_payload.py's digest changes with it even if the
 # effective config mapping happens to be unchanged.
-RENDERER_VERSION = "2"
+RENDERER_VERSION = "3"
 
 
 KERNEL_AGENTS = {
@@ -116,6 +116,8 @@ def parse_native_catalog(cfg: Mapping[str, str]) -> list[tuple[str, str]]:
         if token.count(":") != 1:
             raise ValueError(f"malformed CFG_NATIVE_AGENT_CATALOG entry: {token!r}")
         name, profile = token.split(":", 1)
+        if profile == "top":
+            raise ValueError(f"CFG_NATIVE_AGENT_CATALOG entry {token!r}: top is not a native agent profile")
         entries.append((name, profile))
     return entries
 

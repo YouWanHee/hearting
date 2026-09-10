@@ -33,7 +33,7 @@ another adapter.
 - Run deterministic guards directly when hook execution is unavailable or untrusted.
 - Task-specific detail is progressively disclosed through the selected Skill and adapter README/ADAPTATION docs; do not preload unrelated procedures.
 - Call the six runtime-root-sensitive utilities (`capability-route`, `artifact_producer`, `spec-transaction`, `dispatch-owner`, `dispatch-batch`, `dispatch-node`) through the installed `$AGENT_HOME`; a checkout-relative call to one of them is allowed only under dev activation (`AGENT_HOME` is that checkout itself), enforced by `hooks/runtime-root-guard.sh`.
-- Peer-session steering (`OPERATIONS §5.14`): watch a peer depth-0 session with the checked `utilities/peer-steward.py watch` — a detached watcher writes a disk receipt and the `PostToolUse(Bash)` `asyncRewake` carrier wakes this session once (`join`/`status`/`rearm`/`ack` read it; the next prompt sweeps anything un-acked). After the armed line, end the turn: do not launch Background Bash, `Monitor`, liveness, or `dispatch-wait` for that watch and do not emit periodic recaps — the carrier wakes this session exactly once. `wait` stays a bounded foreground surface and must never be backgrounded; `peer-steward.py start` defaults a launched child session to `bypass` permissions (`dispatch-defaults.yaml` `steward.child_permission_mode`, opt-out is `inherit`). `peer-steward.py prompt` reports `prompted=true` only after the submission was observed (state flip, target transcript, or a prompt box herdr actually read); `failed`/`queued`/`unverified` are typed verdicts (a `blocked` target or an open form is never typed into), and a dim `❯ …` line in an *empty* target input is Claude Code's prompt suggestion, not an unsubmitted prompt. Every pane prompt goes through that wrapper (never `herdr agent prompt`/`pane send-text` directly): its ledger row (`to.pane`, caller session, digest, verdict receipt) is the only attribution herdr's own log lacks.
+- Peer-session steering (`OPERATIONS §5.14`): watch a peer depth-0 session with the checked `utilities/peer-steward.py watch`; its armed line carries the same `parent_next=` directive a launch receipt does, and `join`/`status`/`rearm`/`ack` read the watcher's disk receipt. `wait` stays a bounded foreground surface and must never be backgrounded; `peer-steward.py start` defaults a launched child session to `bypass` permissions (`dispatch-defaults.yaml` `steward.child_permission_mode`, opt-out is `inherit`). `peer-steward.py prompt` reports `prompted=true` only after the submission was observed; `failed`/`queued`/`unverified` are typed verdicts (a `blocked` target or an open form is never typed into), and a dim `❯ …` line in an *empty* target input is Claude Code's prompt suggestion, not an unsubmitted prompt. Every pane prompt goes through that wrapper (never `herdr agent prompt`/`pane send-text` directly): its ledger row (`to.pane`, caller session, digest, verdict receipt) is the only attribution herdr's own log lacks.
 
 ## Routing and Execution
 
@@ -62,13 +62,11 @@ For `autopilot-code`, `direct` is inline, `quick` is one registered dispatch-dep
 owner, and `standard+` follows `code-plan -> code-execute -> code-test ->
 code-report` under `core/OPERATIONS.md §5.10`. Dispatch depth 3 is forbidden.
 
-After an interactive `dispatch-owner --start` reports
-`parent_completion_delivery=claude-parent-runtime`, the projected
-`PostToolUse(Bash)` `asyncRewake` hook owns that exact owner attempt until one
-terminal receipt. Do not launch or re-arm Background Bash, `Monitor`, liveness,
-or `dispatch-wait`, and do not emit periodic progress recaps. End the turn after
-the ordinary one-time launch notice; the native hook wakes this session once.
-Only an explicit `poll-fallback` authorizes a model-owned bounded wait.
+Receipts state the next action; you do not carry the delivery taxonomy.
+`parent_next=end-turn` means a runtime carrier owns that attempt — end the turn
+and start no wait, poll, re-arm, or recap for it. `parent_next=bounded-wait`
+means run the printed `parent_next_command` once. Never filter launch stdout:
+an unstated directive is not `end-turn`.
 
 Checked wrappers keep `capability_mode` separate from a non-owner
 `worker_mode`, which must equal its portable `unit`. A dispatch-depth-1 owner is

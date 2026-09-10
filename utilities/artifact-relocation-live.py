@@ -13,6 +13,7 @@ import argparse
 import collections
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -664,38 +665,97 @@ def backup(args: argparse.Namespace) -> int:
 
 
 def scoped_quiescence(args: argparse.Namespace) -> int:
-    raw = read_json(args.input)
+    spec = importlib.util.spec_from_file_location("relocation_quiescence", Path(__file__).with_name("artifact-quiescence.py"))
+    validator = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(validator)
+    integrity = validator.validate_integrity(args.input, allow_fixture=getattr(args, "allow_fixture", False))
+    if not integrity["valid"]:
+        raise ValueError("quiescence-evidence-invalid:" + ";".join(integrity["reasons"]))
+    raw = integrity["payload"]
     root = Path(args.artifact_root).resolve(strict=True)
+    if raw.get("schema_version") != 4:
+        raise ValueError("quiescence-evidence-schema-invalid")
     if raw.get("config", {}).get("artifact_root") != str(root):
         raise ValueError("quiescence-artifact-root-mismatch")
-    job_files = raw.get("sources", {}).get("jobs", {}).get("files") or []
-    external_registries = []
-    scoped_registries = []
-    for row in job_files:
-        path = Path(str(row.get("path", ""))).resolve(strict=False)
-        if path == Path(raw.get("config", {}).get("resource_index", "")).resolve(strict=False):
-            continue
-        try:
-            path.relative_to(root)
-            scoped_registries.append(str(path))
-        except ValueError:
-            external_registries.append(str(path))
-    scoped_jobs = raw.get("open_jobs", 0) if scoped_registries else 0
+    attribution = raw.get("sources", {}).get("attribution")
+    if not isinstance(attribution, dict) or attribution.get("attribution_version") != 1:
+        raise ValueError("quiescence-attribution-missing")
+    sealed = {key: value for key, value in attribution.items() if key != "snapshot_sha256"}
+    expected_attribution = "sha256:" + hashlib.sha256(
+        json.dumps(sealed, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    if attribution.get("snapshot_sha256") != expected_attribution:
+        raise ValueError("quiescence-attribution-digest-mismatch")
+    target = attribution.get("target_root") or {}
+    root_stat = root.stat()
+    if (
+        target.get("resolved_path") != str(root)
+        or target.get("device") != root_stat.st_dev
+        or target.get("inode") != root_stat.st_ino
+    ):
+        raise ValueError("quiescence-attribution-target-mismatch")
+    summary = attribution.get("summary") or {}
+    rows = attribution.get("rows") or []
+    if not isinstance(rows, list):
+        raise ValueError("quiescence-attribution-rows-invalid")
+    calculated = {
+        decision: {"dispatch": 0, "resource": 0}
+        for decision in ("target", "external", "unattributable", "historical")
+    }
+    try:
+        for row in rows:
+            calculated[row["decision"]][row["kind"]] += 1
+    except (KeyError, TypeError):
+        raise ValueError("quiescence-attribution-row-invalid") from None
+    if summary != calculated:
+        raise ValueError("quiescence-attribution-summary-mismatch")
+    external_registries = sorted({
+        str((row.get("identity") or {}).get("registry_path"))
+        for row in rows
+        if row.get("kind") == "resource" and row.get("open") is True
+        and row.get("decision") == "external"
+        and (row.get("identity") or {}).get("registry_path")
+    })
+    scoped_registries = sorted({
+        str((row.get("identity") or {}).get("registry_path"))
+        for row in rows
+        if row.get("kind") == "resource" and row.get("open") is True
+        and row.get("decision") == "target"
+        and (row.get("identity") or {}).get("registry_path")
+    })
+    scoped_jobs = raw.get("open_jobs", 0)
+    external_jobs = (summary.get("external") or {}).get("resource")
+    external_dispatch = (summary.get("external") or {}).get("dispatch")
+    scoped_dispatch = (summary.get("target") or {}).get("dispatch")
+    unattributable = sum((summary.get("unattributable") or {}).values())
+    if not all(isinstance(value, int) and not isinstance(value, bool) and value >= 0
+               for value in (scoped_jobs, external_jobs, external_dispatch,
+                             scoped_dispatch, unattributable)):
+        raise ValueError("quiescence-attribution-summary-invalid")
+    if (
+        raw.get("open_jobs") != (summary.get("target") or {}).get("resource")
+        or raw.get("open_dispatch_attempts") != scoped_dispatch
+        or raw.get("unattributable_open_items") != unattributable
+    ):
+        raise ValueError("quiescence-attribution-count-mismatch")
     malformed = raw.get("source_diagnostics") or []
     body = {
         "schema_version": "artifact-relocation-scoped-quiescence/v1",
         "status": "pass" if (
-            raw.get("lock_present") is False
+            raw.get("observation_valid") is True
+            and raw.get("lock_present") is False
             and raw.get("open_dispatch_attempts") == 0
             and scoped_jobs == 0
+            and raw.get("unattributable_open_items") == 0
         ) else "blocked",
         "artifact_root_identity": str(root),
-        "raw_observation_sha256": digest_file(args.input),
+        "raw_observation_sha256": integrity["sha256"].removeprefix("sha256:"),
         "lock_present": raw.get("lock_present"),
         "open_dispatch_attempts": raw.get("open_dispatch_attempts"),
         "open_jobs": raw.get("open_jobs"),
         "scoped_open_jobs": scoped_jobs,
-        "external_open_jobs": raw.get("open_jobs", 0) - scoped_jobs,
+        "external_open_jobs": external_jobs,
+        "external_open_dispatch_attempts": external_dispatch,
         "external_resource_registries": external_registries,
         "scoped_resource_registries": scoped_registries,
         "open_routes": raw.get("open_routes"),

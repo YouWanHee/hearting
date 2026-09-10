@@ -113,8 +113,16 @@ def deny(reason):
 
 
 def restricted_model(model, restricted):
-    tokens = set(re.split(r"[^a-z0-9]+", str(model).lower()))
-    return any(alias.lower() in tokens for alias in restricted)
+    # Hand-mirrored from utilities/model_config.py `restricted_model` (this
+    # hook is embedded Python inside a shell file and imports nothing): an
+    # entry matches as a whole id, or as a token when it is a bare alias.
+    lowered = str(model).lower()
+    tokens = set(re.split(r"[^a-z0-9]+", lowered))
+    for alias in restricted:
+        alias = alias.lower()
+        if alias and (alias == lowered or (re.fullmatch(r"[a-z0-9]+", alias) and alias in tokens)):
+            return True
+    return False
 
 
 def apply_policy(tool_input):
@@ -160,7 +168,10 @@ def apply_policy(tool_input):
         target = override
     else:
         tier = conf.get("CFG_NATIVE_SUBAGENT", "").strip()
-        target = conf.get("CFG_TIER_%s_MODEL" % tier.upper(), "").strip() if tier else ""
+        # Tier ids are normalized the way model_profile does: `balanced-deep` names
+        # the CFG_TIER_BALANCED_DEEP_* keys.
+        tier_key = tier.upper().replace("-", "_")
+        target = conf.get("CFG_TIER_%s_MODEL" % tier_key, "").strip() if tier else ""
     if not target or restricted_model(target, restricted):
         deny("native-subagent-eligible-model-unavailable")
         return

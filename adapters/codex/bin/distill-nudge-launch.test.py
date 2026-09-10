@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Codex nudge integration with real controllers and synthetic worker effects.
 
-All mutable state lives under /var/tmp. No provider CLI or real mem.py runs.
+All mutable state lives under the runner-provided temporary directory. No provider CLI or real mem.py runs.
 TEST_SOURCE_ROOT permits a private candidate to exercise the source checkout.
 """
 from __future__ import annotations
@@ -91,6 +91,24 @@ raise SystemExit(hook.main())
 '''
 
 
+END_HOOK_RUNNER = r'''import importlib.util,os,sys,types
+from pathlib import Path
+# Only unrelated route/Fleet bookkeeping is stubbed. The native bridge,
+# completion launch/receipt and tracked preflight all execute their real code.
+fleet=types.ModuleType('fleet');fleet.__path__=[];sys.modules['fleet']=fleet
+interaction=types.ModuleType('fleet.interaction');interaction.clear_wait=lambda *a:None
+sys.modules['fleet.interaction']=interaction;fleet.interaction=interaction
+source=Path(os.environ['TEST_SOURCE_ROOT'])
+spec=importlib.util.spec_from_file_location('fixture_end',source/'adapters/codex/hooks/sessionend-lifecycle.py')
+hook=importlib.util.module_from_spec(spec);spec.loader.exec_module(hook)
+hook.PREFLIGHT=Path(os.environ['TEST_PREFLIGHT'])
+def bookkeeping(*args,**kwargs):
+    assert args[:2]==('material-route','clear'),args
+hook.run_preflight=bookkeeping
+raise SystemExit(hook.main())
+'''
+
+
 def load_module(name: str, path: Path):
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
@@ -101,7 +119,7 @@ def load_module(name: str, path: Path):
 
 class NudgeIntegrationTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="hearting-nudge-test-", dir="/var/tmp")
+        self.temp = tempfile.TemporaryDirectory(prefix="hearting-nudge-test-")
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
         self.fixture = self.base / "source"
@@ -166,12 +184,13 @@ class NudgeIntegrationTests(unittest.TestCase):
             row = self.receipt()
             if not row or row["state"] in ("completed", "failed"): break
             time.sleep(.02)
-        row = self.receipt()
-        for key in ("command", "runner"):
-            identity = row.get(key) if row else None
-            if identity and identity["pid"] != os.getpid() and self.completion.identity_alive(identity):
-                try: os.killpg(identity["pid"], signal.SIGTERM)
-                except ProcessLookupError: pass
+        for receipt in (self.receipt, self.end_receipt):
+            row = receipt()
+            for key in ("command", "runner"):
+                identity = row.get(key) if row else None
+                if identity and identity["pid"] != os.getpid() and self.completion.identity_alive(identity):
+                    try: os.killpg(identity["pid"], signal.SIGTERM)
+                    except ProcessLookupError: pass
         for child in self.children:
             if child.poll() is None:
                 os.killpg(child.pid, signal.SIGKILL)
@@ -218,6 +237,44 @@ class NudgeIntegrationTests(unittest.TestCase):
         self.children.append(child)
         return child
 
+    def native_session_end(self, **extra):
+        runner = self.base / "end-hook-runner.py"
+        runner.write_text(END_HOOK_RUNNER)
+        transcript = self.base / "synthetic-transcript.jsonl"
+        if not transcript.exists(): transcript.write_text('{"synthetic":true}\n')
+        before = time.monotonic()
+        result = subprocess.run([sys.executable, "-B", str(runner)], cwd=self.cwd,
+            env=dict(self.env, **extra), text=True, capture_output=True, timeout=3,
+            input=json.dumps({"session_id":self.sid, "cwd":str(self.cwd),
+                              "transcript_path":str(transcript)}))
+        return result, time.monotonic() - before
+
+    def end_receipt(self):
+        return self.completion.read_receipt("codex", self.sid, self.env)
+
+    def test_native_session_end_receipt_waits_for_delayed_increment(self):
+        self.start_held()
+        result, elapsed = self.native_session_end()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertLess(elapsed, 3)
+        self.wait_for(lambda: self.end_receipt() and self.end_receipt().get("command"))
+        time.sleep(.15)
+        self.assertEqual(self.end_receipt()["state"], "started")
+        self.assertEqual([r["event"] for r in self.events()], ["worker-start"])
+        # Same generation re-entry cannot spawn a second tracked completion.
+        first = self.end_receipt()
+        repeated, _ = self.native_session_end()
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        self.assertEqual(self.end_receipt()["command"], first["command"])
+        Path(self.env["FAKE_RELEASE"]).touch()
+        final = self.wait_for(lambda: (r if (r := self.end_receipt()) and r["state"] in ("completed","failed") else None))
+        self.assertEqual(final["state"], "completed", final)
+        self.assertEqual([(r["event"],r.get("mode")) for r in self.events()],
+            [("worker-start","increment"),("worker-finish","increment"),
+             ("initial-sync",None),("worker-start","curate"),
+             ("worker-finish","curate"),("post-sync",None)])
+
     def start_held(self, **extra):
         self.state_path().write_text("9\n")
         result, duration = self.prompt(FAKE_HOLD="1", **extra)
@@ -249,6 +306,20 @@ class NudgeIntegrationTests(unittest.TestCase):
         self.assertEqual(self.events()[0]["cwd"], str(self.cwd))
         self.assertEqual([self.events()[0][key] for key in ("enable","apply","accepted")], ["1"]*3)
         self.assertEqual(self.events()[0]["completion"], "1")
+
+    def test_compatibility_increment_alias_keeps_counter_and_active_receipt(self):
+        first = self.start_held()
+        counter = self.state_path().read_bytes()
+        result = subprocess.run([str(self.fixture/"adapters/codex/bin/preflight.sh"),
+            "turn-nudge-distill",str(self.cwd),self.sid],cwd=self.cwd,
+            env=dict(self.env,FAKE_HOLD="1"),capture_output=True,text=True,timeout=3)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(self.state_path().read_bytes(),counter)
+        self.assertEqual(self.receipt()["input_generation"],first["input_generation"])
+        self.assertEqual([r["event"] for r in self.events()],["worker-start"])
+        Path(self.env["FAKE_RELEASE"]).touch()
+        self.assertEqual(self.terminal()["state"],"completed")
+        self.assertEqual([r["mode"] for r in self.events() if r["event"]=="worker-start"],["increment"])
 
     def test_active_second_firing_is_deduplicated_then_new_generation_runs(self):
         first = self.start_held()

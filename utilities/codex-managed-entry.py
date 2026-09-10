@@ -21,6 +21,32 @@ ROOT = Path(__file__).resolve().parents[1]
 GATEWAY = ROOT / "utilities" / "codex-managed-gateway.py"
 FEATURE = "default_mode_request_user_input"
 
+sys.path.insert(0, str(ROOT))
+from tools.fleet import session_registry  # noqa: E402
+
+
+def _proc_start(pid: int) -> str | None:
+    """/proc/<pid>/stat field 22 (starttime) as a str, else None — the same PID-reuse
+    guard value `tools/fleet/collectors/procscan.read_proc_start` computes, kept as a
+    small local copy here rather than an import so a launch-path failure in Fleet's
+    package never blocks starting Codex itself."""
+    try:
+        with open("/proc/%d/stat" % pid) as handle:
+            data = handle.read()
+    except OSError:
+        return None
+    try:
+        rest = data[data.rindex(")") + 1:].split()
+        if rest[0] == "Z":
+            return None
+        return rest[19]
+    except (ValueError, IndexError):
+        return None
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
 
 class EntryError(RuntimeError):
     """The isolated managed-entry boundary is unsafe or unavailable."""
@@ -334,6 +360,9 @@ def execute(args: argparse.Namespace) -> int:
         return 0
     app_server: subprocess.Popen[Any] | None = None
     gateway: subprocess.Popen[Any] | None = None
+    client_proc: subprocess.Popen[Any] | None = None
+    app_server_pid: int | None = None
+    client_pid: int | None = None
     try:
         app_server = subprocess.Popen(
             [
@@ -350,6 +379,22 @@ def execute(args: argparse.Namespace) -> int:
             stderr=None,
             start_new_session=True,
         )
+        app_server_pid = app_server.pid
+        try:
+            session_registry.write(
+                "codex",
+                app_server_pid,
+                {
+                    "cwd": str(workspace),
+                    "startedAt": _now_ms(),
+                    "procStart": _proc_start(app_server_pid),
+                    "kind": "codex-app-server",
+                    "entrypoint": "codex-managed-entry",
+                    "harness": "codex",
+                },
+            )
+        except Exception:
+            pass
         wait_socket(upstream, app_server, 20)
         gateway_command = [
             sys.executable,
@@ -364,6 +409,8 @@ def execute(args: argparse.Namespace) -> int:
             str(ledger),
             "--trace",
             str(trace),
+            "--session-registry-pid",
+            str(app_server_pid),
         ]
         if args.gateway_fault != "none":
             gateway_command += ["--fault", args.gateway_fault]
@@ -406,14 +453,39 @@ def execute(args: argparse.Namespace) -> int:
                 ),
                 file=sys.stderr,
             )
-        result = subprocess.run(
+        # B-2a: Popen (not run) so the client pid exists to write its own registry
+        # record. No `start_new_session`/stdio arguments — same process group, same
+        # tty, same inherited stdin/stdout/stderr as the prior `subprocess.run` call,
+        # so TUI focus and Ctrl-C delivery are unchanged (R11).
+        client_proc = subprocess.Popen(
             client,
             cwd=workspace,
             env=environment,
-            check=False,
         )
-        return result.returncode
+        client_pid = client_proc.pid
+        try:
+            session_registry.write(
+                "codex",
+                client_pid,
+                {
+                    "cwd": str(workspace),
+                    "startedAt": _now_ms(),
+                    "procStart": _proc_start(client_pid),
+                    "kind": "codex-tui",
+                    "entrypoint": "codex-managed-entry",
+                    "harness": "codex",
+                },
+            )
+        except Exception:
+            pass
+        return client_proc.wait()
     finally:
+        for pid in (client_pid, app_server_pid):
+            if pid is not None:
+                try:
+                    session_registry.remove("codex", pid)
+                except Exception:
+                    pass
         terminate(gateway)
         terminate(app_server)
         for path in (front, control, upstream):

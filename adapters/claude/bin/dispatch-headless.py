@@ -70,6 +70,7 @@ from dispatch_contract import (  # noqa: E402
     validate_nested_eligibility,
     wait_governor_reservation_claim,
 )
+from parent_next_directive import receipt_lines as parent_next_receipt_lines  # noqa: E402
 from dispatch_summary import launch_summary_owner  # noqa: E402
 from artifact_producer import (  # noqa: E402
     ProducerError,
@@ -113,11 +114,13 @@ from stage_session_runtime import (  # noqa: E402
     prompt_fragment as stage_session_prompt,
 )
 from model_profile import (  # noqa: E402
+    TOP_PROFILE,
     ModelProfileError,
+    require_top_route,
     resolve_runtime_profile,
     validate_registered_profile,
 )
-from model_config import ModelConfigError, resolve_config  # noqa: E402
+from model_config import ModelConfigError, resolve_config, restricted_model  # noqa: E402
 from codex_dispatch_terminal import REVIEW_BLOCKING_NOTE, inspect_terminal_attempt  # noqa: E402
 from codex_managed_dispatch import (  # noqa: E402
     MANAGED_PARENT_DELIVERY,
@@ -407,15 +410,13 @@ def _model_policy() -> dict[str, str]:
 
 
 def _main_session_only_model(model: str) -> bool:
-    tokens = set(re.split(r"[^a-z0-9]+", model.lower()))
     policy = _model_policy()
     if "CFG_MAIN_SESSION_ONLY_MODELS" not in policy:
         raise ModelSelectionError(
             "dispatch-model-policy-unavailable",
             "CFG_MAIN_SESSION_ONLY_MODELS is not declared",
         )
-    restricted = policy["CFG_MAIN_SESSION_ONLY_MODELS"].split()
-    return any(alias.lower() in tokens for alias in restricted)
+    return restricted_model(model, policy["CFG_MAIN_SESSION_ONLY_MODELS"])
 
 
 def _require_headless_model(model: str, source: str) -> None:
@@ -424,6 +425,18 @@ def _require_headless_model(model: str, source: str) -> None:
             "headless-main-session-only-model",
             f"model selected by {source} is interactive dispatch-depth-0 main-session only",
         )
+
+
+def _model_config_state() -> tuple[str, str]:
+    """Which models.conf this launch resolved (`user` or `shipped`) and why --
+    on the receipt so a user copy silently replaced by the shipped file is
+    visible (top review B2)."""
+
+    try:
+        _values, receipt = resolve_config("claude", source_root=ROOT)
+    except ModelConfigError as exc:
+        return "unavailable", str(exc)[:80]
+    return receipt.source, receipt.reason
 
 
 def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
@@ -436,6 +449,14 @@ def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
         )
     except ModelProfileError as exc:
         raise ModelSelectionError("invalid-dispatch-model-profile", str(exc)) from exc
+    try:
+        binding = getattr(args, "owner_route_binding", None)
+        require_top_route(
+            getattr(args, "route_file", None) or getattr(binding, "route_file", None),
+            profile=args.model_profile or "",
+        )
+    except ModelProfileError as exc:
+        raise ModelSelectionError(exc.reason, str(exc)) from exc
     if args.inherit_model_settings:
         if args.model_profile or args.model_role or args.model or args.effort:
             raise ModelSelectionError(
@@ -469,9 +490,23 @@ def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
         except ModelProfileError as exc:
             raise ModelSelectionError("invalid-dispatch-model-profile", str(exc)) from exc
         model = args.model or resolved["model"]
-        _require_headless_model(model, f"profile:{args.model_profile}")
+        if resolved["profile"] == TOP_PROFILE and args.model:
+            # No cascade in or out: nothing runs under the `top` label but the
+            # top model itself (top review m1).
+            raise ModelSelectionError(
+                "profile-top-override-forbidden",
+                "the top exception profile admits no concrete --model override, capacity retry included",
+            )
+        if resolved["profile"] == TOP_PROFILE:
+            # The one door: a route-sealed `top` profile resolves to the
+            # main-session-only model on purpose (2026-09-09 사용자 결정). The
+            # waiver covers exactly that resolved model.
+            source = "profile-top"
+        else:
+            _require_headless_model(model, f"profile:{args.model_profile}")
+            source = "profile+capacity" if args.model else "profile"
         return {
-            "source": "profile+capacity" if args.model else "profile",
+            "source": source,
             "role": args.model_role or "_kernel/owner",
             "profile": resolved["profile"],
             "tier": resolved["tier"],
@@ -2875,6 +2910,9 @@ def main(argv: list[str]) -> int:
     print(f"model_role={settings['role']}")
     print(f"model_profile={settings['profile']}")
     print(f"model_tier={settings['tier']}")
+    _config_source, _config_reason = _model_config_state()
+    print(f"model_config_source={_config_source}")
+    print(f"model_config_reason={_config_reason}")
     print(f"profile_granularity={settings['granularity']}")
     for key, value in sorted(getattr(args, "profile_selection_receipt", {}).items()):
         print(f"{key}={value}")
@@ -2915,16 +2953,21 @@ def main(argv: list[str]) -> int:
     )
     print(f"registered={1 if args.attempt_claimed else 0}")
     print(f"started={1 if action == 'start' and args.attempt_claimed else 0}")
-    print(
-        "child_spawned="
-        + str(
-            int(
-                action == "start"
-                and bool(args.attempt_claimed)
-                and bool(getattr(args, "child_pid", None))
-            )
-        )
+    spawned_child = int(
+        action == "start"
+        and bool(args.attempt_claimed)
+        and bool(getattr(args, "child_pid", None))
     )
+    print(f"child_spawned={spawned_child}")
+    if spawned_child:
+        # The receipt states the parent's next action itself, so a parent does
+        # not have to carry the completion-delivery taxonomy in its own
+        # instructions (`utilities/parent_next_directive.py`).
+        for directive_line in parent_next_receipt_lines(
+            getattr(args, "parent_completion_delivery", ""), args.attempt_id,
+            agent_home=args.agent_home,
+        ):
+            print(directive_line)
     print(f"child_pid={getattr(args, 'child_pid', None) or '-'}")
     print(f"child_pid_start={getattr(args, 'child_pid_start', None) or '-'}")
     print(f"launch_heartbeat={getattr(args, 'launch_heartbeat', 'not-started')}")

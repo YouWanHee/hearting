@@ -189,6 +189,61 @@ def _adopt_child_titles(sessions, jobs):
             job._dispatch_context_owned = True
 
 
+def apply_session_aliases(sessions):
+    """Attach each row's prior session ids (resume/fork), display-join use only.
+
+    Must run before the peer and steward joins — both key on `(harness, session_id)` and
+    both can be addressed by an id the session no longer uses.
+    """
+    from .. import session_registry
+    live_ids = {(str(getattr(s, "harness", "") or "").lower(), s.session_id)
+                for s in sessions if getattr(s, "session_id", None)}
+    for s in sessions:
+        harness = str(getattr(s, "harness", "") or "").lower()
+        if not getattr(s, "pid", None) or harness not in session_registry.HARNESSES:
+            continue
+        try:
+            aliases = session_registry.session_aliases(harness, s.pid)
+        except Exception:
+            continue
+        # A `--fork-session` parent can still be running under its own row. Adopting its
+        # id here would make two rows answer to one key and hand the parent's messages to
+        # the child, so an id that is still someone's current identity is never an alias.
+        aliases = [a for a in aliases if (harness, a) not in live_ids]
+        if aliases:
+            s.session_aliases = aliases
+
+
+def apply_peer_rows(sessions, by_key):
+    """Project the ledger's per-session rows onto the Session objects.
+
+    Joins over every id a row answers to, not just its current one: a resumed session's
+    receipts are split across its old and new id, and only the older key carries the
+    sender identity (measured 2026-09-09 — the newer key held a bare `notice` whose
+    `from.session_id` was empty). Counters sum; each "last" takes the freshest entry
+    (`age_min` counts minutes since, so smaller is newer).
+    """
+    from .. import session_registry
+    for s in sessions:
+        if not getattr(s, "session_id", None):
+            continue
+        rows = [by_key[key] for key in session_registry.session_join_keys(s) if key in by_key]
+        if not rows:
+            continue
+        s.peer_sent_1h = sum(row.get("sent_1h", 0) for row in rows)
+        s.peer_recv_1h = sum(row.get("recv_1h", 0) for row in rows)
+        def _age(entry):
+            # A missing or non-numeric age must not win the "freshest" comparison — `or 0`
+            # would rank an unparseable entry ahead of every real one.
+            age = entry.get("age_min")
+            return age if isinstance(age, (int, float)) and not isinstance(age, bool) else float("inf")
+
+        for field, attr in (("last_recv", "peer_last_recv"), ("last_sent", "peer_last_sent")):
+            entries = [row[field] for row in rows if row.get(field)]
+            if entries:
+                setattr(s, attr, min(entries, key=_age))
+
+
 def collect_all(harness_filter=None, jobs_path=None, usage="cache-only"):
     """Return (sessions, jobs).
 
@@ -228,6 +283,22 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only"):
                     fn(s)
             except Exception:
                 pass  # enrichment failure never removes the backbone row
+    # Managed Codex: the hidden app-server row shares the tag its TUI client minted,
+    # joined on the exact managed state dir (additive; never touches an existing tag).
+    try:
+        share_tags = getattr(modules.get("codex"), "share_managed_tags", None)
+        if share_tags and codex_tick is not None:
+            share_tags(sessions)
+    except Exception:
+        pass
+    # B-2c: server → client copy of tier-1 session_registry state (sessionId/status),
+    # the same managed_dir pairing as share_tags above but the opposite direction.
+    try:
+        share_registry_state = getattr(modules.get("codex"), "share_managed_registry_state", None)
+        if share_registry_state and codex_tick is not None:
+            share_registry_state(sessions)
+    except Exception:
+        pass
 
     # Exact Fleet-owned decision/approval waits are additive enrichment. Run
     # after harness identity resolution and before the single liveness verdict.
@@ -249,6 +320,14 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only"):
         _herdr.enrich(sessions)
     except Exception:
         pass
+    # Resume/fork aliases must be resolved BEFORE the two ledger joins below, which both
+    # key on `(harness, session_id)`: a resumed session's older receipts and any steward
+    # marker written before the resume still name the id it used to have.
+    try:
+        apply_session_aliases(sessions)
+    except Exception:
+        pass
+
     # F-100c: steward flag — exact (harness, session_id) join on the ledger's markers.
     try:
         from . import steward as _steward
@@ -292,8 +371,10 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only"):
                     continue
                 for key in ("rl_5h", "rl_7d", "rl_ms"):
                     value = payload.get(key)
-                    if value is not None and value != []:
-                        setattr(s, key, value)
+                    # B-6/2: when the account snapshot lacks a key, the session field must
+                    # go to None too — a missing account value means "unknown", not
+                    # "keep whatever this session's stale rollout attribution left behind".
+                    setattr(s, key, value if value not in (None, []) else None)
                 if account_windows:
                     s.rl_windows = account_windows
                 elif harness == "codex" and (
@@ -411,15 +492,7 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only"):
     try:
         from . import peer_messages
         peer = peer_messages.collect()
-        by_key = (peer or {}).get("by_session") or {}
-        for s in sessions:
-            row = by_key.get((str(getattr(s, "harness", "") or "").lower(),
-                              s.session_id)) if s.session_id else None
-            if not row:
-                continue
-            s.peer_sent_1h = row.get("sent_1h", 0)
-            s.peer_recv_1h = row.get("recv_1h", 0)
-            s.peer_last_recv = row.get("last_recv")
+        apply_peer_rows(sessions, (peer or {}).get("by_session") or {})
     except Exception:
         peer = None
     collect_all.last_peer_messages = peer

@@ -386,10 +386,12 @@ most likely to drift when the shipped file changes:
 
 | Model profile | Codex realization (shipped default shown) | Registered topology use |
 |---|---|---|
-| `deep` | configured deep tier / configured deep effort (shipped: `xhigh`; an Astra Ultra opt-in changes this coherently, see `models.conf` comments) | standard+ ownership, convergence, and highest-risk legs |
-| `balanced-deep` | configured deep tier / configured balanced-deep effort (shipped: `medium`) | quick one-shot conduction and subordinate deep-model judgment at a lower coordination budget |
-| `light` | configured light tier / configured light effort (shipped: `medium`) | routine implementation, verification, reporting, and breadth legs |
-| `mini` | configured mini tier / configured mini effort (shipped: `low`, not `medium` — mini rides the light model at a lower effort step) | lifecycle and micro-semantic helpers only; substantive dispatch-depth-1/2 work is rejected |
+| `deep` | configured deep tier / `xhigh` | standard+ ownership, convergence, and highest-risk legs |
+| `balanced-deep` | configured deep tier / `medium` | quick one-shot conduction and subordinate deep-model judgment at a lower coordination budget |
+| `balanced` | configured light tier / `high` | long multi-step execution after the decision is settled |
+| `light` | configured light tier / `medium` | routine implementation, verification, reporting, and breadth legs |
+| `mini` | configured mini tier / `low` | lifecycle and micro-semantic helpers only; substantive dispatch-depth-1/2 work is rejected |
+| `top` | configured top tier / `xhigh` | exception above deep: the main-session-only model (`CFG_MAIN_SESSION_ONLY_MODELS`, enforced by this wrapper since 2026-09-10; a user copy without the key stays selected whole-file and unrestricted, receipt `main_session_only_policy=absent`), reachable only from a route that seals the explicit `top` profile on a dispatch-depth-1 owner (refused without it); no cascade in or out, no `--model` override, and `--inherit-model-settings` is refused outright |
 
 Non-route role compatibility overrides remain explicit and config-derived:
 

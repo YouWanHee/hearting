@@ -6,8 +6,10 @@ feeds stays at its snapshot default so the rendered board is byte-identical to a
 pre-SD-122 board.
 """
 import glob
+import importlib.util
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -15,6 +17,53 @@ from pathlib import Path
 _TAIL_BYTES = 64 * 1024
 _WINDOW_SECONDS = 24 * 3600
 _MAX_RECORDS = 200
+
+# C-2 — a herdr sender trailer written 2026-09-08T02:54Z~11:18Z carried a trailing
+# " ; ref=<32hex>" transfer-ref suffix inside the display name (the writer
+# already separates them today; this is read-side tolerance for the records
+# still on disk from that window, display only — the ledger itself is untouched).
+_REF_TRAILER_RE = re.compile(r"\s*;\s*ref=[0-9a-f]{32}\s*$")
+
+_peer_message_module = None
+
+
+def _clean_from_name(name):
+    if not isinstance(name, str):
+        return name
+    return _REF_TRAILER_RE.sub("", name)
+
+
+def _load_peer_message():
+    """Lazy-load `utilities/peer-message.py` (hyphenated — not `import`able by
+    name) once, so `_state_roots()` can ask it for the peer ledger's canonical
+    root (C-8). Fail-soft and cached: a read-only collector must never raise,
+    and re-executing the module on every tick would be wasted work."""
+    global _peer_message_module
+    if _peer_message_module is not None:
+        return _peer_message_module
+    here = Path(__file__).resolve()
+    for candidate in here.parents:
+        pm_path = candidate / "utilities" / "peer-message.py"
+        if pm_path.is_file():
+            try:
+                spec = importlib.util.spec_from_file_location("peer_message", str(pm_path))
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+            except Exception:
+                return None
+            _peer_message_module = module
+            return module
+    return None
+
+
+def _peer_ledger_root():
+    module = _load_peer_message()
+    if module is None:
+        return None
+    try:
+        return str(module.peer_state_root())
+    except Exception:
+        return None
 
 
 def _agent_home():
@@ -45,7 +94,15 @@ def _state_roots():
     `.dispatch` and ignores an inherited `AGENT_DISPATCH_JOBS`). Modelled on
     `tools/fleet/route.py`'s `_dispatch_state_roots` — lazy import, tolerant of every
     failure (never raises out of a read-only collector). F-100c appends every installed
-    runtime's own dispatch root (`_runtime_ledger_roots`)."""
+    runtime's own dispatch root (`_runtime_ledger_roots`).
+
+    C-8 — index 0 is always the peer ledger's canonical root
+    (`peer-message.py::peer_state_root()`), promoting it to the front (never
+    duplicating it) when it is already present. This is the same list
+    `peer-message.py:412 steward_marker_roots` reads back through the
+    "fleet-reader" branch, and its "chain index 0 = the writer's root" contract
+    depends on this ordering. A resolver failure here is swallowed — the rest
+    of the roots still apply."""
     roots = []
     try:
         home = _agent_home()
@@ -71,6 +128,11 @@ def _state_roots():
                 roots.append(extra)
     except Exception:
         pass
+    peer_root = _peer_ledger_root()
+    if peer_root is not None:
+        peer_norm = os.path.normpath(peer_root)
+        roots = [r for r in roots if os.path.normpath(r) != peer_norm]
+        roots.insert(0, peer_root)
     return tuple(roots)
 
 
@@ -141,17 +203,47 @@ def collect(state_roots=None):
         return (str(block.get("harness") or "").lower(), sid) if sid else None
 
     def _row(key):
-        return by_session.setdefault(key, {"sent_1h": 0, "recv_1h": 0, "last_recv": None})
+        return by_session.setdefault(key, {"sent_1h": 0, "recv_1h": 0,
+                                           "last_recv": None, "last_sent": None})
+
+    def _peer_name(block, key):
+        """The ledger's own display name for an endpoint, or ``None``.
+
+        Never the raw session id. A codex→claude transfer record carries
+        ``from.name: null`` (measured 2026-09-09), and the old fallback pasted the
+        36-character id into the name slot, which is what put
+        `← 01a084f7-63f2-7961-ae60-6fc2d8e60fc2` on the board. Naming an unnamed peer
+        is the renderer's job — it can see the tag of a row the collector cannot.
+        """
+        name = _clean_from_name(block.get("name"))
+        if not isinstance(name, str):
+            return None
+        name = name.strip()
+        if not name:
+            return None
+        sid = key[1] if key else None
+        return None if sid and name == sid else name
 
     def _record_recv(to_key, kind, frm, to, from_key, age_min):
         row = _row(to_key)
         if age_min <= 60:
             row["recv_1h"] += 1
-        from_sid = from_key[1] if from_key else None
-        from_name = (frm.get("name") or from_sid or "")
-        row["last_recv"] = {"from_name": from_name, "from_session_id": from_sid,
-                             "from_harness": from_key[0] if from_key else "",
+        row["last_recv"] = {"from_name": _peer_name(frm, from_key),
+                             "from_session_id": from_key[1] if from_key else None,
+                             # An identity-less sender still has a harness, and the sent
+                             # side has always kept it. Dropping it here left the renderer
+                             # unable to look the peer up at all (measured 2026-09-10).
+                             "from_harness": (from_key[0] if from_key
+                                              else str(frm.get("harness") or "").lower()),
                              "kind": kind, "age_min": age_min}
+
+    def _record_sent(from_key, kind, frm, to, to_key, age_min):
+        row = _row(from_key)
+        row["last_sent"] = {"to_name": _peer_name(to, to_key),
+                            "to_session_id": to_key[1] if to_key else None,
+                            "to_harness": (to_key[0] if to_key
+                                           else str(to.get("harness") or "").lower()),
+                            "kind": kind, "age_min": age_min}
 
     def _upgrade_recv(to_key, inherited, frm, to, from_key, age_min):
         # A correlated notice is, by construction, the newest successful receipt for
@@ -161,10 +253,13 @@ def collect(state_roots=None):
         # `recv_1h` is untouched here: the notice and its correlated sent record are one
         # logical message and must count once (F-101i).
         row = _row(to_key)
-        from_sid = from_key[1] if from_key else None
-        from_name = (frm.get("name") or from_sid or "")
-        row["last_recv"] = {"from_name": from_name, "from_session_id": from_sid,
-                             "from_harness": from_key[0] if from_key else "",
+        row["last_recv"] = {"from_name": _peer_name(frm, from_key),
+                             "from_session_id": from_key[1] if from_key else None,
+                             # An identity-less sender still has a harness, and the sent
+                             # side has always kept it. Dropping it here left the renderer
+                             # unable to look the peer up at all (measured 2026-09-10).
+                             "from_harness": (from_key[0] if from_key
+                                              else str(frm.get("harness") or "").lower()),
                              "kind": inherited, "age_min": age_min}
 
     # Correlation is bounded by the existing tail/window/max limits. A clipped sender
@@ -178,14 +273,23 @@ def collect(state_roots=None):
         status = ((rec.get("delivery") or {}).get("status") or "").lower()
         deliverable = status != "failed"
         if from_key:
+            # The endpoint's row exists as soon as the ledger names it, but only a
+            # non-notice record is a SEND. F-101i, send side: a herdr message writes two
+            # records naming the same sender — its own `steer` and the receiver's `notice`
+            # receipt — so counting both made one sent message read `✉ 2/…` (measured
+            # 2026-09-09 on the codex↔claude test pair). `recv_1h` already counted such a
+            # pair once; this is the same rule on the other axis, and it agrees with
+            # `last_sent`, which was never set from a notice.
             row = _row(from_key)
-            if age_min <= 60:
+            if kind != "notice" and age_min <= 60:
                 row["sent_1h"] += 1
         if kind != "notice":
             if from_key and to_key and deliverable:
                 pending.setdefault((from_key, to_key), []).append(kind)
             if to_key and deliverable:
                 _record_recv(to_key, kind, frm, to, from_key, age_min)
+            if from_key and deliverable:
+                _record_sent(from_key, kind, frm, to, to_key, age_min)
         else:
             stack = pending.get((from_key, to_key)) if from_key and to_key else None
             if stack:

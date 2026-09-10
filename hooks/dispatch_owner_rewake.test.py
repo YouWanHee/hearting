@@ -22,6 +22,11 @@ from unittest import mock
 
 
 MODULE_PATH = Path(__file__).with_name("dispatch-owner-rewake.py")
+# A holder that is provably dead *from this process's own PID namespace*:
+# pid 4194304 is above Linux's pid_max, so `/proc/<pid>` never exists, and
+# the namespace is ours so the hook may judge it (a holder recorded from
+# another namespace is unobservable and counts as alive -- top review M3).
+DEAD_HOLDER = ["4194304", "0", os.readlink(f"/proc/{os.getpid()}/ns/pid")]
 SPEC = importlib.util.spec_from_file_location("dispatch_owner_rewake", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
 rewake = importlib.util.module_from_spec(SPEC)
@@ -60,7 +65,20 @@ class DispatchOwnerRewakeTest(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.jobs = self.root / "jobs.log"
-        self.jobs.write_text("fixture\n", encoding="utf-8")
+        self.jobs.write_text(self.row(), encoding="utf-8")
+        environment = mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(self.jobs)}, clear=False)
+        environment.start()
+        self.addCleanup(environment.stop)
+
+    @staticmethod
+    def row(*, attempt_id="att-owner-1", status="open", parent_sid="session-1", age_seconds=0.0, **overrides):
+        stamp = (datetime.now(timezone.utc) - timedelta(seconds=age_seconds)).isoformat().replace("+00:00", "Z")
+        metadata = {"capability": "autopilot-code", "dispatch_depth": "1", "worker_type": "owner",
+                    "parent_sid": parent_sid, "parent_completion_delivery": "claude-parent-runtime",
+                    "launch_claimed": "1", "launch_started": "1", "attempt_id": attempt_id}
+        metadata.update(overrides)
+        pipe = ",".join(f"{k}={v}" for k, v in metadata.items())
+        return "\t".join([stamp, status, "/repo", "/repo", "slug", pipe]) + "\n"
 
     def payload(self, **replacements):
         output = "\n".join(
@@ -112,19 +130,68 @@ class DispatchOwnerRewakeTest(unittest.TestCase):
     def test_foreign_or_incomplete_output_is_ignored(self) -> None:
         foreign = self.payload(session_id="session-2")
         self.assertIsNone(rewake.parse_launch(foreign))
-        ordinary = self.payload(tool_input={"command": "git status"})
-        self.assertIsNone(rewake.parse_launch(ordinary))
         incomplete = self.payload()
         incomplete["tool_response"]["stdout"] = incomplete["tool_response"]["stdout"].replace(
             "started=1", "started=0"
         )
         self.assertIsNone(rewake.parse_launch(incomplete))
-        echoed = self.payload(
-            tool_input={
-                "command": "echo utilities/dispatch-node.py --action start"
-            }
-        )
-        self.assertIsNone(rewake.parse_launch(echoed))
+        unrelated_tool = self.payload(tool_name="Read")
+        self.assertIsNone(rewake.parse_launch(unrelated_tool))
+
+    def test_the_receipt_decides_and_the_command_text_is_never_read(self) -> None:
+        # 2026-09-09: the hook identifies the owner from what the launch
+        # wrote (receipt + registry), never from the Bash command string --
+        # six reviews in a row had found holes in the shell parsing. Any
+        # command whose stdout carries the exact same-session start receipt
+        # arms, prefixes and all; `tool_input.command` is not even consulted.
+        for command in (
+            "git status",
+            "echo utilities/dispatch-node.py --action start",
+            "time nohup python3 -u utilities/dispatch-owner.py --start | tail -3",
+            "bash -c 'python3 utilities/dispatch-owner.py --start'",
+        ):
+            with self.subTest(command=command):
+                launch = rewake.parse_launch(self.payload(tool_input={"command": command}))
+                assert launch is not None
+                self.assertEqual((launch.attempt_id, launch.armed), ("att-owner-1", "stdout"))
+        payload = self.payload()
+        payload["tool_input"] = {}
+        self.assertEqual(rewake.parse_launch(payload).attempt_id, "att-owner-1")
+
+    def test_a_receipt_names_a_candidate_and_only_the_registry_row_proves_it(self) -> None:
+        # Review R1 B1: with the command-surface check gone, any Bash output
+        # shaped like a start receipt would otherwise arm an invented, foreign,
+        # depth-2, unstarted, or stale attempt. The row is the identity.
+        launch = rewake.parse_launch(self.payload())
+        assert launch is not None
+        self.assertIsNotNone(rewake.receipt_row_age(launch))
+        for label, rows in (
+            ("no row", ""),
+            ("foreign session", self.row(parent_sid="session-2")),
+            ("depth-2", self.row(dispatch_depth="2")),
+            ("not started", self.row(launch_started="0")),
+            ("not an owner", self.row(worker_type="stage")),
+            ("other attempt", self.row(attempt_id="att-owner-9")),
+        ):
+            with self.subTest(label=label):
+                self.jobs.write_text(rows, encoding="utf-8")
+                self.assertIsNone(rewake.receipt_row_age(launch))
+                with mock.patch.object(rewake.sys, "stdin", io.StringIO(json.dumps(self.payload()))), \
+                     mock.patch.object(rewake.sys, "stdout", io.StringIO()) as out, \
+                     mock.patch.object(rewake.sys, "stderr", io.StringIO()) as err:
+                    self.assertEqual(rewake.main(), 2)
+                self.assertIn("reason=row-identity-mismatch", err.getvalue())
+                self.assertFalse(rewake.arm_path(self.jobs, "att-owner-1").exists())
+        # a short owner that already ran to done is still a proven identity
+        self.jobs.write_text(self.row(status="done"), encoding="utf-8")
+        self.assertIsNotNone(rewake.receipt_row_age(launch))
+        # but not when its row is older than the arm window (an echoed old receipt)
+        self.jobs.write_text(self.row(status="done", age_seconds=4_000), encoding="utf-8")
+        with mock.patch.object(rewake.sys, "stdin", io.StringIO(json.dumps(self.payload()))), \
+             mock.patch.object(rewake.sys, "stdout", io.StringIO()), \
+             mock.patch.object(rewake.sys, "stderr", io.StringIO()) as err:
+            self.assertEqual(rewake.main(), 2)
+        self.assertIn("reason=not-fresh", err.getvalue())
 
     def test_symlink_registry_is_rejected(self) -> None:
         link = self.root / "jobs-link.log"
@@ -696,7 +763,7 @@ class DispatchOwnerRewakeTest(unittest.TestCase):
         ) as fallback, mock.patch.object(
             rewake, "wait_for_attempt", return_value=("ready", "terminal-quiescent")
         ), mock.patch.object(rewake.sys, "stdout", io.StringIO()):
-            self.assertEqual(rewake.main(), 0)
+            self.assertEqual(rewake.main(), 2)  # a real row behind the receipt: terminal wake
         fallback.assert_not_called()
 
 
@@ -769,84 +836,346 @@ class RegistryConfirmArmTest(unittest.TestCase):
         payload.update(replacements)
         return payload
 
+    def arm(self, payload=None):
+        resolved = rewake.registry_launch(payload or self.payload())
+        if resolved is None or isinstance(resolved, rewake.ArmRefusal):
+            return None
+        launch, claim = resolved
+        self.assertEqual(claim.attempt_id, launch.attempt_id)
+        self.assertTrue(claim.path.is_file())
+        return launch
+
+    def ledger(self, attempt_id: str) -> dict:
+        return json.loads(rewake.arm_path(self.jobs, attempt_id).read_text(encoding="utf-8"))
+
+    def holder_exited(self, attempt_id: str) -> None:
+        """The real hook process exits right after settling; this test process
+        lives on, so mark the ledger holder dead the way exit would."""
+        path = rewake.arm_path(self.jobs, attempt_id)
+        record = json.loads(path.read_text(encoding="utf-8"))
+        record["holder"] = DEAD_HOLDER
+        path.write_text(json.dumps(record), encoding="utf-8")
+
     def test_filtered_stdout_arms_from_the_single_matching_row(self) -> None:
-        launch = rewake.registry_launch(self.payload())
-        self.assertIsNotNone(launch)
+        launch = self.arm()
         assert launch is not None
         self.assertEqual(launch.attempt_id, "att-owner-1")
         self.assertEqual(launch.jobs, self.jobs)
         self.assertEqual(launch.session_id, "session-1")
         self.assertEqual(launch.armed, "registry")
+        record = self.ledger("att-owner-1")
+        self.assertEqual((record["state"], record["arms"], record["session_id"]), ("waiting", 1, "session-1"))
+        self.assertEqual(record["holder"][0], str(os.getpid()))
 
-    def test_wave_of_starts_narrows_by_the_exact_command_slug(self) -> None:
+    def test_a_wave_of_starts_is_armed_one_row_per_call_oldest_first(self) -> None:
         # Five concurrent fleet owners (2026-09-01) made every same-session
-        # candidate window ambiguous; the observed command's own literal
-        # `--slug` names which row this exact start created.
+        # candidate window ambiguous for the old command-slug narrowing. The
+        # ledger makes the order irrelevant: each Bash call's hook takes one
+        # unclaimed row, so N starts in N calls arm N waiters, and an N+1th
+        # call finds nothing left to take.
         self.jobs.write_text(
-            self.row(attempt_id="att-owner-a", slug="cleanup-a")
-            + self.row(attempt_id="att-owner-b", slug="cleanup-b"),
+            self.row(attempt_id="att-owner-a", slug="cleanup-a", age_seconds=20)
+            + self.row(attempt_id="att-owner-b", slug="cleanup-b", age_seconds=10),
             encoding="utf-8",
         )
-        payload = self.payload()
-        payload["tool_input"] = {
-            "command": (
-                "python3 utilities/dispatch-owner.py --start --slug cleanup-b | grep -E 'x'"
-            )
-        }
-        launch = rewake.registry_launch(payload)
-        self.assertIsNotNone(launch)
-        assert launch is not None
-        self.assertEqual(launch.attempt_id, "att-owner-b")
-        self.assertEqual(launch.armed, "registry")
+        first = self.arm(self.payload(tool_input={"command": "python3 dispatch-owner.py --start --slug cleanup-b | grep x"}))
+        second = self.arm(self.payload(tool_input={"command": "ls"}))
+        self.assertEqual([first.attempt_id, second.attempt_id], ["att-owner-a", "att-owner-b"])
+        self.assertIsNone(self.arm())
 
-    def test_wave_narrowing_never_matches_an_unexpanded_variable_or_same_slug(self) -> None:
-        rows = self.row(attempt_id="att-owner-a", slug="cleanup-a") + self.row(
-            attempt_id="att-owner-b", slug="cleanup-a"
+    def test_a_second_claim_for_a_live_holder_is_refused(self) -> None:
+        # Two parallel tool calls (or one call's stdout path racing a later
+        # call's registry path) converge on one waiter per attempt.
+        self.assertIsInstance(rewake.claim_arm(self.jobs, "att-owner-1", "session-1", fresh=True), rewake.ArmClaim)
+        refusal = rewake.claim_arm(self.jobs, "att-owner-1", "session-1", fresh=True)
+        self.assertEqual((refusal.reason, refusal.watched), ("held-live", True))
+        self.assertIsNone(self.arm())
+
+    def test_eight_processes_racing_for_one_attempt_produce_one_claim(self) -> None:
+        # The flock is what makes arming exactly-once under parallel tool
+        # calls; a sequential second claim cannot prove that (review R1 minor).
+        script = (
+            "import importlib.util, sys, pathlib;"
+            f"spec = importlib.util.spec_from_file_location('h', {str(MODULE_PATH)!r});"
+            "m = importlib.util.module_from_spec(spec); sys.modules['h'] = m; spec.loader.exec_module(m);"
+            f"r = m.claim_arm(pathlib.Path({str(self.jobs)!r}), 'att-owner-1', 'session-1', fresh=True);"
+            "print('won' if isinstance(r, m.ArmClaim) else r.reason)"
         )
-        self.jobs.write_text(rows, encoding="utf-8")
-        # Same slug on both rows: still ambiguous after narrowing.
-        payload = self.payload()
-        payload["tool_input"] = {
-            "command": "python3 utilities/dispatch-owner.py --start --slug cleanup-a"
-        }
-        self.assertIsNone(rewake.registry_launch(payload))
-        # An unexpanded shell variable is not a literal and narrows nothing.
-        payload["tool_input"] = {
-            "command": 'python3 utilities/dispatch-owner.py --start --slug "$SLUG"'
-        }
-        self.assertIsNone(rewake.registry_launch(payload))
+        procs = [subprocess.Popen([sys.executable, "-c", script], stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT, text=True) for _ in range(8)]
+        results = [p.communicate()[0].strip() for p in procs]
+        self.assertEqual(results.count("won"), 1, results)
+        self.assertEqual(set(results) - {"won"}, {"held-live"}, results)
 
-    def test_a_lone_candidate_still_arms_regardless_of_the_command_slug(self) -> None:
-        # Narrowing is an ambiguity tie-break only: a single exact candidate
-        # keeps arming even when the recorded command's slug spells the
-        # display slug differently (the pre-2026-09-01 contract, unchanged).
-        launch = rewake.registry_launch(self.payload())
-        self.assertIsNotNone(launch)
+    def test_a_dead_holder_is_reclaimed_but_an_alive_one_is_not(self) -> None:
+        sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        self.addCleanup(sleeper.kill)
+        path = rewake.arm_path(self.jobs, "att-owner-1")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        alive = list(rewake._process_identity(sleeper.pid))
+        record = {"schema": 1, "attempt_id": "att-owner-1", "session_id": "session-1",
+                  "holder": alive, "state": "waiting", "arms": 1, "gate_delivery_id": None}
+        path.write_text(json.dumps(record), encoding="utf-8")
+        self.assertIsNone(self.arm())
+        sleeper.kill()
+        sleeper.wait()
+        launch = self.arm()
         assert launch is not None
-        self.assertEqual(launch.attempt_id, "att-owner-1")
+        self.assertEqual((launch.attempt_id, launch.armed), ("att-owner-1", "registry-rearm"))
+        self.assertEqual(self.ledger("att-owner-1")["arms"], 2)
 
-    def test_started_receipt_that_arms_nothing_emits_one_typed_notice(self) -> None:
-        # Partial grep-filtered stdout: started=1 survives the filter but the
-        # dispatch_depth/worker_type fields the stdout fast path needs do
-        # not, and two same-session rows keep the registry fallback
-        # ambiguous.  Silence here lost four fleet wakes on 2026-09-01.
+    def test_a_stale_row_is_refused_first_time_but_a_lapsed_claim_is_rearmed_regardless_of_age(self) -> None:
+        self.jobs.write_text(self.row(age_seconds=4_000), encoding="utf-8")
+        self.assertIsNone(self.arm())
+        path = rewake.arm_path(self.jobs, "att-owner-1")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"schema": 1, "attempt_id": "att-owner-1", "session_id": "session-1",
+                                    "holder": DEAD_HOLDER, "state": "lapsed", "arms": 3,
+                                    "gate_delivery_id": None}), encoding="utf-8")
+        launch = self.arm()
+        assert launch is not None
+        self.assertEqual(launch.armed, "registry-rearm")
+        self.assertEqual(self.ledger("att-owner-1")["arms"], 4)
+
+    def test_ended_exhausted_foreign_or_unreadable_claims_never_rearm(self) -> None:
+        path = rewake.arm_path(self.jobs, "att-owner-1")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        base = {"schema": 1, "attempt_id": "att-owner-1", "session_id": "session-1",
+                "holder": DEAD_HOLDER, "state": "lapsed", "arms": 1, "gate_delivery_id": None}
+        for label, record, reason in (
+            ("ended", {**base, "state": "ended"}, "ended"),
+            ("exhausted", {**base, "arms": rewake.ARM_LIMIT}, "exhausted"),
+            ("foreign-session", {**base, "session_id": "session-2"}, "foreign-session"),
+            ("unknown-state", {**base, "state": "armed"}, "unreadable"),
+            ("wrong-schema", {**base, "schema": 99}, "unreadable"),
+        ):
+            with self.subTest(label=label):
+                path.write_text(json.dumps(record), encoding="utf-8")
+                self.assertIsNone(self.arm())
+                self.assertEqual(rewake.claim_arm(self.jobs, "att-owner-1", "session-1", fresh=True).reason, reason)
+        path.write_text("{not json", encoding="utf-8")
+        self.assertIsNone(self.arm())
+        self.assertEqual(rewake.claim_arm(self.jobs, "att-owner-1", "session-1", fresh=True).reason, "unreadable")
+
+    def test_a_live_pid_whose_identity_cannot_be_read_counts_as_alive(self) -> None:
+        # Review R1 M1: a transient /proc read failure is not a death.
+        claim = rewake.claim_arm(self.jobs, "att-owner-1", "session-1", fresh=True)
+        assert isinstance(claim, rewake.ArmClaim)
+        with mock.patch.object(rewake, "_process_identity", return_value=None):
+            self.assertTrue(rewake._holder_alive(list(claim.holder)))
+        self.assertFalse(rewake._holder_alive(DEAD_HOLDER))                  # pid does not exist
+        self.assertFalse(rewake._holder_alive([str(os.getpid()), "0", DEAD_HOLDER[2]]))  # live pid, wrong start: reuse
+        self.assertTrue(rewake._holder_alive([str(os.getpid()), "0", "pid:[0]"]))       # another namespace: unobservable
+
+    def test_a_holder_from_another_pid_namespace_is_never_declared_dead(self) -> None:
+        # Top review M3: a pid is a coordinate in the holder's namespace; from
+        # another one the number means nothing, so the holder counts as alive.
+        foreign = ["4194304", "0", "pid:[4026531999]"]
+        self.assertTrue(rewake._holder_alive(foreign))
+        path = rewake.arm_path(self.jobs, "att-owner-1")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"schema": 1, "attempt_id": "att-owner-1", "session_id": "session-1",
+                                    "holder": foreign, "state": "waiting", "arms": 1, "gate_delivery_id": None}), encoding="utf-8")
+        self.assertEqual(rewake.claim_arm(self.jobs, "att-owner-1", "session-1", fresh=True).reason, "held-live")
+
+    def test_a_symlink_swapped_in_after_validation_is_not_followed(self) -> None:
+        # Top review N1: the registry is read through O_NOFOLLOW, so a link
+        # placed at the trusted path between validation and read is refused.
+        other = self.root / "other.log"
+        other.write_text(self.row(attempt_id="att-replaced"), encoding="utf-8")
+        self.assertEqual([a for a, _ in rewake._session_owner_rows(self.jobs, "session-1")], ["att-owner-1"])
+        self.jobs.unlink()
+        self.jobs.symlink_to(other)
+        self.assertIsNone(rewake._read_registry_lines(self.jobs))
+        self.assertEqual(rewake._session_owner_rows(self.jobs, "session-1"), [])
+
+    def test_a_proven_start_whose_ledger_is_unreadable_says_so(self) -> None:
+        # Review R1 M2: a claim failure that leaves nobody watching is a loss,
+        # and a loss is loud; only a watched attempt stays silent.
+        path = rewake.arm_path(self.jobs, "att-owner-1")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{not json", encoding="utf-8")
+        stdout = "\n".join(("check=ok", "status=start", "dispatch_depth=1", "worker_type=owner",
+                            "parent_completion_delivery=claude-parent-runtime", "registered=1", "started=1",
+                            "attempt_id=att-owner-1", "parent_session_id=session-1", f"job_registry={self.jobs}"))
+        with mock.patch.object(rewake.sys, "stdin", io.StringIO(json.dumps(self.payload(stdout=stdout)))), \
+             mock.patch.object(rewake.sys, "stdout", io.StringIO()), \
+             mock.patch.object(rewake.sys, "stderr", io.StringIO()) as err:
+            self.assertEqual(rewake.main(), 2)
+        self.assertIn("reason=unreadable", err.getvalue())
+
+    def test_a_receipt_naming_a_forged_registry_binds_nothing(self) -> None:
+        # Review R2 B1: the receipt may name the trusted registry (env, else
+        # canonical), never replace it -- a writable file full of
+        # self-described rows is not a registry.
+        forged = self.root / "forged.log"
+        forged.write_text(self.row(attempt_id="att-forged"), encoding="utf-8")
+        self.jobs.write_text("", encoding="utf-8")
+        stdout = "\n".join(("check=ok", "status=start", "dispatch_depth=1", "worker_type=owner",
+                            "parent_completion_delivery=claude-parent-runtime", "registered=1", "started=1",
+                            "attempt_id=att-forged", "parent_session_id=session-1", f"job_registry={forged}"))
+        self.assertIsNone(rewake.parse_launch(self.payload(stdout=stdout)))
+        with mock.patch.object(rewake.sys, "stdin", io.StringIO(json.dumps(self.payload(stdout=stdout)))), \
+             mock.patch.object(rewake.sys, "stdout", io.StringIO()), \
+             mock.patch.object(rewake.sys, "stderr", io.StringIO()) as err:
+            self.assertEqual(rewake.main(), 2)
+        self.assertIn("state=not-armed", err.getvalue())
+        self.assertFalse((forged.parent / rewake.ARM_DIRECTORY / "att-forged.json").exists())
+        # the same receipt naming the trusted registry, whose row proves it, arms
+        self.jobs.write_text(self.row(attempt_id="att-forged"), encoding="utf-8")
+        launch = rewake.parse_launch(self.payload(stdout=stdout.replace(str(forged), str(self.jobs))))
+        assert launch is not None
+        self.assertEqual((launch.attempt_id, launch.jobs), ("att-forged", self.jobs))
+
+    def test_an_unusable_inherited_registry_trusts_nothing(self) -> None:
+        # Review R3 B1: when AGENT_DISPATCH_JOBS is set but unusable, the hook
+        # must not quietly trust the canonical registry in its place.
+        link = self.root / "inherited-link.log"
+        link.symlink_to(self.jobs)
+        for bad in (str(link), str(self.root / "absent.log"), ""):
+            with self.subTest(inherited=bad), \
+                 mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": bad}), \
+                 mock.patch.object(rewake, "_canonical_jobs", return_value=str(self.jobs)):
+                self.assertIsNone(rewake._trusted_jobs())
+                self.assertIsNone(rewake.parse_launch(self.payload(stdout=f"check=ok\njob_registry={self.jobs}")))
+                self.assertIsNone(self.arm())
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch.object(rewake, "_canonical_jobs", return_value=str(self.jobs)):
+            self.assertEqual(rewake._trusted_jobs(), self.jobs)  # absent variable: canonical
+
+    def test_ended_is_sealed_only_after_the_receipt_went_out(self) -> None:
+        # Review R2 B2: a crash between classification and emission must leave
+        # the claim re-armable, or the wake is lost forever.
+        with mock.patch.object(rewake.sys, "stdin", io.StringIO(json.dumps(self.payload()))), \
+             mock.patch.object(rewake, "wait_for_attempt", return_value=("ready", "terminal-quiescent")), \
+             mock.patch.object(rewake, "classified_receipt", side_effect=RuntimeError("crash")), \
+             mock.patch.object(rewake.sys, "stdout", io.StringIO()), \
+             mock.patch.object(rewake.sys, "stderr", io.StringIO()):
+            with self.assertRaises(RuntimeError):
+                rewake.main()
+        self.assertEqual(self.ledger("att-owner-1")["state"], "waiting")
+        self.holder_exited("att-owner-1")
+        launch = self.arm(self.payload(tool_input={"command": "ls"}))
+        assert launch is not None
+        self.assertEqual(launch.armed, "registry-rearm")
+
+    def test_the_registry_path_keeps_the_receipt_named_attempts_refusal(self) -> None:
+        # Review R2 M2: a partially filtered receipt whose row is stale says
+        # `not-fresh`, not a generic `unclaimed`.
+        self.jobs.write_text(self.row(attempt_id="att-owner-a", age_seconds=5)
+                             + self.row(attempt_id="att-owner-b", age_seconds=4_000), encoding="utf-8")
+        self.assertIsInstance(rewake.claim_arm(self.jobs, "att-owner-a", "session-1", fresh=True), rewake.ArmClaim)
+        stdout = "check=ok\nstatus=start\nregistered=1\nstarted=1\nattempt_id=att-owner-b\nparent_session_id=session-1"
+        refusal = rewake.registry_launch(self.payload(stdout=stdout))
+        self.assertEqual(refusal.reason, "not-fresh")
+        with mock.patch.object(rewake.sys, "stdin", io.StringIO(json.dumps(self.payload(stdout=stdout)))), \
+             mock.patch.object(rewake.sys, "stdout", io.StringIO()), \
+             mock.patch.object(rewake.sys, "stderr", io.StringIO()) as err:
+            self.assertEqual(rewake.main(), 2)
+        self.assertIn("reason=not-fresh", err.getvalue())
+
+    def test_retention_prunes_old_ended_and_ancient_records_only(self) -> None:
+        directory = rewake.arm_directory(self.jobs)
+        directory.mkdir(parents=True, exist_ok=True)
+        now = time.time()
+        live = list(rewake._process_identity(os.getpid()))
+        cases = {
+            "att-ended-old": ({"state": "ended"}, 8 * 86_400, False),
+            "att-ended-recent": ({"state": "ended"}, 86_400, True),
+            "att-lapsed-old": ({"state": "lapsed"}, 8 * 86_400, True),
+            "att-lapsed-ancient": ({"state": "lapsed"}, 31 * 86_400, False),
+            "att-waiting-dead-ancient": ({"state": "waiting"}, 31 * 86_400, False),
+            # review R2 M1: a live (or unobservable) holder's claim is never pruned
+            "att-waiting-live-ancient": ({"state": "waiting", "holder": live}, 31 * 86_400, True),
+            "att-gate-live-ancient": ({"state": "gate-wake-sent", "holder": live}, 31 * 86_400, True),
+        }
+        for name, (record, age, _kept) in cases.items():
+            path = directory / f"{name}.json"
+            path.write_text(json.dumps({"schema": 1, "attempt_id": name, "session_id": "session-1",
+                                        "holder": DEAD_HOLDER, "arms": 1, **record}), encoding="utf-8")
+            os.utime(path, (now - age, now - age))
+        lock = directory / ".lock"; lock.write_text("", encoding="utf-8"); os.utime(lock, (now - 40 * 86_400,) * 2)
+        self.assertIsInstance(rewake.claim_arm(self.jobs, "att-owner-1", "session-1", fresh=True), rewake.ArmClaim)
+        for name, (_record, _age, kept) in cases.items():
+            with self.subTest(name=name):
+                self.assertEqual((directory / f"{name}.json").exists(), kept)
+        self.assertTrue(lock.exists())
+
+    def test_a_preserved_prefix_cannot_starve_expired_records_behind_it(self) -> None:
+        # Review R3 M2: the scan window rotates, so a full window of live
+        # holders in front does not keep an expired record behind it forever.
+        directory = rewake.arm_directory(self.jobs)
+        directory.mkdir(parents=True, exist_ok=True)
+        now = time.time()
+        live = list(rewake._process_identity(os.getpid()))
+        for index in range(rewake.ARM_PRUNE_SCAN_LIMIT):
+            path = directory / f"att-a{index:04d}.json"
+            path.write_text(json.dumps({"schema": 1, "attempt_id": path.stem, "session_id": "session-1",
+                                        "holder": live, "state": "waiting", "arms": 1}), encoding="utf-8")
+            os.utime(path, (now - 31 * 86_400,) * 2)
+        expired = directory / "att-zzz-lapsed.json"
+        expired.write_text(json.dumps({"schema": 1, "attempt_id": "att-zzz-lapsed", "session_id": "session-1",
+                                       "holder": DEAD_HOLDER, "state": "lapsed", "arms": 1}), encoding="utf-8")
+        os.utime(expired, (now - 31 * 86_400,) * 2)
+        rewake._prune_arm_directory(directory, now)   # first window: the live prefix only
+        self.assertTrue(expired.exists())
+        rewake._prune_arm_directory(directory, now)   # next window starts after the cursor
+        self.assertFalse(expired.exists())
+        self.assertEqual(len(list(directory.glob("att-a*.json"))), rewake.ARM_PRUNE_SCAN_LIMIT)
+
+    def test_settle_records_the_outcome_only_for_the_holder(self) -> None:
+        claim = rewake.claim_arm(self.jobs, "att-owner-1", "session-1", fresh=True)
+        assert isinstance(claim, rewake.ArmClaim)
+        self.assertTrue(rewake.settle_arm(claim, "gate-wake-sent", gate_delivery_id="delivery-x"))
+        record = self.ledger("att-owner-1")
+        self.assertEqual((record["state"], record["gate_delivery_id"]), ("gate-wake-sent", "delivery-x"))
+        stranger = rewake.ArmClaim(path=claim.path, attempt_id="att-owner-1", session_id="session-1",
+                                   arms=1, holder=tuple(DEAD_HOLDER))
+        self.assertFalse(rewake.settle_arm(stranger, "ended"))
+        self.assertFalse(rewake.settle_arm(claim, "bogus"))
+        self.assertEqual(self.ledger("att-owner-1")["state"], "gate-wake-sent")
+
+    def test_a_partially_filtered_receipt_still_arms_from_the_registry(self) -> None:
+        # grep-filtered stdout: started=1 survives but the fields the stdout
+        # fast path needs do not. Silence here lost four fleet wakes on
+        # 2026-09-01; the ledger arms the rows one call at a time instead.
         self.jobs.write_text(
-            self.row(attempt_id="att-owner-a", slug="cleanup-a")
+            self.row(attempt_id="att-owner-a", slug="cleanup-a", age_seconds=5)
             + self.row(attempt_id="att-owner-b", slug="cleanup-b"),
             encoding="utf-8",
         )
         stdout = "check=ok\nstatus=start\nregistered=1\nstarted=1\nattempt_id=att-owner-b"
+        with mock.patch.object(rewake.sys, "stdin", io.StringIO(json.dumps(self.payload(stdout=stdout)))), \
+             mock.patch.object(rewake, "wait_for_attempt", return_value=("ready", "terminal-quiescent")) as wait, \
+             mock.patch.object(rewake.sys, "stdout", io.StringIO()), \
+             mock.patch.object(rewake.sys, "stderr", io.StringIO()) as err:
+            self.assertEqual(rewake.main(), 2)
+        self.assertEqual(wait.call_args.args[0].attempt_id, "att-owner-a")
+        self.assertNotIn("state=not-armed", err.getvalue())
+        self.assertEqual(self.ledger("att-owner-a")["state"], "ended")
+
+    def test_a_started_receipt_with_no_registry_emits_one_typed_notice(self) -> None:
+        stdout = "\n".join(("check=ok", "status=start", "registered=1", "started=1",
+                            "attempt_id=att-owner-b", "parent_session_id=session-1"))
         payload = self.payload(stdout=stdout)
-        payload["tool_input"] = {
-            "command": "python3 utilities/dispatch-owner.py --start | grep -E 'status='"
-        }
-        with mock.patch.object(rewake.sys, "stdin", io.StringIO(json.dumps(payload))), \
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch.object(rewake, "_canonical_jobs", return_value=None), \
+             mock.patch.object(rewake.sys, "stdin", io.StringIO(json.dumps(payload))), \
              mock.patch.object(rewake.sys, "stdout", io.StringIO()) as out, \
              mock.patch.object(rewake.sys, "stderr", io.StringIO()) as err:
             self.assertEqual(rewake.main(), 2)
         self.assertIn("state=not-armed", err.getvalue())
         self.assertIn("attempt_id=att-owner-b", err.getvalue())
         self.assertIn("state=not-armed", json.loads(out.getvalue())["systemMessage"])
+
+    def test_a_started_receipt_whose_attempt_is_already_watched_stays_silent(self) -> None:
+        self.assertIsInstance(rewake.claim_arm(self.jobs, "att-owner-1", "session-1", fresh=True), rewake.ArmClaim)
+        stdout = "\n".join(("check=ok", "status=start", "registered=1", "started=1",
+                            "attempt_id=att-owner-1", "parent_session_id=session-1"))
+        with mock.patch.object(rewake.sys, "stdout", io.StringIO()) as out, \
+             mock.patch.object(rewake.sys, "stderr", io.StringIO()) as err:
+            self.assertEqual(rewake.no_arm_notice(self.payload(stdout=stdout)), 0)
+        self.assertEqual((out.getvalue(), err.getvalue()), ("", ""))
 
     def test_a_failed_start_stays_silent_without_a_notice(self) -> None:
         # No registered row exists (the start failed before registration) and
@@ -873,53 +1202,73 @@ class RegistryConfirmArmTest(unittest.TestCase):
         self.assertEqual(wait.call_args.args[0].attempt_id, "att-owner-1")
         self.assertIn("armed=registry", message)
         self.assertIn("attempt_id=att-owner-1", message)
+        self.assertEqual(self.ledger("att-owner-1")["state"], "ended")
 
-    def test_foreign_stale_ambiguous_or_sessionless_input_never_arms(self) -> None:
+    def test_a_missing_readiness_helper_lapses_the_claim(self) -> None:
+        # Review R1 B3: a helper missing from this call's agent home is a lapse
+        # the next Bash call may recover from, never a permanent end.
+        with mock.patch.object(rewake.sys, "stdin", io.StringIO(json.dumps(self.payload()))), \
+             mock.patch.object(rewake, "agent_home", return_value=self.root / "no-such-home"), \
+             mock.patch.object(rewake.sys, "stdout", io.StringIO()), \
+             mock.patch.object(rewake.sys, "stderr", io.StringIO()):
+            self.assertEqual(rewake.main(), 0)
+        self.assertEqual(self.ledger("att-owner-1")["state"], "lapsed")
+
+    def test_a_timed_out_wait_lapses_and_the_next_call_rearms(self) -> None:
+        with mock.patch.object(rewake.sys, "stdin", io.StringIO(json.dumps(self.payload()))), \
+             mock.patch.object(rewake, "wait_for_attempt", return_value=("timeout", "owner-not-quiescent-after-1s")), \
+             mock.patch.object(rewake.sys, "stdout", io.StringIO()), \
+             mock.patch.object(rewake.sys, "stderr", io.StringIO()):
+            self.assertEqual(rewake.main(), 0)
+        self.assertEqual(self.ledger("att-owner-1")["state"], "lapsed")
+        self.assertIsNone(self.arm())  # the settling process is still alive for an instant
+        self.holder_exited("att-owner-1")
+        launch = self.arm(self.payload(tool_input={"command": "git status"}))
+        assert launch is not None
+        self.assertEqual(launch.armed, "registry-rearm")
+
+    def test_foreign_stale_or_sessionless_input_never_arms(self) -> None:
         self.jobs.write_text(self.row(parent_sid="session-2"), encoding="utf-8")
-        self.assertIsNone(rewake.registry_launch(self.payload()))
+        self.assertIsNone(self.arm())
         self.jobs.write_text(self.row(age_seconds=4_000), encoding="utf-8")
-        self.assertIsNone(rewake.registry_launch(self.payload()))
-        self.jobs.write_text(
-            self.row() + self.row(attempt_id="att-owner-2"), encoding="utf-8"
-        )
-        self.assertIsNone(rewake.registry_launch(self.payload()))
+        self.assertIsNone(self.arm())
         self.jobs.write_text(self.row(), encoding="utf-8")
         self.assertIsNone(rewake.registry_launch(self.payload(session_id="")))
         self.assertIsNone(rewake.registry_launch(self.payload(session_id=None)))
+        self.assertIsNone(rewake.registry_launch(self.payload(tool_name="Read")))
 
     def test_closed_or_non_owner_rows_never_arm(self) -> None:
         self.jobs.write_text(
             self.row() + self.row(status="done", note="completed-marker"), encoding="utf-8"
         )
-        self.assertIsNone(rewake.registry_launch(self.payload()))
+        self.assertIsNone(self.arm())
         self.jobs.write_text(self.row(dispatch_depth="2"), encoding="utf-8")
-        self.assertIsNone(rewake.registry_launch(self.payload()))
+        self.assertIsNone(self.arm())
         self.jobs.write_text(self.row(launch_started="0"), encoding="utf-8")
-        self.assertIsNone(rewake.registry_launch(self.payload()))
+        self.assertIsNone(self.arm())
         self.jobs.write_text(
             self.row(parent_completion_delivery="one-shot"), encoding="utf-8"
         )
-        self.assertIsNone(rewake.registry_launch(self.payload()))
+        self.assertIsNone(self.arm())
 
-    def test_command_jobs_argument_wins_and_symlinks_are_rejected(self) -> None:
+    def test_the_command_jobs_literal_is_not_read_and_symlinked_receipts_are_rejected(self) -> None:
         other = self.root / "explicit.log"
         other.write_text(self.row(attempt_id="att-owner-explicit"), encoding="utf-8")
         payload = self.payload()
         payload["tool_input"]["command"] = (
             f"python3 utilities/dispatch-owner.py --start --jobs {other} --slug owner | tail -5"
         )
-        launch = rewake.registry_launch(payload)
+        launch = self.arm(payload)
         assert launch is not None
-        self.assertEqual(launch.attempt_id, "att-owner-explicit")
-        self.assertEqual(launch.jobs, other)
+        self.assertEqual((launch.attempt_id, launch.jobs), ("att-owner-1", self.jobs))
         link = self.root / "jobs-link.log"
         link.symlink_to(other)
-        payload["tool_input"]["command"] = (
-            f"python3 utilities/dispatch-owner.py --start --jobs={link} --slug owner | tail -5"
-        )
-        linked = rewake.registry_launch(payload)
-        assert linked is not None
-        self.assertEqual(linked.jobs, self.jobs)
+        self.jobs.write_text(self.row(attempt_id="att-owner-2"), encoding="utf-8")
+        # a receipt naming a symlink (or any file other than the trusted registry) binds nothing
+        self.assertIsNone(self.arm(self.payload(stdout=f"check=ok\njob_registry={link}",
+                                                tool_input={"command": "x"})))
+        self.assertIsNone(self.arm(self.payload(stdout=f"check=ok\njob_registry={other}",
+                                                tool_input={"command": "x"})))
 
     def test_missing_all_sealed_registry_sources_does_not_reconstruct_agent_home(self) -> None:
         payload = self.payload(stdout="check=ok")
@@ -930,32 +1279,34 @@ class RegistryConfirmArmTest(unittest.TestCase):
         ):
             self.assertIsNone(rewake.registry_launch(payload))
 
-    def test_a_start_free_dispatch_owner_command_never_arms(self) -> None:
-        payload = self.payload()
-        payload["tool_input"]["command"] = "python3 utilities/dispatch-owner.py --status"
-        self.assertIsNone(rewake.registry_launch(payload))
-
-    def test_quick_dispatch_node_start_arms_but_dry_run_does_not(self) -> None:
-        payload = self.payload(stdout="check=ok")
-        payload["tool_input"]["command"] = (
-            "python3 utilities/dispatch-node.py --route route.json --node one-shot "
-            "--action=start --slug quick --adapter claude | tail -5"
-        )
-        launch = rewake.registry_launch(payload)
-        self.assertIsNotNone(launch)
-        assert launch is not None
-        self.assertEqual(launch.attempt_id, "att-owner-1")
-
-        payload["tool_input"]["command"] = payload["tool_input"]["command"].replace(
-            "--action=start", "--action=dry-run"
-        )
-        self.assertIsNone(rewake.registry_launch(payload))
-
     def test_space_delimited_registry_metadata_is_tolerated(self) -> None:
         self.jobs.write_text(self.row().replace(",", " "), encoding="utf-8")
-        launch = rewake.registry_launch(self.payload())
+        launch = self.arm()
         assert launch is not None
         self.assertEqual(launch.attempt_id, "att-owner-1")
+
+    def test_every_launcher_surface_arms_the_fresh_row_once(self) -> None:
+        # Whatever launched the owner -- `preflight.sh dispatch-owner`, a
+        # `time`/`nohup`/`bash -c`/`python3 -u` prefix (the R8 majors the
+        # parser never closed), or a foreign command that merely mentions the
+        # utility -- the fresh same-session row arms exactly once. Arming is
+        # the row's debt to this session, not a property of the command
+        # surface; the ledger, not the parser, keeps a foreign mention from
+        # re-arming a prior attempt.
+        commands = (
+            '"$AGENT_HOME/adapters/codex/bin/preflight.sh" dispatch-owner --start --slug s',
+            "time nohup python3 -u utilities/dispatch-owner.py --start --slug s > /dev/null 2>&1",
+            "bash -c 'python3 utilities/dispatch-owner.py --start --slug s'",
+            "grep dispatch-owner --start jobs.log",
+            "cat preflight.sh dispatch-owner",
+        )
+        for index, command in enumerate(commands):
+            with self.subTest(command=command):
+                self.jobs.write_text(self.row(attempt_id=f"att-owner-{index}"), encoding="utf-8")
+                launch = self.arm(self.payload(tool_input={"command": command}))
+                assert launch is not None
+                self.assertEqual(launch.attempt_id, f"att-owner-{index}")
+                self.assertIsNone(self.arm(self.payload(tool_input={"command": command})))
 
 
 import dispatch_contract as D  # noqa: E402
@@ -984,7 +1335,8 @@ class CarrierOneClaimGateTest(unittest.TestCase):
         # this repo checkout is that checkout.
         self.agent_home = MODULE_PATH.parents[1]
         self.environment = mock.patch.dict(
-            os.environ, {"AGENT_HOME": str(self.agent_home)}, clear=False
+            os.environ, {"AGENT_HOME": str(self.agent_home), "AGENT_DISPATCH_JOBS": str(self.jobs)},
+            clear=False
         )
         self.environment.start()
         self.addCleanup(self.environment.stop)
@@ -1011,6 +1363,7 @@ class CarrierOneClaimGateTest(unittest.TestCase):
             "attempt_schema_version=2,dispatch_depth=1,transport=headless,"
             "execution_surface=registered-headless,registered_worker=1,"
             "fallback_hop=same-harness-headless,attempt_id=att-owner-1,"
+            "worker_type=owner,launch_claimed=1,launch_started=1,"
             "parent_attempt_id=att-owner-parent,"
             "parent_completion_delivery=claude-parent-runtime,parent_sid=session-1,"
             "route_id=rt-owner,route_node=report,harness=claude"
@@ -1021,8 +1374,9 @@ class CarrierOneClaimGateTest(unittest.TestCase):
                 f",parent_runtime_pid_start={ancestry[1]}"
                 f",parent_runtime_ns={ancestry[2]}"
             )
+        stamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         self.jobs.write_text(
-            f"2026-08-25T00:00:00Z\topen\t/repo\t/wt\towner\t{pipe}\n", encoding="utf-8"
+            f"{stamp}\topen\t/repo\t/wt\towner\t{pipe}\n", encoding="utf-8"
         )
 
     def _close_and_materialize(self):
@@ -1151,6 +1505,107 @@ class CarrierOneClaimGateTest(unittest.TestCase):
         self.assertIn("state=attention", stdout)
 
 
+class LosingCarrierLeavesGatesTest(CarrierOneClaimGateTest):
+    """Top review B1: a hook that lost the completion claim must not consume
+    the recipient's gate records on its way to a silent exit, and a winning
+    hook acks a folded gate only after its receipt went out."""
+
+    def _gate(self, delivery_id="delivery-independent-gate", owner="att-parallel-owner"):
+        receipt = {"schema_version": 2, "state": "attention", "parent_attempt_id": owner,
+                   "job_registry": str(self.jobs), "delivery_classification": "attention",
+                   "children": [{"attempt_id": owner, "status": "open", "readiness": "human-gate",
+                                 "reason": "shards/frame/interview.json",
+                                 "required_action": "human-gate:frame-review", "harness": "claude",
+                                 "delivery_classification": "attention"}]}
+        rewake.pending_delivery.create(
+            self.root, recipient_kind="claude-parent-runtime", recipient_key="session-1",
+            delivery_id=delivery_id, session_generation="unsupported", session_generation_supported="0",
+            attempt_ids=[owner], parent_attempt_id=owner, route_id="rt-parallel", route_node="frame",
+            receipt=receipt, receipt_digest=rewake.pending_delivery._canonical_receipt_digest(receipt),
+            row_revisions={owner: "human-gate:frame-review"})
+        rewake._RECIPIENT_KEY_CACHE.clear()
+        return delivery_id
+
+    def test_a_losing_carrier_leaves_an_undelivered_gate_for_the_sweep(self):
+        from dispatch_session_sweep import sweep_deliver, ack_delivered
+        self._open_row()
+        self._close_and_materialize()
+        claimed, _ = sweep_deliver(self.root, "claude-parent-runtime", "session-1")
+        self.assertEqual(len(claimed), 1)
+        gate_id = self._gate()
+        with mock.patch.object(rewake, "runtime_ancestry_binding", return_value=self.ANCESTRY):
+            code, out, err = self._run_main()
+        self.assertEqual((code, out, err), (0, "", ""))
+        gate = rewake.pending_delivery.read(self.root, "session-1", gate_id)
+        self.assertEqual(gate["state"], "pending")   # untouched, not acked
+        ack_delivered(self.root, "session-1", claimed, acked_by="test-sweep")
+        later, _ = sweep_deliver(self.root, "claude-parent-runtime", "session-1")
+        self.assertEqual([r["delivery_id"] for r in later], [gate_id])
+
+    def _run_main_patched(self, **patches):
+        """`_run_main` pins the wait to `ready`; these cases need the failure
+        states, so they drive `main` themselves."""
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(rewake.sys, "stdin", io.StringIO(json.dumps(self.payload()))), \
+             mock.patch.object(rewake.sys, "stdout", out), \
+             mock.patch.object(rewake.sys, "stderr", err), \
+             mock.patch.object(rewake, "runtime_ancestry_binding", return_value=self.ANCESTRY):
+            stack = [mock.patch.object(rewake, key, value) for key, value in patches.items()]
+            for patch in stack:
+                patch.start()
+            try:
+                code = rewake.main()
+            finally:
+                for patch in stack:
+                    patch.stop()
+        return code, out.getvalue(), err.getvalue()
+
+    def test_another_owners_gate_never_ends_a_non_terminal_wait(self):
+        # Top review R2-M1: a timeout or a missing readiness helper lapses the
+        # claim; folding in someone else's gate changes only what the receipt
+        # displays, never whether this owner finished.
+        for label, patches in (
+            ("timeout", {"wait_for_attempt": mock.Mock(return_value=("timeout", "owner-not-quiescent"))}),
+            ("no-helper", {"agent_home": mock.Mock(return_value=self.root / "no-such-home")}),
+        ):
+            with self.subTest(label=label):
+                self._open_row()                      # still open: the owner never finished
+                self._gate(f"delivery-foreign-{label}", owner="att-someone-else")
+                code, _out, err = self._run_main_patched(**patches)
+                self.assertEqual(code, 2)             # the gate is worth waking for
+                self.assertIn("human gate is open", err)
+                ledger = rewake._read_arm(rewake.arm_path(self.jobs, "att-owner-1"))
+                self.assertEqual(ledger["state"], "lapsed")   # not `ended`
+                rewake.arm_path(self.jobs, "att-owner-1").unlink()
+
+        # and with no foreign gate the same failures lapse exactly as before
+        self._open_row()
+        code, _out, _err = self._run_main_patched(
+            wait_for_attempt=mock.Mock(return_value=("timeout", "owner-not-quiescent")))
+        self.assertEqual(code, 0)
+        self.assertEqual(rewake._read_arm(rewake.arm_path(self.jobs, "att-owner-1"))["state"], "lapsed")
+
+    def test_a_winning_carrier_acks_a_folded_gate_only_after_the_receipt_went_out(self):
+        self._open_row()
+        self._close_and_materialize()
+        gate_id = self._gate()
+        with mock.patch.object(rewake, "runtime_ancestry_binding", return_value=self.ANCESTRY):
+            code, out, err = self._run_main()
+        self.assertEqual(code, 2)
+        self.assertIn("human gate is open", err)
+        self.assertEqual(rewake.pending_delivery.read(self.root, "session-1", gate_id)["state"], "acked")
+        # and when the emit itself fails, the gate stays retryable
+        rewake.arm_path(self.jobs, "att-owner-1").unlink()   # a fresh claim for the second run
+        self._open_row()
+        self._close_and_materialize()
+        gate_id = self._gate("delivery-independent-gate-2")
+        with mock.patch.object(rewake, "runtime_ancestry_binding", return_value=self.ANCESTRY), \
+             mock.patch.object(rewake, "emit_receipt", side_effect=RuntimeError("no emit")):
+            with self.assertRaises(RuntimeError):
+                self._run_main()
+        self.assertEqual(rewake.pending_delivery.read(self.root, "session-1", gate_id)["state"], "sent-ambiguous")
+
+
 class DispatchOwnerRewakeMaterializeAbsenceTest(unittest.TestCase):
     def test_hook_module_never_imports_the_materializer(self):
         source = MODULE_PATH.read_text(encoding="utf-8")
@@ -1181,13 +1636,14 @@ class A12ArmingFailureFixture(unittest.TestCase):
         pipe = (
             "attempt_schema_version=2,dispatch_depth=1,transport=headless,"
             "execution_surface=registered-headless,registered_worker=1,"
-            "fallback_hop=same-harness-headless,"
+            "fallback_hop=same-harness-headless,worker_type=owner,launch_claimed=1,launch_started=1,"
             f"attempt_id={self.ATTEMPT},parent_attempt_id=att-a12-parent,"
             "parent_completion_delivery=claude-parent-runtime,parent_sid=session-a12,"
             "route_id=rt-a12-fixture,route_node=report,harness=claude"
         )
+        stamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         self.jobs.write_text(
-            f"2026-08-25T00:00:00Z\topen\t/repo\t/wt\towner\t{pipe}\n", encoding="utf-8"
+            f"{stamp}\topen\t/repo\t/wt\towner\t{pipe}\n", encoding="utf-8"
         )
 
     def _run_main_with(self, payload, *, env=None):
@@ -1274,7 +1730,12 @@ class A12ArmingFailureFixture(unittest.TestCase):
         self.assertIn("state=not-armed", json.loads(stdout)["systemMessage"])
         self._terminal_edge_and_recover()
 
-    def test_condition_3_unrecognized_launcher_zero_carrier_one_terminal_edge_one_record(self):
+    def test_condition_3_unrecognized_launcher_now_arms_from_the_receipt(self):
+        # Pre-2026-09-09 this condition was "zero carrier": the hook did not
+        # recognize `bash -c` as an owner-start command. The receipt is the
+        # identity now, so the same call arms and the wake is delivered;
+        # the row still closes and materializes independently (§4.4 -- the
+        # hook never materializes, see the static import test below).
         output = "\n".join((
             "check=ok", "status=start", "dispatch_depth=1", "worker_type=owner",
             "parent_completion_delivery=claude-parent-runtime",
@@ -1288,10 +1749,14 @@ class A12ArmingFailureFixture(unittest.TestCase):
             "tool_input": {"command": "bash -c 'echo hi'"},
             "tool_response": {"stdout": output, "stderr": ""},
         }
-        code, stdout, stderr = self._run_main_with(payload)
-        self.assertEqual(code, 0)
-        self.assertEqual(stdout, "")
-        self.assertEqual(stderr, "")
+        with mock.patch.object(rewake, "wait_for_attempt", return_value=("ready", "terminal-quiescent")) as wait, \
+             mock.patch.dict(os.environ, {"AGENT_HOME": str(MODULE_PATH.parents[1])}):
+            code, stdout, stderr = self._run_main_with(payload, env={"AGENT_DISPATCH_JOBS": str(self.jobs)})
+        self.assertEqual(code, 2)
+        self.assertEqual(wait.call_args.args[0].attempt_id, self.ATTEMPT)
+        self.assertIn("armed=stdout", stderr)
+        ledger = json.loads(rewake.arm_path(self.jobs, self.ATTEMPT).read_text(encoding="utf-8"))
+        self.assertEqual(ledger["state"], "ended")
         self._terminal_edge_and_recover()
 
 
@@ -1323,8 +1788,7 @@ class RegistryCanonicalJobsFallbackTest(RegistryConfirmArmTest):
         return payload
 
     def test_unexpanded_jobs_variable_falls_back_to_canonical_registry(self) -> None:
-        launch = rewake.registry_launch(self.payload())
-        self.assertIsNotNone(launch)
+        launch = self.arm()
         assert launch is not None
         self.assertEqual(launch.attempt_id, "att-owner-1")
         self.assertEqual(launch.jobs, self.jobs)
@@ -1335,27 +1799,6 @@ class RegistryCanonicalJobsFallbackTest(RegistryConfirmArmTest):
         with mock.patch.object(rewake, "_canonical_jobs", return_value=None):
             self.assertIsNone(rewake.registry_launch(self.payload()))
         self.canonical.start()
-
-
-class PreflightLaunchSurfaceTest(unittest.TestCase):
-    """`preflight.sh dispatch-owner --start` is a recognized owner-start surface."""
-
-    def test_preflight_wrapper_start_is_recognized(self) -> None:
-        self.assertEqual(
-            rewake._start_surface(
-                '"$AGENT_HOME/adapters/codex/bin/preflight.sh" dispatch-owner '
-                "--start --slug s --jobs /tmp/j.log"
-            ),
-            "dispatch-owner",
-        )
-        self.assertEqual(
-            rewake._start_surface("preflight.sh dispatch-node --action start --node plan"),
-            "dispatch-node",
-        )
-
-    def test_unrelated_mentions_still_never_arm(self) -> None:
-        self.assertIsNone(rewake._start_surface("grep dispatch-owner --start jobs.log"))
-        self.assertIsNone(rewake._start_surface("cat preflight.sh dispatch-owner"))
 
 
 class GateCarrierTest(unittest.TestCase):
@@ -1375,15 +1818,20 @@ class GateCarrierTest(unittest.TestCase):
         meta = ",".join([
             "attempt_schema_version=2", "dispatch_depth=1", "transport=headless",
             "execution_surface=registered-headless", "registered_worker=1",
+            "worker_type=owner", "launch_claimed=1", "launch_started=1",
             "attempt_id=att-gate-owner", "parent_sid=session-gate",
             "parent_completion_delivery=claude-parent-runtime",
             "route_id=rt-gate", "route_node=frame", "harness=claude",
         ])
+        stamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         self.jobs.write_text(
-            "\t".join(["2026-09-04T00:00:00Z", "open", "/repo", "/wt", "owner", meta])
+            "\t".join([stamp, "open", "/repo", "/wt", "owner", meta])
             + "\n",
             encoding="utf-8",
         )
+        trusted = mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(self.jobs)}, clear=False)
+        trusted.start()
+        self.addCleanup(trusted.stop)
 
     def _gate_record(self, *, delivery_id="delivery-gate-0001", state=None):
         rewake._PROBE_DIRECTORY_MTIME.clear()
@@ -1697,6 +2145,10 @@ class GateCarrierTest(unittest.TestCase):
         self.assertTrue(record["claim_owner"].startswith("claude-async-rewake-gate:"))
         rewake._PROBE_DIRECTORY_MTIME.clear()
         self.assertFalse(rewake._open_gate_pending(self._launch()))   # lease still live
+        # the spent wake is on the ledger: no Bash call re-arms while this
+        # gate record is open, and the first one after it closes does
+        ledger = json.loads(rewake.arm_path(self.jobs, "att-gate-owner").read_text(encoding="utf-8"))
+        self.assertEqual((ledger["state"], ledger["gate_delivery_id"]), ("gate-wake-sent", delivery_id))
         # the terminal wake still acks
         from dispatch_session_sweep import sweep_deliver
         records, _n = sweep_deliver(self.state, "claude-parent-runtime", "session-gate",
@@ -1773,156 +2225,118 @@ class GateCarrierTest(unittest.TestCase):
         self.assertFalse(rewake.is_human_gate_record(record))
 
 
-class ReleaseRearmTest(unittest.TestCase):
-    """SD-129: the release command is the second arming event."""
+class GateCloseRearmTest(GateCarrierTest):
+    """SD-129 without command parsing: the wake spent on a gate is re-armed by
+    the first same-session Bash call after that gate record closes -- the
+    release retires it (`retire_gate_delivery`), or the next-prompt sweep
+    acks it -- whichever command that call happens to be. The release command
+    itself is such a call, so "the release is the second arming event" still
+    holds; a release from another pane, and SD-OPEN-48's refused-as-already-
+    released case (record already closed), are covered by the same rule."""
 
     def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
-        self.jobs = self.root / "jobs.log"
-        self.route = self.root / "rt-gate.json"
-        self.route.write_text(json.dumps({"route_id": "rt-gate", "nodes": []}), encoding="utf-8")
-        self.write_rows([("att-gate-owner", "open", "session-gate", "rt-gate")])
+        super().setUp()
+        self.environment = mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(self.jobs)}, clear=False)
+        self.environment.start()
+        self.addCleanup(self.environment.stop)
 
-    def write_rows(self, rows):
-        lines = []
-        for attempt_id, status, session, route_id in rows:
-            meta = ",".join([
-                "attempt_schema_version=2", "dispatch_depth=1", "worker_type=owner",
-                "launch_claimed=1", "launch_started=1",
-                f"attempt_id={attempt_id}", f"parent_sid={session}",
-                "parent_completion_delivery=claude-parent-runtime",
-                f"owner_route_id={route_id}", "harness=claude",
-            ])
-            lines.append("\t".join(["2026-09-04T00:00:00Z", status, "/repo", "/wt", "owner", meta]))
-        self.jobs.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    def spend_wake_on(self, delivery_id) -> rewake.ArmClaim:
+        claim = rewake.claim_arm(self.jobs, "att-gate-owner", "session-gate", fresh=True)
+        assert isinstance(claim, rewake.ArmClaim)
+        self.assertTrue(rewake.settle_arm(claim, "gate-wake-sent", gate_delivery_id=delivery_id))
+        path = rewake.arm_path(self.jobs, "att-gate-owner")  # that hook process has exited
+        record = json.loads(path.read_text(encoding="utf-8"))
+        record["holder"] = DEAD_HOLDER
+        path.write_text(json.dumps(record), encoding="utf-8")
+        return claim
 
-    def payload(self, command=None, stdout=None, session="session-gate"):
-        command = command or (
-            f"python3 $AGENT_HOME/utilities/workflow-supervisor.py release --route \"$R\" "
-            f"--gate frame-review --decision proceed --jobs {self.jobs}"
-        )
-        if stdout is None:
-            stdout = json.dumps({"gate": "frame-review", "decision": "proceed",
-                                 "route_id": "rt-gate", "released_by": "user"})
-        return {
-            "hook_event_name": "PostToolUse", "tool_name": "Bash", "session_id": session,
-            "tool_input": {"command": command},
-            "tool_response": {"stdout": stdout, "stderr": ""},
-        }
+    def call(self, command="python3 utilities/workflow-supervisor.py release --route r.json --gate frame-review --decision proceed",
+             session="session-gate"):
+        return {"hook_event_name": "PostToolUse", "tool_name": "Bash", "session_id": session,
+                "tool_input": {"command": command}, "tool_response": {"stdout": "", "stderr": ""}}
 
-    def test_a_successful_release_rearms_on_the_routes_open_owner(self):
-        launch = rewake.release_launch(self.payload())
-        self.assertIsNotNone(launch)
-        self.assertEqual((launch.attempt_id, launch.armed), ("att-gate-owner", "release"))
-        self.assertEqual(launch.jobs, self.jobs)
+    def test_no_call_rearms_while_the_announced_gate_is_open(self):
+        delivery_id = self._gate_record(state="sent-ambiguous")
+        self.spend_wake_on(delivery_id)
+        for command in ("cat shards/frame/interview.md", "git status",
+                        self.call()["tool_input"]["command"]):
+            with self.subTest(command=command):
+                self.assertNotIsInstance(rewake.registry_launch(self.call(command)), tuple)
 
-    def test_the_legacy_gate_release_surface_rearms_too(self):
-        command = (f"python3 utilities/workflow-supervisor.py gate --route {self.route} "
-                   f"--gate frame-review --release --jobs {self.jobs}")
-        stdout = json.dumps({"gate": "frame-review", "action": "released",
-                             "released_by": "user", "route_id": "rt-gate"})
-        launch = rewake.release_launch(self.payload(command=command, stdout=stdout))
-        self.assertIsNotNone(launch)
-        self.assertEqual(launch.attempt_id, "att-gate-owner")
+    def test_the_first_call_after_the_gate_closes_rearms_the_owner(self):
+        delivery_id = self._gate_record(state="sent-ambiguous")
+        self.spend_wake_on(delivery_id)
+        # what `retire_gate_delivery` (release) or the prompt sweep does
+        rewake.pending_delivery.ack(self.state, "session-gate", delivery_id, acked_by="gate-release")
+        resolved = rewake.registry_launch(self.call())
+        assert resolved is not None
+        launch, claim = resolved
+        self.assertEqual((launch.attempt_id, launch.armed, claim.arms), ("att-gate-owner", "registry-rearm", 2))
+        self.assertNotIsInstance(rewake.registry_launch(self.call("ls")), tuple)  # one waiter again
 
-    def test_a_failed_release_arms_nothing(self):
-        stdout = "workflow-supervisor: route declares no human gate 'frame-review'"
-        self.assertIsNone(rewake.release_launch(self.payload(stdout=stdout)))
-        # review round 1, M1: a literal --route path is not a fallback for the
-        # route id -- every refused release names one too
-        literal = (f"python3 utilities/workflow-supervisor.py release --route {self.route} "
-                   f"--gate frame-review --decision proceed --jobs {self.jobs}")
-        self.assertIsNone(rewake.release_launch(self.payload(command=literal, stdout=stdout)))
-        self.assertIsNone(rewake.release_launch(self.payload(command=literal, stdout="")))
-        # and a refused release emits no not-armed notice either (its stderr told the story)
-        with mock.patch.object(sys, "stdout", io.StringIO()) as out:
-            self.assertEqual(rewake.release_no_arm_notice(self.payload(command=literal, stdout=stdout)), 0)
-        self.assertEqual(out.getvalue(), "")
+    def test_an_owner_that_finished_right_after_the_release_is_still_rearmed(self):
+        # Top review M1: the release closed the gate, and the owner ran to
+        # `done` before this Bash call's hook ran; the spent claim is still
+        # owed its wake, so the done row is a candidate and the wait ends at
+        # once with the terminal receipt.
+        import dispatch_contract as D
+        delivery_id = self._gate_record(state="sent-ambiguous")
+        self.spend_wake_on(delivery_id)
+        rewake.pending_delivery.ack(self.state, "session-gate", delivery_id, acked_by="gate-release")
+        text = self.jobs.read_text(encoding="utf-8").replace(
+            "attempt_schema_version=2,", "attempt_schema_version=2,fallback_hop=same-harness-headless,")
+        self.jobs.write_text(text, encoding="utf-8")
+        self.assertTrue(D.close_attempt_row(self.jobs, "att-gate-owner", "completed-marker"))
+        resolved = rewake.registry_launch(self.call())
+        assert isinstance(resolved, tuple), resolved
+        launch, claim = resolved
+        self.assertEqual((launch.attempt_id, launch.armed, claim.arms), ("att-gate-owner", "registry-rearm", 2))
+        # a done row with no claim of this session's is never a new candidate
+        self.jobs.write_text(self.jobs.read_text(encoding="utf-8").replace("att-gate-owner", "att-other-done"), encoding="utf-8")
+        self.assertIsNone(rewake.registry_launch(self.call()))
 
-    def test_sd_open_48_a_release_refused_as_already_released_still_arms_the_running_owner(self):
-        """#13 (cairn W15b, 2026-09-07 07:48): the owner had released its own
-        gate, the depth-0 release was refused "RUNNING, not blocked", nothing
-        armed, and the owner's completion sat in pending-delivery until the
-        next prompt sweep."""
-        prose = "workflow-supervisor: workflow is RUNNING, not blocked on a human gate"
-        typed = json.dumps({"gate": "frame-review", "route_id": "rt-gate",
-                            "refusal": "gate-not-blocked", "workflow_state": "RUNNING"})
-        literal = (f"python3 utilities/workflow-supervisor.py release --route {self.route} "
-                   f"--gate frame-review --decision proceed --jobs {self.jobs}")
-        payload = self.payload(command=literal, stdout=typed)
-        payload["tool_response"]["stderr"] = prose
-        launch = rewake.release_launch(payload)
-        self.assertIsNotNone(launch)
-        self.assertEqual((launch.attempt_id, launch.armed), ("att-gate-owner", "release-refused"))
-        # review finding 13: the route id comes from the supervisor's typed
-        # refusal line -- prose alone, a literal, or another refusal arms nothing
-        prose_only = self.payload(command=literal, stdout="")
-        prose_only["tool_response"]["stderr"] = prose
-        self.assertIsNone(rewake.release_launch(prose_only))
-        other = json.dumps({"gate": "frame-review", "route_id": "rt-gate", "refusal": "gate-undeclared"})
-        self.assertIsNone(rewake.release_launch(self.payload(command=literal, stdout=other)))
-        foreign_gate = json.dumps({"gate": "plan-review", "route_id": "rt-gate", "refusal": "gate-not-blocked"})
-        self.assertIsNone(rewake.release_launch(self.payload(command=literal, stdout=foreign_gate)))
-        # refused-as-released with no started open owner says so once
-        self.write_rows([("att-gate-owner", "done", "session-gate", "rt-gate")])
-        self.assertIsNone(rewake.release_launch(payload))
-        with mock.patch.object(sys, "stdout", io.StringIO()) as out:
-            self.assertEqual(rewake.release_no_arm_notice(payload), 0)
-        self.assertIn("state=not-armed surface=release-refused", json.loads(out.getvalue())["systemMessage"])
-        with mock.patch.object(sys, "stdout", io.StringIO()) as out:
-            self.assertEqual(rewake.release_no_arm_notice(prose_only), 0)
-        self.assertEqual(out.getvalue(), "")
+    def test_a_missing_or_unnamed_gate_record_counts_as_open(self):
+        # Review R1 B2: only a record that was read and is closed re-arms; an
+        # unnamed or *missing* record is no closing evidence. The holder is
+        # marked dead so this branch, not liveness, is what refuses.
+        for delivery_id in (None, "delivery-never-written"):
+            with self.subTest(delivery_id=delivery_id):
+                self.spend_wake_on(delivery_id)
+                refusal = rewake.claim_arm(self.jobs, "att-gate-owner", "session-gate", fresh=False)
+                self.assertEqual((refusal.reason, refusal.watched), ("gate-open", True))
+                self.assertNotIsInstance(rewake.registry_launch(self.call()), tuple)
+                rewake.arm_path(self.jobs, "att-gate-owner").unlink()
+
+    def test_a_foreign_sessions_call_never_rearms_this_owner(self):
+        delivery_id = self._gate_record(state="sent-ambiguous")
+        self.spend_wake_on(delivery_id)
+        rewake.pending_delivery.ack(self.state, "session-gate", delivery_id, acked_by="gate-release")
+        self.assertNotIsInstance(rewake.registry_launch(self.call(session="someone-else")), tuple)
 
     def test_a_registered_but_never_started_owner_never_arms(self):
         """review round 1, M2: the row the fence leaves behind (registered, refused
         at start) must not arm a six-hour wait on nothing."""
         lines = self.jobs.read_text(encoding="utf-8").replace("launch_started=1", "launch_started=0")
         self.jobs.write_text(lines, encoding="utf-8")
-        self.assertIsNone(rewake.release_launch(self.payload()))
+        self.assertNotIsInstance(rewake.registry_launch(self.call()), tuple)
 
-    def test_a_proven_release_that_arms_nothing_says_so_once(self):
-        self.write_rows([("att-gate-owner", "done", "session-gate", "rt-gate")])
-        with mock.patch.object(sys, "stdout", io.StringIO()) as out, \
-                mock.patch.object(sys, "stdin", io.StringIO(json.dumps(self.payload()))), \
-                mock.patch.object(sys, "stderr", io.StringIO()):
-            code = rewake.main()
-        self.assertEqual(code, 0)
-        rendered = json.loads(out.getvalue())
-        self.assertIn("state=not-armed surface=release", rendered["systemMessage"])
-
-    def test_no_open_owner_or_an_ambiguous_set_arms_nothing(self):
-        self.write_rows([("att-gate-owner", "done", "session-gate", "rt-gate")])
-        self.assertIsNone(rewake.release_launch(self.payload()))
-        self.write_rows([("att-gate-owner", "open", "session-gate", "rt-gate"),
-                         ("att-gate-owner-2", "open", "session-gate", "rt-gate")])
-        self.assertIsNone(rewake.release_launch(self.payload()))
-
-    def test_a_foreign_sessions_release_never_arms_this_session(self):
-        self.assertIsNone(rewake.release_launch(self.payload(session="someone-else")))
-
-    def test_unrelated_supervisor_commands_never_arm(self):
-        for command in (
-            f"python3 utilities/workflow-supervisor.py status --route {self.route}",
-            f"python3 utilities/workflow-supervisor.py await-release --route {self.route} --gate frame-review",
-            f"python3 utilities/workflow-supervisor.py gate --route {self.route} --gate frame-review --block",
-        ):
-            with self.subTest(command=command):
-                self.assertIsNone(rewake.release_launch(self.payload(command=command)))
-
-    def test_main_treats_the_release_as_a_launch(self):
+    def test_main_rearms_through_the_release_call_and_waits_to_the_terminal(self):
+        delivery_id = self._gate_record(state="sent-ambiguous")
+        self.spend_wake_on(delivery_id)
+        rewake.pending_delivery.ack(self.state, "session-gate", delivery_id, acked_by="gate-release")
         ready = subprocess.CompletedProcess([], 0, stdout="ready")
         (self.root / "utilities").mkdir()
         (self.root / "utilities" / "dispatch-attempt-ready.py").write_text("", encoding="utf-8")
         with mock.patch.object(rewake.subprocess, "run", return_value=ready), \
                 mock.patch.object(rewake, "agent_home", return_value=self.root), \
-                mock.patch.object(sys, "stdin", io.StringIO(json.dumps(self.payload()))), \
+                mock.patch.object(sys, "stdin", io.StringIO(json.dumps(self.call()))), \
                 mock.patch.object(sys, "stdout", io.StringIO()), \
                 mock.patch.object(sys, "stderr", io.StringIO()) as stderr:
             rewake.main()
         self.assertIn("attempt_id=att-gate-owner", stderr.getvalue())
-        self.assertIn("armed=release", stderr.getvalue())
+        self.assertIn("armed=registry-rearm", stderr.getvalue())
+        ledger = json.loads(rewake.arm_path(self.jobs, "att-gate-owner").read_text(encoding="utf-8"))
+        self.assertEqual(ledger["state"], "ended")
 
 
 if __name__ == "__main__":

@@ -19,7 +19,7 @@ _UTILITIES_DIR = str(Path(__file__).resolve().parent)
 if _UTILITIES_DIR not in sys.path:
     sys.path.insert(0, _UTILITIES_DIR)
 
-from dispatch_contract import resolve_dispatch_state_root  # noqa: E402
+from dispatch_contract import resolve_dispatch_state_root, stable_state_root  # noqa: E402
 
 _KINDS = ("watch", "steer", "handoff", "gate-relay", "notice")
 _SURFACES = (
@@ -58,34 +58,40 @@ _PEER_TRAILER_RE = re.compile(
     r"\(peer-from:\s*(?P<harness>[A-Za-z0-9_-]+)\s+(?P<sid>[^\s)]+)(?:\s+(?P<name>[^)]*?))?\s*\)")
 
 
-def peer_alias(harness, session_id):
-    """Fleet's display tag only; never resolve a tag/name/pane back to an id."""
-    if not usable_session_id(session_id):
-        return "[?]"
+def _session_handle():
+    """``fleet.session_handle``, the one home of the shared identity rules, or ``None``.
+
+    Imported lazily and by path: this tool ships next to `tools/` in both the checkout and
+    an installed release, but it is a standalone script and never runs as part of that
+    package.
+    """
     try:
         tools = str(Path(__file__).resolve().parents[1] / "tools")
         if tools not in sys.path:
             sys.path.insert(0, tools)
-        from fleet.session_handle import minted_tag, derived_tag
-        from fleet.titles import read_tag
-        tag = None
-        if harness in ("codex", "opencode"):
-            tag = minted_tag(session_id)
-        elif harness == "claude":
-            home = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
-            for path in (home / "sessions").glob("*.json"):
-                try:
-                    rec = json.loads(path.read_text(encoding="utf-8"))
-                    if rec.get("sessionId") == session_id and rec.get("nameSource") == "derived":
-                        tag = derived_tag(rec.get("name"))
-                        if tag:
-                            break
-                except (OSError, ValueError, AttributeError):
-                    continue
-            tag = tag or read_tag(session_id, harness="claude")
-        return f"[{tag}]" if isinstance(tag, str) and re.fullmatch(r"[0-9a-f]{2}", tag) else "[?]"
+        from fleet import session_handle
+        return session_handle
+    except Exception:
+        return None
+
+
+def peer_alias(harness, session_id):
+    """Fleet's display tag only; never resolve a tag/name/pane back to an id.
+
+    The badge rule itself lives in ``fleet.session_handle.resolve_tag`` — the trailer and
+    the board have to agree on what `[46]` means, so there is one definition, not a copy
+    here that can drift away from the one Fleet draws.
+    """
+    if not usable_session_id(session_id):
+        return "[?]"
+    handle = _session_handle()
+    if handle is None:
+        return "[?]"
+    try:
+        tag = handle.resolve_tag(harness, session_id)
     except Exception:
         return "[?]"
+    return f"[{tag}]" if isinstance(tag, str) and re.fullmatch(r"[0-9a-f]{2}", tag) else "[?]"
 
 
 def peer_trailer(harness, session_id, name=None, *, transfer_ref=None):
@@ -104,7 +110,7 @@ def _transfer_path(ref):
     # No caller-controlled paths, legacy ids, or arbitrary-length lookup keys.
     if not isinstance(ref, str) or not re.fullmatch(r"[0-9a-f]{32}", ref):
         raise ValueError("invalid-peer-transfer-ref")
-    return _ledger_root() / "peer-messages" / "transfers" / f"{ref}.json"
+    return peer_state_root() / "peer-messages" / "transfers" / f"{ref}.json"
 
 
 def _read_transfer_record(ref):
@@ -279,6 +285,19 @@ def claude_session_name(session_id, config_dir=None):
     return None
 
 
+def claude_session_id_for_address(address, config_dir=None):
+    """A peer socket address → that session's id; the rule lives in
+    ``fleet.session_handle.session_id_for_address`` so the ledger writer and the board
+    cannot disagree about who a socket belongs to."""
+    handle = _session_handle()
+    if handle is None:
+        return None
+    try:
+        return usable_session_id(handle.session_id_for_address(address, config_dir=config_dir))
+    except Exception:
+        return None
+
+
 def _agent_home():
     home = os.environ.get("AGENT_HOME")
     return Path(home) if home else Path.cwd()
@@ -288,10 +307,32 @@ def _ledger_root():
     return resolve_dispatch_state_root(_agent_home(), explicit_jobs=None, environ=os.environ)
 
 
+def peer_state_root():
+    """The one canonical root for the SD-122 peer-message ledger (plan.md C-1).
+
+    Kept separate from the dispatch registry root on purpose: a Codex managed
+    session inherits ``AGENT_DISPATCH_JOBS`` pointing at its own tree
+    (``~/.codex/.harness/dispatch``), and ``_ledger_root()`` follows that same
+    chain — so anchoring the ledger to it forks the ledger into two roots
+    (plan.md §2.2). Chain: ``AGENT_PEER_LEDGER_ROOT`` (test/ops override) ->
+    ``stable_state_root(os.environ)`` (the per-user root, independent of any
+    dispatch registry selection) -> ``_ledger_root()`` (only if both above
+    fail). Reads stay tolerant of the old root (`steward_marker_roots`,
+    `_iter_records`) — this function decides only where NEW records land.
+    """
+    override = os.environ.get("AGENT_PEER_LEDGER_ROOT")
+    if override:
+        return Path(override)
+    try:
+        return stable_state_root(os.environ)
+    except Exception:
+        return _ledger_root()
+
+
 def _ledger_path(from_session_id, when=None):
     when = when or time.gmtime()
     month = time.strftime("%Y-%m", when)
-    root = _ledger_root() / "peer-messages" / month
+    root = peer_state_root() / "peer-messages" / month
     # The id is a filename here. An unusable one shards to `unknown` instead of minting
     # a junk sibling of the real per-session shards (or, with a separator in it, a path
     # outside the month directory at all).
@@ -306,7 +347,7 @@ def steward_marker_path(harness, session_id):
     cleared by `peer-message release`, and swept of evidence-less leftovers by
     `peer-message prune-steward-markers`."""
     safe = "".join(ch if (ch.isalnum() or ch in "._-") else "_" for ch in str(session_id or ""))
-    return _ledger_root() / "peer-steward" / str(harness or "unknown") / f"{safe or 'unknown'}.json"
+    return peer_state_root() / "peer-steward" / str(harness or "unknown") / f"{safe or 'unknown'}.json"
 
 
 def mark_steward(harness, session_id, to, kind, ts, source=None):
@@ -435,7 +476,7 @@ def steward_marker_roots():
             return roots, "dispatch-chain"
     except Exception:
         pass
-    return [_ledger_root()], "own-root"
+    return [peer_state_root()], "own-root"
 
 
 def read_steward_markers(roots=None):
@@ -447,7 +488,7 @@ def read_steward_markers(roots=None):
     so every consumer is defended against leftovers of the old send-marks rule. The
     prune surface walks the files itself (`_iter_marker_files`) because it needs paths."""
     out = {}
-    root_list = [Path(r) for r in roots] if roots else [_ledger_root()]
+    root_list = [Path(r) for r in roots] if roots else [peer_state_root()]
     for base in root_list:
         for harness, _path, data in _iter_marker_files(base):
             if data is None or not data.get("session_id"):
@@ -638,36 +679,58 @@ def _unlink_unevidenced_marker(path):
 
 
 def _iter_records(since_hours=None):
-    root = _ledger_root() / "peer-messages"
-    if not root.is_dir():
-        return
+    """C-9 — reads follow the same "migration-free, tolerant" contract as every
+    other peer-ledger reader: a single root (`peer_state_root()`) is where NEW
+    records land (C-1), but records written before that cutover still live under
+    the dispatch-registry chain, so `cmd_list`/`cmd_status` must see both. Walks
+    the same root set `steward_marker_roots()` gives every other consumer
+    (peer 정본 root first, then the dispatch resolver chain, then every
+    installed runtime's own root), de-duplicated by `Path.resolve()` — not by
+    file, since two different roots' same-named shards are genuinely different
+    records. A root that fails to resolve is skipped; the rest are still read.
+    """
+    roots, _source = steward_marker_roots()
+    if not roots:
+        roots = [peer_state_root()]
     cutoff = None
     if since_hours is not None:
         cutoff = time.time() - since_hours * 3600
-    for month_dir in sorted(root.glob("*")):
-        if not month_dir.is_dir():
+    seen = set()
+    for base in roots:
+        try:
+            resolved = Path(base).resolve()
+        except Exception:
             continue
-        for f in sorted(month_dir.glob("*.jsonl")):
-            try:
-                with open(f, "r", encoding="utf-8", errors="replace") as fh:
-                    for line in fh:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            rec = json.loads(line)
-                        except Exception:
-                            continue
-                        if cutoff is not None:
-                            try:
-                                ts = time.strptime(rec.get("ts", ""), "%Y-%m-%dT%H:%M:%SZ")
-                                if time.mktime(ts) - time.timezone < cutoff:
-                                    continue
-                            except Exception:
-                                pass
-                        yield rec
-            except Exception:
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        root = Path(base) / "peer-messages"
+        if not root.is_dir():
+            continue
+        for month_dir in sorted(root.glob("*")):
+            if not month_dir.is_dir():
                 continue
+            for f in sorted(month_dir.glob("*.jsonl")):
+                try:
+                    with open(f, "r", encoding="utf-8", errors="replace") as fh:
+                        for line in fh:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                rec = json.loads(line)
+                            except Exception:
+                                continue
+                            if cutoff is not None:
+                                try:
+                                    ts = time.strptime(rec.get("ts", ""), "%Y-%m-%dT%H:%M:%SZ")
+                                    if time.mktime(ts) - time.timezone < cutoff:
+                                        continue
+                                except Exception:
+                                    pass
+                            yield rec
+                except Exception:
+                    continue
 
 
 def cmd_list(args):

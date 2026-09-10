@@ -13,6 +13,7 @@ const isHarnessRoot = (candidate) =>
 const root = isHarnessRoot(envRoot) ? envRoot : pluginRoot
 const preflight = path.join(root, "adapters", "opencode", "bin", "preflight.sh")
 const summaryTrigger = path.join(root, "utilities", "session_summary_trigger.py")
+const herdrProjection = path.join(root, "tools", "fleet", "herdr_projection.py")
 const designPattern = /(designs?\/|\/design\/|spec\/design|preview\.html$|slides?\.html$|03_components|scaffolds\/)/
 // Capabilities that mutate the spec blueprint — must pass the prd.md read gate in a
 // spec-backed cwd. Mirrors Claude's PreToolUse[Skill] spec-skill-gate scope.
@@ -195,6 +196,26 @@ function spawnSummary(sid, phase) {
   }
 }
 
+// Pane-header identity, shared with Claude and Codex (tools/fleet/herdr_projection.py).
+// OpenCode has no user-configurable status line, so the pane header is the only place
+// this session can say which session it is -- and it must say it in the same shape the
+// other two harnesses do. Fire-and-forget: a turn never waits on a display projection.
+function projectPane(sid) {
+  if (!sid || isWorkerSession() || !process.env.HERDR_PANE_ID) return
+  try {
+    const child = spawn("python3", [herdrProjection, "--harness", "opencode",
+      "--session-id", sid], {
+      cwd: root,
+      env: { ...process.env, AGENT_HOME: root },
+      detached: true,
+      stdio: "ignore",
+    })
+    child.unref()
+  } catch {
+    // best-effort; the pane header is display-only
+  }
+}
+
 function collectPreflight(command, args) {
   const result = spawnSync(preflight, [command, ...args], {
     cwd: root,
@@ -316,6 +337,7 @@ export const AgentHarnessGuards = async (ctx) => {
       if (!isWorkerSession()) {
         spawnDetached("session-end", [baseDir(ctx), sid])
         spawnSummary(eventSid, "final")
+        projectPane(eventSid)
       }
       // Liveness side-channel: touch the heartbeat for the active dispatch slug
       // so dispatch-liveness.py can detect stale/crashed headless sessions even
@@ -338,6 +360,7 @@ export const AgentHarnessGuards = async (ctx) => {
     const eventSid = input.sessionID || output?.message?.sessionID || ""
     const sid = eventSid || "opencode-plugin"
     spawnSummary(eventSid, "initial")
+    projectPane(eventSid)
     sd111SessionSweep(sid)
     const prompt = promptText(output)
     const turn = input.messageID || output?.message?.id || ""

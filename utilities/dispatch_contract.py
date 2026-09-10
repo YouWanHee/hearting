@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import base64
 from contextlib import contextmanager
+import contextvars
 from dataclasses import dataclass
 import errno
 import fcntl
@@ -2161,6 +2162,11 @@ def process_group_observation(pgid: int) -> ProcessGroupObservation:
 
     if pgid <= 0:
         return ProcessGroupObservation("unverifiable", reason="invalid-pgid")
+    scan = _PROCESS_TABLE_SCAN.get()
+    if scan is not None:
+        # Batch observer pass (`process_table_scan_scope`): same verdict, one
+        # walk shared by every group of the pass instead of one per call.
+        return _process_group_from_scan(scan, pgid)
     members: list[tuple[int, str, str]] = []
     incomplete_reason = ""
     try:
@@ -2257,6 +2263,186 @@ def _parent_leader_pids(metadata: dict[str, str]) -> set[int]:
     return excluded
 
 
+@dataclass(frozen=True)
+class ProcessTableScan:
+    """One ``/proc`` walk, indexed by attempt tag and by process group.
+
+    Shared by every observation of one observer pass (`process_table_scan_scope`).
+    ``incomplete_reason`` follows `attempt_tagged_descendants`' rules for the
+    tag index. ``group_errors`` follows `process_group_observation`'s rules: each
+    entry is ``(walk_order, pgid_or_None, reason)`` -- ``None`` for a failure the
+    single-shot probe hits before it can compare the group (unreadable ``stat``,
+    unparsable pgid), the pgid for one it hits only while collecting that group
+    (a parsed pgid whose start field is missing). A group query takes the last
+    entry in walk order that applies to it, exactly as the single-shot loop's
+    ``incomplete_reason`` is the last one it overwrote.
+    """
+
+    members_by_attempt: dict[str, tuple[tuple[int, str, str], ...]]
+    members_by_pgid: dict[int, tuple[tuple[int, str, str], ...]]
+    incomplete_reason: str = ""
+    group_errors: tuple[tuple[int, int | None, str], ...] = ()
+    error: str = ""
+
+
+_PROCESS_TABLE_SCAN: contextvars.ContextVar = contextvars.ContextVar(
+    "dispatch_process_table_scan", default=None
+)
+
+
+def scan_process_table() -> ProcessTableScan:
+    """Walk ``/proc`` once and index live processes by attempt tag and by pgid.
+
+    Per-process reads, skips, and incomplete reasons are exactly those of the
+    two single-shot probes, evaluated independently on the same raw ``stat``
+    line: the tag index needs ``tail[0]``/``tail[19]`` and then ``environ``
+    (a permission failure is another uid's process and is skipped); the group
+    index needs ``int(tail[2])`` first (a failure there is a group-wide
+    incomplete walk, like an unreadable ``stat``) and ``tail[19]`` only for the
+    group that pgid names. The tag value is recorded for every process instead
+    of being compared with one attempt id; parent-leader exclusion is per
+    attempt and is applied later, in `_tagged_descendants_from_scan`.
+    """
+
+    prefix = f"{ATTEMPT_DESCENDANT_ENV}=".encode()
+    by_attempt: dict[str, list[tuple[int, str, str]]] = {}
+    by_pgid: dict[int, list[tuple[int, str, str]]] = {}
+    incomplete_reason = ""
+    group_errors: list[tuple[int, int | None, str]] = []
+    try:
+        entries = tuple(Path("/proc").iterdir())
+    except OSError as exc:
+        return ProcessTableScan({}, {}, error=f"procfs-enumeration:{exc.errno or 'error'}")
+    for order, entry in enumerate(entries):
+        if not entry.name.isdigit():
+            continue
+        try:
+            raw = (entry / "stat").read_text(encoding="utf-8")
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            if exc.errno in {errno.ENOENT, errno.ESRCH}:
+                continue
+            group_errors.append((order, None, f"procfs-member:{entry.name}:{exc.errno or 'error'}"))
+            if exc.errno not in {errno.EACCES, errno.EPERM}:
+                incomplete_reason = f"procfs-environ:{entry.name}:{exc.errno or 'error'}"
+            continue
+        except ValueError:
+            # A comm that is not UTF-8 raises UnicodeDecodeError (a ValueError) out
+            # of the read itself; both single-shot probes count that row as
+            # malformed before any field is compared (review round 2, major 1).
+            reason = f"procfs-member:{entry.name}:malformed"
+            group_errors.append((order, None, reason))
+            incomplete_reason = reason
+            continue
+        tail = raw[raw.rfind(")") + 2 :].split()
+        pid = int(entry.name)
+        # Group index: the single-shot probe compares `int(tail[2])` before it
+        # touches anything else, so a pgid it cannot parse is an incomplete walk
+        # for every group; a missing start field is seen only by that group.
+        try:
+            pgid = int(tail[2])
+        except (IndexError, ValueError):
+            group_errors.append((order, None, f"procfs-member:{entry.name}:malformed"))
+        else:
+            try:
+                by_pgid.setdefault(pgid, []).append((pid, tail[19], tail[0]))
+            except IndexError:
+                group_errors.append((order, pgid, f"procfs-member:{entry.name}:malformed"))
+        # Tag index: state and start, zombie skip, then environ.
+        try:
+            state, start = tail[0], tail[19]
+        except IndexError:
+            incomplete_reason = f"procfs-member:{entry.name}:malformed"
+            continue
+        if state == "Z":
+            continue
+        try:
+            environ = (entry / "environ").read_bytes()
+        except (FileNotFoundError, PermissionError):
+            continue
+        except OSError as exc:
+            if exc.errno in {errno.ENOENT, errno.ESRCH, errno.EACCES, errno.EPERM}:
+                continue
+            incomplete_reason = f"procfs-environ:{entry.name}:{exc.errno or 'error'}"
+            continue
+        # `tag in environ.split(...)` names a process once however many times the
+        # same entry repeats; a process carrying two different tag values is
+        # found by either single-shot query, so it is indexed under both.
+        for item in dict.fromkeys(environ.split(b"\0")):
+            if item.startswith(prefix):
+                tag_value = item[len(prefix):].decode("utf-8", "replace")
+                by_attempt.setdefault(tag_value, []).append((pid, start, state))
+    return ProcessTableScan(
+        {tag: tuple(sorted(rows, key=lambda member: member[0])) for tag, rows in by_attempt.items()},
+        {pgid: tuple(sorted(rows, key=lambda member: member[0])) for pgid, rows in by_pgid.items()},
+        incomplete_reason,
+        tuple(group_errors),
+    )
+
+
+@contextmanager
+def process_table_scan_scope():
+    """Fleet-only batch path: one ``/proc`` walk for every observation of one pass.
+
+    `attempt_tagged_descendants` and `process_group_observation` are single-shot
+    probes for the moment before a quiescence verdict and are never meant for a
+    hot path -- yet a monitor that classifies every registered attempt on every
+    tick reached both once per row (2026-09-08 audit: 187 rows, 20 s of a ~40 s
+    tick). Inside this scope every call answers from one walk taken on entry,
+    with the same populated / unverifiable / empty verdict per attempt or group;
+    the walk is dropped on exit, so the next pass reads ``/proc`` again. Only
+    observe-only passes may hold this scope: a caller that waits for a process
+    to disappear must stay outside it, which every existing quiescence caller
+    does. A nested scope joins the enclosing pass.
+    """
+
+    if _PROCESS_TABLE_SCAN.get() is not None:
+        yield
+        return
+    token = _PROCESS_TABLE_SCAN.set(scan_process_table())
+    try:
+        yield
+    finally:
+        _PROCESS_TABLE_SCAN.reset(token)
+
+
+def _tagged_descendants_from_scan(
+    scan: ProcessTableScan, metadata: dict[str, str], attempt_id: str
+) -> ProcessGroupObservation:
+    if scan.error:
+        return ProcessGroupObservation("unverifiable", reason=scan.error)
+    excluded_pids = _parent_leader_pids(metadata)
+    ordered = tuple(
+        member for member in scan.members_by_attempt.get(attempt_id, ())
+        if member[0] not in excluded_pids
+    )
+    if ordered:
+        return ProcessGroupObservation("populated", ordered, scan.incomplete_reason)
+    if scan.incomplete_reason:
+        return ProcessGroupObservation("unverifiable", (), scan.incomplete_reason)
+    if not attempt_scan_namespace_authority(metadata):
+        return ProcessGroupObservation(
+            "unverifiable", (), "observer-namespace-mismatch"
+        )
+    return ProcessGroupObservation("empty")
+
+
+def _process_group_from_scan(scan: ProcessTableScan, pgid: int) -> ProcessGroupObservation:
+    if scan.error:
+        return ProcessGroupObservation("unverifiable", reason=scan.error)
+    ordered = scan.members_by_pgid.get(pgid, ())
+    incomplete_reason = ""
+    for _order, scope_pgid, reason in scan.group_errors:
+        if scope_pgid is None or scope_pgid == pgid:
+            incomplete_reason = reason          # last applicable entry in walk order wins
+    if any(state != "Z" for _pid, _start, state in ordered):
+        return ProcessGroupObservation("populated", ordered, incomplete_reason)
+    if incomplete_reason:
+        return ProcessGroupObservation("unverifiable", ordered, incomplete_reason)
+    return ProcessGroupObservation("empty", ordered)
+
+
 def attempt_tagged_descendants(metadata: dict[str, str]) -> ProcessGroupObservation:
     """Find live processes still tagged with this attempt, whatever group they left.
 
@@ -2276,6 +2462,11 @@ def attempt_tagged_descendants(metadata: dict[str, str]) -> ProcessGroupObservat
     attempt_id = metadata.get("attempt_id", "")
     if not attempt_id:
         return ProcessGroupObservation("unverifiable", reason="attempt-id-missing")
+    scan = _PROCESS_TABLE_SCAN.get()
+    if scan is not None:
+        # Batch observer pass (`process_table_scan_scope`): same verdict, one
+        # walk shared by every attempt of the pass instead of one per call.
+        return _tagged_descendants_from_scan(scan, metadata, attempt_id)
     tag = f"{ATTEMPT_DESCENDANT_ENV}={attempt_id}".encode()
     # SD-OPEN-47 (H7-b): a child's liveness is its own process set. The
     # recorded parent leader (the owner's governed process) is an ancestor,
@@ -5233,7 +5424,9 @@ def validate_nested_eligibility(
 FENCED_HUMAN_GATES = frozenset({"frame-review"})
 
 
-def _human_gate_entry_fence(route: dict, node: dict) -> None:
+def _human_gate_entry_fence(
+    route: dict, node: dict, jobs: Path | None = None
+) -> None:
     """Refuse to start a node whose entry human gate is not released (SD-129).
 
     Defect M, measured 2026-09-04 on route rt-da62cded: the owner raised
@@ -5245,12 +5438,11 @@ def _human_gate_entry_fence(route: dict, node: dict) -> None:
 
     The answer comes from `workflow_state.human_gate_resolution`, the same rule
     the owner's `await-release` and the carriers read, and from the same ledger
-    root the supervisor writes (`workflow_state.default_ledger_root()`); the
-    reader never derives its own root from the wrapper's `--jobs`, because the
-    writer does not either. Both "never raised" and "raised, not released" are
-    refusals: a route sealed with the binding must pass through the gate, or a
-    self-approving owner is back to the two 2026-09-03 cycles that pressed
-    their own gate. `revise` and `stop` leave the gate unreleased too.
+    root the supervisor writes. An explicit wrapper `--jobs` is the authority
+    for both sides; ambient roots are used only when no registry was supplied.
+    Both "never raised" and "raised, not released" are refusals: a route sealed
+    with the binding must pass through the gate. `revise` and `stop` leave the
+    gate unreleased too.
     """
 
     # Two conditions, both required (review rounds 1 and 2, B1):
@@ -5284,9 +5476,20 @@ def _human_gate_entry_fence(route: dict, node: dict) -> None:
         return
     import workflow_state as WS  # noqa: WPS433 -- workflow_state imports this module
 
-    ledger = WS.WorkflowLedger(str(route["route_id"]), str(route.get("route_hash", "")))
-    entries = ledger.journal()
-    where = f"route {route['route_id']} ledger {ledger.root}"
+    try:
+        ledger = WS.WorkflowLedger(
+            str(route["route_id"]), str(route.get("route_hash", "")), jobs=jobs
+        )
+        entries = ledger.journal()
+        _root, source = WS.ledger_root_for(jobs)
+    except WS.WorkflowStateError as exc:
+        raise DispatchContractError(
+            "workflow-ledger-authority-invalid", str(exc)
+        ) from exc
+    where = (
+        f"route {route['route_id']} ledger {ledger.root} "
+        f"ledger_root_source={source}"
+    )
     for binding in bindings:
         gate = str(binding["gate"])
         resolution = WS.human_gate_resolution(entries, gate)
@@ -5385,7 +5588,7 @@ def completion_marker_gate(
             blocked.append((dep, readiness))
     if missing:
         raise DispatchContractError("completion-marker-missing", ",".join(missing))
-    _human_gate_entry_fence(route, node)
+    _human_gate_entry_fence(route, node, jobs)
     _auxiliary_arbitration_gate(route, node, agent_home, jobs)
     if blocked:
         reason = (

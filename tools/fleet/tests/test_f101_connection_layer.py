@@ -41,15 +41,81 @@ class StripContractTest(unittest.TestCase):
             self.assertIn("term_width", signature(getattr(render, name)).parameters)
 
     def test_peer_and_steward_fail_soft_and_fit(self):
-        peer = render._peer_link_strip({"from_session_id": "sid", "from_name": "a",
-                                        "kind": "handoff", "age_min": 2}, term_width=12)
+        peer = render._peer_link_strip(None, {"from_session_id": "sid", "from_name": "a",
+                                              "kind": "handoff", "age_min": 2}, term_width=12)
         self.assertLessEqual(sum(render._dw(t) for t, _ in peer[0]), 12)
-        self.assertEqual(render._peer_link_strip({"from_session_id": ""}), [])
+        # A record naming no endpoint at all — no tag, no name, no id, no harness — is
+        # not a relation and draws nothing. Anything else now DOES draw (see
+        # OffScreenPeerTest): endpoint visibility stopped deciding existence.
+        self.assertEqual(render._peer_link_strip(None, {"from_session_id": ""}), [])
+        self.assertEqual(render._peer_link_strip(None, None), [])
         steward = render._steward_link_strip(
-            [{"harness": "claude", "session_id": "s%d" % i} for i in range(20)],
+            [{"harness": "claude", "session_id": "s%d" % i} for i in range(20)], None,
             {("claude", "s%d" % i): "%02x" % i for i in range(20)}, term_width=60)
         self.assertLessEqual(sum(render._dw(t) for t, _ in steward[0]), 60)
         self.assertIn("+", "".join(t for t, _ in steward[0]))
+
+    def test_icon_says_kind_and_arrow_says_direction(self):
+        """User decision 2026-09-09: the glyph carries WHAT, the arrow carries WHICH WAY,
+        and neither repeats the other — so no icon may vary between the two directions."""
+        recv = _text(render._peer_link_strip(
+            None, {"from_session_id": "s", "from_name": "peer", "age_min": 1}, {})[0])
+        sent = _text(render._peer_link_strip(
+            {"to_session_id": "s", "to_name": "peer", "age_min": 1}, None, {})[0])
+        self.assertIn("✉ ←", recv)
+        self.assertIn("✉ →", sent)
+        watches = _text(render._steward_link_strip(
+            [{"harness": "claude", "session_id": "s"}], None, {("claude", "s"): "b0"})[0])
+        watched = _text(render._steward_link_strip(
+            None, [{"harness": "claude", "session_id": "s", "name": "n"}],
+            {("claude", "s"): "b0"})[0])
+        self.assertIn("⚑ →", watches)
+        self.assertIn("⚑ ← [b0] claude", watched)
+
+
+class PeerEndpointLabelTest(unittest.TestCase):
+    """The label ladder: on-screen tag → ledger name → `<harness>:<sid8>`. A full raw
+    session id is never a label (user 2026-09-09 saw
+    `← 01a084f7-63f2-7961-ae60-6fc2d8e60fc2` on the board)."""
+
+    _SID = "01a084f7-63f2-7961-ae60-6fc2d8e60fc2"
+
+    def _label(self, tag_by_key, name=None):
+        entry = {"from_harness": "codex", "from_session_id": self._SID,
+                 "from_name": name, "age_min": 3}
+        return _text(render._peer_link_strip(None, entry, tag_by_key)[0])
+
+    def test_visible_endpoint_uses_its_badge(self):
+        self.assertIn("[3a] codex", self._label({("codex", self._SID): "3a"}))
+
+    # These two pin the fallback ladder BELOW the badge, so the resolver is stubbed out.
+    # Without the stub they read this machine's live session records: `_SID` is a real id,
+    # and once off-board peers learned to resolve their own tag both started returning
+    # `[3a] codex` here — a test failing on live state rather than on the behavior it names.
+
+    def test_offscreen_endpoint_falls_back_to_the_ledger_name(self):
+        with mock.patch.object(render, "_resolve_session_tag", return_value=None):
+            text = self._label({}, name="peer-test-codex")
+        self.assertIn("peer-test-codex", text)
+        self.assertNotIn(self._SID, text)
+
+    def test_nameless_offscreen_endpoint_is_harness_and_short_prefix(self):
+        with mock.patch.object(render, "_resolve_session_tag", return_value=None):
+            text = self._label({})
+        self.assertIn("codex:01a084f7", text)
+        self.assertNotIn(self._SID, text)
+
+    def test_an_offscreen_endpoint_still_gets_its_badge_when_one_resolves(self):
+        # The point of resolving off-board: one session keeps one shape whether or not it
+        # happens to be on screen this tick.
+        with mock.patch.object(render, "_resolve_session_tag", return_value="3a"):
+            text = self._label({}, name="peer-test-codex")
+        self.assertIn("[3a] codex", text)
+
+    def test_the_badge_wins_over_a_name(self):
+        text = self._label({("codex", self._SID): "3a"}, name="peer-test-codex")
+        self.assertIn("[3a] codex", text)
+        self.assertNotIn("peer-test-codex", text)
 
 
 class PeerCorrelationTest(unittest.TestCase):
@@ -136,6 +202,8 @@ class ConnectionLayerInsetOrderTest(unittest.TestCase):
         gpu_i = idx(lambda t: "GPU h1:0" in t)
         peer_i = idx(lambda t: "←" in t and "peerB" in t)
         steward_i = idx(lambda t: "[46]" in t and "→" in t)
+        # Each strip's leading CONTENT glyph is its own icon, so the shared-inset
+        # invariant is measured at the icon, not at the arrow that follows it.
         plugin_i = idx(lambda t: "codex task" in t)
         dispatch_i = idx(lambda t: "job1" in t)
 
@@ -150,8 +218,8 @@ class ConnectionLayerInsetOrderTest(unittest.TestCase):
         offsets = {
             "subagent": content_offset(subagent_i, render._ICON_SUBAGENT),
             "gpu": content_offset(gpu_i, "●"),
-            "peer": content_offset(peer_i, "←"),
-            "steward": content_offset(steward_i, "→"),
+            "peer": content_offset(peer_i, render._ICON_PEER),
+            "steward": content_offset(steward_i, render._ICON_STEWARD),
         }
         self.assertEqual(len(set(offsets.values())), 1,
                          "inset offsets differ across strips: %r" % offsets)
@@ -175,10 +243,10 @@ class StewardFoldPlaceholderTest(unittest.TestCase):
         tag_by_key = {("claude", "s%d" % i): "%02x" % i for i in range(20)}
         tag_by_key[("unknown", "sBadTag")] = None
 
-        segs = render._steward_link_strip(targets, tag_by_key, term_width=60)[0]
+        segs = render._steward_link_strip(targets, None, tag_by_key, term_width=60)[0]
         text = _text(segs)
         self.assertLessEqual(sum(render._dw(t) for t, _k in segs), 60)
-        self.assertRegex(text, r"^\s*→( \[[0-9a-f]{2}\])+ \+\d+$")
+        self.assertRegex(text, r"^\s*⚑ →( \[[0-9a-f]{2}\])+ \+\d+$")
         self.assertIn("[00]", text)
         self.assertIn("[01]", text)
         shown = len(re.findall(r"\[[0-9a-f]{2}\]", text))
@@ -188,9 +256,11 @@ class StewardFoldPlaceholderTest(unittest.TestCase):
         self.assertNotIn("None", text)
 
 
-class ConnectionLinkFoldTest(unittest.TestCase):
-    """F-101g-(6) — a peer link to a folded/hidden target session disappears along
-    with that session's row; the effect is symmetric under group-order reversal."""
+class OffScreenPeerTest(unittest.TestCase):
+    """The received-message line no longer depends on whether the OTHER session is
+    rendered this tick. F-101g-(6) used to hide it along with the folded peer row, which
+    is what made the same receipt appear and disappear between ticks (user 2026-09-09:
+    "받는 세션도 좀 이상하긴하네 일관성이 없고"). Visibility now decides the LABEL only."""
 
     def _fixture(self):
         a = Session(harness="claude", pid=1, cwd="/x/group1", slug="a", session_id="sidA",
@@ -198,36 +268,139 @@ class ConnectionLinkFoldTest(unittest.TestCase):
                    peer_last_recv={"from_name": "peerB", "from_session_id": "sidB",
                                    "from_harness": "claude", "kind": "handoff", "age_min": 2})
         b = Session(harness="claude", pid=2, cwd="/x/group2", slug="b", session_id="sidB",
-                   liveness="stale", elapsed_min=100)
+                   liveness="stale", elapsed_min=100, session_tag="b0")
         return a, b
 
-    def test_link_vanishes_when_target_group_folds(self):
-        a, b = self._fixture()
-        lines = render._build_lines([a, b], [], "fleet", False, 0, layout="wide",
-                                    term_width=168)
-        rows = _lines_text(lines)
-        self.assertFalse(any("←" in t for t in rows))
-        self.assertTrue(any("folded" in t for t in rows))
-
-    def test_link_reappears_when_show_all_reveals_the_target(self):
-        a, b = self._fixture()
+    def _rows(self, sessions, show_all=False):
         prev = render._SHOW_ALL
-        render._SHOW_ALL = True
+        render._SHOW_ALL = show_all
         try:
-            lines = render._build_lines([a, b], [], "fleet", False, 0, layout="wide",
-                                        term_width=168)
+            return _lines_text(render._build_lines(sessions, [], "fleet", False, 0,
+                                                   layout="wide", term_width=168))
         finally:
             render._SHOW_ALL = prev
-        rows = _lines_text(lines)
-        self.assertTrue(any("←" in t and "peerB" in t for t in rows))
 
-    def test_fold_effect_is_symmetric_under_group_order_reversal(self):
+    def test_link_survives_a_folded_target_and_is_named(self):
         a, b = self._fixture()
-        lines = render._build_lines([b, a], [], "fleet", False, 0, layout="wide",
-                                    term_width=168)
-        rows = _lines_text(lines)
-        self.assertFalse(any("←" in t for t in rows))
+        rows = self._rows([a, b])
+        self.assertTrue(any("✉ ←" in t and "peerB" in t for t in rows))
         self.assertTrue(any("folded" in t for t in rows))
+
+    def test_visible_target_upgrades_the_label_to_its_badge(self):
+        a, b = self._fixture()
+        rows = self._rows([a, b], show_all=True)
+        self.assertTrue(any("✉ ← [b0] claude" in t for t in rows))
+
+    def test_shape_is_identical_under_group_order_reversal(self):
+        a, b = self._fixture()
+        forward = [t for t in self._rows([a, b]) if "✉ ←" in t]
+        reversed_ = [t for t in self._rows([b, a]) if "✉ ←" in t]
+        self.assertEqual(forward, reversed_)
+        self.assertEqual(len(forward), 1)
+
+
+class StewardParentStripTest(unittest.TestCase):
+    """`⚑ ←` — the watched session finally shows who is watching it. The steward marker
+    is written on one side only, so before this the target row carried no reverse field
+    at all (measured 2026-09-09)."""
+
+    def test_target_row_shows_its_supervisor(self):
+        parent = Session(harness="claude", pid=1, cwd="/x/p", slug="p", session_id="sidP",
+                         liveness="working", elapsed_min=1, session_tag="b0", steward=True,
+                         steward_targets=[{"harness": "codex", "session_id": "sidT"}])
+        target = Session(harness="codex", pid=2, cwd="/x/p", slug="t", session_id="sidT",
+                         liveness="working", elapsed_min=1, session_tag="13",
+                         steward_parents=[{"harness": "claude", "session_id": "sidP",
+                                           "name": "hearting-b0"}])
+        rows = _lines_text(render._build_lines([parent, target], [], "fleet", False, 0,
+                                               layout="wide", term_width=168))
+        self.assertTrue(any("⚑ → [13]" in t for t in rows))
+        self.assertTrue(any("⚑ ← [b0] claude" in t for t in rows))
+
+
+class RelationLineBudgetTest(unittest.TestCase):
+    """A session spends at most TWO rows on relations, whatever it is doing.
+
+    Before this a session that had sent, received, watched and was watched drew four
+    rows — one per direction. The user measured that on the live board (2026-09-10:
+    "그 감독 줄과 메시지 줄이 따로 있으면 최대 총 4줄까지 있는건데, 그건 좀 과한것 같아.
+    2줄로 줄여 어차피 횡으로 여유 많은데"). Vertical space is the scarce axis on this
+    board; horizontal is not.
+    """
+
+    def _busiest_session(self):
+        return Session(
+            harness="claude", pid=1, cwd="/x/repo", slug="a", session_id="sidA",
+            liveness="working", elapsed_min=1, session_tag="a1",
+            peer_last_sent={"to_name": "peerB", "to_session_id": "sidB",
+                            "to_harness": "claude", "kind": "steer", "age_min": 1},
+            peer_last_recv={"from_name": "peerC", "from_session_id": "sidC",
+                            "from_harness": "codex", "kind": "handoff", "age_min": 2},
+            steward=True,
+            steward_targets=[{"harness": "claude", "session_id": "sidD"}],
+            steward_parents=[{"harness": "claude", "session_id": "sidE",
+                              "name": "hearting-b0"}])
+
+    def _relation_rows(self, width=168):
+        peers = [self._busiest_session()]
+        for sid, tag in (("sidB", "b0"), ("sidC", "c0"), ("sidD", "d0"), ("sidE", "e0")):
+            peers.append(Session(harness="claude", pid=len(peers) + 1, cwd="/x/repo",
+                                 slug=sid, session_id=sid, liveness="working",
+                                 elapsed_min=1, session_tag=tag))
+        rows = _lines_text(render._build_lines(peers, [], "fleet", False, 0,
+                                               layout="wide", term_width=width))
+        return [t for t in rows if render._ICON_PEER in t or render._ICON_STEWARD in t]
+
+    def test_a_session_with_every_relation_spends_exactly_two_rows(self):
+        rows = self._relation_rows()
+        self.assertEqual(len(rows), 2, "relation rows: %r" % rows)
+
+    def test_each_row_carries_both_of_its_directions(self):
+        peer_row, steward_row = self._relation_rows()
+        self.assertIn("✉ →", peer_row)
+        self.assertIn("←", peer_row.split("✉ →", 1)[1])
+        self.assertIn("⚑ →", steward_row)
+        self.assertIn("←", steward_row.split("⚑ →", 1)[1])
+
+    def test_the_icon_is_not_repeated_for_the_second_direction(self):
+        # The icon says what the relation is — once per row. Repeating it would make the
+        # second half read as a separate relation, which is what the two rows already did.
+        for row in self._relation_rows():
+            self.assertEqual(row.count(render._ICON_PEER)
+                             + row.count(render._ICON_STEWARD), 1)
+
+    def test_a_single_direction_still_draws_one_row_not_a_dangling_arrow(self):
+        line = render._peer_link_strip(
+            {"to_session_id": "s", "to_name": "peer", "age_min": 1}, None, {})
+        self.assertEqual(len(line), 1)
+        self.assertNotIn("←", _text(line[0]))
+
+    def test_a_narrow_terminal_keeps_both_endpoints_and_drops_the_detail(self):
+        # Endpoints are the fact; kind and age are the trimming allowance.
+        sent = {"to_session_id": "sB", "to_name": "peerB", "kind": "steer", "age_min": 1}
+        recv = {"from_session_id": "sC", "from_name": "peerC", "kind": "handoff",
+                "age_min": 2}
+        tags = {("", "sB"): "b0", ("", "sC"): "c0"}
+        with mock.patch.object(render, "_resolve_session_tag", return_value=None):
+            segs = render._peer_link_strip(sent, recv, tags, term_width=46)[0]
+        text = _text(segs)
+        self.assertLessEqual(sum(render._dw(t) for t, _k in segs), 46)
+        self.assertIn("[b0]", text)
+        self.assertIn("[c0]", text)
+        self.assertNotIn("steer", text)
+
+    def test_the_steward_row_folds_its_watch_list_before_dropping_the_watcher(self):
+        # Who is watching me is one fact; who I watch is a list. The list yields first.
+        targets = [{"harness": "claude", "session_id": "s%d" % i} for i in range(20)]
+        tag_by_key = {("claude", "s%d" % i): "%02x" % i for i in range(20)}
+        tag_by_key[("claude", "sP")] = "b0"
+        parents = [{"harness": "claude", "session_id": "sP", "name": "steward"}]
+        with mock.patch.object(render, "_resolve_session_tag", return_value=None):
+            segs = render._steward_link_strip(targets, parents, tag_by_key, term_width=40)[0]
+        text = _text(segs)
+        self.assertLessEqual(sum(render._dw(t) for t, _k in segs), 40)
+        self.assertIn("← [b0] claude", text)
+        self.assertIn("+", text)
 
 
 class LedgerAbsentByteIdenticalTest(unittest.TestCase):

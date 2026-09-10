@@ -44,7 +44,7 @@ so that residual runtime input is reported separately from profile masking.
 | spec read gate | `hooks/spec-skill-gate.sh` + `hooks/spec-read-marker.sh` |
 | git safety gate | `hooks/git-state-guard.sh` |
 | material route gate | `hooks/material-route-guard.py`; same-session route compile marker plus source Edit/Write and `git commit` chokepoints |
-| interactive owner completion | `hooks/dispatch-owner-rewake.py`; `PostToolUse(Bash)` `asyncRewake` arms from a successful same-session dispatch-depth-1 owner start (or, SD-129, from that session's `workflow-supervisor.py release` of the owner's gate), waits outside the model, wakes at once when the owner raises a human gate, and returns one exact-attempt receipt without recurring background monitors |
+| interactive owner completion | `hooks/dispatch-owner-rewake.py`; `PostToolUse(Bash)` `asyncRewake` arms from the start receipt or the registry's same-session dispatch-depth-1 owner row — never from the command text; an arm ledger keeps one waiter per attempt and re-arms after the owner's gate closes (SD-129) — waits outside the model, wakes at once when the owner raises a human gate, and returns one exact-attempt receipt without recurring background monitors |
 | steward watch completion | `hooks/peer-steward-rewake.py`; `PostToolUse(Bash)` `asyncRewake` arms only from a same-session `peer-steward.py watch` armed line with `wake=hook`, waits on the watch receipt outside the model, acks it, and returns one exit-2 notice per watch; `hooks/peer-message-record.py prompt` sweeps un-acked receipts at the next prompt if the hook dies |
 | memory write guard | `hooks/builtin-memory-guard.sh` |
 | memory candidate exposure | `UserPromptSubmit` runs `hooks/mem-recall-inject.sh`: active current-project/global capsule headlines and IDs only, maximum six / 2,400 UTF-8 bytes, fail-open. The model decides relevance and reads full records. The bridge publishes the same-turn receipt required by main-session material mutation; explicit `recall-gate` is the fallback |
@@ -92,7 +92,7 @@ The Claude Code adapter maps portable roles from `core/CONVENTIONS.md §2` to co
 | `deep maker` | `opus` | Planning, research synthesis, and visual/editorial work requiring high judgment |
 | `deep orchestrator` | `opus` xhigh | Stage gates, failover, and evidence judgment for standard+ dispatch-depth-1 ownership |
 | `fast implementer` | `sonnet` | Routine implementation and refactoring; escalate complex API/library design |
-| `orchestrator` | `sonnet` high | Balanced mechanical coordination of decided calls, paths, and states |
+| `orchestrator` | `sonnet` medium | Balanced mechanical coordination of decided calls, paths, and states |
 | `external adversary` | Codex CLI via `codex-review-team` | Independent hostile review for the `adversarial` intensity pass. The same Codex engine may host a neutral cross-harness parallel leg, but that is a reviewer role, not this hostile role. |
 | `external adversary orchestrator` | `sonnet` wrapper | Invoke and summarize the external engine rather than perform the review |
 
@@ -102,8 +102,15 @@ Route-bound registered work uses a second, independent execution-budget axis:
 |---|---|---|
 | `deep` | `opus` / `xhigh` | standard+ ownership, convergence, and highest-risk legs |
 | `balanced-deep` | `opus` / `medium` | quick one-shot conduction and subordinate deep-model judgment at lower coordination cost |
+| `balanced` | `sonnet` / `high` | long multi-step execution after the decision is settled |
 | `light` | `sonnet` / `medium` | routine implementation, verification, reporting, and breadth legs |
-| `mini` | `haiku` / `medium` | lifecycle and micro-semantic helpers only; substantive dispatch-depth-1/2 work is rejected |
+| `mini` | `sonnet` / `low` | lifecycle and micro-semantic helpers only; substantive dispatch-depth-1/2 work is rejected |
+| `top` | `fable` / `max` | exception above deep: the main-session-only model, reachable only from a route that seals the explicit `top` profile on a dispatch-depth-1 owner (`model_source=profile-top`; the wrapper refuses `top` without that route); no cascade in or out, no `--model` override |
+
+These are the shipped defaults and equal the user's runtime mapping (2026-09-09
+사용자 결정: a runtime value changed by instruction becomes the shipped default).
+The top model is reserved for the main session, so both deep-side profiles ride
+`opus` and separate by effort. The deep-tier capacity cascade is `opus -> sonnet`.
 
 The route compiler seals `model_profile`; the wrapper resolves it through the
 complete user copy at `$CLAUDE_CONFIG_DIR/agent-config/models.conf` (default
@@ -113,8 +120,16 @@ or removes it. The wrapper may also receive the independently sealed
 `model_role`. A dispatch-depth-1 `_kernel/owner` is valid with a profile and no
 stage `worker_mode`. Non-route jobs retain explicit role/concrete-model
 selection. Registered inheritance and config-declared interactive-main-only
-models are rejected before launch; `fable` therefore remains available only to
-the interactive main session, while its usage/status telemetry stays visible.
+models are rejected before launch. The shipped `CFG_MAIN_SESSION_ONLY_MODELS`
+list names `fable`, so a registered headless or native delegated launch of Fable
+is refused with a typed reason instead of being silently remapped; the deep tier
+launches `opus` there. A user copy with a different list replaces this one whole —
+and that list is checked against the *generated* agent definitions, which are built
+from the **shipped** file. Restricting a model those definitions pin denies the
+matching subagent type outright (`native-subagent-main-session-only-model`), so a
+user copy naming `opus` today would deny `deep` and `general-purpose`. The same
+mismatch appears for one release cycle whenever the two files are changed and the
+new release is not yet installed.
 
 Two `CONVENTIONS §1.1` properties are intensity-independent and this adapter honors them: every review the `품질관리팀` runs carries the refute-by-default adversarial stance (anchored in `CONVENTIONS §1.1` / `roles/MODES.md`; `agent-modes/qa/_review_rules.md` is the single source for the code-review, plan-review, and test modes that load it), and every declared independent group records its realized independence. Registry-v6 groups launch 2–4 blind dispatch-depth-2 siblings atomically, use at least two harness families when `cross-harness` is required, and add asymmetric model profiles and perspectives to reduce correlated error. The hostile `external adversary` pass stays reserved for `adversarial`. If an explicitly requested cross-harness axis cannot be realized, fail loudly; an auto-selected group may use typed same-family degradation while preserving and reporting profile/perspective diversity.
 
@@ -139,13 +154,24 @@ The five portable profiles are deep, balanced-deep, balanced, light and mini.
 Concrete defaults and generated native agents come from this adapter's
 `config/models.conf`; runtime loading selects the user's whole file first.
 A missing balanced row is derived only from that user's light row in memory;
-explicit settings win, and other missing required keys retain whole-file fallback.
+explicit settings win, and other missing required keys retain whole-file fallback,
+except tier keys (`CFG_TIER_<tier>_MODEL/EFFORT`) of a tier that the user copy never
+references **and** this adapter's own wrappers never read by name: a release that adds
+a tier (2026-09-08 `balanced-deep`) leaves an older complete user copy selected
+whole-file, so its own main-only list and tiers keep applying (receipt
+`unreferenced_tier_keys`). The role mappers reach `CFG_TIER_DEEP_MODEL` and friends
+without a profile, so those keys stay required; the per-adapter list is declared in
+`utilities/model_config.py` (`WRAPPER_REQUIRED_TIERS`). A test fails if a wrapper
+under `adapters/<adapter>/bin` starts naming a tier the list omits; a consumer that
+builds the key name at runtime or lives elsewhere has to be added to the list by hand.
 OpenCode reports collapsed-balanced-to-light and preserves its full light budget.
 No install/update/reapply/uninstall writes the normalization back. Source checks
 do not activate an installed release or change an in-flight sealed route.
 
 A profile value may name a tier (`deep:high`) or an explicit model
 (`model/<id>:high`). This keeps existing user tier keys intact when two profiles
-need different models. The shipped deep point uses the main-only model and is
-still rejected by delegated launch guards; balanced-deep uses the eligible deep
-tier. A user-selected legacy tier continues to override the shipped profile.
+need different models. The shipped deep point is the `deep` tier (`opus`/xhigh);
+balanced-deep rides its own `balanced-deep` tier (`opus`/medium), so the two
+deep-side profiles currently share a model and differ only in effort. The `top`
+tier (`fable`/max) is the one exception to `CFG_MAIN_SESSION_ONLY_MODELS`, and
+only through a route that sealed the `top` profile for its owner. A user-selected legacy tier continues to override the shipped profile.

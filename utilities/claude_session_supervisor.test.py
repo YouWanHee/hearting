@@ -2375,5 +2375,73 @@ class DurableHandoffTransportTest(unittest.TestCase):
         self.assertIsNone(self.charge())
 
 
+
+class TerminalCommitActivationTests(unittest.TestCase):
+    """§13.53.2: both halves of the checked support must hold.
+
+    The route seals the runtime-capability verdict; the Claude adapter turns
+    that into `--enable-terminal-commit`; the supervisor requires *both* plus
+    exact route identity. Any one of them alone must leave the legacy
+    owner-driven close/finalize path in place."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.route_file = self.base / "route.json"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _seal(self, *, declared):
+        route = {"capability": "autopilot-code", "nodes": [{"id": "report", "terminal": True}],
+                 "runtime_support": {"terminal_commit": declared}}
+        route["route_hash"] = supervisor.canonical_route_hash(route)
+        route["route_id"] = supervisor.route_id_from_hash(route["route_hash"])
+        self.route_file.write_text(json.dumps(route), encoding="utf-8")
+        return route
+
+    def _args(self, route, *, requested):
+        return SimpleNamespace(route_file=str(self.route_file), route_id=route["route_id"],
+                               route_hash=route["route_hash"], enable_terminal_commit=requested)
+
+    def test_both_halves_required(self):
+        for declared in (True, False):
+            for requested in (True, False):
+                route = self._seal(declared=declared)
+                with self.subTest(declared=declared, requested=requested):
+                    with mock.patch.dict(os.environ, {}, clear=False):
+                        os.environ.pop("AGENT_DISPATCH_TERMINAL_COMMIT", None)
+                        self.assertIs(
+                            supervisor.terminal_commit_enabled(self._args(route, requested=requested)),
+                            declared and requested)
+
+    def test_a_route_that_does_not_declare_support_ignores_the_env_switch(self):
+        """The env variable is a runtime opt-in, not an override: it can never
+        open the gate on a route whose runtime lacks the contract."""
+        route = self._seal(declared=False)
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_TERMINAL_COMMIT": "1"}):
+            self.assertFalse(supervisor.terminal_commit_enabled(self._args(route, requested=False)))
+
+    def test_route_identity_drift_closes_the_gate_on_a_declaring_route(self):
+        route = self._seal(declared=True)
+        drifted = self._args(route, requested=True)
+        drifted.route_hash = "sha256:" + "0" * 64
+        self.assertFalse(supervisor.terminal_commit_enabled(drifted))
+
+    def test_adapter_passes_the_flag_only_when_the_route_declares_support(self):
+        path = ROOT / "adapters" / "claude" / "bin" / "dispatch-headless.py"
+        spec = importlib.util.spec_from_file_location("claude_dispatch_headless_probe", path)
+        headless = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = headless
+        spec.loader.exec_module(headless)
+        for declared in (True, False):
+            self._seal(declared=declared)
+            with self.subTest(declared=declared):
+                self.assertIs(
+                    headless._route_declares_terminal_commit_support(str(self.route_file)), declared)
+        self.assertFalse(headless._route_declares_terminal_commit_support(str(self.base / "absent.json")))
+
+
+
 if __name__ == "__main__":
     unittest.main()

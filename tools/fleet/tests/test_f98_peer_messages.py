@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """F-98 — read-only peer-message ledger projection (SD-122 §13.37.2)."""
+import importlib.util
 import json
 import os
 import sys
 import tempfile
 import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
 _TOOLS_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -15,6 +17,18 @@ if _TOOLS_DIR not in sys.path:
 from fleet import render  # noqa: E402
 from fleet.collectors import peer_messages  # noqa: E402
 from fleet.model import Session  # noqa: E402
+
+# `utilities/peer-message.py` is hyphenated (not `import`able by name); loaded the
+# same way its own test suite (utilities/peer_message.test.py) does.
+_REPO_ROOT = os.path.dirname(_TOOLS_DIR)
+_PM_SPEC = importlib.util.spec_from_file_location(
+    "peer_message_c6", os.path.join(_REPO_ROOT, "utilities", "peer-message.py"))
+peer_message = importlib.util.module_from_spec(_PM_SPEC)
+_PM_SPEC.loader.exec_module(peer_message)
+_PS_SPEC = importlib.util.spec_from_file_location(
+    "peer_steward_c6", os.path.join(_REPO_ROOT, "utilities", "peer-steward.py"))
+peer_steward = importlib.util.module_from_spec(_PS_SPEC)
+_PS_SPEC.loader.exec_module(peer_steward)
 
 
 def _write_ledger(root, from_sid, records):
@@ -126,7 +140,50 @@ class CollectorTest(unittest.TestCase):
             result = peer_messages.collect(state_roots=[tmp])
         last_recv = result["by_session"][("claude", "sid-b")]["last_recv"]
         self.assertNotEqual(last_recv["from_name"], "sid-b-display")
-        self.assertEqual(last_recv["from_name"], "sid-a")
+        # The sender has no ledger name here, and an unnamed sender stays unnamed: the
+        # collector used to paste the raw session id into the display-name slot, which is
+        # how `← 01a084f7-63f2-7961-ae60-6fc2d8e60fc2` reached the board (2026-09-09).
+        # The exact id stays in its own field for the join; naming is the renderer's job.
+        self.assertIsNone(last_recv["from_name"])
+        self.assertEqual(last_recv["from_session_id"], "sid-a")
+
+    def test_last_sent_is_the_symmetric_send_side(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_ledger(tmp, "sid-a", [
+                _rec("sid-a", to_sid="sid-b", to_name="sid-b-display", kind="steer", minutes_ago=1)
+            ])
+            result = peer_messages.collect(state_roots=[tmp])
+        last_sent = result["by_session"][("claude", "sid-a")]["last_sent"]
+        self.assertEqual(last_sent["to_session_id"], "sid-b")
+        self.assertEqual(last_sent["to_name"], "sid-b-display")
+        self.assertEqual(last_sent["kind"], "steer")
+        # The receiver's own row records only what it received.
+        self.assertIsNone(result["by_session"][("claude", "sid-b")]["last_sent"])
+
+    def test_notice_receipt_is_not_counted_as_a_send(self):
+        """A `notice` is the RECEIVER's receipt for someone else's message. Treating it as
+        a send would make every received message also draw a `✉ →` on the wrong row."""
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_ledger(tmp, "sid-a", [
+                _rec("sid-a", to_sid="sid-b", kind="notice", minutes_ago=1)
+            ])
+            result = peer_messages.collect(state_roots=[tmp])
+        self.assertIsNone(result["by_session"][("claude", "sid-a")]["last_sent"])
+        self.assertEqual(result["by_session"][("claude", "sid-a")]["sent_1h"], 0)
+
+    def test_one_herdr_message_counts_once_on_both_axes(self):
+        """A herdr message writes TWO records naming the same sender — its own `steer` and
+        the receiver's `notice` receipt. Counting both made one sent message read `✉ 2/…`
+        (measured 2026-09-09 on the codex↔claude test pair)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_ledger(tmp, "sid-a", [
+                _rec("sid-a", to_sid="sid-b", kind="steer", minutes_ago=1),
+                _rec("sid-a", to_sid="sid-b", kind="notice", minutes_ago=1),
+            ])
+            result = peer_messages.collect(state_roots=[tmp])
+        self.assertEqual(result["by_session"][("claude", "sid-a")]["sent_1h"], 1)
+        self.assertEqual(result["by_session"][("claude", "sid-b")]["recv_1h"], 1)
+        self.assertEqual(result["by_session"][("claude", "sid-b")]["sent_1h"], 0)
 
     def test_join_is_exact_session_id_not_name(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -136,6 +193,65 @@ class CollectorTest(unittest.TestCase):
             result = peer_messages.collect(state_roots=[tmp])
         self.assertNotIn(("claude", "hearting-21 [f3e821]"), result["by_session"])
         self.assertEqual(result["by_session"][("claude", "sid-a")]["sent_1h"], 1)
+
+
+class ResumedSessionJoinTest(unittest.TestCase):
+    """A resumed session's receipts are split across the id it has now and the one it had
+    before, and only the older key carries the sender identity (measured 2026-09-09: the
+    newer key held a bare `notice` whose `from.session_id` was empty). Joining over both
+    is what lets the board name the sender instead of drawing nothing."""
+
+    def _session(self, **kwargs):
+        from fleet.model import Session
+        return Session(harness="claude", pid=1, cwd="/x", slug="s", **kwargs)
+
+    def test_counters_sum_and_the_freshest_entry_wins(self):
+        from fleet import collectors
+        s = self._session(session_id="new", session_aliases=["old"])
+        collectors.apply_peer_rows([s], {
+            ("claude", "old"): {"sent_1h": 1, "recv_1h": 2, "last_sent": None,
+                                "last_recv": {"from_name": "steward", "from_session_id": "p",
+                                              "from_harness": "claude", "kind": "steer",
+                                              "age_min": 5}},
+            ("claude", "new"): {"sent_1h": 3, "recv_1h": 1, "last_sent": None,
+                                "last_recv": {"from_name": None, "from_session_id": None,
+                                              "from_harness": "", "kind": "notice",
+                                              "age_min": 40}},
+        })
+        self.assertEqual((s.peer_sent_1h, s.peer_recv_1h), (4, 3))
+        self.assertEqual(s.peer_last_recv["from_name"], "steward")
+        self.assertEqual(s.peer_last_recv["from_session_id"], "p")
+
+    def test_a_malformed_age_never_wins_the_freshest_comparison(self):
+        from fleet import collectors
+        s = self._session(session_id="new", session_aliases=["old"])
+        collectors.apply_peer_rows([s], {
+            ("claude", "old"): {"sent_1h": 0, "recv_1h": 0, "last_sent": None,
+                                "last_recv": {"from_name": "real", "age_min": 5}},
+            ("claude", "new"): {"sent_1h": 0, "recv_1h": 0, "last_sent": None,
+                                "last_recv": {"from_name": "broken", "age_min": None}},
+        })
+        self.assertEqual(s.peer_last_recv["from_name"], "real")
+
+    def test_a_session_without_aliases_is_unchanged(self):
+        from fleet import collectors
+        s = self._session(session_id="new")
+        collectors.apply_peer_rows([s], {
+            ("claude", "old"): {"sent_1h": 9, "recv_1h": 9, "last_recv": None,
+                                "last_sent": None}})
+        self.assertEqual((s.peer_sent_1h, s.peer_recv_1h), (0, 0))
+
+    def test_a_still_live_id_is_never_adopted_as_an_alias(self):
+        """`--fork-session` leaves the parent running under its own row; adopting its id
+        would hand the parent's messages to the child."""
+        from fleet import collectors
+        parent_sid = "6044eb9f-7983-4c41-9b86-0bb2b70638fa"
+        child = self._session(session_id="01a084f7-63f2-7961-ae60-6fc2d8e60fc2")
+        parent = self._session(session_id=parent_sid)
+        parent.pid = 2
+        with mock.patch("fleet.session_registry.session_aliases", return_value=[parent_sid]):
+            collectors.apply_session_aliases([child, parent])
+        self.assertIsNone(child.session_aliases)
 
 
 class StableRootResolverTest(unittest.TestCase):
@@ -210,6 +326,203 @@ class RenderByteIdenticalTest(unittest.TestCase):
                                     "kind": "steer", "age_min": 1})
         d = s.to_dict()
         self.assertNotIn("summary", json.dumps(d["peer_last_recv"]))
+
+
+class LedgerFormatTest(unittest.TestCase):
+    """C-6 — `AGENT_PEER_LEDGER_ROOT` round trip, `refs`/`transfer_ref` shape, and
+    legacy `ref=`-in-name display tolerance (C-2)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self._old = dict(os.environ)
+        os.environ["AGENT_PEER_LEDGER_ROOT"] = str(self.root)
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        os.environ.clear()
+        os.environ.update(self._old)
+
+    def _record_line(self, from_sid="sid-a"):
+        path = peer_message._ledger_path(from_sid)
+        return json.loads(path.read_text(encoding="utf-8").splitlines()[-1])
+
+    def test_agent_peer_ledger_root_round_trip_four_fields(self):
+        self.assertEqual(peer_message.peer_state_root(), self.root)
+        rc = peer_message.cmd_record(peer_message.argparse.Namespace(
+            from_harness="codex", from_session_id="sid-a", from_project="proj",
+            from_name="hearting-codex-1", to_harness="claude", to_session_id="sid-b",
+            to_name=None, kind="steer", surface="herdr", status="sent", receipt=None,
+            ref=[], body_file=None, body_stdin=False))
+        self.assertEqual(rc, 0)
+        rec = self._record_line()
+        self.assertEqual(rec["from"]["harness"], "codex")
+        self.assertEqual(rec["from"]["session_id"], "sid-a")
+        self.assertEqual(rec["from"]["project"], "proj")
+        self.assertEqual(rec["from"]["name"], "hearting-codex-1")
+
+    def test_refs_is_a_top_level_list_transfer_ref_is_a_separate_top_level_key(self):
+        transfer_ref = "0123456789abcdef0123456789abcdef"
+        rc = peer_message.cmd_record(peer_message.argparse.Namespace(
+            from_harness="codex", from_session_id="sid-a", from_project="proj",
+            from_name=None, to_harness="claude", to_session_id="sid-b", to_name=None,
+            kind="steer", surface="herdr", status="sent", receipt=None,
+            ref=["a", "b"], body_file=None, body_stdin=False, transfer_ref=transfer_ref))
+        self.assertEqual(rc, 0)
+        rec = self._record_line()
+        self.assertEqual(rec["refs"], ["a", "b"])
+        self.assertEqual(rec["transfer_ref"], transfer_ref)
+        self.assertEqual(rec["message_id"], transfer_ref)
+
+    def test_legacy_ref_suffix_in_name_displays_clean(self):
+        month_dir = self.root / "peer-messages" / time.strftime("%Y-%m", time.gmtime())
+        month_dir.mkdir(parents=True)
+        (month_dir / "sid-legacy.jsonl").write_text(json.dumps({
+            "schema_version": 1, "message_id": "legacy1",
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "from": {"harness": "codex", "session_id": "sid-legacy", "project": "p",
+                     "name": "hearting-a9 ; ref=0123456789abcdef0123456789abcdef"},
+            "to": {"harness": "claude", "session_id": "sid-b"}, "kind": "steer",
+            "summary": "hi", "body_sha256": "x",
+            "delivery": {"surface": "herdr", "status": "sent", "receipt": None}, "refs": [],
+        }) + "\n")
+        result = peer_messages.collect(state_roots=[str(self.root)])
+        last_recv = result["by_session"][("claude", "sid-b")]["last_recv"]
+        self.assertEqual(last_recv["from_name"], "hearting-a9")
+
+    def test_a_paths_all_land_under_the_same_root(self):
+        ref = "abcdef0123456789abcdef0123456789"
+        root = str(peer_message.peer_state_root())
+        self.assertTrue(str(peer_message._ledger_path("sid-a")).startswith(root))
+        self.assertTrue(str(peer_message._transfer_path(ref)).startswith(root))
+        self.assertTrue(str(peer_message.steward_marker_path("codex", "sid-a")).startswith(root))
+        self.assertTrue(str(peer_steward._watch_root()).startswith(root))
+
+
+class StateRootsPeerPromotionTest(unittest.TestCase):
+    """C-8 — `_state_roots()` always puts the peer ledger's canonical root at
+    index 0 (promoting, never duplicating, an already-present entry), and a
+    resolver failure never drops the rest of the roots."""
+
+    def test_promotes_peer_root_to_index_zero(self):
+        with mock.patch.object(peer_messages, "_peer_ledger_root", return_value="/tmp/peer-root-x"), \
+             mock.patch.object(peer_messages, "_runtime_ledger_roots", return_value=["/tmp/other"]), \
+             mock.patch.object(peer_messages, "_agent_home", side_effect=Exception("no home")):
+            roots = peer_messages._state_roots()
+        self.assertEqual(roots, ("/tmp/peer-root-x", "/tmp/other"))
+
+    def test_already_present_root_is_promoted_not_duplicated(self):
+        with mock.patch.object(peer_messages, "_peer_ledger_root", return_value="/tmp/same-root"), \
+             mock.patch.object(peer_messages, "_runtime_ledger_roots",
+                                return_value=["/tmp/same-root", "/tmp/other"]), \
+             mock.patch.object(peer_messages, "_agent_home", side_effect=Exception("no home")):
+            roots = peer_messages._state_roots()
+        self.assertEqual(roots, ("/tmp/same-root", "/tmp/other"))
+
+    def test_resolver_failure_preserves_the_rest(self):
+        with mock.patch.object(peer_messages, "_peer_ledger_root", return_value=None), \
+             mock.patch.object(peer_messages, "_runtime_ledger_roots", return_value=["/tmp/other"]), \
+             mock.patch.object(peer_messages, "_agent_home", side_effect=Exception("no home")):
+            roots = peer_messages._state_roots()
+        self.assertEqual(roots, ("/tmp/other",))
+
+
+class PeerEndpointLabelTest(unittest.TestCase):
+    """The name slot holds whatever the sender wrote; the board must not print machine text.
+
+    Measured on the live board: `✉ → uds:/run/user/1002/cc-socks/2952102.sock` came from a
+    real ledger record whose `to.name` was a socket address. That names nothing a person can
+    look up — worse than the `claude:7a001534` fallback, because it is the same
+    non-information dressed as a name.
+    """
+
+    def test_machine_addresses_are_not_treated_as_names(self):
+        for value in ("uds:/run/user/1002/cc-socks/2952102.sock",
+                      "/tmp/whatever.sock",
+                      "http://example/x",
+                      "01a084f7-63f2-7961-ae60-6fc2d8e60fc2",  # raw session id in the name slot
+                      "", "   ", None, 42):
+            with self.subTest(value=value):
+                self.assertFalse(render._peer_name_is_readable(value))
+
+    def test_real_session_names_still_pass(self):
+        # Names here are free-form and often Korean prose, so the check has to be a small
+        # denylist rather than a guess at what a name looks like.
+        # `wB:p3` is deliberately absent: a pane id says where a session runs, not which
+        # session it is, and the live board printed it in the name slot.
+        for value in ("hearting-46", "bc-resnet-67", "케언 W15 사이클 이어받기",
+                      "q1-tts: v6 본생산"):
+            with self.subTest(value=value):
+                self.assertTrue(render._peer_name_is_readable(value))
+
+    def test_an_unusable_name_falls_through_to_the_short_id(self):
+        # Only when no tag can be resolved for the peer — a resolvable tag outranks both,
+        # which is what keeps one relation from changing shape between ticks.
+        with mock.patch.object(render, "_resolve_session_tag", return_value=None):
+            segs = render._peer_endpoint_segs(
+                "claude", "7a001534-ea46-4a67-971b-199c586889e2",
+                "uds:/run/user/1002/cc-socks/2952102.sock", {})
+        self.assertEqual("".join(t for t, _ in segs), "claude:7a001534")
+
+    def test_an_unusable_name_with_no_id_falls_back_to_the_harness(self):
+        segs = render._peer_endpoint_segs("claude", None, "/tmp/x.sock", {})
+        self.assertEqual("".join(t for t, _ in segs), "claude")
+
+    def test_an_on_screen_peer_still_wins_over_every_fallback(self):
+        segs = render._peer_endpoint_segs(
+            "claude", "7a001534-ea46-4a67-971b-199c586889e2", "/tmp/x.sock",
+            {("claude", "7a001534-ea46-4a67-971b-199c586889e2"): "46"})
+        self.assertEqual("".join(t for t, _ in segs), "[46] claude")
+
+
+class PeerEndpointOneShapeTest(unittest.TestCase):
+    """Every relation must read the same way, whoever else is on the board.
+
+    Measured on the live board before this: the same kind of line appeared as `[67] claude`,
+    `wB:p5`, `bc-resnet-67`, `a8e66aa4a25f5d807`, a full Korean session title, and a bare
+    `claude` — six shapes for one relation, which is the inconsistency the user reported.
+    """
+
+    def test_a_session_id_always_produces_the_badge_shape(self):
+        # Off-board peers resolve their own tag, so a session does not change shape when it
+        # scrolls off screen.
+        with mock.patch.object(render, "_resolve_session_tag", return_value="3a"):
+            for name in ("a8e66aa4a25f5d807", "wB:p5", "bc-resnet-67", None,
+                         "Claude Code 사용량 리셋 및 감독 인수인계"):
+                with self.subTest(name=name):
+                    segs = render._peer_endpoint_segs("codex", "sid-1", name, {})
+                    self.assertEqual("".join(t for t, _ in segs), "[3a] codex")
+
+    def test_an_on_board_badge_beats_the_resolver(self):
+        with mock.patch.object(render, "_resolve_session_tag", side_effect=AssertionError):
+            segs = render._peer_endpoint_segs("claude", "sid-1", "x", {("claude", "sid-1"): "67"})
+        self.assertEqual("".join(t for t, _ in segs), "[67] claude")
+
+    def test_a_resolver_failure_never_breaks_the_row(self):
+        with mock.patch.object(render, "_resolve_session_tag", side_effect=OSError("boom")):
+            segs = render._peer_endpoint_segs("claude", "sid-1", "bc-resnet-67", {})
+        self.assertEqual("".join(t for t, _ in segs), "bc-resnet-67")
+
+    def test_machine_values_are_never_shown_as_a_name(self):
+        with mock.patch.object(render, "_resolve_session_tag", return_value=None):
+            for name in ("a8e66aa4a25f5d807",                      # bare hex id
+                         "wB:p5",                                   # a pane, not a session
+                         "uds:/run/user/1002/cc-socks/2952102.sock",
+                         "01a084f7-63f2-7961-ae60-6fc2d8e60fc2",
+                         "Claude Code 사용량 리셋 및 감독 인수인계"):   # a title, not a name
+                with self.subTest(name=name):
+                    segs = render._peer_endpoint_segs("claude", None, name, {})
+                    self.assertEqual("".join(t for t, _ in segs), "claude")
+
+    def test_a_long_real_name_is_clipped_not_discarded(self):
+        # `fleet-stall-codex-parity-10` is a real name that happens to be long; a clipped
+        # real name beats falling through to `claude:a8e66aa4`.
+        with mock.patch.object(render, "_resolve_session_tag", return_value=None):
+            segs = render._peer_endpoint_segs("claude", None, "fleet-stall-codex-parity-10", {})
+        shown = "".join(t for t, _ in segs)
+        self.assertTrue(shown.startswith("fleet-stall-codex-parity"), shown)
+        self.assertNotEqual(shown, "claude")
 
 
 if __name__ == "__main__":

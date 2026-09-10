@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 from pathlib import Path
+import re
 import sys
 import tempfile
 import unittest
@@ -130,23 +131,121 @@ class ModelProfileTest(unittest.TestCase):
         finally:
             Path(path).unlink()
 
+    @staticmethod
+    def _declared_point(config, profile):
+        """Independent derivation of a profile's operating point from the raw
+        CFG_ keys (tier -> CFG_TIER_<TIER>_MODEL / _EFFORT|_VARIANT), so the
+        expectation follows the shipped file instead of a literal table."""
+        tier, budget = config[f"CFG_MODEL_PROFILE_{profile.upper().replace('-', '_')}"].split(":", 1)
+        key = tier.upper().replace("-", "_")
+        return (config[f"CFG_TIER_{key}_MODEL"], budget)
+
+    @staticmethod
+    def _reachable_models(adapter, config):
+        """Every concrete model this config can put in front of a worker: the declared
+        tier models plus each of the five profiles' resolved model. A profile may name a
+        model directly (`model/<id>:budget`), so scanning `CFG_TIER_*_MODEL` alone leaves
+        a hole an edit can walk through (review MA-2a). Resolution goes through the values
+        already parsed here, not through a second read of the file — one value, one source.
+        """
+        models = {value for key, value in config.items()
+                  if key.endswith("_MODEL") and key != "CFG_TIER_TOP_MODEL"}
+        for profile in ("deep", "balanced-deep", "balanced", "light", "mini"):
+            models.add(PROFILE.resolve_profile_values(adapter, config, profile)["model"])
+        return models
+
+    @staticmethod
+    def _restricted(model, aliases):
+        """The predicate every launch surface actually uses: tokenize the id and test
+        alias membership (`dispatch-headless.py`, `stage-dispatch-fallback.py`,
+        `hooks/subagent-model-default.sh` all do exactly this). Exact string equality
+        would see `model/fable:...` but not `model/claude-fable-5-1:...`, which the
+        wrapper still refuses at launch (review r2-1)."""
+        tokens = set(re.split(r"[^a-z0-9]+", model.lower()))
+        return any(alias.lower() in tokens for alias in aliases)
+
+    def test_claude_shipped_default_is_the_user_profile_mapping(self):
+        # 2026-09-09 user rule: the shipped default equals the user's runtime
+        # mapping — the top model (Fable) is reserved for the main session, so
+        # both deep-side profiles ride opus and separate by effort only.
+        config = PROFILE.load_config(ROOT / "adapters" / "claude" / "config" / "models.conf")
+        main_only = config["CFG_MAIN_SESSION_ONLY_MODELS"].split()
+        self.assertEqual(main_only, ["fable"])
+        self.assertEqual(self._declared_point(config, "deep"), ("opus", "xhigh"))
+        self.assertEqual(self._declared_point(config, "balanced-deep"), ("opus", "medium"))
+        cascade = [entry.split(":", 1)[0] for entry in config["CFG_TIER_DEEP_FAILOVER_CASCADE"].split()]
+        self.assertEqual(cascade, ["opus", "sonnet"])
+        self.assertEqual(cascade[0], config["CFG_TIER_DEEP_MODEL"])
+        # The role mappers read CFG_TIER_DEEP_EFFORT directly while route-bound work
+        # reads the profile's budget; a config where the two disagree silently makes
+        # the README's `deep reviewer` row false, so pin them equal (review MI-4).
+        self.assertEqual(config["CFG_TIER_DEEP_EFFORT"], "xhigh")
+        self.assertEqual(config["CFG_TIER_DEEP_EFFORT"], self._declared_point(config, "deep")[1])
+        # A main-session-only model may never appear in a dispatch-eligible tier, in the
+        # cascade the fallback walks, or as ANY profile's resolved model — the last of
+        # which is the `model/<id>:budget` profile form a tier-key scan cannot see
+        # (review MA-2a).
+        self.assertNotIn(config["CFG_TIER_DEEP_MODEL"], main_only)
+        self.assertEqual([model for model in cascade if model in main_only], [])
+        self.assertEqual(
+            [m for m in self._reachable_models("claude", config) if self._restricted(m, main_only)],
+            [],
+        )
+        # The one sanctioned exception (2026-09-09 decision, second half): the
+        # `top` profile resolves to the main-only model on purpose, at the CLI's
+        # highest effort, and nothing else reaches it.
+        top = PROFILE.resolve_profile_values("claude", config, "top")
+        self.assertEqual((top["model"], top["budget"], top["tier"]), ("fable", "max", "top"))
+        self.assertTrue(self._restricted(top["model"], main_only))
+        self.assertEqual(config["CFG_TIER_DEEP_FAILOVER"], "light")
+        points = {profile: self._declared_point(config, profile) for profile in ("deep", "balanced-deep", "balanced", "light", "mini")}
+        self.assertNotEqual(points["deep"], points["balanced-deep"])  # two distinct operating points
+        self.assertEqual(len(set(points.values())), 5)  # five distinct operating points
+
+    def test_codex_shipped_default_is_the_user_profile_mapping(self):
+        # Same 2026-09-09 rule on the Codex adapter: Astra is the top model and
+        # stays with the main session, so the deep tier is Sol at its maximum
+        # effort and balanced-deep is the same model at medium. This adapter has
+        # no main-session-only KEY — the restriction is carried by never naming
+        # Astra in a tier or cascade, which is what this test pins.
+        config = PROFILE.load_config(ROOT / "adapters" / "codex" / "config" / "models.conf")
+        self.assertEqual(self._declared_point(config, "deep"), ("gpt-5.6-sol", "xhigh"))
+        self.assertEqual(self._declared_point(config, "balanced-deep"), ("gpt-5.6-sol", "medium"))
+        cascade = [entry.split(":", 1)[0] for entry in config["CFG_TIER_DEEP_FAILOVER_CASCADE"].split()]
+        self.assertEqual(cascade[0], config["CFG_TIER_DEEP_MODEL"])
+        self.assertEqual(config["CFG_TIER_DEEP_EFFORT"], "xhigh")  # review MI-4, as above
+        self.assertEqual(config["CFG_TIER_DEEP_EFFORT"], self._declared_point(config, "deep")[1])
+        # Every way a model can be reached — tier keys, the cascade, and each profile's
+        # RESOLVED model (which covers the `model/<id>:budget` form a key scan misses,
+        # review MA-2a). `tools/check-model-config.py` separately refuses the literal
+        # anywhere outside this file.
+        reachable = set(cascade) | self._reachable_models("codex", config)
+        self.assertEqual([m for m in reachable if self._restricted(m, ["astra"])], [])
+        # Since 2026-09-10 the codex adapter declares the key too (parity), and
+        # the `top` exception profile is the one door to Astra.
+        self.assertEqual(config["CFG_MAIN_SESSION_ONLY_MODELS"].split(), ["gpt-6-astra"])
+        top = PROFILE.resolve_profile_values("codex", config, "top")
+        self.assertEqual((top["model"], top["budget"], top["tier"]), ("gpt-6-astra", "xhigh", "top"))
+
     def test_portable_profiles_resolve_to_declared_adapter_budgets(self):
+        claude_config = PROFILE.load_config(ROOT / "adapters" / "claude" / "config" / "models.conf")
+        codex_config = PROFILE.load_config(ROOT / "adapters" / "codex" / "config" / "models.conf")
         expected = {
-            # Five profiles use the configured judgment and execution budgets;
-            # Claude keeps five operating points across three concrete models.
+            # Five profiles use the configured judgment and execution budgets.
+            # Claude expectations derive from the shipped config (the user's
+            # runtime mapping is the shipped default, 2026-09-09); the concrete
+            # contract itself is asserted in
+            # test_claude_shipped_default_is_the_user_profile_mapping.
             "claude": {
-                "deep": ("fable", "high"),
-                "balanced-deep": ("opus", "high"),
-                "balanced": ("sonnet", "high"),
-                "light": ("sonnet", "medium"),
-                "mini": ("sonnet", "low"),
+                profile: self._declared_point(claude_config, profile)
+                for profile in ("deep", "balanced-deep", "balanced", "light", "mini")
             },
+            # Codex expectations derive from its shipped config for the same
+            # reason as Claude's; the concrete contract is asserted in
+            # test_codex_shipped_default_is_the_user_profile_mapping.
             "codex": {
-                "deep": ("gpt-6-astra", "high"),
-                "balanced-deep": ("gpt-6-astra", "medium"),
-                "balanced": ("gpt-5.6-luna", "high"),
-                "light": ("gpt-5.6-luna", "medium"),
-                "mini": ("gpt-5.6-luna", "low"),
+                profile: self._declared_point(codex_config, profile)
+                for profile in ("deep", "balanced-deep", "balanced", "light", "mini")
             },
             # OpenCode has five profiles and three shipped operating points:
             # balanced/light/mini share one model and runtime-default budget,
@@ -187,7 +286,7 @@ class ModelProfileTest(unittest.TestCase):
             user.parent.mkdir()
             user.write_text(
                 shipped.replace(
-                    "CFG_TIER_DEEP_MODEL=gpt-6-astra",
+                    "CFG_TIER_DEEP_MODEL=gpt-5.6-sol",
                     "CFG_TIER_DEEP_MODEL=user/deep",
                 )
             )
@@ -332,6 +431,80 @@ class ModelProfileTest(unittest.TestCase):
         self.assertEqual(balanced_deep["budget"], "medium")
         self.assertNotEqual(deep["budget"], "")
         self.assertNotEqual(balanced_deep["budget"], "")
+
+
+class TopExceptionProfileTest(unittest.TestCase):
+    """The `top` exception profile (2026-09-09 사용자 결정): one door above deep."""
+
+    def demand(self, judgment):
+        return {"schema_version": 1, "judgment_requirement": judgment, "execution_scope": "short-local",
+                "judgment_reason": "final review of a structural hook change", "execution_reason": "one review",
+                "evidence_refs": ["DESIGN.md"]}
+
+    def test_top_is_known_but_not_portable(self):
+        self.assertNotIn("top", PROFILE.PORTABLE_PROFILES)
+        self.assertIn("top", PROFILE.KNOWN_PROFILES)
+        self.assertEqual(PROFILE.EXCEPTION_PROFILES, ("top",))
+
+    def test_each_adapter_declares_top_and_opencode_collapses_typed(self):
+        expected = {"claude": ("fable", "max", "top", "full"),
+                    "codex": ("gpt-6-astra", "xhigh", "top", "full"),
+                    "opencode": ("opencode-go/qwen3.8-max", "runtime-default", "deep", "collapsed-top-to-deep")}
+        for adapter, point in expected.items():
+            with self.subTest(adapter=adapter):
+                resolved = PROFILE.resolve_profile(
+                    adapter, ROOT / "adapters" / adapter / "config" / "models.conf", "top")
+                self.assertEqual((resolved["model"], resolved["budget"], resolved["tier"], resolved["granularity"]), point)
+
+    def test_an_undeclared_top_profile_is_refused_typed_never_derived(self):
+        config = PROFILE.load_config(ROOT / "adapters" / "claude" / "config" / "models.conf")
+        without = {k: v for k, v in config.items() if not k.endswith("_TOP")}
+        with self.assertRaises(PROFILE.ModelProfileError) as refused:
+            PROFILE.resolve_profile_values("claude", without, "top")
+        self.assertEqual(refused.exception.reason, "profile-top-undeclared")
+
+    def test_explicit_top_needs_judgment_and_never_comes_from_the_matrix(self):
+        for judgment in ("important", "difficult-uncertain"):
+            row = PROFILE.resolve_profile_demand(self.demand(judgment), explicit_profile="top")
+            self.assertEqual((row["resolved_profile"], row["source"], row["reason"]),
+                             ("top", "explicit", "explicit-top-exception"))
+            PROFILE.validate_profile_selection(row, self.demand(judgment), profile="top")
+            self.assertNotEqual(PROFILE.resolve_profile_demand(self.demand(judgment))["resolved_profile"], "top")
+        with self.assertRaises(PROFILE.ModelProfileError) as refused:
+            PROFILE.resolve_profile_demand(self.demand("predetermined"), explicit_profile="top")
+        self.assertEqual(refused.exception.reason, "profile-top-predetermined")
+        # a legacy (demand-less) stage may not be lifted to top without a demand
+        with self.assertRaises(PROFILE.ModelProfileError):
+            PROFILE.resolve_profile_demand(None, explicit_profile="top", legacy=True, existing_versioned_stage=True)
+
+    def test_top_is_limited_to_a_registered_depth_one_owner(self):
+        PROFILE.validate_registered_profile("top", registered_worker=True, dispatch_depth=1, worker_type="owner")
+        for kwargs in (dict(registered_worker=True, dispatch_depth=2, worker_type="stage"),
+                       dict(registered_worker=True, dispatch_depth=2, worker_type="review"),
+                       dict(registered_worker=True, dispatch_depth=1, worker_type="review"),
+                       dict(registered_worker=False, dispatch_depth=1, worker_type="owner"),
+                       dict(registered_worker=True, dispatch_depth=1, worker_type="support")):
+            with self.subTest(**kwargs), self.assertRaises(PROFILE.ModelProfileError) as refused:
+                PROFILE.validate_registered_profile("top", **kwargs)
+            self.assertEqual(refused.exception.reason, "profile-top-depth-forbidden")
+
+    def test_top_requires_the_route_that_sealed_it(self):
+        import tempfile
+        tmp = Path(tempfile.mkdtemp())
+        PROFILE.require_top_route(None, profile="deep")  # other profiles need no route
+        with self.assertRaises(PROFILE.ModelProfileError) as refused:
+            PROFILE.require_top_route(None, profile="top")
+        self.assertEqual(refused.exception.reason, "profile-top-route-required")
+        route = tmp / "route.json"
+        route.write_text('{"owner_model_profile": "balanced-deep"}', encoding="utf-8")
+        with self.assertRaises(PROFILE.ModelProfileError) as mismatch:
+            PROFILE.require_top_route(str(route), profile="top")
+        self.assertEqual(mismatch.exception.reason, "profile-top-route-mismatch")
+        route.write_text('{"owner_model_profile": "top"}', encoding="utf-8")
+        PROFILE.require_top_route(str(route), profile="top")
+        with self.assertRaises(PROFILE.ModelProfileError) as unreadable:
+            PROFILE.require_top_route(str(tmp / "absent.json"), profile="top")
+        self.assertEqual(unreadable.exception.reason, "profile-top-route-required")
 
 
 if __name__ == "__main__":

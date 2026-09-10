@@ -42,10 +42,9 @@ fallback, mutate the user's `.codex`, or weaken the sandbox. Only a
 always a registered-headless owner, so passing your own `interactive` transport is rejected at
 the probe, again at `capability-route.py compile`, and again at launch. `--parent-harness` must
 be the adapter the owner will actually run as; bind that decision by passing the compiled route
-to the launch, `dispatch-owner --route-evidence "$ROUTE_FILE" --start ...`, so the adapter
-cascade cannot select a harness the tuples never probed. Getting any of this wrong fails route
-compilation or owner selection before material work; it must never exhaust checked hops and then
-silently run the route inline.
+to the launch, `dispatch-owner --start --route-evidence <route_file> --prompt-file <brief>` (the
+route fills the rest), so the adapter cascade cannot select a harness the tuples never probed. Getting any of this wrong fails route
+compilation or owner selection before material work, never a silent inline run.
 For a Codex owner the generator automatically applies the prospective standard-owner network
 and exact registry check. A raw depth-0 `nested-headless` call without that context reports
 `prospective-owner-check-required`; it is not evidence that nested networking is unavailable.
@@ -98,15 +97,8 @@ until every exact `parent_attempt_id` child is closed or ready for typed harvest
 resumes the same Codex thread or Claude session once with a bounded receipt. Do not
 call liveness, inspect raw child output, or do parallel work while parked.
 
-Only when the wrapper reports `completion_delivery=poll-fallback`, use the checked
-legacy wait in the same turn:
-
-```bash
-sh <agent-home>/utilities/dispatch-wait.sh --parent <conductor-slug>
-# exit 0 = done and harvest
-# exit 2 = still alive; continue the same bounded fallback wait
-# exit 3 = suspect or dead; diagnose and redispatch
-```
+Obey the launch receipt: `parent_next=end-turn` yields; `parent_next=bounded-wait`
+runs the printed `parent_next_command` once.
 
 After judging a stage's artifact contract complete, publish its captured exact-attempt completion before
 dispatching the next stage. The completion transaction writes the immutable marker/link and
@@ -310,11 +302,8 @@ STAGE_PROMPT="<sub-skill contract + absolute input paths (Intent: shards/frame/i
 ```
 
 On the normal supervised path, yield `runtime_wait: registered-children` and consume
-the typed receipt on resume. Only for an explicitly reported `poll-fallback`:
-
-```bash
-sh "$AGENT_HOME/utilities/dispatch-wait.sh" --parent <cycle-slug>
-```
+the typed receipt on resume; a `parent_next=bounded-wait` receipt runs its printed
+command once.
 
 After the typed receipt (or fallback exit 0), read only plan status and paths. A terminal recovery receipt permits checked exact-attempt diagnosis; raw transcript inspection still requires a terminal/closed row or explicit operator recovery. Direct and the quick one-shot owner keep their declared inline plan; standard+ invokes `code-plan` in-session only after the compiled fallback policy reaches inline under the closed rules above.
 

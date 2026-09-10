@@ -315,10 +315,16 @@ esac
 
 # Hang guard: bound a silent `codex exec`. Curate receives delta, snapshot, and
 # artifact evidence on a deep model, so it gets a larger timeout budget.
+#
+# Main-owned receipt controllers run both tiers outside the native hook budget.
+# The SessionEnd bridge alone detaches final completion; its tracked preflight
+# command joins any nudge and waits synchronously through curate and final sync.
+# D-42 excludes worker-session hooks entirely. These finite model budgets do
+# not claim to fit the native three-second SessionEnd deadline.
 if [ "$mode" = "curate" ]; then
-  timeout_s=${CODEX_DISTILL_TIMEOUT_CURATE:-600}
+  timeout_s=${CODEX_DISTILL_TIMEOUT_CURATE:-90}
 else
-  timeout_s=${CODEX_DISTILL_TIMEOUT:-300}
+  timeout_s=${CODEX_DISTILL_TIMEOUT:-20}
 fi
 if [ "${MEM_SESSION_COMPLETION:-}" = "1" ]; then
   # The detached completion runner owns one process group, including every
