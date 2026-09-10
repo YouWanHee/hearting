@@ -330,6 +330,133 @@ def cmd_wait(args):
     return code
 
 
+# Hearting installs a launcher wrapper for Codex at `$CODEX_HOME/.harness/bin/codex` and
+# puts that directory first on the shell PATH ("protected ingress"). Only that wrapper
+# reaches `codex-managed-entry.py`, and only the managed entry writes the tier-1 session
+# record — so a Codex started around the wrapper has no session id anywhere: no ledger
+# endpoint, no board badge, nothing to steer by name.
+#
+# A shell only reads its startup files once. A herdr pane opened BEFORE the ingress was
+# installed keeps the PATH it started with forever, and nothing can reach it afterwards —
+# the profile cannot touch a process that is already running. Measured 2026-09-10 on this
+# machine: `command -v codex` in a pane whose shell started 2026-08-24 answered
+# `~/.local/bin/codex` (the vendor binary), while a pane opened 2026-09-09 answered with
+# the wrapper. The install is correct; the old pane is simply older than it. Those panes
+# can live for weeks, and every Codex started in one is silently unmanaged.
+#
+# So the launch re-establishes the ingress in the PANE, on the line before the agent
+# starts. `herdr agent start` types a bare `codex …` into that same shell (measured: the
+# started process's argv is `codex`, not an absolute path), so the pane's own PATH is what
+# decides, and a terminal processes its input in order — the export is applied before the
+# next line runs, without waiting on a clock. It is idempotent: prepending a directory
+# that is already first changes nothing. Claude and OpenCode have no such wrapper and need
+# nothing here.
+_MANAGED_INGRESS = {"codex": ("CODEX_HOME", "~/.codex", ".harness/bin")}
+
+
+def _managed_ingress_dir(kind):
+    """The directory holding hearting's launcher wrapper for `kind`, or ``None``.
+
+    Existence-checked: a harness with no wrapper installed must not have a PATH entry
+    typed into someone's terminal on its behalf.
+    """
+    spec = _MANAGED_INGRESS.get(kind)
+    if not spec:
+        return None
+    env_name, default_home, suffix = spec
+    home = os.environ.get(env_name) or os.path.expanduser(default_home)
+    directory = os.path.join(home, suffix)
+    wrapper = os.path.join(directory, kind)
+    return directory if os.path.isfile(wrapper) and os.access(wrapper, os.X_OK) else None
+
+
+def _pane_has_agent(pane):
+    """True when herdr already sees an agent in this pane.
+
+    Typing into a pane that is running an agent would inject text into that agent's
+    prompt. `herdr agent start` requires a bare shell prompt for the same reason, so this
+    only declines to act where the start itself is going to refuse.
+    """
+    try:
+        proc = subprocess.run(["herdr", "pane", "get", pane], capture_output=True,
+                              text=True, timeout=5)
+        payload = json.loads(proc.stdout or "")
+    except Exception:
+        return True          # unreadable pane: assume occupied, type nothing
+    block = (payload.get("result") or {}).get("pane") if isinstance(payload, dict) else None
+    if not isinstance(block, dict):
+        return True
+    return bool(block.get("agent"))
+
+
+def _ensure_pane_ingress(pane, kind):
+    """Put hearting's launcher wrapper first on the PANE's PATH. Returns a typed reason.
+
+    ``None`` means nothing was needed or nothing was typed; any other value names why, and
+    is carried into the launch receipt so an unmanaged launch can never be silent.
+    """
+    directory = _managed_ingress_dir(kind)
+    if directory is None:
+        return None
+    if _pane_has_agent(pane):
+        return "pane-occupied"
+    line = 'export PATH="%s:$PATH"' % directory
+    try:
+        text = subprocess.run(["herdr", "pane", "send-text", pane, line],
+                              capture_output=True, text=True, timeout=5)
+        if text.returncode != 0:
+            return "ingress-send-failed"
+        enter = subprocess.run(["herdr", "pane", "send-keys", pane, "Enter"],
+                               capture_output=True, text=True, timeout=5)
+        if enter.returncode != 0:
+            return "ingress-send-failed"
+    except Exception:
+        return "ingress-send-failed"
+    return None
+
+
+_MANAGED_ENTRY_MARK = "codex-managed-entry"
+_MANAGED_ENV_MARK = "AGENT_CODEX_MANAGED_GATEWAY"
+
+
+def _pane_is_managed(pane):
+    """Did a hearting-managed entry actually run in this pane? Read, never inferred.
+
+    Two shapes, because the managed launch has two: the entry process itself is
+    `codex-managed-entry.py` in its own argv, and the app-server and TUI client it spawns
+    carry `AGENT_CODEX_MANAGED_GATEWAY` in their environment instead. The first version of
+    this check looked only for the env var on the foreground process and reported
+    `managed=false` for a launch that was, in fact, managed (measured 2026-09-10) — the
+    entry sets that variable for its CHILDREN, not for itself.
+    """
+    try:
+        proc = subprocess.run(["herdr", "pane", "process-info", "--pane", pane],
+                              capture_output=True, text=True, timeout=5)
+        payload = json.loads(proc.stdout or "")
+        info = (payload.get("result") or {}).get("process_info") or {}
+        processes = info.get("foreground_processes") or []
+    except Exception:
+        return None
+    for process in processes:
+        if not isinstance(process, dict):
+            continue
+        argv = " ".join(str(part) for part in (process.get("argv") or []))
+        if _MANAGED_ENTRY_MARK in argv or _MANAGED_ENTRY_MARK in str(process.get("cmdline") or ""):
+            return True
+        pid = process.get("pid")
+        if not pid:
+            continue
+        try:
+            with open("/proc/%d/environ" % int(pid), "rb") as fh:
+                raw = fh.read()
+        except Exception:
+            continue
+        if any(entry.startswith(_MANAGED_ENV_MARK.encode() + b"=")
+               for entry in raw.split(b"\0")):
+            return True
+    return False if processes else None
+
+
 # The harness flag that puts a launched session in a chosen directory. `herdr agent
 # start` has none of its own — the agent it starts inherits the PANE's shell cwd — so
 # `--cwd` used to move nothing but this CLI process: a session started with
@@ -360,6 +487,10 @@ def cmd_start(args):
                   f"name={args.name} pane={args.pane} cwd={pane_cwd}")
             return 1
         cwd_flag = [flag, pane_cwd]
+
+    # Before the agent is started, not after: this is the line that decides whether the
+    # session that comes up is hearting-managed at all.
+    ingress_note = _ensure_pane_ingress(args.pane, args.kind)
 
     mode = args.permission_mode or _default_permission_mode()
     agent_args = list(getattr(args, "agent_args", None) or [])
@@ -423,9 +554,19 @@ def cmd_start(args):
     #
     # `cwd=` only when one was asked for: it is the receipt that the flag was honored,
     # and an unasked-for value would cost an extra herdr call on every start.
+    # `managed=` is read off the started process, not inferred from how it was launched.
+    # An unmanaged Codex writes no session record, so it has no id, no badge and no way to
+    # be addressed later — that has to be visible at the launch, not discovered hours
+    # later as a nameless row on the board.
+    managed = "-"
+    if started and _MANAGED_INGRESS.get(args.kind):
+        verdict = _pane_is_managed(args.pane)
+        managed = "unknown" if verdict is None else str(verdict).lower()
     print(
         f"started={str(started).lower()} agent={args.kind} name={args.name} "
-        f"pane={args.pane} permission_mode={mode} session_id={started_sid or '-'}"
+        f"pane={args.pane} permission_mode={mode} session_id={started_sid or '-'} "
+        f"managed={managed}"
+        + (f" ingress={ingress_note}" if ingress_note else "")
         + (f" cwd={pane_cwd}" if pane_cwd else "")
     )
     return 0
