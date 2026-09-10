@@ -617,6 +617,7 @@ The supervisor accepts only exact child rows whose durable launch fence records
 `launch_started=1`. An empty or register-only runtime wait receives one bounded
 same-session correction requiring `--start` and the three-field receipt; repeated
 absence then fails closed.
+The one exception is a sealed serial chain: registered-only successors behind its started frontier are the supervisor's to start, so they are neither joined nor corrected, and a chain of two or more sessions registers or starts only while its owner's supervisor lease is proven held (`subsession-chain-advance-unsupervised` or `-supervision-unproven` otherwise).
 
 ### §5.13. Operator Compute Hosts
 
