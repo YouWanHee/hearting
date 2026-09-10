@@ -276,7 +276,7 @@ role`, while route-bound registered work carries one of these sealed profiles:
 | `balanced` | configured light tier / runtime default | collapsed to `light` (`collapsed-balanced-to-light`) |
 | `light` | configured light tier / runtime default | distinct |
 | `mini` | configured mini tier / runtime default | collapsed to `light`; lifecycle/micro-only, substantive dispatch-depth-1/2 work is rejected |
-| `top` | configured deep tier / runtime default | collapsed to `deep` (`collapsed-top-to-deep`): this account has no model above the deep flagship, so a route sealed with the `top` exception profile still runs here, typed as a demotion |
+| `top` | configured deep tier / runtime default | collapsed to `deep` (`collapsed-top-to-deep`): this account has no model above the deep flagship, so a route that sealed the `top` exception profile for its owner still runs here, typed as a demotion; the wrapper refuses `top` without that route, and no `--model` override runs under the `top` label. Unlike Claude and Codex this adapter still accepts `--inherit-model-settings`: it declares no main-session-only model, so there is nothing for an inherited setting to leak |
 
 The portable policy assigns `balanced-deep` to quick one-shot conduction and `deep` to
 every standard+ owner. OpenCode preserves those sealed labels, but its current

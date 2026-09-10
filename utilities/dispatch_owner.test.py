@@ -622,6 +622,17 @@ class DispatchOwnerTests(unittest.TestCase):
             self.assertEqual(str(refused.exception), "inherited-registry-unusable")
         self.assertIn("AGENT_DISPATCH_JOBS", OWNER.hint_for("inherited-registry-unusable"))
         self.assertIn("SESSION", OWNER.hint_for("inherited-registry-unusable"))  # R5 m1: a per-command change cannot help
+        # top review M2: with no inherited variable, a canonical path that exists
+        # as a symlink is refused too; an absent canonical file (first run) is not
+        link_canonical = self.home / "canonical-link.log"
+        link_canonical.symlink_to(canonical)
+        with mock.patch.object(OWNER, "_canonical_jobs", return_value=str(link_canonical)):
+            with self.assertRaises(OWNER.OwnerError) as refused:
+                OWNER._authoritative_jobs({}, {"AGENT_DISPATCH_CALLER_HARNESS": "claude"})
+            self.assertEqual(str(refused.exception), "canonical-registry-unusable")
+        with mock.patch.object(OWNER, "_canonical_jobs", return_value=str(self.home / "not-yet" / "jobs.log")):
+            self.assertEqual(OWNER._authoritative_jobs({}, {"AGENT_DISPATCH_CALLER_HARNESS": "claude"}), "")
+        self.assertIn("symlink", OWNER.hint_for("canonical-registry-unusable"))
         # the same symlink is fine for an unmanaged codex caller, and a managed codex
         # parent still accepts its realpath alias
         self.assertEqual(OWNER._authoritative_jobs({}, {"AGENT_DISPATCH_CALLER_HARNESS": "codex",
@@ -1194,6 +1205,22 @@ class TopProfileOwnerTupleTest(unittest.TestCase):
         path = Path(tempfile.mkdtemp()) / "route.json"
         path.write_text(json.dumps(payload), encoding="utf-8")
         return str(path)
+
+    def test_top_reaches_the_wrapper_only_as_the_routes_derivation(self):
+        # top review B1: the flag is never the door
+        _, values, forwarded, _, derived = OWNER._parse(
+            ["--start", "--route-evidence", self._route(), "--prompt-file", "/p.md"])
+        self.assertEqual(values["--model-profile"], "top")
+        self.assertIn("--model-profile", derived)
+        for argv in (["--start", "--route-evidence", self._route(), "--model-profile", "top", "--prompt-file", "/p.md"],
+                     ["--start", "--worktree", "/w", "--slug", "s", "--capability", "autopilot-code",
+                      "--capability-mode", "audit", "--qa", "standard", "--intensity", "standard",
+                      "--dispatch-depth", "1", "--worker-type", "owner", "--owner", "autopilot-code",
+                      "--assigned-contract", "autopilot-code", "--model-profile", "top", "--prompt-file", "/p.md"]):
+            with self.subTest(argv=argv[:4]), self.assertRaises(OWNER.OwnerError) as refused:
+                OWNER._parse(argv)
+            self.assertEqual(str(refused.exception), "profile-top-route-required")
+        self.assertIn("--route-evidence", OWNER.hint_for("profile-top-route-required"))
 
     def test_an_unknown_profile_is_still_refused_and_the_hint_names_top(self):
         with self.assertRaises(OWNER.OwnerError) as refused:

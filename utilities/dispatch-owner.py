@@ -97,13 +97,19 @@ _HINTS = {
                              "(see eligibility.* and capacity_headroom.* above; utilities/usage-check.sh --harness all)",
     "exactly-one-action-required": "pass exactly one of --dry-run | --register | --start",
     "owner-tuple-required": "the launchable tuple is --dispatch-depth 1 --worker-type owner|review",
-    "invalid-model-profile": "--model-profile deep|balanced-deep|balanced|light|top",
+    "invalid-model-profile": "--model-profile deep|balanced-deep|balanced|light (top only from a route that seals it)",
+    "profile-top-route-required": "drop --model-profile top: the top exception profile is sealed by a route "
+                                  "(compose/compile --profile-demands '{\"__owner__\": …}' --explicit-profiles "
+                                  "'{\"__owner__\": \"top\"}') and reaches the owner through --route-evidence only",
     "review-worker-unit-required": "--worker-type review needs --unit <catalog persona from roles/units/>",
     "review-worker-route-evidence-unsupported": "a route node's reviewer is launched by stage dispatch; drop --route-evidence for an ad-hoc review worker",
     "forbidden-flag": "model, reasoning, effort, variant and completion-delivery are sealed by the profile and route; remove the flag",
     "explicit-jobs-outside-parent-registry": "drop --jobs: an interactive Claude parent's completion hook trusts only the inherited "
                                              "AGENT_DISPATCH_JOBS (or the installed canonical registry), so an owner started into another "
                                              "registry could never wake this session",
+    "canonical-registry-unusable": "the installed canonical registry path exists but is not an absolute, non-symlink "
+                                   "regular file (a symlinked jobs.log?); the parent's completion hook will not read it. "
+                                   "Restore the real file at that path before starting an owner",
     "inherited-registry-unusable": "AGENT_DISPATCH_JOBS is set but is not an absolute, non-symlink regular file, and the "
                                    "parent's completion hook reads the SESSION's value, not this command's: changing or unsetting "
                                    "it for one Bash call starts an owner the parent can never wake. Fix the variable in the "
@@ -396,6 +402,11 @@ def _parse(argv):
         raise OwnerError("review-output-owner-forbidden")
     if values["--model-profile"] not in {"deep", "balanced-deep", "balanced", "light", "top"}:
         raise OwnerError("invalid-model-profile")
+    if values["--model-profile"] == "top" and (not route_evidence or "--model-profile" not in derived):
+        # The exception profile is a route's decision (a full demand sealed by
+        # compose/compile), never a flag's: an explicit `--model-profile top`
+        # -- with or without a route -- is refused (top review B1).
+        raise OwnerError("profile-top-route-required")
     # Equal-form required options are forwarded unchanged; split-form options
     # were appended above.  Selector-only --adapter/--route-evidence never
     # cross the boundary.
@@ -485,6 +496,15 @@ def _authoritative_jobs(values, env):
             trusted = inherited
         else:
             trusted = _canonical_jobs()
+            canonical = Path(trusted) if trusted else None
+            # The hook trusts the canonical file only as a regular file. A
+            # registry that does not exist yet is the ordinary first run (the
+            # wrapper creates it); one that exists as a symlink or a
+            # non-regular file would be written by the wrapper and never
+            # read by the hook (top review M2).
+            if canonical is not None and (canonical.is_symlink() or canonical.exists()) \
+                    and not _usable_registry(trusted):
+                raise OwnerError("canonical-registry-unusable")
         if explicit and (not trusted or _resolved_path(explicit) != _resolved_path(trusted)):
             raise OwnerError("explicit-jobs-outside-parent-registry")
     return explicit or inherited

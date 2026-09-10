@@ -4,8 +4,8 @@
 
 `deep maker`, `deep reviewer`, `deep editor`, and `deep orchestrator` map to
 `opus`/xhigh (the shipped deep tier equals the user's runtime mapping, 2026-09-09;
-`fable` is main-session-only — reachable from registered dispatch only through the
-sealed `top` exception profile on a dispatch-depth-1 owner or review worker — and
+`fable` is main-session-only — reachable from registered dispatch only through a
+route that sealed the `top` exception profile for its dispatch-depth-1 owner — and
 the capacity cascade is `opus -> sonnet`, which `top` never enters). Retained `orchestrator` is the balanced mechanical role and maps to
 `sonnet`/medium; it is not an alias for the standard+ dispatch-depth-1 conductor. Fast
 portable roles map to `sonnet`/medium. (Both follow `CFG_TIER_LIGHT_EFFORT`; the
@@ -177,8 +177,9 @@ main/orchestrator chooses per job and the wrapper only reflects that choice:
   bound to the session (never from the command text) and arms one native
   `asyncRewake` hook for it, one waiter per attempt (and, since SD-122 v56, a second
   `asyncRewake` hook for an exact steward watch armed by `peer-steward.py watch`). The hook waits for terminal
-  quiescence outside the model and wakes once with an exact harvest command;
-  ordinary Bash calls are silent no-ops, and no Background Bash monitor,
+  quiescence outside the model and wakes once with an exact receipt (a harvest
+  command when one is required); an ordinary Bash call arms nothing unless a
+  fresh or re-armable row of this session is waiting, and no Background Bash monitor,
   `dispatch-wait`, progress recap, or periodic re-arm is created. Immediately
   before rendering, the hook re-reads the exact row and its sealed completion
   evidence: every terminal receipt, success or attention, exits two — Claude

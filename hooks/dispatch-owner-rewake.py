@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import time
@@ -303,6 +304,29 @@ ARM_ROW_STATUSES = frozenset({"open"})
 RECEIPT_ROW_STATUSES = frozenset({"open", "done"})
 
 
+def _read_registry_lines(jobs: Path) -> list[str] | None:
+    """Read the trusted registry without following a symlink placed at its
+    path after validation (top review N1): the descriptor is opened with
+    O_NOFOLLOW and must be a regular file, so a swapped-in link is refused
+    at read time rather than followed."""
+
+    try:
+        fd = os.open(jobs, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as handle:
+            fd = -1
+            return handle.read().splitlines()
+    except OSError:
+        return None
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
 def _session_owner_rows(
     jobs: Path, session: str, *, statuses: frozenset[str] = ARM_ROW_STATUSES
 ) -> list[tuple[str, float]]:
@@ -312,12 +336,13 @@ def _session_owner_rows(
     paths share (review R1 B1): a receipt on stdout only *names* a candidate;
     the row proves it -- exists, `parent_sid` is this session, every
     `REGISTRY_OWNER_START` key matches. A receipt may name a row that already
-    ran to `done` (a short owner finishing before the hook ran); the registry
-    path arms open rows only."""
+    ran to `done` (a short owner finishing before the hook ran). The registry
+    path takes a *new* claim only on an open row; a row that ran to `done`
+    while this session already held its claim is still re-armable, because
+    the wake it owes was never delivered (top review M1)."""
 
-    try:
-        lines = jobs.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
+    lines = _read_registry_lines(jobs)
+    if lines is None:
         return []
     latest: dict[str, tuple[str, str, dict[str, str]]] = {}
     for line in lines:
@@ -372,8 +397,16 @@ def registry_launch(payload: object) -> tuple[Launch, ArmClaim] | ArmRefusal | N
     window = _arm_window()
     named = _single(_fields(_stdout(payload.get("tool_response"))), "attempt_id")
     refusal: ArmRefusal | None = None
-    for attempt_id, age in _session_owner_rows(jobs, session):
-        claim = claim_arm(jobs, attempt_id, session, fresh=age <= window)
+    open_rows = {attempt_id for attempt_id, _age in _session_owner_rows(jobs, session)}
+    # A row that already ran to `done` is never a *new* claim (its completion
+    # is the sweep's), but one whose claim this session already holds -- a
+    # spent gate wake, a dead holder, a lapse -- is still owed its wake and
+    # may have finished between the release and this call (top review M1).
+    for attempt_id, age in _session_owner_rows(jobs, session, statuses=RECEIPT_ROW_STATUSES):
+        fresh = attempt_id in open_rows and age <= window
+        if attempt_id not in open_rows and not arm_path(jobs, attempt_id).exists():
+            continue
+        claim = claim_arm(jobs, attempt_id, session, fresh=fresh)
         if isinstance(claim, ArmRefusal):
             # Keep the receipt-named attempt's reason above any other's
             # (review R2 M2): the notice must say why *that* start did not arm.
@@ -410,6 +443,11 @@ def _holder_alive(holder: object) -> bool:
     try:
         pid = int(holder[0])
     except ValueError:
+        return True
+    if holder[2] != process_namespace_identity(os.getpid()):
+        # The pid is a coordinate in the holder's own PID namespace; from
+        # another one the same number names someone else and its absence
+        # proves nothing (top review M3) -- unobservable counts as alive.
         return True
     if not Path(f"/proc/{pid}").exists():
         return False
@@ -1088,18 +1126,15 @@ def _gate_notices(
     that owner's hook's wake, and spending this process's single wake on it
     would lose this attempt's completion notice.
 
-    `settle` is how the announced record is left. The terminal wake acks
-    (A59-3: a gate folded into a terminal receipt is not re-announced). The
-    in-wait wake passes `sent-ambiguous` (review round 1, M6): whether an
-    exit-2 wake reaches the session is unmeasured (SD-OPEN-29/32), and an
-    acked record would have spent the sweep fallback the contract still
-    requires. The cost is bounded at-least-once: if the person has not
-    released by the next prompt the sweep shows the same gate once more.
-
-    Each record is claimed and then acked -- not left `sent-ambiguous`. A gate
-    record is a pointer; the gate itself is durable in the workflow ledger, so
-    the usual at-least-once argument does not apply, and re-delivery would put
-    the same gate in front of the user on every prompt (A59-3 forbids that).
+    `settle` is how the announced record is left, and both call sites pass
+    `sent-ambiguous` (review round 1, M6): whether an exit-2 wake reaches the
+    session is unmeasured (SD-OPEN-29/32), and an acked record would have
+    spent the sweep fallback the contract still requires. The terminal caller
+    (`_emit_with_gates`) acks separately once its receipt has actually gone
+    out, so a gate folded into a delivered terminal receipt is not
+    re-announced (A59-3) while one whose receipt never went out still is. The
+    cost is bounded at-least-once: if the person has not released by the next
+    prompt the sweep shows the same gate once more.
     """
 
     notices: list[str] = []
@@ -1283,21 +1318,20 @@ def main() -> int:
         if wait_state not in {"ready", "attention"}:
             settle_arm(claim, "lapsed")
         state, message = classified_receipt(launch, wait_state, wait_reason, root)
-    # SD-123 (8)(b): an open gate rides this same wake. It also forces the
-    # attention state -- a route whose next step is a human decision has not
-    # succeeded, however cleanly the owner attempt ended.
-    gates = _gate_notices(launch)
-    if gates:
-        state = "attention"
-        message = (
-            message
-            + " A human gate is open and awaiting your decision; it is answered, not harvested. "
-            + " ".join(gates)
-        )
     # `ended` is sealed only once the receipt has actually gone out (review
-    # R2 B2): a crash between classification and emission leaves the claim
-    # `waiting` under a dead holder, so the next Bash call re-arms and the
-    # wake is delivered at least once instead of never.
+    # R2 B2), or once another carrier owns the completion: a crash between
+    # classification and emission leaves the claim `waiting` under a dead
+    # holder, so the next Bash call re-arms and the wake is delivered at
+    # least once instead of never.
+    #
+    # Open gates ride the wake this process actually emits (SD-123 (8)(b))
+    # and force the attention state. They are folded in *after* the
+    # decision to emit (top review B1: a hook that lost the completion claim
+    # used to claim-and-ack every gate for the recipient on its way to a
+    # silent exit, so the gate was never announced by anyone), left
+    # `sent-ambiguous` while the receipt goes out, and acked only after it
+    # did (A59-3: a gate folded into a delivered terminal receipt is not
+    # re-announced; one that was not delivered still is).
     block = _attention_has_open_child(message)
     if block:
         # A live owned child is still open -- no delivery-owing terminal
@@ -1305,27 +1339,58 @@ def main() -> int:
         # open|running -> done), so there is nothing to claim. This keeps
         # Claude from stopping prematurely; SD-111's claim gate does not
         # apply to it.
-        return _ended(claim, emit_receipt(state, message, block=True), terminal=state in TERMINAL_STATES)
+        return _emit_with_gates(launch, claim, state, message, block=True)
     owing = _delivery_owing_row(launch)
     if owing is None:
         # Not (yet) a delivery-owing terminal completion -- still open/
         # running (timeout, bridge error) or a non-SD-111 row. Emit exactly
         # as before the claim gate existed; only a genuine delivery-owing
         # terminal notice is claim-gated.
-        return _ended(claim, emit_receipt(state, message, block=False), terminal=state in TERMINAL_STATES)
+        return _emit_with_gates(launch, claim, state, message, block=False)
     win = _carrier_one_claim(launch, owing)
     if win is None:
         # Another carrier holds (or already acked) the durable record: the
-        # completion is delivered by it, so this attempt is finished here.
+        # completion is delivered by it, so this attempt is finished here --
+        # and the recipient's gates are that carrier's (or the sweep's) too.
         return _ended(claim, 0, terminal=True)
-    exit_code = emit_receipt(state, message, block=False)
+    exit_code = _emit_with_gates(launch, claim, state, message, block=False)
     try:
         pending_delivery.mark_sent_ambiguous(
             win.root, win.recipient_key, win.delivery_id, claim_owner=win.claim_owner,
         )
     except pending_delivery.PendingDeliveryError:
         pass
-    return _ended(claim, exit_code, terminal=True)
+    return exit_code
+
+
+def _emit_with_gates(launch: Launch, claim: ArmClaim, state: str, message: str, *, block: bool) -> int:
+    """Fold the recipient's open gates into the receipt about to go out, emit
+    it, and only then ack them; seal the claim after the emit."""
+
+    # The owner's own outcome, read before any gate is folded in (top review
+    # R2-M1): a gate belongs to whoever raised it and only changes what this
+    # receipt *displays*. Letting it also decide this claim sealed a timed-out
+    # or helper-less wait as `ended`, so the owner -- still open -- could never
+    # be re-armed and its completion never woke the session again.
+    terminal = state in TERMINAL_STATES
+    announced: list[str] = []
+    gates = _gate_notices(launch, settle="sent-ambiguous", announced=announced)
+    if gates:
+        state = "attention"
+        message = (
+            message
+            + " A human gate is open and awaiting your decision; it is answered, not harvested. "
+            + " ".join(gates)
+        )
+    exit_code = emit_receipt(state, message, block=block)
+    root = launch.jobs.resolve(strict=False).parent
+    recipient_key = _recipient_key(launch)
+    for delivery_id in announced:
+        try:
+            pending_delivery.ack(root, recipient_key, delivery_id, acked_by=f"async-rewake:{launch.session_id}")
+        except pending_delivery.PendingDeliveryError:
+            pass
+    return _ended(claim, exit_code, terminal=terminal)
 
 
 def _ended(claim: ArmClaim, exit_code: int, *, terminal: bool) -> int:

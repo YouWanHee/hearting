@@ -75,6 +75,25 @@ OPTIONAL_PROFILE_KEYS = frozenset({
     "CFG_MODEL_PROFILE_BALANCED", "CFG_MODEL_PROFILE_GRANULARITY_BALANCED",
     "CFG_MODEL_PROFILE_TOP", "CFG_MODEL_PROFILE_GRANULARITY_TOP",
 })
+# Policy keys a release added after a user copy was seeded. A complete user
+# copy without one stays selected whole-file, and the consumer sees the key
+# as absent (top review B2, 2026-09-10: the codex main-session-only key made
+# every earlier codex copy `user-incomplete`, replacing the user's whole
+# policy with the shipped file while the docs promised "no restriction").
+# Only a key whose consumer tolerates absence belongs here. The codex
+# wrapper reads its main-only list with a default (`policy.get(key, "")`), so
+# an older copy without it is unrestricted and says so on the receipt
+# (`main_session_only_policy=absent`); the Claude wrapper *raises*
+# `dispatch-model-policy-unavailable` when its key is missing, so making that
+# one optional would refuse every Claude dispatch instead of protecting it --
+# it stays required (combined review m1).
+OPTIONAL_POLICY_KEYS: dict[str, frozenset[str]] = {
+    "codex": frozenset({"CFG_MAIN_SESSION_ONLY_MODELS"}),
+}
+# Tiers a user copy may reference without declaring: the exception tier's
+# resolver refuses typed (`profile-top-undeclared`) instead of the whole copy
+# falling back to the shipped file.
+OPTIONAL_TIERS = frozenset({"TOP"})
 
 
 def restricted_model(model: str, restricted: list[str] | tuple[str, ...] | str) -> bool:
@@ -121,7 +140,15 @@ def _unreferenced_tier_keys(missing: set[str], user_values: Mapping[str, str], a
     with the shipped one. A tier stays required when the user file references it
     (a profile's `tier:budget`, or a scalar tier selector) or when this adapter's
     wrappers read its keys by name (`WRAPPER_REQUIRED_TIERS`)."""
-    required = _referenced_tiers(user_values) | WRAPPER_REQUIRED_TIERS.get(adapter, frozenset())
+    # `OPTIONAL_TIERS` excuses a tier the *user file* points at (the
+    # exception tier's resolver refuses typed instead), never one this
+    # adapter's wrappers read by name -- those must stay declared or the
+    # wrapper reads `None` (combined review m2). Subtracting before the
+    # union is a pre-emptive correction, not a fix for an observed escape:
+    # it changes nothing while `OPTIONAL_TIERS` and every adapter's
+    # `WRAPPER_REQUIRED_TIERS` stay disjoint, and holds the invariant the
+    # first overlap would otherwise break (guard review m4).
+    required = (_referenced_tiers(user_values) - OPTIONAL_TIERS) | WRAPPER_REQUIRED_TIERS.get(adapter, frozenset())
     optional: set[str] = set()
     for key in missing:
         match = TIER_KEY.fullmatch(key)
@@ -297,7 +324,7 @@ def resolve_config(
         else:
             reason = "user-malformed"
     else:
-        optional_balanced = set(OPTIONAL_PROFILE_KEYS)
+        optional_balanced = set(OPTIONAL_PROFILE_KEYS) | set(OPTIONAL_POLICY_KEYS.get(adapter, frozenset()))
         missing = set(shipped_values) - set(user_values)
         unreferenced_tier = _unreferenced_tier_keys(missing - optional_balanced, user_values, adapter)
         if missing - optional_balanced - unreferenced_tier:

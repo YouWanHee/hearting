@@ -32,7 +32,14 @@ def selection(**values):
         dispatch_depth=values.get("dispatch_depth", 1),
         worker_type=values.get("worker_type", "owner"),
         capacity_retry=values.get("capacity_retry", 0),
+        route_file=values.get("route_file"),
     )
+
+
+def top_route(tmp: Path, owner_profile: str = "top") -> str:
+    path = tmp / f"route-{owner_profile}.json"
+    path.write_text('{"route_id": "rt-top-fixture", "owner_model_profile": "%s", "nodes": []}' % owner_profile, encoding="utf-8")
+    return str(path)
 
 
 def shipped_policy() -> dict[str, str]:
@@ -71,16 +78,37 @@ class CodexDispatchModelEligibilityTest(unittest.TestCase):
         self.assertEqual(refused.exception.reason, "headless-main-session-only-model")
 
     def test_the_sealed_top_profile_is_the_one_door_to_astra(self):
+        import tempfile
+        tmp = Path(tempfile.mkdtemp())
+        route = top_route(tmp)
         policy = shipped_policy()
-        result = WRAPPER.resolve_model_settings(selection(profile="top"))
+        result = WRAPPER.resolve_model_settings(selection(profile="top", route_file=route))
         self.assertEqual((result["model"], result["reasoning"], result["source"], result["tier"]),
                          (policy["CFG_TIER_TOP_MODEL"], policy["CFG_TIER_TOP_EFFORT"], "profile-top", "top"))
+        with self.assertRaises(WRAPPER.ModelSelectionError) as no_route:
+            WRAPPER.resolve_model_settings(selection(profile="top"))
+        self.assertEqual(no_route.exception.reason, "profile-top-route-required")
         with self.assertRaises(WRAPPER.ModelSelectionError) as override:
-            WRAPPER.resolve_model_settings(selection(profile="top", model="gpt-6-astra", reasoning="xhigh", capacity_retry=1))
-        self.assertEqual(override.exception.reason, "headless-main-session-only-model")
+            WRAPPER.resolve_model_settings(selection(profile="top", route_file=route, model="gpt-5.6-sol", reasoning="xhigh", capacity_retry=1))
+        self.assertEqual(override.exception.reason, "profile-top-override-forbidden")
         with self.assertRaises(WRAPPER.ModelSelectionError) as depth:
-            WRAPPER.resolve_model_settings(selection(profile="top", dispatch_depth=2, worker_type="stage"))
+            WRAPPER.resolve_model_settings(selection(profile="top", route_file=route, dispatch_depth=2, worker_type="stage"))
         self.assertEqual(depth.exception.reason, "invalid-dispatch-model-profile")
+
+    def test_no_headless_launch_may_inherit_the_interactive_model(self):
+        # top review M1 + combined review B1: this machine's interactive
+        # default is Astra, and no headless launch -- registered or not --
+        # can prove otherwise, so inheritance is refused outright (parity
+        # with the Claude adapter, which never accepted it).
+        for registered in (1, 0):
+            with self.subTest(registered_worker=registered), \
+                 self.assertRaises(WRAPPER.ModelSelectionError) as refused:
+                WRAPPER.resolve_model_settings(selection(inherit=True, registered_worker=registered))
+            self.assertEqual(refused.exception.reason, "headless-model-inheritance-ineligible")
+        # the exclusivity check still comes first
+        with self.assertRaises(WRAPPER.ModelSelectionError) as combined:
+            WRAPPER.resolve_model_settings(selection(inherit=True, profile="deep"))
+        self.assertEqual(combined.exception.reason, "invalid-dispatch-model-selection")
 
     def test_a_user_copy_without_the_key_carries_no_restriction(self):
         without = {k: v for k, v in shipped_policy().items() if k != "CFG_MAIN_SESSION_ONLY_MODELS"}

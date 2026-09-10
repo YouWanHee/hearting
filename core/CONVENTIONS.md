@@ -147,7 +147,7 @@ a scalar quality ranking:
 | `balanced` | Predetermined work with an extended multi-step execution | light model with high execution budget | allowed |
 | `light` | Predetermined, short local execution | configured light budget | allowed |
 | `mini` | Lifecycle, classification, title, or explicitly micro-semantic help | configured micro budget | forbidden for substantive registered dispatch-depth-1/2 owner, stage, and review nodes |
-| `top` | Exception above deep: the harness's main-session-only model, only by explicit selection under important or difficult-uncertain judgment | configured top budget, opt-in (a harness without one collapses to deep, typed) | dispatch-depth-1 owner or review worker only; not a stage node, leg, matrix cell, policy band, or capacity cascade |
+| `top` | Above deep: the harness's main-session-only model, only by a route-sealed explicit selection under important or difficult-uncertain judgment | configured top budget, opt-in (undeclared runtime config refuses typed) | route-sealed dispatch-depth-1 owner only; not a stage node, leg, review worker, matrix cell, policy band, or capacity cascade |
 
 SD-88 v84 uses one pure resolver for compile and compose. `profile_demand`
 contains `schema_version: 1`, `judgment_requirement`, `execution_scope`, nonempty

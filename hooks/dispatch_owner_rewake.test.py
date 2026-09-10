@@ -22,10 +22,11 @@ from unittest import mock
 
 
 MODULE_PATH = Path(__file__).with_name("dispatch-owner-rewake.py")
-# A holder that is provably dead: pid 4194304 is above Linux's pid_max, so
-# `/proc/<pid>` never exists. (pid 1 is a *live* pid whose identity an
-# unprivileged reader cannot observe, which the hook now counts as alive.)
-DEAD_HOLDER = ["4194304", "0", "pid:[0]"]
+# A holder that is provably dead *from this process's own PID namespace*:
+# pid 4194304 is above Linux's pid_max, so `/proc/<pid>` never exists, and
+# the namespace is ours so the hook may judge it (a holder recorded from
+# another namespace is unobservable and counts as alive -- top review M3).
+DEAD_HOLDER = ["4194304", "0", os.readlink(f"/proc/{os.getpid()}/ns/pid")]
 SPEC = importlib.util.spec_from_file_location("dispatch_owner_rewake", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
 rewake = importlib.util.module_from_spec(SPEC)
@@ -963,7 +964,30 @@ class RegistryConfirmArmTest(unittest.TestCase):
         with mock.patch.object(rewake, "_process_identity", return_value=None):
             self.assertTrue(rewake._holder_alive(list(claim.holder)))
         self.assertFalse(rewake._holder_alive(DEAD_HOLDER))                  # pid does not exist
-        self.assertFalse(rewake._holder_alive([str(os.getpid()), "0", "pid:[0]"]))  # live pid, wrong identity
+        self.assertFalse(rewake._holder_alive([str(os.getpid()), "0", DEAD_HOLDER[2]]))  # live pid, wrong start: reuse
+        self.assertTrue(rewake._holder_alive([str(os.getpid()), "0", "pid:[0]"]))       # another namespace: unobservable
+
+    def test_a_holder_from_another_pid_namespace_is_never_declared_dead(self) -> None:
+        # Top review M3: a pid is a coordinate in the holder's namespace; from
+        # another one the number means nothing, so the holder counts as alive.
+        foreign = ["4194304", "0", "pid:[4026531999]"]
+        self.assertTrue(rewake._holder_alive(foreign))
+        path = rewake.arm_path(self.jobs, "att-owner-1")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"schema": 1, "attempt_id": "att-owner-1", "session_id": "session-1",
+                                    "holder": foreign, "state": "waiting", "arms": 1, "gate_delivery_id": None}), encoding="utf-8")
+        self.assertEqual(rewake.claim_arm(self.jobs, "att-owner-1", "session-1", fresh=True).reason, "held-live")
+
+    def test_a_symlink_swapped_in_after_validation_is_not_followed(self) -> None:
+        # Top review N1: the registry is read through O_NOFOLLOW, so a link
+        # placed at the trusted path between validation and read is refused.
+        other = self.root / "other.log"
+        other.write_text(self.row(attempt_id="att-replaced"), encoding="utf-8")
+        self.assertEqual([a for a, _ in rewake._session_owner_rows(self.jobs, "session-1")], ["att-owner-1"])
+        self.jobs.unlink()
+        self.jobs.symlink_to(other)
+        self.assertIsNone(rewake._read_registry_lines(self.jobs))
+        self.assertEqual(rewake._session_owner_rows(self.jobs, "session-1"), [])
 
     def test_a_proven_start_whose_ledger_is_unreadable_says_so(self) -> None:
         # Review R1 M2: a claim failure that leaves nobody watching is a loss,
@@ -1479,6 +1503,107 @@ class CarrierOneClaimGateTest(unittest.TestCase):
             code, stdout, stderr = self._run_main()
         self.assertEqual(code, 2)
         self.assertIn("state=attention", stdout)
+
+
+class LosingCarrierLeavesGatesTest(CarrierOneClaimGateTest):
+    """Top review B1: a hook that lost the completion claim must not consume
+    the recipient's gate records on its way to a silent exit, and a winning
+    hook acks a folded gate only after its receipt went out."""
+
+    def _gate(self, delivery_id="delivery-independent-gate", owner="att-parallel-owner"):
+        receipt = {"schema_version": 2, "state": "attention", "parent_attempt_id": owner,
+                   "job_registry": str(self.jobs), "delivery_classification": "attention",
+                   "children": [{"attempt_id": owner, "status": "open", "readiness": "human-gate",
+                                 "reason": "shards/frame/interview.json",
+                                 "required_action": "human-gate:frame-review", "harness": "claude",
+                                 "delivery_classification": "attention"}]}
+        rewake.pending_delivery.create(
+            self.root, recipient_kind="claude-parent-runtime", recipient_key="session-1",
+            delivery_id=delivery_id, session_generation="unsupported", session_generation_supported="0",
+            attempt_ids=[owner], parent_attempt_id=owner, route_id="rt-parallel", route_node="frame",
+            receipt=receipt, receipt_digest=rewake.pending_delivery._canonical_receipt_digest(receipt),
+            row_revisions={owner: "human-gate:frame-review"})
+        rewake._RECIPIENT_KEY_CACHE.clear()
+        return delivery_id
+
+    def test_a_losing_carrier_leaves_an_undelivered_gate_for_the_sweep(self):
+        from dispatch_session_sweep import sweep_deliver, ack_delivered
+        self._open_row()
+        self._close_and_materialize()
+        claimed, _ = sweep_deliver(self.root, "claude-parent-runtime", "session-1")
+        self.assertEqual(len(claimed), 1)
+        gate_id = self._gate()
+        with mock.patch.object(rewake, "runtime_ancestry_binding", return_value=self.ANCESTRY):
+            code, out, err = self._run_main()
+        self.assertEqual((code, out, err), (0, "", ""))
+        gate = rewake.pending_delivery.read(self.root, "session-1", gate_id)
+        self.assertEqual(gate["state"], "pending")   # untouched, not acked
+        ack_delivered(self.root, "session-1", claimed, acked_by="test-sweep")
+        later, _ = sweep_deliver(self.root, "claude-parent-runtime", "session-1")
+        self.assertEqual([r["delivery_id"] for r in later], [gate_id])
+
+    def _run_main_patched(self, **patches):
+        """`_run_main` pins the wait to `ready`; these cases need the failure
+        states, so they drive `main` themselves."""
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(rewake.sys, "stdin", io.StringIO(json.dumps(self.payload()))), \
+             mock.patch.object(rewake.sys, "stdout", out), \
+             mock.patch.object(rewake.sys, "stderr", err), \
+             mock.patch.object(rewake, "runtime_ancestry_binding", return_value=self.ANCESTRY):
+            stack = [mock.patch.object(rewake, key, value) for key, value in patches.items()]
+            for patch in stack:
+                patch.start()
+            try:
+                code = rewake.main()
+            finally:
+                for patch in stack:
+                    patch.stop()
+        return code, out.getvalue(), err.getvalue()
+
+    def test_another_owners_gate_never_ends_a_non_terminal_wait(self):
+        # Top review R2-M1: a timeout or a missing readiness helper lapses the
+        # claim; folding in someone else's gate changes only what the receipt
+        # displays, never whether this owner finished.
+        for label, patches in (
+            ("timeout", {"wait_for_attempt": mock.Mock(return_value=("timeout", "owner-not-quiescent"))}),
+            ("no-helper", {"agent_home": mock.Mock(return_value=self.root / "no-such-home")}),
+        ):
+            with self.subTest(label=label):
+                self._open_row()                      # still open: the owner never finished
+                self._gate(f"delivery-foreign-{label}", owner="att-someone-else")
+                code, _out, err = self._run_main_patched(**patches)
+                self.assertEqual(code, 2)             # the gate is worth waking for
+                self.assertIn("human gate is open", err)
+                ledger = rewake._read_arm(rewake.arm_path(self.jobs, "att-owner-1"))
+                self.assertEqual(ledger["state"], "lapsed")   # not `ended`
+                rewake.arm_path(self.jobs, "att-owner-1").unlink()
+
+        # and with no foreign gate the same failures lapse exactly as before
+        self._open_row()
+        code, _out, _err = self._run_main_patched(
+            wait_for_attempt=mock.Mock(return_value=("timeout", "owner-not-quiescent")))
+        self.assertEqual(code, 0)
+        self.assertEqual(rewake._read_arm(rewake.arm_path(self.jobs, "att-owner-1"))["state"], "lapsed")
+
+    def test_a_winning_carrier_acks_a_folded_gate_only_after_the_receipt_went_out(self):
+        self._open_row()
+        self._close_and_materialize()
+        gate_id = self._gate()
+        with mock.patch.object(rewake, "runtime_ancestry_binding", return_value=self.ANCESTRY):
+            code, out, err = self._run_main()
+        self.assertEqual(code, 2)
+        self.assertIn("human gate is open", err)
+        self.assertEqual(rewake.pending_delivery.read(self.root, "session-1", gate_id)["state"], "acked")
+        # and when the emit itself fails, the gate stays retryable
+        rewake.arm_path(self.jobs, "att-owner-1").unlink()   # a fresh claim for the second run
+        self._open_row()
+        self._close_and_materialize()
+        gate_id = self._gate("delivery-independent-gate-2")
+        with mock.patch.object(rewake, "runtime_ancestry_binding", return_value=self.ANCESTRY), \
+             mock.patch.object(rewake, "emit_receipt", side_effect=RuntimeError("no emit")):
+            with self.assertRaises(RuntimeError):
+                self._run_main()
+        self.assertEqual(rewake.pending_delivery.read(self.root, "session-1", gate_id)["state"], "sent-ambiguous")
 
 
 class DispatchOwnerRewakeMaterializeAbsenceTest(unittest.TestCase):
@@ -2148,6 +2273,27 @@ class GateCloseRearmTest(GateCarrierTest):
         launch, claim = resolved
         self.assertEqual((launch.attempt_id, launch.armed, claim.arms), ("att-gate-owner", "registry-rearm", 2))
         self.assertNotIsInstance(rewake.registry_launch(self.call("ls")), tuple)  # one waiter again
+
+    def test_an_owner_that_finished_right_after_the_release_is_still_rearmed(self):
+        # Top review M1: the release closed the gate, and the owner ran to
+        # `done` before this Bash call's hook ran; the spent claim is still
+        # owed its wake, so the done row is a candidate and the wait ends at
+        # once with the terminal receipt.
+        import dispatch_contract as D
+        delivery_id = self._gate_record(state="sent-ambiguous")
+        self.spend_wake_on(delivery_id)
+        rewake.pending_delivery.ack(self.state, "session-gate", delivery_id, acked_by="gate-release")
+        text = self.jobs.read_text(encoding="utf-8").replace(
+            "attempt_schema_version=2,", "attempt_schema_version=2,fallback_hop=same-harness-headless,")
+        self.jobs.write_text(text, encoding="utf-8")
+        self.assertTrue(D.close_attempt_row(self.jobs, "att-gate-owner", "completed-marker"))
+        resolved = rewake.registry_launch(self.call())
+        assert isinstance(resolved, tuple), resolved
+        launch, claim = resolved
+        self.assertEqual((launch.attempt_id, launch.armed, claim.arms), ("att-gate-owner", "registry-rearm", 2))
+        # a done row with no claim of this session's is never a new candidate
+        self.jobs.write_text(self.jobs.read_text(encoding="utf-8").replace("att-gate-owner", "att-other-done"), encoding="utf-8")
+        self.assertIsNone(rewake.registry_launch(self.call()))
 
     def test_a_missing_or_unnamed_gate_record_counts_as_open(self):
         # Review R1 B2: only a record that was read and is closed re-arms; an

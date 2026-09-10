@@ -137,6 +137,12 @@ def parse_native_catalog() -> list[tuple[str, str]]:
             print(f"malformed CFG_NATIVE_AGENT_CATALOG entry: {token!r}", file=sys.stderr)
             raise SystemExit(1)
         name, profile = token.split(":", 1)
+        if profile == "top":
+            # A native subagent can never run the main-session-only model
+            # (the admission hook refuses it at every spawn), so a catalog
+            # entry pinning it would only generate a definition that always
+            # fails (top review m4).
+            raise SystemExit(f"CFG_NATIVE_AGENT_CATALOG entry {token!r}: top is not a native agent profile")
         entries.append((name, profile))
     return entries
 

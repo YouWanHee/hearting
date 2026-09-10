@@ -115,6 +115,7 @@ from stage_session_runtime import (  # noqa: E402
 from model_profile import (  # noqa: E402
     TOP_PROFILE,
     ModelProfileError,
+    require_top_route,
     resolve_runtime_profile,
     validate_registered_profile,
 )
@@ -331,7 +332,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--inherit-model-settings",
         action="store_true",
-        help="do not override model/reasoning; inherit the active Codex config for this dispatch",
+        help="legacy input retained for typed rejection; registered headless Codex dispatch requires an explicit eligible role/model",
     )
     p.add_argument("--require-hook-trust", action="store_true")
     p.add_argument("--profile")
@@ -745,6 +746,18 @@ def _require_headless_model(model: str, source: str) -> None:
         )
 
 
+def _model_config_state() -> tuple[str, str]:
+    """Which models.conf this launch resolved (`user` or `shipped`) and why --
+    on the receipt so a user copy silently replaced by the shipped file is
+    visible (top review B2)."""
+
+    try:
+        _values, receipt = resolve_config("codex", source_root=ROOT)
+    except ModelConfigError as exc:
+        return "unavailable", str(exc)[:80]
+    return receipt.source, receipt.reason
+
+
 def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
     try:
         validate_registered_profile(
@@ -755,16 +768,31 @@ def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
         )
     except ModelProfileError as exc:
         raise ModelSelectionError("invalid-dispatch-model-profile", str(exc)) from exc
+    try:
+        binding = getattr(args, "owner_route_binding", None)
+        require_top_route(
+            getattr(args, "route_file", None) or getattr(binding, "route_file", None),
+            profile=args.model_profile or "",
+        )
+    except ModelProfileError as exc:
+        raise ModelSelectionError(exc.reason, str(exc)) from exc
     if args.inherit_model_settings:
         if args.model_profile or args.model_role or args.model or args.reasoning:
             raise ModelSelectionError(
                 "invalid-dispatch-model-selection",
                 "--inherit-model-settings is mutually exclusive with --model-profile, --model-role, --model, and --reasoning",
             )
-        return {
-            "source": "inherit", "role": "inherit", "profile": "unsealed",
-            "tier": "inherit", "granularity": "legacy", "model": "inherit", "reasoning": "inherit",
-        }
+        # Parity with the Claude adapter (top review M1, combined review B1):
+        # no headless Codex launch can prove the inherited interactive
+        # settings exclude a main-session-only model -- on this machine the
+        # interactive default IS the top model -- so inheritance is refused
+        # outright and the flag is off the documented surface. It stays in
+        # argparse so an old caller gets this typed reason instead of an
+        # unknown-argument error.
+        raise ModelSelectionError(
+            "headless-model-inheritance-ineligible",
+            "registered headless Codex dispatch cannot prove that inherited interactive settings exclude a main-only model; select --model-profile, --model-role, or --model with --reasoning",
+        )
     if args.model_profile:
         if not args.model_role and args.worker_type != "owner":
             raise ModelSelectionError(
@@ -788,11 +816,17 @@ def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
         except ModelProfileError as exc:
             raise ModelSelectionError("invalid-dispatch-model-profile", str(exc)) from exc
         model = args.model or resolved["model"]
-        if resolved["profile"] == TOP_PROFILE and not args.model:
+        if resolved["profile"] == TOP_PROFILE and args.model:
+            # No cascade in or out: nothing runs under the `top` label but the
+            # top model itself (top review m1).
+            raise ModelSelectionError(
+                "profile-top-override-forbidden",
+                "the top exception profile admits no concrete --model override, capacity retry included",
+            )
+        if resolved["profile"] == TOP_PROFILE:
             # The one door to the main-session-only model from registered
             # dispatch: a route-sealed `top` profile (2026-09-09 사용자 결정).
-            # The waiver covers exactly the resolved model; a capacity
-            # override under `top` still faces the gate.
+            # The waiver covers exactly the resolved model.
             source = "profile-top"
         else:
             _require_headless_model(model, f"profile:{args.model_profile}")
@@ -850,7 +884,7 @@ def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
     if not args.model and not args.reasoning:
         raise ModelSelectionError(
             "missing-dispatch-model-selection",
-            "main dispatch must choose --model-role, --model with --reasoning, or --inherit-model-settings",
+            "main dispatch must choose --model-role or --model with --reasoning",
         )
     if not args.model or not args.reasoning:
         raise ModelSelectionError(
@@ -3332,6 +3366,9 @@ def main(argv: list[str]) -> int:
     print(f"model_role={settings['role']}")
     print(f"model_profile={settings['profile']}")
     print(f"model_tier={settings['tier']}")
+    _config_source, _config_reason = _model_config_state()
+    print(f"model_config_source={_config_source}")
+    print(f"model_config_reason={_config_reason}")
     print(f"profile_granularity={settings['granularity']}")
     print(f"main_session_only_policy={_main_session_only_policy_state()}")
     for key, value in sorted(getattr(args, "profile_selection_receipt", {}).items()):

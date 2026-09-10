@@ -225,10 +225,78 @@ class TopProfileOptionalityTest(unittest.TestCase):
         self.assertEqual((receipt.source, receipt.reason), ("user", "user-valid"))
         self.assertEqual(receipt.unreferenced_tier_keys, "CFG_TIER_TOP_EFFORT,CFG_TIER_TOP_MODEL")
         self.assertNotIn("CFG_MODEL_PROFILE_TOP", values)  # never derived
-        # a copy that opts in without declaring the tier is incomplete
+        # a copy that opts in without declaring the tier stays selected whole-file,
+        # and resolving `top` on it refuses typed instead (top review B2 (iii))
         user.write_text(legacy_user + "CFG_MODEL_PROFILE_TOP=top:max\n", encoding="utf-8")
-        _values, receipt = config.resolve_config("claude", runtime=home, source_root=root)
+        values, receipt = config.resolve_config("claude", runtime=home, source_root=root)
+        self.assertEqual((receipt.source, receipt.reason), ("user", "user-valid"))
+        from model_profile import ModelProfileError, resolve_profile_values
+        with self.assertRaises(ModelProfileError) as refused:
+            resolve_profile_values("claude", values, "top")
+        self.assertEqual(refused.exception.reason, "profile-top-undeclared")
+
+    def test_a_codex_copy_without_the_main_only_key_stays_selected_whole_file(self):
+        # top review B2: a policy key a release added must not turn an older
+        # complete codex copy into `user-incomplete` (a silent whole-file
+        # replacement of the user's policy).
+        shipped = BASE + 'CFG_MAIN_SESSION_ONLY_MODELS="shipped-top"\n'
+        legacy_user = BASE.replace("CFG_TIER_DEEP_MODEL=", "CFG_TIER_DEEP_MODEL=user-custom-") if "CFG_TIER_DEEP_MODEL=" in BASE else BASE
+        root = self.make_root(adapter="codex", shipped=shipped)
+        home = root / "home"
+        user = home / "agent-config" / "models.conf"
+        user.parent.mkdir(parents=True)
+        user.write_text(legacy_user, encoding="utf-8")
+        values, receipt = config.resolve_config("codex", runtime=home, source_root=root)
+        self.assertEqual((receipt.source, receipt.reason), ("user", "user-valid"))
+        self.assertNotIn("CFG_MAIN_SESSION_ONLY_MODELS", values)   # absent, never merged
+        # the same omission on claude is still incomplete (the key is required there)
+        root2 = self.make_root(adapter="claude", shipped=shipped)
+        home2 = root2 / "home"
+        (home2 / "agent-config").mkdir(parents=True)
+        (home2 / "agent-config" / "models.conf").write_text(legacy_user, encoding="utf-8")
+        _v, receipt2 = config.resolve_config("claude", runtime=home2, source_root=root2)
+        self.assertEqual(receipt2.reason, "user-incomplete")
+
+    def test_every_optional_policy_key_is_shipped_and_registered_by_hand(self):
+        # combined review m1: the optional-key registration is hand-written,
+        # so pin what it must satisfy -- the key exists in that adapter's
+        # shipped file (otherwise the entry is dead), and a user copy without
+        # it stays selected whole-file with the key absent (the consumer must
+        # tolerate that, which is why the Claude key is deliberately absent
+        # from this map: its wrapper raises when the key is missing).
+        # Absence *tolerance* itself is asserted at the consumer, not here:
+        # `codex_dispatch_model_eligibility.test.py`
+        # ::test_a_user_copy_without_the_key_carries_no_restriction
+        # (guard review m5).
+        root = config.repository_root()
+        for adapter, keys in config.OPTIONAL_POLICY_KEYS.items():
+            shipped = config.parse_config(config.shipped_path(adapter, source_root=root))
+            for key in keys:
+                with self.subTest(adapter=adapter, key=key):
+                    self.assertIn(key, shipped)
+        self.assertNotIn("claude", config.OPTIONAL_POLICY_KEYS)
+        # and a shipped key that is registered nowhere still makes a copy
+        # incomplete -- the deliberate default this map is an exception to
+        shipped_text = BASE + 'CFG_SOME_NEW_POLICY_KEY=value\n'
+        root2 = self.make_root(shipped=shipped_text)
+        home = root2 / "home"
+        (home / "agent-config").mkdir(parents=True)
+        (home / "agent-config" / "models.conf").write_text(BASE, encoding="utf-8")
+        _values, receipt = config.resolve_config("claude", runtime=home, source_root=root2)
         self.assertEqual(receipt.reason, "user-incomplete")
+
+    def test_opencode_declares_no_main_session_only_policy(self):
+        # guard review m1: opencode is the one adapter whose registered
+        # headless dispatch may still inherit the interactive model, and the
+        # reason is that its shipped config declares no main-session-only
+        # list -- there is nothing an inherited model could leak. Only a
+        # README sentence said so. Pin it here: the day opencode declares
+        # such a key, this reddens and the inherit allowance must be
+        # revisited (adapters/opencode/bin/dispatch-headless.py) rather than
+        # staying open silently.
+        shipped = config.parse_config(
+            config.shipped_path("opencode", source_root=config.repository_root()))
+        self.assertNotIn("CFG_MAIN_SESSION_ONLY_MODELS", shipped)
 
     def test_restricted_model_matches_whole_ids_and_alias_tokens(self):
         self.assertTrue(config.restricted_model("claude-fable-5-1", "fable"))

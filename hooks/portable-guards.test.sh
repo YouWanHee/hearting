@@ -1212,7 +1212,7 @@ if "$CODEX" headless >/tmp/codex_headless.out 2>/tmp/codex_headless.err \
   && grep -q '^runtime_projection_requires=hearting,AGENTS.md,hooks.json,native-skills,native-agents,native-modes$' /tmp/codex_headless.out \
   && grep -q '^runtime_projection_strict_requires=complete-codex-hook-trust$' /tmp/codex_headless.out \
   && grep -q '^model_selection_policy=main-orchestrator-must-select-per-job$' /tmp/codex_headless.out \
-  && grep -q '^model_selection_surface=--model-profile <deep|balanced-deep|balanced|light|mini> \[--model-role <portable-role>\]|--model-role <portable-role>|--model <model> --reasoning <effort>|--inherit-model-settings$' /tmp/codex_headless.out \
+  && grep -q '^model_selection_surface=--model-profile <deep|balanced-deep|balanced|light|mini> \[--model-role <portable-role>\]|--model-role <portable-role>|--model <model> --reasoning <effort>$' /tmp/codex_headless.out \
   && grep -q '^claude_headless=unsupported$' /tmp/codex_headless.out \
   && grep -q '^liveness_surface=codex-session-jsonl-mtime$' /tmp/codex_headless.out \
   && grep -q '^liveness_check=adapters/codex/bin/preflight.sh liveness \[jobs.log\]$' /tmp/codex_headless.out \
@@ -1405,16 +1405,17 @@ if AGENT_DISPATCH_JOBS="$TMP/codex-env-jobs.log" \
 else
   bad "codex harvest and liveness should keep using the selected shared registry"
 fi
-if "$CODEX" dispatch --dry-run --worktree "$TMP/repo" --slug codex-inherit-model --capability autopilot-code --mode dev --qa standard --prompt-text "do work" --inherit-model-settings --jobs "$TMP/codex-inherit-model.log" >/tmp/codex_inherit_model.out 2>/tmp/codex_inherit_model.err \
-  && grep -q '^model_source=inherit$' /tmp/codex_inherit_model.out \
-  && grep -q '^model_role=inherit$' /tmp/codex_inherit_model.out \
-  && grep -q '^model=inherit$' /tmp/codex_inherit_model.out \
-  && grep -q '^reasoning=inherit$' /tmp/codex_inherit_model.out \
-  && ! grep -q -- '--model ' /tmp/codex_inherit_model.out \
-  && [ ! -e "$TMP/codex-inherit-model.log" ]; then
-  ok "codex dispatch wrapper can explicitly inherit model settings"
+if "$CODEX" dispatch --dry-run --worktree "$TMP/repo" --slug codex-inherit-model --capability autopilot-code --mode dev --qa standard --prompt-text "do work" --inherit-model-settings --jobs "$TMP/codex-inherit-model.log" >/tmp/codex_inherit_model.out 2>/tmp/codex_inherit_model.err; then
+  bad "codex dispatch wrapper should reject unprovable model inheritance"
 else
-  bad "codex dispatch wrapper should explicitly inherit model settings only on request"
+  rc=$?
+  if [ "$rc" -eq 64 ] \
+    && grep -q '^reason=headless-model-inheritance-ineligible$' /tmp/codex_inherit_model.out \
+    && [ ! -e "$TMP/codex-inherit-model.log" ]; then
+    ok "codex dispatch wrapper rejects unprovable model inheritance"
+  else
+    bad "codex dispatch wrapper should reject unprovable model inheritance cleanly"
+  fi
 fi
 if "$CODEX" dispatch --dry-run --worktree "$TMP/repo" --slug codex-bad-cap --capability nope-capability --mode dev --qa standard --prompt-text "do work" --jobs "$TMP/codex-bad-cap.log" >/tmp/codex_bad_cap.out 2>/tmp/codex_bad_cap.err; then
   bad "codex dispatch wrapper should fail invalid capability"
