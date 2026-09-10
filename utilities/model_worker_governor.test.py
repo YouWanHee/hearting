@@ -1141,5 +1141,120 @@ class GovernorIdentityRegressionTest(unittest.TestCase):
         self.assertNotIn("release_proven",self.state()["claims"][t])
 
 
+class GovernorReclaimTest(unittest.TestCase):
+    """A dead claimant's lease must be returnable, and only by kernel proof.
+
+    2026-09-10: `release` needs the witness handle issued in the calling
+    process, so a claimant that died without releasing held its slot forever.
+    Twelve such deaths lock the governor; ten of twelve were measured, and an
+    approved route was refused twice.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+
+    def tearDown(self):
+        for key, handle in list(GOVERNOR._LEASE_WITNESSES.items()):
+            if key[0] == str(self.root):
+                GOVERNOR.close_witness(handle)
+                GOVERNOR._LEASE_WITNESSES.pop(key, None)
+        self.temp.cleanup()
+
+    def state(self):
+        path = self.root / "state.json"
+        return json.loads(path.read_text()) if path.exists() else {}
+
+    def _dead_claimant_lease(self, worker_class="dispatch"):
+        """One lease whose claimant process really exited without releasing."""
+        script = (
+            "import importlib.util, json, sys\n"
+            # the governor imports its siblings by bare name
+            f"sys.path.insert(0, {str(PATH.parent)!r})\n"
+            f"spec = importlib.util.spec_from_file_location('g', {str(PATH)!r})\n"
+            "m = importlib.util.module_from_spec(spec)\n"
+            "sys.modules['g'] = m\n"
+            "spec.loader.exec_module(m)\n"
+            f"h = m.create_witness({str(self.root)!r}, 'reservation')\n"
+            f"t = m.reserve({str(self.root)!r}, {worker_class!r}, 1, witness_binding=h.binding())[0]\n"
+            f"m.claim_reservation({str(self.root)!r}, t, {worker_class!r})\n"
+            "print(t)\n"
+        )
+        source = self.root / f"claimant-{worker_class}.py"
+        source.write_text(script, encoding="utf-8")
+        done = subprocess.run([sys.executable, str(source)], capture_output=True, text=True, timeout=120)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        return done.stdout.strip()
+
+    def test_a_dead_claimants_lease_is_reclaimed_and_a_live_one_is_not(self):
+        dead = self._dead_claimant_lease()
+        live_handle = GOVERNOR.create_witness(self.root, "reservation")
+        live = GOVERNOR.reserve(self.root, "dispatch", 1, witness_binding=live_handle.binding())[0]
+        GOVERNOR.claim_reservation(self.root, live, "dispatch")
+        self.assertEqual(set(self.state()["leases"]), {dead, live})
+
+        # `release` cannot help the dead one: the proof it needs died with it
+        blocked = GOVERNOR.release(self.root, dead)
+        self.assertEqual(blocked["status"], "blocked")
+        self.assertTrue(blocked["occupied"])
+
+        result = GOVERNOR.reclaim(self.root)
+        self.assertEqual(result["reclaimed_count"], 1, result)
+        self.assertEqual(result["reclaimed"][0]["token"], dead)
+        self.assertEqual(result["reclaimed"][0]["reason"], "exclusive-lock-acquired")
+        self.assertEqual([row["token"] for row in result["retained"]], [live])
+        self.assertEqual(result["retained"][0]["reason"], "exact-witness-lock-held")
+        self.assertEqual(list(self.state()["leases"]), [live])
+
+        # the receipt says it was reclaimed, not handed back
+        claim = self.state()["claims"][dead]
+        self.assertFalse(claim["release_proven"])
+        self.assertEqual(claim["reclaimed_by"], "witness-proof")
+        self.assertIsNotNone(claim["released_at"])
+
+        # and the live claimant can still return its own lease normally
+        self.assertTrue(GOVERNOR.release(self.root, live)["release_proven"])
+
+    def test_a_witness_that_proves_nothing_keeps_its_lease(self):
+        dead = self._dead_claimant_lease()
+        witness = self.state()["leases"][dead]["claimant_witness"]
+        path = self.root / witness["relative_path"]
+
+        # replaced file: same path, different inode -> not the recorded witness
+        path.unlink()
+        path.write_text("not the sealed payload", encoding="utf-8")
+        result = GOVERNOR.reclaim(self.root)
+        self.assertEqual(result["reclaimed_count"], 0, result)
+        self.assertIn(result["retained"][0]["reason"],
+                      {"witness-replaced", "witness-binding-mismatch", "witness-payload-mismatch"})
+        self.assertEqual(list(self.state()["leases"]), [dead])
+
+        # and a lease with no witness at all is never guessed at
+        GOVERNOR._state_change(self.root, lambda data, now: data["leases"][dead].pop("claimant_witness"))
+        result = GOVERNOR.reclaim(self.root)
+        self.assertEqual(result["reclaimed_count"], 0, result)
+        self.assertEqual(result["retained"][0]["reason"], "no-identity-witness")
+        self.assertEqual(list(self.state()["leases"]), [dead])
+
+    def test_a_full_governor_names_the_recovery_path_instead_of_dead_ending(self):
+        dead = self._dead_claimant_lease()
+        with self.assertRaises(ValueError) as refused:
+            GOVERNOR.check(self.root, "dispatch", total=1, budget=8)
+        message = str(refused.exception)
+        self.assertIn("global model-worker cap reached", message)
+        self.assertIn("reclaim", message)
+        self.assertIn("1 of 1 lease(s)", message)
+        # the hint is a diagnostic: the refusal still refuses and state is intact
+        self.assertEqual(list(self.state()["leases"]), [dead])
+
+    def test_one_token_can_be_reclaimed_without_touching_its_peers(self):
+        first = self._dead_claimant_lease()
+        second = self._dead_claimant_lease("title")
+        result = GOVERNOR.reclaim(self.root, token=first)
+        self.assertEqual([row["token"] for row in result["reclaimed"]], [first])
+        self.assertEqual(result["retained"], [])
+        self.assertEqual(list(self.state()["leases"]), [second])
+
+
 if __name__ == "__main__":
     unittest.main()
