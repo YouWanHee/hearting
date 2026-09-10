@@ -361,6 +361,29 @@ def _unique_session_owner(values):
     return {"kind": "session", "harness": harness, "id": session_id}
 
 
+def _launcher_session_setup(values=None):
+    """Pin one exact launcher session and discard inherited remote ambiguity.
+
+    A remote tmux server may retain environment from whichever client created or
+    last updated it.  Start every managed run from an empty session-identity set,
+    then add back only the launcher's unique, validated identity.  This also
+    keeps the SSH boundary allowlisted instead of forwarding arbitrary env.
+    """
+    values = os.environ if values is None else values
+    keys = tuple(key for key, _harness in SESSION_ENV_KEYS)
+    setup = ["unset " + " ".join(keys)]
+    owner = _unique_session_owner(values)
+    if owner is None:
+        return setup
+    canonical_key = {
+        "claude": "CLAUDE_CODE_SESSION_ID",
+        "codex": "CODEX_THREAD_ID",
+        "opencode": "OPENCODE_SESSION_ID",
+    }[owner["harness"]]
+    setup.append("export %s=%s" % (canonical_key, shlex.quote(owner["id"])))
+    return setup
+
+
 def _socket_inodes(pid, proc_root=Path("/proc")):
     inodes = set()
     try:
@@ -912,6 +935,14 @@ def process_owner(pid, expected_start):
         verified = proc_stat(current)
         if verified is None or verified["start"] != stat["start"]:
             return None, "ancestor-reused-or-gone", None
+        # A managed run is an explicit attribution boundary.  Its command
+        # receives launcher-sanitized session evidence, while a tmux server or
+        # remote shell above it may retain unrelated identities in its original
+        # /proc environment.  Keep generic processes on the all-ancestry rule,
+        # but never let evidence outside this exact run override or contaminate
+        # the run's own job/run/session evidence.
+        if run_id:
+            break
         current = stat["ppid"]
         depth += 1
 
@@ -1276,7 +1307,7 @@ def cmd_run(args):
     run_dir = config["run_root"] / run_id
     rendered = " ".join(shlex.quote(part) for part in command)
 
-    setup = [
+    setup = _launcher_session_setup() + [
         f"export HEARTING_COMPUTE_RUN_ID={shlex.quote(run_id)}",
         f"export HEARTING_COMPUTE_HOST={shlex.quote(name)}",
     ]

@@ -673,6 +673,16 @@ may end long before it finishes and any later session on any host that mounts
 that root can follow it by id through `runs`, `tail`, and `stop`. A run id
 doubles as the remote `tmux` session name, and a second launch within the same
 second takes a fresh directory rather than overwriting the first one's log.
+Before the payload starts, the launcher removes the four allowlisted runtime
+session variables and restores only one unique, validated launcher identity.
+The payload's exact `HEARTING_COMPUTE_RUN_ID` is then an attribution boundary:
+the process probe may use exact job, run, session, and harness evidence at or
+below that boundary, but it ignores ancestry above it because a long-lived
+remote shell or tmux server can retain an unrelated original `/proc` environment.
+A missing or conflicting launcher identity therefore yields no session link.
+Processes without this managed-run marker retain the generic all-ancestry,
+ambiguity-fail-closed rule; cwd, title, transcript, and nearest-session guessing
+remain forbidden.
 
 This is deliberately not dispatch: no capability, registry, attempt, or
 completion gate is involved, and the harness never chooses a host on its own.
