@@ -85,6 +85,11 @@ _HINTS = {
     "route-evidence-unreadable": "pass the route *file* printed by compose as route_file=, not the route id",
     "explicit-adapter-outside-route-evidence": "drop --adapter; the route's sealed candidates decide. To change them, recompose: "
                                                "solo/quick with --children <harness>, staged with --parent-harness <harness>",
+    "route-evidence-candidates-outside-policy": "the route sealed no harness this user's policy admits (configured_candidates= above is empty): "
+                                                "your dispatch-defaults.yaml enables <policy-harnesses> for this model profile. Recompose the route "
+                                                "for one of those (solo/quick: --children <harness>; staged: --parent-harness <harness>), or add the "
+                                                "harness to harnesses.enabled and this profile's quality bands first. This is not a usage limit -- "
+                                                "see eligibility.* above",
     "no-eligible-route-evidence-candidate": "no sealed candidate is usable: it is usage-limited, gated, or has no positive capacity score "
                                             "(see eligibility.* and capacity_headroom.* above). Recompose the route for another harness "
                                             "(solo/quick: --children <harness>; staged: --parent-harness <harness>) or wait for the reset",
@@ -578,6 +583,7 @@ def main(argv):
         ):
             raise OwnerError("explicit-adapter-disabled-by-user-policy")
         sealed = sealed_context["harnesses"] if sealed_context else None
+        policy_harnesses = list(configured)
         if sealed is not None:
             if explicit is not None and explicit not in sealed:
                 raise OwnerError("explicit-adapter-outside-route-evidence")
@@ -670,8 +676,24 @@ def main(argv):
                 allocation=allocation, counts=counts, rejected=rejected,
                 capacity=capacity, relief_promoted=relief_promoted,
             )))
-            reason = "no-eligible-route-evidence-candidate" if sealed is not None else "no-eligible-candidate"
-            print(f"check=failed\nreason={reason}\nchild_spawned=0\nhint={hint_for(reason)}")
+            if sealed is not None and not configured:
+                # Nothing was even a candidate: every harness the route sealed
+                # sits outside this user's enabled set and quality bands. The
+                # old answer here was `no-eligible-route-evidence-candidate`,
+                # whose hint blames usage limits, gating, or capacity -- and
+                # the audit above prints `eligibility.<harness>=ok` right next
+                # to it, so the receipt contradicted itself (2026-09-10, a
+                # route sealed for a harness the policy excludes).
+                reason = "route-evidence-candidates-outside-policy"
+                detail = hint_for(reason).replace(
+                    "<policy-harnesses>", ",".join(policy_harnesses) or "none")
+            elif sealed is not None:
+                reason = "no-eligible-route-evidence-candidate"
+                detail = hint_for(reason)
+            else:
+                reason = "no-eligible-candidate"
+                detail = hint_for(reason)
+            print(f"check=failed\nreason={reason}\nchild_spawned=0\nhint={detail}")
             return 65
         wrapper = ROOT / "adapters" / selected / "bin" / "dispatch-headless.py"
         if not os.access(wrapper, os.X_OK):

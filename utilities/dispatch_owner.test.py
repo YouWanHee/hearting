@@ -1034,6 +1034,38 @@ class RefusalHintTest(unittest.TestCase):
         self.assertIn("reason=route-evidence-direct-route-has-no-owner", out)
         self.assertIn("hint=a direct route runs inline; compose --shape solo", out)
 
+    def test_a_route_sealed_for_an_excluded_harness_names_the_policy(self):
+        # 2026-09-10: a route sealed for a harness the user's policy omits was
+        # refused `no-eligible-route-evidence-candidate`, whose hint blames a
+        # usage limit, gating, or capacity -- while the same receipt printed
+        # `eligibility.<harness>=ok`. Name the real reason instead.
+        route = {
+            "effective_intensity": "quick", "slug": "policy-excluded",
+            "capability": "autopilot-code", "capability_mode": "audit",
+            "cwd": "/w/tree", "owner_model_profile": "balanced-deep",
+            "owner_harness_policy": {"primary": ["claude"], "relief": [],
+                                     "last_resort": [], "promote_relief_below": 0},
+            "dispatch_allocation": {"strategy": "balanced", "window": 30,
+                                    "harness_order": ["claude", "codex", "opencode"]},
+            "registered_headless_candidates": [{"harness": "opencode", "status": "supported"}],
+        }
+        path = Path(tempfile.mkdtemp()) / "route.json"
+        path.write_text(json.dumps(route), encoding="utf-8")
+        rc, out = self._run(["--start", "--route-evidence", str(path), "--prompt-file", "/p.md"])
+        self.assertEqual(rc, 65)
+        self.assertIn("reason=route-evidence-candidates-outside-policy", out)
+        self.assertIn("configured_candidates=\n", out + "\n")     # nothing was a candidate
+        self.assertRegex(out, r"(?m)^hint=the route sealed no harness this user's policy admits")
+        self.assertIn("enables claude for this model profile", out)  # the substitution ran
+        self.assertNotIn("<policy-harnesses>", out)
+        self.assertIn("child_spawned=0", out)
+        # a route sealed for a harness the policy *does* admit keeps the old
+        # verdict when that harness is merely unusable
+        route["registered_headless_candidates"] = [{"harness": "claude", "status": "supported"}]
+        path.write_text(json.dumps(route), encoding="utf-8")
+        rc2, out2 = self._run(["--start", "--route-evidence", str(path), "--prompt-file", "/p.md"])
+        self.assertNotIn("route-evidence-candidates-outside-policy", out2)
+
     def test_every_hint_key_is_a_reason_the_selector_can_emit(self):
         # Astra final review m2: searching the whole source was a tautology,
         # because the keys appear in the _HINTS table itself. Search only the
