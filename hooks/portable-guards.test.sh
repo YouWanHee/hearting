@@ -2135,7 +2135,7 @@ EOF
 if AGENT_HOME="$ROOT" CODEX_HOME="$TUIHOME" "$CODEX" tui-config >"$TMP/logs/codex_tui.out" 2>"$TMP/logs/codex_tui.err" \
   && grep -q '^status=ok$' "$TMP/logs/codex_tui.out" \
   && grep -q '^changed=yes$' "$TMP/logs/codex_tui.out" \
-  && grep -Fq 'status_line = ["project-name", "git-branch", "context-used", "current-dir", "model-with-reasoning", "five-hour-limit", "weekly-limit"]' "$TUIHOME/config.toml" \
+  && grep -Fq 'status_line = ["thread-title", "git-branch", "context-used", "model-with-reasoning", "five-hour-limit", "weekly-limit"]' "$TUIHOME/config.toml" \
   && grep -Fq 'status_line_use_colors = true' "$TUIHOME/config.toml" \
   && grep -Fq 'model = "keep-me"' "$TUIHOME/config.toml" \
   && grep -Fq '[hooks.state]' "$TUIHOME/config.toml" \

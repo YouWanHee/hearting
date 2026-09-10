@@ -9,7 +9,7 @@
 
 ## 0. Invariants — One Router and the Artifact Order Convention
 
-This is the single routing contract for spec-backed projects that contain `.agent_reports/spec`, with legacy `.claude_reports` compatibility. Read it on demand when the adapter's status or reminder surface indicates routing is due; hooks expose runtime state but do not replace or eagerly inject this contract.
+This routing contract covers spec-backed projects containing `.agent_reports/spec`, with legacy `.claude_reports` compatibility. Read when adapter status/reminders indicate routing is due; hooks expose runtime state without replacing or eagerly injecting this contract.
 
 Every task first passes through the work-nature map in §2. Direct work, runtime plugins, and built-in Skills are used only where this router places them. Adapter and runtime projection work also remains core-first: establish the portable invariant in `core/`, read its governing document, then change adapter or generated output. A read marker enforces order but is not a substitute for review.
 
@@ -24,8 +24,8 @@ simple factual or explanatory answer that requests no new durable artifact, or
 an explicit conversational/no-files constraint.
 `direct` is an intensity inside the selected entry route, not a bypass around entry routing.
 
-Before material work or read-only context recovery, confirm main's current
-prompt received the capsule probe. Apply `MEMORY` §7.4–§7.5: agent relevance,
+Before material work or read-only recovery, confirm the
+current main-session prompt received its bounded capsule candidate probe. Apply `MEMORY` §7.4–§7.5: agent relevance,
 full-record reads, unrelated-hit exclusion, and contextual `recall`/`skip`
 recovery for failed/missing hooks, without raw-prompt storage or classification.
 Registered route-bound workers remain lifecycle/receipt-exempt.
@@ -35,14 +35,14 @@ Registered route-bound workers remain lifecycle/receipt-exempt.
 Distinguish read-only orientation from creating/refreshing persistent artifacts.
 Understanding a project, recovering context, resuming current state or reporting
 status is orientation only without a request for new analysis or modification;
-these are intent examples, not keywords. Orientation invokes no capability and
-writes no artifact. Recover in order:
+these are intent examples, not keywords.
+Read-only orientation invokes no capability and writes no artifact. Recover in order:
 
 1. Record contextual `recall` with one targeted query at the memory gate and
    search before broad discovery. Truncated/insufficient hits are indexes:
-   read full bodies by ID before use, then record `applied` or `miss` by gate ID.
-2. Resolve canonical artifacts through adapter status and
-   `utilities/artifact-root.sh`. Linked worktrees read the primary root, not
+   read the full body by record ID before use, then record `applied` or `miss` by gate ID.
+2. Use the adapter status surface and `utilities/artifact-root.sh` for canonical
+   artifacts. Linked worktrees read the primary root, not
    their tracked snapshot: `.agent_reports/`, or existing `.claude_reports/`
    only when the former is absent.
 3. Before broad source census, read the relevant subset of newest
