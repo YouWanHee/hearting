@@ -87,7 +87,13 @@ Keep `ROUTE_FILE`, `CANONICAL_JOBS`, `NODE_ID`, and the captured `ATTEMPT_ID` to
 that node's completion transaction succeeds. Never dispatch standard+ with a raw wrapper
 command that omits the route record.
 
-The prompt carries only subskill name, absolute input paths, output contract, intensity, and slug. It never carries plan bodies or prior-stage conversation. Each stage reads files; the conductor reads only verdict and gate state. Register every stage in `.dispatch/jobs.log`; `core/OPERATIONS.md`'s checked `utilities/model-worker-governor.py` owns the actual global/per-class registered-worker caps, so this reference does not restate a numeric ceiling that would drift from it. Runtime-native subagent/delegation limits are a separate, adapter-owned surface and are never substituted for the registered governor's caps. Runtime-owned completion observes exact liveness outside the model; the conductor never adds a recurring monitor. One-line or no-artifact micro-stages stay inline.
+Prompts carry only subskill, absolute inputs, output contract, intensity and
+slug; no plan bodies or prior conversation. Stages read files; conductor reads
+verdict/gate state. Register every stage in the canonical jobs registry.
+`core/OPERATIONS.md` and `utilities/model-worker-governor.py` own global/per-class
+caps, distinct from adapter-native delegation limits. Runtime completion watches
+exact liveness outside the model, without a conductor recurring monitor.
+One-line/no-artifact micro-stages stay inline.
 
 #### Runtime-Owned Batch Join
 
@@ -144,12 +150,10 @@ python3 <agent-home>/utilities/capability-route.py complete \
   --registered-worker 0 --fallback-hop inline
 ```
 
-No `--jobs`. The marker this publishes is current and opens the dependency gate for the next
-stage exactly like a dispatched one; `registered_worker=0` is what tells the readiness check
-there is no process to verify. Skipping this is the single most expensive mistake available
-here: the next stage is refused for the missing dependency, its fallback descends to inline,
-that run publishes no marker either, and **one marker-less stage forces the whole remainder of
-the route inline** — measured on route `rt-b2d68cbf14d31c62`, eight nodes and zero markers.
+Omit `--jobs`: `registered_worker=0` tells readiness there is no process to
+verify; the current marker opens the same dependency gate. Missing markers
+cascade: the next start refuses, falls inline and may omit its marker too,
+forcing the remaining route inline (rt-b2d68cbf14d31c62: eight nodes, zero markers).
 
 `--execution-surface inline` with `dispatch_depth > 0` requires `--fallback-hop inline`; the
 contract refuses the mismatched combination rather than recording a surface the run did not have.
@@ -181,12 +185,10 @@ python3 <agent-home>/utilities/capability-route.py complete \
   --reviewer-subagent <transcript path>
 ```
 
-A named reviewer attempt must have reviewed *this* gate, not merely hold the
-job title: the row must not be a sub-session slice, must — if it is bound to a
-route at all — be bound to this route and node, and must have reached a terminal
-verdict (`done`, and not a `dead-*` note; `completed-review-blocking` counts,
-because a FAIL is a produced verdict). An ad-hoc SD-OPEN-40 reviewer carries no
-route binding and stays admissible.
+A named attempt must have reviewed this gate: no sub-session slice; any route
+binding matches this route/node; terminal `done` with a non-`dead-*` note.
+`completed-review-blocking` qualifies because FAIL is a produced verdict.
+Route-free ad-hoc SD-OPEN-40 reviewers remain admissible.
 
 Name nothing and the completing attempt is the reviewer, which is independent
 only when its own registry row says `worker_type=review`. Everything else — no
@@ -200,12 +202,9 @@ one proceeds, and the degradation travels: `complete` prints
 outcome lists the node under `review_independence_degraded`, and the §0.5
 completion card has to say that gate was not independently reviewed.
 
-The SD-94 owner-closure path — the owner ruling over a review that returned
-FAIL — is recorded `review_independence=owner-overridden` with
-`review_gate_closure=owner-closure`, and is listed alongside the degraded ones.
-It is the most literal case of "reviewed" meaning "the owner decided", and the
-row it closes genuinely belongs to a review worker, so without this it would
-have read as independent.
+SD-94 owner rulings over FAIL record `review_independence=owner-overridden`
+and `review_gate_closure=owner-closure`, alongside degraded nodes. A review-worker
+row alone cannot make that owner decision independent.
 
 Naming a reviewer *after* the node completed is a no-op: provenance is not part
 of marker identity, so the call replays the existing marker and prints

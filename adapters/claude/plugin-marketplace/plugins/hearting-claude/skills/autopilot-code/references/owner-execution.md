@@ -63,52 +63,37 @@ Before merge/commit: (1) run `python3 tools/generate.py`, (2) record new `utilit
 
 ## Post-Frame Direction Gate (SD-123)
 
-This gate is mode-conditional, not universal. `standard+` `autopilot-code` routes
-compiled under an explicit `hybrid`/`both`/`post-frame-only` `confirmation.mode`
-seal `human_gates: ["frame-review"]` and the `frame` node's (and any frame
-parallel-group clone's) continuation as `{"kind": "human-gate", "gate":
-"frame-review"}` — steps 1-5 below apply to those routes. A non-composed route
-compiled under the shipped `autonomous` default (O3) instead realizes that same
-continuation as `{"kind": "inline-next"}` and seals an empty
-`human_gate_bindings` for this gate: whatever node the compiled graph actually
-places after `frame` (`plan` in the common graph, but `execute` in a graph like
-`frame,execute,test` that has no `plan` node) starts immediately and steps 1-4
-below do not apply. An explicit composed recipe keeps every gate it declares
-regardless of the default confirmation mode, exactly like the explicit-mode
-routes above. Whether this gate binds at all, and what it binds to, is always
-the compiled `human_gate_bindings` and the graph's actual successor node —
-never inferred from the mode name or a hardcoded node id. A route sealed before
-`confirmation_mode` existed at all keeps whatever the recipe declared at compile
-time and is never retro-fitted onto either shape; do not attempt to apply this
-gate to an already-open route regardless of which shape it sealed.
+Apply steps 1–4 only when compiled `human_gate_bindings` retains `frame-review`:
+explicit `hybrid`/`both`/`post-frame-only` standard+ routes seal that human gate
+and frame/clones' `human-gate` continuation; explicit composed recipes retain
+all declared gates regardless of mode. Shipped `autonomous` (O3) non-composed
+routes instead seal no binding and `frame` continues `inline-next`, immediately
+starting its actual successor. Read bindings and graph, never infer from mode
+or hardcode `plan`: `frame,execute,test` has `execute` as successor. Pre-mode
+routes retain their compile-time recipe; no retrofitting this gate onto open
+routes. Step 5 defines mode selection.
 
-1. After `frame` (and, at `standard`, `frame-alternative`) completes, before
-   dispatching the compiled bound successor (read from `human_gate_bindings`
-   and the graph's actual successor node — `plan` in the common graph, but
-   not always): build `shards/frame/frame-summary.json` from
-   `shards/frame/direction-brief.md` — exactly the five fields 방향 (direction),
-   대안 (alternatives), 위험 (risk), 범위 변경 (scope change), 비용 (cost), total
-   size ≤1KB. Reference it by **path** when raising attention; never embed the
-   summary, a `required_action`, or a gate field inside a stage-advance receipt
-   body (seam 3 — `utilities/dispatch_completion_join.py`'s v2/v3 receipt
-   negotiation returns its body by identity when no advanced record exists).
-   Then build the **interview** `shards/frame/interview.json` (schema
-   `frame_interview_v1`, SD-129) from the briefs: `understanding` (one plain
-   sentence restating what the user wants, which the user confirms or
-   corrects), `brief` (problem / outcome / affected / constraints / open, each a
-   few plain lines), and `questions` — only the decisions the briefs leave to
-   the user. Rules, all checked by `utilities/frame_interview.py validate
-   --intensity <intensity>` and refused by `gate --block` when broken: no
-   harness words (route, owner, gate, node, shard, worker, …); one topic per
-   question; at most two short sentences (≤160 chars); 2–4 options, each with
-   a one-line "what choosing it means"; exactly one `recommended` option so the
-   user can answer "yes" and move on; a `why` naming why only the user can
-   decide it — a fact you can establish by reading code or running a tool is
-   never a question, investigate it instead; at most 7 questions at
-   `standard+` (3 at `quick`, 1 at `direct`), and nothing whose answer is
-   already obvious. A tired reader must be able to answer every question
-   without opening the plan. Questions the frame legs listed under "Questions
-   only the user can answer" are the first candidates.
+1. After frame (including standard's alternative) and before its bound
+   successor, build `shards/frame/frame-summary.json` from
+   `shards/frame/direction-brief.md`: exactly 방향 (direction), 대안
+   (alternatives), 위험 (risk), 범위 변경 (scope change), 비용 (cost), total ≤1KB.
+   Raise attention by **path**; never embed summary, `required_action` or gate
+   fields in stage-advance receipt bodies (seam 3: v2/v3 negotiation in
+   `utilities/dispatch_completion_join.py` returns the body by identity when
+   no advanced record exists).
+   Then build `shards/frame/interview.json`, schema `frame_interview_v1`
+   (SD-129), from briefs: `understanding` is one plain sentence for user
+   confirmation/correction; `brief` has problem/outcome/affected/constraints/open,
+   each a few plain lines; `questions` contains only unresolved user decisions.
+   `utilities/frame_interview.py validate --intensity <intensity>` checks these
+   rules and `gate --block` refuses violations: no harness words (route, owner,
+   gate, node, shard, worker, …); one topic/question; ≤2 short sentences and
+   ≤160 chars; 2–4 options with one-line consequences; exactly one recommended
+   option, answerable by “yes”; `why` explains why only the user can decide.
+   Investigate code/tool-answerable facts instead of asking. Cap questions at
+   7 standard+, 3 quick, 1 direct; omit obvious answers. A tired reader must
+   answer without opening the plan. Start with frame briefs' “Questions only
+   the user can answer”.
 2. Raise the existing typed attention path (SD-78/108) with
    `required_action=human-gate:frame-review`, naming
    `shards/frame/interview.json` as the reviewable artifact
@@ -116,34 +101,24 @@ gate to an already-open route regardless of which shape it sealed.
    --block --artifact <absolute interview path>`); the interview references
    `frame-summary.json` by path. The depth-0 session puts the summary card and
    the questions to the user and records the answers on the release.
-3. Wait for the release on the one checked surface (SD-129), in bounded
-   foreground calls, doing nothing else in between:
-   `python3 <agent-home>/utilities/workflow-supervisor.py await-release --route
-   <route file> --gate frame-review --max 110` — exit 2 means still blocked:
-   call it again; exit 0 (`status=proceed`) means a person released the gate,
-   and the payload carries `released_by`, `artifact`, and any interview
-   `answers`; exit 3 (`revise`) returns to `frame` under the `code-refine`
-   retry boundary and the gate is raised again afterwards; exit 4 (`stop`)
-   cancels the route with `abandon_reason=operator-decision`. Never release
-   your own gate (`release`/`gate --release`) to move on: the frame gate is
-   sealed `release_authority=depth-0` at the raise, so a registered owner's
-   release is refused typed (`gate-release-authority-refused`) and would
-   otherwise unblock a plan nobody confirmed. Write the interview in the
-   `frame_interview_v1` shape only: an artifact that calls itself an
-   interview under another schema is refused at the raise
-   (`interview-schema-unsupported`). Never sleep, never write an ad-hoc polling
-   loop, and never spawn the bound successor while `await-release` has not
-   returned 0 — every launch surface refuses a successor start whose entry
-   gate is not released (`human-gate-unreleased` / `human-gate-not-raised`,
-   defect M). The person records the answer from the depth-0 session with
-   `workflow-supervisor.py release --route <route file> --gate frame-review
-   --decision proceed|revise|stop --actor <actor> --answers <answers file>`.
-   `proceed` claims and reports the bound successor atomically (never spawn
-   it a second time on retry); `revise` returns to `frame` under the
-   `code-refine` retry boundary; `stop` cancels the route with
-   `abandon_reason=operator-decision`. Pass `--answers-out
-   shards/frame/interview-answers.json` to `await-release` so the recorded
-   answers land in your cycle directory.
+3. Wait only through bounded foreground `python3 <agent-home>/utilities/workflow-supervisor.py
+   await-release --route <route file> --gate frame-review --max 110
+   --answers-out shards/frame/interview-answers.json`, with no intervening work.
+   Exit 2: still blocked, repeat the call. Exit 0 (`status=proceed`): human
+   release, carrying `released_by`, `artifact`, interview `answers`. Exit 3
+   (`revise`): return to frame via `code-refine`, then raise again. Exit 4
+   (`stop`): cancel with `abandon_reason=operator-decision`.
+   Never self-release (`release`/`gate --release`), sleep, invent polling loops,
+   or start the successor before exit 0. Raise seals `release_authority=depth-0`;
+   owner release refuses `gate-release-authority-refused`. Every start surface
+   refuses unreleased entry gates (`human-gate-unreleased` /
+   `human-gate-not-raised`, defect M). Interviews require `frame_interview_v1`;
+   other interview schemas refuse `interview-schema-unsupported` at raise.
+   The depth-0 person records `workflow-supervisor.py release --route <route
+   file> --gate frame-review --decision proceed|revise|stop --actor <actor>
+   --answers <answers file>`. Proceed atomically claims/reports the bound
+   successor: do not spawn it again on retry. Revise/stop follow the exit
+   semantics above; `--answers-out` saves the recorded answers in the cycle.
 4. On `proceed`, render the agreed intent before anything else:
    `python3 <agent-home>/utilities/frame_interview.py render-intent --interview
    shards/frame/interview.json --answers shards/frame/interview-answers.json
@@ -159,17 +134,13 @@ gate to an already-open route regardless of which shape it sealed.
    refused by the validator (`round` ≤ 2); remaining doubts go to the plan's
    risk section when `successor == plan`, and a third raise, if a route ever
    needs one, carries the frame summary alone.
-5. `confirmation.mode` (`profiles/dispatch-defaults.yaml` /
-   `utilities/dispatch-defaults.py`, default `autonomous`) governs this gate
-   and has four values: `autonomous` removes this binding entirely, but only
-   for a non-composed route doing routine, already-authorized `autopilot-code`
-   work (`frame`'s continuation realizes as `inline-next`, steps 1-4 above do
-   not apply); an explicit composed recipe keeps every gate it declares
-   regardless of `confirmation.mode`. `post-frame-only`
-   makes this gate the sole confirmation point; `hybrid` layers it onto the
-   existing pre-plan notify; `both` makes both stages always explicit — read
-   it via `query_confirmation_mode`, never hardcode a mode.
-   `core/WORKFLOW.md` §0.4 owns the user-facing card text.
+5. Read `confirmation.mode` through `query_confirmation_mode`
+   (`profiles/dispatch-defaults.yaml` / `utilities/dispatch-defaults.py`), never
+   hardcode it. Default `autonomous` removes only routine already-authorized,
+   non-composed autopilot-code's frame binding as above; `post-frame-only`
+   makes this the sole confirmation; `hybrid` adds it to pre-plan notify;
+   `both` makes both explicit. Composed gates remain. `core/WORKFLOW.md` §0.4
+   owns the card text.
 
 ## Artifact Producer Lifecycle (W7C)
 
@@ -185,8 +156,7 @@ by the dispatch-depth-1 owner). Full contract: `capabilities/autopilot-code.md`
    `AGENT_ARTIFACT_*` variables. `legacy-compat` means the cutover is inactive
    and the legacy `plans/` layout is still the write target.
 2. Write every artifact under `$AGENT_ARTIFACT_OUTPUT_DIR/plans/...`; never
-   write to a legacy top-level bucket while the cutover is active, never write
-   under `shared/`.
+   write under `shared/` or an active-cutover legacy top-level bucket.
 3. Pass the exported `AGENT_ARTIFACT_*` variables to every stage dispatch
    (the adapters forward them); stage workers call `begin --node <id>` and
    join the same cycle.
