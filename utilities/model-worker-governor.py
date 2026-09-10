@@ -386,25 +386,20 @@ def _state_change(root: str | Path, fn: Callable[[dict[str, Any], float], Any]) 
         return result
 
 
-def _cap_hint(root: str | Path, data: dict[str, Any]) -> str:
-    """Name the recovery path when the cap is held by provably dead claimants.
-
-    A full governor used to be a dead end: the message said the cap was
-    reached and nothing said that most of it was held by processes that no
-    longer exist, or what to run about it (2026-09-10, an approved route
-    blocked twice with 10 of 12 leases dead). This is a diagnostic on the
-    refusal path only -- it returns nothing and changes no state.
-    """
-
-    try:
-        stuck = reclaimable(root, data)
-    except Exception:  # noqa: BLE001 - a hint must never mask the refusal
-        return ""
-    if stuck < 1:
-        return ""
-    return (f"; {stuck} of {len(data.get('leases', {}))} lease(s) are held by a provably absent "
-            "claimant (witness lock free) -- return them with "
-            "`model-worker-governor.py reclaim`, never by editing state.json or raising the cap")
+CAP_RECOVERY_HINT = (
+    "; if the holders are gone this is recoverable: `model-worker-governor.py status` reports "
+    "`reclaimable_leases` and `reclaim` returns the ones whose claimant is provably absent "
+    "(witness lock free) -- never by editing state.json or raising the cap"
+)
+# The hint is a fixed string on purpose. It first computed `reclaimable(...)`,
+# which opens every lease's witness and attempts a lock -- inside the state
+# lock, on the refusal path. A diagnostic that takes locks is not a
+# diagnostic: it perturbed the governor's own suite (two tests that had
+# passed 4/4 began failing about half the time, one of them because a
+# release silently stopped proving and the capacity it should have freed
+# never came back). Reclaimability is reported by `status`, which is an
+# explicit operator call, and proven by `reclaim`, which is the one command
+# allowed to touch those locks.
 
 
 def _assert_available(
@@ -426,9 +421,9 @@ def _assert_available(
     reservations = data["reservations"]
     occupied = [*leases.values(), *reservations.values()]
     if len(occupied) + count > total:
-        raise ValueError("global model-worker cap reached" + _cap_hint(root, data))
+        raise ValueError("global model-worker cap reached" + CAP_RECOVERY_HINT)
     if sum(item.get("class") == worker_class for item in occupied) + count > class_limit(worker_class):
-        raise ValueError(f"{worker_class} class cap reached" + _cap_hint(root, data))
+        raise ValueError(f"{worker_class} class cap reached" + CAP_RECOVERY_HINT)
     # Unclaimed reservations hold rolling-budget capacity. Claiming one moves
     # that capacity from ``reservations`` to ``starts`` in the same lock.
     if len(data["starts"]) + len(reservations) + count > budget:
