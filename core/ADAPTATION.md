@@ -262,11 +262,17 @@ help loaded on demand.
   in `tools/surface-budget.json` and a total ceiling in
   `tools/check-surface-budget.py`. Caps are per file and independent: a
   change that grows any one of them fails the boundary check even when
-  another shrinks. The only way to grow a file is to reseal in the same
-  change with a recorded `--reason`, and a reseal is refused outright when
-  the measured total would exceed the code ceiling. Reductions are locked in
-  by resealing downward. The ceiling is lowered only in a commit that lands a
-  measured reduction and is never raised by editing the budget file.
+  another shrinks. Each cap sits one ordinary edit above its measurement —
+  3% of the bytes, and two directives or 3%, whichever is larger — so a normal
+  change has room to land; caps sealed at the exact measurement made all nine
+  surfaces permanently full and pushed growth into skipping the gate instead.
+  The margin is finite and cannot be widened by repetition: a reseal takes it
+  from the current measurement, never from the previous cap. Growing a file
+  past its cap means resealing in the same change with a recorded `--reason`,
+  and a reseal is refused outright when the sealed caps would exceed the code
+  ceiling. Reductions are locked in by resealing downward. The ceiling is
+  lowered only in a commit that lands a measured reduction and is never raised
+  by editing the budget file.
 - Ordinary, unknown, and repeated hook states inject zero bytes. A verified
   pressure-band transition may emit one compact directive of at most 240 UTF-8
   bytes.

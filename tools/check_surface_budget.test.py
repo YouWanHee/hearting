@@ -107,7 +107,29 @@ class CheckTest(_FixtureMixin):
         rc, out = _run(root=self.tmp)
         self.assertEqual(rc, 0, out)
         self.assertIn("surface_budget=ok", out)
-        self.assertEqual(self._budget()["surfaces"]["core/CORE.md"]["directives"], 1)
+        # A seal records what the surface measures and caps it one ordinary
+        # edit higher; the two are separate fields precisely so a later reseal
+        # compares measurement against measurement.
+        budget = self._budget()
+        self.assertEqual(budget["measured"]["core/CORE.md"]["directives"], 1)
+        self.assertEqual(
+            budget["surfaces"]["core/CORE.md"]["directives"],
+            1 + csb.HEADROOM_DIRECTIVES_MIN,
+        )
+        self.assertGreater(
+            budget["surfaces"]["core/CORE.md"]["bytes"],
+            budget["measured"]["core/CORE.md"]["bytes"],
+        )
+
+    def test_reseal_does_not_ratchet_caps_upward(self) -> None:
+        # Headroom is taken from the measurement every time, never added to the
+        # previous cap: resealing an unchanged tree twice must be a no-op, or
+        # the budget would widen by 3% for every reseal anyone happened to run.
+        first = self._budget()["surfaces"]
+        rc, out = _run("--reseal", root=self.tmp)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self._budget()["surfaces"], first)
+        self.assertEqual(self._budget()["history"], [])
 
     def test_one_added_paragraph_fails_over_bytes(self) -> None:
         self._append("core/CORE.md", "\nOne more explanatory paragraph.\n")
@@ -116,16 +138,30 @@ class CheckTest(_FixtureMixin):
         self.assertIn("FAIL: surface-budget over-bytes core/CORE.md", out)
         self.assertIn("over-total", out)
 
-    def test_added_rule_fails_over_directives_even_under_bytes(self) -> None:
+    def test_added_rules_fail_over_directives_even_under_bytes(self) -> None:
+        data = self._budget()
+        cap = data["surfaces"]["core/HOOKS.md"]["directives"]
+        data["surfaces"]["core/HOOKS.md"]["bytes"] += 1_000
+        data["total_bytes"] += 1_000
+        self._write_budget(data)
+        # One past the cap, so the directive count is what fails and not bytes.
+        self._append("core/HOOKS.md", "\nYou must also do this.\n" * cap)
+        rc, out = _run(root=self.tmp)
+        self.assertEqual(rc, 1)
+        self.assertIn(
+            f"FAIL: surface-budget over-directives core/HOOKS.md: {cap + 1} > {cap}", out
+        )
+        self.assertNotIn("over-bytes", out)
+
+    def test_rules_within_the_directive_headroom_pass(self) -> None:
+        # The margin is the point: a rule or two may land without a reseal.
         data = self._budget()
         data["surfaces"]["core/HOOKS.md"]["bytes"] += 1_000
         data["total_bytes"] += 1_000
         self._write_budget(data)
         self._append("core/HOOKS.md", "\nYou must also do this.\n")
         rc, out = _run(root=self.tmp)
-        self.assertEqual(rc, 1)
-        self.assertIn("FAIL: surface-budget over-directives core/HOOKS.md: 2 > 1", out)
-        self.assertNotIn("over-bytes", out)
+        self.assertEqual(rc, 0, out)
 
     def test_rule_inside_a_code_fence_is_not_a_directive(self) -> None:
         data = self._budget()

@@ -16,9 +16,18 @@ Contract (fail-closed):
 * the sum of sealed byte caps and the measured total may never exceed
   ``TOTAL_BYTE_CEILING`` — the ceiling lives in code so raising it is a
   reviewed code change, not a JSON edit;
-* ``--reseal`` lowers caps to the current measurement (locking in a
-  reduction) and refuses to raise any cap unless ``--reason`` is given, in
-  which case the raise is recorded in the file's ``history``.
+* ``--reseal`` rewrites caps to the current measurement plus ``HEADROOM``,
+  and refuses to raise the sealed *measurement* of any surface unless
+  ``--reason`` is given, in which case the raise is recorded in the file's
+  ``history``.
+
+Caps carry headroom on purpose. Sealing every surface at its exact size made
+each of the nine permanently full: the next edit anywhere failed the gate no
+matter how small, so the gate stopped reading as a budget and started reading
+as a freeze, and growth landed by skipping it instead. A cap is a budget with
+room to spend; what refuses drift is that the room is finite and one reseal
+never widens it, since the margin is always taken from the measurement rather
+than from the previous cap.
 
 A directive is one match of ``DIRECTIVE_PATTERN`` outside fenced code blocks
 and inline code spans.
@@ -30,22 +39,51 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import json
+import math
 import re
 import sys
 from pathlib import Path
 
-SCHEMA = 1
+SCHEMA = 2
 BUDGET_FILE = "tools/surface-budget.json"
+# Room one ordinary edit needs: about a table row of prose, or two rules.
+# Applied to the measurement at every reseal, never compounded onto the old
+# cap, so repeated reseals cannot ratchet the surface upward.
+HEADROOM_BYTES = 0.03
+# Percentages are meaningless on counts this small, so directives get a flat
+# floor and the percentage only matters for the largest documents.
+HEADROOM_DIRECTIVES = 0.03
+HEADROOM_DIRECTIVES_MIN = 2
+
+
+def with_headroom(measured: dict[str, int]) -> dict[str, int]:
+    """Cap for one surface: its measurement plus the standing margin."""
+    return {
+        "bytes": math.ceil(measured["bytes"] * (1 + HEADROOM_BYTES)),
+        "directives": measured["directives"] + max(
+            HEADROOM_DIRECTIVES_MIN,
+            math.ceil(measured["directives"] * HEADROOM_DIRECTIVES),
+        ),
+    }
 # Lower it only in the commit that lands a measured reduction; never raise it
 # without a reviewed rationale in that commit.
 #   2026-09-09 9c666bc2  420,908  kickoff seal
 #   2026-09-09 84215f45  397,795  completion-delivery carriers moved to ADAPTATION §7
 #   2026-09-09 7271f92f  361,173  §5.10 SD decision records moved to ADAPTATION §8
-#   2026-09-09 (this)    362,830  RAISED +1,657: the astra instruction-surface review found four
+#   2026-09-09           362,830  RAISED +1,657: the astra instruction-surface review found four
 #                                 rule clauses missing from the §5.10 summaries (SD-67 unproven-
 #                                 absence pin, SD-94 owner-closure constraints, SD-64/71/77 evidence
 #                                 order, SD-69 commit boundary); restored verbatim from §8.
-TOTAL_BYTE_CEILING = 362_830
+#   2026-09-10 (this)    375,000  RAISED +12,170: caps now carry HEADROOM over the measurement
+#                                 instead of sitting on it. Sealed at exact size, all nine surfaces
+#                                 were permanently full — a one-row edit to core/HOOKS.md had to be
+#                                 rewritten to 737 bytes against a 738-byte original, and separately
+#                                 a +719-byte core/OPERATIONS.md change landed on main leaving the
+#                                 gate red, because the only ways past a full budget are to shrink
+#                                 the sentence or to skip the gate. The ceiling now sits just above
+#                                 the sealed cap sum, so the 3% is free to spend and re-arming
+#                                 another 3% still costs a reviewed change here.
+TOTAL_BYTE_CEILING = 375_000
 SURFACES: tuple[str, ...] = (
     "core/CORE.md",
     "core/WORKFLOW.md",
@@ -126,9 +164,14 @@ def measure(root: Path) -> dict[str, dict[str, int] | None]:
     return out
 
 
-def load_budget(path: Path, *, strict_ceiling: bool = True) -> dict:
+def load_budget(path: Path, *, strict_ceiling: bool = True, legacy_ok: bool = False) -> dict:
     data = json.loads(path.read_text(encoding="utf-8"))
-    if data.get("schema") != SCHEMA:
+    schema = data.get("schema")
+    # Reseal is the one path that may read the outgoing schema, because reading
+    # it is how the file gets migrated. `check` stays strict so a stale file can
+    # never be mistaken for a current seal.
+    accepted = {SCHEMA, SCHEMA - 1} if legacy_ok else {SCHEMA}
+    if schema not in accepted:
         raise ValueError(f"budget schema must be {SCHEMA}")
     surfaces = data.get("surfaces")
     if not isinstance(surfaces, dict):
@@ -218,26 +261,33 @@ def reseal(root: Path, budget_path: Path, *, reason: str | None, commit: str | N
         try:
             # A lowered code ceiling leaves a stale echo behind; reseal is the
             # one path that rewrites it, so it must not refuse on that alone.
-            previous = load_budget(budget_path, strict_ceiling=False)
+            previous = load_budget(budget_path, strict_ceiling=False, legacy_ok=True)
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             return [f"budget-unreadable {budget_path}: {exc}"]
     old_surfaces = previous.get("surfaces", {})
-    total = sum(cur["bytes"] for cur in current.values() if cur)
+    caps = {rel: with_headroom(current[rel]) for rel in SURFACES}  # type: ignore[arg-type]
+    total = sum(cap["bytes"] for cap in caps.values())
     if total > TOTAL_BYTE_CEILING:
         return [f"over-ceiling {total} > {TOTAL_BYTE_CEILING}: cannot seal a surface above the code ceiling"]
 
     raises: list[dict] = []
+    old_measured = previous.get("measured", {})
     for rel in SURFACES:
         cur = current[rel]
-        old = old_surfaces.get(rel)
+        # Schema 1 sealed caps at the measurement, so its caps are its
+        # measurements; schema 2 records them separately.
+        old = old_measured.get(rel) or old_surfaces.get(rel)
         if old is None:
             continue
         for key in ("bytes", "directives"):
             if cur[key] > old[key]:
                 raises.append({"surface": rel, "field": key, "from": old[key], "to": cur[key]})
-    old_total = previous.get("total_bytes")
-    if isinstance(old_total, int) and total > old_total:
-        raises.append({"surface": "*", "field": "total_bytes", "from": old_total, "to": total})
+    measured_total = sum(cur["bytes"] for cur in current.values() if cur)
+    old_total = previous.get("measured_total_bytes")
+    if not isinstance(old_total, int):
+        old_total = previous.get("total_bytes")
+    if isinstance(old_total, int) and measured_total > old_total:
+        raises.append({"surface": "*", "field": "total_bytes", "from": old_total, "to": measured_total})
     if raises and not reason:
         return [
             "raise-needs-reason " + ", ".join(f"{r['surface']}:{r['field']} {r['from']}->{r['to']}" for r in raises)
@@ -257,12 +307,22 @@ def reseal(root: Path, budget_path: Path, *, reason: str | None, commit: str | N
         "sealed_at": today,
         "sealed_commit": commit or previous.get("sealed_commit", "-"),
         "ceiling_bytes": TOTAL_BYTE_CEILING,
+        "headroom": {
+            "bytes": HEADROOM_BYTES,
+            "directives": HEADROOM_DIRECTIVES,
+            "directives_min": HEADROOM_DIRECTIVES_MIN,
+        },
         "total_bytes": total,
-        "surfaces": {rel: dict(current[rel]) for rel in SURFACES},  # type: ignore[arg-type]
+        "measured_total_bytes": measured_total,
+        "surfaces": caps,
+        "measured": {rel: dict(current[rel]) for rel in SURFACES},  # type: ignore[arg-type]
         "history": history,
     }
     budget_path.write_text(json.dumps(data, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
-    print(f"sealed surfaces={len(SURFACES)} total_bytes={total} raises={len(raises)} path={budget_path}")
+    print(
+        f"sealed surfaces={len(SURFACES)} measured={measured_total} "
+        f"caps={total} headroom={total - measured_total} raises={len(raises)} path={budget_path}"
+    )
     return []
 
 
