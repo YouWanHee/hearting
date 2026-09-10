@@ -5,7 +5,9 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from tools.fleet.herdr_projection import compose
@@ -273,6 +275,90 @@ class RuntimeProjectionTest(unittest.TestCase):
     def test_statusline_malformed_input_exits_zero(self):
         with tempfile.TemporaryDirectory() as td:
             self.assertEqual(subprocess.run([str(STATUSLINE)], input="{bad", text=True, capture_output=True, env={**os.environ, "AGENT_HOME": td}).returncode, 0)
+
+
+class PaneTitleLadderTest(unittest.TestCase):
+    """The pane header and the board must climb ONE ladder for the same session.
+
+    Measured 2026-09-10: four of six Claude panes had a badge and no title at all, while
+    the board named every one of them. The board's ladder is fresh sidecar → the
+    transcript's own ai-title → the runtime's session name; the pane header stopped at the
+    first rung, so any session whose title worker had failed (`summary_failures: 3` on two
+    of them) went anonymous in its pane.
+    """
+
+    SID = "11111111-2222-3333-4444-555555555555"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name) / "claude"
+        (self.home / "projects" / "-x-repo").mkdir(parents=True)
+        self.transcript = self.home / "projects" / "-x-repo" / (self.SID + ".jsonl")
+        # Real files, not a patched module: `herdr_projection` imports `fleet.titles`
+        # while this file imports `tools.fleet.titles`, and those are two module objects
+        # for one source file — patching one leaves the other untouched.
+        self._patch = unittest.mock.patch.dict(
+            os.environ, {"CLAUDE_CONFIG_DIR": str(self.home),
+                         "XDG_STATE_HOME": str(Path(self.tmp.name) / "state")})
+        self._patch.start()
+        self.addCleanup(self._patch.stop)
+
+    def _write_transcript(self, title):
+        self.transcript.write_text(
+            json.dumps({"type": "ai-title", "aiTitle": title}) + "\n", encoding="utf-8")
+
+    def _write_sidecar(self, title, age_sec=0):
+        from tools.fleet import titles
+        path = Path(titles.sidecar_path(self.SID, harness="claude"))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"title": title, "ts": time.time() - age_sec}),
+                        encoding="utf-8")
+
+    def _title(self):
+        from tools.fleet.herdr_projection import session_title
+        return session_title("claude", self.SID)
+
+    def test_the_transcript_title_is_used_when_the_sidecar_has_none(self):
+        # The real case: the title worker ran and failed, leaving `title: ""`.
+        self._write_sidecar("")
+        self._write_transcript("r1-model S8 재진입 버그 수정")
+        self.assertEqual(self._title(), "r1-model S8 재진입 버그 수정")
+
+    def test_a_fresh_sidecar_still_outranks_the_transcript(self):
+        # Order matters: the sidecar is the worker's considered summary, the ai-title is
+        # whatever the runtime named the session first.
+        self._write_transcript("older transcript title")
+        self._write_sidecar("v6 Command Model Release")
+        self.assertEqual(self._title(), "v6 Command Model Release")
+
+    def test_a_stale_sidecar_yields_to_the_transcript_but_beats_nothing(self):
+        # The board drops a sidecar this old; the header keeps it rather than going blank,
+        # but only once the rung the board WOULD have used has been tried.
+        self._write_sidecar("aged summary", age_sec=86400)
+        self._write_transcript("current transcript title")
+        self.assertEqual(self._title(), "current transcript title")
+        self.transcript.unlink()
+        self.assertEqual(self._title(), "aged summary")
+
+    def test_no_title_anywhere_is_empty_not_a_placeholder(self):
+        # A pane header saying "?" or repeating the folder is worse than one saying
+        # nothing — herdr already shows the folder beside it.
+        self.assertEqual(self._title(), "")
+
+    def test_the_locator_never_borrows_a_neighbour_transcript(self):
+        from tools.fleet.collectors.claude import ai_title_for_session
+        neighbour = self.home / "projects" / "-x-repo" / "99999999-0000-0000-0000-000000000000.jsonl"
+        neighbour.write_text(
+            json.dumps({"type": "ai-title", "aiTitle": "someone else's session"}) + "\n",
+            encoding="utf-8")
+        self.assertIsNone(ai_title_for_session(self.SID, home=str(self.home)))
+
+    def test_a_missing_id_or_home_is_none_not_a_crash(self):
+        from tools.fleet.collectors.claude import ai_title_for_session
+        for value in (None, "", 42):
+            with self.subTest(value=value):
+                self.assertIsNone(ai_title_for_session(value))
 
 
 if __name__ == "__main__":
