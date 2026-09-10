@@ -1,9 +1,10 @@
 {
- "schema": 2,
+ "schema": 3,
  "measurement": "UTF-8 bytes per surface; directives = matches of /\\b(?:must|never|always|shall|do not|don't)\\b|(?<![가-힣])반드시(?![가-힣])|(?<![가-힣])금지(?=[한된됨되함]|(?![가-힣]))|해야(?:만)? 한다/ (case-insensitive) outside fenced code blocks and inline code spans",
  "sealed_at": "2026-09-10",
  "sealed_commit": "e37d2304",
  "ceiling_bytes": 375000,
+ "ceiling_directives": 480,
  "headroom": {
   "bytes": 0.03,
   "directives": 0.03,
@@ -11,6 +12,8 @@
  },
  "total_bytes": 374415,
  "measured_total_bytes": 363505,
+ "total_directives": 468,
+ "measured_total_directives": 446,
  "surfaces": {
   "core/CORE.md": {
    "bytes": 26040,

@@ -220,6 +220,48 @@ class CheckTest(_FixtureMixin):
         self.assertEqual(rc, 1)
         self.assertIn("total-cap-exceeds-ceiling", out)
 
+    def test_the_rule_total_is_the_headline_and_it_bites(self) -> None:
+        # 2026-09-10: bytes were the proxy, rules are the thing. The rule
+        # total is reported first and enforced with the same three failure
+        # classes the byte total has.
+        rc, out = _run(root=self.tmp)
+        self.assertEqual(rc, 0)
+        rules = [line for line in out.splitlines() if line.startswith("total directives=")]
+        totals = [line for line in out.splitlines() if line.startswith("total ")]
+        self.assertEqual(len(rules), 1)
+        self.assertTrue(totals[0].startswith("total directives="), totals)
+
+        data = self._budget()
+        data["total_directives"] = data["measured_total_directives"] - 1
+        self._write_budget(data)
+        rc, out = _run(root=self.tmp)
+        self.assertEqual(rc, 1)
+        self.assertIn("over-total-directives", out)
+
+    def test_rule_caps_and_totals_cannot_pass_the_code_ceiling(self) -> None:
+        data = self._budget()
+        data["surfaces"]["core/OPERATIONS.md"]["directives"] = csb.TOTAL_DIRECTIVE_CEILING + 1
+        self._write_budget(data)
+        rc, out = _run(root=self.tmp)
+        self.assertEqual(rc, 1)
+        self.assertIn("directive-caps-exceed-ceiling", out)
+
+        data = self._budget()
+        data["total_directives"] = csb.TOTAL_DIRECTIVE_CEILING + 1
+        self._write_budget(data)
+        rc, out = _run(root=self.tmp)
+        self.assertEqual(rc, 1)
+        self.assertIn("directive-total-cap-exceeds-ceiling", out)
+
+    def test_a_forged_rule_ceiling_echo_is_refused(self) -> None:
+        data = self._budget()
+        data["ceiling_directives"] = 999_999_999
+        self._write_budget(data)
+        rc, out = _run(root=self.tmp)
+        self.assertEqual(rc, 1)
+        self.assertIn("budget-unreadable", out)
+        self.assertIn("ceiling_directives", out)
+
     def test_ceiling_echo_must_match_the_code_ceiling(self) -> None:
         # R2 minor 1: a forged ceiling_bytes echo used to pass unnoticed.
         data = self._budget()
@@ -282,7 +324,10 @@ class ResealTest(_FixtureMixin):
         self.assertEqual(entry["commit"], "abc123")
         self.assertEqual(entry["reason"], "reviewed: moved a rule in from OPERATIONS")
         fields = {(r["surface"], r["field"]) for r in entry["raised"]}
-        self.assertEqual(fields, {("core/CORE.md", "bytes"), ("core/CORE.md", "directives"), ("*", "total_bytes")})
+        self.assertEqual(fields, {
+            ("core/CORE.md", "bytes"), ("core/CORE.md", "directives"),
+            ("*", "total_bytes"), ("*", "total_directives"),
+        })
         rc, out = _run(root=self.tmp)
         self.assertEqual(rc, 0, out)
 
