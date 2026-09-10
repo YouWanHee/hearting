@@ -3787,7 +3787,7 @@ BYTE_BUDGET_EOF
 # anywhere without an equal cut fails here (diagnosis rrev_c5dd77e9 R2/R7).
 check_model_visible_surface_budget() {
   if [ ! -f tools/surface-budget.json ] \
-    || ! grep -Fq '"schema": 1' tools/surface-budget.json \
+    || ! grep -Fq '"schema": 2' tools/surface-budget.json \
     || ! grep -Fq 'TOTAL_BYTE_CEILING = ' tools/check-surface-budget.py; then
     fail_msg "model-visible surface budget: tools/surface-budget.json and the code ceiling must be versioned"
     return
