@@ -261,7 +261,9 @@ BUCKET_GROUP = {
 }
 MAX_DEPTH = 6
 MAX_FILES_PER_GROUP = 500
-NEWEST = 6
+# Slots in the entry list. One block per session rather than per prompt, so the
+# list can afford to name more than a per-turn injection could.
+NEWEST = 9
 MARKDOWN = {".md", ".markdown"}
 
 
@@ -371,19 +373,59 @@ def collect(budget: Budget) -> dict:
     return found
 
 
+def dedupe(files: list) -> list:
+    """Drop repeat projections of one artifact, newest path kept.
+
+    A producer cycle writes its artifact into the campaign tree and again under
+    `shared/<kind>/ref_*/revisions/rrev_*`, so the same document reaches this
+    list twice under two unrelated paths. Six slots spent on four documents is a
+    smaller list, not a fuller one. Name and byte size identify the pair without
+    opening either file, which the no-bodies-read bound requires; two genuinely
+    different files colliding on both costs one path in a presence list.
+    """
+    seen = set()
+    kept = []
+    for mtime, path in sorted(files, key=lambda item: item[0], reverse=True):
+        try:
+            key = (path.name, path.stat().st_size)
+        except OSError:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append((mtime, path))
+    return kept
+
+
+def entry_paths(found: dict) -> list:
+    """Fill the entry list a group at a time, newest first within each.
+
+    One global recency sort lets the busiest bucket take every slot: on the
+    store this was measured against, six slots went to research and analysis and
+    all 29 documents were invisible, which reads as "this project has no
+    documents". Round-robin gives every non-empty group a share and still hands
+    leftover slots back to whoever has more.
+    """
+    queues = {group: dedupe(files) for group, files in found.items() if files}
+    picked = []
+    while queues and len(picked) < NEWEST:
+        for group in list(queues):
+            if len(picked) >= NEWEST:
+                break
+            picked.append(queues[group].pop(0))
+            if not queues[group]:
+                del queues[group]
+    picked.sort(key=lambda item: item[0], reverse=True)
+    return [path for _, path in picked]
+
+
 def render(found: dict, budget: Budget) -> str:
-    counts = {}
-    newest = []
-    for group, files in found.items():
-        if files:
-            counts[group] = len(files)
-            newest.extend(files)
+    counts = {group: len(files) for group, files in found.items() if files}
     if not counts:
         return ""
 
-    newest.sort(key=lambda item: item[0], reverse=True)
     entry_lines = []
-    for _, path in newest[:NEWEST]:
+    for path in entry_paths(found):
         try:
             entry_lines.append("- " + str(path.relative_to(root)))
         except ValueError:

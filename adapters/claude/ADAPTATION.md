@@ -96,10 +96,11 @@ workers stay silent. Candidate relevance and full-record adoption remain model
 judgments.
 
 `SessionStart` runs the portable `local-evidence-inject.sh` presence probe for
-the session cwd: research/documents/analysis bucket counts plus at most six
-newest entry paths from the canonical artifact root (2,400-UTF-8-byte bound, no
-body reads, no prompt classifier, silent when the root holds no such artifacts,
-worker-exempt, fail-open). It realizes `roles/response-policy.md` "Local
+the session cwd: research/documents/analysis bucket counts plus at most nine
+newest entry paths from the canonical artifact root, taken a bucket at a time
+and at most once per artifact (2,400-UTF-8-byte bound, no body reads, no prompt
+classifier, silent when the root holds no such artifacts, worker-exempt,
+fail-open). It realizes `roles/response-policy.md` "Local
 evidence before recall" deterministically. It is registered matcher-less, so it
 fires for `startup`, `resume`, `clear`, and `compact` alike — the compaction
 case is why a per-prompt registration was defensible, and it is the one thing
