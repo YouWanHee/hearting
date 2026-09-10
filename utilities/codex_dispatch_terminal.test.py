@@ -90,6 +90,73 @@ class CodexDispatchTerminalTest(unittest.TestCase):
             include_failure_detail=detail,
         )
 
+    def test_a_review_artifact_that_declares_fail_contradicts_a_pass_envelope(self):
+        # P-4: the round that shipped as a pass. Envelope PASS, artifact body
+        # opening with `## 평결: FAIL`. The envelope keeps its authority (the
+        # verdict field is untouched) but the contradiction is named.
+        artifact = self.root / "phase_review.md"
+        artifact.write_text("## 평결: FAIL\n\nblocking: one\n", encoding="utf-8")
+        result = inspect_terminal_attempt(
+            self.write_log(verdict="PASS", blocker="none", artifact=str(artifact), sandbox=False),
+            worktree=self.worktree,
+            artifact_root_metadata=self.root,
+            worker_type="review",
+        )
+        self.assertEqual(result["verdict"], "PASS")
+        self.assertEqual(result["review_artifact_verdict"], "FAIL")
+        self.assertEqual(result["review_verdict_conflict"], "artifact-fail-envelope-pass")
+
+    def test_only_a_review_worker_and_only_the_harmful_direction_conflict(self):
+        fail_artifact = self.root / "review-fail.md"
+        fail_artifact.write_text("## 평결: FAIL\n", encoding="utf-8")
+        pass_artifact = self.root / "review-pass.md"
+        pass_artifact.write_text("## 평결: PASS\n", encoding="utf-8")
+        quiet_artifact = self.root / "review-quiet.md"
+        quiet_artifact.write_text("no verdict heading at all\n", encoding="utf-8")
+
+        # a non-review worker is not read for a verdict at all
+        stage = inspect_terminal_attempt(
+            self.write_log(verdict="PASS", blocker="none", artifact=str(fail_artifact), sandbox=False),
+            worktree=self.worktree, artifact_root_metadata=self.root, worker_type="stage")
+        self.assertNotIn("review_artifact_verdict", stage)
+        self.assertNotIn("review_verdict_conflict", stage)
+
+        # an artifact that declares nothing changes nothing
+        quiet = inspect_terminal_attempt(
+            self.write_log(verdict="PASS", blocker="none", artifact=str(quiet_artifact), sandbox=False),
+            worktree=self.worktree, artifact_root_metadata=self.root, worker_type="review")
+        self.assertEqual(quiet["review_artifact_verdict"], "unstated")
+        self.assertNotIn("review_verdict_conflict", quiet)
+
+        # agreement is not a conflict
+        agreed = inspect_terminal_attempt(
+            self.write_log(verdict="PASS", blocker="none", artifact=str(pass_artifact), sandbox=False),
+            worktree=self.worktree, artifact_root_metadata=self.root, worker_type="review")
+        self.assertNotIn("review_verdict_conflict", agreed)
+
+        # a FAIL envelope over a PASS artifact already blocks on its own
+        blocking = inspect_terminal_attempt(
+            self.write_log(verdict="FAIL", blocker="one", artifact=str(pass_artifact), sandbox=False),
+            worktree=self.worktree, artifact_root_metadata=self.root, worker_type="review")
+        self.assertEqual(blocking["failure_note"], terminal.REVIEW_BLOCKING_NOTE)
+        self.assertNotIn("review_verdict_conflict", blocking)
+
+    def test_the_declared_verdict_reads_one_heading_not_review_prose(self):
+        artifact = self.root / "prose.md"
+        # a bare line, an inline mention, and a verdict word far past the head
+        # must all read as `unstated`: this is a declared field, not a scan.
+        artifact.write_text(
+            "평결: FAIL\n\nthe reviewer wrote verdict FAIL in a sentence\n"
+            + ("filler line\n" * 500)
+            + "## 평결: FAIL\n",
+            encoding="utf-8")
+        self.assertEqual(terminal.artifact_declared_verdict(artifact), "unstated")
+        heading = self.root / "heading.md"
+        heading.write_text("# 평결 : **BLOCKED**\nrest\n", encoding="utf-8")
+        self.assertEqual(terminal.artifact_declared_verdict(heading), "BLOCKED")
+        missing = self.root / "nope.md"
+        self.assertEqual(terminal.artifact_declared_verdict(missing / "deeper"), "unreadable")
+
     def test_compatibility_failure_notes_remain_stable(self):
         blocked = inspect_terminal_log(self.write_log())
         generic = inspect_terminal_log(self.write_log(sandbox=False))

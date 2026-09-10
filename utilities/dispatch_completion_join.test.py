@@ -3203,5 +3203,60 @@ class HyphenModuleNoDataclassInvariantTest(unittest.TestCase):
         self.assertEqual(offenders, [], offenders)
 
 
+class RouteCompletionEvidenceReviewConflictTest(unittest.TestCase):
+    """P-4: contradictory review evidence never completes a route node."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.base = Path(temp.name)
+        self.worktree = self.base / "repo"
+        self.worktree.mkdir()
+        subprocess.run(["git", "init", "-q", str(self.worktree)], check=True)
+        self.root = self.base / ".agent_reports"
+        self.root.mkdir()
+        env = mock.patch.dict(os.environ, {"AGENT_ARTIFACT_ROOT": str(self.root)})
+        env.start()
+        self.addCleanup(env.stop)
+        self.artifact = self.root / "phase_review.md"
+
+    def metadata(self, *, worker_type):
+        log = self.base / f"attempt-{worker_type}.jsonl"
+        rows = [
+            {"type": "turn.started"},
+            {"type": "item.completed", "item": {
+                "type": "agent_message",
+                "text": f"artifact: {self.artifact}\nverdict: PASS\nblocker: none",
+            }},
+            {"type": "turn.completed"},
+        ]
+        log.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+        return {
+            "log_file": str(log),
+            "artifact_root": str(self.root),
+            "worker_type": worker_type,
+        }
+
+    def test_a_pass_envelope_over_a_fail_artifact_cannot_complete_the_node(self):
+        self.artifact.write_text("## 평결: FAIL\n\nblocking: one\n", encoding="utf-8")
+        artifact, reason = JOIN.route_completion_evidence(
+            self.metadata(worker_type="review"), worktree=str(self.worktree))
+        self.assertIsNone(artifact)
+        self.assertEqual(
+            reason, "evidence-review-verdict-conflict:artifact-fail-envelope-pass")
+
+    def test_agreement_and_non_review_workers_are_untouched(self):
+        self.artifact.write_text("## 평결: PASS\n", encoding="utf-8")
+        agreed, reason = JOIN.route_completion_evidence(
+            self.metadata(worker_type="review"), worktree=str(self.worktree))
+        self.assertEqual((agreed, reason), (str(self.artifact), ""))
+        # the same contradiction on a stage worker stays evidence: the check is
+        # about a review's own stated verdict, not about artifact bodies at large
+        self.artifact.write_text("## 평결: FAIL\n", encoding="utf-8")
+        stage, stage_reason = JOIN.route_completion_evidence(
+            self.metadata(worker_type="stage"), worktree=str(self.worktree))
+        self.assertEqual((stage, stage_reason), (str(self.artifact), ""))
+
+
 if __name__ == "__main__":
     unittest.main()

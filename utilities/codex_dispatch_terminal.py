@@ -654,6 +654,17 @@ def inspect_terminal_attempt(
     if review_blocking_handoff(parsed, worker_type):
         parsed["failure_note"] = REVIEW_BLOCKING_NOTE
 
+    if (
+        worker_type == REVIEW_WORKER_TYPE
+        and parsed.get("artifact_state") == "readable"
+        and parsed.get("artifact_shape") == "file"
+    ):
+        declared = artifact_declared_verdict(artifact_path)
+        parsed["review_artifact_verdict"] = declared
+        conflict = review_artifact_conflict(str(parsed.get("verdict")), declared)
+        if conflict:
+            parsed["review_verdict_conflict"] = conflict
+
     if include_failure_detail and parsed["verdict"] in {"FAIL", "BLOCKED"}:
         blocker = str(parsed.get("blocker", ""))
         if blocker != "none":
@@ -670,6 +681,51 @@ def inspect_terminal_attempt(
     for key in ("artifact", "blocker", "diagnostic"):
         parsed.pop(key, None)
     return parsed
+
+
+# P-4 (2026-09-10, top-tier review round 2 att-0be411a9): a review closed
+# `verdict: PASS` in its terminal envelope while its own artifact opened with
+# `## 평결: FAIL`, and the owner was told the round passed. The envelope stays
+# authoritative -- §5.10 forbids manufacturing a verdict out of artifacts --
+# so this reads ONE defined field and only ever *names* the contradiction.
+# Deliberately narrow:
+#   * review workers only, and only an artifact that is a single file;
+#   * only the opening heading, inside the first 4KB, matched by an anchored
+#     pattern -- this is a declared field, not a scan of review prose
+#     (prose scanning is how the Bash-text hook kept losing);
+#   * an artifact that declares nothing reports `unstated` and changes
+#     nothing, so reviews that never adopted the heading are unaffected;
+#   * only the harmful direction is a conflict (a PASS envelope over a
+#     FAIL/BLOCKED artifact). FAIL over PASS already blocks on its own.
+_ARTIFACT_VERDICT_RE = re.compile(
+    r"^[ \t]{0,3}#{1,6}[ \t]*(?:평결|verdict)[ \t]*[:\uff1a][ \t]*\**[ \t]*(PASS|FAIL|BLOCKED)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+_ARTIFACT_VERDICT_HEAD_BYTES = 4096
+
+
+def artifact_declared_verdict(path: Path) -> str:
+    """The verdict a review artifact declares in its own opening heading.
+
+    Returns `PASS`/`FAIL`/`BLOCKED`, `unstated` when the artifact declares no
+    such heading, or `unreadable` when the head cannot be read.
+    """
+
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            head = handle.read(_ARTIFACT_VERDICT_HEAD_BYTES)
+    except OSError:
+        return "unreadable"
+    match = _ARTIFACT_VERDICT_RE.search(head)
+    return match.group(1).upper() if match else "unstated"
+
+
+def review_artifact_conflict(envelope_verdict: str, declared: str) -> str:
+    """`artifact-<v>-envelope-pass` when a PASS envelope contradicts its artifact."""
+
+    if envelope_verdict == "PASS" and declared in {"FAIL", "BLOCKED"}:
+        return f"artifact-{declared.lower()}-envelope-pass"
+    return ""
 
 
 def review_blocking_handoff(
