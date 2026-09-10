@@ -10,8 +10,11 @@ pane header, where the shape is ours to fix (user 2026-09-09: "그 바깥에 장
     [3a] claude   통신 표시 일관성 수정
     [b0] claude ⚑ 하팅 감독 — 네 세션 관리
 
-as `display_agent` = ``[<tag>] <harness>[ ⚑]`` and `title` = the summary Fleet's title
-worker already produced. Nothing here generates a summary; it only projects one.
+Both halves go into `title`, because that is the only field herdr paints above the pane:
+`display_agent` is reported too and herdr stores it, but a pane whose `display_agent` said
+``[6b] claude`` for hours still showed no identity until `title` was filled (measured
+2026-09-10 — the user watched that A/B and said "제목은 뜨는데 id는 여전히 안뜨는데. 그게
+중요한건데"). Nothing here generates a summary; it only projects one.
 
 Display-only and fail-soft throughout: no herdr, no pane, no title, or a slow formatter
 all mean "report less", never an error. Registered workers project nothing at all — the
@@ -30,8 +33,9 @@ _TOOLS = str(Path(__file__).resolve().parents[1])
 if _TOOLS not in sys.path:
     sys.path.insert(0, _TOOLS)
 
-from fleet.session_handle import (clip_cells, resolve_display_inputs,  # noqa: E402
-                                  resolve_tag, sanitize_title)
+from fleet.session_handle import (_cell_width, clip_cells,  # noqa: E402
+                                  resolve_display_inputs, resolve_tag,
+                                  sanitize_title)
 
 HARNESSES = ("claude", "codex", "opencode")
 _AGENT_W = 24            # herdr's display_agent budget
@@ -158,6 +162,36 @@ def compose(harness: str, session_id: str, *, tag=None, steward=None, title=None
     return clip_cells(agent, _AGENT_W), clip_cells(sanitize_title(title), _TITLE_W)
 
 
+_HEADER_W = 72           # herdr paints one string above the pane; give the summary room
+
+
+def header_title(agent: str, title: str) -> str:
+    """`[6b] claude ⚑ 요약` — the ONE string herdr actually paints above the pane.
+
+    `display_agent` is reported as well, but herdr does not paint it on the pane header.
+    Measured 2026-09-10: four panes carried `[6b] claude` in `display_agent` for hours
+    while their headers showed no identity at all, and a header only started saying
+    something once `title` was filled — the user watched exactly that A/B happen and
+    reported "제목은 뜨는데 id는 여전히 안뜨는데. 그게 중요한건데".
+
+    So the requested format — number, harness, steward mark, then the summary
+    (user 2026-09-09: "세션 번호를 herdr의 pane 상단 제목에 뜨게끔 하자 요약과 더불어서",
+    "맨 앞에 harness 이름은 뜨게끔") — is joined here, into the field that reaches the
+    header. The badge comes first and is never the part that gets clipped: a summary
+    truncated by a few characters still reads, an identity truncated does not.
+    """
+    agent = sanitize_title(agent)
+    title = sanitize_title(title)
+    if not agent:
+        return clip_cells(title, _HEADER_W)
+    if not title:
+        return clip_cells(agent, _HEADER_W)
+    room = _HEADER_W - _cell_width(agent) - 1
+    if room <= 0:
+        return clip_cells(agent, _HEADER_W)
+    return agent + " " + clip_cells(title, room)
+
+
 def _formatter_path() -> Path:
     override = os.environ.get("HERDR_SESSION_METADATA_FORMATTER")
     if override:
@@ -208,10 +242,13 @@ def project(harness: str, session_id: str, *, pane_id=None, worker=None,
     if report_session:
         commands.append([herdr, "pane", "report-agent-session", pane, "--source", source,
                          "--agent", harness, "--agent-session-id", session_id])
+    # Both fields go in the SAME report: herdr's metadata record is per-source and a
+    # report replaces it whole, so sending one alone clears the other (measured).
     metadata = [herdr, "pane", "report-metadata", pane, "--source", source,
                 "--display-agent", agent]
-    if shown_title:
-        metadata += ["--title", shown_title]
+    header = header_title(agent, shown_title)
+    if header:
+        metadata += ["--title", header]
     commands.append(metadata)
     for command in commands:
         try:
