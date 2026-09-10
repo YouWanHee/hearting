@@ -19,7 +19,7 @@ MISSING = object()
 
 class StrictDistillOutputTest(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="apply-distill-strict-", dir="/var/tmp")
+        self.temp = tempfile.TemporaryDirectory(prefix="apply-distill-strict-")
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.workspace = self.root / "workspace"

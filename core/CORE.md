@@ -14,7 +14,7 @@
 
 ## 2. Agent Home
 
-The canonical neutral name for the installed harness root is:
+Installed harness root:
 
 ```text
 <agent-home>
@@ -42,11 +42,10 @@ $HOME/.claude/              # Claude Code runtime home, mostly runtime-owned
 $HOME/.codex/               # Codex runtime home, mostly runtime-owned
 ```
 
-General-user installation uses a checksum-verified managed release. Maintainer
-development uses a linked checkout. Release updates stage and validate a new
-root before switching `current`; they must not fetch, pull, or rewrite a linked
-checkout. Runtime activation remains local after the release has been
-downloaded, and session reload or restart boundaries remain runtime-specific.
+Users install checksum-verified managed releases; maintainers develop linked
+checkouts. Updates validate a staged root before switching `current` and must
+not fetch/pull/rewrite linked checkouts. Activation is local after download;
+reload/restart boundaries remain runtime-specific.
 
 Runtime homes should be adapter projections, not the source repository. Keep credentials, sessions, logs, SQLite state, caches, and other runtime-owned files in the runtime home. Expose the harness into each runtime home with symlinks or adapter-owned bootstrap files.
 
@@ -58,49 +57,36 @@ does not match the sealed release identity. Launch mismatch diagnostics must
 name the expected root and how to invoke its tooling; never relax the identity
 check to accept a projection tree.
 
-Portable model profiles belong to core, while each adapter owns its shipped
-concrete model mapping. Installation seeds that mapping once as
-`<runtime-home>/agent-config/models.conf`. The seeded file is user-owned: it is
-never symlinked, refreshed, reapplied, or removed by a harness update or
-uninstall. Runtime consumers select a valid, complete user file as one unit and
-otherwise fall back to the shipped adapter default as one unit; they never merge
-the two. INST-D-20 permits one narrow, memory-only normalization: when only
-the new balanced profile and its optional granularity are absent, retain the
-entire selected user file and derive balanced from that user's light operating
-point (high effort on supported adapters; the complete existing light budget
-on a reduced-granularity adapter). Explicit balanced wins. Missing any other
-required key retains whole-file fallback. No loader or installer writes this
-normalization back, including on install/update/reapply/uninstall. The same
-rule derives a missing balanced dispatch policy from the user's entire light
-policy without enabling any disabled vendor.
-Native runtime settings and adapter fragments remain outside
-`agent-config`.
+Core owns portable profiles; adapters own concrete mappings, seeded once to
+`<runtime-home>/agent-config/models.conf`. This user-owned file is never
+symlinked, refreshed, reapplied or removed by update/uninstall. Consumers select
+one valid complete user file, otherwise one shipped default, without merging.
+INST-D-20 allows only in-memory derivation when balanced and its optional
+granularity alone are absent: retain the whole user file, derive from its light
+point (high effort where supported; the complete light budget on reduced-
+granularity adapters). Explicit balanced wins; other missing required keys cause
+whole-file fallback. Loaders/installers never write normalization back, including
+install/update/reapply/uninstall. Missing balanced dispatch policy derives from
+the entire user light policy without enabling disabled vendors. Native settings
+and adapter fragments stay outside `agent-config`.
 
-A harness-created derived execution home (for example a nested dispatch-owned
-runtime home) may receive a regular snapshot of its parent's whole effective
-configuration before projection, so a recursive dispatch does not silently
-fall back to the shipped default. User-runtime seed-once semantics above are
-unchanged for every other case. A derived snapshot is tracked by an explicit
-parent/destination/exact-content provenance receipt, never merged or
-symlinked into place. Updating an owned snapshot requires matching ownership
-plus hash/CAS evidence; an unmarked, foreign, or user-modified destination is
-preserved as a typed conflict, never overwritten -- byte equality with the
-shipped default proves no ownership by itself. A full preparation (snapshot
-decision, installer, and native rendering) is one serialized transaction per
-destination; snapshot ownership and successful projection are separate facts,
-and a failure leaves a truthful incomplete/conflict state rather than a false
-complete claim. Legacy adoption of an unmarked derived home is explicit,
-backed up, hash-pinned, and permitted only with proved target quiescence;
-missing quiescence evidence refuses, and ordinary setup never adopts a derived
-home implicitly. Quiescence evidence names its runtime-process ownership and
-observer scope; missing evidence for a relevant process refuses recovery. It
-does not claim control over privileged operating-system administrators.
+Harness-created derived execution homes (e.g. nested dispatch homes) may snapshot
+the parent's whole effective config before projection to avoid shipped-default
+fallback; other homes retain seed-once behavior. Snapshots are regular files with
+parent/destination/exact-content provenance, never merges or symlinks. Updates
+require ownership and hash/CAS proof. Preserve unmarked, foreign or user-modified
+destinations as typed conflicts; shipped-byte equality proves no ownership.
+Snapshot decision, installer and native rendering form one serialized transaction
+per destination. Ownership and successful projection are separate facts; failures
+retain incomplete/conflict status. Legacy unmarked-home adoption requires explicit authorization, backup, pinned
+hash and proved target quiescence; ordinary setup cannot adopt.
+Quiescence names runtime-process ownership and observer scope; missing relevant
+process evidence refuses recovery, without claiming control over privileged OS
+administrators.
 
-Project-independent global runtime state (the dispatch attempt registry and
-similar cross-project bookkeeping) lives under `<agent-home>/.dispatch/` or an
-XDG state directory, never inside a project artifact root — this is the
-existing convention (see `core/OPERATIONS.md` §5.10/§5.12), restated here as
-policy rather than changed.
+Global cross-project runtime state (dispatch registry and similar bookkeeping)
+stays under `<agent-home>/.dispatch/` or XDG state, never project artifacts
+(`core/OPERATIONS.md` §5.10/§5.12; existing policy).
 
 Projection example:
 
@@ -118,7 +104,7 @@ unless it is intentionally describing a specific adapter runtime home.
 
 ## 3. Artifact Root
 
-The canonical project artifact directory is:
+Canonical project artifacts:
 
 ```text
 .agent_reports/
@@ -148,10 +134,8 @@ directory may appear there as a Git snapshot, but it is read-only shadow state
 and must never receive agent output. Dispatch adapters pass the canonical root
 to workers and grant only the runtime-specific access needed for that path.
 
-The artifact root's top-level population is closed. Every top-level name is one
-of the following, and its disposition class states how the harness treats it.
-Declaring a name here is classification only: it never assigns a new owner and
-never orders a move or a delete.
+The following closed top-level population assigns disposition only, never
+ownership, moves or deletion.
 
 | Folder | Meaning | Disposition class |
 |---|---|---|
@@ -268,25 +252,25 @@ absolute bundle path. `bundle_id` is the reproducible `project/experiment`.
 
 ## 3.2. Agent Notes And Worklog Board
 
-The canonical neutral name for the cross-project continuity board data root is:
+Cross-project continuity board data root:
 
 ```text
 <agent-notes-root>
 ```
 
-It is not the project artifact root and not the unified memory store. It is a
-mutable operator-facing state layer used to carry agent work across projects and
-sessions:
+This mutable operator board carries work across projects/sessions, separately
+from project artifacts and unified memory. Never commit its contents to the
+harness repo; the final row permits an intentional separate notes-repo mirror.
 
-| Folder | Meaning | Commit policy |
-|---|---|---|
-| `cards/` | Layer 1 user-owned task/project cards | user data; never commit to the harness repo |
-| `_layer2/` | Layer 2 agent-owned notes, catalogs, and source-to-card routing rows | mutable board data; never commit to the harness repo |
-| `_triage/` | retired review queue (read-only history) | runtime history; never commit to the harness repo |
-| `_feedback/`, `_change_review/` | feedback and change-review queues | runtime/user state; never commit to the harness repo |
-| `digests/`, `oncall/`, `study/`, `manual/` | daily summaries, operator reports, study proposals, and board manual content | state/docs for the notes root; never commit to the harness repo unless intentionally mirrored in a separate notes repo |
+| Folder | Meaning |
+|---|---|
+| `cards/` | Layer 1 user-owned task/project cards; user data |
+| `_layer2/` | Layer 2 agent-owned notes, catalogs, source-to-card routing; mutable board data |
+| `_triage/` | retired review queue; read-only runtime history |
+| `_feedback/`, `_change_review/` | feedback/change-review queues; runtime/user state |
+| `digests/`, `oncall/`, `study/`, `manual/` | daily summaries, operator reports, study proposals, board manual; state/docs may be intentionally mirrored in a separate notes repo |
 
-The neutral name for the UI/application that reads and updates this state is:
+Its reader/writer application:
 
 ```text
 <worklog-board-app>

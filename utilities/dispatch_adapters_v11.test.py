@@ -688,7 +688,7 @@ class AdapterV11Test(unittest.TestCase):
    spec=importlib.util.spec_from_file_location(f"{harness}_dispatch_next",ROOT/f"adapters/{harness}/bin/dispatch-headless.py")
    wrapper=importlib.util.module_from_spec(spec); spec.loader.exec_module(wrapper)
    argv=["dispatch-headless.py",*command[2:]]
-   env={**os.environ,"PATH":str(fakebin)+os.pathsep+os.environ.get("PATH",""),
+   env={**self.child_env(root),"PATH":str(fakebin)+os.pathsep+os.environ.get("PATH",""),
         "AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(art),
         "AGENT_DISPATCH_JOBS":str(jobs),"AGENT_DISPATCH_CHILD":"1",
         "AGENT_DISPATCH_ATTEMPT_ID":"att-parent-fixture",

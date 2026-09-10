@@ -139,7 +139,7 @@ raise SystemExit(2)
 
 class StrictAdapterCallers(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="strict-adapter-callers-", dir="/var/tmp")
+        self.temp = tempfile.TemporaryDirectory(prefix="strict-adapter-callers-")
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
         self.fixture_counter = 0

@@ -758,7 +758,15 @@ class DispatchOwnerRewakeTest(unittest.TestCase):
         assert launch is not None
         self.assertEqual(launch.armed, "stdout")
         payload = self.payload()
-        with mock.patch.object(rewake.sys, "stdin", io.StringIO(json.dumps(payload))), (
+        # main() checks `readiness.is_file()` under agent_home() before ever
+        # calling the (here mocked) wait_for_attempt; under tools/run-tests.py
+        # isolation AGENT_HOME is unset, which would send this down the
+        # readiness-helper-missing bridge-error branch (exit 0) instead of the
+        # mocked ready/terminal-quiescent path this test actually exercises.
+        # This repo checkout is a real one that carries the helper.
+        agent_home = MODULE_PATH.parents[1]
+        with mock.patch.dict(os.environ, {"AGENT_HOME": str(agent_home)}, clear=False), \
+             mock.patch.object(rewake.sys, "stdin", io.StringIO(json.dumps(payload))), (
             mock.patch.object(rewake, "registry_launch")
         ) as fallback, mock.patch.object(
             rewake, "wait_for_attempt", return_value=("ready", "terminal-quiescent")
@@ -894,15 +902,49 @@ class RegistryConfirmArmTest(unittest.TestCase):
     def test_eight_processes_racing_for_one_attempt_produce_one_claim(self) -> None:
         # The flock is what makes arming exactly-once under parallel tool
         # calls; a sequential second claim cannot prove that (review R1 minor).
-        script = (
-            "import importlib.util, sys, pathlib;"
-            f"spec = importlib.util.spec_from_file_location('h', {str(MODULE_PATH)!r});"
-            "m = importlib.util.module_from_spec(spec); sys.modules['h'] = m; spec.loader.exec_module(m);"
-            f"r = m.claim_arm(pathlib.Path({str(self.jobs)!r}), 'att-owner-1', 'session-1', fresh=True);"
-            "print('won' if isinstance(r, m.ArmClaim) else r.reason)"
+        # A meaningful regression also needs every contender genuinely live
+        # and racing at once: a coordinated start (all 8 wait for a shared
+        # "go" marker) proves they actually overlap, and the winner must stay
+        # alive (a shared "done" count every racer, winner included, waits
+        # on) until every sibling has reported its own claim_arm() result --
+        # otherwise a late-starting loser would find the winner's short-lived
+        # process already exited and its flock released, and would legitimately
+        # reclaim the attempt as a second "won" (real dead-holder recovery,
+        # see test_a_dead_holder_is_reclaimed_but_an_alive_one_is_not, not a
+        # concurrency defect in claim_arm itself).
+        barrier = self.root / "barrier"
+        ready_dir, done_dir = barrier / "ready", barrier / "done"
+        ready_dir.mkdir(parents=True)
+        done_dir.mkdir(parents=True)
+        go = barrier / "go"
+        script_path = self.root / "racer.py"
+        script_path.write_text(
+            "import importlib.util, pathlib, sys, time\n"
+            f"spec = importlib.util.spec_from_file_location('h', {str(MODULE_PATH)!r})\n"
+            "m = importlib.util.module_from_spec(spec); sys.modules['h'] = m; spec.loader.exec_module(m)\n"
+            "idx = sys.argv[1]\n"
+            f"ready_dir = pathlib.Path({str(ready_dir)!r})\n"
+            f"done_dir = pathlib.Path({str(done_dir)!r})\n"
+            f"go = pathlib.Path({str(go)!r})\n"
+            "(ready_dir / idx).write_text('1')\n"
+            "deadline = time.monotonic() + 10\n"
+            "while not go.exists() and time.monotonic() < deadline: time.sleep(0.01)\n"
+            f"r = m.claim_arm(pathlib.Path({str(self.jobs)!r}), 'att-owner-1', 'session-1', fresh=True)\n"
+            "outcome = 'won' if isinstance(r, m.ArmClaim) else r.reason\n"
+            "print(outcome, flush=True)\n"
+            "(done_dir / idx).write_text('1')\n"
+            "deadline = time.monotonic() + 10\n"
+            "while len(list(done_dir.iterdir())) < 8 and time.monotonic() < deadline: time.sleep(0.01)\n"
         )
-        procs = [subprocess.Popen([sys.executable, "-c", script], stdout=subprocess.PIPE,
-                                  stderr=subprocess.STDOUT, text=True) for _ in range(8)]
+        procs = [
+            subprocess.Popen([sys.executable, str(script_path), str(i)],
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            for i in range(8)
+        ]
+        deadline = time.monotonic() + 10
+        while len(list(ready_dir.iterdir())) < 8 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        go.write_text("1")
         results = [p.communicate()[0].strip() for p in procs]
         self.assertEqual(results.count("won"), 1, results)
         self.assertEqual(set(results) - {"won"}, {"held-live"}, results)

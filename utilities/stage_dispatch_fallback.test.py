@@ -37,8 +37,8 @@ class FallbackTest(unittest.TestCase):
   claude_home=base/"claude-home"; models=claude_home/"agent-config/models.conf"
   models.parent.mkdir(parents=True)
   model_text=(ROOT/"adapters/claude/config/models.conf").read_text()
-  self.assertIn("CFG_MODEL_PROFILE_DEEP=model/fable:high",model_text)
-  models.write_text(model_text.replace("CFG_MODEL_PROFILE_DEEP=model/fable:high","CFG_MODEL_PROFILE_DEEP=deep:high"))
+  self.assertIn("CFG_MODEL_PROFILE_DEEP=deep:xhigh",model_text)
+  models.write_text(model_text.replace("CFG_MODEL_PROFILE_DEEP=deep:xhigh","CFG_MODEL_PROFILE_DEEP=deep:high"))
   model_env=mock.patch.dict(os.environ,{"CLAUDE_CONFIG_DIR":str(claude_home)})
   model_env.start();self.addCleanup(model_env.stop)
   self.owner=subprocess.Popen(["sleep","60"])

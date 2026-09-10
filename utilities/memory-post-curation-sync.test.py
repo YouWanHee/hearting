@@ -33,7 +33,7 @@ completion = module("memory_session_completion", ROOT / "utilities/memory_sessio
 
 class SyncTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="memory-post-sync-", dir="/var/tmp")
+        self.temp = tempfile.TemporaryDirectory(prefix="memory-post-sync-")
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
         self.project = self.base / "project"

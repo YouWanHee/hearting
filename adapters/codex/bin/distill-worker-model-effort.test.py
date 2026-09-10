@@ -26,9 +26,11 @@ import model_config  # noqa: E402
 
 class DistillWorkerModelEffortTest(unittest.TestCase):
     def setUp(self):
-        # /tmp can itself be a Git worktree. A real private root keeps the
-        # worker's normal Git-root discovery independent of that ambient state.
-        self.temp = tempfile.TemporaryDirectory(prefix="distill-effort-", dir="/var/tmp")
+        # The isolated runner's TMPDIR is already proven outside every Git
+        # worktree (tools/run-tests.py choose_suite_temp_parent); a redundant
+        # hardcoded parent here only breaks under isolation profiles where
+        # /var/tmp is read-only, without adding protection.
+        self.temp = tempfile.TemporaryDirectory(prefix="distill-effort-")
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
         self.base.chmod(0o700)

@@ -1,8 +1,9 @@
 # Autopilot-* Routing Map — Agent-Facing Core
 
-> A compact map for the main agent to route a task request to capabilities and roles. Each adapter maps them to its runtime-native skills, commands, agents, or profiles. Do not force symmetry; separate work according to its nature.
->
-> The root `README.md` owns the user-facing meaning map and entry list. `CONVENTIONS.md` owns QA, model, and folder definitions. This document contains routing tables only, avoiding duplicated narrative and invocation examples.
+> Main-agent capability/role router, projected by each adapter to native surfaces.
+> Do not force symmetry; route by work nature. Root `README.md` owns user-facing
+> meaning/entries; `CONVENTIONS.md` owns QA, models and folders. This document owns
+> routing, without duplicated prose/examples.
 
 ---
 
@@ -23,45 +24,33 @@ simple factual or explanatory answer that requests no new durable artifact, or
 an explicit conversational/no-files constraint.
 `direct` is an intensity inside the selected entry route, not a bypass around entry routing.
 
-Before material work or read-only context recovery proceeds, confirm that the
-current main-session prompt received its bounded capsule candidate probe. The
-probe searches mechanically but does not decide relevance; inspect a candidate's
-full record before applying it and ignore unrelated candidates. If the prompt
-hook is unavailable or failed, record `recall` with one focused query or `skip`
-with a short contextual reason through `mem recall-gate`. Neither path stores the
-raw prompt, classifies it, or prescribes topic categories. Registered route-bound
-workers do not run this main-session lifecycle and remain exempt from its receipt.
+Before material work or read-only context recovery, confirm main's current
+prompt received the capsule probe. Apply `MEMORY` §7.4–§7.5: agent relevance,
+full-record reads, unrelated-hit exclusion, and contextual `recall`/`skip`
+recovery for failed/missing hooks, without raw-prompt storage or classification.
+Registered route-bound workers remain lifecycle/receipt-exempt.
 
 ### 0.1. Read-Only Orientation Before Capability Routing
 
-Before selecting a capability or Skill, distinguish read-only orientation from
-work that creates or refreshes a persistent artifact. A request whose desired
-outcome is to understand the project, recover prior context, resume from the
-current state, or report status is orientation when it does not also ask for a
-new analysis or a modification. These examples describe intent; they are not a
-keyword classifier.
+Distinguish read-only orientation from creating/refreshing persistent artifacts.
+Understanding a project, recovering context, resuming current state or reporting
+status is orientation only without a request for new analysis or modification;
+these are intent examples, not keywords. Orientation invokes no capability and
+writes no artifact. Recover in order:
 
-Read-only orientation invokes no capability and writes no artifact. Recover
-context in this order:
-
-1. Record `recall` at the memory opportunity gate with one targeted query from
-   the task, then search before broad discovery. This is an agent judgment for
-   orientation, not a prompt-keyword classifier. A shortened, ellipsized, or
-   otherwise insufficient hit is only an index: read the full body by record ID
-   before using it as evidence. Record `applied` or `miss` against the gate id
-   after the evidence decision.
-2. Use the adapter status surface and `utilities/artifact-root.sh` to resolve
-   the project-wide canonical artifact root. In a linked worktree, ignore its
-   tracked artifact snapshot and read the primary worktree's canonical root.
-   Prefer canonical `.agent_reports/`; only when it is absent, use an existing
-   legacy `.claude_reports/`.
-3. Read existing state before a broad source census: the newest relevant
-   `pipeline_summary.md`, `pipeline_state.yaml`, `summary.md`, `REPORT.md`, or
-   `STORY.md`; the latest experiment contract and `experiments/_RUNLOG.md`;
-   and the current `spec/prd.md` or task-specific specification. Read only the
-   subset needed to orient, and follow any relevant pointers from memory.
-4. Inspect primary code, data, and raw logs only when recovered contracts leave
-   a material question unanswered or must be checked against live behavior.
+1. Record contextual `recall` with one targeted query at the memory gate and
+   search before broad discovery. Truncated/insufficient hits are indexes:
+   read full bodies by ID before use, then record `applied` or `miss` by gate ID.
+2. Resolve canonical artifacts through adapter status and
+   `utilities/artifact-root.sh`. Linked worktrees read the primary root, not
+   their tracked snapshot: `.agent_reports/`, or existing `.claude_reports/`
+   only when the former is absent.
+3. Before broad source census, read the relevant subset of newest
+   `pipeline_summary.md`, `pipeline_state.yaml`, `summary.md`, `REPORT.md`,
+   `STORY.md`, experiment contract/`experiments/_RUNLOG.md`, and current
+   `spec/prd.md` or task spec. Follow relevant memory pointers.
+4. Inspect primary code/data/raw logs when a material question remains or
+   recovered contracts need validation against live behavior.
 
 Resolve conflicts with this evidence precedence:
 
@@ -88,9 +77,9 @@ external research, implementation, and completed-artifact inspection retain
 their §0.2/work-nature primaries. When analysis already exists, read it before
 deciding that reanalysis is needed.
 
-This boundary was strengthened after a 2026-07-14 incident where a context
-recovery request in a spec-backed project was routed to `analyze-project` before
-its existing legacy artifact root and memory-linked artifacts were read.
+A 2026-07-14 context-recovery request wrongly entered `analyze-project` before
+reading its legacy artifact root and memory-linked artifacts; this boundary
+prevents that recurrence.
 
 **Hard artifact order:**
 
@@ -408,11 +397,9 @@ check. Any other successor receives the same recorded intent through its own
 normal handoff, not an invented plan node. An interview gate may be raised at
 most twice per route (`round` ≤ 2).
 
-Entry routers therefore have two deterministic load phases: manifest-owned
-metadata before approval, then the selected portable owner contract after
-approval. A router may expose one direct owner-reference index, but no
-pre-approval reference may contain execution procedure. The confirmation is
-one-time for an unchanged approved route and scope.
+The pre/post-approval load split above is deterministic. A router may expose one
+direct owner-reference index, with no execution procedure in pre-approval
+references. Unchanged approved route/scope needs no second confirmation.
 
 ### 0.5. Post-Execution Completion Report
 
@@ -469,14 +456,11 @@ the sealed output. Owner briefs must spell out this order; admission is not a
 prerequisite for the terminal marker. `--allow-open-route` is not a repair for an
 out-of-order completion sequence.
 
-`close` writes an outcome sidecar beside the immutable route record — the record
-itself cannot carry the closure, because `route_hash` covers every other field.
-`status --open-only` then answers "what was started and never finished" directly.
-An unclosed route is indistinguishable from abandoned work, and the same applies
-to the other things a finished attempt leaves behind: a merged worktree and
-branch, a spec `pipeline_state.yaml` still naming a live phase, and a memory
-handoff still `pending` after its obligation is met. Close what the attempt
-opened, or the next session pays for it in reconstruction.
+`close` writes an outcome sidecar: `route_hash` makes the route immutable.
+`status --open-only` exposes unfinished work. Close what this attempt opened:
+unclosed routes resemble abandonment, as do merged worktrees/branches, spec
+`pipeline_state.yaml` still in a live phase, and fulfilled handoffs left pending.
+Leaving them open forces the next session to reconstruct completion.
 
 ### 0.6. Tracked-Workflow Lifecycle and Continuation
 
@@ -710,19 +694,12 @@ These rules close three gaps: a broken trail caused by over-creating plans for q
 
 Every entry capability resolves through `capabilities/topologies.json`, the machine-readable execution-topology source. Intensity, topology class, worker kind, transport, DAG nodes, write scopes, promotion signals, and completion gates remain separate axes. `utilities/capability-route.py` compiles an immutable route bound to the registry digest, source commit, physical absolute working directory, artifact root, and transport evidence. Adapters may project compact summaries and pointers, but must not copy the graph into bootstrap or Skill metadata.
 
-The route compiler is **enforced** (promoted from report-only, 2026-07-22): every node
-references a unit in `roles/units/`, and routing happens at entry only — a
-dispatch-depth-2 worker never routes and never selects another worker. Enumerated
-recipes are curated fast paths, not the default. For a request no recipe fits, the
-entry composes its own route from the same catalog (**compose-on-demand**, §0.2.1):
-`capability-route.py compose` seals a `direct`, `solo`, or `staged` shape, and a staged
-`--graph` is the session's own subgraph of the owning capability's stage nodes; the
-composed graph passes the same validator, is hash-sealed exactly like a recipe route,
-is marked `composed: true` with its recipe embedded, and is confirmed under §0.4 (a
-`[경로]` notice for small work, the card or the SD-123 pair otherwise). Until SD-135
-the composed path was `standard+`-only, every composed node was dispatch depth 2 with
-no source write, and the assembly helper was not recognized by the route-binding
-guard — 18 of 635 routes were composed and every one sat under a preset entry.
-Composition changes route *shape only* — it never bypasses the §0.1
-spec/artifact-order gates, never grants dispatch depth 3, and never substitutes for a
-capability's own completion gates.
+The compiler is **enforced** (formerly report-only, 2026-07-22): every node
+references `roles/units/`; routing occurs at entry only. A depth-2 worker never
+routes or selects another worker. Apply §0.2.1's compose-on-demand shape,
+validation and gate contract when no curated preset fits; confirm under §0.4
+(small-work notice, card or SD-123 pair). Before SD-135, composition was
+`standard+`-only, all composed nodes were depth 2 without source writes, and
+the binding guard did not recognize its helper: only 18/635 routes were composed,
+all under preset entries. Those historical limits are retired; composition
+retains §0.2.1's spec/artifact, depth and completion protections.

@@ -15,16 +15,11 @@ Three distinct roles keep this contract honest. Keep the vocabulary separate —
 | **conformance** | Deterministic *verification* that guards, hook bridges, and adapters honor this contract — exact assertions, no model. Covers the `test` status class plus cross-adapter parity. | No | `hooks/portable-guards.test.sh`, `tools/check-adaptation-boundary.sh` (+ per-adapter mirrors). |
 | **drill** | Behavioral *regression* — whether the agent follows the rules on a live scenario (golden set). Covers only what cannot be made deterministic. | Yes | `loops/drill/`. |
 
-Design bias (deterministic-first, §0.5): push a check *down* this table when you
-can — out of **drill** (agent behavior) into **guard** + **conformance**
-(mechanism + deterministic test). Reserve drill for residue that genuinely needs
-an agent in the loop. A hook's output shape is deterministic, so it belongs in
-conformance, never drill.
-
-The drill **runner** also invokes the conformance layer directly, as a separate
-deterministic pre-stage — not a drill case, no agent in loop — before it runs
-any behavioral case. This keeps conformance firing from depending solely on the
-preflight doctor path, without blurring the conformance/drill distinction above.
+Deterministic-first (§0.5): move checks from drill into guard + conformance
+where possible; drill retains only behavior needing an agent. Hook output
+shape belongs to conformance, never drill. The drill runner invokes conformance
+as a separate deterministic pre-stage before behavioral cases, independently
+of doctor, without treating it as an agent drill case.
 
 ## Status Classes
 
@@ -55,7 +50,7 @@ preflight doctor path, without blurring the conformance/drill distinction above.
 | memory candidate exposure and agent-owned adoption | `hooks/mem-recall-inject.sh`, `tools/memory/mem.py candidates`, `tools/memory/mem.py recall` | `portable-check` | Every eligible main prompt gets a fail-open, capsule-only lookup: active current-project/global rows, headline plus ID, maximum six and 2,400 UTF-8 bytes, no bodies or access touch. The model decides relevance and reads the full record before applying it. The bridge publishes a same-turn receipt; main-session material work fails closed when no successful probe or explicit recall-gate recovery occurred. Registered route-bound workers are exempt. | Register an adapter-native prompt bridge that supplies prompt, cwd, session, and native turn/message ID when available. Consume only the runtime's structured context field. Preserve the explicit `recall` helper for deeper search and hook-failure recovery. |
 | local evidence exposure | `hooks/local-evidence-inject.sh` | `portable-check` | Every eligible main prompt gets a fail-open presence probe of the cwd's canonical artifact root: research/documents/analysis bucket counts plus at most six newest entry paths, bounded to 2,400 UTF-8 bytes, no bodies read and no prompt classifier. Silent when the root holds no such artifacts; workers are exempt. Realizes `roles/response-policy.md` "Local evidence before recall": a domain question those artifacts cover starts from them, not from model recall. | Attach the probe to the runtime's prompt-submit surface (`--cwd <dir> --format text\|hook-json`), consume only the runtime's structured context field, and keep every failure as zero context. |
 | memory distillation trigger | `hooks/mem-turn-nudge.sh`, `hooks/mem-distill-dispatch.sh` | `adapter-coupled-automation` | On an interactive main session only, periodically distill session deltas into DB memory through a no-tools worker. `AGENT_SESSION_ROLE=worker` and adapter compatibility markers make both hooks silent no-ops before counters, locks, or model calls. The shared dispatcher uses `MEM_DISTILL_WORKER=<executable>` with `<mode> <model> <prompt-file>` arguments. | Provide session transcript source (`mem.py distill --source <adapter>`), detached worker invocation, no-tools/action contract, and the same main/worker gate before automatic memory mutation. Deterministic safety hooks remain active in workers. |
-| periodic curation trigger (opt-in, default off) | `utilities/mem-periodic-curate.sh` | `adapter-coupled-automation` | Optional nightly backstop for long-lived sessions where the SessionEnd curator cadence is too sparse. Gated on `MEM_PERIODIC_CURATE_ENABLE=1`; unset is a complete no-op, following the `MEM_DISTILL_ENABLE` precedent. A **single cron firing point** runs one `mem-distill-dispatch.sh periodic-curate <cwd>` per eligible project **sequentially**, sharing the ordinary D-41 slots and per-project locks — never a session-event fan-out, which is the structure behind the v18 216-worker incident. The rolling start budget does not apply to this mode (it guards concurrent hook fan-out; this loop is one bounded sequential caller, and the shared budget silently no-opped the batch tail in the 2026-08-13 field run). Projects are selected from the store DB — origins holding active records, soft-ceiling-exceeded first, then by active record count — not by directory listing, and `reattribute` is denied in this evidence-blind mode at both prompt and applier. The script refuses to run inside a worker, registered, or dispatch-child context (D-42), and `periodic-curate` mode does not advance distill markers. SessionEnd curate remains the backstop. Cron registration is documented, not installed, and the cron environment must supply what interactive settings normally provide — the dispatcher gate and a PATH holding the runtime CLI: `0 4 * * * MEM_PERIODIC_CURATE_ENABLE=1 MEM_DISTILL_ENABLE=1 PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin <agent-home>/utilities/mem-periodic-curate.sh >> <state-dir>/periodic-curate.log 2>&1`. | Provide an equivalent single-firing-point scheduler that runs project curation sequentially inside the shared bounded-worker controls, keeps the opt-in gate default-off, and preserves the main/worker boundary. |
+| periodic curation trigger (opt-in, default off) | `utilities/mem-periodic-curate.sh` | `adapter-coupled-automation` | Apply `core/MEMORY.md` §7.0's complete periodic-curation contract: default-off `MEM_PERIODIC_CURATE_ENABLE=1`, one sequential cron caller under D-41 slots/project locks/timeouts (rolling-start-budget exempt), DB eligibility/order, no `reattribute`, D-42 worker refusal, no marker advance, SessionEnd backstop. That section retains the v18 fan-out and 2026-08-13 batch-tail diagnoses. Cron is documented, not installed; supply the dispatcher gate and CLI PATH normally provided by interactive settings: `0 4 * * * MEM_PERIODIC_CURATE_ENABLE=1 MEM_DISTILL_ENABLE=1 PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin <agent-home>/utilities/mem-periodic-curate.sh >> <state-dir>/periodic-curate.log 2>&1`. | Provide an equivalent single-firing scheduler preserving that sequential bounded-worker, opt-in and main/worker contract. |
 | oncall briefing injection | `hooks/mem-briefing-inject.sh` | `portable-check` | On the dedicated agent desk, inject daily oncall report once per day. | Run `hooks/mem-briefing-inject.sh --cwd <dir> [--format text]` before prompt handling, or attach it to a prompt-submit event. |
 | worklog state signal | `utilities/agent-worklog-state.sh` | `portable-check` | Surface configured `<agent-notes-root>` / `<worklog-board-app>` inventory without mutating data. | Run `utilities/agent-worklog-state.sh [cwd]` or an adapter wrapper before worklog-board or agent-notes work. |
 | runtime hook output protocol | adapter hook bridges | `adapter-payload-wrapper` | Hook stdout must match the owning runtime's hook protocol exactly. Context-injection hooks emit the runtime's structured context object; side-effect-only lifecycle hooks keep stdout empty unless that runtime explicitly accepts a structured success object. Portable helper text is never forwarded as raw hook stdout. | Each adapter must document its hook output contract, test the exact stdout shape for every native hook bridge, and route diagnostic/helper text to logs or stderr only when the runtime accepts it. |
@@ -114,14 +109,11 @@ Adapters may reuse scripts directly only when they can supply the expected input
 payload and consume the expected output decision. Otherwise, the invariant must
 be wrapped or reimplemented behind an adapter-native event bridge.
 
-Adapter hook bridges own the final runtime output protocol. A portable helper can
-print human-readable status for explicit CLI use, but a native runtime hook must
-not forward that text unless the runtime accepts it for that hook event. For
-example, a context hook may emit `hookSpecificOutput.additionalContext` when the
-runtime supports it, while a lifecycle side-effect hook such as a session-end
-sync may need to perform the mutation with empty stdout or a minimal structured
-success object so the runtime does not attempt to parse helper text as hook
-JSON.
+Apply the catalog's runtime hook output protocol to every bridge. For example,
+a supported context hook may emit `hookSpecificOutput.additionalContext`;
+a session-end sync may require empty stdout or a minimal structured success
+object so helper text is not parsed as hook JSON. Human-readable helper output
+remains available for explicit CLI use.
 
 Codex realizes approval waits through its native `PermissionRequest` bridge and
 clears them after native `PostToolUse` or a turn/session backstop. Its decision
