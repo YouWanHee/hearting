@@ -1645,6 +1645,14 @@ def _collapse_parallel_nodes(nodes):
         rounds = [m.get("attempt_round") for m in members
                   if isinstance(m.get("attempt_round"), int)
                   and not isinstance(m.get("attempt_round"), bool)]
+        route_rounds = [m.get("route_attempt_round") for m in members
+                        if isinstance(m.get("route_attempt_round"), int)
+                        and not isinstance(m.get("route_attempt_round"), bool)]
+        revision = next((m.get("revision_of") for m in members
+                         if m.get("id") == gid and m.get("revision_of") is not None), None)
+        if revision is None:
+            revision = next((m.get("revision_of") for m in members
+                             if m.get("revision_of") is not None), None)
         merged = dict(members[0])
         # ``gate_passed`` is the single completion carrier for registered,
         # native, and inline attempts alike.  It is resolved from the exact
@@ -1661,6 +1669,8 @@ def _collapse_parallel_nodes(nodes):
             "elapsed_min": max(elapsed) if elapsed else None,
             "gate_passed": True if all(member_gates) else None,
             "attempt_round": max(rounds) if rounds else None,
+            "route_attempt_round": max(route_rounds) if route_rounds else None,
+            "revision_of": revision,
             "round_node_id": gid,
             "parallel_width": len(members),
         })
@@ -5028,7 +5038,8 @@ def _route_card_l2(view, max_width=None):
             current = []
             used = 0
 
-        for text, key, mark in flow_nodes:
+        from . import route
+        for node, text, key, mark in flow_nodes:
             separator = ("› " if relation_before else "") if not current else " › "
             node_width = _dw(separator) + _dw(text) + _dw(mark)
             if current and max_width is not None and used + node_width > max_width:
@@ -5044,6 +5055,13 @@ def _route_card_l2(view, max_width=None):
                 _append_segment(current, text, key)
                 _append_segment(current, mark, "gate_t")
                 used += node_width
+                evidence = route.revision_evidence_text(node)
+                evidence_segment = "  " + evidence if evidence else None
+                if (evidence_segment
+                        and (max_width is None
+                             or used + _dw(evidence_segment) <= max_width)):
+                    _append_segment(current, evidence_segment, "dim")
+                    used += _dw(evidence_segment)
             relation_before = True
         flush_current()
         flow_nodes.clear()
@@ -5051,15 +5069,24 @@ def _route_card_l2(view, max_width=None):
     need_prefix = False
     for level in ordered:
         if len(level) == 1:
-            flow_nodes.append(_route_node_text(level[0]))
+            flow_nodes.append((level[0], *_route_node_text(level[0])))
             continue
         flush_flow(need_prefix)
         need_prefix = False
         for index, node in enumerate(level):
             branch = "└" if index == len(level) - 1 else "├"
             text, key, mark = _route_node_text(node)
-            out_lines.extend(_wrap_route_node(
-                "  " + branch + " ", text, key, mark, max_width, continuation="    "))
+            rows = _wrap_route_node(
+                "  " + branch + " ", text, key, mark, max_width, continuation="    ")
+            from . import route
+            evidence = route.revision_evidence_text(node)
+            evidence_segment = "  " + evidence if evidence else None
+            if (rows and evidence_segment
+                    and (max_width is None
+                         or sum(_dw(token) for token, _kind in rows[-1])
+                         + _dw(evidence_segment) <= max_width)):
+                _append_segment(rows[-1], evidence_segment, "dim")
+            out_lines.extend(rows)
         need_prefix = True
     flush_flow(need_prefix)
     return out_lines
