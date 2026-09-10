@@ -66,6 +66,32 @@ def _newest_transcript_path(home, cwd, sid):
     return best
 
 
+def ai_title_for_session(sid, home=None):
+    """The transcript's own `ai-title` for one session id, or ``None``.
+
+    The board's title ladder is: fresh sidecar → this → registry name → slug
+    (`enrich` steps 3a/3b). The herdr pane header used to stop at the sidecar, so a
+    session whose title worker had failed showed a full title on the board and NOTHING in
+    its pane — two ladders for one value (measured 2026-09-10: `[6b]`/`[15]` had
+    `summary_failures: 3` and an empty sidecar title while the board read their titles
+    straight out of the transcript). `_tail_ai_title` stays the one definition of what an
+    ai-title is; this only locates the file for a caller that has an id and no cwd.
+
+    Located by globbing `<sid>.jsonl` rather than deriving the project directory from a
+    cwd: the filename IS the session id, so there is nothing to guess and no neighbor
+    transcript to borrow by accident.
+    """
+    if not sid or not isinstance(sid, str):
+        return None
+    import glob as _glob
+    base = home or _home()
+    for path in _glob.glob(os.path.join(base, "projects", "*", sid + ".jsonl")):
+        title = _tail_ai_title(path)
+        if title:
+            return title
+    return None
+
+
 def _newest_transcript_mtime(home, cwd, sid):
     path = _newest_transcript_path(home, cwd, sid)
     return _mtime(path) if path else None

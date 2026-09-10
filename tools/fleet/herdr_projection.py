@@ -69,20 +69,43 @@ def _runtime_name(harness: str, session_id: str) -> str:
 
 
 def session_title(harness: str, session_id: str) -> str:
-    """The summary Fleet's own title worker already wrote — never a newly generated one.
+    """The summary Fleet already has — never a newly generated one.
 
-    Falls back to the runtime's own session name so a session whose sidecar has not been
-    written yet still says something; it never falls back to the folder name, which would
-    just repeat what herdr already shows beside the pane.
+    The board's ladder (`collectors/claude.enrich` steps 3a/3b) — fresh sidecar, then the
+    transcript's own ai-title — with a stale sidecar and the runtime's session name below
+    it so a header never goes blank where it used to say something. It used to stop at the
+    sidecar, so a session whose title worker had failed showed a full title on the board
+    and NOTHING in its pane header — measured 2026-09-10, four of six Claude panes were
+    anonymous while the board named every one of them. Two ladders for one value is how a
+    pane and a board start disagreeing about the same session.
+
+    It never falls back to the folder name, which would just repeat what herdr already
+    shows beside the pane. A registered dispatch session's attempt-sid sidecar (the
+    board's step 3a') is deliberately not consulted: a worker projects nothing at all —
+    the pane belongs to the interactive session.
     """
-    title = ""
+    stale = ""
     try:
-        from fleet.titles import read
-        title = sanitize_title((read(session_id, harness=harness) or {}).get("title"))
+        from fleet.titles import fresh_title, read
+        title = sanitize_title(fresh_title(session_id, harness=harness))
+        if title:
+            return title
+        stale = sanitize_title((read(session_id, harness=harness) or {}).get("title"))
     except Exception:
-        title = ""
-    if title:
-        return title
+        stale = ""
+    if harness == "claude":
+        try:
+            from fleet.collectors.claude import ai_title_for_session
+            title = sanitize_title(ai_title_for_session(session_id))
+        except Exception:
+            title = ""
+        if title:
+            return title
+    # A sidecar too old for the board is still this session's own considered summary, and
+    # a header that goes blank as a title ages is worse than one that keeps it. It sits
+    # BELOW the ai-title so the two surfaces agree wherever the board has anything at all.
+    if stale:
+        return stale
     # Only the runtime's OWN name is an acceptable stand-in. `display_name()` would fall
     # through to the folder — or to its literal "?" last resort — and a pane header saying
     # "?" is worse than one saying nothing.
