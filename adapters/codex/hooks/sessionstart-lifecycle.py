@@ -13,6 +13,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[3]
 PREFLIGHT = ROOT / "adapters" / "codex" / "bin" / "preflight.sh"
+LOCAL_EVIDENCE_HOOK = ROOT / "hooks" / "local-evidence-inject.sh"
 
 
 def first_string(mapping: dict[str, Any], *keys: str) -> str:
@@ -73,6 +74,28 @@ def run_preflight(*args: str) -> str:
     return result.stdout
 
 
+def local_evidence_context(current_cwd: str) -> str:
+    """Run the bounded local-evidence presence probe; every failure is zero context.
+
+    Session start rather than prompt submit: the block is byte-identical between
+    prompts, and this event also fires on resume/clear/compact, which is the only
+    thing a per-prompt repeat was buying. The probe holds its own wall-clock
+    budget, so this timeout is a backstop, not the fence.
+    """
+    command = [str(LOCAL_EVIDENCE_HOOK), "--cwd", current_cwd, "--format", "text"]
+    env = os.environ.copy()
+    env["AGENT_HOME"] = str(ROOT)
+    try:
+        result = subprocess.run(
+            command, cwd=str(ROOT), env=env, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=5, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return result.stdout if result.returncode == 0 else ""
+
+
 def env_truthy(name: str) -> bool:
     return os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
 
@@ -106,8 +129,10 @@ def main() -> int:
             pass
 
     parts = []
-    if not is_worker_session() and env_truthy("CODEX_SESSION_MEMORY_INJECT"):
-        parts.append(run_preflight("memory", current_cwd))
+    if not is_worker_session():
+        if env_truthy("CODEX_SESSION_MEMORY_INJECT"):
+            parts.append(run_preflight("memory", current_cwd))
+        parts.append(local_evidence_context(current_cwd))
     emit_context("SessionStart", parts)
     return 0
 

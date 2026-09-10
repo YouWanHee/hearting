@@ -1051,10 +1051,10 @@
       "hard_block": false
     },
     {
-      "slug": "hook__local-evidence-inject__UserPromptSubmit",
+      "slug": "hook__local-evidence-inject__SessionStart",
       "name": "local-evidence-inject",
       "mono": "local-evidence-inject",
-      "event": "UserPromptSubmit",
+      "event": "SessionStart",
       "hard_block": false
     },
     {

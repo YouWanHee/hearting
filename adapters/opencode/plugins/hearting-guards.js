@@ -31,10 +31,15 @@ const turnBySession = new Map()
 //   * memoryBySession — session memory briefing, computed once per session and
 //     re-emitted on every call so it persists the way Claude's SessionStart
 //     additionalContext does.
+//   * localEvidenceBySession — artifact-root presence probe, computed once per
+//     session for the same reason: the block is byte-identical between turns
+//     because only a newly written artifact changes it, so recomputing it per
+//     turn bought nothing and spent ~360 tokens a turn.
 //   * turnContextBySession — { turn, blocks } for the capsule candidate probe
 //     and the per-turn signals: recomputed when a new user turn arrives, then
 //     re-emitted on every model call of that turn.
 const memoryBySession = new Map()
+const localEvidenceBySession = new Map()
 const turnContextBySession = new Map()
 
 function baseDir(ctx) {
@@ -347,6 +352,7 @@ export const AgentHarnessGuards = async (ctx) => {
         promptBySession.delete(sid)
         turnBySession.delete(sid)
         memoryBySession.delete(sid)
+        localEvidenceBySession.delete(sid)
         turnContextBySession.delete(sid)
       }
     }
@@ -373,14 +379,19 @@ export const AgentHarnessGuards = async (ctx) => {
       return
     }
     // Every model call re-emits the same blocks. The probe/preflight work still
-    // runs once per session (memory) or once per user turn (candidates,
-    // prompt-signal, briefing) — only the emission repeats, so the caps in
-    // core/MEMORY.md are unchanged and no extra process is spawned per
+    // runs once per session (memory, local evidence) or once per user turn
+    // (candidates, prompt-signal, briefing) — only the emission repeats, so the
+    // caps in core/MEMORY.md are unchanged and no extra process is spawned per
     // tool-loop continuation.
     if (!memoryBySession.has(sid)) {
       memoryBySession.set(sid, collectPreflight("memory", [cwd]))
     }
     appendContext(output, memoryBySession.get(sid))
+
+    if (!localEvidenceBySession.has(sid)) {
+      localEvidenceBySession.set(sid, collectPreflight("local-evidence", [cwd]))
+    }
+    appendContext(output, localEvidenceBySession.get(sid))
 
     const prompt = promptBySession.get(sid) || ""
     const turn = turnBySession.get(sid) || ""
@@ -392,7 +403,6 @@ export const AgentHarnessGuards = async (ctx) => {
     if (prompt && (!cached || cached.turn !== turnKey)) {
       const blocks = [
         collectCandidates([prompt, cwd, sid, turn]),
-        collectPreflight("local-evidence", [cwd]),
         collectPreflight("prompt-signal", [cwd, sid]),
         collectPreflight("briefing", [cwd]),
       ].filter(Boolean)
