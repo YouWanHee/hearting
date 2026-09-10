@@ -143,7 +143,11 @@ def _unreferenced_tier_keys(missing: set[str], user_values: Mapping[str, str], a
     # `OPTIONAL_TIERS` excuses a tier the *user file* points at (the
     # exception tier's resolver refuses typed instead), never one this
     # adapter's wrappers read by name -- those must stay declared or the
-    # wrapper reads `None` (combined review m2).
+    # wrapper reads `None` (combined review m2). Subtracting before the
+    # union is a pre-emptive correction, not a fix for an observed escape:
+    # it changes nothing while `OPTIONAL_TIERS` and every adapter's
+    # `WRAPPER_REQUIRED_TIERS` stay disjoint, and holds the invariant the
+    # first overlap would otherwise break (guard review m4).
     required = (_referenced_tiers(user_values) - OPTIONAL_TIERS) | WRAPPER_REQUIRED_TIERS.get(adapter, frozenset())
     optional: set[str] = set()
     for key in missing:

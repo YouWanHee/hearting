@@ -257,13 +257,17 @@ class TopProfileOptionalityTest(unittest.TestCase):
         _v, receipt2 = config.resolve_config("claude", runtime=home2, source_root=root2)
         self.assertEqual(receipt2.reason, "user-incomplete")
 
-    def test_every_optional_policy_key_is_real_and_absence_tolerant(self):
+    def test_every_optional_policy_key_is_shipped_and_registered_by_hand(self):
         # combined review m1: the optional-key registration is hand-written,
         # so pin what it must satisfy -- the key exists in that adapter's
         # shipped file (otherwise the entry is dead), and a user copy without
         # it stays selected whole-file with the key absent (the consumer must
         # tolerate that, which is why the Claude key is deliberately absent
         # from this map: its wrapper raises when the key is missing).
+        # Absence *tolerance* itself is asserted at the consumer, not here:
+        # `codex_dispatch_model_eligibility.test.py`
+        # ::test_a_user_copy_without_the_key_carries_no_restriction
+        # (guard review m5).
         root = config.repository_root()
         for adapter, keys in config.OPTIONAL_POLICY_KEYS.items():
             shipped = config.parse_config(config.shipped_path(adapter, source_root=root))
@@ -280,6 +284,19 @@ class TopProfileOptionalityTest(unittest.TestCase):
         (home / "agent-config" / "models.conf").write_text(BASE, encoding="utf-8")
         _values, receipt = config.resolve_config("claude", runtime=home, source_root=root2)
         self.assertEqual(receipt.reason, "user-incomplete")
+
+    def test_opencode_declares_no_main_session_only_policy(self):
+        # guard review m1: opencode is the one adapter whose registered
+        # headless dispatch may still inherit the interactive model, and the
+        # reason is that its shipped config declares no main-session-only
+        # list -- there is nothing an inherited model could leak. Only a
+        # README sentence said so. Pin it here: the day opencode declares
+        # such a key, this reddens and the inherit allowance must be
+        # revisited (adapters/opencode/bin/dispatch-headless.py) rather than
+        # staying open silently.
+        shipped = config.parse_config(
+            config.shipped_path("opencode", source_root=config.repository_root()))
+        self.assertNotIn("CFG_MAIN_SESSION_ONLY_MODELS", shipped)
 
     def test_restricted_model_matches_whole_ids_and_alias_tokens(self):
         self.assertTrue(config.restricted_model("claude-fable-5-1", "fable"))

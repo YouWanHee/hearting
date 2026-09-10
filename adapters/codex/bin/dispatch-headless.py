@@ -332,7 +332,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--inherit-model-settings",
         action="store_true",
-        help="do not override model/reasoning; inherit the active Codex config for this dispatch",
+        help="legacy input retained for typed rejection; registered headless Codex dispatch requires an explicit eligible role/model",
     )
     p.add_argument("--require-hook-trust", action="store_true")
     p.add_argument("--profile")
@@ -884,7 +884,7 @@ def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
     if not args.model and not args.reasoning:
         raise ModelSelectionError(
             "missing-dispatch-model-selection",
-            "main dispatch must choose --model-role, --model with --reasoning, or --inherit-model-settings",
+            "main dispatch must choose --model-role or --model with --reasoning",
         )
     if not args.model or not args.reasoning:
         raise ModelSelectionError(

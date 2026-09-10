@@ -726,7 +726,7 @@ status=tool-contract
 tool_contract=headless-dispatch
 tool_contract_check=adapters/codex/bin/preflight.sh headless --check <worktree>
 strict_tool_contract_check=adapters/codex/bin/preflight.sh headless --check --require-hook-trust <worktree>
-command_template=codex exec --cd <worktree> --sandbox workspace-write (--model <main-selected-model> -c model_reasoning_effort=<main-selected-reasoning>|inherit) -c approval_policy=never --json -
+command_template=codex exec --cd <worktree> --sandbox workspace-write --model <main-selected-model> -c model_reasoning_effort=<main-selected-reasoning> -c approval_policy=never --json -
 model_selection_policy=main-orchestrator-must-select-per-job
 model_selection_surface=--model-profile <deep|balanced-deep|balanced|light|mini> [--model-role <portable-role>]|--model-role <portable-role>|--model <model> --reasoning <effort>
 runtime_projection_requires=hearting,AGENTS.md,hooks.json,native-skills,native-agents,native-modes

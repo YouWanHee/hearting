@@ -442,7 +442,11 @@ def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
         if args.model_profile == TOP_PROFILE and args.model:
             # No cascade in or out, on every adapter (combined review m5):
             # nothing runs under the `top` label but the top model itself,
-            # even where `top` collapses onto the deep tier.
+            # even where `top` collapses onto the deep tier. This adapter
+            # must read the *requested* profile, not the resolved one:
+            # opencode resolves `top` to `collapsed-top-to-deep`, so a check
+            # on `resolved["profile"]` (what claude and codex use, where the
+            # label survives) would never fire here (guard review m3).
             raise ModelSelectionError(
                 "profile-top-override-forbidden",
                 "the top exception profile admits no concrete --model override, capacity retry included",
