@@ -20,6 +20,25 @@ SPEC.loader.exec_module(GOVERNOR)
 from replica_batch_contract import build_manifest
 
 
+def _run_as_non_group_actor(case):
+    """Keep API/witness tests independent of host-wide procfs churn.
+
+    The runner makes the suite a group leader. An unrelated PID disappearing
+    during its /proc scan correctly blocks group return. Exercise these
+    non-group API cases in a real child, as _legacy_migration_return does;
+    dedicated group-drain/incomplete-observation cases retain their coverage.
+    """
+    if os.getpid() != os.getpgrp():
+        return False
+    test_name = f"{type(case).__name__}.{case._testMethodName}"
+    result = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve()), test_name],
+        capture_output=True, text=True, timeout=60,
+    )
+    case.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+    return True
+
+
 def _legacy_migration_return(root):
     """Exercise the original non-group API in a real child, not a mocked PGID.
 
@@ -105,12 +124,15 @@ class GovernorTest(unittest.TestCase):
         return min(GOVERNOR.CLASS_LIMITS["dispatch"], GOVERNOR.DEFAULT_TOTAL_LIMIT)
 
     def test_caps_release_and_kill_switch(self):
+        if _run_as_non_group_actor(self):
+            return
         with tempfile.TemporaryDirectory() as temp_dir:
             cap = self._dispatch_cap()
             tokens = [GOVERNOR.acquire(temp_dir, "dispatch") for _ in range(cap)]
             with self.assertRaisesRegex(ValueError, "global model-worker cap|class cap"):
                 GOVERNOR.acquire(temp_dir, "dispatch")
-            GOVERNOR.release(temp_dir, tokens.pop())
+            returned = GOVERNOR.release(temp_dir, tokens.pop())
+            self.assertTrue(returned["release_proven"], returned)
             tokens.append(GOVERNOR.acquire(temp_dir, "dispatch"))
             Path(temp_dir, "KILL_SWITCH").touch()
             with self.assertRaisesRegex(ValueError, "kill switch"):
@@ -1048,6 +1070,8 @@ class GovernorIdentityRegressionTest(unittest.TestCase):
         p=self.root/"state.json";return json.loads(p.read_text()) if p.exists() else {}
 
     def test_owner_to_claimant_witness_transfer_and_proven_receipt_retention(self):
+        if _run_as_non_group_actor(self):
+            return
         h=GOVERNOR.create_witness(self.root,"reservation")
         try:
             t=GOVERNOR.reserve(self.root,"dispatch",1,witness_binding=h.binding())[0]
@@ -1055,7 +1079,8 @@ class GovernorIdentityRegressionTest(unittest.TestCase):
             row=self.state()["claims"][t]
             self.assertEqual(row["owner_witness"],h.binding())
             self.assertEqual(GOVERNOR.observe_witness(self.root,row["claimant_witness"]).state,"live")
-            self.assertTrue(GOVERNOR.release(self.root,t)["release_proven"])
+            returned = GOVERNOR.release(self.root,t)
+            self.assertTrue(returned["release_proven"], returned)
             state=self.state();self.assertTrue(state["claims"][t]["release_proven"])
             self.assertEqual(state["leases"],{})
             future=state["claims"][t]["released_at"]+GOVERNOR.CLAIM_RECEIPT_SECONDS+1
@@ -1275,6 +1300,85 @@ class GovernorReclaimTest(unittest.TestCase):
         self.assertEqual([row["token"] for row in result["reclaimed"]], [first])
         self.assertEqual(result["retained"], [])
         self.assertEqual(list(self.state()["leases"]), [second])
+
+    def test_full_acquire_reclaims_once_outside_admission_transaction(self):
+        dead = self._dead_claimant_lease()
+        original = GOVERNOR._state_change
+        in_transaction = False
+
+        def tracked(root, operation):
+            nonlocal in_transaction
+            self.assertFalse(in_transaction, "nested governor transaction")
+            in_transaction = True
+            try:
+                return original(root, operation)
+            finally:
+                in_transaction = False
+
+        with mock.patch.object(GOVERNOR, "_state_change", side_effect=tracked), \
+             mock.patch.object(GOVERNOR, "reclaim", wraps=GOVERNOR.reclaim) as reclaim:
+            fresh = GOVERNOR.acquire(self.root, "dispatch", total=1, budget=8)
+        reclaim.assert_called_once_with(self.root)
+        self.assertEqual(list(self.state()["leases"]), [fresh])
+        self.assertEqual(self.state()["claims"][dead]["reclaimed_by"], "witness-proof")
+
+    def test_full_reserve_reclaims_before_atomic_batch_retry(self):
+        dead = self._dead_claimant_lease()
+        with mock.patch.object(GOVERNOR, "reclaim", wraps=GOVERNOR.reclaim) as reclaim:
+            tokens = GOVERNOR.reserve(self.root, "dispatch", 2, total=2, budget=8)
+        reclaim.assert_called_once_with(self.root)
+        self.assertEqual(set(self.state()["reservations"]), set(tokens))
+        self.assertNotIn(dead, self.state()["leases"])
+
+    def test_live_full_leases_still_refuse_both_admission_paths(self):
+        live = GOVERNOR.acquire(self.root, "dispatch", total=1, budget=8)
+        for admit in (lambda: GOVERNOR.acquire(self.root, "dispatch", total=1, budget=8),
+                      lambda: GOVERNOR.reserve(self.root, "dispatch", 1, total=1, budget=8)):
+            with mock.patch.object(GOVERNOR, "reclaim", wraps=GOVERNOR.reclaim) as reclaim:
+                with self.assertRaisesRegex(ValueError, "global model-worker cap"):
+                    admit()
+            reclaim.assert_called_once_with(self.root)
+            self.assertEqual(list(self.state()["leases"]), [live])
+
+    def test_no_witness_scan_for_room_budget_validation_or_check(self):
+        with mock.patch.object(GOVERNOR, "reclaim", side_effect=AssertionError("unexpected reclaim")), \
+             mock.patch.object(GOVERNOR, "reclaimable", side_effect=AssertionError("diagnostic scan")):
+            GOVERNOR.acquire(self.root, "dispatch", total=3, budget=8)
+            GOVERNOR.reserve(self.root, "dispatch", 1, total=3, budget=8)
+            with self.assertRaisesRegex(ValueError, "rolling"):
+                GOVERNOR.acquire(self.root, "dispatch", total=3, budget=2)
+            with self.assertRaisesRegex(ValueError, "positive integer"):
+                GOVERNOR.reserve(self.root, "dispatch", 0)
+            with self.assertRaisesRegex(ValueError, "cap"):
+                GOVERNOR.check(self.root, "dispatch", total=1)
+            with mock.patch.dict(os.environ, {"AGENT_MODEL_WORKERS_DISABLED": "1"}):
+                with self.assertRaisesRegex(ValueError, "kill switch"):
+                    GOVERNOR.acquire(self.root, "dispatch")
+
+    def test_class_cap_triggers_reclaim_but_start_budget_is_not_refunded(self):
+        self._dead_claimant_lease("title")
+        with mock.patch.object(GOVERNOR, "class_limit", return_value=1), \
+             mock.patch.object(GOVERNOR, "reclaim", wraps=GOVERNOR.reclaim) as reclaim:
+            with self.assertRaisesRegex(ValueError, "rolling"):
+                GOVERNOR.acquire(self.root, "title", total=8, budget=1)
+        reclaim.assert_called_once_with(self.root)
+        self.assertEqual(self.state()["leases"], {})
+        self.assertEqual(len(self.state()["starts"]), 1)
+
+    def test_reclaimed_capacity_lost_to_contender_does_not_loop(self):
+        self._dead_claimant_lease()
+        original = GOVERNOR.reclaim
+
+        def contested(root):
+            result = original(root)
+            GOVERNOR.acquire(root, "title", total=1, budget=8)
+            return result
+
+        with mock.patch.object(GOVERNOR, "reclaim", side_effect=contested) as reclaim:
+            with self.assertRaisesRegex(ValueError, "global model-worker cap"):
+                GOVERNOR.reserve(self.root, "dispatch", 1, total=1, budget=8)
+        reclaim.assert_called_once_with(self.root)
+        self.assertEqual(self.state()["reservations"], {})
 
 
 if __name__ == "__main__":

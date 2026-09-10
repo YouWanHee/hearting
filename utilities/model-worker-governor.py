@@ -398,8 +398,25 @@ CAP_RECOVERY_HINT = (
 # passed 4/4 began failing about half the time, one of them because a
 # release silently stopped proving and the capacity it should have freed
 # never came back). Reclaimability is reported by `status`, which is an
-# explicit operator call, and proven by `reclaim`, which is the one command
-# allowed to touch those locks.
+# explicit operator call, and proven by `reclaim`. Admission calls reclaim
+# only after a capacity refusal has unwound the state lock.
+
+
+class _CapacityReached(ValueError):
+    """A concurrency cap refused admission (not validation or start budget)."""
+
+
+def _admit_with_reclaim(root: str | Path, operation: Callable) -> Any:
+    try:
+        return _state_change(root, operation)
+    except _CapacityReached:
+        # Never nest this in _assert_available or a _state_change callback:
+        # reclaim owns its own state transaction and exact witness proof.
+        if reclaim(root)["reclaimed_count"] == 0:
+            raise
+    # One retry, including identity, kill-switch, caps and rolling budget.
+    # Another contender may have consumed the returned capacity meanwhile.
+    return _state_change(root, operation)
 
 
 def _assert_available(
@@ -421,9 +438,9 @@ def _assert_available(
     reservations = data["reservations"]
     occupied = [*leases.values(), *reservations.values()]
     if len(occupied) + count > total:
-        raise ValueError("global model-worker cap reached" + CAP_RECOVERY_HINT)
+        raise _CapacityReached("global model-worker cap reached" + CAP_RECOVERY_HINT)
     if sum(item.get("class") == worker_class for item in occupied) + count > class_limit(worker_class):
-        raise ValueError(f"{worker_class} class cap reached" + CAP_RECOVERY_HINT)
+        raise _CapacityReached(f"{worker_class} class cap reached" + CAP_RECOVERY_HINT)
     # Unclaimed reservations hold rolling-budget capacity. Claiming one moves
     # that capacity from ``reservations`` to ``starts`` in the same lock.
     if len(data["starts"]) + len(reservations) + count > budget:
@@ -470,7 +487,7 @@ def acquire(
         return token
 
     try:
-        token = _state_change(root, operation)
+        token = _admit_with_reclaim(root, operation)
     except BaseException:
         if handle is not None:
             close_witness(handle)
@@ -1173,7 +1190,7 @@ def reserve(
             tokens.append(token)
         return tokens
 
-    return _state_change(root, operation)
+    return _admit_with_reclaim(root, operation)
 
 
 def reservation_check(
