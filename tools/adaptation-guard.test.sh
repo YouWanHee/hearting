@@ -47,6 +47,22 @@ else
   bad "build-manifest unknown option must fail before writing manifest.json"
 fi
 
+# This suite mutates the checkout it runs in and asserts the tree is clean
+# afterwards. `tools/generated-projections.test.sh` mutates the same checkout
+# (it edits harness-manifest.json and reruns tools/generate.py, rewriting every
+# projection). The runner executes suites in parallel over one working tree, so
+# without a shared lock the two overlap and whichever asserts cleanliness fails
+# on the *other* one's in-flight edit -- observed in CI 2026-09-10 as
+# `M adapters/codex/skills/post-it/SKILL.md`, a file this suite never touches.
+# Blocking, not `-n`: both suites are short and both must run.
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"${TMPDIR:-/tmp}/hearting-worktree-mutation.lock"
+  if ! flock -w 900 9; then
+    echo "worktree-mutation lock not acquired within 900s" >&2
+    exit 70
+  fi
+fi
+
 TMP=$(mktemp -d)
 CREATED=""      # 정리할 임시 생성 파일들
 # 변형 전 baseline: 미커밋 Phase 2 편집·untracked 파일은 정상이므로 기준선에 포함해 비교한다.
