@@ -253,24 +253,27 @@ help loaded on demand.
   behind two absolute paths — a symlink and its target, or two projections of
   it — is injected twice rather than deduped. Verification asserts the number
   of carriers, not merely that some carrier exists.
-- A stored surface baseline rejects growth greater than five percent unless the
-  same change records a reviewed rationale and updates the budget.
+- A stored surface baseline warns on growth greater than five percent; the same
+  change records a reviewed rationale and updates the baseline.
 - Model-visible surface budget: the nine documents an agent reads to route
   and dispatch work (`core/{CORE,WORKFLOW,CONVENTIONS,OPERATIONS,HOOKS,MEMORY}.md`,
   `adapters/claude/CLAUDE.md`, the `autopilot-code` `dev-pipeline` and
   `owner-execution` references) carry sealed per-file byte and directive caps
-  in `tools/surface-budget.json` and a total ceiling in
-  `tools/check-surface-budget.py`. Caps are per file and independent: a
-  change that grows any one of them fails the boundary check even when
-  another shrinks. Each cap sits one ordinary edit above its measurement —
+  in `tools/surface-budget.json` and total ceilings in
+  `tools/check-surface-budget.py`. **Directive (rule) caps are fail-closed;
+  byte caps are advisory** — going over one prints an `ADVISORY` line and does
+  not fail, because the reduction is about what an agent must hold in mind,
+  counted in rules, and byte caps that force prose to be squeezed are not.
+  Rule caps are per file and independent: a change that adds rules to any one
+  surface fails the boundary check even when another shrinks. Each cap sits one ordinary edit above its measurement —
   3% of the bytes, and two directives or 3%, whichever is larger — so a normal
   change has room to land; caps sealed at the exact measurement made all nine
   surfaces permanently full and pushed growth into skipping the gate instead.
   The margin is finite and cannot be widened by repetition: a reseal takes it
   from the current measurement, never from the previous cap. Growing a file
   past its cap means resealing in the same change with a recorded `--reason`,
-  and a reseal is refused outright when the sealed caps would exceed the code
-  ceiling. Reductions are locked in by resealing downward. The ceiling is
+  and a reseal is refused outright when the sealed rule caps would exceed the
+  code rule ceiling. Reductions are locked in by resealing downward. The ceiling is
   lowered only in a commit that lands a measured reduction and is never raised
   by editing the budget file.
 - Ordinary, unknown, and repeated hook states inject zero bytes. A verified
