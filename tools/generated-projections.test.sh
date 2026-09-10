@@ -18,11 +18,23 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 # tree, so without a shared lock the two overlap and the one asserting
 # cleanliness fails on this one's in-flight edit -- observed in CI 2026-09-10
 # as `M adapters/codex/skills/post-it/SKILL.md`, a file it never touches.
-# Blocking, not `-n`: both suites are short and both must run.
+# Blocking, not `-n`: both suites are short and both must run. The lock lives
+# in the shared git directory, NOT under $TMPDIR: the runner hands every suite
+# its own TMPDIR, so a $TMPDIR-derived path gave each suite a private lock and
+# no exclusion at all (measured 2026-09-10 -- the first version of this guard
+# changed nothing in CI). The git common dir is the one path two suites in the
+# same checkout always agree on, and it is outside the tracked tree, so the
+# lock file cannot dirty the very `git status` this suite asserts on.
+_wt_lock_dir=$(git -C "$ROOT" rev-parse --git-common-dir 2>/dev/null || true)
+case "$_wt_lock_dir" in
+  "") _wt_lock="/tmp/hearting-worktree-mutation.lock" ;;
+  /*) _wt_lock="$_wt_lock_dir/hearting-worktree-mutation.lock" ;;
+  *)  _wt_lock="$ROOT/$_wt_lock_dir/hearting-worktree-mutation.lock" ;;
+esac
 if command -v flock >/dev/null 2>&1; then
-  exec 9>"${TMPDIR:-/tmp}/hearting-worktree-mutation.lock"
+  exec 9>"$_wt_lock"
   if ! flock -w 900 9; then
-    echo "worktree-mutation lock not acquired within 900s" >&2
+    echo "worktree-mutation lock not acquired within 900s: $_wt_lock" >&2
     exit 70
   fi
 fi

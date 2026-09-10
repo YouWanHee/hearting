@@ -14,6 +14,37 @@ if ! ROOT=$(git rev-parse --show-toplevel 2>/dev/null); then
   ROOT=$(cd "$(dirname -- "$0")/.." && pwd)
 fi
 cd "$ROOT"
+# This suite mutates the checkout it runs in and asserts the tree is clean
+# afterwards. `tools/generated-projections.test.sh` mutates the same checkout
+# (it edits harness-manifest.json and reruns tools/generate.py, rewriting every
+# projection). The runner executes suites in parallel over one working tree, so
+# without a shared lock the two overlap and whichever asserts cleanliness fails
+# on the *other* one's in-flight edit -- observed in CI 2026-09-10 as
+# `M adapters/codex/skills/post-it/SKILL.md`, a file this suite never touches.
+# Taken above the first case, not just before the mutations: the early
+# build-manifest cases read harness-manifest.json's mtime, which the peer
+# suite rewrites.
+# Blocking, not `-n`: both suites are short and both must run. The lock lives
+# in the shared git directory, NOT under $TMPDIR: the runner hands every suite
+# its own TMPDIR, so a $TMPDIR-derived path gave each suite a private lock and
+# no exclusion at all (measured 2026-09-10 -- the first version of this guard
+# changed nothing in CI). The git common dir is the one path two suites in the
+# same checkout always agree on, and it is outside the tracked tree, so the
+# lock file cannot dirty the very `git status` this suite asserts on.
+_wt_lock_dir=$(git -C "$ROOT" rev-parse --git-common-dir 2>/dev/null || true)
+case "$_wt_lock_dir" in
+  "") _wt_lock="/tmp/hearting-worktree-mutation.lock" ;;
+  /*) _wt_lock="$_wt_lock_dir/hearting-worktree-mutation.lock" ;;
+  *)  _wt_lock="$ROOT/$_wt_lock_dir/hearting-worktree-mutation.lock" ;;
+esac
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"$_wt_lock"
+  if ! flock -w 900 9; then
+    echo "worktree-mutation lock not acquired within 900s: $_wt_lock" >&2
+    exit 70
+  fi
+fi
+
 GUARD="tools/check-adaptation-boundary.sh"
 BM="tools/build-manifest.py"
 fails=0
@@ -45,22 +76,6 @@ if [ "$unknown_rc" -ne 0 ] \
   ok "build-manifest rejects unknown options before writes"
 else
   bad "build-manifest unknown option must fail before writing manifest.json"
-fi
-
-# This suite mutates the checkout it runs in and asserts the tree is clean
-# afterwards. `tools/generated-projections.test.sh` mutates the same checkout
-# (it edits harness-manifest.json and reruns tools/generate.py, rewriting every
-# projection). The runner executes suites in parallel over one working tree, so
-# without a shared lock the two overlap and whichever asserts cleanliness fails
-# on the *other* one's in-flight edit -- observed in CI 2026-09-10 as
-# `M adapters/codex/skills/post-it/SKILL.md`, a file this suite never touches.
-# Blocking, not `-n`: both suites are short and both must run.
-if command -v flock >/dev/null 2>&1; then
-  exec 9>"${TMPDIR:-/tmp}/hearting-worktree-mutation.lock"
-  if ! flock -w 900 9; then
-    echo "worktree-mutation lock not acquired within 900s" >&2
-    exit 70
-  fi
 fi
 
 TMP=$(mktemp -d)
