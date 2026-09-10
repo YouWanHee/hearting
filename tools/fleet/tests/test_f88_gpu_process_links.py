@@ -1,5 +1,11 @@
 import importlib.util
 import io
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -238,6 +244,128 @@ class GpuProcessAndResourceRenderTest(unittest.TestCase):
         job = DispatchJob(key="autopilot-code", harness="codex")
         job._runtime_session_id = "sid-exact"
         self.assertEqual(render._gpu_resources_for_session(job, resources), linked)
+
+    def test_managed_run_fences_stale_ancestor_sessions_end_to_end(self):
+        module = _compute_hosts_module()
+        identity_keys = {
+            "AGENT_DISPATCH_ATTEMPT_ID", "AGENT_DISPATCH_SELF_SLUG",
+            "HEARTING_COMPUTE_RUN_ID", "HEARTING_COMPUTE_HOST",
+            "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "CODEX_SESSION_ID",
+            "OPENCODE_SESSION_ID",
+        }
+        clean = {key: value for key, value in os.environ.items()
+                 if key not in identity_keys}
+        parent_source = (
+            "import os, subprocess, sys\n"
+            "env = dict(os.environ)\n"
+            "for key in ('CLAUDE_CODE_SESSION_ID', 'CODEX_THREAD_ID', "
+            "'CODEX_SESSION_ID', 'OPENCODE_SESSION_ID'):\n"
+            "    env.pop(key, None)\n"
+            "mode = sys.argv[1]\n"
+            "if mode != 'generic':\n"
+            "    env['HEARTING_COMPUTE_RUN_ID'] = 'managed-run'\n"
+            "    env['HEARTING_COMPUTE_HOST'] = 'local'\n"
+            "if mode in ('exact', 'generic'):\n"
+            "    env['CODEX_THREAD_ID'] = 'launch-thread'\n"
+            "if mode == 'conflict':\n"
+            "    env['CODEX_THREAD_ID'] = 'launch-thread'\n"
+            "    env['CLAUDE_CODE_SESSION_ID'] = 'other-launcher'\n"
+            "child = subprocess.Popen([sys.executable, '-c', "
+            "'import time; time.sleep(30)'], env=env)\n"
+            "print(child.pid, flush=True)\n"
+            "child.wait()\n"
+        )
+
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TEST_TMPDIR", "/tmp")) as tmp:
+            fake_smi = Path(tmp) / "nvidia-smi"
+            fake_smi.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os, sys\n"
+                "if any(a.startswith('--query-gpu=') for a in sys.argv):\n"
+                " print('0, GPU-A, NVIDIA A100, 42, 40960, 12288')\n"
+                "else:\n"
+                " print('GPU-A, %s, python, 1024' % os.environ['TARGET_PID'])\n",
+                encoding="utf-8",
+            )
+            fake_smi.chmod(0o755)
+            stale_parent_env = {
+                **clean,
+                "CODEX_THREAD_ID": "stale-thread",
+                "CODEX_SESSION_ID": "other-stale",
+                "CLAUDE_CODE_SESSION_ID": "stale-claude",
+            }
+            for mode in ("exact", "missing", "conflict", "generic"):
+                with self.subTest(mode=mode):
+                    child_pid = None
+                    parent = subprocess.Popen(
+                        [sys.executable, "-c", parent_source, mode],
+                        text=True, stdout=subprocess.PIPE, env=stale_parent_env,
+                    )
+                    try:
+                        child_pid = int(parent.stdout.readline().strip())
+                        parent_environ = (Path("/proc") / str(parent.pid) / "environ").read_bytes()
+                        child_environ = (Path("/proc") / str(child_pid) / "environ").read_bytes()
+                        self.assertIn(b"CODEX_THREAD_ID=stale-thread\0", parent_environ)
+                        self.assertIn(b"CLAUDE_CODE_SESSION_ID=stale-claude\0",
+                                      parent_environ)
+                        self.assertNotIn(b"stale-thread", child_environ)
+                        self.assertNotIn(b"stale-claude", child_environ)
+                        if mode != "generic":
+                            self.assertIn(b"HEARTING_COMPUTE_RUN_ID=managed-run\0",
+                                          child_environ)
+                        result = subprocess.run(
+                            ["bash", "-c", module.PROBE_SCRIPT],
+                            text=True, capture_output=True, timeout=5,
+                            env={
+                                **clean,
+                                "PATH": tmp + os.pathsep + os.environ.get("PATH", ""),
+                                "TARGET_PID": str(child_pid),
+                            },
+                        )
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        payload = json.loads(result.stdout)
+                    finally:
+                        if child_pid is not None:
+                            try:
+                                os.kill(child_pid, 15)
+                            except ProcessLookupError:
+                                pass
+                        try:
+                            parent.wait(timeout=2)
+                        except subprocess.TimeoutExpired:
+                            parent.terminate()
+                            parent.wait(timeout=2)
+                        if parent.stdout is not None:
+                            parent.stdout.close()
+
+                    process = payload["gpus"][0]["processes"][0]
+                    if mode == "generic":
+                        self.assertNotEqual(process["owner"]["kind"], "run")
+                    else:
+                        self.assertEqual(process["owner"]["kind"], "run")
+                        self.assertEqual(process["owner"]["id"], "managed-run")
+                    session_owner = process.get("session_owner")
+                    if mode == "exact":
+                        self.assertEqual(
+                            (session_owner["harness"], session_owner["id"]),
+                            ("codex", "launch-thread"),
+                        )
+                    else:
+                        self.assertIsNone(session_owner)
+
+                    snapshot = {
+                        "configured": True,
+                        "hosts": [{"host": "local", **payload}],
+                    }
+                    render.set_compute_hosts(snapshot)
+                    try:
+                        target_session = Session(
+                            harness="codex", pid=103, session_id="launch-thread")
+                        linked = render._gpu_resources_for_session(
+                            target_session, render._gpu_session_resources(snapshot))
+                    finally:
+                        render.set_compute_hosts(None)
+                    self.assertEqual(bool(linked), mode == "exact")
 
     def test_resource_strip_matches_native_indent_and_degrades_without_overflow(self):
         linked = render._gpu_resources_for_session(

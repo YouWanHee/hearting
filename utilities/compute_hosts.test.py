@@ -303,6 +303,64 @@ class ComputeHostsTest(unittest.TestCase):
         log = (self.run_root / run_id / "log").read_text(encoding="utf-8")
         self.assertEqual(log, f"{run_id}|here")
 
+    def test_tmux_run_pins_launcher_session_over_stale_server_environment(self):
+        fakebin = self.root / "tmux-bin"
+        fakebin.mkdir()
+        tmux = fakebin / "tmux"
+        tmux.write_text(
+            "#!/bin/sh\n"
+            "while [ \"$#\" -gt 1 ]; do shift; done\n"
+            "CODEX_THREAD_ID=stale-thread CODEX_SESSION_ID=other-stale "
+            "CLAUDE_CODE_SESSION_ID=stale-claude /bin/bash -lc \"$1\"\n",
+            encoding="utf-8",
+        )
+        tmux.chmod(0o755)
+        clean = {key: value for key, value in self.env.items()
+                 if key not in dict(load_module().SESSION_ENV_KEYS)}
+        env = {**clean, "PATH": str(fakebin) + os.pathsep + os.environ["PATH"],
+               "CODEX_THREAD_ID": "launch-thread"}
+        result = subprocess.run(
+            [sys.executable, str(TOOL), "run", "here", "--name", "tmux-owner",
+             "--", "bash", "-c",
+             "printf '%s|%s|%s' \"$CODEX_THREAD_ID\" "
+             "\"${CODEX_SESSION_ID-}\" \"${CLAUDE_CODE_SESSION_ID-}\""],
+            text=True, capture_output=True, env=env,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        run_id = result.stdout.split()[1]
+        log = (self.run_root / run_id / "log").read_text(encoding="utf-8")
+        self.assertEqual(log, "launch-thread||")
+
+    def test_conflicting_launcher_sessions_fail_closed_in_nohup_payload(self):
+        fakebin = self.root / "nohup-bin"
+        fakebin.mkdir()
+        for command in ("bash", "mkdir", "nohup", "setsid"):
+            target = Path("/usr/bin") / command
+            if not target.exists():
+                target = Path("/bin") / command
+            (fakebin / command).symlink_to(target)
+        clean = {key: value for key, value in self.env.items()
+                 if key not in dict(load_module().SESSION_ENV_KEYS)}
+        env = {**clean, "PATH": str(fakebin),
+               "CODEX_THREAD_ID": "conflicting-codex",
+               "CLAUDE_CODE_SESSION_ID": "conflicting-claude"}
+        result = subprocess.run(
+            [sys.executable, str(TOOL), "run", "here", "--name", "nohup-owner",
+             "--", "bash", "-c",
+             "printf '%s|%s' \"${CODEX_THREAD_ID-}\" "
+             "\"${CLAUDE_CODE_SESSION_ID-}\""],
+            text=True, capture_output=True, env=env,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        run_id = result.stdout.split()[1]
+        exit_path = self.run_root / run_id / "exit_code"
+        for _ in range(50):
+            if exit_path.is_file():
+                break
+            time.sleep(0.1)
+        log = (self.run_root / run_id / "log").read_text(encoding="utf-8")
+        self.assertEqual(log, "|")
+
     def test_failure_exit_code_is_preserved(self):
         result = self.run_tool("run", "here", "--", "bash", "-c", "exit 7")
         run_id = result.stdout.split()[1]
