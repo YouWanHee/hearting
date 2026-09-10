@@ -3782,13 +3782,16 @@ BYTE_BUDGET_EOF
 }
 
 # The nine documents an agent reads to route and dispatch work are a sealed
-# surface: byte and directive caps live in tools/surface-budget.json, the
-# total ceiling lives in tools/check-surface-budget.py. Adding a paragraph
+# surface: byte and directive caps live in tools/surface-budget.json, both
+# total ceilings live in tools/check-surface-budget.py. The rule ceiling is
+# the one the reduction is about -- bytes are the cheaper proxy, and the two
+# can move in opposite directions (2026-09-10). Adding a paragraph
 # anywhere without an equal cut fails here (diagnosis rrev_c5dd77e9 R2/R7).
 check_model_visible_surface_budget() {
   if [ ! -f tools/surface-budget.json ] \
-    || ! grep -Fq '"schema": 2' tools/surface-budget.json \
-    || ! grep -Fq 'TOTAL_BYTE_CEILING = ' tools/check-surface-budget.py; then
+    || ! grep -Fq '"schema": 3' tools/surface-budget.json \
+    || ! grep -Fq 'TOTAL_BYTE_CEILING = ' tools/check-surface-budget.py \
+    || ! grep -Fq 'TOTAL_DIRECTIVE_CEILING = ' tools/check-surface-budget.py; then
     fail_msg "model-visible surface budget: tools/surface-budget.json and the code ceiling must be versioned"
     return
   fi
