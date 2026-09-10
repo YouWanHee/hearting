@@ -11,6 +11,22 @@ export PYTHONDONTWRITEBYTECODE=1
 unset AGENT_ARTIFACT_ROOT AGENT_ROUTE_FILE AGENT_ROUTE_ID AGENT_ROUTE_NODE
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+# This suite edits harness-manifest.json in the checkout it runs in and reruns
+# tools/generate.py, so every projection is rewritten for the duration.
+# `tools/adaptation-guard.test.sh` mutates the same checkout and then asserts
+# the tree is clean. The runner executes suites in parallel over one working
+# tree, so without a shared lock the two overlap and the one asserting
+# cleanliness fails on this one's in-flight edit -- observed in CI 2026-09-10
+# as `M adapters/codex/skills/post-it/SKILL.md`, a file it never touches.
+# Blocking, not `-n`: both suites are short and both must run.
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"${TMPDIR:-/tmp}/hearting-worktree-mutation.lock"
+  if ! flock -w 900 9; then
+    echo "worktree-mutation lock not acquired within 900s" >&2
+    exit 70
+  fi
+fi
+
 TMP=$(mktemp -d)
 MANIFEST="$ROOT/harness-manifest.json"
 TARGET="$ROOT/adapters/codex/skills/post-it/SKILL.md"
