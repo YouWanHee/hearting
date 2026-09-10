@@ -5,6 +5,7 @@ import importlib.util
 import io
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -24,6 +25,16 @@ _OWNER_SPEC = importlib.util.spec_from_file_location("dispatch_owner", SELECTOR)
 OWNER = importlib.util.module_from_spec(_OWNER_SPEC)
 _OWNER_SPEC.loader.exec_module(OWNER)
 
+
+# The owner/headless selector proves Claude's session-resume support by
+# probing `claude --help`, and refuses (`claude-session-resume-indeterminate`,
+# exit 69) rather than guess when the binary is absent. That refusal is
+# correct; asserting a successful selection in an environment without the CLI
+# is not. CI has no `claude`, so these cases reported a missing runtime as a
+# product failure (2026-09-10). Skip instead -- the way the guard suite
+# already skips its codex runtime discovery.
+CLAUDE_CLI = shutil.which("claude")
+NEEDS_CLAUDE_CLI = "no claude binary: the selector's session-resume probe cannot be proven here"
 
 class DispatchOwnerTests(unittest.TestCase):
     def setUp(self):
@@ -224,12 +235,14 @@ class DispatchOwnerTests(unittest.TestCase):
         budget_key = "reasoning" if expected["budget_kind"] == "effort" and adapter == "codex" else expected["budget_kind"]
         self.assertIn(f"{budget_key}={expected['budget']}", result.stdout)
 
+    @unittest.skipUnless(CLAUDE_CLI, NEEDS_CLAUDE_CLI)
     def test_configured_claude_selects_claude_wrapper_and_adapter_model_config(self):
         self.assert_model_map(self.run_owner(), "claude")
 
     def test_configured_codex_selects_codex_wrapper_and_adapter_model_config(self):
         self.assert_model_map(self.run_owner("codex"), "codex")
 
+    @unittest.skipUnless(CLAUDE_CLI, NEEDS_CLAUDE_CLI)
     def test_each_adapter_derives_model_and_budget_from_its_models_conf(self):
         for adapter in ("claude", "codex"):
             with self.subTest(adapter=adapter):
@@ -240,6 +253,7 @@ class DispatchOwnerTests(unittest.TestCase):
         self.assert_model_map(result, "codex")
         self.assertNotIn("interactive-inheritance", result.stdout)
 
+    @unittest.skipUnless(CLAUDE_CLI, NEEDS_CLAUDE_CLI)
     def test_schema_v2_balances_repeated_owner_attempts_across_three_harnesses(self):
         config = self.balanced_config()
         selected = []
@@ -265,6 +279,7 @@ class DispatchOwnerTests(unittest.TestCase):
             ["claude", "codex", "opencode", "claude", "codex", "opencode"],
         )
 
+    @unittest.skipUnless(CLAUDE_CLI, NEEDS_CLAUDE_CLI)
     def test_balanced_recent_count_rotation_is_even_across_three_harnesses(self):
         config = self.balanced_quality_config()
         selected = []
@@ -311,6 +326,7 @@ class DispatchOwnerTests(unittest.TestCase):
         self.assertIn("adapter=opencode", result.stdout)
         self.assertIn("quality_band=last_resort", result.stdout)
 
+    @unittest.skipUnless(CLAUDE_CLI, NEEDS_CLAUDE_CLI)
     def test_opencode_is_light_peer_but_deep_last_resort(self):
         config = self.balanced_quality_config()
         light = self.run_owner(config=config, model_profile="light")
@@ -446,6 +462,7 @@ class DispatchOwnerTests(unittest.TestCase):
         self.assertIn("reason=no-eligible-candidate", result.stdout)
         self.assertIn("child_spawned=0", result.stdout)
 
+    @unittest.skipUnless(CLAUDE_CLI, NEEDS_CLAUDE_CLI)
     def test_explicit_adapter_can_override_unknown_capacity(self):
         self.jobs.unlink()
         result = self.run_owner(

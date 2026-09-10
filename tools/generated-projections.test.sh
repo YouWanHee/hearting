@@ -11,34 +11,10 @@ export PYTHONDONTWRITEBYTECODE=1
 unset AGENT_ARTIFACT_ROOT AGENT_ROUTE_FILE AGENT_ROUTE_ID AGENT_ROUTE_NODE
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-# This suite edits harness-manifest.json in the checkout it runs in and reruns
-# tools/generate.py, so every projection is rewritten for the duration.
-# `tools/adaptation-guard.test.sh` mutates the same checkout and then asserts
-# the tree is clean. The runner executes suites in parallel over one working
-# tree, so without a shared lock the two overlap and the one asserting
-# cleanliness fails on this one's in-flight edit -- observed in CI 2026-09-10
-# as `M adapters/codex/skills/post-it/SKILL.md`, a file it never touches.
-# Blocking, not `-n`: both suites are short and both must run. The lock lives
-# in the shared git directory, NOT under $TMPDIR: the runner hands every suite
-# its own TMPDIR, so a $TMPDIR-derived path gave each suite a private lock and
-# no exclusion at all (measured 2026-09-10 -- the first version of this guard
-# changed nothing in CI). The git common dir is the one path two suites in the
-# same checkout always agree on, and it is outside the tracked tree, so the
-# lock file cannot dirty the very `git status` this suite asserts on.
-_wt_lock_dir=$(git -C "$ROOT" rev-parse --git-common-dir 2>/dev/null || true)
-case "$_wt_lock_dir" in
-  "") _wt_lock="/tmp/hearting-worktree-mutation.lock" ;;
-  /*) _wt_lock="$_wt_lock_dir/hearting-worktree-mutation.lock" ;;
-  *)  _wt_lock="$ROOT/$_wt_lock_dir/hearting-worktree-mutation.lock" ;;
-esac
-if command -v flock >/dev/null 2>&1; then
-  exec 9>"$_wt_lock"
-  if ! flock -w 900 9; then
-    echo "worktree-mutation lock not acquired within 900s: $_wt_lock" >&2
-    exit 70
-  fi
-fi
-
+# Shared with every other suite that reads or writes this checkout; see
+# tools/worktree-lock.sh for why it is anchored at the git dir.
+. "$ROOT/tools/worktree-lock.sh"
+worktree_lock_acquire "$ROOT" 900 || exit 70
 TMP=$(mktemp -d)
 MANIFEST="$ROOT/harness-manifest.json"
 TARGET="$ROOT/adapters/codex/skills/post-it/SKILL.md"
