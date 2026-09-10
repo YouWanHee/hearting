@@ -157,6 +157,35 @@ class CodexDispatchTerminalTest(unittest.TestCase):
         missing = self.root / "nope.md"
         self.assertEqual(terminal.artifact_declared_verdict(missing / "deeper"), "unreadable")
 
+    def test_a_rate_limit_death_is_not_reported_as_a_broken_envelope(self):
+        # 2026-09-10, att-2164dce2: a `top` review that simply ran out of Fable
+        # quota was reported as a malformed handoff, because the live
+        # supervisor and this post-hoc reader classified the same result row
+        # differently. They now share one classifier.
+        def result_log(name, text):
+            path = self.base / name
+            path.write_text(json.dumps({
+                "type": "result", "subtype": "error", "is_error": True, "result": text,
+            }) + "\n", encoding="utf-8")
+            return path
+
+        capacity = self.inspect(result_log("cap.jsonl", "You've reached your Fable limit"))
+        self.assertEqual(capacity["reason"], "claude-result-capacity")
+        self.assertEqual(capacity["failure_note"], "dead-capacity")
+        self.assertEqual(capacity["failure_class"], "capacity")
+
+        auth = self.inspect(result_log("auth.jsonl", "authentication_error"))
+        self.assertEqual(auth["reason"], "claude-result-auth")
+        self.assertEqual(auth["failure_note"], "dead-auth")
+
+        # an actually broken envelope keeps the name every consumer already reads
+        broken = self.inspect(result_log("broken.jsonl", "unexpected token in json"))
+        self.assertEqual(broken["reason"], "claude-result-runtime-error")
+        self.assertEqual(broken["failure_note"], "dead-runtime-error")
+        for view in (capacity, auth, broken):
+            self.assertEqual((view["state"], view["blocker_reason"]),
+                             ("invalid", "contract-violation"))
+
     def test_compatibility_failure_notes_remain_stable(self):
         blocked = inspect_terminal_log(self.write_log())
         generic = inspect_terminal_log(self.write_log(sandbox=False))
