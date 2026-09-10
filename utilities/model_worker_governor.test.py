@@ -1182,7 +1182,16 @@ class GovernorReclaimTest(unittest.TestCase):
         )
         source = self.root / f"claimant-{worker_class}.py"
         source.write_text(script, encoding="utf-8")
-        done = subprocess.run([sys.executable, str(source)], capture_output=True, text=True, timeout=120)
+        # `start_new_session=True` matters, not hygiene: the runner executes
+        # suites in parallel and `_local_return_proof` asks whether the
+        # caller's process group has drained. A child left in the shared group
+        # makes a *sibling* suite's release refuse `group-descendants-live` --
+        # a correct refusal about the wrong process (CI 2026-09-10 lost
+        # `test_owner_to_claimant_witness_transfer...` this way while the same
+        # run passed here). Its own session keeps this fixture's children out
+        # of every other suite's observation.
+        done = subprocess.run([sys.executable, str(source)], capture_output=True,
+                              text=True, timeout=120, start_new_session=True)
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         return done.stdout.strip()
 
@@ -1212,8 +1221,14 @@ class GovernorReclaimTest(unittest.TestCase):
         self.assertEqual(claim["reclaimed_by"], "witness-proof")
         self.assertIsNotNone(claim["released_at"])
 
-        # and the live claimant can still return its own lease normally
-        self.assertTrue(GOVERNOR.release(self.root, live)["release_proven"])
+        # The live lease is untouched and still refuses reclamation. Its
+        # *release* is deliberately not asserted here: a group-owned lease can
+        # only be returned by a lone group leader with a drained group, which
+        # is a property of whatever process runs this suite, not of reclaim
+        # (the file's own `_legacy_migration_return` documents the same
+        # sensitivity). `GovernorIdentityRegressionTest` owns that assertion.
+        self.assertEqual(GOVERNOR.reclaim(self.root, token=live)["reclaimed_count"], 0)
+        self.assertEqual(list(self.state()["leases"]), [live])
 
     def test_a_witness_that_proves_nothing_keeps_its_lease(self):
         dead = self._dead_claimant_lease()
@@ -1243,9 +1258,15 @@ class GovernorReclaimTest(unittest.TestCase):
         message = str(refused.exception)
         self.assertIn("global model-worker cap reached", message)
         self.assertIn("reclaim", message)
-        self.assertIn("1 of 1 lease(s)", message)
-        # the hint is a diagnostic: the refusal still refuses and state is intact
+        self.assertIn("status", message)
+        # The hint names the path without probing for it: computing the count
+        # here meant opening every witness and taking a lock inside the state
+        # lock, on the refusal path, which perturbed this very suite. The count
+        # belongs to `status`; the refusal only points at it.
+        self.assertNotIn("lease(s) are held", message)
         self.assertEqual(list(self.state()["leases"]), [dead])
+        # and `status`, an explicit call, is where the number comes from
+        self.assertEqual(GOVERNOR.reclaimable(self.root, self.state()), 1)
 
     def test_one_token_can_be_reclaimed_without_touching_its_peers(self):
         first = self._dead_claimant_lease()
