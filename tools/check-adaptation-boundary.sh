@@ -1477,7 +1477,7 @@ check_codex_tool_projection() {
   # completeness check and the denylist above are separate assertions and must not be conflated.
   TOOL_PROJECTED="memory material figure-semantic-manifest.schema.json figure-semantic-verify.py"
   TOOL_DEFERRED="__pycache__ integrations artifact-w8-handoff.py artifact_w8_handoff.test.py build-manifest.py render-hub.py render-landing.py render-fleet-svg.py generate.py harness_manifest.py sync-skill-invocation-policy.py sync-entry-skill-layer.py entry-skill-layer.test.py generated-projections.test.sh sync-missing-projections.sh sync-missing-projections.py figure-semantic-verify.test.py check-adaptation-boundary.sh check-model-config.py check-unit-config.py check-utility-census.py context-footprint.py context-footprint-baseline.json adaptation-exemptions.tsv adaptation-guard.test.sh routing-contract.test.sh design-mcp skill-conformance web-bundle fleet profile install improvement release capability_topology.py capability_topology.test.py report-manifest-verify.py report_manifest_verify.test.py report-bundle.py report_bundle_verify.test.py smoke-attestation.py smoke_attestation.test.py lab-config-provenance.py artifact-producer-canary.py artifact-delta-census.py artifact_delta_census.test.py lab_config_provenance.test.py browser-acceptance check-runtime-memory-boundary.py runtime_memory_boundary.test.py migration-manifest.py migration_manifest.test.py git-hooks check-scope-placeholders.py scope-placeholders.tsv scope_placeholders.test.py run-tests.py run_tests.test.py test-baseline.tsv test-isolation.tsv installed-layout-triggers.tsv check-installed-layout-trigger.py dispatch-discriminators.tsv"
-  TOOL_DEFERRED="$TOOL_DEFERRED check-sd-procedure-hooks.py check_sd_procedure_hooks.test.py sd-procedure-hooks.tsv stage-advance-census.py stage_advance_census.test.py dispatch-refusal-census.py dispatch_refusal_census.test.py check_ledger_invariant.py ledger_invariant.test.py check-surface-budget.py check_surface_budget.test.py surface-budget.json bytecode-cache-tolerance.test.sh"
+  TOOL_DEFERRED="$TOOL_DEFERRED check-sd-procedure-hooks.py check_sd_procedure_hooks.test.py sd-procedure-hooks.tsv stage-advance-census.py stage_advance_census.test.py dispatch-refusal-census.py dispatch_refusal_census.test.py check_ledger_invariant.py ledger_invariant.test.py check-surface-budget.py check_surface_budget.test.py surface-budget.json bytecode-cache-tolerance.test.sh worktree-lock.sh"
   tool_count=0
   for f in tools/*; do
     [ -e "$f" ] || continue
@@ -2535,7 +2535,7 @@ check_opencode_tool_projection() {
   # completeness check and the denylist above are separate assertions and must not be conflated.
   TOOL_PROJECTED="memory material figure-semantic-manifest.schema.json figure-semantic-verify.py"
   TOOL_DEFERRED="__pycache__ integrations artifact-w8-handoff.py artifact_w8_handoff.test.py build-manifest.py render-hub.py render-landing.py render-fleet-svg.py generate.py harness_manifest.py sync-skill-invocation-policy.py sync-entry-skill-layer.py entry-skill-layer.test.py generated-projections.test.sh sync-missing-projections.sh sync-missing-projections.py figure-semantic-verify.test.py check-adaptation-boundary.sh check-model-config.py check-unit-config.py check-utility-census.py context-footprint.py context-footprint-baseline.json adaptation-exemptions.tsv adaptation-guard.test.sh routing-contract.test.sh design-mcp skill-conformance web-bundle fleet profile install improvement release capability_topology.py capability_topology.test.py report-manifest-verify.py report_manifest_verify.test.py report-bundle.py report_bundle_verify.test.py smoke-attestation.py smoke_attestation.test.py lab-config-provenance.py artifact-producer-canary.py artifact-delta-census.py artifact_delta_census.test.py lab_config_provenance.test.py browser-acceptance check-runtime-memory-boundary.py runtime_memory_boundary.test.py migration-manifest.py migration_manifest.test.py git-hooks check-scope-placeholders.py scope-placeholders.tsv scope_placeholders.test.py run-tests.py run_tests.test.py test-baseline.tsv test-isolation.tsv installed-layout-triggers.tsv check-installed-layout-trigger.py dispatch-discriminators.tsv"
-  TOOL_DEFERRED="$TOOL_DEFERRED check-sd-procedure-hooks.py check_sd_procedure_hooks.test.py sd-procedure-hooks.tsv stage-advance-census.py stage_advance_census.test.py dispatch-refusal-census.py dispatch_refusal_census.test.py check_ledger_invariant.py ledger_invariant.test.py check-surface-budget.py check_surface_budget.test.py surface-budget.json bytecode-cache-tolerance.test.sh"
+  TOOL_DEFERRED="$TOOL_DEFERRED check-sd-procedure-hooks.py check_sd_procedure_hooks.test.py sd-procedure-hooks.tsv stage-advance-census.py stage_advance_census.test.py dispatch-refusal-census.py dispatch_refusal_census.test.py check_ledger_invariant.py ledger_invariant.test.py check-surface-budget.py check_surface_budget.test.py surface-budget.json bytecode-cache-tolerance.test.sh worktree-lock.sh"
   tool_count=0
   for f in tools/*; do
     [ -e "$f" ] || continue
@@ -3787,13 +3787,16 @@ BYTE_BUDGET_EOF
 }
 
 # The nine documents an agent reads to route and dispatch work are a sealed
-# surface: byte and directive caps live in tools/surface-budget.json, the
-# total ceiling lives in tools/check-surface-budget.py. Adding a paragraph
+# surface: byte and directive caps live in tools/surface-budget.json, both
+# total ceilings live in tools/check-surface-budget.py. The rule ceiling is
+# the one the reduction is about -- bytes are the cheaper proxy, and the two
+# can move in opposite directions (2026-09-10). Adding a paragraph
 # anywhere without an equal cut fails here (diagnosis rrev_c5dd77e9 R2/R7).
 check_model_visible_surface_budget() {
   if [ ! -f tools/surface-budget.json ] \
-    || ! grep -Fq '"schema": 1' tools/surface-budget.json \
-    || ! grep -Fq 'TOTAL_BYTE_CEILING = ' tools/check-surface-budget.py; then
+    || ! grep -Fq '"schema": 3' tools/surface-budget.json \
+    || ! grep -Fq 'TOTAL_BYTE_CEILING = ' tools/check-surface-budget.py \
+    || ! grep -Fq 'TOTAL_DIRECTIVE_CEILING = ' tools/check-surface-budget.py; then
     fail_msg "model-visible surface budget: tools/surface-budget.json and the code ceiling must be versioned"
     return
   fi

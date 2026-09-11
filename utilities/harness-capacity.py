@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import sys
 import time
 import urllib.request
 
@@ -166,6 +167,45 @@ def _codex_score(now: float, stale_after: int) -> float | None:
     return None
 
 
+def _opencode_api_score() -> float | None:
+    """Live Go-plan headroom via the same reader the Fleet gauge uses.
+
+    Until 2026-09-10 this slot was hardcoded to `None` behind the comment "no
+    supported proactive API". That stopped being true on 2026-09-04, when the
+    public `GET /zen/go/v1/usage` endpoint shipped and
+    `tools/fleet/collectors/zen_go_usage.py` started reading it with the
+    user's own inference key; the capacity probe simply never caught up, so
+    opencode stayed permanently unknown to placement while the dashboard two
+    panes over showed its rolling window at 100%.
+
+    Imported, not reimplemented: a second HTTP client for the same number is
+    how the two codex readers drifted apart before. A missing key, a missing
+    collector, or any transient failure returns None (unknown), never a
+    guess. The collector owns its own 3-second timeout and TTL cache.
+    """
+
+    tools = Path(__file__).resolve().parents[1] / "tools"
+    if str(tools) not in sys.path:
+        sys.path.insert(0, str(tools))
+    try:
+        from fleet.collectors import zen_go_usage
+    except Exception:
+        return None
+    try:
+        usage = zen_go_usage.account_usage()
+    except Exception:
+        return None
+    if not isinstance(usage, dict) or "error" in usage:
+        return None
+    # Every window the account exposes counts, exactly as the Claude reader
+    # merges its own: the tightest one decides the headroom. `weekly` here is
+    # a Monday-anchored window, not a rolling 7d, but for "how much room is
+    # left right now" that distinction does not change the answer.
+    used = [row[1] for row in (usage.get("rl_windows") or [])
+            if isinstance(row, (list, tuple)) and len(row) >= 2]
+    return _headroom(used)
+
+
 def capacity_scores(*, stale_after: int = 3600, now: float | None = None) -> dict[str, float | None]:
     """Return headroom percentages; unknown is ``None`` and never invented."""
     now = time.time() if now is None else now
@@ -181,8 +221,7 @@ def capacity_scores(*, stale_after: int = 3600, now: float | None = None) -> dic
     return {
         "claude": manual.get("claude", _claude_score(now, stale_after)),
         "codex": codex,
-        # No supported proactive API. Exhaustion still arrives through usage-check.
-        "opencode": manual.get("opencode"),
+        "opencode": manual.get("opencode", _opencode_api_score()),
     }
 
 

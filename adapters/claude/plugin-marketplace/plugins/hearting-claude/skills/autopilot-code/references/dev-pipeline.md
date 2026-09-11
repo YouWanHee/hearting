@@ -87,13 +87,7 @@ Keep `ROUTE_FILE`, `CANONICAL_JOBS`, `NODE_ID`, and the captured `ATTEMPT_ID` to
 that node's completion transaction succeeds. Never dispatch standard+ with a raw wrapper
 command that omits the route record.
 
-Prompts carry only subskill, absolute inputs, output contract, intensity and
-slug; no plan bodies or prior conversation. Stages read files; conductor reads
-verdict/gate state. Register every stage in the canonical jobs registry.
-`core/OPERATIONS.md` and `utilities/model-worker-governor.py` own global/per-class
-caps, distinct from adapter-native delegation limits. Runtime completion watches
-exact liveness outside the model, without a conductor recurring monitor.
-One-line/no-artifact micro-stages stay inline.
+The prompt carries only subskill name, absolute input paths, output contract, intensity, and slug. It never carries plan bodies or prior-stage conversation. Each stage reads files; the conductor reads only verdict and gate state. Register every stage in the sealed registry and keep conductor plus active stages at or below five processes. Runtime-owned completion observes exact liveness outside the model; the conductor never adds a recurring monitor. One-line or no-artifact micro-stages stay inline.
 
 #### Runtime-Owned Batch Join
 

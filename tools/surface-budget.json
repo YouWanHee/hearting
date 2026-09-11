@@ -1,11 +1,58 @@
 {
- "schema": 1,
+ "schema": 3,
  "measurement": "UTF-8 bytes per surface; directives = matches of /\\b(?:must|never|always|shall|do not|don't)\\b|(?<![가-힣])반드시(?![가-힣])|(?<![가-힣])금지(?=[한된됨되함]|(?![가-힣]))|해야(?:만)? 한다/ (case-insensitive) outside fenced code blocks and inline code spans",
- "sealed_at": "2026-09-09",
- "sealed_commit": "8bac145b",
- "ceiling_bytes": 362830,
- "total_bytes": 362789,
+ "sealed_at": "2026-09-10",
+ "sealed_commit": "e37d2304",
+ "ceiling_bytes": 375000,
+ "ceiling_directives": 480,
+ "headroom": {
+  "bytes": 0.03,
+  "directives": 0.03,
+  "directives_min": 2
+ },
+ "total_bytes": 374415,
+ "measured_total_bytes": 363505,
+ "total_directives": 468,
+ "measured_total_directives": 446,
  "surfaces": {
+  "core/CORE.md": {
+   "bytes": 26040,
+   "directives": 26
+  },
+  "core/WORKFLOW.md": {
+   "bytes": 51575,
+   "directives": 58
+  },
+  "core/CONVENTIONS.md": {
+   "bytes": 62148,
+   "directives": 75
+  },
+  "core/OPERATIONS.md": {
+   "bytes": 113111,
+   "directives": 146
+  },
+  "core/HOOKS.md": {
+   "bytes": 27184,
+   "directives": 37
+  },
+  "core/MEMORY.md": {
+   "bytes": 33794,
+   "directives": 33
+  },
+  "adapters/claude/CLAUDE.md": {
+   "bytes": 11311,
+   "directives": 28
+  },
+  "skills/autopilot-code/references/dev-pipeline.md": {
+   "bytes": 33975,
+   "directives": 40
+  },
+  "skills/autopilot-code/references/owner-execution.md": {
+   "bytes": 15277,
+   "directives": 25
+  }
+ },
+ "measured": {
   "core/CORE.md": {
    "bytes": 25281,
    "directives": 24
@@ -15,15 +62,15 @@
    "directives": 56
   },
   "core/CONVENTIONS.md": {
-   "bytes": 60338,
+   "bytes": 60337,
    "directives": 72
   },
   "core/OPERATIONS.md": {
-   "bytes": 109097,
+   "bytes": 109816,
    "directives": 141
   },
   "core/HOOKS.md": {
-   "bytes": 26393,
+   "bytes": 26392,
    "directives": 35
   },
   "core/MEMORY.md": {
@@ -35,7 +82,7 @@
    "directives": 26
   },
   "skills/autopilot-code/references/dev-pipeline.md": {
-   "bytes": 32986,
+   "bytes": 32985,
    "directives": 38
   },
   "skills/autopilot-code/references/owner-execution.md": {
@@ -60,6 +107,25 @@
      "field": "total_bytes",
      "from": 361173,
      "to": 362830
+    }
+   ]
+  },
+  {
+   "on": "2026-09-10",
+   "commit": "e37d2304",
+   "reason": "caps sat on the measurement, so every surface was permanently full: a one-row core/HOOKS.md edit had to be squeezed to 737 bytes against a 738-byte original, and a +719-byte core/OPERATIONS.md change landed on main with the gate left red. Caps now carry 3% headroom (directives +2 or 3%, whichever is larger), taken from the measurement at every reseal so repeated reseals cannot ratchet.",
+   "raised": [
+    {
+     "surface": "core/OPERATIONS.md",
+     "field": "bytes",
+     "from": 109097,
+     "to": 109816
+    },
+    {
+     "surface": "*",
+     "field": "total_bytes",
+     "from": 362789,
+     "to": 363505
     }
    ]
   }

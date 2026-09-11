@@ -4,7 +4,9 @@ import io
 import json
 import os
 from pathlib import Path
+import sys
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -589,6 +591,42 @@ class CodexGaugeReaderTests(unittest.TestCase):
                         C.urllib.request, "urlopen",
                         return_value=io.BytesIO(json.dumps(payload).encode("utf-8"))):
                 self.assertEqual(C._codex_api_score(), 24.0)
+
+
+class OpencodeGaugeTests(unittest.TestCase):
+    """The Go-plan gauge the placement probe ignored until 2026-09-10."""
+
+    def _with_collector(self, payload):
+        module = types.ModuleType("fleet.collectors.zen_go_usage")
+        module.account_usage = lambda: payload
+        fleet = types.ModuleType("fleet")
+        collectors = types.ModuleType("fleet.collectors")
+        collectors.zen_go_usage = module
+        fleet.collectors = collectors
+        return mock.patch.dict(sys.modules, {
+            "fleet": fleet,
+            "fleet.collectors": collectors,
+            "fleet.collectors.zen_go_usage": module,
+        })
+
+    def test_the_tightest_window_decides_the_headroom(self):
+        with self._with_collector({"rl_windows": [["5h", 100, 0], ["wk", 67, 0], ["mo", 53, 0]]}):
+            self.assertEqual(C._opencode_api_score(), 0.0)
+        with self._with_collector({"rl_windows": [["5h", 12, 0], ["wk", 40, 0]]}):
+            self.assertEqual(C._opencode_api_score(), 60.0)
+
+    def test_absence_and_rejection_stay_unknown_never_a_guess(self):
+        for payload in (None, {}, {"rl_windows": []}, {"error": "auth", "detail": 401}):
+            with self.subTest(payload=payload), self._with_collector(payload):
+                self.assertIsNone(C._opencode_api_score())
+
+    def test_capacity_scores_publishes_the_gauge_and_honours_the_manual_override(self):
+        with self._with_collector({"rl_windows": [["5h", 30, 0]]}):
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("HARNESS_CAPACITY_SCORES", None)
+                self.assertEqual(C.capacity_scores()["opencode"], 70.0)
+            with mock.patch.dict(os.environ, {"HARNESS_CAPACITY_SCORES": "opencode:5"}):
+                self.assertEqual(C.capacity_scores()["opencode"], 5.0)
 
 
 if __name__ == "__main__":
