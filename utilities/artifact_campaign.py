@@ -185,16 +185,29 @@ def _cycle_rows(root, path, campaign):
             members.add(record.get("cycle_id"))
     if members != set(ids):
         raise CampaignError("campaign-membership-drift")
-    bound = set()
-    for entry in path.parent.iterdir():
-        if entry.name in {"campaign.json", EVENT_NAME}:
-            continue
-        if entry.is_dir() and (entry / ".cycle.json").exists():
+    directories = {}
+    for entry, layout in locator.iter_cycle_dirs(path.parent):
+        _safe(path.parent, entry)
+        if (entry / ".cycle.json").exists():
             binding, _ = read_json(root, entry / ".cycle.json")
-            if binding.get("campaign_id") != campaign["campaign_id"]:
-                raise CampaignError("campaign-cycle-binding-mismatch", entry)
-            bound.add(binding.get("cycle_id"))
-    if bound != set(ids):
+        elif (entry / "manifest.json").exists():
+            # Historical sealed cycles predate .cycle.json. Their immutable
+            # manifest plus producer record and index still prove the binding.
+            document, _ = read_json(root, entry / "manifest.json")
+            binding = document.get("cycle", {})
+        elif layout == "legacy-id" and entry.name in ids:
+            binding = {"cycle_id": entry.name, "campaign_id": campaign["campaign_id"]}
+        else:
+            # Undeclared material is not silently made a cycle or a new
+            # residual-zero requirement. Declared members still must resolve.
+            continue
+        if not isinstance(binding, dict) or binding.get("campaign_id") != campaign["campaign_id"]:
+            raise CampaignError("campaign-cycle-binding-mismatch", entry)
+        cid = binding.get("cycle_id")
+        if not isinstance(cid, str) or cid in directories:
+            raise CampaignError("campaign-cycle-binding-duplicate", entry)
+        directories[cid] = entry
+    if set(directories) != set(ids):
         raise CampaignError("campaign-cycle-bindings-incomplete")
     rows = []
     for cid in sorted(ids):
@@ -203,9 +216,11 @@ def _cycle_rows(root, path, campaign):
         record, _ = read_json(root, records / (cid + ".json"))
         if record.get("state") not in {"sealed", "superseded"} or not record.get("sealed_on"):
             raise CampaignError("campaign-cycle-not-sealed", cid)
-        directory = path.parent / str(record.get("locator", cid))
+        directory = directories[cid]
         _safe(path.parent, directory)
-        if directory.parent != path.parent:
+        expected_directory = (path.parent / str(record["locator"]) if record.get("locator")
+                              else path.parent / "cycles" / cid)
+        if directory != expected_directory:
             raise CampaignError("campaign-cycle-locator-invalid", cid)
         document, raw = read_json(root, directory / "manifest.json")
         report = manifest.validate(document)
@@ -252,7 +267,9 @@ def _snapshot(root, path):
     if effective.get("state") != "active":
         raise CampaignError("campaign-not-active", effective.get("state"))
     criterion = campaign.get("completion_criterion", {}).get("statement")
-    if not isinstance(criterion, str) or not criterion.strip() or not campaign.get("goal"):
+    if (not isinstance(criterion, str) or not criterion.strip()
+            or not isinstance(campaign.get("goal"), str) or not campaign["goal"].strip()
+            or not identity.is_well_formed(campaign.get("campaign_id"), "campaign")):
         raise CampaignError("campaign-criterion-missing")
     root_id, rows = _cycle_rows(root, path, campaign)
     return {"artifact_root_id": root_id.artifact_root_id, "root": str(root),

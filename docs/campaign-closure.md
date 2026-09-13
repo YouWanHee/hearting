@@ -57,6 +57,8 @@ campaign 멤버 목록, producer cycle 기록, `.cycle.json`, 봉인된 manifest
 schema/ID/root/producer, 색인과 파일 digest·size를 검증한다. 승인된 옛 병합의
 비정규 JSON은 실제 바이트에 결속한 producer seal과 정규화된 내용에 결속한
 index digest를 각각 검증한다. 현재 포맷에 맞추려고 원본을 재작성하지 않는다.
+옛 `cycles/<cycle_id>` 배치와 `.cycle.json` 이전 봉인도 manifest·producer·index의
+일치로 검증하며, 종료를 위해 디렉터리를 이관하거나 봉인을 다시 쓰게 하지 않는다.
 
 `abandoned`는 봉인 상태로 집계되며 성공으로 바뀌지 않는다. 미종결 route의
 실패 marker도 그대로다. `residual=0`이나 모든 cycle 성공 조건은 추가하지 않는다.
@@ -98,7 +100,7 @@ commit 전후 실패, 복구, 이후 begin 차단, 봉인 파일 보존, legacy 
 세 하네스 native 입력 parser를 포함한다. native parser fixture 통과를 실제
 사용자 승인이나 세 하네스 실모델 canary로 주장하지 않는다.
 
-검증 기록: 신규 집중 18건 PASS. isolated runner에서 producer, manifest,
+검증 기록: 신규 집중 19건 PASS. isolated runner에서 producer, manifest,
 lifecycle, index, reader, relayout 및 신규 campaign suite가 통과했다. 생성
 20그룹·적응 경계·표면 예산 검사도 통과했으며 기존 예산 경고의 상한을
 올리지 않았다. 실제 BC 경로의 승인 없는 close는 exit 65로 거부됐고

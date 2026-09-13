@@ -107,6 +107,20 @@ class CampaignTest(F.ProducerTestBase):
             with self.assertRaisesRegex(C.CampaignError, "campaign-index-mismatch"):
                 C.status(self.root, self.path)
 
+    def test_legacy_cycle_layout_closes_without_moving_or_rewriting_sealed_bytes(self):
+        cid = self.result["cycle_id"]; old = self.manifest.parent
+        target = old.parent / "cycles" / cid; target.parent.mkdir()
+        old.rename(target); (target / ".cycle.json").unlink()
+        record = P.read_cycle_record(self.root, cid); record.pop("locator")
+        P._write_cycle_record(self.root, record, exclusive=False)
+        index = C.admission.load_index(self.root)
+        index.cycles[cid]["cycle_path"] = str(target.relative_to(self.root))
+        C.admission._write_index(self.root, index)
+        C.locator.rebuild_indexes(self.root)
+        self.approve(); self.finish()
+        self.assertTrue(target.is_dir())
+        self.assertEqual((target / "manifest.json").read_bytes(), self.original)
+
     def test_changed_goal_invalidates_old_acceptance(self):
         self.approve()
         value = json.loads(self.path.read_text()); value["goal"] += " and another goal"
@@ -137,6 +151,8 @@ class CampaignTest(F.ProducerTestBase):
             C.status(self.root, self.path)
 
     def test_abandoned_is_sealed_not_success_and_residual_is_not_a_gate(self):
+        residual = self.path.parent / "retained-notes" / "unclassified.txt"
+        residual.parent.mkdir(); residual.write_text("not a declared cycle")
         child = self.child()
         self.write_output(child, data=b"Residual 843; abandoned work, no success claimed\n")
         P.finalize(self.root, cycle_id=child["cycle_id"], state="abandoned", abandon_reason="route-unrecoverable", allow_open_route=True)
@@ -144,6 +160,7 @@ class CampaignTest(F.ProducerTestBase):
         self.assertEqual(sorted(row["state"] for row in report["cycles"]), ["abandoned", "completed"])
         self.approve(); self.finish()
         self.assertEqual(P.read_cycle_record(self.root, child["cycle_id"])["cycle_state"], "abandoned")
+        self.assertEqual(residual.read_text(), "not a declared cycle")
 
     def test_crash_after_event_commit_blocks_begin_and_recovery_needs_no_new_approval(self):
         self.approve()
