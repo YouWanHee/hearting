@@ -53,6 +53,7 @@ import artifact_index  # noqa: E402
 import artifact_lifecycle  # noqa: E402
 import artifact_locator  # noqa: E402
 import artifact_manifest  # noqa: E402
+import artifact_campaign  # noqa: E402
 import route_identity  # noqa: E402
 import dispatch_lock_order  # noqa: E402
 import dispatch_terminal_commit  # noqa: E402
@@ -726,9 +727,11 @@ def read_campaign(root: Path, campaign_id: str) -> Optional[Dict[str, Any]]:
     if found is not None:
         record = _read_json(found / "campaign.json")
         if record is not None and record.get("campaign_id") == campaign_id:
-            return record
+            return artifact_campaign.fold_campaign(root, found / "campaign.json", record)
     fallback = _read_json(Path(root) / "campaigns" / campaign_id / "campaign.json")
-    return fallback if fallback is not None and fallback.get("campaign_id") == campaign_id else None
+    if fallback is not None and fallback.get("campaign_id") == campaign_id:
+        return artifact_campaign.fold_campaign(root, Path(root) / "campaigns" / campaign_id / "campaign.json", fallback)
+    return None
 
 
 def find_campaign_by_key(root: Path, key: str) -> Optional[Dict[str, Any]]:
@@ -737,6 +740,8 @@ def find_campaign_by_key(root: Path, key: str) -> Optional[Dict[str, Any]]:
         return None
     for entry in artifact_locator.iter_campaign_dirs(root):
         record = _read_json(entry / "campaign.json")
+        if record:
+            record = artifact_campaign.fold_campaign(root, entry / "campaign.json", record)
         if record and record.get("key") == key and record.get("state") == "active":
             return record
     return None
@@ -744,6 +749,7 @@ def find_campaign_by_key(root: Path, key: str) -> Optional[Dict[str, Any]]:
 
 def _write_campaign(root: Path, record: Dict[str, Any], *, exclusive: bool) -> None:
     path = _campaign_path(root, record["campaign_id"], record)
+    artifact_campaign.check_campaign_write(root, path, record)
     _ensure_dir(path.parent)
     if exclusive:
         _write_exclusive(path, _json_bytes(record))
@@ -1046,6 +1052,10 @@ def begin(
                 raise ProducerError("campaign-unknown", campaign_id)
         elif campaign_key:
             campaign = find_campaign_by_key(root, campaign_key)
+            if campaign is None:
+                previous = _find_campaign_by_key_any_state(root, campaign_key)
+                if previous is not None:
+                    raise ProducerError("campaign-not-active", previous["campaign_id"])
         if parent_cycle_id:
             parent = read_cycle_record(root, parent_cycle_id)
             if parent is None or parent.get("state") not in {"open", "sealed"}:
@@ -3067,7 +3077,7 @@ def _find_campaign_by_key_any_state(root: Path, key: str) -> Optional[Dict[str, 
     for entry in artifact_locator.iter_campaign_dirs(root):
         record = _read_json(entry / "campaign.json")
         if record and record.get("key") == key:
-            return record
+            return artifact_campaign.fold_campaign(root, entry / "campaign.json", record)
     return None
 
 
@@ -3427,6 +3437,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p = sub.add_parser("status")
     p.add_argument("--artifact-root", required=True)
 
+    for command in ("campaign-status", "campaign-close", "campaign-recover"):
+        p = sub.add_parser(command, help="verify, accept, or recover a campaign's administrative closure")
+        p.add_argument("--artifact-root", required=True)
+        p.add_argument("--campaign", required=True, help="campaign ID or campaign.json path")
+        if command == "campaign-close":
+            p.add_argument("--approval-harness", choices=("claude", "codex", "opencode"))
+            p.add_argument("--approval-session", help="native session containing the USER's exact approval statement")
+
     p = sub.add_parser("begin")
     p.add_argument("--artifact-root", required=True)
     p.add_argument(
@@ -3533,6 +3551,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                               w7=w7, approval_receipt_sha256=args.approval_receipt_sha256)
         elif args.command == "status":
             result = status(root)
+        elif args.command == "campaign-status":
+            result = artifact_campaign.status(root, args.campaign)
+        elif args.command in {"campaign-close", "campaign-recover"}:
+            result = artifact_campaign.close(root, args.campaign,
+                harness=getattr(args, "approval_harness", None),
+                session=getattr(args, "approval_session", None), recover=args.command == "campaign-recover")
         elif args.command == "begin":
             pins: List[Dict[str, Any]] = []
             for row in args.shared_reference:
@@ -3611,7 +3635,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except artifact_admission.AdmissionRecoveryRequired as exc:
         _print({"status": "blocked", "reason": "recovery-required", "detail": str(exc)})
         return BLOCKED
-    except artifact_lifecycle.LifecycleError as exc:
+    except (artifact_lifecycle.LifecycleError, artifact_campaign.CampaignError) as exc:
         _print({"status": "blocked", "reason": exc.code, "detail": exc.detail})
         return BLOCKED
     except (OSError, ValueError) as exc:

@@ -303,6 +303,12 @@ def scan_index(root: Path) -> Tuple[Dict[str, str], Dict[str, Dict[str, str]]]:
 
     for campaign_path in iter_campaign_dirs(root):
         campaign = _read_json(campaign_path / "campaign.json")
+        if campaign is not None:
+            from artifact_campaign import CampaignError, fold_campaign
+            try:
+                campaign = fold_campaign(root, campaign_path / "campaign.json", campaign)
+            except CampaignError as exc:
+                raise LocatorError(exc.code, exc.detail) from exc
         manifest_campaign = _campaign_from_manifests(campaign_path)
         if campaign is None:
             campaign = manifest_campaign

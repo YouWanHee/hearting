@@ -217,6 +217,24 @@ writes to them are blocked.
 global depth-1 rule. The per-shape boundary table is owned by the component
 blueprint `spec/artifact-path-contract/prd.md` D-23; it is not restated here.
 
+**Campaign closure.** `artifact_producer.py campaign-status|campaign-close|campaign-recover`
+owns administrative satisfaction. Status verifies the campaign's exact cycle
+membership, sealed manifests and their payloads and prints a reviewable goal,
+criterion and approval statement bound to that snapshot. Sealed abandoned
+cycles remain abandoned; this operation neither repairs route failure markers
+nor adds a residual-zero criterion. All cycles being sealed never substitutes
+for the user's acceptance of the goal and criterion. Close accepts the exact
+statement only from a native user message in the named session, derives the
+user actor from that evidence, and rechecks the snapshot under the producer's
+admission lock. Caller-authored actor/approval JSON is not authority.
+An immutable campaign event is the commit point; campaign.json is its
+recoverable projection. Readers and begin honor a committed close even after
+a crash before projection. Same-event replay is idempotent, conflicting state
+is preserved, and campaign-recover completes only that committed projection.
+Cycle manifests and route evidence remain immutable. Unavailable native
+evidence leaves closure pending and reports the explicit approval statement;
+an agent never submits that statement on the user's behalf.
+
 **Exactly one disposition.** Except for `_scratch/`, every regular file and
 container under the artifact root has exactly one disposition, and none is left
 unclassified. Classification implies no destructive action: a `C-LEG` name is
