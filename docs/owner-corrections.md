@@ -77,3 +77,19 @@ terminal 결과와 교정 통보는 별도이므로 입력 영수증 저장 실�
 새 입력 계약이 없는 기존 실행 중 supervisor는 접수 전에 unsupported를 반환한다.
 설치 업데이트가 이미 실행 중인 pinned 프로세스를 바꾸지는 않는다. 운영 home-os owner,
 제품 파일, route, 원장, marker, proof를 이번 검증으로 변경하지 않았다.
+
+## 배포 확인
+
+구현 `e47bd942`는 main에 병합·푸시됐고
+[v2.141.2](https://github.com/dmlguq456/hearting/releases/tag/v2.141.2)로 배포했다.
+Release 실행 `34763860904` 성공. 게시된 아카이브 SHA256은
+`62247d35114280acf5d5904ce78f79678cce46b23848f8dbb93ea19c59fe4064`이다.
+2026-09-13 세 로컬 하네스 설치 후 strict doctor가 모두 fresh, verify drift 0을 반환했다.
+배포본의 변경 파일 13개가 커밋 소스와 바이트 단위로 일치하며, 설치 전후 점검한 사용자
+설정·인증 파일 10개는 불변이었다. 신규 input 검사는 최종 14건이며 실제 Luna 교정도
+확정 커밋에서 다시 통과했다.
+
+로컬 근거: `/tmp/owner-input-native-evidence.json`,
+`/tmp/owner-input-final2.tsv`, `/tmp/owner-input-surface-tests.tsv`,
+`/tmp/owner-input-release-tests.tsv`, `/tmp/owner-input-installed-integrity.json`,
+`/tmp/owner-input-installed-doctor.json`. 운영 로그 원문은 공개 첨부하지 않았다.
