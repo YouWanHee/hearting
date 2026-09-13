@@ -76,3 +76,27 @@ python3 <new-release>/utilities/dispatch_terminal_commit.py finish --jobs <canon
 checks. The repair session does not rerun product work or force operating records.
 Older pinned validators still reject newly supported payload names; installed
 consumers and the explicitly selected recovery helper must use the fixed release.
+
+## Released and observed
+
+Source `e9a597d1ae9eb136c6fbb86c5f599d74411646ad` is published as
+[v2.141.1](https://github.com/dmlguq456/hearting/releases/tag/v2.141.1).
+The [release run](https://github.com/dmlguq456/hearting/actions/runs/34759227029)
+passed validation, packaging and the published-release smoke test. All three
+local runtimes are installed, strict doctor reports fresh, and verify reports
+no drift. The 13 changed release files match the source commit; the 11 observed
+user settings/authentication files are unchanged. Installed locator, transaction
+recovery and real join-error subprocess tests passed.
+
+The product owner then ran the supplied normal exact `finish` command. Independent
+read-only checks confirmed `completed / quiescent / owner-envelope-sealed`, an
+unchanged report evidence digest, all 47 original files unchanged, and all 46
+payloads (including `.last-run.json`) present with matching sizes and hashes.
+Manifest, producer record and admission-index digests agree; installed exact
+cycle verification returns `already-sealed`. Product work was not rerun. The
+observer session performed no operating-record repair.
+
+Local verification records: `/tmp/hidden-final-verification.json`,
+`/tmp/homeos-hidden-settlement-observation.json`,
+`/tmp/homeos-hidden-installed-inspect.json`, `/tmp/hidden-installed-integrity.json`,
+`/tmp/hidden-runtime-doctor.json`, `/tmp/hidden-runtime-verify.json`.
