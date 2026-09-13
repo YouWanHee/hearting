@@ -380,6 +380,9 @@ def materialize_after_terminal_close(jobs: Path, attempt_id: str) -> Path | None
         row = current_attempt_row(jobs, attempt_id)
         if row is None:
             return None
+        if row.metadata.get("worker_type") == "owner":
+            from dispatch_owner_input import materialize_unresolved
+            materialize_unresolved(jobs, attempt_id)
         if row.metadata.get("workflow_completion") == "runtime-v1":
             from dispatch_terminal_commit import settle_owner_completion
             settlement = settle_owner_completion(jobs, row.status, row.metadata)
@@ -498,6 +501,9 @@ def reconcile_pending_delivery(jobs: Path) -> dict[str, int]:
         attempt_id = metadata.get("attempt_id", "")
         if attempt_id:
             rows_by_attempt[attempt_id] = metadata
+        if attempt_id and metadata.get("worker_type") == "owner":
+            from dispatch_owner_input import materialize_unresolved
+            materialize_unresolved(jobs, attempt_id)
         if attempt_id and metadata.get("delivery_intent") == "1":
             record_file = None
             if metadata.get("parent_sid") and metadata.get("delivery_id"):

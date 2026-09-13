@@ -359,6 +359,10 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
         return {**result, "state": "needs-attention", "reason": "owner-launch-not-admitted"}
     status, metadata = rows[aid]
     result.update(owner_attempt_id=aid, owner_started=metadata.get("launch_started") == "1")
+    result["correction_command"] = shlex.join([
+        sys.executable, str(ROOT / "utilities/capability-route.py"), "correct",
+        "--jobs", str(jobs), "--attempt-id", aid,
+    ])
     if status == "done" and metadata.get("failure_class") == "pass":
         from dispatch_terminal_commit import owner_workflow_gaps
         missing = owner_workflow_gaps(jobs, metadata, route)

@@ -743,6 +743,7 @@ def drive_serial_chain(
     reconcile: Callable[[dict, set[str]], bool], max_reparks: int,
     on_timeout: Callable[[set[str]], None] | None = None,
     on_advance: Callable[[str, frozenset[str]], None] | None = None,
+    allow_advance: Callable[[], bool] | None = None,
     emit: Callable[[dict], None] | None = None,
 ) -> ChainDriveResult:
     """Run every serial successor at one non-model supervisor checkpoint."""
@@ -778,6 +779,8 @@ def drive_serial_chain(
             receipt = join(set(attempts))
             joined_rows = refresh(set(attempts))
             joined = {row.attempt_id: row for row in joined_rows}
+        if allow_advance is not None and not allow_advance():
+            break
         step = advance_chain_step(jobs, parent_attempt_id, joined)
         if step.outcome != "advanced":
             refusal = step if step.outcome == "refused" else None

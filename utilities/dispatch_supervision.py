@@ -19,7 +19,7 @@ from dispatch_receipt_identity import receipt_digest
 import dispatch_pending_delivery as pending_delivery
 
 KIND = "supervision"
-REASONS = frozenset({"no-progress", "process-unverifiable", "join-deadline", "supervisor-exited", "join-observer-failed", "terminal-evidence-conflict", "workflow-completion-pending"})
+REASONS = frozenset({"owner-input-undelivered", "no-progress", "process-unverifiable", "join-deadline", "supervisor-exited", "join-observer-failed", "terminal-evidence-conflict", "workflow-completion-pending"})
 
 
 class SupervisionError(ValueError):
@@ -67,7 +67,10 @@ def _root(rows: dict, attempt: str) -> str:
     raise SupervisionError("supervision-lineage-unresolved")
 
 
-def _pending(rows: dict, attempts: list[str], jobs: Path) -> bool:
+def _pending(rows: dict, attempts: list[str], jobs: Path, reason=None) -> bool:
+    if reason == "owner-input-undelivered":
+        from dispatch_owner_input import unresolved
+        return any(unresolved(jobs, aid) for aid in attempts)
     from dispatch_contract import observed_attempt_liveness
     from codex_dispatch_terminal import terminal_envelope_observed
     for aid in attempts:
@@ -88,7 +91,11 @@ def _pending(rows: dict, attempts: list[str], jobs: Path) -> bool:
     return False
 
 
-def _obligation_revision(rows: dict, attempts: list[str], reason: str) -> str:
+def _obligation_revision(rows: dict, attempts: list[str], reason: str, jobs=None) -> str:
+    if reason == "owner-input-undelivered":
+        from dispatch_owner_input import unresolved_revision
+        return hashlib.sha256(json.dumps([(aid, unresolved_revision(jobs, aid))
+                                          for aid in attempts]).encode()).hexdigest()
     if reason != "terminal-evidence-conflict":
         return ""
     value = [(aid, terminal_conflict_digest(rows[aid][1])) for aid in attempts]
@@ -117,7 +124,7 @@ def materialize(jobs: Path, attempts: set[str], *, reason: str) -> list[dict]:
             "recipient_thread_id": recipient,
             "sealed_batch_id": meta.get("managed_sealed_batch_id", ""),
             "job_registry": str(jobs), "reason": reason,
-            "obligation_revision": _obligation_revision(rows, monitored, reason),
+            "obligation_revision": _obligation_revision(rows, monitored, reason, jobs),
             "responsible": "supervision-controller", "required_action": "inspect-recovery",
         }
         key = hashlib.sha256(json.dumps(receipt, sort_keys=True).encode()).hexdigest()
@@ -189,9 +196,9 @@ def validate_receipt(receipt: dict, *, jobs: Path, expected_thread_id: str,
             or any(_root(rows, aid) != owner for aid in receipt["monitored_attempt_ids"])):
         raise SupervisionError("supervision-lineage-mismatch")
     # A recovered batch must not receive an obsolete intervention request.
-    if _obligation_revision(rows, receipt["monitored_attempt_ids"], receipt["reason"]) != receipt["obligation_revision"]:
+    if _obligation_revision(rows, receipt["monitored_attempt_ids"], receipt["reason"], Path(receipt["job_registry"])) != receipt["obligation_revision"]:
         raise SupervisionError("supervision-resolved")
-    if validate_live and not _pending(rows, receipt["monitored_attempt_ids"], jobs):
+    if validate_live and not _pending(rows, receipt["monitored_attempt_ids"], jobs, receipt["reason"]):
         raise SupervisionError("supervision-resolved")
     record = pending_delivery.read(jobs.parent, expected_thread_id, receipt["pending_delivery_id"])
     if record is None or record.get("receipt") != receipt:
@@ -224,13 +231,20 @@ def notice_is_current(record: dict) -> bool:
     if (owner not in rows or rows[owner][1].get("parent_sid") != receipt["recipient_thread_id"]
             or any(_root(rows, aid) != owner for aid in receipt["monitored_attempt_ids"])):
         raise SupervisionError("supervision-lineage-mismatch")
-    if _obligation_revision(rows, receipt["monitored_attempt_ids"], receipt["reason"]) != receipt["obligation_revision"]:
+    if _obligation_revision(rows, receipt["monitored_attempt_ids"], receipt["reason"], Path(receipt["job_registry"])) != receipt["obligation_revision"]:
         return False
-    return _pending(rows, receipt["monitored_attempt_ids"], Path(receipt["job_registry"]))
+    return _pending(rows, receipt["monitored_attempt_ids"], Path(receipt["job_registry"]), receipt["reason"])
 
 
 def render_text(receipt: dict) -> str:
     receipt = validate(receipt)
+    if receipt["reason"] == "owner-input-undelivered":
+        command = shlex.join(["python3", str(Path(__file__).with_name("capability-route.py")),
+                              "correct", "--jobs", receipt["job_registry"],
+                              "--attempt-id", receipt["owner_attempt_id"]])
+        return ("A user correction was not delivered, or its delivery is unknown. "
+                "The execution result is unchanged. Read the exact input receipts, tell the user "
+                "what remains unconfirmed, and do not resend an unknown input automatically. " + command)
     if receipt["reason"] == "workflow-completion-pending":
         utility = Path(__file__).with_name("dispatch_terminal_commit.py")
         command = (f"python3 {shlex.quote(str(utility))} finish --jobs {shlex.quote(receipt['job_registry'])} "

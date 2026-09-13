@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import queue
+import threading
 import os
 from pathlib import Path
 import shlex
@@ -13,6 +15,7 @@ import sys
 import time
 from typing import Any
 from dispatch_receipt_identity import JOIN_REASONS, COMPLETION_ACTIONS
+from dispatch_owner_input import OwnerInput
 
 from dispatch_completion_join import (
     JoinContractError,
@@ -535,6 +538,14 @@ class AppServer:
             raise SupervisorError("app-server-launch-failed") from exc
         self.next_id = 1
         self.pending: list[dict[str, Any]] = []
+        self.input_control = None
+        self.messages = queue.Queue()
+        def receive():
+            for line in self.process.stdout:
+                self.messages.put(line)
+            self.messages.put("")
+        self.reader = threading.Thread(target=receive, daemon=True)
+        self.reader.start()
 
     def send(self, value: dict[str, Any]) -> None:
         if self.process.stdin is None:
@@ -545,7 +556,14 @@ class AppServer:
     def read(self) -> dict[str, Any]:
         if self.process.stdout is None:
             raise SupervisorError("app-server-stdout-closed")
-        line = self.process.stdout.readline()
+        while True:
+            if self.input_control is not None:
+                self.input_control.tick(self)
+            try:
+                line = self.messages.get(timeout=0.2)
+                break
+            except queue.Empty:
+                continue
         if not line:
             raise SupervisorError("app-server-eof")
         try:
@@ -554,6 +572,8 @@ class AppServer:
             raise SupervisorError("app-server-protocol-json-invalid") from exc
         if not isinstance(value, dict):
             raise SupervisorError("app-server-protocol-shape-invalid")
+        if self.input_control is not None and self.input_control.response(value):
+            return self.read()
         return value
 
     def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -588,6 +608,12 @@ class AppServer:
             except subprocess.TimeoutExpired:
                 self.process.kill()
                 self.process.wait(timeout=5)
+
+        if self.process.stdin is not None:
+            self.process.stdin.close()
+        self.reader.join(timeout=1)
+        if not self.reader.is_alive() and self.process.stdout is not None:
+            self.process.stdout.close()
 
 
 def sandbox_policy(args: argparse.Namespace) -> dict[str, Any]:
@@ -630,6 +656,9 @@ def run_turn(
     if not isinstance(turn, dict) or not isinstance(turn.get("id"), str):
         raise SupervisorError("turn-start-response-invalid")
     turn_id = turn["id"]
+    control = getattr(args, "owner_input", None)
+    if control is not None:
+        control.started(turn_id)
     emit({"type": "dispatch.supervisor.turn.started", "turn_id": turn_id})
     final_text: str | None = None
     final_item: dict[str, Any] | None = None
@@ -670,6 +699,8 @@ def run_turn(
         ):
             if not isinstance(completed, dict) or completed.get("status") != "completed":
                 raise SupervisorError("app-server-turn-failed")
+            if control is not None:
+                control.completed(turn_id)
             return final_text, final_item
 
 
@@ -884,6 +915,7 @@ def main(argv: list[str] | None = None) -> int:
         runtime_env["AGENT_DISPATCH_COMPLETION_STATE_FILE"] = str(state_path)
     runtime_env["AGENT_DISPATCH_SUPERVISOR_LEASE_FILE"] = str(lease_path)
     server: AppServer | None = None
+    control = None
     lease = hold_supervisor_lease(
         args.jobs, args.parent_attempt_id, lease_path
     )
@@ -952,6 +984,8 @@ def main(argv: list[str] | None = None) -> int:
         if not isinstance(thread, dict) or not isinstance(thread.get("id"), str):
             raise SupervisorError("thread-start-response-invalid")
         thread_id = thread["id"]
+        control = OwnerInput(args.jobs, args.parent_attempt_id, thread_id, "codex-active-turn", emit)
+        args.owner_input = server.input_control = control
 
         launch_remediated: set[tuple[str, ...]] = set()
         next_prompt = prompt
@@ -977,6 +1011,7 @@ def main(argv: list[str] | None = None) -> int:
                 write_supervisor_state(
                     state_path, args.parent_attempt_id, delivered, phase="running-turn"
                 )
+            next_prompt = control.prepare(next_prompt)
             final_text, _final_item = run_turn(
                 server, thread_id=thread_id, prompt=next_prompt, args=args
             )
@@ -1014,6 +1049,9 @@ def main(argv: list[str] | None = None) -> int:
                     continuations += 1
                     continue
                 completed_delivery = True
+            if control.pending():
+                next_prompt = "Continue the same work using the pending user correction; preserve active children."
+                continue
             new_attempts = set(current).difference(delivered)
             partition = partition_runtime_wait_children(
                 Path(args.jobs), args.parent_attempt_id,
@@ -1153,6 +1191,7 @@ def main(argv: list[str] | None = None) -> int:
                         join=lambda attempts: run_join(args, attempts),
                         reconcile=lambda rows, attempts: runtime_reconcile(args, rows, attempts),
                         max_reparks=args.max_join_reparks,
+                        allow_advance=lambda: not control.pending(),
                         emit=emit,
                     )
                 except subsession_advance.ChainDriveError as exc:
@@ -1176,7 +1215,7 @@ def main(argv: list[str] | None = None) -> int:
                     receipt["delivery_timing"]
                 )
                 current_rows = current_children(Path(args.jobs), args.parent_attempt_id)
-                advanced_record = attempt_stage_advance(
+                advanced_record = None if control.pending() else attempt_stage_advance(
                     args,
                     current_rows,
                     set(new_attempts),
@@ -1258,6 +1297,10 @@ def main(argv: list[str] | None = None) -> int:
                     emit=emit,
                 )
 
+            if not control.terminal_boundary():
+                active_outbox = None
+                next_prompt = "Address the pending user correction before finishing this same work."
+                continue
             terminal = classify_codex_result(final_text)
             if terminal.failure_class == "pass":
                 from dispatch_terminal_commit import owner_workflow_continuation
@@ -1272,6 +1315,7 @@ def main(argv: list[str] | None = None) -> int:
                         raise SupervisorError("workflow-completion-incomplete")
                     emit({"type": "dispatch.supervisor.resumed", "parent_attempt_id": args.parent_attempt_id,
                           "continuation_reason": "workflow-completion-incomplete", "continuation_ordinal": continuations + 1})
+                    control.reopen()
                     next_prompt = _apply_notice(correction, notice)
                     continuations += 1
                     continue
@@ -1324,8 +1368,12 @@ def main(argv: list[str] | None = None) -> int:
         return 70
     finally:
         try:
-            if server is not None:
-                server.close()
+            try:
+                if control is not None:
+                    control.close()
+            finally:
+                if server is not None:
+                    server.close()
         finally:
             try:
                 open_children = {

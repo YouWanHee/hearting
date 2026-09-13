@@ -6102,6 +6102,11 @@ def main():
     start.add_argument("--interview",type=Path,help="semantic frame question; runtime owns its registration and cycle fields")
     start.add_argument("--answers",type=Path,help="actual native answers; runtime records intent and releases the gate")
     start.add_argument("--decision",choices=("proceed","revise","stop"),default="proceed")
+    correction=sub.add_parser("correct", help="deliver a correction to one existing owner; without a message file, inspect its receipts")
+    correction.add_argument("--attempt-id", required=True)
+    correction.add_argument("--jobs", type=Path)
+    correction.add_argument("--message-file", type=Path)
+    correction.add_argument("--request-id", help="stable idempotency key; defaults to the message digest")
     co=sub.add_parser("continuation")
     co.add_argument("--source-route",required=True)
     co.add_argument("--resume-from-node",required=True)
@@ -6191,6 +6196,18 @@ def main():
         if a.start:
             from work_start import start_work
             print(json.dumps(start_work(route,path,Path(a.jobs or _compose_default_jobs())),ensure_ascii=False))
+        return 0
+    if a.command=="correct":
+        from dispatch_owner_input import submit, inspect, InputError
+        jobs=Path(a.jobs or _compose_default_jobs())
+        try:
+            result=(submit(jobs,a.attempt_id,a.message_file.read_text(),a.request_id)
+                    if a.message_file else inspect(jobs,a.attempt_id))
+        except InputError as exc:
+            print(json.dumps({"state":"not-admitted","reason":str(exc),
+                              "next_step":"Retain the correction. Inspect the exact owner; do not restart it or treat a file edit as delivery."}))
+            return 69
+        print(json.dumps(result,ensure_ascii=False))
         return 0
     if a.command=="start":
         from work_start import start_work

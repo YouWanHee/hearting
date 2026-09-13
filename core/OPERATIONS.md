@@ -830,6 +830,19 @@ both is a resource job whose payload is a `compute-hosts run` invocation.
 
 ### §5.14. Peer-Session Steering (steward role)
 
+Registered owner corrections belong to the execution supervisor, through
+`capability-route.py correct --attempt-id <id> --message-file <file>` (omit the
+file to inspect). The exact attempt and its live supervisor lease bind one
+durable input receipt; repeating a request ID returns that receipt. Codex uses
+its existing App Server connection to steer an active turn. CLI transports
+retain the input for the next turn in the same owner. Pending input takes
+precedence over automatic stage advancement and terminal closure. A transport
+receipt proves delivery, not implementation; an interrupted send remains
+unknown and is handed back through the existing supervision notice carrier.
+Old supervisors without this input contract report unsupported before queueing.
+Corrections preserve route, completion and cleanup evidence; completed-prefix
+reuse uses the existing `continuation` compiler rather than a fresh recipe.
+
 A steward is informally depth −1; not a dispatch depth. This role carries no launch,
 gate, write, or approval authority over the session it addresses — its peer messages are
 advisory context between two already-running sessions, and the append-only ledger below

@@ -11,6 +11,7 @@ from pathlib import Path
 import selectors
 import shlex
 import subprocess
+from dispatch_owner_input import OwnerInput
 import sys
 import time
 from typing import Any, NamedTuple
@@ -1310,6 +1311,7 @@ def main(argv: list[str] | None = None) -> int:
         args.jobs, args.parent_attempt_id, args.lease_file or ""
     )
     lease_acquired = False
+    control = None
     lease_exit: tuple[object, object, object] = (None, None, None)
     try:
         lease.__enter__()
@@ -1318,6 +1320,13 @@ def main(argv: list[str] | None = None) -> int:
             recovered_rc = recover_cleanup_on_startup(args)
             if recovered_rc is not None:
                 return recovered_rc
+        if args.runtime_harness == "opencode":
+            from opencode_session_runtime import read_binding
+            input_thread = read_binding(args) or "pending-native-session"
+        else:
+            input_thread = session_id
+        control = OwnerInput(args.jobs, args.parent_attempt_id, input_thread,
+                             args.runtime_harness + "-next-turn", emit)
         if turn_transport == "stream-json":
             stream_session = ClaudeStreamSession(args, session_id)
         recovered = read_supervisor_phase_state(
@@ -1394,6 +1403,8 @@ def main(argv: list[str] | None = None) -> int:
             )
             turn_kwargs = ({"handoff_intent": pending_handoff_intent}
                            if pending_handoff_intent is not None else {})
+            if pending_handoff_intent is None:
+                next_prompt = control.prepare(next_prompt)
             result, process_rc = run_turn(
                 args,
                 session_id,
@@ -1402,6 +1413,11 @@ def main(argv: list[str] | None = None) -> int:
                 stream_session=stream_session,
                 **turn_kwargs,
             )
+            if args.runtime_harness == "opencode":
+                control.bind_initial_thread(read_binding(args))
+            if process_rc == 0:
+                control.started(str(turn_ordinal))
+                control.completed(str(turn_ordinal))
             if pending_handoff_intent is not None:
                 # A cleanup turn is terminal even when the model asks for
                 # another continuation. No second cleanup or new child.
@@ -1497,6 +1513,10 @@ def main(argv: list[str] | None = None) -> int:
                     resume = True
                     continue
                 completed_delivery = True
+            if pending_handoff_intent is None and process_rc == 0 and not result.get("is_error") and control.pending():
+                next_prompt = "Continue the same work using the pending user correction; preserve active children."
+                resume = True
+                continue
             new_attempts = set(current).difference(delivered)
             partition = partition_runtime_wait_children(
                 Path(args.jobs), args.parent_attempt_id,
@@ -1635,7 +1655,8 @@ def main(argv: list[str] | None = None) -> int:
                         refresh=lambda attempts: current_children(Path(args.jobs), args.parent_attempt_id, attempts),
                         join=lambda attempts: run_join(args, attempts),
                         reconcile=lambda rows, attempts: runtime_reconcile(args, rows, attempts),
-                        max_reparks=args.max_join_reparks, on_advance=_advance_claim,
+                        max_reparks=args.max_join_reparks,
+                        allow_advance=lambda: not control.pending(), on_advance=_advance_claim,
                         emit=emit,
                     )
                 except subsession_advance.ChainDriveError as exc:
@@ -1660,7 +1681,7 @@ def main(argv: list[str] | None = None) -> int:
                     receipt["delivery_timing"]
                 )
                 current_rows = current_children(Path(args.jobs), args.parent_attempt_id)
-                advanced_record = attempt_stage_advance(
+                advanced_record = None if control.pending() else attempt_stage_advance(
                     args, current_rows, set(new_attempts), delivery_timing
                 )
                 # §13.32.1-(2)6/(3)B: the same `--enable-stage-advance` gate
@@ -1679,12 +1700,16 @@ def main(argv: list[str] | None = None) -> int:
                 # its event sequence remain exactly the historical behavior.
                 terminal_commit_mode = terminal_commit_enabled(args)
                 sealed_envelope = None
-                if terminal_commit_mode:
+                if not control.terminal_boundary():
+                    terminal_nodes = ()
+                elif terminal_commit_mode:
                     settled = terminal_commit_adapter(args, current_rows)
                     terminal_nodes = settled.terminal_nodes if settled.result == "completed" else ()
                     sealed_envelope = settled.envelope_text if settled.result == "completed" else None
                 else:
                     terminal_nodes = terminal_route_completion(args, current_rows)
+                if not terminal_nodes:
+                    control.reopen()
                 if terminal_nodes:
                     if not terminal_commit_mode:
                         emit(
@@ -1833,6 +1858,10 @@ def main(argv: list[str] | None = None) -> int:
                     emit=emit,
                 )
 
+            if process_rc == 0 and not result.get("is_error") and not control.terminal_boundary():
+                next_prompt = "Address the pending user correction before finishing this same work."
+                resume = True
+                continue
             terminal = classify_runtime_result(args, result, process_rc)
             if terminal.failure_class == "pass":
                 from dispatch_terminal_commit import owner_workflow_continuation
@@ -1847,6 +1876,7 @@ def main(argv: list[str] | None = None) -> int:
                         raise SupervisorError("workflow-completion-incomplete")
                     emit({"type": "dispatch.supervisor.resumed", "parent_attempt_id": args.parent_attempt_id,
                           "continuation_reason": "workflow-completion-incomplete", "continuation_ordinal": continuations + 1})
+                    control.reopen()
                     next_prompt = _apply_notice(correction, notice)
                     continuations += 1
                     resume = True
@@ -1922,6 +1952,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 70
     finally:
+        if control is not None:
+            control.close()
         if stream_session is not None:
             stream_session.close()
         try:
