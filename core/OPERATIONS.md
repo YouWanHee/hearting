@@ -680,7 +680,9 @@ Missing observation keeps the cleanup obligation and its durable supervision
 notice open. A later proof settles it without a new model turn or cancellation.
 Historical artifact and residue seals remain audit evidence: a valid artifact
 never proves that a live descendant stopped. The launcher/watchdog owns signals;
-join/reconcile own proof recovery and notification, not guessed process death.
+join/reconcile own proof recovery, bounded typed observer-error diagnostics and
+notification, not guessed process death. The shared controller retains the same
+batch across observation failures.
 
 A terminal `capability-owner` node is executed by the bound depth-1 owner.
 The shared terminal observer consumes that owner's exact native PASS, readable

@@ -280,6 +280,53 @@ except d.DispatchContractError as e: print(json.dumps({'reason':e.reason}))
         records = list(pending.record_directory(self.root, "parent-test").glob("delivery-*.json"))
         self.assertEqual(json.loads(records[0].read_text())["receipt"]["reason"], "join-observer-failed")
 
+    def test_join_error_keeps_exact_typed_reason_but_rejects_foreign_or_raw_output(self):
+        valid = dict(schema_version=2, state="contract-error", parent_attempt_id="att-owner",
+                     children=[], reason="join-internal-error-PermissionError")
+        self.assertIn("exit=69:reason=join-internal-error-PermissionError",
+                      supervision.join_process_error(69, valid, "att-owner"))
+        for change in ({"parent_attempt_id": "att-foreign"}, {"state": "ready"},
+                       {"reason": "secret log: /private/path\nbody"}, {"reason": "x" * 129},
+                       {"children": [{"attempt_id": "att-child"}]}):
+            self.assertTrue(supervision.join_process_error(69, {**valid, **change}, "att-owner")
+                            .endswith("reason=unverified-error-receipt"))
+
+    def test_runtime_join_error_reaches_shared_wait_and_next_observation_recovers(self):
+        from types import SimpleNamespace
+        self._notice_rows()
+        before = self.jobs.read_bytes()
+        # Claude and OpenCode use the same session supervisor implementation.
+        for filename in ("claude-session-supervisor.py", "codex-app-server-supervisor.py"):
+            with self.subTest(supervisor=filename):
+                source = Path(__file__).with_name(filename)
+                spec = importlib.util.spec_from_file_location("join_error_" + filename.replace("-", "_"), source)
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[spec.name] = module
+                spec.loader.exec_module(module)
+                script = self.root / "failed-observer.py"
+                script.write_text('import json\nprint(json.dumps(dict(schema_version=2, '
+                                  'state="contract-error", parent_attempt_id="att-owner", children=[], '
+                                  'reason="join-internal-error-PermissionError")))\nraise SystemExit(69)\n')
+                import shlex
+                args = SimpleNamespace(join_command=shlex.join([sys.executable, str(script)]),
+                                       jobs=str(self.jobs), parent_attempt_id="att-owner",
+                                       join_interval=0.01, join_timeout=0)
+                def first_join(attempts):
+                    return module.run_join(args, attempts)
+                count = 0
+                def observer(attempts):
+                    nonlocal count
+                    count += 1
+                    return first_join(attempts) if count == 1 else {"state": "ready"}
+                events = []
+                with mock.patch.object(supervision.time, "sleep"), mock.patch.object(module, "emit"):
+                    result = supervision.wait_for_batch(join=observer, attempts={"att-child"},
+                        jobs=self.jobs, parent_attempt_id="att-owner", emit=events.append)
+                self.assertEqual(result["state"], "ready")
+                self.assertIn("exit=69:reason=join-internal-error-PermissionError", events[0]["observer_error"])
+                self.assertEqual(events[0]["responsible"], "supervision-controller")
+                self.assertEqual(self.jobs.read_bytes(), before)
+
     def test_wait_owns_more_than_old_seven_checkpoints_without_model_resume(self):
         self._notice_rows()
         join = mock.Mock(side_effect=[{"state": "timeout"} for _ in range(9)] + [{"state": "ready"}])

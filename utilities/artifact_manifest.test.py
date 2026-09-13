@@ -348,6 +348,28 @@ class TestLocatorSafety(unittest.TestCase):
         self.assertIn("locator-empty", _codes(m.validate_locators(self._with_path(""))))
         self.assertIn("locator-trailing-slash", _codes(m.validate_locators(self._with_path("a/"))))
 
+    def test_payload_names_preserve_dotfiles_without_admitting_path_escape(self):
+        for path in ("artifacts/evidence/test-results/.last-run.json",
+                     "artifacts/.coverage", "artifacts/.test-cache/result.json"):
+            with self.subTest(path=path):
+                self.assertTrue(m.validate(self._with_path(path)).ok)
+                self.assertTrue(m.validate_locator_path(path).ok)
+        for path, code in (
+            ("artifacts/../.credentials", "locator-dot-segment"),
+            ("artifacts/./result", "locator-dot-segment"),
+            ("artifacts//.result", "locator-empty-component"),
+            ("artifacts/.result\n", "locator-control-char"),
+            ("/artifacts/.result", "locator-absolute"),
+            ("artifacts/." + "a" * 128, "locator-invalid-component"),
+            ("artifacts/.cache/manifest.json", "locator-reserved-name"),
+            ("artifacts-shadow/.result", "locator-hidden-component"),
+            (".runtime/result", "locator-hidden-component"),
+            (".cycle.json", "locator-hidden-component"),
+        ):
+            with self.subTest(path=path):
+                self.assertIn(code, _codes(m.validate_locators(self._with_path(path))))
+                self.assertIn(code, _codes(m.validate_locator_path(path)))
+
     def test_rejects_reserved_manifest_filename_locator(self):
         self.assertIn("locator-reserved-name", _codes(m.validate_locators(self._with_path("manifest.json"))))
 

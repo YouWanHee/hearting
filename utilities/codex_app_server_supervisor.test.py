@@ -394,8 +394,10 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
             "import sys, runpy, os\nfrom pathlib import Path\nfrom types import SimpleNamespace\n"
             + "sys.path.insert(0, " + repr(str(SUPERVISOR.parent)) + ")\n"
             + "import dispatch_terminal_commit as T\n"
-            + "T._route_module = lambda: SimpleNamespace(terminal_gate_observation=lambda *a, **k: "
-              "{'report': {'passed': Path(os.environ['FAKE_REPORT_PROOF']).exists(), 'reason': 'marker-unreadable'}})\n"
+            + "route_module = T._route_module()\n"
+            + "route_module._marker_identity_row = lambda *a, **k: "
+              "{'passed': Path(os.environ['FAKE_REPORT_PROOF']).exists(), 'reason': 'marker-unreadable'}\n"
+            + "T._route_module = lambda: route_module\n"
             + "runpy.run_path(" + repr(str(SUPERVISOR)) + ", run_name='__main__')\n")
         self.app.write_text(self.app.read_text().replace("turns += 1", "turns += 1\n        if turns == 2: open(os.environ['FAKE_REPORT_PROOF'], 'w').write('proved')"))
         command = self.command(); command[1] = str(wrapper)

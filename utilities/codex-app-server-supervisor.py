@@ -406,7 +406,8 @@ def run_join(args: argparse.Namespace, attempts: set[str]) -> dict[str, Any]:
     except (TypeError, ValueError) as exc:
         raise SupervisorError("join-receipt-json-invalid") from exc
     if result.returncode not in {0, 3}:
-        raise SupervisorError("join-process-contract-failed")
+        from dispatch_supervision import join_process_error
+        raise SupervisorError(join_process_error(result.returncode, value, args.parent_attempt_id))
     receipt = _typed_receipt(value, args.parent_attempt_id, attempts)
     completed_ns = time.monotonic_ns()
     join_timing = validate_delivery_timing(receipt["delivery_timing"])

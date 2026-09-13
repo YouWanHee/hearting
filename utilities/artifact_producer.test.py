@@ -7,6 +7,7 @@ real canonical root, registry, and routes directory are never touched.
 import importlib.util
 import fcntl
 import json
+import hashlib
 import os
 import subprocess
 import sys
@@ -1171,6 +1172,32 @@ class FinalizeTest(ProducerTestBase):
                 self.close(route, route_file)
                 sealed = P.finalize(self.root, cycle_id=result["cycle_id"])
                 self.assertEqual(sealed["status"], "sealed")
+
+    def test_collection_uses_manifest_paths_before_reading_any_payload(self):
+        directory = Path(self._tmp.name) / "collection"
+        artifacts = directory / "artifacts"
+        artifacts.mkdir(parents=True)
+        (artifacts / "a.md").write_text("valid output")
+        invalid = artifacts / "bad name.txt"
+        invalid.write_text("retain invalid output")
+        with mock.patch.object(Path, "read_bytes", side_effect=AssertionError("premature payload read")):
+            rows, violations = P._enumerate_output(directory)
+        self.assertEqual(rows, [])
+        self.assertIn("locator-invalid-component:artifacts/bad name.txt", violations)
+        invalid.unlink()  # fixture only
+        outside = Path(self._tmp.name) / "outside"
+        outside.write_text("not a payload")
+        link = artifacts / ".link"
+        link.symlink_to(outside)
+        rows, violations = P._enumerate_output(directory)
+        self.assertEqual(rows, [])
+        self.assertIn("symlink-forbidden:artifacts/.link", violations)
+        link.unlink()
+        cache = artifacts / ".cache"
+        cache.symlink_to(outside.parent, target_is_directory=True)
+        rows, violations = P._enumerate_output(directory)
+        self.assertEqual(rows, [])
+        self.assertIn("symlink-forbidden:artifacts/.cache", violations)
 
 
 class RecoveryTest(ProducerTestBase):
@@ -2899,6 +2926,45 @@ class TerminalTransactionIntegrationTest(ProducerTestBase):
             self.assertEqual(before,{str(path):path.read_bytes() for path in paths})
             artifact.write_text("post-seal corruption")
             self.assertNotEqual(terminal.settle_terminal_commit(request).result,"completed")
+
+    def test_hidden_payload_settlement_recovers_and_verifies_bytes_for_three_harnesses(self):
+        import dispatch_terminal_commit as terminal
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness=harness):
+                fixture = TerminalTransactionIntegrationTest(); fixture.setUp()
+                try:
+                    route, path, jobs, owner, result, report, request = fixture._prepare_fixture(harness)
+                    rel = "evidence/visual/test-results/.last-run.json"
+                    payload = b'{"status":"passed","failedTests":[]}\n'
+                    hidden = fixture.write_output(result, rel=rel, data=payload)
+                    fixture._closed_owner(jobs, owner)
+                    registry = jobs.read_bytes()
+                    marker = R.completion_dir(route["route_id"], jobs=jobs) / "report.json"
+                    marker_bytes = marker.read_bytes()
+                    with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs)}):
+                        # Crash after manifest publication; exact finish owns recovery.
+                        with mock.patch.object(P, "_commit_sealed", side_effect=RuntimeError("crash")):
+                            interrupted = terminal.settle_terminal_commit(request)
+                        self.assertNotEqual(interrupted.result, "completed", interrupted)
+                        manifest = Path(result["cycle_dir"]) / "manifest.json"
+                        sealed = manifest.read_bytes()
+                        doc = json.loads(sealed)
+                        revision = next(r for r in doc["artifact_revisions"]
+                                        if r["locator"]["path"] == "artifacts/" + rel)
+                        self.assertEqual(revision["content_digest"], "sha256:" + hashlib.sha256(payload).hexdigest())
+                        self.assertEqual(revision["byte_size"], len(payload))
+                        for _ in range(2):
+                            settled = terminal.settle_terminal_commit(request)
+                            self.assertEqual(settled.result, "completed", settled)
+                            self.assertEqual(manifest.read_bytes(), sealed)
+                            self.assertEqual(hidden.read_bytes(), payload)
+                        hidden.write_bytes(payload + b"drift")
+                        self.assertNotEqual(terminal.settle_terminal_commit(request).result, "completed")
+                        self.assertEqual(manifest.read_bytes(), sealed)
+                        self.assertEqual(marker.read_bytes(), marker_bytes)
+                        self.assertEqual(jobs.read_bytes(), registry)
+                finally:
+                    fixture.doCleanups()
 
     def test_default_services_recover_each_durable_boundary_without_duplicate_outputs(self):
         import dispatch_terminal_commit as terminal

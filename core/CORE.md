@@ -217,6 +217,14 @@ writes to them are blocked.
 global depth-1 rule. The per-shape boundary table is owned by the component
 blueprint `spec/artifact-path-contract/prd.md` D-23; it is not restated here.
 
+**Cycle payload paths.** Producer collection and manifest validation share one
+locator check. Inside cycle-relative `artifacts/`, dot-prefixed names retain
+their paths and sealed bytes/digests through normal finalization and recovery.
+This corrects D-6's blanket hidden-name rejection; dot segments, symlinks,
+absolute/escaping paths and out-of-payload files remain invalid. Cycle controls
+and legacy relocation/exclusion retain their contracts. Invalid paths identify
+the locator and reason before payload reads or manifest publication.
+
 **Campaign closure.** `artifact_producer.py campaign-status|campaign-close|campaign-recover`
 owns administrative satisfaction. Status verifies the campaign's exact cycle
 membership, sealed manifests and their payloads and prints a reviewable goal,

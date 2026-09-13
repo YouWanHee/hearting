@@ -26,6 +26,19 @@ class SupervisionError(ValueError):
     pass
 
 
+def join_process_error(returncode: int, receipt: object, parent_attempt_id: str) -> str:
+    """Preserve the join protocol's typed failure, never arbitrary child output."""
+    reason = "unverified-error-receipt"
+    if (isinstance(receipt, dict) and receipt.get("schema_version") == 2
+            and receipt.get("state") == "contract-error"
+            and receipt.get("parent_attempt_id") == parent_attempt_id
+            and receipt.get("children") == []):
+        candidate = receipt.get("reason")
+        if isinstance(candidate, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,127}", candidate):
+            reason = candidate
+    return f"join-process-contract-failed:exit={returncode}:reason={reason}"
+
+
 def _rows(jobs: Path) -> dict:
     from dispatch_contract import parse_registry_metadata
     rows = {}

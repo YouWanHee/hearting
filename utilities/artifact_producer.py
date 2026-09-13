@@ -154,7 +154,6 @@ PRIMARY_CANDIDATES = (
     "final_report.md", "report.md", "prd.md", "plan.md", "handoff.md", "verdict.json",
 )
 _KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
-_REL_RE = re.compile(r"^[A-Za-z0-9._][A-Za-z0-9._/ -]{0,1023}$")
 
 
 class ProducerError(Exception):
@@ -1242,7 +1241,7 @@ def _enumerate_output(directory: Path, *, exclude_hidden: bool = False,
     residue, or a component longer than the locator limit) are left out of the
     manifest and reported through `excluded` instead of failing validation
     (W7E retrospective seal of relocated legacy trees)."""
-    rows: List[Tuple[str, bytes]] = []
+    paths: List[Tuple[str, Path]] = []
     violations: List[str] = []
     artifacts = directory / "artifacts"
     if not artifacts.is_dir() or artifacts.is_symlink():
@@ -1265,10 +1264,16 @@ def _enumerate_output(directory: Path, *, exclude_hidden: bool = False,
             if excluded is not None:
                 excluded.append(rel)
             continue
-        if not _REL_RE.match(rel) or ".." in rel.split("/"):
-            violations.append(f"unsafe-locator:{rel}")
+        locator = artifact_manifest.validate_locator_path(rel)
+        if not locator.ok:
+            violations.extend(f"{v.code}:{rel}" for v in locator.violations)
             continue
-        rows.append((rel, entry.read_bytes()))
+        paths.append((rel, entry))
+    # Validate the whole collection before reading payload bytes. A rejected
+    # path must not silently vanish, or surface only after manifest allocation.
+    if violations:
+        return [], violations
+    rows = [(rel, entry.read_bytes()) for rel, entry in paths]
     return rows, violations
 
 
