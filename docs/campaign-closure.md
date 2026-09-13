@@ -107,3 +107,25 @@ lifecycle, index, reader, relayout 및 신규 campaign suite가 통과했다. �
 campaign·cycle·manifest·route 기록 65개가 그대로였다. 로컬 근거는
 `/tmp/campaign-close*-suites.tsv`, `/tmp/bc-campaign-close-readonly.json`,
 `/tmp/bc-campaign-no-approval-observation.json`이다.
+
+## 배포·적용 결과
+
+구현 `9ad69506`과 옛 배치 호환 `27171dbf`를 main에 반영·푸시했다.
+[v2.141.0](https://github.com/dmlguq456/hearting/releases/tag/v2.141.0)의 정확한
+source commit은 `27171dbf7763df0470878e345bcc574941b126bb`다.
+[Release 작업](https://github.com/dmlguq456/hearting/actions/runs/34756670855)의
+입력 검증·패키징·게시·실제 게시본 설치 smoke가 모두 통과했다.
+
+2026-09-13 관리형 `harness update --version v2.141.0 --yes --json`으로
+Claude/Codex/OpenCode를 설치했다. strict runtime doctor와 verify는 exit 0,
+세 하네스 fresh, drift 0이다. 설치본의 변경 파일 7개가 release source와 일치했고
+설치본 집중 19건도 통과했다. 사용자 설정·인증 파일 11개는 설치 전후 내용이 같다.
+archive SHA256은 `226073ade1a217d2eee441372862f6d9c6fa24edeb012b36982988c9800f7c91`이다.
+
+설치본의 실제 BC 조회도 16 cycle 검증을 통과해 `awaiting-user-acceptance`다.
+BC campaign을 종료하지 않았다. 기존 세션은 이전 release에 고정돼 있을 수 있으므로
+명령을 즉시 쓸 때는 `/home/Uihyeop/.local/share/hearting/releases/v2.141.0/utilities/artifact_producer.py`
+를 직접 지정한다. 새 Claude/Codex 세션 또는 OpenCode 재시작부터 새 설치본을 쓴다.
+설치 근거는 `/tmp/campaign-installed-evidence.json`,
+`/tmp/campaign-runtime-{update,doctor,verify}.json`,
+`/tmp/bc-campaign-installed-status.json`에 보존했다.
