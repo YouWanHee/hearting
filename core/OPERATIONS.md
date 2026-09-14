@@ -639,7 +639,12 @@ the work.
 **Visibility is a requirement, not a nicety.** Independently of capability,
 Fleet and the status surfaces expose the workflow, its current stage, its child
 resource jobs, resource class and identity, last update, next stage, and
-failure reason. Where a runtime cannot render a resource row directly, it shows
+failure reason. A worker card shows its assigned work, not every node in the
+route: a depth-1 frame owns only its exact frame node; the later owner owns the
+execution stages, excluding the separate pre-owner frame pair. Depth alone does
+not confer ownership of a pipeline. Card progress uses the same assigned scope;
+the route overview retains the complete graph and its independent total.
+Where a runtime cannot render a resource row directly, it shows
 the supervising owner and links the child registry;
 `workflow-supervisor.py status` is the portable projection that any surface may
 read. An ordinary detached process is never run invisibly on the user's behalf.

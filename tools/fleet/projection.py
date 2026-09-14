@@ -498,12 +498,33 @@ def _terminal_route_projection(value):
     return bool(nodes) and all(node.get("state") in {"done", "failed"} for node in nodes)
 
 
+def _assigned_route_scope(entity, record, jobs, route_node, owner):
+    """Display responsibility from assignment, independently of dispatch depth."""
+    if route_node and not owner:
+        return (route_node,)
+    nodes = record.get("nodes") or ()
+    bootstrap_ids = {n.get("id") for n in nodes
+                     if n.get("worker_type") == "frame" and n.get("dispatch_depth") == 1}
+    if not bootstrap_ids:
+        return None
+    if owner and _field(entity, "worker_type") == "owner":
+        return tuple(n["id"] for n in nodes if n.get("id") not in bootstrap_ids)
+    # The interactive parent prepares the frame pair before an owner exists.
+    # Its live children are the evidence for that phase, not future route nodes.
+    children = _owner_children(entity, jobs) if owner else ()
+    if children and all(_field(c, "route_node") in bootstrap_ids for c in children):
+        return tuple(n["id"] for n in nodes if n.get("id") in bootstrap_ids)
+    return None
+
+
 def _projection_from_record(entity, record, route_id, jobs, node_evidence=None, now=None,
                             route_node=None, owner=False, degradations=None):
     from . import route
     view = _record_view(record, route_id, jobs, node_evidence=node_evidence, now=now,
                         degradations=degradations)
     nodes = tuple(view.get("nodes") or ())
+    scope_ids = _assigned_route_scope(entity, record, jobs, route_node, owner)
+    work_nodes = nodes if scope_ids is None else tuple(n for n in nodes if n["id"] in scope_ids)
     projections = tuple(ActiveNodeProjection(
         id=node.get("id"), depends_on=tuple(node.get("depends_on") or ()),
         level=node.get("level"), unit=node.get("unit"),
@@ -513,7 +534,7 @@ def _projection_from_record(entity, record, route_id, jobs, node_evidence=None, 
         replica_group=node.get("replica_group"),
         model_profile=node.get("model_profile"), perspective=node.get("perspective"),
         degradation=node.get("degradation"),
-    ) for node in nodes)
+    ) for node in work_nodes)
     selected = next((node for node in projections if node.id == route_node), None)
     contract = _field(entity, "assigned_contract")
     active_nodes = tuple(node for node in projections if node.state == "active")
@@ -539,7 +560,8 @@ def _projection_from_record(entity, record, route_id, jobs, node_evidence=None, 
         attempt_id=_field(entity, "attempt_id"), assigned_contract=contract,
         unit=selected.unit if selected else _field(entity, "unit"), stage_label=label,
         node_state=node_state, active_nodes=active_nodes,
-        progress=ProgressProjection(**(view.get("progress") or {"done": 0, "total": len(nodes)})),
+        progress=ProgressProjection(sum(n.get("state") == "done" for n in work_nodes), len(work_nodes)),
+        scope_node_ids=scope_ids,
         _route_view={"record": record, "nodes": nodes, "view": view},
     )
 
@@ -1412,11 +1434,22 @@ def resolve_work_projection(entity, jobs=(), route_records=None, node_evidence=N
         return WorkProjection(source="none", ambiguity=MULTIPLE_OWNER_ROUTES)
     if len(route_keys) == 1 and exact:
         p = exact[0]
+        record = (p._route_view or {}).get("record")
+        if record is not None:
+            # A parent aggregates its own children. Copying the first leaf's
+            # projection would silently lose every parallel sibling's scope.
+            return _projection_from_record(
+                entity, record, p.route_id,
+                [j for j in jobs if _field(j, "route_id") == p.route_id],
+                node_evidence=(node_evidence or {}).get(p.route_id, {}),
+                now=now, owner=True, degradations=degradations,
+            )
         active = p.active_nodes
         owner_node, owner_state = _owner_active_selection(active)
         return WorkProjection(source="route-exact", route_id=p.route_id, route_hash=p.route_hash,
                               route_node=owner_node, node_state=owner_state,
                               active_nodes=active, progress=p.progress,
+                              scope_node_ids=p.scope_node_ids,
                               stage_label=_active_stage_label(active),
                               _route_view=p._route_view)
 

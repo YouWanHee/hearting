@@ -1706,15 +1706,19 @@ _collapse_replica_nodes = _collapse_parallel_nodes
 
 
 def _projection_route_seq(entity):
-    """Return the attached route's record-order node sequence, if validated."""
+    """Return assigned work in sealed order; the route overview is separate."""
     projection = getattr(entity, "work_projection", None)
     if not projection or getattr(projection, "source", None) != "route-exact":
         return None
     backing = getattr(projection, "_route_view", None) or {}
     view = backing.get("view") or {}
     from . import route
+    nodes = view.get("nodes") or ()
+    scope = getattr(projection, "scope_node_ids", None)
+    if scope is not None:
+        nodes = [node for node in nodes if node.get("id") in scope]
     return [(route.node_display_label(node), node.get("state"))
-            for node in _collapse_parallel_nodes(view.get("nodes") or ())]
+            for node in _collapse_parallel_nodes(nodes)]
 
 
 _LEGACY_STAGE_COLOR_INDEX = {
@@ -5680,7 +5684,8 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
             "unit_catalog_digest": _record.get("unit_catalog_digest"),
             "composed": bool(_record.get("composed")),
             "effective_intensity": _record.get("effective_intensity"),
-            "progress": _projection.progress.to_dict() if _projection.progress else None,
+            "progress": (_backing.get("view") or {}).get("progress",
+                _projection.progress.to_dict() if _projection.progress else None),
             "nodes": _nodes, "key": _projection.route_id,
         })
     display_jobs = _current_attempt_jobs(jobs)

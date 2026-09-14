@@ -181,6 +181,9 @@ class WorkProjection:
     node_state: Optional[str] = None
     active_nodes: tuple = ()
     progress: Optional[ProgressProjection] = None
+    # None retains a legacy/full-route projection; () means no assigned nodes.
+    # The complete route remains in _route_view for the independent overview.
+    scope_node_ids: Optional[tuple] = None
     ambiguity: Optional[str] = None
     _route_view: Optional[dict] = field(default=None, repr=False, compare=False)
 
