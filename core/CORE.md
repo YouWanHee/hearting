@@ -262,6 +262,23 @@ route, shared-reference and artifact bytes remain unchanged. Any other
 degraded reason, closed campaign, non-placeholder key or incomplete sealed
 cycle set is refused before mutation.
 
+**Campaign/cycle locator amendment.** `artifact_locator_amendment.py
+prepare|apply|verify` is the sole supported correction surface when an applied
+campaign metadata amendment has left an `_unassigned` physical locator or
+sealed cycle names that hide their revision order. It moves the campaign and
+its named cycle directories to collision-free `<date>_<slug>` canonical
+locators, updates only the corresponding locator/slug/title record fields,
+the cycle display-title declaration, campaign display-title locator, and both
+derived indexes. Stable IDs, campaign membership and order, parent lineage,
+sealed manifest, `.cycle.json`, artifact, route/outcome and shared-reference
+bytes remain unchanged. Old route evidence paths stay readable through
+root-contained relative symlink redirects; authoritative locator scans ignore
+those redirects and index only real canonical directories. Prepare and apply
+hold the producer admission lock, bind exact directory and byte preimages to a
+durable journal, reject target collisions or foreign manifest bindings, roll
+back interrupted partial moves only from recognized pre/post states, and make
+an identical committed replay verify-only and idempotent.
+
 **Campaign run log correction.** A legacy aggregate `experiments/_RUNLOG.md`
 that W7G mechanically promoted into a one-file cycle has no independent work
 boundary. `artifact_resplit.py repair-runlog-cycle` is the sole correction
