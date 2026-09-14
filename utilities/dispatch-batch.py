@@ -1939,7 +1939,10 @@ def main(argv: list[str] | None = None) -> int:
             capped_node_id = str(capped_node["id"])
             if capped_node_id not in DISPATCH_NODE.ROUND_CAPPED_NODE_IDS:
                 continue
-            prior = DISPATCH_NODE.prior_round_attempts(jobs, route["route_id"], capped_node_id)
+            prior = DISPATCH_NODE.prior_round_attempts(
+                jobs, route["route_id"], capped_node_id,
+                route=route if capped_node.get("kind") == "review-worker" else None,
+            )
             round_no = len(prior) + 1
             max_round = DISPATCH_NODE.max_review_rounds(route["effective_intensity"])
             if round_no > max_round:

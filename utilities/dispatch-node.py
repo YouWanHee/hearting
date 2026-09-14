@@ -285,24 +285,16 @@ def has_model_selection(adapter_args):
 # worker assignment; the owner's free-text prompt cannot silently turn round N
 # into "a fresh independent audit" again (observed 2026-08-24 rt-08dd7ba8: twelve
 # execute/impl-review rounds, each FAIL on a new finding).
-def prior_round_attempts(jobs, route_id, node_id, *, exclude_slug=None, exclude_attempt=None):
+def prior_round_attempts(jobs, route_id, node_id, *, exclude_slug=None, exclude_attempt=None, route=None):
  """Return the prior registry rows for one exact route/node as (slug, note) pairs."""
  prior=[]
+ route_ids = {r["route_id"] for r in ROUTE.review_lineage_routes(route, node_id)} if route else {route_id}
  try:
   lines=Path(jobs).read_text(encoding="utf-8",errors="replace").splitlines()
  except OSError:
   return prior
- for line in lines:
-  cols=line.rstrip("\n").split("\t")
-  if len(cols)<6: continue
-  meta=parse_registry_metadata(cols[5])
-   # The registry writer emits `route_id=`; `route=` never appears in a
-  # production row, so filtering on it matched nothing and every capped
-  # node counted round 1 forever. `route=` is kept as a read-only
-  # compatibility fallback, with `route_id` taking precedence.
-  if (meta.get("route_id") or meta.get("route"))!=route_id or meta.get("route_node")!=node_id: continue
-  if meta.get("stage_authority")=="0": continue
-  if exclude_slug and cols[4]==exclude_slug: continue
+ for cols, meta in ROUTE.review_round_records(lines, route_ids, node_id):
+  if exclude_slug and cols[4]==exclude_slug and (meta.get("route_id") or meta.get("route"))==route_id: continue
   if exclude_attempt and meta.get("attempt_id")==exclude_attempt: continue
   prior.append((cols[4],meta.get("note","")))
  return prior
@@ -544,7 +536,8 @@ def main():
  except ValueError as e:
   raise SystemExit(str(e))
  contract=assigned_contract(capability=route["capability"],worker_type=worker_type,route_node=node["id"],completion_gate=node.get("completion_gate"),root=ROOT)
- prior_rounds=prior_round_attempts(registry.path,route["route_id"],node["id"],exclude_slug=a.slug,exclude_attempt=a.attempt_id) if not a.subsession_id else []
+ prior_rounds=prior_round_attempts(registry.path,route["route_id"],node["id"],exclude_slug=a.slug,exclude_attempt=a.attempt_id,
+                                  route=route if node.get("kind")=="review-worker" else None) if not a.subsession_id else []
  round_no=len(prior_rounds)+1
  if a.node in ROUND_CAPPED_NODE_IDS and not a.subsession_id:
   max_round=max_review_rounds(route["effective_intensity"])

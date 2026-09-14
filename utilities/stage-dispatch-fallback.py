@@ -1589,7 +1589,8 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
     # Reuse the already-loaded definitions rather than duplicating the cap.
     if node["id"] in DISPATCH_NODE.ROUND_CAPPED_NODE_IDS:
         prior_rounds = DISPATCH_NODE.prior_round_attempts(
-            args.jobs, route["route_id"], node["id"]
+            args.jobs, route["route_id"], node["id"],
+            route=route if node.get("kind") == "review-worker" else None,
         )
         round_no = len(prior_rounds) + 1
         max_round = DISPATCH_NODE.max_review_rounds(route["effective_intensity"])
