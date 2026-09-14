@@ -7,6 +7,7 @@ never blank, per the PRD missing-cell rule).
 """
 import hashlib
 import json
+import os
 import re
 from dataclasses import dataclass, field, asdict, fields, is_dataclass
 from typing import Optional
@@ -795,6 +796,26 @@ def session_parent_visible(session):
     return not (getattr(session, "liveness", None) in ("stale", "dead") or app_server)
 
 
+def unique_managed_parents(sessions):
+    """Exact-one interactive client per managed directory; never choose by order."""
+    found = {}
+    ambiguous = set()
+    for session in sessions:
+        directory = getattr(session, "managed_dir", None)
+        if (getattr(session, "harness", None) != "codex"
+                or getattr(session, "app_server", False)
+                or getattr(session, "is_child", False) or not directory):
+            continue
+        key = os.path.normpath(directory)
+        if key in found:
+            ambiguous.add(key)
+        else:
+            found[key] = session
+    for key in ambiguous:
+        found.pop(key, None)
+    return found
+
+
 # Grace window for a dispatch job's parent-session edge (F-80), in ticks — not seconds.
 # The 0.66-1.37s sid-registry gap measured at session-end is comfortably inside 3 ticks at
 # the default 2s render interval (~6s), and genuine death promotes immediately via
@@ -826,7 +847,7 @@ class ParentEdgeTracker:
         self._store = {}
         self._seen = set()
 
-    def resolve(self, slug, parent_sid, parent_visible, dead_evidence):
+    def resolve(self, slug, parent_sid, parent_visible, dead_evidence, display_sid=None):
         """(edge_sid_or_None, promoted_orphan: bool) for this tick's verdict.
 
         parent_visible: True the parent session currently passes the render `shown`
@@ -842,8 +863,10 @@ class ParentEdgeTracker:
             self._store.pop(key, None)
             return None, False
         if parent_visible:
-            self._store[key] = {"parent_sid": parent_sid, "confirmed": True, "missing_ticks": 0}
-            return parent_sid, False
+            edge_sid = display_sid or parent_sid
+            self._store[key] = {"parent_sid": parent_sid, "edge_sid": edge_sid,
+                                "confirmed": True, "missing_ticks": 0}
+            return edge_sid, False
         if dead_evidence:
             self._store.pop(key, None)
             return None, True
@@ -859,7 +882,7 @@ class ParentEdgeTracker:
             self._store.pop(key, None)
             return None, True
         entry["missing_ticks"] = missing
-        return entry["parent_sid"], False
+        return entry["edge_sid"], False
 
     def sweep(self):
         """Drop keys not seen this tick (unbounded-growth guard). Call once per tick."""
@@ -875,8 +898,9 @@ class ParentEdgeTracker:
 _PARENT_EDGE_TRACKER = ParentEdgeTracker()
 
 
-def parent_edge_resolve(slug, parent_sid, parent_visible, dead_evidence):
-    return _PARENT_EDGE_TRACKER.resolve(slug, parent_sid, parent_visible, dead_evidence)
+def parent_edge_resolve(slug, parent_sid, parent_visible, dead_evidence, display_sid=None):
+    return _PARENT_EDGE_TRACKER.resolve(
+        slug, parent_sid, parent_visible, dead_evidence, display_sid)
 
 
 def parent_edge_sweep():

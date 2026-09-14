@@ -84,12 +84,35 @@ def resolve_parent_edges(sessions, jobs):
     never leak into ``--json`` output on their own.
     """
     from .. import model
-    sessions_by_sid = {s.session_id: s for s in sessions if getattr(s, "session_id", None)}
+    sessions_by_sid = {}
+    for session in sessions:
+        if getattr(session, "session_id", None):
+            sessions_by_sid.setdefault(session.session_id, []).append(session)
+    managed_parents = model.unique_managed_parents(sessions)
     for j in jobs:
         parent_sid = getattr(j, "parent_sid", None)
         if not (getattr(j, "is_child", False) and parent_sid):
             continue
-        parent_session = sessions_by_sid.get(parent_sid)
+        candidates = sessions_by_sid.get(parent_sid, [])
+        visible = [s for s in candidates if model.session_parent_visible(s)
+                   and not getattr(s, "is_child", False)]
+        parent_session = (visible[0] if len(visible) == 1 else
+                          candidates[0] if len(candidates) == 1 else None)
+        resolved_sid = parent_sid
+        directory = getattr(j, "parent_managed_dir", None)
+        # A managed app-server can know the current fork while its visible TUI
+        # still carries the original thread. Resolve the exact client here,
+        # before grace/orphan classification, not later in the renderer.
+        hidden_companion = (parent_session is not None
+                            and getattr(parent_session, "app_server", False)
+                            and getattr(parent_session, "managed_dir", None) == directory
+                            and getattr(parent_session, "liveness", None) != "dead")
+        if (not visible and (not candidates or hidden_companion) and directory
+                and getattr(j, "source", None) != "plugin-queue"):
+            client = managed_parents.get(os.path.normpath(directory))
+            if client is not None and getattr(client, "session_id", None):
+                parent_session = client
+                resolved_sid = client.session_id
         if parent_session is None:
             # Complete collector-side absence — cannot be told apart from a real registry
             # gap, so it gets grace like any other non-visible reason (F-80 L2c "완전 부재").
@@ -99,7 +122,7 @@ def resolve_parent_edges(sessions, jobs):
             parent_visible = model.session_parent_visible(parent_session)
             dead_evidence = getattr(parent_session, "liveness", None) == "dead"
         edge_sid, promoted = model.parent_edge_resolve(
-            j.slug, parent_sid, parent_visible, dead_evidence)
+            j.slug, parent_sid, parent_visible, dead_evidence, display_sid=resolved_sid)
         j._parent_edge_sid = edge_sid
         j._parent_edge_promoted_orphan = promoted
 

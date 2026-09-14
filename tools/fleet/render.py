@@ -3260,25 +3260,8 @@ def _mem_repo_rows(events, sid_titles, limit=_MEM_REPO_ROW_LIMIT):
 
 
 def _unique_managed_parents(sessions):
-    """{normalized managed_dir: visible Codex TUI Session}, exact-one only."""
-    found = {}
-    ambiguous = set()
-    for session in sessions:
-        managed_dir = getattr(session, "managed_dir", None)
-        if (
-            getattr(session, "harness", None) != "codex"
-            or getattr(session, "app_server", False)
-            or not managed_dir
-        ):
-            continue
-        key = os.path.normpath(managed_dir)
-        if key in found:
-            ambiguous.add(key)
-        else:
-            found[key] = session
-    for key in ambiguous:
-        found.pop(key, None)
-    return found
+    from .model import unique_managed_parents
+    return unique_managed_parents(sessions)
 
 
 def _group_key_job(j, session_groups=None, job_groups=None, managed_session_groups=None):
@@ -3287,6 +3270,9 @@ def _group_key_job(j, session_groups=None, job_groups=None, managed_session_grou
     managed_session_groups = managed_session_groups or {}
     if getattr(j, "parent_slug", None) and j.parent_slug in job_groups:
         return job_groups[j.parent_slug]
+    edge_sid = getattr(j, "_parent_edge_sid", None)
+    if edge_sid in session_groups:
+        return session_groups[edge_sid]
     if getattr(j, "parent_sid", None) and j.parent_sid in session_groups:
         return session_groups[j.parent_sid]
     parent_managed_dir = getattr(j, "parent_managed_dir", None)
@@ -5621,6 +5607,12 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
     """
     global _SELECTABLE
     _SELECTABLE = []     # reset before any early return — a stale target map must never survive
+    # Direct managed-row callers use the same parent decision as collect_all.
+    # Existing collector verdicts (including grace) never advance a second tick.
+    from .collectors import resolve_parent_edges
+    resolve_parent_edges(sessions, [j for j in jobs
+                                   if getattr(j, "parent_managed_dir", None)
+                                   and not hasattr(j, "_parent_edge_promoted_orphan")])
     # Direct hermetic callers from pre-v16 tests may construct rows without running the
     # collector boundary.  Use the same shared resolver as the snapshot path; never call
     # live_stage() or a renderer-specific route resolver. Terminal node evidence is the
@@ -5920,7 +5912,6 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
         # their capability-owner job via parent_slug. This keeps main-session context light
         # while fleet still shows cross-harness orchestration shape.
         children = {}      # session_id -> [jobs] (nested under an on-screen parent)
-        managed_children = {}  # id(Session) -> [jobs], exact unique managed-dir recovery
         job_children = {}  # parent dispatch slug -> [dispatch-depth-2 jobs]
         orphans = []       # project-level fallback (parent dead/off-screen/no-env)
         loops_jobs = []    # no-parent-is-normal (cron loops) — no orphan marker
@@ -5939,7 +5930,6 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
         # (user 2026-07-24: drill runs "orphan으로 잡히고 메인 세션은 연결도 안되고" — noise, since the
         # fixture decouples on purpose). Non-drill groups keep the exact prior classification.
         is_drill_case = str(name).startswith("drill:")
-        shown_managed_parents = _unique_managed_parents(shown)
         for j in group_jobs:
             if getattr(j, "parent_slug", None) and getattr(j, "depth", 1) >= 2:
                 if j.parent_slug in visible_parent_slugs:
@@ -5995,20 +5985,6 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
             elif j.is_child and j.parent_sid and j.parent_sid in shown_sids:
                 # No ledger verdict reached this row — fall back to the pre-ledger check.
                 children.setdefault(j.parent_sid, []).append(j)
-            elif (
-                j.is_child
-                and getattr(j, "source", None) != "plugin-queue"
-                and getattr(j, "parent_managed_dir", None)
-            ):
-                managed_parent = shown_managed_parents.get(
-                    os.path.normpath(j.parent_managed_dir)
-                )
-                if managed_parent is not None:
-                    managed_children.setdefault(id(managed_parent), []).append(j)
-                elif j.key in _LOOPS_KEYS or is_drill_case:
-                    loops_jobs.append(j)
-                else:
-                    orphans.append(j)
             elif getattr(j, "source", None) == "plugin-queue":
                 # F-50c: a plugin-queue job nests ONLY on an exact `sessionId` ==
                 # `Session.session_id` match (the branch above). Its `parent_cwd` is the
@@ -6305,7 +6281,7 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
                 _seen_glyphs.add("mem")
                 continue
             kids = _sort_group_jobs(
-                children.get(s.session_id, []) + managed_children.get(id(s), [])
+                children.get(s.session_id, [])
             )
             if s.session_id in rendered_parent_sids:
                 kids = []
