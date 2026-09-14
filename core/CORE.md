@@ -4,6 +4,10 @@
 
 ## 1. Layers
 
+[Loop Engineering](LOOP_ENGINEERING.md) is Hearting's maintainer design standard:
+responsibility through execution, recovery, closure and acknowledged handoff,
+with a simpler caller surface. It distinguishes principles from verified implementation.
+
 | Layer | Owns | Portable? |
 |---|---|---|
 | Core | workflow, artifact layout, memory lifecycle, QA tiers, model roles, safety invariants | yes |
