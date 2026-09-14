@@ -202,7 +202,35 @@ _EXEC_WRAPPER_COMMS = ("sh", "bash", "zsh", "dash", "ksh", "fish")
 # canonical identification is the env marker below (same keys as `mem_worker` in scan()),
 # these are only the comm-visible shapes that carry no env of their own.
 _EXEC_HELPER_COMMS = ("statusline", "ps", "tmux", "ss")
-_EXEC_MAX_DEPTH = 4
+_EXEC_MAX_DEPTH = 12  # sandbox → bwrap → sandbox → shell → lease → workload
+_EXEC_SANDBOX_COMMS = ("codex-linux-sandbox", "codex-linux-san", "bwrap")
+
+
+def _exec_identity(pid):
+    """One local PID/start/parent observation; unreadable is not absence proof."""
+    try:
+        with open("/proc/%s/stat" % pid) as handle:
+            raw = handle.read()
+        fields = raw[raw.rindex(")") + 1:].split()
+        if fields[0] in ("Z", "X"):
+            return None
+        return (int(fields[1]), fields[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _exec_is_wrapper(pid, comm):
+    if comm in _EXEC_WRAPPER_COMMS or comm in _EXEC_SANDBOX_COMMS:
+        return True
+    if comm in ("python", "python3"):
+        try:
+            with open("/proc/%s/cmdline" % pid, "rb") as handle:
+                args = handle.read(16384).decode(errors="replace").split("\0")
+            return any(os.path.basename(arg) == "verification-background-lease.py"
+                       for arg in args[1:3])
+        except OSError:
+            pass
+    return False
 
 
 def _exec_is_helper(pid, comm):
@@ -213,6 +241,11 @@ def _exec_is_helper(pid, comm):
     double-count the same work.
     """
     base = (comm or "").strip()
+    # Execution containers carry tool descendants; unlike model/MCP companions,
+    # they are transparent and never themselves returned as work evidence.
+    if base in _EXEC_SANDBOX_COMMS:
+        env = read_environ(pid)
+        return env.get("MEM_DISTILL") == "1" or env.get("FLEET_TITLE_REFRESH") == "1"
     # A harness process, or one of a harness's own hyphenated companion binaries (observed
     # 2026-07-30: every idle Codex row carried a long-lived `codex-code-mode` child, which is
     # runtime plumbing, not the user's work). Nested harnesses already own their own rows.
@@ -263,7 +296,8 @@ def children_index(tree):
     return kids
 
 
-def _oldest_work_child(pid, tree, kids, min_age=0, max_age=None):
+def _oldest_work_child(pid, tree, kids, min_age=0, max_age=None, attempt_id=None,
+                       bind_attempt=False):
     """(cpid, etime, comm) of the longest-running non-helper child, or None.
 
     Longest-running rather than newest: the thing the session is *waiting on* is the thing
@@ -280,13 +314,15 @@ def _oldest_work_child(pid, tree, kids, min_age=0, max_age=None):
             continue
         if _exec_is_helper(cpid, comm):
             continue
+        if bind_attempt and (read_environ(cpid).get("AGENT_DISPATCH_ATTEMPT_ID") or None) != attempt_id:
+            continue
         if best is None or (etime, -cpid) > (best[1], -best[0]):
             best = (cpid, etime, comm)
     return best
 
 
 def exec_child(pid, tree=None, kids=None, min_age=EXEC_MIN_AGE_SEC,
-               max_depth=_EXEC_MAX_DEPTH):
+               max_depth=_EXEC_MAX_DEPTH, expected_start=None, attempt_id=None):
     """Long-lived work descendant of `pid` → {'pid','comm','etime_s'}, else None.
 
     The ≥`min_age` gate applies to the session's DIRECT child (that is what "this session
@@ -299,6 +335,10 @@ def exec_child(pid, tree=None, kids=None, min_age=EXEC_MIN_AGE_SEC,
     plumbing. An unknown session age (pid absent from `tree`) disables that cut rather than
     hiding the evidence — absence of a fact is never used as a fact.
     """
+    root_identity = _exec_identity(pid) if expected_start is not None else None
+    if expected_start is not None and (
+            root_identity is None or root_identity[1] != str(expected_start)):
+        return None
     if tree is None:
         tree = proc_tree()
     if kids is None:
@@ -307,20 +347,46 @@ def exec_child(pid, tree=None, kids=None, min_age=EXEC_MIN_AGE_SEC,
     max_age = None
     if entry is not None and entry[1] > EXEC_BOOT_GRACE_SEC:
         max_age = entry[1] - EXEC_BOOT_GRACE_SEC
-    picked = _oldest_work_child(pid, tree, kids, min_age=min_age, max_age=max_age)
+    picked = _oldest_work_child(pid, tree, kids, min_age=min_age, max_age=max_age,
+                                attempt_id=attempt_id, bind_attempt=expected_start is not None)
     if picked is None:
         return None
     cur_pid, cur_etime, cur_comm = picked
-    seen = {pid}
+    path = [pid]
+    identities = {pid: root_identity} if root_identity is not None else {}
     for _ in range(max(0, max_depth)):
-        if cur_pid in seen or cur_comm not in _EXEC_WRAPPER_COMMS:
+        if cur_pid in path:
+            return None
+        if expected_start is not None:
+            identity = _exec_identity(cur_pid)
+            if identity is None or identity[0] != path[-1]:
+                return None
+            identities[cur_pid] = identity
+        path.append(cur_pid)
+        if not _exec_is_wrapper(cur_pid, cur_comm):
             break
-        seen.add(cur_pid)
-        nxt = _oldest_work_child(cur_pid, tree, kids)
+        nxt = _oldest_work_child(cur_pid, tree, kids, attempt_id=attempt_id,
+                                 bind_attempt=expected_start is not None)
         if nxt is None:
+            if (expected_start is not None or cur_comm in _EXEC_SANDBOX_COMMS
+                    or cur_comm not in _EXEC_WRAPPER_COMMS):
+                return None
             break
         cur_pid, cur_etime, cur_comm = nxt
-    return {"pid": cur_pid, "comm": cur_comm, "etime_s": cur_etime}
+    else:
+        return None
+    result = {"pid": cur_pid, "comm": cur_comm, "etime_s": cur_etime}
+    if expected_start is not None:
+        # Recheck every edge after selection, so PID reuse or reparenting during
+        # the snapshot cannot turn a different process into owned execution.
+        if any(_exec_identity(p) != identities[p] for p in path):
+            return None
+        result.update(ownership_verified=True, root_pid=pid,
+                      root_start=str(expected_start), proc_start=identities[cur_pid][1],
+                      attempt_id=attempt_id,
+                      ancestry=[{"pid": p, "ppid": identities[p][0],
+                                 "start": identities[p][1]} for p in path])
+    return result
 
 
 def _pid_ttys():
@@ -515,6 +581,7 @@ def scan(harness_filter=None):
         # Tag memory workers and title refreshers to prevent inherited cwd/env misattribution.
         mem_worker = env.get("MEM_DISTILL") == "1" or env.get("FLEET_TITLE_REFRESH") == "1"
         detached = _is_detached(pid_tty.get(pid), app_server, det_ttys)
+        proc_start = read_proc_start(pid)
         sess = Session(
             harness=comm,
             pid=pid,
@@ -527,7 +594,7 @@ def scan(harness_filter=None):
             elapsed_min=etime_to_min(etime),
             slug=os.path.basename(cwd.rstrip("/")) if cwd else None,
             mem_worker=mem_worker,
-            proc_start=read_proc_start(pid),      # tier-2 identity half — see read_proc_start
+            proc_start=proc_start,      # tier-2 identity half — see read_proc_start
             route_file=env.get("AGENT_ROUTE_FILE") or None,
             route_id=env.get("AGENT_ROUTE_ID") or None,
             route_node=env.get("AGENT_ROUTE_NODE") or None,
@@ -537,7 +604,9 @@ def scan(harness_filter=None):
             worker_type=env.get("AGENT_DISPATCH_WORKER_TYPE") or None,
             owner=env.get("AGENT_DISPATCH_OWNER") or None,
             model_role=env.get("AGENT_DISPATCH_MODEL_ROLE") or None,
-            exec_child=exec_child(pid, tree, kids),
+            exec_child=(exec_child(pid, tree, kids, expected_start=proc_start,
+                                   attempt_id=env.get("AGENT_DISPATCH_ATTEMPT_ID") or None)
+                        if proc_start is not None else None),
         )
         sessions.append(sess)
         orca_sock = env.get("ORCA_RELAY_SOCKET_PATH")

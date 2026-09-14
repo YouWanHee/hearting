@@ -206,7 +206,7 @@ def _adopt_child_titles(sessions, jobs):
                     'ctx_pct', 'active_context_tokens', 'context_window_tokens',
                     'session_input_tokens', 'session_cached_input_tokens',
                     'session_output_tokens', 'session_reasoning_output_tokens',
-                    'session_total_tokens', 'exec_child', 'exec_tool'):
+                    'session_total_tokens', 'exec_tool'):
                 setattr(job, field_name, getattr(source, field_name, None))
             job._context_evidence = getattr(source, '_context_evidence', None)
             job._dispatch_context_owned = True
@@ -435,7 +435,8 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only"):
     jobs = []
     try:
         from . import dispatch
-        jobs = dispatch.collect(jobs_path=jobs_path, harness_filter=harness_filter)
+        jobs = dispatch.collect(jobs_path=jobs_path, harness_filter=harness_filter,
+                                session_rows=sessions)
     except Exception:
         jobs = []
 

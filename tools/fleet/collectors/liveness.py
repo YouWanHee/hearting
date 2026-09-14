@@ -89,8 +89,8 @@ def collect_evidence(sess):
         "orphan": bool(sess.orphan),
         "status": sess.status,
         "task_lifecycle": getattr(sess, "task_lifecycle", None),
-        # F-47: owned process-subtree evidence. Only `shell` consults it (prd.md:612) — the
-        # classifier decides, this layer just carries the fact.
+        # F-47: the shared classifier separates owned tool execution from the
+        # model's waiting state; this layer only carries process evidence.
         "exec_child": getattr(sess, "exec_child", None),
         "interaction_wait": getattr(sess, "interaction_state", None),
         "mtime": sess.mtime,

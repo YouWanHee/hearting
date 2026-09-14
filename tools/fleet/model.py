@@ -986,6 +986,36 @@ def exec_child_is_background(exec_child, updated_at, now):
     return updated_at > child_started_at + SESSION_WORK_SEC
 
 
+def owned_exec_work(ev_in, now=None):
+    """Positive execution activity, independent of model/supervisor waiting."""
+    child = exec_child_evidence(ev_in.get("exec_child"))
+    if child is None or child.get("ownership_verified") is not True or exec_child_is_wait(child):
+        return None
+    ancestry = child.get("ancestry")
+    if not child.get("proc_start") or not isinstance(ancestry, list) or len(ancestry) < 2:
+        return None
+    if any(not isinstance(edge, dict) or not edge.get("pid") or not edge.get("start")
+           for edge in ancestry):
+        return None
+    if (ancestry[0]["pid"] != child.get("root_pid")
+            or ancestry[0]["start"] != child.get("root_start")
+            or ancestry[-1]["pid"] != child.get("pid")
+            or ancestry[-1]["start"] != child["proc_start"]
+            or len({edge["pid"] for edge in ancestry}) != len(ancestry)
+            or any(edge.get("ppid") != parent["pid"]
+                   for parent, edge in zip(ancestry, ancestry[1:]))):
+        return None
+    if ev_in.get("attempt_id"):
+        if child.get("attempt_id") != ev_in["attempt_id"]:
+            return None
+    elif (child.get("root_pid") != ev_in.get("pid")
+          or child.get("root_start") != str(ev_in.get("proc_start"))):
+        return None
+    if exec_child_is_background(child, ev_in.get("updated_at"), now):
+        return None
+    return child
+
+
 def _session_status_state(status, exec_child=None, background_child=False):
     """tier-1 registry status → activity-axis state. None = registry is silent.
 
@@ -1142,6 +1172,10 @@ def classify_attempt_evidence(ev_in, now=None):
             else "shared observed-liveness: %s (%s)"
             % (observed_state, observed.get("reason", "unknown"))
         )
+        work = owned_exec_work(ev_in, now)
+        if observed_state == "parked-supervised" and work is not None:
+            state, source = "working", "shared-observer+proc"
+            rule = "supervisor parked; exact owned tool is running: %s" % work["comm"]
     # A positive exact-attempt tag is process evidence from the current
     # namespace. It keeps execution live even when the recorded leader is
     # missing/reused and must outrank terminal summaries and heartbeats, but
@@ -1241,6 +1275,7 @@ def classify_attempt_evidence(ev_in, now=None):
         "terminal_observation": terminal,
         "parent_extinction": ev_in.get("parent_extinction"),
         "observed_liveness": observed,
+        "exec_child": ev_in.get("exec_child"),
         "registry_transition": ev_in.get("registry_transition"),
         "progress_fingerprint": deterministic_progress_fingerprint(ev_in),
         "observed_at": now,
@@ -1313,6 +1348,11 @@ def classify_session(ev_in, now, stale_min=SESSION_STALE_MIN, key=None):
         status, st, ev_in.get("exec_child"), background_child=background_child
     )
     m = ev_in.get("mtime")
+
+    work = owned_exec_work(ev_in, now)
+    if work is not None:
+        return out("working", 2, "owned-exec",
+                   "exact owned tool is running: %s" % work["comm"])
 
     lifecycle = ev_in.get("task_lifecycle")
     if ev_in.get("harness") == "codex" and st is None:

@@ -920,6 +920,7 @@ def _dispatch_liveness(job, now, track=True, codex_index=None):
             )
         ),
         "proc_liveness": getattr(job, "_proc_liveness", None),
+        "exec_child": getattr(job, "exec_child", None),
         "row_terminal_mismatch": bool(getattr(job, "row_terminal_mismatch", False)),
     }
     state, evidence = model.classify_job(ev_in, now,
@@ -3322,7 +3323,29 @@ def _campaign_labels(jobs):
         pass
 
 
-def collect(jobs_path=None, harness_filter=None):
+def _attach_execution_evidence(jobs, session_rows):
+    """Join only an exact attempt's verified execution; no cwd/title fallback."""
+    by_attempt = {}
+    by_process = {}
+    for session in session_rows:
+        child = getattr(session, "exec_child", None)
+        attempt = getattr(session, "attempt_id", None)
+        if getattr(session, "liveness", None) == "dead":
+            continue
+        if model.owned_exec_work({"pid": session.pid, "proc_start": session.proc_start,
+                                  "exec_child": child}) is None:
+            continue
+        by_process.setdefault((session.harness, session.pid, session.proc_start), []).append(child)
+        if attempt and child.get("attempt_id") == attempt:
+            by_attempt.setdefault(attempt, []).append(child)
+    for job in jobs:
+        candidates = (by_attempt.get(job.attempt_id, []) if job.attempt_id else
+                      by_process.get((job.harness, job.pid, job.proc_start), []))
+        if len(candidates) == 1:
+            job.exec_child = candidates[0]
+
+
+def collect(jobs_path=None, harness_filter=None, session_rows=()):
     """Return merged [DispatchJob]. harness_filter does not restrict dispatch — the section
     is cross-harness by design (jobs, not sessions)."""
     proc_jobs = _scan_processes()
@@ -3495,6 +3518,9 @@ def collect(jobs_path=None, harness_filter=None):
             _enrich_codex_attempt_session(j)
             _enrich_opencode_attempt_session(j)
             _enrich_attempt_summary(j)
+        # Attach execution before the single classifier pass. The governed
+        # leader and the tool's app-server can be different processes.
+        _attach_execution_evidence(jobs, session_rows)
         for j in jobs:
             j.liveness = _dispatch_liveness(j, now, codex_index=codex_index)
         jobs = _retain_dead_terminal_owners(jobs, now, jobs_path=jobs_path)
