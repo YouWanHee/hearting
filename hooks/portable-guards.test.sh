@@ -323,7 +323,59 @@ if AGENT_ROUTE_FILE="$route_refine_direct" AGENT_ROUTE_ID="$route_refine_direct_
   bad "target-artifact must be anchored to a canonical top-level container"
 else
   [ "$?" -eq 2 ] && ok "target-artifact cannot match an owned-looking nested suffix" \
-    || bad "nested target-artifact violation wrong exit"
+  || bad "nested target-artifact violation wrong exit"
+fi
+
+# A draft/refine route's declared support scopes (frame shards, strategy, stage
+# output, reviews, final) are not target documents. The snapshot helper must
+# skip exactly those declared scopes instead of failing the write closed, while
+# an owned document target still gets its pre-change snapshot. The support
+# route reuses a compiled direct draft route and adds one frame node, then
+# recomputes its sealed identity.
+route_draft=$(fixture_route autopilot-draft paper route-draft)
+route_draft_id=$(fixture_route_id "$route_draft")
+route_draft_support=$(python3 - "$route_draft" "$TMP/proj/.agent_reports/.runtime/routes" "$ROOT" <<'PY'
+import json,sys
+from pathlib import Path
+route_path,routes_dir,root=sys.argv[1:4]
+sys.path.insert(0,str(Path(root)/"utilities"))
+import route_identity
+route=json.loads(Path(route_path).read_text(encoding="utf-8"))
+inline=next(node for node in route["nodes"] if node["id"]=="inline")
+inline.setdefault("write_scope",[]).append("shards/frame/**")
+route["route_hash"]=route_identity.route_hash(route)
+route["route_id"]=route_identity.route_id_from_hash(route["route_hash"])
+out=Path(routes_dir)/f"{route['route_id']}.json"
+out.parent.mkdir(parents=True,exist_ok=True)
+out.write_text(json.dumps(route),encoding="utf-8")
+print(out)
+PY
+)
+route_draft_support_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8"))["route_id"])' "$route_draft_support")
+mkdir -p "$TMP/proj/.agent_reports/shards/frame"
+if AGENT_ROUTE_FILE="$route_draft_support" AGENT_ROUTE_ID="$route_draft_support_id" AGENT_ROUTE_NODE=inline \
+  "$ART" --file "$TMP/proj/.agent_reports/shards/frame/direction-brief.md" >/tmp/art_draft_support.out 2>/tmp/art_draft_support.err; then
+  ok "a declared draft frame shard is not a snapshot target"
+else
+  bad "a declared draft frame shard should pass the snapshot guard"
+fi
+if AGENT_ROUTE_FILE="$route_draft_support" AGENT_ROUTE_ID="$route_draft_support_id" AGENT_ROUTE_NODE=inline \
+  "$ART" --file "$TMP/proj/.agent_reports/test_logs/draft.log" >/tmp/art_draft_scope_out.out 2>/tmp/art_draft_scope_out.err; then
+  bad "a draft route must still reject a write outside the node scope"
+else
+  [ "$?" -eq 2 ] && grep -q 'artifact-write-outside-node-scope' /tmp/art_draft_scope_out.err \
+    && ok "a draft support route keeps its node-scope boundary" \
+    || bad "draft support route scope rejection wrong failure"
+fi
+mkdir -p "$TMP/proj/.agent_reports/documents/draftcycle"
+printf 'before\n' > "$TMP/proj/.agent_reports/documents/draftcycle/doc.md"
+if AGENT_ROUTE_FILE="$route_draft_support" AGENT_ROUTE_ID="$route_draft_support_id" AGENT_ROUTE_NODE=inline \
+  "$ART" --file "$TMP/proj/.agent_reports/documents/draftcycle/doc.md" >/tmp/art_draft_doc.out 2>/tmp/art_draft_doc.err; then
+  [ -f "$TMP/proj/.agent_reports/documents/draftcycle/_internal/versions/v1/doc.md" ] \
+    && ok "an owned draft document target keeps its pre-change snapshot" \
+    || bad "draft document target snapshot missing"
+else
+  bad "an owned draft document target should pass snapshot preparation"
 fi
 
 echo "== artifact guard Bash channel (C-2b, Tier A/B/C) =="

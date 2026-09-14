@@ -12,8 +12,21 @@ class ArtifactSnapshotTest(unittest.TestCase):
   path.write_text(json.dumps({"route_id":route_id,"route_hash":f"sha256:{route_id}","capability":capability,"effective_intensity":intensity,"nodes":[{"id":"transaction","write_scope":["target-artifact"]}]}))
   return path
 
- def run_helper(self, artifact: Path, target: Path, route: Path, route_id: str):
-  return subprocess.run([sys.executable,str(HELPER),"prepare","--artifact-root",str(artifact),"--target",str(target),"--route",str(route),"--route-id",route_id,"--node","transaction"],text=True,capture_output=True)
+ def run_helper(self, artifact: Path, target: Path, route: Path, route_id: str, node: str="transaction"):
+  return subprocess.run([sys.executable,str(HELPER),"prepare","--artifact-root",str(artifact),"--target",str(target),"--route",str(route),"--route-id",route_id,"--node",node],text=True,capture_output=True)
+
+ def draft_route(self, root: Path, *, route_id="rt-draft", intensity="standard") -> Path:
+  path=root/f"{route_id}.json"
+  nodes=[
+   {"id":"frame","write_scope":["shards/frame/**"]},
+   {"id":"frame-alternative","write_scope":["shards/frame-alternative/**"]},
+   {"id":"strategy","write_scope":["analysis/**","strategy/**","assets/source/**"]},
+   {"id":"review","write_scope":["reviews/strategy/**"]},
+   {"id":"draft-production","write_scope":["draft/**"]},
+   {"id":"finalize","write_scope":["final/**","pipeline_summary.md"]},
+  ]
+  path.write_text(json.dumps({"route_id":route_id,"route_hash":f"sha256:{route_id}","capability":"autopilot-draft","effective_intensity":intensity,"nodes":nodes}))
+  return path
 
  def test_same_route_reuses_one_version_and_preserves_relative_paths(self):
   with tempfile.TemporaryDirectory() as td:
@@ -69,6 +82,64 @@ class ArtifactSnapshotTest(unittest.TestCase):
    self.assertEqual(result.returncode,0,result.stderr)
    self.assertEqual((doc.parent/"doc_v2.md").read_text(),"current\n")
    self.assertFalse((doc.parent/"_internal").exists())
+
+ def test_draft_support_scopes_skip_snapshot(self):
+  with tempfile.TemporaryDirectory() as td:
+   root=Path(td); artifact=root/".agent_reports"; route=self.draft_route(root)
+   cases=[("frame","shards/frame/direction-brief.md"),
+          ("frame-alternative","shards/frame-alternative/direction-brief.md"),
+          ("strategy","strategy/plan.md"),
+          ("strategy","analysis/source-map.md"),
+          ("review","reviews/strategy/verdict.md"),
+          ("draft-production","draft/cheatsheet.md"),
+          ("finalize","final/final.md"),
+          ("finalize","pipeline_summary.md")]
+   for node,rel in cases:
+    target=artifact/rel; target.parent.mkdir(parents=True,exist_ok=True); target.write_text("support\n")
+    result=self.run_helper(artifact,target,route,"rt-draft",node=node)
+    self.assertEqual(result.returncode,0,result.stderr)
+    self.assertIn("support-artifact",result.stdout)
+   self.assertEqual([path for path in artifact.rglob("_internal")],[])
+
+ def test_cycle_layout_support_artifact_skips_snapshot(self):
+  with tempfile.TemporaryDirectory() as td:
+   root=Path(td); artifact=root/".agent_reports"
+   target=artifact/"campaigns/2026-09-14_c/cycles/cyc_x/artifacts/shards/frame/direction-brief.md"
+   target.parent.mkdir(parents=True); target.write_text("support\n")
+   route=self.draft_route(root)
+   result=self.run_helper(artifact,target,route,"rt-draft",node="frame")
+   self.assertEqual(result.returncode,0,result.stderr)
+   self.assertIn("support-artifact",result.stdout)
+
+ def test_cycle_layout_document_still_snapshots(self):
+  with tempfile.TemporaryDirectory() as td:
+   root=Path(td); artifact=root/".agent_reports"
+   target=artifact/"campaigns/c/cycles/y/artifacts/documents/name/draft/manuscript.md"
+   target.parent.mkdir(parents=True); target.write_text("doc-before\n")
+   route=self.draft_route(root)
+   result=self.run_helper(artifact,target,route,"rt-draft",node="draft-production")
+   self.assertEqual(result.returncode,0,result.stderr)
+   self.assertEqual((target.parents[1]/"_internal/versions/v1/draft/manuscript.md").read_text(),"doc-before\n")
+
+ def test_malformed_and_undeclared_support_paths_still_fail_closed(self):
+  with tempfile.TemporaryDirectory() as td:
+   root=Path(td); artifact=root/".agent_reports"; route=self.draft_route(root)
+   malformed=artifact/"documents/loose.md"; malformed.parent.mkdir(parents=True); malformed.write_text("x\n")
+   result=self.run_helper(artifact,malformed,route,"rt-draft",node="strategy")
+   self.assertEqual(result.returncode,65); self.assertIn("target-container-unowned",result.stderr)
+   undeclared=artifact/"shards/other/x.md"; undeclared.parent.mkdir(parents=True); undeclared.write_text("x\n")
+   result=self.run_helper(artifact,undeclared,route,"rt-draft",node="strategy")
+   self.assertEqual(result.returncode,65); self.assertIn("target-container-unowned",result.stderr)
+
+ def test_shared_and_outside_root_still_fail_closed(self):
+  with tempfile.TemporaryDirectory() as td:
+   root=Path(td); artifact=root/".agent_reports"; route=self.draft_route(root)
+   shared=artifact/"shared/spec/ref/revisions/1/prd.md"; shared.parent.mkdir(parents=True); shared.write_text("x\n")
+   result=self.run_helper(artifact,shared,route,"rt-draft",node="finalize")
+   self.assertEqual(result.returncode,65); self.assertIn("target-shared-immutable",result.stderr)
+   outside=root/"outside.md"; outside.write_text("x\n")
+   result=self.run_helper(artifact,outside,route,"rt-draft",node="finalize")
+   self.assertEqual(result.returncode,65); self.assertIn("target-outside-artifact-root",result.stderr)
 
 
 if __name__=="__main__": unittest.main()
