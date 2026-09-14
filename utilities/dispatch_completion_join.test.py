@@ -982,6 +982,12 @@ class DispatchCompletionJoinTest(unittest.TestCase):
                    "children": [{"attempt_id": "att-a", "status": "open",
                                  "required_action": "complete-open"}]}
         prepared = JOIN.prepare_supervisor_outbox(path, "att-parent", set(), receipt, [child])
+        JOIN.begin_supervisor_turn(path, "att-parent", set(), receipt_id=prepared.outbox.receipt_id)
+        receiving = JOIN.read_supervisor_phase_state(path, "att-parent")
+        self.assertEqual(receiving.phase, "running-turn")
+        self.assertEqual(receiving.outbox, prepared.outbox)
+        # A restarted observer can still recover the pending receipt verbatim.
+        self.assertEqual(receiving.delivered_attempt_ids, prepared.delivered_attempt_ids)
         before = path.read_bytes()
         self.assertFalse(JOIN.acknowledge_supervisor_delivery(path, "att-parent", "foreign"))
         self.assertEqual(path.read_bytes(), before)
@@ -1004,6 +1010,9 @@ class DispatchCompletionJoinTest(unittest.TestCase):
                            {"attempt_id": "att-b", "parent_attempt_id": "att-parent"})])
         self.assertFalse(JOIN.acknowledge_supervisor_delivery(
             path, "att-parent", prepared.outbox.receipt_id))
+        self.assertEqual(JOIN.read_supervisor_phase_state(path, "att-parent"), replacement)
+        with self.assertRaisesRegex(JOIN.JoinContractError, "receipt-mismatch"):
+            JOIN.begin_supervisor_turn(path, "att-parent", set(), receipt_id=prepared.outbox.receipt_id)
         self.assertEqual(JOIN.read_supervisor_phase_state(path, "att-parent"), replacement)
 
     def test_supervisor_outbox_partial_consume_preserves_same_receipt(self):
@@ -1050,6 +1059,11 @@ class DispatchCompletionJoinTest(unittest.TestCase):
         self.assertEqual(partial.outbox.receipt_digest, prepared.outbox.receipt_digest)
         self.assertEqual(partial.outbox.receipt, receipt)
         self.assertEqual(partial.outbox.consumed_attempt_ids, frozenset({"att-a"}))
+        JOIN.begin_supervisor_turn(state_path, "att-parent", set(),
+                                   receipt_id=prepared.outbox.receipt_id)
+        receiving = JOIN.read_supervisor_phase_state(state_path, "att-parent")
+        self.assertEqual(receiving.phase, "running-turn")
+        self.assertEqual(receiving.outbox, partial.outbox)
         self.assertFalse(
             JOIN.consume_supervisor_outbox_attempts(
                 state_path, "att-parent", {"att-a"}

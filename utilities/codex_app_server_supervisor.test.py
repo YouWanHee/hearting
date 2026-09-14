@@ -108,7 +108,8 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
                             os.close(lease_fd)
                         state_path = os.environ.get('AGENT_DISPATCH_COMPLETION_STATE_FILE')
                         with open(state_path, encoding='utf-8') as h:
-                            delivered = json.load(h)['delivered_attempt_ids']
+                            state = json.load(h)
+                            delivered = state['delivered_attempt_ids']
                         if os.environ.get('FAKE_MIXED_START') == '1' and 'att-child' in delivered:
                             jobs = os.environ['FAKE_JOBS']
                             with open(jobs, encoding='utf-8') as h:
@@ -116,7 +117,7 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
                             with open(jobs, 'w', encoding='utf-8') as h:
                                 h.write(rows)
                         record('turn-start', turn=turns, prompt=prompt, delivered=delivered,
-                               lease_held=lease_held)
+                               lease_held=lease_held, phase=state['phase'], outbox=state.get('outbox'))
                         turn_id = f'turn-{turns}'
                         send({'jsonrpc':'2.0','id':value['id'],'result':{'turn':{'id':turn_id}}})
                         send({'jsonrpc':'2.0','method':'thread/tokenUsage/updated','params':{
@@ -274,6 +275,10 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
         events = [item["event"] for item in trace]
         self.assertEqual(events, ["turn-start", "join-start", "join-end", "turn-start"])
         self.assertEqual(trace[0]["delivered"], [])
+        self.assertEqual(trace[0]["phase"], "running-turn")
+        self.assertEqual(trace[3]["phase"], "running-turn")
+        self.assertEqual(set(trace[3]["outbox"]["attempt_ids"]), {"att-child-a", "att-child-b"})
+        self.assertEqual(trace[3]["outbox"]["consumed_attempt_ids"], [])
         self.assertTrue(all(item.get("lease_held") for item in trace if item["event"] == "turn-start"))
         self.assertEqual(
             set(trace[3]["delivered"]), {"att-child-a", "att-child-b"}

@@ -41,6 +41,7 @@ from dispatch_completion_join import (
     start_retry_prompt,
     validate_delivery_timing,
     write_supervisor_state,
+    begin_supervisor_turn,
 )
 from dispatch_contract import (
     SUCCESS_NOTES as COMPLETION_JOIN_SUCCESS_NOTES,
@@ -1385,10 +1386,10 @@ def main(argv: list[str] | None = None) -> int:
                     resumed_receipt, active_outbox, jobs=args.jobs,
                     notice=pending_notice,
                 )
-            if active_outbox is None:
-                write_supervisor_state(
-                    state_path, args.parent_attempt_id, delivered, phase="running-turn"
-                )
+            begin_supervisor_turn(
+                state_path, args.parent_attempt_id, delivered,
+                receipt_id=active_outbox.receipt_id if active_outbox is not None else None,
+            )
             turn_ordinal += 1
             turn_started_ns = time.monotonic_ns()
             emit(

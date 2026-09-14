@@ -39,7 +39,7 @@ import time
 from .model import (fmt_min, dash, project_of, exec_child_is_wait,
                     session_parent_visible)
 from . import gitinfo
-from .refresh import LiveSnapshot, RefreshPump, MAX_LEAKED_WORKERS
+from .refresh import LiveSnapshot, RefreshPump
 from .session_handle import display_name as _display_name
 from .session_handle import _cell_width as _session_handle_cell_width
 from .session_handle import clip_cells as _clip_cells
@@ -4229,11 +4229,7 @@ def _refresh_health_segments(narrow=False):
     segs = [(" · ", "dim"), ("refreshed " + _refresh_age_label(health.get("age")), "dim")]
     state = health.get("state")
     if state == "stalled":
-        text = " · stalled"
-        leaked = health.get("leaked_workers") or 0
-        if leaked >= MAX_LEAKED_WORKERS:
-            text += " (%d workers stuck)" % leaked
-        segs.append((text, "lvl_y"))
+        segs.append((" · collection delayed", "lvl_y"))
     elif state == "failed":
         error = health.get("last_error") or ""
         limit = 20 if narrow else 40

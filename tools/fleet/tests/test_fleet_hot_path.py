@@ -172,31 +172,21 @@ class ReaderScopeTest(unittest.TestCase):
 
 
 class ProjectionScopeTest(unittest.TestCase):
-    def test_attach_projections_holds_one_reader_scope_for_the_whole_pass(self):
-        entered = []
-
-        @contextmanager
-        def read_scope():
-            entered.append(True)
-            yield
-
-        stub = SimpleNamespace(read_scope=read_scope,
-                               glob_bucket=lambda *a, **k: (entered.append("glob") or []))
-        sessions = [Session(harness="claude", pid=11, cwd="/tmp/x", slug="alpha"),
-                    Session(harness="codex", pid=12, cwd="/tmp/y", slug="beta")]
-        with tempfile.TemporaryDirectory() as tmp, \
-             mock.patch.object(projection, "_artifact_reader", return_value=stub):
-            projection.attach_projections(sessions, [], artifact_root=tmp, now=1000.0)
-        self.assertEqual(entered.count(True), 1)
-        self.assertGreaterEqual(entered.count("glob"), 2)   # both entities asked inside it
-        self.assertEqual(entered[0], True)                  # ...and only after the scope opened
-
-    def test_attach_projections_without_a_reader_still_projects(self):
-        sessions = [Session(harness="claude", pid=11, cwd="/tmp/x", slug="alpha")]
-        with tempfile.TemporaryDirectory() as tmp, \
-             mock.patch.object(projection, "_artifact_reader", return_value=None):
-            out, _ = projection.attach_projections(sessions, [], artifact_root=tmp, now=1000.0)
-        self.assertIsNotNone(out[0].work_projection)
+    def test_live_projection_never_scans_campaign_inventory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_root(Path(tmp))
+            sessions = [Session(harness="codex", pid=11, cwd=tmp, slug="hot-path")]
+            with mock.patch.object(reader.artifact_locator, "scan_index",
+                                   side_effect=AssertionError("live campaign census")):
+                projection.attach_projections(sessions, [], artifact_root=root,
+                                              spec_markers={}, capability_groundings={}, now=1000.0)
+                self.assertEqual(sessions[0].work_projection.source, "none")
+                self.assertIsNone(projection._spec_pipeline_state_path(tmp, "hot-path"))
+                # A directly scoped legacy directory remains available without a scan.
+                (root / "plans" / "2026-09-14_hot-path" / "execute").mkdir(parents=True)
+                projection.attach_projections(sessions, [], artifact_root=root,
+                                              spec_markers={}, capability_groundings={}, now=1000.0)
+                self.assertEqual(sessions[0].work_projection.source, "artifact-inferred")
 
 
 class ProcessTableScanScopeTest(unittest.TestCase):

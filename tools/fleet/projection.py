@@ -7,7 +7,6 @@ result.  It never starts a provider and never writes harness state.
 
 from __future__ import annotations
 
-import contextlib
 import contextvars
 import glob
 import hashlib
@@ -263,12 +262,23 @@ def _owner_active_selection(active_nodes):
     return ("%s(%d-way)" % (group, len(named)) if len(named) > 1 else named[0].id), "active"
 
 
-def _load_evidence_records(node_evidence, route_records):
+def _load_evidence_records(node_evidence, route_records, entities=None):
     """Load records named only by terminal jobs.log evidence, without inventing routes."""
     from . import route
     records = dict(route_records or {})
+    owner_ids = route_ids = None
+    if entities is not None:
+        owner_ids = {str(value) for e in entities for value in
+                     (_field(e, "session_id"), _field(e, "slug")) if value}
+        route_ids = {str(value) for e in entities for value in
+                     (_field(e, "route_id"), _field(e, "owner_route_id")) if value}
     for rid, nodes in (node_evidence or {}).items():
         if rid in records:
+            continue
+        # Historical terminal evidence stays in the registry snapshot. Only
+        # open the routes referenced by this board's actual rows/parent edges.
+        if (route_ids is not None and rid not in route_ids
+                and not any(_field(ev, "parent") in owner_ids for ev in (nodes or {}).values())):
             continue
         for evidence in (nodes or {}).values():
             path = _field(evidence, "route_file")
@@ -597,20 +607,19 @@ def _artifact_candidates(entity, artifact_root=None):
     slug = _field(entity, "slug") or _field(entity, "key")
     if not slug:
         return []
-    roots = []
+    roots = set()
     for value in (artifact_root, _field(entity, "artifact_root"), _field(entity, "cwd")):
         if value:
             value = os.path.realpath(os.path.expanduser(str(value)))
-            roots.extend((value, os.path.join(value, ".agent_reports")))
+            roots.update((value, os.path.join(value, ".agent_reports")))
     candidates = set()
-    reader = _artifact_reader()
     for root in roots:
-        # W7D: plan cycles live under campaigns/*/cycles/*/artifacts/plans; the
-        # top-level plans/ stays a read-only fallback (both come back from
-        # glob_bucket). `root` itself may already be the plans dir.
-        matches = (reader.glob_bucket(Path(root), "plans", "*_%s" % slug) if reader is not None
-                   else glob.glob(os.path.join(root, "plans", "*_%s" % slug)))
-        for path in [str(m) for m in matches] + glob.glob(os.path.join(root, "*_%s" % slug)):
+        # A live row without a route binding cannot claim a campaign from a
+        # matching basename. Keep the directly scoped legacy fallback only;
+        # never turn a display refresh into a full NAS campaign census.
+        pattern = "*_%s" % glob.escape(str(slug))
+        matches = glob.glob(os.path.join(root, "plans", pattern))
+        for path in matches + glob.glob(os.path.join(root, pattern)):
             if os.path.isdir(path):
                 candidates.add(os.path.realpath(path))
     return sorted(candidates)
@@ -839,10 +848,10 @@ def _spec_pipeline_state_path(root, slug):
     reader = _artifact_reader()
     for reports_dir in (".agent_reports", ".claude_reports"):
         artifacts = os.path.join(root, reports_dir)
-        # W7D: cycle spec trees and the latest shared/spec revision first, the
-        # legacy top-level spec/ last as a read-only fallback.
-        bases = ([str(b) for b, _ in reader.bucket_dirs(Path(artifacts), "spec")] if reader is not None
-                 else [os.path.join(artifacts, "spec")])
+        # A project/topic read marker does not identify a campaign cycle.
+        # Resolve the shared pointer or direct legacy path, never all cycles.
+        shared = reader.latest_shared_dir(Path(artifacts), "spec") if reader is not None else None
+        bases = ([str(shared)] if shared is not None else []) + [os.path.join(artifacts, "spec")]
         for base in bases:
             path = os.path.join(base, slug, "pipeline_state.yaml") if slug else os.path.join(base, "pipeline_state.yaml")
             if os.path.isfile(path):
@@ -1501,7 +1510,7 @@ def attach_projections(sessions: Iterable[Session], jobs: Iterable[DispatchJob],
                       capability_groundings=None, degradations=None):
     """Attach work to every row and exact-owned context to live cards."""
     sessions, jobs = list(sessions), list(jobs)
-    route_records = _load_evidence_records(node_evidence, route_records)
+    route_records = _load_evidence_records(node_evidence, route_records, sessions + jobs)
     home = spec_marker_home or _grounding_home()
     if spec_markers is None:
         spec_markers = _spec_marker_index(home)
@@ -1532,27 +1541,20 @@ def attach_projections(sessions: Iterable[Session], jobs: Iterable[DispatchJob],
     # marker is eligible only when this exact session is actively in autopilot-spec.
     for session in sessions:
         session.cap_grounding = _capability_grounding_for(session, cap_index, now=now)
-    # One projection pass = one artifact-reader scope: `_artifact_candidates` asks the
-    # reader once per entity x root, and inside the scope those calls share one locator
-    # scan per root instead of re-walking the tree each time (2026-09-08 audit: 80 walks,
-    # 23.6 s per tick). The memo dies with this block, so the next tick scans records again.
-    reader = _artifact_reader()
-    read_scope = getattr(reader, "read_scope", None) if reader is not None else None
     from . import route
     round_token = _ROUND_SCOPE.set(
         route.RoundScope(route_records, node_evidence or {}, tuple(jobs))
     )
     try:
-        with (read_scope() if read_scope is not None else contextlib.nullcontext()):
-            for entity in all_entities:
-                entity.work_projection = resolve_work_projection(
-                    entity, jobs=jobs, route_records=route_records,
-                    node_evidence=node_evidence, artifact_root=artifact_root, now=now,
-                    spec_markers=spec_markers,
-                    cap_grounding=(entity.cap_grounding if isinstance(entity, Session) else None),
-                    degradations=degradations)
-                entity.stage = (entity.work_projection.stage_label
-                                if isinstance(entity, DispatchJob) else getattr(entity, "stage", None))
+        for entity in all_entities:
+            entity.work_projection = resolve_work_projection(
+                entity, jobs=jobs, route_records=route_records,
+                node_evidence=node_evidence, artifact_root=artifact_root, now=now,
+                spec_markers=spec_markers,
+                cap_grounding=(entity.cap_grounding if isinstance(entity, Session) else None),
+                degradations=degradations)
+            entity.stage = (entity.work_projection.stage_label
+                            if isinstance(entity, DispatchJob) else getattr(entity, "stage", None))
     finally:
         _ROUND_SCOPE.reset(round_token)
     return sessions, jobs

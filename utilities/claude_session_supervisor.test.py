@@ -93,7 +93,11 @@ class ClaudeSessionSupervisorTest(unittest.TestCase):
                 prompt = sys.stdin.read()
                 state_path = os.environ['AGENT_DISPATCH_COMPLETION_STATE_FILE']
                 with open(state_path, encoding='utf-8') as state_handle:
-                    delivered = json.load(state_handle)['delivered_attempt_ids']
+                    state = json.load(state_handle)
+                    assert state['phase'] == 'running-turn', state
+                    delivered = state['delivered_attempt_ids']
+                    if delivered:
+                        assert set(state['outbox']['attempt_ids']).issubset(delivered), state
                 if os.environ.get('FAKE_MIXED_START') == '1' and 'att-child' in delivered:
                     jobs = os.environ['FAKE_JOBS']
                     with open(jobs, encoding='utf-8') as h:
@@ -145,7 +149,11 @@ class ClaudeSessionSupervisorTest(unittest.TestCase):
                     payload = json.loads(line)
                     prompt = payload['message']['content'][0]['text']
                     with open(state_path, encoding='utf-8') as state_handle:
-                        delivered = json.load(state_handle)['delivered_attempt_ids']
+                        state = json.load(state_handle)
+                        assert state['phase'] == 'running-turn', state
+                        delivered = state['delivered_attempt_ids']
+                        if delivered:
+                            assert set(state['outbox']['attempt_ids']).issubset(delivered), state
                     with open(os.environ['FAKE_TRACE'], 'a', encoding='utf-8') as h:
                         h.write(json.dumps({'event':'turn-start','pid':os.getpid(),
                                             'time':time.monotonic(),'session':session,

@@ -1128,6 +1128,31 @@ def _matching_attempt_terminal(ev_in):
     return terminal
 
 
+def _fresh_attempt_turn(ev_in, now):
+    """Display evidence only; never a completion or delivery acknowledgement."""
+    activity = ev_in.get("runtime_activity")
+    if not isinstance(activity, dict) or activity.get("source") != "codex-attempt-stream":
+        return False
+    if (ev_in.get("harness") != "codex" or not ev_in.get("attempt_id")
+            or activity.get("attempt_id") != ev_in["attempt_id"]
+            or not activity.get("thread_id") or not activity.get("turn_id")
+            or activity["thread_id"] != ev_in.get("runtime_session_id")):
+        return False
+    stamp = activity.get("observed_at")
+    return (isinstance(stamp, (int, float)) and not isinstance(stamp, bool)
+            and isinstance(now, (int, float)) and not isinstance(now, bool)
+            and 0 <= now - stamp <= SESSION_WORK_SEC)
+
+
+def has_attempt_identity(ev_in):
+    """Whether the exact classifier owns this row instead of cwd mtime."""
+    return (
+        (ev_in.get("pid") is not None and bool(ev_in.get("proc_start")))
+        or (ev_in.get("pid_local") is not None and bool(ev_in.get("pid_local_start")))
+        or all(ev_in.get(key) for key in ("attempt_id", "route_id", "route_node"))
+    )
+
+
 def classify_attempt_evidence(ev_in, now=None):
     """Pure F-25 exact-attempt verdict shared by all dispatch surfaces.
 
@@ -1136,17 +1161,9 @@ def classify_attempt_evidence(ev_in, now=None):
     with deterministic progress evidence. This function never reads the process
     table itself.
     """
-    identity = ("attempt_id", "route_id", "route_node")
-    has_process_identity = ev_in.get("pid") is not None and bool(ev_in.get("proc_start"))
-    has_recorded_identity = (
-        has_process_identity
-        or (
-            ev_in.get("pid_local") is not None
-            and bool(ev_in.get("pid_local_start"))
-        )
-    )
-    if not has_recorded_identity and any(not ev_in.get(key) for key in identity):
+    if not has_attempt_identity(ev_in):
         return None
+    has_process_identity = ev_in.get("pid") is not None and bool(ev_in.get("proc_start"))
     heartbeat = _matching_attempt_heartbeat(ev_in)
     terminal = _matching_attempt_terminal(ev_in)
     pid_scope = ev_in.get("pid_scope")
@@ -1179,6 +1196,9 @@ def classify_attempt_evidence(ev_in, now=None):
         if observed_state == "parked-supervised" and work is not None:
             state, source = "working", "shared-observer+proc"
             rule = "supervisor parked; exact owned tool is running: %s" % work["comm"]
+        elif observed_state == "parked-supervised" and _fresh_attempt_turn(ev_in, now):
+            state, source = "working", "shared-observer+runtime"
+            rule = "supervisor waiting phase; fresh exact runtime turn activity"
     # A positive exact-attempt tag is process evidence from the current
     # namespace. It keeps execution live even when the recorded leader is
     # missing/reused and must outrank terminal summaries and heartbeats, but
@@ -1278,6 +1298,7 @@ def classify_attempt_evidence(ev_in, now=None):
         "terminal_observation": terminal,
         "parent_extinction": ev_in.get("parent_extinction"),
         "observed_liveness": observed,
+        "runtime_activity": ev_in.get("runtime_activity"),
         "exec_child": ev_in.get("exec_child"),
         "registry_transition": ev_in.get("registry_transition"),
         "progress_fingerprint": deterministic_progress_fingerprint(ev_in),

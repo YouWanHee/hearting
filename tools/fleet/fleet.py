@@ -233,6 +233,13 @@ def main(argv=None):
         def collector(harness_filter=None, usage="cache-only"):      # LIVE real data + injected demo fixtures (merged)
             rs, rj = collect_all(harness_filter=harness_filter, usage="cache-only")
             ds, dj = demo.collect(harness_filter=harness_filter)
+            # Real rows are projected by collect_all. Only the injected rows
+            # still need projection; never reread the live routes/artifact tree.
+            if __package__ in (None, ""):
+                from fleet.projection import attach_projections
+            else:
+                from .projection import attach_projections
+            ds, dj = attach_projections(ds, dj)
             return rs + ds, rj + dj
 
     def projected_collector(harness_filter=None, usage="cache-only"):
@@ -240,29 +247,13 @@ def main(argv=None):
             sessions, jobs = collector(harness_filter=harness_filter)
         else:
             sessions, jobs = collector(harness_filter=harness_filter, usage=usage)
-        try:
-            if __package__ in (None, ""):
-                from fleet.projection import attach_projections
-                from fleet.collectors import dispatch as _dispatch
-            else:
-                from .projection import attach_projections
-                from .collectors import dispatch as _dispatch
-            # F-28a terminal node evidence (dispatch.py's _scan_route_nodes) must survive
-            # into the projection or a node whose live job already went terminal silently
-            # regresses to "pending" (see projection.py's resolve_work_projection).
-            node_evidence = getattr(_dispatch.collect, "last_route_nodes", None)
-            degradations = getattr(_dispatch.collect, "last_degradations", None)
-            result = attach_projections(sessions, jobs, artifact_root=os.environ.get("AGENT_ARTIFACT_ROOT"),
-                                        node_evidence=node_evidence, degradations=degradations)
-        except Exception:
-            result = (sessions, jobs)
         projected_collector.last_resource_jobs = list(
             getattr(collect_all, "last_resource_jobs", []))
         projected_collector.last_resource_malformed = getattr(
             collect_all, "last_resource_malformed", 0)
         projected_collector.last_usage_snapshots = dict(
             getattr(collect_all, "last_usage_snapshots", {}))
-        return result
+        return sessions, jobs
 
     projected_collector.last_resource_jobs = []
     projected_collector.last_resource_malformed = 0
