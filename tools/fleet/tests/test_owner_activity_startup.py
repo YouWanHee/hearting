@@ -99,6 +99,28 @@ class OwnerActivityTest(unittest.TestCase):
 
 
 class SnapshotProjectionTest(unittest.TestCase):
+    def test_activity_read_during_slow_collection_is_not_a_future_event(self):
+        clock = [1000.0]
+        job = model.DispatchJob(key="code", slug="owner", source="proc", harness="codex",
+                                cwd="/fixture", pid=123, proc_start="456", attempt_id="att-exact")
+        def enrich(row):
+            clock[0] = 1002.0
+            row._runtime_activity = {"source": "codex-attempt-stream", "attempt_id": "att-exact",
+                                     "thread_id": "thread", "turn_id": "turn", "observed_at": 1002.0}
+        def classify(row, now, **kwargs):
+            return model.classify_attempt_evidence({**vars(row), "runtime_session_id": "thread",
+                "runtime_activity": row._runtime_activity,
+                "observed_liveness": {"state": "parked-supervised"}}, now)["state"]
+        with mock.patch.object(dispatch, "_scan_processes", return_value=[job]), \
+             mock.patch.object(dispatch, "_candidate_jobs_paths", return_value=[]), \
+             mock.patch.object(dispatch, "_build_codex_rollout_index", return_value={}), \
+             mock.patch.object(dispatch, "_reconcile_drill_rows", return_value=[job]), \
+             mock.patch.object(dispatch, "_enrich_codex_attempt_session", side_effect=enrich), \
+             mock.patch.object(dispatch, "_dispatch_liveness", side_effect=classify), \
+             mock.patch.object(dispatch.time, "time", side_effect=lambda: clock[0]):
+            rows = dispatch.collect()
+        self.assertEqual(rows[0].liveness, "working")
+
     def test_exact_attempts_do_not_build_an_unused_cwd_rollout_index(self):
         exact = model.DispatchJob(key="code", slug="owner", harness="codex", cwd="/nas/repo",
                                   pid=123, proc_start="456", attempt_id="att-exact")

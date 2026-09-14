@@ -3563,6 +3563,9 @@ def collect(jobs_path=None, harness_filter=None, session_rows=()):
         # Attach execution before the single classifier pass. The governed
         # leader and the tool's app-server can be different processes.
         _attach_execution_evidence(jobs, session_rows)
+        # Collection may block on NAS. Events read above can legitimately be
+        # newer than the tick's start; judge freshness at observation time.
+        now = time.time()
         for j in jobs:
             j.liveness = _dispatch_liveness(j, now, codex_index=codex_index)
         jobs = _retain_dead_terminal_owners(jobs, now, jobs_path=jobs_path)
