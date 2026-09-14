@@ -157,6 +157,33 @@ class TestPositive(unittest.TestCase):
             self.assertTrue(report.ok, report.violations)
 
 
+class TestLegacyCampaignMergeFields(unittest.TestCase):
+    def test_accepts_legacy_key_and_merged_from(self):
+        doc = _valid_document()
+        doc["campaign"]["key"] = "ac-cmd-public-data"
+        doc["campaign"]["merged_from"] = {
+            "campaign_id": "camp_" + "0" * 32,
+            "goal": "old goal",
+            "key": "legacy:key",
+            "locator": "2026-09-03_old",
+            "title": "old title",
+        }
+        report = m.validate(doc)
+        self.assertTrue(report.ok, report.violations)
+
+    def test_rejects_unknown_key_inside_legacy_merged_from(self):
+        doc = _valid_document()
+        doc["campaign"]["merged_from"] = {
+            "campaign_id": "camp_" + "0" * 32,
+            "goal": "old goal",
+            "key": "legacy:key",
+            "locator": "2026-09-03_old",
+            "title": "old title",
+            "bogus": 1,
+        }
+        self.assertIn("unknown-key", _codes(m.validate_shape(doc)))
+
+
 class TestClosedSchemaUnknownKey(unittest.TestCase):
     def test_rejects_unknown_top_level_key(self):
         doc = _valid_document()
@@ -320,6 +347,28 @@ class TestLocatorSafety(unittest.TestCase):
     def test_rejects_empty_or_trailing_slash_locator(self):
         self.assertIn("locator-empty", _codes(m.validate_locators(self._with_path(""))))
         self.assertIn("locator-trailing-slash", _codes(m.validate_locators(self._with_path("a/"))))
+
+    def test_payload_names_preserve_dotfiles_without_admitting_path_escape(self):
+        for path in ("artifacts/evidence/test-results/.last-run.json",
+                     "artifacts/.coverage", "artifacts/.test-cache/result.json"):
+            with self.subTest(path=path):
+                self.assertTrue(m.validate(self._with_path(path)).ok)
+                self.assertTrue(m.validate_locator_path(path).ok)
+        for path, code in (
+            ("artifacts/../.credentials", "locator-dot-segment"),
+            ("artifacts/./result", "locator-dot-segment"),
+            ("artifacts//.result", "locator-empty-component"),
+            ("artifacts/.result\n", "locator-control-char"),
+            ("/artifacts/.result", "locator-absolute"),
+            ("artifacts/." + "a" * 128, "locator-invalid-component"),
+            ("artifacts/.cache/manifest.json", "locator-reserved-name"),
+            ("artifacts-shadow/.result", "locator-hidden-component"),
+            (".runtime/result", "locator-hidden-component"),
+            (".cycle.json", "locator-hidden-component"),
+        ):
+            with self.subTest(path=path):
+                self.assertIn(code, _codes(m.validate_locators(self._with_path(path))))
+                self.assertIn(code, _codes(m.validate_locator_path(path)))
 
     def test_rejects_reserved_manifest_filename_locator(self):
         self.assertIn("locator-reserved-name", _codes(m.validate_locators(self._with_path("manifest.json"))))

@@ -37,9 +37,11 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tools.fleet import interaction as fleet_interaction
 from tools.fleet import session_registry
+from dispatch_contract import WRAPPER_PARENT_HARNESSES
 from dispatch_completion_join import (  # noqa: E402
     DELIVERY_TIMING_POINTS,
     JoinContractError,
+    completion_followup_text,
     STAGE_ADVANCE_RECEIPT_KEY,
     STAGE_ADVANCE_SCHEMA_VERSION,
     advance_delivery_timing,
@@ -48,7 +50,9 @@ from dispatch_completion_join import (  # noqa: E402
     typed_stage_advance_block,
     validate_delivery_timing,
 )
-import human_gate_receipt  # noqa: E402
+import human_gate_receipt
+import dispatch_notice_receipt as notice_receipt
+import dispatch_supervision  # noqa: E402
 
 
 MAX_FRAME_BYTES = 16 * 1024 * 1024
@@ -68,21 +72,10 @@ MAX_THREAD_LINEAGE = 16
 INTERNAL_ID_PREFIX = "hearting-managed:"
 ID_PATTERN = re.compile(r"^[A-Za-z0-9._:@/+\-=]{1,256}$")
 FLEET_SESSION_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,256}$")
-ALLOWED_RECEIPT_KEYS = {
-    "schema_version", "state", "parent_attempt_id", "job_registry", "children",
-    "delivery_timing", "delivery_classification",
-}
-ALLOWED_CHILD_KEYS = {
-    "attempt_id", "status", "readiness", "reason", "required_action", "harness",
-    "delivery_classification",
-}
-ALLOWED_REASONS = {
-    "registry-closed", "registry-closed-marker", "terminal-observed", "row-advanced",
-    "terminal-failure-or-unclosed",
-}
-REQUIRED_ACTIONS = {
-    "complete-open", "inspect-done-failure", "advance-completed",
-}
+from dispatch_receipt_identity import CANONICAL_RECEIPT_KEYS, CANONICAL_CHILD_KEYS
+ALLOWED_RECEIPT_KEYS = CANONICAL_RECEIPT_KEYS | {"delivery_timing"}
+ALLOWED_CHILD_KEYS = CANONICAL_CHILD_KEYS
+from dispatch_receipt_identity import COMPLETION_REASONS as ALLOWED_REASONS, COMPLETION_ACTIONS as REQUIRED_ACTIONS
 AGENT_HOME = Path(__file__).resolve().parents[1]
 
 
@@ -531,6 +524,7 @@ class PendingInternal:
         deferred_after_steer: bool = False,
         event: threading.Event | None = None,
         outcome: dict[str, Any] | None = None,
+        recipient_epoch: int | None = None,
     ):
         self.kind = kind
         self.thread_id = thread_id
@@ -538,6 +532,7 @@ class PendingInternal:
         self.delivery_id = delivery_id
         self.identity = identity if identity is not None else {}
         self.receipt = receipt
+        self.recipient_epoch = recipient_epoch if recipient_epoch is not None else (receipt or {}).get("recipient_epoch")
         self.tui_request_id = tui_request_id
         self.deferred_after_steer = deferred_after_steer
         self.event = event if event is not None else threading.Event()
@@ -951,6 +946,18 @@ class ManagedGateway:
                 identity = (thread_id, key)
                 self._appserver_requests.setdefault(identity, time.time())
                 self._publish_wait_locked(thread_id)
+                # Human availability is not a deadline. Codex 0.153.4's TUI
+                # ignores autoResolutionMs and expires non-blocking questions
+                # after 60s grace + 60s countdown. Project only the native UI
+                # wait policy; the TUI still owns answers and explicit cancel.
+                params = message["params"]
+                projected = dict(params)
+                if isinstance(params.get("isBlocking"), bool):
+                    projected["isBlocking"] = True
+                if "autoResolutionMs" in params:
+                    projected["autoResolutionMs"] = None
+                if projected != params:
+                    message = {**message, "params": projected}
         elif method == "serverRequest/resolved":
             params = message.get("params")
             if isinstance(params, dict):
@@ -1323,7 +1330,7 @@ class ManagedGateway:
                 self._send_manual_steer_locked(
                     item.request_id, item.params, state
                 )
-            elif (item.receipt or {}).get("kind") == human_gate_receipt.KIND:
+            elif notice_receipt.is_notice(item.receipt):
                 self._send_human_gate_locked(item, state)
             else:
                 self._send_completion_locked(item, state, "steer")
@@ -1338,7 +1345,7 @@ class ManagedGateway:
         ):
             return
         pending = state.idle_completions.pop(0)
-        if (pending.receipt or {}).get("kind") == human_gate_receipt.KIND:
+        if notice_receipt.is_notice(pending.receipt):
             self._send_human_gate_locked(pending, state)
         else:
             self._send_completion_locked(pending, state, "start")
@@ -1421,7 +1428,7 @@ class ManagedGateway:
                 response = self.status()
             elif value.get("op") == "deliver":
                 response = self.deliver(value)
-            elif value.get("op") == "deliver-human-gate":
+            elif value.get("op") in {"deliver-human-gate", "deliver-notice"}:
                 response = self.deliver_human_gate(value)
             else:
                 raise GatewayError("control-operation-invalid")
@@ -1584,11 +1591,11 @@ class ManagedGateway:
                 )
                 or (
                     required_action in {
-                        "inspect-done-failure", "advance-completed"
+                        "inspect-done-failure", "advance-completed", "finish-workflow"
                     }
                     and status != "done"
                 )
-                or harness not in {"codex", "claude", "unknown"}
+                or harness not in (*WRAPPER_PARENT_HARNESSES, "unknown")
                 or delivery_state not in {"success", "attention"}
                 or (
                     delivery_state == "success"
@@ -1686,30 +1693,11 @@ class ManagedGateway:
         receipt: dict[str, Any],
         delivery_id: str,
     ) -> dict[str, Any]:
-        commands: list[str] = []
-        harvest = shlex.quote(
-            str(AGENT_HOME / "adapters" / "codex" / "bin" / "preflight.sh")
-        )
-        jobs = shlex.quote(str(receipt["job_registry"]))
-        for child in receipt["children"]:
-            attempt = shlex.quote(str(child["attempt_id"]))
-            if child["required_action"] == "complete-open":
-                commands.append(
-                    f"{harvest} harvest --jobs {jobs} --attempt-id {attempt} "
-                    "--status open --mark-done"
-                )
-            elif child["required_action"] == "inspect-done-failure":
-                commands.append(
-                    f"{harvest} harvest --jobs {jobs} --attempt-id {attempt} "
-                    "--status done --failure-detail"
-                )
-        command_text = "\n".join(commands) or "(no harvest command; advance the route)"
         context = (
             "AGENT_HARNESS_COMPLETION_V1\n"
-            + canonical(receipt)
-            + "\nExact typed receipt. Run only these commands:\n"
-            + command_text
-            + "\nThen continue the route; no raw logs or waits."
+            + canonical(receipt) + "\n"
+            + completion_followup_text(receipt, jobs=str(receipt["job_registry"]),
+                surface=str(AGENT_HOME / "adapters" / "codex" / "bin" / "preflight.sh"))
         )
         if len(context.encode("utf-8")) > MAX_CONTEXT_BYTES:
             raise GatewayError("completion-context-oversized")
@@ -1729,18 +1717,22 @@ class ManagedGateway:
         self, request: dict[str, Any]
     ) -> tuple[str, str, str, dict[str, Any], str, str]:
         receipt = request.get("receipt")
+        codec = notice_receipt.codec(receipt)
         with self._lock:
             expected_thread = self._binding_thread_id
             expected_epoch = self._epoch
+        transport_epoch = request.get("recipient_epoch", (receipt or {}).get("recipient_epoch")) if isinstance(receipt, dict) else None
+        if type(transport_epoch) is not int or transport_epoch != expected_epoch:
+            raise GatewayError("recipient-epoch-mismatch")
         try:
-            normalized = human_gate_receipt.validate(
+            normalized = codec.validate(
                 receipt, expected_thread=expected_thread,
                 expected_epoch=expected_epoch,
             )
-            human_gate_receipt.validate_digest(
+            codec.validate_digest(
                 normalized, request.get("receipt_digest")
             )
-        except human_gate_receipt.HumanGateReceiptError as exc:
+        except (human_gate_receipt.HumanGateReceiptError, dispatch_supervision.SupervisionError) as exc:
             raise GatewayError(str(exc)) from exc
         parent = request.get("parent_attempt_id")
         if parent != normalized["owner_attempt_id"]:
@@ -1749,25 +1741,25 @@ class ManagedGateway:
         if batch != normalized["sealed_batch_id"]:
             raise GatewayError("human-gate-batch-mismatch")
         try:
-            human_gate_receipt.validate_receipt(
+            codec.validate_receipt(
                 normalized, jobs=Path(normalized["job_registry"]),
                 expected_thread_id=expected_thread, expected_epoch=expected_epoch,
                 expected_attempts={normalized["owner_attempt_id"]},
                 expected_sealed_batch_id=batch,
                 validate_live=True,
             )
-        except (human_gate_receipt.HumanGateReceiptError, OSError) as exc:
+        except (human_gate_receipt.HumanGateReceiptError, dispatch_supervision.SupervisionError, OSError) as exc:
             raise GatewayError(str(exc)) from exc
         supplied = request.get("delivery_id")
-        if not isinstance(supplied, str) or not supplied.startswith("hg-dlv-"):
+        if not isinstance(supplied, str) or not supplied.startswith(("hg-dlv-", "sn-dlv-")):
             raise GatewayError("human-gate-delivery-id-invalid")
-        delivery_id = human_gate_receipt.gateway_delivery_id(normalized)
+        delivery_id = codec.gateway_delivery_id(normalized)
         if supplied != delivery_id:
             raise GatewayError("human-gate-delivery-id-mismatch")
         return normalized["recipient_thread_id"], parent, batch, normalized, request["receipt_digest"], delivery_id
 
     def deliver_human_gate(self, request: dict[str, Any]) -> dict[str, Any]:
-        """Deliver a live gate through its own ledger namespace and context key."""
+        """One notice transport; each kind owns its validation and context."""
         try:
             thread_id, parent, batch, receipt, receipt_digest, delivery_id = self._human_gate_validation(request)
         except GatewayError as exc:
@@ -1779,7 +1771,7 @@ class ManagedGateway:
             # Re-check both binding dimensions before consulting or creating
             # durable state so reconnect/fork races cannot prepare old work.
             if (self._binding_thread_id != thread_id
-                    or receipt.get("recipient_epoch") != self._epoch):
+                    or request.get("recipient_epoch", receipt.get("recipient_epoch")) != self._epoch):
                 return {"schema_version": 1, "status": "rejected", "delivery_id": delivery_id,
                         "reason": "recipient-epoch-mismatch"}
             existing = self.ledger.get(delivery_id)
@@ -1813,7 +1805,8 @@ class ManagedGateway:
                     return {"schema_version": 1, "status": "rejected", "delivery_id": delivery_id,
                             "reason": "thread-not-owned-by-current-tui"}
                 pending = PendingInternal(kind="human-gate-wait", thread_id=thread_id,
-                                          delivery_id=delivery_id, identity=identity, receipt=receipt)
+                                          delivery_id=delivery_id, identity=identity, receipt=receipt,
+                                          recipient_epoch=self._epoch)
                 state = self._threads.setdefault(thread_id, ThreadState())
                 try:
                     self.ledger._transition(delivery_id, "prepared", **identity)
@@ -1894,8 +1887,22 @@ class ManagedGateway:
     def _send_human_gate_locked(self, pending: PendingInternal, state: ThreadState) -> None:
         current_thread = self._binding_thread_id
         current_epoch = self._epoch
+        # Rebind only unsent work whose semantic identity is still valid.
+        # Recovery obligations survive a connection generation; approval
+        # gates carry their own epoch and their codec refuses stale release.
+        if pending.recipient_epoch != current_epoch:
+            existing = self.ledger.get(pending.delivery_id)
+            if existing and existing.get("state") == "prepared":
+                try:
+                    notice_receipt.codec(pending.receipt).validate(
+                        pending.receipt, expected_thread=current_thread,
+                        expected_epoch=current_epoch)
+                except (human_gate_receipt.HumanGateReceiptError, dispatch_supervision.SupervisionError):
+                    pass
+                else:
+                    pending.recipient_epoch = current_epoch
         if (current_thread != pending.thread_id
-                or pending.receipt.get("recipient_epoch") != current_epoch):
+                or pending.recipient_epoch != current_epoch):
             # Close every local projection of a prepared request.  The
             # validation snapshot is deliberately outside the mutation lock;
             # once the binding changes, the requester must receive one typed
@@ -1937,13 +1944,23 @@ class ManagedGateway:
                 # here; disconnect cannot find this pending object anymore.
                 pending.event.set()
             return
+        if pending.receipt.get("kind") == "supervision":
+            try:
+                dispatch_supervision.validate_receipt(
+                    pending.receipt, jobs=Path(pending.receipt["job_registry"]),
+                    expected_thread_id=pending.thread_id, expected_epoch=current_epoch,
+                    expected_attempts={pending.receipt["owner_attempt_id"]},
+                    expected_sealed_batch_id=pending.receipt["sealed_batch_id"])
+            except (ValueError, OSError) as exc:
+                self._reject_delivery_locked(pending, str(exc))
+                return
         request_id = self._new_internal_id()
         pending.request_id = request_id
         pending.kind = "human-gate-steer" if state.active_turn_id and state.steer_ready else "human-gate-start"
         key = request_key(request_id)
         assert key is not None
         self._internal[key] = pending
-        params = human_gate_receipt.context(pending.receipt, pending.delivery_id)
+        params = notice_receipt.context(pending.receipt, pending.delivery_id)
         method = "turn/steer" if pending.kind == "human-gate-steer" else "turn/start"
         if method == "turn/steer":
             params["expectedTurnId"] = state.active_turn_id

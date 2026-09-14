@@ -7,6 +7,7 @@ real canonical root, registry, and routes directory are never touched.
 import importlib.util
 import fcntl
 import json
+import hashlib
 import os
 import subprocess
 import sys
@@ -47,8 +48,15 @@ def gate_evidence():
 
 
 def registered_headless():
+    # Two supported harnesses, not one: quick now compiles a cross-harness
+    # frame pair, so a single-candidate evidence set is no longer a valid quick
+    # route at all (`quick-frame-cross-harness-unavailable`). Same shape the
+    # canary's own fixture uses in `tools/artifact-producer-canary.py`.
     return {"candidates": [{
         "harness": "codex", "transport": "headless", "surface": "registered-headless",
+        "status": "supported", "probe_source": "fixture-probe", "probe_time": "2026-07-20T00:00:00Z",
+    }, {
+        "harness": "claude", "transport": "headless", "surface": "registered-headless",
         "status": "supported", "probe_source": "fixture-probe", "probe_time": "2026-07-20T00:00:00Z",
     }]}
 
@@ -953,6 +961,38 @@ class CheckWriteTest(ProducerTestBase):
         verdict = P.check_write(self.root, target)
         self.assertEqual((verdict["verdict"], verdict["reason"]), ("deny", "cycle-not-open"))
 
+    def test_worker_write_is_bound_to_issued_cycle_and_returns_its_output_path(self):
+        self.activate()
+        route, _, first = self.begin(title="current")
+        _, _, other = self.begin(capability="autopilot-draft", mode="doc", title="neighbour")
+        current = self.write_output(first, "shards/frame/direction-brief.md", b"current\n")
+        neighbour = self.write_output(other, "shards/frame/direction-brief.md", b"neighbour\n")
+        # Both cycles are open, with exactly the same node-relative filename.
+        # Neither a false output hint nor an omitted cycle env overrides the route.
+        for use_cycle_env in (True, False):
+            env = {"AGENT_ROUTE_ID": route["route_id"], "AGENT_ARTIFACT_OUTPUT_DIR": str(neighbour.parent)}
+            if use_cycle_env:
+                env["AGENT_ARTIFACT_CYCLE_ID"] = first["cycle_id"]
+            with self.subTest(cycle_env=use_cycle_env), mock.patch.dict(os.environ, env):
+                self.assertEqual(P.check_write(self.root, current)["verdict"], "allow")
+                verdict = P.check_write(self.root, neighbour)
+                self.assertEqual(verdict["reason"], "artifact-outside-bound-cycle")
+                self.assertIn(first["env"]["AGENT_ARTIFACT_OUTPUT_DIR"], verdict["detail"])
+        self.assertEqual(neighbour.read_bytes(), b"neighbour\n")
+
+    def test_registered_completion_reuses_cycle_scope_before_marker_publication(self):
+        self.activate()
+        route, _, result = self.begin()
+        foreign = Path(self._tmp.name) / "foreign.md"
+        foreign.write_text("other cycle result\n")
+        with mock.patch.object(R, "_marker_attempt_axes") as axes:
+            with self.assertRaisesRegex(ValueError, "artifact-outside-bound-cycle"):
+                R._publish_completion_locked(route, {}, "frame", foreign,
+                                             attempt_id="att-wrong-cycle", attempt_metadata={})
+            axes.assert_not_called()
+        self.assertEqual(P.require_cycle_output(self.root, self.write_output(result), route_id=route["route_id"]),
+                         Path(result["cycle_dir"]) / "artifacts")
+
     def test_resolve_output_dir(self):
         self.assertEqual(P.resolve_output_dir(self.root, "spec"), (self.root / "spec", "legacy"))
         self.activate()
@@ -1132,6 +1172,32 @@ class FinalizeTest(ProducerTestBase):
                 self.close(route, route_file)
                 sealed = P.finalize(self.root, cycle_id=result["cycle_id"])
                 self.assertEqual(sealed["status"], "sealed")
+
+    def test_collection_uses_manifest_paths_before_reading_any_payload(self):
+        directory = Path(self._tmp.name) / "collection"
+        artifacts = directory / "artifacts"
+        artifacts.mkdir(parents=True)
+        (artifacts / "a.md").write_text("valid output")
+        invalid = artifacts / "bad name.txt"
+        invalid.write_text("retain invalid output")
+        with mock.patch.object(Path, "read_bytes", side_effect=AssertionError("premature payload read")):
+            rows, violations = P._enumerate_output(directory)
+        self.assertEqual(rows, [])
+        self.assertIn("locator-invalid-component:artifacts/bad name.txt", violations)
+        invalid.unlink()  # fixture only
+        outside = Path(self._tmp.name) / "outside"
+        outside.write_text("not a payload")
+        link = artifacts / ".link"
+        link.symlink_to(outside)
+        rows, violations = P._enumerate_output(directory)
+        self.assertEqual(rows, [])
+        self.assertIn("symlink-forbidden:artifacts/.link", violations)
+        link.unlink()
+        cache = artifacts / ".cache"
+        cache.symlink_to(outside.parent, target_is_directory=True)
+        rows, violations = P._enumerate_output(directory)
+        self.assertEqual(rows, [])
+        self.assertIn("symlink-forbidden:artifacts/.cache", violations)
 
 
 class RecoveryTest(ProducerTestBase):
@@ -1338,6 +1404,26 @@ class CliTest(ProducerTestBase):
 class ReviewPublicationLeaseTest(ProducerTestBase):
     """SD-117 §13.34.5-(2): L1 review-publication-lease enforcement."""
 
+    def live_v2_holder(self, cycle_id, attempt, nonce):
+        witness = D.review_governed_lease_path(self.root, cycle_id, attempt)
+        witness.parent.mkdir(parents=True, exist_ok=True)
+        witness.write_bytes(D.review_governed_lease_payload(attempt, cycle_id, nonce))
+        process = subprocess.Popen(
+            [sys.executable, "-c", "import fcntl,sys; f=open(sys.argv[1],'r+b'); "
+             "fcntl.flock(f,fcntl.LOCK_EX); print('ready',flush=True); sys.stdin.read()", str(witness)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, start_new_session=True,
+        )
+        def cleanup():
+            if process.poll() is None:
+                process.terminate()
+            process.wait(timeout=5)
+            process.stdin.close(); process.stdout.close()
+        self.addCleanup(cleanup)
+        self.assertEqual(process.stdout.readline().strip(), "ready")
+        namespace = os.readlink(f"/proc/{process.pid}/ns/pid")
+        return process, {"pid": process.pid, "pid_start": D.process_start_ticks(process.pid),
+                         "pgid": process.pid, "pid_ns": namespace, "pid_observer_ns": namespace}
+
     def test_review_round_one_fail_keeps_cycle_open_and_registered_publication_verdict_is_allow(self):
         self.activate()
         route, route_file, result = self.begin()
@@ -1431,23 +1517,23 @@ class ReviewPublicationLeaseTest(ProducerTestBase):
             "review_governed_lease": D.REVIEW_GOVERNED_LEASE_KIND,
             "review_governed_lease_nonce": nonce,
         }
+        process, identity = self.live_v2_holder(cycle_id, attempt, nonce)
+        record.update(identity)
         v2 = lease_dir / f"{attempt}.json"
         v2.write_text(json.dumps(record), encoding="utf-8")
-        governed = D.review_governed_lease_path(self.root, cycle_id, attempt)
-        governed.parent.mkdir(parents=True)
-        governed.write_bytes(D.review_governed_lease_payload(attempt, cycle_id, nonce))
-        with governed.open("r+b") as held:
-            fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            self.assertEqual(P._live_review_lease(self.root, cycle_id), v2)
-            record["released_at"] = P._rfc3339(now)
-            v2.write_text(json.dumps(record), encoding="utf-8")
-            self.assertEqual(P._live_review_lease(self.root, cycle_id), corrupt)
-            record["released_at"] = None
-            record["deadline"] = P._rfc3339(now - 2)
-            v2.write_text(json.dumps(record), encoding="utf-8")
-            self.assertEqual(P._live_review_lease(self.root, cycle_id), corrupt)
-            record["deadline"] = P._rfc3339(now + 300)
-            v2.write_text(json.dumps(record), encoding="utf-8")
+        self.assertEqual(P._live_review_lease(self.root, cycle_id), v2)
+        record["released_at"] = P._rfc3339(now)
+        v2.write_text(json.dumps(record), encoding="utf-8")
+        self.assertEqual(P._live_review_lease(self.root, cycle_id), corrupt)
+        record["released_at"] = None
+        record["acquired_at"] = P._rfc3339(now - 10)
+        record["deadline"] = P._rfc3339(now - 2)
+        v2.write_text(json.dumps(record), encoding="utf-8")
+        # A valid time limit never overrides an exactly live holder.
+        self.assertEqual(P._live_review_lease(self.root, cycle_id), v2)
+        record["deadline"] = P._rfc3339(now + 300)
+        v2.write_text(json.dumps(record), encoding="utf-8")
+        process.stdin.close(); process.wait(timeout=5)
         corrupt.unlink()
         self.assertIsNone(P._live_review_lease(self.root, cycle_id))
 
@@ -1459,6 +1545,7 @@ class ReviewPublicationLeaseTest(ProducerTestBase):
         cycle_id = result["cycle_id"]
         attempt = "att-finalize-race-v2"
         nonce = "d" * 64
+        process, identity = self.live_v2_holder(cycle_id, attempt, nonce)
         now = time.time()
         lease_dir = P._review_lease_dir(self.root, cycle_id)
         lease_dir.mkdir(parents=True, exist_ok=True)
@@ -1469,15 +1556,12 @@ class ReviewPublicationLeaseTest(ProducerTestBase):
             "expired": False,
             "review_governed_lease": D.REVIEW_GOVERNED_LEASE_KIND,
             "review_governed_lease_nonce": nonce,
+            **identity,
         }), encoding="utf-8")
-        governed = D.review_governed_lease_path(self.root, cycle_id, attempt)
-        governed.parent.mkdir(parents=True)
-        governed.write_bytes(D.review_governed_lease_payload(attempt, cycle_id, nonce))
-        with governed.open("r+b") as held:
-            fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            with self.assertRaises(P.ProducerError) as caught:
-                P.finalize(self.root, cycle_id=cycle_id)
-            self.assertEqual(caught.exception.code, "cycle-finalize-blocked-live-review")
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=cycle_id)
+        self.assertEqual(caught.exception.code, "cycle-finalize-blocked-live-review")
+        process.stdin.close(); process.wait(timeout=5)
         self.assertEqual(P.finalize(self.root, cycle_id=cycle_id)["status"], "sealed")
 
     def test_recovery_journal_roll_forward_is_fenced_by_live_v2_lease(self):
@@ -2611,34 +2695,216 @@ class QuickOwnerBindingIntegrationTest(ProducerTestBase):
 
 
 class TerminalTransactionIntegrationTest(ProducerTestBase):
-    def _prepare_fixture(self):
+    def _prepare_fixture(self, harness="claude", capability="autopilot-code"):
         import dispatch_terminal_commit as terminal
         self.activate()
-        route=R.compile_route("autopilot-code","dev","standard",cwd=R.ROOT,artifact_root=self.root,
+        route=R.compile_route(capability,"update" if capability=="autopilot-spec" else "dev","standard",cwd=R.ROOT,artifact_root=self.root,
             predicates=[],transport="headless",tracking="tracked",tracked_gate_evidence=gate_evidence(),
-            slug="terminal-transaction-fixture",dispatch_evidence={"tuples":[nested("claude","codex")]})
+            slug="terminal-transaction-fixture",dispatch_evidence={"tuples":[nested(harness,"codex")]})
+        if capability=="autopilot-spec":
+            route=R.compose_route(capability=capability,capability_mode="update",shape="staged",
+                graph="review,prd-transaction",slug="terminal-transaction-fixture",cwd=R.ROOT,
+                artifact_root=self.root,intensity="standard",dispatch_evidence={"tuples":[nested(harness,"codex")]})
         route_file=Path(L.admit_runtime_route(self.root,route).route_file)
         jobs=Path(self._tmp.name)/"jobs.log"; owner="att-transaction-owner"; child="att-transaction-report"
         owner_meta=dict(attempt_id=owner,worker_type="owner",dispatch_depth="1",registered_worker="1",
-            harness="claude",owner_route_file=str(route_file),owner_route_id=route["route_id"],
+            harness=harness,owner_route_file=str(route_file),owner_route_id=route["route_id"],
             owner_route_hash=route["route_hash"])
         def row(status,slug,metadata):
             return f"2026-09-08T00:00:00Z\t{status}\t{R.ROOT}\t{R.ROOT}\t{slug}\t"+",".join(f"{k}={v}" for k,v in metadata.items())+"\n"
         jobs.write_text(row("open","owner",owner_meta))
         with mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(jobs)}):
-            result=P.begin(self.root,route_file=route_file,capability="autopilot-code",intensity="standard",
+            result=P.begin(self.root,route_file=route_file,capability=capability,intensity="standard",
                            jobs=jobs,owner_attempt_id=owner)
-            artifact=self.write_output(result,rel="plans/fixture/final_report.md",data=b"verified fixture report\n")
-            node=next(node for node in route["nodes"] if node.get("terminal"))
+            artifact=self.write_output(result,rel=("spec/_internal/reviews/verdict.md" if capability=="autopilot-spec"
+                else "plans/fixture/final_report.md"),data=b"verified fixture report\n")
+            node=next(node for node in route["nodes"] if (node["id"]=="review" if capability=="autopilot-spec" else node.get("terminal")))
             child_meta=dict(attempt_schema_version=2,attempt_id=child,parent_attempt_id=owner,
                 dispatch_depth=2,transport="headless",execution_surface="registered-headless",registered_worker="1",
                 fallback_hop="same-harness-headless",harness="codex",route_id=route["route_id"],
                 route_hash=route["route_hash"],route_node=node["id"],failure_class="pass",launch_outcome="reaped-before-publish")
             subprocess.run([sys.executable,"-c","pass"],check=True)
-            jobs.write_text(row("open","owner",owner_meta)+row("done","report",child_meta))
-            R._publish_completion_locked(route,node,node["id"],artifact,attempt_id=child,attempt_metadata=child_meta,jobs=jobs)
+            jobs.write_text(row("open","owner",owner_meta)+row("open","report",child_meta))
+            R.complete_node(route,node,node["id"],artifact,attempt_id=child,jobs=jobs)
             request=terminal.TerminalCommitRequest(route_file,owner,jobs,self.root)
             return route,route_file,jobs,owner,result,artifact,request
+
+    def test_spec_owner_settlement_uses_native_executor_evidence_for_all_harnesses(self):
+        import dispatch_terminal_commit as terminal
+        from dispatch_completion_join import exact_attempt_row, join_selected_attempts
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness=harness):
+                fixture=TerminalTransactionIntegrationTest(); fixture.setUp()
+                try:
+                    route,path,jobs,owner,cycle,review,request=fixture._prepare_fixture(harness,"autopilot-spec")
+                    report=fixture.write_output(cycle,rel="spec/_internal/owner-report.md",data=b"verified transaction report\n")
+                    text=f"artifact: {report}\nverdict: PASS\nblocker: none"
+                    native={
+                        "codex":[{"type":"item.completed","item":{"type":"agent_message","text":text}},
+                                 {"type":"turn.completed"}],
+                        "claude":[{"type":"result","subtype":"success","is_error":False,"result":text}],
+                        "opencode":[{"type":"text","sessionID":"ses_test","part":{"type":"text","text":text}},
+                                    {"type":"step_finish","sessionID":"ses_test","part":{"type":"step-finish","reason":"stop"}}],
+                    }[harness]
+                    log=jobs.parent/"owner.jsonl"; log.write_text("\n".join(json.dumps(r) for r in native)+"\n")
+                    jobs.write_text(jobs.read_text().replace("worker_type=owner",f"attempt_schema_version=2,worker_type=owner,log_file={log},workflow_completion=runtime-v1"))
+                    self.assertIsNone(terminal.owner_workflow_continuation(jobs,owner,path))
+                    old=review.read_bytes(); review.unlink()
+                    self.assertIn("review",terminal.owner_workflow_continuation(jobs,owner,path))
+                    review.write_bytes(old)
+                    fixture._closed_owner(jobs,owner); meta=exact_attempt_row(jobs,owner).metadata
+                    before=jobs.read_bytes()
+                    with mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(jobs),"AGENT_ARTIFACT_ROOT":str(fixture.root)}):
+                        gates=R.terminal_gate_observation(route,jobs=jobs,exact_terminal=True)
+                        self.assertTrue(gates["prd-transaction"]["passed"],gates)
+                        snapshot={str(p):p.read_bytes() for p in fixture.root.rglob("*") if p.is_file()}
+                        diagnosis=terminal.inspect_owner_completion(jobs,"done",meta)
+                        self.assertEqual((diagnosis["state"],diagnosis["checkpoint"]),("closure-pending","not-claimed"))
+                        self.assertEqual(snapshot,{str(p):p.read_bytes() for p in fixture.root.rglob("*") if p.is_file()})
+                        marker=R.completion_dir(route["route_id"],jobs=jobs)/"prd-transaction.json"
+                        marker.write_text("{}")
+                        self.assertFalse(R.terminal_gate_observation(route,jobs=jobs)["prd-transaction"]["passed"])
+                        marker.unlink()
+                        # An unavailable native result remains an owned obligation.
+                        saved=log.read_bytes(); log.write_text("")
+                        self.assertFalse(R.terminal_gate_observation(route,jobs=jobs)["prd-transaction"]["passed"])
+                        log.write_bytes(saved)
+                        receipt=join_selected_attempts(jobs=jobs,expected_attempts={owner},timeout=0,recover=True)
+                        self.assertEqual(receipt["state"],"ready",receipt)
+                        self.assertFalse(terminal.owner_completion_pending(jobs,"done",meta))
+                        self.assertEqual(terminal.settle_owner_completion(jobs,"done",meta).result,"completed")
+                        self.assertEqual(jobs.read_bytes(),before)
+                        self.assertFalse((R.completion_dir(route["route_id"],jobs=jobs)/"prd-transaction.json").exists())
+                        self.assertEqual(P.read_cycle_record(fixture.root,cycle["cycle_id"])["state"],"sealed")
+                        report.write_text("changed after settlement")
+                        self.assertTrue(terminal.owner_completion_pending(jobs,"done",meta))
+                finally: fixture.doCleanups()
+
+    def _closed_owner(self, jobs, owner):
+        lines=jobs.read_text().splitlines()
+        for i,line in enumerate(lines):
+            fields=line.split("\t"); meta=D.parse_registry_metadata(fields[5])
+            if meta.get("attempt_id") != owner: continue
+            meta.update(attempt_schema_version="2", execution_surface="registered-headless", transport="headless",
+                        fallback_hop="same-harness-headless", failure_class="pass", note="completed-supervisor",
+                        workflow_completion="runtime-v1", launch_outcome="reaped-before-publish",
+                        parent_sid="fixture-parent", parent_completion_delivery="codex-managed-gateway")
+            fields[1]="done"; fields[5]=",".join(f"{k}={v}" for k,v in meta.items());lines[i]="\t".join(fields)
+        jobs.write_text("\n".join(lines)+"\n")
+        return meta
+
+    def test_executing_owner_uses_same_terminal_proof_before_and_after_settlement(self):
+        import dispatch_terminal_commit as terminal
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness=harness):
+                fixture=TerminalTransactionIntegrationTest(); fixture.setUp()
+                try:
+                    route,path,jobs,owner,result,artifact,request=fixture._prepare_fixture(harness)
+                    jobs.write_text(jobs.read_text().replace("worker_type=owner", "attempt_schema_version=2,workflow_completion=runtime-v1,worker_type=owner"))
+                    before=jobs.read_bytes()
+                    self.assertIsNone(terminal.owner_workflow_continuation(jobs,owner,path))
+                    saved=artifact.read_bytes(); artifact.unlink()
+                    prompt=terminal.owner_workflow_continuation(jobs,owner,path)
+                    self.assertIn("[workflow-completion-pending]",prompt)
+                    self.assertIn("same owner",prompt)
+                    self.assertEqual(jobs.read_bytes(),before)
+                    artifact.write_bytes(saved)
+                    self.assertIsNone(terminal.owner_workflow_continuation(jobs,owner,path))
+                    self.assertEqual(jobs.read_bytes(),before)
+                finally: fixture.doCleanups()
+
+    def test_runtime_completion_finishes_and_replays_without_changing_pass_for_three_harnesses(self):
+        import dispatch_terminal_commit as terminal
+        import workflow_state
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness=harness):
+                fixture=TerminalTransactionIntegrationTest(); fixture.setUp()
+                try:
+                    route,path,jobs,owner,result,artifact,request=fixture._prepare_fixture(harness)
+                    fixture._closed_owner(jobs,owner)
+                    from dispatch_completion_join import exact_attempt_row, materialize_after_terminal_close
+                    meta=exact_attempt_row(jobs,owner).metadata
+                    before=jobs.read_bytes()
+                    self.assertTrue(terminal.owner_completion_pending(jobs,"done",meta))
+                    settled = terminal.settle_owner_completion(jobs,"done",meta)
+                    self.assertEqual(settled.result,"completed",settled)
+                    materialize_after_terminal_close(jobs,owner)
+                    self.assertFalse(terminal.owner_completion_pending(jobs,"done",meta))
+                    self.assertIn(str(artifact),terminal.completed_owner_handoff(jobs,"done",meta))
+                    self.assertEqual(workflow_state.WorkflowLedger(route["route_id"],route["route_hash"],jobs=jobs).state()["workflow_state"],"COMPLETE")
+                    manifest=Path(result["cycle_dir"])/"manifest.json"
+                    sealed=manifest.read_bytes()
+                    self.assertEqual(P.read_cycle_record(fixture.root,result["cycle_id"])["state"],"sealed")
+                    self.assertEqual(terminal.settle_owner_completion(jobs,"done",meta).result,"completed")
+                    self.assertEqual(manifest.read_bytes(),sealed)
+                    self.assertEqual(jobs.read_bytes(),before)
+                    artifact.write_text("changed after sealing")
+                    self.assertTrue(terminal.owner_completion_pending(jobs,"done",meta))
+                finally: fixture.doCleanups()
+
+    def test_runtime_completion_failure_keeps_pass_notice_and_recovers_without_a_model(self):
+        import dispatch_terminal_commit as terminal
+        import dispatch_supervision as supervision
+        from dispatch_completion_join import exact_attempt_row, join_selected_attempts, materialize_after_terminal_close
+        route,path,jobs,owner,result,artifact,request=self._prepare_fixture()
+        self._closed_owner(jobs,owner); meta=exact_attempt_row(jobs,owner).metadata; before=jobs.read_bytes()
+        with mock.patch.object(P,"finalize_exact_cycle",side_effect=P.ProducerError("fixture-busy")):
+            materialize_after_terminal_close(jobs,owner)
+            self.assertTrue(terminal.owner_completion_pending(jobs,"done",meta))
+            import workflow_state
+            self.assertNotEqual(workflow_state.WorkflowLedger(route["route_id"],route["route_hash"],jobs=jobs).state()["workflow_state"],"COMPLETE")
+            receipt=join_selected_attempts(jobs=jobs,expected_attempts={owner},timeout=0,recover=False)
+            self.assertNotEqual(receipt["state"],"ready")
+        notices=supervision.materialize(jobs,{owner},reason="workflow-completion-pending")
+        self.assertTrue(supervision.notice_is_current(notices[0]))
+        self.assertEqual(jobs.read_bytes(),before)
+
+        receipt=join_selected_attempts(jobs=jobs,expected_attempts={owner},timeout=2,recover=True)
+        self.assertEqual(receipt["state"],"ready",receipt)
+        self.assertFalse(supervision.notice_is_current(notices[0]))
+        self.assertEqual(jobs.read_bytes(),before)
+
+    def test_completed_retry_history_does_not_block_closure_or_allow_late_start(self):
+        import dispatch_terminal_commit as terminal
+        route,path,jobs,owner,result,artifact,request=self._prepare_fixture()
+        lines=jobs.read_text().splitlines(); fields=lines[-1].split("\t")
+        meta=D.parse_registry_metadata(fields[5]); current=meta["attempt_id"]
+        meta.update(attempt_id="att-prior-review", failure_class="runtime", note="dead-runtime-exit",
+                    retry_attempt_id=current, retry_claimed_at="fixture-past")
+        fields[5]=",".join(f"{k}={v}" for k,v in meta.items())
+        lines.insert(-1,"\t".join(fields));jobs.write_text("\n".join(lines)+"\n")
+        self._closed_owner(jobs,owner)
+        from dispatch_completion_join import exact_attempt_row
+        owner_meta=exact_attempt_row(jobs,owner).metadata; before=jobs.read_bytes()
+        settled=terminal.settle_owner_completion(jobs,"done",owner_meta)
+        self.assertEqual(settled.result,"completed",settled)
+        self.assertEqual(jobs.read_bytes(),before)
+        with self.assertRaises(D.DispatchContractError) as caught:
+            D.ensure_terminal_claim_absent(jobs,route["route_id"],"att-prior-review")
+        self.assertEqual(caught.exception.reason,"terminal-claim-conflict")
+
+    def test_late_conflict_in_nonterminal_child_holds_consumption_without_rewriting_success(self):
+        import dispatch_terminal_commit as terminal
+        from dispatch_completion_join import exact_attempt_row
+        route,path,jobs,owner,result,artifact,request=self._prepare_fixture()
+        self._closed_owner(jobs,owner)
+        # This is a registered advisory child, separate from the report marker.
+        child=dict(attempt_id="att-advisory",parent_attempt_id=owner,worker_type="review",dispatch_depth="2",
+                   attempt_schema_version="2",registered_worker="1",execution_surface="registered-headless",
+                   transport="headless",fallback_hop="same-harness-headless",harness="codex",
+                   note="completed-review",failure_class="pass",launch_outcome="reaped-before-publish")
+        prefix=f"2026-09-08T00:00:00Z\tdone\t{R.ROOT}\t{R.ROOT}\tadvisory\t"
+        original=jobs.read_text(); jobs.write_text(original+prefix+",".join(f"{k}={v}" for k,v in child.items())+"\n")
+        meta=exact_attempt_row(jobs,owner).metadata
+        self.assertEqual(terminal.settle_owner_completion(jobs,"done",meta).result,"completed")
+        manifest=Path(result["cycle_dir"])/"manifest.json"; sealed=manifest.read_bytes()
+        child.update(terminal_conflict="1",conflicting_terminal_note="dead-runtime-exit",conflicting_failure_class="runtime")
+        jobs.write_text(original+prefix+",".join(f"{k}={v}" for k,v in child.items())+"\n")
+        conflicted=jobs.read_bytes()
+        self.assertTrue(terminal.owner_completion_pending(jobs,"done",meta))
+        self.assertNotEqual(terminal.settle_owner_completion(jobs,"done",meta).result,"completed")
+        self.assertEqual(jobs.read_bytes(),conflicted)
+        self.assertEqual(manifest.read_bytes(),sealed)
 
     def test_default_services_close_finalize_envelope_and_replay(self):
         import dispatch_terminal_commit as terminal
@@ -2660,6 +2926,45 @@ class TerminalTransactionIntegrationTest(ProducerTestBase):
             self.assertEqual(before,{str(path):path.read_bytes() for path in paths})
             artifact.write_text("post-seal corruption")
             self.assertNotEqual(terminal.settle_terminal_commit(request).result,"completed")
+
+    def test_hidden_payload_settlement_recovers_and_verifies_bytes_for_three_harnesses(self):
+        import dispatch_terminal_commit as terminal
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness=harness):
+                fixture = TerminalTransactionIntegrationTest(); fixture.setUp()
+                try:
+                    route, path, jobs, owner, result, report, request = fixture._prepare_fixture(harness)
+                    rel = "evidence/visual/test-results/.last-run.json"
+                    payload = b'{"status":"passed","failedTests":[]}\n'
+                    hidden = fixture.write_output(result, rel=rel, data=payload)
+                    fixture._closed_owner(jobs, owner)
+                    registry = jobs.read_bytes()
+                    marker = R.completion_dir(route["route_id"], jobs=jobs) / "report.json"
+                    marker_bytes = marker.read_bytes()
+                    with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs)}):
+                        # Crash after manifest publication; exact finish owns recovery.
+                        with mock.patch.object(P, "_commit_sealed", side_effect=RuntimeError("crash")):
+                            interrupted = terminal.settle_terminal_commit(request)
+                        self.assertNotEqual(interrupted.result, "completed", interrupted)
+                        manifest = Path(result["cycle_dir"]) / "manifest.json"
+                        sealed = manifest.read_bytes()
+                        doc = json.loads(sealed)
+                        revision = next(r for r in doc["artifact_revisions"]
+                                        if r["locator"]["path"] == "artifacts/" + rel)
+                        self.assertEqual(revision["content_digest"], "sha256:" + hashlib.sha256(payload).hexdigest())
+                        self.assertEqual(revision["byte_size"], len(payload))
+                        for _ in range(2):
+                            settled = terminal.settle_terminal_commit(request)
+                            self.assertEqual(settled.result, "completed", settled)
+                            self.assertEqual(manifest.read_bytes(), sealed)
+                            self.assertEqual(hidden.read_bytes(), payload)
+                        hidden.write_bytes(payload + b"drift")
+                        self.assertNotEqual(terminal.settle_terminal_commit(request).result, "completed")
+                        self.assertEqual(manifest.read_bytes(), sealed)
+                        self.assertEqual(marker.read_bytes(), marker_bytes)
+                        self.assertEqual(jobs.read_bytes(), registry)
+                finally:
+                    fixture.doCleanups()
 
     def test_default_services_recover_each_durable_boundary_without_duplicate_outputs(self):
         import dispatch_terminal_commit as terminal
@@ -2806,6 +3111,25 @@ class LocatorDateDuplicationTest(ProducerTestBase):
             P.artifact_locator.locator_base("2026-09-05T00:00:00Z",
                                             "2026-08-24-artifact-knowledge-index-w7"),
             "2026-09-05_2026-08-24-artifact-knowledge-index-w7")
+
+
+class RouteLaunchContextTest(ProducerTestBase):
+    def test_route_launch_prepares_exact_context_once_without_copied_env(self):
+        self.activate()
+        route, path = self.route()
+        preview = P.prepare_route_artifact_env(path, start=False, jobs=self.jobs)
+        self.assertEqual(preview["AGENT_ARTIFACT_CYCLE_ID"], "")
+        self.assertEqual(list(P.list_cycle_records(self.root)), [])
+        env = P.prepare_route_artifact_env(path, start=True, jobs=self.jobs)
+        with mock.patch.dict(os.environ, {"AGENT_ARTIFACT_CYCLE_ID": "cyc_foreign",
+                                        "AGENT_ARTIFACT_OUTPUT_DIR": "/foreign/artifacts"}):
+            again = P.prepare_route_artifact_env(path, start=True, jobs=self.jobs)
+            ready = P.prepare_route_artifact_env(path, start=False, jobs=self.jobs)
+        self.assertEqual(again, env)
+        self.assertEqual(ready, env)
+        self.assertEqual(len(list(P.list_cycle_records(self.root))), 1)
+        self.assertEqual(P.read_cycle_record(self.root, env["AGENT_ARTIFACT_CYCLE_ID"])["route_id"], route["route_id"])
+        self.assertEqual(Path(env["AGENT_ARTIFACT_OUTPUT_DIR"]), Path(env["AGENT_ARTIFACT_CYCLE_DIR"]) / "artifacts")
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import threading
 import unittest
 from unittest import mock
@@ -250,6 +251,7 @@ raise SystemExit(3 if state == 'timeout' else 0)
         )
         claimed = dict(record)
         with mock.patch.object(module.human_gate_receipt, "validate_pending_record") as validate, \
+             mock.patch.object(module, "negotiate_human_gate", return_value={"epoch": 9}), \
              mock.patch.object(module.human_gate_receipt, "gateway_delivery_id",
                                return_value="hg-dlv-exact"), \
              mock.patch.object(module.pending_delivery, "claim", return_value=claimed), \
@@ -356,23 +358,22 @@ raise SystemExit(3 if state == 'timeout' else 0)
         self.assertIn("jobs-path-invalid", result.stdout)
         self.assertFalse(self.control_path.exists())
 
-    def test_timeout_never_connects_to_gateway(self) -> None:
+    def test_timeout_retains_completion_carrier_without_terminal_delivery(self) -> None:
         attempts = ["att-a", "att-b"]
-        self.jobs.write_text(
-            row(attempts[0], harness="codex", status="open")
-            + row(attempts[1], harness="claude", status="open"),
-            encoding="utf-8",
-        )
-        result = subprocess.run(
-            self.command(attempts, mode="timeout"),
-            text=True,
-            capture_output=True,
-            timeout=5,
-        )
-        self.assertEqual(result.returncode, 3, result.stderr + result.stdout)
-        payload = json.loads(result.stdout)
-        self.assertEqual(payload["status"], "timeout")
-        self.assertFalse(self.control_path.exists())
+        self.jobs.write_text(row(attempts[0], harness="codex", status="open")
+                             + row(attempts[1], harness="claude", status="open"), encoding="utf-8")
+        before = self.jobs.read_bytes()
+        process = subprocess.Popen(self.command(attempts, mode="timeout"),
+                                   text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            time.sleep(0.7)
+            self.assertIsNone(process.poll())
+            self.assertEqual(self.jobs.read_bytes(), before)
+            self.assertFalse(self.control_path.exists())
+        finally:
+            process.terminate()
+            out, err = process.communicate(timeout=5)
+        self.assertNotIn('"status": "delivered"', out)
 
     def test_terminal_observed_open_child_keeps_actionable_status(self) -> None:
         self.jobs.write_text(
@@ -429,11 +430,12 @@ raise SystemExit(3 if state == 'timeout' else 0)
         self.assertEqual(result.returncode, 65)
         self.assertIn("attempt-set-invalid", result.stdout)
 
-    def test_direct_managed_codex_and_claude_children_use_hashed_parent(self) -> None:
-        attempts = ["att-direct-codex", "att-direct-claude"]
+    def test_direct_managed_sibling_children_use_hashed_parent(self) -> None:
+        attempts = ["att-direct-codex", "att-direct-claude", "att-direct-opencode"]
         self.jobs.write_text(
             session_row(attempts[0], harness="codex")
-            + session_row(attempts[1], harness="claude"),
+            + session_row(attempts[1], harness="claude")
+            + session_row(attempts[2], harness="opencode"),
             encoding="utf-8",
         )
         server = ControlServer(self.control_path)
@@ -455,7 +457,7 @@ raise SystemExit(3 if state == 'timeout' else 0)
         self.assertNotIn("RAW_SESSION_CHILD_SENTINEL", encoded)
         self.assertEqual(
             {child["harness"] for child in server.request["receipt"]["children"]},
-            {"codex", "claude"},
+            {"codex", "claude", "opencode"},
         )
 
     def test_retryable_disconnect_reconnect_sends_once_after_server_appears(self) -> None:

@@ -34,7 +34,7 @@ fail=0
 # assert a projection surface nothing loads.
 # memory-post-curation-sync.py is likewise invoked from the canonical root by
 # each main completion controller; model workers never own this lifecycle.
-SHARED_UTILITY_DEFERRED="artifact-pointer-bridge.py artifact-quiescence.py artifact-relocation.py artifact-relocation-live.py artifact-knowledge-feed.py cairn-artifact-read.sh cairn-artifact-read.ts dispatch-readiness.py verification-background-lease.py memory-store.sh memory-post-curation-sync.py compute-hosts execution_access.py execution_access_diagnose.py execution-access-diagnose.py governor_identity.py artifact_restore_sealed.py"
+    SHARED_UTILITY_DEFERRED="artifact-knowledge-feed.py artifact-pointer-bridge.py artifact-quiescence.py artifact-relocation-live.py artifact-relocation.py artifact_campaign.py artifact_restore_sealed.py cairn-artifact-read.sh cairn-artifact-read.ts campaign_title_repair.py compute-hosts dispatch-readiness.py dispatch_attempt_policy.py dispatch_capacity_evidence.py dispatch_notice_receipt.py dispatch_owner_input.py dispatch_parent_completion.py dispatch_receipt_identity.py dispatch_supervision.py execution-access-diagnose.py execution_access.py execution_access_diagnose.py governor_identity.py memory-post-curation-sync.py memory-store.sh opencode_session_runtime.py review_watchdog.py verification-background-lease.py work_start.py"
 
 say() {
   printf '%s\n' "$*"
@@ -2183,7 +2183,7 @@ check_opencode_bin_wrappers() {
 
   if ! grep -Fq 'preflight.sh qa-policy <quick|light|standard|thorough|adversarial> [code|research|doc|general]' adapters/opencode/bin/preflight.sh \
     || ! grep -Fq 'runtime_surface=opencode-qa-policy' adapters/opencode/bin/preflight.sh \
-    || ! grep -Fq 'stage_graph_selector=intensity-not-qa' adapters/opencode/bin/preflight.sh \
+    || ! grep -Fq 'stage_graph_selector=explicit-graph-or-intensity-default' adapters/opencode/bin/preflight.sh \
     || ! grep -Fq 'preflight.sh qa-policy <level> [code|research|doc|general]' adapters/opencode/AGENTS.md \
     || ! grep -Fq 'QA policy mapping' adapters/opencode/README.md \
     || ! grep -Fq 'QA policy mapping' adapters/opencode/ADAPTATION.md; then
@@ -3852,15 +3852,17 @@ check_worker_bootstrap_contract() {
     fail_msg "roles/worker-bootstrap.md must own the exact portable three-line handoff"
   fi
 
-  for worker_type in owner stage review support; do
+  for worker_type in owner stage review support frame; do
     fragment="roles/worker-types/$worker_type.md"
     if [ ! -f "$fragment" ] || ! grep -Fq '# Worker Type:' "$fragment"; then
       fail_msg "missing portable worker-type fragment: $fragment"
     fi
     if ! grep -Fq "worker_type: $worker_type" profiles/*.yaml 2>/dev/null; then
       # Not every type needs a current profile, but each declared profile must be typed;
-      # owner/review currently route through generated prompts rather than a profile.
-      [ "$worker_type" = owner ] || [ "$worker_type" = review ] || \
+      # owner/review currently route through generated prompts rather than a profile, and
+      # frame (frame-universal, 2026-09-10) deliberately has no profiles/*.yaml of its own
+      # either -- it is launched via dispatch-owner.py's route-evidence tuple, not a profile.
+      [ "$worker_type" = owner ] || [ "$worker_type" = review ] || [ "$worker_type" = frame ] || \
         fail_msg "profile declarations must expose their worker type"
     fi
   done

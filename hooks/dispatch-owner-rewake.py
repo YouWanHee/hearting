@@ -31,6 +31,7 @@ from dispatch_completion_join import (  # noqa: E402
     current_attempt_row,
     current_children,
     current_delivery_state,
+    completion_harvest_command,
     delivery_classification,
     delivery_required_action,
 )
@@ -51,8 +52,9 @@ DEFAULT_INTERVAL_SECONDS = 5  # one readiness probe costs ~0.1s; 20s dominated t
 DEFAULT_MAX_SECONDS = 21_600
 DEFAULT_ARM_WINDOW_SECONDS = 600
 MAXIMUM_CLOCK_SKEW_SECONDS = 60
-REGISTRY_OWNER_START = {
-    "worker_type": "owner",
+# Depth-1 workers that may wake the interactive parent through this hook.
+DEPTH1_WORKER_TYPES = frozenset({"owner", "frame", "review"})
+REGISTRY_DEPTH1_START = {
     "dispatch_depth": "1",
     "parent_completion_delivery": "claude-parent-runtime",
     "launch_claimed": "1",
@@ -60,6 +62,25 @@ REGISTRY_OWNER_START = {
 }
 SUCCESS_NOTIFICATION = "\x1b]9;Hearting dispatch completed\x07"
 CLAIM_LEASE_SECONDS = 30.0
+
+
+def _worker_type_is_depth1(candidate: object) -> bool:
+    """True when `candidate` names an allowed depth-1 waited worker type.
+
+    `candidate` is either a single string (the registry row's scalar
+    `metadata.get("worker_type")`) or an iterable of strings (the stdout
+    fast path's `fields.get("worker_type", [])`, which can repeat if a
+    filtered command echoed the same key twice) -- both shapes are answered
+    by this one function so a future widening of `DEPTH1_WORKER_TYPES` only
+    has to change one place. The bug this guards against: turning
+    `DEPTH1_WORKER_TYPES` into a collection but leaving a caller compare a
+    scalar to it with `==` would silently never match anything -- every
+    caller here goes through membership (`in`/`isdisjoint`), never equality
+    against the set itself.
+    """
+    if isinstance(candidate, str):
+        return candidate in DEPTH1_WORKER_TYPES
+    return not DEPTH1_WORKER_TYPES.isdisjoint(candidate or ())
 
 
 @dataclass(frozen=True)
@@ -125,7 +146,7 @@ def _validated_jobs(raw: str | None) -> Path | None:
 # ---------------------------------------------------------------------------
 
 ARM_DIRECTORY = "rewake-arms"
-ARM_LIMIT = 8  # same finite discipline as dispatch_pending_delivery.RECLAIM_LIMIT
+ARM_LIMIT = 8  # Bounds this async hook; the next real prompt retains sweep recovery.
 ARM_SCHEMA = 1
 ARM_STATES = frozenset({"waiting", "gate-wake-sent", "lapsed", "ended"})
 
@@ -179,8 +200,8 @@ def _bash_call(payload: object) -> tuple[dict[str, Any], str] | None:
 
 
 def parse_launch(payload: object) -> Launch | None:
-    """The receipt fast path: a successful depth-1 owner start whose stdout
-    names the attempt, the registry, and this session as the parent."""
+    """The receipt fast path: a successful depth-1 owner-or-frame start whose
+    stdout names the attempt, the registry, and this session as the parent."""
 
     gate = _bash_call(payload)
     if gate is None:
@@ -191,12 +212,13 @@ def parse_launch(payload: object) -> Launch | None:
         "check": "ok",
         "status": "start",
         "dispatch_depth": "1",
-        "worker_type": "owner",
         "parent_completion_delivery": "claude-parent-runtime",
         "registered": "1",
         "started": "1",
     }
     if any(expected not in fields.get(key, []) for key, expected in required_memberships.items()):
+        return None
+    if not _worker_type_is_depth1(fields.get("worker_type", [])):
         return None
     attempt_id = _single(fields, "attempt_id")
     parent_session = _single(fields, "parent_session_id")
@@ -330,16 +352,18 @@ def _read_registry_lines(jobs: Path) -> list[str] | None:
 def _session_owner_rows(
     jobs: Path, session: str, *, statuses: frozenset[str] = ARM_ROW_STATUSES
 ) -> list[tuple[str, float]]:
-    """Every claimed-and-started depth-1 owner row bound to `session` whose
-    latest status is in `statuses`, as ``(attempt_id, age_seconds)``, oldest
-    first. Empty on any refusal. This is the one identity check both arming
-    paths share (review R1 B1): a receipt on stdout only *names* a candidate;
-    the row proves it -- exists, `parent_sid` is this session, every
-    `REGISTRY_OWNER_START` key matches. A receipt may name a row that already
-    ran to `done` (a short owner finishing before the hook ran). The registry
-    path takes a *new* claim only on an open row; a row that ran to `done`
-    while this session already held its claim is still re-armable, because
-    the wake it owes was never delivered (top review M1)."""
+    """Every claimed-and-started depth-1 owner/frame/review row bound to `session`
+    whose latest status is in `statuses`, as ``(attempt_id, age_seconds)``,
+    oldest first. Empty on any refusal. This is the one identity check both
+    arming paths share (review R1 B1): a receipt on stdout only *names* a
+    candidate; the row proves it -- exists, `parent_sid` is this session,
+    every `REGISTRY_DEPTH1_START` key matches, and `worker_type` is a member
+    of `DEPTH1_WORKER_TYPES` (checked by `_worker_type_is_depth1`, not folded
+    into the equality dict -- see its module-level comment). A receipt may
+    name a row that already ran to `done` (a short owner finishing before the
+    hook ran). The registry path takes a *new* claim only on an open row; a
+    row that ran to `done` while this session already held its claim is still
+    re-armable, because the wake it owes was never delivered (top review M1)."""
 
     lines = _read_registry_lines(jobs)
     if lines is None:
@@ -359,7 +383,9 @@ def _session_owner_rows(
     for attempt_id, (stamp, status, metadata) in latest.items():
         if status not in statuses or metadata.get("parent_sid") != session:
             continue
-        if any(metadata.get(key) != value for key, value in REGISTRY_OWNER_START.items()):
+        if any(metadata.get(key) != value for key, value in REGISTRY_DEPTH1_START.items()):
+            continue
+        if not _worker_type_is_depth1(metadata.get("worker_type")):
             continue
         age = _row_age(stamp, now)
         if age is None or age < -MAXIMUM_CLOCK_SKEW_SECONDS:
@@ -786,7 +812,6 @@ def classified_receipt(
     if not (home / "adapters" / "codex" / "bin" / "preflight.sh").is_file():
         home = root
     harvest = home / "adapters" / "codex" / "bin" / "preflight.sh"
-    jobs_argument = shlex.quote(str(launch.jobs))
     status = delivery.status if delivery is not None else ""
     row_revision = delivery.row_revision if delivery is not None else "unavailable"
     marker_current = bool(delivery and _completion_evidence_current(delivery))
@@ -825,17 +850,11 @@ def classified_receipt(
             reason = "terminal-failure-or-unclosed"
         if state == "success":
             instruction = "No harvest command is required; the registered owner completed."
-        elif required_action == "complete-open":
+        elif required_action in {"complete-open", "inspect-done-failure"}:
             instruction = (
-                "Use only the exact checked harvest command: "
-                f"{shlex.quote(str(harvest))} harvest --jobs {jobs_argument} "
-                f"--attempt-id {shlex.quote(launch.attempt_id)} --status open --mark-done."
-            )
-        elif required_action == "inspect-done-failure":
-            instruction = (
-                "Use only the exact checked harvest command: "
-                f"{shlex.quote(str(harvest))} harvest --jobs {jobs_argument} "
-                f"--attempt-id {shlex.quote(launch.attempt_id)} --status done --failure-detail."
+                "Exact completion bookkeeping command:\n"
+                + completion_harvest_command(launch.attempt_id, required_action,
+                    jobs=str(launch.jobs), surface=str(harvest))
             )
         elif required_action == "advance-completed":
             instruction = "No harvest command is required; advance or finish the route."
@@ -849,10 +868,9 @@ def classified_receipt(
             )
         else:
             instruction = (
-                "Inspect the exact current row and completion marker with: "
-                f"{shlex.quote(str(harvest))} harvest --jobs {jobs_argument} "
-                f"--attempt-id {shlex.quote(launch.attempt_id)} --status done "
-                "--failure-detail."
+                "Inspect the exact current row and completion marker with:\n"
+                + completion_harvest_command(launch.attempt_id, "inspect-done-failure",
+                    jobs=str(launch.jobs), surface=str(harvest))
             )
     elif transaction_error:
         state = "attention"
@@ -880,7 +898,7 @@ def classified_receipt(
         f"advanced={int(advanced)} "
         f"reason={reason} required_action={required_action}. "
         "Do not start or re-arm Background Bash, Monitor, liveness, or dispatch-wait. "
-        f"{instruction} Do not emit a periodic progress recap."
+        f"{instruction}\nDo not emit a periodic progress recap."
     )
     return state, message
 
@@ -1056,7 +1074,7 @@ def _recipient_gate_records(launch: Launch) -> list[tuple[Path, str, str, dict]]
             continue
         if record is None or record.get("state") not in pending_delivery.OPEN_STATES:
             continue
-        if not is_human_gate_record(record):
+        if not is_human_gate_record(record) and record.get("receipt", {}).get("kind") != "supervision":
             continue
         found.append((root, recipient_key, delivery_id, record))
     return found
@@ -1068,10 +1086,9 @@ _PROBE_NEXT_DEADLINE_NS: dict[str, int] = {}
 
 def _open_gate_pending(launch: Launch) -> bool:
     """SD-129 probe for `wait_for_attempt`: is a gate record for THIS attempt
-    waiting for a carrier? `pending`, or a lease another carrier let expire,
-    and still claimable (`attempts` below `RECLAIM_LIMIT`; a record whose
-    reclaim budget is spent is left to the release-time retirement, so the
-    hook never spins on something it can never claim -- review round 1, B3).
+    waiting for a carrier? `pending`, or a lease another carrier let expire.
+    The hook's interval and one-wake boundary govern its work; earlier failed
+    claims do not cancel delivery responsibility.
     A live claim by the sweep is left alone -- it acks within its own turn.
 
     The recipient directory is only scanned when its mtime moved since the
@@ -1098,8 +1115,6 @@ def _open_gate_pending(launch: Launch) -> bool:
     _PROBE_NEXT_DEADLINE_NS.pop(key, None)
     for _root, _key, _delivery_id, record in _recipient_gate_records(launch):
         if launch.attempt_id not in (record.get("attempt_ids") or []):
-            continue
-        if (record.get("attempts") or 0) >= pending_delivery.RECLAIM_LIMIT:
             continue
         state = record.get("state")
         if state == "pending":
@@ -1167,6 +1182,15 @@ def _gate_notices(
             )
         except pending_delivery.PendingDeliveryError:
             continue
+        if record.get("receipt", {}).get("kind") == "supervision":
+            try:
+                from dispatch_supervision import notice_is_current
+                if not notice_is_current(record):
+                    pending_delivery.reject_claimed(root, recipient_key, delivery_id,
+                        claim_owner=claim_owner, reason="supervision-resolved")
+                    continue
+            except (OSError, ValueError, pending_delivery.PendingDeliveryError):
+                continue
         notices.append(_bounded_receipt_text(record))
         if announced is not None:
             announced.append(delivery_id)
@@ -1189,6 +1213,8 @@ def gate_wake_message(launch: Launch, notices: list[str]) -> str:
     still alive and waiting -- so the session answers the gate instead of
     harvesting the attempt."""
 
+    if any("Hearting supervision needs attention." in notice for notice in notices):
+        return " ".join(notices)
     return (
         "Hearting human gate awaiting your decision (SD-123/129). Runtime gate receipt "
         f"schema=2 state=attention attempt_id={launch.attempt_id} armed={launch.armed} "

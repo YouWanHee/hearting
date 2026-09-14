@@ -43,7 +43,8 @@ from dispatch_contract import (  # noqa: E402
     resolve_agent_home,
     process_table_scan_scope,
 )
-from dispatch_completion_join import read_supervisor_phase_state  # noqa: E402
+from dispatch_completion_join import read_supervisor_phase_state, read_join_observation  # noqa: E402
+from dispatch_attempt_policy import terminal_conflict_pending  # noqa: E402
 from codex_dispatch_terminal import terminal_envelope_observed  # noqa: E402
 
 try:  # W7D read-side layout resolver; absent on a pre-cutover checkout.
@@ -133,6 +134,14 @@ def _strip_autopilot_prefix(name):
     if name and name.startswith("autopilot-"):
         return name[len("autopilot-"):]
     return name
+
+
+def _attempt_attention(meta):
+    """Project the shared conflict verdict, without granting execution authority."""
+    try:
+        return "terminal-evidence-conflict" if terminal_conflict_pending(meta) else None
+    except (ValueError, TypeError, UnicodeDecodeError):
+        return "terminal-evidence-unreadable"
 
 
 def _parse_pipe_meta(pipe):
@@ -937,6 +946,15 @@ def _dispatch_liveness(job, now, track=True, codex_index=None):
     elif common_observation and common_observation.state == "parked-supervised":
         job.stage = "parked-supervised"
         job.note = "parked-supervised"
+        if registry_path and job.attempt_id:
+            observation = read_join_observation(
+                Path(registry_path), {"parent_attempt_id": job.attempt_id}, now=now
+            )
+            if observation.get("state") == "attention":
+                job.stage = "supervision-attention"
+                job.note = "process-unverifiable"
+                job.state_evidence = {**evidence, "join_observation": observation}
+                return "blocked"
     return state
 
 
@@ -2255,6 +2273,7 @@ def _scan_registry_evidence(paths):
                 "parent_attempt_id": meta.get("parent_attempt_id"),
                 "note": meta.get("note"),
                 "registry_order": registry_order,
+                "attention_reason": _attempt_attention(meta),
             })
             # route_file/route_hash/parent name WHERE the sealed record lives and who the
             # conductor is — raw registry fields, independent of whether this particular
@@ -2278,6 +2297,10 @@ def _scan_registry_evidence(paths):
                 # A standalone Fleet must not fall back to its ambient registry
                 # when resolving a terminal-only route's completion markers.
                 "_registry_path": path,
+                "attempt_id": attempt_id,
+                "attention_reason": (_attempt_attention(meta)
+                                     if attempt_contract["attempt_contract_status"] == "current"
+                                     else None),
             })
             if attempt_contract["attempt_contract_status"] != "current":
                 continue
@@ -2781,6 +2804,7 @@ def _scan_jobs_log(path, seen_slugs, seen_keys=None, registry_priority=0,
         if dead_terminal_owner:
             job.note = meta.get("note") or "dead-runtime-exit"
         job._registry_metadata = dict(meta)
+        job.attention_reason = _attempt_attention(meta)
         job._registry_repo = repo
         job._registry_worktree = cwd
         jobs.append(job)
@@ -2803,7 +2827,16 @@ def _scan_jobs_log(path, seen_slugs, seen_keys=None, registry_priority=0,
             or job.registered_worker is not True
         ):
             violations.append("quick-surface")
-        if job.fallback_hop != "same-harness-headless":
+        # N4: display must mirror the registration contract, not a stale copy of
+        # it. Quick's same-harness pin applies to the WORK node (`one-shot`)
+        # only; its two frame legs are an advisory pair whose one mandatory
+        # independence axis IS cross-harness. Without this exception Fleet
+        # paints a healthy cross-harness frame leg as broken, and an operator
+        # cancels a working round trip.
+        if job.fallback_hop != "same-harness-headless" and not (
+            job.worker_type == "frame"
+            and job.route_node in ("frame", "frame-alternative")
+        ):
             violations.append("quick-fallback")
         if violations:
             job.attempt_contract_status = "invalid:" + ",".join(violations)

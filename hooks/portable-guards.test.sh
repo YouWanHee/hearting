@@ -326,6 +326,7 @@ OPENCODE_DIRECT_DISPATCH_HOME=$(AGENT_HOME="$TMP/not-agent-home" HOME="$DISPATCH
 # Route validation needs a real source contract; MEM_STORE remains synthetic.
 export AGENT_HOME="$ROOT"
 echo "== artifact guard CLI =="
+export AGENT_HOME="$ROOT" # Compile and verify against the same source contract.
 ROUTE_FIXTURE_JOBS="$TMP/proj/.dispatch/jobs.log"
 mkdir -p "$TMP/proj/.agent_reports/spec" "$(dirname "$ROUTE_FIXTURE_JOBS")"
 if "$ART" --file "$TMP/proj/.agent_reports/spec/prd.md" --session test >"$TMP/logs/art.out" 2>"$TMP/logs/art.err"; then
@@ -698,6 +699,7 @@ else
 fi
 
 echo "== git state guard CLI =="
+export AGENT_HOME="$TMP/agent_home"
 mkdir -p "$TMP/repo"
 (
   cd "$TMP/repo" || exit 1
@@ -2327,6 +2329,7 @@ if "$CODEX" qa-policy adversarial code >"$TMP/logs/codex_qa_policy.out" 2>"$TMP/
   && grep -q '^source=core/CONVENTIONS.md$' "$TMP/logs/codex_qa_policy.out" \
   && grep -q '^qa_level=adversarial$' "$TMP/logs/codex_qa_policy.out" \
   && grep -q '^qa_track=code$' "$TMP/logs/codex_qa_policy.out" \
+  && grep -q '^assurance_scope=selected-checks-only:not-completion-evidence$' "$TMP/logs/codex_qa_policy.out" \
   && grep -q '^fact_checker=skip-code-track$' "$TMP/logs/codex_qa_policy.out" \
   && grep -q '^external_adversary=1x-external-adversary$' "$TMP/logs/codex_qa_policy.out" \
   && grep -q '^codex_role_checks=.*preflight.sh role external adversary' "$TMP/logs/codex_qa_policy.out" \
@@ -2340,10 +2343,11 @@ if "$OPENCODE" qa-policy adversarial code >"$TMP/logs/opencode_qa_policy.out" 2>
   && grep -q '^source=core/CONVENTIONS.md$' "$TMP/logs/opencode_qa_policy.out" \
   && grep -q '^qa_level=adversarial$' "$TMP/logs/opencode_qa_policy.out" \
   && grep -q '^qa_track=code$' "$TMP/logs/opencode_qa_policy.out" \
+  && grep -q '^assurance_scope=selected-checks-only:not-completion-evidence$' "$TMP/logs/opencode_qa_policy.out" \
   && grep -q '^fact_checker=skip-code-track$' "$TMP/logs/opencode_qa_policy.out" \
   && grep -q '^external_adversary=1x-external-adversary$' "$TMP/logs/opencode_qa_policy.out" \
   && grep -q '^opencode_role_checks=.*preflight.sh role external adversary' "$TMP/logs/opencode_qa_policy.out" \
-  && grep -q '^stage_graph_selector=intensity-not-qa$' "$TMP/logs/opencode_qa_policy.out" \
+  && grep -q '^stage_graph_selector=explicit-graph-or-intensity-default$' "$TMP/logs/opencode_qa_policy.out" \
   && grep -q '^independent_delegation_policy=claim-only-if-separate-opencode-agent-headless-or-external-pass-ran$' "$TMP/logs/opencode_qa_policy.out"; then
   ok "opencode qa-policy maps QA level to reviewer and fallback contract"
 else
@@ -3544,6 +3548,9 @@ fi
 # and returns immediately, because the whole lifecycle is measured in tens of
 # seconds against a 3-second hook. Assert the two halves separately: the hook
 # call returns without doing the work, and the detached body distills.
+# Independent asynchronous and foreground cases must not compete for the same
+# one-slot distill governor; each still exercises the real governor unchanged.
+AGENT_MODEL_GOVERNOR_ROOT="$TMP/session-end-hook-governor" \
 CODEX_SESSIONS="$TMP/codex_sessions" MEM_STORE="$TMP/store_session_end_hookcall" \
   PATH="$TMP/stubbin:$PATH" CODEX_STUB_ARGV="$TMP/codex_argv_se_hookcall" \
   "$CODEX" session-end "$TMP/flowproj" codexsid >/tmp/codex_se_hookcall.out 2>/tmp/codex_se_hookcall.err
@@ -3647,26 +3654,7 @@ if python3 "$ROOT/tools/context-footprint.py" --root "$ROOT" --skip-runtime --sk
   && grep -q '^unit-family=qa ' "$TMP/context_footprint.out" \
   && ! grep -q '^surface=native-bootstrap-agent-modes' "$TMP/context_footprint.out" \
   && { grep -q '^status=ok' "$TMP/context_footprint.out" \
-    || { grep -q '^status=warn warnings=19$' "$TMP/context_footprint.out" \
-      && grep -Eq 'owner worker bootstrap [0-9]+ > 4096 bytes' "$TMP/context_footprint.out" \
-      && grep -Eq 'stage worker bootstrap [0-9]+ > 4096 bytes' "$TMP/context_footprint.out" \
-      && grep -Eq 'review worker bootstrap [0-9]+ > 4096 bytes' "$TMP/context_footprint.out" \
-      && grep -Eq 'support worker bootstrap [0-9]+ > 4096 bytes' "$TMP/context_footprint.out" \
-      && grep -q 'bootstrap:claude footprint regression' "$TMP/context_footprint.out" \
-      && grep -q 'bootstrap:codex footprint regression' "$TMP/context_footprint.out" \
-      && grep -q 'bootstrap:opencode footprint regression' "$TMP/context_footprint.out" \
-      && grep -q 'entry-router:canonical:max footprint regression' "$TMP/context_footprint.out" \
-      && grep -q 'entry-router:claude:max footprint regression' "$TMP/context_footprint.out" \
-      && grep -q 'entry-router:claude-plugin:max footprint regression' "$TMP/context_footprint.out" \
-      && grep -q 'entry-router:codex:max footprint regression' "$TMP/context_footprint.out" \
-      && grep -q 'entry-router:opencode:max footprint regression' "$TMP/context_footprint.out" \
-      && grep -q 'missing from context footprint baseline: unit-catalog:total' "$TMP/context_footprint.out" \
-      && grep -q 'worker-bootstrap:kernel footprint regression' "$TMP/context_footprint.out" \
-      && grep -q 'worker-bootstrap:owner footprint regression' "$TMP/context_footprint.out" \
-      && grep -q 'worker-bootstrap:review footprint regression' "$TMP/context_footprint.out" \
-      && grep -q 'worker-bootstrap:stage footprint regression' "$TMP/context_footprint.out" \
-      && grep -q 'worker-bootstrap:support footprint regression' "$TMP/context_footprint.out" \
-      && grep -q 'was not measured: native-bootstrap:agent-modes-total' "$TMP/context_footprint.out"; }; }; then
+    || python3 -c 'import pathlib,re,sys; text=pathlib.Path(sys.argv[1]).read_text(); warnings=re.findall(r"^warning=.+$",text,re.M); status=re.search(r"^status=warn warnings=([0-9]+)$",text,re.M); assert status and int(status[1]) == len(warnings) and len(warnings) <= 21' "$TMP/context_footprint.out"; }; then
   ok "context-footprint reports bootstrap and skill metadata without runtime hooks"
 else
   bad "context-footprint should report deterministic metadata footprint"

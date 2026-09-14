@@ -112,9 +112,11 @@ class CompletionMarkerTest(unittest.TestCase):
             "workflow_mode": "tracked",
             "artifact_guard": {"satisfied": True, "source": "fixture"},
         }
-        # Seal the same fixture runtime and state roots that wrapper children
-        # validate. An outer test runner's HOME/AGENT_HOME is not this fixture.
+        # Compile and adapter validation must see the same deliberate runtime,
+        # state root and git environment. Otherwise the installed host release
+        # is sealed here and the wrapper never reaches the marker being tested.
         with mock.patch.dict(os.environ, self.base_env(), clear=True):
+            ROUTE._forget_launch_path(ROOT)
             route = ROUTE.compile_route(
                 "autopilot-code", "dev", "strong", self.repo, self.artifact,
                 signals=["shared-contract"], transport="headless", tracking="tracked",

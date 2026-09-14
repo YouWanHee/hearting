@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import textwrap
 from types import SimpleNamespace
 import unittest
@@ -91,15 +92,14 @@ class ClaudeSessionSupervisorTest(unittest.TestCase):
                 session = args[args.index(key) + 1]
                 prompt = sys.stdin.read()
                 state_path = os.environ['AGENT_DISPATCH_COMPLETION_STATE_FILE']
-                if '--failure-detail' in prompt:
-                    with open(state_path, encoding='utf-8') as state_handle:
-                        state_value = json.load(state_handle)
-                    state_value.pop('outbox', None)
-                    state_value['phase'] = 'running-turn'
-                    with open(state_path, 'w', encoding='utf-8') as state_handle:
-                        json.dump(state_value, state_handle)
                 with open(state_path, encoding='utf-8') as state_handle:
                     delivered = json.load(state_handle)['delivered_attempt_ids']
+                if os.environ.get('FAKE_MIXED_START') == '1' and 'att-child' in delivered:
+                    jobs = os.environ['FAKE_JOBS']
+                    with open(jobs, encoding='utf-8') as h:
+                        rows = h.read().replace('launch_started=0', 'launch_started=1')
+                    with open(jobs, 'w', encoding='utf-8') as h:
+                        h.write(rows)
                 with open(os.environ['FAKE_TRACE'], 'a', encoding='utf-8') as h:
                     h.write(json.dumps({'event':'turn-start','time':time.monotonic(),
                                         'resume':resume,'session':session,'prompt':prompt,
@@ -144,13 +144,6 @@ class ClaudeSessionSupervisorTest(unittest.TestCase):
                 for line in sys.stdin:
                     payload = json.loads(line)
                     prompt = payload['message']['content'][0]['text']
-                    if '--failure-detail' in prompt:
-                        with open(state_path, encoding='utf-8') as state_handle:
-                            state_value = json.load(state_handle)
-                        state_value.pop('outbox', None)
-                        state_value['phase'] = 'running-turn'
-                        with open(state_path, 'w', encoding='utf-8') as state_handle:
-                            json.dump(state_value, state_handle)
                     with open(state_path, encoding='utf-8') as state_handle:
                         delivered = json.load(state_handle)['delivered_attempt_ids']
                     with open(os.environ['FAKE_TRACE'], 'a', encoding='utf-8') as h:
@@ -208,7 +201,7 @@ class ClaudeSessionSupervisorTest(unittest.TestCase):
                         else:
                             terminal = ',failure_class=pass,note=completed-supervisor'
                         fields[1] = 'done'
-                        fields[5] += terminal
+                        fields[5] += terminal + ',launch_outcome=never-launched'
                         kept.append('\\t'.join(fields))
                 with open(jobs, 'w', encoding='utf-8') as h:
                     h.write('\\n'.join(kept) + '\\n')
@@ -374,6 +367,7 @@ class ClaudeSessionSupervisorTest(unittest.TestCase):
         self.assertEqual(len(joins), 1, rows)
         self.assertEqual(joins[0]["delivery_timing_schema_version"], 1)
         self.assertIsInstance(joins[0]["join_completed_ns"], int)
+        # The fake join closes a row without a marker or committed receipt.
         self.assertIn('"delivery_classification":"attention"', turns[1]["prompt"])
         timing_events = [
             row for row in rows
@@ -714,6 +708,37 @@ class ClaudeSessionSupervisorTest(unittest.TestCase):
         self.assertNotIn("RAW_CLAUDE_SENTINEL", result.stdout)
         self.assertEqual(sum(row.get("type") == "result" for row in rows), 1)
 
+    def test_premature_pass_resumes_same_owner_before_terminal_commit(self):
+        self.jobs.write_text(owner_row(self.lease).replace("attempt_id=att-parent", "workflow_completion=runtime-v1,attempt_id=att-parent"))
+        route = self.base / "workflow-route.json"
+        value = seal_route({"schema_version": 2, "cwd": str(self.base),
+            "nodes": [{"id": "report", "dispatch_depth": 2, "terminal": True}], "resume_retry_boundaries": []})
+        route.write_text(json.dumps(value))
+        proof = self.base / "report.proof"
+        wrapper = self.base / "checked-supervisor.py"
+        wrapper.write_text(
+            "import sys, runpy, os\nfrom pathlib import Path\nfrom types import SimpleNamespace\n"
+            + "sys.path.insert(0, " + repr(str(SUPERVISOR.parent)) + ")\n"
+            + "import dispatch_terminal_commit as T\n"
+            + "route_module = T._route_module()\n"
+            + "route_module._marker_identity_row = lambda *a, **k: "
+              "{'passed': Path(os.environ['FAKE_REPORT_PROOF']).exists(), 'reason': 'marker-unreadable'}\n"
+            + "T._route_module = lambda: route_module\n"
+            + "runpy.run_path(" + repr(str(SUPERVISOR)) + ", run_name='__main__')\n")
+        self.claude.write_text(self.claude.read_text().replace("resume = '--resume' in args", "resume = '--resume' in args\nif resume: open(os.environ['FAKE_REPORT_PROOF'], 'w').write('proved')"))
+        command = self.command(); command[1] = str(wrapper)
+        command += ["--route-file", str(route), "--route-id", value["route_id"], "--route-hash", value["route_hash"]]
+        result = subprocess.run(command, input="initial assignment", text=True, capture_output=True,
+            env=self.child_env(FAKE_TRACE=str(self.trace), FAKE_NO_CHILD="1", FAKE_REPORT_PROOF=str(proof)), timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        turns = [json.loads(line) for line in self.trace.read_text().splitlines() if json.loads(line).get("event") == "turn-start"]
+        self.assertEqual(len(turns), 2, turns)
+        self.assertIn("[workflow-completion-pending]", turns[1]["prompt"])
+        self.assertIn("report", turns[1]["prompt"])
+        self.assertIn("workflow-completion-incomplete", result.stdout)
+        self.assertEqual(len(self.jobs.read_text().splitlines()), 1)
+        self.assertIn("completed-supervisor", self.jobs.read_text())
+
     def test_no_child_finishes_without_resume(self):
         self.jobs.write_text(owner_row(self.lease), encoding="utf-8")
         result = self.run_supervisor(FAKE_NO_CHILD="1")
@@ -747,6 +772,20 @@ class ClaudeSessionSupervisorTest(unittest.TestCase):
             for row in rows
         ))
 
+    def test_started_child_is_collected_before_correcting_unstarted_sibling(self):
+        pending = child_row().replace("att-child", "att-pending").replace("launch_started=1", "launch_started=0")
+        self.jobs.write_text(owner_row(self.lease) + child_row() + pending)
+        result = self.run_supervisor(FAKE_MIXED_START="1", FAKE_JOBS=str(self.jobs))
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        trace = [json.loads(line) for line in self.trace.read_text().splitlines()]
+        self.assertEqual([event["event"] for event in trace], [
+            "turn-start", "join-start", "join-end", "turn-start",
+            "join-start", "join-end", "turn-start",
+        ])
+        self.assertEqual(trace[3]["delivered"], ["att-child"])
+        self.assertEqual(set(trace[-1]["delivered"]), {"att-child", "att-pending"})
+        self.assertNotIn('"state": "registration-required"', result.stdout)
+
     def test_bound_long_route_survives_thirteen_continuations_and_completes(self):
         route = self.base / "long-route.json"
         route_value = seal_route({
@@ -763,13 +802,6 @@ class ClaudeSessionSupervisorTest(unittest.TestCase):
                 import json, os, sys
                 state_path = os.environ['AGENT_DISPATCH_COMPLETION_STATE_FILE']
                 prompt = sys.stdin.read()
-                if '--failure-detail' in prompt:
-                    with open(state_path, encoding='utf-8') as h:
-                        state_value = json.load(h)
-                    state_value.pop('outbox', None)
-                    state_value['phase'] = 'running-turn'
-                    with open(state_path, 'w', encoding='utf-8') as h:
-                        json.dump(state_value, h)
                 with open(state_path, encoding='utf-8') as h:
                     delivered = json.load(h)['delivered_attempt_ids']
                 turn = len(delivered) + 1
@@ -837,9 +869,10 @@ class ClaudeSessionSupervisorTest(unittest.TestCase):
             self.assertEqual(boundary["previous_count"], index)
             timing_order = [
                 boundary["last_child_terminal_ns"], boundary["join_completed_ns"],
-                boundary["same_thread_resume_ns"], boundary["exact_harvest_ns"],
+                boundary["same_thread_resume_ns"],
                 boundary["next_stage_start_ns"],
             ]
+            self.assertIsNone(boundary["exact_harvest_ns"])
             self.assertEqual(timing_order, sorted(timing_order))
         self.assertFalse(any(
             row.get("type") == "dispatch.supervisor.owner-boundary"
@@ -936,16 +969,6 @@ class ClaudeSessionSupervisorTest(unittest.TestCase):
             (tmp / "releases" / "v2" / "adapters" / "codex" / "bin"
              / "preflight.sh").resolve(),
         )
-
-    def test_remediation_prompt_uses_shared_absolute_harvest_surface(self):
-        prompt = supervisor.remediation_prompt({"att-child"}, jobs="/tmp/fixture-jobs.log")
-        self.assertIn(
-            str(ROOT / "adapters" / "codex" / "bin" / "preflight.sh")
-            + " harvest --jobs /tmp/fixture-jobs.log --attempt-id att-child --mark-done",
-            prompt,
-        )
-        self.assertIn("shared, runtime-neutral registry harvest compatibility surface", prompt)
-        self.assertIn("does not change either harness", prompt)
 
     def test_missing_result_has_no_false_terminal(self):
         broken = self.base / "broken.py"
@@ -1084,7 +1107,7 @@ class ClaudeSessionSupervisorTest(unittest.TestCase):
                     for attempt in attempts:
                         fields = current[attempt]
                         fields[1] = 'done'
-                        fields[5] += ',failure_class=pass,note=completed-supervisor'
+                        fields[5] += ',failure_class=pass,note=completed-supervisor,launch_outcome=never-launched'
                         kept.append('\\t'.join(fields))
                     with open(jobs, 'w', encoding='utf-8') as h:
                         h.write('\\n'.join(kept) + '\\n')
@@ -1147,11 +1170,10 @@ class ClaudeSessionSupervisorTest(unittest.TestCase):
             result.stdout,
         )
 
-    def test_join_timeout_repark_bound_trips_without_spurious_model_turn(self):
+    def test_join_deadlines_preserve_owner_past_old_repark_bound(self):
         self.jobs.write_text(owner_row(self.lease) + child_row(), encoding="utf-8")
-        # More timeouts than --max-join-reparks allows: the supervisor must
-        # fail closed via the repark bound, never by silently delivering a
-        # timeout receipt to the model as if it were actionable.
+        # Deadlines cannot end a live dependency. The compatibility flag no
+        # longer grants termination; eventual ready produces exactly one turn.
         join_script = self._timeout_then_ready_join(timeouts=10)
         cmd = self.command_with_join(join_script)
         idx = cmd.index("--join-timeout")
@@ -1164,11 +1186,11 @@ class ClaudeSessionSupervisorTest(unittest.TestCase):
             env=self.child_env(FAKE_TRACE=str(self.trace)),
             timeout=10,
         )
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("join-timeout-repark-exceeded", result.stdout + result.stderr)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("join-timeout-repark-exceeded", result.stdout + result.stderr)
         trace = [json.loads(line) for line in self.trace.read_text().splitlines()]
         turn_starts = [row for row in trace if row["event"] == "turn-start"]
-        self.assertEqual(len(turn_starts), 1, trace)
+        self.assertEqual(len(turn_starts), 2, trace)
 
     def _blocked_child_row(self) -> str:
         log = self.base / "att-child.claude.jsonl"
@@ -1273,153 +1295,30 @@ class ClaudeSessionSupervisorTest(unittest.TestCase):
             (link / module.name).symlink_to(module)
         return link / "claude-session-supervisor.py"
 
-    def test_d5_unsatisfiable_receipt_is_never_delivered_and_seals_protocol(self):
-        self.jobs.write_text(owner_row(self.lease) + child_row(), encoding="utf-8")
+    def test_attention_is_runtime_acknowledged_without_model_harvest(self):
+        self.jobs.write_text(owner_row(self.lease) + self._blocked_child_row(), encoding="utf-8")
+        result = subprocess.run(self.command_with_join(self._non_closing_join()),
+            input="initial assignment", text=True, capture_output=True,
+            env=self.child_env(FAKE_TRACE=str(self.trace)), timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        turns = self._turn_starts()
+        self.assertEqual(len(turns), 2, turns)
+        self.assertIn("inspect-done-failure", turns[1]["prompt"])
+        self.assertNotIn("redelivery-suppressed", result.stdout)
+        self.assertIn("dead-worker-blocked", self.jobs.read_text())
+        self.assertNotIn("owner-redelivery-abandoned", self.jobs.read_text())
+        self.assertFalse(self.state.exists())
+
+    def test_compatibility_command_path_cannot_prevent_notification_delivery(self):
+        self.jobs.write_text(owner_row(self.lease) + self._blocked_child_row(), encoding="utf-8")
         cmd = self.command_with_join(self._non_closing_join())
         cmd[1] = str(self._divergent_surface_supervisor())
-        result = subprocess.run(
-            cmd,
-            input="initial assignment",
-            text=True,
-            capture_output=True,
-            env=self.child_env(FAKE_TRACE=str(self.trace)),
-            timeout=20,
-        )
-        self.assertEqual(result.returncode, 70, result.stderr + result.stdout)
-        events = self._events(result.stdout)
-        unsatisfiable = [
-            row for row in events
-            if row.get("type") == "dispatch.supervisor.receipt-unsatisfiable"
-        ]
-        self.assertEqual(len(unsatisfiable), 1, events)
-        self.assertEqual(unsatisfiable[0]["reason"], "unrecognized-surface")
-        # The row, not the event, is the evidence that a terminal was sealed.
-        registry = self.jobs.read_text(encoding="utf-8")
-        self.assertIn("note=owner-attention-unactionable", registry)
-        self.assertIn("failure_class=protocol", registry)
-        self.assertNotIn("note=owner-redelivery-abandoned", registry)
-        self.assertNotIn("note=dead-runtime-exit", registry)
-        # Not delivered at all: only the initial turn ever ran.
-        self.assertEqual(len(self._turn_starts()), 1, self.trace.read_text())
-
-    def test_d5a_actionable_but_unexecuted_receipt_is_redelivered_not_sealed(self):
-        # The round-2 tripwire. An open row whose required action stays
-        # `complete-open` because the owner has not run the command yet is a
-        # legitimate state: a non-advancing row must never seal on its own.
-        self.jobs.write_text(owner_row(self.lease) + child_row(), encoding="utf-8")
-        result = subprocess.run(
-            self.command_with_join(self._non_closing_join()),
-            input="initial assignment",
-            text=True,
-            capture_output=True,
-            env=self.child_env(FAKE_TRACE=str(self.trace)),
-            timeout=30,
-        )
-        turns = self._turn_starts()
-        # initial + first delivery + at least one re-delivery after the first
-        # unchanged pass.
-        self.assertGreaterEqual(len(turns), 3, self.trace.read_text())
-        events = self._events(result.stdout)
-        suppressed = [
-            row for row in events
-            if row.get("type") == "dispatch.supervisor.redelivery-suppressed"
-        ]
-        # Exactly one suppression, and only after the bound -- never on the
-        # first unchanged pass.
-        self.assertEqual(
-            [row["resolution"] for row in suppressed],
-            ["identical-redelivery-bound"],
-            events,
-        )
-        self.assertEqual(suppressed[0]["identical_redeliveries"], 3, events)
-
-    def test_d5b_identical_bound_seals_abandonment_never_attention_or_budget(self):
-        self.jobs.write_text(owner_row(self.lease) + child_row(), encoding="utf-8")
-        result = subprocess.run(
-            self.command_with_join(self._non_closing_join()),
-            input="initial assignment",
-            text=True,
-            capture_output=True,
-            env=self.child_env(FAKE_TRACE=str(self.trace)),
-            timeout=30,
-        )
-        self.assertEqual(result.returncode, 70, result.stderr + result.stdout)
-        registry = self.jobs.read_text(encoding="utf-8")
-        self.assertIn("note=owner-redelivery-abandoned", registry)
-        self.assertIn("failure_class=runtime", registry)
-        self.assertNotIn("note=owner-attention-unactionable", registry)
-        # DC-8b: the continuation budget must never be what stops an identical
-        # prompt -- that is the defect this bound replaces.
-        combined = result.stdout + result.stderr
-        self.assertNotIn("continuation-limit-exceeded", combined)
-        # The route node stays incomplete, so SD-106 same-node redispatch
-        # remains available: no completion marker is published by the seal.
-        self.assertEqual(
-            list((self.base / "supervisor-state").glob("**/completion/**")), []
-        )
-        self.assertNotIn("completion_marker=", registry)
-
-    def test_d6_in_place_row_advance_resumes_the_normal_loop(self):
-        # An unchanged outbox buys in-place work first. When that work advances
-        # the row, the loop resumes normally and the counter resets.
-        counter = self.base / "advancing_join.count"
-        counter.write_text("0", encoding="utf-8")
-        script = self.base / "fake_join_advancing.py"
-        script.write_text(
-            textwrap.dedent(
-                """\
-                import json, sys
-                counter_path = COUNTER_PATH
-                jobs = sys.argv[sys.argv.index('--jobs') + 1]
-                parent = sys.argv[sys.argv.index('--parent-attempt-id') + 1]
-                attempts = [sys.argv[i + 1] for i, v in enumerate(sys.argv) if v == '--attempt-id']
-                with open(counter_path, encoding='utf-8') as handle:
-                    calls = int(handle.read()) + 1
-                with open(counter_path, 'w', encoding='utf-8') as handle:
-                    handle.write(str(calls))
-                status, action = 'open', 'complete-open'
-                if calls >= 2:
-                    with open(jobs, encoding='utf-8') as handle:
-                        lines = handle.read().splitlines()
-                    out = []
-                    for line in lines:
-                        fields = line.split(TAB)
-                        if len(fields) == 6 and 'attempt_id=att-child,' in fields[5] + ',':
-                            fields[1] = 'done'
-                            fields[5] += ',failure_class=pass,note=completed-supervisor'
-                        out.append(TAB.join(fields))
-                    with open(jobs, 'w', encoding='utf-8') as handle:
-                        handle.write('\\n'.join(out) + '\\n')
-                    status, action = 'done', 'advance-completed'
-                print(json.dumps({'schema_version': 2, 'state': 'ready',
-                    'parent_attempt_id': parent,
-                    'children': [{'attempt_id': a, 'status': status, 'readiness': 'ready',
-                                  'reason': 'registry-closed',
-                                  'required_action': action} for a in attempts]}))
-                """
-            )
-            .replace("COUNTER_PATH", repr(str(counter)))
-            .replace("TAB", repr("\t")),
-            encoding="utf-8",
-        )
-        self.jobs.write_text(owner_row(self.lease) + child_row(), encoding="utf-8")
-        result = subprocess.run(
-            self.command_with_join(script),
-            input="initial assignment",
-            text=True,
-            capture_output=True,
-            env=self.child_env(FAKE_TRACE=str(self.trace)),
-            timeout=30,
-        )
-        events = self._events(result.stdout)
-        suppressed = [
-            row for row in events
-            if row.get("type") == "dispatch.supervisor.redelivery-suppressed"
-        ]
-        self.assertEqual([row["resolution"] for row in suppressed], ["row-advanced"], events)
-        registry = self.jobs.read_text(encoding="utf-8")
-        self.assertNotIn("note=owner-redelivery-abandoned", registry)
-        self.assertNotIn("note=owner-attention-unactionable", registry)
+        result = subprocess.run(cmd, input="initial assignment", text=True,
+            capture_output=True, env=self.child_env(FAKE_TRACE=str(self.trace)), timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertEqual(len(self._turn_starts()), 2)
+        self.assertNotIn("receipt-unsatisfiable", result.stdout)
+        self.assertNotIn("owner-attention-unactionable", self.jobs.read_text())
 
     def test_d7_ordinary_advance_suppresses_nothing_and_spends_one_continuation(self):
         # Regression: the normal path -- a receipt whose row advances between
@@ -1489,47 +1388,52 @@ class ClaudeSessionSupervisorTest(unittest.TestCase):
             events,
         )
 
-    def test_live_unresolved_child_still_raises(self):
-        # Fix 4 must not become "never fail": a genuinely unresolved, live
-        # (non-quiescent) child with no terminal evidence still raises.
-        log = self.base / "att-live.claude.jsonl"
-        route = self.base / "route.json"
-        row = (
-            f"2026-07-23T00:00:00Z\topen\t{self.base}\t{self.base}\tchild\t"
-            "attempt_schema_version=2,dispatch_depth=2,transport=headless,"
-            "execution_surface=registered-headless,registered_worker=1,launch_started=1,"
-            "fallback_hop=same-harness-headless,harness=claude,"
-            f"attempt_id=att-live,parent_attempt_id={PARENT},"
-            f"log_file={log},artifact_root={self.artifact_root},"
-            f"route_file={route},route_node=frame\n"
-        )
-        self.jobs.write_text(owner_row(self.lease) + row, encoding="utf-8")
-        join_script = self._non_closing_join()
-        result = subprocess.run(
-            self.command_with_join(join_script)
-            + ["--max-continuations", "1"],
-            input="initial assignment",
-            text=True,
-            capture_output=True,
-            env=self.child_env(FAKE_TRACE=str(self.trace)),
-            timeout=10,
-        )
-        self.assertNotEqual(result.returncode, 0)
-        # SD-116 (c): exhaustion no longer necessarily dies with
-        # "continuation-limit-exceeded" on the very next turn -- the reserved
-        # budget now buys exactly one extra cleanup turn first (see
-        # `_seal_terminal_handoff_or_raise`), which can shift a genuinely
-        # unresolved child onto whichever no-progress guard trips first (here,
-        # the pre-existing identical-redelivery bound). Either way it still
-        # raises -- this fixture's actual invariant.
-        combined = result.stdout + result.stderr
-        self.assertTrue(
-            "continuation-limit-exceeded" in combined
-            or "identical-redelivery-bound" in combined,
-            combined,
-        )
-        registry = self.jobs.read_text(encoding="utf-8")
-        self.assertIn("\topen\t", registry)
+    def test_unverifiable_child_keeps_controller_responsibility_without_model_redelivery(self):
+        self._assert_unverifiable_child_is_retained("open")
+
+    def test_done_word_does_not_discharge_unverified_child_cleanup(self):
+        self._assert_unverifiable_child_is_retained("done")
+
+    def _assert_unverifiable_child_is_retained(self, child_status):
+        parent = owner_row(self.lease).rstrip("\n") + ",parent_sid=parent-test,parent_completion_delivery=codex-managed-gateway\n"
+        self.jobs.write_text(parent + child_row(status=child_status), encoding="utf-8")
+        output = self.base / "controller.jsonl"
+        env = {**os.environ, "FAKE_TRACE": str(self.trace), "AGENT_ARTIFACT_ROOT": str(self.artifact_root)}
+        with output.open("w") as stream:
+            process = subprocess.Popen(self.command_with_join(self._non_closing_join())
+                + ["--max-continuations", "2"], stdin=subprocess.PIPE,
+                stdout=stream, stderr=subprocess.STDOUT, text=True, env=env)
+            try:
+                process.stdin.write("initial assignment")
+                process.stdin.close()
+                deadline = time.monotonic() + 8
+                while time.monotonic() < deadline and "dispatch.supervisor.reparked" not in output.read_text():
+                    self.assertIsNone(process.poll(), output.read_text())
+                    time.sleep(0.02)
+                self.assertIn("dispatch.supervisor.reparked", output.read_text())
+                checkpoints = [json.loads(line) for line in output.read_text().splitlines()
+                    if line.startswith("{") and json.loads(line).get("type") == "dispatch.supervisor.reparked"]
+                self.assertEqual(checkpoints[0]["notice_error"], "", checkpoints)
+                self.assertIsNone(process.poll())
+                turns = [json.loads(line) for line in self.trace.read_text().splitlines()
+                         if json.loads(line)["event"] == "turn-start"]
+                self.assertEqual(len(turns), 2, turns)
+                self.assertIn("\topen\t", self.jobs.read_text())
+                # The fixture now supplies terminal/quiescence evidence. The
+                # controller, not another model bookkeeping turn, observes it.
+                settled = child_row(status="done").rstrip("\n") + ",launch_outcome=never-launched,note=dead-launch-error,failure_class=runtime\n"
+                self.jobs.write_text(parent + settled)
+                self.assertEqual(process.wait(timeout=10), 0, output.read_text())
+                turns = [json.loads(line) for line in self.trace.read_text().splitlines()
+                         if json.loads(line)["event"] == "turn-start"]
+                self.assertEqual(len(turns), 2)
+                self.assertNotIn("owner-redelivery-abandoned", self.jobs.read_text())
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    process.wait(timeout=5)
+
+
 
 
 class TypedReceiptStageAdvanceNegotiationTest(unittest.TestCase):
@@ -1853,11 +1757,11 @@ class ContinuationTripartiteBudgetTest(unittest.TestCase):
     def _delegate(self):
         return ClaudeSessionSupervisorTest
 
-    def test_identical_redelivery_spends_stall_only_and_existing_seal_is_unchanged(self):
+    def test_delivery_consumes_one_continuation_and_no_model_bookkeeping_stall(self):
         case = ClaudeSessionSupervisorTest()
         case.setUp()
         try:
-            case.jobs.write_text(owner_row(case.lease) + child_row(), encoding="utf-8")
+            case.jobs.write_text(owner_row(case.lease) + case._blocked_child_row(), encoding="utf-8")
             result = subprocess.run(
                 case.command_with_join(case._non_closing_join()),
                 input="initial assignment",
@@ -1866,16 +1770,17 @@ class ContinuationTripartiteBudgetTest(unittest.TestCase):
                 env=case.child_env(FAKE_TRACE=str(case.trace)),
                 timeout=30,
             )
-            self.assertEqual(result.returncode, 70, result.stderr + result.stdout)
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
             registry = case.jobs.read_text(encoding="utf-8")
-            self.assertIn("note=owner-redelivery-abandoned", registry)
+            self.assertNotIn("note=owner-redelivery-abandoned", registry)
             sys.path.insert(0, str(ROOT / "utilities"))
             import dispatch_budget_record as BR
             rows = BR.read_rows(case.jobs.parent, PARENT)
             reservations = [row for row in rows if row.get("record_kind") == "reservation"]
             self.assertTrue(reservations)
             stall_charged = [row for row in reservations if row["class"] == "stall"]
-            self.assertTrue(stall_charged, rows)
+            self.assertEqual(stall_charged, [], rows)
+            self.assertEqual(len(reservations), 1, rows)
         finally:
             case.tearDown() if hasattr(case, "tearDown") else None
 
@@ -1895,38 +1800,21 @@ class ContinuationTripartiteBudgetTest(unittest.TestCase):
         finally:
             case.tearDown() if hasattr(case, "tearDown") else None
 
-    def test_every_continuation_limit_exceeded_is_preceded_by_a_budget_warning_record(self):
-        case = ClaudeSessionSupervisorTest()
-        case.setUp()
-        try:
-            case.jobs.write_text(owner_row(case.lease) + child_row(), encoding="utf-8")
-            result = subprocess.run(
-                case.command_with_join(case._non_closing_join())
-                # SD-116 (c): exhaustion now buys one extra terminal-handoff
-                # cleanup turn before dying (`_seal_terminal_handoff_or_raise`),
-                # which costs one extra identical redelivery of the same
-                # receipt -- raise the redelivery bound so this fixture still
-                # exercises the genuine continuation-limit-exceeded path this
-                # test is about, instead of tripping the unrelated
-                # identical-redelivery guard first.
-                + ["--max-continuations", "1", "--max-identical-redeliveries", "50"],
-                input="initial assignment",
-                text=True,
-                capture_output=True,
-                env=case.child_env(FAKE_TRACE=str(case.trace)),
-                timeout=30,
-            )
-            self.assertEqual(result.returncode, 70, result.stderr + result.stdout)
-            registry = case.jobs.read_text(encoding="utf-8")
-            self.assertIn("reconcile_reason=continuation-limit-exceeded", registry)
-            sys.path.insert(0, str(ROOT / "utilities"))
-            import dispatch_budget_record as BR
-            rows = BR.read_rows(case.jobs.parent, PARENT)
-            warnings = [row for row in rows if row.get("record_kind") == "warning"]
-            self.assertTrue(warnings, rows)
+    def test_budget_denial_records_warning_at_the_admission_boundary(self):
+        module = supervisor
+        import dispatch_continuation_budget as B
+        import dispatch_budget_record as BR
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger = B.ContinuationLedger(B.ContinuationBudget(1, "test", reserved=0))
+            kwargs = dict(parent_attempt_id=PARENT, route_id="rt-budget", route_hash="hash",
+                          purpose="ordinary", stalled=False)
+            first, _ = module._admit_continuation(ledger, root, ordinal=0, **kwargs)
+            second, _ = module._admit_continuation(ledger, root, ordinal=1, **kwargs)
+            self.assertTrue(first.admitted)
+            self.assertFalse(second.admitted)
+            warnings = [row for row in BR.read_rows(root, PARENT) if row.get("record_kind") == "warning"]
             self.assertEqual(warnings[-1]["reason"], "continuation-budget-exhausted")
-        finally:
-            case.tearDown() if hasattr(case, "tearDown") else None
 
     def test_terminal_handoff_purpose_is_sealed_at_the_single_completion_receipt_site(self):
         source = SUPERVISOR.read_text(encoding="utf-8")

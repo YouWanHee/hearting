@@ -47,8 +47,11 @@ from dispatch_contract import (ARTIFACT_PROOF_RECEIPT,
                                reconcile_local_registry, resolve_agent_home,
                                resolve_dispatch_state_root,
                                resolve_parent_extinction,
+                               resolve_terminal_conflict,
+                               resolve_attempt_cleanup,
                                seal_cancellation_quiescence_receipt,
                                signal_exact_process_group,
+                               ROUTE_IDENTITY_METADATA_KEYS,
                                validate_attempt_metadata)  # noqa: E402
 from dispatch_continuation_budget import resolve_continuation_budget  # noqa: E402
 from owner_route_binding import (  # noqa: E402
@@ -66,8 +69,12 @@ from codex_dispatch_terminal import (  # noqa: E402
     inspect_terminal_attempt,
 )
 from dispatch_completion_join import (  # noqa: E402
+    ChildRow,
+    classify_exact_route_free_review_outcome,
+    current_attempt_row,
     materialize_after_terminal_close,
     reconcile_pending_delivery,
+    review_terminal_evidence,
 )
 from dispatch_summary import ensure_attempt_owner  # noqa: E402
 import dispatch_pending_delivery as pending_delivery  # noqa: E402
@@ -579,13 +586,55 @@ def carrier_terminal(row):
     )
 
 
-def classify(row, args, newest_orders, rows=None):
-    if row["status"] not in OPEN: return "terminal", "already-terminal", None
+def _foreground_review_candidate(meta):
+    return (
+        meta.get("transport") == "headless"
+        and meta.get("execution_surface") == "registered-headless"
+        and meta.get("registered_worker") == "1"
+        and meta.get("dispatch_depth") == "1"
+        and meta.get("worker_type") == "review"
+        and meta.get("launch_lifecycle") in {"foreground-scoped", "detached"}
+        and not any(meta.get(key) for key in ROUTE_IDENTITY_METADATA_KEYS)
+    )
+
+
+def _foreground_binding(meta):
+    try:
+        return (
+            str(meta["attempt_id"]), int(meta["pid"]),
+            str(meta["pid_start"]), int(meta["pgid"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def classify(row, args, newest_orders, rows=None, *, expected_binding=None):
+    if row["status"] not in OPEN:
+        return "terminal", "cleanup-check-required", None
     meta = row["meta"]
     if row.get("legacy_read_only"):
         return "legacy-read-only", "legacy-attempt-row", None
     if row.get("attempt_contract_status") != "current":
         return "contract-invalid", row.get("attempt_contract_status", "invalid"), None
+    if _foreground_review_candidate(row["meta"]):
+        # The selected row is the admission boundary.  Its binding is never
+        # reconstructed from the row being classified: refresh first, then
+        # observe quiescence on that exact fresh snapshot.
+        if expected_binding is None:
+            return "active", "foreground-outcome-binding-required", None
+        fresh = current_attempt_row(args.jobs, row["meta"].get("attempt_id", ""))
+        if fresh is not None:
+            process = attempt_process_quiescence(fresh.metadata)
+            classification = classify_exact_route_free_review_outcome(
+                fresh,
+                jobs=args.jobs,
+                expected_attempt_id=expected_binding[0],
+                expected_pid=expected_binding[1],
+                expected_pid_start=expected_binding[2],
+                expected_pgid=expected_binding[3],
+                quiescence=process,
+            )
+            return classification.as_registry_tuple()
     # OPERATIONS §5.10: every post-hoc carrier classifies the exact log through
     # the shared helper, so a reviewer whose FAIL names a readable in-root
     # artifact is booked `completed-review-blocking` here exactly as the
@@ -629,7 +678,10 @@ def classify(row, args, newest_orders, rows=None):
         getattr(args, "now", time.time()),
     )
     if exact and exact["state"] == "working": return "active", exact["rule"], None
-    if exact and exact["state"] == "done": return "terminal-heartbeat", exact["rule"], "completed-terminal-heartbeat"
+    if exact and exact["state"] == "done":
+        if _marker_backed_repair(row, args.agent_home, args.jobs):
+            return "marker-backed-stale", "completed-marker-linkage", "completed-marker"
+        return "terminal-pending", "terminal-commit-required", None
     if exact and exact["state"] == "dead":
         if _marker_backed_repair(row, args.agent_home, args.jobs):
             return "marker-backed-stale", "completed-marker-linkage", "completed-marker"
@@ -842,7 +894,20 @@ def reconcile(rows, args):
         if all(key[:2]): newest[key] = row["order"]
     decisions = []
     for row in selected:
-        category, reason, note = classify(row, args, newest, rows)
+        selected_binding = (
+            _foreground_binding(row["meta"])
+            if _foreground_review_candidate(row["meta"])
+            else None
+        )
+        category, reason, note = classify(
+            row, args, newest, rows, expected_binding=selected_binding
+        )
+        terminal_cleanup = None
+        if row["status"] not in OPEN and row.get("attempt_contract_status") == "current":
+            terminal_cleanup = resolve_attempt_cleanup(
+                args.jobs, row["meta"]["attempt_id"], apply=args.apply)
+            category = "terminal-settled" if terminal_cleanup["settled"] else "terminal-cleanup-pending"
+            reason = terminal_cleanup["reason"]
         closed = False
         cascade = []
         summary_owner = {"state": "not-applied", "reason": "dry-run"}
@@ -861,12 +926,17 @@ def reconcile(rows, args):
                 for item in fresh_rows:
                     key = fold_key(item["meta"])
                     if all(key[:2]): latest[key] = item["order"]
-                fresh_category, fresh_reason, fresh_note = classify(fresh, args, latest, fresh_rows)
+                fresh_category, fresh_reason, fresh_note = classify(
+                    fresh, args, latest, fresh_rows,
+                    expected_binding=selected_binding,
+                )
                 fresh_decision.update(category=fresh_category, reason=fresh_reason, note=fresh_note)
                 return fresh_note == note and fresh_category == category
 
             reconcile_evidence = {"classifier_source": ATTEMPT_CLASSIFIER_SOURCE,
                                   "reconcile_reason": reason}
+            if selected_binding is not None:
+                reconcile_evidence.update(review_terminal_evidence(note, reason))
             if note == REVIEW_BLOCKING_NOTE:
                 # Seal the artifact the reviewer named, as the join does, so the
                 # owner-closure gate can re-verify it from the row.
@@ -895,7 +965,8 @@ def reconcile(rows, args):
         decisions.append({"attempt_id": row["meta"].get("attempt_id"), "slug": row["slug"],
                           "category": category, "reason": reason, "proposed_note": note,
                           "revalidated": revalidated, "closed": closed,
-                          "cascade": cascade, "summary_owner": summary_owner})
+                          "cascade": cascade, "summary_owner": summary_owner,
+                          "cleanup": terminal_cleanup})
     record = {"at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
               "apply": args.apply, "classifier_source": ATTEMPT_CLASSIFIER_SOURCE,
               "attempted": len(selected), "closed": sum(item["closed"] for item in decisions),
@@ -943,8 +1014,11 @@ def _receiptless_namespace_cancel_reason(row, args):
         return "observer-namespace-unavailable"
     if meta.get("pid_observer_ns") in {None, "", observer_namespace}:
         return "namespace-not-foreign"
-    if observer_namespace_extinct(meta) != "extinct":
+    namespace_state = observer_namespace_extinct(meta)
+    if namespace_state == "present":
         return "namespace-not-extinct"
+    if namespace_state != "extinct":
+        return "namespace-observation-unavailable"
     if _marker_backed_repair(row, args.agent_home, args.jobs):
         return "completion-marker-present"
     terminal = inspect_terminal_attempt(
@@ -2138,11 +2212,13 @@ def emit_inventory(state_root, args):
 
 
 def main(argv):
-    p = argparse.ArgumentParser(description=__doc__); p.add_argument("operation", choices=("current", "liveness", "reconcile", "attempt-state", "orphan-status", "orphan-scan", "repair-stale-row", "archive-import", "inventory"))
+    p = argparse.ArgumentParser(description=__doc__); p.add_argument("operation", choices=("current", "liveness", "reconcile", "attempt-state", "orphan-status", "orphan-scan", "repair-stale-row", "resolve-terminal-conflict", "archive-import", "inventory"))
     p.add_argument("--jobs", type=Path); p.add_argument("--global-jobs", type=Path); p.add_argument("--local-jobs", type=Path)
     p.add_argument("--session"); p.add_argument("--route")
     p.add_argument("--node"); p.add_argument("--attempt"); p.add_argument("--job"); p.add_argument("--all", action="store_true")
     p.add_argument("--apply", action="store_true"); p.add_argument("--audit", type=Path); p.add_argument("--integration-ref")
+    p.add_argument("--review-evidence", type=Path)
+    p.add_argument("--expected-row-sha256")
     p.add_argument("--cancel-receiptless-namespace", action="store_true")
     p.add_argument("--automatic-cancel-receiptless", action="store_true")
     p.add_argument("--recover-receiptless", action="store_true")
@@ -2194,6 +2270,35 @@ def main(argv):
     if not args.jobs:
         print("check=failed\nreason=jobs-required"); return 64
     args.jobs = args.jobs.resolve()
+    if args.operation == "resolve-terminal-conflict":
+        if not args.attempt or any((args.session, args.route, args.node, args.job, args.all)):
+            print("check=failed\nreason=exact-attempt-required"); return 64
+        matches = [r for r in read_rows(args.jobs) if r["meta"].get("attempt_id") == args.attempt]
+        if len(matches) != 1:
+            print("check=failed\nreason=attempt-terminal-row-not-unique"); return 65
+        from dispatch_attempt_policy import terminal_conflict_pending, terminal_conflicts, committed_outcome
+        row = matches[0]
+        raw = next(line for line in args.jobs.read_text().splitlines()
+                   if len(line.split("\t")) == 6
+                   and parse_registry_metadata(line.split("\t")[5]).get("attempt_id") == args.attempt)
+        result = {"attempt_id": args.attempt, "outcome": committed_outcome(row["status"], row["meta"]),
+                  "pending": terminal_conflict_pending(row["meta"]),
+                  "row_sha256": hashlib.sha256(raw.encode()).hexdigest(),
+                  "committed_note": row["meta"].get("note", ""),
+                  "conflicting_note": row["meta"].get("conflicting_terminal_note", ""),
+                  "conflicts": terminal_conflicts(row["meta"]),
+                  "disposition": "keep-committed-after-review", "applied": False}
+        if args.apply:
+            if not args.review_evidence or not args.expected_row_sha256:
+                print("check=failed\nreason=terminal-conflict-review-and-row-required"); return 64
+            try:
+                resolve_terminal_conflict(args.jobs, args.attempt,
+                    expected_row_sha256=args.expected_row_sha256, review=args.review_evidence.absolute())
+            except (OSError, DispatchContractError) as exc:
+                print(f"check=failed\nreason={exc}"); return 65
+            result.update(pending=False, applied=True)
+        print("check=ok\n" + json.dumps(result, sort_keys=True))
+        return 0
     if args.operation not in ("liveness", "orphan-scan") and not any((args.session, args.route, args.node, args.attempt, args.job)):
         print("check=failed\nreason=current-filter-required"); return 64
     recovery_modes = sum(bool(value) for value in (

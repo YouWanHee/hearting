@@ -31,6 +31,135 @@ def attempt_row(metadata,status="open"):
  pipe=CURRENT+","+",".join(f"{key}={value}" for key,value in metadata.items())
  return f"2026-08-25T00:00:00Z\t{status}\t/r\t/w\texecute\t{pipe}"
 
+class FrameLaunchGateTest(unittest.TestCase):
+ def fixture(self, base, harnesses=("codex", "claude"), candidates=("codex", "claude")):
+  route={"dispatch_contract_version":3,"route_id":"rt-frame-gate",
+         "route_hash":"sha256:frame-gate","effective_intensity":"standard",
+         "dispatch_evidence":{"tuples":[{"status":"supported","child_harness":h}
+                                         for h in candidates]},
+         "human_gate_bindings":[{"gate":"frame-review","node":"plan","position":"entry"}],
+         "nodes":[{"id":n,"dispatch_depth":1,"worker_type":"frame","unit":"plan/frame",
+                   "depends_on":[],"continuation":{"kind":"human-gate","gate":"frame-review"}}
+                  for n in ("frame","frame-alternative")]+
+                 [{"id":"plan","depends_on":["frame","frame-alternative"]}]}
+  rows=[]; markers={}
+  for node,harness in zip(route["nodes"],harnesses):
+   attempt="att-"+node["id"]
+   marker={"attempt_id":attempt,"registered_worker":True}
+   markers[node["id"]]=marker
+   metadata={"attempt_id":attempt,"route_id":route["route_id"],"route_hash":route["route_hash"],
+             "route_node":node["id"],"harness":harness,"worker_type":"frame",
+             "note":"completed-marker"}
+   rows.append(attempt_row(metadata,"done"))
+   directory=base/".dispatch"/"completion"/route["route_id"]
+   directory.mkdir(parents=True,exist_ok=True)
+   (directory/(node["id"]+".json")).write_text(json.dumps(marker))
+  path=base/"route.json";path.write_text(json.dumps(route))
+  jobs=base/"jobs.log";jobs.write_text("\n".join(rows))
+  return route,path,jobs,markers,rows
+
+ def test_actual_pair_rejects_same_harness_and_allows_recorded_single_harness(self):
+  with tempfile.TemporaryDirectory() as td:
+   base=Path(td)
+   for harnesses,candidates,reason in (
+       (("codex","claude"),("codex","claude"),None),
+       (("codex","codex"),("codex","claude"),"frame-cross-harness-required"),
+       (("codex","codex"),("codex",),None),
+       (("codex","opencode"),("codex","claude"),"frame-harness-unsupported")):
+    with self.subTest(harnesses=harnesses,candidates=candidates):
+     route,path,jobs,markers,rows=self.fixture(base,harnesses,candidates)
+     if reason:
+      with self.assertRaises(D.DispatchContractError) as caught:
+       D._frame_pair_attempt_gate(route,route["nodes"][-1],markers,jobs,rows)
+      self.assertEqual(caught.exception.reason,reason)
+     else:
+      D._frame_pair_attempt_gate(route,route["nodes"][-1],markers,jobs,rows)
+
+ def test_standard_owner_is_fenced_by_real_gate_journal(self):
+  import workflow_state as WS
+  from types import SimpleNamespace
+  with tempfile.TemporaryDirectory() as td:
+   base=Path(td);route,path,jobs,markers,rows=self.fixture(base)
+   binding=SimpleNamespace(route_file=str(path))
+   with mock.patch.object(D,"completion_marker_is_current",return_value=True), \
+        mock.patch.object(D,"completion_attempt_readiness",return_value=D.AttemptReadiness("ready","test")):
+    with self.assertRaises(D.DispatchContractError) as caught:
+     D.owner_frame_launch_gate(binding,"start",base,jobs)
+    self.assertEqual(caught.exception.reason,"human-gate-not-raised")
+    ledger=WS.WorkflowLedger(route["route_id"],route["route_hash"],jobs=jobs)
+    ledger.set_workflow_state("BLOCKED_HUMAN_GATE",evidence={"gate":"frame-review"},actor="gate")
+    with self.assertRaises(D.DispatchContractError) as caught:
+     D.owner_frame_launch_gate(binding,"start",base,jobs)
+    self.assertEqual(caught.exception.reason,"human-gate-unreleased")
+    ledger.set_workflow_state("RUNNING",evidence={"released_gate":"frame-review",
+      "decision":"proceed","actor_kind":"human","released_by":"test-person"},actor="gate")
+    D.owner_frame_launch_gate(binding,"start",base,jobs)
+    # A substituted pair cannot use an earlier approval to bypass diversity.
+    self.fixture(base,("codex","codex"))
+    with self.assertRaises(D.DispatchContractError) as caught:
+     D.owner_frame_launch_gate(binding,"start",base,jobs)
+    self.assertEqual(caught.exception.reason,"frame-cross-harness-required")
+
+ def test_frame_quota_failure_allows_recorded_same_harness_pair_but_not_unknown_or_live_failure(self):
+  with tempfile.TemporaryDirectory() as td:
+   base=Path(td);route,path,jobs,markers,rows=self.fixture(base,("codex","codex"))
+   root=base/".agent_reports";root.mkdir()
+   log=base/"quota.jsonl"
+   log.write_text(json.dumps({"type":"result","subtype":"error_during_execution","is_error":True,
+                             "errors":["429 usage limit reached"],"result":"weekly rate limit exceeded"})+"\n")
+   failed=(f"2026-09-12\tdone\t{base}\t{base}\tfailed-frame\tattempt_id=att-capacity,worker_type=frame,"
+      f"dispatch_depth=1,harness=claude,route_id={route['route_id']},route_hash={route['route_hash']},"
+      f"log_file={log},artifact_root={root},launch_outcome=reaped-before-publish")
+   lines=[failed,*rows]
+   D._frame_pair_attempt_gate(route,route["nodes"][-1],markers,jobs,lines)
+   records=[json.loads(line) for p in (base/"degradations").glob("*.jsonl") for line in p.read_text().splitlines()]
+   self.assertTrue(any(r.get("reason")=="frame-single-available-harness" and r.get("prior_attempt_ids")==["att-capacity"] for r in records),records)
+   for replacement in (failed.replace("\tdone\t","\topen\t"),failed.replace("reaped-before-publish","unknown"),
+                       failed.replace("route_id=rt-frame-gate","route_id=rt-other"),
+                       failed+",failure_class=pass"):
+    with self.assertRaises(D.DispatchContractError):
+     D._frame_pair_attempt_gate(route,route["nodes"][-1],markers,jobs,[replacement,*rows])
+   log.write_text(json.dumps({"type":"result","is_error":True,"subtype":"error","result":"generic runtime failure"})+"\n")
+   with self.assertRaises(D.DispatchContractError):
+    D._frame_pair_attempt_gate(route,route["nodes"][-1],markers,jobs,lines)
+
+ def test_frame_global_quota_requires_current_account_all_profiles_and_cleanup(self):
+  import time
+  from datetime import datetime, timezone
+  import dispatch_capacity_evidence as Q
+  with tempfile.TemporaryDirectory() as td:
+   base=Path(td); route,path,jobs,markers,rows=self.fixture(base,("codex","codex"))
+   env={"HOME":str(base),"PATH":os.environ["PATH"]}
+   account=base/".claude.json"
+   account.write_text(json.dumps({"oauthAccount":{"accountUuid":"a","organizationUuid":"org"}}))
+   now=int(time.time()); stamp=datetime.fromtimestamp(now,timezone.utc).isoformat()
+   log=base/"att-prior-quota.claude.jsonl"
+   events=[{"type":"rate_limit_event","session_id":"quota-session","rate_limit_info":{
+    "status":"rejected","rateLimitType":"seven_day","resetsAt":now+3600}},
+    {"type":"result","session_id":"quota-session","is_error":True,"api_error_status":429}]
+   log.write_text("".join(json.dumps(r)+"\n" for r in events))
+   scope=Q.launch_scope("claude",env)
+   failed=(f"{stamp}\tdone\t{base}\t{base}\tprior\tattempt_id=att-prior-quota,harness=claude,"
+           f"route_id=other-route,note=dead-launch-exit-1,log_file={log},launch_outcome=reaped-before-publish,"
+           +",".join(f"{k}={v}" for k,v in scope.items()))
+   with mock.patch.dict(os.environ,env,clear=True):
+    # Snapshot has the failure; jobs itself deliberately doesn't. The gate
+    # consumes its locked snapshot, not a second read behind the caller.
+    D._frame_pair_attempt_gate(route,route["nodes"][-1],markers,jobs,[failed,*rows])
+    for replacement in (failed.replace("reaped-before-publish","unknown"),
+                        failed.replace("\tdone\t","\topen\t"),failed.replace(scope["quota_scope"],"other-scope")):
+     with self.assertRaises(D.DispatchContractError):
+      D._frame_pair_attempt_gate(route,route["nodes"][-1],markers,jobs,[replacement,*rows])
+    active=failed.replace("\tdone\t","\topen\t").replace("att-prior-quota","att-active").replace("other-route",route["route_id"])
+    with self.assertRaises(D.DispatchContractError):
+     D._frame_pair_attempt_gate(route,route["nodes"][-1],markers,jobs,[failed,*rows,active])
+    events[0]["rate_limit_info"]["rateLimitType"]="seven_day_opus"
+    log.write_text("".join(json.dumps(r)+"\n" for r in events))
+    with self.assertRaises(D.DispatchContractError):
+     D._frame_pair_attempt_gate(route,route["nodes"][-1],markers,jobs,[failed,*rows])
+
+
+
 class DispatchContractTest(unittest.TestCase):
  def test_cancel_closes_witness_only_on_cancelled_receipt(self):
   with tempfile.TemporaryDirectory() as td:
@@ -1334,7 +1463,7 @@ class DispatchContractTest(unittest.TestCase):
   finally:
    proc.kill();proc.wait()
 
- def test_supervisor_handoff_repairs_lower_authority_foreground_verdict(self):
+ def test_conflicting_supervisor_cannot_rewrite_the_committed_foreground_verdict(self):
   with tempfile.TemporaryDirectory() as td:
    jobs=Path(td)/"jobs.log"
    meta=("attempt_schema_version=2,dispatch_depth=2,transport=headless,"
@@ -1353,13 +1482,13 @@ class DispatchContractTest(unittest.TestCase):
      "terminal_event":"turn.completed",
      "reconcile_reason":"exact-final-handoff",
     })
-   self.assertEqual(result,"repaired-terminal")
+   self.assertEqual(result,"terminal-conflict")
    text=jobs.read_text()
-   self.assertIn("note=completed-supervisor",text)
+   self.assertEqual(D.parse_registry_metadata(text.split("\t")[5])["note"], "dead-worker-fail")
    self.assertIn("prior_failure_class=fail",text)
    self.assertIn("terminal_conflict=1",text)
 
- def test_equal_authority_verdict_conflict_fails_closed(self):
+ def test_conflict_preserves_pass_and_requests_inspection(self):
   with tempfile.TemporaryDirectory() as td:
    jobs=Path(td)/"jobs.log"
    meta=("attempt_schema_version=2,dispatch_depth=1,transport=headless,"
@@ -1372,7 +1501,9 @@ class DispatchContractTest(unittest.TestCase):
     jobs,"att-conflict","dead-worker-fail",
     evidence={"failure_class":"fail","classifier_source":"supervisor-terminal-v1"})
    self.assertEqual(result,"terminal-conflict")
-   self.assertIn("note=dead-terminal-conflict",jobs.read_text())
+   meta=D.parse_registry_metadata(jobs.read_text().strip().split("\t")[5])
+   self.assertEqual((meta["note"],meta["failure_class"]),("completed-supervisor","pass"))
+   self.assertEqual(D.decide_attempt("done",meta,process_state="quiescent").action,"inspect-conflict")
 
  def test_remounted_proc_nspid_is_bound_to_inner_namespace(self):
   inner_namespace="pid:[inner-remounted]"
@@ -2793,7 +2924,7 @@ class DispatchContractTest(unittest.TestCase):
 
  # SD-OPEN-47 (H7): a sidecar-sealed residue receipt names the survivors as
  # leftovers of a finished worker; they never veto quiescence again.
- def test_sd_open_47_tagged_residue_receipt_lifts_the_descendant_veto(self):
+ def test_historical_residue_receipt_does_not_lift_live_descendant_veto(self):
   attempt="att-residue-receipt-fixture"
   residue=subprocess.Popen([sys.executable,"-c","import time; time.sleep(30)"],
                            env=dict(os.environ,AGENT_DISPATCH_ATTEMPT_ID=attempt),
@@ -2816,16 +2947,22 @@ class DispatchContractTest(unittest.TestCase):
               attempt_descendant_residue=f"{residue.pid}:1",
               attempt_descendant_residue_basis="terminal-envelope")
   self.assertTrue(D.tagged_residue_receipt(sealed))
-  self.assertEqual(D.post_exit_receipt_reason(sealed),"governed-process-group-drained")
-  self.assertEqual(D.attempt_process_quiescence(sealed).state,"quiescent")
-  self.assertEqual(D.attempt_process_quiescence(sealed,terminal_receipt=True).state,
-                   "quiescent")
+  self.assertEqual(D.post_exit_receipt_reason(sealed),"")
+  self.assertEqual(D.attempt_process_quiescence(sealed).state,"live")
+  self.assertEqual(D.attempt_process_quiescence(sealed,terminal_receipt=True).state,"live")
+  artifact=dict(sealed,post_exit_receipt_substitute=D.ARTIFACT_PROOF_RECEIPT,
+                artifact_proof_sha256="a"*64,artifact_proof_verdict="PASS",
+                artifact_proof_observer_ns=ns)
+  self.assertTrue(D._artifact_proof_receipt(artifact))
+  self.assertEqual(D.attempt_process_quiescence(artifact,terminal_receipt=True).state,"live")
   # The empty proof is still the only other accepted descendant proof.
   bogus=dict(sealed,attempt_descendant_proof="attempt-tagged-anything-v1")
   self.assertFalse(D.tagged_residue_receipt(bogus))
   self.assertEqual(D.attempt_process_quiescence(bogus).reason,"attempt-descendant-live")
   unbased=dict(sealed,attempt_descendant_residue_basis="")
   self.assertFalse(D.tagged_residue_receipt(unbased))
+  residue.terminate();residue.wait(timeout=5)
+  self.assertEqual(D.attempt_process_quiescence(artifact,terminal_receipt=True).state,"quiescent")
 
  # A-N1. A confirmed death still advances, with its original reason intact.
  def test_confirmed_death_without_tagged_processes_stays_quiescent(self):
@@ -3195,7 +3332,7 @@ class DispatchContractTest(unittest.TestCase):
   bound node of every other recipe starts, whether or not the topology declares
   a raising continuation for its gate."""
   registry=json.loads((Path(__file__).resolve().parents[1]/"capabilities"/"topologies.json").read_text(encoding="utf-8"))
-  self.assertEqual(D.FENCED_HUMAN_GATES,frozenset({"frame-review"}))
+  self.assertEqual(D.FENCED_HUMAN_GATES,frozenset({"frame-review","preview-disposition"}))
   seen=[]
   for recipe in registry["recipes"]:
    bindings=recipe.get("human_gate_bindings") or []
@@ -3219,6 +3356,7 @@ class DispatchContractTest(unittest.TestCase):
           mock.patch.object(D,"completion_marker_is_current",return_value=True), \
           mock.patch.object(D,"completion_attempt_readiness",return_value=ready), \
           mock.patch.object(D,"_sibling_attempt_gate"), \
+          mock.patch.object(D,"_frame_pair_attempt_gate"), \
           mock.patch.object(D,"_auxiliary_arbitration_gate"):
       try:
        D.completion_marker_gate(str(path),binding["node"],"start",base,base/"jobs.log",
@@ -3228,8 +3366,133 @@ class DispatchContractTest(unittest.TestCase):
        verdict=exc.reason
      seen.append((recipe["capability"],binding["gate"],binding["node"],verdict))
   fenced=[row for row in seen if row[3]!="started"]
-  self.assertEqual(fenced,[("autopilot-code","frame-review","plan","human-gate-not-raised")],seen)
+  # `frame-review` is a universal gate now: every autopilot recipe that has a
+  # frame pair binds it to the entry of its first work node, and each of those
+  # bound nodes must be fenced. The rule is unchanged -- exactly the gates in
+  # FENCED_HUMAN_GATES fence, and nothing else does.
+  self.assertEqual(fenced,[
+   ("autopilot-code","frame-review","plan","human-gate-not-raised"),
+   ("autopilot-design","frame-review","refs","human-gate-not-raised"),
+   ("autopilot-draft","frame-review","material-strategy","human-gate-not-raised"),
+   ("autopilot-refine","frame-review","review","human-gate-not-raised"),
+   # refine's preview approval before the transaction applies an edit
+   # (user decision 2026-09-10: an approval, not a direction, so not absorbed)
+   ("autopilot-refine","preview-disposition","transaction","human-gate-not-raised"),
+   ("autopilot-spec","frame-review","research","human-gate-not-raised"),
+  ],seen)
+  self.assertEqual({row[1] for row in fenced},set(D.FENCED_HUMAN_GATES))
   self.assertGreaterEqual(len(seen),5)
+
+ def test_an_old_generation_route_keeps_its_own_gate_and_is_never_retro_fitted(self):
+  """W5 gate absorption: `autopilot-{design,draft,refine,spec}` retired their own
+  direction gates (`direction-confirmation`, `user-refine-disposition`,
+  `preview-disposition`, `intent-confirmation`) in favour of the one universal
+  `frame-review` raised by the frame legs. Routes compiled BEFORE that change
+  are never retro-fitted -- the same rule `core/WORKFLOW.md` already states for
+  the SD-123 gate ("a route sealed before this cycle keeps `inline-next` and is
+  never retro-fitted"). The fence reads only the route object it is handed, so
+  no version branch and no migration code exist: an old-generation route is
+  judged by its own nodes, gate names and bindings."""
+  registry=json.loads((Path(__file__).resolve().parents[1]/"capabilities"/"topologies.json").read_text(encoding="utf-8"))
+  today={r["capability"]:r for r in registry["recipes"]}
+
+  # (a) old-generation `autopilot-code`: one depth-2 `frame` node, no
+  # `frame-alternative` leg -- today's topology seals two depth-1 legs.
+  with tempfile.TemporaryDirectory() as td:
+   base=Path(td); route,path=self._gated_route(base,route_id="rt-oldgen-code0001")
+   self.assertEqual([n["id"] for n in route["nodes"]],["frame","plan"])
+   self.assertEqual(route["nodes"][0]["dispatch_depth"],2)
+   new_frame=[n for n in today["autopilot-code"]["standard_plus"]["nodes"] if n["id"].startswith("frame")]
+   self.assertEqual([n["id"] for n in new_frame],["frame","frame-alternative"])
+   self.assertEqual({n["dispatch_depth"] for n in new_frame},{1})
+   with mock.patch.dict(os.environ,{"AGENT_WORKFLOW_ROOT":str(base/"workflow")}):
+    with self.assertRaises(D.DispatchContractError) as caught:
+     self._fence_start(base,path)
+    self.assertEqual(caught.exception.reason,"human-gate-not-raised")
+    ledger=self._gate_ledger(base,route)
+    with ledger.lock():
+     ledger.set_workflow_state("READY",evidence={},actor="fixture")
+     ledger.set_workflow_state("BLOCKED_HUMAN_GATE",
+      evidence={"gate":"frame-review","artifact":"interview.json"},actor="gate")
+     ledger.set_workflow_state("RUNNING",evidence={"released_gate":"frame-review",
+      "released_by":"user","actor_kind":"user","decision":"proceed"},actor="release")
+    self._fence_start(base,path)   # the old generation's own gate still opens it
+
+  # (b) old-generation `autopilot-{design,refine}`: no frame legs at all, the
+  # first work node raises the retired direction gate, and the binding sits on
+  # that gate's successor. Today's topology fences those recipes at `refs` /
+  # `review` on `frame-review`; the old route is untouched by that and starts,
+  # exactly as it did before this cycle.
+  for capability,gate,raiser,gated_node in (
+    ("autopilot-design","direction-confirmation","refs","build"),):
+   with self.subTest(capability=capability), tempfile.TemporaryDirectory() as td:
+    base=Path(td)
+    route={"dispatch_contract_version":3,"route_id":"rt-oldgen-"+capability[-6:],
+           "route_hash":"sha256:"+"7"*64,"registry_digest":"sha256:"+"8"*64,
+           "human_gates":[gate],
+           "human_gate_bindings":[{"gate":gate,"node":gated_node,"position":"entry"}],
+           "nodes":[{"id":raiser,"depends_on":[],"kind":"pipeline-stage",
+                     "completion_gate":capability+"-"+raiser,"dispatch_depth":2,
+                     "continuation":{"kind":"human-gate","gate":gate}},
+                    {"id":gated_node,"depends_on":[raiser],"kind":"pipeline-stage",
+                     "completion_gate":capability+"-"+gated_node,"dispatch_depth":2}]}
+    path=base/"route.json"; path.write_text(json.dumps(route),encoding="utf-8")
+    marker_dir=base/".dispatch"/"completion"/route["route_id"]
+    marker_dir.mkdir(parents=True)
+    (marker_dir/f"{raiser}.json").write_text(json.dumps({"attempt_id":"att-frame",
+     "registered_worker":True}),encoding="utf-8")
+    # today: one gate, `frame-review`, bound at the frame legs' shared successor
+    self.assertEqual(today[capability]["human_gates"],["frame-review"])
+    self.assertEqual(today[capability]["human_gate_bindings"],
+                     [{"gate":"frame-review","node":raiser,"position":"entry"}])
+    self.assertNotIn(gate,{(n.get("continuation") or {}).get("gate")
+                           for n in today[capability]["standard_plus"]["nodes"]})
+    # the old route: its own gate is read, found unfenced, and nothing is
+    # rewritten to `frame-review` -- the node starts with no ledger at all.
+    with mock.patch.dict(os.environ,{"AGENT_WORKFLOW_ROOT":str(base/"workflow")}):
+     self._fence_start(base,path,node=gated_node)
+    self.assertEqual(json.loads(path.read_text(encoding="utf-8")),route)
+
+  # (c) `autopilot-refine` is the exception: `preview-disposition` was NOT
+  # absorbed (user decision 2026-09-10 -- it approves an edit before the
+  # transaction applies it; it is not a direction). Today's recipe keeps it,
+  # bound at `transaction`, and it is fenced. So an old-generation refine route
+  # is judged by its own gate exactly as before -- nothing is rewritten -- but
+  # that gate now actually holds: refused until released, started after.
+  refine=today["autopilot-refine"]
+  self.assertEqual(refine["human_gates"],["frame-review","preview-disposition"])
+  self.assertIn({"gate":"preview-disposition","node":"transaction","position":"entry"},
+                refine["human_gate_bindings"])
+  self.assertEqual({n["id"]:(n.get("continuation") or {}).get("gate")
+                    for n in refine["standard_plus"]["nodes"]}["review"],"preview-disposition")
+  with tempfile.TemporaryDirectory() as td:
+   base=Path(td)
+   route={"dispatch_contract_version":3,"route_id":"rt-oldgen-refine01",
+          "route_hash":"sha256:"+"7"*64,"registry_digest":"sha256:"+"8"*64,
+          "human_gates":["preview-disposition"],
+          "human_gate_bindings":[{"gate":"preview-disposition","node":"transaction","position":"entry"}],
+          "nodes":[{"id":"review","depends_on":[],"kind":"pipeline-stage",
+                    "completion_gate":"autopilot-refine-review","dispatch_depth":2,
+                    "continuation":{"kind":"human-gate","gate":"preview-disposition"}},
+                   {"id":"transaction","depends_on":["review"],"kind":"pipeline-stage",
+                    "completion_gate":"autopilot-refine-transaction","dispatch_depth":2}]}
+   path=base/"route.json"; path.write_text(json.dumps(route),encoding="utf-8")
+   marker_dir=base/".dispatch"/"completion"/route["route_id"]; marker_dir.mkdir(parents=True)
+   (marker_dir/"review.json").write_text(json.dumps({"attempt_id":"att-review",
+    "registered_worker":True}),encoding="utf-8")
+   with mock.patch.dict(os.environ,{"AGENT_WORKFLOW_ROOT":str(base/"workflow")}):
+    with self.assertRaises(D.DispatchContractError) as caught:
+     self._fence_start(base,path,node="transaction")
+    self.assertEqual(caught.exception.reason,"human-gate-not-raised")
+    ledger=self._gate_ledger(base,route)
+    with ledger.lock():
+     ledger.set_workflow_state("READY",evidence={},actor="fixture")
+     ledger.set_workflow_state("BLOCKED_HUMAN_GATE",
+      evidence={"gate":"preview-disposition","artifact":"preview.md"},actor="gate")
+     ledger.set_workflow_state("RUNNING",evidence={"released_gate":"preview-disposition",
+      "released_by":"user","actor_kind":"user","decision":"proceed"},actor="release")
+    self._fence_start(base,path,node="transaction")
+   self.assertEqual(json.loads(path.read_text(encoding="utf-8")),route)
 
  def test_a_route_without_bindings_is_not_fenced(self):
   with tempfile.TemporaryDirectory() as td:
@@ -3407,6 +3670,209 @@ class DispatchContractTest(unittest.TestCase):
   self.assertEqual(D.attempt_process_quiescence(identity),
                    D._attempt_process_quiescence_impl(identity))
 
+ def test_post_claim_admission_is_idempotent_and_rejects_commit_after_abort(self):
+  calls=[]
+  cleanup=D.ReviewAdmissionCleanup(
+   watchdog_group="empty", fenced_child_group="empty", readiness="closed-removed",
+   review_lease="never-acquired", governed_witness="unlocked",
+   payload_marker="absent", status="verified-never-launched")
+  admission=D.PostClaimAdmission(
+   {"review_admission":"prepared"},
+   abort=lambda reason: (calls.append(("abort",reason)) or cleanup),
+   commit=lambda: calls.append(("commit", "ok")),
+  )
+  first=admission.abort("fault")
+  self.assertIs(first, cleanup)
+  self.assertIs(admission.abort("duplicate"), cleanup)
+  with self.assertRaises(D.DispatchContractError) as caught:
+   admission.commit()
+  self.assertEqual(caught.exception.reason,"review-admission-commit-after-abort")
+  self.assertEqual(calls,[("abort","fault")])
+
+ def _cleanup_fault_row(self, base, attempt):
+  jobs=Path(base)/"jobs.log"
+  row=(f"2026-07-23T00:00:01Z\topen\t/repo\t/wt\tchild\t{CURRENT},"
+       f"attempt_id={attempt}")
+  self.assertTrue(D.claim_attempt_row(jobs,attempt,row,launch=False))
+  return jobs
+
+ @staticmethod
+ def _cleanup_fault_spawn(gate_fd):
+  return subprocess.Popen(
+   [sys.executable,str(Path(__file__).with_name("launch-fence.py")),
+    "--parent-pid",str(os.getpid()),"--gate-fd",str(gate_fd),"--",
+    "sleep","60"], pass_fds=(gate_fd,), start_new_session=True)
+
+ @staticmethod
+ def _cleanup_record(status="verified-never-launched", lease="released"):
+  return D.ReviewAdmissionCleanup(
+   watchdog_group="empty", fenced_child_group="empty",
+   readiness="closed-removed", review_lease=lease,
+   governed_witness="unlocked",
+   payload_marker=("may-have-started" if status == "verified-post-release-reaped" else "absent"),
+   status=status)
+
+ def test_post_claim_abort_runs_when_registered_group_proof_fails_and_annotates_unverified(self):
+  with tempfile.TemporaryDirectory() as td:
+   jobs=self._cleanup_fault_row(td,"att-cleanup-group-fault")
+   child=[];abort_calls=[]
+   cleanup=self._cleanup_record()
+   def spawn(gate_fd):
+    proc=self._cleanup_fault_spawn(gate_fd);child.append(proc);return proc
+   admission=D.PostClaimAdmission(
+    {"review_admission":"prepared","invalid":"metadata"},
+    abort=lambda reason: (abort_calls.append(reason) or cleanup),
+    commit=lambda: None)
+   with mock.patch.object(D,"_abort_fenced_launch",return_value=False):
+    with self.assertRaises(D.DispatchContractError) as caught:
+     D.spawn_claimed_attempt(jobs,"att-cleanup-group-fault",parent_binding=None,spawn=spawn,
+                             post_claim=lambda _identity: admission)
+   self.assertEqual(caught.exception.reason,"attempt-launch-cleanup-unverified")
+   self.assertEqual(abort_calls,["post-claim-metadata-invalid"])
+   meta=D.parse_registry_metadata(jobs.read_text().strip().split("\t",5)[5])
+   self.assertEqual(meta["review_admission"],"aborted")
+   self.assertEqual(meta["review_admission_cleanup"],"unverified")
+   self.assertEqual(meta["launch_claimed"],"1")
+   for proc in child:
+    if proc.poll() is None:proc.kill()
+    proc.wait()
+
+ def test_post_claim_abort_merges_returned_cleanup_after_registered_group_proof(self):
+  with tempfile.TemporaryDirectory() as td:
+   jobs=self._cleanup_fault_row(td,"att-cleanup-merge")
+   child=[];abort_calls=[]
+   cleanup=self._cleanup_record()
+   def spawn(gate_fd):
+    proc=self._cleanup_fault_spawn(gate_fd);child.append(proc);return proc
+   def mutate(_identity):
+    fields=jobs.read_text().strip().split("\t")
+    fields[1]="done"
+    jobs.write_text("\t".join(fields)+"\n")
+    return D.PostClaimAdmission(
+     {"review_admission":"prepared"},
+     abort=lambda reason: (abort_calls.append(reason) or cleanup),
+     commit=lambda: None)
+   with mock.patch.object(D,"_abort_fenced_launch",return_value=True):
+    with self.assertRaises(D.DispatchContractError) as caught:
+     D.spawn_claimed_attempt(jobs,"att-cleanup-merge",parent_binding=None,spawn=spawn,
+                             post_claim=mutate)
+   self.assertEqual(caught.exception.reason,"attempt-post-claim-identity-changed")
+   self.assertEqual(abort_calls,["post-claim-record-failed"])
+   meta=D.parse_registry_metadata(jobs.read_text().strip().split("\t",5)[5])
+   self.assertEqual(meta["review_admission"],"aborted")
+   self.assertEqual(meta["review_admission_cleanup"],"verified-lease-released-v1")
+   for proc in child:
+    if proc.poll() is None:proc.kill()
+    proc.wait()
+
+ def test_post_release_commit_failure_merges_cleanup_and_records_terminal_failure(self):
+  with tempfile.TemporaryDirectory() as td:
+   jobs=self._cleanup_fault_row(td,"att-cleanup-commit")
+   child=[];abort_calls=[]
+   cleanup=self._cleanup_record("verified-post-release-reaped")
+   def spawn(gate_fd):
+    proc=self._cleanup_fault_spawn(gate_fd);child.append(proc);return proc
+   admission=D.PostClaimAdmission(
+    {"review_admission":"prepared"},
+    abort=lambda reason: (abort_calls.append(reason) or cleanup),
+    commit=lambda: (_ for _ in ()).throw(RuntimeError("commit-close-fault")))
+   with mock.patch.object(D,"_abort_fenced_launch",return_value=True):
+    with self.assertRaises(D.DispatchContractError) as caught:
+     D.spawn_claimed_attempt(jobs,"att-cleanup-commit",parent_binding=None,spawn=spawn,
+                             post_claim=lambda _identity: admission)
+   self.assertEqual(caught.exception.reason,"attempt-post-claim-commit-failed")
+   self.assertEqual(abort_calls,["post-release-commit-failed"])
+   meta=D.parse_registry_metadata(jobs.read_text().strip().split("\t",5)[5])
+   self.assertEqual(meta["review_admission"],"commit-failed")
+   self.assertEqual(meta["review_admission_cleanup"],"verified-post-release-reaped-v1")
+   self.assertEqual(meta["launch_outcome"],"post-release-failed")
+   for proc in child:
+    if proc.poll() is None:proc.kill()
+    proc.wait()
+
+ def test_real_watchdog_commit_close_fault_drains_before_lease_and_outside_jobs_lock(self):
+  import dispatch_lifecycle as lifecycle
+  import review_watchdog
+  import time
+  import signal
+  with tempfile.TemporaryDirectory() as td:
+   base=Path(td); attempt="att-real-commit-fault"
+   jobs=self._cleanup_fault_row(td,attempt); marker=base/"grandchild"
+   budget=lifecycle.begin_finite_watchdog(30); holder={}; order=[]
+   code=("import pathlib,subprocess,time; p=subprocess.Popen(['sleep','30'],start_new_session=True); "
+         f"pathlib.Path({str(marker)!r}).write_text(str(p.pid)); time.sleep(30)")
+   def spawn(gate_fd):
+    handle=review_watchdog.launch_review_watchdog(
+     [sys.executable,str(Path(__file__).with_name("launch-fence.py")),
+      "--parent-pid",str(os.getpid()),"--gate-fd",str(gate_fd),"--",sys.executable,"-c",code],
+     gate_fd=gate_fd,budget=budget,attempt_id=attempt,nonce="a"*64)
+    holder["handle"]=handle
+    return handle.process
+   def admission(identity):
+    handle=holder["handle"]; receipt=handle.read_ready(2); child=receipt["child"]
+    def release():
+     self.assertIsNotNone(handle.process.poll())
+     self.assertEqual(D.attempt_tagged_descendants(dict(identity,attempt_id=attempt)).state,"empty")
+     # The production watchdog also seals an outcome through this lock.
+     with Path(str(jobs)+".lock").open("a") as probe:
+      D.fcntl.flock(probe.fileno(),D.fcntl.LOCK_EX|D.fcntl.LOCK_NB)
+     order.append("release"); return True
+    def commit():
+     handle.commit()
+     deadline=time.monotonic()+3
+     while not marker.exists() and time.monotonic()<deadline:time.sleep(.02)
+     self.assertTrue(marker.exists())
+     raise OSError("COMMIT delivered but close failed")
+    return D.PostClaimAdmission(
+     {"review_admission":"prepared","review_fence_pid":str(child["pid"])},
+     abort=lambda _reason:lifecycle._review_cleanup(handle,child=child,lease_acquired=True,
+       lease_release=release,witness_probe=lambda:handle.process.poll() is not None),commit=commit)
+   try:
+    with self.assertRaises(D.DispatchContractError) as caught:
+     D.spawn_claimed_attempt(jobs,attempt,parent_binding=None,spawn=spawn,post_claim=admission)
+    self.assertEqual(caught.exception.reason,"attempt-post-claim-commit-failed")
+    self.assertEqual(order,["release"])
+    self.assertEqual(holder["handle"].process.returncode,-signal.SIGTERM)
+    metadata=D.parse_registry_metadata(jobs.read_text().strip().split("\t",5)[5])
+    self.assertEqual(metadata["launch_outcome"],"post-release-failed")
+    self.assertEqual(metadata["review_admission_cleanup"],"verified-post-release-reaped-v1")
+   finally:
+    handle=holder.get("handle")
+    if handle is not None and handle.process.poll() is None:
+     handle.process.terminate();handle.process.wait(timeout=5)
+
+ def test_review_holder_uses_live_process_past_deadline_and_rejects_future_timestamp(self):
+  identity=D.process_launch_identity(os.getpid())
+  nonce="f"*64
+  metadata=dict(identity,attempt_id="att-holder",review_governed_lease=D.REVIEW_GOVERNED_LEASE_KIND,
+               review_governed_lease_nonce=nonce)
+  record={"schema_version":2,"attempt_id":"att-holder","cycle_id":"cyc-holder",
+          "acquired_at":"2020-01-01T00:00:00Z","deadline":"2020-01-01T00:01:00Z",
+          "released_at":None,"expired":False}
+  metadata["review_lease_record_digest"]=D.review_lease_record_digest(record)
+  self.assertEqual(D.review_holder_disposition(record,metadata,Path("/tmp"),now=2_000_000_000).state,"live")
+  future=dict(record,acquired_at="2099-01-01T00:00:00Z",deadline="2099-01-01T00:01:00Z")
+  self.assertEqual(D.review_holder_disposition(future,metadata,Path("/tmp"),now=2_000_000_000).reason,
+                   "lease-acquired-in-future")
+
+ def test_review_holder_uses_flock_only_for_namespace_unverifiable(self):
+  nonce="0"*64
+  metadata={"attempt_id":"att-witness","pid":"1","pid_start":"1","pgid":"1",
+            "pid_ns":"n","pid_observer_ns":"o","review_governed_lease":D.REVIEW_GOVERNED_LEASE_KIND,
+            "review_governed_lease_nonce":nonce}
+  record={"schema_version":2,"attempt_id":"att-witness","cycle_id":"cyc-witness",
+          "acquired_at":"2020-01-01T00:00:00Z","deadline":"2099-01-01T00:01:00Z",
+          "released_at":None,"expired":False}
+  metadata["review_lease_record_digest"]=D.review_lease_record_digest(record)
+  with mock.patch.object(D,"attempt_governed_process_quiescence",
+                         return_value=D.ProcessQuiescence("unverifiable","process-namespace-unverifiable")), \
+       mock.patch.object(D,"review_governed_lease_is_held",return_value=True):
+   self.assertEqual(D.review_holder_disposition(record,metadata,Path("/tmp")).state,"live")
+  with mock.patch.object(D,"attempt_governed_process_quiescence",
+                         return_value=D.ProcessQuiescence("quiescent","process-pid-gone")), \
+       mock.patch.object(D,"review_governed_lease_is_held",return_value=True):
+   self.assertEqual(D.review_holder_disposition(record,metadata,Path("/tmp")).state,"dead")
+
 def extinct_metadata(attempt="att-extinct-fixture"):
  # CURRENT (used by attempt_row()) already carries registered_worker=1.
  return cancellation_metadata(attempt)
@@ -3571,6 +4037,76 @@ class CancellationQuiescenceExtinctSourceTest(unittest.TestCase):
    proof=D.prove_attempt_quiescence(
     metadata,max_wait_seconds=0,allow_namespace_extinct=True)
   self.assertFalse(proof.proven)
+
+
+class TerminalCleanupResponsibilityTest(unittest.TestCase):
+ def setUp(self):
+  self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
+  self.jobs=Path(self.tmp.name)/"jobs.log"
+
+ def test_terminal_proof_preserves_success_and_cannot_authorize_retry(self):
+  metadata=extinct_metadata("att-cleanup-success")
+  metadata.update(note="completed-marker",completion_marker="original-marker",
+                  delivery_receipt_b64="original-receipt",failure_class="pass")
+  self.jobs.write_text(attempt_row(metadata,"done")+"\n")
+  empty=D.ProcessGroupObservation("empty")
+  mismatch=D.ProcessGroupObservation("unverifiable",reason="observer-namespace-mismatch")
+  with mock.patch.object(D,"process_group_observation",return_value=empty), \
+       mock.patch.object(D,"attempt_tagged_descendants",return_value=mismatch), \
+       mock.patch.object(D,"attempt_scan_namespace_authority",return_value=False), \
+       mock.patch.object(D,"observer_namespace_extinct",return_value="extinct"):
+   original=self.jobs.read_bytes()
+   planned=D.resolve_attempt_cleanup(self.jobs,metadata["attempt_id"])
+   self.assertEqual(planned["reason"],"cleanup-proof-available")
+   self.assertEqual(self.jobs.read_bytes(),original)
+   result=D.resolve_attempt_cleanup(self.jobs,metadata["attempt_id"],apply=True)
+   self.assertTrue(result["settled"],result)
+   sealed=D.parse_registry_metadata(self.jobs.read_text().strip().split("\t",5)[5])
+   self.assertTrue(D._cleanup_receipt_reason(sealed))
+   self.assertEqual(D.attempt_process_quiescence(sealed,terminal_receipt=True).state,"quiescent")
+   again=self.jobs.read_bytes()
+   self.assertTrue(D.resolve_attempt_cleanup(self.jobs,metadata["attempt_id"],apply=True)["settled"])
+   self.assertEqual(self.jobs.read_bytes(),again)
+  self.assertEqual({k:sealed[k] for k in metadata},metadata)
+  self.assertEqual(D.cancellation_receipt_reason(sealed),"")
+  self.assertEqual(D.post_exit_receipt_reason(sealed),"")
+  self.assertNotIn("retry_attempt_id",sealed)
+  self.assertFalse(D._cleanup_receipt_reason(dict(sealed,pid_start="another-process")))
+  self.assertFalse(D._cleanup_receipt_reason(dict(sealed,cleanup_receipt_digest="sha256:wrong")))
+  populated=D.ProcessGroupObservation("populated",((4242,"900","S"),))
+  with mock.patch.object(D,"attempt_tagged_descendants",return_value=populated):
+   self.assertEqual(D.attempt_process_quiescence(sealed,terminal_receipt=True).state,"live")
+
+ def test_incomplete_observation_preserves_obligation_and_all_bytes(self):
+  metadata=extinct_metadata("att-cleanup-unknown")
+  self.jobs.write_text(attempt_row(metadata,"done")+"\n")
+  original=self.jobs.read_bytes()
+  with mock.patch.object(D,"process_group_observation",return_value=D.ProcessGroupObservation("empty")), \
+       mock.patch.object(D,"attempt_tagged_descendants",return_value=D.ProcessGroupObservation("unverifiable",reason="proc-permission-denied")), \
+       mock.patch.object(D,"attempt_scan_namespace_authority",return_value=False), \
+       mock.patch.object(D,"observer_namespace_extinct",return_value="extinct"):
+   result=D.resolve_attempt_cleanup(self.jobs,metadata["attempt_id"],apply=True)
+  self.assertFalse(result["settled"],result)
+  self.assertEqual(self.jobs.read_bytes(),original)
+
+ def test_live_terminal_child_remains_owned_then_real_exit_settles(self):
+  child=subprocess.Popen([sys.executable,"-c","import sys; sys.stdin.read()"],
+                         stdin=subprocess.PIPE,start_new_session=True,
+                         env=dict(os.environ,AGENT_DISPATCH_ATTEMPT_ID="att-cleanup-live"))
+  self.addCleanup(lambda: child.poll() is None and (child.kill(),child.wait(timeout=5)))
+  metadata={**D.process_launch_identity(child.pid),"attempt_id":"att-cleanup-live",
+            "note":"completed-marker","launch_lifecycle":"foreground-scoped",
+            "pid_scope":"namespace-local"}
+  self.jobs.write_text(attempt_row(metadata,"done")+"\n")
+  original=self.jobs.read_bytes()
+  self.assertFalse(D.resolve_attempt_cleanup(self.jobs,metadata["attempt_id"],apply=True)["settled"])
+  self.assertEqual(self.jobs.read_bytes(),original)
+  child.stdin.close();child.wait(timeout=5)
+  result=D.resolve_attempt_cleanup(self.jobs,metadata["attempt_id"],apply=True)
+  self.assertTrue(result["settled"],result)
+  sealed=D.parse_registry_metadata(self.jobs.read_text().strip().split("\t",5)[5])
+  self.assertEqual(sealed["note"],"completed-marker")
+  self.assertEqual(D.attempt_process_quiescence(sealed,terminal_receipt=True).state,"quiescent")
 
 
 class CancellationReceiptWedgeTest(unittest.TestCase):
@@ -3922,9 +4458,9 @@ class DeliveryIntentValuesTest(unittest.TestCase):
         self.assertEqual(restored["children"][0]["delivery_classification"], "success")
         self.assertEqual(restored["children"][0]["required_action"], "advance-completed")
         self.assertNotIn("reason", restored["children"][0])
-        canonical = {k: v for k, v in restored.items() if k in D._CANONICAL_RECEIPT_KEYS}
+        canonical = {k: v for k, v in restored.items() if k in __import__("dispatch_receipt_identity").CANONICAL_RECEIPT_KEYS}
         canonical["children"] = [
-            {k: v for k, v in c.items() if k in D._CANONICAL_CHILD_KEYS}
+            {k: v for k, v in c.items() if k in __import__("dispatch_receipt_identity").CANONICAL_CHILD_KEYS}
             for c in restored["children"]
         ]
         digest = hashlib.sha256(
@@ -3943,6 +4479,31 @@ class DeliveryIntentValuesTest(unittest.TestCase):
         self.assertEqual(restored["children"][0]["delivery_classification"], "attention")
         self.assertEqual(restored["children"][0]["required_action"], "inspect-done-failure")
         self.assertEqual(restored["children"][0]["reason"], "terminal-failure-or-unclosed")
+
+    def test_committed_delivery_proof_is_independent_of_harness_and_terminal_producer(self):
+        for harness in ("claude", "codex", "opencode"):
+            for note in ("completed-review", "completed-marker", "completed-supervisor", "completed-subsession"):
+                with self.subTest(harness=harness, note=note):
+                    metadata = self._metadata(harness=harness, note=note, failure_class="pass")
+                    metadata.update(D._delivery_intent_values(self._fields(metadata), metadata))
+                    self.assertTrue(D._delivery_commit_proven(metadata))
+
+    def test_committed_receipt_cannot_be_rebound_or_replace_failure_with_success(self):
+        metadata = self._metadata(note="completed-review", failure_class="pass")
+        metadata.update(D._delivery_intent_values(self._fields(metadata), metadata))
+        for changes in (
+            {"attempt_id": "att-other"}, {"parent_attempt_id": "att-other"},
+            {"parent_sid": "other-session"}, {"parent_completion_delivery": "codex-managed-gateway"},
+            {"harness": "opencode"}, {"delivery_receipt_digest": "0" * 64},
+            {"delivery_receipt_b64": "!invalid"}, {"delivery_receipt_b64": "W10"},
+            {"delivery_receipt_b64": D.base64.b64encode(b'{"kind":{}}').decode()},
+            {"delivery_intent": "0"}, {"note": "dead-failed", "failure_class": "fail"},
+        ):
+            with self.subTest(changes=changes):
+                self.assertFalse(D._delivery_commit_proven({**metadata, **changes}))
+        failed = self._metadata(note="dead-failed", failure_class="fail")
+        failed.update(D._delivery_intent_values(self._fields(failed), failed))
+        self.assertFalse(D._delivery_commit_proven(failed))
 
     def test_already_stamped_row_never_restamps(self):
         metadata = self._metadata(
@@ -4072,7 +4633,7 @@ class DeliveryIntentWiringTest(unittest.TestCase):
             )
             self.assertEqual(metadata.get("delivery_intent"), "1")
 
-    def test_w3_repaired_terminal_branch_never_stamps_or_overwrites_intent(self):
+    def test_w3_conflict_never_rewrites_committed_result_or_receipt(self):
         with tempfile.TemporaryDirectory() as td:
             jobs = Path(td) / "jobs.log"
             jobs.write_text(self._row() + "\n", encoding="utf-8")
@@ -4092,10 +4653,11 @@ class DeliveryIntentWiringTest(unittest.TestCase):
                     "classifier_source": "supervisor-terminal-v1",
                 },
             )
-            self.assertEqual(outcome, "repaired-terminal")
+            self.assertEqual(outcome, "terminal-conflict")
             after = D.parse_registry_metadata(
                 jobs.read_text(encoding="utf-8").splitlines()[0].split("\t")[5]
             )
+            self.assertEqual((after["note"], after["failure_class"]), ("completed-marker", "pass"))
             self.assertEqual(after.get("delivery_intent"), before.get("delivery_intent"))
             self.assertEqual(after.get("delivery_id"), before.get("delivery_id"))
             self.assertEqual(
@@ -4700,6 +5262,264 @@ class LaunchMismatchAnnotationTest(unittest.TestCase):
                        'reason {"mismatches":{}}', 'reason {"mismatches":[]}',
                        "reason null"):
             self.assertEqual(D.launch_mismatch_annotation(detail), {}, detail)
+
+
+class ForegroundOutcomeSealTest(unittest.TestCase):
+ def _jobs(self, directory, extra=""):
+  jobs=Path(directory)/"jobs.log"
+  jobs.write_text(
+   "2026-09-11T00:00:00Z\topen\t/r\t/w\treview\t"
+   "attempt_schema_version=2,dispatch_depth=1,transport=headless,"
+   "execution_surface=registered-headless,registered_worker=1,"
+   "fallback_hop=same-harness-headless,worker_type=review,"
+   "launch_lifecycle=foreground-scoped,attempt_id=att-contract,"
+   "pid=123,pid_start=456,pgid=123,pid_ns=pid:[1],pid_observer_ns=pid:[1]"
+   + extra + "\n", encoding="utf-8")
+  return jobs
+
+ def test_partial_and_seventh_outcome_keys_are_rejected_without_mutation(self):
+  for extra, reason in (
+   (",foreground_outcome_schema=1", "foreground-outcome-partial"),
+   (",foreground_outcome_schema=1,foreground_outcome_ready=1,foreground_extra=x", "foreground-outcome-malformed"),
+  ):
+   with self.subTest(reason=reason), tempfile.TemporaryDirectory() as td:
+    jobs=self._jobs(td, extra)
+    before=jobs.read_bytes()
+    with self.assertRaises(D.DispatchContractError) as ctx:
+     D.seal_foreground_result(jobs,"att-contract",123,"456",123,exit_code=0,failure="",group_empty=True)
+    self.assertEqual(ctx.exception.reason, reason)
+    self.assertEqual(jobs.read_bytes(), before)
+
+ def test_each_route_identity_key_refuses_authority(self):
+  for key in D.ROUTE_IDENTITY_METADATA_KEYS:
+   with self.subTest(key=key), tempfile.TemporaryDirectory() as td:
+    jobs=self._jobs(td, f",{key}=route-value")
+    with self.assertRaises(D.DispatchContractError) as ctx:
+     D.seal_foreground_result(jobs,"att-contract",123,"456",123,exit_code=0,failure="",group_empty=True)
+    self.assertEqual(ctx.exception.reason, "foreground-outcome-ineligible")
+
+ def test_concurrent_identical_seals_converge_and_conflict_preserves_bytes(self):
+  with tempfile.TemporaryDirectory() as td:
+   jobs=self._jobs(td)
+   barrier=threading.Barrier(2)
+   results=[]
+   def identical():
+    barrier.wait()
+    try: results.append(D.seal_foreground_result(jobs,"att-contract",123,"456",123,exit_code=0,failure="",group_empty=True))
+    except Exception as exc: results.append(exc)
+   threads=[threading.Thread(target=identical) for _ in range(2)]
+   for thread in threads: thread.start()
+   for thread in threads: thread.join()
+   self.assertEqual(len(results), 2)
+   self.assertTrue(all(isinstance(item, D.SealedForegroundOutcome) for item in results))
+   committed=jobs.read_bytes()
+   with self.assertRaises(D.DispatchContractError) as ctx:
+    D.seal_foreground_result(jobs,"att-contract",123,"456",123,exit_code=7,failure="exit-7",group_empty=True)
+   self.assertEqual(ctx.exception.reason, "foreground-outcome-conflict")
+   self.assertEqual(jobs.read_bytes(), committed)
+
+
+class _AttemptPolicyFixture(unittest.TestCase):
+ """Shared route-file plumbing for the depth-1 registration tests below."""
+ def policy(self,route,**kw):
+  args=dict(route_node="frame",intensity="standard",harness="codex",dispatch_depth=1,
+   parent_slug=None,execution_surface="registered-headless",registered_worker=True,
+   fallback_hop="same-harness-headless",fallback_ordinal=1,parent_harness="claude",
+   parent_transport="headless",parent_sandbox="workspace-write",launch_authority="conductor")
+  args.update(kw)
+  with tempfile.TemporaryDirectory() as td:
+   path=Path(td)/"route.json"; path.write_text(json.dumps(route))
+   return D.headless_attempt_policy(route_file=str(path),**args)
+ def refusal(self,route,**kw):
+  with self.assertRaises(D.DispatchContractError) as caught: self.policy(route,**kw)
+  return caught.exception
+
+class FrameLegRegistrationTest(_AttemptPolicyFixture):
+ """N1: a standard+ frame leg is dispatch depth 1 and carries NO `fallback_hops`.
+
+ The compiler attaches a checked chain to depth-2 nodes only, so before the
+ early return every frame registration died at `route-fallback-hops-missing`
+ while compile and route-verify both passed. These tests pin the return AND
+ the three refusals that fence it, and -- the load-bearing half -- pin that a
+ node MISSING the axes still fails loudly rather than slipping through.
+ """
+ def frame_node(self,**overrides):
+  node={"id":"frame","dispatch_depth":1,"worker_type":"frame","unit":"plan/frame"}
+  node.update(overrides)
+  return {key:value for key,value in node.items() if value is not None}
+ def route(self,node,harnesses=("codex","claude")):
+  return {"schema_version":2,"effective_intensity":"standard",
+   "dispatch_evidence":{"tuples":[
+    {"parent_harness":"claude","parent_transport":"headless",
+     "parent_sandbox":"workspace-write","child_harness":harness,
+     "launch_authority":"conductor","status":"supported"} for harness in harnesses]},
+   "nodes":[node,{"id":"plan","dispatch_depth":2,"fallback_hops":[
+    {"ordinal":1,"fallback_hop":"same-harness-headless","candidates":[]}]}]}
+
+ def test_a_well_formed_frame_leg_registers_on_both_headless_hops(self):
+  """The positive case, on both hops the frame pair may use. It never reaches
+  the `fallback_hops` check -- the node deliberately has no chain at all."""
+  node=self.frame_node()
+  self.assertNotIn("fallback_hops",node)
+  for hop,ordinal in (("same-harness-headless",1),("cross-harness-headless",2)):
+   with self.subTest(hop=hop):
+    policy=self.policy(self.route(node),fallback_hop=hop,fallback_ordinal=ordinal)
+    self.assertEqual(policy["fallback_hop"],hop)
+    self.assertEqual(policy["fallback_ordinal"],ordinal)
+    self.assertFalse(policy["quick"])
+    self.assertIsNone(policy["terminal_attempt_limit"])
+
+ def test_an_absent_axis_key_fails_loudly_instead_of_taking_the_early_return(self):
+  """The guard against "the key was added but nothing reads it". A frame node
+  that does not SAY it is one takes the ordinary standard+ path, where its
+  missing chain is a loud refusal -- not a silent admission."""
+  for missing in ("worker_type","unit"):
+   with self.subTest(missing=missing):
+    node=self.frame_node(**{missing:None})
+    self.assertNotIn(missing,node)
+    exception=self.refusal(self.route(node))
+    self.assertEqual(exception.reason,"route-fallback-hops-missing")
+    self.assertEqual(exception.detail,"frame")
+  # ...and a wrong value is refused the same way, not merely an absent key.
+  for wrong in ({"worker_type":"owner"},{"unit":"_kernel/owner"}):
+   with self.subTest(wrong=wrong):
+    self.assertEqual(self.refusal(self.route(self.frame_node(**wrong))).reason,
+                     "route-fallback-hops-missing")
+
+ def test_a_stringly_typed_registered_worker_is_the_frame_branchs_own_refusal(self):
+  """The one surface refusal that is genuinely the frame branch's to make.
+
+  `validate_attempt_metadata` normalizes `"1"` to True and lets the call
+  through, so the branch's `registered_worker is not True` identity check is
+  the only thing standing between a stringly-typed caller and an unchecked
+  registration -- and it must answer `frame-route-surface-invalid`, not
+  quick's `quick-route-surface-invalid`."""
+  route=self.route(self.frame_node())
+  self.assertTrue(D._registered_worker("1"))  # the validator is genuinely satisfied
+  exception=self.refusal(route,registered_worker="1")
+  self.assertEqual((exception.reason,exception.detail),
+                   ("frame-route-surface-invalid","registered-headless"))
+  self.assertNotEqual(exception.reason,"quick-route-surface-invalid")
+
+ def test_a_non_headless_surface_or_hop_is_refused_before_the_frame_branch(self):
+  """The other two frame-surface clauses are belt-and-braces: this entry point
+  always validates as a registered-headless WRAPPER, so a non-registered
+  surface or a non-headless hop is refused one layer earlier, with that
+  layer's own reason. Both layers are pinned -- the observable refusal
+  unmuted, and the branch's own clause with the outer layer muted -- so
+  neither can be dropped on the assumption that the other still covers it."""
+  route=self.route(self.frame_node())
+  for kw,outer in (
+    (dict(execution_surface="claude-subagent",registered_worker=False,
+          fallback_hop="native-subagent",fallback_ordinal=3),
+     "headless-wrapper-surface-mismatch"),
+    (dict(fallback_hop="inline",fallback_ordinal=4),
+     "registered-worker-fallback-mismatch"),
+  ):
+   with self.subTest(outer=outer):
+    self.assertEqual(self.refusal(route,**kw).reason,outer)
+    with mock.patch.object(D,"validate_attempt_metadata"):
+     inner=self.refusal(route,**kw)
+    self.assertEqual(inner.reason,"frame-route-surface-invalid")
+    self.assertNotEqual(inner.reason,"quick-route-surface-invalid")
+
+ def test_the_requested_harness_must_be_in_the_routes_checked_evidence(self):
+  """Standard+ HAS checked dispatch evidence, so the harness is verified
+  against it rather than taken on trust."""
+  route=self.route(self.frame_node(),harnesses=("codex",))
+  exception=self.refusal(route,harness="claude")
+  self.assertEqual((exception.reason,exception.detail),("frame-harness-unsupported","claude"))
+  # an `unsupported` row is not a supported row
+  degraded=self.route(self.frame_node())
+  for row in degraded["dispatch_evidence"]["tuples"]:
+   if row["child_harness"]=="claude": row["status"]="unsupported"
+  self.assertEqual(self.refusal(degraded,harness="claude").reason,"frame-harness-unsupported")
+  self.assertEqual(self.policy(degraded,harness="codex")["fallback_hop"],"same-harness-headless")
+
+ def test_launch_authority_and_depth_zero_are_not_the_same_axis(self):
+  """A frame leg is launched under `launch_authority: "depth-0"`, which is a
+  DIFFERENT axis from the fallback-chain authority enum. Conflating them was
+  the wide change this cycle deliberately rejected; pin that they stay apart."""
+  self.assertNotIn("depth-0",D.LAUNCH_AUTHORITIES)
+  self.assertEqual(D.LAUNCH_AUTHORITIES,{"conductor","ancestor-broker"})
+
+class QuickThreeNodeRegistrationTest(_AttemptPolicyFixture):
+ """Quick is a three-node route, so its shape check is a per-node-id table."""
+ NODES={
+  "one-shot":("owner","_kernel/owner"),
+  "frame":("frame","plan/frame"),
+  "frame-alternative":("frame","plan/frame"),
+ }
+ def route(self,**overrides):
+  nodes=[]
+  for node_id,(worker_type,unit) in self.NODES.items():
+   node={"id":node_id,"dispatch_depth":1,"worker_type":worker_type,"unit":unit,
+         "execution_surface":"registered-headless","registered_worker":True}
+   node.update(overrides.get(node_id) or {})
+   nodes.append(node)
+  # a node id quick's table does not know, present in the route so the walk
+  # gets past `route-node-unknown` and reaches the shape table itself
+  nodes.append({"id":"mystery","dispatch_depth":1,"worker_type":"frame","unit":"plan/frame",
+                "execution_surface":"registered-headless","registered_worker":True})
+  return {"schema_version":2,"effective_intensity":"quick","nodes":nodes,
+   "registered_headless_candidates":[
+    {"harness":harness,"transport":"headless","surface":"registered-headless",
+     "status":"supported"} for harness in ("codex","claude")]}
+
+ def test_each_node_id_must_carry_its_own_tuple(self):
+  for node_id in self.NODES:
+   with self.subTest(node_id=node_id):
+    policy=self.policy(self.route(),route_node=node_id,intensity="quick")
+    self.assertTrue(policy["quick"])
+    self.assertEqual(policy["terminal_attempt_limit"],1)  # one candidate per harness
+  for node_id,wrong in (("one-shot",{"worker_type":"frame"}),
+                        ("one-shot",{"unit":"plan/frame"}),
+                        ("frame",{"worker_type":"owner"}),
+                        ("frame",{"unit":"_kernel/owner"}),
+                        ("frame-alternative",{"worker_type":"owner"}),
+                        ("frame-alternative",{"unit":"_kernel/owner"})):
+   with self.subTest(node_id=node_id,wrong=wrong):
+    exception=self.refusal(self.route(**{node_id:wrong}),route_node=node_id,intensity="quick")
+    self.assertEqual((exception.reason,exception.detail),("quick-route-shape-invalid",node_id))
+
+ def test_a_node_id_outside_the_table_is_a_shape_refusal(self):
+  """`mystery` is a real node in the route -- it is not `route-node-unknown`.
+  Quick admits exactly three ids and nothing else, however well formed."""
+  exception=self.refusal(self.route(),route_node="mystery",intensity="quick")
+  self.assertEqual((exception.reason,exception.detail),("quick-route-shape-invalid","mystery"))
+
+ def test_the_same_harness_pin_narrowed_to_the_work_node(self):
+  """The pin exists to keep quick's WORK on one harness. The frame pair's one
+  MANDATORY independence axis is cross-harness, so keeping the restriction
+  system-wide would have broken the pair it was meant to protect."""
+  exception=self.refusal(self.route(),route_node="one-shot",intensity="quick",
+   fallback_hop="cross-harness-headless",fallback_ordinal=2,harness="claude")
+  self.assertEqual((exception.reason,exception.detail),
+                   ("quick-fallback-forbidden","cross-harness-headless"))
+  for node_id in ("frame","frame-alternative"):
+   with self.subTest(node_id=node_id):
+    policy=self.policy(self.route(),route_node=node_id,intensity="quick",
+     fallback_hop="cross-harness-headless",fallback_ordinal=2,harness="claude")
+    self.assertEqual(policy["fallback_hop"],"cross-harness-headless")
+    self.assertTrue(policy["quick"])
+  # a frame leg is still fenced to the two HEADLESS hops -- widening the pin
+  # did not open the native-subagent or inline hops to it
+  with mock.patch.object(D,"validate_attempt_metadata"):
+   for hop in ("native-subagent","inline"):
+    with self.subTest(hop=hop):
+     exception=self.refusal(self.route(),route_node="frame",intensity="quick",
+      fallback_hop=hop,fallback_ordinal=3)
+     self.assertEqual((exception.reason,exception.detail),("quick-fallback-forbidden",hop))
+
+ def test_the_surface_refusal_stays_quicks_own_reason(self):
+  """Quick reads the surface off the NODE (the frame branch reads it off the
+  caller's arguments); the two refusals must not be confused for each other."""
+  for node_id in self.NODES:
+   with self.subTest(node_id=node_id):
+    exception=self.refusal(self.route(**{node_id:{"registered_worker":False}}),
+     route_node=node_id,intensity="quick")
+    self.assertEqual(exception.reason,"quick-route-surface-invalid")
+    self.assertNotEqual(exception.reason,"frame-route-surface-invalid")
 
 
 if __name__=="__main__": unittest.main()

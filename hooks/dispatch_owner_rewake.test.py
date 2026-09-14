@@ -22,6 +22,7 @@ from unittest import mock
 
 
 MODULE_PATH = Path(__file__).with_name("dispatch-owner-rewake.py")
+ROOT = MODULE_PATH.parents[1]
 # A holder that is provably dead *from this process's own PID namespace*:
 # pid 4194304 is above Linux's pid_max, so `/proc/<pid>` never exists, and
 # the namespace is ours so the hook may judge it (a holder recorded from
@@ -125,6 +126,22 @@ class DispatchOwnerRewakeTest(unittest.TestCase):
         self.assertEqual(launch.attempt_id, "att-owner-1")
         self.assertEqual(launch.jobs, self.jobs)
         self.assertEqual(launch.session_id, "session-1")
+
+    def test_session_owner_rows_accepts_depth1_review_and_rejects_registry_negatives(self) -> None:
+        self.jobs.write_text(self.row(worker_type="review"), encoding="utf-8")
+        self.assertEqual(
+            [attempt_id for attempt_id, _age in rewake._session_owner_rows(self.jobs, "session-1")],
+            ["att-owner-1"],
+        )
+        for key, value in (
+            ("dispatch_depth", "2"),
+            ("parent_completion_delivery", "codex-stop-hook"),
+            ("launch_claimed", "0"),
+            ("launch_started", "0"),
+        ):
+            with self.subTest(key=key):
+                self.jobs.write_text(self.row(worker_type="review", **{key: value}), encoding="utf-8")
+                self.assertEqual(rewake._session_owner_rows(self.jobs, "session-1"), [])
 
     def test_exact_successful_quick_dispatch_node_start_is_armed(self) -> None:
         payload = self.payload()
@@ -265,7 +282,8 @@ class DispatchOwnerRewakeTest(unittest.TestCase):
         self.assertIn("required_action=inspect-done-failure", message)
         self.assertIn("state=attention", message)
         self.assertIn("Hearting dispatch requires attention", message)
-        self.assertIn("--status done --failure-detail", message)
+        self.assertIn("--status done", message)
+        self.assertNotIn("--failure-detail", message)
 
     def write_marker_bound_owner(self, *, status: str = "open", child: bool = False):
         evidence = self.root / "report.md"
@@ -640,7 +658,8 @@ class DispatchOwnerRewakeTest(unittest.TestCase):
         self.assertIn("required_action=inspect-done-failure", message)
         self.assertIn(f"--jobs {self.jobs}", message)
         self.assertIn("--attempt-id att-owner-1", message)
-        self.assertIn("--status done --failure-detail", message)
+        self.assertIn("--status done", message)
+        self.assertNotIn("--failure-detail", message)
 
     def test_complete_open_receipt_names_the_exact_registry(self) -> None:
         launch = rewake.parse_launch(self.payload())
@@ -718,9 +737,9 @@ class DispatchOwnerRewakeTest(unittest.TestCase):
         (new_release / "core" / "CORE.md").write_text("fixture\n", encoding="utf-8")
 
         message = rewake.receipt(launch, "attention", "terminal-quiescent", new_release)
-        match = re.search(r"checked harvest command: (.+?)\. Do not", message)
-        assert match is not None, message
-        harvest_line = match.group(1)
+        commands = JOIN.harvest_command_lines(message)
+        self.assertEqual(len(commands), 1, message)
+        harvest_line = commands[0]
         # The command this hook renders does name the sealed OLD release --
         # that half of the pipeline already works (see the sibling
         # `test_receipt_prefers_the_sealed_launch_home_over_a_mutable_root`).
@@ -2052,10 +2071,9 @@ class GateCarrierTest(unittest.TestCase):
             rewake._open_gate_pending(launch)
             row.assert_not_called()
 
-    def test_the_real_unclaimable_record_never_spins_the_loop(self):
-        """review round 2, N4: B3 with the real probe and real notices."""
+    def test_repeated_claim_failure_still_wakes_once_when_delivery_recovers(self):
         delivery_id = self._gate_record()
-        for _ in range(rewake.pending_delivery.RECLAIM_LIMIT):
+        for _ in range(10):
             rewake.pending_delivery.claim(self.state, "session-gate", delivery_id,
                                           claim_owner="x", lease_seconds=0.001)
             rewake.pending_delivery.reclaim(self.state, "session-gate", delivery_id,
@@ -2090,24 +2108,21 @@ class GateCarrierTest(unittest.TestCase):
                 mock.patch.object(sys, "stdout", io.StringIO()), \
                 mock.patch.object(sys, "stderr", io.StringIO()) as stderr:
             code = rewake.main()
-        self.assertEqual(code, 0)
-        self.assertNotIn("owner=alive-waiting", stderr.getvalue())
-        self.assertEqual(sleep.call_count, run.call_count - 1)
-        self.assertLessEqual(run.call_count, 8)
+        self.assertEqual(code, 2)
+        self.assertIn("owner=alive-waiting", stderr.getvalue())
+        self.assertLessEqual(run.call_count, 1)
 
-    def test_the_probe_ignores_a_record_whose_reclaim_budget_is_spent(self):
-        """review round 1, B3: an unclaimable record must not keep the probe
-        returning True forever."""
+    def test_probe_recovers_expired_claims_without_an_eight_attempt_dead_end(self):
         delivery_id = self._gate_record()
-        for _ in range(rewake.pending_delivery.RECLAIM_LIMIT):
+        for _ in range(10):
             rewake.pending_delivery.claim(self.state, "session-gate", delivery_id,
                                           claim_owner="x", lease_seconds=0.001)
             rewake.pending_delivery.reclaim(self.state, "session-gate", delivery_id,
                                             now_ns=time.monotonic_ns() + 10**12)
         record = rewake.pending_delivery.read(self.state, "session-gate", delivery_id)
-        self.assertGreaterEqual(record["attempts"], rewake.pending_delivery.RECLAIM_LIMIT)
+        self.assertEqual(record["attempts"], 10)
         rewake._PROBE_DIRECTORY_MTIME.clear()
-        self.assertFalse(rewake._open_gate_pending(self._launch()))
+        self.assertTrue(rewake._open_gate_pending(self._launch()))
 
     def test_an_unannounced_probe_sleeps_and_the_wait_stays_bounded(self):
         """review round 1, B3: when the probe fires but nothing can be announced the
@@ -2380,6 +2395,134 @@ class GateCloseRearmTest(GateCarrierTest):
         self.assertIn("armed=registry-rearm", stderr.getvalue())
         ledger = json.loads(rewake.arm_path(self.jobs, "att-gate-owner").read_text(encoding="utf-8"))
         self.assertEqual(ledger["state"], "ended")
+
+
+class Depth1WorkerTypeProjectionTest(unittest.TestCase):
+    def test_only_owner_frame_review_are_depth1(self):
+        for worker_type in ("owner", "frame", "review"):
+            self.assertTrue(rewake._worker_type_is_depth1(worker_type))
+        for worker_type in ("stage", "dev/backend", ""):
+            self.assertFalse(rewake._worker_type_is_depth1(worker_type))
+        self.assertTrue(rewake._worker_type_is_depth1({"review", "other"}))
+        self.assertFalse(rewake._worker_type_is_depth1({"stage", "other"}))
+
+    def test_depth1_projection_is_not_duplicated_in_adapters(self):
+        for adapter in ("claude", "codex", "opencode"):
+            source = (ROOT / "adapters" / adapter / "bin" / "dispatch-headless.py").read_text(encoding="utf-8")
+            self.assertNotIn("def _worker_type_is_depth1", source)
+            self.assertNotIn("DEPTH1_WORKER_TYPES", source)
+
+    def test_stdout_review_worker_uses_the_same_depth_one_gate(self):
+        payload = {
+            "hook_event_name": "PostToolUse", "tool_name": "Bash",
+            "session_id": "session-1",
+            "tool_input": {"command": "python3 utilities/dispatch-headless.py --start"},
+            "tool_response": {"stdout": "\n".join((
+                "check=ok", "status=start", "dispatch_depth=1",
+                "worker_type=review", "parent_completion_delivery=claude-parent-runtime",
+                "registered=1", "started=1", "attempt_id=att-review",
+                "parent_session_id=session-1", "job_registry=/tmp/jobs.log",
+            ))},
+        }
+        with mock.patch.object(rewake, "_trusted_jobs", return_value=Path("/tmp/jobs.log")), \
+                mock.patch.object(rewake, "_validated_jobs", return_value=Path("/tmp/jobs.log")):
+            launch = rewake.parse_launch(payload)
+        self.assertIsNotNone(launch)
+        self.assertEqual(launch.attempt_id, "att-review")
+
+
+class FrameWorkerTypeArmingTest(unittest.TestCase):
+    """W2 (frame-bootstrap-layer, 2026-09-10): a depth-1 `frame` worker must
+    arm the same wait a depth-1 `owner` worker does, through both arming
+    paths, via the shared `DEPTH1_WORKER_TYPES` constant and the shared
+    `_worker_type_is_depth1` comparison helper both paths call."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.jobs = self.root / "jobs.log"
+        environment = mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(self.jobs)}, clear=False)
+        environment.start()
+        self.addCleanup(environment.stop)
+
+    @staticmethod
+    def row(*, attempt_id="att-frame-1", status="open", parent_sid="session-1",
+             worker_type="frame", age_seconds=0.0, **overrides):
+        stamp = (datetime.now(timezone.utc) - timedelta(seconds=age_seconds)).isoformat().replace("+00:00", "Z")
+        metadata = {"capability": "autopilot-code", "dispatch_depth": "1", "worker_type": worker_type,
+                    "parent_sid": parent_sid, "parent_completion_delivery": "claude-parent-runtime",
+                    "launch_claimed": "1", "launch_started": "1", "attempt_id": attempt_id}
+        metadata.update(overrides)
+        pipe = ",".join(f"{k}={v}" for k, v in metadata.items())
+        return "\t".join([stamp, status, "/repo", "/repo", "slug", pipe]) + "\n"
+
+    def stdout_payload(self, *, worker_type="frame", attempt_id="att-frame-1", session_id="session-1"):
+        output = "\n".join((
+            "check=ok", "status=start", "dispatch_depth=1", f"worker_type={worker_type}",
+            "parent_completion_delivery=claude-parent-runtime",
+            f"parent_session_id={session_id}", f"job_registry={self.jobs}",
+            f"attempt_id={attempt_id}", "registered=1", "started=1",
+        ))
+        return {
+            "hook_event_name": "PostToolUse", "tool_name": "Bash", "session_id": session_id,
+            "tool_input": {"command": "python3 utilities/dispatch-owner.py --start --worker-type frame"},
+            "tool_response": {"stdout": output, "stderr": ""},
+        }
+
+    def test_frame_stdout_start_receipt_arms_through_parse_launch(self) -> None:
+        # Item 1 of W2's required tests: the real stdout fast path (parse_launch,
+        # the module's *only* entry to the "worker_type=frame" stdout receipt)
+        # recognizes and arms a frame launch exactly as it does an owner one.
+        self.jobs.write_text(self.row(), encoding="utf-8")
+        launch = rewake.parse_launch(self.stdout_payload())
+        self.assertIsNotNone(launch)
+        assert launch is not None
+        self.assertEqual((launch.attempt_id, launch.armed), ("att-frame-1", "stdout"))
+
+    def test_frame_registry_row_arms_through_registry_launch(self) -> None:
+        # Item 2: a filtered stdout (no worker_type/status fields survive) still
+        # arms from the registry row alone, through the real registry-path
+        # function `registry_launch` -> `_session_owner_rows`.
+        self.jobs.write_text(self.row(), encoding="utf-8")
+        filtered = self.stdout_payload()
+        filtered["tool_response"]["stdout"] = "check=ok"
+        resolved = rewake.registry_launch(filtered)
+        self.assertIsInstance(resolved, tuple)
+        launch, claim = resolved
+        self.assertEqual((launch.attempt_id, launch.armed), ("att-frame-1", "registry"))
+        self.assertEqual(claim.attempt_id, "att-frame-1")
+
+    def test_registry_consumer_uses_membership_not_equality_against_the_shared_set(self) -> None:
+        # Item 3: the structural regression test. If `worker_type` were ever
+        # folded back into `REGISTRY_DEPTH1_START`'s equality dict (comparing
+        # a scalar with `!=` against `DEPTH1_WORKER_TYPES`, a set), a real
+        # frame row could never match -- `metadata.get(key) != value` is true
+        # for every string against a frozenset -- and `_session_owner_rows`
+        # would silently return nothing for every frame launch. This exercises
+        # the literal consumer function directly.
+        self.jobs.write_text(self.row(worker_type="frame"), encoding="utf-8")
+        rows = rewake._session_owner_rows(self.jobs, "session-1")
+        self.assertEqual([attempt_id for attempt_id, _age in rows], ["att-frame-1"])
+        # The vocabulary itself must be a real collection checked by
+        # membership, and worker_type must not sit inside the equality dict.
+        self.assertIsInstance(rewake.DEPTH1_WORKER_TYPES, frozenset)
+        self.assertEqual(rewake.DEPTH1_WORKER_TYPES, frozenset({"owner", "frame", "review"}))
+        self.assertNotIn("worker_type", rewake.REGISTRY_DEPTH1_START)
+
+    def test_owner_worker_type_still_arms_unchanged(self) -> None:
+        # The pre-existing vocabulary member must keep working after the widening.
+        self.jobs.write_text(self.row(worker_type="owner", attempt_id="att-owner-frame-sibling"), encoding="utf-8")
+        rows = rewake._session_owner_rows(self.jobs, "session-1")
+        self.assertEqual([attempt_id for attempt_id, _age in rows], ["att-owner-frame-sibling"])
+
+    def test_a_worker_type_outside_the_vocabulary_still_never_arms(self) -> None:
+        for worker_type in ("stage", "support"):
+            with self.subTest(worker_type=worker_type):
+                self.jobs.write_text(self.row(worker_type=worker_type), encoding="utf-8")
+                self.assertEqual(rewake._session_owner_rows(self.jobs, "session-1"), [])
+                stdout_launch = rewake.parse_launch(self.stdout_payload(worker_type=worker_type))
+                self.assertIsNone(stdout_launch)
 
 
 if __name__ == "__main__":

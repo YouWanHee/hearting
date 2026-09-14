@@ -59,12 +59,13 @@ class DemandSchema(unittest.TestCase):
         for value in invalid:
             with self.subTest(value=value), self.assertRaises(P.ModelProfileError):
                 P.resolve_profile_demand(value)
-        for profile in ("light", "balanced", "mini"):
-            with self.assertRaises(P.ModelProfileError):
-                P.resolve_profile_demand(demand("important"), explicit_profile=profile)
-        for profile in ("balanced", "balanced-deep", "deep"):
-            with self.assertRaises(P.ModelProfileError):
-                P.resolve_profile_demand(demand(), explicit_profile=profile)
+        for value in (None, demand(), demand("important"), demand("difficult-uncertain")):
+            for profile in P.KNOWN_PROFILES:
+                row = P.resolve_profile_demand(value, explicit_profile=profile)
+                self.assertEqual(row["resolved_profile"], profile)
+                P.validate_profile_selection(row, value, profile=profile)
+        with self.assertRaises(P.ModelProfileError):
+            P.resolve_profile_demand(demand(), explicit_profile="unknown")
         row = P.resolve_profile_demand(None, explicit_profile="light", legacy=True, existing_versioned_stage=True)
         self.assertEqual(row["resolved_profile"], "light")
         self.assertIsNone(row["demand_digest"])
@@ -79,8 +80,7 @@ class DemandSchema(unittest.TestCase):
         self.assertTrue(decision["stop_conditions"])
         self.assertEqual([P.resolve_profile_demand(d)["resolved_profile"] for d in stages],
                          ["balanced-deep", "balanced", "deep", "light"])
-        with self.assertRaises(P.ModelProfileError):
-            P.resolve_profile_demand(stages[2], explicit_profile="balanced")
+        self.assertEqual(P.resolve_profile_demand(stages[2], explicit_profile="balanced")["resolved_profile"], "balanced")
 
     def test_user_whole_file_derivation_and_no_writeback(self):
         for adapter in C.ADAPTERS:
@@ -173,7 +173,12 @@ class RouteDemand(unittest.TestCase):
         demands={"execute":demand("important")}
         route=self.compile(profile_demands=demands)
         R.verify_route(route,R.ROOT)
-        graph=",".join(n["id"] for n in R.TOPO.resolve_recipe(R.TOPO.load_registry(),"autopilot-code","dev")["standard_plus"]["nodes"])
+        # Both frame legs raise `frame-review`, and compose emits one binding
+        # per raising node, so a graph naming both is refused as a gate bound
+        # twice. This test is about the resolver, not the graph, so it composes
+        # the widest graph compose can currently express.
+        graph=",".join(n["id"] for n in R.TOPO.resolve_recipe(R.TOPO.load_registry(),"autopilot-code","dev")["standard_plus"]["nodes"]
+                       if n["id"]!="frame-alternative")
         composed=R.compose_route(capability="autopilot-code",capability_mode="dev",shape="staged",graph=graph,
             slug="sd88",cwd=R.ROOT,artifact_root=R.ROOT, spec_read="fixture",profile_demands=demands,
             dispatch_evidence=self.dispatch(self.nested()))
@@ -187,10 +192,11 @@ class RouteDemand(unittest.TestCase):
         self.assertEqual(route["owner_profile_selection"]["source"],"legacy")
 
     def test_owner_floor_unknown_target_and_partial_reject(self):
-        for demands in ({"__owner__":demand("important")},{"execute":{}},{"absent":demand()}):
+        for demands in ({"__owner__":{}},{"execute":{}},{"absent":demand()}):
             with self.assertRaises(ValueError): self.compile(profile_demands=demands)
-        with self.assertRaises(ValueError):
-            self.compile(profile_demands={"execute":demand("important")},explicit_profiles={"execute":"light"})
+        route = self.compile(profile_demands={"execute":demand("important")},explicit_profiles={"execute":"light"})
+        self.assertEqual(next(n for n in route["nodes"] if n["id"] == "execute")["model_profile"], "light")
+        R.verify_route(route, R.ROOT)
 
     def test_tamper_rejected_before_wrapper_spawn_and_legacy_hash_stays(self):
         route=self.compile(profile_demands={"execute":demand("important")})
@@ -264,13 +270,22 @@ class RouteDemand(unittest.TestCase):
                 "--dispatch-evidence",str(evidence),"--profile-demands",str(demands)]
             for action,extra,expected in (("compile",["--intensity","standard","--signal","shared-contract",
                     "--transport","headless","--tracking","tracked","--workflow-mode","tracked"],"balanced-deep"),
-                    ("compose",["--shape","staged","--graph","execute,report","--explicit-profiles",str(explicit)],"deep")):
+                    ("compose",["--full-record","--shape","staged","--graph","execute,report","--explicit-profiles",str(explicit)],"deep")):
                 result=subprocess.run([sys.executable,str(ROOT/"utilities/capability-route.py"),action,*common,*extra],
                     capture_output=True,text=True,env=env)
                 self.assertEqual(result.returncode,0,result.stdout+result.stderr)
                 route=json.loads(result.stdout);node=next(n for n in route["nodes"] if n["id"]=="execute")
                 self.assertEqual(node["model_profile"],expected)
                 self.assertEqual(node["profile_selection"]["source"],"explicit" if action=="compose" else "matrix")
+            result = subprocess.run([sys.executable, str(ROOT/"utilities/capability-route.py"), "compose",
+                *common[:-2], "--shape", "staged", "--graph", "frame,frame-alternative,test,report",
+                "--profile", "light", "--full-record"], capture_output=True, text=True, env=env)
+            self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+            route = json.loads(result.stdout)
+            self.assertEqual(route["owner_model_profile"], "light")
+            self.assertEqual({n["model_profile"] for n in route["nodes"]}, {"light"})
+            self.assertEqual(route["profile_demands"], {})
+            R.verify_route(route, ROOT)
 
     def test_continuation_keeps_only_remaining_demand_inputs(self):
         fixture=F.TestContinuation();fixture.setUp()
@@ -301,6 +316,72 @@ class TopExceptionRoute(unittest.TestCase):
     dispatch = F.TestRoute.dispatch
     nested = F.TestRoute.nested
     TOP = {"__owner__": "top"}
+
+    def test_owner_demand_replaces_default_for_quick_and_standard(self):
+        for judgment, scope, profile in (("predetermined", "short-local", "light"),
+                ("predetermined", "extended-multistep", "balanced"),
+                ("important", "short-local", "balanced-deep"),
+                ("difficult-uncertain", "short-local", "deep")):
+            for compile_route in (self.quick, self.staged):
+                for explicit in ({}, {"__owner__": profile}):
+                    with self.subTest(profile=profile, shape=compile_route.__name__, explicit=explicit):
+                        route = compile_route(profile_demands={"__owner__": demand(judgment, scope)},
+                                              explicit_profiles=explicit)
+                        self.assertEqual(route["owner_model_profile"], profile)
+                        R.verify_route(route, R.ROOT)
+                        for node in route["nodes"]:
+                            if node["id"] == "one-shot":
+                                self.assertEqual(node["model_profile"], profile)
+                        if profile == "light":
+                            self.assertEqual({n["model_profile"] for n in route["nodes"]
+                                              if n["unit"] == "plan/frame"}, {"balanced"})
+
+    def test_light_compose_owner_and_semantic_stages_round_trip(self):
+        for shape, graph in (("solo", None), ("staged", "plan,plan-check,test,report")):
+            route = R.compose_route(capability="autopilot-code", capability_mode="dev", shape=shape,
+                graph=graph, slug="light-owner", cwd=R.ROOT, artifact_root=R.ROOT,
+                spec_read="fixture", registered_headless_evidence=self.registered_headless(),
+                dispatch_evidence=self.dispatch(self.nested()),
+                profile_demands={"__owner__": demand()}, explicit_profiles={"__owner__": "light"})
+            self.assertEqual(route["owner_model_profile"], "light")
+            R.verify_route(route, R.ROOT)
+        route = self.staged(capability="autopilot-spec", capability_mode="app",
+            profile_demands={"__owner__": demand(), "prd-transaction": demand()},
+            explicit_profiles={"__owner__": "light", "prd-transaction": "light"})
+        R.verify_route(route, R.ROOT)
+
+    def test_one_profile_option_carries_explicit_light_without_demand_files(self):
+        for shape, graph in (("solo", None), ("staged", "frame,frame-alternative,test,report"),
+                             ("staged", "test,report")):
+            route = R.compose_route(capability="autopilot-code", capability_mode="dev", shape=shape,
+                graph=graph, slug="explicit-light", cwd=R.ROOT, artifact_root=R.ROOT,
+                spec_read="fixture", registered_headless_evidence=self.registered_headless(),
+                dispatch_evidence=self.dispatch(self.nested()), profile="light")
+            self.assertEqual(route["owner_model_profile"], "light")
+            self.assertEqual({n["model_profile"] for n in route["nodes"]}, {"light"})
+            self.assertEqual(route["owner_profile_selection"]["source"], "explicit")
+            R.verify_route(route, R.ROOT)
+            self.assertNotIn("plan-check", {n["id"] for n in route["nodes"]})
+
+    def test_owner_default_drift_and_quick_dual_selection_are_refused(self):
+        route = self.staged()
+        route["owner_model_profile"] = "light"
+        route["owner_profile_selection"] = P.resolve_profile_demand(
+            None, explicit_profile="light", legacy=True, existing_versioned_stage=True)
+        route["route_hash"] = R.route_hash(route)
+        route["route_id"] = "rt-" + route["route_hash"].split(":")[1][:16]
+        with self.assertRaises(ValueError):
+            R.verify_route(route, R.ROOT)
+        with self.assertRaisesRegex(ValueError, "owner-node-profile-selection-conflict"):
+            self.quick(profile_demands={"__owner__": demand(), "one-shot": demand("important")},
+                       explicit_profiles={"one-shot": "balanced-deep"})
+
+    def test_inline_demand_does_not_invent_an_owner_or_break_verification(self):
+        route = R.compose_route(capability="autopilot-code", capability_mode="dev", shape="direct",
+            graph=None, slug="inline-demand", cwd=R.ROOT, artifact_root=R.ROOT, spec_read="fixture",
+            profile_demands={"__owner__": demand("important")})
+        self.assertIsNone(route["owner_model_profile"])
+        R.verify_route(route, R.ROOT)
 
     def owner_demand(self, judgment="difficult-uncertain"):
         return {"__owner__": demand(judgment)}
@@ -346,10 +427,26 @@ class TopExceptionRoute(unittest.TestCase):
     def test_staged_route_seals_top_on_the_owner_only_and_verifies(self):
         route = self.staged(profile_demands=self.owner_demand("important"), explicit_profiles=self.TOP)
         self.assert_top_owner(route)
-        self.assertNotIn("top", {n["model_profile"] for n in route["nodes"]})
+        # The invariant is that a `top` OWNER does not spread `top` onto the
+        # recipe's stage nodes. The frame anchor is the one deliberate
+        # exception and is not an instance of that spreading at all: it is
+        # raised by the frame tier ladder, which keys on the owner's resolved
+        # profile rather than copying it. Everything else must still be off
+        # `top`.
+        self.assertNotIn("top", {n["model_profile"] for n in route["nodes"]
+                                 if n["id"] != "frame"})
         plain = self.staged()
         self.assertEqual(plain["owner_model_profile"], "deep")
         R.verify_route(plain, R.ROOT)
+        # Proof the anchor's `top` comes from the ladder and not from the
+        # owner: a plain staged route asked for no `top` anywhere, its owner is
+        # `deep`, and the anchor is `top` regardless -- while the alternative
+        # leg stays at the owner's own working tier.
+        by_id = {n["id"]: n for n in plain["nodes"]}
+        self.assertEqual(by_id["frame"]["model_profile"], "top")
+        self.assertEqual(by_id["frame-alternative"]["model_profile"], "deep")
+        self.assertNotIn("top", {n["model_profile"] for n in plain["nodes"]
+                                 if n["id"] != "frame"})
 
     def test_a_recipe_with_depth_one_stage_nodes_keeps_them_off_top(self):
         # Review R2 B1: autopilot-spec's `prd-transaction` (and refine's
@@ -405,8 +502,9 @@ class TopExceptionRoute(unittest.TestCase):
         with self.assertRaises(ValueError) as refused:
             R._profile_input_maps(nodes, demands, {"execute": "top"})
         self.assertEqual(str(refused.exception), "profile-explicit-top-owner-only:execute")
-        with self.assertRaises(ValueError):
-            self.staged(profile_demands=self.owner_demand("predetermined"), explicit_profiles=self.TOP)
+        route = self.staged(profile_demands=self.owner_demand("predetermined"), explicit_profiles=self.TOP)
+        self.assertEqual(route["owner_model_profile"], "top")
+        R.verify_route(route, R.ROOT)
         with self.assertRaisesRegex(ValueError, "profile-explicit-input-invalid:__owner__"):
             R._profile_input_maps(nodes, demands, {"__owner__": "summit"})
 

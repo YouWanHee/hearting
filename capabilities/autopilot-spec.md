@@ -32,6 +32,50 @@ new-intent analysis. Actual code work belongs to autopilot-code, which detects
 
 Adapters may expose this capability through native commands, skill files, prompt instructions, or explicit wrappers. The adapter must report unsupported runtime mechanics instead of silently treating another runtime's native file format as portable.
 
+## Post-Frame Direction Gate
+
+**One gate, raised from the frame legs (SD-123/SD-129).** A `quick+` route seals `human_gates: ["frame-review"]` and both
+`frame` and `frame-alternative` continuations as that human gate, bound at
+`one-shot`'s entry for `quick` and `research`'s entry for `standard+`. `frame-review` is the recipe's only human gate: the old
+`intent-confirmation` declaration is retired, because no node ever raised it
+and no command in the harness could release it — the intent question it named
+is exactly what the frame interview now asks. A route sealed before this cycle
+keeps its own generation's gate name, binding and node shape and is **never
+retro-fitted** — the entry fence in `utilities/dispatch_contract.py` reads
+only the route object it was handed.
+
+Depth-0 launches the frame pair, joins both direction briefs, and builds
+`spec/_internal/research/frame/frame-summary.json` (five fields —
+방향/대안/위험/범위 변경/비용, ≤1KB) plus the **frame interview**
+`spec/_internal/research/frame/interview.json` (SD-129: a one-sentence
+restatement the user confirms, a plain-language brief, and at most
+`frame_interview.py`'s `QUESTION_CAP` short questions — one topic each, 2–4
+options, one recommended, no harness vocabulary, only decisions the user alone
+can make; `utilities/frame_interview.py validate` is the bar and `gate --block`
+refuses what fails it). For this capability the restatement names the product
+intent in the user's own words, which is the claim the PRD is later measured
+against. Depth-0 puts those questions to the user, records the answers with
+`workflow-supervisor.py release --gate frame-review --decision
+proceed|revise|stop --answers <file>`, and renders
+`spec/_internal/research/frame/intent.md` with `frame_interview.py
+render-intent`.
+
+The owner **receives** `intent.md`'s path as an input. It raises no gate,
+waits on no release, and renders no intent of its own — all of that is
+finished before it is launched. `intent.md` is the agreed intent `research`
+reads first, so a PRD requirement that contradicts a recorded decision is a
+`spec-review` blocker; pass its absolute path in the `research` prompt as
+`Intent:`. `revise` re-runs the frame pair before owner launch and `stop`
+cancels the prepared workflow, so neither consumes the owner's retry
+boundary. A `research` start whose entry gate is not released is refused by
+every launch surface (`human-gate-unreleased`). `direct` has no gate: the
+depth-0 session asks its one question of the same kind inline inside the §0.4
+card step — a documented obligation on the acting session, not a
+machine-checked cap, since a `direct` route carries no gate binding. The
+declared `confirmation.mode` (default `hybrid`) governs the ordered pair —
+blocking direction gate first, route notice after; `core/WORKFLOW.md` §0.4
+owns the user-facing card.
+
 ## Artifact Ownership
 
 Use the shared artifact root rule: prefer `.agent_reports/`; use legacy `.claude_reports/` only when it already exists and `.agent_reports/` does not.
@@ -57,9 +101,10 @@ W7C write-cutover contract (`utilities/artifact_producer.py`, registry table
 `producer_lifecycle` in `capabilities/topologies.json`). The same lifecycle
 binds `direct`, `quick`, and `standard+`; only the acting owner differs.
 
-1. **begin before the first write.** After the route is compiled and bound,
-   the owner (the inline session for `direct`, the dispatch-depth-1 owner for
-   `quick` and `standard+`) runs `artifact_producer.py begin --artifact-root
+1. **begin before the first write.** After route compile/bind, depth-0 runs
+   `begin` before either frame leg starts; the later owner inherits that cycle.
+   Without frame, the acting owner (inline for `direct`, depth-1 otherwise)
+   begins the cycle. The command is `artifact_producer.py begin --artifact-root
    <root> --route <route file> --capability autopilot-spec --intensity <intensity>`.
    While the cutover is inactive this returns `legacy-compat` and the legacy
    `<artifact-root>/spec/` layout stays writable; once active it
@@ -74,15 +119,12 @@ binds `direct`, `quick`, and `standard+`; only the acting owner differs.
    `AGENT_ARTIFACT_CAMPAIGN_ID`/`CYCLE_ID`/`PRODUCER_ID`/`CYCLE_DIR`/`OUTPUT_DIR`
    from the owner (dispatch env pass-through) and call `begin --node <id>`
    on the same route, which resumes the owner's open cycle.
-4. **complete → close → finalize → admit-shared.** First complete the terminal
-   node with the verified cycle-local PRD as evidence, then close the route.
-   The marker must not depend on an already-admitted shared revision. The owner runs `artifact_producer.py
-   finalize --artifact-root <root> --cycle <cycle_id>` once the route is
-   closed: it enumerates `artifacts/`, builds and validates the D-6 manifest,
-   commits `manifest.json` (the commit point), applies the index, and seals
-   the cycle record. Empty output leaves no lineage (D-9). `recover` rolls a
-   crashed finalize forward or back from its journal. Never use
-   `--allow-open-route` to bypass an unfinished terminal node.
+4. **terminal evidence before shared admission.** The terminal node uses the
+   verified cycle-local PRD as evidence, independent of any shared revision.
+   For new registered owners the shared completion controller then completes
+   the workflow, closes the route and seals the exact cycle. Inline work and
+   legacy recovery retain explicit complete/close/finalize. Shared admission
+   follows the sealed cycle; it cannot stand in for terminal evidence.
 5. **shared admission.** `spec` output is admitted to `shared/spec/` by `admit-shared --kind spec` after the cycle is sealed (canonical shared kind). A root holds one canonical `spec` reference: a repeat admit without `--reference`/`--key` lands on that single reference (several references without a selector is `shared-reference-ambiguous`); a `--key` that matches none of the existing references is refused (`shared-reference-exists`) and a second reference is only ever created with `--new-reference`.
 
 ## Role Requirements

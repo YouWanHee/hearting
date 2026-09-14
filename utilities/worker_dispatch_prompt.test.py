@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 
 import os
+import json
 import importlib.util
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
+
+import frame_interview as FI
+import workflow_state as WS
+import worker_bootstrap as WB
 
 ROOT = Path(__file__).resolve().parents[1]
 ADAPTERS = {
@@ -133,6 +140,9 @@ class WorkerDispatchPromptTest(unittest.TestCase):
                     **os.environ,
                     "AGENT_HOME": str(ROOT),
                     "AGENT_ARTIFACT_ROOT": str(artifact_root),
+                    "AGENT_ARTIFACT_CYCLE_ID": "cyc-concrete-prompt",
+                    "AGENT_ARTIFACT_CYCLE_DIR": str(artifact_root / "campaigns" / "stream" / "current"),
+                    "AGENT_ARTIFACT_OUTPUT_DIR": "",
                     "OPENCODE_CONFIG_CONTENT": "{}",
                 }
                 env.pop("AGENT_DISPATCH_JOBS", None)
@@ -149,6 +159,8 @@ class WorkerDispatchPromptTest(unittest.TestCase):
                 self.assertIn(f"- assigned_contract: {expected_contract}", prompt)
                 self.assertNotIn("- worker_role:", prompt)
                 self.assertIn("CUSTOM ASSIGNMENT", prompt)
+                self.assertIn("- artifact_cycle_id: cyc-concrete-prompt", prompt)
+                self.assertIn(f"- artifact_output_dir: {artifact_root}/campaigns/stream/current/artifacts", prompt)
                 self.assertIn("artifact: <canonical path | ->", prompt)
                 self.assertIn("verdict: PASS | FAIL | BLOCKED", prompt)
                 self.assertIn("blocker: none | <one line>", prompt)
@@ -165,7 +177,7 @@ class WorkerDispatchPromptTest(unittest.TestCase):
                     self.assertNotIn("- guard_session_id: codex-headless", prompt)
                     self.assertNotIn("codex-headless", prompt)
 
-    def test_route_bound_stage_prompts_name_deterministic_heartbeat_consumer(self):
+    def test_three_adapters_leave_progress_bookkeeping_to_runtime(self):
         for harness, (wrapper, model, _suffix) in ADAPTERS.items():
             with self.subTest(harness=harness):
                 spec=importlib.util.spec_from_file_location(f"dispatch_{harness}",wrapper)
@@ -181,17 +193,151 @@ class WorkerDispatchPromptTest(unittest.TestCase):
                 args.artifact_root="/artifacts"
                 render=module.prompt if harness=="opencode" else module.dispatch_prompt
                 prompt,_=render(args)
-                self.assertIn("Stage progress contract (SD-58)",prompt)
-                self.assertIn("att-promptheartbeat01",prompt)
-                self.assertIn("rt-prompt",prompt)
-                self.assertIn("--phase analysis",prompt)
-                self.assertIn("unchanged phase/evidence pair is not progress",prompt)
-                heartbeat_path=(
-                    ROOT/"utilities/dispatch-progress.py"
-                    if harness=="claude"
-                    else ROOT/f"adapters/{harness}/bin/preflight.sh"
-                )
-                self.assertIn(str(heartbeat_path),prompt)
+                self.assertIn("The runtime observes tool progress",prompt)
+                self.assertIn("No per-tool heartbeat command is required",prompt)
+                self.assertNotIn("--phase analysis",prompt)
+                self.assertNotIn("Stage progress contract",prompt)
+                self.assertIn("TASK",prompt)
+
+
+class FrameAssignmentPromptTest(unittest.TestCase):
+    def test_real_adapter_prompts_distinguish_goal_report_from_current_frame_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            route = root / "route.json"
+            route.write_text(json.dumps({"nodes":[{"id":"frame-alternative",
+                "outputs":["shards/frame-alternative/direction-brief.md"]}]}))
+            for harness, (wrapper, model, _) in ADAPTERS.items():
+                with self.subTest(harness=harness), mock.patch.dict(os.environ,
+                        {"AGENT_ARTIFACT_OUTPUT_DIR":str(root / "artifacts")}):
+                    spec = importlib.util.spec_from_file_location("frame_assignment_"+harness, wrapper)
+                    module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+                    args = module.parser().parse_args(["--worktree",str(root),"--slug","frame-task",
+                        "--capability","autopilot-code","--capability-mode","dev","--worker-mode","plan/frame",
+                        "--worker-type","frame","--unit","plan/frame","--intensity","standard",
+                        "--dispatch-depth","1","--prompt-text","Write the final task results to final_report.md.",*model])
+                    args.artifact_root=str(root);args.route_file=str(route);args.route_node="frame-alternative"
+                    args.route_id="rt-frame"
+                    render=module.prompt if harness=="opencode" else module.dispatch_prompt
+                    text,_=render(args)
+                    self.assertIn("User goal to analyze (the later owner's task)",text)
+                    self.assertIn("final_report.md",text)
+                    self.assertIn(str(root / "artifacts/shards/frame-alternative/direction-brief.md"),text)
+                    self.assertNotIn("Assignment:\nWrite the final task results",text)
+                    self.assertIn("only its own declared brief",text)
+                    self.assertEqual(args.assigned_contract,"plan/frame")
+                    self.assertIn("frame unit contract is already included",text)
+                    self.assertNotIn("Read only the assigned autopilot-code",text)
+                    self.assertNotIn("Read only the exposed autopilot-code",text)
+                    self.assertNotIn("skills/autopilot-code/SKILL.md",text)
+
+    def test_legacy_frame_keeps_its_callers_path_and_nonframe_assignment_is_unchanged(self):
+        frame=WB.assignment_prompt(SimpleNamespace(worker_type="frame"),"Analyze this work; output /tmp/brief.md",{})
+        self.assertIn("/tmp/brief.md",frame)
+        for kind in ("owner","stage","review","support"):
+            self.assertEqual(WB.assignment_prompt(SimpleNamespace(worker_type=kind),"TASK",{}),"Assignment:\nTASK\n\n")
+
+
+class ReleasedTaskPromptTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.jobs = self.root / "canonical" / "jobs.log"
+        self.jobs.parent.mkdir()
+        self.jobs.touch()
+        self.route_id = "rt-released-context"
+        self.interview = self.root / "issued-cycle" / "interview.json"
+        self.interview.parent.mkdir()
+        self.value = {
+            "schema": FI.SCHEMA, "route_id": self.route_id, "round": 1,
+            "understanding": "Run only sum([1,2]) and record the observed result.",
+            "brief": {"constraints": "No source edits or repository audit."},
+            "questions": [{"id": "record-failure", "topic": "Evidence",
+                "question": "Which observations should be recorded?",
+                "options": [{"label": "Both", "means": "Record the alias failure and python3 success."},
+                            {"label": "Success", "means": "Record the successful command."}],
+                "recommended": 0}],
+        }
+        self.interview.write_text(json.dumps(self.value))
+        self.answers = FI.answers_template(self.value)
+        self.answers["understanding_confirmed"] = True
+        self.answers["answers"]["record-failure"] = {"choice": 0, "note": "Keep the failure."}
+        self.ledger = WS.WorkflowLedger(self.route_id, jobs=self.jobs)
+        self.ledger.root.mkdir(parents=True)
+        self.raised = {"at": "2026-09-11T11:00:00Z", "workflow_state": "BLOCKED_HUMAN_GATE",
+            "evidence": {"gate": "frame-review", "artifact": str(self.interview),
+                         "interview": True, "questions": 1}}
+        self.released = {"at": "2026-09-11T11:01:00Z", "workflow_state": "READY",
+            "evidence": {"released_gate": "frame-review", "decision": "proceed",
+                         "answers": self.answers}}
+        self.write_journal(self.raised, self.released)
+
+    def write_journal(self, *entries):
+        self.ledger.journal_path.write_text("".join(json.dumps(e) + "\n" for e in entries))
+
+    def args(self, **overrides):
+        return SimpleNamespace(**{"worker_type": "stage", "route_id": self.route_id,
+                                  "jobs": self.jobs, **overrides})
+
+    def test_no_plan_stage_or_intent_copy_needed_in_all_three_adapters(self):
+        for harness, (wrapper, model, _suffix) in ADAPTERS.items():
+            spec = importlib.util.spec_from_file_location("context_" + harness, wrapper)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            for worker_type, unit, depth in (("owner", "_kernel/owner", "1"),
+                                             ("stage", "qa/test", "2"),
+                                             ("review", "qa/code-review", "2")):
+                with self.subTest(harness=harness, worker_type=worker_type):
+                    args = module.parser().parse_args([
+                        "--worktree", str(self.root), "--slug", "context", "--capability", "autopilot-code",
+                        "--capability-mode", "dev", "--intensity", "standard", "--dispatch-depth", depth,
+                        "--worker-type", worker_type, "--unit", unit, "--jobs", str(self.jobs), *model])
+                    args.attempt_id = "att-context"
+                    args.route_id = None if worker_type == "owner" else self.route_id
+                    if worker_type == "owner":
+                        args.owner_route_binding = SimpleNamespace(route_id=self.route_id, route_file="/issued/route.json")
+                    args.artifact_root = str(self.root)
+                    render = module.prompt if harness == "opencode" else module.dispatch_prompt
+                    for custom in (None, "Run the assigned stage with this extra detail."):
+                        args.prompt_text = custom
+                        # A different ambient cycle must never supply the task.
+                        with mock.patch.dict(os.environ, {"AGENT_ARTIFACT_OUTPUT_DIR": "/wrong-cycle/artifacts"}):
+                            prompt, _ = render(args)
+                        self.assertIn("Run only sum([1,2])", prompt)
+                        self.assertIn("Record the alias failure and python3 success.", prompt)
+                        self.assertIn("record-failure", prompt)
+                        self.assertIn("No source edits or repository audit.", prompt)
+                        if custom:
+                            self.assertIn(custom, prompt)
+                        self.assertFalse((self.interview.parent / "intent.md").exists())
+
+    def test_latest_raise_drops_old_answers_and_frame_remains_independent(self):
+        self.assertEqual(WB.released_task_prompt(self.args(worker_type="frame")), "")
+        self.write_journal(self.raised, self.released, self.raised)
+        self.assertEqual(WB.released_task_prompt(self.args()), "")
+        self.write_journal(self.raised)
+        self.assertEqual(WB.released_task_prompt(self.args()), "")
+
+    def test_legacy_route_does_not_inherit_another_routes_context(self):
+        self.assertEqual(WB.released_task_prompt(self.args(route_id="rt-unrelated")), "")
+        self.assertEqual(WB.released_task_prompt(self.args(route_id=None)), "")
+        fresh_jobs = self.root / "fresh-preview" / "jobs.log"
+        self.assertEqual(WB.released_task_prompt(self.args(jobs=fresh_jobs)), "")
+        self.assertFalse(fresh_jobs.parent.exists())
+
+    def test_missing_or_foreign_input_returns_the_exact_recovery_path(self):
+        self.interview.unlink()
+        with self.assertRaisesRegex(ValueError, "Restore the recorded interview"):
+            WB.released_task_prompt(self.args())
+        self.interview.write_text(json.dumps({**self.value, "route_id": "rt-other"}))
+        with self.assertRaisesRegex(ValueError, "different route"):
+            WB.released_task_prompt(self.args())
+        self.interview.write_text(json.dumps(self.value))
+        self.released["evidence"]["answers"] = {**self.answers, "route_id": "rt-other"}
+        self.write_journal(self.raised, self.released)
+        with self.assertRaisesRegex(ValueError, "route_id"):
+            WB.released_task_prompt(self.args())
 
 
 if __name__ == "__main__":

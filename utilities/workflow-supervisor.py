@@ -273,13 +273,13 @@ def artifact_evidence(armed):
 # completion markers
 # --------------------------------------------------------------------------------
 
-def terminal_gate_state(route):
+def terminal_gate_state(route, jobs=None):
     """Report, per terminal node, whether its completion gate is actually proven.
 
     Delegates to the shared `capability-route.py` seam so `status`/`complete` here and
     `close`'s outcome sidecar always agree on gate truth from the same evidence.
     """
-    return route_module().terminal_gate_observation(route)
+    return route_module().terminal_gate_observation(route, jobs=jobs)
 
 
 # --------------------------------------------------------------------------------
@@ -571,6 +571,8 @@ def cmd_gate(args):
             released_by = resolved_released_by(actor_kind, args.by)
             resolution = WS.human_gate_resolution(ledger.journal(), args.gate)
             assert_release_authority(actor_kind, resolution, gates[args.gate], args.gate)
+            if any(args.gate in n.get("inline_human_gates", []) for n in route.get("nodes", [])):
+                WS.require_gate_artifact_current(resolution)
             if resolution["interview"]:
                 # The legacy surface has no --answers, and an interview gate
                 # released without them is the guess the interview replaces
@@ -636,6 +638,11 @@ def cmd_gate(args):
             # the journal.
             args.artifact = str(Path(str(args.artifact)).expanduser().resolve(strict=False))
             interview = load_interview_artifact(args.artifact)
+            if (args.gate == "frame-review"
+                    and any(n.get("worker_type") == "frame" and n.get("dispatch_depth") == 1
+                            for n in route.get("nodes", []))
+                    and interview is None):
+                raise SupervisorError("frame-interview-required: bootstrap confirmation requires an interview and the person's answers")
             if interview is not None:
                 # SD-129: an interview is refused BEFORE it reaches a person when
                 # a tired reader could not answer it -- the validator is the
@@ -653,6 +660,21 @@ def cmd_gate(args):
                         f"interview-route-mismatch: {interview.get('route_id')!r} is not this route")
             release_authority = gate_release_authority_at_raise(
                 gates[args.gate], interview, args.artifact)
+            if args.gate == "frame-review" and any(n.get("worker_type") == "frame" for n in route.get("nodes", [])):
+                release_authority = "depth-0"
+            inline_gate = any(args.gate in n.get("inline_human_gates", []) for n in route.get("nodes", []))
+            if inline_gate:
+                if not Path(args.artifact).is_file():
+                    raise SupervisorError("inline-gate-preview-unreadable")
+                preview_digest = hashlib.sha256(Path(args.artifact).read_bytes()).hexdigest()
+            current_state = ledger.state()["workflow_state"]
+            revised = (current_state == "FAILED_RETRYABLE"
+                       and WS.human_gate_resolution(ledger.journal(), args.gate)["status"] == "revise")
+            # Re-enter an explicitly revised gate through the existing retry
+            # state path. Validate both hops before creating a delivery record.
+            if revised:
+                WS.assert_transition(current_state, "READY")
+            WS.assert_transition("READY" if revised else current_state, "BLOCKED_HUMAN_GATE")
             record_path, created = create_gate_delivery(
                 route, args.gate, args.artifact, jobs_path, epoch,
                 route_path=args.route, release_authority=release_authority,
@@ -660,6 +682,8 @@ def cmd_gate(args):
                 questions=len(interview.get("questions") or []) if interview is not None else 0,
             )
             try:
+                if revised:
+                    ledger.set_workflow_state("READY", evidence={"retry_gate": args.gate}, actor="gate")
                 # `artifact` rides in the journal so every later reader -- the
                 # owner's await-release, the launch fence, a release that
                 # validates interview answers -- finds the reviewable path
@@ -672,7 +696,8 @@ def cmd_gate(args):
                                                     "interview": interview is not None,
                                                     "questions": len(interview.get("questions") or [])
                                                     if interview is not None else 0,
-                                                    "release_authority": release_authority},
+                                                    "release_authority": release_authority,
+                                                    **({"artifact_sha256": preview_digest} if inline_gate else {})},
                                           actor="gate")
             except BaseException:
                 if created:
@@ -741,12 +766,27 @@ def _owner_row(rows, route_id):
             meta = row["meta"]
             if meta.get("attempt_id") != attempt_id:
                 continue
+            # N3, second door: this shortcut identifies the CALLER, and a frame
+            # leg can be the caller. Excluding frame legs only from the depth
+            # walk below would leave the same wrong answer reachable here --
+            # a frame leg asking who owns the gate would be told "you do".
+            # A frame leg is never the gate recipient, by either route in.
+            if meta.get("worker_type") == "frame":
+                break
             if route_id in (meta.get("owner_route_id"), meta.get("route_id")):
                 return row
             break
     for row in reversed(rows):
         meta = row["meta"]
         if meta.get("dispatch_depth") != "1":
+            continue
+        # N3: depth 1 is no longer a synonym for "the owner". A route's frame
+        # legs register at depth 1 too, and this walk returns the most RECENTLY
+        # registered match -- so without this skip the direction-confirmation
+        # gate is handed to a frame leg (a headless worker that cannot answer
+        # it) instead of the session that opened the route, and the gate never
+        # reaches the user. Registration ORDER must not decide the recipient.
+        if meta.get("worker_type") == "frame":
             continue
         if route_id in (meta.get("owner_route_id"), meta.get("route_id")):
             return row
@@ -810,6 +850,13 @@ def existing_gate_delivery(route, gate, jobs):
     """
     ledger = ledger_for(route, jobs)
     epoch = max(gate_raise_epoch(ledger, gate) - 1, 0)
+    for entry in reversed(ledger.journal()):
+        evidence = entry.get("evidence") or {}
+        if entry.get("workflow_state") == "BLOCKED_HUMAN_GATE" and evidence.get("gate") == gate:
+            recorded = evidence.get("delivery")
+            if recorded and Path(recorded).is_file():
+                return {"delivery": recorded, "delivery_created": False}
+            break
     try:
         jobs_path = Path(jobs) if jobs else default_jobs_path()
         recipient_key, _kind, attempt_id, _harness = gate_recipient(route, jobs_path)
@@ -898,6 +945,81 @@ def gate_receipt(*, attempt_id, jobs_path, gate, artifact, harness):
     }
 
 
+def create_local_frame_gate_delivery(route, gate, artifact, jobs_path, epoch, *, route_path,
+                                     release_authority, interview, questions):
+    """A frame interview belongs to the already interactive parent, before any owner.
+
+    Keep a durable local handback record. No fake owner or asynchronous receipt is
+    issued: the raising depth-0 session displays this command's artifact/questions.
+    """
+    if gate != "frame-review" or _owner_row(_registry_rows(jobs_path), route["route_id"]) is not None:
+        return None
+    frames = [n for n in route.get("nodes", []) if n.get("worker_type") == "frame"
+              and n.get("dispatch_depth") == 1]
+    if {n.get("id") for n in frames} != {"frame", "frame-alternative"}:
+        return None
+    if release_actor_kind() == "headless-owner" or os.environ.get("AGENT_DISPATCH_ATTEMPT_ID"):
+        raise SupervisorError("frame-gate-depth0-required")
+    from dispatch_parent_completion import interactive_parent_identity
+    try:
+        parent_harness, session = interactive_parent_identity()
+    except ValueError as exc:
+        raise SupervisorError(str(exc)) from exc
+    if not session:
+        raise SupervisorError("frame-gate-parent-identity-missing")
+    bindings = [b for b in route.get("human_gate_bindings", []) if b.get("gate") == gate]
+    if len(bindings) != 1:
+        raise SupervisorError("frame-gate-binding-invalid")
+    from dispatch_contract import completion_marker_gate, dispatch_state_roots, parse_registry_metadata
+    import dispatch_contract as contract
+    rows = Path(jobs_path).read_text().splitlines()
+    try:
+        completion_marker_gate(str(route_path), bindings[0]["node"], "start", ROOT,
+                               Path(jobs_path), registry_lines=rows, _raising_frame_gate=True)
+    except contract.DispatchContractError as exc:
+        raise SupervisorError(f"frame-gate-not-ready: {exc.reason}: {exc.detail}") from exc
+    attempts = []
+    for frame in frames:
+        candidates = [root / "completion" / route["route_id"] / (frame["id"] + ".json")
+                      for root in dispatch_state_roots(ROOT, Path(jobs_path))]
+        marker_path = next(path for path in candidates if path.is_file())
+        attempt = json.loads(marker_path.read_text())["attempt_id"]
+        metadata = [parse_registry_metadata(line.split("\t")[5]) for line in rows
+                    if len(line.split("\t")) == 6
+                    and parse_registry_metadata(line.split("\t")[5]).get("attempt_id") == attempt]
+        if len(metadata) != 1 or metadata[0].get("parent_sid") != session:
+            raise SupervisorError("frame-gate-parent-binding-mismatch")
+        attempts.append(attempt)
+    if parent_harness == "codex":
+        control = os.environ.get("AGENT_CODEX_MANAGED_CONTROL_SOCKET")
+        if not control:
+            raise SupervisorError("frame-gate-managed-parent-required")
+        try:
+            HUMAN_GATE.probe_consumer(Path(control), expected_thread_id=session)
+        except HUMAN_GATE.HumanGateReceiptError as exc:
+            raise SupervisorError(f"frame-gate-parent-unavailable: {exc}") from exc
+    artifact_path = Path(artifact)
+    if not artifact_path.is_absolute() or not artifact_path.is_file():
+        raise SupervisorError("frame-gate-artifact-unreadable")
+    ledger = ledger_for(route, jobs_path)
+    path = ledger.root / "local-frame-gates" / f"raise-{epoch + 1}.json"
+    record = {"schema_version": 1, "kind": "interactive-frame-handback", "state": "pending",
+              "route_id": route["route_id"], "route_hash": route.get("route_hash"),
+              "gate": gate, "epoch": epoch + 1, "recipient_session": session,
+              "attempt_ids": attempts, "artifact": str(artifact), "interview": interview,
+              "questions": questions, "release_authority": "depth-0"}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        if json.loads(path.read_text()) != record:
+            raise SupervisorError("frame-gate-record-conflict")
+        return path, False
+    with path.open("x", encoding="utf-8") as stream:
+        json.dump(record, stream, sort_keys=True)
+        stream.flush()
+        os.fsync(stream.fileno())
+    return path, True
+
+
 def create_gate_delivery(
     route, gate, artifact, jobs_path, epoch, *, route_path,
     release_authority, interview, questions,
@@ -908,6 +1030,11 @@ def create_gate_delivery(
     the caller must not take the transition if this fails, so a gate never exists
     without a way to reach a person.
     """
+    local = create_local_frame_gate_delivery(
+        route, gate, artifact, jobs_path, epoch, route_path=route_path,
+        release_authority=release_authority, interview=interview, questions=questions)
+    if local is not None:
+        return local
     recipient_key, recipient_kind, attempt_id, harness = gate_recipient(route, jobs_path)
     delivery_id = gate_delivery_id(
         recipient_key, route["route_id"], gate, attempt_id, epoch
@@ -1066,6 +1193,8 @@ def gate_release_authority_at_raise(binding, interview, artifact):
     allowance for a headless owner to release a plain, non-interview gate
     rather than die at it after 53 minutes stays as it was.
     """
+    if (binding or {}).get("gate") == "preview-disposition":
+        return "depth-0"  # Applying an edit always requires the person's decision.
     declared = str((binding or {}).get("release_authority") or "").strip()
     if declared:
         if declared not in RELEASE_AUTHORITIES:
@@ -1109,6 +1238,8 @@ def assert_release_authority(actor_kind, resolution, binding, gate):
     """
     if actor_kind != "headless-owner":
         return
+    if gate == "preview-disposition":
+        raise SupervisorError("gate-release-authority-refused: preview-disposition requires the person's decision")
     authority = str((resolution or {}).get("release_authority") or "").strip()
     if not authority and (resolution or {}).get("interview"):
         # A raise that predates the field but recorded an interview: the
@@ -1136,6 +1267,22 @@ def retire_gate_delivery(route, gate, jobs):
     """
     try:
         jobs_path = Path(jobs) if jobs else default_jobs_path()
+        ledger = ledger_for(route, jobs)
+        for entry in reversed(ledger.journal()):
+            evidence = entry.get("evidence") or {}
+            if entry.get("workflow_state") != "BLOCKED_HUMAN_GATE" or evidence.get("gate") != gate:
+                continue
+            path = Path(evidence.get("delivery") or "/missing")
+            if path.parent != ledger.root / "local-frame-gates":
+                break
+            record = json.loads(path.read_text())
+            if record.get("kind") != "interactive-frame-handback" or record.get("route_id") != route["route_id"]:
+                break
+            record["state"] = "acked"
+            temporary = path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(record, sort_keys=True))
+            os.replace(temporary, path)
+            return "acked"
         recipient_key, _kind, attempt_id, _harness = gate_recipient(route, jobs_path)
         root = Path(jobs_path).resolve(strict=False).parent
         # Inside the try as well: the release transition and its sidecar row are
@@ -1157,15 +1304,6 @@ def retire_gate_delivery(route, gate, jobs):
                 continue
             if record.get("state") not in {"claimed", "sent-ambiguous"}:
                 # `pending`: nobody holds it, so take the ordinary claim path.
-                if (record.get("attempts") or 0) >= PENDING.RECLAIM_LIMIT:
-                    # `claim` refuses a record whose reclaim budget is spent, so
-                    # ack can never reach it; the release still supersedes it
-                    # (review round 2, N3) -- expire it under the declared actor
-                    # rather than leave it `pending` forever.
-                    PENDING.expire_if_due(root, recipient_key, delivery_id,
-                                          actor=PENDING.EXPIRY_ACTOR,
-                                          reason="receipt-row-superseded")
-                    return "expired"
                 PENDING.claim(root, recipient_key, delivery_id,
                               claim_owner=f"gate-release:{os.getpid()}",
                               lease_seconds=60.0, require_generation_proof=False)
@@ -1269,7 +1407,7 @@ def _gate_predecessor_node(route, gate_name):
     `node`/`position`, which name where the gate blocks *entry*."""
     for node in route.get("nodes", []) or []:
         continuation = node.get("continuation") or {}
-        if continuation.get("kind") == "human-gate" and continuation.get("gate") == gate_name:
+        if WS.node_raises_human_gate(node, gate_name):
             return node
     return None
 
@@ -1306,6 +1444,9 @@ def cmd_release(args):
         assert_release_authority(
             actor_kind, WS.human_gate_resolution(ledger.journal(), args.gate),
             gates[args.gate], args.gate)
+        inline_gate = args.gate in predecessor.get("inline_human_gates", [])
+        if inline_gate and args.decision == "proceed":
+            WS.require_gate_artifact_current(WS.human_gate_resolution(ledger.journal(), args.gate))
         answers = release_answers(ledger, args.gate, args.decision, getattr(args, "answers", None))
         if args.decision == "proceed":
             ledger.set_workflow_state(
@@ -1346,14 +1487,15 @@ def cmd_release(args):
                           "answers": answers},
                 actor="release",
             )
-            ledger.set_workflow_state(
-                "FAILED_RETRYABLE",
-                evidence={"gate": args.gate, "released_by": actor,
-                          "retry_boundary": "frame", "next_stage": "code-refine"},
-                actor="release",
-            )
+            if not inline_gate:
+                ledger.set_workflow_state(
+                    "FAILED_RETRYABLE",
+                    evidence={"gate": args.gate, "released_by": actor,
+                              "retry_boundary": "frame", "next_stage": "code-refine"},
+                    actor="release",
+                )
             payload = {"gate": args.gate, "decision": "revise", "node": node_id,
-                      "retry_boundary": "frame",
+                      "retry_boundary": "preview" if inline_gate else "frame",
                       "workflow_state": ledger.state()["workflow_state"]}
         elif args.decision == "stop":
             ledger.set_workflow_state(
@@ -1627,7 +1769,7 @@ def cmd_status(args):
     state = ledger.state()
     armed = read_armed(ledger)
     terminal_nodes = WS.route_terminal_nodes(route)
-    gates = terminal_gate_state(route)
+    gates = terminal_gate_state(route, getattr(args, "jobs", None))
     node_states = state["nodes"]
     failed = {node: row for node, row in node_states.items()
               if str(row.get("state", "")).startswith("FAILED")}
@@ -1688,25 +1830,19 @@ def cmd_complete(args):
     terminal_nodes = WS.route_terminal_nodes(route)
     if not terminal_nodes:
         raise SupervisorError("route declares no terminal node")
-    gates = terminal_gate_state(route)
-    unproven = {node: row for node, row in gates.items() if not row["passed"]}
     with ledger.lock():
         state = ledger.state()
+        gates = terminal_gate_state(route, getattr(args, "jobs", None))
+        unproven = {node: row for node, row in gates.items() if row.get("passed") is not True}
+        unproven.update({node: {"passed": False, "reason": "missing-terminal-gate"}
+                         for node in terminal_nodes if node not in gates})
         if unproven:
             print(json.dumps({"complete": False, "reason": "terminal-gate-unproven",
                               **ledger_metadata(getattr(args, "jobs", None), ledger),
                               "unproven": unproven,
                               "workflow_state": state["workflow_state"]}, sort_keys=True))
             return 3
-        for node in terminal_nodes:
-            if state["nodes"].get(node, {}).get("state") != "STAGE_SUCCEEDED":
-                ledger.record(node, "STAGE_SUCCEEDED",
-                              evidence={"terminal_gate": gates[node]}, actor="complete")
-        if ledger.state()["workflow_state"] != "TERMINAL_VERIFY":
-            ledger.set_workflow_state("TERMINAL_VERIFY", evidence={"terminal_gates": gates},
-                                      actor="complete")
-        ledger.set_workflow_state("COMPLETE", evidence={"terminal_gates": gates},
-                                  actor="complete")
+        ledger.complete(terminal_nodes, gates)
     print(json.dumps({"complete": True, **ledger_metadata(getattr(args, "jobs", None), ledger),
                       "terminal_nodes": terminal_nodes,
                       "workflow_state": ledger.state()["workflow_state"]}, sort_keys=True))

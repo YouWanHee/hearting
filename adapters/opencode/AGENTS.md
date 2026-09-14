@@ -9,7 +9,9 @@ Edit portable sources first.
 
 ## Source Order
 
-Read `core/CORE.md` first; load the remaining documents only when the task
+Resolve all paths below against active `AGENT_HOME` (shared `utilities/agent-home.sh`
+fallback), including explicitly activated source checkouts; never guess another
+checkout from cwd or previous tasks. Read `core/CORE.md` first; load remaining documents only when the task
 touches the named domain.
 
 1. `core/CORE.md`
@@ -70,6 +72,12 @@ partial. OpenCode native UI/config owns model and context fields.
 
 ## Dispatch
 
+For ordinary execution use `preflight.sh compose --start --prompt-file <task>`.
+Runtime prepares the cycle, starts declared frames and reuses exact attempts.
+Follow `parent_next`; reuse `resume_command` after wakes or corrections. At
+`needs-question`, compare the completed frames and ask the native interview.
+Actual release precedes owner execution; runtime closes route/cycle before success.
+
 Route by `core/WORKFLOW.md §0.2`: precedence names the capability that owns
 the artifacts; §0.2.1 then picks the work **shape** before any preset.
 `direct`/`solo`/`staged` go through `preflight.sh compose` (portable
@@ -103,6 +111,45 @@ Dispatch contract v3 atomically claims one stable
 attempt row before spawn and starts no child for a duplicate claim. Broker v1/v2
 routes are read-only migration inputs; the retired broker exposes only legacy
 `status`/`stop`.
+
+A depth-0 frame leg has no `preflight.sh` subcommand here; call the portable
+selector directly, one Bash call per leg: `python3
+"$AGENT_HOME/utilities/dispatch-owner.py" --adapter <harness> --start
+--route-evidence <route.json> --route-node frame|frame-alternative
+--dispatch-depth 1 --worker-type frame --unit plan/frame --prompt-file
+<shard>/prompt.txt`. Never two legs in one call: one waiter arms per call, so
+the second leg's direction question would otherwise silently never reach the
+user. Export `AGENT_ARTIFACT_ROOT`, `AGENT_ARTIFACT_CAMPAIGN_ID`,
+`AGENT_ARTIFACT_CYCLE_ID` and `AGENT_ARTIFACT_CYCLE_DIR` before every launch
+call, never a subset, or both briefs land in an unrelated, possibly closed,
+campaign/cycle directory.
+
+**OpenCode has no automatic wake carrier, and this is not carrier parity with
+Claude.** An OpenCode depth-0 parent joins its frame legs by an *explicit
+bounded wait*: each leg's receipt reads `parent_next=bounded-wait`, and you run
+that leg's printed `parent_next_command` exactly once — once per leg, two legs,
+two waits. Nothing wakes this session on its own. Do not describe or rely on a
+Claude-style carrier here; that gap is a deliberate scope boundary, not a
+defect to work around.
+
+A frame node declares no `fallback_hops` — an unavailable (not merely late)
+harness means depth-0 explicitly re-launches that one leg on another sealed
+candidate harness and records that it did so. A `top` anchor refused with a
+rate-limit-shaped typed refusal, or exiting early with zero artifacts, is
+re-launched at `deep` exactly once, never attempting `top` again, with
+`frame_profile_degraded=top→deep` recorded in both the route/attempt record
+and the user-facing card or notice; decide that from the observed launch
+outcome, never from a usage query.
+
+Depth-0 always waits for both legs; past the hard limit it stops and asks, and
+no path proceeds on one leg. Two differing direction verdicts go side by side
+and nothing downstream starts until the user picks one. The one-sentence
+restatement gets an explicit yes/no even when the interview carries zero
+questions, recorded in `understanding_confirmed`. Then
+`workflow-supervisor.py release --route <route> --gate frame-review --decision
+proceed --answers <file>` — the one machine event that authorizes the owner's
+launch — and the owner is launched with `intent.md`'s absolute path in its
+prompt as `Intent:`. `core/OPERATIONS.md §5.10b` is the contract.
 
 `standard+` uses a dispatch-depth-1 capability owner and separable dispatch-depth-2
 `code-plan -> code-execute -> code-test -> code-report` workers. `direct` is

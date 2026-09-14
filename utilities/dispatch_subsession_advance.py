@@ -571,6 +571,8 @@ def coordinate_chain_advance_from_joined_rows(
     if predecessor_row is None:
         return None
     metadata = predecessor_row.metadata
+    if DC.terminal_conflict_pending(metadata):
+        return None
     if predecessor_row.status not in TERMINAL_STATUSES:
         return None
 
@@ -661,6 +663,8 @@ def advance_chain_step(jobs: Path, parent_attempt_id: str, joined: dict) -> Chai
         return ChainAdvanceStep("not-chain")
     metadata = predecessor.metadata
     chain_id = metadata.get("session_chain_id", "")
+    if DC.terminal_conflict_pending(metadata):
+        return ChainAdvanceStep("unavailable", chain_id=chain_id, reason="terminal-evidence-conflict")
     try:
         predecessor_index = int(metadata.get("subsession_index", "0"))
     except ValueError:
@@ -699,6 +703,10 @@ def advance_chain_step(jobs: Path, parent_attempt_id: str, joined: dict) -> Chai
     except (OSError, ValueError):
         record = None
     reason = (record or {}).get("reason", "")
+    if reason == "terminal-evidence-conflict":
+        # An evidence review pauses this chain; it does not cancel unopened
+        # slices or discard the owner that will resume after the disposition.
+        return ChainAdvanceStep("unavailable", chain_id=chain_id, reason=reason)
     if reason:
         return ChainAdvanceStep("refused", chain_id=chain_id, predecessor_index=predecessor_index,
                                 successor_index=successor_index, reason=reason,
@@ -735,6 +743,7 @@ def drive_serial_chain(
     reconcile: Callable[[dict, set[str]], bool], max_reparks: int,
     on_timeout: Callable[[set[str]], None] | None = None,
     on_advance: Callable[[str, frozenset[str]], None] | None = None,
+    allow_advance: Callable[[], bool] | None = None,
     emit: Callable[[dict], None] | None = None,
 ) -> ChainDriveResult:
     """Run every serial successor at one non-model supervisor checkpoint."""
@@ -770,6 +779,8 @@ def drive_serial_chain(
             receipt = join(set(attempts))
             joined_rows = refresh(set(attempts))
             joined = {row.attempt_id: row for row in joined_rows}
+        if allow_advance is not None and not allow_advance():
+            break
         step = advance_chain_step(jobs, parent_attempt_id, joined)
         if step.outcome != "advanced":
             refusal = step if step.outcome == "refused" else None
@@ -794,15 +805,10 @@ def drive_serial_chain(
         attempts = {step.attempt_id}  # type: ignore[arg-type]
         traversed.add(step.attempt_id or "")
         last = step.attempt_id
-        reparks = 0
-        receipt = join(set(attempts))
-        while receipt.get("state") == "timeout":
-            reparks += 1
-            if reparks > max_reparks:
-                raise ChainDriveError("join-timeout-repark-exceeded")
-            if on_timeout:
-                on_timeout(set(attempts))
-            receipt = join(set(attempts))
+        from dispatch_supervision import wait_for_batch
+        receipt = wait_for_batch(join=join, attempts=set(attempts), jobs=jobs,
+                                 parent_attempt_id=parent_attempt_id, emit=emit,
+                                 on_timeout=on_timeout)
         joined_rows = refresh(set(attempts))
         joined = {row.attempt_id: row for row in joined_rows}
     if sibling_attempts:

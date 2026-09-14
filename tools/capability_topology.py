@@ -395,7 +395,7 @@ def _unit_frontmatter(unit):
         raise TopologyError(f"unit {unit}: frontmatter unit id mismatch ({fields['unit']!r})")
     if not fields["role"]:
         raise TopologyError(f"unit {unit}: frontmatter role required")
-    if fields["worker_type"] not in ("owner", "stage", "review", "support"):
+    if fields["worker_type"] not in ("owner", "stage", "review", "support", "frame"):
         raise TopologyError(f"unit {unit}: invalid worker_type {fields['worker_type']!r}")
     if fields["read_only"] not in ("true", "false"):
         raise TopologyError(f"unit {unit}: read_only must be true or false")
@@ -506,7 +506,6 @@ def _validate_gate_contracts(recipe, registry):
     # same three facts off the recipe, and
     # `capability_topology.test.py` pins the two to agree on every realized group.
     nodes_by_id = {node.get("id"): node for node in recipe["standard_plus"].get("nodes", [])}
-    expected_arbiter_gates = set()
     for group in recipe["standard_plus"].get("parallel_groups", []):
         if not any(leg.get("leg_class") == "auxiliary" for leg in group.get("legs", [])):
             continue
@@ -531,32 +530,15 @@ def _validate_gate_contracts(recipe, registry):
                 f"consumer, found {len(consumers)}"
             )
         gate = consumers[0].get("completion_gate")
-        expected_arbiter_gates.add(gate)
         entry = contracts.get(gate)
         if not isinstance(entry, dict) or entry.get("auxiliary_arbiter") is not True:
             raise TopologyError(
                 f"{recipe['capability']}: auxiliary group {group.get('id')} arbiter gate "
                 f"{gate} must declare auxiliary_arbiter"
             )
-    for gate in sorted(
-        gate for gate, entry in contracts.items()
-        if isinstance(entry, dict) and entry.get("auxiliary_arbiter") is True
-    ):
-        owner = nodes_by_id.get(
-            next(
-                (
-                    node.get("id") for node in recipe["standard_plus"].get("nodes", [])
-                    if node.get("completion_gate") == gate
-                ),
-                None,
-            )
-        )
-        if owner is None or gate in expected_arbiter_gates:
-            continue
-        raise TopologyError(
-            f"{recipe['capability']}: gate {gate} declares auxiliary_arbiter but "
-            "arbitrates no auxiliary-bearing group in this recipe"
-        )
+    # `auxiliary_arbiter` is a gate's ability to consume auxiliary findings.
+    # Only a selected auxiliary group creates that obligation. Reusing the
+    # review unit on a smaller graph does not require its preset's producers.
 
 
 def _validate_activation_conditions(registry):
@@ -822,6 +804,10 @@ def _validate_recipe(recipe, registry, standard_plus_owner_profile):
             f"{recipe['capability']}:quick: model_profile must match "
             f"owner_profile_by_intensity.quick ({quick_owner_profile})"
         )
+    inline_gates = quick.get("inline_human_gates", [])
+    expected_inline = ["preview-disposition"] if recipe["capability"] == "autopilot-refine" else []
+    if inline_gates != expected_inline:
+        raise TopologyError(f"{recipe['capability']}: quick inline human gates differ from the apply contract")
     for scope in quick.get("write_scope", []): _scope_root(scope)
     _validate_guard_scope(recipe, quick.get("write_scope", []), quick.get("guard_preconditions", []), registry, "quick")
     _validate_bucket_anchor(recipe, registry, quick.get("write_scope", []), None, "quick")

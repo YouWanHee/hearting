@@ -37,6 +37,13 @@ another adapter.
 
 ## Routing and Execution
 
+For ordinary execution use `capability-route.py compose --start --prompt-file
+<task>` through active `AGENT_HOME`. Runtime prepares the cycle, starts declared
+frames and reuses exact attempts. Follow `parent_next`; reuse `resume_command`
+after wakes or corrections. At `needs-question`, compare completed frames and
+ask the native interview. Actual release precedes owner execution; runtime
+closes route/cycle before success. The commands below remain low-level interfaces.
+
 Route by `core/WORKFLOW.md §0.2`: the semantic precedence names the
 capability that owns the artifacts; §0.2.1 then picks the **shape** of the
 work before any preset. `direct`, `solo`, and `staged` go through
@@ -66,7 +73,11 @@ Receipts state the next action; you do not carry the delivery taxonomy.
 `parent_next=end-turn` means a runtime carrier owns that attempt — end the turn
 and start no wait, poll, re-arm, or recap for it. `parent_next=bounded-wait`
 means run the printed `parent_next_command` once. Never filter launch stdout:
-an unstated directive is not `end-turn`.
+an unstated directive is not `end-turn`. Depth-0 launches each frame leg in
+its own Bash call — never two in one, since one waiter arms per call — with
+the four `AGENT_ARTIFACT_*` variables exported each time; the rewake hook
+carries the join, and `release --answers` alone authorizes the owner's launch.
+`OPERATIONS §5.10b` owns the rest.
 
 Checked wrappers keep `capability_mode` separate from a non-owner
 `worker_mode`, which must equal its portable `unit`. A dispatch-depth-1 owner is

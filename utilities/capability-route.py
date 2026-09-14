@@ -37,6 +37,8 @@ from dispatch_contract import (
     agent_home_equivalent,
     attempt_process_quiescence,
     completion_marker_is_current,
+    completion_attempt_readiness,
+    completion_conflict_attempt,
     dispatch_state_roots,
     ensure_global_registry_writable,
     parse_registry_metadata,
@@ -190,7 +192,7 @@ def _launch_source_revision(path):
     resolved=Path(path).resolve(strict=False)
     key=str(resolved)
     if key not in _LAUNCH_SOURCE_REVISION_CACHE:
-        _LAUNCH_SOURCE_REVISION_CACHE[key]=_runtime_activation_module().source_revision(resolved)
+        _LAUNCH_SOURCE_REVISION_CACHE[key]=_runtime_activation_module().source_revision(resolved,runtime_launch=True)
     return _LAUNCH_SOURCE_REVISION_CACHE[key]
 
 def _launch_content_digest(path):
@@ -1990,23 +1992,25 @@ def _seal_dispatch_defaults(nodes, capability, owner_profile=None):
     )
 
 
-def _owner_profile_policy_gap(owner_profile, effective, registry):
-    """None when `owner_profile` is what the portable intensity policy admits
-    for `effective`, else the typed gap: `top-requires-owner` (the exception
-    profile on a direct route, which has no owner) or `mismatch`. One rule
-    read by both the compiler and `verify_route` (review R1 B1: the compiler
-    admitted `top` above the intensity's expected owner profile while verify
-    still demanded equality, so every `top` route compiled and then could
-    not bind, launch, harvest, or close)."""
+def _resolve_owner_profile(effective, registry, demand=None, explicit_profile=None):
+    """One selection for compile and verify: demand, otherwise legacy default.
 
+    Intensity describes the workflow shape; its compatibility default must not
+    veto the independently validated judgment/execution demand.
+    """
+    default = registry["owner_profile_by_intensity"].get(effective) or "light"
+    selection = PROFILE.resolve_profile_demand(
+        demand, explicit_profile=explicit_profile if explicit_profile is not None else default if demand is None else None,
+        legacy=explicit_profile is None, existing_versioned_stage=True)
+    profile = selection["resolved_profile"]
     if effective == "direct":
-        if owner_profile == PROFILE.TOP_PROFILE:
-            return "top-requires-owner"
-        return None if owner_profile is None else "mismatch"
-    expected = registry["owner_profile_by_intensity"].get(effective)
-    if owner_profile == PROFILE.TOP_PROFILE:
-        return None
-    return None if not expected or owner_profile == expected else "mismatch"
+        if profile == PROFILE.TOP_PROFILE:
+            raise ValueError("owner-profile-top-requires-owner")
+        return None, selection
+    if profile != PROFILE.TOP_PROFILE and registry["model_profiles"].get(
+            profile, {}).get("registered_topology") is not True:
+        raise ValueError("owner-profile-ineligible-for-registered-dispatch")
+    return profile, selection
 
 
 def _owner_node(node, effective):
@@ -2022,6 +2026,91 @@ def _owner_node(node, effective):
             and node.get("dispatch_depth") == 1 and node.get("unit") == "_kernel/owner")
 
 
+def _frame_node(node):
+    """Whether `node` is a frame bootstrap leg: the depth-1 direction-setting
+    pair that the depth-0 session launches itself, ahead of any owner. Mirrors
+    `_owner_node`'s style so both the compiler and every verify check read one
+    predicate. This is the SECOND node class allowed the `top` exception
+    profile -- a frame leg is the one place where spending the main-session
+    model buys the whole route its framing, and it is bounded to one leg by
+    `replica_batch_contract`'s per-group top cap."""
+
+    return (node.get("unit") == "plan/frame"
+            and node.get("dispatch_depth") == 1
+            and node.get("worker_type") == "frame")
+
+
+def _quick_frame_diversity(candidates):
+    """ONE definition of a quick frame pair's harness diversity, shared by the
+    compiler and `verify_route` (they used to count supported harnesses
+    separately, and a policy change on one side alone would have made every
+    sealed single-harness route unverifiable).
+
+    Zero supported harnesses cannot frame at all. One is a recorded
+    degradation, not a refusal (user decision, 2026-09-10): both legs run on
+    that harness with their two perspectives and the route says so."""
+
+    harnesses = sorted({
+        row.get("harness") for row in candidates or []
+        if row.get("status") == "supported" and row.get("harness")
+    })
+    if not harnesses:
+        raise ValueError("quick-frame-harness-unavailable")
+    return ("cross-harness" if len(harnesses) >= 2
+            else "single-harness:" + harnesses[0])
+
+
+def _stamp_frame_profiles(nodes, owner_profile, owner_demand):
+    """Stamp every frame leg's `model_profile` from the one tier ladder.
+
+    ONE function called by BOTH the compiler and `verify_route`'s expected-node
+    recomputation. It has to be shared: the verifier rebuilds the node list
+    from the recipe and compares field by field, so a ladder applied on only
+    one side reports every standard+ route as
+    `node-profile-declaration-mismatch:frame` -- which is exactly what happened
+    the first time this was written inline in the compiler.
+
+    Runs BEFORE `_seal_profile_demands` on both sides, because that is what
+    turns the stamped profile into the node's sealed selection."""
+
+    rungs = PROFILE.frame_profile_for_owner(owner_profile)
+    for node in nodes:
+        if not _frame_node(node):
+            continue
+        # `frame` is the anchor leg (the one raised a tier); every other leg of
+        # the pair -- today only `frame-alternative` -- stays at the owner's
+        # working tier so the pair keeps two genuinely different voices.
+        profile = rungs["anchor" if node.get("id") == "frame" else "others"]
+        node["model_profile"] = profile
+        if profile == PROFILE.TOP_PROFILE:
+            # `top` is not a portable profile, so it cannot be sealed through
+            # the legacy "explicit profile, no demand" path -- the resolver
+            # refuses that with `profile-demand-required`. Give the anchor a
+            # real explicit selection instead: the owner's own demand when the
+            # caller supplied one (same judgment, same evidence, one
+            # decision), otherwise the frame shape's intrinsic demand, whose
+            # reasons say in as many words that the shape is speaking rather
+            # than task-specific evidence somebody gathered.
+            node["profile_explicit"] = True
+            node["profile_demand"] = json.loads(json.dumps(
+                owner_demand or PROFILE.FRAME_ANCHOR_SHAPE_DEMAND))
+    return nodes
+
+
+def _recipe_has_frame(recipe):
+    return any(_frame_node(node) for node in recipe["standard_plus"]["nodes"])
+
+
+def _quick_gate_bindings(recipe):
+    """Quick's single human gate binding: the frame pair fences `one-shot`."""
+
+    bindings = ([{"gate": "frame-review", "node": "one-shot", "position": "entry"}]
+                if _recipe_has_frame(recipe) else [])
+    bindings.extend({"gate": gate, "node": "one-shot", "position": "terminal"}
+                    for gate in recipe["quick"].get("inline_human_gates", []))
+    return bindings
+
+
 def _seal_profile_demands(nodes, profile_demands=None, explicit_profiles=None, *, legacy=False):
     demands = profile_demands or {}
     explicit_profiles = explicit_profiles or {}
@@ -2030,18 +2119,17 @@ def _seal_profile_demands(nodes, profile_demands=None, explicit_profiles=None, *
             continue
         node_id = node["id"]
         demand = demands.get(node_id, node.get("profile_demand"))
-        supplied = node_id in demands or "profile_demand" in node
+        supplied = demand is not None
         if supplied:
             demand = PROFILE.normalize_profile_demand(demand)
         explicit = explicit_profiles.get(node_id)
         if node.get("profile_explicit") and node_id not in explicit_profiles:
             explicit = node.get("model_profile")
         if not supplied:
-            if node_id in explicit_profiles:
-                raise ValueError("profile-demand-required:" + node_id)
-            explicit = node.get("model_profile", "light")
+            if explicit is None and legacy:
+                explicit = node.get("model_profile", "light")
         selection = PROFILE.resolve_profile_demand(
-            demand, explicit_profile=explicit, legacy=legacy,
+            demand, explicit_profile=explicit, legacy=legacy and node_id not in explicit_profiles and not node.get("profile_explicit"),
             existing_versioned_stage=legacy,
         )
         node["profile_demand"] = demand
@@ -2058,12 +2146,16 @@ def _profile_input_maps(nodes, demands, explicit):
             raise ValueError("profile-input-unknown-node:" + label)
     for key, value in (demands or {}).items():
         normalized[key] = PROFILE.normalize_profile_demand(value)
+    frame_ids = {n["id"] for n in nodes if _frame_node(n)}
     for key, value in (explicit or {}).items():
-        if key not in normalized or value not in PROFILE.KNOWN_PROFILES:
+        if value not in PROFILE.KNOWN_PROFILES:
             raise ValueError("profile-explicit-input-invalid:" + key)
-        if value == PROFILE.TOP_PROFILE and key != "__owner__":
+        if value == PROFILE.TOP_PROFILE and key != "__owner__" and key not in frame_ids:
             # The top exception profile is a dispatch-depth-1 decision: a
-            # stage node or parallel leg never spends the main-session model.
+            # depth-2 stage node or parallel leg never spends the main-session
+            # model. A depth-1 frame leg is the one added exception -- it is an
+            # anchor for the whole route's direction, launched by the depth-0
+            # session itself.
             raise ValueError("profile-explicit-top-owner-only:" + key)
     return normalized, dict(explicit or {})
 
@@ -2084,8 +2176,8 @@ def _verify_profile_contract(route):
     owner_profile = route.get("owner_model_profile") or "light"
     owner_expected = PROFILE.resolve_profile_demand(
         demands.get("__owner__"), explicit_profile=(explicit.get("__owner__")
-            if "__owner__" in demands else owner_profile),
-        legacy=True, existing_versioned_stage=True)
+            if "__owner__" in explicit or "__owner__" in demands else owner_profile),
+        legacy="__owner__" not in explicit, existing_versioned_stage=True)
     if owner_expected != route.get("owner_profile_selection"):
         raise ValueError("owner-profile-selection-map-mismatch")
     for node in route.get("nodes", []):
@@ -2097,7 +2189,7 @@ def _verify_profile_contract(route):
             raise ValueError("node-profile-explicit-map-mismatch:" + node_id)
     PROFILE.validate_profile_selection(
         route.get("owner_profile_selection"), route.get("owner_profile_demand"),
-        profile=route.get("owner_model_profile") or "light", existing_versioned_stage=True,
+        profile=route.get("owner_model_profile"), existing_versioned_stage=True,
     )
     for node in route.get("nodes", []):
         if node.get("kind") == "resource-runner":
@@ -2137,55 +2229,6 @@ def _seal_small_work_confirmation():
     except (DEFAULTS.DefaultsConfigError, OSError, json.JSONDecodeError):
         return DEFAULTS.DEFAULT_SMALL_WORK_CONFIRMATION
     return DEFAULTS.query_small_work_confirmation(cfg)
-
-
-_AUTONOMOUS_REMOVABLE_GATE = "frame-review"
-_AUTONOMOUS_REMOVABLE_CAPABILITY = "autopilot-code"
-
-
-def _effective_confirmation_graph(
-    nodes, recipe, effective_intensity, capability, sealed_mode, *, composed=False
-):
-    """O3/SD-123: the single place that turns `confirmation_mode` into a
-    realized node graph and human-gate binding set. Compile and verify both
-    call this exactly once (after parallel-group expansion) and feed its
-    result to node graph matching, `human_gate_bindings`, `_workflow_contract()`
-    and every hash comparison, so the two paths cannot disagree.
-
-    - `direct`/`quick` -> no bindings, nodes unchanged.
-    - `sealed_mode` is anything other than the literal `"autonomous"` --
-      including `None` (an old route sealed before this field existed, or a
-      route that predates SD-123 entirely) and every explicit legacy mode
-      (`hybrid`, `both`, `post-frame-only`) -- returns the recipe's nodes and
-      bindings verbatim. Legacy routes must keep verifying exactly as before;
-      this is never a retro-fit.
-    - `autonomous` removes only the `autopilot-code` `frame-review` binding
-      and rewrites every realized node (including frame parallel-group
-      clones) whose continuation targets that gate to `inline-next`. Every
-      other capability/gate pairing is untouched. Explicit composed recipes
-      retain all declared gates regardless of the default confirmation mode.
-    """
-    bindings = json.loads(json.dumps(recipe["human_gate_bindings"]))
-    if effective_intensity in ("direct", "quick"):
-        return nodes, []
-    if composed or sealed_mode != "autonomous" or capability != _AUTONOMOUS_REMOVABLE_CAPABILITY:
-        return nodes, bindings
-    removed_gates = {
-        row["gate"] for row in bindings if row["gate"] == _AUTONOMOUS_REMOVABLE_GATE
-    }
-    if not removed_gates:
-        return nodes, bindings
-    bindings = [row for row in bindings if row["gate"] not in removed_gates]
-    nodes = json.loads(json.dumps(nodes))
-    for node in nodes:
-        continuation = node.get("continuation")
-        if (
-            isinstance(continuation, dict)
-            and continuation.get("kind") == "human-gate"
-            and continuation.get("gate") in removed_gates
-        ):
-            node["continuation"] = {"kind": "inline-next"}
-    return nodes, bindings
 
 
 def _seal_terminal_commit_support(validation_basis):
@@ -2261,7 +2304,7 @@ def compile_route(capability, capability_mode, requested_intensity, cwd, artifac
                   tracking="tracked", tracked_gate_evidence=None, dispatch_evidence=None,
                   registered_headless_evidence=None, slug=None,
                          route_origin="preset", shape=None, profile_demands=None,
-                         explicit_profiles=None, campaign_key=None, parent_cycle_id=None):
+                         explicit_profiles=None, campaign_key=None, parent_cycle_id=None, profile=None):
     registry=TOPO.load_registry(); TOPO.validate_registry(registry)
     recipe=TOPO.resolve_recipe(registry, capability, capability_mode)
     return _compile_from_recipe(
@@ -2273,7 +2316,7 @@ def compile_route(capability, capability_mode, requested_intensity, cwd, artifac
         registered_headless_evidence=registered_headless_evidence, slug=slug,
         campaign_key=campaign_key, parent_cycle_id=parent_cycle_id,
         route_origin=route_origin, shape=shape, profile_demands=profile_demands,
-        explicit_profiles=explicit_profiles)
+        explicit_profiles=explicit_profiles, profile=profile)
 
 # ---------------------------------------------------------------------------
 # compose: the preset-free work route (SD-135).
@@ -2364,6 +2407,13 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec):
             "compose-graph-unknown-node:" + ",".join(unknown)
             + " (available: " + ",".join(base_nodes) + ")"
         )
+    def gate_group(node_id):
+        base = base_nodes[node_id]
+        continuation = base.get("continuation") or {}
+        if continuation.get("kind") == "human-gate":
+            return continuation["gate"], tuple(base.get("depends_on", []))
+        return None
+
     nodes = []
     overrides = {}
     for index, (node_id, unit) in enumerate(graph_spec):
@@ -2381,6 +2431,19 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec):
             overrides[node_id] = unit
         previous = nodes[-1] if nodes else None
         node["depends_on"] = [previous["id"]] if previous else []
+        if previous and gate_group(previous["id"]):
+            group = gate_group(previous["id"])
+            if gate_group(node_id) == group:
+                # Independent raisers share their predecessor. Serializing
+                # them would make the first gate block its own second raiser.
+                node["depends_on"] = list(previous["depends_on"])
+            else:
+                raisers = []
+                for prior in reversed(nodes):
+                    if gate_group(prior["id"]) != group:
+                        break
+                    raisers.append(prior["id"])
+                node["depends_on"] = list(reversed(raisers))
         node["inputs"] = _compose_inputs(base_nodes, base_nodes[node_id], set(ids))
         node.pop("terminal", None)
         node.pop("terminal_gate", None)
@@ -2395,19 +2458,31 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec):
         terminal["model_required_reason"] = "terminal-report"
     # Human gates: a base node whose continuation was `human-gate G` keeps G
     # only when a graph node follows it; G is rebound to that node's entry.
+    # One binding per DISTINCT gate, not one per raiser. Sibling nodes can raise
+    # the same gate -- the frame pair both continue on `frame-review` -- and a
+    # second binding for the same gate is refused by
+    # `capability_topology.py:734-737` ("every declared human gate must bind to
+    # exactly one node"), which made a compose graph naming both frame legs
+    # impossible at any capability. The anchor is the node following the LAST
+    # raiser, so the gate opens only after every raiser has run.
     bindings, gates = [], []
+    gate_anchor: dict[str, str] = {}
     for index, node in enumerate(nodes[:-1]):
         base = base_nodes[node["id"]]
         continuation = base.get("continuation") or {}
         if continuation.get("kind") == "human-gate":
             gate = continuation["gate"]
-            bindings.append({"gate": gate, "node": nodes[index + 1]["id"], "position": "entry"})
-            gates.append(gate)
+            if gate not in gate_anchor:
+                gates.append(gate)
+            gate_anchor[gate] = nodes[index + 1]["id"]
             node["continuation"] = {"kind": "human-gate", "gate": gate}
         elif node.get("kind") == "resource-runner":
             node["continuation"] = {"kind": "supervised"}
         else:
             node["continuation"] = {"kind": "inline-next"}
+    bindings.extend(
+        {"gate": gate, "node": gate_anchor[gate], "position": "entry"} for gate in gates
+    )
     # A gate declared on the entry of a base SOURCE node (no predecessor raises
     # it, e.g. autopilot-spec `intent-confirmation` on `research`) is kept
     # verbatim when that node is kept: it is parent-owned, not a continuation.
@@ -2419,11 +2494,19 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec):
                 and row.get("gate") not in gates):
             bindings.append({"gate": row["gate"], "node": node_id, "position": "entry"})
             gates.append(row["gate"])
-    groups = [
-        json.loads(json.dumps(group))
-        for group in base_recipe["standard_plus"].get("parallel_groups") or []
-        if group["node"] in kept_ids and group["node"] != terminal["id"]
-    ]
+    groups, omitted_groups = [], []
+    for group in base_recipe["standard_plus"].get("parallel_groups") or []:
+        anchor = next((n for n in nodes if n["id"] == group["node"]), None)
+        if anchor is None or anchor is terminal:
+            continue
+        consumers = [n for n in nodes if anchor["id"] in n.get("depends_on", [])]
+        if anchor["kind"] == "pipeline-stage" and not any(
+                n["kind"] == "review-worker" for n in consumers):
+            # The preset's fan-out requires a review consumer. A caller who
+            # selected a smaller graph did not select that fan-out obligation.
+            omitted_groups.append({"id": group["id"], "reason": "review-consumer-not-selected"})
+        else:
+            groups.append(json.loads(json.dumps(group)))
     extensions = [
         json.loads(json.dumps(row))
         for row in base_recipe.get("conditional_extensions") or []
@@ -2457,6 +2540,8 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec):
     }
     if groups:
         recipe["standard_plus"]["parallel_groups"] = groups
+    if omitted_groups:
+        recipe["compose"]["omitted_parallel_presets"] = omitted_groups
     return recipe
 
 
@@ -2518,14 +2603,12 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
                   tracking=None, artifact_guard=None, children=None, parent_harness="claude",
                   dispatch_evidence=None, registered_headless_evidence=None,
                   transport_evidence="compose-default", jobs=None, profile_demands=None, explicit_profiles=None,
-                  campaign_key=None, parent_cycle_id=None):
+                  campaign_key=None, parent_cycle_id=None, profile=None, work_request=None):
     """Resolve every default, then compile through the ordinary sealer."""
     if shape not in COMPOSE_SHAPES:
         raise ValueError(f"compose-shape-invalid:{shape}")
     if shape != "staged" and graph:
         raise ValueError(f"compose-graph-only-staged:{shape}")
-    if shape == "staged" and not graph:
-        raise ValueError("compose-graph-required")
     registry = TOPO.load_registry()
     base = next((r for r in registry["recipes"] if r["capability"] == capability), None)
     if base is None:
@@ -2573,9 +2656,9 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
         dispatch_evidence=dispatch_evidence,
         registered_headless_evidence=registered_headless_evidence,
         route_origin="compose", shape=shape,
-        profile_demands=profile_demands, explicit_profiles=explicit_profiles,
+        profile_demands=profile_demands, explicit_profiles=explicit_profiles, profile=profile,
     )
-    if shape == "staged":
+    if shape == "staged" and graph:
         recipe = compose_subgraph_recipe(registry, base, parse_graph_spec(graph))
         route = compile_composed_route(
             recipe, capability_mode, requested, cwd, artifact_root,
@@ -2585,6 +2668,11 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
             capability, capability_mode, requested, cwd, artifact_root,
             predicates=predicates, inline_reason="atomic-direct" if shape == "direct" else None,
             **common)
+    if work_request is not None:
+        from work_start import validate_request
+        route["work_request"] = dict(validate_request(work_request))
+        route["route_hash"] = route_hash(route)
+        route["route_id"] = ROUTE_IDENTITY.route_id_from_hash(route["route_hash"])
     return route
 
 
@@ -2625,7 +2713,7 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
                          tracking="tracked", tracked_gate_evidence=None, dispatch_evidence=None,
                          registered_headless_evidence=None, slug=None, composed=False,
                   route_origin="preset", shape=None, profile_demands=None,
-                  explicit_profiles=None, campaign_key=None, parent_cycle_id=None):
+                  explicit_profiles=None, campaign_key=None, parent_cycle_id=None, profile=None):
     dispatch_terminal_commit.require_current_cleanup("route-compile")
     if route_origin not in ROUTE_ORIGINS: raise ValueError("invalid route origin")
     cwd=Path(cwd).resolve(strict=True); artifact=Path(artifact_root).resolve()
@@ -2655,8 +2743,6 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
     effective=max((requested,inferred),key=ORDER.get)
     if composed and effective in ("direct","quick"):
         raise ValueError("composed routes require a standard+ effective intensity")
-    sealed_confirmation_mode=_seal_confirmation_mode()
-    realized_human_gate_bindings=[]
     registered_headless_candidates=None
     if effective=="direct":
         transport="interactive"
@@ -2686,16 +2772,54 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
         registered_headless_candidates=_validate_registered_headless_evidence(
             registered_headless_evidence
         )
+        # Quick's cross-harness guarantee is carried entirely by this candidate
+        # list -- `owner_route_binding._supported_owner_harnesses` reads it, and
+        # `dispatch-owner.py` refuses an `--adapter` outside it. How many
+        # harnesses it supports decides the pair's diversity, sealed on both
+        # frame nodes by `_quick_frame_diversity` (shared with `verify_route`).
+        #
+        # Deliberately NOT touched: `EVIDENCE_CONSUMER_DISPATCH_DEPTH` and the
+        # depth-2 evidence-consumer path. Quick has no depth-2 node, so making
+        # that depth configurable would mean redefining five call sites plus
+        # fallback-chain attachment for no gain here.
+        _frame_diversity=_quick_frame_diversity(registered_headless_candidates)
         transport="headless"
         owner_model_profile=registry["owner_profile_by_intensity"]["quick"]
-        nodes=[{"id":"one-shot","kind":recipe["quick"]["worker_kind"],"dispatch_depth":1,"role":"orchestrator",
-                "unit":"_kernel/owner",
+        # What quick's frame legs LOSE compared to standard+: no
+        # `dispatch_evidence.tuples` per-field sealing of
+        # parent_transport/parent_sandbox/child_harness, and no `fallback_hops`
+        # chain at all. Recovery from a dead quick frame leg is an explicit
+        # depth-0 re-launch, never a machine fallback hop. Do not read quick's
+        # frame pair as carrying the standard+ guarantee.
+        _quick_frame=lambda node_id,profile:{
+                "id":node_id,"kind":"map-worker","depends_on":[],"role":"deep maker",
+                "unit":"plan/frame","worker_type":"frame","dispatch_depth":1,
+                "launch_authority":"depth-0","model_profile":profile,
+                "inputs":["task"],
+                "outputs":[f"shards/{node_id}/direction-brief.md"],
+                "write_scope":[f"shards/{node_id}/**"],"resource_class":"normal",
+                "execution_surface":"registered-headless","registered_worker":True,
+                "completion_gate":"quick-frame",
+                "harness_diversity":_frame_diversity,
+                "continuation":{"kind":"human-gate","gate":"frame-review"},
+                "advance_class":"runtime-eligible","commit_expected":False}
+        nodes=[_quick_frame("frame","balanced-deep"),
+               _quick_frame("frame-alternative","light"),
+               {"id":"one-shot","kind":recipe["quick"]["worker_kind"],"dispatch_depth":1,"role":"orchestrator",
+                "depends_on":["frame","frame-alternative"],
+                "unit":"_kernel/owner","worker_type":"owner",
                 "model_profile":owner_model_profile,
                 "write_scope":recipe["quick"]["write_scope"],"resource_class":"normal",
                 "execution_surface":"registered-headless","registered_worker":True,
                 "completion_gate":"quick-complete",
                 "terminal":True,"terminal_gate":"quick-complete"}]
-        gates=["quick-complete"]
+        if recipe["quick"].get("inline_human_gates"):
+            nodes[-1]["inline_human_gates"] = list(recipe["quick"]["inline_human_gates"])
+        gates=["quick-frame","quick-complete"]
+        if not _recipe_has_frame(recipe):
+            nodes = [nodes[-1]]
+            nodes[0]["depends_on"] = []
+            gates = ["quick-complete"]
         selection_basis=[{"axis":"direct-predicate-gap","signal":p,"source":"compiler"} for p in sorted(known_pred-set(predicates))]
     else:
         if transport not in (None, "headless"):
@@ -2710,10 +2834,6 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
         )
         for node in nodes:
             node.pop("fallback_hops", None)
-        nodes,realized_human_gate_bindings=_effective_confirmation_graph(
-            nodes, recipe, effective, capability, sealed_confirmation_mode,
-            composed=composed
-        )
         selection_basis=[{"axis":"promotion","signal":s,"source":"caller"} for s in signals]
     _validate_output_scopes(nodes)
     if effective != "direct" and inline_reason is not None:
@@ -2734,38 +2854,39 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
         for node in nodes:
             if node.get("dispatch_depth")==2:
                 node["fallback_hops"]=json.loads(json.dumps(chain))
+    if profile is not None:
+        if profile not in PROFILE.PORTABLE_PROFILES:
+            raise ValueError("profile-explicit-unknown:" + str(profile))
+        explicit_profiles = {**{n["id"]: profile for n in nodes if n.get("kind") != "resource-runner"},
+                             "__owner__": profile, **(explicit_profiles or {})}
     profile_demands, explicit_profiles = _profile_input_maps(nodes, profile_demands, explicit_profiles)
     owner_demand = profile_demands.get("__owner__")
-    owner_profile_selection = PROFILE.resolve_profile_demand(
-        owner_demand, explicit_profile=(explicit_profiles.get("__owner__") if owner_demand
-                                       else owner_model_profile or "light"),
-        legacy=True, existing_versioned_stage=True,
-    )
+    owner_model_profile, owner_profile_selection = _resolve_owner_profile(
+        effective, registry, owner_demand, explicit_profiles.get("__owner__"))
     resolved_owner_profile = owner_profile_selection["resolved_profile"]
-    # A direct route seals no owner profile; the one thing it must still
-    # refuse is an explicit `top` (direct runs inline in the main session,
-    # which already IS the top model's home -- there is no owner to give it to).
-    gap = _owner_profile_policy_gap(
-        resolved_owner_profile if effective != "direct" or resolved_owner_profile == PROFILE.TOP_PROFILE else None,
-        effective, registry)
-    if gap == "top-requires-owner":
-        raise ValueError("owner-profile-top-requires-owner")
-    if gap:
-        raise ValueError("owner-profile-eligibility-conflict")
-    if effective != "direct":
-        owner_model_profile = resolved_owner_profile
-    if resolved_owner_profile == PROFILE.TOP_PROFILE:
-        # Review R1 B2 / R2 B1: the owner's own node -- and only it -- seals
-        # the same explicit `top` selection the owner did; otherwise the route
-        # claims `top` while its node says `balanced-deep`, and the launched
-        # owner's route guard refuses the mismatch.
+    if owner_demand is not None or "__owner__" in explicit_profiles:
+        # Quick's one-shot is the owner process, so there is one selection.
+        # Semantic owner stages in standard+ remain independently selected.
         for node in nodes:
             if _owner_node(node, effective):
-                node["model_profile"] = PROFILE.TOP_PROFILE
+                node["model_profile"] = resolved_owner_profile
                 node["profile_explicit"] = True
                 node["profile_demand"] = owner_demand
+    # The frame bootstrap tier ladder, applied for BOTH shapes at once, after
+    # `resolved_owner_profile` and before `_seal_profile_demands`. Quick's
+    # frame pair is built literally above by `_quick_frame`, and the five
+    # standard+ recipes declare theirs in `topologies.json` -- both carry a
+    # static `model_profile` that CANNOT be right, because the correct value
+    # depends on the owner profile this route just resolved, which no static
+    # recipe field can see. Stamping unconditionally is exactly what demotes
+    # those static values to placeholders instead of letting one decision live
+    # in two homes. The one home is `model_profile.FRAME_PROFILE_LADDER`.
+    _stamp_frame_profiles(nodes, resolved_owner_profile, owner_demand)
     legacy_nodes = not composed or _versioned_subgraph(registry, recipe)
     _seal_profile_demands(nodes, profile_demands, explicit_profiles, legacy=legacy_nodes)
+    for node in nodes:
+        if _owner_node(node, effective) and node["model_profile"] != owner_model_profile:
+            raise ValueError("owner-node-profile-selection-conflict:" + node["id"])
     dispatch_defaults_digest,dispatch_allocation,owner_harness_policy=_seal_dispatch_defaults(
         nodes, capability, owner_model_profile
     )
@@ -2806,7 +2927,7 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
       "dispatch_defaults_digest":dispatch_defaults_digest,
       "dispatch_allocation":dispatch_allocation,
       "owner_harness_policy":owner_harness_policy,
-      "confirmation_mode":sealed_confirmation_mode,
+      "confirmation_mode":_seal_confirmation_mode(),
       "small_work_confirmation":_seal_small_work_confirmation(),
       "selection":{"direct_predicates":predicates,"promotion_signals":[{"signal":s,"source":"caller"} for s in signals],
                    "selection_basis":selection_basis,
@@ -2816,10 +2937,21 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
       "continuation_budget":continuation_budget,
       "nodes":nodes,"parallel_groups":_realized_parallel_groups(nodes),
       "conditional_extensions":_realize_conditional_extensions(recipe, effective),
-      "completion_gates":gates,"human_gates":recipe["human_gates"],
-      "human_gate_bindings":json.loads(json.dumps(realized_human_gate_bindings)),
+      "completion_gates":gates,
+      # The portable recipe owns whether this capability has a frame layer.
+      # Quick must not extend it to capabilities outside the five recipes.
+      "human_gates":(sorted(set(recipe["human_gates"])|{"frame-review"})
+                     if effective=="quick" and _recipe_has_frame(recipe) else recipe["human_gates"]),
+      # Quick binds the frame gate at `one-shot`'s entry: that is quick's only
+      # fence point, and without it quick runs with no check at all. Only
+      # `direct` (which has no owner and no worker) still binds nothing.
+      "human_gate_bindings":json.loads(json.dumps(
+          _quick_gate_bindings(recipe) if effective=="quick"
+          else recipe["human_gate_bindings"] if effective!="direct" else [])),
       "workflow_contract":_workflow_contract(
-          registry, nodes, realized_human_gate_bindings),
+          registry, nodes,
+          _quick_gate_bindings(recipe) if effective=="quick"
+          else recipe["human_gate_bindings"] if effective!="direct" else []),
       "resume_retry_boundaries":recipe["resume_retry_boundaries"],
       "dispatch_evidence":checked_dispatch,
       "dispatch_contract_version":DISPATCH_CONTRACT_VERSION,
@@ -2952,6 +3084,9 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
     digest currentness stays required for anything that launches, dispatches, or
     mutates, and the closure records which case it was.
     """
+    if "work_request" in route:
+        from work_start import validate_request
+        validate_request(route["work_request"])
     if route.get("schema_version") != ROUTE_SCHEMA_VERSION:
         raise ValueError(
             f"legacy route schema_version={route.get('schema_version')!r} rejected for mutating/resume use"
@@ -3004,7 +3139,6 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
             k: v for k, v in node.items()
             if k not in ("fallback_hops", "harness_affinity", "harness_policy")
         }
-    expected_bindings=[]
     if route.get("composed"):
         if route.get("effective_intensity") in ("direct","quick"):
             raise ValueError("composed routes require a standard+ effective intensity")
@@ -3020,10 +3154,10 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
             expected_nodes, composed_recipe["standard_plus"].get("parallel_groups"),
             route.get("effective_intensity"), route.get("capability"),
             auxiliary_check_units=registry.get("auxiliary_check_units"))
-        expected_nodes,expected_bindings=_effective_confirmation_graph(
-            expected_nodes, composed_recipe, route.get("effective_intensity"),
-            route.get("capability"), route.get("confirmation_mode"), composed=True)
         if route.get("profile_selection_contract_version") == 1:
+            # Same ladder, same order as the compiler: stamp, then seal.
+            _stamp_frame_profiles(expected_nodes, route.get("owner_model_profile"),
+                                  route.get("owner_profile_demand"))
             _seal_profile_demands(expected_nodes, route.get("profile_demands"),
                                   route.get("explicit_profiles"),
                                   legacy=_versioned_subgraph(registry, composed_recipe))
@@ -3041,10 +3175,10 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
                 expected_nodes, route_recipe["standard_plus"].get("parallel_groups"),
                 route.get("effective_intensity"), route.get("capability"),
                 auxiliary_check_units=registry.get("auxiliary_check_units"))
-            expected_nodes,expected_bindings=_effective_confirmation_graph(
-                expected_nodes, route_recipe, route.get("effective_intensity"),
-                route.get("capability"), route.get("confirmation_mode"))
             if route.get("profile_selection_contract_version") == 1:
+                # Same ladder, same order as the compiler: stamp, then seal.
+                _stamp_frame_profiles(expected_nodes, route.get("owner_model_profile"),
+                                      route.get("owner_profile_demand"))
                 _seal_profile_demands(expected_nodes, route.get("profile_demands"),
                                       route.get("explicit_profiles"), legacy=True)
                 by_id = {n["id"]: n for n in expected_nodes}
@@ -3060,18 +3194,6 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
             if ([n.get("id") for n in route.get("nodes", [])]
                     != [n.get("id") for n in expected_nodes]):
                 raise ValueError("route nodes differ from the declared recipe")
-            # SD-123/O3: confirmation_mode has already been realized into
-            # `expected_nodes` above, so compile and verify cannot disagree
-            # on which nodes' continuations are rewritten to `inline-next`.
-            # Checked narrowly (continuation only, by id) so this does not
-            # shadow the more specific per-field diagnostics below for an
-            # unrelated tampered field (e.g. `model_profile`).
-            expected_continuation_by_id={n["id"]:n.get("continuation") for n in expected_nodes}
-            for node in route.get("nodes", []):
-                if node.get("continuation") != expected_continuation_by_id.get(node.get("id")):
-                    raise ValueError(
-                        "route node continuation differs from the realized confirmation-mode graph"
-                    )
     expected_extensions=_realize_conditional_extensions(
         route_recipe, route.get("effective_intensity")
     )
@@ -3080,6 +3202,13 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
     route_node_ids={node.get("id") for node in route.get("nodes", [])}
     if any(not set(row["after"]) <= route_node_ids for row in expected_extensions):
         raise ValueError("route conditional extension anchor is not realized")
+    # Mirror of the compiler: quick binds its own frame gate, only `direct`
+    # binds nothing. Verifier and compiler must move together or a quick route
+    # compiles and then refuses to verify.
+    expected_bindings=json.loads(json.dumps(
+        _quick_gate_bindings(route_recipe) if route.get("effective_intensity")=="quick"
+        else route_recipe["human_gate_bindings"]
+        if route.get("effective_intensity")!="direct" else []))
     if route.get("human_gate_bindings") != expected_bindings:
         raise ValueError("route human gate bindings differ from the sealed recipe")
     if route.get("workflow_contract") != _workflow_contract(
@@ -3087,6 +3216,13 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
         raise ValueError("route workflow contract differs from the realized stage graph")
     if {row["gate"] for row in expected_bindings} - set(route.get("human_gates") or []):
         raise ValueError("route binds an undeclared human gate")
+    if route.get("effective_intensity") != "direct" and "preview-disposition" in (route.get("human_gates") or []):
+        preview_raisers = [n for n in route.get("nodes", [])
+                           if n.get("continuation") == {"kind": "human-gate", "gate": "preview-disposition"}
+                           or "preview-disposition" in n.get("inline_human_gates", [])]
+        preview_bindings = [b for b in expected_bindings if b.get("gate") == "preview-disposition"]
+        if not preview_raisers or not preview_bindings:
+            raise ValueError("preview-approval-boundary-missing")
     if route.get("owner_dispatch_depth") not in {0, 1} or route.get("max_dispatch_depth") not in {0, 1, 2}:
         raise ValueError("invalid qualified dispatch depth")
     if any(key in route for key in ("depth", "owner_depth", "max_depth")):
@@ -3134,11 +3270,11 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
             raise ValueError("invalid dispatch_allocation harness order")
     observed_dispatch_depths = [route["owner_dispatch_depth"]]
     effective=route.get("effective_intensity")
-    gap=_owner_profile_policy_gap(route.get("owner_model_profile"), effective, registry)
-    if gap=="top-requires-owner":
-        raise ValueError("owner-profile-top-requires-owner")
-    if gap:
-        raise ValueError("owner_model_profile differs from the portable intensity policy")
+    selected_owner, _ = _resolve_owner_profile(
+        effective, registry, route.get("owner_profile_demand"),
+        (route.get("explicit_profiles") or {}).get("__owner__"))
+    if route.get("owner_model_profile") != selected_owner:
+        raise ValueError("owner_model_profile differs from the portable owner selection")
     # The owner's own node (quick `one-shot`) must carry the profile the route
     # sealed for the owner (the policy check above already admitted it, `top`
     # included); a standard+ recipe's semantic owner node keeps the portable
@@ -3195,7 +3331,12 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
         if node.get("dispatch_depth") in {1, 2}:
             profile = node.get("model_profile")
             row = registry["model_profiles"].get(profile)
-            top_owner_node = profile == PROFILE.TOP_PROFILE and _owner_node(node, effective)
+            # The `top` exception profile is unregistered on purpose, so only
+            # the two node classes allowed to hold it skip the registered check:
+            # the owner, and a depth-1 frame anchor leg.
+            top_owner_node = profile == PROFILE.TOP_PROFILE and (
+                _owner_node(node, effective) or _frame_node(node)
+            )
             if not top_owner_node and (
                 not isinstance(row, dict) or row.get("registered_topology") is not True
             ):
@@ -3206,7 +3347,8 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
             and node.get("unit") == "_kernel/owner"
             and (
                 node.get("dispatch_depth") != 1
-                or node.get("model_profile") != expected_owner_profile
+                or (route.get("profile_selection_contract_version") is None
+                    and node.get("model_profile") != expected_owner_profile)
             )
         ):
             raise ValueError(
@@ -3287,8 +3429,11 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
             or route.get("max_dispatch_depth") != 1
             or selection.get("transport") != "headless"
             or selection.get("inline_reason") is not None
+            # `serial-attempt` is a per-(route_id, route_node) attempt budget,
+            # so it stays true unchanged with three nodes. `max_dispatch_depth`
+            # stays 1 because the frame legs are depth 1 as well.
             or route.get("registered_headless_policy") != "serial-attempt"
-            or len(route.get("nodes",[])) != 1
+            or len(route.get("nodes",[])) != (3 if _recipe_has_frame(route_recipe) else 1)
         ):
             raise ValueError("quick route shape mismatch")
         candidates=_validate_registered_headless_evidence({
@@ -3296,17 +3441,40 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
         })
         if candidates != route.get("registered_headless_candidates"):
             raise ValueError("quick registered-headless evidence is not canonical")
-        node=route["nodes"][0]
+        diversity=_quick_frame_diversity(candidates)
+        if any(n.get("harness_diversity") != diversity
+               for n in route.get("nodes",[]) if _frame_node(n)):
+            raise ValueError("quick route frame harness diversity mismatch")
+        node=next((n for n in route["nodes"] if n.get("id")=="one-shot"), None)
+        if node is None:
+            raise ValueError("quick route shape mismatch")
+        if node.get("inline_human_gates", []) != route_recipe["quick"].get("inline_human_gates", []):
+            raise ValueError("quick-inline-human-gates-mismatch")
+        if node.get("write_scope") != route_recipe["quick"]["write_scope"]:
+            raise ValueError("quick-write-scope-mismatch")
         if (
-            node.get("id") != "one-shot"
-            or node.get("dispatch_depth") != 1
+            node.get("dispatch_depth") != 1
             or node.get("unit") != "_kernel/owner"
             or node.get("model_profile") != owner_profile
             or node.get("execution_surface") != "registered-headless"
             or node.get("registered_worker") is not True
             or node.get("fallback_hops")
+            or sorted(node.get("depends_on") or []) !=
+               (["frame","frame-alternative"] if _recipe_has_frame(route_recipe) else [])
         ):
             raise ValueError("quick node axes mismatch")
+        frame_legs=[n for n in route["nodes"] if _frame_node(n)]
+        if sorted(n.get("id") for n in frame_legs) != (
+                ["frame","frame-alternative"] if _recipe_has_frame(route_recipe) else []):
+            raise ValueError("quick route frame pair mismatch")
+        for leg in frame_legs:
+            if (
+                leg.get("execution_surface") != "registered-headless"
+                or leg.get("registered_worker") is not True
+                or leg.get("fallback_hops")
+                or leg.get("launch_authority") != "depth-0"
+            ):
+                raise ValueError("quick frame leg axes mismatch")
     dd_digest=route.get("dispatch_defaults_digest")
     if dd_digest is not None and (not isinstance(dd_digest, str) or not dd_digest.startswith("sha256:")):
         raise ValueError("invalid dispatch_defaults_digest format")
@@ -3440,8 +3608,12 @@ def terminal_gate_observation(route, *, jobs=None, exact_terminal=False):
     rows={}
     for node_id in terminal_ids:
         node=nodes[node_id]
-        rows[node_id]=_marker_identity_row(route,node,node_id,node.get("terminal_gate"), jobs=jobs,
-                                          exact_terminal=exact_terminal)
+        marker=completion_dir(route["route_id"],jobs=jobs)/f"{node_id}.json"
+        if owner_executed_terminal(node) and not (marker.exists() or marker.is_symlink()):
+            rows[node_id]=_owner_terminal_observation(route,node,jobs=jobs)
+        else:
+            rows[node_id]=_marker_identity_row(route,node,node_id,node.get("terminal_gate"), jobs=jobs,
+                                              exact_terminal=exact_terminal)
     for group_id,error in sorted(owner_merge_auxiliary_groups(route).items()):
         key=f"parallel_group:{group_id}"
         row=_arbitration_observation(route,group_id,error)
@@ -3461,6 +3633,82 @@ def terminal_gate_observation(route, *, jobs=None, exact_terminal=False):
                 row={"passed":False,"reason":"auxiliary-arbitration-identity-unverified"}
         rows[key]=row
     return rows
+
+def owner_executed_terminal(node):
+    """A declared owner operation has the owner's executor, not an absent child."""
+    return (node.get("terminal") is True and node.get("kind") == "capability-owner"
+            and node.get("unit") == "_kernel/owner" and node.get("dispatch_depth") == 1)
+
+
+def _owner_terminal_observation(route,node,*,jobs=None):
+    """Consume the same exact native handoff as worker completion, without
+    inventing a second attempt or publishing a synthetic worker marker.
+
+    The claim binds this proof's digest just as it binds a worker marker. All
+    subsequent readers recheck the owner, prerequisites, output and cleanup.
+    """
+    from owner_route_binding import resolve_owner_route_lifecycle
+    def absent(reason):
+        return {"passed":False,"reason":reason}
+    try:
+        jobs=Path(jobs) if jobs is not None else completion_dir(route["route_id"]).parents[1]/"jobs.log"
+        owners=[]
+        for line in jobs.read_text(encoding="utf-8").splitlines():
+            fields=line.split("\t")
+            if len(fields)!=6: continue
+            meta=parse_registry_metadata(fields[5])
+            if (meta.get("worker_type")=="owner" and meta.get("dispatch_depth")=="1"
+                    and meta.get("owner_route_id")==route["route_id"]):
+                owners.append((fields,meta))
+        if not owners: return absent("owner-attempt-absent")
+        fields,meta=owners[-1]
+        binding,_=resolve_owner_route_lifecycle(jobs,owner_attempt_id=meta["attempt_id"])
+        if (binding is None or binding.route_id!=route["route_id"] or binding.route_hash!=route["route_hash"]
+                or meta.get("registered_worker")!="1"):
+            return absent("owner-route-identity-mismatch")
+        if fields[1]!="done" or meta.get("failure_class")!="pass":
+            return absent("owner-terminal-not-pass")
+        if completion_conflict_attempt({"attempt_id":meta["attempt_id"]},["\t".join(fields)]):
+            return absent("terminal-evidence-conflict")
+        process=attempt_process_quiescence(meta,terminal_receipt=True)
+        if process.state!="quiescent": return absent("owner-not-quiescent")
+        # A PASS proposal cannot erase a missing review or other prerequisite.
+        prerequisites=owner_terminal_prerequisites(route,node,jobs)
+        if prerequisites:
+            return absent("owner-prerequisite-unproven:"+json.dumps(prerequisites,sort_keys=True))
+        terminal=inspect_terminal_attempt(meta.get("log_file"),worktree=route["cwd"],
+                                          artifact_root_metadata=route["artifact_root"],worker_type="owner")
+        if terminal.get("state")!="valid" or terminal.get("verdict")!="PASS" or terminal.get("artifact_state")!="readable":
+            return absent("owner-terminal-evidence-unverified")
+        encoded=str(terminal["artifact_path_b64"])
+        evidence=Path(base64.urlsafe_b64decode(encoded+"="*(-len(encoded)%4)).decode())
+        digest=evidence_digest(evidence)
+        identity={"route_id":route["route_id"],"route_hash":route["route_hash"],"node_id":node["id"],
+                  "attempt_id":meta["attempt_id"],"completion_gate":node["terminal_gate"],
+                  "evidence":str(evidence),"evidence_digest":digest,"source":"owner-terminal"}
+        return {**identity,"passed":True,"current":True,"reason":"owner-terminal-verified",
+                "marker_digest":hashlib.sha256(json.dumps(identity,sort_keys=True).encode()).hexdigest(),
+                "attempt_readiness":"quiescent"}
+    except (OSError,ValueError,KeyError,TypeError):
+        return absent("owner-terminal-evidence-unverified")
+
+
+def owner_terminal_prerequisites(route,node,jobs):
+    nodes={n["id"]:n for n in route["nodes"]}
+    pending=list(node.get("depends_on",[])); seen=set(); missing={}
+    while pending:
+        node_id=pending.pop()
+        if node_id in seen: continue
+        seen.add(node_id)
+        predecessor=nodes[node_id]
+        pending.extend(predecessor.get("depends_on",[]))
+        if (predecessor.get("kind")=="capability-owner" and predecessor.get("unit")=="_kernel/owner"
+                and predecessor.get("dispatch_depth")==1):
+            continue  # This executor's final handoff includes its own preceding operations.
+        proof=_marker_identity_row(route,predecessor,node_id,predecessor.get("completion_gate"),
+                                   jobs=jobs,exact_terminal=predecessor.get("dispatch_depth") in (1,2))
+        if not proof.get("passed"): missing[node_id]=proof["reason"]
+    return missing
 
 def terminal_gate_proven(gates):
     """Tri-state aggregate: True if every declared terminal gate passed, False if any
@@ -4527,6 +4775,19 @@ def _marker_identity_row(route, node, node_id, gate, *, jobs=None, exact_termina
         return {"passed": False, "reason": "completion-evidence-unreadable"}
     if digest != evidence.get("sha256"):
         return {"passed": False, "reason": "completion-evidence-hash-mismatch"}
+    if marker.get("registered_worker") is True or marker.get("stage_authority") == "owner-chain":
+        try:
+            registry = Path(jobs) if jobs is not None else _continuation_source_jobs(route)
+        except ValueError:
+            registry = path.parents[2] / "jobs.log"
+        try:
+            lines = registry.read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            lines = []  # Existing semantic-history contract permits archived process rows.
+        except OSError:
+            return {"passed": False, "reason": "registry-unreadable"}
+        if completion_conflict_attempt(marker, lines):
+            return {"passed": False, "reason": "terminal-evidence-conflict"}
     if exact_terminal:
         if jobs is None or not completion_marker_is_current(route, node, path, marker):
             return {"passed": False, "reason": "completion-marker-not-current"}
@@ -4541,7 +4802,7 @@ def _marker_identity_row(route, node, node_id, gate, *, jobs=None, exact_termina
         if (not matches or matches[-1][0][1] != "done"
                 or matches[-1][1].get("failure_class") != "pass"
                 or matches[-1][1].get("attempt_id") != marker.get("attempt_id")
-                or attempt_process_quiescence(matches[-1][1], terminal_receipt=True).state != "quiescent"):
+                or completion_attempt_readiness(route, node, marker, Path(jobs)).state != "ready"):
             return {"passed": False, "reason": "completion-attempt-not-current"}
         return {"passed": True, "reason": "completion-marker-verified", "current": True,
                 "node_id": node_id, "attempt_id": marker["attempt_id"], "completion_gate": gate,
@@ -4553,8 +4814,10 @@ def _marker_identity_row(route, node, node_id, gate, *, jobs=None, exact_termina
     # preserves legacy inline markers whose attempt is intentionally absent.
     if jobs is None:
         return {"passed": True, "reason": "completion-marker-verified",
+                "marker_digest": hashlib.sha256(marker_bytes).hexdigest(),
                 "evidence": evidence.get("path")}
     return {"passed": True, "reason": "completion-marker-verified",
+            "marker_digest": hashlib.sha256(marker_bytes).hexdigest(),
             "evidence": evidence.get("path"), "current": True,
             "attempt_readiness": "unchecked", "attempt_id": marker.get("attempt_id")}
 
@@ -4712,6 +4975,13 @@ def _publish_completion_locked(
 ):
     """Publish marker history, exact-attempt link, and canonical marker under one node lock."""
 
+    # The same producer binding owns write admission and completion evidence.
+    # An open neighbouring cycle cannot certify this route's completed work.
+    from artifact_producer import ProducerError, require_cycle_output
+    try:
+        require_cycle_output(Path(route["artifact_root"]), Path(evidence), route_id=route["route_id"])
+    except ProducerError as exc:
+        raise ValueError(f"{exc.code}: {exc.detail}") from exc
     _validate_auxiliary_arbiter(route, node, evidence)
     axes=_marker_attempt_axes(node,attempt_id,attempt_metadata)
     evidence_sha=evidence_digest(evidence)
@@ -5697,6 +5967,21 @@ def _compose_artifact_root(cwd):
     return root
 
 
+def compose_receipt(route, path):
+    """The ordinary caller needs its choices and handle, not all sealed evidence."""
+    return {
+        "route_file": str(Path(path).resolve()), "route_id": route["route_id"],
+        "selection": route.get("selection", {}),
+        "cwd": route["cwd"], "artifact_root": route["artifact_root"],
+        "effective_intensity": route["effective_intensity"],
+        "owner_model_profile": route.get("owner_model_profile"),
+        "nodes": [{key: node[key] for key in
+                   ("id", "unit", "dispatch_depth", "model_profile", "depends_on", "terminal") if key in node}
+                  for node in route["nodes"]],
+        "human_gates": route.get("human_gates", []),
+    }
+
+
 def _emit_compiled_route(a,route,artifact_root,output=None):
     """Shared tail of compile/compose: runtime-root check, canonical write-once, owner binding, prints."""
     output=output if output is not None else getattr(a,"output",None)
@@ -5748,9 +6033,14 @@ def _emit_compiled_route(a,route,artifact_root,output=None):
     if attachment is not None:
         print("owner_route_binding_written=1", file=sys.stderr)
     print(f"route_file={output_path.resolve()}",file=sys.stderr)
-    print(json.dumps(route,sort_keys=True))
+    result = (compose_receipt(route, output_path)
+              if a.command == "compose" and not getattr(a, "full_record", False) else route)
+    if not getattr(a, "start", False):
+        print(json.dumps(result,sort_keys=True))
+    return output_path.resolve()
 
 def main():
+    from dispatch_parent_completion import default_parent_harness
     p=argparse.ArgumentParser(); sub=p.add_subparsers(dest="command",required=True)
     c=sub.add_parser("compile"); c.add_argument("--capability",required=True); c.add_argument("--capability-mode",default="default")
     c.add_argument("--slug",required=True)
@@ -5770,12 +6060,17 @@ def main():
     c.add_argument("--output")
     cp=sub.add_parser("compose",help="preset-free work route: name the shape (and stage subgraph), defaults fill the rest")
     cp.add_argument("--slug",required=True)
+    cp.add_argument("--start",action="store_true",help="prepare and start the selected work; the runtime owns frame launches and waiting")
+    cp.add_argument("--prompt-file",type=Path,help="the user's task, stored with the route for frame and owner execution")
+    cp.add_argument("--owner",choices=("claude","codex","opencode"),help="explicit owner runtime; otherwise use normal selection")
     cp.add_argument("--campaign-key",help="explicit work stream passed to the producer owner")
     cp.add_argument("--parent-cycle",help="open or sealed predecessor cycle; causal link, not input approval")
     cp.add_argument("--profile-demands", help="JSON file mapping node ids and __owner__ to full SD-88 demands")
     cp.add_argument("--explicit-profiles", help="JSON file mapping demanded node ids to explicit profiles")
-    cp.add_argument("--shape",choices=COMPOSE_SHAPES,default=None,help="direct (inline) | solo (one registered depth-1 owner) | staged (owner + your stage subgraph); default staged when --graph is given, else direct")
-    cp.add_argument("--graph",default=None,help="comma list of the capability's stage ids in your order, optional :unit override, e.g. execute,test,report or execute:dev/refactor,test")
+    cp.add_argument("--profile", choices=sorted(PROFILE.PORTABLE_PROFILES),
+                    help="explicit model budget for owner and model nodes; node-specific --explicit-profiles takes precedence")
+    cp.add_argument("--shape",choices=COMPOSE_SHAPES,default=None,help="direct (inline) | solo (one registered owner) | staged (capability recipe, optionally narrowed by --graph); default staged with --graph, else direct")
+    cp.add_argument("--graph",default=None,help="optional staged subgraph in your order; incompatible inherited parallel presets are omitted; optional :unit override, e.g. execute,test,report")
     cp.add_argument("--capability",default=COMPOSE_DEFAULT_CAPABILITY); cp.add_argument("--capability-mode",default=None)
     cp.add_argument("--intensity",default=None,help="default by shape: direct/quick/standard; staged accepts strong+")
     cp.add_argument("--cwd",default=None,help="default: current directory"); cp.add_argument("--artifact-root",default=None,help="default: utilities/artifact-root.sh for cwd")
@@ -5784,13 +6079,34 @@ def main():
     cp.add_argument("--drift-verdict",default=None); cp.add_argument("--tracking",choices=sorted(TRACKING),default=None)
     cp.add_argument("--artifact-guard",default=None)
     cp.add_argument("--children",default=None,help="comma list of child harnesses to probe for staged/solo (default claude,codex)")
-    cp.add_argument("--parent-harness",default="claude",choices=("claude","codex","opencode"))
+    cp.add_argument("--parent-harness",default=None,choices=("claude","codex","opencode"),help="default: actual parent runtime")
     cp.add_argument("--jobs",default=None,help="registry for the readiness probe (default AGENT_DISPATCH_JOBS or the stable state root)")
     cp.add_argument("--dispatch-evidence",help="checked evidence JSON (skips the live probe)")
     cp.add_argument("--registered-headless-evidence",help="checked quick candidates JSON (skips the live probe)")
     cp.add_argument("--transport-evidence",default="compose-default")
     cp.add_argument("--explain",action="store_true",help="print the [경로] card and the sealed graph without writing the route")
     cp.add_argument("--output")
+    cp.add_argument("--full-record",action="store_true",help="print all sealed evidence; default prints choices and the canonical route_file")
+    cp.add_argument("--help-all",action="help",help="also show advanced/compatibility inputs")
+    if "--help-all" not in sys.argv:
+        advanced = {"parent_cycle", "profile_demands", "explicit_profiles", "intensity", "artifact_root",
+                    "signal", "drift_verdict", "tracking", "artifact_guard", "parent_harness", "jobs",
+                    "dispatch_evidence", "registered_headless_evidence", "transport_evidence", "output", "full_record"}
+        for option in cp._actions:
+            if option.dest in advanced:
+                option.help = argparse.SUPPRESS
+    start=sub.add_parser("start",help="continue one sealed work request; existing attempts are reused")
+    start.add_argument("--route",required=True,type=Path)
+    start.add_argument("--jobs",type=Path,default=None)
+    start.add_argument("--wait",action="store_true",help="the receipt's bounded wait for a parent without an automatic carrier")
+    start.add_argument("--interview",type=Path,help="semantic frame question; runtime owns its registration and cycle fields")
+    start.add_argument("--answers",type=Path,help="actual native answers; runtime records intent and releases the gate")
+    start.add_argument("--decision",choices=("proceed","revise","stop"),default="proceed")
+    correction=sub.add_parser("correct", help="deliver a correction to one existing owner; without a message file, inspect its receipts")
+    correction.add_argument("--attempt-id", required=True)
+    correction.add_argument("--jobs", type=Path)
+    correction.add_argument("--message-file", type=Path)
+    correction.add_argument("--request-id", help="stable idempotency key; defaults to the message digest")
     co=sub.add_parser("continuation")
     co.add_argument("--source-route",required=True)
     co.add_argument("--resume-from-node",required=True)
@@ -5843,6 +6159,8 @@ def main():
         dispatch_terminal_commit.require_current_cleanup("route-" + a.command)
     if a.command=="compose":
         shape=a.shape or ("staged" if a.graph else "direct")
+        if a.start and (a.explain or a.prompt_file is None):
+            raise ValueError("compose-start-requires-task: use --start --prompt-file <task>, without --explain")
         cwd=a.cwd or os.getcwd()
         artifact_root=a.artifact_root or _compose_artifact_root(cwd)
         route=compose_route(
@@ -5852,13 +6170,15 @@ def main():
             spec_read=a.spec_read,drift_verdict=a.drift_verdict,tracking=a.tracking,
             artifact_guard=a.artifact_guard,
             children=[c.strip() for c in a.children.split(",") if c.strip()] if a.children else None,
-            parent_harness=a.parent_harness,
+            parent_harness=a.owner or a.parent_harness or ("claude" if shape=="direct" else default_parent_harness("claude")),
             dispatch_evidence=json.loads(Path(a.dispatch_evidence).read_text()) if a.dispatch_evidence else None,
             registered_headless_evidence=(json.loads(Path(a.registered_headless_evidence).read_text())
                                           if a.registered_headless_evidence else None),
             transport_evidence=a.transport_evidence,jobs=a.jobs,
             profile_demands=json.loads(Path(a.profile_demands).read_text()) if a.profile_demands else None,
             explicit_profiles=json.loads(Path(a.explicit_profiles).read_text()) if a.explicit_profiles else None,
+            profile=a.profile,
+            work_request={"text":a.prompt_file.read_text(),"owner_harness":a.owner} if a.prompt_file else None,
         )
         print(compose_card(route),file=sys.stderr)
         if a.explain:
@@ -5872,7 +6192,28 @@ def main():
                               "human_gates":route.get("human_gates"),"parallel_groups":route.get("parallel_groups"),
                               "tracked_gate_evidence":route.get("tracked_gate_evidence")},sort_keys=True))
             return 0
-        _emit_compiled_route(a,route,artifact_root)
+        path = _emit_compiled_route(a,route,artifact_root)
+        if a.start:
+            from work_start import start_work
+            print(json.dumps(start_work(route,path,Path(a.jobs or _compose_default_jobs())),ensure_ascii=False))
+        return 0
+    if a.command=="correct":
+        from dispatch_owner_input import submit, inspect, InputError
+        jobs=Path(a.jobs or _compose_default_jobs())
+        try:
+            result=(submit(jobs,a.attempt_id,a.message_file.read_text(),a.request_id)
+                    if a.message_file else inspect(jobs,a.attempt_id))
+        except InputError as exc:
+            print(json.dumps({"state":"not-admitted","reason":str(exc),
+                              "next_step":"Retain the correction. Inspect the exact owner; do not restart it or treat a file edit as delivery."}))
+            return 69
+        print(json.dumps(result,ensure_ascii=False))
+        return 0
+    if a.command=="start":
+        from work_start import start_work
+        route=verify_route(json.loads(a.route.read_text()))
+        print(json.dumps(start_work(route,a.route,Path(a.jobs or _compose_default_jobs()),wait=a.wait,
+                                   interview=a.interview,answers=a.answers,decision=a.decision),ensure_ascii=False))
         return 0
     if a.command=="compile":
         gate={"spec_read":{"satisfied":a.spec_read.lower() not in ("0","false","no"),"source":a.spec_read},

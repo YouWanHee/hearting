@@ -71,6 +71,7 @@ from dispatch_mode_contract import (  # noqa: E402
     validate_route_mode_axes,
 )
 from worker_bootstrap import assigned_contract, worker_type_for_kind  # noqa: E402
+from dispatch_attempt_policy import decide_attempt, committed_outcome
 from codex_dispatch_terminal import REVIEW_BLOCKING_NOTE  # noqa: E402
 from dispatch_degradation import record_degradation  # noqa: E402
 from dispatch_allocation_receipt import record_allocation_receipt  # noqa: E402
@@ -168,9 +169,10 @@ def tuple_key(row: dict) -> str:
     ))
 
 
-def _usage_states(jobs: Path) -> dict[str, str]:
+def _usage_states(jobs: Path, profile=None) -> dict[str, str]:
     result = subprocess.run(
-        [str(ROOT / "utilities/usage-check.sh"), "--harness", "all", "--jobs", str(jobs)],
+        [str(ROOT / "utilities/usage-check.sh"), "--harness", "all", "--jobs", str(jobs),
+         "--model-profile", profile or ""],
         cwd=ROOT,
         text=True,
         capture_output=True,
@@ -265,7 +267,7 @@ def ordered_fallback_hops(
         # parent filter.
         return list(node["fallback_hops"]), None
     counts = attempt_counts(jobs, window=int(allocation["window"]))
-    states = _usage_states(jobs)
+    states = _usage_states(jobs, node.get("model_profile"))
     headless: dict[str, tuple[dict, dict]] = {}
     trailing_rows: list[tuple[dict, dict]] = []
     tail_hops = []
@@ -707,23 +709,23 @@ def terminal_attempt_state(
         "terminal_action": "registry-terminal",
         "note": note or "unknown",
     }
-    process = attempt_process_quiescence(row)
+    # The exact terminal row is the gate that may consume a portable drain
+    # receipt after its observer namespace has gone away.
+    process = attempt_process_quiescence(row, terminal_receipt=True)
     fields.update(process_state=process.state, process_reason=process.reason)
-    if process.state == "live":
+    decision = decide_attempt("done", row, process_state=process.state,
+                              process_reason=process.reason)
+    if decision.action == "wait":
         return "draining", fields
-    if process.state != "quiescent":
+    if decision.action == "recover":
         return "fail-closed", fields
-    if note == "completed-marker":
+    if decision.action == "advance":
         return "terminal", fields
-    if note == REVIEW_BLOCKING_NOTE:
-        # OPERATIONS §5.10: a reviewer that recorded blocking findings finished.
-        # That is a stage result for the owner to read, never a launch failure
-        # to fall back from -- descending to the next hop here would spend the
-        # round budget on a second review the owner did not ask for.
+    if decision.action == "review":
         return "terminal", {**fields, "review_verdict": "FAIL"}
-    if note == "dead-capacity":
+    if decision.retry_kind == "capacity":
         return "capacity", {**fields, "failure_class": "capacity"}
-    if note.startswith("dead-"):
+    if decision.retry_allowed:
         return "fallback", fields
     return "fail-closed", fields
 
@@ -1107,6 +1109,9 @@ def wrapper_command(
         "--execution-surface", "registered-headless",
         "--registered-worker", "1",
     ]
+    retry_of = (capacity_prior or {}).get("attempt_id") or getattr(args, "automatic_retry_of", "")
+    if retry_of:
+        command += ["--automatic-retry-of", retry_of]
     unit = node.get("unit") or ""
     if unit and not unit.startswith("_kernel/"):
         command += ["--worker-mode", unit]
@@ -1282,23 +1287,26 @@ def watch_launched_attempt(args, route, node, attempt_id, launch_fields):
             if verdict[0] == "observed":
                 advisory.update(verdict[1])
             return verdict
-        if last.get("action", "").startswith("fail-closed"):
-            return "fail-closed", last
-        if last.get("terminal_action") == "dead-capacity":
-            return "capacity", last
-        if last.get("terminal_action") == "dead-no-progress":
-            return "fallback", last
-        if last.get("terminal_action") == "process-exited":
-            return "fallback", last
-        if last.get("terminal_action") == "registry-terminal":
-            terminal = terminal_attempt_state(
-                args.jobs, route["route_id"], node["id"], attempt_id
-            )
-            if terminal is None:
-                return "fail-closed", last
+        # Observe progress here; derive retry permission only from the exact
+        # settled attempt row. Process exit can precede marker publication.
+        terminal = terminal_attempt_state(
+            args.jobs, route["route_id"], node["id"], attempt_id
+        )
+        if terminal is not None:
             if terminal[0] == "draining":
                 return "observed", terminal[1]
             return terminal
+        if last.get("action", "").startswith("fail-closed"):
+            return "fail-closed", last
+        action = last.get("terminal_action")
+        if action == "process-exited":
+            # Keep the existing bounded observation window. If publication
+            # is still pending at its end, return the original launch receipt
+            # to the owner without launching another attempt.
+            return "observed", last
+        if action in {"dead-capacity", "dead-no-progress", "registry-terminal"}:
+            # The cached claim has no matching durable terminal record.
+            return "fail-closed", last
         return "observed", last
 
     # Establish a file/heartbeat fingerprint before the first deadline. This
@@ -1382,6 +1390,13 @@ def capacity_retry(
     if rejected:
         attempts.append(f"{ordinal}:{tuple_key(row)}:{rejected}")
         return "descend", {}, rejected
+
+    from dispatch_capacity_evidence import active_limits
+    quota = active_limits(args.jobs, models={harness: alt_model}).get(harness)
+    if quota:
+        reason = f"capacity-quota-until-{quota['reset_epoch']}"
+        attempts.append(f"{ordinal}:{tuple_key(row)}:{reason}")
+        return "descend", {"quota_reset_epoch": str(quota["reset_epoch"])}, reason
 
     retry_id = capacity_attempt_identity(
         args, route, node, row, ordinal, f"{alt_model}/{alt_paired}"
@@ -1585,9 +1600,15 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                 effective_intensity=route["effective_intensity"],
                 round=str(round_no), max_round=str(max_round),
                 child_spawned="0",
+                **DISPATCH_NODE.review_budget_recovery_fields(node.get("kind")),
             )
 
     prior_failures = registry_failures(args.jobs, route["route_id"], node["id"])
+    prior_rows = registry_rows(args.jobs, route["route_id"], node["id"])
+    args.automatic_retry_of = (
+        prior_rows[-1].get("attempt_id", "") if prior_rows
+        and committed_outcome(prior_rows[-1]["_status"], prior_rows[-1]) == "failed" else ""
+    )
     failed_tuples = set(args.failed_tuple) | set(prior_failures)
     attempts: list[str] = []
     direct_failures: list[dict[str, str]] = []
@@ -1636,6 +1657,12 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
         if hop["fallback_hop"] in {"same-harness-headless", "cross-harness-headless"}:
             for row in hop.get("candidates", []):
                 key = tuple_key(row)
+                # Re-read after an early failure too: a whole-account quota
+                # cannot be cured by changing models later in this same chain.
+                from dispatch_capacity_evidence import active_limits
+                quota = active_limits(args.jobs, profile=node.get("model_profile")).get(row.get("child_harness"))
+                if quota:
+                    row = {**row, "_allocation_skip": f"quota-until-{quota['reset_epoch']}"}
                 if row.get("_allocation_skip"):
                     attempts.append(
                         f"{ordinal}:{key}:skipped-{row['_allocation_skip']}"
@@ -1766,7 +1793,7 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                             fields.get("reason")
                             or (worker_failure if worker_failure != "-" else "wrapper-exit")
                         )
-                        if failure_reason in PRELAUNCH_PROCESS_BLOCK_REASONS:
+                        if failure_reason in PRELAUNCH_PROCESS_BLOCK_REASONS or failure_reason.startswith("retry-"):
                             return fail(
                                 failure_reason,
                                 78,
@@ -1841,6 +1868,8 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                         if output:
                             print(output)
                         return 0
+                if registry_has_attempt(args.jobs, attempt_id):
+                    args.automatic_retry_of = attempt_id
                 if early == "capacity":
                     failed = {
                         **fields, "attempt_id": attempt_id,

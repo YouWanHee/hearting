@@ -354,12 +354,12 @@ class RegistryTest(unittest.TestCase):
         "--attempt",attempt,"--route",route,"--node",node)
   live=self.invoke(*args);self.assertEqual(live.returncode,0,live.stdout+live.stderr);self.assertIn("state=working",live.stdout)
   heartbeat["phase"]="terminal";(heartbeat_dir/f"{attempt}.json").write_text(json.dumps(heartbeat))
-  done=self.invoke(*args);self.assertEqual(done.returncode,0,done.stdout+done.stderr);self.assertIn("state=done",done.stdout)
+  done=self.invoke(*args);self.assertEqual(done.returncode,0,done.stdout+done.stderr);self.assertIn("state=working",done.stdout)
   with self.jobs.open("a") as out:
    out.write(f"2026-07-16T00:00:05Z\topen\t/r\t/w\tnamespace\troute_id={route},route_node={node},attempt_id={attempt},pid=437,pid_start=1,pid_scope=namespace-local\n")
   applied=self.invoke("reconcile","--attempt",attempt,"--apply")
-  record=json.loads(applied.stdout);self.assertEqual(record["closed"],1);self.assertEqual(record["decisions"][0]["category"],"terminal-heartbeat")
-  self.assertIn("note=completed-terminal-heartbeat",self.jobs.read_text())
+  record=json.loads(applied.stdout);self.assertEqual(record["closed"],0)
+  self.assertNotIn("note=completed-terminal-heartbeat",self.jobs.read_text())
  def test_codex_liveness_rejects_visible_namespace_pid_without_proof(self):
   import importlib.util
   path=ROOT/"adapters/codex/bin/dispatch-liveness.py"
@@ -1260,6 +1260,21 @@ class RegistryTest(unittest.TestCase):
   self.assertEqual(applied["decisions"][0]["reason"],"namespace-not-extinct")
   self.assertIn("\topen\t",self.jobs.read_text())
 
+ def test_unreadable_namespace_reports_missing_observation_without_closing(self):
+  module=self.load_registry_module("namespace_observation_unavailable")
+  attempt="att-observer-unavailable"
+  self.jobs.write_text(self.cancellation_row(attempt))
+  before=self.jobs.read_bytes()
+  with mock.patch.object(module,"observer_namespace_extinct",return_value="unverifiable"), \
+       mock.patch.object(module,"prove_attempt_quiescence") as prove, \
+       contextlib.redirect_stdout(io.StringIO()) as stream:
+   module.automatic_cancel_receiptless(module.read_rows(self.jobs),self.cancellation_args(attempt))
+  applied=json.loads(stream.getvalue())
+  self.assertEqual(applied["closed"],0)
+  self.assertEqual(applied["decisions"][0]["reason"],"namespace-observation-unavailable")
+  prove.assert_not_called()
+  self.assertEqual(self.jobs.read_bytes(),before)
+
  def test_automatic_extinct_and_envelope_absent_closes_with_receipt(self):
   # R-2
   module=self.load_registry_module("r2_automatic_extinct")
@@ -1543,7 +1558,7 @@ class ArtifactProofReceiptSealTest(unittest.TestCase):
   self.assertEqual(record["decisions"][0]["artifact_sha256"],self.digest)
   self.assertEqual(self.jobs.read_text(),before)
 
- def test_seal_makes_a_closed_row_reach_a_terminal_verdict(self):
+ def test_output_seal_preserved_while_common_reconcile_settles_cleanup(self):
   self.write_row()
   metadata=parse_registry_metadata(self.jobs.read_text().strip().split("\t",5)[5])
   before=observed_attempt_liveness("done",metadata,terminal_receipt_gate=True)
@@ -1564,11 +1579,18 @@ class ArtifactProofReceiptSealTest(unittest.TestCase):
   self.assertNotIn("launch_outcome",text)
 
   sealed=parse_registry_metadata(text.strip().split("\t",5)[5])
-  self.assertEqual(post_exit_receipt_reason(sealed),
-                   "receipt-superseded-by-artifact-proof")
+  self.assertEqual(post_exit_receipt_reason(sealed), "")
   after=observed_attempt_liveness("done",sealed,terminal_receipt_gate=True)
-  self.assertEqual(after.state,"terminal")
-  self.assertEqual(after.reason,"registry-closed")
+  self.assertEqual(after.state,"unverifiable")
+  reconciled=self.invoke("reconcile","--attempt",self.attempt,"--apply")
+  self.assertEqual(reconciled.returncode,0,reconciled.stdout+reconciled.stderr)
+  decision=json.loads(reconciled.stdout)["decisions"][0]
+  self.assertEqual(decision["category"],"terminal-settled",decision)
+  self.assertFalse(decision["closed"])
+  settled=parse_registry_metadata(self.jobs.read_text().strip().split("\t",5)[5])
+  self.assertEqual({k:settled[k] for k in sealed},sealed)
+  self.assertEqual(observed_attempt_liveness("done",settled,terminal_receipt_gate=True).state,"terminal")
+  self.assertNotIn("cancellation_quiescence_receipt",settled)
 
  def test_seal_survives_a_live_tagged_process_that_outlived_the_worker(self):
   """The exact shape that made the receipt unissuable: a leaked tagged process."""
@@ -1584,7 +1606,12 @@ class ArtifactProofReceiptSealTest(unittest.TestCase):
    sealed=parse_registry_metadata(self.jobs.read_text().strip().split("\t",5)[5])
    self.assertEqual(
     observed_attempt_liveness("done",sealed,terminal_receipt_gate=True).state,
-    "terminal")
+    "alive")
+   before=self.jobs.read_bytes()
+   recovery=self.invoke("reconcile","--attempt",self.attempt,"--apply")
+   self.assertEqual(recovery.returncode,0,recovery.stdout+recovery.stderr)
+   self.assertEqual(json.loads(recovery.stdout)["decisions"][0]["category"],"terminal-cleanup-pending")
+   self.assertEqual(self.jobs.read_bytes(),before)
    # Without the seal the same live tag still vetoes quiescence -- and now
    # reports the descendant as live process evidence instead of merely
    # withholding terminal progression, matching every other populated-scan
@@ -2118,6 +2145,25 @@ class ResolveOwnerRouteAdvanceTest(unittest.TestCase):
                         return_value=(binding,"owner-route-advance-anchor-unresolvable")):
    route_id,route_file,status=self.module.resolve_owner_route(row,None,str(self.jobs))
   self.assertEqual((route_id,route_file,status),("rt-legacy","/legacy.json","ok"))
+
+
+class ForegroundRegistryContractTest(unittest.TestCase):
+ def test_classifier_has_no_row_derived_binding_fallback_and_refreshes_before_probe(self):
+  source=SCRIPT.read_text(encoding="utf-8")
+  self.assertNotIn("expected_binding or _foreground_binding", source)
+  refresh=source.index("fresh = current_attempt_row")
+  quiescence=source.index("attempt_process_quiescence(fresh.metadata)")
+  classify=source.index("classify_exact_route_free_review_outcome(")
+  self.assertLess(refresh, quiescence)
+  self.assertLess(quiescence, classify)
+
+ def test_all_route_identity_keys_are_shared_with_the_contract(self):
+  module=importlib.util.module_from_spec(
+      importlib.util.spec_from_file_location("dispatch_registry_contract", SCRIPT))
+  spec=module.__spec__
+  assert spec is not None and spec.loader is not None
+  spec.loader.exec_module(module)
+  self.assertEqual(tuple(module.ROUTE_IDENTITY_METADATA_KEYS), tuple(D.ROUTE_IDENTITY_METADATA_KEYS))
 
 
 if __name__=="__main__":unittest.main()

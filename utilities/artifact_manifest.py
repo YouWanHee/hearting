@@ -28,8 +28,10 @@ _MEDIA_TYPE_RE = re.compile(
 )
 # A leading underscore is the harness's own cycle-internal convention
 # (`_internal/`, CORE.md §3 C-INT) and is therefore a valid locator component;
-# a leading dot stays a hidden component (rejected above).
+# Legacy cycle-relative names retain this grammar. The explicit artifacts/
+# payload namespace also admits dot-prefixed names; dot segments remain invalid.
 _LOCATOR_COMPONENT_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$")
+_PAYLOAD_COMPONENT_RE = re.compile(r"^[A-Za-z0-9_.][A-Za-z0-9._-]{0,127}$")
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 _MAX_LOCATOR_COMPONENTS = 32
@@ -338,6 +340,22 @@ def _v_completion_criterion(value: Any, path: str, violations: List[Violation]) 
     _check_closed_object(value, path, {"statement": _v_str}, {}, violations)
 
 
+def _v_legacy_merged_from(value: Any, path: str, violations: List[Violation]) -> None:
+    _check_closed_object(
+        value,
+        path,
+        {
+            "campaign_id": _v_typed_id("campaign"),
+            "goal": _v_str,
+            "key": _v_str,
+            "locator": _v_str,
+            "title": _v_str,
+        },
+        {},
+        violations,
+    )
+
+
 def _v_campaign(value: Any, path: str, violations: List[Violation]) -> None:
     _check_closed_object(
         value,
@@ -349,7 +367,15 @@ def _v_campaign(value: Any, path: str, violations: List[Violation]) -> None:
             "title": _v_str,
             "state": _v_str,
         },
-        {},
+        {
+            # Legacy read-only campaign-merge metadata that predates the closure
+            # of this schema. It is produced only by the campaign-merge migration
+            # and must be accepted so sealed manifests stay immutable while index
+            # rebuild/verify can still validate them. Arbitrary extra keys remain
+            # rejected.
+            "key": _v_str,
+            "merged_from": _v_legacy_merged_from,
+        },
         violations,
     )
 
@@ -679,6 +705,8 @@ def _check_locator_path(path_value: Any, vpath: str, violations: List[Violation]
             _locator_violation("locator-too-many-components", vpath, "too many components")
         )
         return
+    payload = len(components) > 1 and components[0] == "artifacts"
+    component_re = _PAYLOAD_COMPONENT_RE if payload else _LOCATOR_COMPONENT_RE
     for comp in components:
         if comp == "":
             violations.append(
@@ -690,12 +718,12 @@ def _check_locator_path(path_value: Any, vpath: str, violations: List[Violation]
                 _locator_violation("locator-dot-segment", vpath, "dot segment")
             )
             return
-        if comp.startswith("."):
+        if comp.startswith(".") and not payload:
             violations.append(
                 _locator_violation("locator-hidden-component", vpath, "hidden component")
             )
             return
-        if not _LOCATOR_COMPONENT_RE.match(comp):
+        if not component_re.fullmatch(comp):
             violations.append(
                 _locator_violation("locator-invalid-component", vpath, "invalid component")
             )
@@ -704,6 +732,13 @@ def _check_locator_path(path_value: Any, vpath: str, violations: List[Violation]
         violations.append(
             _locator_violation("locator-reserved-name", vpath, "reserved locator name")
         )
+
+
+def validate_locator_path(path_value: str) -> ValidationReport:
+    """One grammar for producer collection and manifest/reader consumption."""
+    violations: List[Violation] = []
+    _check_locator_path(path_value, path_value, violations)
+    return _report(violations)
 
 
 def validate_locators(document: Mapping[str, Any]) -> ValidationReport:

@@ -27,7 +27,12 @@ from typing import Callable
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
+from dispatch_attempt_policy import decide_attempt, required_action
+from dispatch_receipt_identity import (
+    CANONICAL_RECEIPT_KEYS, CANONICAL_CHILD_KEYS, canonical_receipt, receipt_digest, unseal_receipt,
+)
 from dispatch_contract import (  # noqa: E402
+    AUTOMATIC_RECEIPTLESS_CLASSIFIER,
     SUBSESSION_NOTE,
     _marker_bound_current_marker,
     SUBSESSION_TERMINAL_CLASSIFIER,
@@ -36,7 +41,14 @@ from dispatch_contract import (  # noqa: E402
     SUCCESS_NOTES,
     DispatchContractError,
     ProcessQuiescence,
+    FOREGROUND_OUTCOME_KEYS,
+    ROUTE_IDENTITY_METADATA_KEYS,
+    _foreground_outcome_values_from_pipe,
+    detached_review_outcome_from_pipe,
+    attempt_raw_row_sha256,
     attempt_process_quiescence,
+    foreground_review_eligible,
+    validate_review_output_binding,
     close_attempt_row,
     marker_bound_delivery_transaction,
     marker_bound_process_identity,
@@ -44,6 +56,7 @@ from dispatch_contract import (  # noqa: E402
     parse_registry_metadata,
     process_identity_disposition,
     reconcile_attempt_terminal,
+    resolve_attempt_cleanup,
     row_is_subsession,
 )
 import dispatch_pending_delivery as pending_delivery  # noqa: E402
@@ -102,19 +115,6 @@ DELIVERY_TIMING_POINTS = (
     "final_report_marker_ns",
     "owner_terminal_envelope_ns",
 )
-# SD-111 D-2/C-2: mirrors codex-managed-gateway.py's ALLOWED_RECEIPT_KEYS /
-# ALLOWED_CHILD_KEYS minus "delivery_timing". Duplicated (not imported) because
-# codex-managed-gateway.py imports this module already -- importing back would
-# be circular. Keep both lists synchronized by hand; §11 forbids widening
-# either vocabulary.
-CANONICAL_RECEIPT_KEYS = frozenset({
-    "schema_version", "state", "parent_attempt_id", "job_registry", "children",
-    "delivery_classification",
-})
-CANONICAL_CHILD_KEYS = frozenset({
-    "attempt_id", "status", "readiness", "reason", "required_action", "harness",
-    "delivery_classification",
-})
 MAX_DELIVERY_RECEIPT_BYTES = 2048
 # SUCCESS_NOTES / SUBSESSION_NOTE / row_is_subsession are re-exported from
 # `dispatch_contract`, which owns the definition (this module imports that one,
@@ -136,27 +136,19 @@ def canonical_delivery_receipt(receipt: dict[str, object]) -> dict[str, object]:
     digest/``delivery_id`` across carriers.
     """
 
-    if not isinstance(receipt, dict):
-        raise JoinContractError("delivery-receipt-invalid")
-    canonical: dict[str, object] = {
-        key: value for key, value in receipt.items() if key in CANONICAL_RECEIPT_KEYS
-    }
-    raw_children = receipt.get("children")
-    if isinstance(raw_children, list):
-        canonical["children"] = [
-            {key: value for key, value in child.items() if key in CANONICAL_CHILD_KEYS}
-            for child in raw_children
-            if isinstance(child, dict)
-        ]
-    return canonical
+    try:
+        return canonical_receipt(receipt)
+    except ValueError as exc:
+        raise JoinContractError(str(exc)) from exc
 
 
 def canonical_receipt_digest(receipt: dict[str, object]) -> str:
     """Return the sha256 hex digest of the timing-excluded canonical receipt."""
 
-    canonical = canonical_delivery_receipt(receipt)
-    encoded = json.dumps(canonical, separators=(",", ":"), sort_keys=True).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    try:
+        return receipt_digest(receipt)
+    except ValueError as exc:
+        raise JoinContractError(str(exc)) from exc
 
 
 def seal_delivery_receipt(receipt: dict[str, object]) -> str:
@@ -177,21 +169,10 @@ def seal_delivery_receipt(receipt: dict[str, object]) -> str:
 
 def unseal_delivery_receipt(encoded: str) -> dict[str, object]:
     """Decode a sealed receipt body back into the exact original dict."""
-
-    if not isinstance(encoded, str) or not encoded:
-        raise JoinContractError("delivery-receipt-invalid")
-    padded = encoded + "=" * (-len(encoded) % 4)
     try:
-        decoded = base64.standard_b64decode(padded.encode("ascii"))
+        return unseal_receipt(encoded)
     except ValueError as exc:
         raise JoinContractError("delivery-receipt-invalid") from exc
-    try:
-        value = json.loads(decoded.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError) as exc:
-        raise JoinContractError("delivery-receipt-invalid") from exc
-    if not isinstance(value, dict):
-        raise JoinContractError("delivery-receipt-invalid")
-    return value
 
 
 OWNER_ROUTE_NODE = "_owner"
@@ -227,10 +208,18 @@ def pending_record_identity(
     route_id = metadata.get("route_id") or ""
     route_node = metadata.get("route_node") or ""
     parent_attempt_id = metadata.get("parent_attempt_id") or ""
-    is_owner_row = (
-        metadata.get("worker_type") == "owner"
-        or metadata.get("dispatch_depth") == "1"
-    )
+    # A depth-1 review has no owner route. Its exact attempt is its delivery
+    # scope; do not invent an owner binding or conflate cycle and session.
+    if (metadata.get("worker_type") == "review"
+            and metadata.get("dispatch_depth") == "1"
+            and not any(metadata.get(key) for key in ROUTE_IDENTITY_METADATA_KEYS)):
+        attempt_id = metadata.get("attempt_id", "")
+        return (f"review:{attempt_id}" if attempt_id else "", "_review",
+                parent_attempt_id or NO_PARENT_ATTEMPT)
+    is_owner_row = (metadata.get("worker_type") == "owner"
+                    or (metadata.get("dispatch_depth") == "1"
+                        and metadata.get("worker_type") not in {"review", "frame"}
+                        and metadata.get("owner_route_id")))
     if is_owner_row:
         sealed = (
             metadata.get("owner_route_file"),
@@ -326,6 +315,10 @@ def materialize_pending_delivery(jobs: Path, row_fields: list[str]) -> Path | No
     if len(row_fields) != 6:
         raise JoinContractError("delivery-receipt-invalid")
     metadata = parse_registry_metadata(row_fields[5])
+    if metadata.get("workflow_completion") == "runtime-v1":
+        from dispatch_terminal_commit import owner_completion_pending
+        if owner_completion_pending(jobs, row_fields[1], metadata):
+            return None
     if metadata.get("delivery_intent") != "1":
         return None
     required = (
@@ -388,6 +381,14 @@ def materialize_after_terminal_close(jobs: Path, attempt_id: str) -> Path | None
         row = current_attempt_row(jobs, attempt_id)
         if row is None:
             return None
+        if row.metadata.get("worker_type") == "owner":
+            from dispatch_owner_input import materialize_unresolved
+            materialize_unresolved(jobs, attempt_id)
+        if row.metadata.get("workflow_completion") == "runtime-v1":
+            from dispatch_terminal_commit import settle_owner_completion
+            settlement = settle_owner_completion(jobs, row.status, row.metadata)
+            if settlement is not None and settlement.result != "completed":
+                return None
         return materialize_pending_delivery(jobs, row.raw.split("\t"))
     except (JoinContractError, pending_delivery.PendingDeliveryError, OSError, ImportError) as exc:
         sys.stderr.write(
@@ -501,6 +502,9 @@ def reconcile_pending_delivery(jobs: Path) -> dict[str, int]:
         attempt_id = metadata.get("attempt_id", "")
         if attempt_id:
             rows_by_attempt[attempt_id] = metadata
+        if attempt_id and metadata.get("worker_type") == "owner":
+            from dispatch_owner_input import materialize_unresolved
+            materialize_unresolved(jobs, attempt_id)
         if attempt_id and metadata.get("delivery_intent") == "1":
             record_file = None
             if metadata.get("parent_sid") and metadata.get("delivery_id"):
@@ -615,13 +619,9 @@ def required_action_for_attempt(
             if status == "done":
                 return "inspect-done-failure"
 
-    if status in OPEN_STATES:
-        return "complete-open"
-    if status != "done":
+    if status not in OPEN_STATES | {"done"}:
         raise JoinContractError("owned-row-status-invalid")
-    if metadata.get("failure_class") == "pass" or metadata.get("note") in SUCCESS_NOTES:
-        return "advance-completed"
-    return "inspect-done-failure"
+    return required_action(status, metadata)
 
 
 def harvest_command_lines(prompt: str) -> list[str]:
@@ -713,8 +713,9 @@ class CurrentDeliveryState:
     quiescent: bool
     owned_children: int
     advanced: bool
-    supervisor_terminal: bool = False
-    subsession_terminal: bool = False
+    completion_proven: bool = False
+    terminal_conflict: bool = False
+    workflow_complete: bool = True
 
 
 def delivery_classification(state: CurrentDeliveryState) -> str:
@@ -723,15 +724,13 @@ def delivery_classification(state: CurrentDeliveryState) -> str:
     return (
         "success"
         if (
-            (
-                (state.marker is not None and bool(state.marker_digest))
-                or state.supervisor_terminal
-                or state.subsession_terminal
-            )
+            state.completion_proven
             and state.status == "done"
             and state.verdict == "PASS"
             and state.quiescent
             and state.owned_children == 0
+            and not state.terminal_conflict
+            and state.workflow_complete
         )
         else "attention"
     )
@@ -743,9 +742,73 @@ def delivery_required_action(state: CurrentDeliveryState) -> str:
     classification = delivery_classification(state)
     if classification == "success":
         return "advance-completed"
+    if not state.workflow_complete:
+        return "finish-workflow"
     if state.status in OPEN_STATES:
         return "complete-open"
     return "inspect-done-failure"
+
+
+def completion_harvest_command(attempt_id: str, action: str, *, jobs: str, surface: str) -> str:
+    """Project an already-decided record action; grant no workflow authority."""
+    if action == "finish-workflow":
+        utility = Path(__file__).with_name("dispatch_terminal_commit.py")
+        return f"python3 {shlex.quote(str(utility))} finish --jobs {shlex.quote(jobs)} --attempt {shlex.quote(attempt_id)}"
+    if action not in {"complete-open", "inspect-done-failure"}:
+        return ""
+    registry = f"--jobs {shlex.quote(jobs)} " if jobs else ""
+    status = "--status open --mark-done" if action == "complete-open" else "--status done"
+    return f"{shlex.quote(surface)} harvest {registry}--attempt-id {shlex.quote(attempt_id)} {status}"
+
+
+def completion_followup_text(receipt: dict, *, jobs: str, surface: str) -> str:
+    # A submitted work request already owns preparation and continuation. Give
+    # its parent that exact handle again, rather than ask it to rediscover a
+    # route or synthesize a new workflow from generic harvest instructions.
+    work_commands = {}
+    completed_work = set()
+    if jobs:
+        from route_identity import route_hash
+        for child in receipt["children"]:
+            try:
+                row = exact_attempt_row(Path(jobs), child["attempt_id"])
+                meta = row.metadata
+                if meta.get("dispatch_depth") != "1" or meta.get("worker_type") not in {"frame", "owner"}:
+                    continue
+                if meta["worker_type"] == "owner" and child["required_action"] == "advance-completed":
+                    if meta.get("workflow_completion") == "runtime-v1":
+                        completed_work.add(child["attempt_id"])
+                    continue  # Already sealed; successful work has no extra command obligation.
+                path = Path(meta.get("owner_route_file") or meta.get("route_file") or "")
+                route = json.loads(path.read_text())
+                if (not route.get("work_request") or route.get("route_hash") != route_hash(route)
+                        or route["route_hash"] != (meta.get("owner_route_hash") or meta.get("route_hash"))
+                        or route.get("route_id") != (meta.get("owner_route_id") or meta.get("route_id"))):
+                    continue
+                work_commands[child["attempt_id"]] = shlex.join([
+                    sys.executable, str(Path(__file__).absolute().with_name("capability-route.py")),
+                    "start", "--route", str(path), "--jobs", jobs])
+            except (OSError, ValueError, KeyError, JoinContractError):
+                continue  # Legacy/corrupt context retains the exact inspection surface below.
+    commands = [work_commands.get(child["attempt_id"]) or
+                completion_harvest_command(child["attempt_id"], child["required_action"],
+                    jobs=jobs, surface=surface) for child in receipt["children"]]
+    if completed_work and all(child["attempt_id"] in completed_work for child in receipt["children"]):
+        return ("The requested work is complete, including its declared stages and runtime workflow/route/cycle settlement. "
+                "Report the result to the user. No harvest, next-stage launch, route restart, or manual finalization is required.")
+    if work_commands:
+        text = "\n".join(dict.fromkeys(command for command in commands if command))
+        return ("Continue the existing work with its exact handle:\n" + text
+                + "\nThis reuses registered attempts and the shared outcome/cleanup controller. "
+                  "It returns the current frame results and whether a native user question is ready. "
+                  "Use those exact results; another cycle's artifact cannot replace a failed frame. "
+                  "No replacement launch or manual workflow/cycle finalization is implied.")
+    command_text = "\n".join(command for command in commands if command) or "(no harvest command; advance the route)"
+    return ("Completion bookkeeping for the listed attempts:\n" + command_text
+            + "\nThe commands use the shared, runtime-neutral registry harvest compatibility surface; "
+              "it does not select or change the owner or child harness. "
+              "Continue the authorized work within its existing human gates. "
+              "This receipt creates no new approval step.")
 
 
 def delivery_timing_fields(**values: int | None) -> dict[str, int | None]:
@@ -1304,7 +1367,7 @@ def read_supervisor_state(
 def child_row_revision(row: ChildRow) -> str:
     """Return the bounded exact-row revision sealed into an outbox receipt."""
 
-    return hashlib.sha256(row.raw.encode("utf-8")).hexdigest()
+    return attempt_raw_row_sha256(row.raw)
 
 
 def receipt_with_current_actions(
@@ -1514,6 +1577,31 @@ def consume_supervisor_outbox_attempts(
             set(state.delivered_attempt_ids),
             phase=phase,
             outbox=next_outbox,
+        )
+        return True
+
+
+def acknowledge_supervisor_delivery(
+    path: Path | None, parent_attempt_id: str, receipt_id: str,
+) -> bool:
+    """Acknowledge the exact notification after the runtime's receiving turn.
+
+    This commits delivery only. It never closes a worker, publishes a marker,
+    authorizes retry, or requires the model to execute a bookkeeping command.
+    """
+    if path is None or not receipt_id:
+        return False
+    with _supervisor_state_lock(path):
+        state = read_supervisor_phase_state(path, parent_attempt_id)
+        if state is None:
+            return False
+        if state.outbox is None:
+            return True
+        if state.outbox.receipt_id != receipt_id:
+            return False
+        _write_supervisor_state_unlocked(
+            path, parent_attempt_id, set(state.delivered_attempt_ids),
+            phase="running-turn", outbox=None,
         )
         return True
 
@@ -2717,6 +2805,9 @@ def current_delivery_state(
     if result.advanced:
         # SD-111 P2 trigger 1: the registry lock already released above.
         materialize_after_terminal_close(jobs, attempt_id)
+    from dispatch_terminal_commit import owner_completion_pending
+    current = current_attempt_row(jobs, attempt_id) if result.advanced else snapshot
+    workflow_complete = current is None or not owner_completion_pending(jobs, current.status, current.metadata)
     return CurrentDeliveryState(
         marker=result.marker,
         marker_digest=result.marker_digest,
@@ -2727,8 +2818,9 @@ def current_delivery_state(
         quiescent=result.quiescent,
         owned_children=result.owned_children,
         advanced=result.advanced,
-        supervisor_terminal=result.supervisor_terminal,
-        subsession_terminal=result.subsession_terminal,
+        completion_proven=result.completion_proven,
+        terminal_conflict=result.terminal_conflict,
+        workflow_complete=workflow_complete,
     )
 
 
@@ -2847,46 +2939,130 @@ def supervisor_guarded_attempt_ids(
     return guarded
 
 
-def _liveness_state(
-    row: ChildRow,
-    command: list[str],
-    env: dict[str, str],
-    timeout: float = 30.0,
-) -> str:
-    """Return ``alive`` or ``terminal`` without exposing liveness output."""
+def join_observation_path(jobs: Path, identity: dict[str, str]) -> Path:
+    key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+    return jobs.resolve().parent / "join-observations" / f"{key}.json"
 
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
-        fields = row.raw.split("\t")
-        if len(fields) == 6 and fields[1] == "running":
-            fields[1] = "open"
-        handle.write("\t".join(fields) + "\n")
-        registry = Path(handle.name)
+
+def read_join_observation(jobs: Path, identity: dict[str, str], *, now: float | None = None) -> dict:
+    """Read a fresh exact-parent diagnostic; it never grants completion."""
+    path = join_observation_path(jobs, identity)
     try:
-        result = subprocess.run(
-            [*command, str(registry)],
-            env={**env, "AGENT_DISPATCH_JOBS": str(registry)},
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=max(0.1, timeout),
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise JoinContractError("liveness-contract-unavailable") from exc
+        if path.is_symlink() or path.stat().st_size > MAX_STATE_BYTES:
+            return {}
+        value = json.loads(path.read_text(encoding="utf-8"))
+        age = (time.time() if now is None else now) - value["observed_at"]
+        if (value.get("schema_version") != 1 or value.get("identity") != identity
+                or not 0 <= age <= 120 or value.get("state") not in {"waiting", "attention", "ready"}
+                or not isinstance(value.get("children"), list)):
+            return {}
+        return value
+    except (OSError, ValueError, TypeError, KeyError):
+        return {}
+
+
+def write_join_observation(jobs: Path, identity: dict[str, str], children: list[dict],
+                           *, elapsed: float, recovery_results: dict) -> None:
+    """Publish bounded diagnostics separately from the completion receipt."""
+    pending = [child for child in children if child["readiness"] == "pending"]
+    attention = elapsed >= 30 and any(child["reason"] == "process-unverifiable" for child in pending)
+    value = {"schema_version": 1, "identity": identity, "observed_at": time.time(),
+             "state": "attention" if attention else ("waiting" if pending else "ready"),
+             "elapsed_seconds": round(elapsed, 1),
+             "pending_count": len(pending),
+             "children": [{"attempt_id": child["attempt_id"], "reason": child["reason"],
+                           "recovery_reason": recovery_results.get(child["attempt_id"], {}).get("reason", "")}
+                          for child in pending[:16]]}
+    path = join_observation_path(jobs, identity)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
     finally:
         try:
-            registry.unlink()
-        except OSError:
+            os.unlink(temporary)
+        except FileNotFoundError:
             pass
-    if result.returncode == 0:
-        return "alive"
-    if result.returncode == 3:
-        return "terminal"
-    raise JoinContractError("liveness-contract-failed")
+
+
+def recover_receiptless_attempt(jobs: Path, row: ChildRow) -> dict[str, object]:
+    """Ask the existing proof authority to settle one exact receiptless row.
+
+    A failed observation never grants cancellation. The registry helper owns
+    proof, revalidation, and closure; the join only schedules the bounded check.
+    """
+    if row.status not in OPEN_STATES:
+        return resolve_attempt_cleanup(jobs, row.attempt_id, apply=True)
+    command = [
+        sys.executable, str(ROOT / "utilities" / "dispatch-registry.py"),
+        "reconcile", "--attempt", row.attempt_id,
+        "--automatic-cancel-receiptless", "--apply",
+        "--cancellation-wait", "0", "--jobs", str(jobs),
+    ]
+    try:
+        result = subprocess.run(command, text=True, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, timeout=10, check=False)
+        record = json.loads(result.stdout)
+        decisions = record.get("decisions")
+        if (result.returncode != 0
+                or record.get("classifier_source") != AUTOMATIC_RECEIPTLESS_CLASSIFIER
+                or not isinstance(decisions, list) or len(decisions) != 1
+                or decisions[0].get("attempt_id") != row.attempt_id):
+            raise ValueError("recovery-contract-invalid")
+        decision = decisions[0]
+        closed = decision.get("closed") == 1
+        if closed and not str(decision.get("receipt_digest") or "").startswith("sha256:"):
+            raise ValueError("recovery-proof-missing")
+        return {"attempt_id": row.attempt_id, "closed": closed,
+                "reason": str(decision.get("reason") or "recovery-unavailable")[:160]}
+    except (OSError, ValueError, TypeError, AttributeError, subprocess.TimeoutExpired):
+        return {"attempt_id": row.attempt_id, "closed": False,
+                "reason": "recovery-process-failed"}
+
+
+def settle_finished_attempt(jobs: Path, row: ChildRow) -> dict[str, object]:
+    """Commit exact terminal evidence before a runtime join can deliver it.
+
+    Reapers and joiners use the same terminal writers. The canonical row, not
+    a writer's exit code, proves that the transition actually committed.
+    """
+    reason = ""
+    try:
+        if _route_free_review_row(row):
+            expected = (row.attempt_id, int(row.metadata.get("pid", "0")),
+                        row.metadata.get("pid_start", ""), int(row.metadata.get("pgid", "0")))
+            fresh = exact_attempt_row(jobs, row.attempt_id)
+            if fresh.status not in OPEN_STATES:
+                return {"attempt_id": row.attempt_id, "closed": True, "reason": "terminal-committed"}
+            classification = classify_exact_route_free_review_outcome(
+                fresh, jobs=jobs, expected_attempt_id=expected[0], expected_pid=expected[1],
+                expected_pid_start=expected[2], expected_pgid=expected[3],
+                quiescence=attempt_process_quiescence(fresh.metadata))
+            reason = apply_exact_route_free_review_classification(
+                fresh, jobs=jobs, classification=classification)
+        else:
+            reason = close_finished_child(row, jobs=jobs)
+        current = exact_attempt_row(jobs, row.attempt_id)
+        if current.status == "done" and current.metadata.get("workflow_completion") == "runtime-v1":
+            from dispatch_terminal_commit import owner_completion_pending
+            materialize_after_terminal_close(jobs, current.attempt_id)
+            if owner_completion_pending(jobs, current.status, current.metadata):
+                return {"attempt_id": row.attempt_id, "closed": False, "reason": "workflow-completion-pending"}
+        return {"attempt_id": row.attempt_id, "closed": current.status not in OPEN_STATES,
+                "reason": reason or ("terminal-committed" if current.status not in OPEN_STATES
+                                     else "terminal-commit-unconfirmed")}
+    except (DispatchContractError, JoinContractError, OSError, ValueError) as exc:
+        return {"attempt_id": row.attempt_id, "closed": False,
+                "reason": str(getattr(exc, "reason", type(exc).__name__))[:160]}
 
 
 def _join_snapshot(
     *,
+    jobs: Path,
     initial: list[ChildRow],
     refresh: Callable[[set[str]], list[ChildRow]],
     identity: dict[str, str],
@@ -2895,11 +3071,12 @@ def _join_snapshot(
     liveness_command: list[str] | None,
     liveness_probe_timeout: float,
     env: dict[str, str] | None,
+    recovery: Callable[[ChildRow], dict[str, object]] | None = None,
+    observation_jobs: Path | None = None,
+    settlement: Callable[[ChildRow], dict[str, object]] | None = None,
 ) -> dict[str, object]:
     """Join one immutable exact-attempt snapshot."""
 
-    command = liveness_command or [str(ROOT / "utilities" / "dispatch-liveness.sh")]
-    runtime_env = dict(os.environ if env is None else env)
     interval = max(0.05, interval)
     timeout = max(0.0, timeout)
     if not initial:
@@ -2911,11 +3088,20 @@ def _join_snapshot(
         }
     snapshot = {row.attempt_id for row in initial}
     started = time.monotonic()
+    last_recovery: dict[str, float] = {}
+    last_settlement: dict[str, float] = {}
+    recovery_results: dict[str, dict[str, object]] = {}
+    last_observation = float("-inf")
+    last_signature = ""
+    observation_error = ""
+    notice_published = False
+    last_notice_attempt = float("-inf")
 
     while True:
         rows = refresh(snapshot)
         children: list[dict[str, str]] = []
         pending = False
+        recovered = False
         for row in rows:
             observed = observed_attempt_liveness(
                 row.status,
@@ -2929,56 +3115,45 @@ def _join_snapshot(
                 # even when their final runtime envelope is not visible yet.
                 terminal_receipt_gate=True,
             )
-            if row.status == "done":
-                if observed.state == "terminal":
-                    readiness, reason = "ready", "registry-closed"
-                elif (
-                    observed.process_reason == "attempt-descendant-live"
-                    and _marker_bound_prepare_marker_proof(
-                        row.metadata, row.attempt_id
-                    ) is not None
-                ):
-                    # SD-OPEN-47 (H7-c): the exact leader is gone and the row
-                    # is live only through tagged residue (a background shell,
-                    # a detached wait), while the completion marker chain
-                    # already proves this attempt finished. That residue must
-                    # not hold the owner in `runtime_wait: registered-children`
-                    # until the join times out and reparks forever. A live
-                    # exact leader (`*-pid-live`) or a missing post-exit
-                    # receipt keeps the SD-79/80/89 gate as before (review
-                    # finding 3).
-                    readiness, reason = "ready", "registry-closed-marker"
-                else:
-                    readiness = "pending"
-                    reason = (
-                        "process-alive"
-                        if observed.state == "alive"
-                        else "process-unverifiable"
-                    )
-                    pending = True
-            elif row.status in OPEN_STATES:
-                if observed.state == "alive":
-                    readiness, reason = "pending", "process-alive"
-                    pending = True
-                elif observed.state == "reconcile-needed":
-                    readiness, reason = "ready", "terminal-observed"
-                elif observed.process_reason == "post-exit-receipt-incomplete":
-                    # A namespace-local fallback probe cannot replace the
-                    # wrapper-issued portable receipt.
-                    readiness, reason = "pending", "process-unverifiable"
-                    pending = True
-                else:
-                    probe = _liveness_state(
-                        row, command, runtime_env, liveness_probe_timeout
-                    )
-                    if probe == "terminal":
-                        readiness, reason = "ready", "terminal-observed"
-                    else:
-                        readiness = "pending"
-                        reason = "process-unverifiable"
-                        pending = True
-            else:
+            if row.status not in OPEN_STATES | {"done"}:
                 raise JoinContractError("owned-row-status-invalid")
+            decision = decide_attempt(
+                row.status, row.metadata,
+                process_state=observed.process_state,
+                process_reason=observed.process_reason,
+                terminal_observed=observed.reason == "terminal-observed",
+            )
+            from dispatch_terminal_commit import owner_completion_pending
+            workflow_pending = owner_completion_pending(jobs, row.status, row.metadata)
+            if decision.action in {"wait", "recover"}:
+                readiness = "pending"
+                reason = "process-alive" if decision.action == "wait" else "process-unverifiable"
+                pending = True
+            else:
+                readiness = "ready"
+                reason = "registry-closed" if row.status == "done" else "terminal-observed"
+            if workflow_pending:
+                readiness, reason, pending = "pending", "workflow-completion-pending", True
+            if (settlement is not None and (readiness == "ready" and row.status in OPEN_STATES or workflow_pending)
+                    and decision.action != "inspect-conflict"):
+                if time.monotonic() - last_settlement.get(row.attempt_id, float("-inf")) >= 2:
+                    last_settlement[row.attempt_id] = time.monotonic()
+                    outcome = settlement(row)
+                    recovery_results[row.attempt_id] = outcome
+                    recovered = recovered or outcome.get("closed") is True
+                # A quiescent process is not a committed outcome. Keep the
+                # recovery obligation and its bounded parent notice active.
+                readiness, reason, pending = "pending", ("workflow-completion-pending" if workflow_pending
+                                                        else "terminal-commit-pending"), True
+            if (recovery is not None and readiness == "pending"
+                    and reason == "process-unverifiable"
+                    and row.metadata.get("registered_worker") == "1"
+                    and row.metadata.get("pid_scope") == "namespace-local"
+                    and time.monotonic() - last_recovery.get(row.attempt_id, float("-inf")) >= 30):
+                last_recovery[row.attempt_id] = time.monotonic()
+                outcome = recovery(row)
+                recovery_results[row.attempt_id] = outcome
+                recovered = recovered or outcome.get("closed") is True or outcome.get("changed") is True
             children.append(
                 {
                     "attempt_id": row.attempt_id,
@@ -2986,11 +3161,36 @@ def _join_snapshot(
                     "status": row.status,
                     "readiness": readiness,
                     "reason": reason,
-                    "required_action": required_action_for_attempt(
-                        row.status, row.metadata
-                    ),
+                    "required_action": ("finish-workflow" if workflow_pending
+                                        else required_action_for_attempt(row.status, row.metadata)),
                 }
             )
+        if recovered:
+            # Re-read the canonical rows and all process evidence. The helper's
+            # exit code or JSON alone never makes a child ready.
+            continue
+        signature = json.dumps(children, sort_keys=True)
+        elapsed = time.monotonic() - started
+        if observation_jobs is not None and (signature != last_signature
+                or time.monotonic() - last_observation >= 30):
+            try:
+                write_join_observation(observation_jobs, identity, children,
+                                       elapsed=elapsed, recovery_results=recovery_results)
+                observation_error = ""
+            except OSError:
+                # A display record never owns the child's lifetime or verdict.
+                observation_error = "join-observation-write-failed"
+            last_signature, last_observation = signature, time.monotonic()
+        if (not notice_published and observation_jobs is not None and elapsed >= 30
+                and time.monotonic() - last_notice_attempt >= 30
+                and any(child["reason"] == "process-unverifiable" for child in children)):
+            last_notice_attempt = time.monotonic()
+            try:
+                from dispatch_supervision import materialize
+                materialize(observation_jobs, snapshot, reason="process-unverifiable")
+                notice_published = True
+            except (OSError, ValueError, pending_delivery.PendingDeliveryError) as exc:
+                observation_error = "supervision-notice-unpersisted:" + str(exc)
         if not pending:
             return {
                 "schema_version": SCHEMA_VERSION,
@@ -3007,8 +3207,34 @@ def _join_snapshot(
                 "state": "timeout",
                 **identity,
                 "children": children,
+                "recovery_diagnostics": list(recovery_results.values()),
+                "observation_error": observation_error,
             }
         time.sleep(interval)
+
+
+def join_selected_attempts(*, jobs: Path, expected_attempts: set[str],
+                           timeout: float = 0.0, interval: float = 2.0,
+                           recover: bool = True) -> dict[str, object]:
+    """Use the runtime join for an operator's exact selected attempts too.
+
+    Selection is done by the caller; subsequent observations keep that fixed
+    identity set. The same terminal writers and cleanup recovery own progress.
+    No parent runtime or completion-note vocabulary is inferred here.
+    """
+    def refresh(attempts):
+        return [exact_attempt_row(jobs, attempt) for attempt in sorted(attempts)]
+
+    return _join_snapshot(
+        jobs=jobs,
+        initial=refresh(expected_attempts), refresh=refresh,
+        identity={"selected_attempts": ",".join(sorted(expected_attempts))},
+        interval=interval, timeout=timeout, liveness_command=None,
+        liveness_probe_timeout=30.0, env=None,
+        recovery=(lambda row: recover_receiptless_attempt(jobs, row)) if recover else None,
+        observation_jobs=jobs if recover else None,
+        settlement=(lambda row: settle_finished_attempt(jobs, row)) if recover else None,
+    )
 
 
 def join_batch(
@@ -3020,11 +3246,13 @@ def join_batch(
     timeout: float = 3600.0,
     liveness_command: list[str] | None = None,
     env: dict[str, str] | None = None,
+    recover_receiptless: bool = False,
 ) -> dict[str, object]:
     """Join one immutable child batch sealed to an exact parent attempt."""
 
     initial = current_children(jobs, parent_attempt_id, expected_attempts)
     return _join_snapshot(
+        jobs=jobs,
         initial=initial,
         refresh=lambda snapshot: current_children(jobs, parent_attempt_id, snapshot),
         identity={"parent_attempt_id": parent_attempt_id},
@@ -3033,6 +3261,9 @@ def join_batch(
         liveness_command=liveness_command,
         liveness_probe_timeout=30.0,
         env=env,
+        recovery=(lambda row: recover_receiptless_attempt(jobs, row)) if recover_receiptless else None,
+        observation_jobs=jobs if recover_receiptless else None,
+        settlement=(lambda row: settle_finished_attempt(jobs, row)) if recover_receiptless else None,
     )
 
 
@@ -3046,6 +3277,7 @@ def join_session_batch(
     timeout: float = 540.0,
     liveness_command: list[str] | None = None,
     env: dict[str, str] | None = None,
+    recover_receiptless: bool = False,
 ) -> dict[str, object]:
     """Join one exact batch sealed to an interactive parent session."""
 
@@ -3056,6 +3288,7 @@ def join_session_batch(
         parent_completion_delivery,
     )
     return _join_snapshot(
+        jobs=jobs,
         initial=initial,
         refresh=lambda snapshot: current_session_children(
             jobs,
@@ -3069,6 +3302,9 @@ def join_session_batch(
         liveness_command=liveness_command,
         liveness_probe_timeout=5.0,
         env=env,
+        recovery=(lambda row: recover_receiptless_attempt(jobs, row)) if recover_receiptless else None,
+        observation_jobs=jobs if recover_receiptless else None,
+        settlement=(lambda row: settle_finished_attempt(jobs, row)) if recover_receiptless else None,
     )
 
 
@@ -3088,7 +3324,9 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--attempt-id", action="append", default=[])
     value.add_argument("--interval", type=float, default=2.0)
     value.add_argument("--timeout", type=float, default=3600.0)
-    value.add_argument("--liveness-command")
+    value.add_argument("--liveness-command", help="Compatibility input; only shared exact process evidence decides readiness")
+    value.add_argument("--recover-receiptless", action="store_true",
+                       help="run bounded exact-proof recovery while joining owned children")
     return value
 
 
@@ -3122,6 +3360,7 @@ def main(argv: list[str] | None = None) -> int:
                     set(args.attempt_id) if args.attempt_id else None
                 ),
                 parent_completion_delivery=args.parent_completion_delivery,
+                recover_receiptless=args.recover_receiptless,
                 interval=args.interval,
                 timeout=args.timeout,
                 liveness_command=liveness,
@@ -3130,6 +3369,7 @@ def main(argv: list[str] | None = None) -> int:
             receipt = join_batch(
                 jobs=Path(args.jobs),
                 parent_attempt_id=args.parent_attempt_id or "",
+                recover_receiptless=args.recover_receiptless,
                 expected_attempts=(
                     set(args.attempt_id) if args.attempt_id else None
                 ),
@@ -3284,24 +3524,204 @@ def route_completion_evidence(
     return artifact, ""
 
 
-def close_finished_child(row: ChildRow, *, jobs: str | Path) -> str:
-    """Close one finished-but-open child from its own terminal evidence.
+@dataclass(frozen=True)
+class ExactReviewClassification:
+    """A neutral decision shared by reaper and registry reconciliation."""
 
-    A route-bound node may only be closed through the completion-marker path
-    (OPERATIONS §5.10, SD-70); `dispatch-harvest --mark-done` refuses it with
-    `route-completion-required`. The supervised-parent park hook in turn admits
-    only that harvest command (`classify_supervised_shell_command`), so a
-    supervised owner cannot execute the one command that would work: the model
-    has no legal exit and the batch deadlocks until the owner is killed. A
-    supervisor is not park-guarded and already owns the join outside the model
-    loop, so it performs this closure itself.
+    state: str
+    reason: str
+    note: str | None
+    close_action: str
 
-    Completion is never invented — without a valid terminal envelope naming an
-    in-root artifact the child stays open and the caller keeps its existing
-    failure. Returns ``""`` on success, else a short skip reason.
+    def as_registry_tuple(self) -> tuple[str, str, str | None]:
+        return self.state, self.reason, self.note
+
+
+def _route_free_review_row(row: ChildRow) -> bool:
+    metadata = row.metadata
+    return (
+        metadata.get("transport") == "headless"
+        and metadata.get("execution_surface") == "registered-headless"
+        and metadata.get("registered_worker") == "1"
+        and metadata.get("dispatch_depth") == "1"
+        and metadata.get("worker_type") == "review"
+        and metadata.get("launch_lifecycle") in {"foreground-scoped", "detached"}
+        and not any(metadata.get(key) for key in ROUTE_IDENTITY_METADATA_KEYS)
+    )
+
+
+def classify_exact_route_free_review_outcome(
+    row: ChildRow,
+    *,
+    jobs: str | Path,
+    expected_attempt_id: str,
+    expected_pid: int,
+    expected_pid_start: str,
+    expected_pgid: int,
+    quiescence: ProcessQuiescence,
+) -> ExactReviewClassification:
+    """Classify one sealed, route-free review without mutating its row."""
+
+    if not _route_free_review_row(row):
+        return ExactReviewClassification(
+            "contract-invalid", "foreground-outcome-ineligible",
+            "dead-foreground-outcome-ineligible", "typed-close"
+        )
+    detached = row.metadata.get("launch_lifecycle") == "detached"
+    if not foreground_review_eligible(
+        {**row.metadata, "launch_lifecycle": "foreground-scoped"},
+        expected_attempt_id=expected_attempt_id,
+        expected_pid=expected_pid,
+        expected_pid_start=expected_pid_start,
+        expected_pgid=expected_pgid,
+    ):
+        return ExactReviewClassification(
+            "contract-invalid", "foreground-outcome-binding-mismatch",
+            "dead-foreground-outcome-binding-mismatch", "typed-close"
+        )
+    seal_error = None
+    try:
+        raw_fields = row.raw.split("\t")
+        if len(raw_fields) != 6:
+            raise DispatchContractError("foreground-outcome-malformed")
+        sealed = (detached_review_outcome_from_pipe(raw_fields[5]) if detached
+                  else _foreground_outcome_values_from_pipe(raw_fields[5]))
+    except (DispatchContractError, IndexError) as exc:
+        sealed = None
+        seal_error = exc
+    if sealed is None:
+        if seal_error is not None:
+            if quiescence.state != "quiescent":
+                return ExactReviewClassification(
+                    "active", f"foreground-process-{quiescence.reason}", None, "pending"
+                )
+            return ExactReviewClassification(
+                "terminal-handoff", seal_error.reason,
+                "dead-foreground-outcome-malformed", "typed-close"
+            )
+        if detached and quiescence.state == "quiescent":
+            return ExactReviewClassification(
+                "terminal-handoff", "review-process-outcome-missing",
+                "dead-review-process-outcome-missing", "typed-close"
+            )
+        return ExactReviewClassification(
+            "active", "foreground-outcome-pending", None, "pending"
+        )
+    if quiescence.state != "quiescent":
+        return ExactReviewClassification(
+            "active", f"foreground-process-{quiescence.reason}", None, "pending"
+        )
+    if sealed["foreground_process_failure"] != "none":
+        failure = sealed["foreground_process_failure"]
+        return ExactReviewClassification(
+            "terminal-handoff", f"foreground-process-{failure}", f"dead-{failure}", "typed-close"
+        )
+    metadata = row.metadata
+    terminal = inspect_terminal_attempt(
+        metadata.get("log_file"),
+        worktree=_row_worktree(row),
+        artifact_root_metadata=metadata.get("artifact_root"),
+        worker_type=metadata.get("worker_type"),
+    )
+    if terminal.get("state") != "valid":
+        state = str(terminal.get("state") or "absent")
+        reason = str(terminal.get("reason") or f"terminal-{state}")
+        note = "dead-missing-result" if state == "absent" else "dead-invalid-envelope"
+        return ExactReviewClassification("terminal-handoff", reason, note, "typed-close")
+    verdict = str(terminal.get("verdict") or "")
+    if verdict in {"FAIL", "BLOCKED"}:
+        if review_blocking_handoff(terminal, metadata.get("worker_type")):
+            return ExactReviewClassification(
+                "terminal-handoff", "typed-review-blocking", REVIEW_BLOCKING_NOTE, "typed-close"
+            )
+        note = "dead-worker-fail" if verdict == "FAIL" else "dead-worker-blocked"
+        return ExactReviewClassification("terminal-handoff", f"typed-{verdict.lower()}", note, "typed-close")
+    if verdict != "PASS":
+        return ExactReviewClassification("terminal-handoff", "terminal-verdict-invalid", "dead-invalid-envelope", "typed-close")
+    if terminal.get("artifact_state") != "readable":
+        return ExactReviewClassification(
+            "terminal-handoff", f"evidence-{terminal.get('artifact_state') or 'absent'}",
+            "dead-invalid-envelope", "typed-close"
+        )
+    artifact, evidence_reason = route_completion_evidence(
+        metadata, worktree=_row_worktree(row)
+    )
+    if artifact is None:
+        return ExactReviewClassification(
+            "terminal-handoff", evidence_reason, "dead-invalid-envelope", "typed-close"
+        )
+    try:
+        validate_review_output_binding(
+            jobs,
+            attempt_id=row.attempt_id,
+            output_path=artifact,
+            cycle_id=metadata.get("review_cycle_id", ""),
+            producer_id=metadata.get("review_producer_id", ""),
+            capability=metadata.get("capability", ""),
+            unit=metadata.get("unit", ""),
+            worktree=_row_worktree(row),
+            artifact_root=metadata.get("artifact_root", ""),
+        )
+    except (DispatchContractError, OSError) as exc:
+        return ExactReviewClassification(
+            "terminal-handoff", getattr(exc, "reason", "review-output-binding-invalid"),
+            "dead-invalid-envelope", "typed-close"
+        )
+    return ExactReviewClassification("done", "detached-review-pass" if detached else "foreground-review-pass", "completed-review", "wrapper-pass")
+
+
+def review_terminal_evidence(note: str, reason: str) -> dict[str, str]:
+    """Preserve the classifier's result at every review terminal writer."""
+    return {
+        "classifier_source": "foreground-review-classifier-v1",
+        "reconcile_reason": reason,
+        "failure_class": "pass" if note == "completed-review" else "contract",
+    }
+
+
+def apply_exact_route_free_review_classification(
+    row: ChildRow, *, jobs: str | Path, classification: ExactReviewClassification
+) -> str:
+    """Apply one already-computed review decision through one terminal CAS."""
+
+    if classification.close_action == "pending":
+        return "pending"
+    if classification.close_action == "typed-close":
+        return close_finished_child(row, jobs=jobs, classification=classification)
+    if classification.close_action == "wrapper-pass":
+        return close_wrapper_pass(row, jobs=jobs, classification=classification)
+    return "foreground-outcome-close-action-invalid"
+
+
+def close_finished_child(
+    row: ChildRow, *, jobs: str | Path, classification: ExactReviewClassification | None = None
+) -> str:
+    """Reconcile cleanup or commit a still-open child's exact terminal evidence.
+
+    The runtime owns this transition; a model need not harvest to acknowledge
+    delivery or close rows. Committed results are never reclassified here.
     """
 
+    if row.status not in OPEN_STATES:
+        result = resolve_attempt_cleanup(Path(jobs), row.attempt_id, apply=True)
+        return "" if result["settled"] else str(result["reason"])
     metadata = getattr(row, "metadata", {}) or {}
+    if classification is not None:
+        if classification.close_action == "pending":
+            return "pending"
+        if classification.close_action == "wrapper-pass":
+            return "classification-action-mismatch"
+        try:
+            closed = close_attempt_row(
+                Path(jobs), row.attempt_id, classification.note or "dead-foreground-review",
+                evidence=review_terminal_evidence(classification.note, classification.reason),
+            )
+        except (DispatchContractError, OSError) as exc:
+            return getattr(exc, "reason", type(exc).__name__)
+        if closed:
+            materialize_after_terminal_close(Path(jobs), row.attempt_id)
+            return ""
+        return classification.reason
     route_file = metadata.get("route_file")
     route_node = metadata.get("route_node")
     if not route_file or not route_node:
@@ -3444,8 +3864,25 @@ def close_finished_child(row: ChildRow, *, jobs: str | Path) -> str:
     return completion
 
 
-def close_wrapper_pass(row: ChildRow, *, jobs: str | Path) -> str:
+def close_wrapper_pass(
+    row: ChildRow, *, jobs: str | Path, classification: ExactReviewClassification | None = None
+) -> str:
     """Complete one wrapper-reaped PASS or close a typed contract failure."""
+
+    if classification is not None:
+        if classification.close_action != "wrapper-pass":
+            return close_finished_child(row, jobs=jobs, classification=classification)
+        try:
+            closed = close_attempt_row(
+                Path(jobs), row.attempt_id, classification.note or "completed-review",
+                evidence=review_terminal_evidence(classification.note, classification.reason),
+            )
+        except (DispatchContractError, OSError) as exc:
+            return getattr(exc, "reason", type(exc).__name__)
+        if closed:
+            materialize_after_terminal_close(Path(jobs), row.attempt_id)
+            return ""
+        return classification.reason
 
     reason = close_finished_child(row, jobs=jobs)
     if not reason:

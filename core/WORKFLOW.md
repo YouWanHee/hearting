@@ -165,17 +165,46 @@ artifact and the entire evaluation ran inline in the main session.
 The precedence above decides which capability **owns the artifacts** of a
 request. It does not oblige the session to run that entry's whole recipe.
 Before proposing a route, choose the **shape** of the work from its size; the
-enumerated preset graph is one explicit choice among four, never the default
-a loosely matching request is bent into:
+shape and explicit choices determine the route; defaults only fill omissions:
 
 | Shape | When | Route |
 |---|---|---|
 | `direct` | one atomic, reversible change the session makes and checks inline | `capability-route.py compose --slug <slug>` — the inline node, dispatch depth 0 |
 | `solo` | one bounded piece of work that deserves its own registered session but no separate stages | `compose --shape solo` — one registered dispatch-depth-1 owner, no dispatch depth 2 |
-| `staged` | separable stages the session names itself | `compose --graph <stage,…>` — a dispatch-depth-1 owner plus the named stage subgraph of the owning capability, `standard+` |
-| preset | the request names the entry's full loop, or a promotion signal or spec-backed flow requires the enumerated recipe | `capability-route.py compile` with the registry recipe |
+| `staged` | work with separate stages | `compose --shape staged` uses the capability's standard recipe; optional `--graph <stage,…>` selects a subgraph |
 
-`compose` fills every other flag from the checkout: cwd, artifact root
+For execution, use `compose --start --prompt-file <task>` with the selected
+shape/graph; `--profile light` or `--owner <harness>` is an explicit choice.
+The task file contains the requested work, not instructions for running the
+parent. The runtime seals it, prepares its cycle, starts the frame pair when
+declared, and returns one receipt. Reuse that receipt's `resume_command` after
+wakes or input corrections. It reuses exact attempts, carries partial admission
+obligations, and never retries a failed attempt merely because it was called
+again. Follow its `parent_next` while work is running. An expired bounded wait
+returns `needs-attention`: report the pending work; runtime watchers retain
+execution/cleanup responsibility and the deadline grants no retry authority.
+`needs-interview` means both frames have been checked: compare their results,
+fill the returned semantic template, and use `start --route <file> --interview
+<question.json>`. It registers the gate before returning `needs-question`.
+After the native answer, use the same command with `--answers <answers.json>`;
+it records intent, releases the gate, and starts the owner. Already answered
+questions can supply both files without asking again. `--decision revise|stop`
+records those choices; repeated answers reuse the recorded decision.
+Runtime settlement closes the route and cycle before owner success is delivered.
+The model does not assemble launch tuples or artifact variables, harvest, or
+finalize ordinary work. Recovery commands name the exact
+attempt; a changed scope still belongs to the user.
+
+Without `--start`, `compose` returns the selected stages, profiles, human gates
+and canonical `route_file`; full evidence stays in that file. `--help-all`
+documents the advanced machine-compatible inputs, including `--full-record`.
+`compose` preserves the chosen stages and derives their dependencies. Inherited
+parallel presets that do not fit the selected graph are omitted; missing preset
+stages are not mandatory. The sealed result shows the realized stages and omitted
+defaults before execution. Input/output, explicit human gates, and terminal proof
+remain binding contracts for the selected work.
+`compile` remains the low-level explicit interface. Callers need not switch to it
+to obtain a complete recipe. `compose` fills omitted flags from the checkout: cwd, artifact root
 (`utilities/artifact-root.sh`), tracking and workflow mode by shape, a
 default drift verdict, the spec-read gate (it refuses with
 `compose-spec-read-required` when a `spec/prd.md` exists under the cwd or the
@@ -307,15 +336,11 @@ sessions read the detail they need after approval. If a runtime automatically
 injects a selected Skill body into main, do not duplicate that read; record the
 runtime limitation rather than claiming total-token savings.
 
-**Standard+ two-stage confirmation (SD-123).** For `autopilot-code` at
-`standard+`, the §0.4 gate above is a non-blocking `[실행 통지]` rather than a
-blocking card — the same five fields, in order, plus one closing line "frame
-뒤 방향 확인 예정" — and route compile/bind/producer-begin proceed immediately
-after it (frame never touches source, so the route-participation invariant
-above still holds). A second, blocking `[방향 확인]` card follows the frame
-group join, before the compiled bound successor starts (read from
-`human_gate_bindings` and the graph's actual successor node, `plan` in the
-common graph but not always):
+**Two-stage confirmation (SD-123).** For the five frame recipes at `quick+`,
+depth-0 submits `compose --start`; the runtime first compiles/binds the route,
+issues its producer cycle, and launches the two frame nodes. These steps authorize frame artifacts, not owner
+execution. After both briefs arrive, depth-0 presents this blocking direction
+card and the interview. User approval precedes the owner and the §0.4 notice:
 
 ```text
 [방향 확인]
@@ -323,79 +348,69 @@ common graph but not always):
 방향: <채택한 방향 한 줄>
 대안: <기각한 대안과 이유>
 위험: <frame이 찾은 최대 위험·가정>
-범위 변경: <시작 통지 대비 증감, 없으면 "없음">
-비용: <frame 실소비와 남은 단계·강도>
+범위 변경: <처음 요청 대비 증감, 없으면 "없음">
+비용: <frame 실소비·하네스 구성과 남은 단계·강도>
 
 → 진행(권장) / 수정: <틀린 부분> / 중단
 ```
 
 Deliver this card through a native structured-question surface when one is
 available, the plain-text form otherwise — the same fallback rule as the §0.4
-card. `confirmation.mode` (`profiles/dispatch-defaults.yaml`) governs
-the pair and has four values: `autonomous` (the shipped default as of O3 —
-resolved whenever a config's `confirmation` block or `mode` key is absent, for
-any schema version, and whenever no config file exists at all) drops both the
-post-frame `[방향 확인]` block and its `frame-review` human gate, but only for
-a non-composed route doing routine, already-authorized `autopilot-code`
-work — `frame`'s continuation realizes as `inline-next` and the compiled
-bound successor starts immediately; `hybrid` is the two-card shape
-above; `both` restores a blocking start card; `post-frame-only` drops the
-start notify entirely but keeps the post-frame gate. Explicit user-declared,
-composed-recipe, deploy, destructive, and other-capability gates are untouched by `autonomous`
-— it only ever removes the one routine `autopilot-code` `frame-review`
-binding. A route sealed with no `confirmation_mode` field at all (compiled
-before SD-123 introduced the field) keeps its recipe's legacy nodes and
-bindings verbatim and is never retro-fitted onto `autonomous`; a user file
-seeded from the shipped profile before this change, or that selects
-`hybrid`/`both`/`post-frame-only` explicitly, keeps that legacy behavior too —
-the shipped default change is not migrated into existing config files.
-`utilities/capability-route.py`'s `_effective_confirmation_graph()` is the one
-helper both compile and verify call to realize this, so the two paths cannot
-disagree.
+card. Only once the direction is confirmed does the owner start, and the §0.4
+gate then arrives as a non-blocking `[실행 통지]` — the same five fields, in
+order. It announces the route the confirmed direction produced; it does not
+re-ask a direction the user has already settled.
+`confirmation.mode` (`profiles/dispatch-defaults.yaml`, default `hybrid`)
+governs that ordered pair: `hybrid` is the shape above (blocking direction
+gate first, notice after), `both` makes the later notice blocking as well, and
+`post-frame-only` drops the notice entirely. A route compiled before this
+cycle keeps `frame.continuation=inline-next` and is never retro-fitted onto
+this gate.
 
-**The frame interview (SD-129).** On a `standard+` `autopilot-code` route
-whose compiled graph actually retains the `frame-review` binding — an
-explicitly declared `hybrid`, `both`, or `post-frame-only` `confirmation.mode`
-on a non-composed route, or equally any composed recipe that declares the
-gate — the `[방향 확인]` card is not the whole gate. The gate
-record names `shards/frame/interview.json`: the owner's
-one-sentence restatement of what the user wants, a plain-language brief, and
-the few decisions the frame legs could not settle without the user. The
-depth-0 session that receives the gate (asyncRewake wake or the next-prompt
-sweep) does the interview itself, in this order, and never leaves it to a
-helper:
+**The frame interview (SD-129).** The `[방향 확인]` card is not the whole
+gate. The gate record names its exact cycle-local interview: a one-sentence
+restatement of what the user wants, a plain-language brief, and the few
+decisions the frame legs could not settle without the user. The depth-0
+session builds that record from the joined frame legs and does the interview
+itself, in this order, and never leaves it to a helper:
 
-1. Ask first whether the restatement is right — the owner's sentence, verbatim,
+1. Ask first whether the restatement is right — that sentence, verbatim,
    with 예 / 아니오(고쳐 말하기) — and record a correction in the user's words.
 2. Put the `[방향 확인]` five-field summary as the card above.
-3. Ask each interview question through `AskUserQuestion` (at most four per
-   call), one topic per question, the recommended option first and labelled
+3. Ask each interview question through the native question tool, one topic
+   per question, the recommended option first and labelled
    (권장), each option with its one-line meaning; never paraphrase a question
    into harness vocabulary, and never add questions the interview does not
    carry. A tired reader must be able to answer without opening the plan.
-4. Write the answers with `frame_interview.py answers-template` as the shape
-   and record them on the release: `workflow-supervisor.py release --route
-   <route file> --gate frame-review --decision proceed --answers <file>`.
-   `proceed` without answers is refused for an interview gate.
+4. Put the actual responses in the returned `answers_template` and submit
+   `start --route <file> --answers <file>`. The runtime renders intent and
+   records the release that authorizes owner launch. A repeated submission
+   reuses it. Legacy recovery: `workflow-supervisor.py
+   release --route <route file> --gate frame-review --decision proceed --answers <file>`.
 
-Question counts are bounded by intensity — at most 7 at `standard+`, 3 at
-`quick`, 1 at `direct` — and the validator refuses an interview that breaks
-the plain-language rules before it reaches anyone (the `standard+` cap and
-the wording rules are machine-checked at the raise; steps 1–3 above and the
-`direct`/`quick` caps are obligations on the acting session that nothing
-checks mechanically). `direct`/`quick` have no `frame` node: the acting
-session asks its 0–1 / 0–3 questions — concerning only decisions the request
-and recovered context leave unresolved — of the same kind inline, inside the
-§0.4 confirmation step (the blocking card, or the non-blocking `[경로]` line
-when the sealed `small_work_confirmation` is `notice`), and records the
-answers in the plan or the work log.
-The recorded answers become `shards/frame/intent.md` (owner-rendered), the
-brief the compiled bound successor reads first; when that successor is
-`plan`, `plan-author` is told to cite each decision by its question id and to
-report one it cannot honor as a blocker — a prompt contract, not a gate
-check. Any other successor receives the same recorded intent through its own
-normal handoff, not an invented plan node. An interview gate may be raised at
-most twice per route (`round` ≤ 2).
+`OPERATIONS §5.10b` owns selector mechanics and the one-time `top`→`deep`
+demotion; the public work entry owns launch calls and artifact context. Both legs
+are always waited for — past the hard limit depth-0 stops and asks, rather
+than proceeding on one — and differing direction verdicts go side by side,
+nothing downstream starting until the user picks one. Step 1 is asked even
+when the interview carries zero questions; `understanding_confirmed` records
+that answer.
+
+Question counts are bounded by intensity, and `QUESTION_CAP` in
+`utilities/frame_interview.py` owns those numbers — do not restate them here.
+The validator refuses an interview that breaks the plain-language rules
+before it reaches anyone; the cap and the wording rules are machine-checked at
+the raise for every route carrying the gate, `quick` included, while steps 1–3
+above stay obligations on the acting session that nothing checks mechanically.
+Only code/design/draft/refine/spec run the frame pair at `quick` and above,
+before the owner. Other recipes retain their topology. `direct` asks its
+question inline in the §0.4 card and records the answer in the plan or work log.
+The recorded answers become `shards/frame/intent.md`, rendered by depth-0.
+The runtime supplies the released task and decisions to the owner and every
+subsequent worker, including graphs without `plan`. The assigned stage narrows
+that task; a role preset does not replace it. Workers cite applicable question
+ids and report decisions they cannot honor. An interview gate may be raised at most twice
+per route (`round` ≤ 2).
 
 The pre/post-approval load split above is deterministic. A router may expose one
 direct owner-reference index, with no execution procedure in pre-approval
@@ -431,30 +446,29 @@ the node. That list covers both `degraded` (the owner reviewed its own work) and
 a real result and neither blocks the route, but reporting it as review would
 make "reviewed" mean nothing (`OPERATIONS §5.10`, SD-OPEN-41(b)).
 
-For dispatched or long-running work, main emits this card only after it has
-synchronously waited or polled for terminal state, harvested the result and
-worker artifact, integrated it when authorized, and verified the final state.
-A worker handoff, background-process exit, or stage verdict alone is not task
-completion. Read-only orientation, simple factual answers, and status-only
-replies are exempt and use concise prose instead.
+For dispatched work, the parent follows the runtime's next-action receipt and
+checks the completed artifact before reporting. Normal success needs no harvest.
+A process exit or intermediate stage verdict alone is not task completion.
+Read-only orientation and status replies use concise prose instead.
 
-Reporting completion is not the same as recording it. A compiled route states
-that work began; nothing else states that it ended, and `complete` closes only a
-registered attempt in the jobs registry, so inline and `direct` work leaves no
-closure at all. Close the route in the same turn as the card:
+New registered owners carry `workflow_completion=runtime-v1`. Their completion
+controller owns the exact workflow/route/cycle closing transaction after PASS
+and child cleanup. It records COMPLETE only after sealing, retries interrupted
+closure without a model turn and sends a recovery notice while closure remains
+pending. The owner and parent have no separate close/finalize procedure.
+
+Inline work and legacy recovery explicitly record terminal completion and close
+the route before reporting:
 
 ```text
 python3 utilities/capability-route.py close --route <route.json> [--commit <sha>] [--summary <line>]
 python3 utilities/capability-route.py status --artifact-root <dir> --open-only
 ```
 
-For producer-backed work, the terminal sequence is **complete → close → finalize
-→ admit-shared** (admission only for shared kinds). Complete the terminal node
-using its verified cycle-local artifact as evidence, then close the route. Only
-then finalize the cycle so its manifest binds the terminal evidence, and admit
-the sealed output. Owner briefs must spell out this order; admission is not a
-prerequisite for the terminal marker. `--allow-open-route` is not a repair for an
-out-of-order completion sequence.
+For producer-backed work, the controller's transaction is **terminal proof →
+route close → exact cycle seal → workflow COMPLETE**. Inline and legacy recovery
+use complete, close and finalize in that order. Shared admission applies only to
+shared kinds after sealing; it is never a prerequisite for the terminal marker.
 
 `close` writes an outcome sidecar: `route_hash` makes the route immutable.
 `status --open-only` exposes unfinished work. Close what this attempt opened:
@@ -471,6 +485,16 @@ succeeded — a training run that reached its last epoch, a green CI check, a
 worker that returned `PASS` — is stage evidence, never workflow completion. No
 acting agent, dispatch-depth-1 owner, supervisor, or runtime lifecycle hook may
 declare completion from an intermediate success.
+
+Committed success and remaining cleanup are separate facts. A marker does not
+make a live descendant quiescent: the execution boundary retains cleanup,
+and the common supervisor retains the wait or recovery notice until it ends.
+Exact inspection reads the worker's result; requesting more failure detail is
+optional and cannot become a second completion gate.
+The runtime acknowledges a delivered notification after its receiving turn
+finishes. Delivery does not restrict the owner's tools or prove stage success;
+launch dependencies, write authorization and terminal cleanup scopes own those
+decisions. Repeating a notification cannot declare the owner abandoned.
 
 A steward's idle-notify subscription is observation, not a continuation; it never
 satisfies the registered-continuation obligation below (`core/OPERATIONS.md §5.14`).
@@ -498,6 +522,11 @@ its terminal node. `BLOCKED_HUMAN_GATE` never advances automatically; only an
 explicit human release returns it to `RUNNING`. `FAILED_*` never advances a
 downstream stage.
 
+The completion writer validates and records the remaining legal path through
+`STAGE_SUCCEEDED` and `TERMINAL_VERIFY` to `COMPLETE`. Repeated or interrupted
+closure resumes from the journal. Markers cannot erase unresolved human gates,
+failures, or cancellation.
+
 **Every non-terminal stage declares exactly one continuation.** A stage graph
 that leaves a stage with no way to reach the next one is the defect this
 contract exists to prevent, so the declaration is mechanical, not editorial:
@@ -506,7 +535,7 @@ contract exists to prevent, so the declaration is mechanical, not editorial:
 |---|---|
 | `inline-next` | the same checked payload runs the next stage before it returns |
 | `supervised` | a registered continuation supervisor observes child termination and starts the next stage exactly once |
-| `human-gate` | an explicit human gate named in the recipe's `human_gates` blocks the successor — e.g. `autopilot-code`'s `frame` node continues into gate `frame-review`, releasing with `workflow-supervisor.py release --gate frame-review --decision proceed\|revise\|stop` (§0.4, SD-123) |
+| `human-gate` | an explicit human gate named in the recipe's `human_gates` blocks the successor — e.g. each recipe's depth-1 bootstrap frame pair continues into gate `frame-review`, which fences that recipe's first work node and releases with `workflow-supervisor.py release --gate frame-review --decision proceed\|revise\|stop` (§0.4, SD-123) |
 | `monitor` | a checked monitor waits on an external state change and reports a typed condition match |
 
 A detached resource process can never continue itself, so a `resource-runner`
@@ -518,6 +547,13 @@ declared human gate binds to the exact node it gates (`entry` before that node,
 any of these is rejected at route compile, and a launch bound to such a graph is
 rejected before the process starts** — the refusal is the point, because the
 alternative is silent abandonment.
+
+Human decisions have no elapsed-time default. A question window closing or an
+empty response does not release, reject, or cancel the durable gate. Its owner
+keeps the exact question and gate available for a later real answer; independent
+authorized work can continue. Managed question surfaces disable automatic empty
+answers where the runtime supports this. Otherwise the owner leaves a plain-text
+question for a later reply instead of repeatedly opening expiring prompts.
 
 A continuation route projects this contract onto its suffix. It drops a gate
 whose gated entry node was cut, never rebinds a retained raising continuation to
@@ -566,8 +602,8 @@ Autopilot entrypoints choose `intensity`; verification rigor is derived from it 
 | Request shape | Default | Routing |
 |---|---|---|
 | One-off answer, typo, rename, or explicit no-artifact work | `direct` | No plan stage, plan check, or durable plan |
-| Small localized change that misses at least one atomic-direct predicate and has no promotion signal | `quick` | Registered-headless dispatch-depth-1 one-shot conductor with orient-lite, micro-plan, plan-check-lite, focused verification, and concise report; no dispatch depth 2 |
-| Work with a promotion signal or separable durable stages | `standard` | Durable plan/checklist; a `deep` dispatch-depth-1 conductor dispatches capability-defined stages with file-only handoff and realizes only registry-declared parallel groups, normally a two-leg asymmetric framing group |
+| Small localized change that misses at least one atomic-direct predicate and has no promotion signal | `quick` | A depth-0-run bootstrap layer runs first — two frame legs, cross-harness when available, joined and interviewed directly by the depth-0 session, the anchor a tier above the owner's own model profile. Then a registered-headless dispatch-depth-1 one-shot conductor with orient-lite, micro-plan, plan-check-lite, focused verification, and concise report; no dispatch depth 2 |
+| Work with a promotion signal or separable durable stages | `standard` | Same depth-0-run bootstrap frame layer as `quick`, then durable plan/checklist; a dispatch-depth-1 conductor (default `deep`) dispatches selected stages with file-only handoff and realizes only registry-declared parallel groups (plan/implementation-review, not frame) |
 | Important multi-file or risk-bearing work | `strong` | A `deep` owner plus the declared plan/review groups; selected high-value anchors may widen to a third profile/perspective leg while other groups remain width two |
 | Complex cross-domain or cross-harness work | `thorough` | Bounded dispatch-depth-2 perspective and verifier workers |
 | High-stakes, irreversible, security, or external-facing work | `adversarial` | Thorough plus an explicit adversary, failure-mode, or security pass |
@@ -635,14 +671,14 @@ under §0.4, and internal routing is automatic. Portable model roles come from
 | `analyze-project` | One capability analyzing code, paper, or document mode itself |
 | `autopilot-spec` | Planning role for PRD, material role for research import, and setup logic for hosting and CI/CD |
 | `autopilot-design` | Design maker and critic plus material web-image-search |
-| `autopilot-code` | Direct is dispatch-depth-0 inline. Quick is one `balanced-deep` registered-headless dispatch-depth-1 one-shot conductor. Every `standard+` owner is `deep`; at `standard`, it dispatches framing as `balanced-deep + light` cross-harness legs before planning. At `strong+`, framing adds a deep contrarian leg and plan/implementation-review open asymmetric declared groups; `thorough+` adds implementation-risk and failure-mode legs. Planning, implementation, test, report, and task-aware review remain separate file-handoff stages. |
+| `autopilot-code` | Direct is dispatch-depth-0 inline. From `quick`, depth-0 first runs the two-leg frame bootstrap (see above). Quick defaults to `balanced-deep` and standard+ to `deep`; explicit profile choices take precedence. Each uses one registered dispatch-depth-1 owner. At `strong+`, plan/implementation-review open asymmetric declared groups; `thorough+` adds implementation-risk and failure-mode legs. Planning, implementation, test, report, and task-aware review remain separate file-handoff stages. |
 | `autopilot-code` in app mode | General code flow plus design critique at plan review and after render, DB migration safety, and automatic deploy after an authorized push |
 | `autopilot-draft` | Material figure/data/reference work, writing implementation, editorial polish, and research fact-check |
 | `autopilot-refine` | Reuse the draft roles plus editorial review |
 | `autopilot-lab` | Setup uses research plan review, implementation scaffold, and QA smoke tests. Evaluation uses functional QA, figure generation, and research survey; at `standard+`, checkpoint evaluation, media generation, report assembly, and independent verification dispatch as stage workers under the eval execution topology in `capabilities/autopilot-lab.md`. The actual long-running training run is asynchronous and human-gated through RUNLOG ⏳ rather than a stage-worker dispatch. |
 | `analyze-user` | Cross-project material collection plus editorial review |
 
-For every durable stage at `standard+`, use an independent headless session under `OPERATIONS §5.10`; the named team roles run inside that session, and the dispatch-depth-1 conductor passes only artifact paths. Direct stays dispatch depth 0 and quick stays one registered-headless dispatch-depth-1 one-shot conductor.
+For every durable stage at `standard+`, use an independent headless session under `OPERATIONS §5.10`; the named team roles run inside that session, and the dispatch-depth-1 conductor passes only artifact paths. Direct stays dispatch depth 0, and a depth-0-run bootstrap layer — two frame legs, cross-harness when available, joined and interviewed directly by the depth-0 session, the anchor a tier above the owner's own model profile — runs ahead of quick, which stays one registered-headless dispatch-depth-1 one-shot conductor.
 
 Each entrypoint is an explicit unit of intent. The §0.4 confirmation is the
 single top-level route handshake. Capability-local review controls such as
@@ -694,12 +730,15 @@ These rules close three gaps: a broken trail caused by over-creating plans for q
 
 Every entry capability resolves through `capabilities/topologies.json`, the machine-readable execution-topology source. Intensity, topology class, worker kind, transport, DAG nodes, write scopes, promotion signals, and completion gates remain separate axes. `utilities/capability-route.py` compiles an immutable route bound to the registry digest, source commit, physical absolute working directory, artifact root, and transport evidence. Adapters may project compact summaries and pointers, but must not copy the graph into bootstrap or Skill metadata.
 
-The compiler is **enforced** (formerly report-only, 2026-07-22): every node
-references `roles/units/`; routing occurs at entry only. A depth-2 worker never
-routes or selects another worker. Apply §0.2.1's compose-on-demand shape,
-validation and gate contract when no curated preset fits; confirm under §0.4
-(small-work notice, card or SD-123 pair). Before SD-135, composition was
-`standard+`-only, all composed nodes were depth 2 without source writes, and
-the binding guard did not recognize its helper: only 18/635 routes were composed,
-all under preset entries. Those historical limits are retired; composition
-retains §0.2.1's spec/artifact, depth and completion protections.
+The route compiler is **enforced** (promoted from report-only, 2026-07-22): every node
+references a unit in `roles/units/`, and routing happens at entry only — a
+dispatch-depth-2 worker never routes and never selects another worker. Enumerated
+recipes are curated fast paths, not the default. For a request no recipe fits, the
+entry composes its own route from the same catalog (**compose-on-demand**, §0.2.1):
+`capability-route.py compose` seals a `direct`, `solo`, or `staged` shape. Staged
+uses the capability recipe unless `--graph` selects a subgraph. Both use the same
+validator and seal; a subgraph embeds its recipe as `composed: true`. Confirmation
+follows §0.4 (`[경로]` for small work, the card or SD-123 pair otherwise).
+Composition changes route *shape only* — it never bypasses the §0.1
+spec/artifact-order gates, never grants dispatch depth 3, and never substitutes for a
+capability's own completion gates.

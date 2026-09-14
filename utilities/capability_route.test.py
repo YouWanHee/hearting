@@ -132,7 +132,13 @@ class TestRoute(unittest.TestCase):
  def compile_v3(self,evidence):
   return R.compile_route(**self.args(requested_intensity="strong",predicates=[],signals=["shared-contract"],transport="headless",inline_reason=None,dispatch_evidence=evidence))
  def registered_headless(self,status="supported"):
-  return {"candidates":[{"harness":"codex","transport":"headless","surface":"registered-headless","status":status,"probe_source":"fixture-probe","probe_time":"2026-07-20T00:00:00Z"}]}
+  # Two supported harnesses, not one: quick now compiles a cross-harness frame
+  # pair, and a single supported harness is sealed as `single-harness:<h>` on both legs of a
+  # candidate list at compile. `status` still drives BOTH rows so the
+  # unsupported fixture keeps naming `quick-headless-unavailable`.
+  return {"candidates":[
+   {"harness":"codex","transport":"headless","surface":"registered-headless","status":status,"probe_source":"fixture-probe","probe_time":"2026-07-20T00:00:00Z"},
+   {"harness":"claude","transport":"headless","surface":"registered-headless","status":status,"probe_source":"fixture-probe","probe_time":"2026-07-20T00:00:00Z"}]}
  def legacy_v2(self,route):
   legacy=json.loads(json.dumps(route)); legacy.pop("dispatch_contract_version",None); legacy["broker_contract_version"]=2
   for row in legacy["dispatch_evidence"]["tuples"]:
@@ -184,11 +190,27 @@ class TestRoute(unittest.TestCase):
  def test_ambiguous_quick(self):
   a=R.compile_route(**self.args(predicates=[],transport=None,inline_reason=None,registered_headless_evidence=self.registered_headless()))
   self.assertEqual(a["effective_intensity"],"quick")
-  self.assertEqual(a["nodes"][0]["dispatch_depth"],1)
-  self.assertEqual(a["nodes"][0]["execution_surface"],"registered-headless")
-  self.assertTrue(a["nodes"][0]["registered_worker"])
+  # Quick is now a three-node route: the depth-1 frame pair the depth-0
+  # session launches itself, then the owner. The owner axes this test has
+  # always protected are read off `one-shot` by id, not by position.
+  self.assertEqual([n["id"] for n in a["nodes"]],["frame","frame-alternative","one-shot"])
+  owner=next(n for n in a["nodes"] if n["id"]=="one-shot")
+  self.assertEqual(owner["dispatch_depth"],1)
+  self.assertEqual(owner["execution_surface"],"registered-headless")
+  self.assertTrue(owner["registered_worker"])
+  self.assertEqual(owner["depends_on"],["frame","frame-alternative"])
+  for leg in a["nodes"][:2]:
+   self.assertEqual((leg["dispatch_depth"],leg["unit"],leg["worker_type"]),(1,"plan/frame","frame"))
+   self.assertEqual(leg["launch_authority"],"depth-0")
+   self.assertTrue(leg["registered_worker"])
+   self.assertNotIn("fallback_hops",leg)
   self.assertEqual(a["conditional_extensions"][0]["after"],["one-shot"])
-  self.assertEqual(a["human_gate_bindings"],[])
+  # A6/SD-123 used to read "quick binds nothing". Quick now fences its owner
+  # behind the frame gate -- only `direct` still binds nothing.
+  self.assertEqual(a["human_gate_bindings"],
+   [{"gate":"frame-review","node":"one-shot","position":"entry"}])
+  self.assertIn("frame-review",a["human_gates"])
+  self.assertEqual(a["completion_gates"],["quick-frame","quick-complete"])
  def test_quick_missing_eligibility_fails_closed(self):
   with self.assertRaisesRegex(ValueError,"quick-headless-unavailable"):
    R.compile_route(**self.args(predicates=[],transport=None,inline_reason=None,requested_intensity="quick"))
@@ -217,14 +239,27 @@ class TestRoute(unittest.TestCase):
       recipe["capability"],mode,"quick",R.ROOT,R.ROOT,predicates=[],transport=None,
       tracking="tracked",tracked_gate_evidence=self.args()["tracked_gate_evidence"],
       registered_headless_evidence=self.registered_headless())
-     self.assertEqual(len(route["nodes"]),1)
+     # Still exactly ONE registered-headless quick owner per recipe mode --
+     # that is what this test protects. The route now also carries the two
+     # depth-1 frame legs ahead of it, which are not owners.
+     framed = recipe["capability"] in {
+      "autopilot-code","autopilot-design","autopilot-draft","autopilot-refine","autopilot-spec"}
+     self.assertEqual([n["id"] for n in route["nodes"]],
+                      ["frame","frame-alternative","one-shot"] if framed else ["one-shot"])
+     owners=[n for n in route["nodes"] if n.get("unit")=="_kernel/owner"]
+     self.assertEqual([n["id"] for n in owners],["one-shot"])
+     owner=owners[0]
      self.assertEqual(route["owner_dispatch_depth"],1)
      self.assertEqual(route["max_dispatch_depth"],1)
-     self.assertEqual(route["nodes"][0]["dispatch_depth"],1)
+     self.assertEqual(owner["dispatch_depth"],1)
      self.assertEqual(route["owner_model_profile"],"balanced-deep")
-     self.assertEqual(route["nodes"][0]["model_profile"],"balanced-deep")
-     self.assertEqual(route["nodes"][0]["execution_surface"],"registered-headless")
-     self.assertTrue(route["nodes"][0]["registered_worker"])
+     self.assertEqual(owner["model_profile"],"balanced-deep")
+     self.assertEqual(owner["execution_surface"],"registered-headless")
+     self.assertTrue(owner["registered_worker"])
+     for leg in route["nodes"][:2]:
+      self.assertEqual(leg["dispatch_depth"],1)
+      self.assertEqual(leg["execution_surface"],"registered-headless")
+      self.assertTrue(leg["registered_worker"])
      R.verify_route(route,R.ROOT)
  def test_promotion_standard(self):
   evidence=self.dispatch(self.nested())
@@ -266,7 +301,9 @@ class TestRoute(unittest.TestCase):
      tracked_gate_evidence=self.args()["tracked_gate_evidence"],
      registered_headless_evidence=self.registered_headless())
     self.assertEqual(quick["owner_model_profile"],"balanced-deep")
-    self.assertEqual(quick["nodes"][0]["model_profile"],"balanced-deep")
+    self.assertEqual(
+     next(n for n in quick["nodes"] if n["id"]=="one-shot")["model_profile"],
+     "balanced-deep")
     R.verify_route(quick,R.ROOT); compiled+=1
     for intensity in ("standard","strong","thorough","adversarial"):
      with self.subTest(capability=recipe["capability"],mode=mode,intensity=intensity):
@@ -290,15 +327,16 @@ class TestRoute(unittest.TestCase):
        expected,recipe["standard_plus"].get("parallel_groups"),intensity,
        recipe["capability"],
        auxiliary_check_units=registry.get("auxiliary_check_units"))
+      # Same two steps, same order, as the compiler and the verifier: the
+      # frame tier ladder is stamped from the RESOLVED owner profile first,
+      # and only then are demands sealed. The recipe's own static
+      # `model_profile` on a frame leg is a placeholder that this stamp
+      # overwrites, so rebuilding `expected` without it compares the compiled
+      # route against a value nothing is supposed to keep.
+      R._stamp_frame_profiles(expected, route["owner_model_profile"],
+                              route.get("owner_profile_demand"))
       R._seal_profile_demands(expected, legacy=True)
       for node in expected: node.pop("fallback_hops",None)
-      # O3: the shipped default confirmation mode is now `autonomous`, which
-      # realizes `autopilot-code`'s `frame` continuation as `inline-next`
-      # instead of the recipe's `human-gate` -- the same transform compile
-      # applies, so re-derive the expectation through the shared helper
-      # rather than asserting the untransformed recipe shape.
-      expected,_=R._effective_confirmation_graph(
-       expected,recipe,intensity,recipe["capability"],route["confirmation_mode"])
       def stable(nodes):
        return [
         {key:value for key,value in node.items()
@@ -363,8 +401,12 @@ class TestRoute(unittest.TestCase):
   self.assertNotIn("impl-review-alternative",[x["id"] for x in standard["nodes"]])
   self.assertNotIn("plan-alternative",[x["id"] for x in standard["nodes"]])
   strong=self.compile_v3(evidence)
+  # The frame pair is no longer a parallel_group, so it no longer widens with
+  # intensity: `frame-contrarian` does not exist at any intensity now. The
+  # asymmetric-group expansion this test protects is still read off
+  # plan/plan-check/impl-review.
   self.assertEqual([x["id"] for x in strong["nodes"]],
-   ["frame","frame-alternative","frame-contrarian","plan","plan-alternative","plan-check","plan-check-alternative","execute","impl-review","impl-review-alternative","test","report"])
+   ["frame","frame-alternative","plan","plan-alternative","plan-check","plan-check-alternative","execute","impl-review","impl-review-alternative","test","report"])
   base=next(n for n in strong["nodes"] if n["id"]=="impl-review")
   alternative=next(n for n in strong["nodes"] if n["id"]=="impl-review-alternative")
   self.assertEqual(base["parallel_group"],"impl-review")
@@ -386,13 +428,25 @@ class TestRoute(unittest.TestCase):
   # cross-model 2-way exploration from `standard`; the plan synthesizer reads
   # BOTH legs' briefs, and at `strong` the plan itself replicates with
   # plan-check as the arbiter reading both plans.
+  #
+  # The two-way frame exploration is now carried by an EXPLICITLY declared
+  # pair of depth-1 nodes rather than by a parallel_group replica, so the
+  # independence is asserted directly (distinct model profiles, distinct
+  # outputs and write scopes) instead of through group metadata. The
+  # downstream half -- plan reads both briefs, plan replicates at strong --
+  # is unchanged and is what the rest of this test still checks.
   evidence=self.dispatch(self.nested())
   standard=R.compile_route(**self.args(signals=["public-api"],transport="headless",inline_reason=None,dispatch_evidence=evidence))
   frame=next(n for n in standard["nodes"] if n["id"]=="frame")
   frame_replica=next(n for n in standard["nodes"] if n["id"]=="frame-alternative")
-  self.assertEqual(frame["parallel_group"],"frame")
-  self.assertEqual(frame_replica["parallel_group"],"frame")
-  self.assertEqual(frame_replica["parallel_independence_axes"],["cross-harness","model-profile","perspective"])
+  for leg in (frame,frame_replica):
+   self.assertNotIn("parallel_group",leg)
+   self.assertNotIn("fallback_hops",leg)
+   self.assertEqual((leg["unit"],leg["dispatch_depth"],leg["worker_type"]),("plan/frame",1,"frame"))
+   self.assertEqual(leg["launch_authority"],"depth-0")
+  self.assertNotEqual(frame["model_profile"],frame_replica["model_profile"])
+  self.assertEqual(frame["outputs"],["shards/frame/direction-brief.md"])
+  self.assertEqual(frame["write_scope"],["shards/frame/**"])
   self.assertEqual(frame_replica["outputs"],["shards/frame-alternative/direction-brief.md"])
   self.assertEqual(frame_replica["write_scope"],["shards/frame-alternative/**"])
   plan=next(n for n in standard["nodes"] if n["id"]=="plan")
@@ -470,7 +524,9 @@ class TestRoute(unittest.TestCase):
   route=self.compile_v3(self.dispatch(self.nested()))
   units={n["id"]:n.get("unit") for n in route["nodes"]}
   self.assertEqual(units,{
-   "frame":"plan/frame","frame-alternative":"plan/frame","frame-contrarian":"plan/frame",
+   # `frame-contrarian` is gone: the frame pair is declared explicitly and no
+   # longer widens with intensity.
+   "frame":"plan/frame","frame-alternative":"plan/frame",
    "plan":"plan/plan-author","plan-alternative":"plan/plan-author",
    "plan-check":"qa/plan-review","plan-check-alternative":"qa/plan-review","execute":"dev/backend",
    "impl-review":"qa/code-review","impl-review-alternative":"qa/code-review",
@@ -1064,7 +1120,11 @@ class TestRoute(unittest.TestCase):
    p=Path(td)/"route.json"; a=R.compile_route(**self.args()); R.write_once(p,a); R.write_once(p,a)
  def test_v3_direct_surface_and_fallback_order(self):
   evidence=self.dispatch(self.nested(status="unsupported",failure="nested-network-unconfirmed"),self.nested(child="claude"))
-  route=self.compile_v3(evidence); chain=route["nodes"][0]["fallback_hops"]
+  # nodes[0] is now the depth-1 `frame` leg, which carries no fallback chain
+  # by design (recovery from a dead frame leg is an explicit depth-0
+  # re-launch). Read the chain off the first node that has one.
+  route=self.compile_v3(evidence)
+  chain=next(n for n in route["nodes"] if n.get("fallback_hops"))["fallback_hops"]
   self.assertEqual(route["dispatch_contract_version"],3)
   self.assertEqual(route["dispatch_evidence_scope_version"],1)
   self.assertNotIn("broker_contract_version",route)
@@ -1188,7 +1248,9 @@ class TestRoute(unittest.TestCase):
   with self.assertRaisesRegex(ValueError,"must not carry broker fields"): self.compile_v3(self.dispatch(row))
  def test_fallback_candidates_must_exactly_match_checked_evidence(self):
   route=self.compile_v3(self.dispatch(self.nested(parent="claude",child="claude")))
-  candidate=route["nodes"][0]["fallback_hops"][0]["candidates"][0]
+  # nodes[0] is the depth-1 `frame` leg now and carries no fallback chain;
+  # take the first node that has one.
+  candidate=next(n for n in route["nodes"] if n.get("fallback_hops"))["fallback_hops"][0]["candidates"][0]
   candidate["child_harness"]="opencode"
   route["route_hash"]=R.route_hash(route); route["route_id"]="rt-"+route["route_hash"].split(":",1)[1][:16]
   with self.assertRaisesRegex(ValueError,"differs from checked evidence"):
@@ -1211,13 +1273,20 @@ class TestRoute(unittest.TestCase):
  def test_seal_stamps_valid_affinity_and_digest(self):
   with dispatch_defaults_config(DD_CONFIG_A):
    route=self._standard()
-  by_id={n["id"]:n["harness_affinity"] for n in route["nodes"]}
-  self.assertEqual(set(by_id),{"frame","frame-alternative","plan","plan-check","execute","impl-review","test","report"})
+  # harness_affinity is a dispatch-depth-2 stage allocation. The frame pair is
+  # now depth-1 and launched by the depth-0 session itself, so it is outside
+  # that table and carries no affinity cell at all -- assert that rather than
+  # silently dropping the two ids from the census.
+  for leg in ("frame","frame-alternative"):
+   node=next(n for n in route["nodes"] if n["id"]==leg)
+   self.assertEqual(node["dispatch_depth"],1)
+   self.assertNotIn("harness_affinity",node)
+  by_id={n["id"]:n["harness_affinity"] for n in route["nodes"] if n.get("dispatch_depth")==2}
+  self.assertEqual(set(by_id),{"plan","plan-check","execute","impl-review","test","report"})
   for value in by_id.values(): self.assertIn(value,R.VALID_AFFINITY)
-  # DD_CONFIG_A leaves these four cells sparse; the shipped
+  # DD_CONFIG_A leaves these cells sparse; the shipped
   # profiles/dispatch-defaults.yaml capability baseline now merges beneath
   # the user file, so they answer "diverse" instead of "unspecified".
-  self.assertEqual(by_id["frame"],"diverse")
   self.assertEqual(by_id["plan"],"diverse")
   self.assertEqual(by_id["plan-check"],"diverse")
   self.assertEqual(by_id["impl-review"],"diverse")
@@ -1309,12 +1378,16 @@ class TestRoute(unittest.TestCase):
     route=self._standard()
   self.assertIsNone(route["dispatch_defaults_digest"])
   self.assertIsNone(route["dispatch_allocation"])
-  for node in route["nodes"]: self.assertEqual(node["harness_affinity"],"unspecified")
+  # Only depth-2 stage nodes carry an affinity cell; the depth-1 frame pair is
+  # allocated by the depth-0 launcher, not by this table.
+  for node in route["nodes"]:
+   if node.get("dispatch_depth")==2: self.assertEqual(node["harness_affinity"],"unspecified")
+   else: self.assertNotIn("harness_affinity",node)
   # T-3: confirmation_mode must NOT ride _seal_dispatch_defaults's
   # (None, None, None) early return for an absent config file -- that would
   # seal confirmation_mode=None instead of the "hybrid" default for exactly
   # the user this config is absent for.
-  self.assertEqual(route["confirmation_mode"],"autonomous")
+  self.assertEqual(route["confirmation_mode"],"hybrid")
  def test_seal_confirmation_mode_reads_v4_config(self):
   v4_config=(
    "schema_version: 4\n"
@@ -1335,210 +1408,7 @@ class TestRoute(unittest.TestCase):
  def test_seal_confirmation_mode_defaults_for_v1_config_without_block(self):
   with dispatch_defaults_config(DD_CONFIG_A):
    route=self._standard()
-  self.assertEqual(route["confirmation_mode"],"autonomous")
- def _v4_confirmation_config(self,mode):
-  return (
-   "schema_version: 4\n"
-   "harnesses:\n  enabled: [claude, codex]\n"
-   "profiles:\n"
-   + "".join(
-     f"  {profile}:\n    primary: [claude, codex]\n    relief: []\n"
-     "    last_resort: []\n    promote_relief_below: 0\n"
-     for profile in ("deep","balanced-deep","light","mini")
-   )
-   + "allocation:\n  strategy: capacity-aware\n  window: 30\n"
-   f"confirmation:\n  mode: {mode}\n"
-   "capabilities:\n"
-  )
- def test_o3_four_mode_confirmation_compile_verify_matrix(self):
-  """O3/plan.md WP4: autonomous removes only the autopilot-code frame-review
-  binding and rewrites frame/frame-clone continuations to inline-next;
-  explicit legacy modes keep today's bindings/continuation unchanged. Assert
-  through the real compile+verify path (not a dict-only query) at both
-  standard and strong, and that workflow_contract/route hash agree."""
-  for intensity in ("standard","strong"):
-   frame_ids={
-    "standard":{"frame","frame-alternative"},
-    "strong":{"frame","frame-alternative","frame-contrarian"},
-   }[intensity]
-   for mode in ("autonomous","hybrid","both","post-frame-only"):
-    with self.subTest(intensity=intensity,mode=mode):
-     with dispatch_defaults_config(self._v4_confirmation_config(mode)):
-      route=R.compile_route(**self.args(
-       requested_intensity=intensity,predicates=[],signals=["shared-contract"],
-       transport="headless",inline_reason=None,
-       dispatch_evidence=self.dispatch(self.nested())))
-     R.verify_route(route,R.ROOT)
-     self.assertEqual(route["confirmation_mode"],mode)
-     frame_nodes=[n for n in route["nodes"] if n["id"] in frame_ids]
-     self.assertEqual({n["id"] for n in frame_nodes},frame_ids)
-     other_nodes=[n for n in route["nodes"] if n["id"] not in frame_ids]
-     # join policy/all-join and every non-frame node are unaffected by mode.
-     frame_group=next(g for g in route["parallel_groups"] if g["id"]=="frame")
-     self.assertEqual(set(frame_group["members"]),frame_ids)
-     self.assertEqual(frame_group["join_policy"],"all")
-     if mode=="autonomous":
-      self.assertEqual(route["human_gate_bindings"],[])
-      for node in frame_nodes:
-       self.assertEqual(node["continuation"],{"kind":"inline-next"})
-      self.assertNotIn("frame-review",route["workflow_contract"]["continuations"].values())
-      for frame_id in frame_ids:
-       self.assertEqual(route["workflow_contract"]["continuations"][frame_id],"inline-next")
-      self.assertEqual(route["workflow_contract"]["human_gate_bindings"],[])
-     else:
-      self.assertEqual(
-       route["human_gate_bindings"],
-       [{"gate":"frame-review","node":"plan","position":"entry"}])
-      for node in frame_nodes:
-       self.assertEqual(node["continuation"],{"kind":"human-gate","gate":"frame-review"})
-      for frame_id in frame_ids:
-       self.assertEqual(route["workflow_contract"]["continuations"][frame_id],"human-gate")
-      self.assertEqual(
-       route["workflow_contract"]["human_gate_bindings"],
-       [{"gate":"frame-review","node":"plan","position":"entry"}])
-     # every other realized node's continuation is untouched by mode.
-     for node in other_nodes:
-      if node.get("terminal") is True: continue
-      self.assertIn("continuation",node)
- def _write_route_and_dep_markers(self,base,route):
-  path=base/"route.json"; path.write_text(json.dumps(route),encoding="utf-8")
-  plan=next(n for n in route["nodes"] if n["id"]=="plan")
-  marker_dir=base/".dispatch"/"completion"/route["route_id"]
-  marker_dir.mkdir(parents=True,exist_ok=True)
-  for dep in plan["depends_on"]:
-   (marker_dir/f"{dep}.json").write_text(
-    json.dumps({"attempt_id":f"att-{dep}","registered_worker":True}),encoding="utf-8")
-  return path
- def test_compiled_route_meets_the_upstream_entry_fence(self):
-  """SD-129 x O3 seam: the shipped `autonomous` default and upstream's
-  `_human_gate_entry_fence` are only compatible if a REALLY COMPILED route
-  carries the shape the fence reads. Upstream's own fence tests use
-  hand-built route dicts; this one crosses compile -> fence."""
-  import workflow_state as WS
-
-  # (a) autonomous compile: no binding, frame continuations inline-next.
-  with dispatch_defaults_config(self._v4_confirmation_config("autonomous")):
-   route=R.compile_route(**self.args(
-    requested_intensity="standard",predicates=[],signals=["shared-contract"],
-    transport="headless",inline_reason=None,
-    dispatch_evidence=self.dispatch(self.nested())))
-  R.verify_route(route,R.ROOT)
-  self.assertEqual(route["confirmation_mode"],"autonomous")
-  self.assertEqual(route["human_gate_bindings"],[])
-  for node_id in ("frame","frame-alternative"):
-   node=next(n for n in route["nodes"] if n["id"]==node_id)
-   self.assertEqual(node["continuation"],{"kind":"inline-next"})
-
-  # (b) the fence accepts a `plan` start WITHOUT touching the ledger.
-  with tempfile.TemporaryDirectory() as td:
-   base=Path(td); path=self._write_route_and_dep_markers(base,route)
-   workflow_root=base/"workflow"
-   self.assertFalse(workflow_root.exists())
-   ready=D.AttemptReadiness("ready","fixture-ready","att-dep")
-   def _boom(*a,**k):
-    raise AssertionError("autonomous route must not touch the workflow ledger")
-   with mock.patch.dict(os.environ,{"AGENT_WORKFLOW_ROOT":str(workflow_root)}), \
-        mock.patch.object(WS,"WorkflowLedger",_boom), \
-        mock.patch.object(D,"completion_marker_is_current",return_value=True), \
-        mock.patch.object(D,"completion_attempt_readiness",return_value=ready), \
-        mock.patch.object(D,"_sibling_attempt_gate"), \
-        mock.patch.object(D,"_auxiliary_arbitration_gate"):
-    try:
-     D.completion_marker_gate(str(path),"plan","start",base,base/"jobs.log",
-                              registry_lines=[],attempt_id="att-plan-new")
-    except D.DispatchContractError as exc:
-     self.assertNotEqual(exc.reason,"completion-marker-missing",
-      "dependency-marker setup is a fixture defect, not a fence result")
-     raise
-   self.assertFalse(workflow_root.exists())
-
-  # (c) explicit hybrid compile: the entry binding and human-gate continuations return.
-  with dispatch_defaults_config(self._v4_confirmation_config("hybrid")):
-   hybrid_route=R.compile_route(**self.args(
-    requested_intensity="standard",predicates=[],signals=["shared-contract"],
-    transport="headless",inline_reason=None,
-    dispatch_evidence=self.dispatch(self.nested())))
-  R.verify_route(hybrid_route,R.ROOT)
-  self.assertEqual(
-   hybrid_route["human_gate_bindings"],
-   [{"gate":"frame-review","node":"plan","position":"entry"}])
-  for node_id in ("frame","frame-alternative"):
-   node=next(n for n in hybrid_route["nodes"] if n["id"]==node_id)
-   self.assertEqual(node["continuation"],{"kind":"human-gate","gate":"frame-review"})
-
-  # (d) the fence's three outcomes on that compiled route.
-  with tempfile.TemporaryDirectory() as td:
-   base=Path(td); path=self._write_route_and_dep_markers(base,hybrid_route)
-   (base/"jobs.log").write_text("")  # explicit registry must exist for the upstream ledger authority fence
-   ready=D.AttemptReadiness("ready","fixture-ready","att-dep")
-
-   def _start():
-    with mock.patch.object(D,"completion_marker_is_current",return_value=True), \
-         mock.patch.object(D,"completion_attempt_readiness",return_value=ready), \
-         mock.patch.object(D,"_sibling_attempt_gate"), \
-         mock.patch.object(D,"_auxiliary_arbitration_gate"):
-     D.completion_marker_gate(str(path),"plan","start",base,base/"jobs.log",
-                              registry_lines=[],attempt_id="att-plan-new")
-
-   with mock.patch.dict(os.environ,{"AGENT_WORKFLOW_ROOT":str(base/"workflow")}):
-    # (d1) missing gate.
-    with self.assertRaises(D.DispatchContractError) as caught:
-     _start()
-    self.assertNotEqual(caught.exception.reason,"completion-marker-missing",
-     "dependency-marker setup is a fixture defect, not a fence result")
-    self.assertEqual(caught.exception.reason,"human-gate-not-raised")
-
-    # (d2) unreleased gate.
-    ledger=WS.WorkflowLedger(hybrid_route["route_id"],hybrid_route["route_hash"],
-                              root=base/"workflow")
-    with ledger.lock():
-     ledger.set_workflow_state("READY",evidence={},actor="fixture")
-     ledger.set_workflow_state("BLOCKED_HUMAN_GATE",
-      evidence={"gate":"frame-review","artifact":"shards/frame/interview.json"},
-      actor="gate")
-    with self.assertRaises(D.DispatchContractError) as caught:
-     _start()
-    self.assertNotEqual(caught.exception.reason,"completion-marker-missing",
-     "dependency-marker setup is a fixture defect, not a fence result")
-    self.assertEqual(caught.exception.reason,"human-gate-unreleased")
-
-    # (d3) recorded release: the start succeeds.
-    with ledger.lock():
-     ledger.set_workflow_state("RUNNING",evidence={"released_gate":"frame-review",
-      "released_by":"user","actor_kind":"user","decision":"proceed"},actor="release")
-    _start()
- def test_o3_autonomous_tampered_continuation_is_rejected(self):
-  with dispatch_defaults_config(self._v4_confirmation_config("autonomous")):
-   route=self._standard()
-  tampered=json.loads(json.dumps(route))
-  for node in tampered["nodes"]:
-   if node["id"]=="frame":
-    node["continuation"]={"kind":"human-gate","gate":"frame-review"}
-  tampered["route_hash"]=R.route_hash(tampered)
-  tampered["route_id"]="rt-"+tampered["route_hash"].split(":",1)[1][:16]
-  with self.assertRaisesRegex(ValueError,"route node continuation differs"):
-   R.verify_route(tampered,R.ROOT)
- def test_o3_legacy_route_with_no_sealed_confirmation_mode_keeps_old_semantics(self):
-  """A route sealed before SD-123 introduced `confirmation_mode` never had
-  the field at all -- deleting it (rather than setting an explicit legacy
-  string) is the honest fixture for that population, and it must keep
-  verifying under the original recipe-verbatim human-gate semantics even
-  though the shipped default is now `autonomous`."""
-  with dispatch_defaults_config(self._v4_confirmation_config("hybrid")):
-   route=self._standard()
   self.assertEqual(route["confirmation_mode"],"hybrid")
-  legacy=json.loads(json.dumps(route))
-  del legacy["confirmation_mode"]
-  legacy["route_hash"]=R.route_hash(legacy)
-  legacy["route_id"]="rt-"+legacy["route_hash"].split(":",1)[1][:16]
-  # verifies fine even under a config that would now seal `autonomous` for a
-  # *new* route -- the absent field is never retro-fitted.
-  with dispatch_defaults_config(self._v4_confirmation_config("autonomous")):
-   R.verify_route(legacy,R.ROOT)
-  frame=next(n for n in legacy["nodes"] if n["id"]=="frame")
-  self.assertEqual(frame["continuation"],{"kind":"human-gate","gate":"frame-review"})
-  self.assertEqual(
-   legacy["human_gate_bindings"],[{"gate":"frame-review","node":"plan","position":"entry"}])
  def test_seal_corrupt_config_fails_loud(self):
   with dispatch_defaults_config(DD_CONFIG_CORRUPT):
    with self.assertRaisesRegex(ValueError,"corrupt dispatch-defaults config"):
@@ -1585,31 +1455,6 @@ class TestRoute(unittest.TestCase):
    R.compile_composed_route(
     self._composed_recipe(),"composed-fixture","direct",R.ROOT,R.ROOT,
     predicates=ALL,tracking="tracked",tracked_gate_evidence=self.args()["tracked_gate_evidence"])
- def test_autonomous_preserves_explicit_composed_frame_gate(self):
-  recipe=self._composed_recipe()
-  with dispatch_defaults_config(self._v4_confirmation_config("autonomous")):
-   route=self._composed(recipe)
-  bindings=recipe["human_gate_bindings"]
-  self.assertEqual(route["confirmation_mode"],"autonomous")
-  self.assertEqual(route["human_gate_bindings"],bindings)
-  self.assertEqual(route["workflow_contract"]["human_gate_bindings"],bindings)
-  frames=[n for n in route["nodes"] if n.get("parallel_group")=="frame"]
-  self.assertEqual(len(frames),3)
-  for node in frames:
-   self.assertEqual(node["continuation"],{"kind":"human-gate","gate":"frame-review"})
-   self.assertEqual(route["workflow_contract"]["continuations"][node["id"]],"human-gate")
-  R.verify_route(route,R.ROOT)
-
-  tampered=json.loads(json.dumps(route))
-  tampered["human_gate_bindings"]=[]
-  for node in tampered["nodes"]:
-   if node.get("parallel_group")=="frame":
-    node["continuation"]={"kind":"inline-next"}
-  tampered["workflow_contract"]=R._workflow_contract(R.TOPO.load_registry(),tampered["nodes"],[])
-  tampered["route_hash"]=R.route_hash(tampered)
-  tampered["route_id"]="rt-"+tampered["route_hash"].split(":",1)[1][:16]
-  with self.assertRaisesRegex(ValueError,"composed route nodes differ"):
-   R.verify_route(tampered,R.ROOT)
  def test_composed_spec_touch_gate(self):
   recipe=self._composed_recipe()
   execute=next(n for n in recipe["standard_plus"]["nodes"] if n["id"]=="execute")
@@ -1730,12 +1575,15 @@ class TestRoute(unittest.TestCase):
    # probe would fail whenever an operator has set `runtime.terminal_commit`.
    # The gate's real behavior is pinned in TerminalCommitSupportTests.
    self.assertIsInstance(route["runtime_support"]["terminal_commit"],bool)
-   node=route["nodes"][0]; attempt="att-terminal-current"
+   # quick is a three-node route now; the terminal node this test is about is
+   # `one-shot`, not nodes[0] (which is the `frame` leg).
+   node=next(n for n in route["nodes"] if n.get("terminal")); attempt="att-terminal-current"
+   self.assertEqual(node["id"],"one-shot")
    subprocess.run([sys.executable,"-c","pass"],check=True)
    meta=dict(attempt_schema_version=2,dispatch_depth=1,transport="headless",
        execution_surface="registered-headless",registered_worker="1",fallback_hop="same-harness-headless",
        route_id=route["route_id"],route_hash=route["route_hash"],route_node=node["id"],
-       attempt_id=attempt,failure_class="pass",launch_outcome="reaped-before-publish")
+       attempt_id=attempt,failure_class="pass",note="completed-marker",launch_outcome="reaped-before-publish")
    def row(values):
     return "2026-09-08T00:00:00Z\tdone\t/repo\t/wt\towner\t"+",".join(f"{k}={v}" for k,v in values.items())+"\n"
    jobs.write_text(row(meta)); evidence.write_text("first")
@@ -2502,9 +2350,7 @@ class TestContinuation(unittest.TestCase):
                         for row in built["human_gate_bindings"]))
  def test_cut_raiser_requires_exact_source_release_not_source_completion(self):
   with tempfile.TemporaryDirectory() as tmp:
-   # This gate-specific case explicitly selects hybrid; autonomous has no frame gate.
-   with mock.patch.object(R,"_seal_confirmation_mode",return_value="hybrid"):
-    source=self._source(Path(tmp)/"artifacts")
+   source=self._source(Path(tmp)/"artifacts")
    plan_index=next(i for i,node in enumerate(source["nodes"]) if node["id"]=="plan")
    for node in source["nodes"][:plan_index]:
     self._complete_node(source,node,Path(tmp)/"evidence")
@@ -2512,9 +2358,7 @@ class TestContinuation(unittest.TestCase):
     self._build(source,resume_from_node="plan",requested_boundary="plan")
  def test_cut_raiser_seals_and_revalidates_exact_proceed_evidence(self):
   with tempfile.TemporaryDirectory() as tmp:
-   # This gate-specific case explicitly selects hybrid; autonomous has no frame gate.
-   with mock.patch.object(R,"_seal_confirmation_mode",return_value="hybrid"):
-    source=self._source(Path(tmp)/"artifacts")
+   source=self._source(Path(tmp)/"artifacts")
    self._complete_prefix(source,"plan",Path(tmp)/"evidence")
    built=self._build(source,resume_from_node="plan",requested_boundary="plan")
    proof=built["reused_human_gate_releases"][0]
@@ -2572,9 +2416,7 @@ class TestContinuation(unittest.TestCase):
    R._verify_continuation_gate_release_proofs(route)
  def test_retained_human_gate_continuation_without_binding_fails_closed(self):
   with tempfile.TemporaryDirectory() as tmp:
-   # This gate-specific case explicitly selects hybrid; autonomous has no frame gate.
-   with mock.patch.object(R,"_seal_confirmation_mode",return_value="hybrid"):
-    source=self._source(Path(tmp)/"artifacts")
+   source=self._source(Path(tmp)/"artifacts")
    source["human_gates"]=[]; source["human_gate_bindings"]=[]
    source["route_hash"]=R.route_hash(source)
    source["route_id"]="rt-"+source["route_hash"].split(":",1)[1][:16]
@@ -2586,10 +2428,10 @@ class TestContinuation(unittest.TestCase):
   with tempfile.TemporaryDirectory() as tmp:
    artifact=Path(tmp)/"artifacts"
    source=self._source(artifact)
-   self.assertEqual(source["confirmation_mode"],"autonomous")
+   self.assertEqual(source["confirmation_mode"],"hybrid")
    self._complete_prefix(source,"test",Path(tmp)/"evidence")
    continuation=self._build(source)
-   self.assertEqual(continuation["confirmation_mode"],"autonomous")
+   self.assertEqual(continuation["confirmation_mode"],"hybrid")
 
  def test_sd_open_46_composed_route_continuation_inherits_composition(self):
   # SD-OPEN-46: a continuation of a composed (compose-on-demand) route must
@@ -3160,7 +3002,14 @@ class TestContinuation(unittest.TestCase):
       sealed.write_text("",encoding="utf-8")
       wreck()
       declined=self._build(source,resume_from_node="execute",requested_boundary="execute")
-      self.assertEqual(declined["source_commit"],pinned)
+      if name == "registry is a directory":
+       self.assertEqual(declined["first_runnable_blocker"],
+        "continuation-source-node-unverified:frame:registry-unreadable")
+       self.assertEqual(declined["new_nodes"],[])
+       self.assertNotIn("source_commit",declined)
+      else:
+       self.assertEqual(declined["source_commit"],pinned)
+      self.assertEqual(source["source_commit"],pinned)
       self.assertNotIn("source_commit_rebind",declined)
     # An unresolved jobs binding is unreadable in the same sense.
     if sealed.is_dir(): sealed.rmdir()
@@ -3409,7 +3258,14 @@ class TestContinuation(unittest.TestCase):
    restore()
    for name,route in cases.items():
     with self.subTest(name):
-     self.assertEqual(route["source_commit"],pinned)
+     if name == "directory":
+      self.assertEqual(route["first_runnable_blocker"],
+       "continuation-source-node-unverified:frame:registry-unreadable")
+      self.assertEqual(route["new_nodes"],[])
+      self.assertNotIn("source_commit",route)
+     else:
+      self.assertEqual(route["source_commit"],pinned)
+     self.assertEqual(source["source_commit"],pinned)
      self.assertNotIn("source_commit_rebind",route)
 
  def test_c_pruned_release_registry_is_not_authoritative(self):
@@ -5331,6 +5187,44 @@ class ComposeRouteTest(TestRoute):
  def compose(self,**kw):
   d=dict(capability="autopilot-code",capability_mode="dev",shape="staged",graph="execute,test,report",slug="compose-fixture",cwd=R.ROOT,artifact_root=R.ROOT,dispatch_evidence=self.evidence())
   d.update(kw); return R.compose_route(**d)
+ def test_work_request_is_sealed_and_cannot_be_replaced_at_resume(self):
+  request={"text":"Run the accepted commands, including exit 7.","owner_harness":"opencode"}
+  route=self.compose(work_request=request,profile="light")
+  self.assertEqual(route["work_request"],request)
+  R.verify_route(route,R.ROOT)
+  changed=self.compose(work_request={**request,"text":"Only run the passing command."},profile="light")
+  self.assertNotEqual(route["route_id"],changed["route_id"])
+  route["work_request"]["text"]="Only run the passing command."
+  with self.assertRaisesRegex(ValueError,"modified route hash"): R.verify_route(route,R.ROOT)
+  for bad in ({"text":"","owner_harness":None},{"text":"task","owner_harness":"invented"}, {"text":"task"}):
+   with self.assertRaises(ValueError): self.compose(work_request=bad)
+ def test_compose_start_prints_one_work_receipt_and_preserves_full_route(self):
+  import contextlib, io, types
+  with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ,{"AGENT_HOME":str(R.ROOT),"AGENT_DISPATCH_ATTEMPT_ID":""}):
+   route=self.compose(artifact_root=tmp,work_request={"text":"task","owner_harness":"codex"})
+   out=io.StringIO()
+   with contextlib.redirect_stdout(out),contextlib.redirect_stderr(io.StringIO()):
+    path=R._emit_compiled_route(types.SimpleNamespace(command="compose",start=True),route,tmp)
+   self.assertEqual(out.getvalue(),"")
+   self.assertEqual(json.loads(path.read_text()),route)
+ def test_compose_receipt_keeps_choices_and_full_canonical_record(self):
+  import contextlib, io, types
+  with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ,{"AGENT_HOME":str(R.ROOT)}):
+   route=self.compose(artifact_root=tmp,profile="light")
+   outputs=[]
+   with mock.patch.dict(os.environ,{"AGENT_DISPATCH_ATTEMPT_ID":""}):
+    for full in (False,True):
+     out=io.StringIO()
+     with contextlib.redirect_stdout(out),contextlib.redirect_stderr(io.StringIO()):
+      R._emit_compiled_route(types.SimpleNamespace(command="compose",full_record=full),route,tmp)
+     outputs.append(json.loads(out.getvalue()))
+   receipt,full=outputs
+   self.assertEqual(full,route)
+   self.assertEqual(json.loads(Path(receipt["route_file"]).read_text()),route)
+   self.assertEqual(receipt["owner_model_profile"],"light")
+   self.assertEqual([n["id"] for n in receipt["nodes"]],["execute","test","report"])
+   self.assertTrue(all(n["model_profile"]=="light" for n in receipt["nodes"]))
+   self.assertLess(len(json.dumps(receipt)),len(json.dumps(route))//3)
  def test_campaign_selection_is_optional_validated_and_sealed(self):
   old=self.compose()
   self.assertNotIn("campaign_key",old); self.assertNotIn("parent_cycle_id",old)
@@ -5364,6 +5258,30 @@ class ComposeRouteTest(TestRoute):
   self.assertEqual(route["conditional_extensions"][0]["after"],["report"])
   self.assertIn("small_work_confirmation",route)
   R.verify_route(route,R.ROOT)
+ def test_staged_without_graph_uses_recipe_without_another_cli(self):
+  route=self.compose(graph=None)
+  self.assertFalse(route.get("composed",False))
+  self.assertEqual(route["selection"]["shape"],"staged")
+  self.assertEqual([n["id"] for n in route["nodes"]],
+   ["frame","frame-alternative","plan","plan-check","execute","impl-review","test","report"])
+  R.verify_route(route,R.ROOT)
+ def test_chosen_graph_does_not_require_presets_review_stage(self):
+  for intensity in ("standard","strong"):
+   route=self.compose(graph="plan,test,report",intensity=intensity)
+   self.assertEqual([n["id"] for n in route["nodes"]],["plan","test","report"])
+   self.assertEqual(route["parallel_groups"],[])
+   self.assertEqual(route["composed_recipe"]["compose"]["omitted_parallel_presets"],
+    [{"id":"plan","reason":"review-consumer-not-selected"}])
+   R.verify_route(route,R.ROOT)
+ def test_frame_pair_stays_independent_and_gates_the_following_work(self):
+  route=self.compose(graph="frame,frame-alternative,plan,test,report")
+  nodes={n["id"]:n for n in route["nodes"]}
+  self.assertEqual(nodes["frame"]["depends_on"],[])
+  self.assertEqual(nodes["frame-alternative"]["depends_on"],[])
+  self.assertEqual(nodes["plan"]["depends_on"],["frame","frame-alternative"])
+  self.assertEqual(route["human_gate_bindings"],
+   [{"gate":"frame-review","node":"plan","position":"entry"}])
+  R.verify_route(route,R.ROOT)
  def test_subgraph_inputs_keep_the_base_contract(self):
   """Round-1 B1: a kept node keeps every declared input it can still get; a dropped producer's file is not promised."""
   route=self.compose(graph="execute,test,report")
@@ -5371,35 +5289,70 @@ class ComposeRouteTest(TestRoute):
   self.assertEqual(by_id["execute"]["inputs"],["task"])  # plan.md/checklist.md come from the dropped plan node
   self.assertEqual(by_id["test"]["inputs"],["source-diff"])  # semantic token kept; nothing appended (round 2 M2)
   self.assertEqual(by_id["report"]["inputs"],["dev_logs/**","test_logs/**"])
+  # The widest graph compose can express today: `frame-alternative` cannot be
+  # named alongside `frame`, because compose_subgraph_recipe emits one
+  # `frame-review` binding per frame leg and the registry validator refuses a
+  # gate bound twice. So the comparison is against the preset MINUS that leg,
+  # with `plan` losing exactly the dropped producer's brief -- which is rule B1
+  # itself, applied to the whole graph rather than to a three-node cut.
   full=self.compose(graph="frame,plan,plan-check,execute,impl-review,test,report")
   preset=R.compile_route(**self.args(requested_intensity="standard",predicates=[],signals=["shared-contract"],inline_reason=None,dispatch_evidence=self.evidence()))
-  self.assertEqual({n["id"]:n["inputs"] for n in full["nodes"]},{n["id"]:n["inputs"] for n in preset["nodes"]})  # a full-graph compose equals the preset (group expansion included)
+  expected={n["id"]:list(n["inputs"]) for n in preset["nodes"] if n["id"]!="frame-alternative"}
+  expected["plan"]=[i for i in expected["plan"] if i!="shards/frame-alternative/direction-brief.md"]
+  self.assertEqual({n["id"]:n["inputs"] for n in full["nodes"]},expected)  # a full-graph compose equals the preset (group expansion included)
   self.assertEqual({n["id"]:n["inputs"] for n in self.compose(graph="impl-review,test")["nodes"]},{"impl-review":["source-diff"],"test":["source-diff"]})
  def test_frame_gate_rebinds_to_the_node_that_follows(self):
   route=self.compose(graph="frame,execute,test")
   self.assertEqual(route["human_gate_bindings"],[{"gate":"frame-review","node":"execute","position":"entry"}])
   frame=next(n for n in route["nodes"] if n["id"]=="frame")
   self.assertEqual(frame["continuation"],{"kind":"human-gate","gate":"frame-review"})
-  self.assertEqual([g["id"] for g in route["parallel_groups"]],["frame"])
-  self.assertIn("frame-alternative",[n["id"] for n in route["nodes"]])
+  # The second frame leg used to arrive for free, as a parallel-group replica
+  # of `frame`. It is an explicitly declared node now, so a graph that names
+  # only `frame` gets only `frame` -- and no realized group at all.
+  self.assertEqual(route["parallel_groups"],[])
+  self.assertNotIn("frame-alternative",[n["id"] for n in route["nodes"]])
   R.verify_route(route,R.ROOT)
  def test_source_node_entry_gate_is_kept(self):
-  """autopilot-spec `intent-confirmation` binds the entry of the first node; a full-graph compose keeps it."""
-  route=self.compose(capability="autopilot-spec",capability_mode="update",graph="research,review,prd-transaction",signals=["shared-contract"])
-  self.assertEqual(route["human_gate_bindings"],[{"gate":"intent-confirmation","node":"research","position":"entry"}])
-  self.assertEqual(route["human_gates"],["intent-confirmation"])
-  self.assertEqual([n["id"] for n in route["nodes"] if not n.get("parallel_leg_index")],["research","review","prd-transaction"])
+  """autopilot-spec's `frame-review` binds the entry of the first node after `frame`; a full-graph compose keeps it."""
+  # W5 retired `intent-confirmation` entirely -- autopilot-spec now raises only
+  # `frame-review` from its `frame`/`frame-alternative` legs, bound at
+  # `research@entry`. The rule under test is unchanged: an entry gate on a kept
+  # node survives verbatim across compose.
+  route=self.compose(capability="autopilot-spec",capability_mode="update",graph="frame,research,review,prd-transaction",signals=["shared-contract"])
+  self.assertEqual(route["human_gate_bindings"],[
+   {"gate":"frame-review","node":"research","position":"entry"}])
+  self.assertEqual(route["human_gates"],["frame-review"])
+  self.assertEqual([n["id"] for n in route["nodes"] if not n.get("parallel_leg_index")],["frame","research","review","prd-transaction"])
   self.assertTrue(route["nodes"][-1]["terminal"]); self.assertEqual(route["nodes"][-1]["dispatch_depth"],1)
   R.verify_route(route,R.ROOT)
-  # dropping the research anchor leaves spec-review's auxiliary_arbiter declaration orphaned: the registry validator refuses it as-is
-  with self.assertRaisesRegex(Exception,"auxiliary_arbiter"):
-   self.compose(capability="autopilot-spec",capability_mode="update",graph="review,prd-transaction",signals=["shared-contract"])
+  # ...and dropping the `frame` raiser drops the gate: nothing else in the
+  # subgraph raises `frame-review`, so it is not promised even though `research`
+  # (the bound node) is still present.
+  without=self.compose(capability="autopilot-spec",capability_mode="update",graph="research,review,prd-transaction",signals=["shared-contract"])
+  self.assertEqual(without["human_gate_bindings"],[]); self.assertEqual(without["human_gates"],[])
+  R.verify_route(without,R.ROOT)
+  # A review unit can be reused without selecting its preset's producer group.
+  review_only=self.compose(capability="autopilot-spec",capability_mode="update",graph="review,prd-transaction",signals=["shared-contract"])
+  R.verify_route(review_only,R.ROOT)
  def test_terminal_frame_drops_its_group_and_gate(self):
-  route=self.compose(graph="frame")
-  self.assertEqual([n["id"] for n in route["nodes"]],["frame"]); self.assertTrue(route["nodes"][0]["terminal"])
+  # `frame` is no longer a parallel-group anchor, and it is a dispatch-depth-1
+  # node, so a `frame`-only subgraph has no depth-2 evidence consumer and can
+  # no longer be composed at all. The two rules this test protects are
+  # unchanged and are pinned on the shapes that can still carry them.
+  # (1) G6: a parallel group whose anchor became the terminal is dropped.
+  grouped=self.compose(graph="plan,impl-review",intensity="strong")
+  self.assertEqual([g["id"] for g in grouped["parallel_groups"]],["plan"])
+  self.assertNotIn("impl-review-alternative",[n["id"] for n in grouped["nodes"]])
+  self.assertTrue(grouped["nodes"][-1]["terminal"])
+  R.verify_route(grouped,R.ROOT)
+  # (2) a terminal frame raises no gate (nothing follows it) and is forced to
+  # model-required; a dropped sink drops the conditional extension with it.
+  route=self.compose(graph="plan,plan-check,frame")
+  self.assertEqual([n["id"] for n in route["nodes"]],["plan","plan-check","frame"])
+  self.assertTrue(route["nodes"][-1]["terminal"])
   self.assertEqual(route["parallel_groups"],[]); self.assertEqual(route["human_gates"],[])
   self.assertEqual(route["conditional_extensions"],[])
-  self.assertEqual(route["nodes"][0]["advance_class"],"model-required")
+  self.assertEqual(route["nodes"][-1]["advance_class"],"model-required")
   R.verify_route(route,R.ROOT)
  def test_unit_override_must_be_a_declared_choice(self):
   route=self.compose(graph="execute:dev/refactor,test")
@@ -5408,7 +5361,6 @@ class ComposeRouteTest(TestRoute):
   with self.assertRaisesRegex(ValueError,"compose-unit-not-in-choices"): self.compose(graph="execute:qa/test,test")
  def test_typed_refusals(self):
   with self.assertRaisesRegex(ValueError,"compose-graph-unknown-node"): self.compose(graph="execute,deploy")
-  with self.assertRaisesRegex(ValueError,"compose-graph-required"): self.compose(graph=None)
   with self.assertRaisesRegex(ValueError,"compose-graph-only-staged"): self.compose(shape="direct",graph="execute")
   with self.assertRaisesRegex(ValueError,"compose-shape-intensity-mismatch"): self.compose(intensity="quick")
   with self.assertRaisesRegex(ValueError,"compose-shape-intensity-mismatch"): self.compose(shape="direct",graph=None,intensity="standard")
@@ -5426,9 +5378,16 @@ class ComposeRouteTest(TestRoute):
   R.verify_route(route,R.ROOT)
   card=R.compose_card(route); self.assertIn("direct(direct)",card); self.assertIn(route["route_id"],card); self.assertIn("사람 게이트 없음",card)
  def test_solo_shape_is_one_registered_owner(self):
-  cands={"candidates":[{"harness":"claude","transport":"headless","surface":"registered-headless","status":"supported","probe_source":"fixture","probe_time":"2026-09-07T00:00:00Z"}]}
+  # Two supported harnesses: solo compiles quick, and quick now refuses a
+  # single-harness candidate list because its frame pair is cross-harness.
+  cands={"candidates":[
+   {"harness":"claude","transport":"headless","surface":"registered-headless","status":"supported","probe_source":"fixture","probe_time":"2026-09-07T00:00:00Z"},
+   {"harness":"codex","transport":"headless","surface":"registered-headless","status":"supported","probe_source":"fixture","probe_time":"2026-09-07T00:00:00Z"}]}
   route=self.compose(shape="solo",graph=None,dispatch_evidence=None,registered_headless_evidence=cands)
-  self.assertEqual(route["effective_intensity"],"quick"); self.assertEqual(route["nodes"][0]["id"],"one-shot")
+  self.assertEqual(route["effective_intensity"],"quick")
+  # Still exactly one owner -- the frame pair ahead of it are not owners.
+  self.assertEqual([n["id"] for n in route["nodes"] if n.get("unit")=="_kernel/owner"],["one-shot"])
+  self.assertEqual([n["id"] for n in route["nodes"]],["frame","frame-alternative","one-shot"])
   self.assertEqual(route["selection"]["shape"],"solo"); self.assertEqual(route["selection"]["route_origin"],"compose")
   R.verify_route(route,R.ROOT)
  def test_staged_accepts_strong_and_expands_declared_groups(self):
@@ -5622,6 +5581,320 @@ class TerminalCommitSupportTests(unittest.TestCase):
   self.assertEqual(route["route_hash"],R.route_hash(route))
   forged=json.loads(json.dumps(route)); forged["runtime_support"]["terminal_commit"]=False
   self.assertNotEqual(R.route_hash(forged),route["route_hash"])
+
+
+class FrameBootstrapLayerTest(unittest.TestCase):
+ """The depth-1 frame layer: quick's new three-node shape, the standard+ frame
+ pair, and the five neighbouring properties that had to stay EXACTLY as they
+ were. The second half is the point -- a route-shape change this wide is only
+ safe if the things it did not touch are pinned as loudly as the things it did.
+
+ Borrows `TestRoute`'s hermetic AGENT_HOME/registry isolation and its evidence
+ fixtures by reference rather than by subclassing, so the whole `TestRoute`
+ suite is not re-run a second time under this class's name.
+ """
+ setUp=TestRoute.setUp
+ _restore_agent_home=TestRoute._restore_agent_home
+ args=TestRoute.args
+ dispatch=TestRoute.dispatch
+ nested=TestRoute.nested
+ FRAME_IDS=("frame","frame-alternative")
+ FRAME_CAPABILITIES=(("autopilot-code","dev"),("autopilot-design","default"),
+                     ("autopilot-draft","doc"),("autopilot-refine","default"),
+                     ("autopilot-spec","api"))
+
+ def quick(self,harnesses=("codex","claude"),**kw):
+  candidates={"candidates":[
+   {"harness":harness,"transport":"headless","surface":"registered-headless",
+    "status":"supported","probe_source":"fixture-probe",
+    "probe_time":"2026-07-20T00:00:00Z"} for harness in harnesses]}
+  return R.compile_route(**self.args(requested_intensity="quick",predicates=[],
+   transport=None,inline_reason=None,registered_headless_evidence=candidates,**kw))
+
+ def standard(self,capability="autopilot-code",mode="dev"):
+  return R.compile_route(capability,mode,"standard",R.ROOT,R.ROOT,predicates=[],
+   transport="headless",tracking="tracked",
+   tracked_gate_evidence=self.args()["tracked_gate_evidence"],
+   dispatch_evidence=self.dispatch(self.nested()))
+
+ # -- quick's three-node shape ---------------------------------------------
+ def test_quick_frame_scope_is_exactly_the_five_portable_recipes(self):
+  registry=R.TOPO.load_registry()
+  framed=[]
+  for recipe in registry["recipes"]:
+   route=self.quick(capability=recipe["capability"],capability_mode=recipe["modes"][0])
+   R.verify_route(route,R.ROOT)
+   frames=[n["id"] for n in route["nodes"] if n.get("worker_type")=="frame"]
+   if frames:
+    framed.append(recipe["capability"])
+    self.assertEqual(frames,["frame","frame-alternative"])
+   else:
+    self.assertEqual([n["id"] for n in route["nodes"]],["one-shot"])
+    self.assertEqual(route["human_gate_bindings"],[])
+  self.assertEqual(set(framed),{c for c,m in self.FRAME_CAPABILITIES})
+
+ def test_orphaned_quick_preview_gate_is_rejected_even_when_rehashed(self):
+  route=self.quick(capability="autopilot-refine",capability_mode="default")
+  self.assertEqual(route["effective_intensity"],"quick")
+  node=next(n for n in route["nodes"] if n["id"]=="one-shot")
+  self.assertEqual(node["inline_human_gates"],["preview-disposition"])
+  self.assertIn({"gate":"preview-disposition","node":"one-shot","position":"terminal"},route["human_gate_bindings"])
+  R.verify_route(route,R.ROOT)
+  node.pop("inline_human_gates")
+  route["route_hash"]=R.route_hash(route)
+  route["route_id"]="rt-"+route["route_hash"].split(":",1)[1][:16]
+  with self.assertRaisesRegex(ValueError,"preview-approval-boundary-missing"):
+   R.verify_route(route,R.ROOT)
+
+ def test_serial_attempt_survives_the_extra_two_nodes(self):
+  """`serial-attempt` is a per-(route_id, route_node) attempt budget, so three
+  nodes each get their own budget from the same policy word. If it had had to
+  change, quick's registration budget would have changed with it."""
+  route=self.quick()
+  self.assertEqual(len(route["nodes"]),3)
+  self.assertEqual(route["registered_headless_policy"],"serial-attempt")
+  R.verify_route(route,R.ROOT)
+
+ def test_the_frame_legs_do_not_raise_quicks_dispatch_depth(self):
+  """The frame pair is depth 1, like the owner -- not a depth-2 stage. Quick
+  gaining a depth-2 node would give it a fallback-chain obligation it has no
+  evidence for."""
+  route=self.quick()
+  self.assertEqual(route["max_dispatch_depth"],1)
+  self.assertEqual(route["owner_dispatch_depth"],1)
+  self.assertEqual({node["dispatch_depth"] for node in route["nodes"]},{1})
+
+ def test_the_conditional_extension_anchors_on_the_terminal_not_a_frame_leg(self):
+  """autopilot-code's `offer-artifact` extension follows whatever ends the
+  route. `frame` is nodes[0] now, so an anchor read by position would name it."""
+  route=self.quick()
+  self.assertEqual([row["after"] for row in route["conditional_extensions"]],[["one-shot"]])
+  self.assertEqual([node["id"] for node in route["nodes"] if node.get("terminal")],["one-shot"])
+
+ def test_only_the_one_shot_node_is_the_owner(self):
+  """`_owner_node` is what lets a node inherit the owner's sealed profile and
+  its `top` exception. A frame leg answering True here would silently take the
+  owner's model on every quick route."""
+  route=self.quick()
+  by_id={node["id"]:node for node in route["nodes"]}
+  self.assertTrue(R._owner_node(by_id["one-shot"],"quick"))
+  for node_id in self.FRAME_IDS:
+   with self.subTest(node_id=node_id):
+    self.assertFalse(R._owner_node(by_id[node_id],"quick"))
+    self.assertTrue(R._frame_node(by_id[node_id]))
+  self.assertFalse(R._frame_node(by_id["one-shot"]))
+
+ def test_quick_single_harness_compiles_as_a_recorded_degradation(self):
+  """Cross-harness is the default, and one supported harness is a recorded
+  degradation rather than a refusal (user decision, 2026-09-10): both legs run
+  there with their two perspectives, and both frame nodes say so. Compile and
+  verify read ONE helper, so a sealed route can never be compilable but
+  unverifiable (or the reverse)."""
+  route=self.quick(harnesses=("codex","claude"))
+  self.assertEqual(len(route["nodes"]),3)
+  by_id={n["id"]:n for n in route["nodes"]}
+  for node_id in self.FRAME_IDS:
+   self.assertEqual(by_id[node_id]["harness_diversity"],"cross-harness")
+  R.verify_route(route,R.ROOT)
+  single=self.quick(harnesses=("codex",))
+  by_id={n["id"]:n for n in single["nodes"]}
+  for node_id in self.FRAME_IDS:
+   self.assertEqual(by_id[node_id]["harness_diversity"],"single-harness:codex")
+  R.verify_route(single,R.ROOT)
+  # A sealed cross-harness route that later loses a harness is refused: the
+  # stamp says "cross-harness", the candidates now say one.
+  forged=json.loads(json.dumps(route))
+  forged["registered_headless_candidates"]=[
+   row for row in forged["registered_headless_candidates"] if row["harness"]=="codex"]
+  forged["route_hash"]=R.route_hash(forged)
+  forged["route_id"]="rt-"+forged["route_hash"].split(":",1)[1][:16]
+  with self.assertRaisesRegex(ValueError,"harness diversity mismatch|not canonical"):
+   R.verify_route(forged,R.ROOT)
+  # No supported harness at all still cannot frame.
+  with self.assertRaisesRegex(ValueError,"quick-frame-harness-unavailable"):
+   R._quick_frame_diversity([{"harness":"codex","status":"unsupported"}])
+
+ # -- the standard+ frame pair ---------------------------------------------
+ def test_every_frame_capability_declares_the_same_pair_of_legs(self):
+  for capability,mode in self.FRAME_CAPABILITIES:
+   with self.subTest(capability=capability):
+    route=self.standard(capability,mode)
+    legs=[node for node in route["nodes"] if node["id"] in self.FRAME_IDS]
+    self.assertEqual([node["id"] for node in legs],list(self.FRAME_IDS))
+    for leg in legs:
+     self.assertEqual(leg["kind"],"map-worker")
+     self.assertEqual(leg["unit"],"plan/frame")
+     self.assertEqual(leg["worker_type"],"frame")
+     self.assertEqual(leg["dispatch_depth"],1)
+     self.assertEqual(leg["launch_authority"],"depth-0")
+     self.assertEqual(leg["continuation"],{"kind":"human-gate","gate":"frame-review"})
+     self.assertEqual(leg["depends_on"],[])
+     # a depth-1 leg has no fallback chain and no depth-2 affinity cell, and
+     # it is not a parallel-group replica -- three separate ways the old
+     # shape could leak back in
+     self.assertNotIn("fallback_hops",leg)
+     self.assertNotIn("harness_affinity",leg)
+     self.assertNotIn("parallel_group",leg)
+     self.assertNotIn(leg["id"],[group["id"] for group in route["parallel_groups"]])
+    self.assertNotEqual(legs[0]["model_profile"],legs[1]["model_profile"])
+    work=[node for node in route["nodes"] if node["id"] not in self.FRAME_IDS]
+    self.assertEqual(work[0]["depends_on"],["frame","frame-alternative"])
+    # membership, not position: refine also binds its preview approval
+    # (`preview-disposition` at `transaction`) after the frame gate
+    self.assertIn({"gate":"frame-review","node":work[0]["id"],"position":"entry"},
+                  route["human_gate_bindings"])
+    R.verify_route(route,R.ROOT)
+
+ # -- what did NOT change ---------------------------------------------------
+ def test_the_evidence_consumer_depth_is_still_a_constant_two(self):
+  """Deliberately untouched. `EVIDENCE_CONSUMER_DISPATCH_DEPTH` is read by five
+  call sites plus fallback-chain attachment; making it configurable so a
+  depth-1 frame leg could consume evidence was rejected as far wider than the
+  guarded early return that was shipped instead. Pin the constant AND its use,
+  so a later edit cannot quietly soften either."""
+  self.assertEqual(R.EVIDENCE_CONSUMER_DISPATCH_DEPTH,2)
+  route=self.standard()
+  nodes=route["nodes"]
+  self.assertEqual(R._evidence_parent_dispatch_depth(nodes,1),1)
+  # the derivation reads depth-2 nodes, and nothing else: strip them and the
+  # frame pair (depth 1) does not stand in for them
+  depth1_only=[node for node in nodes if node.get("dispatch_depth")!=2]
+  self.assertTrue(any(R._frame_node(node) for node in depth1_only))
+  with self.assertRaisesRegex(ValueError,"dispatch-evidence-without-consumer-node"):
+   R._evidence_parent_dispatch_depth(depth1_only,1)
+  # and the parent depth it derives is still owner depth, not the frame leg's
+  with self.assertRaisesRegex(ValueError,"dispatch-evidence-parent-depth-mismatch"):
+   R._evidence_parent_dispatch_depth(nodes,2)
+  # the USE, not just the constant: compile and verify both still route their
+  # checked evidence through this derivation, with the whole node list and the
+  # owner's depth -- so the frame pair cannot become an evidence consumer by
+  # anyone quietly rewiring a call site instead of the constant
+  with mock.patch.object(R,"_evidence_parent_dispatch_depth",
+                         wraps=R._evidence_parent_dispatch_depth) as spy:
+   compiled=self.standard()
+   R.verify_route(compiled,R.ROOT)
+  self.assertTrue(spy.call_args_list)
+  for call in spy.call_args_list:
+   observed_nodes,owner_depth=call.args
+   self.assertEqual(owner_depth,1)
+   self.assertTrue(any(node.get("dispatch_depth")==2 for node in observed_nodes))
+
+ def test_the_top_exception_widened_to_frame_ids_and_nothing_else(self):
+  """Part C. `top` is a depth-1 decision: the owner, and now a frame anchor
+  leg. A depth-2 stage node must still be refused by name."""
+  nodes=[{"id":"frame","unit":"plan/frame","dispatch_depth":1,"worker_type":"frame",
+          "model_profile":"balanced-deep"},
+         {"id":"frame-alternative","unit":"plan/frame","dispatch_depth":1,
+          "worker_type":"frame","model_profile":"light"},
+         {"id":"execute","kind":"pipeline-stage","dispatch_depth":2,"model_profile":"light"}]
+  demand={"schema_version":1,"judgment_requirement":"important",
+          "execution_scope":"short-local",
+          "judgment_reason":"Approved decision recorded in the task.",
+          "execution_reason":"Execute the declared fixture steps.",
+          "evidence_refs":["decision.md"]}
+  demands={key:dict(demand) for key in ("__owner__","frame","frame-alternative","execute")}
+  for node_id in self.FRAME_IDS:
+   with self.subTest(node_id=node_id):
+    _demands,explicit=R._profile_input_maps(nodes,demands,{node_id:"top"})
+    self.assertEqual(explicit,{node_id:"top"})
+  _demands,explicit=R._profile_input_maps(nodes,demands,{"__owner__":"top"})
+  self.assertEqual(explicit,{"__owner__":"top"})
+  with self.assertRaises(ValueError) as refused:
+   R._profile_input_maps(nodes,demands,{"execute":"top"})
+  self.assertEqual(str(refused.exception),"profile-explicit-top-owner-only:execute")
+  # a node that only LOOKS like a frame leg does not get the exception either
+  impostor=[dict(nodes[0],id="frame",worker_type="stage")]+nodes[1:]
+  with self.assertRaises(ValueError) as refused:
+   R._profile_input_maps(impostor,demands,{"frame":"top"})
+  self.assertEqual(str(refused.exception),"profile-explicit-top-owner-only:frame")
+
+ # -- the frame tier ladder is stamped, never inherited from the recipe -----
+ def test_the_recipe_placeholder_profile_never_reaches_a_compiled_frame_leg(self):
+  """THE POINT OF THIS TEST: the same decision must not live in two homes.
+
+  `capabilities/topologies.json` declares a static `model_profile` on each
+  standard+ frame leg, and the quick node builder hardcodes two more. None of
+  them can be correct, because the right value depends on the owner profile the
+  route resolves at compile time, which no static field can see. The compiler
+  stamps every frame leg from `model_profile.FRAME_PROFILE_LADDER`, so the
+  static values are placeholders. Without this test that is a silent latent
+  bug: the placeholders would keep drifting and nothing would notice.
+  """
+  registry=R.TOPO.load_registry()
+  ladder=R.PROFILE.FRAME_PROFILE_LADDER
+  # The declared placeholders really do disagree with the ladder -- otherwise
+  # this test would pass for the wrong reason (nothing to overwrite).
+  disagreeing=0
+  for capability,mode in self.FRAME_CAPABILITIES:
+   recipe=R.TOPO.resolve_recipe(registry,capability,mode)
+   owner=registry["owner_profile_by_intensity"]["standard"]
+   rungs=ladder[owner]
+   for node in recipe["standard_plus"]["nodes"]:
+    if node.get("unit")!="plan/frame": continue
+    rung="anchor" if node["id"]=="frame" else "others"
+    if node.get("model_profile")!=rungs[rung]: disagreeing+=1
+  self.assertGreater(disagreeing,0,
+   "the static placeholders match the ladder, so this test cannot prove the stamp happens")
+
+  # standard+: owner is `deep` at every intensity, so anchor `top` / other `deep`
+  for capability,mode in self.FRAME_CAPABILITIES:
+   with self.subTest(capability=capability):
+    route=self.standard(capability=capability,mode=mode)
+    rungs=ladder[route["owner_model_profile"]]
+    by_id={n["id"]:n for n in route["nodes"]}
+    self.assertEqual(by_id["frame"]["model_profile"],rungs["anchor"])
+    self.assertEqual(by_id["frame-alternative"]["model_profile"],rungs["others"])
+    R.verify_route(route,R.ROOT)
+
+  # quick: owner is `balanced-deep`, so both legs land on `deep`
+  route=self.quick()
+  rungs=ladder[route["owner_model_profile"]]
+  by_id={n["id"]:n for n in route["nodes"]}
+  self.assertEqual(route["owner_model_profile"],"balanced-deep")
+  self.assertEqual(by_id["frame"]["model_profile"],rungs["anchor"])
+  self.assertEqual(by_id["frame-alternative"]["model_profile"],rungs["others"])
+  self.assertEqual((rungs["anchor"],rungs["others"]),("deep","deep"))
+  R.verify_route(route,R.ROOT)
+
+ def test_a_top_anchor_carries_a_real_demand_rather_than_an_unsealed_label(self):
+  """`top` is not portable, so it cannot be sealed through the legacy
+  "explicit profile, no demand" path. If the compiler stamped the label without
+  a demand, every standard+ compile would die `profile-demand-required` -- and
+  if it stamped a demand that did not resolve to `top`, verify would refuse the
+  route. Pin both halves."""
+  route=self.standard()
+  anchor=next(n for n in route["nodes"] if n["id"]=="frame")
+  self.assertEqual(anchor["model_profile"],"top")
+  self.assertEqual(anchor["profile_selection"]["resolved_profile"],"top")
+  self.assertEqual(anchor["profile_selection"]["source"],"explicit")
+  self.assertEqual(anchor["profile_selection"]["reason"],"explicit-top-exception")
+  self.assertEqual(anchor["profile_demand"],R.PROFILE.FRAME_ANCHOR_SHAPE_DEMAND)
+  # the sibling leg stays portable and needs no demand of its own
+  other=next(n for n in route["nodes"] if n["id"]=="frame-alternative")
+  self.assertEqual(other["model_profile"],"deep")
+  self.assertIsNone(other["profile_demand"])
+  R.verify_route(route,R.ROOT)
+
+ def test_the_owners_own_demand_is_reused_when_the_caller_supplied_one(self):
+  """One decision, one place: when the caller already recorded WHY this route
+  needs top-tier judgment, the anchor reuses that demand rather than inventing
+  a second, differently worded one."""
+  demand={"schema_version":1,"judgment_requirement":"difficult-uncertain",
+          "execution_scope":"extended-multistep",
+          "judgment_reason":"caller supplied judgment reason",
+          "execution_reason":"caller supplied execution reason",
+          "evidence_refs":["fixture://caller"]}
+  route=R.compile_route("autopilot-code","dev","standard",R.ROOT,R.ROOT,predicates=[],
+   transport="headless",tracking="tracked",
+   tracked_gate_evidence=self.args()["tracked_gate_evidence"],
+   dispatch_evidence=self.dispatch(self.nested()),
+   profile_demands={"__owner__":demand},explicit_profiles={"__owner__":"top"})
+  self.assertEqual(route["owner_model_profile"],"top")
+  anchor=next(n for n in route["nodes"] if n["id"]=="frame")
+  self.assertEqual(anchor["model_profile"],"top")
+  self.assertEqual(anchor["profile_demand"],demand)
+  self.assertNotEqual(anchor["profile_demand"],R.PROFILE.FRAME_ANCHOR_SHAPE_DEMAND)
+  R.verify_route(route,R.ROOT)
 
 
 if __name__=="__main__": unittest.main()

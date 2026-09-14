@@ -212,6 +212,8 @@ class FallbackTest(unittest.TestCase):
    code,printed=self.run_review_inline(path)
   self.assertEqual(code,65,printed)
   self.assertIn("reason=review-round-budget-exhausted",printed)
+  self.assertIn("required_action=resolve-review-findings",printed)
+  self.assertIn(".owner-closure.md","\n".join(printed))
   self.assertIn(f"round={cap+1}",printed)
   self.assertIn(f"max_round={cap}",printed)
   self.assertIn("child_spawned=0",printed)
@@ -341,7 +343,12 @@ class FallbackTest(unittest.TestCase):
   path=self.route(native="supported"); same="codex/headless/workspace-write/codex/conductor"; cross="codex/headless/workspace-write/claude/conductor"
   result=self.run_chain(path,"--failed-tuple",same,"--failed-tuple",cross); self.assertEqual(result.returncode,79,result.stdout+result.stderr); self.assertIn("skipped-child-proof-missing",result.stdout); self.assertIn("selected_hop=inline",result.stdout)
   route=json.loads(path.read_text()); route["dispatch_evidence"]["native_subagent"][0]["status"]="unsupported"
-  for node in route["nodes"]: node["fallback_hops"][2]["candidates"][0]["status"]="unsupported"
+  # Only depth-2 nodes carry a fallback chain. The depth-1 frame bootstrap legs
+  # deliberately have no `fallback_hops` key at all -- recovery from a dead
+  # frame leg is an explicit depth-0 relaunch, never a machine hop -- so degrade
+  # every chain that exists instead of assuming every node has one.
+  for node in route["nodes"]:
+   if "fallback_hops" in node: node["fallback_hops"][2]["candidates"][0]["status"]="unsupported"
   route["route_hash"]=R.route_hash(route); route["route_id"]="rt-"+route["route_hash"].split(":",1)[1][:16]; path.write_text(json.dumps(route))
   result=self.run_chain(path,"--failed-tuple",same,"--failed-tuple",cross); self.assertEqual(result.returncode,79,result.stdout+result.stderr); self.assertIn("selected_hop=inline",result.stdout)
   self.assertIn("route_reuse=required",result.stdout)
@@ -440,17 +447,61 @@ class FallbackTest(unittest.TestCase):
    state,fields=F.watch_launched_attempt(args,route,node,"att-tool",{"child_pid":str(proc.pid),"child_pid_start":"2"})
   self.assertEqual(state,"fail-closed")
   self.assertEqual(fields.get("reason"),"progress-error")
- def test_process_exit_without_marker_advances_fallback(self):
-  args=SimpleNamespace(jobs=self.jobs,progress_window_seconds=1,watchdog_max_windows=2)
-  route={"route_id":"rt-fixture"}
-  node={"id":"plan"}
+ def test_process_exit_without_terminal_record_does_not_authorize_retry(self):
+  args=SimpleNamespace(jobs=self.jobs,progress_window_seconds=1,watchdog_max_windows=2,direct_timeout=0.1)
   seed=mock.Mock(returncode=0,stdout="",stderr="")
   exited=mock.Mock(returncode=0,stdout="action=process-exited\nterminal_action=process-exited\n",stderr="")
-  with mock.patch.object(F.subprocess,"run",side_effect=[seed,exited]):
-   state,fields=F.watch_launched_attempt(
-    args,route,node,"att-process-exit",{"child_pid":"1","child_pid_start":"2"})
-  self.assertEqual(state,"fallback")
+  with mock.patch.object(F.subprocess,"run",side_effect=[seed]+[exited]*20):
+   state,fields=F.watch_launched_attempt(args,{"route_id":"rt-fixture"},{"id":"plan"},"att-process-exit",{})
+  self.assertEqual(state,"observed")
   self.assertEqual(fields["terminal_action"],"process-exited")
+
+ def test_watchdog_cache_cannot_override_current_terminal_row(self):
+  args=SimpleNamespace(jobs=self.jobs,progress_window_seconds=1,watchdog_max_windows=2,direct_timeout=0.1)
+  for cached in ("process-exited", "dead-no-progress", "dead-capacity"):
+   for note, expected in (("completed-marker", "terminal"),
+                          ("completed-review-blocking", "terminal"),
+                          ("dead-worker-fail", "fallback"),
+                          ("dead-capacity", "capacity")):
+    with self.subTest(cached=cached,note=note):
+     self.jobs.write_text(
+      "2026-07-24T00:00:00Z\tdone\t/repo\t/wt\tplan-check\t"
+      "route_id=rt-fixture,route_node=plan-check,attempt_id=att-terminal,"
+      f"launch_outcome=reaped-before-publish,note={note}\n")
+     seed=mock.Mock(returncode=0,stdout="",stderr="")
+     stale=mock.Mock(returncode=0,stdout=f"action={cached}\nterminal_action={cached}\n",stderr="")
+     with mock.patch.object(F.subprocess,"run",side_effect=[seed,stale]):
+      state,fields=F.watch_launched_attempt(args,{"route_id":"rt-fixture"},{"id":"plan-check"},"att-terminal",{})
+     self.assertEqual(state,expected)
+     self.assertEqual(fields["note"],note)
+
+ def test_cached_failure_without_terminal_record_cannot_authorize_retry(self):
+  args=SimpleNamespace(jobs=self.jobs,progress_window_seconds=1,watchdog_max_windows=2,direct_timeout=0.1)
+  for cached in ("dead-no-progress", "dead-capacity", "registry-terminal"):
+   with self.subTest(cached=cached):
+    seed=mock.Mock(returncode=0,stdout="",stderr="")
+    stale=mock.Mock(returncode=0,stdout=f"action={cached}\nterminal_action={cached}\n",stderr="")
+    with mock.patch.object(F.subprocess,"run",side_effect=[seed,stale]):
+     state,_=F.watch_launched_attempt(args,{"route_id":"rt-fixture"},{"id":"plan"},"att-missing",{})
+    self.assertEqual(state,"fail-closed")
+
+ def test_completed_but_live_or_unverifiable_attempt_cannot_authorize_retry(self):
+  proc=self._live_row(attempt="att-settling")
+  self.jobs.write_text(self.jobs.read_text().replace("\topen\t", "\tdone\t").rstrip("\n") + ",note=completed-marker\n")
+  args=SimpleNamespace(jobs=self.jobs,progress_window_seconds=1,watchdog_max_windows=2,direct_timeout=0.1)
+  seed=mock.Mock(returncode=0,stdout="",stderr="")
+  stale=mock.Mock(returncode=0,stdout="action=dead-capacity\nterminal_action=dead-capacity\n",stderr="")
+  with mock.patch.object(F.subprocess,"run",side_effect=[seed]+[stale]*20):
+   state,fields=F.watch_launched_attempt(args,{"route_id":"rt-fixture"},{"id":"plan"},"att-settling",{})
+  self.assertEqual(state,"observed")
+  self.assertEqual(fields["process_state"],"live")
+  self.assertIsNone(proc.poll())
+  with mock.patch.object(F.subprocess,"run",side_effect=[seed,stale]), mock.patch.object(
+       F,"attempt_process_quiescence",return_value=SimpleNamespace(state="unverifiable",reason="observer-unavailable")):
+   state,fields=F.watch_launched_attempt(args,{"route_id":"rt-fixture"},{"id":"plan"},"att-settling",{})
+  self.assertEqual(state,"fail-closed")
+  self.assertEqual(fields["process_reason"],"observer-unavailable")
+
  def test_completed_row_is_draining_until_exact_process_exits(self):
   proc=subprocess.Popen(["sleep","30"],start_new_session=True)
   try:
@@ -488,6 +539,39 @@ class FallbackTest(unittest.TestCase):
   state,fields=F.terminal_attempt_state(self.jobs,"rt-q","plan-check","att-rb")
   self.assertEqual(state,"fallback")
   self.assertNotIn("review_verdict",fields)
+ def test_terminal_fallback_consumes_portable_receipt_after_observer_exit(self):
+  import dispatch_contract as D
+  for harness in ("claude","codex","opencode"):
+   for lifecycle,outcome in (("foreground-scoped","governed-process-reaped"),
+                             ("detached","governed-process-group-drained")):
+    for note,expected in (("completed-marker","terminal"),
+                          ("completed-review-blocking","terminal"),
+                          ("dead-capacity","capacity"),
+                          ("dead-worker-fail","fallback")):
+     with self.subTest(harness=harness,lifecycle=lifecycle,note=note):
+      metadata={"route_id":"rt-q","route_node":"plan-check","attempt_id":"att-receipted",
+       "attempt_schema_version":"2","dispatch_depth":"2","transport":"headless",
+       "execution_surface":"registered-headless","registered_worker":"1",
+       "fallback_hop":"same-harness-headless","harness":harness,"note":note,
+       "pid":"437","pgid":"437","pid_start":"20","pid_scope":"namespace-local",
+       "pid_ns":"pid:[foreign-fixture]","pid_observer_ns":"pid:[foreign-fixture]",
+       "launch_lifecycle":lifecycle,"launch_outcome":outcome,
+       "group_reap_proof":D.GROUP_REAP_PROOF,"group_reap_pgid":"437",
+       "attempt_descendant_proof":D.ATTEMPT_DESCENDANT_PROOF,
+       "attempt_descendant_observer_ns":"pid:[foreign-fixture]"}
+      def write(status="done"):
+       self.jobs.write_text("2026-09-11T00:00:00Z\t"+status+"\t/repo\t/wt\treview\t"+
+        ",".join(f"{k}={v}" for k,v in metadata.items())+"\n")
+      write()
+      state,fields=F.terminal_attempt_state(self.jobs,"rt-q","plan-check","att-receipted")
+      self.assertEqual(state,expected,fields)
+      self.assertEqual(fields["process_state"],"quiescent")
+      write("open")
+      self.assertIsNone(F.terminal_attempt_state(self.jobs,"rt-q","plan-check","att-receipted"))
+      metadata.pop("group_reap_proof")
+      write()
+      state,fields=F.terminal_attempt_state(self.jobs,"rt-q","plan-check","att-receipted")
+      self.assertEqual(state,"fail-closed",fields)
  def test_attempt_identity_is_stable_across_actions(self):
   path=self.route(); first=self.run_chain(path); second=self.run_chain(path)
   def attempt(result):

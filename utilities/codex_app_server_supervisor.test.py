@@ -11,6 +11,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import textwrap
 from types import SimpleNamespace
 import unittest
@@ -106,15 +107,14 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
                         finally:
                             os.close(lease_fd)
                         state_path = os.environ.get('AGENT_DISPATCH_COMPLETION_STATE_FILE')
-                        if '--failure-detail' in prompt:
-                            with open(state_path, encoding='utf-8') as h:
-                                state_value = json.load(h)
-                            state_value.pop('outbox', None)
-                            state_value['phase'] = 'running-turn'
-                            with open(state_path, 'w', encoding='utf-8') as h:
-                                json.dump(state_value, h)
                         with open(state_path, encoding='utf-8') as h:
                             delivered = json.load(h)['delivered_attempt_ids']
+                        if os.environ.get('FAKE_MIXED_START') == '1' and 'att-child' in delivered:
+                            jobs = os.environ['FAKE_JOBS']
+                            with open(jobs, encoding='utf-8') as h:
+                                rows = h.read().replace('launch_started=0', 'launch_started=1')
+                            with open(jobs, 'w', encoding='utf-8') as h:
+                                h.write(rows)
                         record('turn-start', turn=turns, prompt=prompt, delivered=delivered,
                                lease_held=lease_held)
                         turn_id = f'turn-{turns}'
@@ -220,7 +220,7 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
                 for attempt in attempts:
                     fields = current[attempt]
                     fields[1] = 'done'
-                    fields[5] += ',failure_class=pass,note=completed-supervisor'
+                    fields[5] += ',failure_class=pass,note=completed-supervisor,launch_outcome=never-launched'
                     kept.append('\\t'.join(fields))
                 with open(jobs, 'w', encoding='utf-8') as h:
                     h.write('\\n'.join(kept) + '\\n')
@@ -315,6 +315,8 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
         self.assertEqual(len(observed), 1)
         self.assertEqual(observed[0]["delivery_timing_schema_version"], 1)
         self.assertIsInstance(observed[0]["join_completed_ns"], int)
+        # This transport fixture supplies no marker/committed child receipt.
+        # A bare done/pass word must arrive as attention, not proved success.
         self.assertIn('"delivery_classification":"attention"', trace[3]["prompt"])
         timing_events = [
             row for row in rows
@@ -379,6 +381,37 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
         self.assertEqual(
             turns[1]["prompt"].count("[continuation-budget-warning]"), 1
         )
+
+    def test_premature_pass_resumes_same_owner_before_terminal_commit(self):
+        self.jobs.write_text(owner_row(self.lease).replace("attempt_id=att-parent", "workflow_completion=runtime-v1,attempt_id=att-parent"))
+        route = self.base / "workflow-route.json"
+        value = seal_route({"schema_version": 2, "cwd": str(self.base),
+            "nodes": [{"id": "report", "dispatch_depth": 2, "terminal": True}], "resume_retry_boundaries": []})
+        route.write_text(json.dumps(value))
+        proof = self.base / "report.proof"
+        wrapper = self.base / "checked-supervisor.py"
+        wrapper.write_text(
+            "import sys, runpy, os\nfrom pathlib import Path\nfrom types import SimpleNamespace\n"
+            + "sys.path.insert(0, " + repr(str(SUPERVISOR.parent)) + ")\n"
+            + "import dispatch_terminal_commit as T\n"
+            + "route_module = T._route_module()\n"
+            + "route_module._marker_identity_row = lambda *a, **k: "
+              "{'passed': Path(os.environ['FAKE_REPORT_PROOF']).exists(), 'reason': 'marker-unreadable'}\n"
+            + "T._route_module = lambda: route_module\n"
+            + "runpy.run_path(" + repr(str(SUPERVISOR)) + ", run_name='__main__')\n")
+        self.app.write_text(self.app.read_text().replace("turns += 1", "turns += 1\n        if turns == 2: open(os.environ['FAKE_REPORT_PROOF'], 'w').write('proved')"))
+        command = self.command(); command[1] = str(wrapper)
+        command += ["--route-file", str(route), "--route-id", value["route_id"], "--route-hash", value["route_hash"]]
+        result = subprocess.run(command, input="initial assignment", text=True, capture_output=True,
+            env={**os.environ, "FAKE_TRACE": str(self.trace), "FAKE_NO_CHILD": "1", "FAKE_REPORT_PROOF": str(proof)}, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        turns = [json.loads(line) for line in self.trace.read_text().splitlines() if json.loads(line).get("event") == "turn-start"]
+        self.assertEqual(len(turns), 2, turns)
+        self.assertIn("[workflow-completion-pending]", turns[1]["prompt"])
+        self.assertIn("report", turns[1]["prompt"])
+        self.assertIn("workflow-completion-incomplete", result.stdout)
+        self.assertEqual(len(self.jobs.read_text().splitlines()), 1)
+        self.assertIn("completed-supervisor", self.jobs.read_text())
 
     def test_no_child_finishes_in_one_turn(self):
         self.jobs.write_text(owner_row(self.lease), encoding="utf-8")
@@ -455,6 +488,20 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
         self.assertEqual(len(parked), 1)
         self.assertEqual(parked[0]["attempt_count"], 2)
 
+    def test_started_child_is_collected_before_correcting_unstarted_sibling(self):
+        pending = child_row("att-pending").replace("launch_started=1", "launch_started=0")
+        self.jobs.write_text(owner_row(self.lease) + child_row() + pending)
+        result = self.run_supervisor(FAKE_MIXED_START="1", FAKE_JOBS=str(self.jobs))
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        trace = [json.loads(line) for line in self.trace.read_text().splitlines()]
+        self.assertEqual([event["event"] for event in trace], [
+            "turn-start", "join-start", "join-end", "turn-start",
+            "join-start", "join-end", "turn-start",
+        ])
+        self.assertEqual(trace[3]["delivered"], ["att-child"])
+        self.assertEqual(set(trace[-1]["delivered"]), {"att-child", "att-pending"})
+        self.assertNotIn('"state": "registration-required"', result.stdout)
+
     def test_bound_long_route_survives_thirteen_continuations_and_completes(self):
         route = self.base / "long-route.json"
         route_value = seal_route({
@@ -484,14 +531,6 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
                     elif method == 'turn/start':
                         turns += 1
                         prompt = value['params']['input'][0]['text']
-                        if '--failure-detail' in prompt:
-                            state_path = os.environ['AGENT_DISPATCH_COMPLETION_STATE_FILE']
-                            with open(state_path, encoding='utf-8') as h:
-                                state_value = json.load(h)
-                            state_value.pop('outbox', None)
-                            state_value['phase'] = 'running-turn'
-                            with open(state_path, 'w', encoding='utf-8') as h:
-                                json.dump(state_value, h)
                         if turns <= 13:
                             attempt = f'att-child-{turns}'
                             with open(os.environ['LONG_JOBS'], 'a', encoding='utf-8') as h:
@@ -561,9 +600,10 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
             self.assertEqual(boundary["previous_count"], index)
             timing_order = [
                 boundary["last_child_terminal_ns"], boundary["join_completed_ns"],
-                boundary["same_thread_resume_ns"], boundary["exact_harvest_ns"],
+                boundary["same_thread_resume_ns"],
                 boundary["next_stage_start_ns"],
             ]
+            self.assertIsNone(boundary["exact_harvest_ns"])
             self.assertEqual(timing_order, sorted(timing_order))
         self.assertFalse(any(
             row.get("type") == "dispatch.supervisor.owner-boundary"
@@ -684,83 +724,69 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
         registry = self.jobs.read_text(encoding="utf-8")
         self.assertIn("dead-worker-blocked", registry)
 
-    def test_d12_identical_redelivery_bound_seals_abandonment(self):
-        # D-12: the codex loop carries the same bound as the claude one. Before
-        # it, an open row the owner never harvested was re-delivered until the
-        # continuation budget was spent and the owner died `dead-runtime-exit`.
-        self.jobs.write_text(owner_row(self.lease) + child_row(), encoding="utf-8")
-        result = subprocess.run(
-            self.command_with_join(self._non_closing_join()),
-            input="initial assignment",
-            text=True,
-            capture_output=True,
-            env={
-                **os.environ,
-                "FAKE_TRACE": str(self.trace),
-                "AGENT_ARTIFACT_ROOT": str(self.artifact_root),
-            },
-            timeout=30,
-        )
-        self.assertEqual(result.returncode, 70, result.stderr + result.stdout)
-        events = [
-            json.loads(line)
-            for line in result.stdout.splitlines()
-            if line.startswith("{")
-        ]
-        suppressed = [
-            row for row in events
-            if row.get("type") == "dispatch.supervisor.redelivery-suppressed"
-        ]
-        self.assertEqual(
-            [row["resolution"] for row in suppressed],
-            ["identical-redelivery-bound"],
-            events,
-        )
-        registry = self.jobs.read_text(encoding="utf-8")
-        self.assertIn("note=owner-redelivery-abandoned", registry)
-        self.assertIn("failure_class=runtime", registry)
-        self.assertNotIn("note=owner-attention-unactionable", registry)
-        self.assertNotIn(
-            "continuation-limit-exceeded", result.stdout + result.stderr
-        )
+    def test_attention_is_runtime_acknowledged_without_model_harvest(self):
+        self.jobs.write_text(owner_row(self.lease) + self._blocked_child_row(), encoding="utf-8")
+        result = subprocess.run(self.command_with_join(self._non_closing_join()),
+            input="initial assignment", text=True, capture_output=True,
+            env={**os.environ, "FAKE_TRACE": str(self.trace),
+                 "AGENT_ARTIFACT_ROOT": str(self.artifact_root)}, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        turns = [json.loads(line) for line in self.trace.read_text().splitlines()
+                 if json.loads(line)["event"] == "turn-start"]
+        self.assertEqual(len(turns), 2, turns)
+        self.assertIn("inspect-done-failure", turns[1]["prompt"])
+        self.assertNotIn("redelivery-suppressed", result.stdout)
+        registry = self.jobs.read_text()
+        self.assertIn("dead-worker-blocked", registry)
+        self.assertNotIn("owner-redelivery-abandoned", registry)
+        self.assertFalse(self.state.exists())
 
-    def test_live_unresolved_child_still_raises(self):
-        log = self.base / "att-live.codex.jsonl"
-        route = self.base / "route.json"
-        row = (
-            f"2026-07-23T00:00:00Z\topen\t{self.base}\t{self.base}\tchild\t"
-            "attempt_schema_version=2,dispatch_depth=2,transport=headless,"
-            "execution_surface=registered-headless,registered_worker=1,launch_started=1,"
-            "fallback_hop=same-harness-headless,harness=codex,"
-            f"attempt_id=att-live,parent_attempt_id={PARENT},"
-            f"log_file={log},artifact_root={self.artifact_root},"
-            f"route_file={route},route_node=frame\n"
-        )
-        self.jobs.write_text(owner_row(self.lease) + row, encoding="utf-8")
-        result = subprocess.run(
-            self.command_with_join(self._non_closing_join()) + ["--max-continuations", "1"],
-            input="initial assignment",
-            text=True,
-            capture_output=True,
-            env={**os.environ, "FAKE_TRACE": str(self.trace)},
-            timeout=10,
-        )
-        self.assertNotEqual(result.returncode, 0)
-        # SD-116 (c): exhaustion no longer necessarily dies with
-        # "continuation-limit-exceeded" on the very next turn -- the reserved
-        # budget now buys exactly one extra cleanup turn first (see
-        # `_seal_terminal_handoff_or_raise`), which can shift a genuinely
-        # unresolved child onto whichever no-progress guard trips first (here,
-        # the pre-existing identical-redelivery bound). Either way it still
-        # raises -- this fixture's actual invariant.
-        combined = result.stdout + result.stderr
-        self.assertTrue(
-            "continuation-limit-exceeded" in combined
-            or "identical-redelivery-bound" in combined,
-            combined,
-        )
-        registry = self.jobs.read_text(encoding="utf-8")
-        self.assertIn("\topen\t", registry)
+    def test_unverifiable_child_keeps_controller_responsibility_without_model_redelivery(self):
+        self._assert_unverifiable_child_is_retained("open")
+
+    def test_done_word_does_not_discharge_unverified_child_cleanup(self):
+        self._assert_unverifiable_child_is_retained("done")
+
+    def _assert_unverifiable_child_is_retained(self, child_status):
+        parent = owner_row(self.lease).rstrip("\n") + ",parent_sid=parent-test,parent_completion_delivery=codex-managed-gateway\n"
+        self.jobs.write_text(parent + child_row(status=child_status), encoding="utf-8")
+        output = self.base / "controller.jsonl"
+        env = {**os.environ, "FAKE_TRACE": str(self.trace), "AGENT_ARTIFACT_ROOT": str(self.artifact_root)}
+        with output.open("w") as stream:
+            process = subprocess.Popen(self.command_with_join(self._non_closing_join())
+                + ["--max-continuations", "2"], stdin=subprocess.PIPE,
+                stdout=stream, stderr=subprocess.STDOUT, text=True, env=env)
+            try:
+                process.stdin.write("initial assignment")
+                process.stdin.close()
+                deadline = time.monotonic() + 8
+                while time.monotonic() < deadline and "dispatch.supervisor.reparked" not in output.read_text():
+                    self.assertIsNone(process.poll(), output.read_text())
+                    time.sleep(0.02)
+                self.assertIn("dispatch.supervisor.reparked", output.read_text())
+                checkpoints = [json.loads(line) for line in output.read_text().splitlines()
+                    if line.startswith("{") and json.loads(line).get("type") == "dispatch.supervisor.reparked"]
+                self.assertEqual(checkpoints[0]["notice_error"], "", checkpoints)
+                self.assertIsNone(process.poll())
+                turns = [json.loads(line) for line in self.trace.read_text().splitlines()
+                         if json.loads(line)["event"] == "turn-start"]
+                self.assertEqual(len(turns), 2, turns)
+                self.assertIn("\topen\t", self.jobs.read_text())
+                # The fixture now supplies terminal/quiescence evidence. The
+                # controller, not another model bookkeeping turn, observes it.
+                settled = child_row(status="done").rstrip("\n") + ",launch_outcome=never-launched,note=dead-launch-error,failure_class=runtime\n"
+                self.jobs.write_text(parent + settled)
+                self.assertEqual(process.wait(timeout=10), 0, output.read_text())
+                turns = [json.loads(line) for line in self.trace.read_text().splitlines()
+                         if json.loads(line)["event"] == "turn-start"]
+                self.assertEqual(len(turns), 2)
+                self.assertNotIn("owner-redelivery-abandoned", self.jobs.read_text())
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    process.wait(timeout=5)
+
+
 
 
 def load_supervisor_module():
@@ -779,129 +805,56 @@ def fake_run_result(returncode, stdout):
     )
 
 
-class RuntimeReceiptlessCancelTest(unittest.TestCase):
-    """Unit-level coverage for the B7 sibling helper (plan SS3.2 B7 / SS9.9)."""
+class SharedReceiptlessRecoveryTest(unittest.TestCase):
+    """The former Codex-only recovery now belongs to the shared join."""
 
     def setUp(self):
-        self.module = load_supervisor_module()
-        self.args = argparse.Namespace(
-            jobs="/fixture/jobs.log", parent_attempt_id=PARENT
-        )
+        load_supervisor_module()
+        import dispatch_completion_join
+        self.module = dispatch_completion_join
+        self.child = argparse.Namespace(attempt_id="att-child", status="open")
 
-    def test_closes_and_emits_once_per_proven_attempt(self):
-        # S-1
-        record = json.dumps({
+    def response(self, *, closed=0, reason="namespace-not-extinct", digest=None):
+        return fake_run_result(0, json.dumps({
             "classifier_source": "automatic-receipt-unavailable-v1",
-            "decisions": [{
-                "closed": 1,
-                "receipt_digest": "sha256:" + "a" * 64,
-                "reason": "automatic-cancelled-receipt-unavailable",
-            }],
-        })
-        emitted = []
-        with mock.patch.object(
-            self.module, "subprocess"
-        ) as fake_subprocess, mock.patch.object(
-            self.module, "emit", side_effect=lambda payload: emitted.append(payload)
-        ):
-            fake_subprocess.run.return_value = fake_run_result(0, record)
-            fake_subprocess.TimeoutExpired = subprocess.TimeoutExpired
-            closed = self.module.runtime_receiptless_cancel(self.args, {"att-child"})
-        self.assertEqual(closed, {"att-child"})
-        self.assertEqual(fake_subprocess.run.call_count, 1)
-        cancelled = [e for e in emitted if e["type"] == "dispatch.supervisor.receiptless-cancelled"]
-        self.assertEqual(len(cancelled), 1)
-        self.assertEqual(cancelled[0]["attempt_id"], "att-child")
-        self.assertEqual(cancelled[0]["receipt_digest"], "sha256:" + "a" * 64)
+            "decisions": [{"attempt_id": "att-child", "closed": closed,
+                           "reason": reason, "receipt_digest": digest}],
+        }))
 
-    def test_only_new_attempts_ever_reach_the_exact_attempt_argv(self):
-        # S-2
-        record = json.dumps({
-            "classifier_source": "automatic-receipt-unavailable-v1",
-            "decisions": [{"closed": 0, "reason": "namespace-not-extinct"}],
-        })
-        calls = []
-        def fake_run(command, **kwargs):
-            calls.append(command)
-            return fake_run_result(0, record)
-        with mock.patch.object(self.module, "subprocess") as fake_subprocess, \
-             mock.patch.object(self.module, "emit"):
-            fake_subprocess.run.side_effect = fake_run
-            fake_subprocess.TimeoutExpired = subprocess.TimeoutExpired
-            self.module.runtime_receiptless_cancel(self.args, {"att-only-this-one"})
-        self.assertEqual(len(calls), 1)
-        self.assertIn("--attempt", calls[0])
-        argv_after_attempt = calls[0][calls[0].index("--attempt") + 1]
-        self.assertEqual(argv_after_attempt, "att-only-this-one")
-        self.assertNotIn("--all", calls[0])
+    def test_exact_proven_closure_and_scope(self):
+        with mock.patch.object(self.module.subprocess, "run", return_value=self.response(
+                closed=1, digest="sha256:" + "a" * 64)) as run:
+            result = self.module.recover_receiptless_attempt(Path("/fixture/jobs.log"), self.child)
+        self.assertTrue(result["closed"])
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("--attempt") + 1], "att-child")
+        self.assertNotIn("--all", command)
+        self.assertEqual(run.call_args.kwargs["timeout"], 10)
 
-    def test_no_event_for_an_ordinary_not_eligible_result(self):
-        # S-3
-        record = json.dumps({
-            "classifier_source": "automatic-receipt-unavailable-v1",
-            "decisions": [{"closed": 0, "reason": "terminal-envelope-valid"}],
-        })
-        emitted = []
-        with mock.patch.object(self.module, "subprocess") as fake_subprocess, \
-             mock.patch.object(
-                 self.module, "emit", side_effect=lambda payload: emitted.append(payload)
-             ):
-            fake_subprocess.run.return_value = fake_run_result(0, record)
-            fake_subprocess.TimeoutExpired = subprocess.TimeoutExpired
-            closed = self.module.runtime_receiptless_cancel(self.args, {"att-child"})
-        self.assertEqual(closed, set())
-        self.assertEqual(emitted, [])
+    def test_unproven_and_live_rows_are_not_closed(self):
+        for reason in ("process-alive", "namespace-not-extinct", "namespace-observation-unavailable"):
+            with self.subTest(reason=reason), mock.patch.object(self.module.subprocess, "run",
+                    return_value=self.response(reason=reason)):
+                result = self.module.recover_receiptless_attempt(Path("/fixture/jobs.log"), self.child)
+            self.assertFalse(result["closed"])
+            self.assertEqual(result["reason"], reason)
 
-    def test_repeated_call_over_an_already_cancelled_child_is_idempotent(self):
-        # S-4
-        record = json.dumps({
-            "classifier_source": "automatic-receipt-unavailable-v1",
-            "decisions": [{
-                "closed": 1,
-                "receipt_digest": "sha256:" + "b" * 64,
-                "reason": "automatic-cancelled-receipt-unavailable",
-            }],
-        })
-        with mock.patch.object(self.module, "subprocess") as fake_subprocess, \
-             mock.patch.object(self.module, "emit"):
-            fake_subprocess.run.return_value = fake_run_result(0, record)
-            fake_subprocess.TimeoutExpired = subprocess.TimeoutExpired
-            first = self.module.runtime_receiptless_cancel(self.args, {"att-child"})
-            second = self.module.runtime_receiptless_cancel(self.args, {"att-child"})
-        self.assertEqual(first, {"att-child"})
-        self.assertEqual(second, {"att-child"})
+    def test_missing_proof_and_malformed_output_are_not_closure(self):
+        for response in (self.response(closed=1), fake_run_result(1, "broken"),
+                         fake_run_result(0, "[]")):
+            with self.subTest(response=response), mock.patch.object(self.module.subprocess, "run", return_value=response):
+                result = self.module.recover_receiptless_attempt(Path("/fixture/jobs.log"), self.child)
+            self.assertFalse(result["closed"])
+            self.assertEqual(result["reason"], "recovery-process-failed")
 
-    def test_non_zero_exit_or_unparseable_stdout_is_skipped_not_closed(self):
-        # part of S-4/S-5 coverage: a process failure is never a close
-        emitted = []
-        with mock.patch.object(self.module, "subprocess") as fake_subprocess, \
-             mock.patch.object(
-                 self.module, "emit", side_effect=lambda payload: emitted.append(payload)
-             ):
-            fake_subprocess.run.return_value = fake_run_result(1, "not-json")
-            fake_subprocess.TimeoutExpired = subprocess.TimeoutExpired
-            closed = self.module.runtime_receiptless_cancel(self.args, {"att-child"})
-        self.assertEqual(closed, set())
-        skipped = [e for e in emitted if e["type"] == "dispatch.supervisor.receiptless-cancel-skipped"]
-        self.assertEqual(len(skipped), 1)
-        self.assertEqual(skipped[0]["attempt_id"], "att-child")
-
-    def test_repark_exhaustion_still_raises_join_timeout_repark_exceeded(self):
-        # S-5 (regression): existing exhaustion test is preserved in the
-        # end-to-end class below (test_live_unresolved_child_still_raises);
-        # this asserts the new helper does not swallow that raise when it is
-        # itself part of the repark loop -- a runtime_receiptless_cancel call
-        # that finds nothing eligible must never suppress the bound.
-        record = json.dumps({
-            "classifier_source": "automatic-receipt-unavailable-v1",
-            "decisions": [{"closed": 0, "reason": "process-alive"}],
-        })
-        with mock.patch.object(self.module, "subprocess") as fake_subprocess, \
-             mock.patch.object(self.module, "emit"):
-            fake_subprocess.run.return_value = fake_run_result(0, record)
-            fake_subprocess.TimeoutExpired = subprocess.TimeoutExpired
-            closed = self.module.runtime_receiptless_cancel(self.args, {"att-child"})
-        self.assertEqual(closed, set())
+    def test_second_ineligible_call_does_not_invent_another_closure(self):
+        with mock.patch.object(self.module.subprocess, "run", side_effect=[
+                self.response(closed=1, digest="sha256:" + "b" * 64),
+                self.response(reason="attempt-already-terminal")]):
+            first = self.module.recover_receiptless_attempt(Path("/fixture/jobs.log"), self.child)
+            second = self.module.recover_receiptless_attempt(Path("/fixture/jobs.log"), self.child)
+        self.assertTrue(first["closed"])
+        self.assertFalse(second["closed"])
 
 
 class TypedReceiptStageAdvanceNegotiationTest(unittest.TestCase):
@@ -1214,11 +1167,11 @@ class ContinuationTripartiteBudgetTest(unittest.TestCase):
     """SD-116 §13.34.4-(2), symmetric to claude_session_supervisor.test.py's
     identically-named class."""
 
-    def test_identical_redelivery_spends_stall_only_and_existing_seal_is_unchanged(self):
+    def test_delivery_consumes_one_continuation_and_no_model_bookkeeping_stall(self):
         case = CodexAppServerSupervisorTest()
         case.setUp()
         try:
-            case.jobs.write_text(owner_row(case.lease) + child_row(), encoding="utf-8")
+            case.jobs.write_text(owner_row(case.lease) + case._blocked_child_row(), encoding="utf-8")
             result = subprocess.run(
                 case.command_with_join(case._non_closing_join()),
                 input="initial assignment",
@@ -1231,15 +1184,16 @@ class ContinuationTripartiteBudgetTest(unittest.TestCase):
                 },
                 timeout=30,
             )
-            self.assertEqual(result.returncode, 70, result.stderr + result.stdout)
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
             registry = case.jobs.read_text(encoding="utf-8")
-            self.assertIn("note=owner-redelivery-abandoned", registry)
+            self.assertNotIn("note=owner-redelivery-abandoned", registry)
             sys.path.insert(0, str(ROOT / "utilities"))
             import dispatch_budget_record as BR
             rows = BR.read_rows(case.jobs.parent, PARENT)
             reservations = [row for row in rows if row.get("record_kind") == "reservation"]
             stall_charged = [row for row in reservations if row["class"] == "stall"]
-            self.assertTrue(stall_charged, rows)
+            self.assertEqual(stall_charged, [], rows)
+            self.assertEqual(len(reservations), 1, rows)
         finally:
             case.tearDown() if hasattr(case, "tearDown") else None
 
@@ -1259,41 +1213,21 @@ class ContinuationTripartiteBudgetTest(unittest.TestCase):
         finally:
             case.tearDown() if hasattr(case, "tearDown") else None
 
-    def test_every_continuation_limit_exceeded_is_preceded_by_a_budget_warning_record(self):
-        case = CodexAppServerSupervisorTest()
-        case.setUp()
-        try:
-            case.jobs.write_text(owner_row(case.lease) + child_row(), encoding="utf-8")
-            result = subprocess.run(
-                case.command_with_join(case._non_closing_join())
-                # SD-116 (c): exhaustion now buys one extra terminal-handoff
-                # cleanup turn before dying (`_seal_terminal_handoff_or_raise`),
-                # which costs one extra identical redelivery of the same
-                # receipt -- raise the redelivery bound so this fixture still
-                # exercises the genuine continuation-limit-exceeded path this
-                # test is about.
-                + ["--max-continuations", "1", "--max-identical-redeliveries", "50"],
-                input="initial assignment",
-                text=True,
-                capture_output=True,
-                env={
-                    **os.environ,
-                    "FAKE_TRACE": str(case.trace),
-                    "AGENT_ARTIFACT_ROOT": str(case.artifact_root),
-                },
-                timeout=30,
-            )
-            self.assertEqual(result.returncode, 70, result.stderr + result.stdout)
-            registry = case.jobs.read_text(encoding="utf-8")
-            self.assertIn("reconcile_reason=continuation-limit-exceeded", registry)
-            sys.path.insert(0, str(ROOT / "utilities"))
-            import dispatch_budget_record as BR
-            rows = BR.read_rows(case.jobs.parent, PARENT)
-            warnings = [row for row in rows if row.get("record_kind") == "warning"]
-            self.assertTrue(warnings, rows)
+    def test_budget_denial_records_warning_at_the_admission_boundary(self):
+        module = load_supervisor_module()
+        import dispatch_continuation_budget as B
+        import dispatch_budget_record as BR
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger = B.ContinuationLedger(B.ContinuationBudget(1, "test", reserved=0))
+            kwargs = dict(parent_attempt_id=PARENT, route_id="rt-budget", route_hash="hash",
+                          purpose="ordinary", stalled=False)
+            first, _ = module._admit_continuation(ledger, root, ordinal=0, **kwargs)
+            second, _ = module._admit_continuation(ledger, root, ordinal=1, **kwargs)
+            self.assertTrue(first.admitted)
+            self.assertFalse(second.admitted)
+            warnings = [row for row in BR.read_rows(root, PARENT) if row.get("record_kind") == "warning"]
             self.assertEqual(warnings[-1]["reason"], "continuation-budget-exhausted")
-        finally:
-            case.tearDown() if hasattr(case, "tearDown") else None
 
     def test_terminal_handoff_purpose_is_sealed_at_the_single_completion_receipt_site(self):
         source = SUPERVISOR.read_text(encoding="utf-8")

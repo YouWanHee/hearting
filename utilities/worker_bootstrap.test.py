@@ -10,6 +10,14 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class WorkerBootstrapTest(unittest.TestCase):
+    def test_issued_cycle_context_supplies_missing_output_directory(self):
+        env = {"AGENT_ARTIFACT_CYCLE_ID": "cyc-test", "AGENT_ARTIFACT_CYCLE_DIR": "/issued/cycle"}
+        values = W.artifact_cycle_environment(env)
+        self.assertEqual(values["AGENT_ARTIFACT_OUTPUT_DIR"], "/issued/cycle/artifacts")
+        self.assertIn("/issued/cycle/artifacts", W.artifact_context_prompt(env))
+        self.assertNotIn("AGENT_ARTIFACT_OUTPUT_DIR", env)
+        self.assertEqual(W.artifact_context_prompt({}), "")
+
     def test_deterministic_fallback_types(self):
         self.assertEqual(W.resolve_worker_type(explicit=None, dispatch_depth=1), "owner")
         self.assertEqual(
@@ -49,6 +57,25 @@ class WorkerBootstrapTest(unittest.TestCase):
             "support",
         )
 
+    def test_explicit_frame_beats_depth_one_owner_fallback(self):
+        # frame-universal (2026-09-10): a depth-1 frame node's explicit
+        # worker_type must win over the dispatch_depth==1 "owner" fallback --
+        # the same precedence already pinned for review at depth 1 above, now
+        # pinned for frame too, so a depth-1 frame node is never silently
+        # resolved away from "frame" (here to "owner"; elsewhere, if it ever
+        # reached the unrelated topology-kind fallback, to "support").
+        self.assertEqual(
+            W.resolve_worker_type(explicit="frame", dispatch_depth=1),
+            "frame",
+        )
+        self.assertEqual(
+            W.resolve_worker_type(
+                explicit="frame", dispatch_depth=1, worker_role="map-worker",
+                route_node="frame",
+            ),
+            "frame",
+        )
+
     def test_render_has_one_kernel_one_type_and_exact_handoff(self):
         rendered = W.render_worker_bootstrap(ROOT, "stage")
         self.assertEqual(rendered.count("# Portable Worker Kernel"), 1)
@@ -58,6 +85,14 @@ class WorkerBootstrapTest(unittest.TestCase):
         self.assertNotIn("```text\nartifact:", rendered)
         self.assertNotIn("# Worker Type: Owner", rendered)
         self.assertNotIn("# Worker Type: Review", rendered)
+
+    def test_ordinary_worker_does_not_receive_chain_bookkeeping(self):
+        for worker_type in W.WORKER_TYPES:
+            text=W.render_worker_bootstrap(ROOT,worker_type)
+            self.assertNotIn("after at most three",text)
+            self.assertNotIn("Native helper support",text)
+            self.assertNotIn("dispatch_subsession_handoff.py",text)
+        self.assertIn("No per-tool heartbeat",W.runtime_progress_prompt())
 
     def test_render_appends_unit_persona_body(self):
         bare = W.render_worker_bootstrap(ROOT, "review")
@@ -146,6 +181,10 @@ class WorkerBootstrapTest(unittest.TestCase):
         self.assertEqual(W.worker_type_for_kind("map-worker"), "support")
         with self.assertRaises(ValueError):
             W.worker_type_for_kind("resource-runner")
+
+    def test_frame_contract_is_its_unit_even_with_legacy_owner_default(self):
+        self.assertEqual(W.assigned_contract(capability="autopilot-code",worker_type="frame",
+            route_node="frame",explicit="autopilot-code",unit="plan/frame",root=ROOT),"plan/frame")
 
 
 if __name__ == "__main__":

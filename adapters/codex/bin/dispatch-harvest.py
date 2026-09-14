@@ -25,14 +25,14 @@ from dispatch_contract import (  # noqa: E402
 )
 from codex_dispatch_terminal import inspect_terminal_attempt  # noqa: E402
 from dispatch_completion_join import (  # noqa: E402
-    consume_supervisor_outbox_attempts,
     consume_parent_session_attempt,
     JoinContractError,
     materialize_after_terminal_close,
     parent_session_state_path,
-    read_supervisor_phase_state,
     required_action_for_attempt,
     route_completion_evidence,
+    consume_supervisor_outbox_attempts,
+    read_supervisor_phase_state,
 )
 _route_spec = importlib.util.spec_from_file_location(
     "capability_route", ROOT / "utilities" / "capability-route.py"
@@ -223,8 +223,13 @@ def consume_supervised_harvest(
         or args.attempt_id in state.outbox.consumed_attempt_ids
     ):
         return True
+    # Upstream dropped `--failure-detail` from the command `completion_prompt`
+    # emits for `inspect-done-failure`; that action now arrives as a bare
+    # `--status done` inspection. Treat any non-`--mark-done` harvest that
+    # matched its exact attempt as the acknowledged inspection, and keep the
+    # explicit flag for legacy command strings that still carry it.
     succeeded = (args.mark_done and marked_done == 1) or (
-        args.failure_detail and matched == 1
+        not args.mark_done and matched == 1
     )
     if not succeeded:
         return False

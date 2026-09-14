@@ -37,6 +37,7 @@ import os
 from pathlib import Path
 import tempfile
 import time
+from dispatch_receipt_identity import CANONICAL_RECEIPT_KEYS, CANONICAL_CHILD_KEYS, receipt_digest
 
 
 class PendingDeliveryError(RuntimeError):
@@ -52,7 +53,6 @@ SCHEMA_VERSION = 1
 MAX_RECEIPT_BYTES = 2048
 DIR_MODE = 0o700
 FILE_MODE = 0o600
-RECLAIM_LIMIT = 8  # SD-106 규율과 같은 유한 상한.
 
 RECIPIENT_KINDS = frozenset({
     "claude-parent-runtime",
@@ -107,39 +107,12 @@ REQUIRED_FIELDS = (
 RECOVERY_AUDIT_FIELDS = frozenset({"expiry_actor", "expiry_detail", "expired_at_ns"})
 IMMUTABLE_FIELDS = ("delivery_id", "recipient_digest", "attempt_ids", "receipt_digest")
 
-# Mirrors dispatch_completion_join.{CANONICAL_RECEIPT_KEYS,CANONICAL_CHILD_KEYS,
-# canonical_receipt_digest}. Duplicated (not imported): dispatch_completion_join
-# imports *this* module for materialize_pending_delivery, so the reverse import
-# would be circular. Keep both copies synchronized by hand; §11 forbids
-# widening either vocabulary.
-CANONICAL_RECEIPT_KEYS = frozenset({
-    "schema_version", "state", "parent_attempt_id", "job_registry", "children",
-    "delivery_classification",
-})
-CANONICAL_CHILD_KEYS = frozenset({
-    "attempt_id", "status", "readiness", "reason", "required_action", "harness",
-    "delivery_classification",
-})
 
 
 def _canonical_receipt_digest(receipt: dict) -> str:
     if not isinstance(receipt, dict):
         raise PendingDeliveryError("pending-delivery-identity-conflict", "receipt-not-dict")
-    if receipt.get("kind") == "human-gate":
-        encoded = json.dumps(
-            receipt, ensure_ascii=False, separators=(",", ":"), sort_keys=True
-        ).encode("utf-8")
-        return "sha256:" + hashlib.sha256(encoded).hexdigest()
-    canonical = {k: v for k, v in receipt.items() if k in CANONICAL_RECEIPT_KEYS}
-    children = receipt.get("children")
-    if isinstance(children, list):
-        canonical["children"] = [
-            {k: v for k, v in child.items() if k in CANONICAL_CHILD_KEYS}
-            for child in children
-            if isinstance(child, dict)
-        ]
-    encoded = json.dumps(canonical, separators=(",", ":"), sort_keys=True).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return receipt_digest(receipt)
 
 
 def recipient_digest(recipient_key: str) -> str:
@@ -369,11 +342,15 @@ def claim(
     claim_owner: str,
     lease_seconds: float,
     require_generation_proof: bool = False,
+    live_recipient_generation: tuple[str, str] | None = None,
     expected_state: str = "pending",
 ) -> dict:
     """CAS ``expected_state -> claimed`` under one flock (SD-111 §10.2:
     read-check-write inside one lock; ``os.replace`` atomicity alone is not
-    CAS)."""
+    CAS). A courier may supply the recipient/generation it just proved through
+    the live runtime. That proof belongs to this claim, not to the immutable
+    receipt. The courier must first validate the receipt's own binding rules.
+    """
 
     if lease_seconds <= 0:
         raise PendingDeliveryError("pending-delivery-identity-conflict", "lease_seconds")
@@ -386,16 +363,26 @@ def claim(
             raise PendingDeliveryError("pending-delivery-identity-conflict", "recipient")
         if value["delivery_id"] != delivery_id:
             raise PendingDeliveryError("pending-delivery-identity-conflict", "delivery_id")
-        if require_generation_proof and value.get("session_generation_supported") != "1":
+        if live_recipient_generation is not None and (
+            not require_generation_proof
+            or len(live_recipient_generation) != 2
+            or live_recipient_generation[0] != recipient_key
+            or not isinstance(live_recipient_generation[1], str)
+            or not live_recipient_generation[1]
+        ):
+            raise PendingDeliveryError("pending-delivery-generation-unproven")
+        if (require_generation_proof and live_recipient_generation is None
+                and value.get("session_generation_supported") != "1"):
             raise PendingDeliveryError("pending-delivery-generation-unproven")
         if value["state"] != expected_state:
             raise PendingDeliveryError(
                 "pending-delivery-claim-refused", f"state={value['state']}"
             )
-        if value["attempts"] >= RECLAIM_LIMIT:
-            raise PendingDeliveryError("pending-delivery-reclaim-exhausted")
         now = time.monotonic_ns()
         updated = dict(value)
+        if live_recipient_generation is not None:
+            updated["session_generation"] = live_recipient_generation[1]
+            updated["session_generation_supported"] = "1"
         updated["state"] = "claimed"
         updated["claimed_at_ns"] = now
         updated["claim_owner"] = claim_owner
@@ -462,10 +449,12 @@ def ack(
 
 
 def reclaim(root: Path, recipient_key: str, delivery_id: str, *, now_ns: int) -> dict:
-    """Bounded lease reclaim: ``{claimed,sent-ambiguous} -> pending`` once the
-    claim deadline has passed. Exhausting ``RECLAIM_LIMIT`` attempts is a
-    typed terminal refusal, not a further state transition -- the record
-    stays exactly where it was so a human/operator sees the stuck claim."""
+    """Reclaim an expired lease without deciding whether to send again.
+
+    Claims count ownership transfers, not emissions. A courier owns backoff,
+    acceptance checks and no-resend rules; this queue cannot abandon an owed
+    delivery because earlier couriers crashed or observed transient failures.
+    """
 
     path = record_path(root, recipient_key, delivery_id)
     with _record_lock(path):
@@ -479,9 +468,6 @@ def reclaim(root: Path, recipient_key: str, delivery_id: str, *, now_ns: int) ->
         deadline = value.get("claim_deadline_ns")
         if deadline is not None and now_ns < deadline:
             raise PendingDeliveryError("pending-delivery-claim-refused", "lease-not-expired")
-        # The exhaustion check belongs to the next `claim()`, not here: a
-        # reclaim only restores eligibility to retry, it is not itself a
-        # retry attempt.
         updated = dict(value)
         updated["state"] = "pending"
         updated["claim_owner"] = None

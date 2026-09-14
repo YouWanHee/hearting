@@ -20,22 +20,21 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-# W7C producer-cycle environment passed from an owner to its stage workers.
-ARTIFACT_PRODUCER_CYCLE_ENV = (
-    "AGENT_ARTIFACT_CAMPAIGN_ID", "AGENT_ARTIFACT_CYCLE_ID", "AGENT_ARTIFACT_PRODUCER_ID",
-    "AGENT_ARTIFACT_CYCLE_DIR", "AGENT_ARTIFACT_OUTPUT_DIR",
-)
+
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "utilities"))
-from dispatch_contract import (  # noqa: E402
+from dispatch_contract import (
+    workflow_completion_receipt,  # noqa: E402
     DispatchContractError,
+    foreground_review_launch_identity,
     bytecode_cache_env,
     GROUP_REAP_PROOF,
     GOVERNOR_RESERVATION_ENV,
     REPLICA_RESERVATION_ROW_KEYS,
     anchored_capacity_failure,
     annotate_attempt_row,
+    adapter_launch_failure_outcome,
     launch_mismatch_annotation,
     attempt_launch_is_available,
     attempt_launch_state,
@@ -43,6 +42,8 @@ from dispatch_contract import (  # noqa: E402
     claim_attempt_row,
     close_attempt_row,
     completion_marker_gate,
+    owner_frame_launch_gate,
+    recover_preview_gate_after_refusal,
     dispatch_state_root,
     dispatch_state_roots,
     PRELAUNCH_PROCESS_BLOCK_REASONS,
@@ -50,6 +51,7 @@ from dispatch_contract import (  # noqa: E402
     headless_attempt_policy,
     launch_orphan_watch,
     launch_reap_watch,
+    seal_foreground_result,
     new_attempt_id,
     parent_attempt_binding_is_live,
     parse_registry_metadata,
@@ -58,10 +60,13 @@ from dispatch_contract import (  # noqa: E402
     sealed_launch_home,
     resolve_live_parent_attempt,
     resolve_model_governor_root,
+    review_governed_lease_is_held,
     replica_batch_expectation,
     reserve_governor_token,
     runtime_ancestry_binding,
     spawn_claimed_attempt,
+    SUPERVISOR_LEASE_KIND,
+    supervisor_lease_path,
     validate_nested_eligibility,
     wait_governor_reservation_claim,
 )
@@ -74,11 +79,15 @@ from artifact_producer import (  # noqa: E402
 )
 from dispatch_completion_join import materialize_after_terminal_close  # noqa: E402
 from dispatch_lifecycle import (  # noqa: E402
+    acquire_foreground_review_admission,
+    acquire_review_admission,
+    begin_finite_watchdog,
     DETACHED,
     FOREGROUND_SCOPED,
     LIFECYCLES,
     deterministic_post_exit_outcome,
     reconcile_launch_lifecycle,
+    launch_review_watchdog,
     wait_foreground,
 )
 from dispatch_mode_contract import (  # noqa: E402
@@ -94,9 +103,11 @@ from owner_route_binding import (  # noqa: E402
     owner_binding_tuple_failure_fields,
     validate_runtime_requirements,
 )
-from worker_bootstrap import (  # noqa: E402
+from worker_bootstrap import (
+    ARTIFACT_PRODUCER_CYCLE_ENV, artifact_cycle_environment, artifact_context_prompt, released_task_prompt, assignment_prompt, contract_read_prompt,
     assigned_contract,
     render_worker_bootstrap,
+    runtime_progress_prompt,
     resolve_worker_type,
 )
 from stage_session_runtime import (  # noqa: E402
@@ -114,6 +125,11 @@ from model_profile import (  # noqa: E402
     resolve_runtime_profile,
     validate_registered_profile,
 )
+from codex_managed_dispatch import (
+    MANAGED_PARENT_DELIVERY, ManagedDispatchError, probe_managed_codex_parent,
+    launch_managed_completion_sidecar, registered_parent_delivery,
+)
+import dispatch_parent_completion as parent_completion
 from execution_access import (  # noqa: E402
     AccessContext,
     ExecutionAccessError,
@@ -231,17 +247,14 @@ def parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--parent-session-id",
-        default=os.environ.get("AGENT_DISPATCH_PARENT_SESSION_ID")
-        or os.environ.get("OPENCODE_SESSION_ID")
-        or os.environ.get("CODEX_THREAD_ID")
-        or os.environ.get("CLAUDE_CODE_SESSION_ID"),
+        default=parent_completion.default_parent_session_id(),
     )
     p.add_argument(
         "--parent-cwd",
         default=os.environ.get("AGENT_DISPATCH_PARENT_CWD") or None,
     )
     p.add_argument("--worker-role", help="legacy compatibility metadata; not bootstrap identity")
-    p.add_argument("--worker-type", choices=("owner", "stage", "review", "support"))
+    p.add_argument("--worker-type", choices=("owner", "stage", "review", "support", "frame"))
     p.add_argument("--review-output", help="exact durable report path for a route-free review worker")
     p.add_argument("--unit", default="", help="catalog unit ref for the assigned route node (roles/units/<unit>.md)")
     p.add_argument("--assigned-contract")
@@ -280,10 +293,15 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--registered-worker", type=int, choices=(0, 1), default=1)
     p.add_argument("--capacity-retry", type=int, choices=(0, 1), default=0)
     p.add_argument("--prior-attempt-id")
+    p.add_argument("--automatic-retry-of", help="Exact failed predecessor; revalidated atomically at claim")
     p.add_argument("--cooled-model")
     p.add_argument("--selection-source")
     p.add_argument("--launch-authority", choices=("conductor", "ancestor-broker"), default="conductor")
-    p.add_argument("--parent-harness", default=os.environ.get("AGENT_DISPATCH_CURRENT_HARNESS") or os.environ.get("AGENT_DISPATCH_OWNER_HARNESS") or "opencode")
+    p.add_argument("--parent-harness", default=parent_completion.default_parent_harness("opencode"))
+    p.add_argument(
+        "--allow-unmanaged-parent-poll", action="store_true",
+        help="operator-only recovery: permit explicit bounded polling for an unmanaged Codex parent",
+    )
     p.add_argument("--parent-transport", default=os.environ.get("AGENT_DISPATCH_CURRENT_TRANSPORT") or "unknown")
     p.add_argument("--parent-sandbox", default=os.environ.get("AGENT_DISPATCH_CURRENT_SANDBOX") or "unknown")
     # default None (not "unknown"): an explicitly supplied `--nested-eligibility
@@ -410,6 +428,12 @@ def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
         require_top_route(
             getattr(args, "route_file", None) or getattr(binding, "route_file", None),
             profile=args.model_profile or "",
+            # Pass the launching node so a frame anchor leg is checked against
+            # ITS OWN sealed profile, not the owner's. Without this the route
+            # compiles `top` onto the anchor and this wrapper refuses it --
+            # and because each harness has its own copy of this call, omitting
+            # it in one place breaks that one harness only.
+            node=getattr(args, "route_node", None),
         )
     except ModelProfileError as exc:
         raise ModelSelectionError(exc.reason, str(exc)) from exc
@@ -559,6 +583,61 @@ def resolve_report_bundle_root(route_file: str | None, route_node: str | None) -
     return path
 
 
+def prepare_nested_runtime(worktree: Path, attempt_id: str, environ=None) -> dict[str, str]:
+    """Keep OpenCode's mutable state inside the invoking owner's workspace.
+
+    OpenCode writes dependency state beside its config as well as under XDG
+    data/cache/state. User config and the existing auth are linked for reading;
+    no credentials or user configuration are copied or rewritten.
+    """
+    env = os.environ if environ is None else environ
+    if not re.fullmatch(r"att-[A-Za-z0-9_-]+", attempt_id):
+        raise DispatchContractError("nested-opencode-attempt-invalid")
+    worktree = Path(worktree).resolve()
+    runtime = worktree / ".dispatch" / "opencode-runtime" / attempt_id
+    if not runtime.resolve().is_relative_to(worktree):
+        raise DispatchContractError("nested-opencode-runtime-outside-worktree")
+    values = {}
+    for kind in ("data", "cache", "state", "config"):
+        directory = runtime / kind
+        if not directory.resolve().is_relative_to(worktree):
+            raise DispatchContractError("nested-opencode-runtime-outside-worktree")
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        directory.chmod(0o700)
+        values[f"XDG_{kind.upper()}_HOME"] = str(directory)
+    source_data = Path(env.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
+    auth = source_data / "opencode" / "auth.json"
+    if auth.is_file():
+        destination = Path(values["XDG_DATA_HOME"]) / "opencode" / "auth.json"
+        destination.parent.mkdir(exist_ok=True, mode=0o700)
+        if destination.is_symlink() and destination.resolve() == auth.resolve():
+            pass
+        elif destination.exists() or destination.is_symlink():
+            raise DispatchContractError("nested-opencode-auth-link-conflict", str(destination))
+        else:
+            destination.symlink_to(auth.resolve())
+    source_config = Path(env.get("OPENCODE_CONFIG_DIR") or
+                         Path(env.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "opencode")
+    config = Path(values["XDG_CONFIG_HOME"]) / "opencode"
+    config.mkdir(exist_ok=True, mode=0o700)
+    # These files are dependency-manager outputs. Configuration and relative
+    # plugin/command/agent inputs remain links to the caller's original bytes.
+    generated = {".git", ".gitignore", "node_modules", "package.json", "package-lock.json", "bun.lock", "bun.lockb"}
+    if source_config.is_dir():
+        for source in source_config.iterdir():
+            if source.name in generated:
+                continue
+            link = config / source.name
+            if link.is_symlink() and link.resolve() == source.resolve():
+                continue
+            if link.exists() or link.is_symlink():
+                raise DispatchContractError("nested-opencode-config-link-conflict", str(link))
+            link.symlink_to(source.resolve(), target_is_directory=source.is_dir())
+    if env.get("OPENCODE_CONFIG_DIR"):
+        values["OPENCODE_CONFIG_DIR"] = str(config)
+    return values
+
+
 def qa_track(capability: str) -> str:
     if capability.startswith("code-") or capability == "autopilot-code":
         return "code"
@@ -647,23 +726,10 @@ def prompt(args: argparse.Namespace) -> tuple[str, str]:
         route_node=args.route_node,
         completion_gate=args.completion_gate,
         explicit=args.assigned_contract,
+        unit=args.unit,
         root=ROOT,
     )
-    heartbeat = ""
-    if args.attempt_id and args.route_id and args.route_node:
-        base = (
-            f"{shlex.quote(str(ROOT / 'adapters/opencode/bin/preflight.sh'))} stage-heartbeat "
-            f"--attempt-id {shlex.quote(args.attempt_id)} "
-            f"--route-id {shlex.quote(args.route_id)} "
-            f"--route-node {shlex.quote(args.route_node)} "
-            "--jobs \"$AGENT_DISPATCH_JOBS\""
-        )
-        heartbeat = (
-            "Stage progress contract (SD-58):\n"
-            f"- Emit analysis on entry: {base} --phase analysis --kind registry --evidence analysis-entered\n"
-            "- After a real tool call, write, test, or artifact update, run the same command with phase tool|file-write|test|artifact and kind tool|file|test|artifact plus a deterministic id/signature.\n"
-            "- Repeated prose or an unchanged phase/evidence pair is not progress. Emit terminal only after the assigned artifact is durable.\n\n"
-        )
+    heartbeat = runtime_progress_prompt()
     return (
         f"{bootstrap}\n"
         "Dispatch metadata:\n"
@@ -687,23 +753,41 @@ def prompt(args: argparse.Namespace) -> tuple[str, str]:
         f"- owner_harness: {args.owner_harness or '-'}\n"
         f"- worktree: {args.worktree}\n"
         f"- artifact_root: {args.artifact_root}\n"
+        f"{artifact_context_prompt(os.environ)}"
         f"- route_state: {'consume the immutable record already validated by the wrapper' if args.route_file else 'validated dispatch metadata'}\n\n"
         "OpenCode realization:\n"
         "- The wrapper already validated capability mode, optional worker mode, QA, artifact-root access, and any route record. Use worker-route only for a safety recheck.\n"
         "- The typed bootstrap contains the portable unit. A dispatch-depth-1 capability owner must not load any worker mode.\n"
         f"- Run adapters/opencode/bin/preflight.sh qa-policy {args.qa} {qa_track(args.capability)} and keep its required assurance in the artifact.\n"
-        f"- Read only the assigned {args.assigned_contract} Skill/mode and named artifact inputs. Project instruction auto-load is not treated as physically masked; do not manually load a full harness bootstrap.\n"
+        f"{contract_read_prompt(args, 'opencode')}"
         "- Preserve the reported QA/tool contracts in the artifact; owner workers launch checked adapter wrappers directly.\n\n"
         f"{heartbeat}"
         f"{stage_session_prompt(args)}"
-        "Assignment:\n"
-        f"{task.rstrip()}\n\n"
+        f"{released_task_prompt(args)}"
+        f"{assignment_prompt(args, task, os.environ)}"
         "End with the kernel's exact three-line handoff as the entire final message — "
         "no summary sentence before it, nothing after it.\n",
         source,
     )
 
 def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -> str:
+    if getattr(args, "owner_route_binding", None):
+        binding = args.owner_route_binding
+        lease = (supervisor_lease_path(args.jobs_path, args.attempt_id) if args.attempt_id
+                 else dispatch_state_root(args.jobs_path) / "supervisor-state" / "preview-only.lease")
+        cmd = [
+            sys.executable, str(ROOT / "utilities" / "claude-session-supervisor.py"),
+            "--runtime-harness", "opencode", "--worktree", args.worktree,
+            "--jobs", str(args.jobs_path), "--parent-attempt-id", args.attempt_id or "unassigned",
+            "--state-file", str(lease.with_suffix(".json")), "--lease-file", str(lease),
+            "--route-file", binding.route_file, "--route-id", binding.route_id,
+            "--route-hash", binding.route_hash, "--opencode-agent", args.agent,
+        ]
+        if args.resolved_model_settings["source"] != "inherit":
+            cmd += ["--model", args.resolved_model_settings["model"],
+                    "--variant", args.resolved_model_settings["variant"]]
+        return (" ".join(shlex.quote(x) for x in cmd)
+                + f" < {shlex.quote(str(prompt_path))} >> {shlex.quote(str(log_path))} 2>&1")
     cmd = [
         "opencode",
         "run",
@@ -723,63 +807,25 @@ def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -
 
 
 def _effective_parent_cwd(args):
-    """Where the DISPATCHING session lives — not merely where the wrapper ran.
-
-    Orchestrators routinely `cd` into the task worktree before dispatching, so a raw
-    getcwd() records the child's own worktree — a path that can never anchor the
-    parent session row in Fleet (observed: Codex dispatch-depth-1 jobs stayed orphan,
-    2026-07-16). When the launch cwd sits inside the task worktree and that worktree
-    is linked, back-map to the primary checkout instead; explicit --parent-cwd or
-    AGENT_DISPATCH_PARENT_CWD still wins via args.parent_cwd.
-    """
-    cwd = os.path.realpath(args.parent_cwd or os.getcwd())
-    try:
-        wt = os.path.realpath(args.worktree)
-    except (OSError, TypeError):
-        return cwd
-    if args.parent_cwd is None and (cwd == wt or cwd.startswith(wt + os.sep)):
-        try:
-            out = subprocess.check_output(
-                ["git", "-C", wt, "worktree", "list", "--porcelain"],
-                text=True, stderr=subprocess.DEVNULL)
-            first = next((ln.split(" ", 1)[1] for ln in out.splitlines()
-                          if ln.startswith("worktree ")), None)
-            if first and os.path.realpath(first) != wt:
-                return os.path.realpath(first)
-        except (OSError, subprocess.SubprocessError, IndexError):
-            pass
-    return cwd
+    return parent_completion.effective_parent_cwd(args)
 
 
 def resolve_parent_completion_delivery(args: argparse.Namespace) -> str:
-    """Select the checked parent-runtime completion-delivery adapter.
-
-    Ported from the Codex wrapper's resolve_parent_completion_delivery
-    (adapters/codex/bin/dispatch-headless.py), minus the Codex-only managed
-    single-ingress gateway branch -- an OpenCode parent is never a managed
-    Codex gateway target, so that probe never applies here.
-    """
-    direct_registered = (
-        getattr(args, "action", "") in {"register", "start"}
-        and args.dispatch_depth == 1
-        and args.launch_lifecycle == DETACHED
-        and args.execution_surface == "registered-headless"
-        and bool(args.registered_worker)
-        and bool(args.parent_session_id)
-        and os.environ.get("AGENT_DISPATCH_CHILD") != "1"
-    )
-    if direct_registered and args.parent_harness == "claude":
-        args.parent_completion_reason = "claude-async-rewake-resume"
-        return "claude-parent-runtime"
-    if direct_registered:
-        args.parent_completion_reason = "parent-identity-unmatched"
-        return "poll-fallback"
-    args.parent_completion_reason = "parent-attempt-owned"
-    return "parent-runtime-supervised"
+    return parent_completion.resolve_parent_completion_delivery(
+        args, probe=probe_managed_codex_parent)
 
 
 def bind_parent_completion_delivery(args: argparse.Namespace) -> None:
     args.parent_completion_delivery = resolve_parent_completion_delivery(args)
+
+
+def validate_interactive_parent_launch(args: argparse.Namespace) -> None:
+    parent_completion.validate_interactive_parent_launch(args)
+
+
+def launch_parent_completion_sidecar(args: argparse.Namespace, jobs: Path) -> None:
+    parent_completion.launch_parent_completion_sidecar(
+        args, jobs, launch=launch_managed_completion_sidecar, annotate=annotate_attempt_row)
 
 
 def _route_node_leg_fields(args):
@@ -842,12 +888,35 @@ def acquire_review_lease_after_claim(
     if not args.review_output:
         return {}
     binding = args.review_output_binding
-    result = review_lease_acquire(
-        Path(args.artifact_root), cycle_id=binding["cycle_id"],
-        attempt_id=args.attempt_id, review_output=binding["output_path"],
-        binding=binding, governed_identity=identity, jobs=jobs,
+    budget = getattr(args, "watchdog_budget", None)
+    if budget is None:
+        raise ProducerError("review-watchdog-budget-missing")
+    witness_metadata = {
+        "attempt_id": args.attempt_id,
+        "review_cycle_id": binding["cycle_id"],
+        "review_governed_lease": "summary-flock-v1",
+        "review_governed_lease_nonce": args.review_governed_lease_nonce,
+    }
+    witness_unlocked = lambda: not review_governed_lease_is_held(
+        Path(args.artifact_root), witness_metadata
     )
-    return dict(result.get("registry_metadata") or {})
+    if args.launch_lifecycle == DETACHED:
+        handle = getattr(args, "review_watchdog_handle", None)
+        if handle is None:
+            raise ProducerError("review-watchdog-handle-missing")
+        return acquire_review_admission(
+            handle=handle, budget=budget, identity=identity,
+            root=Path(args.artifact_root), cycle_id=binding["cycle_id"],
+            attempt_id=args.attempt_id, review_output=binding["output_path"],
+            binding=binding, jobs=jobs, nonce=args.review_governed_lease_nonce,
+            lease_acquire=review_lease_acquire, witness_probe=witness_unlocked,
+        )
+    return acquire_foreground_review_admission(
+        budget=budget, identity=identity, root=Path(args.artifact_root),
+        cycle_id=binding["cycle_id"], attempt_id=args.attempt_id,
+        review_output=binding["output_path"], binding=binding, jobs=jobs,
+        lease_acquire=review_lease_acquire, witness_probe=witness_unlocked,
+    )
 
 
 def attach_summary_owner(args, log_path: Path, prompt_path: Path, identity):
@@ -940,6 +1009,13 @@ def append_job(jobs: Path, args: argparse.Namespace) -> bool:
             f",owner_route_id={args.owner_route_binding.route_id}"
             f",owner_route_hash={args.owner_route_binding.route_hash}"
         )
+        pipe += (
+            ",completion_delivery=session-resume-supervised,completion_delivery_reason=ok"
+            f",supervisor_lease={SUPERVISOR_LEASE_KIND}"
+            f",supervisor_lease_file={supervisor_lease_path(jobs, args.attempt_id)}"
+            f",supervisor_lease_nonce={secrets.token_hex(32)}"
+        )
+    pipe += workflow_completion_receipt(args)
     settings = args.resolved_model_settings
     for key, value in sorted(getattr(args, "profile_selection_receipt", {}).items()):
         pipe += f",{key}={value}"
@@ -954,10 +1030,7 @@ def append_job(jobs: Path, args: argparse.Namespace) -> bool:
         f",parent_completion_reason={getattr(args, 'parent_completion_reason', 'unspecified')}"
     )
     if args.parent_completion_delivery == "claude-parent-runtime":
-        # SD-111 P2 round 2 C-3 (2-a-5), sibling parity with the Claude
-        # adapter (core/ADAPTATION.md §2.0) -- OpenCode never sets this
-        # delivery value today, so this branch is structurally present but a
-        # no-op in practice.
+        # Preserve the actual Claude parent identity for this OpenCode child.
         ancestry = runtime_ancestry_binding(os.getpid())
         if ancestry is not None:
             ancestry_pid, ancestry_start, ancestry_ns = ancestry
@@ -990,6 +1063,8 @@ def append_job(jobs: Path, args: argparse.Namespace) -> bool:
                 pipe += f",{key}={replica_reservation[key]}"
     leg_class, auxiliary_check = _route_node_leg_fields(args)
     pipe += f",leg_class={leg_class},auxiliary_check={auxiliary_check}"
+    if getattr(args, "automatic_retry_of", None):
+        pipe += f",automatic_retry_of={args.automatic_retry_of}"
     if args.capacity_retry:
         pipe += (
             f",capacity_retry=1,prior_attempt_id={args.prior_attempt_id}"
@@ -1390,6 +1465,8 @@ def validate_route_record(args: argparse.Namespace) -> int:
             early_jobs, attempt_id=args.attempt_id,
         )
     except DispatchContractError as e:
+        e.detail = recover_preview_gate_after_refusal(
+            args.route_file, args.route_node, args.action, args.agent_home, early_jobs, e)
         return fail(
             e.reason,
             78 if e.reason in PRELAUNCH_PROCESS_BLOCK_REASONS else 65,
@@ -1548,6 +1625,10 @@ def main(argv: list[str]) -> int:
     args.replacement_notes = attempt_policy["replacement_notes"]
     bind_parent_completion_delivery(args)
     try:
+        validate_interactive_parent_launch(args)
+    except DispatchContractError as exc:
+        return fail(exc.reason, 69, detail=exc.detail, child_spawned="0")
+    try:
         args.resolved_model_settings = resolve_model_settings(args)
         from model_profile import selection_receipt, ModelProfileError
         try:
@@ -1589,11 +1670,14 @@ def main(argv: list[str]) -> int:
     except DispatchContractError as e:
         return fail(e.reason, 65, detail=e.detail, child_spawned="0")
     try:
+        owner_frame_launch_gate(args.owner_route_binding, action, agent_home, jobs)
         completion_marker_gate(
             args.route_file, args.route_node, action, agent_home, jobs,
             attempt_id=args.attempt_id,
         )
     except DispatchContractError as e:
+        e.detail = recover_preview_gate_after_refusal(
+            args.route_file, args.route_node, action, agent_home, jobs, e)
         return fail(e.reason, 78 if e.reason in PRELAUNCH_PROCESS_BLOCK_REASONS else 65,
                     detail=e.detail, child_spawned="0")
     # Item 5-1 (SD-48~50 exact parent binding), ported from the Claude wrapper.
@@ -1668,6 +1752,13 @@ def main(argv: list[str]) -> int:
             detail=str(exc),
             child_spawned="0",
         )
+    args.nested_runtime_env = {}
+    if action == "start" and args.dispatch_depth == 2 and args.parent_harness == "codex":
+        try:
+            args.nested_runtime_env = prepare_nested_runtime(Path(args.worktree), args.attempt_id)
+        except (DispatchContractError, OSError) as exc:
+            return fail(getattr(exc, "reason", "nested-opencode-runtime-unavailable"), 73,
+                        detail=str(exc), child_spawned="0")
     log_dir = (
         Path(args.log_dir)
         if args.log_dir
@@ -1728,9 +1819,13 @@ def main(argv: list[str]) -> int:
                 args.attempt_claimed = attempt_launch_is_available(
                     jobs, args.attempt_id
                 )
+            parent_completion.validate_registered_delivery(args, jobs, read=registered_parent_delivery)
         except DispatchContractError as e:
             cancel_governor_reservation(governor, governor_root, reservation_token)
             return fail(e.reason, 73, detail=e.detail, child_spawned="0")
+        except ManagedDispatchError as e:
+            cancel_governor_reservation(governor, governor_root, reservation_token)
+            return fail(str(e), 73, child_spawned="0")
         if args.attempt_claimed:
             try:
                 prompt_path.write_text(prompt_text, encoding="utf-8")
@@ -1797,7 +1892,7 @@ def main(argv: list[str]) -> int:
             # through unchanged so stage workers write into the same
             # `campaigns/<camp>/cycles/<cyc>/artifacts/` and never issue a
             # second lineage.
-            **{key: os.environ.get(key, "") for key in ARTIFACT_PRODUCER_CYCLE_ENV},
+            **artifact_cycle_environment(os.environ),
             "REPORT_BUNDLE_ROOT": str(args.report_bundle_root or ""),
             "AGENT_ROUTE_FILE": (
                 args.route_file
@@ -1815,11 +1910,15 @@ def main(argv: list[str]) -> int:
             # Same rule as the other two adapters: a worker inherits AGENT_HOME
             # at the managed release; keep its bytecode out of that tree.
             **bytecode_cache_env(),
-            "AGENT_DISPATCH_CURRENT_HARNESS": "opencode",
+            **parent_completion.worker_runtime_identity("opencode"),
             "AGENT_DISPATCH_CURRENT_TRANSPORT": "headless",
             "AGENT_DISPATCH_CURRENT_SANDBOX": "adapter-default",
             **stage_session_environment(args),
+            "AGENT_DISPATCH_COMPLETION_MODE": (
+                "supervised" if args.owner_route_binding else "poll"
+            ),
             "OPENCODE_CONFIG_CONTENT": args.opencode_config_content,
+            **args.nested_runtime_env,
             # Headless liveness contract: the OpenCode runtime child exposes
             # the dispatch slug to the plugin, which records a plugin-load
             # marker at init and touches <log_dir>/<slug>.heartbeat on every
@@ -1827,6 +1926,13 @@ def main(argv: list[str]) -> int:
             # secondary alive signal independent of the OpenCode SQLite mtime.
             "OPENCODE_DISPATCH_SLUG": args.slug,
         }
+        if args.owner_route_binding:
+            lease = supervisor_lease_path(jobs, args.attempt_id)
+            dispatch_env["AGENT_DISPATCH_COMPLETION_STATE_FILE"] = str(lease.with_suffix(".json"))
+            dispatch_env["AGENT_DISPATCH_SUPERVISOR_LEASE_FILE"] = str(lease)
+        else:
+            dispatch_env.pop("AGENT_DISPATCH_COMPLETION_STATE_FILE", None)
+            dispatch_env.pop("AGENT_DISPATCH_SUPERVISOR_LEASE_FILE", None)
         if args.worker_role:
             dispatch_env["AGENT_DISPATCH_WORKER_ROLE"] = args.worker_role
         else:
@@ -1835,7 +1941,31 @@ def main(argv: list[str]) -> int:
             dispatch_env["AGENT_DISPATCH_UNIT"] = args.unit
         else:
             dispatch_env.pop("AGENT_DISPATCH_UNIT", None)
+        launch_parent_completion_sidecar(args, jobs)
+        if args.managed_sidecar_state == "launch-failed":
+            annotate_attempt_row(
+                jobs, args.attempt_id, {"launch_outcome": "never-launched"}
+            )
+            cancel_governor_reservation(
+                governor, governor_root, reservation_token
+            )
+            close_job_row(
+                jobs,
+                args.slug,
+                args.worktree,
+                "managed-sidecar-launch-failed",
+                "",
+                args.attempt_id,
+            )
+            return fail(
+                "managed-sidecar-launch-failed",
+                75,
+                detail=args.managed_sidecar_reason,
+                attempt_id=args.attempt_id,
+                child_spawned="0",
+            )
         fence_failure_read_fd, fence_failure_write_fd = os.pipe()
+        args.watchdog_budget = begin_finite_watchdog(args.foreground_timeout)
         def spawn_worker(gate_fd: int) -> subprocess.Popen:
             fence_command = [
                 sys.executable, str(ROOT / "utilities" / "launch-fence.py"),
@@ -1860,6 +1990,25 @@ def main(argv: list[str]) -> int:
                     "run", "--class", "dispatch", "--", "sh", "-c", command,
                 ]
             )
+            if args.review_output and args.launch_lifecycle == DETACHED:
+                try:
+                    args.review_watchdog_handle = launch_review_watchdog(
+                        fence_command, gate_fd=gate_fd, budget=args.watchdog_budget,
+                        attempt_id=args.attempt_id,
+                        nonce=args.review_governed_lease_nonce,
+                        failure_fd=fence_failure_write_fd, env=dispatch_env,
+                        lease_release_spec={
+                            "root": args.artifact_root,
+                            "cycle_id": args.review_output_binding["cycle_id"],
+                            "attempt_id": args.attempt_id,
+                        }, jobs=jobs,
+                    )
+                finally:
+                    try:
+                        os.close(fence_failure_write_fd)
+                    except OSError:
+                        pass
+                return args.review_watchdog_handle.process
             try:
                 return subprocess.Popen(
                     fence_command,
@@ -1876,6 +2025,8 @@ def main(argv: list[str]) -> int:
                 except OSError:
                     pass
         launch_metadata = args.launch_lifecycle_resolution.metadata()
+        from dispatch_capacity_evidence import launch_scope
+        launch_metadata.update(launch_scope("opencode", dispatch_env))
         if args.dispatch_depth >= 2 and os.environ.get("AGENT_DISPATCH_CHILD") == "1":
             launch_metadata["pid_scope"] = "namespace-local"
         try:
@@ -1911,15 +2062,7 @@ def main(argv: list[str]) -> int:
                 print("child_spawned=0")
                 print("reason=attempt-launch-already-claimed")
                 return 0
-            outcome = (
-                "reaped-before-publish"
-                if exc.reason == "attempt-launch-identity-record-failed"
-                else (
-                    "launch-cleanup-unverified"
-                    if exc.reason == "attempt-launch-cleanup-unverified"
-                    else "never-launched"
-                )
-            )
+            outcome = adapter_launch_failure_outcome(jobs, args.attempt_id, exc.reason)
             annotate_attempt_row(jobs, args.attempt_id, {"launch_outcome": outcome})
             cancel_governor_reservation(governor, governor_root, reservation_token)
             reason = (
@@ -1946,6 +2089,8 @@ def main(argv: list[str]) -> int:
             args.governor_reservation = wait_governor_reservation_claim(
                 governor, governor_root, reservation_token, proc,
                 expected_reservation=args.replica_batch_expectation,
+                watchdog_receipt=(args.review_watchdog_handle.receipt
+                                  if getattr(args, "review_watchdog_handle", None) else None),
             )
         except DispatchContractError as exc:
             fence_failure, fence_released = read_launch_fence_failure(
@@ -1953,11 +2098,11 @@ def main(argv: list[str]) -> int:
             )
             try:
                 os.killpg(proc.pid, signal.SIGTERM)
-                proc.wait(timeout=0.5)
+                proc.wait(timeout=5.0 if getattr(args, "review_watchdog_handle", None) else 0.5)
             except (ProcessLookupError, subprocess.TimeoutExpired):
                 try:
                     os.killpg(proc.pid, signal.SIGKILL)
-                    proc.wait(timeout=0.5)
+                    proc.wait(timeout=5.0 if getattr(args, "review_watchdog_handle", None) else 0.5)
                 except (ProcessLookupError, subprocess.TimeoutExpired):
                     pass
             cancel_governor_reservation(governor, governor_root, reservation_token)
@@ -2012,6 +2157,14 @@ def main(argv: list[str]) -> int:
                 attempt_id=args.attempt_id, child_spawned="1",
             )
         read_launch_fence_failure(fence_failure_read_fd)
+        foreground_review_handoff = (
+            getattr(args, "launch_lifecycle", DETACHED) == FOREGROUND_SCOPED
+            and getattr(args, "dispatch_depth", None) == 1
+            and getattr(args, "worker_type", None) == "review"
+            and getattr(args, "execution_surface", None) == "registered-headless"
+            and bool(getattr(args, "registered_worker", False))
+            and not any(foreground_review_launch_identity(args).values())
+        )
         if (args.dispatch_depth == 1 and args.worker_type == "owner"
                 and args.launch_lifecycle == DETACHED):
             try:
@@ -2060,7 +2213,46 @@ def main(argv: list[str]) -> int:
         args.child_pid = proc.pid
         args.child_pid_start = start_ticks
         args.launch_heartbeat = seed_launch_heartbeat(args, jobs, proc.pid, start_ticks)
-        if args.launch_lifecycle == FOREGROUND_SCOPED:
+        if args.launch_lifecycle == FOREGROUND_SCOPED and foreground_review_handoff:
+            binding = args.parent_binding
+            try:
+                outcome = wait_foreground(
+                    proc, args.foreground_timeout,
+                    watchdog_budget=args.watchdog_budget,
+                    parent_pid=binding.observed_pid if binding else None,
+                    parent_pid_start=binding.observed_pid_start if binding else None,
+                    parent_is_live=(
+                        (lambda: parent_attempt_binding_is_live(jobs, binding))
+                        if binding else None
+                    ),
+                )
+                foreground_seal = seal_foreground_result(
+                    jobs, args.attempt_id, proc.pid, start_ticks or "",
+                    int(launch_metadata.get("pgid", "0")),
+                    exit_code=outcome.exit_code, failure=outcome.failure,
+                    group_empty=outcome.group_empty,
+                )
+                reap_watch_pid = launch_reap_watch(
+                    jobs, args.attempt_id, proc.pid, start_ticks or "",
+                    int(launch_metadata.get("pgid", "0")),
+                    foreground_seal=foreground_seal,
+                )
+            except (DispatchContractError, ValueError) as exc:
+                reason = getattr(exc, "reason", "foreground-outcome-seal-error")
+                detail = getattr(exc, "detail", str(exc))
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                close_job_row(jobs, args.slug, args.worktree, reason, "", args.attempt_id)
+                return fail(reason, 70, detail=detail, child_spawned="0")
+            annotate_attempt_row(
+                jobs, args.attempt_id,
+                {"reap_watch": "post-exit", "reap_watch_pid": str(reap_watch_pid)},
+            )
+            args.worker_exit = outcome.exit_code
+            args.worker_failure = outcome.failure
+        elif args.launch_lifecycle == FOREGROUND_SCOPED:
             binding = args.parent_binding
             outcome = wait_foreground(
                 proc,
@@ -2072,6 +2264,7 @@ def main(argv: list[str]) -> int:
                     if binding
                     else None
                 ),
+                watchdog_budget=args.watchdog_budget,
             )
             annotate_attempt_row(
                 jobs,
@@ -2122,7 +2315,11 @@ def main(argv: list[str]) -> int:
     print(f"parent_session_id={args.parent_session_id or '-'}")
     print(f"parent_attempt_id={args.parent_binding.attempt_id if getattr(args, 'parent_binding', None) else '-'}")
     print(f"parent_completion_delivery={args.parent_completion_delivery}")
+    print("completion_delivery=" + ("session-resume-supervised" if args.owner_route_binding else "one-shot"))
     print(f"parent_completion_reason={getattr(args, 'parent_completion_reason', 'unspecified')}")
+    for key in ("managed_sidecar_state", "managed_sidecar_reason", "managed_sidecar_pid",
+                "managed_sealed_batch_id", "managed_sidecar_log"):
+        print(f"{key}={getattr(args, key, '-')}")
     print(f"worker_role={args.worker_role or '-'}")
     print(f"worker_type={args.worker_type}")
     print(f"assigned_contract={args.assigned_contract}")

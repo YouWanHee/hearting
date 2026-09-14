@@ -22,7 +22,7 @@ Installed harness root:
 
 Runtime code should resolve it in this order:
 
-1. `AGENT_HOME`
+1. `AGENT_HOME` (the active runtime root, including an explicitly activated checkout)
 2. adapter-specific compatibility variables such as `CLAUDE_HOME`
 3. `${XDG_DATA_HOME:-$HOME/.local/share}/hearting/current` when a managed release is installed
 4. `$HOME/hearting` when a canonical linked checkout is present
@@ -220,6 +220,32 @@ writes to them are blocked.
 **Cycle boundaries.** A cycle boundary is a bucket-specific function, not a
 global depth-1 rule. The per-shape boundary table is owned by the component
 blueprint `spec/artifact-path-contract/prd.md` D-23; it is not restated here.
+
+**Cycle payload paths.** Producer collection and manifest validation share one
+locator check. Inside cycle-relative `artifacts/`, dot-prefixed names retain
+their paths and sealed bytes/digests through normal finalization and recovery.
+This corrects D-6's blanket hidden-name rejection; dot segments, symlinks,
+absolute/escaping paths and out-of-payload files remain invalid. Cycle controls
+and legacy relocation/exclusion retain their contracts. Invalid paths identify
+the locator and reason before payload reads or manifest publication.
+
+**Campaign closure.** `artifact_producer.py campaign-status|campaign-close|campaign-recover`
+owns administrative satisfaction. Status verifies the campaign's exact cycle
+membership, sealed manifests and their payloads and prints a reviewable goal,
+criterion and approval statement bound to that snapshot. Sealed abandoned
+cycles remain abandoned; this operation neither repairs route failure markers
+nor adds a residual-zero criterion. All cycles being sealed never substitutes
+for the user's acceptance of the goal and criterion. Close accepts the exact
+statement only from a native user message in the named session, derives the
+user actor from that evidence, and rechecks the snapshot under the producer's
+admission lock. Caller-authored actor/approval JSON is not authority.
+An immutable campaign event is the commit point; campaign.json is its
+recoverable projection. Readers and begin honor a committed close even after
+a crash before projection. Same-event replay is idempotent, conflicting state
+is preserved, and campaign-recover completes only that committed projection.
+Cycle manifests and route evidence remain immutable. Unavailable native
+evidence leaves closure pending and reports the explicit approval statement;
+an agent never submits that statement on the user's behalf.
 
 **Exactly one disposition.** Except for `_scratch/`, every regular file and
 container under the artifact root has exactly one disposition, and none is left

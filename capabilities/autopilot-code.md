@@ -40,7 +40,9 @@ Artifact intensity policy:
 - `quick`: no durable `plan.md` by default; record a short summary/evidence only when a work-cycle artifact is already required;
 - `standard+`: create or resume `$AGENT_ARTIFACT_OUTPUT_DIR/plans/<date>_<slug>/`.
 
-Required public artifacts for `standard+` work cycles:
+The default full graph produces the following public artifacts. A selected
+subgraph produces only its declared outputs; omitted planning does not require
+a substitute plan or checklist:
 
 - `plan.md` at the plan root;
 - `checklist.md` at the plan root when the plan is multi-step;
@@ -55,14 +57,10 @@ W7C write-cutover contract (`utilities/artifact_producer.py`, registry table
 `producer_lifecycle` in `capabilities/topologies.json`). The same lifecycle
 binds `direct`, `quick`, and `standard+`; only the acting owner differs.
 
-1. **begin before the first write.** After the route is compiled and bound,
-   the owner (the inline session for `direct`, the dispatch-depth-1 owner for
-   `quick` and `standard+`) runs `artifact_producer.py begin --artifact-root
-   <root> --route <route file> --capability autopilot-code --intensity <intensity>`.
-   While the cutover is inactive this returns `legacy-compat` and the legacy
-   `<artifact-root>/plans/` layout stays writable; once active it
-   issues `campaign_id`/`cycle_id`/`producer_id` and the cycle directory
-   `campaigns/<campaign-locator>/<cycle-locator>/artifacts/` before any artifact exists.
+1. **prepare the route's cycle.** Registered frame/owner launch prepares or
+   resumes the route's cycle and carries its exact `AGENT_ARTIFACT_*` context.
+   Inline work uses `artifact_producer.py begin --artifact-root <root>
+   --route <route file> --capability autopilot-code --intensity direct`.
 2. **write only inside the open cycle.** Every durable artifact goes under
    `<cycle_dir>/artifacts/plans/...` (`AGENT_ARTIFACT_OUTPUT_DIR`).
    `artifact_producer.py check-write` is the single allow/deny oracle used by
@@ -72,12 +70,14 @@ binds `direct`, `quick`, and `standard+`; only the acting owner differs.
    `AGENT_ARTIFACT_CAMPAIGN_ID`/`CYCLE_ID`/`PRODUCER_ID`/`CYCLE_DIR`/`OUTPUT_DIR`
    from the owner (dispatch env pass-through) and call `begin --node <id>`
    on the same route, which resumes the owner's open cycle.
-4. **finalize after route closure.** The owner runs `artifact_producer.py
-   finalize --artifact-root <root> --cycle <cycle_id>` once the route is
-   closed: it enumerates `artifacts/`, builds and validates the D-6 manifest,
-   commits `manifest.json` (the commit point), applies the index, and seals
-   the cycle record. Empty output leaves no lineage (D-9). `recover` rolls a
-   crashed finalize forward or back from its journal.
+4. **runtime-owned closure.** New registered owners write their report and
+   return the final handoff. After exact PASS and process cleanup, the shared
+   completion controller completes the workflow, closes the route and seals
+   the exact cycle. It retries interrupted settlement without another model
+   turn; pending closure preserves PASS and carries a recovery notice.
+   Inline work and legacy recovery retain explicit route close and producer
+   finalize. Runtime-owned owners and their parents have no separate finalize
+   command to remember.
 5. **shared admission.** This capability's output is cycle-local; it is never admitted to `shared/` (only `spec`, `analysis`, and explicitly promoted `research` are shared kinds).
 
 ## Role Requirements
@@ -92,7 +92,7 @@ Minimum role mapping:
 - review: QA/reviewer role for plan, code, and test review;
 - app UI changes: design role as critic or handoff verifier when design artifacts exist.
 
-Pipeline intensity is the primary ceremony selector. `direct` is inline and `quick` is one `balanced-deep` registered one-shot conductor. Every `standard+` owner uses `deep`; `standard` opens framing as two asymmetric cross-harness legs (`balanced-deep` anchor plus `light` alternative). `strong` adds a deep contrarian framing leg and opens width-two plan (`deep + balanced-deep`) and implementation-review (`balanced-deep + light`) groups. `thorough|adversarial` add the declared light implementation-risk plan leg and deep failure-mode review leg. All legs are dispatch-depth-2 siblings with disjoint artifacts, exact all-join, and route-sealed role/profile/perspective; other stages remain sequential. The same intensity determines plan-check, selected reviews, and code-test rigor without a separate user-facing QA axis. Concrete models remain adapter-specific.
+Pipeline intensity is the primary ceremony selector. `direct` is inline and `quick` is one registered one-shot conductor (default `balanced-deep`); both `quick` and `standard+` open with a fixed two-leg frame bootstrap that depth-0 launches itself before the owner starts, anchor profile one tier above the owner via `model_profile.frame_profile_for_owner` — there is no third frame leg at any intensity. The standard+ owner defaults to `deep`; an explicit profile such as `light` takes precedence, including through `compose --profile light`. `strong` opens width-two plan (`deep + balanced-deep`) and implementation-review (`balanced-deep + light`) groups. `thorough|adversarial` add the declared light implementation-risk plan leg and deep failure-mode review leg. Those groups are dispatch-depth-2 siblings with disjoint artifacts, exact all-join, and route-sealed role/profile/perspective; other stages remain sequential. The selected graph determines which stages run; intensity supplies their default review and verification rigor without a separate user-facing QA axis. Concrete models remain adapter-specific.
 
 ## Stage Mapping
 
@@ -111,57 +111,38 @@ Stage-local gates must not become full independent QA loops after every sub-stag
 
 **Corrections are batched, never atomic.** A failed review gate (`plan-check`, `impl-review`, `test`) is followed by exactly one correction pass that closes every 🔴 finding of that round together, plus the follow-on gaps the review named; the owner never redispatches the full `plan` or `execute` node to fix a single finding. The plan correction runs through the `code-refine` boundary and the code correction re-enters the `execute` boundary as a bounded fix under the same node. The re-review that follows is a **closure check** under the review unit's Round Protocol — the owner's assignment names the round number and the prior review artifact and asks whether the prior 🔴 items are closed and the delta is clean; it never asks for a fresh independent re-audit of the whole artifact. Each correction consumes one unit of the `core/CONVENTIONS.md §1.1` retry budget; when the budget is spent, remaining concerns go to the plan's risk/unresolved section and the owner reports them instead of opening another round. A review round that records blocking findings ends `completed-review-blocking`, not as a dead worker; when the budget is spent on such rounds, the owner writes `round_{N}.owner-closure.md` beside the review artifacts (frontmatter `verdict: closed-by-owner`, `node`, `gate`; body naming every blocking attempt and its disposition) and completes the review node with that record as evidence — `core/OPERATIONS.md §5.10` owns the gate's evidence checks.
 
-**Post-frame direction gate (SD-123/SD-129).** This gate is mode-conditional. A
-`standard+` route compiled under an explicit `hybrid`/`both`/`post-frame-only`
-`confirmation.mode` seals `human_gates: ["frame-review"]` and the `frame`
-node's continuation as a human gate; under the shipped `autonomous` default a
-non-composed route realizes that same continuation as `{"kind":
-"inline-next"}` with an empty `human_gate_bindings` (a composed recipe keeps
-every gate it declares), and the rest of this paragraph describes only the
-gate-bearing shape. A route sealed before this cycle keeps whatever it sealed
-and is never retro-fitted. After `frame` completes and before the compiled
-bound successor starts (read from `human_gate_bindings` and the graph's actual
-successor node — never inferred from the mode name or a hardcoded node id),
-the owner builds `shards/frame/frame-summary.json` (five fields —
-방향/대안/위험/범위 변경/비용, ≤1KB) from `shards/frame/direction-brief.md` and the
-**frame interview** `shards/frame/interview.json` (SD-129: a one-sentence
-restatement the user confirms, a plain-language brief, and at most 7 short
-questions — one topic each, 2–4 options, one recommended, no harness
-vocabulary, only decisions the user alone can make; `utilities/frame_interview.py
-validate` is the bar and `gate --block` refuses what fails it), raises the
-existing typed attention path with `required_action=human-gate:frame-review`
-referencing the interview **by path** (never embedded in a stage-advance
-receipt body), and waits on the bounded checked surface
-`workflow-supervisor.py await-release --gate frame-review` (SD-129) until a
-person records `workflow-supervisor.py release --gate frame-review --decision
-proceed|revise|stop` from the depth-0 session. `proceed` carries the user's
-answers (`--answers`, required when the artifact is an interview), which the
-owner renders into `shards/frame/intent.md` (`frame_interview.py
-render-intent`) — the agreed intent the bound successor reads first (Problem /
-Proposed Outcome / Affected / Constraints / Decisions / Open Questions); when
-the successor is `plan`, a plan that contradicts a recorded decision is a
-plan-check blocker, and any other successor receives the same recorded intent
-through its own normal handoff rather than an invented plan node. `proceed`
-claims and starts the bound successor exactly once; `revise` returns to
-`frame` under the `code-refine` retry boundary; `stop` cancels the route. On
-such a gate-bearing route, a successor start whose entry gate is not released
-is refused by every launch surface (`human-gate-unreleased` /
-`human-gate-not-raised`), and an owner never releases its own gate to
-move on. `direct`/`quick` have no gate: the depth-0 session asks the same kind
-of question — only about decisions the request and recovered context leave
-unresolved — inline inside the §0.4 confirmation step, whichever shape that
-route's sealed `small_work_confirmation` gives it (the blocking card, or the
-non-blocking `[경로]` notice line when sealed `notice` applies) (at most 0–1 /
-0–3 — a documented obligation on the acting session, not a machine-checked
-cap, since those routes carry no gate binding).
+**Pre-owner direction gate (SD-123).** Depth-0 compiles/binds the route and
+begins its producer cycle before launching the frame pair. The direction gate
+binds at `one-shot` entry for `quick`, `plan` entry for `standard+`. Legacy
+sealed routes remain unchanged. Depth-0 joins both direction briefs and builds
+`shards/frame/frame-summary.json` (five fields — 방향/대안/위험/범위 변경/비용,
+≤1KB) plus the **frame interview** `shards/frame/interview.json` (SD-129: a
+one-sentence restatement the user confirms, a plain-language brief, and at most
+`frame_interview.py`'s `QUESTION_CAP` short questions — one topic each, 2–4
+options, one recommended, no harness vocabulary, only decisions the user alone
+can make; `utilities/frame_interview.py validate` is the bar and `gate --block`
+refuses what fails it). Depth-0 puts those questions to the user, records the
+answers with `workflow-supervisor.py release --gate frame-review --decision
+proceed|revise|stop --answers <file>`, and renders `shards/frame/intent.md`
+with `frame_interview.py render-intent`.
 
-The declared `confirmation.mode` — `autonomous` (the shipped default),
-`hybrid`, `both`, `post-frame-only` — governs whether this gate exists at all.
-`autonomous` removes it, but only for a non-composed route doing routine,
-already-authorized `autopilot-code` work; an explicit composed recipe keeps
-every gate it declares regardless of `confirmation.mode`. Otherwise it is the
-sole confirmation point, layers onto the pre-plan notify, or both apply;
-`core/WORKFLOW.md` §0.4 owns the user-facing card.
+The owner **receives** `intent.md`'s path as an input. It raises no gate, waits
+on no release, and renders no intent of its own — all of that is finished before
+it is launched. The runtime also renders the released understanding and answers
+into every owner and stage prompt, including graphs without plan. Each assigned
+stage stays inside that scope and records the relevant decisions; the owner
+does not have to copy the intent into each dispatch prompt. `revise` re-runs the frame pair
+before owner launch and `stop` cancels the prepared workflow, so
+neither consumes the owner's `code-refine` retry budget. A first-work-node
+start whose entry gate is not released is refused by every launch surface
+(`human-gate-unreleased`). `direct` has no gate: the depth-0 session asks its
+one question of the same kind inline inside the §0.4 card step — a documented
+obligation on the acting session, not a machine-checked cap, since a `direct`
+route carries no gate binding.
+
+The declared `confirmation.mode` (default `hybrid`) governs the ordered pair —
+blocking direction gate first, route notice after; `core/WORKFLOW.md` §0.4 owns
+the user-facing card.
 
 A declared `plan-check` parallel group is a 2-way read-only review: two plan-check verdicts merge under the existing review-anchor merge contract (stricter-wins plus the union of blocking findings). When the two legs nominate different plan legs as winner, `plan.md` materialization is blocked unless the owner writes a bounded merge-arbitration memo, which is the only path into the existing bounded `code-refine` flow. `plan-check` itself never mutates the plan.
 

@@ -7,10 +7,12 @@ import base64
 from contextlib import contextmanager
 import contextvars
 from dataclasses import dataclass
+from datetime import datetime
 import errno
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -22,9 +24,13 @@ import tempfile
 import time
 import uuid
 from typing import Callable, Iterator, Mapping, NamedTuple
+from types import MappingProxyType
 
 from route_identity import registered_node_identity
 from governor_identity import close_witness, create_witness
+from dispatch_attempt_policy import (decide_attempt, SUBSESSION_NOTE, SUCCESS_NOTES, committed_outcome,
+                                     terminal_conflict_identity, terminal_conflicts, terminal_conflict_pending)
+from dispatch_receipt_identity import receipt_digest as shared_receipt_digest, unseal_receipt
 
 _GOVERNOR_WITNESS_HANDLES: dict[tuple[str, str], object] = {}
 
@@ -331,6 +337,8 @@ ATTEMPT_MUTABLE_METADATA = {
     "retry_attempt_id",
     "retry_claimed_at",
     "start_permitted",
+    "cleanup_receipt_b64",
+    "cleanup_receipt_digest",
     "cancellation_quiescence_receipt",
     "cancellation_receipt_digest",
     "quiescence_pgid_proof",
@@ -361,6 +369,8 @@ ATTEMPT_TERMINAL_EVIDENCE_KEYS = {
     "prior_failure_class",
     "conflicting_classifier_source",
     "conflicting_failure_class",
+    "conflicting_terminal_note",
+    "terminal_conflicts_b64",
     "receipt_state",
     "marker_state",
     # SD-111 P2 (D-4): the delivery-intent 8-field allowlist. Stamped once by
@@ -402,6 +412,37 @@ ATTEMPT_TERMINAL_EVIDENCE_KEYS = {
     "review_gate_closure",
     "owner_closure",
 }
+
+# Foreground review completion is authoritative only for a deliberately
+# route-free registered depth-1 review.  Keep this list exhaustive: adding a
+# provenance field here would silently turn a route-bound row into a new
+# authority surface.
+ROUTE_IDENTITY_METADATA_KEYS = (
+    "route_file",
+    "route_id",
+    "route_hash",
+    "route_node",
+    "registry_digest",
+    "write_scope",
+    "completion_gate",
+    "owner_route_file",
+    "owner_route_id",
+    "owner_route_hash",
+    "batch_route_id",
+    "batch_route_node",
+)
+FOREGROUND_OUTCOME_KEYS = (
+    "foreground_outcome_schema",
+    "foreground_outcome_ready",
+    "foreground_process_exit",
+    "foreground_process_failure",
+    "foreground_group_empty",
+    "foreground_outcome_source",
+)
+FOREGROUND_OUTCOME_SOURCE = "wait-foreground-v1"
+FOREGROUND_FAILURES = frozenset({
+    "none", "timeout", "parent-terminated", "process-identity-unavailable",
+})
 _MODULE_ROOT = Path(__file__).resolve().parents[1]
 _CAPACITY_TERMINAL_RE = re.compile(
     r"(?:error\s*[:\-]\s*)?(?:selected\s+)?model(?:\s+[A-Za-z0-9._:/-]+)?\s+"
@@ -621,6 +662,168 @@ class DispatchContractError(ValueError):
         self.detail = detail or reason
 
 
+@dataclass(frozen=True)
+class ReviewHolderDisposition:
+    """Closed report-lease liveness result.
+
+    Timestamp expiry is deliberately absent from this decision.  It is only a
+    stale/unobservable ceiling; exact process evidence or the namespace-safe
+    governed witness is the authority for a live holder.
+    """
+
+    state: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class ReviewAdmissionCleanup:
+    """Closed proof returned by watchdog admission cleanup."""
+
+    watchdog_group: str
+    fenced_child_group: str
+    readiness: str
+    review_lease: str
+    governed_witness: str
+    payload_marker: str
+    status: str
+
+
+class PostClaimAdmission:
+    """Compatible post-claim transaction object for review admission.
+
+    The common transaction owns registry mutation.  The callbacks own only
+    external resources and are intentionally idempotent, so an abort never
+    acquires or mutates the jobs lock.
+    """
+
+    __slots__ = (
+        "metadata", "_abort_callback", "_commit_callback", "_abort_result",
+        "_committed", "_aborted", "_commit_started",
+    )
+
+    def __init__(self, metadata: Mapping[str, str], *, abort: Callable[[str], ReviewAdmissionCleanup], commit: Callable[[], None]):
+        self.metadata = dict(metadata)
+        self._abort_callback = abort
+        self._commit_callback = commit
+        self._abort_result: ReviewAdmissionCleanup | None = None
+        self._committed = False
+        self._aborted = False
+        self._commit_started = False
+
+    def abort(self, reason: str) -> ReviewAdmissionCleanup:
+        if self._committed:
+            raise DispatchContractError("review-admission-abort-after-commit")
+        if self._abort_result is None:
+            self._aborted = True
+            try:
+                self._abort_result = self._abort_callback(reason)
+            except BaseException:
+                self._abort_result = ReviewAdmissionCleanup(
+                    watchdog_group="unverified", fenced_child_group="unverified",
+                    readiness="unverified", review_lease="unverified",
+                    governed_witness="unverified", payload_marker="unverified",
+                    status="unverified",
+                )
+        return self._abort_result
+
+    def commit(self) -> None:
+        if self._committed:
+            return
+        if self._aborted:
+            raise DispatchContractError("review-admission-commit-after-abort")
+        self._commit_started = True
+        self._commit_callback()
+        self._committed = True
+
+
+@dataclass(frozen=True)
+class SealedForegroundOutcome:
+    """The lock-scoped foreground result and its seal-moment row evidence."""
+
+    values: Mapping[str, str]
+    attempt_raw_row_sha256: str
+
+
+def foreground_review_eligible(
+    metadata: Mapping[str, object],
+    *,
+    expected_attempt_id: str,
+    expected_pid: int,
+    expected_pid_start: str,
+    expected_pgid: int,
+) -> bool:
+    """Return the one exact route-free foreground-review predicate."""
+
+    return _foreground_review_eligibility_reason(
+        metadata,
+        expected_attempt_id=expected_attempt_id,
+        expected_pid=expected_pid,
+        expected_pid_start=expected_pid_start,
+        expected_pgid=expected_pgid,
+    ) == ""
+
+
+def _foreground_review_eligibility_reason(
+    metadata: Mapping[str, object],
+    *,
+    expected_attempt_id: str,
+    expected_pid: int,
+    expected_pid_start: str,
+    expected_pgid: int,
+) -> str:
+    """Give the seal/classifier callers a stable refusal family."""
+
+    if not (
+        metadata.get("transport") == "headless"
+        and metadata.get("execution_surface") == "registered-headless"
+        and metadata.get("registered_worker") == "1"
+        and metadata.get("dispatch_depth") == "1"
+        and metadata.get("worker_type") == "review"
+        and metadata.get("launch_lifecycle") == "foreground-scoped"
+        and not any(metadata.get(key) for key in ROUTE_IDENTITY_METADATA_KEYS)
+        and metadata.get("pgid", "").isdigit()
+        and metadata.get("pid", "").isdigit()
+        and metadata.get("pid_start")
+        and metadata.get("pgid") == metadata.get("pid")
+        and metadata.get("pid_ns")
+        and metadata.get("pid_ns") == metadata.get("pid_observer_ns")
+    ):
+        return "eligibility"
+    if not (
+        metadata.get("attempt_id") == expected_attempt_id
+        and metadata.get("pid") == str(expected_pid)
+        and metadata.get("pid_start") == expected_pid_start
+        and metadata.get("pgid") == str(expected_pgid)
+    ):
+        return "binding"
+    return ""
+
+
+def foreground_review_launch_identity(args: object) -> dict[str, object]:
+    """Project the route identity that the adapter will actually record.
+
+    Flat CLI values cover the ordinary route fields; owner and replica binding
+    objects carry the remaining fields.  Keeping this projection next to the
+    shared twelve-key predicate prevents an adapter from treating a missing
+    flat attribute as proof that the eventual registry row is route-free.
+    """
+
+    identity: dict[str, object] = {
+        key: getattr(args, key, None) or ""
+        for key in ROUTE_IDENTITY_METADATA_KEYS
+    }
+    owner = getattr(args, "owner_route_binding", None)
+    if owner is not None:
+        identity["owner_route_file"] = getattr(owner, "route_file", None) or ""
+        identity["owner_route_id"] = getattr(owner, "route_id", None) or ""
+        identity["owner_route_hash"] = getattr(owner, "route_hash", None) or ""
+    reservation = getattr(args, "replica_batch_reservation", None) or {}
+    for key in ("batch_route_id", "batch_route_node"):
+        if key in reservation:
+            identity[key] = reservation.get(key) or ""
+    return identity
+
+
 # SD-113 A47-2: the vocabulary `_delivery_intent_values()` recognizes as a
 # record-creating `parent_completion_delivery` stamp must equal
 # `dispatch_pending_delivery.RECIPIENT_KINDS` exactly -- documented here so a
@@ -731,8 +934,8 @@ class MarkerBoundDeliveryResult:
     quiescent: bool
     owned_children: int
     advanced: bool
-    supervisor_terminal: bool = False
-    subsession_terminal: bool = False
+    completion_proven: bool = False
+    terminal_conflict: bool = False
 
 
 @dataclass(frozen=True)
@@ -1084,6 +1287,15 @@ REVIEW_POST_CLAIM_METADATA_KEYS = frozenset({
     "review_lease_acquired_at",
     "review_lease_deadline",
     "review_lease_record_digest",
+    "review_admission",
+    "review_watchdog_budget_digest",
+    "review_readiness_digest",
+    "review_fence_pid",
+    "review_fence_pid_start",
+    "review_fence_pgid",
+    "review_fence_pid_ns",
+    "review_fence_pid_observer_ns",
+    "review_governed_lease_nonce",
 })
 
 
@@ -1205,6 +1417,125 @@ def review_lease_record_digest(record: Mapping[str, object]) -> str:
         dict(record), ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _review_epoch(value: str) -> float:
+    try:
+        return time.mktime(time.strptime(value, "%Y-%m-%dT%H:%M:%SZ")) - time.timezone
+    except ValueError:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+
+
+def review_holder_disposition(
+    lease_record: Mapping[str, object] | None,
+    registry_metadata: Mapping[str, object] | None,
+    artifact_root: str | Path,
+    *,
+    now: float | None = None,
+) -> ReviewHolderDisposition:
+    """Classify one exact v2 holder without treating its timestamp as death.
+
+    Process evidence wins over the flock fallback.  The fallback is admitted
+    only for the namespace-unverifiable case required by SD-90, so a released,
+    reused, zombie, or positively dead process can never be revived by a held
+    file descriptor.
+    """
+
+    if not isinstance(lease_record, Mapping) or lease_record.get("schema_version") != 2:
+        return ReviewHolderDisposition("malformed", "lease-record-schema")
+    if not isinstance(registry_metadata, Mapping):
+        return ReviewHolderDisposition("malformed", "registry-metadata-missing")
+    if lease_record.get("released_at") is not None or lease_record.get("expired") is True:
+        return ReviewHolderDisposition("dead", "released-or-expired")
+    acquired_at = lease_record.get("acquired_at")
+    deadline = lease_record.get("deadline")
+    if not isinstance(acquired_at, str) or not isinstance(deadline, str):
+        return ReviewHolderDisposition("malformed", "lease-time-missing")
+    try:
+        acquired_epoch = _review_epoch(acquired_at)
+        deadline_epoch = _review_epoch(deadline)
+    except (TypeError, ValueError, OverflowError):
+        return ReviewHolderDisposition("malformed", "lease-time-invalid")
+    observed_now = time.time() if now is None else now
+    if acquired_epoch > observed_now:
+        return ReviewHolderDisposition("malformed", "lease-acquired-in-future")
+    if deadline_epoch <= acquired_epoch:
+        return ReviewHolderDisposition("malformed", "lease-deadline-invalid")
+    required = ("attempt_id", "pid", "pid_start", "pgid", "pid_ns", "pid_observer_ns")
+    identity_complete = not any(not str(registry_metadata.get(key, "")) for key in required)
+    if identity_complete and (
+        not str(registry_metadata.get("pid", "")).isdigit()
+        or not str(registry_metadata.get("pgid", "")).isdigit()
+    ):
+        return ReviewHolderDisposition("malformed", "holder-identity-invalid")
+    nonce = str(registry_metadata.get("review_governed_lease_nonce", ""))
+    witness_bound = (
+        registry_metadata.get("review_governed_lease") == REVIEW_GOVERNED_LEASE_KIND
+        and REVIEW_GOVERNED_LEASE_NONCE_RE.fullmatch(nonce) is not None
+    )
+    if not identity_complete and not witness_bound:
+        return ReviewHolderDisposition("malformed", "holder-identity-incomplete")
+    budget_fields = (
+        "watchdog_timeout_seconds", "watchdog_origin_monotonic_ns",
+        "watchdog_deadline_monotonic_ns", "watchdog_origin_epoch",
+        "watchdog_deadline_epoch", "watchdog_budget_digest",
+    )
+    budget_present = [key in lease_record for key in budget_fields]
+    if any(budget_present) and not all(budget_present):
+        return ReviewHolderDisposition("malformed", "watchdog-budget-incomplete")
+    if all(budget_present):
+        try:
+            timeout = float(lease_record["watchdog_timeout_seconds"])
+            origin_ns = int(lease_record["watchdog_origin_monotonic_ns"])
+            deadline_ns = int(lease_record["watchdog_deadline_monotonic_ns"])
+            origin_epoch = float(lease_record["watchdog_origin_epoch"])
+            deadline_epoch_exact = float(lease_record["watchdog_deadline_epoch"])
+            budget_payload = {
+                "timeout_seconds": timeout,
+                "origin_monotonic_ns": origin_ns,
+                "deadline_monotonic_ns": deadline_ns,
+                "origin_epoch": origin_epoch,
+            }
+            expected_budget_digest = "sha256:" + hashlib.sha256(
+                json.dumps(budget_payload, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+            if (
+                not math.isfinite(timeout) or timeout <= 0
+                or origin_ns < 0
+                or deadline_ns != origin_ns + int(timeout * 1_000_000_000)
+                or not math.isfinite(origin_epoch)
+                or not math.isfinite(deadline_epoch_exact)
+                or deadline_epoch_exact != origin_epoch + timeout
+                or expected_budget_digest != str(lease_record["watchdog_budget_digest"])
+                or abs(deadline_epoch - deadline_epoch_exact) > 1.0
+            ):
+                return ReviewHolderDisposition("malformed", "watchdog-budget-contradictory")
+        except (TypeError, ValueError, OverflowError):
+            return ReviewHolderDisposition("malformed", "watchdog-budget-invalid")
+    for key in _PROCESS_IDENTITY_METADATA_KEYS | {"review_governed_lease", "review_governed_lease_nonce"}:
+        if key in lease_record and str(lease_record.get(key, "")) != str(registry_metadata.get(key, "")):
+            return ReviewHolderDisposition("malformed", f"holder-binding-mismatch:{key}")
+    record_digest = lease_record.get("review_lease_record_digest")
+    metadata_digest = registry_metadata.get("review_lease_record_digest")
+    if metadata_digest is None:
+        return ReviewHolderDisposition("malformed", "lease-record-digest-missing")
+    if record_digest is not None and metadata_digest is not None:
+        unsigned = {key: value for key, value in lease_record.items() if key != "review_lease_record_digest"}
+        if review_lease_record_digest(unsigned) != metadata_digest:
+            return ReviewHolderDisposition("malformed", "lease-record-digest-mismatch")
+    if identity_complete:
+        process = attempt_governed_process_quiescence({str(k): str(v) for k, v in registry_metadata.items()})
+        if process.state == "live":
+            return ReviewHolderDisposition("live", process.reason)
+        if process.state == "quiescent":
+            return ReviewHolderDisposition("dead", process.reason)
+        if process.reason in {"process-identity-invalid", "process-identity-missing"}:
+            return ReviewHolderDisposition("malformed", process.reason)
+        if process.reason != "process-namespace-unverifiable" or not witness_bound:
+            return ReviewHolderDisposition("unobservable", process.reason)
+    if witness_bound and review_governed_lease_is_held(artifact_root, registry_metadata):
+        return ReviewHolderDisposition("live", "governed-witness-held")
+    return ReviewHolderDisposition("unobservable", "process-namespace-unverifiable")
 
 
 def validate_review_output_binding(
@@ -1387,12 +1718,11 @@ def review_output_write_authorized(
         if not isinstance(acquired_at, str) or not isinstance(deadline, str):
             return False
         try:
-            acquired_epoch = time.mktime(time.strptime(acquired_at, "%Y-%m-%dT%H:%M:%SZ")) - time.timezone
-            deadline_epoch = time.mktime(time.strptime(deadline, "%Y-%m-%dT%H:%M:%SZ")) - time.timezone
+            acquired_epoch = _review_epoch(acquired_at)
+            deadline_epoch = _review_epoch(deadline)
         except (TypeError, ValueError, OverflowError):
             return False
-        now = time.time()
-        if acquired_epoch > now or deadline_epoch < now or deadline_epoch <= acquired_epoch:
+        if deadline_epoch <= acquired_epoch:
             return False
         metadata = binding.get("_registry_metadata")
         if not isinstance(metadata, Mapping):
@@ -1420,7 +1750,10 @@ def review_output_write_authorized(
         record_digest = review_lease_record_digest(record_for_digest)
         if record_digest != metadata.get("review_lease_record_digest"):
             return False
-        return review_governed_lease_is_held(binding["artifact_root"], metadata)
+        disposition = review_holder_disposition(
+            lease_record, metadata, binding["artifact_root"]
+        )
+        return disposition.state == "live"
     except (DispatchContractError, OSError, TypeError, ValueError):
         return False
 
@@ -1631,6 +1964,7 @@ def _supervisor_lease_metadata_valid(
     delivery_by_harness = {
         "claude": "session-resume-supervised",
         "codex": "app-server-supervised",
+        "opencode": "session-resume-supervised",
     }
     harness = metadata.get("harness", "")
     if (
@@ -2553,23 +2887,13 @@ def _detached_group_drain_receipt(metadata: dict[str, str]) -> bool:
         and metadata.get("launch_outcome") == "governed-process-group-drained"
         and metadata.get("group_reap_proof") == GROUP_REAP_PROOF
         and metadata.get("group_reap_pgid") == raw_group
-        and (
-            metadata.get("attempt_descendant_proof") == ATTEMPT_DESCENDANT_PROOF
-            or _tagged_residue_receipt(metadata)
-        )
+        and metadata.get("attempt_descendant_proof") == ATTEMPT_DESCENDANT_PROOF
         and metadata.get("attempt_descendant_observer_ns") == observer_namespace
     )
 
 
 def _tagged_residue_receipt(metadata: dict[str, str]) -> bool:
-    """Did the detached drain observer seal a typed tagged-residue receipt?
-
-    SD-OPEN-47 (H7): `dispatch-reap-watch.py` writes this only after the exact
-    leader exited, its process group drained, the attempt already carried
-    semantic terminal evidence, and tagged survivors outlived the residue grace.
-    The pids it names are residue of a finished worker; every quiescence
-    consumer treats them exactly like the operator-sealed artifact proof.
-    """
+    """Read historical residue diagnostics, without declaring those processes gone."""
 
     observer_namespace = metadata.get("pid_observer_ns", "")
     return bool(
@@ -2742,7 +3066,10 @@ def prove_attempt_quiescence(
             if (
                 allow_namespace_extinct
                 and group.state == "empty"
-                and descendants.state == "empty"
+                and (descendants.state == "empty" or (
+                    descendants.state == "unverifiable"
+                    and descendants.reason == "observer-namespace-mismatch"
+                ))
                 and observer_namespace_extinct(metadata) == "extinct"
             ):
                 return QuiescenceProof(
@@ -2771,19 +3098,7 @@ def prove_attempt_quiescence(
 
 
 def _artifact_proof_receipt(metadata: dict[str, str]) -> bool:
-    """Was an artifact-proof substitute sealed for this exact attempt and observer?
-
-    A detached drain receipt needs `attempt-tagged-empty-v1`, so a single process
-    that escaped the governed group while carrying the attempt tag makes the
-    receipt unissuable forever -- and every gate that consumes it (`reconcile`,
-    `dispatch_completion_join`) then has no terminal state to reach, even for a
-    worker that finished and wrote its artifact.  This substitute is the recorded
-    proof that the worker's own last `stage-heartbeat --phase artifact` digest
-    matches the artifact on disk, so its output was already final when the
-    governed process died.  `dispatch-registry.py reconcile
-    --seal-artifact-proof-receipt` is the only writer, and it re-derives the whole
-    chain before and after the write; this predicate only reads the seal back.
-    """
+    """Read a historical output proof; it grants no process-cleanup authority."""
 
     raw_pid = metadata.get("pid", "")
     observer_namespace = metadata.get("pid_observer_ns", "")
@@ -2809,8 +3124,6 @@ def _post_exit_receipt_reason(metadata: dict[str, str]) -> str:
         return "governed-process-group-reaped"
     if _detached_group_drain_receipt(metadata):
         return "governed-process-group-drained"
-    if _artifact_proof_receipt(metadata):
-        return "receipt-superseded-by-artifact-proof"
     return ""
 
 
@@ -2851,6 +3164,80 @@ def cancellation_receipt_reason(metadata: dict[str, str]) -> str:
     return _cancellation_receipt_reason(metadata)
 
 
+CLEANUP_RECEIPT_TYPE = "attempt-cleanup-v1"
+
+
+def _cleanup_receipt_reason(metadata: dict[str, str]) -> str:
+    """Consume only exact cleanup proof; it is neither a verdict nor retry credit."""
+    try:
+        record = json.loads(base64.b64decode(metadata.get("cleanup_receipt_b64", ""), validate=True))
+        if not isinstance(record, dict):
+            return ""
+        return "attempt-cleanup-proven" if (
+            record.get("receipt_type") == CLEANUP_RECEIPT_TYPE
+            and record.get("attempt_id") == metadata.get("attempt_id")
+            and record.get("binding_digest") == _cancellation_quiescence_binding_digest(metadata)
+            and _canonical_sha256(record) == metadata.get("cleanup_receipt_digest")
+            and record.get("namespace_authority") is True
+            and record.get("process_group", {}).get("state") == "empty"
+            and record.get("attempt_tagged_descendants", {}).get("state") == "empty"
+        ) else ""
+    except (ValueError, TypeError, AttributeError):
+        return ""
+
+
+def resolve_attempt_cleanup(jobs: Path, attempt_id: str, *, apply: bool = False) -> dict[str, object]:
+    try:
+        return _resolve_attempt_cleanup(Path(jobs), attempt_id, apply=apply)
+    except (OSError, ValueError, DispatchContractError) as error:
+        return {"attempt_id": attempt_id, "settled": False, "changed": False,
+                "reason": getattr(error, "reason", "cleanup-observation-unavailable")}
+
+
+def _resolve_attempt_cleanup(jobs: Path, attempt_id: str, *, apply: bool = False) -> dict[str, object]:
+    """Reconcile cleanup on an exact terminal row, preserving its committed result.
+
+    The runtime join and operator reconcile use this same bounded, signal-free
+    authority. A missing proof remains an obligation; no cancellation or retry
+    receipt is issued. Process observations happen outside the registry lock.
+    """
+    matches = [line.split("\t") for line in jobs.read_text(encoding="utf-8").splitlines()
+               if len(line.split("\t")) == 6
+               and row_has_attempt(line.split("\t")[5], attempt_id)]
+    result = {"attempt_id": attempt_id, "settled": False, "changed": False}
+    if len(matches) != 1:
+        return {**result, "reason": "cleanup-row-not-unique"}
+    fields = matches[0]
+    metadata = parse_registry_metadata(fields[5])
+    if fields[1] not in {"done", "killed", "cancelled"}:
+        return {**result, "reason": "cleanup-terminal-result-required"}
+    validate_attempt_metadata(metadata)
+    process = attempt_process_quiescence(metadata, terminal_receipt=True)
+    if process.state == "quiescent":
+        return {**result, "settled": True, "reason": process.reason}
+    if process.state == "live":
+        return {**result, "reason": process.reason}
+    proof = prove_attempt_quiescence(metadata, max_wait_seconds=0, allow_namespace_extinct=True)
+    if not proof.proven:
+        return {**result, "reason": process.reason,
+                "group_state": proof.process_group_state, "descendant_state": proof.descendant_state,
+                "namespace_authority": proof.namespace_authority}
+    record = _cancellation_quiescence_receipt_record(metadata, proof)
+    record["receipt_type"] = CLEANUP_RECEIPT_TYPE
+    digest = _canonical_sha256(record)
+    if not apply:
+        return {**result, "reason": "cleanup-proof-available", "proof_source": proof.source}
+    values = {"cleanup_receipt_b64": base64.b64encode(json.dumps(record, sort_keys=True).encode()).decode(),
+              "cleanup_receipt_digest": digest}
+    changed = annotate_attempt_row_if(
+        jobs, attempt_id, values, lambda fresh: fresh == fields,
+        statuses=frozenset({"done", "killed", "cancelled"}),
+    )
+    return {**result, "settled": changed, "changed": changed,
+            "reason": "attempt-cleanup-proven" if changed else "cleanup-row-changed",
+            "proof_source": proof.source, "receipt_digest": digest if changed else ""}
+
+
 def attempt_process_quiescence(
     metadata: dict[str, str], *, terminal_receipt: bool = False
 ) -> ProcessQuiescence:
@@ -2887,28 +3274,13 @@ def attempt_process_quiescence(
             and metadata.get("pid_scope") == "namespace-local"
             and not _post_exit_receipt_reason(metadata)
             and not _cancellation_receipt_reason(metadata)
+            and not _cleanup_receipt_reason(metadata)
         ):
             return ProcessQuiescence("unverifiable", "post-exit-receipt-incomplete")
         return result
     probe = attempt_tagged_descendants(metadata)
     if probe.state == "populated":
-        # A visible tagged process normally vetoes quiescence, because it may
-        # still be writing this attempt's output. A sealed artifact proof settles
-        # exactly that question the other way: the artifact on disk already
-        # matches the digest the worker itself recorded at its final artifact
-        # heartbeat, and the governed process is gone (checked above), so the
-        # survivor is leaked residue rather than the worker. Only at a terminal
-        # gate, and only with the operator-sealed proof -- an unsealed row keeps
-        # the veto.
-        if terminal_receipt and _artifact_proof_receipt(metadata):
-            return result
-        # SD-OPEN-47 (H7): the drain observer already proved, after terminal
-        # evidence and the residue grace, that these tagged survivors are
-        # leftovers of a finished worker. They never veto again, at any gate:
-        # the alternative is a child row no join, reconcile, or successor
-        # gate can ever close while the residue lives.
-        if _tagged_residue_receipt(metadata):
-            return result
+        # Output evidence never settles a live process cleanup obligation.
         return ProcessQuiescence(
             "live", "attempt-descendant-live", probe.members[0][0]
         )
@@ -2918,6 +3290,7 @@ def attempt_process_quiescence(
         and metadata.get("pid_scope") == "namespace-local"
         and not _post_exit_receipt_reason(metadata)
         and not _cancellation_receipt_reason(metadata)
+        and not _cleanup_receipt_reason(metadata)
     ):
         return ProcessQuiescence("unverifiable", "post-exit-receipt-incomplete")
     if result.state != "quiescent":
@@ -2933,7 +3306,7 @@ def attempt_process_quiescence(
         if (
             terminal_receipt
             and probe.reason == "observer-namespace-mismatch"
-            and _post_exit_receipt_reason(metadata)
+            and (_post_exit_receipt_reason(metadata) or _cleanup_receipt_reason(metadata))
         ):
             return result
         return ProcessQuiescence("unverifiable", "attempt-descendant-unverifiable")
@@ -2977,7 +3350,7 @@ def _attempt_process_quiescence_impl(metadata: dict[str, str]) -> ProcessQuiesce
         return ProcessQuiescence("unverifiable", "process-identity-invalid")
 
     candidates = authoritative_process_identities(metadata)
-    receipt_reason = _post_exit_receipt_reason(metadata)
+    receipt_reason = _post_exit_receipt_reason(metadata) or _cleanup_receipt_reason(metadata)
 
     if not candidates:
         if receipt_reason:
@@ -3646,9 +4019,34 @@ def wait_governor_reservation_claim(
     *,
     timeout: float | None = None,
     expected_reservation: dict[str, object] | None = None,
+    watchdog_receipt: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Observe reserve→runner transfer before the reserving process may exit."""
 
+    claimant_pid = proc.pid
+    claimant_start = None
+    if watchdog_receipt is not None:
+        from review_watchdog import _is_receipt_digest_valid
+        watchdog = watchdog_receipt.get("watchdog") or {}
+        claimant = watchdog_receipt.get("child") or {}
+        observed_watchdog = process_launch_identity(proc.pid)
+        if (not isinstance(watchdog, Mapping) or not isinstance(claimant, Mapping)
+                or not _is_receipt_digest_valid(watchdog_receipt)
+                or watchdog.get("pid") != str(proc.pid)
+                or any(watchdog.get(k) != observed_watchdog.get(k) for k in
+                       ("pid", "pid_start", "pgid", "pid_ns", "pid_observer_ns"))):
+            raise DispatchContractError("model-worker-reservation-watchdog-mismatch")
+        try:
+            claimant_pid = int(claimant["pid"])
+            claimant_start = str(claimant["pid_start"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise DispatchContractError("model-worker-reservation-claim-mismatch") from exc
+        observed = _runtime_ancestry_proc_stat(claimant_pid)
+        observed_claimant = process_launch_identity(claimant_pid)
+        if (not observed or observed["ppid"] != proc.pid
+                or any(claimant.get(k) != observed_claimant.get(k) for k in
+                       ("pid", "pid_start", "pgid", "pid_ns", "pid_observer_ns"))):
+            raise DispatchContractError("model-worker-reservation-claim-mismatch", "sealed watchdog child differs")
     if timeout is None:
         timeout = reservation_claim_timeout()
     deadline = time.monotonic() + max(0.1, timeout)
@@ -3670,13 +4068,13 @@ def wait_governor_reservation_claim(
         if payload.get("state") == "claimed":
             _validate_replica_reservation(payload, expected_reservation)
             if (
-                str(payload.get("claimant_pid", "")) != str(proc.pid)
+                str(payload.get("claimant_pid", "")) != str(claimant_pid)
                 or str(payload.get("claimant_starttime", ""))
-                != str(process_start_ticks(proc.pid) or payload.get("claimant_starttime", ""))
+                != str(claimant_start or process_start_ticks(claimant_pid) or payload.get("claimant_starttime", ""))
             ):
                 raise DispatchContractError(
                     "model-worker-reservation-claim-mismatch",
-                    f"expected_pid={proc.pid} claimant_pid={payload.get('claimant_pid', '-')}",
+                    f"expected_pid={claimant_pid} claimant_pid={payload.get('claimant_pid', '-')}",
                 )
             _return_governor_witness(root, token, payload)
             return payload
@@ -3768,10 +4166,10 @@ def _abort_fenced_launch(
             else "identity-unverifiable"
         )
         if status != "signalled":
-            try:
-                proc.kill()
-            except (OSError, ProcessLookupError):
-                pass
+            # A failed exact signal is not permission to fall back to a
+            # process-only kill: the group/namespace proof is the safety
+            # boundary.  The caller records cleanup as unverified.
+            pass
         try:
             proc.wait(timeout=0.75)
         except (OSError, subprocess.TimeoutExpired):
@@ -3779,6 +4177,127 @@ def _abort_fenced_launch(
     group = process_group_observation(proc.pid)
     return proc.poll() is not None and group.state == "empty"
 
+
+def _review_admission_cleanup_token(cleanup: ReviewAdmissionCleanup | None) -> str:
+    if cleanup is None:
+        return "unverified"
+    if cleanup.status == "verified-post-release-reaped":
+        return "verified-post-release-reaped-v1"
+    if cleanup.status == "verified-never-launched" and cleanup.review_lease == "released":
+        return "verified-lease-released-v1"
+    if cleanup.status == "verified-never-launched" and cleanup.review_lease == "never-acquired":
+        return "verified-lease-never-acquired-v1"
+    return "unverified"
+
+
+def _unverified_review_admission_cleanup() -> ReviewAdmissionCleanup:
+    return ReviewAdmissionCleanup(
+        watchdog_group="unverified",
+        fenced_child_group="unverified",
+        readiness="unverified",
+        review_lease="unverified",
+        governed_witness="unverified",
+        payload_marker="unverified",
+        status="unverified",
+    )
+
+
+def _merge_review_cleanup_group_proof(
+    cleanup: ReviewAdmissionCleanup | None, registered_group_empty: bool,
+) -> ReviewAdmissionCleanup | None:
+    """Fold the transaction's exact registered-group proof into callback proof."""
+
+    if cleanup is None:
+        return None
+    watchdog_group = "empty" if registered_group_empty else "unverified"
+    verified = (
+        watchdog_group == "empty"
+        and cleanup.fenced_child_group == "empty"
+        and cleanup.readiness == "closed-removed"
+        and cleanup.review_lease in {"released", "never-acquired"}
+        and cleanup.governed_witness == "unlocked"
+    )
+    status = (
+        "verified-post-release-reaped"
+        if cleanup.status == "verified-post-release-reaped"
+        else "verified-never-launched"
+    ) if verified else "unverified"
+    return ReviewAdmissionCleanup(
+        watchdog_group=watchdog_group,
+        fenced_child_group=cleanup.fenced_child_group,
+        readiness=cleanup.readiness,
+        review_lease=cleanup.review_lease,
+        governed_witness=cleanup.governed_witness,
+        payload_marker=(
+            "may-have-started" if status == "verified-post-release-reaped"
+            else "absent"
+        ) if verified else "unverified",
+        status=status,
+    )
+
+
+def _record_review_admission_failure(
+    jobs: Path, attempt_id: str, cleanup: ReviewAdmissionCleanup | None,
+    *, post_release: bool = False,
+) -> bool:
+    """Annotate a claimed row using one lock acquisition, never from abort()."""
+
+    token = _review_admission_cleanup_token(cleanup)
+    if post_release and token.startswith("verified-"):
+        token = "verified-post-release-reaped-v1"
+    try:
+        with Path(f"{jobs}.lock").open("a", encoding="utf-8") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            lines = Path(jobs).read_text(encoding="utf-8", errors="replace").splitlines()
+            matches: list[tuple[int, list[str], dict[str, str]]] = []
+            for index, line in enumerate(lines):
+                fields = line.split("\t")
+                if len(fields) != 6:
+                    continue
+                metadata = parse_registry_metadata(fields[5])
+                if metadata.get("attempt_id") == attempt_id:
+                    matches.append((index, fields, metadata))
+            if len(matches) != 1 or matches[0][2].get("launch_claimed") != "1":
+                return False
+            index, fields, metadata = matches[0]
+            updates = {
+                "launch_outcome": "post-release-failed" if post_release else "never-launched",
+                "review_admission": "aborted" if not post_release else "commit-failed",
+                "review_admission_cleanup": token,
+            }
+            parts = [
+                part for part in fields[5].split(",")
+                if part.split("=", 1)[0] not in updates
+            ]
+            parts.extend(f"{key}={value}" for key, value in sorted(updates.items()))
+            fields[5] = ",".join(parts)
+            lines[index] = "\t".join(fields)
+            _atomic_registry_replace(Path(jobs), lines)
+            return token != "unverified"
+    except (OSError, DispatchContractError):
+        return False
+
+
+
+def adapter_launch_failure_outcome(jobs: Path, attempt_id: str, reason: str) -> str:
+    """Preserve the launch transaction's outcome when an adapter reports it."""
+    rows = []
+    for line in Path(jobs).read_text(encoding="utf-8").splitlines():
+        fields = line.split("\t")
+        if len(fields) == 6 and row_has_attempt(fields[5], attempt_id):
+            rows.append(parse_registry_metadata(fields[5]))
+    if len(rows) != 1:
+        raise DispatchContractError("attempt-row-not-unique", attempt_id)
+    metadata = rows[0]
+    if metadata.get("review_admission") in {"aborted", "commit-failed"}:
+        outcome = metadata.get("launch_outcome", "")
+        if outcome in {"never-launched", "post-release-failed"}:
+            return outcome
+        raise DispatchContractError("review-admission-outcome-missing", attempt_id)
+    return {
+        "attempt-launch-identity-record-failed": "reaped-before-publish",
+        "attempt-launch-cleanup-unverified": "launch-cleanup-unverified",
+    }.get(reason, "never-launched")
 
 def _parent_liveness_evidence(
     jobs: Path, metadata: dict[str, str]
@@ -3941,7 +4460,7 @@ def spawn_claimed_attempt(
     launch_metadata: dict[str, str] | None = None,
     preclaim: Callable[[list[str]], None] | None = None,
     pre_release: Callable[[dict[str, str]], dict[str, str] | None] | None = None,
-    post_claim: Callable[[dict[str, str]], dict[str, str] | None] | None = None,
+    post_claim: Callable[[dict[str, str]], dict[str, str] | PostClaimAdmission | None] | None = None,
 ) -> tuple[subprocess.Popen, dict[str, str]]:
     """Claim one registered attempt while publishing its fenced process.
 
@@ -4147,20 +4666,110 @@ def spawn_claimed_attempt(
                 ),
                 parent_binding.attempt_id,
             )
+        admission: PostClaimAdmission | None = None
+        admission_cleanup: ReviewAdmissionCleanup | None = None
+
+        def abort_admission(reason: str) -> ReviewAdmissionCleanup | None:
+            nonlocal admission_cleanup
+            if admission is None:
+                return None
+            try:
+                admission_cleanup = admission.abort(reason)
+            except BaseException:
+                admission_cleanup = _unverified_review_admission_cleanup()
+            if admission_cleanup is None:
+                admission_cleanup = _unverified_review_admission_cleanup()
+            return admission_cleanup
+
+        def record_admission_failure(*, post_release: bool = False) -> bool:
+            if admission is None and admission_cleanup is None:
+                return True
+            # The external annotator intentionally opens the same lock path
+            # independently.  Drop this fd first so fault injection cannot
+            # turn cleanup into a self-deadlock, then resume the caller's
+            # critical section for the surrounding context manager.
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            try:
+                return _record_review_admission_failure(
+                    jobs, attempt_id, admission_cleanup, post_release=post_release
+                )
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+
+        def finalize_admission_failure(
+            reason: str, *, post_release: bool = False
+        ) -> bool:
+            """Run every external cleanup effect before deriving the verdict."""
+
+            nonlocal admission_cleanup
+            watchdog_owned = admission is not None and bool(
+                admission.metadata.get("review_fence_pid")
+            )
+            # A watchdog owns the fenced child and setsid descendants. Give
+            # that authority the teardown request before observing its death;
+            # killing it first destroys the only complete cleanup owner.
+            # Its outcome seal needs this same registry lock.
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            try:
+                if watchdog_owned:
+                    if not post_release:
+                        try:
+                            os.close(gate_write)
+                        except OSError:
+                            pass
+                    returned_cleanup = abort_admission(reason)
+                    registered_group_empty = (
+                        attempt_scan_namespace_authority(identity)
+                        and proc.poll() is not None
+                        and process_group_observation(int(identity["pgid"])).state == "empty"
+                    )
+                else:
+                    registered_group_empty = _abort_fenced_launch(
+                        proc, -1 if post_release else gate_write, identity["pid_start"],
+                    )
+                    returned_cleanup = abort_admission(reason)
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            if returned_cleanup is not None:
+                admission_cleanup = returned_cleanup
+            admission_cleanup = _merge_review_cleanup_group_proof(
+                admission_cleanup, registered_group_empty
+            )
+            annotation_verified = record_admission_failure(post_release=post_release)
+            cleanup_proof_verified = (
+                admission_cleanup is None
+                or _review_admission_cleanup_token(admission_cleanup) != "unverified"
+            )
+            return (
+                bool(registered_group_empty)
+                and bool(cleanup_proof_verified)
+                and bool(annotation_verified)
+            )
+
         if post_claim is not None:
             # Drop the jobs lock only for launches that actually need producer
             # admission. Ordinary launches retain their historical lock/fence
             # boundary unchanged.
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
             try:
+                raw_post = post_claim(dict(identity))
+                if isinstance(raw_post, PostClaimAdmission):
+                    admission = raw_post
+                    raw_post = raw_post.metadata
+                if raw_post is not None and not isinstance(raw_post, Mapping):
+                    raise DispatchContractError(
+                        "attempt-post-claim-result-invalid", type(raw_post).__name__
+                    )
                 post_metadata = {
                     key: str(value)
-                    for key, value in (post_claim(dict(identity)) or {}).items()
+                    for key, value in (raw_post or {}).items()
                     if value not in (None, "")
                 }
             except BaseException as exc:
-                cleanup_verified = _abort_fenced_launch(
-                    proc, gate_write, identity["pid_start"]
+                if isinstance(getattr(exc, "cleanup", None), ReviewAdmissionCleanup):
+                    admission_cleanup = exc.cleanup
+                cleanup_verified = finalize_admission_failure(
+                    "post-claim-callback-failed"
                 )
                 raise DispatchContractError(
                     "attempt-post-claim-callback-failed"
@@ -4175,8 +4784,8 @@ def spawn_claimed_attempt(
                 if any(char in value for char in ",\t\r\n")
             )
             if invalid_keys or invalid_values:
-                cleanup_verified = _abort_fenced_launch(
-                    proc, gate_write, identity["pid_start"]
+                cleanup_verified = finalize_admission_failure(
+                    "post-claim-metadata-invalid"
                 )
                 raise DispatchContractError(
                     "attempt-post-claim-metadata-invalid"
@@ -4254,8 +4863,11 @@ def spawn_claimed_attempt(
                 _atomic_registry_replace(jobs, fresh_lines)
                 identity.update(post_metadata)
             except (DispatchContractError, OSError) as exc:
-                cleanup_verified = _abort_fenced_launch(
-                    proc, gate_write, identity["pid_start"]
+                # Abort owns only external resources; this row annotation is
+                # deliberately performed here after cleanup and under one
+                # fresh lock acquisition to avoid the jobs-lock cycle.
+                cleanup_verified = finalize_admission_failure(
+                    "post-claim-record-failed"
                 )
                 if isinstance(exc, DispatchContractError):
                     reason, detail = exc.reason, exc.detail
@@ -4268,9 +4880,7 @@ def spawn_claimed_attempt(
         try:
             os.write(gate_write, b"1")
         except OSError as exc:
-            cleanup_verified = _abort_fenced_launch(
-                proc, gate_write, identity["pid_start"]
-            )
+            cleanup_verified = finalize_admission_failure("gate-write-failed")
             raise DispatchContractError(
                 (
                     "attempt-launch-fence-release-failed"
@@ -4281,6 +4891,18 @@ def spawn_claimed_attempt(
             ) from exc
         else:
             os.close(gate_write)
+        if admission is not None:
+            try:
+                admission.commit()
+            except BaseException as exc:
+                cleanup_verified = finalize_admission_failure(
+                    "post-release-commit-failed", post_release=True
+                )
+                raise DispatchContractError(
+                    "attempt-post-claim-commit-failed"
+                    if cleanup_verified else "attempt-launch-cleanup-unverified",
+                    str(exc),
+                ) from exc
         return proc, identity
 
 
@@ -4418,6 +5040,9 @@ def validate_attempt_metadata(
         dispatch_depth = int(metadata.get("dispatch_depth", -1))
     except (TypeError, ValueError) as exc:
         raise DispatchContractError("invalid-attempt-metadata", str(exc)) from exc
+    retry_of = metadata.get("automatic_retry_of")
+    if retry_of is not None and not re.fullmatch(r"att-[A-Za-z0-9._-]{1,240}", str(retry_of)):
+        raise DispatchContractError("retry-predecessor-invalid", str(retry_of))
     if schema_version != ATTEMPT_SCHEMA_VERSION:
         raise DispatchContractError(
             "legacy-attempt-row-read-only",
@@ -4611,12 +5236,40 @@ def headless_attempt_policy(
         raise DispatchContractError("route-dispatch-depth-mismatch", str(node.get("dispatch_depth")))
 
     if route.get("effective_intensity") == "quick":
-        if dispatch_depth != 1 or parent_slug or route_node != "one-shot":
+        # Quick is a THREE-node route now (`frame`, `frame-alternative`,
+        # `one-shot`), so the shape check is a per-node-id table rather than a
+        # pin to a single id. Depth 1 and "no parent slug" still hold for all
+        # three; what differs is the tuple each id must carry.
+        expected_tuple = {
+            "one-shot": ("owner", "_kernel/owner"),
+            "frame": ("frame", "plan/frame"),
+            "frame-alternative": ("frame", "plan/frame"),
+        }.get(str(route_node))
+        if dispatch_depth != 1 or parent_slug or expected_tuple is None:
+            raise DispatchContractError("quick-route-shape-invalid", str(route_node))
+        if (node.get("worker_type"), node.get("unit")) != expected_tuple:
             raise DispatchContractError("quick-route-shape-invalid", str(route_node))
         if node.get("execution_surface") != "registered-headless" or node.get("registered_worker") is not True:
             raise DispatchContractError("quick-route-surface-invalid", str(node.get("execution_surface")))
-        if effective_hop != "same-harness-headless":
+        # The same-harness pin exists to keep quick's WORK pinned to one
+        # harness, so its (nonexistent) fallback budget and artifact lineage do
+        # not fragment. That reason applies to `one-shot` alone; the frame legs
+        # are an advisory pair ahead of the work, and cross-harness is the one
+        # MANDATORY independence axis for this bootstrap layer -- keeping the
+        # restriction system-wide would force both legs onto one harness and
+        # break the cycle's own acceptance criterion.
+        if route_node == "one-shot" and effective_hop != "same-harness-headless":
             raise DispatchContractError("quick-fallback-forbidden", effective_hop)
+        if route_node != "one-shot" and effective_hop not in (
+            "same-harness-headless", "cross-harness-headless"
+        ):
+            raise DispatchContractError("quick-fallback-forbidden", effective_hop)
+        # Unchanged below on purpose: candidate filtering and
+        # `terminal_attempt_limit` are per-(route_id, route_node) serial-attempt
+        # budgets, so three nodes each get their own budget from the same
+        # candidate list -- exactly right without modification. The early
+        # `return` keeps quick out of the `fallback_hops`-required check, which
+        # no depth-1 node can ever satisfy.
         candidates = [
             row
             for row in route.get("registered_headless_candidates") or []
@@ -4633,6 +5286,43 @@ def headless_attempt_policy(
             replacement_attempt_limit=1,
             replacement_notes=frozenset({"dead-protocol", "dead-permission-reject"}),
         )
+        return policy
+
+    # N1: a standard+ frame leg is depth 1 and carries NO `fallback_hops`, by
+    # construction -- the compiler attaches a checked chain only to
+    # dispatch_depth == 2 nodes. Without this early return every standard+
+    # frame registration dies at `route-fallback-hops-missing` while compile and
+    # route-verify both pass: precisely the late-failure class this cycle
+    # exists to remove.
+    #
+    # Why an early return instead of teaching the compiler to attach a chain to
+    # depth-1 nodes: `_fallback_chain` matching keys on `launch_authority`, and
+    # LAUNCH_AUTHORITIES holds only {"conductor", "ancestor-broker"}. A depth-1
+    # frame leg is launched under `launch_authority: "depth-0"`, a DIFFERENT
+    # axis; making a chain match it would mean adding a new enum value that
+    # batch, chain and manifest code all read. That is a far wider and riskier
+    # change than one guarded return, and it was rejected deliberately.
+    if (
+        int(node.get("dispatch_depth", -1)) == 1
+        and node.get("worker_type") == "frame"
+        and node.get("unit") == "plan/frame"
+    ):
+        if execution_surface != "registered-headless" or registered_worker is not True:
+            raise DispatchContractError("frame-route-surface-invalid", str(execution_surface))
+        if effective_hop not in {"same-harness-headless", "cross-harness-headless"}:
+            raise DispatchContractError("frame-route-surface-invalid", effective_hop)
+        # Standard+ HAS checked dispatch evidence (quick does not), so the
+        # requested harness is checked against it rather than taken on trust.
+        supported = [
+            row
+            for row in ((route.get("dispatch_evidence") or {}).get("tuples") or [])
+            if isinstance(row, dict)
+            and row.get("status") == "supported"
+            and row.get("child_harness") == harness
+        ]
+        if not supported:
+            raise DispatchContractError("frame-harness-unsupported", str(harness))
+        policy.update(fallback_hop=effective_hop)
         return policy
 
     chain = node.get("fallback_hops")
@@ -5422,7 +6112,7 @@ def validate_nested_eligibility(
 
 # The human gates whose owner contract implements raise + await (SD-129
 # §13.41.2-5). See `_human_gate_entry_fence`.
-FENCED_HUMAN_GATES = frozenset({"frame-review"})
+FENCED_HUMAN_GATES = frozenset({"frame-review", "preview-disposition"})
 
 
 def _human_gate_entry_fence(
@@ -5450,16 +6140,28 @@ def _human_gate_entry_fence(
     #   1. some node of THIS route raises the gate -- the SD-123 mechanism is
     #      `predecessor.continuation = {kind: human-gate, gate}` ->
     #      BLOCKED_HUMAN_GATE -> release; a binding with no raising continuation
-    #      (`intent-confirmation`) is satisfied by the §0.4 card;
+    #      is satisfied by the §0.4 card;
     #   2. the gate is in FENCED_HUMAN_GATES -- the gates whose owner contract
-    #      actually implements the raise and the wait. The topology declares
-    #      raising continuations for five more gates (`direction-confirmation`,
-    #      `preview-disposition`, `explicit-handback`, `full-run-authorization`,
-    #      `deploy-authorization`) that no capability document, skill or owner
-    #      reference tells an owner to raise; fencing those would turn a
-    #      declaration into a mandatory step nobody documented (round 2, B1).
+    #      actually implements the raise and the wait. The topology still
+    #      declares raising continuations for three more gates
+    #      (`explicit-handback`, `full-run-authorization`, `deploy-authorization`)
+    #      that no capability document, skill or owner reference tells an owner
+    #      to raise; fencing those would turn a declaration into a mandatory
+    #      step nobody documented (round 2, B1).
     # A gate joins the set in the same change that teaches its owner to raise
     # it; `dispatch_contract.test.py` pins the set against the real topology.
+    # The three direction gates the other autopilot recipes used to declare
+    # (`direction-confirmation`, `user-refine-disposition`, `intent-confirmation`)
+    # were absorbed into the one universal `frame-review` once
+    # `capabilities/autopilot-{design,draft,spec}.md` documented the raise.
+    # `preview-disposition` was NOT absorbed (user decision, 2026-09-10): it is
+    # an approval before refine's transaction applies an edit, not a direction,
+    # and it joins this set in the same change that documents its raise in
+    # `capabilities/autopilot-refine.md`. Before that change it was declared but
+    # never fenced, so no refine route ever actually waited on it.
+    # Routes compiled before that absorption are never retro-fitted: this fence
+    # reads only the route object it was handed, so an old-generation route
+    # keeps its own generation's node shape, gate names and bindings.
     raised_gates = {
         str((n.get("continuation") or {}).get("gate"))
         for n in (route.get("nodes") or [])
@@ -5514,6 +6216,199 @@ def _human_gate_entry_fence(
         )
 
 
+
+def recover_preview_gate_after_refusal(route_file, route_node, action, agent_home, jobs,
+                                      error: DispatchContractError) -> str:
+    """Outside the claim lock, turn a proved legacy preview into a real question.
+
+    The original start still fails. This never grants approval or changes a route.
+    Only a current completed review artifact can back the existing gate transaction.
+    """
+    if (action != "start" or error.reason != "human-gate-not-raised"
+            or not error.detail.startswith("preview-disposition:") or not route_file or not jobs):
+        return error.detail
+    try:
+        route = json.loads(Path(route_file).read_text())
+        bindings = [b for b in route.get("human_gate_bindings", [])
+                    if b.get("gate") == "preview-disposition" and b.get("node") == route_node
+                    and b.get("position", "entry") == "entry"]
+        raisers = [n for n in route.get("nodes", [])
+                   if n.get("continuation") == {"kind": "human-gate", "gate": "preview-disposition"}]
+        target = next(n for n in route.get("nodes", []) if n.get("id") == route_node)
+        if len(bindings) != 1 or len(raisers) != 1 or raisers[0]["id"] not in target.get("depends_on", []):
+            raise ValueError("preview-predecessor-unverified")
+        predecessor = raisers[0]
+        paths = [r / "completion" / route["route_id"] / (predecessor["id"] + ".json")
+                 for r in dispatch_state_roots(Path(agent_home), Path(jobs))]
+        marker_path = next(p for p in paths if p.is_file())
+        marker = json.loads(marker_path.read_text())
+        if not completion_marker_is_current(route, predecessor, marker_path, marker):
+            raise ValueError("preview-marker-unverified")
+        ready = completion_attempt_readiness(route, predecessor, marker, Path(jobs))
+        if ready.state != "ready":
+            raise ValueError("preview-attempt-" + ready.state)
+        artifact = Path(marker["evidence"]["path"])
+        if not artifact.is_absolute() or not artifact.is_file():
+            raise ValueError("preview-artifact-unreadable")
+        result = subprocess.run(
+            [sys.executable, str(Path(__file__).with_name("workflow-supervisor.py")),
+             "gate", "--route", str(route_file), "--gate", "preview-disposition",
+             "--block", "--jobs", str(jobs), "--artifact", str(artifact)],
+            text=True, capture_output=True, timeout=15, check=False)
+        if result.returncode:
+            raise ValueError("gate-carrier-refused: " + result.stderr.strip()[:240])
+        payload = json.loads(result.stdout)
+        if payload.get("action") != "blocked" or payload.get("workflow_state") != "BLOCKED_HUMAN_GATE":
+            raise ValueError("gate-block-unverified")
+        return error.detail + "; preview_gate_recovery=blocked delivery=" + str(payload.get("delivery", "-"))
+    except (OSError, ValueError, KeyError, StopIteration, DispatchContractError, subprocess.TimeoutExpired) as exc:
+        return error.detail + "; preview_gate_recovery=unavailable reason=" + str(exc)[:320]
+
+
+def owner_frame_launch_gate(binding, action: str, agent_home: Path,
+                            jobs: Path | None = None) -> None:
+    """The depth-0 frame must finish and be approved before an owner starts."""
+    if binding is None or action != "start":
+        return
+    route = json.loads(Path(binding.route_file).read_text(encoding="utf-8"))
+    frames = {n.get("id") for n in route.get("nodes", [])
+              if n.get("worker_type") == "frame" and n.get("dispatch_depth") == 1}
+    if not frames:
+        return  # Earlier route generations keep their original owner contract.
+    entries = [n for n in route.get("nodes", [])
+               if frames.issubset(set(n.get("depends_on", [])))]
+    if frames != {"frame", "frame-alternative"} or len(entries) != 1:
+        raise DispatchContractError("frame-owner-entry-invalid", str(route.get("route_id")))
+    completion_marker_gate(binding.route_file, entries[0]["id"], action, agent_home, jobs)
+
+
+def _frame_capacity_failures(route: dict, lines: list[str], harnesses: set[str]) -> dict[str, str]:
+    """Exact failed frame attempts can disprove admission-time availability.
+
+    Capacity estimates and a generic exit code are not that proof. Retain the
+    latest attempt per unavailable harness, its native quota result and cleanup.
+    """
+    from codex_dispatch_terminal import inspect_terminal_attempt
+    latest = {}
+    for line in lines:
+        fields = line.split("\t")
+        if len(fields) != 6:
+            continue
+        meta = parse_registry_metadata(fields[5])
+        if (meta.get("route_id") == route["route_id"] and meta.get("route_hash") == route["route_hash"]
+                and meta.get("worker_type") == "frame" and meta.get("dispatch_depth") == "1"
+                and meta.get("harness") in harnesses):
+            latest[meta["harness"]] = (fields, meta)
+    unavailable = {}
+    for harness, (fields, meta) in latest.items():
+        if fields[1] != "done" or terminal_conflict_pending(meta) or meta.get("failure_class") == "pass":
+            continue
+        if attempt_process_quiescence(meta, terminal_receipt=True).state != "quiescent":
+            continue
+        terminal = inspect_terminal_attempt(meta.get("log_file"), worktree=fields[3],
+            artifact_root_metadata=meta.get("artifact_root"))
+        if terminal.get("failure_class") == "capacity":
+            unavailable[harness] = meta["attempt_id"]
+    return unavailable
+
+
+def _frame_pair_attempt_gate(route: dict, node: dict, markers: dict,
+                             jobs: Path, registry_lines: list[str] | None) -> None:
+    """Compare the exact completed attempts, never a declared diversity label."""
+    frames = [n for n in route.get("nodes", [])
+              if n.get("id") in node.get("depends_on", [])
+              and n.get("worker_type") == "frame" and n.get("dispatch_depth") == 1]
+    if not frames:
+        return
+    if {n.get("id") for n in frames} != {"frame", "frame-alternative"}:
+        raise DispatchContractError("frame-pair-incomplete", str(node.get("id")))
+    try:
+        lines = registry_lines if registry_lines is not None else jobs.read_text().splitlines()
+    except OSError as exc:
+        raise DispatchContractError("frame-attempt-unverifiable", "registry-unreadable") from exc
+    attempts, harnesses = [], []
+    for frame in frames:
+        attempt = markers[frame["id"]].get("attempt_id")
+        rows = []
+        for line in lines:
+            fields = line.split("\t")
+            if len(fields) == 6:
+                metadata = parse_registry_metadata(fields[5])
+                if metadata.get("attempt_id") == attempt:
+                    rows.append((fields, metadata))
+        if len(rows) != 1:
+            raise DispatchContractError("frame-attempt-unverifiable", str(attempt))
+        fields, metadata = rows[0]
+        try:
+            identity = registered_node_identity(metadata, frame)
+        except ValueError as exc:
+            raise DispatchContractError("frame-attempt-unverifiable", str(attempt)) from exc
+        if (fields[1] != "done" or metadata.get("note") != "completed-marker"
+                or identity !=
+                   (route.get("route_id"), route.get("route_hash") or "", frame["id"])
+                or metadata.get("worker_type") != "frame"
+                or metadata.get("harness") not in {"codex", "claude", "opencode"}):
+            raise DispatchContractError("frame-attempt-unverifiable", str(attempt))
+        attempts.append(attempt)
+        harnesses.append(metadata["harness"])
+    if len(set(attempts)) != 2:
+        raise DispatchContractError("frame-attempt-duplicate", str(attempts))
+    if route.get("effective_intensity") == "quick":
+        candidates, field = route.get("registered_headless_candidates") or [], "harness"
+    else:
+        candidates = (route.get("dispatch_evidence") or {}).get("tuples") or []
+        field = "child_harness"
+    supported = {r.get(field) for r in candidates
+                 if isinstance(r, dict) and r.get("status") == "supported"}
+    supported &= {"codex", "claude", "opencode"}
+    if not supported or not set(harnesses).issubset(supported):
+        raise DispatchContractError("frame-harness-unsupported", str(harnesses))
+    if len(supported) > 1 and len(set(harnesses)) != 2:
+        missing = supported - set(harnesses)
+        unavailable = _frame_capacity_failures(route, lines, missing)
+        # Selection may already have skipped quota on a different route.
+        # Reuse that scoped evidence; do not require another doomed launch to
+        # manufacture a local failure. Positive gate admission additionally
+        # requires exact cleanup, unlike a negative selection exclusion.
+        from dispatch_capacity_evidence import active_limits
+        quota_by_frame = [active_limits(jobs, profile=f.get("model_profile"), registry_lines=lines) for f in frames]
+        quota_attempts = set()
+        for harness in missing - set(unavailable):
+            proofs = [limits.get(harness) for limits in quota_by_frame]
+            if not all(proofs):
+                continue
+            ids = {proof["attempt_id"] for proof in proofs}
+            exact = []
+            active_here = False
+            for line in lines:
+                fields = line.split("\t")
+                if len(fields) != 6:
+                    continue
+                meta = parse_registry_metadata(fields[5])
+                if (meta.get("route_id") == route["route_id"] and meta.get("harness") == harness
+                        and fields[1] in {"open", "running"}):
+                    active_here = True
+                if meta.get("attempt_id") in ids:
+                    exact.append((fields, meta))
+            if active_here or len(exact) != len(ids) or any(
+                    fields[1] != "done" or terminal_conflict_pending(meta)
+                    or attempt_process_quiescence(meta, terminal_receipt=True).state != "quiescent"
+                    for fields, meta in exact):
+                continue
+            unavailable[harness] = sorted(ids)[0]
+            quota_attempts.update(ids)
+        if set(unavailable) != missing:
+            raise DispatchContractError("frame-cross-harness-required", str(harnesses))
+        from dispatch_degradation import record_degradation
+        recorded = record_degradation(route_id=route["route_id"], route_hash=route["route_hash"],
+            route_node=node["id"], dispatch_depth=1, writer="dispatch_contract.py", jobs=jobs,
+            fallback_hop="same-harness-headless", execution_surface="registered-headless",
+            reason="frame-single-available-harness", prior_attempt_ids=sorted(set(unavailable.values()) | quota_attempts),
+            attempt_trace=attempts, harness=harnesses[0], detail=json.dumps(unavailable, sort_keys=True))
+        if not recorded:
+            raise DispatchContractError("frame-degradation-record-pending", "retry the same gate after restoring state storage")
+
+
 def completion_marker_gate(
     route_file: str | None,
     route_node: str | None,
@@ -5523,6 +6418,7 @@ def completion_marker_gate(
     *,
     registry_lines: list[str] | None = None,
     attempt_id: str | None = None,
+    _raising_frame_gate: bool = False,
 ) -> None:
     """SD-56 decision gate: a record-bound ``--start`` must not spawn a node
     whose ``depends_on`` predecessors have no completion marker, nor one whose
@@ -5553,6 +6449,7 @@ def completion_marker_gate(
     if node is None:
         return
     missing = []
+    markers = {}
     blocked: list[tuple[str, AttemptReadiness]] = []
     for dep in node.get("depends_on", []):
         marker_path = next(
@@ -5578,6 +6475,7 @@ def completion_marker_gate(
         if dep_node is None or not completion_marker_is_current(route, dep_node, marker_path, marker):
             missing.append(dep)
             continue
+        markers[dep] = marker
         readiness = completion_attempt_readiness(
             route,
             dep_node,
@@ -5589,7 +6487,15 @@ def completion_marker_gate(
             blocked.append((dep, readiness))
     if missing:
         raise DispatchContractError("completion-marker-missing", ",".join(missing))
-    _human_gate_entry_fence(route, node, jobs)
+    if not blocked:
+        _frame_pair_attempt_gate(route, node, markers,
+                                 jobs or (resolve_dispatch_state_root(agent_home) / "jobs.log"),
+                                 registry_lines)
+    if _raising_frame_gate:
+        if set(node.get("depends_on", [])) != {"frame", "frame-alternative"}:
+            raise DispatchContractError("frame-owner-entry-invalid", str(node.get("id")))
+    else:
+        _human_gate_entry_fence(route, node, jobs)
     _auxiliary_arbitration_gate(route, node, agent_home, jobs)
     if blocked:
         reason = (
@@ -5725,18 +6631,11 @@ def _sibling_attempt_gate(
     registry_lines: list[str] | None = None,
     attempt_id: str | None = None,
 ) -> None:
-    """SD-79: refuse to launch over a previous attempt of *this* node that still runs.
+    """Check the latest node execution using the shared lifecycle decision.
 
-    The ``depends_on`` loop above cannot cover this. A retry, a fallback hop, and
-    a capacity re-selection are all further attempts at the *same* node, so they
-    never appear in any node's ``depends_on`` list and that loop structurally
-    never fires for them. This is also not
-    ``completion_attempt_readiness``'s ``conflicting_active`` scan: that one asks
-    whether a *registry status word* says another attempt is still open, while
-    this one asks the operating system whether the previous attempt's processes
-    are still alive. A row closed by a false death verdict looks quiet to the
-    first check and loud to this one -- which is the whole failure this repairs.
-    Do not merge them.
+    This preflight is advisory to the atomic claim boundary. It cannot grant
+    retry permission or override a committed result; it explains outstanding
+    cleanup before the claimant reaches the jobs lock.
     """
 
     if registry_lines is None:
@@ -5774,7 +6673,9 @@ def _sibling_attempt_gate(
         sibling_metadata,
         terminal_receipt=sibling_status in {"done", "killed", "cancelled"},
     )
-    if process.state == "quiescent":
+    decision = decide_attempt(sibling_status, sibling_metadata,
+                              process_state=process.state, process_reason=process.reason)
+    if decision.action not in {"wait", "recover"}:
         return
     reason = (
         "prior-attempt-still-live"
@@ -5911,6 +6812,26 @@ def completion_marker_is_current(
         return False
 
 
+def completion_conflict_attempt(marker: Mapping[str, object], registry_lines: list[str]) -> str:
+    """Find a recorded consumption hold without reclassifying an old marker.
+
+    Semantic history may outlive its process registry. Actual launch still
+    requires completion_attempt_readiness and its current execution proof.
+    """
+    for line in registry_lines:
+        fields = line.split("\t")
+        if len(fields) != 6:
+            continue
+        meta = parse_registry_metadata(fields[5])
+        same_chain = (marker.get("stage_authority") == "owner-chain"
+                      and marker.get("session_chain_id")
+                      and meta.get("session_chain_id") == marker["session_chain_id"])
+        same_attempt = marker.get("attempt_id") and meta.get("attempt_id") == marker["attempt_id"]
+        if (same_chain or same_attempt) and terminal_conflict_pending(meta):
+            return meta.get("attempt_id", "")
+    return ""
+
+
 def completion_attempt_readiness(
     route: dict[str, object],
     node: dict[str, object],
@@ -5922,6 +6843,13 @@ def completion_attempt_readiness(
     """Combine a current semantic marker with its exact governed process state."""
 
     if marker.get("stage_authority") == "owner-chain":
+        try:
+            chain_rows = registry_lines if registry_lines is not None else jobs.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return AttemptReadiness("unverifiable", "registry-unreadable")
+        conflict = completion_conflict_attempt(marker, chain_rows)
+        if conflict:
+            return AttemptReadiness("unverifiable", "terminal-evidence-conflict", conflict)
         return AttemptReadiness("ready", "subsession-chain-quiescence-verified-at-stage-gate")
     if node.get("kind") == "resource-runner" or marker.get("registered_worker") is False:
         return AttemptReadiness("ready", "semantic-terminal-no-registered-process")
@@ -5967,6 +6895,8 @@ def completion_attempt_readiness(
             "unverifiable", f"marker-attempt-row-count-{len(exact)}", attempt_id
         )
     fields, metadata = exact[0]
+    if terminal_conflict_pending(metadata):
+        return AttemptReadiness("unverifiable", "terminal-evidence-conflict", attempt_id)
     try:
         validate_attempt_metadata(metadata)
     except DispatchContractError as exc:
@@ -6006,10 +6936,27 @@ def _immutable_attempt_identity(fields: list[str]) -> tuple[object, ...]:
             (key, value)
             for key, value in metadata.items()
             if key not in ATTEMPT_MUTABLE_METADATA
+            and key not in FOREGROUND_OUTCOME_KEYS
+            and key != "review_process_outcome_b64"
         )
     )
     return fields[2], fields[3], fields[4], immutable_metadata
 
+
+
+def launched_attempt_identity(fields: list[str]) -> tuple[object, ...]:
+    """Compare an admitted attempt across its one terminal/delivery commit.
+
+    Reuse registry mutation vocabularies; terminal evidence is added at close,
+    whereas the admitted process identity and lifecycle must stay unchanged.
+    """
+    base = _immutable_attempt_identity(fields)
+    metadata = parse_registry_metadata(fields[5])
+    return (*base[:3],
+            tuple((key, value) for key, value in base[3]
+                  if key not in ATTEMPT_TERMINAL_EVIDENCE_KEYS),
+            tuple((key, metadata.get(key, "")) for key in sorted(_PROCESS_IDENTITY_METADATA_KEYS)),
+            metadata.get("launch_lifecycle", ""))
 
 def _atomic_registry_replace(jobs: Path, lines: list[str]) -> None:
     """Replace the registry after fsync without exposing a truncated file."""
@@ -6030,6 +6977,298 @@ def _atomic_registry_replace(jobs: Path, lines: list[str]) -> None:
             os.unlink(tmp_name)
         except FileNotFoundError:
             pass
+
+
+_FOREGROUND_SIGNED_INTEGER = re.compile(r"(?:0|-?[1-9][0-9]*)\Z")
+_FOREGROUND_FAILURE_SUFFIX = re.compile(r"(?:exit|signal)-([1-9][0-9]*)\Z")
+
+
+def attempt_raw_row_sha256(raw_row: str) -> str:
+    """Hash one exact raw registry row, without normalizing its bytes."""
+
+    if not isinstance(raw_row, str):
+        raise TypeError("raw registry row must be text")
+    return hashlib.sha256(raw_row.encode("utf-8")).hexdigest()
+
+
+def _foreground_outcome_values_from_pipe(pipe: str) -> dict[str, str] | None:
+    """Validate the foreground namespace and return canonical values."""
+
+    found: dict[str, str] = {}
+    for part in pipe.split(","):
+        key = part.split("=", 1)[0]
+        if not key.startswith("foreground_"):
+            continue
+        if "=" not in part or key not in FOREGROUND_OUTCOME_KEYS:
+            raise DispatchContractError("foreground-outcome-malformed", key)
+        if key in found:
+            raise DispatchContractError("foreground-outcome-malformed", key)
+        found[key] = part.split("=", 1)[1]
+    if not found:
+        return None
+    if set(found) != set(FOREGROUND_OUTCOME_KEYS):
+        raise DispatchContractError(
+            "foreground-outcome-partial", ",".join(sorted(found))
+        )
+    if found["foreground_outcome_schema"] != "1":
+        raise DispatchContractError("foreground-outcome-malformed", "foreground_outcome_schema")
+    if found["foreground_outcome_ready"] != "1":
+        raise DispatchContractError("foreground-outcome-malformed", "foreground_outcome_ready")
+    if found["foreground_outcome_source"] != FOREGROUND_OUTCOME_SOURCE:
+        raise DispatchContractError("foreground-outcome-malformed", "foreground_outcome_source")
+    exit_text = found["foreground_process_exit"]
+    if not _FOREGROUND_SIGNED_INTEGER.fullmatch(exit_text):
+        raise DispatchContractError("foreground-outcome-malformed", "foreground_process_exit")
+    failure = found["foreground_process_failure"]
+    if failure == "none":
+        pass
+    elif failure in {"timeout", "parent-terminated", "process-identity-unavailable"}:
+        pass
+    else:
+        match = _FOREGROUND_FAILURE_SUFFIX.fullmatch(failure)
+        if match is None:
+            raise DispatchContractError("foreground-outcome-malformed", "foreground_process_failure")
+    try:
+        exit_code = int(exit_text)
+    except ValueError as exc:  # pragma: no cover - guarded by the regex
+        raise DispatchContractError("foreground-outcome-malformed", "foreground_process_exit") from exc
+    if (failure == "none") != (exit_code == 0):
+        raise DispatchContractError("foreground-outcome-malformed", "none-exit-relation")
+    if failure.startswith(("exit-", "signal-")):
+        suffix = int(failure.split("-", 1)[1])
+        if failure.startswith("exit-") and exit_code != suffix:
+            raise DispatchContractError("foreground-outcome-malformed", "exit-relation")
+    if found["foreground_group_empty"] not in {"0", "1"}:
+        raise DispatchContractError("foreground-outcome-malformed", "foreground_group_empty")
+    return {key: found[key] for key in FOREGROUND_OUTCOME_KEYS}
+
+
+def _foreground_outcome_values(
+    *, exit_code: object, failure: object, group_empty: object
+) -> dict[str, str]:
+    if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+        raise DispatchContractError("foreground-outcome-malformed", "foreground_process_exit")
+    if not isinstance(failure, str):
+        raise DispatchContractError("foreground-outcome-malformed", "foreground_process_failure")
+    storage_failure = "none" if failure == "" else failure
+    if storage_failure == "none":
+        pass
+    elif storage_failure in {"timeout", "parent-terminated", "process-identity-unavailable"}:
+        pass
+    elif _FOREGROUND_FAILURE_SUFFIX.fullmatch(storage_failure) is None:
+        raise DispatchContractError("foreground-outcome-malformed", "foreground_process_failure")
+    if (storage_failure == "none") != (exit_code == 0):
+        raise DispatchContractError("foreground-outcome-malformed", "none-exit-relation")
+    if storage_failure.startswith("exit-"):
+        if exit_code != int(storage_failure.split("-", 1)[1]):
+            raise DispatchContractError("foreground-outcome-malformed", "exit-relation")
+    if not isinstance(group_empty, bool):
+        raise DispatchContractError("foreground-outcome-malformed", "foreground_group_empty")
+    return {
+        "foreground_outcome_schema": "1",
+        "foreground_outcome_ready": "1",
+        "foreground_process_exit": str(exit_code),
+        "foreground_process_failure": storage_failure,
+        "foreground_group_empty": "1" if group_empty else "0",
+        "foreground_outcome_source": FOREGROUND_OUTCOME_SOURCE,
+    }
+
+
+def _review_watchdog_outcome_identity(metadata: Mapping[str, str]) -> dict[str, str]:
+    return {key: metadata.get(key, "") for key in (
+        "attempt_id", "pid", "pid_start", "pgid", "pid_ns", "pid_observer_ns",
+        "review_watchdog_budget_digest", "review_readiness_digest",
+        "review_governed_lease_nonce",
+    )}
+
+
+def detached_review_outcome_from_pipe(pipe: str) -> dict[str, str] | None:
+    """Read the watchdog's outcome; never derive process success from prose."""
+    metadata = _parse_review_metadata(pipe)
+    encoded = metadata.get("review_process_outcome_b64")
+    if encoded is None:
+        return None
+    try:
+        raw = base64.b64decode(encoded, altchars=b"-_", validate=True)
+        body = json.loads(raw)
+        if not isinstance(body, dict) or set(body) != {"source", "identity", "outcome"}:
+            raise ValueError("shape")
+        if body["source"] != "review-watchdog-v1":
+            raise ValueError("source")
+        expected = _review_watchdog_outcome_identity(metadata)
+        if body["identity"] != expected or not all(expected.values()):
+            raise ValueError("identity")
+        outcome = body["outcome"]
+        if not isinstance(outcome, dict) or set(outcome) != set(FOREGROUND_OUTCOME_KEYS):
+            raise ValueError("outcome")
+        return _foreground_outcome_values_from_pipe(",".join(f"{k}={v}" for k, v in outcome.items()))
+    except (ValueError, TypeError, UnicodeError) as exc:
+        raise DispatchContractError("review-process-outcome-invalid") from exc
+
+
+def seal_detached_review_result(
+    jobs: str | Path, attempt_id: str, *, budget_digest: str, nonce: str,
+    exit_code: int,
+) -> None:
+    """Only the exact watchdog seals its result; the reaper closes the row.
+
+    The reader independently proves quiescence. A killed watchdog leaves no
+    result, which cannot authorize PASS even when the log claims success.
+    """
+    current = process_launch_identity(os.getpid())
+    failure = ("" if exit_code == 0 else "timeout" if exit_code == 124
+               else f"signal-{-exit_code}" if exit_code < 0 else f"exit-{exit_code}")
+    outcome = _foreground_outcome_values(exit_code=exit_code, failure=failure, group_empty=False)
+    jobs = Path(jobs)
+    ensure_global_registry_writable(jobs)
+    with Path(f"{jobs}.lock").open("a", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        lines = jobs.read_text(encoding="utf-8").splitlines()
+        matches = _foreground_row(lines, attempt_id)
+        if len(matches) != 1:
+            raise DispatchContractError("review-process-outcome-row-not-unique")
+        index, fields, metadata = matches[0]
+        metadata = _parse_review_metadata(fields[5])
+        if (metadata.get("worker_type") != "review"
+                or metadata.get("dispatch_depth") != "1"
+                or any(metadata.get(key) for key in ROUTE_IDENTITY_METADATA_KEYS)):
+            return  # Route-bound reviews retain their marker completion path.
+        if (fields[1] not in {"open", "running"}
+                or metadata.get("launch_lifecycle") != "detached"
+                or metadata.get("review_watchdog_budget_digest") != budget_digest
+                or metadata.get("review_governed_lease_nonce") != nonce
+                or metadata.get("review_admission") != "prepared"
+                or metadata.get("launch_claimed") != "1"
+                or any(metadata.get(key) != current.get(key) for key in
+                       ("pid", "pid_start", "pgid", "pid_ns", "pid_observer_ns"))
+                or not foreground_review_eligible(
+                    {**metadata, "launch_lifecycle": "foreground-scoped"},
+                    expected_attempt_id=attempt_id, expected_pid=os.getpid(),
+                    expected_pid_start=current.get("pid_start", ""), expected_pgid=os.getpid())):
+            raise DispatchContractError("review-process-outcome-binding-mismatch")
+        identity = _review_watchdog_outcome_identity(metadata)
+        if not all(identity.values()):
+            raise DispatchContractError("review-process-outcome-binding-mismatch")
+        existing = detached_review_outcome_from_pipe(fields[5])
+        if existing is not None:
+            if existing != outcome:
+                raise DispatchContractError("review-process-outcome-conflict")
+            return
+        body = {"source": "review-watchdog-v1", "identity": identity, "outcome": outcome}
+        encoded = base64.urlsafe_b64encode(json.dumps(body, sort_keys=True, separators=(",", ":")).encode()).decode()
+        fields[5] += ",review_process_outcome_b64=" + encoded
+        lines[index] = "\t".join(fields)
+        _atomic_registry_replace(jobs, lines)
+
+
+def _foreground_row(
+    lines: list[str], attempt_id: str
+) -> list[tuple[int, list[str], dict[str, str]]]:
+    matches: list[tuple[int, list[str], dict[str, str]]] = []
+    for index, line in enumerate(lines):
+        fields = line.split("\t")
+        if len(fields) != 6:
+            continue
+        metadata = parse_registry_metadata(fields[5])
+        if metadata.get("attempt_id") == attempt_id:
+            matches.append((index, fields, metadata))
+    return matches
+
+
+def seal_foreground_result(
+    jobs: str | Path,
+    attempt_id: str,
+    pid: int,
+    pid_start: str,
+    pgid: int,
+    *,
+    exit_code: object,
+    failure: object,
+    group_empty: object,
+) -> SealedForegroundOutcome:
+    """Atomically persist and revalidate one foreground review outcome."""
+
+    if not attempt_id:
+        raise DispatchContractError("foreground-outcome-attempt-required", "attempt_id")
+    desired = _foreground_outcome_values(
+        exit_code=exit_code, failure=failure, group_empty=group_empty
+    )
+    jobs = Path(jobs)
+    ensure_global_registry_writable(jobs)
+    with Path(f"{jobs}.lock").open("a", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        lines = jobs.read_text(encoding="utf-8", errors="replace").splitlines()
+        matches = _foreground_row(lines, attempt_id)
+        if not matches:
+            raise DispatchContractError("foreground-outcome-row-not-found", "count=0")
+        if len(matches) != 1:
+            raise DispatchContractError(
+                "foreground-outcome-row-ambiguous", f"count={len(matches)}"
+            )
+        index, fields, metadata = matches[0]
+        validate_attempt_metadata(metadata)
+        if fields[1] not in {"open", "running"}:
+            raise DispatchContractError("foreground-outcome-row-not-open", fields[1])
+        if not foreground_review_eligible(
+            metadata,
+            expected_attempt_id=attempt_id,
+            expected_pid=pid,
+            expected_pid_start=pid_start,
+            expected_pgid=pgid,
+        ):
+            eligibility_reason = _foreground_review_eligibility_reason(
+                metadata,
+                expected_attempt_id=attempt_id,
+                expected_pid=pid,
+                expected_pid_start=pid_start,
+                expected_pgid=pgid,
+            )
+            if eligibility_reason == "binding":
+                raise DispatchContractError("foreground-outcome-binding-mismatch", "binding")
+            raise DispatchContractError("foreground-outcome-ineligible", eligibility_reason)
+        existing = _foreground_outcome_values_from_pipe(fields[5])
+        if existing is not None and existing != desired:
+            raise DispatchContractError("foreground-outcome-conflict", "values")
+        identity = _immutable_attempt_identity(fields)
+        if existing is None:
+            fields[5] = fields[5] + "," + ",".join(
+                f"{key}={value}" for key, value in desired.items()
+            )
+            lines[index] = "\t".join(fields)
+            _atomic_registry_replace(jobs, lines)
+
+        readback_lines = jobs.read_text(encoding="utf-8", errors="replace").splitlines()
+        readback = _foreground_row(readback_lines, attempt_id)
+        if len(readback) == 0:
+            raise DispatchContractError("foreground-outcome-readback-mismatch", "count=0")
+        if len(readback) != 1:
+            raise DispatchContractError(
+                "foreground-outcome-readback-mismatch", f"count={len(readback)}"
+            )
+        _, readback_fields, readback_metadata = readback[0]
+        try:
+            if (
+                _immutable_attempt_identity(readback_fields) != identity
+                or readback_fields[1] not in {"open", "running"}
+                or not foreground_review_eligible(
+                    readback_metadata,
+                    expected_attempt_id=attempt_id,
+                    expected_pid=pid,
+                    expected_pid_start=pid_start,
+                    expected_pgid=pgid,
+                )
+                or _foreground_outcome_values_from_pipe(readback_fields[5]) != desired
+            ):
+                raise DispatchContractError("foreground-outcome-readback-mismatch", "row")
+        except DispatchContractError as exc:
+            if exc.reason == "foreground-outcome-readback-mismatch":
+                raise
+            raise DispatchContractError("foreground-outcome-readback-mismatch", exc.detail) from exc
+        raw = readback_fields
+        return SealedForegroundOutcome(
+            values=MappingProxyType(dict(desired)),
+            attempt_raw_row_sha256=attempt_raw_row_sha256("\t".join(raw)),
+        )
 
 
 def _cancellation_quiescence_receipt_record(
@@ -6609,7 +7848,6 @@ def marker_bound_process_identity(
 # checked supervisor closed a depth-1 owner", and one of them (SD-94 marker
 # eligibility, `capability-route.py`) grants a privilege a sub-session must never
 # have.
-SUBSESSION_NOTE = "completed-subsession"
 SUBSESSION_TERMINAL_CLASSIFIER = "completion-join-subsession-terminal-v1"
 SUBSESSION_CHAIN_REFUSAL_CLASSIFIER = "subsession-chain-refusal-v1"
 
@@ -6617,8 +7855,7 @@ SUBSESSION_CHAIN_REFUSAL_CLASSIFIER = "subsession-chain-refusal-v1"
 # module because `dispatch_completion_join` imports this one, never the reverse.
 # Consumers that ask "did this attempt succeed?" use this set; the two that ask
 # "*which producer* closed this row" (SD-94 marker eligibility and
-# `supervisor_terminal` below) keep their narrow literal on purpose.
-SUCCESS_NOTES = frozenset({"completed-marker", "completed-supervisor", SUBSESSION_NOTE})
+# legacy terminal proof below) keep their narrow literal on purpose.
 
 
 def row_is_subsession(metadata: dict[str, str]) -> bool:
@@ -6962,17 +8199,24 @@ def marker_bound_delivery_transaction(
             quiescent=quiescent,
             owned_children=owned_open_count(refreshed),
             advanced=advanced,
-            supervisor_terminal=(
-                refreshed_metadata.get("note") == "completed-supervisor"
-                and refreshed_metadata.get("failure_class") == "pass"
+            completion_proven=(
+                _delivery_commit_proven(refreshed_metadata)
+                if refreshed_metadata.get("delivery_intent") else
+                # Read compatibility for rows predating the one-time receipt.
+                # New terminal kinds use the common committed receipt, not
+                # another producer-specific boolean in every carrier.
+                bool(refreshed_marker is not None and refreshed_marker_digest)
+                or (refreshed_metadata.get("note") == "completed-supervisor"
+                    and refreshed_metadata.get("worker_type") == "owner"
+                    and refreshed_metadata.get("dispatch_depth") == "1"
+                    and refreshed_metadata.get("failure_class") == "pass")
+                or (refreshed_fields[1] == "done"
+                    and refreshed_metadata.get("note") == SUBSESSION_NOTE
+                    and refreshed_metadata.get("failure_class") == "pass"
+                    and refreshed_metadata.get("classifier_source") == SUBSESSION_TERMINAL_CLASSIFIER
+                    and row_is_subsession(refreshed_metadata))
             ),
-            subsession_terminal=(
-                refreshed_fields[1] == "done"
-                and refreshed_metadata.get("note") == SUBSESSION_NOTE
-                and refreshed_metadata.get("failure_class") == "pass"
-                and refreshed_metadata.get("classifier_source") == SUBSESSION_TERMINAL_CLASSIFIER
-                and row_is_subsession(refreshed_metadata)
-            ),
+            terminal_conflict=terminal_conflict_pending(refreshed_metadata),
         )
 
 
@@ -7021,13 +8265,38 @@ def mark_attempt_launch_started(jobs: Path, attempt_id: str, pid: int) -> None:
             )
         index, fields, metadata = matches[0]
         validate_attempt_metadata(metadata)
-        expected_start = metadata.get("pid_start", "")
+        # A detached governed review stores the watchdog as the attempt PID.
+        # Its payload fence is the separately sealed child, whose exact parent
+        # must still be that live watchdog. Other launches retain the old tuple.
+        fence = metadata
+        if metadata.get("review_admission") == "prepared" and metadata.get("launch_lifecycle") == "detached":
+            metadata = _parse_review_metadata(fields[5])
+            if (metadata.get("worker_type") != "review"
+                    or metadata.get("review_governed_lease") != REVIEW_GOVERNED_LEASE_KIND
+                    or not REVIEW_GOVERNED_LEASE_NONCE_RE.fullmatch(metadata.get("review_governed_lease_nonce", ""))
+                    or not metadata.get("review_readiness_digest")
+                    or not metadata.get("review_watchdog_budget_digest")
+                    or pid != os.getpid()
+                    or metadata.get("pid") != str(os.getppid())
+                    or not process_identity_is_live(os.getppid(), metadata.get("pid_start", ""))
+                    or exact_process_group_signal_authority(os.getppid(), metadata.get("pid_start", "")) != "authoritative"):
+                raise DispatchContractError("attempt-launch-fence-identity-mismatch", attempt_id)
+            parent = process_launch_identity(os.getppid())
+            if any(metadata.get(key) != parent.get(key) for key in
+                   ("pid", "pid_start", "pgid", "pid_ns", "pid_observer_ns")):
+                raise DispatchContractError("attempt-launch-fence-identity-mismatch", attempt_id)
+            current = process_launch_identity(pid)
+            fence = {key: metadata.get("review_fence_" + key, "") for key in
+                     ("pid", "pid_start", "pgid", "pid_ns", "pid_observer_ns")}
+            if any(not value or current.get(key) != value for key, value in fence.items()):
+                raise DispatchContractError("attempt-launch-fence-identity-mismatch", attempt_id)
+        expected_start = fence.get("pid_start", "")
         if (
             fields[1] not in {"open", "running"}
             or metadata.get("launch_claimed") != "1"
             or metadata.get("launch_fence") != "registry-v1"
-            or metadata.get("pid") != str(pid)
-            or metadata.get("pgid") != str(pid)
+            or fence.get("pid") != str(pid)
+            or fence.get("pgid") != str(pid)
             or not expected_start
             or not process_identity_is_live(pid, expected_start)
             or exact_process_group_signal_authority(pid, expected_start)
@@ -7093,6 +8362,43 @@ def recover_unstarted_attempt(jobs: Path, attempt_id: str) -> bool:
         return True
 
 
+def _automatic_retry_admission(lines: list[str], metadata: dict[str, str]) -> None:
+    """The jobs lock arbitrates retries against the committed predecessor.
+
+    Observers propose a predecessor, never permission. Distinct consumers of
+    one failure converge on one successor; explicit review rounds have no
+    automatic_retry_of binding and keep their separate workflow semantics.
+    """
+    prior = metadata.get("automatic_retry_of")
+    if not prior:
+        return
+    predecessor = None
+    for line in lines:
+        fields = line.split("\t")
+        if len(fields) != 6:
+            continue
+        candidate = parse_registry_metadata(fields[5])
+        if (candidate.get("automatic_retry_of") == prior
+                and candidate.get("attempt_id") != metadata.get("attempt_id")
+                and (candidate.get("launch_claimed") == "1" or fields[1] not in {"open", "running"})):
+            raise DispatchContractError("retry-already-claimed",
+                                        f"responsible_attempt={candidate.get('attempt_id')}")
+        if candidate.get("attempt_id") == prior:
+            if predecessor is not None:
+                raise DispatchContractError("retry-predecessor-ambiguous", prior)
+            predecessor = (fields[1], candidate)
+    if predecessor is None:
+        raise DispatchContractError("retry-predecessor-missing", prior)
+    status, source = predecessor
+    if any(source.get(k) != metadata.get(k) for k in ("route_id", "route_node", "parent_attempt_id")):
+        raise DispatchContractError("retry-predecessor-binding-mismatch", prior)
+    proof = attempt_process_quiescence(source, terminal_receipt=status in {"done", "killed", "cancelled"})
+    decision = decide_attempt(status, source, process_state=proof.state, process_reason=proof.reason)
+    if not decision.retry_allowed:
+        raise DispatchContractError("retry-predecessor-not-retryable",
+            f"attempt={prior} outcome={decision.outcome} responsible={decision.responsible} action={decision.action}")
+
+
 def claim_attempt_row(
     jobs: Path,
     attempt_id: str,
@@ -7142,6 +8448,18 @@ def claim_attempt_row(
                 terminal_owner)
         if mutation_precheck is not None:
             mutation_precheck(lines)
+        # A serial successor consumes its predecessors just as a DAG edge
+        # consumes markers. Recheck the same conflict policy at actual claim,
+        # including an observation arriving after the coordinator's preview.
+        if launch and row_metadata.get("session_chain_id"):
+            for existing in lines:
+                fields = existing.split("\t")
+                if len(fields) != 6:
+                    continue
+                prior = parse_registry_metadata(fields[5])
+                if (prior.get("session_chain_id") == row_metadata["session_chain_id"]
+                        and terminal_conflict_pending(prior)):
+                    raise DispatchContractError("terminal-evidence-conflict", prior.get("attempt_id", ""))
         for index, existing in enumerate(lines):
             fields = existing.split("\t")
             if len(fields) == 6 and row_has_attempt(fields[5], attempt_id):
@@ -7154,6 +8472,7 @@ def claim_attempt_row(
                     )
                 if not launch or metadata.get("launch_claimed") == "1" or fields[1] != "open":
                     return False
+                _automatic_retry_admission(lines, row_metadata)
                 if preclaim is not None:
                     preclaim(lines)
                 pipe = ",".join(part for part in fields[5].split(",") if not part.startswith("launch_claimed="))
@@ -7209,6 +8528,8 @@ def claim_attempt_row(
                     "quick-replacement-attempts-exhausted",
                     f"replacement_attempts={len(replacement_attempts)} limit={replacement_attempt_limit}",
                 )
+        if launch:
+            _automatic_retry_admission(lines, row_metadata)
         if launch and preclaim is not None:
             preclaim(lines)
         row_fields[5] += f",launch_claimed={1 if launch else 0}"
@@ -7233,20 +8554,6 @@ def _row_identity(fields: list[str]) -> tuple[str, ...] | None:
     return None
 
 
-# SD-111 D-2/C-2: duplicated (not imported) from dispatch_completion_join's
-# CANONICAL_RECEIPT_KEYS/CANONICAL_CHILD_KEYS/canonical_receipt_digest/
-# seal_delivery_receipt -- dispatch_completion_join imports THIS module, so
-# the reverse import would be circular. Keep every copy of this vocabulary
-# (here, dispatch_completion_join.py, dispatch_pending_delivery.py)
-# synchronized by hand; §11 forbids widening it.
-_CANONICAL_RECEIPT_KEYS = frozenset({
-    "schema_version", "state", "parent_attempt_id", "job_registry", "children",
-    "delivery_classification",
-})
-_CANONICAL_CHILD_KEYS = frozenset({
-    "attempt_id", "status", "readiness", "reason", "required_action", "harness",
-    "delivery_classification",
-})
 _MAX_DELIVERY_RECEIPT_BYTES = 2048
 _DELIVERY_INTENT_IMMUTABLE_KEYS = frozenset({
     "delivery_intent", "delivery_id", "delivery_recipient_digest", "delivery_receipt_digest",
@@ -7266,6 +8573,52 @@ _DELIVERY_INTENT_IMMUTABLE_KEYS = frozenset({
 #     UNIMPLEMENTED: a record is created for these rows too. See the P2 dev
 #     log for the full grep trail.
 _SD105_CANCELLED_NOTE = "cancelled-receipt-unavailable"
+
+
+def _terminal_delivery_receipt(metadata: dict[str, str]) -> dict:
+    """The terminal writer and every carrier use this same semantic result."""
+    is_success = committed_outcome("done", metadata) == "succeeded"
+    child = {
+        "attempt_id": metadata.get("attempt_id", ""),
+        "status": "done",
+        "readiness": "ready",
+        "harness": metadata.get("harness", ""),
+        "required_action": "advance-completed" if is_success else "inspect-done-failure",
+        "delivery_classification": "success" if is_success else "attention",
+    }
+    if not is_success:
+        child["reason"] = "terminal-failure-or-unclosed"
+    receipt = {
+        "schema_version": 2,
+        "state": "delivered",
+        "parent_attempt_id": metadata.get("parent_attempt_id", ""),
+        "job_registry": "",
+        "children": [child],
+        "delivery_classification": child["delivery_classification"],
+    }
+    return receipt
+
+
+def _delivery_commit_proven(metadata: dict[str, str]) -> bool:
+    """Validate the existing committed receipt without repeating worker checks.
+
+    Write authorization and runtime classification were proved before close.
+    Re-running those checks after a lease/cycle closes would reject a valid
+    completion. Current cleanup, conflicts and row CAS remain separate duties.
+    """
+    if metadata.get("delivery_intent") != "1" or not metadata.get("parent_sid"):
+        return False
+    try:
+        receipt = unseal_receipt(metadata.get("delivery_receipt_b64", ""))
+    except ValueError:
+        return False
+    return (
+        receipt == _terminal_delivery_receipt(metadata)
+        and metadata.get("delivery_recipient_kind") == metadata.get("parent_completion_delivery")
+        and metadata.get("delivery_recipient_digest") == hashlib.sha256(metadata["parent_sid"].encode()).hexdigest()
+        and shared_receipt_digest(receipt) == metadata.get("delivery_receipt_digest")
+        and receipt.get("delivery_classification") == "success"
+    )
 
 
 def _delivery_intent_values(fields: list[str], metadata: dict[str, str]) -> dict[str, str]:
@@ -7297,37 +8650,8 @@ def _delivery_intent_values(fields: list[str], metadata: dict[str, str]) -> dict
         return {}
     recipient_kind = metadata["parent_completion_delivery"]
     recipient_key = metadata["parent_sid"]
-    parent_attempt_id = metadata.get("parent_attempt_id", "")
-    route_id = metadata.get("route_id", "")
-    route_node = metadata.get("route_node", "")
-    is_success = (
-        metadata.get("failure_class") == "pass"
-        or metadata.get("note") in SUCCESS_NOTES
-    )
-    child = {
-        "attempt_id": attempt_id,
-        "status": "done",
-        "readiness": "ready",
-        "harness": metadata.get("harness", ""),
-        "required_action": "advance-completed" if is_success else "inspect-done-failure",
-        "delivery_classification": "success" if is_success else "attention",
-    }
-    if not is_success:
-        child["reason"] = "terminal-failure-or-unclosed"
-    receipt = {
-        "schema_version": 2,
-        "state": "delivered",
-        "parent_attempt_id": parent_attempt_id,
-        "job_registry": "",
-        "children": [child],
-        "delivery_classification": child["delivery_classification"],
-    }
-    canonical = {key: value for key, value in receipt.items() if key in _CANONICAL_RECEIPT_KEYS}
-    canonical["children"] = [
-        {key: value for key, value in child.items() if key in _CANONICAL_CHILD_KEYS}
-    ]
-    canonical_bytes = json.dumps(canonical, separators=(",", ":"), sort_keys=True).encode("utf-8")
-    receipt_digest = hashlib.sha256(canonical_bytes).hexdigest()
+    receipt = _terminal_delivery_receipt(metadata)
+    receipt_digest = shared_receipt_digest(receipt)
 
     receipt_bytes = json.dumps(receipt, separators=(",", ":"), sort_keys=True).encode("utf-8")
     if len(receipt_bytes) > _MAX_DELIVERY_RECEIPT_BYTES:
@@ -7498,7 +8822,85 @@ def attempt_launch_state(
     return "existing-unknown"
 
 
+def resolve_terminal_conflict(
+    jobs: Path, attempt_id: str, *, expected_row_sha256: str, review: Path,
+) -> dict[str, str]:
+    """Record an explicit review of an exact conflict, preserving its result.
+
+    This never selects a different verdict. A changed conflict or live process
+    invalidates the disposition; its caller must inspect the current evidence.
+    """
+    review_bytes = review.read_bytes()
+    if not review.is_absolute() or review.is_symlink() or not review_bytes.strip():
+        raise DispatchContractError("terminal-conflict-review-required")
+    lines = jobs.read_text(encoding="utf-8").splitlines()
+    matches = [(i, line.split("\t")) for i, line in enumerate(lines)
+               if len(line.split("\t")) == 6 and row_has_attempt(line.split("\t")[5], attempt_id)]
+    if len(matches) != 1:
+        raise DispatchContractError("attempt-terminal-row-not-unique")
+    _, fields = matches[0]
+    if fields[1] not in {"done", "killed", "cancelled"}:
+        raise DispatchContractError("terminal-conflict-not-terminal")
+    metadata = parse_registry_metadata(fields[5])
+    proof = attempt_process_quiescence(metadata, terminal_receipt=fields[1] in {"done", "killed", "cancelled"})
+    if proof.state != "quiescent":
+        raise DispatchContractError("terminal-conflict-process-unsettled", proof.reason)
+    if not terminal_conflict_pending(metadata):
+        raise DispatchContractError("terminal-conflict-not-pending")
+    conflicts = terminal_conflicts(metadata)
+    for entry in conflicts.values():
+        if not entry.get("review_sha256"):
+            entry.update(review_sha256=hashlib.sha256(review_bytes).hexdigest(),
+                         review_path_b64=base64.b64encode(str(review).encode()).decode())
+    values = {"terminal_conflicts_b64": base64.b64encode(json.dumps(conflicts, sort_keys=True).encode()).decode()}
+    expected = "\t".join(fields)
+    if hashlib.sha256(expected.encode()).hexdigest() != expected_row_sha256:
+        raise DispatchContractError("terminal-conflict-row-changed")
+    ensure_global_registry_writable(jobs)
+    with Path(f"{jobs}.lock").open("a", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        fresh = jobs.read_text(encoding="utf-8").splitlines()
+        matches = [i for i, line in enumerate(fresh) if len(line.split("\t")) == 6
+                   and row_has_attempt(line.split("\t")[5], attempt_id)]
+        if len(matches) != 1 or fresh[matches[0]] != expected:
+            raise DispatchContractError("terminal-conflict-row-changed")
+        # A resolution is diagnostic metadata, never a second terminal commit.
+        fields[5] = _updated_attempt_metadata(fields[5], values, terminal=True)
+        fresh[matches[0]] = "\t".join(fields)
+        _atomic_registry_replace(jobs, fresh)
+    return values
+
+
+def workflow_completion_receipt(args) -> str:
+    """Seal who finishes a newly launched route owner, across all adapters."""
+    bound = getattr(args, "owner_route_binding", None) or getattr(args, "route_file", None)
+    if getattr(args, "worker_type", None) == "owner" and bound and int(args.dispatch_depth) == 1:
+        return ",workflow_completion=runtime-v1"
+    return ""
+
+
 def reconcile_attempt_terminal(
+    jobs: Path,
+    attempt_id: str,
+    note: str,
+    *,
+    evidence: dict[str, str] | None = None,
+) -> str:
+    """One terminal commit, with conflicts handed back outside the jobs lock."""
+    outcome = _commit_attempt_terminal(jobs, attempt_id, note, evidence=evidence)
+    if outcome == "terminal-conflict":
+        from dispatch_supervision import materialize
+        try:
+            materialize(Path(jobs), {attempt_id}, reason="terminal-evidence-conflict")
+        except (OSError, ValueError, RuntimeError) as exc:
+            # The conflict is already durable. Keep the publication failure
+            # visible and retryable rather than reverting the committed result.
+            from dispatch_completion_join import log_delivery_refusal
+            log_delivery_refusal(Path(jobs), attempt_id, "terminal-conflict-delivery-pending")
+    return outcome
+
+
+def _commit_attempt_terminal(
     jobs: Path,
     attempt_id: str,
     note: str,
@@ -7540,59 +8942,32 @@ def reconcile_attempt_terminal(
             incoming = evidence or {}
             prior_class = metadata.get("failure_class", "")
             next_class = str(incoming.get("failure_class", ""))
-            if not prior_class or not next_class or prior_class == next_class:
+            prior_outcome = committed_outcome(fields[1], metadata)
+            next_outcome = committed_outcome("done", {"note": note, **incoming})
+            if (prior_outcome == next_outcome
+                    and (not prior_class or not next_class or prior_class == next_class)):
                 return "already-terminal"
-
-            def authority(source: str, detected: str) -> int:
-                if source == "supervisor-terminal-v1":
-                    return 30
-                if source == "completion-join-terminal-verdict-v1":
-                    return 20
-                if detected == "foreground-terminal-handoff":
-                    return 10
-                return 0
-
-            prior_rank = authority(
-                metadata.get("classifier_source", ""),
-                metadata.get("detected_by", ""),
-            )
-            next_rank = authority(
-                str(incoming.get("classifier_source", "")),
-                str(incoming.get("detected_by", "")),
-            )
-            semantic = {"pass", "fail", "blocked"}
+            # A classifier is an evidence producer, not an authority that can
+            # rewrite another committed result (and its immutable receipt).
             values = {
                 "terminal_conflict": "1",
                 "prior_terminal_note": metadata.get("note", ""),
                 "prior_classifier_source": metadata.get("classifier_source", ""),
                 "prior_failure_class": prior_class,
+                "conflicting_classifier_source": str(incoming.get("classifier_source", "")),
+                "conflicting_failure_class": next_class,
+                "conflicting_terminal_note": note,
             }
-            if next_rank > prior_rank and next_class in semantic:
-                values.update({"note": note, **incoming})
-                fields[5] = _updated_attempt_metadata(
-                    fields[5], values, terminal=True
-                )
-                lines[index] = "\t".join(fields)
-                _atomic_registry_replace(jobs, lines)
-                return "repaired-terminal"
-            if next_rank == prior_rank and {prior_class, next_class} <= semantic:
-                values.update(
-                    {
-                        "note": "dead-terminal-conflict",
-                        "failure_class": "contract",
-                        "conflicting_classifier_source": str(
-                            incoming.get("classifier_source", "")
-                        ),
-                        "conflicting_failure_class": next_class,
-                    }
-                )
-                fields[5] = _updated_attempt_metadata(
-                    fields[5], values, terminal=True
-                )
-                lines[index] = "\t".join(fields)
-                _atomic_registry_replace(jobs, lines)
-                return "terminal-conflict"
-            return "already-terminal"
+            conflicts = terminal_conflicts(metadata)
+            conflicts.setdefault(terminal_conflict_identity({**metadata, **values}), {
+                "note": note, "failure_class": next_class,
+                "classifier_source": str(incoming.get("classifier_source", "")),
+            })
+            values["terminal_conflicts_b64"] = base64.b64encode(json.dumps(conflicts, sort_keys=True).encode()).decode()
+            fields[5] = _updated_attempt_metadata(fields[5], values, terminal=True)
+            lines[index] = "\t".join(fields)
+            _atomic_registry_replace(jobs, lines)
+            return "terminal-conflict" if terminal_conflict_pending({**metadata, **values}) else "already-terminal"
         if fields[1] not in {"open", "running"}:
             raise DispatchContractError(
                 "attempt-terminal-status-invalid", fields[1]
@@ -7663,6 +9038,8 @@ def launch_reap_watch(
     pid: int,
     pid_start: str,
     pgid: int,
+    *,
+    foreground_seal: SealedForegroundOutcome | None = None,
 ) -> int:
     """Start the exact detached-process drain observer in the launch namespace."""
 
@@ -7671,6 +9048,62 @@ def launch_reap_watch(
             "reap-watch-identity-invalid",
             "attempt_id, leader pid/start, and leader pgid are required",
         )
+    jobs = Path(jobs)
+    if foreground_seal is not None:
+        if not isinstance(foreground_seal, SealedForegroundOutcome):
+            raise DispatchContractError(
+                "reap-watch-foreground-seal-invalid", "type"
+            )
+        try:
+            lines = jobs.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError as exc:
+            raise DispatchContractError(
+                "reap-watch-foreground-seal-invalid", "registry"
+            ) from exc
+        matches = _foreground_row(lines, attempt_id)
+        if len(matches) != 1:
+            raise DispatchContractError(
+                "reap-watch-foreground-seal-invalid", f"rows={len(matches)}"
+            )
+        _index, fields, metadata = matches[0]
+        if fields[1] not in {"open", "running"} or not foreground_review_eligible(
+            metadata,
+            expected_attempt_id=attempt_id,
+            expected_pid=pid,
+            expected_pid_start=pid_start,
+            expected_pgid=pgid,
+        ):
+            raise DispatchContractError(
+                "reap-watch-foreground-seal-invalid", "binding-or-eligibility"
+            )
+        try:
+            values = _foreground_outcome_values_from_pipe(fields[5])
+        except DispatchContractError as exc:
+            raise DispatchContractError(
+                "reap-watch-foreground-seal-invalid", exc.detail
+            ) from exc
+        if (
+            values is None
+            or dict(foreground_seal.values) != values
+            or foreground_seal.attempt_raw_row_sha256
+            != attempt_raw_row_sha256("\t".join(fields))
+        ):
+            raise DispatchContractError(
+                "reap-watch-foreground-seal-invalid", "stale-or-mismatched"
+            )
+    else:
+        # A foreground review must consume the exact object returned by the
+        # locked seal API.  Detached launches retain their historical None
+        # fence and therefore need no registry read here.
+        try:
+            lines = jobs.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            lines = []
+        matches = _foreground_row(lines, attempt_id)
+        if len(matches) == 1 and matches[0][2].get("launch_lifecycle") == "foreground-scoped":
+            raise DispatchContractError(
+                "reap-watch-foreground-seal-required", attempt_id
+            )
     script = _MODULE_ROOT / "utilities" / "dispatch-reap-watch.py"
     # The observer is governance machinery, not part of the governed attempt.
     # A direct wrapper can inherit the same attempt tag that supplied its

@@ -2,7 +2,7 @@
 unit: plan/frame
 family: plan
 role: deep maker
-worker_type: stage
+worker_type: frame
 floor: highest
 read_only: false          # nature: writes the direction brief shard only; concrete write_scope stays node-owned
 stance: none
@@ -22,16 +22,18 @@ you are dispatched, never user-invoked directly.
 Why this stage exists (user directive 2026-07-24): when the direction is set
 implicitly inside plan authoring and it bends early, everything downstream
 executes the wrong direction precisely — the result is hotfix/patch cascades
-and cost blowups. Framing therefore runs as its own stage in a route-declared
-2-way group at `standard` and 3-way group at `strong+`. Cross-harness placement
-is primary, while asymmetric model profiles and perspectives widen the search
-before anything commits.
+and cost blowups. Framing therefore runs as its own stage, launched directly by
+the depth-0 session after route binding and producer begin, before owner
+launch (`core/WORKFLOW.md` frame procedure). Cross-harness placement is primary,
+while asymmetric model profiles and perspectives widen the search before
+anything commits.
 
 ## Independence Contract
 
-- You may be one leg of a bounded 2–3-way framing group. Work blind: do not
-  look for, read, or converge toward the other legs' shards. Disagreement
-  between legs is signal for the plan synthesizer, not an error to reconcile.
+- You are one of exactly two frame legs the depth-0 session launches itself;
+  there is no third leg at any intensity. Work blind: do not look for, read,
+  or converge toward the other leg's shard. Disagreement between legs is
+  signal for the plan synthesizer, not an error to reconcile.
 - Like `autopilot-research` retrieval, breadth beats early convergence: sweep
   the problem from more than one angle (symptom evidence, root cause,
   architecture fit, prior-art in the repo) before narrowing.
@@ -53,7 +55,10 @@ before anything commits.
    choose", say so explicitly and name the single missing fact — do not emit a
    survey without a verdict.
 5. **Write the direction brief** to the exact output path given in the prompt,
-   using the schema below.
+   using the schema below. Under producer cutover, a relative shard path is
+   rooted at `AGENT_ARTIFACT_OUTPUT_DIR` (the open cycle's `artifacts/`), not
+   `AGENT_ARTIFACT_ROOT`. Use the inherited cycle; do not begin another cycle
+   or write to legacy root-level `shards/`.
 6. Return per `_shared/dual-io.md`.
 
 ## Direction-Brief Schema
@@ -79,7 +84,7 @@ created: {YYYY-MM-DD}
    sentence a non-engineer could answer, with your recommended answer and one
    line on why you cannot decide it yourself. Facts you could establish by
    reading code or running a tool do not belong here; establish them. The
-   owner turns this list into the frame interview (SD-129).
+   dispatching depth-0 session turns this list into the frame interview (SD-129).
 
 ## Constraints
 

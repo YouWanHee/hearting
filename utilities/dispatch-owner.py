@@ -11,7 +11,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
-from owner_route_binding import OwnerRouteBindingError, validate_owner_route_binding, derive_quick_owner_binding
+from owner_route_binding import OwnerRouteBindingError, validate_owner_route_binding, derive_quick_owner_binding, derive_frame_route_binding
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -53,14 +53,23 @@ _REQUIRED = {
 # Captured for validation but not required: `--unit` is meaningless for an owner
 # (the tuple contract pins it to `_kernel/owner`) and mandatory for the SD-OPEN-40
 # review launch below.
-_CAPTURED = _REQUIRED | {"--unit", "--review-output"}
+_CAPTURED = _REQUIRED | {"--unit", "--review-output", "--model-role"}
 # SD-OPEN-40: the depth-1 tuples this selector may launch. `review` exists so an
 # independent reviewer can be a *registered review worker* instead of an owner
 # wearing a reviewer's prompt. Before it, every ad-hoc independent review landed
 # in the registry as `worker_type=owner`, which is exactly the self-declaration
 # SD-OPEN-41(b)'s marker gate has to reject -- the degraded path was the only
 # reachable one because no normal path existed.
-_LAUNCHABLE_WORKER_TYPES = {"owner", "review"}
+# Frame nodes are depth-1 advisory workers. Both public node dispatch and
+# direct owner selection use this selector; the adapter's atomic attempt claim
+# remains the single registration authority.
+_LAUNCHABLE_WORKER_TYPES = {"owner", "review", "frame"}
+# Legacy route-free frame calls must supply their own scope. Route-bound calls
+# derive it from the producer, so inherited/partial environment is not authority.
+_FRAME_ARTIFACT_ENV = (
+    "AGENT_ARTIFACT_ROOT", "AGENT_ARTIFACT_CAMPAIGN_ID",
+    "AGENT_ARTIFACT_CYCLE_ID", "AGENT_ARTIFACT_CYCLE_DIR",
+)
 _UNIT_REF = re.compile(r"^[a-z-]+/[a-z-]+$")
 _RESERVED_UNITS = {"_kernel/owner", "_kernel/resource"}
 
@@ -91,18 +100,23 @@ _HINTS = {
                                                 "harness to harnesses.enabled and this profile's quality bands first. This is not a usage limit -- "
                                                 "see eligibility.* above",
     "no-eligible-route-evidence-candidate": "no sealed candidate is usable: it is usage-limited, gated, or has no positive capacity score "
-                                            "(see eligibility.* and capacity_headroom.* above). Recompose the route for another harness "
-                                            "(solo/quick: --children <harness>; staged: --parent-harness <harness>) or wait for the reset",
+                                            "(see eligibility.* and capacity_headroom.* above). Resume the same route after the reported reset, "
+                                            "or select an available candidate already sealed in this profile; changing the candidate set requires recomposition",
     "no-eligible-candidate": "no configured owner harness is usable: usage-limited, gated, or no positive capacity score "
                              "(see eligibility.* and capacity_headroom.* above; utilities/usage-check.sh --harness all)",
     "exactly-one-action-required": "pass exactly one of --dry-run | --register | --start",
-    "owner-tuple-required": "the launchable tuple is --dispatch-depth 1 --worker-type owner|review",
+    "owner-tuple-required": "the launchable tuple is --dispatch-depth 1 --worker-type owner|review|frame",
     "invalid-model-profile": "--model-profile deep|balanced-deep|balanced|light (top only from a route that seals it)",
     "profile-top-route-required": "drop --model-profile top: the top exception profile is sealed by a route "
                                   "(compose/compile --profile-demands '{\"__owner__\": …}' --explicit-profiles "
                                   "'{\"__owner__\": \"top\"}') and reaches the owner through --route-evidence only",
     "review-worker-unit-required": "--worker-type review needs --unit <catalog persona from roles/units/>",
     "review-worker-route-evidence-unsupported": "a route node's reviewer is launched by stage dispatch; drop --route-evidence for an ad-hoc review worker",
+    "review-output-frame-forbidden": "a frame worker returns its advisory verdict through the ordinary dispatch handoff; drop --review-output",
+    "frame-artifact-scope-missing": "export all four of AGENT_ARTIFACT_ROOT, AGENT_ARTIFACT_CAMPAIGN_ID, AGENT_ARTIFACT_CYCLE_ID "
+                                    "and AGENT_ARTIFACT_CYCLE_DIR in the same Bash call as the launch (OPERATIONS §5.10b)",
+    "route-node-unknown": "--route-node must name an id present in the sealed route's nodes list",
+    "route-node-worker-type-forbidden": "--route-node selects a frame node's own profile and role; only --worker-type frame may use it",
     "forbidden-flag": "model, reasoning, effort, variant and completion-delivery are sealed by the profile and route; remove the flag",
     "explicit-jobs-outside-parent-registry": "drop --jobs: an interactive Claude parent's completion hook trusts only the inherited "
                                              "AGENT_DISPATCH_JOBS (or the installed canonical registry), so an owner started into another "
@@ -128,7 +142,23 @@ class OwnerError(ValueError):
     pass
 
 
-def _route_defaults(path):
+def _node_model_settings(route, route_node):
+    """A frame uses its sealed node profile and role, independently of the owner."""
+    nodes = route.get("nodes")
+    node = next(
+        (row for row in nodes if isinstance(row, dict) and row.get("id") == route_node),
+        None,
+    ) if isinstance(nodes, list) else None
+    if node is None:
+        raise OwnerError("route-node-unknown")
+    settings = {"--model-profile": node.get("model_profile"), "--model-role": node.get("role")}
+    for flag, value in settings.items():
+        if not isinstance(value, str) or not value.strip():
+            raise OwnerError(f"route-node-model-setting-missing:{flag}")
+    return settings
+
+
+def _route_defaults(path, route_node=None):
     """Owner-tuple values a sealed route states; None for fields it lacks."""
     try:
         route = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -144,6 +174,11 @@ def _route_defaults(path):
         "--dispatch-depth": "1", "--worker-type": "owner",
         "--owner": capability, "--assigned-contract": capability,
     })
+    if route_node is not None:
+        values.update(_node_model_settings(route, route_node))
+        node = next(row for row in route["nodes"] if row.get("id") == route_node)
+        if node.get("unit") == "plan/frame" and node.get("dispatch_depth") == 1:
+            values.update({"--worker-type": "frame", "--unit": "plan/frame", "--assigned-contract": "plan/frame"})
     return {flag: (str(value) if value not in (None, "") else None) for flag, value in values.items()}
 
 
@@ -153,7 +188,7 @@ def _same_value(flag, given, sealed):
     return str(given) == str(sealed)
 
 
-def _sealed_owner_context(path):
+def _sealed_owner_context(path, *, worker_type="owner"):
     """Return route-sealed owner candidates, quality policy, and allocation.
 
     An owner is not a route node, so this selector stays route-blind for
@@ -181,7 +216,8 @@ def _sealed_owner_context(path):
         # this only moves the same verdict ahead of the launch.
         rows, field = route.get("registered_headless_candidates") or [], "harness"
     else:
-        rows, field = (route.get("dispatch_evidence") or {}).get("tuples") or [], "parent_harness"
+        rows = (route.get("dispatch_evidence") or {}).get("tuples") or []
+        field = "child_harness" if worker_type == "frame" else "parent_harness"
         if any(
             isinstance(row, dict)
             and row.get("status") == "unsupported"
@@ -198,7 +234,7 @@ def _sealed_owner_context(path):
     harnesses &= _defaults.DISPATCHABLE_HARNESSES
     if not harnesses:
         raise OwnerError("route-evidence-no-supported-owner-harness")
-    policy = route.get("owner_harness_policy")
+    policy = None if worker_type == "frame" else route.get("owner_harness_policy")
     if policy is not None:
         if not isinstance(policy, dict) or any(
             not isinstance(policy.get(band), list)
@@ -239,25 +275,11 @@ def export_owner_route_env(child_env, binding):
 
 
 def _caller_harness(env):
-    """Keep the interactive caller distinct from the selected child adapter."""
-
-    explicit = env.get("AGENT_DISPATCH_CALLER_HARNESS") or env.get(
-        "AGENT_DISPATCH_CURRENT_HARNESS"
-    )
-    if explicit:
-        if explicit not in _defaults.DISPATCHABLE_HARNESSES:
-            raise OwnerError("caller-harness-invalid")
-        return explicit
-    detected = set()
-    if env.get("CODEX_THREAD_ID") or env.get("CODEX_SESSION_ID"):
-        detected.add("codex")
-    if env.get("CLAUDE_CODE_SESSION_ID"):
-        detected.add("claude")
-    if env.get("OPENCODE_SESSION_ID"):
-        detected.add("opencode")
-    if len(detected) > 1:
-        raise OwnerError("caller-harness-ambiguous")
-    return next(iter(detected), None)
+    from dispatch_parent_completion import interactive_parent_identity, DispatchContractError
+    try:
+        return interactive_parent_identity(env)[0] or None
+    except DispatchContractError as exc:
+        raise OwnerError(exc.reason) from exc
 
 
 def _load_defaults():
@@ -276,6 +298,7 @@ def _parse(argv):
     forwarded = []
     explicit = None
     route_evidence = None
+    route_node = None
     values = {}
     actions = []
     i = 0
@@ -301,6 +324,19 @@ def _parse(argv):
             continue
         if arg.startswith("--route-evidence="):
             route_evidence = arg.split("=", 1)[1]
+            i += 1
+            continue
+        # Selector-only, like --adapter/--route-evidence: a frame launch bound
+        # to a route node derives that node's sealed model profile and role.
+        # The selected binding later forwards the wrapper's route-node flag.
+        if arg == "--route-node":
+            if i + 1 >= len(argv):
+                raise OwnerError("route-node-missing")
+            route_node = argv[i + 1]
+            i += 2
+            continue
+        if arg.startswith("--route-node="):
+            route_node = arg.split("=", 1)[1]
             i += 1
             continue
         name, equal, value = arg.partition("=")
@@ -344,13 +380,14 @@ def _parse(argv):
         i += 1
     derived = []
     required = set(_REQUIRED)
-    # Only a gap opens the route: a caller that spells out the whole tuple is
-    # parsed exactly as before and validated by the binding checks downstream.
+    # Owner tuples retain gap-fill compatibility. Frame launches always read
+    # their node: a complete caller tuple cannot replace its sealed model axes.
     gaps = [flag for flag in _REQUIRED if not values.get(flag)]
-    if route_evidence and gaps and values.get("--worker-type", "owner") == "owner":
-        for flag, sealed in _route_defaults(route_evidence).items():
+    if route_evidence and (gaps or route_node) and values.get("--worker-type", "owner") in {"owner", "frame"}:
+        sealed_flags = _ROUTE_SEALED | ({"--model-profile", "--model-role"} if route_node else set())
+        for flag, sealed in _route_defaults(route_evidence, route_node).items():
             if values.get(flag):
-                if flag in _ROUTE_SEALED and sealed is not None and not _same_value(flag, values[flag], sealed):
+                if flag in sealed_flags and sealed is not None and not _same_value(flag, values[flag], sealed):
                     raise OwnerError(f"route-evidence-arg-mismatch:{flag}")
                 continue
             if sealed is None:
@@ -369,6 +406,8 @@ def _parse(argv):
     worker_type = values["--worker-type"]
     if values["--dispatch-depth"] != "1" or worker_type not in _LAUNCHABLE_WORKER_TYPES:
         raise OwnerError("owner-tuple-required")
+    if route_node and worker_type != "frame":
+        raise OwnerError("route-node-worker-type-forbidden")
     unit = (values.get("--unit") or "").strip()
     if worker_type == "owner":
         # Unchanged: the owner tuple pins its own unit downstream
@@ -377,8 +416,10 @@ def _parse(argv):
         if unit and unit != "_kernel/owner":
             raise OwnerError("invalid-owner-unit")
     else:
-        # A review worker is a *unit*, not a kernel role: it must name the
-        # catalog persona it reviews as, and it can never borrow the owner's.
+        # A review or frame worker is a *unit*, not a kernel role: it must
+        # name the catalog persona it runs as, and it can never borrow the
+        # owner's. This reuses the same check for both -- SD-OPEN-40's review
+        # gate widened, not duplicated, for frame-universal.
         if not unit:
             raise OwnerError("review-worker-unit-required")
         if unit in _RESERVED_UNITS:
@@ -389,11 +430,21 @@ def _parse(argv):
         # than a shape that `foo/bar` also satisfies.
         if not (ROOT / "roles" / "units" / f"{unit}.md").is_file():
             raise OwnerError("unknown-review-worker-unit")
-        if route_evidence:
+        if worker_type == "review" and route_evidence:
             # A route node's review worker is launched by the stage dispatcher
             # with its node binding, not by this selector. Accepting route
             # evidence here would let one node be claimed by two launch paths.
+            # Frame's public entry points converge here and share one claim.
             raise OwnerError("review-worker-route-evidence-unsupported")
+        if worker_type == "frame" and values.get("--review-output"):
+            # A frame worker returns an advisory verdict through the ordinary
+            # dispatch handoff (roles/worker-types/frame.md), never a durable
+            # review report -- --review-output has nothing to bind to here.
+            raise OwnerError("review-output-frame-forbidden")
+        if worker_type == "frame" and not route_evidence:
+            absent = [name for name in _FRAME_ARTIFACT_ENV if not os.environ.get(name)]
+            if absent:
+                raise OwnerError("frame-artifact-scope-missing:" + ",".join(absent))
         # A report is an explicit opt-in capability.  It is forwarded as a
         # value, never inferred from caller environment or route metadata.
         if values.get("--review-output") and not Path(values["--review-output"]).is_absolute():
@@ -410,6 +461,14 @@ def _parse(argv):
     # Equal-form required options are forwarded unchanged; split-form options
     # were appended above.  Selector-only --adapter/--route-evidence never
     # cross the boundary.
+    # W3: carry the selector-only `--route-node` to the quick-binding call site
+    # through `values` rather than by widening this return tuple -- every
+    # existing caller unpacks five values, and a sixth would break them all.
+    # It is never forwarded to the wrapper (the parser above `continue`s past
+    # it); the quick binding re-emits its own `--route-node` from the node it
+    # actually resolved.
+    if route_node:
+        values["--route-node"] = route_node
     return explicit, values, forwarded, route_evidence, derived
 
 
@@ -423,8 +482,10 @@ def _eligible(state):
     return state != "limited" and not state.startswith("limited(")
 
 
-def _usage(jobs):
+def _usage(jobs, profile=None):
     cmd = [str(ROOT / "utilities" / "usage-check.sh"), "--harness", "all"]
+    if profile:
+        cmd += ["--model-profile", profile]
     if jobs:
         cmd += ["--jobs", jobs]
     result = subprocess.run(cmd, text=True, capture_output=True, env=os.environ.copy())
@@ -580,7 +641,7 @@ def main(argv):
         explicit, values, forwarded, route_evidence, derived = _parse(argv)
         jobs = _authoritative_jobs(values, os.environ)
         profile = values["--model-profile"]
-        sealed_context = _sealed_owner_context(route_evidence) if route_evidence else None
+        sealed_context = _sealed_owner_context(route_evidence, worker_type=values["--worker-type"]) if route_evidence else None
         if sealed_context and isinstance(sealed_context.get("policy"), dict):
             policy = dict(sealed_context["policy"])
             config = None
@@ -615,7 +676,7 @@ def main(argv):
                     for band in _defaults.QUALITY_BANDS
                 },
             }
-        states = _usage(jobs)
+        states = _usage(jobs, profile)
         allocation = (
             sealed_context.get("allocation")
             if sealed_context and isinstance(sealed_context.get("allocation"), dict)
@@ -737,7 +798,7 @@ def main(argv):
         child_env = {
             key: value for key, value in os.environ.items() if not _MODEL_ENV.fullmatch(key)
         }
-        if values["--worker-type"] == "review":
+        if values["--worker-type"] in {"review", "frame"}:
             # A direct reviewer is deliberately route-free.  The selector may
             # itself run inside a route-owned owner, so inherited route
             # variables must not silently bind the child to that owner/node.
@@ -753,16 +814,29 @@ def main(argv):
         child_env["AGENT_DISPATCH_OWNER_HARNESS"] = selected
         if route_evidence:
             route_data = json.loads(Path(route_evidence).read_text(encoding="utf-8"))
-            if route_data.get("effective_intensity") == "quick":
-                binding = derive_quick_owner_binding(
+            if values["--worker-type"] == "frame" or route_data.get("effective_intensity") == "quick":
+                # W3: quick is a three-node route, so the caller's own
+                # `--route-node` selects which node this launch binds to. The
+                # default keeps every existing quick OWNER launch identical.
+                derive = (derive_frame_route_binding if values["--worker-type"] == "frame"
+                          else derive_quick_owner_binding)
+                binding = derive(
                     route_evidence, worktree=values["--worktree"],
                     capability=values["--capability"], capability_mode=values["--capability-mode"],
                     intensity=values["--intensity"], harness=selected,
+                    route_node=values.get("--route-node") or "one-shot",
                 )
                 forwarded += ["--route-file", binding.route_file, "--route-id", binding.route_id,
                               "--route-hash", binding.route_hash, "--route-node", binding.route_node,
                               "--registry-digest", binding.registry_digest, "--write-scope", binding.write_scope,
                               "--completion-gate", binding.completion_gate]
+                if values["--worker-type"] == "frame":
+                    from artifact_producer import prepare_route_artifact_env, ProducerError
+                    try:
+                        child_env.update(prepare_route_artifact_env(
+                            Path(binding.route_file), start="--start" in forwarded, jobs=Path(jobs)))
+                    except ProducerError as exc:
+                        raise OwnerError(f"{exc.code}:{exc.detail}") from exc
                 # Deliberately NOT export_owner_route_env() here. The adapters
                 # treat "env binding present" as the discriminator for a
                 # standard+ owner and refuse `owner-route-binding-tuple-invalid`
@@ -780,6 +854,13 @@ def main(argv):
                 harness=selected,
             )
                 export_owner_route_env(child_env, binding)
+            if values["--worker-type"] == "owner":
+                from artifact_producer import prepare_route_artifact_env, ProducerError
+                try:
+                    child_env.update(prepare_route_artifact_env(
+                        Path(binding.route_file), start="--start" in forwarded, jobs=Path(jobs)))
+                except ProducerError as exc:
+                    raise OwnerError(f"{exc.code}:{exc.detail}") from exc
         child = subprocess.run([str(wrapper), *forwarded], env=child_env)
         return child.returncode
     except (OwnerError, OwnerRouteBindingError, OSError) as exc:

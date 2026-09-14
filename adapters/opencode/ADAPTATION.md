@@ -348,7 +348,7 @@ Harness-specific status signals need OpenCode-native realization:
 | permission mapping | Run `adapters/opencode/bin/preflight.sh permissions` to inspect the OpenCode native permission contract and confirm Claude `allowedTools` is unsupported |
 | MCP mapping | Run `adapters/opencode/bin/preflight.sh mcp --check` to inspect OpenCode's native MCP CLI/config surface; do not copy Claude `settings.json` MCP registrations or project `tools/design-mcp` wholesale |
 | headless dispatch | Run `adapters/opencode/bin/preflight.sh headless --check <worktree>` before OpenCode `run` dispatch; it checks the worktree, command availability, and installed runtime projection without launching. The dispatch surface accepts `--model-profile deep|balanced-deep|light|mini` independently of optional behavioral `--model-role`. A route-bound profile resolves through `config/models.conf`; `_kernel/owner` rejects a stage `worker_mode` and may be profile-only, caller model/variant replacement is denied, and substantive registered `mini` is denied. Because OpenCode has no verified distinct effort variant, every profile separation is carried by the model: `balanced-deep` has its own configured tier, distinct from the deep tier, while `balanced` and `mini` collapse into `light`, so the row reports `profile_granularity=collapsed-mini` with `collapsed-balanced-to-light`, and `runtime-default` is represented by omitting `--variant`. Registry/Fleet keeps capability mode, worker mode, role, profile, tier, and granularity separate. `--start` reruns the same projection check; liveness, harvest, merge, and cleanup boundaries remain unchanged |
-| QA policy mapping | `adapters/opencode/bin/preflight.sh qa-policy <level> [code|research|doc|general]` maps the shared QA assurance budget to OpenCode role checks and fallback reporting. `stage_graph_selector=intensity-not-qa` preserves the core split: intensity selects graph/depth, QA only scales selected checks |
+| QA policy mapping | `adapters/opencode/bin/preflight.sh qa-policy <level> [code|research|doc|general]` maps the shared QA assurance budget to OpenCode role checks and fallback reporting. `stage_graph_selector=explicit-graph-or-intensity-default` preserves the core split: an explicit graph takes precedence over the default recipe; QA only scales selected checks |
 | role modes | Read `roles/MODES.md`, then run `adapters/opencode/bin/preflight.sh mode-info <family/mode>`; treat adapter-coupled modes as unsupported unless wrappers exist, obey `fallback=reference-only`, and satisfy any named `tool_contract` / `tool_contract_check` before claiming tool-contract modes |
 | hook invariants | Read `core/HOOKS.md`; OpenCode plugin hooks cover prompt lifecycle context, write/edit/patch guards, the spec read gate (command/read), and design HTML post-write checks, while explicit preflight wrappers remain fallback for disabled/untrusted plugins and events not yet covered |
 | capabilities | Read `capabilities/README.md`, then run `adapters/opencode/bin/preflight.sh capability-info <capability>`; do not assume Claude Skill invocation |
@@ -568,18 +568,19 @@ DBs, caches, `.env*`, build output, dispatch logs, or worktrees into this repo.
 
 ## SD-110 runtime-owned deterministic stage advance — not an advance target
 
-OpenCode has no per-process session supervisor realization comparable to
-Claude session-resume or the Codex App Server, and the same route-owned
-dispatch-depth-2 evidence gap recorded above means SD-110's eligibility
-predicates cannot be locally proven here. This adapter therefore carries no
-`attempt_stage_advance` call site and no `--enable-stage-advance` flag: every
-OpenCode-bound boundary keeps today's unchanged model-turn delivery path
-regardless of `advance_class`. Its delivery receipts stay a plain v1/v2
-consumer — no `accept_stage_advance` negotiation exists on this surface — so
-it can never receive a `stage_advance` v3 block, and no route compiled for an
-OpenCode-owned node is a runtime-advance source or target. This is a parity
-gap, not a rejected design: the moment OpenCode exposes its own route-owned
-dispatch-depth-2 evidence, this section is the one to revisit.
+Registered standard+ owners use the shared CLI completion controller
+(`utilities/claude-session-supervisor.py`, retained compatibility filename).
+The native driver runs `opencode run --format json`, binds the observed
+`sessionID` to the exact attempt, and resumes with `--session`. The controller
+owns the live lease, exact child join, completion commit, receipt consumption,
+and next model turn. A registered parent without that live lease receives the
+printed bounded-wait fallback; registration alone never promises a wake.
+
+Ordinary same-session continuation does not enable SD-110 deterministic
+advance or SD-119 serial-chain owner support. The adapter exposes neither
+`--enable-stage-advance` nor stage-advance receipt negotiation. Those surfaces
+retain their checked single-session/registered-headless fallback. Interactive
+OpenCode depth-0 delivery also remains an explicit bounded wait.
 
 ## Execution access request
 

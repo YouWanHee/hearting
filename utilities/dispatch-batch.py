@@ -558,7 +558,14 @@ def assign_harnesses(
         # group-level diagnostics/degradation evidence below, which
         # legitimately wants group-wide reasons.
         node_exclusions: dict[str, set[str]] = {}
+        from dispatch_capacity_evidence import active_limits
+        quota_limits = active_limits(jobs, profile=node.get("model_profile")) if jobs is not None else {}
         for adapter in SUPPORTED_BATCH_HARNESSES:
+            if adapter in quota_limits:
+                reason = f"quota-until-{quota_limits[adapter]['reset_epoch']}"
+                exclusions.setdefault(adapter, set()).add(reason)
+                node_exclusions.setdefault(adapter, set()).add(reason)
+                continue
             try:
                 selection = DISPATCH_NODE.resolve_checked_tuple(
                     route, node, adapter, parent_identity=parent_identity
@@ -2001,6 +2008,9 @@ def main(argv: list[str] | None = None) -> int:
         # only on the exception object and died here, leaving PRD 13.30.2's "no
         # silent path" with nothing typed anywhere in the cycle.
         extra = {}
+        if reason == "review-round-budget-exhausted":
+            capped = next((n for n in nodes if n["id"] == getattr(exc, "route_node", None)), {})
+            extra.update(DISPATCH_NODE.review_budget_recovery_fields(capped.get("kind")))
         if reason in {
             "launch-runtime-root-mismatch",
             "launch-compatibility-tuple-required",

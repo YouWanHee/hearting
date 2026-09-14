@@ -319,6 +319,7 @@ class FakeAppServer:
         *,
         thread_id: str = "thread-1",
         question: str = "PRIVATE QUESTION",
+        wait_policy: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         deadline = time.monotonic() + 5
         while self.current is None and time.monotonic() < deadline:
@@ -348,6 +349,7 @@ class FakeAppServer:
                 ],
             },
         }
+        message["params"].update(wait_policy or {})
         self.current.write_json(message)
         return message
 
@@ -628,6 +630,120 @@ class ManagedGatewayTest(unittest.TestCase):
         self.assertIn("hearting-human-gate", context)
         self.assertNotIn("hearting-completion", context)
 
+    def _supervision_request(self):
+        import dispatch_supervision as supervision
+        import dispatch_contract as contract
+        process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
+        def cleanup():
+            if process.poll() is None:
+                process.terminate()
+            process.wait(timeout=5)
+        self.addCleanup(cleanup)
+        jobs = self.root / "notice-jobs.log"
+        epoch = control(self.control, {"schema_version": 1, "op": "status"})["epoch"]
+        common = ("attempt_schema_version=2,transport=headless,execution_surface=registered-headless,"
+                  "registered_worker=1,fallback_hop=same-harness-headless,")
+        jobs.write_text("2026-09-11T00:00:00Z\topen\t/r\t/w\towner\t" + common
+            + "dispatch_depth=1,attempt_id=att-notice-owner,parent_sid=thread-1,"
+            "parent_completion_delivery=codex-managed-gateway,"
+            "managed_sealed_batch_id=batch-notice,route_id=rt-notice,route_node=owner\n"
+            + "2026-09-11T00:00:00Z\topen\t/r\t/w\tchild\t" + common
+            + f"dispatch_depth=2,attempt_id=att-notice-child,parent_attempt_id=att-notice-owner,pid={process.pid},"
+            + f"pid_start={contract.process_start_ticks(process.pid)},pgid={process.pid},"
+            + f"pid_observer_ns={contract.process_namespace_identity()}\n")
+        record = supervision.materialize(jobs, {"att-notice-child"}, reason="join-deadline")[0]
+        receipt = record["receipt"]
+        request = {"schema_version": 1, "op": "deliver-notice", "thread_id": "thread-1",
+                   "recipient_epoch": epoch,
+                   "parent_attempt_id": "att-notice-owner", "sealed_batch_id": "batch-notice",
+                   "delivery_id": supervision.gateway_delivery_id(receipt),
+                   "receipt_digest": record["receipt_digest"], "receipt": receipt}
+        return request, jobs, process
+
+    def test_real_row_without_generation_traverses_courier_queue_and_gateway(self):
+        from types import SimpleNamespace
+        import dispatch_pending_delivery as pending
+        request, jobs, process = self._supervision_request()
+        before = jobs.read_bytes()
+        self.assertNotIn(b"session_generation", before)
+        spec = importlib.util.spec_from_file_location("completion_notice_integration",
+                                                     ROOT / "utilities" / "codex-managed-completion.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        args = SimpleNamespace(jobs=jobs, parent_session_id="thread-1", sealed_batch_id="batch-notice",
+                               control_socket=self.control, interval=0.01)
+        watcher = module.NoticeWatcher(args, {"att-notice-owner"}, None)
+        delivery_id = request["receipt"]["pending_delivery_id"]
+        path = pending.record_path(jobs.parent, "thread-1", delivery_id)
+        # A disconnected parent never consumes the record. The same courier
+        # retries after connection returns, using a real control handshake.
+        with mock.patch.object(module, "negotiate_human_gate", return_value=None):
+            watcher._one(path)
+        self.assertEqual(pending.read(jobs.parent, "thread-1", delivery_id)["state"], "pending")
+        watcher._one(path)
+        record = pending.read(jobs.parent, "thread-1", delivery_id)
+        self.assertEqual(record["state"], "acked", list(watcher.errors))
+        self.assertEqual(record["session_generation"], str(request["recipient_epoch"]))
+        self.assertEqual(record["claim_authority"], "generation-proven")
+        self.assertEqual(jobs.read_bytes(), before)
+        self.assertIsNone(process.poll())
+
+    def test_recovery_obligation_survives_epoch_change_before_send(self):
+        request, jobs, process = self._supervision_request()
+        # Prepare a real durable notice, then change only the transport
+        # generation before its first send. Its work binding stays unchanged.
+        receipt = request["receipt"]
+        identity = dict(thread_id="thread-1", parent_attempt_id="att-notice-owner",
+                        sealed_batch_id="batch-notice", receipt_digest=request["receipt_digest"])
+        item = GATEWAY.PendingInternal(kind="human-gate-wait", thread_id="thread-1",
+            delivery_id=request["delivery_id"], receipt=receipt, identity=identity,
+            recipient_epoch=request["recipient_epoch"] - 1)
+        with self.gateway._lock:
+            self.gateway.ledger._transition(item.delivery_id, "prepared", **identity)
+            self.gateway._delivery_pending[item.delivery_id] = item
+            state = self.gateway._threads["thread-1"]
+            self.gateway._send_human_gate_locked(item, state)
+        self.assertTrue(item.event.wait(5))
+        self.assertEqual(item.outcome["status"], "accepted", item.outcome)
+        self.assertEqual(item.recipient_epoch, request["recipient_epoch"])
+        replay = control(self.control, request)
+        self.assertTrue(replay["replay"])
+        self.assertIsNone(process.poll())
+
+    def test_notice_transport_refuses_stale_generation_before_creating_a_send(self):
+        request, jobs, process = self._supervision_request()
+        stale = dict(request, recipient_epoch=request["recipient_epoch"] - 1)
+        self.assertEqual(control(self.control, stale)["reason"], "recipient-epoch-mismatch")
+        self.assertIsNone(self.gateway.ledger.get(request["delivery_id"]))
+        self.assertEqual(control(self.control, request)["status"], "accepted")
+
+    def test_supervision_uses_notice_transport_once_without_completing_live_work(self):
+        request, jobs, process = self._supervision_request()
+        before = jobs.read_bytes()
+        first = control(self.control, request)
+        self.assertEqual(first["status"], "accepted", first)
+        second = control(self.control, request)
+        self.assertEqual((second["status"], second["replay"]), ("accepted", True))
+        self.assertIsNone(process.poll())
+        self.assertEqual(jobs.read_bytes(), before)
+        starts = [message for message in self.server.messages if message.get("method") == "turn/start"]
+        contexts = [m["params"].get("additionalContext", {}) for m in starts]
+        notices = [c for c in contexts if "hearting-supervision" in c]
+        self.assertEqual(len(notices), 1)
+        self.assertNotIn("hearting-completion", notices[0])
+        self.assertIn("not workflow completion", notices[0]["hearting-supervision"]["value"])
+
+    def test_recovered_work_suppresses_late_supervision_notice(self):
+        request, jobs, process = self._supervision_request()
+        process.terminate(); process.wait(timeout=5)
+        lines = jobs.read_text().splitlines()
+        lines[1] = lines[1].replace("\topen\t", "\tdone\t") + ",note=completed-marker"
+        jobs.write_text("\n".join(lines) + "\n")
+        result = control(self.control, request)
+        self.assertEqual(result["reason"], "supervision-resolved", result)
+        self.assertFalse(any("hearting-supervision" in m.get("params", {}).get("additionalContext", {})
+                             for m in self.server.messages))
+
     def test_sibling_thread_start_does_not_move_binding(self) -> None:
         self.server.next_start_id = "thread-sibling"
         self.client.request("thread/start", {})
@@ -832,6 +948,8 @@ class ManagedGatewayTest(unittest.TestCase):
         completion_context = starts[0]["params"]["additionalContext"]["hearting-completion"]["value"]
         self.assertIn("AGENT_HARNESS_COMPLETION_V1", encoded)
         self.assertIn("no harvest command; advance the route", encoded)
+        self.assertNotIn("Run only these commands", completion_context)
+        self.assertIn("This receipt creates no new approval step", completion_context)
         self.assertIn('"delivery_classification":"success"', completion_context)
         self.assertIn('"delivery_timing_schema_version":1', completion_context)
         self.assertNotIn("RAW_CHILD", encoded)
@@ -841,6 +959,17 @@ class ManagedGatewayTest(unittest.TestCase):
             set(GATEWAY.DELIVERY_TIMING_POINTS).difference(timing), set()
         )
         self.assertIsInstance(timing["same_thread_resume_ns"], int)
+
+    def test_opencode_child_uses_the_same_exact_parent_gateway(self) -> None:
+        request = receipt_request("batch-opencode")
+        request["receipt"]["children"][0]["harness"] = "opencode"
+        result = control(self.control, request)
+        self.assertEqual(result["status"], "accepted", result)
+        self.assertEqual(self.server.counts(), (1, 0))
+        starts = [value for value in self.server.messages if value.get("method") == "turn/start"]
+        context = starts[0]["params"]["additionalContext"]["hearting-completion"]["value"]
+        self.assertIn('"harness":"opencode"', context)
+        self.assertIn('"delivery_classification":"success"', context)
 
     def test_invalid_delivery_timing_is_rejected_before_upstream(self) -> None:
         before = self.server.counts()
@@ -945,6 +1074,7 @@ class ManagedGatewayTest(unittest.TestCase):
         )
         context = params["additionalContext"]["hearting-completion"]["value"]
         command = next(line for line in context.splitlines() if " harvest --jobs " in line)
+        self.assertNotIn("--failure-detail", command)
         environment = dict(os.environ)
         for name in (
             "AGENT_DISPATCH_JOBS",
@@ -962,6 +1092,15 @@ class ManagedGatewayTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn(f"job_registry={jobs}", result.stdout)
+        self.assertIn("matched=1", result.stdout)
+
+        # Attention can mean a delivery/cleanup obligation on a PASS row.
+        # The generated inspection must remain usable for that exact row.
+        jobs.write_text(jobs.read_text().replace("failure_class=child-failed", "failure_class=pass")
+                        .replace("note=dead-worker-fail", "note=completed-review"))
+        result = subprocess.run(shlex.split(command), text=True, capture_output=True,
+                                env=environment, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("matched=1", result.stdout)
 
     def test_active_manual_turn_receipt_steers_without_second_turn(self) -> None:
@@ -1109,6 +1248,49 @@ class ManagedGatewayTest(unittest.TestCase):
         )
         self.assertNotIn("PRIVATE QUESTION", persisted)
         self.assertNotIn("PRIVATE OPTION", persisted)
+
+    def test_question_deadline_projection_preserves_identity_and_real_answers(self) -> None:
+        # Current schema generated from the installed codex-cli 0.153.4:
+        # autoResolutionMs is deprecated; isBlocking is the timer authority.
+        # Also cover older peers without isBlocking and already unbounded UI.
+        policies = [
+            ({"isBlocking": False, "autoResolutionMs": None},
+             {"isBlocking": True, "autoResolutionMs": None}),
+            ({"isBlocking": False}, {"isBlocking": True}),
+            ({"autoResolutionMs": 120000}, {"autoResolutionMs": None}),
+            ({"isBlocking": True, "autoResolutionMs": None},
+             {"isBlocking": True, "autoResolutionMs": None}),
+        ]
+        for ordinal, (before, after) in enumerate(policies):
+            with self.subTest(policy=before):
+                request_id = 950 + ordinal
+                request = self.server.emit_user_input(request_id, wait_policy=before)
+                received = self.client.wait_for(
+                    lambda value: value.get("method") == "item/tool/requestUserInput"
+                    and value.get("id") == request_id
+                )
+                self.assertEqual(received, {
+                    **request, "params": {**request["params"], **after}
+                })
+                for key, value in before.items():
+                    self.assertEqual(request["params"][key], value)
+                self.wait_interaction("thread-1", True)
+                self.assertFalse(any(
+                    value.get("id") == request_id
+                    for value in self.server.approval_responses
+                ))
+                # An explicit empty/cancel response remains a TUI decision;
+                # the gateway must neither invent an answer nor suppress it.
+                answer = ({"answers": {"choice": {"answers": ["Proceed"]}}}
+                          if ordinal % 2 == 0 else {"answers": {}})
+                self.client.respond(request_id, answer)
+                self.wait_interaction("thread-1", False)
+                expected = {"jsonrpc": "2.0", "id": request_id, "result": answer}
+                deadline = time.monotonic() + 5
+                while (expected not in self.server.approval_responses
+                       and time.monotonic() < deadline):
+                    time.sleep(0.01)
+                self.assertIn(expected, self.server.approval_responses)
 
     def test_typed_ids_remain_distinct_until_each_response(self) -> None:
         self.server.emit_user_input(17)

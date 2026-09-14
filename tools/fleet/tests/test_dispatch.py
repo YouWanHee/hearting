@@ -2066,7 +2066,7 @@ class CodexAttemptIdentityTest(unittest.TestCase):
         self.assertEqual(evidence["pid_identity_source"], "host")
         self.assertEqual((evidence["pid_local"], evidence["pid_host"]), (7, pid))
 
-    def test_namespace_local_terminal_heartbeat_is_done(self):
+    def test_namespace_local_terminal_heartbeat_is_only_progress(self):
         with tempfile.TemporaryDirectory() as tmp:
             heartbeat_dir = os.path.join(tmp, ".dispatch", "heartbeats")
             os.makedirs(heartbeat_dir)
@@ -2083,8 +2083,8 @@ class CodexAttemptIdentityTest(unittest.TestCase):
                  mock.patch("fleet.collectors.dispatch.os.path.exists", return_value=False):
                 state = dispatch._dispatch_liveness(job, now=1000.0, track=False)
 
-        self.assertEqual(state, "done")
-        self.assertIn("terminal heartbeat", job.state_evidence["attempt"]["rule"])
+        self.assertNotEqual(state, "done")
+        self.assertNotIn("terminal heartbeat", job.state_evidence["attempt"]["rule"])
 
     def test_namespace_local_stale_heartbeat_never_uses_cwd_transcript(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2220,6 +2220,15 @@ class CodexAttemptIdentityTest(unittest.TestCase):
             self.assertEqual(state, "idle")
             self.assertEqual(rows[0].stage, "parked-supervised")
             self.assertEqual(classifier.call_args.kwargs["supervisor_phase"], "parked")
+            with mock.patch.object(dispatch, "observed_supervised_owner_liveness", return_value=observed), \
+                 mock.patch.object(dispatch, "_job_transcript_signal", return_value="dead"), \
+                 mock.patch.object(dispatch, "read_join_observation", return_value={
+                     "state": "attention", "children": [{"attempt_id": "att-child",
+                     "reason": "process-unverifiable", "recovery_reason": "namespace-not-extinct"}]}):
+                state = dispatch._dispatch_liveness(rows[0], now=1000.0, track=False)
+            self.assertEqual(state, "blocked")
+            self.assertEqual(rows[0].stage, "supervision-attention")
+            self.assertEqual(rows[0].state_evidence["join_observation"]["children"][0]["attempt_id"], "att-child")
 
     def test_legacy_row_without_process_identity_keeps_rollout_fallback(self):
         job = DispatchJob(key="code-test", slug="legacy", cwd="/work/wt",

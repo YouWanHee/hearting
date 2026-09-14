@@ -10,14 +10,14 @@
 
 ## §1. Pipeline Intensity, Stage Graph, and Assurance (canonical)
 
-Pipeline intensity controls which orchestration shape an autopilot entry uses. Verification rigor—how much assurance selected checks receive—is derived from the same intensity through §1.1 rather than selected as a separate axis. There is no user-facing `--qa` selector to reconcile with the pipeline graph.
+Intensity supplies the default recipe below; an explicit graph selects its stages. Rigor (§1.1) budgets only selected checks. QA policy output is a recommendation, never evidence that a check ran. There is no separate user-facing `--qa` selector.
 
 | Stage | Meaning | Typical realization |
 |---|---|---|
 | `intake` | Parse request, mode, constraints, risk, and intensity | Route/capability preflight, spec significance, target selection |
 | `orient` | Gather only the context needed for the selected intensity | Read spec, source, or material artifacts; `orient-lite` for quick |
 | `plan` | Choose the work path before production | Absent for direct, inline micro-plan for quick, durable plan for standard+ |
-| `plan-check` | Check that the plan can safely feed production | Required for quick+; depth scales with intensity |
+| `plan-check` | Check that the plan can safely feed production | Included by the quick+ default recipe; optional in an explicit graph |
 | `produce` | Create or modify the artifact | Code, draft, report, design, spec, or note |
 | `verify` | Run a concrete checker | Tests, visual harness, claim verification, compile, consistency, or drift check |
 | `synth` | Merge independent perspectives into one path | Only when perspective workers ran |
@@ -27,12 +27,12 @@ Pipeline intensity controls which orchestration shape an autopilot entry uses. V
 |---|---|---|---|---|
 | `direct` | `intake → produce → sanity/report` | No plan, plan check, or durable plan; final sanity only | Inline | none/light |
 | `quick` | `intake → orient-lite → micro-plan → plan-check-lite → produce → verify-lite → report` | One dispatch-depth-1 session; 3–4 focused plan questions and one concrete sanity check | One-shot conductor; no dispatch depth 2 | quick |
-| `standard` | `intake → orient → declared framing group → synth/owner-plan → plan-check → optional verifier/planner → produce → verify → report` | Durable plan where the capability owns a work cycle; a declared framing anchor normally opens two asymmetric legs and merges them before planning | Thin conductor dispatches each durable stage as dispatch depth 2 with file-only handoff | standard |
+| `standard` | `intake → orient → synth/owner-plan → plan-check → optional verifier/planner → produce → verify → report` (frame already ran as a fixed two-leg depth-0 bootstrap before this graph starts) | Durable plan where the capability owns a work cycle | Thin conductor dispatches each durable stage as dispatch depth 2 with file-only handoff | standard |
 | `strong` | Standard plus every declared strong-tier group and an optional fix loop | Retain framing breadth and open the declared plan-committal, implementation-review, or other risk groups; a registry `width_by_intensity` may widen a high-value group to three legs | Stage dispatch plus bounded parallel-group fan-out/fan-in; exact width is route-sealed | standard/thorough |
 | `thorough` | Strong groups plus deeper synthesis/verification | A declared group may add a third implementation-risk, failure-mode, or contrarian leg; unchanged groups remain width two | The base recipe realizes only registry-declared 2–4-way siblings; composed routes may add other bounded dispatch-depth-2 perspectives | thorough |
 | `adversarial` | Thorough plus adversarial failure-mode/security verification | Use the route-declared width and adversarial perspective; no undeclared fan-out | Bounded declared group or composed adversary/verifier; dispatch depth remains at most 2 | adversarial |
 
-Stage-local gates stay cheap and ask only whether output can feed the next stage. An independent QA pass uses another harness, execution profile, perspective, or model family and runs only where selected intensity calls for it. A declared `cross-harness` group must realize at least two eligible harnesses; N greater than the harness count gains additional independence through profile and perspective diversity. Final verification remains capability-specific. Every non-direct graph includes at least a small plan check because a bad plan corrupts every downstream stage.
+Stage gates check whether output can feed the next stage. Independent QA runs only where selected, using another harness, profile, perspective, or model family. A declared `cross-harness` group requires two eligible harnesses; further legs add profile or perspective diversity. Final verification remains capability-specific. Never add an omitted plan-check or report an unexecuted check as passed.
 
 Dispatch depth is portable route topology, not process ancestry, runtime-native
 agent nesting, or proof of registry membership. Dispatch dispatch depth 0 is user-facing
@@ -59,13 +59,13 @@ alone are insufficient.
 
 ### §1.1. Verification Rigor Tiers
 
-Rigor is an assurance budget inside the graph selected by intensity. It does not create stages, choose topology, or grant dispatch depth 2. Reviewer counts are upper bounds for a selected pass rather than automatic fan-out after every stage.
+Rigor budgets assurance inside the selected graph. It creates no stages or dispatch depth. Reviewer counts bound a selected pass; they do not require fan-out after each stage.
 
 | Rigor | Derived from | Plan check | Selected independent pass | Final verification | Retry budget |
 |---|---|---|---|---|---|
 | `quick` | `quick` | Self-check or 3–4 focused questions | None by default; the self-check itself carries the adversarial stance below | One concrete sanity check | None automatically |
 | `light`/none | `direct` | Focused self-check if present, held to the adversarial stance below | At most one fast reviewer at an already selected review point | Focused command, render, or source check | One pass |
-| `standard` | `standard`, `strong` | Lightweight independent review where planning exists | A framing group normally starts at width two; `strong` opens every declared strong-tier group and may widen selected high-value anchors according to the sealed registry policy | Normal capability verification; source check when relevant | At most one correction |
+| `standard` | `standard`, `strong` | Lightweight independent review where planning exists | Frame is a fixed two-leg depth-0 bootstrap that does not scale with rigor; `strong` opens every declared strong-tier plan/implementation-review group and may widen selected high-value anchors according to the sealed registry policy | Normal capability verification; source check when relevant | At most one correction |
 | `thorough` | `thorough` | Deeper or multi-axis review | Keep declared groups and realize their thorough width, commonly adding an implementation-risk, failure-mode, or contrarian third leg | Broader evidence and adequacy review | Up to two corrections |
 | `adversarial` | `adversarial` | Hostile owner-plan critique | Realize the adversarial route width and any selected security, contradiction, or failure-mode perspective | Verification plus adversarial evidence | Two corrections plus one selected adversary pass |
 
@@ -74,7 +74,7 @@ A correction in the retry budget is one **batched** pass that closes every block
 Two properties cut across every rigor tier and do not scale away at low intensity:
 
 1. **Adversarial stance is universal (all tiers, including `direct` and `quick`).** Any review or self-check that runs adopts a refute-by-default posture: it actively tries to falsify the artifact's correctness claims, enumerates the concrete failure modes it can substantiate, and treats inadequate evidence as *not proven* rather than a pass. This is a stance inside whatever check already runs, not an added stage, so it adds no dispatch at `direct`/`quick`. It is what makes review adversarial before any separate adversary *pass* exists.
- 2. **Independent exploration is bounded, asymmetric, and cross-harness first.** Registry-v6 `parallel_groups` declare exactly which direction, plan, review, or verification anchors fan out, their intensity-specific width, and ordered execution-profile/perspective legs. Width is 2–4 and is never inferred from reviewer count. `cross-harness` means the group realizes at least two eligible harnesses; `model-profile` and `perspective` axes reduce correlated failure when N exceeds available harness families. For the code track, framing starts at width two for `standard` and adds a deep contrarian leg at `strong+`; plan and implementation review start at width two for `strong` and add a light implementation-risk or deep failure-mode leg at `thorough+`. Other capabilities keep their migrated width-two groups unless their own registry/spec explicitly widens them. All legs are blind siblings at dispatch depth 2, write disjoint artifacts, and join before continuation; evidence synthesis is not a majority vote. When only one harness is available, an explicitly requested cross-harness pass fails loudly; an auto-selected group may use typed same-harness degradation while retaining profile/perspective diversity. `direct`/`quick` stay single-session but keep the adversarial stance from (1).
+ 2. **Independent exploration is bounded, asymmetric, and cross-harness first.** Registry-v6 `parallel_groups` declare exactly which direction, plan, review, or verification anchors fan out, their intensity-specific width, and ordered execution-profile/perspective legs. Width is 2–4 and is never inferred from reviewer count. `cross-harness` means the group realizes at least two eligible harnesses; `model-profile` and `perspective` axes reduce correlated failure when N exceeds available harness families. For the code track, the frame pair is the depth-0 bootstrap layer (two legs at every intensity from `quick`), not a group; plan and implementation review start at width two for `strong` and add a light implementation-risk or deep failure-mode leg at `thorough+`. Other capabilities keep their migrated width-two groups unless their own registry/spec explicitly widens them. All legs are blind siblings at dispatch depth 2, write disjoint artifacts, and join before continuation; evidence synthesis is not a majority vote. When only one harness is available, an explicitly requested cross-harness pass fails loudly; an auto-selected group may use typed same-harness degradation while retaining profile/perspective diversity. `direct`/`quick` stay single-session but keep the adversarial stance from (1).
 
  3. **Leg class is a gate-authority axis, separate from the model-profile budget axis.** Every leg declares `leg_class: peer` or `leg_class: auxiliary`. A **peer** leg carries part of the group's gate authority — at least one realized peer leg must land on a quality-peer harness (SD-100 ①) — and is where cross-harness independence is demanded. An **auxiliary** leg is advisory: it widens the group with a closed narrow check (assumption, edge-case, failure-mode, simplicity, test-gap) on the `light` budget, cannot block the stage by itself (its unit verdict enum carries no blocking token), and its findings feed the arbiter's `auxiliary_findings_considered`. The **arbiter is never the group's own anchor** — it is the owner's merge record for a `review-worker` anchor, the declared downstream consumer for a `map-worker` anchor, and the direct downstream `review-worker` for a `pipeline-stage` anchor (`OPERATIONS §5.10`). `model_profile` remains the execution-budget axis and never selects gate authority; a peer leg's budget and an auxiliary leg's advisory role are orthogonal. Existing `light` scout legs on `frame`/`plan`/`impl-review` stay `peer` — only newly declared narrow-check legs are `auxiliary`.
 
@@ -156,23 +156,29 @@ Predetermined work selects light for short-local execution and balanced for
 extended-multistep execution. Important judgment selects balanced-deep at either
 length; difficult-uncertain judgment selects deep at either length. Length alone
 never selects a deep profile. Important explicit deep records additional judgment
-headroom; important permits only balanced-deep/deep, difficult-uncertain only deep,
-and predetermined explicit selection must match its exact cell.
+headroom. These are recommendations: an explicit known profile takes precedence
+without requiring a demand document or a justification for overriding the matrix.
 
 The selection records schema/source/resolver_version/demand_digest/resolved_profile/
-judgment_floor/reason. `judgment_floor` is none, balanced-deep, or deep, independently
-of execution length. Compile and compose seal the normalized demand and selection
+judgment_floor/reason. `judgment_floor` retains the historical field name for the recommendation,
+not a launch minimum; it is unknown when no demand was supplied. Compile and compose seal the normalized demand and selection
 for the owner and every realized node/leg; all launch surfaces consume that seal.
 Unknown/partial inputs, empty evidence, version mismatch, or tampering fail before
 spawn. Completely unannotated versioned stages keep their existing profile with
 source=legacy, demand_digest=null, judgment_floor=unknown and
 reason=unannotated-existing-stage. Existing sealed routes retain their original
-bytes/hash. New ad-hoc stages require full demand inputs.
+bytes/hash. New ad-hoc stages provide either an explicit profile or demand inputs.
 
 The unannotated quick owner=balanced-deep and standard+ owner=deep are compatibility
-values, never evidence of demand. Existing owner eligibility, QA, intensity, depth,
-peer authority and vendor constraints remain independent. A selected cell that
-conflicts with owner eligibility is a typed rejection, never a silent reassignment.
+defaults, used only when neither an explicit profile nor an owner demand is supplied. A complete owner demand
+selects its model through the same resolver as a stage; intensity does not impose
+a second profile floor. Compile and verification recompute this one selection,
+and quick's one-shot process carries its owner's selection. Registered-profile
+eligibility, QA, intensity, depth, peer authority and vendor constraints remain
+independent. Invalid supplied data or an unknown profile is rejected before
+route issuance; choosing outside the recommendation is not a refusal.
+`compose --profile light` selects light for the owner and model nodes; an
+optional per-node explicit map overrides that choice without a demand file.
 Capacity substitution stays inside the sealed profile and eligible vendor band.
 Effort labels are adapter/model-relative operating points, never portable scores.
 OpenCode balanced preserves the selected light point and reports
@@ -209,18 +215,18 @@ For standard+ code stage dispatch, role and profile are explicit: ordinary frame
 
 ## §3. Hard Cross-Document Invariants
 
-1. Intensity selects graph and depth; §1.1 derives assurance from intensity. There is no user-facing `--qa` axis, and rigor alone cannot open dispatch depth 2 or a full pipeline.
+1. Explicit graph selection takes precedence over the intensity recipe. §1.1 budgets selected checks; QA alone opens no stage or dispatch depth.
 2. Quick means one-session micro-plan, plan-check-lite, and verify-lite carrying the adversarial stance (§1.1). Requiring a durable plan, an added independent pass, or parallel/cross-harness reviewer fan-out for a small `direct`/`quick` task is still drift; the universal adversarial stance is a posture inside the existing check, not a new stage or session.
 3. Adversarial means thorough plus a selected external adversary, failure-mode, security, or claim-verification pass. `standard + external/Codex` is not the definition.
 4. Code has no fact-checker.
-5. Do not hardcode code-test to thorough or parallel QA on every call; scale final verification from intensity-derived rigor. Registry-v6 `parallel_groups` alone declare an anchor's intensity-specific width, profile, perspective, join, and independence axes. Width stays 2–4, is selective rather than universal, and never applies to `direct`/`quick`.
+5. Do not hardcode code-test to thorough or parallel QA on every call; scale final verification from intensity-derived rigor. Registry-v6 `parallel_groups` alone declare an anchor's intensity-specific width, profile, perspective, join, and independence axes. Width stays 2–4, is selective rather than universal, and never applies to `direct`; at `quick` it reaches the bootstrap layer alone — the two frame legs before owner launch — and not quick's work graph, which stays exactly one `one-shot` node.
 6. `--no-fact-check` and `--no-style-audit` must not leak to unrelated capabilities.
 7. An external review wrapper is not the reviewer; separate the independent engine from the mechanical orchestrator.
 8. New or strengthened instructions, rules, and hooks preserve why, including the motivating incident and date, inline or in the commit message. Drills are the strongest executable preservation of intent.
 9. Never reduce a semantic requirement to token or regex rules without verifying that meaning is preserved; see `DESIGN_PRINCIPLES §0.7`.
 10. Token pressure is orthogonal to intensity and cannot reduce graph, depth, dispatch, model role/profile, assurance, required guards, or input context.
 11. Primary routing is semantic (`WORKFLOW §0.2`): new empirical work keeps the execution capability primary, and secondary capabilities never substitute for it. Native sub-agent restrictions and registered headless-dispatch restrictions are separate delegation surfaces (`OPERATIONS §5.10`); extending one to the other requires verified runtime evidence, and the fallback is inline execution with the reason recorded.
-12. Two assurance properties are intensity-independent: (a) every review that actually runs carries the refute-by-default adversarial **stance** of §1.1; (b) an independent pass declares and records its actual independence axes. Cross-harness remains primary, while model-profile and perspective asymmetry generalize dual-model direction exploration into bounded N-way groups. Only the registry may select or widen a group, and neither property converts `direct`/`quick` into added sessions.
+12. Two assurance properties are intensity-independent: (a) every review that actually runs carries the refute-by-default adversarial **stance** of §1.1; (b) an independent pass declares and records its actual independence axes. Cross-harness remains primary, while model-profile and perspective asymmetry generalize dual-model direction exploration into bounded N-way groups. Only the registry may select or widen a group, and neither property converts `direct` into added sessions or widens quick's work graph — quick's direction-setting is a separately declared layer before owner launch, not a widened group inside it.
 13. Conditional follow-ups are route-sealed owner postconditions. They cannot be
     inferred from hooks, silently omitted while their readiness condition is
     true, or represented as an extra dispatch depth. A false condition records

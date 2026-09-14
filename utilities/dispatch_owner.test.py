@@ -49,6 +49,40 @@ class DispatchOwnerTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_native_quota_blocks_selection_and_preserves_sealed_candidates(self):
+        import time
+        import dispatch_capacity_evidence as quota
+        runtime = self.home / "claude-home"
+        runtime.mkdir()
+        (runtime / ".claude.json").write_text(json.dumps({"oauthAccount": {
+            "accountUuid": "fixture-account", "organizationUuid": "fixture-org"}}))
+        env = {"HOME": str(self.home), "CLAUDE_CONFIG_DIR": str(runtime)}
+        now = int(time.time())
+        log = self.home / "att-selector-quota.claude.jsonl"
+        log.write_text(json.dumps({"type": "rate_limit_event", "session_id": "fixture",
+            "rate_limit_info": {"status": "rejected", "rateLimitType": "seven_day", "resetsAt": now + 3600}}) + "\n" +
+            json.dumps({"type": "result", "session_id": "fixture", "is_error": True, "api_error_status": 429}) + "\n")
+        stamp = datetime.fromtimestamp(now, timezone.utc).isoformat()
+        scope = quota.launch_scope("claude", env)
+        self.jobs.write_text(f"{stamp}\tdone\t/r\t/w\tfailed\t"
+            f"harness=claude,attempt_id=att-selector-quota,note=dead-launch-exit-1,log_file={log},"
+            + ",".join(f"{k}={v}" for k,v in scope.items()) + "\n")
+        before = self.jobs.read_bytes()
+        result = self.run_owner(config=self.quality_config())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("\nadapter=codex\n", result.stdout)
+        self.assertIn("eligibility.claude=limited(", result.stdout)
+        self.assertEqual(before, self.jobs.read_bytes())
+        # A Claude-only user policy stays unavailable; no quality-band widening.
+        path = self.quality_config()
+        policy = path.read_text().replace("enabled: [claude, codex, opencode]", "enabled: [claude]")
+        policy = policy.replace("primary: [claude, codex]", "primary: [claude]").replace("[opencode]", "[]")
+        path.write_text(policy)
+        refused = self.run_owner(config=path)
+        self.assertEqual(refused.returncode, 65, refused.stdout + refused.stderr)
+        self.assertIn("child_spawned=0", refused.stdout)
+        self.assertNotIn("\nadapter=codex\n", refused.stdout)
+
     def config(self, owners="claude"):
         path = self.home / "dispatch-defaults.yaml"
         path.write_text(
@@ -746,6 +780,16 @@ class RouteEvidenceOwnerHarnessTest(unittest.TestCase):
                                 {"harness": "claude", "status": "unsupported"}]})
         self.assertEqual(OWNER._sealed_owner_harnesses(path), {"codex"})
 
+    def test_standard_frame_selects_child_harness_without_owner_policy(self):
+        path = self._route({"effective_intensity": "standard",
+                            "dispatch_evidence": {"tuples": [
+                                {"parent_harness": "claude", "child_harness": "codex",
+                                 "status": "supported"}]},
+                            "owner_harness_policy": {"primary": ["claude"]}})
+        context = OWNER._sealed_owner_context(path, worker_type="frame")
+        self.assertEqual(context["harnesses"], {"codex"})
+        self.assertIsNone(context["policy"])
+
     def test_direct_route_has_no_owner_to_bind(self):
         path = self._route({"effective_intensity": "direct", "dispatch_evidence": None})
         with self.assertRaises(OWNER.OwnerError) as caught:
@@ -772,7 +816,7 @@ class RouteEvidenceOwnerHarnessTest(unittest.TestCase):
         both and every quick owner died at launch.
         """
         source = Path(OWNER.__file__).read_text(encoding="utf-8")
-        body = source.split("if route_data.get(\"effective_intensity\") == \"quick\":", 1)[1]
+        body = source.split('if values["--worker-type"] == "frame" or route_data.get("effective_intensity") == "quick":', 1)[1]
         quick, standard = body.split("else:", 1)
         self.assertIn('"--route-file", binding.route_file', quick)
         code = "\n".join(
@@ -825,6 +869,26 @@ class RegisteredReviewerLaunchTest(unittest.TestCase):
         # reviewer reads, and it is the field the completion gate later checks.
         self.assertIn("--unit", forwarded)
         self.assertIn("qa/code-review", forwarded)
+
+    def test_a_frame_launch_needs_all_four_artifact_scope_variables(self):
+        # OPERATIONS §5.10b used to ask depth-0, in prose, to export all four
+        # before every frame launch. The launch checks it now: any subset is
+        # refused at the caller, naming exactly what is missing.
+        four = {name: "/fixture/" + name.lower() for name in OWNER._FRAME_ARTIFACT_ENV}
+        for dropped in OWNER._FRAME_ARTIFACT_ENV:
+            with self.subTest(dropped=dropped), mock.patch.dict(os.environ, four):
+                del os.environ[dropped]
+                with self.assertRaises(OWNER.OwnerError) as caught:
+                    self._parse("--worker-type", "frame", "--unit", "plan/frame")
+                self.assertEqual(str(caught.exception), "frame-artifact-scope-missing:" + dropped)
+        with mock.patch.dict(os.environ, four):
+            _, values, _, _, _ = self._parse("--worker-type", "frame", "--unit", "plan/frame")
+        self.assertEqual(values["--worker-type"], "frame")
+        # owner and review launches are untouched by the frame-only check
+        with mock.patch.dict(os.environ, {}, clear=False):
+            for name in OWNER._FRAME_ARTIFACT_ENV:
+                os.environ.pop(name, None)
+            self._parse("--worker-type", "review", "--unit", "qa/code-review")
 
     def test_a_review_tuple_without_a_unit_is_refused(self):
         # `worker_type=review` with no unit reaches the mode contract as
@@ -1036,6 +1100,85 @@ class RouteDerivedOwnerTupleTest(unittest.TestCase):
         self.assertIn("--qa", str(caught.exception))
 
 
+class FrameModelRoleHandoffTest(unittest.TestCase):
+    _route = RouteDerivedOwnerTupleTest._route
+
+    def setUp(self):
+        self.env = mock.patch.dict(os.environ, {
+            name: "/fixture/" + name.lower() for name in OWNER._FRAME_ARTIFACT_ENV
+        })
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
+    def _args(self, node="frame", **overrides):
+        path = self._route(nodes=[{"id": node, "role": "deep maker", "model_profile": "deep"}], **overrides)
+        return ["--dry-run", "--route-evidence", path, "--route-node", node,
+                "--worker-type", "frame", "--unit", "plan/frame", "--prompt-text", "probe"]
+
+    def test_route_node_alone_supplies_frame_identity_without_copied_environment(self):
+        path = self._route(nodes=[{"id": "frame", "role": "deep maker", "model_profile": "light",
+                                 "unit": "plan/frame", "dispatch_depth": 1}])
+        with mock.patch.dict(os.environ, {}, clear=True):
+            _, values, forwarded, _, _ = OWNER._parse([
+                "--start", "--route-evidence", path, "--route-node", "frame", "--prompt-text", "probe"])
+        self.assertEqual(values["--worker-type"], "frame")
+        self.assertEqual(values["--unit"], "plan/frame")
+        self.assertEqual(values["--dispatch-depth"], "1")
+        for harness in ("codex", "claude", "opencode"):
+            spec = importlib.util.spec_from_file_location("frame_identity_" + harness,
+                ROOT / "adapters" / harness / "bin" / "dispatch-headless.py")
+            adapter = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = adapter
+            spec.loader.exec_module(adapter)
+            args = adapter.parser().parse_args(forwarded)
+            self.assertEqual(args.worker_type, "frame")
+            self.assertEqual(args.dispatch_depth, 1)
+            self.assertEqual(adapter.resolve_model_settings(args)["profile"], "light")
+
+    def test_actual_adapter_parsers_and_resolvers_consume_the_selected_node_role(self):
+        for node in ("frame", "frame-alternative"):
+            _, values, forwarded, _, _ = OWNER._parse(self._args(node))
+            self.assertEqual(values["--model-profile"], "deep")
+            for harness in ("codex", "claude", "opencode"):
+                with self.subTest(node=node, harness=harness):
+                    path = ROOT / "adapters" / harness / "bin" / "dispatch-headless.py"
+                    spec = importlib.util.spec_from_file_location("frame_role_" + harness, path)
+                    adapter = importlib.util.module_from_spec(spec)
+                    sys.modules[spec.name] = adapter
+                    spec.loader.exec_module(adapter)
+                    args = adapter.parser().parse_args(forwarded)
+                    # No fake role/profile resolver: use the adapter's actual profile selection.
+                    settings = adapter.resolve_model_settings(args)
+                    self.assertEqual(settings["role"], "deep maker")
+                    self.assertEqual(settings["profile"], "deep")
+                    args.model_role = None
+                    with self.assertRaises(adapter.ModelSelectionError) as caught:
+                        adapter.resolve_model_settings(args)
+                    self.assertEqual(caught.exception.reason, "model-profile-role-required")
+
+    def test_explicit_complete_tuple_still_gets_the_sealed_role(self):
+        args = self._args() + ["--worktree", "/w/tree", "--slug", "s", "--capability", "autopilot-code",
+            "--capability-mode", "audit", "--qa", "standard", "--intensity", "quick",
+            "--dispatch-depth", "1", "--assigned-contract", "autopilot-code",
+            "--owner", "autopilot-code", "--model-profile", "deep"]
+        _, values, forwarded, _, _ = OWNER._parse(args)
+        self.assertEqual(values["--model-role"], "deep maker")
+        self.assertEqual(forwarded.count("--model-role"), 1)
+
+    def test_caller_cannot_replace_either_sealed_model_axis(self):
+        for flag, value in (("--model-role", "fast reviewer"), ("--model-profile", "light")):
+            with self.subTest(flag=flag), self.assertRaises(OWNER.OwnerError) as caught:
+                OWNER._parse(self._args() + [flag, value])
+            self.assertEqual(str(caught.exception), "route-evidence-arg-mismatch:" + flag)
+
+    def test_a_missing_sealed_role_cannot_be_supplied_by_the_caller(self):
+        path = self._route(nodes=[{"id": "frame", "model_profile": "deep"}])
+        with self.assertRaises(OWNER.OwnerError) as caught:
+            OWNER._parse(["--dry-run", "--route-evidence", path, "--route-node", "frame",
+                          "--worker-type", "frame", "--unit", "plan/frame", "--model-role", "deep maker"])
+        self.assertEqual(str(caught.exception), "route-node-model-setting-missing:--model-role")
+
+
 class RefusalHintTest(unittest.TestCase):
     """Every typed refusal that has a known next step prints it as `hint=`."""
 
@@ -1164,6 +1307,7 @@ class RouteDefaultsReceiptTest(unittest.TestCase):
              mock.patch.object(OWNER, "_usage", return_value={"claude": "ok", "codex": "ok", "opencode": "ok"}), \
              mock.patch.object(OWNER._capacity, "capacity_scores", return_value={"claude": 80.0, "codex": 80.0, "opencode": 80.0}), \
              mock.patch.object(OWNER, "derive_quick_owner_binding", return_value=binding), \
+             mock.patch("artifact_producer.prepare_route_artifact_env", return_value={}), \
              mock.patch.dict(os.environ, _isolated_env({"AGENT_DISPATCH_JOBS": str(jobs)}), clear=True), \
              redirect_stdout(buf):
             rc = OWNER.main(["--dry-run", "--route-evidence", str(path), "--prompt-text", "probe"])
@@ -1196,6 +1340,7 @@ class RouteDefaultsReceiptTest(unittest.TestCase):
              mock.patch.object(OWNER, "_usage", return_value={"claude": "ok", "codex": "ok", "opencode": "ok"}), \
              mock.patch.object(OWNER._capacity, "capacity_scores", return_value={"claude": 80.0, "codex": 80.0, "opencode": 80.0}), \
              mock.patch.object(OWNER, "derive_quick_owner_binding", return_value=binding), \
+             mock.patch("artifact_producer.prepare_route_artifact_env", return_value={}), \
              mock.patch.dict(os.environ, _isolated_env({"AGENT_DISPATCH_JOBS": str(jobs)}), clear=True), \
              redirect_stdout(buf):
             rc = OWNER.main(["--dry-run", "--route-evidence", str(path), "--worktree", str(ROOT), "--slug", "probe",

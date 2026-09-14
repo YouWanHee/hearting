@@ -109,6 +109,32 @@ def assert_node_state(state: str) -> str:
     return state
 
 
+def completion_transition_path(current: str, target: str, registry_path=None) -> list[str]:
+    """Find the existing success path; never traverse recovery or human release.
+
+    Terminal evidence can arrive before lifecycle observations are journaled.
+    The completion writer catches up along the registry's legal transitions,
+    instead of requiring callers to manufacture intermediate state changes.
+    """
+    vocab = vocabulary(registry_path)
+    failures = frozenset(vocab["failure_states"])
+    if current in failures:
+        raise WorkflowStateError(f"workflow completion requires resolution of {current}")
+    pending = [(current, [])]
+    visited = set()
+    while pending:
+        state, path = pending.pop(0)
+        if state == target:
+            return path
+        if state in visited:
+            continue
+        visited.add(state)
+        pending.extend((next_state, [*path, next_state])
+                       for next_state in vocab["transitions"].get(state, ())
+                       if next_state not in failures and next_state not in visited)
+    raise WorkflowStateError(f"no successful completion path {current} -> {target}")
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -386,6 +412,44 @@ class WorkflowLedger:
         })
         return self.state()
 
+    def completion_paths(self, terminal_nodes, terminal_gates):
+        """Validate the full completion suffix without modifying the journal."""
+        current = self.state()
+        if not terminal_nodes or any(
+                terminal_gates.get(node, {}).get("passed") is not True
+                for node in terminal_nodes) or any(
+                row.get("passed") is not True for row in terminal_gates.values()):
+            raise WorkflowStateError("terminal-gate-unproven")
+        failures = frozenset(vocabulary(self.registry_path)["failure_states"])
+        for node, row in current["nodes"].items():
+            if row.get("state") in failures:
+                raise WorkflowStateError(
+                    f"workflow completion requires resolution of {node}:{row['state']}")
+        workflow_path = completion_transition_path(
+            current["workflow_state"], "COMPLETE", self.registry_path)
+        node_paths = {}
+        for node in terminal_nodes:
+            previous = current["nodes"].get(node, {}).get("state")
+            path = (completion_transition_path(previous, "STAGE_SUCCEEDED", self.registry_path)
+                    if previous else ["STAGE_SUCCEEDED"])
+            for step in path:
+                assert_node_state(step)
+            node_paths[node] = path
+        return node_paths, workflow_path
+
+    def complete(self, terminal_nodes, terminal_gates, *, actor="complete") -> dict:
+        """Append the prevalidated suffix under the caller's ledger lock.
+
+        After an I/O interruption, the same planner returns only missing steps.
+        """
+        node_paths, workflow_path = self.completion_paths(terminal_nodes, terminal_gates)
+        for node, path in node_paths.items():
+            for step in path:
+                self.record(node, step, evidence={"terminal_gate": terminal_gates[node]}, actor=actor)
+        for step in workflow_path:
+            self.set_workflow_state(step, evidence={"terminal_gates": terminal_gates}, actor=actor)
+        return self.state()
+
     # -- exactly-once claims -----------------------------------------------------
     def claim_path(self, key: str) -> Path:
         if not key or not all(character in "0123456789abcdef" for character in key):
@@ -554,6 +618,9 @@ def human_gate_resolution(entries: list, gate: str) -> dict:
                 # that against the route binding.
                 "release_authority": evidence.get("release_authority") or None,
             })
+            result.pop("artifact_sha256", None)
+            if evidence.get("artifact_sha256"):
+                result["artifact_sha256"] = evidence["artifact_sha256"]
             continue
         if result["status"] != "blocked":
             continue
@@ -578,3 +645,31 @@ def human_gate_resolution(entries: list, gate: str) -> dict:
                 "answers": evidence.get("answers"),
             })
     return result
+
+
+def node_raises_human_gate(node: dict, gate: str) -> bool:
+    return ((node.get("continuation") or {}) == {"kind": "human-gate", "gate": gate}
+            or gate in node.get("inline_human_gates", []))
+
+
+def require_gate_artifact_current(resolution: dict) -> None:
+    digest = resolution.get("artifact_sha256")
+    path = Path(str(resolution.get("artifact") or ""))
+    if (not digest or not path.is_absolute() or not path.is_file()
+            or hashlib.sha256(path.read_bytes()).hexdigest() != digest):
+        raise WorkflowStateError("inline-gate-preview-changed-or-unbound")
+
+
+def require_inline_gate_release(route: dict, node: dict, *, jobs=None) -> None:
+    from route_identity import route_hash
+    if route.get("route_hash") != route_hash(route):
+        raise WorkflowStateError("inline-gate-route-identity-mismatch")
+    ledger = WorkflowLedger(route["route_id"], route["route_hash"], jobs=jobs)
+    for gate in node.get("inline_human_gates", []):
+        binding = {"gate": gate, "node": node["id"], "position": "terminal"}
+        if binding not in route.get("human_gate_bindings", []):
+            raise WorkflowStateError("inline-gate-binding-missing")
+        resolution = human_gate_resolution(ledger.journal(), gate)
+        if resolution["status"] != "proceed" or resolution.get("actor_kind") != "user":
+            raise WorkflowStateError("inline-gate-unreleased:" + gate)
+        require_gate_artifact_current(resolution)

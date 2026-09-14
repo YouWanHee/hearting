@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -58,9 +59,6 @@ class ProgressTest(unittest.TestCase):
         `--phase launch` failed `progress-phase-regression` and that exit was
         reported as `progress-watchdog-fail-closed`."""
         P.heartbeat(self.args(phase="analysis", kind="tool", evidence="reading"), 5)
-        with self.assertRaises(D.DispatchContractError) as caught:
-            P.heartbeat(self.args(), 6)
-        self.assertEqual(caught.exception.reason, "progress-phase-regression")
         kept = P.heartbeat(self.args(if_absent=True), 6)
         self.assertEqual((kept["phase"], kept["evidence"]), ("analysis", "reading"))
         # first seed on an empty state still writes launch
@@ -73,14 +71,104 @@ class ProgressTest(unittest.TestCase):
                        "--phase", "launch", "--kind", "registry", "--evidence", "x", "--if-absent"])
         self.assertEqual(code, 0)
 
-    def test_warning_then_exact_interrupt(self):
+    def test_phase_is_current_work_and_test_can_return_to_tool(self):
+        test=P.heartbeat(self.args(phase="test",kind="test",evidence="test-1"),1)
+        tool=P.heartbeat(self.args(phase="tool",kind="tool",evidence="inspect-failure"),2)
+        self.assertEqual(tool["sequence"],test["sequence"]+1)
+        self.assertEqual(P.heartbeat(self.args(phase="tool",kind="tool",evidence="inspect-failure"),3),tool)
+
+    def test_native_tool_progress_replaces_per_tool_model_heartbeat(self):
+        log=self.base/"worker.jsonl"
+        # This exact log path is registered before observing the runtime.
+        text=self.jobs.read_text().rstrip()+",log_file="+str(log)+"\n"
+        self.jobs.write_text(text)
+        fixtures=[
+            ({"type":"item.started","item":{"id":"cmd-1","type":"command_execution","command":"private text"}},
+             {"type":"item.completed","item":{"id":"cmd-1","type":"command_execution","aggregated_output":"private output"}}),
+            ({"type":"assistant","message":{"content":[{"type":"tool_use","id":"call-1","input":{"secret":"x"}}]}},
+             {"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"call-1","content":"private output"}]}}),
+            ({"type":"tool_use","part":{"type":"tool","callID":"call-2","state":{"status":"running","input":{"secret":"x"}}}},
+             {"type":"tool_use","part":{"type":"tool","callID":"call-2","state":{"status":"completed","output":"private output"}}}),
+        ]
+        for i,(started,finished) in enumerate(fixtures):
+            with self.subTest(runtime=i):
+                log.write_text(json.dumps(started)+"\n")
+                event=P.runtime_tool_progress({"log_file":str(log)})
+                self.assertIsNotNone(event)
+                self.assertNotIn("private",json.dumps(event))
+                with log.open("a") as out:out.write(json.dumps(finished)+"\n")
+                completed=P.runtime_tool_progress({"log_file":str(log)},event)
+                self.assertNotEqual(completed,event)
+                with log.open("a") as out:out.write(json.dumps(finished)+"\n")
+                self.assertEqual(P.runtime_tool_progress({"log_file":str(log)},completed),completed)
+                # Arbitrarily long speech cannot grant progress or erase the last tool.
+                with log.open("a") as out:out.write(json.dumps({"type":"text","text":"speech"*50000})+"\n")
+                self.assertEqual(P.runtime_tool_progress({"log_file":str(log)},completed),completed)
+        log.write_text(json.dumps(fixtures[0][0])+"\n")
+        first=P.watchdog(self.args(),0)
+        with log.open("a") as out:out.write(json.dumps(fixtures[0][1])+"\n")
+        second=P.watchdog(self.args(),9)
+        self.assertEqual(second["last_progress_at"],9)
+        with log.open("a") as out:out.write(json.dumps({"type":"text","text":"more words"})+"\n")
+        third=P.watchdog(self.args(),18)
+        self.assertEqual(third["last_progress_at"],9)
+        self.assertFalse(third.get("terminal_action"))
+        fourth=P.watchdog(self.args(),20)
+        self.assertEqual(fourth["action"],"warning")
+
+    def test_stall_notifies_without_signal_failure_or_retry_then_progress_resumes(self):
+        text=self.jobs.read_text().rstrip()+",parent_sid=thread-fixture,parent_completion_delivery=codex-managed-gateway\n"
+        self.jobs.write_text(text)
         P.heartbeat(self.args(), 0)
-        first = P.watchdog(self.args(), 10)
-        self.assertEqual((first["warning"], first["action"]), (1, "warning"))
-        second = P.watchdog(self.args(apply=True), 20)
-        self.assertEqual(second["terminal_action"], "dead-no-progress")
-        self.proc.wait(timeout=3)
-        self.assertIn("note=dead-no-progress", self.jobs.read_text())
+        first=P.watchdog(self.args(),10)
+        self.assertEqual(first["action"],"warning")
+        original=self.jobs.read_bytes()
+        with mock.patch.object(P,"signal_authoritative_process_group") as signal:
+            second=P.watchdog(self.args(apply=True),20)
+            again=P.watchdog(self.args(apply=True),30)
+        signal.assert_not_called()
+        self.assertEqual(second["action"],"no-progress")
+        self.assertTrue(second["supervision_notice_ids"],second)
+        self.assertEqual(second["supervision_notice_ids"],again["supervision_notice_ids"])
+        self.assertFalse(second.get("terminal_action"))
+        self.assertIsNone(self.proc.poll())
+        self.assertEqual(self.jobs.read_bytes(),original)
+        P.heartbeat(self.args(phase="tool",kind="tool",evidence="slow-tool-finished"),31)
+        self.assertEqual(P.watchdog(self.args(apply=True),31)["action"],"observe")
+        # A later successful commit remains the sole terminal authority.
+        self.proc.terminate();self.proc.wait(timeout=5)
+        fields=self.jobs.read_text().strip().split("\t")
+        fields[1]="done";fields[5]+=",note=completed-marker,failure_class=pass"
+        self.jobs.write_text("\t".join(fields)+"\n")
+        self.assertEqual(P.watchdog(self.args(apply=True),32)["terminal_action"],"registry-terminal")
+
+    def test_closed_row_consumes_portable_receipt_but_cached_observation_cannot(self):
+        self.proc.terminate(); self.proc.wait(timeout=5)
+        fields = self.jobs.read_text().strip().split("\t")
+        metadata = D.parse_registry_metadata(fields[5])
+        metadata.update(pid_scope="namespace-local", pid_ns="pid:[foreign-fixture]",
+            pid_observer_ns="pid:[foreign-fixture]", launch_lifecycle="detached",
+            launch_outcome="governed-process-group-drained", group_reap_proof=D.GROUP_REAP_PROOF,
+            group_reap_pgid=metadata["pgid"], attempt_descendant_proof=D.ATTEMPT_DESCENDANT_PROOF,
+            attempt_descendant_observer_ns="pid:[foreign-fixture]", note="completed-marker")
+        fields[1] = "done"
+        fields[5] = ",".join(f"{k}={v}" for k,v in metadata.items())
+        self.jobs.write_text("\t".join(fields)+"\n")
+        result = P.watchdog(self.args(), 10)
+        self.assertEqual(result["terminal_action"], "registry-terminal", result)
+        # The same cached action and portable receipt on an open row do not
+        # grant terminal authority. Nor does an incomplete receipt on a closed row.
+        fields[1] = "open"
+        self.jobs.write_text("\t".join(fields)+"\n")
+        result = P.watchdog(self.args(), 11)
+        self.assertEqual(result["terminal_action"], "", result)
+        self.assertEqual(result["action"], "fail-closed-process-unverifiable")
+        fields[1] = "done"
+        metadata.pop("group_reap_proof")
+        fields[5] = ",".join(f"{k}={v}" for k,v in metadata.items())
+        self.jobs.write_text("\t".join(fields)+"\n")
+        result = P.watchdog(self.args(), 12)
+        self.assertEqual(result["terminal_action"], "", result)
 
     def _verification_lease(self, process, *, deadline=100):
         lease = self.base / "verification-leases" / f"{self.attempt}.json"
@@ -224,12 +312,12 @@ class ProgressTest(unittest.TestCase):
         self.assertEqual((verdict["state"], verdict["source"]),
                          ("working", "namespace"))
 
-    def test_signal_denied_fails_closed_without_closing_live_row(self):
+    def test_stall_has_no_signal_permission_dependency(self):
         P.heartbeat(self.args(), 0)
         P.watchdog(self.args(), 10)
         with mock.patch.object(P.os, "killpg", side_effect=PermissionError):
             state = P.watchdog(self.args(apply=True), 20)
-        self.assertEqual(state["action"], "fail-closed-signal-denied")
+        self.assertEqual(state["action"], "no-progress")
         row = self.jobs.read_text(encoding="utf-8")
         self.assertIn("\topen\t", row)
         self.assertNotIn("note=dead-no-progress", row)
@@ -251,11 +339,11 @@ class ProgressTest(unittest.TestCase):
         with mock.patch.object(P.os, "killpg") as killpg:
             state = P.watchdog(self.args(apply=True), 21)
         killpg.assert_not_called()
-        self.assertEqual(state["action"], "fail-closed-identity")
+        self.assertEqual(state["action"], "no-progress")
         self.assertIsNone(self.proc.poll())
         self.assertIn("\topen\t", self.jobs.read_text())
 
-    def test_namespace_bound_outer_identity_can_interrupt_exact_group(self):
+    def test_namespace_bound_outer_identity_does_not_turn_stall_into_failure(self):
         self.jobs.write_text(self.jobs.read_text().replace(
             (
                 f"pid={self.proc.pid},pid_start={self.proc_start},pgid={self.proc.pid},"
@@ -272,10 +360,10 @@ class ProgressTest(unittest.TestCase):
         P.heartbeat(self.args(), 0)
         P.watchdog(self.args(), 10)
         state = P.watchdog(self.args(apply=True), 20)
-        self.proc.wait(timeout=3)
-        self.assertEqual(state["action"], "interrupted")
-        self.assertEqual(state["signalled_pid"], self.proc.pid)
-        self.assertIn("note=dead-no-progress", self.jobs.read_text())
+        self.assertIsNone(self.proc.poll())
+        self.assertEqual(state["action"], "no-progress")
+        self.assertNotIn("signalled_pid",state)
+        self.assertNotIn("note=dead-no-progress", self.jobs.read_text())
 
     def test_pgid_change_during_adjacent_revalidation_sends_no_signal(self):
         P.heartbeat(self.args(), 0)
@@ -285,8 +373,8 @@ class ProgressTest(unittest.TestCase):
         ), mock.patch.object(P.os, "killpg") as killpg:
             state = P.watchdog(self.args(apply=True), 20)
         killpg.assert_not_called()
-        self.assertEqual(state["action"], "fail-closed-identity")
-        self.assertEqual(state["process_reason"], "progress-signal-group-unverifiable")
+        self.assertEqual(state["action"], "no-progress")
+        self.assertNotIn("signalled_pid", state)
         self.assertIsNone(self.proc.poll())
         self.assertIn("\topen\t", self.jobs.read_text())
 
@@ -345,6 +433,83 @@ class ProgressTest(unittest.TestCase):
         state=P.watchdog(self.args(),10)
         self.assertEqual(state["terminal_action"],"process-exited")
         self.assertNotIn("fail-closed",state["action"])
+
+    def test_late_terminal_row_supersedes_cached_exit_after_watchdog_restart(self):
+        P.heartbeat(self.args(), 0)
+        self.proc.terminate(); self.proc.wait(timeout=3)
+        self.assertEqual(P.watchdog(self.args(), 1)["terminal_action"], "process-exited")
+        D.close_attempt_row_if(self.jobs, self.attempt, "completed-marker", lambda fields: True)
+        restarted = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(restarted)
+        state = restarted.watchdog(self.args(), 2)
+        self.assertEqual(state["terminal_action"], "registry-terminal")
+
+    def test_completed_row_precedes_stale_capacity_log_without_signalling(self):
+        log = self.base / "stage.codex.jsonl"
+        log.write_text("Selected model is at capacity\n")
+        self.jobs.write_text(self.jobs.read_text().rstrip("\n") + f",log_file={log}\n")
+        D.close_attempt_row_if(self.jobs, self.attempt, "completed-marker", lambda fields: True)
+        with mock.patch.object(P, "signal_authoritative_process_group") as signal_group:
+            state = P.watchdog(self.args(apply=True), 1)
+        signal_group.assert_not_called()
+        self.assertEqual(state["semantic_terminal_action"], "registry-terminal")
+        self.assertEqual(state["action"], "draining")
+        self.assertIn("note=completed-marker", self.jobs.read_text())
+
+    def test_real_watchdog_exit_then_delayed_completion_never_retries(self):
+        fallback_spec = importlib.util.spec_from_file_location(
+            "fallback_exit_race", ROOT / "utilities/stage-dispatch-fallback.py"
+        )
+        fallback = importlib.util.module_from_spec(fallback_spec)
+        fallback_spec.loader.exec_module(fallback)
+        self.proc.terminate(); self.proc.wait(timeout=3)
+        original_row = self.jobs.read_text()
+        watchdog_path = P.state_paths(D.dispatch_state_root(self.jobs), self.attempt)[1]
+        args = SimpleNamespace(jobs=self.jobs, progress_window_seconds=30,
+                               watchdog_max_windows=2, direct_timeout=5)
+        # Exercise the shared decision boundary with all three harness tags.
+        # The worker and watchdog are real processes; only publication timing
+        # is controlled here. This does not launch a model or mutate live jobs.
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness=harness):
+                self.jobs.write_text(original_row.rstrip("\n") + f",harness={harness}\n")
+                watchdog_path.unlink(missing_ok=True)
+                stop = threading.Event()
+                publication = {}
+
+                def publish_after_exit():
+                    deadline = time.monotonic() + 5
+                    while time.monotonic() < deadline and not stop.wait(0.01):
+                        state = P.read_json(watchdog_path)
+                        if state.get("terminal_action") == "process-exited":
+                            publication["exit_observed_at"] = time.monotonic()
+                            # Cairn's completion publication lag was ~0.95 s.
+                            if stop.wait(0.95):
+                                return
+                            publication["closed"] = D.close_attempt_row_if(
+                                self.jobs, self.attempt, "completed-marker",
+                                lambda fields: fields[1] == "open",
+                            )
+                            publication["published_at"] = time.monotonic()
+                            return
+
+                publisher = threading.Thread(target=publish_after_exit)
+                publisher.start()
+                try:
+                    state, fields = fallback.watch_launched_attempt(
+                        args, {"route_id": "rt-1"}, {"id": "test"}, self.attempt, {}
+                    )
+                finally:
+                    stop.set()
+                    publisher.join(timeout=6)
+                self.assertFalse(publisher.is_alive())
+                self.assertTrue(publication.get("closed"), publication)
+                self.assertGreaterEqual(
+                    publication["published_at"] - publication["exit_observed_at"], 0.95
+                )
+                self.assertEqual(state, "terminal", fields)
+                self.assertEqual(fields["note"], "completed-marker")
+                self.assertEqual(len(self.jobs.read_text().splitlines()), 1)
 
     def test_registry_terminal_is_cached_but_withheld_while_process_drains(self):
         text = self.jobs.read_text().replace("\topen\t", "\tdone\t")

@@ -33,6 +33,7 @@ with an explicit promotion (D-3).
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -52,11 +53,14 @@ import artifact_index  # noqa: E402
 import artifact_lifecycle  # noqa: E402
 import artifact_locator  # noqa: E402
 import artifact_manifest  # noqa: E402
+import artifact_campaign  # noqa: E402
 import route_identity  # noqa: E402
 import dispatch_lock_order  # noqa: E402
 import dispatch_terminal_commit  # noqa: E402
 from dispatch_contract import (  # noqa: E402
     _PROCESS_IDENTITY_METADATA_KEYS,
+    REVIEW_GOVERNED_LEASE_KIND,
+    REVIEW_GOVERNED_LEASE_NONCE_RE,
     encode_review_output_locator,
     review_governed_lease_is_held,
     review_lease_record_digest,
@@ -66,6 +70,12 @@ from dispatch_contract import (  # noqa: E402
     review_output_binding_digest,
     review_output_write_authorized,
     validate_review_output_binding,
+    review_holder_disposition,
+)
+from dispatch_lifecycle import (
+    FiniteWatchdogBudget,
+    begin_finite_watchdog,
+    remaining_watchdog_seconds,
 )
 
 PRODUCER_REL = ".runtime/artifact-producer/v1"
@@ -144,7 +154,6 @@ PRIMARY_CANDIDATES = (
     "final_report.md", "report.md", "prd.md", "plan.md", "handoff.md", "verdict.json",
 )
 _KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
-_REL_RE = re.compile(r"^[A-Za-z0-9._][A-Za-z0-9._/ -]{0,1023}$")
 
 
 class ProducerError(Exception):
@@ -162,6 +171,11 @@ class ProducerError(Exception):
 def _rfc3339(now: Optional[float] = None) -> str:
     t = time.time() if now is None else now
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t)) + "Z"
+
+
+def _rfc3339_precise(now: Optional[float] = None) -> str:
+    t = time.time() if now is None else float(now)
+    return datetime.fromtimestamp(t, tz=timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
 def _canonical(payload: Any) -> bytes:
@@ -712,9 +726,11 @@ def read_campaign(root: Path, campaign_id: str) -> Optional[Dict[str, Any]]:
     if found is not None:
         record = _read_json(found / "campaign.json")
         if record is not None and record.get("campaign_id") == campaign_id:
-            return record
+            return artifact_campaign.fold_campaign(root, found / "campaign.json", record)
     fallback = _read_json(Path(root) / "campaigns" / campaign_id / "campaign.json")
-    return fallback if fallback is not None and fallback.get("campaign_id") == campaign_id else None
+    if fallback is not None and fallback.get("campaign_id") == campaign_id:
+        return artifact_campaign.fold_campaign(root, Path(root) / "campaigns" / campaign_id / "campaign.json", fallback)
+    return None
 
 
 def find_campaign_by_key(root: Path, key: str) -> Optional[Dict[str, Any]]:
@@ -723,6 +739,8 @@ def find_campaign_by_key(root: Path, key: str) -> Optional[Dict[str, Any]]:
         return None
     for entry in artifact_locator.iter_campaign_dirs(root):
         record = _read_json(entry / "campaign.json")
+        if record:
+            record = artifact_campaign.fold_campaign(root, entry / "campaign.json", record)
         if record and record.get("key") == key and record.get("state") == "active":
             return record
     return None
@@ -730,6 +748,7 @@ def find_campaign_by_key(root: Path, key: str) -> Optional[Dict[str, Any]]:
 
 def _write_campaign(root: Path, record: Dict[str, Any], *, exclusive: bool) -> None:
     path = _campaign_path(root, record["campaign_id"], record)
+    artifact_campaign.check_campaign_write(root, path, record)
     _ensure_dir(path.parent)
     if exclusive:
         _write_exclusive(path, _json_bytes(record))
@@ -847,6 +866,31 @@ def _env_for(root: Path, record: Mapping[str, Any]) -> Dict[str, str]:
         "AGENT_ARTIFACT_CYCLE_DIR": str(directory),
         "AGENT_ARTIFACT_OUTPUT_DIR": str(directory / "artifacts"),
     }
+
+
+def prepare_route_artifact_env(route_file: Path, *, start: bool, jobs: Path) -> Dict[str, str]:
+    """Resolve the route's own output context; callers need not copy begin's env.
+
+    Start owns idempotent preparation. Readiness checks only read an existing
+    cycle. No inherited cycle or 'latest' directory participates in selection.
+    """
+    raw = _read_json(route_file)
+    if not isinstance(raw, dict) or not raw.get("artifact_root"):
+        raise ProducerError("route-artifact-root-missing", str(route_file))
+    root = Path(raw["artifact_root"]).resolve()
+    route = load_route(root, route_file)
+    if start:
+        return begin(root, route_file=route_file, capability=route["capability"],
+                     intensity=route["effective_intensity"], require_cycle=True, jobs=jobs)["env"]
+    records = [record for record in list_cycle_records(root)
+               if record.get("route_id") == route["route_id"] and record.get("state") == "open"]
+    if not records:
+        return {"AGENT_ARTIFACT_ROOT": str(root), **{name: "" for name in (
+            "AGENT_ARTIFACT_CAMPAIGN_ID", "AGENT_ARTIFACT_CYCLE_ID", "AGENT_ARTIFACT_PRODUCER_ID",
+            "AGENT_ARTIFACT_CYCLE_DIR", "AGENT_ARTIFACT_OUTPUT_DIR")}}
+    if len(records) != 1 or records[0].get("route_hash") != route["route_hash"]:
+        raise ProducerError("route-cycle-binding-ambiguous", route["route_id"])
+    return _env_for(root, records[0])
 
 
 def _route_naming(
@@ -1007,6 +1051,10 @@ def begin(
                 raise ProducerError("campaign-unknown", campaign_id)
         elif campaign_key:
             campaign = find_campaign_by_key(root, campaign_key)
+            if campaign is None:
+                previous = _find_campaign_by_key_any_state(root, campaign_key)
+                if previous is not None:
+                    raise ProducerError("campaign-not-active", previous["campaign_id"])
         if parent_cycle_id:
             parent = read_cycle_record(root, parent_cycle_id)
             if parent is None or parent.get("state") not in {"open", "sealed"}:
@@ -1193,7 +1241,7 @@ def _enumerate_output(directory: Path, *, exclude_hidden: bool = False,
     residue, or a component longer than the locator limit) are left out of the
     manifest and reported through `excluded` instead of failing validation
     (W7E retrospective seal of relocated legacy trees)."""
-    rows: List[Tuple[str, bytes]] = []
+    paths: List[Tuple[str, Path]] = []
     violations: List[str] = []
     artifacts = directory / "artifacts"
     if not artifacts.is_dir() or artifacts.is_symlink():
@@ -1216,10 +1264,16 @@ def _enumerate_output(directory: Path, *, exclude_hidden: bool = False,
             if excluded is not None:
                 excluded.append(rel)
             continue
-        if not _REL_RE.match(rel) or ".." in rel.split("/"):
-            violations.append(f"unsafe-locator:{rel}")
+        locator = artifact_manifest.validate_locator_path(rel)
+        if not locator.ok:
+            violations.extend(f"{v.code}:{rel}" for v in locator.violations)
             continue
-        rows.append((rel, entry.read_bytes()))
+        paths.append((rel, entry))
+    # Validate the whole collection before reading payload bytes. A rejected
+    # path must not silently vanish, or surface only after manifest allocation.
+    if violations:
+        return [], violations
+    rows = [(rel, entry.read_bytes()) for rel, entry in paths]
     return rows, violations
 
 
@@ -1500,7 +1554,10 @@ def _review_lease_path(root: Path, cycle_id: str, attempt_id: str) -> Path:
 
 
 def _rfc3339_to_epoch(value: str) -> float:
-    return time.mktime(time.strptime(value, "%Y-%m-%dT%H:%M:%SZ")) - time.timezone
+    try:
+        return time.mktime(time.strptime(value, "%Y-%m-%dT%H:%M:%SZ")) - time.timezone
+    except ValueError:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
 
 
 def _lease_record_is_live(
@@ -1525,8 +1582,6 @@ def _lease_record_is_live(
     except (ValueError, OverflowError):
         return True
     when = time.time() if now is None else now
-    if when > deadline_ts:
-        return False
     if _is_v2_review_lease(record):
         if record.get("expired") is not False:
             return True
@@ -1538,22 +1593,26 @@ def _lease_record_is_live(
             )
         except (ValueError, OverflowError):
             return True
-        nonce = record.get("review_governed_lease_nonce")
-        if (
-            root is None or acquired_ts is None or acquired_ts > when
-            or deadline_ts <= acquired_ts
-            or not isinstance(record.get("attempt_id"), str)
-            or not isinstance(record.get("cycle_id"), str)
-            or record.get("review_governed_lease") is None
-            or not isinstance(nonce, str)
-        ):
+        if root is None or acquired_ts is None or acquired_ts > when or deadline_ts <= acquired_ts:
             return True
-        return review_governed_lease_is_held(root, {
-            "attempt_id": record["attempt_id"],
-            "review_cycle_id": record["cycle_id"],
-            "review_governed_lease": record["review_governed_lease"],
-            "review_governed_lease_nonce": nonce,
-        })
+        metadata = dict(record)
+        metadata["review_cycle_id"] = record.get("cycle_id", "")
+        # The record stores the sealed fields while the jobs row mirrors the
+        # digest.  Reconstruct that mirror for the closed disposition so a
+        # dead exact holder can unblock abandon instead of being treated as
+        # malformed forever.
+        metadata["review_lease_record_digest"] = review_lease_record_digest(record)
+        disposition = review_holder_disposition(record, metadata, root, now=when)
+        if disposition.state in {"live", "malformed"}:
+            return True
+        if disposition.state == "dead":
+            return False
+        # Valid but unobservable holders remain conservative until the finite
+        # stale ceiling, after which time permits recovery but never grants a
+        # write.
+        return when <= deadline_ts
+    if when > deadline_ts:
+        return False
     pid = record.get("pid")
     pid_start = record.get("pid_start")
     pgid = record.get("pgid")
@@ -1778,6 +1837,7 @@ def review_lease_acquire(
     binding: Optional[Mapping[str, Any]] = None,
     governed_identity: Optional[Mapping[str, Any]] = None,
     jobs: Optional[str | Path] = None,
+    watchdog_budget: Optional[FiniteWatchdogBudget] = None,
 ) -> Dict[str, Any]:
     root = Path(root).resolve()
     lock_fd = artifact_admission._acquire_lock(root, artifact_admission.LOCK_TIMEOUT_DEFAULT, now=now)
@@ -1791,6 +1851,17 @@ def review_lease_acquire(
         existing = _read_json(path)
         when = time.time() if now is None else now
         v2_requested = review_output is not None or binding is not None
+        if v2_requested and watchdog_budget is None:
+            watchdog_budget = begin_finite_watchdog(
+                deadline_seconds, origin_epoch=when
+            )
+        if v2_requested and not isinstance(watchdog_budget, FiniteWatchdogBudget):
+            raise ProducerError("review-lease-budget-invalid", attempt_id)
+        if v2_requested and watchdog_budget is not None:
+            if remaining_watchdog_seconds(watchdog_budget) <= 0:
+                raise ProducerError("review-lease-budget-exhausted", attempt_id)
+            if when < watchdog_budget.origin_epoch:
+                raise ProducerError("review-lease-budget-contradictory", attempt_id)
         # E47-9: the same (cycle, attempt) re-acquiring its own still-live
         # lease is an idempotent no-op -- zero state change.
         existing_live = existing is not None and _lease_record_is_live(
@@ -1856,10 +1927,16 @@ def review_lease_acquire(
                 for key in _PROCESS_IDENTITY_METADATA_KEYS
             ):
                 raise ProducerError("review-lease-identity-mismatch", attempt_id)
+            nonce = identity.get("review_governed_lease_nonce", registry_metadata.get("review_governed_lease_nonce"))
+            if not isinstance(nonce, str) or REVIEW_GOVERNED_LEASE_NONCE_RE.fullmatch(nonce) is None:
+                raise ProducerError("review-governed-lease-nonce-invalid", attempt_id)
+            if (
+                registry_metadata.get("review_governed_lease") != REVIEW_GOVERNED_LEASE_KIND
+                or registry_metadata.get("review_governed_lease_nonce") != nonce
+            ):
+                raise ProducerError("review-governed-lease-nonce-mismatch", attempt_id)
             if not review_governed_lease_is_held(root, registry_metadata):
                 raise ProducerError("review-governed-lease-not-held", attempt_id)
-            if not isinstance(deadline_seconds, (int, float)) or not 1.0 <= float(deadline_seconds) <= 900.0:
-                raise ProducerError("review-lease-deadline-invalid", str(deadline_seconds))
             schema_version = 2
             binding_digest = str(canonical_binding["digest"])
         else:
@@ -1900,11 +1977,24 @@ def review_lease_acquire(
         pid = int(identity.get("pid", os.getpid()))
         pid_start = str(identity.get("pid_start", process_start_ticks(pid) or ""))
         pgid = int(identity.get("pgid", os.getpgid(pid)))
+        lease_seconds = (
+            watchdog_budget.timeout_seconds
+            if schema_version == 2 and watchdog_budget is not None
+            else max(1.0, deadline_seconds)
+        )
         record = {
             "schema_version": schema_version, "cycle_id": cycle_id, "attempt_id": attempt_id,
             "pid": pid, "pid_start": pid_start,
             "pgid": pgid, "acquired_at": _rfc3339(when),
-            "deadline": _rfc3339(when + max(1.0, deadline_seconds)),
+            # The audit wall deadline belongs to the one launch-origin clock,
+            # not to the later lease-acquisition moment.  ``acquired_at``
+            # remains the real acquisition observation for future-timestamp
+            # rejection and audit coherence.
+            "deadline": (_rfc3339_precise(
+                watchdog_budget.origin_epoch + watchdog_budget.timeout_seconds
+                if schema_version == 2 and watchdog_budget is not None
+                else when + lease_seconds
+            ) if schema_version == 2 else _rfc3339(when + lease_seconds)),
             "released_at": None, "expired": False,
         }
         if schema_version == 2:
@@ -1918,6 +2008,12 @@ def review_lease_acquire(
                 "producer_id": canonical_binding["producer_id"],
                 "review_governed_lease": registry_metadata.get("review_governed_lease"),
                 "review_governed_lease_nonce": registry_metadata.get("review_governed_lease_nonce"),
+                "watchdog_timeout_seconds": watchdog_budget.timeout_seconds,
+                "watchdog_origin_monotonic_ns": watchdog_budget.origin_monotonic_ns,
+                "watchdog_deadline_monotonic_ns": watchdog_budget.deadline_monotonic_ns,
+                "watchdog_origin_epoch": watchdog_budget.origin_epoch,
+                "watchdog_deadline_epoch": watchdog_budget.origin_epoch + watchdog_budget.timeout_seconds,
+                "watchdog_budget_digest": watchdog_budget.digest,
             })
             for key in _PROCESS_IDENTITY_METADATA_KEYS:
                 if key in identity:
@@ -2986,7 +3082,7 @@ def _find_campaign_by_key_any_state(root: Path, key: str) -> Optional[Dict[str, 
     for entry in artifact_locator.iter_campaign_dirs(root):
         record = _read_json(entry / "campaign.json")
         if record and record.get("key") == key:
-            return record
+            return artifact_campaign.fold_campaign(root, entry / "campaign.json", record)
     return None
 
 
@@ -3114,6 +3210,68 @@ def _relative(root: Path, target: Path) -> Optional[str]:
         return None
 
 
+def _quick_refine_write_gate(root: Path, target: Path, route=None) -> None:
+    relative = _relative(Path(root).resolve(), Path(target))
+    if relative is None:
+        return
+    parts = relative.split("/")
+    if parts[:1] == ["campaigns"]:
+        index = 4 if len(parts) > 2 and parts[2] == "cycles" else 3
+        if len(parts) <= index or parts[index] != "artifacts":
+            return
+        parts = parts[index + 1:]
+    if len(parts) < 2 or parts[0] not in {"documents", "research"} or "_internal" in parts:
+        return
+    if route is None:
+        path = os.environ.get("AGENT_ROUTE_FILE") or os.environ.get("AGENT_OWNER_ROUTE_FILE")
+        if not path:
+            return  # The route/material guard independently requires a binding.
+        route = _read_json(Path(path))
+        if not isinstance(route, dict):
+            raise ProducerError("inline-gate-route-unreadable")
+    if route.get("capability") != "autopilot-refine" or route.get("effective_intensity") != "quick":
+        return
+    node = next((n for n in route.get("nodes", []) if n.get("id") == "one-shot"), {})
+    if node.get("inline_human_gates") != ["preview-disposition"]:
+        raise ProducerError("inline-gate-binding-missing")
+    import workflow_state as WS
+    try:
+        WS.require_inline_gate_release(route, node, jobs=os.environ.get("AGENT_DISPATCH_JOBS") or None)
+    except (WS.WorkflowStateError, OSError, ValueError) as exc:
+        raise ProducerError("quick-preview-approval-required", str(exc)) from exc
+
+
+def require_cycle_output(
+    root: Path, target: Path, *, cycle_id: Optional[str] = None, route_id: Optional[str] = None,
+) -> Optional[Path]:
+    """Bind writes and completion evidence to the producer's issued cycle.
+
+    Route lookup recovers omitted environment context from producer records;
+    directory names, recency and a caller-supplied output path are not authority.
+    Legacy routes without a producer cycle retain their existing contract.
+    """
+    record = read_cycle_record(root, cycle_id) if cycle_id else None
+    if cycle_id and record is None:
+        raise ProducerError("cycle-unknown", cycle_id)
+    if record is None and route_id:
+        candidates = [item for item in list_cycle_records(root) if item.get("route_id") == route_id]
+        opened = [item for item in candidates if item.get("state") == "open"]
+        candidates = opened or candidates
+        if len(candidates) > 1:
+            raise ProducerError("route-cycle-binding-ambiguous", route_id)
+        record = candidates[0] if candidates else None
+    if record is None:
+        return None
+    if route_id and record.get("route_id") != route_id:
+        raise ProducerError("cycle-route-binding-mismatch", f"cycle={record['cycle_id']} route={route_id}")
+    output = cycle_dir(root, record["campaign_id"], record["cycle_id"], record) / "artifacts"
+    try:
+        Path(target).resolve().relative_to(output.resolve())
+    except ValueError as exc:
+        raise ProducerError("artifact-outside-bound-cycle", f"cycle={record['cycle_id']} output_dir={output}") from exc
+    return output
+
+
 def check_write(root: Path, target: Path) -> Dict[str, Any]:
     """Classify one prospective write under the artifact root.
 
@@ -3123,6 +3281,10 @@ def check_write(root: Path, target: Path) -> Dict[str, Any]:
     rel = _relative(root, Path(target))
     active = is_active(root)
     base = {"cutover": "active" if active else "inactive", "target": str(target)}
+    try:
+        _quick_refine_write_gate(root, target)
+    except ProducerError as exc:
+        return {**base, "verdict": "deny", "reason": exc.code, "detail": exc.detail, "layout": "inline-gate"}
     try:
         _authorize_active_cleanup(root, "partial-report", Path(target), None)
     except ProducerError as exc:
@@ -3136,6 +3298,13 @@ def check_write(root: Path, target: Path) -> Dict[str, Any]:
     if top == "shared":
         return {**base, "verdict": "deny", "reason": "shared-revision-immutable", "layout": "shared"}
     if top == "campaigns":
+        try:
+            require_cycle_output(
+                root, target, cycle_id=os.environ.get("AGENT_ARTIFACT_CYCLE_ID"),
+                route_id=os.environ.get("AGENT_ROUTE_ID") or os.environ.get("AGENT_OWNER_ROUTE_ID"),
+            )
+        except ProducerError as exc:
+            return {**base, "verdict": "deny", "reason": exc.code, "detail": exc.detail, "layout": "cycle"}
         legacy = len(parts) >= 5 and parts[2] == "cycles"
         readable = len(parts) >= 4 and parts[2] != "cycles"
         if not legacy and not readable:
@@ -3173,7 +3342,8 @@ def check_write(root: Path, target: Path) -> Dict[str, Any]:
             return {**base, "verdict": "deny", "reason": "cycle-not-open", "layout": "cycle", "cycle_id": cycle_id}
         bucket = parts[artifacts_index + 1] if len(parts) > artifacts_index + 2 else None
         return {**base, "verdict": "allow", "reason": "open-cycle-artifacts", "layout": "cycle",
-                "cycle_id": cycle_id, "campaign_id": campaign_id, "bucket": bucket}
+                "cycle_id": cycle_id, "campaign_id": campaign_id, "bucket": bucket,
+                "output_dir": str(cycle_path / "artifacts")}
     if active:
         return {**base, "verdict": "deny", "reason": "legacy-top-level-write-denied", "layout": "legacy",
                 "bucket": top, "hint": LEGACY_WRITE_HINT}
@@ -3271,6 +3441,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     p = sub.add_parser("status")
     p.add_argument("--artifact-root", required=True)
+
+    for command in ("campaign-status", "campaign-close", "campaign-recover"):
+        p = sub.add_parser(command, help="verify, accept, or recover a campaign's administrative closure")
+        p.add_argument("--artifact-root", required=True)
+        p.add_argument("--campaign", required=True, help="campaign ID or campaign.json path")
+        if command == "campaign-close":
+            p.add_argument("--approval-harness", choices=("claude", "codex", "opencode"))
+            p.add_argument("--approval-session", help="native session containing the USER's exact approval statement")
 
     p = sub.add_parser("begin")
     p.add_argument("--artifact-root", required=True)
@@ -3378,6 +3556,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                               w7=w7, approval_receipt_sha256=args.approval_receipt_sha256)
         elif args.command == "status":
             result = status(root)
+        elif args.command == "campaign-status":
+            result = artifact_campaign.status(root, args.campaign)
+        elif args.command in {"campaign-close", "campaign-recover"}:
+            result = artifact_campaign.close(root, args.campaign,
+                harness=getattr(args, "approval_harness", None),
+                session=getattr(args, "approval_session", None), recover=args.command == "campaign-recover")
         elif args.command == "begin":
             pins: List[Dict[str, Any]] = []
             for row in args.shared_reference:
@@ -3456,7 +3640,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except artifact_admission.AdmissionRecoveryRequired as exc:
         _print({"status": "blocked", "reason": "recovery-required", "detail": str(exc)})
         return BLOCKED
-    except artifact_lifecycle.LifecycleError as exc:
+    except (artifact_lifecycle.LifecycleError, artifact_campaign.CampaignError) as exc:
         _print({"status": "blocked", "reason": exc.code, "detail": exc.detail})
         return BLOCKED
     except (OSError, ValueError) as exc:
