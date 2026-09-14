@@ -243,6 +243,25 @@ Cycle manifests and route evidence remain immutable. Unavailable native
 evidence leaves closure pending and reports the explicit approval statement;
 an agent never submits that statement on the user's behalf.
 
+**Campaign metadata amendment.** `artifact_metadata_amendment.py
+prepare|apply|verify` is the sole supported correction surface for an active
+`_unassigned` campaign whose missing assignment is the exact and only degraded
+condition. It changes only `campaign.json.key` and `.goal`, removes only the
+exact `degraded=true` / `degraded_reason=campaign-unassigned` marker, and writes
+the producer-owned
+`.runtime/artifact-producer/v1/campaign-metadata-amendments.json` and
+`cycle-display-titles.json` declarations. Each declaration is bound to the
+sealed evidence by sorted, duplicate-free manifest revision IDs and canonical
+parsed-JSON digests. The transaction holds the producer admission lock,
+revalidates a prepared byte preimage before writing, journals exact rollback
+bytes, rejects races or foreign bindings, and makes an identical replay
+idempotent. Stable root, repository, campaign, cycle, manifest, artifact and
+revision IDs; campaign membership; parent lineage; locator names; existing
+campaign display-title declarations; and sealed manifest, cycle, payload,
+route, shared-reference and artifact bytes remain unchanged. Any other
+degraded reason, closed campaign, non-placeholder key or incomplete sealed
+cycle set is refused before mutation.
+
 **Campaign run log correction.** A legacy aggregate `experiments/_RUNLOG.md`
 that W7G mechanically promoted into a one-file cycle has no independent work
 boundary. `artifact_resplit.py repair-runlog-cycle` is the sole correction
