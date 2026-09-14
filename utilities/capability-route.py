@@ -6440,10 +6440,11 @@ def main():
     elif a.command=="continuation":
         source_path=Path(a.source_route).resolve(strict=True)
         source=verify_route(json.loads(source_path.read_text(encoding="utf-8")))
-        # The launch-sealed owner tuple names the exact bytes supplied on this
-        # CLI invocation.  Keep that path attached to the verified source so a
-        # multi-hop continuation does not pair the R0 file with R1 metadata.
-        source["route_file"] = str(source_path)
+        # Keep the source path local to this invocation.  Do not attach it to
+        # the verified route payload: continuation lineage hashes cover the
+        # sealed route object, and a filesystem locator is runtime context,
+        # not route identity.  Adding it here made valid owner-closure proof
+        # markers fail their downstream currentness check.
         artifact=Path(a.artifact_root).resolve(strict=False)
         if artifact != Path(source["artifact_root"]).resolve(strict=False):
             print(

@@ -1015,6 +1015,21 @@ class CompletionMarkerTest(unittest.TestCase):
             self.assertFalse((ROUTE.completion_dir(source["route_id"]) / "plan-check.json").exists())
         self.assertEqual(before, (self.jobs.read_bytes(), tuple(p.read_bytes() for p in reviews)))
 
+    def test_continuation_source_locator_does_not_change_lineage_hash(self):
+        """A CLI filesystem path is invocation context, never route identity."""
+        source, _route, path, _node, _memo, _reviews = self.continuation_closure_fixture()
+        verified = ROUTE.verify_route(json.loads(path.read_text()))
+        original_hash = verified["route_hash"]
+        verified["route_file"] = str(path)
+        self.assertEqual(ROUTE.route_hash(verified), original_hash)
+        verified.pop("route_file")
+        continuation = ROUTE.build_continuation_route(
+            verified, resume_from_node="test", requested_boundary="test",
+            reason="locator regression", artifact_root=self.artifact,
+        )
+        self.assertEqual(verified["route_hash"], original_hash)
+        self.assertEqual(continuation["source_route_hash"], original_hash)
+
     def test_continuation_closure_refuses_missing_dependency_and_live_round(self):
         source, route, path, node, memo, reviews = self.continuation_closure_fixture()
         with mock.patch.dict(os.environ, self.base_env(), clear=True):
