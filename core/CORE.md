@@ -142,7 +142,7 @@ never orders a move or a delete.
 | `documents/` | document drafts and refinement artifacts | `C-DUR` |
 | `experiments/` | experiment setup, evaluation, and run logs (declared, currently absent — a reserved boundary, not an error) | `C-DUR` |
 | `designs/` | standalone design decision records (declared, currently absent — a reserved boundary, not an error; spec-owned design instead anchors at `spec/design/`) | `C-DUR` |
-| `campaigns/` | W7C producer output: `campaigns/<campaign-locator>/<cycle-locator>/artifacts/<bucket>/…` plus machine-managed `campaign.json`, per-cycle `.cycle.json` stable-ID binding, and `manifest.json` commit point; the only new-write target once the write-cutover is active (`utilities/artifact_producer.py`) | `C-DUR` |
+| `campaigns/` | W7C producer output: `campaigns/<campaign-locator>/<cycle-locator>/artifacts/<bucket>/…` plus machine-managed `campaign.json`, per-cycle `.cycle.json` stable-ID binding, and `manifest.json` commit point; an optional digest-bound campaign-level `RUNLOG.md` may preserve a migrated aggregate run log without manufacturing a cycle; the only new-write target once the write-cutover is active (`utilities/artifact_producer.py`) | `C-DUR` |
 | `shared/` | immutable shared revisions `shared/<spec\|analysis\|research>/<ref>/revisions/<rrev>/…`; created only by `admit-shared` from a sealed cycle, research only with an explicit promotion; never a direct write target | `C-DUR` |
 | `_internal/` | cycle-internal support material — a cycle's child, not an independent entry | `C-INT` |
 | `reviews/` | review support material | `C-INT` |
@@ -242,6 +242,20 @@ is preserved, and campaign-recover completes only that committed projection.
 Cycle manifests and route evidence remain immutable. Unavailable native
 evidence leaves closure pending and reports the explicit approval statement;
 an agent never submits that statement on the user's behalf.
+
+**Campaign run log correction.** A legacy aggregate `experiments/_RUNLOG.md`
+that W7G mechanically promoted into a one-file cycle has no independent work
+boundary. `artifact_resplit.py repair-runlog-cycle` is the sole correction
+surface: it accepts only an active campaign's sealed resplit cycle whose one
+primary experiment revision is exactly that locator, requires an exact dry-run
+expectation and an external verified backup, preserves the Markdown bytes as
+`campaigns/<campaign-locator>/RUNLOG.md`, records its digest and source cycle in
+`campaign.json.runlog`, removes only that cycle's live projection, appends a
+compatibility redirect, and rebuilds derived indexes. The campaign run log is
+metadata, not a cycle or closure criterion. Historical manifests, migration
+journals, and compatibility maps outside the named projection remain
+byte-identical; the named manifest and route records are retired whole after
+backup rather than rewritten.
 
 **Exactly one disposition.** Except for `_scratch/`, every regular file and
 container under the artifact root has exactly one disposition, and none is left

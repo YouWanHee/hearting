@@ -107,6 +107,24 @@ class CampaignTest(F.ProducerTestBase):
             with self.assertRaisesRegex(C.CampaignError, "campaign-index-mismatch"):
                 C.status(self.root, self.path)
 
+    def test_campaign_runlog_is_digest_bound_metadata_not_a_cycle(self):
+        source_cycle = "cyc_" + "f" * 32
+        body = b"# aggregate run log\n"
+        runlog_path = self.path.parent / "RUNLOG.md"
+        runlog_path.write_bytes(body)
+        value = json.loads(self.path.read_text())
+        value["runlog"] = {
+            "contract": "campaign-runlog/v1", "path": "RUNLOG.md",
+            "sha256": "sha256:" + C.hashlib.sha256(body).hexdigest(),
+            "source_cycle_id": source_cycle, "source_locator": "experiments/_RUNLOG.md",
+        }
+        self.path.write_text(json.dumps(value))
+        report = C.status(self.root, self.path)
+        self.assertEqual([row["cycle_id"] for row in report["cycles"]], [self.result["cycle_id"]])
+        runlog_path.write_bytes(b"drift\n")
+        with self.assertRaisesRegex(C.CampaignError, "campaign-runlog-digest-mismatch"):
+            C.status(self.root, self.path)
+
     def test_legacy_cycle_layout_closes_without_moving_or_rewriting_sealed_bytes(self):
         cid = self.result["cycle_id"]; old = self.manifest.parent
         target = old.parent / "cycles" / cid; target.parent.mkdir()

@@ -51,6 +51,8 @@ def _tree_snapshot(root, skip_runtime=True):
 class Fixture(unittest.TestCase):
     """Base: a temp artifact root with one sealed W7C lump cycle (the fixture in §5)."""
 
+    INCLUDE_RUNLOG = False
+
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         base = Path(self._tmp.name)
@@ -70,6 +72,8 @@ class Fixture(unittest.TestCase):
         self.w("plans/2026-04-02_beta/plan.md", "plan beta\n")
         self.w("experiments/2026-04-03_exp/run.md", "run\n")
         self.w("experiments/2026-04-03_exp/metrics.json", "{}\n")
+        if self.INCLUDE_RUNLOG:
+            self.w("experiments/_RUNLOG.md", "# aggregate run log\n")
         # no YYYY-MM-DD_ directory prefix on purpose -- exercises D-79 started_on
         # priority (2): the entry document's own written date (frontmatter `created:`)
         self.w("research/topic-x/report.md", "---\ncreated: 2026-03-15\n---\nresearch topic x\n")
@@ -124,6 +128,9 @@ class Fixture(unittest.TestCase):
             {"path": "research/topic-x/report.md", "kind": "file", "disposition": "w6-baseline-legacy", "detail": "cycle-candidate:research"},
             {"path": "plans/stage-sessions/rt-aaaaaaaaaaaaaaaa/session.json", "kind": "file", "disposition": "w6-baseline-legacy", "detail": "cycle-candidate:plans"},
         ]
+        if self.INCLUDE_RUNLOG:
+            rows.append({"path": "experiments/_RUNLOG.md", "kind": "file",
+                         "disposition": "w6-baseline-legacy", "detail": "cycle-candidate:experiments"})
         rows_path = Path(self._tmp.name) / "census-rows.jsonl"
         rows_path.write_text("".join(json.dumps(r) + "\n" for r in rows))
         route, route_file = self.route()
@@ -150,10 +157,14 @@ class Fixture(unittest.TestCase):
             "b1": f"legacy:{self.root_slug}:experiments/2026-04-03_exp",
             "b2": f"legacy:{self.root_slug}:research/topic-x",
         }
+        if self.INCLUDE_RUNLOG:
+            keys["runlog"] = f"legacy:{self.root_slug}:experiments/_RUNLOG.md"
         if two_campaigns:
             groups = [("prop-a", "wwd-a", ["a1", "a2"]), ("prop-b", "wwd-b", ["b1", "b2"])]
         else:
             groups = [("prop-a", "wwd-a", ["a1", "a2", "b1", "b2"])]
+        if self.INCLUDE_RUNLOG:
+            groups[-1][2].append("runlog")
         proposals = []
         campaigns = []
         for proposal_id, slug, members in groups:
@@ -2519,6 +2530,52 @@ class CorrectionGateGuardTests(Fixture):
         result = self.r1()
         self.assertEqual(result["status"], "already-applied")
         self.assertEqual(before, _tree_snapshot(W._admission_dir(run_dir), skip_runtime=False))
+
+
+class RunlogCycleRepairTests(Fixture):
+    INCLUDE_RUNLOG = True
+
+    def test_dry_run_apply_and_idempotency_promote_runlog_to_campaign(self):
+        self.run_full()
+        # Production roots have already retired the legacy top-level source; the
+        # generic resplit fixture intentionally preserves it for other tests.
+        (self.root / "experiments/_RUNLOG.md").unlink()
+        key = f"legacy:{self.root_slug}:experiments/_RUNLOG.md"
+        record = W._find_cycle_by_key(self.root, key)
+        self.assertIsNotNone(record)
+        cycle_id = record["cycle_id"]
+        cycle_dir = P.cycle_dir(self.root, record["campaign_id"], cycle_id, record)
+        original = (cycle_dir / W.RUNLOG_PAYLOAD_LOCATOR).read_bytes()
+        ready = W.repair_runlog_cycle(self.root, cycle_id=cycle_id)
+        self.assertEqual(ready["status"], "ready")
+        with self.assertRaisesRegex(W.ResplitError, "runlog-repair-expectation-mismatch"):
+            W.repair_runlog_cycle(self.root, cycle_id=cycle_id, backup_root=self.backup_root(),
+                                  expect="sha256:" + "0" * 64, apply=True)
+        result = W.repair_runlog_cycle(
+            self.root, cycle_id=cycle_id, backup_root=self.backup_root(),
+            expect=ready["expect"], apply=True,
+        )
+        self.assertEqual(result["status"], "applied")
+        self.assertFalse(cycle_dir.exists())
+        self.assertIsNone(P.read_cycle_record(self.root, cycle_id))
+        campaign = P.read_campaign(self.root, record["campaign_id"])
+        self.assertNotIn(cycle_id, campaign["cycles"])
+        self.assertEqual(campaign["runlog"]["source_cycle_id"], cycle_id)
+        self.assertEqual((Path(result["target"])).read_bytes(), original)
+        self.assertTrue(P.artifact_admission.verify_index(self.root).ok)
+        resolved = C.resolve_legacy(self.root, "experiments/_RUNLOG.md")
+        self.assertEqual(resolved["target"], Path(result["target"]).relative_to(self.root).as_posix())
+        replay = W.repair_runlog_cycle(self.root, cycle_id=cycle_id, apply=True)
+        self.assertEqual(replay["status"], "already-applied")
+
+    def test_non_runlog_cycle_is_refused_without_mutation(self):
+        self.run_full()
+        record = W._find_cycle_by_key(self.root, f"legacy:{self.root_slug}:experiments/2026-04-03_exp")
+        before = _tree_snapshot(self.root, skip_runtime=False)
+        with self.assertRaises(W.ResplitError) as ctx:
+            W.repair_runlog_cycle(self.root, cycle_id=record["cycle_id"])
+        self.assertEqual(ctx.exception.code, "runlog-repair-cycle-ineligible")
+        self.assertEqual(before, _tree_snapshot(self.root, skip_runtime=False))
 
 
 class OwnershipGuardTests(unittest.TestCase):

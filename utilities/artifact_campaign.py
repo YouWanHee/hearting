@@ -165,11 +165,40 @@ def check_campaign_write(root, path, proposed):
             raise CampaignError("campaign-terminal-write-conflict", path)
 
 
+def _validate_runlog(root, path, campaign, ids):
+    value = campaign.get("runlog")
+    if value is None:
+        return
+    keys = {"contract", "path", "sha256", "source_cycle_id", "source_locator"}
+    if not isinstance(value, dict) or set(value) != keys:
+        raise CampaignError("campaign-runlog-invalid", "shape")
+    source_cycle_id = value.get("source_cycle_id")
+    if (value.get("contract") != "campaign-runlog/v1" or value.get("path") != "RUNLOG.md"
+            or value.get("source_locator") != "experiments/_RUNLOG.md"
+            or not identity.is_well_formed(source_cycle_id, "cycle")
+            or source_cycle_id in ids
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(value.get("sha256")))):
+        raise CampaignError("campaign-runlog-invalid", "contract")
+    runlog = _safe(path.parent, path.parent / "RUNLOG.md")
+    try:
+        fd = os.open(runlog, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode):
+                raise CampaignError("campaign-runlog-invalid", "kind")
+            actual = "sha256:" + hashlib.sha256(stream.read()).hexdigest()
+    except OSError as exc:
+        raise CampaignError("campaign-runlog-missing", runlog) from exc
+    if actual != value["sha256"]:
+        raise CampaignError("campaign-runlog-digest-mismatch", runlog)
+
+
 def _cycle_rows(root, path, campaign):
     ids = campaign.get("cycles")
     if (not isinstance(ids, list) or not ids or not all(isinstance(cid, str) for cid in ids)
             or len(set(ids)) != len(ids)):
         raise CampaignError("campaign-membership-invalid")
+    _validate_runlog(root, path, campaign, ids)
     records = root / ".runtime/artifact-producer/v1/cycles"
     root_id = lifecycle.read_root_identity(root)
     if root_id is None:
