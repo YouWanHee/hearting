@@ -72,7 +72,9 @@ partial. OpenCode native UI/config owns model and context fields.
 
 ## Dispatch
 
-For ordinary execution use `preflight.sh compose --start --prompt-file <task>`.
+For ordinary execution use `preflight.sh compose --campaign-key <stream> --start
+--prompt-file <task>` (the stream key is required; `--unassigned` is the only
+keyless form).
 Runtime prepares the cycle, starts declared frames and reuses exact attempts.
 Follow `parent_next`; reuse `resume_command` after wakes or corrections. At
 `needs-question`, compare the completed frames and ask the native interview.

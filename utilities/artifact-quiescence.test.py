@@ -57,7 +57,8 @@ class QuiescenceTest(unittest.TestCase):
                 intensity="quick" if quick else "standard", cwd=cwd, artifact_root=str(root),
                 spec_read="hermetic-fixture", drift_verdict="hermetic-fixture",
                 dispatch_evidence=None if quick else evidence,
-                registered_headless_evidence={"candidates": candidates} if quick else None)
+                registered_headless_evidence={"candidates": candidates} if quick else None,
+                unassigned=True)
         Q.ROUTES.verify_route(route, allow_stale_registry=True)
         path = root / ".runtime" / "routes" / f"{route['route_id']}.json"
         path.write_text(json.dumps(route), encoding="utf-8")

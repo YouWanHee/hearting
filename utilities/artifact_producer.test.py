@@ -225,11 +225,12 @@ class ActivateAndBeginTest(ProducerTestBase):
         self.assertEqual(record["state"], "open")
         self.assertEqual(record["route_id"], route["route_id"])
         self.assertEqual(campaign["cycles"], [result["cycle_id"]])
-        for named in (campaign, record):
-            self.assertEqual(named["slug"], "w7i-test")
-            self.assertEqual(named["title"], "w7i-test")
-            self.assertEqual(named["slug_source"], "route")
-            self.assertEqual(named["locator_suffix"], "")
+        # The cycle is named by the route slug; the campaign by the stream key.
+        self.assertEqual((record["slug"], record["title"], record["slug_source"], record["locator_suffix"]),
+                         ("w7i-test", "w7i-test", "route", ""))
+        self.assertEqual((campaign["slug"], campaign["title"], campaign["slug_source"], campaign["locator_suffix"]),
+                         ("w7i-naming", "w7i-naming", "campaign-key", ""))
+        self.assertEqual(campaign["locator"], f"{campaign['created_on'][:10]}_w7i-naming")
         self.assertEqual(json.loads((self.root / "campaigns" / "INDEX.json").read_text())[result["cycle_id"]],
                          cycle_dir.relative_to(self.root).as_posix())
 
@@ -249,9 +250,86 @@ class ActivateAndBeginTest(ProducerTestBase):
         )
         legacy_record = P.read_cycle_record(self.root, derived["cycle_id"])
         legacy_campaign = P.read_campaign(self.root, derived["campaign_id"])
-        for named in (legacy_campaign, legacy_record):
-            self.assertEqual(named["slug"], "legacy-goal-for-naming")
-            self.assertEqual(named["slug_source"], "derived-legacy-route")
+        self.assertEqual((legacy_record["slug"], legacy_record["slug_source"]),
+                         ("legacy-goal-for-naming", "derived-legacy-route"))
+        self.assertEqual((legacy_campaign["slug"], legacy_campaign["slug_source"]),
+                         ("legacy-derived", "campaign-key"))
+
+    def test_campaign_is_named_from_its_key_not_the_first_route_slug(self):
+        """TF-Rehancer 2026-09-15: key `tf-rehancer-icassp`, first slug
+        `tf-rehancer-analysis-cx` produced campaign folder
+        `<date>_tf-rehancer-analysis-cx`."""
+        self.activate()
+        first_route, first_file = self.route(slug="tf-rehancer-analysis-cx", campaign_key="tf-rehancer-icassp")
+        first = P.begin(self.root, route_file=first_file, capability="autopilot-code", intensity="direct")
+        campaign = P.read_campaign(self.root, first["campaign_id"])
+        date = campaign["created_on"][:10]
+        self.assertEqual(campaign["locator"], f"{date}_tf-rehancer-icassp")
+        self.assertEqual((campaign["key"], campaign["slug"], campaign["title"], campaign["slug_source"]),
+                         ("tf-rehancer-icassp", "tf-rehancer-icassp", "tf-rehancer-icassp", "campaign-key"))
+        self.assertEqual(Path(first["cycle_dir"]).name, f"{date}_tf-rehancer-analysis-cx")
+        self.assertEqual(Path(first["cycle_dir"]).parent.name, f"{date}_tf-rehancer-icassp")
+        # A second route with another slug joins the same folder; it adds a cycle, not a name.
+        _, second_file = self.route(slug="tf-rehancer-research", campaign_key="tf-rehancer-icassp",
+                                    gate_source="second")
+        second = P.begin(self.root, route_file=second_file, capability="autopilot-code", intensity="direct")
+        self.assertEqual(second["campaign_id"], first["campaign_id"])
+        self.assertEqual(Path(second["cycle_dir"]).parent.name, f"{date}_tf-rehancer-icassp")
+        self.assertEqual(P.read_campaign(self.root, first["campaign_id"])["locator"], campaign["locator"])
+        # The key is the title verbatim; the locator is its D-88 slug.
+        _, odd_file = self.route(slug="bounded-task", campaign_key="TTS.v6:Release", gate_source="odd")
+        odd = P.begin(self.root, route_file=odd_file, capability="autopilot-code", intensity="direct")
+        odd_campaign = P.read_campaign(self.root, odd["campaign_id"])
+        self.assertEqual((odd_campaign["title"], odd_campaign["slug"]), ("TTS.v6:Release", "tts-v6-release"))
+        self.assertEqual(odd_campaign["locator"], f"{date}_tts-v6-release")
+        # The reserved container keeps its fixed name and stays degraded.
+        _, keyless_file = self.route(slug="stray-work", gate_source="keyless")
+        keyless = P.begin(self.root, route_file=keyless_file, capability="autopilot-code", intensity="direct")
+        container = P.read_campaign(self.root, keyless["campaign_id"])
+        self.assertEqual((container["key"], container["slug"], container["title"], container["slug_source"]),
+                         ("_unassigned", "unassigned", "_unassigned", "reserved"))
+        self.assertTrue(keyless["degraded"])
+        summaries = P.list_campaign_summaries(self.root)
+        self.assertEqual(sorted(row["key"] for row in summaries),
+                         ["TTS.v6:Release", "_unassigned", "tf-rehancer-icassp"])
+        by_key = {row["key"]: row for row in summaries}
+        self.assertEqual(by_key["tf-rehancer-icassp"]["cycle_count"], 2)
+        self.assertTrue(by_key["_unassigned"]["degraded"])
+        odd_campaign["state"] = "superseded"
+        P._write_campaign(self.root, odd_campaign, exclusive=False)
+        self.assertNotIn("TTS.v6:Release", {row["key"] for row in P.list_campaign_summaries(self.root)})
+        self.assertIn("TTS.v6:Release", {row["key"] for row in P.list_campaign_summaries(self.root, active_only=False)})
+
+    def test_join_backfills_missing_display_fields_and_repairs_a_promoted_placeholder_title(self):
+        self.activate()
+        _, first_file = self.route(slug="first-task", campaign_key="promoted-stream")
+        first = P.begin(self.root, route_file=first_file, capability="autopilot-code", intensity="direct")
+        campaign = P.read_campaign(self.root, first["campaign_id"])
+        # A pre-W7I record lacks every display field; the join fills them from the key, not the route.
+        legacy = {k: v for k, v in campaign.items() if k not in ("slug", "title", "slug_source", "slug_truncated")}
+        P._write_campaign(self.root, legacy, exclusive=False)
+        _, second_file = self.route(slug="second-task", campaign_key="promoted-stream", gate_source="second")
+        P.begin(self.root, route_file=second_file, capability="autopilot-code", intensity="direct")
+        filled = P.read_campaign(self.root, first["campaign_id"])
+        self.assertEqual((filled["slug"], filled["title"], filled["slug_source"], filled["slug_truncated"]),
+                         ("promoted-stream", "promoted-stream", "campaign-key", False))
+        self.assertEqual(filled["locator"], campaign["locator"])
+        # A campaign promoted out of `_unassigned` by the metadata amendment still
+        # carries the reserved placeholder title; the next join names it by its key
+        # so later manifests stop sealing `campaign.title = "_unassigned"`.
+        promoted = dict(filled)
+        promoted["title"] = "_unassigned"
+        P._write_campaign(self.root, promoted, exclusive=False)
+        _, third_file = self.route(slug="third-task", campaign_key="promoted-stream", gate_source="third")
+        third = P.begin(self.root, route_file=third_file, capability="autopilot-code", intensity="direct")
+        repaired = P.read_campaign(self.root, first["campaign_id"])
+        self.assertEqual(repaired["title"], "promoted-stream")
+        self.assertEqual(repaired["locator"], campaign["locator"])
+        self.assertEqual(third["campaign_id"], first["campaign_id"])
+        # The reserved container itself is never renamed by a join.
+        _, keyless_file = self.route(slug="stray", gate_source="stray")
+        keyless = P.begin(self.root, route_file=keyless_file, capability="autopilot-code", intensity="direct")
+        self.assertEqual(P.read_campaign(self.root, keyless["campaign_id"])["title"], "_unassigned")
 
     def test_collision_suffix_is_smallest_and_resume_keeps_it(self):
         self.activate()
@@ -2704,7 +2782,8 @@ class TerminalTransactionIntegrationTest(ProducerTestBase):
         if capability=="autopilot-spec":
             route=R.compose_route(capability=capability,capability_mode="update",shape="staged",
                 graph="review,prd-transaction",slug="terminal-transaction-fixture",cwd=R.ROOT,
-                artifact_root=self.root,intensity="standard",dispatch_evidence={"tuples":[nested(harness,"codex")]})
+                artifact_root=self.root,intensity="standard",dispatch_evidence={"tuples":[nested(harness,"codex")]},
+                unassigned=True)
         route_file=Path(L.admit_runtime_route(self.root,route).route_file)
         jobs=Path(self._tmp.name)/"jobs.log"; owner="att-transaction-owner"; child="att-transaction-report"
         owner_meta=dict(attempt_id=owner,worker_type="owner",dispatch_depth="1",registered_worker="1",
@@ -3070,9 +3149,10 @@ class LocatorDateDuplicationTest(ProducerTestBase):
         campaign = P.read_campaign(self.root, result["campaign_id"])
         locator = campaign["locator"]
         self.assertEqual(len(P.artifact_locator._DATE_PREFIX.findall(locator)), 1, locator)
-        self.assertTrue(locator.endswith("_r5-streaming-window-sim"), locator)
-        self.assertEqual(campaign["slug"], "r5-streaming-window-sim")
-        self.assertEqual(campaign["slug_source"], "route")
+        # The campaign carries the stream key, not the route slug.
+        self.assertTrue(locator.endswith("_streaming-release"), locator)
+        self.assertEqual(campaign["slug"], "streaming-release")
+        self.assertEqual(campaign["slug_source"], "campaign-key")
         # The route sealed the normalised slug, so the cycle locator under it
         # carries one date too.
         self.assertEqual(route["slug"], "r5-streaming-window-sim")

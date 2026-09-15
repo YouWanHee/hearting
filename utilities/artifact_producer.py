@@ -923,6 +923,60 @@ def _route_naming(
     return slug, display_title, "derived-legacy-route", truncated
 
 
+UNASSIGNED_KEY = "_unassigned"
+
+
+def _campaign_naming(campaign_key: Optional[str]) -> Tuple[str, str, str, bool]:
+    """Return (slug, title, slug_source, truncated) for a *campaign* record.
+
+    A campaign is the work stream the agent proposed; its locator and title
+    come from that proposal, never from the first route that happened to
+    join it.  Deriving the campaign name from the first cycle's slug produced
+    ``<date>_tf-rehancer-analysis-cx`` for the stream ``tf-rehancer-icassp``
+    (TF-Rehancer 2026-09-15).  The reserved `_unassigned` container keeps its
+    fixed name.
+    """
+    if campaign_key is None:
+        return "unassigned", UNASSIGNED_KEY, "reserved", False
+    slug, truncated = artifact_locator.slugify(campaign_key, fallback="stream")
+    return slug, campaign_key, "campaign-key", truncated
+
+
+def list_campaign_summaries(root: Path, *, active_only: bool = True) -> List[Dict[str, Any]]:
+    """Cheap, read-only listing of the root's campaigns for callers that
+    must show the agent which work streams already exist (compose).
+
+    Reads each ``campaign.json`` once and treats a committed satisfaction
+    event as terminal; it never folds or validates like `read_campaign`, so
+    it is a summary surface, not admission authority.
+    """
+    root = Path(root)
+    rows: List[Dict[str, Any]] = []
+    for entry in artifact_locator.iter_campaign_dirs(root):
+        record = _read_json(entry / "campaign.json")
+        if not record or not isinstance(record.get("campaign_id"), str):
+            continue
+        state = str(record.get("state") or "unknown")
+        if (entry / artifact_campaign.EVENT_NAME).exists():
+            state = "satisfied"
+        if active_only and state != "active":
+            continue
+        cycles = record.get("cycles")
+        rows.append({
+            "campaign_id": record["campaign_id"],
+            "key": record.get("key"),
+            "title": record.get("title"),
+            "goal": record.get("goal"),
+            "locator": entry.name,
+            "state": state,
+            "degraded": record.get("degraded") is True,
+            "cycle_count": len(cycles) if isinstance(cycles, list) else 0,
+            "created_on": str(record.get("created_on") or ""),
+        })
+    rows.sort(key=lambda row: (row["created_on"], str(row["key"])), reverse=True)
+    return rows
+
+
 def _campaign_degradation(campaign: Mapping[str, Any]) -> Dict[str, Any]:
     if campaign.get("degraded") is True:
         return {"degraded": True, "degraded_reason": campaign.get("degraded_reason", "campaign-unassigned")}
@@ -1099,7 +1153,7 @@ def begin(
                 }
         index = artifact_admission.load_index(root)
         if campaign is None and campaign_key is None:
-            campaign = find_campaign_by_key(root, "_unassigned")
+            campaign = find_campaign_by_key(root, UNASSIGNED_KEY)
         campaign_created = False
         slug, display_title, slug_source, slug_truncated = _route_naming(
             route, campaign, title=title, goal=goal, root=root)
@@ -1108,18 +1162,22 @@ def begin(
             new_campaign_id = alloc.allocate("campaign")
             while new_campaign_id in index.stable_ids:
                 new_campaign_id = alloc.allocate("campaign")
+            # The campaign is named from the proposed stream key; the route
+            # slug names only this cycle (CONVENTIONS "Campaign or cycle").
+            campaign_slug, campaign_title, campaign_slug_source, campaign_slug_truncated = (
+                _campaign_naming(campaign_key))
             locator, locator_suffix = artifact_locator.allocate_locator(
-                root / "campaigns", started_on, slug if campaign_key else "unassigned")
+                root / "campaigns", started_on, campaign_slug)
             campaign = {
                 "schema_version": 1,
                 "contract": CONTRACT,
                 "campaign_id": new_campaign_id,
-                "key": campaign_key or "_unassigned",
+                "key": campaign_key or UNASSIGNED_KEY,
                 **({"degraded": True, "degraded_reason": "campaign-unassigned"} if campaign_key is None else {}),
-                "slug": slug if campaign_key else "unassigned",
-                "title": display_title if campaign_key else "_unassigned",
-                "slug_source": slug_source,
-                "slug_truncated": slug_truncated,
+                "slug": campaign_slug,
+                "title": campaign_title,
+                "slug_source": campaign_slug_source,
+                "slug_truncated": campaign_slug_truncated,
                 "locator": locator,
                 "locator_suffix": locator_suffix,
                 "goal": (goal or f"{route_capability} cycle output") if campaign_key else "Work stream not proposed",
@@ -1136,13 +1194,23 @@ def begin(
             # missing display fields are filled from this route for hybrid joins.
             campaign = dict(campaign)
             changed = False
+            existing_key = campaign.get("key")
+            fill_slug, fill_title, fill_source, fill_truncated = _campaign_naming(
+                None if existing_key in (None, UNASSIGNED_KEY) else str(existing_key))
             for key, value in (
-                ("slug", slug), ("title", display_title), ("slug_source", slug_source),
-                ("slug_truncated", slug_truncated),
+                ("slug", fill_slug), ("title", fill_title), ("slug_source", fill_source),
+                ("slug_truncated", fill_truncated),
             ):
                 if key not in campaign:
                     campaign[key] = value
                     changed = True
+            # A campaign promoted out of `_unassigned` by the §37 metadata
+            # amendment keeps the reserved placeholder title (the amendment
+            # writes key/goal only); every later manifest would seal
+            # `campaign.title = "_unassigned"`.  The key is the stream name.
+            if existing_key not in (None, UNASSIGNED_KEY) and campaign.get("title") == UNASSIGNED_KEY:
+                campaign["title"] = fill_title
+                changed = True
             if changed:
                 _write_campaign(root, campaign, exclusive=False)
         new_cycle_id = alloc.allocate("cycle")
@@ -3442,6 +3510,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p = sub.add_parser("status")
     p.add_argument("--artifact-root", required=True)
 
+    p = sub.add_parser("campaign-list", help="summarize the root's campaigns (keys, titles, cycle counts)")
+    p.add_argument("--artifact-root", required=True)
+    p.add_argument("--all-states", action="store_true", help="include satisfied/superseded campaigns")
+
     for command in ("campaign-status", "campaign-close", "campaign-recover"):
         p = sub.add_parser(command, help="verify, accept, or recover a campaign's administrative closure")
         p.add_argument("--artifact-root", required=True)
@@ -3556,6 +3628,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                               w7=w7, approval_receipt_sha256=args.approval_receipt_sha256)
         elif args.command == "status":
             result = status(root)
+        elif args.command == "campaign-list":
+            rows = list_campaign_summaries(root, active_only=not args.all_states)
+            result = {"status": "ok", "artifact_root": str(Path(root).resolve()), "campaigns": rows}
         elif args.command == "campaign-status":
             result = artifact_campaign.status(root, args.campaign)
         elif args.command in {"campaign-close", "campaign-recover"}:

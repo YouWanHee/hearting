@@ -91,7 +91,7 @@ class OpenCodeComposeBindTest(unittest.TestCase):
 
     def test_compose_without_output_binds_the_canonical_route(self) -> None:
         session = self._session("noout")
-        result = self._run("compose", "--slug", "oc-noout", "--cwd", str(self.repo), session=session)
+        result = self._run("compose", "--slug", "oc-noout", "--unassigned", "--cwd", str(self.repo), session=session)
         self.assertEqual(result.returncode, 0, result.stderr)
         route = json.loads(result.stdout.strip().splitlines()[-1])
         self.assertEqual(route["selection"]["route_origin"], "compose")
@@ -108,7 +108,7 @@ class OpenCodeComposeBindTest(unittest.TestCase):
 
     def test_compose_without_cwd_uses_the_sealed_cwd(self) -> None:
         session = self._session("nocwd")
-        result = subprocess.run([str(PREFLIGHT), "compose", "--slug", "oc-nocwd"], text=True,
+        result = subprocess.run([str(PREFLIGHT), "compose", "--slug", "oc-nocwd", "--unassigned"], text=True,
                                 capture_output=True, env=self._env(session), cwd=str(self.repo))
         self.assertEqual(result.returncode, 0, result.stderr)
         route = json.loads(result.stdout.strip().splitlines()[-1])
@@ -120,12 +120,12 @@ class OpenCodeComposeBindTest(unittest.TestCase):
 
     def test_compose_with_explicit_output_still_binds(self) -> None:
         session = self._session("out")
-        explain = self._run("compose", "--slug", "oc-out", "--cwd", str(self.repo), "--explain", session=session)
+        explain = self._run("compose", "--slug", "oc-out", "--unassigned", "--cwd", str(self.repo), "--explain", session=session)
         self.assertEqual(explain.returncode, 0, explain.stderr)
         self.assertIsNone(self._marker(session), "--explain must not bind")
         route_id = json.loads(explain.stdout.strip().splitlines()[-1])["route_id"]
         output = self.repo / ".agent_reports" / ".runtime" / "routes" / f"{route_id}.json"
-        result = self._run("compose", "--slug", "oc-out", "--cwd", str(self.repo), "--output", str(output), session=session)
+        result = self._run("compose", "--slug", "oc-out", "--unassigned", "--cwd", str(self.repo), "--output", str(output), session=session)
         self.assertEqual(result.returncode, 0, result.stderr)
         marker = self._marker(session)
         self.assertIsNotNone(marker)
@@ -133,7 +133,7 @@ class OpenCodeComposeBindTest(unittest.TestCase):
 
     def test_failed_compose_binds_nothing_and_keeps_its_exit_status(self) -> None:
         session = self._session("fail")
-        result = self._run("compose", "--slug", "oc-fail", "--cwd", str(self.repo), "--shape", "direct",
+        result = self._run("compose", "--slug", "oc-fail", "--unassigned", "--cwd", str(self.repo), "--shape", "direct",
                            "--graph", "execute", session=session)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("compose-graph-only-staged", result.stderr)
@@ -141,7 +141,7 @@ class OpenCodeComposeBindTest(unittest.TestCase):
 
     def test_no_session_id_binds_nothing(self) -> None:
         session = self._session("nosid")
-        result = self._run("compose", "--slug", "oc-nosid", "--cwd", str(self.repo), session=None)
+        result = self._run("compose", "--slug", "oc-nosid", "--unassigned", "--cwd", str(self.repo), session=None)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIsNone(self._marker(session))
         route = json.loads(result.stdout.strip().splitlines()[-1])
@@ -157,7 +157,7 @@ class OpenCodeComposeBindTest(unittest.TestCase):
         session = self._session("inherited")
         with mock.patch.dict(os.environ, {"AGENT_ARTIFACT_ROOT": str(foreign),
                                           "AGENT_DISPATCH_ATTEMPT_ID": "att-fixture-worker"}):
-            result = self._run("compose", "--slug", "oc-inherited", "--cwd", str(self.repo), session=session)
+            result = self._run("compose", "--slug", "oc-inherited", "--unassigned", "--cwd", str(self.repo), session=session)
         self.assertEqual(result.returncode, 0, result.stderr)
         route = json.loads(result.stdout.strip().splitlines()[-1])
         self._assert_isolated(route)

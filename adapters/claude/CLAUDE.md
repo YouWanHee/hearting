@@ -37,8 +37,10 @@ another adapter.
 
 ## Routing and Execution
 
-For ordinary execution use `capability-route.py compose --start --prompt-file
-<task>` through active `AGENT_HOME`. Runtime prepares the cycle, starts declared
+For ordinary execution use `capability-route.py compose --campaign-key
+<stream> --start --prompt-file <task>` through active `AGENT_HOME` (name the
+work stream; `artifact_producer.py campaign-list` shows active keys, and
+`--unassigned` is the only keyless form). Runtime prepares the cycle, starts declared
 frames and reuses exact attempts. Follow `parent_next`; reuse `resume_command`
 after wakes or corrections. At `needs-question`, compare completed frames and
 ask the native interview. Actual release precedes owner execution; runtime

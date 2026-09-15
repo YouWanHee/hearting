@@ -694,6 +694,28 @@ class TestReviewFindingRegressions(AdmissionContractBase):
             "index-repository-identity-mismatch", [v.code for v in retry.violations]
         )
 
+    def test_rebuild_keeps_the_idempotency_key_after_a_cycle_directory_rename(self):
+        # A locator amendment or a hand rename (D-89) moves the folder; the
+        # sealed manifest still carries cycle_id, so the caller's key survives.
+        doc, outcome = self._admit_valid(key="custom-key-after-rename")
+        cycle_dir = self.root / outcome.cycle_path
+        # Legacy admission publishes `campaigns/<camp>/cycles/<cyc>`; keep the
+        # `cycles/` container and rename the campaign and cycle folders around it.
+        container = cycle_dir.parent
+        campaign_dir = container.parent if container.name == "cycles" else container
+        renamed_campaign = campaign_dir.with_name(campaign_dir.name + "-renamed")
+        os.rename(str(campaign_dir), str(renamed_campaign))
+        moved_parent = renamed_campaign / "cycles" if container.name == "cycles" else renamed_campaign
+        moved_cycle = moved_parent / (cycle_dir.name + "-moved")
+        os.rename(str(moved_parent / cycle_dir.name), str(moved_cycle))
+        rebuilt = adm.rebuild_index(self.root)
+        report = adm._read_json(adm._admission_dir(self.root) / "rebuild-report.json")
+        self.assertEqual(report["fallback_idempotency_keys"], [])
+        self.assertIn("custom-key-after-rename", rebuilt.manifests)
+        self.assertEqual(rebuilt.cycles[doc["cycle"]["cycle_id"]]["cycle_path"],
+                         os.path.relpath(str(moved_cycle), str(self.root)))
+        self.assertTrue(adm.verify_index(self.root).ok)
+
     def test_rebuild_records_manifest_id_fallback(self):
         # F8i: the manifest-id fallback is a recorded machine-readable fact.
         doc, outcome = self._admit_valid(key="custom-key-original")
