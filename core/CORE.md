@@ -146,7 +146,7 @@ never orders a move or a delete.
 | `documents/` | document drafts and refinement artifacts | `C-DUR` |
 | `experiments/` | experiment setup, evaluation, and run logs (declared, currently absent — a reserved boundary, not an error) | `C-DUR` |
 | `designs/` | standalone design decision records (declared, currently absent — a reserved boundary, not an error; spec-owned design instead anchors at `spec/design/`) | `C-DUR` |
-| `campaigns/` | W7C producer output: `campaigns/<campaign-locator>/<cycle-locator>/artifacts/<bucket>/…` plus machine-managed `campaign.json`, per-cycle `.cycle.json` stable-ID binding, and `manifest.json` commit point; an optional digest-bound campaign-level `RUNLOG.md` may preserve a migrated aggregate run log without manufacturing a cycle; the only new-write target once the write-cutover is active (`utilities/artifact_producer.py`) | `C-DUR` |
+| `campaigns/` | W7C producer output: `campaigns/<campaign-locator>/<cycle-locator>/artifacts/<bucket>/…` plus machine-managed `campaign.json`, per-cycle `.cycle.json` stable-ID binding (with the cycle's start time), and `manifest.json` commit point; an optional digest-bound campaign-level `RUNLOG.md` may preserve a migrated aggregate run log without manufacturing a cycle; the only new-write target once the write-cutover is active (`utilities/artifact_producer.py`) | `C-DUR` |
 | `shared/` | immutable shared revisions `shared/<spec\|analysis\|research>/<ref>/revisions/<rrev>/…`; created only by `admit-shared` from a sealed cycle, research only with an explicit promotion; never a direct write target | `C-DUR` |
 | `_internal/` | cycle-internal support material — a cycle's child, not an independent entry | `C-INT` |
 | `reviews/` | review support material | `C-INT` |

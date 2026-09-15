@@ -11,6 +11,7 @@ from typing import Any, Dict, Iterable, Mapping, Sequence
 
 import artifact_admission
 import artifact_identity
+import artifact_locator
 from campaign_title_repair import canonical, digest_bytes, digest_json, write_atomic, write_atomic_bytes
 
 PACKAGE_SCHEMA = "hearting-artifact-metadata-amendment-package/v1"
@@ -250,8 +251,12 @@ def _prepare_locked(root: Path, *, campaign_id: str, key: str, goal: str,
         if not isinstance(locator, str) or "/" in locator or locator in {"", ".", ".."}:
             raise AmendmentError(f"cycle-locator-invalid:{cycle_id}")
         cycle_dir = campaign_json.parent / locator
-        binding_doc = _read_json(cycle_dir / ".cycle.json")
-        if binding_doc != {"schema_version": 1, "kind": "artifact-cycle-binding", "campaign_id": campaign_id, "cycle_id": cycle_id}:
+        try:
+            binding_doc = artifact_locator.read_cycle_binding(cycle_dir)
+        except artifact_locator.LocatorError:
+            binding_doc = None
+        if (binding_doc is None or binding_doc["campaign_id"] != campaign_id
+                or binding_doc["cycle_id"] != cycle_id):
             raise AmendmentError(f"cycle-binding-mismatch:{cycle_id}")
         manifest_path = cycle_dir / "manifest.json"
         binding = _manifest_binding(manifest_path, root_id=identity.artifact_root_id,

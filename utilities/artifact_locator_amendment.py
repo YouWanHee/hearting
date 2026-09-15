@@ -283,9 +283,12 @@ def _prepare_locked(root: Path, *, campaign_id: str, campaign_locator: str,
         move = new_locator != old_locator
         if not _real_dir(old_dir) or (move and _lexists(old_campaign_dir / new_locator)):
             raise LocatorAmendmentError(f"cycle-target-collision:{cycle_id}")
-        binding_doc = _read_json(old_dir / ".cycle.json")
-        if binding_doc != {"schema_version": 1, "kind": "artifact-cycle-binding",
-                           "campaign_id": campaign_id, "cycle_id": cycle_id}:
+        try:
+            binding_doc = artifact_locator.read_cycle_binding(old_dir)
+        except artifact_locator.LocatorError:
+            binding_doc = None
+        if (binding_doc is None or binding_doc["campaign_id"] != campaign_id
+                or binding_doc["cycle_id"] != cycle_id):
             raise LocatorAmendmentError(f"cycle-binding-mismatch:{cycle_id}")
         manifest_path = old_dir / "manifest.json"
         binding = _binding(manifest_path, root_id=parsed_identity.artifact_root_id,
