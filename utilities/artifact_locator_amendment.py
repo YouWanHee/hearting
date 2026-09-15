@@ -260,7 +260,6 @@ def _prepare_locked(root: Path, *, campaign_id: str, campaign_locator: str,
     manifest_sources = []
     cycle_rows = []
     mutable_paths = {campaign_json, root / CYCLE_TITLES_REL, root / DISPLAY_TITLES_REL,
-                     root / CAMPAIGN_METADATA_REL,
                      root / "campaigns" / artifact_locator.INDEX_JSON,
                      root / "campaigns" / artifact_locator.INDEX_MD,
                      root / artifact_admission.ADMISSION_REL / "index.json"}
@@ -463,8 +462,12 @@ def _validate_package(package: Mapping[str, Any]) -> None:
     targets = package.get("file_targets")
     # campaign record + one producer record per cycle + cycle title sidecar +
     # two locator indexes + one admission index, plus the campaign display-title
-    # sidecar when the root has one.
-    if not isinstance(targets, list) or not (5 + len(cycles) <= len(targets) <= 6 + len(cycles)):
+    # sidecar exactly when the package carries it.
+    if not isinstance(targets, list):
+        raise LocatorAmendmentError("package-file-target-count")
+    display_targets = sum(1 for t in targets if isinstance(t, Mapping)
+                          and str(t.get("post_path")) == DISPLAY_TITLES_REL.as_posix())
+    if display_targets > 1 or len(targets) != 5 + len(cycles) + display_targets:
         raise LocatorAmendmentError("package-file-target-count")
     target_pre_paths = []; target_post_paths = []
     for target in targets:

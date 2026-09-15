@@ -180,7 +180,7 @@ shape and explicit choices determine the route; defaults only fill omissions:
 
 | Shape | When | Route |
 |---|---|---|
-| `direct` | one atomic, reversible change the session makes and checks inline | `capability-route.py compose --slug <slug>` — the inline node, dispatch depth 0 |
+| `direct` | one atomic, reversible change the session makes and checks inline | `capability-route.py compose --campaign-key <stream> --slug <slug>` — the inline node, dispatch depth 0 |
 | `solo` | one bounded piece of work that deserves its own registered session but no separate stages | `compose --shape solo` — one registered dispatch-depth-1 owner, no dispatch depth 2 |
 | `staged` | work with separate stages | `compose --shape staged` uses the capability's standard recipe; optional `--graph <stage,…>` selects a subgraph |
 

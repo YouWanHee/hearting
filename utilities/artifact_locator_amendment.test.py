@@ -142,6 +142,27 @@ class LocatorAmendmentTests(unittest.TestCase):
         again = L.apply(package, expected_package_digest=L.package_digest(package))
         self.assertEqual(again["status"], "already-applied")
 
+    def test_fault_on_a_mixed_package_restores_the_unmoved_cycle_too(self) -> None:
+        (self.root / A.DISPLAY_TITLES_REL).unlink()
+        self.requests[self.CYCLES[1]] = {"locator": "2026-09-13_cycle-2", "title": "v2 · 제목만 바뀜"}
+        package = self.package()
+        targets = {row["pre_path"]: (self.root / row["pre_path"]).read_bytes() for row in package["file_targets"]}
+        record_path = self.root / A.PRODUCER_REL / "cycles" / f"{self.CYCLES[1]}.json"
+        # One campaign rename + one cycle rename + N file writes: fault after
+        # the record writes so the rollback must undo files and moves alike.
+        for fault in (2, 3 + len(package["file_targets"])):
+            with self.assertRaisesRegex(L.LocatorAmendmentError, "injected-locator-failure"):
+                L.apply(package, expected_package_digest=L.package_digest(package), fault_after_steps=fault)
+            self.assertTrue(self.old_campaign.is_dir() and not self.old_campaign.is_symlink())
+            self.assertFalse(self.new_campaign.exists())
+            self.assertTrue((self.old_campaign / "2026-09-13_cycle-1").is_dir())
+            self.assertTrue((self.old_campaign / "2026-09-13_cycle-2").is_dir())
+            self.assertFalse((self.old_campaign / "2026-09-13_cycle-2").is_symlink())
+            self.assertEqual(targets, {path: (self.root / path).read_bytes() for path in targets})
+            self.assertEqual(json.loads(record_path.read_text())["title"], "2026-09-13_cycle-2")
+        self.assertEqual(L.apply(package, expected_package_digest=L.package_digest(package))["status"], "applied")
+        self.assertEqual(json.loads(record_path.read_text())["title"], "v2 · 제목만 바뀜")
+
     def test_fault_rolls_back_then_replay_succeeds(self) -> None:
         package = self.package()
         targets = {row["pre_path"]: (self.root / row["pre_path"]).read_bytes() for row in package["file_targets"]}

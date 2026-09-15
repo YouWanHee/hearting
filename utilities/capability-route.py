@@ -1064,7 +1064,7 @@ def build_continuation_route(
     }
     inherited_keys=(
         "schema_version","capability","capability_mode","slug","slug_truncated",
-        "campaign_key","parent_cycle_id",
+        "campaign_key","parent_cycle_id","campaign_unassigned",
         "requested_intensity",
         "effective_intensity","owner_model_profile","execution_topology",
         "owner_dispatch_depth","max_dispatch_depth","tracking",
@@ -2692,20 +2692,25 @@ COMPOSE_CAMPAIGN_LIST_CAP = 12
 
 
 def compose_campaign_summaries(artifact_root):
-    """Active campaigns of the root, newest first; empty when the root has
-    none or cannot be read (a fresh project is not an error here)."""
+    """Active campaigns of the root, newest first.  A fresh root has none
+    (empty list); a root that cannot be read returns None so the caller says
+    "unavailable" rather than mislabelling a join as a creation."""
     try:
         import artifact_producer
         return artifact_producer.list_campaign_summaries(Path(artifact_root))
-    except Exception:
-        return []
+    except (OSError, ImportError, ValueError):
+        return None
 
 
 def compose_campaign_hint(artifact_root):
-    rows = [r for r in compose_campaign_summaries(artifact_root) if r.get("key") not in (None, "_unassigned")]
-    shown = ", ".join(f"{r['key']}({r['cycle_count']})" for r in rows[:COMPOSE_CAMPAIGN_LIST_CAP])
-    if len(rows) > COMPOSE_CAMPAIGN_LIST_CAP:
-        shown += f", … +{len(rows) - COMPOSE_CAMPAIGN_LIST_CAP}"
+    rows = compose_campaign_summaries(artifact_root)
+    if rows is None:
+        shown = "unavailable (campaign scan failed)"
+    else:
+        keyed = [r for r in rows if r.get("key") not in (None, "_unassigned")]
+        shown = ", ".join(f"{r['key']}({r['cycle_count']})" for r in keyed[:COMPOSE_CAMPAIGN_LIST_CAP])
+        if len(keyed) > COMPOSE_CAMPAIGN_LIST_CAP:
+            shown += f", … +{len(keyed) - COMPOSE_CAMPAIGN_LIST_CAP}"
     return (f"name the work stream with --campaign-key <existing|new> (active: {shown or 'none'}); "
             "--unassigned keeps the work in the root's degraded _unassigned container")
 
@@ -2715,12 +2720,15 @@ def compose_campaign_selection(route):
     key = route.get("campaign_key")
     parent = route.get("parent_cycle_id")
     rows = compose_campaign_summaries(route["artifact_root"])
+    unavailable = rows is None
+    rows = rows or []
     active = [r for r in rows if r.get("key") not in (None, "_unassigned")]
     selection = {"key": key, "active_count": len(active),
-                 "active_keys": [r["key"] for r in active[:COMPOSE_CAMPAIGN_LIST_CAP]]}
+                 "active_keys": [r["key"] for r in active[:COMPOSE_CAMPAIGN_LIST_CAP]],
+                 "active_keys_unavailable": unavailable}
     if key is not None:
         match = next((r for r in rows if r.get("key") == key), None)
-        selection.update(mode="join" if match else "create",
+        selection.update(mode="unresolved" if unavailable else ("join" if match else "create"),
                          campaign_id=match["campaign_id"] if match else None,
                          title=match["title"] if match else None)
     elif parent is not None:
@@ -2738,6 +2746,8 @@ def _compose_campaign_line(selection):
         text = f"캠페인 {selection['key']} (신규 생성)"
     elif mode == "parent":
         text = f"캠페인 parent {selection['parent_cycle_id']} 상속"
+    elif mode == "unresolved":
+        text = f"캠페인 {selection['key']} (기존 여부 확인 불가: 캠페인 목록 읽기 실패)"
     else:
         text = "캠페인 미배정 (_unassigned, degraded)"
     shown = ", ".join(selection["active_keys"][:6])

@@ -5275,6 +5275,14 @@ class ComposeRouteTest(TestRoute):
    # A root with no campaigns yet still demands the proposal and shows an empty list.
    with self.assertRaisesRegex(ValueError,"active: none"):
     self.compose(artifact_root=str(root/"fresh"),unassigned=False)
+   # A failed campaign scan is reported as unavailable, never as "no campaigns" / "create".
+   import artifact_producer
+   with mock.patch.object(artifact_producer,"list_campaign_summaries",side_effect=OSError("scan failed")):
+    with self.assertRaisesRegex(ValueError,"active: unavailable"):
+     self.compose(artifact_root=tmp,unassigned=False)
+    unresolved=R.compose_campaign_selection(joined)
+    self.assertEqual((unresolved["mode"],unresolved["active_keys_unavailable"]),("unresolved",True))
+    self.assertIn("확인 불가",R.compose_card(joined))
  def test_graph_spec_parsing(self):
   self.assertEqual(R.parse_graph_spec("execute,test:qa/test , report"),[("execute",None),("test","qa/test"),("report",None)])
   for bad in ("", " , ", "execute,execute", "Bad!"):

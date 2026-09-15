@@ -1204,6 +1204,13 @@ def begin(
                 if key not in campaign:
                     campaign[key] = value
                     changed = True
+            # A campaign promoted out of `_unassigned` by the §37 metadata
+            # amendment keeps the reserved placeholder title (the amendment
+            # writes key/goal only); every later manifest would seal
+            # `campaign.title = "_unassigned"`.  The key is the stream name.
+            if existing_key not in (None, UNASSIGNED_KEY) and campaign.get("title") == UNASSIGNED_KEY:
+                campaign["title"] = fill_title
+                changed = True
             if changed:
                 _write_campaign(root, campaign, exclusive=False)
         new_cycle_id = alloc.allocate("cycle")

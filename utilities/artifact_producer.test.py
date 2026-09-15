@@ -300,6 +300,37 @@ class ActivateAndBeginTest(ProducerTestBase):
         self.assertNotIn("TTS.v6:Release", {row["key"] for row in P.list_campaign_summaries(self.root)})
         self.assertIn("TTS.v6:Release", {row["key"] for row in P.list_campaign_summaries(self.root, active_only=False)})
 
+    def test_join_backfills_missing_display_fields_and_repairs_a_promoted_placeholder_title(self):
+        self.activate()
+        _, first_file = self.route(slug="first-task", campaign_key="promoted-stream")
+        first = P.begin(self.root, route_file=first_file, capability="autopilot-code", intensity="direct")
+        campaign = P.read_campaign(self.root, first["campaign_id"])
+        # A pre-W7I record lacks every display field; the join fills them from the key, not the route.
+        legacy = {k: v for k, v in campaign.items() if k not in ("slug", "title", "slug_source", "slug_truncated")}
+        P._write_campaign(self.root, legacy, exclusive=False)
+        _, second_file = self.route(slug="second-task", campaign_key="promoted-stream", gate_source="second")
+        P.begin(self.root, route_file=second_file, capability="autopilot-code", intensity="direct")
+        filled = P.read_campaign(self.root, first["campaign_id"])
+        self.assertEqual((filled["slug"], filled["title"], filled["slug_source"], filled["slug_truncated"]),
+                         ("promoted-stream", "promoted-stream", "campaign-key", False))
+        self.assertEqual(filled["locator"], campaign["locator"])
+        # A campaign promoted out of `_unassigned` by the metadata amendment still
+        # carries the reserved placeholder title; the next join names it by its key
+        # so later manifests stop sealing `campaign.title = "_unassigned"`.
+        promoted = dict(filled)
+        promoted["title"] = "_unassigned"
+        P._write_campaign(self.root, promoted, exclusive=False)
+        _, third_file = self.route(slug="third-task", campaign_key="promoted-stream", gate_source="third")
+        third = P.begin(self.root, route_file=third_file, capability="autopilot-code", intensity="direct")
+        repaired = P.read_campaign(self.root, first["campaign_id"])
+        self.assertEqual(repaired["title"], "promoted-stream")
+        self.assertEqual(repaired["locator"], campaign["locator"])
+        self.assertEqual(third["campaign_id"], first["campaign_id"])
+        # The reserved container itself is never renamed by a join.
+        _, keyless_file = self.route(slug="stray", gate_source="stray")
+        keyless = P.begin(self.root, route_file=keyless_file, capability="autopilot-code", intensity="direct")
+        self.assertEqual(P.read_campaign(self.root, keyless["campaign_id"])["title"], "_unassigned")
+
     def test_collision_suffix_is_smallest_and_resume_keeps_it(self):
         self.activate()
         results = []
