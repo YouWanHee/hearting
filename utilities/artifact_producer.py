@@ -12,7 +12,7 @@ mutex, and the derived index.
 Layout (D-2, closed):
 
     campaigns/<campaign-locator>/campaign.json              mutable campaign record
-    campaigns/<campaign-locator>/<cycle-locator>/.cycle.json stable-ID locator binding
+    campaigns/<campaign-locator>/<cycle-locator>/.cycle.json stable-ID locator binding + started_on
     campaigns/<campaign-locator>/<cycle-locator>/artifacts  producer output (open)
     campaigns/<campaign-locator>/<cycle-locator>/manifest.json finalize commit point
     shared/<spec|analysis|research>/<ref>/reference.json
@@ -589,9 +589,10 @@ def _write_cycle_record(root: Path, record: Dict[str, Any], *, exclusive: bool) 
         _write_atomic(path, data, 0o600)
 
 
-def _write_cycle_binding(directory: Path, campaign_id: str, cycle_id: str) -> None:
+def _write_cycle_binding(directory: Path, campaign_id: str, cycle_id: str,
+                         *, started_on: Optional[str] = None) -> None:
     marker = Path(directory) / artifact_locator.CYCLE_BINDING
-    data = artifact_locator.cycle_binding_bytes(campaign_id, cycle_id)
+    data = artifact_locator.cycle_binding_bytes(campaign_id, cycle_id, started_on=started_on)
     if marker.is_file() and not marker.is_symlink():
         if marker.read_bytes() != data:
             raise ProducerError("cycle-binding-conflict", str(marker))
@@ -1258,7 +1259,7 @@ def begin(
         _ensure_dir(target / "artifacts")
         campaign["cycles"] = list(campaign.get("cycles", [])) + [new_cycle_id]
         _write_campaign(root, campaign, exclusive=False)
-        _write_cycle_binding(target, campaign["campaign_id"], new_cycle_id)
+        _write_cycle_binding(target, campaign["campaign_id"], new_cycle_id, started_on=started_on)
         if binding_jobs is not None and binding_owner:
             try:
                 dispatch_terminal_commit.publish_producer_binding(

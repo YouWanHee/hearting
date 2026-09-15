@@ -3212,5 +3212,60 @@ class RouteLaunchContextTest(ProducerTestBase):
         self.assertEqual(Path(env["AGENT_ARTIFACT_OUTPUT_DIR"]), Path(env["AGENT_ARTIFACT_CYCLE_DIR"]) / "artifacts")
 
 
+class CycleBindingAndIndexOrderTest(ProducerTestBase):
+    def test_cycle_binding_records_the_start_time_and_legacy_bindings_still_read(self):
+        self.activate()
+        _route, _route_file, result = self.begin()
+        cycle_dir = Path(result["cycle_dir"])
+        record = P.read_cycle_record(self.root, result["cycle_id"])
+        binding = json.loads((cycle_dir / ".cycle.json").read_text())
+        self.assertEqual(binding["started_on"], record["started_on"])
+        self.assertEqual(P.artifact_locator.read_cycle_binding(cycle_dir)["started_on"], record["started_on"])
+        self.assertEqual(P.artifact_locator.resolve_path(self.root, result["cycle_id"]), cycle_dir)
+        # Bindings written before the field existed keep resolving unchanged.
+        legacy = {key: value for key, value in binding.items() if key != "started_on"}
+        (cycle_dir / ".cycle.json").write_text(json.dumps(legacy), encoding="utf-8")
+        self.assertNotIn("started_on", P.artifact_locator.read_cycle_binding(cycle_dir))
+        self.assertEqual(P.artifact_locator.resolve_path(self.root, result["cycle_id"]), cycle_dir)
+        for bad in ({**binding, "started_on": "2026-09-14"}, {**binding, "sealed_on": binding["started_on"]}):
+            (cycle_dir / ".cycle.json").write_text(json.dumps(bad), encoding="utf-8")
+            with self.assertRaises(P.artifact_locator.LocatorError):
+                P.artifact_locator.read_cycle_binding(cycle_dir)
+        with self.assertRaises(P.artifact_locator.LocatorError):
+            P.artifact_locator.cycle_binding_bytes(record["campaign_id"], result["cycle_id"], started_on="today")
+
+    def test_index_markdown_lists_each_campaign_then_its_cycles_in_start_order(self):
+        self.activate()
+
+        def open_cycle(slug, key):
+            _route, route_file = self.route(slug=slug, gate_source=slug)
+            return P.begin(self.root, route_file=route_file, capability="autopilot-code",
+                           intensity="direct", campaign_key=key)
+
+        alpha_late = open_cycle("alpha-late", "alpha")
+        alpha_early = open_cycle("alpha-early", "alpha")
+        beta = open_cycle("beta-only", "beta")
+        stamps = {alpha_late["cycle_id"]: "2026-09-14T15:00:00Z",
+                  alpha_early["cycle_id"]: "2026-09-14T09:00:00Z",
+                  beta["cycle_id"]: "2026-09-13T10:00:00Z"}
+        for cycle_id, when in stamps.items():
+            path = P.cycle_record_path(self.root, cycle_id)
+            record = json.loads(path.read_text(encoding="utf-8"))
+            record["started_on"] = when
+            path.write_text(json.dumps(record), encoding="utf-8")
+        for campaign_id, when in ((alpha_late["campaign_id"], "2026-09-14T08:00:00Z"),
+                                  (beta["campaign_id"], "2026-09-13T08:00:00Z")):
+            campaign = P.read_campaign(self.root, campaign_id)
+            campaign["created_on"] = when
+            P._write_campaign(self.root, campaign, exclusive=False)
+        P.artifact_locator.rebuild_indexes(self.root)
+        markdown = (self.root / "campaigns" / "INDEX.md").read_text(encoding="utf-8")
+        order = [line.split("|")[1].strip() for line in markdown.splitlines() if line.startswith("| c")]
+        # Older campaign first; within a campaign the same-day cycles follow the clock, not the ID.
+        self.assertEqual(order, [beta["campaign_id"], beta["cycle_id"],
+                                 alpha_late["campaign_id"], alpha_early["cycle_id"], alpha_late["cycle_id"]])
+        self.assertIn("| 2026-09-14T09:00:00Z |", markdown)
+
+
 if __name__ == "__main__":
     unittest.main()

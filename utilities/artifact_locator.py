@@ -23,6 +23,12 @@ _DATE_PREFIX = re.compile(r"^\d{4}-\d{2}-\d{2}")
 _SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$")
 _CAMPAIGN_ID = re.compile(r"^camp_[0-9a-f]{32}$")
 _CYCLE_ID = re.compile(r"^cyc_[0-9a-f]{32}$")
+_RFC3339 = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+_BINDING_REQUIRED = frozenset({"schema_version", "kind", "campaign_id", "cycle_id"})
+# `started_on` is display data (D-88: the date prefix shows `cycle.started_on`);
+# the binding carries the full timestamp so same-day cycles stay orderable
+# from the folder alone. Bindings written before it existed omit it.
+_BINDING_OPTIONAL = frozenset({"started_on"})
 
 
 class LocatorError(ValueError):
@@ -194,17 +200,21 @@ def _manifest_cycle_id(path: Path) -> Optional[str]:
     return value
 
 
-def cycle_binding_bytes(campaign_id: str, cycle_id: str) -> bytes:
+def cycle_binding_bytes(campaign_id: str, cycle_id: str, *, started_on: Optional[str] = None) -> bytes:
     if _CAMPAIGN_ID.fullmatch(str(campaign_id)) is None:
         raise LocatorError("locator-campaign-id-invalid", str(campaign_id))
     if _CYCLE_ID.fullmatch(str(cycle_id)) is None:
         raise LocatorError("locator-cycle-id-invalid", str(cycle_id))
-    payload = {
+    payload: Dict[str, Any] = {
         "schema_version": 1,
         "kind": "artifact-cycle-binding",
         "campaign_id": campaign_id,
         "cycle_id": cycle_id,
     }
+    if started_on is not None:
+        if not isinstance(started_on, str) or _RFC3339.fullmatch(started_on) is None:
+            raise LocatorError("locator-cycle-started-on-invalid", str(started_on))
+        payload["started_on"] = started_on
     return (json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
 
@@ -213,9 +223,13 @@ def read_cycle_binding(path: Path) -> Optional[Dict[str, Any]]:
     if not marker.exists() and not marker.is_symlink():
         return None
     binding = _read_json(marker)
-    if binding is None or set(binding) != {"schema_version", "kind", "campaign_id", "cycle_id"}:
+    if (binding is None or not _BINDING_REQUIRED <= set(binding)
+            or set(binding) - _BINDING_REQUIRED - _BINDING_OPTIONAL):
         raise LocatorError("locator-cycle-binding-invalid", marker.as_posix())
     if binding.get("schema_version") != 1 or binding.get("kind") != "artifact-cycle-binding":
+        raise LocatorError("locator-cycle-binding-invalid", marker.as_posix())
+    if "started_on" in binding and (not isinstance(binding["started_on"], str)
+                                    or _RFC3339.fullmatch(binding["started_on"]) is None):
         raise LocatorError("locator-cycle-binding-invalid", marker.as_posix())
     if _CAMPAIGN_ID.fullmatch(str(binding.get("campaign_id"))) is None:
         raise LocatorError("locator-campaign-id-invalid", str(binding.get("campaign_id")))
@@ -288,7 +302,8 @@ def scan_index(root: Path) -> Tuple[Dict[str, str], Dict[str, Dict[str, str]]]:
     mapping: Dict[str, str] = {}
     rows: Dict[str, Dict[str, str]] = {}
 
-    def add(identifier: str, path: Path, *, title: str, started: str, status: str) -> None:
+    def add(identifier: str, path: Path, *, title: str, started: str, status: str,
+            campaign: str) -> None:
         rel = path.resolve().relative_to(root).as_posix()
         previous = mapping.get(identifier)
         if previous is not None and previous != rel:
@@ -298,6 +313,7 @@ def scan_index(root: Path) -> Tuple[Dict[str, str], Dict[str, Dict[str, str]]]:
             "title": title,
             "started": started,
             "status": status,
+            "campaign": campaign,
             "path": rel,
         }
 
@@ -326,6 +342,7 @@ def scan_index(root: Path) -> Tuple[Dict[str, str], Dict[str, Dict[str, str]]]:
             title=campaign_title,
             started=str(campaign.get("created_on") or ""),
             status=str(campaign.get("state") or "unknown"),
+            campaign=campaign_id,
         )
         unresolved = []
         assigned_ids = set()
@@ -361,6 +378,7 @@ def scan_index(root: Path) -> Tuple[Dict[str, str], Dict[str, Dict[str, str]]]:
                 title=str(record.get("title") or record.get("slug") or campaign_title),
                 started=str(record.get("started_on") or ""),
                 status=str(record.get("state") or ("sealed" if (cycle_path / "manifest.json").is_file() else "open")),
+                campaign=campaign_id,
             )
         # A manual rename changes only the display locator. For an open cycle
         # there is no manifest yet, so bind the sole remaining record to the
@@ -387,6 +405,7 @@ def scan_index(root: Path) -> Tuple[Dict[str, str], Dict[str, Dict[str, str]]]:
                 title=str(record.get("title") or record.get("slug") or campaign_title),
                 started=str(record.get("started_on") or ""),
                 status="open",
+                campaign=campaign_id,
             )
     return dict(sorted(mapping.items())), rows
 
@@ -407,6 +426,31 @@ def _atomic_write(path: Path, data: bytes) -> None:
             pass
 
 
+def _display_order(rows: Mapping[str, Mapping[str, str]]) -> Iterator[str]:
+    """Campaigns oldest first, each followed by its cycles in start order.
+
+    A human table sorted by ID interleaves the cycles of every campaign at
+    random; several cycles share a date prefix, so the full ``started``
+    timestamp is the order. Rows without a timestamp come last, by ID.
+    """
+
+    def key(identifier: str) -> Tuple[bool, str, str]:
+        started = str(rows[identifier].get("started") or "")
+        return (started == "", started, identifier)
+
+    by_campaign: Dict[str, list] = {}
+    for identifier, row in rows.items():
+        by_campaign.setdefault(str(row.get("campaign") or ""), []).append(identifier)
+    campaigns = sorted((c for c in by_campaign if c in rows), key=key)
+    for campaign_id in campaigns:
+        yield campaign_id
+        for identifier in sorted((i for i in by_campaign[campaign_id] if i != campaign_id), key=key):
+            yield identifier
+    for campaign_id in sorted(c for c in by_campaign if c not in rows):
+        for identifier in sorted(by_campaign[campaign_id], key=key):
+            yield identifier
+
+
 def _markdown(rows: Mapping[str, Mapping[str, str]]) -> bytes:
     def cell(value: str) -> str:
         return str(value).replace("\\", "\\\\").replace("|", "\\|").replace("\n", " ")
@@ -419,7 +463,7 @@ def _markdown(rows: Mapping[str, Mapping[str, str]]) -> bytes:
         "| ID | Title | Started | Status | Path |",
         "|---|---|---|---|---|",
     ]
-    for identifier in sorted(rows):
+    for identifier in _display_order(rows):
         row = rows[identifier]
         lines.append(
             "| {0} | {1} | {2} | {3} | {4} |".format(

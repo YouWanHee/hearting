@@ -44,8 +44,10 @@ class AmendmentTests(unittest.TestCase):
         for index, cycle_id in enumerate(self.CYCLES):
             locator = f"2026-09-13_cycle-{index+1}"
             cycle_dir = self.campaign_dir / locator
+            # First cycle: binding written before `started_on` existed; second: current shape.
             write_json(cycle_dir / ".cycle.json", {"schema_version": 1, "kind": "artifact-cycle-binding",
-                                                    "campaign_id": self.CAMPAIGN_ID, "cycle_id": cycle_id})
+                                                    "campaign_id": self.CAMPAIGN_ID, "cycle_id": cycle_id,
+                                                    **({"started_on": "2026-09-13T01:00:00Z"} if index else {})})
             (cycle_dir / "artifacts" / "analysis").mkdir(parents=True)
             (cycle_dir / "artifacts" / "analysis" / "REPORT.md").write_text(f"report {index}\n")
             manifest = {
