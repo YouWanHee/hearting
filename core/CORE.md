@@ -232,9 +232,13 @@ the locator and reason before payload reads or manifest publication.
 **Campaign closure.** `artifact_producer.py campaign-status|campaign-close|campaign-recover`
 owns administrative satisfaction. Status verifies the campaign's exact cycle
 membership, sealed manifests and their payloads and prints a reviewable goal,
-criterion and approval statement bound to that snapshot. Sealed abandoned
-cycles remain abandoned; this operation neither repairs route failure markers
-nor adds a residual-zero criterion. All cycles being sealed never substitutes
+criterion and approval statement bound to that snapshot. Membership is the
+set of member records: an output-less cycle that `finalize` removed from
+`campaign.cycles` keeps its `abandoned`/`no-lineage` record for audit and is
+reported under `detached_cycles` instead of drift
+(`artifact_campaign.is_member_record` is the one definition both sides use).
+Sealed abandoned cycles remain abandoned; this operation neither repairs route
+failure markers nor adds a residual-zero criterion. All cycles being sealed never substitutes
 for the user's acceptance of the goal and criterion. Close accepts the exact
 statement only from a native user message in the named session, derives the
 user actor from that evidence, and rechecks the snapshot under the producer's

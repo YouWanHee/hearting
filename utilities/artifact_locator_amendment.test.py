@@ -107,6 +107,41 @@ class LocatorAmendmentTests(unittest.TestCase):
             "already-applied",
         )
 
+    def test_root_without_title_repair_sidecar_and_unmoved_cycle_still_amends(self) -> None:
+        """A fresh root never ran the fleet title repair (no display-title v2
+        sidecar), and a cycle whose locator is already right only needs its
+        title; neither is a refusal (TF-Rehancer replay, 2026-09-15)."""
+        (self.root / A.DISPLAY_TITLES_REL).unlink()
+        kept_locator = "2026-09-13_cycle-2"
+        self.requests[self.CYCLES[1]] = {"locator": kept_locator, "title": "v2 · 제목만 바뀜"}
+        package = self.package()
+        rows = {row["cycle_id"]: row for row in package["cycles"]}
+        self.assertTrue(rows[self.CYCLES[0]]["move"])
+        self.assertFalse(rows[self.CYCLES[1]]["move"])
+        self.assertEqual(len(package["file_targets"]), 5 + len(self.CYCLES))
+        record_pre = json.loads((self.root / A.PRODUCER_REL / "cycles" / f"{self.CYCLES[1]}.json").read_text())
+        result = L.apply(package, expected_package_digest=L.package_digest(package))
+        self.assertEqual(result["status"], "applied")
+        self.assertFalse((self.root / A.DISPLAY_TITLES_REL).exists())
+        self.assertTrue((self.new_campaign / kept_locator).is_dir())
+        self.assertFalse((self.new_campaign / kept_locator).is_symlink())
+        self.assertTrue((self.old_campaign).is_symlink())
+        self.assertTrue((self.new_campaign / "2026-09-13_cycle-1").is_symlink())
+        record_post = json.loads((self.root / A.PRODUCER_REL / "cycles" / f"{self.CYCLES[1]}.json").read_text())
+        self.assertEqual(record_post["title"], "v2 · 제목만 바뀜")
+        for field in ("locator", "slug", "locator_suffix", "slug_source"):
+            self.assertEqual(record_post.get(field), record_pre.get(field), field)
+        titles = json.loads((self.root / A.CYCLE_TITLES_REL).read_text())
+        self.assertEqual({row["cycle_id"]: row["display_title"] for row in titles["entries"]}[self.CYCLES[1]],
+                         "v2 · 제목만 바뀜")
+        mapping, _ = artifact_locator.scan_index(self.root)
+        self.assertEqual(mapping[self.CYCLES[1]], f"campaigns/{self.new_campaign.name}/{kept_locator}")
+        admission = json.loads((self.root / artifact_admission.ADMISSION_REL / "index.json").read_text())
+        self.assertEqual(admission["cycles"][self.CYCLES[1]]["cycle_path"],
+                         f"campaigns/{self.new_campaign.name}/{kept_locator}")
+        again = L.apply(package, expected_package_digest=L.package_digest(package))
+        self.assertEqual(again["status"], "already-applied")
+
     def test_fault_rolls_back_then_replay_succeeds(self) -> None:
         package = self.package()
         targets = {row["pre_path"]: (self.root / row["pre_path"]).read_bytes() for row in package["file_targets"]}

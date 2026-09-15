@@ -181,7 +181,7 @@ class RouteDemand(unittest.TestCase):
                        if n["id"]!="frame-alternative")
         composed=R.compose_route(capability="autopilot-code",capability_mode="dev",shape="staged",graph=graph,
             slug="sd88",cwd=R.ROOT,artifact_root=R.ROOT, spec_read="fixture",profile_demands=demands,
-            dispatch_evidence=self.dispatch(self.nested()))
+            dispatch_evidence=self.dispatch(self.nested()),unassigned=True)
         R.verify_route(composed,R.ROOT)
         pick=lambda r:next(n for n in r["nodes"] if n["id"]=="execute")
         self.assertEqual(pick(route)["profile_selection"],pick(composed)["profile_selection"])
@@ -270,7 +270,7 @@ class RouteDemand(unittest.TestCase):
                 "--dispatch-evidence",str(evidence),"--profile-demands",str(demands)]
             for action,extra,expected in (("compile",["--intensity","standard","--signal","shared-contract",
                     "--transport","headless","--tracking","tracked","--workflow-mode","tracked"],"balanced-deep"),
-                    ("compose",["--full-record","--shape","staged","--graph","execute,report","--explicit-profiles",str(explicit)],"deep")):
+                    ("compose",["--full-record","--unassigned","--shape","staged","--graph","execute,report","--explicit-profiles",str(explicit)],"deep")):
                 result=subprocess.run([sys.executable,str(ROOT/"utilities/capability-route.py"),action,*common,*extra],
                     capture_output=True,text=True,env=env)
                 self.assertEqual(result.returncode,0,result.stdout+result.stderr)
@@ -278,7 +278,7 @@ class RouteDemand(unittest.TestCase):
                 self.assertEqual(node["model_profile"],expected)
                 self.assertEqual(node["profile_selection"]["source"],"explicit" if action=="compose" else "matrix")
             result = subprocess.run([sys.executable, str(ROOT/"utilities/capability-route.py"), "compose",
-                *common[:-2], "--shape", "staged", "--graph", "frame,frame-alternative,test,report",
+                *common[:-2], "--unassigned", "--shape", "staged", "--graph", "frame,frame-alternative,test,report",
                 "--profile", "light", "--full-record"], capture_output=True, text=True, env=env)
             self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
             route = json.loads(result.stdout)
@@ -342,7 +342,8 @@ class TopExceptionRoute(unittest.TestCase):
                 graph=graph, slug="light-owner", cwd=R.ROOT, artifact_root=R.ROOT,
                 spec_read="fixture", registered_headless_evidence=self.registered_headless(),
                 dispatch_evidence=self.dispatch(self.nested()),
-                profile_demands={"__owner__": demand()}, explicit_profiles={"__owner__": "light"})
+                profile_demands={"__owner__": demand()}, explicit_profiles={"__owner__": "light"},
+                unassigned=True)
             self.assertEqual(route["owner_model_profile"], "light")
             R.verify_route(route, R.ROOT)
         route = self.staged(capability="autopilot-spec", capability_mode="app",
@@ -356,7 +357,7 @@ class TopExceptionRoute(unittest.TestCase):
             route = R.compose_route(capability="autopilot-code", capability_mode="dev", shape=shape,
                 graph=graph, slug="explicit-light", cwd=R.ROOT, artifact_root=R.ROOT,
                 spec_read="fixture", registered_headless_evidence=self.registered_headless(),
-                dispatch_evidence=self.dispatch(self.nested()), profile="light")
+                dispatch_evidence=self.dispatch(self.nested()), profile="light", unassigned=True)
             self.assertEqual(route["owner_model_profile"], "light")
             self.assertEqual({n["model_profile"] for n in route["nodes"]}, {"light"})
             self.assertEqual(route["owner_profile_selection"]["source"], "explicit")
@@ -379,7 +380,7 @@ class TopExceptionRoute(unittest.TestCase):
     def test_inline_demand_does_not_invent_an_owner_or_break_verification(self):
         route = R.compose_route(capability="autopilot-code", capability_mode="dev", shape="direct",
             graph=None, slug="inline-demand", cwd=R.ROOT, artifact_root=R.ROOT, spec_read="fixture",
-            profile_demands={"__owner__": demand("important")})
+            profile_demands={"__owner__": demand("important")}, unassigned=True)
         self.assertIsNone(route["owner_model_profile"])
         R.verify_route(route, R.ROOT)
 
@@ -471,13 +472,13 @@ class TopExceptionRoute(unittest.TestCase):
         composed = R.compose_route(capability="autopilot-code", capability_mode="dev", shape="solo",
             graph=None, slug="top-solo", cwd=R.ROOT, artifact_root=R.ROOT, spec_read="fixture",
             profile_demands=self.owner_demand(), explicit_profiles=self.TOP,
-            registered_headless_evidence=self.registered_headless())
+            registered_headless_evidence=self.registered_headless(), unassigned=True)
         self.assert_top_owner(composed)
         self.assertEqual(next(n for n in composed["nodes"] if n["id"] == "one-shot")["model_profile"], "top")
         with self.assertRaises(ValueError) as refused:
             R.compose_route(capability="autopilot-code", capability_mode="dev", shape="direct",
                 graph=None, slug="top-direct", cwd=R.ROOT, artifact_root=R.ROOT, spec_read="fixture",
-                profile_demands=self.owner_demand(), explicit_profiles=self.TOP)
+                profile_demands=self.owner_demand(), explicit_profiles=self.TOP, unassigned=True)
         self.assertEqual(str(refused.exception), "owner-profile-top-requires-owner")
 
     def test_the_owner_selector_reads_top_from_a_real_route_file(self):

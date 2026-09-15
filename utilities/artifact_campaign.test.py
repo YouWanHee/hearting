@@ -70,6 +70,42 @@ class CampaignTest(F.ProducerTestBase):
         with self.assertRaisesRegex(P.ProducerError, "campaign-not-active"):
             self.child()
 
+    def test_abandoned_empty_cycle_record_is_detached_not_membership_drift(self):
+        """TF-Rehancer 2026-09-15: three abandoned output-less cycles left records
+        with the campaign id but no directory and no `cycles[]` entry, and
+        `campaign-status` was blocked forever with `campaign-membership-drift`."""
+        empty_route = F.compile_for("direct", self.root, slug="abandoned-attempt", gate_source="abandoned-input")
+        empty_binding = F.L.admit_runtime_route(self.root, empty_route)
+        empty = P.begin(self.root, route_file=Path(empty_binding.route_file), capability="autopilot-code",
+                        intensity="direct", campaign_key="campaign-closure")
+        self.assertEqual(empty["campaign_id"], self.campaign)
+        outcome = P.finalize(self.root, cycle_id=empty["cycle_id"], state="abandoned",
+                             abandon_reason="operator-decision")
+        self.assertEqual(outcome["status"], "no-lineage")
+        record = P.read_cycle_record(self.root, empty["cycle_id"])
+        self.assertEqual((record["state"], record["campaign_id"]), ("abandoned", self.campaign))
+        self.assertNotIn(empty["cycle_id"], json.loads(self.path.read_text())["cycles"])
+        self.assertFalse(C.is_member_record(record))
+        report = C.status(self.root, self.path)
+        self.assertEqual(report["status"], "awaiting-user-acceptance")
+        self.assertEqual([row["cycle_id"] for row in report["cycles"]], [self.result["cycle_id"]])
+        self.assertEqual([(row["cycle_id"], row["state"], row["abandon_reason"]) for row in report["detached_cycles"]],
+                         [(empty["cycle_id"], "abandoned", "operator-decision")])
+        # The detached record is reported, never folded into the approval digest.
+        self.assertNotIn("detached", json.dumps(C._snapshot(self.root, self.path)))
+        # A detached id that is still listed is a real drift and stays refused.
+        listed = json.loads(self.path.read_text())
+        listed["cycles"].append(empty["cycle_id"])
+        P._write_campaign(self.root, listed, exclusive=False)
+        with self.assertRaisesRegex(C.CampaignError, "campaign-membership-drift"):
+            C.status(self.root, self.path)
+        listed["cycles"].pop()
+        P._write_campaign(self.root, listed, exclusive=False)
+        # Closure proceeds with the detached record left in place.
+        self.approve()
+        self.assertEqual(self.finish()["status"], "satisfied")
+        self.assertEqual(P.read_cycle_record(self.root, empty["cycle_id"]), record)
+
     def test_no_native_user_approval_is_read_only(self):
         self.approve(role="assistant")
         before = self.path.read_bytes()

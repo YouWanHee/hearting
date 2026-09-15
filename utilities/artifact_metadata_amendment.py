@@ -195,7 +195,11 @@ def _protected_files(root: Path, campaign_dir: Path, campaign_json: Path,
     if shared.is_dir() and not shared.is_symlink():
         paths.update(path for path in shared.rglob("*") if path.is_file() and not path.is_symlink())
     rows = []
-    for path in sorted(paths):
+    # Sort by the recorded posix string: `Path` ordering compares components,
+    # so `shards/retrieval/…` sorted before `shards/retrieval-alternative/…`
+    # while the validator's string order puts them the other way round, and a
+    # real root (TF-Rehancer 2026-09-15) was refused as not canonical.
+    for path in sorted(paths, key=lambda item: item.relative_to(root).as_posix()):
         raw = _read_bytes(path)
         assert raw is not None
         rows.append({"path": path.relative_to(root).as_posix(), "digest": digest_bytes(raw)})

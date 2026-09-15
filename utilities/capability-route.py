@@ -2603,7 +2603,7 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
                   tracking=None, artifact_guard=None, children=None, parent_harness="claude",
                   dispatch_evidence=None, registered_headless_evidence=None,
                   transport_evidence="compose-default", jobs=None, profile_demands=None, explicit_profiles=None,
-                  campaign_key=None, parent_cycle_id=None, profile=None, work_request=None):
+                  campaign_key=None, parent_cycle_id=None, profile=None, work_request=None, unassigned=False):
     """Resolve every default, then compile through the ordinary sealer."""
     if shape not in COMPOSE_SHAPES:
         raise ValueError(f"compose-shape-invalid:{shape}")
@@ -2628,6 +2628,15 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
         raise ValueError("compose-shape-intensity-mismatch:staged")
     cwd = str(Path(cwd).resolve(strict=True))
     artifact_root = str(Path(artifact_root).resolve())
+    # The campaign is the agent's proposal for the work stream (CONVENTIONS
+    # "Campaign or cycle").  A route sealed without one silently landed in the
+    # root's degraded `_unassigned` container (TF-Rehancer 2026-09-15: nine
+    # routes, zero keys), so compose demands the proposal, shows the streams
+    # that already exist, and accepts only an explicit opt-out.
+    if unassigned and (campaign_key is not None or parent_cycle_id is not None):
+        raise ValueError("compose-campaign-selection-conflict:--unassigned excludes --campaign-key and --parent-cycle")
+    if campaign_key is None and parent_cycle_id is None and not unassigned:
+        raise ValueError("compose-campaign-key-required:" + compose_campaign_hint(artifact_root))
     if tracking is None:
         tracking = "tracked" if shape == "staged" else "untracked"
     gate = {
@@ -2668,12 +2677,73 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
             capability, capability_mode, requested, cwd, artifact_root,
             predicates=predicates, inline_reason="atomic-direct" if shape == "direct" else None,
             **common)
+    if unassigned:
+        route["campaign_unassigned"] = True
     if work_request is not None:
         from work_start import validate_request
         route["work_request"] = dict(validate_request(work_request))
+    if unassigned or work_request is not None:
         route["route_hash"] = route_hash(route)
         route["route_id"] = ROUTE_IDENTITY.route_id_from_hash(route["route_hash"])
     return route
+
+
+COMPOSE_CAMPAIGN_LIST_CAP = 12
+
+
+def compose_campaign_summaries(artifact_root):
+    """Active campaigns of the root, newest first; empty when the root has
+    none or cannot be read (a fresh project is not an error here)."""
+    try:
+        import artifact_producer
+        return artifact_producer.list_campaign_summaries(Path(artifact_root))
+    except Exception:
+        return []
+
+
+def compose_campaign_hint(artifact_root):
+    rows = [r for r in compose_campaign_summaries(artifact_root) if r.get("key") not in (None, "_unassigned")]
+    shown = ", ".join(f"{r['key']}({r['cycle_count']})" for r in rows[:COMPOSE_CAMPAIGN_LIST_CAP])
+    if len(rows) > COMPOSE_CAMPAIGN_LIST_CAP:
+        shown += f", … +{len(rows) - COMPOSE_CAMPAIGN_LIST_CAP}"
+    return (f"name the work stream with --campaign-key <existing|new> (active: {shown or 'none'}); "
+            "--unassigned keeps the work in the root's degraded _unassigned container")
+
+
+def compose_campaign_selection(route):
+    """What the sealed campaign choice means in this artifact root (read-only)."""
+    key = route.get("campaign_key")
+    parent = route.get("parent_cycle_id")
+    rows = compose_campaign_summaries(route["artifact_root"])
+    active = [r for r in rows if r.get("key") not in (None, "_unassigned")]
+    selection = {"key": key, "active_count": len(active),
+                 "active_keys": [r["key"] for r in active[:COMPOSE_CAMPAIGN_LIST_CAP]]}
+    if key is not None:
+        match = next((r for r in rows if r.get("key") == key), None)
+        selection.update(mode="join" if match else "create",
+                         campaign_id=match["campaign_id"] if match else None,
+                         title=match["title"] if match else None)
+    elif parent is not None:
+        selection.update(mode="parent", parent_cycle_id=parent)
+    else:
+        selection.update(mode="unassigned", explicit=route.get("campaign_unassigned") is True)
+    return selection
+
+
+def _compose_campaign_line(selection):
+    mode = selection["mode"]
+    if mode == "join":
+        text = f"캠페인 {selection['key']} (기존 합류)"
+    elif mode == "create":
+        text = f"캠페인 {selection['key']} (신규 생성)"
+    elif mode == "parent":
+        text = f"캠페인 parent {selection['parent_cycle_id']} 상속"
+    else:
+        text = "캠페인 미배정 (_unassigned, degraded)"
+    shown = ", ".join(selection["active_keys"][:6])
+    if selection["active_count"] > 6:
+        shown += " …"
+    return f"  {text} · 활성 캠페인 {selection['active_count']}개" + (f": {shown}" if shown else "")
 
 
 def compose_card(route):
@@ -2685,7 +2755,8 @@ def compose_card(route):
     return (
         f"[경로] {route['capability']} · {shape}({route['effective_intensity']}) {graph}"
         f" · route {route['route_id']} · origin compose · 사람 게이트 {gates}\n"
-        f"  cwd {route['cwd']} · slug {route.get('slug', '-')}"
+        f"  cwd {route['cwd']} · slug {route.get('slug', '-')}\n"
+        + _compose_campaign_line(compose_campaign_selection(route))
     )
 
 
@@ -6166,6 +6237,7 @@ def compose_receipt(route, path):
                    ("id", "unit", "dispatch_depth", "model_profile", "depends_on", "terminal") if key in node}
                   for node in route["nodes"]],
         "human_gates": route.get("human_gates", []),
+        "campaign": compose_campaign_selection(route),
     }
 
 
@@ -6250,7 +6322,8 @@ def main():
     cp.add_argument("--start",action="store_true",help="prepare and start the selected work; the runtime owns frame launches and waiting")
     cp.add_argument("--prompt-file",type=Path,help="the user's task, stored with the route for frame and owner execution")
     cp.add_argument("--owner",choices=("claude","codex","opencode"),help="explicit owner runtime; otherwise use normal selection")
-    cp.add_argument("--campaign-key",help="explicit work stream passed to the producer owner")
+    cp.add_argument("--campaign-key",help="the work stream this route joins or creates (required unless --parent-cycle or --unassigned); `artifact_producer.py campaign-list` shows active keys")
+    cp.add_argument("--unassigned",action="store_true",help="explicit opt-out: keep this work in the root's degraded _unassigned container, proposing no stream")
     cp.add_argument("--parent-cycle",help="open or sealed predecessor cycle; causal link, not input approval")
     cp.add_argument("--profile-demands", help="JSON file mapping node ids and __owner__ to full SD-88 demands")
     cp.add_argument("--explicit-profiles", help="JSON file mapping demanded node ids to explicit profiles")
@@ -6354,7 +6427,7 @@ def main():
         route=compose_route(
             capability=a.capability,capability_mode=a.capability_mode,shape=shape,graph=a.graph,
             slug=a.slug,cwd=cwd,artifact_root=artifact_root,intensity=a.intensity,signals=a.signal,
-            campaign_key=a.campaign_key,parent_cycle_id=a.parent_cycle,
+            campaign_key=a.campaign_key,parent_cycle_id=a.parent_cycle,unassigned=a.unassigned,
             spec_read=a.spec_read,drift_verdict=a.drift_verdict,tracking=a.tracking,
             artifact_guard=a.artifact_guard,
             children=[c.strip() for c in a.children.split(",") if c.strip()] if a.children else None,
@@ -6378,6 +6451,7 @@ def main():
                                         "completion_gate":n.get("completion_gate"),"terminal":n.get("terminal") is True}
                                        for n in route["nodes"]],
                               "human_gates":route.get("human_gates"),"parallel_groups":route.get("parallel_groups"),
+                              "campaign":compose_campaign_selection(route),
                               "tracked_gate_evidence":route.get("tracked_gate_evidence")},sort_keys=True))
             return 0
         path = _emit_compiled_route(a,route,artifact_root)

@@ -1069,7 +1069,7 @@ class MaterialRouteGuardTest(unittest.TestCase):
         route on stdout carries both, and the PostToolUse bind reads them."""
         command = [
             sys.executable, str(ROUTER), "compose",
-            "--slug", "compose-fixture", "--cwd", str(self.repo),
+            "--slug", "compose-fixture", "--unassigned", "--cwd", str(self.repo),
         ]
         result = subprocess.run(
             command, text=True, capture_output=True,

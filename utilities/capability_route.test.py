@@ -5186,7 +5186,10 @@ class ComposeRouteTest(TestRoute):
   return self.dispatch(self.nested(parent="claude",child="claude"),self.nested(parent="claude",child="codex"))
  def compose(self,**kw):
   d=dict(capability="autopilot-code",capability_mode="dev",shape="staged",graph="execute,test,report",slug="compose-fixture",cwd=R.ROOT,artifact_root=R.ROOT,dispatch_evidence=self.evidence())
-  d.update(kw); return R.compose_route(**d)
+  d.update(kw)
+  # A compose fixture that names no stream opts out explicitly, exactly as a caller must.
+  if d.get("campaign_key") is None and d.get("parent_cycle_id") is None and "unassigned" not in d: d["unassigned"]=True
+  return R.compose_route(**d)
  def test_work_request_is_sealed_and_cannot_be_replaced_at_resume(self):
   request={"text":"Run the accepted commands, including exit 7.","owner_harness":"opencode"}
   route=self.compose(work_request=request,profile="light")
@@ -5228,7 +5231,15 @@ class ComposeRouteTest(TestRoute):
  def test_campaign_selection_is_optional_validated_and_sealed(self):
   old=self.compose()
   self.assertNotIn("campaign_key",old); self.assertNotIn("parent_cycle_id",old)
+  self.assertIs(old["campaign_unassigned"],True)
   R.verify_route(old,R.ROOT)
+  old["campaign_unassigned"]=False
+  with self.assertRaisesRegex(ValueError,"modified route hash"): R.verify_route(old,R.ROOT)
+  # A keyless proposal is refused, not silently degraded; the refusal names the escape hatch.
+  with self.assertRaisesRegex(ValueError,"compose-campaign-key-required.*--unassigned"): self.compose(unassigned=False)
+  with self.assertRaisesRegex(ValueError,"compose-campaign-selection-conflict"): self.compose(campaign_key="tts-v6-release",unassigned=True)
+  by_parent=self.compose(parent_cycle_id="cyc_"+"b"*32)
+  self.assertNotIn("campaign_unassigned",by_parent); self.assertEqual(R.compose_campaign_selection(by_parent)["mode"],"parent")
   selected=self.compose(campaign_key="tts-v6-release",parent_cycle_id="cyc_"+"a"*32)
   self.assertEqual(selected["campaign_key"],"tts-v6-release")
   self.assertEqual(selected["parent_cycle_id"],"cyc_"+"a"*32)
@@ -5239,6 +5250,31 @@ class ComposeRouteTest(TestRoute):
   for values in ({"campaign_key":""},{"campaign_key":"_unassigned"},{"campaign_key":"a/b"},
                  {"campaign_key":"a"*129},{"parent_cycle_id":"cyc_invalid"}):
    with self.assertRaises(ValueError): self.compose(**values)
+ def test_compose_shows_existing_streams_and_classifies_the_choice(self):
+  import contextlib, io
+  with tempfile.TemporaryDirectory() as tmp:
+   root=Path(tmp)
+   camp=root/"campaigns"/"2026-09-14_tts-v6-release"; camp.mkdir(parents=True)
+   (camp/"campaign.json").write_text(json.dumps({"campaign_id":"camp_"+"1"*32,"key":"tts-v6-release","title":"TTS v6","goal":"ship","state":"active","cycles":["cyc_"+"2"*32],"created_on":"2026-09-14T00:00:00Z"}))
+   closed=root/"campaigns"/"2026-09-13_old-stream"; closed.mkdir()
+   (closed/"campaign.json").write_text(json.dumps({"campaign_id":"camp_"+"3"*32,"key":"old-stream","title":"old","goal":"done","state":"superseded","cycles":[],"created_on":"2026-09-13T00:00:00Z"}))
+   with self.assertRaisesRegex(ValueError,r"compose-campaign-key-required.*active: tts-v6-release\(1\)"):
+    self.compose(artifact_root=tmp,unassigned=False)
+   joined=self.compose(artifact_root=tmp,campaign_key="tts-v6-release")
+   sel=R.compose_campaign_selection(joined)
+   self.assertEqual((sel["mode"],sel["campaign_id"],sel["active_keys"]),("join","camp_"+"1"*32,["tts-v6-release"]))
+   created=R.compose_campaign_selection(self.compose(artifact_root=tmp,campaign_key="tts-v7-release"))
+   self.assertEqual((created["mode"],created["campaign_id"]),("create",None))
+   degraded=R.compose_campaign_selection(self.compose(artifact_root=tmp))
+   self.assertEqual((degraded["mode"],degraded["explicit"]),("unassigned",True))
+   card=R.compose_card(joined)
+   self.assertIn("캠페인 tts-v6-release (기존 합류)",card); self.assertIn("활성 캠페인 1개: tts-v6-release",card)
+   self.assertIn("캠페인 미배정",R.compose_card(self.compose(artifact_root=tmp)))
+   receipt=R.compose_receipt(joined,Path(tmp)/"route.json")
+   self.assertEqual(receipt["campaign"]["mode"],"join")
+   # A root with no campaigns yet still demands the proposal and shows an empty list.
+   with self.assertRaisesRegex(ValueError,"active: none"):
+    self.compose(artifact_root=str(root/"fresh"),unassigned=False)
  def test_graph_spec_parsing(self):
   self.assertEqual(R.parse_graph_spec("execute,test:qa/test , report"),[("execute",None),("test","qa/test"),("report",None)])
   for bad in ("", " , ", "execute,execute", "Bad!"):
@@ -5493,7 +5529,7 @@ class TerminalCommitSupportTests(unittest.TestCase):
     return R.compose_route(slug="gate",capability="autopilot-code",capability_mode="dev",
                            shape="direct",graph=None,cwd=str(R.ROOT),
                            artifact_root=artifacts,spec_read="fixture",
-                           drift_verdict="fixture")
+                           drift_verdict="fixture",unassigned=True)
 
  def test_a_runtime_publishing_the_whole_contract_opens_the_gate(self):
   route=self._compose(R.ROOT)

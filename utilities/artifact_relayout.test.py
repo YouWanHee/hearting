@@ -262,8 +262,10 @@ class PreservationTests(RelayoutFixture):
         self.assertIsNone(RD.migration_hold(self.root))
 
     def test_second_apply_is_no_op_and_suffixes_stay_fixed(self):
-        self.cycle(slug="same-day-a", title="Same day")
-        self.cycle(slug="same-day-b", title="Same day", campaign_key="k1")
+        # Two streams whose keys slugify to the same name collide on relayout;
+        # a campaign is named from its key, so the cycle titles do not matter.
+        self.cycle(slug="same-day-a", title="Same day", campaign_key="same.day")
+        self.cycle(slug="same-day-b", title="Same day", campaign_key="same-day")
         self.legacyize(keep_titles=True)
         self.apply()
         campaigns = sorted(p.name for p in (self.root / "campaigns").iterdir() if p.is_dir())

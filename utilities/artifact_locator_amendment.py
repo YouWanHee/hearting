@@ -172,18 +172,23 @@ def _protected(root: Path, campaign_dir: Path, campaign_json: Path,
     if routes.is_dir() and not routes.is_symlink():
         paths.update(path for path in routes.glob("*.json") if path.is_file() and not path.is_symlink())
     rows = []
-    for path in sorted(paths - mutable_paths):
+    # String order, not `Path` component order: the validator compares the
+    # recorded posix strings (see artifact_metadata_amendment._protected_files).
+    for path in sorted(paths - mutable_paths, key=lambda item: item.relative_to(root).as_posix()):
         raw = _read_bytes(path)
         assert raw is not None
         rows.append({"path": path.relative_to(root).as_posix(), "digest": digest_bytes(raw)})
     return rows
 
 
-def _sidecar_entry(doc: Mapping[str, Any], campaign_id: str, code: str) -> Dict[str, Any]:
+def _sidecar_entry(doc: Mapping[str, Any], campaign_id: str, code: str,
+                   *, optional: bool = False) -> Dict[str, Any] | None:
     entries = doc.get("entries")
     if not isinstance(entries, list):
         raise LocatorAmendmentError(f"{code}-entries-required")
     found = [row for row in entries if isinstance(row, dict) and row.get("campaign_id") == campaign_id]
+    if optional and not found:
+        return None
     if len(found) != 1:
         raise LocatorAmendmentError(f"{code}-campaign-entry-count:{len(found)}")
     return found[0]
@@ -226,18 +231,22 @@ def _prepare_locked(root: Path, *, campaign_id: str, campaign_locator: str,
 
     campaign_meta = _read_json(root / CAMPAIGN_METADATA_REL)
     cycle_titles = _read_json(root / CYCLE_TITLES_REL)
-    display_titles = _read_json(root / DISPLAY_TITLES_REL)
+    display_titles = _read_json(root / DISPLAY_TITLES_REL, missing_ok=True)
     if campaign_meta is None or campaign_meta.get("schema") != CAMPAIGN_SCHEMA:
         raise LocatorAmendmentError("campaign-metadata-amendment-required")
     if cycle_titles is None or cycle_titles.get("schema") != CYCLE_SCHEMA:
         raise LocatorAmendmentError("cycle-title-sidecar-required")
-    if display_titles is None or display_titles.get("schema") != "hearting-campaign-display-titles/v2":
-        raise LocatorAmendmentError("campaign-display-title-sidecar-required")
+    # D-103 aligns an *existing* campaign display-title v2 entry; a root that
+    # never ran the fleet title repair has none, and that is not a refusal.
+    display_entry = None
+    if display_titles is not None:
+        if display_titles.get("schema") != "hearting-campaign-display-titles/v2":
+            raise LocatorAmendmentError("campaign-display-title-sidecar-invalid")
+        display_entry = _sidecar_entry(display_titles, campaign_id, "campaign-display-title", optional=True)
     meta_entry = _sidecar_entry(campaign_meta, campaign_id, "campaign-metadata")
     if meta_entry.get("key") != campaign.get("key") or meta_entry.get("goal") != campaign.get("goal"):
         raise LocatorAmendmentError("campaign-metadata-binding-mismatch")
-    display_entry = _sidecar_entry(display_titles, campaign_id, "campaign-display-title")
-    if display_entry.get("campaign_locator") != old_campaign_locator:
+    if display_entry is not None and display_entry.get("campaign_locator") != old_campaign_locator:
         raise LocatorAmendmentError("campaign-display-locator-mismatch")
 
     file_targets: list[Dict[str, str]] = []
@@ -251,6 +260,7 @@ def _prepare_locked(root: Path, *, campaign_id: str, campaign_locator: str,
     manifest_sources = []
     cycle_rows = []
     mutable_paths = {campaign_json, root / CYCLE_TITLES_REL, root / DISPLAY_TITLES_REL,
+                     root / CAMPAIGN_METADATA_REL,
                      root / "campaigns" / artifact_locator.INDEX_JSON,
                      root / "campaigns" / artifact_locator.INDEX_MD,
                      root / artifact_admission.ADMISSION_REL / "index.json"}
@@ -271,7 +281,8 @@ def _prepare_locked(root: Path, *, campaign_id: str, campaign_locator: str,
             raise LocatorAmendmentError(f"cycle-not-sealed:{cycle_id}")
         old_locator = str(record.get("locator", ""))
         old_dir = old_campaign_dir / old_locator
-        if not _real_dir(old_dir) or new_locator == old_locator or _lexists(old_campaign_dir / new_locator):
+        move = new_locator != old_locator
+        if not _real_dir(old_dir) or (move and _lexists(old_campaign_dir / new_locator)):
             raise LocatorAmendmentError(f"cycle-target-collision:{cycle_id}")
         binding_doc = _read_json(old_dir / ".cycle.json")
         if binding_doc != {"schema_version": 1, "kind": "artifact-cycle-binding",
@@ -289,12 +300,18 @@ def _prepare_locked(root: Path, *, campaign_id: str, campaign_locator: str,
             raise LocatorAmendmentError(f"cycle-title-binding-mismatch:{cycle_id}")
         title_entry["display_title"] = title
         updated_record = dict(record)
-        updated_record.update({"locator": new_locator, "locator_suffix": "", "slug": new_slug,
-                               "slug_source": "locator-amendment", "slug_truncated": False, "title": title})
+        if move:
+            updated_record.update({"locator": new_locator, "locator_suffix": "", "slug": new_slug,
+                                   "slug_source": "locator-amendment", "slug_truncated": False, "title": title})
+        else:
+            # Unchanged locator: only the title moves; the D-90 suffix and the
+            # recorded slug provenance stay exactly as issued.
+            new_slug = str(record.get("slug", new_slug))
+            updated_record["title"] = title
         file_targets.append(_target(record_path, record_path, root, canonical(updated_record) + b"\n"))
         mutable_paths.add(record_path)
         cycle_rows.append({"cycle_id": cycle_id, "old_locator": old_locator,
-                           "new_locator": new_locator, "new_slug": new_slug, "title": title})
+                           "new_locator": new_locator, "new_slug": new_slug, "title": title, "move": move})
     if len({row["new_locator"] for row in cycle_rows}) != len(cycle_rows):
         raise LocatorAmendmentError("cycle-target-duplicate")
     if len(title_by_cycle) != len(member_ids):
@@ -307,15 +324,16 @@ def _prepare_locked(root: Path, *, campaign_id: str, campaign_locator: str,
 
     cycle_titles_post = {**cycle_titles, "entries": sorted(title_entries,
                          key=lambda row: (str(row.get("campaign_id")), str(row.get("cycle_id"))))}
-    display_entries = [dict(row) for row in display_titles["entries"]]
-    display_match = [row for row in display_entries if row.get("campaign_id") == campaign_id]
-    display_match[0]["campaign_locator"] = campaign_locator
-    display_post = {**display_titles, "entries": sorted(display_entries,
-                    key=lambda row: (str(row.get("campaign_id")), str(row.get("campaign_locator"))))}
     file_targets.append(_target(root / CYCLE_TITLES_REL, root / CYCLE_TITLES_REL, root,
                                 canonical(cycle_titles_post) + b"\n"))
-    file_targets.append(_target(root / DISPLAY_TITLES_REL, root / DISPLAY_TITLES_REL, root,
-                                canonical(display_post) + b"\n"))
+    if display_entry is not None:
+        display_entries = [dict(row) for row in display_titles["entries"]]
+        display_match = [row for row in display_entries if row.get("campaign_id") == campaign_id]
+        display_match[0]["campaign_locator"] = campaign_locator
+        display_post = {**display_titles, "entries": sorted(display_entries,
+                        key=lambda row: (str(row.get("campaign_id")), str(row.get("campaign_locator"))))}
+        file_targets.append(_target(root / DISPLAY_TITLES_REL, root / DISPLAY_TITLES_REL, root,
+                                    canonical(display_post) + b"\n"))
 
     locator_mapping, locator_rows = artifact_locator.scan_index(root)
     new_mapping = dict(locator_mapping)
@@ -396,12 +414,17 @@ def _validate_package(package: Mapping[str, Any]) -> None:
     for row in cycles:
         if not isinstance(row, Mapping):
             raise LocatorAmendmentError("package-cycle-object-required")
-        _assert_closed(row, {"cycle_id", "old_locator", "new_locator", "new_slug", "title"}, "package-cycle-fields")
+        _assert_closed(row, {"cycle_id", "old_locator", "new_locator", "new_slug", "title", "move"}, "package-cycle-fields")
         cycle_id = str(row.get("cycle_id")); old_locator = str(row.get("old_locator")); new_locator = str(row.get("new_locator"))
         if not artifact_identity.is_well_formed(cycle_id, "cycle") or cycle_id in seen_ids:
             raise LocatorAmendmentError("package-cycle-id-invalid")
         _locator(old_locator); _, cycle_slug = _locator(new_locator)
-        if old_locator == new_locator or new_locator in seen_targets or row.get("new_slug") != cycle_slug or not str(row.get("title", "")).strip():
+        move = row.get("move")
+        if not isinstance(move, bool) or move != (old_locator != new_locator):
+            raise LocatorAmendmentError("package-cycle-move-invalid")
+        if new_locator in seen_targets or not str(row.get("title", "")).strip():
+            raise LocatorAmendmentError("package-cycle-locator-invalid")
+        if move and row.get("new_slug") != cycle_slug:
             raise LocatorAmendmentError("package-cycle-locator-invalid")
         seen_ids.add(cycle_id); seen_targets.add(new_locator)
     sources = package.get("manifest_sources")
@@ -438,9 +461,10 @@ def _validate_package(package: Mapping[str, Any]) -> None:
         if re.fullmatch(r"sha256:[0-9a-f]{64}", str(row["digest"])) is None:
             raise LocatorAmendmentError("package-protected-digest-malformed")
     targets = package.get("file_targets")
-    # campaign record + one producer record per cycle + two title sidecars +
-    # two locator indexes + one admission index.
-    if not isinstance(targets, list) or len(targets) != 6 + len(cycles):
+    # campaign record + one producer record per cycle + cycle title sidecar +
+    # two locator indexes + one admission index, plus the campaign display-title
+    # sidecar when the root has one.
+    if not isinstance(targets, list) or not (5 + len(cycles) <= len(targets) <= 6 + len(cycles)):
         raise LocatorAmendmentError("package-file-target-count")
     target_pre_paths = []; target_post_paths = []
     for target in targets:
@@ -505,7 +529,7 @@ def _precheck(root: Path, package: Mapping[str, Any]) -> None:
     if not _real_dir(old) or _lexists(new):
         raise LocatorAmendmentError("locator-preimage-drift")
     for row in package["cycles"]:
-        if not _real_dir(old / row["old_locator"]) or _lexists(old / row["new_locator"]):
+        if not _real_dir(old / row["old_locator"]) or (row["move"] and _lexists(old / row["new_locator"])):
             raise LocatorAmendmentError(f"cycle-locator-preimage-drift:{row['cycle_id']}")
     for target in package["file_targets"]:
         if not _target_state(root, target, "pre"):
@@ -537,6 +561,10 @@ def _recover_pre(root: Path, package: Mapping[str, Any]) -> None:
     for row in package["cycles"]:
         old_cycle = work / str(row["old_locator"])
         new_cycle = work / str(row["new_locator"])
+        if not row["move"]:
+            if not _real_dir(old_cycle):
+                raise LocatorAmendmentError(f"locator-rollback-cycle-missing:{row['cycle_id']}")
+            continue
         if old_cycle.is_symlink():
             _remove_exact_symlink(old_cycle, str(row["new_locator"]))
         if _real_dir(new_cycle):
@@ -595,11 +623,13 @@ def apply(package: Mapping[str, Any], *, expected_package_digest: str,
         try:
             os.rename(old, new); tick()
             for row in package["cycles"]:
-                os.rename(new / row["old_locator"], new / row["new_locator"]); tick()
+                if row["move"]:
+                    os.rename(new / row["old_locator"], new / row["new_locator"]); tick()
             for target in package["file_targets"]:
                 write_atomic_bytes(root / str(target["post_path"]), _unb64(target["post_bytes_b64"])); tick()
             for row in package["cycles"]:
-                os.symlink(row["new_locator"], new / row["old_locator"]); tick()
+                if row["move"]:
+                    os.symlink(row["new_locator"], new / row["old_locator"]); tick()
             os.symlink(package["new_campaign_locator"], old); tick()
             result = verify(package)
         except Exception:
@@ -629,7 +659,7 @@ def verify(package: Mapping[str, Any]) -> Dict[str, Any]:
     for row in package["cycles"]:
         new_cycle = new / str(row["new_locator"])
         old_cycle = new / str(row["old_locator"])
-        if not _real_dir(new_cycle) or not _readlink_exact(old_cycle, str(row["new_locator"])):
+        if not _real_dir(new_cycle) or (row["move"] and not _readlink_exact(old_cycle, str(row["new_locator"]))):
             raise LocatorAmendmentError(f"cycle-locator-not-applied:{row['cycle_id']}")
         if new_cycle.resolve().parent != new.resolve():
             raise LocatorAmendmentError(f"cycle-target-outside-campaign:{row['cycle_id']}")
