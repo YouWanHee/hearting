@@ -24,11 +24,40 @@ _SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$")
 _CAMPAIGN_ID = re.compile(r"^camp_[0-9a-f]{32}$")
 _CYCLE_ID = re.compile(r"^cyc_[0-9a-f]{32}$")
 _RFC3339 = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+_DATE_ONLY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _BINDING_REQUIRED = frozenset({"schema_version", "kind", "campaign_id", "cycle_id"})
 # `started_on` is display data (D-88: the date prefix shows `cycle.started_on`);
 # the binding carries the full timestamp so same-day cycles stay orderable
-# from the folder alone. Bindings written before it existed omit it.
+# from the folder alone. Bindings written before it existed omit it. A cycle
+# whose work predates the producer (W7G resplit, W7H residue) knows only the
+# work's date, so a date-only value is allowed and means exactly that.
 _BINDING_OPTIONAL = frozenset({"started_on"})
+
+
+def started_on_is_valid(value: Any) -> bool:
+    return isinstance(value, str) and (_RFC3339.fullmatch(value) is not None
+                                       or _DATE_ONLY.fullmatch(value) is not None)
+
+
+def display_started_on(record: Optional[Mapping[str, Any]],
+                       manifest: Optional[Mapping[str, Any]] = None) -> Optional[str]:
+    """The start a reader wants: the work's date for a resplit cycle (D-79
+    ``resplit_started_on``, which is also what the folder name shows), else the
+    record's own ``started_on``, else the sealed manifest's. Same order as
+    ``artifact_relayout._cycle_date``; never a path date or an mtime."""
+    record = record or {}
+    cycle = (manifest or {}).get("cycle") if isinstance(manifest, Mapping) else None
+    # A W7G/W7H cycle whose date came from a folder name, an mtime or its
+    # origin cycle stores that date as midnight; the clock is a placeholder,
+    # so the reader gets the date alone rather than a time nobody recorded.
+    date_derived = bool(record.get("derived_from_cycle_id") or record.get("started_on_source"))
+    for candidate in (record.get("resplit_started_on"), record.get("started_on"),
+                      cycle.get("started_on") if isinstance(cycle, Mapping) else None):
+        if started_on_is_valid(candidate):
+            if date_derived and candidate.endswith("T00:00:00Z"):
+                return candidate[:10]
+            return candidate
+    return None
 
 
 class LocatorError(ValueError):
@@ -212,7 +241,7 @@ def cycle_binding_bytes(campaign_id: str, cycle_id: str, *, started_on: Optional
         "cycle_id": cycle_id,
     }
     if started_on is not None:
-        if not isinstance(started_on, str) or _RFC3339.fullmatch(started_on) is None:
+        if not started_on_is_valid(started_on):
             raise LocatorError("locator-cycle-started-on-invalid", str(started_on))
         payload["started_on"] = started_on
     return (json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
@@ -228,8 +257,7 @@ def read_cycle_binding(path: Path) -> Optional[Dict[str, Any]]:
         raise LocatorError("locator-cycle-binding-invalid", marker.as_posix())
     if binding.get("schema_version") != 1 or binding.get("kind") != "artifact-cycle-binding":
         raise LocatorError("locator-cycle-binding-invalid", marker.as_posix())
-    if "started_on" in binding and (not isinstance(binding["started_on"], str)
-                                    or _RFC3339.fullmatch(binding["started_on"]) is None):
+    if "started_on" in binding and not started_on_is_valid(binding["started_on"]):
         raise LocatorError("locator-cycle-binding-invalid", marker.as_posix())
     if _CAMPAIGN_ID.fullmatch(str(binding.get("campaign_id"))) is None:
         raise LocatorError("locator-campaign-id-invalid", str(binding.get("campaign_id")))
@@ -376,7 +404,7 @@ def scan_index(root: Path) -> Tuple[Dict[str, str], Dict[str, Dict[str, str]]]:
                 cycle_id,
                 cycle_path,
                 title=str(record.get("title") or record.get("slug") or campaign_title),
-                started=str(record.get("started_on") or ""),
+                started=display_started_on(record) or "",
                 status=str(record.get("state") or ("sealed" if (cycle_path / "manifest.json").is_file() else "open")),
                 campaign=campaign_id,
             )
@@ -403,7 +431,7 @@ def scan_index(root: Path) -> Tuple[Dict[str, str], Dict[str, Dict[str, str]]]:
                 cycle_id,
                 cycle_path,
                 title=str(record.get("title") or record.get("slug") or campaign_title),
-                started=str(record.get("started_on") or ""),
+                started=display_started_on(record) or "",
                 status="open",
                 campaign=campaign_id,
             )

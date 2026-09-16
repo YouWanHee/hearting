@@ -3227,12 +3227,16 @@ class CycleBindingAndIndexOrderTest(ProducerTestBase):
         (cycle_dir / ".cycle.json").write_text(json.dumps(legacy), encoding="utf-8")
         self.assertNotIn("started_on", P.artifact_locator.read_cycle_binding(cycle_dir))
         self.assertEqual(P.artifact_locator.resolve_path(self.root, result["cycle_id"]), cycle_dir)
-        for bad in ({**binding, "started_on": "2026-09-14"}, {**binding, "sealed_on": binding["started_on"]}):
+        for bad in ({**binding, "started_on": "2026-09-14 09:00"}, {**binding, "sealed_on": binding["started_on"]}):
             (cycle_dir / ".cycle.json").write_text(json.dumps(bad), encoding="utf-8")
             with self.assertRaises(P.artifact_locator.LocatorError):
                 P.artifact_locator.read_cycle_binding(cycle_dir)
         with self.assertRaises(P.artifact_locator.LocatorError):
             P.artifact_locator.cycle_binding_bytes(record["campaign_id"], result["cycle_id"], started_on="today")
+        # A work date without a clock (resplit/residue cycles) is allowed and stays date-only.
+        (cycle_dir / ".cycle.json").write_bytes(P.artifact_locator.cycle_binding_bytes(
+            record["campaign_id"], result["cycle_id"], started_on="2026-06-11"))
+        self.assertEqual(P.artifact_locator.read_cycle_binding(cycle_dir)["started_on"], "2026-06-11")
 
     def test_index_markdown_lists_each_campaign_then_its_cycles_in_start_order(self):
         self.activate()
@@ -3311,11 +3315,39 @@ class CycleBindingAndIndexOrderTest(ProducerTestBase):
         self.assertEqual((by_id[opened["cycle_id"]]["action"], by_id[opened["cycle_id"]]["source"]),
                          ("missing", None))
 
+        # A W7G resplit cycle records the resplit run in `started_on` and the
+        # work's date in `resplit_started_on`; the reader wants the work's date
+        # (D-79), in the binding and in INDEX.md alike, never the move time.
+        path = P.cycle_record_path(self.root, opened["cycle_id"])
+        record = json.loads(path.read_text())
+        record["started_on"] = "2026-09-03T15:12:03Z"
+        record["resplit_started_on"] = "2026-06-11"
+        record["derived_from_cycle_id"] = "cyc_" + "1" * 32
+        path.write_text(json.dumps(record), encoding="utf-8")
+        row = {r["cycle_id"]: r for r in P.backfill_cycle_bindings(self.root, apply=True)["cycles"]}[opened["cycle_id"]]
+        self.assertEqual((row["action"], row["source"], row["started_on"]),
+                         ("added", "record:resplit_started_on", "2026-06-11"))
+        self.assertEqual(P.artifact_locator.read_cycle_binding(markers[opened["cycle_id"]].parent)["started_on"],
+                         "2026-06-11")
+        self.assertIn("| 2026-06-11 |", (self.root / "campaigns" / "INDEX.md").read_text(encoding="utf-8"))
+        self.assertNotIn("2026-09-03T15:12:03Z", (self.root / "campaigns" / "INDEX.md").read_text(encoding="utf-8"))
+        # The fleet-wide resplit stored the folder date as midnight with no
+        # `resplit_started_on`; that placeholder clock is dropped the same way.
+        record.pop("resplit_started_on")
+        record["started_on"] = "2026-07-26T00:00:00Z"
+        path.write_text(json.dumps(record), encoding="utf-8")
+        legacy = {k: v for k, v in json.loads(markers[opened["cycle_id"]].read_text()).items() if k != "started_on"}
+        markers[opened["cycle_id"]].write_text(json.dumps(legacy), encoding="utf-8")
+        row = {r["cycle_id"]: r for r in P.backfill_cycle_bindings(self.root)["cycles"]}[opened["cycle_id"]]
+        self.assertEqual((row["action"], row["source"], row["started_on"]), ("would-add", "record", "2026-07-26"))
+        self.assertEqual(P.artifact_locator.display_started_on(
+            {"started_on": "2026-07-26T00:00:00Z"}), "2026-07-26T00:00:00Z")  # a real midnight start stays
+
         # A binding that already carries a different time is left alone.
         tampered = dict(json.loads(markers[sealed["cycle_id"]].read_text()), started_on="2020-01-01T00:00:00Z")
         markers[sealed["cycle_id"]].write_text(json.dumps(tampered), encoding="utf-8")
         result = P.backfill_cycle_bindings(self.root, apply=True)
-        self.assertEqual(result["counts"], {"conflict": 1, "missing": 1})
+        self.assertEqual(result["counts"], {"added": 1, "conflict": 1})
         self.assertEqual(json.loads(markers[sealed["cycle_id"]].read_text())["started_on"], "2020-01-01T00:00:00Z")
 
 
