@@ -87,7 +87,8 @@ OK, BLOCKED, USAGE = 0, 65, 64
 # D-86: the one-line hint attached to a legacy-top-level-write-denied result.
 # The `reason` token itself (compared verbatim by fleet_cutover_gate's
 # negative probe) never changes; this hint rides in a separate field/detail.
-LEGACY_WRITE_HINT = "run `artifact_producer.py begin --route <route file>` first, then retry"
+LEGACY_WRITE_HINT = ("run `artifact_producer.py begin --route <route file>` first; if begin already ran, "
+                     "export its --env-file output (AGENT_ARTIFACT_*) into this shell, then retry")
 
 # D-81: campaign.json `related[]` row kinds (producer-internal API only).
 RELATED_KINDS = ("related", "precedes", "supersedes")
@@ -1420,7 +1421,11 @@ def _choose_primary(rows: Sequence[Tuple[str, bytes]], primary: Optional[str],
     if primary:
         candidate = primary if primary.startswith("artifacts/") else "artifacts/" + primary
         if candidate not in names:
-            raise ProducerError("primary-artifact-missing", primary)
+            shown = ", ".join(names[:6]) + (", ..." if len(names) > 6 else "")
+            raise ProducerError(
+                "primary-artifact-missing",
+                f"{primary} (expected a cycle-relative path under artifacts/; cycle outputs: {shown or 'none'})",
+            )
         return candidate
     for wanted in PRIMARY_CANDIDATES:
         for rel in names:
@@ -1498,6 +1503,22 @@ def validate_shared_reference_pins(root: Path, pins: Sequence[Mapping[str, Any]]
         except ProducerError as exc:
             violations.append({"index": i, "code": exc.code, "detail": exc.detail})
     return violations
+
+
+def _cycle_relative_primary(primary: Optional[str], directory: Path) -> Optional[str]:
+    """Map an absolute `--primary` that points inside this cycle's `artifacts/`
+    onto the cycle-relative form `_choose_primary` expects. Anything else is
+    returned unchanged so the existing `primary-artifact-missing` verdict still
+    names what the caller passed (2026-09-16 DX report: an absolute path failed
+    with no hint that only cycle-relative locators are accepted)."""
+    if not primary or not os.path.isabs(primary):
+        return primary
+    try:
+        rel = Path(primary).resolve().relative_to(Path(directory).resolve())
+    except (OSError, ValueError):
+        return primary
+    rel_posix = rel.as_posix()
+    return rel_posix if rel_posix.startswith("artifacts/") else primary
 
 
 def build_manifest(
@@ -2519,7 +2540,8 @@ def finalize(
             if parent is None or parent.get("state") != "sealed":
                 raise ProducerError("parent-cycle-not-sealed", record["parent_cycle_id"])
         document = build_manifest(
-            root, record, route, rows, state=state, primary=primary,
+            root, record, route, rows, state=state,
+            primary=_cycle_relative_primary(primary, directory),
             allow_open_route=allow_open_route, allocator=alloc, now=now,
             abandon_reason=abandon_reason, support_locators=support_locators,
         )
@@ -3623,7 +3645,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--artifact-root", required=True)
     p.add_argument("--cycle", required=True)
     p.add_argument("--state", default="completed", choices=["completed", "abandoned"])
-    p.add_argument("--primary")
+    p.add_argument("--primary", help="primary artifact as a cycle-relative locator "
+                   "(artifacts/<bucket>/<file>); an absolute path inside this cycle's artifacts/ is accepted")
     p.add_argument("--publication", default="not-offered")
     p.add_argument("--allow-open-route", action="store_true")
     p.add_argument("--adopt-root-output", action="append", default=[])

@@ -48,6 +48,39 @@ class DispatchReadinessTest(unittest.TestCase):
         self.assertTrue(all(not row.prospective_standard_owner for row in claude))
         self.assertTrue(all(row.parent_transport == "headless" for row in observed))
 
+    def test_comma_separated_harness_lists_are_accepted(self) -> None:
+        # 2026-09-16 DX: `--child-harness claude,codex` used to fail as
+        # `dispatch-readiness-harness-unknown` with no hint about the flag shape.
+        def evaluate(args):
+            return {"parent_harness": args.parent_harness,
+                    "child_harness": args.child_harness, "status": "supported"}
+
+        with tempfile.TemporaryDirectory() as raw, mock.patch.object(
+            READINESS.NESTED, "evaluate", side_effect=evaluate
+        ):
+            root = Path(raw)
+            evidence = READINESS.generate(
+                worktree=root, jobs=root / "jobs.log",
+                owner_harnesses=["claude"], child_harnesses=["claude,codex", " opencode "],
+            )
+        self.assertEqual(
+            sorted(row["child_harness"] for row in evidence["tuples"]),
+            ["claude", "codex", "opencode"],
+        )
+
+    def test_unknown_harness_error_names_the_value_and_the_flag_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            with self.assertRaises(READINESS.ReadinessError) as raised:
+                READINESS.generate(
+                    worktree=root, jobs=root / "jobs.log",
+                    owner_harnesses=["claude"], child_harnesses=["claude", "gemini"],
+                )
+        message = str(raised.exception)
+        self.assertTrue(message.startswith("dispatch-readiness-harness-unknown"))
+        self.assertIn("gemini", message)
+        self.assertIn("commas", message)
+
     def test_active_dispatch_cannot_masquerade_as_pre_owner_readiness(self) -> None:
         with tempfile.TemporaryDirectory() as raw, mock.patch.dict(
             os.environ, {"AGENT_DISPATCH_DEPTH": "1"}, clear=True

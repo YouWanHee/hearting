@@ -612,6 +612,13 @@ def _audit(
             )
     if quality_band:
         lines.append(f"quality_band={quality_band}")
+    warning = _explicit_capacity_warning(source, adapter, capacity, allocation)
+    if warning:
+        # Explicit targets bypass the capacity cascade by design (the user
+        # manages quota); the receipt still says when the gauge could not see
+        # the harness or saw it exhausted (2026-09-16: codex 503 on first turn
+        # behind capacity_headroom.codex=unknown).
+        lines.append(f"capacity_warning.{adapter}={warning}")
     lines.append(f"relief_promoted={int(relief_promoted)}")
     for n, item in enumerate(rejected, 1):
         lines.append(f"rejected.{n}={item}:usage-{states[item]}")
@@ -624,6 +631,21 @@ def _audit(
         f"trace.4=configured={','.join(configured)};selected={adapter or '-'};source={source};deviation_reason={reason}",
     ]
     return lines
+
+
+def _explicit_capacity_warning(source, adapter, capacity, allocation):
+    """Typed headroom caveat for an explicit owner choice; never a gate."""
+    if source != "explicit" or not adapter or capacity is None:
+        return None
+    value = capacity.get(adapter)
+    if value is None:
+        return "headroom-unknown"
+    if value <= 0:
+        return "headroom-exhausted"
+    gate = 100 - float((allocation or {}).get("usage_gate_used_percent", 90))
+    if value < gate:
+        return f"headroom-below-gate:{round(value, 1)}<{round(gate, 1)}"
+    return None
 
 
 def _error(reason, configured=(), explicit=None, states=None):

@@ -5607,7 +5607,11 @@ def _complete_node_locked(
     if not jobs and attempt_id and explicit_attempt_metadata is None:
         raise ValueError("unregistered completion requires explicit attempt metadata")
     if not jobs and explicit_attempt_metadata is not None and not attempt_id:
-        raise ValueError("explicit attempt metadata requires --attempt-id")
+        raise ValueError(
+            "explicit attempt metadata requires --attempt-id "
+            "(--dispatch-depth/--transport/--execution-surface/--registered-worker/--fallback-hop "
+            "describe an attempt; an inline node completed by the main session omits them all)"
+        )
 
     jobs_path=Path(jobs) if jobs else None
     directory=completion_dir(route["route_id"])
