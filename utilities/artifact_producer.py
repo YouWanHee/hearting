@@ -943,6 +943,70 @@ def _campaign_naming(campaign_key: Optional[str]) -> Tuple[str, str, str, bool]:
     return slug, campaign_key, "campaign-key", truncated
 
 
+def backfill_cycle_bindings(root: Path, *, apply: bool = False) -> Dict[str, Any]:
+    """Add ``started_on`` to readable-layout ``.cycle.json`` bindings that predate it.
+
+    The time is the producer record's ``started_on``, else the sealed manifest's
+    ``cycle.started_on``. Nothing is estimated from directory names or mtimes:
+    the field is display data and the record wins (D-88). A binding that
+    already carries a different time is reported as ``conflict`` and left
+    alone. Dry run by default; ``apply`` holds the producer admission lock,
+    replaces each binding atomically and rebuilds the indexes. Idempotent.
+    """
+    root = Path(root).resolve()
+    lock_fd = artifact_admission._acquire_lock(root, artifact_admission.LOCK_TIMEOUT_DEFAULT) if apply else None
+    try:
+        rows: List[Dict[str, Any]] = []
+        counts: Dict[str, int] = {}
+        for campaign_path in artifact_locator.iter_campaign_dirs(root):
+            for entry, layout in artifact_locator.iter_cycle_dirs(campaign_path):
+                if layout != "readable":
+                    continue
+                rel = entry.relative_to(root).as_posix()
+                try:
+                    binding = artifact_locator.read_cycle_binding(entry)
+                except artifact_locator.LocatorError as exc:
+                    rows.append({"path": rel, "action": "invalid", "detail": exc.code})
+                    continue
+                if binding is None:
+                    rows.append({"path": rel, "action": "no-binding"})
+                    continue
+                cycle_id = binding["cycle_id"]
+                record = artifact_locator.read_cycle_record(root, cycle_id) or {}
+                manifest = artifact_locator._read_json(entry / "manifest.json") or {}
+                cycle = manifest.get("cycle") if isinstance(manifest.get("cycle"), dict) else {}
+                source, started_on = None, None
+                for candidate_source, candidate in (("record", record.get("started_on")),
+                                                    ("manifest", cycle.get("started_on"))):
+                    if isinstance(candidate, str) and artifact_locator._RFC3339.fullmatch(candidate):
+                        source, started_on = candidate_source, candidate
+                        break
+                row: Dict[str, Any] = {"cycle_id": cycle_id, "path": rel, "source": source,
+                                       "started_on": started_on}
+                if started_on is None:
+                    row["action"] = "missing"
+                elif "started_on" in binding:
+                    row["action"] = "present" if binding["started_on"] == started_on else "conflict"
+                    if row["action"] == "conflict":
+                        row["binding_started_on"] = binding["started_on"]
+                else:
+                    row["action"] = "added" if apply else "would-add"
+                    if apply:
+                        data = artifact_locator.cycle_binding_bytes(
+                            binding["campaign_id"], cycle_id, started_on=started_on)
+                        _write_atomic(entry / artifact_locator.CYCLE_BINDING, data)
+                rows.append(row)
+        for row in rows:
+            counts[row["action"]] = counts.get(row["action"], 0) + 1
+        if apply and counts.get("added"):
+            artifact_locator.rebuild_indexes(root)
+        return {"status": "applied" if apply else "dry-run", "artifact_root": str(root),
+                "counts": counts, "cycles": rows}
+    finally:
+        if lock_fd is not None:
+            artifact_admission._release_lock(root, lock_fd)
+
+
 def list_campaign_summaries(root: Path, *, active_only: bool = True) -> List[Dict[str, Any]]:
     """Cheap, read-only listing of the root's campaigns for callers that
     must show the agent which work streams already exist (compose).
@@ -3515,6 +3579,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--artifact-root", required=True)
     p.add_argument("--all-states", action="store_true", help="include satisfied/superseded campaigns")
 
+    p = sub.add_parser("cycle-binding-backfill",
+                       help="add started_on to .cycle.json bindings written before the field existed")
+    p.add_argument("--artifact-root", required=True)
+    p.add_argument("--apply", action="store_true", help="write the bindings (default: dry run)")
+
     for command in ("campaign-status", "campaign-close", "campaign-recover"):
         p = sub.add_parser(command, help="verify, accept, or recover a campaign's administrative closure")
         p.add_argument("--artifact-root", required=True)
@@ -3632,6 +3701,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         elif args.command == "campaign-list":
             rows = list_campaign_summaries(root, active_only=not args.all_states)
             result = {"status": "ok", "artifact_root": str(Path(root).resolve()), "campaigns": rows}
+        elif args.command == "cycle-binding-backfill":
+            result = backfill_cycle_bindings(root, apply=args.apply)
         elif args.command == "campaign-status":
             result = artifact_campaign.status(root, args.campaign)
         elif args.command in {"campaign-close", "campaign-recover"}:

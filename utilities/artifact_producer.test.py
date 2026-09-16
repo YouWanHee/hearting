@@ -3266,6 +3266,58 @@ class CycleBindingAndIndexOrderTest(ProducerTestBase):
                                  alpha_late["campaign_id"], alpha_early["cycle_id"], alpha_late["cycle_id"]])
         self.assertIn("| 2026-09-14T09:00:00Z |", markdown)
 
+    def test_backfill_adds_start_times_to_older_bindings_and_never_estimates(self):
+        self.activate()
+        route, route_file = self.route(slug="sealed-one", gate_source="sealed-one")
+        sealed = P.begin(self.root, route_file=route_file, capability="autopilot-code",
+                         intensity="direct", campaign_key="backfill")
+        self.write_output(sealed)
+        self.close(route, route_file)
+        P.finalize(self.root, cycle_id=sealed["cycle_id"])
+        _route, open_file = self.route(slug="open-one", gate_source="open-one")
+        opened = P.begin(self.root, route_file=open_file, capability="autopilot-code",
+                         intensity="direct", campaign_key="backfill")
+        markers = {}
+        for result in (sealed, opened):
+            marker = Path(result["cycle_dir"]) / ".cycle.json"
+            legacy = {k: v for k, v in json.loads(marker.read_text()).items() if k != "started_on"}
+            marker.write_text(json.dumps(legacy), encoding="utf-8")
+            markers[result["cycle_id"]] = marker
+        expected = {cid: P.read_cycle_record(self.root, cid)["started_on"] for cid in markers}
+
+        dry = P.backfill_cycle_bindings(self.root)
+        self.assertEqual((dry["status"], dry["counts"]), ("dry-run", {"would-add": 2}))
+        self.assertTrue(all("started_on" not in json.loads(m.read_text()) for m in markers.values()))
+
+        applied = P.backfill_cycle_bindings(self.root, apply=True)
+        self.assertEqual((applied["status"], applied["counts"]), ("applied", {"added": 2}))
+        for cid, marker in markers.items():
+            self.assertEqual(P.artifact_locator.read_cycle_binding(marker.parent)["started_on"], expected[cid])
+            self.assertEqual(P.artifact_locator.resolve_path(self.root, cid), marker.parent)
+        self.assertEqual(P.backfill_cycle_bindings(self.root, apply=True)["counts"], {"present": 2})
+
+        # A sealed cycle whose record lost its time falls back to the manifest; an
+        # open cycle with no time anywhere is reported, never guessed from the path.
+        for cid in markers:
+            path = P.cycle_record_path(self.root, cid)
+            record = json.loads(path.read_text()); record.pop("started_on")
+            path.write_text(json.dumps(record), encoding="utf-8")
+            legacy = {k: v for k, v in json.loads(markers[cid].read_text()).items() if k != "started_on"}
+            markers[cid].write_text(json.dumps(legacy), encoding="utf-8")
+        by_id = {row["cycle_id"]: row for row in P.backfill_cycle_bindings(self.root)["cycles"]}
+        self.assertEqual((by_id[sealed["cycle_id"]]["action"], by_id[sealed["cycle_id"]]["source"],
+                          by_id[sealed["cycle_id"]]["started_on"]),
+                         ("would-add", "manifest", expected[sealed["cycle_id"]]))
+        self.assertEqual((by_id[opened["cycle_id"]]["action"], by_id[opened["cycle_id"]]["source"]),
+                         ("missing", None))
+
+        # A binding that already carries a different time is left alone.
+        tampered = dict(json.loads(markers[sealed["cycle_id"]].read_text()), started_on="2020-01-01T00:00:00Z")
+        markers[sealed["cycle_id"]].write_text(json.dumps(tampered), encoding="utf-8")
+        result = P.backfill_cycle_bindings(self.root, apply=True)
+        self.assertEqual(result["counts"], {"conflict": 1, "missing": 1})
+        self.assertEqual(json.loads(markers[sealed["cycle_id"]].read_text())["started_on"], "2020-01-01T00:00:00Z")
+
 
 if __name__ == "__main__":
     unittest.main()
