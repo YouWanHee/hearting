@@ -198,7 +198,7 @@ EXEC_BOOT_GRACE_SEC = 10
 # `zsh -c '<snapshot> && <real command>'` is how Claude's Bash tool runs everything, so the
 # direct child is almost never the interesting name — descend to the real work (prd.md:263).
 # It is still the TOOL CALL, though: its age is how long the session has been on this one
-# call, which is the number `exec_child` reports as `etime_s` (F-47 v83).
+# call, which is the number `exec_child` reports as `etime_s` (F-47, 2026-09-16).
 _EXEC_WRAPPER_COMMS = ("sh", "bash", "zsh", "dash", "ksh", "fish")
 # Harness-internal helpers that could in principle outlive 60s. Deliberately short: the
 # canonical identification is the env marker below (same keys as `mem_worker` in scan()),

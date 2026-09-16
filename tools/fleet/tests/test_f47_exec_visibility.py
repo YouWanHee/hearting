@@ -66,7 +66,7 @@ class ExecChildScan(unittest.TestCase):
             found = procscan.exec_child(100, tree, kids)
         self.assertEqual(found["comm"], "python3")
         self.assertEqual(found["pid"], 300)
-        # v83 — elapsed is the CALL's (the direct child / wrapper), because that is how long
+        # 2026-09-16 — elapsed is the CALL's (the direct child / wrapper), because that is how long
         # the session has been on this one Bash call; the leaf's own age is kept beside it.
         self.assertEqual(found["etime_s"], 720)
         self.assertEqual(found["leaf_etime_s"], 700)
@@ -134,7 +134,7 @@ class ExecChildScan(unittest.TestCase):
 
 
 class ShellCorrection(unittest.TestCase):
-    """model.py — `shell` means "turn ended, a background shell job survives" (v83).
+    """model.py — `shell` means "turn ended, a background shell job survives" (2026-09-16).
 
     v30 read it as "the Bash tool is running" and promoted `shell` + a long-lived child to
     working. Measured 2026-09-16: a foreground Bash call holds `busy` start to finish, and
@@ -154,7 +154,7 @@ class ShellCorrection(unittest.TestCase):
         return model.classify_session(ev, now)
 
     def test_shell_with_long_lived_child_is_idle_and_says_why(self):
-        # v83 premise correction: the turn is OVER, so the row must not read as working;
+        # 2026-09-16 premise correction: the turn is OVER, so the row must not read as working;
         # the job stays visible through the rule text and the badge.
         child = {"pid": 200, "comm": "python3", "etime_s": 720, "kind": "work"}
         state, ev = self.classify(self.evidence("shell", child))
@@ -378,7 +378,7 @@ class ExecDetailRender(unittest.TestCase):
 
 
 class WaitPrimitiveCorrection(unittest.TestCase):
-    """v47 — a call with nothing under it is WAITING; v83 — and it says so legibly.
+    """v47 — a call with nothing under it is WAITING; 2026-09-16 — and it says so legibly.
 
     A poll loop's instantaneous sample almost always lands on its `sleep`, so promoting
     on it painted sleeping sessions green. The evidence stays visible; only the reading
@@ -422,7 +422,7 @@ class WaitPrimitiveCorrection(unittest.TestCase):
         self.assertEqual(state, "working")
 
     def test_wait_badge_on_a_working_row_is_legible_and_never_names_the_primitive(self):
-        # v83: the row is working because the TURN is live (busy), not because of this
+        # 2026-09-16: the row is working because the TURN is live (busy), not because of this
         # badge, so the badge is visible rather than dim — that is the whole point, the
         # user must be able to see "이 세션은 스크립트를 기다리는 중" at a glance. And it
         # names the wait, never `sleep`, whose own clock resets every iteration.
@@ -470,7 +470,7 @@ class CensusFollowsClassification(unittest.TestCase):
 
 
 class WaitingCallVisibility(unittest.TestCase):
-    """v83 — "스크립트 돌려두고 기다리는 세션" reads correctly every tick.
+    """2026-09-16 — "스크립트 돌려두고 기다리는 세션" reads correctly every tick.
 
     All four numbers below were measured 2026-09-16 against a live Claude Code 2.1.273
     session (pid 4013556), sampling `procscan.exec_child` every 0.25s:
@@ -516,7 +516,7 @@ class WaitingCallVisibility(unittest.TestCase):
 
     # (b) stability -----------------------------------------------------------------------
     def test_badge_survives_the_gap_between_loop_iterations(self):
-        # Between two `sleep`s the wrapper momentarily has no child. Before v83 the
+        # Between two `sleep`s the wrapper momentarily has no child. Before the fix the
         # ownership path returned None here and the badge vanished for that tick.
         ids = {100: (1, "900"), 200: (100, "901")}
         found = self.owned_scan([(100, 1, 3600, "claude"), (200, 100, 540, "zsh")],

@@ -3994,7 +3994,7 @@ def _compact_context_gauge_width(available, depth=0):
 
 
 _EXEC_GLYPH = "⚙"
-# F-47 v47 → v83 — a tool call with nothing running under it renders as ⏳. v47 forced it
+# F-47 v47, corrected 2026-09-16 — a tool call with nothing running under it renders as ⏳. v47 forced it
 # ALWAYS dim because `shell` + a `sleep` child used to promote the ROW to working, so a
 # bright badge sat on top of a green glyph the wait itself had caused (user 2026-08-05
 # "fleet에서 sleep 명령어가 뜨는 건 좀 모순"). That promotion is gone — `shell` is idle by
@@ -4035,7 +4035,7 @@ def _exec_detail_segs(entity):
     if isinstance(child, dict) and child.get("comm"):
         etime = child.get("etime_s")
         if exec_child_is_wait(child):
-            # v83: name the wait, not the primitive, and leave `key` at the row's own
+            # 2026-09-16: name the wait, not the primitive, and leave `key` at the row's own
             # classification — dim on an idle/background row, live under a busy turn.
             glyph, label = _WAIT_GLYPH, _WAIT_LABEL
         else:

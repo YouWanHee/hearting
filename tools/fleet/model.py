@@ -290,7 +290,7 @@ class Session:
     task_lifecycle: Optional[str] = None  # exact Codex task_started/task_complete/turn_aborted
     # F-47 (v30) — owned exec evidence, additive. `exec_child` = what this session's
     # long-lived tool call is doing ({'pid','comm','kind','etime_s','leaf_etime_s',
-    # 'child_pid'}, collectors/procscan.py — `etime_s` is the CALL's elapsed, v83);
+    # 'child_pid'}, collectors/procscan.py — `etime_s` is the CALL's elapsed);
     # `exec_tool` = a Codex rollout tool_call with no matching output yet ({'name','command'}).
     # Both are None when there is no evidence — never a guess (prd.md:263).
     exec_child: Optional[dict] = None
@@ -933,9 +933,9 @@ def _settle(key, state, tier, now, source, rule):
 def exec_child_evidence(exec_child):
     """The `exec_child` dict when it is usable F-47 evidence, else None.
 
-    The age gate reads `etime_s`, which is the TOOL CALL's elapsed (v83) — so it now asks
+    The age gate reads `etime_s`, which is the TOOL CALL's elapsed (2026-09-16) — so it now asks
     the question it always meant to ask ("has this session been on one call for a while"),
-    where the pre-v83 leaf elapsed reset on every `sleep` and silently withheld the evidence.
+    where the pre-correction leaf elapsed reset on every `sleep` and silently withheld the evidence.
     Re-applies the ≥`SESSION_WORK_SEC` age gate here rather than trusting the collector:
     `classify_session` is a pure function over a caller-supplied evidence dict (demo
     fixtures, `--json` replays, tests), so the threshold has to hold at the decision point
@@ -952,7 +952,7 @@ def exec_child_evidence(exec_child):
     return exec_child
 
 
-# F-47 (v47, generalized v83) — wait/guard primitives. A tool call that bottoms out on one
+# F-47 (v47, generalized 2026-09-16) — wait/guard primitives. A tool call that bottoms out on one
 # of these with nothing under it is WAITING, not working: a poll loop's instantaneous sample
 # almost always lands on its `sleep`. They are TRANSPARENT while a real workload runs
 # beneath them, though — `flock … timeout … node …` is node's work, and reading the top name
