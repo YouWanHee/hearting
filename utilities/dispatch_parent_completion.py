@@ -217,9 +217,20 @@ def validate_interactive_parent_launch(args) -> None:
     if getattr(args, "allow_unmanaged_parent_poll", False):
         args.parent_completion_reason = "operator-authorized-unmanaged-poll"
         return
+    # Carry the typed probe verdict (why this parent counted as unmanaged) so a
+    # rejected launch says which precondition failed instead of only the class:
+    # `managed-entry-not-enabled` is a TUI launched outside the managed
+    # launcher, `managed-parent-thread-mismatch` is a stale/wrong
+    # --parent-session-id, `managed-control-missing`/`managed-gateway-not-ready`
+    # is a dead gateway. Tests and callers match `reason`, never this text.
+    probe = getattr(args, "parent_completion_reason", "") or "-"
+    probe_class = getattr(args, "parent_completion_reason_class", "") or "-"
     raise DispatchContractError(
         "managed-entry-required",
-        "unmanaged interactive Codex parents cannot register or start a worker without a completion carrier; restart through preflight.sh managed-entry",
+        "unmanaged interactive Codex parents cannot register or start a worker without a completion carrier; "
+        f"probe={probe} probe_class={probe_class}; restart through preflight.sh managed-entry "
+        "(a TUI started outside the installed managed `codex` launcher reports probe=interactive-auto-wake-unsupported "
+        "or managed-entry-not-enabled)",
     )
 
 

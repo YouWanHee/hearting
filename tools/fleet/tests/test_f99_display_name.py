@@ -30,6 +30,7 @@ class _HermeticStateRoot(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         os.environ["AGENT_HOME"] = self.tmp.name
         os.environ["HOME"] = self.tmp.name
+        os.environ["CLAUDE_CONFIG_DIR"] = self.tmp.name
         for key in ("CLAUDE_HOME", "AGENT_DISPATCH_JOBS", "XDG_STATE_HOME", "HARNESS_STATE_ROOT"):
             os.environ.pop(key, None)
 

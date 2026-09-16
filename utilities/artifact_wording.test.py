@@ -144,6 +144,26 @@ class HintContractTest(unittest.TestCase):
             else:
                 os.environ[k] = v
 
+    def test_finalize_primary_accepts_absolute_path_inside_cycle_artifacts(self):
+        # 2026-09-16 DX: an absolute --primary failed `primary-artifact-missing`
+        # with no hint that only cycle-relative locators are accepted.
+        cycle = self.root / "campaigns" / "c" / "cyc"
+        (cycle / "artifacts" / "documents").mkdir(parents=True)
+        target = cycle / "artifacts" / "documents" / "report.md"
+        target.write_text("x", encoding="utf-8")
+        self.assertEqual(P._cycle_relative_primary(str(target), cycle), "artifacts/documents/report.md")
+        self.assertEqual(P._cycle_relative_primary("artifacts/documents/report.md", cycle),
+                         "artifacts/documents/report.md")
+        self.assertEqual(P._cycle_relative_primary("documents/report.md", cycle), "documents/report.md")
+        outside = str(self.root / "elsewhere.md")
+        self.assertEqual(P._cycle_relative_primary(outside, cycle), outside)
+        self.assertIsNone(P._cycle_relative_primary(None, cycle))
+        with self.assertRaises(P.ProducerError) as ctx:
+            P._choose_primary([("artifacts/documents/report.md", b"x")], "documents/other.md")
+        self.assertEqual(ctx.exception.code, "primary-artifact-missing")
+        self.assertIn("cycle-relative", ctx.exception.detail)
+        self.assertIn("artifacts/documents/report.md", ctx.exception.detail)
+
     def test_a16_8_check_write_hint_equals_resolve_output_detail(self):
         target = self.root / "plans" / "2026-01-01_x" / "plan.md"
         verdict = P.check_write(self.root, target)
