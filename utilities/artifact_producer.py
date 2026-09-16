@@ -946,9 +946,11 @@ def _campaign_naming(campaign_key: Optional[str]) -> Tuple[str, str, str, bool]:
 def backfill_cycle_bindings(root: Path, *, apply: bool = False) -> Dict[str, Any]:
     """Add ``started_on`` to readable-layout ``.cycle.json`` bindings that predate it.
 
-    The time is the producer record's ``started_on``, else the sealed manifest's
-    ``cycle.started_on``. Nothing is estimated from directory names or mtimes:
-    the field is display data and the record wins (D-88). A binding that
+    The value follows ``artifact_locator.display_started_on``: a resplit cycle's
+    work date (D-79 ``resplit_started_on``, date-only), else the record's own
+    ``started_on``, else the sealed manifest's. Nothing is estimated from
+    directory names or mtimes: the field is display data and the record wins
+    (D-88). A binding that
     already carries a different time is reported as ``conflict`` and left
     alone. Dry run by default; ``apply`` holds the producer admission lock,
     replaces each binding atomically and rebuilds the indexes. Idempotent.
@@ -974,13 +976,12 @@ def backfill_cycle_bindings(root: Path, *, apply: bool = False) -> Dict[str, Any
                 cycle_id = binding["cycle_id"]
                 record = artifact_locator.read_cycle_record(root, cycle_id) or {}
                 manifest = artifact_locator._read_json(entry / "manifest.json") or {}
-                cycle = manifest.get("cycle") if isinstance(manifest.get("cycle"), dict) else {}
-                source, started_on = None, None
-                for candidate_source, candidate in (("record", record.get("started_on")),
-                                                    ("manifest", cycle.get("started_on"))):
-                    if isinstance(candidate, str) and artifact_locator._RFC3339.fullmatch(candidate):
-                        source, started_on = candidate_source, candidate
-                        break
+                started_on = artifact_locator.display_started_on(record, manifest)
+                source = None
+                if started_on is not None:
+                    # `display_started_on` may have trimmed a placeholder clock; match on the prefix.
+                    source = ("record:resplit_started_on" if str(record.get("resplit_started_on")).startswith(started_on)
+                              else "record" if str(record.get("started_on")).startswith(started_on) else "manifest")
                 row: Dict[str, Any] = {"cycle_id": cycle_id, "path": rel, "source": source,
                                        "started_on": started_on}
                 if started_on is None:
