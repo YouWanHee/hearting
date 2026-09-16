@@ -225,11 +225,12 @@ class ActivateAndBeginTest(ProducerTestBase):
         self.assertEqual(record["state"], "open")
         self.assertEqual(record["route_id"], route["route_id"])
         self.assertEqual(campaign["cycles"], [result["cycle_id"]])
-        for named in (campaign, record):
-            self.assertEqual(named["slug"], "w7i-test")
-            self.assertEqual(named["title"], "w7i-test")
-            self.assertEqual(named["slug_source"], "route")
-            self.assertEqual(named["locator_suffix"], "")
+        # The cycle is named by the route slug; the campaign by the stream key.
+        self.assertEqual((record["slug"], record["title"], record["slug_source"], record["locator_suffix"]),
+                         ("w7i-test", "w7i-test", "route", ""))
+        self.assertEqual((campaign["slug"], campaign["title"], campaign["slug_source"], campaign["locator_suffix"]),
+                         ("w7i-naming", "w7i-naming", "campaign-key", ""))
+        self.assertEqual(campaign["locator"], f"{campaign['created_on'][:10]}_w7i-naming")
         self.assertEqual(json.loads((self.root / "campaigns" / "INDEX.json").read_text())[result["cycle_id"]],
                          cycle_dir.relative_to(self.root).as_posix())
 
@@ -249,9 +250,86 @@ class ActivateAndBeginTest(ProducerTestBase):
         )
         legacy_record = P.read_cycle_record(self.root, derived["cycle_id"])
         legacy_campaign = P.read_campaign(self.root, derived["campaign_id"])
-        for named in (legacy_campaign, legacy_record):
-            self.assertEqual(named["slug"], "legacy-goal-for-naming")
-            self.assertEqual(named["slug_source"], "derived-legacy-route")
+        self.assertEqual((legacy_record["slug"], legacy_record["slug_source"]),
+                         ("legacy-goal-for-naming", "derived-legacy-route"))
+        self.assertEqual((legacy_campaign["slug"], legacy_campaign["slug_source"]),
+                         ("legacy-derived", "campaign-key"))
+
+    def test_campaign_is_named_from_its_key_not_the_first_route_slug(self):
+        """TF-Rehancer 2026-09-15: key `tf-rehancer-icassp`, first slug
+        `tf-rehancer-analysis-cx` produced campaign folder
+        `<date>_tf-rehancer-analysis-cx`."""
+        self.activate()
+        first_route, first_file = self.route(slug="tf-rehancer-analysis-cx", campaign_key="tf-rehancer-icassp")
+        first = P.begin(self.root, route_file=first_file, capability="autopilot-code", intensity="direct")
+        campaign = P.read_campaign(self.root, first["campaign_id"])
+        date = campaign["created_on"][:10]
+        self.assertEqual(campaign["locator"], f"{date}_tf-rehancer-icassp")
+        self.assertEqual((campaign["key"], campaign["slug"], campaign["title"], campaign["slug_source"]),
+                         ("tf-rehancer-icassp", "tf-rehancer-icassp", "tf-rehancer-icassp", "campaign-key"))
+        self.assertEqual(Path(first["cycle_dir"]).name, f"{date}_tf-rehancer-analysis-cx")
+        self.assertEqual(Path(first["cycle_dir"]).parent.name, f"{date}_tf-rehancer-icassp")
+        # A second route with another slug joins the same folder; it adds a cycle, not a name.
+        _, second_file = self.route(slug="tf-rehancer-research", campaign_key="tf-rehancer-icassp",
+                                    gate_source="second")
+        second = P.begin(self.root, route_file=second_file, capability="autopilot-code", intensity="direct")
+        self.assertEqual(second["campaign_id"], first["campaign_id"])
+        self.assertEqual(Path(second["cycle_dir"]).parent.name, f"{date}_tf-rehancer-icassp")
+        self.assertEqual(P.read_campaign(self.root, first["campaign_id"])["locator"], campaign["locator"])
+        # The key is the title verbatim; the locator is its D-88 slug.
+        _, odd_file = self.route(slug="bounded-task", campaign_key="TTS.v6:Release", gate_source="odd")
+        odd = P.begin(self.root, route_file=odd_file, capability="autopilot-code", intensity="direct")
+        odd_campaign = P.read_campaign(self.root, odd["campaign_id"])
+        self.assertEqual((odd_campaign["title"], odd_campaign["slug"]), ("TTS.v6:Release", "tts-v6-release"))
+        self.assertEqual(odd_campaign["locator"], f"{date}_tts-v6-release")
+        # The reserved container keeps its fixed name and stays degraded.
+        _, keyless_file = self.route(slug="stray-work", gate_source="keyless")
+        keyless = P.begin(self.root, route_file=keyless_file, capability="autopilot-code", intensity="direct")
+        container = P.read_campaign(self.root, keyless["campaign_id"])
+        self.assertEqual((container["key"], container["slug"], container["title"], container["slug_source"]),
+                         ("_unassigned", "unassigned", "_unassigned", "reserved"))
+        self.assertTrue(keyless["degraded"])
+        summaries = P.list_campaign_summaries(self.root)
+        self.assertEqual(sorted(row["key"] for row in summaries),
+                         ["TTS.v6:Release", "_unassigned", "tf-rehancer-icassp"])
+        by_key = {row["key"]: row for row in summaries}
+        self.assertEqual(by_key["tf-rehancer-icassp"]["cycle_count"], 2)
+        self.assertTrue(by_key["_unassigned"]["degraded"])
+        odd_campaign["state"] = "superseded"
+        P._write_campaign(self.root, odd_campaign, exclusive=False)
+        self.assertNotIn("TTS.v6:Release", {row["key"] for row in P.list_campaign_summaries(self.root)})
+        self.assertIn("TTS.v6:Release", {row["key"] for row in P.list_campaign_summaries(self.root, active_only=False)})
+
+    def test_join_backfills_missing_display_fields_and_repairs_a_promoted_placeholder_title(self):
+        self.activate()
+        _, first_file = self.route(slug="first-task", campaign_key="promoted-stream")
+        first = P.begin(self.root, route_file=first_file, capability="autopilot-code", intensity="direct")
+        campaign = P.read_campaign(self.root, first["campaign_id"])
+        # A pre-W7I record lacks every display field; the join fills them from the key, not the route.
+        legacy = {k: v for k, v in campaign.items() if k not in ("slug", "title", "slug_source", "slug_truncated")}
+        P._write_campaign(self.root, legacy, exclusive=False)
+        _, second_file = self.route(slug="second-task", campaign_key="promoted-stream", gate_source="second")
+        P.begin(self.root, route_file=second_file, capability="autopilot-code", intensity="direct")
+        filled = P.read_campaign(self.root, first["campaign_id"])
+        self.assertEqual((filled["slug"], filled["title"], filled["slug_source"], filled["slug_truncated"]),
+                         ("promoted-stream", "promoted-stream", "campaign-key", False))
+        self.assertEqual(filled["locator"], campaign["locator"])
+        # A campaign promoted out of `_unassigned` by the metadata amendment still
+        # carries the reserved placeholder title; the next join names it by its key
+        # so later manifests stop sealing `campaign.title = "_unassigned"`.
+        promoted = dict(filled)
+        promoted["title"] = "_unassigned"
+        P._write_campaign(self.root, promoted, exclusive=False)
+        _, third_file = self.route(slug="third-task", campaign_key="promoted-stream", gate_source="third")
+        third = P.begin(self.root, route_file=third_file, capability="autopilot-code", intensity="direct")
+        repaired = P.read_campaign(self.root, first["campaign_id"])
+        self.assertEqual(repaired["title"], "promoted-stream")
+        self.assertEqual(repaired["locator"], campaign["locator"])
+        self.assertEqual(third["campaign_id"], first["campaign_id"])
+        # The reserved container itself is never renamed by a join.
+        _, keyless_file = self.route(slug="stray", gate_source="stray")
+        keyless = P.begin(self.root, route_file=keyless_file, capability="autopilot-code", intensity="direct")
+        self.assertEqual(P.read_campaign(self.root, keyless["campaign_id"])["title"], "_unassigned")
 
     def test_collision_suffix_is_smallest_and_resume_keeps_it(self):
         self.activate()
@@ -2704,7 +2782,8 @@ class TerminalTransactionIntegrationTest(ProducerTestBase):
         if capability=="autopilot-spec":
             route=R.compose_route(capability=capability,capability_mode="update",shape="staged",
                 graph="review,prd-transaction",slug="terminal-transaction-fixture",cwd=R.ROOT,
-                artifact_root=self.root,intensity="standard",dispatch_evidence={"tuples":[nested(harness,"codex")]})
+                artifact_root=self.root,intensity="standard",dispatch_evidence={"tuples":[nested(harness,"codex")]},
+                unassigned=True)
         route_file=Path(L.admit_runtime_route(self.root,route).route_file)
         jobs=Path(self._tmp.name)/"jobs.log"; owner="att-transaction-owner"; child="att-transaction-report"
         owner_meta=dict(attempt_id=owner,worker_type="owner",dispatch_depth="1",registered_worker="1",
@@ -3070,9 +3149,10 @@ class LocatorDateDuplicationTest(ProducerTestBase):
         campaign = P.read_campaign(self.root, result["campaign_id"])
         locator = campaign["locator"]
         self.assertEqual(len(P.artifact_locator._DATE_PREFIX.findall(locator)), 1, locator)
-        self.assertTrue(locator.endswith("_r5-streaming-window-sim"), locator)
-        self.assertEqual(campaign["slug"], "r5-streaming-window-sim")
-        self.assertEqual(campaign["slug_source"], "route")
+        # The campaign carries the stream key, not the route slug.
+        self.assertTrue(locator.endswith("_streaming-release"), locator)
+        self.assertEqual(campaign["slug"], "streaming-release")
+        self.assertEqual(campaign["slug_source"], "campaign-key")
         # The route sealed the normalised slug, so the cycle locator under it
         # carries one date too.
         self.assertEqual(route["slug"], "r5-streaming-window-sim")
@@ -3130,6 +3210,236 @@ class RouteLaunchContextTest(ProducerTestBase):
         self.assertEqual(len(list(P.list_cycle_records(self.root))), 1)
         self.assertEqual(P.read_cycle_record(self.root, env["AGENT_ARTIFACT_CYCLE_ID"])["route_id"], route["route_id"])
         self.assertEqual(Path(env["AGENT_ARTIFACT_OUTPUT_DIR"]), Path(env["AGENT_ARTIFACT_CYCLE_DIR"]) / "artifacts")
+
+
+class CycleBindingAndIndexOrderTest(ProducerTestBase):
+    def test_cycle_binding_records_the_start_time_and_legacy_bindings_still_read(self):
+        self.activate()
+        _route, _route_file, result = self.begin()
+        cycle_dir = Path(result["cycle_dir"])
+        record = P.read_cycle_record(self.root, result["cycle_id"])
+        binding = json.loads((cycle_dir / ".cycle.json").read_text())
+        self.assertEqual(binding["started_on"], record["started_on"])
+        self.assertEqual(P.artifact_locator.read_cycle_binding(cycle_dir)["started_on"], record["started_on"])
+        self.assertEqual(P.artifact_locator.resolve_path(self.root, result["cycle_id"]), cycle_dir)
+        # Bindings written before the field existed keep resolving unchanged.
+        legacy = {key: value for key, value in binding.items() if key != "started_on"}
+        (cycle_dir / ".cycle.json").write_text(json.dumps(legacy), encoding="utf-8")
+        self.assertNotIn("started_on", P.artifact_locator.read_cycle_binding(cycle_dir))
+        self.assertEqual(P.artifact_locator.resolve_path(self.root, result["cycle_id"]), cycle_dir)
+        for bad in ({**binding, "started_on": "2026-09-14 09:00"}, {**binding, "sealed_on": binding["started_on"]}):
+            (cycle_dir / ".cycle.json").write_text(json.dumps(bad), encoding="utf-8")
+            with self.assertRaises(P.artifact_locator.LocatorError):
+                P.artifact_locator.read_cycle_binding(cycle_dir)
+        with self.assertRaises(P.artifact_locator.LocatorError):
+            P.artifact_locator.cycle_binding_bytes(record["campaign_id"], result["cycle_id"], started_on="today")
+        # A work date without a clock (resplit/residue cycles) is allowed and stays date-only.
+        (cycle_dir / ".cycle.json").write_bytes(P.artifact_locator.cycle_binding_bytes(
+            record["campaign_id"], result["cycle_id"], started_on="2026-06-11"))
+        self.assertEqual(P.artifact_locator.read_cycle_binding(cycle_dir)["started_on"], "2026-06-11")
+
+    def test_index_markdown_lists_each_campaign_then_its_cycles_in_start_order(self):
+        self.activate()
+
+        def open_cycle(slug, key):
+            _route, route_file = self.route(slug=slug, gate_source=slug)
+            return P.begin(self.root, route_file=route_file, capability="autopilot-code",
+                           intensity="direct", campaign_key=key)
+
+        alpha_late = open_cycle("alpha-late", "alpha")
+        alpha_early = open_cycle("alpha-early", "alpha")
+        beta = open_cycle("beta-only", "beta")
+        stamps = {alpha_late["cycle_id"]: "2026-09-14T15:00:00Z",
+                  alpha_early["cycle_id"]: "2026-09-14T09:00:00Z",
+                  beta["cycle_id"]: "2026-09-13T10:00:00Z"}
+        for cycle_id, when in stamps.items():
+            path = P.cycle_record_path(self.root, cycle_id)
+            record = json.loads(path.read_text(encoding="utf-8"))
+            record["started_on"] = when
+            path.write_text(json.dumps(record), encoding="utf-8")
+        for campaign_id, when in ((alpha_late["campaign_id"], "2026-09-14T08:00:00Z"),
+                                  (beta["campaign_id"], "2026-09-13T08:00:00Z")):
+            campaign = P.read_campaign(self.root, campaign_id)
+            campaign["created_on"] = when
+            P._write_campaign(self.root, campaign, exclusive=False)
+        P.artifact_locator.rebuild_indexes(self.root)
+        markdown = (self.root / "campaigns" / "INDEX.md").read_text(encoding="utf-8")
+        order = [line.split("|")[1].strip() for line in markdown.splitlines() if line.startswith("| c")]
+        # Older campaign first; within a campaign the same-day cycles follow the clock, not the ID.
+        self.assertEqual(order, [beta["campaign_id"], beta["cycle_id"],
+                                 alpha_late["campaign_id"], alpha_early["cycle_id"], alpha_late["cycle_id"]])
+        self.assertIn("| 2026-09-14T09:00:00Z |", markdown)
+
+    def test_backfill_adds_start_times_to_older_bindings_and_never_estimates(self):
+        self.activate()
+        route, route_file = self.route(slug="sealed-one", gate_source="sealed-one")
+        sealed = P.begin(self.root, route_file=route_file, capability="autopilot-code",
+                         intensity="direct", campaign_key="backfill")
+        self.write_output(sealed)
+        self.close(route, route_file)
+        P.finalize(self.root, cycle_id=sealed["cycle_id"])
+        _route, open_file = self.route(slug="open-one", gate_source="open-one")
+        opened = P.begin(self.root, route_file=open_file, capability="autopilot-code",
+                         intensity="direct", campaign_key="backfill")
+        markers = {}
+        for result in (sealed, opened):
+            marker = Path(result["cycle_dir"]) / ".cycle.json"
+            legacy = {k: v for k, v in json.loads(marker.read_text()).items() if k != "started_on"}
+            marker.write_text(json.dumps(legacy), encoding="utf-8")
+            markers[result["cycle_id"]] = marker
+        expected = {cid: P.read_cycle_record(self.root, cid)["started_on"] for cid in markers}
+
+        dry = P.backfill_cycle_bindings(self.root)
+        self.assertEqual((dry["status"], dry["counts"]), ("dry-run", {"would-add": 2}))
+        self.assertTrue(all("started_on" not in json.loads(m.read_text()) for m in markers.values()))
+
+        applied = P.backfill_cycle_bindings(self.root, apply=True)
+        self.assertEqual((applied["status"], applied["counts"]), ("applied", {"added": 2}))
+        for cid, marker in markers.items():
+            self.assertEqual(P.artifact_locator.read_cycle_binding(marker.parent)["started_on"], expected[cid])
+            self.assertEqual(P.artifact_locator.resolve_path(self.root, cid), marker.parent)
+        self.assertEqual(P.backfill_cycle_bindings(self.root, apply=True)["counts"], {"present": 2})
+
+        # A sealed cycle whose record lost its time falls back to the manifest; an
+        # open cycle with no time anywhere is reported, never guessed from the path.
+        for cid in markers:
+            path = P.cycle_record_path(self.root, cid)
+            record = json.loads(path.read_text()); record.pop("started_on")
+            path.write_text(json.dumps(record), encoding="utf-8")
+            legacy = {k: v for k, v in json.loads(markers[cid].read_text()).items() if k != "started_on"}
+            markers[cid].write_text(json.dumps(legacy), encoding="utf-8")
+        by_id = {row["cycle_id"]: row for row in P.backfill_cycle_bindings(self.root)["cycles"]}
+        self.assertEqual((by_id[sealed["cycle_id"]]["action"], by_id[sealed["cycle_id"]]["source"],
+                          by_id[sealed["cycle_id"]]["started_on"]),
+                         ("would-add", "manifest", expected[sealed["cycle_id"]]))
+        self.assertEqual((by_id[opened["cycle_id"]]["action"], by_id[opened["cycle_id"]]["source"]),
+                         ("missing", None))
+
+        # A W7G resplit cycle records the resplit run in `started_on` and the
+        # work's date in `resplit_started_on`; the reader wants the work's date
+        # (D-79), in the binding and in INDEX.md alike, never the move time.
+        path = P.cycle_record_path(self.root, opened["cycle_id"])
+        record = json.loads(path.read_text())
+        record["started_on"] = "2026-09-03T15:12:03Z"
+        record["resplit_started_on"] = "2026-06-11"
+        record["derived_from_cycle_id"] = "cyc_" + "1" * 32
+        path.write_text(json.dumps(record), encoding="utf-8")
+        row = {r["cycle_id"]: r for r in P.backfill_cycle_bindings(self.root, apply=True)["cycles"]}[opened["cycle_id"]]
+        self.assertEqual((row["action"], row["source"], row["started_on"]),
+                         ("added", "record:resplit_started_on", "2026-06-11"))
+        self.assertEqual(P.artifact_locator.read_cycle_binding(markers[opened["cycle_id"]].parent)["started_on"],
+                         "2026-06-11")
+        self.assertIn("| 2026-06-11 |", (self.root / "campaigns" / "INDEX.md").read_text(encoding="utf-8"))
+        self.assertNotIn("2026-09-03T15:12:03Z", (self.root / "campaigns" / "INDEX.md").read_text(encoding="utf-8"))
+        # The fleet-wide resplit stored the folder date as midnight with no
+        # `resplit_started_on`; that placeholder clock is dropped the same way.
+        record.pop("resplit_started_on")
+        record["started_on"] = "2026-07-26T00:00:00Z"
+        path.write_text(json.dumps(record), encoding="utf-8")
+        legacy = {k: v for k, v in json.loads(markers[opened["cycle_id"]].read_text()).items() if k != "started_on"}
+        markers[opened["cycle_id"]].write_text(json.dumps(legacy), encoding="utf-8")
+        row = {r["cycle_id"]: r for r in P.backfill_cycle_bindings(self.root)["cycles"]}[opened["cycle_id"]]
+        self.assertEqual((row["action"], row["source"], row["started_on"]), ("would-add", "record", "2026-07-26"))
+        self.assertEqual(P.artifact_locator.display_started_on(
+            {"started_on": "2026-07-26T00:00:00Z"}), "2026-07-26T00:00:00Z")  # a real midnight start stays
+
+        # A binding that already carries a different time is left alone.
+        tampered = dict(json.loads(markers[sealed["cycle_id"]].read_text()), started_on="2020-01-01T00:00:00Z")
+        markers[sealed["cycle_id"]].write_text(json.dumps(tampered), encoding="utf-8")
+        result = P.backfill_cycle_bindings(self.root, apply=True)
+        self.assertEqual(result["counts"], {"added": 1, "conflict": 1})
+        self.assertEqual(json.loads(markers[sealed["cycle_id"]].read_text())["started_on"], "2020-01-01T00:00:00Z")
+
+    def test_time_recovery_reads_original_mtimes_from_the_retirement_backup(self):
+        import hashlib, io, tarfile
+        self.activate()
+        route, route_file = self.route(slug="migrated-work", gate_source="migrated-work")
+        sealed = P.begin(self.root, route_file=route_file, capability="autopilot-code",
+                         intensity="direct", campaign_key="recovery")
+        target = self.write_output(sealed, rel="plans/cycle/plan.md", data=b"plan body\n")
+        self.close(route, route_file)
+        P.finalize(self.root, cycle_id=sealed["cycle_id"])
+        # Pretend this sealed cycle came out of the W7G resplit: date-only start, no clock.
+        record_path = P.cycle_record_path(self.root, sealed["cycle_id"])
+        record = json.loads(record_path.read_text())
+        record.update({"derived_from_cycle_id": "cyc_" + "2" * 32, "started_on": "2026-07-13T00:00:00Z"})
+        record_path.write_text(json.dumps(record), encoding="utf-8")
+        # A retirement backup of the same root: original bytes under their legacy path, original mtime.
+        store = Path(self._tmp.name) / "retirement"
+        run_dir = store / ROOT_ID / "20260903T230843Z"
+        run_dir.mkdir(parents=True)
+        import calendar
+        original_mtime = calendar.timegm((2026, 7, 13, 9, 34, 26, 0, 0, 0))  # the legacy file's last write
+        with tarfile.open(run_dir / "retired-sources.tar.gz", "w:gz") as archive:
+            info = tarfile.TarInfo("plans/legacy/plan.md")
+            info.size, info.mtime = len(b"plan body\n"), original_mtime
+            archive.addfile(info, io.BytesIO(b"plan body\n"))
+            other = tarfile.TarInfo("plans/legacy/other.md")
+            other.size, other.mtime = 6, original_mtime + 3600
+            archive.addfile(other, io.BytesIO(b"other\n"))
+        digest = hashlib.sha256(b"plan body\n").hexdigest()
+        (run_dir / "retired-manifest.jsonl").write_text(
+            json.dumps({"sha256": digest, "size": 10, "source": "plans/legacy/plan.md", "target": "x"}) + "\n"
+            + json.dumps({"sha256": hashlib.sha256(b"other\n").hexdigest(), "size": 6,
+                          "source": "plans/legacy/other.md", "target": "y"}) + "\n", encoding="utf-8")
+        (run_dir / "backup-seal.json").write_text(json.dumps({"archive_sha256": "abc"}), encoding="utf-8")
+
+        dry = P.recover_cycle_times(self.root, backup_store=store)
+        self.assertEqual((dry["status"], dry["counts"], dry["backup_runs"]),
+                         ("dry-run", {"would-recover": 1}, ["20260903T230843Z"]))
+        row = dry["cycles"][0]
+        # The folder was named today by `begin`; the recovered date disagreeing with it is reported, not hidden.
+        self.assertEqual((row["recovered_started_on"], row["matched"], row["total"], row["folder_date_agrees"]),
+                         ("2026-07-13T09:34:26Z", 1, 1, False))
+        self.assertNotIn("recovered_started_on", json.loads(record_path.read_text()))
+        self.assertTrue((run_dir / "mtime-index.json").is_file())  # listing the archive is cached
+
+        applied = P.recover_cycle_times(self.root, backup_store=store, apply=True)
+        self.assertEqual(applied["counts"], {"recovered": 1})
+        record = json.loads(record_path.read_text())
+        self.assertEqual((record["recovered_started_on"], record["recovered_started_on_source"],
+                          record["started_on"], record["recovered_started_on_evidence"]["matched"]),
+                         ("2026-07-13T09:34:26Z", P.RECOVERED_SOURCE, "2026-07-13T00:00:00Z", 1))
+        journal = Path(applied["journal"])
+        self.assertEqual(json.loads(journal.read_text().splitlines()[0])["pre"]["started_on"], "2026-07-13T00:00:00Z")
+        self.assertIn("| 2026-07-13T09:34:26Z |", (self.root / "campaigns" / "INDEX.md").read_text(encoding="utf-8"))
+        # The campaign row starts with its earliest cycle, not with the day the resplit created it.
+        _mapping, view = P.artifact_locator.scan_index(self.root)
+        self.assertEqual(view[sealed["campaign_id"]]["started"], "2026-07-13T09:34:26Z")
+        self.assertEqual(P.recover_cycle_times(self.root, backup_store=store, apply=True)["counts"], {"already": 1})
+        # The recovered clock is what the binding backfill and the display use from now on.
+        marker = Path(sealed["cycle_dir"]) / ".cycle.json"
+        marker.write_text(json.dumps({k: v for k, v in json.loads(marker.read_text()).items() if k != "started_on"}))
+        row = P.backfill_cycle_bindings(self.root, apply=True)["cycles"][0]
+        self.assertEqual((row["action"], row["started_on"]), ("added", "2026-07-13T09:34:26Z"))
+        # An earliest write *after* the folder's date is a later bulk rewrite, not the
+        # start: it is kept as evidence and the display stays date-only.
+        record = json.loads(record_path.read_text())
+        record["locator"] = "2026-07-01_migrated-work"
+        record.pop("recovered_started_on"); record.pop("recovered_earliest_write")
+        record_path.write_text(json.dumps(record), encoding="utf-8")
+        Path(sealed["cycle_dir"]).rename(Path(sealed["cycle_dir"]).with_name("2026-07-01_migrated-work"))
+        row = P.recover_cycle_times(self.root, backup_store=store, apply=True)["cycles"][0]
+        self.assertEqual((row["action"], row["display"], row["recovered_started_on"], row["earliest_write"]),
+                         ("recovered", "evidence-only", None, "2026-07-13T09:34:26Z"))
+        record = json.loads(record_path.read_text())
+        self.assertEqual((record.get("recovered_started_on"), record["recovered_earliest_write"]),
+                         (None, "2026-07-13T09:34:26Z"))
+        self.assertEqual(P.artifact_locator.display_started_on(record), "2026-07-13")
+        self.assertEqual(P.recover_cycle_times(self.root, backup_store=store)["counts"], {"already": 1})
+        sealed["cycle_dir"] = str(Path(sealed["cycle_dir"]).with_name("2026-07-01_migrated-work"))
+        # A cycle whose bytes are not in any backup is reported, never guessed.
+        target = Path(sealed["cycle_dir"]) / "artifacts" / "plans" / "cycle" / "plan.md"
+        target.write_bytes(b"rewritten after the fact\n")
+        record["derived_from_cycle_id"] = "cyc_" + "3" * 32
+        manifest_path = Path(sealed["cycle_dir"]) / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        for rev in manifest["artifact_revisions"]:
+            rev["content_digest"] = "sha256:" + "f" * 64
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        record.pop("recovered_started_on", None); record.pop("recovered_earliest_write", None)
+        record_path.write_text(json.dumps(record), encoding="utf-8")
+        self.assertEqual(P.recover_cycle_times(self.root, backup_store=store)["counts"], {"no-match": 1})
 
 
 if __name__ == "__main__":

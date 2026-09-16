@@ -17,7 +17,13 @@ import hashlib
 import json
 
 ROUTE_HASH_EXCLUDED_KEYS = frozenset(
-    {"route_hash", "route_id", "owner_attempt_id", "route_family_key"}
+    {
+        "route_hash", "route_id", "owner_attempt_id", "route_family_key",
+        # Invocation-only locators are attached by a few legacy helpers while
+        # reading a sealed route.  They are not part of the route contract and
+        # must never invalidate lineage proof when carried in memory.
+        "route_file", "_route_file",
+    }
 )
 
 

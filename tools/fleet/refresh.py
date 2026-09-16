@@ -32,23 +32,17 @@ class LiveSnapshot:
 # The measurement above is for the snapshot pump only. The compute-host pump
 # (remote GPU host queries) borrows the same 90s floor as a POLICY CHOICE, not
 # a measurement -- its producer's normal duration was not profiled in this
-# cycle. A false "stalled" there only costs one leaked daemon thread (capped at
-# MAX_LEAKED_WORKERS) and a " · gpu stalled" header suffix; it never touches
-# snapshot collection or display. Since the original defect was "never comes
-# back", judging late is safer than judging early. See FLEET_REFRESH_STALL_AFTER
-# to override either pump's threshold.
+# cycle. This threshold controls the collection-delay label only. A slow live
+# producer remains responsible for returning its result; another scan cannot
+# repair blocked NFS IO and would multiply contention. See
+# FLEET_REFRESH_STALL_AFTER to override either pump's display threshold.
 DEFAULT_STALL_FLOOR = 90.0
 DEFAULT_STALL_MULTIPLIER = 6
 MIN_STALL_AFTER = 5.0
-MAX_LEAKED_WORKERS = 3
 
 
 class RefreshWorkerDied(RuntimeError):
     """The worker thread exited without the pump observing completion."""
-
-
-class RefreshWorkerStalled(RuntimeError):
-    """The worker thread is still alive well past its expected duration."""
 
 
 def _resolve_stall_after(interval):
@@ -83,12 +77,10 @@ class RefreshPump:
         self._last_error = None
         self._started_at = None
         self._last_success_at = None
-        self._leaked_workers = 0
         self._stall_after = (
             float(stall_after) if stall_after is not None
             else _resolve_stall_after(self._interval)
         )
-        self._thread_token = None
 
     @property
     def generation(self):
@@ -139,7 +131,7 @@ class RefreshPump:
             return True
 
     def _reap_locked(self, now):
-        """Recognize a worker that died or hung without the pump noticing.
+        """Recover only a worker that actually exited without clearing state.
 
         Must be called with ``self._lock`` held.
         """
@@ -152,20 +144,6 @@ class RefreshPump:
                     "worker thread exited without clearing state")
             self._running = False
             return
-        if self._started_at is not None and now - self._started_at > self._stall_after:
-            self._leaked_workers += 1
-            self._last_error = RefreshWorkerStalled(
-                "worker has run for %.1fs, exceeding stall_after=%.1fs"
-                % (now - self._started_at, self._stall_after))
-            if self._leaked_workers < MAX_LEAKED_WORKERS:
-                # The old worker is abandoned as a daemon thread; a fresh
-                # worker takes over the schedule. If the old one eventually
-                # returns, the token check in _run discards its result.
-                self._running = False
-            # else: at the cap, stop spawning more daemon threads -- the
-            # blocking cause has not gone away, so piling on threads is not
-            # honest recovery. Leave `_running` True: request() will keep
-            # refusing until the operator notices via health().
 
     def poll(self, after_generation=0):
         """Return ``(generation, value)`` only when a newer success exists."""
@@ -180,18 +158,16 @@ class RefreshPump:
 
         This is a pure read: it never reaps or restarts a worker. It reports
         "stalled" the moment a running worker crosses ``stall_after``, even if
-        nothing has called ``request()``/``request_due()`` yet to trigger
-        recovery -- so a caller can observe a hang independently of when the
-        next scheduled request happens to land.
+        nothing has called ``request()``/``request_due()``. The producer is
+        still live and retains responsibility for publishing its result.
         """
         current = self._clock() if now is None else float(now)
         with self._lock:
             last_success_at = self._last_success_at
             age = None if last_success_at is None else current - last_success_at
             stalled = (
-                self._leaked_workers >= MAX_LEAKED_WORKERS
-                or (self._running and self._started_at is not None
-                    and current - self._started_at > self._stall_after)
+                self._running and self._started_at is not None
+                and current - self._started_at > self._stall_after
             )
             if stalled:
                 state = "stalled"
@@ -210,7 +186,7 @@ class RefreshPump:
                 "last_success_at": last_success_at,
                 "age": age,
                 "last_error": last_error,
-                "leaked_workers": self._leaked_workers,
+                "leaked_workers": 0,  # retained read schema; live workers are never abandoned
                 "stall_after": self._stall_after,
             }
 
@@ -224,19 +200,16 @@ class RefreshPump:
             thread.join(max(0.0, float(join_timeout)))
 
     def _start_locked(self):
-        token = object()
-        self._thread_token = token
         self._started_at = self._clock()
         thread = self._thread_factory(
             target=self._run,
-            args=(token,),
             name=self._name,
             daemon=True,
         )
         self._thread = thread
         thread.start()
 
-    def _run(self, token):
+    def _run(self):
         value = None
         error = None
         try:
@@ -251,14 +224,6 @@ class RefreshPump:
             error = exc
 
         with self._lock:
-            # This check MUST run before any of _latest/_generation/_last_error
-            # are published, and before _next_due/_pending are touched. A
-            # worker declared stalled and superseded by a new one must not be
-            # allowed to publish a result after the fact: that result is
-            # necessarily staler than whatever the new worker already
-            # published, so honoring it would make the display regress.
-            if self._thread_token is not token:
-                return
             if error is None:
                 self._latest = value
                 self._generation += 1

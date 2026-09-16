@@ -138,6 +138,11 @@ class SharedControllerTest(unittest.TestCase):
 import json, os, sys
 session = sys.argv[sys.argv.index('--session') + 1] if '--session' in sys.argv else 'ses_actual'
 prompt = sys.stdin.read()
+with open(sys.argv[sys.argv.index('--fixture-state') + 1]) as s:
+ state = json.load(s)
+ assert state['phase'] == 'running-turn', state
+ if '--session' in sys.argv:
+  assert state['outbox']['attempt_ids'] and not state['outbox'].get('consumed_attempt_ids'), state
 with open(os.environ['FAKE_TRACE'], 'a') as f:
  f.write(json.dumps({'event':'native-turn', 'session':session, 'resume':'--session' in sys.argv, 'prompt':prompt}) + '\\n')
 text = 'artifact: -\\nverdict: PASS\\nblocker: none' if '--session' in sys.argv else 'artifact: -\\nverdict: BLOCKED\\nblocker: registered child running; report follows on wake'
@@ -147,7 +152,7 @@ for kind, part in [('step_start',{}), ('text',{'text':text}), ('step_finish',{'r
         f.jobs.write_text(fixture.owner_row(f.lease).replace('harness=claude', 'harness=opencode')
                           + fixture.child_row())
         command = f.command() + ['--runtime-harness','opencode', '--opencode-command',
-                                  shlex.join([sys.executable, str(native)])]
+                                  shlex.join([sys.executable, str(native), '--fixture-state', str(f.state)])]
         result = subprocess.run(command, input='initial', text=True, capture_output=True,
                                 env=f.child_env(FAKE_TRACE=str(f.trace)), timeout=15)
         self.assertEqual(result.returncode, 0, result.stdout+result.stderr)

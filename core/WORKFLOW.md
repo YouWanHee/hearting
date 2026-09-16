@@ -169,12 +169,14 @@ shape and explicit choices determine the route; defaults only fill omissions:
 
 | Shape | When | Route |
 |---|---|---|
-| `direct` | one atomic, reversible change the session makes and checks inline | `capability-route.py compose --slug <slug>` — the inline node, dispatch depth 0 |
+| `direct` | one atomic, reversible change the session makes and checks inline | `capability-route.py compose --campaign-key <stream> --slug <slug>` — the inline node, dispatch depth 0 |
 | `solo` | one bounded piece of work that deserves its own registered session but no separate stages | `compose --shape solo` — one registered dispatch-depth-1 owner, no dispatch depth 2 |
 | `staged` | work with separate stages | `compose --shape staged` uses the capability's standard recipe; optional `--graph <stage,…>` selects a subgraph |
 
-For execution, use `compose --start --prompt-file <task>` with the selected
-shape/graph; `--profile light` or `--owner <harness>` is an explicit choice.
+For execution, use `compose --campaign-key <stream> --start --prompt-file
+<task>` with the selected shape/graph (the campaign choice is required:
+an existing or new stream key, `--parent-cycle`, or an explicit
+`--unassigned`; the refusal lists the root's active keys); `--profile light` or `--owner <harness>` is an explicit choice.
 The task file contains the requested work, not instructions for running the
 parent. The runtime seals it, prepares its cycle, starts the frame pair when
 declared, and returns one receipt. Reuse that receipt's `resume_command` after

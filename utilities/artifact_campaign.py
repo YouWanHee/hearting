@@ -34,6 +34,38 @@ class CampaignError(Exception):
         super().__init__(code + (": " + self.detail if self.detail else ""))
 
 
+# One definition of campaign membership for producer cycle records.
+# `artifact_producer._remove_empty_cycle` drops an output-less cycle from
+# `campaign.cycles` but keeps its record (state `abandoned` or `no-lineage`)
+# so the sealed abandon reason stays auditable.  Such a record is detached,
+# not a member: counting it against `campaign.cycles` reported a permanent
+# `campaign-membership-drift` (TF-Rehancer root, 2026-09-15, three abandoned
+# records with no directory).  Writer and verifier both read this set.
+DETACHED_STATES = frozenset({"abandoned", "no-lineage"})
+
+
+def is_member_record(record):
+    return isinstance(record, dict) and record.get("state") not in DETACHED_STATES
+
+
+def campaign_records(root, campaign_id):
+    """Split this campaign's producer records into (members, detached)."""
+    records = Path(root) / ".runtime/artifact-producer/v1/cycles"
+    members, detached = [], []
+    for entry in sorted(records.glob("*.json")):
+        record, _ = read_json(root, entry)
+        if record.get("campaign_id") != campaign_id:
+            continue
+        (members if is_member_record(record) else detached).append(record)
+    return members, detached
+
+
+def detached_rows(detached):
+    return [{"cycle_id": record.get("cycle_id"), "state": record.get("state"),
+             "abandon_reason": record.get("abandon_reason"), "sealed_on": record.get("sealed_on"),
+             "locator": record.get("locator")} for record in detached]
+
+
 def canonical(value):
     return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()
 
@@ -165,11 +197,40 @@ def check_campaign_write(root, path, proposed):
             raise CampaignError("campaign-terminal-write-conflict", path)
 
 
+def _validate_runlog(root, path, campaign, ids):
+    value = campaign.get("runlog")
+    if value is None:
+        return
+    keys = {"contract", "path", "sha256", "source_cycle_id", "source_locator"}
+    if not isinstance(value, dict) or set(value) != keys:
+        raise CampaignError("campaign-runlog-invalid", "shape")
+    source_cycle_id = value.get("source_cycle_id")
+    if (value.get("contract") != "campaign-runlog/v1" or value.get("path") != "RUNLOG.md"
+            or value.get("source_locator") != "experiments/_RUNLOG.md"
+            or not identity.is_well_formed(source_cycle_id, "cycle")
+            or source_cycle_id in ids
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(value.get("sha256")))):
+        raise CampaignError("campaign-runlog-invalid", "contract")
+    runlog = _safe(path.parent, path.parent / "RUNLOG.md")
+    try:
+        fd = os.open(runlog, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode):
+                raise CampaignError("campaign-runlog-invalid", "kind")
+            actual = "sha256:" + hashlib.sha256(stream.read()).hexdigest()
+    except OSError as exc:
+        raise CampaignError("campaign-runlog-missing", runlog) from exc
+    if actual != value["sha256"]:
+        raise CampaignError("campaign-runlog-digest-mismatch", runlog)
+
+
 def _cycle_rows(root, path, campaign):
     ids = campaign.get("cycles")
     if (not isinstance(ids, list) or not ids or not all(isinstance(cid, str) for cid in ids)
             or len(set(ids)) != len(ids)):
         raise CampaignError("campaign-membership-invalid")
+    _validate_runlog(root, path, campaign, ids)
     records = root / ".runtime/artifact-producer/v1/cycles"
     root_id = lifecycle.read_root_identity(root)
     if root_id is None:
@@ -178,11 +239,9 @@ def _cycle_rows(root, path, campaign):
     if index.artifact_root_id != root_id.artifact_root_id:
         raise CampaignError("campaign-index-root-mismatch")
     # A campaign list alone cannot hide an open member or an unregistered tree.
-    members = set()
-    for entry in records.glob("*.json"):
-        record, _ = read_json(root, entry)
-        if record.get("campaign_id") == campaign["campaign_id"]:
-            members.add(record.get("cycle_id"))
+    # Detached records (see `is_member_record`) are reported, never counted.
+    member_records, detached = campaign_records(root, campaign["campaign_id"])
+    members = {record.get("cycle_id") for record in member_records}
     if members != set(ids):
         raise CampaignError("campaign-membership-drift")
     directories = {}
@@ -288,9 +347,11 @@ def status(root, selection):
                 "recovery_command": ["python3", str(Path(__file__).with_name("artifact_producer.py")),
                                      "campaign-recover", "--artifact-root", str(root), "--campaign", str(path)]}
     snapshot = _snapshot(root, path)
+    _members, detached = campaign_records(root, raw["campaign_id"])
     return {"status": "awaiting-user-acceptance", "campaign_id": raw["campaign_id"],
             "goal": raw["goal"], "completion_criterion": raw["completion_criterion"],
-            "cycles": snapshot["cycles"], "snapshot_digest": digest(snapshot),
+            "cycles": snapshot["cycles"], "detached_cycles": detached_rows(detached),
+            "snapshot_digest": digest(snapshot),
             "approval_statement": approval_text(raw["campaign_id"], digest(snapshot)),
             "instruction": "After reviewing the goal, criterion and cycle outcomes, the USER may send this exact statement in their native session. The agent must not submit it."}
 

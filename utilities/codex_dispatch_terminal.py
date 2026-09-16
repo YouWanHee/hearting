@@ -47,12 +47,14 @@ _SANDBOX_INIT_RE = re.compile(
     r"[^\n]*Unable to mount source on destination: No such file or directory",
     re.I,
 )
-# The only row the codex app-server supervisor can physically emit between a
+# Telemetry the codex app-server supervisor can physically emit between a
 # turn's final `agent_message` and that turn's `turn.completed`. Producer:
 # `utilities/codex-app-server-supervisor.py` `run_turn`, the
 # `thread/tokenUsage/updated` branch -- it emits after the `item/completed`
 # that set `final_text`, so a valid handoff sits two rows before the terminal
-# instead of one. Every other `dispatch.supervisor.*` emit on that path
+# instead of one. The checked `dispatch.supervisor.turn.completed` boundary
+# can now occur there too; the walkback below validates its completed status
+# and runtime identity. Other `dispatch.supervisor.*` emits on that path
 # (`owner-boundary`, `launch-settled`, `parked`, `reparked`, `resumed`,
 # `redelivery-suppressed`, `reconciled`, `join-observed`) is followed by a
 # `continue` that starts a new turn, and `delivery-timing` is emitted after
@@ -151,6 +153,14 @@ def _codex_final_agent_message(
 
     for index in range(terminal_index - 1, -1, -1):
         row = rows[index]
+        if row.get("type") == "dispatch.supervisor.turn.completed":
+            # The runtime boundary is distinct from the owner's terminal
+            # envelope. Failed/malformed boundaries cannot bridge a handoff.
+            if (row.get("status") == "completed"
+                    and isinstance(row.get("thread_id"), str) and row["thread_id"]
+                    and isinstance(row.get("turn_id"), str) and row["turn_id"]):
+                continue
+            return None
         if row.get("type") in _TERMINAL_TELEMETRY_TYPES:
             continue
         if row.get("type") != "item.completed":

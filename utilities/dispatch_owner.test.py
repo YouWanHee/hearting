@@ -350,6 +350,36 @@ class DispatchOwnerTests(unittest.TestCase):
         self.assert_model_map(result, "codex")
         self.assertIn("quality_band=explicit", result.stdout)
 
+    def test_explicit_target_receipt_warns_on_exhausted_or_unknown_headroom(self):
+        # 2026-09-16: an explicit codex owner died on its first turn (backend
+        # 503) behind `capacity_headroom.codex=unknown`; the explicit choice still
+        # wins, but the receipt must say the gauge could not vouch for it.
+        exhausted = self.run_owner(
+            "claude", ("--adapter", "codex"),
+            config=self.balanced_quality_config(),
+            model_profile="deep",
+            env_extra={"HARNESS_CAPACITY_SCORES": "claude:50,codex:0,opencode:80"},
+        )
+        self.assert_model_map(exhausted, "codex")
+        self.assertIn("capacity_warning.codex=headroom-exhausted", exhausted.stdout)
+        self.assertIn("capacity_source.codex=manual", exhausted.stdout)
+        unknown = self.run_owner(
+            "claude", ("--adapter", "codex"),
+            config=self.balanced_quality_config(),
+            model_profile="deep",
+            env_extra={"HARNESS_CAPACITY_SCORES": "claude:50,opencode:80"},
+        )
+        self.assert_model_map(unknown, "codex")
+        self.assertIn("capacity_warning.codex=headroom-unknown", unknown.stdout)
+        healthy = self.run_owner(
+            "claude", ("--adapter", "codex"),
+            config=self.balanced_quality_config(),
+            model_profile="deep",
+            env_extra={"HARNESS_CAPACITY_SCORES": "claude:50,codex:60,opencode:80"},
+        )
+        self.assert_model_map(healthy, "codex")
+        self.assertNotIn("capacity_warning.", healthy.stdout)
+
     def test_balanced_owner_uses_global_headroom_when_all_candidates_are_gated(self):
         result = self.run_owner(
             config=self.balanced_quality_config(),

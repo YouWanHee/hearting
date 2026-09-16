@@ -39,7 +39,7 @@ import time
 from .model import (fmt_min, dash, project_of, exec_child_is_wait,
                     session_parent_visible)
 from . import gitinfo
-from .refresh import LiveSnapshot, RefreshPump, MAX_LEAKED_WORKERS
+from .refresh import LiveSnapshot, RefreshPump
 from .session_handle import display_name as _display_name
 from .session_handle import _cell_width as _session_handle_cell_width
 from .session_handle import clip_cells as _clip_cells
@@ -1706,15 +1706,19 @@ _collapse_replica_nodes = _collapse_parallel_nodes
 
 
 def _projection_route_seq(entity):
-    """Return the attached route's record-order node sequence, if validated."""
+    """Return assigned work in sealed order; the route overview is separate."""
     projection = getattr(entity, "work_projection", None)
     if not projection or getattr(projection, "source", None) != "route-exact":
         return None
     backing = getattr(projection, "_route_view", None) or {}
     view = backing.get("view") or {}
     from . import route
+    nodes = view.get("nodes") or ()
+    scope = getattr(projection, "scope_node_ids", None)
+    if scope is not None:
+        nodes = [node for node in nodes if node.get("id") in scope]
     return [(route.node_display_label(node), node.get("state"))
-            for node in _collapse_parallel_nodes(view.get("nodes") or ())]
+            for node in _collapse_parallel_nodes(nodes)]
 
 
 _LEGACY_STAGE_COLOR_INDEX = {
@@ -3260,25 +3264,8 @@ def _mem_repo_rows(events, sid_titles, limit=_MEM_REPO_ROW_LIMIT):
 
 
 def _unique_managed_parents(sessions):
-    """{normalized managed_dir: visible Codex TUI Session}, exact-one only."""
-    found = {}
-    ambiguous = set()
-    for session in sessions:
-        managed_dir = getattr(session, "managed_dir", None)
-        if (
-            getattr(session, "harness", None) != "codex"
-            or getattr(session, "app_server", False)
-            or not managed_dir
-        ):
-            continue
-        key = os.path.normpath(managed_dir)
-        if key in found:
-            ambiguous.add(key)
-        else:
-            found[key] = session
-    for key in ambiguous:
-        found.pop(key, None)
-    return found
+    from .model import unique_managed_parents
+    return unique_managed_parents(sessions)
 
 
 def _group_key_job(j, session_groups=None, job_groups=None, managed_session_groups=None):
@@ -3287,6 +3274,9 @@ def _group_key_job(j, session_groups=None, job_groups=None, managed_session_grou
     managed_session_groups = managed_session_groups or {}
     if getattr(j, "parent_slug", None) and j.parent_slug in job_groups:
         return job_groups[j.parent_slug]
+    edge_sid = getattr(j, "_parent_edge_sid", None)
+    if edge_sid in session_groups:
+        return session_groups[edge_sid]
     if getattr(j, "parent_sid", None) and j.parent_sid in session_groups:
         return session_groups[j.parent_sid]
     parent_managed_dir = getattr(j, "parent_managed_dir", None)
@@ -4239,11 +4229,7 @@ def _refresh_health_segments(narrow=False):
     segs = [(" · ", "dim"), ("refreshed " + _refresh_age_label(health.get("age")), "dim")]
     state = health.get("state")
     if state == "stalled":
-        text = " · stalled"
-        leaked = health.get("leaked_workers") or 0
-        if leaked >= MAX_LEAKED_WORKERS:
-            text += " (%d workers stuck)" % leaked
-        segs.append((text, "lvl_y"))
+        segs.append((" · collection delayed", "lvl_y"))
     elif state == "failed":
         error = health.get("last_error") or ""
         limit = 20 if narrow else 40
@@ -5621,6 +5607,12 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
     """
     global _SELECTABLE
     _SELECTABLE = []     # reset before any early return — a stale target map must never survive
+    # Direct managed-row callers use the same parent decision as collect_all.
+    # Existing collector verdicts (including grace) never advance a second tick.
+    from .collectors import resolve_parent_edges
+    resolve_parent_edges(sessions, [j for j in jobs
+                                   if getattr(j, "parent_managed_dir", None)
+                                   and not hasattr(j, "_parent_edge_promoted_orphan")])
     # Direct hermetic callers from pre-v16 tests may construct rows without running the
     # collector boundary.  Use the same shared resolver as the snapshot path; never call
     # live_stage() or a renderer-specific route resolver. Terminal node evidence is the
@@ -5688,7 +5680,8 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
             "unit_catalog_digest": _record.get("unit_catalog_digest"),
             "composed": bool(_record.get("composed")),
             "effective_intensity": _record.get("effective_intensity"),
-            "progress": _projection.progress.to_dict() if _projection.progress else None,
+            "progress": (_backing.get("view") or {}).get("progress",
+                _projection.progress.to_dict() if _projection.progress else None),
             "nodes": _nodes, "key": _projection.route_id,
         })
     display_jobs = _current_attempt_jobs(jobs)
@@ -5920,7 +5913,6 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
         # their capability-owner job via parent_slug. This keeps main-session context light
         # while fleet still shows cross-harness orchestration shape.
         children = {}      # session_id -> [jobs] (nested under an on-screen parent)
-        managed_children = {}  # id(Session) -> [jobs], exact unique managed-dir recovery
         job_children = {}  # parent dispatch slug -> [dispatch-depth-2 jobs]
         orphans = []       # project-level fallback (parent dead/off-screen/no-env)
         loops_jobs = []    # no-parent-is-normal (cron loops) — no orphan marker
@@ -5939,7 +5931,6 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
         # (user 2026-07-24: drill runs "orphan으로 잡히고 메인 세션은 연결도 안되고" — noise, since the
         # fixture decouples on purpose). Non-drill groups keep the exact prior classification.
         is_drill_case = str(name).startswith("drill:")
-        shown_managed_parents = _unique_managed_parents(shown)
         for j in group_jobs:
             if getattr(j, "parent_slug", None) and getattr(j, "depth", 1) >= 2:
                 if j.parent_slug in visible_parent_slugs:
@@ -5995,20 +5986,6 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
             elif j.is_child and j.parent_sid and j.parent_sid in shown_sids:
                 # No ledger verdict reached this row — fall back to the pre-ledger check.
                 children.setdefault(j.parent_sid, []).append(j)
-            elif (
-                j.is_child
-                and getattr(j, "source", None) != "plugin-queue"
-                and getattr(j, "parent_managed_dir", None)
-            ):
-                managed_parent = shown_managed_parents.get(
-                    os.path.normpath(j.parent_managed_dir)
-                )
-                if managed_parent is not None:
-                    managed_children.setdefault(id(managed_parent), []).append(j)
-                elif j.key in _LOOPS_KEYS or is_drill_case:
-                    loops_jobs.append(j)
-                else:
-                    orphans.append(j)
             elif getattr(j, "source", None) == "plugin-queue":
                 # F-50c: a plugin-queue job nests ONLY on an exact `sessionId` ==
                 # `Session.session_id` match (the branch above). Its `parent_cwd` is the
@@ -6305,7 +6282,7 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
                 _seen_glyphs.add("mem")
                 continue
             kids = _sort_group_jobs(
-                children.get(s.session_id, []) + managed_children.get(id(s), [])
+                children.get(s.session_id, [])
             )
             if s.session_id in rendered_parent_sids:
                 kids = []

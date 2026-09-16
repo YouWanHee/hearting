@@ -1109,7 +1109,7 @@ def _write_supervisor_state_unlocked(
         or not _safe_identity(parent_attempt_id)
         or phase not in STATE_PHASES
         or any(not _safe_identity(attempt) for attempt in delivered_attempt_ids)
-        or (outbox is not None and phase not in {"deliverable", "recovery"})
+        or (outbox is not None and phase not in {"deliverable", "recovery", "running-turn"})
     ):
         raise JoinContractError("supervisor-state-contract-invalid")
     value = {
@@ -1254,6 +1254,38 @@ def re_fullmatch_digest(value: object) -> bool:
     )
 
 
+def begin_supervisor_turn(
+    path: Path | None,
+    parent_attempt_id: str,
+    delivered_attempt_ids: set[str],
+    *,
+    receipt_id: str | None = None,
+) -> None:
+    """Publish execution without acknowledging or overwriting pending delivery.
+
+    A receiving turn may run for minutes. Its outbox must survive a crash until
+    the runtime acknowledges that exact receipt after the turn returns. Read
+    under the state lock so concurrent partial consumption is never undone.
+    """
+    if path is None:
+        return
+    with _supervisor_state_lock(path):
+        state = read_supervisor_phase_state(path, parent_attempt_id)
+        if state is None and path.exists():
+            raise JoinContractError("supervisor-state-contract-invalid")
+        outbox = state.outbox if state is not None else None
+        if outbox is not None and outbox.receipt_id != receipt_id:
+            raise JoinContractError("supervisor-outbox-receipt-mismatch")
+        if state is None and receipt_id is not None:
+            raise JoinContractError("supervisor-outbox-missing")
+        delivered = set(delivered_attempt_ids)
+        if state is not None:
+            delivered.update(state.delivered_attempt_ids)
+        _write_supervisor_state_unlocked(
+            path, parent_attempt_id, delivered, phase="running-turn", outbox=outbox,
+        )
+
+
 def read_supervisor_phase_state(
     path: Path | None,
     parent_attempt_id: str,
@@ -1289,6 +1321,7 @@ def read_supervisor_phase_state(
         if not isinstance(outbox_value, dict) or value.get("phase") not in {
             "deliverable",
             "recovery",
+            "running-turn",
         }:
             return None
         receipt_id = outbox_value.get("receipt_id")

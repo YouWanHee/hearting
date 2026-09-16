@@ -201,6 +201,10 @@ class StatuslineTapInjectionTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.agent_home = os.path.join(self._tmp.name, "home")
         os.makedirs(self.agent_home)
+        # The tap lives in the Claude config home (what tools/fleet reads), never
+        # under AGENT_HOME: a managed release tree written to goes cache-stale.
+        self.config_home = os.path.join(self._tmp.name, "claude-config")
+        os.makedirs(self.config_home)
         # Stub `claude`: a script whose comm is "claude"; it runs statusline.sh as a child
         # so the ancestor walk finds it (statusline PPID → bash stub, comm == "claude").
         self.stub = os.path.join(self._tmp.name, "claude")
@@ -218,16 +222,30 @@ class StatuslineTapInjectionTest(unittest.TestCase):
     def _run(self, stdin_json):
         env = dict(os.environ)
         env["AGENT_HOME"] = self.agent_home
+        env["CLAUDE_CONFIG_DIR"] = self.config_home
         env["FLEET_TITLE_DISABLE"] = "1"           # keep the refresher out of the test
+        env["HARNESS_CAPACITY_REFRESH_DISABLE"] = "1"   # and the capacity gauge probe (network + live cache)
         proc = subprocess.Popen([self.stub, _STATUSLINE], stdin=subprocess.PIPE,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
         out, err = proc.communicate(stdin_json.encode("utf-8"), timeout=30)
         return proc, out, err
 
     def _tap(self, sid):
-        with open(os.path.join(self.agent_home, ".statusline", sid + ".json"),
+        with open(os.path.join(self.config_home, ".statusline", sid + ".json"),
                   encoding="utf-8") as f:
             return f.read()
+
+    def test_tap_never_lands_under_agent_home(self):
+        # 2026-09-16: a session launched with AGENT_HOME=<managed release tree>
+        # wrote .statusline* there, drifting the release digest so all three
+        # runtimes reported freshness=cache-stale. State goes to the config home.
+        stdin_json = json.dumps({"session_id": "sidH", "cwd": "/tmp",
+                                 "model": {"display_name": "M"}})
+        self._run(stdin_json)
+        self.assertTrue(os.path.isfile(os.path.join(self.config_home, ".statusline", "sidH.json")))
+        self.assertTrue(os.path.isfile(os.path.join(self.config_home, ".statusline-last.json")))
+        for name in (".statusline", ".statusline-last.json", ".statusline-last-out.txt"):
+            self.assertFalse(os.path.lexists(os.path.join(self.agent_home, name)), name)
 
     def test_tap_gains_pid_and_proc_start(self):
         stdin_json = json.dumps({"session_id": "sidZ", "cwd": "/tmp",

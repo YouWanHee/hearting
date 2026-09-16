@@ -55,6 +55,7 @@ class _ConfigHomeMixin:
         )}
         os.environ["AGENT_HOME"] = _REPO_ROOT
         os.environ["CLAUDE_CONFIG_DIR"] = os.path.join(self._tmp.name, "claude")
+        os.environ["HARNESS_CAPACITY_REFRESH_DISABLE"] = "1"
         os.environ["CODEX_HOME"] = os.path.join(self._tmp.name, "codex")
         os.environ["XDG_CONFIG_HOME"] = os.path.join(self._tmp.name, "config")
         os.environ["FLEET_TITLE_STATE_DIR"] = os.path.join(self._tmp.name, "state")

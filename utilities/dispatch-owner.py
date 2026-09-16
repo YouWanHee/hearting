@@ -584,7 +584,7 @@ def _canonical_jobs():
 def _audit(
     status, adapter, source, configured, explicit, states, *, allocation=None,
     counts=None, rejected=(), fallback=None, reason="none", capacity=None,
-    quality_band=None, relief_promoted=False,
+    quality_band=None, relief_promoted=False, capacity_sources=None,
 ):
     lines = [
         f"status={status}", f"adapter={adapter or '-'}", f"selection_source={source}",
@@ -610,8 +610,20 @@ def _audit(
                 f"capacity_headroom.{harness}="
                 + ("unknown" if value is None else str(round(value, 1)))
             )
+            if capacity_sources and capacity_sources.get(harness):
+                # live | cache:<age>s;live=<reason> | rollout;live=<reason> |
+                # taps | manual | active-limit | unknown:<reason> — says why an
+                # unknown gauge is unknown and how old a reused reading is.
+                lines.append(f"capacity_source.{harness}={capacity_sources[harness]}")
     if quality_band:
         lines.append(f"quality_band={quality_band}")
+    warning = _explicit_capacity_warning(source, adapter, capacity, allocation)
+    if warning:
+        # Explicit targets bypass the capacity cascade by design (the user
+        # manages quota); the receipt still says when the gauge could not see
+        # the harness or saw it exhausted (2026-09-16: codex 503 on first turn
+        # behind capacity_headroom.codex=unknown).
+        lines.append(f"capacity_warning.{adapter}={warning}")
     lines.append(f"relief_promoted={int(relief_promoted)}")
     for n, item in enumerate(rejected, 1):
         lines.append(f"rejected.{n}={item}:usage-{states[item]}")
@@ -624,6 +636,21 @@ def _audit(
         f"trace.4=configured={','.join(configured)};selected={adapter or '-'};source={source};deviation_reason={reason}",
     ]
     return lines
+
+
+def _explicit_capacity_warning(source, adapter, capacity, allocation):
+    """Typed headroom caveat for an explicit owner choice; never a gate."""
+    if source != "explicit" or not adapter or capacity is None:
+        return None
+    value = capacity.get(adapter)
+    if value is None:
+        return "headroom-unknown"
+    if value <= 0:
+        return "headroom-exhausted"
+    gate = 100 - float((allocation or {}).get("usage_gate_used_percent", 90))
+    if value < gate:
+        return f"headroom-below-gate:{round(value, 1)}<{round(gate, 1)}"
+    return None
 
 
 def _error(reason, configured=(), explicit=None, states=None):
@@ -699,7 +726,9 @@ def main(argv):
             )
 
         rejected = [h for h in sorted(states) if not _eligible(states[h])]
-        capacity = _capacity.capacity_scores()
+        capacity_report = _capacity.capacity_report()
+        capacity = capacity_report["scores"]
+        capacity_sources = capacity_report["sources"]
 
         def automatically_available(harness):
             score = capacity.get(harness)
@@ -782,7 +811,7 @@ def main(argv):
                                       allocation=allocation, counts=counts,
                                       rejected=rejected if source != "explicit" else (),
                                       fallback=selected if source == "eligibility-fallback" else None,
-                                      reason=reason, capacity=capacity,
+                                      reason=reason, capacity=capacity, capacity_sources=capacity_sources,
                                       quality_band=quality_band,
                                       relief_promoted=relief_promoted)))
             print("check=failed\nreason=wrapper-unavailable\nchild_spawned=0")
@@ -791,7 +820,7 @@ def main(argv):
                                   allocation=allocation, counts=counts,
                                   rejected=rejected if source != "explicit" else (),
                                   fallback=selected if source == "eligibility-fallback" else None,
-                                  reason=reason, capacity=capacity,
+                                  reason=reason, capacity=capacity, capacity_sources=capacity_sources,
                                   quality_band=quality_band,
                                   relief_promoted=relief_promoted)), flush=True)
         print(f"route_defaults={','.join(derived) or 'none'}", flush=True)

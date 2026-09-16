@@ -10,8 +10,8 @@ TOOLS = Path(__file__).resolve().parents[2]
 if str(TOOLS) not in sys.path:
     sys.path.insert(0, str(TOOLS))
 
-from fleet import fleet, render  # noqa: E402
-from fleet.collectors import dispatch  # noqa: E402
+from fleet import fleet, render, model  # noqa: E402
+from fleet.collectors import dispatch, resolve_parent_edges  # noqa: E402
 from fleet.model import DispatchJob, Session  # noqa: E402
 
 
@@ -23,7 +23,11 @@ def flatten(lines):
 
 
 class ManagedDispatchParentTest(unittest.TestCase):
+    def setUp(self):
+        model.reset_parent_edge_tracker()
+
     def tearDown(self):
+        model.reset_parent_edge_tracker()
         render.set_show_all(False)
 
     def session(self, sid="stale-visible-thread", pid=10, managed_dir=MANAGED):
@@ -53,6 +57,64 @@ class ManagedDispatchParentTest(unittest.TestCase):
         self.assertIn("managed-owner", text)
         self.assertNotIn("orphaned dispatch rows", text)
         self.assertNotIn("(orphan)", text)
+
+    def test_collector_hidden_current_thread_attaches_to_original_tui(self):
+        for reverse in (False, True):
+            with self.subTest(reverse=reverse):
+                model.reset_parent_edge_tracker()
+                tui = self.session()
+                job = self.job()
+                server = self.session(sid=job.parent_sid, pid=11)
+                server.app_server = True
+                server._managed_client_present = True
+                sessions = [server, tui] if reverse else [tui, server]
+                resolve_parent_edges(sessions, [job])
+                self.assertEqual(job._parent_edge_sid, tui.session_id)
+                self.assertFalse(job._parent_edge_promoted_orphan)
+                self.assertEqual(job.parent_sid, "current-thread-not-on-tui-row")
+                text = self.rendered(sessions, job)
+                self.assertIn("managed-owner", text)
+                self.assertNotIn("(orphan)", text)
+                self.assertNotIn("orphaned dispatch rows", text)
+
+    def test_same_thread_client_wins_over_hidden_server_in_either_order(self):
+        for reverse in (False, True):
+            job = self.job()
+            tui = self.session(sid=job.parent_sid)
+            server = self.session(sid=job.parent_sid, pid=11)
+            server.app_server = True
+            server._managed_client_present = True
+            sessions = [server, tui] if reverse else [tui, server]
+            resolve_parent_edges(sessions, [job])
+            self.assertEqual(job._parent_edge_sid, tui.session_id)
+            self.assertFalse(job._parent_edge_promoted_orphan)
+
+    def test_managed_edge_grace_keeps_original_authority_and_visible_identity(self):
+        tui, job = self.session(), self.job()
+        resolve_parent_edges([tui], [job])
+        for _ in range(3):
+            resolve_parent_edges([], [job])
+            self.assertEqual(job._parent_edge_sid, tui.session_id)
+        resolve_parent_edges([], [job])
+        self.assertTrue(job._parent_edge_promoted_orphan)
+
+    def test_dead_exact_parent_is_not_replaced_by_other_live_thread(self):
+        job = self.job()
+        dead = self.session(sid=job.parent_sid, pid=11)
+        dead.liveness = "dead"
+        resolve_parent_edges([dead, self.session()], [job])
+        self.assertTrue(job._parent_edge_promoted_orphan)
+
+    def test_child_or_unknown_identity_cannot_become_managed_parent(self):
+        for kind in ("child", "sidless"):
+            with self.subTest(kind=kind):
+                tui, job = self.session(), self.job()
+                if kind == "child":
+                    tui.is_child = True
+                else:
+                    tui.session_id = None
+                resolve_parent_edges([tui], [job])
+                self.assertTrue(job._parent_edge_promoted_orphan)
 
     def test_mismatched_or_ambiguous_managed_dir_stays_orphan(self):
         mismatch = self.rendered(

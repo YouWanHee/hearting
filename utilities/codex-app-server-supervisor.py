@@ -44,6 +44,7 @@ from dispatch_completion_join import (
     unstarted_child_attempts,
     validate_delivery_timing,
     write_supervisor_state,
+    begin_supervisor_turn,
 )
 from dispatch_contract import (
     DispatchContractError,
@@ -661,7 +662,7 @@ def run_turn(
     control = getattr(args, "owner_input", None)
     if control is not None:
         control.started(turn_id)
-    emit({"type": "dispatch.supervisor.turn.started", "turn_id": turn_id})
+    emit({"type": "dispatch.supervisor.turn.started", "thread_id": thread_id, "turn_id": turn_id})
     final_text: str | None = None
     final_item: dict[str, Any] | None = None
     while True:
@@ -672,7 +673,8 @@ def run_turn(
         raw_params = event.get("params")
         event_params = raw_params if isinstance(raw_params, dict) else {}
         if (method == "thread/tokenUsage/updated"
-                and event_params.get("threadId") == thread_id):
+                and event_params.get("threadId") == thread_id
+                and event_params.get("turnId") == turn_id):
             usage = normalize_token_usage(event_params.get("tokenUsage"))
             if usage is not None:
                 emit({
@@ -699,7 +701,9 @@ def run_turn(
             and isinstance(completed, dict)
             and completed.get("id") == turn_id
         ):
-            if not isinstance(completed, dict) or completed.get("status") != "completed":
+            emit({"type": "dispatch.supervisor.turn.completed", "thread_id": thread_id,
+                  "turn_id": turn_id, "status": completed.get("status")})
+            if completed.get("status") != "completed":
                 raise SupervisorError("app-server-turn-failed")
             if control is not None:
                 control.completed(turn_id)
@@ -1009,10 +1013,10 @@ def main(argv: list[str] | None = None) -> int:
                     resumed_receipt, active_outbox, jobs=args.jobs,
                     notice=pending_notice,
                 )
-            if active_outbox is None:
-                write_supervisor_state(
-                    state_path, args.parent_attempt_id, delivered, phase="running-turn"
-                )
+            begin_supervisor_turn(
+                state_path, args.parent_attempt_id, delivered,
+                receipt_id=active_outbox.receipt_id if active_outbox is not None else None,
+            )
             next_prompt = control.prepare(next_prompt)
             final_text, _final_item = run_turn(
                 server, thread_id=thread_id, prompt=next_prompt, args=args

@@ -31,8 +31,6 @@ from dispatch_completion_join import (  # noqa: E402
     parent_session_state_path,
     required_action_for_attempt,
     route_completion_evidence,
-    consume_supervisor_outbox_attempts,
-    read_supervisor_phase_state,
 )
 _route_spec = importlib.util.spec_from_file_location(
     "capability_route", ROOT / "utilities" / "capability-route.py"
@@ -203,44 +201,6 @@ def default_runtime_jobs(environ: dict[str, str] | os._Environ[str]) -> Path:
     return codex_home.expanduser() / ".harness" / "dispatch" / "jobs.log"
 
 
-def consume_supervised_harvest(
-    args: argparse.Namespace,
-    *,
-    matched: int,
-    marked_done: int,
-) -> bool:
-    """Acknowledge one outbox action only after its harvest succeeded."""
-
-    state_file = os.environ.get("AGENT_DISPATCH_COMPLETION_STATE_FILE", "")
-    parent_attempt = os.environ.get("AGENT_DISPATCH_ATTEMPT_ID", "")
-    if not state_file or not parent_attempt or not args.attempt_id:
-        return True
-    state = read_supervisor_phase_state(Path(state_file), parent_attempt)
-    if (
-        state is None
-        or state.outbox is None
-        or args.attempt_id not in state.outbox.attempt_ids
-        or args.attempt_id in state.outbox.consumed_attempt_ids
-    ):
-        return True
-    # Upstream dropped `--failure-detail` from the command `completion_prompt`
-    # emits for `inspect-done-failure`; that action now arrives as a bare
-    # `--status done` inspection. Treat any non-`--mark-done` harvest that
-    # matched its exact attempt as the acknowledged inspection, and keep the
-    # explicit flag for legacy command strings that still carry it.
-    succeeded = (args.mark_done and marked_done == 1) or (
-        not args.mark_done and matched == 1
-    )
-    if not succeeded:
-        return False
-    try:
-        return consume_supervisor_outbox_attempts(
-            Path(state_file), parent_attempt, {args.attempt_id}
-        )
-    except JoinContractError:
-        return False
-
-
 def main(argv: list[str]) -> int:
     args = parser().parse_args(argv[1:])
     if args.mark_done and not (args.slug or args.attempt_id or args.worktree):
@@ -355,13 +315,6 @@ def main(argv: list[str]) -> int:
                 if home.exists():
                     shutil.rmtree(home, ignore_errors=True)
 
-
-    if not consume_supervised_harvest(
-        args, matched=len(rows), marked_done=marked_done
-    ):
-        print("check=failed")
-        print("reason=supervisor-outbox-consume-failed")
-        return 70
 
     emit_header(args, jobs, len(rows), marked_done, malformed)
     for fields in rows:

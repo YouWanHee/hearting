@@ -6,8 +6,15 @@
 # context     = stdin 의 context_window.used_percentage (공식 값) — 부재 시 current_usage/context_window_size, 최후 fallback 만 id "1m" 추측.
 set -euo pipefail
 AGENT_HOME="${AGENT_HOME:-${CLAUDE_HOME:-$HOME/.claude}}"
+# 상태 파일(.statusline-last*.json, .statusline/<sid>.json)은 Claude Code 설정 홈에 쓴다.
+# AGENT_HOME이 관리형 릴리즈 트리(~/.local/share/hearting/releases/vX)를 가리키는 세션에서
+# 여기에 쓰면 릴리즈 digest가 봉인값과 어긋나 세 런타임 projection이 cache-stale로 고정되고
+# (2026-09-16 실측), 읽는 쪽(tools/fleet/collectors, utilities/harness-capacity.py)은
+# CLAUDE_CONFIG_DIR/~/.claude만 보므로 tap도 유실된다. 도구 조회(session_handle.py,
+# refresh_title.py)만 AGENT_HOME을 쓴다.
+SL_STATE_HOME="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 input=$(cat)
-printf '%s' "$input" > "$AGENT_HOME/.statusline-last.json" 2>/dev/null || true  # 디버그·필드 탐사용 (최신 입력 1건)
+printf '%s' "$input" > "$SL_STATE_HOME/.statusline-last.json" 2>/dev/null || true  # 디버그·필드 탐사용 (최신 입력 1건)
 
 eval "$(printf '%s' "$input" | python3 -c '
 import sys, json, shlex
@@ -134,7 +141,7 @@ fi
 # last-writer-wins(모든 세션 덮어씀)이라 세션 구분 불가 → 세션별 파일이 필요. 우리 소유 파일 write
 # 라 zero-injection 원칙 위배 아님(§0.5). 기존 렌더·단일파일 무영향(순수 추가).
 if [ -n "$S_SID" ]; then
-  sldir="$AGENT_HOME/.statusline"
+  sldir="$SL_STATE_HOME/.statusline"
   mkdir -p "$sldir" 2>/dev/null || true
   # 소유 claude pid + /proc starttime 을 tap 에 additive 주입 (F-25 tier-2 식별 증거) —
   # sessions/<pid>.json registry 가 살아있는 세션에서 소실되면(2026-07-20 실측) fleet 이
@@ -155,6 +162,26 @@ if [ -n "$S_SID" ]; then
   fi
   # stale 청소: mtime > 1일 세션 파일 제거(디렉토리 폭증 방지 — 종료된 세션 잔존물). find 없으면 skip.
   find "$sldir" -maxdepth 1 \( -name '*.json' -o -name '.*.json.tmp' \) -mtime +1 -delete 2>/dev/null || true
+fi
+
+# 용량 계기판 간헐 갱신(2026-09-16): codex/opencode 사용량은 공유 캐시
+# (agent-fleet/usage/<h>.json)에 두고 dispatch·Fleet·이 틱이 같이 읽는다. 캐시 파일이
+# 10분 넘게 안 움직였을 때만 refresher를 분리 기동한다(성공은 갱신, 실패도 attempted_at을
+# 올려 mtime이 움직이므로 실패가 이어져도 10분에 한 번만 시도). Fleet이 열려 있으면
+# Fleet의 60초 갱신이 먼저 mtime을 움직여 이 경로는 자연히 쉰다. 즉시 반환 필수.
+cap_state="${FLEET_USAGE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/agent-fleet/usage}"
+cap_refresher="$AGENT_HOME/utilities/harness-capacity.py"
+if [ "${HARNESS_CAPACITY_REFRESH_DISABLE:-}" != "1" ] && [ -f "$cap_refresher" ] \
+   && command -v python3 >/dev/null 2>&1; then
+  cap_now=$(date +%s); cap_stale=0
+  for cap_h in codex opencode; do
+    cap_m=$(stat -c %Y "$cap_state/$cap_h.json" 2>/dev/null || echo 0)
+    case "$cap_m" in ''|*[!0-9]*) cap_m=0 ;; esac
+    [ $((cap_now - cap_m)) -gt "${HARNESS_CAPACITY_REFRESH_AFTER:-600}" ] && cap_stale=1
+  done
+  if [ "$cap_stale" -eq 1 ]; then
+    ( setsid python3 "$cap_refresher" --refresh >/dev/null 2>&1 </dev/null & ) >/dev/null 2>&1 || true
+  fi
 fi
 
 # §4.7 F-17/F-21 공용 fleet 제목 refresher 트리거 — Claude statusline debounce surface.
@@ -418,6 +445,6 @@ out=""; sep=" ${DIM}│${RST} "
 for s in "${segs_arr[@]}"; do [ -z "$out" ] && out="$s" || out="${out}${sep}${s}"; done
 [ -n "${jobs_lbl:-}" ] && out="${out}
 ${GRN}>_${RST}${DIM} running:${RST} ${jobs_lbl}"
-printf '%s' "$out" > "$AGENT_HOME/.statusline-last-out.txt" 2>/dev/null || true  # 디버그 — 실제 렌더 시점 출력 사본
+printf '%s' "$out" > "$SL_STATE_HOME/.statusline-last-out.txt" 2>/dev/null || true  # 디버그 — 실제 렌더 시점 출력 사본
 printf '%s\n' "$out"
 exit 0  # 마지막 && list 가 비어있는 jobs_lbl 로 exit 1 → statusline 미표시 (2026-06-11 점검에서 발견)

@@ -7,6 +7,7 @@ never blank, per the PRD missing-cell rule).
 """
 import hashlib
 import json
+import os
 import re
 from dataclasses import dataclass, field, asdict, fields, is_dataclass
 from typing import Optional
@@ -180,6 +181,9 @@ class WorkProjection:
     node_state: Optional[str] = None
     active_nodes: tuple = ()
     progress: Optional[ProgressProjection] = None
+    # None retains a legacy/full-route projection; () means no assigned nodes.
+    # The complete route remains in _route_view for the independent overview.
+    scope_node_ids: Optional[tuple] = None
     ambiguity: Optional[str] = None
     _route_view: Optional[dict] = field(default=None, repr=False, compare=False)
 
@@ -795,6 +799,26 @@ def session_parent_visible(session):
     return not (getattr(session, "liveness", None) in ("stale", "dead") or app_server)
 
 
+def unique_managed_parents(sessions):
+    """Exact-one interactive client per managed directory; never choose by order."""
+    found = {}
+    ambiguous = set()
+    for session in sessions:
+        directory = getattr(session, "managed_dir", None)
+        if (getattr(session, "harness", None) != "codex"
+                or getattr(session, "app_server", False)
+                or getattr(session, "is_child", False) or not directory):
+            continue
+        key = os.path.normpath(directory)
+        if key in found:
+            ambiguous.add(key)
+        else:
+            found[key] = session
+    for key in ambiguous:
+        found.pop(key, None)
+    return found
+
+
 # Grace window for a dispatch job's parent-session edge (F-80), in ticks — not seconds.
 # The 0.66-1.37s sid-registry gap measured at session-end is comfortably inside 3 ticks at
 # the default 2s render interval (~6s), and genuine death promotes immediately via
@@ -826,7 +850,7 @@ class ParentEdgeTracker:
         self._store = {}
         self._seen = set()
 
-    def resolve(self, slug, parent_sid, parent_visible, dead_evidence):
+    def resolve(self, slug, parent_sid, parent_visible, dead_evidence, display_sid=None):
         """(edge_sid_or_None, promoted_orphan: bool) for this tick's verdict.
 
         parent_visible: True the parent session currently passes the render `shown`
@@ -842,8 +866,10 @@ class ParentEdgeTracker:
             self._store.pop(key, None)
             return None, False
         if parent_visible:
-            self._store[key] = {"parent_sid": parent_sid, "confirmed": True, "missing_ticks": 0}
-            return parent_sid, False
+            edge_sid = display_sid or parent_sid
+            self._store[key] = {"parent_sid": parent_sid, "edge_sid": edge_sid,
+                                "confirmed": True, "missing_ticks": 0}
+            return edge_sid, False
         if dead_evidence:
             self._store.pop(key, None)
             return None, True
@@ -859,7 +885,7 @@ class ParentEdgeTracker:
             self._store.pop(key, None)
             return None, True
         entry["missing_ticks"] = missing
-        return entry["parent_sid"], False
+        return entry["edge_sid"], False
 
     def sweep(self):
         """Drop keys not seen this tick (unbounded-growth guard). Call once per tick."""
@@ -875,8 +901,9 @@ class ParentEdgeTracker:
 _PARENT_EDGE_TRACKER = ParentEdgeTracker()
 
 
-def parent_edge_resolve(slug, parent_sid, parent_visible, dead_evidence):
-    return _PARENT_EDGE_TRACKER.resolve(slug, parent_sid, parent_visible, dead_evidence)
+def parent_edge_resolve(slug, parent_sid, parent_visible, dead_evidence, display_sid=None):
+    return _PARENT_EDGE_TRACKER.resolve(
+        slug, parent_sid, parent_visible, dead_evidence, display_sid)
 
 
 def parent_edge_sweep():
@@ -960,6 +987,36 @@ def exec_child_is_background(exec_child, updated_at, now):
         return False
     child_started_at = now - child["etime_s"]
     return updated_at > child_started_at + SESSION_WORK_SEC
+
+
+def owned_exec_work(ev_in, now=None):
+    """Positive execution activity, independent of model/supervisor waiting."""
+    child = exec_child_evidence(ev_in.get("exec_child"))
+    if child is None or child.get("ownership_verified") is not True or exec_child_is_wait(child):
+        return None
+    ancestry = child.get("ancestry")
+    if not child.get("proc_start") or not isinstance(ancestry, list) or len(ancestry) < 2:
+        return None
+    if any(not isinstance(edge, dict) or not edge.get("pid") or not edge.get("start")
+           for edge in ancestry):
+        return None
+    if (ancestry[0]["pid"] != child.get("root_pid")
+            or ancestry[0]["start"] != child.get("root_start")
+            or ancestry[-1]["pid"] != child.get("pid")
+            or ancestry[-1]["start"] != child["proc_start"]
+            or len({edge["pid"] for edge in ancestry}) != len(ancestry)
+            or any(edge.get("ppid") != parent["pid"]
+                   for parent, edge in zip(ancestry, ancestry[1:]))):
+        return None
+    if ev_in.get("attempt_id"):
+        if child.get("attempt_id") != ev_in["attempt_id"]:
+            return None
+    elif (child.get("root_pid") != ev_in.get("pid")
+          or child.get("root_start") != str(ev_in.get("proc_start"))):
+        return None
+    if exec_child_is_background(child, ev_in.get("updated_at"), now):
+        return None
+    return child
 
 
 def _session_status_state(status, exec_child=None, background_child=False):
@@ -1071,6 +1128,31 @@ def _matching_attempt_terminal(ev_in):
     return terminal
 
 
+def _fresh_attempt_turn(ev_in, now):
+    """Display evidence only; never a completion or delivery acknowledgement."""
+    activity = ev_in.get("runtime_activity")
+    if not isinstance(activity, dict) or activity.get("source") != "codex-attempt-stream":
+        return False
+    if (ev_in.get("harness") != "codex" or not ev_in.get("attempt_id")
+            or activity.get("attempt_id") != ev_in["attempt_id"]
+            or not activity.get("thread_id") or not activity.get("turn_id")
+            or activity["thread_id"] != ev_in.get("runtime_session_id")):
+        return False
+    stamp = activity.get("observed_at")
+    return (isinstance(stamp, (int, float)) and not isinstance(stamp, bool)
+            and isinstance(now, (int, float)) and not isinstance(now, bool)
+            and 0 <= now - stamp <= SESSION_WORK_SEC)
+
+
+def has_attempt_identity(ev_in):
+    """Whether the exact classifier owns this row instead of cwd mtime."""
+    return (
+        (ev_in.get("pid") is not None and bool(ev_in.get("proc_start")))
+        or (ev_in.get("pid_local") is not None and bool(ev_in.get("pid_local_start")))
+        or all(ev_in.get(key) for key in ("attempt_id", "route_id", "route_node"))
+    )
+
+
 def classify_attempt_evidence(ev_in, now=None):
     """Pure F-25 exact-attempt verdict shared by all dispatch surfaces.
 
@@ -1079,17 +1161,9 @@ def classify_attempt_evidence(ev_in, now=None):
     with deterministic progress evidence. This function never reads the process
     table itself.
     """
-    identity = ("attempt_id", "route_id", "route_node")
-    has_process_identity = ev_in.get("pid") is not None and bool(ev_in.get("proc_start"))
-    has_recorded_identity = (
-        has_process_identity
-        or (
-            ev_in.get("pid_local") is not None
-            and bool(ev_in.get("pid_local_start"))
-        )
-    )
-    if not has_recorded_identity and any(not ev_in.get(key) for key in identity):
+    if not has_attempt_identity(ev_in):
         return None
+    has_process_identity = ev_in.get("pid") is not None and bool(ev_in.get("proc_start"))
     heartbeat = _matching_attempt_heartbeat(ev_in)
     terminal = _matching_attempt_terminal(ev_in)
     pid_scope = ev_in.get("pid_scope")
@@ -1118,6 +1192,13 @@ def classify_attempt_evidence(ev_in, now=None):
             else "shared observed-liveness: %s (%s)"
             % (observed_state, observed.get("reason", "unknown"))
         )
+        work = owned_exec_work(ev_in, now)
+        if observed_state == "parked-supervised" and work is not None:
+            state, source = "working", "shared-observer+proc"
+            rule = "supervisor parked; exact owned tool is running: %s" % work["comm"]
+        elif observed_state == "parked-supervised" and _fresh_attempt_turn(ev_in, now):
+            state, source = "working", "shared-observer+runtime"
+            rule = "supervisor waiting phase; fresh exact runtime turn activity"
     # A positive exact-attempt tag is process evidence from the current
     # namespace. It keeps execution live even when the recorded leader is
     # missing/reused and must outrank terminal summaries and heartbeats, but
@@ -1217,6 +1298,8 @@ def classify_attempt_evidence(ev_in, now=None):
         "terminal_observation": terminal,
         "parent_extinction": ev_in.get("parent_extinction"),
         "observed_liveness": observed,
+        "runtime_activity": ev_in.get("runtime_activity"),
+        "exec_child": ev_in.get("exec_child"),
         "registry_transition": ev_in.get("registry_transition"),
         "progress_fingerprint": deterministic_progress_fingerprint(ev_in),
         "observed_at": now,
@@ -1289,6 +1372,11 @@ def classify_session(ev_in, now, stale_min=SESSION_STALE_MIN, key=None):
         status, st, ev_in.get("exec_child"), background_child=background_child
     )
     m = ev_in.get("mtime")
+
+    work = owned_exec_work(ev_in, now)
+    if work is not None:
+        return out("working", 2, "owned-exec",
+                   "exact owned tool is running: %s" % work["comm"])
 
     lifecycle = ev_in.get("task_lifecycle")
     if ev_in.get("harness") == "codex" and st is None:

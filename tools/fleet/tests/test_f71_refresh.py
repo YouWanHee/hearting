@@ -10,7 +10,7 @@ TOOLS = Path(__file__).resolve().parents[2]
 if str(TOOLS) not in sys.path:
     sys.path.insert(0, str(TOOLS))
 
-from fleet.refresh import MAX_LEAKED_WORKERS, RefreshPump  # noqa: E402
+from fleet.refresh import RefreshPump  # noqa: E402
 from fleet import gitinfo, render  # noqa: E402
 from fleet.model import Session  # noqa: E402
 
@@ -280,66 +280,61 @@ class RefreshPumpRecoveryTest(unittest.TestCase):
         self.assertEqual(health["state"], "failed")
         self.assertIn("SystemExit", health["last_error"])
 
-    def test_a_worker_that_hangs_past_stall_after_is_superseded(self):
-        release = threading.Event()
-        entered = threading.Event()
-
+    def test_delayed_live_worker_is_single_and_recovers_after_io_returns(self):
+        release, entered = threading.Event(), threading.Event()
+        calls = []
         def producer():
+            calls.append(1)
             entered.set()
             release.wait()
-            return "never"
-
+            return "recovered"
         clock = self._clock()
         pump = RefreshPump(producer, 2.0, clock=clock, stall_after=90.0)
         pump.start()
         self._wait_started(entered)
         try:
-            clock.advance(100.0)          # past stall_after
-            self.assertTrue(pump.request_due(),
-                            "a hung worker must be superseded, not waited on forever")
-            health = pump.health()
-            self.assertEqual(health["leaked_workers"], 1)
-            self.assertIn("stall_after", health["last_error"])
-            # The replacement worker hangs on the same producer, so the pump
-            # keeps superseding until the cap, and only then stops spawning.
-            for _ in range(MAX_LEAKED_WORKERS):
+            for _ in range(10):
                 clock.advance(100.0)
-                pump.request_due()
-            health = pump.health()
-            self.assertEqual(health["state"], "stalled")
-            self.assertGreaterEqual(health["leaked_workers"], MAX_LEAKED_WORKERS)
-            self.assertFalse(pump.request_due(),
-                             "at the cap the pump must stop piling on daemon threads")
+                self.assertFalse(pump.request_due())
+            self.assertEqual(calls, [1])
+            self.assertEqual(pump.health()["state"], "stalled")
+            self.assertEqual(pump.health()["leaked_workers"], 0)
+            release.set()
+            self._wait(lambda: pump.generation == 1)
+            self.assertEqual(pump.poll(0)[1], "recovered")
+            self.assertEqual(pump.health()["state"], "idle")
+            self.assertEqual(pump.health()["age"], 0)
         finally:
             release.set()
+            pump.stop()
 
-    def test_a_revived_stale_worker_never_publishes_over_a_newer_result(self):
-        # The abandoned worker stays alive as a daemon thread. If it finished
-        # later and published, the display would regress to older data.
-        release = threading.Event()
-        entered = threading.Event()
+    def test_manual_refresh_during_io_delay_waits_then_coalesces_once(self):
+        release, entered = threading.Event(), threading.Event()
         calls = []
-
         def producer():
             calls.append(1)
             if len(calls) == 1:
                 entered.set()
                 release.wait()
-                return "STALE"
-            return "FRESH"
-
+                return "first"
+            return "second"
         clock = self._clock()
         pump = RefreshPump(producer, 2.0, clock=clock, stall_after=90.0)
         pump.start()
         self._wait_started(entered)
-        clock.advance(100.0)
-        pump.request_due()
-        self._wait(lambda: pump.generation >= 1)
-        release.set()
-        # Give the revived first worker a real chance to publish.
-        self._wait(lambda: len(calls) >= 2)
-        time.sleep(0.2)
-        self.assertEqual(pump.poll(0)[1], "FRESH")
+        try:
+            for _ in range(10):
+                clock.advance(100.0)
+                self.assertFalse(pump.request(force=True))
+            self.assertEqual(len(calls), 1)
+            release.set()
+            self._wait(lambda: pump.generation == 2)
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(pump.poll(0)[1], "second")
+            self.assertEqual(pump.health()["state"], "idle")
+        finally:
+            release.set()
+            pump.stop()
 
     def test_an_ordinary_exception_still_recovers_and_is_not_called_stalled(self):
         calls = []
@@ -380,7 +375,7 @@ class RefreshPumpRecoveryTest(unittest.TestCase):
             self.assertEqual(pump.health()["state"], "running")
             clock.advance(100.0)
             self.assertEqual(pump.health()["state"], "stalled")
-            self.assertEqual(pump._leaked_workers, 0, "health() must not reap")
+            self.assertEqual(pump.health()["leaked_workers"], 0, "health() must not reap")
         finally:
             release.set()
 
@@ -398,7 +393,8 @@ class RefreshPumpRecoveryTest(unittest.TestCase):
             compute_hosts=None)
         header = render._plain(render._hearting_header_row())
         self.assertIn("refreshed 6m", header)
-        self.assertIn("stalled", header)
+        self.assertIn("collection delayed", header)
+        self.assertNotIn("workers stuck", header)
 
     def test_a_missing_health_snapshot_leaves_the_header_unchanged(self):
         render.set_refresh_health(snapshot=None, compute_hosts=None)

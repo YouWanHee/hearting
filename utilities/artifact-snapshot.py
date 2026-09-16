@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import fnmatch
 import hashlib
 import json
 import os
@@ -14,6 +15,11 @@ from pathlib import Path
 
 OWNED_CONTAINERS={"documents","research"}
 EXCLUDED_NAMES={"pipeline_summary.md","pipeline_state.yaml"}
+# Only these buckets hold pre-change target documents. A draft/refine route's
+# other declared scopes (frame shards, strategy, draft stage output, reviews,
+# final) are support artifacts: they never had a target document to preserve,
+# so they are not snapshot targets.
+WORKTREE_ONLY={"source-scoped"}
 
 
 class SnapshotError(Exception):
@@ -62,6 +68,58 @@ def target_parts(artifact_root: Path, target: Path) -> tuple[Path,Path]:
     if "_internal" in parts or parts[-1] in EXCLUDED_NAMES:
         raise SnapshotError("target-machine-managed")
     return artifact_root.joinpath(*prefix,parts[0],parts[1]),Path(*parts[2:])
+
+
+def bucket_relative_parts(artifact_root: Path, target: Path) -> tuple[str,...]:
+    """The target's path below the artifact root, with the cycle prefix removed."""
+    resolved=target.resolve(strict=False)
+    try:
+        rel=resolved.relative_to(artifact_root)
+    except ValueError:
+        return ()
+    parts=rel.parts
+    if len(parts)>=5 and parts[0]=="campaigns" and parts[2]=="cycles" and parts[4]=="artifacts":
+        return parts[5:]
+    if len(parts)>=4 and parts[0]=="campaigns" and parts[3]=="artifacts":
+        return parts[4:]
+    return parts
+
+
+def component_match(values: tuple[str,...], pattern: str) -> bool:
+    parts=pattern.split("/") if pattern else []
+    recursive=bool(parts and parts[-1]=="**")
+    if recursive:
+        parts=parts[:-1]
+        if len(values)<len(parts):
+            return False
+    elif len(values)!=len(parts):
+        return False
+    return all(fnmatch.fnmatchcase(value_part,pattern_part)
+               for value_part,pattern_part in zip(values,parts))
+
+
+def declared_support_target(node: dict, relative: tuple[str,...]) -> bool:
+    """Whether the target sits in a declared, non-document node write scope.
+
+    A draft/refine node's document targets are ``documents/**``,
+    ``research/**`` or the ``target-artifact`` alias for them. Everything else
+    the node declares (frame shards, strategy, stage output, reviews, final)
+    is a support artifact with no pre-change document to preserve. This keeps
+    the refusal for an owned-bucket path that is merely malformed, because
+    such a path matches no declared support scope here.
+    """
+    if not relative:
+        return False
+    for scope in node.get("write_scope") or []:
+        if not isinstance(scope,str) or not scope or scope=="target-artifact":
+            continue
+        root=scope[:-3] if scope.endswith("/**") else scope
+        first=root.split("/",1)[0]
+        if first in OWNED_CONTAINERS or first in WORKTREE_ONLY or first=="source":
+            continue
+        if component_match(relative,re.sub(r"<[a-z_]+>","*",scope)):
+            return True
+    return False
 
 
 def ensure_directory(path: Path) -> None:
@@ -174,8 +232,18 @@ def prepare(args) -> int:
     try:
         artifact_dir,relative=target_parts(artifact_root,target)
     except SnapshotError as exc:
-        if str(exc)=="target-machine-managed":
-            emit({"status":"skipped","reason":str(exc),"target":str(target)})
+        reason=str(exc)
+        if reason=="target-machine-managed":
+            emit({"status":"skipped","reason":reason,"target":str(target)})
+            return 0
+        # A draft/refine route's declared support scopes are not target
+        # documents. Skip only a path that a node actually declared as
+        # support; a malformed owned path or an undeclared container still
+        # fails closed below.
+        if reason=="target-container-unowned" and declared_support_target(
+            node,bucket_relative_parts(artifact_root,target)
+        ):
+            emit({"status":"skipped","reason":"support-artifact","target":str(target)})
             return 0
         raise
     if not target.exists():

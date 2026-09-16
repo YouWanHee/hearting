@@ -6726,6 +6726,18 @@ def completion_marker_is_current(
         if history != marker:
             return False
 
+        if marker.get("stage_authority") == "owner-closure":
+            _route_module().validate_continuation_owner_closure(route, node, marker)
+            if not (
+                marker.get("dispatch_depth") == node.get("dispatch_depth")
+                and marker.get("transport") == "headless"
+                and marker.get("execution_surface") == "inline"
+                and marker.get("fallback_hop") == "inline"
+            ):
+                return False
+            # Continue through the shared immutable attempt-link check below.
+            # A crash after marker publication but before its link is a hold.
+
         if node.get("kind") == "resource-runner":
             return (
                 marker.get("attempt_id") is None
@@ -6791,6 +6803,8 @@ def completion_marker_is_current(
             "fallback_hop": marker.get("fallback_hop"),
             "evidence_sha256": evidence_record.get("sha256"),
         }
+        if marker.get("stage_authority") == "owner-closure":
+            link_expected.update(stage_authority="owner-closure", owner_closure_proof=marker["owner_closure_proof"])
         if not all(link.get(key) == value for key, value in link_expected.items()):
             return False
         # The link records its own absolute location as written by the marker
@@ -6842,6 +6856,14 @@ def completion_attempt_readiness(
 ) -> AttemptReadiness:
     """Combine a current semantic marker with its exact governed process state."""
 
+    if marker.get("stage_authority") == "owner-closure":
+        try:
+            _route_module().validate_continuation_owner_closure(
+                route, node, marker, jobs=jobs, lines=registry_lines, check_process=True,
+            )
+        except (DispatchContractError, ValueError, OSError, KeyError, TypeError) as exc:
+            return AttemptReadiness("unverifiable", str(exc), str(marker.get("attempt_id") or ""))
+        return AttemptReadiness("ready", "owner-closure-source-rounds-quiescent", marker["attempt_id"])
     if marker.get("stage_authority") == "owner-chain":
         try:
             chain_rows = registry_lines if registry_lines is not None else jobs.read_text(encoding="utf-8").splitlines()

@@ -1064,7 +1064,7 @@ def build_continuation_route(
     }
     inherited_keys=(
         "schema_version","capability","capability_mode","slug","slug_truncated",
-        "campaign_key","parent_cycle_id",
+        "campaign_key","parent_cycle_id","campaign_unassigned",
         "requested_intensity",
         "effective_intensity","owner_model_profile","execution_topology",
         "owner_dispatch_depth","max_dispatch_depth","tracking",
@@ -2603,7 +2603,7 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
                   tracking=None, artifact_guard=None, children=None, parent_harness="claude",
                   dispatch_evidence=None, registered_headless_evidence=None,
                   transport_evidence="compose-default", jobs=None, profile_demands=None, explicit_profiles=None,
-                  campaign_key=None, parent_cycle_id=None, profile=None, work_request=None):
+                  campaign_key=None, parent_cycle_id=None, profile=None, work_request=None, unassigned=False):
     """Resolve every default, then compile through the ordinary sealer."""
     if shape not in COMPOSE_SHAPES:
         raise ValueError(f"compose-shape-invalid:{shape}")
@@ -2628,6 +2628,15 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
         raise ValueError("compose-shape-intensity-mismatch:staged")
     cwd = str(Path(cwd).resolve(strict=True))
     artifact_root = str(Path(artifact_root).resolve())
+    # The campaign is the agent's proposal for the work stream (CONVENTIONS
+    # "Campaign or cycle").  A route sealed without one silently landed in the
+    # root's degraded `_unassigned` container (TF-Rehancer 2026-09-15: nine
+    # routes, zero keys), so compose demands the proposal, shows the streams
+    # that already exist, and accepts only an explicit opt-out.
+    if unassigned and (campaign_key is not None or parent_cycle_id is not None):
+        raise ValueError("compose-campaign-selection-conflict:--unassigned excludes --campaign-key and --parent-cycle")
+    if campaign_key is None and parent_cycle_id is None and not unassigned:
+        raise ValueError("compose-campaign-key-required:" + compose_campaign_hint(artifact_root))
     if tracking is None:
         tracking = "tracked" if shape == "staged" else "untracked"
     gate = {
@@ -2668,12 +2677,83 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
             capability, capability_mode, requested, cwd, artifact_root,
             predicates=predicates, inline_reason="atomic-direct" if shape == "direct" else None,
             **common)
+    if unassigned:
+        route["campaign_unassigned"] = True
     if work_request is not None:
         from work_start import validate_request
         route["work_request"] = dict(validate_request(work_request))
+    if unassigned or work_request is not None:
         route["route_hash"] = route_hash(route)
         route["route_id"] = ROUTE_IDENTITY.route_id_from_hash(route["route_hash"])
     return route
+
+
+COMPOSE_CAMPAIGN_LIST_CAP = 12
+
+
+def compose_campaign_summaries(artifact_root):
+    """Active campaigns of the root, newest first.  A fresh root has none
+    (empty list); a root that cannot be read returns None so the caller says
+    "unavailable" rather than mislabelling a join as a creation."""
+    try:
+        import artifact_producer
+        return artifact_producer.list_campaign_summaries(Path(artifact_root))
+    except (OSError, ImportError, ValueError):
+        return None
+
+
+def compose_campaign_hint(artifact_root):
+    rows = compose_campaign_summaries(artifact_root)
+    if rows is None:
+        shown = "unavailable (campaign scan failed)"
+    else:
+        keyed = [r for r in rows if r.get("key") not in (None, "_unassigned")]
+        shown = ", ".join(f"{r['key']}({r['cycle_count']})" for r in keyed[:COMPOSE_CAMPAIGN_LIST_CAP])
+        if len(keyed) > COMPOSE_CAMPAIGN_LIST_CAP:
+            shown += f", … +{len(keyed) - COMPOSE_CAMPAIGN_LIST_CAP}"
+    return (f"name the work stream with --campaign-key <existing|new> (active: {shown or 'none'}); "
+            "--unassigned keeps the work in the root's degraded _unassigned container")
+
+
+def compose_campaign_selection(route):
+    """What the sealed campaign choice means in this artifact root (read-only)."""
+    key = route.get("campaign_key")
+    parent = route.get("parent_cycle_id")
+    rows = compose_campaign_summaries(route["artifact_root"])
+    unavailable = rows is None
+    rows = rows or []
+    active = [r for r in rows if r.get("key") not in (None, "_unassigned")]
+    selection = {"key": key, "active_count": len(active),
+                 "active_keys": [r["key"] for r in active[:COMPOSE_CAMPAIGN_LIST_CAP]],
+                 "active_keys_unavailable": unavailable}
+    if key is not None:
+        match = next((r for r in rows if r.get("key") == key), None)
+        selection.update(mode="unresolved" if unavailable else ("join" if match else "create"),
+                         campaign_id=match["campaign_id"] if match else None,
+                         title=match["title"] if match else None)
+    elif parent is not None:
+        selection.update(mode="parent", parent_cycle_id=parent)
+    else:
+        selection.update(mode="unassigned", explicit=route.get("campaign_unassigned") is True)
+    return selection
+
+
+def _compose_campaign_line(selection):
+    mode = selection["mode"]
+    if mode == "join":
+        text = f"캠페인 {selection['key']} (기존 합류)"
+    elif mode == "create":
+        text = f"캠페인 {selection['key']} (신규 생성)"
+    elif mode == "parent":
+        text = f"캠페인 parent {selection['parent_cycle_id']} 상속"
+    elif mode == "unresolved":
+        text = f"캠페인 {selection['key']} (기존 여부 확인 불가: 캠페인 목록 읽기 실패)"
+    else:
+        text = "캠페인 미배정 (_unassigned, degraded)"
+    shown = ", ".join(selection["active_keys"][:6])
+    if selection["active_count"] > 6:
+        shown += " …"
+    return f"  {text} · 활성 캠페인 {selection['active_count']}개" + (f": {shown}" if shown else "")
 
 
 def compose_card(route):
@@ -2685,7 +2765,8 @@ def compose_card(route):
     return (
         f"[경로] {route['capability']} · {shape}({route['effective_intensity']}) {graph}"
         f" · route {route['route_id']} · origin compose · 사람 게이트 {gates}\n"
-        f"  cwd {route['cwd']} · slug {route.get('slug', '-')}"
+        f"  cwd {route['cwd']} · slug {route.get('slug', '-')}\n"
+        + _compose_campaign_line(compose_campaign_selection(route))
     )
 
 
@@ -4103,6 +4184,16 @@ def route_status(artifact_root, *, diagnostics=None):
     return rows
 
 def _marker_attempt_axes(node, attempt_id, attempt_metadata):
+    if attempt_metadata is not None and attempt_metadata.get("stage_authority") == "owner-closure":
+        # The attempt names the historical reviewer, not a newly launched
+        # continuation worker. The common proof reader verifies this provenance.
+        return {
+            "attempt_id": attempt_id, "dispatch_depth": node.get("dispatch_depth"),
+            "transport": "headless", "execution_surface": "inline",
+            "registered_worker": False, "fallback_hop": "inline",
+            "stage_authority": "owner-closure",
+            "owner_closure_proof": attempt_metadata["owner_closure_proof"],
+        }
     if node.get("kind") == "resource-runner":
         if attempt_id or attempt_metadata:
             raise ValueError("resource completion cannot carry agent attempt axes")
@@ -4352,9 +4443,15 @@ def _completion_marker_replay(route, node, node_id, evidence, axes, directory):
     and raises when the marker on disk contradicts itself.
     """
     canonical_path=directory/f"{node_id}.json"
-    if not canonical_path.is_file():
-        return None
-    existing=json.loads(canonical_path.read_text(encoding="utf-8"))
+    recovering = not canonical_path.is_file()
+    if recovering:
+        sequence = _next_marker_sequence(directory, node_id) - 1
+        if sequence < 1:
+            return None
+        candidate = directory / f"{node_id}.{sequence}.json"
+    else:
+        candidate = canonical_path
+    existing=json.loads(candidate.read_text(encoding="utf-8"))
     identity={
         "evidence_sha256":evidence_digest(evidence),
         **axes,
@@ -4364,6 +4461,8 @@ def _completion_marker_replay(route, node, node_id, evidence, axes, directory):
         **{key:existing.get(key) for key in axes},
     }
     if existing_identity!=identity:
+        if recovering:
+            raise ValueError("completion-recovery-history-conflict")
         return None
     static_identity={
         "schema_version":2,
@@ -4381,6 +4480,8 @@ def _completion_marker_replay(route, node, node_id, evidence, axes, directory):
         or json.loads(history_path.read_text(encoding="utf-8"))!=existing
     ):
         raise ValueError("canonical completion marker history conflict")
+    if recovering:
+        atomic_write(canonical_path, existing)
     return existing
 
 def evidence_digest(evidence):
@@ -4775,6 +4876,16 @@ def _marker_identity_row(route, node, node_id, gate, *, jobs=None, exact_termina
         return {"passed": False, "reason": "completion-evidence-unreadable"}
     if digest != evidence.get("sha256"):
         return {"passed": False, "reason": "completion-evidence-hash-mismatch"}
+    if marker.get("stage_authority") == "owner-closure":
+        if not completion_marker_is_current(route, node, path, marker):
+            return {"passed": False, "reason": "owner-closure-proof-not-current"}
+        if exact_terminal:
+            registry = Path(jobs) if jobs is not None else _continuation_source_jobs(route)
+            ready = completion_attempt_readiness(route, node, marker, registry)
+            return {"passed": ready.state == "ready", "reason": ready.reason, "current": ready.state == "ready",
+                    "node_id": node_id, "attempt_id": marker["attempt_id"], "completion_gate": gate,
+                    "marker_digest": hashlib.sha256(marker_bytes).hexdigest(), "evidence_digest": digest,
+                    "evidence": evidence["path"], "review_independence": "owner-overridden"}
     if marker.get("registered_worker") is True or marker.get("stage_authority") == "owner-chain":
         try:
             registry = Path(jobs) if jobs is not None else _continuation_source_jobs(route)
@@ -5086,6 +5197,8 @@ def _publish_completion_locked(
         "completion_marker":str(canonical_marker_path),
         "completion_marker_history":str(history_marker_path),
     }
+    if marker.get("stage_authority") == "owner-closure":
+        attempt_link.update(stage_authority="owner-closure", owner_closure_proof=marker["owner_closure_proof"])
     # Idempotent republish (review P-1): an existing sidecar whose only
     # difference from the link we would write is the SPELLING of its two
     # self-referential paths (pointer vs resolved form of one directory) is
@@ -5110,6 +5223,13 @@ def _publish_completion_locked(
             )
     if not _skip_rewrite:
         write_once(attempt_path,attempt_link)
+    if not canonical_marker_path.exists():
+        # Recover publication after a crash using the verified immutable link
+        # and latest history. A stale attempt cannot restore an older head.
+        directory = completion_dir(route["route_id"])
+        if marker["sequence"] != _next_marker_sequence(directory, node_id) - 1:
+            raise ValueError("completion-recovery-history-not-latest")
+        atomic_write(canonical_marker_path, marker)
     current_marker=json.loads(canonical_marker_path.read_text(encoding="utf-8"))
     if current_marker==marker:
         atomic_write(
@@ -5191,28 +5311,28 @@ def _mentions(text, token):
     """Whole-token mention: `att-r1` must not be satisfied by `att-r10`."""
     return re.search(r"(?<![A-Za-z0-9_./-])"+re.escape(token)+r"(?![A-Za-z0-9_-])",text) is not None
 
-def _review_round_rows(lines, route_id, node_id):
-    """Registry rows of one route node that count as review rounds.
-
-    Mirrors `dispatch-node.py prior_round_attempts`: same route/node,
-    sub-sessions (`stage_authority=0`) excluded, legacy `route=` key honoured
-    read-only. Returns every status; the caller separates live from terminated."""
+def review_round_records(lines, route_ids, node_id):
+    """One round census for admission and closure, including every status."""
     rows=[]
     for line in lines:
         fields=line.split("\t")
         if len(fields)!=6:
             continue
         metadata=parse_registry_metadata(fields[5])
-        if (metadata.get("route_id") or metadata.get("route"))!=route_id:
+        if (metadata.get("route_id") or metadata.get("route")) not in route_ids:
             continue
         if metadata.get("route_node")!=node_id:
             continue
-        if str(metadata.get("stage_authority","1"))=="0":
+        if str(metadata.get("stage_authority","1")).lower() in {"0", "false"}:
             continue
-        rows.append((fields[1],metadata))
+        rows.append((fields,metadata))
     return rows
 
-def _owner_closure_eligibility(route, node, node_id, evidence, row_metadata, lines):
+def _review_round_rows(lines, route_id, node_id):
+    return [(fields[1], meta) for fields, meta in review_round_records(lines, {route_id}, node_id)]
+
+def _owner_closure_eligibility(route, node, node_id, evidence, row_metadata, lines,
+                               *, rounds=None, check_canonical=True):
     """Admit `complete` on a `completed-review-blocking` row, or raise a typed refusal.
 
     Returns the closure facts the caller seals on the row. Checks, in order:
@@ -5231,7 +5351,8 @@ def _owner_closure_eligibility(route, node, node_id, evidence, row_metadata, lin
     if node.get("kind")!="review-worker" or row_metadata.get("worker_type")!="review":
         refuse("node-not-review",
                f"kind={node.get('kind') or '-'};worker_type={row_metadata.get('worker_type') or '-'}")
-    rounds=_review_round_rows(lines,route["route_id"],node_id)
+    if rounds is None:
+        rounds=_review_round_rows(lines,route["route_id"],node_id)
     live=[metadata.get("attempt_id") or "-" for status,metadata in rounds if status in _LIVE_ROW_STATUSES]
     if live:
         # A live review worker may still write a second blocking artifact
@@ -5246,7 +5367,7 @@ def _owner_closure_eligibility(route, node, node_id, evidence, row_metadata, lin
         refuse("round-budget-not-exhausted",f"rounds={len(terminated)};max_round={max_round}")
     own=row_metadata.get("attempt_id")
     canonical=completion_dir(route["route_id"])/f"{node_id}.json"
-    if canonical.is_file():
+    if check_canonical and canonical.is_file():
         try:
             existing=json.loads(canonical.read_text(encoding="utf-8"))
         except (OSError,ValueError):
@@ -5324,6 +5445,151 @@ def _owner_closure_eligibility(route, node, node_id, evidence, row_metadata, lin
         "max_round":max_round,
     }
 
+
+def review_lineage_routes(route, node_id):
+    """Exact node ancestry shared by review admission and disposition.
+
+    A continuation's new route ID is not a fresh review budget. Read only the
+    canonical parents named by its sealed edges; never infer from campaigns.
+    """
+    lineage = [route]
+    seen = {route["route_id"]}
+    current = route
+    while current.get("continuation_contract_version") == 1:
+        parent_id = current.get("source_route_id")
+        if not isinstance(parent_id, str) or not re.fullmatch(r"rt-[0-9a-f]{16}", parent_id) or parent_id in seen:
+            raise ValueError("owner-closure-lineage-invalid")
+        parent = json.loads(canonical_route_path(Path(route["artifact_root"]), parent_id).read_text(encoding="utf-8"))
+        if (parent.get("route_id") != parent_id
+                or parent.get("route_hash") != current.get("source_route_hash")
+                or route_hash(parent) != parent.get("route_hash")
+                or route_hash(current) != current.get("route_hash")):
+            raise ValueError("owner-closure-lineage-hash-mismatch")
+        for key in ("artifact_root", "cwd", "capability", "effective_intensity"):
+            if parent.get(key) != current.get(key):
+                raise ValueError(f"owner-closure-lineage-context-mismatch:{key}")
+        child_node = next((n for n in current["nodes"] if n["id"] == node_id), None)
+        parent_node = next((n for n in parent["nodes"] if n["id"] == node_id), None)
+        edge = next((n for n in current.get("new_nodes", []) if n.get("node_id") == node_id), None)
+        if (not child_node or not parent_node or not edge
+                or edge.get("source_contract_hash") != _continuation_contract_hash(parent_node)
+                or child_node.get("source_contract_hash") != _continuation_contract_hash(parent_node)
+                or edge.get("realized_contract_hash") != _continuation_contract_hash(child_node)):
+            raise ValueError("owner-closure-lineage-node-mismatch")
+        # Topology rewriting may re-root dependencies, but cannot replace the
+        # review's assignment, assurance, gate or permitted write domain.
+        expected_node = {**parent_node, "depends_on": child_node.get("depends_on", []),
+                         "source_contract_hash": _continuation_contract_hash(parent_node)}
+        if expected_node != child_node:
+            raise ValueError("owner-closure-lineage-node-mismatch:assignment")
+        lineage.append(parent)
+        seen.add(parent_id)
+        current = parent
+    return lineage
+
+
+def continuation_owner_closure_plan(route, node, evidence, jobs, attempt_id, *,
+                                    lines=None, check_process=True, check_dependencies=True):
+    """Read-only authority shared by check, commit and downstream consumers."""
+    from artifact_producer import require_cycle_output
+    from dispatch_contract import attempt_process_quiescence, terminal_conflict_pending
+
+    jobs = Path(jobs).resolve()
+    if jobs != _continuation_source_jobs(route).resolve():
+        raise ValueError("owner-closure-registry-mismatch")
+    lineage = review_lineage_routes(route, node["id"])
+    if len(lineage) < 2:
+        raise ValueError("owner-closure-official-continuation-required")
+    route_by_id = {r["route_id"]: r for r in lineage}
+    if lines is None:
+        lines = jobs.read_text(encoding="utf-8").splitlines()
+    rounds = [row for r in reversed(lineage) for row in _review_round_rows(lines, r["route_id"], node["id"])]
+    exact = [(status, meta) for status, meta in rounds if meta.get("attempt_id") == attempt_id]
+    if len(exact) != 1:
+        raise ValueError("owner-closure-source-attempt-not-exact")
+    status, selected = exact[0]
+    source_id = selected.get("route_id") or selected.get("route")
+    if source_id == route["route_id"] or status != "done" or selected.get("note") != REVIEW_BLOCKING_NOTE:
+        raise ValueError("owner-closure-source-not-blocking-ancestor")
+    output = require_cycle_output(Path(route["artifact_root"]), Path(evidence), route_id=route["route_id"])
+    if output is None:
+        raise ValueError("owner-closure-destination-cycle-missing")
+    facts = _owner_closure_eligibility(route, node, node["id"], evidence, selected, lines,
+                                     rounds=rounds, check_canonical=False)
+    reviews = []
+    seen = set()
+    for row_status, meta in rounds:
+        identity = meta.get("attempt_id")
+        parent = route_by_id[meta.get("route_id") or meta.get("route")]
+        if not identity or identity in seen:
+            raise ValueError("owner-closure-round-identity-ambiguous")
+        seen.add(identity)
+        validate_attempt_metadata(meta)
+        if ROUTE_IDENTITY.registered_node_identity(meta, node) != (parent["route_id"], parent["route_hash"], node["id"]):
+            raise ValueError("owner-closure-round-route-mismatch")
+        if terminal_conflict_pending(meta):
+            raise ValueError(f"owner-closure-terminal-evidence-conflict:{identity}")
+        if check_process:
+            process = attempt_process_quiescence(meta, terminal_receipt=True)
+            if process.state != "quiescent":
+                raise ValueError(f"owner-closure-round-{process.state}:{identity}:{process.reason}")
+        if row_status == "done" and meta.get("note") == REVIEW_BLOCKING_NOTE:
+            reviewed = _owner_closure_eligibility(parent, node, node["id"], evidence, meta, lines,
+                                                 rounds=rounds, check_canonical=False)
+            encoded = reviewed["review_artifact_b64"]
+            artifact = Path(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode("utf-8"))
+            reviews.append({"attempt_id": identity, "route_id": parent["route_id"],
+                            "route_hash": parent["route_hash"], "artifact": str(artifact),
+                            "sha256": evidence_digest(artifact)})
+    if check_dependencies:
+        for dependency in node.get("depends_on", []):
+            predecessor = next(n for n in route["nodes"] if n["id"] == dependency)
+            path = completion_dir(route["route_id"], jobs=jobs) / f"{dependency}.json"
+            if not completion_marker_is_current(route, predecessor, path):
+                raise ValueError(f"owner-closure-dependency-unproven:{dependency}")
+            marker = json.loads(path.read_text(encoding="utf-8"))
+            ready = completion_attempt_readiness(route, predecessor, marker, jobs, registry_lines=lines)
+            if ready.state != "ready":
+                raise ValueError(f"owner-closure-dependency-{ready.state}:{dependency}:{ready.reason}")
+    return {"schema_version": 1, "source_attempt_id": attempt_id, "jobs": str(jobs),
+            "lineage": [{"route_id": r["route_id"], "route_hash": r["route_hash"]} for r in lineage],
+            "output_dir": str(output), "reviews": reviews,
+            "rounds": facts["rounds"], "max_round": facts["max_round"]}
+
+
+def validate_continuation_owner_closure(route, node, marker, *, jobs=None, lines=None, check_process=False):
+    proof = marker.get("owner_closure_proof")
+    if (not isinstance(proof, dict) or marker.get("registered_worker") is not False
+            or marker.get("review_independence") != "owner-overridden"
+            or marker.get("review_gate_closure") != "owner-closure"
+            or marker.get("attempt_id") != proof.get("source_attempt_id")):
+        raise ValueError("owner-closure-proof-invalid")
+    actual = continuation_owner_closure_plan(
+        route, node, Path(marker["evidence"]["path"]), jobs or proof.get("jobs", ""), marker["attempt_id"],
+        lines=lines, check_process=check_process, check_dependencies=False,
+    )
+    if actual != proof:
+        raise ValueError("owner-closure-proof-drift")
+
+
+def _publish_continuation_owner_closure(route, node, evidence, jobs, attempt_id, lines):
+    proof = continuation_owner_closure_plan(route, node, evidence, jobs, attempt_id, lines=lines)
+    path = completion_dir(route["route_id"], jobs=jobs) / f"{node['id']}.json"
+    if path.exists():
+        existing = json.loads(path.read_text(encoding="utf-8"))
+        if (existing.get("stage_authority") != "owner-closure"
+                or existing.get("owner_closure_proof") != proof
+                or existing.get("evidence") != {"path": str(evidence), "sha256": evidence_digest(evidence)}):
+            raise ValueError("owner-closure-node-already-complete")
+    marker = _publish_completion_locked(
+        route, node, node["id"], evidence, jobs=jobs, attempt_id=attempt_id,
+        attempt_metadata={"stage_authority": "owner-closure", "owner_closure_proof": proof},
+        owner_override=True,
+    )
+    return marker, {"status": "continuation-gate-completed", "gate_closure": "owner-closure",
+                    "source_attempt_id": attempt_id, "source_rows_changed": 0,
+                    "blocking_attempts": [r["attempt_id"] for r in proof["reviews"]]}
+
 def _complete_node_locked(
     route,
     node,
@@ -5341,7 +5607,11 @@ def _complete_node_locked(
     if not jobs and attempt_id and explicit_attempt_metadata is None:
         raise ValueError("unregistered completion requires explicit attempt metadata")
     if not jobs and explicit_attempt_metadata is not None and not attempt_id:
-        raise ValueError("explicit attempt metadata requires --attempt-id")
+        raise ValueError(
+            "explicit attempt metadata requires --attempt-id "
+            "(--dispatch-depth/--transport/--execution-surface/--registered-worker/--fallback-hop "
+            "describe an attempt; an inline node completed by the main session omits them all)"
+        )
 
     jobs_path=Path(jobs) if jobs else None
     directory=completion_dir(route["route_id"])
@@ -5405,6 +5675,8 @@ def _complete_node_locked(
             if ROUTE_IDENTITY.registered_node_identity(row_metadata, node) != (
                 route["route_id"], route["route_hash"], node_id
             ):
+                if explicit_attempt_metadata is None and not review_claim and route.get("continuation_contract_version") == 1:
+                    return _publish_continuation_owner_closure(route, node, evidence, jobs_path, attempt_id, lines)
                 raise ValueError("attempt row route identity mismatch")
             if explicit_attempt_metadata is not None:
                 axis_keys=(
@@ -5979,6 +6251,7 @@ def compose_receipt(route, path):
                    ("id", "unit", "dispatch_depth", "model_profile", "depends_on", "terminal") if key in node}
                   for node in route["nodes"]],
         "human_gates": route.get("human_gates", []),
+        "campaign": compose_campaign_selection(route),
     }
 
 
@@ -6063,7 +6336,8 @@ def main():
     cp.add_argument("--start",action="store_true",help="prepare and start the selected work; the runtime owns frame launches and waiting")
     cp.add_argument("--prompt-file",type=Path,help="the user's task, stored with the route for frame and owner execution")
     cp.add_argument("--owner",choices=("claude","codex","opencode"),help="explicit owner runtime; otherwise use normal selection")
-    cp.add_argument("--campaign-key",help="explicit work stream passed to the producer owner")
+    cp.add_argument("--campaign-key",help="the work stream this route joins or creates (required unless --parent-cycle or --unassigned); `artifact_producer.py campaign-list` shows active keys")
+    cp.add_argument("--unassigned",action="store_true",help="explicit opt-out: keep this work in the root's degraded _unassigned container, proposing no stream")
     cp.add_argument("--parent-cycle",help="open or sealed predecessor cycle; causal link, not input approval")
     cp.add_argument("--profile-demands", help="JSON file mapping node ids and __owner__ to full SD-88 demands")
     cp.add_argument("--explicit-profiles", help="JSON file mapping demanded node ids to explicit profiles")
@@ -6129,7 +6403,8 @@ def main():
     n=sub.add_parser("node"); n.add_argument("--route",required=True); n.add_argument("--node",required=True)
     d=sub.add_parser("complete"); d.add_argument("--route",required=True); d.add_argument("--node",required=True); d.add_argument("--evidence",required=True); d.add_argument("--output")
     d.add_argument("--jobs",help="canonical registry path for a registered attempt")
-    d.add_argument("--attempt-id",help="exact current attempt id")
+    d.add_argument("--attempt-id",help="exact current attempt, or an official continuation's blocking source review")
+    d.add_argument("--check",action="store_true",help="read-only check of continuation owner-closure authority; publishes nothing")
     d.add_argument("--dispatch-depth",type=int)
     d.add_argument("--transport")
     d.add_argument("--execution-surface")
@@ -6155,7 +6430,7 @@ def main():
     st=sub.add_parser("status"); st.add_argument("--artifact-root",required=True)
     st.add_argument("--open-only",action="store_true",help="list only routes with no recorded outcome")
     a=p.parse_args()
-    if a.command not in {"verify", "node", "status", "close"}:
+    if a.command not in {"verify", "node", "status", "close"} and not (a.command == "complete" and a.check):
         dispatch_terminal_commit.require_current_cleanup("route-" + a.command)
     if a.command=="compose":
         shape=a.shape or ("staged" if a.graph else "direct")
@@ -6166,7 +6441,7 @@ def main():
         route=compose_route(
             capability=a.capability,capability_mode=a.capability_mode,shape=shape,graph=a.graph,
             slug=a.slug,cwd=cwd,artifact_root=artifact_root,intensity=a.intensity,signals=a.signal,
-            campaign_key=a.campaign_key,parent_cycle_id=a.parent_cycle,
+            campaign_key=a.campaign_key,parent_cycle_id=a.parent_cycle,unassigned=a.unassigned,
             spec_read=a.spec_read,drift_verdict=a.drift_verdict,tracking=a.tracking,
             artifact_guard=a.artifact_guard,
             children=[c.strip() for c in a.children.split(",") if c.strip()] if a.children else None,
@@ -6190,6 +6465,7 @@ def main():
                                         "completion_gate":n.get("completion_gate"),"terminal":n.get("terminal") is True}
                                        for n in route["nodes"]],
                               "human_gates":route.get("human_gates"),"parallel_groups":route.get("parallel_groups"),
+                              "campaign":compose_campaign_selection(route),
                               "tracked_gate_evidence":route.get("tracked_gate_evidence")},sort_keys=True))
             return 0
         path = _emit_compiled_route(a,route,artifact_root)
@@ -6252,10 +6528,11 @@ def main():
     elif a.command=="continuation":
         source_path=Path(a.source_route).resolve(strict=True)
         source=verify_route(json.loads(source_path.read_text(encoding="utf-8")))
-        # The launch-sealed owner tuple names the exact bytes supplied on this
-        # CLI invocation.  Keep that path attached to the verified source so a
-        # multi-hop continuation does not pair the R0 file with R1 metadata.
-        source["route_file"] = str(source_path)
+        # Keep the source path local to this invocation.  Do not attach it to
+        # the verified route payload: continuation lineage hashes cover the
+        # sealed route object, and a filesystem locator is runtime context,
+        # not route identity.  Adding it here made valid owner-closure proof
+        # markers fail their downstream currentness check.
         artifact=Path(a.artifact_root).resolve(strict=False)
         if artifact != Path(source["artifact_root"]).resolve(strict=False):
             print(
@@ -6441,6 +6718,13 @@ def main():
                         "registered_worker":a.registered_worker,
                         "fallback_hop":a.fallback_hop,
                     }
+                if a.check:
+                    if not a.jobs or not a.attempt_id or a.output or review_claim or explicit_attempt_metadata or a.subsession_manifest:
+                        raise ValueError("owner-closure-check-requires-exact-jobs-attempt-and-no-overrides")
+                    proof = continuation_owner_closure_plan(route, node, evidence, a.jobs, a.attempt_id)
+                    print(json.dumps({"result": "ready", "read_only": True, "route_id": route["route_id"],
+                                      "node_id": a.node, "owner_closure_proof": proof}, sort_keys=True))
+                    return
                 if a.subsession_manifest:
                     if review_claim:
                         raise ValueError("reviewer-claim-unsupported-on-subsession-gate")

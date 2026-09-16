@@ -12,7 +12,7 @@ mutex, and the derived index.
 Layout (D-2, closed):
 
     campaigns/<campaign-locator>/campaign.json              mutable campaign record
-    campaigns/<campaign-locator>/<cycle-locator>/.cycle.json stable-ID locator binding
+    campaigns/<campaign-locator>/<cycle-locator>/.cycle.json stable-ID locator binding + started_on
     campaigns/<campaign-locator>/<cycle-locator>/artifacts  producer output (open)
     campaigns/<campaign-locator>/<cycle-locator>/manifest.json finalize commit point
     shared/<spec|analysis|research>/<ref>/reference.json
@@ -87,7 +87,8 @@ OK, BLOCKED, USAGE = 0, 65, 64
 # D-86: the one-line hint attached to a legacy-top-level-write-denied result.
 # The `reason` token itself (compared verbatim by fleet_cutover_gate's
 # negative probe) never changes; this hint rides in a separate field/detail.
-LEGACY_WRITE_HINT = "run `artifact_producer.py begin --route <route file>` first, then retry"
+LEGACY_WRITE_HINT = ("run `artifact_producer.py begin --route <route file>` first; if begin already ran, "
+                     "export its --env-file output (AGENT_ARTIFACT_*) into this shell, then retry")
 
 # D-81: campaign.json `related[]` row kinds (producer-internal API only).
 RELATED_KINDS = ("related", "precedes", "supersedes")
@@ -589,9 +590,10 @@ def _write_cycle_record(root: Path, record: Dict[str, Any], *, exclusive: bool) 
         _write_atomic(path, data, 0o600)
 
 
-def _write_cycle_binding(directory: Path, campaign_id: str, cycle_id: str) -> None:
+def _write_cycle_binding(directory: Path, campaign_id: str, cycle_id: str,
+                         *, started_on: Optional[str] = None) -> None:
     marker = Path(directory) / artifact_locator.CYCLE_BINDING
-    data = artifact_locator.cycle_binding_bytes(campaign_id, cycle_id)
+    data = artifact_locator.cycle_binding_bytes(campaign_id, cycle_id, started_on=started_on)
     if marker.is_file() and not marker.is_symlink():
         if marker.read_bytes() != data:
             raise ProducerError("cycle-binding-conflict", str(marker))
@@ -923,6 +925,288 @@ def _route_naming(
     return slug, display_title, "derived-legacy-route", truncated
 
 
+UNASSIGNED_KEY = "_unassigned"
+
+
+def _campaign_naming(campaign_key: Optional[str]) -> Tuple[str, str, str, bool]:
+    """Return (slug, title, slug_source, truncated) for a *campaign* record.
+
+    A campaign is the work stream the agent proposed; its locator and title
+    come from that proposal, never from the first route that happened to
+    join it.  Deriving the campaign name from the first cycle's slug produced
+    ``<date>_tf-rehancer-analysis-cx`` for the stream ``tf-rehancer-icassp``
+    (TF-Rehancer 2026-09-15).  The reserved `_unassigned` container keeps its
+    fixed name.
+    """
+    if campaign_key is None:
+        return "unassigned", UNASSIGNED_KEY, "reserved", False
+    slug, truncated = artifact_locator.slugify(campaign_key, fallback="stream")
+    return slug, campaign_key, "campaign-key", truncated
+
+
+RECOVERED_SOURCE = "retirement-backup-mtime"
+
+
+def default_backup_store() -> Path:
+    state = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+    return Path(state) / "hearting" / "artifact-retirement"
+
+
+def _retirement_mtime_index(run_dir: Path) -> Dict[str, int]:
+    """``source path -> mtime`` of a retirement archive, cached beside it.
+
+    The archive is the pre-migration bytes with their original mtimes (the
+    W7C/W7G copies lost theirs). Listing a multi-GB gzip means decompressing
+    it once; the cache is keyed by the seal's archive digest."""
+    import tarfile
+    seal = _read_json(run_dir / "backup-seal.json") or {}
+    cache_path = run_dir / "mtime-index.json"
+    cached = _read_json(cache_path)
+    if (isinstance(cached, dict) and cached.get("archive_sha256") == seal.get("archive_sha256")
+            and isinstance(cached.get("members"), dict)):
+        return {str(k): int(v) for k, v in cached["members"].items()}
+    members: Dict[str, int] = {}
+    with tarfile.open(run_dir / "retired-sources.tar.gz", "r:gz") as archive:
+        for member in archive:
+            if member.isfile():
+                members[member.name] = int(member.mtime)
+    try:
+        _write_atomic(cache_path, _json_bytes({"schema_version": 1, "archive_sha256": seal.get("archive_sha256"),
+                                               "members": members}))
+    except OSError:
+        pass  # the cache is a convenience; the archive stays the source
+    return members
+
+
+def _retirement_digest_index(store: Path, root_id: str) -> Tuple[Dict[str, Tuple[str, int, str]], List[str]]:
+    """``sha256 -> (source path, mtime, run)`` over every retirement run of a root."""
+    by_sha: Dict[str, Tuple[str, int, str]] = {}
+    runs: List[str] = []
+    base = store / root_id
+    if not base.is_dir():
+        return by_sha, runs
+    for run_dir in sorted(p for p in base.iterdir() if p.is_dir()):
+        manifest = run_dir / "retired-manifest.jsonl"
+        if not manifest.is_file() or not (run_dir / "retired-sources.tar.gz").is_file():
+            continue
+        mtimes = _retirement_mtime_index(run_dir)
+        runs.append(run_dir.name)
+        for line in manifest.read_text(encoding="utf-8").splitlines():
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            source, sha = row.get("source"), row.get("sha256")
+            if isinstance(source, str) and isinstance(sha, str) and source in mtimes:
+                by_sha.setdefault(sha, (source, mtimes[source], run_dir.name))
+    return by_sha, runs
+
+
+def recover_cycle_times(root: Path, *, backup_store: Optional[Path] = None,
+                        apply: bool = False) -> Dict[str, Any]:
+    """Recover the start time of cycles that only know their work's date.
+
+    W7G resplit and W7H residue cycles were built from copies whose mtimes
+    were the copy time, so their records carry a date (or the resplit run
+    time) and no clock. The retirement backup of the same root keeps the
+    original files with their original mtimes, and its manifest keys them by
+    sha256. Each sealed artifact revision's ``content_digest`` therefore leads
+    back to the original file; the earliest such mtime is the cycle's
+    ``recovered_started_on`` (UTC, second precision), kept beside the
+    untouched ``started_on`` with its evidence. An mtime is a *last* write:
+    when the earliest one lands after the folder's date (a later bulk
+    rewrite), it cannot be the start, so it is stored as evidence only
+    (``recovered_earliest_write``) and the display keeps the date. Earlier
+    than the folder date means the folder date was wrong (a copy date) and
+    the recovered time wins. Dry run by default; ``apply``
+    holds the producer admission lock, journals every record pre-image under
+    ``.runtime/artifact-producer/v1/time-recovery/`` and rebuilds the indexes.
+    """
+    root = Path(root).resolve()
+    store = Path(backup_store) if backup_store is not None else default_backup_store()
+    identity = artifact_lifecycle.read_root_identity(root)
+    if identity is None:
+        raise ProducerError("root-identity-missing", str(root))
+    by_sha, runs = _retirement_digest_index(store, identity.artifact_root_id)
+    lock_fd = artifact_admission._acquire_lock(root, artifact_admission.LOCK_TIMEOUT_DEFAULT) if apply else None
+    journal: List[Dict[str, Any]] = []
+    try:
+        rows: List[Dict[str, Any]] = []
+        for record_path in sorted((producer_dir(root) / "cycles").glob("cyc_*.json")):
+            record = _read_json(record_path)
+            if not isinstance(record, dict):
+                continue
+            if not (record.get("derived_from_cycle_id") or record.get("started_on_source")):
+                continue  # a producer-born cycle already has its real clock
+            cycle_id = record["cycle_id"]
+            row: Dict[str, Any] = {"cycle_id": cycle_id, "locator": record.get("locator"),
+                                   "previous": record.get("recovered_started_on")}
+            try:
+                directory = artifact_locator.resolve_path(root, cycle_id)
+            except artifact_locator.LocatorError as exc:
+                rows.append({**row, "action": "unresolved", "detail": exc.code}); continue
+            if directory is None:
+                rows.append({**row, "action": "unresolved", "detail": "no-directory"}); continue
+            manifest = _read_json(directory / "manifest.json")
+            if not isinstance(manifest, dict):
+                rows.append({**row, "action": "no-manifest"}); continue
+            digests = [str(rev.get("content_digest", "")).split(":", 1)[-1]
+                       for rev in manifest.get("artifact_revisions", []) if isinstance(rev, dict)]
+            hits = [by_sha[d] for d in digests if d in by_sha]
+            row.update({"matched": len(hits), "total": len(digests)})
+            if not digests:
+                rows.append({**row, "action": "no-artifacts"}); continue
+            if not hits:
+                rows.append({**row, "action": "no-match"}); continue
+            earliest = min(h[1] for h in hits)
+            latest = max(h[1] for h in hits)
+            recovered = _rfc3339(earliest)
+            folder_date = str(record.get("locator") or "")[:10]
+            usable = not folder_date or recovered[:10] <= folder_date
+            evidence = {"matched": len(hits), "total": len(digests), "earliest": recovered,
+                        "latest": _rfc3339(latest), "backup_runs": sorted({h[2] for h in hits})}
+            row.update({"recovered_started_on": recovered if usable else None,
+                        "earliest_write": recovered, "latest_write": evidence["latest"],
+                        "backup_run": evidence["backup_runs"],
+                        "folder_date_agrees": recovered[:10] == folder_date,
+                        "display": "recovered" if usable else "evidence-only"})
+            if (record.get("recovered_earliest_write") == recovered
+                    and record.get("recovered_started_on") == (recovered if usable else None)):
+                rows.append({**row, "action": "already"}); continue
+            row["action"] = "recovered" if apply else "would-recover"
+            if apply:
+                journal.append({"cycle_id": cycle_id, "pre": dict(record)})
+                record["recovered_earliest_write"] = recovered
+                record["recovered_started_on_evidence"] = evidence
+                if usable:
+                    record["recovered_started_on"] = recovered
+                    record["recovered_started_on_source"] = RECOVERED_SOURCE
+                else:
+                    record.pop("recovered_started_on", None)
+                    record.pop("recovered_started_on_source", None)
+                _write_cycle_record(root, record, exclusive=False)
+            rows.append(row)
+        counts: Dict[str, int] = {}
+        for row in rows:
+            counts[row["action"]] = counts.get(row["action"], 0) + 1
+        result: Dict[str, Any] = {"status": "applied" if apply else "dry-run", "artifact_root": str(root),
+                                  "backup_store": str(store), "backup_runs": runs, "counts": counts,
+                                  "cycles": rows}
+        if apply and journal:
+            journal_dir = producer_dir(root) / "time-recovery"
+            _ensure_dir(journal_dir)
+            journal_file = journal_dir / (time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+                                          + "-" + os.urandom(3).hex() + ".jsonl")
+            _write_exclusive(journal_file, "".join(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n"
+                                                    for entry in journal).encode("utf-8"), 0o600)
+            result["journal"] = str(journal_file)
+            artifact_locator.rebuild_indexes(root)
+        return result
+    finally:
+        if lock_fd is not None:
+            artifact_admission._release_lock(root, lock_fd)
+
+
+def backfill_cycle_bindings(root: Path, *, apply: bool = False) -> Dict[str, Any]:
+    """Add ``started_on`` to readable-layout ``.cycle.json`` bindings that predate it.
+
+    The value follows ``artifact_locator.display_started_on``: a resplit cycle's
+    work date (D-79 ``resplit_started_on``, date-only), else the record's own
+    ``started_on``, else the sealed manifest's. Nothing is estimated from
+    directory names or mtimes: the field is display data and the record wins
+    (D-88). A binding that
+    already carries a different time is reported as ``conflict`` and left
+    alone. Dry run by default; ``apply`` holds the producer admission lock,
+    replaces each binding atomically and rebuilds the indexes. Idempotent.
+    """
+    root = Path(root).resolve()
+    lock_fd = artifact_admission._acquire_lock(root, artifact_admission.LOCK_TIMEOUT_DEFAULT) if apply else None
+    try:
+        rows: List[Dict[str, Any]] = []
+        counts: Dict[str, int] = {}
+        for campaign_path in artifact_locator.iter_campaign_dirs(root):
+            for entry, layout in artifact_locator.iter_cycle_dirs(campaign_path):
+                if layout != "readable":
+                    continue
+                rel = entry.relative_to(root).as_posix()
+                try:
+                    binding = artifact_locator.read_cycle_binding(entry)
+                except artifact_locator.LocatorError as exc:
+                    rows.append({"path": rel, "action": "invalid", "detail": exc.code})
+                    continue
+                if binding is None:
+                    rows.append({"path": rel, "action": "no-binding"})
+                    continue
+                cycle_id = binding["cycle_id"]
+                record = artifact_locator.read_cycle_record(root, cycle_id) or {}
+                manifest = artifact_locator._read_json(entry / "manifest.json") or {}
+                started_on = artifact_locator.display_started_on(record, manifest)
+                source = None
+                if started_on is not None:
+                    # `display_started_on` may have trimmed a placeholder clock; match on the prefix.
+                    source = ("record:resplit_started_on" if str(record.get("resplit_started_on")).startswith(started_on)
+                              else "record" if str(record.get("started_on")).startswith(started_on) else "manifest")
+                row: Dict[str, Any] = {"cycle_id": cycle_id, "path": rel, "source": source,
+                                       "started_on": started_on}
+                if started_on is None:
+                    row["action"] = "missing"
+                elif "started_on" in binding:
+                    row["action"] = "present" if binding["started_on"] == started_on else "conflict"
+                    if row["action"] == "conflict":
+                        row["binding_started_on"] = binding["started_on"]
+                else:
+                    row["action"] = "added" if apply else "would-add"
+                    if apply:
+                        data = artifact_locator.cycle_binding_bytes(
+                            binding["campaign_id"], cycle_id, started_on=started_on)
+                        _write_atomic(entry / artifact_locator.CYCLE_BINDING, data)
+                rows.append(row)
+        for row in rows:
+            counts[row["action"]] = counts.get(row["action"], 0) + 1
+        if apply and counts.get("added"):
+            artifact_locator.rebuild_indexes(root)
+        return {"status": "applied" if apply else "dry-run", "artifact_root": str(root),
+                "counts": counts, "cycles": rows}
+    finally:
+        if lock_fd is not None:
+            artifact_admission._release_lock(root, lock_fd)
+
+
+def list_campaign_summaries(root: Path, *, active_only: bool = True) -> List[Dict[str, Any]]:
+    """Cheap, read-only listing of the root's campaigns for callers that
+    must show the agent which work streams already exist (compose).
+
+    Reads each ``campaign.json`` once and treats a committed satisfaction
+    event as terminal; it never folds or validates like `read_campaign`, so
+    it is a summary surface, not admission authority.
+    """
+    root = Path(root)
+    rows: List[Dict[str, Any]] = []
+    for entry in artifact_locator.iter_campaign_dirs(root):
+        record = _read_json(entry / "campaign.json")
+        if not record or not isinstance(record.get("campaign_id"), str):
+            continue
+        state = str(record.get("state") or "unknown")
+        if (entry / artifact_campaign.EVENT_NAME).exists():
+            state = "satisfied"
+        if active_only and state != "active":
+            continue
+        cycles = record.get("cycles")
+        rows.append({
+            "campaign_id": record["campaign_id"],
+            "key": record.get("key"),
+            "title": record.get("title"),
+            "goal": record.get("goal"),
+            "locator": entry.name,
+            "state": state,
+            "degraded": record.get("degraded") is True,
+            "cycle_count": len(cycles) if isinstance(cycles, list) else 0,
+            "created_on": str(record.get("created_on") or ""),
+        })
+    rows.sort(key=lambda row: (row["created_on"], str(row["key"])), reverse=True)
+    return rows
+
+
 def _campaign_degradation(campaign: Mapping[str, Any]) -> Dict[str, Any]:
     if campaign.get("degraded") is True:
         return {"degraded": True, "degraded_reason": campaign.get("degraded_reason", "campaign-unassigned")}
@@ -1099,7 +1383,7 @@ def begin(
                 }
         index = artifact_admission.load_index(root)
         if campaign is None and campaign_key is None:
-            campaign = find_campaign_by_key(root, "_unassigned")
+            campaign = find_campaign_by_key(root, UNASSIGNED_KEY)
         campaign_created = False
         slug, display_title, slug_source, slug_truncated = _route_naming(
             route, campaign, title=title, goal=goal, root=root)
@@ -1108,18 +1392,22 @@ def begin(
             new_campaign_id = alloc.allocate("campaign")
             while new_campaign_id in index.stable_ids:
                 new_campaign_id = alloc.allocate("campaign")
+            # The campaign is named from the proposed stream key; the route
+            # slug names only this cycle (CONVENTIONS "Campaign or cycle").
+            campaign_slug, campaign_title, campaign_slug_source, campaign_slug_truncated = (
+                _campaign_naming(campaign_key))
             locator, locator_suffix = artifact_locator.allocate_locator(
-                root / "campaigns", started_on, slug if campaign_key else "unassigned")
+                root / "campaigns", started_on, campaign_slug)
             campaign = {
                 "schema_version": 1,
                 "contract": CONTRACT,
                 "campaign_id": new_campaign_id,
-                "key": campaign_key or "_unassigned",
+                "key": campaign_key or UNASSIGNED_KEY,
                 **({"degraded": True, "degraded_reason": "campaign-unassigned"} if campaign_key is None else {}),
-                "slug": slug if campaign_key else "unassigned",
-                "title": display_title if campaign_key else "_unassigned",
-                "slug_source": slug_source,
-                "slug_truncated": slug_truncated,
+                "slug": campaign_slug,
+                "title": campaign_title,
+                "slug_source": campaign_slug_source,
+                "slug_truncated": campaign_slug_truncated,
                 "locator": locator,
                 "locator_suffix": locator_suffix,
                 "goal": (goal or f"{route_capability} cycle output") if campaign_key else "Work stream not proposed",
@@ -1136,13 +1424,23 @@ def begin(
             # missing display fields are filled from this route for hybrid joins.
             campaign = dict(campaign)
             changed = False
+            existing_key = campaign.get("key")
+            fill_slug, fill_title, fill_source, fill_truncated = _campaign_naming(
+                None if existing_key in (None, UNASSIGNED_KEY) else str(existing_key))
             for key, value in (
-                ("slug", slug), ("title", display_title), ("slug_source", slug_source),
-                ("slug_truncated", slug_truncated),
+                ("slug", fill_slug), ("title", fill_title), ("slug_source", fill_source),
+                ("slug_truncated", fill_truncated),
             ):
                 if key not in campaign:
                     campaign[key] = value
                     changed = True
+            # A campaign promoted out of `_unassigned` by the §37 metadata
+            # amendment keeps the reserved placeholder title (the amendment
+            # writes key/goal only); every later manifest would seal
+            # `campaign.title = "_unassigned"`.  The key is the stream name.
+            if existing_key not in (None, UNASSIGNED_KEY) and campaign.get("title") == UNASSIGNED_KEY:
+                campaign["title"] = fill_title
+                changed = True
             if changed:
                 _write_campaign(root, campaign, exclusive=False)
         new_cycle_id = alloc.allocate("cycle")
@@ -1190,7 +1488,7 @@ def begin(
         _ensure_dir(target / "artifacts")
         campaign["cycles"] = list(campaign.get("cycles", [])) + [new_cycle_id]
         _write_campaign(root, campaign, exclusive=False)
-        _write_cycle_binding(target, campaign["campaign_id"], new_cycle_id)
+        _write_cycle_binding(target, campaign["campaign_id"], new_cycle_id, started_on=started_on)
         if binding_jobs is not None and binding_owner:
             try:
                 dispatch_terminal_commit.publish_producer_binding(
@@ -1286,7 +1584,11 @@ def _choose_primary(rows: Sequence[Tuple[str, bytes]], primary: Optional[str],
     if primary:
         candidate = primary if primary.startswith("artifacts/") else "artifacts/" + primary
         if candidate not in names:
-            raise ProducerError("primary-artifact-missing", primary)
+            shown = ", ".join(names[:6]) + (", ..." if len(names) > 6 else "")
+            raise ProducerError(
+                "primary-artifact-missing",
+                f"{primary} (expected a cycle-relative path under artifacts/; cycle outputs: {shown or 'none'})",
+            )
         return candidate
     for wanted in PRIMARY_CANDIDATES:
         for rel in names:
@@ -1364,6 +1666,22 @@ def validate_shared_reference_pins(root: Path, pins: Sequence[Mapping[str, Any]]
         except ProducerError as exc:
             violations.append({"index": i, "code": exc.code, "detail": exc.detail})
     return violations
+
+
+def _cycle_relative_primary(primary: Optional[str], directory: Path) -> Optional[str]:
+    """Map an absolute `--primary` that points inside this cycle's `artifacts/`
+    onto the cycle-relative form `_choose_primary` expects. Anything else is
+    returned unchanged so the existing `primary-artifact-missing` verdict still
+    names what the caller passed (2026-09-16 DX report: an absolute path failed
+    with no hint that only cycle-relative locators are accepted)."""
+    if not primary or not os.path.isabs(primary):
+        return primary
+    try:
+        rel = Path(primary).resolve().relative_to(Path(directory).resolve())
+    except (OSError, ValueError):
+        return primary
+    rel_posix = rel.as_posix()
+    return rel_posix if rel_posix.startswith("artifacts/") else primary
 
 
 def build_manifest(
@@ -2385,7 +2703,8 @@ def finalize(
             if parent is None or parent.get("state") != "sealed":
                 raise ProducerError("parent-cycle-not-sealed", record["parent_cycle_id"])
         document = build_manifest(
-            root, record, route, rows, state=state, primary=primary,
+            root, record, route, rows, state=state,
+            primary=_cycle_relative_primary(primary, directory),
             allow_open_route=allow_open_route, allocator=alloc, now=now,
             abandon_reason=abandon_reason, support_locators=support_locators,
         )
@@ -3442,6 +3761,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p = sub.add_parser("status")
     p.add_argument("--artifact-root", required=True)
 
+    p = sub.add_parser("campaign-list", help="summarize the root's campaigns (keys, titles, cycle counts)")
+    p.add_argument("--artifact-root", required=True)
+    p.add_argument("--all-states", action="store_true", help="include satisfied/superseded campaigns")
+
+    p = sub.add_parser("cycle-binding-backfill",
+                       help="add started_on to .cycle.json bindings written before the field existed")
+    p.add_argument("--artifact-root", required=True)
+    p.add_argument("--apply", action="store_true", help="write the bindings (default: dry run)")
+
+    p = sub.add_parser("cycle-time-recovery",
+                       help="recover migrated cycles' start times from the retirement backup's original mtimes")
+    p.add_argument("--artifact-root", required=True)
+    p.add_argument("--backup-store", help="retirement store (default: $XDG_STATE_HOME/hearting/artifact-retirement)")
+    p.add_argument("--apply", action="store_true", help="write recovered_started_on into records (default: dry run)")
+
     for command in ("campaign-status", "campaign-close", "campaign-recover"):
         p = sub.add_parser(command, help="verify, accept, or recover a campaign's administrative closure")
         p.add_argument("--artifact-root", required=True)
@@ -3480,7 +3814,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--artifact-root", required=True)
     p.add_argument("--cycle", required=True)
     p.add_argument("--state", default="completed", choices=["completed", "abandoned"])
-    p.add_argument("--primary")
+    p.add_argument("--primary", help="primary artifact as a cycle-relative locator "
+                   "(artifacts/<bucket>/<file>); an absolute path inside this cycle's artifacts/ is accepted")
     p.add_argument("--publication", default="not-offered")
     p.add_argument("--allow-open-route", action="store_true")
     p.add_argument("--adopt-root-output", action="append", default=[])
@@ -3556,6 +3891,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                               w7=w7, approval_receipt_sha256=args.approval_receipt_sha256)
         elif args.command == "status":
             result = status(root)
+        elif args.command == "campaign-list":
+            rows = list_campaign_summaries(root, active_only=not args.all_states)
+            result = {"status": "ok", "artifact_root": str(Path(root).resolve()), "campaigns": rows}
+        elif args.command == "cycle-binding-backfill":
+            result = backfill_cycle_bindings(root, apply=args.apply)
+        elif args.command == "cycle-time-recovery":
+            result = recover_cycle_times(root, apply=args.apply,
+                                         backup_store=Path(args.backup_store) if args.backup_store else None)
         elif args.command == "campaign-status":
             result = artifact_campaign.status(root, args.campaign)
         elif args.command in {"campaign-close", "campaign-recover"}:

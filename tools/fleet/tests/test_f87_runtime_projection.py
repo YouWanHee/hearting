@@ -31,6 +31,8 @@ class RuntimeProjectionTest(unittest.TestCase):
         for name in self._WORKER_ENV:
             env.pop(name, None)
         env.update({"AGENT_HOME": str(root / "agent"), "HOME": str(root / "home"),
+                    "CLAUDE_CONFIG_DIR": str(root / "home" / ".claude"),
+                    "HARNESS_CAPACITY_REFRESH_DISABLE": "1",
                     "CODEX_HOME": str(root / "codex"), "FLEET_TITLE_STATE_DIR": str(root / "titles"),
                     "PYTHONDONTWRITEBYTECODE": "1"})
         env.update(overrides)

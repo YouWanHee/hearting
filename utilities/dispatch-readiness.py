@@ -36,6 +36,23 @@ def _unique(values: list[str]) -> list[str]:
     return list(dict.fromkeys(values))
 
 
+KNOWN_HARNESSES = ("claude", "codex", "opencode")
+
+
+def _split_harness_values(values) -> list[str]:
+    """Accept both `--child-harness a --child-harness b` and `--child-harness a,b`.
+
+    The comma form used to fail as `dispatch-readiness-harness-unknown` with no
+    hint that the flag repeats (2026-09-16 DX report)."""
+    out: list[str] = []
+    for value in values or ():
+        for part in str(value).split(","):
+            part = part.strip()
+            if part:
+                out.append(part)
+    return out
+
+
 def generate(
     *,
     worktree: Path,
@@ -51,16 +68,19 @@ def generate(
     if not jobs.is_absolute():
         raise ReadinessError("owner-registry-path-not-absolute")
     jobs = jobs.resolve()
-    parents = _unique(owner_harnesses)
-    children = _unique(child_harnesses)
+    parents = _unique(_split_harness_values(owner_harnesses))
+    children = _unique(_split_harness_values(child_harnesses))
     if not parents or not children:
         raise ReadinessError("dispatch-readiness-tuples-empty")
-    disabled = disabled_harnesses or set()
-    unknown = (set(parents) | set(children) | disabled) - {
-        "claude", "codex", "opencode"
-    }
+    disabled = set(_split_harness_values(disabled_harnesses or ()))
+    unknown = (set(parents) | set(children) | disabled) - set(KNOWN_HARNESSES)
     if unknown:
-        raise ReadinessError("dispatch-readiness-harness-unknown")
+        raise ReadinessError(
+            "dispatch-readiness-harness-unknown: "
+            + ",".join(sorted(unknown))
+            + f" (known: {','.join(KNOWN_HARNESSES)}; repeat --owner-harness/--child-harness "
+            "per value or separate values with commas)"
+        )
 
     rows: list[dict[str, Any]] = []
     for parent in parents:

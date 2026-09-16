@@ -4,6 +4,10 @@
 
 ## 1. Layers
 
+[Loop Engineering](LOOP_ENGINEERING.md) is Hearting's maintainer design standard:
+responsibility through execution, recovery, closure and acknowledged handoff,
+with a simpler caller surface. It distinguishes principles from verified implementation.
+
 | Layer | Owns | Portable? |
 |---|---|---|
 | Core | workflow, artifact layout, memory lifecycle, QA tiers, model roles, safety invariants | yes |
@@ -146,7 +150,7 @@ ownership, moves or deletion.
 | `documents/` | document drafts and refinement artifacts | `C-DUR` |
 | `experiments/` | experiment setup, evaluation, and run logs (declared, currently absent — a reserved boundary, not an error) | `C-DUR` |
 | `designs/` | standalone design decision records (declared, currently absent — a reserved boundary, not an error; spec-owned design instead anchors at `spec/design/`) | `C-DUR` |
-| `campaigns/` | W7C producer output: `campaigns/<campaign-locator>/<cycle-locator>/artifacts/<bucket>/…` plus machine-managed `campaign.json`, per-cycle `.cycle.json` stable-ID binding, and `manifest.json` commit point; the only new-write target once the write-cutover is active (`utilities/artifact_producer.py`) | `C-DUR` |
+| `campaigns/` | W7C producer output: `campaigns/<campaign-locator>/<cycle-locator>/artifacts/<bucket>/…` plus machine-managed `campaign.json`, per-cycle `.cycle.json` stable-ID binding (with the cycle's start time), and `manifest.json` commit point; an optional digest-bound campaign-level `RUNLOG.md` may preserve a migrated aggregate run log without manufacturing a cycle; the only new-write target once the write-cutover is active (`utilities/artifact_producer.py`) | `C-DUR` |
 | `shared/` | immutable shared revisions `shared/<spec\|analysis\|research>/<ref>/revisions/<rrev>/…`; created only by `admit-shared` from a sealed cycle, research only with an explicit promotion; never a direct write target | `C-DUR` |
 | `_internal/` | cycle-internal support material — a cycle's child, not an independent entry | `C-INT` |
 | `reviews/` | review support material | `C-INT` |
@@ -232,9 +236,13 @@ the locator and reason before payload reads or manifest publication.
 **Campaign closure.** `artifact_producer.py campaign-status|campaign-close|campaign-recover`
 owns administrative satisfaction. Status verifies the campaign's exact cycle
 membership, sealed manifests and their payloads and prints a reviewable goal,
-criterion and approval statement bound to that snapshot. Sealed abandoned
-cycles remain abandoned; this operation neither repairs route failure markers
-nor adds a residual-zero criterion. All cycles being sealed never substitutes
+criterion and approval statement bound to that snapshot. Membership is the
+set of member records: an output-less cycle that `finalize` removed from
+`campaign.cycles` keeps its `abandoned`/`no-lineage` record for audit and is
+reported under `detached_cycles` instead of drift
+(`artifact_campaign.is_member_record` is the one definition both sides use).
+Sealed abandoned cycles remain abandoned; this operation neither repairs route
+failure markers nor adds a residual-zero criterion. All cycles being sealed never substitutes
 for the user's acceptance of the goal and criterion. Close accepts the exact
 statement only from a native user message in the named session, derives the
 user actor from that evidence, and rechecks the snapshot under the producer's
@@ -246,6 +254,56 @@ is preserved, and campaign-recover completes only that committed projection.
 Cycle manifests and route evidence remain immutable. Unavailable native
 evidence leaves closure pending and reports the explicit approval statement;
 an agent never submits that statement on the user's behalf.
+
+**Campaign metadata amendment.** `artifact_metadata_amendment.py
+prepare|apply|verify` is the sole supported correction surface for an active
+`_unassigned` campaign whose missing assignment is the exact and only degraded
+condition. It changes only `campaign.json.key` and `.goal`, removes only the
+exact `degraded=true` / `degraded_reason=campaign-unassigned` marker, and writes
+the producer-owned
+`.runtime/artifact-producer/v1/campaign-metadata-amendments.json` and
+`cycle-display-titles.json` declarations. Each declaration is bound to the
+sealed evidence by sorted, duplicate-free manifest revision IDs and canonical
+parsed-JSON digests. The transaction holds the producer admission lock,
+revalidates a prepared byte preimage before writing, journals exact rollback
+bytes, rejects races or foreign bindings, and makes an identical replay
+idempotent. Stable root, repository, campaign, cycle, manifest, artifact and
+revision IDs; campaign membership; parent lineage; locator names; existing
+campaign display-title declarations; and sealed manifest, cycle, payload,
+route, shared-reference and artifact bytes remain unchanged. Any other
+degraded reason, closed campaign, non-placeholder key or incomplete sealed
+cycle set is refused before mutation.
+
+**Campaign/cycle locator amendment.** `artifact_locator_amendment.py
+prepare|apply|verify` is the sole supported correction surface when an applied
+campaign metadata amendment has left an `_unassigned` physical locator or
+sealed cycle names that hide their revision order. It moves the campaign and
+its named cycle directories to collision-free `<date>_<slug>` canonical
+locators, updates only the corresponding locator/slug/title record fields,
+the cycle display-title declaration, campaign display-title locator, and both
+derived indexes. Stable IDs, campaign membership and order, parent lineage,
+sealed manifest, `.cycle.json`, artifact, route/outcome and shared-reference
+bytes remain unchanged. Old route evidence paths stay readable through
+root-contained relative symlink redirects; authoritative locator scans ignore
+those redirects and index only real canonical directories. Prepare and apply
+hold the producer admission lock, bind exact directory and byte preimages to a
+durable journal, reject target collisions or foreign manifest bindings, roll
+back interrupted partial moves only from recognized pre/post states, and make
+an identical committed replay verify-only and idempotent.
+
+**Campaign run log correction.** A legacy aggregate `experiments/_RUNLOG.md`
+that W7G mechanically promoted into a one-file cycle has no independent work
+boundary. `artifact_resplit.py repair-runlog-cycle` is the sole correction
+surface: it accepts only an active campaign's sealed resplit cycle whose one
+primary experiment revision is exactly that locator, requires an exact dry-run
+expectation and an external verified backup, preserves the Markdown bytes as
+`campaigns/<campaign-locator>/RUNLOG.md`, records its digest and source cycle in
+`campaign.json.runlog`, removes only that cycle's live projection, appends a
+compatibility redirect, and rebuilds derived indexes. The campaign run log is
+metadata, not a cycle or closure criterion. Historical manifests, migration
+journals, and compatibility maps outside the named projection remain
+byte-identical; the named manifest and route records are retired whole after
+backup rather than rewritten.
 
 **Exactly one disposition.** Except for `_scratch/`, every regular file and
 container under the artifact root has exactly one disposition, and none is left

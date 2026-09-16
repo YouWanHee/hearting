@@ -279,7 +279,8 @@ class WorkStartTest(unittest.TestCase):
             route = router.compose_route(capability="autopilot-code", capability_mode="dev", shape="staged",
                 graph="frame,frame-alternative,test,report", slug="work-start", cwd=W.ROOT,
                 artifact_root=self.tmp.name, dispatch_evidence=evidence, parent_harness="codex", profile="light",
-                work_request={"text":"Run both commands and record exit 7 and exit 0.","owner_harness":"codex"})
+                work_request={"text":"Run both commands and record exit 7 and exit 0.","owner_harness":"codex"},
+                unassigned=True)
             router.verify_route(route, W.ROOT)
             self.path.write_text(json.dumps(route))
             for node in ("frame", "frame-alternative", "owner"):

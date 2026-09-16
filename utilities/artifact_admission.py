@@ -669,28 +669,42 @@ def _write_index(root: Path, index: artifact_index.IndexDocument) -> None:
     _atomic_write_bytes(_index_path(root), artifact_index.canonical_bytes(index))
 
 
-def _known_idempotency_keys(root: Path) -> Dict[str, str]:
-    """Map `cycle_path -> idempotency_key` recovered from the current index."""
+def _known_idempotency_keys(root: Path) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """Recover caller-supplied idempotency keys from the current index.
+
+    Returns ``(by_cycle_id, by_cycle_path)``.  The stable cycle id is the
+    primary join: a campaign or cycle directory that was renamed (locator
+    amendment, or a hand rename D-89 tolerates) still carries its
+    ``cycle.cycle_id`` in the sealed manifest, so the key survives a rebuild
+    and an exact retry stays a no-op.  Matching by path alone silently fell
+    back to `manifest_id` after every rename (TF-Rehancer 2026-09-15, three
+    `fallback_idempotency_keys`).  The path map remains for manifests whose
+    cycle id is absent.
+    """
     payload = _read_json(_index_path(root))
     if not isinstance(payload, dict):
-        return {}
+        return {}, {}
     try:
         index = artifact_index.parse(payload)
     except Exception:
-        return {}
+        return {}, {}
     cycle_paths = {
         cycle_id: row.get("cycle_path")
         for cycle_id, row in index.cycles.items()
         if isinstance(row, dict)
     }
-    keys = {}
+    by_cycle: Dict[str, str] = {}
+    by_path: Dict[str, str] = {}
     for key, row in index.manifests.items():
-        if not isinstance(row, dict):
+        if not isinstance(row, dict) or not isinstance(key, str):
             continue
-        cycle_path = cycle_paths.get(row.get("cycle_id"))
-        if isinstance(cycle_path, str) and isinstance(key, str):
-            keys[cycle_path] = key
-    return keys
+        cycle_id = row.get("cycle_id")
+        if isinstance(cycle_id, str):
+            by_cycle[cycle_id] = key
+        cycle_path = cycle_paths.get(cycle_id)
+        if isinstance(cycle_path, str):
+            by_path[cycle_path] = key
+    return by_cycle, by_path
 
 
 def _compute_rebuilt_index(
@@ -699,7 +713,7 @@ def _compute_rebuilt_index(
     root = Path(root)
     identity = ensure_root_identity(root)
     campaigns_dir = root / "campaigns"
-    known_keys = _known_idempotency_keys(root)
+    known_by_cycle, known_by_path = _known_idempotency_keys(root)
     fallback_keys: List[str] = []
     items = []
     if campaigns_dir.exists():
@@ -734,7 +748,11 @@ def _compute_rebuilt_index(
                 # index itself is gone do we fall back to the manifest id, and
                 # that fallback is recorded as such rather than silently
                 # producing a different document.
-                idempotency_key = known_keys.get(cycle_path)
+                cycle_row = document.get("cycle")
+                cycle_id = cycle_row.get("cycle_id") if isinstance(cycle_row, dict) else None
+                idempotency_key = known_by_cycle.get(cycle_id) if isinstance(cycle_id, str) else None
+                if idempotency_key is None:
+                    idempotency_key = known_by_path.get(cycle_path)
                 if idempotency_key is None:
                     idempotency_key = document.get("manifest_id")
                     fallback_keys.append(idempotency_key)

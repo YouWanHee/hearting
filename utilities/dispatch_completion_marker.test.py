@@ -86,7 +86,7 @@ class CompletionMarkerTest(unittest.TestCase):
                 else:
                     os.environ[key] = value
 
-    def compile_route(self):
+    def compile_route(self, intensity="strong"):
         rows = [
             {
                 "parent_harness": harness,
@@ -118,8 +118,8 @@ class CompletionMarkerTest(unittest.TestCase):
         with mock.patch.dict(os.environ, self.base_env(), clear=True):
             ROUTE._forget_launch_path(ROOT)
             route = ROUTE.compile_route(
-                "autopilot-code", "dev", "strong", self.repo, self.artifact,
-                signals=["shared-contract"], transport="headless", tracking="tracked",
+                "autopilot-code", "dev", intensity, self.repo, self.artifact,
+                signals=["shared-contract"] if intensity == "strong" else [], transport="headless", tracking="tracked",
                 tracked_gate_evidence=gate, dispatch_evidence=evidence,
             )
         self.current_route = route
@@ -943,9 +943,9 @@ class CompletionMarkerTest(unittest.TestCase):
         "launch_outcome=governed-process-group-drained"
     )
 
-    def review_blocking_row(self, attempt_id, round_no, *, note=None, artifact=True):
+    def review_blocking_row(self, attempt_id, round_no, *, note=None, artifact=True, directory=None):
         """One finished plan-check review round: exact log + readable in-root artifact."""
-        review = self.artifact / "_internal" / "plan_reviews" / f"round_{round_no}.md"
+        review = (directory or self.artifact) / "_internal" / "plan_reviews" / f"round_{round_no}.md"
         review.parent.mkdir(parents=True, exist_ok=True)
         if artifact:
             review.write_text(f"## Plan Review Results\nround {round_no}: 1 blocking finding\n",
@@ -985,6 +985,231 @@ class CompletionMarkerTest(unittest.TestCase):
             encoding="utf-8",
         )
         return memo
+
+    def continuation_closure_fixture(self):
+        """Real producer admission, official lineage and preserved source FAILs."""
+        import artifact_producer as P
+        self.jobs = self.stable_dispatch / "jobs.log"
+        self.jobs.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.jobs.touch(mode=0o600)
+        route = self.compile_route("standard")
+        env = self.base_env()
+        # Empty issued cycles exercise the cutover contract that the historical
+        # same-route fixtures (unbound legacy artifact roots) did not reach.
+        with mock.patch.dict(os.environ, env, clear=True):
+            source_path = ROUTE.canonical_route_path(self.artifact, route["route_id"])
+            source_path.parent.mkdir(parents=True, exist_ok=True)
+            source_path.write_text(json.dumps(route))
+            issued = P.begin(self.artifact, route_file=source_path, capability=route["capability"],
+                             intensity=route["effective_intensity"], require_cycle=True)
+            source_output = Path(issued["cycle_dir"]) / "artifacts"
+            r1 = self.review_blocking_row("att-source-review-r1", 1, directory=source_output)
+            r2 = self.review_blocking_row("att-source-review-r2", 2, directory=source_output)
+            # Real, reaped session leaders, observed from their own namespace.
+            # No namespace mismatch or missing PID is synthesized as proof.
+            for attempt in ("att-source-review-r1", "att-source-review-r2"):
+                child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
+                                         stdin=subprocess.PIPE, start_new_session=True)
+                start = D.process_start_ticks(child.pid)
+                namespace = D.process_namespace_identity(child.pid)
+                child.communicate(timeout=5)
+                self.assertIsNotNone(start)
+                self.assertIsNotNone(namespace)
+                rows = self.jobs.read_text().splitlines()
+                self.jobs.write_text("\n".join(
+                    line + (f",pid={child.pid},pid_start={start},pgid={child.pid},"
+                            f"pid_ns={namespace},pid_observer_ns={namespace}"
+                            if f"attempt_id={attempt}," in line else "") for line in rows) + "\n")
+            continuation = ROUTE.build_continuation_route(
+                route, resume_from_node=route["nodes"][0]["id"], requested_boundary=route["nodes"][0]["id"],
+                reason="fixture continuation", artifact_root=self.artifact,
+            )
+            continuation_path = ROUTE.canonical_route_path(self.artifact, continuation["route_id"])
+            continuation_path.write_text(json.dumps(continuation))
+            current = P.begin(self.artifact, route_file=continuation_path, capability=route["capability"],
+                              intensity=route["effective_intensity"], require_cycle=True)
+            output = Path(current["cycle_dir"]) / "artifacts"
+            memo = self.owner_closure(continuation, directory=output / "_internal/plan_reviews",
+                                      attempts=("att-source-review-r1", "att-source-review-r2"),
+                                      artifacts=(r1.name, r2.name))
+            node = next(n for n in continuation["nodes"] if n["id"] == "plan-check")
+            for dependency in node["depends_on"]:
+                predecessor = next(n for n in continuation["nodes"] if n["id"] == dependency)
+                evidence = output / f"{dependency}.md"
+                evidence.write_text("fixture predecessor result\n")
+                ROUTE._publish_completion_locked(
+                    continuation, predecessor, dependency, evidence, jobs=self.jobs,
+                    attempt_id=f"att-inline-{dependency}-fixture", attempt_metadata={
+                        "attempt_schema_version": 2, "dispatch_depth": predecessor["dispatch_depth"],
+                        "transport": "interactive", "execution_surface": "inline",
+                        "registered_worker": False, "fallback_hop": "inline",
+                    },
+                )
+        return route, continuation, continuation_path, node, memo, (r1, r2)
+
+    def test_continuation_closure_preserves_source_and_unblocks_consumer(self):
+        source, route, path, node, memo, reviews = self.continuation_closure_fixture()
+        before = self.jobs.read_bytes(), tuple(p.read_bytes() for p in reviews)
+        with mock.patch.dict(os.environ, self.base_env(), clear=True):
+            # The original producer boundary remains closed to this memo.
+            import artifact_producer as P
+            with self.assertRaisesRegex(P.ProducerError, "artifact-outside-bound-cycle"):
+                P.require_cycle_output(self.artifact, memo, route_id=source["route_id"])
+            proof = ROUTE.continuation_owner_closure_plan(route, node, memo, self.jobs, "att-source-review-r2")
+            self.assertEqual(proof["rounds"], 2)
+            target = ROUTE.completion_dir(route["route_id"]) / "plan-check.json"
+            self.assertFalse(target.exists())
+            marker, receipt = ROUTE.complete_node(route, node, node["id"], memo, self.jobs, "att-source-review-r2")
+            self.assertEqual(receipt["source_rows_changed"], 0)
+            self.assertEqual(marker["review_independence"], "owner-overridden")
+            self.assertFalse(marker["registered_worker"])
+            self.assertTrue(D.completion_marker_is_current(route, node, target), marker)
+            self.assertEqual(D.completion_attempt_readiness(route, node, marker, self.jobs).state, "ready")
+            self.assertTrue(ROUTE._marker_identity_row(route, node, node["id"], node["completion_gate"],
+                                                       jobs=self.jobs, exact_terminal=True)["passed"])
+            consumer = next(n for n in route["nodes"] if "plan-check" in n.get("depends_on", []))
+            # All adapters call this shared gate before they can spawn.
+            D.completion_marker_gate(path, consumer["id"], "start", self.agent_home, jobs=self.jobs)
+            bytes_before = target.read_bytes()
+            again, _ = ROUTE.complete_node(route, node, node["id"], memo, self.jobs, "att-source-review-r2")
+            self.assertEqual(marker, again)
+            self.assertEqual(target.read_bytes(), bytes_before)
+            self.assertFalse(target.with_name("plan-check.2.json").exists())
+            self.assertFalse((ROUTE.completion_dir(source["route_id"]) / "plan-check.json").exists())
+        self.assertEqual(before, (self.jobs.read_bytes(), tuple(p.read_bytes() for p in reviews)))
+
+    def test_continuation_source_locator_does_not_change_lineage_hash(self):
+        """A CLI filesystem path is invocation context, never route identity."""
+        source, _route, path, _node, _memo, _reviews = self.continuation_closure_fixture()
+        verified = ROUTE.verify_route(json.loads(path.read_text()))
+        original_hash = verified["route_hash"]
+        verified["route_file"] = str(path)
+        self.assertEqual(ROUTE.route_hash(verified), original_hash)
+        verified.pop("route_file")
+        continuation = ROUTE.build_continuation_route(
+            verified, resume_from_node="test", requested_boundary="test",
+            reason="locator regression", artifact_root=self.artifact,
+        )
+        self.assertEqual(verified["route_hash"], original_hash)
+        self.assertEqual(continuation["source_route_hash"], original_hash)
+
+    def test_continuation_closure_refuses_missing_dependency_and_live_round(self):
+        source, route, path, node, memo, reviews = self.continuation_closure_fixture()
+        with mock.patch.dict(os.environ, self.base_env(), clear=True):
+            dependency = ROUTE.completion_dir(route["route_id"]) / f"{node['depends_on'][0]}.json"
+            original = dependency.read_bytes()
+            dependency.unlink()
+            with self.assertRaisesRegex(ValueError, "dependency-unproven"):
+                ROUTE.continuation_owner_closure_plan(route, node, memo, self.jobs, "att-source-review-r2")
+            dependency.write_bytes(original)
+            self.current_route = route
+            self.write_row("open", "new-review", "att-current-review", "worker_type=review", node_id="plan-check")
+            before = self.jobs.read_bytes()
+            with self.assertRaisesRegex(ValueError, "round-still-open"):
+                ROUTE.complete_node(route, node, node["id"], memo, self.jobs, "att-source-review-r2")
+            self.assertEqual(self.jobs.read_bytes(), before)
+            self.assertFalse((ROUTE.completion_dir(route["route_id"]) / "plan-check.json").exists())
+
+    def test_continuation_closure_recovers_interrupted_publication(self):
+        source, route, path, node, memo, reviews = self.continuation_closure_fixture()
+        with mock.patch.dict(os.environ, self.base_env(), clear=True):
+            target = ROUTE.completion_dir(route["route_id"]) / "plan-check.json"
+            before = self.jobs.read_bytes()
+            write = ROUTE.atomic_write
+            def crash_after_history(path, value):
+                if Path(path) == target:
+                    raise OSError("fixture crash after immutable history")
+                return write(path, value)
+            with mock.patch.object(ROUTE, "atomic_write", side_effect=crash_after_history):
+                with self.assertRaisesRegex(OSError, "fixture crash"):
+                    ROUTE.complete_node(route, node, node["id"], memo, self.jobs, "att-source-review-r2")
+            self.assertFalse(target.exists())
+            history = target.with_name("plan-check.1.json").read_bytes()
+            marker, _ = ROUTE.complete_node(route, node, node["id"], memo, self.jobs, "att-source-review-r2")
+            self.assertEqual(marker["sequence"], 1)
+            self.assertEqual(target.with_name("plan-check.1.json").read_bytes(), history)
+            self.assertFalse(target.with_name("plan-check.2.json").exists())
+            target.unlink()  # Also recover when the exact attempt link exists.
+            again, _ = ROUTE.complete_node(route, node, node["id"], memo, self.jobs, "att-source-review-r2")
+            self.assertEqual(again, marker)
+            self.assertTrue(D.completion_marker_is_current(route, node, target))
+            link = ROUTE._attempt_completion_path(route, node["id"], "att-source-review-r2", jobs=self.jobs)
+            original_link = link.read_bytes()
+            link.unlink()
+            self.assertFalse(D.completion_marker_is_current(route, node, target))
+            ROUTE.complete_node(route, node, node["id"], memo, self.jobs, "att-source-review-r2")
+            self.assertEqual(link.read_bytes(), original_link)
+            self.assertTrue(D.completion_marker_is_current(route, node, target))
+            self.assertEqual(self.jobs.read_bytes(), before)
+
+    def test_continuation_closure_check_cli_is_read_only(self):
+        source, route, path, node, memo, reviews = self.continuation_closure_fixture()
+        def snapshot():
+            return {str(p.relative_to(self.base)): p.read_bytes()
+                    for root in (self.artifact, self.stable_dispatch) for p in root.rglob("*") if p.is_file()}
+        before = snapshot()
+        result = subprocess.run([sys.executable, str(ROOT / "utilities/capability-route.py"),
+                                 "complete", "--check", "--route", str(path), "--node", node["id"],
+                                 "--evidence", str(memo), "--jobs", str(self.jobs),
+                                 "--attempt-id", "att-source-review-r2"],
+                                env=self.base_env(), capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(json.loads(result.stdout)["read_only"])
+        self.assertEqual(snapshot(), before)
+
+    def test_continuation_closure_unknown_conflict_and_changed_review_hold_consumption(self):
+        source, route, path, node, memo, reviews = self.continuation_closure_fixture()
+        with mock.patch.dict(os.environ, self.base_env(), clear=True):
+            marker, _ = ROUTE.complete_node(route, node, node["id"], memo, self.jobs, "att-source-review-r2")
+            target = ROUTE.completion_dir(route["route_id"]) / "plan-check.json"
+            original_marker, original_rows = target.read_bytes(), self.jobs.read_bytes()
+            with mock.patch.object(D, "attempt_process_quiescence", return_value=D.ProcessQuiescence("unverifiable", "namespace-not-visible")):
+                ready = D.completion_attempt_readiness(route, node, marker, self.jobs)
+                self.assertEqual(ready.state, "unverifiable")
+                self.assertIn("namespace-not-visible", ready.reason)
+            # A currently unresolved conflict cannot consume the old receipt.
+            with mock.patch.object(D, "terminal_conflict_pending", return_value=True):
+                self.assertFalse(D.completion_marker_is_current(route, node, target))
+                self.assertEqual(D.completion_attempt_readiness(route, node, marker, self.jobs).state, "unverifiable")
+            reviews[0].write_text("changed findings\n")
+            self.assertFalse(D.completion_marker_is_current(route, node, target))
+            with self.assertRaisesRegex(ValueError, "node-already-complete"):
+                ROUTE.complete_node(route, node, node["id"], memo, self.jobs, "att-source-review-r2")
+            self.assertEqual(target.read_bytes(), original_marker)
+            self.assertEqual(self.jobs.read_bytes(), original_rows)
+
+    def test_continuation_closure_rejects_sibling_wrong_cycle_and_forged_lineage(self):
+        source, route, path, node, memo, reviews = self.continuation_closure_fixture()
+        with mock.patch.dict(os.environ, self.base_env(), clear=True):
+            old_memo = self.owner_closure(source, directory=reviews[0].parent,
+                                         attempts=("att-source-review-r1", "att-source-review-r2"),
+                                         artifacts=tuple(p.name for p in reviews))
+            with self.assertRaisesRegex(Exception, "artifact-outside-bound-cycle"):
+                ROUTE.continuation_owner_closure_plan(route, node, old_memo, self.jobs, "att-source-review-r2")
+            forged = copy.deepcopy(route)
+            forged["source_route_hash"] = "sha256:" + "f" * 64
+            with self.assertRaisesRegex(ValueError, "lineage-hash-mismatch"):
+                ROUTE.continuation_owner_closure_plan(forged, node, memo, self.jobs, "att-source-review-r2")
+            source_path = ROUTE.canonical_route_path(self.artifact, source["route_id"])
+            original = source_path.read_bytes()
+            changed = copy.deepcopy(source)
+            next(n for n in changed["nodes"] if n["id"] == node["id"])["unit"] = "qa/another-review"
+            source_path.write_text(json.dumps(changed))
+            with self.assertRaisesRegex(ValueError, "lineage-hash-mismatch"):
+                ROUTE.continuation_owner_closure_plan(route, node, memo, self.jobs, "att-source-review-r2")
+            source_path.write_bytes(original)
+            self.assertFalse((ROUTE.completion_dir(route["route_id"]) / "plan-check.json").exists())
+
+    def test_continuation_round_census_is_shared_with_dispatch_and_not_reset_by_slug(self):
+        source, route, path, node, memo, reviews = self.continuation_closure_fixture()
+        spec = importlib.util.spec_from_file_location("closure_dispatch_node", ROOT / "utilities/dispatch-node.py")
+        dispatch = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(dispatch)
+        with mock.patch.dict(os.environ, self.base_env(), clear=True):
+            rounds = dispatch.prior_round_attempts(self.jobs, route["route_id"], node["id"],
+                                                   exclude_slug="plan-check-r2", route=route)
+            self.assertEqual(len(rounds), 2)
+            self.assertEqual([note for slug, note in rounds], ["completed-review-blocking"] * 2)
 
     def test_two_blocking_rounds_with_owner_closure_publish_the_marker(self):
         route = self.compile_route()          # strong -> review round cap 2

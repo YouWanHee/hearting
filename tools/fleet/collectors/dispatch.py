@@ -573,6 +573,8 @@ def _build_codex_rollout_index(jobs):
     for job in jobs:
         if getattr(job, "harness", None) != "codex" or not getattr(job, "cwd", None):
             continue
+        if model.has_attempt_identity(vars(job)):
+            continue
         row_kwargs = (
             {"job": job}
             if getattr(job, "_registry_path", None) or getattr(job, "_launch_home", None)
@@ -930,11 +932,14 @@ def _dispatch_liveness(job, now, track=True, codex_index=None):
         # A loop proc row is decided by tier-2 evidence; skip the mtime probe entirely
         # (it was never consulted on that path pre-F-25 either).
         "transcript": (
-            None if is_loop else _job_transcript_signal(
+            None if is_loop or model.has_attempt_identity(vars(job)) else _job_transcript_signal(
                 job, now, codex_index=codex_index
             )
         ),
         "proc_liveness": getattr(job, "_proc_liveness", None),
+        "exec_child": getattr(job, "exec_child", None),
+        "runtime_activity": getattr(job, "_runtime_activity", None),
+        "runtime_session_id": getattr(job, "_runtime_session_id", None),
         "row_terminal_mismatch": bool(getattr(job, "row_terminal_mismatch", False)),
     }
     state, evidence = model.classify_job(ev_in, now,
@@ -1467,14 +1472,17 @@ def _enrich_claude_stream_session(job):
 
 
 def _codex_attempt_thread_ids(lines):
-    """Pull every ``thread_id`` off ``thread.started`` rows in ``lines``."""
+    """Read thread identity from native exec or supervised App Server events."""
     thread_ids = set()
     for line in lines:
         try:
             payload = json.loads(line)
         except Exception:
             continue
-        if isinstance(payload, dict) and payload.get("type") == "thread.started":
+        if isinstance(payload, dict) and payload.get("type") in {
+            "thread.started", "dispatch.supervisor.turn.started",
+            "dispatch.supervisor.token_usage", "dispatch.supervisor.turn.completed",
+        }:
             thread_id = payload.get("thread_id")
             if isinstance(thread_id, str) and thread_id:
                 thread_ids.add(thread_id)
@@ -1484,8 +1492,8 @@ def _codex_attempt_thread_ids(lines):
 def _parse_codex_attempt_tail(path):
     """Read sanitized App Server telemetry and the currently open command item.
 
-    ``thread.started`` — the only event carrying ``thread_id`` — is written once, on the
-    file's first line (F-82). A tail-only read permanently loses it once the log outgrows
+    Native exec writes ``thread.started`` once; supervisors carry thread identity
+    on turn/usage events. A tail-only read loses early identity once the log outgrows
     the tail window, so a file bigger than head+tail also gets a bounded head read; the
     bytes read stay a constant independent of file size (F-51b/F-51d non-blocking tick).
     """
@@ -1523,8 +1531,11 @@ def _parse_codex_attempt_tail(path):
         if lines:
             lines = lines[1:]  # the first item is a partial JSON line
     latest_usage = None
-    thread_ids = set(head_thread_ids)
+    thread_ids = head_thread_ids | _codex_attempt_thread_ids(lines)
     open_commands = {}
+    activity = None
+    current_turn = None
+    closed_turns = set()
     for line in lines:
         try:
             payload = json.loads(line)
@@ -1533,6 +1544,19 @@ def _parse_codex_attempt_tail(path):
         if not isinstance(payload, dict):
             continue
         row_type = payload.get("type")
+        if row_type == "dispatch.supervisor.turn.started":
+            current_turn = payload.get("turn_id")
+            activity = None
+            open_commands.clear()
+        elif row_type in {
+            "dispatch.supervisor.turn.completed", "dispatch.supervisor.parked",
+            "dispatch.supervisor.resumed", "dispatch.supervisor.owner-boundary",
+            "dispatch.supervisor.error", "turn.completed", "turn.failed",
+        }:
+            if payload.get("turn_id"):
+                closed_turns.add(payload["turn_id"])
+            activity = None
+            open_commands.clear()
         if row_type == "thread.started":
             thread_id = payload.get("thread_id")
             if isinstance(thread_id, str) and thread_id:
@@ -1541,6 +1565,18 @@ def _parse_codex_attempt_tail(path):
             usage = payload.get("token_usage")
             if isinstance(usage, dict):
                 latest_usage = usage
+                thread_id, turn_id = payload.get("thread_id"), payload.get("turn_id")
+                try:
+                    stamp = datetime.fromisoformat(payload["timestamp"].replace("Z", "+00:00"))
+                    observed_at = stamp.timestamp() if stamp.tzinfo is not None else None
+                except (KeyError, TypeError, ValueError, AttributeError, OverflowError):
+                    observed_at = None
+                if (isinstance(thread_id, str) and thread_id and isinstance(turn_id, str)
+                        and turn_id and turn_id not in closed_turns and observed_at is not None
+                        and current_turn in (None, turn_id)):
+                    current_turn = turn_id
+                    activity = {"thread_id": thread_id, "turn_id": turn_id,
+                                "observed_at": observed_at}
         elif row_type == "item.started":
             item = payload.get("item")
             if not isinstance(item, dict) or item.get("type") != "command_execution":
@@ -1556,6 +1592,7 @@ def _parse_codex_attempt_tail(path):
     parsed = {"token_usage": latest_usage,
               "thread_id": next(iter(thread_ids)) if len(thread_ids) == 1 else None,
               "thread_ambiguity": len(thread_ids) > 1,
+              "activity": activity if len(thread_ids) == 1 else None,
               "exec_tool": next(reversed(open_commands.values())) if open_commands else None}
     _CODEX_ATTEMPT_CACHE[path] = (cache_key[0], cache_key[1], parsed)
     if len(_CODEX_ATTEMPT_CACHE) > 128:
@@ -1590,6 +1627,7 @@ def _codex_attempt_rollout(job, thread_id):
 
 
 def _enrich_codex_attempt_session(job):
+    job._runtime_activity = None
     path = _owned_attempt_log_path(job)
     if getattr(job, "harness", None) != "codex" or path is None:
         return
@@ -1603,6 +1641,11 @@ def _enrich_codex_attempt_session(job):
         thread_id = None
     elif thread_id:
         job._runtime_session_id = thread_id
+    activity = parsed.get("activity")
+    job._runtime_activity = (
+        dict(activity, attempt_id=job.attempt_id, source="codex-attempt-stream")
+        if activity is not None and activity["thread_id"] == thread_id else None
+    )
     usage = parsed.get("token_usage") or {}
     last = usage.get("last") if isinstance(usage.get("last"), dict) else {}
     total = usage.get("total") if isinstance(usage.get("total"), dict) else {}
@@ -3342,7 +3385,29 @@ def _campaign_labels(jobs):
         pass
 
 
-def collect(jobs_path=None, harness_filter=None):
+def _attach_execution_evidence(jobs, session_rows):
+    """Join only an exact attempt's verified execution; no cwd/title fallback."""
+    by_attempt = {}
+    by_process = {}
+    for session in session_rows:
+        child = getattr(session, "exec_child", None)
+        attempt = getattr(session, "attempt_id", None)
+        if getattr(session, "liveness", None) == "dead":
+            continue
+        if model.owned_exec_work({"pid": session.pid, "proc_start": session.proc_start,
+                                  "exec_child": child}) is None:
+            continue
+        by_process.setdefault((session.harness, session.pid, session.proc_start), []).append(child)
+        if attempt and child.get("attempt_id") == attempt:
+            by_attempt.setdefault(attempt, []).append(child)
+    for job in jobs:
+        candidates = (by_attempt.get(job.attempt_id, []) if job.attempt_id else
+                      by_process.get((job.harness, job.pid, job.proc_start), []))
+        if len(candidates) == 1:
+            job.exec_child = candidates[0]
+
+
+def collect(jobs_path=None, harness_filter=None, session_rows=()):
     """Return merged [DispatchJob]. harness_filter does not restrict dispatch — the section
     is cross-harness by design (jobs, not sessions)."""
     proc_jobs = _scan_processes()
@@ -3515,6 +3580,12 @@ def collect(jobs_path=None, harness_filter=None):
             _enrich_codex_attempt_session(j)
             _enrich_opencode_attempt_session(j)
             _enrich_attempt_summary(j)
+        # Attach execution before the single classifier pass. The governed
+        # leader and the tool's app-server can be different processes.
+        _attach_execution_evidence(jobs, session_rows)
+        # Collection may block on NAS. Events read above can legitimately be
+        # newer than the tick's start; judge freshness at observation time.
+        now = time.time()
         for j in jobs:
             j.liveness = _dispatch_liveness(j, now, codex_index=codex_index)
         jobs = _retain_dead_terminal_owners(jobs, now, jobs_path=jobs_path)

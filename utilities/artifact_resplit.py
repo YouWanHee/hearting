@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sys
 import tarfile
 from pathlib import Path
@@ -82,6 +83,8 @@ R1_TERMINAL = {"admitted"}
 R2_TERMINAL = {"complete", "rolled-back"}
 R3_TERMINAL = {"complete", "rolled-back"}
 OK, BLOCKED = 0, 65
+RUNLOG_SOURCE_LOCATOR = "experiments/_RUNLOG.md"
+RUNLOG_PAYLOAD_LOCATOR = "artifacts/experiments/_RUNLOG.md"
 
 
 class ResplitError(Exception):
@@ -3185,6 +3188,245 @@ def resplit_legacy_cycle(
 
 
 # ---------------------------------------------------------------------------
+# Narrow W7G aggregate-runlog correction
+# ---------------------------------------------------------------------------
+
+
+def _runlog_file_row(root: Path, path: Path) -> Dict[str, Any]:
+    if path.is_symlink() or not path.is_file():
+        raise ResplitError("runlog-repair-input-invalid", str(path))
+    try:
+        rel = path.relative_to(root).as_posix()
+    except ValueError as exc:
+        raise ResplitError("runlog-repair-path-outside-root", str(path)) from exc
+    return {"path": rel, "byte_size": path.stat().st_size, "sha256": "sha256:" + C._sha(path)}
+
+
+def _runlog_existing(root: Path, cycle_id: str) -> Optional[Dict[str, Any]]:
+    for directory in P.artifact_locator.iter_campaign_dirs(root):
+        campaign = P._read_json(directory / "campaign.json")
+        runlog = campaign.get("runlog") if isinstance(campaign, dict) else None
+        if not isinstance(runlog, dict) or runlog.get("source_cycle_id") != cycle_id:
+            continue
+        target = directory / "RUNLOG.md"
+        if (cycle_id in campaign.get("cycles", []) or target.is_symlink() or not target.is_file()
+                or "sha256:" + C._sha(target) != runlog.get("sha256")):
+            raise ResplitError("runlog-repair-partial-state", cycle_id)
+        return {"status": "already-applied", "cycle_id": cycle_id,
+                "campaign_id": campaign.get("campaign_id"),
+                "runlog": str(target), "sha256": runlog.get("sha256")}
+    return None
+
+
+def _validate_runlog_cycle(root: Path, cycle_id: str) -> Dict[str, Any]:
+    root = Path(root).resolve()
+    if not P.is_active(root):
+        raise ResplitError("runlog-repair-cutover-inactive", str(root))
+    if not artifact_identity.is_well_formed(cycle_id, "cycle"):
+        raise ResplitError("runlog-repair-cycle-id-invalid", cycle_id)
+    record_path = root / ".runtime/artifact-producer/v1/cycles" / (cycle_id + ".json")
+    record = P._read_json(record_path)
+    if record is None:
+        existing = _runlog_existing(root, cycle_id)
+        if existing:
+            return {"already": existing}
+        raise ResplitError("runlog-repair-cycle-missing", cycle_id)
+    key = record.get("cycle_key")
+    if (record.get("state") != "sealed" or not record.get("sealed_on")
+            or record.get("cycle_state") != "completed" or not record.get("derived_from_cycle_id")
+            or not isinstance(key, str)
+            or not re.fullmatch(r"legacy:[a-z0-9][a-z0-9-]{0,63}:experiments/_RUNLOG\.md", key)):
+        raise ResplitError("runlog-repair-cycle-ineligible", cycle_id)
+    campaign = P.read_campaign(root, record.get("campaign_id", ""))
+    if (not isinstance(campaign, dict) or campaign.get("state") != "active"
+            or cycle_id not in campaign.get("cycles", []) or len(campaign.get("cycles", [])) < 2
+            or campaign.get("runlog") is not None):
+        raise ResplitError("runlog-repair-campaign-ineligible", record.get("campaign_id", ""))
+    campaign_path = P._campaign_path(root, campaign["campaign_id"], campaign)
+    cycle_dir = P.cycle_dir(root, campaign["campaign_id"], cycle_id, record)
+    try:
+        cycle_dir.relative_to(campaign_path.parent)
+    except ValueError as exc:
+        raise ResplitError("runlog-repair-cycle-path-invalid", str(cycle_dir)) from exc
+    if cycle_dir.is_symlink() or not cycle_dir.is_dir():
+        raise ResplitError("runlog-repair-cycle-path-invalid", str(cycle_dir))
+    for entry in cycle_dir.rglob("*"):
+        if entry.is_symlink():
+            raise ResplitError("runlog-repair-symlink", str(entry))
+    manifest_path = cycle_dir / "manifest.json"
+    manifest = P._read_json(manifest_path)
+    if not isinstance(manifest, dict):
+        raise ResplitError("runlog-repair-manifest-invalid", str(manifest_path))
+    report = P.artifact_manifest.validate(manifest)
+    revisions, artifacts = manifest.get("artifact_revisions"), manifest.get("artifacts")
+    routes = manifest.get("routes")
+    if (not report.ok or len(revisions or []) != 1 or len(artifacts or []) != 1
+            or revisions[0].get("locator", {}).get("path") != RUNLOG_PAYLOAD_LOCATOR
+            or artifacts[0].get("role") != "primary" or artifacts[0].get("type") != "experiment"
+            or len(routes or []) != 1 or routes[0].get("route_id") != record.get("route_id")
+            or manifest.get("shared_references") or manifest.get("shared_reference_revisions")
+            or manifest.get("cycle", {}).get("cycle_id") != cycle_id
+            or manifest.get("campaign", {}).get("campaign_id") != campaign["campaign_id"]):
+        raise ResplitError("runlog-repair-manifest-ineligible", cycle_id)
+    manifest_raw = manifest_path.read_bytes()
+    if "sha256:" + hashlib.sha256(manifest_raw).hexdigest() != record.get("manifest_digest"):
+        raise ResplitError("runlog-repair-manifest-drift", cycle_id)
+    payload = cycle_dir / RUNLOG_PAYLOAD_LOCATOR
+    payload_row = _runlog_file_row(root, payload)
+    revision = revisions[0]
+    if (payload_row["sha256"] != revision.get("content_digest")
+            or payload_row["byte_size"] != revision.get("byte_size")):
+        raise ResplitError("runlog-repair-payload-drift", cycle_id)
+    for other in P.list_cycle_records(root):
+        if other.get("cycle_id") != cycle_id and (other.get("route_id") == record.get("route_id")
+                or other.get("parent_cycle_id") == cycle_id):
+            raise ResplitError("runlog-repair-shared-live-reference", other.get("cycle_id", ""))
+    route_id = record.get("route_id")
+    route_path = root / ".runtime/routes" / (str(route_id) + ".json")
+    outcome_path = root / ".runtime/routes" / (str(route_id) + ".outcome.json")
+    route, outcome = P._read_json(route_path), P._read_json(outcome_path)
+    if (not isinstance(route, dict) or not isinstance(outcome, dict)
+            or route.get("route_id") != route_id or route.get("resplit_cycle_key") != key
+            or outcome.get("route_id") != route_id
+            or Path(str(record.get("route_file", ""))).resolve() != route_path):
+        raise ResplitError("runlog-repair-route-ineligible", str(route_id))
+    target = campaign_path.parent / "RUNLOG.md"
+    if target.exists() or target.is_symlink():
+        raise ResplitError("runlog-repair-target-exists", str(target))
+    if not P.artifact_admission.verify_index(root).ok:
+        raise ResplitError("runlog-repair-index-drift", cycle_id)
+    exact = [campaign_path, record_path, route_path, outcome_path,
+             root / ".runtime/artifact-producer/v1/compat.json",
+             root / ".runtime/artifact-admission/v1/index.json",
+             root / ".runtime/artifact-admission/v1/rebuild-report.json",
+             root / "campaigns/INDEX.json", root / "campaigns/INDEX.md"]
+    files = [_runlog_file_row(root, path) for path in exact if path.exists()]
+    files.extend(_runlog_file_row(root, path) for path in sorted(cycle_dir.rglob("*")) if path.is_file())
+    files = sorted({row["path"]: row for row in files}.values(), key=lambda row: row["path"])
+    snapshot = {"contract": "campaign-runlog-repair-snapshot/v1", "artifact_root": str(root),
+                "campaign_id": campaign["campaign_id"], "cycle_id": cycle_id,
+                "route_id": route_id, "payload": payload_row, "files": files}
+    expectation = P._digest(P._canonical(snapshot))
+    return {"root": root, "record": record, "campaign": campaign,
+            "campaign_path": campaign_path, "cycle_dir": cycle_dir,
+            "record_path": record_path, "route_path": route_path,
+            "outcome_path": outcome_path, "target": target, "payload": payload,
+            "payload_row": payload_row, "snapshot": snapshot, "expect": expectation}
+
+
+def _backup_runlog_repair(ctx: Dict[str, Any], backup_root: Path) -> Dict[str, Any]:
+    root = ctx["root"]
+    identity = P.artifact_lifecycle.read_root_identity(root)
+    if identity is None:
+        raise ResplitError("runlog-repair-root-identity-missing", str(root))
+    backup_root = _validated_backup_root(root, backup_root)
+    backup_dir = backup_root / identity.artifact_root_id / ("runlog-cycle-" + ctx["record"]["cycle_id"]
+                  + "-" + ctx["expect"].split(":", 1)[1][:12])
+    if backup_dir.exists():
+        raise ResplitError("runlog-repair-backup-exists", str(backup_dir))
+    backup_dir.mkdir(parents=True)
+    archive = backup_dir / "preimage.tar"
+    entries = ctx["snapshot"]["files"]
+    with tarfile.open(archive, "w") as tar:
+        for row in entries:
+            tar.add(root / row["path"], arcname=row["path"], recursive=False)
+    archive_sha = "sha256:" + C._sha(archive)
+    with tarfile.open(archive, "r") as tar:
+        members = {member.name: member for member in tar.getmembers()}
+        for row in entries:
+            member = members.get(row["path"])
+            stream = tar.extractfile(member) if member is not None else None
+            body = stream.read() if stream is not None else b""
+            if (member is None or member.size != row["byte_size"]
+                    or "sha256:" + hashlib.sha256(body).hexdigest() != row["sha256"]):
+                raise ResplitError("runlog-repair-backup-incomplete", row["path"])
+    seal = {"schema_version": 1, "kind": "campaign-runlog-repair-backup",
+            "artifact_root": str(root), "cycle_id": ctx["record"]["cycle_id"],
+            "expect": ctx["expect"], "archive": str(archive),
+            "archive_sha256": archive_sha, "entries": entries, "sealed_at": C._now()}
+    P._write_atomic(backup_dir / "backup-seal.json", P._json_bytes(seal))
+    return {"directory": str(backup_dir), "archive": str(archive),
+            "archive_sha256": archive_sha, "seal": str(backup_dir / "backup-seal.json")}
+
+
+def repair_runlog_cycle(root: Path, *, cycle_id: str, backup_root: Optional[Path] = None,
+                        expect: Optional[str] = None, apply: bool = False) -> Dict[str, Any]:
+    root = Path(root).resolve()
+    ctx = _validate_runlog_cycle(root, cycle_id)
+    if "already" in ctx:
+        return ctx["already"]
+    public = {"status": "ready", "cycle_id": cycle_id,
+              "campaign_id": ctx["campaign"]["campaign_id"],
+              "source": str(ctx["payload"]), "target": str(ctx["target"]),
+              "sha256": ctx["payload_row"]["sha256"], "expect": ctx["expect"]}
+    if not apply:
+        return public
+    if backup_root is None:
+        raise ResplitError("backup-root-required", "repair-runlog-cycle")
+    if expect != ctx["expect"]:
+        raise ResplitError("runlog-repair-expectation-mismatch", ctx["expect"])
+    lock_fd = P.artifact_admission._acquire_lock(root, P.artifact_admission.LOCK_TIMEOUT_DEFAULT)
+    try:
+        checked = _validate_runlog_cycle(root, cycle_id)
+        if checked.get("expect") != expect:
+            raise ResplitError("runlog-repair-stale", checked.get("expect", "already-applied"))
+        ctx = checked
+        backup = _backup_runlog_repair(ctx, Path(backup_root))
+        body = ctx["payload"].read_bytes()
+        P._write_atomic(ctx["target"], body)
+        target_rel = ctx["target"].relative_to(root).as_posix()
+        stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        run_dir = root / ".runtime/artifact-producer/v1/migrations" / (stamp + "-runlog-cycle-repair-" + cycle_id)
+        P._ensure_dir(run_dir)
+        identities = [
+            {"binding_key": "artifact_root", "id_kind": "artifact_root", "required_id": "artifact_root_id",
+             "stable_id": P.artifact_lifecycle.read_root_identity(root).artifact_root_id},
+            {"binding_key": "campaign", "id_kind": "campaign", "required_id": "campaign_id",
+             "stable_id": ctx["campaign"]["campaign_id"]},
+            {"binding_key": "cycle", "id_kind": "cycle", "required_id": "cycle_id", "stable_id": cycle_id},
+        ]
+        old_cycle_rel = ctx["cycle_dir"].relative_to(root).as_posix()
+        aliases = {RUNLOG_SOURCE_LOCATOR, old_cycle_rel + "/" + RUNLOG_PAYLOAD_LOCATOR}
+        legacy_campaign = ctx["campaign"].get("legacy_locator")
+        legacy_cycle = ctx["record"].get("legacy_locator")
+        if legacy_campaign and legacy_cycle:
+            aliases.add(f"campaigns/{legacy_campaign}/cycles/{legacy_cycle}/artifacts/{RUNLOG_SOURCE_LOCATOR}")
+        rows = [{"schema_version": "artifact-relocation-compatibility-map-row/v1", "kind": "file",
+                 "source_locator": source, "target_locator": target_rel,
+                 "sha256": ctx["payload_row"]["sha256"].split(":", 1)[1], "identity_refs": identities}
+                for source in sorted(aliases)]
+        map_path = run_dir / "compatibility-map.jsonl"
+        P._write_atomic(map_path, b"".join(P._canonical(row) + b"\n" for row in rows))
+        compat = P._read_json(root / ".runtime/artifact-producer/v1/compat.json") or {}
+        C.compat_append(root, maps=[map_path],
+                        approval_receipt_sha256=compat.get("approval_receipt_sha256"))
+        campaign = dict(ctx["campaign"])
+        campaign["cycles"] = [cid for cid in campaign["cycles"] if cid != cycle_id]
+        campaign["runlog"] = {"contract": "campaign-runlog/v1", "path": "RUNLOG.md",
+                              "sha256": ctx["payload_row"]["sha256"], "source_cycle_id": cycle_id,
+                              "source_locator": RUNLOG_SOURCE_LOCATOR}
+        P._write_campaign(root, campaign, exclusive=False)
+        for path in (ctx["record_path"], ctx["route_path"], ctx["outcome_path"]):
+            path.unlink()
+        shutil.rmtree(ctx["cycle_dir"])
+        P.artifact_admission.rebuild_index(root)
+        P.artifact_locator.rebuild_indexes(root)
+        verify = P.artifact_admission.verify_index(root)
+        if not verify.ok:
+            raise ResplitError("runlog-repair-index-rebuild-failed", str(verify.violations[:3]))
+        P.artifact_campaign._cycle_rows(root, ctx["campaign_path"], campaign)
+        resolution = C.resolve_legacy(root, RUNLOG_SOURCE_LOCATOR)
+        if resolution.get("target") != target_rel:
+            raise ResplitError("runlog-repair-compat-failed", str(resolution))
+        result = dict(public, status="applied", backup=backup, run_dir=str(run_dir),
+                      removed_cycle_dir=str(ctx["cycle_dir"]), compatibility_map=str(map_path))
+        P._write_atomic(run_dir / "repair-report.json", P._json_bytes(result))
+        return result
+    finally:
+        P.artifact_admission._release_lock(root, lock_fd)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -3230,6 +3472,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     r.add_argument("--crash-after-phase")
     r.add_argument("--crash-at")
 
+    repair = sub.add_parser("repair-runlog-cycle", help="promote a mechanical W7G _RUNLOG.md cycle to campaign metadata")
+    repair.add_argument("--cycle-id", required=True)
+    repair.add_argument("--backup-root")
+    repair.add_argument("--expect")
+    repair.add_argument("--apply", action="store_true")
+
     args = parser.parse_args(argv)
     root = Path(args.artifact_root)
     try:
@@ -3270,7 +3518,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
             _print(result)
             return OK if result.get("status") not in {"hold"} else BLOCKED
-    except (ResplitError, C.CutoverError, P.ProducerError) as exc:
+        if args.command == "repair-runlog-cycle":
+            result = repair_runlog_cycle(
+                root, cycle_id=args.cycle_id,
+                backup_root=Path(args.backup_root) if args.backup_root else None,
+                expect=args.expect, apply=args.apply,
+            )
+            _print(result)
+            return OK
+    except (ResplitError, C.CutoverError, P.ProducerError, P.artifact_campaign.CampaignError) as exc:
         _print({"error": getattr(exc, "code", "error"), "detail": getattr(exc, "detail", str(exc))})
         return BLOCKED
     return OK

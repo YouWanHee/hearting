@@ -914,5 +914,125 @@ class WorkProjectionTest(unittest.TestCase):
             self.assertEqual(dispatch.resolve_plan_qa_artifact(job), "standard")
 
 
+class AssignedRouteScopeTest(unittest.TestCase):
+    """A route's planned graph is not each registered worker's assignment."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.cwd = self.temp.name
+        self.record = {
+            "schema_version": 1, "capability": "autopilot-code", "cwd": self.cwd,
+            "effective_intensity": "standard", "execution_topology": "staged",
+            "nodes": [
+                {"id": "frame", "depends_on": [], "dispatch_depth": 1,
+                 "worker_type": "frame", "unit": "plan/frame"},
+                {"id": "frame-alternative", "depends_on": [], "dispatch_depth": 1,
+                 "worker_type": "frame", "unit": "plan/frame"},
+                {"id": "test", "depends_on": ["frame", "frame-alternative"],
+                 "dispatch_depth": 2, "unit": "qa/test"},
+                {"id": "report", "depends_on": ["test"], "dispatch_depth": 2,
+                 "unit": "editorial/report"},
+            ],
+        }
+        self._seal()
+        render.set_process_view(False)
+        self.addCleanup(render.set_process_view, False)
+
+    def _seal(self):
+        self.record["route_hash"] = route.route_hash(self.record)
+        self.record["route_id"] = "rt-" + self.record["route_hash"].split(":", 1)[1][:16]
+        self.rid = self.record["route_id"]
+        self.path = os.path.join(self.cwd, "route.json")
+        with open(self.path, "w") as stream:
+            json.dump(self.record, stream)
+
+    def _leaf(self, node="frame", harness="codex", depth=1):
+        return DispatchJob(
+            key="code", slug="assigned-worker", cwd=self.cwd, harness=harness,
+            parent_sid="parent", is_child=True, worker_type="frame" if depth == 1 else "stage",
+            depth=depth, intensity="standard", liveness="working", route_id=self.rid,
+            route_file=self.path, route_hash=self.record["route_hash"], route_node=node,
+        )
+
+    def _attach(self, jobs, sessions=()):
+        projection.attach_projections(sessions, jobs, route_records={self.rid: self.record},
+                                      node_evidence={}, spec_markers={}, capability_groundings={},
+                                      now=100.0)
+
+    def test_depth1_frame_card_has_only_its_own_node_across_layouts_and_harnesses(self):
+        for harness in ("claude", "codex", "opencode"):
+            for node in ("frame", "frame-alternative"):
+                with self.subTest(harness=harness, node=node):
+                    job = self._leaf(node, harness)
+                    self._attach([job])
+                    self.assertEqual(render._projection_route_seq(job), [(node, "active")])
+                    self.assertEqual(job.work_projection.progress.total, 1)
+                    self.assertEqual(job.work_projection.to_dict()["scope_node_ids"], [node])
+                    parent = Session(harness=harness, pid=1, proc_start="parent-start",
+                                     cwd=self.cwd, session_id="parent", slug="parent", liveness="idle")
+                    for layout, width in (("wide", 200), ("narrow", 120), ("stack", 65)):
+                        text = "\n".join(render._plain(line) for line in render._build_lines(
+                            [parent], [job], "both", width < 70, 0,
+                            layout=layout, term_width=width) if line)
+                        self.assertNotIn("report", text)
+                        self.assertNotIn("test", text)
+                        self.assertIn("frame", text)
+
+    def test_owner_scope_excludes_preowner_pair_but_overview_keeps_entire_graph(self):
+        owner = DispatchJob(key="code", slug="owner", cwd=self.cwd, harness="codex",
+                            depth=1, worker_type="owner", liveness="working",
+                            owner_route_id=self.rid, owner_route_file=self.path,
+                            owner_route_hash=self.record["route_hash"])
+        self._attach([owner])
+        self.assertEqual([n for n, _ in render._projection_route_seq(owner)], ["test", "report"])
+        self.assertEqual(owner.work_projection.progress.total, 2)
+        summary = projection.route_summary_from_projections([owner])[0]
+        self.assertEqual([n["id"] for n in summary["nodes"]],
+                         ["frame", "frame-alternative", "test", "report"])
+        self.assertEqual(summary["progress"]["total"], 4)
+
+    def test_node_bound_review_or_stage_does_not_own_the_remaining_pipeline(self):
+        job = self._leaf("test", depth=2)
+        self._attach([job])
+        self.assertEqual(render._projection_route_seq(job), [("test", "active")])
+        self.assertEqual(job.work_projection.progress.total, 1)
+
+    def test_parent_of_frame_pair_aggregates_both_legs_without_future_owner_stages(self):
+        parent = Session(harness="codex", pid=1, proc_start="parent-start",
+                         cwd=self.cwd, session_id="parent", slug="parent", liveness="idle")
+        first, second = self._leaf(), self._leaf("frame-alternative", "opencode")
+        second.slug = "second-worker"
+        self._attach([second, first], [parent])
+        self.assertEqual(parent.work_projection.scope_node_ids, ("frame", "frame-alternative"))
+        self.assertEqual({n.id for n in parent.work_projection.active_nodes},
+                         {"frame", "frame-alternative"})
+        self.assertEqual(parent.work_projection.progress.total, 2)
+        self.assertEqual([n for n, _ in render._projection_route_seq(parent)], ["frame(2-way)"])
+
+    def test_process_overview_never_uses_first_frame_worker_progress_as_route_total(self):
+        job = self._leaf()
+        self._attach([job])
+        render.set_process_view(True)
+        with mock.patch.object(render, "_build_process_lines",
+                               wraps=render._build_process_lines) as process_view:
+            render._build_lines([], [job], "both", False, 0, layout="wide", term_width=200)
+        view = process_view.call_args.args[2][self.rid]
+        self.assertEqual(view["progress"]["total"], 4)
+        self.assertEqual(len(view["nodes"]), 4)
+
+    def test_legacy_depth2_frame_still_belongs_to_its_owner(self):
+        for n in self.record["nodes"][:2]:
+            n["dispatch_depth"] = 2
+        self._seal()
+        owner = DispatchJob(key="code", slug="owner", cwd=self.cwd, harness="codex",
+                            depth=1, worker_type="owner", owner_route_id=self.rid,
+                            owner_route_file=self.path, owner_route_hash=self.record["route_hash"])
+        self._attach([owner])
+        self.assertEqual([n for n, _ in render._projection_route_seq(owner)],
+                         ["frame(2-way)", "test", "report"])
+        self.assertEqual(owner.work_projection.progress.total, 4)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -439,6 +439,18 @@ class CodexDispatchTerminalTest(unittest.TestCase):
             (0, "FAIL", "worker-reported"),
         )
 
+    def test_receiving_turn_boundary_preserves_only_completed_handoff(self):
+        report = self.root / "turn_report.md"
+        report.write_text("# report\n", encoding="utf-8")
+        boundary = {"type": "dispatch.supervisor.turn.completed", "thread_id": "th1",
+                    "turn_id": "t1", "status": "completed"}
+        for event, valid in [(boundary, True), (dict(boundary, status="failed"), False),
+                             (dict(boundary, turn_id=None), False)]:
+            with self.subTest(event=event):
+                result = self.inspect(self.write_log(verdict="PASS", blocker="none",
+                    artifact=str(report), sandbox=False, between=[event]))
+                self.assertEqual(result["exit_code"] == 0, valid, result)
+
     def test_terminal_walkback_stops_at_work_items_boundaries_and_unknown_rows(self):
         report = self.root / "walkback_report.md"
         report.write_text("# report\n", encoding="utf-8")
