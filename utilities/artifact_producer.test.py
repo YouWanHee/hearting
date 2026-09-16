@@ -3350,6 +3350,77 @@ class CycleBindingAndIndexOrderTest(ProducerTestBase):
         self.assertEqual(result["counts"], {"added": 1, "conflict": 1})
         self.assertEqual(json.loads(markers[sealed["cycle_id"]].read_text())["started_on"], "2020-01-01T00:00:00Z")
 
+    def test_time_recovery_reads_original_mtimes_from_the_retirement_backup(self):
+        import hashlib, io, tarfile
+        self.activate()
+        route, route_file = self.route(slug="migrated-work", gate_source="migrated-work")
+        sealed = P.begin(self.root, route_file=route_file, capability="autopilot-code",
+                         intensity="direct", campaign_key="recovery")
+        target = self.write_output(sealed, rel="plans/cycle/plan.md", data=b"plan body\n")
+        self.close(route, route_file)
+        P.finalize(self.root, cycle_id=sealed["cycle_id"])
+        # Pretend this sealed cycle came out of the W7G resplit: date-only start, no clock.
+        record_path = P.cycle_record_path(self.root, sealed["cycle_id"])
+        record = json.loads(record_path.read_text())
+        record.update({"derived_from_cycle_id": "cyc_" + "2" * 32, "started_on": "2026-07-13T00:00:00Z"})
+        record_path.write_text(json.dumps(record), encoding="utf-8")
+        # A retirement backup of the same root: original bytes under their legacy path, original mtime.
+        store = Path(self._tmp.name) / "retirement"
+        run_dir = store / ROOT_ID / "20260903T230843Z"
+        run_dir.mkdir(parents=True)
+        import calendar
+        original_mtime = calendar.timegm((2026, 7, 13, 9, 34, 26, 0, 0, 0))  # the legacy file's last write
+        with tarfile.open(run_dir / "retired-sources.tar.gz", "w:gz") as archive:
+            info = tarfile.TarInfo("plans/legacy/plan.md")
+            info.size, info.mtime = len(b"plan body\n"), original_mtime
+            archive.addfile(info, io.BytesIO(b"plan body\n"))
+            other = tarfile.TarInfo("plans/legacy/other.md")
+            other.size, other.mtime = 6, original_mtime + 3600
+            archive.addfile(other, io.BytesIO(b"other\n"))
+        digest = hashlib.sha256(b"plan body\n").hexdigest()
+        (run_dir / "retired-manifest.jsonl").write_text(
+            json.dumps({"sha256": digest, "size": 10, "source": "plans/legacy/plan.md", "target": "x"}) + "\n"
+            + json.dumps({"sha256": hashlib.sha256(b"other\n").hexdigest(), "size": 6,
+                          "source": "plans/legacy/other.md", "target": "y"}) + "\n", encoding="utf-8")
+        (run_dir / "backup-seal.json").write_text(json.dumps({"archive_sha256": "abc"}), encoding="utf-8")
+
+        dry = P.recover_cycle_times(self.root, backup_store=store)
+        self.assertEqual((dry["status"], dry["counts"], dry["backup_runs"]),
+                         ("dry-run", {"would-recover": 1}, ["20260903T230843Z"]))
+        row = dry["cycles"][0]
+        # The folder was named today by `begin`; the recovered date disagreeing with it is reported, not hidden.
+        self.assertEqual((row["recovered_started_on"], row["matched"], row["total"], row["folder_date_agrees"]),
+                         ("2026-07-13T09:34:26Z", 1, 1, False))
+        self.assertNotIn("recovered_started_on", json.loads(record_path.read_text()))
+        self.assertTrue((run_dir / "mtime-index.json").is_file())  # listing the archive is cached
+
+        applied = P.recover_cycle_times(self.root, backup_store=store, apply=True)
+        self.assertEqual(applied["counts"], {"recovered": 1})
+        record = json.loads(record_path.read_text())
+        self.assertEqual((record["recovered_started_on"], record["recovered_started_on_source"],
+                          record["started_on"], record["recovered_started_on_evidence"]["matched"]),
+                         ("2026-07-13T09:34:26Z", P.RECOVERED_SOURCE, "2026-07-13T00:00:00Z", 1))
+        journal = Path(applied["journal"])
+        self.assertEqual(json.loads(journal.read_text().splitlines()[0])["pre"]["started_on"], "2026-07-13T00:00:00Z")
+        self.assertIn("| 2026-07-13T09:34:26Z |", (self.root / "campaigns" / "INDEX.md").read_text(encoding="utf-8"))
+        self.assertEqual(P.recover_cycle_times(self.root, backup_store=store, apply=True)["counts"], {"already": 1})
+        # The recovered clock is what the binding backfill and the display use from now on.
+        marker = Path(sealed["cycle_dir"]) / ".cycle.json"
+        marker.write_text(json.dumps({k: v for k, v in json.loads(marker.read_text()).items() if k != "started_on"}))
+        row = P.backfill_cycle_bindings(self.root, apply=True)["cycles"][0]
+        self.assertEqual((row["action"], row["started_on"]), ("added", "2026-07-13T09:34:26Z"))
+        # A cycle whose bytes are not in any backup is reported, never guessed.
+        target.write_bytes(b"rewritten after the fact\n")
+        record["derived_from_cycle_id"] = "cyc_" + "3" * 32
+        manifest_path = Path(sealed["cycle_dir"]) / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        for rev in manifest["artifact_revisions"]:
+            rev["content_digest"] = "sha256:" + "f" * 64
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        record.pop("recovered_started_on")
+        record_path.write_text(json.dumps(record), encoding="utf-8")
+        self.assertEqual(P.recover_cycle_times(self.root, backup_store=store)["counts"], {"no-match": 1})
+
 
 if __name__ == "__main__":
     unittest.main()

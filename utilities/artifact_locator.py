@@ -46,6 +46,10 @@ def display_started_on(record: Optional[Mapping[str, Any]],
     record's own ``started_on``, else the sealed manifest's. Same order as
     ``artifact_relayout._cycle_date``; never a path date or an mtime."""
     record = record or {}
+    # A time recovered from the pre-migration backup (original file mtimes,
+    # `cycle-time-recovery`) is the best evidence there is; it comes first.
+    if started_on_is_valid(record.get("recovered_started_on")):
+        return record["recovered_started_on"]
     cycle = (manifest or {}).get("cycle") if isinstance(manifest, Mapping) else None
     # A W7G/W7H cycle whose date came from a folder name, an mtime or its
     # origin cycle stores that date as midnight; the clock is a placeholder,

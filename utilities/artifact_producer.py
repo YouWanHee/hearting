@@ -943,6 +943,152 @@ def _campaign_naming(campaign_key: Optional[str]) -> Tuple[str, str, str, bool]:
     return slug, campaign_key, "campaign-key", truncated
 
 
+RECOVERED_SOURCE = "retirement-backup-mtime"
+
+
+def default_backup_store() -> Path:
+    state = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+    return Path(state) / "hearting" / "artifact-retirement"
+
+
+def _retirement_mtime_index(run_dir: Path) -> Dict[str, int]:
+    """``source path -> mtime`` of a retirement archive, cached beside it.
+
+    The archive is the pre-migration bytes with their original mtimes (the
+    W7C/W7G copies lost theirs). Listing a multi-GB gzip means decompressing
+    it once; the cache is keyed by the seal's archive digest."""
+    import tarfile
+    seal = _read_json(run_dir / "backup-seal.json") or {}
+    cache_path = run_dir / "mtime-index.json"
+    cached = _read_json(cache_path)
+    if (isinstance(cached, dict) and cached.get("archive_sha256") == seal.get("archive_sha256")
+            and isinstance(cached.get("members"), dict)):
+        return {str(k): int(v) for k, v in cached["members"].items()}
+    members: Dict[str, int] = {}
+    with tarfile.open(run_dir / "retired-sources.tar.gz", "r:gz") as archive:
+        for member in archive:
+            if member.isfile():
+                members[member.name] = int(member.mtime)
+    try:
+        _write_atomic(cache_path, _json_bytes({"schema_version": 1, "archive_sha256": seal.get("archive_sha256"),
+                                               "members": members}))
+    except OSError:
+        pass  # the cache is a convenience; the archive stays the source
+    return members
+
+
+def _retirement_digest_index(store: Path, root_id: str) -> Tuple[Dict[str, Tuple[str, int, str]], List[str]]:
+    """``sha256 -> (source path, mtime, run)`` over every retirement run of a root."""
+    by_sha: Dict[str, Tuple[str, int, str]] = {}
+    runs: List[str] = []
+    base = store / root_id
+    if not base.is_dir():
+        return by_sha, runs
+    for run_dir in sorted(p for p in base.iterdir() if p.is_dir()):
+        manifest = run_dir / "retired-manifest.jsonl"
+        if not manifest.is_file() or not (run_dir / "retired-sources.tar.gz").is_file():
+            continue
+        mtimes = _retirement_mtime_index(run_dir)
+        runs.append(run_dir.name)
+        for line in manifest.read_text(encoding="utf-8").splitlines():
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            source, sha = row.get("source"), row.get("sha256")
+            if isinstance(source, str) and isinstance(sha, str) and source in mtimes:
+                by_sha.setdefault(sha, (source, mtimes[source], run_dir.name))
+    return by_sha, runs
+
+
+def recover_cycle_times(root: Path, *, backup_store: Optional[Path] = None,
+                        apply: bool = False) -> Dict[str, Any]:
+    """Recover the start time of cycles that only know their work's date.
+
+    W7G resplit and W7H residue cycles were built from copies whose mtimes
+    were the copy time, so their records carry a date (or the resplit run
+    time) and no clock. The retirement backup of the same root keeps the
+    original files with their original mtimes, and its manifest keys them by
+    sha256. Each sealed artifact revision's ``content_digest`` therefore leads
+    back to the original file; the earliest such mtime is the cycle's
+    ``recovered_started_on`` (UTC, second precision), kept beside the
+    untouched ``started_on`` with its evidence. Dry run by default; ``apply``
+    holds the producer admission lock, journals every record pre-image under
+    ``.runtime/artifact-producer/v1/time-recovery/`` and rebuilds the indexes.
+    """
+    root = Path(root).resolve()
+    store = Path(backup_store) if backup_store is not None else default_backup_store()
+    identity = artifact_lifecycle.read_root_identity(root)
+    if identity is None:
+        raise ProducerError("root-identity-missing", str(root))
+    by_sha, runs = _retirement_digest_index(store, identity.artifact_root_id)
+    lock_fd = artifact_admission._acquire_lock(root, artifact_admission.LOCK_TIMEOUT_DEFAULT) if apply else None
+    journal: List[Dict[str, Any]] = []
+    try:
+        rows: List[Dict[str, Any]] = []
+        for record_path in sorted((producer_dir(root) / "cycles").glob("cyc_*.json")):
+            record = _read_json(record_path)
+            if not isinstance(record, dict):
+                continue
+            if not (record.get("derived_from_cycle_id") or record.get("started_on_source")):
+                continue  # a producer-born cycle already has its real clock
+            cycle_id = record["cycle_id"]
+            row: Dict[str, Any] = {"cycle_id": cycle_id, "locator": record.get("locator"),
+                                   "previous": record.get("recovered_started_on")}
+            try:
+                directory = artifact_locator.resolve_path(root, cycle_id)
+            except artifact_locator.LocatorError as exc:
+                rows.append({**row, "action": "unresolved", "detail": exc.code}); continue
+            manifest = _read_json(directory / "manifest.json")
+            if not isinstance(manifest, dict):
+                rows.append({**row, "action": "no-manifest"}); continue
+            digests = [str(rev.get("content_digest", "")).split(":", 1)[-1]
+                       for rev in manifest.get("artifact_revisions", []) if isinstance(rev, dict)]
+            hits = [by_sha[d] for d in digests if d in by_sha]
+            row.update({"matched": len(hits), "total": len(digests)})
+            if not digests:
+                rows.append({**row, "action": "no-artifacts"}); continue
+            if not hits:
+                rows.append({**row, "action": "no-match"}); continue
+            earliest = min(h[1] for h in hits)
+            latest = max(h[1] for h in hits)
+            recovered = _rfc3339(earliest)
+            folder_date = str(record.get("locator") or "")[:10]
+            row.update({"recovered_started_on": recovered, "latest_write": _rfc3339(latest),
+                        "backup_run": sorted({h[2] for h in hits}),
+                        "folder_date_agrees": recovered[:10] == folder_date})
+            if record.get("recovered_started_on") == recovered:
+                rows.append({**row, "action": "already"}); continue
+            row["action"] = "recovered" if apply else "would-recover"
+            if apply:
+                journal.append({"cycle_id": cycle_id, "pre": dict(record)})
+                record["recovered_started_on"] = recovered
+                record["recovered_started_on_source"] = RECOVERED_SOURCE
+                record["recovered_started_on_evidence"] = {
+                    "matched": len(hits), "total": len(digests), "earliest": recovered,
+                    "latest": _rfc3339(latest), "backup_runs": row["backup_run"]}
+                _write_cycle_record(root, record, exclusive=False)
+            rows.append(row)
+        counts: Dict[str, int] = {}
+        for row in rows:
+            counts[row["action"]] = counts.get(row["action"], 0) + 1
+        result: Dict[str, Any] = {"status": "applied" if apply else "dry-run", "artifact_root": str(root),
+                                  "backup_store": str(store), "backup_runs": runs, "counts": counts,
+                                  "cycles": rows}
+        if apply and journal:
+            journal_dir = producer_dir(root) / "time-recovery"
+            _ensure_dir(journal_dir)
+            journal_file = journal_dir / (time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + ".jsonl")
+            _write_exclusive(journal_file, "".join(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n"
+                                                    for entry in journal).encode("utf-8"), 0o600)
+            result["journal"] = str(journal_file)
+            artifact_locator.rebuild_indexes(root)
+        return result
+    finally:
+        if lock_fd is not None:
+            artifact_admission._release_lock(root, lock_fd)
+
+
 def backfill_cycle_bindings(root: Path, *, apply: bool = False) -> Dict[str, Any]:
     """Add ``started_on`` to readable-layout ``.cycle.json`` bindings that predate it.
 
@@ -3585,6 +3731,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--artifact-root", required=True)
     p.add_argument("--apply", action="store_true", help="write the bindings (default: dry run)")
 
+    p = sub.add_parser("cycle-time-recovery",
+                       help="recover migrated cycles' start times from the retirement backup's original mtimes")
+    p.add_argument("--artifact-root", required=True)
+    p.add_argument("--backup-store", help="retirement store (default: $XDG_STATE_HOME/hearting/artifact-retirement)")
+    p.add_argument("--apply", action="store_true", help="write recovered_started_on into records (default: dry run)")
+
     for command in ("campaign-status", "campaign-close", "campaign-recover"):
         p = sub.add_parser(command, help="verify, accept, or recover a campaign's administrative closure")
         p.add_argument("--artifact-root", required=True)
@@ -3704,6 +3856,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             result = {"status": "ok", "artifact_root": str(Path(root).resolve()), "campaigns": rows}
         elif args.command == "cycle-binding-backfill":
             result = backfill_cycle_bindings(root, apply=args.apply)
+        elif args.command == "cycle-time-recovery":
+            result = recover_cycle_times(root, apply=args.apply,
+                                         backup_store=Path(args.backup_store) if args.backup_store else None)
         elif args.command == "campaign-status":
             result = artifact_campaign.status(root, args.campaign)
         elif args.command in {"campaign-close", "campaign-recover"}:
