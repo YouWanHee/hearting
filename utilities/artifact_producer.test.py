@@ -3403,6 +3403,9 @@ class CycleBindingAndIndexOrderTest(ProducerTestBase):
         journal = Path(applied["journal"])
         self.assertEqual(json.loads(journal.read_text().splitlines()[0])["pre"]["started_on"], "2026-07-13T00:00:00Z")
         self.assertIn("| 2026-07-13T09:34:26Z |", (self.root / "campaigns" / "INDEX.md").read_text(encoding="utf-8"))
+        # The campaign row starts with its earliest cycle, not with the day the resplit created it.
+        _mapping, view = P.artifact_locator.scan_index(self.root)
+        self.assertEqual(view[sealed["campaign_id"]]["started"], "2026-07-13T09:34:26Z")
         self.assertEqual(P.recover_cycle_times(self.root, backup_store=store, apply=True)["counts"], {"already": 1})
         # The recovered clock is what the binding backfill and the display use from now on.
         marker = Path(sealed["cycle_dir"]) / ".cycle.json"

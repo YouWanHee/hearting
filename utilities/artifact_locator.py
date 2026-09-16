@@ -439,6 +439,13 @@ def scan_index(root: Path) -> Tuple[Dict[str, str], Dict[str, Dict[str, str]]]:
                 status="open",
                 campaign=campaign_id,
             )
+        # A campaign begins with its first cycle. A producer-born campaign's
+        # `created_on` already is that; a W7G resplit campaign's is the resplit
+        # run, so the earliest cycle start (possibly recovered) is shown instead.
+        cycle_starts = [row["started"] for key, row in rows.items()
+                        if key != campaign_id and row.get("campaign") == campaign_id and row.get("started")]
+        if cycle_starts and rows[campaign_id]["started"] and min(cycle_starts) < rows[campaign_id]["started"]:
+            rows[campaign_id]["started"] = min(cycle_starts)
     return dict(sorted(mapping.items())), rows
 
 
