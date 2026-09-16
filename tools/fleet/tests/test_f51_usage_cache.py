@@ -34,6 +34,22 @@ class F51UsageCacheTest(unittest.TestCase):
             os.environ["FLEET_USAGE_STATE_DIR"] = self.old
         self.tmp.cleanup()
 
+    def test_record_and_widened_read_serve_ad_hoc_probes(self):
+        # 2026-09-16: dispatch placement writes its own live reading through and
+        # reads the last-good one back beyond the Fleet freshness window.
+        self.assertTrue(usage_cache.record("codex", {"windows": [["7d", 40, None]]}, now=1000.0))
+        self.assertEqual(usage_cache.read("codex", now=1000.0)["freshness"], "fresh")
+        self.assertEqual(usage_cache.read("codex", now=1000.0 + 1200)["freshness"], "unknown")
+        widened = usage_cache.read("codex", now=1000.0 + 1200, stale_max=3600)
+        self.assertEqual(widened["freshness"], "stale")
+        self.assertEqual(widened["payload"]["windows"][0][1], 40)
+        self.assertFalse(usage_cache.record("codex", None))
+        self.assertTrue(usage_cache.record_attempt("codex", now=1000.0 + 1300))
+        after = usage_cache.read("codex", now=1000.0 + 1300, stale_max=3600)
+        self.assertEqual(after["attempted_at"], 2300.0)
+        self.assertEqual(after["observed_at"], 1000.0)
+        self.assertEqual(after["payload"]["windows"][0][1], 40)
+
     def test_cache_only_never_calls_fetcher(self):
         calls = []
         usage_cache.FETCHERS["claude"] = lambda: calls.append(1)

@@ -362,6 +362,7 @@ class DispatchOwnerTests(unittest.TestCase):
         )
         self.assert_model_map(exhausted, "codex")
         self.assertIn("capacity_warning.codex=headroom-exhausted", exhausted.stdout)
+        self.assertIn("capacity_source.codex=manual", exhausted.stdout)
         unknown = self.run_owner(
             "claude", ("--adapter", "codex"),
             config=self.balanced_quality_config(),

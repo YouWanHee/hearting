@@ -30,6 +30,8 @@ import os
 import re
 import sqlite3
 import time
+import socket
+import urllib.error
 import urllib.request
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -1319,15 +1321,23 @@ def _api_usage():
     Rollout samples update only when a session is used, so an active probe is
     the reliable primary source. Return None on any failure
     (expired token, offline, schema change) — the rollout scan below remains the fallback."""
+    return _api_usage_detail()[0]
+
+
+def _api_usage_detail():
+    """(payload, reason): the one HTTP client for the codex gauge, shared with
+    utilities/harness-capacity.py. `reason` names why there is no payload
+    (`no-auth`, `no-token`, `http-<code>`, `timeout`, `network:<Exc>`, `schema`)
+    so a dispatch receipt can say *why* headroom is unknown (2026-09-16)."""
     try:
         with open(os.path.join(_home(), "auth.json")) as f:
             a = json.load(f)
         toks = a.get("tokens") or {}
         tok, acc = toks.get("access_token"), toks.get("account_id")
     except Exception:
-        return None
+        return None, "no-auth"
     if not tok:
-        return None
+        return None, "no-token"
     req = urllib.request.Request(
         "https://chatgpt.com/backend-api/wham/usage",
         headers={"Authorization": "Bearer " + tok,
@@ -1336,8 +1346,15 @@ def _api_usage():
     try:
         with urllib.request.urlopen(req, timeout=3) as r:
             d = json.load(r)
-    except Exception:
-        return None
+    except urllib.error.HTTPError as exc:
+        return None, "http-%s" % exc.code
+    except (socket.timeout, TimeoutError):
+        return None, "timeout"
+    except Exception as exc:
+        reason = getattr(exc, "reason", None)
+        if isinstance(reason, (socket.timeout, TimeoutError)):
+            return None, "timeout"
+        return None, "network:%s" % type(exc).__name__
     rl = (d if isinstance(d, dict) else {}).get("rate_limit") or {}
 
     def rp(k, fallback):
@@ -1347,14 +1364,14 @@ def _api_usage():
     raw_windows = [rp("primary_window", "5h"), rp("secondary_window", "7d")]
     windows = [[w["label"], w["pct"], w.get("reset")] for w in raw_windows if w]
     if not windows:
-        return None
+        return None, "schema"
     p5 = p7 = rs5 = rs7 = None
     for label, pct, reset in windows:
         if label == "5h":
             p5, rs5 = pct, reset
         elif label == "7d":
             p7, rs7 = pct, reset
-    return {"rl_5h": p5, "rl_7d": p7, "rs_5h": rs5, "rs_7d": rs7, "windows": windows}
+    return {"rl_5h": p5, "rl_7d": p7, "rs_5h": rs5, "rs_7d": rs7, "windows": windows}, "live"
 
 
 def account_usage():
