@@ -401,12 +401,20 @@ class WaitPrimitiveCorrection(unittest.TestCase):
         self.assertIn("turn ended", ev["rule"])
         self.assertIn("sleep", ev["rule"])
 
-    def test_every_wait_primitive_suppresses_promotion(self):
+    def test_every_wait_primitive_reads_as_a_wait_in_evidence_and_badge(self):
+        # Retargeted after review m1: `_session_status_state` now sends every `shell` row to
+        # idle regardless of the child, so looping the vocabulary through it asserted
+        # nothing — mutation check, flipping `exec_child_is_wait` to `return False` left the
+        # old test green. Aim at the predicate and the badge, which is what the list drives.
         for comm in model.EXEC_WAIT_COMMS:
-            model.reset_state_tracker()
             child = {"pid": 200, "comm": comm, "etime_s": 720}
-            state, _ev = model.classify_session(self.evidence("shell", child), 1200.0)
-            self.assertEqual(state, "idle", comm)
+            self.assertTrue(model.exec_child_is_wait(child), comm)
+            sess = Session(harness="claude", pid=100, liveness="idle", ctx_pct=40,
+                           exec_child=child)
+            rows = render._context_detail_row(sess, term_width=200)
+            text = "".join(t for row in rows for t, _k in row)
+            self.assertIn("⏳ 대기 12m", text, comm)
+            self.assertNotIn(comm, text, comm)
 
     def test_busy_mapping_is_untouched_by_a_sleep_child(self):
         child = {"pid": 200, "comm": "sleep", "etime_s": 720}
@@ -459,10 +467,6 @@ class CensusFollowsClassification(unittest.TestCase):
         sessions = [Session(harness="claude", pid=100, liveness="idle", cwd="/w",
                             exec_child={"pid": 200, "comm": "python3", "etime_s": 720})]
         self.assertEqual(sum(1 for s in sessions if s.liveness == "working"), 0)
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class WaitingCallVisibility(unittest.TestCase):
@@ -603,3 +607,82 @@ class WaitingCallVisibility(unittest.TestCase):
         sess = Session(harness="codex", pid=100, liveness="working", ctx_pct=40,
                        exec_tool={"name": "exec", "command": "python3"})
         self.assertIn("⚙ exec", self.text_of(render._context_detail_row(sess, term_width=200)))
+
+    # regressions found by the 2026-09-16 independent review ------------------------------
+    def test_a_background_poll_loop_does_not_oscillate(self):
+        """Review B1 — the blocking regression this cycle introduced and then fixed.
+
+        `exec_child_evidence`'s >=60s gate used to land on the LEAF's age, and that is what
+        held `owned_exec_work` (tier 2, decided before the registry) still while a poll loop
+        alternated between its body and its `sleep`. Moving `etime_s` to the call made every
+        3-second loop body clear that gate, so the row flipped working/idle every tick and
+        `_group_activity_rank` dragged the project card with it. The leaf now has its own
+        gate, so the shape below is stably idle again — as it is on main.
+        """
+        base = dict(proc_start="208", root_pid=100, root_start="200",
+                    ownership_verified=True, attempt_id=None,
+                    ancestry=[dict(pid=100, ppid=1, start="200"),
+                              dict(pid=200, ppid=100, start="208")])
+        body = dict(base, pid=200, comm="curl", etime_s=900, leaf_etime_s=3, kind="work")
+        nap = dict(base, pid=200, comm="sleep", etime_s=900, leaf_etime_s=2, kind="wait")
+        seen = []
+        for child in (body, nap, body, nap, body):
+            model.reset_state_tracker()
+            # `updated_at` = the turn ending ~5s after the loop was backgrounded, which is
+            # what `run_in_background` looks like — and it keeps `exec_child_is_background`
+            # False forever, so nothing else damps the oscillation.
+            ev = {"harness": "claude", "pid": 100, "pid_alive": True, "status": "shell",
+                  "proc_start": "200", "mtime": 1000.0, "transcript": True,
+                  "exec_child": child, "updated_at": 305.0}
+            seen.append(model.classify_session(ev, 1200.0)[0])
+        self.assertEqual(set(seen), {"idle"}, seen)
+
+    def test_a_real_long_running_workload_still_counts_as_work(self):
+        # The other side of the same gate: the leaf test must not silence genuine work.
+        child = dict(pid=200, comm="python3", etime_s=900, leaf_etime_s=880, kind="work",
+                     proc_start="208", root_pid=100, root_start="200",
+                     ownership_verified=True, attempt_id=None,
+                     ancestry=[dict(pid=100, ppid=1, start="200"),
+                               dict(pid=200, ppid=100, start="208")])
+        ev = {"harness": "claude", "pid": 100, "pid_alive": True, "status": "shell",
+              "proc_start": "200", "mtime": 1000.0, "transcript": True,
+              "exec_child": child, "updated_at": 305.0}
+        state, evidence = model.classify_session(ev, 1200.0)
+        self.assertEqual(state, "working")
+        self.assertEqual(evidence["source"], "owned-exec")
+
+    def test_evidence_without_a_leaf_age_falls_back_to_the_call(self):
+        # `--json` replays and fixtures predate `leaf_etime_s`; they must keep working.
+        child = dict(pid=200, comm="node", etime_s=120, proc_start="208",
+                     root_pid=100, root_start="200", ownership_verified=True,
+                     attempt_id=None,
+                     ancestry=[dict(pid=100, ppid=1, start="200"),
+                               dict(pid=200, ppid=100, start="208")])
+        self.assertEqual(model.exec_child_work_age(child), 120)
+        ev = {"harness": "claude", "pid": 100, "pid_alive": True, "status": "shell",
+              "proc_start": "200", "mtime": 1000.0, "transcript": True,
+              "exec_child": child, "updated_at": 305.0}
+        self.assertEqual(model.classify_session(ev, 1200.0)[0], "working")
+
+    def test_ownership_verified_child_still_decides_before_the_registry(self):
+        # Review M1 — pin what production actually does rather than what the tier-1
+        # docstring reads like on its own: `procscan.scan` always collects ownership
+        # evidence, and `owned_exec_work` is consulted before the registry status, so
+        # `shell` is idle BY THE REGISTRY, not unconditionally. main behaves identically;
+        # this is a documented gap, not a regression, and the test exists so a future
+        # reader cannot mistake the narrower claim for the whole contract.
+        child = dict(pid=200, comm="python3", etime_s=720, leaf_etime_s=720, kind="work",
+                     proc_start="208", root_pid=100, root_start="200",
+                     ownership_verified=True, attempt_id=None,
+                     ancestry=[dict(pid=100, ppid=1, start="200"),
+                               dict(pid=200, ppid=100, start="208")])
+        ev = {"harness": "claude", "pid": 100, "pid_alive": True, "status": "shell",
+              "proc_start": "200", "mtime": 1000.0, "transcript": True,
+              "exec_child": child, "updated_at": 500.0}
+        state, evidence = model.classify_session(ev, 1200.0)
+        self.assertEqual(state, "working")
+        self.assertEqual(evidence["source"], "owned-exec")
+
+
+if __name__ == "__main__":
+    unittest.main()

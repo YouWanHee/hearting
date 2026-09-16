@@ -133,7 +133,8 @@ def collect(harness_filter=None):
         S(harness="claude", pid=90013, cwd="/home/demo/demo-lib", session_id="demo-wait-1",
           slug="demo-lib-wait", model="Opus 5", effort="high",
           ctx_pct=22, elapsed_min=34, branch="chore/poll", liveness="idle",
-          status="shell", exec_child={"pid": 90113, "comm": "sleep", "etime_s": 240},
+          status="shell", exec_child={"pid": 90113, "comm": "sleep", "etime_s": 240,
+                              "leaf_etime_s": 4, "kind": "wait"},
           summary="CI 결과 폴링 대기 — 다음 검사까지 sleep"),
         # detached tmux session (no client attached) — idle but backgrounded, shown with ◌ not ○
         S(harness="claude", pid=90006, cwd="/home/demo/demo-app", session_id="demo-claude-3",

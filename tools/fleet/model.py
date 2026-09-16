@@ -963,6 +963,28 @@ def exec_child_evidence(exec_child):
 EXEC_WAIT_COMMS = ("sleep", "wait", "inotifywait", "flock", "timeout")
 
 
+def exec_child_work_age(exec_child):
+    """How long the process running RIGHT NOW has been running, in seconds, else None.
+
+    Deliberately not `etime_s`. `etime_s` is the CALL's elapsed — the right answer for "how
+    long has this session been on this one thing", which is what the badge shows. "Is a tool
+    actually running right now" is a different question and needs the leaf's own age: a poll
+    loop's 3-second `curl` is not 15 minutes of work just because its loop is.
+
+    Letting `etime_s` answer both is exactly what review B1 (2026-09-16) caught — before
+    `etime_s` moved to the call, the ≥60s gate happened to sit on the leaf and that is what
+    held `owned_exec_work` still while a loop alternated body/`sleep`. `etime_s` is the
+    fallback for evidence dicts written before `leaf_etime_s` existed.
+    """
+    if not isinstance(exec_child, dict):
+        return None
+    for key in ("leaf_etime_s", "etime_s"):
+        value = exec_child.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return value
+    return None
+
+
 def exec_child_is_wait(exec_child):
     """True when the exec evidence describes waiting rather than work (F-47).
 
@@ -1010,6 +1032,12 @@ def owned_exec_work(ev_in, now=None):
     child = exec_child_evidence(ev_in.get("exec_child"))
     if child is None or child.get("ownership_verified") is not True or exec_child_is_wait(child):
         return None
+    # The LEAF must itself be substantial (review B1): a background poll loop otherwise
+    # alternates `working` (body, tier 2 here) with `idle` (sleep, tier 1 registry) on every
+    # tick, and `_group_activity_rank` re-sorts the project card each time it flips.
+    work_age = exec_child_work_age(child)
+    if work_age is None or work_age < SESSION_WORK_SEC:
+        return None
     ancestry = child.get("ancestry")
     if not child.get("proc_start") or not isinstance(ancestry, list) or len(ancestry) < 2:
         return None
@@ -1052,6 +1080,14 @@ def _session_status_state(status):
     `_status_desc` records which of the two it is. Adding a third state would have to be
     answered by every `liveness == "working"` consumer — hysteresis rank, sort rank, group
     tier, pulse census — for a distinction the badge already owns.
+
+    Scope: this is the tier-1 REGISTRY rule only. `classify_session` consults
+    `owned_exec_work` (tier 2) before it, and `procscan.scan` always collects with
+    `expected_start`, so in production every row carries ownership-verified evidence and a
+    `shell` row whose owned workload is genuinely running still resolves to `working` there
+    (review M1, 2026-09-16 — main does the same). `shell` is idle *by the registry*, not
+    unconditionally; `test_ownership_verified_child_still_decides_before_the_registry` pins
+    the real layering so this docstring cannot drift into the stronger claim.
     """
     if status == "busy":
         return "working"
@@ -1072,9 +1108,15 @@ def _status_desc(status, exec_child=None):
     comm = child.get("comm")
     secs = int(child.get("etime_s") or 0)
     if status == "shell":
+        # Say only what was observed: the turn ended and something is still alive. Whether
+        # that something is detached background work is `exec_child_is_background`'s
+        # question, and a call's own `sleep` is not background at all (review m2).
+        if exec_child_is_wait(child):
+            return ("claude-registry+proc",
+                    "registry status=shell: turn ended, call still waiting %ds (leaf %s)"
+                    % (secs, comm))
         return ("claude-registry+proc",
-                "registry status=shell: turn ended, background %s (%ds) still alive"
-                % (comm, secs))
+                "registry status=shell: turn ended, %s (%ds) still alive" % (comm, secs))
     if status == "busy":
         if exec_child_is_wait(child):
             return ("claude-registry+proc",
