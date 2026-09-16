@@ -1012,7 +1012,12 @@ def recover_cycle_times(root: Path, *, backup_store: Optional[Path] = None,
     sha256. Each sealed artifact revision's ``content_digest`` therefore leads
     back to the original file; the earliest such mtime is the cycle's
     ``recovered_started_on`` (UTC, second precision), kept beside the
-    untouched ``started_on`` with its evidence. Dry run by default; ``apply``
+    untouched ``started_on`` with its evidence. An mtime is a *last* write:
+    when the earliest one lands after the folder's date (a later bulk
+    rewrite), it cannot be the start, so it is stored as evidence only
+    (``recovered_earliest_write``) and the display keeps the date. Earlier
+    than the folder date means the folder date was wrong (a copy date) and
+    the recovered time wins. Dry run by default; ``apply``
     holds the producer admission lock, journals every record pre-image under
     ``.runtime/artifact-producer/v1/time-recovery/`` and rebuilds the indexes.
     """
@@ -1056,19 +1061,28 @@ def recover_cycle_times(root: Path, *, backup_store: Optional[Path] = None,
             latest = max(h[1] for h in hits)
             recovered = _rfc3339(earliest)
             folder_date = str(record.get("locator") or "")[:10]
-            row.update({"recovered_started_on": recovered, "latest_write": _rfc3339(latest),
-                        "backup_run": sorted({h[2] for h in hits}),
-                        "folder_date_agrees": recovered[:10] == folder_date})
-            if record.get("recovered_started_on") == recovered:
+            usable = not folder_date or recovered[:10] <= folder_date
+            evidence = {"matched": len(hits), "total": len(digests), "earliest": recovered,
+                        "latest": _rfc3339(latest), "backup_runs": sorted({h[2] for h in hits})}
+            row.update({"recovered_started_on": recovered if usable else None,
+                        "earliest_write": recovered, "latest_write": evidence["latest"],
+                        "backup_run": evidence["backup_runs"],
+                        "folder_date_agrees": recovered[:10] == folder_date,
+                        "display": "recovered" if usable else "evidence-only"})
+            if (record.get("recovered_earliest_write") == recovered
+                    and record.get("recovered_started_on") == (recovered if usable else None)):
                 rows.append({**row, "action": "already"}); continue
             row["action"] = "recovered" if apply else "would-recover"
             if apply:
                 journal.append({"cycle_id": cycle_id, "pre": dict(record)})
-                record["recovered_started_on"] = recovered
-                record["recovered_started_on_source"] = RECOVERED_SOURCE
-                record["recovered_started_on_evidence"] = {
-                    "matched": len(hits), "total": len(digests), "earliest": recovered,
-                    "latest": _rfc3339(latest), "backup_runs": row["backup_run"]}
+                record["recovered_earliest_write"] = recovered
+                record["recovered_started_on_evidence"] = evidence
+                if usable:
+                    record["recovered_started_on"] = recovered
+                    record["recovered_started_on_source"] = RECOVERED_SOURCE
+                else:
+                    record.pop("recovered_started_on", None)
+                    record.pop("recovered_started_on_source", None)
                 _write_cycle_record(root, record, exclusive=False)
             rows.append(row)
         counts: Dict[str, int] = {}
@@ -1080,7 +1094,8 @@ def recover_cycle_times(root: Path, *, backup_store: Optional[Path] = None,
         if apply and journal:
             journal_dir = producer_dir(root) / "time-recovery"
             _ensure_dir(journal_dir)
-            journal_file = journal_dir / (time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + ".jsonl")
+            journal_file = journal_dir / (time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+                                          + "-" + os.urandom(3).hex() + ".jsonl")
             _write_exclusive(journal_file, "".join(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n"
                                                     for entry in journal).encode("utf-8"), 0o600)
             result["journal"] = str(journal_file)
