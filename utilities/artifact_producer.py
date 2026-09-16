@@ -1039,6 +1039,8 @@ def recover_cycle_times(root: Path, *, backup_store: Optional[Path] = None,
                 directory = artifact_locator.resolve_path(root, cycle_id)
             except artifact_locator.LocatorError as exc:
                 rows.append({**row, "action": "unresolved", "detail": exc.code}); continue
+            if directory is None:
+                rows.append({**row, "action": "unresolved", "detail": "no-directory"}); continue
             manifest = _read_json(directory / "manifest.json")
             if not isinstance(manifest, dict):
                 rows.append({**row, "action": "no-manifest"}); continue
