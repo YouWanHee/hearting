@@ -17,6 +17,106 @@ C = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(C)
 
 
+_STATE_TMP = None
+_STATE_OLD = None
+
+
+def setUpModule():
+    # Every networked probe writes through to Fleet's shared usage cache; keep
+    # test fixtures (fake wham payloads) out of the live ~/.local/state store.
+    global _STATE_TMP, _STATE_OLD
+    _STATE_TMP = tempfile.TemporaryDirectory()
+    _STATE_OLD = os.environ.get("FLEET_USAGE_STATE_DIR")
+    os.environ["FLEET_USAGE_STATE_DIR"] = _STATE_TMP.name
+
+
+def tearDownModule():
+    if _STATE_OLD is None:
+        os.environ.pop("FLEET_USAGE_STATE_DIR", None)
+    else:
+        os.environ["FLEET_USAGE_STATE_DIR"] = _STATE_OLD
+    _STATE_TMP.cleanup()
+
+
+class SharedCacheFallbackTests(unittest.TestCase):
+    """2026-09-16: a codex backend 503 at compose time made the gauge `unknown`
+    although Fleet had a true reading minutes earlier. The live probe now
+    writes through to the shared cache and placement reads it back."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.env = mock.patch.dict(os.environ, {"FLEET_USAGE_STATE_DIR": self.tmp.name,
+                                                "HARNESS_CAPACITY_SCORES": ""})
+        self.env.start()
+        C._LAST_PROBE_REASON.clear()
+
+    def tearDown(self):
+        self.env.stop()
+        self.tmp.cleanup()
+
+    def _cache(self):
+        return C._usage_cache()
+
+    def test_live_probe_writes_through_and_reports_live(self):
+        payload = {"rate_limit": {"primary_window": {"used_percent": 76.0},
+                                  "secondary_window": {"used_percent": 40.0}}}
+        with tempfile.TemporaryDirectory() as home:
+            (Path(home) / "auth.json").write_text(
+                json.dumps({"tokens": {"access_token": "t", "account_id": "a"}}), encoding="utf-8")
+            with mock.patch.dict(os.environ, {"CODEX_HOME": home}), \
+                    mock.patch.object(C.urllib.request, "urlopen",
+                                      return_value=io.BytesIO(json.dumps(payload).encode("utf-8"))):
+                score, source = C._codex_probe(now=1000.0, stale_after=3600)
+        self.assertEqual((score, source), (24.0, "live"))
+        snapshot = self._cache().read("codex")      # written at wall-clock time
+        self.assertEqual(snapshot["freshness"], "fresh")
+        self.assertEqual(snapshot["payload"]["windows"][0][1], 76)
+
+    def test_probe_failure_reuses_cached_reading_with_age_and_reason(self):
+        cache = self._cache()
+        cache.record("codex", {"rl_5h": None, "rl_7d": 100, "windows": [["7d", 100, None]]}, now=700.0)
+        with mock.patch.object(C, "_codex_api_score", return_value=None), \
+                mock.patch.object(C, "_codex_score", side_effect=AssertionError("cache precedes rollouts")):
+            C._LAST_PROBE_REASON["codex"] = "http-503"
+            score, source = C._codex_probe(now=1000.0, stale_after=3600)
+        self.assertEqual(score, 0.0)
+        self.assertEqual(source, "cache:300s;live=http-503")
+
+    def test_stale_cache_is_not_reused_beyond_stale_after(self):
+        cache = self._cache()
+        cache.record("codex", {"windows": [["7d", 10, None]]}, now=0.0)
+        with mock.patch.object(C, "_codex_api_score", return_value=None), \
+                mock.patch.object(C, "_codex_score", return_value=None):
+            C._LAST_PROBE_REASON["codex"] = "timeout"
+            score, source = C._codex_probe(now=5000.0, stale_after=3600)
+        self.assertIsNone(score)
+        self.assertEqual(source, "unknown:timeout")
+
+    def test_capacity_report_names_manual_and_unknown_sources(self):
+        with mock.patch.dict(os.environ, {"HARNESS_CAPACITY_SCORES": "codex:12"}), \
+                mock.patch.object(C, "_opencode_api_score", return_value=None), \
+                mock.patch.object(C, "_claude_score", return_value=None):
+            report = C.capacity_report(now=0.0)
+            self.assertEqual(C.capacity_scores(now=0.0)["codex"], 12.0)
+        self.assertEqual(report["sources"]["codex"], "manual")
+        self.assertTrue(report["sources"]["opencode"].startswith("unknown:"))
+        self.assertEqual(report["sources"]["claude"], "unknown:no-fresh-taps")
+
+    def test_refresh_bumps_attempted_at_on_failure_without_losing_payload(self):
+        cache = self._cache()
+        cache.record("codex", {"windows": [["7d", 30, None]]}, now=100.0)
+        with mock.patch.object(C, "_codex_api_score", return_value=None), \
+                mock.patch.object(C, "_codex_score", return_value=None), \
+                mock.patch.object(C, "_opencode_api_score", return_value=None), \
+                mock.patch.object(C, "_claude_score", return_value=None):
+            report = C.refresh_gauges(now=200.0)
+        self.assertEqual(report["scores"]["codex"], 70.0)      # cache reused
+        snapshot = cache.read("codex", now=200.0)
+        self.assertEqual(snapshot["attempted_at"], 200.0)
+        self.assertEqual(snapshot["observed_at"], 100.0)
+        self.assertEqual(snapshot["payload"]["windows"][0][1], 30)
+
+
 class CapacityPolicyTests(unittest.TestCase):
     def setUp(self):
         self.policy = {

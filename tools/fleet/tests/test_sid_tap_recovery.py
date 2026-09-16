@@ -224,6 +224,7 @@ class StatuslineTapInjectionTest(unittest.TestCase):
         env["AGENT_HOME"] = self.agent_home
         env["CLAUDE_CONFIG_DIR"] = self.config_home
         env["FLEET_TITLE_DISABLE"] = "1"           # keep the refresher out of the test
+        env["HARNESS_CAPACITY_REFRESH_DISABLE"] = "1"   # and the capacity gauge probe (network + live cache)
         proc = subprocess.Popen([self.stub, _STATUSLINE], stdin=subprocess.PIPE,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
         out, err = proc.communicate(stdin_json.encode("utf-8"), timeout=30)

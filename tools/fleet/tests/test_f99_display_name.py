@@ -31,6 +31,7 @@ class _HermeticStateRoot(unittest.TestCase):
         os.environ["AGENT_HOME"] = self.tmp.name
         os.environ["HOME"] = self.tmp.name
         os.environ["CLAUDE_CONFIG_DIR"] = self.tmp.name
+        os.environ["HARNESS_CAPACITY_REFRESH_DISABLE"] = "1"
         for key in ("CLAUDE_HOME", "AGENT_DISPATCH_JOBS", "XDG_STATE_HOME", "HARNESS_STATE_ROOT"):
             os.environ.pop(key, None)
 

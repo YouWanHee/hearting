@@ -584,7 +584,7 @@ def _canonical_jobs():
 def _audit(
     status, adapter, source, configured, explicit, states, *, allocation=None,
     counts=None, rejected=(), fallback=None, reason="none", capacity=None,
-    quality_band=None, relief_promoted=False,
+    quality_band=None, relief_promoted=False, capacity_sources=None,
 ):
     lines = [
         f"status={status}", f"adapter={adapter or '-'}", f"selection_source={source}",
@@ -610,6 +610,11 @@ def _audit(
                 f"capacity_headroom.{harness}="
                 + ("unknown" if value is None else str(round(value, 1)))
             )
+            if capacity_sources and capacity_sources.get(harness):
+                # live | cache:<age>s;live=<reason> | rollout;live=<reason> |
+                # taps | manual | active-limit | unknown:<reason> — says why an
+                # unknown gauge is unknown and how old a reused reading is.
+                lines.append(f"capacity_source.{harness}={capacity_sources[harness]}")
     if quality_band:
         lines.append(f"quality_band={quality_band}")
     warning = _explicit_capacity_warning(source, adapter, capacity, allocation)
@@ -721,7 +726,9 @@ def main(argv):
             )
 
         rejected = [h for h in sorted(states) if not _eligible(states[h])]
-        capacity = _capacity.capacity_scores()
+        capacity_report = _capacity.capacity_report()
+        capacity = capacity_report["scores"]
+        capacity_sources = capacity_report["sources"]
 
         def automatically_available(harness):
             score = capacity.get(harness)
@@ -804,7 +811,7 @@ def main(argv):
                                       allocation=allocation, counts=counts,
                                       rejected=rejected if source != "explicit" else (),
                                       fallback=selected if source == "eligibility-fallback" else None,
-                                      reason=reason, capacity=capacity,
+                                      reason=reason, capacity=capacity, capacity_sources=capacity_sources,
                                       quality_band=quality_band,
                                       relief_promoted=relief_promoted)))
             print("check=failed\nreason=wrapper-unavailable\nchild_spawned=0")
@@ -813,7 +820,7 @@ def main(argv):
                                   allocation=allocation, counts=counts,
                                   rejected=rejected if source != "explicit" else (),
                                   fallback=selected if source == "eligibility-fallback" else None,
-                                  reason=reason, capacity=capacity,
+                                  reason=reason, capacity=capacity, capacity_sources=capacity_sources,
                                   quality_band=quality_band,
                                   relief_promoted=relief_promoted)), flush=True)
         print(f"route_defaults={','.join(derived) or 'none'}", flush=True)

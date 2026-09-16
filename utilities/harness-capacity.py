@@ -3,7 +3,9 @@
 
 Capacity never changes the quality policy: it only orders peers inside a band,
 or promotes an explicitly declared relief band below its configured threshold.
-OpenCode intentionally has no proactive gauge until its runtime exposes one.
+Every networked gauge shares Fleet's last-good usage cache (write-through on
+success, read-back on failure) so a transient probe failure keeps the last true
+reading instead of becoming unknown.
 """
 
 from __future__ import annotations
@@ -91,44 +93,103 @@ def _claude_score(now: float, stale_after: int) -> float | None:
     return _headroom(latest_used.values())
 
 
+# Why the last live probe produced no reading, per harness; `_codex_probe` /
+# `_opencode_probe` turn it into the `unknown:<reason>` source a receipt prints.
+_LAST_PROBE_REASON: dict[str, str] = {}
+
+
+def _fleet_collectors():
+    tools = Path(__file__).resolve().parents[1] / "tools"
+    if str(tools) not in sys.path:
+        sys.path.insert(0, str(tools))
+
+
+def _usage_cache():
+    """Fleet's last-good usage cache (`~/.local/state/agent-fleet/usage`), the one
+    store every reader shares: Fleet ticks, the statusline's stale-driven refresh,
+    and each dispatch-time probe all write it; placement reads it when the live
+    probe fails. None when the Fleet package is unavailable."""
+    _fleet_collectors()
+    try:
+        from fleet.collectors import usage_cache
+    except Exception:
+        return None
+    return usage_cache
+
+
+def _fleet_windows_headroom(payload) -> float | None:
+    windows = (payload or {}).get("windows") if isinstance(payload, dict) else None
+    if not isinstance(windows, list):
+        return None
+    return _headroom(row[1] for row in windows if isinstance(row, (list, tuple)) and len(row) >= 2)
+
+
 def _codex_api_score() -> float | None:
     """Live account headroom via the codex TUI's own `/wham/usage` endpoint.
 
     Rollout samples update only when a codex session runs, so a rollout-only
     reader self-reinforces starvation: an idle codex degrades to unknown,
     capacity-aware placement stops selecting it, and the gauge never refreshes
-    (observed 2026-08-13). The fleet collector already proved this active probe
-    (`tools/fleet/collectors/codex.py account_usage`); the two readers must not
-    drift apart again. A missing/unreadable `auth.json` returns None before any
-    network I/O, which keeps hermetic fixtures (temp `CODEX_HOME`) offline.
+    (observed 2026-08-13). One HTTP client, imported from
+    `tools/fleet/collectors/codex.py` rather than reimplemented (the two readers
+    drifted apart once). A missing/unreadable `auth.json` returns None before
+    any network I/O, which keeps hermetic fixtures (temp `CODEX_HOME`) offline.
+    A successful reading is written through to the shared usage cache.
     """
-    home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    _fleet_collectors()
     try:
-        tokens = json.loads((home / "auth.json").read_text(encoding="utf-8")).get("tokens") or {}
-    except (OSError, ValueError, AttributeError):
+        from fleet.collectors import codex as fleet_codex
+    except Exception as exc:
+        _LAST_PROBE_REASON["codex"] = f"collector-unavailable:{type(exc).__name__}"
         return None
-    token = tokens.get("access_token")
-    if not token:
+    payload, reason = fleet_codex._api_usage_detail()
+    if payload is None:
+        _LAST_PROBE_REASON["codex"] = reason or "probe-failed"
         return None
-    request = urllib.request.Request(
-        "https://chatgpt.com/backend-api/wham/usage",
-        headers={
-            "Authorization": "Bearer " + token,
-            "chatgpt-account-id": tokens.get("account_id") or "",
-            "User-Agent": "codex-cli",
-        },
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=3) as response:
-            payload = json.load(response)
-    except Exception:
-        return None
-    limits = (payload if isinstance(payload, dict) else {}).get("rate_limit") or {}
-    return _headroom(
-        (limits.get(window) or {}).get("used_percent")
-        for window in ("primary_window", "secondary_window")
-        if isinstance(limits.get(window), dict)
-    )
+    cache = _usage_cache()
+    if cache is not None:
+        cache.record("codex", payload)
+    _LAST_PROBE_REASON.pop("codex", None)
+    return _fleet_windows_headroom(payload)
+
+
+def _cached_score(harness: str, now: float, stale_after: int) -> tuple[float | None, str | None]:
+    """Last-good reading from the shared cache, if younger than `stale_after`."""
+    cache = _usage_cache()
+    if cache is None:
+        return None, None
+    snapshot = cache.read(harness, now=now, stale_max=stale_after)
+    payload = snapshot.get("payload")
+    if not isinstance(payload, dict) or not payload:
+        return None, None
+    if harness == "opencode":
+        used = [row[1] for row in (payload.get("rl_windows") or [])
+                if isinstance(row, (list, tuple)) and len(row) >= 2]
+        score = _headroom(used)
+    else:
+        score = _fleet_windows_headroom(payload)
+    if score is None:
+        return None, None
+    age = int(max(0.0, now - float(snapshot.get("observed_at") or now)))
+    return score, f"cache:{age}s"
+
+
+def _codex_probe(now: float, stale_after: int) -> tuple[float | None, str]:
+    """(headroom, source). Order: live probe → shared cache (≤ stale_after) →
+    own rollout samples (≤ stale_after) → unknown with the live probe's reason.
+    A transient backend failure at compose time therefore reuses the most recent
+    true reading instead of turning into `unknown` (2026-09-16 10:36)."""
+    score = _codex_api_score()
+    if score is not None:
+        return score, "live"
+    reason = _LAST_PROBE_REASON.get("codex", "probe-failed")
+    score, source = _cached_score("codex", now, stale_after)
+    if score is not None:
+        return score, f"{source};live={reason}"
+    score = _codex_score(now, stale_after)
+    if score is not None:
+        return score, f"rollout;live={reason}"
+    return None, f"unknown:{reason}"
 
 
 def _codex_score(now: float, stale_after: int) -> float | None:
@@ -167,6 +228,17 @@ def _codex_score(now: float, stale_after: int) -> float | None:
     return None
 
 
+def _opencode_probe(now: float, stale_after: int) -> tuple[float | None, str]:
+    score = _opencode_api_score()
+    if score is not None:
+        return score, "live"
+    reason = _LAST_PROBE_REASON.get("opencode", "probe-failed")
+    score, source = _cached_score("opencode", now, stale_after)
+    if score is not None:
+        return score, f"{source};live={reason}"
+    return None, f"unknown:{reason}"
+
+
 def _opencode_api_score() -> float | None:
     """Live Go-plan headroom via the same reader the Fleet gauge uses.
 
@@ -189,14 +261,22 @@ def _opencode_api_score() -> float | None:
         sys.path.insert(0, str(tools))
     try:
         from fleet.collectors import zen_go_usage
-    except Exception:
+    except Exception as exc:
+        _LAST_PROBE_REASON["opencode"] = f"collector-unavailable:{type(exc).__name__}"
         return None
     try:
         usage = zen_go_usage.account_usage()
-    except Exception:
+    except Exception as exc:
+        _LAST_PROBE_REASON["opencode"] = f"probe-raised:{type(exc).__name__}"
         return None
     if not isinstance(usage, dict) or "error" in usage:
+        _LAST_PROBE_REASON["opencode"] = (
+            f"probe-error:{usage.get('error')}" if isinstance(usage, dict) else "probe-failed")
         return None
+    cache = _usage_cache()
+    if cache is not None:
+        cache.record("opencode", usage)
+    _LAST_PROBE_REASON.pop("opencode", None)
     # Every window the account exposes counts, exactly as the Claude reader
     # merges its own: the tightest one decides the headroom. `weekly` here is
     # a Monday-anchored window, not a rolling 7d, but for "how much room is
@@ -206,30 +286,61 @@ def _opencode_api_score() -> float | None:
     return _headroom(used)
 
 
-def capacity_scores(*, stale_after: int = 3600, now: float | None = None) -> dict[str, float | None]:
-    """Return headroom percentages; unknown is ``None`` and never invented."""
+def capacity_report(*, stale_after: int = 3600, now: float | None = None) -> dict[str, dict]:
+    """Headroom percentages plus where each one came from.
+
+    ``scores``: unknown is ``None`` and never invented. ``sources``: ``manual``,
+    ``live``, ``cache:<age>s;live=<reason>``, ``rollout;live=<reason>``,
+    ``taps``, ``active-limit`` or ``unknown:<reason>`` — the receipt prints it so
+    an unknown gauge says why (timeout, http-503, no-auth) instead of nothing.
+    """
     now = time.time() if now is None else now
     manual = _manual_scores()
+    scores: dict[str, float | None] = {}
+    sources: dict[str, str] = {}
     if "codex" in manual:
-        codex = manual["codex"]
+        scores["codex"], sources["codex"] = manual["codex"], "manual"
     else:
         # Active probe first: the rollout gauge only refreshes while codex runs,
         # so on its own it starves an idle harness into permanent unknown.
-        codex = _codex_api_score()
-        if codex is None:
-            codex = _codex_score(now, stale_after)
-    scores = {
-        "claude": manual.get("claude", _claude_score(now, stale_after)),
-        "codex": codex,
-        "opencode": manual.get("opencode", _opencode_api_score()),
-    }
+        scores["codex"], sources["codex"] = _codex_probe(now, stale_after)
+    if "claude" in manual:
+        scores["claude"], sources["claude"] = manual["claude"], "manual"
+    else:
+        claude = _claude_score(now, stale_after)
+        scores["claude"], sources["claude"] = claude, ("taps" if claude is not None else "unknown:no-fresh-taps")
+    if "opencode" in manual:
+        scores["opencode"], sources["opencode"] = manual["opencode"], "manual"
+    else:
+        scores["opencode"], sources["opencode"] = _opencode_probe(now, stale_after)
 
     from dispatch_capacity_evidence import active_limits
     jobs = os.environ.get("AGENT_DISPATCH_JOBS")
     if jobs:
         for harness in active_limits(jobs, now=now):
             scores[harness] = 0.0
-    return scores
+            sources[harness] = "active-limit"
+    return {"scores": scores, "sources": sources}
+
+
+def capacity_scores(*, stale_after: int = 3600, now: float | None = None) -> dict[str, float | None]:
+    """Return headroom percentages; unknown is ``None`` and never invented."""
+    return capacity_report(stale_after=stale_after, now=now)["scores"]
+
+
+def refresh_gauges(now: float | None = None) -> dict[str, dict]:
+    """Probe every networked gauge once and leave the result in the shared
+    cache: a hit is written through by the probe itself, a miss bumps
+    `attempted_at` so stale-driven refreshers (the Claude statusline tick, Fleet)
+    back off instead of retrying every tick. Local-only readers (claude taps)
+    are reported, not probed."""
+    report = capacity_report(now=now)
+    cache = _usage_cache()
+    if cache is not None:
+        for harness in ("codex", "opencode"):
+            if report["scores"].get(harness) is None or not report["sources"][harness].startswith(("live", "manual")):
+                cache.record_attempt(harness, now=now)
+    return report
 
 
 ORDERING_NEUTRAL_SCORE = 50.0
@@ -535,4 +646,17 @@ def select(policy, states, counts, declared_order, scores, *, strategy="capacity
 
 
 if __name__ == "__main__":
-    print(json.dumps(capacity_scores(), sort_keys=True))
+    import argparse
+
+    parser = argparse.ArgumentParser(description="harness capacity gauge")
+    parser.add_argument("--refresh", action="store_true",
+                        help="probe the networked gauges once and update the shared usage cache")
+    parser.add_argument("--json", action="store_true", help="print scores and sources")
+    args = parser.parse_args()
+    if args.refresh:
+        report = refresh_gauges()
+        print(json.dumps(report, sort_keys=True))
+    elif args.json:
+        print(json.dumps(capacity_report(), sort_keys=True))
+    else:
+        print(json.dumps(capacity_scores(), sort_keys=True))

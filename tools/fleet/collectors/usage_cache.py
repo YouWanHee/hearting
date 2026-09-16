@@ -55,8 +55,12 @@ def _unknown(attempted_at=None):
             "attempted_at": attempted_at}
 
 
-def read(harness, now=None):
+def read(harness, now=None, stale_max=None):
+    """Last-good snapshot. `stale_max` widens the Fleet default (15 min) for a
+    reader that prefers an older true reading over none, e.g. dispatch placement
+    after a transient probe failure (2026-09-16: codex backend 503 at compose)."""
     now = time.time() if now is None else float(now)
+    stale_max = STALE_MAX if stale_max is None else float(stale_max)
     try:
         with open(_path(harness), encoding="utf-8") as fh:
             item = json.load(fh)
@@ -71,7 +75,7 @@ def read(harness, now=None):
             or fetched > now or attempted > now:
         return _unknown(attempted)
     age = now - float(fetched)
-    if age < 0 or age > STALE_MAX:
+    if age < 0 or age > stale_max:
         return _unknown(attempted)
     freshness = "fresh" if age <= FRESH_WINDOWS.get(harness, 180.0) else "stale"
     return {"payload": item["payload"], "freshness": freshness,
@@ -95,6 +99,32 @@ def _write(harness, payload, fetched_at, attempted_at):
             os.unlink(temp)
         except OSError:
             pass
+
+
+def record(harness, payload, now=None):
+    """Write-through from any successful ad-hoc probe (dispatch placement, a
+    manual `harness-capacity.py --refresh`), so one reading serves every reader.
+    Only a dict payload counts; anything else is a no-op."""
+    if not isinstance(payload, dict):
+        return False
+    now = time.time() if now is None else float(now)
+    try:
+        _write(harness, payload, now, now)
+        return True
+    except OSError:
+        return False
+
+
+def record_attempt(harness, now=None):
+    """Note a failed probe without discarding the last-good payload; the file
+    mtime moves so stale-driven refreshers back off instead of retrying every tick."""
+    now = time.time() if now is None else float(now)
+    previous = read(harness, now=now, stale_max=float("inf"))
+    try:
+        _write(harness, previous.get("payload") or {}, previous.get("observed_at") or 0.0, now)
+        return True
+    except OSError:
+        return False
 
 
 def _worker(harness):

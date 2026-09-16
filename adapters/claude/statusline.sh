@@ -164,6 +164,26 @@ if [ -n "$S_SID" ]; then
   find "$sldir" -maxdepth 1 \( -name '*.json' -o -name '.*.json.tmp' \) -mtime +1 -delete 2>/dev/null || true
 fi
 
+# 용량 계기판 간헐 갱신(2026-09-16): codex/opencode 사용량은 공유 캐시
+# (agent-fleet/usage/<h>.json)에 두고 dispatch·Fleet·이 틱이 같이 읽는다. 캐시 파일이
+# 10분 넘게 안 움직였을 때만 refresher를 분리 기동한다(성공은 갱신, 실패도 attempted_at을
+# 올려 mtime이 움직이므로 실패가 이어져도 10분에 한 번만 시도). Fleet이 열려 있으면
+# Fleet의 60초 갱신이 먼저 mtime을 움직여 이 경로는 자연히 쉰다. 즉시 반환 필수.
+cap_state="${FLEET_USAGE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/agent-fleet/usage}"
+cap_refresher="$AGENT_HOME/utilities/harness-capacity.py"
+if [ "${HARNESS_CAPACITY_REFRESH_DISABLE:-}" != "1" ] && [ -f "$cap_refresher" ] \
+   && command -v python3 >/dev/null 2>&1; then
+  cap_now=$(date +%s); cap_stale=0
+  for cap_h in codex opencode; do
+    cap_m=$(stat -c %Y "$cap_state/$cap_h.json" 2>/dev/null || echo 0)
+    case "$cap_m" in ''|*[!0-9]*) cap_m=0 ;; esac
+    [ $((cap_now - cap_m)) -gt "${HARNESS_CAPACITY_REFRESH_AFTER:-600}" ] && cap_stale=1
+  done
+  if [ "$cap_stale" -eq 1 ]; then
+    ( setsid python3 "$cap_refresher" --refresh >/dev/null 2>&1 </dev/null & ) >/dev/null 2>&1 || true
+  fi
+fi
+
 # §4.7 F-17/F-21 공용 fleet 제목 refresher 트리거 — Claude statusline debounce surface.
 # 조건: working main은 120s, NOW 실패는 30/60/120s backoff 뒤 재시도한다.
 # 재귀가드: refresher 의 claude -p 는 statusline 미실행 + FLEET_TITLE_REFRESH env 이중.
