@@ -3409,7 +3409,24 @@ class CycleBindingAndIndexOrderTest(ProducerTestBase):
         marker.write_text(json.dumps({k: v for k, v in json.loads(marker.read_text()).items() if k != "started_on"}))
         row = P.backfill_cycle_bindings(self.root, apply=True)["cycles"][0]
         self.assertEqual((row["action"], row["started_on"]), ("added", "2026-07-13T09:34:26Z"))
+        # An earliest write *after* the folder's date is a later bulk rewrite, not the
+        # start: it is kept as evidence and the display stays date-only.
+        record = json.loads(record_path.read_text())
+        record["locator"] = "2026-07-01_migrated-work"
+        record.pop("recovered_started_on"); record.pop("recovered_earliest_write")
+        record_path.write_text(json.dumps(record), encoding="utf-8")
+        Path(sealed["cycle_dir"]).rename(Path(sealed["cycle_dir"]).with_name("2026-07-01_migrated-work"))
+        row = P.recover_cycle_times(self.root, backup_store=store, apply=True)["cycles"][0]
+        self.assertEqual((row["action"], row["display"], row["recovered_started_on"], row["earliest_write"]),
+                         ("recovered", "evidence-only", None, "2026-07-13T09:34:26Z"))
+        record = json.loads(record_path.read_text())
+        self.assertEqual((record.get("recovered_started_on"), record["recovered_earliest_write"]),
+                         (None, "2026-07-13T09:34:26Z"))
+        self.assertEqual(P.artifact_locator.display_started_on(record), "2026-07-13")
+        self.assertEqual(P.recover_cycle_times(self.root, backup_store=store)["counts"], {"already": 1})
+        sealed["cycle_dir"] = str(Path(sealed["cycle_dir"]).with_name("2026-07-01_migrated-work"))
         # A cycle whose bytes are not in any backup is reported, never guessed.
+        target = Path(sealed["cycle_dir"]) / "artifacts" / "plans" / "cycle" / "plan.md"
         target.write_bytes(b"rewritten after the fact\n")
         record["derived_from_cycle_id"] = "cyc_" + "3" * 32
         manifest_path = Path(sealed["cycle_dir"]) / "manifest.json"
@@ -3417,7 +3434,7 @@ class CycleBindingAndIndexOrderTest(ProducerTestBase):
         for rev in manifest["artifact_revisions"]:
             rev["content_digest"] = "sha256:" + "f" * 64
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-        record.pop("recovered_started_on")
+        record.pop("recovered_started_on", None); record.pop("recovered_earliest_write", None)
         record_path.write_text(json.dumps(record), encoding="utf-8")
         self.assertEqual(P.recover_cycle_times(self.root, backup_store=store)["counts"], {"no-match": 1})
 
