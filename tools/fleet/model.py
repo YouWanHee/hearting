@@ -288,8 +288,9 @@ class Session:
     session_total_tokens: Optional[int] = None
     status: Optional[str] = None        # raw harness status (claude idle/shell/busy)
     task_lifecycle: Optional[str] = None  # exact Codex task_started/task_complete/turn_aborted
-    # F-47 (v30) — owned exec evidence, additive. `exec_child` = the long-lived non-helper
-    # descendant this session is running ({'pid','comm','etime_s'}, collectors/procscan.py);
+    # F-47 (v30) — owned exec evidence, additive. `exec_child` = what this session's
+    # long-lived tool call is doing ({'pid','comm','kind','etime_s','leaf_etime_s',
+    # 'child_pid'}, collectors/procscan.py — `etime_s` is the CALL's elapsed, v83);
     # `exec_tool` = a Codex rollout tool_call with no matching output yet ({'name','command'}).
     # Both are None when there is no evidence — never a guess (prd.md:263).
     exec_child: Optional[dict] = None
@@ -932,6 +933,9 @@ def _settle(key, state, tier, now, source, rule):
 def exec_child_evidence(exec_child):
     """The `exec_child` dict when it is usable F-47 evidence, else None.
 
+    The age gate reads `etime_s`, which is the TOOL CALL's elapsed (v83) — so it now asks
+    the question it always meant to ask ("has this session been on one call for a while"),
+    where the pre-v83 leaf elapsed reset on every `sleep` and silently withheld the evidence.
     Re-applies the ≥`SESSION_WORK_SEC` age gate here rather than trusting the collector:
     `classify_session` is a pure function over a caller-supplied evidence dict (demo
     fixtures, `--json` replays, tests), so the threshold has to hold at the decision point
@@ -948,19 +952,31 @@ def exec_child_evidence(exec_child):
     return exec_child
 
 
-# F-47 (v47) — wait primitives. A session whose descended child is one of these is
-# WAITING, not working: a poll loop's instantaneous sample almost always lands on its
-# `sleep`, so promoting on it painted sleeping sessions green. The evidence is still
-# shown (dim `⏳` badge, render.py) — only the promotion is suppressed. Deliberately a
-# tiny POSIX-primitive list, not a helper list that rots (F-26): these names are the
-# OS's fixed vocabulary, not this harness's.
-EXEC_WAIT_COMMS = ("sleep", "wait", "inotifywait", "flock")
+# F-47 (v47, generalized v83) — wait/guard primitives. A tool call that bottoms out on one
+# of these with nothing under it is WAITING, not working: a poll loop's instantaneous sample
+# almost always lands on its `sleep`. They are TRANSPARENT while a real workload runs
+# beneath them, though — `flock … timeout … node …` is node's work, and reading the top name
+# alone misread 121/121 measured samples of exactly that shape as a wait (2026-09-16).
+# `collectors/procscan.py` owns the descent and records its verdict as `kind`; this list is
+# only the vocabulary. Deliberately a tiny POSIX-primitive list, not a helper list that rots
+# (F-26): these names are the OS's fixed vocabulary, not this harness's.
+EXEC_WAIT_COMMS = ("sleep", "wait", "inotifywait", "flock", "timeout")
 
 
 def exec_child_is_wait(exec_child):
-    """True when the exec-child evidence names a wait primitive (F-47 v47)."""
-    return (isinstance(exec_child, dict)
-            and exec_child.get("comm") in EXEC_WAIT_COMMS)
+    """True when the exec evidence describes waiting rather than work (F-47).
+
+    `kind` is the collector's verdict over the whole descent and is what a live scan
+    carries. `comm` is the fallback for evidence dicts written before `kind` existed
+    (`--json` replays, demo fixtures, hand-built tests) — reading it alone is the misread
+    above, so it is a compatibility path, not the rule.
+    """
+    if not isinstance(exec_child, dict):
+        return False
+    kind = exec_child.get("kind")
+    if kind in ("wait", "work"):
+        return kind == "wait"
+    return exec_child.get("comm") in EXEC_WAIT_COMMS
 
 
 def exec_child_is_background(exec_child, updated_at, now):
@@ -1019,47 +1035,52 @@ def owned_exec_work(ev_in, now=None):
     return child
 
 
-def _session_status_state(status, exec_child=None, background_child=False):
+def _session_status_state(status):
     """tier-1 registry status → activity-axis state. None = registry is silent.
 
-    F-47 (v30, prd.md:612): `shell` is "the Bash tool is running", not an idle synonym. On
-    its own it stays idle (a shell waiting at a prompt really is idle), but combined with
-    tier-2 evidence that the session owns a long-lived child it resolves to `working` — the
-    registry says WHAT the session is doing and the process tree confirms it is still doing
-    it, so the two tiers agree rather than compete. `busy`/`idle` are untouched.
+    v30 read `shell` as "the Bash tool is running" and promoted `shell` + a long-lived child
+    to `working`. Measured 2026-09-16 (Claude Code 2.1.273 and 2.1.272,
+    `~/.claude/sessions/<pid>.json`), that premise is backwards: a FOREGROUND Bash call holds
+    `busy` for its whole duration — `updatedAt` does not move for 90s — and `shell` is written
+    only AFTER the turn ends, while a background shell job survives. So `shell` means "idle
+    with a detached job", the promotion painted finished turns as working, and both it and
+    its v47 wait-primitive exception are gone: `shell` is idle and the badge alone carries
+    the surviving job.
 
-    v47 exception: a wait-primitive child (`sleep` & co) never promotes — the process
-    tree confirms the session is WAITING, and calling that working is the misread.
+    Running vs waiting is a DISPLAY distinction (`⚙` vs `⏳`), not a state. A busy session
+    waiting on a script still holds a live turn, so the activity axis stays two-valued and
+    `_status_desc` records which of the two it is. Adding a third state would have to be
+    answered by every `liveness == "working"` consumer — hysteresis rank, sort rank, group
+    tier, pulse census — for a distinction the badge already owns.
     """
     if status == "busy":
-        return "working"
-    if (status == "shell" and exec_child_evidence(exec_child)
-            and not exec_child_is_wait(exec_child) and not background_child):
         return "working"
     if status in ("idle", "shell"):
         return "idle"
     return None
 
 
-def _status_desc(status, state, exec_child, background_child=False):
-    """(source, rule) for a tier-1 registry verdict — honest about the combined F-47 case."""
-    if status == "shell" and background_child:
-        child = exec_child_evidence(exec_child)
-        return (
-            "claude-registry+proc",
-            "registry status=shell + long-lived child %s, but later registry activity proves background"
-            % child.get("comm"),
-        )
-    if status == "shell" and exec_child_is_wait(exec_child) and exec_child_evidence(exec_child):
-        child = exec_child_evidence(exec_child)
+def _status_desc(status, exec_child=None):
+    """(source, rule) for a tier-1 registry verdict — names what the tool call is doing.
+
+    This rule text is where the run/wait distinction reaches `--json` and the L3 evidence
+    line, since the activity axis above stays two-valued on purpose.
+    """
+    child = exec_child_evidence(exec_child)
+    if child is None:
+        return ("claude-registry", "registry status=%s" % status)
+    comm = child.get("comm")
+    secs = int(child.get("etime_s") or 0)
+    if status == "shell":
         return ("claude-registry+proc",
-                "registry status=shell + wait primitive %s (%ds) — waiting, not promoted"
-                % (child.get("comm"), int(child.get("etime_s"))))
-    if status == "shell" and state == "working":
-        child = exec_child_evidence(exec_child)
+                "registry status=shell: turn ended, background %s (%ds) still alive"
+                % (comm, secs))
+    if status == "busy":
+        if exec_child_is_wait(child):
+            return ("claude-registry+proc",
+                    "registry status=busy + tool call waiting %ds (leaf %s)" % (secs, comm))
         return ("claude-registry+proc",
-                "registry status=shell + long-lived child %s (%ds)"
-                % (child.get("comm"), int(child.get("etime_s"))))
+                "registry status=busy + tool call running %s (%ds)" % (comm, secs))
     return ("claude-registry", "registry status=%s" % status)
 
 
@@ -1362,15 +1383,8 @@ def classify_session(ev_in, now, stale_min=SESSION_STALE_MIN, key=None):
         )
 
     status = ev_in.get("status")
-    background_child = exec_child_is_background(
-        ev_in.get("exec_child"), ev_in.get("updated_at"), now
-    )
-    st = _session_status_state(
-        status, exec_child=ev_in.get("exec_child"), background_child=background_child
-    )
-    st_source, st_rule = _status_desc(
-        status, st, ev_in.get("exec_child"), background_child=background_child
-    )
+    st = _session_status_state(status)
+    st_source, st_rule = _status_desc(status, ev_in.get("exec_child"))
     m = ev_in.get("mtime")
 
     work = owned_exec_work(ev_in, now)

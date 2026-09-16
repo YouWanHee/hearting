@@ -48,7 +48,8 @@ class ExecChildScan(unittest.TestCase):
         tree, kids = tree_of([(100, 1, 3600, "claude"), (200, 100, 720, "python3")])
         with no_helper_env():
             found = procscan.exec_child(100, tree, kids)
-        self.assertEqual(found, {"pid": 200, "comm": "python3", "etime_s": 720})
+        self.assertEqual(found, {"pid": 200, "comm": "python3", "etime_s": 720,
+                                 "leaf_etime_s": 720, "kind": "work", "child_pid": 200})
 
     def test_no_child_is_no_evidence(self):
         tree, kids = tree_of([(100, 1, 3600, "claude")])
@@ -65,15 +66,22 @@ class ExecChildScan(unittest.TestCase):
             found = procscan.exec_child(100, tree, kids)
         self.assertEqual(found["comm"], "python3")
         self.assertEqual(found["pid"], 300)
-        # prd.md:263 — elapsed is the DESCENDED process's own etime, not the wrapper's.
-        self.assertEqual(found["etime_s"], 700)
+        # v83 — elapsed is the CALL's (the direct child / wrapper), because that is how long
+        # the session has been on this one Bash call; the leaf's own age is kept beside it.
+        self.assertEqual(found["etime_s"], 720)
+        self.assertEqual(found["leaf_etime_s"], 700)
+        self.assertEqual(found["kind"], "work")
 
     def test_wrapper_without_work_child_reports_itself(self):
         # A 12-minute `zsh` with nothing under it IS a 12-minute Bash tool call; inventing a
         # command name would be a guess, reporting the wrapper is the honest reading.
         tree, kids = tree_of([(100, 1, 3600, "claude"), (200, 100, 720, "zsh")])
         with no_helper_env():
-            self.assertEqual(procscan.exec_child(100, tree, kids)["comm"], "zsh")
+            found = procscan.exec_child(100, tree, kids)
+        self.assertEqual(found["comm"], "zsh")
+        # Nothing is running under the call, so it reads as a wait — which is also why the
+        # bare `zsh` name never reaches the screen (render shows `⏳ 대기 <elapsed>`).
+        self.assertEqual(found["kind"], "wait")
 
     def test_child_under_min_age_ignored(self):
         tree, kids = tree_of([(100, 1, 3600, "claude"), (200, 100, 59, "python3")])
@@ -126,7 +134,12 @@ class ExecChildScan(unittest.TestCase):
 
 
 class ShellCorrection(unittest.TestCase):
-    """model.py — `shell` is "Bash tool running", not an idle synonym (prd.md:612)."""
+    """model.py — `shell` means "turn ended, a background shell job survives" (v83).
+
+    v30 read it as "the Bash tool is running" and promoted `shell` + a long-lived child to
+    working. Measured 2026-09-16: a foreground Bash call holds `busy` start to finish, and
+    `shell` is written only after the turn ends. The promotion is gone; the badge carries
+    the surviving job."""
 
     def setUp(self):
         model.reset_state_tracker()
@@ -140,13 +153,15 @@ class ShellCorrection(unittest.TestCase):
     def classify(self, ev, now=1200.0):
         return model.classify_session(ev, now)
 
-    def test_shell_with_long_lived_child_is_working(self):
-        child = {"pid": 200, "comm": "python3", "etime_s": 720}
+    def test_shell_with_long_lived_child_is_idle_and_says_why(self):
+        # v83 premise correction: the turn is OVER, so the row must not read as working;
+        # the job stays visible through the rule text and the badge.
+        child = {"pid": 200, "comm": "python3", "etime_s": 720, "kind": "work"}
         state, ev = self.classify(self.evidence("shell", child))
-        self.assertEqual(state, "working")
+        self.assertEqual(state, "idle")
         self.assertEqual(ev["tier"], 1)
         self.assertEqual(ev["source"], "claude-registry+proc")
-        self.assertIn("shell", ev["rule"])
+        self.assertIn("turn ended", ev["rule"])
         self.assertIn("python3", ev["rule"])
         self.assertEqual(ev["raw_status"], "shell")
 
@@ -167,15 +182,20 @@ class ShellCorrection(unittest.TestCase):
         )
         self.assertEqual(state, "idle")
         self.assertEqual(ev["source"], "claude-registry+proc")
-        self.assertIn("later registry activity proves background", ev["rule"])
+        self.assertIn("turn ended", ev["rule"])
+        self.assertIn("tail", ev["rule"])
 
-    def test_process_start_skew_does_not_demote_current_shell_child(self):
+    def test_shell_is_idle_whatever_the_registry_clock_skew(self):
+        # The old rule needed a `updatedAt` gap to tell a live shell child from a background
+        # one, so clock skew could flip the row. `shell` is idle either way now.
         now = 5000.0
         child = {"pid": 200, "comm": "python3", "etime_s": 720}
-        state, _ev = self.classify(
-            self.evidence("shell", child, updated_at=4330.0, mtime=4330.0), now=now
-        )
-        self.assertEqual(state, "working")
+        for updated in (4330.0, 4401.0):
+            model.reset_state_tracker()
+            state, _ev = self.classify(
+                self.evidence("shell", child, updated_at=updated, mtime=updated), now=now
+            )
+            self.assertEqual(state, "idle", updated)
 
     def test_idle_with_child_is_not_promoted(self):
         # Background case: the turn ended, the child outlived it. Model-side waiting is a
@@ -200,7 +220,7 @@ class ShellCorrection(unittest.TestCase):
             state, _ev = self.classify(self.evidence("shell", child))
             self.assertEqual(state, "idle", "child=%r" % (child,))
 
-    def test_stale_window_still_beats_promoted_shell(self):
+    def test_stale_window_still_beats_a_shell_row_with_a_child(self):
         # The one documented tier-3-over-tier-1 exception (§4.8) must keep winning: a
         # 48h-silent session showing `working` is worse than showing it stale.
         child = {"pid": 200, "comm": "python3", "etime_s": 720}
@@ -219,7 +239,7 @@ class ShellCorrection(unittest.TestCase):
         collected = liveness.collect_evidence(sess)
         self.assertEqual(collected["exec_child"]["comm"], "python3")
         with mock.patch.object(liveness, "_alive", return_value=True):
-            self.assertEqual(liveness.classify(sess, now=1200.0), "working")
+            self.assertEqual(liveness.classify(sess, now=1200.0), "idle")
         self.assertEqual(sess.state_evidence["source"], "claude-registry+proc")
 
 
@@ -358,7 +378,7 @@ class ExecDetailRender(unittest.TestCase):
 
 
 class WaitPrimitiveCorrection(unittest.TestCase):
-    """v47 — a wait-primitive child (`sleep` & co) is WAITING: no promotion, dim ⏳ badge.
+    """v47 — a call with nothing under it is WAITING; v83 — and it says so legibly.
 
     A poll loop's instantaneous sample almost always lands on its `sleep`, so promoting
     on it painted sleeping sessions green. The evidence stays visible; only the reading
@@ -378,7 +398,7 @@ class WaitPrimitiveCorrection(unittest.TestCase):
         state, ev = model.classify_session(self.evidence("shell", child), 1200.0)
         self.assertEqual(state, "idle")
         self.assertEqual(ev["source"], "claude-registry+proc")
-        self.assertIn("waiting, not promoted", ev["rule"])
+        self.assertIn("turn ended", ev["rule"])
         self.assertIn("sleep", ev["rule"])
 
     def test_every_wait_primitive_suppresses_promotion(self):
@@ -393,22 +413,30 @@ class WaitPrimitiveCorrection(unittest.TestCase):
         state, _ev = model.classify_session(self.evidence("busy", child), 1200.0)
         self.assertEqual(state, "working")
 
-    def test_wait_badge_is_hourglass_and_dim_even_on_a_working_row(self):
-        # Working via some other evidence (busy status) — the badge must still not
-        # read as work: the child is a wait, whatever the row's state.
+    def test_wait_badge_on_a_working_row_is_legible_and_never_names_the_primitive(self):
+        # v83: the row is working because the TURN is live (busy), not because of this
+        # badge, so the badge is visible rather than dim — that is the whole point, the
+        # user must be able to see "이 세션은 스크립트를 기다리는 중" at a glance. And it
+        # names the wait, never `sleep`, whose own clock resets every iteration.
         sess = Session(harness="claude", pid=100, liveness="working", ctx_pct=40,
-                       exec_child={"pid": 200, "comm": "sleep", "etime_s": 240})
+                       exec_child={"pid": 200, "comm": "sleep", "etime_s": 240,
+                                   "kind": "wait"})
         rows = render._context_detail_row(sess, term_width=200)
         text = "".join(t for row in rows for t, _k in row)
-        self.assertIn("⏳ sleep 4m", text)
+        self.assertIn("⏳ 대기 4m", text)
+        self.assertNotIn("sleep", text)
         self.assertNotIn("⚙", text)
         keys = [k for row in rows for t, k in row if "⏳" in t]
-        self.assertEqual(keys, ["dim"])
+        self.assertEqual(keys, ["g_work"])
 
     def test_wait_badge_under_idle_row_is_dim(self):
+        # The acceptance case the v47 rule exists for: a background poll loop under a
+        # finished turn must not make the row — or its group — look hot.
         sess = Session(harness="claude", pid=100, liveness="idle", ctx_pct=40,
                        exec_child={"pid": 200, "comm": "sleep", "etime_s": 240})
         rows = render._context_detail_row(sess, term_width=200)
+        text = "".join(t for row in rows for t, _k in row)
+        self.assertIn("⏳ 대기 4m", text)
         keys = [k for row in rows for t, k in row if "⏳" in t]
         self.assertEqual(keys, ["dim"])
 
@@ -435,3 +463,143 @@ class CensusFollowsClassification(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WaitingCallVisibility(unittest.TestCase):
+    """v83 — "스크립트 돌려두고 기다리는 세션" reads correctly every tick.
+
+    All four numbers below were measured 2026-09-16 against a live Claude Code 2.1.273
+    session (pid 4013556), sampling `procscan.exec_child` every 0.25s:
+      (a) `busy` resolved to working without consulting the wait evidence, so the glyph
+          said work while the badge said wait, and a 40-minute wait looked like generation.
+      (b) the ownership path returned None whenever the wrapper had no child right then —
+          217 of 349 samples across a 100s wait — so the badge blinked out in the gaps.
+      (c) label and elapsed came from the leaf: a 100s wait reported `sleep` at 0–1s, and a
+          `sleep 20` poll loop can therefore never show a 9-minute wait.
+      (d) the descent stopped at the first wait comm: `flock … timeout … python3` read as
+          `⏳ flock` in 121/121 samples while python3 computed three levels below it.
+    """
+
+    def setUp(self):
+        model.reset_state_tracker()
+
+    def text_of(self, rows):
+        return "".join(text for row in rows for text, _key in row)
+
+    def owned_scan(self, rows, ids, expected_start):
+        """`exec_child` down the ownership-verified path Claude sessions always take."""
+        tree, kids = tree_of(rows)
+        with mock.patch.object(procscan, "_exec_identity", side_effect=ids.get), \
+             mock.patch.object(procscan, "read_environ", return_value={}):
+            return procscan.exec_child(100, tree, kids, expected_start=expected_start)
+
+    # (c) elapsed -------------------------------------------------------------------------
+    def test_poll_loop_reports_the_calls_elapsed_not_the_sleeps(self):
+        # 9 minutes into a `sleep 20` loop: the leaf is 3s old and always will be.
+        tree, kids = tree_of([(100, 1, 3600, "claude"),
+                              (200, 100, 540, "zsh"),
+                              (300, 200, 3, "sleep")])
+        with no_helper_env():
+            found = procscan.exec_child(100, tree, kids)
+        self.assertEqual(found["etime_s"], 540)      # the call — what the user asked to see
+        self.assertEqual(found["leaf_etime_s"], 3)   # the sleep — kept for forensics only
+        self.assertEqual(found["kind"], "wait")
+        sess = Session(harness="claude", pid=100, liveness="working", ctx_pct=40,
+                       exec_child=found)
+        text = self.text_of(render._context_detail_row(sess, term_width=200))
+        self.assertIn("⏳ 대기 9m", text)
+        self.assertNotIn("sleep", text)
+
+    # (b) stability -----------------------------------------------------------------------
+    def test_badge_survives_the_gap_between_loop_iterations(self):
+        # Between two `sleep`s the wrapper momentarily has no child. Before v83 the
+        # ownership path returned None here and the badge vanished for that tick.
+        ids = {100: (1, "900"), 200: (100, "901")}
+        found = self.owned_scan([(100, 1, 3600, "claude"), (200, 100, 540, "zsh")],
+                                ids, expected_start="900")
+        self.assertIsNotNone(found)
+        self.assertEqual(found["kind"], "wait")
+        self.assertEqual(found["etime_s"], 540)
+        self.assertTrue(found["ownership_verified"])
+
+    def test_the_elapsed_is_identical_mid_sleep_and_in_the_gap(self):
+        # The badge must not jitter as the loop cycles: same call, same elapsed, same kind.
+        ids = {100: (1, "900"), 200: (100, "901"), 300: (200, "902")}
+        mid = self.owned_scan([(100, 1, 3600, "claude"), (200, 100, 540, "zsh"),
+                               (300, 200, 7, "sleep")], ids, expected_start="900")
+        gap = self.owned_scan([(100, 1, 3600, "claude"), (200, 100, 540, "zsh")],
+                              ids, expected_start="900")
+        for field in ("etime_s", "kind", "child_pid"):
+            self.assertEqual(mid[field], gap[field], field)
+
+    # (d) guards --------------------------------------------------------------------------
+    def test_guard_chain_with_a_workload_under_it_is_work(self):
+        # `flock -w 1500 … timeout 1500 node …` — measured on cairn-91, 226s of real work
+        # that rendered as `⏳ flock`. A guard with something under it IS that something.
+        tree, kids = tree_of([(100, 1, 3600, "claude"),
+                              (200, 100, 240, "zsh"),
+                              (300, 200, 239, "flock"),
+                              (400, 300, 239, "timeout"),
+                              (500, 400, 238, "python3")])
+        with no_helper_env():
+            found = procscan.exec_child(100, tree, kids)
+        self.assertEqual(found["comm"], "python3")
+        self.assertEqual(found["kind"], "work")
+        self.assertEqual(found["etime_s"], 240)
+        sess = Session(harness="claude", pid=100, liveness="working", ctx_pct=40,
+                       exec_child=found)
+        self.assertIn("⚙ python3 4m", self.text_of(render._context_detail_row(sess, term_width=200)))
+
+    def test_a_guard_with_nothing_under_it_really_is_a_wait(self):
+        # The other half of the same rule: `flock` blocked on a lock has no child, and that
+        # is a genuine wait — the rule must not simply stop calling guards waits.
+        tree, kids = tree_of([(100, 1, 3600, "claude"),
+                              (200, 100, 240, "zsh"),
+                              (300, 200, 239, "flock")])
+        with no_helper_env():
+            found = procscan.exec_child(100, tree, kids)
+        self.assertEqual(found["comm"], "flock")
+        self.assertEqual(found["kind"], "wait")
+
+    # (a) the two readings are distinguishable --------------------------------------------
+    def test_a_busy_session_waiting_is_distinguishable_from_one_working(self):
+        waiting = {"pid": 300, "comm": "sleep", "etime_s": 540, "kind": "wait"}
+        running = {"pid": 300, "comm": "python3", "etime_s": 540, "kind": "work"}
+        seen = {}
+        for name, child in (("wait", waiting), ("work", running)):
+            model.reset_state_tracker()
+            ev = {"harness": "claude", "pid": 100, "pid_alive": True, "status": "busy",
+                  "mtime": 1000.0, "transcript": True, "exec_child": child}
+            state, evidence = model.classify_session(ev, 1200.0)
+            # The turn IS live in both cases, so the activity axis stays `working` — the
+            # distinction is carried by the evidence rule and the badge, not by a state.
+            self.assertEqual(state, "working", name)
+            sess = Session(harness="claude", pid=100, liveness="working", ctx_pct=40,
+                           exec_child=child)
+            seen[name] = (evidence["rule"],
+                          self.text_of(render._context_detail_row(sess, term_width=200)))
+        self.assertIn("waiting", seen["wait"][0])
+        self.assertIn("running", seen["work"][0])
+        self.assertNotEqual(seen["wait"][0], seen["work"][0])
+        self.assertIn("⏳ 대기 9m", seen["wait"][1])
+        self.assertIn("⚙ python3 9m", seen["work"][1])
+
+    # thresholds and neighbours preserved -------------------------------------------------
+    def test_a_call_under_the_flicker_threshold_is_still_invisible(self):
+        tree, kids = tree_of([(100, 1, 3600, "claude"),
+                              (200, 100, 59, "zsh"),
+                              (300, 200, 3, "sleep")])
+        with no_helper_env():
+            self.assertIsNone(procscan.exec_child(100, tree, kids))
+
+    def test_sandbox_plumbing_with_nothing_under_it_is_still_no_evidence(self):
+        # Widening "a bare wrapper is the call" must not start badging rows for the
+        # runtime's own sandbox scaffolding mid-setup.
+        tree, kids = tree_of([(100, 1, 3600, "codex"), (200, 100, 240, "bwrap")])
+        with no_helper_env():
+            self.assertIsNone(procscan.exec_child(100, tree, kids))
+
+    def test_codex_rollout_badge_is_untouched(self):
+        sess = Session(harness="codex", pid=100, liveness="working", ctx_pct=40,
+                       exec_tool={"name": "exec", "command": "python3"})
+        self.assertIn("⚙ exec", self.text_of(render._context_detail_row(sess, term_width=200)))

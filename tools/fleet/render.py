@@ -3994,10 +3994,19 @@ def _compact_context_gauge_width(available, depth=0):
 
 
 _EXEC_GLYPH = "⚙"
-# F-47 v47 — a wait-primitive child (`sleep` & co) renders as ⏳ and ALWAYS dim: the
-# session is waiting on purpose, and the badge must not read as work even when the row
-# is working for some other reason (busy status, fresh transcript).
+# F-47 v47 → v83 — a tool call with nothing running under it renders as ⏳. v47 forced it
+# ALWAYS dim because `shell` + a `sleep` child used to promote the ROW to working, so a
+# bright badge sat on top of a green glyph the wait itself had caused (user 2026-08-05
+# "fleet에서 sleep 명령어가 뜨는 건 좀 모순"). That promotion is gone — `shell` is idle by
+# measurement (model._session_status_state) — so brightness can follow the row's own
+# classification like every other badge: dim under an idle/background row, live under a busy
+# turn, which is the only way "이 세션은 9분째 스크립트를 기다리는 중" is visible at a glance.
 _WAIT_GLYPH = "⏳"
+# The leaf of a waiting call is a primitive (`sleep`, `flock`) whose name tells the user
+# nothing and whose clock resets every iteration, so a 9-minute wait rendered as `sleep 18s`.
+# The badge names the WAIT and lets the elapsed — the CALL's, not the leaf's — carry the
+# information; the leaf comm stays in `--json` for forensics.
+_WAIT_LABEL = "대기"
 
 
 def _fmt_exec_age(seconds):
@@ -4017,19 +4026,23 @@ def _exec_detail_segs(entity):
     and the only one with a real elapsed. Brightness follows the CLASSIFICATION, not the
     badge: a promoted `working` row gets the live hue, a background child under an idle row
     stays dim (prd.md:263 — the badge never makes a row or its group look hot).
+
+    The elapsed is the CALL's, so it counts a whole `sleep 20` poll loop instead of resetting
+    with each iteration, and a waiting call is labelled `대기` rather than by its primitive.
     """
     key = "g_work" if getattr(entity, "liveness", None) == "working" else "dim"
     child = getattr(entity, "exec_child", None)
     if isinstance(child, dict) and child.get("comm"):
         etime = child.get("etime_s")
-        glyph = _EXEC_GLYPH
-        if exec_child_is_wait(child):            # v47: waiting, never bright
-            glyph, key = _WAIT_GLYPH, "dim"
+        if exec_child_is_wait(child):
+            # v83: name the wait, not the primitive, and leave `key` at the row's own
+            # classification — dim on an idle/background row, live under a busy turn.
+            glyph, label = _WAIT_GLYPH, _WAIT_LABEL
         else:
             # A real non-helper descendant is experiment activity even if its interactive
             # parent is sleeping. Promote only this status detail, never the title.
-            key = "g_work"
-        text = "%s %s" % (glyph, child["comm"])
+            glyph, label, key = _EXEC_GLYPH, child["comm"], "g_work"
+        text = "%s %s" % (glyph, label)
         if isinstance(etime, (int, float)) and not isinstance(etime, bool):
             text += " %s" % _fmt_exec_age(etime)
         return [(text, key)]
