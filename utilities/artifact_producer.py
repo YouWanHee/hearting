@@ -3799,7 +3799,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                    help="the work stream this cycle belongs to; reuses the active "
                         "campaign holding that key. Defaults to the sealed route's key. "
                         "With no campaign/key/parent selection, uses the root's "
-                        "_unassigned campaign and reports degraded=true")
+                        "_unassigned campaign and reports degraded=true. Size: a stream with a "
+                        "one-sentence closing condition — not a project name, not a one-cycle task")
     p.add_argument("--title")
     p.add_argument("--goal")
     p.add_argument("--parent-cycle",
