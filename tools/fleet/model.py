@@ -1115,8 +1115,12 @@ def _status_desc(status, exec_child=None):
             return ("claude-registry+proc",
                     "registry status=shell: turn ended, call still waiting %ds (leaf %s)"
                     % (secs, comm))
+        # Name and clock from the SAME process (review r2 N2): pairing the leaf's comm with
+        # the call's elapsed said "curl (900s) still alive" for a 3-second curl.
+        leaf_secs = int(exec_child_work_age(child) or 0)
         return ("claude-registry+proc",
-                "registry status=shell: turn ended, %s (%ds) still alive" % (comm, secs))
+                "registry status=shell: turn ended, call %ds, running %s (%ds)"
+                % (secs, comm, leaf_secs))
     if status == "busy":
         if exec_child_is_wait(child):
             return ("claude-registry+proc",

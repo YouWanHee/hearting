@@ -664,6 +664,17 @@ class WaitingCallVisibility(unittest.TestCase):
               "exec_child": child, "updated_at": 305.0}
         self.assertEqual(model.classify_session(ev, 1200.0)[0], "working")
 
+    def test_shell_rule_never_pairs_a_leaf_name_with_the_calls_clock(self):
+        # Review r2 N2: a 3-second `curl` inside a 900-second loop was described as
+        # "curl (900s) still alive". Each number must belong to the process it is next to.
+        child = {"pid": 300, "comm": "curl", "etime_s": 900, "leaf_etime_s": 3, "kind": "work"}
+        ev = {"harness": "claude", "pid": 100, "pid_alive": True, "status": "shell",
+              "mtime": 1000.0, "transcript": True, "exec_child": child}
+        _state, evidence = model.classify_session(ev, 1200.0)
+        self.assertIn("call 900s", evidence["rule"])
+        self.assertIn("curl (3s)", evidence["rule"])
+        self.assertNotIn("curl (900s)", evidence["rule"])
+
     def test_ownership_verified_child_still_decides_before_the_registry(self):
         # Review M1 — pin what production actually does rather than what the tier-1
         # docstring reads like on its own: `procscan.scan` always collects ownership
