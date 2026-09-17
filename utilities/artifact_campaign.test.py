@@ -55,6 +55,23 @@ class CampaignTest(F.ProducerTestBase):
     def finish(self):
         return C.close(self.root, self.path, harness="codex", session=SID)
 
+    def provisional_child(self, closed):
+        """Seal a second campaign member `state: active` (route open at seal
+        time, D-6). `closed`: "proven" closes the route with terminal markers
+        written first; "unproven" closes it with none; `None` leaves it open."""
+        route = F.compile_for("direct", self.root, slug="provisional-cycle", gate_source="provisional-input")
+        binding = F.L.admit_runtime_route(self.root, route)
+        route_file = Path(binding.route_file)
+        child = P.begin(self.root, route_file=route_file, capability="autopilot-code",
+                        intensity="direct", campaign_id=self.campaign)
+        self.write_output(child)
+        P.finalize(self.root, cycle_id=child["cycle_id"], allow_open_route=True)
+        if closed == "proven":
+            self.close(route, route_file)
+        elif closed == "unproven":
+            F.R.close_route(route, route_file, commit="a" * 40, summary="fixture")
+        return route, route_file, child
+
     def test_cli_and_idempotency_preserve_sealed_bytes_and_reject_new_cycle(self):
         self.approve()
         args = ["campaign-close", "--artifact-root", str(self.root), "--campaign", str(self.path),
@@ -328,6 +345,107 @@ class CampaignTest(F.ProducerTestBase):
                 C.verify_approval("opencode", sid, statement)
             del row["parts"][0]["synthetic"]
             self.assertEqual(C.close(self.root, self.path, harness="opencode", session=sid)["status"], "satisfied")
+
+    def test_proven_campaign_rows_and_digest_are_unchanged(self):
+        report = C.status(self.root, self.path)
+        row = report["cycles"][0]
+        self.assertEqual(set(row) - {"disposition"},
+                         {"cycle_id", "state", "manifest_digest", "index_digest",
+                          "route_id", "manifest_id", "manifest_revision_id"})
+        self.assertEqual(row["disposition"], "completed")
+        snapshot = C._snapshot(self.root, self.path)
+        without_disposition = [{k: v for k, v in r.items() if k != "disposition"} for r in report["cycles"]]
+        self.assertEqual(without_disposition, snapshot["cycles"])
+        self.assertEqual(report["snapshot_digest"], C.digest(snapshot))
+        self.assertNotIn("unproven_cycles", report)
+
+    def test_route_closed_unproven_cycle_is_disclosed_and_closable(self):
+        route, route_file, child = self.provisional_child("unproven")
+        manifest_before = (Path(child["cycle_dir"]) / "manifest.json").read_bytes()
+        record_before = P.read_cycle_record(self.root, child["cycle_id"])
+        report = C.status(self.root, self.path)
+        self.assertEqual(report["status"], "awaiting-user-acceptance")
+        row = next(r for r in report["cycles"] if r["cycle_id"] == child["cycle_id"])
+        self.assertEqual(row["state"], "active")
+        self.assertEqual(row["disposition"], C.PROVISIONAL_DISPOSITION)
+        self.assertIs(row["terminal_gate_proven"], False)
+        self.assertTrue(any(reason.endswith(":completion-marker-absent") for reason in row["terminal_gate_reasons"]))
+        self.assertTrue(row["route_outcome_digest"].startswith("sha256:"))
+        self.assertEqual(report["unproven_cycles"], {"count": 1, "without_terminal_proof": 1})
+        self.approve()
+        result = self.finish()
+        self.assertEqual(result["status"], "satisfied")
+        event = json.loads(C._event_path(self.path).read_text())
+        snap_row = next(r for r in event["payload"]["snapshot"]["cycles"] if r["cycle_id"] == child["cycle_id"])
+        for key in ("route_closed", "terminal_gate_proven", "terminal_gate_reasons", "route_outcome_digest"):
+            self.assertIn(key, snap_row)
+        self.assertNotIn("disposition", snap_row)
+        self.assertIsNotNone(C._load_event(self.root, self.path))
+        self.assertEqual((Path(child["cycle_dir"]) / "manifest.json").read_bytes(), manifest_before)
+        self.assertEqual(P.read_cycle_record(self.root, child["cycle_id"]), record_before)
+
+    def test_outcome_bytes_change_invalidates_prior_statement(self):
+        route, route_file, child = self.provisional_child("unproven")
+        self.approve()
+        outcome_path = C.lifecycle.canonical_outcome_path(self.root, route["route_id"])
+        outcome = json.loads(outcome_path.read_text())
+        outcome["summary"] = "changed after approval"
+        outcome_path.write_text(json.dumps(outcome))
+        with self.assertRaisesRegex(C.CampaignError, "campaign-user-acceptance-required"):
+            self.finish()
+
+    def test_route_closed_with_proof_stays_active_and_sealed_unproven(self):
+        route, route_file, child = self.provisional_child("proven")
+        report = C.status(self.root, self.path)
+        row = next(r for r in report["cycles"] if r["cycle_id"] == child["cycle_id"])
+        self.assertEqual(row["state"], "active")
+        self.assertEqual(row["disposition"], C.PROVISIONAL_DISPOSITION)
+        self.assertIs(row["terminal_gate_proven"], True)
+        self.assertEqual(row["terminal_gate_reasons"], [])
+        self.assertEqual(report["unproven_cycles"]["without_terminal_proof"], 0)
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=child["cycle_id"], state="completed", allow_open_route=True)
+        self.assertEqual(caught.exception.code, "finalize-state-conflict")
+
+    def test_open_route_provisional_cycle_is_refused_with_next_step(self):
+        route, route_file, child = self.provisional_child(None)
+        with self.assertRaises(C.CampaignError) as caught:
+            C.status(self.root, self.path)
+        self.assertEqual(caught.exception.code, "campaign-cycle-provisional-active")
+        self.assertIn("open=1", caught.exception.detail)
+        self.assertIn(f"route={route['route_id']}", caught.exception.detail)
+        self.assertIn("route_state=open", caught.exception.detail)
+        self.assertIn("complete", caught.exception.detail)
+        self.assertIn("--allow-unproven", caught.exception.detail)
+        self.assertNotIn("finalize", caught.exception.detail)
+        F.R.close_route(route, route_file, commit="a" * 40, summary="fixture")
+        report = C.status(self.root, self.path)
+        self.assertEqual(report["status"], "awaiting-user-acceptance")
+
+    def test_outcome_identity_mismatch_is_typed(self):
+        route, route_file, child = self.provisional_child("unproven")
+        outcome_path = C.lifecycle.canonical_outcome_path(self.root, route["route_id"])
+        outcome = json.loads(outcome_path.read_text())
+        outcome["route_hash"] = "sha256:" + "0" * 64
+        outcome_path.write_text(json.dumps(outcome))
+        with self.assertRaisesRegex(C.CampaignError, "campaign-cycle-route-outcome-mismatch"):
+            C.status(self.root, self.path)
+
+    def test_integrity_errors_win_over_open_route_refusal(self):
+        self.provisional_child(None)
+        self.output.write_bytes(b"bad bytes")
+        with self.assertRaisesRegex(C.CampaignError, "campaign-artifact-mismatch"):
+            C.status(self.root, self.path)
+
+
+class OpenRefusalDetailTest(unittest.TestCase):
+    def test_open_refusal_detail_is_bounded(self):
+        pending = [(f"cyc_{i:032x}", f"rt-{i:016x}") for i in range(12)]
+        detail = C._open_refusal_detail(pending)
+        self.assertTrue(detail.startswith("open=12 "))
+        self.assertIn("+2 more", detail)
+        self.assertEqual(detail.count("route_state=open"), 10)
+        self.assertNotIn("finalize", detail)
 
 
 if __name__ == "__main__":

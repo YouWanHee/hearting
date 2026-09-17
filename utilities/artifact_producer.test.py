@@ -1461,6 +1461,21 @@ class CliTest(ProducerTestBase):
         self.assertIn("requested=abandoned", payload["detail"])
         self.assertIn("published_cycle_state=active", payload["detail"])
 
+    def test_finalize_allow_open_route_cli_prints_provisional_warning_to_stderr(self):
+        import io
+        import contextlib
+        self.activate()
+        route, route_file, result = self.begin()
+        self.write_output(result)
+        cycle_id = result["cycle_id"]
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = P.main(["finalize", "--artifact-root", str(self.root), "--cycle", cycle_id,
+                           "--allow-open-route"])
+        self.assertEqual(code, P.OK)
+        self.assertEqual(json.loads(out.getvalue().strip().splitlines()[-1])["provisional"], True)
+        self.assertIn("cannot make this cycle completed", err.getvalue())
+
     def test_malformed_manifest_cycle_state_exits_blocked_not_traceback(self):
         self.activate()
         route, route_file, result = self.begin()
@@ -1826,6 +1841,8 @@ class FinalizeStateConflictTest(ProducerTestBase):
         sealed = P.finalize(self.root, cycle_id=cycle_id, allow_open_route=True)
         self.assertEqual(sealed["status"], "sealed")
         self.assertEqual(sealed["cycle_state"], "active")
+        self.assertIs(sealed["provisional"], True)
+        self.assertIn("cannot make this cycle completed", sealed["warning"])
         manifest_path = Path(result["cycle_dir"]) / "manifest.json"
         manifest_bytes = manifest_path.read_bytes()
         with self.assertRaises(P.ProducerError) as caught:
@@ -1857,7 +1874,9 @@ class FinalizeStateConflictTest(ProducerTestBase):
         self.write_output(result)
         self.close(route, route_file)
         cycle_id = result["cycle_id"]
-        P.finalize(self.root, cycle_id=cycle_id)
+        completed_sealed = P.finalize(self.root, cycle_id=cycle_id)
+        self.assertNotIn("provisional", completed_sealed)
+        self.assertNotIn("warning", completed_sealed)
         with self.assertRaises(P.ProducerError) as caught:
             P.finalize(self.root, cycle_id=cycle_id, state="abandoned", abandon_reason="operator-decision")
         self.assertEqual(caught.exception.code, "finalize-state-conflict")
@@ -1867,7 +1886,9 @@ class FinalizeStateConflictTest(ProducerTestBase):
         self.write_output(result2)
         R.close_route(route2, route_file2, commit="a" * 40, summary="abandoned fixture")
         cycle_id2 = result2["cycle_id"]
-        P.finalize(self.root, cycle_id=cycle_id2, state="abandoned", abandon_reason="operator-decision")
+        abandoned_sealed = P.finalize(self.root, cycle_id=cycle_id2, state="abandoned", abandon_reason="operator-decision")
+        self.assertNotIn("provisional", abandoned_sealed)
+        self.assertNotIn("warning", abandoned_sealed)
         with self.assertRaises(P.ProducerError) as caught2:
             P.finalize(self.root, cycle_id=cycle_id2, state="completed")
         self.assertEqual(caught2.exception.code, "finalize-state-conflict")

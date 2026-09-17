@@ -93,6 +93,15 @@ LEGACY_WRITE_HINT = ("run `artifact_producer.py begin --route <route file>` firs
 # D-81: campaign.json `related[]` row kinds (producer-internal API only).
 RELATED_KINDS = ("related", "precedes", "supersedes")
 
+# Attached to a first-publication `finalize --allow-open-route` response whose
+# cycle sealed `state: active` (D-6): closing the route later, proven or not,
+# cannot retroactively make this cycle `completed`.
+PROVISIONAL_SEAL_WARNING = (
+    "sealed provisionally active: closing the route later, with or without proof, cannot make "
+    "this cycle completed; campaign closure lists it as sealed-unproven. Order for new cycles: "
+    "complete -> close -> finalize."
+)
+
 COMPAT_OVERRIDE_NAME = "compat-override.json"
 INACTIVE_FALLBACK_ENV = "AGENT_ARTIFACT_INACTIVE_FALLBACK"
 ROOT_CLASSES = ("active", "inactive-with-legacy", "inactive-empty", "malformed")
@@ -2746,12 +2755,16 @@ def finalize(
             raise artifact_admission.AdmissionRecoveryRequired(
                 f"cycle {cycle_id} manifest published but post-publish update failed; run recover"
             ) from exc
-        return {"excluded_hidden": excluded_hidden, "adopted_root_outputs": adopted_root_outputs,
+        sealed_result = {"excluded_hidden": excluded_hidden, "adopted_root_outputs": adopted_root_outputs,
             "status": "sealed", "cycle_id": cycle_id, "campaign_id": record["campaign_id"],
             "manifest_digest": digest, "manifest_path": str(manifest_path),
             "artifact_count": len(rows), "lineage_committed": True, "cycle_state": document["cycle"]["state"],
             "storage_state": "sealed",
         }
+        if document["cycle"]["state"] == "active":
+            sealed_result["provisional"] = True
+            sealed_result["warning"] = PROVISIONAL_SEAL_WARNING
+        return sealed_result
     finally:
         if owns_lock:
             artifact_admission._release_lock(root, lock_fd)
@@ -3933,6 +3946,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                               adopt_root_outputs=args.adopt_root_output,
                               abandon_reason=args.abandon_reason,
                               force_abandon_ignoring_lease=args.force_abandon_ignoring_lease)
+            if result.get("warning"):
+                print(result["warning"], file=sys.stderr)
         elif args.command == "review-lease":
             if args.operation == "acquire":
                 if not args.attempt:

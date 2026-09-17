@@ -3,6 +3,11 @@
 Cycle/route success is not inferred from campaign satisfaction. Native session
 stores are the existing local trust boundary, not cryptographic proof against
 a process allowed to forge those stores. No caller-supplied user actor is used.
+
+A row's provisional keys (`route_closed`, `terminal_gate_proven`,
+`terminal_gate_reasons`, `route_outcome_digest`) appear only on a provisional
+member and hold the route outcome sidecar's values as of the close that
+produced them; they are never re-observed later.
 """
 from __future__ import annotations
 
@@ -27,11 +32,22 @@ CONTRACT = "artifact-campaign-closure/v1"
 EVENT_NAME = "campaign.satisfied.json"
 MAX_JSON = 16 * 1024 * 1024
 
+# A cycle sealed `state: active` (route open at seal time, D-6) whose route has
+# since closed. Never written to a record or event; computed for display only,
+# so relabeling it later costs nothing against a signed statement.
+PROVISIONAL_DISPOSITION = "sealed-unproven"
+
 
 class CampaignError(Exception):
     def __init__(self, code, detail=""):
         self.code, self.detail = code, str(detail)
         super().__init__(code + (": " + self.detail if self.detail else ""))
+
+
+def disposition(row):
+    if row.get("route_closed") is True and row.get("state") == "active":
+        return PROVISIONAL_DISPOSITION
+    return row["state"]
 
 
 # One definition of campaign membership for producer cycle records.
@@ -225,6 +241,44 @@ def _validate_runlog(root, path, campaign, ids):
         raise CampaignError("campaign-runlog-digest-mismatch", runlog)
 
 
+def _route_outcome(root, record, document):
+    """`None` when the cycle's route is still open; else `(outcome, raw)`.
+
+    Route-closed is judged by the canonical outcome sidecar's existence, not
+    by `route_file` (relocation-tolerant) or `schema_version`. A sidecar that
+    exists but whose identity does not match the record and the manifest's
+    `routes[]` row is a typed integrity error, not "open".
+    """
+    try:
+        outcome_path = lifecycle.canonical_outcome_path(root, record["route_id"])
+    except lifecycle.LifecycleError as exc:
+        raise CampaignError("campaign-cycle-route-outcome-mismatch", record.get("cycle_id")) from exc
+    if not os.path.lexists(outcome_path):
+        return None
+    outcome, raw = read_json(root, outcome_path)
+    routes = document.get("routes")
+    matching = ([row for row in routes if isinstance(row, dict) and row.get("route_id") == record["route_id"]]
+                if isinstance(routes, list) else [])
+    if (outcome.get("route_id") != record.get("route_id")
+            or outcome.get("route_hash") != record.get("route_hash")
+            or len(matching) != 1
+            or matching[0].get("route_hash") != outcome.get("route_hash")
+            or matching[0].get("terminal_marker") != "pending"):
+        raise CampaignError("campaign-cycle-route-outcome-mismatch", record.get("cycle_id"))
+    return outcome, raw
+
+
+def _open_refusal_detail(pending):
+    entries = [f"cycle={cid} route={rid} route_state=open" for cid, rid in pending]
+    shown = "; ".join(entries[:10])
+    if len(entries) > 10:
+        shown += f" +{len(entries) - 10} more"
+    return (f"open={len(pending)} {shown} "
+            "next=capability-route.py complete --route <route_file> --node <terminal node> "
+            "then close --route <route_file>; or close --route <route_file> --allow-unproven "
+            "(disclosed as unproven); then rerun campaign-status")
+
+
 def _cycle_rows(root, path, campaign):
     ids = campaign.get("cycles")
     if (not isinstance(ids, list) or not ids or not all(isinstance(cid, str) for cid in ids)
@@ -269,6 +323,7 @@ def _cycle_rows(root, path, campaign):
     if set(directories) != set(ids):
         raise CampaignError("campaign-cycle-bindings-incomplete")
     rows = []
+    pending_open = []
     for cid in sorted(ids):
         if not identity.is_well_formed(cid, "cycle"):
             raise CampaignError("campaign-cycle-id-invalid", cid)
@@ -294,8 +349,9 @@ def _cycle_rows(root, path, campaign):
                 or document["campaign"]["campaign_id"] != campaign["campaign_id"]
                 or document["artifact_root_id"] != root_id.artifact_root_id
                 or document["producer"]["producer_id"] != record.get("producer_id")
-                or cycle["state"] not in {"completed", "abandoned"}
-                or cycle["state"] != record.get("cycle_state")):
+                or cycle["state"] not in {"completed", "abandoned", "active"}
+                or cycle["state"] != record.get("cycle_state")
+                or (cycle["state"] == "active" and record.get("state") != "sealed")):
             raise CampaignError("campaign-seal-mismatch", cid)
         expected = index_module.apply(index_module.empty(root_id.artifact_root_id), document,
                                       cycle_path=str(directory.relative_to(root)),
@@ -308,11 +364,32 @@ def _cycle_rows(root, path, campaign):
         failures = lifecycle.verify_artifact_revisions(document, directory)
         if failures:
             raise CampaignError("campaign-artifact-mismatch", cid + ": " + ";".join(failures[:5]))
-        rows.append({"cycle_id": cid, "state": cycle["state"], "manifest_digest": mdigest,
-                     "index_digest": manifest.manifest_digest(document),
-                     "route_id": record["route_id"],
-                     "manifest_id": document["manifest_id"],
-                     "manifest_revision_id": document["manifest_revision_id"]})
+        row = {"cycle_id": cid, "state": cycle["state"], "manifest_digest": mdigest,
+               "index_digest": manifest.manifest_digest(document),
+               "route_id": record["route_id"],
+               "manifest_id": document["manifest_id"],
+               "manifest_revision_id": document["manifest_revision_id"]}
+        if cycle["state"] == "active":
+            outcome = _route_outcome(root, record, document)
+            if outcome is None:
+                pending_open.append((cid, record["route_id"]))
+                continue
+            outcome_doc, outcome_raw = outcome
+            gates = outcome_doc.get("terminal_gates")
+            reasons = []
+            if isinstance(gates, dict):
+                for node_id, gate_row in gates.items():
+                    if not isinstance(gate_row, dict) or gate_row.get("passed") is not True:
+                        reason = gate_row.get("reason") if isinstance(gate_row, dict) else None
+                        reasons.append(f"{node_id}:{reason or 'unknown'}")
+                reasons.sort()
+            row["route_closed"] = True
+            row["terminal_gate_proven"] = outcome_doc.get("terminal_gate_proven")
+            row["terminal_gate_reasons"] = reasons
+            row["route_outcome_digest"] = "sha256:" + hashlib.sha256(outcome_raw).hexdigest()
+        rows.append(row)
+    if pending_open:
+        raise CampaignError("campaign-cycle-provisional-active", _open_refusal_detail(pending_open))
     return root_id, rows
 
 
@@ -348,12 +425,24 @@ def status(root, selection):
                                      "campaign-recover", "--artifact-root", str(root), "--campaign", str(path)]}
     snapshot = _snapshot(root, path)
     _members, detached = campaign_records(root, raw["campaign_id"])
-    return {"status": "awaiting-user-acceptance", "campaign_id": raw["campaign_id"],
-            "goal": raw["goal"], "completion_criterion": raw["completion_criterion"],
-            "cycles": snapshot["cycles"], "detached_cycles": detached_rows(detached),
-            "snapshot_digest": digest(snapshot),
-            "approval_statement": approval_text(raw["campaign_id"], digest(snapshot)),
-            "instruction": "After reviewing the goal, criterion and cycle outcomes, the USER may send this exact statement in their native session. The agent must not submit it."}
+    cycles = [{**row, "disposition": disposition(row)} for row in snapshot["cycles"]]
+    unproven = [row for row in cycles if row["disposition"] == PROVISIONAL_DISPOSITION]
+    instruction = ("After reviewing the goal, criterion and cycle outcomes, the USER may send this "
+                   "exact statement in their native session. The agent must not submit it.")
+    result = {"status": "awaiting-user-acceptance", "campaign_id": raw["campaign_id"],
+              "goal": raw["goal"], "completion_criterion": raw["completion_criterion"],
+              "cycles": cycles, "detached_cycles": detached_rows(detached),
+              "snapshot_digest": digest(snapshot),
+              "approval_statement": approval_text(raw["campaign_id"], digest(snapshot)),
+              "instruction": instruction}
+    if unproven:
+        without_proof = sum(1 for row in unproven if row.get("terminal_gate_proven") is not True)
+        result["unproven_cycles"] = {"count": len(unproven), "without_terminal_proof": without_proof}
+        result["instruction"] = instruction + (
+            f" {len(unproven)} cycle(s) are sealed-unproven: sealed provisionally active before their "
+            f"route closed ({without_proof} without terminal proof); accepting closes the campaign with "
+            "them recorded as sealed, not completed.")
+    return result
 
 
 def _text(content):

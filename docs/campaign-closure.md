@@ -16,8 +16,8 @@ python3 "$AGENT_HOME/utilities/artifact_producer.py" campaign-status \
   --campaign /absolute/project/.agent_reports/campaigns/example/campaign.json
 ```
 
-명령은 goal, criterion, 각 cycle의 실제 completed/abandoned 상태와 manifest
-근거를 보여 준다. 승인 가능한 상태에서만 `approval_statement`를 출력한다.
+명령은 goal, criterion, 각 cycle의 disposition(completed/abandoned/sealed-unproven)과
+manifest 근거를 보여 준다. 승인 가능한 상태에서만 `approval_statement`를 출력한다.
 사용자가 이 내용을 확인하고 **그 문장 전체를 자신의 원 native 세션에 직접
 전송**한다. 예시의 ID/hash를 복사해 쓰지 말고 해당 status의 실제 출력을 쓴다.
 에이전트가 사용자 대신 전송하거나 `actor.kind=user` JSON을 만드는 경로는 없다.
@@ -64,6 +64,20 @@ index digest를 각각 검증한다. 현재 포맷에 맞추려고 원본을 재
 실패 marker도 그대로다. `residual=0`이나 모든 cycle 성공 조건은 추가하지 않는다.
 자유문 criterion의 의미적 충족은 사용자가 명시적으로 수락하며, 코드가 임의로
 자연어 목표를 달성했다고 판정하지 않는다.
+
+`finalize --allow-open-route`로 route가 열린 채 봉인된 cycle은 manifest에
+`state: active`로 남는다(D-6). 그 route가 나중에 닫히면 — 증명 있게든 없게든
+— 서명 행에 사실 4개가 결속된다: `route_closed`, `terminal_gate_proven`,
+`terminal_gate_reasons`, `route_outcome_digest`(route 닫힘 sidecar의 그 시점
+값이며 다시 관측하지 않는다). 표시 이름표 `sealed-unproven`은 이 서명 밖의
+계산값이라 나중에 바꿔도 이미 나간 승인 문장을 깨지 않는다. route가 아직
+열려 있으면 종료 자체가 `campaign-cycle-provisional-active`로 거부되며, 안내는
+`capability-route.py complete` 뒤 `close`를, 또는 증명 없이 닫으려면
+`close --allow-unproven`을 가리킨다 — 이미 봉인된 cycle의 재-`finalize`는
+가리키지 않는다(`finalize-state-conflict`이기 때문). route 닫힘 sidecar가
+기록과 다른 정체를 가리키면 `campaign-cycle-route-outcome-mismatch`다. 이
+장치는 campaign 종료 화면의 표시일 뿐이며, lifecycle·Fleet·Cairn 화면은
+manifest의 `state: active`를 그대로 보여 준다는 한계가 남는다.
 
 `campaigns/<locator>/campaign.satisfied.json`이 no-replace·fsync로
 발행되는 immutable commit point다. D-11 event envelope에 snapshot과 실제 승인
