@@ -95,6 +95,19 @@ class RuleTest(unittest.TestCase):
         self.assertEqual(CT._reject_code("final report", ctx, set()), "generic")
         self.assertEqual(CT._reject_code("최종 구현 보고서", ctx, set()), "generic")
 
+    def test_reject_generic_forbidden_by_containment_not_just_exact(self):
+        # Gap G1 / owner addendum item 14: FORBIDDEN_GENERIC_TITLES entries reject
+        # by containment (a residue label carried inside a longer candidate is
+        # still a residue label), while the extra exact-match list is unchanged.
+        ctx = self._ctx()
+        self.assertEqual(
+            CT._reject_code("2026-08-10_ax_command_phase_c1 — legacy support residue", ctx, set()), "generic")
+        self.assertEqual(CT._reject_code("legacy support residue (sr-corrnet)", ctx, set()), "generic")
+        # A title merely containing the word "report" or "요약" (not equal to one
+        # of the exact-match extra entries) is still accepted.
+        self.assertIsNone(CT._reject_code("quarterly progress report addendum", ctx, set()))
+        self.assertIsNone(CT._reject_code("모델 성능 요약 노트", ctx, set()))
+
     def test_reject_markdown_link(self):
         ctx = self._ctx()
         self.assertEqual(CT._reject_code("See [here](x) for detail", ctx, set()), "markdown-link")
@@ -108,6 +121,13 @@ class RuleTest(unittest.TestCase):
         self.assertEqual(CT._route_task_first_line("autopilot-code (dev) — Fix the widget\nmore"), "Fix the widget")
         self.assertIsNone(CT._route_task_first_line(None))
         self.assertIsNone(CT._route_task_first_line("   \n   \n"))
+
+    def test_route_task_first_line_strips_korean_task_head(self):
+        # Gap G2: same rule family as "Task:", for route-task text produced in Korean.
+        self.assertEqual(
+            CT._route_task_first_line("작업: 9pt 전환·복원 cheatsheet 정정본 (v2)"),
+            "9pt 전환·복원 cheatsheet 정정본 (v2)")
+        self.assertEqual(CT._route_task_first_line("작업 : spaced colon variant"), "spaced colon variant")
 
     def test_first_heading_skips_frontmatter_and_code_fence(self):
         raw = b"---\ntitle: x\n---\n```\n# not a heading\n```\n# Real Heading\nbody\n"
@@ -163,6 +183,60 @@ class RuleTest(unittest.TestCase):
         ctx = self._ctx()
         decision = CT.derive_display_title(ctx, existing_title="Whatever It Is", reserved=set())
         self.assertEqual(decision, CT.Decision("Whatever It Is", "existing-declaration", None, ()))
+
+    def test_derive_display_title_terminal_reason_is_primary_heading_outcome(self):
+        # Gap G3: a folder-name record title (rejected as slug-like, true for every
+        # W7-migrated cycle) must not mask the primary-heading outcome as
+        # "no-source" -- the terminal reason is the primary step's own outcome, and
+        # the rejected chain keeps every attempted source.
+        record = {"locator": "2026-09-17_my-fixture-slug", "title": "My Fixture Slug"}
+        manifest = {
+            "artifacts": [{"artifact_id": "art_x", "role": "primary"}],
+            "artifact_revisions": [{"artifact_id": "art_x", "media_type": "application/json",
+                                    "locator": {"kind": "cycle-relative", "path": "data.json"}}],
+        }
+        ctx = self._ctx(record=record, manifest=manifest)
+        decision = CT.derive_display_title(ctx, existing_title=None, reserved=set())
+        self.assertIsNone(decision.title)
+        self.assertEqual(decision.reason, "primary-not-markdown")
+        self.assertEqual(decision.rejected, (("record-title", "slug-like"),))
+
+    def test_derive_display_title_terminal_reason_uses_primary_rejection_when_present(self):
+        # When the primary heading itself is attempted and rejected, its own
+        # rejection code is the terminal reason (not a synthesized no-source).
+        record = {"locator": "2026-09-17_my-fixture-slug"}
+        manifest = {
+            "artifacts": [{"artifact_id": "art_x", "role": "primary"}],
+            "artifact_revisions": [{"artifact_id": "art_x", "media_type": "text/markdown",
+                                    "locator": {"kind": "cycle-relative", "path": "artifacts/report.md"},
+                                    "content_digest": "sha256:" + "0" * 64}],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            cycle_dir = Path(tmp)
+            (cycle_dir / "artifacts").mkdir()
+            data = b"# legacy support residue\nbody\n"
+            (cycle_dir / "artifacts" / "report.md").write_bytes(data)
+            digest = artifact_manifest.digest_bytes(data)
+            manifest["artifact_revisions"][0]["content_digest"] = digest
+            ctx = self._ctx(record=record, manifest=manifest, cycle_dir=cycle_dir)
+            decision = CT.derive_display_title(ctx, existing_title=None, reserved=set())
+        self.assertIsNone(decision.title)
+        self.assertEqual(decision.reason, "generic")
+        self.assertEqual(decision.rejected, (("primary-heading", "generic"),))
+
+    def test_reason_cell_shows_chain_for_unassigned_rows_only(self):
+        # The markdown report's reason column shows the full chain for unassigned
+        # rows (gap G3) but a plain reason for other verdicts.
+        row = {"verdict": "unassigned", "reason": "primary-not-markdown",
+              "rejected": [("record-title", "slug-like")]}
+        self.assertEqual(CT._reason_cell(row), "record-title:slug-like")
+        row_multi = {"verdict": "unassigned", "reason": "generic",
+                    "rejected": [("record-title", "slug-like"), ("primary-heading", "generic")]}
+        self.assertEqual(CT._reason_cell(row_multi), "record-title:slug-like, primary-heading:generic")
+        row_no_chain = {"verdict": "unassigned", "reason": "primary-missing", "rejected": []}
+        self.assertEqual(CT._reason_cell(row_no_chain), "primary-missing")
+        row_ineligible = {"verdict": "ineligible", "reason": "record-superseded", "rejected": []}
+        self.assertEqual(CT._reason_cell(row_ineligible), "record-superseded")
 
 
 # ---------------------------------------------------------------------------

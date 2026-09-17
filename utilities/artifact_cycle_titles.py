@@ -43,7 +43,12 @@ DISPLAY_TITLES_REL = AMA.DISPLAY_TITLES_REL
 PRODUCER_REL = AMA.PRODUCER_REL
 
 MAX_TITLE_CHARS = 80
-GENERIC_TITLES = CTR.FORBIDDEN_GENERIC_TITLES | {
+# `FORBIDDEN_GENERIC_TITLES` (campaign_title_repair) is rejected by containment: a
+# candidate carrying "legacy support residue" as a label, not just as the whole
+# string, is still a residue label (owner addendum item 14). The extra list below
+# stays exact-match so an ordinary title that merely contains "report" or "요약"
+# is not rejected.
+GENERIC_TITLES_EXACT = {
     "goal", "runlog", "experiments runlog", "report", "final report", "summary",
     "분석 요약", "최종 구현 보고서", "문서화 실행 요약", "보고서", "요약",
 }
@@ -64,6 +69,7 @@ _FILENAME_EXT_RE = re.compile(r"\.(md|json|ya?ml|txt|py|sh)$", re.IGNORECASE)
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 _ROUTE_PREFIX_HASH_RE = re.compile(r"^#+\s*")
 _ROUTE_PREFIX_TASK_RE = re.compile(r"^Task:\s*", re.IGNORECASE)
+_ROUTE_PREFIX_TASK_KO_RE = re.compile(r"^작업\s*:\s*")
 _ROUTE_PREFIX_CAPABILITY_RE = re.compile(r"^autopilot-[\w.-]+\s*\([^)]*\)\s*[—-]\s*")
 _HEADING_TRAILING_HASH_RE = re.compile(r"\s*#+\s*$")
 
@@ -163,6 +169,7 @@ def _route_task_first_line(route_text: Optional[str]) -> Optional[str]:
         return None
     line = _ROUTE_PREFIX_HASH_RE.sub("", line)
     line = _ROUTE_PREFIX_TASK_RE.sub("", line)
+    line = _ROUTE_PREFIX_TASK_KO_RE.sub("", line)
     line = _ROUTE_PREFIX_CAPABILITY_RE.sub("", line)
     return line
 
@@ -272,7 +279,8 @@ def _reject_code(candidate: str, ctx: CycleContext, reserved: Set[str]) -> Optio
         return "token-only"
     if "/" in candidate or _FILENAME_EXT_RE.search(candidate):
         return "filename-like"
-    if candidate.casefold() in GENERIC_TITLES:
+    folded = candidate.casefold()
+    if folded in GENERIC_TITLES_EXACT or any(forbidden in folded for forbidden in CTR.FORBIDDEN_GENERIC_TITLES):
         return "generic"
     if "](" in candidate:
         return "markdown-link"
@@ -296,9 +304,19 @@ def derive_display_title(ctx: CycleContext, *, existing_title: Optional[str], re
         if code is None:
             return Decision(candidate, source, None, tuple(rejected))
         rejected.append((source, code))
-    reason = "no-source"
-    if not rejected and primary_reason:
+    # Terminal reason is the primary-heading outcome: its rejection code if a
+    # heading candidate existed and was rejected, else the extraction-failure
+    # reason if the primary step produced no candidate at all. `no-source` is
+    # reserved for the case where neither happened (owner addendum item 14 /
+    # gap G3) -- record-title or route-task rejections alone must not mask a
+    # primary-heading outcome, since primary-heading is always attempted last.
+    primary_rejection = next((code for source, code in rejected if source == "primary-heading"), None)
+    if primary_rejection is not None:
+        reason = primary_rejection
+    elif primary_reason is not None:
         reason = primary_reason
+    else:
+        reason = "no-source"
     return Decision(None, None, reason, tuple(rejected))
 
 
@@ -944,6 +962,16 @@ def restore_backfill(root: Path, journal_path: Path) -> Dict[str, Any]:
         artifact_admission._release_lock(root, lock_fd)
 
 
+def _reason_cell(row: Mapping[str, Any]) -> str:
+    """Unassigned rows show the full rejection chain, not just the terminal
+    reason, so the reader can see why every earlier source lost out too."""
+    if row.get("verdict") == "unassigned":
+        rejected = row.get("rejected") or []
+        if rejected:
+            return ", ".join(f"{source}:{code}" for source, code in rejected)
+    return str(row.get("reason", ""))
+
+
 def _render_report(result: Mapping[str, Any]) -> str:
     lines = [
         "# Cycle display-title backfill", "",
@@ -957,10 +985,9 @@ def _render_report(result: Mapping[str, Any]) -> str:
         "|---|---|---|---|---|---|",
     ]
     for row in result["rows"]:
-        lines.append("| " + " | ".join(
-            str(row.get(key, "")).replace("|", "\\|") for key in
-            ("cycle_id", "campaign_id", "verdict", "source", "title", "reason")
-        ) + " |")
+        cells = [str(row.get(key, "")) for key in ("cycle_id", "campaign_id", "verdict", "source", "title")]
+        cells.append(_reason_cell(row))
+        lines.append("| " + " | ".join(cell.replace("|", "\\|") for cell in cells) + " |")
     return "\n".join(lines) + "\n"
 
 
