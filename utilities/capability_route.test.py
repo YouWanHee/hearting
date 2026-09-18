@@ -6019,8 +6019,14 @@ class RouteChainWriterTest(ComposeRouteTest):
       route,tmp)
    self.assertEqual(json.loads(path.read_text()),route)
  def test_depth2_worker_never_writes(self):
+  # A real depth-2 worker always carries the full typed identity tuple (see
+  # the child_env fixtures above, e.g. AGENT_DISPATCH_WORKER_TYPE="stage");
+  # setting only DEPTH+ATTEMPT_ID here left _registered_owner_attempt's
+  # env validation seeing an incomplete tuple and raising instead of taking
+  # its early non-owner return -- match the real shape.
   with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
     os.environ,{"CLAUDE_CODE_SESSION_ID":"sid-d2","AGENT_DISPATCH_DEPTH":"2",
+               "AGENT_DISPATCH_WORKER_TYPE":"stage",
                "AGENT_DISPATCH_ATTEMPT_ID":"att-worker","AGENT_HOME":str(R.ROOT)}):
    route=self.compose(artifact_root=tmp)
    err=self._emit(route,tmp)
