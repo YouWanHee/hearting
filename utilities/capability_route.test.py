@@ -6111,6 +6111,24 @@ class RouteChainWriterTest(ComposeRouteTest):
   self.assertEqual(len(lines),2)
   self.assertEqual(lines[1]["route_id"],"rt-successor")
   self.assertEqual(lines[1]["by_attempt"],"att-owner")
+ def test_depth1_continuation_finds_source_route_beyond_display_tail(self):
+  # review 🟡-a: a long-lived parent pushes the continued route's line past TAIL_BYTES
+  self.RC.append("claude","sid-long",self.RC.build_line(
+    {"route_id":"rt-early","route_hash":"h-early","capability":"autopilot-code"},
+    event="compose",harness="claude",session_id="sid-long",route_file="/tmp/early.json"))
+  filler=0
+  while os.path.getsize(self.RC.ledger_path("claude","sid-long"))<=self.RC.TAIL_BYTES+4096:
+   filler+=1
+   self.RC.append("claude","sid-long",self.RC.build_line(
+     {"route_id":f"rt-fill-{filler}","route_hash":"h","capability":"autopilot-research",
+      "slug":"x"*80},
+     event="compose",harness="claude",session_id="sid-long",route_file="/tmp/"+"f"*200+".json"))
+  self.assertNotIn("rt-early",[l["route_id"] for l in self.RC.read_tail("claude","sid-long")])
+  with mock.patch.dict(os.environ,{
+    "AGENT_DISPATCH_DEPTH":"1","AGENT_DISPATCH_PARENT_SESSION_ID":"sid-long",
+    "AGENT_DISPATCH_ATTEMPT_ID":"att-owner"}):
+   self.assertEqual(R._route_chain_identity("continuation",{"source_route_id":"rt-early"}),
+                    ("claude","sid-long",1,"att-owner"))
  def test_depth1_continuation_without_parent_ledger_writes_nothing(self):
   with mock.patch.dict(os.environ,{
     "AGENT_DISPATCH_DEPTH":"1","AGENT_DISPATCH_PARENT_SESSION_ID":"sid-no-ledger",

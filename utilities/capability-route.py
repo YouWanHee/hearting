@@ -6272,6 +6272,9 @@ def _route_chain_module():
         return None
 
 
+_ROUTE_CHAIN_PARENT_SCAN_BYTES = 1024 * 1024
+
+
 def _route_chain_parent_ledger(rc, parent_sid, source_route_id):
     """`(harness, session_id)` | None — the ledger-anchored parent lookup (plan §3 B-2,
     round 1 🔴-1 fix). The only signal this file trusts for "what harness is my depth-0
@@ -6292,7 +6295,9 @@ def _route_chain_parent_ledger(rc, parent_sid, source_route_id):
     if len(found) != 1:
         return None
     harness = found[0]
-    for line in rc.read_tail(harness, parent_sid):
+    # One lookup per continuation, not per Fleet tick, so read far past the display tail: a
+    # long-lived parent can push the continued route's line beyond TAIL_BYTES (review 🟡-a).
+    for line in rc.read_tail(harness, parent_sid, max_bytes=_ROUTE_CHAIN_PARENT_SCAN_BYTES):
         if line.get("route_id") == source_route_id:
             return harness, parent_sid
     return None

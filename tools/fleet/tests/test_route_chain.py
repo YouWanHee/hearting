@@ -238,6 +238,20 @@ class ReadTailTest(EnvTmpTestCase):
         self.assertEqual(route_chain.read_tail("claude", "sess-tail2"), [])
 
 
+    def test_drops_line_whose_ts_is_present_but_not_a_number(self):
+        path = route_chain.ledger_path("claude", "sess-ts")
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        base = {"v": 1, "harness": "claude", "session_id": "sess-ts",
+                "route_file": "/tmp/r.json"}
+        good = dict(base, route_id="rt-good", ts=2.0)
+        no_ts = dict(base, route_id="rt-no-ts")
+        with open(path, "w") as fh:
+            for bad_ts in ("2026-09-18", None, True):
+                fh.write(json.dumps(dict(base, route_id="rt-bad", ts=bad_ts)) + "\n")
+            fh.write(json.dumps(no_ts) + "\n")
+            fh.write(json.dumps(good) + "\n")
+        self.assertEqual(route_chain.read_tail("claude", "sess-ts"), [no_ts, good])
+
 class ChainKeyAndSegmentTest(unittest.TestCase):
     def test_chain_key_priority(self):
         self.assertEqual(route_chain.chain_key({"campaign_key": "k1", "parent_cycle_id": "p1"}), "k1")
@@ -577,6 +591,26 @@ class EnrichTest(EnvTmpTestCase):
         labels = [n["label"] for n in sess.route_chain["nodes"]]
         self.assertEqual(labels, ["research", "draft"])
 
+
+    def test_enrich_one_bad_session_does_not_blank_the_others(self):
+        r1 = _fake_route("rt-1", "research")
+        route_chain.append("claude", "sess-ok", _line_for(r1, harness="claude",
+                                                          session_id="sess-ok", ts=1.0))
+        good = _sess(harness="claude", session_id="sess-ok")
+        bad = _sess(harness="claude", session_id="sess-bad")
+        real_segment = route_chain.current_segment
+
+        def segment(lines):
+            if not lines:
+                raise TypeError("simulated malformed segment")
+            return real_segment(lines)
+
+        with mock.patch.object(route_chain, "current_segment", side_effect=segment), \
+             mock.patch("fleet.route.load", side_effect=lambda *a, **k: r1), \
+             mock.patch("fleet.route.load_outcome",
+                         side_effect=lambda *a, **k: {"present": False}):
+            route_chain.enrich([bad, good])
+        self.assertEqual([n["label"] for n in good.route_chain["nodes"]], ["research"])
 
 class PerformanceGuardTest(EnvTmpTestCase):
     def test_enrich_never_lists_route_dirs_or_opens_jobs_log(self):

@@ -232,6 +232,13 @@ def inherited_plan(lines):
     return [], None
 
 
+def _is_number(value):
+    """A present ledger `ts` must be a real number; a bool, string or null makes the whole line
+    invalid, so no later sort or comparison can raise on it (one malformed line must not blank
+    a tick). An absent `ts` stays valid — every reader already defaults it to 0."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
 def read_tail(harness, session_id, max_bytes=TAIL_BYTES):
     """Validated ledger lines from the tail `max_bytes` of one session's ledger file."""
     try:
@@ -264,6 +271,7 @@ def read_tail(harness, session_id, max_bytes=TAIL_BYTES):
         except ValueError:
             continue
         if (not isinstance(obj, dict) or obj.get("v") != SCHEMA
+                or ("ts" in obj and not _is_number(obj["ts"]))
                 or obj.get("harness") != harness or obj.get("session_id") != session_id
                 or not isinstance(obj.get("route_id"), str) or not obj.get("route_id")
                 or not isinstance(obj.get("route_file"), str) or not obj.get("route_file")):
@@ -502,7 +510,10 @@ def enrich(sessions, jobs=(), node_evidence=None, now=None):
         except Exception:
             lines = []
         per_session_lines[id(sess)] = lines
-        per_session_segment[id(sess)] = current_segment(lines)
+        try:
+            per_session_segment[id(sess)] = current_segment(lines)
+        except Exception:
+            per_session_segment[id(sess)] = []
 
     def _identity(sess):
         return (str(getattr(sess, "harness", "") or "").lower(), getattr(sess, "session_id", None))
@@ -510,18 +521,21 @@ def enrich(sessions, jobs=(), node_evidence=None, now=None):
     origin_of = {}
     receiver_of = {}
     for sess in eligible:
-        for line in per_session_segment.get(id(sess), ()):
-            rid = line.get("route_id")
-            event = line.get("event")
-            if event in ("compose", "compile", "continuation"):
-                bucket, cmp_key = origin_of, rid
-            elif event == "start":
-                bucket, cmp_key = receiver_of, rid
-            else:
-                continue
-            prev = bucket.get(cmp_key)
-            if prev is None or line.get("ts", 0) > prev[1].get("ts", 0):
-                bucket[cmp_key] = (sess, line)
+        try:
+            for line in per_session_segment.get(id(sess), ()):
+                rid = line.get("route_id")
+                event = line.get("event")
+                if event in ("compose", "compile", "continuation"):
+                    bucket, cmp_key = origin_of, rid
+                elif event == "start":
+                    bucket, cmp_key = receiver_of, rid
+                else:
+                    continue
+                prev = bucket.get(cmp_key)
+                if prev is None or line.get("ts", 0) > prev[1].get("ts", 0):
+                    bucket[cmp_key] = (sess, line)
+        except Exception:
+            continue   # one session's bad segment drops only its own handoff marks
 
     handoffs = {}
     for rid, (origin_sess, origin_line) in origin_of.items():
