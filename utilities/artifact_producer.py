@@ -3807,7 +3807,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         p.add_argument("--campaign", required=True, help="campaign ID or campaign.json path")
         if command == "campaign-close":
             p.add_argument("--approval-harness", choices=("claude", "codex", "opencode"))
-            p.add_argument("--approval-session", help="native session containing the USER's exact approval statement")
+            p.add_argument("--approval-session", help="native session where the USER approved: the exact statement, or a short consent as their first input right after the statement was shown")
 
     p = sub.add_parser("begin")
     p.add_argument("--artifact-root", required=True)
