@@ -1507,14 +1507,59 @@ class CarrierOneClaimGateTest(unittest.TestCase):
     def test_record_not_yet_materialized_crash_window_is_silent(self):
         # Intent stamped (row closed), but neither trigger 1 nor trigger 2
         # has materialized a record yet -- the hook must never materialize
-        # it itself (§4.4) and must go silent, not raise.
+        # it itself (§4.4) and must go silent, not raise, once its bounded
+        # record grace is spent (grace 0 here).
         self._open_row()
         self.assertTrue(D.close_attempt_row(self.jobs, "att-owner-1", "completed-marker"))
-        with mock.patch.object(rewake, "runtime_ancestry_binding", return_value=self.ANCESTRY):
+        with mock.patch.object(rewake, "runtime_ancestry_binding", return_value=self.ANCESTRY), \
+             mock.patch.dict(rewake.os.environ, {"AGENT_CLAUDE_REWAKE_RECORD_GRACE_SECONDS": "0"}):
             code, stdout, stderr = self._run_main()
         self.assertEqual(code, 0)
         self.assertEqual(stdout, "")
         self.assertEqual(stderr, "")
+
+    def test_a_record_that_materializes_during_the_grace_is_claimed_and_wakes(self):
+        # 2026-09-17: an owner's supervisor closed its row while alive; the
+        # record appeared only after the process group drained. The carrier
+        # must wait for it instead of treating "not yet" as "someone else".
+        self._open_row()
+        self.assertTrue(D.close_attempt_row(self.jobs, "att-owner-1", "completed-marker"))
+        fields = self.jobs.read_text(encoding="utf-8").splitlines()[0].split("\t")
+        calls = {"n": 0}
+        real_sleep = rewake.time.sleep
+
+        def late_materialize(_seconds):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                self.assertIsNotNone(JOIN.materialize_pending_delivery(self.jobs, fields))
+            real_sleep(0)
+
+        with mock.patch.object(rewake, "runtime_ancestry_binding", return_value=self.ANCESTRY), \
+             mock.patch.object(rewake.time, "sleep", side_effect=late_materialize), \
+             mock.patch.dict(rewake.os.environ, {
+                 "AGENT_CLAUDE_REWAKE_RECORD_GRACE_SECONDS": "60",
+                 "AGENT_CLAUDE_REWAKE_INTERVAL_SECONDS": "1",
+             }):
+            code, stdout, stderr = self._run_main()
+        self.assertEqual(code, 2)
+        self.assertIn("systemMessage", stdout)
+        self.assertGreaterEqual(calls["n"], 2)
+
+    def test_a_record_claimed_elsewhere_does_not_wait_out_the_grace(self):
+        self._open_row()
+        record_path = self._close_and_materialize()
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        root = self.jobs.resolve(strict=False).parent
+        rewake.pending_delivery.claim(
+            root, "session-1", record["delivery_id"],
+            claim_owner="someone-else", lease_seconds=30.0,
+        )
+        with mock.patch.object(rewake, "runtime_ancestry_binding", return_value=self.ANCESTRY), \
+             mock.patch.object(rewake.time, "sleep", side_effect=AssertionError("must not wait")), \
+             mock.patch.dict(rewake.os.environ, {"AGENT_CLAUDE_REWAKE_RECORD_GRACE_SECONDS": "60"}):
+            code, stdout, stderr = self._run_main()
+        self.assertEqual(code, 0)
+        self.assertEqual(stdout, "")
 
     def test_second_incarnation_mismatch_reads_claims_and_injects_nothing(self):
         # Same session_id, different runtime process (pid, start) than the

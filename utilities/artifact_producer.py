@@ -48,6 +48,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import artifact_admission  # noqa: E402
+import artifact_cycle_titles  # noqa: E402
 import artifact_identity  # noqa: E402
 import artifact_index  # noqa: E402
 import artifact_lifecycle  # noqa: E402
@@ -92,6 +93,15 @@ LEGACY_WRITE_HINT = ("run `artifact_producer.py begin --route <route file>` firs
 
 # D-81: campaign.json `related[]` row kinds (producer-internal API only).
 RELATED_KINDS = ("related", "precedes", "supersedes")
+
+# Attached to a first-publication `finalize --allow-open-route` response whose
+# cycle sealed `state: active` (D-6): closing the route later, proven or not,
+# cannot retroactively make this cycle `completed`.
+PROVISIONAL_SEAL_WARNING = (
+    "sealed provisionally active: closing the route later, with or without proof, cannot make "
+    "this cycle completed; campaign closure lists it as sealed-unproven. Order for new cycles: "
+    "complete -> close -> finalize."
+)
 
 COMPAT_OVERRIDE_NAME = "compat-override.json"
 INACTIVE_FALLBACK_ENV = "AGENT_ARTIFACT_INACTIVE_FALLBACK"
@@ -2746,12 +2756,16 @@ def finalize(
             raise artifact_admission.AdmissionRecoveryRequired(
                 f"cycle {cycle_id} manifest published but post-publish update failed; run recover"
             ) from exc
-        return {"excluded_hidden": excluded_hidden, "adopted_root_outputs": adopted_root_outputs,
+        sealed_result = {"excluded_hidden": excluded_hidden, "adopted_root_outputs": adopted_root_outputs,
             "status": "sealed", "cycle_id": cycle_id, "campaign_id": record["campaign_id"],
             "manifest_digest": digest, "manifest_path": str(manifest_path),
             "artifact_count": len(rows), "lineage_committed": True, "cycle_state": document["cycle"]["state"],
             "storage_state": "sealed",
         }
+        if document["cycle"]["state"] == "active":
+            sealed_result["provisional"] = True
+            sealed_result["warning"] = PROVISIONAL_SEAL_WARNING
+        return sealed_result
     finally:
         if owns_lock:
             artifact_admission._release_lock(root, lock_fd)
@@ -2910,6 +2924,7 @@ def _commit_sealed(
                    cycle_path=os.path.relpath(str(directory), str(root)))
     _remove_journal(root, record["cycle_id"])
     artifact_locator.rebuild_indexes(root)
+    artifact_cycle_titles.emit_after_seal_locked(root, sealed, document, directory / "manifest.json")
 
 
 # ---------------------------------------------------------------------------
@@ -3776,13 +3791,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--backup-store", help="retirement store (default: $XDG_STATE_HOME/hearting/artifact-retirement)")
     p.add_argument("--apply", action="store_true", help="write recovered_started_on into records (default: dry run)")
 
+    p = sub.add_parser("cycle-display-titles-backfill",
+                       help="declare cycle display titles for Cairn from sealed cycles (default: dry run)")
+    p.add_argument("--artifact-root", required=True)
+    p.add_argument("--apply", action="store_true", help="write the declaration (default: dry run)")
+    p.add_argument("--report", help="write a markdown report to this path")
+    p.add_argument("--out", help="write the candidate declaration bytes to this path (outside the artifact root)")
+    p.add_argument("--reader-dir", help="Cairn app_dir to gate --apply against (default: ~/.config/cairn-sync/config.json)")
+    p.add_argument("--expect-post-digest", help="refuse --apply unless the computed post-digest matches")
+    p.add_argument("--restore-journal", help="restore the declaration from a prior --apply's journal")
+
     for command in ("campaign-status", "campaign-close", "campaign-recover"):
         p = sub.add_parser(command, help="verify, accept, or recover a campaign's administrative closure")
         p.add_argument("--artifact-root", required=True)
         p.add_argument("--campaign", required=True, help="campaign ID or campaign.json path")
         if command == "campaign-close":
             p.add_argument("--approval-harness", choices=("claude", "codex", "opencode"))
-            p.add_argument("--approval-session", help="native session containing the USER's exact approval statement")
+            p.add_argument("--approval-session", help="native session where the USER approved: the exact statement, or a short consent as their first input right after the statement was shown")
 
     p = sub.add_parser("begin")
     p.add_argument("--artifact-root", required=True)
@@ -3900,6 +3925,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         elif args.command == "cycle-time-recovery":
             result = recover_cycle_times(root, apply=args.apply,
                                          backup_store=Path(args.backup_store) if args.backup_store else None)
+        elif args.command == "cycle-display-titles-backfill":
+            if args.restore_journal:
+                result = artifact_cycle_titles.restore_backfill(root, Path(args.restore_journal))
+            else:
+                result = artifact_cycle_titles.backfill(
+                    root, apply=args.apply,
+                    report_path=Path(args.report) if args.report else None,
+                    out_path=Path(args.out) if args.out else None,
+                    reader_dir=Path(args.reader_dir) if args.reader_dir else None,
+                    expect_post_digest=args.expect_post_digest,
+                )
+            _print(result)
+            return BLOCKED if str(result.get("status", "")).startswith("refused") else OK
         elif args.command == "campaign-status":
             result = artifact_campaign.status(root, args.campaign)
         elif args.command in {"campaign-close", "campaign-recover"}:
@@ -3933,6 +3971,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                               adopt_root_outputs=args.adopt_root_output,
                               abandon_reason=args.abandon_reason,
                               force_abandon_ignoring_lease=args.force_abandon_ignoring_lease)
+            if result.get("warning"):
+                print(result["warning"], file=sys.stderr)
         elif args.command == "review-lease":
             if args.operation == "acquire":
                 if not args.attempt:
@@ -3976,6 +4016,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             parser.error("unknown command")
             return USAGE
     except ProducerError as exc:
+        _print({"status": "blocked", "reason": exc.code, "detail": exc.detail})
+        return BLOCKED
+    except artifact_cycle_titles.CycleTitlesError as exc:
         _print({"status": "blocked", "reason": exc.code, "detail": exc.detail})
         return BLOCKED
     except artifact_admission.AdmissionBusy as exc:

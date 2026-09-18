@@ -2696,6 +2696,58 @@ class MaterializePendingDeliveryTest(unittest.TestCase):
             self.assertEqual(record["recipient_kind"], "claude-parent-runtime")
             self.assertEqual(record["state"], "pending")
 
+    FRAME_METADATA = (
+        "attempt_schema_version=2,dispatch_depth=1,transport=headless,"
+        "execution_surface=registered-headless,registered_worker=1,"
+        "fallback_hop=same-harness-headless,worker_type=frame"
+    )
+
+    def _frame_row(self, attempt="att-materialize-frame"):
+        # Real dispatch-depth-1 frame shape (2026-09-17 rt-4a5f4051 row):
+        # route_id/route_node like a stage row, launched by the depth-0
+        # session, so no parent attempt key at all.
+        pipe = ",".join([
+            self.FRAME_METADATA,
+            f"attempt_id={attempt}",
+            "parent_completion_delivery=claude-parent-runtime",
+            "parent_sid=sess-materialize-frame",
+            "route_id=rt-materialize-frame",
+            "route_node=frame",
+            "harness=claude",
+        ])
+        return f"2026-09-17T00:00:00Z\topen\t/r\t/w\tframe-slug\t{pipe}"
+
+    def test_materialize_frame_row_resolves_no_parent_sentinel(self):
+        # Regression (2026-09-17): a depth-1 frame terminal was refused as
+        # identity-incomplete (empty parent attempt), no pending record was
+        # ever created, and the asyncRewake carrier exited 0 -- the depth-0
+        # session never woke for a finished frame.
+        with tempfile.TemporaryDirectory() as td:
+            jobs = Path(td) / "jobs.log"
+            jobs.write_text(self._frame_row() + "\n", encoding="utf-8")
+            fields = self._close_and_get_fields(jobs, "att-materialize-frame")
+            self.assertEqual(
+                JOIN.pending_record_identity(D.parse_registry_metadata(fields[5])),
+                ("rt-materialize-frame", "frame", JOIN.NO_PARENT_ATTEMPT),
+            )
+            path = JOIN.materialize_pending_delivery(jobs, fields)
+            self.assertIsNotNone(path)
+            record = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(record["route_id"], "rt-materialize-frame")
+            self.assertEqual(record["route_node"], "frame")
+            self.assertEqual(record["parent_attempt_id"], "-")
+            self.assertEqual(record["recipient_kind"], "claude-parent-runtime")
+            self.assertEqual(record["state"], "pending")
+
+    def test_frame_row_without_route_identity_stays_incomplete(self):
+        # A frame row that lost its route_id/route_node must not be minted an
+        # identity out of thin air.
+        metadata = D.parse_registry_metadata(",".join([
+            self.FRAME_METADATA, "attempt_id=att-frame-bare",
+            "parent_sid=sess-x", "parent_completion_delivery=claude-parent-runtime",
+        ]))
+        self.assertEqual(JOIN.pending_record_identity(metadata)[2], "")
+
     def test_stage_row_identity_is_unchanged_by_owner_resolution(self):
         with tempfile.TemporaryDirectory() as td:
             jobs = Path(td) / "jobs.log"

@@ -240,9 +240,11 @@ reported under `detached_cycles` instead of drift
 Sealed abandoned cycles remain abandoned; this operation neither repairs route
 failure markers nor adds a residual-zero criterion. All cycles being sealed never substitutes
 for the user's acceptance of the goal and criterion. Close accepts the exact
-statement only from a native user message in the named session, derives the
-user actor from that evidence, and rechecks the snapshot under the producer's
-admission lock. Caller-authored actor/approval JSON is not authority.
+statement, or a short consent that is the user's first input after an assistant
+turn showed it, only from a native human turn in the named session that the
+peer ledger does not attribute to another session; it derives the user actor
+from that evidence, and rechecks
+the snapshot under the producer's admission lock. Caller-authored actor/approval JSON is not authority.
 An immutable campaign event is the commit point; campaign.json is its
 recoverable projection. Readers and begin honor a committed close even after
 a crash before projection. Same-event replay is idempotent, conflicting state

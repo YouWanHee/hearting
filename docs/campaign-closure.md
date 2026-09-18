@@ -16,12 +16,32 @@ python3 "$AGENT_HOME/utilities/artifact_producer.py" campaign-status \
   --campaign /absolute/project/.agent_reports/campaigns/example/campaign.json
 ```
 
-명령은 goal, criterion, 각 cycle의 실제 completed/abandoned 상태와 manifest
-근거를 보여 준다. 승인 가능한 상태에서만 `approval_statement`를 출력한다.
-사용자가 이 내용을 확인하고 **그 문장 전체를 자신의 원 native 세션에 직접
-전송**한다. 예시의 ID/hash를 복사해 쓰지 말고 해당 status의 실제 출력을 쓴다.
+명령은 goal, criterion, 각 cycle의 disposition(completed/abandoned/sealed-unproven)과
+manifest 근거를 보여 준다. 승인 가능한 상태에서만 `approval_statement`를 출력한다.
+에이전트는 이 내용과 `approval_statement` 문장을 **그대로** 보여 주는 글로 턴을 마친다.
+사용자는 문장 전체를 입력하거나, 짧은 **닫기 동의**로 답한다. 닫기 동의는 닫는 동사가
+있는 짧은 답 전체다("응 닫아", "닫아", "네 닫아주세요", "승인", "승인합니다", "close it",
+"approve"). "응"·"ok"·"네"만으로는 무엇에 대한 동의인지 알 수 없어 승인이 아니다.
+Claude 세션에서만, 사용자가 **입력한 시각** 직전의 마지막 assistant 글에 정확한 문장이
+있고 그 뒤 첫 사람 입력일 때 그 snapshot의 승인으로 읽는다. 질문("?", "~하나", "어떻게")은
+판정하지 않는다. 짧은 동의는 `campaign-close` 직전의 **마지막** 사용자 입력이어야 하며,
+그 뒤에 무엇이든 입력하면 무효가 된다. 부정("아니", "안 닫아", "잠깐", "취소", "거부", "아직",
+"no")은 길이와 상관없이 앞선 승인을 거둔다 — 에이전트가 `campaign-close`를 실행하는 중에
+쳐서 아직 대기열에만 있는 부정도 포함한다(정확한 문장으로 한 승인은 60자 이하의 부정이나
+`campaign-reject` 문장으로만 거둔다).
+에이전트가 바쁜 중에 입력해 `queued_command`(origin human)로 저장된 입력도 사용자 입력이다.
+Codex·OpenCode 세션은 정확한 문장만 받는다. `codex exec`, 다른 프로그램이 앱 서버로 구동한
+Codex 세션(예: Claude Code 플러그인, originator `Claude Code`), Codex 하위 에이전트, OpenCode 하위
+세션(`parentID`)은 사용자로 보지 않는다. headless `opencode run` 세션은 대화형과 구분할 수 없어
+아래 신뢰 경계에 속한다.
 에이전트가 사용자 대신 전송하거나 `actor.kind=user` JSON을 만드는 경로는 없다.
-일반적인 "수정해 달라" 지시, 모델·도구 출력, peer 전달문, 빈 답변은 승인이 아니다.
+일반적인 "수정해 달라" 지시, 모델·도구 출력, 빈 답변은 승인이 아니다. Claude Code가
+사람 입력으로 기록하지 않은 행(headless `sdk`, 프롬프트 제안 수락, task-notification,
+도구 결과)도 승인이 아니다. 다른 세션이 프롬프트 창에 주입한 입력은 저장 모양이 사람
+입력과 같으므로 peer trailer, peer 원장의 본문 digest, 또는 최근 원장 행의 요약 일치로
+걸러 낸다. 원장을 읽지 못하면 짧은 동의는 꺼지고 정확한 문장만 받는다. 원장에 남지 않는
+주입(`herdr agent prompt` 직접 호출, tmux 입력)은 사람 입력과 구분할 수 없으며, 이는 아래
+native 저장소 신뢰 경계에 속한다.
 
 실제 답변이 기록된 뒤 운영자가 다음을 실행한다. Claude/Codex는 native 세션
 ID(UUID), OpenCode는 `ses_…`를 사용한다. 부모 세션의 현재 환경으로 읽는다.
@@ -33,7 +53,7 @@ python3 "$AGENT_HOME/utilities/artifact_producer.py" campaign-close \
   --approval-harness claude --approval-session ACTUAL_NATIVE_SESSION_ID
 ```
 
-현재 snapshot에 결속한 exact user message를 읽고 actor를 도출한다. Codex는
+현재 snapshot에 결속한 user 승인(정확한 문장, 또는 그 문장을 제시한 assistant 턴 직후의 짧은 동의)을 읽고 actor를 도출한다. Codex는
 `CODEX_HOME/sessions`의 session_meta와 user message, Claude는
 `CLAUDE_CONFIG_DIR/projects`의 sessionId/user message를 검증한다. 각 변수의
 기본 runtime home도 지원한다. OpenCode는 [공식 `opencode export <sessionID>`](https://opencode.ai/docs/cli/#export)의
@@ -64,6 +84,20 @@ index digest를 각각 검증한다. 현재 포맷에 맞추려고 원본을 재
 실패 marker도 그대로다. `residual=0`이나 모든 cycle 성공 조건은 추가하지 않는다.
 자유문 criterion의 의미적 충족은 사용자가 명시적으로 수락하며, 코드가 임의로
 자연어 목표를 달성했다고 판정하지 않는다.
+
+`finalize --allow-open-route`로 route가 열린 채 봉인된 cycle은 manifest에
+`state: active`로 남는다(D-6). 그 route가 나중에 닫히면 — 증명 있게든 없게든
+— 서명 행에 사실 4개가 결속된다: `route_closed`, `terminal_gate_proven`,
+`terminal_gate_reasons`, `route_outcome_digest`(route 닫힘 sidecar의 그 시점
+값이며 다시 관측하지 않는다). 표시 이름표 `sealed-unproven`은 이 서명 밖의
+계산값이라 나중에 바꿔도 이미 나간 승인 문장을 깨지 않는다. route가 아직
+열려 있으면 종료 자체가 `campaign-cycle-provisional-active`로 거부되며, 안내는
+`capability-route.py complete` 뒤 `close`를, 또는 증명 없이 닫으려면
+`close --allow-unproven`을 가리킨다 — 이미 봉인된 cycle의 재-`finalize`는
+가리키지 않는다(`finalize-state-conflict`이기 때문). route 닫힘 sidecar가
+기록과 다른 정체를 가리키면 `campaign-cycle-route-outcome-mismatch`다. 이
+장치는 campaign 종료 화면의 표시일 뿐이며, lifecycle·Fleet·Cairn 화면은
+manifest의 `state: active`를 그대로 보여 준다는 한계가 남는다.
 
 `campaigns/<locator>/campaign.satisfied.json`이 no-replace·fsync로
 발행되는 immutable commit point다. D-11 event envelope에 snapshot과 실제 승인

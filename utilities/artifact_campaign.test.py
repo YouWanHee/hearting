@@ -4,6 +4,7 @@ import concurrent.futures
 import contextlib
 import importlib.util
 import io
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -37,6 +38,9 @@ class CampaignTest(F.ProducerTestBase):
         self.native.parent.mkdir(parents=True)
         self.patch = mock.patch.dict(os.environ, {"CODEX_HOME": str(self.home)})
         self.patch.start(); self.addCleanup(self.patch.stop)
+        ledger = Path(self._tmp.name) / "peer-ledger"
+        self.ledger_patch = mock.patch.dict(os.environ, {"AGENT_PEER_LEDGER_ROOT": str(ledger)})
+        self.ledger_patch.start(); self.addCleanup(self.ledger_patch.stop)
 
     def child(self, by_key=False):
         route = F.compile_for("direct", self.root, slug="later-cycle", gate_source="later-input")
@@ -54,6 +58,23 @@ class CampaignTest(F.ProducerTestBase):
 
     def finish(self):
         return C.close(self.root, self.path, harness="codex", session=SID)
+
+    def provisional_child(self, closed):
+        """Seal a second campaign member `state: active` (route open at seal
+        time, D-6). `closed`: "proven" closes the route with terminal markers
+        written first; "unproven" closes it with none; `None` leaves it open."""
+        route = F.compile_for("direct", self.root, slug="provisional-cycle", gate_source="provisional-input")
+        binding = F.L.admit_runtime_route(self.root, route)
+        route_file = Path(binding.route_file)
+        child = P.begin(self.root, route_file=route_file, capability="autopilot-code",
+                        intensity="direct", campaign_id=self.campaign)
+        self.write_output(child)
+        P.finalize(self.root, cycle_id=child["cycle_id"], allow_open_route=True)
+        if closed == "proven":
+            self.close(route, route_file)
+        elif closed == "unproven":
+            F.R.close_route(route, route_file, commit="a" * 40, summary="fixture")
+        return route, route_file, child
 
     def test_cli_and_idempotency_preserve_sealed_bytes_and_reject_new_cycle(self):
         self.approve()
@@ -313,6 +334,234 @@ class CampaignTest(F.ProducerTestBase):
             path.write_text(json.dumps(row) + "\n")
             self.assertEqual(C.close(self.root, self.path, harness="claude", session=SID)["status"], "satisfied")
 
+    def _claude_store(self, rows):
+        base = Path(self._tmp.name) / ("claude-consent-%d" % id(rows))
+        path = base / "projects/project" / (SID + ".jsonl")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows), encoding="utf-8")
+        return base
+
+    @staticmethod
+    def _ts(second):
+        return "2026-09-18T03:05:%02d.000Z" % second
+
+    def _typed(self, text, second, **extra):
+        # The shape Claude Code 2.1.27x writes for a prompt the human submitted.
+        return {"type": "user", "sessionId": SID, "timestamp": self._ts(second), "origin": {"kind": "human"},
+                "promptSource": "typed", "message": {"role": "user", "content": text}, **extra}
+
+    def _shown(self, text, second):
+        return {"type": "assistant", "sessionId": SID, "timestamp": self._ts(second),
+                "message": {"role": "assistant", "content": [{"type": "text", "text": text}]}}
+
+    def _tool_round(self, second):
+        return [{"type": "assistant", "sessionId": SID, "timestamp": self._ts(second),
+                 "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "t", "name": "Bash", "input": {}}]}},
+                {"type": "user", "sessionId": SID, "timestamp": self._ts(second + 1),
+                 "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": "ok"}]}}]
+
+    def _enqueue(self, text, second):
+        return {"type": "queue-operation", "operation": "enqueue", "sessionId": SID,
+                "timestamp": self._ts(second), "content": text}
+
+    def _queued_command(self, text, typed_second, written_second):
+        return {"type": "attachment", "sessionId": SID, "timestamp": self._ts(written_second),
+                "attachment": {"type": "queued_command", "prompt": text, "origin": {"kind": "human"},
+                               "commandMode": "prompt", "timestamp": self._ts(typed_second)}}
+
+    def _verify(self, rows, ledger_rows=()):
+        ledger = Path(os.environ["AGENT_PEER_LEDGER_ROOT"]) / "peer-messages" / "2026-09" / "sender.jsonl"
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        ledger.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in ledger_rows), encoding="utf-8")
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self._claude_store(rows))}):
+            return C.verify_approval("claude", SID, self.statement)
+
+    def _refused(self, rows, ledger_rows=()):
+        with self.assertRaisesRegex(C.CampaignError, "campaign-user-acceptance-required"):
+            self._verify(rows, ledger_rows)
+
+    def test_closing_consent_right_after_the_statement_was_shown_closes(self):
+        # 2026-09-18 user instruction: "응 닫아" after the agent showed the
+        # statement is the user's approval; no digest retyping (session 5ed5b30b
+        # lines 112 -> 116 had exactly this shape and was refused before).
+        self.statement = C.status(self.root, self.path)["approval_statement"]
+        rows = [self._shown("승인 대상:\n" + self.statement + "\n닫을까요?", 1), self._typed("응 닫아", 30)]
+        approval = self._verify(rows)
+        self.assertEqual((approval["acceptance_mode"], approval["reply_text"], approval["presentation"]["line"]),
+                         ("presented-consent", "응 닫아", 1))
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self._claude_store(rows))}):
+            self.assertEqual(C.close(self.root, self.path, harness="claude", session=SID)["status"], "satisfied")
+
+    def test_consent_typed_while_the_agent_was_busy_counts_by_its_typing_time(self):
+        self.statement = C.status(self.root, self.path)["approval_statement"]
+        rows = [self._shown(self.statement, 1), *self._tool_round(2),
+                self._enqueue("응 닫아", 5), self._queued_command("응 닫아", 5, 9)]
+        self.assertEqual(self._verify(rows)["acceptance_mode"], "presented-consent")
+        # exact statement typed mid-turn (session 5ed5b30b line 154) is accepted too
+        rows = [self._enqueue(self.statement, 5), self._queued_command(self.statement, 5, 9)]
+        self.assertEqual(self._verify(rows)["acceptance_mode"], "exact-statement")
+
+    def test_consent_that_was_not_an_answer_to_the_shown_statement_is_refused(self):
+        self.statement = C.status(self.root, self.path)["approval_statement"]
+        shown = self._shown(self.statement + "\n닫을까요?", 10)
+        cases = {
+            "no statement shown": [self._typed("응 닫아", 30)],
+            "typed before it was shown (queued, dequeued after)": [
+                self._enqueue("응 닫아", 5), shown,
+                {**self._typed("응 닫아", 12), "promptSource": "queued"}],
+            "not the first input after it": [shown, self._typed("사이클 두 개는 뭐야", 20), self._typed("응 닫아", 30)],
+            "agent moved on to another question": [
+                shown, *self._tool_round(11), self._shown("그리고 v5 학습도 바로 시작할까요?", 15), self._typed("응 닫아", 30)],
+            "statement buried in an unrelated question, bare yes": [
+                self._shown("테스트도 돌릴까요? (참고: " + self.statement + ")", 10), self._typed("응", 30)],
+            "question, not consent": [shown, self._typed("닫아야 하나", 30)],
+            "refusal": [shown, self._typed("승인 안 해", 30)],
+            "accepted, then withdrawn": [shown, self._typed("응 닫아", 30), self._typed("아 잠깐 취소", 40)],
+            "withdrawn while still queued": [shown, self._typed("응 닫아", 30), self._enqueue("아니 닫지 마", 40)],
+            "headless sdk prompt": [shown, {**self._typed("응 닫아", 30), "promptSource": "sdk"}],
+            "prompt suggestion accepted": [shown, {**self._typed("응 닫아", 30), "promptSource": "suggestion_accepted"}],
+            "headless exact statement": [{**self._typed(self.statement, 30), "promptSource": "sdk", "origin": None}],
+        }
+        for name, rows in cases.items():
+            with self.subTest(name):
+                self._refused(rows)
+
+    def test_task_notifications_and_tool_results_do_not_break_the_answer(self):
+        self.statement = C.status(self.root, self.path)["approval_statement"]
+        notice = {**self._typed("<task-notification>done</task-notification>", 20),
+                  "origin": {"kind": "task-notification"}, "promptSource": "system"}
+        rows = [self._shown(self.statement, 1), *self._tool_round(2), notice, self._typed("응 닫아", 30)]
+        self.assertEqual(self._verify(rows)["acceptance_mode"], "presented-consent")
+
+    def test_input_injected_by_another_session_never_approves(self):
+        # Pane prompts are stored like typed human input; the peer trailer, a
+        # ledger digest (any recipient, whitespace forms) or a recent ledger row
+        # whose summary starts the text excludes them.
+        self.statement = C.status(self.root, self.path)["approval_statement"]
+        shown = self._shown(self.statement, 10)
+        digest = lambda text: hashlib.sha256(text.encode()).hexdigest()
+        self._refused([shown, self._typed("승인\n\n(peer-from: claude [4a] x ; ref=1)", 30)])
+        self._refused([self._typed(self.statement + "\n\n(peer-from: claude [4a] x ; ref=1)", 30)])
+        self._refused([shown, self._typed("응 닫아", 30)],
+                      [{"to": {"harness": "claude", "name": "wE:p6"}, "body_sha256": digest("응 닫아 ")}])
+        self._refused([shown, self._typed("응 닫아", 30)],
+                      [{"to": {"harness": "claude", "session_id": SID}, "summary": "응 닫아",
+                        "ts": "2026-09-18T03:05:31Z", "body_sha256": digest("different bytes")}])
+        # an injected message between the statement and the user's own reply does not count as that reply
+        injected = self._typed("[steer] 계속할까\n\n(peer-from: claude [4a] x ; ref=1)", 20)
+        self.assertEqual(self._verify([shown, injected, self._typed("응 닫아", 30)])["acceptance_mode"],
+                         "presented-consent")
+
+    def test_unreadable_peer_ledger_turns_short_consent_off(self):
+        self.statement = C.status(self.root, self.path)["approval_statement"]
+        rows = [self._shown(self.statement, 10), self._typed("응 닫아", 30)]
+        with mock.patch.object(C._PeerLedger, "_records", side_effect=OSError("ledger gone")):
+            self._refused(rows)
+            self.assertEqual(self._verify([self._typed(self.statement, 30)])["acceptance_mode"], "exact-statement")
+
+    def test_rejection_and_acceptance_order(self):
+        self.statement = C.status(self.root, self.path)["approval_statement"]
+        rejection = self.statement.replace("campaign-satisfy", "campaign-reject", 1)
+        shown = self._shown(self.statement, 10)
+        self.assertEqual(self._verify([shown, self._typed("아니", 20), self._typed(self.statement, 30)])["acceptance_mode"],
+                         "exact-statement")
+        self.assertEqual(self._verify([self._typed(rejection, 5), shown, self._typed("응 닫아", 30)])["acceptance_mode"],
+                         "presented-consent")
+        self._refused([self._typed(self.statement, 5), shown, self._typed("안 닫아", 30)])
+
+    def test_consent_vocabulary(self):
+        for text in ("응 닫아", "닫아", "네 닫아주세요", "승인", "승인합니다", "ㅇㅇ 닫아", "닫아.", "close it", "approve"):
+            self.assertEqual(C.consent_verdict(text), "accept", text)
+        for text in ("아니", "아니요 닫아", "승인 안 해", "승인 못 해", "승인 불가", "종료하지 않아", "안 닫아",
+                     "닫지 마", "ㄴㄴ", "싫어", "don\u2019t close", "never close", "no", "not yet", "취소", "잠깐만"):
+            self.assertEqual(C.consent_verdict(text), "reject", text)
+        for text in ("응", "ok", "yes", "좋아요", "y", "go back", "닫아야 하나", "닫으면 어떻게 돼", "승인해도 될까",
+                     "확인 중", "진행 중이야", "어 그런데…", "ok, but first explain the cycles", "close the other one", ""):
+            self.assertIsNone(C.consent_verdict(text), text)
+
+    def test_round_two_review_cases(self):
+        self.statement = C.status(self.root, self.path)["approval_statement"]
+        shown = self._shown(self.statement, 10)
+        digest = lambda text: hashlib.sha256(text.encode()).hexdigest()
+        # a human refusal the peer ledger happens to know still withdraws
+        self._refused([shown, self._typed("응 닫아", 20), self._typed("아니", 30)],
+                      [{"to": {"harness": "claude", "session_id": "other"}, "body_sha256": digest("아니")}])
+        self._refused([shown, self._typed("응 닫아", 20), self._enqueue("취소", 30)],
+                      [{"to": {"harness": "claude"}, "body_sha256": digest("취소")}])
+        # any later input voids a short consent; long refusals and more refusal words count
+        for later in ("거부", "반려", "아직이요", "노노", "nah", "rejected", "deny", "abort", "안됨",
+                      "아니, 잠깐만요. 사이클 두 개가 완료 확인 없이 닫혔다는 게 마음에 걸려서 조금 더 보고 다시 판단할게요",
+                      "그리고 v5 학습 결과도 알려줘"):
+            with self.subTest(later):
+                self._refused([shown, self._typed("응 닫아", 20), self._typed(later, 30)])
+        # a human "승인" is not mistaken for an unrelated recent peer message
+        approval = self._verify([shown, self._typed("승인", 30)],
+                                [{"to": {"harness": "claude"}, "summary": "승인 대기 보고", "ts": "2026-09-18T03:05:31Z",
+                                  "body_sha256": digest("승인 대기 보고")}])
+        self.assertEqual(approval["acceptance_mode"], "presented-consent")
+        # a queued input with no typing time is ordered by when it was written
+        rejection = self.statement.replace("campaign-satisfy", "campaign-reject", 1)
+        self._refused([{**self._typed(self.statement, 20), "promptSource": "queued"}, self._typed(rejection, 30)])
+        # a delivered copy is paired with its enqueue even when their clocks differ by a millisecond
+        rows = [shown, {**self._enqueue("응 닫아", 20), "timestamp": "2026-09-18T03:05:20.001Z"},
+                {**self._queued_command("응 닫아", 20, 25),
+                 "attachment": {**self._queued_command("응 닫아", 20, 25)["attachment"],
+                                "timestamp": "2026-09-18T03:05:20.000Z"}}]
+        self.assertEqual(self._verify(rows)["acceptance_mode"], "presented-consent")
+        # notifications and slash commands are not the user answering
+        rows = [shown, self._enqueue("<task-notification>done</task-notification>", 15),
+                {**self._typed("<command-name>/model</command-name>", 16)}, self._typed("네! 닫아주세요", 30)]
+        self.assertEqual(self._verify(rows)["reply_text"], "네! 닫아주세요")
+
+    def test_programmatic_codex_and_opencode_child_sessions_are_not_a_user(self):
+        self.statement = C.status(self.root, self.path)["approval_statement"]
+        base = Path(self._tmp.name) / "codex-originator"
+        rollout = base / "sessions/2026/09/18" / ("rollout-y-" + SID + ".jsonl")
+        rollout.parent.mkdir(parents=True)
+        user = {"type": "response_item", "payload": {"type": "message", "role": "user",
+                                                     "content": [{"type": "input_text", "text": self.statement}]}}
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(base)}):
+            for meta, accepted in (({"source": "vscode", "originator": "Claude Code"}, False),
+                                   ({"source": "mcp", "originator": "codex_mcp"}, False),
+                                   ({"source": "vscode", "originator": "codex-tui"}, True),
+                                   ({"source": "vscode", "originator": "Codex Desktop"}, True)):
+                rollout.write_text(json.dumps({"type": "session_meta", "payload": {"id": SID, **meta}}) + "\n"
+                                   + json.dumps(user) + "\n")
+                with self.subTest(meta):
+                    if accepted:
+                        self.assertEqual(C.verify_approval("codex", SID, self.statement)["acceptance_mode"], "exact-statement")
+                    else:
+                        with self.assertRaisesRegex(C.CampaignError, "campaign-user-acceptance-required"):
+                            C.verify_approval("codex", SID, self.statement)
+        sid = "ses_child"
+        row = {"info": {"id": "msg_user", "sessionID": sid, "role": "user"},
+               "parts": [{"type": "text", "text": self.statement}]}
+        def export(command, stdout, **kwargs):
+            stdout.write(json.dumps({"info": {"id": sid, "parentID": "ses_parent"}, "messages": [row]}).encode())
+            stdout.flush()
+            return subprocess.CompletedProcess(command, 0)
+        with mock.patch.object(C.subprocess, "run", side_effect=export):
+            with self.assertRaisesRegex(C.CampaignError, "campaign-user-acceptance-required"):
+                C.verify_approval("opencode", sid, self.statement)
+
+    def test_codex_exec_sessions_are_not_a_user(self):
+        self.statement = C.status(self.root, self.path)["approval_statement"]
+        base = Path(self._tmp.name) / "codex"
+        rollout = base / "sessions/2026/09/18" / ("rollout-x-" + SID + ".jsonl")
+        rollout.parent.mkdir(parents=True)
+        user = {"type": "response_item", "payload": {"type": "message", "role": "user",
+                                                     "content": [{"type": "input_text", "text": self.statement}]}}
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(base)}):
+            for source, accepted in (("exec", False), ("vscode", True), ("cli", True)):
+                rollout.write_text(json.dumps({"type": "session_meta", "payload": {"id": SID, "source": source}}) + "\n"
+                                   + json.dumps(user) + "\n")
+                with self.subTest(source):
+                    if accepted:
+                        self.assertEqual(C.verify_approval("codex", SID, self.statement)["acceptance_mode"], "exact-statement")
+                    else:
+                        with self.assertRaisesRegex(C.CampaignError, "campaign-user-acceptance-required"):
+                            C.verify_approval("codex", SID, self.statement)
+
     def test_opencode_native_export_and_synthetic_rejection(self):
         statement = C.status(self.root, self.path)["approval_statement"]; sid = "ses_fixture"
         row = {"info": {"id": "msg_user", "sessionID": sid, "role": "user"},
@@ -328,6 +577,107 @@ class CampaignTest(F.ProducerTestBase):
                 C.verify_approval("opencode", sid, statement)
             del row["parts"][0]["synthetic"]
             self.assertEqual(C.close(self.root, self.path, harness="opencode", session=sid)["status"], "satisfied")
+
+    def test_proven_campaign_rows_and_digest_are_unchanged(self):
+        report = C.status(self.root, self.path)
+        row = report["cycles"][0]
+        self.assertEqual(set(row) - {"disposition"},
+                         {"cycle_id", "state", "manifest_digest", "index_digest",
+                          "route_id", "manifest_id", "manifest_revision_id"})
+        self.assertEqual(row["disposition"], "completed")
+        snapshot = C._snapshot(self.root, self.path)
+        without_disposition = [{k: v for k, v in r.items() if k != "disposition"} for r in report["cycles"]]
+        self.assertEqual(without_disposition, snapshot["cycles"])
+        self.assertEqual(report["snapshot_digest"], C.digest(snapshot))
+        self.assertNotIn("unproven_cycles", report)
+
+    def test_route_closed_unproven_cycle_is_disclosed_and_closable(self):
+        route, route_file, child = self.provisional_child("unproven")
+        manifest_before = (Path(child["cycle_dir"]) / "manifest.json").read_bytes()
+        record_before = P.read_cycle_record(self.root, child["cycle_id"])
+        report = C.status(self.root, self.path)
+        self.assertEqual(report["status"], "awaiting-user-acceptance")
+        row = next(r for r in report["cycles"] if r["cycle_id"] == child["cycle_id"])
+        self.assertEqual(row["state"], "active")
+        self.assertEqual(row["disposition"], C.PROVISIONAL_DISPOSITION)
+        self.assertIs(row["terminal_gate_proven"], False)
+        self.assertTrue(any(reason.endswith(":completion-marker-absent") for reason in row["terminal_gate_reasons"]))
+        self.assertTrue(row["route_outcome_digest"].startswith("sha256:"))
+        self.assertEqual(report["unproven_cycles"], {"count": 1, "without_terminal_proof": 1})
+        self.approve()
+        result = self.finish()
+        self.assertEqual(result["status"], "satisfied")
+        event = json.loads(C._event_path(self.path).read_text())
+        snap_row = next(r for r in event["payload"]["snapshot"]["cycles"] if r["cycle_id"] == child["cycle_id"])
+        for key in ("route_closed", "terminal_gate_proven", "terminal_gate_reasons", "route_outcome_digest"):
+            self.assertIn(key, snap_row)
+        self.assertNotIn("disposition", snap_row)
+        self.assertIsNotNone(C._load_event(self.root, self.path))
+        self.assertEqual((Path(child["cycle_dir"]) / "manifest.json").read_bytes(), manifest_before)
+        self.assertEqual(P.read_cycle_record(self.root, child["cycle_id"]), record_before)
+
+    def test_outcome_bytes_change_invalidates_prior_statement(self):
+        route, route_file, child = self.provisional_child("unproven")
+        self.approve()
+        outcome_path = C.lifecycle.canonical_outcome_path(self.root, route["route_id"])
+        outcome = json.loads(outcome_path.read_text())
+        outcome["summary"] = "changed after approval"
+        outcome_path.write_text(json.dumps(outcome))
+        with self.assertRaisesRegex(C.CampaignError, "campaign-user-acceptance-required"):
+            self.finish()
+
+    def test_route_closed_with_proof_stays_active_and_sealed_unproven(self):
+        route, route_file, child = self.provisional_child("proven")
+        report = C.status(self.root, self.path)
+        row = next(r for r in report["cycles"] if r["cycle_id"] == child["cycle_id"])
+        self.assertEqual(row["state"], "active")
+        self.assertEqual(row["disposition"], C.PROVISIONAL_DISPOSITION)
+        self.assertIs(row["terminal_gate_proven"], True)
+        self.assertEqual(row["terminal_gate_reasons"], [])
+        self.assertEqual(report["unproven_cycles"]["without_terminal_proof"], 0)
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=child["cycle_id"], state="completed", allow_open_route=True)
+        self.assertEqual(caught.exception.code, "finalize-state-conflict")
+
+    def test_open_route_provisional_cycle_is_refused_with_next_step(self):
+        route, route_file, child = self.provisional_child(None)
+        with self.assertRaises(C.CampaignError) as caught:
+            C.status(self.root, self.path)
+        self.assertEqual(caught.exception.code, "campaign-cycle-provisional-active")
+        self.assertIn("open=1", caught.exception.detail)
+        self.assertIn(f"route={route['route_id']}", caught.exception.detail)
+        self.assertIn("route_state=open", caught.exception.detail)
+        self.assertIn("complete", caught.exception.detail)
+        self.assertIn("--allow-unproven", caught.exception.detail)
+        self.assertNotIn("finalize", caught.exception.detail)
+        F.R.close_route(route, route_file, commit="a" * 40, summary="fixture")
+        report = C.status(self.root, self.path)
+        self.assertEqual(report["status"], "awaiting-user-acceptance")
+
+    def test_outcome_identity_mismatch_is_typed(self):
+        route, route_file, child = self.provisional_child("unproven")
+        outcome_path = C.lifecycle.canonical_outcome_path(self.root, route["route_id"])
+        outcome = json.loads(outcome_path.read_text())
+        outcome["route_hash"] = "sha256:" + "0" * 64
+        outcome_path.write_text(json.dumps(outcome))
+        with self.assertRaisesRegex(C.CampaignError, "campaign-cycle-route-outcome-mismatch"):
+            C.status(self.root, self.path)
+
+    def test_integrity_errors_win_over_open_route_refusal(self):
+        self.provisional_child(None)
+        self.output.write_bytes(b"bad bytes")
+        with self.assertRaisesRegex(C.CampaignError, "campaign-artifact-mismatch"):
+            C.status(self.root, self.path)
+
+
+class OpenRefusalDetailTest(unittest.TestCase):
+    def test_open_refusal_detail_is_bounded(self):
+        pending = [(f"cyc_{i:032x}", f"rt-{i:016x}") for i in range(12)]
+        detail = C._open_refusal_detail(pending)
+        self.assertTrue(detail.startswith("open=12 "))
+        self.assertIn("+2 more", detail)
+        self.assertEqual(detail.count("route_state=open"), 10)
+        self.assertNotIn("finalize", detail)
 
 
 if __name__ == "__main__":
