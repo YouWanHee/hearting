@@ -4,6 +4,7 @@ import concurrent.futures
 import contextlib
 import importlib.util
 import io
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -37,6 +38,9 @@ class CampaignTest(F.ProducerTestBase):
         self.native.parent.mkdir(parents=True)
         self.patch = mock.patch.dict(os.environ, {"CODEX_HOME": str(self.home)})
         self.patch.start(); self.addCleanup(self.patch.stop)
+        ledger = Path(self._tmp.name) / "peer-ledger"
+        self.ledger_patch = mock.patch.dict(os.environ, {"AGENT_PEER_LEDGER_ROOT": str(ledger)})
+        self.ledger_patch.start(); self.addCleanup(self.ledger_patch.stop)
 
     def child(self, by_key=False):
         route = F.compile_for("direct", self.root, slug="later-cycle", gate_source="later-input")
@@ -329,6 +333,234 @@ class CampaignTest(F.ProducerTestBase):
                 C.verify_approval("claude", SID, statement)
             path.write_text(json.dumps(row) + "\n")
             self.assertEqual(C.close(self.root, self.path, harness="claude", session=SID)["status"], "satisfied")
+
+    def _claude_store(self, rows):
+        base = Path(self._tmp.name) / ("claude-consent-%d" % id(rows))
+        path = base / "projects/project" / (SID + ".jsonl")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows), encoding="utf-8")
+        return base
+
+    @staticmethod
+    def _ts(second):
+        return "2026-09-18T03:05:%02d.000Z" % second
+
+    def _typed(self, text, second, **extra):
+        # The shape Claude Code 2.1.27x writes for a prompt the human submitted.
+        return {"type": "user", "sessionId": SID, "timestamp": self._ts(second), "origin": {"kind": "human"},
+                "promptSource": "typed", "message": {"role": "user", "content": text}, **extra}
+
+    def _shown(self, text, second):
+        return {"type": "assistant", "sessionId": SID, "timestamp": self._ts(second),
+                "message": {"role": "assistant", "content": [{"type": "text", "text": text}]}}
+
+    def _tool_round(self, second):
+        return [{"type": "assistant", "sessionId": SID, "timestamp": self._ts(second),
+                 "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "t", "name": "Bash", "input": {}}]}},
+                {"type": "user", "sessionId": SID, "timestamp": self._ts(second + 1),
+                 "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": "ok"}]}}]
+
+    def _enqueue(self, text, second):
+        return {"type": "queue-operation", "operation": "enqueue", "sessionId": SID,
+                "timestamp": self._ts(second), "content": text}
+
+    def _queued_command(self, text, typed_second, written_second):
+        return {"type": "attachment", "sessionId": SID, "timestamp": self._ts(written_second),
+                "attachment": {"type": "queued_command", "prompt": text, "origin": {"kind": "human"},
+                               "commandMode": "prompt", "timestamp": self._ts(typed_second)}}
+
+    def _verify(self, rows, ledger_rows=()):
+        ledger = Path(os.environ["AGENT_PEER_LEDGER_ROOT"]) / "peer-messages" / "2026-09" / "sender.jsonl"
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        ledger.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in ledger_rows), encoding="utf-8")
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self._claude_store(rows))}):
+            return C.verify_approval("claude", SID, self.statement)
+
+    def _refused(self, rows, ledger_rows=()):
+        with self.assertRaisesRegex(C.CampaignError, "campaign-user-acceptance-required"):
+            self._verify(rows, ledger_rows)
+
+    def test_closing_consent_right_after_the_statement_was_shown_closes(self):
+        # 2026-09-18 user instruction: "응 닫아" after the agent showed the
+        # statement is the user's approval; no digest retyping (session 5ed5b30b
+        # lines 112 -> 116 had exactly this shape and was refused before).
+        self.statement = C.status(self.root, self.path)["approval_statement"]
+        rows = [self._shown("승인 대상:\n" + self.statement + "\n닫을까요?", 1), self._typed("응 닫아", 30)]
+        approval = self._verify(rows)
+        self.assertEqual((approval["acceptance_mode"], approval["reply_text"], approval["presentation"]["line"]),
+                         ("presented-consent", "응 닫아", 1))
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self._claude_store(rows))}):
+            self.assertEqual(C.close(self.root, self.path, harness="claude", session=SID)["status"], "satisfied")
+
+    def test_consent_typed_while_the_agent_was_busy_counts_by_its_typing_time(self):
+        self.statement = C.status(self.root, self.path)["approval_statement"]
+        rows = [self._shown(self.statement, 1), *self._tool_round(2),
+                self._enqueue("응 닫아", 5), self._queued_command("응 닫아", 5, 9)]
+        self.assertEqual(self._verify(rows)["acceptance_mode"], "presented-consent")
+        # exact statement typed mid-turn (session 5ed5b30b line 154) is accepted too
+        rows = [self._enqueue(self.statement, 5), self._queued_command(self.statement, 5, 9)]
+        self.assertEqual(self._verify(rows)["acceptance_mode"], "exact-statement")
+
+    def test_consent_that_was_not_an_answer_to_the_shown_statement_is_refused(self):
+        self.statement = C.status(self.root, self.path)["approval_statement"]
+        shown = self._shown(self.statement + "\n닫을까요?", 10)
+        cases = {
+            "no statement shown": [self._typed("응 닫아", 30)],
+            "typed before it was shown (queued, dequeued after)": [
+                self._enqueue("응 닫아", 5), shown,
+                {**self._typed("응 닫아", 12), "promptSource": "queued"}],
+            "not the first input after it": [shown, self._typed("사이클 두 개는 뭐야", 20), self._typed("응 닫아", 30)],
+            "agent moved on to another question": [
+                shown, *self._tool_round(11), self._shown("그리고 v5 학습도 바로 시작할까요?", 15), self._typed("응 닫아", 30)],
+            "statement buried in an unrelated question, bare yes": [
+                self._shown("테스트도 돌릴까요? (참고: " + self.statement + ")", 10), self._typed("응", 30)],
+            "question, not consent": [shown, self._typed("닫아야 하나", 30)],
+            "refusal": [shown, self._typed("승인 안 해", 30)],
+            "accepted, then withdrawn": [shown, self._typed("응 닫아", 30), self._typed("아 잠깐 취소", 40)],
+            "withdrawn while still queued": [shown, self._typed("응 닫아", 30), self._enqueue("아니 닫지 마", 40)],
+            "headless sdk prompt": [shown, {**self._typed("응 닫아", 30), "promptSource": "sdk"}],
+            "prompt suggestion accepted": [shown, {**self._typed("응 닫아", 30), "promptSource": "suggestion_accepted"}],
+            "headless exact statement": [{**self._typed(self.statement, 30), "promptSource": "sdk", "origin": None}],
+        }
+        for name, rows in cases.items():
+            with self.subTest(name):
+                self._refused(rows)
+
+    def test_task_notifications_and_tool_results_do_not_break_the_answer(self):
+        self.statement = C.status(self.root, self.path)["approval_statement"]
+        notice = {**self._typed("<task-notification>done</task-notification>", 20),
+                  "origin": {"kind": "task-notification"}, "promptSource": "system"}
+        rows = [self._shown(self.statement, 1), *self._tool_round(2), notice, self._typed("응 닫아", 30)]
+        self.assertEqual(self._verify(rows)["acceptance_mode"], "presented-consent")
+
+    def test_input_injected_by_another_session_never_approves(self):
+        # Pane prompts are stored like typed human input; the peer trailer, a
+        # ledger digest (any recipient, whitespace forms) or a recent ledger row
+        # whose summary starts the text excludes them.
+        self.statement = C.status(self.root, self.path)["approval_statement"]
+        shown = self._shown(self.statement, 10)
+        digest = lambda text: hashlib.sha256(text.encode()).hexdigest()
+        self._refused([shown, self._typed("승인\n\n(peer-from: claude [4a] x ; ref=1)", 30)])
+        self._refused([self._typed(self.statement + "\n\n(peer-from: claude [4a] x ; ref=1)", 30)])
+        self._refused([shown, self._typed("응 닫아", 30)],
+                      [{"to": {"harness": "claude", "name": "wE:p6"}, "body_sha256": digest("응 닫아 ")}])
+        self._refused([shown, self._typed("응 닫아", 30)],
+                      [{"to": {"harness": "claude", "session_id": SID}, "summary": "응 닫아",
+                        "ts": "2026-09-18T03:05:31Z", "body_sha256": digest("different bytes")}])
+        # an injected message between the statement and the user's own reply does not count as that reply
+        injected = self._typed("[steer] 계속할까\n\n(peer-from: claude [4a] x ; ref=1)", 20)
+        self.assertEqual(self._verify([shown, injected, self._typed("응 닫아", 30)])["acceptance_mode"],
+                         "presented-consent")
+
+    def test_unreadable_peer_ledger_turns_short_consent_off(self):
+        self.statement = C.status(self.root, self.path)["approval_statement"]
+        rows = [self._shown(self.statement, 10), self._typed("응 닫아", 30)]
+        with mock.patch.object(C._PeerLedger, "_records", side_effect=OSError("ledger gone")):
+            self._refused(rows)
+            self.assertEqual(self._verify([self._typed(self.statement, 30)])["acceptance_mode"], "exact-statement")
+
+    def test_rejection_and_acceptance_order(self):
+        self.statement = C.status(self.root, self.path)["approval_statement"]
+        rejection = self.statement.replace("campaign-satisfy", "campaign-reject", 1)
+        shown = self._shown(self.statement, 10)
+        self.assertEqual(self._verify([shown, self._typed("아니", 20), self._typed(self.statement, 30)])["acceptance_mode"],
+                         "exact-statement")
+        self.assertEqual(self._verify([self._typed(rejection, 5), shown, self._typed("응 닫아", 30)])["acceptance_mode"],
+                         "presented-consent")
+        self._refused([self._typed(self.statement, 5), shown, self._typed("안 닫아", 30)])
+
+    def test_consent_vocabulary(self):
+        for text in ("응 닫아", "닫아", "네 닫아주세요", "승인", "승인합니다", "ㅇㅇ 닫아", "닫아.", "close it", "approve"):
+            self.assertEqual(C.consent_verdict(text), "accept", text)
+        for text in ("아니", "아니요 닫아", "승인 안 해", "승인 못 해", "승인 불가", "종료하지 않아", "안 닫아",
+                     "닫지 마", "ㄴㄴ", "싫어", "don\u2019t close", "never close", "no", "not yet", "취소", "잠깐만"):
+            self.assertEqual(C.consent_verdict(text), "reject", text)
+        for text in ("응", "ok", "yes", "좋아요", "y", "go back", "닫아야 하나", "닫으면 어떻게 돼", "승인해도 될까",
+                     "확인 중", "진행 중이야", "어 그런데…", "ok, but first explain the cycles", "close the other one", ""):
+            self.assertIsNone(C.consent_verdict(text), text)
+
+    def test_round_two_review_cases(self):
+        self.statement = C.status(self.root, self.path)["approval_statement"]
+        shown = self._shown(self.statement, 10)
+        digest = lambda text: hashlib.sha256(text.encode()).hexdigest()
+        # a human refusal the peer ledger happens to know still withdraws
+        self._refused([shown, self._typed("응 닫아", 20), self._typed("아니", 30)],
+                      [{"to": {"harness": "claude", "session_id": "other"}, "body_sha256": digest("아니")}])
+        self._refused([shown, self._typed("응 닫아", 20), self._enqueue("취소", 30)],
+                      [{"to": {"harness": "claude"}, "body_sha256": digest("취소")}])
+        # any later input voids a short consent; long refusals and more refusal words count
+        for later in ("거부", "반려", "아직이요", "노노", "nah", "rejected", "deny", "abort", "안됨",
+                      "아니, 잠깐만요. 사이클 두 개가 완료 확인 없이 닫혔다는 게 마음에 걸려서 조금 더 보고 다시 판단할게요",
+                      "그리고 v5 학습 결과도 알려줘"):
+            with self.subTest(later):
+                self._refused([shown, self._typed("응 닫아", 20), self._typed(later, 30)])
+        # a human "승인" is not mistaken for an unrelated recent peer message
+        approval = self._verify([shown, self._typed("승인", 30)],
+                                [{"to": {"harness": "claude"}, "summary": "승인 대기 보고", "ts": "2026-09-18T03:05:31Z",
+                                  "body_sha256": digest("승인 대기 보고")}])
+        self.assertEqual(approval["acceptance_mode"], "presented-consent")
+        # a queued input with no typing time is ordered by when it was written
+        rejection = self.statement.replace("campaign-satisfy", "campaign-reject", 1)
+        self._refused([{**self._typed(self.statement, 20), "promptSource": "queued"}, self._typed(rejection, 30)])
+        # a delivered copy is paired with its enqueue even when their clocks differ by a millisecond
+        rows = [shown, {**self._enqueue("응 닫아", 20), "timestamp": "2026-09-18T03:05:20.001Z"},
+                {**self._queued_command("응 닫아", 20, 25),
+                 "attachment": {**self._queued_command("응 닫아", 20, 25)["attachment"],
+                                "timestamp": "2026-09-18T03:05:20.000Z"}}]
+        self.assertEqual(self._verify(rows)["acceptance_mode"], "presented-consent")
+        # notifications and slash commands are not the user answering
+        rows = [shown, self._enqueue("<task-notification>done</task-notification>", 15),
+                {**self._typed("<command-name>/model</command-name>", 16)}, self._typed("네! 닫아주세요", 30)]
+        self.assertEqual(self._verify(rows)["reply_text"], "네! 닫아주세요")
+
+    def test_programmatic_codex_and_opencode_child_sessions_are_not_a_user(self):
+        self.statement = C.status(self.root, self.path)["approval_statement"]
+        base = Path(self._tmp.name) / "codex-originator"
+        rollout = base / "sessions/2026/09/18" / ("rollout-y-" + SID + ".jsonl")
+        rollout.parent.mkdir(parents=True)
+        user = {"type": "response_item", "payload": {"type": "message", "role": "user",
+                                                     "content": [{"type": "input_text", "text": self.statement}]}}
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(base)}):
+            for meta, accepted in (({"source": "vscode", "originator": "Claude Code"}, False),
+                                   ({"source": "mcp", "originator": "codex_mcp"}, False),
+                                   ({"source": "vscode", "originator": "codex-tui"}, True),
+                                   ({"source": "vscode", "originator": "Codex Desktop"}, True)):
+                rollout.write_text(json.dumps({"type": "session_meta", "payload": {"id": SID, **meta}}) + "\n"
+                                   + json.dumps(user) + "\n")
+                with self.subTest(meta):
+                    if accepted:
+                        self.assertEqual(C.verify_approval("codex", SID, self.statement)["acceptance_mode"], "exact-statement")
+                    else:
+                        with self.assertRaisesRegex(C.CampaignError, "campaign-user-acceptance-required"):
+                            C.verify_approval("codex", SID, self.statement)
+        sid = "ses_child"
+        row = {"info": {"id": "msg_user", "sessionID": sid, "role": "user"},
+               "parts": [{"type": "text", "text": self.statement}]}
+        def export(command, stdout, **kwargs):
+            stdout.write(json.dumps({"info": {"id": sid, "parentID": "ses_parent"}, "messages": [row]}).encode())
+            stdout.flush()
+            return subprocess.CompletedProcess(command, 0)
+        with mock.patch.object(C.subprocess, "run", side_effect=export):
+            with self.assertRaisesRegex(C.CampaignError, "campaign-user-acceptance-required"):
+                C.verify_approval("opencode", sid, self.statement)
+
+    def test_codex_exec_sessions_are_not_a_user(self):
+        self.statement = C.status(self.root, self.path)["approval_statement"]
+        base = Path(self._tmp.name) / "codex"
+        rollout = base / "sessions/2026/09/18" / ("rollout-x-" + SID + ".jsonl")
+        rollout.parent.mkdir(parents=True)
+        user = {"type": "response_item", "payload": {"type": "message", "role": "user",
+                                                     "content": [{"type": "input_text", "text": self.statement}]}}
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(base)}):
+            for source, accepted in (("exec", False), ("vscode", True), ("cli", True)):
+                rollout.write_text(json.dumps({"type": "session_meta", "payload": {"id": SID, "source": source}}) + "\n"
+                                   + json.dumps(user) + "\n")
+                with self.subTest(source):
+                    if accepted:
+                        self.assertEqual(C.verify_approval("codex", SID, self.statement)["acceptance_mode"], "exact-statement")
+                    else:
+                        with self.assertRaisesRegex(C.CampaignError, "campaign-user-acceptance-required"):
+                            C.verify_approval("codex", SID, self.statement)
 
     def test_opencode_native_export_and_synthetic_rejection(self):
         statement = C.status(self.root, self.path)["approval_statement"]; sid = "ses_fixture"
