@@ -1548,7 +1548,12 @@ def _session_stage_segs(entity, working, max_width):
         # can contradict its own capability is worse than no tag.
         name = cap["capability"].replace("autopilot-", "")
         knob_items = [k for k in (cap.get("mode"), cap_intensity) if k]
-        segs = [(name, "name_dim")]
+        # User 2026-09-18 ("메인세션에서 라우팅 스킬도 회색인데?"): on a main row this tag is
+        # the ONLY sign of the work it is in — no breadcrumb follows it, unlike the owner card
+        # and the spec branch above — so it must not recede like a dial label. Same status rule
+        # as the projection fallback below: work hue while working, plain text otherwise; the
+        # knobs stay dim.
+        segs = [(name, "g_work" if working else None)]
         if knob_items:
             segs += [("(", "dim"), ("·".join(knob_items), "dim"), (")", "dim")]
         return segs
