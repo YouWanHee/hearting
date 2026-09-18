@@ -215,7 +215,7 @@ logs, caches, databases, or `$CODEX_HOME/config.toml`.
 
 Portable behavior contract = `roles/response-policy.md`.
 
-- **Audience-language first** — user artifacts default to the user's current communication language unless a stronger audience/repository contract applies.
+- **Audience-language first** — user artifacts default to the user's current communication language unless a stronger audience/repository contract applies. Code and commits keep the repo's language.
 - Keep responses concise, match promises with same-turn action, verify before asserting, and follow current conventions; expose a convention change before committing it.
 - **Local evidence before recall** — repo research/analysis/briefing artifacts answer domain questions first; memory-only answers say so and flag risky items; §0.4 card exemption never waives this check.
 - **Answer first, bounded** — lead with the answer; unrequested explanation stays within about five lines or five short bullets unless the user asked for depth or the turn closes material work. Offer the rest rather than delivering it unbidden.
