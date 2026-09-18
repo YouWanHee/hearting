@@ -1096,10 +1096,13 @@ if "$CODEX" write "$TMP/cxspec/src/main.py" cxwsid2 >/tmp/codex_wg.out 2>/tmp/co
 else
   bad "codex write guard should not gate ordinary source files"
 fi
-mkdir -p "$TMP/codex-route-home/core" "$TMP/cg"
+mkdir -p "$TMP/codex-route-home/core" "$TMP/cg" "$TMP/codex-iso/.codex"
 printf 'fixture\n' > "$TMP/codex-route-home/core/CORE.md"
-AGENT_HOME="$TMP/codex-route-home" "$CODEX" read "$TMP/specproj/.agent_reports/spec/prd.md" testsid >/dev/null 2>&1
-if AGENT_HOME="$TMP/codex-route-home" FLEET_CAPABILITY_GROUNDING_DIR="$TMP/cg" "$CODEX" route autopilot-code "$TMP/specproj" testsid debug direct >/tmp/codex_route.out 2>/tmp/codex_route.err \
+# The fixture AGENT_HOME is not a harness root, so the wrapper would otherwise resolve its
+# utilities from this host's installed Codex activation or ~/hearting — testing whatever is
+# installed instead of this checkout. An empty HOME/CODEX_HOME leaves only the wrapper's own tree.
+AGENT_HOME="$TMP/codex-route-home" HOME="$TMP/codex-iso" CODEX_HOME="$TMP/codex-iso/.codex" "$CODEX" read "$TMP/specproj/.agent_reports/spec/prd.md" testsid >/dev/null 2>&1
+if AGENT_HOME="$TMP/codex-route-home" HOME="$TMP/codex-iso" CODEX_HOME="$TMP/codex-iso/.codex" FLEET_CAPABILITY_GROUNDING_DIR="$TMP/cg" "$CODEX" route autopilot-code "$TMP/specproj" testsid debug direct >/tmp/codex_route.out 2>/tmp/codex_route.err \
   && grep -q '^runtime_surface=adapter-owned-harness-status$' /tmp/codex_route.out \
   && grep -q '^git_dirty_tracked=' /tmp/codex_route.out \
   && grep -q '^headless_open_jobs=' /tmp/codex_route.out \
@@ -1115,8 +1118,8 @@ if AGENT_HOME="$TMP/codex-route-home" FLEET_CAPABILITY_GROUNDING_DIR="$TMP/cg" "
 else
   bad "codex route wrapper should combine status, prompt signal, capability-info, and spec gate"
 fi
-AGENT_HOME="$TMP/codex-route-home" "$CODEX" read "$TMP/specproj/.agent_reports/spec/prd.md" worker-testsid >/dev/null 2>&1
-if AGENT_HOME="$TMP/codex-route-home" FLEET_CAPABILITY_GROUNDING_DIR="$TMP/cg" AGENT_SESSION_ROLE=worker \
+AGENT_HOME="$TMP/codex-route-home" HOME="$TMP/codex-iso" CODEX_HOME="$TMP/codex-iso/.codex" "$CODEX" read "$TMP/specproj/.agent_reports/spec/prd.md" worker-testsid >/dev/null 2>&1
+if AGENT_HOME="$TMP/codex-route-home" HOME="$TMP/codex-iso" CODEX_HOME="$TMP/codex-iso/.codex" FLEET_CAPABILITY_GROUNDING_DIR="$TMP/cg" AGENT_SESSION_ROLE=worker \
   "$CODEX" route autopilot-code "$TMP/specproj" worker-testsid debug direct >/tmp/codex_worker_route.out 2>/tmp/codex_worker_route.err \
   && [ ! -e "$TMP/cg/worker-testsid" ] \
   && [ ! -e "$TMP/codex-route-home/.capability-grounding" ]; then
