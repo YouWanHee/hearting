@@ -67,6 +67,19 @@ class SkillOnlyCellTest(unittest.TestCase):
         self.assertNotIn("exec", cell)
         self.assertNotIn(":", cell)
 
+    def test_capability_name_is_lit_not_dim(self):
+        """User 2026-09-18 ("메인세션에서 라우팅 스킬도 회색인데?"): the tag is the main row's
+        only sign of its work, so the name wears the status rule — work hue while working,
+        plain text while idle — and never the dim dial key. The knobs stay dim."""
+        cap = {"capability": "autopilot-code", "mode": "dev", "intensity": "standard"}
+        for working, name_key in ((True, "g_work"), (False, None)):
+            s = _session()
+            s.cap_grounding = cap
+            segs = render._session_stage_segs(s, working, 80)
+            with self.subTest(working=working):
+                self.assertEqual(segs[0], ("code", name_key))
+                self.assertEqual([k for t, k in segs[1:]], ["dim", "dim", "dim"])
+
     def test_capability_without_knobs(self):
         self.assertEqual(self._cell({"capability": "autopilot-research"}), "research")
 
