@@ -34,7 +34,7 @@ class RouteChainStripTest(unittest.TestCase):
         lines = render._route_chain_strip(chain, term_width=None)
         self.assertEqual(len(lines), 1)
         self.assertEqual(_text(lines[0]).strip(),
-                          "경로 research ✓ › draft ● solo › apply ○")
+                          "경로 research(std) ✓ › draft(std) ● › apply ○")
 
     def test_hidden_when_single_node_without_plan(self):
         chain = route_chain.assemble(
@@ -63,39 +63,57 @@ class RouteChainStripTest(unittest.TestCase):
                           "plan_source": "inherited", "nodes": receiver_nodes,
                           "current": receiver_nodes[0]}
         lines2 = render._route_chain_strip(receiver_chain, term_width=None)
-        self.assertEqual(_text(lines2[0]).strip(), "경로 draft ● solo › apply ○")
+        self.assertEqual(_text(lines2[0]).strip(), "경로 draft(std) ● › apply ○")
 
-    def test_width_ladder_full_then_no_shape_then_current_plus_counts(self):
-        nodes = [_node("research", "done"), _node("draft", "open", shape="solo"),
-                 _node("apply", "planned")]
+    def test_width_ladder_knobs_fold_past_first_then_current_then_counts(self):
+        nodes = [_node("research", "done"), _node("draft", "open"), _node("apply", "planned")]
         chain = {"v": 1, "key": "k1", "visible": True, "plan": ["research", "draft", "apply"],
                 "plan_source": "explicit", "nodes": nodes, "current": nodes[1]}
-        full_segs = render._route_chain_strip(chain, term_width=None)[0]
-        full = _text(full_segs)
-        full_w = sum(render._dw(t) for t, _k in full_segs)
-        self.assertIn("solo", full)
+        texts = [_text(body) for body, _full in render._route_chain_bodies(chain)]
+        self.assertEqual(texts[0], "research(std) ✓ › draft(std) ● › apply ○")
+        self.assertEqual(texts[1], "research ✓ › draft(std) ● › apply ○")
+        self.assertEqual(texts[2], "research ✓ › draft ● › apply ○")
+        self.assertEqual(texts[3], "draft(std) ● +1✓ +1○")
+        self.assertEqual(texts[4], "draft ● +1✓ +1○")
+        widths = [sum(render._dw(t) for t, _k in body)
+                  for body, _full in render._route_chain_bodies(chain)]
+        self.assertEqual(widths, sorted(widths, reverse=True))
+        full_w = widths[0]
+        self.assertEqual(_text(render._route_chain_cell(chain, full_w - 1)[0]), texts[1])
 
-        no_shape_segs = render._route_chain_strip(chain, term_width=full_w - 1)[0]
-        no_shape = _text(no_shape_segs)
-        no_shape_w = sum(render._dw(t) for t, _k in no_shape_segs)
-        self.assertNotIn("solo", no_shape)
-        self.assertIn("draft ●", no_shape)
-        self.assertLess(no_shape_w, full_w)
+    def test_mode_and_retry_round_ride_the_same_paren(self):
+        node = _node("code", "done", round_n=2)
+        node["capability_mode"] = "dev"
+        self.assertEqual(render._route_chain_node_knobs(node, True), "dev·std·R2")
+        self.assertEqual(render._route_chain_node_knobs(node, False), "R2")
 
-        current_only = _text(render._route_chain_strip(chain, term_width=no_shape_w - 1)[0])
-        self.assertIn("draft ●", current_only)
-        self.assertNotIn("research", current_only)
+    def test_only_the_current_node_is_lit(self):
+        nodes = [_node("code", "done"), _node("lab", "open")]
+        chain = {"v": 1, "key": "k1", "visible": True, "plan": [], "plan_source": None,
+                "nodes": nodes, "current": nodes[1]}
+        working = render._route_chain_bodies(chain, working=True)[0][0]
+        keyed = [(t, k) for t, k in working if t.strip()]
+        self.assertEqual(keyed[0], ("code(std)", "dim"))
+        self.assertEqual(keyed[1], (" ✓", "dim"))
+        self.assertIn(("lab", "g_work"), keyed)
+        self.assertIn((" ●", "g_work"), keyed)
+        self.assertIn(("std", "dim"), keyed)            # the current node's knobs stay dim
+        idle = render._route_chain_bodies(chain, working=False)[0][0]
+        self.assertIn(("lab", None), idle)               # plain, not dim, while idle
+
+    def test_failed_past_node_keeps_its_red_glyph(self):
+        nodes = [_node("code", "failed"), _node("lab", "open")]
+        chain = {"v": 1, "key": "k1", "visible": True, "plan": [], "plan_source": None,
+                "nodes": nodes, "current": nodes[1]}
+        body = render._route_chain_bodies(chain)[0][0]
+        self.assertIn((" ✕", "lvl_r"), body)
 
     def test_failed_and_unknown_counts_in_current_only_form(self):
         nodes = [_node("research", "failed"), _node("draft", "unknown"),
                  _node("apply", "open", shape="solo")]
         chain = {"v": 1, "key": "k1", "visible": True, "plan": [], "plan_source": None,
                 "nodes": nodes, "current": nodes[2]}
-        full_segs = render._route_chain_strip(chain, term_width=None)[0]
-        full_w = sum(render._dw(t) for t, _k in full_segs)
-        no_shape_segs = render._route_chain_strip(chain, term_width=full_w - 1)[0]
-        no_shape_w = sum(render._dw(t) for t, _k in no_shape_segs)
-        current_only = _text(render._route_chain_strip(chain, term_width=no_shape_w - 1)[0])
+        current_only = _text(render._route_chain_bodies(chain)[3][0])
         self.assertIn("+1✕", current_only)
         self.assertIn("+1?", current_only)
 
@@ -200,7 +218,7 @@ class ChainInStageCellTest(unittest.TestCase):
         nodes = [_node("code", "done"), _node("lab", "open", shape="direct")]
         rows = _board([_chain_session(nodes, nodes[1])])
         row = _session_row_text(rows)
-        self.assertIn("code ✓ › lab ● direct", row)
+        self.assertIn("code(std) ✓ › lab(std) ●", row)
         self.assertFalse(any("경로 " in t for t in rows))
 
     def test_chain_over_forty_cells_keeps_current_in_cell_and_full_line_below(self):
@@ -209,10 +227,11 @@ class ChainInStageCellTest(unittest.TestCase):
         rows = _board([_chain_session(nodes, nodes[3], plan=("research", "draft", "refine",
                                                              "apply", "code"))])
         row = _session_row_text(rows)
-        self.assertIn("apply ● staged +3✓ +1○", row)
+        self.assertIn("apply(std) ● +3✓ +1○", row)
         line = [t for t in rows if "경로 " in t]
         self.assertEqual(len(line), 1)
-        self.assertIn("research ✓ › draft ✓ › refine ✓ › apply ● staged › code ○", line[0])
+        self.assertIn("research(std) ✓ › draft(std) ✓ › refine(std) ✓ › apply(std) ● › code ○",
+                      line[0])
 
     def test_cell_budget_caps_at_forty(self):
         self.assertEqual(render._SESSION_CELL_MAX, 40)
@@ -229,8 +248,8 @@ class ChainInStageCellTest(unittest.TestCase):
         rows = _board([session], jobs=[owner])
         self.assertTrue(any("lab-owner" in t for t in rows))          # the owner card renders
         row = _session_row_text(rows)
-        self.assertNotIn("code ✓", row)                                # D3 blanks the cell
-        self.assertTrue(any("경로 code ✓ › lab ● solo" in t for t in rows))
+        self.assertNotIn("code(std) ✓", row)                           # D3 blanks the cell
+        self.assertTrue(any("경로 code(std) ✓ › lab(std) ●" in t for t in rows))
 
     def test_narrow_card_shows_the_capability_tag_not_a_dash(self):
         session = Session(harness="claude", pid=12, cwd="/x/narrow", slug="narrow",
