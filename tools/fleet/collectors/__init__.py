@@ -479,6 +479,14 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only"):
     except Exception:
         pass
 
+    try:
+        from .. import route_chain as _route_chain
+        _route_chain.enrich(sessions, jobs=jobs,
+                             node_evidence=getattr(dispatch.collect, "last_route_nodes", None),
+                             now=_time.time())
+    except Exception:
+        pass
+
     # v16: all surfaces receive one projection after evidence collection and association.
     try:
         from ..projection import attach_projections

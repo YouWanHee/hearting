@@ -2425,6 +2425,20 @@ def _is_owner_mode_row(j):
     )
 
 
+def _owner_route_shape(j):
+    """The bound route's compose `shape`, only for an owner row whose route was actually
+    composed (never a compile-shaped preset route) — F-<next> plan §3 C-4.4."""
+    if not _is_owner_mode_row(j):
+        return None
+    backing = getattr(getattr(j, "work_projection", None), "_route_view", None) or {}
+    record = backing.get("record") if isinstance(backing.get("record"), dict) else {}
+    selection = record.get("selection") if isinstance(record.get("selection"), dict) else {}
+    if selection.get("route_origin") != "compose":
+        return None
+    shape = selection.get("shape")
+    return shape if isinstance(shape, str) and shape else None
+
+
 def _mode_axis_conflict(j):
     legacy = getattr(j, "mode", None) or ""
     worker_mode = getattr(j, "worker_mode", None)
@@ -2587,6 +2601,12 @@ def _opts_segs(j, max_width=None):
             _display_capability_mode(j),
             _short_level(getattr(j, "intensity", None)),
         ) if t]
+    # F-<next>: a compose-shaped owner route names its shape as a fourth behaviour knob
+    # (mode·intensity·shape·role, plan §3 C-4.4) — owner rows only, and only when the
+    # bound route was actually composed (never a compile-shaped preset route).
+    shape = None if depth >= 2 else _owner_route_shape(j)
+    if shape:
+        knob_items.append(shape)
     # the worker ROLE is a behaviour knob too (who the worker acts as), not environment —
     # it rides the paren group's last slot (user 2026-07-20: "owner의 위치가 애매").
     role = "" if depth >= 2 else _dispatch_role_suffix(
@@ -2594,6 +2614,11 @@ def _opts_segs(j, max_width=None):
     if role:
         knob_items.append(role)
     knobs = "·".join(knob_items)
+    if (shape and max_width is not None
+            and (len(entry or "") + len(knobs) + 2) > max_width):
+        # K-7: shape is the first thing this dial drops when narrow.
+        knob_items = [t for t in knob_items if t != shape]
+        knobs = "·".join(knob_items)
     # F-78 (user 2026-08-14 "unit, node, profile 등이 좋긴 좋은데 … 전부 다 뜰때 가로로 너무
     # 길어지는데"). Measured at 50-54 cells. Two of those cells' worth of content was not
     # information:
@@ -3758,6 +3783,86 @@ def _peer_link_strip(sent=None, recv=None, tag_by_key=None, term_width=None, dep
         return []
     return [_fit_strip([lambda: build(True, True), lambda: build(True, False),
                         lambda: build(False, False)], term_width)]
+
+
+_ROUTE_CHAIN_MARK = {"done": ("✓", None), "failed": ("✕", "lvl_r"), "unknown": ("?", "lvl_y")}
+
+
+def _route_chain_node_text(node, show_shape):
+    """One node's `label<round> <glyph>[ <shape>]` text + style key (F-<next> plan §3 C-4.1)."""
+    label = node.get("label") or "?"
+    round_n = node.get("round")
+    suffix = "(R%d)" % round_n if isinstance(round_n, int) and round_n >= 2 else ""
+    state = node.get("state")
+    if state == "planned":
+        return label + " ○", "dim"
+    if state == "open":
+        text = label + suffix + " ●"
+        if show_shape and node.get("shape"):
+            text += " " + node["shape"]
+        return text, "g_work"
+    glyph, key = _ROUTE_CHAIN_MARK.get(state, ("?", "lvl_y"))
+    return label + suffix + " " + glyph, key
+
+
+def _route_chain_node_segs(node, show_shape, tag_by_key):
+    """One node's segments, substituting the handoff form when this node was passed
+    to another session (`label◌→[tag]` open, `label✓→[tag]`/`label✕→[tag]` closed, all dim)."""
+    handoff_to = node.get("handoff_to")
+    if handoff_to:
+        tag = (tag_by_key or {}).get((handoff_to.get("harness"), handoff_to.get("session_id")))
+        tag_text = "[" + str(tag) + "]" if tag else ("→" + (handoff_to.get("harness") or "?"))
+        state = node.get("state")
+        arrow = "✓→" if state == "done" else ("✕→" if state == "failed" else "◌→")
+        return [((node.get("label") or "?") + arrow + tag_text, "dim")]
+    text, key = _route_chain_node_text(node, show_shape)
+    return [(text, key)]
+
+
+def _route_chain_strip(chain, tag_by_key=None, term_width=None, depth=0, in_card=False):
+    """The session's route chain, one line (F-<next> plan §3 C-4):
+    `경로 research ✓ › draft ● solo › apply ○`. `chain` is `route_chain.assemble()`'s
+    return shape, or None/invisible for no line."""
+    if not isinstance(chain, dict) or not chain.get("visible"):
+        return []
+    nodes = chain.get("nodes") or []
+    if not nodes:
+        return []
+    indent = _conn_indent(depth, in_card)
+    current = chain.get("current")
+    current_idx = len(nodes) - 1
+    for i, node in enumerate(nodes):
+        if node is current:
+            current_idx = i
+            break
+
+    def build_full(show_shape):
+        segs = [(indent, None), ("경로", "dim"), (" ", None)]
+        for i, node in enumerate(nodes):
+            if i:
+                segs.append((" › ", "dim"))
+            segs += _route_chain_node_segs(node, show_shape and node is current, tag_by_key)
+        return segs
+
+    def build_current_only():
+        segs = ([(indent, None), ("경로", "dim"), (" ", None)]
+                + _route_chain_node_segs(nodes[current_idx], True, tag_by_key))
+        counts = {}
+        for j, node in enumerate(nodes):
+            if j == current_idx:
+                continue
+            counts[node.get("state")] = counts.get(node.get("state"), 0) + 1
+        tail = " ".join(
+            "+%d%s" % (counts[state], glyph)
+            for state, glyph in (("done", "✓"), ("planned", "○"), ("failed", "✕"), ("unknown", "?"))
+            if counts.get(state)
+        )
+        if tail:
+            segs.append((" " + tail, "dim"))
+        return segs
+
+    return [_fit_strip([lambda: build_full(True), lambda: build_full(False),
+                        build_current_only], term_width)]
 
 
 def _steward_target_tags(targets, tag_by_key):
@@ -6359,6 +6464,10 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
             detail = _context_detail_row(s, term_width=term_width, now_key="now_main")
             if detail:
                 lines.extend(detail)
+            # F-<next>: the session's route chain rides right after its own detail row and
+            # before every other connection strip (plan §3 C-4.2).
+            lines.extend(_route_chain_strip(getattr(s, "route_chain", None), tag_by_key,
+                                            term_width=term_width))
             # F-101a: relation strips follow the session detail rows, not the 44-column subtitle.
             _peer_last = getattr(s, "peer_last_recv", None)
             # The session has no full-route detail surface. Route progress belongs

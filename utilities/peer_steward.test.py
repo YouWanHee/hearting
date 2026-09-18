@@ -1676,5 +1676,49 @@ class FromNameBareSubprocessTest(unittest.TestCase):
         self.assertEqual(proc.stdout.strip(), "hearting-codex-c3")
 
 
+class CurrentSessionIdentityDelegationTest(unittest.TestCase):
+    """F-<next> fleet-route-chain-r2 plan §3 B-3: `_current_session_identity` delegates to
+    `dispatch_parent_completion.interactive_parent_identity` first, keeping the prior
+    claude > codex > opencode > AGENT_SESSION_ID fallback for the ambiguous/unset case."""
+
+    _ENV_KEYS = ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID", "CODEX_THREAD_ID",
+                 "CODEX_SESSION_ID", "OPENCODE_SESSION_ID", "AGENT_SESSION_ID",
+                 "AGENT_DISPATCH_CALLER_HARNESS", "AGENT_DISPATCH_CURRENT_HARNESS")
+
+    def _clean_env(self, **overrides):
+        env = {key: None for key in self._ENV_KEYS}
+        env.update(overrides)
+        return mock.patch.dict(os.environ, {k: v for k, v in env.items() if v is not None},
+                               clear=False)
+
+    def setUp(self):
+        for key in self._ENV_KEYS:
+            os.environ.pop(key, None)
+        self.addCleanup(lambda: [os.environ.pop(k, None) for k in self._ENV_KEYS])
+
+    def test_explicit_caller_harness_wins(self):
+        with self._clean_env(CLAUDE_CODE_SESSION_ID="sid-c", CODEX_THREAD_ID="sid-x",
+                             AGENT_DISPATCH_CALLER_HARNESS="codex"):
+            self.assertEqual(peer_steward._current_session_identity(), ("sid-x", "codex"))
+
+    def test_ambiguous_multiple_sessions_falls_back_to_legacy_priority(self):
+        # No explicit caller harness + two sessions set -> interactive_parent_identity()
+        # raises caller-harness-ambiguous; the prior claude-first order still applies.
+        with self._clean_env(CLAUDE_CODE_SESSION_ID="sid-c", CODEX_THREAD_ID="sid-x"):
+            self.assertEqual(peer_steward._current_session_identity(), ("sid-c", "claude"))
+
+    def test_single_session_delegates_cleanly(self):
+        with self._clean_env(CODEX_THREAD_ID="sid-solo"):
+            self.assertEqual(peer_steward._current_session_identity(), ("sid-solo", "codex"))
+
+    def test_agent_session_id_still_falls_back_to_unknown(self):
+        with self._clean_env(AGENT_SESSION_ID="sid-legacy"):
+            self.assertEqual(peer_steward._current_session_identity(), ("sid-legacy", "unknown"))
+
+    def test_nothing_set_returns_empty_unknown(self):
+        with self._clean_env():
+            self.assertEqual(peer_steward._current_session_identity(), ("", "unknown"))
+
+
 if __name__ == "__main__":
     unittest.main()

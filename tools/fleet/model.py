@@ -371,6 +371,8 @@ class Session:
     work_projection: Optional[WorkProjection] = None
     cap_grounding: Optional[dict] = None   # {capability, mode?, intensity?} for an inline entry
                                             # session (capability-grounding marker); None otherwise.
+    route_chain: Optional[dict] = None     # F-<next> assembled session route chain (route_chain.py
+                                            # assemble()'s return shape); None outside its writer harnesses.
     association_ambiguity: Optional[str] = None
     _context_evidence: Optional[ContextEvidence] = field(default=None, repr=False, compare=False)
     _refresh_source: Optional[dict] = field(default=None, repr=False, compare=False)

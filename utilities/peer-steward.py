@@ -58,6 +58,19 @@ _PERMISSION_FLAGS = {
 
 
 def _current_session_identity():
+    """`(session_id, harness)` — delegates to `dispatch_parent_completion
+    .interactive_parent_identity` (the portable first-source-of-truth, F-<next> plan §3 B-3)
+    when it can resolve one unambiguous caller harness; falls back to the prior
+    claude > codex > opencode > AGENT_SESSION_ID priority otherwise (an explicit caller
+    harness env still wins there too, so a genuinely ambiguous or unset environment keeps
+    its exact prior behavior)."""
+    try:
+        from dispatch_parent_completion import interactive_parent_identity
+        harness, sid = interactive_parent_identity()
+        if sid:
+            return sid, harness
+    except Exception:   # caller-harness-ambiguous/invalid -> fall through to legacy order
+        pass
     if os.environ.get("CLAUDE_CODE_SESSION_ID"):
         return os.environ["CLAUDE_CODE_SESSION_ID"], "claude"
     if os.environ.get("CODEX_THREAD_ID"):

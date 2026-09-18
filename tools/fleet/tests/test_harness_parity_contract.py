@@ -29,7 +29,9 @@ _REPO_ROOT = os.path.dirname(_TOOLS_DIR)
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 
-from fleet import model, refresh, session_registry               # noqa: E402
+from unittest import mock                                          # noqa: E402
+
+from fleet import model, refresh, route_chain, session_registry   # noqa: E402
 from fleet.collectors import liveness                             # noqa: E402
 from fleet.collectors import peer_messages                        # noqa: E402
 from fleet.model import Session                                   # noqa: E402
@@ -404,6 +406,71 @@ class RefreshRecoveryContract(unittest.TestCase):
             health = pump.health()
             self.assertEqual(health["state"], "stalled")
             self.assertEqual(health["leaked_workers"], 0)
+
+
+# --------------------------------------------------------------------------
+# Surface ④ — route chain writer coverage (F-<next>, plan §3 C-5)
+# --------------------------------------------------------------------------
+
+class RouteChainWriterParityTest(unittest.TestCase):
+    """`WRITER_SUPPORT` is explicit per harness (U5: OpenCode is `not-implemented`,
+    never skipped); claude/codex share the same env writer and produce the same
+    assembled chain shape from the same fixture."""
+
+    def test_writer_support_matches_the_declared_map(self):
+        self.assertEqual(route_chain.WRITER_SUPPORT,
+                          {"claude": "env", "codex": "env", "opencode": "not-implemented"})
+        for h in HARNESSES:
+            with self.subTest(harness=h):
+                self.assertIn(h, route_chain.WRITER_SUPPORT)
+
+    def _session(self, harness, sid):
+        return Session(harness=harness, pid=1, session_id=sid)
+
+    def test_opencode_session_never_gets_a_chain_even_with_a_ledger(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"FLEET_ROUTE_CHAIN_DIR": tmp}):
+                # OpenCode has no writer (U5) -- there is no legal way to have produced
+                # this file, but even if state existed, enrich() must never read it.
+                oc_dir = os.path.join(tmp, "opencode")
+                os.makedirs(oc_dir, mode=0o700)
+                line = route_chain.build_line(
+                    {"route_id": "rt-1", "route_hash": "h1", "capability": "autopilot-research"},
+                    event="compose", harness="opencode", session_id="oc-1",
+                    route_file="/tmp/r.json",
+                )
+                with open(os.path.join(oc_dir, "oc-1.jsonl"), "w", encoding="utf-8") as fh:
+                    fh.write(json.dumps(line) + "\n")
+                session = self._session("opencode", "oc-1")
+                route_chain.enrich([session])
+                self.assertIsNone(session.route_chain)
+
+    def test_claude_and_codex_produce_the_same_chain_shape_from_the_same_fixture(self):
+        record = {"route_id": "rt-1", "route_hash": "h1", "capability": "autopilot-research",
+                  "capability_mode": "default", "effective_intensity": "standard"}
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"FLEET_ROUTE_CHAIN_DIR": tmp}):
+                chains = {}
+                for harness in ("claude", "codex"):
+                    line = route_chain.build_line(
+                        record, event="compose", harness=harness, session_id="sid-1",
+                        route_file="/tmp/rt-1.json",
+                    )
+                    route_chain.append(harness, "sid-1", line)
+                    session = self._session(harness, "sid-1")
+                    with mock.patch("fleet.route.load", side_effect=lambda *a, **k: record), \
+                         mock.patch("fleet.route.load_outcome",
+                                     side_effect=lambda *a, **k: {"present": False}):
+                        route_chain.enrich([session])
+                    chains[harness] = session.route_chain
+                self.assertEqual(
+                    [n["label"] for n in chains["claude"]["nodes"]],
+                    [n["label"] for n in chains["codex"]["nodes"]],
+                )
+                self.assertEqual(
+                    [n["state"] for n in chains["claude"]["nodes"]],
+                    [n["state"] for n in chains["codex"]["nodes"]],
+                )
 
 
 if __name__ == "__main__":
