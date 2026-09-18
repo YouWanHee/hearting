@@ -1540,7 +1540,7 @@ def _session_stage_segs(entity, working, max_width, tag_by_key=None):
     # route chain (two or more routes, or a declared plan) takes this cell — whole when it
     # fits, else its current node and counts, with the full chain on the `경로` line below.
     chain_cell = _route_chain_cell(getattr(entity, "route_chain", None),
-                                   min(max_width, _SESSION_CELL_MAX), tag_by_key)
+                                   min(max_width, _SESSION_CELL_MAX), tag_by_key, working)
     if chain_cell is not None:
         return chain_cell[0]
     cap = getattr(entity, "cap_grounding", None) or {}
@@ -3826,45 +3826,67 @@ def _peer_link_strip(sent=None, recv=None, tag_by_key=None, term_width=None, dep
                         lambda: build(False, False)], term_width)]
 
 
-_ROUTE_CHAIN_MARK = {"done": ("✓", None), "failed": ("✕", "lvl_r"), "unknown": ("?", "lvl_y")}
+# Past nodes recede (dim); a failure or an unverifiable state keeps its alarm hue.
+_ROUTE_CHAIN_MARK = {"done": ("✓", "dim"), "failed": ("✕", "lvl_r"), "unknown": ("?", "lvl_y")}
 
 
-def _route_chain_node_text(node, show_shape):
-    """One node's `label<round> <glyph>[ <shape>]` text + style key (F-<next> plan §3 C-4.1)."""
-    label = node.get("label") or "?"
+def _route_chain_node_knobs(node, with_knobs):
+    """The node's paren detail: `mode·intensity` (the same knobs as the single-route tag)
+    when `with_knobs`, plus its retry round `R<n>`, which is kept even when the knobs fold."""
+    items = []
+    if with_knobs:
+        mode = node.get("capability_mode")
+        if mode and mode != "default":
+            items.append(str(mode).replace(",", "·"))
+        level = _short_level(node.get("intensity"))
+        if level:
+            items.append(level)
     round_n = node.get("round")
-    suffix = "(R%d)" % round_n if isinstance(round_n, int) and round_n >= 2 else ""
-    state = node.get("state")
-    if state == "planned":
-        return label + " ○", "dim"
-    if state == "open":
-        text = label + suffix + " ●"
-        if show_shape and node.get("shape"):
-            text += " " + node["shape"]
-        return text, "g_work"
-    glyph, key = _ROUTE_CHAIN_MARK.get(state, ("?", "lvl_y"))
-    return label + suffix + " " + glyph, key
+    if isinstance(round_n, int) and not isinstance(round_n, bool) and round_n >= 2:
+        items.append("R%d" % round_n)
+    return "·".join(items)
 
 
-def _route_chain_node_segs(node, show_shape, tag_by_key):
-    """One node's segments, substituting the handoff form when this node was passed
-    to another session (`label◌→[tag]` open, `label✓→[tag]`/`label✕→[tag]` closed, all dim)."""
+def _route_chain_node_segs(node, with_knobs, tag_by_key, is_current=False, working=False):
+    """One node, `label(mode·intensity) glyph` (user 2026-09-18: "세부 (direct, std 등)이 괄호로
+    묶이고 컬러는 lab에만 … code쪽에도 그걸 다 기록해주고"). Only the current node is lit —
+    work hue while the session works, plain otherwise — past nodes and their details are dim,
+    and a planned node is `label ○`. A node handed to another session keeps its dim
+    `label◌→[tag]` form (`✓→`/`✕→` once closed)."""
+    label = node.get("label") or "?"
     handoff_to = node.get("handoff_to")
     if handoff_to:
         tag = (tag_by_key or {}).get((handoff_to.get("harness"), handoff_to.get("session_id")))
         tag_text = "[" + str(tag) + "]" if tag else ("→" + (handoff_to.get("harness") or "?"))
         state = node.get("state")
         arrow = "✓→" if state == "done" else ("✕→" if state == "failed" else "◌→")
-        return [((node.get("label") or "?") + arrow + tag_text, "dim")]
-    text, key = _route_chain_node_text(node, show_shape)
-    return [(text, key)]
+        return [(label + arrow + tag_text, "dim")]
+    state = node.get("state")
+    if state == "planned":
+        return [(label + " ○", "dim")]
+    knobs = _route_chain_node_knobs(node, with_knobs)
+    if is_current:
+        lit = "g_work" if (working and state == "open") else None
+        segs = [(label, lit)]
+        if knobs:
+            segs += [("(", "dim"), (knobs, "dim"), (")", "dim")]
+        if state == "open":
+            return segs + [(" ●", lit)]
+        glyph, key = _ROUTE_CHAIN_MARK.get(state, ("?", "lvl_y"))
+        return segs + [(" " + glyph, key if key != "dim" else lit)]
+    text = label + ("(" + knobs + ")" if knobs else "")
+    if state == "open":
+        return [(text + " ●", "dim")]
+    glyph, key = _ROUTE_CHAIN_MARK.get(state, ("?", "lvl_y"))
+    return [(text, "dim"), (" " + glyph, key)]
 
 
-def _route_chain_bodies(chain, tag_by_key=None):
+def _route_chain_bodies(chain, tag_by_key=None, working=False):
     """Width-ladder bodies of a visible route chain, widest first: `[(segs, full), ...]`.
-    `full` means every node is drawn; the narrower bodies keep only the current node plus
-    `+N✓ +M○` counts. `chain` is `route_chain.assemble()`'s return shape; an invisible or
-    empty chain has no bodies."""
+    `full` means every node is drawn: every node with its details, then only the current
+    node's, then none. The narrower bodies keep only the current node plus `+N✓ +M○`
+    counts. `chain` is `route_chain.assemble()`'s return shape; an invisible or empty chain
+    has no bodies."""
     if not isinstance(chain, dict) or not chain.get("visible"):
         return []
     nodes = chain.get("nodes") or []
@@ -3877,16 +3899,19 @@ def _route_chain_bodies(chain, tag_by_key=None):
             current_idx = i
             break
 
-    def full(show_shape):
+    def full(past_knobs, current_knobs):
         segs = []
         for i, node in enumerate(nodes):
             if i:
                 segs.append((" › ", "dim"))
-            segs += _route_chain_node_segs(node, show_shape and node is current, tag_by_key)
+            is_current = i == current_idx
+            segs += _route_chain_node_segs(node, current_knobs if is_current else past_knobs,
+                                           tag_by_key, is_current=is_current, working=working)
         return segs
 
-    def current_only(show_shape):
-        segs = _route_chain_node_segs(nodes[current_idx], show_shape, tag_by_key)
+    def current_only(with_knobs):
+        segs = _route_chain_node_segs(nodes[current_idx], with_knobs, tag_by_key,
+                                      is_current=True, working=working)
         counts = {}
         for j, node in enumerate(nodes):
             if j == current_idx:
@@ -3901,16 +3926,16 @@ def _route_chain_bodies(chain, tag_by_key=None):
             segs.append((" " + tail, "dim"))
         return segs
 
-    return [(full(True), True), (full(False), True),
+    return [(full(True, True), True), (full(False, True), True), (full(False, False), True),
             (current_only(True), False), (current_only(False), False)]
 
 
-def _route_chain_cell(chain, max_width, tag_by_key=None):
+def _route_chain_cell(chain, max_width, tag_by_key=None, working=False):
     """`(segs, full)` for a session's stage cell, or None when the chain is not visible.
     The first ladder body that fits `max_width` wins; when none fits, the narrowest one is
     clipped. The caller that decides whether the separate `경로` line is still needed asks
     this same function with the same budget, so the cell and the line never disagree."""
-    bodies = _route_chain_bodies(chain, tag_by_key)
+    bodies = _route_chain_bodies(chain, tag_by_key, working)
     if not bodies:
         return None
     for segs, is_full in bodies:
@@ -3920,16 +3945,17 @@ def _route_chain_cell(chain, max_width, tag_by_key=None):
     return _clip_segs(segs, max_width)[0], False
 
 
-def _route_chain_strip(chain, tag_by_key=None, term_width=None, depth=0, in_card=False):
+def _route_chain_strip(chain, tag_by_key=None, term_width=None, depth=0, in_card=False,
+                       working=False):
     """The session's route chain as its own line, `경로 research ✓ › draft ● solo › apply ○`.
     Since 2026-09-18 the chain lives in the session's stage cell whenever it fits there
     whole; this line is the overflow surface for a chain the cell had to shorten, and for
     a session whose cell is suppressed by an owner card (D3)."""
-    bodies = _route_chain_bodies(chain, tag_by_key)
+    bodies = _route_chain_bodies(chain, tag_by_key, working)
     if not bodies:
         return []
     lead = [(_conn_indent(depth, in_card), None), ("경로", "dim"), (" ", None)]
-    return [_fit_strip([lambda body=body: lead + body for body, _full in bodies[:3]],
+    return [_fit_strip([lambda body=body: lead + body for body, _full in bodies[:4]],
                        term_width)]
 
 
@@ -6540,10 +6566,12 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
             _chain = getattr(s, "route_chain", None)
             _cell_budget = (_narrow_session_cell_budget(term_width) if _srow
                             else _wide_session_cell_budget(wide_route_zone))
+            _working = s.liveness == "working"
             _cell = (None if suppress_session_stage
-                     else _route_chain_cell(_chain, _cell_budget, tag_by_key))
+                     else _route_chain_cell(_chain, _cell_budget, tag_by_key, _working))
             if not (_cell and _cell[1]):
-                lines.extend(_route_chain_strip(_chain, tag_by_key, term_width=term_width))
+                lines.extend(_route_chain_strip(_chain, tag_by_key, term_width=term_width,
+                                                working=_working))
             # F-101a: relation strips follow the session detail rows, not the 44-column subtitle.
             _peer_last = getattr(s, "peer_last_recv", None)
             # The session has no full-route detail surface. Route progress belongs
