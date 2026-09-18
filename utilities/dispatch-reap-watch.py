@@ -274,7 +274,21 @@ def watch(args: argparse.Namespace) -> int:
     # additionally defers the close while an exact live parent conductor
     # still owns delivery of `capability-route.py complete` for this row.
     record = attempt_record(args.jobs, args.attempt_id)
-    if record is None or record[0][1] not in {"open", "running"}:
+    if record is None:
+        return 0
+    if record[0][1] not in {"open", "running"}:
+        # The row was closed while the governed process was still alive --
+        # a depth-1 owner's supervisor closes its own row (`completed-
+        # supervisor`) and calls the runtime settlement from inside that
+        # live process, so `attempt_process_quiescence` answers `live`, the
+        # settlement defers as `child-not-quiescent`, and no pending-delivery
+        # record exists. Nothing else retried it: an idle depth-0 session
+        # never woke for a finished owner (2026-09-17, att-08c8cb74 /
+        # att-31dd6f00, route and cycle left open overnight). The drain above
+        # is the first moment the process is provably gone, so retry the
+        # idempotent, never-raising settlement exactly here.
+        if record[0][1] == "done":
+            materialize_after_terminal_close(args.jobs, args.attempt_id)
         return 0
     if terminal_envelope_observed(record[1].get("log_file")):
         # Detached registered workers cannot write their own marker after
