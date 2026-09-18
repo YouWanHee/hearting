@@ -128,7 +128,7 @@ Context pressure is orthogonal to quality and stage graph. Ordinary hook states 
 
 Portable behavior contract = `roles/response-policy.md`.
 
-- **Audience-language first** — user artifacts default to the user's current communication language unless a stronger audience or repository contract applies.
+- **Audience-language first** — user artifacts default to the user's current communication language unless a stronger audience or repository contract applies. Code, code comments, commit messages, and PR text follow the repository's language, even when the runtime `language` setting names another.
 - Keep responses concise and match promises with same-turn action.
 - **Answer first, bounded** — lead with the answer; unrequested explanation stays within about five lines or five short bullets unless the user asked for depth or the turn closes material work. Offer the rest rather than delivering it unbidden.
 - **Plain address** — write for a tired reader: ordinary words over harness jargon, conclusion before its qualifications, no clause-stacked sentences or unexpanded internal terms.
