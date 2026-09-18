@@ -484,6 +484,10 @@ For producer-backed work, the controller's transaction is **terminal proof →
 route close → exact cycle seal → workflow COMPLETE**. Inline and legacy recovery
 use complete, close and finalize in that order. Shared admission applies only to
 shared kinds after sealing; it is never a prerequisite for the terminal marker.
+A cycle sealed while its route is open (`finalize --allow-open-route`) stays
+`active` in its manifest; a later close, proven or not, leaves it there, and
+campaign closure lists it as `sealed-unproven` with the route's recorded proof
+state.
 
 `close` writes an outcome sidecar beside the immutable route record — the record
 itself cannot carry the closure, because `route_hash` covers every other field.
