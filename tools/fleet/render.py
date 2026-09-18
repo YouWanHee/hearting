@@ -1124,6 +1124,30 @@ def _route_zone_width(term_width, name_width=None):
     return _ROUTE_STAGE_ZONE_MAX + max(0, int(term_width) - 168 - name_growth)
 
 
+# User 2026-09-18 ("최대 30칸을 좀 더 늘려 40칸 정도로"): a main session's stage cell holds its
+# whole route chain (`code ✓ › lab ● direct`) up to this many cells before it shortens to the
+# current node and the separate `경로` line takes over.
+_SESSION_CELL_MAX = 40
+# The narrow/stack card's L2 before its stage cell: 4-cell inset, the elapsed cell under the
+# harness column (_HW), the model cell (_MW), and the 2-cell gap — `_session_row_2line` builds
+# exactly this prefix, pinned by test.
+_NARROW_L2_STAGE_COL = 4 + 16 + 23 + 2
+
+
+def _wide_session_cell_budget(stage_zone):
+    """The route-chain budget of a WIDE session row's stage cell."""
+    return min(_SESSION_CELL_MAX, stage_zone or _STAGE_ZONE_MAX)
+
+
+def _narrow_session_cell_budget(term_width):
+    """The stage-cell budget of a narrow/stack session card: the historical 28 cells as a
+    floor (a stack card never showed less), growing into what L2 has left after its prefix
+    and the tinted row's six edge cells, capped like the wide cell."""
+    if not term_width:
+        return 28
+    return max(28, min(_SESSION_CELL_MAX, int(term_width) - 6 - _NARROW_L2_STAGE_COL))
+
+
 def _drop_past_stages(items, cur_i, max_width):
     """SD-F2 (prd.md:164) — a breadcrumb's information value is "where now", not "where
     I've been": fold PAST stages (i < cur_i) first, earliest first, so the active stage (and
@@ -1504,7 +1528,7 @@ def _spec_phase_seq(entity):
     return [(str(a), str(b)) for a, b in seq]
 
 
-def _session_stage_segs(entity, working, max_width):
+def _session_stage_segs(entity, working, max_width, tag_by_key=None):
     """Stage-zone segments for a session row. A spec-grounding projection renders a lit phase
     breadcrumb in the EXACT dispatch-row syntax (user 2026-07-24 "code에 맞춰서 소괄호에 넣는
     걸로"): ``spec(mode·intensity) : spec✓ › dev●`` — entry ``spec`` in the dim name_dim hue, the
@@ -1512,6 +1536,13 @@ def _session_stage_segs(entity, working, max_width):
     a dim paren group joined by ``·`` exactly as ``_opts_segs`` does, then the dim ` : `
     breadcrumb lead-in (``_stage_zone_segs``). Deferred / n·a phases are dropped (not part of this
     project's flow; also avoids a skip glyph absent from many fonts). Otherwise the flat label."""
+    # User 2026-09-18 ("그걸 그냥 옆쪽에 - 있던 자리에 바로 하는건 별로인가?"): a visible
+    # route chain (two or more routes, or a declared plan) takes this cell — whole when it
+    # fits, else its current node and counts, with the full chain on the `경로` line below.
+    chain_cell = _route_chain_cell(getattr(entity, "route_chain", None),
+                                   min(max_width, _SESSION_CELL_MAX), tag_by_key)
+    if chain_cell is not None:
+        return chain_cell[0]
     cap = getattr(entity, "cap_grounding", None) or {}
     cap_intensity = _short_level(cap.get("intensity"))
     seq = _spec_phase_seq(entity)
@@ -1856,7 +1887,7 @@ def _session_tag_chip(s, dim=False):
 
 
 def _session_row(s, narrow, is_parent=False, child_count=0, name_width=None,
-                 show_projection_stage=True, stage_zone=None):
+                 show_projection_stage=True, stage_zone=None, tag_by_key=None):
     live = s.liveness
     slug = s.slug or (s.cwd.rsplit("/", 1)[-1] if s.cwd else "?")
     dim_tel = live in ("stale", "dead") or s.app_server or s.detached
@@ -1964,7 +1995,8 @@ def _session_row(s, narrow, is_parent=False, child_count=0, name_width=None,
         # truncated to `…` even on a wide terminal with a mostly-empty zone (user "stage 폭 엄청
         # 길잖아 근데 왜 금방 … 표시로 줄이는지"). Use the same terminal-aware budget the conductor
         # breadcrumb got, so a spec phase breadcrumb / long label fills the real space first.
-        segs += _session_stage_segs(s, live == "working", stage_zone or _STAGE_ZONE_MAX)
+        segs += _session_stage_segs(s, live == "working", stage_zone or _STAGE_ZONE_MAX,
+                                    tag_by_key)
     else:
         segs.append(("-", "dim"))
     if dead_stale:
@@ -2915,7 +2947,7 @@ def _dispatch_row(j, orphan=False, parent_model=None, parent_harness=None, is_la
 # bracket gauge · cost · ⏱). model keeps its fixed width so gauges align vertically across cards
 # (the nvtop column feel). Same segment parts as the 1-line rows — zero new color keys.
 def _session_row_2line(s, is_parent=False, child_count=0, _split=False, term_width=None,
-                       show_projection_stage=True):
+                       show_projection_stage=True, tag_by_key=None):
     live = s.liveness
     slug = s.slug or (s.cwd.rsplit("/", 1)[-1] if s.cwd else "?")
     dim_tel = live in ("stale", "dead") or s.app_server or s.detached
@@ -2986,10 +3018,14 @@ def _session_row_2line(s, is_parent=False, child_count=0, _split=False, term_wid
     # indent / no far-right flush).
     l2 = [("    ", None), (_pad(fmt_min(s.elapsed_min), _HW), "dim")]
     l2 += _model_cell(s.model, s.effort, _MW, dim=dim_tel)
-    projection_stage = (_projection_stage_text(s, max_width=28)
-                        if show_projection_stage else "")
-    l2 += [("  ", None), (projection_stage or "-",
-                           "g_work" if projection_stage and live == "working" else "dim")]
+    # Same cell as the wide row (capability tag, route chain, spec breadcrumb): this card
+    # used to call the bare projection text and showed `-` for inline work the wide row named.
+    l2 += [("  ", None)]
+    if show_projection_stage:
+        l2 += _session_stage_segs(s, live == "working",
+                                  _narrow_session_cell_budget(term_width), tag_by_key)
+    else:
+        l2 += [("-", "dim")]
     # v16: context is emitted by _context_detail_row beneath the complete card.
     if _split:
         return l1, l2, br_segs
@@ -3007,11 +3043,11 @@ def _stack_split(l2):
 
 
 def _session_row_stack(s, is_parent=False, child_count=0, term_width=None,
-                       show_projection_stage=True):
+                       show_projection_stage=True, tag_by_key=None):
     """v16 ultra-narrow card: identity and telemetry, with detail row emitted separately."""
     l1, l2 = _session_row_2line(
         s, is_parent, child_count, term_width=term_width,
-        show_projection_stage=show_projection_stage)
+        show_projection_stage=show_projection_stage, tag_by_key=tag_by_key)
     return [l1, l2]
 
 
@@ -3824,16 +3860,16 @@ def _route_chain_node_segs(node, show_shape, tag_by_key):
     return [(text, key)]
 
 
-def _route_chain_strip(chain, tag_by_key=None, term_width=None, depth=0, in_card=False):
-    """The session's route chain, one line (F-<next> plan §3 C-4):
-    `경로 research ✓ › draft ● solo › apply ○`. `chain` is `route_chain.assemble()`'s
-    return shape, or None/invisible for no line."""
+def _route_chain_bodies(chain, tag_by_key=None):
+    """Width-ladder bodies of a visible route chain, widest first: `[(segs, full), ...]`.
+    `full` means every node is drawn; the narrower bodies keep only the current node plus
+    `+N✓ +M○` counts. `chain` is `route_chain.assemble()`'s return shape; an invisible or
+    empty chain has no bodies."""
     if not isinstance(chain, dict) or not chain.get("visible"):
         return []
     nodes = chain.get("nodes") or []
     if not nodes:
         return []
-    indent = _conn_indent(depth, in_card)
     current = chain.get("current")
     current_idx = len(nodes) - 1
     for i, node in enumerate(nodes):
@@ -3841,17 +3877,16 @@ def _route_chain_strip(chain, tag_by_key=None, term_width=None, depth=0, in_card
             current_idx = i
             break
 
-    def build_full(show_shape):
-        segs = [(indent, None), ("경로", "dim"), (" ", None)]
+    def full(show_shape):
+        segs = []
         for i, node in enumerate(nodes):
             if i:
                 segs.append((" › ", "dim"))
             segs += _route_chain_node_segs(node, show_shape and node is current, tag_by_key)
         return segs
 
-    def build_current_only():
-        segs = ([(indent, None), ("경로", "dim"), (" ", None)]
-                + _route_chain_node_segs(nodes[current_idx], True, tag_by_key))
+    def current_only(show_shape):
+        segs = _route_chain_node_segs(nodes[current_idx], show_shape, tag_by_key)
         counts = {}
         for j, node in enumerate(nodes):
             if j == current_idx:
@@ -3866,8 +3901,36 @@ def _route_chain_strip(chain, tag_by_key=None, term_width=None, depth=0, in_card
             segs.append((" " + tail, "dim"))
         return segs
 
-    return [_fit_strip([lambda: build_full(True), lambda: build_full(False),
-                        build_current_only], term_width)]
+    return [(full(True), True), (full(False), True),
+            (current_only(True), False), (current_only(False), False)]
+
+
+def _route_chain_cell(chain, max_width, tag_by_key=None):
+    """`(segs, full)` for a session's stage cell, or None when the chain is not visible.
+    The first ladder body that fits `max_width` wins; when none fits, the narrowest one is
+    clipped. The caller that decides whether the separate `경로` line is still needed asks
+    this same function with the same budget, so the cell and the line never disagree."""
+    bodies = _route_chain_bodies(chain, tag_by_key)
+    if not bodies:
+        return None
+    for segs, is_full in bodies:
+        if sum(_dw(text) for text, _key in segs) <= max_width:
+            return segs, is_full
+    segs, _full = bodies[-1]
+    return _clip_segs(segs, max_width)[0], False
+
+
+def _route_chain_strip(chain, tag_by_key=None, term_width=None, depth=0, in_card=False):
+    """The session's route chain as its own line, `경로 research ✓ › draft ● solo › apply ○`.
+    Since 2026-09-18 the chain lives in the session's stage cell whenever it fits there
+    whole; this line is the overflow surface for a chain the cell had to shorten, and for
+    a session whose cell is suppressed by an owner card (D3)."""
+    bodies = _route_chain_bodies(chain, tag_by_key)
+    if not bodies:
+        return []
+    lead = [(_conn_indent(depth, in_card), None), ("경로", "dim"), (" ", None)]
+    return [_fit_strip([lambda body=body: lead + body for body, _full in bodies[:3]],
+                       term_width)]
 
 
 def _steward_target_tags(targets, tag_by_key):
@@ -6455,13 +6518,15 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
             if _srow:
                 lines.extend(_srow(s, is_parent=bool(nested_n), child_count=nested_n,
                                    term_width=term_width,
-                                   show_projection_stage=not suppress_session_stage))
+                                   show_projection_stage=not suppress_session_stage,
+                                   tag_by_key=tag_by_key))
             else:
                 lines.append(_session_row(s, narrow, is_parent=bool(nested_n),
                                           child_count=nested_n,
                                           name_width=wide_name_width,
                                           show_projection_stage=not suppress_session_stage,
-                                          stage_zone=wide_route_zone))
+                                          stage_zone=wide_route_zone,
+                                          tag_by_key=tag_by_key))
             if not (s.liveness in ("stale", "dead") or s.app_server or s.detached):
                 _sess_bold_ids.update(range(_n0, len(lines)))
             # F-69: main-session rows get the brighter, bold NOW sentence; dispatch
@@ -6469,10 +6534,16 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
             detail = _context_detail_row(s, term_width=term_width, now_key="now_main")
             if detail:
                 lines.extend(detail)
-            # F-<next>: the session's route chain rides right after its own detail row and
-            # before every other connection strip (plan §3 C-4.2).
-            lines.extend(_route_chain_strip(getattr(s, "route_chain", None), tag_by_key,
-                                            term_width=term_width))
+            # F-103: the route chain rides in the session's stage cell when it fits there
+            # whole (same budget the row used); otherwise — or when an owner card suppressed
+            # the cell (D3) — its own line follows the detail row, before every other strip.
+            _chain = getattr(s, "route_chain", None)
+            _cell_budget = (_narrow_session_cell_budget(term_width) if _srow
+                            else _wide_session_cell_budget(wide_route_zone))
+            _cell = (None if suppress_session_stage
+                     else _route_chain_cell(_chain, _cell_budget, tag_by_key))
+            if not (_cell and _cell[1]):
+                lines.extend(_route_chain_strip(_chain, tag_by_key, term_width=term_width))
             # F-101a: relation strips follow the session detail rows, not the 44-column subtitle.
             _peer_last = getattr(s, "peer_last_recv", None)
             # The session has no full-route detail surface. Route progress belongs
