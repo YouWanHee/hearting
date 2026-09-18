@@ -171,5 +171,88 @@ class JsonAdditiveTest(unittest.TestCase):
         json.dumps(payload)   # additive field must stay JSON-serializable
 
 
+
+def _board(sessions, layout="wide", term_width=168, jobs=()):
+    return ["" if ln is None else _text(ln)
+            for ln in render._build_lines(sessions, list(jobs), "both", False, 0,
+                                          layout=layout, term_width=term_width)]
+
+
+def _session_row_text(rows):
+    """The session's own row: its harness cell, not the usage header or an owner card."""
+    return next(t for t in rows if "claude code" in t and "usage" not in t and "╭" not in t)
+
+
+def _chain_session(nodes, current, sid="sid-chain", plan=()):
+    session = Session(harness="claude", pid=11, cwd="/x/chain", slug="chain", session_id=sid,
+                      liveness="working", elapsed_min=5)
+    session.route_chain = {"v": 1, "key": "k1", "visible": True, "plan": list(plan),
+                           "plan_source": "explicit" if plan else None,
+                           "nodes": nodes, "current": current}
+    return session
+
+
+class ChainInStageCellTest(unittest.TestCase):
+    """User 2026-09-18: the chain takes the session's stage cell (the old `-` slot), up to
+    40 cells; the separate `경로` line is only the overflow surface."""
+
+    def test_short_chain_fills_the_cell_and_drops_the_line(self):
+        nodes = [_node("code", "done"), _node("lab", "open", shape="direct")]
+        rows = _board([_chain_session(nodes, nodes[1])])
+        row = _session_row_text(rows)
+        self.assertIn("code ✓ › lab ● direct", row)
+        self.assertFalse(any("경로 " in t for t in rows))
+
+    def test_chain_over_forty_cells_keeps_current_in_cell_and_full_line_below(self):
+        nodes = [_node("research", "done"), _node("draft", "done"), _node("refine", "done"),
+                 _node("apply", "open", shape="staged"), _node("code", "planned")]
+        rows = _board([_chain_session(nodes, nodes[3], plan=("research", "draft", "refine",
+                                                             "apply", "code"))])
+        row = _session_row_text(rows)
+        self.assertIn("apply ● staged +3✓ +1○", row)
+        line = [t for t in rows if "경로 " in t]
+        self.assertEqual(len(line), 1)
+        self.assertIn("research ✓ › draft ✓ › refine ✓ › apply ● staged › code ○", line[0])
+
+    def test_cell_budget_caps_at_forty(self):
+        self.assertEqual(render._SESSION_CELL_MAX, 40)
+        self.assertEqual(render._wide_session_cell_budget(200), 40)
+        self.assertEqual(render._narrow_session_cell_budget(400), 40)
+        self.assertEqual(render._narrow_session_cell_budget(60), 28)   # historical floor
+
+    def test_owner_card_suppressed_cell_keeps_the_line(self):
+        nodes = [_node("code", "done"), _node("lab", "open", shape="solo")]
+        session = _chain_session(nodes, nodes[1], sid="sid-owner-parent")
+        owner = DispatchJob(key="autopilot-lab", slug="lab-owner", worker_type="owner",
+                            depth=1, liveness="working", parent_sid="sid-owner-parent",
+                            is_child=True, cwd="/x/chain", harness="claude", elapsed_min=1)
+        rows = _board([session], jobs=[owner])
+        self.assertTrue(any("lab-owner" in t for t in rows))          # the owner card renders
+        row = _session_row_text(rows)
+        self.assertNotIn("code ✓", row)                                # D3 blanks the cell
+        self.assertTrue(any("경로 code ✓ › lab ● solo" in t for t in rows))
+
+    def test_narrow_card_shows_the_capability_tag_not_a_dash(self):
+        session = Session(harness="claude", pid=12, cwd="/x/narrow", slug="narrow",
+                          session_id="sid-narrow", liveness="working", elapsed_min=5)
+        session.cap_grounding = {"capability": "autopilot-lab", "mode": "setup",
+                                 "intensity": "direct"}
+        l1, l2 = render._session_row_2line(session, term_width=100)
+        self.assertIn("lab(setup·direct)", _text(l2))
+
+    def test_narrow_card_prefix_width_matches_the_budget_constant(self):
+        session = Session(harness="claude", pid=13, cwd="/x/narrow", slug="narrow",
+                          session_id="sid-narrow2", liveness="working", elapsed_min=5,
+                          model="claude-opus-5", effort="xhigh")
+        session.cap_grounding = {"capability": "autopilot-code"}
+        _l1, l2 = render._session_row_2line(session, term_width=100)
+        prefix = 0
+        for text, _key in l2:
+            if text == "code":
+                break
+            prefix += render._dw(text)
+        self.assertEqual(prefix, render._NARROW_L2_STAGE_COL)
+
+
 if __name__ == "__main__":
     unittest.main()
