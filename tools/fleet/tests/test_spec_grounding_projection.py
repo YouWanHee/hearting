@@ -11,6 +11,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
@@ -545,6 +546,24 @@ class CapabilityGroundingTest(unittest.TestCase):
             s = _session(sid="sid-old", cwd="/x", elapsed_min=1)
             self.assertIsNone(projection._capability_grounding_for(
                 s, projection._capability_grounding_index(tmp), now=NOW))
+
+    def test_new_location_marker_wins_over_legacy_release_marker(self):
+        # F-<next> fleet-route-chain-r2: the writer moved to a state-root location outside
+        # AGENT_HOME; the projection must prefer that new marker for a sid present in both.
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as new_dir:
+            self._write(tmp, "sid-both", "capability=autopilot-code\nmode=debug\nintensity=direct\n")
+            with open(os.path.join(new_dir, "sid-both"), "w", encoding="utf-8") as handle:
+                handle.write("capability=autopilot-refine\nmode=dev\nintensity=standard\n")
+            with mock.patch.dict(os.environ, {"FLEET_CAPABILITY_GROUNDING_DIR": new_dir}):
+                index = projection._capability_grounding_index(tmp)
+            self.assertEqual(index["sid-both"][1]["capability"], "autopilot-refine")
+
+    def test_legacy_release_marker_still_read_as_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as new_dir:
+            self._write(tmp, "sid-legacy-only", "capability=autopilot-code\nmode=dev\nintensity=standard\n")
+            with mock.patch.dict(os.environ, {"FLEET_CAPABILITY_GROUNDING_DIR": new_dir}):
+                index = projection._capability_grounding_index(tmp)
+            self.assertEqual(index["sid-legacy-only"][1]["capability"], "autopilot-code")
 
 
 if __name__ == "__main__":

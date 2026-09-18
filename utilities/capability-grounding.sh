@@ -7,13 +7,17 @@
 #   capability-grounding.sh record --sid <id> --capability <name> \
 #       [--mode <m>] [--intensity <i>] [--agent-home <dir>] [--cwd <dir>]
 #
-# Writes `<agent-home>/.capability-grounding/<sid>` with KV lines. Overwrites on each call, so the
+# Writes `${FLEET_CAPABILITY_GROUNDING_DIR:-${XDG_STATE_HOME:-~/.local/state}/agent-fleet
+# /capability-grounding}/<sid>` with KV lines. The release tree is immutable — this writer moved
+# out of it (F-<next> fleet-route-chain-r2); it no longer depends on `AGENT_HOME`, and does not lean
+# on the runtime's build/ignore lists (`runtime_activation._IGNORE_NAMES`, build-release exclude)
+# to keep a release clean. `--agent-home` is accepted for caller compatibility and discarded. A
+# release built before this change still holds `<agent-home>/.capability-grounding/`; Fleet reads
+# that old location as a fallback only (tools/fleet/projection.py). Overwrites on each call, so the
 # freshest entry-skill invocation wins (the session's CURRENT capability). Fleet reads the file's
 # mtime for freshness (same sid-reuse rule as the spec marker) and the KV body for the tag.
 
 set -eu
-
-AGENT_HOME="${AGENT_HOME:-${CLAUDE_HOME:-}}"
 
 # The fixed, capability-agnostic intensity vocabulary (CONVENTIONS §1.1). A mode is
 # capability-specific, so the caller passes it explicitly; only the value is validated as
@@ -34,13 +38,12 @@ record() {
       --mode) mode=${2:-}; shift 2 ;;
       --intensity) intensity=${2:-}; shift 2 ;;
       --cwd) cwd=${2:-}; shift 2 ;;
-      --agent-home) AGENT_HOME=${2:-}; shift 2 ;;
+      --agent-home) shift 2 ;;   # accepted for compat, discarded — write location is fixed below
       *) echo "capability-grounding: unknown argument: $1" >&2; return 64 ;;
     esac
   done
   [ -n "$sid" ] || { echo "capability-grounding: --sid is required" >&2; return 64; }
   [ -n "$cap" ] || { echo "capability-grounding: --capability is required" >&2; return 64; }
-  [ -n "$AGENT_HOME" ] || return 0
   # Only the entry-capability set is grounded; a sub-skill or tool call is not a session identity.
   case "$cap" in
     autopilot-apply|autopilot-code|autopilot-design|autopilot-draft|autopilot-lab|autopilot-refine|autopilot-research|autopilot-ship|autopilot-spec) ;;
@@ -48,8 +51,8 @@ record() {
   esac
   valid_intensity "$intensity" || intensity=""
 
-  dir="$AGENT_HOME/.capability-grounding"
-  mkdir -p "$dir" 2>/dev/null || return 0
+  dir="${FLEET_CAPABILITY_GROUNDING_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/agent-fleet/capability-grounding}"
+  (umask 077 && mkdir -p "$dir") 2>/dev/null || return 0
   tmp="$dir/.$sid.tmp.$$"
   {
     printf 'capability=%s\n' "$cap"

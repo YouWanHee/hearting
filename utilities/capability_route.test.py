@@ -5941,4 +5941,223 @@ class FrameBootstrapLayerTest(unittest.TestCase):
   R.verify_route(route,R.ROOT)
 
 
+class RouteChainWriterTest(ComposeRouteTest):
+ """F-<next> fleet-route-chain-r2 plan §3 B-4 — `_record_route_chain`/`_route_chain_identity`/
+ `_resolve_compose_plan` writer surface. `TestRoute.setUp` already isolates AGENT_HOME and
+ XDG_STATE_HOME per test; this class additionally pins `FLEET_ROUTE_CHAIN_DIR` and clears
+ `AGENT_DISPATCH_DEPTH` so every test starts from an explicit, known identity axis."""
+ def setUp(self):
+  super().setUp()
+  self._rc_tmp=tempfile.TemporaryDirectory()
+  self.addCleanup(self._rc_tmp.cleanup)
+  self._rc_patch=mock.patch.dict(os.environ,{"FLEET_ROUTE_CHAIN_DIR":self._rc_tmp.name})
+  self._rc_patch.start()
+  self.addCleanup(self._rc_patch.stop)
+  # This suite's OWN process is itself a live dispatch worker (real
+  # AGENT_DISPATCH_CALLER_HARNESS/CURRENT_HARNESS=claude in the ambient environment,
+  # measured 2026-09-18) -- identity-sensitive tests must not inherit that leak.
+  self._identity_guard={key:os.environ.get(key) for key in (
+   "AGENT_DISPATCH_DEPTH","AGENT_DISPATCH_CALLER_HARNESS","AGENT_DISPATCH_CURRENT_HARNESS",
+   "AGENT_DISPATCH_PARENT_SESSION_ID","CLAUDE_CODE_SESSION_ID","CLAUDE_SESSION_ID",
+   "CODEX_THREAD_ID","CODEX_SESSION_ID","OPENCODE_SESSION_ID",
+  )}
+  for key in self._identity_guard: os.environ.pop(key,None)
+  self.addCleanup(self._restore_identity_guard)
+  import importlib
+  sys.path.insert(0,str(P.parent.parent/"tools"))
+  from fleet import route_chain as RC
+  self.RC=RC
+  self.addCleanup(RC.clear_cache if hasattr(RC,"clear_cache") else (lambda:None))
+ def _restore_identity_guard(self):
+  for key,value in self._identity_guard.items():
+   if value is None: os.environ.pop(key,None)
+   else: os.environ[key]=value
+ def _emit(self,route,artifact_root,**kw):
+  import types
+  ns=types.SimpleNamespace(command="compose",start=False,full_record=False,
+                           _route_chain_plan=kw.pop("_route_chain_plan",(None,None)),**kw)
+  out=io.StringIO(); err=io.StringIO()
+  # _emit_compiled_route's runtime-root check needs AGENT_HOME to name THIS checkout
+  # (routes here are composed with cwd=R.ROOT) -- same override the existing
+  # ComposeRouteTest compose-start/receipt tests already use.
+  with mock.patch.dict(os.environ,{"AGENT_HOME":str(R.ROOT)}), \
+       contextlib.redirect_stdout(out),contextlib.redirect_stderr(err):
+   R._emit_compiled_route(ns,route,artifact_root)
+  return err.getvalue()
+ def test_compose_appends_one_line_for_calling_session(self):
+  with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+    os.environ,{"CLAUDE_CODE_SESSION_ID":"sid-caller","AGENT_DISPATCH_ATTEMPT_ID":"",
+               "AGENT_HOME":str(R.ROOT)}):
+   route=self.compose(artifact_root=tmp)
+   err=self._emit(route,tmp)
+   self.assertIn("route_chain_written=1 harness=claude",err)
+   lines=self.RC.read_tail("claude","sid-caller")
+   self.assertEqual(len(lines),1)
+   self.assertEqual(lines[0]["route_id"],route["route_id"])
+   self.assertEqual(lines[0]["event"],"compose")
+   self.assertNotIn("work_request",lines[0])
+ def test_route_bytes_and_hash_unchanged_by_plan(self):
+  with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+    os.environ,{"CLAUDE_CODE_SESSION_ID":"sid-hash","AGENT_DISPATCH_ATTEMPT_ID":"",
+               "AGENT_HOME":str(R.ROOT)}):
+   plain=self.compose(artifact_root=tmp,slug="plan-hash-a")
+   planned=self.compose(artifact_root=tmp,slug="plan-hash-b")
+   self.assertNotIn("plan",plain); self.assertNotIn("plan",planned)
+   self._emit(plain,tmp,_route_chain_plan=(None,None))
+   self._emit(planned,tmp,_route_chain_plan=(["research","draft"],"explicit"))
+   lines=self.RC.read_tail("claude","sid-hash")
+   self.assertIsNone(lines[0].get("plan"))
+   self.assertEqual(lines[1].get("plan"),["research","draft"])
+ def test_writer_failure_never_fails_compose(self):
+  with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+    os.environ,{"CLAUDE_CODE_SESSION_ID":"sid-boom","AGENT_DISPATCH_ATTEMPT_ID":"",
+               "AGENT_HOME":str(R.ROOT)}):
+   route=self.compose(artifact_root=tmp)
+   with mock.patch.object(self.RC,"append",side_effect=RuntimeError("boom")):
+    path=R._emit_compiled_route(
+      __import__("types").SimpleNamespace(command="compose",start=False,full_record=False),
+      route,tmp)
+   self.assertEqual(json.loads(path.read_text()),route)
+ def test_depth2_worker_never_writes(self):
+  # A real depth-2 worker always carries the full typed identity tuple (see
+  # the child_env fixtures above, e.g. AGENT_DISPATCH_WORKER_TYPE="stage");
+  # setting only DEPTH+ATTEMPT_ID here left _registered_owner_attempt's
+  # env validation seeing an incomplete tuple and raising instead of taking
+  # its early non-owner return -- match the real shape.
+  with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+    os.environ,{"CLAUDE_CODE_SESSION_ID":"sid-d2","AGENT_DISPATCH_DEPTH":"2",
+               "AGENT_DISPATCH_WORKER_TYPE":"stage",
+               "AGENT_DISPATCH_ATTEMPT_ID":"att-worker","AGENT_HOME":str(R.ROOT)}):
+   route=self.compose(artifact_root=tmp)
+   err=self._emit(route,tmp)
+   self.assertIn("route_chain_written=0",err)
+   self.assertEqual(self.RC.read_tail("claude","sid-d2"),[])
+ def test_opencode_identity_is_not_recorded(self):
+  with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+    os.environ,{"OPENCODE_SESSION_ID":"sid-oc","AGENT_DISPATCH_ATTEMPT_ID":"",
+               "AGENT_HOME":str(R.ROOT)},clear=False):
+   os.environ.pop("CLAUDE_CODE_SESSION_ID",None); os.environ.pop("CODEX_THREAD_ID",None)
+   route=self.compose(artifact_root=tmp)
+   self._emit(route,tmp)
+   self.assertEqual(self.RC.read_tail("opencode","sid-oc"),[])
+ def test_tmp_artifact_root_without_explicit_dir_is_not_recorded(self):
+  with mock.patch.dict(os.environ,{"CLAUDE_CODE_SESSION_ID":"sid-tmp","AGENT_DISPATCH_ATTEMPT_ID":"",
+                                   "AGENT_HOME":str(R.ROOT)}):
+   os.environ.pop("FLEET_ROUTE_CHAIN_DIR",None)
+   route=self.compose(artifact_root=tempfile.gettempdir())
+   err=self._emit(route,tempfile.gettempdir())
+   self.assertIn("reason=tmp-artifact-root",err)
+   os.environ["FLEET_ROUTE_CHAIN_DIR"]=self._rc_tmp.name   # restore for addCleanup symmetry
+ def test_codex_thread_id_records_codex_ledger(self):
+  with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+    os.environ,{"CODEX_THREAD_ID":"sid-codex","AGENT_DISPATCH_ATTEMPT_ID":"",
+               "AGENT_HOME":str(R.ROOT)}):
+   os.environ.pop("CLAUDE_CODE_SESSION_ID",None)
+   route=self.compose(artifact_root=tmp)
+   err=self._emit(route,tmp)
+   self.assertIn("route_chain_written=1 harness=codex",err)
+ def test_plan_invalid_refuses_before_route_write(self):
+  import types
+  with mock.patch.dict(os.environ,{"CLAUDE_CODE_SESSION_ID":"sid-plan-invalid"}):
+   with self.assertRaisesRegex(ValueError,"compose-plan-invalid"):
+    R._resolve_compose_plan(types.SimpleNamespace(
+      plan="not-a-real-capability",campaign_key=None,parent_cycle="p"))
+ def test_plan_inherited_within_same_campaign_and_reset_on_new_campaign(self):
+  import types
+  with mock.patch.dict(os.environ,{"CLAUDE_CODE_SESSION_ID":"sid-inherit","AGENT_DISPATCH_ATTEMPT_ID":"",
+                                   "AGENT_HOME":str(R.ROOT)}):
+   with tempfile.TemporaryDirectory() as tmp:
+    first=self.compose(artifact_root=tmp,campaign_key="stream-x")
+    self._emit(first,tmp,_route_chain_plan=(["code"],"explicit"))
+    same_campaign=types.SimpleNamespace(plan=None,campaign_key="stream-x",parent_cycle=None)
+    plan,source=R._resolve_compose_plan(same_campaign)
+    self.assertEqual((plan,source),(["code"],"inherited"))
+    other_campaign=types.SimpleNamespace(plan=None,campaign_key="stream-y",parent_cycle=None)
+    self.assertEqual(R._resolve_compose_plan(other_campaign),(None,None))
+ def test_explain_prints_plan_line_and_writes_nothing(self):
+  with mock.patch.dict(os.environ,{"CLAUDE_CODE_SESSION_ID":"sid-explain"}):
+   route=self.compose(slug="explain-plan-fixture")
+   card=R.compose_card(route,["research","draft"],"explicit")
+   self.assertIn("계획 research › draft",card)
+   self.assertEqual(self.RC.read_tail("claude","sid-explain"),[])
+ def test_start_by_other_session_appends_start_once(self):
+  with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+    os.environ,{"CLAUDE_CODE_SESSION_ID":"sid-owner","AGENT_DISPATCH_ATTEMPT_ID":""}):
+   route=self.compose(artifact_root=tmp)
+  with mock.patch.dict(os.environ,{"CLAUDE_CODE_SESSION_ID":"sid-starter"}):
+   R._record_route_chain(route,str(Path(tmp)/"r.json"),"start")
+   R._record_route_chain(route,str(Path(tmp)/"r.json"),"start")
+   lines=self.RC.read_tail("claude","sid-starter")
+   self.assertEqual(len(lines),1)
+   self.assertEqual(lines[0]["event"],"start")
+ def test_depth1_non_continuation_event_writes_nothing(self):
+  with mock.patch.dict(os.environ,{"AGENT_DISPATCH_DEPTH":"1",
+                                   "AGENT_DISPATCH_PARENT_SESSION_ID":"sid-parent",
+                                   "AGENT_DISPATCH_ATTEMPT_ID":"att-1"}):
+   self.assertIsNone(R._route_chain_identity("compose",{}))
+ def test_depth1_continuation_appends_to_anchored_parent_ledger_with_by_attempt(self):
+  self.RC.append("codex","sid-parent",self.RC.build_line(
+    {"route_id":"rt-source","route_hash":"h-source","capability":"autopilot-code"},
+    event="compose",harness="codex",session_id="sid-parent",route_file="/tmp/source.json"))
+  with mock.patch.dict(os.environ,{
+    "AGENT_DISPATCH_DEPTH":"1","AGENT_DISPATCH_PARENT_SESSION_ID":"sid-parent",
+    "AGENT_DISPATCH_ATTEMPT_ID":"att-owner","AGENT_DISPATCH_CALLER_HARNESS":"claude"}):
+   identity=R._route_chain_identity("continuation",{"source_route_id":"rt-source"})
+   self.assertEqual(identity,("codex","sid-parent",1,"att-owner"))
+   route={"route_id":"rt-successor","route_hash":"h-successor","capability":"autopilot-code",
+          "source_route_id":"rt-source","artifact_root":self._rc_tmp.name}
+   R._record_route_chain(route,"/tmp/successor.json","continuation")
+  lines=self.RC.read_tail("codex","sid-parent")
+  self.assertEqual(len(lines),2)
+  self.assertEqual(lines[1]["route_id"],"rt-successor")
+  self.assertEqual(lines[1]["by_attempt"],"att-owner")
+ def test_depth1_continuation_finds_source_route_beyond_display_tail(self):
+  # review 🟡-a: a long-lived parent pushes the continued route's line past TAIL_BYTES
+  self.RC.append("claude","sid-long",self.RC.build_line(
+    {"route_id":"rt-early","route_hash":"h-early","capability":"autopilot-code"},
+    event="compose",harness="claude",session_id="sid-long",route_file="/tmp/early.json"))
+  filler=0
+  while os.path.getsize(self.RC.ledger_path("claude","sid-long"))<=self.RC.TAIL_BYTES+4096:
+   filler+=1
+   self.RC.append("claude","sid-long",self.RC.build_line(
+     {"route_id":f"rt-fill-{filler}","route_hash":"h","capability":"autopilot-research",
+      "slug":"x"*80},
+     event="compose",harness="claude",session_id="sid-long",route_file="/tmp/"+"f"*200+".json"))
+  self.assertNotIn("rt-early",[l["route_id"] for l in self.RC.read_tail("claude","sid-long")])
+  with mock.patch.dict(os.environ,{
+    "AGENT_DISPATCH_DEPTH":"1","AGENT_DISPATCH_PARENT_SESSION_ID":"sid-long",
+    "AGENT_DISPATCH_ATTEMPT_ID":"att-owner"}):
+   self.assertEqual(R._route_chain_identity("continuation",{"source_route_id":"rt-early"}),
+                    ("claude","sid-long",1,"att-owner"))
+ def test_depth1_continuation_without_parent_ledger_writes_nothing(self):
+  with mock.patch.dict(os.environ,{
+    "AGENT_DISPATCH_DEPTH":"1","AGENT_DISPATCH_PARENT_SESSION_ID":"sid-no-ledger",
+    "AGENT_DISPATCH_ATTEMPT_ID":"att-owner"}):
+   self.assertIsNone(R._route_chain_identity(
+     "continuation",{"source_route_id":"rt-anything"}))
+ def test_depth1_continuation_with_two_harness_ledgers_writes_nothing(self):
+  for harness in ("claude","codex"):
+   self.RC.append(harness,"sid-both",self.RC.build_line(
+     {"route_id":"rt-source","route_hash":"h","capability":"autopilot-code"},
+     event="compose",harness=harness,session_id="sid-both",route_file="/tmp/s.json"))
+  with mock.patch.dict(os.environ,{
+    "AGENT_DISPATCH_DEPTH":"1","AGENT_DISPATCH_PARENT_SESSION_ID":"sid-both",
+    "AGENT_DISPATCH_ATTEMPT_ID":"att-owner"}):
+   self.assertIsNone(R._route_chain_identity("continuation",{"source_route_id":"rt-source"}))
+ def test_depth1_continuation_ledger_without_source_route_writes_nothing(self):
+  self.RC.append("codex","sid-unrelated",self.RC.build_line(
+    {"route_id":"rt-other","route_hash":"h","capability":"autopilot-code"},
+    event="compose",harness="codex",session_id="sid-unrelated",route_file="/tmp/s.json"))
+  with mock.patch.dict(os.environ,{
+    "AGENT_DISPATCH_DEPTH":"1","AGENT_DISPATCH_PARENT_SESSION_ID":"sid-unrelated",
+    "AGENT_DISPATCH_ATTEMPT_ID":"att-owner"}):
+   self.assertIsNone(R._route_chain_identity("continuation",{"source_route_id":"rt-source"}))
+ def test_depth0_continuation_writes_own_ledger(self):
+  with mock.patch.dict(os.environ,{"CLAUDE_CODE_SESSION_ID":"sid-depth0",
+                                   "AGENT_DISPATCH_ATTEMPT_ID":""}):
+   os.environ.pop("AGENT_DISPATCH_DEPTH",None)
+   identity=R._route_chain_identity("continuation",{"source_route_id":"rt-x"})
+   self.assertEqual(identity,("claude","sid-depth0",0,None))
+
+
 if __name__=="__main__": unittest.main()

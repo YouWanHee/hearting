@@ -716,12 +716,12 @@ _ENTRY_CAPABILITIES = frozenset((
 ))
 
 
-def _capability_grounding_index(home):
-    """Scan ``<home>/.capability-grounding`` into ``{sid: (mtime, {k:v})}``. Each file is a KV
+def _scan_grounding_dir(path):
+    """Scan one capability-grounding directory into ``{sid: (mtime, {k:v})}``. Each file is a KV
     body (``capability=…``) named by session id. Missing dir / OSError -> empty index."""
     index = {}
     try:
-        entries = list(os.scandir(os.path.join(home, ".capability-grounding")))
+        entries = list(os.scandir(path))
     except OSError:
         return {}
     for entry in entries:
@@ -741,6 +741,22 @@ def _capability_grounding_index(home):
         if fields.get("capability") in _ENTRY_CAPABILITIES:
             index[entry.name] = (mtime, fields)
     return index
+
+
+def _capability_grounding_index(home):
+    """``{sid: (mtime, {k:v})}`` — the new state-root location wins; ``<home>/.capability-grounding``
+    (a release tree that predates F-<next> fleet-route-chain-r2) is a read-only fallback, consulted
+    only for a sid the new location does not have."""
+    try:
+        from . import route_chain as _route_chain
+        new_dir = _route_chain.capability_grounding_dir()
+    except Exception:
+        new_dir = None
+    new_index = _scan_grounding_dir(new_dir) if new_dir else {}
+    old_index = _scan_grounding_dir(os.path.join(home, ".capability-grounding"))
+    merged = dict(old_index)
+    merged.update(new_index)
+    return merged
 
 
 def _capability_grounding_for(entity, index, now=None):
@@ -1539,8 +1555,19 @@ def attach_projections(sessions: Iterable[Session], jobs: Iterable[DispatchJob],
             job._context_evidence = None
     # Resolve the current inline entry before artifact fallback.  A spec-read
     # marker is eligible only when this exact session is actively in autopilot-spec.
+    # F-<next>: an open route this exact session composed/started/continued beats the
+    # capability-grounding marker (route._chain rule 5) — a live route is stronger
+    # evidence than a best-effort inline marker.
+    from . import route_chain as _route_chain
+    now_for_chain = time.time() if now is None else now
     for session in sessions:
-        session.cap_grounding = _capability_grounding_for(session, cap_index, now=now)
+        marker = _capability_grounding_for(session, cap_index, now=now)
+        elapsed_min = _field(session, "elapsed_min") or 0
+        session.cap_grounding = _route_chain.current_capability(
+            getattr(session, "route_chain", None), marker,
+            session_start=now_for_chain - elapsed_min * 60,
+            slack=_SPEC_MARKER_FRESHNESS_SLACK_S,
+        )
     from . import route
     round_token = _ROUND_SCOPE.set(
         route.RoundScope(route_records, node_evidence or {}, tuple(jobs))

@@ -2756,18 +2756,22 @@ def _compose_campaign_line(selection):
     return f"  {text} · 활성 캠페인 {selection['active_count']}개" + (f": {shown}" if shown else "")
 
 
-def compose_card(route):
+def compose_card(route, plan=None, plan_source=None):
     """One-line `[경로]` notice the acting session pastes instead of a card."""
     shape = route.get("selection", {}).get("shape") or shape_for_intensity(route["effective_intensity"])
     ids = [node["id"] for node in route["nodes"]]
     graph = "→".join(ids) if route.get("composed") else (ids[0] if ids else "-")
     gates = ",".join(sorted({row["gate"] for row in route.get("human_gate_bindings") or []})) or "없음"
-    return (
+    card = (
         f"[경로] {route['capability']} · {shape}({route['effective_intensity']}) {graph}"
         f" · route {route['route_id']} · origin compose · 사람 게이트 {gates}\n"
         f"  cwd {route['cwd']} · slug {route.get('slug', '-')}\n"
         + _compose_campaign_line(compose_campaign_selection(route))
     )
+    if plan:
+        suffix = " (상속)" if plan_source == "inherited" else ""
+        card += f"\n  계획 {' › '.join(plan)}{suffix}"
+    return card
 
 
 def compile_composed_route(composed_recipe, capability_mode, requested_intensity, cwd, artifact_root,
@@ -6255,6 +6259,161 @@ def compose_receipt(route, path):
     }
 
 
+def _route_chain_module():
+    """Lazy sys.path insert + import of `tools/fleet/route_chain` (`peer-message.py:461-465`
+    idiom) — this file must not gain a hard import-time dependency on the Fleet package."""
+    tools_dir = ROOT / "tools"
+    try:
+        if tools_dir.is_dir() and str(tools_dir) not in sys.path:
+            sys.path.insert(0, str(tools_dir))
+        from fleet import route_chain as _rc  # noqa: WPS433
+        return _rc
+    except Exception:
+        return None
+
+
+_ROUTE_CHAIN_PARENT_SCAN_BYTES = 1024 * 1024
+
+
+def _route_chain_parent_ledger(rc, parent_sid, source_route_id):
+    """`(harness, session_id)` | None — the ledger-anchored parent lookup (plan §3 B-2,
+    round 1 🔴-1 fix). The only signal this file trusts for "what harness is my depth-0
+    parent" is whether that parent's OWN ledger (in exactly one harness directory) already
+    carries the route being continued — never jobs.log `parent_harness` or
+    `AGENT_DISPATCH_CALLER_HARNESS` (both name the OWNER's own harness at depth>=1, not the
+    depth-0 parent's; R-3)."""
+    if not parent_sid or not source_route_id:
+        return None
+    found = []
+    for harness in rc.HARNESSES:
+        try:
+            path = rc.ledger_path(harness, parent_sid)
+        except ValueError:
+            continue
+        if os.path.isfile(path):
+            found.append(harness)
+    if len(found) != 1:
+        return None
+    harness = found[0]
+    # One lookup per continuation, not per Fleet tick, so read far past the display tail: a
+    # long-lived parent can push the continued route's line beyond TAIL_BYTES (review 🟡-a).
+    for line in rc.read_tail(harness, parent_sid, max_bytes=_ROUTE_CHAIN_PARENT_SCAN_BYTES):
+        if line.get("route_id") == source_route_id:
+            return harness, parent_sid
+    return None
+
+
+def _route_chain_identity(event, route):
+    """`(harness, session_id, dispatch_depth, by_attempt)` | None — never raises (plan §3 B-1.2)."""
+    try:
+        depth = int(os.environ.get("AGENT_DISPATCH_DEPTH") or 0)
+    except (TypeError, ValueError):
+        return None
+    if depth >= 2:
+        return None
+    if depth == 1:
+        if event != "continuation":
+            return None
+        parent_sid = os.environ.get("AGENT_DISPATCH_PARENT_SESSION_ID")
+        if not parent_sid:
+            return None
+        rc = _route_chain_module()
+        if rc is None:
+            return None
+        anchor = _route_chain_parent_ledger(rc, parent_sid, (route or {}).get("source_route_id"))
+        if anchor is None:
+            return None
+        harness, sid = anchor
+        return harness, sid, depth, os.environ.get("AGENT_DISPATCH_ATTEMPT_ID")
+    try:
+        from dispatch_parent_completion import interactive_parent_identity
+        harness, sid = interactive_parent_identity()
+    except Exception:
+        return None
+    if not harness or not sid:
+        return None
+    rc = _route_chain_module()
+    if rc is None or rc.WRITER_SUPPORT.get(harness) != "env":
+        return None
+    return harness, sid, depth, None
+
+
+def _record_route_chain(route, route_file, event, *, plan=None, plan_source=None):
+    """Append one route-chain ledger line. Every failure is silent — route creation/start
+    must never fail because of this sidecar (plan §3 B-1.3). Success/failure is only
+    ever observable on stderr."""
+    try:
+        rc = _route_chain_module()
+        if rc is None:
+            return
+        identity = _route_chain_identity(event, route)
+        if identity is None:
+            print("route_chain_written=0 reason=no-identity", file=sys.stderr)
+            return
+        harness, sid, depth, by_attempt = identity
+        if not os.environ.get("FLEET_ROUTE_CHAIN_DIR"):
+            artifact_root = route.get("artifact_root")
+            if isinstance(artifact_root, str) and artifact_root:
+                real_root = os.path.realpath(artifact_root)
+                real_tmp = os.path.realpath(tempfile.gettempdir())
+                if real_root == real_tmp or real_root.startswith(real_tmp + os.sep):
+                    print("route_chain_written=0 reason=tmp-artifact-root", file=sys.stderr)
+                    return
+        if event == "start" and any(
+            line.get("route_id") == route.get("route_id")
+            for line in rc.read_tail(harness, sid)
+        ):
+            print("route_chain_written=0 reason=start-already-recorded", file=sys.stderr)
+            return
+        line = rc.build_line(
+            route, event=event, harness=harness, session_id=sid, route_file=route_file,
+            plan=plan, plan_source=plan_source, dispatch_depth=depth, by_attempt=by_attempt,
+        )
+        if rc.append(harness, sid, line):
+            print(f"route_chain_written=1 harness={harness}", file=sys.stderr)
+        else:
+            print("route_chain_written=0 reason=append-failed", file=sys.stderr)
+    except Exception as exc:
+        try:
+            print(f"route_chain_written=0 reason={exc}", file=sys.stderr)
+        except Exception:
+            pass
+
+
+def _resolve_compose_plan(a):
+    """`(plan, plan_source)` for the compose CLI's `--plan` input (plan §3 B-1.5). An explicit
+    `--plan` is validated eagerly — before any route work — and its failure is a normal
+    `ValueError("compose-plan-invalid:...")`, never swallowed. With no explicit plan, an
+    inherited value is read from this session's own ledger, but ONLY when the new route's
+    own chain key still matches the ledger's current segment (D-9: a fresh campaign starts
+    a fresh chain, so it must not silently inherit a different campaign's declared plan).
+    Never raises for the inherited path — a ledger read failure just means no inheritance."""
+    rc = _route_chain_module()
+    if a.plan:
+        if rc is None:
+            raise ValueError("compose-plan-invalid:route-chain-unavailable")
+        known = {r["capability"] for r in TOPO.load_registry()["recipes"]}
+        return rc.parse_plan(a.plan, known), "explicit"
+    if rc is None:
+        return None, None
+    try:
+        identity = _route_chain_identity("compose", None)
+        if identity is None:
+            return None, None
+        harness, sid, _depth, _by = identity
+        lines = rc.read_tail(harness, sid)
+        segment = rc.current_segment(lines)
+        if not segment:
+            return None, None
+        new_key = rc.chain_key({"campaign_key": a.campaign_key, "parent_cycle_id": a.parent_cycle})
+        if rc.chain_key(segment[-1]) != new_key:
+            return None, None
+        plan, source = rc.inherited_plan(segment)
+        return (plan, source) if plan else (None, None)
+    except Exception:
+        return None, None
+
+
 def _emit_compiled_route(a,route,artifact_root,output=None):
     """Shared tail of compile/compose: runtime-root check, canonical write-once, owner binding, prints."""
     output=output if output is not None else getattr(a,"output",None)
@@ -6305,6 +6464,9 @@ def _emit_compiled_route(a,route,artifact_root,output=None):
         raise ValueError(str(exc)) from exc
     if attachment is not None:
         print("owner_route_binding_written=1", file=sys.stderr)
+    plan, plan_source = getattr(a, "_route_chain_plan", (None, None))
+    _record_route_chain(route, str(output_path.resolve()), a.command,
+                        plan=plan, plan_source=plan_source)
     print(f"route_file={output_path.resolve()}",file=sys.stderr)
     result = (compose_receipt(route, output_path)
               if a.command == "compose" and not getattr(a, "full_record", False) else route)
@@ -6339,6 +6501,7 @@ def main():
     cp.add_argument("--campaign-key",help="the work stream this route joins or creates (required unless --parent-cycle or --unassigned); `artifact_producer.py campaign-list` shows active keys. Size it as a stream with a one-sentence closing condition — not a project name, not a one-cycle task (join the stream that task serves)")
     cp.add_argument("--unassigned",action="store_true",help="explicit opt-out: keep this work in the root's degraded _unassigned container, proposing no stream")
     cp.add_argument("--parent-cycle",help="open or sealed predecessor cycle; causal link, not input approval")
+    cp.add_argument("--plan",default=None,help="optional declared capability sequence for this session's route chain, e.g. research,draft,apply; shown in Fleet, not sealed into the route")
     cp.add_argument("--profile-demands", help="JSON file mapping node ids and __owner__ to full SD-88 demands")
     cp.add_argument("--explicit-profiles", help="JSON file mapping demanded node ids to explicit profiles")
     cp.add_argument("--profile", choices=sorted(PROFILE.PORTABLE_PROFILES),
@@ -6438,6 +6601,7 @@ def main():
             raise ValueError("compose-start-requires-task: use --start --prompt-file <task>, without --explain")
         cwd=a.cwd or os.getcwd()
         artifact_root=a.artifact_root or _compose_artifact_root(cwd)
+        a._route_chain_plan = _resolve_compose_plan(a)
         route=compose_route(
             capability=a.capability,capability_mode=a.capability_mode,shape=shape,graph=a.graph,
             slug=a.slug,cwd=cwd,artifact_root=artifact_root,intensity=a.intensity,signals=a.signal,
@@ -6455,7 +6619,8 @@ def main():
             profile=a.profile,
             work_request={"text":a.prompt_file.read_text(),"owner_harness":a.owner} if a.prompt_file else None,
         )
-        print(compose_card(route),file=sys.stderr)
+        _plan_for_card, _plan_source_for_card = a._route_chain_plan
+        print(compose_card(route, _plan_for_card, _plan_source_for_card),file=sys.stderr)
         if a.explain:
             print("route_file_written=0 explain=1",file=sys.stderr)
             print(json.dumps({"route_id":route["route_id"],"capability":route["capability"],
@@ -6488,6 +6653,7 @@ def main():
     if a.command=="start":
         from work_start import start_work
         route=verify_route(json.loads(a.route.read_text()))
+        _record_route_chain(route, str(Path(a.route).resolve()), "start")
         print(json.dumps(start_work(route,a.route,Path(a.jobs or _compose_default_jobs()),wait=a.wait,
                                    interview=a.interview,answers=a.answers,decision=a.decision),ensure_ascii=False))
         return 0
@@ -6631,6 +6797,11 @@ def main():
             raise ValueError(str(exc)) from exc
         if advance is not None:
             print("owner_route_advance_written=1", file=sys.stderr)
+        # rule 6: a depth-1 owner records its continuation only once it actually advanced
+        # the bound route (an unadvanced attempt leaves the predecessor route's own ●,
+        # which is honest — nothing here claims progress the owner has not proven).
+        if os.environ.get("AGENT_DISPATCH_DEPTH") != "1" or advance is not None:
+            _record_route_chain(route, str(output_path.resolve()), "continuation")
         print(f"route_file={output_path.resolve()}",file=sys.stderr)
         print(json.dumps(route,sort_keys=True))
     elif a.command=="status":
