@@ -3883,18 +3883,20 @@ def _route_chain_node_segs(node, with_knobs, tag_by_key, is_current=False, worki
     return [(text, "dim"), (" " + glyph, key)]
 
 
-# User 2026-09-18 ("가장 마지막 라우팅 3개까지만 고정으로"): the cell always shows a fixed
-# window of this many chain nodes — the current one and the two before it, or, early in a
-# chain, the planned ones after it. Older nodes are simply out of the window.
-_ROUTE_CHAIN_WINDOW = 3
+# User 2026-09-18 ("가장 마지막 라우팅 3개까지만 고정으로", then "최대 4개로 하고, 계획도 바로
+# 앞에꺼 1개까지는 보이게"): the cell always shows a window of at most this many chain nodes —
+# the node right after the current one (the next planned step) when there is one, and the
+# current node with as much history before it as the rest of the window holds. Later plan
+# steps and older routes are simply out of the window.
+_ROUTE_CHAIN_WINDOW = 4
 
 
 def _route_chain_window(nodes, current_idx):
-    """The `_ROUTE_CHAIN_WINDOW` nodes to draw: ending at the current node when it has
-    enough history, otherwise starting at the chain's head and running into its plan."""
-    start = max(0, min(current_idx - (_ROUTE_CHAIN_WINDOW - 1),
-                       len(nodes) - _ROUTE_CHAIN_WINDOW))
-    return start, nodes[start:start + _ROUTE_CHAIN_WINDOW]
+    """`(start, window)`: at most `_ROUTE_CHAIN_WINDOW` nodes ending one past the current
+    node when a next node exists, else at the current node."""
+    ahead = 1 if current_idx + 1 < len(nodes) else 0
+    start = max(0, current_idx - (_ROUTE_CHAIN_WINDOW - 1 - ahead))
+    return start, nodes[start:current_idx + 1 + ahead]
 
 
 def _route_chain_bodies(chain, tag_by_key=None, working=False):

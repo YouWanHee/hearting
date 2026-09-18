@@ -65,19 +65,29 @@ class RouteChainCellTest(unittest.TestCase):
                           "current": receiver_nodes[0]}
         self.assertEqual(_cell(receiver_chain), "draft(std) ● › apply ○")
 
-    def test_window_keeps_the_last_three_ending_at_the_current_node(self):
+    def test_window_without_a_plan_keeps_the_last_four(self):
         nodes = [_node(name, "done") for name in ("a", "b", "c", "d")]
         nodes.append(_node("e", "open"))
         chain = {"v": 1, "key": "k1", "visible": True, "plan": [], "plan_source": None,
                 "nodes": nodes, "current": nodes[4]}
-        self.assertEqual(_cell(chain), "c(std) ✓ › d(std) ✓ › e(std) ●")
+        start, window = render._route_chain_window(nodes, 4)
+        self.assertEqual([n["label"] for n in window], ["b", "c", "d", "e"])
+        cell = _cell(chain)
+        self.assertNotIn("a", cell.split("›")[0])
+        self.assertEqual(cell.count("›"), 3)
 
-    def test_window_runs_into_the_plan_early_in_a_chain(self):
+    def test_window_with_a_plan_shows_three_back_and_one_next(self):
+        nodes = [_node(name, "done") for name in ("research", "draft", "refine")]
+        nodes += [_node("apply", "open"), _node("code", "planned"), _node("ship", "planned")]
+        _start, window = render._route_chain_window(nodes, 3)
+        self.assertEqual([n["label"] for n in window], ["draft", "refine", "apply", "code"])
+
+    def test_window_early_in_a_chain_shows_only_the_next_plan_step(self):
         nodes = [_node("research", "open"), _node("draft", "planned"),
                  _node("apply", "planned"), _node("ship", "planned")]
         chain = {"v": 1, "key": "k1", "visible": True, "plan": [], "plan_source": None,
                 "nodes": nodes, "current": nodes[0]}
-        self.assertEqual(_cell(chain), "research(std) ● › draft ○ › apply ○")
+        self.assertEqual(_cell(chain), "research(std) ● › draft ○")
 
     def test_width_ladder_knobs_fold_past_first_then_current_then_counts(self):
         nodes = [_node("research", "done"), _node("draft", "open"), _node("apply", "planned")]
@@ -226,7 +236,7 @@ def _chain_session(nodes, current, sid="sid-chain", plan=()):
 
 class ChainInStageCellTest(unittest.TestCase):
     """User 2026-09-18: the chain takes the session's stage cell (the old `-` slot), up to
-    40 cells, as a fixed window of its last three nodes; there is no separate chain line."""
+    40 cells, as a window of at most four nodes (one next plan step); no separate line."""
 
     def test_short_chain_fills_the_cell(self):
         nodes = [_node("code", "done"), _node("lab", "open", shape="direct")]
@@ -234,14 +244,14 @@ class ChainInStageCellTest(unittest.TestCase):
         self.assertIn("code(std) ✓ › lab(std) ●", _session_row_text(rows))
         self.assertFalse(any("경로 " in t for t in rows))
 
-    def test_long_chain_shows_its_last_three_and_no_line(self):
+    def test_long_chain_shows_three_back_one_next_and_no_line(self):
         nodes = [_node("research", "done"), _node("draft", "done"), _node("refine", "done"),
                  _node("apply", "open", shape="staged"), _node("code", "planned")]
         rows = _board([_chain_session(nodes, nodes[3], plan=("research", "draft", "refine",
                                                              "apply", "code"))])
         row = _session_row_text(rows)
-        # 43 cells with every detail, so the past details fold inside the 40-cell cell
-        self.assertIn("draft ✓ › refine ✓ › apply(std) ●", row)
+        # 42 cells with the current node's details, so every detail folds inside 40
+        self.assertIn("draft ✓ › refine ✓ › apply ● › code ○", row)
         self.assertNotIn("research", row)
         self.assertFalse(any("경로 " in t for t in rows))
 
