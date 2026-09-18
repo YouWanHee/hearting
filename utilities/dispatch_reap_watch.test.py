@@ -472,6 +472,62 @@ class DispatchReapWatchTest(unittest.TestCase):
                 replayed_events = [json.loads(line) for line in stream]
             self.assertEqual(replayed_events, events)
 
+    def test_an_already_closed_owner_is_settled_after_the_group_drains(self):
+        # 2026-09-17: the supervisor closed its owner row (completed-supervisor)
+        # while alive, so the in-process settlement deferred and no delivery
+        # record existed. After the drain this watcher must retry it.
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            jobs = base / "jobs.log"
+            attempt = "att-closed-owner"
+            worker = subprocess.Popen(
+                ["sleep", "0.08"],
+                env={**os.environ, D.ATTEMPT_DESCENDANT_ENV: attempt},
+                start_new_session=True,
+            )
+            identity = D.process_launch_identity(worker.pid)
+            metadata = ",".join(
+                f"{key}={value}"
+                for key, value in {
+                    **identity,
+                    "attempt_id": attempt,
+                    "launch_lifecycle": "detached",
+                    "log_file": str(base / "owner.jsonl"),
+                    "parent_attempt_id": "-",
+                    "parent_completion_delivery": "claude-parent-runtime",
+                    "parent_sid": "sess-closed-owner",
+                    "owner_route_id": "rt-closed-owner",
+                    "harness": "claude",
+                }.items()
+            )
+            jobs.write_text(
+                "2026-09-17T00:00:00Z\topen\t/repo\t/wt\towner\t"
+                f"{OWNER},{metadata}\n",
+                encoding="utf-8",
+            )
+            self.assertTrue(D.close_attempt_row(jobs, attempt, "completed-supervisor"))
+            records = base / "pending-delivery"
+            self.assertFalse(any(records.rglob("*.json")) if records.exists() else False)
+            watcher = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(WATCH),
+                    "--jobs", str(jobs),
+                    "--attempt-id", attempt,
+                    "--pid", str(worker.pid),
+                    "--pid-start", identity["pid_start"],
+                    "--pgid", identity["pgid"],
+                    "--interval", "0.02",
+                ],
+            )
+            worker.wait(timeout=5)
+            self.assertEqual(watcher.wait(timeout=10), 0)
+            made = list(records.rglob("*.json"))
+            self.assertEqual(len(made), 1)
+            record = json.loads(made[0].read_text(encoding="utf-8"))
+            self.assertEqual(record["route_id"], "rt-closed-owner")
+            self.assertEqual(record["state"], "pending")
+
     def test_ledger_failure_does_not_change_missing_result_close(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
