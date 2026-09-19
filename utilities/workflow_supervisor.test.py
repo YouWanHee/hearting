@@ -35,6 +35,11 @@ import capability_topology as TOPO  # noqa: E402
 import dispatch_contract as DC  # noqa: E402
 
 
+# Completing nodes here must not launch detached open-cycle checkpoints into
+# fixture roots, including from CLI subprocesses this suite spawns.
+os.environ.setdefault("AGENT_ARTIFACT_CHECKPOINT", "off")
+
+
 def _load(name, relative):
     spec = importlib.util.spec_from_file_location(name, ROOT / relative)
     module = importlib.util.module_from_spec(spec)

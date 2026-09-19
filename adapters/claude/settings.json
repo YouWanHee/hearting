@@ -438,6 +438,11 @@
             "type": "command",
             "command": "python3 \"$HOME/.claude/hooks/herdr-session-projection.py\"",
             "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "python3 \"$HOME/.claude/hooks/open-cycle-checkpoint.py\"",
+            "timeout": 5
           }
         ]
       }

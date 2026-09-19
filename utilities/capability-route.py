@@ -5273,7 +5273,18 @@ def complete_node(
             materialize_after_terminal_close(Path(jobs), attempt_id)
         except Exception:  # noqa: BLE001 -- a committed close is never unwound by delivery-layer failure
             pass
+    _launch_open_cycle_checkpoint(route)
     return marker, row
+
+
+def _launch_open_cycle_checkpoint(route):
+    """The route's open cycle republishes its interim manifest after a stage
+    completes: detached, rate-limited, and never part of the completion."""
+    try:
+        import artifact_checkpoint_trigger
+        artifact_checkpoint_trigger.launch_for_route(route, trigger="stage-complete")
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # OPERATIONS §5.10 "Review verdict is a result, not a worker death" -- the
@@ -6232,6 +6243,7 @@ def complete_subsession_stage(route, node, node_id, evidence, manifest_path, job
             attempt_id=attempt_id,attempt_metadata=metadata,
             owner_chain=True,
         )
+    _launch_open_cycle_checkpoint(route)
     return marker,{"status":"stage-gate-aggregated","sessions":len(manifest["sessions"])}
 
 def _compose_artifact_root(cwd):

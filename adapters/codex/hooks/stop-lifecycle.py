@@ -47,6 +47,9 @@ def _sid(value):
 def main() -> int:
     try:
         payload = json.load(sys.stdin)
+    except Exception:
+        return 0
+    try:
         session_id = "" if _worker() else _sid(payload)
         if session_id:
             from fleet import interaction
@@ -54,6 +57,14 @@ def main() -> int:
 
             interaction.clear_wait(session_id, "codex")
             launch_trigger("codex", session_id, "final")
+    except Exception:
+        pass
+    try:
+        # Refresh this session's (or dispatched worker's) open-cycle interim
+        # manifest: detached, rate-limited, silent.
+        import artifact_checkpoint_trigger
+
+        artifact_checkpoint_trigger.launch_for_session("codex", _sid(payload))
     except Exception:
         pass
     return 0

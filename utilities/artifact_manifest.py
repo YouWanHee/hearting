@@ -1388,3 +1388,37 @@ def validate(document: Any) -> ValidationReport:
     lineage = validate_lineage(document)
     events = validate_events(document)
     return shape.merged(locators).merged(lineage).merged(events)
+
+
+# ---------------------------------------------------------------------------
+# interim (open-cycle) manifest
+# ---------------------------------------------------------------------------
+
+# An open cycle's checkpoint publishes this same closed document with one
+# difference: `cycle.state` is `open`, a value no sealed manifest may carry.
+# It claims no lineage commit and no completion, so it has no cycle.* or
+# route.terminal.recorded event; every other rule is the sealed rule.
+INTERIM_CYCLE_STATE = "open"
+
+
+def validate_interim(document: Any) -> ValidationReport:
+    if not isinstance(document, dict) or not isinstance(document.get("cycle"), dict):
+        return validate(document)
+    if document["cycle"].get("state") != INTERIM_CYCLE_STATE:
+        return _report([Violation("interim-state-invalid", "$.cycle.state",
+                                  "interim manifest must declare cycle.state 'open'")])
+    violations: List[Violation] = []
+    for index, row in enumerate(document.get("events") or []):
+        event_type = row.get("event_type") if isinstance(row, dict) else None
+        if isinstance(event_type, str) and (event_type.startswith("cycle.")
+                                            or event_type == "route.terminal.recorded"):
+            violations.append(Violation("interim-terminal-event", "$.events[{0}]".format(index),
+                                        "an open cycle records no terminal event"))
+    for index, row in enumerate(document.get("routes") or []):
+        if isinstance(row, dict) and (row.get("terminal_marker") != "pending"
+                                      or row.get("terminal_evidence_id") != ""):
+            violations.append(Violation("interim-terminal-event", "$.routes[{0}]".format(index),
+                                        "an open cycle's route has no terminal marker"))
+    probe = dict(document)
+    probe["cycle"] = {**document["cycle"], "state": "active"}
+    return _report(violations).merged(validate(probe))
