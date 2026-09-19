@@ -55,6 +55,11 @@ capabilities:
     execute: gpt
 """
 
+# Completing nodes here must not launch detached open-cycle checkpoints into
+# fixture roots, including from CLI subprocesses this suite spawns.
+os.environ.setdefault("AGENT_ARTIFACT_CHECKPOINT", "off")
+
+
 @contextlib.contextmanager
 def dispatch_defaults_config(text):
  with tempfile.TemporaryDirectory() as td:

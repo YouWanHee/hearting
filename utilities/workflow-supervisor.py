@@ -505,6 +505,13 @@ def poll_once(route, ledger):
                 results.append({"node": node_id, "action": "human-gate"})
                 continue
             _evaluate(route, ledger, armed, results)
+    # A supervised run is live work: let its open cycle republish the interim
+    # manifest (detached and rate-limited, outside the ledger lock).
+    try:
+        import artifact_checkpoint_trigger
+        artifact_checkpoint_trigger.launch_for_route(route, trigger="supervisor-poll")
+    except Exception:  # noqa: BLE001
+        pass
     return results
 
 
