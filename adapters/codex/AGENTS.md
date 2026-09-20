@@ -79,10 +79,10 @@ The managed launcher exports the session's one canonical `AGENT_DISPATCH_JOBS`.
 Treat it as immutable at every dispatch depth; never reconstruct a registry from
 `$AGENT_HOME/.dispatch/jobs.log`, because packaged `$AGENT_HOME` is versioned source.
 
-The managed gateway's witnessed `thread/fork` lineage is authoritative for a
-forked session. An inherited `CODEX_THREAD_ID` is only a start-thread hint; a
-proved successor is reported as `managed-thread-advanced` and sealed into the
-batch, while an unrelated thread switch still fails closed.
+Only an epoch TUI start, resume, or current-fork response advances binding;
+siblings, notifications, tools, failures, and stale responses do not. Seal
+thread/epoch/generation. Recovery: prove host workspace/tab/pane/cwd, use its
+native visible-pane API, never hidden tmux. Headless work is separate.
 
 ## Tool Contracts
 

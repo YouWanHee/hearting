@@ -457,3 +457,18 @@ explicit settings win, and other missing required keys retain whole-file fallbac
 OpenCode reports collapsed-balanced-to-light and preserves its full light budget.
 No install/update/reapply/uninstall writes the normalization back. Source checks
 do not activate an installed release or change an in-flight sealed route.
+
+### Visible-main transition recovery
+
+The managed gateway binds a visible main only from exact same-epoch TUI
+request/response evidence for `thread/start`, `thread/resume`, or a direct fork
+of the current binding. Tool/native-subagent threads and siblings remain
+diagnostic. Binding generation and the exact transition chain fence every
+completion batch; parent diagnostics distinguish unmanaged entry,
+unproved-transition, stale-generation, disconnected-TUI, and approval-owner
+failures. `preflight.sh interactive-main-recovery --check` reads the current
+Herdr pane inventory only. Explicit `--start` revalidates the existing
+workspace/tab/pane, creates and verifies one visible pane with Herdr's native
+split API, and calls `herdr agent start` there. It has no tmux fallback. If a
+post-split check or start fails, it reports the created pane for operator
+cleanup. Herdr identifiers are optional provenance, never transition authority.

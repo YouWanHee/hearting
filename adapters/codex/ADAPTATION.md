@@ -500,6 +500,23 @@ proof that the receipt was not accepted: the gateway serializes that exact
 delivery into one `turn/start` after idle. A crash during this in-memory defer
 is durable `sent-ambiguous`, so retry cannot create a duplicate wake.
 
+Visible-main transitions are a separate local projection: initial binding,
+successful same-TUI `thread/start`, successful same-TUI `thread/resume`, and a
+direct fork of the current binding are distinct from tool/native-subagent
+threads and diagnostic siblings. Only an exact successful TUI request/response
+in the current epoch advances the binding, with monotonic last-requested-wins
+sequencing. Present `sessionId`/`forkedFromId` contradictions fail closed;
+documented optional absence is recorded as unverified. Delivery is fenced by
+thread, epoch, binding generation, transition chain, parent/session, canonical
+jobs identity, attempts, and batch. `utilities/interactive-main-recovery.py`
+is the narrow Herdr-only recovery surface: `preflight.sh
+interactive-main-recovery --check` reads pane evidence, while explicit
+`--start` rechecks the source workspace/tab/pane, creates a visible pane with
+`herdr pane split`, validates its workspace/tab/cwd, and then runs `herdr agent
+start`; it has no tmux fallback. A post-split failure reports the created pane
+for operator cleanup. Herdr IDs are optional provenance and never transition
+authority.
+
 The wrapper validates the capability catalog, validates an optional non-owner
 `worker_mode` through `mode-info`, and `_kernel/owner` rejects a worker mode
 before prompt or registry writes. Registration materializes the portable

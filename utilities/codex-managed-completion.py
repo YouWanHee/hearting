@@ -597,6 +597,8 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--parent-session-id")
     value.add_argument("--sealed-batch-id", required=True)
     value.add_argument("--thread-id")
+    value.add_argument("--gateway-epoch", type=int)
+    value.add_argument("--binding-generation", type=int)
     value.add_argument("--attempt-id", action="append", default=[])
     value.add_argument("--interval", type=float, default=2.0)
     value.add_argument("--timeout", type=float, default=3600.0)
@@ -663,6 +665,10 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         "sealed_batch_id": args.sealed_batch_id,
         "receipt": normalized,
     }
+    if args.gateway_epoch is not None:
+        request["gateway_epoch"] = args.gateway_epoch
+    if args.binding_generation is not None:
+        request["binding_generation"] = args.binding_generation
     result = deliver_with_retry(args, request)
     status = result.get("status")
     return result, {

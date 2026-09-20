@@ -160,6 +160,14 @@ class FakeAppServer:
         self.current: Any = None
         self.next_start_id = "thread-1"
         self.next_fork_id = "thread-2"
+        self.thread_start_session_id: str | None = None
+        self.thread_resume_session_id: str | None = None
+        self.thread_fork_session_id: str | None = None
+        self.thread_start_forked_from_id: str | None = None
+        self.thread_resume_forked_from_id: str | None = None
+        self.thread_fork_parent_id: str | None = None
+        self.thread_start_error = False
+        self.thread_resume_error = False
         self.thread = threading.Thread(target=self._accept_loop, daemon=True)
         self.thread.start()
 
@@ -204,29 +212,58 @@ class FakeAppServer:
                 self.thread_start_received.set()
                 if self.hold_thread_start:
                     self.release_thread_start.wait(5)
+                if self.thread_start_error:
+                    websocket.write_json({
+                        "jsonrpc": "2.0", "id": message["id"],
+                        "error": {"code": -32001, "message": "start failed"},
+                    })
+                    continue
+                thread = {"id": self.next_start_id}
+                if self.thread_start_session_id is not None:
+                    thread["sessionId"] = self.thread_start_session_id
+                if self.thread_start_forked_from_id is not None:
+                    thread["forkedFromId"] = self.thread_start_forked_from_id
                 websocket.write_json(
                     {
                         "jsonrpc": "2.0",
                         "id": message["id"],
-                        "result": {"thread": {"id": self.next_start_id}},
+                        "result": {"thread": thread},
                     }
                 )
             elif method == "thread/resume":
                 params = message.get("params") or {}
                 resumed = params.get("threadId") or self.next_start_id
+                if self.thread_resume_error:
+                    websocket.write_json({
+                        "jsonrpc": "2.0", "id": message["id"],
+                        "error": {"code": -32002, "message": "resume failed"},
+                    })
+                    continue
+                thread = {"id": resumed}
+                if self.thread_resume_session_id is not None:
+                    thread["sessionId"] = self.thread_resume_session_id
+                if self.thread_resume_forked_from_id is not None:
+                    thread["forkedFromId"] = self.thread_resume_forked_from_id
                 websocket.write_json(
                     {
                         "jsonrpc": "2.0",
                         "id": message["id"],
-                        "result": {"thread": {"id": resumed}},
+                        "result": {"thread": thread},
                     }
                 )
             elif method == "thread/fork":
+                params = message.get("params") or {}
+                thread = {"id": self.next_fork_id}
+                parent = self.thread_fork_parent_id or params.get("threadId")
+                if parent is not None:
+                    thread["forkedFromId"] = parent
+                if self.thread_fork_session_id is not None:
+                    thread["sessionId"] = self.thread_fork_session_id
                 websocket.write_json(
                     {
                         "jsonrpc": "2.0",
                         "id": message["id"],
-                        "result": {"thread": {"id": self.next_fork_id}},
+                        "result": {"thread": thread},
                     }
                 )
             elif method == "turn/start":
@@ -423,12 +460,15 @@ def control(path: Path, value: dict[str, Any]) -> dict[str, Any]:
 
 
 def receipt_request(
-    batch: str = "batch-1", thread_id: str = "thread-1"
+    batch: str = "batch-1", thread_id: str = "thread-1", *,
+    gateway_epoch: int = 1, binding_generation: int = 1,
 ) -> dict[str, Any]:
     return {
         "schema_version": 1,
         "op": "deliver",
         "thread_id": thread_id,
+        "gateway_epoch": gateway_epoch,
+        "binding_generation": binding_generation,
         "parent_attempt_id": "att-parent",
         "sealed_batch_id": batch,
         "receipt": {
@@ -543,6 +583,47 @@ class ManagedGatewayTest(unittest.TestCase):
         self.assertEqual(status["thread_ancestors"], ["thread-1"])
         self.assertEqual(status["binding_source"], "fork")
 
+    def test_successful_same_tui_new_start_advances_visible_binding(self) -> None:
+        self.server.next_start_id = "thread-new-conversation"
+        self.client.request("thread/start", {})
+        status = control(self.control, {"schema_version": 1, "op": "status"})
+        self.assertEqual(status["thread_id"], "thread-new-conversation")
+        self.assertEqual(status["binding_source"], "start")
+        self.assertEqual(status["binding_generation"], 2)
+
+    def test_successful_same_tui_resume_of_other_conversation_advances_binding(self) -> None:
+        self.client.request("thread/resume", {"threadId": "thread-resumed"})
+        status = control(self.control, {"schema_version": 1, "op": "status"})
+        self.assertEqual(status["thread_id"], "thread-resumed")
+        self.assertEqual(status["binding_source"], "resume")
+        self.assertEqual(status["binding_generation"], 2)
+
+    def test_contradictory_present_session_id_does_not_bind(self) -> None:
+        self.server.next_start_id = "thread-forged-root"
+        self.server.thread_start_session_id = "thread-unrelated-root"
+        self.client.request("thread/start", {})
+        status = control(self.control, {"schema_version": 1, "op": "status"})
+        self.assertEqual(status["thread_id"], "thread-1")
+        self.assertEqual(status["binding_generation"], 1)
+        self.assertEqual(status["last_transition_reason"], "session-id-contradiction")
+
+    def test_start_with_forked_from_id_does_not_bind(self) -> None:
+        self.server.next_start_id = "thread-forged-start"
+        self.server.thread_start_forked_from_id = "thread-1"
+        self.client.request("thread/start", {})
+        status = control(self.control, {"schema_version": 1, "op": "status"})
+        self.assertEqual(status["thread_id"], "thread-1")
+        self.assertEqual(status["binding_generation"], 1)
+        self.assertEqual(status["last_transition_reason"], "forked-from-contradiction")
+
+    def test_resume_with_forked_from_id_does_not_bind(self) -> None:
+        self.server.thread_resume_forked_from_id = "thread-forged-parent"
+        self.client.request("thread/resume", {"threadId": "thread-resumed"})
+        status = control(self.control, {"schema_version": 1, "op": "status"})
+        self.assertEqual(status["thread_id"], "thread-1")
+        self.assertEqual(status["binding_generation"], 1)
+        self.assertEqual(status["last_transition_reason"], "forked-from-contradiction")
+
     def _human_gate_request(self) -> dict[str, Any]:
         receipt_module = GATEWAY.human_gate_receipt
         jobs = self.root / "state" / "jobs.log"
@@ -614,6 +695,7 @@ class ManagedGatewayTest(unittest.TestCase):
         status = control(self.control, {"schema_version": 1, "op": "status"})
         self.assertEqual(status["capabilities"]["human_gate_delivery"], {
             "version": 1, "thread_id": "thread-1", "epoch": status["epoch"],
+            "binding_generation": status["binding_generation"],
         })
         request = self._human_gate_request()
         first = control(self.control, request)
@@ -717,6 +799,34 @@ class ManagedGatewayTest(unittest.TestCase):
         self.assertIsNone(self.gateway.ledger.get(request["delivery_id"]))
         self.assertEqual(control(self.control, request)["status"], "accepted")
 
+    def test_real_control_socket_stale_generation_sends_no_upstream_turn(self):
+        self.server.next_start_id = "thread-new"
+        self.client.request("thread/start", {})
+        status = control(self.control, {"schema_version": 1, "op": "status"})
+        self.assertEqual(status["thread_id"], "thread-new")
+        self.assertEqual(status["binding_generation"], 2)
+        request = receipt_request("batch-stale-generation", "thread-new")
+        request["gateway_epoch"] = status["epoch"]
+        request["binding_generation"] = 1
+        before = self.server.counts()
+        result = control(self.control, request)
+        self.assertEqual(result["status"], "rejected")
+        self.assertEqual(result["reason"], "stale-binding-generation")
+        self.assertEqual(self.server.counts(), before)
+
+    def test_completion_without_epoch_or_generation_sends_no_upstream_turn(self):
+        for missing, reason in (
+            ("gateway_epoch", "stale-batch-epoch"),
+            ("binding_generation", "stale-binding-generation"),
+        ):
+            request = receipt_request(f"batch-missing-{missing}")
+            request.pop(missing)
+            before = self.server.counts()
+            result = control(self.control, request)
+            self.assertEqual(result["status"], "rejected")
+            self.assertEqual(result["reason"], reason)
+            self.assertEqual(self.server.counts(), before)
+
     def test_supervision_uses_notice_transport_once_without_completing_live_work(self):
         request, jobs, process = self._supervision_request()
         before = jobs.read_bytes()
@@ -744,15 +854,15 @@ class ManagedGatewayTest(unittest.TestCase):
         self.assertFalse(any("hearting-supervision" in m.get("params", {}).get("additionalContext", {})
                              for m in self.server.messages))
 
-    def test_sibling_thread_start_does_not_move_binding(self) -> None:
+    def test_same_tui_new_start_is_not_classified_as_sibling(self) -> None:
         self.server.next_start_id = "thread-sibling"
         self.client.request("thread/start", {})
         status = control(
             self.control, {"schema_version": 1, "op": "status"}
         )
-        self.assertEqual(status["thread_id"], "thread-1")
-        self.assertEqual(status["binding_source"], "initial")
-        self.assertEqual(status["sibling_thread_ids"], ["thread-sibling"])
+        self.assertEqual(status["thread_id"], "thread-sibling")
+        self.assertEqual(status["binding_source"], "start")
+        self.assertEqual(status["sibling_thread_ids"], [])
         self.assertEqual(status["witnessed_thread_id"], "thread-sibling")
 
     def test_exact_same_thread_resume_is_accepted(self) -> None:
@@ -763,18 +873,15 @@ class ManagedGatewayTest(unittest.TestCase):
         self.assertEqual(status["thread_id"], "thread-1")
         self.assertEqual(status["binding_source"], "resume")
 
-    def test_resume_of_different_id_is_rejected_as_sibling(self) -> None:
+    def test_same_tui_resume_of_different_id_is_a_visible_transition(self) -> None:
         self.client.request("thread/resume", {"threadId": "thread-other"})
         status = control(
             self.control, {"schema_version": 1, "op": "status"}
         )
-        self.assertEqual(status["thread_id"], "thread-1")
-        self.assertEqual(status["binding_source"], "initial")
-        self.assertIn("thread-other", status["sibling_thread_ids"])
+        self.assertEqual(status["thread_id"], "thread-other")
+        self.assertEqual(status["binding_source"], "resume")
 
     def test_fork_of_non_binding_thread_is_rejected(self) -> None:
-        self.server.next_start_id = "thread-sibling"
-        self.client.request("thread/start", {})
         self.server.next_fork_id = "thread-sibling-fork"
         self.client.request("thread/fork", {"threadId": "thread-sibling"})
         status = control(
@@ -842,23 +949,33 @@ class ManagedGatewayTest(unittest.TestCase):
         final = control(
             self.control, {"schema_version": 1, "op": "status"}
         )
-        self.assertEqual(final["thread_id"], "thread-2")
-        self.assertEqual(final["binding_source"], "fork")
-        self.assertIn("thread-sibling", final["sibling_thread_ids"])
+        self.assertIn(final["thread_id"], {"thread-sibling", "thread-2"})
+        self.assertEqual(
+            final["binding_source"],
+            "start" if final["thread_id"] == "thread-sibling" else "fork",
+        )
 
         # No probe ever observed a binding outside the two legitimate
         # values (pre-fork "thread-1", post-fork "thread-2") — the lock
         # around binding mutation rules out any interleaved/torn value.
         for snapshot in snapshots:
-            self.assertIn(snapshot["thread_id"], {"thread-1", "thread-2"})
+            self.assertIn(snapshot["thread_id"], {"thread-1", "thread-2", "thread-sibling"})
 
-        # The sibling thread never owns the binding at any point in the
-        # race, so its delivery is unconditionally rejected.
-        self.assertEqual(results["deliver_sibling"]["status"], "rejected")
-        self.assertEqual(
-            results["deliver_sibling"]["reason"],
-            "thread-not-owned-by-current-tui",
-        )
+        # A same-TUI start is now a real transition, so the concurrent
+        # delivery is accepted only if that transition won the request race;
+        # the final binding may advance after an earlier rejection.
+        if final["thread_id"] == "thread-sibling":
+            sibling_outcome = results["deliver_sibling"]
+            self.assertIn(sibling_outcome["status"], {"accepted", "sent-ambiguous", "rejected"})
+            if sibling_outcome["status"] == "rejected":
+                self.assertIn(sibling_outcome["reason"], {
+                    "stale-binding-generation", "thread-not-owned-by-current-tui",
+                })
+        else:
+            self.assertEqual(results["deliver_sibling"]["status"], "rejected")
+            self.assertIn(results["deliver_sibling"]["reason"], {
+                "stale-binding-generation", "thread-not-owned-by-current-tui",
+            })
 
         # A delivery explicitly addressed to "thread-1" either lands
         # before the fork advances the binding (accepted) or after
@@ -867,9 +984,9 @@ class ManagedGatewayTest(unittest.TestCase):
         binding_outcome = results["deliver_binding"]
         self.assertIn(binding_outcome["status"], {"accepted", "rejected"})
         if binding_outcome["status"] == "rejected":
-            self.assertEqual(
-                binding_outcome["reason"], "thread-not-owned-by-current-tui"
-            )
+            self.assertIn(binding_outcome["reason"], {
+                "stale-binding-generation", "thread-not-owned-by-current-tui",
+            })
 
     def test_manual_unwitnessed_turn_start_does_not_move_binding(self) -> None:
         self.client.request(
@@ -1457,9 +1574,14 @@ class ManagedGatewayTest(unittest.TestCase):
                 break
             time.sleep(0.01)
         result = control(self.control, receipt_request("batch-offline"))
-        self.assertEqual(result["status"], "retryable")
+        self.assertEqual(result["status"], "rejected")
+        self.assertEqual(result["reason"], "stale-binding-generation")
         self.client = self._connect_client()
-        result = control(self.control, receipt_request("batch-reconnected"))
+        status = control(self.control, {"schema_version": 1, "op": "status"})
+        result = control(self.control, receipt_request(
+            "batch-reconnected", gateway_epoch=status["epoch"],
+            binding_generation=status["binding_generation"],
+        ))
         self.assertEqual(result["status"], "accepted")
         self.assertEqual(self.server.connections, 2)
 
@@ -1628,7 +1750,7 @@ class ValidateDeliveryStageAdvanceNegotiationTest(unittest.TestCase):
         }
 
     def test_default_gateway_is_byte_identical_to_pre_sd110(self):
-        request = receipt_request()
+        request = receipt_request(gateway_epoch=0, binding_generation=0)
         *_, normalized, _receipt_digest, _delivery_id = self.gateway._validate_delivery(
             request
         )
@@ -1652,7 +1774,7 @@ class ValidateDeliveryStageAdvanceNegotiationTest(unittest.TestCase):
         self.assertNotIn("chain_id", json.dumps(normalized, sort_keys=True))
 
     def test_unnegotiated_gateway_rejects_stray_stage_advance_key(self):
-        request = receipt_request()
+        request = receipt_request(gateway_epoch=0, binding_generation=0)
         request["receipt"] = {
             **request["receipt"],
             "schema_version": GATEWAY.STAGE_ADVANCE_SCHEMA_VERSION,
@@ -1662,7 +1784,7 @@ class ValidateDeliveryStageAdvanceNegotiationTest(unittest.TestCase):
             self.gateway._validate_delivery(request)
 
     def test_negotiated_gateway_attaches_stage_advance_block(self):
-        request = receipt_request()
+        request = receipt_request(gateway_epoch=0, binding_generation=0)
         record = self._record()
         request["receipt"] = {
             **request["receipt"],
@@ -1676,7 +1798,7 @@ class ValidateDeliveryStageAdvanceNegotiationTest(unittest.TestCase):
         self.assertEqual(normalized["stage_advance"], record)
 
     def test_negotiated_gateway_still_accepts_v2_receipts(self):
-        request = receipt_request()
+        request = receipt_request(gateway_epoch=0, binding_generation=0)
         *_, normalized, _receipt_digest, _delivery_id = (
             self.negotiated_gateway._validate_delivery(request)
         )

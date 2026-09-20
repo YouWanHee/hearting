@@ -450,7 +450,19 @@ class ManagedGatewayRegistryTest(unittest.TestCase):
         gw = self._gateway()
         message = {"id": [1, "s1"], "result": {"thread": {"id": "sid-abc"}}}
         with gw._lock:
-            gw._track_tui_response_locked(("s", (1, "s1")), "thread/start", {}, message)
+            gw._latest_transition_sequence = 1
+            transition = {
+                "epoch": gw._epoch,
+                "sequence": 1,
+                "method": "thread/start",
+                "params": {},
+                "prior_thread_id": "",
+                "prior_generation": 0,
+            }
+            gw._track_tui_response_locked(
+                ("s", (1, "s1")), "thread/start", {}, message,
+                transition=transition,
+            )
             pending = gw._pending_registry_fields
         self.assertEqual(pending, {"sessionId": "sid-abc"})
 

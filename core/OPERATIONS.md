@@ -485,9 +485,26 @@ starts no subprocess or SessionEnd work, and emits no continuation. This
 supersedes older `native-Stop` and ordinary interactive park wording in this
 section; those shapes are migration history only.
 
-The SD-92 advanced-thread clause accepts only a gateway-witnessed fork lineage
-or an exact same-thread resume. An unrelated thread switch remains
-`managed-gateway-not-ready` and cannot inherit the predecessor's completion.
+The SD-92 advanced-thread clause accepts an exact same-epoch visible-TUI
+`thread/start` or `thread/resume`, or a gateway-witnessed direct fork of the
+current binding. A tool/native-subagent thread, unrelated sibling, response from
+another TUI, failed newest request, and stale older response remain diagnostic
+only. Present `thread.sessionId`/`forkedFromId` contradictions fail closed;
+documented-but-absent optional evidence is recorded as unverified. Completion
+delivery is sealed to the exact thread, epoch, binding generation, transition
+chain, parent/session, canonical jobs identity, attempts, and batch, then
+revalidated immediately before send. Typed parent outcomes distinguish
+`managed-entry-required`, `transition-unproved`, `binding-generation-mismatch`,
+`tui-disconnected`, and `approval-owner-mismatch`.
+
+Interactive-main recovery is distinct from registered headless work. It first
+proves the current terminal host, workspace, tab, source pane, and cwd from
+that host's live evidence, then uses only the host's supported native API to
+create a visible pane in the same workspace/tab and start the protected managed
+launcher. A read-only check creates nothing. A partial mutation reports the
+created pane for operator cleanup; it neither guesses another pane nor silently
+falls back to hidden tmux. Host environment identifiers are provenance, not
+managed-thread transition authority.
 
 **SD-110 runtime-owned deterministic stage advance.** At an eligible-linear
 boundary — completion gate proven, exactly one non-terminal runnable

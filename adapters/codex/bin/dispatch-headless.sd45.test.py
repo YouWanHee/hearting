@@ -816,7 +816,7 @@ class CodexSD78CompletionDelivery(unittest.TestCase):
         )
         with self.assertRaises(WH.DispatchContractError) as raised:
             WH.validate_interactive_parent_launch(args)
-        self.assertEqual(raised.exception.reason, "managed-entry-required")
+        self.assertEqual(raised.exception.reason, "tui-disconnected")
 
     def test_claude_parent_keeps_claude_wake_adapter_for_codex_child(self):
         args = self.parent_args(

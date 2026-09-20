@@ -35,6 +35,9 @@ class StatusServer:
         sibling_thread_ids: list[str] | None = None,
         witnessed_thread_id: str = "",
         binding_source: str = "initial",
+        binding_generation: int = 1,
+        binding_session_id: str = "thread-1",
+        session_id_verification: str = "verified",
         status_value: str = "ready",
         approval_owner: str = "tui",
         upstream_clients: int = 1,
@@ -45,6 +48,9 @@ class StatusServer:
         self.sibling_thread_ids = sibling_thread_ids or []
         self.witnessed_thread_id = witnessed_thread_id
         self.binding_source = binding_source
+        self.binding_generation = binding_generation
+        self.binding_session_id = binding_session_id
+        self.session_id_verification = session_id_verification
         self.status_value = status_value
         self.approval_owner = approval_owner
         self.upstream_clients = upstream_clients
@@ -77,6 +83,9 @@ class StatusServer:
             "witnessed_thread_id": self.witnessed_thread_id,
             "sibling_thread_ids": self.sibling_thread_ids,
             "binding_source": self.binding_source,
+            "binding_generation": self.binding_generation,
+            "binding_session_id": self.binding_session_id,
+            "session_id_verification": self.session_id_verification,
             "tui_connected": self.status_value == "ready",
         }
         connection.sendall(
@@ -203,7 +212,7 @@ class ManagedDispatchTest(unittest.TestCase):
                 parent_session_id="thread-1",
                 environ=self.env(self.control),
             )
-        self.assertEqual(raised.exception.reason_class, "lineage-mismatch")
+        self.assertEqual(raised.exception.reason_class, "expected-thread-not-witnessed")
 
     def test_reason_class_tui_disconnected(self) -> None:
         server = StatusServer(self.control, status_value="disconnected")
@@ -261,7 +270,7 @@ class ManagedDispatchTest(unittest.TestCase):
                 parent_session_id="thread-B",
                 environ=self.env(sibling_control, thread_id="thread-B"),
             )
-        self.assertEqual(raised.exception.reason_class, "lineage-mismatch")
+        self.assertEqual(raised.exception.reason_class, "expected-thread-not-witnessed")
         server_for_a = StatusServer(self.control, thread_id="thread-A")
         self.addCleanup(server_for_a.close)
         binding = MANAGED.probe_managed_codex_parent(
