@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -26,6 +27,20 @@ def completed(stdout: str, code: int = 0) -> subprocess.CompletedProcess[str]:
 
 
 class InteractiveMainRecoveryTest(unittest.TestCase):
+    def test_explicit_socket_is_used_for_every_host_request(self):
+        calls = []
+        responses = [self.payload, self.split_payload, self.get_payload, "{}"]
+        def run(command, **kwargs):
+            calls.append((command, kwargs))
+            return completed(responses[len(calls) - 1])
+        with mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": "/wrong/server.sock"}, clear=True):
+            RECOVERY.start(self.args(), runner=run, which=lambda _: "herdr")
+        self.assertEqual(len(calls), 4)
+        for command, kwargs in calls:
+            self.assertEqual(kwargs.get("env", {}).get("HERDR_SOCKET_PATH"), str(self.socket_path))
+        self.assertEqual(calls[-1][0][1:3], ["pane", "run"])
+        self.assertIn(str(self.launcher), calls[-1][0][-1])
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
@@ -65,7 +80,7 @@ class InteractiveMainRecoveryTest(unittest.TestCase):
     def test_check_reads_pane_inventory_only(self) -> None:
         calls: list[list[str]] = []
 
-        def run(command):
+        def run(command, **kwargs):
             calls.append(command)
             return completed(self.payload)
 
@@ -80,7 +95,7 @@ class InteractiveMainRecoveryTest(unittest.TestCase):
     def test_start_creates_visible_pane_with_native_host_api(self) -> None:
         calls: list[list[str]] = []
 
-        def run(command):
+        def run(command, **kwargs):
             calls.append(command)
             if command[1:3] == ["pane", "list"]:
                 return completed(self.payload)
@@ -96,15 +111,15 @@ class InteractiveMainRecoveryTest(unittest.TestCase):
                 runner=run,
                 which=lambda _: "/usr/bin/herdr",
             )
-        self.assertEqual(result["status"], "started")
+        self.assertEqual(result["status"], "launch-requested")
         self.assertEqual(calls[0], ["herdr", "pane", "list"])
         self.assertEqual(calls[1], [
             "herdr", "pane", "split", "--pane", "p-1", "--direction", "right",
             "--cwd", "/tmp/project", "--focus",
         ])
         self.assertEqual(calls[2], ["herdr", "pane", "get", "p-2"])
-        self.assertEqual(calls[3][calls[3].index("--pane") + 1], "p-2")
-        self.assertIn(str(self.launcher), calls[3])
+        self.assertEqual(calls[3][3], "p-2")
+        self.assertIn(str(self.launcher), calls[3][-1])
         self.assertFalse(any("tmux" in call for call in calls))
 
     def test_foreign_tab_is_rejected(self) -> None:
@@ -112,7 +127,7 @@ class InteractiveMainRecoveryTest(unittest.TestCase):
             with mock.patch.dict("os.environ", {"HERDR_WORKSPACE_ID": "w-1", "HERDR_TAB_ID": "other"}, clear=True):
                 RECOVERY.checked_pane(
                     "p-1", workspace="/tmp/project", socket_path=str(self.socket_path),
-                    runner=lambda _: completed(self.payload), which=lambda _: "herdr",
+                    runner=lambda _, **kwargs: completed(self.payload), which=lambda _: "herdr",
                 )
         self.assertEqual(raised.exception.reason, "tab-mismatch")
 
@@ -126,14 +141,14 @@ class InteractiveMainRecoveryTest(unittest.TestCase):
                 with self.assertRaises(RECOVERY.RecoveryError) as raised:
                     RECOVERY.checked_pane(
                         "p-1", workspace="/tmp/project", socket_path=str(self.socket_path),
-                        runner=lambda _: completed(payload), which=lambda _: "herdr",
+                        runner=lambda _, **kwargs: completed(payload), which=lambda _: "herdr",
                     )
             self.assertEqual(raised.exception.reason, reason)
 
     def test_path_shadow_cannot_replace_protected_launcher(self) -> None:
         calls: list[list[str]] = []
 
-        def run(command):
+        def run(command, **kwargs):
             calls.append(command)
             if command[1:3] == ["pane", "list"]:
                 return completed(self.payload)
@@ -145,12 +160,12 @@ class InteractiveMainRecoveryTest(unittest.TestCase):
 
         with mock.patch.dict("os.environ", {"PATH": str(self.root)}, clear=True):
             RECOVERY.start(self.args(), runner=run, which=lambda _: str(self.root / "fake-herdr"))
-        self.assertEqual(calls[3][calls[3].index("--") + 1], str(self.launcher))
+        self.assertEqual(shlex.split(calls[3][-1])[0], str(self.launcher))
 
     def test_split_failure_starts_no_agent(self) -> None:
         calls: list[list[str]] = []
 
-        def run(command):
+        def run(command, **kwargs):
             calls.append(command)
             if command[1:3] == ["pane", "list"]:
                 return completed(self.payload)
@@ -160,13 +175,13 @@ class InteractiveMainRecoveryTest(unittest.TestCase):
             with self.assertRaises(RECOVERY.RecoveryError) as raised:
                 RECOVERY.start(self.args(), runner=run, which=lambda _: "/usr/bin/herdr")
         self.assertEqual(raised.exception.reason, "herdr-pane-split-failed")
-        self.assertFalse(any(command[1:3] == ["agent", "start"] for command in calls))
+        self.assertFalse(any(command[1:3] == ["pane", "run"] for command in calls))
 
     def test_post_split_validation_reports_created_pane(self) -> None:
         calls: list[list[str]] = []
         foreign = dict(self.created_pane, tab_id="w-1:t-other")
 
-        def run(command):
+        def run(command, **kwargs):
             calls.append(command)
             if command[1:3] == ["pane", "list"]:
                 return completed(self.payload)
@@ -181,10 +196,27 @@ class InteractiveMainRecoveryTest(unittest.TestCase):
                 RECOVERY.start(self.args(), runner=run, which=lambda _: "/usr/bin/herdr")
         self.assertEqual(raised.exception.reason, "tab-mismatch")
         self.assertEqual(raised.exception.created_pane, "p-2")
-        self.assertFalse(any(command[1:3] == ["agent", "start"] for command in calls))
+        self.assertFalse(any(command[1:3] == ["pane", "run"] for command in calls))
+
+    def test_launch_transport_error_keeps_created_pane(self):
+        def run(command, **kwargs):
+            responses = {"list": self.payload, "split": self.split_payload, "get": self.get_payload}
+            if command[2] in responses:
+                return completed(responses[command[2]])
+            raise RECOVERY.RecoveryError("herdr-invocation-failed", "timed out")
+        with mock.patch.dict(os.environ, {}, clear=True), self.assertRaises(RECOVERY.RecoveryError) as raised:
+            RECOVERY.start(self.args(), runner=run, which=lambda _: "herdr")
+        self.assertEqual(raised.exception.created_pane, "p-2")
+
+    def test_missing_host_location_is_rejected_before_mutation(self):
+        payload = json.dumps({"result": {"panes": [{"pane_id": "p-1", "cwd": "/tmp/project"}]}})
+        with mock.patch.dict(os.environ, {}, clear=True), self.assertRaises(RECOVERY.RecoveryError) as raised:
+            RECOVERY.checked_pane("p-1", socket_path=str(self.socket_path),
+                                  runner=lambda _, **kwargs: completed(payload), which=lambda _: "herdr")
+        self.assertEqual(raised.exception.reason, "pane-location-missing")
 
     def test_agent_start_failure_is_typed(self) -> None:
-        def run(command):
+        def run(command, **kwargs):
             if command[1:3] == ["pane", "list"]:
                 return completed(self.payload)
             if command[1:3] == ["pane", "split"]:

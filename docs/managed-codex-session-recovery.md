@@ -27,6 +27,8 @@ an upstream `turn/start` or `turn/steer`.
 | later successful TUI start | selects the new root conversation |
 | later successful TUI resume | selects the requested conversation |
 | direct TUI fork of the current binding | advances to the fork |
+| initial explicit TUI fork | establishes from the exact requested source |
+| resume of a previously forked thread | accepts valid persisted ancestry without granting it authority |
 | failed transition or stale older response | none |
 | bare notification, sibling, tool, or native-subagent thread | diagnostic only |
 | another TUI epoch | none; the old evidence is stale |
@@ -34,6 +36,11 @@ an upstream `turn/start` or `turn/steer`.
 The UI action that triggered the original incident has not been reproduced, so
 do not label it as start, resume, or fork without captured request/response
 evidence.
+
+Revisiting a conversation retains the witnessed launcher root in a bounded
+transition history. Resuming the same thread in the same epoch preserves the
+generation and its pending batches. A true thread change or reconnect still
+rejects stale batches rather than delivering them to another conversation.
 
 ## Read-only Herdr check
 
@@ -51,7 +58,11 @@ preflight.sh interactive-main-recovery --check \
 `--start` is a separate explicit mutation. It repeats the source proof, verifies
 the protected managed launcher from its owner-private install record, asks Herdr
 to create a focused visible pane in the same workspace/tab and cwd, verifies the
-created pane, and starts Codex there. It never falls back to tmux. If validation
+created pane, and submits the shell-quoted protected executable through
+`herdr pane run`. Every API call uses the validated socket, including when
+`--socket` differs from the ambient environment. `launch-requested` proves
+command submission only; it does not assert native readiness or a managed
+binding. It never falls back to tmux. If validation
 or agent start fails after the split, the result includes `created_pane`; cleanup
 remains an operator decision.
 

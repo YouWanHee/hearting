@@ -163,6 +163,10 @@ def probe_managed_codex_parent(
     response = _control_request(
         control, {"schema_version": 1, "op": "status"}
     )
+    if response.get("binding_blocked") is True:
+        raise ManagedDispatchError(
+            "managed-gateway-not-ready", reason_class="transition-unproved"
+        )
     epoch = response.get("epoch")
     gateway_thread = response.get("thread_id")
     ancestors = response.get("thread_ancestors", [])

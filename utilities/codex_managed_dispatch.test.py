@@ -379,6 +379,7 @@ class ManagedDispatchTest(unittest.TestCase):
                     **self.env(control),
                     "AGENT_HOME": str(MANAGED.ROOT),
                     "AGENT_ARTIFACT_ROOT": str(reports),
+                    "AGENT_DISPATCH_JOBS": str(jobs),
                     "AGENT_DISPATCH_CHILD": "0",
                 }
                 try:

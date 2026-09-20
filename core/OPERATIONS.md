@@ -487,7 +487,11 @@ section; those shapes are migration history only.
 
 The SD-92 advanced-thread clause accepts an exact same-epoch visible-TUI
 `thread/start` or `thread/resume`, or a gateway-witnessed direct fork of the
-current binding. A tool/native-subagent thread, unrelated sibling, response from
+current binding (or the exact requested source at initial fork entry). Persisted
+fork ancestry on a resumed thread is valid metadata, not transition authority.
+An immutable witnessed launcher root and bounded transition history survive
+conversation revisits; an identity-preserving same-epoch resume keeps the batch
+generation. A tool/native-subagent thread, unrelated sibling, response from
 another TUI, failed newest request, and stale older response remain diagnostic
 only. Present `thread.sessionId`/`forkedFromId` contradictions fail closed;
 documented-but-absent optional evidence is recorded as unverified. Completion
@@ -504,7 +508,8 @@ create a visible pane in the same workspace/tab and start the protected managed
 launcher. A read-only check creates nothing. A partial mutation reports the
 created pane for operator cleanup; it neither guesses another pane nor silently
 falls back to hidden tmux. Host environment identifiers are provenance, not
-managed-thread transition authority.
+managed-thread transition authority. Every host API call uses the validated
+socket. Command submission is reported separately from native readiness.
 
 **SD-110 runtime-owned deterministic stage advance.** At an eligible-linear
 boundary — completion gate proven, exactly one non-terminal runnable

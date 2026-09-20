@@ -308,6 +308,13 @@ prompt carries the carrier taxonomy (dispatch-complexity diagnosis
 
 - **Visible-main transition fence:** the gateway distinguishes initial binding, a successful `thread/start` requested by the sole visible TUI, a successful `thread/resume` requested by that same TUI, a direct `thread/fork` of the current binding, and threads created by tools or native subagents. Only an exact successful TUI request/response pair in the current TUI epoch may advance the visible binding; siblings and notification-only events remain diagnostic. Requests carry a monotonic sequence and last-requested-wins rule: a failed newest request does not bind, and an older response cannot bind after a newer request. Present `sessionId` and `forkedFromId` evidence is checked for contradiction; documented optional fields that are absent are recorded as unverified/absent rather than invented. Every prepared completion is fenced by exact thread, epoch, binding generation, launcher-root transition chain, parent/session identity, canonical jobs identity, attempts, and batch, and is revalidated immediately before send. A stale generation never retargets or sends upstream. Parent errors distinguish unmanaged entry, managed-but-unproved transition, stale generation, disconnected TUI, and approval-owner mismatch. The sidecar remains a control-socket producer only, with one upstream client and TUI approval ownership unchanged.
 
+An initial explicit TUI fork may establish the binding from its exact requested
+source. A resumed fork's valid persisted ancestry is not a contradiction and
+never grants thread authority by itself. Authorization retains the witnessed
+launcher root across bounded conversation revisits without predecessor cycles.
+Same-thread resume in the same epoch preserves the binding generation; an
+actual thread or epoch change still fences old batches without retargeting.
+
 **`parent-runtime-supervised` completion delivery (SD-113).** A row whose
 `parent_completion_delivery = parent-runtime-supervised` never gets a
 pending-delivery record — its completion delivery is owned solely by the

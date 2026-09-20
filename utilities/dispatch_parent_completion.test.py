@@ -40,6 +40,24 @@ def args(parent="codex", **values):
 
 
 class ParentDeliveryContract(unittest.TestCase):
+    def test_managed_failure_explains_actual_reason_and_visible_host_recovery(self):
+        for probe_class, expected in (("lineage-mismatch", "transition-unproved"),
+                                      ("upstream-client-count-invalid", "managed-gateway-not-ready")):
+            with self.subTest(probe_class=probe_class), mock.patch.dict(os.environ, {
+                "AGENT_CODEX_MANAGED_GATEWAY": "1", "HERDR_PANE_ID": "wK:p3",
+                "HERDR_SOCKET_PATH": "/checked/herdr.sock",
+            }, clear=True):
+                request = args(parent_completion_delivery="poll-fallback",
+                               parent_completion_reason="managed-gateway-not-ready",
+                               parent_completion_reason_class=probe_class)
+                with self.assertRaises(P.DispatchContractError) as raised:
+                    P.validate_interactive_parent_launch(request)
+                self.assertEqual(raised.exception.reason, expected)
+                self.assertIn("already managed", str(raised.exception))
+                self.assertIn("interactive-main-recovery --check", str(raised.exception))
+                self.assertIn("visible pane", str(raised.exception))
+                self.assertNotIn("unmanaged interactive Codex parents", str(raised.exception))
+
     def test_every_adapter_parser_binds_the_actual_parent_session(self):
         for parent, key in (("codex", "CODEX_THREAD_ID"),
                             ("claude", "CLAUDE_CODE_SESSION_ID"),

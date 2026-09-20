@@ -16,6 +16,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import shlex
 import stat
 import subprocess
 import sys
@@ -40,11 +41,18 @@ class RecoveryError(RuntimeError):
         self.created_pane = created_pane
 
 
-def _run(command: list[str]) -> subprocess.CompletedProcess[str]:
+def _run(command: list[str], *, env=None) -> subprocess.CompletedProcess[str]:
     try:
-        return subprocess.run(command, capture_output=True, text=True, timeout=5)
+        return subprocess.run(command, capture_output=True, text=True, timeout=5, env=env)
     except (OSError, subprocess.SubprocessError) as exc:
         raise RecoveryError("herdr-invocation-failed", str(exc)) from exc
+
+
+def host_runner(socket_path, runner):
+    """Use the socket actually checked, regardless of ambient host variables."""
+    verified = validate_herdr_socket(socket_path)
+    env = dict(os.environ, HERDR_SOCKET_PATH=str(verified))
+    return lambda command: runner(command, env=env)
 
 
 def validate_herdr_socket(path: str | None = None) -> Path:
@@ -176,8 +184,7 @@ def checked_pane(
     pane_id: str, *, workspace: str | None = None, socket_path: str | None = None,
     runner=_run, which=shutil.which,
 ) -> dict[str, Any]:
-    validate_herdr_socket(socket_path)
-    pane = select_pane(herdr_panes(runner=runner, which=which), pane_id)
+    pane = select_pane(herdr_panes(runner=host_runner(socket_path, runner), which=which), pane_id)
     result = {
         "pane_id": _field(pane, "pane_id", "paneId", "id"),
         "workspace_id": _field(pane, "workspace_id", "workspaceId"),
@@ -185,6 +192,8 @@ def checked_pane(
         "cwd": _field(pane, "cwd", "working_directory", "workingDirectory"),
         "agent": pane.get("agent"),
     }
+    if not result["workspace_id"] or not result["tab_id"]:
+        raise RecoveryError("pane-location-missing", pane_id)
     if not result["cwd"]:
         raise RecoveryError("pane-cwd-missing", pane_id)
     if workspace is not None:
@@ -203,6 +212,7 @@ def start(args: argparse.Namespace, *, runner=_run, which=shutil.which) -> dict[
         args.pane, workspace=workspace, socket_path=args.socket,
         runner=runner, which=which,
     )
+    runner = host_runner(args.socket, runner)
     launcher = protected_launcher(Path(args.launcher_state).expanduser())
     split = runner([
         "herdr", "pane", "split", "--pane", args.pane, "--direction", "right",
@@ -231,9 +241,14 @@ def start(args: argparse.Namespace, *, runner=_run, which=shutil.which) -> dict[
         raise RecoveryError(
             exc.reason, exc.detail, created_pane=created_pane
         ) from exc
-    command = ["herdr", "agent", "start", args.name, "--kind", "codex", "--pane", created_pane,
-               "--", str(launcher), "--cd", workspace, *args.agent_args]
-    result = runner(command)
+    # `agent start --kind codex -- ...` accepts Codex arguments, not an
+    # executable override. Run the verified executable through pane run.
+    command = ["herdr", "pane", "run", created_pane,
+               shlex.join([str(launcher), "--cd", workspace, *args.agent_args])]
+    try:
+        result = runner(command)
+    except RecoveryError as exc:
+        raise RecoveryError(exc.reason, exc.detail, created_pane=created_pane) from exc
     if result.returncode != 0:
         raise RecoveryError(
             "herdr-agent-start-failed", (result.stderr or result.stdout).strip(),
@@ -247,7 +262,8 @@ def start(args: argparse.Namespace, *, runner=_run, which=shutil.which) -> dict[
         raise RecoveryError(
             "herdr-agent-start-rejected", str(payload["error"]), created_pane=created_pane
         )
-    return {"status": "started", "pane": pane, "workspace": workspace, "herdr": payload}
+    # Submission proves neither native readiness nor a managed binding.
+    return {"status": "launch-requested", "pane": pane, "workspace": workspace, "herdr": payload}
 
 
 def parser() -> argparse.ArgumentParser:
@@ -257,7 +273,6 @@ def parser() -> argparse.ArgumentParser:
     mode.add_argument("--start", action="store_true")
     value.add_argument("--pane", default=os.environ.get("HERDR_PANE_ID", ""))
     value.add_argument("--socket", default=os.environ.get("HERDR_SOCKET_PATH", ""))
-    value.add_argument("--name", default="hearting-managed-main")
     value.add_argument("--workspace", default=os.getcwd())
     value.add_argument(
         "--launcher-state",
