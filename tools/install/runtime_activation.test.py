@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import json
 import socket
 import subprocess
 import sys
@@ -10,6 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import runtime_activation as activation  # noqa: E402
 import installer  # noqa: E402
+import fixture_env  # noqa: E402
 
 
 class RuntimeSnapshotTest(unittest.TestCase):
@@ -419,19 +421,81 @@ class LinkedReleaseBundleTest(unittest.TestCase):
             bundle_source, _ = self._build(release, root / "codex-home")
             checksum = activation._bundle_checksum(bundle_source)
             self.assertIsInstance(checksum, str)
-            # A release stays byte-identical, but a runtime dropping a __pycache__
-            # into it must not read as a stale bundle (it is digest-ignored, and a
-            # linked bundle asserts its link, not the tree behind it).
             (release / "utilities" / "__pycache__").mkdir()
             (release / "utilities" / "__pycache__" / "tool.pyc").write_bytes(b"\x00")
             self.assertEqual(activation._bundle_checksum(bundle_source), checksum)
-            # Repointing the link is exactly what "stale" must mean here.
             elsewhere = self._release(root, "v7.7.7")
             # destructive-ok: reason=repoint the bundle link to make the checksum stale; boundary=the one symlink this test just created under its own temporary codex home
             bundle_source.unlink()
             os.symlink(elsewhere, bundle_source, target_is_directory=True)
             self.assertIsNone(activation._bundle_checksum(bundle_source))
 
+
+class RuntimeActivationOwnershipTest(unittest.TestCase):
+    def test_capture_excludes_runtime_local_harness_siblings(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            with fixture_env.patched_environment(root / "fixture", source):
+                state_dir = activation.paths.harness_state_dir("codex")
+                local_dispatch = state_dir / "dispatch" / "jobs.log"
+                managed = state_dir / "managed-sessions" / "live.json"
+                sibling = state_dir / "unknown-sibling" / "value"
+                local_dispatch.parent.mkdir(parents=True)
+                managed.parent.mkdir(parents=True)
+                sibling.parent.mkdir(parents=True)
+                local_dispatch.write_text("local row\n", encoding="utf-8")
+                managed.write_text("session\n", encoding="utf-8")
+                sibling.write_text("unknown\n", encoding="utf-8")
+                snapshot = activation.capture_runtime_state("codex")
+                self.addCleanup(activation.discard_runtime_state, snapshot)
+                destinations = {Path(item["dest"]) for item in snapshot["records"]}
+                self.assertNotIn(state_dir, destinations)
+                self.assertNotIn(local_dispatch, destinations)
+                self.assertNotIn(managed, destinations)
+                self.assertNotIn(sibling, destinations)
+                self.assertIn(state_dir / "transactions", destinations)
+
+
+class RuntimeActivationConflictPreflightTest(unittest.TestCase):
+    def test_codex_conflict_refuses_before_capture(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            with fixture_env.patched_environment(root / "fixture", source):
+                config = activation.paths.runtime_home("codex") / "config.toml"
+                config.parent.mkdir(parents=True)
+                config.write_text(
+                    '[plugins."hearting-codex@fixture"]\nenabled = true\n',
+                    encoding="utf-8",
+                )
+                before = config.read_bytes()
+                with self.assertRaisesRegex(activation.ActivationError, "hearting-codex"):
+                    activation.validate_request(
+                        "codex", "activate", mode="linked", source=str(source)
+                    )
+                self.assertEqual(config.read_bytes(), before)
+
+    def test_refresh_conflict_refuses_before_capture(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            with fixture_env.patched_environment(root / "fixture", source):
+                state_path = activation._state_path("codex")
+                state_path.parent.mkdir(parents=True)
+                state_path.write_text(
+                    json.dumps({"mode": "linked", "source_root": str(source)}),
+                    encoding="utf-8",
+                )
+                config = activation.paths.runtime_home("codex") / "config.toml"
+                config.write_text(
+                    '[plugins."hearting-codex"]\n', encoding="utf-8"
+                )
+                with self.assertRaisesRegex(activation.ActivationError, "hearting-codex"):
+                    activation.validate_request("codex", "refresh")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

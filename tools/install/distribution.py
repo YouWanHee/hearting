@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -1126,9 +1127,9 @@ def _activate_release(root: Path, runtimes: Iterable[str]) -> dict:
     except json.JSONDecodeError:
         report = None
     if result.returncode != 0 or not isinstance(report, dict):
-        detail = (result.stderr or result.stdout).strip()
+        detail = _activation_failure_detail(result.stdout, result.stderr)
         raise DistributionError(
-            f"runtime activation failed ({result.returncode}): {detail[:1000]}"
+            f"runtime activation failed ({result.returncode}): {detail}"
         )
     rows = report.get("runtimes")
     if not isinstance(rows, list):
@@ -1142,6 +1143,61 @@ def _activate_release(root: Path, runtimes: Iterable[str]) -> dict:
         },
         "report": report,
     }
+
+
+def _activation_failure_detail(stdout: str, stderr: str) -> str:
+    """Select and sanitize a bounded child activation diagnostic."""
+
+    def tail(value: str) -> str:
+        raw = value if isinstance(value, str) else str(value or "")
+        return raw.encode("utf-8", "replace")[-65536:].decode("utf-8", "replace")
+
+    stdout_tail = tail(stdout)
+    stderr_tail = tail(stderr)
+    selected = ""
+    try:
+        parsed = json.loads(stdout_tail)
+    except (TypeError, ValueError):
+        parsed = None
+    if isinstance(parsed, dict):
+        for key in ("error", "detail"):
+            value = parsed.get(key)
+            if isinstance(value, str) and value.strip():
+                selected = value
+                break
+        if not selected and isinstance(parsed.get("lines"), list):
+            for value in reversed(parsed["lines"]):
+                if isinstance(value, str) and value.strip():
+                    selected = value
+                    break
+    if not selected:
+        for stream in (stderr_tail, stdout_tail):
+            lines = [line for line in stream.splitlines() if line.strip()]
+            if lines:
+                selected = lines[-1]
+                break
+
+    selected = "".join(
+        " " if unicodedata.category(char).startswith("C") else char
+        for char in selected
+    )
+    selected = re.sub(r"\s+", " ", selected).strip()
+    assignment = re.compile(
+        r"(?i)\b(token|password|secret|authorization|api[-_]?key)\b"
+        r"(\s*[=:]\s*)(\"[^\"]*\"|'[^']*'|[^\s,;?&#]+)"
+    )
+    selected = assignment.sub(r"\1\2[REDACTED]", selected)
+    selected = re.sub(
+        r"(?i)(\b[a-z][a-z0-9+.-]*://)[^/?#\s@]+@",
+        r"\1[REDACTED]@",
+        selected,
+    )
+    selected = re.sub(
+        r"(?i)([?&])([a-z0-9_.~-]+)(=)([^&#\s]*)",
+        r"\1\2\3[REDACTED]",
+        selected,
+    )
+    return selected[:1000]
 
 
 def _reconcile_codex_launcher() -> dict:
