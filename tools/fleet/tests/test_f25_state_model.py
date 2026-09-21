@@ -246,6 +246,28 @@ class HysteresisSequenceTest(FixtureBase):
         self.assertEqual(state, "working")
         self.assertEqual(ev["tier"], 1)
 
+    def test_codex_registry_freshness_wall_clock_delta_table(self):
+        # mtime and updated_at are wall clocks, not a causal or monotonic ordering.
+        epsilon = 0.000001
+        cases = (
+            ("below tolerance", 100.0, 101.0 - epsilon, "idle", 1),
+            ("at tolerance", 100.0, 101.0, "idle", 1),
+            ("above tolerance", 100.0, 101.0 + epsilon, "working", 2),
+            ("negative skew", 101.0, 100.0, "idle", 1),
+            ("future mtime", 2000.0, 2002.0, "working", 2),
+            ("very large values", 1_000_000_000_000.0,
+             1_000_000_000_002.0, "working", 2),
+        )
+        for name, updated_at, mtime, expected_state, expected_tier in cases:
+            with self.subTest(name=name):
+                state, evidence = model.classify_session({
+                    "harness": "codex", "pid_alive": True, "orphan": False,
+                    "status": "idle", "updated_at": updated_at, "mtime": mtime,
+                    "transcript": True, "task_lifecycle": "task_started",
+                }, 1000.0)
+                self.assertEqual(state, expected_state)
+                self.assertEqual(evidence["tier"], expected_tier)
+
 
 class TrackerLifecycleTest(FixtureBase):
     """R7 — singleton state must not leak or grow unbounded."""
@@ -505,6 +527,16 @@ class AdditiveSchemaTest(unittest.TestCase):
         for f in ("proc_start", "registry_proc_start", "started_at", "updated_at",
                   "registry_name", "kind", "provenance", "state_evidence"):
             self.assertIsNone(getattr(s, f), f)
+
+    def test_state_evidence_source_and_rule_are_extensible_strings(self):
+        """Consumers must not reject new source/rule values as unknown enums."""
+        evidence = model._evidence(
+            "idle", 2, "future-source+v99", "future rule vocabulary v99", {}
+        )
+        self.assertEqual(evidence["source"], "future-source+v99")
+        self.assertEqual(evidence["rule"], "future rule vocabulary v99")
+        self.assertIsInstance(evidence["source"], str)
+        self.assertIsInstance(evidence["rule"], str)
 
 
 class NamespaceLocalDescendantEvidenceTest(unittest.TestCase):

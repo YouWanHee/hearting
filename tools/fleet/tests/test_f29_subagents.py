@@ -474,31 +474,23 @@ class CodexSubagentTest(unittest.TestCase):
                 self.assertIsNone(codex._latest_task_lifecycle(ambiguous))
             self.assertEqual(parse.call_count, 2)
 
-    def test_lifecycle_parser_configurations_share_exact_cursor_in_both_orders(self):
+    def test_native_subagent_full_scan_is_independent_of_session_cursor(self):
         with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "bounded.jsonl")
+            path = os.path.join(tmp, "child.jsonl")
+            self._lifecycle(path, [("task_started", "old")])
+            self.assertEqual(codex._latest_task_lifecycle(path), ("task_started", "old"))
+
+            replacement = os.path.join(tmp, "replacement.jsonl")
             self._lifecycle(
-                path,
-                [("task_started", "turn"), ("task_complete", "turn")],
-                trailing=4096,
+                replacement,
+                [("task_started", "new"), ("task_complete", "new")],
             )
-            for first_narrow in (True, False):
-                codex._LIFECYCLE_CACHE.clear()
-                calls = (
-                    ((64, 128), (65536, 1048576))
-                    if first_narrow else
-                    ((65536, 1048576), (64, 128))
-                )
-                with mock.patch.object(
-                    codex, "_initialize_lifecycle_cursor",
-                    wraps=codex._initialize_lifecycle_cursor,
-                ) as parse:
-                    results = [
-                        codex._latest_task_lifecycle(path, chunk, max_scan)
-                        for chunk, max_scan in calls
-                    ]
-                self.assertEqual(results, [("task_complete", "turn")] * 2)
-                self.assertEqual(parse.call_count, 1)
+            os.replace(replacement, path)
+
+            self.assertIs(
+                codex._subagent_active("open", path, now=os.path.getmtime(path)),
+                False,
+            )
 
     def test_lifecycle_chunk_is_io_only_and_does_not_fork_cursor(self):
         with tempfile.TemporaryDirectory() as tmp:

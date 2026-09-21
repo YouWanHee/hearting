@@ -4,6 +4,7 @@ import os
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -98,21 +99,117 @@ class IncrementalLifecycleTest(unittest.TestCase):
                 handle.write(terminal[split:])
             self.assertEqual(codex._latest_task_lifecycle(path), ("task_complete", "turn"))
 
-    def test_default_and_full_modes_share_one_cursor(self):
+    def test_max_scan_none_reads_current_file_without_using_or_mutating_cursor(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "modes.jsonl")
+            self._write(path, _event("task_started", "old"), "{}\n" * 200)
+            canonical = os.path.realpath(path)
+            self.assertEqual(codex._latest_task_lifecycle(path), ("task_started", "old"))
+            cached = codex._LIFECYCLE_CACHE[canonical]
+
+            # A contract-external middle rewrite is intentionally invisible to the
+            # cursor. The exact native-subagent mode must still read current bytes.
+            with open(path, "r+b") as handle:
+                handle.write(_event("task_started", "new").encode("utf-8"))
+                handle.seek(0, os.SEEK_END)
+                handle.write(b"{}\n")
+
+            self.assertEqual(
+                codex._latest_task_lifecycle(path, max_scan=None),
+                ("task_started", "new"),
+            )
+            self.assertIs(codex._LIFECYCLE_CACHE[canonical], cached)
+            self.assertEqual(codex._latest_task_lifecycle(path), ("task_started", "old"))
+
+    def test_max_scan_none_reads_replacement_immediately_without_evicting_cursor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "rotation.jsonl")
+            self._write(path, _event("task_started", "old"))
+            canonical = os.path.realpath(path)
+            self.assertEqual(codex._latest_task_lifecycle(path), ("task_started", "old"))
+            cached = codex._LIFECYCLE_CACHE[canonical]
+
+            replacement = os.path.join(tmp, "replacement.jsonl")
+            self._write(replacement, _event("task_started", "new"))
+            os.replace(replacement, path)
+
+            self.assertEqual(
+                codex._latest_task_lifecycle(path, max_scan=None),
+                ("task_started", "new"),
+            )
+            self.assertIs(codex._LIFECYCLE_CACHE[canonical], cached)
+            self.assertIsNone(codex._latest_task_lifecycle(path))
+            self.assertNotIn(canonical, codex._LIFECYCLE_CACHE)
+
+    def test_max_scan_none_io_failure_does_not_evict_session_cursor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "exact-error.jsonl")
             self._write(path, _event("task_started", "turn"))
+            canonical = os.path.realpath(path)
+            self.assertEqual(codex._latest_task_lifecycle(path), ("task_started", "turn"))
+            cached = codex._LIFECYCLE_CACHE[canonical]
             with mock.patch.object(
-                codex, "_initialize_lifecycle_cursor",
-                wraps=codex._initialize_lifecycle_cursor,
-            ) as initialize:
-                self.assertEqual(codex._latest_task_lifecycle(path), ("task_started", "turn"))
+                codex, "_parse_latest_task_lifecycle", side_effect=OSError
+            ):
+                self.assertIsNone(codex._latest_task_lifecycle(path, max_scan=None))
+            self.assertIs(codex._LIFECYCLE_CACHE[canonical], cached)
+
+    def test_append_timestamp_regression_before_or_after_read_fails_closed(self):
+        for phase in ("before", "after"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as tmp:
+                codex._LIFECYCLE_CACHE.clear()
+                path = os.path.join(tmp, "timestamp-%s.jsonl" % phase)
+                canonical = os.path.realpath(path)
+                self._write(path, _event("task_started", "turn"))
                 self.assertEqual(
-                    codex._latest_task_lifecycle(path, max_scan=None),
-                    ("task_started", "turn"),
+                    codex._latest_task_lifecycle(path), ("task_started", "turn")
                 )
-            initialize.assert_called_once()
-            self.assertEqual(list(codex._LIFECYCLE_CACHE), [os.path.realpath(path)])
+                cached = codex._LIFECYCLE_CACHE[canonical]
+                with open(path, "a", encoding="utf-8") as handle:
+                    handle.write("{}\n")
+                current = os.stat(path)
+                regressed = SimpleNamespace(
+                    st_dev=current.st_dev,
+                    st_ino=current.st_ino,
+                    st_size=current.st_size,
+                    st_mtime_ns=(
+                        cached.mtime_ns - 1
+                        if phase == "before" else current.st_mtime_ns
+                    ),
+                    st_ctime_ns=(
+                        current.st_ctime_ns
+                        if phase == "before" else cached.ctime_ns - 1
+                    ),
+                )
+                with mock.patch.object(
+                    codex.os if phase == "before" else codex,
+                    "stat" if phase == "before" else "_stable_path_stat",
+                    return_value=regressed,
+                ):
+                    self.assertIsNone(codex._latest_task_lifecycle(path))
+                self.assertNotIn(canonical, codex._LIFECYCLE_CACHE)
+
+    def test_saved_boundary_change_and_short_read_fail_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "boundary.jsonl")
+            canonical = os.path.realpath(path)
+            self._write(path, _event("task_started", "turn"), "{}\n" * 200)
+            self.assertEqual(codex._latest_task_lifecycle(path), ("task_started", "turn"))
+            cached = codex._LIFECYCLE_CACHE[canonical]
+            with open(path, "r+b") as handle:
+                handle.seek(cached.offset - 2)
+                handle.write(b"[]")
+                handle.seek(0, os.SEEK_END)
+                handle.write(b"{}\n")
+            self.assertIsNone(codex._latest_task_lifecycle(path))
+            self.assertNotIn(canonical, codex._LIFECYCLE_CACHE)
+
+            self.assertEqual(codex._latest_task_lifecycle(path), ("task_started", "turn"))
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write("{}\n")
+            with mock.patch.object(codex, "_cursor_boundary", side_effect=OSError):
+                self.assertIsNone(codex._latest_task_lifecycle(path))
+            self.assertNotIn(canonical, codex._LIFECYCLE_CACHE)
 
     def test_unrelated_malformed_json_is_ignored_but_bad_lifecycle_clears(self):
         with tempfile.TemporaryDirectory() as tmp:

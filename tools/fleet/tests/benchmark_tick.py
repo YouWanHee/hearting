@@ -29,7 +29,7 @@ from fleet.collectors import codex, dispatch, liveness, procscan, usage_api  # n
 from fleet.model import Session  # noqa: E402
 
 
-BENCHMARK_SCHEMA = "fleet-tick-benchmark-v1"
+BENCHMARK_SCHEMA = "fleet-tick-benchmark-v2"
 FIXTURE_SCHEMA = "fleet-tick-fixture-v1"
 SESSION_FIELDS = (
     "harness", "pid", "proc_start", "cwd", "elapsed_min", "session_id", "title",
@@ -260,13 +260,12 @@ class _Counters:
     def reset(self):
         self.current = {
             "lifecycle_calls": 0,
-            "raw_lifecycle_parses": 0,
+            "lifecycle_cursor_initializations": 0,
+            "lifecycle_exact_scans": 0,
             "raw_edge_builds_by_home": {},
             "cwd_parses": 0,
             "roots_visited": 0,
             "files_visited": 0,
-            "cache_hits": 0,
-            "cache_misses": 0,
             "cache_evictions": 0,
         }
 
@@ -276,15 +275,28 @@ class _Counters:
 
 @contextlib.contextmanager
 def _instrument(counters):
-    raw_lifecycle = codex._initialize_lifecycle_cursor
+    cursor_initialization = codex._initialize_lifecycle_cursor
+    exact_scan = codex._parse_latest_task_lifecycle
     lifecycle = codex._latest_task_lifecycle
     raw_edges = codex._build_thread_subagents
     transcript_cwd = dispatch._codex_transcript_cwd
     real_walk = os.walk
 
-    def counted_raw_lifecycle(*args, **kwargs):
-        counters.current["raw_lifecycle_parses"] += 1
-        return raw_lifecycle(*args, **kwargs)
+    exact_depth = 0
+
+    def counted_cursor_initialization(*args, **kwargs):
+        if exact_depth == 0:
+            counters.current["lifecycle_cursor_initializations"] += 1
+        return cursor_initialization(*args, **kwargs)
+
+    def counted_exact_scan(*args, **kwargs):
+        nonlocal exact_depth
+        counters.current["lifecycle_exact_scans"] += 1
+        exact_depth += 1
+        try:
+            return exact_scan(*args, **kwargs)
+        finally:
+            exact_depth -= 1
 
     def counted_lifecycle(*args, **kwargs):
         counters.current["lifecycle_calls"] += 1
@@ -308,7 +320,11 @@ def _instrument(counters):
 
     with contextlib.ExitStack() as stack:
         stack.enter_context(mock.patch.object(
-            codex, "_initialize_lifecycle_cursor", side_effect=counted_raw_lifecycle
+            codex, "_initialize_lifecycle_cursor",
+            side_effect=counted_cursor_initialization,
+        ))
+        stack.enter_context(mock.patch.object(
+            codex, "_parse_latest_task_lifecycle", side_effect=counted_exact_scan
         ))
         stack.enter_context(mock.patch.object(
             codex, "_latest_task_lifecycle", side_effect=counted_lifecycle
@@ -331,12 +347,6 @@ def _run_tick(jobs_path, fixture_root, counters):
     sessions, jobs = collect_all(jobs_path=jobs_path)
     cpu_ns = time.process_time_ns() - cpu_start
     wall_ns = time.perf_counter_ns() - wall_start
-    counters.current["cache_misses"] = counters.current["raw_lifecycle_parses"]
-    counters.current["cache_hits"] = max(
-        0,
-        counters.current["lifecycle_calls"]
-        - counters.current["raw_lifecycle_parses"],
-    )
     counters.current["cache_evictions"] = max(
         0,
         getattr(codex, "_LIFECYCLE_CACHE_EVICTIONS", 0) - evictions_before,
@@ -450,9 +460,9 @@ def _validate_result(result):
     if len(result.get("warm_samples", [])) != result["iterations"]:
         raise ValueError("warm sample count mismatch")
     required_counters = {
-        "raw_lifecycle_parses", "raw_edge_builds_by_home", "cwd_parses",
-        "cache_hits", "cache_misses", "cache_evictions", "roots_visited",
-        "files_visited",
+        "lifecycle_cursor_initializations", "lifecycle_exact_scans",
+        "raw_edge_builds_by_home", "cwd_parses", "cache_evictions",
+        "roots_visited", "files_visited",
     }
     for sample in [result.get("cold_sample")] + result.get("warm_samples", []):
         if not isinstance(sample, dict) or not required_counters.issubset(
@@ -484,8 +494,9 @@ def _comparison(baseline, current):
         all(count <= 1 for count in sample["counters"]["raw_edge_builds_by_home"].values())
         for sample in all_samples
     )
-    zero_warm_parses = all(
-        sample["counters"]["raw_lifecycle_parses"] == 0 for sample in warm
+    zero_warm_cursor_initializations = all(
+        sample["counters"]["lifecycle_cursor_initializations"] == 0
+        for sample in warm
     )
     expected_cwd = current["expected"]["unique_rollouts"]
     cwd_scaled = all(
@@ -493,14 +504,18 @@ def _comparison(baseline, current):
     )
     checks.update({
         "edge_builds_at_most_one_per_home": edge_bound,
-        "unchanged_warm_lifecycle_parses_zero": zero_warm_parses,
+        "unchanged_warm_lifecycle_cursor_initializations_zero": (
+            zero_warm_cursor_initializations
+        ),
         "cwd_parses_equal_unique_rollouts": cwd_scaled,
     })
-    baseline_lifecycle = [
-        item["counters"]["raw_lifecycle_parses"] for item in baseline["warm_samples"]
+    baseline_lifecycle_cursor_initializations = [
+        item["counters"]["lifecycle_cursor_initializations"]
+        for item in baseline["warm_samples"]
     ]
-    current_lifecycle = [
-        item["counters"]["raw_lifecycle_parses"] for item in current["warm_samples"]
+    current_lifecycle_cursor_initializations = [
+        item["counters"]["lifecycle_cursor_initializations"]
+        for item in current["warm_samples"]
     ]
     baseline_cwd = [item["counters"]["cwd_parses"] for item in baseline["warm_samples"]]
     current_cwd = [item["counters"]["cwd_parses"] for item in current["warm_samples"]]
@@ -513,9 +528,9 @@ def _comparison(baseline, current):
             current["warm_summary"]["cpu_median_ns"]
             - baseline["warm_summary"]["cpu_median_ns"]
         ),
-        "warm_raw_lifecycle_parses_median": (
-            statistics.median(current_lifecycle)
-            - statistics.median(baseline_lifecycle)
+        "warm_lifecycle_cursor_initializations_median": (
+            statistics.median(current_lifecycle_cursor_initializations)
+            - statistics.median(baseline_lifecycle_cursor_initializations)
         ),
         "warm_cwd_parses_median": (
             statistics.median(current_cwd) - statistics.median(baseline_cwd)

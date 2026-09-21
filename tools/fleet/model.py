@@ -923,6 +923,8 @@ def reset_parent_edge_tracker():
 def _evidence(state, tier, source, rule, inputs, raw_status=None, hysteresis=None):
     # `inputs` is copied: evidence is a snapshot of the tick that produced it, and the
     # caller's dict must not be able to mutate a verdict after the fact.
+    # `source` and `rule` are extensible strings, not closed-enum values; classifiers
+    # may add vocabulary without changing the state_evidence object shape.
     return {"state": state, "tier": tier, "source": source, "rule": rule,
             "derived": tier == 3, "inputs": dict(inputs), "raw_status": raw_status,
             "hysteresis": hysteresis}
@@ -1146,6 +1148,7 @@ def _codex_registry_idle_is_stale(ev_in):
         return False
     if not math.isfinite(updated_at) or not math.isfinite(mtime):
         return False
+    # Both values are wall clocks; their numeric delta does not prove causal order.
     return mtime - updated_at > CODEX_REGISTRY_SKEW_SEC
 
 

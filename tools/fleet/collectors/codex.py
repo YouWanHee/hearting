@@ -254,6 +254,13 @@ def _cursor_boundary(handle, offset):
     return data
 
 
+def _lifecycle_timestamps_regressed(cursor, *stats):
+    return any(
+        stat.st_mtime_ns < cursor.mtime_ns or stat.st_ctime_ns < cursor.ctime_ns
+        for stat in stats
+    )
+
+
 def _stable_path_stat(canonical_path, handle, endpoint):
     """Return the current path stat only while it still names this open snapshot."""
     opened = os.fstat(handle.fileno())
@@ -290,9 +297,7 @@ def _parse_latest_task_lifecycle(rollout_path, chunk=65536, max_scan=1048576):
     """Return the latest exact lifecycle after one stable full-history scan.
 
     ``max_scan`` remains in the private compatibility surface because native-subagent
-    callers explicitly pass ``None``. Both modes are now exact: bounded work comes from
-    `_latest_task_lifecycle` retaining a cursor and reading only appended bytes.
-    Filesystem errors deliberately reach that caching wrapper.
+    callers explicitly pass ``None``. Filesystem errors deliberately reach the caller.
     """
     del max_scan
     canonical_path = os.path.realpath(os.path.abspath(rollout_path))
@@ -306,10 +311,19 @@ def _latest_task_lifecycle(rollout_path, chunk=65536, max_scan=1048576):
     boundary fingerprint and consume only bytes after the saved offset. Rotation,
     truncation, retargeting, or any I/O failure removes the cursor and returns no
     lifecycle for that observation; a later clean call may initialize afresh.
-    ``max_scan`` is intentionally not part of cursor identity so default and
-    ``None`` callers share one exact state.
+    Intermediate-byte rewrites are outside the contract and are not detected;
+    detecting them would require rereading the whole file on every tick, which
+    conflicts with this feature's purpose. ``max_scan=None`` is the uncached exact
+    full scan used for native-subagent state.
     """
-    del max_scan
+    if max_scan is None:
+        try:
+            return _parse_latest_task_lifecycle(
+                rollout_path, chunk=chunk, max_scan=None
+            )
+        except (OSError, ValueError):
+            return None
+
     global _LIFECYCLE_CACHE_EVICTIONS
     canonical_path = os.path.realpath(os.path.abspath(rollout_path))
     cached = _LIFECYCLE_CACHE.get(canonical_path)
@@ -324,6 +338,9 @@ def _latest_task_lifecycle(rollout_path, chunk=65536, max_scan=1048576):
             _LIFECYCLE_CACHE.pop(canonical_path, None)
             return None
         if before.st_size < cached.offset:
+            _LIFECYCLE_CACHE.pop(canonical_path, None)
+            return None
+        if _lifecycle_timestamps_regressed(cached, before):
             _LIFECYCLE_CACHE.pop(canonical_path, None)
             return None
         if before.st_size == cached.offset:
@@ -349,13 +366,17 @@ def _latest_task_lifecycle(rollout_path, chunk=65536, max_scan=1048576):
                     raise OSError("lifecycle identity changed before append read")
                 if endpoint < cached.offset:
                     raise OSError("lifecycle file truncated before append read")
+                if _lifecycle_timestamps_regressed(cached, opened):
+                    raise OSError("lifecycle timestamps regressed before append read")
                 if _cursor_boundary(handle, cached.offset) != cached.boundary:
-                    raise OSError("lifecycle prefix changed before append read")
+                    raise OSError("saved lifecycle boundary changed before append read")
                 lifecycle, carry = _read_lifecycle_range(
                     handle, cached.offset, endpoint, chunk,
                     cached.lifecycle, cached.carry,
                 )
                 current = _stable_path_stat(canonical_path, handle, endpoint)
+                if _lifecycle_timestamps_regressed(cached, current):
+                    raise OSError("lifecycle timestamps regressed after append read")
                 boundary = _cursor_boundary(handle, endpoint)
             updated = _LifecycleCursor(
                 dev=opened.st_dev,
