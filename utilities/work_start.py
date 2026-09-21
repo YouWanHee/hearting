@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 import shlex
@@ -22,7 +23,8 @@ from dispatch_completion_join import (
     join_selected_attempts, current_delivery_state, delivery_classification,
     delivery_required_action, completion_harvest_command,
 )
-from dispatch_parent_completion import default_parent_session_id
+from dispatch_parent_completion import default_parent_session_id, interactive_parent_identity
+from codex_managed_dispatch import ManagedDispatchError, probe_managed_codex_parent
 from parent_next_directive import parent_next
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -215,6 +217,23 @@ def _rows(jobs):
     return rows
 
 
+def _current_parent_session_id():
+    parent = default_parent_session_id()
+    if (os.environ.get("AGENT_CODEX_MANAGED_GATEWAY") != "1"
+            or os.environ.get("AGENT_DISPATCH_CHILD") == "1"):
+        return parent
+    harness, inherited = interactive_parent_identity()
+    if harness != "codex" or parent != inherited:
+        return parent
+    # Admission records the gateway's witnessed thread after resume/fork.
+    # Reuse must consult the same proof, not the launcher's inherited seed.
+    try:
+        return probe_managed_codex_parent(
+            parent_harness=harness, parent_session_id=parent).thread_id
+    except ManagedDispatchError as exc:
+        raise DispatchContractError("work-parent-recovery-required", str(exc)) from exc
+
+
 def _slot(route, node, rows):
     matches = [aid for aid, (_, meta) in rows.items()
                if ((node == "owner" and meta.get("worker_type") == "owner"
@@ -226,7 +245,7 @@ def _slot(route, node, rows):
         if not matches:
             raise DispatchContractError("work-attempt-identity-conflict", aid)
         meta = rows[aid][1]
-        parent = default_parent_session_id()
+        parent = _current_parent_session_id()
         if not parent or meta.get("parent_sid") != parent:
             raise DispatchContractError("work-parent-recovery-required", aid)
         digest = (meta.get("owner_route_hash") or meta.get("route_hash")) if node == "owner" else meta.get("route_hash")
@@ -309,10 +328,14 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
         attempts = set()
         # Validate every reused identity before starting any missing sibling.
         slots = [_slot(route, node["id"], rows) for node in frames]
-        for index, node in enumerate(frames):
-            aid = slots[index]
+        for node, aid in zip(frames, slots):
             if aid not in rows:
-                launch = _start(route, path, jobs, node["id"], harnesses[index % len(harnesses)], run)
+                # Readiness proves runtime support, not remaining usage. Passing
+                # a round-robin candidate as --adapter turned an automatic
+                # choice into a user override and bypassed the capacity gate.
+                # The selector rechecks live usage inside the sealed pool for
+                # each frame, just as it does for an automatic owner.
+                launch = _start(route, path, jobs, node["id"], None, run)
                 result["launches"].append(launch)
                 rows = _rows(jobs)
                 if aid not in rows:
@@ -413,7 +436,7 @@ def start_work(route, path, jobs, *, wait=False, interview=None, answers=None,
         # a replacement or infer completion from the caller's exception.
         try:
             rows = _rows(Path(jobs))
-            parent = default_parent_session_id()
+            parent = _current_parent_session_id()
             owned = {aid for aid, (status, meta) in rows.items() if status in {"open", "running"}
                      and parent and meta.get("parent_sid") == parent
                      and route["route_id"] in {meta.get("owner_route_id"), meta.get("route_id")}}
