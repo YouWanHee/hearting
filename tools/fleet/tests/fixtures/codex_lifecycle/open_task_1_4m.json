@@ -1,0 +1,8 @@
+{
+  "schema": "codex-lifecycle-fixture-v1",
+  "turn_id": "turn-open-1-4m",
+  "trailing_note_bytes": 1468006,
+  "expected_lifecycle": "task_started",
+  "expected_liveness": "working",
+  "expected_source": "codex-lifecycle"
+}

@@ -251,7 +251,9 @@ class CodexSubagentTest(unittest.TestCase):
                 [("task_started", "turn")],
                 trailing=1048576 + 4096,
             )
-            self.assertIsNone(codex._latest_task_lifecycle(path))
+            self.assertEqual(
+                codex._latest_task_lifecycle(path), ("task_started", "turn")
+            )
             self.assertTrue(codex._subagent_active("open", path))
 
     def test_subagent_terminal_pair_may_span_more_than_session_scan_limit(self):
@@ -264,7 +266,9 @@ class CodexSubagentTest(unittest.TestCase):
                         [("task_started", "turn"), (terminal, "turn")],
                         between=1048576 + 4096,
                     )
-                    self.assertIsNone(codex._latest_task_lifecycle(path))
+                    self.assertEqual(
+                        codex._latest_task_lifecycle(path), (terminal, "turn")
+                    )
                     self.assertIs(codex._subagent_active("open", path), False)
 
     def test_matching_abort_is_done(self):
@@ -455,8 +459,8 @@ class CodexSubagentTest(unittest.TestCase):
             self._lifecycle(valid, [("task_started", "turn")])
             self._lifecycle(ambiguous, [("task_complete", "turn")])
             with mock.patch.object(
-                codex, "_parse_latest_task_lifecycle",
-                wraps=codex._parse_latest_task_lifecycle,
+                codex, "_initialize_lifecycle_cursor",
+                wraps=codex._initialize_lifecycle_cursor,
             ) as parse:
                 self.assertEqual(
                     codex._latest_task_lifecycle(valid),
@@ -470,7 +474,7 @@ class CodexSubagentTest(unittest.TestCase):
                 self.assertIsNone(codex._latest_task_lifecycle(ambiguous))
             self.assertEqual(parse.call_count, 2)
 
-    def test_lifecycle_parser_configurations_are_isolated_in_both_orders(self):
+    def test_lifecycle_parser_configurations_share_exact_cursor_in_both_orders(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "bounded.jsonl")
             self._lifecycle(
@@ -486,39 +490,29 @@ class CodexSubagentTest(unittest.TestCase):
                     ((65536, 1048576), (64, 128))
                 )
                 with mock.patch.object(
-                    codex, "_parse_latest_task_lifecycle",
-                    wraps=codex._parse_latest_task_lifecycle,
+                    codex, "_initialize_lifecycle_cursor",
+                    wraps=codex._initialize_lifecycle_cursor,
                 ) as parse:
                     results = [
                         codex._latest_task_lifecycle(path, chunk, max_scan)
                         for chunk, max_scan in calls
                     ]
-                expected = (
-                    [None, ("task_complete", "turn")]
-                    if first_narrow else
-                    [("task_complete", "turn"), None]
-                )
-                self.assertEqual(results, expected)
-                self.assertEqual(parse.call_count, 2)
+                self.assertEqual(results, [("task_complete", "turn")] * 2)
+                self.assertEqual(parse.call_count, 1)
 
-    def test_lifecycle_chunk_is_identity_and_global_lru_is_bounded(self):
+    def test_lifecycle_chunk_is_io_only_and_does_not_fork_cursor(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "active.jsonl")
             self._lifecycle(path, [("task_started", "turn")])
             with mock.patch.object(
-                codex, "_parse_latest_task_lifecycle",
-                wraps=codex._parse_latest_task_lifecycle,
+                codex, "_initialize_lifecycle_cursor",
+                wraps=codex._initialize_lifecycle_cursor,
             ) as parse:
                 for chunk in range(1, codex._LIFECYCLE_CACHE_MAX + 2):
                     codex._latest_task_lifecycle(path, chunk=chunk)
-            self.assertEqual(parse.call_count, codex._LIFECYCLE_CACHE_MAX + 1)
-            self.assertEqual(len(codex._LIFECYCLE_CACHE), codex._LIFECYCLE_CACHE_MAX)
-            first = (os.path.realpath(path), 1, 1048576)
-            newest = (
-                os.path.realpath(path), codex._LIFECYCLE_CACHE_MAX + 1, 1048576
-            )
-            self.assertNotIn(first, codex._LIFECYCLE_CACHE)
-            self.assertIn(newest, codex._LIFECYCLE_CACHE)
+            self.assertEqual(parse.call_count, 1)
+            self.assertEqual(len(codex._LIFECYCLE_CACHE), 1)
+            self.assertIn(os.path.realpath(path), codex._LIFECYCLE_CACHE)
 
     def test_lifecycle_append_replacement_and_io_failure_invalidate(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -538,11 +532,12 @@ class CodexSubagentTest(unittest.TestCase):
             replacement = os.path.join(tmp, "replacement.jsonl")
             self._lifecycle(replacement, [("task_started", "replacement")])
             os.replace(replacement, path)
+            self.assertIsNone(codex._latest_task_lifecycle(path))
             self.assertEqual(
                 codex._latest_task_lifecycle(path),
                 ("task_started", "replacement"),
             )
-            key = (os.path.realpath(path), 65536, 1048576)
+            key = os.path.realpath(path)
             with mock.patch.object(codex.os, "stat", side_effect=OSError):
                 self.assertIsNone(codex._latest_task_lifecycle(path))
             self.assertNotIn(key, codex._LIFECYCLE_CACHE)
@@ -563,9 +558,9 @@ class CodexSubagentTest(unittest.TestCase):
                     },
                 }) + "\n")
             with mock.patch.object(
-                codex, "_parse_latest_task_lifecycle",
-                wraps=codex._parse_latest_task_lifecycle,
-            ) as parse:
+                codex, "_read_lifecycle_range",
+                wraps=codex._read_lifecycle_range,
+            ) as read_range:
                 self.assertEqual(
                     codex._latest_task_lifecycle(changed),
                     ("task_complete", "changed"),
@@ -574,21 +569,19 @@ class CodexSubagentTest(unittest.TestCase):
                     codex._latest_task_lifecycle(unchanged),
                     ("task_started", "unchanged"),
                 )
-            parse.assert_called_once()
-            self.assertEqual(parse.call_args.args[0], os.path.realpath(changed))
+            read_range.assert_called_once()
+            self.assertGreater(read_range.call_args.args[1], 0)
 
     def test_lifecycle_open_failure_removes_stale_entry(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "failure.jsonl")
             self._lifecycle(path, [("task_started", "turn")])
             codex._latest_task_lifecycle(path)
-            key = (os.path.realpath(path), 65536, 1048576)
+            key = os.path.realpath(path)
             # Force a stamp miss so the wrapper reaches the raw open, then fail it.
             stat = os.stat(path)
             os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1))
-            with mock.patch.object(
-                codex, "_parse_latest_task_lifecycle", side_effect=OSError
-            ):
+            with mock.patch("builtins.open", side_effect=OSError):
                 self.assertIsNone(codex._latest_task_lifecycle(path))
             self.assertNotIn(key, codex._LIFECYCLE_CACHE)
 
@@ -596,19 +589,11 @@ class CodexSubagentTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "changing.jsonl")
             self._lifecycle(path, [("task_started", "turn")])
-            raw = codex._parse_latest_task_lifecycle
-
-            def mutate(canonical, chunk, max_scan):
-                result = raw(canonical, chunk, max_scan)
-                with open(canonical, "a", encoding="utf-8") as handle:
-                    handle.write("{}\n")
-                return result
-
             with mock.patch.object(
-                codex, "_parse_latest_task_lifecycle", side_effect=mutate
+                codex, "_stable_path_stat", side_effect=OSError
             ):
                 self.assertIsNone(codex._latest_task_lifecycle(path))
-            key = (os.path.realpath(path), 65536, 1048576)
+            key = os.path.realpath(path)
             self.assertNotIn(key, codex._LIFECYCLE_CACHE)
 
     def test_symlink_retarget_binds_one_canonical_target_per_call(self):
@@ -622,17 +607,17 @@ class CodexSubagentTest(unittest.TestCase):
                 [("task_started", "b"), ("task_complete", "b")],
             )
             os.symlink(target_a, link)
-            raw = codex._parse_latest_task_lifecycle
+            raw = codex._initialize_lifecycle_cursor
             parsed_paths = []
 
-            def retarget(canonical, chunk, max_scan):
+            def retarget(canonical, chunk):
                 parsed_paths.append(canonical)
                 os.unlink(link)
                 os.symlink(target_b, link)
-                return raw(canonical, chunk, max_scan)
+                return raw(canonical, chunk)
 
             with mock.patch.object(
-                codex, "_parse_latest_task_lifecycle", side_effect=retarget
+                codex, "_initialize_lifecycle_cursor", side_effect=retarget
             ):
                 self.assertEqual(
                     codex._latest_task_lifecycle(link), ("task_started", "a")
@@ -648,20 +633,20 @@ class CodexSubagentTest(unittest.TestCase):
             link = os.path.join(tmp, "current.jsonl")
             self._lifecycle(target, [("task_started", "old")])
             os.symlink(target, link)
-            raw = codex._parse_latest_task_lifecycle
+            raw = codex._initialize_lifecycle_cursor
 
-            def replace(canonical, chunk, max_scan):
-                result = raw(canonical, chunk, max_scan)
+            def replace(canonical, chunk):
+                result = raw(canonical, chunk)
                 replacement = os.path.join(tmp, "new.jsonl")
                 self._lifecycle(replacement, [("task_started", "new")])
                 os.replace(replacement, canonical)
                 return result
 
             with mock.patch.object(
-                codex, "_parse_latest_task_lifecycle", side_effect=replace
+                codex, "_initialize_lifecycle_cursor", side_effect=replace
             ):
                 self.assertIsNone(codex._latest_task_lifecycle(link))
-            key = (os.path.realpath(target), 65536, 1048576)
+            key = os.path.realpath(target)
             self.assertNotIn(key, codex._LIFECYCLE_CACHE)
             self.assertEqual(
                 codex._latest_task_lifecycle(link), ("task_started", "new")

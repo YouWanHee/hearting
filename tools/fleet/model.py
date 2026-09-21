@@ -7,6 +7,7 @@ never blank, per the PRD missing-cell rule).
 """
 import hashlib
 import json
+import math
 import os
 import re
 from dataclasses import dataclass, field, asdict, fields, is_dataclass
@@ -640,6 +641,7 @@ class ResourceJob:
 # --- F-25 state model constants (single block; PRD v8 §4.8) ---
 SESSION_WORK_SEC       = 60      # absorbed from liveness.py `age_min < 1.0`
 SESSION_STALE_MIN      = 48 * 60 # absorbed from liveness.py STALE_MIN
+CODEX_REGISTRY_SKEW_SEC = 1.0    # registry idle older than rollout by more is silent
 JOB_STALE_MIN          = 15      # absorbed from dispatch.py _job_liveness(stale_min=15)
 JOB_QUEUED_GRACE_MIN   = 15      # absorbed from dispatch.py _QUEUED_GRACE_MIN
 ATTEMPT_HEARTBEAT_LIVE_SEC = JOB_STALE_MIN * 60
@@ -1132,6 +1134,21 @@ def _status_desc(status, exec_child=None):
     return ("claude-registry", "registry status=%s" % status)
 
 
+def _codex_registry_idle_is_stale(ev_in):
+    """Whether newer primary rollout evidence makes Codex registry ``idle`` silent."""
+    if ev_in.get("harness") != "codex" or ev_in.get("status") != "idle":
+        return False
+    updated_at = ev_in.get("updated_at")
+    mtime = ev_in.get("mtime")
+    numeric = (int, float)
+    if (not isinstance(updated_at, numeric) or isinstance(updated_at, bool)
+            or not isinstance(mtime, numeric) or isinstance(mtime, bool)):
+        return False
+    if not math.isfinite(updated_at) or not math.isfinite(mtime):
+        return False
+    return mtime - updated_at > CODEX_REGISTRY_SKEW_SEC
+
+
 def deterministic_progress_fingerprint(ev_in):
     """Hash only bounded, attempt-scoped progress evidence.
 
@@ -1434,6 +1451,15 @@ def classify_session(ev_in, now, stale_min=SESSION_STALE_MIN, key=None):
     st = _session_status_state(status)
     st_source, st_rule = _status_desc(status, ev_in.get("exec_child"))
     m = ev_in.get("mtime")
+    stale_codex_idle = _codex_registry_idle_is_stale(ev_in)
+    if stale_codex_idle:
+        st = None
+        freshness_rule = (
+            "registry status=idle ignored: Codex rollout mtime is %.3fs newer "
+            "than registry updated_at" % (m - ev_in["updated_at"])
+        )
+    else:
+        freshness_rule = None
 
     work = owned_exec_work(ev_in, now)
     if work is not None:
@@ -1443,9 +1469,23 @@ def classify_session(ev_in, now, stale_min=SESSION_STALE_MIN, key=None):
     lifecycle = ev_in.get("task_lifecycle")
     if ev_in.get("harness") == "codex" and st is None:
         if lifecycle == "task_started":
-            return out("working", 2, "codex-lifecycle", "latest exact Codex task is started")
+            source = (
+                "codex-lifecycle+registry-freshness"
+                if stale_codex_idle else "codex-lifecycle"
+            )
+            rule = "latest exact Codex task is started"
+            if freshness_rule:
+                rule = freshness_rule + "; " + rule
+            return out("working", 2, source, rule)
         if lifecycle in {"task_complete", "turn_aborted"}:
-            return out("idle", 2, "codex-lifecycle", f"latest exact Codex task is {lifecycle}")
+            source = (
+                "codex-lifecycle+registry-freshness"
+                if stale_codex_idle else "codex-lifecycle"
+            )
+            rule = f"latest exact Codex task is {lifecycle}"
+            if freshness_rule:
+                rule = freshness_rule + "; " + rule
+            return out("idle", 2, source, rule)
 
     if m is None:
         # No recency signal at all → lean on the registry, else idle.
@@ -1467,7 +1507,11 @@ def classify_session(ev_in, now, stale_min=SESSION_STALE_MIN, key=None):
         if st and _is_unused(st, ev_in):
             return out("unused", 1, "claude-registry",
                        "unused exempt from the stale window (mtime frozen at spawn)")
-        return out("stale", 3, "mtime", "no activity for > %d min" % stale_min)
+        source = "mtime+codex-registry-freshness" if stale_codex_idle else "mtime"
+        rule = "no activity for > %d min" % stale_min
+        if freshness_rule:
+            rule = freshness_rule + "; " + rule
+        return out("stale", 3, source, rule)
     if st:
         if _is_unused(st, ev_in):
             return out("unused", 1, "claude-registry",
@@ -1475,8 +1519,16 @@ def classify_session(ev_in, now, stale_min=SESSION_STALE_MIN, key=None):
         return out(st, 1, st_source, st_rule)
     # codex/opencode expose no status field → recency heuristic (fresh write == working)
     if age_min * 60.0 < SESSION_WORK_SEC:
-        return out("working", 3, "mtime", "activity within %ds" % SESSION_WORK_SEC)
-    return out("idle", 3, "mtime", "no activity within %ds" % SESSION_WORK_SEC)
+        source = "mtime+codex-registry-freshness" if stale_codex_idle else "mtime"
+        rule = "activity within %ds" % SESSION_WORK_SEC
+        if freshness_rule:
+            rule = freshness_rule + "; " + rule
+        return out("working", 3, source, rule)
+    source = "mtime+codex-registry-freshness" if stale_codex_idle else "mtime"
+    rule = "no activity within %ds" % SESSION_WORK_SEC
+    if freshness_rule:
+        rule = freshness_rule + "; " + rule
+    return out("idle", 3, source, rule)
 
 
 def _classify_plugin_queue_job(ev_in, raw, out):

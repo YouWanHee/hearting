@@ -276,7 +276,7 @@ class _Counters:
 
 @contextlib.contextmanager
 def _instrument(counters):
-    raw_lifecycle = codex._parse_latest_task_lifecycle
+    raw_lifecycle = codex._initialize_lifecycle_cursor
     lifecycle = codex._latest_task_lifecycle
     raw_edges = codex._build_thread_subagents
     transcript_cwd = dispatch._codex_transcript_cwd
@@ -308,7 +308,7 @@ def _instrument(counters):
 
     with contextlib.ExitStack() as stack:
         stack.enter_context(mock.patch.object(
-            codex, "_parse_latest_task_lifecycle", side_effect=counted_raw_lifecycle
+            codex, "_initialize_lifecycle_cursor", side_effect=counted_raw_lifecycle
         ))
         stack.enter_context(mock.patch.object(
             codex, "_latest_task_lifecycle", side_effect=counted_lifecycle
@@ -613,6 +613,31 @@ def _live_result(iterations):
     }
 
 
+def _live_budget(result, max_warm_wall_seconds):
+    """Machine-check one saved live sample without pretending it is semantic proof."""
+    if result.get("benchmark_schema") != BENCHMARK_SCHEMA:
+        raise ValueError("invalid benchmark schema")
+    if result.get("mode") != "live-descriptive-only":
+        raise ValueError("live budget input must come from --live")
+    samples = result.get("warm_samples")
+    if not isinstance(samples, list) or not samples:
+        raise ValueError("live budget input has no warm samples")
+    wall_ns = []
+    for sample in samples:
+        value = sample.get("wall_ns") if isinstance(sample, dict) else None
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError("live budget input has an invalid wall_ns sample")
+        wall_ns.append(value)
+    value = max(wall_ns) / 1_000_000_000.0
+    return {
+        "metric": "max_warm_wall_seconds",
+        "value": value,
+        "limit": max_warm_wall_seconds,
+        "pass": value <= max_warm_wall_seconds,
+        "iterations": len(wall_ns),
+    }
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--fixture")
@@ -622,9 +647,26 @@ def main(argv=None):
     parser.add_argument("--result-out")
     parser.add_argument("--comparison-out")
     parser.add_argument("--live", action="store_true")
+    parser.add_argument("--check-live-budget")
+    parser.add_argument("--max-warm-wall-seconds", type=float)
     args = parser.parse_args(argv)
     if args.iterations < 1:
         parser.error("--iterations must be positive")
+    if args.check_live_budget:
+        if (args.fixture or args.baseline_out or args.compare_baseline or args.result_out
+                or args.comparison_out or args.live):
+            parser.error("--check-live-budget does not accept benchmark/output options")
+        if (args.max_warm_wall_seconds is None
+                or not math.isfinite(args.max_warm_wall_seconds)
+                or args.max_warm_wall_seconds <= 0):
+            parser.error("--check-live-budget requires a positive --max-warm-wall-seconds")
+        with open(args.check_live_budget, encoding="utf-8") as handle:
+            result = json.load(handle)
+        budget = _live_budget(result, args.max_warm_wall_seconds)
+        print(json.dumps(budget, sort_keys=True))
+        return 0 if budget["pass"] else 1
+    if args.max_warm_wall_seconds is not None:
+        parser.error("--max-warm-wall-seconds requires --check-live-budget")
     if args.live:
         if args.baseline_out or args.compare_baseline or args.comparison_out:
             parser.error("--live accepts only --result-out")
