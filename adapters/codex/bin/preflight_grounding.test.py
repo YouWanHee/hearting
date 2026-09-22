@@ -23,6 +23,8 @@ class PreflightGroundingTest(unittest.TestCase):
         cwd = base / "repo"
         cwd.mkdir()
         env = {**os.environ, "AGENT_HOME": str(agent_home), "HOME": str(base)}
+        env.pop("XDG_STATE_HOME", None)
+        env.pop("FLEET_CAPABILITY_GROUNDING_DIR", None)
         if worker:
             env["AGENT_SESSION_ROLE"] = "worker"
         result = subprocess.run(
@@ -31,14 +33,15 @@ class PreflightGroundingTest(unittest.TestCase):
             text=True, capture_output=True, env=env, timeout=20,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        return agent_home / ".capability-grounding" / "sid-f43"
+        self.assertFalse((agent_home / ".capability-grounding").exists())
+        return base / ".local" / "state" / "agent-fleet" / "capability-grounding" / "sid-f43"
 
     def test_main_route_records_exact_capability_mode_and_intensity(self):
         marker = self.run_route()
         self.assertEqual(
             marker.read_text(encoding="utf-8").splitlines(),
             ["capability=autopilot-code", "mode=debug", "intensity=direct",
-             "cwd=" + str(marker.parents[2] / "repo")],
+             "cwd=" + str(marker.parents[4] / "repo")],
         )
 
     def test_worker_route_does_not_create_inline_main_marker(self):

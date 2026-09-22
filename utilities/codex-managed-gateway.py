@@ -137,6 +137,16 @@ def thread_id_from_message(message: dict[str, Any]) -> str:
     return ""
 
 
+def thread_from_message(message: dict[str, Any]) -> dict[str, Any] | None:
+    result = message.get("result")
+    if isinstance(result, dict) and isinstance(result.get("thread"), dict):
+        return result["thread"]
+    params = message.get("params")
+    if isinstance(params, dict) and isinstance(params.get("thread"), dict):
+        return params["thread"]
+    return None
+
+
 class WebSocket:
     """Minimal RFC 6455 text transport for App Server Unix sockets."""
 
@@ -525,6 +535,7 @@ class PendingInternal:
         event: threading.Event | None = None,
         outcome: dict[str, Any] | None = None,
         recipient_epoch: int | None = None,
+        binding_generation: int | None = None,
     ):
         self.kind = kind
         self.thread_id = thread_id
@@ -533,6 +544,11 @@ class PendingInternal:
         self.identity = identity if identity is not None else {}
         self.receipt = receipt
         self.recipient_epoch = recipient_epoch if recipient_epoch is not None else (receipt or {}).get("recipient_epoch")
+        self.binding_generation = (
+            binding_generation
+            if binding_generation is not None
+            else (receipt or {}).get("binding_generation")
+        )
         self.tui_request_id = tui_request_id
         self.deferred_after_steer = deferred_after_steer
         self.event = event if event is not None else threading.Event()
@@ -602,10 +618,28 @@ class ManagedGateway:
         # _current_thread_id (last-witnessed thread, kept for bookkeeping).
         self._binding_thread_id = ""
         self._binding_source = ""
+        self._binding_generation = 0
+        self._binding_blocked = False
+        self._binding_session_id = ""
+        self._binding_session_id_state = "unverified"
+        self._transition_sequence = 0
+        self._latest_transition_sequence = 0
+        self._last_transition: dict[str, Any] = {}
         self._sibling_thread_ids: list[str] = []
+        self._launcher_thread_id = ""
+        self._transition_history: list[str] = []
+        # Fork metadata is separate from visible navigation authority.
         self._thread_predecessors: dict[str, str] = {}
         self._threads: dict[str, ThreadState] = {}
         self._tui_requests: dict[tuple[str, Any], tuple[str, dict[str, Any]]] = {}
+        self._pending_transitions: dict[tuple[str, Any], dict[str, Any]] = {}
+        # Herdr is optional provenance only. Managed sessions remain usable
+        # without it, and these identifiers never authorize a transition.
+        self._herdr_provenance = {
+            key: value for key in
+            ("HERDR_WORKSPACE_ID", "HERDR_TAB_ID", "HERDR_PANE_ID")
+            if (value := os.environ.get(key, ""))
+        }
         self._appserver_requests: dict[
             tuple[str, tuple[str, Any]], float
         ] = {}
@@ -718,10 +752,20 @@ class ManagedGateway:
                 self._current_thread_id = ""
                 self._binding_thread_id = ""
                 self._binding_source = ""
+                self._binding_generation = 0
+                self._binding_blocked = False
+                self._binding_session_id = ""
+                self._binding_session_id_state = "unverified"
+                self._transition_sequence = 0
+                self._latest_transition_sequence = 0
+                self._last_transition = {}
                 self._sibling_thread_ids.clear()
+                self._launcher_thread_id = ""
+                self._transition_history.clear()
                 self._thread_predecessors.clear()
                 self._threads.clear()
                 self._tui_requests.clear()
+                self._pending_transitions.clear()
                 for thread_id in {
                     identity[0] for identity in self._appserver_requests
                 }:
@@ -791,6 +835,7 @@ class ManagedGateway:
                 self._delivery_pending.clear()
                 self._internal.clear()
                 self._tui_requests.clear()
+                self._pending_transitions.clear()
                 for thread_id in {
                     identity[0] for identity in self._appserver_requests
                 }:
@@ -800,7 +845,16 @@ class ManagedGateway:
                 self._current_thread_id = ""
                 self._binding_thread_id = ""
                 self._binding_source = ""
+                self._binding_generation = 0
+                self._binding_blocked = False
+                self._binding_session_id = ""
+                self._binding_session_id_state = "unverified"
+                self._transition_sequence = 0
+                self._latest_transition_sequence = 0
+                self._last_transition = {}
                 self._sibling_thread_ids.clear()
+                self._launcher_thread_id = ""
+                self._transition_history.clear()
                 self._thread_predecessors.clear()
                 current_tui = self._tui
                 current_upstream = self._upstream
@@ -841,10 +895,19 @@ class ManagedGateway:
             key = request_key(message.get("id")) if "id" in message else None
             if key is not None and isinstance(method, str):
                 params = message.get("params")
-                self._tui_requests[key] = (
-                    method,
-                    dict(params) if isinstance(params, dict) else {},
-                )
+                copied_params = dict(params) if isinstance(params, dict) else {}
+                self._tui_requests[key] = (method, copied_params)
+                if method in {"thread/start", "thread/resume", "thread/fork"}:
+                    self._transition_sequence += 1
+                    self._latest_transition_sequence = self._transition_sequence
+                    self._pending_transitions[key] = {
+                        "epoch": epoch,
+                        "sequence": self._transition_sequence,
+                        "method": method,
+                        "params": copied_params,
+                        "prior_thread_id": self._binding_thread_id,
+                        "prior_generation": self._binding_generation,
+                    }
             self._upstream.write_json(message)
             self.trace("tui-forward", method=str(method or ""))
 
@@ -979,8 +1042,9 @@ class ManagedGateway:
         if key is not None and ("result" in message or "error" in message):
             tracked = self._tui_requests.pop(key, None)
             if tracked is not None:
+                transition = self._pending_transitions.pop(key, None)
                 self._track_tui_response_locked(
-                    key, tracked[0], tracked[1], message
+                    key, tracked[0], tracked[1], message, transition=transition
                 )
             self._send_tui_locked(message)
             return
@@ -1119,54 +1183,11 @@ class ManagedGateway:
         method: str,
         params: dict[str, Any],
         message: dict[str, Any],
+        *,
+        transition: dict[str, Any] | None = None,
     ) -> None:
-        if method in {"thread/start", "thread/resume", "thread/fork"} and "error" not in message:
-            thread_id = (
-                thread_id_from_message(message)
-                or str(params.get("threadId", ""))
-            )
-            if thread_id:
-                self._current_thread_id = thread_id
-                self._threads.setdefault(thread_id, ThreadState())
-                predecessor = params.get("threadId")
-                is_witnessed_fork_of_binding = (
-                    method == "thread/fork"
-                    and isinstance(predecessor, str)
-                    and ID_PATTERN.fullmatch(predecessor)
-                    and predecessor != thread_id
-                    and predecessor == self._binding_thread_id
-                )
-                if not self._binding_thread_id:
-                    # Establish: first witnessed thread identity this epoch.
-                    self._binding_thread_id = thread_id
-                    self._binding_source = "initial"
-                    if is_witnessed_fork_of_binding:
-                        self._thread_predecessors[thread_id] = predecessor
-                    # B-2b: the thread id IS the session_registry sessionId — this is
-                    # the gateway's one moment of proof for it (witnessed thread
-                    # start/resume/fork response, never a bare notification).
-                    self._merge_pending_registry_fields_locked({"sessionId": thread_id})
-                elif is_witnessed_fork_of_binding:
-                    # Advance by fork: witnessed fork of the current binding.
-                    self._thread_predecessors[thread_id] = predecessor
-                    self._binding_thread_id = thread_id
-                    self._binding_source = "fork"
-                    self._merge_pending_registry_fields_locked({"sessionId": thread_id})
-                elif (
-                    method == "thread/resume"
-                    and thread_id == self._binding_thread_id
-                ):
-                    # Advance by resume: exact same-thread resume.
-                    self._binding_source = "resume"
-                elif thread_id == self._binding_thread_id:
-                    pass
-                else:
-                    # Reject: unrelated thread/start, a fork of a non-binding
-                    # thread, or a resume of a different id. The binding stays
-                    # unchanged; the witnessed thread is recorded as a sibling.
-                    if thread_id not in self._sibling_thread_ids:
-                        self._sibling_thread_ids.append(thread_id)
-                        del self._sibling_thread_ids[:-MAX_THREAD_LINEAGE]
+        if method in {"thread/start", "thread/resume", "thread/fork"}:
+            self._track_transition_response_locked(request, method, params, message, transition)
         if method != "turn/start":
             return
         thread_id = str(params.get("threadId", ""))
@@ -1186,6 +1207,158 @@ class ManagedGateway:
         state.active_turn = turn or self._minimal_turn(turn_id)
         if state.steer_ready:
             self._drain_queued_locked(state)
+
+    def _track_transition_response_locked(
+        self,
+        request: tuple[str, Any],
+        method: str,
+        params: dict[str, Any],
+        message: dict[str, Any],
+        transition: dict[str, Any] | None,
+    ) -> None:
+        """Commit only exact successful TUI transition evidence.
+
+        App Server notifications and sibling observations deliberately never
+        enter this function.  The request record is the local proof that the
+        sole visible TUI asked for this transition in the current epoch.
+        """
+        if transition is None or transition.get("epoch") != self._epoch:
+            return
+        sequence = transition.get("sequence")
+        if not isinstance(sequence, int):
+            return
+        latest = sequence == self._latest_transition_sequence
+        if "error" in message:
+            self._last_transition = {
+                "sequence": sequence, "method": method, "status": "failed",
+                "reason": "request-failed",
+            }
+            return
+        thread = thread_from_message(message)
+        thread_id = thread.get("id") if isinstance(thread, dict) else None
+        if not isinstance(thread_id, str) or not ID_PATTERN.fullmatch(thread_id):
+            if latest:
+                self._binding_blocked = True
+            self._last_transition = {
+                "sequence": sequence, "method": method, "status": "rejected",
+                "reason": "response-thread-id-invalid",
+            }
+            return
+        self._current_thread_id = thread_id
+        self._threads.setdefault(thread_id, ThreadState())
+        prior = transition.get("prior_thread_id") or ""
+        session_id = thread.get("sessionId") if isinstance(thread, dict) else None
+        forked_from = thread.get("forkedFromId") if isinstance(thread, dict) else None
+        reason = ""
+        valid = True
+        source = "initial" if not prior else method.removeprefix("thread/")
+        requested = params.get("threadId")
+        fork_predecessor = requested if method == "thread/fork" else ""
+        known_predecessor = self._thread_predecessors.get(thread_id)
+        if session_id is not None and (
+            not isinstance(session_id, str)
+            or not ID_PATTERN.fullmatch(session_id)
+        ):
+            valid, reason = False, "session-id-contradiction"
+        elif forked_from is not None and (
+            not isinstance(forked_from, str)
+            or not ID_PATTERN.fullmatch(forked_from)
+            or forked_from == thread_id
+        ):
+            valid, reason = False, "forked-from-contradiction"
+        elif method == "thread/start":
+            if forked_from is not None:
+                valid, reason = False, "forked-from-contradiction"
+            elif session_id is not None and session_id != thread_id:
+                valid, reason = False, "session-id-contradiction"
+        elif method == "thread/resume":
+            if not isinstance(requested, str) or requested != thread_id:
+                valid, reason = False, "resume-thread-id-mismatch"
+            elif (
+                forked_from is not None
+                and known_predecessor
+                and forked_from != known_predecessor
+            ):
+                valid, reason = False, "forked-from-contradiction"
+            elif (
+                prior == thread_id
+                and session_id is not None
+                and self._binding_session_id
+                and session_id != self._binding_session_id
+            ):
+                valid, reason = False, "session-id-contradiction"
+            # Persisted ancestry is metadata, never authorization evidence.
+        elif method == "thread/fork":
+            if (
+                not isinstance(fork_predecessor, str)
+                or not ID_PATTERN.fullmatch(fork_predecessor)
+                or (prior and fork_predecessor != prior)
+                or thread_id == fork_predecessor
+            ):
+                valid, reason = False, "fork-predecessor-mismatch"
+            elif forked_from is not None and forked_from != fork_predecessor:
+                valid, reason = False, "forked-from-contradiction"
+            elif (
+                session_id is not None
+                and self._binding_session_id
+                and session_id != self._binding_session_id
+            ):
+                valid, reason = False, "session-id-contradiction"
+        if sequence != self._latest_transition_sequence:
+            valid, reason = False, "stale-transition-response"
+        if not valid:
+            if latest:
+                # Success was forwarded to the TUI: the old identity is now
+                # diagnostic only until a new transition proves its target.
+                self._binding_blocked = True
+            self._last_transition = {
+                "sequence": sequence, "method": method, "status": "rejected",
+                "reason": reason, "thread_id": thread_id,
+            }
+            if thread_id not in self._sibling_thread_ids:
+                self._sibling_thread_ids.append(thread_id)
+                del self._sibling_thread_ids[:-MAX_THREAD_LINEAGE]
+            return
+        self._binding_blocked = False
+        self._binding_thread_id = thread_id
+        self._binding_source = source
+        if not self._launcher_thread_id:
+            self._launcher_thread_id = (
+                fork_predecessor if method == "thread/fork" else thread_id
+            )
+        # Same-thread resume preserves batches; real identity changes revoke.
+        if prior != thread_id:
+            self._binding_generation += 1
+        previous_thread = prior or (
+            fork_predecessor if method == "thread/fork" else ""
+        )
+        history = ([previous_thread] if previous_thread else []) + self._transition_history
+        self._transition_history = list(dict.fromkeys(
+            item for item in history
+            if item not in {thread_id, self._launcher_thread_id}
+        ))[:MAX_THREAD_LINEAGE - 1]
+        if method == "thread/fork":
+            self._thread_predecessors[thread_id] = fork_predecessor
+        if isinstance(session_id, str) and session_id:
+            self._binding_session_id = session_id
+            self._binding_session_id_state = "verified"
+        elif (
+            (method == "thread/fork" or prior == thread_id)
+            and self._binding_session_id
+        ):
+            self._binding_session_id_state = "documented-optional-absent"
+        else:
+            self._binding_session_id = ""
+            self._binding_session_id_state = "documented-optional-absent"
+        self._last_transition = {
+            "sequence": sequence, "method": method, "status": "committed",
+            "reason": "", "thread_id": thread_id,
+            "prior_thread_id": prior,
+        }
+        # Preserve the historical registry field while exposing the stronger
+        # sessionId evidence separately in status.  A missing optional field is
+        # not promoted to protocol proof.
+        self._merge_pending_registry_fields_locked({"sessionId": thread_id})
 
     def _handle_internal_response_locked(
         self, pending: PendingInternal, message: dict[str, Any]
@@ -1456,22 +1629,24 @@ class ManagedGateway:
     def status(self) -> dict[str, Any]:
         with self._lock:
             state = self._threads.get(self._binding_thread_id)
-            ancestors: list[str] = []
-            observed = {self._binding_thread_id}
-            current = self._binding_thread_id
-            while len(ancestors) < MAX_THREAD_LINEAGE:
-                predecessor = self._thread_predecessors.get(current, "")
-                if not predecessor or predecessor in observed:
-                    break
-                ancestors.append(predecessor)
-                observed.add(predecessor)
-                current = predecessor
+            # Repeated visits cannot create cycles or erase the launch root.
+            ancestors = [
+                item for item in self._transition_history
+                if item not in {self._binding_thread_id, self._launcher_thread_id}
+            ][:MAX_THREAD_LINEAGE - 1]
+            if (
+                self._launcher_thread_id
+                and self._launcher_thread_id != self._binding_thread_id
+            ):
+                ancestors.append(self._launcher_thread_id)
             return {
                 "schema_version": 1,
                 "status": (
-                    "ready" if self._tui and self._upstream
+                    ("unproved" if self._binding_blocked else "ready")
+                    if self._tui and self._upstream
                     else "disconnected"
                 ),
+                "binding_blocked": self._binding_blocked,
                 "epoch": self._epoch,
                 "thread_id": self._binding_thread_id,
                 "thread_ancestors": ancestors,
@@ -1481,12 +1656,20 @@ class ManagedGateway:
                 "witnessed_thread_id": self._current_thread_id,
                 "sibling_thread_ids": list(self._sibling_thread_ids),
                 "binding_source": self._binding_source,
+                "binding_generation": self._binding_generation,
+                "binding_session_id": self._binding_session_id,
+                "session_id_verification": self._binding_session_id_state,
+                "herdr_provenance": dict(self._herdr_provenance),
+                "latest_transition_sequence": self._latest_transition_sequence,
+                "last_transition": dict(self._last_transition),
+                "last_transition_reason": self._last_transition.get("reason", ""),
                 "tui_connected": bool(self._tui),
                 "capabilities": {
                     HUMAN_GATE_CAPABILITY: {
                         "version": HUMAN_GATE_CAPABILITY_VERSION,
                         "thread_id": self._binding_thread_id,
                         "epoch": self._epoch,
+                        "binding_generation": self._binding_generation,
                     }
                 },
             }
@@ -1507,6 +1690,23 @@ class ManagedGateway:
         thread_id = self._validate_identifier(
             thread_id, "thread-id-invalid"
         )
+        supplied_epoch = request.get("gateway_epoch")
+        supplied_generation = request.get("binding_generation")
+        with self._lock:
+            if self._binding_blocked:
+                raise GatewayError("transition-unproved")
+            expected_epoch = self._epoch
+            expected_generation = self._binding_generation
+            expected_thread = self._binding_thread_id
+        if type(supplied_epoch) is not int or supplied_epoch != expected_epoch:
+            raise GatewayError("stale-batch-epoch")
+        if (
+            type(supplied_generation) is not int
+            or supplied_generation != expected_generation
+        ):
+            raise GatewayError("stale-binding-generation")
+        if expected_thread and thread_id != expected_thread:
+            raise GatewayError("thread-not-owned-by-current-tui")
         parent_attempt_id = self._validate_identifier(
             request.get("parent_attempt_id"), "parent-attempt-id-invalid"
         )
@@ -1719,6 +1919,8 @@ class ManagedGateway:
         receipt = request.get("receipt")
         codec = notice_receipt.codec(receipt)
         with self._lock:
+            if self._binding_blocked:
+                raise GatewayError("transition-unproved")
             expected_thread = self._binding_thread_id
             expected_epoch = self._epoch
         transport_epoch = request.get("recipient_epoch", (receipt or {}).get("recipient_epoch")) if isinstance(receipt, dict) else None
@@ -1767,6 +1969,9 @@ class ManagedGateway:
         identity = {"thread_id": thread_id, "parent_attempt_id": parent,
                     "sealed_batch_id": batch, "receipt_digest": receipt_digest}
         with self._lock:
+            if self._binding_blocked:
+                return {"schema_version": 1, "status": "rejected",
+                        "delivery_id": delivery_id, "reason": "transition-unproved"}
             # Validation ran against a snapshot outside this mutation lock.
             # Re-check both binding dimensions before consulting or creating
             # durable state so reconnect/fork races cannot prepare old work.
@@ -1885,6 +2090,9 @@ class ManagedGateway:
             pending.event.set()
 
     def _send_human_gate_locked(self, pending: PendingInternal, state: ThreadState) -> None:
+        if self._binding_blocked:
+            self._reject_delivery_locked(pending, "transition-unproved")
+            return
         current_thread = self._binding_thread_id
         current_epoch = self._epoch
         # Rebind only unsent work whose semantic identity is still valid.
@@ -2002,6 +2210,9 @@ class ManagedGateway:
             "receipt_digest": receipt_digest,
         }
         with self._lock:
+            if self._binding_blocked:
+                return {"schema_version": 1, "status": "rejected",
+                        "delivery_id": delivery_id, "reason": "transition-unproved"}
             existing = self.ledger.get(delivery_id)
             if existing and existing.get("state") == "accepted":
                 return {
@@ -2055,6 +2266,8 @@ class ManagedGateway:
                     delivery_id=delivery_id,
                     identity=identity,
                     receipt=receipt,
+                    recipient_epoch=request["gateway_epoch"],
+                    binding_generation=request["binding_generation"],
                 )
                 self._delivery_pending[delivery_id] = pending
                 if self.fault == "before-send" and not self._fault_used:
@@ -2101,10 +2314,20 @@ class ManagedGateway:
         state: ThreadState,
         action: str,
     ) -> None:
+        if self._binding_blocked:
+            self._reject_delivery_locked(pending, "transition-unproved")
+            return
         if pending.receipt is None:
             self._reject_delivery_locked(
                 pending, "queued-receipt-missing"
             )
+            return
+        if (
+            pending.thread_id != self._binding_thread_id
+            or pending.recipient_epoch != self._epoch
+            or pending.binding_generation != self._binding_generation
+        ):
+            self._reject_delivery_locked(pending, "stale-binding-generation")
             return
         request_id = self._new_internal_id()
         pending.request_id = request_id

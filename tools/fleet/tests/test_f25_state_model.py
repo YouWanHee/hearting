@@ -166,6 +166,108 @@ class HysteresisSequenceTest(FixtureBase):
         self.assertEqual(state, "working")
         self.assertEqual(ev["tier"], 1)
 
+    def test_stale_codex_registry_idle_yields_to_exact_lifecycle(self):
+        value = {
+            "harness": "codex", "pid_alive": True, "orphan": False,
+            "status": "idle", "updated_at": 900.0, "mtime": 999.0,
+            "transcript": True, "task_lifecycle": "task_started",
+        }
+        state, ev = model.classify_session(value, 1000.0)
+        self.assertEqual(state, "working")
+        self.assertEqual(ev["tier"], 2)
+        self.assertEqual(ev["source"], "codex-lifecycle+registry-freshness")
+        self.assertIn("registry status=idle ignored", ev["rule"])
+        self.assertEqual(ev["raw_status"], "idle")
+        self.assertEqual(ev["inputs"]["updated_at"], 900.0)
+        self.assertEqual(ev["inputs"]["mtime"], 999.0)
+
+        terminal = dict(value, task_lifecycle="task_complete")
+        state, ev = model.classify_session(terminal, 1000.0)
+        self.assertEqual(state, "idle")
+        self.assertEqual(ev["tier"], 2)
+        self.assertEqual(ev["source"], "codex-lifecycle+registry-freshness")
+
+    def test_stale_codex_registry_idle_without_lifecycle_uses_mtime(self):
+        recent = {
+            "harness": "codex", "pid_alive": True, "orphan": False,
+            "status": "idle", "updated_at": 900.0, "mtime": 999.0,
+            "transcript": True, "task_lifecycle": None,
+        }
+        state, ev = model.classify_session(recent, 1000.0)
+        self.assertEqual(state, "working")
+        self.assertEqual(ev["tier"], 3)
+        self.assertEqual(ev["source"], "mtime+codex-registry-freshness")
+        self.assertIn("registry status=idle ignored", ev["rule"])
+        self.assertEqual(ev["raw_status"], "idle")
+        self.assertEqual(ev["inputs"]["updated_at"], 900.0)
+        self.assertEqual(ev["inputs"]["mtime"], 999.0)
+
+        old = dict(recent, updated_at=800.0, mtime=900.0)
+        state, ev = model.classify_session(old, 200000.0)
+        self.assertEqual(state, "stale")
+        self.assertEqual(ev["tier"], 3)
+        self.assertEqual(ev["source"], "mtime+codex-registry-freshness")
+        self.assertEqual(ev["raw_status"], "idle")
+
+    def test_fresh_codex_registry_idle_retains_priority(self):
+        base = {
+            "harness": "codex", "pid_alive": True, "orphan": False,
+            "status": "idle", "mtime": 999.0, "transcript": True,
+            "task_lifecycle": "task_started",
+        }
+        for updated_at in (999.0, 998.0):
+            with self.subTest(updated_at=updated_at):
+                state, ev = model.classify_session(
+                    dict(base, updated_at=updated_at), 1000.0
+                )
+                self.assertEqual(state, "idle")
+                self.assertEqual(ev["tier"], 1)
+                self.assertEqual(ev["source"], "claude-registry")
+
+    def test_registry_freshness_exception_is_codex_idle_only_and_fail_closed(self):
+        base = {
+            "pid_alive": True, "orphan": False, "status": "idle",
+            "updated_at": 900.0, "mtime": 999.0, "transcript": True,
+            "task_lifecycle": "task_started",
+        }
+        for harness in ("claude", "opencode"):
+            state, ev = model.classify_session(dict(base, harness=harness), 1000.0)
+            self.assertEqual(state, "idle")
+            self.assertEqual(ev["tier"], 1)
+        for updated_at in (None, "900", float("nan"), float("inf")):
+            state, ev = model.classify_session(
+                dict(base, harness="codex", updated_at=updated_at), 1000.0
+            )
+            self.assertEqual(state, "idle")
+            self.assertEqual(ev["tier"], 1)
+        state, ev = model.classify_session(
+            dict(base, harness="codex", status="busy"), 1000.0
+        )
+        self.assertEqual(state, "working")
+        self.assertEqual(ev["tier"], 1)
+
+    def test_codex_registry_freshness_wall_clock_delta_table(self):
+        # mtime and updated_at are wall clocks, not a causal or monotonic ordering.
+        epsilon = 0.000001
+        cases = (
+            ("below tolerance", 100.0, 101.0 - epsilon, "idle", 1),
+            ("at tolerance", 100.0, 101.0, "idle", 1),
+            ("above tolerance", 100.0, 101.0 + epsilon, "working", 2),
+            ("negative skew", 101.0, 100.0, "idle", 1),
+            ("future mtime", 2000.0, 2002.0, "working", 2),
+            ("very large values", 1_000_000_000_000.0,
+             1_000_000_000_002.0, "working", 2),
+        )
+        for name, updated_at, mtime, expected_state, expected_tier in cases:
+            with self.subTest(name=name):
+                state, evidence = model.classify_session({
+                    "harness": "codex", "pid_alive": True, "orphan": False,
+                    "status": "idle", "updated_at": updated_at, "mtime": mtime,
+                    "transcript": True, "task_lifecycle": "task_started",
+                }, 1000.0)
+                self.assertEqual(state, expected_state)
+                self.assertEqual(evidence["tier"], expected_tier)
+
 
 class TrackerLifecycleTest(FixtureBase):
     """R7 — singleton state must not leak or grow unbounded."""
@@ -425,6 +527,16 @@ class AdditiveSchemaTest(unittest.TestCase):
         for f in ("proc_start", "registry_proc_start", "started_at", "updated_at",
                   "registry_name", "kind", "provenance", "state_evidence"):
             self.assertIsNone(getattr(s, f), f)
+
+    def test_state_evidence_source_and_rule_are_extensible_strings(self):
+        """Consumers must not reject new source/rule values as unknown enums."""
+        evidence = model._evidence(
+            "idle", 2, "future-source+v99", "future rule vocabulary v99", {}
+        )
+        self.assertEqual(evidence["source"], "future-source+v99")
+        self.assertEqual(evidence["rule"], "future rule vocabulary v99")
+        self.assertIsInstance(evidence["source"], str)
+        self.assertIsInstance(evidence["rule"], str)
 
 
 class NamespaceLocalDescendantEvidenceTest(unittest.TestCase):

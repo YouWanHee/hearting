@@ -85,5 +85,54 @@ class StandaloneDistributionSafetyTest(unittest.TestCase):
         self.assertEqual(service.read_text(encoding="utf-8"), "foreign\n")
 
 
+class ActivationFailureDiagnosticTest(unittest.TestCase):
+    def test_stdout_json_precedence_and_last_lines_entry(self) -> None:
+        self.assertEqual(
+            distribution._activation_failure_detail(
+                '{"error":"typed error", "detail":"detail", "lines":["old", "last"]}',
+                "stderr terminal",
+            ),
+            "typed error",
+        )
+        self.assertEqual(
+            distribution._activation_failure_detail(
+                '{"error":12, "detail": "", "lines":["old", "last"]}',
+                "stderr terminal",
+            ),
+            "last",
+        )
+
+    def test_malformed_json_uses_terminal_stderr_then_stdout(self) -> None:
+        self.assertEqual(
+            distribution._activation_failure_detail('{"error":', "first\nstderr terminal\n"),
+            "stderr terminal",
+        )
+        self.assertEqual(
+            distribution._activation_failure_detail("stdout terminal\n", "\n"),
+            "stdout terminal",
+        )
+
+    def test_tail_bound_controls_redaction_and_unicode_limit(self) -> None:
+        stdout = "prefix " + ("x" * 70000) + "\n" + (
+            "Error: token = abc password:'def' secret: ghi "
+            "authorization=Bearer%20abc api-key=q "
+            "https://user:pass@example.test/path?token=abc&x=yz\n"
+        )
+        detail = distribution._activation_failure_detail(stdout, "")
+        self.assertLessEqual(len(detail), 1000)
+        self.assertNotIn("abc", detail)
+        self.assertNotIn("def", detail)
+        self.assertNotIn("ghi", detail)
+        self.assertNotIn("user:pass@", detail)
+        self.assertIn("[REDACTED]", detail)
+        self.assertIn("example.test/path", detail)
+        self.assertIn("?token=[REDACTED]&x=[REDACTED]", detail)
+        self.assertNotIn("\n", detail)
+        self.assertEqual(
+            distribution._activation_failure_detail("\u0000\u200bterminal\tpath", ""),
+            "terminal path",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

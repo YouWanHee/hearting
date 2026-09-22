@@ -325,7 +325,10 @@ class CutoverTest(unittest.TestCase):
         self.close(route, route_file)
         with self.assertRaises(C.CutoverError) as ctx:  # hidden residue fails D-6 unless excluded
             C.seal_legacy_cycle(self.root, cycle_dir=cycle_dir, route_file=route_file)
-        self.assertIn("locator-hidden-component", ctx.exception.detail)
+        # Both residues are rejected; filesystem enumeration order is not a contract.
+        self.assertTrue(any(reason in ctx.exception.detail for reason in
+                            ("locator-hidden-component", "locator-invalid-component")),
+                        ctx.exception.detail)
         self.assertIsNone(P.read_cycle_record(self.root, cyc))
         result = C.seal_legacy_cycle(self.root, cycle_dir=cycle_dir, route_file=route_file,
                                      title="W7 relocation", started_on="2026-08-25T00:00:00Z",

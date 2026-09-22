@@ -41,6 +41,9 @@ Contract:
   summary(views)                                 -> --json-shaped list (drops internal refs).
   clear_cache()                                  -> test hermeticity (model.reset_state_tracker
                                                      precedent).
+  load_outcome(route_file, expect_id=None, expect_hash=None)
+                                                 -> outcome sidecar dict, read-only, cached
+                                                     (F-<next> route chain, plan §3 Phase A A-2).
 """
 import hashlib
 import json
@@ -51,6 +54,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 _CACHE = {}          # {abspath: (mtime, size, record|None)}
+_OUTCOME_CACHE = {}  # {abspath: (mtime, size, outcome|None)} — F-<next> sidecar reader
 
 # F-30 retry rounds are display evidence, not route shape. Only these semantic
 # nodes carry the compact marker; every other opaque route node keeps its sealed
@@ -463,6 +467,68 @@ def clear_cache():
     """Test hermeticity: drop the mtime+size caches (model.reset_state_tracker() precedent)."""
     _CACHE.clear()
     _MARKER_CACHE.clear()
+    _OUTCOME_CACHE.clear()
+
+
+# --- outcome sidecar (F-<next> route chain, plan §3 Phase A A-2) — read-only, NEVER writes ---
+def _outcome_path(route_file):
+    p = Path(route_file)
+    return str(p.with_name(p.stem + ".outcome.json"))
+
+
+def _load_outcome_uncached(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if "terminal_gate_proven" not in data:
+        tgp = "absent"
+    else:
+        value = data.get("terminal_gate_proven")
+        tgp = value if value in (True, False, None) else "absent"
+    return {
+        "terminal_gate_proven": tgp,
+        "closed_at": data.get("closed_at") if isinstance(data.get("closed_at"), str) else None,
+        "route_id": data.get("route_id"),
+        "route_hash": data.get("route_hash"),
+    }
+
+
+def load_outcome(route_file, expect_id=None, expect_hash=None):
+    """`{"present": False}` | `{"present": True, "terminal_gate_proven": True|False|None|"absent",
+    "closed_at": str|None, "match": bool}` — read-only sidecar reader for the
+    `<route>.outcome.json` file next to `route_file` (capability-route.py:~3895 naming, reproduced
+    here for reading only). Never raises, never writes."""
+    if not route_file or not isinstance(route_file, (str, bytes, os.PathLike)):
+        return {"present": False}
+    try:
+        path = _outcome_path(route_file)
+        st = os.stat(path)
+        key = (st.st_mtime, st.st_size)
+    except (OSError, TypeError, ValueError):
+        return {"present": False}
+    cached = _OUTCOME_CACHE.get(path)
+    if cached is not None and (cached[0], cached[1]) == key:
+        outcome = cached[2]
+    else:
+        outcome = _load_outcome_uncached(path)
+        _OUTCOME_CACHE[path] = (key[0], key[1], outcome)
+    if outcome is None:
+        return {"present": False}
+    result = dict(outcome)
+    match = True
+    if expect_id is not None and result.get("route_id") != expect_id:
+        match = False
+    if expect_hash is not None and result.get("route_hash") != expect_hash:
+        match = False
+    result["present"] = True
+    result["match"] = match
+    del result["route_id"]
+    del result["route_hash"]
+    return result
 
 
 def _valid_attempt_axes(marker, node):

@@ -62,6 +62,13 @@ REGISTRY_DEPTH1_START = {
 }
 SUCCESS_NOTIFICATION = "\x1b]9;Hearting dispatch completed\x07"
 CLAIM_LEASE_SECONDS = 30.0
+# How long a terminal, delivery-owing row may wait for its pending-delivery
+# record to materialize before this carrier gives up silently. Trigger 1 can
+# lag the row close: an owner's supervisor closes its row while still alive,
+# and the settlement that writes the record runs only after the process group
+# drains (dispatch-reap-watch). Exiting at the first missing record made that
+# ordinary lag a permanently lost wake for an idle session (2026-09-17).
+DEFAULT_RECORD_GRACE_SECONDS = 900
 
 
 def _worker_type_is_depth1(candidate: object) -> bool:
@@ -1029,6 +1036,21 @@ def _carrier_one_claim(launch: Launch, metadata: dict[str, str]) -> ClaimWin | N
     return ClaimWin(claim_owner, recipient_key, delivery_id, root)
 
 
+def _record_missing(launch: Launch, metadata: dict[str, str]) -> bool:
+    """True only while the owed record does not exist yet -- never for a
+    record another carrier claimed or acked (that stays a silent exit)."""
+
+    delivery_id = metadata.get("delivery_id", "")
+    recipient_key = metadata.get("parent_sid", "")
+    if not delivery_id or not recipient_key:
+        return False
+    root = launch.jobs.resolve(strict=False).parent
+    try:
+        return pending_delivery.read(root, recipient_key, delivery_id) is None
+    except pending_delivery.PendingDeliveryError:
+        return False
+
+
 _RECIPIENT_KEY_CACHE: dict[tuple[str, str], str] = {}
 
 
@@ -1374,6 +1396,17 @@ def main() -> int:
         # terminal notice is claim-gated.
         return _emit_with_gates(launch, claim, state, message, block=False)
     win = _carrier_one_claim(launch, owing)
+    if win is None and _record_missing(launch, owing):
+        grace = _bounded_number(
+            "AGENT_CLAUDE_REWAKE_RECORD_GRACE_SECONDS", DEFAULT_RECORD_GRACE_SECONDS, 0, 3_600
+        )
+        step = _bounded_number(
+            "AGENT_CLAUDE_REWAKE_INTERVAL_SECONDS", DEFAULT_INTERVAL_SECONDS, 1, 300
+        )
+        until = time.monotonic() + grace
+        while win is None and time.monotonic() < until and _record_missing(launch, owing):
+            time.sleep(max(0.0, min(step, until - time.monotonic())))
+            win = _carrier_one_claim(launch, owing)
     if win is None:
         # Another carrier holds (or already acked) the durable record: the
         # completion is delivered by it, so this attempt is finished here --

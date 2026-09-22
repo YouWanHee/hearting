@@ -84,6 +84,19 @@ def _resolver_return_values(source_path: Path) -> set[str]:
                 f"{source_path}: unresolved delivery return {node.value.id}"
             )
             values.add(constants[node.value.id])
+        elif (isinstance(node.value, ast.Call)
+              and isinstance(node.value.func, ast.Attribute)
+              and isinstance(node.value.func.value, ast.Name)
+              and node.value.func.attr == "resolve_parent_completion_delivery"):
+            # Follow the actual imported shared resolver; retain fail-closed
+            # handling for unknown calls or newly introduced return forms.
+            alias = node.value.func.value.id
+            imports = {item.asname or item.name: item.name
+                       for statement in tree.body if isinstance(statement, ast.Import)
+                       for item in statement.names}
+            assert imports.get(alias) == "dispatch_parent_completion", source_path
+            values.update(_resolver_return_values(
+                ROOT / "utilities" / "dispatch_parent_completion.py"))
         else:
             raise AssertionError(f"{source_path}: unsupported return expression")
     return values

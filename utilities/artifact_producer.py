@@ -33,7 +33,10 @@ with an explicit promotion (D-3).
 from __future__ import annotations
 
 import argparse
+import contextlib
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
+import fcntl
 import hashlib
 import json
 import os
@@ -48,6 +51,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import artifact_admission  # noqa: E402
+import artifact_cycle_titles  # noqa: E402
 import artifact_identity  # noqa: E402
 import artifact_index  # noqa: E402
 import artifact_lifecycle  # noqa: E402
@@ -92,6 +96,15 @@ LEGACY_WRITE_HINT = ("run `artifact_producer.py begin --route <route file>` firs
 
 # D-81: campaign.json `related[]` row kinds (producer-internal API only).
 RELATED_KINDS = ("related", "precedes", "supersedes")
+
+# Attached to a first-publication `finalize --allow-open-route` response whose
+# cycle sealed `state: active` (D-6): closing the route later, proven or not,
+# cannot retroactively make this cycle `completed`.
+PROVISIONAL_SEAL_WARNING = (
+    "sealed provisionally active: closing the route later, with or without proof, cannot make "
+    "this cycle completed; campaign closure lists it as sealed-unproven. Order for new cycles: "
+    "complete -> close -> finalize."
+)
 
 COMPAT_OVERRIDE_NAME = "compat-override.json"
 INACTIVE_FALLBACK_ENV = "AGENT_ARTIFACT_INACTIVE_FALLBACK"
@@ -1697,14 +1710,28 @@ def build_manifest(
     now: Optional[float],
     abandon_reason: Optional[str] = None,
     support_locators: Sequence[str] = (),
+    reserved: Optional["InterimReservation"] = None,
+    interim: bool = False,
+    facts: Optional[Sequence[Tuple[str, str, int]]] = None,
 ) -> Dict[str, Any]:
+    """Build the D-6 cycle document.
+
+    `facts` rows are `(locator, content_digest, byte_size)`; when absent they are
+    computed from `rows`.  `reserved` carries the IDs an open-cycle checkpoint
+    already published, so the sealed document keeps them.  `interim` builds that
+    checkpoint document itself: `cycle.state` is `open`, with no cycle or route
+    terminal event and no route-closure requirement.
+    """
     identity = artifact_lifecycle.read_root_identity(root)
     if identity is None:
         raise ProducerError("root-identity-missing")
     campaign = read_campaign(root, record["campaign_id"])
     if campaign is None:
         raise ProducerError("campaign-unknown", record["campaign_id"])
-    man_id = allocator.allocate("manifest")
+    if facts is None:
+        facts = [(rel, _digest(data), len(data)) for rel, data in rows]
+    man_id = (reserved.manifest_id if reserved is not None and reserved.manifest_id
+              else allocator.allocate("manifest"))
     mrev_id = allocator.allocate("manifest_revision")
     when = _rfc3339(now)
     # `support_locators` are `artifacts/`-relative locators the caller marks as
@@ -1712,11 +1739,11 @@ def build_manifest(
     # loose files into a cycle this way). Empty by default, so an ordinary cycle's
     # manifest bytes are unchanged.
     support_rels = {"artifacts/" + rel.lstrip("/") for rel in support_locators}
-    primary_rel = _choose_primary(rows, primary, support=support_rels)
+    primary_rel = _choose_primary([(rel, None) for rel, _d, _s in facts], primary, support=support_rels)
 
-    def provenance(digest: str) -> Dict[str, Any]:
+    def provenance(digest: str, recorded_in: Optional[str] = None) -> Dict[str, Any]:
         return {
-            "source_manifest_id": man_id, "source_revision_id": mrev_id,
+            "source_manifest_id": man_id, "source_revision_id": recorded_in or mrev_id,
             "producer_route_id": route["route_id"], "algorithm_version": ALGORITHM_VERSION,
             "schema_version": 1, "source_digest": digest,
         }
@@ -1724,10 +1751,17 @@ def build_manifest(
     artifacts: List[Dict[str, Any]] = []
     revisions: List[Dict[str, Any]] = []
     events: List[Dict[str, Any]] = []
-    for rel, data in rows:
-        art_id = allocator.allocate("artifact")
-        arev_id = allocator.allocate("artifact_revision")
-        digest = _digest(data)
+    for rel, digest, byte_size in facts:
+        # A path the open-cycle checkpoint already published keeps its artifact
+        # ID; its revision ID is kept only while the content is unchanged.
+        kept = reserved.artifacts.get(rel) if reserved is not None else None
+        art_id = kept.artifact_id if kept else allocator.allocate("artifact")
+        # A revision already reserved for this content (current, or earlier and
+        # returned to) keeps its ID, provenance and recording event, so its rows
+        # are identical in every interim document and the sealed one.
+        same = reserved.revision_for(rel, digest) if reserved is not None else None
+        arev_id = same.artifact_revision_id if same else allocator.allocate("artifact_revision")
+        revision_provenance = provenance(digest, same.recorded_in if same else None)
         inner = rel[len("artifacts/"):]
         artifacts.append({
             "artifact_id": art_id, "cycle_id": record["cycle_id"],
@@ -1736,23 +1770,26 @@ def build_manifest(
         })
         revisions.append({
             "artifact_revision_id": arev_id, "artifact_id": art_id, "revision_sequence": 1,
-            "content_digest": digest, "byte_size": len(data), "media_type": _media_type(rel),
-            "locator": {"kind": "cycle-relative", "path": rel}, "provenance": provenance(digest),
+            "content_digest": digest, "byte_size": byte_size, "media_type": _media_type(rel),
+            "locator": {"kind": "cycle-relative", "path": rel}, "provenance": revision_provenance,
         })
+        reuse_event = same is not None and same.event_id and same.stream_id and same.recorded_at
         events.append({
-            "event_id": allocator.allocate("event"), "stream_id": allocator.allocate("stream"),
+            "event_id": same.event_id if reuse_event else allocator.allocate("event"),
+            "stream_id": same.stream_id if reuse_event else allocator.allocate("stream"),
             "stream_sequence": 1, "event_type": "artifact.revision.recorded", "target_id": art_id,
-            "actor": {"kind": "producer", "id": record["producer_id"]}, "recorded_at": when,
-            "provenance": provenance(digest), "evidence_ids": [], "payload": {"locator": rel},
+            "actor": {"kind": "producer", "id": record["producer_id"]},
+            "recorded_at": same.recorded_at if reuse_event else when,
+            "provenance": revision_provenance, "evidence_ids": [], "payload": {"locator": rel},
         })
-    cycle_digest = _digest(_canonical([[rel, _digest(data)] for rel, data in rows]))
+    cycle_digest = _digest(_canonical([[rel, digest] for rel, digest, _size in facts]))
     routes_row = {
         "artifact_root_id": identity.artifact_root_id, "route_id": route["route_id"],
         "route_hash": route["route_hash"], "terminal_marker": "pending",
         "terminal_evidence_id": "",
     }
-    closed = route_is_closed(root, route)
-    if not closed and not allow_open_route:
+    closed = False if interim else route_is_closed(root, route)
+    if not closed and not allow_open_route and not interim:
         raise ProducerError(
             "route-not-closed",
             f"{route['route_id']}: required order: complete -> close -> finalize -> admit-shared; "
@@ -1762,13 +1799,15 @@ def build_manifest(
     # only exists once the route is closed.  Sealing an open route therefore
     # records a provisional `active` cycle (lineage committed, completion not
     # claimed); `abandoned` needs no terminal evidence.
-    if state == "abandoned":
+    if interim:
+        cycle_state = artifact_manifest.INTERIM_CYCLE_STATE
+    elif state == "abandoned":
         cycle_state = "abandoned"
     elif closed:
         cycle_state = "completed"
     else:
         cycle_state = "active"
-    if cycle_state != "active":
+    if cycle_state not in ("active", artifact_manifest.INTERIM_CYCLE_STATE):
         payload = {"abandon_reason": abandon_reason} if cycle_state == "abandoned" else {}
         events.append({
             "event_id": allocator.allocate("event"), "stream_id": allocator.allocate("stream"),
@@ -1812,7 +1851,7 @@ def build_manifest(
                 "route_id": route["route_id"], "route_hash": route["route_hash"],
                 "capability": record["capability"], "intensity": record["intensity"],
             })),
-            "outcome_criterion": {"required_artifact_roles": ["primary"] if rows else [], "decision_required": False},
+            "outcome_criterion": {"required_artifact_roles": ["primary"] if facts else [], "decision_required": False},
             "state": cycle_state,
         },
         "artifacts": artifacts, "artifact_revisions": revisions,
@@ -1834,6 +1873,653 @@ def build_manifest(
         except artifact_lifecycle.LifecycleError as exc:
             raise ProducerError(exc.code, exc.detail)
     return document
+
+
+# ---------------------------------------------------------------------------
+# open-cycle checkpoint: the interim manifest
+# ---------------------------------------------------------------------------
+#
+# A consumer that mirrors artifacts (Cairn) can only read a sealed cycle's
+# `manifest.json`.  A checkpoint publishes the same closed D-6 document for a
+# cycle that is still open -- `cycle.state` is `open` -- under
+# `.runtime/artifact-producer/v1/open-manifests/<cyc>.json`.
+#
+# IDs come from one cumulative reservation ledger,
+# `checkpoints/<cyc>.ids.json`: every locator a checkpoint ever published keeps
+# its artifact ID there, even while a later checkpoint leaves the file out
+# (grown past a size limit, briefly missing), and a revision keeps its ID,
+# provenance and recording event while its digest is unchanged.  Every later
+# checkpoint and the final `finalize` assign IDs from that ledger, so a
+# consumer row survives the seal.  Sealing removes the interim files.
+# `checkpoints/<cyc>.json` is bookkeeping only (interval, last result, digest
+# cache).
+
+OPEN_MANIFEST_DIR = "open-manifests"
+CHECKPOINT_DIR = "checkpoints"
+CHECKPOINT_TRIGGERS = ("explicit", "stage-complete", "supervisor-poll", "turn-end")
+CHECKPOINT_INTERVAL_ENV = "AGENT_ARTIFACT_CHECKPOINT_MIN_INTERVAL"
+CHECKPOINT_MIN_INTERVAL_SECONDS = 900.0
+# An automatic trigger never publishes a first interim document for a cycle
+# whose files have not changed for this long: that cycle is not live work.
+CHECKPOINT_STALE_SECONDS = 24 * 3600.0
+CHECKPOINT_FINALIZE_LOCK_SECONDS = 60.0
+RESERVATION_SCHEMA_VERSION = 1
+# Earlier revisions a locator keeps in the ledger, so content that returns to
+# an earlier digest returns to that revision's ID.
+RESERVATION_HISTORY_LIMIT = 16
+# A route is finalized by the release it was sealed to.  Only a release that
+# carries this file keeps interim IDs at the seal, so a cycle whose route is
+# sealed to an older release publishes no interim document.
+INTERIM_SUPPORT_MARKER = "utilities/artifact_checkpoint_trigger.py"
+# Weights, archives, and array dumps are not something a reader opens; they
+# stay on disk and are declared only by the sealed manifest.
+CHECKPOINT_EXCLUDED_SUFFIXES = frozenset({
+    ".pt", ".pth", ".ckpt", ".safetensors", ".bin", ".onnx", ".h5", ".hdf5", ".pkl",
+    ".pickle", ".joblib", ".npy", ".npz", ".tflite", ".pb", ".tar", ".zip", ".gz", ".tgz",
+    ".xz", ".bz2", ".7z", ".zst", ".tfrecord", ".arrow", ".parquet", ".lmdb", ".mdb",
+})
+_STALE_TEMP_SECONDS = 3600.0
+
+
+@dataclass(frozen=True)
+class CheckpointLimits:
+    max_walk_entries: int = 20000
+    max_files: int = 2000
+    max_total_bytes: int = 256 * 1024 * 1024
+    max_file_bytes: int = 32 * 1024 * 1024
+
+    def to_payload(self) -> Dict[str, int]:
+        return {"max_walk_entries": self.max_walk_entries, "max_files": self.max_files,
+                "max_total_bytes": self.max_total_bytes, "max_file_bytes": self.max_file_bytes}
+
+
+@dataclass(frozen=True)
+class ReservedRevision:
+    artifact_id: str
+    artifact_revision_id: str
+    content_digest: str
+    # The manifest revision that first recorded this artifact revision and its
+    # `artifact.revision.recorded` event; reused while the digest is unchanged.
+    recorded_in: Optional[str] = None
+    event_id: Optional[str] = None
+    stream_id: Optional[str] = None
+    recorded_at: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class InterimReservation:
+    manifest_id: Optional[str]
+    artifacts: Dict[str, ReservedRevision]
+    dropped: int = 0
+    # locator -> content_digest -> an earlier revision of the same artifact
+    history: Dict[str, Dict[str, ReservedRevision]] = field(default_factory=dict)
+
+    def revision_for(self, locator: str, digest: str) -> Optional[ReservedRevision]:
+        current = self.artifacts.get(locator)
+        if current is not None and current.content_digest == digest:
+            return current
+        return self.history.get(locator, {}).get(digest) if current is not None else None
+
+
+def _without_event_reuse(reserved: InterimReservation) -> InterimReservation:
+    """The same IDs, with every reused provenance/event field dropped."""
+    def bare(row: ReservedRevision) -> ReservedRevision:
+        return replace(row, recorded_in=None, event_id=None, stream_id=None, recorded_at=None)
+    return InterimReservation(
+        reserved.manifest_id, {loc: bare(row) for loc, row in reserved.artifacts.items()}, reserved.dropped,
+        {loc: {d: bare(row) for d, row in rows.items()} for loc, rows in reserved.history.items()},
+    )
+
+
+def open_manifest_path(root: Path, cycle_id: str) -> Path:
+    if not artifact_identity.is_well_formed(cycle_id, "cycle"):
+        raise ProducerError("cycle-id-invalid", str(cycle_id))
+    return producer_dir(root) / OPEN_MANIFEST_DIR / f"{cycle_id}.json"
+
+
+def checkpoint_state_path(root: Path, cycle_id: str) -> Path:
+    if not artifact_identity.is_well_formed(cycle_id, "cycle"):
+        raise ProducerError("cycle-id-invalid", str(cycle_id))
+    return producer_dir(root) / CHECKPOINT_DIR / f"{cycle_id}.json"
+
+
+def reservation_path(root: Path, cycle_id: str) -> Path:
+    return checkpoint_state_path(root, cycle_id).with_suffix(".ids.json")
+
+
+def _checkpoint_lock_path(root: Path, cycle_id: str) -> Path:
+    return checkpoint_state_path(root, cycle_id).with_suffix(".lock")
+
+
+def checkpoint_interval_seconds() -> float:
+    raw = os.environ.get(CHECKPOINT_INTERVAL_ENV, "")
+    try:
+        value = float(raw) if raw else CHECKPOINT_MIN_INTERVAL_SECONDS
+    except ValueError:
+        return CHECKPOINT_MIN_INTERVAL_SECONDS
+    return value if value >= 0 else CHECKPOINT_MIN_INTERVAL_SECONDS
+
+
+@contextlib.contextmanager
+def _checkpoint_lock(root: Path, cycle_id: str, *, timeout: float):
+    """Per-cycle lock shared by checkpoint (ID assignment + writes) and finalize
+    (ID reuse through interim removal).  Never taken before the admission lock."""
+    path = _checkpoint_lock_path(root, cycle_id)
+    _ensure_dir(path.parent)
+    fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise ProducerError("checkpoint-lock-busy", cycle_id)
+                time.sleep(0.05)
+        yield
+    finally:
+        os.close(fd)
+
+
+def _well_formed_or_none(value: Any, kind: str) -> Optional[str]:
+    return value if isinstance(value, str) and artifact_identity.is_well_formed(value, kind) else None
+
+
+def _reserved_revision(row: Any, artifact_id: str) -> Optional[ReservedRevision]:
+    """One revision entry, checked by ID format only.  Reused provenance and
+    event fields must also pass the manifest's own value rules; a field that
+    does not is dropped (a fresh one is issued), never carried into a seal."""
+    if not isinstance(row, Mapping):
+        return None
+    arev_id = _well_formed_or_none(row.get("artifact_revision_id"), "artifact_revision")
+    digest = row.get("content_digest")
+    if arev_id is None or not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+        return None
+    recorded_at = row.get("recorded_at")
+    return ReservedRevision(
+        artifact_id, arev_id, digest,
+        recorded_in=_well_formed_or_none(row.get("recorded_in"), "manifest_revision"),
+        event_id=_well_formed_or_none(row.get("event_id"), "event"),
+        stream_id=_well_formed_or_none(row.get("stream_id"), "stream"),
+        recorded_at=(recorded_at if isinstance(recorded_at, str)
+                     and artifact_manifest._RFC3339_RE.match(recorded_at) else None),
+    )
+
+
+def _reserved_row(locator: Any, row: Any) -> Optional[Tuple[ReservedRevision, List[ReservedRevision]]]:
+    """One ledger row (current revision + earlier ones), checked by ID format and
+    locator grammar only -- a later manifest schema or contract version never
+    invalidates a reservation."""
+    if not isinstance(locator, str) or not isinstance(row, Mapping):
+        return None
+    if not artifact_manifest.validate_locator_path(locator).ok:
+        return None
+    art_id = _well_formed_or_none(row.get("artifact_id"), "artifact")
+    current = _reserved_revision(row, art_id) if art_id else None
+    if current is None:
+        return None
+    raw = row.get("history")
+    earlier = [_reserved_revision(item, art_id) for item in (raw if isinstance(raw, list) else [])]
+    return current, [rev for rev in earlier if rev is not None]
+
+
+def _reservation_from_rows(manifest_id: Any, rows: Iterable[Tuple[Any, Any]]) -> InterimReservation:
+    kept: Dict[str, ReservedRevision] = {}
+    history: Dict[str, Dict[str, ReservedRevision]] = {}
+    seen_artifacts: Set[str] = set()
+    seen_revisions: Set[str] = set()
+    seen_events: Set[str] = set()
+    seen_streams: Set[str] = set()
+    dropped = 0
+
+    def unique_events(rev: ReservedRevision) -> ReservedRevision:
+        # A duplicated event or stream ID would make the sealed manifest invalid;
+        # keep the revision and let it record a fresh event instead.
+        if (rev.event_id in seen_events or rev.stream_id in seen_streams
+                or not (rev.event_id and rev.stream_id and rev.recorded_at)):
+            return replace(rev, event_id=None, stream_id=None, recorded_at=None)
+        seen_events.add(rev.event_id)
+        seen_streams.add(rev.stream_id)
+        return rev
+
+    for locator, row in rows:
+        parsed = _reserved_row(locator, row)
+        # A duplicated artifact or revision ID would make the next manifest
+        # invalid; drop the row.
+        if (parsed is None or locator in kept or parsed[0].artifact_id in seen_artifacts
+                or parsed[0].artifact_revision_id in seen_revisions):
+            dropped += 1
+            continue
+        current, earlier = parsed
+        kept[locator] = unique_events(current)
+        seen_artifacts.add(current.artifact_id)
+        seen_revisions.add(current.artifact_revision_id)
+        for rev in earlier:
+            if (rev.artifact_revision_id in seen_revisions or rev.content_digest == current.content_digest
+                    or rev.content_digest in history.get(locator, {})):
+                continue
+            history.setdefault(locator, {})[rev.content_digest] = unique_events(rev)
+            seen_revisions.add(rev.artifact_revision_id)
+    return InterimReservation(_well_formed_or_none(manifest_id, "manifest"), kept, dropped, history)
+
+
+def _reservation_from_document(document: Mapping[str, Any]) -> InterimReservation:
+    """Fallback when the ledger is gone: the published interim document's rows."""
+    events = {row.get("target_id"): row for row in document.get("events") or []
+              if isinstance(row, Mapping) and row.get("event_type") == "artifact.revision.recorded"}
+    rows = []
+    for revision in document.get("artifact_revisions") or []:
+        if not isinstance(revision, Mapping):
+            continue
+        locator = (revision.get("locator") or {}).get("path") if isinstance(revision.get("locator"), Mapping) else None
+        event = events.get(revision.get("artifact_id")) or {}
+        provenance = revision.get("provenance") if isinstance(revision.get("provenance"), Mapping) else {}
+        rows.append((locator, {
+            "artifact_id": revision.get("artifact_id"),
+            "artifact_revision_id": revision.get("artifact_revision_id"),
+            "content_digest": revision.get("content_digest"),
+            "recorded_in": provenance.get("source_revision_id"),
+            "event_id": event.get("event_id"), "stream_id": event.get("stream_id"),
+            "recorded_at": event.get("recorded_at"),
+        }))
+    return _reservation_from_rows(document.get("manifest_id"), rows)
+
+
+def read_interim_reservation(root: Path, record: Mapping[str, Any]) -> Tuple[Optional[InterimReservation], str]:
+    """The cycle's ID reservation and a status word: `absent`, `present`,
+    `document-fallback` (ledger missing, rebuilt from the interim document),
+    `unreadable`, or `identity-mismatch`.  For the last two the returned
+    reservation is the document fallback, when one can be read."""
+    cid = record["cycle_id"]
+    fallback: Optional[InterimReservation] = None
+    document = _read_json(open_manifest_path(root, cid))
+    if document is not None and isinstance(document.get("cycle"), Mapping) \
+            and document["cycle"].get("cycle_id") == cid:
+        fallback = _reservation_from_document(document)
+    ledger_path = reservation_path(root, cid)
+    try:
+        ledger_path.lstat()
+    except FileNotFoundError:
+        return (fallback, "document-fallback") if fallback is not None else (None, "absent")
+    except OSError:
+        return fallback, "unreadable"
+    payload = _read_json(ledger_path)
+    if payload is None or not isinstance(payload.get("artifacts"), Mapping):
+        return fallback, "unreadable"
+    if (payload.get("cycle_id") != cid or payload.get("campaign_id") != record.get("campaign_id")
+            or payload.get("route_id") != record.get("route_id")):
+        return fallback, "identity-mismatch"
+    return _reservation_from_rows(payload.get("manifest_id"), sorted(payload["artifacts"].items())), "present"
+
+
+def _ledger_row(current: ReservedRevision, earlier: Mapping[str, ReservedRevision]) -> Dict[str, Any]:
+    row = {key: value for key, value in asdict(current).items() if value is not None}
+    kept = [rev for digest, rev in earlier.items() if digest != current.content_digest]
+    if kept:
+        row["history"] = [
+            {key: value for key, value in asdict(rev).items() if value is not None and key != "artifact_id"}
+            for rev in kept[-RESERVATION_HISTORY_LIMIT:]
+        ]
+    return row
+
+
+def _reservation_payload(record: Mapping[str, Any], document: Mapping[str, Any],
+                         previous: Optional[InterimReservation]) -> Dict[str, Any]:
+    """Union of the previous reservation and this document -- never shrinks.  A
+    locator whose content changed keeps its earlier revision in `history`."""
+    rows: Dict[str, Dict[str, Any]] = {}
+    if previous is not None:
+        for locator, row in previous.artifacts.items():
+            rows[locator] = _ledger_row(row, previous.history.get(locator, {}))
+    events = {row["target_id"]: row for row in document["events"]
+              if row["event_type"] == "artifact.revision.recorded"}
+    for revision in document["artifact_revisions"]:
+        locator = revision["locator"]["path"]
+        event = events.get(revision["artifact_id"], {})
+        current = ReservedRevision(
+            revision["artifact_id"], revision["artifact_revision_id"], revision["content_digest"],
+            recorded_in=revision["provenance"]["source_revision_id"],
+            event_id=event.get("event_id"), stream_id=event.get("stream_id"),
+            recorded_at=event.get("recorded_at"),
+        )
+        earlier: Dict[str, ReservedRevision] = {}
+        if previous is not None:
+            earlier = dict(previous.history.get(locator, {}))
+            before = previous.artifacts.get(locator)
+            if before is not None and before.content_digest != current.content_digest:
+                earlier.pop(before.content_digest, None)
+                earlier[before.content_digest] = before
+        rows[locator] = _ledger_row(current, earlier)
+    return {
+        "schema_version": RESERVATION_SCHEMA_VERSION, "cycle_id": record["cycle_id"],
+        "campaign_id": record["campaign_id"], "route_id": record.get("route_id"),
+        "manifest_id": document["manifest_id"], "artifacts": dict(sorted(rows.items())),
+    }
+
+
+def remove_interim(root: Path, cycle_id: str) -> None:
+    """Drop a cycle's interim document, reservation and bookkeeping (idempotent)."""
+    if not artifact_identity.is_well_formed(cycle_id, "cycle"):
+        return
+    for path in (open_manifest_path(root, cycle_id), reservation_path(root, cycle_id),
+                 checkpoint_state_path(root, cycle_id), _checkpoint_lock_path(root, cycle_id)):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _sweep_orphan_interims(root: Path, *, now: Optional[float] = None) -> List[str]:
+    """Remove interim files of cycles that are no longer open.  A cycle record
+    that exists but cannot be read keeps its files (a transient read error must
+    not cost a live cycle its IDs); abandoned temporary files are dropped."""
+    clock = time.time() if now is None else now
+    removed: List[str] = []
+    for name in (OPEN_MANIFEST_DIR, CHECKPOINT_DIR):
+        directory = producer_dir(root) / name
+        if not directory.is_dir():
+            continue
+        for entry in sorted(directory.iterdir()):
+            if entry.name.startswith(".") and ".tmp-" in entry.name:
+                try:
+                    if clock - entry.lstat().st_mtime > _STALE_TEMP_SECONDS:
+                        entry.unlink()
+                except OSError:
+                    pass
+                continue
+            cycle_id = entry.name.split(".", 1)[0]
+            if not artifact_identity.is_well_formed(cycle_id, "cycle") or cycle_id in removed:
+                continue
+            try:
+                cycle_record_path(root, cycle_id).lstat()
+            except FileNotFoundError:
+                record: Optional[Dict[str, Any]] = {"state": "absent"}
+            except OSError:
+                continue
+            else:
+                record = read_cycle_record(root, cycle_id)
+                if record is None:
+                    continue
+            if record.get("state") != "open":
+                remove_interim(root, cycle_id)
+                removed.append(cycle_id)
+    return removed
+
+
+def _route_release_supports_interim(route: Mapping[str, Any]) -> Tuple[bool, str]:
+    tuple_ = route.get("launch_compatibility_tuple")
+    runtime = tuple_.get("runtime_root") if isinstance(tuple_, Mapping) else None
+    path = runtime.get("path") if isinstance(runtime, Mapping) else None
+    if not isinstance(path, str) or not path:
+        return False, "runtime-root-unsealed"
+    return (Path(path) / INTERIM_SUPPORT_MARKER).is_file(), path
+
+
+def _checkpoint_scan(directory: Path, previous: Mapping[str, Any], limits: CheckpointLimits) -> Dict[str, Any]:
+    """Bounded walk of `artifacts/`.  Returns `facts` (locator, digest, size),
+    the refreshed digest cache, exclusion counts and the newest file mtime, or a
+    `skip` reason as soon as a limit is exceeded (the walk stops there)."""
+    artifacts = directory / "artifacts"
+    if not artifacts.is_dir() or artifacts.is_symlink():
+        return {"skip": "artifacts-dir-missing"}
+    excluded = {"hidden": 0, "binary": 0, "oversize": 0, "non-regular": 0, "invalid-locator": 0}
+    candidates: List[Tuple[str, str, os.stat_result]] = []
+    visited = total = 0
+    newest = 0.0
+    for current, dirs, files in os.walk(str(artifacts), followlinks=False):
+        kept_dirs = []
+        for name in sorted(dirs):
+            if name.startswith("."):
+                excluded["hidden"] += 1
+            elif os.path.islink(os.path.join(current, name)):
+                excluded["non-regular"] += 1
+            else:
+                kept_dirs.append(name)
+        dirs[:] = kept_dirs
+        for name in sorted(files):
+            visited += 1
+            if visited > limits.max_walk_entries:
+                return {"skip": "walk-limit", "visited": visited}
+            path = os.path.join(current, name)
+            try:
+                info = os.lstat(path)
+            except OSError:
+                excluded["non-regular"] += 1
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                excluded["non-regular"] += 1
+                continue
+            newest = max(newest, info.st_mtime)
+            if name.startswith("."):
+                excluded["hidden"] += 1
+                continue
+            if os.path.splitext(name)[1].lower() in CHECKPOINT_EXCLUDED_SUFFIXES:
+                excluded["binary"] += 1
+                continue
+            if info.st_size > limits.max_file_bytes:
+                excluded["oversize"] += 1
+                continue
+            rel = Path(path).relative_to(directory).as_posix()
+            if not artifact_manifest.validate_locator_path(rel).ok:
+                excluded["invalid-locator"] += 1
+                continue
+            candidates.append((rel, path, info))
+            total += info.st_size
+            if len(candidates) > limits.max_files:
+                return {"skip": "file-count-limit", "files": len(candidates)}
+            if total > limits.max_total_bytes:
+                return {"skip": "byte-size-limit", "bytes": total}
+    facts: List[Tuple[str, str, int]] = []
+    stats: Dict[str, List[Any]] = {}
+    for rel, path, info in sorted(candidates):
+        old = previous.get(rel)
+        if (isinstance(old, list) and len(old) == 3 and old[0] == info.st_size
+                and old[1] == info.st_mtime_ns and isinstance(old[2], str)):
+            digest, size = old[2], info.st_size
+        else:
+            try:
+                data = Path(path).read_bytes()
+            except OSError:
+                excluded["non-regular"] += 1
+                continue
+            digest, size = _digest(data), len(data)
+        facts.append((rel, digest, size))
+        stats[rel] = [size, info.st_mtime_ns, digest]
+    return {"facts": facts, "stats": stats, "excluded": excluded, "newest_mtime": newest,
+            "total_bytes": sum(size for _rel, _digest_value, size in facts)}
+
+
+def _checkpoint_target(root: Path, cycle_id: Optional[str], route_file: Optional[Path]) -> Optional[Dict[str, Any]]:
+    if cycle_id:
+        record = read_cycle_record(root, cycle_id)
+        if record is None:
+            raise ProducerError("cycle-unknown", cycle_id)
+        return record
+    if route_file is None:
+        raise ProducerError("checkpoint-target-required", "--cycle or --route")
+    route = load_route(root, route_file)
+    records = [row for row in list_cycle_records(root)
+               if row.get("route_id") == route["route_id"] and row.get("state") == "open"]
+    if not records:
+        return None
+    if len(records) != 1:
+        raise ProducerError("route-cycle-binding-ambiguous", route["route_id"])
+    return records[0]
+
+
+def checkpoint(
+    root: Path,
+    *,
+    cycle_id: Optional[str] = None,
+    route_file: Optional[Path] = None,
+    trigger: str = "explicit",
+    now: Optional[float] = None,
+    allocator: Optional[artifact_identity.IdAllocator] = None,
+    limits: Optional[CheckpointLimits] = None,
+) -> Dict[str, Any]:
+    """Publish (or refresh) an open cycle's interim manifest.
+
+    Every outcome that is not an error is a result: `emitted`, `unchanged`, or
+    `skipped` with a `reason`.  Only a live cycle is published: the cycle is
+    open with no sealed manifest, and its route is readable, not closed, and
+    sealed to a release that keeps interim IDs at the seal.  Scans are
+    rate-limited per cycle (`checkpoint_interval_seconds`) for every trigger,
+    including an explicit one.  The scan runs unlocked; every write -- the
+    reservation, the document and the bookkeeping -- happens under the cycle's
+    checkpoint lock after the cycle is re-read.
+    """
+    root = Path(root).resolve()
+    if trigger not in CHECKPOINT_TRIGGERS:
+        raise ProducerError("checkpoint-trigger-invalid", trigger)
+    clock = time.time() if now is None else float(now)
+    record = _checkpoint_target(root, cycle_id, route_file)
+    if record is None:
+        return {"status": "skipped", "reason": "no-open-cycle", "trigger": trigger}
+    cid = record["cycle_id"]
+    base = {"cycle_id": cid, "route_id": record.get("route_id"), "trigger": trigger}
+
+    def skipped(reason: str, **extra: Any) -> Dict[str, Any]:
+        return {"status": "skipped", "reason": reason, **base, **extra}
+
+    if record.get("state") != "open":
+        return skipped("cycle-not-open", cycle_state=record.get("state"))
+    directory = cycle_dir(root, record["campaign_id"], cid, record)
+    if (directory / "manifest.json").exists():
+        return skipped("sealed-manifest-present")
+    try:
+        route = load_route(root, Path(record["route_file"]))
+    except ProducerError as exc:
+        return skipped("route-unreadable", detail=exc.code)
+    if route["route_hash"] != record.get("route_hash"):
+        return skipped("route-hash-drift")
+    if route_is_closed(root, route):
+        return skipped("route-closed")
+    supported, release = _route_release_supports_interim(route)
+    if not supported:
+        return skipped("route-release-predates-interim", runtime_root=release)
+    state_path = checkpoint_state_path(root, cid)
+    state = _read_json(state_path) or {}
+    observed_scan = state.get("last_scan_at")
+    interval = checkpoint_interval_seconds()
+    if (isinstance(observed_scan, (int, float)) and not isinstance(observed_scan, bool)
+            and clock - observed_scan < interval):
+        return skipped("min-interval", next_eligible_at=_rfc3339(observed_scan + interval))
+    limits = limits or CheckpointLimits()
+    previous_stats = state.get("stats") if isinstance(state.get("stats"), dict) else {}
+    scan = _checkpoint_scan(directory, previous_stats, limits)
+    try:
+        with _checkpoint_lock(root, cid, timeout=0.0):
+            return _checkpoint_commit(
+                root, record, route, directory, scan, observed_scan=observed_scan, clock=clock,
+                trigger=trigger, limits=limits, interval=interval, base=base,
+                allocator=allocator or artifact_identity.IdAllocator(),
+            )
+    except ProducerError as exc:
+        if exc.code == "checkpoint-lock-busy":
+            return skipped("busy")
+        raise
+
+
+def _checkpoint_commit(
+    root: Path, record: Mapping[str, Any], route: Mapping[str, Any], directory: Path,
+    scan: Mapping[str, Any], *, observed_scan: Any, clock: float, trigger: str,
+    limits: CheckpointLimits, interval: float, base: Mapping[str, Any],
+    allocator: artifact_identity.IdAllocator,
+) -> Dict[str, Any]:
+    cid = record["cycle_id"]
+    fresh = read_cycle_record(root, cid)
+    if fresh is None:
+        return {"status": "skipped", "reason": "cycle-record-unreadable", **base}
+    if fresh.get("state") != "open":
+        # Sealed or dropped while this checkpoint scanned: whatever interim
+        # files remain (the lock this call just re-created, at least) are garbage.
+        remove_interim(root, cid)
+        return {"status": "skipped", "reason": "cycle-not-open", **base}
+    if (directory / "manifest.json").exists():
+        # Still open with a manifest present: a seal in flight or a torn one.
+        # The reservation stays -- a re-run finalize must find it.
+        return {"status": "skipped", "reason": "sealed-manifest-present", **base}
+    state_path = checkpoint_state_path(root, cid)
+    state = _read_json(state_path) or {}
+    if state.get("last_scan_at") != observed_scan:
+        # Another checkpoint scanned and settled while this one scanned; its
+        # result is newer than nothing and this scan may predate its files.
+        return {"status": "skipped", "reason": "superseded", **base}
+    interim_path = open_manifest_path(root, cid)
+    had_interim = interim_path.exists()
+    previous_stats = state.get("stats") if isinstance(state.get("stats"), dict) else {}
+    bookkeeping: Dict[str, Any] = {
+        "schema_version": 1, "cycle_id": cid, "campaign_id": fresh["campaign_id"],
+        "route_id": fresh.get("route_id"), "cycle_path": os.path.relpath(str(directory), str(root)),
+        "open_manifest": os.path.relpath(str(interim_path), str(root)),
+        "last_scan_at": state.get("last_scan_at"), "last_scan_on": state.get("last_scan_on"),
+        "last_trigger": trigger, "last_emitted_at": state.get("last_emitted_at"),
+        "output_digest": state.get("output_digest"), "limits": limits.to_payload(),
+        "min_interval_seconds": interval, "stats": previous_stats,
+    }
+
+    def settle(status: str, reason: Optional[str], *, scanned: bool = True, **extra: Any) -> Dict[str, Any]:
+        if scanned:
+            bookkeeping.update({"last_scan_at": clock, "last_scan_on": _rfc3339(clock)})
+        bookkeeping.update({"last_status": status, "last_reason": reason})
+        bookkeeping.update({key: value for key, value in extra.items() if key in {
+            "stats", "excluded", "artifact_count", "total_bytes", "output_digest",
+            "last_emitted_at", "manifest_id", "manifest_revision_id"}})
+        _ensure_dir(state_path.parent)
+        _write_atomic(state_path, _json_bytes(bookkeeping), 0o644)
+        result = {"status": status, **base, **{k: v for k, v in extra.items() if k != "stats"}}
+        if reason:
+            result["reason"] = reason
+        return result
+
+    if scan.get("skip"):
+        detail = {key: value for key, value in scan.items() if key != "skip"}
+        return settle("skipped", scan["skip"], limit_detail=detail)
+    facts = scan["facts"]
+    common = {"stats": scan["stats"], "excluded": scan["excluded"],
+              "artifact_count": len(facts), "total_bytes": scan["total_bytes"]}
+    if not had_interim and not facts:
+        return settle("skipped", "no-output", scanned=False, **common)
+    if (trigger != "explicit" and not had_interim and scan["newest_mtime"]
+            and clock - scan["newest_mtime"] > CHECKPOINT_STALE_SECONDS):
+        return settle("skipped", "stale-cycle", scanned=False,
+                      newest_file_on=_rfc3339(scan["newest_mtime"]), **common)
+    reserved, reservation = read_interim_reservation(root, fresh)
+    if reservation in ("unreadable", "identity-mismatch"):
+        # Never re-issue IDs over a reservation this code cannot read.
+        return settle("skipped", f"reservation-{reservation}", **common)
+    output_digest = _digest(_canonical([[rel, digest] for rel, digest, _size in facts]))
+    reserved_matches = reserved is not None and all(
+        rel in reserved.artifacts and reserved.artifacts[rel].content_digest == digest
+        for rel, digest, _size in facts)
+    if (had_interim and reservation == "present" and reserved_matches
+            and state.get("output_digest") == output_digest):
+        return settle("unchanged", None, path=str(interim_path), **common)
+    try:
+        document = build_manifest(
+            root, fresh, route, (), state="completed", primary=None, allow_open_route=True,
+            allocator=allocator, now=clock, reserved=reserved, interim=True, facts=facts,
+        )
+    except ProducerError as exc:
+        return settle("skipped", exc.code, detail=exc.detail, **common)
+    report = artifact_manifest.validate_interim(document)
+    if not report.ok:
+        return settle("skipped", "interim-invalid",
+                      detail=";".join(v.code for v in report.violations), **common)
+    # The reservation is written before the document: a crash in between leaves
+    # IDs reserved but unpublished, never published but unreserved.
+    ledger = reservation_path(root, cid)
+    _ensure_dir(ledger.parent)
+    _write_atomic(ledger, _json_bytes(_reservation_payload(fresh, document, reserved)), 0o644)
+    _ensure_dir(interim_path.parent)
+    _write_atomic(interim_path, artifact_manifest.canonical_bytes(document), 0o644)
+    return settle(
+        "emitted", None, path=str(interim_path), output_digest=output_digest,
+        last_emitted_at=clock, manifest_id=document["manifest_id"],
+        manifest_revision_id=document["manifest_revision_id"],
+        reservation=reservation, **common,
+    )
 
 
 def _remove_empty_cycle(root: Path, record: Mapping[str, Any]) -> None:
@@ -2588,6 +3274,7 @@ def finalize(
     owns_lock = lock_fd is None
     if owns_lock:
         lock_fd = artifact_admission._acquire_lock(root, artifact_admission.LOCK_TIMEOUT_DEFAULT, now=now)
+    interim_guard = contextlib.ExitStack()
     try:
         if _recovery_scope == "root":
             _recover_locked(root, now=now)
@@ -2624,6 +3311,10 @@ def finalize(
                     "storage_state": "sealed", "cycle_state": published}
         if record.get("state") != "open":
             raise ProducerError("cycle-not-open", record.get("state", "?"))
+        # The open-cycle checkpoint assigns IDs under this lock; holding it until
+        # the interim document is removed keeps a concurrent checkpoint from
+        # republishing IDs the sealed manifest did not take.
+        interim_guard.enter_context(_checkpoint_lock(root, cycle_id, timeout=CHECKPOINT_FINALIZE_LOCK_SECONDS))
         # A live review lease protects the report's exact write window from
         # both terminal outcomes.  The check remains under the producer
         # admission lock and happens before any terminal mutation.
@@ -2693,6 +3384,7 @@ def finalize(
             if state == "abandoned":
                 record["abandon_reason"] = abandon_reason
             _write_cycle_record(root, record, exclusive=False)
+            remove_interim(root, cycle_id)
             return {"status": "no-lineage", "cycle_id": cycle_id, "lineage_committed": False}
         # An open predecessor may be linked at begin; the existing manifest
         # index still requires that predecessor to be admitted before its child.
@@ -2702,24 +3394,38 @@ def finalize(
             parent = read_cycle_record(root, record["parent_cycle_id"])
             if parent is None or parent.get("state") != "sealed":
                 raise ProducerError("parent-cycle-not-sealed", record["parent_cycle_id"])
-        document = build_manifest(
-            root, record, route, rows, state=state,
-            primary=_cycle_relative_primary(primary, directory),
-            allow_open_route=allow_open_route, allocator=alloc, now=now,
-            abandon_reason=abandon_reason, support_locators=support_locators,
-        )
-        report = artifact_manifest.validate(document)
-        if not report.ok:
-            raise ProducerError("manifest-invalid", ";".join(v.code for v in report.violations))
-        digest = artifact_manifest.manifest_digest(document)
+        reserved, reservation = read_interim_reservation(root, record)
         identity = artifact_lifecycle.read_root_identity(root)
         index = artifact_admission.load_index(root)
-        index_report = artifact_index.check(
-            index, document, idempotency_key=cycle_id, manifest_digest=digest,
-            repository_id=identity.repository_id if identity else None,
-        )
-        if not index_report.ok:
-            raise ProducerError("index-rejected", ";".join(v.code for v in index_report.violations))
+        # A reservation never blocks a seal: when a reused field makes the
+        # document fail, rebuild with fresh events, then with fresh IDs, and say so.
+        attempts: List[Tuple[Optional[InterimReservation], Optional[str]]] = [(reserved, None)]
+        if reserved is not None:
+            attempts += [(_without_event_reuse(reserved), "events-fresh"), (None, "ids-fresh")]
+        for candidate, rebuilt in attempts:
+            document = build_manifest(
+                root, record, route, rows, state=state,
+                primary=_cycle_relative_primary(primary, directory),
+                allow_open_route=allow_open_route, allocator=alloc, now=now,
+                abandon_reason=abandon_reason, support_locators=support_locators,
+                reserved=candidate,
+            )
+            report = artifact_manifest.validate(document)
+            if not report.ok:
+                failure = ProducerError("manifest-invalid", ";".join(v.code for v in report.violations))
+                continue
+            digest = artifact_manifest.manifest_digest(document)
+            index_report = artifact_index.check(
+                index, document, idempotency_key=cycle_id, manifest_digest=digest,
+                repository_id=identity.repository_id if identity else None,
+            )
+            if not index_report.ok:
+                failure = ProducerError("index-rejected", ";".join(v.code for v in index_report.violations))
+                continue
+            reserved, interim_rebuilt, failure = candidate, rebuilt, None
+            break
+        if failure is not None:
+            raise failure
         if state == "completed" and route_is_closed(root, route):
             completion = artifact_lifecycle.evaluate_cycle_completion(
                 document, content_root=directory, route_file=Path(record["route_file"]),
@@ -2746,13 +3452,29 @@ def finalize(
             raise artifact_admission.AdmissionRecoveryRequired(
                 f"cycle {cycle_id} manifest published but post-publish update failed; run recover"
             ) from exc
-        return {"excluded_hidden": excluded_hidden, "adopted_root_outputs": adopted_root_outputs,
+        sealed_result = {"excluded_hidden": excluded_hidden, "adopted_root_outputs": adopted_root_outputs,
             "status": "sealed", "cycle_id": cycle_id, "campaign_id": record["campaign_id"],
             "manifest_digest": digest, "manifest_path": str(manifest_path),
             "artifact_count": len(rows), "lineage_committed": True, "cycle_state": document["cycle"]["state"],
             "storage_state": "sealed",
         }
+        if reservation != "absent":
+            # The interim document's IDs were (or, when unusable, were not)
+            # carried into the sealed manifest; say which.
+            kept = reserved.artifacts if reserved is not None else {}
+            sealed_result["interim_ids"] = reservation
+            if interim_rebuilt:
+                sealed_result["interim_ids_rebuilt"] = interim_rebuilt
+            sealed_result["interim_ids_kept"] = sum(
+                1 for row in document["artifact_revisions"]
+                if row["locator"]["path"] in kept
+                and kept[row["locator"]["path"]].artifact_id == row["artifact_id"])
+        if document["cycle"]["state"] == "active":
+            sealed_result["provisional"] = True
+            sealed_result["warning"] = PROVISIONAL_SEAL_WARNING
+        return sealed_result
     finally:
+        interim_guard.close()
         if owns_lock:
             artifact_admission._release_lock(root, lock_fd)
 
@@ -2909,7 +3631,9 @@ def _commit_sealed(
     _write_journal(root, record["cycle_id"], state="committed", manifest_digest=digest,
                    cycle_path=os.path.relpath(str(directory), str(root)))
     _remove_journal(root, record["cycle_id"])
+    remove_interim(root, record["cycle_id"])
     artifact_locator.rebuild_indexes(root)
+    artifact_cycle_titles.emit_after_seal_locked(root, sealed, document, directory / "manifest.json")
 
 
 # ---------------------------------------------------------------------------
@@ -2984,6 +3708,9 @@ def _recover_locked(root: Path, *, now: Optional[float] = None) -> Dict[str, Lis
             else:
                 entry.unlink()
                 result["rolled_back"].append(journal.get("revision_id", entry.stem))
+    removed_interims = _sweep_orphan_interims(root)
+    if removed_interims:
+        result["interims_removed"] = removed_interims
     return result
 
 
@@ -3743,6 +4470,23 @@ def _print(payload: Any) -> None:
     print(json.dumps(payload, sort_keys=True))
 
 
+def _checkpoint_cli(args: argparse.Namespace) -> Dict[str, Any]:
+    route_file: Optional[Path] = None
+    root_value = args.artifact_root or os.environ.get("AGENT_ARTIFACT_ROOT") or ""
+    if args.route:
+        route_file = Path(args.route)
+        if not root_value:
+            raw = _read_json(route_file)
+            root_value = str((raw or {}).get("artifact_root") or "")
+    cycle_id = args.cycle or (None if args.route else os.environ.get("AGENT_ARTIFACT_CYCLE_ID") or None)
+    if not root_value:
+        raise ProducerError("checkpoint-target-required", "--artifact-root or $AGENT_ARTIFACT_ROOT")
+    root = Path(root_value)
+    if route_file is not None:
+        route_file = resolve_route_argument(root, route_file)
+    return checkpoint(root, cycle_id=cycle_id, route_file=route_file, trigger=args.trigger)
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
@@ -3776,13 +4520,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--backup-store", help="retirement store (default: $XDG_STATE_HOME/hearting/artifact-retirement)")
     p.add_argument("--apply", action="store_true", help="write recovered_started_on into records (default: dry run)")
 
+    p = sub.add_parser("cycle-display-titles-backfill",
+                       help="declare cycle display titles for Cairn from sealed cycles (default: dry run)")
+    p.add_argument("--artifact-root", required=True)
+    p.add_argument("--apply", action="store_true", help="write the declaration (default: dry run)")
+    p.add_argument("--report", help="write a markdown report to this path")
+    p.add_argument("--out", help="write the candidate declaration bytes to this path (outside the artifact root)")
+    p.add_argument("--reader-dir", help="Cairn app_dir to gate --apply against (default: ~/.config/cairn-sync/config.json)")
+    p.add_argument("--expect-post-digest", help="refuse --apply unless the computed post-digest matches")
+    p.add_argument("--restore-journal", help="restore the declaration from a prior --apply's journal")
+
     for command in ("campaign-status", "campaign-close", "campaign-recover"):
         p = sub.add_parser(command, help="verify, accept, or recover a campaign's administrative closure")
         p.add_argument("--artifact-root", required=True)
         p.add_argument("--campaign", required=True, help="campaign ID or campaign.json path")
         if command == "campaign-close":
             p.add_argument("--approval-harness", choices=("claude", "codex", "opencode"))
-            p.add_argument("--approval-session", help="native session containing the USER's exact approval statement")
+            p.add_argument("--approval-session", help="native session where the USER approved: the exact statement, or a short consent as their first input right after the statement was shown")
 
     p = sub.add_parser("begin")
     p.add_argument("--artifact-root", required=True)
@@ -3799,7 +4553,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                    help="the work stream this cycle belongs to; reuses the active "
                         "campaign holding that key. Defaults to the sealed route's key. "
                         "With no campaign/key/parent selection, uses the root's "
-                        "_unassigned campaign and reports degraded=true")
+                        "_unassigned campaign and reports degraded=true. Size: a stream with a "
+                        "one-sentence closing condition — not a project name, not a one-cycle task")
     p.add_argument("--title")
     p.add_argument("--goal")
     p.add_argument("--parent-cycle",
@@ -3821,6 +4576,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--adopt-root-output", action="append", default=[])
     p.add_argument("--abandon-reason", choices=sorted(ABANDON_REASONS))
     p.add_argument("--force-abandon-ignoring-lease", action="store_true")
+
+    p = sub.add_parser("checkpoint",
+                       help="publish an open cycle's interim manifest (the sealed schema with "
+                            "cycle.state=open) for readers such as Cairn; rate-limited per cycle")
+    p.add_argument("--artifact-root",
+                   help="default: $AGENT_ARTIFACT_ROOT, else the route file's artifact_root")
+    p.add_argument("--cycle", help="default: $AGENT_ARTIFACT_CYCLE_ID when --route is absent")
+    p.add_argument("--route", help="route file or bare route id; selects the route's one open cycle")
+    p.add_argument("--trigger", default="explicit", choices=CHECKPOINT_TRIGGERS)
 
     p = sub.add_parser("review-lease")
     p.add_argument("--artifact-root", required=True)
@@ -3869,6 +4633,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         if args.command not in {"check-write"}:
             dispatch_terminal_commit.require_current_cleanup("producer-" + args.command)
+        if args.command == "checkpoint":
+            _print(_checkpoint_cli(args))
+            return OK
         root = Path(args.artifact_root)
         if args.command == "activate":
             w7: Dict[str, Any] = {}
@@ -3899,6 +4666,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         elif args.command == "cycle-time-recovery":
             result = recover_cycle_times(root, apply=args.apply,
                                          backup_store=Path(args.backup_store) if args.backup_store else None)
+        elif args.command == "cycle-display-titles-backfill":
+            if args.restore_journal:
+                result = artifact_cycle_titles.restore_backfill(root, Path(args.restore_journal))
+            else:
+                result = artifact_cycle_titles.backfill(
+                    root, apply=args.apply,
+                    report_path=Path(args.report) if args.report else None,
+                    out_path=Path(args.out) if args.out else None,
+                    reader_dir=Path(args.reader_dir) if args.reader_dir else None,
+                    expect_post_digest=args.expect_post_digest,
+                )
+            _print(result)
+            return BLOCKED if str(result.get("status", "")).startswith("refused") else OK
         elif args.command == "campaign-status":
             result = artifact_campaign.status(root, args.campaign)
         elif args.command in {"campaign-close", "campaign-recover"}:
@@ -3932,6 +4712,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                               adopt_root_outputs=args.adopt_root_output,
                               abandon_reason=args.abandon_reason,
                               force_abandon_ignoring_lease=args.force_abandon_ignoring_lease)
+            if result.get("warning"):
+                print(result["warning"], file=sys.stderr)
         elif args.command == "review-lease":
             if args.operation == "acquire":
                 if not args.attempt:
@@ -3975,6 +4757,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             parser.error("unknown command")
             return USAGE
     except ProducerError as exc:
+        _print({"status": "blocked", "reason": exc.code, "detail": exc.detail})
+        return BLOCKED
+    except artifact_cycle_titles.CycleTitlesError as exc:
         _print({"status": "blocked", "reason": exc.code, "detail": exc.detail})
         return BLOCKED
     except artifact_admission.AdmissionBusy as exc:

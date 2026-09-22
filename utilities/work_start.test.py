@@ -15,6 +15,7 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
+from types import SimpleNamespace
 
 import work_start as W
 from dispatch_completion_join import CurrentDeliveryState
@@ -46,6 +47,8 @@ class WorkStartTest(unittest.TestCase):
         self.statuses = {}
         self.parent = mock.patch.object(W, "default_parent_session_id", return_value="parent")
         self.parent.start(); self.addCleanup(self.parent.stop)
+        self.environment = mock.patch.dict(os.environ, {"AGENT_CODEX_MANAGED_GATEWAY": "0"})
+        self.environment.start(); self.addCleanup(self.environment.stop)
         self.join = mock.patch.object(W, "join_selected_attempts", side_effect=self.observe)
         self.join.start(); self.addCleanup(self.join.stop)
         self.gate = mock.patch.object(W, "owner_frame_launch_gate", side_effect=self.owner_gate)
@@ -93,7 +96,7 @@ class WorkStartTest(unittest.TestCase):
             self.assertEqual(result["state"], "preparing", result)
             self.assertEqual(result["parent_next"], "end-turn")
         self.assertEqual(len(self.calls), 2)
-        self.assertEqual([c[c.index("--adapter")+1] for c in self.calls], ["codex", "opencode"])
+        self.assertTrue(all("--adapter" not in c for c in self.calls))
         self.ready = True
         result = self.start()
         self.assertEqual(result["state"], "needs-interview", result)
@@ -118,6 +121,59 @@ class WorkStartTest(unittest.TestCase):
         self.assertIn("capacity temporarily full", result["launches"][1]["diagnostic"])
         self.assertEqual(self.start()["state"], "preparing")
         self.assertEqual(len(self.calls), 2)
+
+    def test_automatic_frames_use_real_selector_usage_gate_before_wrapper_launch(self):
+        owner = load("work_start_capacity_owner", W.ROOT / "utilities/dispatch-owner.py")
+        self.route.update(cwd=self.tmp.name, capability="autopilot-code", capability_mode="debug",
+                          owner_model_profile="deep")
+        for node in self.route["nodes"][:2]:
+            node.update(model_profile="deep", role="deep maker", unit="plan/frame")
+        self.route["dispatch_evidence"]["tuples"] = [
+            {"child_harness": h, "status": "supported"} for h in ("claude", "codex")]
+        self.path.write_text(json.dumps(self.route))
+        context = {"harnesses": ["claude", "codex"],
+            "policy": {"primary": ["claude", "codex"], "relief": [], "last_resort": [],
+                       "promote_relief_below": 0},
+            "allocation": {"strategy": "balanced", "window": 30,
+                "harness_order": ["claude", "codex", "opencode"], "usage_gate_used_percent": 85}}
+        binding = SimpleNamespace(route_file=str(self.path), route_id=self.route["route_id"],
+            route_hash=self.route["route_hash"], route_node="frame", registry_digest="sha256:fixture",
+            write_scope="shards/frame/**", completion_gate="code-frame")
+        launched = []
+        def wrapper(command, **kwargs):
+            launched.append(Path(command[0]).parents[1].name)
+            return subprocess.CompletedProcess(command, 0)
+        def select(command, **kwargs):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                rc = owner.main(command[2:])
+            if rc == 0:
+                self.admit(command)
+            return subprocess.CompletedProcess(command, rc, output.getvalue(), "")
+        import artifact_producer
+        for headroom in (3, 1):
+            with self.subTest(headroom=headroom), contextlib.ExitStack() as stack:
+                self.jobs.unlink(missing_ok=True); self.calls.clear(); launched.clear()
+                stack.enter_context(mock.patch.dict(os.environ, {}, clear=True))
+                stack.enter_context(mock.patch.object(owner, "_authoritative_jobs", return_value=str(self.jobs)))
+                stack.enter_context(mock.patch.object(owner, "_sealed_owner_context", return_value=context))
+                stack.enter_context(mock.patch.object(owner, "_usage", return_value=dict.fromkeys(("claude", "codex", "opencode"), "ok")))
+                stack.enter_context(mock.patch.object(owner._capacity, "capacity_report", return_value={
+                    "scores": {"claude": headroom, "codex": 50, "opencode": 0}, "sources": {}}))
+                stack.enter_context(mock.patch.object(owner, "derive_frame_route_binding", return_value=binding))
+                stack.enter_context(mock.patch.object(artifact_producer, "prepare_route_artifact_env", return_value={}))
+                stack.enter_context(mock.patch.object(owner.subprocess, "run", side_effect=wrapper))
+                result = W.start_work(self.route, self.path, self.jobs, run=select)
+                self.assertEqual(result["state"], "preparing", result)
+                self.assertEqual(launched, ["codex", "codex"])
+                self.assertTrue(all("selection_source=configured-balanced" in r["receipt"] for r in result["launches"]))
+                # No authorized capacity is a refusal before any model wrapper.
+                self.jobs.unlink(); self.calls.clear(); launched.clear()
+                with mock.patch.object(owner, "_usage", return_value=dict.fromkeys(("claude", "codex", "opencode"), "limited(reset)")):
+                    refused = W.start_work(self.route, self.path, self.jobs, run=select)
+                self.assertEqual(refused["state"], "needs-attention", refused)
+                self.assertEqual(launched, [])
+                self.assertFalse(self.jobs.exists())
 
     def test_public_answer_submission_releases_then_starts_only_one_owner(self):
         self.start(); self.ready = True
@@ -226,6 +282,21 @@ class WorkStartTest(unittest.TestCase):
         self.assertEqual(result["reason"], "work-parent-recovery-required", result)
         self.assertEqual(self.calls, [])
 
+    def test_resume_reuses_witnessed_parent_and_refuses_sibling_or_missing_proof(self):
+        self.start()
+        W.default_parent_session_id.return_value = "inherited"
+        with mock.patch.dict(os.environ, {"AGENT_CODEX_MANAGED_GATEWAY": "1", "AGENT_DISPATCH_CHILD": "0"}), \
+             mock.patch.object(W, "interactive_parent_identity", return_value=("codex", "inherited")), \
+             mock.patch.object(W, "probe_managed_codex_parent", return_value=SimpleNamespace(thread_id="parent")) as probe:
+            self.assertEqual(self.start()["state"], "preparing")
+            self.assertEqual(len(self.calls), 2)
+            probe.assert_called_with(parent_harness="codex", parent_session_id="inherited")
+            probe.return_value = SimpleNamespace(thread_id="sibling")
+            self.assertEqual(self.start()["reason"], "work-parent-recovery-required")
+            probe.side_effect = W.ManagedDispatchError("managed-gateway-not-ready")
+            self.assertEqual(self.start()["reason"], "work-parent-recovery-required")
+            self.assertEqual(len(self.calls), 2)
+
     def test_route_hash_collision_is_never_adopted(self):
         self.start()
         self.jobs.write_text(self.jobs.read_text().replace("route_hash=sha256:probe", "route_hash=sha256:other"))
@@ -236,7 +307,8 @@ class WorkStartTest(unittest.TestCase):
         self.route["effective_intensity"] = "quick"
         self.route["registered_headless_candidates"] = [{"harness":"opencode","status":"supported"}]
         self.start()
-        self.assertEqual([c[c.index("--adapter")+1] for c in self.calls], ["opencode", "opencode"])
+        self.assertTrue(all("--adapter" not in c for c in self.calls))
+        self.assertTrue(all(c[c.index("--route-evidence") + 1] == str(self.path) for c in self.calls))
 
     def test_owner_completion_waits_for_runtime_closure_and_reuses_attempt(self):
         self.route["nodes"] = []

@@ -471,6 +471,10 @@ For producer-backed work, the controller's transaction is **terminal proof →
 route close → exact cycle seal → workflow COMPLETE**. Inline and legacy recovery
 use complete, close and finalize in that order. Shared admission applies only to
 shared kinds after sealing; it is never a prerequisite for the terminal marker.
+A cycle sealed while its route is open (`finalize --allow-open-route`) stays
+`active` in its manifest; a later close, proven or not, leaves it there, and
+campaign closure lists it as `sealed-unproven` with the route's recorded proof
+state.
 
 `close` writes an outcome sidecar: `route_hash` makes the route immutable.
 `status --open-only` exposes unfinished work. Close what this attempt opened:
@@ -703,7 +707,7 @@ Code uses sibling `spec/` and `plans/` buckets.
 
 Numeric prefixes such as `00_`, `01_`, `02_`, and `05_` are retired. Use plain names inside `spec/`, separating user-facing files from machine-oriented `_internal/`. The spec transaction helper snapshots the exact prior `prd.md` automatically whenever an existing PRD changes, regardless of intensity; initial creation and no-op updates do not allocate a version. See `CONVENTIONS §§5 and 6.5`.
 
-**Producer lifecycle (W7C).** Every folder above is a bucket inside one producer cycle once the write-cutover is active: `begin` issues the campaign/cycle/producer IDs before the first write, artifacts land under `campaigns/<campaign-locator>/<cycle-locator>/artifacts/<bucket>/…`, stage workers join the owner's open cycle through the `AGENT_ARTIFACT_*` environment, and `finalize` commits `manifest.json` after route closure. Legacy top-level writes are allowed only in the pre-activation compatibility window. See `core/CORE.md §3`.
+**Producer lifecycle (W7C).** Every folder above is a bucket inside one producer cycle once the write-cutover is active: `begin` issues the campaign/cycle/producer IDs before the first write, artifacts land under `campaigns/<campaign-locator>/<cycle-locator>/artifacts/<bucket>/…`, stage workers join the owner's open cycle through the `AGENT_ARTIFACT_*` environment, and `finalize` commits `manifest.json` after route closure. Before that, `artifact_producer.py checkpoint` publishes a live open cycle's interim manifest — the same schema with `cycle.state: open` — at `.runtime/artifact-producer/v1/open-manifests/<cyc>.json`; stage completion, supervisor polls and session turn ends trigger it automatically (at most once per 15 minutes per cycle, weights and oversized trees excluded), and `finalize` keeps its artifact IDs, then removes it. Legacy top-level writes are allowed only in the pre-activation compatibility window. See `core/CORE.md §3`.
 
 ## 6.1. Cross-Project Continuity Layer
 

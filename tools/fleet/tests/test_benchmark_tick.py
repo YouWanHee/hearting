@@ -16,22 +16,23 @@ if TOOLS_DIR not in sys.path:
     sys.path.insert(0, TOOLS_DIR)
 
 from fleet.tests import benchmark_tick
+from fleet.collectors import codex
 
 
 SCRIPT = Path(benchmark_tick.__file__).resolve()
 FIXTURE = SCRIPT.parent / "fixtures" / "tick_benchmark" / "v1" / "fixture.json"
 
 
-def _sample(edge_builds=None, cwd_parses=6, lifecycle_parses=0):
+def _sample(edge_builds=None, cwd_parses=6, cursor_initializations=0,
+            exact_scans=0):
     return {
         "wall_ns": 100,
         "cpu_ns": 90,
         "counters": {
-            "raw_lifecycle_parses": lifecycle_parses,
+            "lifecycle_cursor_initializations": cursor_initializations,
+            "lifecycle_exact_scans": exact_scans,
             "raw_edge_builds_by_home": edge_builds or {"$FIXTURE_ROOT/home": 1},
             "cwd_parses": cwd_parses,
-            "cache_hits": 0,
-            "cache_misses": lifecycle_parses,
             "cache_evictions": 0,
             "roots_visited": 1,
             "files_visited": 1,
@@ -46,7 +47,7 @@ def _valid_result():
         "fixture_schema": benchmark_tick.FIXTURE_SCHEMA,
         "fixture_sha256": "fixture-digest",
         "iterations": 20,
-        "cold_sample": _sample(lifecycle_parses=3),
+        "cold_sample": _sample(cursor_initializations=3),
         "warm_samples": [_sample() for _index in range(20)],
         "warm_summary": {
             "wall_median_ns": 100,
@@ -89,8 +90,31 @@ class BenchmarkComparisonGateTest(unittest.TestCase):
                 self.assertFalse(comparison["pass"])
                 self.assertFalse(comparison["checks"][check])
                 self.assertTrue(
-                    comparison["checks"]["unchanged_warm_lifecycle_parses_zero"]
+                    comparison["checks"][
+                        "unchanged_warm_lifecycle_cursor_initializations_zero"
+                    ]
                 )
+
+    def test_lifecycle_observer_counters_separate_exact_scans_from_cursor_init(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "rollout.jsonl")
+            Path(path).write_text(
+                '{"type":"event_msg","payload":'
+                '{"type":"task_started","turn_id":"t"}}\n',
+                encoding="utf-8",
+            )
+            codex._LIFECYCLE_CACHE.clear()
+            counters = benchmark_tick._Counters(tmp)
+            with benchmark_tick._instrument(counters):
+                codex._latest_task_lifecycle(path)
+                codex._latest_task_lifecycle(path)
+                codex._latest_task_lifecycle(path, max_scan=None)
+            observed = counters.snapshot()
+        self.assertEqual(observed["lifecycle_calls"], 3)
+        self.assertEqual(observed["lifecycle_cursor_initializations"], 1)
+        self.assertEqual(observed["lifecycle_exact_scans"], 1)
+        self.assertNotIn("cache_hits", observed)
+        self.assertNotIn("cache_misses", observed)
 
 
 class BenchmarkComparisonCliTest(unittest.TestCase):

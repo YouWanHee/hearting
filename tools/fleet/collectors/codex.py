@@ -56,6 +56,7 @@ _SUBAGENT_INDEX = {}                  # runtime home -> (read time, stamp, map, 
 _LIFECYCLE_CACHE_MAX = 512
 _LIFECYCLE_CACHE = OrderedDict()
 _LIFECYCLE_CACHE_EVICTIONS = 0
+_LIFECYCLE_BOUNDARY_BYTES = 256
 _TURN_CONTEXT_CACHE_MAX = 512
 _TURN_CONTEXT_CACHE = OrderedDict()
 _TURN_CONTEXT_CACHE_EVICTIONS = 0
@@ -185,100 +186,218 @@ def _rollout_home(path):
     return prefix if found and prefix else None
 
 
-def _parse_latest_task_lifecycle(rollout_path, chunk=65536, max_scan=1048576):
-    """Return the latest validated lifecycle pair, or ``None`` if it is ambiguous.
+@dataclass(frozen=True)
+class _LifecycleCursor:
+    """Validated JSONL state at one stable byte boundary of one file identity."""
 
-    Rows are consumed in physical JSONL order from the tail.  A terminal event is
-    trusted only when the immediately preceding lifecycle starts the same turn.
-    Invalid lifecycle rows fail closed instead of exposing an older state.
-    ``max_scan=None`` performs the exact full-rollout scan required for a known
-    native subagent; ordinary session enrichment keeps its bounded default.
+    dev: int
+    ino: int
+    offset: int
+    mtime_ns: int
+    ctime_ns: int
+    carry: bytes
+    lifecycle: object
+    boundary: bytes
 
-    Raw filesystem errors deliberately reach the caller so the caching wrapper can
-    distinguish unreadable input from a readable, validated ``None`` result.
-    """
-    terminal = {"task_complete", "turn_aborted"}
-    end = os.path.getsize(rollout_path)
-    floor = 0 if max_scan is None else max(0, end - max_scan)
-    carry = b""
-    latest = None
-    with open(rollout_path, "rb") as f:
-        while end > floor:
-            start = max(floor, end - chunk)
-            f.seek(start)
-            data = f.read(end - start) + carry
-            lines = data.splitlines()
-            if start > 0:
-                carry = lines.pop(0) if lines else data
-            for line in reversed(lines):
-                try:
-                    row = json.loads(line)
-                except Exception:
-                    continue
-                if not isinstance(row, dict) or row.get("type") != "event_msg":
-                    continue
-                payload = row.get("payload")
-                event_type = payload.get("type") if isinstance(payload, dict) else None
-                if event_type not in terminal | {"task_started"}:
-                    continue
-                turn_id = payload.get("turn_id")
-                if not isinstance(turn_id, str) or not turn_id:
-                    return None
-                if latest is None:
-                    latest = (event_type, turn_id)
-                    if event_type == "task_started":
-                        return latest
-                    continue
-                # The latest event is terminal: establish its exact matching start.
-                if event_type != "task_started" or turn_id != latest[1]:
-                    return None
-                return latest
-            end = start
+
+def _advance_task_lifecycle(lifecycle, raw_line):
+    """Advance one complete JSONL record; unrelated or malformed JSON is silent."""
+    try:
+        row = json.loads(raw_line)
+    except Exception:
+        return lifecycle
+    if not isinstance(row, dict) or row.get("type") != "event_msg":
+        return lifecycle
+    payload = row.get("payload")
+    event_type = payload.get("type") if isinstance(payload, dict) else None
+    if event_type not in {"task_started", "task_complete", "turn_aborted"}:
+        return lifecycle
+    turn_id = payload.get("turn_id")
+    if not isinstance(turn_id, str) or not turn_id:
+        return None
+    if event_type == "task_started":
+        return (event_type, turn_id)
+    if lifecycle == ("task_started", turn_id):
+        return (event_type, turn_id)
     return None
 
 
-def _latest_task_lifecycle(rollout_path, chunk=65536, max_scan=1048576):
-    """Strong-stamp LRU around the raw lifecycle parser.
+def _consume_lifecycle_bytes(lifecycle, carry, data):
+    """Consume complete newline-delimited rows, retaining an incomplete suffix."""
+    parts = (carry + data).split(b"\n")
+    carry = parts.pop()
+    for raw_line in parts:
+        lifecycle = _advance_task_lifecycle(lifecycle, raw_line.rstrip(b"\r"))
+    return lifecycle, carry
 
-    Resolve the caller's spelling once, then bind the cache key, both stats, and
-    parsed bytes to that exact canonical path. Readable ambiguity is cacheable;
-    transient I/O and changed-during-read input are not.
+
+def _read_lifecycle_range(handle, start, end, chunk, lifecycle=None, carry=b""):
+    if not isinstance(chunk, int) or chunk <= 0:
+        raise ValueError("chunk must be a positive integer")
+    handle.seek(start)
+    remaining = end - start
+    while remaining:
+        data = handle.read(min(chunk, remaining))
+        if not data:
+            raise OSError("short lifecycle read")
+        lifecycle, carry = _consume_lifecycle_bytes(lifecycle, carry, data)
+        remaining -= len(data)
+    return lifecycle, carry
+
+
+def _cursor_boundary(handle, offset):
+    start = max(0, offset - _LIFECYCLE_BOUNDARY_BYTES)
+    handle.seek(start)
+    data = handle.read(offset - start)
+    if len(data) != offset - start:
+        raise OSError("short lifecycle boundary read")
+    return data
+
+
+def _lifecycle_timestamps_regressed(cursor, *stats):
+    return any(
+        stat.st_mtime_ns < cursor.mtime_ns or stat.st_ctime_ns < cursor.ctime_ns
+        for stat in stats
+    )
+
+
+def _stable_path_stat(canonical_path, handle, endpoint):
+    """Return the current path stat only while it still names this open snapshot."""
+    opened = os.fstat(handle.fileno())
+    current = os.stat(canonical_path)
+    identity = (opened.st_dev, opened.st_ino)
+    if identity != (current.st_dev, current.st_ino):
+        raise OSError("lifecycle path identity changed")
+    if opened.st_size < endpoint or current.st_size < endpoint:
+        raise OSError("lifecycle file truncated during read")
+    return current
+
+
+def _initialize_lifecycle_cursor(canonical_path, chunk=65536):
+    """Read one newly observed identity exactly once from byte zero."""
+    with open(canonical_path, "rb") as handle:
+        opened = os.fstat(handle.fileno())
+        endpoint = opened.st_size
+        lifecycle, carry = _read_lifecycle_range(handle, 0, endpoint, chunk)
+        current = _stable_path_stat(canonical_path, handle, endpoint)
+        boundary = _cursor_boundary(handle, endpoint)
+    return _LifecycleCursor(
+        dev=opened.st_dev,
+        ino=opened.st_ino,
+        offset=endpoint,
+        mtime_ns=current.st_mtime_ns,
+        ctime_ns=current.st_ctime_ns,
+        carry=carry,
+        lifecycle=lifecycle,
+        boundary=boundary,
+    )
+
+
+def _parse_latest_task_lifecycle(rollout_path, chunk=65536, max_scan=1048576):
+    """Return the latest exact lifecycle after one stable full-history scan.
+
+    ``max_scan`` remains in the private compatibility surface because native-subagent
+    callers explicitly pass ``None``. Filesystem errors deliberately reach the caller.
     """
+    del max_scan
+    canonical_path = os.path.realpath(os.path.abspath(rollout_path))
+    return _initialize_lifecycle_cursor(canonical_path, chunk).lifecycle
+
+
+def _latest_task_lifecycle(rollout_path, chunk=65536, max_scan=1048576):
+    """Identity-bound incremental lifecycle observation.
+
+    A path's first stable identity is scanned in full. Later calls verify a small
+    boundary fingerprint and consume only bytes after the saved offset. Rotation,
+    truncation, retargeting, or any I/O failure removes the cursor and returns no
+    lifecycle for that observation; a later clean call may initialize afresh.
+    Intermediate-byte rewrites are outside the contract and are not detected;
+    detecting them would require rereading the whole file on every tick, which
+    conflicts with this feature's purpose. ``max_scan=None`` is the uncached exact
+    full scan used for native-subagent state.
+    """
+    if max_scan is None:
+        try:
+            return _parse_latest_task_lifecycle(
+                rollout_path, chunk=chunk, max_scan=None
+            )
+        except (OSError, ValueError):
+            return None
+
     global _LIFECYCLE_CACHE_EVICTIONS
     canonical_path = os.path.realpath(os.path.abspath(rollout_path))
-    key = (canonical_path, chunk, max_scan)
+    cached = _LIFECYCLE_CACHE.get(canonical_path)
     try:
         before = os.stat(canonical_path)
     except OSError:
-        _LIFECYCLE_CACHE.pop(key, None)
+        _LIFECYCLE_CACHE.pop(canonical_path, None)
         return None
-    stamp = (
-        before.st_dev, before.st_ino, before.st_size,
-        before.st_mtime_ns, before.st_ctime_ns,
-    )
-    cached = _LIFECYCLE_CACHE.get(key)
-    if cached is not None and cached[0] == stamp:
-        _LIFECYCLE_CACHE.move_to_end(key)
-        return cached[1]
+
+    if cached is not None:
+        if (before.st_dev, before.st_ino) != (cached.dev, cached.ino):
+            _LIFECYCLE_CACHE.pop(canonical_path, None)
+            return None
+        if before.st_size < cached.offset:
+            _LIFECYCLE_CACHE.pop(canonical_path, None)
+            return None
+        if _lifecycle_timestamps_regressed(cached, before):
+            _LIFECYCLE_CACHE.pop(canonical_path, None)
+            return None
+        if before.st_size == cached.offset:
+            if (before.st_mtime_ns, before.st_ctime_ns) != (
+                    cached.mtime_ns, cached.ctime_ns):
+                _LIFECYCLE_CACHE.pop(canonical_path, None)
+                return None
+            _LIFECYCLE_CACHE.move_to_end(canonical_path)
+            return cached.lifecycle
+
     try:
-        parsed = _parse_latest_task_lifecycle(canonical_path, chunk, max_scan)
-        after = os.stat(canonical_path)
-    except OSError:
-        _LIFECYCLE_CACHE.pop(key, None)
+        if cached is None:
+            updated = _initialize_lifecycle_cursor(canonical_path, chunk)
+            confirmed = os.stat(canonical_path)
+            if ((confirmed.st_dev, confirmed.st_ino) != (updated.dev, updated.ino)
+                    or confirmed.st_size < updated.offset):
+                raise OSError("lifecycle identity changed after initialization")
+        else:
+            with open(canonical_path, "rb") as handle:
+                opened = os.fstat(handle.fileno())
+                endpoint = opened.st_size
+                if (opened.st_dev, opened.st_ino) != (cached.dev, cached.ino):
+                    raise OSError("lifecycle identity changed before append read")
+                if endpoint < cached.offset:
+                    raise OSError("lifecycle file truncated before append read")
+                if _lifecycle_timestamps_regressed(cached, opened):
+                    raise OSError("lifecycle timestamps regressed before append read")
+                if _cursor_boundary(handle, cached.offset) != cached.boundary:
+                    raise OSError("saved lifecycle boundary changed before append read")
+                lifecycle, carry = _read_lifecycle_range(
+                    handle, cached.offset, endpoint, chunk,
+                    cached.lifecycle, cached.carry,
+                )
+                current = _stable_path_stat(canonical_path, handle, endpoint)
+                if _lifecycle_timestamps_regressed(cached, current):
+                    raise OSError("lifecycle timestamps regressed after append read")
+                boundary = _cursor_boundary(handle, endpoint)
+            updated = _LifecycleCursor(
+                dev=opened.st_dev,
+                ino=opened.st_ino,
+                offset=endpoint,
+                mtime_ns=current.st_mtime_ns,
+                ctime_ns=current.st_ctime_ns,
+                carry=carry,
+                lifecycle=lifecycle,
+                boundary=boundary,
+            )
+    except (OSError, ValueError):
+        _LIFECYCLE_CACHE.pop(canonical_path, None)
         return None
-    after_stamp = (
-        after.st_dev, after.st_ino, after.st_size,
-        after.st_mtime_ns, after.st_ctime_ns,
-    )
-    if after_stamp != stamp:
-        _LIFECYCLE_CACHE.pop(key, None)
-        return None
-    _LIFECYCLE_CACHE[key] = (stamp, parsed)
-    _LIFECYCLE_CACHE.move_to_end(key)
+
+    _LIFECYCLE_CACHE[canonical_path] = updated
+    _LIFECYCLE_CACHE.move_to_end(canonical_path)
     while len(_LIFECYCLE_CACHE) > _LIFECYCLE_CACHE_MAX:
         _LIFECYCLE_CACHE.popitem(last=False)
         _LIFECYCLE_CACHE_EVICTIONS += 1
-    return parsed
+    return updated.lifecycle
 
 
 def _subagent_active(edge_status, rollout_path, updated_at=None, updated_at_ms=None,

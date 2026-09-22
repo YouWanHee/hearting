@@ -200,10 +200,17 @@ class ParentContextConformance(unittest.TestCase):
                 self.assertIn("COMPLETED", sh_live.stdout)
                 wait = self.run_parent_surface(
                     ["sh", str(WAIT), "--jobs", str(jobs), "--interval", "1", "--max", "5"],
-                    run["env"], "pass-wait",
+                    run["env"], "pass-wait", expected=2,
                 )
-                self.assertIn("terminal-unclosed", wait.stdout)
-                self.assertIn(run["attempt"], wait.stdout)
+                pending = json.loads(wait.stdout.splitlines()[-1])
+                self.assertEqual(pending["state"], "pending")
+                children = {child["attempt_id"]: child for child in pending["children"]}
+                self.assertEqual(set(children), {run["attempt"], "att-decoy"})
+                self.assertEqual(children[run["attempt"]]["status"], "open")
+                self.assertEqual(children[run["attempt"]]["readiness"], "pending")
+                self.assertEqual(children[run["attempt"]]["reason"], "terminal-commit-pending")
+                self.assertEqual(children[run["attempt"]]["required_action"], "complete-open")
+                self.assertEqual(children["att-decoy"]["reason"], "process-unverifiable")
                 harvest = self.run_parent_surface(
                     [sys.executable, str(HARVEST), "--jobs", str(jobs),
                      "--attempt-id", run["attempt"], "--status", "open"],
@@ -218,7 +225,8 @@ class ParentContextConformance(unittest.TestCase):
                 # selector. Liveness uses a separately labeled current/open row
                 # with the same exact wrapper-shaped JSONL. The readiness-only
                 # wait surface does not reinterpret transcript content; a gone
-                # process whose row remains open is terminal-unclosed.
+                # process whose row remains open awaits a terminal commit.
+                # Pending evidence is exit 2; exit 3 requires a committed failure.
                 real_before = run["jobs"].read_bytes()
                 harvest = self.run_parent_surface(
                     [sys.executable, str(HARVEST), "--jobs", str(run["jobs"]),
@@ -252,10 +260,17 @@ class ParentContextConformance(unittest.TestCase):
                 self.assertIn(f"turn.completed {verdict}", sh_live.stdout)
                 wait = self.run_parent_surface(
                     ["sh", str(WAIT), "--jobs", str(supplemental), "--interval", "1", "--max", "5"],
-                    run["env"], f"{verdict.lower()}-supplemental-wait",
+                    run["env"], f"{verdict.lower()}-supplemental-wait", expected=2,
                 )
-                self.assertIn("terminal-unclosed", wait.stdout)
-                self.assertIn(supplemental_attempt, wait.stdout)
+                pending = json.loads(wait.stdout.splitlines()[-1])
+                self.assertEqual(pending["state"], "pending")
+                self.assertEqual(len(pending["children"]), 1)
+                child = pending["children"][0]
+                self.assertEqual(child["attempt_id"], supplemental_attempt)
+                self.assertEqual(child["status"], "open")
+                self.assertEqual(child["readiness"], "pending")
+                self.assertEqual(child["reason"], "terminal-commit-pending")
+                self.assertEqual(child["required_action"], "complete-open")
                 self.assertIn("\topen\t", supplemental.read_text())
                 self.assertEqual(run["jobs"].read_bytes(), real_before)
 

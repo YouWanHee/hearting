@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,6 +34,7 @@ if str(UTILITIES_ROOT) not in sys.path:
     sys.path.insert(0, str(UTILITIES_ROOT))
 
 import harness_manifest
+import dispatch_contract
 import model_config
 import native_agent_payload
 import projector
@@ -210,6 +212,113 @@ def _same_tree(left: Path, right: Path) -> bool:
         return False
 
 
+def _validate_external_plugin_conflicts(runtime: str, scope: str) -> None:
+    """Read-only conflict gate for native/plugin activation ownership.
+
+    This runs from ``validate_request`` before the installer creates a launcher
+    snapshot, runtime snapshot, lock, transaction, or activation record.  The
+    installer never disables or quarantines an external plugin; the operator
+    must remove the conflicting entry first.
+    """
+
+    if runtime == "codex":
+        config = _config_path(runtime, scope, "config.toml")
+        if not config.is_file():
+            if config.exists():
+                raise ActivationError(f"invalid Codex config: {config} is not a regular file")
+            return
+        try:
+            text = config.read_text(encoding="utf-8")
+            import tomllib
+
+            data = tomllib.loads(text)
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            raise ActivationError(f"invalid Codex config: {config}: {exc}") from exc
+        plugins = data.get("plugins", {})
+        if not isinstance(plugins, dict):
+            raise ActivationError(f"invalid Codex plugin table: {config}")
+        for name, table in plugins.items():
+            if not isinstance(name, str) or name.split("@", 1)[0] != "hearting-codex":
+                continue
+            if not isinstance(table, dict):
+                raise ActivationError(f"invalid Codex plugin table: {config}")
+            enabled = table.get("enabled", True)
+            if not isinstance(enabled, bool):
+                raise ActivationError(f"invalid Codex plugin enabled value: {config}")
+            if enabled:
+                raise ActivationError(
+                    f"external plugin conflict: hearting-codex is active in {config}"
+                )
+        return
+
+    if runtime == "claude":
+        registry = _claude_plugins_path(scope)
+        if registry.is_file():
+            try:
+                data = json.loads(registry.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ActivationError(
+                    f"invalid Claude plugin registry: {registry}: {exc}"
+                ) from exc
+            if not isinstance(data, dict) or not isinstance(data.get("plugins", {}), dict):
+                raise ActivationError(f"invalid Claude plugin registry object: {registry}")
+            if any(
+                isinstance(key, str) and key.split("@", 1)[0] == "hearting-claude"
+                for key in data["plugins"]
+            ):
+                raise ActivationError(
+                    f"external plugin conflict: hearting-claude is active in {registry}"
+                )
+        elif registry.exists():
+            raise ActivationError(
+                f"invalid Claude plugin registry: {registry} is not a regular file"
+            )
+
+        settings = _config_path(runtime, scope, "settings.json")
+        if not settings.is_file():
+            if settings.exists():
+                raise ActivationError(f"invalid Claude settings: {settings} is not a regular file")
+            return
+        try:
+            data = json.loads(settings.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ActivationError(f"invalid Claude settings: {settings}: {exc}") from exc
+        if not isinstance(data, dict):
+            raise ActivationError(f"invalid Claude settings object: {settings}")
+        enabled_plugins = data.get("enabledPlugins", {})
+        if enabled_plugins is None:
+            return
+        if not isinstance(enabled_plugins, dict):
+            raise ActivationError(f"Claude settings enabledPlugins is not an object: {settings}")
+        if any(
+            isinstance(key, str)
+            and key.split("@", 1)[0] == "hearting-claude"
+            and value is not False
+            for key, value in enabled_plugins.items()
+        ):
+            raise ActivationError(
+                f"external plugin conflict: hearting-claude is active in {settings}"
+            )
+        return
+
+    for config in _opencode_config_paths(scope):
+        if not config.is_file():
+            if config.exists():
+                raise ActivationError(f"invalid OpenCode config: {config} is not a regular file")
+            continue
+        data = _read_opencode_config(config)
+        for key in ("plugin", "plugins"):
+            values = data.get(key, [])
+            if values is None:
+                continue
+            if not isinstance(values, list):
+                raise ActivationError(f"invalid OpenCode plugin list: {config}")
+            if any(_is_harness_npm_plugin_entry(value) for value in values):
+                raise ActivationError(
+                    f"external plugin conflict: Hearting npm plugin is active in {config}"
+                )
+
+
 def validate_request(
     runtime: str,
     command: str,
@@ -244,6 +353,7 @@ def validate_request(
             _validate_source_symlinks(root)
         except ActivationError as exc:
             raise ActivationError(f"invalid-before-mutation: {exc}") from exc
+        _validate_external_plugin_conflicts(runtime, scope)
         return {"runtime": runtime, "command": command, "source": str(root)}
     if command == "refresh":
         try:
@@ -265,6 +375,7 @@ def validate_request(
             _validate_source_symlinks(root)
         except ActivationError as exc:
             raise ActivationError(f"invalid-before-mutation: {exc}") from exc
+        _validate_external_plugin_conflicts(runtime, scope)
         return {"runtime": runtime, "command": command, "source": str(root)}
     if mode is not None and mode not in MODES:
         raise ActivationError(
@@ -762,28 +873,6 @@ def _desired_entries(
     return _linked_entries(runtime, active_root, scope)
 
 
-def _plugin_roots(runtime: str, scope: str = "global") -> List[Path]:
-    home = paths.runtime_home(runtime, scope)
-    if runtime == "codex":
-        marker, expected = ".codex-plugin/plugin.json", "hearting-codex"
-    elif runtime == "claude":
-        marker, expected = ".claude-plugin/plugin.json", "hearting-claude"
-    else:
-        return []
-    roots = []
-    cache = home / "plugins/cache"
-    if not cache.is_dir():
-        return roots
-    for manifest in cache.glob(f"**/{marker}"):
-        try:
-            data = json.loads(manifest.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if data.get("name") == expected:
-            roots.append(manifest.parent.parent)
-    return sorted(set(roots), key=lambda item: str(item))
-
-
 def _native_present(runtime: str, scope: str = "global") -> bool:
     home = paths.runtime_home(runtime, scope)
     state = _load_json(_state_path(runtime, scope))
@@ -1051,18 +1140,6 @@ def _is_harness_npm_plugin(value: str) -> bool:
     return bool(re.match(r"^hearting(?:-opencode)?(?:@[^/]*)?$", token))
 
 
-def _config_backup(runtime: str, scope: str, path: Path, original: bytes) -> dict:
-    digest = hashlib.sha256(original).hexdigest()
-    backup = (
-        paths.harness_state_dir(runtime, scope)
-        / "config-backups"
-        / f"{path.name}.{digest}"
-    )
-    if not backup.exists():
-        _atomic_bytes(backup, original)
-    return {"path": str(backup), "sha256": digest}
-
-
 def _config_path(runtime: str, scope: str, *parts: str) -> Path:
     path = paths.runtime_home(runtime, scope).joinpath(*parts)
     _ensure_runtime_destination(runtime, path, scope)
@@ -1111,50 +1188,6 @@ def _codex_plugin_active(scope: str = "global") -> bool:
     return False
 
 
-def _disable_codex_plugin(scope: str = "global") -> Optional[dict]:
-    config = _config_path("codex", scope, "config.toml")
-    if not config.is_file():
-        return None
-    original = config.read_bytes()
-    try:
-        lines = original.decode("utf-8").splitlines(keepends=True)
-    except UnicodeDecodeError as exc:
-        raise ActivationError(f"Codex config is not UTF-8: {config}") from exc
-    ranges = _codex_plugin_ranges(lines)
-    if not ranges:
-        return None
-    enabled = re.compile(
-        r"^(\s*enabled\s*=\s*)(true|false)(\s*(?:#.*)?(?:\r?\n)?)$",
-        re.IGNORECASE,
-    )
-    changed = False
-    offset = 0
-    for raw_start, raw_end in ranges:
-        start, end = raw_start + offset, raw_end + offset
-        found = False
-        for index in range(start + 1, end):
-            match = enabled.match(lines[index])
-            if not match:
-                continue
-            found = True
-            if match.group(2).lower() != "false":
-                lines[index] = f"{match.group(1)}false{match.group(3)}"
-                changed = True
-        if not found:
-            lines.insert(end, "enabled = false\n")
-            offset += 1
-            changed = True
-    if not changed:
-        return None
-    _atomic_bytes(config, "".join(lines).encode("utf-8"))
-    return {
-        "kind": "codex-plugin-disabled",
-        "path": str(config),
-        "disabled": ["hearting-codex"],
-        "backup": _config_backup("codex", scope, config, original),
-    }
-
-
 def _claude_plugins_path(scope: str = "global") -> Path:
     return _config_path("claude", scope, "plugins", "installed_plugins.json")
 
@@ -1183,34 +1216,6 @@ def _claude_plugin_active(scope: str = "global") -> bool:
         key.split("@", 1)[0] == "hearting-claude" and value is not False
         for key, value in enabled.items()
     )
-
-
-def _disable_claude_plugin(scope: str = "global") -> Optional[dict]:
-    registry = _claude_plugins_path(scope)
-    if not registry.is_file():
-        return None
-    original = registry.read_bytes()
-    try:
-        data = json.loads(original.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ActivationError(f"invalid Claude plugin registry: {registry}") from exc
-    if not isinstance(data, dict) or not isinstance(data.get("plugins", {}), dict):
-        raise ActivationError(f"invalid Claude plugin registry object: {registry}")
-    plugins = data.setdefault("plugins", {})
-    removed = [
-        key for key in plugins if key.split("@", 1)[0] == "hearting-claude"
-    ]
-    if not removed:
-        return None
-    for key in removed:
-        del plugins[key]
-    _atomic_json(registry, data)
-    return {
-        "kind": "claude-plugin-disabled",
-        "path": str(registry),
-        "disabled": removed,
-        "backup": _config_backup("claude", scope, registry, original),
-    }
 
 
 def _claude_hook_source(active_root: Path) -> Path:
@@ -1269,19 +1274,10 @@ def _merge_claude_settings(
     config = _config_path("claude", scope, "settings.json")
     original = config.read_bytes() if config.exists() else None
     data = _read_json_object(config, "Claude settings") if config.exists() else {}
-    enabled_plugins = data.get("enabledPlugins")
-    if enabled_plugins is not None and not isinstance(enabled_plugins, dict):
-        raise ActivationError(f"Claude settings enabledPlugins is not an object: {config}")
-    disabled_plugins = []
-    if isinstance(enabled_plugins, dict):
-        for key, value in list(enabled_plugins.items()):
-            if key.split("@", 1)[0] == "hearting-claude" and value is not False:
-                enabled_plugins[key] = False
-                disabled_plugins.append(key)
     hooks = data.setdefault("hooks", {})
     if not isinstance(hooks, dict):
         raise ActivationError(f"Claude settings hooks is not an object: {config}")
-    changed = bool(disabled_plugins)
+    changed = False
     added = 0
     previous_hooks = {}
     if previous:
@@ -1382,16 +1378,10 @@ def _merge_claude_settings(
     return {
         "kind": "claude-settings-merged",
         "path": str(config),
-        "disabled": disabled_plugins,
         "added": added,
         "managed_hooks": source_hooks,
         "managed_values": managed_values,
         "conflicts": conflicts,
-        "backup": (
-            _config_backup("claude", scope, config, original)
-            if changed and original is not None
-            else None
-        ),
     }
 
 
@@ -1473,71 +1463,20 @@ def _hook_command_files_present(hooks: dict) -> bool:
     return True
 
 
-def _disable_opencode_npm(scope: str = "global") -> List[dict]:
-    """Remove only explicit hearting npm entries from JSON config.
-
-    JSONC is intentionally read-only because stdlib cannot preserve comments.
-    The caller receives the original bytes for transaction rollback; removed
-    entries are recorded under the harness-owned state directory.
-    """
-    changes = []
-    for config in _opencode_config_paths(scope):
-        if config.suffix != ".json" or not config.is_file():
-            continue
-        original = config.read_bytes()
-        data = _read_opencode_config(config)
-        removed = []
-        changed = False
-        for key in ("plugin", "plugins"):
-            values = data.get(key)
-            if not isinstance(values, list):
-                continue
-            keep = []
-            for value in values:
-                if _is_harness_npm_plugin_entry(value):
-                    removed.append(_opencode_plugin_name(value))
-                    changed = True
-                else:
-                    keep.append(value)
-            data[key] = keep
-        if not changed:
-            continue
-        _atomic_json(config, data)
-        changes.append(
-            {
-                "kind": "opencode-plugin-disabled",
-                "path": str(config),
-                "disabled": removed,
-                "backup": _config_backup("opencode", scope, config, original),
-            }
-        )
-    return changes
-
-
-def _runtime_config_paths(runtime: str, scope: str = "global") -> List[Path]:
-    if runtime == "codex":
-        return [_config_path(runtime, scope, "config.toml")]
+def _activation_protected_paths(runtime: str, scope: str = "global") -> List[Path]:
+    """Return only state plus the narrow Claude field-owned settings leaf."""
+    paths_owned = [_state_path(runtime, scope)]
     if runtime == "claude":
-        return [
-            _config_path(runtime, scope, "settings.json"),
-            _claude_plugins_path(scope),
-        ]
-    return _opencode_config_paths(scope)
+        paths_owned.append(_config_path(runtime, scope, "settings.json"))
+    return paths_owned
 
 
 def _prepare_runtime_config(
     runtime: str, active_root: Path, previous: Optional[dict], scope: str = "global"
 ) -> List[dict]:
-    if runtime == "codex":
-        changes = [_disable_codex_plugin(scope)]
-    elif runtime == "claude":
-        changes = [
-            _merge_claude_settings(active_root, previous, scope),
-            _disable_claude_plugin(scope),
-        ]
-    else:
-        changes = _disable_opencode_npm(scope)
-    return [change for change in changes if change]
+    if runtime != "claude":
+        return []
+    return [_merge_claude_settings(active_root, previous, scope)]
 
 
 def duplicate_sources(runtime: str, scope: str = "global") -> List[str]:
@@ -1733,7 +1672,7 @@ def _write_journal(path: Path, runtime: str, status_value: str, records: List[di
 
 def _journal_dest_allowed(runtime: str, dest: Path, scope: str) -> bool:
     home = paths.runtime_home(runtime, scope)
-    if dest in {*_runtime_config_paths(runtime, scope), _state_path(runtime, scope)}:
+    if dest in set(_activation_protected_paths(runtime, scope)):
         return True
     exact = {
         "codex": {
@@ -1783,17 +1722,6 @@ def _journal_dest_allowed(runtime: str, dest: Path, scope: str) -> bool:
         "plugins", "hearting-guards.js"
     ):
         return True
-    expected_plugin = {
-        "codex": "hearting-codex",
-        "claude": "hearting-claude",
-    }.get(runtime)
-    if expected_plugin:
-        plugin_cache = home / "plugins" / "cache"
-        try:
-            plugin_relative = dest.relative_to(plugin_cache)
-        except ValueError:
-            return False
-        return expected_plugin in plugin_relative.parts
     return False
 
 
@@ -1873,11 +1801,6 @@ def _trusted_owned(
         except ActivationError:
             pass
 
-    home = paths.runtime_home(runtime, scope)
-    plugin_prefixes = {
-        "codex": home / "plugins/cache/hearting/hearting-codex",
-        "claude": home / "plugins/cache/hearting/hearting-claude",
-    }
     for item in state.get("owned_paths", []):
         value = item.get("dest")
         if not value:
@@ -1904,13 +1827,6 @@ def _trusted_owned(
                         continue
             if value in trusted:
                 continue
-        prefix = plugin_prefixes.get(runtime)
-        if item.get("kind") == "copytree" and prefix is not None:
-            try:
-                dest.relative_to(prefix)
-            except ValueError:
-                continue
-            trusted.add(value)
     return trusted
 
 
@@ -1932,10 +1848,6 @@ def _apply_transaction(
     desired_by_dest = {entry["dest"]: entry for entry in desired}
     removal = [Path(item) for item in owned if item not in desired_by_dest]
 
-    # Plugins are outside both activation modes.  Existing harness caches are
-    # retained under .harness/disabled-plugins, while registry entries are
-    # disabled by the protected config transaction.
-    quarantine = _plugin_roots(runtime, scope)
     allowed_link_roots = list(source_roots)
     if previous:
         for key in ("source_root", "active_root"):
@@ -1959,15 +1871,14 @@ def _apply_transaction(
             snapshots.append(record)
             _write_journal(journal_path, runtime, "preparing", snapshots)
 
-        for dest in removal + quarantine + [Path(item["dest"]) for item in desired]:
+        for dest in removal + [Path(item["dest"]) for item in desired]:
             key = str(dest)
             if key in seen:
                 continue
             seen.add(key)
             _ensure_owned_destination(runtime, dest, scope)
             kind = desired_by_dest.get(key, {}).get("kind", "remove")
-            quarantine_owned = owned | {str(path) for path in quarantine}
-            _safe_existing_dest(dest, kind, quarantine_owned, allowed_link_roots)
+            _safe_existing_dest(dest, kind, owned, allowed_link_roots)
             record = _snapshot_record(dest, backup_root, len(snapshots))
             record["postimage"] = (
                 safe_fs.PathState("missing").public()
@@ -1982,7 +1893,7 @@ def _apply_transaction(
 
         _write_journal(journal_path, runtime, "applying", snapshots)
 
-        for dest in removal + quarantine:
+        for dest in removal:
             for record in snapshots:
                 if record["dest"] == str(dest):
                     record["postimage"] = safe_fs.PathState("missing").public()
@@ -2034,34 +1945,7 @@ def _apply_transaction(
             if fail_after and operation_count >= fail_after:
                 raise ActivationError(f"injected failure after operation {operation_count}")
 
-        disabled = []
-        disabled_root = state_dir / "disabled-plugins" / uuid.uuid4().hex
-        for record in snapshots:
-            if record["dest"] not in {str(path) for path in quarantine}:
-                continue
-            if record["state"] == "moved":
-                disabled_root.mkdir(parents=True, exist_ok=True)
-                target = disabled_root / Path(record["dest"]).name
-                backup = Path(record["backup"])
-                if backup.is_dir():
-                    shutil.copytree(backup, target)
-                else:
-                    shutil.copy2(backup, target)
-                disabled.append(str(target))
-            elif record["state"] == "symlink":
-                disabled.append(f"symlink:{record['target']}")
-        if disabled:
-            changed.append(
-                {
-                    "source": "runtime-plugin-cache",
-                    "dest": str(disabled_root),
-                    "surface": "disabled-plugin",
-                    "kind": "quarantine",
-                    "disabled": disabled,
-                }
-            )
-
-        owned_entries = [item for item in changed if item.get("kind") != "quarantine"]
+        owned_entries = changed
         if commit_callback is not None:
             try:
                 commit_callback(owned_entries)
@@ -2087,11 +1971,201 @@ def _apply_transaction(
         raise
 
     shutil.rmtree(tx_root, ignore_errors=True)
-    return [item for item in changed if item.get("kind") != "quarantine"]
+    return changed
 
 
 def _projection_digest(entries: List[dict]) -> str:
     return _digest_paths(Path(item["source"]) for item in entries)
+
+
+def _activation_owned_paths(
+    runtime: str, source: Optional[str] = None, scope: str = "global"
+) -> List[Path]:
+    """Return the closed invocation rollback set.
+
+    The runtime-local ``.harness`` directory is a container, not an owned leaf.
+    Only its activation record and installer-created namespaces are admitted;
+    runtime dispatch, managed sessions, and all unknown siblings remain outside
+    the set even when they sit beneath that directory.
+    """
+    state = _load_json(_state_path(runtime, scope))
+    roots: List[Path] = []
+    if source:
+        roots.append(_real_source(source))
+    if state:
+        for key in ("source_root", "active_root"):
+            value = state.get(key)
+            if isinstance(value, str):
+                roots.append(Path(value))
+    try:
+        roots.append(paths.agent_home().resolve(strict=True))
+    except (OSError, RuntimeError):
+        pass
+
+    destinations: List[Path] = [
+        _state_path(runtime, scope),
+        *(paths.harness_state_dir(runtime, scope) / name for name in (
+            "transactions", "bundles", "config-backups", "disabled-plugins"
+        )),
+    ]
+    if runtime == "claude":
+        destinations.append(_config_path(runtime, scope, "settings.json"))
+
+    discovery: set[Path] = set()
+    for root in roots:
+        try:
+            discovery.update(Path(item["dest"]) for item in _linked_entries(runtime, root, scope))
+        except ActivationError:
+            continue
+    destinations.extend(sorted(discovery, key=lambda item: str(item)))
+
+    # A previous activation may have owned a projection that the current source
+    # no longer contains.  Admit only the same projection policy's exact leaves;
+    # legacy plugin/quarantine records are intentionally inert.
+    if state:
+        for item in state.get("owned_paths", []):
+            if not isinstance(item, dict) or not isinstance(item.get("dest"), str):
+                continue
+            candidate = Path(item["dest"])
+            if _journal_dest_allowed(runtime, candidate, scope):
+                destinations.append(candidate)
+
+    result: List[Path] = []
+    seen: set[str] = set()
+    for destination in destinations:
+        key = str(destination)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(destination)
+    return result
+
+
+def _test_after_capture_handshake(runtime: str, snapshot: dict) -> None:
+    """Fixture-only acknowledgement barrier for an external dispatch writer."""
+    fixture_raw = os.environ.get("HEARTING_FIXTURE_ROOT")
+    handshake_raw = os.environ.get("HARNESS_RUNTIME_TEST_AFTER_CAPTURE_DIR")
+    selected = os.environ.get("HARNESS_RUNTIME_TEST_AFTER_CAPTURE_RUNTIME")
+    if not handshake_raw and not selected:
+        return
+    if selected != runtime:
+        return
+    if not fixture_raw or not handshake_raw:
+        raise ActivationError("invalid after-capture fixture handshake configuration")
+
+    fixture = Path(fixture_raw).expanduser().absolute().resolve(strict=False)
+    directory = Path(handshake_raw).expanduser()
+    if not directory.is_absolute():
+        raise ActivationError("after-capture handshake directory must be absolute")
+    directory = directory.resolve(strict=False)
+    try:
+        directory.relative_to(fixture)
+    except ValueError as exc:
+        raise ActivationError(
+            f"after-capture handshake directory escapes fixture root: {directory}"
+        ) from exc
+    directory.mkdir(parents=True, exist_ok=True)
+
+    canonical_raw = os.environ.get("AGENT_DISPATCH_JOBS")
+    if not canonical_raw:
+        raise ActivationError("after-capture fixture requires AGENT_DISPATCH_JOBS")
+    canonical_path = Path(canonical_raw).expanduser()
+    if not canonical_path.is_absolute():
+        raise ActivationError("AGENT_DISPATCH_JOBS must be absolute for fixture handshake")
+    canonical_jobs = canonical_path.resolve(strict=False)
+    try:
+        selection = dispatch_contract.resolve_global_registry(
+            paths.agent_home(),
+            str(canonical_path),
+            1,
+            "start",
+            environ=os.environ,
+        )
+    except Exception as exc:
+        raise ActivationError(f"after-capture canonical dispatch resolution failed: {exc}") from exc
+    if selection.path != canonical_jobs:
+        raise ActivationError(
+            "after-capture canonical dispatch mismatch: "
+            f"exported={canonical_jobs} resolved={selection.path}"
+        )
+
+    snapshot_root = Path(snapshot["root"]).resolve(strict=False)
+    try:
+        snapshot_root.relative_to(fixture)
+    except ValueError as exc:
+        raise ActivationError(
+            f"after-capture snapshot root escapes fixture root: {snapshot_root}"
+        ) from exc
+
+    ready = directory / "ready.json"
+    ack = directory / "ack.json"
+    for path in (ready, ack):
+        if path.is_symlink() or (path.exists() and not path.is_file()):
+            raise ActivationError(f"after-capture handshake path is not a regular file: {path}")
+        if path.exists():
+            # destructive-ok: reason=replace one stale fixture handshake file; boundary=ready.json or ack.json below the contained test directory
+            path.unlink()
+
+    nonce = uuid.uuid4().hex
+    ready_payload = {
+        "schema": 1,
+        "phase": "after-capture-before-activate",
+        "runtime": runtime,
+        "nonce": nonce,
+        "canonical_jobs": str(canonical_jobs),
+        "snapshot_root": str(snapshot_root),
+    }
+    temporary = directory / f".ready-{nonce}.tmp"
+    try:
+        temporary.write_text(
+            json.dumps(ready_payload, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        with temporary.open("rb") as handle:
+            os.fsync(handle.fileno())
+        # destructive-ok: reason=atomically publish the exact fixture ready signal; boundary=ready.json below the contained test directory
+        os.replace(temporary, ready)
+        try:
+            directory_fd = os.open(directory, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError:
+            pass
+
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            if ack.is_file() and not ack.is_symlink():
+                try:
+                    data = json.loads(ack.read_text(encoding="utf-8"))
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise ActivationError(f"invalid after-capture acknowledgement: {ack}: {exc}") from exc
+                expected = {
+                    "schema", "phase", "runtime", "nonce", "canonical_jobs",
+                    "appended_sha256", "created_entries",
+                }
+                if set(data) != expected:
+                    raise ActivationError(f"after-capture acknowledgement shape mismatch: {ack}")
+                if (
+                    data.get("schema") != 1
+                    or data.get("phase") != "writer-complete"
+                    or data.get("runtime") != runtime
+                    or data.get("nonce") != nonce
+                    or data.get("canonical_jobs") != str(canonical_jobs)
+                    or not isinstance(data.get("appended_sha256"), str)
+                    or not re.fullmatch(r"[0-9a-fA-F]{64}", data["appended_sha256"])
+                    or not isinstance(data.get("created_entries"), list)
+                    or not all(isinstance(item, str) and item for item in data["created_entries"])
+                ):
+                    raise ActivationError(f"after-capture acknowledgement identity mismatch: {ack}")
+                return
+            time.sleep(0.01)
+    finally:
+        if temporary.exists() or temporary.is_symlink():
+            # destructive-ok: reason=remove one bounded fixture handshake temporary; boundary=one temporary file below the contained test directory
+            temporary.unlink()
+    raise ActivationError(f"after-capture acknowledgement timed out: {ack}")
 
 
 # destructive-ok: reason=discard a failed invocation snapshot; boundary=one mkdtemp rollback root created by this capture
@@ -2104,33 +2178,8 @@ def capture_runtime_state(
     _validate_scope(runtime, scope)
     _validate_state_dir(runtime, scope)
     _recover_transactions(runtime, scope)
-    state = _load_json(_state_path(runtime, scope))
-    roots: List[Path] = []
-    if source:
-        roots.append(_real_source(source))
-    if state:
-        for key in ("source_root", "active_root"):
-            if state.get(key):
-                roots.append(Path(state[key]))
-    try:
-        roots.append(paths.agent_home().resolve(strict=True))
-    except (OSError, RuntimeError):
-        pass
-
-    discovery = set()
-    for root in roots:
-        try:
-            discovery.update(Path(item["dest"]) for item in _linked_entries(runtime, root, scope))
-        except ActivationError:
-            continue
-
-    full_copy_paths = [
-        paths.harness_state_dir(runtime, scope),
-        *_runtime_config_paths(runtime, scope),
-        *_plugin_roots(runtime, scope),
-    ]
+    full_copy_paths = _activation_owned_paths(runtime, source, scope)
     candidate_paths = list(full_copy_paths)
-    candidate_paths.extend(sorted(discovery, key=lambda item: str(item)))
     locks = safe_fs.TargetLocks(candidate_paths)
     try:
         locks.__enter__()
@@ -2147,18 +2196,13 @@ def capture_runtime_state(
                 continue
             seen.add(key)
             _ensure_owned_destination(runtime, dest, scope)
-            preserve_names = (
-                ("managed-sessions",)
-                if dest == paths.harness_state_dir(runtime, scope)
-                else ()
-            )
             record = _copy_snapshot(
-                dest, backup_root, len(records), preserve_names=preserve_names)
+                dest, backup_root, len(records))
             record["_preimage"] = safe_fs.capture_state(
-                dest, exclude_names=preserve_names
+                dest
             )
             records.append(record)
-        for dest in sorted(discovery, key=lambda item: str(item)):
+        for dest in full_copy_paths:
             key = str(dest)
             if key in seen:
                 continue
@@ -2175,7 +2219,7 @@ def capture_runtime_state(
         shutil.rmtree(snapshot_root, ignore_errors=True)
         locks.__exit__(None, None, None)
         raise
-    return {
+    snapshot = {
         "runtime": runtime,
         "scope": scope,
         "root": str(snapshot_root),
@@ -2183,6 +2227,12 @@ def capture_runtime_state(
         "_locks": locks,
         "_sealed": False,
     }
+    try:
+        _test_after_capture_handshake(runtime, snapshot)
+    except Exception:
+        discard_runtime_state(snapshot)
+        raise
+    return snapshot
 
 
 def seal_runtime_state(snapshot: dict) -> None:
@@ -2329,13 +2379,9 @@ def activate(
         raise ActivationError(f"unsupported activation mode: {mode}")
 
     _validate_scope(runtime, scope)
+    _validate_external_plugin_conflicts(runtime, scope)
     _validate_state_dir(runtime, scope)
     _recover_transactions(runtime, scope)
-    if runtime == "opencode" and _opencode_jsonc_harness_present(scope):
-        raise ActivationError(
-            "OpenCode JSONC contains an enabled harness npm plugin; remove that exact "
-            "plugin entry before native activation (comments are not rewritten automatically)"
-        )
     source_root = _real_source(source)
     _validate_source_symlinks(source_root)
     revision = source_revision(source_root)
@@ -2382,11 +2428,6 @@ def activate(
 
     def commit_state(owned):
         config_changes = _prepare_runtime_config(runtime, active_root, previous, scope)
-        disabled = [
-            item
-            for change in config_changes
-            for item in change.get("disabled", [])
-        ]
         state = {
             "schema": SCHEMA,
             "runtime": runtime,
@@ -2402,10 +2443,6 @@ def activate(
             "discovery_paths": [item["dest"] for item in owned],
             "session_action": SESSION_ACTIONS[runtime],
             "external_dependencies": [],
-            "disabled_external_entries": disabled,
-            "config_backups": [
-                change["backup"] for change in config_changes if change.get("backup")
-            ],
             "managed_config": {
                 "claude_hooks": next(
                     (
@@ -2445,7 +2482,7 @@ def activate(
         mode,
         scope,
         source_roots=(source_root, active_root),
-        protected_paths=(*_runtime_config_paths(runtime, scope), previous_path),
+        protected_paths=_activation_protected_paths(runtime, scope),
         commit_callback=commit_state,
     )
     return status(runtime, scope)

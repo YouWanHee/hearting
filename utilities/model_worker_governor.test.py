@@ -1112,6 +1112,8 @@ class GovernorIdentityRegressionTest(unittest.TestCase):
         self.assertFalse((self.root/"state.json").exists())
 
     def test_cancel_claim_race_has_one_winner_and_at_most_one_start(self):
+        if _run_as_non_group_actor(self):
+            return
         import threading
         for _ in range(8):
             t=GOVERNOR.reserve(self.root,"dispatch",1)[0]

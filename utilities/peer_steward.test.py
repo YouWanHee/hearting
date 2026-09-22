@@ -1117,7 +1117,7 @@ class StatusRearmTest(_WatchMixin, unittest.TestCase):
         ):
             time.sleep(0.02)
         out = self._run("rearm", dead["watch_id"], env=self._env("held")).stdout
-        fields = self._fields(out)
+        fields = self._fields(out.splitlines()[0])
         self.assertEqual(fields["state"], "rearmed")
         self.assertEqual(fields["rearmed_from"], dead["watch_id"])
         self.assertNotEqual(fields["watch_id"], dead["watch_id"])
@@ -1563,6 +1563,20 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
                 continue
             for n, line in enumerate(text.splitlines(), 1):
                 if pattern.search(line) and not line.lstrip().startswith(("#", "//", "*", '"""', "'")):
+                    # Recovery launches the verified executable in a newly
+                    # created visible pane; it never prompts an existing agent.
+                    # Pin this exact launch expression, not a whole-file exemption.
+                    if (rel == "utilities/interactive-main-recovery.py"
+                            and line.strip() == 'command = ["herdr", "pane", "run", created_pane,'):
+                        import ast
+                        launch = next(node for node in ast.walk(ast.parse(text))
+                                      if isinstance(node, ast.Assign) and node.lineno == n)
+                        expected = ast.parse(
+                            '["herdr", "pane", "run", created_pane, '
+                            'shlex.join([str(launcher), "--cd", workspace, *args.agent_args])]'
+                        ).body[0].value
+                        self.assertEqual(ast.dump(launch.value), ast.dump(expected))
+                        continue
                     offenders.append(f"{rel}:{n}: {line.strip()[:100]}")
         self.assertEqual(offenders, [], "pane prompts must go through peer-steward.py prompt")
 
@@ -1674,6 +1688,50 @@ class FromNameBareSubprocessTest(unittest.TestCase):
                                   capture_output=True, text=True, env=env, timeout=10)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip(), "hearting-codex-c3")
+
+
+class CurrentSessionIdentityDelegationTest(unittest.TestCase):
+    """F-<next> fleet-route-chain-r2 plan §3 B-3: `_current_session_identity` delegates to
+    `dispatch_parent_completion.interactive_parent_identity` first, keeping the prior
+    claude > codex > opencode > AGENT_SESSION_ID fallback for the ambiguous/unset case."""
+
+    _ENV_KEYS = ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID", "CODEX_THREAD_ID",
+                 "CODEX_SESSION_ID", "OPENCODE_SESSION_ID", "AGENT_SESSION_ID",
+                 "AGENT_DISPATCH_CALLER_HARNESS", "AGENT_DISPATCH_CURRENT_HARNESS")
+
+    def _clean_env(self, **overrides):
+        env = {key: None for key in self._ENV_KEYS}
+        env.update(overrides)
+        return mock.patch.dict(os.environ, {k: v for k, v in env.items() if v is not None},
+                               clear=False)
+
+    def setUp(self):
+        for key in self._ENV_KEYS:
+            os.environ.pop(key, None)
+        self.addCleanup(lambda: [os.environ.pop(k, None) for k in self._ENV_KEYS])
+
+    def test_explicit_caller_harness_wins(self):
+        with self._clean_env(CLAUDE_CODE_SESSION_ID="sid-c", CODEX_THREAD_ID="sid-x",
+                             AGENT_DISPATCH_CALLER_HARNESS="codex"):
+            self.assertEqual(peer_steward._current_session_identity(), ("sid-x", "codex"))
+
+    def test_ambiguous_multiple_sessions_falls_back_to_legacy_priority(self):
+        # No explicit caller harness + two sessions set -> interactive_parent_identity()
+        # raises caller-harness-ambiguous; the prior claude-first order still applies.
+        with self._clean_env(CLAUDE_CODE_SESSION_ID="sid-c", CODEX_THREAD_ID="sid-x"):
+            self.assertEqual(peer_steward._current_session_identity(), ("sid-c", "claude"))
+
+    def test_single_session_delegates_cleanly(self):
+        with self._clean_env(CODEX_THREAD_ID="sid-solo"):
+            self.assertEqual(peer_steward._current_session_identity(), ("sid-solo", "codex"))
+
+    def test_agent_session_id_still_falls_back_to_unknown(self):
+        with self._clean_env(AGENT_SESSION_ID="sid-legacy"):
+            self.assertEqual(peer_steward._current_session_identity(), ("sid-legacy", "unknown"))
+
+    def test_nothing_set_returns_empty_unknown(self):
+        with self._clean_env():
+            self.assertEqual(peer_steward._current_session_identity(), ("", "unknown"))
 
 
 if __name__ == "__main__":

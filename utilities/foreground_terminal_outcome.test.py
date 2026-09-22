@@ -110,6 +110,7 @@ class ForegroundOutcomeTest(unittest.TestCase):
                         observed.append(result)
                         return result
 
+                    args.watchdog_budget = module.begin_finite_watchdog(args.foreground_timeout)
                     namespace = dict(vars(module), args=args, proc=proc, jobs=jobs,
                                      log_path=log_path, wait_foreground=wait)
                     with mock.patch.object(module, "materialize_after_terminal_close") as delivery:

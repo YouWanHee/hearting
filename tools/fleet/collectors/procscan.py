@@ -12,7 +12,7 @@ import os
 import re
 import subprocess
 
-from ..model import Session, etime_to_min
+from ..model import Session, etime_to_min, EXEC_WAIT_COMMS
 
 HARNESSES = ("claude", "codex", "opencode")
 _DELETED = " (deleted)"
@@ -197,6 +197,8 @@ EXEC_MIN_AGE_SEC = 60
 EXEC_BOOT_GRACE_SEC = 10
 # `zsh -c '<snapshot> && <real command>'` is how Claude's Bash tool runs everything, so the
 # direct child is almost never the interesting name — descend to the real work (prd.md:263).
+# It is still the TOOL CALL, though: its age is how long the session has been on this one
+# call, which is the number `exec_child` reports as `etime_s` (F-47, 2026-09-16).
 _EXEC_WRAPPER_COMMS = ("sh", "bash", "zsh", "dash", "ksh", "fish")
 # Harness-internal helpers that could in principle outlive 60s. Deliberately short: the
 # canonical identification is the env marker below (same keys as `mem_worker` in scan()),
@@ -323,13 +325,25 @@ def _oldest_work_child(pid, tree, kids, min_age=0, max_age=None, attempt_id=None
 
 def exec_child(pid, tree=None, kids=None, min_age=EXEC_MIN_AGE_SEC,
                max_depth=_EXEC_MAX_DEPTH, expected_start=None, attempt_id=None):
-    """Long-lived work descendant of `pid` → {'pid','comm','etime_s'}, else None.
+    """What `pid`'s long-lived tool call is doing → evidence dict, else None.
 
-    The ≥`min_age` gate applies to the session's DIRECT child (that is what "this session
-    has been running something for a while" means); the reported comm/etime then come from
-    the descended process, per prd.md:263 ("명령 = 하강 후 자식의 comm, 경과 = 그 프로세스 etime").
-    A wrapper with no work child of its own reports the wrapper itself — a 2-minute `zsh` IS
-    a 2-minute Bash tool call, and inventing nothing is the honest reading.
+    Shape: {'pid','comm','kind','etime_s','leaf_etime_s','child_pid'} + ownership fields.
+
+    The ≥`min_age` gate applies to the session's DIRECT child, and for a Claude session that
+    child IS the tool call (`zsh -c '<snapshot> && <command>'`), so **`etime_s` is the direct
+    child's age**: how long the session has been on this one call. `pid`/`comm` name the
+    process reached by descending — what the call is doing at this instant — and
+    `leaf_etime_s` keeps that process's own age. Measured 2026-09-16: a `sleep 20` poll loop
+    resets its leaf every 20s, so leaf elapsed can never show a 9-minute wait; prd.md:263's
+    "경과 = 그 프로세스 etime" is corrected to the call's elapsed (the comm half stands).
+
+    `kind` is `work` when a real workload runs beneath the call, `wait` when nothing does.
+    Wrappers AND wait/guard primitives are transparent while something runs under them —
+    `flock … timeout … node …` is node's work, not a wait (measured 2026-09-16: 121/121
+    samples read as `flock` while python3 computed three levels below it) — and each becomes
+    the wait leaf when nothing does: a bare `flock` really is blocked on its lock, and a bare
+    `zsh` is a Bash call between commands. Reporting that bare wrapper instead of nothing is
+    what keeps the badge alive every tick rather than blinking out in a loop's gaps.
 
     Children older than `session age - EXEC_BOOT_GRACE_SEC` are dropped as boot-cohort
     plumbing. An unknown session age (pid absent from `tree`) disables that cut rather than
@@ -351,7 +365,9 @@ def exec_child(pid, tree=None, kids=None, min_age=EXEC_MIN_AGE_SEC,
                                 attempt_id=attempt_id, bind_attempt=expected_start is not None)
     if picked is None:
         return None
+    call_pid, call_etime, _call_comm = picked
     cur_pid, cur_etime, cur_comm = picked
+    kind = "work"
     path = [pid]
     identities = {pid: root_identity} if root_identity is not None else {}
     for _ in range(max(0, max_depth)):
@@ -363,19 +379,22 @@ def exec_child(pid, tree=None, kids=None, min_age=EXEC_MIN_AGE_SEC,
                 return None
             identities[cur_pid] = identity
         path.append(cur_pid)
-        if not _exec_is_wrapper(cur_pid, cur_comm):
+        if not (_exec_is_wrapper(cur_pid, cur_comm) or cur_comm in EXEC_WAIT_COMMS):
             break
         nxt = _oldest_work_child(cur_pid, tree, kids, attempt_id=attempt_id,
                                  bind_attempt=expected_start is not None)
         if nxt is None:
-            if (expected_start is not None or cur_comm in _EXEC_SANDBOX_COMMS
-                    or cur_comm not in _EXEC_WRAPPER_COMMS):
-                return None
-            break
+            if cur_comm in _EXEC_WRAPPER_COMMS or cur_comm in EXEC_WAIT_COMMS:
+                kind = "wait"
+                break
+            # A sandbox or lease wrapper with nothing under it is plumbing mid-setup, not a
+            # tool call: naming it would badge every row for the runtime's own scaffolding.
+            return None
         cur_pid, cur_etime, cur_comm = nxt
     else:
         return None
-    result = {"pid": cur_pid, "comm": cur_comm, "etime_s": cur_etime}
+    result = {"pid": cur_pid, "comm": cur_comm, "etime_s": call_etime,
+              "leaf_etime_s": cur_etime, "kind": kind, "child_pid": call_pid}
     if expected_start is not None:
         # Recheck every edge after selection, so PID reuse or reparenting during
         # the snapshot cannot turn a different process into owned execution.

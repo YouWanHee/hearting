@@ -217,20 +217,45 @@ def validate_interactive_parent_launch(args) -> None:
     if getattr(args, "allow_unmanaged_parent_poll", False):
         args.parent_completion_reason = "operator-authorized-unmanaged-poll"
         return
-    # Carry the typed probe verdict (why this parent counted as unmanaged) so a
-    # rejected launch says which precondition failed instead of only the class:
-    # `managed-entry-not-enabled` is a TUI launched outside the managed
-    # launcher, `managed-parent-thread-mismatch` is a stale/wrong
-    # --parent-session-id, `managed-control-missing`/`managed-gateway-not-ready`
-    # is a dead gateway. Tests and callers match `reason`, never this text.
+    # Keep truly unmanaged entry distinct from a managed TUI whose transition
+    # or control proof is missing. The reason is machine-readable and the
+    # probe fields remain attached for operator diagnostics.
     probe = getattr(args, "parent_completion_reason", "") or "-"
     probe_class = getattr(args, "parent_completion_reason_class", "") or "-"
+    managed = (
+        os.environ.get("AGENT_CODEX_MANAGED_GATEWAY") == "1"
+        and probe not in {"interactive-auto-wake-unsupported", "managed-entry-not-enabled"}
+    )
+    if probe_class in {"expected-thread-not-witnessed", "lineage-mismatch", "transition-unproved"}:
+        reason = "transition-unproved"
+    elif probe_class == "binding-generation-mismatch":
+        reason = "binding-generation-mismatch"
+    elif probe_class == "approval-owner-mismatch":
+        reason = "approval-owner-mismatch"
+    elif probe_class == "tui-disconnected":
+        reason = "tui-disconnected"
+    elif managed:
+        reason = "managed-gateway-not-ready"
+    else:
+        reason = "managed-entry-required"
+    explanation = (
+        "this Codex parent is already managed, but its current completion binding could not be verified"
+        if managed else
+        "this interactive Codex parent has no verified managed completion carrier"
+    )
+    if os.environ.get("HERDR_PANE_ID") or os.environ.get("HERDR_SOCKET_PATH"):
+        recovery = (
+            "inspect preflight.sh interactive-main-recovery --check in the current workspace; "
+            "if a fresh main is needed, use Herdr's supported API for a visible pane in the same workspace/tab"
+        )
+    else:
+        recovery = (
+            "check the current terminal host and its supported visible-pane API before starting "
+            "a fresh managed codex main; preserve the existing session and batch identities"
+        )
     raise DispatchContractError(
-        "managed-entry-required",
-        "unmanaged interactive Codex parents cannot register or start a worker without a completion carrier; "
-        f"probe={probe} probe_class={probe_class}; restart through preflight.sh managed-entry "
-        "(a TUI started outside the installed managed `codex` launcher reports probe=interactive-auto-wake-unsupported "
-        "or managed-entry-not-enabled)",
+        reason,
+        f"{explanation}; probe={probe} probe_class={probe_class}; {recovery}",
     )
 
 

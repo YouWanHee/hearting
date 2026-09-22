@@ -318,16 +318,14 @@ class SubdivisionContractTest(unittest.TestCase):
                     baseline["changed_files"][str(devlog / "implementation.md")],
                     SSC.sha256_file(devlog / "implementation.md"),
                 )
-                marker, status = CR.complete_subsession_stage(
-                    route, node, "execute", evidence, manifest_path, jobs_path,
-                )
-                self.assertEqual(status["status"], "stage-gate-aggregated")
                 # B5: the same file changing again after admission is still a
                 # violation -- the baseline is a start state, not a permanent
                 # exemption list. This is the assertion the comment used to
                 # claim while the code below it created a NEW file instead, so
                 # the property it named was never the one under test.
-                CR.completion_dir(route["route_id"]).joinpath("execute.json").unlink()
+                # Keep the gate open while exercising violations: deleting
+                # its canonical marker after success only triggers recovery
+                # from immutable history, not a new mutation window.
                 (devlog / "implementation.md").write_text(
                     "rewritten after admission\n", encoding="utf-8"
                 )
@@ -343,18 +341,18 @@ class SubdivisionContractTest(unittest.TestCase):
                 # restoring the admission content makes it exempt again, so the
                 # rule is the delta and not "this file is now permanently loud"
                 (devlog / "implementation.md").write_text("pre-subdivision\n", encoding="utf-8")
-                _marker, status = CR.complete_subsession_stage(
-                    route, node, "execute", evidence, manifest_path, jobs_path,
-                )
-                self.assertEqual(status["status"], "stage-gate-aggregated")
                 # and a NEW file outside every fence is still caught
-                CR.completion_dir(route["route_id"]).joinpath("execute.json").unlink()
                 rogue = worktree / "unplanned.py"
                 rogue.write_text("after admission\n", encoding="utf-8")
                 with self.assertRaisesRegex(ValueError, "subdivision-scope-violation"):
                     CR.complete_subsession_stage(
                         route, node, "execute", evidence, manifest_path, jobs_path,
                     )
+                rogue.unlink()
+                _marker, status = CR.complete_subsession_stage(
+                    route, node, "execute", evidence, manifest_path, jobs_path,
+                )
+                self.assertEqual(status["status"], "stage-gate-aggregated")
 
     def test_ac30_slice_commit_is_refused(self):
         # AC 30 / SD-103: parallel slices are no-commit workers. index and HEAD

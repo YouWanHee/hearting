@@ -159,6 +159,8 @@ usage: preflight.sh write <file> [session-id] [turn-id]
        preflight.sh status [cwd] [session-id]
        preflight.sh permissions
        preflight.sh tui-config
+       preflight.sh interactive-main-recovery --check --pane <herdr-pane-id>
+       preflight.sh interactive-main-recovery --start --pane <herdr-pane-id> --workspace <dir>
        preflight.sh managed-entry [--check] --codex-home <private-dir> --state-dir <private-dir> --workspace <dir> [--jobs <jobs.log>] [-- client-args...]
        preflight.sh subagent-info [--check]
        preflight.sh headless [--check] [--require-hook-trust] <worktree>
@@ -718,6 +720,10 @@ EOF
   tui-config)
     [ "$#" -eq 1 ] || { echo "codex preflight: tui-config accepts no arguments" >&2; exit 64; }
     AGENT_HOME="$AGENT_ROOT" "$ROOT/adapters/codex/bin/apply-tui-config.sh"
+    ;;
+  interactive-main-recovery)
+    shift
+    exec python3 "$ROOT/utilities/interactive-main-recovery.py" "$@"
     ;;
   managed-entry)
     shift

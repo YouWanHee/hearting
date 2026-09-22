@@ -34,6 +34,8 @@ READINESS_REASON_CLASSES = (
     "tui-disconnected",
     "approval-owner-mismatch",
     "upstream-client-count-invalid",
+    "binding-generation-mismatch",
+    "transition-unproved",
 )
 
 
@@ -52,6 +54,10 @@ class ManagedGatewayBinding:
     epoch: int
     inherited_thread_id: str = ""
     binding_source: str = ""
+    binding_generation: int = 0
+    binding_session_id: str = ""
+    session_id_verification: str = "unverified"
+    transition_chain: tuple[str, ...] = ()
 
     @property
     def thread_advanced(self) -> bool:
@@ -157,12 +163,19 @@ def probe_managed_codex_parent(
     response = _control_request(
         control, {"schema_version": 1, "op": "status"}
     )
+    if response.get("binding_blocked") is True:
+        raise ManagedDispatchError(
+            "managed-gateway-not-ready", reason_class="transition-unproved"
+        )
     epoch = response.get("epoch")
     gateway_thread = response.get("thread_id")
     ancestors = response.get("thread_ancestors", [])
     siblings = response.get("sibling_thread_ids", [])
     witnessed_thread = response.get("witnessed_thread_id", "")
     binding_source = response.get("binding_source", "")
+    binding_generation = response.get("binding_generation")
+    binding_session_id = response.get("binding_session_id", "")
+    session_id_verification = response.get("session_id_verification", "unverified")
     lineage_valid = (
         isinstance(ancestors, list)
         and len(ancestors) <= 16
@@ -179,6 +192,9 @@ def probe_managed_codex_parent(
         or not isinstance(epoch, int)
         or isinstance(epoch, bool)
         or epoch < 1
+        or not isinstance(binding_generation, int)
+        or isinstance(binding_generation, bool)
+        or binding_generation < 1
     ):
         raise ManagedDispatchError("managed-gateway-not-ready")
     inherited_is_current_or_ancestor = (
@@ -188,8 +204,6 @@ def probe_managed_codex_parent(
     known_threads: set[str] = {gateway_thread}
     if lineage_valid:
         known_threads.update(ancestors)
-    if siblings_valid:
-        known_threads.update(siblings)
     if isinstance(witnessed_thread, str) and witnessed_thread:
         known_threads.add(witnessed_thread)
     # Evaluate the five typed readiness reason classes in a fixed,
@@ -223,14 +237,32 @@ def probe_managed_codex_parent(
         epoch,
         inherited_thread_id=current_thread,
         binding_source=binding_source if isinstance(binding_source, str) else "",
+        binding_generation=binding_generation,
+        binding_session_id=binding_session_id if isinstance(binding_session_id, str) else "",
+        session_id_verification=(
+            session_id_verification
+            if isinstance(session_id_verification, str)
+            else "unverified"
+        ),
+        transition_chain=tuple(ancestors) if lineage_valid else (),
     )
 
 
-def sealed_batch_id(thread_id: str, attempt_ids: set[str]) -> str:
+def sealed_batch_id(
+    thread_id: str,
+    attempt_ids: set[str],
+    *,
+    epoch: int = 0,
+    binding_generation: int = 0,
+    parent_session_id: str = "",
+    jobs_identity: str = "",
+    transition_chain: tuple[str, ...] = (),
+) -> str:
     if not attempt_ids or len(attempt_ids) > MAX_BATCH_ATTEMPTS:
         raise ManagedDispatchError("managed-attempt-set-invalid")
-    material = "managed-root-batch-v1\0" + thread_id + "\0" + "\0".join(
-        sorted(attempt_ids)
+    material = "managed-root-batch-v2\0" + "\0".join(
+        [thread_id, str(epoch), str(binding_generation), parent_session_id,
+         jobs_identity, _canonical(list(transition_chain)), *sorted(attempt_ids)]
     )
     return "batch-" + hashlib.sha256(material.encode("utf-8")).hexdigest()
 
@@ -283,7 +315,13 @@ def launch_managed_completion_sidecar(
     env = dict(os.environ if environ is None else environ)
     if not jobs.is_absolute() or parent_session_id != binding.thread_id:
         raise ManagedDispatchError("managed-sidecar-identity-invalid")
-    batch_id = sealed_batch_id(binding.thread_id, attempt_ids)
+    jobs_identity = str(jobs.resolve())
+    batch_id = sealed_batch_id(
+        binding.thread_id, attempt_ids, epoch=binding.epoch,
+        binding_generation=binding.binding_generation,
+        parent_session_id=parent_session_id, jobs_identity=jobs_identity,
+        transition_chain=binding.transition_chain,
+    )
     state_dir = binding.control_socket.parent
     log_dir = state_dir / "managed-sidecars"
     try:
@@ -309,6 +347,10 @@ def launch_managed_completion_sidecar(
         binding.thread_id,
         "--sealed-batch-id",
         batch_id,
+        "--gateway-epoch",
+        str(binding.epoch),
+        "--binding-generation",
+        str(binding.binding_generation),
         "--launch-ready-timeout",
         "60",
         "--timeout",

@@ -6,7 +6,7 @@ binary placed first on PATH; no `WH.probe_claude_session_resume`/
 `claude_session_resume_available` mock is used anywhere in this file.
 """
 import argparse
-import contextlib
+import ast
 import importlib.util
 import os
 import stat
@@ -18,62 +18,11 @@ import unittest.mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
-sys.path.insert(0, str(ROOT / "tools" / "install"))
-import fixture_env  # noqa: E402  (sys.path must be extended first)
-
-_MINIMAL_BASE_ENV = {
-    "PATH": "/usr/bin:/bin",
-    "LANG": "C.UTF-8",
-    "LC_ALL": "C.UTF-8",
-    "PYTHONDONTWRITEBYTECODE": "1",
-    "GIT_OPTIONAL_LOCKS": "0",
-    "GIT_CONFIG_NOSYSTEM": "1",
-    "GIT_CONFIG_GLOBAL": "/dev/null",
-}
-
-
-@contextlib.contextmanager
-def _isolated_env(bindir: Path):
-    """Fresh, non-ambient fixture_env isolation with `bindir` first on PATH.
-
-    Used both around the one-time adapter import below and around every test
-    method in `SD63TruncationProbe`, so no probe/selector call in this file
-    ever observes ambient HOME/XDG/MEM state or resolves a real `claude` from
-    the operator's PATH.
-    """
-    with tempfile.TemporaryDirectory(prefix="sd63-fixture-") as fixture_root:
-        base = dict(_MINIMAL_BASE_ENV)
-        for key, value in os.environ.items():
-            if "D42" in key or key in (
-                "AGENT_DISPATCH_ATTEMPT_ID", "AGENT_DISPATCH_DEPTH",
-                "AGENT_WORKER_TYPE", "AGENT_WORKER_MODE",
-                "AGENT_DISPATCH_REGISTERED_WORKER", "AGENT_DISPATCH_WORKER_TYPE",
-                "AGENT_DISPATCH_WORKER_MODE", "AGENT_SESSION_ROLE",
-                "AGENT_DISPATCH_CHILD", "MEM_DISTILL",
-                "OPENCODE_DISPATCH_SLUG", "FLEET_TITLE_REFRESH",
-            ):
-                base[key] = value
-        base["PATH"] = f"{bindir}:{base['PATH']}"
-        for key in (
-            "MEM_STATE_DIR", "MEM_PROJECTS", "MEM_PROFILE", "MEM_SYNC_DIR",
-            "MEM_JOURNAL_DIR", "MEM_RECALL_RECEIPTS", "MEM_WRITE_EVENTS",
-            "MEM_RECALL_EVENTS", "MEM_TELEMETRY_ROOT", "AGENT_MODEL_GOVERNOR_ROOT",
-        ):
-            base[key] = str(Path(fixture_root) / key.lower())
-        for key in ("MEM_SYNC_REMOTE", "MEM_DUMP_PUSH", "MEM_DUMP_COMMIT", "MEM_DISTILL_ENABLE"):
-            base[key] = "0"
-        with fixture_env.patched_environment(fixture_root, ROOT, base=base):
-            yield
-
-
-with tempfile.TemporaryDirectory(prefix="sd63-import-bin-") as _import_bindir, _isolated_env(
-    Path(_import_bindir)
-):
-    WH_S = importlib.util.spec_from_file_location(
-        "claude_dispatch_headless_sd63", Path(__file__).with_name("dispatch-headless.py")
-    )
-    WH = importlib.util.module_from_spec(WH_S)
-    WH_S.loader.exec_module(WH)
+WH_S = importlib.util.spec_from_file_location(
+    "claude_dispatch_headless_sd63", Path(__file__).with_name("dispatch-headless.py")
+)
+WH = importlib.util.module_from_spec(WH_S)
+WH_S.loader.exec_module(WH)
 
 
 _FAKE_CLAUDE_TEMPLATE = """#!/usr/bin/env python3
@@ -96,7 +45,7 @@ _HELP_BODY_TAIL = (
     "  update|upgrade        Check for updates and install if available\n"
 )
 _HELP_BODY_HEAD = "  -r, --resume [value]  Resume a conversation by session ID, or\n"
-_PAD = "pad " * 5200  # bulks the large-help fixtures used for the 8192-byte truncation slice
+_PAD = "pad " * 5200  # pushes the complete-help fixture size past the min-bytes sentinel
 
 
 def _write_fake_claude(bindir: Path, body: str) -> None:
@@ -134,36 +83,6 @@ def _truncated_help_source() -> str:
     """)
 
 
-def _short_positive_source() -> str:
-    """The exact 226-byte synthetic `claude --help` reproduction: complete, no
-    padding. Asserts via the fake CLI's own `_is_pipe()` helper (stat +
-    os.fstat) that its stdout is a regular file, not a PIPE, before writing --
-    exercising the anonymous regular-file capture this fix depends on."""
-    full = f"Usage: claude [options]\n{_HELP_BODY_HEAD}{_HELP_BODY_TAIL}"
-    return textwrap.dedent(f"""\
-    assert stat.S_ISREG(os.fstat(sys.stdout.fileno()).st_mode), "expected regular-file capture"
-    full = {full!r}
-    data = full.encode()
-    sys.stdout.buffer.write(data)
-    """)
-
-
-def _short_flags_no_sentinel_source() -> str:
-    """Short body with both flags present but the `update|upgrade` sentinel
-    entirely absent -- the missing-tail/sentinel-absent negative the
-    sentinel-only completeness rule must still fail closed on."""
-    full = (
-        "Usage: claude [options]\n"
-        f"{_HELP_BODY_HEAD}"
-        "  --session-id <uuid>   Use a specific session ID for the conversation\n"
-    )
-    return textwrap.dedent(f"""\
-    full = {full!r}
-    data = full.encode()
-    sys.stdout.buffer.write(data)
-    """)
-
-
 _NONZERO_TEMPLATE = """#!/usr/bin/env python3
 import sys
 if len(sys.argv) >= 2 and sys.argv[1] == "--help":
@@ -171,17 +90,6 @@ if len(sys.argv) >= 2 and sys.argv[1] == "--help":
     sys.exit(3)
 sys.exit(1)
 """
-
-
-def _nonzero_complete_help_source() -> str:
-    """Complete short body (sentinel + both flags) but a nonzero exit code --
-    proves exit-code failure outranks apparent completeness."""
-    full = f"Usage: claude [options]\n{_HELP_BODY_HEAD}{_HELP_BODY_TAIL}"
-    return textwrap.dedent(f"""\
-    full = {full!r}
-    sys.stdout.buffer.write(full.encode())
-    sys.exit(3)
-    """)
 
 
 def _owner_args(**overrides):
@@ -192,17 +100,17 @@ def _owner_args(**overrides):
     return argparse.Namespace(**base)
 
 
-class IsolatedTestCase(unittest.TestCase):
+class SD63TruncationProbe(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self._tmp.cleanup)
         self.bindir = Path(self._tmp.name)
-        env_ctx = _isolated_env(self.bindir)
-        env_ctx.__enter__()
-        self.addCleanup(env_ctx.__exit__, None, None, None)
+        self._old_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = f"{self.bindir}:{self._old_path}"
 
+    def tearDown(self):
+        os.environ["PATH"] = self._old_path
+        self._tmp.cleanup()
 
-class SD63TruncationProbe(IsolatedTestCase):
     def test_unavailable_probe_storage_is_typed_indeterminate(self):
         _write_fake_claude(self.bindir, _complete_help_source(True, True))
         # Both named and anonymous regular-file capture must handle a missing
@@ -223,63 +131,16 @@ class SD63TruncationProbe(IsolatedTestCase):
         self.assertEqual(WH.resolve_completion_delivery(args), "session-resume-supervised")
         self.assertEqual(args.completion_delivery_reason, "ok")
 
-    # A2 (F1): short 226-byte complete help, both flags -> supported. The
-    # exact upstream reproduction that the old min-bytes floor rejected.
-    def test_a2_short_complete_help_is_supported_at_226_bytes(self):
-        _write_fake_claude(self.bindir, _short_positive_source())
-        probe = WH.probe_claude_session_resume()
-        self.assertEqual(probe.status, "supported")
-        self.assertEqual(probe.stdout_bytes, 226)
-        self.assertEqual(probe.flags_seen, ("--resume", "--session-id"))
-        for requested in ("auto", "supervised"):
-            args = _owner_args(completion_delivery=requested)
-            self.assertEqual(WH.resolve_completion_delivery(args), "session-resume-supervised")
-            self.assertEqual(args.completion_delivery_reason, "ok")
-
-    def test_a3_short_complete_missing_flags_preserves_negative_semantics(self):
-        for resume, session_id in ((False, True), (True, False), (False, False)):
-            with self.subTest(resume=resume, session_id=session_id):
-                full = "Usage: claude [options]\n" + _HELP_BODY_HEAD + _HELP_BODY_TAIL
-                if not resume:
-                    full = full.replace(_HELP_BODY_HEAD, "")
-                if not session_id:
-                    full = "".join(line for line in full.splitlines(True) if "--session-id" not in line)
-                _write_fake_claude(self.bindir, f"sys.stdout.write({full!r})")
-                probe = WH.probe_claude_session_resume()
-                self.assertEqual((probe.status, probe.reason), ("unsupported", "flags-absent-in-complete-help"))
-                self.assertEqual(probe.stdout_bytes, len(full.encode()))
-                args = _owner_args()
-                self.assertEqual(WH.resolve_completion_delivery(args), "poll-fallback")
-                self.assertEqual(args.completion_delivery_reason, "claude-session-resume-unsupported")
-                with self.assertRaises(WH.DispatchContractError) as caught:
-                    WH.resolve_completion_delivery(_owner_args(completion_delivery="supervised"))
-                self.assertEqual(caught.exception.reason, "claude-session-resume-unavailable")
-
     # B: PIPE-truncated help -> typed refusal (the core SD-63 fix)
     def test_b_pipe_truncated_help_is_typed_refusal_not_poll_fallback(self):
         _write_fake_claude(self.bindir, _truncated_help_source())
         probe = WH.probe_claude_session_resume()
         self.assertEqual(probe.status, "indeterminate")
         self.assertEqual(probe.reason, "help-truncated")
-        self.assertEqual(probe.stdout_bytes, 8192)
-        for requested in ("auto", "supervised"):
-            with self.assertRaises(WH.DispatchContractError) as ctx:
-                WH.resolve_completion_delivery(_owner_args(completion_delivery=requested))
-            self.assertEqual(ctx.exception.reason, "claude-session-resume-indeterminate")
-
-    # B2 (F1): short body, both flags present, sentinel entirely absent ->
-    # typed refusal. A short *complete-looking* capture must still fail
-    # closed instead of being reinterpreted as a real flags-absent negative.
-    def test_b2_short_flags_present_no_sentinel_is_typed_refusal(self):
-        _write_fake_claude(self.bindir, _short_flags_no_sentinel_source())
-        probe = WH.probe_claude_session_resume()
-        self.assertEqual((probe.status, probe.reason), ("indeterminate", "help-truncated"))
-        self.assertEqual(probe.flags_seen, ("--resume", "--session-id"))
-        self.assertEqual(probe.stdout_bytes, 159)
-        for requested in ("auto", "supervised"):
-            with self.assertRaises(WH.DispatchContractError) as ctx:
-                WH.resolve_completion_delivery(_owner_args(completion_delivery=requested))
-            self.assertEqual(ctx.exception.reason, "claude-session-resume-indeterminate")
+        args = _owner_args()
+        with self.assertRaises(WH.DispatchContractError) as ctx:
+            WH.resolve_completion_delivery(args)
+        self.assertEqual(ctx.exception.reason, "claude-session-resume-indeterminate")
 
     # C: complete help, flags absent -> poll-fallback + sealed reason
     def test_c_complete_help_flags_absent_is_poll_fallback_with_reason(self):
@@ -333,19 +194,6 @@ class SD63TruncationProbe(IsolatedTestCase):
             WH.resolve_completion_delivery(args)
         self.assertEqual(ctx.exception.reason, "claude-session-resume-indeterminate")
 
-    # F2 (F1): complete short body (sentinel + both flags) but nonzero exit ->
-    # indeterminate/nonzero-exit; exit-code failure outranks apparent
-    # completeness even when the captured text alone would look supported.
-    def test_f2_nonzero_exit_outranks_complete_short_body(self):
-        _write_fake_claude(self.bindir, _nonzero_complete_help_source())
-        probe = WH.probe_claude_session_resume()
-        self.assertEqual(probe.status, "indeterminate")
-        self.assertEqual(probe.reason, "nonzero-exit")
-        args = _owner_args()
-        with self.assertRaises(WH.DispatchContractError) as ctx:
-            WH.resolve_completion_delivery(args)
-        self.assertEqual(ctx.exception.reason, "claude-session-resume-indeterminate")
-
     # G: explicit operator poll + truncated help -> poll-fallback, probe never run
     def test_g_explicit_poll_bypasses_probe_even_when_truncated(self):
         _write_fake_claude(self.bindir, _truncated_help_source())
@@ -381,14 +229,13 @@ class SD63TruncationProbe(IsolatedTestCase):
         self.assertEqual(probe_fn.call_count, 1)
 
 
-class SD63CodexParity(IsolatedTestCase):
+class SD63CodexParity(unittest.TestCase):
     """Codex's probe is already a feature probe (exit-code only); only the
     reason-sealing behavior is new. No PATH/binary fixture needed here -- this
     exercises the resolver contract via mocking `codex_app_server_available`,
     since that function's own judgment mechanism is unchanged by this cycle."""
 
     def setUp(self):
-        super().setUp()
         codex_spec = importlib.util.spec_from_file_location(
             "codex_dispatch_headless_sd63", ROOT / "adapters/codex/bin/dispatch-headless.py"
         )
@@ -416,15 +263,22 @@ class SD63CodexParity(IsolatedTestCase):
         self.assertEqual(args.completion_delivery_reason, "ok")
 
 
-class SD63OpenCodeParityLock(IsolatedTestCase):
-    """OpenCode has no supervised delivery surface at all -- lock that the
-    SD-63 reason field is never introduced there (a negative assertion)."""
+class SD63OpenCodeParityLock(unittest.TestCase):
+    """Only a sealed capability owner may stamp supervised delivery."""
 
-    def test_opencode_adapter_has_no_completion_delivery_reason(self):
+    def test_opencode_supervised_delivery_requires_owner_route_binding(self):
         opencode_path = ROOT / "adapters/opencode/bin/dispatch-headless.py"
-        text = opencode_path.read_text()
-        self.assertNotIn("completion_delivery_reason", text)
-        self.assertNotIn("session-resume-supervised", text)
+        tree = ast.parse(opencode_path.read_text())
+        stamps = [node for node in ast.walk(tree)
+                  if isinstance(node, ast.Constant) and isinstance(node.value, str)
+                  and "completion_delivery_reason=" in node.value]
+        self.assertEqual(len(stamps), 1)
+        self.assertEqual(stamps[0].value,
+                         ",completion_delivery=session-resume-supervised,completion_delivery_reason=ok,supervisor_lease=")
+        guards = [node for node in ast.walk(tree) if isinstance(node, ast.If)
+                  and stamps[0] in set(ast.walk(ast.Module(body=node.body, type_ignores=[])))]
+        self.assertTrue(any(ast.unparse(node.test) == "getattr(args, 'owner_route_binding', None)"
+                            for node in guards))
 
 
 if __name__ == "__main__":

@@ -21,8 +21,13 @@ Each clause is one contract line plus the signal that it was violated.
   default to the language the user is currently using to communicate. An
   explicit target language, publication venue, external audience, or existing
   artifact language overrides that default. Repository-maintained public docs
-  use the repository's chosen documentation language. *Violation signal:* a
-  fixed locale is imposed without a task or audience requirement.
+  use the repository's chosen documentation language. Code, code comments,
+  identifiers, commit messages, and PR text follow the repository's own
+  language, even when a runtime reply-language setting (such as Claude Code's
+  `language`) names another — that setting governs what the user reads, not
+  what the repository stores. *Violation signal:* a fixed locale is imposed
+  without a task or audience requirement, or a reply-language setting leaks
+  into code or commits.
 
 ### Discipline (concise · promised action)
 

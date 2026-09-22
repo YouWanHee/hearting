@@ -669,6 +669,23 @@ class NamespaceE2E(unittest.TestCase):
             for predecessor in node.get("depends_on", []):
                 predecessor_evidence = artifact_root / f"{predecessor}.md"
                 predecessor_evidence.write_text("fixture predecessor\n", encoding="utf-8")
+                predecessor_node = next(item for item in route["nodes"]
+                                        if item["id"] == predecessor)
+                predecessor_attempt = f"att-fixture-{predecessor}"
+                # The frame pair gate proves exact completed registry attempts;
+                # inline marker files alone are not registered frame evidence.
+                with jobs.open("a", encoding="utf-8") as registry:
+                    registry.write(
+                        f"2026-08-16T00:00:00Z\topen\t{repo}\t{repo}\t{predecessor}\t"
+                        "attempt_schema_version=2,transport=headless,"
+                        "execution_surface=registered-headless,registered_worker=1,"
+                        "fallback_hop=same-harness-headless,launch_outcome=never-launched,"
+                        f"dispatch_depth={predecessor_node['dispatch_depth']},"
+                        f"worker_type={predecessor_node['worker_type']},harness={harness},"
+                        f"attempt_id={predecessor_attempt},route_file={route_path},"
+                        f"route_id={route['route_id']},route_hash={route['route_hash']},"
+                        f"route_node={predecessor},artifact_root={artifact_root}\n"
+                    )
                 completed = subprocess.run(
                     [
                         sys.executable,
@@ -677,12 +694,8 @@ class NamespaceE2E(unittest.TestCase):
                         "--route", str(route_path),
                         "--node", predecessor,
                         "--evidence", str(predecessor_evidence),
-                        "--attempt-id", f"att-inline-{predecessor}",
-                        "--dispatch-depth", "2",
-                        "--transport", "interactive",
-                        "--execution-surface", "inline",
-                        "--registered-worker", "0",
-                        "--fallback-hop", "inline",
+                        "--attempt-id", predecessor_attempt,
+                        "--jobs", str(jobs),
                     ],
                     env=fixture_env,
                     text=True,
@@ -696,6 +709,7 @@ class NamespaceE2E(unittest.TestCase):
             self.addCleanup(lambda: parent.poll() is None and parent.kill())
             parent_start = (Path("/proc") / str(parent.pid) / "stat").read_text().split()[21]
             jobs.write_text(
+                jobs.read_text(encoding="utf-8") +
                 f"2026-08-16T00:00:00Z\topen\t{repo}\t{repo}\towner\t"
                 "attempt_schema_version=2,dispatch_depth=1,transport=headless,"
                 "execution_surface=registered-headless,registered_worker=1,"
@@ -784,13 +798,33 @@ class NamespaceE2E(unittest.TestCase):
             self.assertEqual(refused["code"], 65, refused)
             self.assertIn("reason=human-gate-not-raised", refused["wrapper_output"])
             self.assertIn("child_spawned=0", refused["wrapper_output"])
-            gate_artifact = artifact_root / "frame-review.md"
-            gate_artifact.write_text("PID namespace fixture review\n", encoding="utf-8")
-            for action in ("--block", "--release"):
+            import frame_interview
+            gate_artifact = artifact_root / "frame-review.json"
+            summary_path = artifact_root / "frame-summary.json"
+            summary_path.write_text(json.dumps({"route_id": route["route_id"],
+                "artifacts": [str(artifact_root / f"{name}.md")
+                              for name in node.get("depends_on", [])]}), encoding="utf-8")
+            interview = {
+                "schema": frame_interview.SCHEMA, "route_id": route["route_id"],
+                "summary": str(summary_path),
+                "understanding": "Check completion behavior in an isolated process.",
+                "brief": {"problem": "Completion needs verification.",
+                          "outcome": "Record the observed result.",
+                          "affected": "The test only.",
+                          "constraints": "Use fake executables.", "open": ""},
+                "questions": [],
+            }
+            gate_artifact.write_text(json.dumps(interview), encoding="utf-8")
+            answers = frame_interview.answers_template(interview)
+            answers["understanding_confirmed"] = True
+            answers_path = artifact_root / "frame-answers.json"
+            answers_path.write_text(json.dumps(answers), encoding="utf-8")
+            for action in (["gate", "--block", "--artifact", str(gate_artifact)],
+                           ["release", "--decision", "proceed", "--answers", str(answers_path)]):
                 gate = subprocess.run(
                     [sys.executable, str(package_root / "utilities" / "workflow-supervisor.py"),
-                     "gate", "--route", str(route_path), "--gate", "frame-review",
-                     "--jobs", str(jobs), "--artifact", str(gate_artifact), action],
+                     *action, "--route", str(route_path), "--gate", "frame-review",
+                     "--jobs", str(jobs)],
                     env=fixture_env, text=True, capture_output=True,
                 )
                 self.assertEqual(gate.returncode, 0, gate.stdout + gate.stderr)

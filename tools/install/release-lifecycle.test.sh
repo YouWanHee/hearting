@@ -680,6 +680,50 @@ chmod +x "$VENDOR_BIN/codex"
 PATH="$VENDOR_BIN:$PATH"
 export PATH
 
+start_release_dispatch_writer() {
+  writer_dir=$1
+  (
+    python3 - "$writer_dir" "$AGENT_DISPATCH_JOBS" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import sys
+import time
+
+directory = Path(sys.argv[1])
+jobs = Path(sys.argv[2])
+ready = directory / "ready.json"
+deadline = time.monotonic() + 30
+while not ready.is_file():
+    if time.monotonic() >= deadline:
+        raise SystemExit("ready timeout")
+    time.sleep(0.01)
+payload = json.loads(ready.read_text(encoding="utf-8"))
+row = f"release-writer-{payload['nonce']}\topen\tfixture\t/tmp/wt\tslug\tattempt_id=release-writer-{payload['nonce']}\tlaunch_home={payload['snapshot_root']}\n".encode()
+jobs.parent.mkdir(parents=True, exist_ok=True)
+with jobs.open("ab") as handle:
+    handle.write(row)
+    handle.flush()
+    os.fsync(handle.fileno())
+ack = {
+    "schema": 1,
+    "phase": "writer-complete",
+    "runtime": payload["runtime"],
+    "nonce": payload["nonce"],
+    "canonical_jobs": payload["canonical_jobs"],
+    "appended_sha256": hashlib.sha256(row).hexdigest(),
+    "created_entries": [f"release-writer-{payload['nonce']}"],
+}
+temporary = directory / ".ack.tmp"
+temporary.write_text(json.dumps(ack, sort_keys=True) + "\n", encoding="utf-8")
+with temporary.open("rb") as handle:
+    os.fsync(handle.fileno())
+os.replace(temporary, directory / "ack.json")
+PY
+  ) &
+}
+
 set +e
 "$INTEGRATION/assets/install.sh" --version v-other > "$INTEGRATION/version-override.out" 2>&1
 OVERRIDE_EXIT=$?
@@ -692,7 +736,17 @@ REPOSITORY_OVERRIDE_EXIT=$?
 set -e
 [ "$REPOSITORY_OVERRIDE_EXIT" -eq 64 ]
 
-HARNESS_REPOSITORY=other/harness HARNESS_VERSION=v-other "$INTEGRATION/assets/install.sh" --no-auto-update --json > "$INTEGRATION/install.json"
+INSTALL_HANDSHAKE="$INTEGRATION/after-capture-install"
+mkdir -p "$INSTALL_HANDSHAKE"
+export HARNESS_RUNTIME_TEST_AFTER_CAPTURE_DIR="$INSTALL_HANDSHAKE"
+export HARNESS_RUNTIME_TEST_AFTER_CAPTURE_RUNTIME=codex
+start_release_dispatch_writer "$INSTALL_HANDSHAKE"
+install_writer_pid=$!
+HARNESS_REPOSITORY=other/harness HARNESS_VERSION=v-other "$INTEGRATION/assets/install.sh" --no-auto-update --json > "$INTEGRATION/install.json" \
+  || { cat "$INTEGRATION/install.json" >&2; exit 1; }
+wait "$install_writer_pid"
+grep -q 'release-writer-' "$AGENT_DISPATCH_JOBS" || fail "release install lost acknowledged canonical dispatch write"
+unset HARNESS_RUNTIME_TEST_AFTER_CAPTURE_DIR HARNESS_RUNTIME_TEST_AFTER_CAPTURE_RUNTIME
 "$HARNESS_BIN_DIR/harness" runtime doctor --runtime all --strict --json > "$INTEGRATION/doctor.json"
 "$HARNESS_BIN_DIR/harness" update --json > "$INTEGRATION/update.json"
 
@@ -825,13 +879,23 @@ RELEASES_ROOT="$XDG_DATA_HOME/hearting/releases"
 git config --file "$HOME/.gitconfig" --add safe.directory "$ROOT"
 
 publish_integration_release "v0.0.0-integration-2"
+UPDATE_HANDSHAKE="$INTEGRATION/after-capture-update-2"
+mkdir -p "$UPDATE_HANDSHAKE"
+export HARNESS_RUNTIME_TEST_AFTER_CAPTURE_DIR="$UPDATE_HANDSHAKE"
+export HARNESS_RUNTIME_TEST_AFTER_CAPTURE_RUNTIME=codex
+start_release_dispatch_writer "$UPDATE_HANDSHAKE"
+update_writer_pid=$!
 "$HARNESS_BIN_DIR/harness" update --version v0.0.0-integration-2 --json > "$INTEGRATION/update-v2.json"
+wait "$update_writer_pid"
+grep -q 'release-writer-' "$AGENT_DISPATCH_JOBS" || exit 1
+unset HARNESS_RUNTIME_TEST_AFTER_CAPTURE_DIR HARNESS_RUNTIME_TEST_AFTER_CAPTURE_RUNTIME
 python3 - "$INTEGRATION/update-v2.json" <<'PY'
 import json, sys
 result = json.load(open(sys.argv[1]))
 assert result["exit"] == 0, result
 assert result["release"]["version"] == "v0.0.0-integration-2", result
 PY
+echo "ok - release-bound install and update preserve acknowledged canonical dispatch writes"
 "$HARNESS_BIN_DIR/harness" runtime doctor --runtime codex --strict --json > "$INTEGRATION/doctor-v2.json"
 python3 - "$INTEGRATION/doctor-v2.json" "$VENDOR_BIN/codex" <<'PY'
 import json, os, sys
@@ -886,6 +950,34 @@ echo "ok - injected launcher-boundary failure during a genuine version update re
 # working across it.
 publish_integration_release "v0.0.0-integration-3"
 "$HARNESS_BIN_DIR/harness" update --version v0.0.0-integration-3 --json > "$INTEGRATION/update-v3.json"
+OLD_RELEASE_ROOT=$(readlink -f "$XDG_DATA_HOME/hearting/releases/v0.0.0-integration-2")
+LIVE_SESSION_CANARY="$CODEX_HOME/.harness/managed-sessions/live-release-canary.json"
+mkdir -p "$(dirname "$LIVE_SESSION_CANARY")"
+printf '%s\n' live-session-canary > "$LIVE_SESSION_CANARY"
+LIVE_SESSION_BEFORE=$(sha256sum "$LIVE_SESSION_CANARY" | cut -d ' ' -f 1)
+printf 'live-release-canary\topen\trepo\t/tmp/wt\tslug\tattempt_id=live-release-canary,launch_home=%s\n' \
+  "$OLD_RELEASE_ROOT" >> "$AGENT_DISPATCH_JOBS"
+test -d "$OLD_RELEASE_ROOT" || fail "old release root disappeared before live-pin update"
+python3 - "$AGENT_DISPATCH_JOBS" "$LIVE_SESSION_CANARY" "$OLD_RELEASE_ROOT" <<'PY'
+import hashlib, sys
+from pathlib import Path
+jobs, session, old_root = map(Path, sys.argv[1:])
+assert any(
+    "attempt_id=live-release-canary" in line
+    and f"launch_home={old_root}" in line
+    for line in jobs.read_text().splitlines()
+), jobs.read_text()
+assert hashlib.sha256(session.read_bytes()).hexdigest()
+PY
+echo "ok - live launch_home and managed-session pins survive _activate_release"
+python3 - "$AGENT_DISPATCH_JOBS" <<'PY'
+from pathlib import Path
+path = Path(__import__("sys").argv[1])
+text = path.read_text()
+path.write_text(text.replace("\topen\trepo\t/tmp/wt\tslug\tattempt_id=live-release-canary,", "\tdone\trepo\t/tmp/wt\tslug\tattempt_id=live-release-canary,", 1))
+PY
+test "$(sha256sum "$LIVE_SESSION_CANARY" | cut -d ' ' -f 1)" = "$LIVE_SESSION_BEFORE" \
+  || fail "live managed-session canary changed during release activation"
 publish_integration_release "v0.0.0-integration-4"
 "$HARNESS_BIN_DIR/harness" update --version v0.0.0-integration-4 --json > "$INTEGRATION/update-v4.json"
 

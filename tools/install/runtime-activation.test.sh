@@ -151,6 +151,50 @@ harness() {
   sh "$ROOT/tools/install/harness.sh" "$@"
 }
 
+start_dispatch_writer() {
+  writer_dir=$1
+  (
+    python3 - "$writer_dir" "$AGENT_DISPATCH_JOBS" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import sys
+import time
+
+directory = Path(sys.argv[1])
+jobs = Path(sys.argv[2])
+ready = directory / "ready.json"
+deadline = time.monotonic() + 20
+while not ready.is_file():
+    if time.monotonic() >= deadline:
+        raise SystemExit("ready timeout")
+    time.sleep(0.01)
+payload = json.loads(ready.read_text(encoding="utf-8"))
+row = f"writer-{payload['nonce']}\topen\tfixture\t/tmp/wt\tslug\tattempt_id=writer-{payload['nonce']}\n".encode()
+jobs.parent.mkdir(parents=True, exist_ok=True)
+with jobs.open("ab") as handle:
+    handle.write(row)
+    handle.flush()
+    os.fsync(handle.fileno())
+ack = {
+    "schema": 1,
+    "phase": "writer-complete",
+    "runtime": payload["runtime"],
+    "nonce": payload["nonce"],
+    "canonical_jobs": payload["canonical_jobs"],
+    "appended_sha256": hashlib.sha256(row).hexdigest(),
+    "created_entries": [f"writer-{payload['nonce']}"],
+}
+temporary = directory / ".ack.tmp"
+temporary.write_text(json.dumps(ack, sort_keys=True) + "\n", encoding="utf-8")
+with temporary.open("rb") as handle:
+    os.fsync(handle.fileno())
+os.replace(temporary, directory / "ack.json")
+PY
+  ) &
+}
+
 # A fresh managed activation must project its script but preserve conflicting
 # user-owned values. Status/doctor report the conflict until the user removes
 # those exact keys; uninstall must not remove the custom values.
@@ -371,6 +415,52 @@ assert data["env"]["USER_FLAG"] == "keep"
 PY
 ok "offline linked activation/status/doctor for all runtimes"
 
+# Fixture-only after-capture barrier: the writer targets the resolver-selected
+# canonical registry while activation locks/snapshots are held. Runtime-local
+# dispatch and unknown siblings are separate canaries and must survive both
+# success and rollback.
+LOCAL_DISPATCH="$HOME/.codex/.harness/dispatch/jobs.log"
+UNKNOWN_SIBLING="$HOME/.codex/.harness/unknown-sibling/value"
+mkdir -p "$(dirname "$LOCAL_DISPATCH")" "$(dirname "$UNKNOWN_SIBLING")"
+printf '%s\n' local-before > "$LOCAL_DISPATCH"
+printf '%s\n' unknown-before > "$UNKNOWN_SIBLING"
+HANDSHAKE_DIR="$TMP/after-capture-success"
+mkdir -p "$HANDSHAKE_DIR"
+export HARNESS_RUNTIME_TEST_AFTER_CAPTURE_DIR="$HANDSHAKE_DIR"
+export HARNESS_RUNTIME_TEST_AFTER_CAPTURE_RUNTIME=codex
+start_dispatch_writer "$HANDSHAKE_DIR"
+writer_pid=$!
+harness runtime activate --runtime codex --mode linked --source "$SRC" --json \
+  > "$TMP/handshake-success.json"
+wait "$writer_pid"
+grep -q 'writer-' "$AGENT_DISPATCH_JOBS" || fail "acknowledged canonical dispatch row was lost on success"
+test "$(cat "$LOCAL_DISPATCH")" = local-before || fail "runtime-local dispatch changed on success"
+test "$(cat "$UNKNOWN_SIBLING")" = unknown-before || fail "unknown runtime sibling changed on success"
+
+canonical_before=$(sha256sum "$AGENT_DISPATCH_JOBS" | cut -d ' ' -f 1)
+local_before=$(sha256sum "$LOCAL_DISPATCH" | cut -d ' ' -f 1)
+unknown_before=$(sha256sum "$UNKNOWN_SIBLING" | cut -d ' ' -f 1)
+HANDSHAKE_DIR="$TMP/after-capture-rollback"
+mkdir -p "$HANDSHAKE_DIR"
+export HARNESS_RUNTIME_TEST_AFTER_CAPTURE_DIR="$HANDSHAKE_DIR"
+start_dispatch_writer "$HANDSHAKE_DIR"
+writer_pid=$!
+set +e
+HARNESS_RUNTIME_FAIL_AFTER=1 harness runtime activate --runtime codex --mode linked --source "$SRC" --json \
+  > "$TMP/handshake-rollback.json" 2>&1
+rollback_exit=$?
+set -e
+wait "$writer_pid"
+[ "$rollback_exit" -ne 0 ] || fail "injected activation failure unexpectedly succeeded"
+canonical_after=$(sha256sum "$AGENT_DISPATCH_JOBS" | cut -d ' ' -f 1)
+local_after=$(sha256sum "$LOCAL_DISPATCH" | cut -d ' ' -f 1)
+unknown_after=$(sha256sum "$UNKNOWN_SIBLING" | cut -d ' ' -f 1)
+test "$canonical_before" != "$canonical_after" || fail "acknowledged canonical dispatch row was rolled back"
+test "$local_before" = "$local_after" || fail "runtime-local dispatch changed on rollback"
+test "$unknown_before" = "$unknown_after" || fail "unknown runtime sibling changed on rollback"
+unset HARNESS_RUNTIME_TEST_AFTER_CAPTURE_DIR HARNESS_RUNTIME_TEST_AFTER_CAPTURE_RUNTIME
+echo "ok - acknowledged canonical dispatch writer survives activation success and rollback"
+
 for runtime_home in "$HOME/.claude" "$HOME/.codex" "$HOME/.config/opencode"; do
   test -f "$runtime_home/agent-config/models.conf" \
     || fail "user model config was not seeded for $runtime_home"
@@ -553,6 +643,42 @@ PY
 done
 ok "Codex native+plugin, Claude native+plugin, OpenCode local+npm duplicates detected"
 
+for runtime in codex claude opencode; do
+  case "$runtime" in
+    codex) conflict_path="$HOME/.codex/config.toml"; state_path="$HOME/.codex/.harness/activation.json" ;;
+    claude) conflict_path="$HOME/.claude/plugins/installed_plugins.json"; state_path="$HOME/.claude/.harness/activation.json" ;;
+    opencode) conflict_path="$HOME/.config/opencode/opencode.json"; state_path="$HOME/.config/opencode/.harness/activation.json" ;;
+  esac
+  conflict_before=$(sha256sum "$conflict_path" | cut -d ' ' -f 1)
+  state_before=$(sha256sum "$state_path" | cut -d ' ' -f 1)
+  if harness runtime activate --runtime "$runtime" --mode linked --source "$SRC" --json \
+      > "$TMP/conflict-$runtime.json" 2>&1; then
+    fail "$runtime activation silently mutated around an active external plugin"
+  fi
+  conflict_after=$(sha256sum "$conflict_path" | cut -d ' ' -f 1)
+  state_after=$(sha256sum "$state_path" | cut -d ' ' -f 1)
+  test "$conflict_before" = "$conflict_after" || fail "$runtime conflict input changed"
+  test "$state_before" = "$state_after" || fail "$runtime activation state changed on conflict refusal"
+  grep -Eiq 'external plugin conflict|active' "$TMP/conflict-$runtime.json" \
+    || fail "$runtime conflict refusal lacked a path-bearing diagnostic"
+done
+test ! -e "$HOME/.codex/.harness/disabled-plugins" || fail "Codex plugin quarantine was created"
+test ! -e "$HOME/.claude/.harness/disabled-plugins" || fail "Claude plugin quarantine was created"
+ok "active external plugins refuse before activation artifacts or mutation"
+
+# destructive-ok: reason=remove only the active external-plugin fixture leaves after refusal; boundary=two exact files below the private fixture HOME
+rm -f "$HOME/.codex/config.toml" "$HOME/.claude/plugins/installed_plugins.json"
+python3 - "$HOME/.claude/settings.json" <<'PY'
+import json, sys
+path=sys.argv[1]
+data=json.load(open(path))
+enabled=data.get("enabledPlugins", {})
+enabled.pop("hearting-claude@fixture", None)
+data["enabledPlugins"]=enabled
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(data, handle)
+PY
+printf '%s\n' '{"plugin":[],"theme":"user"}' > "$HOME/.config/opencode/opencode.json"
 harness runtime activate --runtime all --mode linked --source "$SRC" --json \
   > "$TMP/deduplicated.json"
 harness runtime doctor --runtime all --strict --json >/dev/null
@@ -561,29 +687,16 @@ import json, sys
 data=json.load(open(sys.argv[1]))
 assert data["plugin"] == [] and data["theme"] == "user"
 PY
-python3 - "$HOME/.claude/plugins/installed_plugins.json" <<'PY'
+python3 - "$HOME/.claude/.harness/activation.json" "$HOME/.codex/.harness/activation.json" <<'PY'
 import json, sys
-plugins=json.load(open(sys.argv[1]))["plugins"]
-assert "hearting-claude@fixture" not in plugins
-assert "foreign@fixture" in plugins
+for path in sys.argv[1:]:
+    data=json.load(open(path))
+    assert "disabled_external_entries" not in data, data
+    assert "config_backups" not in data, data
 PY
-python3 - "$HOME/.claude/settings.json" <<'PY'
-import json, sys
-settings=json.load(open(sys.argv[1]))
-assert settings["theme"] == "user"
-assert len(settings["hooks"]["SessionStart"]) == 1
-assert settings["enabledPlugins"]["hearting-claude@fixture"] is False
-assert settings["enabledPlugins"]["foreign@fixture"] is True
-PY
-python3 - "$HOME/.codex/config.toml" <<'PY'
-import sys
-text=open(sys.argv[1]).read()
-assert '[plugins."hearting-codex@fixture"]' in text
-assert 'enabled = false' in text
-PY
-test -d "$HOME/.codex/.harness/disabled-plugins" || fail "Codex plugin quarantine missing"
-test -d "$HOME/.claude/.harness/disabled-plugins" || fail "Claude plugin quarantine missing"
-ok "linked reactivation removes external plugin discovery without downloads"
+test ! -e "$HOME/.codex/.harness/disabled-plugins" || fail "Codex plugin quarantine was created"
+test ! -e "$HOME/.claude/.harness/disabled-plugins" || fail "Claude plugin quarantine was created"
+ok "linked reactivation preserves external config and emits no legacy mutation fields"
 
 python3 - "$HOME/.config/opencode/opencode.json" <<'PY'
 import json, sys
@@ -600,14 +713,20 @@ PY
 if harness runtime doctor --runtime opencode --strict --json >/dev/null 2>&1; then
   fail "OpenCode tuple plugin entry was not detected"
 fi
-harness runtime activate --runtime opencode --mode linked --source "$SRC" --json \
-  >/dev/null
+if harness runtime activate --runtime opencode --mode linked --source "$SRC" --json \
+  >/dev/null 2>&1; then
+  fail "OpenCode tuple plugin conflict was not refused"
+fi
 python3 - "$HOME/.config/opencode/opencode.json" <<'PY'
 import json, sys
 data=json.load(open(sys.argv[1]))
 assert data["note"] == "hearting is documentation, not a plugin entry"
-assert data["plugin"] == [["foreign-opencode-plugin@1.0.0", {"foreign": True}]]
+assert data["plugin"] == [
+    ["hearting-opencode@1.2.3", {"fixture": True}],
+    ["foreign-opencode-plugin@1.0.0", {"foreign": True}],
+]
 PY
+printf '%s\n' '{"plugin":[],"theme":"user"}' > "$HOME/.config/opencode/opencode.json"
 printf '%s\n' '{' \
   '  // "plugin": ["hearting-opencode@comment-only"],' \
   '  "theme": "user",' \

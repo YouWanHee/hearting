@@ -79,10 +79,10 @@ The managed launcher exports the session's one canonical `AGENT_DISPATCH_JOBS`.
 Treat it as immutable at every dispatch depth; never reconstruct a registry from
 `$AGENT_HOME/.dispatch/jobs.log`, because packaged `$AGENT_HOME` is versioned source.
 
-The managed gateway's witnessed `thread/fork` lineage is authoritative for a
-forked session. An inherited `CODEX_THREAD_ID` is only a start-thread hint; a
-proved successor is reported as `managed-thread-advanced` and sealed into the
-batch, while an unrelated thread switch still fails closed.
+Only an epoch TUI start, resume, or current-fork response advances binding;
+siblings, notifications, tools, failures, and stale responses do not. Seal
+thread/epoch/generation. Recovery: prove host workspace/tab/pane/cwd, use its
+native visible-pane API, never hidden tmux. Headless work is separate.
 
 ## Tool Contracts
 
@@ -215,7 +215,7 @@ logs, caches, databases, or `$CODEX_HOME/config.toml`.
 
 Portable behavior contract = `roles/response-policy.md`.
 
-- **Audience-language first** — user artifacts default to the user's current communication language unless a stronger audience/repository contract applies.
+- **Audience-language first** — user artifacts default to the user's current communication language unless a stronger audience/repository contract applies. Code and commits keep the repo's language.
 - Keep responses concise, match promises with same-turn action, verify before asserting, and follow current conventions; expose a convention change before committing it.
 - **Local evidence before recall** — repo research/analysis/briefing artifacts answer domain questions first; memory-only answers say so and flag risky items; §0.4 card exemption never waives this check.
 - **Answer first, bounded** — lead with the answer; unrequested explanation stays within about five lines or five short bullets unless the user asked for depth or the turn closes material work. Offer the rest rather than delivering it unbidden.

@@ -98,6 +98,31 @@ class QuotaEvidenceTests(unittest.TestCase):
         self.assertEqual(Q.active_limits(self.jobs, now=self.now + 86400, env=self.env), {})
         self.assertEqual(Q.active_limits(self.jobs, now=self.now + 9 * 86400, env=self.env), {})
 
+    def test_included_credit_rejection_blocks_only_the_launched_model_until_reset(self):
+        self.rows[0]["rate_limit_info"].update(rateLimitType="seven_day_overage_included",
+            overageStatus="rejected", overageDisabledReason="org_level_disabled",
+            unifiedWindows={"seven_day": {"utilization": .99},
+                            "seven_day_overage_included": {"utilization": 1}})
+        self.write()
+        self.jobs.write_text(self.jobs.read_text().replace("model=claude-opus-4-6", "model=credit-model"))
+        before = self.jobs.read_bytes(), self.log.read_bytes()
+        models = {"claude": "credit-model"}
+        states = Q.usage_states(self.jobs, models=models, env=self.env)
+        self.assertTrue(states["claude"].startswith("limited("), states)
+        for requested in ({}, {"claude": "another-model"}):
+            self.assertEqual(Q.active_limits(self.jobs, models=requested, env=self.env), {})
+        self.assertEqual(Q.active_limits(self.jobs, models=models, now=self.now + 86400, env=self.env), {})
+        self.assertEqual(before, (self.jobs.read_bytes(), self.log.read_bytes()))
+        # A different account, an unbound model, and paid overage never gain
+        # blocking authority from this model-specific subscription event.
+        self.config.write_text(json.dumps({"oauthAccount": {"accountUuid": "other", "organizationUuid": "org-a"}}))
+        self.assertEqual(Q.active_limits(self.jobs, models=models, env=self.env), {})
+        for changes in ({"overageStatus": "allowed"}, {"isUsingOverage": True}):
+            rows = copy.deepcopy(self.rows)
+            rows[0]["rate_limit_info"].update(changes)
+            self.assertIsNone(Q.native_quota(rows, observed_at=self.now, requested_model="credit-model"))
+        self.assertIsNone(Q.native_quota(self.rows, observed_at=self.now))
+
     def test_account_org_runtime_and_auth_provider_are_separate_scopes(self):
         original = self.config.read_text()
         for identity in ({"accountUuid": "other", "organizationUuid": "org-a"},

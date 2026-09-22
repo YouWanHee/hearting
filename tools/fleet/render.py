@@ -1124,6 +1124,25 @@ def _route_zone_width(term_width, name_width=None):
     return _ROUTE_STAGE_ZONE_MAX + max(0, int(term_width) - 168 - name_growth)
 
 
+# User 2026-09-18 ("최대 30칸을 좀 더 늘려 40칸 정도로"): a main session's stage cell holds its
+# route-chain window up to this many cells; past that, details fold, then the current node
+# stands alone with counts.
+_SESSION_CELL_MAX = 40
+# The narrow/stack card's L2 before its stage cell: 4-cell inset, the elapsed cell under the
+# harness column (_HW), the model cell (_MW), and the 2-cell gap — `_session_row_2line` builds
+# exactly this prefix, pinned by test.
+_NARROW_L2_STAGE_COL = 4 + 16 + 23 + 2
+
+
+def _narrow_session_cell_budget(term_width):
+    """The stage-cell budget of a narrow/stack session card: the historical 28 cells as a
+    floor (a stack card never showed less), growing into what L2 has left after its prefix
+    and the tinted row's six edge cells, capped like the wide cell."""
+    if not term_width:
+        return 28
+    return max(28, min(_SESSION_CELL_MAX, int(term_width) - 6 - _NARROW_L2_STAGE_COL))
+
+
 def _drop_past_stages(items, cur_i, max_width):
     """SD-F2 (prd.md:164) — a breadcrumb's information value is "where now", not "where
     I've been": fold PAST stages (i < cur_i) first, earliest first, so the active stage (and
@@ -1504,7 +1523,16 @@ def _spec_phase_seq(entity):
     return [(str(a), str(b)) for a, b in seq]
 
 
-def _session_stage_segs(entity, working, max_width):
+def _suppressed_stage_segs(entity, working, max_width, tag_by_key=None):
+    """The stage cell when an owner card renders under the session (D3): the card already
+    shows that route's stage and dial, so the capability tag steps aside — but the route
+    chain is the session's own sequence, not the card's stage, and it has no other surface."""
+    chain_cell = _route_chain_cell(getattr(entity, "route_chain", None),
+                                   min(max_width, _SESSION_CELL_MAX), tag_by_key, working)
+    return chain_cell if chain_cell is not None else [("-", "dim")]
+
+
+def _session_stage_segs(entity, working, max_width, tag_by_key=None):
     """Stage-zone segments for a session row. A spec-grounding projection renders a lit phase
     breadcrumb in the EXACT dispatch-row syntax (user 2026-07-24 "code에 맞춰서 소괄호에 넣는
     걸로"): ``spec(mode·intensity) : spec✓ › dev●`` — entry ``spec`` in the dim name_dim hue, the
@@ -1512,6 +1540,13 @@ def _session_stage_segs(entity, working, max_width):
     a dim paren group joined by ``·`` exactly as ``_opts_segs`` does, then the dim ` : `
     breadcrumb lead-in (``_stage_zone_segs``). Deferred / n·a phases are dropped (not part of this
     project's flow; also avoids a skip glyph absent from many fonts). Otherwise the flat label."""
+    # User 2026-09-18 ("그걸 그냥 옆쪽에 - 있던 자리에 바로 하는건 별로인가?"): a visible
+    # route chain (two or more routes, or a declared plan) takes this cell, as a fixed
+    # window of its last three nodes; there is no separate chain line.
+    chain_cell = _route_chain_cell(getattr(entity, "route_chain", None),
+                                   min(max_width, _SESSION_CELL_MAX), tag_by_key, working)
+    if chain_cell is not None:
+        return chain_cell
     cap = getattr(entity, "cap_grounding", None) or {}
     cap_intensity = _short_level(cap.get("intensity"))
     seq = _spec_phase_seq(entity)
@@ -1548,7 +1583,12 @@ def _session_stage_segs(entity, working, max_width):
         # can contradict its own capability is worse than no tag.
         name = cap["capability"].replace("autopilot-", "")
         knob_items = [k for k in (cap.get("mode"), cap_intensity) if k]
-        segs = [(name, "name_dim")]
+        # User 2026-09-18 ("메인세션에서 라우팅 스킬도 회색인데?"): on a main row this tag is
+        # the ONLY sign of the work it is in — no breadcrumb follows it, unlike the owner card
+        # and the spec branch above — so it must not recede like a dial label. Same status rule
+        # as the projection fallback below: work hue while working, plain text otherwise; the
+        # knobs stay dim.
+        segs = [(name, "g_work" if working else None)]
         if knob_items:
             segs += [("(", "dim"), ("·".join(knob_items), "dim"), (")", "dim")]
         return segs
@@ -1851,7 +1891,7 @@ def _session_tag_chip(s, dim=False):
 
 
 def _session_row(s, narrow, is_parent=False, child_count=0, name_width=None,
-                 show_projection_stage=True, stage_zone=None):
+                 show_projection_stage=True, stage_zone=None, tag_by_key=None):
     live = s.liveness
     slug = s.slug or (s.cwd.rsplit("/", 1)[-1] if s.cwd else "?")
     dim_tel = live in ("stale", "dead") or s.app_server or s.detached
@@ -1959,9 +1999,11 @@ def _session_row(s, narrow, is_parent=False, child_count=0, name_width=None,
         # truncated to `…` even on a wide terminal with a mostly-empty zone (user "stage 폭 엄청
         # 길잖아 근데 왜 금방 … 표시로 줄이는지"). Use the same terminal-aware budget the conductor
         # breadcrumb got, so a spec phase breadcrumb / long label fills the real space first.
-        segs += _session_stage_segs(s, live == "working", stage_zone or _STAGE_ZONE_MAX)
+        segs += _session_stage_segs(s, live == "working", stage_zone or _STAGE_ZONE_MAX,
+                                    tag_by_key)
     else:
-        segs.append(("-", "dim"))
+        segs += _suppressed_stage_segs(s, live == "working", stage_zone or _STAGE_ZONE_MAX,
+                                       tag_by_key)
     if dead_stale:
         # F-13: a stale/dead row has no live model/effort/ctx to show — a wall of "—" placeholders
         # read as broken telemetry rather than "this session stopped". One `done <age>` cell
@@ -2425,6 +2467,20 @@ def _is_owner_mode_row(j):
     )
 
 
+def _owner_route_shape(j):
+    """The bound route's compose `shape`, only for an owner row whose route was actually
+    composed (never a compile-shaped preset route) — F-<next> plan §3 C-4.4."""
+    if not _is_owner_mode_row(j):
+        return None
+    backing = getattr(getattr(j, "work_projection", None), "_route_view", None) or {}
+    record = backing.get("record") if isinstance(backing.get("record"), dict) else {}
+    selection = record.get("selection") if isinstance(record.get("selection"), dict) else {}
+    if selection.get("route_origin") != "compose":
+        return None
+    shape = selection.get("shape")
+    return shape if isinstance(shape, str) and shape else None
+
+
 def _mode_axis_conflict(j):
     legacy = getattr(j, "mode", None) or ""
     worker_mode = getattr(j, "worker_mode", None)
@@ -2587,6 +2643,12 @@ def _opts_segs(j, max_width=None):
             _display_capability_mode(j),
             _short_level(getattr(j, "intensity", None)),
         ) if t]
+    # F-<next>: a compose-shaped owner route names its shape as a fourth behaviour knob
+    # (mode·intensity·shape·role, plan §3 C-4.4) — owner rows only, and only when the
+    # bound route was actually composed (never a compile-shaped preset route).
+    shape = None if depth >= 2 else _owner_route_shape(j)
+    if shape:
+        knob_items.append(shape)
     # the worker ROLE is a behaviour knob too (who the worker acts as), not environment —
     # it rides the paren group's last slot (user 2026-07-20: "owner의 위치가 애매").
     role = "" if depth >= 2 else _dispatch_role_suffix(
@@ -2594,6 +2656,11 @@ def _opts_segs(j, max_width=None):
     if role:
         knob_items.append(role)
     knobs = "·".join(knob_items)
+    if (shape and max_width is not None
+            and (len(entry or "") + len(knobs) + 2) > max_width):
+        # K-7: shape is the first thing this dial drops when narrow.
+        knob_items = [t for t in knob_items if t != shape]
+        knobs = "·".join(knob_items)
     # F-78 (user 2026-08-14 "unit, node, profile 등이 좋긴 좋은데 … 전부 다 뜰때 가로로 너무
     # 길어지는데"). Measured at 50-54 cells. Two of those cells' worth of content was not
     # information:
@@ -2885,7 +2952,7 @@ def _dispatch_row(j, orphan=False, parent_model=None, parent_harness=None, is_la
 # bracket gauge · cost · ⏱). model keeps its fixed width so gauges align vertically across cards
 # (the nvtop column feel). Same segment parts as the 1-line rows — zero new color keys.
 def _session_row_2line(s, is_parent=False, child_count=0, _split=False, term_width=None,
-                       show_projection_stage=True):
+                       show_projection_stage=True, tag_by_key=None):
     live = s.liveness
     slug = s.slug or (s.cwd.rsplit("/", 1)[-1] if s.cwd else "?")
     dim_tel = live in ("stale", "dead") or s.app_server or s.detached
@@ -2956,10 +3023,11 @@ def _session_row_2line(s, is_parent=False, child_count=0, _split=False, term_wid
     # indent / no far-right flush).
     l2 = [("    ", None), (_pad(fmt_min(s.elapsed_min), _HW), "dim")]
     l2 += _model_cell(s.model, s.effort, _MW, dim=dim_tel)
-    projection_stage = (_projection_stage_text(s, max_width=28)
-                        if show_projection_stage else "")
-    l2 += [("  ", None), (projection_stage or "-",
-                           "g_work" if projection_stage and live == "working" else "dim")]
+    # Same cell as the wide row (capability tag, route chain, spec breadcrumb): this card
+    # used to call the bare projection text and showed `-` for inline work the wide row named.
+    l2 += [("  ", None)]
+    stage_fn = _session_stage_segs if show_projection_stage else _suppressed_stage_segs
+    l2 += stage_fn(s, live == "working", _narrow_session_cell_budget(term_width), tag_by_key)
     # v16: context is emitted by _context_detail_row beneath the complete card.
     if _split:
         return l1, l2, br_segs
@@ -2977,11 +3045,11 @@ def _stack_split(l2):
 
 
 def _session_row_stack(s, is_parent=False, child_count=0, term_width=None,
-                       show_projection_stage=True):
+                       show_projection_stage=True, tag_by_key=None):
     """v16 ultra-narrow card: identity and telemetry, with detail row emitted separately."""
     l1, l2 = _session_row_2line(
         s, is_parent, child_count, term_width=term_width,
-        show_projection_stage=show_projection_stage)
+        show_projection_stage=show_projection_stage, tag_by_key=tag_by_key)
     return [l1, l2]
 
 
@@ -3760,6 +3828,138 @@ def _peer_link_strip(sent=None, recv=None, tag_by_key=None, term_width=None, dep
                         lambda: build(False, False)], term_width)]
 
 
+# Past nodes recede (dim); a failure or an unverifiable state keeps its alarm hue.
+_ROUTE_CHAIN_MARK = {"done": ("✓", "dim"), "failed": ("✕", "lvl_r"), "unknown": ("?", "lvl_y")}
+
+
+def _route_chain_node_knobs(node, with_knobs):
+    """The node's paren detail: `mode·intensity` (the same knobs as the single-route tag)
+    when `with_knobs`, plus its retry round `R<n>`, which is kept even when the knobs fold."""
+    items = []
+    if with_knobs:
+        mode = node.get("capability_mode")
+        if mode and mode != "default":
+            items.append(str(mode).replace(",", "·"))
+        level = _short_level(node.get("intensity"))
+        if level:
+            items.append(level)
+    round_n = node.get("round")
+    if isinstance(round_n, int) and not isinstance(round_n, bool) and round_n >= 2:
+        items.append("R%d" % round_n)
+    return "·".join(items)
+
+
+def _route_chain_node_segs(node, with_knobs, tag_by_key, is_current=False, working=False):
+    """One node, `label(mode·intensity) glyph` (user 2026-09-18: "세부 (direct, std 등)이 괄호로
+    묶이고 컬러는 lab에만 … code쪽에도 그걸 다 기록해주고"). Only the current node is lit —
+    work hue while the session works, plain otherwise — past nodes and their details are dim,
+    and a planned node is `label ○`. A node handed to another session keeps its dim
+    `label◌→[tag]` form (`✓→`/`✕→` once closed)."""
+    label = node.get("label") or "?"
+    handoff_to = node.get("handoff_to")
+    if handoff_to:
+        tag = (tag_by_key or {}).get((handoff_to.get("harness"), handoff_to.get("session_id")))
+        tag_text = "[" + str(tag) + "]" if tag else ("→" + (handoff_to.get("harness") or "?"))
+        state = node.get("state")
+        arrow = "✓→" if state == "done" else ("✕→" if state == "failed" else "◌→")
+        return [(label + arrow + tag_text, "dim")]
+    state = node.get("state")
+    if state == "planned":
+        return [(label + " ○", "dim")]
+    knobs = _route_chain_node_knobs(node, with_knobs)
+    if is_current:
+        lit = "g_work" if (working and state == "open") else None
+        segs = [(label, lit)]
+        if knobs:
+            segs += [("(", "dim"), (knobs, "dim"), (")", "dim")]
+        if state == "open":
+            return segs + [(" ●", lit)]
+        glyph, key = _ROUTE_CHAIN_MARK.get(state, ("?", "lvl_y"))
+        return segs + [(" " + glyph, key if key != "dim" else lit)]
+    text = label + ("(" + knobs + ")" if knobs else "")
+    if state == "open":
+        return [(text + " ●", "dim")]
+    glyph, key = _ROUTE_CHAIN_MARK.get(state, ("?", "lvl_y"))
+    return [(text, "dim"), (" " + glyph, key)]
+
+
+# User 2026-09-18 ("가장 마지막 라우팅 3개까지만 고정으로", then "최대 4개로 하고, 계획도 바로
+# 앞에꺼 1개까지는 보이게"): the cell always shows a window of at most this many chain nodes —
+# the node right after the current one (the next planned step) when there is one, and the
+# current node with as much history before it as the rest of the window holds. Later plan
+# steps and older routes are simply out of the window.
+_ROUTE_CHAIN_WINDOW = 4
+
+
+def _route_chain_window(nodes, current_idx):
+    """`(start, window)`: at most `_ROUTE_CHAIN_WINDOW` nodes ending one past the current
+    node when a next node exists, else at the current node."""
+    ahead = 1 if current_idx + 1 < len(nodes) else 0
+    start = max(0, current_idx - (_ROUTE_CHAIN_WINDOW - 1 - ahead))
+    return start, nodes[start:current_idx + 1 + ahead]
+
+
+def _route_chain_bodies(chain, tag_by_key=None, working=False):
+    """Width-ladder bodies of a visible route chain's window, widest first: every node
+    with its details, then only the current node's, then none, and last the current node
+    alone with `+N✓ +M○` counts of the rest. `chain` is `route_chain.assemble()`'s return
+    shape; an invisible or empty chain has no bodies."""
+    if not isinstance(chain, dict) or not chain.get("visible"):
+        return []
+    nodes = chain.get("nodes") or []
+    if not nodes:
+        return []
+    current = chain.get("current")
+    current_idx = len(nodes) - 1
+    for i, node in enumerate(nodes):
+        if node is current:
+            current_idx = i
+            break
+    start, window = _route_chain_window(nodes, current_idx)
+
+    def shown(past_knobs, current_knobs):
+        segs = []
+        for offset, node in enumerate(window):
+            if offset:
+                segs.append((" › ", "dim"))
+            is_current = start + offset == current_idx
+            segs += _route_chain_node_segs(node, current_knobs if is_current else past_knobs,
+                                           tag_by_key, is_current=is_current, working=working)
+        return segs
+
+    def current_only(with_knobs):
+        segs = _route_chain_node_segs(nodes[current_idx], with_knobs, tag_by_key,
+                                      is_current=True, working=working)
+        counts = {}
+        for j, node in enumerate(nodes):
+            if j == current_idx:
+                continue
+            counts[node.get("state")] = counts.get(node.get("state"), 0) + 1
+        tail = " ".join(
+            "+%d%s" % (counts[state], glyph)
+            for state, glyph in (("done", "✓"), ("planned", "○"), ("failed", "✕"), ("unknown", "?"))
+            if counts.get(state)
+        )
+        if tail:
+            segs.append((" " + tail, "dim"))
+        return segs
+
+    return [shown(True, True), shown(False, True), shown(False, False),
+            current_only(True), current_only(False)]
+
+
+def _route_chain_cell(chain, max_width, tag_by_key=None, working=False):
+    """A session stage cell's route-chain segments, or None when the chain is not visible:
+    the first ladder body that fits `max_width`, else the narrowest one clipped."""
+    bodies = _route_chain_bodies(chain, tag_by_key, working)
+    if not bodies:
+        return None
+    for segs in bodies:
+        if sum(_dw(text) for text, _key in segs) <= max_width:
+            return segs
+    return _clip_segs(bodies[-1], max_width)[0]
+
+
 def _steward_target_tags(targets, tag_by_key):
     """The badges of the sessions a steward watches, in board order.
 
@@ -3994,10 +4194,19 @@ def _compact_context_gauge_width(available, depth=0):
 
 
 _EXEC_GLYPH = "⚙"
-# F-47 v47 — a wait-primitive child (`sleep` & co) renders as ⏳ and ALWAYS dim: the
-# session is waiting on purpose, and the badge must not read as work even when the row
-# is working for some other reason (busy status, fresh transcript).
+# F-47 v47, corrected 2026-09-16 — a tool call with nothing running under it renders as ⏳. v47 forced it
+# ALWAYS dim because `shell` + a `sleep` child used to promote the ROW to working, so a
+# bright badge sat on top of a green glyph the wait itself had caused (user 2026-08-05
+# "fleet에서 sleep 명령어가 뜨는 건 좀 모순"). That promotion is gone — `shell` is idle by
+# measurement (model._session_status_state) — so brightness can follow the row's own
+# classification like every other badge: dim under an idle/background row, live under a busy
+# turn, which is the only way "이 세션은 9분째 스크립트를 기다리는 중" is visible at a glance.
 _WAIT_GLYPH = "⏳"
+# The leaf of a waiting call is a primitive (`sleep`, `flock`) whose name tells the user
+# nothing and whose clock resets every iteration, so a 9-minute wait rendered as `sleep 18s`.
+# The badge names the WAIT and lets the elapsed — the CALL's, not the leaf's — carry the
+# information; the leaf comm stays in `--json` for forensics.
+_WAIT_LABEL = "대기"
 
 
 def _fmt_exec_age(seconds):
@@ -4017,19 +4226,23 @@ def _exec_detail_segs(entity):
     and the only one with a real elapsed. Brightness follows the CLASSIFICATION, not the
     badge: a promoted `working` row gets the live hue, a background child under an idle row
     stays dim (prd.md:263 — the badge never makes a row or its group look hot).
+
+    The elapsed is the CALL's, so it counts a whole `sleep 20` poll loop instead of resetting
+    with each iteration, and a waiting call is labelled `대기` rather than by its primitive.
     """
     key = "g_work" if getattr(entity, "liveness", None) == "working" else "dim"
     child = getattr(entity, "exec_child", None)
     if isinstance(child, dict) and child.get("comm"):
         etime = child.get("etime_s")
-        glyph = _EXEC_GLYPH
-        if exec_child_is_wait(child):            # v47: waiting, never bright
-            glyph, key = _WAIT_GLYPH, "dim"
+        if exec_child_is_wait(child):
+            # 2026-09-16: name the wait, not the primitive, and leave `key` at the row's own
+            # classification — dim on an idle/background row, live under a busy turn.
+            glyph, label = _WAIT_GLYPH, _WAIT_LABEL
         else:
             # A real non-helper descendant is experiment activity even if its interactive
             # parent is sleeping. Promote only this status detail, never the title.
-            key = "g_work"
-        text = "%s %s" % (glyph, child["comm"])
+            glyph, label, key = _EXEC_GLYPH, child["comm"], "g_work"
+        text = "%s %s" % (glyph, label)
         if isinstance(etime, (int, float)) and not isinstance(etime, bool):
             text += " %s" % _fmt_exec_age(etime)
         return [(text, key)]
@@ -6332,13 +6545,15 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
             if _srow:
                 lines.extend(_srow(s, is_parent=bool(nested_n), child_count=nested_n,
                                    term_width=term_width,
-                                   show_projection_stage=not suppress_session_stage))
+                                   show_projection_stage=not suppress_session_stage,
+                                   tag_by_key=tag_by_key))
             else:
                 lines.append(_session_row(s, narrow, is_parent=bool(nested_n),
                                           child_count=nested_n,
                                           name_width=wide_name_width,
                                           show_projection_stage=not suppress_session_stage,
-                                          stage_zone=wide_route_zone))
+                                          stage_zone=wide_route_zone,
+                                          tag_by_key=tag_by_key))
             if not (s.liveness in ("stale", "dead") or s.app_server or s.detached):
                 _sess_bold_ids.update(range(_n0, len(lines)))
             # F-69: main-session rows get the brighter, bold NOW sentence; dispatch
@@ -6346,6 +6561,8 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
             detail = _context_detail_row(s, term_width=term_width, now_key="now_main")
             if detail:
                 lines.extend(detail)
+            # F-103: the route chain lives in the session's stage cell (last three nodes);
+            # it has no line of its own.
             # F-101a: relation strips follow the session detail rows, not the 44-column subtitle.
             _peer_last = getattr(s, "peer_last_recv", None)
             # The session has no full-route detail surface. Route progress belongs

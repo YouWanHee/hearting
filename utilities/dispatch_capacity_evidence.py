@@ -18,8 +18,8 @@ import subprocess
 import time
 
 HARNESSES = ("claude", "codex", "opencode")
-WINDOWS = {"five_hour": (6 * 3600, "all"), "seven_day": (8 * 86400, "all"),
-           "seven_day_opus": (8 * 86400, "opus"), "seven_day_sonnet": (8 * 86400, "sonnet")}
+WINDOWS = {"five_hour": 6 * 3600, "seven_day": 8 * 86400,
+           "seven_day_opus": 8 * 86400, "seven_day_sonnet": 8 * 86400}
 
 
 def digest(value):
@@ -81,7 +81,7 @@ def launch_scope(harness, env=None):
     return {"quota_scope": scopes[kind], "quota_scope_kind": kind} if scopes else {}
 
 
-def native_quota(rows, *, observed_at, now=None):
+def native_quota(rows, *, observed_at, now=None, requested_model=None):
     """Accept only an exact failed native session's structured rejected window."""
     now = time.time() if now is None else now
     terminal_index = next((i for i in range(len(rows) - 1, -1, -1) if rows[i].get("type") == "result"), None)
@@ -103,10 +103,26 @@ def native_quota(rows, *, observed_at, now=None):
     if not isinstance(info, dict):
         return None
     window = info.get("rateLimitType")
-    if info.get("status") != "rejected" or not isinstance(window, str) or window not in WINDOWS or info.get("isUsingOverage") is True:
+    if info.get("status") != "rejected" or not isinstance(window, str) or info.get("isUsingOverage") is True:
+        return None
+    if window == "seven_day_overage_included":
+        # This is a separate included-credit pool, not proof that every model
+        # on the subscription is exhausted. Bind it to the model the exact
+        # attempt launched; neither prose nor an alias guessed from prose is
+        # authority. Without that binding it remains diagnostic only.
+        if (info.get("overageStatus") != "rejected" or info.get("isUsingOverage") is not False
+                or not isinstance(requested_model, str)
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]*", requested_model)):
+            return None
+        maximum, model_scope = 8 * 86400, "model:" + requested_model
+    elif window in WINDOWS:
+        maximum = WINDOWS[window]
+        # Native quota bucket suffixes identify families, not execution-model
+        # defaults. Derive the family from the admitted bucket name itself.
+        model_scope = window.removeprefix("seven_day_") if window.startswith("seven_day_") else "all"
+    else:
         return None
     reset = info.get("resetsAt")
-    maximum, model_scope = WINDOWS[window]
     if (isinstance(reset, bool) or not isinstance(reset, (int, float)) or not math.isfinite(reset)
             or not observed_at <= now + 60 or not observed_at < reset <= observed_at + maximum):
         return None
@@ -161,7 +177,8 @@ def observations(jobs, *, now=None, env=None, registry_lines=None):
             continue
         if now - observed > 8 * 86400:
             continue
-        quota = native_quota(_native_rows(log), observed_at=observed, now=now)
+        quota = native_quota(_native_rows(log), observed_at=observed, now=now,
+                             requested_model=meta.get("model"))
         if not quota:
             continue
         bound_scope = meta.get("quota_scope")
@@ -186,7 +203,10 @@ def active_limits(jobs, *, profile=None, models=None, now=None, env=None, regist
         if observation["expired"] or not observation["scope_matches"]:
             continue
         model_scope = observation["model_scope"]
-        if model_scope != "all" and model_scope not in models.get("claude", "").lower():
+        if model_scope.startswith("model:"):
+            if models.get("claude") != model_scope.removeprefix("model:"):
+                continue
+        elif model_scope != "all" and model_scope not in models.get("claude", "").lower():
             continue
         previous = result.get("claude")
         if not previous or previous["reset_epoch"] < observation["reset_epoch"]:

@@ -216,6 +216,17 @@ def pending_record_identity(
         attempt_id = metadata.get("attempt_id", "")
         return (f"review:{attempt_id}" if attempt_id else "", "_review",
                 parent_attempt_id or NO_PARENT_ATTEMPT)
+    # A dispatch-depth-1 frame leg is launched by the depth-0 session itself:
+    # it carries route_id/route_node like a stage row but has no parent
+    # attempt (its parent is the session). Before 2026-09-17 this shape fell
+    # through to the stage triple with an empty parent, so every frame
+    # terminal was refused as identity-incomplete, no record existed, and
+    # the asyncRewake carrier exited 0 without waking the session -- the
+    # 2026-08-29 owner defect reproduced on the frame layer added 2026-09-10.
+    if (metadata.get("worker_type") == "frame"
+            and metadata.get("dispatch_depth") == "1"
+            and route_id and route_node):
+        return route_id, route_node, parent_attempt_id or NO_PARENT_ATTEMPT
     is_owner_row = (metadata.get("worker_type") == "owner"
                     or (metadata.get("dispatch_depth") == "1"
                         and metadata.get("worker_type") not in {"review", "frame"}

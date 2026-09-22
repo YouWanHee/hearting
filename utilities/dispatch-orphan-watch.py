@@ -128,13 +128,13 @@ def _finish_recovery(args) -> bool:
     A failed cleanup hands the exact obligation to the existing parent queue;
     preserving supervisor state makes a failed handback recoverable on restart.
     """
-    from dispatch_supervision import _rows, _root, _pending, materialize
+    from dispatch_supervision import _rows, _pending, materialize
     rows = _rows(Path(args.jobs))
     owned = {args.attempt_id} if args.attempt_id in rows else set()
     for aid in rows:
         if rows[aid][1].get("parent_attempt_id") == args.attempt_id:
             owned.add(aid)
-    if owned and _pending(rows, sorted(owned)):
+    if owned and _pending(rows, sorted(owned), Path(args.jobs)):
         materialize(Path(args.jobs), owned, reason="supervisor-exited")
         return False
     _remove_supervisor_state(args)
