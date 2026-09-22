@@ -220,6 +220,35 @@ sys.exit(status)
         self.assert_call(self.run_worker(extra_env=overrides), "global-model", "low")
         self.assert_call(self.run_worker("curate", overrides), "global-model", "medium")
 
+    def test_cli_rejection_preserves_exit_partial_output_and_pending_delta(self):
+        # A failed CLI can still create output. This must neither turn the
+        # worker's exit into 0 nor apply/emit a partial model result.
+        for mode in ("increment", "curate"):
+            result = self.run_worker(mode, {"DISTILL_FIXTURE_EXIT": "64", "DISTILL_FIXTURE_OUTPUT": "UNTRUSTED PARTIAL RESULT"})
+            self.assertEqual(result.returncode, 64, (result.stdout, result.stderr))
+            self.assertIn("fixture CLI rejected", result.stderr)
+            self.assertNotIn("UNTRUSTED", result.stdout)
+            self.assertFalse((self.store / f".distill-state-{self.last_sid}").exists())
+            delta = self.memory("distill", self.last_sid, "--source", "codex")
+            self.assertIn("Synthetic lifecycle effort fixture.", delta.stdout)
+        self.assertEqual(len(self.receipts()), 2, "no retry or effort-dropping fallback")
+        for receipt in self.receipts():
+            self.assertIn("-c", receipt["argv"])
+
+    def test_missing_output_preserves_failure_and_pending_delta(self):
+        # A successful process alone cannot acknowledge a distilled window.
+        # The supported no-action result is an existing empty output file.
+        for mode in ("increment", "curate"):
+            result = self.run_worker(mode, {"DISTILL_FIXTURE_NO_OUTPUT": "1"})
+            self.assertEqual(result.returncode, 1, (result.stdout, result.stderr))
+            self.assertIn("model-output-missing", result.stderr)
+            self.assertEqual(result.stdout, "")
+            self.assertFalse((self.store / f".distill-state-{self.last_sid}").exists())
+            delta = self.memory("distill", self.last_sid, "--source", "codex")
+            self.assertEqual(delta.returncode, 0, delta.stderr)
+            self.assertIn("Synthetic lifecycle effort fixture.", delta.stdout)
+        self.assertEqual(len(self.receipts()), 2, "missing output must not trigger model retry")
+
     def test_per_mode_overrides_do_not_cross_modes(self):
         self.assert_call(self.run_worker(extra_env={"CODEX_DISTILL_MODEL_INCREMENT": "inc-model"}), "inc-model", "low")
         self.assert_call(self.run_worker("curate", {"CODEX_DISTILL_MODEL_INCREMENT": "inc-model"}), "fixture-light", "medium")

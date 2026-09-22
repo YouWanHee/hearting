@@ -339,9 +339,16 @@ if AGENT_SESSION_ROLE=worker MEM_DISTILL=1 python3 "$ROOT/utilities/model-worker
   -m "$model" \
   -c "model_reasoning_effort=\"$distill_effort\"" \
   - < "$prompt_file" >/dev/null; then
-  exec_ok=1
+  exec_status=0
 else
-  exec_ok=0
+  exec_status=$?
+fi
+
+# Exit 0 without the promised output is not a completed capture. Preserve the
+# delta for another run; an existing empty file is the valid no-action result.
+if [ "$exec_status" -eq 0 ] && [ ! -f "$out_file" ]; then
+  echo "codex distill worker: model-output-missing" >&2
+  exec_status=1
 fi
 
 if [ "${CODEX_DISTILL_APPLY:-}" = "1" ]; then
@@ -349,7 +356,7 @@ if [ "${CODEX_DISTILL_APPLY:-}" = "1" ]; then
     echo "codex distill worker: tool-contract — no-tools/action contract not accepted; refusing CODEX_DISTILL_APPLY" >&2
     exit 69
   fi
-  if [ "$exec_ok" = "1" ] && [ -f "$out_file" ]; then
+  if [ "$exec_status" -eq 0 ] && [ -f "$out_file" ]; then
     # shared applier (shell=False, argv-only). --mode gates id-mutations: increment =
     # add-only enforced; curate = snapshot-id membership whitelist via --snapshot-ids.
     AGENT_HOME="$AGENT_ROOT" python3 "$ROOT/tools/memory/apply-distill-actions.py" \
@@ -360,11 +367,15 @@ if [ "${CODEX_DISTILL_APPLY:-}" = "1" ]; then
   # advance is gated on the exec, not per-record apply success — the same
   # always-advance-after-applier semantics as the portable dispatcher (a poison delta is
   # not reprocessed forever). A preview-only run (no APPLY) or a failed/timed-out exec
-  # (exec_ok=0) keeps the delta for a later real distill. Fixes the prior re-distill
+  # (exec_status non-zero) keeps the delta for a later real distill. Fixes the prior re-distill
   # divergence (the old worker never advanced → reprocessed the same delta every run).
-  if [ "$exec_ok" = "1" ]; then
+  if [ "$exec_status" -eq 0 ]; then
     AGENT_HOME="$AGENT_ROOT" python3 "$ROOT/tools/memory/mem.py" distill "$sid" --source codex --advance >/dev/null 2>&1 || true
   fi
 fi
 
+# A failed model run remains a failure even when the CLI left a partial file.
+# Emitting it would hand the dispatcher an untrusted fragment under a success
+# status, which closes a delta window the run never actually distilled.
+[ "$exec_status" -eq 0 ] || exit "$exec_status"
 [ -f "$out_file" ] && cat "$out_file"
