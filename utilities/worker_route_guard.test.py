@@ -13,8 +13,15 @@ def dispatch(worktree):
 
 class WorkerRouteGuardTest(unittest.TestCase):
  def route(self):
+  # A guarded worker needs a branch, but the source running this suite may be
+  # an exact-SHA (detached) CI checkout. Own that worktree precondition instead
+  # of borrowing the caller's branch or mocking away the real Git guard.
+  temp=tempfile.TemporaryDirectory(); self.addCleanup(temp.cleanup)
+  self.route_worktree=Path(temp.name)/"worktree"; self.route_worktree.mkdir()
+  subprocess.run(["git","init","-q","--initial-branch=guard-fixture",str(self.route_worktree)],check=True)
+  subprocess.run(["git","-C",str(self.route_worktree),"-c","user.name=Fixture","-c","user.email=fixture@example.com","commit","--allow-empty","-qm","base"],check=True)
   gate={"spec_read":{"satisfied":True,"source":"prd-sha256"},"drift_verdict":"within-spec","workflow_mode":"tracked","artifact_guard":{"satisfied":True,"source":"conductor"}}
-  return R.compile_route("autopilot-code","dev","strong",ROOT,ROOT,predicates=ALL,signals=["shared-contract"],transport="headless",tracking="tracked",tracked_gate_evidence=gate,dispatch_evidence=dispatch(ROOT))
+  return R.compile_route("autopilot-code","dev","strong",self.route_worktree,self.route_worktree,predicates=ALL,signals=["shared-contract"],transport="headless",tracking="tracked",tracked_gate_evidence=gate,dispatch_evidence=dispatch(self.route_worktree))
 
  def reseal(self,route):
   route["route_hash"]=R.route_hash(route)
@@ -34,10 +41,10 @@ class WorkerRouteGuardTest(unittest.TestCase):
     self.reseal(route); path=Path(td)/"route.json"; path.write_text(json.dumps(route))
     # Plain material/spec callers remain compatible with legacy route records.
     if case=="absent":
-     _,node,_=G.validate_route_contract(path,"execute",ROOT,ROOT)
+     _,node,_=G.validate_route_contract(path,"execute",self.route_worktree,self.route_worktree)
      self.assertEqual(node["id"],"execute")
     with self.assertRaises(G.WorkerRouteError) as ctx:
-     G.validate_route_contract(path,"execute",ROOT,ROOT,launch_phase="start")
+     G.validate_route_contract(path,"execute",self.route_worktree,self.route_worktree,launch_phase="start")
     self.assertEqual(ctx.exception.reason,expected)
     if case=="incompatible":
      detail=json.loads(str(ctx.exception))
@@ -50,7 +57,7 @@ class WorkerRouteGuardTest(unittest.TestCase):
     route=self.route(); route["launch_compatibility_tuple"]["runtime_root"]=runtime
     self.reseal(route); path=Path(td)/"route.json"; path.write_text(json.dumps(route))
     with self.assertRaises(G.WorkerRouteError) as caught:
-     G.validate_route_contract(path,"execute",ROOT,ROOT,launch_phase="start")
+     G.validate_route_contract(path,"execute",self.route_worktree,self.route_worktree,launch_phase="start")
     self.assertEqual(caught.exception.reason,"launch-runtime-root-mismatch")
     detail=json.loads(str(caught.exception))
     self.assertIn("runtime_root",detail["mismatches"])
@@ -59,9 +66,10 @@ class WorkerRouteGuardTest(unittest.TestCase):
  def test_valid_and_scope_bound(self):
   with tempfile.TemporaryDirectory() as td:
    path=Path(td)/"route.json"; route=self.route(); path.write_text(json.dumps(route))
-   _,node,_=G.validate_route_contract(path,"execute",ROOT,ROOT,"autopilot-code","strong",";".join(next(x for x in route["nodes"] if x["id"]=="execute")["write_scope"]),route["route_id"],route["route_hash"],route["registry_digest"])
+   _,node,git=G.validate_route_contract(path,"execute",self.route_worktree,self.route_worktree,"autopilot-code","strong",";".join(next(x for x in route["nodes"] if x["id"]=="execute")["write_scope"]),route["route_id"],route["route_hash"],route["registry_digest"])
    self.assertEqual(node["id"],"execute")
-   self.assertRaisesRegex(G.WorkerRouteError,"expected=",G.validate_route_contract,path,"execute",ROOT,ROOT,"autopilot-code","strong","spec/**")
+   self.assertEqual(git["branch"],"guard-fixture")
+   self.assertRaisesRegex(G.WorkerRouteError,"expected=",G.validate_route_contract,path,"execute",self.route_worktree,self.route_worktree,"autopilot-code","strong","spec/**")
  def test_detached_spec_worktree_reports_safe_branch_recovery(self):
   with tempfile.TemporaryDirectory() as td:
    repo=Path(td)/"spec worktree"; repo.mkdir()
@@ -78,10 +86,10 @@ class WorkerRouteGuardTest(unittest.TestCase):
  def test_hash_and_reselection_rejected(self):
   with tempfile.TemporaryDirectory() as td:
    path=Path(td)/"route.json"; route=self.route(); route["cwd"]="/tmp"; path.write_text(json.dumps(route))
-   self.assertRaisesRegex(G.WorkerRouteError,"stale or modified",G.validate_route_contract,path,"execute",ROOT,ROOT)
+   self.assertRaisesRegex(G.WorkerRouteError,"stale or modified",G.validate_route_contract,path,"execute",self.route_worktree,self.route_worktree)
   with tempfile.TemporaryDirectory() as td:
    path=Path(td)/"route.json"; route=self.route(); path.write_text(json.dumps(route))
-   self.assertRaisesRegex(G.WorkerRouteError,"expected=autopilot-code",G.validate_route_contract,path,"execute",ROOT,ROOT,"code-execute")
+   self.assertRaisesRegex(G.WorkerRouteError,"expected=autopilot-code",G.validate_route_contract,path,"execute",self.route_worktree,self.route_worktree,"code-execute")
  def test_source_commit_mismatch_rejected(self):
   with tempfile.TemporaryDirectory() as td:
    repo=Path(td)/"repo"; repo.mkdir(); subprocess.run(["git","init","-q",str(repo)],check=True)

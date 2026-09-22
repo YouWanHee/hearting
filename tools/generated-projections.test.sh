@@ -165,7 +165,10 @@ completion_remaining_line=$(grep -n -m1 '남은 사항: <미완료 항목, 위�
   echo "not ok - completion report fields must keep canonical order" >&2
   exit 1
 }
-grep -Fq 'A worker handoff, background-process exit, or stage verdict alone is not task' "$ROOT/core/WORKFLOW.md"
+grep -Fq 'A process exit or intermediate stage verdict alone is not task completion.' "$ROOT/core/WORKFLOW.md" || {
+  echo "not ok - process/stage completion boundary missing from core/WORKFLOW.md" >&2
+  exit 1
+}
 grep -Fq 'material work with the canonical five-field post-execution card' "$ROOT/roles/response-policy.md"
 grep -Fq 'auto-proceed without another confirmation, then use the applicable concise' "$ROOT/roles/response-policy.md"
 if grep -Fq 'auto-proceed and report in one line' "$ROOT/roles/response-policy.md"; then
