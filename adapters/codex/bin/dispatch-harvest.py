@@ -26,9 +26,11 @@ from dispatch_contract import (  # noqa: E402
 from codex_dispatch_terminal import inspect_terminal_attempt  # noqa: E402
 from dispatch_completion_join import (  # noqa: E402
     consume_parent_session_attempt,
+    consume_supervisor_outbox_attempts,
     JoinContractError,
     materialize_after_terminal_close,
     parent_session_state_path,
+    read_supervisor_phase_state,
     required_action_for_attempt,
     route_completion_evidence,
 )
@@ -201,6 +203,41 @@ def default_runtime_jobs(environ: dict[str, str] | os._Environ[str]) -> Path:
     return codex_home.expanduser() / ".harness" / "dispatch" / "jobs.log"
 
 
+def consume_supervised_harvest(args: argparse.Namespace, *, marked_done: int) -> bool:
+    """Acknowledge one outbox action after a mark-done harvest advanced its row.
+
+    Scope is deliberately narrow. Upstream 32d4e1437 moved acknowledgement of an
+    *inspection* to the receiving runtime (`acknowledge_supervisor_delivery`
+    clears the whole outbox after the turn), and its harvest tests assert that an
+    inspection never touches the state file. A `--mark-done` harvest is the other
+    case: it provably closed the exact row, so the action is spent the moment it
+    returns and the supervisor must stop re-rendering it for the rest of the turn.
+    """
+
+    if not args.mark_done:
+        return True
+    state_file = os.environ.get("AGENT_DISPATCH_COMPLETION_STATE_FILE", "")
+    parent_attempt = os.environ.get("AGENT_DISPATCH_ATTEMPT_ID", "")
+    if not state_file or not parent_attempt or not args.attempt_id:
+        return True
+    state = read_supervisor_phase_state(Path(state_file), parent_attempt)
+    if (
+        state is None
+        or state.outbox is None
+        or args.attempt_id not in state.outbox.attempt_ids
+        or args.attempt_id in state.outbox.consumed_attempt_ids
+    ):
+        return True
+    if marked_done != 1:
+        return False
+    try:
+        return consume_supervisor_outbox_attempts(
+            Path(state_file), parent_attempt, {args.attempt_id}
+        )
+    except JoinContractError:
+        return False
+
+
 def main(argv: list[str]) -> int:
     args = parser().parse_args(argv[1:])
     if args.mark_done and not (args.slug or args.attempt_id or args.worktree):
@@ -315,6 +352,11 @@ def main(argv: list[str]) -> int:
                 if home.exists():
                     shutil.rmtree(home, ignore_errors=True)
 
+
+    if not consume_supervised_harvest(args, marked_done=marked_done):
+        print("check=failed")
+        print("reason=supervisor-outbox-consume-failed")
+        return 70
 
     emit_header(args, jobs, len(rows), marked_done, malformed)
     for fields in rows:

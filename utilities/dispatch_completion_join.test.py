@@ -2088,7 +2088,15 @@ class HarvestVocabularyTest(unittest.TestCase):
                 self.assertEqual(JOIN.current_attempt_row(jobs, "att-consumed").status, "done")
                 harvest(pending_commands["att-open"], marked_done=1)
                 final_commands, _guarded = assert_pending({"att-failure"})
+                # A mark-done harvest acknowledges its own action because it
+                # provably closed the row. An inspection does not (upstream
+                # 32d4e1437): it leaves the outbox untouched, and the receiving
+                # runtime commits delivery once its turn returns.
                 harvest(final_commands["att-failure"], marked_done=0)
+                assert_pending({"att-failure"})
+                self.assertTrue(JOIN.acknowledge_supervisor_delivery(
+                    state_path, "att-parent", prepared.outbox.receipt_id
+                ))
                 finished = JOIN.read_supervisor_phase_state(state_path, "att-parent")
                 self.assertIsNotNone(finished)
                 self.assertIsNone(finished.outbox)
