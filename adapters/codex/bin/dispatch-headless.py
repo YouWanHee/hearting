@@ -1764,30 +1764,21 @@ def prepare_nested_codex_home(worktree: Path, source_home: Path | None = None, *
     projection_root = resolve_agent_home().resolve()
     installer = projection_root / "adapters" / "codex" / "bin" / "install-runtime-projection.sh"
 
-    # Inherit the parent's whole effective model configuration into the
-    # nested home BEFORE the installer/native-agent rendering below, so the
-    # nested home does not silently fall back to the shipped default model
-    # tiers (core: harness-created derived execution home inheritance
-    # exception). One helper `prepare` call owns the whole transaction --
-    # snapshot decision, installer, and native payload verification -- under
-    # its own lock; this wrapper never holds that lock itself or spawns a
-    # separate seed/finish call.
-    nested_model_config_dir = projection_root / "tools" / "install"
-    if str(nested_model_config_dir) not in sys.path:
-        sys.path.insert(0, str(nested_model_config_dir))
-    import nested_model_config  # noqa: E402
-
-    try:
-        nested_model_config.prepare(
-            "codex",
-            source,
-            destination,
-            source_root=projection_root,
-            installer=installer,
-            installer_args=["--skills-mode", "native"],
+    env = {**os.environ, "AGENT_HOME": str(projection_root), "CODEX_HOME": str(destination)}
+    result = subprocess.run(
+        [str(installer), "--skills-mode", "native"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise DispatchContractError(
+            "nested-codex-home-projection-failed",
+            (result.stderr or result.stdout).strip() or f"exit-{result.returncode}",
         )
-    except nested_model_config.NestedModelConfigError as exc:
-        raise DispatchContractError("nested-codex-model-config-failed", str(exc)) from exc
 
     auth = source / "auth.json"
     if not auth.is_file():

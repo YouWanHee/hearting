@@ -74,15 +74,7 @@ install/update/reapply/uninstall. Missing balanced dispatch policy derives from
 the entire user light policy without enabling disabled vendors. Native settings
 and adapter fragments stay outside `agent-config`.
 
-Harness-created derived execution homes (e.g. nested dispatch homes) may snapshot
-the parent's whole effective config before projection to avoid shipped-default
-fallback; other homes retain seed-once behavior. Snapshots are regular files with
-parent/destination/exact-content provenance, never merges or symlinks. Updates
-require ownership and hash/CAS proof. Preserve unmarked, foreign or user-modified
-destinations as typed conflicts; shipped-byte equality proves no ownership.
-Snapshot decision, installer and native rendering form one serialized transaction
-per destination. Ownership and successful projection are separate facts; failures
-retain incomplete/conflict status. Legacy unmarked-home adoption requires explicit authorization, backup, pinned
+Legacy unmarked-home adoption requires explicit authorization, backup, pinned
 hash and proved target quiescence; ordinary setup cannot adopt.
 Quiescence names runtime-process ownership and observer scope; missing relevant
 process evidence refuses recovery, without claiming control over privileged OS

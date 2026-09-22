@@ -557,36 +557,6 @@ fixed pin — read the diagnostic for the live mapping):
 | `mini` | configured mini tier / `low`, lifecycle/micro-only |
 | `top` | configured top tier / `xhigh`; the main-session-only model, only through a route that sealed `top` for its depth-1 owner |
 
-### Nested-home model inheritance
-
-`dispatch-headless.py`'s `prepare_nested_codex_home` creates a writable
-sandboxed Codex home for recursive `codex exec`. Before it ran the regular
-installer there, the nested home always seeded the *shipped* default
-`models.conf` -- a complete, valid-looking user file that `resolve_config`
-happily selected, so the parent's actually-configured model tiers (and the
-native agents rendered from them) never reached the nested home. It now first
-calls `tools/install/nested_model_config.py prepare`, the one nested-only
-helper realizing the core exception above: it resolves the parent's whole
-effective config with the existing `model_config.resolve_config`, snapshots
-that exact selection into the nested home's own `agent-config/models.conf`
-under an ownership receipt (`<nested>/.harness/nested-model-config/receipt.json`,
-`hearting.nested-model-config/v1`), then runs the existing installer and
-`native_agent_payload` materialize/verify against what is now the nested
-home's own effective config -- all under one `safe_fs.TargetLock` held for the
-whole transaction. `seed`/`prepare`/`recover --apply` share that same lock; no
-call re-acquires it as a child. An unmarked, foreign, or user-edited
-destination is preserved and reported as a typed conflict, never silently
-overwritten. Explicit legacy recovery (`recover --dry-run`/`--apply`) is a
-separate, backed-up, hash-pinned, quiescence-gated operation intended for a
-human operator repairing an existing (pre-fix) nested home; it is never run
-implicitly by `prepare`. Global installer seed-once semantics for a normal
-user runtime home are unchanged. Recovery checks the private home owner's
-runtime processes plus every relevant registered attempt, using PID start time
-and namespace identity. Inaccessible relevant evidence refuses recovery. This
-proves quiescence within that user-runtime scope, not inactivity of privileged
-OS administrators. The installer defers native agent links only for this
-nested transaction; the helper installs them using ownership and CAS checks.
-
 Non-route role compatibility overrides remain explicit and config-derived:
 
 ```text

@@ -457,11 +457,9 @@ class AdapterV11Test(unittest.TestCase):
    fixture_home=root/"home"; fixture_home.mkdir()
    spec=importlib.util.spec_from_file_location("codex_dispatch_home",ROOT/"adapters/codex/bin/dispatch-headless.py")
    wrapper=importlib.util.module_from_spec(spec); spec.loader.exec_module(wrapper)
-   # Nested model-config inheritance now resolves its projection root through
-   # resolve_agent_home(); pin it to this source checkout (which actually has
-   # tools/install/nested_model_config.py and adapters/codex/config/models.conf)
-   # instead of the real installed runtime home, which this test must not
-   # depend on or mutate.
+   # prepare_nested_codex_home resolves its projection root through
+   # resolve_agent_home(); pin it to this source checkout instead of the real
+   # installed runtime home, which this test must not depend on or mutate.
    env=self.child_env(root/"nested-env")
    env.update({"HOME":str(fixture_home),"CODEX_HOME":str(source)})
    with mock.patch.dict(os.environ,env,clear=True), mock.patch.object(wrapper,"resolve_agent_home",return_value=ROOT):
@@ -472,9 +470,6 @@ class AdapterV11Test(unittest.TestCase):
    self.assertTrue((home/"hearting").is_symlink())
    self.assertEqual((home/"hearting").resolve(),ROOT.resolve())
    self.assertEqual(home.parent,worktree/".dispatch")
-   receipt=json.loads((home/".harness/nested-model-config/receipt.json").read_text(encoding="utf-8"))
-   self.assertEqual(receipt["projection"]["state"],"complete")
-   self.assertEqual(receipt["parent_home"],str(source.resolve()))
    before={name:(home/name).lstat() for name in ("auth.json","config.toml")}
    with mock.patch.object(wrapper,"resolve_agent_home",return_value=ROOT):
     repeated=wrapper.prepare_nested_codex_home(worktree,source)
