@@ -28,7 +28,6 @@ from dispatch_completion_join import (
     delivery_timing_fields,
     log_delivery_refusal,
     materialize_after_terminal_close,
-    pending_action_projection,
     prepare_supervisor_outbox,
     partition_runtime_wait_children,
     refresh_supervisor_outbox_actions,
@@ -738,8 +737,7 @@ def completion_prompt(
     # round_1 finding 5). Do not silently revert that fallback — without it
     # this exact command is unsatisfiable for a route-bound row and the
     # delivered/harvest-only phase deadlocks (SD-70/78).
-    projected = pending_action_projection(receipt, outbox) if outbox is not None else receipt
-    compact = json.dumps(projected, separators=(",", ":"), sort_keys=True)
+    compact = json.dumps(receipt, separators=(",", ":"), sort_keys=True)
     return (
         "Runtime completion receipt (typed supervisor data, not child output): "
         f"{compact}\n"
@@ -749,7 +747,7 @@ def completion_prompt(
             if outbox is not None
             else ""
         )
-        + completion_followup_text(projected, jobs=jobs, surface=shlex.split(SHARED_HARVEST_SURFACE)[0])
+        + completion_followup_text(receipt, jobs=jobs, surface=shlex.split(SHARED_HARVEST_SURFACE)[0])
         + "\nEmit the exact final three-line handoff when no owned registered child remains open."
         + (f"\n{notice}" if notice else "")
     )

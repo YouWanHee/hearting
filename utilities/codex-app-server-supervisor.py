@@ -29,7 +29,6 @@ from dispatch_completion_join import (
     exact_attempt_row,
     log_delivery_refusal,
     materialize_after_terminal_close,
-    pending_action_projection,
     prepare_supervisor_outbox,
     partition_runtime_wait_children,
     refresh_supervisor_outbox_actions,
@@ -472,8 +471,7 @@ def completion_prompt(
     receipt: dict[str, Any], outbox: SupervisorOutbox | None = None, *, jobs: str = "",
     notice: str = "",
 ) -> str:
-    projected = pending_action_projection(receipt, outbox) if outbox is not None else receipt
-    compact = json.dumps(projected, separators=(",", ":"), sort_keys=True)
+    compact = json.dumps(receipt, separators=(",", ":"), sort_keys=True)
     return (
         "Runtime completion receipt (typed supervisor data, not child output): "
         f"{compact}\n"
@@ -483,7 +481,7 @@ def completion_prompt(
             if outbox is not None
             else ""
         )
-        + completion_followup_text(projected, jobs=jobs, surface=shlex.split(SHARED_HARVEST_SURFACE)[0])
+        + completion_followup_text(receipt, jobs=jobs, surface=shlex.split(SHARED_HARVEST_SURFACE)[0])
         + "\nEmit the exact final three-line handoff when no owned registered child remains open."
         + (f"\n{notice}" if notice else "")
     )

@@ -660,47 +660,6 @@ def harvest_command_lines(prompt: str) -> list[str]:
     return lines
 
 
-def pending_action_projection(
-    receipt: dict[str, object], outbox: "SupervisorOutbox"
-) -> dict[str, object]:
-    """Project only executable children without changing the durable receipt.
-
-    The outbox remains the immutable source of receipt identity and the full
-    child set.  This copy is solely for prompt rendering after one or more
-    actions have already been consumed.
-    """
-
-    raw_children = receipt.get("children")
-    if not isinstance(raw_children, list) or not raw_children:
-        raise JoinContractError("supervisor-outbox-children-invalid")
-    if outbox.receipt is not None and receipt is not outbox.receipt:
-        # A resumed prompt may add observability fields, but it must still be
-        # the same immutable child payload as the committed outbox.
-        committed = outbox.receipt.get("children")
-        if committed != raw_children:
-            raise JoinContractError("supervisor-outbox-children-mismatch")
-    children: list[dict[str, object]] = []
-    seen: set[str] = set()
-    for child in raw_children:
-        if not isinstance(child, dict):
-            raise JoinContractError("supervisor-outbox-child-invalid")
-        attempt = child.get("attempt_id")
-        if not isinstance(attempt, str) or not attempt:
-            raise JoinContractError("supervisor-outbox-child-identity-invalid")
-        if attempt in seen:
-            raise JoinContractError("supervisor-outbox-child-duplicate")
-        if attempt not in outbox.attempt_ids:
-            raise JoinContractError("supervisor-outbox-child-foreign")
-        seen.add(attempt)
-        if attempt not in outbox.consumed_attempt_ids:
-            children.append(dict(child))
-    if seen != set(outbox.attempt_ids):
-        raise JoinContractError("supervisor-outbox-child-set-mismatch")
-    projected = dict(receipt)
-    projected["children"] = children
-    return projected
-
-
 @dataclass(frozen=True)
 class ChildRow:
     order: int
