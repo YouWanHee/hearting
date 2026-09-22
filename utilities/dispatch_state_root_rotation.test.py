@@ -209,6 +209,7 @@ class IdempotentRepublishAcrossSpellingTest(unittest.TestCase):
         self.evidence = self.base / "evidence.md"
         self.evidence.write_text("evidence\n", encoding="utf-8")
         self.route = {
+            "artifact_root": str(self.base / ".agent_reports"),
             "route_id": "rt-p1",
             "route_hash": "h" * 8,
             "registry_digest": "d" * 8,
@@ -296,6 +297,7 @@ class FleetGateMarkSpellingFlipTest(unittest.TestCase):
         self.evidence = self.base / "evidence.md"
         self.evidence.write_text("evidence\n", encoding="utf-8")
         self.route = {
+            "artifact_root": str(self.base / ".agent_reports"),
             "route_id": "rt-gm1",
             "route_hash": "h" * 8,
             "registry_digest": "d" * 8,
@@ -461,10 +463,11 @@ class IdempotentRepublishAcrossRotationSuccessionTest(unittest.TestCase):
         self.base = Path(self.temp.name)
         self.prior_env = {
             key: os.environ.get(key)
-            for key in ("AGENT_HOME", "AGENT_DISPATCH_JOBS", "HARNESS_DATA_ROOT")
+            for key in ("AGENT_HOME", "AGENT_DISPATCH_JOBS", "HARNESS_DATA_ROOT", "HARNESS_STATE_ROOT")
         }
         os.environ.pop("AGENT_DISPATCH_JOBS", None)
         os.environ["HARNESS_DATA_ROOT"] = str(self.base / "data")
+        os.environ["HARNESS_STATE_ROOT"] = str(self.base / "state")
         self.addCleanup(self._restore_env)
 
         self.release_a = DISTRIBUTION.data_root() / "releases" / "vA"
@@ -475,6 +478,7 @@ class IdempotentRepublishAcrossRotationSuccessionTest(unittest.TestCase):
         self.evidence = self.base / "evidence.md"
         self.evidence.write_text("evidence\n", encoding="utf-8")
         self.route = {
+            "artifact_root": str(self.base / ".agent_reports"),
             "route_id": "rt-succ",
             "route_hash": "h" * 8,
             "registry_digest": "d" * 8,
@@ -565,10 +569,13 @@ class RetryAfterFailedSuccessionStaysFailedTest(unittest.TestCase):
         self.base = Path(self.temp.name)
         self.prior_env = {
             key: os.environ.get(key)
-            for key in ("AGENT_HOME", "AGENT_DISPATCH_JOBS", "HARNESS_DATA_ROOT")
+            for key in ("AGENT_HOME", "AGENT_DISPATCH_JOBS", "HARNESS_DATA_ROOT", "HARNESS_STATE_ROOT")
         }
         os.environ.pop("AGENT_DISPATCH_JOBS", None)
         os.environ["HARNESS_DATA_ROOT"] = str(self.base / "data")
+        # An installed migration journal must not redirect this legacy fixture
+        # into the real stable state root.
+        os.environ["HARNESS_STATE_ROOT"] = str(self.base / "state")
         self.addCleanup(self._restore_env)
         self.release_a = DISTRIBUTION.data_root() / "releases" / "vA"
         self.release_b = DISTRIBUTION.data_root() / "releases" / "vB"
@@ -643,10 +650,11 @@ class PrefixCollisionRotationSuccessionTest(unittest.TestCase):
         self.base = Path(self.temp.name)
         self.prior_env = {
             key: os.environ.get(key)
-            for key in ("AGENT_HOME", "AGENT_DISPATCH_JOBS", "HARNESS_DATA_ROOT")
+            for key in ("AGENT_HOME", "AGENT_DISPATCH_JOBS", "HARNESS_DATA_ROOT", "HARNESS_STATE_ROOT")
         }
         os.environ.pop("AGENT_DISPATCH_JOBS", None)
         os.environ["HARNESS_DATA_ROOT"] = str(self.base / "data")
+        os.environ["HARNESS_STATE_ROOT"] = str(self.base / "state")
         self.addCleanup(self._restore_env)
 
         self.release_a = DISTRIBUTION.data_root() / "releases" / "v0.9"
@@ -657,6 +665,7 @@ class PrefixCollisionRotationSuccessionTest(unittest.TestCase):
         self.evidence = self.base / "evidence.md"
         self.evidence.write_text("evidence\n", encoding="utf-8")
         self.route = {
+            "artifact_root": str(self.base / ".agent_reports"),
             "route_id": "rt-pfx",
             "route_hash": "h" * 8,
             "registry_digest": "d" * 8,
@@ -768,10 +777,11 @@ class SymlinkedDataRootRotationSuccessionTest(unittest.TestCase):
 
         self.prior_env = {
             key: os.environ.get(key)
-            for key in ("AGENT_HOME", "AGENT_DISPATCH_JOBS", "HARNESS_DATA_ROOT")
+            for key in ("AGENT_HOME", "AGENT_DISPATCH_JOBS", "HARNESS_DATA_ROOT", "HARNESS_STATE_ROOT")
         }
         os.environ.pop("AGENT_DISPATCH_JOBS", None)
         os.environ["HARNESS_DATA_ROOT"] = str(link_root)
+        os.environ["HARNESS_STATE_ROOT"] = str(self.base / "state")
         self.addCleanup(self._restore_env)
 
         self.release_a = DISTRIBUTION.data_root() / "releases" / "vA"
@@ -782,6 +792,7 @@ class SymlinkedDataRootRotationSuccessionTest(unittest.TestCase):
         self.evidence = self.base / "evidence.md"
         self.evidence.write_text("evidence\n", encoding="utf-8")
         self.route = {
+            "artifact_root": str(self.base / ".agent_reports"),
             "route_id": "rt-symroot",
             "route_hash": "h" * 8,
             "registry_digest": "d" * 8,
@@ -1026,7 +1037,7 @@ class RegistryRepairStaleRowTest(unittest.TestCase):
     def _publish(self, route_id, node_id, attempt_id, dispatch_depth=2):
         evidence = self.base / f"evidence-{attempt_id}.md"
         evidence.write_text("evidence\n", encoding="utf-8")
-        route = {"route_id": route_id, "route_hash": "h" * 8, "registry_digest": "d" * 8}
+        route = {"artifact_root": str(self.base / ".agent_reports"), "route_id": route_id, "route_hash": "h" * 8, "registry_digest": "d" * 8}
         node = {
             "completion_gate": "artifact",
             "dispatch_depth": dispatch_depth,

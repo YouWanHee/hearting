@@ -18,8 +18,8 @@ import subprocess
 import time
 
 HARNESSES = ("claude", "codex", "opencode")
-WINDOWS = {"five_hour": (6 * 3600, "all"), "seven_day": (8 * 86400, "all"),
-           "seven_day_opus": (8 * 86400, "opus"), "seven_day_sonnet": (8 * 86400, "sonnet")}
+WINDOWS = {"five_hour": 6 * 3600, "seven_day": 8 * 86400,
+           "seven_day_opus": 8 * 86400, "seven_day_sonnet": 8 * 86400}
 
 
 def digest(value):
@@ -116,7 +116,10 @@ def native_quota(rows, *, observed_at, now=None, requested_model=None):
             return None
         maximum, model_scope = 8 * 86400, "model:" + requested_model
     elif window in WINDOWS:
-        maximum, model_scope = WINDOWS[window]
+        maximum = WINDOWS[window]
+        # Native quota bucket suffixes identify families, not execution-model
+        # defaults. Derive the family from the admitted bucket name itself.
+        model_scope = window.removeprefix("seven_day_") if window.startswith("seven_day_") else "all"
     else:
         return None
     reset = info.get("resetsAt")

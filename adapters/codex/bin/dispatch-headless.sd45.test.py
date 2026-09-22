@@ -814,7 +814,10 @@ class CodexSD78CompletionDelivery(unittest.TestCase):
         self.assertEqual(
             args.parent_completion_reason, "managed-gateway-not-ready"
         )
-        with self.assertRaises(WH.DispatchContractError) as raised:
+        # Validation belongs to the same managed environment as binding.
+        # Otherwise CI's clean environment correctly classifies an unmanaged parent.
+        with mock.patch.dict(os.environ, {"AGENT_CODEX_MANAGED_GATEWAY": "1"}), \
+                self.assertRaises(WH.DispatchContractError) as raised:
             WH.validate_interactive_parent_launch(args)
         self.assertEqual(raised.exception.reason, "managed-gateway-not-ready")
 

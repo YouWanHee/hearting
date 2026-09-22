@@ -6,6 +6,7 @@ binary placed first on PATH; no `WH.probe_claude_session_resume`/
 `claude_session_resume_available` mock is used anywhere in this file.
 """
 import argparse
+import ast
 import importlib.util
 import os
 import stat
@@ -263,14 +264,21 @@ class SD63CodexParity(unittest.TestCase):
 
 
 class SD63OpenCodeParityLock(unittest.TestCase):
-    """OpenCode has no supervised delivery surface at all -- lock that the
-    SD-63 reason field is never introduced there (a negative assertion)."""
+    """Only a sealed capability owner may stamp supervised delivery."""
 
-    def test_opencode_adapter_has_no_completion_delivery_reason(self):
+    def test_opencode_supervised_delivery_requires_owner_route_binding(self):
         opencode_path = ROOT / "adapters/opencode/bin/dispatch-headless.py"
-        text = opencode_path.read_text()
-        self.assertNotIn("completion_delivery_reason", text)
-        self.assertNotIn("session-resume-supervised", text)
+        tree = ast.parse(opencode_path.read_text())
+        stamps = [node for node in ast.walk(tree)
+                  if isinstance(node, ast.Constant) and isinstance(node.value, str)
+                  and "completion_delivery_reason=" in node.value]
+        self.assertEqual(len(stamps), 1)
+        self.assertEqual(stamps[0].value,
+                         ",completion_delivery=session-resume-supervised,completion_delivery_reason=ok,supervisor_lease=")
+        guards = [node for node in ast.walk(tree) if isinstance(node, ast.If)
+                  and stamps[0] in set(ast.walk(ast.Module(body=node.body, type_ignores=[])))]
+        self.assertTrue(any(ast.unparse(node.test) == "getattr(args, 'owner_route_binding', None)"
+                            for node in guards))
 
 
 if __name__ == "__main__":

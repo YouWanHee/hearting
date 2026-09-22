@@ -489,7 +489,8 @@ class DispatchOwnerRewakeTest(unittest.TestCase):
         self.jobs.write_text(
             "2026-08-06T00:00:00Z\tdone\t/repo\t/wt\towner\t"
             "attempt_schema_version=2,attempt_id=att-owner-1,failure_class=pass,"
-            "note=completed-supervisor,launch_outcome=never-launched\n",
+            "note=completed-supervisor,worker_type=owner,dispatch_depth=1,"
+            "launch_outcome=never-launched\n",
             encoding="utf-8",
         )
         state, message = rewake.classified_receipt(
@@ -592,15 +593,16 @@ class DispatchOwnerRewakeTest(unittest.TestCase):
     ) -> None:
         # SD-97 end to end: an earlier `attention/terminal-failure-or-unclosed`
         # snapshot plus the current sealed `done/completed-supervisor/pass` row must
-        # reach the terminal as one exit-0 structured notification. Only a row that
-        # is genuinely unresolved may reach it as an exit-2 warning, and that warning
+        # reach the terminal as one exit-2 structured notification. A row that
+        # is genuinely unresolved reaches it as an exit-2 warning, and that warning
         # must name this exact registry.
         launch = rewake.parse_launch(self.payload())
         assert launch is not None
         self.jobs.write_text(
             "2026-08-06T00:00:00Z\tdone\t/repo\t/wt\towner\t"
             "attempt_schema_version=2,attempt_id=att-owner-1,failure_class=pass,"
-            "note=completed-supervisor,launch_outcome=never-launched\n",
+            "note=completed-supervisor,worker_type=owner,dispatch_depth=1,"
+            "launch_outcome=never-launched\n",
             encoding="utf-8",
         )
         state, message = rewake.classified_receipt(

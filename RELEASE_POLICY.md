@@ -26,16 +26,20 @@ silently skipped.
 
 ## Automation
 
-Every push to `main` runs the deterministic planner. When a release is needed,
-the same serialized workflow validates the repository, builds the four release
-assets, creates an annotated SemVer tag at the exact tested commit, and
-publishes the GitHub Release. It does not rely on the generated tag starting a
-second workflow.
+Every push to `main` runs `Checks`. Only a successful, completed `Checks` run
+from this repository's `main` push admits an automatic release. The serialized
+release workflow runs the deterministic planner, builds the four release assets,
+creates an annotated SemVer tag, and publishes using that run's exact commit
+SHA. Failed, cancelled, pull-request, and foreign-repository runs cannot admit
+a release. A later default-branch tip never replaces the tested commit. The
+workflow does not rely on the generated tag starting a second workflow.
 
 Maintainers may push an explicit SemVer tag, including a prerelease such as
-`v1.2.0-rc.1`. That path validates, builds, and publishes the tagged commit but
-does not reinterpret the maintainer-selected version. Stable tags and release
-assets are never moved or replaced; a correction gets a new version.
+`v1.2.0-rc.1`. Tag pushes and manual releases on `main` or a version tag run the
+same reusable `Checks` workflow at the caller's exact commit before the release
+job can run. They do not poll for another workflow or bypass the full suite.
+Tag releases do not reinterpret the maintainer-selected version. Stable tags
+and release assets are never moved or replaced; a correction gets a new version.
 
 The planner and its policy fixtures can be run locally:
 

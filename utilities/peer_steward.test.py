@@ -1117,7 +1117,7 @@ class StatusRearmTest(_WatchMixin, unittest.TestCase):
         ):
             time.sleep(0.02)
         out = self._run("rearm", dead["watch_id"], env=self._env("held")).stdout
-        fields = self._fields(out)
+        fields = self._fields(out.splitlines()[0])
         self.assertEqual(fields["state"], "rearmed")
         self.assertEqual(fields["rearmed_from"], dead["watch_id"])
         self.assertNotEqual(fields["watch_id"], dead["watch_id"])
@@ -1563,6 +1563,20 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
                 continue
             for n, line in enumerate(text.splitlines(), 1):
                 if pattern.search(line) and not line.lstrip().startswith(("#", "//", "*", '"""', "'")):
+                    # Recovery launches the verified executable in a newly
+                    # created visible pane; it never prompts an existing agent.
+                    # Pin this exact launch expression, not a whole-file exemption.
+                    if (rel == "utilities/interactive-main-recovery.py"
+                            and line.strip() == 'command = ["herdr", "pane", "run", created_pane,'):
+                        import ast
+                        launch = next(node for node in ast.walk(ast.parse(text))
+                                      if isinstance(node, ast.Assign) and node.lineno == n)
+                        expected = ast.parse(
+                            '["herdr", "pane", "run", created_pane, '
+                            'shlex.join([str(launcher), "--cd", workspace, *args.agent_args])]'
+                        ).body[0].value
+                        self.assertEqual(ast.dump(launch.value), ast.dump(expected))
+                        continue
                     offenders.append(f"{rel}:{n}: {line.strip()[:100]}")
         self.assertEqual(offenders, [], "pane prompts must go through peer-steward.py prompt")
 

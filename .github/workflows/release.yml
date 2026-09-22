@@ -2,40 +2,79 @@ name: Release
 
 on:
   push:
-    branches:
-      - main
     tags:
       - "v*"
+  workflow_run:
+    workflows: [Checks]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: read
 
-concurrency:
-  group: release
-  cancel-in-progress: false
-
 jobs:
-  release:
+  admission:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      head: ${{ steps.gate.outputs.head }}
+      validation_required: ${{ steps.gate.outputs.validation_required }}
+    steps:
+      # workflow_run's github.sha is the trusted default-branch revision,
+      # not the candidate revision. Do not execute candidate code to admit it.
+      - name: Check out the admission policy
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Admit the exact release commit
+        id: gate
+        run: python3 tools/release/validation-gate.py >> "$GITHUB_OUTPUT"
+
+  validation:
+    needs: admission
+    if: needs.admission.outputs.validation_required == 'true'
+    uses: ./.github/workflows/checks.yml
+
+  release:
+    needs: [admission, validation]
+    if: >-
+      always() && !cancelled() && needs.admission.result == 'success' &&
+      (needs.admission.outputs.validation_required == 'false' ||
+      (needs.admission.outputs.validation_required == 'true' && needs.validation.result == 'success'))
+    runs-on: ubuntu-latest
+    # Only admitted releases enter serialization. A failed Checks event must
+    # never evict a successful release from GitHub's one-pending-run queue.
+    concurrency:
+      group: release
+      cancel-in-progress: false
     permissions:
       contents: write
     steps:
       - name: Check out the release source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          ref: ${{ needs.admission.outputs.head }}
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Verify the checked out commit
+        env:
+          RELEASE_HEAD: ${{ needs.admission.outputs.head }}
+        run: test "$(git rev-parse HEAD)" = "$RELEASE_HEAD"
 
       - name: Plan release
         id: plan
         env:
           REF_TYPE: ${{ github.ref_type }}
           REF_NAME: ${{ github.ref_name }}
-          RELEASE_HEAD: ${{ github.sha }}
+          RELEASE_HEAD: ${{ needs.admission.outputs.head }}
         run: |
           if [ "$REF_TYPE" = tag ]; then
             python3 tools/release/plan.py validate-version "$REF_NAME"
+            test "$(git rev-parse "refs/tags/$REF_NAME^{commit}")" = "$RELEASE_HEAD"
             {
               echo "release=true"
               echo "mode=tag"
@@ -95,7 +134,7 @@ jobs:
         env:
           RELEASE_TAG: ${{ steps.plan.outputs.version }}
           RELEASE_REPOSITORY: ${{ github.repository }}
-          RELEASE_REF: ${{ github.sha }}
+          RELEASE_REF: ${{ needs.admission.outputs.head }}
         run: |
           python3 tools/install/build-release.py \
             --version "$RELEASE_TAG" \
@@ -108,7 +147,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.plan.outputs.version }}
-          RELEASE_HEAD: ${{ github.sha }}
+          RELEASE_HEAD: ${{ needs.admission.outputs.head }}
         run: |
           if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" >/dev/null 2>&1; then
             echo "release tag already exists: $RELEASE_TAG" >&2

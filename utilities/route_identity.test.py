@@ -8,7 +8,8 @@ import route_identity as MODULE
 class RouteIdentityTest(unittest.TestCase):
     def test_excluded_keys_are_a_single_shared_set(self):
         self.assertEqual(
-            {"route_hash", "route_id", "owner_attempt_id", "route_family_key"},
+            {"route_hash", "route_id", "owner_attempt_id", "route_family_key",
+             "route_file", "_route_file"},
             set(MODULE.ROUTE_HASH_EXCLUDED_KEYS),
         )
 
@@ -17,6 +18,8 @@ class RouteIdentityTest(unittest.TestCase):
         before = MODULE.route_hash(payload)
         payload["owner_attempt_id"] = "att-example"
         payload["route_family_key"] = "sha256:" + "a" * 64
+        payload["route_file"] = "/invocation/route.json"
+        payload["_route_file"] = "/other/invocation/route.json"
         after = MODULE.route_hash(payload)
         self.assertEqual(before, after)
 

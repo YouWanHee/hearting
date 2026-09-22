@@ -67,6 +67,23 @@ def _serial_rows(count: int, *, chain: str = "ssc-acceptance"):
     ]
 
 
+def _finished_fixture_process():
+    """Give simulated model launches a real, already-reaped process identity.
+
+    A bare invented PID cannot prove execution quiescence. The serial driver
+    now retains that cleanup obligation even after the fake join returns done.
+    Keep the real settlement gate and supply the evidence its fixture needs.
+    """
+    with subprocess.Popen(
+        [sys.executable, "-c", "import sys; sys.stdin.read()"],
+        stdin=subprocess.PIPE, start_new_session=True,
+    ) as child:
+        identity = CONTRACT.process_launch_identity(child.pid)
+        assert identity.get("pid_start") and identity.get("pgid") == str(child.pid), identity
+        child.communicate(timeout=5)
+    return identity
+
+
 def _real_chain_fixture(harness, supervisor_module, count: int):
     """Create the sealed pointer and exact registry rows used by flow tests."""
 
@@ -147,7 +164,7 @@ def _real_chain_fixture(harness, supervisor_module, count: int):
             "launch_claimed": "1" if index == 1 else "0",
         }
         if index == 1:
-            metadata.update({"launch_started": "1", "pid": "4242"})
+            metadata.update({"launch_started": "1", **_finished_fixture_process()})
         encoded = ",".join(f"{key}={value}" for key, value in metadata.items())
         metadata_lines.append(
             f"2026-09-10T00:00:{index:02d}Z\topen\t/repo\t{base}\t"
@@ -210,7 +227,7 @@ def _run_real_supervisor_flow(
                     if metadata.get("attempt_id") == attempt_id:
                         metadata["launch_claimed"] = "1"
                         metadata["launch_started"] = "1"
-                        metadata["pid"] = "4242"
+                        metadata.update(_finished_fixture_process())
                         fields[5] = ",".join(f"{key}={value}" for key, value in metadata.items())
                     updated.append("\t".join(fields))
                 harness.jobs.write_text("\n".join(updated) + "\n", encoding="utf-8")
