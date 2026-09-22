@@ -2780,10 +2780,25 @@ class CodexJsonlSource:
         matches = sorted(self.sessions.glob(f"**/*{self.sid}*.jsonl"))
         return matches[-1] if matches else None
 
+    @staticmethod
+    def _text(content):
+        if isinstance(content, str):
+            return content
+        if not isinstance(content, list):
+            return ""
+        return "\n".join(part["text"] for part in content
+                         if isinstance(part, dict)
+                         and part.get("type") in ("input_text", "output_text", "text", "Text")
+                         and isinstance(part.get("text"), str) and part["text"])
+
     def messages(self):
         path = self.locate()
         if path is None:
             return
+        turn = None
+        last_role_turn = None
+        mirrors = {}
+        seen_ids = set()
         with path.open(encoding="utf-8") as f:
             for i, line in enumerate(f, 1):
                 line = line.strip()
@@ -2793,33 +2808,82 @@ class CodexJsonlSource:
                     d = json.loads(line)
                 except Exception:
                     continue
+                if not isinstance(d, dict):
+                    continue
                 payload = d.get("payload") or {}
+                if not isinstance(payload, dict):
+                    continue
                 wrapper_type = d.get("type")
                 ptype = payload.get("type")
                 ts = d.get("timestamp")
-                uuid = payload.get("id") or payload.get("call_id") or f"{ts}:{i}"
+                metadata = payload.get("internal_chat_message_metadata_passthrough")
+                metadata = metadata if isinstance(metadata, dict) else {}
+                current_turn = payload.get("turn_id") or metadata.get("turn_id")
+                if isinstance(current_turn, str) and current_turn:
+                    turn = current_turn
+                uuid = payload.get("id") or payload.get("call_id")
+                role = text = representation = None
 
                 if wrapper_type == "event_msg" and ptype == "user_message":
-                    text = payload.get("message", "")
-                    if text:
-                        yield Msg("user", ts, text, uuid, False)
-                    continue
+                    role, representation = "user", "legacy-user"
+                    text = self._text(payload.get("message"))
 
-                if wrapper_type == "response_item" and ptype == "message":
-                    role = payload.get("role")
-                    # Codex also stores user turns as response_item/message, but
-                    # event_msg/user_message is the cleaner user source and avoids
-                    # duplicate distill deltas.
-                    if role != "assistant":
+                elif wrapper_type == "event_msg" and ptype == "item_completed":
+                    item = payload.get("item")
+                    if not isinstance(item, dict):
                         continue
-                    text = _content_text(payload.get("content"))
-                    if text:
-                        yield Msg(role, ts, text, uuid, False)
+                    if item.get("type") == "UserMessage":
+                        role, representation = "user", "item-user"
+                    elif item.get("type") == "AgentMessage":
+                        role, representation = "assistant", "item-assistant"
+                    else:
+                        continue  # Reasoning/tool output is not user speech.
+                    uuid = item.get("id")
+                    text = self._text(item.get("content"))
+
+                elif wrapper_type == "response_item" and ptype == "message":
+                    role = payload.get("role")
+                    representation = "response-" + str(role)
+                    content = payload.get("content")
+                    if role == "user":
+                        # Codex also writes injected AGENTS/environment blocks
+                        # with role=user. Only explicit native user.text tags
+                        # authorize this fallback; event messages need no guess.
+                        kinds = metadata.get("content_item_kinds")
+                        if not isinstance(content, list) or not isinstance(kinds, list) or len(content) != len(kinds):
+                            continue
+                        content = [part for part, kind in zip(content, kinds) if kind == "user.text"]
+                    elif role != "assistant":
+                        continue
+                    text = self._text(content)
+
+                elif wrapper_type == "response_item" and ptype in ("function_call", "custom_tool_call"):
+                    name = payload.get("name") or "tool"
+                    yield Msg("assistant", ts, f"[tool:{name}]", uuid or f"{ts}:{i}", False)
                     continue
 
-                if wrapper_type == "response_item" and ptype in ("function_call", "custom_tool_call"):
-                    name = payload.get("name") or "tool"
-                    yield Msg("assistant", ts, f"[tool:{name}]", uuid, False)
+                if not text:
+                    continue
+                uuid = uuid if isinstance(uuid, str) and uuid else f"{ts}:{i}"
+                if (role, uuid) in seen_ids:
+                    continue
+                seen_ids.add((role, uuid))
+                if last_role_turn != (role, turn):
+                    mirrors = {}
+                    last_role_turn = (role, turn)
+                if role == "user":
+                    groups = mirrors.setdefault(text, [])
+                    mirror = next((group for group in groups if representation not in group), None)
+                    if mirror is None:
+                        groups.append({representation})
+                    else:
+                        mirror.add(representation)
+                        # User mirrors have different native IDs. Keep each ID
+                        # addressable without repeating speech, including when
+                        # a capture preceded the later mirror. Assistant mirrors
+                        # share IDs and were already handled by seen_ids above.
+                        text = ""
+                yield Msg(role, ts, text, uuid, False)
 
 
 def _opencode_first_str(d, *keys):
