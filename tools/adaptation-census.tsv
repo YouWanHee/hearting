@@ -83,6 +83,7 @@ utility-deferred	capability-grounding.sh
 utility-deferred	capability-route.py
 utility-deferred	capability_route.test.py
 utility-deferred	claude-session-supervisor.py
+utility-deferred	claude_project_dir.py
 utility-deferred	claude_session_supervisor.test.py
 utility-deferred	codex-app-server-supervisor.py
 utility-deferred	codex-jsonl-writer.py
