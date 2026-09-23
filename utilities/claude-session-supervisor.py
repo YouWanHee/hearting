@@ -105,11 +105,12 @@ class SubmissionNotStarted(OSError):
 
 
 def submit_turn(transport, prompt, *, session=None, args=None, timeout=60,
-                preserve_errors=False) -> TurnSubmission:
+                preserve_errors=False, max_duration=None) -> TurnSubmission:
     """Common stream/process submission seam with explicit ambiguity."""
     try:
         if hasattr(transport, "submit"):
-            value = transport.submit(prompt, timeout=timeout)
+            extra = {"max_duration": max_duration} if max_duration is not None else {}
+            value = transport.submit(prompt, timeout=timeout, **extra)
             result, rc = value if isinstance(value, tuple) else (value, 0)
             return TurnSubmission("submitted", result if isinstance(result, dict) else {}, rc)
         if hasattr(transport, "run_turn"):
@@ -1030,7 +1031,17 @@ class ClaudeStreamSession:
         # Origins of results skipped as answers to turns Claude started itself.
         self.skipped_result_origins: list[str] = []
 
-    def run_turn(self, prompt: str, timeout: float) -> tuple[dict[str, Any], int]:
+    def run_turn(
+        self, prompt: str, timeout: float, max_duration: float | None = None
+    ) -> tuple[dict[str, Any], int]:
+        """Submit one turn and read until its result.
+
+        `timeout` is an idle bound: every chunk the process writes restarts
+        it, so an owner that keeps working (polling a long run, streaming tool
+        events) is never killed for its total length, while a silent or wedged
+        process still fails. `max_duration`, when given, is the absolute
+        ceiling that bounds a turn which keeps talking but never finishes.
+        """
         if self.closed or self.process.stdin is None or self.process.stdout is None:
             raise SubmissionNotStarted("claude-stream-closed")
         turn_uuid = str(uuid.uuid4())
@@ -1057,9 +1068,12 @@ class ClaudeStreamSession:
             self.process.stdin.flush()
         except (BrokenPipeError, OSError) as exc:
             raise SupervisorError("claude-stream-write-failed") from exc
-        deadline = time.monotonic() + timeout
+        started = time.monotonic()
+        ceiling = started + max_duration if max_duration is not None else None
+        deadline = started + timeout
         while True:
-            remaining = deadline - time.monotonic()
+            limit = deadline if ceiling is None else min(deadline, ceiling)
+            remaining = limit - time.monotonic()
             if remaining <= 0:
                 raise SupervisorError("claude-turn-process-failed")
             events = self.selector.select(remaining)
@@ -1071,6 +1085,7 @@ class ClaudeStreamSession:
                 raise SupervisorError("claude-stream-read-failed") from exc
             if not chunk:
                 raise SupervisorError("claude-result-missing")
+            deadline = time.monotonic() + timeout
             self.output_buffer += chunk
             if len(self.output_buffer) > 16_777_216:
                 raise SupervisorError("claude-stream-message-oversized")
@@ -1087,9 +1102,11 @@ class ClaudeStreamSession:
                     self.skipped_result_origins.append(
                         str(origin.get("kind")) if isinstance(origin, dict) else str(origin))
 
-    def submit(self, prompt: str, *, timeout: float = 60) -> tuple[dict[str, Any], int]:
+    def submit(
+        self, prompt: str, *, timeout: float = 60, max_duration: float | None = None
+    ) -> tuple[dict[str, Any], int]:
         """Expose the common submission seam for the stream transport."""
-        return self.run_turn(prompt, timeout)
+        return self.run_turn(prompt, timeout, max_duration)
 
     def close(self) -> None:
         if self.closed:
@@ -1140,10 +1157,15 @@ def run_turn(
     stream_session: ClaudeStreamSession | None = None,
     handoff_intent: dict | None = None,
 ) -> tuple[dict[str, Any], int]:
+    # A terminal-handoff turn keeps turn_timeout as its absolute lifetime:
+    # its one-use cleanup scope expires at turn_timeout + 60 s. Every other
+    # turn is bounded by idleness plus the much larger turn ceiling.
+    max_duration = (args.turn_timeout if handoff_intent is not None
+                    else getattr(args, "turn_ceiling", None))
     if getattr(args, "runtime_harness", "claude") == "opencode":
         from opencode_session_runtime import run_turn as native_turn, OpenCodeTransportError
         try:
-            return native_turn(args, prompt, emit=emit)
+            return native_turn(args, prompt, emit=emit, max_duration=max_duration)
         except OpenCodeTransportError as exc:
             raise SupervisorError(str(exc)) from exc
     def submit(transport):
@@ -1155,7 +1177,8 @@ def run_turn(
                 raise SupervisorError("terminal-handoff-recovery-unavailable")
         submission = submit_turn(transport, prompt, session=session_id,
                                  args=args, timeout=args.turn_timeout,
-                                 preserve_errors=handoff_intent is None)
+                                 preserve_errors=handoff_intent is None,
+                                 max_duration=max_duration)
         if handoff_intent is not None:
             if submission.status != "submission-unknown":
                 budget_record.reconcile_submission(
@@ -1251,7 +1274,16 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--join-timeout", type=float, default=3600.0)
     value.add_argument("--max-join-reparks", type=int, default=6, help="Compatibility input; join deadlines no longer terminate owned work")
     value.add_argument("--max-identical-redeliveries", type=int, default=2, help="Compatibility input; delivery no longer requires model bookkeeping commands")
-    value.add_argument("--turn-timeout", type=float, default=7200.0)
+    value.add_argument(
+        "--turn-timeout", type=float, default=7200.0,
+        help="Seconds a stream turn may go without any runtime output before it "
+             "fails; output restarts the clock. The --claude-command resume-process "
+             "fallback applies it to the whole turn.",
+    )
+    value.add_argument(
+        "--turn-ceiling", type=float, default=86400.0,
+        help="Absolute seconds one turn may run even while it keeps producing output",
+    )
     value.add_argument("--max-continuations", type=positive_continuation_limit)
     value.add_argument(
         "--continuation-warning-threshold", type=int, default=3,
