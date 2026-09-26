@@ -656,12 +656,18 @@ def resolve_model_governor_root(
 
 
 class DispatchContractError(ValueError):
-    """Structured dispatch-contract failure."""
+    """Structured dispatch-contract failure.
 
-    def __init__(self, reason: str, detail: str = ""):
+    ``next_action`` is optional and set only by SD-154 route-state refusals
+    (``ROUTE_STATE_REFUSAL_REASONS``) -- every other raiser leaves it ``None``
+    and callers must tolerate that.
+    """
+
+    def __init__(self, reason: str, detail: str = "", *, next_action: str | None = None):
         super().__init__(detail or reason)
         self.reason = reason
         self.detail = detail or reason
+        self.next_action = next_action
 
 
 @dataclass(frozen=True)
@@ -1261,6 +1267,107 @@ def parse_registry_metadata(pipe: str) -> dict[str, str]:
     """Parse the stable six-column registry's comma-delimited metadata."""
 
     return dict(part.split("=", 1) for part in pipe.split(",") if "=" in part)
+
+
+# SD-156: attempt registration's source-lineage fields. One name per fact, so
+# the three wrapper scripts merge the same keys into a row's metadata instead
+# of each inventing their own -- and any future reader of an attempt row knows
+# these are the only lineage keys a registered launch may carry.
+SOURCE_LINEAGE_ROW_FIELD_KEYS = frozenset({
+    "launch_head", "source_commit_sealed", "source_commit_distance", "source_commit_branch",
+})
+
+
+def source_lineage_row_fields(route_validation_json: dict[str, object] | None) -> dict[str, str]:
+    """Attempt-registration fields from a `worker-route-guard.py validate` JSON.
+
+    `route_validation_json` is the parsed stdout of that command (the wrappers
+    already capture it as `args.route_validation`). Reads its top-level
+    `source_lineage` object (added by SD-156) and returns only the fields that
+    have a value -- a route validated before this change, or one whose cwd
+    could not verify (`kind` == `unverifiable`), carries no `observed`/
+    `distance`/`branch` and contributes nothing here.
+    """
+    lineage = (route_validation_json or {}).get("source_lineage")
+    if not isinstance(lineage, dict):
+        return {}
+    fields: dict[str, str] = {}
+    if lineage.get("observed") is not None:
+        fields["launch_head"] = str(lineage["observed"])
+    if lineage.get("sealed") is not None:
+        fields["source_commit_sealed"] = str(lineage["sealed"])
+    if lineage.get("distance") is not None:
+        fields["source_commit_distance"] = str(lineage["distance"])
+    if lineage.get("branch") is not None:
+        fields["source_commit_branch"] = str(lineage["branch"])
+    return fields
+
+
+def _diff_attribution_downstream_of_execute(route: dict[str, object], node_id: str) -> bool:
+    if node_id == "execute":
+        return False
+    by_id = {str(row.get("id")): row for row in route.get("nodes", []) if isinstance(row, dict)}
+    seen: set[str] = set()
+    stack = list((by_id.get(node_id, {}) or {}).get("depends_on", []) or [])
+    while stack:
+        dep = stack.pop()
+        if dep in seen:
+            continue
+        seen.add(dep)
+        if dep == "execute":
+            return True
+        stack.extend((by_id.get(dep, {}) or {}).get("depends_on", []) or [])
+    return False
+
+
+def _diff_attribution_execute_launch_head(jobs: Path, route: dict[str, object]) -> str | None:
+    try:
+        lines = jobs.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    latest: str | None = None
+    for line in lines:
+        fields = line.split("\t")
+        if len(fields) != 6 or fields[1] != "done":
+            continue
+        metadata = parse_registry_metadata(fields[5])
+        if metadata.get("route_id") != route.get("route_id") or metadata.get("route_node") != "execute":
+            continue
+        if metadata.get("launch_head"):
+            latest = metadata["launch_head"]
+    return latest
+
+
+def diff_attribution_lines(route: dict[str, object], node: dict[str, object], jobs: Path) -> list[str]:
+    """`diff_base`/`pre_node_commits` prompt lines for a node downstream of `execute`.
+
+    SD-156: `execute` is the mutation node, so an impl-review/test/report
+    prompt needs to know exactly which commits are that node's own diff --
+    not everything since the sealed `source_commit`, which may include a prior
+    package's commits in a serial execute chain. `diff_base` is `execute`'s
+    most recent terminal attempt's `launch_head` (the observed HEAD SD-156
+    recorded on that attempt's row); `pre_node_commits` is the first-parent
+    commits from the sealed `source_commit` up to and including `diff_base`,
+    read off the same shared `source_lineage_verdict` every other SD-156
+    consumer uses. Empty for a node that is not downstream of `execute`, or
+    when `execute` has no terminal attempt with a recorded `launch_head` yet.
+    """
+    if not _diff_attribution_downstream_of_execute(route, str(node.get("id"))):
+        return []
+    diff_base = _diff_attribution_execute_launch_head(Path(jobs), route)
+    if not diff_base:
+        return []
+    sealed = route.get("source_commit")
+    cwd = route.get("cwd")
+    pre_node_commits: tuple[str, ...] = (diff_base,)
+    if isinstance(sealed, str) and cwd:
+        verdict = _route_module().source_lineage_verdict(cwd, sealed)
+        if verdict.kind in ("descendant", "diverged") and diff_base in verdict.commits:
+            pre_node_commits = tuple(verdict.commits[: verdict.commits.index(diff_base) + 1])
+    return [
+        f"diff_base={diff_base}",
+        f"pre_node_commits={','.join(pre_node_commits)}",
+    ]
 
 
 def _parse_review_metadata(pipe: str) -> dict[str, str]:
@@ -2567,6 +2674,54 @@ PRELAUNCH_PROCESS_BLOCK_REASONS = (
     "prior-attempt-still-live",
     "prior-attempt-unverifiable",
 )
+
+# SD-154/B-2 (defect #2): every reason that means "this route's own recorded
+# state needs a person or a `revise` call, not another launch attempt". A
+# fallback surface that reads one of these off a wrapper's failure output
+# stops with `child_spawned=0` instead of descending to an inline hop --
+# `runtime-unavailable` was never true for the luna route this defect
+# observed (13.59.3 "관측"), and a new member here must be added by name so
+# an unclassified reason cannot silently fall through to the descent path.
+ROUTE_STATE_REFUSAL_REASONS = (
+    "completion-marker-missing",
+    "completion-evidence-revised-unrecorded",
+    "review-round-budget-exhausted",
+    "review-verdictless-bound",
+    "round-unsettled",
+)
+
+
+def route_state_next_action(reason: str, detail: str, route_file: str | None,
+                             node) -> str:
+    """The supported next action a route-state refusal carries (13.59.3 rule 6).
+
+    ``node`` may be a node dict or a bare node id string; only its id is used.
+    ``detail`` is the raiser's detail string (often the dependency node id for
+    `completion-marker-missing`/`completion-evidence-revised-unrecorded`).
+    """
+    node_id = node.get("id") if isinstance(node, Mapping) else node
+    target = detail or node_id or "<node>"
+    route_arg = f"--route {route_file}" if route_file else "--route <route-file>"
+    if reason == "completion-evidence-revised-unrecorded":
+        return (
+            f"capability-route.py revise {route_arg} --node {target} "
+            "--evidence <evidence-path> "
+            "--basis review-findings|user-direction|owner-correction"
+        )
+    if reason == "completion-marker-missing":
+        return (
+            f"wait for node {target} to publish a completion marker, or if its "
+            f"gate evidence already changed run: capability-route.py revise {route_arg} "
+            f"--node {target} --evidence <evidence-path> "
+            "--basis review-findings|user-direction|owner-correction"
+        )
+    if reason == "review-round-budget-exhausted":
+        return "close the node via owner-closure (review) or report the FAIL and open an SD-116 continuation (test)"
+    if reason == "review-verdictless-bound":
+        return "route the round through the sealed fallback chain's remaining unregistered hop (native-subagent, then owner-inline)"
+    if reason == "round-unsettled":
+        return "wait for the live round to settle before starting the next one"
+    return "-"
 
 
 def _parent_leader_pids(metadata: dict[str, str]) -> set[int]:
@@ -6500,6 +6655,72 @@ def _frame_pair_attempt_gate(route: dict, node: dict, markers: dict,
             raise DispatchContractError("frame-degradation-record-pending", "retry the same gate after restoring state storage")
 
 
+def evidence_digest(evidence):
+    """One sha256 over an artifact that may be a file OR a directory of files.
+
+    A worker's artifact is legitimately either shape, and the envelope inspector
+    accepts both, so the marker has to be able to name either. A directory is
+    digested over its sorted root-relative paths and contents, so the value is
+    stable across runs and changes when any member does. Symlinks are recorded by
+    their target text and never followed: a marker must describe the tree it was
+    given, not wherever that tree points today.
+
+    Anything that cannot be attested raises rather than returning a digest. In
+    particular a path that is neither a file nor a directory raises instead of
+    yielding the empty-directory constant — otherwise "deleted before the gate"
+    and "empty at completion" would verify as the same artifact. A non-regular
+    member (FIFO, socket, device) is refused rather than read: reading a FIFO
+    blocks forever, and a completion digest must not be able to wedge.
+
+    SD-154 A-SD154-8: this is the ONE place non-writer code recomputes a
+    completion marker's evidence sha256 -- `gate_currency` calls it once per
+    currency judgement, and every reader that used to keep its own
+    `hashlib.sha256(...read_bytes())` copy (`_marker_identity_row`) now reads
+    `gate_currency`'s result instead. The writer allow-list
+    (`_publish_completion_locked`, `publish_revision_locked`,
+    `write_completion_marker`, `_existing_marker_replay`,
+    `_completion_marker_replay`, `source_evidence_digest`) still calls this
+    directly because a writer computing the digest it is about to seal is not
+    the "recompute to re-verify" pattern the census closes.
+    """
+    path=Path(evidence)
+    if path.is_symlink():
+        raise ValueError(f"evidence-symlink-not-attestable:{path}")
+    if path.is_file():
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    if not path.is_dir():
+        raise ValueError(f"evidence-not-a-file-or-directory:{path}")
+    # Lazy: codex_dispatch_terminal's own import chain reaches back into this
+    # module (opencode_session_runtime -> dispatch_contract), so a top-level
+    # import here would be circular.
+    from codex_dispatch_terminal import directory_artifact_reason
+    # The SAME rule the envelope inspector applies, imported rather than
+    # restated: an empty or oversized directory must be refused at every door,
+    # including the documented manual `complete --evidence` one.
+    refusal=directory_artifact_reason(path)
+    if refusal:
+        raise ValueError(f"evidence-{refusal.removeprefix('artifact-')}:{path}")
+    digest=hashlib.sha256(b"artifact-directory-v1\0")
+    for child in sorted(path.rglob("*"), key=lambda item: item.relative_to(path).parts):
+        # `os.fsencode` and not `.encode("utf-8")`: a filename is bytes, and a
+        # non-UTF-8 name arrives surrogate-escaped and would raise on encode.
+        relative=os.fsencode(child.relative_to(path))
+        if child.is_symlink():
+            digest.update(b"L\0"+relative+b"\0"+os.fsencode(os.readlink(child)))
+        elif child.is_dir():
+            digest.update(b"D\0"+relative+b"\0")
+        elif child.is_file():
+            digest.update(b"F\0"+relative+b"\0")
+            try:
+                digest.update(hashlib.sha256(child.read_bytes()).digest())
+            except OSError as exc:
+                # Typed, never a traceback: this runs inside completion.
+                raise ValueError(f"evidence-member-unreadable:{child}") from exc
+        else:
+            raise ValueError(f"evidence-member-not-regular:{child}")
+    return digest.hexdigest()
+
+
 def completion_marker_gate(
     route_file: str | None,
     route_node: str | None,
@@ -6563,7 +6784,23 @@ def completion_marker_gate(
             missing.append(dep)
             continue
         dep_node = next((row for row in route.get("nodes", []) if row.get("id") == dep), None)
-        if dep_node is None or not completion_marker_is_current(route, dep_node, marker_path, marker):
+        if dep_node is None:
+            missing.append(dep)
+            continue
+        # `completion_marker_is_current` stays the boolean call site (several
+        # tests mock it directly); `gate_currency` only runs -- and only
+        # distinguishes "revised-unrecorded" from a harder failure -- once
+        # that boolean says not-current.
+        if not completion_marker_is_current(route, dep_node, marker_path, marker):
+            currency = gate_currency(route, dep_node, marker_path, marker)
+            if currency.state == "revised-unrecorded":
+                # SD-154 rule 6: a route-state refusal, not "missing" -- the
+                # dependency's gate evidence changed and needs `revise`, not
+                # another launch of a predecessor that already ran.
+                raise DispatchContractError(
+                    "completion-evidence-revised-unrecorded", dep,
+                    next_action=currency.next_action,
+                )
             missing.append(dep)
             continue
         markers[dep] = marker
@@ -6779,142 +7016,338 @@ def _sibling_attempt_gate(
     )
 
 
+def owner_closure_shape(metadata: Mapping[str, object]) -> str | None:
+    """The one judgement of which owner-closure a marker (or row) records.
+
+    B-1 (SD-153 defect #1): a review the owner ruled over exists in two
+    marker shapes that used to be told apart by separate call sites each
+    re-deriving the same fact -- `_marker_identity_row`'s exact_terminal
+    branch and `completion_attempt_readiness` now both call this instead of
+    repeating `marker.get("stage_authority") == "owner-closure"`.
+    `completed_marker_verdict_contradicts` reads the registry ROW, not the
+    marker, and keeps its own narrower `gate_closure == "owner-closure"`
+    check deliberately: a row can carry that one field (and be exempt from
+    the FAIL/`completed-marker` contradiction) without the fuller
+    `review_gate_closure`/`review_independence` pair a real `_complete_node_
+    locked` write always adds alongside it.
+
+    ``"continuation"``: a synthetic marker `capability-route.py`'s
+    `_publish_continuation_owner_closure` writes for a continuation's own
+    node, identified by `stage_authority == "owner-closure"`.
+
+    ``"registered-review"``: the *same* review-worker row that recorded a
+    real blocking verdict, closed in place by the owner instead of a third
+    registered round -- `resolve_review_identity`'s `owner_override` branch
+    stamps `review_gate_closure == "owner-closure"` and
+    `review_independence == "owner-overridden"` onto the marker (and, via
+    `_complete_node_locked`, onto the row).
+
+    ``None`` for an ordinary marker/row -- not owner-closed at all.
+    """
+    if metadata.get("stage_authority") == "owner-closure":
+        return "continuation"
+    if (metadata.get("review_gate_closure") == "owner-closure"
+            and metadata.get("review_independence") == "owner-overridden"):
+        return "registered-review"
+    return None
+
+
+def _marker_schema_identity_ok(
+    route: dict[str, object], node: dict[str, object], marker: dict[str, object],
+    marker_path: Path,
+) -> tuple[bool, Path | None]:
+    """Schema/identity/history-byte checks shared by every marker generation
+    (an ordinary marker, and -- recursively, SD-154 I-4 -- the marker a
+    `stage_authority=revision` marker's `revision.of_sequence` points at).
+    """
+    if not isinstance(marker, dict) or marker.get("schema_version") != 2:
+        return False, None
+    node_id = str(node["id"])
+    sequence = int(marker.get("sequence", 0))
+    if sequence < 1:
+        return False, None
+    expected = {
+        "route_id": route.get("route_id"),
+        "route_hash": route.get("route_hash"),
+        "registry_digest": route.get("registry_digest"),
+        "node_id": node_id,
+        "completion_gate": node.get("completion_gate"),
+    }
+    if any(marker.get(key) != value for key, value in expected.items()):
+        return False, None
+    history_path = marker_path.parent / f"{node_id}.{sequence}.json"
+    try:
+        history = json.loads(history_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False, None
+    if history != marker:
+        return False, None
+    return True, history_path
+
+
+def _marker_link_current(
+    route: dict[str, object], node: dict[str, object], marker: dict[str, object],
+    marker_path: Path,
+) -> bool:
+    """Owner-closure/resource-runner/owner-chain/attempt-link shape checks.
+
+    Reads only the marker's OWN recorded evidence sha256 (never the live
+    evidence file), so this is safe to call on a historical marker whose
+    evidence path may since have been overwritten by a later revision --
+    exactly the recursive "marker k" check SD-154 I-4 needs from
+    `gate_currency`.
+    """
+    node_id = str(node["id"])
+    evidence_record = marker.get("evidence") or {}
+
+    if marker.get("stage_authority") == "owner-closure":
+        _route_module().validate_continuation_owner_closure(route, node, marker)
+        if not (
+            marker.get("dispatch_depth") == node.get("dispatch_depth")
+            and marker.get("transport") == "headless"
+            and marker.get("execution_surface") == "inline"
+            and marker.get("fallback_hop") == "inline"
+        ):
+            return False
+        # Continue through the shared immutable attempt-link check below.
+        # A crash after marker publication but before its link is a hold.
+
+    if node.get("kind") == "resource-runner":
+        return (
+            marker.get("attempt_id") is None
+            and marker.get("dispatch_depth") is None
+            and marker.get("transport") is None
+            and marker.get("execution_surface") is None
+            and marker.get("registered_worker") is False
+            and marker.get("fallback_hop") is None
+        )
+
+    if marker.get("stage_authority") == "owner-chain":
+        manifest_path = Path(str(marker.get("subsession_manifest", "")))
+        if (
+            not manifest_path.is_absolute()
+            or not manifest_path.is_file()
+            or hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+            != marker.get("subsession_manifest_sha256")
+        ):
+            return False
+        manifest = load_manifest(manifest_path, node=node)
+        return (
+            manifest.get("route_id") == route.get("route_id")
+            and manifest.get("route_hash") == route.get("route_hash")
+            and manifest.get("chain_id") == marker.get("session_chain_id")
+            and marker.get("attempt_id")
+            == "att-stage-" + str(marker.get("subsession_manifest_sha256"))[:32]
+            and marker.get("dispatch_depth") == node.get("dispatch_depth")
+            and marker.get("transport") == "headless"
+            and marker.get("execution_surface") == "inline"
+            and marker.get("registered_worker") is False
+            and marker.get("fallback_hop") == "inline"
+        )
+
+    attempt_id = marker.get("attempt_id")
+    if not isinstance(attempt_id, str) or not attempt_id:
+        return False
+    axes = {
+        "attempt_schema_version": ATTEMPT_SCHEMA_VERSION,
+        "dispatch_depth": marker.get("dispatch_depth"),
+        "transport": marker.get("transport"),
+        "execution_surface": marker.get("execution_surface"),
+        "registered_worker": marker.get("registered_worker"),
+        "fallback_hop": marker.get("fallback_hop") or "",
+    }
+    validate_attempt_metadata(axes)
+    if int(axes["dispatch_depth"]) != node.get("dispatch_depth"):
+        return False
+    safe_attempt = "".join(
+        character if character.isalnum() or character in "._-" else "_"
+        for character in attempt_id
+    )
+    link_path = marker_path.parent / f"{node_id}.{safe_attempt}.attempt.json"
+    link = json.loads(link_path.read_text(encoding="utf-8"))
+    link_expected = {
+        "schema_version": 2,
+        "route_id": route.get("route_id"),
+        "node_id": node_id,
+        "attempt_id": attempt_id,
+        "dispatch_depth": marker.get("dispatch_depth"),
+        "transport": marker.get("transport"),
+        "execution_surface": marker.get("execution_surface"),
+        "registered_worker": marker.get("registered_worker"),
+        "fallback_hop": marker.get("fallback_hop"),
+        "evidence_sha256": evidence_record.get("sha256"),
+    }
+    if marker.get("stage_authority") == "owner-closure":
+        link_expected.update(stage_authority="owner-closure", owner_closure_proof=marker["owner_closure_proof"])
+    if not all(link.get(key) == value for key, value in link_expected.items()):
+        return False
+    # The link records its own absolute location as written by the marker
+    # writer, whose env may spell the same directory in pointer form while
+    # this reader resolved it (or vice versa). Identity, not spelling, is
+    # the contract, so compare through agent_home_equivalent -- the
+    # comparison-site normalizer this module defines for exactly this.
+    sequence = int(marker.get("sequence", 0))
+    history_path = marker_path.parent / f"{node_id}.{sequence}.json"
+    for key, expected_path in (
+        ("completion_marker", marker_path),
+        ("completion_marker_history", history_path),
+    ):
+        recorded = link.get(key)
+        if not isinstance(recorded, str) or not agent_home_equivalent(
+            recorded, expected_path
+        ):
+            return False
+    return True
+
+
+class GateCurrency(NamedTuple):
+    """SD-154 rule 5: the one currency judgement every reader/consumer reads.
+
+    ``state`` is one of ``current`` | ``superseded`` | ``revised-unrecorded``
+    | ``integrity-broken:<reason>`` | ``completion-evidence-unreadable``.
+    ``next_action`` is set only for ``revised-unrecorded`` (13.59.3 rule 6).
+    """
+
+    state: str
+    reason: str
+    next_action: str | None = None
+    evidence_digest: str | None = None
+
+
+def evidence_currency(
+    route: dict[str, object],
+    node: dict[str, object],
+    marker_path: Path,
+    marker: dict[str, object] | None = None,
+) -> GateCurrency:
+    """The schema/identity/tombstone/evidence-digest half of `gate_currency`.
+
+    Deliberately stops short of the attempt-link/shape proof
+    (`_marker_link_current`) -- `_marker_identity_row`'s own `passed` field
+    has always been a WEAKER claim than `completion_marker_is_current`'s (a
+    join can pass the identity row without a link file yet existing;
+    `test_ac5_owner_merge_arbitration_transaction` fixes this apart on
+    purpose), so it reads only this half. `gate_currency` calls this first
+    and adds the link proof on top for its own, stronger "current".
+    """
+    try:
+        marker = marker or json.loads(marker_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return GateCurrency("integrity-broken:history-conflict", "completion-marker-unreadable")
+    try:
+        schema_ok, _history_path = _marker_schema_identity_ok(route, node, marker, marker_path)
+    except (KeyError, TypeError, ValueError):
+        schema_ok = False
+    if not schema_ok:
+        return GateCurrency("integrity-broken:identity-mismatch", "completion-marker-identity-mismatch")
+    if marker.get("state") == "superseded-by-upstream-revision":
+        return GateCurrency("superseded", "completion-evidence-superseded")
+    evidence_record = marker.get("evidence")
+    if not isinstance(evidence_record, dict):
+        return GateCurrency("integrity-broken:identity-mismatch", "completion-marker-evidence-missing")
+    evidence_path_str = str(evidence_record.get("path") or "")
+    evidence_path = Path(evidence_path_str) if evidence_path_str else None
+    digest = None
+    if evidence_path is not None and evidence_path.is_absolute():
+        try:
+            digest = evidence_digest(evidence_path)
+        except (OSError, ValueError):
+            digest = None
+    if digest is None:
+        return GateCurrency("completion-evidence-unreadable", "completion-evidence-unreadable")
+    if digest != evidence_record.get("sha256"):
+        node_id = str(node.get("id"))
+        return GateCurrency(
+            "revised-unrecorded", "completion-evidence-revised-unrecorded",
+            route_state_next_action("completion-evidence-revised-unrecorded", node_id, None, node),
+            evidence_digest=digest,
+        )
+    return GateCurrency("current", "completion-marker-verified", evidence_digest=digest)
+
+
+def gate_currency(
+    route: dict[str, object],
+    node: dict[str, object],
+    marker_path: Path,
+    marker: dict[str, object] | None = None,
+) -> GateCurrency:
+    """Prove one completion marker current, superseded, or needing `revise`.
+
+    SD-154 rule 5: this replaces the three evidence-sha recompute copies
+    (`_marker_identity_row`, `_arbitration_observation`,
+    `completion_marker_is_current`) and the consumers that reclassified
+    `completion-evidence-hash-mismatch` by hand. Judgement order:
+    `evidence_currency` (schema/identity/history-byte -> tombstone -> live
+    evidence digest) -> shape/attempt-link -> (revision marker only) the
+    prior marker's own identity/link, recursively one step (I-4; a revision
+    chain is walked one link at a time, never more, since each revision's
+    `of_sequence` names an exact prior sequence and the chain cannot cycle).
+    """
+    try:
+        marker = marker or json.loads(marker_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return GateCurrency("integrity-broken:history-conflict", "completion-marker-unreadable")
+    base = evidence_currency(route, node, marker_path, marker)
+    if base.state != "current":
+        return base
+    evidence_record = marker.get("evidence") or {}
+    digest = base.evidence_digest
+    is_revision = marker.get("stage_authority") == "revision"
+    if not is_revision:
+        try:
+            link_ok = _marker_link_current(route, node, marker, marker_path)
+        except (DispatchContractError, KeyError, OSError, TypeError, ValueError):
+            link_ok = False
+        if not link_ok:
+            return GateCurrency("integrity-broken:identity-mismatch", "completion-marker-link-invalid")
+        return GateCurrency("current", "completion-marker-verified", evidence_digest=digest)
+
+    # SD-154 I-4: a revision marker carries no new attempt-link of its own
+    # (`attempt_id` is the original authoring attempt, provenance only) -- its
+    # own currentness rests on (a) the live evidence digest already matched
+    # above and (b) the marker it revised (`of_sequence`) still proving its
+    # OWN identity/link, recursively, one step.
+    revision = marker.get("revision") or {}
+    of_sequence = revision.get("of_sequence")
+    of_marker_sha256 = revision.get("of_marker_sha256")
+    if (
+        not isinstance(of_sequence, int)
+        or not isinstance(of_marker_sha256, str)
+        or revision.get("evidence_sha256") != evidence_record.get("sha256")
+    ):
+        return GateCurrency("integrity-broken:identity-mismatch", "revision-provenance-invalid")
+    node_id = str(node.get("id"))
+    prior_history_path = marker_path.parent / f"{node_id}.{of_sequence}.json"
+    try:
+        prior_bytes = prior_history_path.read_bytes()
+    except OSError:
+        return GateCurrency("integrity-broken:history-conflict", "canonical completion marker history conflict")
+    if hashlib.sha256(prior_bytes).hexdigest() != of_marker_sha256:
+        return GateCurrency("integrity-broken:history-conflict", "canonical completion marker history conflict")
+    try:
+        prior_marker = json.loads(prior_bytes)
+        prior_schema_ok, _ = _marker_schema_identity_ok(route, node, prior_marker, prior_history_path)
+        prior_link_ok = prior_schema_ok and _marker_link_current(route, node, prior_marker, prior_history_path)
+    except (DispatchContractError, KeyError, OSError, TypeError, ValueError):
+        prior_link_ok = False
+    if not prior_link_ok:
+        return GateCurrency("integrity-broken:identity-mismatch", "revision-predecessor-link-invalid")
+    return GateCurrency("current", "completion-marker-verified", evidence_digest=digest)
+
+
 def completion_marker_is_current(
     route: dict[str, object],
     node: dict[str, object],
     marker_path: Path,
     marker: dict[str, object] | None = None,
 ) -> bool:
-    """Prove one schema-v2 marker and its immutable history/attempt linkage."""
+    """Prove one schema-v2 marker and its immutable history/attempt linkage.
 
-    try:
-        marker = marker or json.loads(marker_path.read_text(encoding="utf-8"))
-        if not isinstance(marker, dict) or marker.get("schema_version") != 2:
-            return False
-        node_id = str(node["id"])
-        sequence = int(marker.get("sequence", 0))
-        if sequence < 1:
-            return False
-        expected = {
-            "route_id": route.get("route_id"),
-            "route_hash": route.get("route_hash"),
-            "registry_digest": route.get("registry_digest"),
-            "node_id": node_id,
-            "completion_gate": node.get("completion_gate"),
-        }
-        if any(marker.get(key) != value for key, value in expected.items()):
-            return False
-        evidence_record = marker.get("evidence")
-        if not isinstance(evidence_record, dict):
-            return False
-        evidence = Path(str(evidence_record.get("path", "")))
-        if not evidence.is_absolute() or not evidence.is_file():
-            return False
-        if hashlib.sha256(evidence.read_bytes()).hexdigest() != evidence_record.get("sha256"):
-            return False
-        history_path = marker_path.parent / f"{node_id}.{sequence}.json"
-        history = json.loads(history_path.read_text(encoding="utf-8"))
-        if history != marker:
-            return False
-
-        if marker.get("stage_authority") == "owner-closure":
-            _route_module().validate_continuation_owner_closure(route, node, marker)
-            if not (
-                marker.get("dispatch_depth") == node.get("dispatch_depth")
-                and marker.get("transport") == "headless"
-                and marker.get("execution_surface") == "inline"
-                and marker.get("fallback_hop") == "inline"
-            ):
-                return False
-            # Continue through the shared immutable attempt-link check below.
-            # A crash after marker publication but before its link is a hold.
-
-        if node.get("kind") == "resource-runner":
-            return (
-                marker.get("attempt_id") is None
-                and marker.get("dispatch_depth") is None
-                and marker.get("transport") is None
-                and marker.get("execution_surface") is None
-                and marker.get("registered_worker") is False
-                and marker.get("fallback_hop") is None
-            )
-
-        if marker.get("stage_authority") == "owner-chain":
-            manifest_path = Path(str(marker.get("subsession_manifest", "")))
-            if (
-                not manifest_path.is_absolute()
-                or not manifest_path.is_file()
-                or hashlib.sha256(manifest_path.read_bytes()).hexdigest()
-                != marker.get("subsession_manifest_sha256")
-            ):
-                return False
-            manifest = load_manifest(manifest_path, node=node)
-            return (
-                manifest.get("route_id") == route.get("route_id")
-                and manifest.get("route_hash") == route.get("route_hash")
-                and manifest.get("chain_id") == marker.get("session_chain_id")
-                and marker.get("attempt_id")
-                == "att-stage-" + str(marker.get("subsession_manifest_sha256"))[:32]
-                and marker.get("dispatch_depth") == node.get("dispatch_depth")
-                and marker.get("transport") == "headless"
-                and marker.get("execution_surface") == "inline"
-                and marker.get("registered_worker") is False
-                and marker.get("fallback_hop") == "inline"
-            )
-
-        attempt_id = marker.get("attempt_id")
-        if not isinstance(attempt_id, str) or not attempt_id:
-            return False
-        axes = {
-            "attempt_schema_version": ATTEMPT_SCHEMA_VERSION,
-            "dispatch_depth": marker.get("dispatch_depth"),
-            "transport": marker.get("transport"),
-            "execution_surface": marker.get("execution_surface"),
-            "registered_worker": marker.get("registered_worker"),
-            "fallback_hop": marker.get("fallback_hop") or "",
-        }
-        validate_attempt_metadata(axes)
-        if int(axes["dispatch_depth"]) != node.get("dispatch_depth"):
-            return False
-        safe_attempt = "".join(
-            character if character.isalnum() or character in "._-" else "_"
-            for character in attempt_id
-        )
-        link_path = marker_path.parent / f"{node_id}.{safe_attempt}.attempt.json"
-        link = json.loads(link_path.read_text(encoding="utf-8"))
-        link_expected = {
-            "schema_version": 2,
-            "route_id": route.get("route_id"),
-            "node_id": node_id,
-            "attempt_id": attempt_id,
-            "dispatch_depth": marker.get("dispatch_depth"),
-            "transport": marker.get("transport"),
-            "execution_surface": marker.get("execution_surface"),
-            "registered_worker": marker.get("registered_worker"),
-            "fallback_hop": marker.get("fallback_hop"),
-            "evidence_sha256": evidence_record.get("sha256"),
-        }
-        if marker.get("stage_authority") == "owner-closure":
-            link_expected.update(stage_authority="owner-closure", owner_closure_proof=marker["owner_closure_proof"])
-        if not all(link.get(key) == value for key, value in link_expected.items()):
-            return False
-        # The link records its own absolute location as written by the marker
-        # writer, whose env may spell the same directory in pointer form while
-        # this reader resolved it (or vice versa). Identity, not spelling, is
-        # the contract, so compare through agent_home_equivalent -- the
-        # comparison-site normalizer this module defines for exactly this.
-        for key, expected_path in (
-            ("completion_marker", marker_path),
-            ("completion_marker_history", history_path),
-        ):
-            recorded = link.get(key)
-            if not isinstance(recorded, str) or not agent_home_equivalent(
-                recorded, expected_path
-            ):
-                return False
-        return True
-    except (DispatchContractError, KeyError, OSError, TypeError, ValueError):
-        return False
+    One-line delegate (SD-154 rule 5): `gate_currency` is the only place that
+    recomputes an evidence sha256 or walks the revision chain; this keeps its
+    ten existing boolean call sites unchanged.
+    """
+    return gate_currency(route, node, marker_path, marker).state == "current"
 
 
 def completion_conflict_attempt(marker: Mapping[str, object], registry_lines: list[str]) -> str:
@@ -6967,7 +7400,7 @@ def completion_attempt_readiness(
 ) -> AttemptReadiness:
     """Combine a current semantic marker with its exact governed process state."""
 
-    if marker.get("stage_authority") == "owner-closure":
+    if owner_closure_shape(marker) == "continuation":
         try:
             _route_module().validate_continuation_owner_closure(
                 route, node, marker, jobs=jobs, lines=registry_lines, check_process=True,

@@ -6,9 +6,11 @@ separate surfaces are exercised against tmpdir fixtures only (no live
 state, no live artifact root):
 
 * `stage-session-chain.py`'s serial register loop (WP5 all-or-nothing).
-* `worker-route-guard.py`'s `planned_subsession_ok` lineage acceptance,
-  now referencing `dispatch_completion_join.SUCCESS_NOTES` instead of the
-  single literal `"completed-supervisor"` (WP6).
+* `worker-route-guard.py`'s launch guard, which accepts the moved HEAD on
+  the plain first-parent descendant lineage verdict (SD-156 retires the
+  WP6 registry-note acceptance this class originally exercised --
+  `planned_subsession_ok` and `_qualifying_subsession_lineage` are gone, and
+  a descendant HEAD now passes for any node with no registry row needed).
 """
 
 import importlib.util
@@ -138,7 +140,7 @@ class ChainHeadMovedGuardAcceptanceTest(unittest.TestCase):
         )
         return repo, route, path, jobs
 
-    def test_slice_2_validate_passes_via_planned_subsession_ok_despite_head_move(self):
+    def test_slice_2_validate_passes_via_descendant_lineage_despite_head_move(self):
         with tempfile.TemporaryDirectory() as td:
             repo, route, path, jobs = self._prep(td)
             with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs)}):
@@ -147,100 +149,47 @@ class ChainHeadMovedGuardAcceptanceTest(unittest.TestCase):
                 )
             self.assertEqual(node["id"], "execute")
 
-    def test_control_a_removing_slice_2s_own_pre_registration_row_rejects(self):
+    def test_head_move_passes_with_no_registry_or_agent_dispatch_jobs_at_all(self):
+        # SD-156: the registry rows this class used to write (slice 1's own
+        # note, slice 2's pre-registration) are no longer read by the launch
+        # guard at all -- a descendant HEAD passes even with an empty
+        # registry and `AGENT_DISPATCH_JOBS` unset entirely. What the WP5/WP6
+        # regression actually needs covered (a moved HEAD from an earlier
+        # slice's commit does not stale the next slice) survives on the
+        # lineage verdict alone.
         with tempfile.TemporaryDirectory() as td:
             repo, route, path, jobs = self._prep(td)
-            # Rewrite the registry without slice 2's own row -- the sole
-            # thing this control changes.
-            lines = [
-                line for line in jobs.read_text(encoding="utf-8").splitlines()
-                if "attempt_id=att-slice-2" not in line
-            ]
-            jobs.write_text("\n".join(lines) + ("\n" if lines else ""))
-            with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs)}):
-                with self.assertRaises(GUARD.WorkerRouteError) as ctx:
-                    GUARD.validate_route_contract(
-                        path, "execute", repo, repo, current_attempt="att-slice-2",
-                    )
-            self.assertEqual(ctx.exception.reason, "route-source-commit-mismatch")
-
-    def test_control_b_slice_1_note_outside_success_notes_rejects(self):
-        with tempfile.TemporaryDirectory() as td:
-            repo, route, path, jobs = self._prep(td, prior_note="in-progress")
-            with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs)}):
-                with self.assertRaises(GUARD.WorkerRouteError) as ctx:
-                    GUARD.validate_route_contract(
-                        path, "execute", repo, repo, current_attempt="att-slice-2",
-                    )
-            self.assertEqual(ctx.exception.reason, "route-source-commit-mismatch")
-
-    def test_wp6_accepts_the_second_success_note_completed_marker(self):
-        with tempfile.TemporaryDirectory() as td:
-            repo, route, path, jobs = self._prep(td, prior_note="completed-marker")
-            with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs)}):
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("AGENT_DISPATCH_JOBS", None)
                 _, node, _ = GUARD.validate_route_contract(
                     path, "execute", repo, repo, current_attempt="att-slice-2",
                 )
             self.assertEqual(node["id"], "execute")
 
-    def test_missing_agent_dispatch_jobs_rejects_for_a_different_reason(self):
-        # §7-9: a missing AGENT_DISPATCH_JOBS silently makes
-        # _qualifying_subsession_lineage() return False, so the same typed
-        # reason as the real accept/refuse cases must not appear here for
-        # the wrong underlying cause. This asserts only that this refusal is
-        # (a) still a refusal and (b) does not accidentally read the guard's
-        # git-lineage evidence as satisfied any other way -- the top-level
-        # exception type and reason string are identical to the other
-        # rejections above (worker-route-guard.py has exactly one typed
-        # reason for the whole mutating-scope branch), so what actually
-        # distinguishes "missing env" from "bad lineage" is that removing
-        # AGENT_DISPATCH_JOBS refuses even when every registry row above is
-        # otherwise perfectly valid.
+    def test_diverged_head_still_rejects_regardless_of_registry_rows(self):
+        # The retired control tests asserted a refusal driven by registry
+        # content (missing pre-registration row, a note outside
+        # SUCCESS_NOTES). That distinction is gone; what still refuses is a
+        # genuinely diverged HEAD (rewritten, not a first-parent descendant
+        # of the sealed commit) -- with the exact same fully-valid registry
+        # fixture this class otherwise uses to show a pass.
         with tempfile.TemporaryDirectory() as td:
             repo, route, path, jobs = self._prep(td)
-            with mock.patch.dict(os.environ, {}, clear=False):
-                os.environ.pop("AGENT_DISPATCH_JOBS", None)
+            # Rewrite the sealed root commit itself (not slice 1's commit on
+            # top of it), so the observed HEAD shares no first-parent history
+            # with `route["source_commit"]` at all.
+            subprocess.run(
+                ["git", "-C", str(repo), "reset", "-q", "--hard", route["source_commit"]], check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo), "commit", "--amend", "-qm", "rewritten"], check=True,
+            )
+            with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs)}):
                 with self.assertRaises(GUARD.WorkerRouteError) as ctx:
                     GUARD.validate_route_contract(
                         path, "execute", repo, repo, current_attempt="att-slice-2",
                     )
             self.assertEqual(ctx.exception.reason, "route-source-commit-mismatch")
-
-    def test_missing_agent_dispatch_jobs_short_circuits_before_reading_any_registry_row(self):
-        # impl-review round 1 finding 4: the previous version of this test
-        # only asserted the same top-level `route-source-commit-mismatch`
-        # reason as `test_control_a_...`/`test_control_b_...` above, which
-        # would also pass if a future regression made the missing-env case
-        # fall through to the genuine lineage evaluation and coincidentally
-        # fail there too -- it would pass for the wrong reason. This asserts
-        # the lineage helper's own result and internal short-circuit
-        # directly: with `AGENT_DISPATCH_JOBS` unset, `_qualifying_subsession_lineage()`
-        # returns `False` from its very first guard clause and never calls
-        # `FALLBACK.registry_rows()` at all -- unlike a genuine lineage
-        # mismatch (control A/B), which always reads the registry and then
-        # evaluates row content.
-        with tempfile.TemporaryDirectory() as td:
-            repo, route, path, jobs = self._prep(td)
-            with mock.patch.dict(os.environ, {}, clear=False):
-                os.environ.pop("AGENT_DISPATCH_JOBS", None)
-                with mock.patch.object(GUARD.FALLBACK, "registry_rows") as registry_rows:
-                    result = GUARD._qualifying_subsession_lineage(
-                        route["route_id"], "execute", "att-slice-2",
-                    )
-            self.assertFalse(result)
-            registry_rows.assert_not_called()
-
-        # Control: with the same otherwise-valid fixture and
-        # `AGENT_DISPATCH_JOBS` set, the same helper reads the registry and
-        # accepts -- proving the missing-env `False` above is a distinct
-        # code path, not a coincidentally-identical lineage refusal.
-        with tempfile.TemporaryDirectory() as td:
-            repo, route, path, jobs = self._prep(td)
-            with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs)}):
-                result = GUARD._qualifying_subsession_lineage(
-                    route["route_id"], "execute", "att-slice-2",
-                )
-            self.assertTrue(result)
 
 
 class ChainSerialRegisterAtomicityTest(unittest.TestCase):

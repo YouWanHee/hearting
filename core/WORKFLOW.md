@@ -459,7 +459,12 @@ the route outcome's `review_independence_degraded`, or a
 the node. That list covers both `degraded` (the owner reviewed its own work) and
 `owner-overridden` (the owner ruled over a review that returned FAIL). Either is
 a real result and neither blocks the route, but reporting it as review would
-make "reviewed" mean nothing (`OPERATIONS §5.10`, SD-OPEN-41(b)).
+make "reviewed" mean nothing (`OPERATIONS §5.10`, SD-OPEN-41(b)). Within the
+`degraded` case, a marker whose `round_census.closure_class` reads
+`owner-override-unlinked` names the sharper shape — an inline completion that
+landed directly over an unresolved blocking FAIL without the evidence-linked
+owner-closure procedure — and `검증` should say so by that name (SD-153 rule 5,
+SD-134 A75-9).
 
 For dispatched work, the parent follows the runtime's next-action receipt and
 checks the completed artifact before reporting. Normal success needs no harvest.

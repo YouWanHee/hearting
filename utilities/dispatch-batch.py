@@ -36,6 +36,8 @@ from dispatch_contract import (  # noqa: E402
     resolve_global_registry,
     resolve_live_parent_attempt,
     resolve_model_governor_root,
+    ROUTE_STATE_REFUSAL_REASONS,
+    route_state_next_action,
     validate_attempt_metadata,
     validate_dispatch_log_dir,
 )
@@ -1935,22 +1937,45 @@ def main(argv: list[str] | None = None) -> int:
         # realized parallel_group leg bypasses that wrapper entirely -- check
         # every capped leg here too, before the atomic reservation, so one leg
         # over budget refuses the whole group (child 0), not just that leg.
+        # SD-153: `admit_round` (budget half) is the one admission decision
+        # every registered launch surface reads -- this pre-check and
+        # dispatch-node.py's own admission (which the leg launch below still
+        # goes through) must agree, so this no longer keeps its own
+        # `len(prior)+1 > max_round` comparison.
         for capped_node in nodes:
             capped_node_id = str(capped_node["id"])
             if capped_node_id not in DISPATCH_NODE.ROUND_CAPPED_NODE_IDS:
                 continue
-            prior = DISPATCH_NODE.prior_round_attempts(
-                jobs, route["route_id"], capped_node_id,
-                route=route if capped_node.get("kind") == "review-worker" else None,
-            )
-            round_no = len(prior) + 1
-            max_round = DISPATCH_NODE.max_review_rounds(route["effective_intensity"])
-            if round_no > max_round:
+            budget = DISPATCH_NODE.admit_round(
+                route, capped_node, jobs,
+                owner_attempt_id=os.environ.get("AGENT_DISPATCH_ATTEMPT_ID"),
+            ).budget
+            if budget.state == "blocked-live":
+                raise BatchError(
+                    "prior-attempt-still-live",
+                    f"route_id={route['route_id']} route_node={capped_node_id}",
+                    route_node=capped_node_id,
+                )
+            if budget.state == "blocked-unsettled":
+                raise BatchError(
+                    "round-unsettled",
+                    f"route_id={route['route_id']} route_node={capped_node_id}",
+                    route_node=capped_node_id,
+                )
+            if budget.state == "exhausted":
                 raise BatchError(
                     "review-round-budget-exhausted",
                     f"route_id={route['route_id']} route_node={capped_node_id} "
                     f"effective_intensity={route['effective_intensity']} "
-                    f"round={round_no} max_round={max_round}",
+                    f"round={budget.next_round} max_round={budget.cap}",
+                    route_node=capped_node_id,
+                )
+            if budget.state == "verdictless-bound":
+                raise BatchError(
+                    "review-verdictless-bound",
+                    f"route_id={route['route_id']} route_node={capped_node_id} "
+                    f"effective_intensity={route['effective_intensity']} "
+                    f"round={budget.next_round} max_round={budget.cap}",
                     route_node=capped_node_id,
                 )
         assignments, independence, diagnostics = assign_harnesses(
@@ -2011,14 +2036,18 @@ def main(argv: list[str] | None = None) -> int:
         # only on the exception object and died here, leaving PRD 13.30.2's "no
         # silent path" with nothing typed anywhere in the cycle.
         extra = {}
-        if reason == "review-round-budget-exhausted":
+        if reason in {"review-round-budget-exhausted", "review-verdictless-bound"}:
             capped = next((n for n in nodes if n["id"] == getattr(exc, "route_node", None)), {})
-            extra.update(DISPATCH_NODE.review_budget_recovery_fields(capped.get("kind")))
+            state = "verdictless-bound" if reason == "review-verdictless-bound" else "exhausted"
+            extra.update(DISPATCH_NODE.review_budget_recovery_fields(capped.get("kind"), state))
+        # `ROUTE_STATE_REFUSAL_REASONS` membership, not literal reason
+        # strings: the static guardian in `dispatch_completion_marker.test.py`
+        # keeps the gate's own missing-dependency reason inside
+        # `dispatch_contract.py` and the adapters' generic relay only.
         if reason in {
             "launch-runtime-root-mismatch",
             "launch-compatibility-tuple-required",
-            "review-round-budget-exhausted",
-        }:
+        } or reason in ROUTE_STATE_REFUSAL_REASONS:
             extra.update({
                 "admitted": "0",
                 "spawned": "0",
@@ -2026,6 +2055,15 @@ def main(argv: list[str] | None = None) -> int:
                 "started": "0",
                 "child_spawned": "0",
             })
+        # SD-154/B-2 (defect #2): a route-state refusal carries a supported
+        # next action rather than descending toward inline. `next_action` is
+        # not in `extra` already only for `review-verdictless-bound`, whose
+        # `review_budget_recovery_fields` above already supplies one.
+        if reason in ROUTE_STATE_REFUSAL_REASONS and "next_action" not in extra:
+            node_hint = getattr(exc, "route_node", None) or detail
+            extra["next_action"] = getattr(exc, "next_action", None) or route_state_next_action(
+                reason, detail, str(route_path), node_hint,
+            )
         degradation_reason = getattr(exc, "degradation_reason", None)
         if degradation_reason:
             extra["degradation_reason"] = degradation_reason

@@ -3,6 +3,7 @@
 from __future__ import annotations
 import argparse, base64, contextlib, fcntl, functools, hashlib, importlib.util, json, os, re, shlex, shutil, subprocess, sys, tempfile, uuid
 from pathlib import Path
+from typing import NamedTuple
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location("capability_topology", ROOT/"tools/capability_topology.py")
@@ -13,6 +14,7 @@ VALID_AFFINITY = DEFAULTS.AFFINITY_VALUES | {"unspecified"}
 sys.path.insert(0, str(ROOT/"utilities"))
 import artifact_locator as ARTIFACT_LOCATOR
 import route_identity as ROUTE_IDENTITY
+import route_lineage as ROUTE_LINEAGE
 import dispatch_runtime_support as RUNTIME_SUPPORT
 import dispatch_terminal_commit
 import model_profile as PROFILE
@@ -42,6 +44,13 @@ from dispatch_contract import (
     completion_marker_is_current,
     completion_attempt_readiness,
     completion_conflict_attempt,
+    owner_closure_shape,
+    _diff_attribution_execute_launch_head,
+    evidence_digest,
+    evidence_currency,
+    gate_currency,
+    ROUTE_STATE_REFUSAL_REASONS,
+    route_state_next_action,
     dispatch_state_roots,
     ensure_global_registry_writable,
     parse_registry_metadata,
@@ -57,7 +66,6 @@ from dispatch_degradation import record_degradation  # noqa: E402
 from dispatch_completion_join import materialize_after_terminal_close  # noqa: E402
 from codex_dispatch_terminal import (  # noqa: E402
     REVIEW_BLOCKING_NOTE,
-    directory_artifact_reason,
     inspect_terminal_attempt,
 )
 from replica_batch_contract import verify_manifest as verify_batch_manifest  # noqa: E402
@@ -166,6 +174,10 @@ def _validate_registered_headless_evidence(evidence):
 
 canonical = ROUTE_IDENTITY.canonical
 route_hash = ROUTE_IDENTITY.route_hash
+# SD-155: one lineage walk, one canonical-path derivation -- re-exported, not
+# redefined, so `ROUTE.verified_route_lineage is route_lineage.verified_route_lineage`.
+verified_route_lineage = ROUTE_LINEAGE.verified_route_lineage
+RouteLineageError = ROUTE_LINEAGE.RouteLineageError
 
 def route_family_key(capability,cwd,capability_mode,owner_attempt_id):
     payload=[capability,str(cwd),capability_mode,owner_attempt_id]
@@ -438,24 +450,99 @@ def _inside_git_worktree(path):
         return False
     return proc.returncode==0 and proc.stdout.strip()=="true"
 
-def _first_parent_contains(path, ancestor, descendant):
-    """True when `ancestor` is on `descendant`'s first-parent line in this tree.
+SOURCE_LINEAGE_GIT_TIMEOUT=30
 
-    One probe for the whole file: `_grounding_cwd_lineage_ok` (sealed-vs-fresh
-    grounding) and the continuation pin rebind ask the same git question, and a
-    second copy would be a second place to forget the timeout.
+class SourceLineage(NamedTuple):
+    """One first-parent lineage verdict against a worktree's live HEAD.
+
+    `kind` is `"exact"` (HEAD is the sealed commit), `"descendant"` (HEAD is a
+    first-parent descendant of it -- the mutation-worktree, mid-cycle-progress
+    shape SD-67/SD-107 named), `"diverged"` (HEAD is neither), or
+    `"unverifiable"` (the question could not be asked at all; `reason` names
+    why: `git-timeout`, `git-failed`, `unsafe-git-operation`,
+    `unsafe-git-state`, `not-a-repo`). `commits[0]` is the observed HEAD
+    whenever `kind` is `"descendant"` or `"diverged"`; `distance` counts the
+    commits ahead of the sealed one along that line.
     """
+    kind: str
+    distance: "int | None"
+    commits: tuple
+    branch: "str | None"
+    reason: "str | None"
+
+def _source_lineage_unverifiable(reason):
+    return SourceLineage("unverifiable",None,(),None,reason)
+
+def source_lineage_verdict(cwd, sealed_commit, *, timeout=SOURCE_LINEAGE_GIT_TIMEOUT):
+    """The one first-parent lineage probe every SD-156 consumer shares.
+
+    `worker-route-guard.py`'s mutation gate, the session hook's staleness
+    check, and `_grounding_cwd_lineage_ok`'s sealed-vs-fresh grounding compare
+    each asked "is the sealed commit an ancestor of the live worktree HEAD"
+    with their own copy of the same git calls -- three places to forget a
+    timeout, and three places that could (and once did, defect C) disagree
+    about what counts as an answer. This is the one probe: `rev-parse
+    --git-dir` (repo existence), `rev-list --first-parent HEAD` (the lineage
+    itself, whose first line is the observed commit), and -- only when HEAD is
+    not the sealed commit itself -- an in-progress-operation check via the
+    git-dir's sidecar files and `rev-parse --abbrev-ref HEAD` (branch;
+    detached HEAD reports the literal string `"HEAD"`).
+
+    The safety checks run only for a HEAD that differs from the sealed commit:
+    accepting drift as legitimate forward progress is the risky question a
+    mid-merge or detached checkout should block, not observing that nothing
+    moved at all -- a linked worktree checked out detached at its own sealed
+    commit (a real, supported shape; `git worktree add <dir> HEAD` produces
+    exactly this) must still verify `exact`.
+    """
+    cwd=Path(cwd)
+    def probe(*args):
+        return subprocess.run(["git","-C",str(cwd),*args],text=True,capture_output=True,timeout=timeout)
     try:
-        probe=subprocess.run(
-            ["git","-C",str(path),"rev-list","--first-parent",descendant],
-            text=True,capture_output=True,timeout=30,
-        )
+        git_dir_probe=probe("rev-parse","--git-dir")
+    except subprocess.TimeoutExpired:
+        return _source_lineage_unverifiable("git-timeout")
     except (OSError,subprocess.SubprocessError):
-        # Same set as `_inside_git_worktree`: two probes of the same shape must
-        # not disagree about what counts as "cannot answer" (round 3, S4).
-        # `TimeoutExpired` is a `SubprocessError`, so this only widens.
-        return False
-    return probe.returncode == 0 and ancestor in probe.stdout.split()
+        return _source_lineage_unverifiable("git-failed")
+    if git_dir_probe.returncode != 0:
+        return _source_lineage_unverifiable("not-a-repo")
+    git_dir=Path(git_dir_probe.stdout.strip())
+    if not git_dir.is_absolute():
+        git_dir=cwd/git_dir
+    try:
+        list_probe=probe("rev-list","--first-parent","HEAD")
+    except subprocess.TimeoutExpired:
+        return _source_lineage_unverifiable("git-timeout")
+    except (OSError,subprocess.SubprocessError):
+        return _source_lineage_unverifiable("git-failed")
+    if list_probe.returncode != 0:
+        return _source_lineage_unverifiable("git-failed")
+    commits=list_probe.stdout.split()
+    if not commits:
+        return _source_lineage_unverifiable("git-failed")
+    if sealed_commit == commits[0]:
+        return SourceLineage("exact",0,(),None,None)
+    if (
+        (git_dir/"MERGE_HEAD").exists()
+        or (git_dir/"rebase-merge").exists() or (git_dir/"rebase-apply").exists()
+        or (git_dir/"CHERRY_PICK_HEAD").exists()
+    ):
+        return _source_lineage_unverifiable("unsafe-git-operation")
+    try:
+        branch_probe=probe("rev-parse","--abbrev-ref","HEAD")
+    except subprocess.TimeoutExpired:
+        return _source_lineage_unverifiable("git-timeout")
+    except (OSError,subprocess.SubprocessError):
+        return _source_lineage_unverifiable("git-failed")
+    if branch_probe.returncode != 0:
+        return _source_lineage_unverifiable("git-failed")
+    branch=branch_probe.stdout.strip()
+    if branch == "HEAD":
+        return _source_lineage_unverifiable("unsafe-git-state")
+    if sealed_commit in commits:
+        distance=commits.index(sealed_commit)
+        return SourceLineage("descendant",distance,tuple(commits[:distance]),branch,None)
+    return SourceLineage("diverged",None,tuple(commits),branch,None)
 
 def _grounding_cwd_lineage_ok(path, sealed_release, actual_release):
     """SD-107 × SD-67/69: the route cwd is the mutation worktree, so its HEAD legitimately
@@ -473,7 +560,7 @@ def _grounding_cwd_lineage_ok(path, sealed_release, actual_release):
         return False
     if sealed == actual:
         return True
-    return _first_parent_contains(path,sealed,actual)
+    return source_lineage_verdict(path,sealed).kind == "descendant"
 
 def _jobs_path_alias_relieves_mismatch(route, expected, actual):
     """SD-112 §13.33.2-(3) decision 1: a `jobs_path`-only mismatch may be
@@ -1097,18 +1184,12 @@ def build_continuation_route(
         for key in ("profile_demands", "explicit_profiles"):
             route[key] = {k: v for k, v in route.get(key, {}).items() if k in retained}
     # Defect C: the pin must name the same commit the grounding tuple above sealed.
-    source_commit,source_commit_rebind,rebind_declined=_continuation_source_commit(
-        source_route,route_nodes,
-    )
+    source_commit,source_commit_rebind=_continuation_source_commit(source_route)
     if source_commit is not None:
         route["source_commit"]=source_commit
     if source_commit_rebind is not None:
         route["source_commit_rebind"]=source_commit_rebind
-    if not rebind_declined:
-        # A declined rebind deliberately keeps the older pin (an SD-67 retry the
-        # launch guard must adjudicate), so pin and grounding legitimately differ
-        # there and only there.
-        _assert_pin_matches_grounding(route.get("source_commit"),launch)
+    _assert_pin_matches_grounding(route.get("source_commit"),launch)
     route["artifact_root"]=str(Path(artifact_root).resolve(strict=False))
     route["nodes"]=route_nodes
     # A continuation is a suffix, not a copy of the source graph. An entry gate
@@ -1250,7 +1331,10 @@ def _verify_continuation_route(route):
         # same lineage against real HEAD before anything dispatches -- so an
         # unanswerable probe is skipped, never guessed at.
         cwd=Path(str(route.get("cwd") or ""))
-        if _inside_git_worktree(cwd) and not _first_parent_contains(cwd,inherited,rebound):
+        if (
+            _inside_git_worktree(cwd)
+            and source_lineage_verdict(cwd,inherited).kind not in ("exact","descendant")
+        ):
             raise ValueError("continuation-source-commit-rebind-lineage-unproven")
     _validate_output_scopes(route.get("nodes",[]))
     return route
@@ -1276,6 +1360,38 @@ def publish_continuation_route(route,source_route,output_path):
         raise ValueError("route-output-alias-basename")
     write_once(path,route)
     return path
+
+def bind_continuation_cycle(artifact_root,source_route,route):
+    """D-120: extend the source route's open cycle binding to a fresh continuation.
+
+    Runs immediately after `publish_continuation_route` lands the new route
+    file. If the source route's verified lineage has no open producer cycle,
+    there is nothing to extend -- an ordinary unbound continuation. If it does,
+    the new route is judged by the same `cycle_route_admission` every write
+    site uses; only an `allow` verdict appends to the audit record
+    (`bind_cycle_route`). A denial (a fork, a material-input change) never
+    blocks publication -- the route is already on disk -- it only rides back
+    as an advisory (D-120 "분기의 정직 표기").
+    """
+    from artifact_producer import ProducerError, bind_cycle_route, route_cycle_for
+    root=Path(artifact_root)
+    try:
+        record=route_cycle_for(root,source_route)
+    except ProducerError as exc:
+        return {"bound":False,"cycle_id":None,"advisory":exc.code}
+    if record is None:
+        return {"bound":False,"cycle_id":None,"advisory":None}
+    try:
+        result=bind_cycle_route(root,record["cycle_id"],route)
+    except ProducerError as exc:
+        # D-120: publication itself is never blocked by a denied bind -- a
+        # sibling fork's *publish-time* advisory is the distinct token
+        # `cycle-lineage-fork`; the *write-time* refusal later (an actual
+        # attempt to write the cycle from either branch) stays
+        # `cycle-route-binding-mismatch:lineage-fork`.
+        advisory = "cycle-lineage-fork" if exc.code == "cycle-route-binding-mismatch:lineage-fork" else exc.code
+        return {"bound":False,"cycle_id":record["cycle_id"],"advisory":advisory}
+    return {"bound":True,"cycle_id":record["cycle_id"],"advisory":result.get("advisory")}
 
 def _git_commit(cwd):
     p=subprocess.run(["git","-C",str(cwd),"rev-parse","HEAD"],text=True,capture_output=True)
@@ -1311,120 +1427,6 @@ def _stage_fallback():
         _STAGE_FALLBACK=module
     return _STAGE_FALLBACK
 
-def continuation_lineage_route_ids(source_route):
-    """Every route id in this continuation's lineage, nearest ancestor first.
-
-    Shared with `worker-route-guard.py`, which asks the same question from the
-    other side: the builder needs it to decide whether to keep a pin, the guard
-    needs it to find the retry evidence that pin implies (SD-133). One
-    definition, so the two can never disagree about what an ancestor is.
-
-    A declined continuation records no attempts of its own, so asking the
-    registry only about the immediate predecessor finds a clean slate one
-    generation later and the decline evaporates (SD-128 review round 3, B1).
-    The lineage is already carried: `source_route_id` names the predecessor and
-    `supersession_edges` accumulates every earlier `from_route_id`.
-
-    `source_route_id` and the first edge name the same route, so for a
-    first-generation continuation they are redundant. They stop being redundant
-    at the second generation, where a grandparent is reachable **only** through
-    an inherited edge -- and that is the common shape, not the exception.
-    """
-    ids=[]
-    candidates=[source_route.get("route_id"),source_route.get("source_route_id")]
-    for edge in (source_route.get("supersession_edges") or []):
-        if isinstance(edge,dict):
-            candidates.append(edge.get("from_route_id"))
-    for value in candidates:
-        if isinstance(value,str) and value and value not in ids:
-            ids.append(value)
-    return ids
-
-def _authoritative_lineage_registry(source_route):
-    """The registry this lineage provably wrote to, or None if unprovable.
-
-    Deliberately stricter than `_continuation_source_jobs`, which may fall
-    through to the live canonical registry so that a continuation can still read
-    *migrated markers* when a sealed release tree is pruned. Markers carry their
-    own route binding and attempt link, so that substitution is safe there. Here
-    the evidence is the **absence** of a row, and absence read out of a registry
-    this lineage never wrote to is not evidence at all (review round 3, B2a: the
-    compat window silently answers from a different `jobs.log`, which exists and
-    is a regular file, and reports no rows).
-
-    Only `exact` and `aliased` resolutions are accepted -- `aliased` because the
-    migration journal digest-verifies the substitution.
-    """
-    jobs=(
-        ((source_route.get("launch_compatibility_tuple") or {}).get("jobs_path") or {})
-        .get("path")
-    )
-    if not isinstance(jobs,str) or not jobs or not Path(jobs).is_absolute():
-        return None
-    try:
-        sealed=Path(jobs).expanduser().resolve(strict=False)
-        resolution=resolve_dangling_registry(sealed)
-    except (OSError,ValueError,DispatchContractError):
-        return None
-    if resolution.status=="exact":
-        return sealed
-    if resolution.status=="aliased":
-        return resolution.jobs_path
-    return None
-
-def _prior_registry_attempt(source_route, node_id):
-    """Did this continuation's lineage already record an attempt on this node?
-
-    **Fail closed.** The rebind is declined -- return True -- whenever the answer
-    cannot be *proved* negative. Three things must all hold before an absent row
-    is read as "this node never ran":
-
-    1. the registry is provably the one the lineage wrote to
-       (`_authoritative_lineage_registry`),
-    2. the lineage is non-empty, and
-    3. that registry actually contains at least one row for the lineage.
-
-    (3) is what separates "no attempt on this node" from "this registry never saw
-    this route". `registry_rows` returns `[]` for a missing file and for a
-    truncated one alike, so an empty read is ambiguous by construction -- and
-    deleting or truncating `jobs.log` is exactly the shape an operator produces
-    (review round 3, B2b). Declining on an unprovable answer is never worse than
-    the behaviour before defect C was fixed: the pin simply stays inherited.
-    """
-    jobs=_authoritative_lineage_registry(source_route)
-    if jobs is None:
-        return True
-    lineage=continuation_lineage_route_ids(source_route)
-    if not lineage:
-        return True
-    try:
-        rows=_stage_fallback().registry_route_rows(jobs,lineage)
-    except (OSError,ValueError):
-        return True
-    if not rows:
-        return True
-    return any(
-        row.get("attempt_id") and row.get("route_node")==str(node_id)
-        for row in rows
-    )
-
-def _retry_mutation_node(source_route, continuation_nodes):
-    """The first node this continuation re-runs that is an SD-67 mutation retry.
-
-    Not just the resume node: a continuation resuming at `plan` still carries
-    `execute`, and in a real `autopilot-code` route `execute` is the only
-    worktree-mutating node. Asking about the resume node alone let a plan-time
-    resume re-pin the route, after which `execute` met `head == source_commit`
-    and passed the guard on the trivial branch -- walking past the very gate
-    the decline exists to protect (review round 2, B1).
-    """
-    for node in continuation_nodes or ():
-        if not _node_mutates_worktree(node):
-            continue
-        if _prior_registry_attempt(source_route,node.get("id")):
-            return node
-    return None
-
 _COMMIT_SHA=re.compile(r"[0-9a-f]{40}")
 
 def _assert_pin_matches_grounding(source_commit, launch):
@@ -1448,8 +1450,8 @@ def _assert_pin_matches_grounding(source_commit, launch):
             f"continuation-source-commit-grounding-mismatch: pin={source_commit} grounding={base}"
         )
 
-def _continuation_source_commit(source_route, continuation_nodes):
-    """Seal the resume-time HEAD as the continuation's `source_commit`.
+def _continuation_source_commit(source_route):
+    """Reseal the resume-time HEAD as the continuation's `source_commit`.
 
     The source route pinned the HEAD it was compiled at, but a continuation seals
     the *current* worktree HEAD into `launch_compatibility_tuple.grounding_roots.cwd`.
@@ -1458,45 +1460,40 @@ def _continuation_source_commit(source_route, continuation_nodes):
     with `route-source-commit-mismatch` (defect C, route rt-d7541f1033ae677f).
     Two sources, one value: the pin and the grounding must name the same commit.
 
-    Returns `(source_commit, rebind_record, rebind_declined)`.
+    SD-156 retires the SD-67/SD-128/SD-133 decline branch this function used to
+    carry: a continuation now always re-pins to the observed HEAD when it is the
+    sealed commit itself or a first-parent descendant of it
+    (`source_lineage_verdict` kind `exact`/`descendant`). `worker-route-guard.py`
+    is the one place that adjudicates a moved HEAD now, on the same lineage
+    verdict, regardless of node position or prior registry attempts -- there is
+    no longer a "mutation retry" this builder must protect by refusing to move
+    the pin. A diverged HEAD (rewritten, reset, unrelated history) still refuses
+    outright; an unverifiable tree (non-git, mid-merge, timeout) leaves the pin
+    untouched, exactly as an unresolvable `git rev-parse HEAD` did before.
 
-    The rebind is **declined** -- the inherited pin is kept, exactly as before this
-    fix -- when *any* node this continuation will re-run mutates the worktree and
-    the source route already recorded an attempt on it. That is SD-67's mutation
-    retry, whose evidence gate lives in `worker-route-guard.py`. Re-pinning there
-    would let a continuation launder a retry past that gate, which
-    `OPERATIONS §5.10` forbids ("never re-pin the route to manufacture this
-    evidence").
-
-    A declined rebind **refuses** the mutation node; it does not hand it to an
-    adjudicating guard. The guard looks its retry evidence up under
-    `route["route_id"]`, which is the continuation's own id, while the prior rows
-    were written under the source route's -- so it finds none and raises
-    `route-source-commit-mismatch`. That is precisely what main does today, so
-    declining is never a regression, but the operator is refused rather than
-    adjudicated. Teaching the guard to follow `source_route_id` is a separate
-    change with its own spec question, not something to smuggle in here.
+    Returns `(source_commit, rebind_record)`; `rebind_record` is `None` when the
+    pin is unchanged.
     """
     inherited=source_route.get("source_commit")
     cwd=source_route.get("cwd")
     if not inherited or not cwd:
-        return inherited,None,False
-    if _retry_mutation_node(source_route,continuation_nodes) is not None:
-        return inherited,None,True
-    head=_git_commit(cwd)
-    if head == inherited or head == "unversioned" or inherited == "unversioned":
-        return inherited,None,False
-    if not _first_parent_contains(cwd,inherited,head):
+        return inherited,None
+    verdict=source_lineage_verdict(cwd,inherited)
+    if verdict.kind in ("exact","unverifiable"):
+        return inherited,None
+    if verdict.kind == "diverged":
+        observed=verdict.commits[0] if verdict.commits else _git_commit(cwd)
         raise ValueError(
-            f"continuation-source-commit-diverged: expected={inherited} observed={head}"
+            f"continuation-source-commit-diverged: expected={inherited} observed={observed}"
         )
+    head=verdict.commits[0]
     return head,{
         "contract_version":CONTINUATION_SOURCE_COMMIT_REBIND_VERSION,
         "inherited_source_commit":inherited,
         "rebound_source_commit":head,
         "basis":"first-parent-descendant",
         "cwd":str(Path(cwd).resolve(strict=False)),
-    },False
+    }
 
 def _validate_tracking_evidence(tracking, evidence):
     if tracking not in TRACKING: raise ValueError("invalid tracking value")
@@ -3865,8 +3862,7 @@ def terminal_gate_proven(gates):
 def canonical_routes_dir(artifact_root):
     return Path(artifact_root).resolve()/".runtime"/"routes"
 
-def canonical_route_path(artifact_root, route_id):
-    return canonical_routes_dir(artifact_root)/f"{route_id}.json"
+canonical_route_path = ROUTE_LINEAGE.canonical_route_path
 
 def route_path_is_exact(path, artifact_root, route_id):
     return Path(path).resolve() == canonical_route_path(artifact_root, route_id)
@@ -4054,6 +4050,12 @@ def close_route(route, route_file, commit=None, summary=None, publication=None,
         outcome["terminal_owner_attempt_id"] = expected_owner_attempt_id
     if expected_producer_binding_digest is not None:
         outcome["producer_binding_digest"] = expected_producer_binding_digest
+    # A-SD154-7: a route's closed outcome names every SD-154 revision recorded
+    # under it, so a reader never has to walk completion-dir history by hand
+    # to learn a gate's evidence was corrected mid-route.
+    revisions = _route_revisions(route, jobs=jobs)
+    if revisions:
+        outcome["revisions"] = revisions
     if not allow_unproven and outcome["terminal_gate_proven"] is not True:
         raise ValueError("route-close-before-complete")
     if publication is not None: outcome["publication"]=publication
@@ -4544,55 +4546,10 @@ def _completion_marker_replay(route, node, node_id, evidence, axes, directory):
         atomic_write(canonical_path, existing)
     return existing
 
-def evidence_digest(evidence):
-    """One sha256 over an artifact that may be a file OR a directory of files.
-
-    A worker's artifact is legitimately either shape, and the envelope inspector
-    accepts both, so the marker has to be able to name either. A directory is
-    digested over its sorted root-relative paths and contents, so the value is
-    stable across runs and changes when any member does. Symlinks are recorded by
-    their target text and never followed: a marker must describe the tree it was
-    given, not wherever that tree points today.
-
-    Anything that cannot be attested raises rather than returning a digest. In
-    particular a path that is neither a file nor a directory raises instead of
-    yielding the empty-directory constant — otherwise "deleted before the gate"
-    and "empty at completion" would verify as the same artifact. A non-regular
-    member (FIFO, socket, device) is refused rather than read: reading a FIFO
-    blocks forever, and a completion digest must not be able to wedge.
-    """
-    path=Path(evidence)
-    if path.is_symlink():
-        raise ValueError(f"evidence-symlink-not-attestable:{path}")
-    if path.is_file():
-        return hashlib.sha256(path.read_bytes()).hexdigest()
-    if not path.is_dir():
-        raise ValueError(f"evidence-not-a-file-or-directory:{path}")
-    # The SAME rule the envelope inspector applies, imported rather than
-    # restated: an empty or oversized directory must be refused at every door,
-    # including the documented manual `complete --evidence` one.
-    refusal=directory_artifact_reason(path)
-    if refusal:
-        raise ValueError(f"evidence-{refusal.removeprefix('artifact-')}:{path}")
-    digest=hashlib.sha256(b"artifact-directory-v1\0")
-    for child in sorted(path.rglob("*"), key=lambda item: item.relative_to(path).parts):
-        # `os.fsencode` and not `.encode("utf-8")`: a filename is bytes, and a
-        # non-UTF-8 name arrives surrogate-escaped and would raise on encode.
-        relative=os.fsencode(child.relative_to(path))
-        if child.is_symlink():
-            digest.update(b"L\0"+relative+b"\0"+os.fsencode(os.readlink(child)))
-        elif child.is_dir():
-            digest.update(b"D\0"+relative+b"\0")
-        elif child.is_file():
-            digest.update(b"F\0"+relative+b"\0")
-            try:
-                digest.update(hashlib.sha256(child.read_bytes()).digest())
-            except OSError as exc:
-                # Typed, never a traceback: this runs inside completion.
-                raise ValueError(f"evidence-member-unreadable:{child}") from exc
-        else:
-            raise ValueError(f"evidence-member-not-regular:{child}")
-    return digest.hexdigest()
+# SD-154 A-2: `evidence_digest` moved to `dispatch_contract.py` (imported
+# above) so file/directory digest identity is the same definition on both
+# sides of the module boundary -- this binding keeps every existing call
+# site in this file unchanged.
 
 def write_completion_marker(
     route, node, node_id, evidence, *,
@@ -4620,6 +4577,45 @@ def write_completion_marker(
             route,node_id,replayed,review_identity,review_claim,
         )
         return replayed
+    # SD-153 rule 5 (13.59.2): every marker of a `ROUND_CAPPED_NODE_IDS` node
+    # -- registered, owner-closure, and inline alike (`test` included, not
+    # only `kind=="review-worker"`) -- carries this census. The read is
+    # read-only (never used to admit or refuse this completion) so it is safe
+    # to compute even on the "attempt row absent" inline path. `jobs` absent
+    # or unreadable is not an exemption: an empty row set still derives a
+    # real census (round_budget's own fail-soft on an unknown intensity is
+    # the only `None` case) rather than the field being silently omitted.
+    round_census=None
+    if node_id in REVIEW_ROUND_CAP.ROUND_CAPPED_NODE_IDS:
+        rows=()
+        if jobs is not None:
+            jobs_path=Path(jobs)
+            if jobs_path.is_file():
+                lines=jobs_path.read_text(encoding="utf-8",errors="replace").splitlines()
+                rows=_review_round_rows(lines,route["route_id"],node_id)
+        if owner_override:
+            site="owner-closure"
+        elif axes.get("registered_worker"):
+            site="registered"
+        else:
+            site="inline"
+        revisions=()
+        if site=="registered":
+            # This exact write IS the completing attempt's own verdict, still
+            # `open`/`running` in the registry a moment before `_complete_
+            # node_locked` marks it `done` -- exclude it rather than reading
+            # it "live" a beat early; `marker_round_census` adds it back as
+            # the one verdict round this write itself lands. Gather the same
+            # upstream revisions `admit_round` used to grant this round a
+            # closure-check (13.59.3 rule 7), so the marker's label matches
+            # what admission already decided.
+            if attempt_id:
+                rows=tuple((status,meta) for status,meta in rows if meta.get("attempt_id")!=attempt_id)
+            revisions=_dependency_revisions(route,node,jobs)
+        round_census=REVIEW_ROUND_CAP.marker_round_census(
+            route,node,rows,site=site,revisions=revisions,
+            independently_reviewed=review_identity.get("review_independence")=="independent",
+        )
     sequence=_next_marker_sequence(directory,node_id)
     marker={
         "schema_version":2,
@@ -4632,6 +4628,7 @@ def write_completion_marker(
         # match for a replay to be the same completion. Empty for every node
         # kind but `review-worker`.
         **review_identity,
+        **({"round_census":round_census} if round_census else {}),
         "completion_gate":node["completion_gate"],
         "evidence":{"path":str(evidence),"sha256":sha},
         "sequence":sequence,
@@ -4930,13 +4927,34 @@ def _marker_identity_row(route, node, node_id, gate, *, jobs=None, exact_termina
             or marker.get("completion_gate") != gate):
         return {"passed": False, "reason": "completion-marker-identity-mismatch"}
     evidence = marker.get("evidence") or {}
-    try:
-        digest = evidence_digest(Path(evidence["path"]))
-    except (OSError, KeyError, TypeError, ValueError):
-        return {"passed": False, "reason": "completion-evidence-unreadable"}
-    if digest != evidence.get("sha256"):
-        return {"passed": False, "reason": "completion-evidence-hash-mismatch"}
-    if marker.get("stage_authority") == "owner-closure":
+    # SD-154 A-SD154-8: `evidence_currency` is the only place non-writer code
+    # recomputes a completion marker's evidence sha256 -- this used to keep
+    # its own copy and its own "hash-mismatch" reason, which it now resolves
+    # into `revised-unrecorded` (evidence changed, `revise` can record it) or
+    # an `integrity-broken:*` reason (nothing short of a restore can). This
+    # row's `passed` has always been WEAKER than `completion_marker_is_current`
+    # (M7/`test_ac5_owner_merge_arbitration_transaction`: a join can pass here
+    # before its attempt-link file exists) -- read only `evidence_currency`,
+    # never the fuller `gate_currency` that also proves the link.
+    currency = evidence_currency(route, node, path, marker)
+    if currency.state == "superseded":
+        return {"passed": False, "reason": currency.reason}
+    if currency.state == "revised-unrecorded":
+        result = {"passed": False, "reason": currency.reason}
+        if currency.next_action:
+            result["next_action"] = currency.next_action
+        return result
+    if currency.state != "current":
+        return {"passed": False, "reason": currency.reason}
+    digest = currency.evidence_digest
+    # B-1 (SD-153 defect #1): the continuation owner-closure shape gets its own
+    # early return (`validate_continuation_owner_closure` proves the whole
+    # cross-generation lineage instead of a single registered row); the
+    # registered-review shape -- the *same* review row closed in place by the
+    # owner -- is a real registered attempt and correctly falls through to the
+    # ordinary registered-worker path below, which `owner_closure_shape` being
+    # non-None for it does not change.
+    if owner_closure_shape(marker) == "continuation":
         if not completion_marker_is_current(route, node, path, marker):
             return {"passed": False, "reason": "owner-closure-proof-not-current"}
         if exact_terminal:
@@ -5029,6 +5047,252 @@ def _registered_marker_fence(route, node, marker, lines):
     if latest != attempt_id:
         return "completion-attempt-not-current"
     return None
+
+
+def _downstream_node_ids(route, node_id):
+    """Every node reachable from `node_id` by `depends_on` edges, transitively.
+
+    SD-154 rule 4: a revision reopens every downstream gate, not only the
+    direct dependent -- a plan revision has to reopen `execute` even though
+    `execute` depends on `plan-check`, not `plan`, directly.
+    """
+    result = set()
+    frontier = [node_id]
+    while frontier:
+        current = frontier.pop()
+        for candidate in route.get("nodes", []):
+            candidate_id = candidate.get("id")
+            if candidate_id in result:
+                continue
+            if current in (candidate.get("depends_on") or []):
+                result.add(candidate_id)
+                frontier.append(candidate_id)
+    return result
+
+
+def revision_basis_verdict(route, node, basis, answers, *, jobs=None, direction=None, reason=None):
+    """SD-154 rule 2: prove a revision's closed basis, or raise
+    `ValueError("revision-basis-unverified")` (or an invalid-basis error).
+
+    `review-findings` requires every attempt in `answers` to be a real verdict
+    row (13.59.2 classification) of a node downstream (`depends_on` transitive
+    closure) of `node`, in the route's own registry -- SD-134 "직함이 아니라
+    배정을 본다" read onto revision provenance. `user-direction` requires a
+    non-empty `direction` (a gate release id or a readable memo path).
+    `owner-correction` requires a non-empty `reason` string.
+    """
+    if basis == "user-direction":
+        if not direction:
+            raise ValueError("revision-basis-unverified")
+        return {"basis": basis, "direction": direction}
+    if basis == "owner-correction":
+        if not reason:
+            raise ValueError("revision-basis-unverified")
+        return {"basis": basis, "reason": reason}
+    if basis != "review-findings":
+        raise ValueError(f"revision-basis-invalid:{basis}")
+    answers = tuple(answers)
+    if not answers or not jobs:
+        raise ValueError("revision-basis-unverified")
+    try:
+        lines = Path(jobs).read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        raise ValueError("revision-basis-unverified")
+    downstream = _downstream_node_ids(route, node["id"])
+    verified = set()
+    for candidate in route.get("nodes", []):
+        candidate_id = candidate.get("id")
+        if candidate_id not in downstream:
+            continue
+        worker_type = candidate.get("worker_type") or (
+            "review" if candidate.get("kind") == "review-worker" else None
+        )
+        if worker_type not in ("review", "test"):
+            continue
+        for cols, meta in review_round_records(lines, {route["route_id"]}, candidate_id):
+            attempt = meta.get("attempt_id")
+            if not attempt or attempt not in answers:
+                continue
+            kind = REVIEW_ROUND_CAP.classify_round_row(
+                cols[1], meta, worker_type=meta.get("worker_type") or worker_type,
+            )
+            if kind == "verdict":
+                verified.add(attempt)
+    if set(answers) - verified:
+        raise ValueError("revision-basis-unverified")
+    return {"basis": basis, "answers": list(answers)}
+
+
+def publish_revision_locked(route, node_id, evidence, *, basis, answers=(), direction=None,
+                            reason=None, author_attempt_id, recorded_by="owner", jobs=None):
+    """SD-154 rule 1: the one writer for a gate-evidence revision.
+
+    Reuses the node completion lock and the history-sequence writer
+    `write_completion_marker` already uses. Publishes marker k+1
+    (`stage_authority=revision`, `revision={...}` per rule 1) over `node_id`
+    and, in the same critical section, tombstones every downstream node's
+    canonical marker (rule 4: `<D>.<m+1>.json`,
+    `state=superseded-by-upstream-revision`). Every kept integrity refusal
+    (rule 6's "유지되는 거부") raises before any marker is touched -- "publish 0
+    markers" (A-SD154-5).
+    """
+    node = next((n for n in route.get("nodes", []) if n.get("id") == node_id), None)
+    if node is None:
+        raise ValueError(f"unknown route node: {node_id}")
+    if basis not in ("review-findings", "user-direction", "owner-correction"):
+        raise ValueError(f"revision-basis-invalid:{basis}")
+    directory = completion_dir(route["route_id"], jobs=jobs)
+    canonical_path = directory / f"{node_id}.json"
+    node_lock = directory / f".{node_id}.completion.lock"
+    with _exclusive_lock(node_lock):
+        try:
+            marker = json.loads(canonical_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            # Not the gate's own missing-dependency reason (`dispatch_
+            # completion_marker.test.py`'s static guardian keeps that literal
+            # inside `dispatch_contract.py` and the adapters' relay) -- there
+            # is nothing to revise, a distinct fact from a dependent gate
+            # finding no marker for an unstarted node.
+            raise ValueError("revision-target-marker-absent")
+        currency = gate_currency(route, node, canonical_path, marker)
+        if currency.state == "current":
+            raise ValueError("revision-evidence-unchanged")
+        if currency.state != "revised-unrecorded":
+            # `superseded`, `completion-evidence-unreadable`, or any
+            # `integrity-broken:*` -- every one of these is a kept refusal
+            # (13.59.3 "유지되는 거부"), not something `revise` can record over.
+            raise ValueError(currency.reason)
+        evidence_path = Path(evidence).resolve()
+        if not (evidence_path.is_file() or evidence_path.is_dir()):
+            raise ValueError("completion-evidence-unreadable")
+        # D-120: a revision's new evidence is bound by the same admitted cycle
+        # write scope as an ordinary completion (`_publish_completion_locked`
+        # already requires this) -- an open neighbouring cycle, or a
+        # sealed/abandoned one, cannot certify a revision's evidence any more
+        # than it can an original completion's.
+        from artifact_producer import ProducerError, require_cycle_output
+        try:
+            require_cycle_output(Path(route["artifact_root"]), evidence_path, route_id=route["route_id"])
+        except ProducerError as exc:
+            raise ValueError(f"{exc.code}: {exc.detail}") from exc
+        evidence_sha = evidence_digest(evidence_path)
+        # Basis verification runs (and can raise `revision-basis-unverified`)
+        # before any write -- a refused revision must publish nothing.
+        revision_basis_verdict(route, node, basis, answers, jobs=jobs, direction=direction, reason=reason)
+        sequence = marker.get("sequence")
+        history_path = directory / f"{node_id}.{sequence}.json"
+        try:
+            prior_bytes = history_path.read_bytes()
+        except OSError:
+            raise ValueError("canonical completion marker history conflict")
+        prior_sha = hashlib.sha256(prior_bytes).hexdigest()
+        from datetime import datetime, timezone
+        new_sequence = _next_marker_sequence(directory, node_id)
+        revision_record = {
+            "of_sequence": sequence,
+            "of_marker_sha256": prior_sha,
+            "of_evidence_sha256": (marker.get("evidence") or {}).get("sha256"),
+            "evidence_sha256": evidence_sha,
+            "basis": basis,
+            "answers": list(answers),
+            "direction": direction,
+            "reason": reason,
+            "author_attempt_id": author_attempt_id,
+            "recorded_by": recorded_by,
+            "recorded_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        }
+        if node_id == "execute":
+            # SD-154 A-2: an execute revision is a code change, not just new
+            # gate evidence -- record the descendant commit range SD-156's
+            # `source_lineage_verdict` proves, from execute's own most recent
+            # terminal `launch_head` to the current HEAD.
+            registry_jobs = Path(jobs) if jobs is not None else _continuation_source_jobs(route)
+            prior_head = _diff_attribution_execute_launch_head(registry_jobs, route)
+            cwd = route.get("cwd")
+            if prior_head and isinstance(cwd, str):
+                verdict = source_lineage_verdict(cwd, prior_head)
+                if verdict.kind == "descendant":
+                    revision_record["commits"] = list(verdict.commits)
+        new_marker = dict(marker)
+        new_marker.pop("state", None)
+        new_marker.pop("superseded_by", None)
+        new_marker["stage_authority"] = "revision"
+        new_marker["evidence"] = {"path": str(evidence_path), "sha256": evidence_sha}
+        new_marker["sequence"] = new_sequence
+        new_marker["revision"] = revision_record
+        # SD-153 rule 5: a revision over a capped node gets its OWN fresh
+        # census (site="revision") -- the prior marker's census (if any)
+        # described a different write and must not survive the copy above.
+        new_marker.pop("round_census", None)
+        if node_id in REVIEW_ROUND_CAP.ROUND_CAPPED_NODE_IDS:
+            census_rows = ()
+            if jobs is not None:
+                census_jobs_path = Path(jobs)
+                if census_jobs_path.is_file():
+                    census_lines = census_jobs_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                    census_rows = _review_round_rows(census_lines, route["route_id"], node_id)
+            census = REVIEW_ROUND_CAP.marker_round_census(route, node, census_rows, site="revision")
+            if census:
+                new_marker["round_census"] = census
+        new_history_path = directory / f"{node_id}.{new_sequence}.json"
+        write_once(new_history_path, new_marker)
+        atomic_write(canonical_path, new_marker)
+        tombstoned = []
+        for downstream_id in sorted(_downstream_node_ids(route, node_id)):
+            downstream_canonical = directory / f"{downstream_id}.json"
+            if not downstream_canonical.is_file():
+                continue
+            try:
+                downstream_marker = json.loads(downstream_canonical.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if downstream_marker.get("state") == "superseded-by-upstream-revision":
+                continue
+            downstream_sequence = _next_marker_sequence(directory, downstream_id)
+            tombstone_marker = dict(downstream_marker)
+            tombstone_marker["sequence"] = downstream_sequence
+            tombstone_marker["state"] = "superseded-by-upstream-revision"
+            tombstone_marker["superseded_by"] = {"node": node_id, "sequence": new_sequence}
+            downstream_history_path = directory / f"{downstream_id}.{downstream_sequence}.json"
+            write_once(downstream_history_path, tombstone_marker)
+            atomic_write(downstream_canonical, tombstone_marker)
+            tombstoned.append(downstream_id)
+    return {"marker": new_marker, "tombstoned": tombstoned}
+
+
+def _route_revisions(route, *, jobs=None):
+    """Every SD-154 revision recorded under this route's completion dir, for
+    the close outcome (A-SD154-7)."""
+    directory = completion_dir(route["route_id"], jobs=jobs)
+    if not directory.is_dir():
+        return []
+    revisions = []
+    for node in route.get("nodes", []):
+        node_id = node["id"]
+        prefix = f"{node_id}."
+        for path in sorted(directory.glob(f"{node_id}.*.json")):
+            middle = path.name[len(prefix):-5]
+            if not middle.isdigit():
+                continue
+            try:
+                marker = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if marker.get("stage_authority") != "revision":
+                continue
+            revision = marker.get("revision") or {}
+            revisions.append({
+                "node": node_id,
+                "sequence": marker.get("sequence"),
+                "author_attempt_id": revision.get("author_attempt_id"),
+                "basis": revision.get("basis"),
+                "of_evidence_sha256": revision.get("of_evidence_sha256"),
+                "evidence_sha256": revision.get("evidence_sha256"),
+                "recorded_by": revision.get("recorded_by"),
+                "recorded_at": revision.get("recorded_at"),
+            })
+    revisions.sort(key=lambda row: (row["node"], row["sequence"] or 0))
+    return revisions
 
 
 def _arbitration_observation(route, group_id, error=None, *, path=None):
@@ -5440,6 +5704,39 @@ def review_round_records(lines, route_ids, node_id):
 def _review_round_rows(lines, route_id, node_id):
     return [(fields[1], meta) for fields, meta in review_round_records(lines, {route_id}, node_id)]
 
+def _node_revision_records(route, node_id, jobs=None):
+    """Every SD-154 `revision` record in one node's own completion-dir
+    history. `dispatch-node.py`'s `admit_round` reads the same set through
+    `_dependency_revisions`, so admission and the marker census agree on it."""
+    directory=completion_dir(route["route_id"],jobs=jobs)
+    if not directory.is_dir():
+        return []
+    prefix=f"{node_id}."
+    revisions=[]
+    for path in sorted(directory.glob(f"{node_id}.*.json")):
+        middle=path.name[len(prefix):-5]
+        if not middle.isdigit():
+            continue
+        try:
+            marker=json.loads(path.read_text(encoding="utf-8"))
+        except (OSError,ValueError):
+            continue
+        if marker.get("stage_authority")=="revision":
+            revisions.append(marker.get("revision") or {})
+    return revisions
+
+def _dependency_revisions(route, node, jobs=None):
+    """13.59.3 rule 7's closure-check eligibility set: every revision
+    recorded on any node this one `depends_on`. `dispatch-node.py`'s
+    `admit_round` calls this same function for its `round_budget`, so a
+    marker published for a closure-check round is labeled
+    `closure_class="closure-check"` the same way admission already saw it."""
+    return [
+        revision
+        for dep in node.get("depends_on",[])
+        for revision in _node_revision_records(route,dep,jobs)
+    ]
+
 def _owner_closure_eligibility(route, node, node_id, evidence, row_metadata, lines,
                                *, rounds=None, check_canonical=True):
     """Admit `complete` on a `completed-review-blocking` row, or raise a typed refusal.
@@ -5462,18 +5759,29 @@ def _owner_closure_eligibility(route, node, node_id, evidence, row_metadata, lin
                f"kind={node.get('kind') or '-'};worker_type={row_metadata.get('worker_type') or '-'}")
     if rounds is None:
         rounds=_review_round_rows(lines,route["route_id"],node_id)
-    live=[metadata.get("attempt_id") or "-" for status,metadata in rounds if status in _LIVE_ROW_STATUSES]
-    if live:
-        # A live review worker may still write a second blocking artifact
-        # nobody has read; the gate never closes over its head.
-        refuse("round-still-open","attempt="+"|".join(live))
-    terminated=[(status,metadata) for status,metadata in rounds if status not in _LIVE_ROW_STATUSES]
+    # SD-153: `round_budget` is the one admission/closure decision every
+    # surface reads. Owner-closure is admitted once a real round budget is
+    # spent (`state="exhausted"`) OR two rounds in a row produced no verdict
+    # at all (`state="verdictless-bound"`) -- either way automatic retries
+    # are no longer the answer. `state="admit"` means the budget still has
+    # room for a registered round, so owner-closure would be premature.
     try:
-        max_round=REVIEW_ROUND_CAP.max_review_rounds(route["effective_intensity"])
+        budget=REVIEW_ROUND_CAP.round_budget(route,node,rounds)
     except ValueError:
         refuse("intensity-unknown",str(route.get("effective_intensity")))
-    if len(terminated)<max_round:
-        refuse("round-budget-not-exhausted",f"rounds={len(terminated)};max_round={max_round}")
+    if budget.state=="blocked-live":
+        # A live review worker may still write a second blocking artifact
+        # nobody has read; the gate never closes over its head.
+        live=[metadata.get("attempt_id") or "-" for status,metadata in rounds if status in _LIVE_ROW_STATUSES]
+        refuse("round-still-open","attempt="+"|".join(live))
+    if budget.state=="blocked-unsettled":
+        refuse("round-unsettled")
+    if budget.state=="admit":
+        refuse("round-budget-not-exhausted",
+               f"rounds={budget.verdict_rounds};max_round={budget.cap};"
+               f"verdictless_streak={budget.verdictless_streak};bound={REVIEW_ROUND_CAP.VERDICTLESS_BOUND}")
+    terminated=[(status,metadata) for status,metadata in rounds if status not in _LIVE_ROW_STATUSES]
+    max_round=budget.cap
     own=row_metadata.get("attempt_id")
     canonical=completion_dir(route["route_id"])/f"{node_id}.json"
     if check_canonical and canonical.is_file():
@@ -5558,25 +5866,19 @@ def _owner_closure_eligibility(route, node, node_id, evidence, row_metadata, lin
 def review_lineage_routes(route, node_id):
     """Exact node ancestry shared by review admission and disposition.
 
-    A continuation's new route ID is not a fresh review budget. Read only the
-    canonical parents named by its sealed edges; never infer from campaigns.
+    A continuation's new route ID is not a fresh review budget. The hash-
+    verified walk itself is `verified_route_lineage` (SD-155) -- shared with
+    D-120 cycle admission and round census. This keeps only what stays
+    review-specific on top: `effective_intensity` parity (not part of the
+    common walk) and exact node-assignment identity between each generation.
     """
-    lineage = [route]
-    seen = {route["route_id"]}
-    current = route
-    while current.get("continuation_contract_version") == 1:
-        parent_id = current.get("source_route_id")
-        if not isinstance(parent_id, str) or not re.fullmatch(r"rt-[0-9a-f]{16}", parent_id) or parent_id in seen:
-            raise ValueError("owner-closure-lineage-invalid")
-        parent = json.loads(canonical_route_path(Path(route["artifact_root"]), parent_id).read_text(encoding="utf-8"))
-        if (parent.get("route_id") != parent_id
-                or parent.get("route_hash") != current.get("source_route_hash")
-                or route_hash(parent) != parent.get("route_hash")
-                or route_hash(current) != current.get("route_hash")):
-            raise ValueError("owner-closure-lineage-hash-mismatch")
-        for key in ("artifact_root", "cwd", "capability", "effective_intensity"):
-            if parent.get(key) != current.get(key):
-                raise ValueError(f"owner-closure-lineage-context-mismatch:{key}")
+    try:
+        lineage = verified_route_lineage(route, artifact_root=route.get("artifact_root"))
+    except RouteLineageError as exc:
+        raise ValueError(exc.code) from exc
+    for current, parent in zip(lineage, lineage[1:]):
+        if parent.get("effective_intensity") != current.get("effective_intensity"):
+            raise ValueError("owner-closure-lineage-context-mismatch:effective_intensity")
         child_node = next((n for n in current["nodes"] if n["id"] == node_id), None)
         parent_node = next((n for n in parent["nodes"] if n["id"] == node_id), None)
         edge = next((n for n in current.get("new_nodes", []) if n.get("node_id") == node_id), None)
@@ -5591,9 +5893,6 @@ def review_lineage_routes(route, node_id):
                          "source_contract_hash": _continuation_contract_hash(parent_node)}
         if expected_node != child_node:
             raise ValueError("owner-closure-lineage-node-mismatch:assignment")
-        lineage.append(parent)
-        seen.add(parent_id)
-        current = parent
     return lineage
 
 
@@ -6798,6 +7097,18 @@ def main():
     ar.add_argument("--group",required=True,help="realized auxiliary-bearing parallel group id")
     ar.add_argument("--evidence",required=True,help="owner merge record carrying auxiliary_findings_considered")
     ar.add_argument("--output")
+    rv=sub.add_parser("revise",help="SD-154: record that a gate's evidence changed after its marker published")
+    rv.add_argument("--route",required=True)
+    rv.add_argument("--node",required=True)
+    rv.add_argument("--evidence",required=True,help="the node's corrected gate evidence (file or directory)")
+    rv.add_argument("--basis",required=True,choices=("review-findings","user-direction","owner-correction"))
+    rv.add_argument("--answers",help="comma list of downstream review/test verdict attempt ids (basis=review-findings)")
+    rv.add_argument("--direction",help="gate release id or readable memo path (basis=user-direction)")
+    rv.add_argument("--reason",help="owner's stated reason (basis=owner-correction)")
+    rv.add_argument("--jobs",help="canonical registry path; required to verify basis=review-findings")
+    rv.add_argument("--author-attempt-id",help="the recording attempt; default AGENT_DISPATCH_ATTEMPT_ID")
+    rv.add_argument("--recorded-by",default="owner")
+    rv.add_argument("--output")
     cl=sub.add_parser("close"); cl.add_argument("--route",required=True)
     cl.add_argument("--commit",help="result commit; defaults to HEAD in the route cwd")
     cl.add_argument("--summary",help="one line naming what the route produced")
@@ -7053,6 +7364,11 @@ def main():
         # which is honest — nothing here claims progress the owner has not proven).
         if os.environ.get("AGENT_DISPATCH_DEPTH") != "1" or advance is not None:
             _record_route_chain(route, str(output_path.resolve()), "continuation")
+        # D-120: the source's open cycle, if any, extends to this continuation.
+        cycle_bind=bind_continuation_cycle(artifact,source,route)
+        print(f"cycle_binding_bound={1 if cycle_bind['bound'] else 0}",file=sys.stderr)
+        if cycle_bind.get("advisory"):
+            print(f"cycle_binding_advisory={cycle_bind['advisory']}",file=sys.stderr)
         print(f"route_file={output_path.resolve()}",file=sys.stderr)
         print(json.dumps(route,sort_keys=True))
     elif a.command=="status":
@@ -7084,12 +7400,46 @@ def main():
                     print("registered=0 started=0 child_spawned=0",file=sys.stderr)
                     raise ValueError("launch-runtime-root-mismatch")
             print(f"route_id={route['route_id']}\nroute_hash={route['route_hash']}")
+            if getattr(a,"cwd",None) and _COMMIT_SHA.fullmatch(str(route.get("source_commit") or "")):
+                # SD-156/B1: `verify` is the one place `material-route-guard.py`
+                # (which never imports this module) can reach a lineage verdict --
+                # subprocess it and read this data line. Exit status and the two
+                # lines above are unchanged; every other `verify` caller is
+                # unaffected by an extra stdout line it does not parse.
+                verdict=source_lineage_verdict(route["cwd"],route["source_commit"])
+                observed=(
+                    route["source_commit"] if verdict.kind=="exact"
+                    else verdict.commits[0] if verdict.commits else None
+                )
+                print("source_lineage="+json.dumps({
+                    "kind":verdict.kind,"sealed":route["source_commit"],
+                    "observed":observed,"distance":verdict.distance,
+                    "branch":verdict.branch,"reason":verdict.reason,
+                },sort_keys=True))
         elif a.command=="arbitrate":
             evidence=Path(a.evidence).resolve()
             if not evidence.is_file(): raise SystemExit("arbitration evidence missing")
             record=arbitrate_group(route,a.group,evidence)
             if a.output: atomic_write(a.output, record)
             print(json.dumps(record,sort_keys=True))
+        elif a.command=="revise":
+            evidence=Path(a.evidence).resolve()
+            if not (evidence.is_file() or evidence.is_dir()):
+                raise SystemExit("revision evidence missing")
+            answers=tuple(x.strip() for x in (a.answers or "").split(",") if x.strip())
+            author_attempt_id=a.author_attempt_id or os.environ.get("AGENT_DISPATCH_ATTEMPT_ID")
+            if not author_attempt_id:
+                raise ValueError("revise-requires-author-attempt-id")
+            result=publish_revision_locked(
+                route,a.node,evidence,basis=a.basis,answers=answers,
+                direction=a.direction,reason=a.reason,
+                author_attempt_id=author_attempt_id,recorded_by=a.recorded_by,
+                jobs=Path(a.jobs) if a.jobs else None,
+            )
+            marker=result["marker"]
+            if a.output: atomic_write(a.output, marker)
+            print(json.dumps(marker,sort_keys=True))
+            print(f"tombstoned={','.join(result['tombstoned']) or '-'}",file=sys.stderr)
         elif a.command=="close":
             outcome,created=close_route(route,a.route,a.commit,a.summary,allow_unproven=a.allow_unproven)
             print(json.dumps(outcome,sort_keys=True))

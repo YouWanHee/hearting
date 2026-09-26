@@ -21,10 +21,13 @@ COMPLETION_ACTIONS = frozenset({"complete-open", "inspect-done-failure", "advanc
 # dispatch_terminal_commit._PROVEN_BLOCKED_GATE_REASONS exactly (item 8,
 # unfinishable-watch) -- a proven-permanent owner_completion_state("blocked")
 # gate is the only source of this reason, so the composed set stays closed.
+# SD-154 I-5: `completion-evidence-hash-mismatch` is `completion-evidence-
+# revised-unrecorded` now (an evidence sha mismatch usually means `revise`
+# can record it, not that anything is broken).
 COMPLETION_REASONS = frozenset({"registry-closed", "registry-closed-marker", "terminal-observed",
                                 "row-advanced", "terminal-failure-or-unclosed",
                                 "closure-blocked:completion-attempt-not-current",
-                                "closure-blocked:completion-evidence-hash-mismatch"})
+                                "closure-blocked:completion-evidence-revised-unrecorded"})
 JOIN_REASONS = COMPLETION_REASONS | {"process-alive", "process-unverifiable",
                                      "terminal-commit-pending", "workflow-completion-pending"}
 

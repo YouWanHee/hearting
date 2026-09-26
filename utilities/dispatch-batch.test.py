@@ -487,6 +487,56 @@ class DispatchBatchTest(unittest.TestCase):
         reserve.assert_not_called()
         popen.assert_not_called()
 
+    def test_route_state_refusal_returns_next_action(self):
+        """A-SD154-2 / defect #2 (13.59.3 rule 6, B-2): a completion_marker_gate
+        refusal whose reason is in `ROUTE_STATE_REFUSAL_REASONS` -- this
+        fixture's `replica_node` nodes depend on `frame`/`frame-replica`,
+        which never published a marker anywhere, so the REAL (unmocked) gate
+        raises `completion-marker-missing` -- stops with exit 65,
+        `child_spawned=0`, and a carried `next_action`, never a `selected_hop`
+        descent toward an unregistered fallback the way a generic
+        `runtime-unavailable` failure would."""
+        self.route["dispatch_contract_version"] = 3
+        self.route_path.write_text(json.dumps(self.route), encoding="utf-8")
+        stack, assignments = self.common_patches()
+        output = io.StringIO()
+        with stack:
+            stack.enter_context(mock.patch.object(BATCH, "load_route", return_value=self.route))
+            stack.enter_context(mock.patch.object(BATCH, "assign_harnesses", return_value=(assignments, "cross-harness", {"families_considered": [], "usable_families": [], "family_exclusions": {}, "capacity": {}, "degradation_cause": ""})))
+            stack.enter_context(mock.patch.object(BATCH, "resolve_agent_home", return_value=self.base))
+            stack.enter_context(mock.patch.object(BATCH, "resolve_global_registry", return_value=SimpleNamespace(path=self.jobs)))
+            stack.enter_context(mock.patch.object(BATCH, "resolve_live_parent_attempt"))
+            # completion_marker_gate itself is deliberately NOT mocked here --
+            # every other full-flow test in this class stubs it out, which is
+            # exactly the coverage gap this test closes (the real gate's
+            # ROUTE_STATE_REFUSAL_REASONS handling was previously only proven
+            # by stub-returned BatchError objects, never a real refusal).
+            stack.enter_context(mock.patch.object(BATCH.subprocess, "check_output", return_value=str(self.base)))
+            reserve = stack.enter_context(mock.patch.object(BATCH, "reserve_batch"))
+            popen = stack.enter_context(mock.patch.object(BATCH.subprocess, "Popen"))
+            stack.enter_context(mock.patch.dict(os.environ, {
+                "AGENT_DISPATCH_SELF_SLUG": "owner",
+                "AGENT_DISPATCH_ATTEMPT_ID": "att-parent-fixture",
+                "AGENT_DISPATCH_CURRENT_HARNESS": "codex",
+                "AGENT_DISPATCH_CURRENT_TRANSPORT": "headless",
+                "AGENT_DISPATCH_CURRENT_SANDBOX": "workspace-write",
+            }))
+            with contextlib.redirect_stdout(output):
+                rc = BATCH.main(self.argv())
+        self.assertEqual(rc, 65)
+        receipt = json.loads(output.getvalue())
+        self.assertEqual(receipt["reason"], "completion-marker-missing")
+        self.assertIn("frame", receipt["detail"])
+        self.assertEqual(
+            {key: receipt[key] for key in ("admitted", "spawned", "registered", "started", "child_spawned")},
+            {"admitted": "0", "spawned": "0", "registered": "0", "started": "0", "child_spawned": "0"},
+        )
+        self.assertIn("next_action", receipt)
+        self.assertNotIn("selected_hop", receipt)
+        self.assertNotIn("runtime-unavailable", json.dumps(receipt))
+        reserve.assert_not_called()
+        popen.assert_not_called()
+
     def test_at5_partial_continuation_reuses_peers_and_claims_only_gap(self):
         source_legs = self.legs()
         _source_manifest, continuation, partial = self.partial_continuation(source_legs)
@@ -3336,8 +3386,11 @@ class GroupLegReviewRoundCapTest(unittest.TestCase):
         }
 
     def _rows(self, node_id, n):
+        # SD-153: `failure_class=fail` makes this a genuine FAIL verdict, so
+        # it still spends the round budget the way a bare `dead-worker-fail`
+        # (a crash, not a verdict) no longer does on its own.
         pipe = ("capability=autopilot-code,attempt_schema_version=2,registered_worker=1,"
-                "route=rt-fixture,route_node=" + node_id + ",note=dead-worker-fail")
+                "route=rt-fixture,route_node=" + node_id + ",note=dead-worker-fail,failure_class=fail")
         return "".join(
             f"2026-08-24T00:00:0{i}Z\tdone\t{self.base}\t{self.base}\tslug-r{i}\t"
             f"{pipe},attempt_id=att-{node_id}-{i}\n"
@@ -3432,6 +3485,153 @@ class GroupLegReviewRoundCapTest(unittest.TestCase):
              contextlib.redirect_stdout(output):
             with self.assertRaisesRegex(AssertionError, "uncapped node must reach assignment"):
                 BATCH.main(argv)
+
+    def test_leg_launch_prompt_carries_the_same_round_protocol_block_as_dispatch_node(self):
+        """SD-153 rule 5 correction, 🟡 item: a dispatch-batch-launched capped
+        leg was proven only by reading source (dispatch-node.py appends
+        `round_protocol_block` to whatever raw `--prompt-text` it receives,
+        and dispatch-batch passes that text through unmodified -- P3's own
+        judgment call that a dedicated test was "disproportionate"). This
+        drives dispatch-batch's real `main()` through a real round-capped
+        `impl-review` group leg with one real verdict-less prior round (so
+        the block's "판정 없음(<note>)" text is non-trivial), intercepts the
+        leg's own process spawn with a fake `Popen`, and inside that fake
+        runs `dispatch-node.py`'s real `main()` in-process -- faking only
+        ITS two subprocess calls (the route `verify` gate and the final
+        adapter-wrapper invocation, neither of which this test is about) --
+        to capture the actual final `--prompt-text` argument dispatch-node.py
+        hands the adapter. Asserts it against `DISPATCH_NODE.round_protocol_
+        block(...)`, the same production function, executed for real by
+        production code, not re-derived by this test."""
+        route = self._route("standard")
+        for node in route["nodes"]:
+            # `kind="pipeline-stage"` (not "review-worker") deliberately: the
+            # SD-155 lineage-verified round census only applies to a real
+            # `review-worker` node's hash-sealed route lineage, which this
+            # hand-built fixture route (unlike `_route`'s real callers) never
+            # seals. The round CAP is keyed by node id (`ROUND_CAPPED_NODE_IDS`
+            # membership), not by kind, so `impl-review` still gets the exact
+            # same admission/`round_protocol_block` wiring under test here.
+            node.update(kind="pipeline-stage", unit="qa/plan-review",
+                        completion_gate="impl-review-complete", write_scope=[])
+        route["capability"] = "autopilot-code"
+        route["capability_mode"] = "dev"
+        route["registry_digest"] = "sha256:fixture-registry"
+        # `bind_dispatch_evidence` checks the assigned candidate's own
+        # parent_harness/transport/sandbox against `current_parent_identity()`
+        # (this test's own AGENT_DISPATCH_CURRENT_* env below): the shared
+        # `candidate()` fixture helper omits those fields entirely (its other
+        # callers never launch a leg far enough to reach this check), so this
+        # test's own candidates carry the full real evidence-tuple shape
+        # (`dispatch-node.py`'s `EVIDENCE_TUPLE_FIELDS`).
+        for node in route["nodes"]:
+            for hop in node["fallback_hops"]:
+                for row in hop["candidates"]:
+                    row.update(
+                        parent_harness="codex", parent_transport="headless",
+                        parent_sandbox="workspace-write", launch_authority="conductor",
+                        probe_source="fixture",
+                    )
+        self.jobs.write_text(
+            "2026-08-24T00:00:01Z\tdone\t" + str(self.base) + "\t" + str(self.base) + "\tslug-r1\t"
+            "capability=autopilot-code,attempt_schema_version=2,registered_worker=1,"
+            "route=rt-fixture,route_node=impl-review,worker_type=review,"
+            "note=dead-invalid-envelope,attempt_id=att-impl-review-1\n",
+            encoding="utf-8",
+        )
+        self.route_path.write_text(json.dumps(route), encoding="utf-8")
+        argv = [
+            "--route", str(self.route_path), "--parallel-group", "impl-review",
+            "--action", "start", "--slug-prefix", "fixture", "--parent", "owner",
+            "--jobs", str(self.jobs),
+        ]
+        captured = {}
+
+        class FakeProcess:
+            def __init__(self, command, **kwargs):
+                self.command = command
+                self.returncode = 0
+                self.pid = 12000
+                leg_env = kwargs.get("env") or {}
+
+                def fake_inner_run(inner_argv, *a, **kw):
+                    if "--worktree" in inner_argv:
+                        node_id = inner_argv[inner_argv.index("--route-node") + 1]
+                        captured[node_id] = list(inner_argv)
+                    return subprocess.CompletedProcess(inner_argv, 0, stdout="", stderr="")
+
+                with mock.patch.dict(os.environ, leg_env, clear=True), \
+                     mock.patch.object(sys, "argv", ["dispatch-node.py"] + command[2:]), \
+                     mock.patch.object(BATCH.DISPATCH_NODE.subprocess, "run", side_effect=fake_inner_run):
+                    try:
+                        BATCH.DISPATCH_NODE.main()
+                    except SystemExit:
+                        pass
+
+            def communicate(self):
+                return success_receipt(self.command), ""
+
+            def poll(self):
+                return self.returncode
+
+        def resolve_full_evidence(route, node, adapter, parent_identity=None):
+            # Unlike the shared module-level `resolve_side_effect` (which
+            # hands `bind_dispatch_evidence` a synthetic two-key `tuple_row`
+            # its other callers never inspect further), this test needs the
+            # FULL candidate row -- including the parent_harness/transport/
+            # sandbox fields added above -- so the real `validate_parent_
+            # identity` check inside `bind_dispatch_evidence` (reached only
+            # once a leg gets this far) passes on real data, not a stub.
+            for entry in sorted(node.get("fallback_hops", []), key=lambda row: row.get("ordinal", 0)):
+                rows = [row for row in entry.get("candidates", []) if row.get("child_harness") == adapter]
+                if rows:
+                    return BATCH.DISPATCH_NODE.CheckedSelection(
+                        rows[0], rows[0], str(entry["fallback_hop"]), int(entry["ordinal"]),
+                    )
+            raise BATCH.DISPATCH_NODE.DispatchNodeError(
+                "dispatch-evidence-no-eligible-fallback", adapter=adapter,
+            )
+
+        with mock.patch.object(BATCH, "load_route", return_value=route), \
+             mock.patch.object(BATCH, "resolve_agent_home", return_value=self.base), \
+             mock.patch.object(BATCH, "resolve_global_registry", return_value=SimpleNamespace(path=self.jobs)), \
+             mock.patch.object(BATCH, "resolve_live_parent_attempt"), \
+             mock.patch.object(BATCH, "completion_marker_gate"), \
+             mock.patch.object(BATCH.subprocess, "check_output", return_value=str(self.base)), \
+             mock.patch.object(BATCH, "reserve_batch", return_value=["a" * 32, "b" * 32]), \
+             mock.patch.object(BATCH, "cancel_unclaimed"), \
+             mock.patch.object(BATCH.DISPATCH_NODE, "resolve_checked_tuple", side_effect=resolve_full_evidence), \
+             mock.patch.object(BATCH.subprocess, "Popen", side_effect=FakeProcess), \
+             mock.patch.dict(os.environ, {
+                 "AGENT_DISPATCH_SELF_SLUG": "owner",
+                 "AGENT_DISPATCH_ATTEMPT_ID": "att-parent-fixture",
+                 "AGENT_DISPATCH_CURRENT_HARNESS": "codex",
+                 "AGENT_DISPATCH_CURRENT_TRANSPORT": "headless",
+                 "AGENT_DISPATCH_CURRENT_SANDBOX": "workspace-write",
+             }), \
+             contextlib.redirect_stdout(io.StringIO()):
+            BATCH.main(argv)
+
+        self.assertIn("impl-review", captured)
+        wrapper_argv = captured["impl-review"]
+        self.assertIn("--prompt-text", wrapper_argv)
+        actual_prompt = wrapper_argv[wrapper_argv.index("--prompt-text") + 1]
+
+        impl_review_node = next(n for n in route["nodes"] if n["id"] == "impl-review")
+        prior_rows = BATCH.DISPATCH_NODE.prior_round_attempts(
+            self.jobs, route["route_id"], "impl-review", route=None,
+        )
+        budget = BATCH.DISPATCH_NODE.admit_round(
+            route, impl_review_node, self.jobs, owner_attempt_id="owner",
+        ).budget
+        expected_block = BATCH.DISPATCH_NODE.round_protocol_block(
+            budget, prior_rows,
+            BATCH.DISPATCH_NODE.worker_type_for_kind(impl_review_node["kind"]),
+            "impl-review",
+        )
+        self.assertNotEqual(expected_block, "")
+        self.assertIn("판정 없음", expected_block)
+        self.assertEqual(actual_prompt, BATCH.DEFAULT_PROMPT + expected_block)
 
 
 if __name__ == "__main__":

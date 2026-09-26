@@ -91,7 +91,12 @@ class WorkerRouteGuardTest(unittest.TestCase):
   with tempfile.TemporaryDirectory() as td:
    path=Path(td)/"route.json"; route=self.route(); path.write_text(json.dumps(route))
    self.assertRaisesRegex(G.WorkerRouteError,"expected=autopilot-code",G.validate_route_contract,path,"execute",self.route_worktree,self.route_worktree,"code-execute")
- def test_source_commit_mismatch_rejected(self):
+ def test_source_commit_descendant_head_passes_regardless_of_node_or_evidence(self):
+  # SD-156: a first-parent descendant HEAD passes for any node, with no
+  # registry row required -- the guard asks one lineage question
+  # (`ROUTE.source_lineage_verdict`), not "is this node's position/evidence
+  # exempt". A genuinely diverged HEAD is still refused
+  # (`test_post_execute_diverged_head_rejected`/`test_mutation_retry_diverged_head_rejected`).
   with tempfile.TemporaryDirectory() as td:
    repo=Path(td)/"repo"; repo.mkdir(); subprocess.run(["git","init","-q",str(repo)],check=True)
    subprocess.run(["git","-C",str(repo),"config","user.email","fixture@example.com"],check=True); subprocess.run(["git","-C",str(repo),"config","user.name","Fixture"],check=True)
@@ -99,8 +104,8 @@ class WorkerRouteGuardTest(unittest.TestCase):
    gate={"spec_read":{"satisfied":True,"source":"prd"},"drift_verdict":"within-spec","workflow_mode":"tracked","artifact_guard":{"satisfied":True,"source":"conductor"}}
    route=R.compile_route("autopilot-code","dev","strong",repo,repo,signals=["shared-contract"],transport="headless",tracking="tracked",tracked_gate_evidence=gate,dispatch_evidence=dispatch(repo)); path=Path(td)/"route.json"; path.write_text(json.dumps(route))
    (repo/"x").write_text("b"); subprocess.run(["git","-C",str(repo),"commit","-am","b","-q"],check=True)
-   with self.assertRaisesRegex(G.WorkerRouteError,"expected=.* observed=") as ctx: G.validate_route_contract(path,"execute",repo,repo)
-   self.assertEqual(ctx.exception.reason,"route-source-commit-mismatch")
+   _,node,_=G.validate_route_contract(path,"execute",repo,repo)
+   self.assertEqual(node["id"],"execute")
 
  def _lineage_repo(self,td,*,lineage_rows=True):
   repo=Path(td)/"repo"; repo.mkdir(); subprocess.run(["git","init","-q",str(repo)],check=True)
@@ -151,23 +156,26 @@ class WorkerRouteGuardTest(unittest.TestCase):
    with self.assertRaisesRegex(G.WorkerRouteError,"expected=.* observed=") as ctx: G.validate_route_contract(path,"test",repo,repo)
    self.assertEqual(ctx.exception.reason,"route-source-commit-mismatch")
 
- def test_pre_mutation_node_moved_head_rejected(self):
-  # SD-65 (c): the plan node precedes execute (the first mutation node) and keeps the
-  # exact-match requirement even though HEAD is a descendant of source_commit.
+ def test_pre_mutation_node_on_descendant_head_passes(self):
+  # SD-65's exact-match requirement for pre-mutation nodes is retired by
+  # SD-156: `plan` precedes `execute` (the first mutation node), but a
+  # first-parent descendant HEAD passes for it exactly as it does downstream.
   with tempfile.TemporaryDirectory() as td:
    repo,route,path=self._lineage_repo(td)
    (repo/"x").write_text("b"); subprocess.run(["git","-C",str(repo),"commit","-am","b","-q"],check=True)
-   with self.assertRaisesRegex(G.WorkerRouteError,"expected=.* observed=") as ctx: G.validate_route_contract(path,"plan",repo,repo)
-   self.assertEqual(ctx.exception.reason,"route-source-commit-mismatch")
+   _,node,_=G.validate_route_contract(path,"plan",repo,repo)
+   self.assertEqual(node["id"],"plan")
 
- def test_execute_node_itself_moved_head_rejected(self):
-  # SD-65: the first mutation node (execute) is grouped with the pre-mutation nodes --
-  # it must still observe HEAD == source_commit before it starts mutating.
+ def test_execute_node_itself_on_descendant_head_passes(self):
+  # SD-156: the first mutation node (execute) no longer requires HEAD ==
+  # source_commit before it starts mutating -- a first-parent descendant is
+  # the same mid-cycle-progress shape SD-107 already accepted for the
+  # grounding tuple.
   with tempfile.TemporaryDirectory() as td:
    repo,route,path=self._lineage_repo(td)
    (repo/"x").write_text("b"); subprocess.run(["git","-C",str(repo),"commit","-am","b","-q"],check=True)
-   with self.assertRaisesRegex(G.WorkerRouteError,"expected=.* observed=") as ctx: G.validate_route_contract(path,"execute",repo,repo)
-   self.assertEqual(ctx.exception.reason,"route-source-commit-mismatch")
+   _,node,_=G.validate_route_contract(path,"execute",repo,repo)
+   self.assertEqual(node["id"],"execute")
 
  def _continuation(self,route,artifact_root):
   first=route["nodes"][0]["id"]
@@ -205,39 +213,22 @@ class WorkerRouteGuardTest(unittest.TestCase):
    path=Path(td)/"continuation.json"; path.write_text(json.dumps(continuation))
    _,node,_=G.validate_route_contract(path,"plan",repo,repo); self.assertEqual(node["id"],"plan")
 
- def test_c_declined_continuation_refuses_the_whole_pre_mutation_prefix(self):
-  # Round 3, S1: a decline is not "one node is refused". It keeps the inherited
-  # pin for the WHOLE route, so every node at or before the mutation node is
-  # refused and the continuation cannot start -- it does not run up to execute
-  # and stop there. Post-mutation nodes still pass on the SD-65 descendant
-  # branch. Measured here rather than asserted in prose.
+ def test_c_continuation_with_no_lineage_rows_still_repins_and_every_node_passes(self):
+  # SD-128's decline guard is retired by SD-156: a continuation always
+  # re-pins to a descendant HEAD now, regardless of what the registry does or
+  # does not prove about a prior attempt on a mutation node -- there is no
+  # longer a registry-lineage question this builder must answer at all.
   with tempfile.TemporaryDirectory() as td:
    repo,source,_=self._lineage_repo(td,lineage_rows=False)
    (repo/"x").write_text("b"); subprocess.run(["git","-C",str(repo),"commit","-am","fast-forward","-q"],check=True)
    head=subprocess.run(["git","-C",str(repo),"rev-parse","HEAD"],text=True,capture_output=True,check=True).stdout.strip()
    continuation=self._continuation(source,repo)
-   # No lineage rows anywhere: the registry cannot prove the mutation node never
-   # ran, so the pin stays inherited.
-   self.assertEqual(continuation["source_commit"],source["source_commit"])
-   self.assertNotIn("source_commit_rebind",continuation)
-   path=Path(td)/"declined.json"; path.write_text(json.dumps(continuation))
-   refused=[]
-   accepted=[]
+   self.assertEqual(continuation["source_commit"],head)
+   self.assertEqual(continuation["source_commit_rebind"]["inherited_source_commit"],source["source_commit"])
+   path=Path(td)/"continuation.json"; path.write_text(json.dumps(continuation))
    for node in continuation["nodes"]:
-    try:
-     G.validate_route_contract(path,node["id"],repo,repo)
-    except G.WorkerRouteError as exc:
-     self.assertEqual(exc.reason,"route-source-commit-mismatch")
-     refused.append(node["id"])
-    else:
-     accepted.append(node["id"])
-   self.assertIn("plan",refused)
-   self.assertIn("execute",refused)
-   self.assertIn("test",accepted)
-   self.assertNotEqual(head,source["source_commit"])
-   # Every refused node is at or before the mutation node; nothing after it.
-   ids=[node["id"] for node in continuation["nodes"]]
-   self.assertLess(max(ids.index(n) for n in refused),min(ids.index(n) for n in accepted))
+    _,validated,_=G.validate_route_contract(path,node["id"],repo,repo)
+    self.assertEqual(validated["id"],node["id"])
 
  def test_c_continuation_on_diverged_head_refused_typed(self):
   # A rewritten HEAD is off the history the source route bound: no node of such a
@@ -275,16 +266,17 @@ class WorkerRouteGuardTest(unittest.TestCase):
     _,node,_=G.validate_route_contract(path,"execute",repo,repo,current_attempt="att-current")
    self.assertEqual(node["id"],"execute")
 
- def test_mutation_first_launch_descendant_without_prior_attempt_rejected(self):
-  # A2: same descendant HEAD but no qualifying registry row -- exact-match rejection stands.
+ def test_mutation_first_launch_descendant_without_prior_attempt_passes(self):
+  # A2, retired by SD-156: a descendant HEAD passes even with no prior
+  # registry row -- there is no separate "first launch vs. retry" branch
+  # left, only the lineage verdict.
   with tempfile.TemporaryDirectory() as td:
    repo,route,path=self._lineage_repo(td)
    (repo/"x").write_text("b"); subprocess.run(["git","-C",str(repo),"commit","-am","b","-q"],check=True)
    jobs=Path(td)/"jobs.log"; jobs.write_text("")
    with self._bound_jobs(str(jobs)):
-    with self.assertRaisesRegex(G.WorkerRouteError,"expected=.* observed=") as ctx:
-     G.validate_route_contract(path,"execute",repo,repo,current_attempt="att-current")
-   self.assertEqual(ctx.exception.reason,"route-source-commit-mismatch")
+    _,node,_=G.validate_route_contract(path,"execute",repo,repo,current_attempt="att-current")
+   self.assertEqual(node["id"],"execute")
 
  def test_mutation_retry_diverged_head_rejected(self):
   # A3a: a qualifying registry row cannot authorize an amended/unrelated HEAD.
@@ -298,41 +290,36 @@ class WorkerRouteGuardTest(unittest.TestCase):
      G.validate_route_contract(path,"execute",repo,repo,current_attempt="att-current")
    self.assertEqual(ctx.exception.reason,"route-source-commit-mismatch")
 
- def test_mutation_retry_registry_unavailable_rejected(self):
-  # A3b: unset, missing-file, and unreadable/malformed registry bindings all fail closed.
+ def test_mutation_retry_passes_regardless_of_registry_availability(self):
+  # A3b, retired by SD-156: the registry is no longer consulted for this gate
+  # at all, so an unset, missing, relative, or malformed `AGENT_DISPATCH_JOBS`
+  # binding no longer matters -- a descendant HEAD passes in every case.
   with tempfile.TemporaryDirectory() as td:
    repo,route,path=self._lineage_repo(td)
    (repo/"x").write_text("b"); subprocess.run(["git","-C",str(repo),"commit","-am","b","-q"],check=True)
    with self.subTest("env-unset"), self._bound_jobs(None):
-    with self.assertRaisesRegex(G.WorkerRouteError,"expected=.* observed=") as ctx:
-     G.validate_route_contract(path,"execute",repo,repo,current_attempt="att-current")
-    self.assertEqual(ctx.exception.reason,"route-source-commit-mismatch")
+    _,node,_=G.validate_route_contract(path,"execute",repo,repo,current_attempt="att-current")
+    self.assertEqual(node["id"],"execute")
    with self.subTest("missing-file"), self._bound_jobs(str(Path(td)/"absent.log")):
-    with self.assertRaisesRegex(G.WorkerRouteError,"expected=.* observed=") as ctx:
-     G.validate_route_contract(path,"execute",repo,repo,current_attempt="att-current")
-    self.assertEqual(ctx.exception.reason,"route-source-commit-mismatch")
+    _,node,_=G.validate_route_contract(path,"execute",repo,repo,current_attempt="att-current")
+    self.assertEqual(node["id"],"execute")
    with self.subTest("relative-path"), self._bound_jobs("relative/jobs.log"):
-    with self.assertRaisesRegex(G.WorkerRouteError,"expected=.* observed=") as ctx:
-     G.validate_route_contract(path,"execute",repo,repo,current_attempt="att-current")
-    self.assertEqual(ctx.exception.reason,"route-source-commit-mismatch")
+    _,node,_=G.validate_route_contract(path,"execute",repo,repo,current_attempt="att-current")
+    self.assertEqual(node["id"],"execute")
    malformed=Path(td)/"malformed.log"; malformed.write_text("not-six-fields\tonly-two\n")
    with self.subTest("malformed-rows"), self._bound_jobs(str(malformed)):
-    with self.assertRaisesRegex(G.WorkerRouteError,"expected=.* observed=") as ctx:
-     G.validate_route_contract(path,"execute",repo,repo,current_attempt="att-current")
-    self.assertEqual(ctx.exception.reason,"route-source-commit-mismatch")
+    _,node,_=G.validate_route_contract(path,"execute",repo,repo,current_attempt="att-current")
+    self.assertEqual(node["id"],"execute")
 
- def test_mutation_retry_current_attempt_only_rejected(self):
-  # EX: the only matching row is the current launch's own identity -- self-evidence excluded.
+ def test_mutation_retry_passes_with_only_the_current_attempts_own_row(self):
+  # EX, retired by SD-156: a registry row -- even the current launch's own --
+  # is no longer evidence this gate reads at all.
   with tempfile.TemporaryDirectory() as td:
    repo,route,path=self._lineage_repo(td)
    (repo/"x").write_text("b"); subprocess.run(["git","-C",str(repo),"commit","-am","b","-q"],check=True)
    jobs=Path(td)/"jobs.log"; jobs.write_text("")
    self._write_registry_row(jobs,route["route_id"],"execute","att-current")
    with self._bound_jobs(str(jobs)):
-    with self.assertRaisesRegex(G.WorkerRouteError,"expected=.* observed=") as ctx:
-     G.validate_route_contract(path,"execute",repo,repo,current_attempt="att-current")
-    self.assertEqual(ctx.exception.reason,"route-source-commit-mismatch")
-    self._write_registry_row(jobs,route["route_id"],"execute","att-prior")
     _,node,_=G.validate_route_contract(path,"execute",repo,repo,current_attempt="att-current")
     self.assertEqual(node["id"],"execute")
 
@@ -345,174 +332,36 @@ class WorkerRouteGuardTest(unittest.TestCase):
    self.assertEqual(state,{"repository":"non-git","operation":"none","branch":"non-git","head":"unversioned"})
 
 class ContinuationRetryLineageTest(WorkerRouteGuardTest):
- """SD-133: an SD-67 retry carried by a continuation is adjudicated, not refused.
+ """SD-133/SD-67's retry-evidence lookup is retired by SD-156 (A73).
 
- A continuation gets a new `route_id`, so the prior attempt that IS the retry
- evidence lives under its ancestor's id. `_qualifying_retry_evidence` looked
- only under the route's own id, so the evidence could never be found: the node
- was refused `route-source-commit-mismatch` and the operator's only recourse was
- to re-dispatch in place on the original route. Reproduced on main.
+ A continuation's mutation node used to need a registry attempt found through
+ its lineage (`_qualifying_retry_evidence`) before a moved HEAD would pass.
+ SD-156 deletes that lookup: the continuation builder re-pins to any
+ descendant HEAD unconditionally (`_continuation_source_commit`), so the node
+ validates on the continuation with no registry evidence of any kind -- this
+ is A73-1's surviving assertion, kept because it is the one case the old
+ lookup existed to serve. A73-2/3/4 (evidence-shaped refusals) and A73-5
+ (multi-generation lineage walk) have no successor here: they asserted the
+ deleted lookup's own behaviour, which `WorkerRouteGuardTest`'s
+ `test_c_continuation_with_no_lineage_rows_still_repins_and_every_node_passes`
+ and `test_c_continuation_after_fast_forward_dispatches_pre_mutation_nodes`
+ already cover from the surviving side (no lineage rows, still passes).
  """
-
- def _lineage_fixture(self, td):
-  repo, source, _path = self._lineage_repo(td, lineage_rows=False)
-  jobs = Path(os.environ["AGENT_DISPATCH_JOBS"])
-  execute = next(n for n in source["nodes"] if n["id"] == "execute")
-  self.assertIn("execute", source.get("resume_retry_boundaries", ()))
-  # execute ran once under the SOURCE route and its commit advanced HEAD.
-  self._write_registry_row(jobs, source["route_id"], "execute", "att-execute-prior")
-  (repo/"x").write_text("b")
-  subprocess.run(["git","-C",str(repo),"commit","-qam","execute output"],check=True)
-  continuation = self._continuation(source, repo)
-  # The pin stays inherited: this is the SD-67 decline, working as designed.
-  self.assertEqual(continuation["source_commit"], source["source_commit"])
-  self.assertNotEqual(continuation["route_id"], source["route_id"])
-  path = Path(td)/"continuation.json"
-  path.write_text(json.dumps(continuation))
-  return repo, source, continuation, path, execute
-
- def test_the_ancestors_attempt_is_found_through_the_lineage(self):
-  with tempfile.TemporaryDirectory() as td:
-   repo, source, continuation, path, _execute = self._lineage_fixture(td)
-   self.assertIn(source["route_id"], R.continuation_lineage_route_ids(continuation))
-   # Under the continuation's own id alone there is nothing -- which is why
-   # main refuses.
-   self.assertEqual(
-    G.FALLBACK.registry_rows(
-     Path(os.environ["AGENT_DISPATCH_JOBS"]), continuation["route_id"], "execute"),
-    [])
-   self.assertTrue(G._qualifying_retry_evidence(continuation, "execute", None))
 
  def test_the_mutation_node_now_validates_on_the_continuation(self):
   with tempfile.TemporaryDirectory() as td:
-   repo, _source, _continuation, path, _execute = self._lineage_fixture(td)
+   repo, source, _path = self._lineage_repo(td, lineage_rows=False)
+   # execute ran once under the SOURCE route and its commit advanced HEAD --
+   # no registry row is written for it here, unlike the pre-SD-156 fixture.
+   (repo/"x").write_text("b")
+   subprocess.run(["git","-C",str(repo),"commit","-qam","execute output"],check=True)
+   continuation = self._continuation(source, repo)
+   self.assertNotEqual(continuation["route_id"], source["route_id"])
+   self.assertIn("source_commit_rebind", continuation)
+   path = Path(td)/"continuation.json"
+   path.write_text(json.dumps(continuation))
    _route, node, _git = G.validate_route_contract(path, "execute", repo, repo)
    self.assertEqual(node["id"], "execute")
-
- def test_without_the_ancestor_attempt_the_node_is_still_refused(self):
-  # The gate did not go away: remove the evidence and the same call refuses.
-  with tempfile.TemporaryDirectory() as td:
-   repo, _source, _continuation, path, _execute = self._lineage_fixture(td)
-   Path(os.environ["AGENT_DISPATCH_JOBS"]).write_text("", encoding="utf-8")
-   with self.assertRaises(G.WorkerRouteError) as ctx:
-    G.validate_route_contract(path, "execute", repo, repo)
-   self.assertEqual(ctx.exception.reason, "route-source-commit-mismatch")
-
- def test_an_attempt_on_a_different_node_does_not_authorise_this_one(self):
-  # The widening is about WHERE the evidence may live, not WHAT counts as
-  # evidence. An ancestor's attempt on `plan` must not license an `execute`
-  # retry -- without the node filter it would, because the lineage read
-  # returns every row for every ancestor route.
-  with tempfile.TemporaryDirectory() as td:
-   repo, source, _continuation, path, _execute = self._lineage_fixture(td)
-   jobs = Path(os.environ["AGENT_DISPATCH_JOBS"])
-   jobs.write_text("", encoding="utf-8")
-   self._write_registry_row(jobs, source["route_id"], "plan", "att-plan-prior")
-   with self.assertRaises(G.WorkerRouteError) as ctx:
-    G.validate_route_contract(path, "execute", repo, repo)
-   self.assertEqual(ctx.exception.reason, "route-source-commit-mismatch")
-
- def test_the_immediate_parent_arrives_by_two_paths(self):
-  # For the FIRST generation only, `source_route_id` and the single
-  # `supersession_edges` entry both name the same predecessor, so dropping
-  # either alone changes nothing here. That redundancy does not extend to
-  # grandparents -- see the next test, which is the majority shape in
-  # production.
-  with tempfile.TemporaryDirectory() as td:
-   _repo, source, continuation, _path, _execute = self._lineage_fixture(td)
-   self.assertEqual(continuation["source_route_id"], source["route_id"])
-   self.assertIn(source["route_id"],
-                 [edge.get("from_route_id")
-                  for edge in continuation.get("supersession_edges", [])])
-
- def test_a_grandparents_attempt_reaches_only_through_supersession_edges(self):
-  # The second generation is where the edges stop being redundant: the
-  # grandparent is named by NO `source_route_id` on this record, only by an
-  # inherited edge. I claimed this branch was un-catchable; it is not, and it
-  # is the majority path -- 16 of 31 production continuation records carry two
-  # or more edges (independent review, 2026-09-06).
-  with tempfile.TemporaryDirectory() as td:
-   repo, grandparent, first, _path, _execute = self._lineage_fixture(td)
-   # Resume at the first node, as the first generation did: a later resume
-   # point would need reused-evidence markers for the skipped prefix, which is
-   # a different contract and not what this test is about.
-   head_node = first["nodes"][0]["id"]
-   second = R.build_continuation_route(
-    first, resume_from_node=head_node, requested_boundary=head_node,
-    reason="second-generation", artifact_root=first["artifact_root"])
-   self.assertEqual(second["source_route_id"], first["route_id"])
-   self.assertNotEqual(second["source_route_id"], grandparent["route_id"])
-   # The grandparent is reachable only through the inherited edges.
-   edges = [edge.get("from_route_id") for edge in second.get("supersession_edges", [])]
-   self.assertIn(grandparent["route_id"], edges)
-   self.assertIn(grandparent["route_id"], R.continuation_lineage_route_ids(second))
-   # And its attempt is what admits the node two generations later.
-   self.assertTrue(G._qualifying_retry_evidence(second, "execute", None))
-   path = Path(td)/"second.json"
-   path.write_text(json.dumps(second))
-   _route, node, _git = G.validate_route_contract(path, "execute", repo, repo)
-   self.assertEqual(node["id"], "execute")
-
- def test_a_node_outside_resume_retry_boundaries_is_still_refused(self):
-  # SD-67's first condition is untouched: only a declared boundary may retry.
-  with tempfile.TemporaryDirectory() as td:
-   repo, _source, continuation, path, _execute = self._lineage_fixture(td)
-   stripped = json.loads(json.dumps(continuation))
-   stripped["resume_retry_boundaries"] = [
-    n for n in stripped.get("resume_retry_boundaries", []) if n != "execute"]
-   # Re-seal so the record still verifies with the narrowed boundary set.
-   stripped["route_hash"] = R.route_hash(stripped)
-   stripped["route_id"] = "rt-" + stripped["route_hash"].split(":",1)[1][:16]
-   narrowed = Path(td)/"narrowed.json"
-   narrowed.write_text(json.dumps(stripped))
-   with self.assertRaises(G.WorkerRouteError) as ctx:
-    G.validate_route_contract(narrowed, "execute", repo, repo)
-   self.assertEqual(ctx.exception.reason, "route-source-commit-mismatch")
-
-
-class QualifyingSubsessionLineageDeferredTest(unittest.TestCase):
- """C4 (S3a): the AND predicate's two success atoms via verdict_pass/success_note."""
-
- def _row(self, *, route_id, node_id, attempt_id, status, extra):
-  meta = {"route_id": route_id, "route_node": node_id, "attempt_id": attempt_id}
-  meta.update(extra)
-  pipe = ",".join(f"{k}={v}" for k, v in meta.items())
-  return "\t".join(["2026-09-24T00:00:00Z", status, "repo", "worktree", "slug", pipe])
-
- def _current_row(self, route_id, node_id, chain, count=2, index=2):
-  return self._row(route_id=route_id, node_id=node_id, attempt_id="att-current", status="open", extra={
-   "stage_authority": "0", "subsession_purpose": "planned", "subsession_mode": "serial",
-   "session_chain_id": chain, "subsession_index": str(index), "subsession_count": str(count),
-  })
-
- def test_pending_deferred_predecessor_does_not_qualify(self):
-  with tempfile.TemporaryDirectory() as td:
-   jobs = Path(td) / "jobs.log"
-   route_id, node_id, chain = "rt-lineage-fixture", "execute", "ssc-fixture"
-   predecessor = self._row(route_id=route_id, node_id=node_id, attempt_id="att-pred", status="done", extra={
-    "stage_authority": "0", "subsession_purpose": "planned", "session_chain_id": chain,
-    "subsession_count": "2", "subsession_index": "1",
-    "note": "completion-deferred", "failure_class": "infrastructure",
-    "classifier_source": "registered-wrapper-completion-transient-v1",
-   })
-   jobs.write_text(self._current_row(route_id, node_id, chain) + "\n" + predecessor + "\n", encoding="utf-8")
-   with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs)}):
-    self.assertFalse(G._qualifying_subsession_lineage(route_id, node_id, "att-current"))
-
- def test_marker_bound_deferred_predecessor_qualifies(self):
-  with tempfile.TemporaryDirectory() as td:
-   jobs = Path(td) / "jobs.log"
-   route_id, node_id, chain = "rt-lineage-fixture", "execute", "ssc-fixture"
-   predecessor = self._row(route_id=route_id, node_id=node_id, attempt_id="att-pred", status="done", extra={
-    "stage_authority": "0", "subsession_purpose": "planned", "session_chain_id": chain,
-    "subsession_count": "2", "subsession_index": "1",
-    "note": "completed-marker", "failure_class": "infrastructure",
-    "classifier_source": "registered-wrapper-completion-transient-v1",
-    "completion_marker": "/artifacts/.runtime/completions/execute.json",
-   })
-   jobs.write_text(self._current_row(route_id, node_id, chain) + "\n" + predecessor + "\n", encoding="utf-8")
-   with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs)}):
-    self.assertTrue(G._qualifying_subsession_lineage(route_id, node_id, "att-current"))
 
 
 if __name__=="__main__": unittest.main()

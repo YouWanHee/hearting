@@ -47,7 +47,7 @@ Derive verification rigor from the plan's selected `--intensity` context under [
 | `thorough` | Multi-axis review only when selected by `intensity=thorough` | Up to two synthesized corrections |
 | `adversarial` | Thorough review plus explicit failure-mode, security, and adversarial critique when available | Explicit unavailable requests fail loudly; automatic escalation falls back to thorough and reports it |
 
-After the `plan/plan-author` unit returns, run only the review action selected by the caller's graph. Do not open a repeated QA loop merely because the rigor tier is high. Add unresolved concerns to the plan's risk or unresolved section after the selected budget and report them to the caller.
+After the `plan/plan-author` unit returns, run only the review action selected by the caller's graph. Do not open a repeated QA loop merely because the rigor tier is high. A refinement is one **verdict round** against the caller's shared `review_round_cap.round_budget` (`CONVENTIONS §1.1`); a crashed or capacity-dead prior round never spent it, so this refinement may still be the first real correction even when it is not the first attempt. Add unresolved concerns to the plan's risk or unresolved section after the selected budget and report them to the caller.
 
 ## Task
 

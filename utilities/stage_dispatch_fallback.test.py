@@ -182,13 +182,18 @@ class FallbackTest(unittest.TestCase):
     code=exc.code
   return code,printed
  def seed_review_rounds(self,route_id,node_id,count):
-  """Prior closed rounds in the production registry shape (`route_id=`)."""
+  """Prior closed rounds in the production registry shape (`route_id=`).
+
+  SD-153: a review verdict must be a real blocking finding, not a crash --
+  `completed-review-blocking` spends the round budget the way `dead-worker-
+  fail` (a crash, never a review verdict) no longer does on its own.
+  """
   with self.jobs.open("a",encoding="utf-8") as fh:
    for i in range(1,count+1):
     fh.write(
      f"2026-08-29T00:00:0{i}Z\tdone\t{self.repo}\t{self.repo}\tround-{node_id}-{i}\t"
      "attempt_schema_version=2,dispatch_depth=2,registered_worker=1,"
-     f"route_id={route_id},route_node={node_id},note=dead-worker-fail,"
+     f"route_id={route_id},route_node={node_id},note=completed-review-blocking,"
      f"attempt_id=att-{node_id}-round-{i}\n")
  def test_review_round_cap_rejects_the_over_budget_round(self):
   # This wrapper carries ordinary standard+ depth-2 work and had no cap check
@@ -217,6 +222,42 @@ class FallbackTest(unittest.TestCase):
    self.seed_review_rounds(route["route_id"],"plan-check",cap-1)
    code,printed=self.run_review_inline(path)
   self.assertNotIn("reason=review-round-budget-exhausted",printed)
+
+ def test_review_round_cap_correction_round_attaches_protocol_block_to_prompt_file(self):
+  # Plan-correction B2 (third surface): unlike dispatch-node.py (which builds
+  # its own prompt) and dispatch-batch.py (which gets the block for free by
+  # re-invoking dispatch-node.py for the actual leg -- see the comment beside
+  # this call site in stage-dispatch-fallback.py), THIS wrapper calls the
+  # adapter directly, so it must attach the identical
+  # `DISPATCH_NODE.round_protocol_block` output itself. Proves the wiring
+  # (the `--prompt-file` rewrite), not just the shared function (already
+  # unit-tested by review_round_cap.test.py::RoundProtocolParityTest).
+  with self.dispatch_env():
+   path=self.route(same_status="supported")
+   route=json.loads(path.read_text())
+   self.seed_parent()
+   self.seed_review_rounds(route["route_id"],"plan-check",1)
+   prompt_file=self.repo/"plan-check-prompt.md"
+   prompt_file.write_text("BASE PROMPT TEXT\n",encoding="utf-8")
+   argv=["stage-dispatch-fallback.py","--route",str(path),"--node","plan-check","--slug","fallback-plan-check",
+         "--parent","owner","--capability-mode","dev","--worker-mode","qa/plan-review",
+         "--model-role","fast reviewer","--jobs",str(self.jobs),
+         "--prompt-file",str(prompt_file),"--dry-run"]
+   with mock.patch.object(sys,"argv",argv):
+    observation=F.LAUNCH_TUPLE.ReportOnlyObservation()
+    code=F._dispatch(observation)
+   node=next(n for n in route["nodes"] if n["id"]=="plan-check")
+   round_rows=F.DISPATCH_NODE.prior_round_attempts(
+    self.jobs,route["route_id"],"plan-check",
+    route=route if node.get("kind")=="review-worker" else None)
+   budget=F.DISPATCH_NODE.admit_round(route,node,self.jobs,owner_attempt_id="att-fallback-parent").budget
+   expected_block=F.DISPATCH_NODE.round_protocol_block(
+    budget,round_rows,F.worker_type_for_kind(node["kind"]),node["id"])
+  self.assertEqual(code,0)
+  self.assertNotEqual(expected_block,"")
+  augmented=sorted(Path(self.jobs).parent.glob("round-protocol-plan-check-*.md"))
+  self.assertEqual(len(augmented),1,augmented)
+  self.assertEqual(augmented[0].read_text(encoding="utf-8"),"BASE PROMPT TEXT\n"+expected_block)
 
  def test_cross_harness_direct_precedes_inline(self):
   result=self.run_chain(self.route()); self.assertEqual(result.returncode,0,result.stdout+result.stderr)
@@ -1486,6 +1527,56 @@ class FallbackTest(unittest.TestCase):
    source=path.read_text(encoding="utf-8")
    self.assertIn("PRELAUNCH_PROCESS_BLOCK_REASONS",source,path)
    self.assertNotIn('startswith("predecessor-process-")',source,path)
+
+ # SD-154/B-2 defect #2 -----------------------------------------------------
+ def test_a_sd154_2_route_state_refusal_does_not_descend_to_inline(self):
+  """A wrapper that reports a route-state reason (13.59.3 rule 6) stops with
+  `child_spawned=0` -- it never falls to `selected_hop=inline`/
+  `runtime-unavailable`, the luna observation's actual mis-classification.
+
+  Uses the revised-evidence member of the set (not the gate's own missing-
+  dependency reason, which `dispatch_completion_marker.test.py`'s static
+  guardian keeps out of every file but `dispatch_contract.py` and the
+  adapters' generic relay).
+  """
+  stub_reason="completion-evidence-revised-unrecorded"
+  self.assertIn(stub_reason,F.ROUTE_STATE_REFUSAL_REASONS)
+  path=self.route()
+  real_run=subprocess.run
+  def fake_run(cmd,*args,**kwargs):
+   if any("dispatch-headless.py" in str(part) for part in cmd):
+    return SimpleNamespace(
+     returncode=65,
+     stdout=f"check=failed\nreason={stub_reason}\ndetail=plan\n",
+     stderr="",
+    )
+   return real_run(cmd,*args,**kwargs)
+  buf=io.StringIO()
+  with self.dispatch_env():
+   with mock.patch.object(F.subprocess,"run",side_effect=fake_run):
+    with contextlib.redirect_stdout(buf):
+     try:
+      code,_observation=self.run_inline(path)
+     except SystemExit as exc:
+      code=exc.code
+  output=buf.getvalue()
+  fields=F.output_fields(output)
+  self.assertEqual(code,65,output)
+  self.assertEqual(fields.get("reason"),stub_reason,output)
+  self.assertEqual(fields.get("child_spawned"),"0",output)
+  self.assertTrue(fields.get("next_action"),output)
+  self.assertNotIn("selected_hop=inline",output)
+  self.assertNotIn("runtime-unavailable",output)
+
+ # M1's real (not stubbed) `completion_marker_gate` half lives in
+ # `dispatch_completion_marker.test.py::CompletionMarkerTest::
+ # test_a_sd154_2_real_gate_reports_next_action_for_route_state_refusal`,
+ # which runs the real wrapper `--start` subprocess -- this file's own
+ # helpers only ever drive the wrapper as `--dry-run`, which never reaches
+ # `completion_marker_gate` (`action != "start"` returns immediately). This
+ # class's test above proves the OTHER half of the same regression: a
+ # fallback chain that receives that exact reason from a wrapper never
+ # descends to inline.
 
 
 class LaunchTupleReportOnlyTest(unittest.TestCase):

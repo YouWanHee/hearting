@@ -2,6 +2,7 @@
 """Materialize a registry route node onto existing adapter dispatch wrappers."""
 import argparse, importlib.util, json, os, subprocess, sys
 from collections import namedtuple
+from dataclasses import dataclass
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
@@ -286,7 +287,13 @@ def has_model_selection(adapter_args):
 # into "a fresh independent audit" again (observed 2026-08-24 rt-08dd7ba8: twelve
 # execute/impl-review rounds, each FAIL on a new finding).
 def prior_round_attempts(jobs, route_id, node_id, *, exclude_slug=None, exclude_attempt=None, route=None):
- """Return the prior registry rows for one exact route/node as (slug, note) pairs."""
+ """Return the prior registry rows for one exact route/node as (cols, metadata) pairs.
+
+ SD-153: callers used to get only (slug, note); `round_budget` needs the row
+ status (`cols[1]`) and the full metadata to classify live/unsettled/verdict/
+ verdict-less, so this now returns exactly what `review_round_records` does,
+ filtered the same way.
+ """
  prior=[]
  route_ids = {r["route_id"] for r in ROUTE.review_lineage_routes(route, node_id)} if route else {route_id}
  try:
@@ -296,7 +303,7 @@ def prior_round_attempts(jobs, route_id, node_id, *, exclude_slug=None, exclude_
  for cols, meta in ROUTE.review_round_records(lines, route_ids, node_id):
   if exclude_slug and cols[4]==exclude_slug and (meta.get("route_id") or meta.get("route"))==route_id: continue
   if exclude_attempt and meta.get("attempt_id")==exclude_attempt: continue
-  prior.append((cols[4],meta.get("note","")))
+  prior.append((cols,meta))
  return prior
 
 # C-14: only the plan-check/impl-review/test QA anchors carry a review/correction
@@ -307,25 +314,126 @@ def prior_round_attempts(jobs, route_id, node_id, *, exclude_slug=None, exclude_
 # fixes the kind, not a hand-kept id list -- enumerated exhaustively from
 # capabilities/topologies.json. dispatch_node.test.py asserts set equality
 # against that file, so a new review node in any recipe breaks the test rather
-# than silently escaping the cap.
-ROUND_CAPPED_NODE_IDS = frozenset({
-    "claim-verify", "critic-review", "fact-verify", "impl-review", "independent-verify",
-    "inspect", "plan-check", "post-deploy-verify", "qa", "quality-review", "release-review",
-    "review", "run-verify", "security-review", "smoke", "strategy-review", "verify",
-    "visual-verify",
-    # Declared exception: kind is pipeline-stage, but `test` is the QA anchor
-    # C-14 named. Every other exception must be explicit here too.
-    "test",
-})
+# than silently escaping the cap. Defined in `review_round_cap.py` (SD-153
+# rule 5) so `capability-route.py`'s marker writers share the exact same set
+# without a back-import cycle; this is a re-export name, never a call.
+ROUND_CAPPED_NODE_IDS = REVIEW_ROUND_CAP.ROUND_CAPPED_NODE_IDS
+
+@dataclass(frozen=True)
+class RoundAdmission:
+ """The shared admission decision for a launch surface: budget AND SD-154
+ auto-revision.
+
+ `auto_revisions` is every revision marker this call recorded (13.59.3 rule
+ 8) -- the launching surface does not need to report them separately, they
+ already exist on disk before `budget` is computed.
+ """
+ budget: object
+ auto_revisions: tuple = ()
+
+
+def _auto_record_revisions(route, node, jobs, rows, *, owner_attempt_id):
+ """SD-154 rule 8: before admitting D's next round, auto-record a revision
+ on each upstream N that is `revised-unrecorded` when D's last round was a
+ blocking FAIL that basis-verifies against N. Never launches anything --
+ only `publish_revision_locked` writes, under its own node lock.
+ """
+ if node["id"] not in ROUND_CAPPED_NODE_IDS or not rows or not owner_attempt_id:
+  return ()
+ last_status, last_meta = rows[-1]
+ worker_type = node.get("worker_type") or ("review" if node.get("kind") == "review-worker" else "test")
+ last_kind = REVIEW_ROUND_CAP.classify_round_row(
+  last_status, last_meta, worker_type=last_meta.get("worker_type") or worker_type,
+ )
+ if last_kind != "verdict":
+  return ()
+ last_note = last_meta.get("note", "")
+ last_blocking = (
+  last_note == ROUTE.REVIEW_BLOCKING_NOTE
+  or (last_note == "dead-worker-fail" and last_meta.get("failure_class") == "fail")
+ )
+ last_attempt = last_meta.get("attempt_id")
+ if not last_blocking or not last_attempt:
+  return ()
+ recorded = []
+ directory = ROUTE.completion_dir(route["route_id"], jobs=jobs)
+ for dep in node.get("depends_on", []):
+  dep_node = next((n for n in route.get("nodes", []) if n.get("id") == dep), None)
+  if dep_node is None:
+   continue
+  marker_path = directory / f"{dep}.json"
+  if not marker_path.is_file():
+   continue
+  currency = ROUTE.gate_currency(route, dep_node, marker_path)
+  if currency.state != "revised-unrecorded":
+   continue  # condition (1): only a revised-but-unrecorded upstream qualifies.
+  try:
+   marker = json.loads(marker_path.read_text(encoding="utf-8"))
+   evidence_path = Path(str((marker.get("evidence") or {}).get("path", "")))
+  except (OSError, ValueError):
+   continue
+  try:
+   ROUTE.revision_basis_verdict(route, dep_node, "review-findings", (last_attempt,), jobs=jobs)
+  except ValueError:
+   continue  # condition (3): basis verification failed -- next_action=revise stays manual.
+  try:
+   result = ROUTE.publish_revision_locked(
+    route, dep, evidence_path, basis="review-findings",
+    answers=(last_attempt,), author_attempt_id=owner_attempt_id,
+    recorded_by="runtime-auto", jobs=jobs,
+   )
+  except ValueError:
+   continue  # A kept integrity refusal: no write, no auto-revision recorded.
+  recorded.append(result["marker"])
+ return tuple(recorded)
+
+
+def admit_round(route, node, jobs, *, owner_attempt_id=None, exclude_slug=None, exclude_attempt=None):
+ """The one admission decision every registered launch surface reads.
+
+ Replaces the three separate `len(prior)+1 > max_round` comparisons that
+ used to live in dispatch-node.py, dispatch-batch.py and
+ stage-dispatch-fallback.py with a single call over the same row census
+ (`prior_round_attempts`) and the shared `RoundBudget` derivation. Also runs
+ SD-154 rule 8's auto-revision (idempotent: a second call over the same
+ state finds each upstream already `current`, not `revised-unrecorded`, and
+ records nothing more) before deriving the budget, so a closure-check that
+ rule 8 just unlocked is visible in the SAME call's `budget.round_kind`.
+ """
+ rows = prior_round_attempts(jobs, route["route_id"], node["id"], exclude_slug=exclude_slug,
+                             exclude_attempt=exclude_attempt,
+                             route=route if node.get("kind") == "review-worker" else None)
+ classified_rows = [(cols[1], meta) for cols, meta in rows]
+ auto_revisions = _auto_record_revisions(route, node, jobs, classified_rows, owner_attempt_id=owner_attempt_id)
+ dependency_revisions = ROUTE._dependency_revisions(route, node, jobs)
+ budget =REVIEW_ROUND_CAP.round_budget(route, node, classified_rows, revisions=dependency_revisions)
+ return RoundAdmission(budget=budget, auto_revisions=auto_revisions)
+
 
 max_review_rounds = REVIEW_ROUND_CAP.max_review_rounds
 review_budget_recovery_fields = REVIEW_ROUND_CAP.recovery_fields
 
-def round_protocol_block(round_no, worker_type, node_id, prior):
- """Render the assignment block that scopes a correction round."""
- if round_no<2: return ""
- history="; ".join(f"{slug} ({note or 'open'})" for slug,note in prior)
- head=(f"Round protocol (round {round_no} of route node `{node_id}`; prior attempts: {history}):\n"
+def round_protocol_block(budget, rows, worker_type, node_id):
+ """Render the assignment block that scopes a correction round.
+
+ `budget` is the `RoundBudget` `admit_round` already computed for this
+ launch; `rows` is the same `(cols, metadata)` census it was built from. A
+ verdict-less row (crashed, capacity-dead, invalid envelope -- never an
+ actual PASS/FAIL/blocking review) renders as "판정 없음(<note>)" in the
+ history so a correction round can tell a real prior finding apart from a
+ round that never reached one (SD-153 rule 5).
+ """
+ if budget.next_round<2: return ""
+ history_parts=[]
+ for cols,meta in rows:
+  slug=cols[4]; status=cols[1]; note=meta.get("note","")
+  kind=REVIEW_ROUND_CAP.classify_round_row(status,meta,worker_type=meta.get("worker_type") or worker_type)
+  if kind=="verdict-less":
+   history_parts.append(f"{slug} (판정 없음({note or status or 'open'}))")
+  else:
+   history_parts.append(f"{slug} ({note or 'open'})")
+ history="; ".join(history_parts)
+ head=(f"Round protocol (round {budget.next_round} of route node `{node_id}`; prior attempts: {history}):\n"
        "- This is a correction round, not a fresh pass. One correction consumes one unit of the intensity retry budget and must close the whole prior 🔴 list at once.\n")
  if worker_type=="review":
   body=("- Apply your unit's Round Protocol for round >= 2: read the prior round's review artifact first (the owner assignment names it; otherwise locate the latest `round_{N-1}.md` / `*_fix{M}.md` under the cycle's `_internal/`).\n"
@@ -541,23 +649,60 @@ def main():
  contract=assigned_contract(capability=route["capability"],worker_type=worker_type,route_node=node["id"],completion_gate=node.get("completion_gate"),root=ROOT)
  prior_rounds=prior_round_attempts(registry.path,route["route_id"],node["id"],exclude_slug=a.slug,exclude_attempt=a.attempt_id,
                                   route=route if node.get("kind")=="review-worker" else None) if not a.subsession_id else []
- round_no=len(prior_rounds)+1
+ # SD-153/SD-154: `admit_round` (budget + rule-8 auto-revision) is the one
+ # admission decision every registered launch surface (this main(),
+ # dispatch-batch.py, stage-dispatch-fallback.py) reads -- no surface keeps
+ # its own `len(prior)+1 > max_round` comparison, or its own auto-revision
+ # copy, any more. A subsession carries no stage-gate authority (common.md),
+ # so it gets the same no-op budget the manual empty-`prior_rounds` call
+ # always produced, without touching auto-revision at all.
+ admission=(
+  admit_round(route,node,registry.path,owner_attempt_id=a.parent,exclude_slug=a.slug,exclude_attempt=a.attempt_id)
+  if not a.subsession_id
+  else RoundAdmission(budget=REVIEW_ROUND_CAP.round_budget(route,node,[],revisions=()))
+ )
+ round_budget=admission.budget
  if a.node in ROUND_CAPPED_NODE_IDS and not a.subsession_id:
-  max_round=max_review_rounds(route["effective_intensity"])
-  if round_no>max_round:
+  if round_budget.state=="blocked-live":
+   print("check=failed")
+   print("reason=prior-attempt-still-live")
+   print(f"route_id={route['route_id']}")
+   print(f"route_node={a.node}")
+   print("child_spawned=0")
+   raise SystemExit(78)
+  if round_budget.state=="blocked-unsettled":
+   print("check=failed")
+   print("reason=round-unsettled")
+   print(f"route_id={route['route_id']}")
+   print(f"route_node={a.node}")
+   print("child_spawned=0")
+   raise SystemExit(65)
+  if round_budget.state=="exhausted":
    print("check=failed")
    print("reason=review-round-budget-exhausted")
    print(f"route_id={route['route_id']}")
    print(f"route_node={a.node}")
    print(f"effective_intensity={route['effective_intensity']}")
-   print(f"round={round_no}")
-   print(f"max_round={max_round}")
+   print(f"round={round_budget.next_round}")
+   print(f"max_round={round_budget.cap}")
    for key,value in review_budget_recovery_fields(node.get("kind")).items():
     print(f"{key}={value}")
    print("child_spawned=0")
    raise SystemExit(65)
- prompt_text=a.prompt_text+round_protocol_block(round_no,worker_type,node["id"],prior_rounds)
- if round_no>=2: print(f"correction_round={round_no}")
+  if round_budget.state=="verdictless-bound":
+   print("check=failed")
+   print("reason=review-verdictless-bound")
+   print(f"route_id={route['route_id']}")
+   print(f"route_node={a.node}")
+   print(f"effective_intensity={route['effective_intensity']}")
+   print(f"round={round_budget.next_round}")
+   print(f"max_round={round_budget.cap}")
+   for key,value in review_budget_recovery_fields(node.get("kind"),"verdictless-bound").items():
+    print(f"{key}={value}")
+   print("child_spawned=0")
+   raise SystemExit(65)
+ prompt_text=a.prompt_text+round_protocol_block(round_budget,prior_rounds,worker_type,node["id"])
+ if round_budget.correction_round: print(f"correction_round={round_budget.correction_round}")
  argv=[sys.executable,str(wrapper),"--"+a.action,"--worktree",route["cwd"],"--slug",a.slug,"--capability",route["capability"],"--capability-mode",route["capability_mode"],"--intensity",route["effective_intensity"],"--dispatch-depth",str(node.get("dispatch_depth",1)),"--worker-type",worker_type,"--unit",node.get("unit",""),"--assigned-contract",contract,"--owner",route["capability"],"--route-file",str(Path(a.route).resolve()),"--route-id",route["route_id"],"--route-hash",route["route_hash"],"--route-node",node["id"],"--registry-digest",route["registry_digest"],"--write-scope",";".join(node["write_scope"]),"--completion-gate",node["completion_gate"],"--jobs",str(registry.path),"--prompt-text",prompt_text]
  unit=node.get("unit","")
  if unit and not unit.startswith("_kernel/"):

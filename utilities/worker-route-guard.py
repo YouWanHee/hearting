@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -13,10 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location("capability_route", ROOT / "utilities" / "capability-route.py")
 ROUTE = importlib.util.module_from_spec(SPEC); SPEC.loader.exec_module(ROUTE)
-FALLBACK_SPEC = importlib.util.spec_from_file_location("stage_dispatch_fallback", ROOT / "utilities" / "stage-dispatch-fallback.py")
-FALLBACK = importlib.util.module_from_spec(FALLBACK_SPEC); FALLBACK_SPEC.loader.exec_module(FALLBACK)
 sys.path.insert(0, str(ROOT / "utilities"))
-from dispatch_attempt_policy import terminal_conflict_pending, verdict_pass, success_note
 
 
 class WorkerRouteError(ValueError):
@@ -62,126 +58,6 @@ def _scopes(value: str | None) -> list[str]:
 # imports. The continuation builder asks the same question when it decides
 # whether to keep a route's pin, and both must get the same answer.
 _worktree_mutating_scope = ROUTE.worktree_mutating_scope
-
-
-def _post_mutation_node(nodes: list[dict], node_id: str) -> bool:
-    by_id = {row["id"]: row for row in nodes}
-    mutating_ids = {row["id"] for row in nodes if any(_worktree_mutating_scope(s) for s in row.get("write_scope", []))}
-    seen: set[str] = set()
-    stack = list(by_id.get(node_id, {}).get("depends_on", []))
-    while stack:
-        dep = stack.pop()
-        if dep in seen: continue
-        seen.add(dep)
-        if dep in mutating_ids: return True
-        stack.extend(by_id.get(dep, {}).get("depends_on", []))
-    return False
-
-
-def _is_first_parent_descendant(cwd: Path, source_commit: str, head: str) -> bool:
-    result = subprocess.run(["git", "-C", str(cwd), "rev-list", "--first-parent", head], text=True, capture_output=True)
-    if result.returncode != 0: return False
-    return source_commit in result.stdout.split()
-
-
-def _direct_mutation_node(node: dict) -> bool:
-    return any(_worktree_mutating_scope(s) for s in node.get("write_scope", []))
-
-
-def _qualifying_retry_evidence(route: dict, node_id: str, current_attempt: str | None) -> bool:
-    """SD-67: a different prior global-registry attempt for this node.
-
-    SD-133: the lookup follows the route's own lineage, not just its id. A
-    continuation gets a new `route_id`, so the attempt that *is* the retry
-    evidence was written under an ancestor's id and this gate could never see
-    it -- an SD-67 retry carried by a continuation was refused rather than
-    adjudicated, and the operator's only route was to re-dispatch in place on
-    the original route.
-
-    The lineage comes from the record's `source_route_id` and
-    `supersession_edges`. **This is not an authentication boundary**, and an
-    earlier version of this comment wrongly said it was: `route_hash` is
-    unkeyed, and nothing checks that a named ancestor is semantically this
-    route's ancestor (same cwd, reachable chain). Anyone able to author a route
-    record could already set `source_commit` or `resume_retry_boundaries`
-    directly, and the registry this reads is the ambient
-    `AGENT_DISPATCH_JOBS` -- forgeable on `main` too. So this widening rests on
-    exactly the trust boundary the surrounding gate already assumed; it does
-    not add one, and it must not be cited as providing one.
-
-    The three SD-67 conditions are unchanged: the node must still be declared
-    in `resume_retry_boundaries`, the prior attempt must still be a different
-    one, and `HEAD` must still be a first-parent descendant of the pin. Only
-    *where the evidence may live* widened.
-    """
-    jobs_env = os.environ.get("AGENT_DISPATCH_JOBS")
-    if not jobs_env: return False
-    jobs_path = Path(jobs_env)
-    if not jobs_path.is_absolute() or not jobs_path.is_file(): return False
-    try:
-        rows = FALLBACK.registry_route_rows(
-            jobs_path, ROUTE.continuation_lineage_route_ids(route)
-        )
-        rows = [row for row in rows if row.get("route_node") == node_id]
-    except (OSError, ValueError):
-        return False
-    current = next((row for row in rows if row.get("attempt_id") == current_attempt), None)
-    if current and current.get("subsession_purpose") == "planned":
-        return False
-    return any(
-        row.get("attempt_id")
-        and row.get("attempt_id") != current_attempt
-        and (
-            not row.get("subsession_id")
-            or row.get("subsession_purpose") == "gap-retry"
-        )
-        for row in rows
-    )
-
-
-def _qualifying_subsession_lineage(
-    route_id: str, node_id: str, current_attempt: str | None
-) -> bool:
-    """A planned serial slice may consume a prior slice without becoming a retry."""
-    jobs_env = os.environ.get("AGENT_DISPATCH_JOBS")
-    if not jobs_env or not current_attempt:
-        return False
-    jobs_path = Path(jobs_env)
-    if not jobs_path.is_absolute() or not jobs_path.is_file():
-        return False
-    try:
-        rows = FALLBACK.registry_rows(jobs_path, route_id, node_id)
-    except (OSError, ValueError):
-        return False
-    current = next((row for row in rows if row.get("attempt_id") == current_attempt), None)
-    if not current or (
-        current.get("stage_authority") not in {"0", "false"}
-        or current.get("subsession_purpose") != "planned"
-        or current.get("subsession_mode") != "serial"
-        or not current.get("session_chain_id")
-    ):
-        return False
-    try:
-        current_index = int(current.get("subsession_index", "0"))
-        current_count = int(current.get("subsession_count", "0"))
-    except ValueError:
-        return False
-    if not 2 <= current_index <= current_count:
-        return False
-    return any(
-        row.get("attempt_id") != current_attempt
-        and row.get("session_chain_id") == current.get("session_chain_id")
-        and row.get("subsession_purpose") == "planned"
-        and row.get("stage_authority") in {"0", "false"}
-        and row.get("_status") == "done"
-        and verdict_pass(row)
-        and success_note(row)
-        and not terminal_conflict_pending(row)
-        and row.get("subsession_count") == current.get("subsession_count")
-        and str(row.get("subsession_index", "")).isdigit()
-        and int(row["subsession_index"]) == current_index - 1
-        for row in rows
-    )
 
 
 def validate_route_contract(route_path: str | Path, node_id: str, cwd: str | Path,
@@ -243,19 +119,44 @@ def validate_route_contract(route_path: str | Path, node_id: str, cwd: str | Pat
             raise _fail("tracked-gate-evidence-missing", "spec_read/artifact_guard not satisfied", rid)
         if gate["workflow_mode"] != "tracked": raise _fail("tracked-mode-mismatch", gate["workflow_mode"], rid)
     git = _git_state(actual_cwd)
-    if git["head"] != route["source_commit"]:
-        downstream_ok = (_post_mutation_node(route["nodes"], node_id)
-                      and _is_first_parent_descendant(actual_cwd, route["source_commit"], git["head"]))
-        mutation_retry_ok = (_direct_mutation_node(node)
-                      and node_id in route.get("resume_retry_boundaries", ())
-                      and _qualifying_retry_evidence(route, node_id, current_attempt)
-                      and _is_first_parent_descendant(actual_cwd, route["source_commit"], git["head"]))
-        planned_subsession_ok = (_direct_mutation_node(node)
-                      and node_id in route.get("resume_retry_boundaries", ())
-                      and _qualifying_subsession_lineage(route["route_id"], node_id, current_attempt)
-                      and _is_first_parent_descendant(actual_cwd, route["source_commit"], git["head"]))
-        if not (downstream_ok or mutation_retry_ok or planned_subsession_ok):
-            raise _fail("route-source-commit-mismatch", f"expected={route['source_commit']} observed={git['head']}", rid)
+    if git["head"] == route["source_commit"]:
+        git["source_lineage"] = {
+            "kind": "exact", "sealed": route["source_commit"],
+            "observed": git["head"], "distance": 0, "branch": git["branch"],
+        }
+    else:
+        # SD-156: one lineage verdict replaces the SD-65/SD-67/SD-128/SD-133
+        # position-and-retry-evidence branches. `exact`/`descendant` pass
+        # regardless of node position or prior registry attempts -- the
+        # continuation builder (`_continuation_source_commit`) already re-pins
+        # to any descendant HEAD, so this guard's only remaining question is
+        # whether the live tree is still on that sealed line of work at all.
+        verdict = ROUTE.source_lineage_verdict(actual_cwd, route["source_commit"])
+        observed = verdict.commits[0] if verdict.commits else git["head"]
+        git["source_lineage"] = {
+            "kind": verdict.kind, "sealed": route["source_commit"],
+            "observed": observed, "distance": verdict.distance, "branch": verdict.branch,
+        }
+        if verdict.kind == "diverged":
+            raise _fail(
+                "route-source-commit-mismatch",
+                f"expected={route['source_commit']} observed={git['head']}; "
+                "next_action=return to the sealed line of work (git switch back to the sealed "
+                "branch, or use reflog to restore the sealed commit) or compose a new route with "
+                "--parent-cycle <current cycle>",
+                rid,
+            )
+        if verdict.kind == "unverifiable":
+            # `unsafe-git-operation`/`unsafe-git-state` keep this guard's existing
+            # vocabulary (`_git_state` already raises them earlier for the cases
+            # it can see); any other unverifiable reason is the new, retryable
+            # token -- never read as a pass.
+            reason = (
+                verdict.reason if verdict.reason in ("unsafe-git-operation", "unsafe-git-state")
+                else "source-lineage-unverifiable"
+            )
+            raise _fail(reason, verdict.reason or "unverifiable", rid)
+        # descendant: passes, any node, any position.
     return route, node, git
 
 
@@ -287,9 +188,13 @@ def main() -> int:
     except WorkerRouteError as exc:
         print(json.dumps({"status":"blocked","reason":exc.reason,"detail":str(exc),"route_id":exc.route_id,"route_file":args.route}, sort_keys=True), file=sys.stderr)
         return 65
-    print(json.dumps({"status":"ok","action":"consume-route-only","route_id":route["route_id"],
+    source_lineage = git.pop("source_lineage", None)
+    output = {"status":"ok","action":"consume-route-only","route_id":route["route_id"],
           "node_id":node["id"],"tracking":route["tracking"],"cwd":route["cwd"],
-          "artifact_root":route["artifact_root"],"git":git}, sort_keys=True))
+          "artifact_root":route["artifact_root"],"git":git}
+    if source_lineage is not None:
+        output["source_lineage"] = source_lineage
+    print(json.dumps(output, sort_keys=True))
     return 0
 
 

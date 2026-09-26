@@ -1225,8 +1225,17 @@ class CompletionState:
 
 
 _PROVEN_BLOCKED_GATE_REASONS = frozenset({
-    "completion-attempt-not-current", "completion-evidence-hash-mismatch",
+    "completion-attempt-not-current", "completion-evidence-revised-unrecorded",
 })
+# SD-154 I-5: an evidence sha mismatch is `completion-evidence-revised-
+# unrecorded` now (owner can recover with `capability-route.py revise`).
+# `gate_currency`'s `integrity-broken:<reason>` family is proven-blocked in
+# spirit too, but its reason carries a variable suffix this exact-match set
+# (and its `dispatch_receipt_identity.COMPLETION_REASONS` mirror, consumed by
+# `claude-session-supervisor.py`/`codex-app-server-supervisor.py` outside this
+# package's fixed files) cannot widen to without a strict-membership consumer
+# change; left as a known gap for the next package/review rather than
+# reaching into those two files.
 
 
 def owner_completion_state(jobs, status, metadata) -> CompletionState:

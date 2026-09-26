@@ -47,6 +47,8 @@ from dispatch_contract import (
     dispatch_state_root,
     dispatch_state_roots,
     PRELAUNCH_PROCESS_BLOCK_REASONS,
+    ROUTE_STATE_REFUSAL_REASONS,
+    route_state_next_action,
     ensure_global_registry_writable,
     headless_attempt_policy,
     launch_orphan_watch,
@@ -70,6 +72,8 @@ from dispatch_contract import (
     supervisor_lease_path,
     validate_nested_eligibility,
     wait_governor_reservation_claim,
+    source_lineage_row_fields,
+    diff_attribution_lines,
 )
 from parent_next_directive import receipt_lines as parent_next_receipt_lines  # noqa: E402
 from dispatch_summary import launch_summary_owner  # noqa: E402
@@ -332,6 +336,18 @@ def fail(reason: str, code: int, **fields: str) -> int:
     for key, value in fields.items():
         print(f"{key}={value}")
     return code
+
+
+def completion_gate_fail_fields(error: DispatchContractError, route_file, route_node) -> dict:
+    """SD-154/B-2: a route-state refusal (13.59.3 rule 6) carries a supported
+    `next_action` so a caller stops instead of misreading it as a transient
+    runtime-unavailable and descending to inline."""
+    fields = {"detail": error.detail, "child_spawned": "0"}
+    if error.reason in ROUTE_STATE_REFUSAL_REASONS:
+        fields["next_action"] = error.next_action or route_state_next_action(
+            error.reason, error.detail, str(route_file), route_node,
+        )
+    return fields
 
 
 def read_launch_fence_failure(fd: int) -> tuple[dict[str, object] | None, bool]:
@@ -696,6 +712,38 @@ def scoped_external_directory_config(
     return json.dumps(config, ensure_ascii=False, separators=(",", ":"))
 
 
+def diff_attribution_prompt(args: argparse.Namespace) -> str:
+    """SD-156: `diff_base`/`pre_node_commits` lines for a node downstream of `execute`.
+
+    One shared computation (`dispatch_contract.diff_attribution_lines`), added
+    to the "Dispatch metadata:" block the three wrappers already assemble --
+    the only place prompt text is composed for every registered launch surface
+    (`stage-dispatch-fallback.py` forwards a prompt file built here, not its
+    own).
+    """
+    route_file = getattr(args, "route_file", None) or getattr(
+        getattr(args, "owner_route_binding", None), "route_file", None,
+    )
+    route_node = getattr(args, "route_node", None)
+    if not route_file or not route_node:
+        return ""
+    try:
+        route = json.loads(Path(route_file).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    node = next((row for row in route.get("nodes", []) if row.get("id") == route_node), None)
+    if node is None:
+        return ""
+    explicit_or_inherited_jobs = getattr(args, "jobs", None) or os.environ.get("AGENT_DISPATCH_JOBS", "")
+    jobs = (
+        Path(explicit_or_inherited_jobs)
+        if explicit_or_inherited_jobs
+        else dispatch_state_roots(args.agent_home)[0] / "jobs.log"
+    )
+    lines = diff_attribution_lines(route, node, jobs)
+    return "".join(f"- {line}\n" for line in lines)
+
+
 def prompt(args: argparse.Namespace) -> tuple[str, str]:
     if args.prompt_file and args.prompt_text:
         raise ValueError("--prompt-file and --prompt-text are mutually exclusive")
@@ -740,6 +788,7 @@ def prompt(args: argparse.Namespace) -> tuple[str, str]:
         # quick carries it as an argument, standard+ as the env binding;
         # the owner needs the path either way.
         f"- route_file: {getattr(args, 'route_file', None) or getattr(getattr(args, 'owner_route_binding', None), 'route_file', None) or '-'}\n"
+        f"{diff_attribution_prompt(args)}"
         f"- model_role: {getattr(args, 'resolved_model_settings', {}).get('role') or args.model_role or '-'}\n"
         f"- model_profile: {getattr(args, 'resolved_model_settings', {}).get('profile') or getattr(args, 'model_profile', None) or '-'}\n"
         f"- parent: {args.parent_slug or '-'}\n"
@@ -997,6 +1046,16 @@ def append_job(jobs: Path, args: argparse.Namespace) -> bool:
     for key in ("route_file", "route_id", "route_hash", "route_node", "registry_digest", "write_scope", "completion_gate", "harness_affinity"):
         value = getattr(args, key)
         if value:
+            pipe += f",{key}={value}"
+    if getattr(args, "route_validation", None):
+        # SD-156: `route_validation` is worker-route-guard's own JSON, already
+        # captured in `validate_route_record`. One helper merges its
+        # `source_lineage` fields the same way for every registered launch.
+        try:
+            validation_json = json.loads(args.route_validation)
+        except (TypeError, ValueError):
+            validation_json = {}
+        for key, value in sorted(source_lineage_row_fields(validation_json).items()):
             pipe += f",{key}={value}"
     if getattr(args, "owner_route_binding", None):
         pipe += (
@@ -1460,8 +1519,7 @@ def validate_route_record(args: argparse.Namespace) -> int:
         return fail(
             e.reason,
             78 if e.reason in PRELAUNCH_PROCESS_BLOCK_REASONS else 65,
-            detail=e.detail,
-            child_spawned="0",
+            **completion_gate_fail_fields(e, args.route_file, args.route_node),
         )
     return 0
 
@@ -1669,7 +1727,7 @@ def main(argv: list[str]) -> int:
         e.detail = recover_preview_gate_after_refusal(
             args.route_file, args.route_node, action, agent_home, jobs, e)
         return fail(e.reason, 78 if e.reason in PRELAUNCH_PROCESS_BLOCK_REASONS else 65,
-                    detail=e.detail, child_spawned="0")
+                    **completion_gate_fail_fields(e, args.route_file, args.route_node))
     # Item 5-1 (SD-48~50 exact parent binding), ported from the Claude wrapper.
     args.parent_binding = None
     if args.dispatch_depth == 2 and action in ("register", "start"):

@@ -341,28 +341,6 @@ def is_material_source(path: Path, repo: Path | None = None) -> bool:
         return False
 
 
-def current_commit(root: Path) -> str:
-    result = _run(["git", "-C", str(root), "rev-parse", "HEAD"])
-    return result.stdout.strip() if result.returncode == 0 else "unversioned"
-
-
-def _first_parent_descendant(root: Path, source_commit: str, head: str) -> bool:
-    """SD-67: a moved HEAD is mid-cycle progress, not a stale route, when it is
-    a first-parent descendant of the pinned ``source_commit``.
-
-    ``worker-route-guard.py`` accepts exactly this lineage for declared retry
-    boundaries; this guard denying it froze every multi-commit route after its
-    first commit — each later material edit and ``git commit`` died
-    ``route-source-commit-stale`` for the rest of the cycle (observed
-    2026-08-07, dispatch-orphan-fixes owner). Rewritten, reset, or divergent
-    history is still stale: only the same line of work, advanced, passes.
-    """
-    if not source_commit or head == "unversioned":
-        return False
-    result = _run(["git", "-C", str(root), "rev-list", "--first-parent", head])
-    return result.returncode == 0 and source_commit in result.stdout.split()
-
-
 def _load_route(path: Path) -> dict[str, Any]:
     try:
         if not path.is_absolute() or path.is_symlink() or path.stat().st_size > 2_000_000:
@@ -481,11 +459,34 @@ def verify_route(
         )
         suffix = f" [verifier={verdict[:160]}]" if verdict else ""
         raise RouteError(f"route-record-verification-failed{suffix}")
-    head = current_commit(expected_root)
-    if route.get("source_commit") != head and not _first_parent_descendant(
-        expected_root, str(route.get("source_commit") or ""), head
-    ):
-        raise RouteError("route-source-commit-stale")
+    # SD-156/B1: `verify --cwd` already computed the one shared lineage verdict
+    # (`capability-route.source_lineage_verdict`) against this same cwd -- read
+    # it off stdout instead of this hook running its own second git probe. The
+    # line is absent only for a non-git route (its `source_commit` is not a
+    # real sha), which this hook never staled on before either.
+    lineage_line = next(
+        (line for line in (result.stdout or "").splitlines() if line.startswith("source_lineage=")),
+        None,
+    )
+    if lineage_line is not None:
+        lineage = json.loads(lineage_line[len("source_lineage="):])
+        kind = lineage.get("kind")
+        if kind not in ("exact", "descendant"):
+            reason = lineage.get("reason")
+            if reason in ("unsafe-git-operation", "unsafe-git-state"):
+                raise RouteError(reason, context={"route_file": str(route_file), "lineage": lineage})
+            if kind == "unverifiable":
+                raise RouteError("source-lineage-unverifiable", context={"route_file": str(route_file), "lineage": lineage})
+            raise RouteError(
+                "route-source-commit-stale",
+                context={
+                    "route_file": str(route_file), "lineage": lineage,
+                    "next_action": (
+                        "git switch back to the sealed branch or use reflog to return to the "
+                        "sealed commit, or compose a new route with --parent-cycle <current cycle>"
+                    ),
+                },
+            )
     if not allow_closed and route_is_closed(route_file):
         raise RouteError("route-closed", context={"route_file": str(route_file)})
     if expected_route_id and route.get("route_id") != expected_route_id:

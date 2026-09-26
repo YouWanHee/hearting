@@ -111,8 +111,17 @@ except d.DispatchContractError as e: print(json.dumps({'reason':e.reason}))
         evidence = self.root / "passed.md"; evidence.write_text("PASS\n")
         marker_path = route_module.completion_dir(route["route_id"], jobs=self.jobs) / "test.json"
         marker_path.parent.mkdir(parents=True)
-        marker_path.write_text(json.dumps({**marker, "route_id": "rt-policy", "node_id": "test",
-            "evidence": {"path": str(evidence), "sha256": route_module.evidence_digest(evidence)}}))
+        # SD-154 A-2: `_marker_identity_row` now proves schema-v2 identity via
+        # `evidence_currency` (single evidence-sha recompute site, A-SD154-8) --
+        # the same schema/sequence/history-byte shape every real
+        # `write_completion_marker` marker carries -- so the on-disk marker
+        # needs those fields too. `marker` itself stays the small dict the rest
+        # of this test passes straight to `completion_attempt_readiness`, which
+        # never reads schema_version/sequence.
+        disk_marker = {**marker, "schema_version": 2, "sequence": 1, "route_id": "rt-policy", "node_id": "test",
+            "evidence": {"path": str(evidence), "sha256": route_module.evidence_digest(evidence)}}
+        marker_path.write_text(json.dumps(disk_marker))
+        (marker_path.parent / "test.1.json").write_text(json.dumps(disk_marker))
         marker_bytes = marker_path.read_bytes()
         observe = lambda: route_module._marker_identity_row(route, node, "test", None, jobs=self.jobs)
         self.assertTrue(observe()["passed"])

@@ -218,6 +218,12 @@ class FrameAssignmentPromptTest(unittest.TestCase):
                         "--dispatch-depth","1","--prompt-text","Write the final task results to final_report.md.",*model])
                     args.artifact_root=str(root);args.route_file=str(route);args.route_node="frame-alternative"
                     args.route_id="rt-frame"
+                    # SD-156: `dispatch_prompt`/`prompt` now call
+                    # `diff_attribution_prompt`, which reads `args.agent_home` --
+                    # `main()` sets this post-parse in real operation
+                    # (`args.agent_home = resolve_agent_home()`); this fixture
+                    # calls the prompt builder directly, so it must set it too.
+                    args.agent_home=module.resolve_agent_home()
                     render=module.prompt if harness=="opencode" else module.dispatch_prompt
                     text,_=render(args)
                     self.assertIn("User goal to analyze (the later owner's task)",text)
