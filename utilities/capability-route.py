@@ -4577,6 +4577,29 @@ def write_completion_marker(
             route,node_id,replayed,review_identity,review_claim,
         )
         return replayed
+    # SD-153 rule 3 (A-SD153-4): an owner-inline completion of a capped
+    # review node records WHY it closed without a registered verdict. The
+    # census is read-only (jobs, if given, is never used to admit or refuse
+    # this completion) so it is safe to compute even on the "attempt row
+    # absent" inline path -- the one route through which a verdictless-bound
+    # node ever gets a marker at all.
+    round_census=None
+    if jobs is not None and node.get("kind")=="review-worker":
+        jobs_path=Path(jobs)
+        if jobs_path.is_file():
+            lines=jobs_path.read_text(encoding="utf-8",errors="replace").splitlines()
+            rounds=_review_round_rows(lines,route["route_id"],node_id)
+            try:
+                budget=REVIEW_ROUND_CAP.round_budget(route,node,rounds)
+            except ValueError:
+                budget=None
+            if budget is not None and budget.state=="verdictless-bound":
+                round_census={
+                    "verdict_rounds":budget.verdict_rounds,
+                    "verdictless_rounds":budget.verdictless_rounds,
+                    "cap":budget.cap,
+                    "closure_class":"review-verdictless-bound",
+                }
     sequence=_next_marker_sequence(directory,node_id)
     marker={
         "schema_version":2,
@@ -4589,6 +4612,7 @@ def write_completion_marker(
         # match for a replay to be the same completion. Empty for every node
         # kind but `review-worker`.
         **review_identity,
+        **({"round_census":round_census} if round_census else {}),
         "completion_gate":node["completion_gate"],
         "evidence":{"path":str(evidence),"sha256":sha},
         "sequence":sequence,

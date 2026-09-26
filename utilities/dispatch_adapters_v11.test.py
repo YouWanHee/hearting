@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import contextlib, importlib.util, io, os, shutil, subprocess, sys, tempfile, threading, unittest
+import contextlib, importlib.util, io, json, os, shutil, subprocess, sys, tempfile, threading, unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
@@ -168,6 +168,91 @@ class AdapterV11Test(unittest.TestCase):
     self.assertEqual(blocked.returncode,73,blocked.stdout+blocked.stderr)
     self.assertIn("reason=global-registry-unwritable",blocked.stdout)
     self.assertIn("child_spawned=0",blocked.stdout)
+ def test_a_sd156_1_claude_wrapper_registered_launch_writes_source_lineage_row_fields(self):
+  """A-SD156-1, claude wrapper leg: a REAL registered `--register` launch
+  (real `worker-route-guard.py validate` subprocess, real git repo, real
+  route compiled by `capability-route.py`) on a first-parent descendant HEAD
+  must write `launch_head`/`source_commit_sealed` onto the registry row --
+  the fact `dispatch_contract.test.py::SourceLineageRowFieldsTest` only
+  proves for the merge helper in isolation, never through an actual wrapper
+  launch (the previous execute attempt's own documented gap)."""
+  import importlib.util as _ilu
+  route_spec=_ilu.spec_from_file_location("a_sd156_1_route_module",ROOT/"utilities/capability-route.py")
+  ROUTE_MODULE=_ilu.module_from_spec(route_spec); route_spec.loader.exec_module(ROUTE_MODULE)
+  with tempfile.TemporaryDirectory() as td:
+   root=Path(td); repo,art=self.fixture(root); jobs=root/"jobs.log"; logs=root/"logs"
+   agent_home=root/"agent-home"; (agent_home/"core").mkdir(parents=True)
+   (agent_home/"core"/"CORE.md").write_text("fixture\n",encoding="utf-8")
+   fakebin=root/"bin"; fakebin.mkdir()
+   fake=fakebin/"claude"; fake.write_text("#!/bin/sh\nexec sleep 60\n",encoding="utf-8"); fake.chmod(0o755)
+   env={"PATH":str(fakebin)+os.pathsep+os.environ.get("PATH",""),
+        "AGENT_HOME":str(agent_home),"AGENT_ARTIFACT_ROOT":str(art),
+        "OPENCODE_CONFIG_CONTENT":"{}","HOME":str(root/"home")}
+   (root/"home").mkdir()
+   evidence_rows=[{
+    "parent_harness":h,"parent_transport":"headless",
+    "parent_sandbox":ROUTE_MODULE.WRAPPER_PARENT_SANDBOXES[h][0],
+    "child_harness":h,"launch_authority":"conductor","status":"supported",
+    "probe_source":f"{h}-fixture","probe_time":"2026-07-16T00:00:00Z","failure_class":"",
+    "checked_worktree":str(repo.resolve()),"failure_scope":"none",
+    "codex_command":"ok" if h=="codex" else "not-applicable","retry_on_isolated_worktree":0,
+   } for h in ("codex","claude","opencode")]
+   gate={"spec_read":{"satisfied":True,"source":"fixture"},"drift_verdict":"within-spec",
+         "workflow_mode":"tracked","artifact_guard":{"satisfied":True,"source":"fixture"}}
+   with mock.patch.dict(os.environ,env,clear=True):
+    ROUTE_MODULE._forget_launch_path(ROOT)
+    route=ROUTE_MODULE.compile_route(
+     "autopilot-code","dev","standard",repo,art,
+     signals=[],transport="headless",tracking="tracked",
+     tracked_gate_evidence=gate,dispatch_evidence={"tuples":evidence_rows,"native_subagent":[]},
+    )
+   sealed=route["source_commit"]
+   route_path=root/"route.json"; route_path.write_text(json.dumps(route),encoding="utf-8")
+   # X (sealed) is compile()'s own HEAD; commit a first-parent child Y before
+   # this node's worker guard validates -- exactly A-SD156-1's fixture shape.
+   (repo/"y").write_text("y",encoding="utf-8")
+   subprocess.run(["git","-C",str(repo),"add","y"],check=True)
+   subprocess.run(["git","-C",str(repo),"commit","-qm","descendant commit"],check=True)
+   observed=subprocess.run(["git","-C",str(repo),"rev-parse","HEAD"],text=True,capture_output=True,check=True).stdout.strip()
+   self.assertNotEqual(observed,sealed)
+   proc=subprocess.Popen(["sleep","60"]); self.parent_procs.append(proc)
+   start=(Path("/proc")/str(proc.pid)/"stat").read_text().split()[21]
+   jobs.write_text(
+    f"2026-07-23T00:00:00Z\topen\t{repo}\t{repo}\towner\t"
+    "attempt_schema_version=2,dispatch_depth=1,transport=headless,"
+    "execution_surface=registered-headless,registered_worker=1,"
+    "fallback_hop=same-harness-headless,worker_type=owner,harness=claude,"
+    "runtime_sandbox=adapter-default,"
+    f"attempt_id=att-parent-fixture,pid={proc.pid},pid_start={start}\n")
+   env["AGENT_DISPATCH_ATTEMPT_ID"]="att-parent-fixture"
+   env["AGENT_DISPATCH_CHILD"]="1"
+   node=next(n for n in route["nodes"] if n["id"]=="plan")
+   cmd=[sys.executable,str(ROOT/"adapters/claude/bin/dispatch-headless.py"),
+    "--register","--worktree",str(repo),"--slug","claude-plan-sd156-1",
+    "--capability","autopilot-code","--capability-mode",route["capability_mode"],
+    "--worker-mode",node["unit"],
+    "--intensity",route["effective_intensity"],"--dispatch-depth","2","--parent","owner",
+    "--worker-role","code-plan","--owner","autopilot-code",
+    "--jobs",str(jobs),"--log-dir",str(logs),
+    "--parent-harness","claude","--parent-transport","headless","--parent-sandbox","adapter-default",
+    "--launch-authority","conductor","--nested-eligibility","supported",
+    "--eligibility-source","claude-fixture","--fallback-ordinal","1",
+    "--route-file",str(route_path),"--route-id",route["route_id"],
+    "--route-hash",route["route_hash"],"--route-node","plan",
+    "--registry-digest",route["registry_digest"],
+    "--write-scope",";".join(node["write_scope"]),
+    "--unit",node.get("unit",""),
+    "--model-role",node["role"],"--model-profile",node["model_profile"],
+   ]
+   result=subprocess.run(cmd,text=True,capture_output=True,env=env)
+   self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+   lines=[l for l in jobs.read_text(encoding="utf-8").splitlines() if "claude-plan-sd156-1" in l]
+   self.assertEqual(len(lines),1,lines)
+   row=lines[0]
+   self.assertIn(f"launch_head={observed}",row)
+   self.assertIn(f"source_commit_sealed={sealed}",row)
+   self.assertIn("source_commit_distance=1",row)
+
  def test_launch_home_row_field_is_the_resolved_release_never_the_current_symlink(self):
   # SD-115 axis 4 (a): a wrapper launched under a mutable pointer (the real
   # shape is `<share>/hearting/current`, mirrored here as a plain symlink to

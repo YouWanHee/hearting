@@ -3721,27 +3721,105 @@ class RouteLineageBindingTest(ProducerTestBase):
         self.assertEqual(admission.reason, "cycle-route-binding-mismatch:material-input")
         self.assertEqual(self._route_ids(begun["cycle_id"]), [a["route_id"]])  # write 0
 
-    # -- A-25.9 (representative subset; full matrix would dominate this file) --
+    # -- A-25.9 (full eleven-case matrix, §42.1 item 9) --------------------
     def test_a25_9_audit_record_tamper_changes_no_decision(self):
+        """Tampering the audit record (`route_bindings[]`) never changes any
+        admission judgment -- judgment reads only the sealed route files and
+        the record's begin `route_id`/`route_hash`/state/capability/intensity,
+        never `route_bindings` itself. The only thing tampering can move is
+        the *rewrite*: the next recording call (an owner begin or a finalize,
+        both funnelled through `_bind_cycle_route_locked`) restores
+        `[A, B, D]` and reports `route-binding-record-drift` unless the
+        tampered list was already a valid prefix of the correct chain (case
+        (f) -- "not yet bound further" is not evidence of tampering)."""
         a = self._root_route("lineage-a9")
         self._publish_root(a)
         begun = self._begin(a)
+        cid = begun["cycle_id"]
         b = self._continuation(a)
+        P.begin(self.root, route_file=R.canonical_route_path(self.root, b["route_id"]),
+               capability=b["capability"], intensity=b["effective_intensity"])
         d = self._continuation(b)
         P.begin(self.root, route_file=R.canonical_route_path(self.root, d["route_id"]),
                capability=d["capability"], intensity=d["effective_intensity"])
         f = self._root_route("lineage-f9")
         self._publish_root(f)
-        record = P.read_cycle_record(self.root, begun["cycle_id"])
-        tampered = dict(record, route_bindings=[record["route_bindings"][0], record["route_bindings"][2]])  # drop B
+        bpp = self._continuation(a, retint="quick", reason="lineage-fixture-a9-bpp")
+        self.assertEqual(self._route_ids(cid), [a["route_id"], b["route_id"], d["route_id"]])
+
+        base = P.read_cycle_record(self.root, cid)["route_bindings"]
+        a_e, b_e, d_e = (dict(e) for e in base)
+        f_e = P._route_binding_entry(f, self.root, is_begin=False)
+        bpp_e = P._route_binding_entry(bpp, self.root, is_begin=False)
+
+        # (a)-(k) exactly as artifact-path-contract §42.1 item 9 lists them.
+        cases = {
+            "a": [a_e, b_e, d_e, f_e],                                    # append F at the end
+            "b": [a_e, f_e, b_e, d_e],                                    # insert F in the middle
+            "c": [a_e, dict(b_e, route_hash="sha256:" + "2" * 64), d_e],  # B's route_hash changed
+            "d": [a_e, dict(b_e, route_id=f["route_id"]), d_e],           # B's route_id -> F
+            "e": [a_e, d_e, b_e],                                         # reorder
+            "f": [a_e, b_e],                                              # drop the tail ([A, B])
+            "g": [a_e, d_e],                                              # drop the middle ([A, D])
+            "h": [a_e, dict(b_e), dict(b_e), d_e],                        # duplicate B
+            "i": [a_e, bpp_e, d_e],                                       # B -> B''s sealed values
+            "j": [a_e, b_e, dict(d_e, basis="owner-correction")],         # basis changed
+            "k": [],                                                      # route_bindings wiped empty
+        }
+        for letter, bindings in cases.items():
+            with self.subTest(case=letter):
+                record = P.read_cycle_record(self.root, cid)
+                tampered = dict(record, route_bindings=[dict(e) for e in bindings])
+                P._write_cycle_record(self.root, tampered, exclusive=False)
+
+                for route in (a, b, d):
+                    self.assertTrue(P.cycle_route_admission(self.root, tampered, route).allow)
+                self.assertEqual(P.cycle_route_admission(self.root, tampered, f).reason,
+                                 "cycle-route-binding-mismatch")
+                self.assertEqual(P.cycle_route_admission(self.root, tampered, bpp).reason,
+                                 "cycle-route-binding-mismatch:material-input")
+                self.assertEqual(P.cycle_route_admission(self.root, tampered, b, finalize=True).reason,
+                                 "cycle-route-binding-mismatch:superseded-route")
+                self.assertTrue(P.cycle_route_admission(self.root, tampered, d, finalize=True).allow)
+                # Refused writes (F, B'') never touch the tampered bytes.
+                self.assertEqual(P.read_cycle_record(self.root, cid), tampered)
+
+                result = P.bind_cycle_route(self.root, cid, d)
+                self.assertTrue(result["written"])
+                if letter == "f":
+                    self.assertIsNone(result["advisory"])
+                else:
+                    self.assertIsNotNone(result["advisory"])
+                    self.assertTrue(result["advisory"].startswith("route-binding-record-drift"))
+                self.assertEqual(self._route_ids(cid), [a["route_id"], b["route_id"], d["route_id"]])
+
+    # -- A-25.9's D-finalize leg: a tampered record still seals routes[]=D --
+    def test_a25_9_finalize_seals_d_despite_tampered_audit_record(self):
+        a = self._root_route("lineage-a9fin")
+        self._publish_root(a)
+        begun = self._begin(a)
+        cid = begun["cycle_id"]
+        b = self._continuation(a)
+        P.begin(self.root, route_file=R.canonical_route_path(self.root, b["route_id"]),
+               capability=b["capability"], intensity=b["effective_intensity"])
+        d = self._continuation(b)
+        d_begin = P.begin(self.root, route_file=R.canonical_route_path(self.root, d["route_id"]),
+                          capability=d["capability"], intensity=d["effective_intensity"])
+        target = Path(d_begin["cycle_dir"]) / "artifacts" / "plan.md"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"body\n")
+        self._close(d)
+        record = P.read_cycle_record(self.root, cid)
+        a_e, b_e, d_e = record["route_bindings"]
+        # (h)-shaped tamper: duplicate B ahead of D.
+        tampered = dict(record, route_bindings=[a_e, dict(b_e), dict(b_e), d_e])
         P._write_cycle_record(self.root, tampered, exclusive=False)
-        for route in (a, b, d):
-            self.assertTrue(P.cycle_route_admission(self.root, tampered, route).allow)
-        self.assertEqual(P.cycle_route_admission(self.root, tampered, f).reason, "cycle-route-binding-mismatch")
-        result = P.bind_cycle_route(self.root, begun["cycle_id"], d)
-        self.assertEqual(result["written"], True)
-        self.assertIsNotNone(result["advisory"])
-        self.assertEqual(self._route_ids(begun["cycle_id"]), [a["route_id"], b["route_id"], d["route_id"]])
+        sealed = P.finalize(self.root, cycle_id=cid)
+        self.assertEqual(sealed["status"], "sealed")
+        manifest = json.loads((Path(d_begin["cycle_dir"]) / "manifest.json").read_text())
+        self.assertEqual(len(manifest["routes"]), 1)
+        self.assertEqual(manifest["routes"][0]["route_id"], d["route_id"])
+        self.assertEqual(self._route_ids(cid), [a["route_id"], b["route_id"], d["route_id"]])
 
     # -- A-25.10 --------------------------------------------------------
     def test_a25_10_sibling_fork_is_symmetric(self):

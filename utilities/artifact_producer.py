@@ -836,14 +836,21 @@ def _bind_cycle_route_locked(root: Path, record: Mapping[str, Any], route: Mappi
     if not admission.allow:
         raise ProducerError(admission.reason, admission.detail)
     expected = [_route_binding_entry(row, root, is_begin=(i == 0)) for i, row in enumerate(admission.path)]
-    stored = list(record.get("route_bindings") or [])
-    if not stored:
+    # A record that never had `route_bindings` at all reads as the compat
+    # single-element view (begin route only) -- a legitimate, common state.
+    # A record whose `route_bindings` field is *present but empty* is not:
+    # every real writer only ever stores a non-empty list (at least the begin
+    # entry), so an explicit `[]` can only be tampering (A-25.9 (k)) and must
+    # not be silently absorbed into the same "nothing bound yet" prefix match.
+    if "route_bindings" not in record:
         stored = [{**_route_binding_entry(admission.path[0], root, is_begin=True),
                   "bound_at": record.get("started_on")}]
+    else:
+        stored = list(record.get("route_bindings") or [])
     stored_core = [_binding_core(e) for e in stored]
     expected_core = [_binding_core(e) for e in expected]
     advisory = None
-    if stored_core == expected_core[: len(stored_core)]:
+    if stored and stored_core == expected_core[: len(stored_core)]:
         new_list = stored + [dict(e, bound_at=_rfc3339()) for e in expected[len(stored_core):]]
     else:
         index = 0

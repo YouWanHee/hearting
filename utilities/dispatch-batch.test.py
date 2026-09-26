@@ -487,6 +487,56 @@ class DispatchBatchTest(unittest.TestCase):
         reserve.assert_not_called()
         popen.assert_not_called()
 
+    def test_route_state_refusal_returns_next_action(self):
+        """A-SD154-2 / defect #2 (13.59.3 rule 6, B-2): a completion_marker_gate
+        refusal whose reason is in `ROUTE_STATE_REFUSAL_REASONS` -- this
+        fixture's `replica_node` nodes depend on `frame`/`frame-replica`,
+        which never published a marker anywhere, so the REAL (unmocked) gate
+        raises `completion-marker-missing` -- stops with exit 65,
+        `child_spawned=0`, and a carried `next_action`, never a `selected_hop`
+        descent toward an unregistered fallback the way a generic
+        `runtime-unavailable` failure would."""
+        self.route["dispatch_contract_version"] = 3
+        self.route_path.write_text(json.dumps(self.route), encoding="utf-8")
+        stack, assignments = self.common_patches()
+        output = io.StringIO()
+        with stack:
+            stack.enter_context(mock.patch.object(BATCH, "load_route", return_value=self.route))
+            stack.enter_context(mock.patch.object(BATCH, "assign_harnesses", return_value=(assignments, "cross-harness", {"families_considered": [], "usable_families": [], "family_exclusions": {}, "capacity": {}, "degradation_cause": ""})))
+            stack.enter_context(mock.patch.object(BATCH, "resolve_agent_home", return_value=self.base))
+            stack.enter_context(mock.patch.object(BATCH, "resolve_global_registry", return_value=SimpleNamespace(path=self.jobs)))
+            stack.enter_context(mock.patch.object(BATCH, "resolve_live_parent_attempt"))
+            # completion_marker_gate itself is deliberately NOT mocked here --
+            # every other full-flow test in this class stubs it out, which is
+            # exactly the coverage gap this test closes (the real gate's
+            # ROUTE_STATE_REFUSAL_REASONS handling was previously only proven
+            # by stub-returned BatchError objects, never a real refusal).
+            stack.enter_context(mock.patch.object(BATCH.subprocess, "check_output", return_value=str(self.base)))
+            reserve = stack.enter_context(mock.patch.object(BATCH, "reserve_batch"))
+            popen = stack.enter_context(mock.patch.object(BATCH.subprocess, "Popen"))
+            stack.enter_context(mock.patch.dict(os.environ, {
+                "AGENT_DISPATCH_SELF_SLUG": "owner",
+                "AGENT_DISPATCH_ATTEMPT_ID": "att-parent-fixture",
+                "AGENT_DISPATCH_CURRENT_HARNESS": "codex",
+                "AGENT_DISPATCH_CURRENT_TRANSPORT": "headless",
+                "AGENT_DISPATCH_CURRENT_SANDBOX": "workspace-write",
+            }))
+            with contextlib.redirect_stdout(output):
+                rc = BATCH.main(self.argv())
+        self.assertEqual(rc, 65)
+        receipt = json.loads(output.getvalue())
+        self.assertEqual(receipt["reason"], "completion-marker-missing")
+        self.assertIn("frame", receipt["detail"])
+        self.assertEqual(
+            {key: receipt[key] for key in ("admitted", "spawned", "registered", "started", "child_spawned")},
+            {"admitted": "0", "spawned": "0", "registered": "0", "started": "0", "child_spawned": "0"},
+        )
+        self.assertIn("next_action", receipt)
+        self.assertNotIn("selected_hop", receipt)
+        self.assertNotIn("runtime-unavailable", json.dumps(receipt))
+        reserve.assert_not_called()
+        popen.assert_not_called()
+
     def test_at5_partial_continuation_reuses_peers_and_claims_only_gap(self):
         source_legs = self.legs()
         _source_manifest, continuation, partial = self.partial_continuation(source_legs)

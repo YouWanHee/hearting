@@ -4,6 +4,7 @@ from unittest import mock
 from pathlib import Path
 
 P=Path(__file__).with_name("dispatch_contract.py")
+ROOT=P.parent.parent
 sys.path.insert(0,str(P.parent))
 import dispatch_contract as D
 from replica_batch_contract import build_manifest
@@ -5558,6 +5559,41 @@ class DiffAttributionTest(unittest.TestCase):
             # execute's direct dependent.
             report_node = route["nodes"][2]
             self.assertEqual(D.diff_attribution_lines(route, report_node, jobs), lines)
+
+    def test_a_sd156_5_claude_wrapper_prompt_carries_diff_attribution(self):
+        """A-SD156-5, claude wrapper leg: `test_a_sd156_5_impl_review_diff_base_
+        is_execute_launch_head` above proves `dispatch_contract.
+        diff_attribution_lines` itself; it never touches the wrapper's own
+        `diff_attribution_prompt`, which is the actual function the "Dispatch
+        metadata:" block calls (`dispatch-headless.py:671`). This drives the
+        real wrapper function, on a route file and jobs.log read from disk
+        exactly the way a live launch would, and asserts the assembled prompt
+        fragment contains `diff_base=`/`pre_node_commits=`."""
+        wrapper_path = ROOT / "adapters" / "claude" / "bin" / "dispatch-headless.py"
+        spec = importlib.util.spec_from_file_location("claude_wrapper_diff_attribution", wrapper_path)
+        wrapper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(wrapper)
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, sealed = self._repo(tmp)
+            (repo / "a").write_text("2")
+            subprocess.run(["git", "-C", str(repo), "commit", "-qam", "execute output"], check=True)
+            head = subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True, check=True,
+            ).stdout.strip()
+            route = self._route(repo, sealed)
+            route_path = Path(tmp) / "route.json"
+            route_path.write_text(json.dumps(route), encoding="utf-8")
+            jobs = Path(tmp) / "jobs.log"
+            pipe = f"route_id=rt-diff-fixture,route_node=execute,attempt_id=att-execute,launch_head={head}"
+            jobs.write_text(
+                "2026-09-26T00:00:00Z\tdone\trepo\tworktree\tslug\t" + pipe + "\n", encoding="utf-8",
+            )
+            args = type("Args", (), {
+                "route_file": str(route_path), "route_node": "test",
+                "agent_home": Path(tmp), "jobs": jobs,
+            })()
+            fragment = wrapper.diff_attribution_prompt(args)
+        self.assertEqual(fragment, f"- diff_base={head}\n- pre_node_commits={head}\n")
 
     def test_execute_node_itself_gets_no_diff_attribution(self):
         route = {"route_id": "rt", "nodes": [{"id": "execute", "depends_on": []}]}
