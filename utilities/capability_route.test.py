@@ -4644,6 +4644,48 @@ class SourceCensusTest(unittest.TestCase):
   self.assertIn("max_review_rounds = REVIEW_ROUND_CAP.max_review_rounds", node_text)
   self.assertNotIn("max_review_rounds(", node_text)
 
+ # SD-153 rule 5 correction: `round_census`'s `closure_class` vocabulary is
+ # closed and derived in exactly one function (`review_round_cap.marker_
+ # round_census`). Every writer (`write_completion_marker`, `publish_
+ # revision_locked`) calls it rather than hand-building the dict; this
+ # census fails if a future writer ever assembles a `closure_class`-keyed
+ # dict literal anywhere else across the surfaces that touch capped-node
+ # markers.
+ _CLOSURE_CLASS_ALLOWED_FUNCTIONS=frozenset({"marker_round_census"})
+
+ def test_a_sd153_5_round_census_only_built_by_marker_round_census(self):
+  import ast
+
+  class ClosureClassDictVisitor(ast.NodeVisitor):
+   def __init__(self):
+    self.stack=[]; self.hits=[]
+   def visit_FunctionDef(self,node):
+    self.stack.append(node.name); self.generic_visit(node); self.stack.pop()
+   def visit_Dict(self,node):
+    for key in node.keys:
+     if isinstance(key,ast.Constant) and key.value=="closure_class":
+      self.hits.append((self.stack[-1] if self.stack else "<module>",node.lineno))
+    self.generic_visit(node)
+
+  offenders=[]
+  for relative in (
+   "utilities/review_round_cap.py","utilities/capability-route.py",
+   "utilities/dispatch-node.py","utilities/dispatch-batch.py",
+   "utilities/stage-dispatch-fallback.py",
+  ):
+   path=P.parents[1]/relative
+   file_tree=ast.parse(path.read_text(encoding="utf-8"))
+   visitor=ClosureClassDictVisitor(); visitor.visit(file_tree)
+   for fn,ln in visitor.hits:
+    if fn not in self._CLOSURE_CLASS_ALLOWED_FUNCTIONS:
+     offenders.append(f"{relative}:{fn}:{ln}")
+  self.assertEqual(offenders,[],offenders)
+  # And every capped-node marker writer reaches that one function, rather
+  # than reading `round_census`/`closure_class` out of thin air.
+  route_text=(P.parents[1]/"utilities"/"capability-route.py").read_text(encoding="utf-8")
+  self.assertEqual(route_text.count("REVIEW_ROUND_CAP.marker_round_census("),2,
+                    "expected exactly two call sites: write_completion_marker, publish_revision_locked")
+
 
 class ContinuationSealedJobsFallbackTest(unittest.TestCase):
  """A pruned release tree must not strand a continuation on its sealed jobs root."""

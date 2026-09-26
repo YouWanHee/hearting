@@ -36,6 +36,41 @@ from dispatch_attempt_policy import (
 # a third registered round on the same kind of silence.
 VERDICTLESS_BOUND = 2
 
+# C-14: only the plan-check/impl-review/test QA anchors carry a review/correction
+# budget under CONVENTIONS §1.1. The cap applies to every recipe node with
+# kind == "review-worker" -- enumerated exhaustively from
+# capabilities/topologies.json (dispatch_node.test.py asserts set equality
+# against that file). Lives here, not in dispatch-node.py, so
+# capability-route.py's marker writers (SD-153 rule 5) can read the same set
+# without dispatch-node.py's back-import of capability-route.py becoming a
+# cycle; dispatch-node.py keeps `ROUND_CAPPED_NODE_IDS` as a re-export name.
+ROUND_CAPPED_NODE_IDS = frozenset({
+    "claim-verify", "critic-review", "fact-verify", "impl-review", "independent-verify",
+    "inspect", "plan-check", "post-deploy-verify", "qa", "quality-review", "release-review",
+    "review", "run-verify", "security-review", "smoke", "strategy-review", "verify",
+    "visual-verify",
+    # Declared exception: kind is pipeline-stage, but `test` is the QA anchor
+    # C-14 named. Every other exception must be explicit here too.
+    "test",
+})
+
+# SD-153 rule 5 (13.59.2): every marker of a `ROUND_CAPPED_NODE_IDS` node --
+# registered, owner-closure, revision, and inline alike -- carries a round
+# census naming one of these closure classes. Closed vocabulary so every
+# writer names the same thing the same way; `marker_round_census` below is the
+# only place that constructs one (`capability_route.test.py`'s source census
+# enforces this).
+CLOSURE_CLASSES = frozenset({
+    "registered-verdict",     # a registered worker's own completion (incl. a closure-check round)
+    "closure-check",          # a registered completion that landed the SD-154 rule 7 closure-check round
+    "owner-closure",          # SD-124 owner-closure over an exhausted/bound review budget
+    "revision",               # SD-154 `publish_revision_locked` over a capped node
+    "review-verdictless-bound",  # review node inline/native completion after the SD-153 rule 3 bound
+    "owner-run-verdictless",     # non-review capped node (e.g. `test`) owner-run after the bound
+    "owner-override-unlinked",   # inline completion over an unresolved blocking FAIL (SD-134 A75-9)
+    "inline-no-unresolved-fail", # plain inline completion, no unresolved blocking verdict in history
+})
+
 
 def recovery_fields(node_kind, state="exhausted"):
     """A budget ends automatic review, not ownership of the findings.
@@ -234,3 +269,90 @@ def round_budget(route, node, rows: Sequence[tuple[str, Mapping]], *, revisions=
         next_action=_NEXT_ACTION_BY_STATE[state],
         closure_check_used=closure_check_used,
     )
+
+
+def _last_round_blocking_verdict(rows, worker_type):
+    """True when the most recent terminated round is a real blocking verdict
+    (a review FAIL or a genuine test failure) -- SD-153 rule 5's "해소 안 된
+    blocking FAIL": an inline completion landing over this row is an override,
+    not an ordinary closure, no matter how much budget remains (SD-134 A75-9).
+    """
+    if not rows:
+        return False
+    status, metadata = rows[-1]
+    kind = classify_round_row(status, metadata, worker_type=metadata.get("worker_type") or worker_type)
+    if kind != "verdict":
+        return False
+    note = metadata.get("note", "")
+    return note == REVIEW_BLOCKING_NOTE or (
+        note == "dead-worker-fail" and metadata.get("failure_class") == "fail"
+    )
+
+
+def marker_round_census(route, node, rows, *, site, revisions=(), independently_reviewed=False):
+    """The one derivation every capped-node marker writer calls for
+    `round_census` (SD-153 rule 5, 13.59.2). Returns `None` only when the
+    route's `effective_intensity` cannot derive a cap at all (`round_budget`'s
+    own `ValueError`); every other case -- including an empty `rows` (no
+    registry to read) -- returns a real census, so a marker is never silently
+    missing the field.
+
+    `site` names which writer is publishing, and fixes most of
+    `closure_class`:
+
+    * `"registered"` -- a registered worker's own completion. `rows` is the
+      node's PRIOR round history (the completing attempt's own row excluded,
+      exactly as `admit_round` saw it before this round ran); this landing
+      round is added back as one verdict round. `closure_class` is
+      `"closure-check"` when the prior budget already resolved this round to
+      `round_kind == "closure-check"` (13.59.3 rule 7), else
+      `"registered-verdict"`.
+    * `"owner-closure"` -- SD-124 owner-closure. Always `"owner-closure"`.
+    * `"revision"` -- SD-154 `publish_revision_locked` over a capped node.
+      Always `"revision"`.
+    * `"inline"` -- everything else (owner-inline, a claimed native-subagent,
+      owner-chain aggregation). `closure_class` is `"owner-override-unlinked"`
+      when the most recent terminated round is an unresolved blocking verdict
+      and this completion is not itself an independently-reviewed claim
+      (`independently_reviewed`, e.g. a verified native-subagent transcript --
+      that IS the sealed fallback chain's legitimate hop, not an override);
+      else the SD-153 rule 3 bound class (`"review-verdictless-bound"` for a
+      `kind == "review-worker"` node, `"owner-run-verdictless"` for every
+      other capped kind -- `test` included) when the budget is
+      `verdictless-bound`; else plain `"inline-no-unresolved-fail"`.
+    """
+    try:
+        budget = round_budget(route, node, rows, revisions=revisions)
+    except ValueError:
+        return None
+    if site == "registered":
+        closure_class = "closure-check" if budget.round_kind == "closure-check" else "registered-verdict"
+        return {
+            "verdict_rounds": budget.verdict_rounds + 1,
+            "verdictless_rounds": budget.verdictless_rounds,
+            "cap": budget.cap,
+            "closure_class": closure_class,
+        }
+    if site == "owner-closure":
+        closure_class = "owner-closure"
+    elif site == "revision":
+        closure_class = "revision"
+    elif site == "inline":
+        worker_type = node.get("worker_type") or ("review" if node.get("kind") == "review-worker" else "test")
+        if not independently_reviewed and _last_round_blocking_verdict(rows, worker_type):
+            closure_class = "owner-override-unlinked"
+        elif budget.state == "verdictless-bound":
+            closure_class = (
+                "review-verdictless-bound" if node.get("kind") == "review-worker"
+                else "owner-run-verdictless"
+            )
+        else:
+            closure_class = "inline-no-unresolved-fail"
+    else:
+        raise ValueError(f"unknown round-census site: {site}")
+    return {
+        "verdict_rounds": budget.verdict_rounds,
+        "verdictless_rounds": budget.verdictless_rounds,
+        "cap": budget.cap,
+        "closure_class": closure_class,
+    }

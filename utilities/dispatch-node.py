@@ -314,16 +314,10 @@ def prior_round_attempts(jobs, route_id, node_id, *, exclude_slug=None, exclude_
 # fixes the kind, not a hand-kept id list -- enumerated exhaustively from
 # capabilities/topologies.json. dispatch_node.test.py asserts set equality
 # against that file, so a new review node in any recipe breaks the test rather
-# than silently escaping the cap.
-ROUND_CAPPED_NODE_IDS = frozenset({
-    "claim-verify", "critic-review", "fact-verify", "impl-review", "independent-verify",
-    "inspect", "plan-check", "post-deploy-verify", "qa", "quality-review", "release-review",
-    "review", "run-verify", "security-review", "smoke", "strategy-review", "verify",
-    "visual-verify",
-    # Declared exception: kind is pipeline-stage, but `test` is the QA anchor
-    # C-14 named. Every other exception must be explicit here too.
-    "test",
-})
+# than silently escaping the cap. Defined in `review_round_cap.py` (SD-153
+# rule 5) so `capability-route.py`'s marker writers share the exact same set
+# without a back-import cycle; this is a re-export name, never a call.
+ROUND_CAPPED_NODE_IDS = REVIEW_ROUND_CAP.ROUND_CAPPED_NODE_IDS
 
 @dataclass(frozen=True)
 class RoundAdmission:
@@ -336,26 +330,6 @@ class RoundAdmission:
  """
  budget: object
  auto_revisions: tuple = ()
-
-
-def _node_history_revisions(route, node_id, jobs):
- """Every SD-154 `revision` record in one node's own completion-dir history."""
- directory = ROUTE.completion_dir(route["route_id"], jobs=jobs)
- if not directory.is_dir():
-  return []
- prefix = f"{node_id}."
- revisions = []
- for path in sorted(directory.glob(f"{node_id}.*.json")):
-  middle = path.name[len(prefix):-5]
-  if not middle.isdigit():
-   continue
-  try:
-   marker = json.loads(path.read_text(encoding="utf-8"))
-  except (OSError, ValueError):
-   continue
-  if marker.get("stage_authority") == "revision":
-   revisions.append(marker.get("revision") or {})
- return revisions
 
 
 def _auto_record_revisions(route, node, jobs, rows, *, owner_attempt_id):
@@ -431,12 +405,8 @@ def admit_round(route, node, jobs, *, owner_attempt_id=None, exclude_slug=None, 
                              route=route if node.get("kind") == "review-worker" else None)
  classified_rows = [(cols[1], meta) for cols, meta in rows]
  auto_revisions = _auto_record_revisions(route, node, jobs, classified_rows, owner_attempt_id=owner_attempt_id)
- dependency_revisions = [
-  revision
-  for dep in node.get("depends_on", [])
-  for revision in _node_history_revisions(route, dep, jobs)
- ]
- budget = REVIEW_ROUND_CAP.round_budget(route, node, classified_rows, revisions=dependency_revisions)
+ dependency_revisions = ROUTE._dependency_revisions(route, node, jobs)
+ budget =REVIEW_ROUND_CAP.round_budget(route, node, classified_rows, revisions=dependency_revisions)
  return RoundAdmission(budget=budget, auto_revisions=auto_revisions)
 
 

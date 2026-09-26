@@ -4577,29 +4577,45 @@ def write_completion_marker(
             route,node_id,replayed,review_identity,review_claim,
         )
         return replayed
-    # SD-153 rule 3 (A-SD153-4): an owner-inline completion of a capped
-    # review node records WHY it closed without a registered verdict. The
-    # census is read-only (jobs, if given, is never used to admit or refuse
-    # this completion) so it is safe to compute even on the "attempt row
-    # absent" inline path -- the one route through which a verdictless-bound
-    # node ever gets a marker at all.
+    # SD-153 rule 5 (13.59.2): every marker of a `ROUND_CAPPED_NODE_IDS` node
+    # -- registered, owner-closure, and inline alike (`test` included, not
+    # only `kind=="review-worker"`) -- carries this census. The read is
+    # read-only (never used to admit or refuse this completion) so it is safe
+    # to compute even on the "attempt row absent" inline path. `jobs` absent
+    # or unreadable is not an exemption: an empty row set still derives a
+    # real census (round_budget's own fail-soft on an unknown intensity is
+    # the only `None` case) rather than the field being silently omitted.
     round_census=None
-    if jobs is not None and node.get("kind")=="review-worker":
-        jobs_path=Path(jobs)
-        if jobs_path.is_file():
-            lines=jobs_path.read_text(encoding="utf-8",errors="replace").splitlines()
-            rounds=_review_round_rows(lines,route["route_id"],node_id)
-            try:
-                budget=REVIEW_ROUND_CAP.round_budget(route,node,rounds)
-            except ValueError:
-                budget=None
-            if budget is not None and budget.state=="verdictless-bound":
-                round_census={
-                    "verdict_rounds":budget.verdict_rounds,
-                    "verdictless_rounds":budget.verdictless_rounds,
-                    "cap":budget.cap,
-                    "closure_class":"review-verdictless-bound",
-                }
+    if node_id in REVIEW_ROUND_CAP.ROUND_CAPPED_NODE_IDS:
+        rows=()
+        if jobs is not None:
+            jobs_path=Path(jobs)
+            if jobs_path.is_file():
+                lines=jobs_path.read_text(encoding="utf-8",errors="replace").splitlines()
+                rows=_review_round_rows(lines,route["route_id"],node_id)
+        if owner_override:
+            site="owner-closure"
+        elif axes.get("registered_worker"):
+            site="registered"
+        else:
+            site="inline"
+        revisions=()
+        if site=="registered":
+            # This exact write IS the completing attempt's own verdict, still
+            # `open`/`running` in the registry a moment before `_complete_
+            # node_locked` marks it `done` -- exclude it rather than reading
+            # it "live" a beat early; `marker_round_census` adds it back as
+            # the one verdict round this write itself lands. Gather the same
+            # upstream revisions `admit_round` used to grant this round a
+            # closure-check (13.59.3 rule 7), so the marker's label matches
+            # what admission already decided.
+            if attempt_id:
+                rows=tuple((status,meta) for status,meta in rows if meta.get("attempt_id")!=attempt_id)
+            revisions=_dependency_revisions(route,node,jobs)
+        round_census=REVIEW_ROUND_CAP.marker_round_census(
+            route,node,rows,site=site,revisions=revisions,
+            independently_reviewed=review_identity.get("review_independence")=="independent",
+        )
     sequence=_next_marker_sequence(directory,node_id)
     marker={
         "schema_version":2,
@@ -5204,6 +5220,20 @@ def publish_revision_locked(route, node_id, evidence, *, basis, answers=(), dire
         new_marker["evidence"] = {"path": str(evidence_path), "sha256": evidence_sha}
         new_marker["sequence"] = new_sequence
         new_marker["revision"] = revision_record
+        # SD-153 rule 5: a revision over a capped node gets its OWN fresh
+        # census (site="revision") -- the prior marker's census (if any)
+        # described a different write and must not survive the copy above.
+        new_marker.pop("round_census", None)
+        if node_id in REVIEW_ROUND_CAP.ROUND_CAPPED_NODE_IDS:
+            census_rows = ()
+            if jobs is not None:
+                census_jobs_path = Path(jobs)
+                if census_jobs_path.is_file():
+                    census_lines = census_jobs_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                    census_rows = _review_round_rows(census_lines, route["route_id"], node_id)
+            census = REVIEW_ROUND_CAP.marker_round_census(route, node, census_rows, site="revision")
+            if census:
+                new_marker["round_census"] = census
         new_history_path = directory / f"{node_id}.{new_sequence}.json"
         write_once(new_history_path, new_marker)
         atomic_write(canonical_path, new_marker)
@@ -5673,6 +5703,39 @@ def review_round_records(lines, route_ids, node_id):
 
 def _review_round_rows(lines, route_id, node_id):
     return [(fields[1], meta) for fields, meta in review_round_records(lines, {route_id}, node_id)]
+
+def _node_revision_records(route, node_id, jobs=None):
+    """Every SD-154 `revision` record in one node's own completion-dir
+    history. `dispatch-node.py`'s `admit_round` reads the same set through
+    `_dependency_revisions`, so admission and the marker census agree on it."""
+    directory=completion_dir(route["route_id"],jobs=jobs)
+    if not directory.is_dir():
+        return []
+    prefix=f"{node_id}."
+    revisions=[]
+    for path in sorted(directory.glob(f"{node_id}.*.json")):
+        middle=path.name[len(prefix):-5]
+        if not middle.isdigit():
+            continue
+        try:
+            marker=json.loads(path.read_text(encoding="utf-8"))
+        except (OSError,ValueError):
+            continue
+        if marker.get("stage_authority")=="revision":
+            revisions.append(marker.get("revision") or {})
+    return revisions
+
+def _dependency_revisions(route, node, jobs=None):
+    """13.59.3 rule 7's closure-check eligibility set: every revision
+    recorded on any node this one `depends_on`. `dispatch-node.py`'s
+    `admit_round` calls this same function for its `round_budget`, so a
+    marker published for a closure-check round is labeled
+    `closure_class="closure-check"` the same way admission already saw it."""
+    return [
+        revision
+        for dep in node.get("depends_on",[])
+        for revision in _node_revision_records(route,dep,jobs)
+    ]
 
 def _owner_closure_eligibility(route, node, node_id, evidence, row_metadata, lines,
                                *, rounds=None, check_canonical=True):

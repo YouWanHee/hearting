@@ -713,6 +713,8 @@ class CompletionMarkerTest(unittest.TestCase):
             (ROOT / "utilities" / "dispatch_contract.py").resolve(),
             (ROOT / "utilities" / "dispatch_completion_marker.test.py").resolve(),
             (ROOT / "utilities" / "dispatch_state_root_rotation.test.py").resolve(),
+            # Asserts dispatch-batch stops on the real gate's route-state refusal.
+            (ROOT / "utilities" / "dispatch-batch.test.py").resolve(),
         }
         for adapter in ("claude", "codex", "opencode"):
             allow.add((ROOT / "adapters" / adapter / "bin" / "dispatch-headless.py").resolve())
@@ -1509,6 +1511,200 @@ class CompletionMarkerTest(unittest.TestCase):
             # dead rows never closed through a completion, but that no longer
             # matters once the owner-inline marker exists and is current.
             D.completion_marker_gate(route_path, "full-run", "start", self.agent_home, jobs=self.jobs)
+
+    # SD-153 rule 5 correction round -- every ROUND_CAPPED_NODE_IDS marker
+    # (not only the review-worker verdictless-bound inline case above)
+    # carries round_census. Each test below closes one 🔴 shape the phase
+    # review named as missing.
+
+    def test_a_sd153_5a_registered_review_verdict_marker_carries_round_census(self):
+        """A registered review worker's own first-pass PASS: `round_census`
+        counts this exact landing round as the one verdict round even though
+        its own registry row is still `open` (not yet marked `done`) at the
+        moment the marker is written -- `write_completion_marker` excludes
+        the completing attempt's own row rather than reading it "live" a
+        beat early, and folds it back in as `verdict_rounds=1`."""
+        route = self.compile_route(intensity="standard")
+        self.write_route(route, "route-census-registered-review.json")
+        self.current_route = route
+        by_id = {n["id"]: n for n in route["nodes"]}
+        node = by_id["plan-check"]
+        self.write_row("open", "plan-check-r1", "att-census-pc-r1", "worker_type=review", node_id="plan-check")
+        evidence = self.base / "plan-check.md"
+        evidence.write_text("plan-check passes\n", encoding="utf-8")
+        with mock.patch.dict(os.environ, self.base_env(), clear=True):
+            marker, _ = ROUTE.complete_node(route, node, "plan-check", evidence, self.jobs, "att-census-pc-r1")
+        self.assertEqual(marker.get("round_census"), {
+            "verdict_rounds": 1, "verdictless_rounds": 0, "cap": 2,
+            "closure_class": "registered-verdict",
+        })
+
+    def test_a_sd153_5b_registered_test_node_verdict_marker_carries_round_census(self):
+        """The same registered-verdict shape on the `test` node -- SD-153
+        rule 5 explicitly includes `test` even though its `kind` is
+        `pipeline-stage`, not `review-worker` (C-14's declared exception)."""
+        route = self.compile_route(intensity="standard")
+        self.write_route(route, "route-census-registered-test.json")
+        self.current_route = route
+        by_id = {n["id"]: n for n in route["nodes"]}
+        node = by_id["test"]
+        self.assertEqual(node["kind"], "pipeline-stage")
+        self.write_row("open", "test-r1", "att-census-test-r1", "worker_type=test", node_id="test")
+        evidence = self.base / "test.md"
+        evidence.write_text("tests pass\n", encoding="utf-8")
+        with mock.patch.dict(os.environ, self.base_env(), clear=True):
+            marker, _ = ROUTE.complete_node(route, node, "test", evidence, self.jobs, "att-census-test-r1")
+        self.assertEqual(marker.get("round_census"), {
+            "verdict_rounds": 1, "verdictless_rounds": 0, "cap": 2,
+            "closure_class": "registered-verdict",
+        })
+
+    def test_a_sd153_5c_owner_closure_marker_carries_round_census(self):
+        """SD-124 owner-closure over two exhausted blocking rounds:
+        `closure_class="owner-closure"` unconditionally, with the real
+        verdict_rounds the two blocking rows spent."""
+        self.jobs = self.stable_dispatch / "jobs.log"
+        self.jobs.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.jobs.touch(mode=0o600)
+        route = self.compile_route(intensity="standard")
+        route_path = self.write_route(route, "route-census-owner-closure.json")
+        self.current_route = route
+        by_id = {n["id"]: n for n in route["nodes"]}
+        r1 = self.review_blocking_row("att-census-oc-r1", 1)
+        r2 = self.review_blocking_row("att-census-oc-r2", 2)
+        memo = self.owner_closure(route, name="census_oc.owner-closure.md",
+                                  attempts=("att-census-oc-r1", "att-census-oc-r2"),
+                                  artifacts=(r1.name, r2.name))
+        node = by_id["plan-check"]
+        closed = self.complete(route_path, "plan-check", memo, jobs=self.jobs, attempt_id="att-census-oc-r2")
+        self.assertEqual(closed.returncode, 0, closed.stdout + closed.stderr)
+        marker = json.loads(closed.stdout.strip().splitlines()[0])
+        self.assertEqual(marker["review_independence"], "owner-overridden")
+        self.assertEqual(marker.get("round_census"), {
+            "verdict_rounds": 2, "verdictless_rounds": 0, "cap": 2,
+            "closure_class": "owner-closure",
+        })
+
+    def test_a_sd153_5d_test_node_owner_run_verdictless_marker_carries_round_census(self):
+        """SD-153 rule 3's bound, on a non-review capped node: two verdict-
+        less `test` rounds bind the node, and the owner running the test
+        directly (command + output as evidence) is recorded
+        `closure_class="owner-run-verdictless"` -- distinct from the
+        review-worker `smoke` case above."""
+        route = self.compile_route(intensity="standard")
+        self.write_route(route, "route-census-test-verdictless.json")
+        self.current_route = route
+        by_id = {n["id"]: n for n in route["nodes"]}
+        node = by_id["test"]
+        for round_no in (1, 2):
+            self.write_row("done", f"test-r{round_no}", f"att-test-r{round_no}",
+                           "worker_type=test,note=dead-invalid-envelope", node_id="test")
+        evidence = self.base / "test-owner-run.md"
+        evidence.write_text(
+            "owner ran the tests directly.\ncommand: python3 -m pytest\noutput: 42 passed\n",
+            encoding="utf-8",
+        )
+        with mock.patch.dict(os.environ, self.base_env(), clear=True):
+            marker = ROUTE._publish_completion_locked(
+                route, node, "test", evidence, jobs=self.jobs,
+                attempt_id="att-owner-run-test", attempt_metadata={
+                    "attempt_schema_version": 2, "dispatch_depth": node["dispatch_depth"],
+                    "transport": "interactive", "execution_surface": "inline",
+                    "registered_worker": False, "fallback_hop": "inline",
+                },
+            )
+        self.assertEqual(marker.get("round_census"), {
+            "verdict_rounds": 0, "verdictless_rounds": 2, "cap": 2,
+            "closure_class": "owner-run-verdictless",
+        })
+
+    def test_a_sd153_5e_inline_override_over_unresolved_fail_with_budget_remaining(self):
+        """An inline completion landing over ONE unresolved blocking FAIL,
+        with budget still open (`verdict_rounds=1 < cap=2`) -- SD-153 rule 5
+        / SD-134 A75-9: `closure_class="owner-override-unlinked"` regardless
+        of remaining budget, and the gate is recorded `degraded` (not
+        `owner-overridden`, since this bypassed the evidence-linked owner-
+        closure path entirely)."""
+        route = self.compile_route(intensity="standard")
+        self.write_route(route, "route-census-override-remaining.json")
+        self.current_route = route
+        by_id = {n["id"]: n for n in route["nodes"]}
+        node = by_id["plan-check"]
+        self.review_blocking_row("att-override-remaining-r1", 1)
+        evidence = self.base / "override-remaining.md"
+        evidence.write_text("owner completes inline without an evidence-linked closure\n", encoding="utf-8")
+        with mock.patch.dict(os.environ, self.base_env(), clear=True):
+            marker = ROUTE._publish_completion_locked(
+                route, node, "plan-check", evidence, jobs=self.jobs,
+                attempt_id="att-override-remaining", attempt_metadata={
+                    "attempt_schema_version": 2, "dispatch_depth": node["dispatch_depth"],
+                    "transport": "interactive", "execution_surface": "inline",
+                    "registered_worker": False, "fallback_hop": "inline",
+                },
+            )
+        self.assertEqual(marker["review_independence"], "degraded")
+        self.assertEqual(marker.get("round_census"), {
+            "verdict_rounds": 1, "verdictless_rounds": 0, "cap": 2,
+            "closure_class": "owner-override-unlinked",
+        })
+
+    def test_a_sd153_5f_inline_override_over_unresolved_fail_with_budget_spent(self):
+        """The same override shape, budget already exhausted
+        (`verdict_rounds=2 >= cap=2`) -- "예산이 남아 있든 소진됐든" still
+        `owner-override-unlinked`, and the closed route's degraded list
+        names the node (SD-134 A75-9's existing plumbing)."""
+        route = self.compile_route(intensity="standard")
+        route_path = ROUTE.canonical_route_path(self.artifact, route["route_id"])
+        route_path.parent.mkdir(parents=True, exist_ok=True)
+        route_path.write_text(json.dumps(route), encoding="utf-8")
+        self.current_route = route
+        by_id = {n["id"]: n for n in route["nodes"]}
+        node = by_id["plan-check"]
+        self.review_blocking_row("att-override-spent-r1", 1)
+        self.review_blocking_row("att-override-spent-r2", 2)
+        evidence = self.base / "override-spent.md"
+        evidence.write_text("owner completes inline without an evidence-linked closure\n", encoding="utf-8")
+        with mock.patch.dict(os.environ, self.base_env(), clear=True):
+            marker = ROUTE._publish_completion_locked(
+                route, node, "plan-check", evidence, jobs=self.jobs,
+                attempt_id="att-override-spent", attempt_metadata={
+                    "attempt_schema_version": 2, "dispatch_depth": node["dispatch_depth"],
+                    "transport": "interactive", "execution_surface": "inline",
+                    "registered_worker": False, "fallback_hop": "inline",
+                },
+            )
+            self.assertEqual(marker["review_independence"], "degraded")
+            self.assertEqual(marker.get("round_census"), {
+                "verdict_rounds": 2, "verdictless_rounds": 0, "cap": 2,
+                "closure_class": "owner-override-unlinked",
+            })
+            outcome, _ = ROUTE.close_route(route, route_path, commit="a" * 40, allow_unproven=True, jobs=self.jobs)
+        self.assertIn("plan-check", outcome.get("review_independence_degraded", []))
+
+    def test_a_sd153_5g_plain_inline_completion_with_no_unresolved_fail(self):
+        """A plain inline completion with no prior round history at all --
+        no verdict, no unresolved FAIL, no bound streak --
+        `closure_class="inline-no-unresolved-fail"`."""
+        route = self.compile_route(intensity="standard")
+        self.write_route(route, "route-census-inline-plain.json")
+        self.current_route = route
+        by_id = {n["id"]: n for n in route["nodes"]}
+        node = by_id["plan-check"]
+        evidence = self.base / "inline-plain.md"
+        evidence.write_text("owner completes inline, nothing to override\n", encoding="utf-8")
+        with mock.patch.dict(os.environ, self.base_env(), clear=True):
+            marker = ROUTE._publish_completion_locked(
+                route, node, "plan-check", evidence, jobs=self.jobs,
+                attempt_id="att-inline-plain", attempt_metadata={
+                    "attempt_schema_version": 2, "dispatch_depth": node["dispatch_depth"],
+                    "transport": "interactive", "execution_surface": "inline",
+                    "registered_worker": False, "fallback_hop": "inline",
+                },
+            )
+        self.assertEqual(marker.get("round_census"), {
+            "verdict_rounds": 0, "verdictless_rounds": 0, "cap": 2,
+            "closure_class": "inline-no-unresolved-fail",
+        })
 
     def test_a_sd154_4_one_closure_check_after_budget(self):
         """A-SD154-4 (13.59.6): standard `plan-check` spends its verdict
