@@ -1889,6 +1889,30 @@ class TestRoute(unittest.TestCase):
    outcome,_=R.close_route(route,path,commit="9"*40,publication="failed",allow_unproven=True)
    self.assertEqual(outcome["schema_version"],4)
    self.assertEqual(outcome["publication"],"failed")
+ def test_a_sd154_7_close_outcome_lists_revisions(self):
+  # A-SD154-7: a route's closed outcome names every SD-154 revision recorded
+  # under it -- a reader never has to walk completion-dir history by hand to
+  # learn a gate's evidence was corrected mid-route.
+  with tempfile.TemporaryDirectory() as tmp:
+   root=Path(tmp)
+   route=R.compile_route(**self.args(artifact_root=root))
+   path=R.canonical_route_path(root,route["route_id"]); R.write_once(path,route)
+   node=next(n for n in route["nodes"] if n["id"]=="inline")
+   evidence=root/"inline.md"; evidence.write_text("inline v1\n",encoding="utf-8")
+   R._publish_completion_locked(route,node,"inline",evidence,attempt_id="att-inline-v1",attempt_metadata={
+    "attempt_schema_version":2,"dispatch_depth":node["dispatch_depth"],"transport":"interactive",
+    "execution_surface":"inline","registered_worker":False,"fallback_hop":""})
+   evidence.write_text("inline v2 (revised)\n",encoding="utf-8")
+   R.publish_revision_locked(route,"inline",evidence,basis="owner-correction",reason="fixture: close outcome revisions",
+                             author_attempt_id="att-revise-fixture")
+   outcome,_=R.close_route(route,path,commit="a"*40,allow_unproven=True)
+   self.assertEqual(len(outcome.get("revisions",[])),1,outcome.get("revisions"))
+   revision=outcome["revisions"][0]
+   self.assertEqual(revision["node"],"inline")
+   self.assertEqual(revision["basis"],"owner-correction")
+   self.assertEqual(revision["author_attempt_id"],"att-revise-fixture")
+   self.assertIn("of_evidence_sha256",revision); self.assertIn("evidence_sha256",revision)
+   self.assertNotEqual(revision["of_evidence_sha256"],revision["evidence_sha256"])
  def test_close_route_on_alias_record_still_succeeds_with_drift_warning(self):
   route=R.compile_route(**self.args())
   with tempfile.TemporaryDirectory() as tmp:
@@ -2839,6 +2863,57 @@ class TestContinuation(unittest.TestCase):
     if previous_jobs is None: os.environ.pop("AGENT_DISPATCH_JOBS",None)
     else: os.environ["AGENT_DISPATCH_JOBS"]=previous_jobs
 
+ def test_continuation_cli_prints_cycle_binding_and_fork_advisory(self):
+  # SD-155/D-120, P2 결함 note: the continuation CLI's `cycle_binding_bound`/
+  # `cycle_binding_advisory` stderr fields (capability-route.py :7259-7261)
+  # were only ever exercised by calling `bind_continuation_cycle` directly in
+  # artifact_producer.test.py -- never through the actual CLI subprocess a
+  # real owner runs. This proves the CLI-level wiring end to end: a first
+  # continuation off an open-cycle source binds silently, a sibling fork off
+  # the same source prints the D-120 "분기의 정직 표기" advisory without
+  # blocking publication.
+  import subprocess,sys
+  with tempfile.TemporaryDirectory() as tmp:
+   previous_home=os.environ.get("AGENT_HOME")
+   previous_jobs=os.environ.get("AGENT_DISPATCH_JOBS")
+   jobs=str(Path(tmp)/"state"/"jobs.log")
+   os.environ["AGENT_HOME"]=str(R.ROOT)
+   os.environ["AGENT_DISPATCH_JOBS"]=jobs
+   try:
+    artifact=Path(tmp)/"artifacts"
+    source=self._source(artifact)
+    self._complete_prefix(source,"test",Path(tmp)/"evidence")
+    source_path=Path(tmp)/"source-route.json"
+    source_path.write_text(json.dumps(source),encoding="utf-8")
+    # The continuation's own lineage walk reads its parent from the
+    # CANONICAL route path (route_lineage.verified_route_lineage), not from
+    # wherever `--source-route` points -- so the source needs a canonical
+    # copy too, exactly as a real compile+publish would leave one.
+    R.write_once(R.canonical_route_path(artifact,source["route_id"]),source)
+    import artifact_producer as AP
+    AP.begin(artifact,route_file=source_path,capability=source["capability"],
+             intensity=source["effective_intensity"])
+    env=os.environ.copy()
+    def continuation_command(reason):
+     return [
+      sys.executable,str(P),"continuation","--source-route",str(source_path),
+      "--resume-from-node","test","--requested-boundary","test",
+      "--reason",reason,"--artifact-root",str(artifact),
+     ]
+    first=subprocess.run(continuation_command("cycle-fixture-b"),capture_output=True,text=True,cwd=str(R.ROOT),env=env)
+    self.assertEqual(first.returncode,0,first.stderr)
+    self.assertIn("cycle_binding_bound=1",first.stderr)
+    self.assertNotIn("cycle_binding_advisory=",first.stderr)
+    second=subprocess.run(continuation_command("cycle-fixture-b-prime"),capture_output=True,text=True,cwd=str(R.ROOT),env=env)
+    self.assertEqual(second.returncode,0,second.stderr)
+    self.assertIn("cycle_binding_bound=0",second.stderr)
+    self.assertIn("cycle_binding_advisory=cycle-lineage-fork",second.stderr)
+   finally:
+    if previous_home is None: os.environ.pop("AGENT_HOME",None)
+    else: os.environ["AGENT_HOME"]=previous_home
+    if previous_jobs is None: os.environ.pop("AGENT_DISPATCH_JOBS",None)
+    else: os.environ["AGENT_DISPATCH_JOBS"]=previous_jobs
+
  def _git_repo(self,root):
   import subprocess
   repo=Path(root)/"repo"; repo.mkdir(parents=True)
@@ -2901,132 +2976,86 @@ class TestContinuation(unittest.TestCase):
     if previous_jobs is None: os.environ.pop("AGENT_DISPATCH_JOBS",None)
     else: os.environ["AGENT_DISPATCH_JOBS"]=previous_jobs
 
- def test_c_rebind_declines_an_sd67_mutation_retry(self):
-  # Review blocking #1: rebinding unconditionally would let a continuation resume
-  # at `execute` after execute already ran and committed, pinning the new HEAD and
-  # walking past SD-67's retry-evidence gate. When a node this continuation
-  # re-runs mutates the worktree AND the source route already has an attempt on
-  # it, the pin is kept. The guard then refuses that node (it looks retry
-  # evidence up under the continuation's own route_id, where the prior rows are
-  # not) -- which is exactly what main does, so declining is never a regression.
+ def test_a_sd156_7_descendant_head_always_repins(self):
+  # SD-156 retires the SD-67/SD-128/SD-133 decline branch this test used to
+  # exercise: a continuation resuming at `execute` after execute already ran
+  # and committed now re-pins unconditionally, with no registry consulted at
+  # all. `worker-route-guard.py` is the one place a moved HEAD is now
+  # adjudicated -- on the same lineage verdict, regardless of prior attempts.
   import subprocess
   with tempfile.TemporaryDirectory() as tmp:
-   previous_jobs=os.environ.get("AGENT_DISPATCH_JOBS")
-   jobs=Path(tmp)/"state"/"jobs.log"; jobs.parent.mkdir(parents=True)
-   os.environ["AGENT_DISPATCH_JOBS"]=str(jobs)
-   try:
-    repo=self._git_repo(tmp); artifact=Path(tmp)/"artifacts"
-    source=self._source(artifact,cwd=repo)
-    pinned=source["source_commit"]
-    self._complete_prefix(source,"execute",Path(tmp)/"evidence")
-    execute=next(node for node in source["nodes"] if node["id"]=="execute")
-    self.assertTrue(R._node_mutates_worktree(execute))
-    # execute already ran once under this route, and its commit advanced HEAD.
-    self._write_attempt_row(jobs,source["route_id"],"execute","att-execute-prior")
-    (repo/"x").write_text("b"); subprocess.run(["git","-C",str(repo),"commit","-qam","execute output"],check=True)
-    declined=self._build(source,resume_from_node="execute",requested_boundary="execute")
-    self.assertEqual(declined["source_commit"],pinned)
-    self.assertNotIn("source_commit_rebind",declined)
-    # Same route, same moved HEAD, but no prior attempt on the mutation node:
-    # this route never mutated the tree, so the move is external and rebinds.
-    # The completed prefix's rows stay -- emptying the file instead would be the
-    # truncation case, which now (correctly) declines (round 3, B2b).
-    self._drop_attempt_rows(jobs,node_id="execute")
-    rebound=self._build(source,resume_from_node="execute",requested_boundary="execute")
-    self.assertEqual(rebound["source_commit"],self._git_head(repo))
-   finally:
-    if previous_jobs is None: os.environ.pop("AGENT_DISPATCH_JOBS",None)
-    else: os.environ["AGENT_DISPATCH_JOBS"]=previous_jobs
+   repo=self._git_repo(tmp); artifact=Path(tmp)/"artifacts"
+   source=self._source(artifact,cwd=repo)
+   pinned=source["source_commit"]
+   self._complete_prefix(source,"execute",Path(tmp)/"evidence")
+   execute=next(node for node in source["nodes"] if node["id"]=="execute")
+   self.assertTrue(R._node_mutates_worktree(execute))
+   (repo/"x").write_text("b"); subprocess.run(["git","-C",str(repo),"commit","-qam","execute output"],check=True)
+   rebound=self._build(source,resume_from_node="execute",requested_boundary="execute")
+   self.assertEqual(rebound["source_commit"],self._git_head(repo))
+   self.assertNotEqual(rebound["source_commit"],pinned)
+   self.assertEqual(rebound["source_commit_rebind"]["inherited_source_commit"],pinned)
 
-
- def test_c_decline_looks_past_the_resume_node_to_every_node_it_reruns(self):
-  # Review round 2, B1 -- the regression this fix exists to close. Asking only
-  # about the resume node let a `plan`-time resume re-pin the route: in a real
-  # autopilot-code route `execute` is the only worktree-mutating node, so `plan`
-  # answered "not a mutation" and the rebind went through. `execute` then ran
-  # later against `head == source_commit` and passed the guard on the trivial
-  # branch, never reaching SD-67's evidence gate. main refuses both nodes.
+ def test_a_sd156_7_plan_resume_carrying_execute_also_repins(self):
+  # SD-156, replacing review round 2 B1's regression coverage: a `plan`-time
+  # resume carries `execute` in its suffix too, and both re-pin to the same
+  # observed HEAD -- there is no longer a "the resume node itself is
+  # innocent" distinction, because there is no decline left to look past it.
   import subprocess
   with tempfile.TemporaryDirectory() as tmp:
-   previous_jobs=os.environ.get("AGENT_DISPATCH_JOBS")
-   jobs=Path(tmp)/"state"/"jobs.log"; jobs.parent.mkdir(parents=True)
-   os.environ["AGENT_DISPATCH_JOBS"]=str(jobs)
-   try:
-    repo=self._git_repo(tmp); artifact=Path(tmp)/"artifacts"
-    source=self._source(artifact,cwd=repo)
-    pinned=source["source_commit"]
-    self._complete_prefix(source,"plan",Path(tmp)/"evidence")
-    execute=next(node for node in source["nodes"] if node["id"]=="execute")
-    self.assertTrue(R._node_mutates_worktree(execute))
-    plan=next(node for node in source["nodes"] if node["id"]=="plan")
-    # The resume node itself is innocent; that is the whole point.
-    self.assertFalse(R._node_mutates_worktree(plan))
-    self._write_attempt_row(jobs,source["route_id"],"execute","att-execute-prior")
-    (repo/"x").write_text("b")
-    subprocess.run(["git","-C",str(repo),"commit","-qam","execute output"],check=True)
-    declined=self._build(source,resume_from_node="plan",requested_boundary="plan")
-    self.assertEqual(declined["source_commit"],pinned)
-    self.assertNotIn("source_commit_rebind",declined)
-    # `execute` is carried by this continuation, which is why it counts.
-    self.assertIn("execute",[node["id"] for node in declined["nodes"]])
-    # Remove the prior attempt on the mutation node and the same resume rebinds:
-    # the decline is about that evidence, not about resuming at `plan`.
-    self._drop_attempt_rows(jobs,node_id="execute")
-    rebound=self._build(source,resume_from_node="plan",requested_boundary="plan")
-    self.assertEqual(rebound["source_commit"],self._git_head(repo))
-   finally:
-    if previous_jobs is None: os.environ.pop("AGENT_DISPATCH_JOBS",None)
-    else: os.environ["AGENT_DISPATCH_JOBS"]=previous_jobs
+   repo=self._git_repo(tmp); artifact=Path(tmp)/"artifacts"
+   source=self._source(artifact,cwd=repo)
+   pinned=source["source_commit"]
+   self._complete_prefix(source,"plan",Path(tmp)/"evidence")
+   execute=next(node for node in source["nodes"] if node["id"]=="execute")
+   self.assertTrue(R._node_mutates_worktree(execute))
+   (repo/"x").write_text("b")
+   subprocess.run(["git","-C",str(repo),"commit","-qam","execute output"],check=True)
+   rebound=self._build(source,resume_from_node="plan",requested_boundary="plan")
+   self.assertEqual(rebound["source_commit"],self._git_head(repo))
+   self.assertNotEqual(rebound["source_commit"],pinned)
+   self.assertIn("execute",[node["id"] for node in rebound["nodes"]])
 
- def test_c_unreadable_registry_declines_the_rebind(self):
-  # Review round 2, B2 -- the read was fail-open, so deleting or truncating
-  # jobs.log turned "this node already ran" into "no rows found" and re-pinned
-  # the route past the SD-67 gate. `registry_rows` returns [] for a missing file
-  # rather than raising, so absence of rows can never prove absence of attempts.
+ def test_a_sd156_7_rebind_ignores_registry_state_entirely(self):
+  # SD-156, replacing review round 2 B2/round 3 B2's registry-unreadable
+  # coverage: a moved HEAD re-pins the same way whether the registry is
+  # intact, deleted, a directory, or unbound -- the builder no longer reads
+  # the registry to decide.
   import subprocess
   with tempfile.TemporaryDirectory() as tmp:
-   previous_jobs=os.environ.get("AGENT_DISPATCH_JOBS")
-   jobs=Path(tmp)/"state"/"jobs.log"; jobs.parent.mkdir(parents=True)
-   os.environ["AGENT_DISPATCH_JOBS"]=str(jobs)
-   try:
-    repo=self._git_repo(tmp); artifact=Path(tmp)/"artifacts"
-    source=self._source(artifact,cwd=repo)
-    pinned=source["source_commit"]
-    self._complete_prefix(source,"execute",Path(tmp)/"evidence")
-    (repo/"x").write_text("b")
-    subprocess.run(["git","-C",str(repo),"commit","-qam","execute output"],check=True)
-    moved=self._git_head(repo)
-    self.assertNotEqual(moved,pinned)
-    sealed=Path(source["launch_compatibility_tuple"]["jobs_path"]["path"])
-    for name,wreck in (
-     ("registry deleted",lambda: sealed.unlink()),
-     ("registry is a directory",lambda: (sealed.unlink(),sealed.mkdir())),
-    ):
-     with self.subTest(name):
-      if sealed.exists() or sealed.is_dir():
-       if sealed.is_dir(): sealed.rmdir()
-       elif sealed.exists(): sealed.unlink()
-      sealed.parent.mkdir(parents=True,exist_ok=True)
-      sealed.write_text("",encoding="utf-8")
-      wreck()
-      declined=self._build(source,resume_from_node="execute",requested_boundary="execute")
-      if name == "registry is a directory":
-       self.assertEqual(declined["first_runnable_blocker"],
-        "continuation-source-node-unverified:frame:registry-unreadable")
-       self.assertEqual(declined["new_nodes"],[])
-       self.assertNotIn("source_commit",declined)
-      else:
-       self.assertEqual(declined["source_commit"],pinned)
-      self.assertEqual(source["source_commit"],pinned)
-      self.assertNotIn("source_commit_rebind",declined)
-    # An unresolved jobs binding is unreadable in the same sense.
-    if sealed.is_dir(): sealed.rmdir()
-    unbound=json.loads(json.dumps(source))
-    unbound["launch_compatibility_tuple"]["jobs_path"]={"path":None,"unresolved":"fixture"}
-    self.assertTrue(R._prior_registry_attempt(unbound,"execute"))
-   finally:
-    if previous_jobs is None: os.environ.pop("AGENT_DISPATCH_JOBS",None)
-    else: os.environ["AGENT_DISPATCH_JOBS"]=previous_jobs
+   repo=self._git_repo(tmp); artifact=Path(tmp)/"artifacts"
+   source=self._source(artifact,cwd=repo)
+   pinned=source["source_commit"]
+   self._complete_prefix(source,"execute",Path(tmp)/"evidence")
+   (repo/"x").write_text("b")
+   subprocess.run(["git","-C",str(repo),"commit","-qam","execute output"],check=True)
+   moved=self._git_head(repo)
+   self.assertNotEqual(moved,pinned)
+   sealed=Path(source["launch_compatibility_tuple"]["jobs_path"]["path"])
+   for name,wreck in (
+    ("registry intact",lambda: None),
+    ("registry deleted",lambda: sealed.unlink()),
+   ):
+    with self.subTest(name):
+     if sealed.is_dir(): sealed.rmdir()
+     elif sealed.exists(): sealed.unlink()
+     sealed.parent.mkdir(parents=True,exist_ok=True)
+     sealed.write_text("",encoding="utf-8")
+     wreck()
+     rebound=self._build(source,resume_from_node="execute",requested_boundary="execute")
+     self.assertEqual(rebound["source_commit"],moved)
+   # A registry that is a directory is unreadable for a DIFFERENT, unrelated
+   # reason (the reused-prefix evidence snapshot at `frame`, not this rebind)
+   # and still blocks the continuation before source_commit is even sealed --
+   # unaffected by SD-156.
+   if sealed.exists(): sealed.unlink()
+   sealed.mkdir()
+   with self.subTest("registry is a directory"):
+    blocked=self._build(source,resume_from_node="execute",requested_boundary="execute")
+    self.assertEqual(blocked["first_runnable_blocker"],
+     "continuation-source-node-unverified:frame:registry-unreadable")
+    self.assertNotIn("source_commit",blocked)
+   sealed.rmdir(); sealed.write_text("",encoding="utf-8")
 
  def test_c_route_and_guard_share_one_mutating_scope_definition(self):
   # S1: the builder's decline and the guard that adjudicates the same node must
@@ -3169,120 +3198,40 @@ class TestContinuation(unittest.TestCase):
     else: os.environ["AGENT_DISPATCH_JOBS"]=previous_jobs
 
 
- def test_c_decline_survives_another_continuation_generation(self):
-  # Review round 3, B1 -- the decline was defeated by building one more
-  # continuation. A declined continuation records no attempts of its own (the
-  # guard refuses its whole pre-mutation prefix), so a continuation built FROM
-  # it saw a clean registry, did not decline, and re-pinned. `execute` then met
-  # `head == source_commit` and was accepted on the guard's trivial branch --
-  # round 2's defect, one generation later. main refuses at every generation.
+ def test_a_sd156_7_repin_survives_a_second_continuation_generation(self):
+  # SD-156, replacing review round 3 B1's regression coverage: re-pinning is
+  # no longer conditional on anything a first-generation continuation did or
+  # did not write, so a second-generation continuation built from the first
+  # re-pins to the (unchanged, since nothing mutated further) observed HEAD
+  # exactly the same way.
   import subprocess
   with tempfile.TemporaryDirectory() as tmp:
    repo=self._git_repo(tmp); artifact=Path(tmp)/"artifacts"
-   jobs=Path(os.environ["AGENT_DISPATCH_JOBS"])
    source=self._source(artifact,cwd=repo)
    pinned=source["source_commit"]
    self._complete_prefix(source,"plan",Path(tmp)/"evidence")
-   self._write_attempt_row(jobs,source["route_id"],"execute","att-execute-prior")
    (repo/"x").write_text("b")
    subprocess.run(["git","-C",str(repo),"commit","-qam","execute output"],check=True)
    moved=self._git_head(repo)
    first=self._build(source,resume_from_node="plan",requested_boundary="plan")
-   self.assertEqual(first["source_commit"],pinned)
-   # The declined continuation is a valid source route with its own new id, and
-   # it wrote no rows -- which is exactly why asking only about it is not enough.
+   self.assertEqual(first["source_commit"],moved)
    self.assertNotEqual(first["route_id"],source["route_id"])
-   self.assertEqual(
-    self._stage_rows(jobs,first["route_id"]),[],
-    "a declined continuation should have no registry rows of its own",
-   )
    second=self._build(first,resume_from_node="plan",requested_boundary="plan")
-   self.assertEqual(
-    second["source_commit"],pinned,
-    "the decline must survive a second continuation generation",
-   )
+   self.assertEqual(second["source_commit"],moved)
    self.assertNotIn("source_commit_rebind",second)
    self.assertIn("execute",[node["id"] for node in second["nodes"]])
-   # And the ancestor whose rows carry the evidence is reachable from the
-   # second-generation source route.
-   self.assertIn(source["route_id"],R.continuation_lineage_route_ids(first))
    self.assertNotEqual(moved,pinned)
 
  def _stage_rows(self,jobs,route_id):
   fallback=R._stage_fallback()
   return fallback.registry_route_rows(Path(jobs),[route_id])
 
- def test_c_unprovable_registry_declines_the_rebind(self):
-  # Review round 3, B2. `registry_rows` returns [] for a missing file, for a
-  # truncated one, and for a registry that simply never saw this route -- three
-  # different truths, one signal. Absence is only evidence once the registry is
-  # proved to be the lineage's own and proved to hold that lineage.
-  import subprocess
-  with tempfile.TemporaryDirectory() as tmp:
-   repo=self._git_repo(tmp); artifact=Path(tmp)/"artifacts"
-   jobs=Path(os.environ["AGENT_DISPATCH_JOBS"])
-   source=self._source(artifact,cwd=repo)
-   pinned=source["source_commit"]
-   self._complete_prefix(source,"execute",Path(tmp)/"evidence")
-   self._write_attempt_row(jobs,source["route_id"],"execute","att-execute-prior")
-   (repo/"x").write_text("b")
-   subprocess.run(["git","-C",str(repo),"commit","-qam","execute output"],check=True)
-   moved=self._git_head(repo)
-   self.assertNotEqual(moved,pinned)
-   sealed=Path(source["launch_compatibility_tuple"]["jobs_path"]["path"])
-   intact=sealed.read_text(encoding="utf-8")
-
-   def rebuild():
-    return self._build(source,resume_from_node="execute",requested_boundary="execute")
-
-   # Positive control (S2): with the registry intact and readable, this same
-   # fixture rebinds once the mutation node's row is gone -- so a decline below
-   # is attributable to the registry state and not to anything else.
-   self._drop_attempt_rows(sealed,node_id="execute")
-   self.assertEqual(rebuild()["source_commit"],moved)
-   sealed.write_text(intact,encoding="utf-8")
-   self.assertEqual(rebuild()["source_commit"],pinned)
-
-   cases={}
-   def restore():
-    if sealed.is_dir(): sealed.rmdir()
-    elif sealed.exists(): sealed.unlink()
-    sealed.parent.mkdir(parents=True,exist_ok=True)
-    sealed.write_text(intact,encoding="utf-8")
-
-   restore(); sealed.unlink(); cases["deleted"]=rebuild()
-   restore(); sealed.unlink(); sealed.mkdir(); cases["directory"]=rebuild()
-   # B2b: truncation. The docstring named it; only deletion was covered, and two
-   # tests actively asserted that an empty registry rebinds.
-   restore(); sealed.write_text("",encoding="utf-8"); cases["truncated"]=rebuild()
-   # A registry that is readable but never saw this lineage: same empty read,
-   # same ambiguity.
-   restore(); self._write_attempt_row(sealed,"rt-someone-elses","execute","att-other")
-   sealed.write_text("".join(
-    f"{line}\n" for line in sealed.read_text(encoding="utf-8").splitlines()
-    if source["route_id"] not in line
-   ),encoding="utf-8")
-   cases["foreign-lineage"]=rebuild()
-   restore()
-   for name,route in cases.items():
-    with self.subTest(name):
-     if name == "directory":
-      self.assertEqual(route["first_runnable_blocker"],
-       "continuation-source-node-unverified:frame:registry-unreadable")
-      self.assertEqual(route["new_nodes"],[])
-      self.assertNotIn("source_commit",route)
-     else:
-      self.assertEqual(route["source_commit"],pinned)
-     self.assertEqual(source["source_commit"],pinned)
-     self.assertNotIn("source_commit_rebind",route)
-
- def test_c_pruned_release_registry_is_not_authoritative(self):
-  # Review round 3, B2a. When the sealed dispatch root's parent is gone,
-  # `_continuation_source_jobs` falls through to the LIVE canonical registry so
-  # that migrated markers stay readable. That substitution is safe for markers
-  # (each carries its own route binding) and unsafe here, where the evidence is
-  # an absent row: the live file exists, is a regular file, and holds no rows
-  # for the old route id.
+ def test_a_sd156_7_pruned_release_registry_source_jobs_falls_through_to_live(self):
+  # `_continuation_source_jobs`'s pruned-release-registry fallback (review
+  # round 3, B2a) is unrelated to SD-156's rebind -- the rebind no longer
+  # reads the registry at all -- but the fallback still matters for marker
+  # resolution elsewhere, so its own behaviour stays covered here, alongside
+  # the rebind re-pinning regardless of which registry is live.
   import subprocess
   with tempfile.TemporaryDirectory() as tmp:
    repo=self._git_repo(tmp); artifact=Path(tmp)/"artifacts"
@@ -3294,18 +3243,10 @@ class TestContinuation(unittest.TestCase):
    try:
     source=self._source(artifact,cwd=repo)
     self.assertEqual(source["launch_compatibility_tuple"]["jobs_path"]["path"],str(sealed))
-    pinned=source["source_commit"]
-    # Resume at the first node, so no reused-evidence markers are needed and
-    # pruning the sealed tree cannot block the build for an unrelated reason.
     self._write_attempt_row(sealed,source["route_id"],"execute","att-execute-prior")
     (repo/"x").write_text("b")
     subprocess.run(["git","-C",str(repo),"commit","-qam","execute output"],check=True)
-    # Control: the sealed registry is intact, so the decline is provable.
-    self.assertEqual(
-     self._build(source,resume_from_node="frame",requested_boundary="frame")["source_commit"],
-     pinned,
-    )
-    self.assertIsNotNone(R._authoritative_lineage_registry(source))
+    moved=self._git_head(repo)
     # Prune the release tree the sealed root lived in, and stand up a live
     # canonical registry that never saw this route -- the observed shape the
     # compat window exists for (release pruning, 2026-08-27).
@@ -3315,17 +3256,12 @@ class TestContinuation(unittest.TestCase):
     live.write_text("",encoding="utf-8")
     os.environ["AGENT_DISPATCH_JOBS"]=str(live)
     # The fall-through registry is a real, readable, regular file with no rows
-    # for this route -- which the old read scored as "never ran".
+    # for this route.
     resolved=R._continuation_source_jobs(source)
     self.assertTrue(Path(resolved).is_file())
     self.assertEqual(self._stage_rows(resolved,source["route_id"]),[])
-    self.assertIsNone(
-     R._authoritative_lineage_registry(source),
-     "a compat-window substitution is not the lineage's own registry",
-    )
-    declined=self._build(source,resume_from_node="frame",requested_boundary="frame")
-    self.assertEqual(declined["source_commit"],pinned)
-    self.assertNotIn("source_commit_rebind",declined)
+    rebound=self._build(source,resume_from_node="frame",requested_boundary="frame")
+    self.assertEqual(rebound["source_commit"],moved)
    finally:
     if previous is None: os.environ.pop("AGENT_DISPATCH_JOBS",None)
     else: os.environ["AGENT_DISPATCH_JOBS"]=previous
@@ -4301,6 +4237,412 @@ class GroundingCwdLineageTest(unittest.TestCase):
   drift["launch_compatibility_tuple"]["grounding_roots"]["cwd"]["release_id"]="f"*40
   ok,mismatches=R.revalidate_launch_compatibility(drift)
   self.assertFalse(ok); self.assertIn("grounding_roots.cwd",mismatches)
+
+
+class SourceLineageVerdictTest(unittest.TestCase):
+ """SD-156: the one first-parent lineage probe every consumer shares."""
+ def _repo(self,tmp):
+  import subprocess
+  root=Path(tmp)/"wt"; root.mkdir()
+  def git(*a): subprocess.run(["git","-C",str(root),*a],check=True,capture_output=True,text=True)
+  git("init","-q"); git("config","user.email","t@t"); git("config","user.name","t")
+  (root/"a").write_text("1"); git("add","."); git("commit","-q","-m","a")
+  base=subprocess.run(["git","-C",str(root),"rev-parse","HEAD"],capture_output=True,text=True).stdout.strip()
+  return root,git,base
+
+ def test_exact_head_passes(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   root,_git,base=self._repo(tmp)
+   verdict=R.source_lineage_verdict(root,base)
+   self.assertEqual(verdict.kind,"exact")
+   self.assertEqual(verdict.distance,0)
+   self.assertEqual(verdict.commits,())
+   self.assertIsNone(verdict.reason)
+
+ def test_a_sd156_1_single_commit_descendant_records_distance_and_branch(self):
+  import subprocess
+  with tempfile.TemporaryDirectory() as tmp:
+   root,git,base=self._repo(tmp)
+   (root/"b").write_text("2"); git("add","."); git("commit","-q","-m","b")
+   head=subprocess.run(["git","-C",str(root),"rev-parse","HEAD"],capture_output=True,text=True).stdout.strip()
+   verdict=R.source_lineage_verdict(root,base)
+   self.assertEqual(verdict.kind,"descendant")
+   self.assertEqual(verdict.distance,1)
+   self.assertEqual(verdict.commits,(head,))
+   self.assertIsNotNone(verdict.branch)
+   self.assertNotEqual(verdict.branch,"HEAD")
+
+ def test_a_sd156_4_merge_commit_with_branch_first_parent_passes(self):
+  import subprocess
+  with tempfile.TemporaryDirectory() as tmp:
+   root,git,base=self._repo(tmp)
+   git("checkout","-qb","feature")
+   (root/"feature").write_text("f"); git("add","."); git("commit","-q","-m","feature work")
+   git("checkout","-q","-")
+   git("-c","user.email=t@t","-c","user.name=t","merge","--no-ff","-q","-m","merge feature","feature")
+   head=subprocess.run(["git","-C",str(root),"rev-parse","HEAD"],capture_output=True,text=True).stdout.strip()
+   verdict=R.source_lineage_verdict(root,base)
+   self.assertEqual(verdict.kind,"descendant")
+   self.assertIn(head,verdict.commits)
+
+ def test_a_sd156_3_diverged_head_refused(self):
+  # subTest shapes: a HEAD reset to before the sealed commit, and an
+  # unrelated orphan branch -- neither is the sealed commit or a first-parent
+  # descendant of it, so both read `diverged`, never a pass.
+  import subprocess
+  with tempfile.TemporaryDirectory() as tmp:
+   root,git,base=self._repo(tmp)
+   with self.subTest("rewritten-root"):
+    git("commit","--amend","-q","-m","rewritten")
+    verdict=R.source_lineage_verdict(root,base)
+    self.assertEqual(verdict.kind,"diverged")
+    self.assertIsNone(verdict.reason)
+  with tempfile.TemporaryDirectory() as tmp:
+   root,git,base=self._repo(tmp)
+   with self.subTest("unrelated-orphan-branch"):
+    git("checkout","-q","--orphan","unrelated")
+    git("commit","-q","--allow-empty","-m","orphan")
+    verdict=R.source_lineage_verdict(root,base)
+    self.assertEqual(verdict.kind,"diverged")
+
+ def test_a_sd156_3_merge_in_progress_is_unverifiable(self):
+  import subprocess
+  with tempfile.TemporaryDirectory() as tmp:
+   root,git,base=self._repo(tmp)
+   git("checkout","-qb","feature")
+   (root/"a").write_text("2"); git("commit","-qam","feature edits a")
+   git("checkout","-q","-")
+   (root/"a").write_text("3"); git("commit","-qam","main edits a")
+   subprocess.run(["git","-C",str(root),"merge","--no-ff","-q","-m","x","feature"],capture_output=True,text=True)
+   git_dir=subprocess.run(["git","-C",str(root),"rev-parse","--git-dir"],capture_output=True,text=True).stdout.strip()
+   self.assertTrue((root/git_dir/"MERGE_HEAD").exists(),"fixture must actually be mid-merge")
+   verdict=R.source_lineage_verdict(root,base)
+   self.assertEqual(verdict.kind,"unverifiable")
+   self.assertEqual(verdict.reason,"unsafe-git-operation")
+
+ def test_a_sd156_3_detached_head_is_unverifiable(self):
+  import subprocess
+  with tempfile.TemporaryDirectory() as tmp:
+   root,git,base=self._repo(tmp)
+   (root/"b").write_text("2"); git("add","."); git("commit","-q","-m","b")
+   git("checkout","-q","--detach","HEAD")
+   verdict=R.source_lineage_verdict(root,base)
+   self.assertEqual(verdict.kind,"unverifiable")
+   self.assertEqual(verdict.reason,"unsafe-git-state")
+
+ def test_not_a_repo_and_git_failure_are_unverifiable(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   verdict=R.source_lineage_verdict(Path(tmp),"a"*40)
+   self.assertEqual(verdict.kind,"unverifiable")
+   self.assertEqual(verdict.reason,"not-a-repo")
+
+ def test_git_timeout_is_unverifiable(self):
+  import subprocess as sp
+  def slow(*a,**k): raise sp.TimeoutExpired(cmd="git",timeout=k.get("timeout",1))
+  with mock.patch.object(R.subprocess,"run",side_effect=slow):
+   verdict=R.source_lineage_verdict(R.ROOT,"a"*40,timeout=1)
+  self.assertEqual(verdict.kind,"unverifiable")
+  self.assertEqual(verdict.reason,"git-timeout")
+
+ def test_a_sd156_6_worker_route_guard_shares_the_same_definition(self):
+  # This test file execs its own copy of capability-route.py, so `G.ROUTE`
+  # is a different module instance of the same source -- bytecode identity is
+  # the only comparison that proves "one definition" rather than "two files
+  # loaded twice" (`test_c_route_and_guard_share_one_mutating_scope_definition`
+  # establishes this pattern for `worktree_mutating_scope`).
+  self.assertEqual(
+   G.ROUTE.source_lineage_verdict.__code__.co_code,
+   R.source_lineage_verdict.__code__.co_code,
+  )
+
+ def test_a_sd156_6_three_consumers_agree_on_a_real_descendant(self):
+  import subprocess
+  with tempfile.TemporaryDirectory() as tmp:
+   root,git,base=self._repo(tmp)
+   (root/"b").write_text("2"); git("add","."); git("commit","-q","-m","b")
+   head=subprocess.run(["git","-C",str(root),"rev-parse","HEAD"],capture_output=True,text=True).stdout.strip()
+   direct=R.source_lineage_verdict(root,base)
+   self.assertEqual(direct.kind,"descendant")
+   guard=G.ROUTE.source_lineage_verdict(root,base)
+   self.assertEqual((guard.kind,guard.distance),(direct.kind,direct.distance))
+   self.assertTrue(R._grounding_cwd_lineage_ok(root,base,head))
+   verify=subprocess.run(
+    [sys.executable,str(P),"verify","--route","/dev/null","--cwd",str(root)],
+    capture_output=True,text=True,
+   )
+   # A bare --route smoke isn't a real route file; assert the shared function
+   # directly instead of round-tripping through a full compiled route here --
+   # `test_c_continuation_cli_rebinds_source_commit_after_fast_forward` and
+   # `hooks/material_route_guard.test.py::test_stale_source_commit_and_tampered_record_are_denied`
+   # already exercise the real `verify --cwd` subprocess end to end.
+   self.assertTrue(verify.returncode != 0)
+
+ def test_a_sd156_6_git_failure_reads_unverifiable_on_every_consumer(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   fake_bin=Path(tmp)/"bin"; fake_bin.mkdir()
+   fake_git=fake_bin/"git"
+   fake_git.write_text("#!/bin/sh\nexit 1\n"); fake_git.chmod(0o755)
+   scratch=Path(tmp)/"scratch"; scratch.mkdir()
+   prior=os.environ.get("PATH")
+   os.environ["PATH"]=str(fake_bin)+os.pathsep+(prior or "")
+   try:
+    direct=R.source_lineage_verdict(scratch,"a"*40)
+    self.assertEqual(direct.kind,"unverifiable")
+    guard=G.ROUTE.source_lineage_verdict(scratch,"a"*40)
+    self.assertEqual(guard.kind,"unverifiable")
+    self.assertFalse(R._grounding_cwd_lineage_ok(scratch,"a"*40,"b"*40))
+   finally:
+    if prior is None: os.environ.pop("PATH",None)
+    else: os.environ["PATH"]=prior
+
+
+class VerifiedRouteLineageTest(TestContinuation):
+ """SD-155: `review_lineage_routes` is `verified_route_lineage` plus only the
+ node-assignment identity check review disposition still needs."""
+
+ def test_review_lineage_uses_verified_lineage_plus_node_assignment(self):
+  import route_lineage as RL
+  with tempfile.TemporaryDirectory() as tmp:
+   artifact=Path(tmp)/"artifacts"
+   source=self._source(artifact)
+   source_path=R.canonical_route_path(artifact,source["route_id"])
+   R.write_once(source_path,source)
+   self._complete_prefix(source,"test",Path(tmp)/"evidence")
+   continuation=self._build(source)
+   continuation_path=R.canonical_route_path(artifact,continuation["route_id"])
+   R.publish_continuation_route(continuation,source,continuation_path)
+
+   # One definition: capability-route's re-export is the leaf's own object.
+   self.assertIs(R.verified_route_lineage,RL.verified_route_lineage)
+
+   lineage=R.verified_route_lineage(continuation,artifact_root=artifact)
+   self.assertEqual([row["route_id"] for row in lineage],
+                    [continuation["route_id"],source["route_id"]])
+   # review_lineage_routes agrees on the walk for a genuine continuation.
+   # "report" is a `new_nodes` entry (its dependency, "test", is realized
+   # fresh by this continuation) but is not itself the resume boundary, so
+   # unlike "test" it carries no resume-provenance fields
+   # (`source_depends_on`/`reused_dependencies`) and matches the parent
+   # exactly. A pure prefix-reused node (e.g. "plan-check") has no
+   # `new_nodes` edge at all and is out of this check's shape.
+   review_lineage=R.review_lineage_routes(continuation,"report")
+   self.assertEqual([row["route_id"] for row in review_lineage],
+                    [row["route_id"] for row in lineage])
+
+   # Tamper only the node assignment (not context/hash chain): the shared
+   # walk still passes, but review disposition's own extra check refuses.
+   tampered=json.loads(json.dumps(continuation))
+   node=next(n for n in tampered["nodes"] if n["id"]=="report")
+   node["unit"]="editorial/tampered-report"
+   tampered["route_hash"]=R.route_hash(tampered)
+   tampered["route_id"]="rt-"+tampered["route_hash"].split(":",1)[1][:16]
+
+   self.assertEqual(
+    [row["route_id"] for row in R.verified_route_lineage(tampered,artifact_root=artifact)],
+    [tampered["route_id"],source["route_id"]])
+   with self.assertRaisesRegex(ValueError,"owner-closure-lineage-node-mismatch"):
+    R.review_lineage_routes(tampered,"report")
+
+
+class SourceCensusTest(unittest.TestCase):
+ """A-SD156-6: the route-lineage consumers stay on the one shared probe.
+
+ Scoped to the route-lineage consumers the phase brief names (worker guard,
+ session hook, grounding comparison) -- other tools' unrelated `rev-list
+ --first-parent` uses (e.g. `adapters/claude/tools/memory/mem.py`'s transcript
+ history squashing) are out of scope, per plan §6's census note.
+ """
+ ROUTE_LINEAGE_CONSUMERS=(
+  "utilities/capability-route.py",
+  "utilities/worker-route-guard.py",
+  "hooks/material-route-guard.py",
+ )
+
+ def test_first_parent_probe_single_site(self):
+  root=P.parents[1]
+  hits=[]
+  for relative in self.ROUTE_LINEAGE_CONSUMERS:
+   text=(root/relative).read_text(encoding="utf-8",errors="replace")
+   if "rev-list" in text and "--first-parent" in text:
+    hits.append(relative)
+  self.assertEqual(hits,["utilities/capability-route.py"],hits)
+
+ # SD-155/D-120, A-25.7: cycle ownership is judged in exactly one place
+ # (`cycle_route_admission`/`route_cycle_for`); lineage is walked in exactly
+ # one place (`verified_route_lineage`); the audit copy (`route_bindings[]`)
+ # is written only by `bind_cycle_route` and read only there plus read
+ # surfaces -- never by admission, finalize or manifest building.
+ _CYCLE_OWNERSHIP_ALLOWED_FUNCTIONS=frozenset({
+  "route_cycle_for","cycle_route_admission","_finalize_route","require_cycle_output",
+  # Self-consistency, not cycle ownership (plan A-4 "비대상" list): route
+  # id/hash derivation, the `rebound` display flag, the reservation ledger's
+  # own identity check, and review-output-binding's capability/route parity.
+  "load_route","begin","read_interim_reservation","prepare_review_output_binding",
+ })
+
+ def test_a25_7_cycle_ownership_and_lineage_single_site(self):
+  import ast
+  producer_path=P.parents[1]/"utilities"/"artifact_producer.py"
+  tree=ast.parse(producer_path.read_text(encoding="utf-8"))
+
+  def is_route_id_field(node):
+   if (isinstance(node,ast.Call) and isinstance(node.func,ast.Attribute)
+       and node.func.attr=="get" and node.args
+       and isinstance(node.args[0],ast.Constant) and node.args[0].value=="route_id"):
+    return True
+   if isinstance(node,ast.Subscript):
+    sl=node.slice
+    if isinstance(sl,ast.Constant) and sl.value=="route_id": return True
+   return False
+
+  class OwnershipCompareVisitor(ast.NodeVisitor):
+   def __init__(self):
+    self.stack=[]; self.hits=[]
+   def visit_FunctionDef(self,node):
+    self.stack.append(node.name); self.generic_visit(node); self.stack.pop()
+   def visit_Compare(self,node):
+    sides=[node.left,*node.comparators]
+    if any(is_route_id_field(s) for s in sides):
+     self.hits.append((self.stack[-1] if self.stack else "<module>",node.lineno))
+    self.generic_visit(node)
+
+  visitor=OwnershipCompareVisitor(); visitor.visit(tree)
+  offenders=[(fn,ln) for fn,ln in visitor.hits if fn not in self._CYCLE_OWNERSHIP_ALLOWED_FUNCTIONS]
+  self.assertEqual(offenders,[],offenders)
+
+  class LineageWalkVisitor(ast.NodeVisitor):
+   """`continuation_contract_version`-driven ancestor walks (a `while`
+   loop testing it, or a direct read of `source_route_id`) outside the one
+   shared walk."""
+   def __init__(self):
+    self.stack=[]; self.hits=[]
+   def visit_FunctionDef(self,node):
+    self.stack.append(node.name); self.generic_visit(node); self.stack.pop()
+   def visit_While(self,node):
+    text=ast.dump(node.test)
+    if "continuation_contract_version" in text:
+     self.hits.append((self.stack[-1] if self.stack else "<module>",node.lineno))
+    self.generic_visit(node)
+
+  lineage_visitor=LineageWalkVisitor(); lineage_visitor.visit(tree)
+  self.assertEqual(lineage_visitor.hits,[],lineage_visitor.hits)
+
+  route_lineage_path=P.parents[1]/"utilities"/"route_lineage.py"
+  lineage_tree=ast.parse(route_lineage_path.read_text(encoding="utf-8"))
+  lineage_visitor2=LineageWalkVisitor(); lineage_visitor2.visit(lineage_tree)
+  self.assertEqual([fn for fn,_ln in lineage_visitor2.hits],["verified_route_lineage"])
+
+  class RouteBindingsVisitor(ast.NodeVisitor):
+   def __init__(self):
+    self.stack=[]; self.hits=[]
+   def visit_FunctionDef(self,node):
+    self.stack.append(node.name); self.generic_visit(node); self.stack.pop()
+   def visit_Constant(self,node):
+    if node.value=="route_bindings":
+     self.hits.append(self.stack[-1] if self.stack else "<module>")
+
+  binding_visitor=RouteBindingsVisitor(); binding_visitor.visit(tree)
+  self.assertEqual(set(binding_visitor.hits),{"_bind_cycle_route_locked"},binding_visitor.hits)
+
+ # SD-154 A-SD154-8: `evidence_digest`'s completion-marker-schema recompute
+ # lives only in `gate_currency`/`evidence_currency` (dispatch_contract.py)
+ # and the closed writer allow-list below. Every OTHER call is a genuinely
+ # different schema this census also enumerates by name rather than
+ # pretending does not exist: an owner-merge arbitration record
+ # (`_arbitration_observation`/`arbitrate_group`/the `parallel_group:` row
+ # inside `terminal_gate_observation`), an owner-executed terminal that has
+ # no completion marker file at all (`_owner_terminal_observation`), a
+ # review-artifact provenance sha for an owner-closure proof
+ # (`continuation_owner_closure_plan`/`_publish_continuation_owner_closure`),
+ # and `source_evidence_digest` (route-reuse's own named exception). None of
+ # these ever duplicated the completion-marker recompute B-1/A-2 unified --
+ # each is the one place ITS OWN schema is hashed.
+ _EVIDENCE_DIGEST_ALLOWED_FUNCTIONS=frozenset({
+  # dispatch_contract.py
+  "gate_currency","evidence_currency",
+  # capability-route.py -- completion-marker writers
+  "_completion_marker_replay","write_completion_marker",
+  "_publish_completion_locked","publish_revision_locked",
+  # capability-route.py -- named exception, route-reuse digest
+  "source_evidence_digest",
+  # capability-route.py -- different schema, not a completion marker
+  "_arbitration_observation","arbitrate_group","terminal_gate_observation",
+  "_owner_terminal_observation",
+  "continuation_owner_closure_plan","_publish_continuation_owner_closure",
+ })
+
+ def test_a_sd154_8_evidence_digest_recomputed_only_in_gate_currency(self):
+  import ast
+
+  class EvidenceDigestVisitor(ast.NodeVisitor):
+   def __init__(self):
+    self.stack=[]; self.hits=[]
+   def visit_FunctionDef(self,node):
+    self.stack.append(node.name); self.generic_visit(node); self.stack.pop()
+   def visit_Call(self,node):
+    name=node.func.id if isinstance(node.func,ast.Name) else (
+     node.func.attr if isinstance(node.func,ast.Attribute) else None)
+    if name=="evidence_digest":
+     self.hits.append((self.stack[-1] if self.stack else "<module>",node.lineno))
+    self.generic_visit(node)
+
+  offenders=[]
+  for relative in ("utilities/capability-route.py","utilities/dispatch_contract.py"):
+   path=P.parents[1]/relative
+   file_tree=ast.parse(path.read_text(encoding="utf-8"))
+   visitor=EvidenceDigestVisitor(); visitor.visit(file_tree)
+   for fn,ln in visitor.hits:
+    if fn not in self._EVIDENCE_DIGEST_ALLOWED_FUNCTIONS:
+     offenders.append(f"{relative}:{fn}:{ln}")
+  self.assertEqual(offenders,[],offenders)
+
+ # A-SD153-7: the round-budget judgement lives in exactly two places -- the
+ # legacy-route fallback inside `review_round_cap.round_budget` itself, and
+ # the compile-time seal that freezes `continuation_budget.review_round_cap`
+ # for every route born from that point on. Every admission surface
+ # (dispatch-node/dispatch-batch/stage-dispatch-fallback/
+ # `_owner_closure_eligibility`) reads the sealed value or calls
+ # `round_budget`/`admit_round` -- none may recompute the cap itself.
+ _MAX_REVIEW_ROUNDS_ALLOWED_FUNCTIONS=frozenset({
+  # utilities/review_round_cap.py -- the one legacy-route fallback site
+  "round_budget",
+ })
+
+ def test_a_sd153_7_max_review_rounds_only_in_round_budget_and_compile(self):
+  import ast
+
+  class MaxReviewRoundsVisitor(ast.NodeVisitor):
+   def __init__(self):
+    self.stack=[]; self.hits=[]
+   def visit_FunctionDef(self,node):
+    self.stack.append(node.name); self.generic_visit(node); self.stack.pop()
+   def visit_Call(self,node):
+    name=node.func.id if isinstance(node.func,ast.Name) else (
+     node.func.attr if isinstance(node.func,ast.Attribute) else None)
+    if name=="max_review_rounds":
+     self.hits.append((self.stack[-1] if self.stack else "<module>",node.lineno))
+    self.generic_visit(node)
+
+  offenders=[]
+  compile_seal_hits=0
+  for relative in (
+   "utilities/review_round_cap.py","utilities/capability-route.py",
+   "utilities/dispatch-batch.py","utilities/stage-dispatch-fallback.py",
+  ):
+   path=P.parents[1]/relative
+   file_tree=ast.parse(path.read_text(encoding="utf-8"))
+   visitor=MaxReviewRoundsVisitor(); visitor.visit(file_tree)
+   for fn,ln in visitor.hits:
+    if relative=="utilities/capability-route.py":
+     compile_seal_hits+=1; continue  # the one route-compile seal, counted below
+    if fn not in self._MAX_REVIEW_ROUNDS_ALLOWED_FUNCTIONS:
+     offenders.append(f"{relative}:{fn}:{ln}")
+  self.assertEqual(offenders,[],offenders)
+  self.assertEqual(compile_seal_hits,1,"expected exactly one compile-time seal call")
+  # dispatch-node.py's alias is a re-export assignment, never a call.
+  node_text=(P.parents[1]/"utilities"/"dispatch-node.py").read_text(encoding="utf-8")
+  self.assertIn("max_review_rounds = REVIEW_ROUND_CAP.max_review_rounds", node_text)
+  self.assertNotIn("max_review_rounds(", node_text)
 
 
 class ContinuationSealedJobsFallbackTest(unittest.TestCase):

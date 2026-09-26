@@ -20,6 +20,9 @@ spec = importlib.util.spec_from_file_location("route", ROOT / "utilities/capabil
 ROUTE = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ROUTE)
 WRAPPER_PARENT_SANDBOXES = ROUTE.WRAPPER_PARENT_SANDBOXES
+_node_spec = importlib.util.spec_from_file_location("dispatch_node_for_marker_test", ROOT / "utilities/dispatch-node.py")
+DISPATCH_NODE = importlib.util.module_from_spec(_node_spec)
+_node_spec.loader.exec_module(DISPATCH_NODE)
 
 ADAPTERS = {
     "codex": ([sys.executable, str(ROOT / "adapters/codex/bin/dispatch-headless.py")], ["--model", "gpt-test", "--reasoning", "low"]),
@@ -240,6 +243,17 @@ class CompletionMarkerTest(unittest.TestCase):
             ]
         return subprocess.run(command, text=True, capture_output=True, env=self.base_env())
 
+    def revise(self, route_path, node_id, evidence_path, *, basis, answers=None, direction=None,
+               reason=None, jobs=None, author_attempt_id="att-revise-fixture"):
+        command = [sys.executable, str(ROOT / "utilities/capability-route.py"), "revise",
+                   "--route", str(route_path), "--node", node_id, "--evidence", str(evidence_path),
+                   "--basis", basis, "--author-attempt-id", author_attempt_id]
+        if answers: command += ["--answers", ",".join(answers)]
+        if direction: command += ["--direction", direction]
+        if reason: command += ["--reason", reason]
+        if jobs is not None: command += ["--jobs", str(jobs)]
+        return subprocess.run(command, text=True, capture_output=True, env=self.base_env())
+
     def registered_axes(self):
         return {
             "dispatch_depth": 2,
@@ -300,6 +314,292 @@ class CompletionMarkerTest(unittest.TestCase):
                 command = self.wrapper_command(harness, "start", route_path, route, "execute")
                 result = subprocess.run(command, text=True, capture_output=True, env=self.base_env())
                 self.assertNotIn("reason=completion-marker-missing", result.stdout)
+
+    # SD-154/B-2 defect #2, M1 (real gate, not stubbed) ----------------------
+    def test_a_sd154_2_real_gate_reports_next_action_for_route_state_refusal(self):
+        """The real wrapper's `completion_marker_gate` -- the exact function
+        `stage-dispatch-fallback.py`'s own stub test (`stage_dispatch_
+        fallback.test.py::FallbackTest::
+        test_a_sd154_2_route_state_refusal_does_not_descend_to_inline`)
+        proves the fallback chain never descends past -- reports a supported
+        `next_action` for its own `completion-marker-missing` refusal, at
+        exit 65, `child_spawned=0`.
+        """
+        route = self.compile_route()
+        route_path = self.write_route(route, "route-v3-next-action.json")
+        harness = next(iter(ADAPTERS))
+        command = self.wrapper_command(harness, "start", route_path, route, "execute")
+        result = subprocess.run(command, text=True, capture_output=True, env=self.base_env())
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("reason=completion-marker-missing", result.stdout)
+        self.assertIn("child_spawned=0", result.stdout)
+        self.assertIn("next_action=", result.stdout)
+        fields = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+        self.assertTrue(fields.get("next_action"), result.stdout)
+
+    # SD-154 revision transition ---------------------------------------------
+    def test_a_sd154_1_revise_records_history_and_admits_next_round(self):
+        """A-SD154-1: `revise` publishes marker k+1 (`stage_authority=revision`)
+        over N, leaves `<N>.1.json` byte-identical, and the canonical marker
+        advances -- N is `current` again by `gate_currency`.
+        """
+        route = self.compile_route(intensity="standard")
+        route_path = self.write_route(route, "route-revise-1.json")
+        plan_evidence = self.base / "plan.md"
+        plan_evidence.write_text("plan v1\n", encoding="utf-8")
+        completed = self.complete(route_path, "plan", plan_evidence)
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+
+        canonical_dir = self.stable_dispatch / "completion" / route["route_id"]
+        plan_seq1_bytes = (canonical_dir / "plan.1.json").read_bytes()
+
+        plan_evidence.write_text("plan v2 (corrected)\n", encoding="utf-8")
+        result = self.revise(
+            route_path, "plan", plan_evidence,
+            basis="user-direction", direction="gate-release-fixture-1",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        marker = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(marker["stage_authority"], "revision")
+        self.assertEqual(marker["sequence"], 2)
+        self.assertEqual(marker["revision"]["basis"], "user-direction")
+        self.assertEqual(marker["revision"]["of_sequence"], 1)
+        self.assertEqual((canonical_dir / "plan.1.json").read_bytes(), plan_seq1_bytes)
+        plan_canonical_now = json.loads((canonical_dir / "plan.json").read_text(encoding="utf-8"))
+        self.assertEqual(plan_canonical_now["sequence"], 2)
+
+    def test_a_sd154_3_revision_tombstones_downstream_marker(self):
+        """A-SD154-3: a revision over N tombstones the canonical marker of
+        every node downstream of N -- `execute` (which depends on
+        `plan-check`, not `plan`, directly) is reopened too.
+        """
+        route = self.compile_route(intensity="standard")
+        route_path = self.write_route(route, "route-revise-3.json")
+        plan_evidence = self.base / "plan.md"
+        plan_evidence.write_text("plan v1\n", encoding="utf-8")
+        self.assertEqual(self.complete(route_path, "plan", plan_evidence).returncode, 0)
+        plan_check_evidence = self.base / "plan-check.md"
+        plan_check_evidence.write_text("plan-check v1\n", encoding="utf-8")
+        self.assertEqual(self.complete(route_path, "plan-check", plan_check_evidence).returncode, 0)
+
+        plan_evidence.write_text("plan v2 (corrected)\n", encoding="utf-8")
+        result = self.revise(
+            route_path, "plan", plan_evidence,
+            basis="owner-correction", reason="fixture: plan needed a correction",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        canonical_dir = self.stable_dispatch / "completion" / route["route_id"]
+        tombstone = json.loads((canonical_dir / "plan-check.json").read_text(encoding="utf-8"))
+        self.assertEqual(tombstone.get("state"), "superseded-by-upstream-revision")
+        self.assertEqual(tombstone.get("superseded_by"), {"node": "plan", "sequence": 2})
+
+        command = self.wrapper_command("claude", "start", route_path, route, "execute")
+        reopened = subprocess.run(command, text=True, capture_output=True, env=self.base_env())
+        self.assertIn("reason=completion-marker-missing", reopened.stdout)
+
+    def test_a_sd154_5_integrity_refusals_publish_nothing(self):
+        """A-SD154-5: kept refusals publish zero new markers."""
+        route = self.compile_route(intensity="standard")
+        route_path = self.write_route(route, "route-revise-5.json")
+        plan_evidence = self.base / "plan.md"
+        plan_evidence.write_text("plan v1\n", encoding="utf-8")
+        self.assertEqual(self.complete(route_path, "plan", plan_evidence).returncode, 0)
+        canonical_dir = self.stable_dispatch / "completion" / route["route_id"]
+
+        with self.subTest("unchanged-evidence"):
+            listing_before = sorted(canonical_dir.glob("plan.*.json"))
+            result = self.revise(
+                route_path, "plan", plan_evidence,
+                basis="user-direction", direction="gate-release-fixture-2",
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("revision-evidence-unchanged", result.stdout + result.stderr)
+            self.assertEqual(sorted(canonical_dir.glob("plan.*.json")), listing_before)
+
+        with self.subTest("basis-unverified-review-findings-with-no-jobs"):
+            plan_evidence.write_text("plan v2\n", encoding="utf-8")
+            listing_before = sorted(canonical_dir.glob("plan.*.json"))
+            result = self.revise(
+                route_path, "plan", plan_evidence,
+                basis="review-findings", answers=["att-not-a-real-verdict"],
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("revision-basis-unverified", result.stdout + result.stderr)
+            self.assertEqual(sorted(canonical_dir.glob("plan.*.json")), listing_before)
+
+        with self.subTest("target-marker-absent"):
+            result = self.revise(
+                route_path, "plan-check", plan_evidence,
+                basis="owner-correction", reason="fixture: no plan-check marker exists yet",
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("revision-target-marker-absent", result.stdout + result.stderr)
+
+        with self.subTest("sealed-cycle-evidence"):
+            # D-120: `publish_revision_locked` must reuse the same
+            # `require_cycle_output` admission `_publish_completion_locked`
+            # already enforces -- a revision cannot certify evidence from
+            # outside the route's bound cycle any more than an original
+            # completion can.
+            import artifact_producer as P
+            cycle_route = self.compile_route(intensity="standard")
+            cycle_route_path = self.write_route(cycle_route, "route-revise-5-cycle.json")
+            with mock.patch.dict(os.environ, self.base_env(), clear=True):
+                issued = P.begin(self.artifact, route_file=cycle_route_path,
+                                 capability=cycle_route["capability"],
+                                 intensity=cycle_route["effective_intensity"], require_cycle=True)
+                bound_evidence = Path(issued["cycle_dir"]) / "artifacts" / "plan.md"
+                bound_evidence.parent.mkdir(parents=True, exist_ok=True)
+                bound_evidence.write_text("plan v1 (bound)\n", encoding="utf-8")
+                completed = self.complete(
+                    cycle_route_path, "plan", bound_evidence,
+                    attempt_id="att-inline-plan-cycle-fixture", attempt_axes={
+                        "dispatch_depth": 2, "transport": "interactive", "execution_surface": "inline",
+                        "registered_worker": "0", "fallback_hop": "inline",
+                    })
+                self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+                # Change the marker's OWN recorded evidence file in place first,
+                # so `gate_currency` sees drift (`revised-unrecorded`) and lets
+                # the call reach the evidence-admission check below -- the
+                # refusal under test is about the NEW `--evidence` path
+                # (`outside_evidence`), not about whether a revision is owed.
+                bound_evidence.write_text("plan v1 (bound, edited)\n", encoding="utf-8")
+                outside_evidence = self.base / "plan-outside-cycle.md"
+                outside_evidence.write_text("plan v2 (outside the bound cycle)\n", encoding="utf-8")
+                cycle_canonical_dir = self.stable_dispatch / "completion" / cycle_route["route_id"]
+                listing_before = sorted(cycle_canonical_dir.glob("plan.*.json"))
+                result = self.revise(
+                    cycle_route_path, "plan", outside_evidence,
+                    basis="owner-correction", reason="fixture: evidence outside the bound cycle",
+                )
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("artifact-outside-bound-cycle", result.stdout + result.stderr)
+            self.assertEqual(sorted(cycle_canonical_dir.glob("plan.*.json")), listing_before)
+
+    def test_a_sd154_9_execute_revision_records_descendant_commits(self):
+        """A-SD154-9 (plan A-2): an `execute` revision is a code change, not
+        just new gate evidence -- `revision.commits` is the descendant range
+        SD-156's `source_lineage_verdict` proves, from execute's own most
+        recent terminal `launch_head` (recorded on the registry row) to the
+        current HEAD."""
+        self.jobs = self.stable_dispatch / "jobs.log"
+        self.jobs.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.jobs.touch(mode=0o600)
+        route = self.compile_route(intensity="standard")
+        route_path = self.write_route(route, "route-revise-9.json")
+        by_id = {n["id"]: n for n in route["nodes"]}
+        inline_metadata = {
+            "attempt_schema_version": 2, "dispatch_depth": 2, "transport": "interactive",
+            "execution_surface": "inline", "registered_worker": False, "fallback_hop": "inline",
+        }
+        with mock.patch.dict(os.environ, self.base_env(), clear=True):
+            for node_id, attempt_id in (
+                ("plan", "att-inline-plan-fixture"),
+                ("plan-check", "att-inline-plan-check-fixture"),
+                ("execute", "att-inline-execute-fixture"),
+            ):
+                evidence = self.base / f"{node_id}.md"
+                evidence.write_text(f"{node_id} v1\n", encoding="utf-8")
+                ROUTE._publish_completion_locked(
+                    route, by_id[node_id], node_id, evidence, jobs=self.jobs,
+                    attempt_id=attempt_id, attempt_metadata=inline_metadata,
+                )
+        sealed_head = subprocess.run(["git", "-C", str(self.repo), "rev-parse", "HEAD"],
+                                     text=True, capture_output=True, check=True).stdout.strip()
+        self.write_row("done", "exec-launch", "att-execute-launch",
+                       f"note=completed-marker,launch_head={sealed_head}", node_id="execute")
+        (self.repo / "y").write_text("y", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.repo), "add", "y"], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "commit", "-qm", "execute revision fixture"], check=True)
+        new_head = subprocess.run(["git", "-C", str(self.repo), "rev-parse", "HEAD"],
+                                  text=True, capture_output=True, check=True).stdout.strip()
+        self.assertNotEqual(new_head, sealed_head)
+        execute_evidence = self.base / "execute.md"
+        execute_evidence.write_text("execute v2 (revised)\n", encoding="utf-8")
+        result = self.revise(
+            route_path, "execute", execute_evidence,
+            basis="owner-correction", reason="fixture: execute code changed", jobs=self.jobs,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        marker = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(marker["revision"]["commits"], [new_head])
+
+    def _a_sd154_10_fixture(self, route_name):
+        """A `plan` marker under the SAME state root `admit_round` resolves
+        (`continuation_closure_fixture`'s convention: jobs.log lives under
+        `stable_dispatch`, not a sibling `self.base` path -- otherwise the
+        marker write and `admit_round`'s explicit-jobs completion_dir resolve
+        two different directories, SD-154 P2's asymmetry pitfall)."""
+        self.jobs = self.stable_dispatch / "jobs.log"
+        self.jobs.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.jobs.touch(mode=0o600)
+        route = self.compile_route(intensity="standard")
+        route_path = self.write_route(route, route_name)
+        plan_node = next(n for n in route["nodes"] if n["id"] == "plan")
+        plan_evidence = self.base / "plan.md"
+        plan_evidence.write_text("plan v1\n", encoding="utf-8")
+        with mock.patch.dict(os.environ, self.base_env(), clear=True):
+            ROUTE._publish_completion_locked(
+                route, plan_node, "plan", plan_evidence, jobs=self.jobs,
+                attempt_id="att-plan-1", attempt_metadata={
+                    "attempt_schema_version": 2, "dispatch_depth": plan_node["dispatch_depth"],
+                    "transport": "interactive", "execution_surface": "inline",
+                    "registered_worker": False, "fallback_hop": "inline",
+                },
+            )
+        # The plan gate's evidence changes in place (a mid-route correction)
+        # without anyone calling `revise` -- condition (1), `revised-unrecorded`.
+        plan_evidence.write_text("plan v2 (corrected)\n", encoding="utf-8")
+        plan_check_node = next(n for n in route["nodes"] if n["id"] == "plan-check")
+        pipe = ("capability=autopilot-code,attempt_schema_version=2,registered_worker=1,"
+                f"route_id={route['route_id']},route_node=plan-check,worker_type=review,"
+                "note=completed-review-blocking,attempt_id=att-plancheck-1")
+        with self.jobs.open("a", encoding="utf-8") as fh:
+            fh.write(f"2026-08-24T00:00:00Z\tdone\t{self.repo}\t{self.repo}\tslug-r1\t{pipe}\n")
+        return route, plan_check_node
+
+    def test_a_sd154_10_admit_round_auto_records_once(self):
+        """A-SD154-10 (13.59.3 rule 8): before admitting `plan-check`'s next
+        round, `admit_round` auto-records a `plan` revision naming the last
+        blocking round as its `answers` -- once, idempotently.
+        """
+        route, plan_check_node = self._a_sd154_10_fixture("route-a10.json")
+        with mock.patch.dict(os.environ, self.base_env(), clear=True):
+            admission = DISPATCH_NODE.admit_round(
+                route, plan_check_node, self.jobs, owner_attempt_id="att-owner-1",
+            )
+        self.assertEqual(len(admission.auto_revisions), 1, admission.auto_revisions)
+        recorded = admission.auto_revisions[0]
+        self.assertEqual(recorded["stage_authority"], "revision")
+        self.assertEqual(recorded["revision"]["basis"], "review-findings")
+        self.assertEqual(recorded["revision"]["answers"], ["att-plancheck-1"])
+        self.assertEqual(recorded["revision"]["recorded_by"], "runtime-auto")
+        self.assertEqual(recorded["revision"]["author_attempt_id"], "att-owner-1")
+        self.assertEqual(admission.budget.round_kind, "closure-check")
+
+        # Idempotent: `plan` is `current` again, so a second call records nothing.
+        with mock.patch.dict(os.environ, self.base_env(), clear=True):
+            second = DISPATCH_NODE.admit_round(
+                route, plan_check_node, self.jobs, owner_attempt_id="att-owner-1",
+            )
+        self.assertEqual(second.auto_revisions, ())
+
+    def test_a_sd154_10_tampered_history_records_nothing(self):
+        """A tampered `<N>.1.json` history file is `integrity-broken`, not
+        `revised-unrecorded` -- `admit_round` must not paper over it."""
+        route, plan_check_node = self._a_sd154_10_fixture("route-a10-tamper.json")
+        canonical_dir = self.stable_dispatch / "completion" / route["route_id"]
+        history_path = canonical_dir / "plan.1.json"
+        tampered = json.loads(history_path.read_text(encoding="utf-8"))
+        tampered["evidence"]["sha256"] = "0" * 64
+        history_path.write_text(json.dumps(tampered), encoding="utf-8")
+
+        with mock.patch.dict(os.environ, self.base_env(), clear=True):
+            admission = DISPATCH_NODE.admit_round(
+                route, plan_check_node, self.jobs, owner_attempt_id="att-owner-1",
+            )
+        self.assertEqual(admission.auto_revisions, ())
 
     # fixture 8 -------------------------------------------------------------
     def test_marker_absence_is_not_a_failure(self):
@@ -988,10 +1288,13 @@ class CompletionMarkerTest(unittest.TestCase):
         source, route, path, node, memo, reviews = self.continuation_closure_fixture()
         before = self.jobs.read_bytes(), tuple(p.read_bytes() for p in reviews)
         with mock.patch.dict(os.environ, self.base_env(), clear=True):
-            # The original producer boundary remains closed to this memo.
+            # D-120: the continuation's `begin` rebound the source's already-open
+            # cycle (verified lineage), so the boundary this once tripped is
+            # exactly what SD-155/D-120 dissolves -- the source's own route_id
+            # now resolves the *shared* bound cycle memo lives in.
             import artifact_producer as P
-            with self.assertRaisesRegex(P.ProducerError, "artifact-outside-bound-cycle"):
-                P.require_cycle_output(self.artifact, memo, route_id=source["route_id"])
+            output_dir = P.require_cycle_output(self.artifact, memo, route_id=source["route_id"])
+            memo.resolve().relative_to(output_dir.resolve())  # no ValueError: memo is inside
             proof = ROUTE.continuation_owner_closure_plan(route, node, memo, self.jobs, "att-source-review-r2")
             self.assertEqual(proof["rounds"], 2)
             target = ROUTE.completion_dir(route["route_id"]) / "plan-check.json"
@@ -1014,6 +1317,74 @@ class CompletionMarkerTest(unittest.TestCase):
             self.assertFalse(target.with_name("plan-check.2.json").exists())
             self.assertFalse((ROUTE.completion_dir(source["route_id"]) / "plan-check.json").exists())
         self.assertEqual(before, (self.jobs.read_bytes(), tuple(p.read_bytes() for p in reviews)))
+
+    def test_owner_workflow_gaps_sees_no_gap_behind_a_real_owner_closure_marker(self):
+        """SD-153 defect #1 (plan §3 B-1): an owner-executed terminal node
+        (e.g. autopilot-spec's `prd-transaction`) that depends on a review
+        node closed by owner-closure must see NO gap in
+        `dispatch_terminal_commit.owner_workflow_gaps` -- through the real
+        `capability-route complete` path (never a hand-written JSON marker or
+        a mocked `_route_module`, the way `dispatch_terminal_commit.test.py`'s
+        `_TerminalCommitFixture` would). P3's handoff could not fit this
+        scenario into that fixture (it mocks the whole route module) and left
+        it an open item; this reuses the review-closure apparatus already
+        proven by `test_registered_review_shape_passes_exact_terminal_identity`
+        for the real-path fixture it asked for.
+
+        `owner_workflow_gaps` walks every node `plan-check` transitively
+        depends on (`frame`/`frame-alternative`/`plan`) AND separately checks
+        every OTHER declared terminal node in the route (`report`) -- so the
+        route here is trimmed to just the ancestor chain plus the synthetic
+        owner-terminal, and the three ancestors get the same trivial inline
+        completion `continuation_closure_fixture` already uses for a review
+        node's own immediate dependency (`registered_worker: False` makes
+        `completion_attempt_readiness` "ready" without a live registry row).
+        """
+        self.jobs = self.stable_dispatch / "jobs.log"
+        self.jobs.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.jobs.touch(mode=0o600)
+        route = self.compile_route()
+        self.write_route(route)
+        by_id = {n["id"]: n for n in route["nodes"]}
+        with mock.patch.dict(os.environ, self.base_env(), clear=True):
+            for ancestor_id in ("frame", "frame-alternative", "plan", "plan-alternative"):
+                ancestor = by_id[ancestor_id]
+                evidence = self.base / f"{ancestor_id}.md"
+                evidence.write_text(f"{ancestor_id} fixture output\n", encoding="utf-8")
+                ROUTE._publish_completion_locked(
+                    route, ancestor, ancestor_id, evidence, jobs=self.jobs,
+                    attempt_id=f"att-inline-{ancestor_id}-fixture", attempt_metadata={
+                        "attempt_schema_version": 2, "dispatch_depth": ancestor["dispatch_depth"],
+                        "transport": "interactive", "execution_surface": "inline",
+                        "registered_worker": False, "fallback_hop": "inline",
+                    },
+                )
+            r1 = self.review_blocking_row("att-shape-owner-r1", 1)
+            r2 = self.review_blocking_row("att-shape-owner-r2", 2)
+            self._reap_real_process("att-shape-owner-r2")
+            memo = self.owner_closure(route, attempts=("att-shape-owner-r1", "att-shape-owner-r2"),
+                                      artifacts=(r1.name, r2.name))
+            node = by_id["plan-check"]
+            marker, _receipt = ROUTE.complete_node(route, node, "plan-check", memo,
+                                                    jobs=self.jobs, attempt_id="att-shape-owner-r2")
+            self.assertEqual(marker["review_independence"], "owner-overridden")
+            sync_node = {
+                "id": "prd-transaction", "kind": "capability-owner", "unit": "_kernel/owner",
+                "dispatch_depth": 1, "terminal": True, "depends_on": ["plan-check"],
+                "completion_gate": "prd-transaction-complete",
+            }
+            trimmed_route = {
+                **route,
+                "nodes": [by_id["frame"], by_id["frame-alternative"], by_id["plan"],
+                          by_id["plan-alternative"], node, sync_node],
+            }
+            owner_metadata = {
+                "workflow_completion": "runtime-v1", "worker_type": "owner",
+                "dispatch_depth": "1", "attempt_id": "att-owner-sync-fixture", "failure_class": "pass",
+            }
+            import dispatch_terminal_commit as T
+            gaps = T.owner_workflow_gaps(self.jobs, owner_metadata, trimmed_route)
+        self.assertEqual(gaps, {})
 
     def test_continuation_source_locator_does_not_change_lineage_hash(self):
         """A CLI filesystem path is invocation context, never route identity."""
@@ -1118,21 +1489,25 @@ class CompletionMarkerTest(unittest.TestCase):
     def test_continuation_closure_rejects_sibling_wrong_cycle_and_forged_lineage(self):
         source, route, path, node, memo, reviews = self.continuation_closure_fixture()
         with mock.patch.dict(os.environ, self.base_env(), clear=True):
+            # D-120: `old_memo` sits under the *source's* cycle dir, and that
+            # cycle is exactly the one the continuation's `begin` rebound into
+            # (verified lineage) -- so this is no longer "wrong cycle", it is
+            # the same cycle by design, and the plan proceeds.
             old_memo = self.owner_closure(source, directory=reviews[0].parent,
                                          attempts=("att-source-review-r1", "att-source-review-r2"),
                                          artifacts=tuple(p.name for p in reviews))
-            with self.assertRaisesRegex(Exception, "artifact-outside-bound-cycle"):
-                ROUTE.continuation_owner_closure_plan(route, node, old_memo, self.jobs, "att-source-review-r2")
+            proof = ROUTE.continuation_owner_closure_plan(route, node, old_memo, self.jobs, "att-source-review-r2")
+            self.assertEqual(proof["rounds"], 2)
             forged = copy.deepcopy(route)
             forged["source_route_hash"] = "sha256:" + "f" * 64
-            with self.assertRaisesRegex(ValueError, "lineage-hash-mismatch"):
+            with self.assertRaisesRegex(ValueError, "route-lineage-unverified"):
                 ROUTE.continuation_owner_closure_plan(forged, node, memo, self.jobs, "att-source-review-r2")
             source_path = ROUTE.canonical_route_path(self.artifact, source["route_id"])
             original = source_path.read_bytes()
             changed = copy.deepcopy(source)
             next(n for n in changed["nodes"] if n["id"] == node["id"])["unit"] = "qa/another-review"
             source_path.write_text(json.dumps(changed))
-            with self.assertRaisesRegex(ValueError, "lineage-hash-mismatch"):
+            with self.assertRaisesRegex(ValueError, "route-lineage-unverified"):
                 ROUTE.continuation_owner_closure_plan(route, node, memo, self.jobs, "att-source-review-r2")
             source_path.write_bytes(original)
             self.assertFalse((ROUTE.completion_dir(route["route_id"]) / "plan-check.json").exists())
@@ -1146,7 +1521,9 @@ class CompletionMarkerTest(unittest.TestCase):
             rounds = dispatch.prior_round_attempts(self.jobs, route["route_id"], node["id"],
                                                    exclude_slug="plan-check-r2", route=route)
             self.assertEqual(len(rounds), 2)
-            self.assertEqual([note for slug, note in rounds], ["completed-review-blocking"] * 2)
+            # SD-153: `prior_round_attempts` now returns (cols, metadata) pairs
+            # -- the full row census `round_budget` needs -- not (slug, note).
+            self.assertEqual([meta.get("note") for cols, meta in rounds], ["completed-review-blocking"] * 2)
 
     def test_two_blocking_rounds_with_owner_closure_publish_the_marker(self):
         route = self.compile_route()          # strong -> review round cap 2
@@ -1183,6 +1560,92 @@ class CompletionMarkerTest(unittest.TestCase):
         again = self.complete(route_path, "plan-check", memo, jobs=self.jobs, attempt_id="att-review-r2")
         self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
         self.assertFalse((directory / "plan-check.2.json").exists())
+
+    def _reap_real_process(self, attempt_id):
+        """Stamp one row with a real, reaped session leader's process identity.
+
+        `attempt_process_quiescence` needs actual pid/namespace fields to call
+        a row quiescent; a synthetic `done` row with none is `unverifiable`,
+        not `ready`. No namespace mismatch or missing PID is synthesized.
+        """
+        child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
+                                 stdin=subprocess.PIPE, start_new_session=True)
+        start = D.process_start_ticks(child.pid)
+        namespace = D.process_namespace_identity(child.pid)
+        child.communicate(timeout=5)
+        self.assertIsNotNone(start)
+        self.assertIsNotNone(namespace)
+        rows = self.jobs.read_text().splitlines()
+        self.jobs.write_text("\n".join(
+            line + (f",pid={child.pid},pid_start={start},pgid={child.pid},"
+                    f"pid_ns={namespace},pid_observer_ns={namespace}"
+                    if f"attempt_id={attempt_id}," in line else "") for line in rows) + "\n")
+
+    def test_registered_review_shape_passes_exact_terminal_identity(self):
+        # B-1 (SD-153 defect #1): the *same* review row closed in place by the
+        # owner (registered-review shape) must reach the same "the owner
+        # ruled on this node" conclusion `_marker_identity_row` already gives
+        # a continuation's own synthetic marker (see the sibling test below).
+        # `write_completion_marker` does not thread an explicit `jobs=` through
+        # its own `completion_dir()` call, so a `jobs.log` outside the stable
+        # per-user root (this class's default `self.jobs`) reads back a marker
+        # `_marker_identity_row` cannot find at that same explicit path -- move
+        # the registry itself onto the stable root, as `continuation_closure_
+        # fixture` already does, so registry and marker root coincide.
+        self.jobs = self.stable_dispatch / "jobs.log"
+        self.jobs.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.jobs.touch(mode=0o600)
+        route = self.compile_route()
+        self.write_route(route)
+        r1 = self.review_blocking_row("att-shape-r1", 1)
+        r2 = self.review_blocking_row("att-shape-r2", 2)
+        self._reap_real_process("att-shape-r2")
+        memo = self.owner_closure(route, attempts=("att-shape-r1", "att-shape-r2"),
+                                  artifacts=(r1.name, r2.name))
+        node = next(n for n in route["nodes"] if n["id"] == "plan-check")
+        # In-process (like the continuation-shape sibling below), not the
+        # `complete()` subprocess: `write_completion_marker` does not thread
+        # `jobs=` through its own `completion_dir()` call, so a subprocess
+        # invoked with `base_env()`'s cleared `AGENT_DISPATCH_JOBS` writes the
+        # marker under the stable per-user root while `--jobs` only pointed
+        # the registry elsewhere -- a real root-resolution asymmetry in
+        # `write_completion_marker`, out of this package's scope, that an
+        # in-process call with one consistent `jobs` value does not hit.
+        with mock.patch.dict(os.environ, self.base_env(), clear=True):
+            marker, _ = ROUTE.complete_node(route, node, "plan-check", memo,
+                                            jobs=self.jobs, attempt_id="att-shape-r2")
+            proof = ROUTE._marker_identity_row(
+                route, node, "plan-check", node.get("completion_gate"),
+                jobs=self.jobs, exact_terminal=True)
+        self.assertTrue(proof["passed"], proof)
+        self.assertEqual(ROUTE.owner_closure_shape(marker), "registered-review")
+
+    def test_continuation_shape_passes_exact_terminal_identity(self):
+        # The sibling of the test above: a continuation's own synthetic
+        # owner-closure marker, `owner_closure_shape`'s other non-None value.
+        source, route, path, node, memo, _reviews = self.continuation_closure_fixture()
+        with mock.patch.dict(os.environ, self.base_env(), clear=True):
+            marker, _ = ROUTE.complete_node(route, node, node["id"], memo, self.jobs, "att-source-review-r2")
+            proof = ROUTE._marker_identity_row(
+                route, node, node["id"], node["completion_gate"],
+                jobs=self.jobs, exact_terminal=True)
+        self.assertTrue(proof["passed"], proof)
+        self.assertEqual(ROUTE.owner_closure_shape(marker), "continuation")
+
+    def test_unshaped_blocking_row_does_not_pass_exact_terminal_identity(self):
+        # A blocking review round that nobody ever ruled over is neither
+        # shape -- `owner_closure_shape` returns None and exact-terminal
+        # identity must not pass over its head.
+        route = self.compile_route()
+        self.write_route(route)
+        self.review_blocking_row("att-plain-r1", 1)
+        self._reap_real_process("att-plain-r1")
+        node = next(n for n in route["nodes"] if n["id"] == "plan-check")
+        with mock.patch.dict(os.environ, self.base_env(), clear=True):
+            proof = ROUTE._marker_identity_row(
+                route, node, "plan-check", node.get("completion_gate"),
+                jobs=self.jobs, exact_terminal=True)
+        self.assertFalse(proof["passed"], proof)
 
     def test_true_dead_worker_is_refused_even_with_a_closure_record(self):
         # The core safety property: a worker that did not finish (dead-*) is
@@ -1328,19 +1791,33 @@ class CompletionMarkerTest(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("owner-closure-round-still-open:attempt=att-live-r2", result.stderr)
                 self.assertFalse((directory / "plan-check.json").exists())
-        # a terminated-but-not-blocking round (a real BLOCKED worker) does count toward
-        # exhaustion, and the closure then rides on the one genuine blocking round
+        # SD-153 (A-SD153-5, revised): a terminated-but-not-blocking round (a
+        # real BLOCKED worker, never a PASS/FAIL/blocking verdict) does NOT
+        # spend the exhaustion budget by itself any more -- only one genuine
+        # verdict (r1's blocking review) has landed, so closure is still
+        # premature, and a third registered round is still admitted rather
+        # than refused as budget-exhausted.
         self.jobs.write_text("\n".join(
             l for l in self.jobs.read_text(encoding="utf-8").splitlines() if "att-live-r2" not in l
         ) + "\n", encoding="utf-8")
         self.write_row("done", "plan-check-r2", "att-live-r2",
                        "worker_type=review,note=dead-worker-blocked,failure_class=blocked", node_id="plan-check")
         result = self.complete(route_path, "plan-check", memo, jobs=self.jobs, attempt_id="att-live-r1")
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        receipt = [json.loads(l) for l in result.stdout.splitlines() if l.startswith("{")][-1]
-        self.assertEqual(receipt["blocking_attempts"], ["att-live-r1"])
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(
+            "owner-closure-round-budget-not-exhausted:rounds=1;max_round=2;verdictless_streak=1;bound=2",
+            result.stderr,
+        )
+        self.assertFalse((directory / "plan-check.json").exists())
         status, meta = self.read_row("att-live-r2")
         self.assertEqual((status, meta.get("note")), ("done", "dead-worker-blocked"))   # untouched
+        node_spec = importlib.util.spec_from_file_location(
+            "m3_dispatch_node", ROOT / "utilities/dispatch-node.py")
+        dispatch = importlib.util.module_from_spec(node_spec)
+        node_spec.loader.exec_module(dispatch)
+        node = next(n for n in route["nodes"] if n["id"] == "plan-check")
+        budget = dispatch.admit_round(route, node, self.jobs).budget
+        self.assertEqual(budget.state, "admit")
 
     def test_m4_second_closure_on_another_attempt_is_refused_and_keeps_the_canonical_marker(self):
         route = self.compile_route()
@@ -1384,7 +1861,13 @@ class CompletionMarkerTest(unittest.TestCase):
         self.assertFalse((directory / "plan-check.json").exists())
 
     def test_minor10_unknown_intensity_is_a_typed_refusal(self):
+        # SD-153: a compiled route's sealed `continuation_budget.review_round_cap`
+        # is now authoritative over a mutated `effective_intensity` -- only a
+        # legacy route with no sealed cap re-derives from `effective_intensity`
+        # (and can therefore hit an unknown one), so the fixture must drop the
+        # field to still exercise this refusal.
         route = dict(self.compile_route())
+        route.pop("continuation_budget", None)
         route["effective_intensity"] = "mythic"
         node = next(n for n in route["nodes"] if n["id"] == "plan-check")
         with self.assertRaises(ValueError) as caught:

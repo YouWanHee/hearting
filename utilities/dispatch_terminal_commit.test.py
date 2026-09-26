@@ -68,6 +68,13 @@ class ProducerBindingTests(unittest.TestCase):
             T.producer_binding_path(self.root, "../route", "att-owner")
 
     def test_owner_prerequisites_keep_resource_evidence_and_do_not_invent_a_second_owner(self):
+        # SD-154 A-2: `_marker_identity_row`'s own evidence-sha recompute is now
+        # `evidence_currency`'s result (single recompute site, A-SD154-8), which
+        # proves full schema-v2 identity (schema_version/sequence/history-byte
+        # match) the way every real `write_completion_marker` marker already
+        # does -- so the fixture marker needs those fields too, and a stale
+        # digest now reads `completion-evidence-revised-unrecorded` (owner can
+        # recover with `revise`), not the retired `completion-evidence-hash-mismatch`.
         evidence=self.root/"resource.json"; evidence.write_text('{"exit_code":0}')
         resource={"id":"run","kind":"resource-runner","completion_gate":"lab-run"}
         publish={"id":"publish","kind":"capability-owner","unit":"_kernel/owner",
@@ -75,15 +82,16 @@ class ProducerBindingTests(unittest.TestCase):
         terminal={**publish,"id":"sync","terminal":True,"depends_on":["publish"]}
         route={"route_id":"rt-resource-owner","route_hash":"sha256:fixture","nodes":[resource,publish,terminal]}
         directory=ROUTE.completion_dir(route["route_id"],jobs=self.jobs); directory.mkdir(parents=True)
-        marker={"route_id":route["route_id"],"route_hash":route["route_hash"],"node_id":"run",
-                "completion_gate":"lab-run","registered_worker":False,
+        marker={"schema_version":2,"route_id":route["route_id"],"route_hash":route["route_hash"],
+                "node_id":"run","completion_gate":"lab-run","registered_worker":False,"sequence":1,
                 "evidence":{"path":str(evidence),"sha256":ROUTE.evidence_digest(evidence)}}
         (directory/"run.json").write_text(json.dumps(marker))
+        (directory/"run.1.json").write_text(json.dumps(marker))
         self.assertEqual(ROUTE.owner_terminal_prerequisites(route,terminal,self.jobs),{})
         self.assertEqual(self.jobs.read_text(),"")
         evidence.write_text('{"exit_code":1}')
         self.assertEqual(ROUTE.owner_terminal_prerequisites(route,terminal,self.jobs),
-                         {"run":"completion-evidence-hash-mismatch"})
+                         {"run":"completion-evidence-revised-unrecorded"})
 
     def test_route_children_consumes_exact_owner_and_inline_gate_proofs(self):
         route = {"route_id": "rt-gate-proof", "route_hash": "sha256:" + "a" * 64,
@@ -997,13 +1005,16 @@ class OwnerCompletionStateTest(_TerminalCommitFixture):
                               ("blocked", "completion-attempt-not-current"))
             self.assertFalse(T.owner_completion_pending(self.jobs, "done", self._metadata()))
 
-    def test_completion_state_evidence_hash_mismatch_is_blocked(self):
-        gates = {"execute": {"passed": False, "reason": "completion-evidence-hash-mismatch"}}
+    def test_completion_state_evidence_revised_unrecorded_is_blocked(self):
+        # SD-154 I-5: the retired `completion-evidence-hash-mismatch` reason is
+        # `completion-evidence-revised-unrecorded` now (owner recovers with
+        # `capability-route.py revise`, not by treating the row as a dead end).
+        gates = {"execute": {"passed": False, "reason": "completion-evidence-revised-unrecorded"}}
         with mock.patch.object(T, "_route_module") as route_module:
             route_module.return_value.terminal_gate_observation.return_value = gates
             state = T.owner_completion_state(self.jobs, "done", self._metadata())
         self.assertEqual((state.state, state.reason),
-                          ("blocked", "completion-evidence-hash-mismatch"))
+                          ("blocked", "completion-evidence-revised-unrecorded"))
 
     def test_completion_state_marker_absent_stays_pending(self):
         # Cannot be proven permanent -- the marker may simply not be written
@@ -1038,7 +1049,7 @@ class OwnerCompletionStateTest(_TerminalCommitFixture):
                 self.assertEqual(state.state, "pending")
                 self.assertEqual(state.reason, reason)
         self.assertEqual(T._PROVEN_BLOCKED_GATE_REASONS,
-                         {"completion-attempt-not-current", "completion-evidence-hash-mismatch"})
+                         {"completion-attempt-not-current", "completion-evidence-revised-unrecorded"})
 
 
 class CompletionRequestDeferredGuardTest(unittest.TestCase):

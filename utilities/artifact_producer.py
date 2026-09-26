@@ -60,6 +60,7 @@ import artifact_locator  # noqa: E402
 import artifact_manifest  # noqa: E402
 import artifact_campaign  # noqa: E402
 import route_identity  # noqa: E402
+import route_lineage  # noqa: E402
 import dispatch_lock_order  # noqa: E402
 import dispatch_terminal_commit  # noqa: E402
 from dispatch_contract import (  # noqa: E402
@@ -670,6 +671,218 @@ def list_cycle_records(root: Path) -> List[Dict[str, Any]]:
     return rows
 
 
+# ---------------------------------------------------------------------------
+# D-120: route lineage binding -- "route W may write cycle C" is judged fresh
+# from the sealed route file and the cycle record's begin values every time,
+# never from the producer's own audit copy (`route_bindings[]`, which
+# `bind_cycle_route` writes and only readers consume). SD-155's
+# `verified_route_lineage` is the one hash-verified walk this admission and
+# `route_cycle_for` both stand on.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Admission:
+    allow: bool
+    reason: Optional[str]
+    detail: str
+    path: List[Dict[str, Any]]
+    next_action: Optional[str]
+
+
+_D120_NEXT_ACTION = {
+    "cycle-not-open": "start a new cycle (--parent-cycle to keep it linked)",
+    "route-lineage-unverified": ("restore the sealed route file, or start a new route; a continuation that "
+                                  "changed capability needs a new child cycle (--parent-cycle)"),
+    "route-hash-drift": "restore the sealed route file",
+    "cycle-route-binding-mismatch": "start a new cycle (--parent-cycle to keep it linked)",
+    "cycle-route-binding-mismatch:material-input": "start a new child cycle (--parent-cycle)",
+    "cycle-route-binding-mismatch:lineage-fork": "continue this branch in a new child cycle (--parent-cycle)",
+    "cycle-route-binding-mismatch:superseded-route": "close and seal from the end route instead",
+}
+
+
+def _d120_next_action(reason: str) -> str:
+    return _D120_NEXT_ACTION.get(reason, _D120_NEXT_ACTION.get(reason.split(":", 1)[0], "retry"))
+
+
+def _routes_dir(root: Path) -> Path:
+    return route_lineage.canonical_route_path(root, "x").parent
+
+
+def _lineage_children(root: Path, route_id: str, route_hash_value: str) -> List[Dict[str, Any]]:
+    """Every continuation whose sealed edge names ``route_id``/``route_hash_value`` as its source.
+
+    A digest-keyed memo is allowed by D-120 ("구현은 디렉터리 목록 digest에 결속된
+    자식 색인을 캐시로 둘 수 있다") but correctness never depends on one; this
+    reads the directory fresh, which is fine at the scale a single cycle's
+    lineage tree reaches.
+    """
+    directory = _routes_dir(root)
+    if not directory.is_dir():
+        return []
+    children: List[Dict[str, Any]] = []
+    for entry in sorted(directory.glob("*.json")):
+        if entry.stem == route_id:
+            continue
+        candidate = _read_json(entry)
+        if not isinstance(candidate, dict):
+            continue
+        if (candidate.get("continuation_contract_version") != 1
+                or candidate.get("source_route_id") != route_id
+                or candidate.get("source_route_hash") != route_hash_value):
+            continue
+        if route_identity.route_hash(candidate) != candidate.get("route_hash"):
+            continue  # a tampered sibling proves nothing; not part of any lineage
+        children.append(candidate)
+    return children
+
+
+def route_cycle_for(root: Path, route: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    """The one open cycle begun by a route in ``route``'s verified lineage, if any.
+
+    Shared by every "find the cycle for this route" call site (env resolution,
+    begin resume, checkpoint, `require_cycle_output`). Two or more open cycles
+    whose begin route sits in the same verified lineage is the existing
+    `route-cycle-binding-ambiguous` refusal.
+    """
+    try:
+        lineage = route_lineage.verified_route_lineage(dict(route), artifact_root=root)
+    except route_lineage.RouteLineageError as exc:
+        raise ProducerError(exc.code, exc.detail) from exc
+    lineage_ids = {r.get("route_id") for r in lineage}
+    matches = [rec for rec in list_cycle_records(root)
+               if rec.get("state") == "open" and rec.get("route_id") in lineage_ids]
+    if len(matches) > 1:
+        raise ProducerError("route-cycle-binding-ambiguous", route.get("route_id", ""))
+    return matches[0] if matches else None
+
+
+def cycle_route_admission(root: Path, record: Mapping[str, Any], route: Mapping[str, Any],
+                          *, finalize: bool = False) -> Admission:
+    """D-120's one admission judgment: may ``route`` write (or seal) ``record``'s cycle?
+
+    Steps 0-4 exactly as spelled out in artifact-path-contract §42: cycle
+    open, ``route``'s hash-verified lineage, the begin route's membership and
+    hash in that lineage, material-input (capability/intensity) parity along
+    the path, and sibling-fork detection at every path node but ``route``
+    itself. ``finalize=True`` adds D-120's finalize-only rule: a route with a
+    still-attached T(C) continuation child cannot seal
+    (`...:superseded-route`).
+    """
+    if record.get("state") != "open":
+        reason = "cycle-not-open"
+        return Admission(False, reason, str(record.get("state")), [], _d120_next_action(reason))
+    try:
+        lineage = route_lineage.verified_route_lineage(dict(route), artifact_root=root)
+    except route_lineage.RouteLineageError as exc:
+        reason = "route-lineage-unverified"
+        return Admission(False, reason, str(exc), [], _d120_next_action(reason))
+    by_id = {r["route_id"]: r for r in lineage}
+    begin_id = record.get("route_id")
+    if begin_id not in by_id:
+        reason = "cycle-route-binding-mismatch"
+        return Admission(False, reason, f"begin={begin_id} not in lineage of {route.get('route_id')}",
+                         [], _d120_next_action(reason))
+    if by_id[begin_id].get("route_hash") != record.get("route_hash"):
+        reason = "route-hash-drift"
+        return Admission(False, reason, str(record.get("cycle_id", "")), [], _d120_next_action(reason))
+    # lineage is [W, parent, ..., A]; the admitted path P runs begin (A) -> W.
+    begin_index = next(i for i, r in enumerate(lineage) if r["route_id"] == begin_id)
+    path = list(reversed(lineage[: begin_index + 1]))
+    for node in path:
+        if node.get("capability") != record.get("capability") or node.get("effective_intensity") != record.get("intensity"):
+            reason = "cycle-route-binding-mismatch:material-input"
+            return Admission(False, reason, f"route={node['route_id']}", path, _d120_next_action(reason))
+    for node in path[:-1]:
+        siblings = _lineage_children(root, node["route_id"], node["route_hash"])
+        qualifying = [s for s in siblings
+                      if s.get("capability") == record.get("capability")
+                      and s.get("effective_intensity") == record.get("intensity")]
+        for sibling in qualifying:
+            if sibling["route_id"] not in by_id:
+                reason = "cycle-route-binding-mismatch:lineage-fork"
+                return Admission(False, reason, f"branch={node['route_id']} siblings={sibling['route_id']},{path[path.index(node)+1]['route_id']}",
+                                 path, _d120_next_action(reason))
+    if finalize:
+        qualifying = [s for s in _lineage_children(root, route["route_id"], route["route_hash"])
+                      if s.get("capability") == record.get("capability")
+                      and s.get("effective_intensity") == record.get("intensity")]
+        if qualifying:
+            reason = "cycle-route-binding-mismatch:superseded-route"
+            return Admission(False, reason, route["route_id"], path, _d120_next_action(reason))
+    return Admission(True, None, "", path, None)
+
+
+def _route_binding_entry(route_row: Mapping[str, Any], root: Path, *, is_begin: bool) -> Dict[str, Any]:
+    return {
+        "route_id": route_row["route_id"],
+        "route_hash": route_row["route_hash"],
+        "route_file": str(route_lineage.canonical_route_path(root, route_row["route_id"])),
+        "basis": "begin" if is_begin else "continuation",
+        "continuation_id": None if is_begin else route_row["route_id"],
+        "source_route_id": None if is_begin else route_row.get("source_route_id"),
+    }
+
+
+def _binding_core(entry: Mapping[str, Any]) -> Dict[str, Any]:
+    return {key: entry.get(key) for key in
+            ("route_id", "route_hash", "route_file", "basis", "continuation_id", "source_route_id")}
+
+
+def _bind_cycle_route_locked(root: Path, record: Mapping[str, Any], route: Mapping[str, Any]) -> Dict[str, Any]:
+    """`bind_cycle_route`'s body, for a caller that already holds the admission lock."""
+    admission = cycle_route_admission(root, record, route)
+    if not admission.allow:
+        raise ProducerError(admission.reason, admission.detail)
+    expected = [_route_binding_entry(row, root, is_begin=(i == 0)) for i, row in enumerate(admission.path)]
+    stored = list(record.get("route_bindings") or [])
+    if not stored:
+        stored = [{**_route_binding_entry(admission.path[0], root, is_begin=True),
+                  "bound_at": record.get("started_on")}]
+    stored_core = [_binding_core(e) for e in stored]
+    expected_core = [_binding_core(e) for e in expected]
+    advisory = None
+    if stored_core == expected_core[: len(stored_core)]:
+        new_list = stored + [dict(e, bound_at=_rfc3339()) for e in expected[len(stored_core):]]
+    else:
+        index = 0
+        field = "route_id"
+        for index in range(min(len(stored_core), len(expected_core))):
+            mismatched = [k for k in expected_core[index] if stored_core[index].get(k) != expected_core[index].get(k)]
+            if mismatched:
+                field = mismatched[0]
+                break
+        else:
+            index = min(len(stored_core), len(expected_core))
+        advisory = f"route-binding-record-drift:index={index};field={field}"
+        new_list = [dict(e, bound_at=(stored[i].get("bound_at") if i < len(stored) else _rfc3339()))
+                    for i, e in enumerate(expected)]
+    written = new_list != stored
+    if written:
+        _write_cycle_record(root, {**record, "route_bindings": new_list}, exclusive=False)
+    return {"written": written, "advisory": advisory}
+
+
+def bind_cycle_route(root: Path, cycle_id: str, route: Mapping[str, Any]) -> Dict[str, Any]:
+    """D-120's one audit-record writer: `route_bindings[]` derived from the sealed lineage.
+
+    Re-judges admission under the admission lock and only writes on allow.
+    The write is append-if-prefix, replace-with-advisory otherwise -- never an
+    input to any judgment (D-120 "권한은 봉인 파일에서만 나온다"). Returns
+    ``{"written": bool, "advisory": str|None}``.
+    """
+    root = Path(root).resolve()
+    lock_fd = artifact_admission._acquire_lock(root, artifact_admission.LOCK_TIMEOUT_DEFAULT)
+    try:
+        record = read_cycle_record(root, cycle_id)
+        if record is None:
+            raise ProducerError("cycle-unknown", cycle_id)
+        return _bind_cycle_route_locked(root, record, route)
+    finally:
+        artifact_admission._release_lock(root, lock_fd)
+
+
 def _write_journal(root: Path, cycle_id: str, **fields: Any) -> None:
     path = journal_path(root, cycle_id)
     _ensure_dir(path.parent)
@@ -975,15 +1188,12 @@ def prepare_route_artifact_env(route_file: Path, *, start: bool, jobs: Path) -> 
     if start:
         return begin(root, route_file=route_file, capability=route["capability"],
                      intensity=route["effective_intensity"], require_cycle=True, jobs=jobs)["env"]
-    records = [record for record in list_cycle_records(root)
-               if record.get("route_id") == route["route_id"] and record.get("state") == "open"]
-    if not records:
+    record = route_cycle_for(root, route)
+    if record is None:
         return {"AGENT_ARTIFACT_ROOT": str(root), **{name: "" for name in (
             "AGENT_ARTIFACT_CAMPAIGN_ID", "AGENT_ARTIFACT_CYCLE_ID", "AGENT_ARTIFACT_PRODUCER_ID",
             "AGENT_ARTIFACT_CYCLE_DIR", "AGENT_ARTIFACT_OUTPUT_DIR")}}
-    if len(records) != 1 or records[0].get("route_hash") != route["route_hash"]:
-        raise ProducerError("route-cycle-binding-ambiguous", route["route_id"])
-    return _env_for(root, records[0])
+    return _env_for(root, record)
 
 
 def _route_naming(
@@ -1396,8 +1606,7 @@ def begin(
         try:
             owner_binding = dispatch_terminal_commit.validate_owner_route(
                 jobs=binding_jobs, route_file=resolved_route_file, owner_attempt_id=binding_owner)
-            existing_open = next((row for row in list_cycle_records(root)
-                                  if row.get("route_id") == route["route_id"] and row.get("state") == "open"), None)
+            existing_open = route_cycle_for(root, route)
             binding_path = dispatch_terminal_commit.producer_binding_path(
                 root, owner_binding.route_id, binding_owner)
             if binding_path.exists():
@@ -1460,33 +1669,44 @@ def begin(
                 raise ProducerError("campaign-not-active", campaign_id or parent_cycle_id or campaign_key)
             if campaign_key is not None and campaign.get("key") != campaign_key:
                 raise ProducerError("campaign-key-mismatch", campaign_key)
-        # Idempotent per route: one open cycle per route.
-        for record in list_cycle_records(root):
-            if record.get("route_id") == route["route_id"] and record.get("state") == "open":
-                if record.get("route_hash") != route["route_hash"]:
-                    raise ProducerError("route-hash-drift", record["cycle_id"])
-                bound_campaign = read_campaign(root, record["campaign_id"])
-                if bound_campaign is None or bound_campaign.get("state") != "active":
-                    raise ProducerError("campaign-not-active", record["campaign_id"])
-                if ((campaign is not None and campaign["campaign_id"] != record["campaign_id"])
-                        or (campaign_key is not None and campaign_key != bound_campaign.get("key"))
-                        or (parent_cycle_id is not None and parent_cycle_id != record.get("parent_cycle_id"))):
-                    raise ProducerError("cycle-campaign-selection-conflict", record["cycle_id"])
-                if binding_jobs is not None and binding_owner:
-                    try:
-                        dispatch_terminal_commit.publish_producer_binding(
-                            artifact_root=root, jobs=binding_jobs, route_file=resolved_route_file,
-                            owner_attempt_id=binding_owner, cycle_id=record["cycle_id"],
-                            owner_begin=owner_begin)
-                    except dispatch_terminal_commit.TerminalCommitError as exc:
-                        raise ProducerError(exc.code, exc.detail) from exc
-                return {
-                    "status": "resumed", "layout": "cycle", "campaign_id": record["campaign_id"],
-                    "cycle_id": record["cycle_id"], "producer_id": record["producer_id"],
-                    "cycle_dir": str(cycle_dir(root, record["campaign_id"], record["cycle_id"], record)),
-                    "env": _env_for(root, record),
-                    **_campaign_degradation(bound_campaign),
-                }
+        # Idempotent per route: one open cycle per verified lineage (D-120). A
+        # continuation resuming an ancestor's open cycle is the same idempotent
+        # path with `rebound=True` and an extended audit record.
+        resumable = route_cycle_for(root, route)
+        if resumable is not None:
+            record = resumable
+            admission = cycle_route_admission(root, record, route)
+            if not admission.allow:
+                raise ProducerError(admission.reason, admission.detail)
+            bound_campaign = read_campaign(root, record["campaign_id"])
+            if bound_campaign is None or bound_campaign.get("state") != "active":
+                raise ProducerError("campaign-not-active", record["campaign_id"])
+            if ((campaign is not None and campaign["campaign_id"] != record["campaign_id"])
+                    or (campaign_key is not None and campaign_key != bound_campaign.get("key"))
+                    or (parent_cycle_id is not None and parent_cycle_id != record.get("parent_cycle_id"))):
+                raise ProducerError("cycle-campaign-selection-conflict", record["cycle_id"])
+            rebound = record.get("route_id") != route["route_id"]
+            # D-120: only an owner `begin --route <continuation>` writes the
+            # audit trail. A worker `begin --node` judges the same admission
+            # (raised above) but never mutates the record.
+            if rebound and owner_begin:
+                _bind_cycle_route_locked(root, record, route)
+            if binding_jobs is not None and binding_owner:
+                try:
+                    dispatch_terminal_commit.publish_producer_binding(
+                        artifact_root=root, jobs=binding_jobs, route_file=resolved_route_file,
+                        owner_attempt_id=binding_owner, cycle_id=record["cycle_id"],
+                        owner_begin=owner_begin)
+                except dispatch_terminal_commit.TerminalCommitError as exc:
+                    raise ProducerError(exc.code, exc.detail) from exc
+            return {
+                "status": "resumed", "layout": "cycle", "campaign_id": record["campaign_id"],
+                "cycle_id": record["cycle_id"], "producer_id": record["producer_id"],
+                "cycle_dir": str(cycle_dir(root, record["campaign_id"], record["cycle_id"], record)),
+                "env": _env_for(root, record),
+                **({"rebound": True} if rebound else {}),
+                **_campaign_degradation(bound_campaign),
+            }
         if campaign is not None:
             artifact_locator.prepare_index_update(root, [campaign["campaign_id"]])
         index = artifact_admission.load_index(root)
@@ -1954,7 +2174,10 @@ def build_manifest(
             "cycle_id": record["cycle_id"], "campaign_id": campaign["campaign_id"],
             "parent_cycle_id": record.get("parent_cycle_id"),
             "started_on": record["started_on"], "input_digest": _digest(_canonical({
-                "route_id": route["route_id"], "route_hash": route["route_hash"],
+                # D-120 fixed-input boundary: the begin route's identity, not
+                # the route sealing the cycle (`route`, which may be a
+                # continuation's rebound lineage extension).
+                "route_id": record["route_id"], "route_hash": record["route_hash"],
                 "capability": record["capability"], "intensity": record["intensity"],
             })),
             "outcome_criterion": {"required_artifact_roles": ["primary"] if facts else [], "decision_required": False},
@@ -1969,8 +2192,13 @@ def build_manifest(
         },
     }
     if closed and cycle_state == "completed":
+        # D-120: the route sealing this cycle (`route`, R) may be a
+        # continuation the begin record's own `route_file` never names --
+        # rebind the terminal evidence from R's own canonical file, not the
+        # begin route's.
         binding, sealed_route = artifact_lifecycle.bind_existing_runtime_route(
-            root, Path(record["route_file"]), expected_root_id=identity.artifact_root_id
+            root, route_lineage.canonical_route_path(root, route["route_id"]),
+            expected_root_id=identity.artifact_root_id
         )
         if sealed_route.get("route_hash") != route["route_hash"]:
             raise ProducerError("route-hash-drift", route["route_id"])
@@ -2445,13 +2673,7 @@ def _checkpoint_target(root: Path, cycle_id: Optional[str], route_file: Optional
     if route_file is None:
         raise ProducerError("checkpoint-target-required", "--cycle or --route")
     route = load_route(root, route_file)
-    records = [row for row in list_cycle_records(root)
-               if row.get("route_id") == route["route_id"] and row.get("state") == "open"]
-    if not records:
-        return None
-    if len(records) != 1:
-        raise ProducerError("route-cycle-binding-ambiguous", route["route_id"])
-    return records[0]
+    return route_cycle_for(root, route)
 
 
 def checkpoint(
@@ -3339,6 +3561,36 @@ def _authorize_active_cleanup(root: Path, operation: str, target: Path, cycle_id
         raise ProducerError("cleanup-scope-violation", exc.detail) from exc
 
 
+def _finalize_route(root: Path, record: Mapping[str, Any]) -> Dict[str, Any]:
+    """D-120 finalize: R is the unique T(C) leaf -- the route with no
+    material-input-qualifying continuation child. `--cycle`-only finalize has
+    no other way to name R; a completion controller that already knows its
+    exact route can seal it directly by checking `cycle_route_admission(...,
+    finalize=True)` itself instead of calling this walk.
+    """
+    begin_route = load_route(root, Path(record["route_file"]))
+    if begin_route["route_hash"] != record["route_hash"]:
+        raise ProducerError("route-hash-drift", record["cycle_id"])
+    current = begin_route
+    visited = {current["route_id"]}
+    while True:
+        candidates = [c for c in _lineage_children(root, current["route_id"], current["route_hash"])
+                      if c.get("capability") == record.get("capability")
+                      and c.get("effective_intensity") == record.get("intensity")]
+        if not candidates:
+            return current
+        if len(candidates) > 1:
+            raise ProducerError(
+                "cycle-route-binding-mismatch:lineage-fork",
+                f"{current['route_id']}:{','.join(sorted(c['route_id'] for c in candidates))}",
+            )
+        nxt = candidates[0]
+        if nxt["route_id"] in visited:
+            raise ProducerError("route-lineage-unverified", f"cycle:{nxt['route_id']}")
+        visited.add(nxt["route_id"])
+        current = nxt
+
+
 def finalize(
     root: Path,
     *,
@@ -3464,9 +3716,17 @@ def finalize(
             # policy separate from this completed publication boundary.
             raise ProducerError("cycle-finalize-blocked-live-review", cycle_id)
         directory = cycle_dir(root, record["campaign_id"], cycle_id, record)
-        route = load_route(root, Path(record["route_file"]))
-        if route["route_hash"] != record["route_hash"]:
-            raise ProducerError("route-hash-drift", cycle_id)
+        # D-120: the route that seals this cycle is the unique T(C) leaf, not
+        # necessarily the begin route -- an inherited (rebound) cycle's begin
+        # route may long since have a continuation writing it.
+        route = _finalize_route(root, record)
+        admission = cycle_route_admission(root, record, route, finalize=True)
+        if not admission.allow:
+            raise ProducerError(admission.reason, admission.detail)
+        if _bind_cycle_route_locked(root, record, route)["written"]:
+            # `_commit_sealed` below reseals from this local copy; refresh it
+            # so the binding write just made is not clobbered back to stale.
+            record = read_cycle_record(root, cycle_id)
         artifact_locator.prepare_index_update(root, [record["campaign_id"]])
         adopted_root_outputs: List[str] = []
         if adopt_root_outputs and state != "abandoned":
@@ -3549,7 +3809,8 @@ def finalize(
             raise failure
         if state == "completed" and route_is_closed(root, route):
             completion = artifact_lifecycle.evaluate_cycle_completion(
-                document, content_root=directory, route_file=Path(record["route_file"]),
+                document, content_root=directory,
+                route_file=route_lineage.canonical_route_path(root, route["route_id"]),
                 publication=publication, expected_root_id=identity.artifact_root_id if identity else None,
             )
             if not completion.ok:
@@ -4471,22 +4732,37 @@ def require_cycle_output(
     """Bind writes and completion evidence to the producer's issued cycle.
 
     Route lookup recovers omitted environment context from producer records;
-    directory names, recency and a caller-supplied output path are not authority.
-    Legacy routes without a producer cycle retain their existing contract.
+    directory names, recency and a caller-supplied output path are not
+    authority. When the sealed route file for `route_id` is readable, lookup
+    and write admission both go through the lineage-aware D-120 path
+    (`route_cycle_for` + `cycle_route_admission`), so a continuation may write
+    the cycle its lineage opened. A `route_id` with no readable route file
+    falls back to the exact match this function always had (legacy routes
+    without a producer cycle retain their existing contract).
     """
     record = read_cycle_record(root, cycle_id) if cycle_id else None
     if cycle_id and record is None:
         raise ProducerError("cycle-unknown", cycle_id)
+    lineage_checked = False
     if record is None and route_id:
-        candidates = [item for item in list_cycle_records(root) if item.get("route_id") == route_id]
-        opened = [item for item in candidates if item.get("state") == "open"]
-        candidates = opened or candidates
-        if len(candidates) > 1:
-            raise ProducerError("route-cycle-binding-ambiguous", route_id)
-        record = candidates[0] if candidates else None
+        route = _read_json(route_lineage.canonical_route_path(root, route_id))
+        if isinstance(route, dict) and route.get("route_id") == route_id:
+            record = route_cycle_for(root, route)
+            lineage_checked = True
+            if record is not None:
+                admission = cycle_route_admission(root, record, route)
+                if not admission.allow:
+                    raise ProducerError(admission.reason, admission.detail)
+        else:
+            candidates = [item for item in list_cycle_records(root) if item.get("route_id") == route_id]
+            opened = [item for item in candidates if item.get("state") == "open"]
+            candidates = opened or candidates
+            if len(candidates) > 1:
+                raise ProducerError("route-cycle-binding-ambiguous", route_id)
+            record = candidates[0] if candidates else None
     if record is None:
         return None
-    if route_id and record.get("route_id") != route_id:
+    if route_id and not lineage_checked and record.get("route_id") != route_id:
         raise ProducerError("cycle-route-binding-mismatch", f"cycle={record['cycle_id']} route={route_id}")
     output = cycle_dir(root, record["campaign_id"], record["cycle_id"], record) / "artifacts"
     try:

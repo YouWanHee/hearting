@@ -927,6 +927,7 @@ _EXPECTED_WRITER_CENSUS = {
     ("artifact_producer.py", "set_campaign_related"): "no-row-effect",
     ("artifact_producer.py", "finalize"): "no-row-effect",  # the no-lineage cycle-record write
     ("artifact_producer.py", "_recover_locked"): "no-row-effect",  # the dropped-record write
+    ("artifact_producer.py", "_bind_cycle_route_locked"): "no-row-effect",  # D-120: `route_bindings[]` is audit-only, never a judgment input
     ("artifact_producer.py", "recover_cycle_times"): "full",
     ("artifact_producer.py", "backfill_cycle_bindings"): "full",
     ("artifact_campaign.py", "_commit_event"): "incremental",

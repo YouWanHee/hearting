@@ -69,6 +69,12 @@ gate must converge, not peel one layer per pass.
 - **Verdict.** `✅` when all prior 🔴 are closed and the delta is clean; otherwise
   `🔴` listing only the open/regressed/new-delta items. Never fail a round on a
   gap that was visible and unreported in an earlier round you could have raised.
+- **A verdict-less prior round is not a prior verdict.** The dispatch assignment's
+  history may list an earlier round as carrying no verdict (rendered `판정
+  없음(<reason>)`) — a crashed, capacity-dead, or invalid-envelope attempt, never a
+  completed review. Read the nearest **verdict**-bearing round as "the prior round"
+  for both closure questions; a verdict-less round contributes no 🔴 list of its own
+  and does not by itself turn this pass into anything other than a closure check.
 
 ## Review Criteria
 

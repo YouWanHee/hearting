@@ -3336,8 +3336,11 @@ class GroupLegReviewRoundCapTest(unittest.TestCase):
         }
 
     def _rows(self, node_id, n):
+        # SD-153: `failure_class=fail` makes this a genuine FAIL verdict, so
+        # it still spends the round budget the way a bare `dead-worker-fail`
+        # (a crash, not a verdict) no longer does on its own.
         pipe = ("capability=autopilot-code,attempt_schema_version=2,registered_worker=1,"
-                "route=rt-fixture,route_node=" + node_id + ",note=dead-worker-fail")
+                "route=rt-fixture,route_node=" + node_id + ",note=dead-worker-fail,failure_class=fail")
         return "".join(
             f"2026-08-24T00:00:0{i}Z\tdone\t{self.base}\t{self.base}\tslug-r{i}\t"
             f"{pipe},attempt_id=att-{node_id}-{i}\n"

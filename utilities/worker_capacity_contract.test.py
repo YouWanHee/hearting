@@ -360,31 +360,13 @@ class WorkerCapacityContractTest(unittest.TestCase):
         ]
         self.assertEqual(len(REGISTRY.current(rows)), 2)
 
-    def test_planned_serial_lineage_is_not_retry_evidence(self):
-        with tempfile.TemporaryDirectory() as td:
-            jobs = Path(td) / "jobs.log"
-            base = "route_id=rt,route_node=execute,session_chain_id=ssc-chain,subsession_mode=serial,subsession_purpose=planned,subsession_count=2,stage_authority=0,failure_class=pass,note=completed-supervisor"
-            jobs.write_text(
-                "2026-08-06T00:00:00Z\tdone\trepo\tworktree\tone\t"
-                + base + ",attempt_id=att-prior,subsession_id=ss-one,subsession_index=1\n"
-                "2026-08-06T00:00:01Z\topen\trepo\tworktree\ttwo\t"
-                + base + ",attempt_id=att-current,subsession_id=ss-two,subsession_index=2\n"
-            )
-            prior = os.environ.get("AGENT_DISPATCH_JOBS")
-            os.environ["AGENT_DISPATCH_JOBS"] = str(jobs)
-            try:
-                self.assertTrue(WORKER_ROUTE._qualifying_subsession_lineage("rt", "execute", "att-current"))
-                # SD-133: the evidence lookup takes the route record, not an id,
-                # because it reads the record's sealed lineage. A route with no
-                # lineage fields is exactly this single-route case.
-                self.assertFalse(WORKER_ROUTE._qualifying_retry_evidence(
-                    {"route_id": "rt"}, "execute", "att-current"))
-            finally:
-                if prior is None:
-                    os.environ.pop("AGENT_DISPATCH_JOBS", None)
-                else:
-                    os.environ["AGENT_DISPATCH_JOBS"] = prior
-
+    # `test_planned_serial_lineage_is_not_retry_evidence` retired: SD-156 deletes
+    # both `_qualifying_subsession_lineage` and `_qualifying_retry_evidence` --
+    # a serial slice's moved HEAD passes worker-route-guard on the plain
+    # descendant lineage verdict now, with no retry-evidence distinction left to
+    # assert. `ChainHeadMovedGuardAcceptanceTest`
+    # (`subsession_chain_head_moved.test.py`) covers the surviving pass/refuse
+    # shape end to end.
 
 if __name__ == "__main__":
     unittest.main()

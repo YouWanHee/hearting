@@ -5483,4 +5483,105 @@ class FrameUnavailabilitySkipsCompletedDeferredLegTest(unittest.TestCase):
         self.assertEqual(unavailable, {"codex": "att-frame-capacity"})
 
 
+class SourceLineageRowFieldsTest(unittest.TestCase):
+    def test_source_lineage_row_fields_carry_launch_head(self):
+        validation = {"source_lineage": {
+            "kind": "descendant", "sealed": "a"*40, "observed": "b"*40,
+            "distance": 1, "branch": "main", "reason": None,
+        }}
+        fields = D.source_lineage_row_fields(validation)
+        self.assertEqual(fields, {
+            "launch_head": "b"*40, "source_commit_sealed": "a"*40,
+            "source_commit_distance": "1", "source_commit_branch": "main",
+        })
+
+    def test_absent_or_unverifiable_source_lineage_contributes_nothing(self):
+        self.assertEqual(D.source_lineage_row_fields(None), {})
+        self.assertEqual(D.source_lineage_row_fields({}), {})
+        self.assertEqual(
+            D.source_lineage_row_fields({"source_lineage": {"kind": "unverifiable", "reason": "not-a-repo"}}),
+            {},
+        )
+
+    def test_exact_kind_carries_distance_zero(self):
+        validation = {"source_lineage": {
+            "kind": "exact", "sealed": "a"*40, "observed": "a"*40,
+            "distance": 0, "branch": "main",
+        }}
+        fields = D.source_lineage_row_fields(validation)
+        self.assertEqual(fields["source_commit_distance"], "0")
+        self.assertEqual(fields["launch_head"], "a"*40)
+
+
+class DiffAttributionTest(unittest.TestCase):
+    def _repo(self, tmp):
+        repo = Path(tmp)/"repo"; repo.mkdir()
+        subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@t"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "t"], check=True)
+        (repo/"a").write_text("1")
+        subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "a"], check=True)
+        sealed = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        return repo, sealed
+
+    def _route(self, repo, sealed):
+        return {
+            "route_id": "rt-diff-fixture", "source_commit": sealed, "cwd": str(repo),
+            "nodes": [
+                {"id": "execute", "depends_on": []},
+                {"id": "test", "depends_on": ["execute"]},
+                {"id": "report", "depends_on": ["test"]},
+            ],
+        }
+
+    def test_a_sd156_5_impl_review_diff_base_is_execute_launch_head(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, sealed = self._repo(tmp)
+            (repo/"a").write_text("2")
+            subprocess.run(["git", "-C", str(repo), "commit", "-qam", "execute output"], check=True)
+            head = subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True, check=True,
+            ).stdout.strip()
+            route = self._route(repo, sealed)
+            jobs = Path(tmp)/"jobs.log"
+            pipe = f"route_id=rt-diff-fixture,route_node=execute,attempt_id=att-execute,launch_head={head}"
+            jobs.write_text(
+                "2026-09-26T00:00:00Z\tdone\trepo\tworktree\tslug\t"+pipe+"\n", encoding="utf-8",
+            )
+            test_node = route["nodes"][1]
+            lines = D.diff_attribution_lines(route, test_node, jobs)
+            self.assertEqual(lines, [f"diff_base={head}", f"pre_node_commits={head}"])
+            # `report` is also downstream of `execute` (through `test`), not just
+            # execute's direct dependent.
+            report_node = route["nodes"][2]
+            self.assertEqual(D.diff_attribution_lines(route, report_node, jobs), lines)
+
+    def test_execute_node_itself_gets_no_diff_attribution(self):
+        route = {"route_id": "rt", "nodes": [{"id": "execute", "depends_on": []}]}
+        self.assertEqual(
+            D.diff_attribution_lines(route, route["nodes"][0], Path("/nonexistent")), [],
+        )
+
+    def test_no_terminal_execute_attempt_yields_no_lines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = Path(tmp)/"jobs.log"; jobs.write_text("")
+            route = {
+                "route_id": "rt",
+                "nodes": [{"id": "execute", "depends_on": []}, {"id": "test", "depends_on": ["execute"]}],
+            }
+            self.assertEqual(D.diff_attribution_lines(route, route["nodes"][1], jobs), [])
+
+    def test_node_not_downstream_of_execute_yields_no_lines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = Path(tmp)/"jobs.log"; jobs.write_text("")
+            route = {
+                "route_id": "rt",
+                "nodes": [{"id": "plan", "depends_on": []}, {"id": "execute", "depends_on": ["plan"]}],
+            }
+            self.assertEqual(D.diff_attribution_lines(route, route["nodes"][0], jobs), [])
+
+
 if __name__=="__main__": unittest.main()

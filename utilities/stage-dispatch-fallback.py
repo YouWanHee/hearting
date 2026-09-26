@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -48,6 +49,7 @@ DIRECT_TIMEOUT_DEFAULT = 45.0
 
 from dispatch_contract import (  # noqa: E402
     PRELAUNCH_PROCESS_BLOCK_REASONS,
+    ROUTE_STATE_REFUSAL_REASONS,
     DispatchContractError,
     attempt_process_quiescence,
     parse_registry_metadata,
@@ -55,6 +57,7 @@ from dispatch_contract import (  # noqa: E402
     resolve_dispatch_state_root,
     resolve_global_registry,
     resolve_live_parent_attempt,
+    route_state_next_action,
     validate_attempt_metadata,
 )
 
@@ -1590,22 +1593,71 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
     # ordinary standard+ depth-2 work goes through this wrapper, which had no
     # such check -- so the cap was unreachable on the path most dispatches take.
     # Reuse the already-loaded definitions rather than duplicating the cap.
+    # SD-153/SD-154: `admit_round` (budget + rule-8 auto-revision) is the one
+    # admission decision every registered launch surface reads -- no surface
+    # keeps its own `len(prior)+1 > max_round` comparison, or its own
+    # auto-revision copy, any more.
     if node["id"] in DISPATCH_NODE.ROUND_CAPPED_NODE_IDS:
-        prior_rounds = DISPATCH_NODE.prior_round_attempts(
+        round_rows = DISPATCH_NODE.prior_round_attempts(
             args.jobs, route["route_id"], node["id"],
             route=route if node.get("kind") == "review-worker" else None,
         )
-        round_no = len(prior_rounds) + 1
-        max_round = DISPATCH_NODE.max_review_rounds(route["effective_intensity"])
-        if round_no > max_round:
+        node_round_budget = DISPATCH_NODE.admit_round(
+            route, node, args.jobs, owner_attempt_id=args.parent_attempt_id,
+        ).budget
+        if node_round_budget.state == "blocked-live":
+            return fail(
+                "prior-attempt-still-live", 78,
+                route_id=route["route_id"], route_node=node["id"],
+                child_spawned="0",
+            )
+        if node_round_budget.state == "blocked-unsettled":
+            return fail(
+                "round-unsettled", 65,
+                route_id=route["route_id"], route_node=node["id"],
+                child_spawned="0",
+                next_action=route_state_next_action("round-unsettled", node["id"], str(args.route), node),
+            )
+        if node_round_budget.state == "exhausted":
             return fail(
                 "review-round-budget-exhausted", 65,
                 route_id=route["route_id"], route_node=node["id"],
                 effective_intensity=route["effective_intensity"],
-                round=str(round_no), max_round=str(max_round),
+                round=str(node_round_budget.next_round), max_round=str(node_round_budget.cap),
                 child_spawned="0",
+                next_action=route_state_next_action("review-round-budget-exhausted", node["id"], str(args.route), node),
                 **DISPATCH_NODE.review_budget_recovery_fields(node.get("kind")),
             )
+        if node_round_budget.state == "verdictless-bound":
+            # `review_budget_recovery_fields` already supplies its own
+            # `next_action` (native-subagent/owner-inline routing, SD-153) --
+            # that satisfies the SD-154 route-state-refusal `next_action`
+            # field too, so it is not duplicated here.
+            return fail(
+                "review-verdictless-bound", 65,
+                route_id=route["route_id"], route_node=node["id"],
+                effective_intensity=route["effective_intensity"],
+                round=str(node_round_budget.next_round), max_round=str(node_round_budget.cap),
+                child_spawned="0",
+                **DISPATCH_NODE.review_budget_recovery_fields(node.get("kind"), "verdictless-bound"),
+            )
+        # B2: unlike dispatch-batch.py (which re-invokes dispatch-node.py for
+        # the actual leg and gets the round protocol block for free), this
+        # wrapper calls the adapter directly -- attach the same block here so
+        # a correction round dispatched through this path is not silently
+        # blind to its prior rounds.
+        round_block = DISPATCH_NODE.round_protocol_block(
+            node_round_budget, round_rows, worker_type_for_kind(node["kind"]), node["id"],
+        )
+        if round_block and args.prompt_file:
+            base_prompt = Path(args.prompt_file).read_text(encoding="utf-8")
+            with tempfile.NamedTemporaryFile(
+                mode="w", delete=False, suffix=".md",
+                prefix=f"round-protocol-{node['id']}-", dir=str(args.jobs.parent), encoding="utf-8",
+            ) as handle:
+                handle.write(base_prompt + round_block)
+                augmented_prompt_path = handle.name
+            args.prompt_file = Path(augmented_prompt_path)
 
     prior_failures = registry_failures(args.jobs, route["route_id"], node["id"])
     prior_rows = registry_rows(args.jobs, route["route_id"], node["id"])
@@ -1804,6 +1856,26 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                                 attempt_id=attempt_id,
                                 child_spawned="0",
                                 detail=fields.get("detail", "-"),
+                                attempt_trace="|".join(attempts),
+                            )
+                        if failure_reason in ROUTE_STATE_REFUSAL_REASONS:
+                            # SD-154/B-2 (defect #2): the wrapper's own
+                            # `completion_marker_gate` (or round admission)
+                            # already proved this is the ROUTE's recorded
+                            # state, not a runtime that is merely unavailable
+                            # right now -- stop here, never fall through to
+                            # the candidate loop's eventual inline hop.
+                            detail = fields.get("detail", "-")
+                            next_action = fields.get("next_action") or route_state_next_action(
+                                failure_reason, detail, str(args.route), node,
+                            )
+                            return fail(
+                                failure_reason,
+                                65,
+                                attempt_id=attempt_id,
+                                child_spawned="0",
+                                detail=detail,
+                                next_action=next_action,
                                 attempt_trace="|".join(attempts),
                             )
                         direct_failures.append({

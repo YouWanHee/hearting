@@ -3487,6 +3487,306 @@ class CycleBindingAndIndexOrderTest(ProducerTestBase):
         self.assertEqual(P.recover_cycle_times(self.root, backup_store=store)["counts"], {"no-match": 1})
 
 
+class RouteLineageBindingTest(ProducerTestBase):
+    """SD-155/D-120 (artifact-path-contract A-25): a route's verified lineage
+    binds an already-open cycle. Every route in this fixture is published by
+    the real builders (`R.compile_route`, `R.build_continuation_route`,
+    `R.publish_continuation_route`) -- never a hand-written route file --
+    so the hash chain admission relies on is the production one.
+    """
+
+    def _root_route(self, slug):
+        return R.compile_route(
+            "autopilot-code", "dev", "direct", R.ROOT, self.root,
+            predicates=["atomic-outcome", "known-scope", "no-shared-contract", "no-resource-run",
+                        "no-artifact-handoff", "no-independent-verifier", "focused-verification"],
+            transport=None, inline_reason="atomic-direct",
+            tracking="tracked", tracked_gate_evidence=gate_evidence(), slug=slug,
+        )
+
+    def _publish_root(self, route):
+        path = R.canonical_route_path(self.root, route["route_id"])
+        R.write_once(path, route)
+        return path
+
+    def _continuation(self, source, *, retint=None, reason="lineage-fixture"):
+        """A hash-verified continuation of ``source``, zero prior evidence needed
+        (`resume_from_node="inline"` is the route's only, first node)."""
+        route = R.build_continuation_route(
+            source, resume_from_node="inline", requested_boundary="inline",
+            reason=reason, artifact_root=self.root,
+        )
+        if retint is not None:
+            # B'': same verified lineage, sealed `effective_intensity` differs --
+            # SD-155 context keys (artifact_root/cwd/capability) never covered
+            # intensity, so this still passes lineage verification and only
+            # trips D-120 admission's material-input step (A-25.8).
+            route = dict(route, effective_intensity=retint)
+            route["route_hash"] = R.route_hash(route)
+            route["route_id"] = "rt-" + route["route_hash"].split(":", 1)[1][:16]
+        path = R.canonical_route_path(self.root, route["route_id"])
+        R.publish_continuation_route(route, source, path)
+        return route
+
+    def _begin(self, route):
+        return P.begin(self.root, route_file=R.canonical_route_path(self.root, route["route_id"]),
+                       capability=route["capability"], intensity=route["effective_intensity"])
+
+    def _bindings(self, cycle_id):
+        record = P.read_cycle_record(self.root, cycle_id)
+        stored = record.get("route_bindings")
+        if stored:
+            return stored
+        # D-120: a record with no `route_bindings` field reads as the begin
+        # route alone -- compat view, never written back by a bare read.
+        return [{"route_id": record.get("route_id"), "route_hash": record.get("route_hash"),
+                "route_file": record.get("route_file"), "basis": "begin",
+                "continuation_id": None, "source_route_id": None}]
+
+    def _route_ids(self, cycle_id):
+        return [row["route_id"] for row in self._bindings(cycle_id)]
+
+    def _close(self, route):
+        route_file = R.canonical_route_path(self.root, route["route_id"])
+        self.close(route, route_file)
+
+    # -- A-25.1 -----------------------------------------------------------
+    def test_a25_1_continuation_writes_same_cycle(self):
+        a = self._root_route("lineage-a1")
+        self._publish_root(a)
+        begun = self._begin(a)
+        b = self._continuation(a)
+        output = P.require_cycle_output(self.root, Path(begun["cycle_dir"]) / "artifacts" / "x.md",
+                                        route_id=b["route_id"])
+        self.assertEqual(output, Path(begun["cycle_dir"]) / "artifacts")
+        bound = R.bind_continuation_cycle(self.root, a, b)
+        self.assertTrue(bound["bound"])
+        self.assertEqual(self._route_ids(begun["cycle_id"]), [a["route_id"], b["route_id"]])
+
+    # -- A-25.2 -------------------------------------------------------------
+    def test_a25_2_foreign_route_refused(self):
+        a = self._root_route("lineage-a2")
+        self._publish_root(a)
+        begun = self._begin(a)
+        f = self._root_route("lineage-f2")  # not a's continuation at all
+        self._publish_root(f)
+        record = P.read_cycle_record(self.root, begun["cycle_id"])
+        admission = P.cycle_route_admission(self.root, record, f)
+        self.assertFalse(admission.allow)
+        self.assertEqual(admission.reason, "cycle-route-binding-mismatch")
+        # A pure judgment call writes nothing: the record never grew a
+        # `route_bindings` field at all.
+        self.assertNotIn("route_bindings", P.read_cycle_record(self.root, begun["cycle_id"]))
+
+    # -- A-25.3 ---------------------------------------------------------
+    def test_a25_3_forged_lineage_refused(self):
+        a = self._root_route("lineage-a3")
+        self._publish_root(a)
+        begun = self._begin(a)
+        b = self._continuation(a)
+        record = P.read_cycle_record(self.root, begun["cycle_id"])
+        b_path = R.canonical_route_path(self.root, b["route_id"])
+
+        with self.subTest("tampered-bytes"):
+            tampered = dict(b, capability="autopilot-research")  # route_hash now stale
+            b_path.write_text(json.dumps(tampered), encoding="utf-8")
+            reloaded = json.loads(b_path.read_text(encoding="utf-8"))
+            admission = P.cycle_route_admission(self.root, record, reloaded)
+            self.assertEqual(admission.reason, "route-lineage-unverified")
+            b_path.write_text(json.dumps(b), encoding="utf-8")  # restore
+
+        with self.subTest("source-route-hash-mismatch"):
+            forged = dict(b, source_route_hash="sha256:" + "0" * 64)
+            forged["route_hash"] = R.route_hash(forged)
+            forged["route_id"] = "rt-" + forged["route_hash"].split(":", 1)[1][:16]
+            forged_path = R.canonical_route_path(self.root, forged["route_id"])
+            R.write_once(forged_path, forged)
+            admission = P.cycle_route_admission(self.root, record, forged)
+            self.assertEqual(admission.reason, "route-lineage-unverified")
+
+        with self.subTest("record-begin-hash-only-differs"):
+            drifted = dict(record, route_hash="sha256:" + "1" * 64)
+            admission = P.cycle_route_admission(self.root, drifted, b)
+            self.assertEqual(admission.reason, "route-hash-drift")
+
+    # -- A-25.4 -----------------------------------------------------------
+    def test_a25_4_owner_begin_on_continuation_rebinds(self):
+        a = self._root_route("lineage-a4")
+        self._publish_root(a)
+        begun = self._begin(a)
+        b = self._continuation(a)
+        resumed = P.begin(self.root, route_file=R.canonical_route_path(self.root, b["route_id"]),
+                          capability=b["capability"], intensity=b["effective_intensity"])
+        self.assertEqual((resumed["status"], resumed.get("rebound"), resumed["cycle_id"]),
+                         ("resumed", True, begun["cycle_id"]))
+        self.assertEqual(P.list_cycle_records(self.root).__len__(), 1)  # no new cycle
+        self.assertEqual(self._route_ids(begun["cycle_id"]), [a["route_id"], b["route_id"]])
+        record_before = P.read_cycle_record(self.root, begun["cycle_id"])
+        P.require_cycle_output(self.root, Path(begun["cycle_dir"]) / "artifacts" / "y.md", route_id=b["route_id"])
+        self.assertEqual(P.read_cycle_record(self.root, begun["cycle_id"]), record_before)
+
+    # -- D-120 (P2 결함 #2): worker `begin --node` on a rebind judges only ----
+    def test_worker_begin_node_on_a_rebind_writes_no_audit_record(self):
+        """D-120 explicitly limits the rebind audit write to an OWNER begin
+        (`node_id is None`); a worker's `begin --node` on the same continuation
+        must rebind (so `require_cycle_output` still resolves against the
+        shared cycle) without ever appending to `route_bindings`. P2's own
+        handoff flagged this as checked only by code review, never by a test
+        -- this fixture is the missing proof."""
+        a = self._root_route("lineage-a4b")
+        self._publish_root(a)
+        begun = self._begin(a)
+        b = self._continuation(a)
+        record_before = P.read_cycle_record(self.root, begun["cycle_id"])
+        node_id = b["nodes"][0]["id"]
+        resumed = P.begin(self.root, route_file=R.canonical_route_path(self.root, b["route_id"]),
+                          capability=b["capability"], intensity=b["effective_intensity"], node_id=node_id)
+        self.assertEqual((resumed["status"], resumed.get("rebound"), resumed["cycle_id"]),
+                         ("resumed", True, begun["cycle_id"]))
+        self.assertEqual(P.list_cycle_records(self.root).__len__(), 1)  # no new cycle
+        # No audit write at all -- record is byte-identical to before, and the
+        # compat view (no `route_bindings` field) still names only `a`.
+        self.assertEqual(P.read_cycle_record(self.root, begun["cycle_id"]), record_before)
+        self.assertNotIn("route_bindings", P.read_cycle_record(self.root, begun["cycle_id"]))
+        self.assertEqual(self._route_ids(begun["cycle_id"]), [a["route_id"]])
+
+    # -- A-25.5 -----------------------------------------------------------
+    def test_a25_5_finalize_seals_last_route_without_schema_change(self):
+        a = self._root_route("lineage-a5")
+        self._publish_root(a)
+        begun = self._begin(a)
+        b = self._continuation(a)
+        P.begin(self.root, route_file=R.canonical_route_path(self.root, b["route_id"]),
+               capability=b["capability"], intensity=b["effective_intensity"])
+        target = Path(begun["cycle_dir"]) / "artifacts" / "plan.md"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"body\n")
+        self._close(b)
+        record = P.read_cycle_record(self.root, begun["cycle_id"])
+        expected_digest = P._digest(P._canonical({
+            "route_id": record["route_id"], "route_hash": record["route_hash"],
+            "capability": record["capability"], "intensity": record["intensity"],
+        }))
+        sealed = P.finalize(self.root, cycle_id=begun["cycle_id"])
+        self.assertEqual(sealed["status"], "sealed")
+        manifest = json.loads((Path(begun["cycle_dir"]) / "manifest.json").read_text())
+        report = m.validate(manifest)
+        self.assertTrue(report.ok, report.violations)
+        self.assertEqual(len(manifest["routes"]), 1)
+        self.assertEqual(manifest["routes"][0]["route_id"], b["route_id"])
+        self.assertEqual(manifest["cycle"]["input_digest"], expected_digest)
+        self.assertEqual(self._route_ids(begun["cycle_id"]), [a["route_id"], b["route_id"]])
+
+    # -- A-25.6 -----------------------------------------------------------
+    def test_a25_6_two_generations_and_gap_append(self):
+        a = self._root_route("lineage-a6")
+        self._publish_root(a)
+        begun = self._begin(a)
+        b = self._continuation(a)
+        d = self._continuation(b)
+        P.begin(self.root, route_file=R.canonical_route_path(self.root, d["route_id"]),
+               capability=d["capability"], intensity=d["effective_intensity"])
+        self.assertEqual(self._route_ids(begun["cycle_id"]), [a["route_id"], b["route_id"], d["route_id"]])
+        # Drop the audit trail back to `[A]` (as if B's bind never landed), then
+        # confirm D's owner begin repairs it to `[A, B, D]` in one call.
+        record = P.read_cycle_record(self.root, begun["cycle_id"])
+        P._write_cycle_record(self.root, {**record, "route_bindings": [record["route_bindings"][0]]},
+                              exclusive=False)
+        P.begin(self.root, route_file=R.canonical_route_path(self.root, d["route_id"]),
+               capability=d["capability"], intensity=d["effective_intensity"])
+        self.assertEqual(self._route_ids(begun["cycle_id"]), [a["route_id"], b["route_id"], d["route_id"]])
+
+    # -- A-25.7 -----------------------------------------------------------
+    def test_a25_7_sealed_cycle_refused(self):
+        a = self._root_route("lineage-a7")
+        self._publish_root(a)
+        begun = self._begin(a)
+        target = Path(begun["cycle_dir"]) / "artifacts" / "plan.md"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"body\n")
+        self._close(a)
+        P.finalize(self.root, cycle_id=begun["cycle_id"])
+        record = P.read_cycle_record(self.root, begun["cycle_id"])
+        admission = P.cycle_route_admission(self.root, record, a)
+        self.assertEqual(admission.reason, "cycle-not-open")
+
+    # -- A-25.8 ----------------------------------------------------------
+    def test_a25_8_material_input_change_refused(self):
+        a = self._root_route("lineage-a8")
+        self._publish_root(a)
+        begun = self._begin(a)
+        bpp = self._continuation(a, retint="quick")
+        record = P.read_cycle_record(self.root, begun["cycle_id"])
+        admission = P.cycle_route_admission(self.root, record, bpp)
+        self.assertEqual(admission.reason, "cycle-route-binding-mismatch:material-input")
+        self.assertEqual(self._route_ids(begun["cycle_id"]), [a["route_id"]])  # write 0
+
+    # -- A-25.9 (representative subset; full matrix would dominate this file) --
+    def test_a25_9_audit_record_tamper_changes_no_decision(self):
+        a = self._root_route("lineage-a9")
+        self._publish_root(a)
+        begun = self._begin(a)
+        b = self._continuation(a)
+        d = self._continuation(b)
+        P.begin(self.root, route_file=R.canonical_route_path(self.root, d["route_id"]),
+               capability=d["capability"], intensity=d["effective_intensity"])
+        f = self._root_route("lineage-f9")
+        self._publish_root(f)
+        record = P.read_cycle_record(self.root, begun["cycle_id"])
+        tampered = dict(record, route_bindings=[record["route_bindings"][0], record["route_bindings"][2]])  # drop B
+        P._write_cycle_record(self.root, tampered, exclusive=False)
+        for route in (a, b, d):
+            self.assertTrue(P.cycle_route_admission(self.root, tampered, route).allow)
+        self.assertEqual(P.cycle_route_admission(self.root, tampered, f).reason, "cycle-route-binding-mismatch")
+        result = P.bind_cycle_route(self.root, begun["cycle_id"], d)
+        self.assertEqual(result["written"], True)
+        self.assertIsNotNone(result["advisory"])
+        self.assertEqual(self._route_ids(begun["cycle_id"]), [a["route_id"], b["route_id"], d["route_id"]])
+
+    # -- A-25.10 --------------------------------------------------------
+    def test_a25_10_sibling_fork_is_symmetric(self):
+        a = self._root_route("lineage-a10")
+        self._publish_root(a)
+        begun = self._begin(a)
+        b = self._continuation(a)
+        R.bind_continuation_cycle(self.root, a, b)
+        bprime = self._continuation(a, reason="lineage-fixture-prime")  # a second, sibling continuation of A
+        fork_bind = R.bind_continuation_cycle(self.root, a, bprime)
+        self.assertFalse(fork_bind["bound"])
+        self.assertEqual(fork_bind["advisory"], "cycle-lineage-fork")
+        self.assertEqual(self._route_ids(begun["cycle_id"]), [a["route_id"], b["route_id"]])  # no write
+        record = P.read_cycle_record(self.root, begun["cycle_id"])
+        self.assertEqual(P.cycle_route_admission(self.root, record, b).reason,
+                         "cycle-route-binding-mismatch:lineage-fork")
+        self.assertEqual(P.cycle_route_admission(self.root, record, bprime).reason,
+                         "cycle-route-binding-mismatch:lineage-fork")
+        self.assertEqual(P.cycle_route_admission(self.root, record, b, finalize=True).reason,
+                         "cycle-route-binding-mismatch:lineage-fork")
+        self.assertTrue(P.cycle_route_admission(self.root, record, a).allow)  # A's own late write still allows
+
+    # -- A-25.11 ----------------------------------------------------------
+    def test_a25_11_superseded_route_cannot_seal(self):
+        a = self._root_route("lineage-a11")
+        self._publish_root(a)
+        begun = self._begin(a)
+        b = self._continuation(a)
+        R.bind_continuation_cycle(self.root, a, b)
+        record = P.read_cycle_record(self.root, begun["cycle_id"])
+        admission = P.cycle_route_admission(self.root, record, a, finalize=True)
+        self.assertEqual(admission.reason, "cycle-route-binding-mismatch:superseded-route")
+        self.assertTrue(P.cycle_route_admission(self.root, record, a).allow)  # A's late write still allows
+
+    # -- A-SD156-2 ---------------------------------------------------------
+    def test_a_sd156_2_commit_needs_no_continuation(self):
+        a = self._root_route("lineage-sd156-2")
+        self._publish_root(a)
+        begun = self._begin(a)
+        output = P.require_cycle_output(self.root, Path(begun["cycle_dir"]) / "artifacts" / "report.md",
+                                        route_id=a["route_id"])
+        self.assertEqual(output, Path(begun["cycle_dir"]) / "artifacts")
+        self.assertEqual(len(self._bindings(begun["cycle_id"])), 1)
+
+
 class CycleBucketDeclarationTest(unittest.TestCase):
     """CORE §3 "Cycle payload buckets" is the declaration readers such as Cairn
     trust; it must name exactly the buckets the producer types."""

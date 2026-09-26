@@ -13,6 +13,21 @@ P = Path(__file__).with_name("dispatch-node.py")
 S = importlib.util.spec_from_file_location("dispatch_node", P)
 N = importlib.util.module_from_spec(S)
 S.loader.exec_module(N)
+import route_identity as ROUTE_IDENTITY
+REVIEW_ROUND_CAP = N.REVIEW_ROUND_CAP
+
+
+def seal_route_hash(route):
+    """Recompute `route_hash` after a fixture mutates the route dict.
+
+    SD-155 (`verified_route_lineage`) recomputes and checks the route's own
+    hash even for a single-generation lineage, so a fixture's `route_hash`
+    must match its final field values -- including a post-construction
+    `effective_intensity` override -- once a review-worker node's round
+    census walks the verified lineage (`prior_round_attempts(..., route=...)`).
+    """
+    route["route_hash"] = ROUTE_IDENTITY.route_hash(route)
+    return route
 
 
 def base_tuple(child_harness, status="supported", probe_source="fixture-check", failure_class="", parent=None):
@@ -637,8 +652,12 @@ class RoundProtocolTest(unittest.TestCase):
     scoping a review to a closure check and a stage to one batched fix."""
 
     def _rows(self, node, n, extra=""):
+        # SD-153: `failure_class=fail` makes this a genuine FAIL verdict for a
+        # non-review worker, so it still spends the round budget and renders
+        # with its literal note (not "판정 없음(...)") -- unlike a review
+        # worker's `dead-worker-fail`, which is a crash, not a verdict.
         pipe = ("capability=autopilot-code,attempt_schema_version=2,registered_worker=1,"
-                "route_id=rt-fixture,route_node=" + node + ",note=dead-worker-fail" + extra)
+                "route_id=rt-fixture,route_node=" + node + ",note=dead-worker-fail,failure_class=fail" + extra)
         return "".join(
             f"2026-08-24T00:00:0{i}Z\tdone\t/repo\t/wt\tslug-r{i}\t{pipe},attempt_id=att-{node}-{i}\n"
             for i in range(1, n + 1)
@@ -651,7 +670,7 @@ class RoundProtocolTest(unittest.TestCase):
             captured["argv"] = cmd
             return mock.Mock(returncode=0)
 
-        route = make_route(node, tuples=[])
+        route = seal_route_hash(make_route(node, tuples=[]))
         printed = []
         with tempfile.TemporaryDirectory() as td:
             jobs = Path(td) / ".dispatch" / "jobs.log"
@@ -707,23 +726,39 @@ class RoundProtocolTest(unittest.TestCase):
 
 
 class ReviewRoundCapTest(unittest.TestCase):
-    """C-14: plan-check/impl-review/test rounds are capped by tier-derived retry
-    budget (CONVENTIONS §1.1), not left unbounded. `execute`/`report` carry no
-    cap here -- their retry mechanism is HEAD-lineage based, not round-counted."""
+    """C-14 + SD-153: plan-check/impl-review/test rounds are capped by
+    tier-derived retry budget (CONVENTIONS §1.1), not left unbounded -- but
+    only a real verdict spends that budget (SD-153 rule 1). `execute`/
+    `report` carry no cap here -- their retry mechanism is HEAD-lineage
+    based, not round-counted."""
 
     def _rows(self, node, n):
+        # A review verdict must be a real blocking finding, not a crash --
+        # `completed-review-blocking` spends the round budget the way two
+        # prior `dead-worker-fail` rows used to (and no longer do, since a
+        # review worker's crash never produced a verdict). `test`'s own
+        # worker is not a review worker (kind=pipeline-stage, C-14's declared
+        # exception), so a genuine FAIL (`dead-worker-fail` +
+        # `failure_class=fail`) still spends its budget the same way a
+        # stage's does.
+        note = "dead-worker-fail,failure_class=fail" if node == "test" else "completed-review-blocking"
         pipe = ("capability=autopilot-code,attempt_schema_version=2,registered_worker=1,"
-                "route_id=rt-fixture,route_node=" + node + ",note=dead-worker-fail")
+                "route_id=rt-fixture,route_node=" + node + ",note=" + note)
         return "".join(
             f"2026-08-24T00:00:0{i}Z\tdone\t/repo\t/wt\tslug-r{i}\t{pipe},attempt_id=att-{node}-{i}\n"
             for i in range(1, n + 1)
         )
 
     def _run(self, node_id, prior_count, *, effective_intensity="standard", slug="slug-next", rows=None):
-        node = dict(make_node(depth=1, dispatch_fallback=[]), id=node_id,
-                    kind="review-worker", unit="qa/code-review", completion_gate="code-" + node_id)
+        if node_id == "test":
+            node = dict(make_node(depth=1, dispatch_fallback=[]), id=node_id,
+                        kind="pipeline-stage", unit="qa/test", completion_gate="code-" + node_id)
+        else:
+            node = dict(make_node(depth=1, dispatch_fallback=[]), id=node_id,
+                        kind="review-worker", unit="qa/code-review", completion_gate="code-" + node_id)
         route = make_route(node, tuples=[])
         route["effective_intensity"] = effective_intensity
+        route = seal_route_hash(route)
         printed = []
         code = None
         launched = []
@@ -817,8 +852,11 @@ class ReviewRoundCapTest(unittest.TestCase):
         self.assertIn("correction_round=2", printed)
 
     def test_round_protocol_history_names_the_finished_review_note(self):
-        prior = [("slug-r1", "completed-review-blocking")]
-        block = N.round_protocol_block(2, "review", "plan-check", prior)
+        cols = ["2026-08-24T00:00:01Z", "done", "/repo", "/wt", "slug-r1"]
+        meta = {"note": "completed-review-blocking"}
+        budget = REVIEW_ROUND_CAP.round_budget(
+            {"effective_intensity": "standard"}, {"kind": "review-worker"}, [("done", meta)], revisions=())
+        block = N.round_protocol_block(budget, [(cols, meta)], "review", "plan-check")
         self.assertIn("Round protocol (round 2", block)
         self.assertIn("slug-r1 (completed-review-blocking)", block)
         self.assertNotIn("dead-worker", block)
@@ -927,6 +965,33 @@ class ReviewRoundCapTest(unittest.TestCase):
                     code = exc.code
         self.assertEqual(code, 0)
         self.assertFalse([l for l in printed if l.startswith("reason=review-round-budget-exhausted")])
+
+    def test_a_sd154_10_admit_round_is_the_one_admission_entry_on_every_surface(self):
+        """A-SD154-10 parity: `dispatch-node.py`'s own `main()`, `dispatch-
+        batch.py` and `stage-dispatch-fallback.py` all call the SAME
+        `admit_round` (this module's live, auto-recording implementation
+        `CompletionMarkerTest::test_a_sd154_10_admit_round_auto_records_once`
+        exercises end to end) -- none keeps a separate `round_budget(...,
+        revisions=())` call of its own that would silently never auto-record.
+        """
+        root = Path(__file__).resolve().parents[1]
+        surfaces = {
+            "utilities/dispatch-node.py": root / "utilities" / "dispatch-node.py",
+            "utilities/dispatch-batch.py": root / "utilities" / "dispatch-batch.py",
+            "utilities/stage-dispatch-fallback.py": root / "utilities" / "stage-dispatch-fallback.py",
+        }
+        missing = []
+        stale = []
+        for label, path in surfaces.items():
+            text = path.read_text(encoding="utf-8")
+            has_admit_round_call = "admit_round(" in text
+            has_own_revisions_literal = "revisions=()" in text and label != "utilities/dispatch-node.py"
+            if not has_admit_round_call:
+                missing.append(label)
+            if has_own_revisions_literal:
+                stale.append(label)
+        self.assertEqual(missing, [], missing)
+        self.assertEqual(stale, [], stale)
 
 
 class SubsessionChainSealTest(unittest.TestCase):
