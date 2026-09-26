@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Unit tests for hooks/peer-message-record.py (SD-122)."""
+import fcntl
 import hashlib
 import json
 import os
@@ -300,6 +301,23 @@ class SweepTest(_BaseTest):
         while time.monotonic() < deadline and not receipt.exists():
             time.sleep(0.02)
         self.assertTrue(receipt.exists(), f"receipt never arrived for {watch_id}")
+        # The watcher renames its receipt into place *before* it appends its
+        # `notice` row, and it holds `<watch_id>.lock` until process exit. Wait
+        # for that lock, so a caller counting notice rows never races the
+        # watcher's own trailing write.
+        lock_path = self._watch_root() / f"{watch_id}.lock"
+        fd = os.open(lock_path, os.O_RDWR)
+        try:
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    self.assertLess(time.monotonic(), deadline,
+                                    f"watcher never exited for {watch_id}")
+                    time.sleep(0.02)
+        finally:
+            os.close(fd)
         return watch_id
 
     def _prompt(self, session_id=None, prompt=""):

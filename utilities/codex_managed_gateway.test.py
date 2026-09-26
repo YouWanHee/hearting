@@ -1612,6 +1612,18 @@ class ManagedGatewayTest(unittest.TestCase):
 
         # A methodless response cannot safely choose between colliding ids.
         self.client.respond("shared", {"answers": {}})
+        # A real App Server resolves only after the gateway forwarded the
+        # answer. Emitting `resolved` before that lets the gateway see the
+        # thread-1 resolution first, after which the late "shared" response
+        # matches thread-2 uniquely and clears it -- an order no real App
+        # Server produces. Wait for the forwarded answer to keep that causality.
+        deadline = time.monotonic() + 5
+        while (not any(value.get("id") == "shared"
+                       for value in self.server.approval_responses)
+               and time.monotonic() < deadline):
+            time.sleep(0.01)
+        self.assertTrue(any(value.get("id") == "shared"
+                            for value in self.server.approval_responses))
         self.wait_interaction("thread-1", True)
         self.wait_interaction("thread-2", True)
         resolved = self.server.emit_resolved("thread-1", "shared")

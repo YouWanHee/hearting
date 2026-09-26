@@ -33,6 +33,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 import workflow_state as WS  # noqa: E402
 import capability_topology as TOPO  # noqa: E402
 import dispatch_contract as DC  # noqa: E402
+import fixture_processes  # noqa: E402
 
 
 # Completing nodes here must not launch detached open-cycle checkpoints into
@@ -118,6 +119,10 @@ class WorkflowFixture(unittest.TestCase):
             os.environ.pop(key, None)
         self.addCleanup(self._restore)
         self.addCleanup(self.tmp.cleanup)
+        # A detached successor (`arm --successor-command`) can still be writing its
+        # marker into the fixture root when the temp dir is removed (Errno 39,
+        # CI 2026-09-26). Registered after the temp-dir cleanup so it runs first.
+        self.addCleanup(fixture_processes.reap, str(self.base))
 
     def _restore(self):
         if self._previous is None:
