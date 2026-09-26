@@ -293,6 +293,28 @@ class DurableHandoffCrashTest(unittest.TestCase):
             self.assertFalse(BR.begin_submission(td, intent))
             self.assertEqual(BR.settle_submission(td, intent, "not-submitted")["status"], "submission-unknown")
 
+    def test_terminal_section_outwaits_a_slow_holder_of_the_ledger_lock(self):
+        # CI 2026-09-26: eight concurrent submitters, each fsyncing inside the
+        # lock, pushed the last one past the 0.25 s reservation deadline and it
+        # raised a false terminal-handoff conflict. Hold the lock for longer
+        # than that deadline; the terminal section must wait, not conflict.
+        import fcntl
+        import threading
+        with tempfile.TemporaryDirectory() as td:
+            claim = BR.claim_terminal_handoff(td, owner_attempt_id="owner", route_hash="hash", child_attempt_ids=[])
+            intent = BR.convert_claim_to_prompt_intent(td, claim, prompt="cleanup", cleanup_scope={})
+            lock_path = str(BR._ledger_path(td, "owner")) + ".lock"
+            with open(lock_path, "a+") as holder:
+                fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
+                release = threading.Timer(4 * BR._LOCK_DEADLINE_SECONDS,
+                                          fcntl.flock, (holder.fileno(), fcntl.LOCK_UN))
+                release.start()
+                try:
+                    self.assertTrue(BR.begin_submission(td, intent))
+                finally:
+                    release.cancel()
+                    release.join()
+
     def test_scope_change_and_second_cleanup_are_refused(self):
         with tempfile.TemporaryDirectory() as td:
             first = BR.claim_terminal_handoff(td, owner_attempt_id="owner", route_hash="hash", child_attempt_ids=["a"])

@@ -244,10 +244,19 @@ CLEANUP+=("$REALDIR7A" "$REALDIR7B")
 mkproject_seeded "$PROJ7" "$REALDIR7A" "$STORE7" 1
 mkproject_seeded "$PROJ7" "$REALDIR7B" "$STORE7" 1
 printf '%s' "$CONC_STUB_BODY" > "$STUB7/claude"; chmod +x "$STUB7/claude"
+# The worker holds its slot until the test releases it (bounded at 60s), not
+# for a fixed 8s: the run deadline is measured from before project selection,
+# so under CI load a 3s deadline could expire before the first worker had even
+# started, leaving zero calls. A worker that waits for an explicit release
+# stays busy past any deadline without racing its own start.
 cat > "$STUB7/sleep" <<'EOS'
 #!/bin/sh
 case "${1:-}" in
-  0.3) exec /bin/sleep 8 ;;
+  0.3)
+    _i=0
+    while [ ! -e "$CONC_DIR/release" ] && [ "$_i" -lt 1200 ]; do
+      /bin/sleep 0.05; _i=$((_i + 1))
+    done ;;
   1) exec /bin/sleep 0.01 ;;
   *) exec /bin/sleep "$@" ;;
 esac
@@ -258,7 +267,7 @@ LOG7="$STORE7/periodic.log"
 MEM_PERIODIC_CURATE_ENABLE=1 MEM_DISTILL_ENABLE=1 \
   MEM_STORE="$STORE7" MEM_PROJECTS="$PROJ7" MEM_PY="$MEM" \
   MEM_DISTILL_WORKER=claude PATH="$STUB7:$PATH" \
-  MEM_PERIODIC_CURATE_TIMEOUT=3 MEM_PERIODIC_CURATE_PROJECT_TIMEOUT=30 \
+  MEM_PERIODIC_CURATE_TIMEOUT=10 MEM_PERIODIC_CURATE_PROJECT_TIMEOUT=30 \
   AGENT_MODEL_GOVERNOR_ROOT="$STORE7/.test-model-governor" \
   CONC_DIR="$STORE7" \
   bash "$UTIL" 2>"$LOG7"
@@ -270,7 +279,11 @@ calls7="$(wc -l < "$STORE7/calls" 2>/dev/null || echo 0)"
 grep -Eq '^mem-periodic-curate project=.* elapsed=[0-9][0-9]*s status=timeout$' "$LOG7" \
   && ok "⑦: timed project emits a bounded one-line timeout log" \
   || bad "⑦: timeout log missing or malformed"
-# Let the detached test worker run its EXIT cleanup before fixture teardown.
+# Release the detached test worker and let it run its EXIT cleanup before
+# fixture teardown.
+touch "$STORE7/release"
+_w7=0
+while [ -d "$STORE7/.active" ] && [ "$_w7" -lt 100 ]; do /bin/sleep 0.05; _w7=$((_w7 + 1)); done
 /bin/sleep 0.4
 
 # ============================================================

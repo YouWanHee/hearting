@@ -55,6 +55,7 @@ WARNING_REASONS = frozenset({
     "continuation-budget-warning",
 })
 _LOCK_DEADLINE_SECONDS = 0.25
+_TERMINAL_LOCK_DEADLINE_SECONDS = 10.0
 _NOTICE_KINDS = frozenset({"budget-warning", "budget-exhausted"})
 
 SUBMISSION_STATES = ("prepared", "intent-sealed", "submitted", "not-submitted", "submission-unknown")
@@ -102,7 +103,11 @@ def _handoff_write(path: Path, value: dict, *, exclusive: bool = False) -> None:
 
 def _terminal_locked(state_root, owner, operation):
     # Same reservation lock; callers must not nest reserve() in this section.
-    result = _with_lock(_ledger_path(state_root, owner), operation)
+    # Each terminal section fsyncs a file and its directory, so under disk load
+    # a few queued callers exceed the short reservation deadline and a lost
+    # wait would surface as a false handoff conflict. Wait longer here.
+    result = _with_lock(_ledger_path(state_root, owner), operation,
+                        deadline_seconds=_TERMINAL_LOCK_DEADLINE_SECONDS)
     if result is None:
         raise TerminalHandoffConflict("terminal-handoff-lock-unavailable")
     return result
@@ -381,10 +386,10 @@ def _parse_lines(text: str) -> list:
     return rows
 
 
-def _with_lock(path: Path, fn):
+def _with_lock(path: Path, fn, *, deadline_seconds: float = _LOCK_DEADLINE_SECONDS):
     os.makedirs(path.parent, exist_ok=True)
     lock_path = Path(str(path) + ".lock")
-    deadline = time.monotonic() + _LOCK_DEADLINE_SECONDS
+    deadline = time.monotonic() + deadline_seconds
     with open(str(lock_path), "a+") as lock:
         while True:
             try:
