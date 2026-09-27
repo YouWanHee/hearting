@@ -480,8 +480,19 @@ and child cleanup. It records COMPLETE only after sealing, retries interrupted
 closure without a model turn and sends a recovery notice while closure remains
 pending. The owner and parent have no separate close/finalize procedure.
 
-Inline work and legacy recovery explicitly record terminal completion and close
-the route before reporting:
+An eligible `direct` inline route is finished by its current depth-0 session
+with one public command. Supply a readable, nonempty artifact from the route's
+exact open cycle and the final summary; the command records terminal proof,
+closes the route, seals that cycle and returns a receipt only after rechecking
+all three. A partial transaction remains `finish-pending` and is resumed with
+the same intent. Session exit alone never finishes the route.
+
+```text
+python3 utilities/capability-route.py finish --route <route.json> --evidence <cycle-local-file> --summary-file <file> [--commit <full-sha>]
+```
+
+Ineligible inline routes and legacy recovery retain their explicit guarded
+completion and close steps; use their recorded route and producer evidence:
 
 ```text
 python3 utilities/capability-route.py close --route <route.json> [--commit <sha>] [--summary <line>]
@@ -489,13 +500,23 @@ python3 utilities/capability-route.py status --artifact-root <dir> --open-only
 ```
 
 For producer-backed work, the controller's transaction is **terminal proof →
-route close → exact cycle seal → workflow COMPLETE**. Inline and legacy recovery
-use complete, close and finalize in that order. Shared admission applies only to
+route close → exact cycle seal → workflow COMPLETE**. Eligible direct inline
+work uses `finish`; legacy recovery uses complete, close and finalize in that
+order. Shared admission applies only to
 shared kinds after sealing; it is never a prerequisite for the terminal marker.
 A cycle sealed while its route is open (`finalize --allow-open-route`) stays
 `active` in its manifest; a later close, proven or not, leaves it there, and
 campaign closure lists it as `sealed-unproven` with the route's recorded proof
 state.
+
+During the same session, a verified OPEN route for the same named campaign may
+also govern writes in a related integration worktree. The guard requires the
+same canonical repository and artifact root plus proof that the route branch
+was actually merged: an exact merge command, matching in-progress
+`MERGE_HEAD`, or a descendant of the exact merge or recorded fast-forward.
+It keeps the route's source, scope, core, spec and recall checks. A sibling
+branch with only a shared ancestor, a different campaign, or a closed route
+requires a new route; integration reuse needs no manual bind command.
 
 `close` writes an outcome sidecar beside the immutable route record — the record
 itself cannot carry the closure, because `route_hash` covers every other field.

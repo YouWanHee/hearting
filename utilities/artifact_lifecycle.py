@@ -543,6 +543,7 @@ def evaluate_cycle_completion(
     route_file: Path,
     publication: str = "not-offered",
     expected_root_id: Optional[str] = None,
+    inline_finish_id: Optional[str] = None,
 ) -> Decision:
     publication_check = validate_publication(publication)
     if not publication_check.ok:
@@ -652,6 +653,18 @@ def evaluate_cycle_completion(
         return Decision(
             "reject", (_violation("completion-route-outcome-identity-mismatch"),)
         )
+    outcome_finish_id = outcome.get("inline_finish_id")
+    if outcome_finish_id:
+        try:
+            import inline_finish
+            finish_state = inline_finish.pending_state(root, binding.route_id)
+        except Exception as exc:  # noqa: BLE001 -- a missing proof is a closed rejection
+            return Decision("reject", (_violation("completion-inline-finish-unverified", detail=str(exc)),))
+        if (not finish_state or finish_state.get("inline_finish_id") != outcome_finish_id
+                or (finish_state.get("state") != "finished"
+                    and not (inline_finish_id == outcome_finish_id
+                             and finish_state.get("state") in {"route-closed", "producer-sealed"}))):
+            return Decision("reject", (_violation("completion-inline-finish-pending"),))
     if outcome.get("terminal_gate_proven") is not True:
         return Decision("reject", (_violation("completion-terminal-gate-unproven"),))
     gates = outcome.get("terminal_gates")

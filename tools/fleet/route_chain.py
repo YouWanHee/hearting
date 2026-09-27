@@ -360,7 +360,9 @@ def assemble(lines, *, load_record, load_outcome, jobs=(), node_evidence=None):
                 ambiguity.append("outcome-mismatch")
             else:
                 tgp = outcome.get("terminal_gate_proven")
-                if tgp is True:
+                if outcome.get("finish_pending"):
+                    state = "finish-pending"
+                elif tgp is True:
                     state = "done"
                 elif tgp is False:
                     state = "failed"

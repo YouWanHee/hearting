@@ -13,6 +13,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -205,6 +206,7 @@ class MaterialRouteGuardTest(unittest.TestCase):
 
     def reset(self) -> None:
         subprocess.run(["git", "-C", str(self.repo), "reset", "--hard", "-q", "HEAD"], check=True)
+
 
     def test_source_edit_denies_silent_no_route_and_accepts_bound_route(self) -> None:
         denied = self.guard("--tool", "Edit", "--file", str(self.repo / "app.py"))
@@ -1831,6 +1833,184 @@ class ArtifactBucketCapsTest(unittest.TestCase):
         path = Path("/tmp/proj/.agent_reports/campaigns/camp_1/cycles/cyc_2/artifacts/research/topic/report.md")
         self.assertEqual(MATERIAL_GUARD.capability_artifact_caps(path), MATERIAL_GUARD.CAPABILITY_ARTIFACT_CAPS["research"])
 
+
+
+class RouteReuseProofTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="route-reuse-proof-")
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.repo = self.base / "repo"
+        self.repo.mkdir()
+        self.artifacts = self.base / "artifacts"
+        self.artifacts.mkdir()
+        self._git("init", "-q", str(self.repo))
+        self._git("config", "user.email", "route-proof@example.invalid")
+        self._git("config", "user.name", "Route Proof")
+        (self.repo / "app.py").write_text("base\n", encoding="utf-8")
+        self._git("add", ".")
+        self._git("commit", "-qm", "source")
+        self.source = self._git("rev-parse", "HEAD")
+        self._git("switch", "-qc", "route-B")
+        (self.repo / "app.py").write_text("route material\n", encoding="utf-8")
+        self._git("commit", "-qam", "route material")
+        self.route_head = self._git("rev-parse", "HEAD")
+        self.target = self.base / "integration"
+        self._git("worktree", "add", "-qb", "integration", str(self.target), self.source)
+        (self.target / "README.md").write_text("integration work\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.target), "add", "README.md"], check=True)
+        subprocess.run(["git", "-C", str(self.target), "commit", "-qm", "integration work"], check=True)
+        self.route = {"effective_intensity":"direct", "campaign_key":"proof-campaign",
+                      "route_id":"rt-" + "1"*16, "route_hash":"sha256:" + "1"*64,
+                      "cwd":str(self.repo), "artifact_root":str(self.artifacts), "source_commit":self.source}
+        self.marker = {"route_id":self.route["route_id"], "route_hash":self.route["route_hash"]}
+        sys.path.insert(0, str(ROOT / "utilities"))
+        import artifact_producer
+        self.producer = artifact_producer
+
+    def _git(self, *args):
+        result = subprocess.run(["git", "-C", str(self.repo), *args], check=True,
+                                capture_output=True, text=True)
+        return result.stdout.strip()
+
+    def _proof(self, target):
+        cycle = {"state":"open", "campaign_id":"camp-proof"}
+        campaign = {"key":"proof-campaign"}
+        with mock.patch.object(MATERIAL_GUARD, "_artifact_root_for",
+                               side_effect=lambda _cwd: self.artifacts.resolve()), \
+             mock.patch.object(self.producer, "route_cycle_for", return_value=cycle), \
+             mock.patch.object(self.producer, "read_campaign", return_value=campaign):
+            def resolve(_session, _root, _home, **kwargs):
+                if not MATERIAL_GUARD._route_reuse_proven(
+                        self.route, self.marker, target, self.base, "proof-session",
+                        kwargs.get("command", "")):
+                    raise MATERIAL_GUARD.RouteError("session-route-reuse-unproven")
+                return self.route
+            with mock.patch.object(MATERIAL_GUARD, "session_route", side_effect=resolve), \
+                 mock.patch.object(MATERIAL_GUARD, "_route_scope_allows", return_value=True), \
+                 mock.patch.object(MATERIAL_GUARD, "require_recall_opportunity", return_value=None), \
+                 mock.patch.dict(os.environ, {"AGENT_ROUTE_FILE":"", "AGENT_ROUTE_ID":"",
+                                              "AGENT_ROUTE_NODE":""}):
+                return MATERIAL_GUARD.cli(["--agent-home", str(self.base), "check", "--tool", "Edit",
+                    "--file", str(target / "app.py"), "--cwd", str(target), "--session", "proof-session"]) == 0
+
+    def test_actual_second_parent_merge_proves_open_direct_route_reuse(self):
+        subprocess.run(["git", "-C", str(self.target), "merge", "--no-ff", "-m", "integrate B", "route-B"],
+                       check=True, capture_output=True, text=True)
+        parents = subprocess.run(["git", "-C", str(self.target), "show", "-s", "--format=%P", "HEAD"],
+                                 check=True, capture_output=True, text=True).stdout.split()
+        self.assertEqual(parents[1], self.route_head)
+        self.assertTrue(self._proof(self.target))
+
+    def test_non_direct_open_route_uses_same_exact_merge_proof(self):
+        # SD-159 governs any current-session OPEN route. The integration
+        # predicate must not silently narrow it to direct intensity.
+        self.route["effective_intensity"] = "standard"
+        subprocess.run(["git", "-C", str(self.target), "merge", "--no-ff", "-m", "integrate B", "route-B"],
+                       check=True, capture_output=True, text=True)
+        self.assertTrue(self._proof(self.target))
+
+    def test_sibling_branch_merge_does_not_prove_route_reuse(self):
+        sibling = self.base / "sibling"
+        self._git("worktree", "add", "-qb", "sibling", str(sibling), self.source)
+        (sibling / "app.py").write_text("sibling\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(sibling), "add", "app.py"], check=True)
+        subprocess.run(["git", "-C", str(sibling), "commit", "-qm", "sibling"], check=True)
+        subprocess.run(["git", "-C", str(self.target), "merge", "--no-ff", "-m", "integrate sibling", "sibling"],
+                       check=True, capture_output=True, text=True)
+        self.assertFalse(self._proof(self.target))
+
+    def test_recorded_fast_forward_intent_and_result_prove_reuse(self):
+        target = self.base / "ff-target"
+        self._git("worktree", "add", "-qb", "ff-target", str(target), self.source)
+        old = subprocess.run(["git", "-C", str(target), "rev-parse", "HEAD"],
+                             check=True, capture_output=True, text=True).stdout.strip()
+        event = {"schema":"route_merge_intent_v1",
+                 "session_key":MATERIAL_GUARD.session_key("proof-session"),
+                 "route_id":self.route["route_id"], "route_hash":self.route["route_hash"],
+                 "campaign_key":self.route["campaign_key"], "route_branch":"route-B",
+                 "branch_ref":"refs/heads/route-B", "route_head":self.route_head,
+                 "target_cwd":str(target.resolve()), "target_branch":"ff-target",
+                 "target_old_head":old, "merge_ref":"route-B"}
+        path = MATERIAL_GUARD._route_merge_event_path(self.artifacts, "proof-session")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(event), encoding="utf-8")
+        subprocess.run(["git", "-C", str(target), "merge", "--ff-only", "route-B"],
+                       check=True, capture_output=True, text=True)
+        self.assertTrue(self._proof(target))
+        recorded = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(recorded["merge_result"]["proof"], "exact-fast-forward-reflog")
+
+    def test_in_progress_merge_head_passes_through_public_guard_cli(self):
+        target = self.base / "merge-head-target"
+        self._git("worktree", "add", "-qb", "merge-head-target", str(target), self.source)
+        merged = subprocess.run(["git", "-C", str(target), "merge", "--no-commit", "--no-ff", "route-B"],
+                                capture_output=True, text=True)
+        self.assertEqual(merged.returncode, 0, merged.stderr)
+        self.assertEqual(self._git("-C", str(target), "rev-parse", "MERGE_HEAD"), self.route_head)
+        self.assertTrue(self._proof(target))
+
+    def test_actual_merge_command_records_premerge_event_for_shared_check(self):
+        # Exercise the public CLI with the real tool command: it records the
+        # exact branch intent, and the subsequent source edit uses the same
+        # route reuse predicate reached by all adapter bridges.
+        with mock.patch.object(MATERIAL_GUARD, "_current_route_for_session",
+                               return_value=(self.marker, self.route)), \
+             mock.patch.object(MATERIAL_GUARD, "_artifact_root_for",
+                               side_effect=lambda _cwd: self.artifacts.resolve()):
+            result = MATERIAL_GUARD.cli(["--agent-home", str(self.base), "check", "--tool", "Bash",
+                "--command", "git merge route-B", "--cwd", str(self.target), "--session", "proof-session"])
+        self.assertEqual(result, 0)
+        subprocess.run(["git", "-C", str(self.target), "merge", "--no-ff", "-m", "integrate", "route-B"],
+                       check=True, capture_output=True, text=True)
+        self.assertTrue(self._proof(self.target))
+
+    def test_quoted_comment_or_injected_merge_text_is_never_parsed_as_exact_merge(self):
+        for command in (
+            "git merge 'route-B'",
+            'git merge "route-B"',
+            "git merge route-B # trailing comment",
+            "# git merge route-B",
+            "git merge route-B; rm -rf /",
+            "git merge route-B && echo done",
+            "git merge route-B | cat",
+            "echo git merge route-B",
+            "git merge --no-ff route-B",
+            "git alias-merge route-B",
+            "git merge",
+            "git merge route-B route-B",
+        ):
+            with self.subTest(command=command):
+                self.assertIsNone(MATERIAL_GUARD._parse_exact_merge(command))
+        self.assertEqual(MATERIAL_GUARD._parse_exact_merge("git merge route-B"), "route-B")
+
+    def test_wrong_campaign_key_does_not_prove_reuse(self):
+        subprocess.run(["git", "-C", str(self.target), "merge", "--no-ff", "-m", "integrate B", "route-B"],
+                       check=True, capture_output=True, text=True)
+        cycle = {"state": "open", "campaign_id": "camp-proof"}
+        campaign = {"key": "a-different-campaign"}
+        with mock.patch.object(MATERIAL_GUARD, "_artifact_root_for",
+                               side_effect=lambda _cwd: self.artifacts.resolve()), \
+             mock.patch.object(self.producer, "route_cycle_for", return_value=cycle), \
+             mock.patch.object(self.producer, "read_campaign", return_value=campaign):
+            self.assertFalse(MATERIAL_GUARD._route_reuse_proven(
+                self.route, self.marker, self.target, self.base, "proof-session"))
+
+    def test_wrong_session_marker_does_not_prove_reuse(self):
+        subprocess.run(["git", "-C", str(self.target), "merge", "--no-ff", "-m", "integrate B", "route-B"],
+                       check=True, capture_output=True, text=True)
+        foreign_marker = {"route_id": "rt-" + "9" * 16, "route_hash": self.route["route_hash"]}
+        self.assertFalse(self._proof_with_marker(self.target, foreign_marker))
+
+    def _proof_with_marker(self, target, marker):
+        cycle = {"state": "open", "campaign_id": "camp-proof"}
+        campaign = {"key": "proof-campaign"}
+        with mock.patch.object(MATERIAL_GUARD, "_artifact_root_for",
+                               side_effect=lambda _cwd: self.artifacts.resolve()), \
+             mock.patch.object(self.producer, "route_cycle_for", return_value=cycle), \
+             mock.patch.object(self.producer, "read_campaign", return_value=campaign):
+            return MATERIAL_GUARD._route_reuse_proven(
+                self.route, marker, target, self.base, "proof-session")
 
 
 if __name__ == "__main__":

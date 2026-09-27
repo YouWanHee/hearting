@@ -3131,6 +3131,41 @@ class TerminalExactRecoveryTest(ProducerTestBase):
         self.assertEqual(P.read_cycle_record(self.root, result["cycle_id"])["state"], "open")
 
 
+class InlineProducerBindingAdmissionLockTest(ProducerTestBase):
+    def test_full_inline_binding_is_rechecked_after_admission_lock_acquisition(self):
+        self.activate()
+        route, route_file = self.route(campaign_key="lock-binding")
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_ATTEMPT_ID":"", "AGENT_ROUTE_FILE":"",
+                                          "AGENT_ROUTE_ID":"", "AGENT_ROUTE_NODE":""}):
+            started = P.begin(self.root, route_file=route_file, capability="autopilot-code",
+                              intensity="direct", jobs=self.jobs)
+        record = P.read_cycle_record(self.root, started["cycle_id"])
+        campaign = P.read_campaign(self.root, record["campaign_id"])
+        binding = {
+            "kind": "inline_producer_binding_v1", "artifact_root_id": ROOT_ID,
+            "campaign_key": campaign["key"], "campaign_id": record["campaign_id"],
+            "cycle_id": record["cycle_id"], "producer_id": record["producer_id"],
+            "route_id": route["route_id"], "route_hash": route["route_hash"],
+            "cycle_record_digest": P.dispatch_terminal_commit.cycle_identity_digest(record),
+            "terminal_marker_digest": "a" * 64, "evidence_sha256": "b" * 64,
+            "inline_finish_id": "c" * 64,
+        }
+        acquire = adm._acquire_lock
+
+        def acquire_then_rebind(root, *args, **kwargs):
+            fd = acquire(root, *args, **kwargs)
+            changed = dict(P.read_cycle_record(self.root, record["cycle_id"]))
+            changed["route_hash"] = "sha256:" + "f" * 64
+            P._write_cycle_record(self.root, changed, exclusive=False)
+            return fd
+
+        with mock.patch.object(adm, "_acquire_lock", side_effect=acquire_then_rebind):
+            with self.assertRaisesRegex(P.ProducerError, "inline-producer-binding-mismatch"):
+                P.finalize_exact_cycle(self.root, cycle_id=record["cycle_id"], expected_binding=binding)
+        self.assertFalse((Path(started["cycle_dir"]) / "manifest.json").exists())
+        self.assertEqual(P.read_cycle_record(self.root, record["cycle_id"])["state"], "open")
+
+
 class QuickOwnerBindingIntegrationTest(ProducerTestBase):
     def test_registered_quick_begin_crash_resumes_same_binding_without_owner_route_fields(self):
         self.activate()
@@ -4137,6 +4172,45 @@ class RouteLineageBindingTest(ProducerTestBase):
         return [{"route_id": record.get("route_id"), "route_hash": record.get("route_hash"),
                 "route_file": record.get("route_file"), "basis": "begin",
                 "continuation_id": None, "source_route_id": None}]
+
+    def test_inline_binding_uses_admitted_continuation_not_begin_route_equality(self):
+        import dispatch_terminal_commit as terminal
+
+        self.activate()
+        begin = self._root_route("inline-binding-begin")
+        self._publish_root(begin)
+        started = self._begin(begin)
+        continuation = self._continuation(begin)
+        record = P.read_cycle_record(self.root, started["cycle_id"])
+        campaign = P.read_campaign(self.root, record["campaign_id"])
+        binding = {
+            "kind": "inline_producer_binding_v1",
+            "artifact_root_id": ROOT_ID,
+            "campaign_key": campaign["key"],
+            "campaign_id": record["campaign_id"],
+            "cycle_id": record["cycle_id"],
+            "producer_id": record["producer_id"],
+            "route_id": continuation["route_id"],
+            "route_hash": continuation["route_hash"],
+            "cycle_record_digest": terminal.cycle_identity_digest(record),
+            "terminal_marker_digest": "a" * 64,
+            "evidence_sha256": "b" * 64,
+            "inline_finish_id": "c" * 64,
+        }
+        slot = self.root / ".runtime/inline-finish/v1" / continuation["route_id"] / "finish.json"
+        slot.parent.mkdir(parents=True)
+        slot.write_text(json.dumps({
+            "schema": "inline_finish_v1", "inline_finish_id": binding["inline_finish_id"],
+            "terminal_marker_digest": binding["terminal_marker_digest"], "state": "route-closed",
+            "intent": {key: binding[key] for key in (
+                "route_id", "route_hash", "artifact_root_id", "campaign_key",
+                "campaign_id", "cycle_id", "producer_id", "evidence_sha256")},
+        }))
+        self.assertNotEqual(record["route_id"], continuation["route_id"])
+        P._inline_producer_binding_check(self.root, record["cycle_id"], binding)
+        wrong = dict(binding, route_hash=begin["route_hash"])
+        with self.assertRaises(P.ProducerError):
+            P._inline_producer_binding_check(self.root, record["cycle_id"], wrong)
 
     def _route_ids(self, cycle_id):
         return [row["route_id"] for row in self._bindings(cycle_id)]

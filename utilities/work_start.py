@@ -446,8 +446,16 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
                          "start", "--route", str(path), "--jobs", str(jobs)])
     result["resume_command"] = resume
     from dispatch_notice_state import closed_outcome
+    import inline_finish
+    pending = inline_finish.pending_state(Path(route.get("artifact_root", "")), route["route_id"])
+    if pending and pending.get("state") != "finished":
+        return {**result, "state":"needs-attention", "reason":"finish-pending",
+                "required_action":"resume-inline-finish", "finish_state":pending.get("state")}
     closed = closed_outcome(path, route)
     if closed:
+        if closed.get("finish_pending"):
+            return {**result, "state": "needs-attention", "reason": "finish-pending",
+                    "required_action": "resume-inline-finish", "outcome": closed}
         # Replaying a finished request cannot prepare frames or reopen a cycle.
         # A closure with an explicitly unproven gate is not successful work.
         if closed.get("terminal_gate_proven") is not True:

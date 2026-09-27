@@ -818,6 +818,61 @@ def cycle_route_admission(root: Path, record: Mapping[str, Any], route: Mapping[
     return Admission(True, None, "", path, None)
 
 
+def _inline_producer_binding_check(root: Path, cycle_id: str,
+                                   binding: Mapping[str, Any]) -> None:
+    """Check a direct finish against D-120's verified route lineage.
+
+    The cycle record names its *begin* route. A continuation may be the route
+    that closes and seals it, so comparing the two route IDs would reject a
+    valid finish and would bypass the common lineage predicate.
+    """
+    record = read_cycle_record(root, cycle_id)
+    campaign = read_campaign(root, record["campaign_id"]) if record else None
+    identity = artifact_lifecycle.read_root_identity(root)
+    route_id = binding.get("route_id")
+    if not isinstance(route_id, str) or not _ROUTE_ID_RE.fullmatch(route_id):
+        raise ProducerError("inline-producer-binding-mismatch", "route-id")
+    path = route_lineage.canonical_route_path(root, route_id)
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise ProducerError("inline-producer-binding-mismatch", "route-missing") from exc
+    if not stat.S_ISREG(info.st_mode) or path.is_symlink() or path.resolve() != path:
+        raise ProducerError("inline-producer-binding-mismatch", "route-kind")
+    route = load_route(root, path)
+    if (not record or not campaign or not identity
+            or binding.get("kind") != "inline_producer_binding_v1"
+            or binding.get("cycle_id") != cycle_id
+            or binding.get("campaign_id") != record.get("campaign_id")
+            or binding.get("campaign_key") != campaign.get("key")
+            or binding.get("producer_id") != record.get("producer_id")
+            or binding.get("artifact_root_id") != identity.artifact_root_id
+            or binding.get("route_hash") != route.get("route_hash")
+            or binding.get("cycle_record_digest") != dispatch_terminal_commit.cycle_identity_digest(record)
+            or not binding.get("inline_finish_id")
+            or not binding.get("terminal_marker_digest")
+            or not binding.get("evidence_sha256")):
+        raise ProducerError("inline-producer-binding-mismatch", cycle_id)
+    admission = cycle_route_admission(
+        root, record, route, finalize=True, validation_only=record.get("state") == "sealed")
+    if not admission.allow:
+        raise ProducerError(admission.reason or "inline-producer-binding-mismatch", admission.detail)
+    import inline_finish
+    finish = inline_finish.pending_state(root, route_id)
+    intent = (finish or {}).get("intent") or {}
+    if (not finish or finish.get("inline_finish_id") != binding["inline_finish_id"]
+            or finish.get("terminal_marker_digest") != binding["terminal_marker_digest"]
+            or intent.get("route_id") != route_id
+            or intent.get("route_hash") != binding["route_hash"]
+            or intent.get("cycle_id") != cycle_id
+            or intent.get("campaign_id") != record["campaign_id"]
+            or intent.get("campaign_key") != campaign["key"]
+            or intent.get("producer_id") != record["producer_id"]
+            or intent.get("artifact_root_id") != identity.artifact_root_id
+            or intent.get("evidence_sha256") != binding["evidence_sha256"]):
+        raise ProducerError("inline-producer-binding-mismatch", "finish-intent")
+
+
 def resolve_cycle_manifest_route(root: Path, record: Mapping[str, Any],
                                  document: Mapping[str, Any]) -> Tuple[Path, Dict[str, Any]]:
     """Resolve and read-only admit the one route sealed by a cycle manifest.
@@ -3746,6 +3801,22 @@ def finalize(
         return payload
 
     try:
+        if (expected_binding and isinstance(expected_binding, Mapping)
+                and expected_binding.get("kind") == "inline_producer_binding_v1"):
+            # The admission mutex is held. Check the actual route's verified
+            # lineage, including valid continuations of the begin route.
+            _inline_producer_binding_check(root, cycle_id, expected_binding)
+        import inline_finish
+        finish = inline_finish.pending_for_cycle(root, cycle_id)
+        if finish and finish.get("state") != "finished":
+            permitted = (
+                isinstance(expected_binding, Mapping)
+                and expected_binding.get("kind") == "inline_producer_binding_v1"
+                and expected_binding.get("inline_finish_id") == finish.get("inline_finish_id")
+                and finish.get("state") == "route-closed"
+            )
+            if not permitted:
+                raise ProducerError("finish-in-progress", cycle_id)
         if _recovery_scope == "root":
             pre = read_cycle_record(root, cycle_id)
             sweep = _recover_locked(root, now=now,
@@ -3913,6 +3984,8 @@ def finalize(
                 document, content_root=directory,
                 route_file=route_lineage.canonical_route_path(root, route["route_id"]),
                 publication=publication, expected_root_id=identity.artifact_root_id if identity else None,
+                inline_finish_id=(expected_binding.get("inline_finish_id")
+                                  if isinstance(expected_binding, Mapping) else None),
             )
             if not completion.ok:
                 raise ProducerError(
@@ -4000,7 +4073,8 @@ def _recover_exact_cycle_locked(root: Path, cycle_id: str, expected_binding: Opt
         manifest_route_file, _manifest_route = resolve_cycle_manifest_route(root, record, document)
         completion = artifact_lifecycle.evaluate_cycle_completion(
             document, content_root=directory, route_file=manifest_route_file,
-            expected_root_id=identity.artifact_root_id if identity else None)
+            expected_root_id=identity.artifact_root_id if identity else None,
+            inline_finish_id=expected_binding.get("inline_finish_id") if isinstance(expected_binding, Mapping) else None)
         if not completion.ok:
             raise ProducerError("completion-rejected", ";".join(v.code for v in completion.reasons))
         _commit_sealed(root, record, document, journal["manifest_digest"], now=now)
@@ -4065,7 +4139,9 @@ def _verify_sealed_cycle_locked(root: Path, record: Mapping[str, Any],
     if document.get("cycle", {}).get("state") == "completed":
         completion = artifact_lifecycle.evaluate_cycle_completion(
             document, content_root=directory, route_file=manifest_route_file,
-            expected_root_id=identity.artifact_root_id if identity else None)
+            expected_root_id=identity.artifact_root_id if identity else None,
+            inline_finish_id=(expected_binding.get("inline_finish_id")
+                              if isinstance(expected_binding, Mapping) else None))
         if not completion.ok:
             raise ProducerError("already-sealed-mismatch", "completion-evidence")
     return {"status": "already-sealed", "cycle_id": record["cycle_id"], "manifest_digest": digest}
@@ -4075,6 +4151,10 @@ def finalize_exact_cycle(root: Path, *, cycle_id: str, expected_binding: Mapping
                          state: str = "completed", **kwargs: Any) -> Dict[str, Any]:
     """Finalize one bound cycle under one admission lock, without root recovery."""
     root = Path(root).resolve()
+    if expected_binding.get("kind") == "inline_producer_binding_v1":
+        # Fast refusal before entering finalize; finalize repeats this *under*
+        # its admission lock, so this precheck grants no write authority.
+        _inline_producer_binding_check(root, cycle_id, expected_binding)
     _authorize_active_cleanup(root, "finalize-forward-recovery", root, cycle_id)
     # Enter public finalize with no lock held. It owns the one admission
     # boundary encompassing exact recovery, lease check and manifest commit.
@@ -4087,6 +4167,8 @@ def verify_finalized_cycle(root: Path, *, cycle_id: str, expected_binding: Mappi
     root = Path(root).resolve()
     lock_fd = artifact_admission._acquire_lock(root, artifact_admission.LOCK_TIMEOUT_DEFAULT)
     try:
+        if expected_binding.get("kind") == "inline_producer_binding_v1":
+            _inline_producer_binding_check(root, cycle_id, expected_binding)
         if _live_review_lease(root, cycle_id) is not None:
             raise ProducerError("cycle-finalize-blocked-live-review", cycle_id)
         record = read_cycle_record(root, cycle_id)
@@ -5011,6 +5093,25 @@ def check_write(root: Path, target: Path) -> Dict[str, Any]:
     if top == "shared":
         return {**base, "verdict": "deny", "reason": "shared-revision-immutable", "layout": "shared"}
     if top == "campaigns":
+        try:
+            locator_mapping, _rows = artifact_locator.scan_index(root)
+            target_resolved = Path(target).resolve(strict=False)
+            campaign_parts = rel.split("/")
+            if len(campaign_parts) >= 3:
+                cycle_relative = "/".join(campaign_parts[:3])
+                cycle_id = next((identifier for identifier, path in locator_mapping.items()
+                                 if path == cycle_relative), None)
+                cycle_record = read_cycle_record(root, cycle_id) if cycle_id else None
+                if cycle_record:
+                    import inline_finish
+                    pending = inline_finish.pending_for_cycle(root, cycle_id)
+                    if pending and pending.get("state") != "finished":
+                        return {**base, "verdict":"deny", "reason":"finish-in-progress",
+                                "layout":"cycle", "cycle_id":cycle_id}
+        except ProducerError as exc:
+            return {**base, "verdict":"deny", "reason":exc.code, "detail":exc.detail, "layout":"cycle"}
+        except (OSError, ValueError) as exc:
+            return {**base, "verdict":"deny", "reason":"finish-state-unreadable", "detail":str(exc), "layout":"cycle"}
         try:
             require_cycle_output(
                 root, target, cycle_id=os.environ.get("AGENT_ARTIFACT_CYCLE_ID"),

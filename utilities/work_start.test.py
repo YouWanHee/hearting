@@ -581,6 +581,23 @@ class WorkStartTest(unittest.TestCase):
         self.path.with_suffix(".outcome.json").write_text(json.dumps(outcome))
         self.assertEqual(self.start()["reason"], "route-closed-unproven")
 
+    def test_direct_start_replay_is_fenced_while_inline_finish_is_pending(self):
+        import artifact_producer
+        import inline_finish
+        pending = {"schema": "inline_finish_v1", "inline_finish_id": "deadbeef",
+                   "state": "node-completed", "intent": {"route_id": self.route["route_id"]}}
+        with mock.patch.object(inline_finish, "pending_state", return_value=pending), \
+             mock.patch.object(artifact_producer, "prepare_route_artifact_env",
+                               side_effect=AssertionError("must not resume preparation")):
+            for intensity in ("direct", "standard"):
+                self.route["effective_intensity"] = intensity
+                result = self.start()
+                self.assertEqual(result["state"], "needs-attention", result)
+                self.assertEqual(result["reason"], "finish-pending")
+                self.assertEqual(result["required_action"], "resume-inline-finish")
+                self.assertEqual(result["finish_state"], "node-completed")
+        self.assertEqual(self.calls, [])
+
     def test_closed_runtime_owner_requires_complete_settlement(self):
         import dispatch_terminal_commit as terminal
         outcome = {"route_id": self.route["route_id"], "route_hash": self.route["route_hash"],

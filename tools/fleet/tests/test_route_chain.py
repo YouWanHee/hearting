@@ -671,6 +671,23 @@ class RouteOutcomeLoaderTest(unittest.TestCase):
         route_file = os.path.join(self.tmp, "rt-1.json")
         self.assertEqual(route.load_outcome(route_file), {"present": False})
 
+    def test_live_inline_finish_intent_overrides_closed_outcome_to_pending(self):
+        route_file = self._write("rt-pending.json", {
+            "route_id": "rt-pending", "route_hash": "hash-pending",
+            "artifact_root": self.tmp,
+        })
+        with open(os.path.join(self.tmp, "rt-pending.outcome.json"), "w") as fh:
+            json.dump({"terminal_gate_proven": True, "route_id": "rt-pending",
+                       "route_hash": "hash-pending"}, fh)
+        sys.path.insert(0, os.path.join(_TOOLS_DIR, "..", "utilities"))
+        import inline_finish
+        with mock.patch.object(inline_finish, "pending_state", return_value={
+                "schema": "inline_finish_v1", "state": "route-closed"}):
+            result = route.load_outcome(route_file, expect_id="rt-pending", expect_hash="hash-pending")
+        self.assertTrue(result["finish_pending"])
+        self.assertEqual(result["finish_state"], "route-closed")
+        self.assertFalse(result["terminal_gate_proven"])
+
     def test_present_true_false_and_absent(self):
         route_file = self._write("rt-2.json", {})
         outcome_path = os.path.join(self.tmp, "rt-2.outcome.json")
