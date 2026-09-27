@@ -1,1 +1,0 @@
-../../../hooks/builtin-memory-guard.sh

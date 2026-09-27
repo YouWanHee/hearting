@@ -374,8 +374,8 @@ def peer_notice(payload: dict[str, Any], current_prompt: str, current_cwd: str) 
 def main() -> int:
     payload = load_payload()
     # Dispatch prompts carry their own explicit status/prompt-signal/mode
-    # bootstrap. Main-only briefing, token context, and turn-nudge would be
-    # duplicate context and can recursively create model work (D-42).
+    # bootstrap. Main-only briefing and token context would be duplicate
+    # context and can recursively create model work (D-42).
     if is_worker_session():
         return 0
     current_cwd = cwd(payload)
@@ -407,7 +407,6 @@ def main() -> int:
     # Phase 1 token self-regulation is transition-only. Normal, unknown,
     # native-owned, and repeated bands return an empty string (zero injection).
     parts.append(token_budget_context(current_cwd, sid))
-    run_preflight("turn-nudge", current_cwd, sid)
     emit_context("UserPromptSubmit", parts)
     return 0
 

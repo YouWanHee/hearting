@@ -52,8 +52,6 @@ The `static` axis lints the live repository deterministically without a user tur
 | `g4_spec_gate` | Spec-backed edits actually read the PRD and emit the hook verdict | Grounding marker exists and transcript contains `spec-significance:` |
 | `g5_artifact_guard` | A spec request stays on the canonical artifact root | No shadow `.claude_reports`/`.agent_reports` directory created outside the repo's canonical root (`g5b` covers the `.agent_reports` variant) |
 | `g6_worktree_dispatch` | A multi-file feature uses worktree isolation and headless dispatch under §5.10 | `main` ref and working tree unchanged; warn on worktree-only in-process half-application |
-| `mem_builtin_guard` | Direct writes to built-in file memory are hard-blocked under §0.5 | No built-in memory file created |
-| `mem_distill_e2e` | Real auto-distillation wiring dispatches a worker and writes an isolated store record plus marker | Marker advances; non-Claude adapters skip this Claude-specific case |
 | `a_postedit_spec_sync` | A small direct code edit that makes the spec stale updates code and PRD together | Both code and PRD contain 50; stale 30 is absent |
 | `g7_skill_conformance` | Skill-design rules: body under 500 lines, one-depth references, invocation frontmatter | Both Claude trees pass; 13 parent-invoked entries use `disable_model=false`, user-only entries use `true`, and failure controls work |
 

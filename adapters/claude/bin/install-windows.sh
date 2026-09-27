@@ -83,9 +83,9 @@ canon = json.load(open(canon_p, encoding='utf-8'))
 run = json.load(open(run_p, encoding='utf-8')) if os.path.exists(run_p) else {}
 run['hooks'] = canon['hooks']
 run['statusLine'] = canon['statusLine']
+run.setdefault('autoMemoryEnabled', canon.get('autoMemoryEnabled', False))  # D-79: user value wins, else off
 env = dict(canon.get('env', {}))
 env.update(run.get('env', {}))          # existing runtime env wins over canonical
-env.setdefault('MEM_DISTILL_ENABLE', '1')
 env['HOME'] = home                        # real %USERPROFILE% so $HOME/.claude resolves
 env['CLAUDE_HOME'] = cdir
 env['AGENT_HOME'] = cdir

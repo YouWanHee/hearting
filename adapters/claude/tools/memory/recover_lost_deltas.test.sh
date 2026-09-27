@@ -1,1 +1,0 @@
-../../../../tools/memory/recover_lost_deltas.test.sh

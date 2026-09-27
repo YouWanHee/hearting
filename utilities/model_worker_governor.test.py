@@ -1232,16 +1232,16 @@ class StartBudgetClassPoolTest(unittest.TestCase):
     def test_each_background_class_has_its_own_pool(self):
         self.assertEqual(
             GOVERNOR.CLASS_START_BUDGETS,
-            {"dispatch": 20, "title": 12, "distill": 4, "loop": 4},
+            {"dispatch": 20, "title": 12, "loop": 4},
         )
         with self._uncapped(), tempfile.TemporaryDirectory() as temp_dir:
-            for worker_class in ("distill", "loop"):
+            for worker_class in ("loop",):
                 for _ in range(GOVERNOR.CLASS_START_BUDGETS[worker_class]):
                     token = GOVERNOR.acquire(temp_dir, worker_class)
                     GOVERNOR.release(temp_dir, token)
                 with self.assertRaisesRegex(ValueError, "start budget"):
                     GOVERNOR.acquire(temp_dir, worker_class)
-            # Exhausting distill and loop leaves title and dispatch untouched.
+            # Exhausting loop leaves title and dispatch untouched.
             for worker_class in ("title", "dispatch"):
                 token = GOVERNOR.acquire(temp_dir, worker_class)
                 GOVERNOR.release(temp_dir, token)

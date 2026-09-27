@@ -1,1 +1,0 @@
-../../../hooks/mem-periodic-curate.test.sh

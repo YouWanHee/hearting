@@ -1,1 +1,0 @@
-../../../../../../loops/drill/cases/mem_builtin_guard/prompt.md

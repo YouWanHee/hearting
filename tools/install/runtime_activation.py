@@ -44,7 +44,7 @@ import user_model_config
 RUNTIMES = ("claude", "codex", "opencode")
 MODES = ("linked", "packaged")
 SCHEMA = 2
-CLAUDE_MANAGED_ENV_KEYS = ("MEM_DISTILL_ENABLE",)
+CLAUDE_MANAGED_ENV_KEYS: tuple = ()
 CLAUDE_STATUSLINE_COMMAND = "bash $HOME/.claude/statusline.sh"
 
 SESSION_ACTIONS = {
@@ -1280,16 +1280,24 @@ def _claude_managed_values(source: dict) -> dict:
         )
     ):
         raise ActivationError("Claude settings source has no valid statusLine command")
-    source_env = source.get("env")
-    if not isinstance(source_env, dict):
-        raise ActivationError("Claude settings source has no env object")
+    auto_memory_enabled = source.get("autoMemoryEnabled")
+    if not isinstance(auto_memory_enabled, bool):
+        raise ActivationError("Claude settings source has no valid autoMemoryEnabled")
     managed_env = {}
-    for key in CLAUDE_MANAGED_ENV_KEYS:
-        value = source_env.get(key)
-        if not isinstance(value, str):
-            raise ActivationError(f"Claude settings source has no valid env.{key}")
-        managed_env[key] = value
-    return {"statusLine": statusline, "env": managed_env}
+    if CLAUDE_MANAGED_ENV_KEYS:
+        source_env = source.get("env")
+        if not isinstance(source_env, dict):
+            raise ActivationError("Claude settings source has no env object")
+        for key in CLAUDE_MANAGED_ENV_KEYS:
+            value = source_env.get(key)
+            if not isinstance(value, str):
+                raise ActivationError(f"Claude settings source has no valid env.{key}")
+            managed_env[key] = value
+    return {
+        "statusLine": statusline,
+        "autoMemoryEnabled": auto_memory_enabled,
+        "env": managed_env,
+    }
 
 
 def _merge_claude_settings(
@@ -1373,17 +1381,46 @@ def _merge_claude_settings(
     else:
         conflicts.append("statusLine")
 
-    current_env = data.get("env", missing_value)
-    if current_env is missing_value:
-        current_env = {}
-        data["env"] = current_env
-        changed = True
-    if not isinstance(current_env, dict):
-        conflicts.append("env")
+    desired_auto_memory = desired_values["autoMemoryEnabled"]
+    current_auto_memory = data.get("autoMemoryEnabled", missing_value)
+    previous_auto_memory = previous_values.get("autoMemoryEnabled", missing_value)
+    if (
+        current_auto_memory is missing_value
+        or current_auto_memory == desired_auto_memory
+        or (
+            previous_auto_memory is not missing_value
+            and current_auto_memory == previous_auto_memory
+        )
+    ):
+        if current_auto_memory != desired_auto_memory:
+            data["autoMemoryEnabled"] = desired_auto_memory
+            changed = True
+        managed_values["autoMemoryEnabled"] = desired_auto_memory
     else:
-        previous_env = previous_values.get("env", {})
-        if not isinstance(previous_env, dict):
-            previous_env = {}
+        conflicts.append("autoMemoryEnabled")
+
+    previous_env = previous_values.get("env", {})
+    if not isinstance(previous_env, dict):
+        previous_env = {}
+    # A key a prior release managed but this one no longer does: drop it only
+    # if the user never changed it away from the value that release set,
+    # mirroring the exact-match hook-entry retirement above.
+    retired_env = {
+        key: value for key, value in previous_env.items()
+        if key not in desired_values["env"]
+    }
+    current_env = data.get("env", missing_value)
+    needs_env_object = bool(desired_values["env"]) or bool(retired_env)
+    if current_env is missing_value:
+        if needs_env_object:
+            current_env = {}
+            data["env"] = current_env
+            changed = True
+    elif not isinstance(current_env, dict):
+        if needs_env_object:
+            conflicts.append("env")
+        current_env = None
+    if isinstance(current_env, dict):
         for key, desired_value in desired_values["env"].items():
             current_value = current_env.get(key, missing_value)
             previous_value = previous_env.get(key, missing_value)
@@ -1399,6 +1436,15 @@ def _merge_claude_settings(
                     current_env[key] = desired_value
                     changed = True
                 managed_values["env"][key] = desired_value
+            else:
+                conflicts.append(f"env.{key}")
+        for key, previous_value in retired_env.items():
+            current_value = current_env.get(key, missing_value)
+            if current_value is missing_value:
+                continue
+            if current_value == previous_value:
+                del current_env[key]
+                changed = True
             else:
                 conflicts.append(f"env.{key}")
 
@@ -1449,17 +1495,22 @@ def _claude_settings_health(
         missing = True
     elif config["statusLine"] != desired_values["statusLine"]:
         conflicts.append("statusLine")
-    actual_env = config.get("env")
-    if "env" not in config:
+    if "autoMemoryEnabled" not in config:
         missing = True
-    elif not isinstance(actual_env, dict):
-        conflicts.append("env")
-    else:
-        for key, value in desired_values["env"].items():
-            if key not in actual_env:
-                missing = True
-            elif actual_env[key] != value:
-                conflicts.append(f"env.{key}")
+    elif config["autoMemoryEnabled"] != desired_values["autoMemoryEnabled"]:
+        conflicts.append("autoMemoryEnabled")
+    if desired_values["env"]:
+        actual_env = config.get("env")
+        if "env" not in config:
+            missing = True
+        elif not isinstance(actual_env, dict):
+            conflicts.append("env")
+        else:
+            for key, value in desired_values["env"].items():
+                if key not in actual_env:
+                    missing = True
+                elif actual_env[key] != value:
+                    conflicts.append(f"env.{key}")
 
     statusline = paths.runtime_home("claude", scope) / "statusline.sh"
     if not statusline.is_file() or not os.access(statusline, os.X_OK):

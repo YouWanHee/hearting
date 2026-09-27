@@ -195,7 +195,7 @@ export MEM_STORE="$STORE3"
 # ---------------------------------------------------------------- repair 3
 echo "== repair 3: dump commits are plain (non-amend) and failures warn =="
 STORE5="$TMP/store-dump"; mkdir -p "$STORE5"; export MEM_STORE="$STORE5"
-export MEM_PROJECTS="$TMP/no-projects"   # hermetic: no live auto-memory absorbs
+export MEM_PROJECTS="$TMP/no-projects"   # hermetic: sync no longer absorbs auto-memory anyway (D-79)
 git -C "$STORE5" init -q
 git -C "$STORE5" config user.email mem-test@example.invalid
 git -C "$STORE5" config user.name "mem test"

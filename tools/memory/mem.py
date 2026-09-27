@@ -2944,31 +2944,6 @@ def ingest_session(source):
         yield msg
 
 
-def distill(sid, advance=False, source_name="claude"):
-    """Print normalized messages after the marker and optionally advance it."""
-    if source_name == "codex":
-        source = CodexJsonlSource(sid)
-    elif source_name == "opencode":
-        source = OpenCodeExportSource(sid)
-    else:
-        source = ClaudeCodeJsonlSource(sid)
-    last_uuid = None
-    out = []
-    for msg in ingest_session(source):
-        # Track the last valid UUID across all records, including sidechains, so
-        # a trailing record without UUID cannot cause repeated distillation.
-        if msg.uuid is not None:
-            last_uuid = msg.uuid
-        if msg.is_sidechain or not (msg.text or "").strip():
-            continue
-        out.append(f"[{msg.role}] {msg.text}")
-    sys.stdout.write("\n\n".join(out))
-    if out:
-        sys.stdout.write("\n")
-    if advance and last_uuid:
-        advance_marker(sid, last_uuid)
-
-
 # ---------- export / import ----------
 def export_dump(target_path=None):
     """Export a deterministic, ID-sorted 16-column JSONL mirror."""
@@ -3397,10 +3372,11 @@ def cleanup_runtime_memory(apply=False, archive=None):
     return len(candidates)
 
 
-def migrate(apply=False, cleanup_native=False, cleanup_archive=None, all_projects=False):
+def migrate(apply=False, cleanup_native=False, cleanup_archive=None, all_projects=False,
+            absorb_auto_memory=True):
     print(f"# migrate  ({'APPLY' if apply else 'dry-run'}; "
           f"{'all projects' if all_projects else 'current project'})")
-    created, skipped = 0, 0
+    created, updated, skipped = 0, 0, 0
     current_key = project_key(Path.cwd(), seed=False)
 
     # Idempotency key: source values already present in the DB.
@@ -3410,48 +3386,80 @@ def migrate(apply=False, cleanup_native=False, cleanup_archive=None, all_project
             rows = con.execute(
                 "SELECT DISTINCT source FROM records WHERE source IS NOT NULL").fetchall()
             existing_src = {r[0] for r in rows}
+            existing_auto_bodies = {}
+            if absorb_auto_memory:
+                auto_rows = con.execute(
+                    "SELECT source, body FROM records "
+                    "WHERE source LIKE 'auto-memory:%' AND status='active'").fetchall()
+                existing_auto_bodies = {r[0]: r[1] for r in auto_rows}
         finally:
             con.close()
     else:
         existing_src = set()
+        existing_auto_bodies = {}
 
     # 1) auto-memory: projects/<cwd>/memory/*.md
     # Audit W3 fix (2026-07-22): absorbed records must carry the same canonical
     # project_key the recall/inject fence compares against — the encoded
     # session-store directory name is only the source-key namespace.
-    key_cache = {}
-    try:
-        for mp in PROJECTS.glob("*/memory/*.md"):
-            if mp.name == "MEMORY.md":
-                continue
-            project_ns = mp.parent.parent.name
-            cwd_origin = _canonical_cwd_key(project_ns, key_cache)
-            if not all_projects and cwd_origin != current_key:
-                continue
-            src = f"auto-memory:{mp.parent.parent.name}/{mp.name}"
-            if src in existing_src:
-                skipped += 1
-                continue
-            try:
-                meta, body = parse_record(mp.read_text(encoding="utf-8"))
-                rtype = meta.get("type", "project")
-                scope = "global" if rtype == "user" else "project"
-                if scope == "global" and not all_projects:
+    # D-79: routine `mem sync` no longer absorbs this channel (`absorb_auto_memory=False`);
+    # only an explicit `mem migrate` call recovers files left by a prior enabled period.
+    if absorb_auto_memory:
+        key_cache = {}
+        try:
+            for mp in PROJECTS.glob("*/memory/*.md"):
+                if mp.name == "MEMORY.md":
                     continue
-                if apply:
-                    write_record("durable", scope, rtype, body, cwd_origin=cwd_origin,
-                                 source=src, quiet=True, journal_action="add",
-                                 journal_insert_only=True, journal_actor="sync",
-                                 journal_cwd=_event_cwd(mp.parent.parent.name),
-                                 headline=meta.get("headline"), aliases=meta.get("aliases"),
-                                 entities=meta.get("entities"), topics=meta.get("topics"),
-                                 artifact_refs=meta.get("artifact_refs"))
-                created += 1
-            except Exception as e:
-                sys.stderr.write(f"[migrate] skip {mp}: {e}\n")
-                continue
-    except Exception as e:
-        sys.stderr.write(f"[migrate] auto-memory source failed; continuing: {e}\n")
+                project_ns = mp.parent.parent.name
+                cwd_origin = _canonical_cwd_key(project_ns, key_cache)
+                if not all_projects and cwd_origin != current_key:
+                    continue
+                src = f"auto-memory:{mp.parent.parent.name}/{mp.name}"
+                try:
+                    meta, body = parse_record(mp.read_text(encoding="utf-8"))
+                    rtype = meta.get("type", "project")
+                    scope = "global" if rtype == "user" else "project"
+                    if scope == "global" and not all_projects:
+                        continue
+                    if src in existing_auto_bodies:
+                        # A source already absorbed once may have been edited since;
+                        # re-upsert only when the body actually changed (D-79 gap: 63/261
+                        # absorbed files carried stale DB bodies on 2026-09-26).
+                        sanitized_body, _flags = sanitize(body)
+                        if existing_auto_bodies[src] == sanitized_body:
+                            skipped += 1
+                            continue
+                        if apply:
+                            write_record("durable", scope, rtype, body, cwd_origin=cwd_origin,
+                                         source=src, quiet=True, journal_action="update",
+                                         journal_insert_only=True, journal_actor="sync",
+                                         journal_cwd=_event_cwd(mp.parent.parent.name),
+                                         headline=meta.get("headline"), aliases=meta.get("aliases"),
+                                         entities=meta.get("entities"), topics=meta.get("topics"),
+                                         artifact_refs=meta.get("artifact_refs"))
+                        updated += 1
+                        continue
+                    if src in existing_src:
+                        # Seen before but no longer active (e.g. `mem supersede`
+                        # retired it): the file surviving on disk must not resurrect
+                        # it or fork a second row for the same source (review finding,
+                        # 2026-09-27) — preserve the retirement and skip.
+                        skipped += 1
+                        continue
+                    if apply:
+                        write_record("durable", scope, rtype, body, cwd_origin=cwd_origin,
+                                     source=src, quiet=True, journal_action="add",
+                                     journal_insert_only=True, journal_actor="sync",
+                                     journal_cwd=_event_cwd(mp.parent.parent.name),
+                                     headline=meta.get("headline"), aliases=meta.get("aliases"),
+                                     entities=meta.get("entities"), topics=meta.get("topics"),
+                                     artifact_refs=meta.get("artifact_refs"))
+                    created += 1
+                except Exception as e:
+                    sys.stderr.write(f"[migrate] skip {mp}: {e}\n")
+                    continue
+        except Exception as e:
+            sys.stderr.write(f"[migrate] auto-memory source failed; continuing: {e}\n")
 
     # 2) Post-its from the registry and current cwd.
     POST_SECT = {"Open Threads": "thread", "Decisions": "decision",
@@ -3570,7 +3578,8 @@ def migrate(apply=False, cleanup_native=False, cleanup_archive=None, all_project
     except Exception as e:
         sys.stderr.write(f"[migrate] Markdown source failed; continuing: {e}\n")
 
-    print(f"  → {'created' if apply else 'would create'} {created}; skipped existing {skipped}")
+    print(f"  → {'created' if apply else 'would create'} {created}; "
+          f"{'updated' if apply else 'would update'} {updated}; skipped existing {skipped}")
     if cleanup_native:
         if not all_projects:
             raise RuntimeError("runtime-memory cleanup requires --all-projects")
@@ -4327,7 +4336,7 @@ def _snap_label(body):
 
 
 def curate_snapshot():
-    """Build a read-only project memory snapshot for the session-end curator."""
+    """Build a read-only project memory snapshot for a manual curation pass."""
     if not DB.exists():
         print("=== END SNAPSHOT ===")
         return
@@ -4399,7 +4408,7 @@ def curate_snapshot():
 
 
 def curate_artifacts():
-    """Build read-only artifact state for the session-end curator."""
+    """Build read-only artifact state for a manual curation pass."""
     import subprocess
     cwd = Path.cwd()
 
@@ -5449,9 +5458,9 @@ def inject(max_working=None, max_durable=None, hook=False):
         else:
             omitted.append(f"profile {len(prof)}")
         _append_inject_line(entries, "")
-    # Informational cleanup signals are handled by the session-end curator.
+    # Informational cleanup signals; housekeeping is a manual pass (D-80).
     if cleanup_lines:
-        _append_inject_line(entries, "## 🧹 Cleanup signals (handled by the session-end curator)")
+        _append_inject_line(entries, "## 🧹 Cleanup signals (manual cleanup pass)")
         shown = 0
         for line in cleanup_lines[:cleanup_limit]:
             if line.startswith("- ") and bullet_count >= max_bullets:
@@ -5968,7 +5977,7 @@ def _sync_locked(json_output=False):
     }
     with contextlib.redirect_stdout(sink):
         try:
-            n = migrate(apply=True)
+            n = migrate(apply=True, absorb_auto_memory=False)
             phases["migrate"] = "ok"
         except Exception as e:
             phases["migrate"] = "failed"
@@ -8901,12 +8910,6 @@ def main():
     pf.add_argument("aspect", nargs="?", help="Stem '07_coding_convention', number '07', or alias 'coding'")
     pf.add_argument("--list", action="store_true", help="List available aspects with labels and body lengths")
 
-    ds = sub.add_parser("distill", help="Print normalized session text after the marker")
-    ds.add_argument("sid")
-    ds.add_argument("--source", choices=["claude", "codex", "opencode"], default=os.environ.get("MEM_SESSION_SOURCE", "claude"),
-                    help="session transcript adapter source")
-    ds.add_argument("--advance", action="store_true", help="Advance the marker to the last message UUID")
-
     sub.add_parser("orphans", help="Show unresolved cwd_origin values (read-only)")
 
     lg = sub.add_parser("log", help="Show the recent write-events journal tail")
@@ -9055,8 +9058,6 @@ def main():
         import_dump(args.path, recovery=args.recovery)
     elif args.cmd == "profile":
         profile(args.aspect, list_mode=args.list)
-    elif args.cmd == "distill":
-        distill(args.sid, advance=args.advance, source_name=args.source)
     elif args.cmd == "orphans":
         orphans()
     elif args.cmd == "log":

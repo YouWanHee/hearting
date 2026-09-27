@@ -8,7 +8,6 @@ set -u
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 MEM="$ROOT/tools/memory/mem.py"
-APPLIER="$ROOT/tools/memory/apply-distill-actions.py"
 [ -f "$MEM" ] || { echo "FAIL: mem.py not found at $MEM"; exit 1; }
 
 PASS=0; FAIL=0
@@ -231,17 +230,6 @@ MEM_DISTILL=1 MEM_ACTOR=curator python3 "$MEM" prune j_curate >/dev/null
 [ "$(last_event_field actor)" = curator ] \
   && ok "MEM_ACTOR=curator overrides MEM_DISTILL=1 → actor=curator" \
   || bad "curator override failed: $(last_event_field actor)"
-
-# apply-distill-actions.py --mode curate wires MEM_ACTOR=curator itself
-seed j_curate2 durable project note "$PKEY" 1 "$TODAY" "applier curator target"
-OUT="$WORKDIR/actions.jsonl"; SNAP="$WORKDIR/snap_ids.txt"
-printf '{"action":"prune","id":"j_curate2"}\n' > "$OUT"
-printf 'j_curate2\n' > "$SNAP"
-: > "$MEM_WRITE_EVENTS"
-MEM_DISTILL=1 python3 "$APPLIER" "$OUT" "$MEM" --mode curate --snapshot-ids "$SNAP" >/dev/null
-[ "$(last_event_field actor)" = curator ] \
-  && ok "apply-distill-actions.py --mode curate → actor=curator (env wiring)" \
-  || bad "applier curator wiring failed: $(events | tail -1)"
 
 # =====================================================================
 echo "== D-37: fail-open (저널 write 실패가 mutation을 막지 않음) =="
@@ -627,7 +615,7 @@ record_ids = {row[0] for row in con.execute("SELECT id FROM records")}
 fts_ids = {row[0] for row in con.execute("SELECT id FROM records_fts")}
 assert record_ids == fts_ids, (record_ids, fts_ids)
 dump_ids = {json.loads(line)["id"] for line in open(dump, encoding="utf-8") if line.strip()}
-assert dump_ids == record_ids and dump_ids, (dump_ids, record_ids)
+assert dump_ids == record_ids, (dump_ids, record_ids)
 print(f"fenced sync isolated DB/FTS/dump assertions: {len(record_ids)} record")
 con.close()
 PY
@@ -635,6 +623,39 @@ PY
     ok "fenced sync isolated dump and SQLite index mirrors are consistent"
   else
     bad "fenced sync isolated dump or SQLite index mirrors are inconsistent"
+  fi
+  # D-79: routine `mem sync` no longer absorbs built-in file memory, so the
+  # auto-memory fixture written above must still be absent from the store.
+  if [ -f "$SYNC_STORE/memory.db" ] && python3 - "$SYNC_STORE/memory.db" <<'PY'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+count = con.execute("SELECT COUNT(*) FROM records").fetchone()[0]
+con.close()
+sys.exit(0 if count == 0 else 1)
+PY
+  then
+    ok "fenced sync does not absorb built-in file memory (D-79)"
+  else
+    bad "fenced sync should not absorb built-in file memory"
+  fi
+  # An explicit `mem migrate --apply --all-projects` remains the recovery path
+  # for files a prior enabled period left behind (D-81.3).
+  if (
+    cd "$SYNC_ROOT"
+    run_checked env MEM_STORE="$SYNC_STORE" MEM_PROJECTS="$SYNC_PROJECTS" MEM_PROFILE="$SYNC_PROFILE" \
+      MEM_WRITE_EVENTS="$SYNC_JOURNAL" MEM_CWD="/wrong/repo" \
+      python3 "$MEM" migrate --apply --all-projects >/dev/null
+  ) && python3 - "$SYNC_STORE/memory.db" <<'PY'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+count = con.execute("SELECT COUNT(*) FROM records").fetchone()[0]
+con.close()
+sys.exit(0 if count == 1 else 1)
+PY
+  then
+    ok "explicit mem migrate --apply --all-projects absorbs built-in file memory"
+  else
+    bad "explicit mem migrate --apply --all-projects should absorb built-in file memory"
   fi
 fi
 # Two distinct post-it source keys with the same normalized body yield one INSERT event;
@@ -692,7 +713,9 @@ else
   bad "Fleet sample-note grouping assertion failed"
 fi
 
-# Existing source plus a sentinel journal row proves prospective-only/no-backfill.
+# Existing source plus a sentinel journal row proves the journal stays
+# prospective-only even though the D-79 gap fix now refreshes a stale body
+# in place (2026-09-26: absorbed files edited afterward kept the old DB body).
 NB_STORE="$ABSORB_TMP/no-backfill-store"; NB_PROJECTS="$ABSORB_TMP/no-backfill-projects"
 NB_PROFILE="$ABSORB_TMP/no-backfill-profile"; NB_ROOT="$ABSORB_TMP/no-backfill-root"
 NB_WRONG="$ABSORB_TMP/no-backfill-wrong"; mkdir -p "$NB_PROJECTS" "$NB_PROFILE" "$NB_ROOT" "$NB_WRONG"
@@ -740,15 +763,18 @@ if [ "$NB_MIGRATE_OK" = 1 ] && [ -f "$NB_JOURNAL" ] && [ "$(cat "$NB_JOURNAL")" 
   && python3 - "$NB_STORE/memory.db" "$NB_SOURCE" <<'PY'
 import sqlite3, sys
 con = sqlite3.connect(sys.argv[1])
-row = con.execute("SELECT source, body FROM records WHERE id='no_backfill'").fetchone()
-assert row == (sys.argv[2], "preexisting source must never be backfilled into the journal"), row
+row = con.execute("SELECT id, source, body FROM records WHERE source=?", (sys.argv[2],)).fetchone()
+# Same id/source (source-upsert, not a duplicate insert); body refreshed to the
+# live file content (D-79 gap fix) even though the row predates any migrate call.
+assert row == ("no_backfill", sys.argv[2],
+               "preexisting source must never be backfilled into the journal\n"), row
 print("no-backfill row/source preservation assertions: 2")
 con.close()
 PY
 then
-  ok "existing source preserves row/source and sentinel with no historical backfill"
+  ok "existing source refreshes its body in place, preserving id/source with no historical journal backfill"
 else
-  bad "existing source row/source or sentinel changed, or migrate failed"
+  bad "existing source id/source or sentinel changed, or migrate failed"
 fi
 
 # Global, undecodable, and invalid legacy sources omit cwd; valid legacy origin survives.

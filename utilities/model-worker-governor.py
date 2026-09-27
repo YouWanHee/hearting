@@ -103,19 +103,19 @@ def _local_return_proof(root: str | Path, token: str, lease: dict[str, Any]) -> 
 # Per-class concurrency caps. A `standard+` cycle occupies its dispatch-depth-1
 # owner plus every leg of its 2-4-way parallel group at once, so one cycle alone
 # holds 3-5 dispatch slots; the former cap of 5 made two concurrent standard+
-# cycles structurally impossible and starved the title/distill classes whenever
+# cycles structurally impossible and starved the title/loop classes whenever
 # dispatch filled the shared global cap.
-CLASS_LIMITS = {"dispatch": 8, "distill": 1, "title": 4, "loop": 2}
+CLASS_LIMITS = {"dispatch": 8, "title": 4, "loop": 2}
 START_WINDOW_SECONDS = 600
 DEFAULT_TOTAL_LIMIT = 12
 DEFAULT_START_BUDGET = 20
 # Separate rolling start budgets per class (per START_WINDOW_SECONDS). A cheap
-# background call (title refresh, memory distill, a loop tick) used to spend
-# the same rolling budget as an expensive dispatch launch, so a session with
-# several live dispatch children could starve every new dispatch admission on
-# their own periodic title updates alone. DEFAULT_START_BUDGET stays equal to
+# background call (title refresh, a loop tick) used to spend the same rolling
+# budget as an expensive dispatch launch, so a session with several live
+# dispatch children could starve every new dispatch admission on their own
+# periodic title updates alone. DEFAULT_START_BUDGET stays equal to
 # CLASS_START_BUDGETS["dispatch"] -- it is the same pool under its old name.
-CLASS_START_BUDGETS = {"dispatch": DEFAULT_START_BUDGET, "title": 12, "distill": 4, "loop": 4}
+CLASS_START_BUDGETS = {"dispatch": DEFAULT_START_BUDGET, "title": 12, "loop": 4}
 # Eight is the same "recent tail" size `status` already uses for
 # `identity_diagnostics` -- enough for an operator to see the last few
 # starts of a class without the receipt growing unbounded.

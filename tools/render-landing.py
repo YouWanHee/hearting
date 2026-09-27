@@ -746,7 +746,6 @@ ARTIFACT_RULES = [
 # What each hard guard denies, read from the hook scripts' own header contracts.
 GUARD_NOTE = {
     "artifact-guard": "writes outside the canonical artifact root",
-    "builtin-memory-guard": "direct writes to built-in file memory",
     "core-first-guard": "adapter edits before the core contract is read",
     "git-state-guard": "edits during a merge, rebase, or cherry-pick",
     "spec-skill-gate": "a spec-changing Skill with no current spec read",
@@ -759,8 +758,8 @@ MEMORY_STEPS = [
      "main-session mutation is gated on it, so retrieval can't be silently skipped."),
     ("Agent-owned recall", "No score threshold adopts a hit. The agent reads the full record by "
      "ID, then cross-checks it against live code."),
-    ("Session distillation", "SessionEnd dispatches a no-tools distiller. Automatic writes declare "
-     "one purpose: decision, user-correction, unresolved-obligation, or artifact-pointer."),
+    ("Agent-declared purpose", "There is no automatic distiller. Writes the main session decides "
+     "to make declare one purpose: decision, user-correction, unresolved-obligation, or artifact-pointer."),
     ("Supersede, never delete", "Changed decisions are superseded — one active canonical path, "
      "full history auditable, deleted rows recoverable from the graveyard."),
     ("Pending protection", "Handoffs stay <code>pending</code> until an explicit consume; prune, "
@@ -1075,7 +1074,7 @@ def build_canvas(d: dict) -> str:
               <div class="rd">Runs alongside every layer to the right — the agent decides what
               matters, the code owns the mechanics.</div>
               <div class="spine">{memory}</div>
-              <div class="rfoot">Workers are exempt: no probe, no inject, no distill, no sync.</div>
+              <div class="rfoot">Workers are exempt: no probe, no inject, no sync.</div>
             </div></div>
           </div>
         </div>
@@ -1580,8 +1579,8 @@ def render_index(d: dict) -> str:
           receipt that material work is gated on.</li>
           <li><b>No classifier decides for you</b> — code owns scope fences and limits; the agent
           reads the full record and judges relevance.</li>
-          <li><b>Sessions distill themselves</b> — a no-tools distiller writes purpose-labelled
-          records at session end. No manual “remember this”.</li>
+          <li><b>The agent writes, not a background process</b> — no automatic distiller; every
+          write declares its purpose in the moment it's made.</li>
           <li><b>History is never lost</b> — supersede over delete, a graveyard for restores, and
           pending handoffs that fail closed until consumed.</li>
         </ul>

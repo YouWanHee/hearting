@@ -24,7 +24,7 @@ source.
 | Local serving truth | `${XDG_DATA_HOME:-$HOME/.local/share}/hearting/memory/memory.db` (SQLite WAL; existing `<agent-home>/memory` remains compatible) | ignored binary; never exchanged | semantic records, transactional outbox/applied/frontier/conflict state, local replica identity and counter, peer/migration evidence, graveyard, and rebuildable indexes |
 | Immutable exchange | Bare repository at `${XDG_STATE_HOME:-$HOME/.local/state}/hearting/memory-sync/exchange`; Git tree path `protocol/v2/ops/<prefix>/<op_id>.json` | private dedicated Git repository, never checked out | canonical operation objects only; one semantic transaction per immutable path |
 | Compatibility projection | `<memory-store>/dump.jsonl` (one ID-sorted record per line) | optionally tracked for old readers | materialized v1-compatible view; never a routine v2 push/fold input and not a complete v2 recovery source |
-| Harness projection | `<agent-home>/projects/<cwd>/memory/` | ignored | compatibility surface for stray auto-memory writes absorbed by `mem sync`; `mem project` can rebuild the projection |
+| Harness projection | `<agent-home>/projects/<cwd>/memory/` | ignored | built-in file memory, disabled by default (D-79); `mem migrate --all-projects` is the one-time recovery path for files a prior enabled period left behind, and `mem project` can rebuild the projection |
 
 Keep `memory.db` on a local filesystem. `MEM_SYNC_DIR` may choose another
 absolute private exchange repository, but its real path must remain outside all
@@ -83,14 +83,13 @@ python3 <agent-home>/tools/memory/mem.py <command>
 | `log [--limit 20] [--action] [--tier] [--actor] [--json]` | Read the bounded write-event timeline (D-38), complementing the `stats` snapshot. |
 | `doctor` | Run bounded read-only local and v2 protocol checks covering integrity, schema/index invariants, pending/capacity/graveyard/dump consistency, outbox/peer/migration state, and worker health. Exit 0 is clean, 1 is WARN, and 2 is FAIL. |
 | `inject [--hook]` | Build bounded SessionStart context from working, durable, and profile records. Defaults to 2,000 characters and 15 bullets; `--hook` emits `additionalContext` JSON. |
-| `sync [--json]` | Absorb only current-project stray projection writes, rebuild indexes, and write the compatibility projection. With remote sync explicitly enabled, finalize/render/fetch/validate/integrate/fold/export/push/fresh-confirm immutable operations. `--json` emits the versioned status and phase outcomes described below. |
+| `sync [--json]` | Run lifecycle maintenance, rebuild indexes, and write the compatibility projection. Does not absorb built-in file memory (D-79). With remote sync explicitly enabled, finalize/render/fetch/validate/integrate/fold/export/push/fresh-confirm immutable operations. `--json` emits the versioned status and phase outcomes described below. |
 | `conflicts` | List bounded unresolved conflict identities without adopting a provisional body. |
 | `show-conflict <id>` | Show every full concurrent variant with explicit labels. |
 | `resolve <id> …` | Create a new agent-authored operation that descends every current maximal head; field-wise automatic semantic merge is forbidden. |
 | `replica status [--json]` | Show the active replica counter and whether copied-state detection requires rotation; install-secret bytes are never printed. |
 | `replica rotate --reason <text>` | Explicitly start a new replica-ID boundary after copying/moving local state. Existing operation IDs and predecessor history are preserved. |
 | `maintenance [--squash-days 14] [--apply]` | Compatibility-only operator maintenance for a separately tracked legacy dump history. It is not v2 operation compaction and is never run or pushed by routine sync. |
-| `distill <sid> [--advance]` | Print normalized transcript text after the shared session marker and optionally advance that marker. |
 | `curate-snapshot` | Print a read-only current-project snapshot, mechanical signals, and destructive `IDS:` membership. Pending records appear under `PROTECTED PENDING` but never in destructive IDs. |
 | `curate-artifacts` | Print read-only git, plan, and spec evidence for the curator agent. |
 | `promote-candidates` | Print a bounded view of visible durable records for agent-owned institutionalization review. Type and strength are metadata, not semantic gates. |
@@ -220,18 +219,19 @@ v2 operation/tombstone compaction and physical deletion are unsupported.
 
 ## Curator safety invariant (D-18/D-35/D-40)
 
-The distiller model never invokes mutation commands directly. Automatic adds
-must declare one of `decision`, `user-correction`, `unresolved-obligation`, or
-`artifact-pointer`; the latter requires `artifact_refs` and must not duplicate
-artifact prose. A no-tools worker
-emits action JSON, and `tools/memory/apply-distill-actions.py` parses the shape,
-checks snapshot membership, and calls `mem.py` with argv-only values. Each
-command also enforces its own project whitelist. Pending records are protected
-both in snapshot membership and through a transaction-time DB check. Prune,
-merge, and delete retain recoverable graveyard data.
+There is no automatic distiller (D-78): the main session decides in the moment
+what to write, and any write it makes must declare one of `decision`,
+`user-correction`, `unresolved-obligation`, or `artifact-pointer`; the latter
+requires `artifact_refs` and must not duplicate artifact prose. Guarded
+mutation commands (merge/prune/supersede/delete/restore) are called directly by
+the acting agent — main session or a manual cleanup pass (D-80) — after reading
+`curate-snapshot`. Each command enforces its own project whitelist. Pending
+records are protected both in snapshot membership and through a
+transaction-time DB check. Prune, merge, and delete retain recoverable
+graveyard data.
 
-These safeguards validate operations; they do not decide meaning. Main agents,
-distillers, and curators make contextual decisions about whether any action is
+These safeguards validate operations; they do not decide meaning. Main agents
+and manual cleanup passes make contextual decisions about whether any action is
 useful. Keyword lists, fixed phrases, content categories, record types, scores,
 and confidence thresholds never substitute for that judgment.
 
@@ -308,14 +308,8 @@ store; `harness memory status` reports the recorded policy.
   `MEM_INJECT_CLEANUP_LINES`, and `MEM_INJECT_SNIPPET_CHARS` tune bounded
   injection budgets. Defaults are 2,000 characters, 15 bullets, 8 working,
   4 durable, 2 cleanup lines, and 100 characters per snippet.
-- `MEM_DISTILL_ENABLE=1` enables background distillation. It is opt-in because
-  it spends model capacity and sends potentially untrusted transcript data to
-  a no-tools worker. Adapter-native settings own runtime enablement.
-- `MEM_DISTILL=1` prevents recursive distillation lifecycle launches.
-- `MEM_DISTILL_WORKER` selects an adapter-owned executable with contract
-  `<worker> <mode> <model> <prompt-file>` and JSON-lines stdout.
-- `MEM_DISTILL_MODEL` selects the portable model role; concrete defaults belong
-  to adapter realization documents.
+- `MEM_DISTILL=1` remains a recognized D-42 worker marker for compatibility,
+  even though there is no automatic distiller to guard against (D-78).
 - `MEM_WRITE_EVENTS`, `MEM_ACTOR`, and `MEM_SID` override telemetry metadata.
 - `mem-recall-inject.sh` is the fail-open prompt bridge for `mem candidates`.
   It exposes only active current-project/global capsule headlines and IDs (at
@@ -339,8 +333,7 @@ store; `harness memory status` reports the recorded policy.
   local backup or a separate lossless v2 bundle.
 - SessionStart injection may remain adapter opt-in when start events repeat on
   resume or compact. SessionEnd uses `mem sync`; adapters pass the user's remote
-  opt-in environment unchanged, report the bounded sync exit class, and still
-  run their bounded curator fallback before returning a nonzero sync status.
+  opt-in environment unchanged and report the sync exit class plainly.
 - `recall.sh` is a thin wrapper over explicit `mem recall`.
 - `register-postit` and `.postit-roots` exist only for legacy Markdown migration.
 

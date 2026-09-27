@@ -83,7 +83,7 @@ Portable capability specs refer to this as the runtime design harness. The
 Claude adapter owns the concrete MCP command, `~/.claude/tools/design-mcp`
 runtime path, and any Claude-specific preview/screenshot/console wiring.
 
-## Memory Distiller Realization
+## Memory Realization
 
 Claude `UserPromptSubmit` first runs the portable `mem-recall-inject.sh` bridge.
 It emits `hookSpecificOutput.additionalContext` only for bounded active
@@ -107,26 +107,12 @@ case is why a per-prompt registration was defensible, and it is the one thing
 the start event already covers. Off the prompt path the block costs ~360 tokens
 once per session instead of once per turn.
 
-Claude Code realizes the portable memory distillation hooks through
-`adapters/claude/settings.json` hook registration and concrete hook scripts under
-`adapters/claude/hooks/`.
-
-The current Claude distiller mapping is:
-
-| Portable worker role | Claude realization |
-|---|---|
-| `fast distiller` / turn-counter add-only worker | `adapters/claude/bin/mem-distill-worker.sh` maps `fast-distiller` to the mini lifecycle tier declared in `adapters/claude/config/models.conf` |
-| `deep curator` / SessionEnd action worker | `adapters/claude/bin/mem-distill-worker.sh` maps `deep-curator` to the curate lifecycle tier (light) declared in `adapters/claude/config/models.conf` |
-
-`hooks/mem-distill-dispatch.sh` keeps the existing Claude behavior: opt-in via
-`MEM_DISTILL_ENABLE=1`, recursion guard through `MEM_DISTILL=1`, no-tools output
-contract through the Claude worker's `--disallowedTools`, JSON/action validation
-in shell/Python code, and `mem` CLI as the only DB mutation path. The shared
-dispatcher contract is `MEM_DISTILL_WORKER=<executable>` with
-`<mode> <model> <prompt-file>` arguments; this adapter sets that executable to
-the Claude worker when using the shared dispatcher. Other adapters must provide
-their own transcript source and worker invocation or explicitly keep automatic
-distillation unsupported.
+There is no automatic distiller (D-78). Claude's built-in file memory is
+disabled via the top-level `"autoMemoryEnabled": false` setting in
+`adapters/claude/settings.json`; SessionEnd keeps running `mem sync` through
+`adapters/claude/settings.json` hook registration and concrete hook scripts
+under `adapters/claude/hooks/`. `MEM_DISTILL=1` remains a recognized D-42
+worker marker for compatibility, even though nothing sets it anymore.
 
 ## Dispatch And Statusline Realization
 

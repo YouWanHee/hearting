@@ -110,7 +110,7 @@ a registry status word alone. `OPERATIONS §5.12` owns the mechanics.
 
 ## Runtime Lifecycle
 
-Claude hooks realize portable invariants for workflow signals, write/spec/core gates, memory, and design checks. Use explicit wrappers when a hook cannot be trusted. Main-session memory lifecycle and distillation do not run for workers. Session end never owns destructive worktree cleanup.
+Claude hooks realize portable invariants for workflow signals, write/spec/core gates, memory, and design checks. Use explicit wrappers when a hook cannot be trusted. Main-session memory lifecycle does not run for workers. Session end never owns destructive worktree cleanup.
 
 Use `statusline.sh` only for runtime status. Harness detail remains available through the adapter tools and docs. Runtime-owned credentials, sessions, logs, caches, databases, and config stay outside this repo.
 

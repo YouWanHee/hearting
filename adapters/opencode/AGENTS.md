@@ -45,7 +45,7 @@ Detailed lifecycle and edge-case contracts live in
 | Need | Command |
 |---|---|
 | lifecycle/workflow | `preflight.sh prompt-signal`, `preflight.sh briefing`, `preflight.sh worklog` |
-| memory | `preflight.sh memory`, `preflight.sh recall-gate`, `preflight.sh recall`, `preflight.sh distill-delta`, `preflight.sh distill-propose` |
+| memory | `preflight.sh memory`, `preflight.sh recall-gate`, `preflight.sh recall` |
 | readiness/loops | `preflight.sh status`, `preflight.sh doctor`, `preflight.sh loop-info <oncall|note|study|drill|runtime-watch>` |
 | QA | `preflight.sh qa-policy <level> [code|research|doc|general]` |
 | runtime | `preflight.sh permissions`, `preflight.sh mcp [--check]` |

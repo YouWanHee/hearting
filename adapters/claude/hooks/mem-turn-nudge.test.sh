@@ -1,1 +1,0 @@
-../../../hooks/mem-turn-nudge.test.sh

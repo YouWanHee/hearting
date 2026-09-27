@@ -5,7 +5,6 @@ set -euo pipefail
 
 ROOT=$(git rev-parse --show-toplevel)
 MEM="$ROOT/tools/memory/mem.py"
-APPLIER="$ROOT/tools/memory/apply-distill-actions.py"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 export MEM_STORE="$TMP/store"
@@ -190,24 +189,6 @@ assert con.execute("select count(*) from records_capsule_fts").fetchone()[0] > 0
 assert con.execute("select count(*) from record_topics where topic='retrieval'").fetchone()[0] > 0
 PY
 
-# Automatic ingress admits only the four storage purposes and requires a capsule.
-cat > "$TMP/actions.jsonl" <<'EOF'
-{"action":"add","tier":"durable","type":"lesson","body":"This legacy free-form type must be rejected.","headline":"Rejected","aliases":[],"entities":[],"topics":[],"artifact_refs":[]}
-{"action":"add","tier":"durable","type":"artifact-pointer","body":"Read the spec when changing retrieval.","headline":"Spec pointer","aliases":[],"entities":[],"topics":["retrieval"],"artifact_refs":[]}
-{"action":"add","tier":"durable","type":"user-correction","body":"The user requires an explicit recall opportunity decision.","headline":"Explicit recall gate","aliases":["recall opportunity"],"entities":["memory"],"topics":["retrieval"],"artifact_refs":[]}
-EOF
-before=$(python3 - "$MEM_STORE/memory.db" <<'PY'
-import sqlite3, sys
-print(sqlite3.connect(sys.argv[1]).execute("select count(*) from records").fetchone()[0])
-PY
-)
-python3 "$APPLIER" "$TMP/actions.jsonl" "$MEM" --mode increment >/dev/null
-after=$(python3 - "$MEM_STORE/memory.db" <<'PY'
-import sqlite3, sys
-print(sqlite3.connect(sys.argv[1]).execute("select count(*) from records").fetchone()[0])
-PY
-)
-[ "$after" -eq $((before + 1)) ]
 
 # A v6 database upgrades additively and backfills active/canonical capsule state.
 legacy="$TMP/legacy"
@@ -257,6 +238,72 @@ sources = {row[0] for row in sqlite3.connect(sys.argv[1]).execute("select source
 assert any(source and source.endswith("/current.md") for source in sources), sources
 assert not any(source and source.endswith("/foreign.md") for source in sources), sources
 PY
+
+# An already-absorbed file edited afterward must refresh in place, keeping the
+# same record id (D-79 gap: 2026-09-26 found 63/261 absorbed files stale).
+current_source="auto-memory:$current_ns/current.md"
+current_id=$(python3 - "$migration_store/memory.db" "$current_source" <<'PY'
+import sqlite3, sys
+row = sqlite3.connect(sys.argv[1]).execute(
+    "select id from records where source=?", (sys.argv[2],)).fetchone()
+print(row[0])
+PY
+)
+printf '%s\n' 'Current project stray memory is eligible for routine recovery.' \
+  'Current project stray memory now carries an appended edit.' \
+  > "$projects/$current_ns/memory/current.md"
+(
+  cd "$ROOT"
+  MEM_STORE="$migration_store" MEM_PROJECTS="$projects" python3 "$MEM" migrate --apply
+) | grep -q 'updated 1'
+python3 - "$migration_store/memory.db" "$current_source" "$current_id" <<'PY'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+row = con.execute("select id,body from records where source=?", (sys.argv[2],)).fetchone()
+assert row[0] == sys.argv[3], row
+assert "appended edit" in row[1], row
+PY
+(
+  cd "$ROOT"
+  MEM_STORE="$migration_store" MEM_PROJECTS="$projects" python3 "$MEM" migrate --apply
+) | grep -q 'updated 0'
+
+# A superseded record must not be resurrected just because its source file
+# still exists on disk, and an edited-then-superseded source must not fork a
+# second row (review finding, 2026-09-27): migrate previously decided
+# "already absorbed" from a status-agnostic set while deciding "body changed"
+# from an active-only set, so a retired row's status silently flipped back to
+# active on the next migrate --apply.
+python3 - "$migration_store/memory.db" "$current_id" <<'PY'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+con.execute("UPDATE records SET status='superseded' WHERE id=?", (sys.argv[2],))
+con.commit()
+PY
+(
+  cd "$ROOT"
+  MEM_STORE="$migration_store" MEM_PROJECTS="$projects" python3 "$MEM" migrate --apply
+) | grep -q 'updated 0'
+python3 - "$migration_store/memory.db" "$current_source" "$current_id" <<'PY'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+rows = con.execute("select id,status from records where source=?", (sys.argv[2],)).fetchall()
+assert rows == [(sys.argv[3], "superseded")], rows
+PY
+printf '%s\n' 'Current project stray memory is eligible for routine recovery.' \
+  'Current project stray memory now carries an edit made after supersession.' \
+  > "$projects/$current_ns/memory/current.md"
+(
+  cd "$ROOT"
+  MEM_STORE="$migration_store" MEM_PROJECTS="$projects" python3 "$MEM" migrate --apply
+) | grep -q 'updated 0'
+python3 - "$migration_store/memory.db" "$current_source" "$current_id" <<'PY'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+rows = con.execute("select id,status from records where source=?", (sys.argv[2],)).fetchall()
+assert rows == [(sys.argv[3], "superseded")], rows
+PY
+
 (
   cd "$ROOT"
   MEM_STORE="$migration_store" MEM_PROJECTS="$projects" python3 "$MEM" migrate --apply --all-projects >/dev/null

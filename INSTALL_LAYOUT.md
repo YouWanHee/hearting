@@ -186,9 +186,15 @@ harness install claude
   are copied once and never linked. Linking them even once can silently dirty
   the repository. `verify` and `update --reapply` use the hash manifest to
   detect, back up, and reapply drift.
-- **Runtime activation:** harness hook entries, `statusLine`, and the explicitly
-  allowlisted `env.MEM_DISTILL_ENABLE` default are merged into the existing
-  `settings.json`. Referenced `tools`, `utilities`, and `statusline.sh` point to
+- **Runtime activation:** harness hook entries, `statusLine`, the top-level
+  `autoMemoryEnabled` default (D-79: off, so Claude Code's own file memory
+  stays disabled and `memory.db` is the sole store), and any explicitly
+  allowlisted `env.*` keys are merged into the existing `settings.json`. A key
+  a prior release managed but the current one no longer does is dropped only
+  when the user's value still exactly matches what that release set; a
+  user-changed value is left in place and reported as a conflict, the same
+  rule the hook-entry retirement below already follows. Referenced `tools`,
+  `utilities`, and `statusline.sh` point to
   either the source or an immutable bundle. Missing or previously managed exact
   values are installed or refreshed. A conflicting user value is preserved and
   reported through `config_conflicts`; strict doctor remains unhealthy until the

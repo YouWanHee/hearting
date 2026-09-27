@@ -102,10 +102,8 @@ full masking.
 | capability mapping | `adapters/opencode/bin/preflight.sh capability-info <capability>` reports OpenCode's native Skill/command realization and instruction-only or tool-contract status; root Skill compatibility references are not projected and report `compat_reference=not-projected` |
 | model role mapping | `adapters/opencode/bin/preflight.sh role <portable-role>` resolves portable model roles through OpenCode adapter environment variables |
 | mode mapping | `adapters/opencode/bin/preflight.sh mode-info <family/mode>` reports whether a mode is portable, tool-contract, or unsupported for OpenCode; tool-contract and unsupported adapter-coupled modes include machine-readable `tool_contract`, optional `tool_contract_check`, `runtime_surface`, and `fallback` fields |
-| memory distill delta | Supported through `tools/memory/mem.py --source opencode`, backed by `opencode export <session-id>` (captured to a temp file — piped export stdout truncates) |
-| memory distill proposal | Implemented — `distill-worker.sh` runs a no-tools `opencode run --pure --agent <distiller>` worker (verified: no shell exec, no hang, timeout-guarded) |
-| memory auto-distillation | Enabled by default — plugin `event`/`session.idle` → detached `preflight session-end` (debounced) → worker → apply. Opt out `OPENCODE_DISTILL_ENABLE=0`; set `OPENCODE_DISTILL_MODEL` for quality |
-| memory store | `tools/memory/{mem.py,protocol_v2.py,git_exchange_v2.py,sync_v2.py}` are runtime-neutral; detached distillation worker execution remains adapter-specific |
+| memory sync | Plugin `event`/`session.idle` → detached `preflight session-end` → `mem sync --json`. No automatic distiller (D-78) |
+| memory store | `tools/memory/{mem.py,protocol_v2.py,git_exchange_v2.py,sync_v2.py}` are runtime-neutral |
 | permission model | OpenCode native `permission` config (`allow`/`ask`/`deny` per tool, per-agent override); adapter documents recommended rules, not a harness guard replacement |
 | statusline | OpenCode TUI footer is native; no user shell statusline surface in config schema; harness status signals stay instruction-only/preflight |
 
@@ -116,7 +114,6 @@ not the full shared `tools/` directory. The adapter currently exposes only
 tools that OpenCode wrappers use directly:
 
 - `memory/mem.py` (OpenCode-owned launcher for the shared memory CLI)
-- `memory/apply-distill-actions.py`
 - `memory/recall.sh` (OpenCode-owned launcher for recall)
 - `material/browser-fetch.sh` (OpenCode-owned launcher for rendered web page extraction)
 - `material/data-script.sh` (OpenCode-owned launcher for Python data-analysis scripts)
