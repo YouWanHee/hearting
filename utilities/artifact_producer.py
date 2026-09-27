@@ -5306,9 +5306,9 @@ def require_cycle_output(
     authority. When the sealed route file for `route_id` is readable, lookup
     and write admission both go through the lineage-aware D-120 path
     (`route_cycle_for` + `cycle_route_admission`), so a continuation may write
-    the cycle its lineage opened. A `route_id` with no readable route file
-    falls back to the exact match this function always had (legacy routes
-    without a producer cycle retain their existing contract).
+    the cycle its lineage opened. Only a genuinely missing canonical route
+    file permits the legacy exact begin-route match, including an explicitly
+    selected legacy cycle. Existing but unreadable or malformed proof refuses.
     """
     record = read_cycle_record(root, cycle_id) if cycle_id else None
     if cycle_id and record is None:
@@ -5321,8 +5321,10 @@ def require_cycle_output(
         route_path = route_lineage.canonical_route_path(root, route_id)
         try:
             route_stat = route_path.lstat()
-        except OSError:
+        except FileNotFoundError:
             route_stat = None
+        except OSError as exc:
+            raise ProducerError("route-lineage-unverified", f"route-unreadable={route_id}") from exc
         if (route_stat is not None and (not stat.S_ISREG(route_stat.st_mode)
                 or route_path.is_symlink() or route_path.resolve() != route_path)):
             raise ProducerError("route-lineage-unverified", f"route-kind={route_id}")
@@ -5334,13 +5336,19 @@ def require_cycle_output(
                 admission = cycle_route_admission(root, record, route)
                 if not admission.allow:
                     raise ProducerError(admission.reason, admission.detail)
+                if cycle_id:
+                    # An explicit selector must not bypass the shared lookup's
+                    # refusal of multiple open cycles in the same lineage.
+                    selected = route_cycle_for(root, route)
+                    if selected is None or selected.get("cycle_id") != record.get("cycle_id"):
+                        raise ProducerError("cycle-route-binding-mismatch", f"cycle={cycle_id} route={route_id}")
                 lineage_checked = True
-        elif record is not None:
-            # An explicitly selected producer cycle is already route-bound;
-            # never downgrade it to a begin-route ID comparison when its
-            # canonical route proof is absent or malformed.
+        elif route_stat is not None:
+            # Existing but malformed proof is never a legacy missing route.
             raise ProducerError("route-lineage-unverified", f"route={route_id}")
-        else:
+        elif record is None:
+            # Legacy records can lack a canonical route. Preserve only their
+            # original exact begin-route match; continuation still needs proof.
             candidates = [item for item in list_cycle_records(root) if item.get("route_id") == route_id]
             opened = [item for item in candidates if item.get("state") == "open"]
             candidates = opened or candidates
@@ -5407,9 +5415,9 @@ def check_write(root: Path, target: Path) -> Dict[str, Any]:
         try:
             require_cycle_output(
                 root, target, cycle_id=os.environ.get("AGENT_ARTIFACT_CYCLE_ID"),
-                # An owner binding names the authority for its explicit cycle.
-                # A nested/stale node route must not mask that owner identity.
-                route_id=os.environ.get("AGENT_OWNER_ROUTE_ID") or os.environ.get("AGENT_ROUTE_ID"),
+                # A node's active route is its write authority. The enclosing
+                # owner must not mask a foreign or invalid child route.
+                route_id=os.environ.get("AGENT_ROUTE_ID") or os.environ.get("AGENT_OWNER_ROUTE_ID"),
             )
         except ProducerError as exc:
             return {**base, "verdict": "deny", "reason": exc.code, "detail": exc.detail, "layout": "cycle"}

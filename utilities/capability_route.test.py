@@ -4529,7 +4529,65 @@ class VerifiedRouteLineageTest(TestContinuation):
    self.assertEqual([row["route_id"] for row in R.review_lineage_routes(full,"plan-check")],
                     [full["route_id"],full_source["route_id"]])
 
-   # Provenance edits remain invalid even after the child route hash is recomputed.
+ def test_nested_plan_check_census_keeps_all_ancestor_route_ids(self):
+  """A fresh continuation ID must not reset the review budget.
+
+  This follows the production failure shape (rt6c -> rt50 -> rtf2): the first
+  continuation resumes at plan-check, then a nested continuation resumes at
+  impl-review and carries plan-check in its reused prefix. Admission's caller
+  must still see attempts recorded under every generation that owned the
+  review.
+  """
+  dn_spec=importlib.util.spec_from_file_location("dispatch_node_for_continuation_test",P.with_name("dispatch-node.py"))
+  DN=importlib.util.module_from_spec(dn_spec); dn_spec.loader.exec_module(DN)
+  with tempfile.TemporaryDirectory() as tmp:
+   artifact=Path(tmp)/"artifacts"
+   source=self._source(artifact)
+   R.write_once(R.canonical_route_path(artifact,source["route_id"]),source)
+   self._complete_prefix(source,"plan-check",Path(tmp)/"evidence-source")
+   first=R.build_continuation_route(
+    source,resume_from_node="plan-check",requested_boundary="plan-check",
+    reason="resume-review-boundary",artifact_root=artifact,
+   )
+   R.publish_continuation_route(
+    first,source,R.canonical_route_path(artifact,first["route_id"]))
+   self._complete_prefix(first,"impl-review",Path(tmp)/"evidence-first")
+   nested=R.build_continuation_route(
+    first,resume_from_node="impl-review",requested_boundary="impl-review",
+    reason="nested-resume",artifact_root=artifact,
+   )
+   R.publish_continuation_route(
+    nested,first,R.canonical_route_path(artifact,nested["route_id"]))
+
+   lineage=R.review_lineage_routes(nested,"plan-check")
+   self.assertEqual([row["route_id"] for row in lineage],
+                    [nested["route_id"],first["route_id"],source["route_id"]])
+   cap=DN.REVIEW_ROUND_CAP.max_review_rounds(source["effective_intensity"])
+   # Put the completed blocking verdicts on both ancestor IDs, just as the
+   # production registry does when a review is retried through continuations.
+   for index,route_id in enumerate((source["route_id"],first["route_id"]),1):
+    with self._jobs.open("a",encoding="utf-8") as handle:
+     for round_no in range(1,cap+1):
+      handle.write(
+       f"2026-09-01T00:00:{index:02d}{round_no:02d}Z\tdone\t{R.ROOT}\t{R.ROOT}\t"
+       f"ancestor-plan-check-{index}-{round_no}\t"
+       "attempt_schema_version=2,dispatch_depth=2,registered_worker=1,"
+       f"route_id={route_id},route_node=plan-check,note=completed-review-blocking,"
+       f"attempt_id=att-ancestor-plan-check-{index}-{round_no}\n")
+   prior=DN.prior_round_attempts(
+    self._jobs,nested["route_id"],"plan-check",route=nested)
+   # The first continuation's completed plan-check marker contributes one
+   # ordinary registry row in addition to the four explicit blocking rounds.
+   self.assertEqual(len(prior),2*cap+1)
+   budget=DN.REVIEW_ROUND_CAP.round_budget(
+    nested,next(node for node in first["nodes"] if node["id"]=="plan-check"),
+    [(cols[1],meta) for cols,meta in prior])
+   self.assertEqual(budget.state,"exhausted")
+   self.assertEqual(budget.verdict_rounds,2*cap)
+
+   # Assignment/provenance edits remain invalid after every affected hash is
+   # recomputed. The shared route-lineage walk accepts these self-consistent
+   # hashes; review admission must enforce the exact source assignment too.
    for mutate in (
     lambda row: row.__setitem__("marker_digest","sha256:"+"0"*64),
     lambda row: row.__setitem__("terminal_attempt_id","att-foreign"),
@@ -4553,6 +4611,26 @@ class VerifiedRouteLineageTest(TestContinuation):
    forged["route_id"]="rt-"+forged["route_hash"].split(":",1)[1][:16]
    with self.assertRaisesRegex(ValueError,"owner-closure-lineage-node-mismatch:assignment"):
     R.review_lineage_routes(forged,"plan-check")
+
+   for label,mutate in (
+    ("source_depends_on",lambda node:node.__setitem__("source_depends_on",["forged"])),
+    ("reused_dependencies",lambda node:node["reused_dependencies"][0].__setitem__("terminal_attempt_id","att-forged")),
+    ("gate",lambda node:node.__setitem__("completion_gate","forged-gate")),
+    ("write_scope",lambda node:node.__setitem__("write_scope",["forged-scope"])),
+    ("profile",lambda node:node.__setitem__("model_profile","forged-profile")),
+    ("role",lambda node:node.__setitem__("role","external adversary")),
+    ("unit",lambda node:node.__setitem__("unit","editorial/forged")),
+   ):
+    with self.subTest(assignment=label):
+     forged=json.loads(json.dumps(first))
+     node=next(row for row in forged["nodes"] if row["id"]=="plan-check")
+     mutate(node)
+     descriptor=next(row for row in forged["new_nodes"] if row["node_id"]=="plan-check")
+     descriptor["realized_contract_hash"]=R._continuation_contract_hash(node)
+     forged["route_hash"]=R.route_hash(forged)
+     forged["route_id"]="rt-"+forged["route_hash"].split(":",1)[1][:16]
+     with self.assertRaisesRegex(ValueError,"owner-closure-lineage-node-mismatch:assignment"):
+      R.review_lineage_routes(forged,"plan-check")
 
 
 class SourceCensusTest(unittest.TestCase):

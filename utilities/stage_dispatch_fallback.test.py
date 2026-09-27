@@ -267,7 +267,166 @@ class FallbackTest(unittest.TestCase):
      f"2026-08-29T00:00:0{i}Z\tdone\t{self.repo}\t{self.repo}\tround-{node_id}-{i}\t"
      "attempt_schema_version=2,dispatch_depth=2,registered_worker=1,"
      f"route_id={route_id},route_node={node_id},note=completed-review-blocking,"
-     f"attempt_id=att-{node_id}-round-{i}\n")
+      f"attempt_id=att-{node_id}-round-{i}\n")
+
+ def continuation_review_route(self,resume_from_node="plan-check"):
+  """Publish a real continuation that retains a runnable plan-check node."""
+  evidence={"tuples":[self.tuple("codex","supported"),self.tuple("claude","supported")],
+   "native_subagent":[{"harness":"codex","transport":"headless",
+    "execution_surface":"codex-native-subagent","registered_worker":False,
+    "status":"supported","check_source":"fixture"}]}
+  with mock.patch.dict(os.environ,self.launch_roots_env()):
+   source=R.compose_route(
+    capability="autopilot-code",capability_mode="dev",shape="staged",
+    graph="frame,plan,plan-check",slug="continuation-plan-check",
+    cwd=self.repo,artifact_root=self.art,intensity="standard",
+    signals=["shared-contract"],tracking="tracked",parent_harness="codex",
+    dispatch_evidence=evidence,unassigned=True,
+   )
+  R.write_once(R.canonical_route_path(self.art,source["route_id"]),source)
+  boundary=next(i for i,node in enumerate(source["nodes"]) if node["id"]==resume_from_node)
+  for node in source["nodes"][:boundary]:
+   attempt_id=f"att-source-{node['id']}"
+   evidence=self.art/"_internal"/"continuation-source"/f"{node['id']}.md"
+   evidence.parent.mkdir(parents=True,exist_ok=True)
+   evidence.write_text(f"source completion for {node['id']}\n",encoding="utf-8")
+   metadata={
+    "attempt_schema_version":2,"dispatch_depth":node["dispatch_depth"],
+    "transport":"headless","execution_surface":"registered-headless",
+    "registered_worker":"1","fallback_hop":"same-harness-headless",
+   }
+   with mock.patch.dict(os.environ,self.launch_roots_env()), \
+        mock.patch.object(R,"_launch_open_cycle_checkpoint"):
+    R.complete_node(source,node,node["id"],evidence,attempt_id=attempt_id,
+                    explicit_attempt_metadata=metadata)
+   jobs=self.jobs
+   link_path=R._attempt_completion_path(source,node["id"],attempt_id,jobs=jobs)
+   link=json.loads(link_path.read_text(encoding="utf-8"))
+   link.update({"verdict":"PASS","quiescence_proof_digest":"sha256:"+"a"*64,
+                "last_turn_id":f"turn-{node['id']}"})
+   R.atomic_write(link_path,link)
+   with jobs.open("a",encoding="utf-8") as handle:
+    handle.write("\t".join([
+     "2026-09-01T00:00:00Z","done",str(self.repo),str(self.repo),"source-prefix",
+     f"route_id={source['route_id']},route_node={node['id']},attempt_id={attempt_id}",
+    ])+"\n")
+  import workflow_state as WS
+  ledger=WS.WorkflowLedger(source["route_id"],source["route_hash"],jobs=self.jobs)
+  for node in source["nodes"][:boundary]:
+   continuation=node.get("continuation") or {}
+   if continuation.get("kind")!="human-gate":
+    continue
+   gate=continuation["gate"]
+   if WS.human_gate_resolution(ledger.journal(),gate)["status"]!="not-raised":
+    continue
+   with ledger.lock():
+    if ledger.state()["workflow_state"]=="CREATED":
+     ledger.set_workflow_state("READY",evidence={},actor="continuation-fixture")
+    ledger.set_workflow_state("BLOCKED_HUMAN_GATE",
+     evidence={"gate":gate,"artifact":"fixture.md"},actor="continuation-fixture")
+    ledger.set_workflow_state("RUNNING",evidence={"released_gate":gate,
+     "decision":"proceed","released_by":"fixture-user","actor_kind":"user"},
+     actor="continuation-fixture")
+  first=R.build_continuation_route(
+   source,resume_from_node=resume_from_node,requested_boundary=resume_from_node,
+   reason="resume-review-boundary",artifact_root=self.art,
+  )
+  first_path=R.canonical_route_path(self.art,first["route_id"])
+  R.publish_continuation_route(first,source,first_path)
+  return source,first,first_path
+
+ def run_continuation_review_action(self,path,action,reviewed_evidence=None):
+  self.seed_predecessor_markers(path,"plan")
+  self.seed_predecessor_markers(path,"plan-check")
+  route=json.loads(Path(path).read_text(encoding="utf-8"))
+  if any(node["id"]=="plan" for node in route["nodes"]):
+   self.seed_plan_marker(route)
+   if reviewed_evidence is None:
+    marker_path=R.completion_dir(route["route_id"],jobs=self.jobs)/"plan.json"
+    reviewed_evidence=json.loads(marker_path.read_text(encoding="utf-8"))["evidence"]["path"]
+  self.seed_parent()
+  argv=["stage-dispatch-fallback.py","--route",str(path),"--node","plan-check",
+        "--slug",f"continuation-plan-check-{action}","--parent","owner",
+        "--capability-mode","dev","--worker-mode","qa/plan-review",
+        "--model-role","fast reviewer","--jobs",str(self.jobs),f"--{action}"]
+  if reviewed_evidence:
+   argv.extend(["--reviewed-evidence",str(reviewed_evidence)])
+  spawned=[]; printed=[]
+  from types import SimpleNamespace
+  real_run=subprocess.run
+  def run(cmd,**kwargs):
+   if any(str(part).endswith("/bin/dispatch-headless.py") for part in cmd):
+    spawned.append(cmd)
+    receipt=("check=ok\nregistered=0\nstarted=0\nchild_spawned=0\n" if "--dry-run" in cmd else
+             "check=ok\nregistered=1\nstarted=1\nchild_spawned=1\nattempt_id=att-mocked-child\n")
+    return SimpleNamespace(returncode=0,stdout=receipt,stderr="")
+   return real_run(cmd,**kwargs)
+  with mock.patch.object(sys,"argv",argv), \
+       mock.patch("builtins.print",side_effect=lambda *a,**k:printed.append(" ".join(map(str,a)))), \
+       mock.patch("subprocess.run",side_effect=run), \
+       mock.patch.object(F,"watch_launched_attempt",return_value=("observed",{})):
+   observation=F.LAUNCH_TUPLE.ReportOnlyObservation()
+   try:
+    code=F._dispatch(observation)
+   except SystemExit as exc:
+    code=exc.code
+  return code,printed,spawned
+
+ def seed_bound_review_rounds(self,route,node_id,count,reviewed_evidence):
+  """Write valid completed verdict rows and their exact review-input bindings."""
+  from review_input import _file,seal_binding
+  candidate=_file(reviewed_evidence)
+  with self.jobs.open("a",encoding="utf-8") as handle:
+   for index in range(1,count+1):
+    attempt_id=f"att-bound-{route['route_id']}-{node_id}-{index}"
+    metadata={"attempt_id":attempt_id,"route_id":route["route_id"],
+     "route_hash":route["route_hash"],"route_node":node_id}
+    input_digest=seal_binding(self.jobs,metadata,candidate)
+    fields={**metadata,"attempt_schema_version":"2","dispatch_depth":"2",
+     "registered_worker":"1","worker_type":"review",
+     "note":"completed-review-blocking","review_input_digest":input_digest}
+    encoded=",".join(f"{key}={value}" for key,value in fields.items())
+    handle.write("\t".join([
+     f"2026-09-01T00:00:{index:02d}Z","done",str(self.repo),str(self.repo),
+     f"bound-plan-check-{index}",encoded,
+    ])+"\n")
+
+ def test_continuation_plan_check_dry_run_and_start_share_inherited_budget(self):
+  with self.dispatch_env():
+   source,first,path=self.continuation_review_route(resume_from_node="plan-check")
+   cap=F.DISPATCH_NODE.max_review_rounds(first["effective_intensity"])
+   source_plan_marker=json.loads(
+    (R.completion_dir(source["route_id"],jobs=self.jobs)/"plan.json").read_text())
+   reviewed_evidence=source_plan_marker["evidence"]["path"]
+   self.seed_bound_review_rounds(source,"plan-check",cap,reviewed_evidence)
+   # The child route has a new ID, but every surface must count its source
+   # generation before admitting a review attempt. Start's adapter call is
+   # mocked so a regression cannot contact a model or append a real job.
+   results={action:self.run_continuation_review_action(path,action,reviewed_evidence)
+            for action in ("dry-run","start")}
+  for action,(code,printed,spawned) in results.items():
+   with self.subTest(action=action):
+    output="\n".join(printed)
+    self.assertEqual(code,65,output)
+    self.assertIn("reason=review-round-budget-exhausted",output)
+    self.assertIn(f"round={cap+1}",output)
+    self.assertIn("child_spawned=0",output)
+    self.assertEqual(spawned,[],"an over-budget continuation must not launch a child")
+
+ def test_continuation_plan_check_start_launch_is_mocked_when_within_budget(self):
+  with self.dispatch_env():
+   source,first,path=self.continuation_review_route(resume_from_node="plan-check")
+   source_plan_marker=json.loads(
+    (R.completion_dir(source["route_id"],jobs=self.jobs)/"plan.json").read_text())
+   reviewed_evidence=source_plan_marker["evidence"]["path"]
+   dry=self.run_continuation_review_action(path,"dry-run",reviewed_evidence)
+   start=self.run_continuation_review_action(path,"start",reviewed_evidence)
+  self.assertEqual(dry[0],0,"\n".join(dry[1]))
+  self.assertEqual(len(dry[2]),1,"dry-run must reach only the mocked launch preflight")
+  self.assertIn("--dry-run",dry[2][0])
+  self.assertEqual(start[0],0,"\n".join(start[1]))
+  self.assertEqual(len(start[2]),1,"start must reach only the mocked child launcher")
+  self.assertNotIn("--dry-run",start[2][0])
  def test_review_round_cap_rejects_the_over_budget_round(self):
   # This wrapper carries ordinary standard+ depth-2 work and had no cap check
   # at all, so the C-14 budget was unreachable on the path most dispatches

@@ -4244,6 +4244,30 @@ class RouteLineageBindingTest(ProducerTestBase):
         route_file = R.canonical_route_path(self.root, route["route_id"])
         self.close(route, route_file)
 
+    def _tree_state(self):
+        """Snapshot fixture bytes and symlink targets to prove judgments are pure."""
+        state = {}
+        for path in sorted(self.root.rglob("*")):
+            relative = path.relative_to(self.root).as_posix()
+            mode = path.lstat().st_mode
+            if path.is_symlink():
+                state[relative] = ("symlink", os.readlink(path))
+            elif path.is_file():
+                state[relative] = ("file", path.read_bytes())
+            elif path.is_dir():
+                state[relative] = ("dir", mode & 0o777)
+            else:
+                state[relative] = ("other", mode & 0o777)
+        return state
+
+    def _check_explicit_cycle(self, cycle_id, route_id, target):
+        with mock.patch.dict(os.environ, {
+            "AGENT_ARTIFACT_CYCLE_ID": cycle_id,
+            "AGENT_ROUTE_ID": route_id,
+        }, clear=False):
+            os.environ.pop("AGENT_OWNER_ROUTE_ID", None)
+            return P.check_write(self.root, target)
+
     # -- A-25.1 -----------------------------------------------------------
     def test_a25_1_continuation_writes_same_cycle(self):
         a = self._root_route("lineage-a1")
@@ -4286,15 +4310,17 @@ class RouteLineageBindingTest(ProducerTestBase):
             verdict = P.check_write(self.root, target)
         self.assertEqual(verdict["verdict"], "allow", verdict)
 
-        # Owner authority wins when an unrelated/stale child route variable is
-        # also present; the explicit cycle is still judged by D-120 lineage.
+        # When both identities are present, the current child route is the
+        # authority for its write. An unrelated child route cannot be hidden
+        # behind an otherwise-valid owner route.
         with mock.patch.dict(os.environ, {
             "AGENT_ARTIFACT_CYCLE_ID": begun["cycle_id"],
             "AGENT_OWNER_ROUTE_ID": continuation["route_id"],
             "AGENT_ROUTE_ID": foreign["route_id"],
         }, clear=False):
             verdict = P.check_write(self.root, target)
-        self.assertEqual(verdict["verdict"], "allow", verdict)
+        self.assertEqual(verdict["verdict"], "deny", verdict)
+        self.assertEqual(verdict["reason"], "cycle-route-binding-mismatch", verdict)
         self.assertEqual(P.read_cycle_record(self.root, begun["cycle_id"]), before)
         self.assertEqual(P.cycle_record_path(self.root, begun["cycle_id"]).read_bytes(), before_bytes)
 
@@ -4303,12 +4329,179 @@ class RouteLineageBindingTest(ProducerTestBase):
         other = self._root_route("explicit-cycle-other")
         self._publish_root(other)
         other_begun = self._begin(other)
-        with self.assertRaises(P.ProducerError):
+        with self.assertRaises(P.ProducerError) as caught:
             P.require_cycle_output(self.root, target, cycle_id=other_begun["cycle_id"],
                                    route_id=continuation["route_id"])
+        self.assertEqual(caught.exception.code, "cycle-route-binding-mismatch")
         with self.assertRaises(P.ProducerError):
             P.require_cycle_output(self.root, self.root / "outside.md",
                                    cycle_id=begun["cycle_id"], route_id=continuation["route_id"])
+
+    def test_explicit_cycle_check_write_denies_unverified_and_nonadmitted_lineage_without_mutation(self):
+        self.activate()
+        a = self._root_route("explicit-cycle-refusal-begin")
+        self._publish_root(a)
+        begun = self._begin(a)
+        b = self._continuation(a)
+        target = Path(begun["cycle_dir"]) / "artifacts" / "dev_logs" / "result.md"
+        route_path = R.canonical_route_path(self.root, b["route_id"])
+        original_route = route_path.read_bytes()
+
+        def denied_without_mutation(reason, route_id=None):
+            route_id = route_id or b["route_id"]
+            before = self._tree_state()
+            with self.assertRaises(P.ProducerError) as caught:
+                P.require_cycle_output(self.root, target, cycle_id=begun["cycle_id"], route_id=route_id)
+            self.assertEqual(caught.exception.code, reason)
+            verdict = self._check_explicit_cycle(begun["cycle_id"], route_id, target)
+            self.assertEqual((verdict["verdict"], verdict["reason"]), ("deny", reason), verdict)
+            self.assertEqual(self._tree_state(), before)
+
+        # The canonical route file is the proof used by check_write. A stale
+        # hash, malformed JSON, absence, or a symlink must never fall back to
+        # the begin-route equality check when an explicit cycle was selected.
+        with self.subTest("tampered-canonical-route"):
+            route_path.write_text(json.dumps(dict(b, capability="autopilot-research")), encoding="utf-8")
+            denied_without_mutation("route-lineage-unverified")
+            route_path.write_bytes(original_route)
+        with self.subTest("malformed-canonical-route"):
+            route_path.write_text("{malformed", encoding="utf-8")
+            denied_without_mutation("route-lineage-unverified")
+            route_path.write_bytes(original_route)
+        with self.subTest("missing-canonical-route"):
+            route_path.unlink()
+            denied_without_mutation("cycle-route-binding-mismatch")
+            route_path.write_bytes(original_route)
+        with self.subTest("symlink-canonical-route"):
+            backup = Path(self._tmp.name) / "continuation-route.json"
+            backup.write_bytes(original_route)
+            route_path.unlink()
+            route_path.symlink_to(backup)
+            try:
+                denied_without_mutation("route-lineage-unverified")
+            finally:
+                route_path.unlink()
+                route_path.write_bytes(original_route)
+
+        with self.subTest("lineage-fork"):
+            R.bind_continuation_cycle(self.root, a, b)
+            self._continuation(a, reason="explicit-cycle-refusal-sibling")
+            denied_without_mutation("cycle-route-binding-mismatch:lineage-fork")
+
+        with self.subTest("changed-material-input"):
+            changed = self._continuation(a, retint="quick", reason="explicit-cycle-refusal-retint")
+            denied_without_mutation("cycle-route-binding-mismatch:material-input", changed["route_id"])
+
+        # A new, unrelated route cannot claim this cycle, and the route-bound
+        # output helper still rejects a path outside that cycle's artifacts.
+        foreign = self._root_route("explicit-cycle-refusal-foreign")
+        self._publish_root(foreign)
+        foreign_begun = self._begin(foreign)
+        denied_without_mutation("cycle-route-binding-mismatch", foreign["route_id"])
+        before = self._tree_state()
+        with self.assertRaisesRegex(P.ProducerError, "artifact-outside-bound-cycle"):
+            P.require_cycle_output(self.root, self.root / "outside.md",
+                                   cycle_id=begun["cycle_id"], route_id=a["route_id"])
+        self.assertEqual(self._tree_state(), before)
+        before = self._tree_state()
+        verdict = self._check_explicit_cycle(foreign_begun["cycle_id"], b["route_id"], target)
+        self.assertEqual((verdict["verdict"], verdict["reason"]),
+                         ("deny", "cycle-route-binding-mismatch"), verdict)
+        self.assertEqual(self._tree_state(), before)
+
+    def test_explicit_cycle_check_write_preserves_exact_begin_route_compat_fallback(self):
+        self.activate()
+        route = self._root_route("explicit-cycle-exact-begin")
+        self._publish_root(route)
+        begun = self._begin(route)
+        target = Path(begun["cycle_dir"]) / "artifacts" / "dev_logs" / "begin-route.md"
+        route_path = R.canonical_route_path(self.root, route["route_id"])
+
+        # Existing canonical begin-route proof is an exact successful match.
+        output = P.require_cycle_output(self.root, target, cycle_id=begun["cycle_id"],
+                                        route_id=route["route_id"])
+        self.assertEqual(output, Path(begun["cycle_dir"]) / "artifacts")
+        verdict = self._check_explicit_cycle(begun["cycle_id"], route["route_id"], target)
+        self.assertEqual((verdict["verdict"], verdict["reason"]),
+                         ("allow", "open-cycle-artifacts"), verdict)
+
+        # Compatibility applies only to a genuinely absent canonical route
+        # file and the exact begin-route identity. It never authorizes a
+        # missing continuation route (covered in the refusal matrix above).
+        original = route_path.read_bytes()
+        route_path.unlink()
+        try:
+            before = self._tree_state()
+            output = P.require_cycle_output(self.root, target, cycle_id=begun["cycle_id"],
+                                            route_id=route["route_id"])
+            self.assertEqual(output, Path(begun["cycle_dir"]) / "artifacts")
+            with mock.patch.dict(os.environ, {
+                "AGENT_ARTIFACT_CYCLE_ID": begun["cycle_id"],
+                "AGENT_ROUTE_ID": route["route_id"],
+            }, clear=False):
+                os.environ.pop("AGENT_OWNER_ROUTE_ID", None)
+                verdict = P.check_write(self.root, target)
+            self.assertEqual((verdict["verdict"], verdict["reason"]),
+                             ("allow", "open-cycle-artifacts"), verdict)
+            self.assertEqual(self._tree_state(), before)
+        finally:
+            route_path.write_bytes(original)
+
+    def test_explicit_cycle_check_write_refuses_sealed_and_abandoned_cycles_without_mutation(self):
+        for final_state in ("sealed", "abandoned"):
+            with self.subTest(final_state=final_state):
+                fixture = RouteLineageBindingTest()
+                fixture.setUp()
+                try:
+                    fixture.activate()
+                    route = fixture._root_route("explicit-cycle-closed-" + final_state)
+                    fixture._publish_root(route)
+                    begun = fixture._begin(route)
+                    target = Path(begun["cycle_dir"]) / "artifacts" / "dev_logs" / "late.md"
+                    if final_state == "sealed":
+                        fixture._close(route)
+                        P.finalize(fixture.root, cycle_id=begun["cycle_id"])
+                    else:
+                        P.finalize(fixture.root, cycle_id=begun["cycle_id"], state="abandoned",
+                                   abandon_reason="operator-decision")
+                    before = fixture._tree_state()
+                    with self.assertRaises(P.ProducerError) as caught:
+                        P.require_cycle_output(fixture.root, target, cycle_id=begun["cycle_id"],
+                                               route_id=route["route_id"])
+                    self.assertEqual(caught.exception.code, "cycle-not-open")
+                    self.assertEqual(fixture._tree_state(), before)
+                    verdict = fixture._check_explicit_cycle(begun["cycle_id"], route["route_id"], target)
+                    self.assertEqual((verdict["verdict"], verdict["reason"]),
+                                     ("deny", "cycle-not-open"), verdict)
+                    self.assertEqual(fixture._tree_state(), before)
+                finally:
+                    fixture.doCleanups()
+
+    def test_explicit_cycle_check_write_cannot_select_one_cycle_from_ambiguous_lineage(self):
+        self.activate()
+        route = self._root_route("explicit-cycle-ambiguous")
+        self._publish_root(route)
+        begun = self._begin(route)
+        record = P.read_cycle_record(self.root, begun["cycle_id"])
+        duplicate = dict(record, cycle_id="cyc_" + "d" * 32)
+        duplicate_path = P.producer_dir(self.root) / "cycles" / f"{duplicate['cycle_id']}.json"
+        duplicate_path.write_text(json.dumps(duplicate), encoding="utf-8")
+        target = Path(begun["cycle_dir"]) / "artifacts" / "dev_logs" / "ambiguous.md"
+        before = self._tree_state()
+        with self.assertRaises(P.ProducerError) as caught:
+            P.require_cycle_output(self.root, target, cycle_id=begun["cycle_id"],
+                                   route_id=route["route_id"])
+        self.assertEqual(caught.exception.code, "route-cycle-binding-ambiguous")
+        self.assertEqual(self._tree_state(), before)
+        with mock.patch.dict(os.environ, {
+            "AGENT_ARTIFACT_CYCLE_ID": begun["cycle_id"],
+            "AGENT_ROUTE_ID": route["route_id"],
+        }, clear=False):
+            os.environ.pop("AGENT_OWNER_ROUTE_ID", None)
+            verdict = P.check_write(self.root, target)
+        self.assertEqual((verdict["verdict"], verdict["reason"]),
+                         ("deny", "route-cycle-binding-ambiguous"), verdict)
+        self.assertEqual(self._tree_state(), before)
 
     # -- A-25.2 -------------------------------------------------------------
     def test_a25_2_foreign_route_refused(self):
