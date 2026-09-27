@@ -633,16 +633,45 @@ class ClaudeHookGroupIdentityTest(unittest.TestCase):
                 [changed],
             )
 
-    def test_identity_is_matcher_plus_commands(self):
-        tuned = {"matcher": "Bash", "hooks": [dict(self.PROJECTION, timeout=99)]}
-        self.assertEqual(
-            activation._hook_group_identity({"matcher": "Bash", "hooks": [self.PROJECTION]}),
-            activation._hook_group_identity(tuned),
-        )
-        self.assertNotEqual(
-            activation._hook_group_identity({"matcher": "Edit", "hooks": [self.PROJECTION]}),
-            activation._hook_group_identity(tuned),
-        )
+    def test_a_group_the_user_trimmed_does_not_run_its_remaining_hook_twice(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pair = {"matcher": "*", "hooks": [self.PROJECTION, self.NUDGE]}
+            old = self._release(root, "old", [pair])
+            new = self._release(root, "new", [pair])
+            trimmed = {"matcher": "*", "hooks": [dict(self.PROJECTION, timeout=30)]}
+            config = root / "settings.json"
+            config.write_text(json.dumps({"hooks": {"UserPromptSubmit": [trimmed]}}), encoding="utf-8")
+
+            self._merge(config, new, old)
+
+            groups = json.loads(config.read_text(encoding="utf-8"))["hooks"]["UserPromptSubmit"]
+            # The kept hook stays tuned and only the missing one comes back.
+            self.assertEqual(groups, [trimmed, {"matcher": "*", "hooks": [self.NUDGE]}])
+
+    def test_uninstall_removes_tuned_and_trimmed_copies_but_not_user_hooks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            managed = [{"matcher": "*", "hooks": [self.PROJECTION, self.NUDGE]}]
+            user_group = {"hooks": [{"type": "command", "command": "my-own-hook"}]}
+            mixed = {"matcher": "*", "hooks": [dict(self.NUDGE, timeout=1), {"type": "command", "command": "mine-too"}]}
+            config = root / "settings.json"
+            config.write_text(json.dumps({"hooks": {"UserPromptSubmit": [
+                {"matcher": "*", "hooks": [dict(self.PROJECTION, timeout=30)]}, mixed, user_group,
+            ]}}), encoding="utf-8")
+            original = activation._config_path
+            activation._config_path = lambda *_args, **_kwargs: config
+            try:
+                activation._unmerge_claude_settings(
+                    {"managed_config": {"claude_hooks": {"UserPromptSubmit": managed}}}, "global"
+                )
+            finally:
+                activation._config_path = original
+
+            self.assertEqual(
+                json.loads(config.read_text(encoding="utf-8"))["hooks"]["UserPromptSubmit"],
+                [{"matcher": "*", "hooks": [{"type": "command", "command": "mine-too"}]}, user_group],
+            )
 
 
 if __name__ == "__main__":

@@ -1292,22 +1292,48 @@ def _claude_managed_values(source: dict) -> dict:
     return {"statusLine": statusline, "env": managed_env}
 
 
-def _hook_group_identity(item) -> str:
-    """Which hook group this is, ignoring values a user may tune.
+def _hook_keys(item) -> List[str]:
+    """Which hooks a group runs: one key per hook, its matcher plus command.
 
-    A group is the hooks it runs under one matcher. Timeout, async and other
-    per-hook knobs are the user's to change; comparing whole groups made every
-    tuned group look foreign, so each install appended the template copy again
-    and the hook ran twice.
+    Timeout, async and other per-hook knobs are the user's to tune, and a user
+    may drop one hook from a group. Comparing whole groups made any such group
+    look foreign, so each install appended the template copy again and the
+    hooks ran twice.
     """
     if not isinstance(item, dict):
-        return json.dumps(item, sort_keys=True)
+        return [json.dumps(item, sort_keys=True)]
     hooks = item.get("hooks")
-    commands = sorted(
-        str(hook.get("command", "")) if isinstance(hook, dict) else json.dumps(hook, sort_keys=True)
+    return [
+        json.dumps([
+            item.get("matcher"),
+            hook.get("command", "") if isinstance(hook, dict) else json.dumps(hook, sort_keys=True),
+        ])
         for hook in (hooks if isinstance(hooks, list) else [])
-    )
-    return json.dumps([item.get("matcher"), commands])
+    ]
+
+
+def _event_hook_keys(entries) -> set:
+    return {key for item in (entries if isinstance(entries, list) else []) for key in _hook_keys(item)}
+
+
+def _without_hooks(entries: list, drop: set) -> list:
+    """Remove the hooks whose key is in drop; a group left empty goes too."""
+    kept = []
+    for item in entries:
+        if not isinstance(item, dict) or not isinstance(item.get("hooks"), list):
+            if not set(_hook_keys(item)) & drop:
+                kept.append(item)
+            continue
+        hooks = [
+            hook
+            for hook, key in zip(item["hooks"], _hook_keys(item))
+            if key not in drop
+        ]
+        if len(hooks) == len(item["hooks"]):
+            kept.append(item)
+        elif hooks:
+            kept.append(dict(item, hooks=hooks))
+    return kept
 
 
 def _merge_claude_settings(
@@ -1344,22 +1370,15 @@ def _merge_claude_settings(
             if not isinstance(current, list) or not isinstance(old_entries, list):
                 continue
             old = {json.dumps(item, sort_keys=True) for item in old_entries}
-            # A group the user tuned keeps its values while the release still
-            # ships that hook; once the release drops it, the tuned copy goes
-            # too instead of pointing at a script that no longer exists.
-            new_entries = source_hooks.get(event)
-            still_shipped = {
-                _hook_group_identity(item)
-                for item in (new_entries if isinstance(new_entries, list) else [])
-            }
-            retired = {_hook_group_identity(item) for item in old_entries} - still_shipped
-            kept = [
-                item
-                for item in current
-                if json.dumps(item, sort_keys=True) not in old
-                and _hook_group_identity(item) not in retired
-            ]
-            if len(kept) != len(current):
+            # A hook the user tuned keeps its values while the release still
+            # ships it; once the release drops it, the tuned copy goes too
+            # instead of pointing at a script that no longer exists.
+            retired = _event_hook_keys(old_entries) - _event_hook_keys(source_hooks.get(event))
+            kept = _without_hooks(
+                [item for item in current if json.dumps(item, sort_keys=True) not in old],
+                retired,
+            )
+            if kept != current:
                 hooks[event] = kept
                 changed = True
     for event, entries in source_hooks.items():
@@ -1368,13 +1387,19 @@ def _merge_claude_settings(
         current = hooks.setdefault(event, [])
         if not isinstance(current, list):
             raise ActivationError(f"Claude settings hook event is not a list: {event}")
-        known = {_hook_group_identity(item) for item in current}
+        known = _event_hook_keys(current)
         for item in entries:
-            marker = _hook_group_identity(item)
-            if marker in known:
+            missing = [key for key in _hook_keys(item) if key not in known]
+            if not missing:
                 continue
-            current.append(item)
-            known.add(marker)
+            if len(missing) == len(_hook_keys(item)):
+                addition = item
+            else:
+                # Only the hooks this settings file lacks, so the ones already
+                # present (possibly tuned) do not run twice.
+                addition = _without_hooks([item], set(_hook_keys(item)) - set(missing))[0]
+            current.append(addition)
+            known.update(missing)
             added += 1
             changed = True
 
@@ -1466,8 +1491,7 @@ def _claude_settings_health(
             if not isinstance(entries, list) or not isinstance(actual.get(event), list):
                 missing = True
                 continue
-            present = {_hook_group_identity(item) for item in actual[event]}
-            if any(_hook_group_identity(item) not in present for item in entries):
+            if _event_hook_keys(entries) - _event_hook_keys(actual[event]):
                 missing = True
         if not _hook_command_files_present(actual):
             missing = True
@@ -2718,8 +2742,8 @@ def _unmerge_claude_settings(
 ) -> List[str]:
     """Remove what the activation record still proves it owns.
 
-    Hook groups match by matcher and commands, so a copy the user tuned leaves
-    with the hooks it runs; statusLine and env values must still match exactly.
+    Hooks match by matcher and command, so a copy the user tuned leaves with
+    the hooks it runs; statusLine and env values must still match exactly.
     """
     managed_config = state.get("managed_config", {})
     if not isinstance(managed_config, dict):
@@ -2746,13 +2770,8 @@ def _unmerge_claude_settings(
             current = hooks.get(event)
             if not isinstance(current, list) or not isinstance(entries, list):
                 continue
-            managed_set = {_hook_group_identity(item) for item in entries}
-            kept = [
-                item
-                for item in current
-                if _hook_group_identity(item) not in managed_set
-            ]
-            if len(kept) != len(current):
+            kept = _without_hooks(current, _event_hook_keys(entries))
+            if kept != current:
                 changed = True
                 if kept:
                     hooks[event] = kept
