@@ -421,6 +421,16 @@ class EligibilityTest(CycleTitlesTestBase):
         found = CT._walk_manifests(self.root)
         self.assertEqual(found.get(result["cycle_id"], []), [Path(outcome["manifest_path"])])
 
+        payload_manifest = cycle_dir / "artifacts" / "_internal" / "candidate" / "manifest.json"
+        payload_manifest.parent.mkdir(parents=True, exist_ok=True)
+        payload_manifest.write_text(json.dumps({
+            "cycle": {"cycle_id": result["cycle_id"]},
+            "campaign": {"campaign_id": result["campaign_id"]},
+        }), encoding="utf-8")
+        found_with_payload = CT._walk_manifests(self.root)
+        self.assertEqual(found_with_payload.get(result["cycle_id"], []),
+                         [Path(outcome["manifest_path"])])
+
         clone_dir = campaign_dir / "clone-of-cycle"
         shutil.copytree(cycle_dir, clone_dir)
         found_after_clone = CT._walk_manifests(self.root)

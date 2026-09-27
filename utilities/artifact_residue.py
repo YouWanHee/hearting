@@ -75,6 +75,7 @@ import json
 import os
 import re
 import sys
+import stat
 import tarfile
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Set, Tuple
@@ -367,6 +368,29 @@ def _link_resolves_at(root: Path, target_rel: str, link_target: str) -> bool:
     return os.path.exists(probe)
 
 
+def _exact_cycle_manifest(root: Path, cycle_dir: Path) -> Optional[Path]:
+    """Return a regular exact cycle control manifest, never a payload basename."""
+    root, cycle_dir = Path(root), Path(cycle_dir)
+    campaign_dir = cycle_dir.parent.parent if cycle_dir.parent.name == "cycles" else cycle_dir.parent
+    if campaign_dir.parent != root / "campaigns":
+        return None
+    if cycle_dir not in {path for path, _layout in artifact_locator.iter_cycle_dirs(campaign_dir)}:
+        return None
+    manifest = cycle_dir / "manifest.json"
+    try:
+        observed = os.lstat(manifest)
+    except OSError:
+        return None
+    if stat.S_ISLNK(observed.st_mode) or not stat.S_ISREG(observed.st_mode):
+        return None
+    classified = artifact_manifest.classify_artifact_path(
+        str(root), campaign_dir.relative_to(root).as_posix(),
+        cycle_dir.relative_to(root).as_posix(), "control",
+        manifest.relative_to(root).as_posix(), "regular",
+    )
+    return manifest if classified.allowed else None
+
+
 def _origin_cycle(root: Path, rel_dir: str) -> Optional[Dict[str, Any]]:
     """The migrated cycle a legacy `<bucket>/<d1>` directory resolves to, if any.
 
@@ -386,8 +410,9 @@ def _origin_cycle(root: Path, rel_dir: str) -> Optional[Dict[str, Any]]:
         return None
     probe = Path(root) / str(target)
     for _ in range(8):
-        if (probe / "manifest.json").is_file():
-            manifest = P._read_json(probe / "manifest.json") or {}
+        manifest_path = _exact_cycle_manifest(root, probe)
+        if manifest_path is not None:
+            manifest = P._read_json(manifest_path) or {}
             cycle = manifest.get("cycle") or {}
             campaign = manifest.get("campaign") or {}
             cycle_id, campaign_id = cycle.get("cycle_id"), campaign.get("campaign_id")
@@ -407,8 +432,9 @@ def _cycle_id_above(root: Path, rel: str) -> Optional[str]:
     """The sealed cycle a root-relative path sits in (nearest `manifest.json` above it), if any."""
     probe = (Path(root) / rel).parent
     for _ in range(12):
-        if (probe / "manifest.json").is_file():
-            manifest = P._read_json(probe / "manifest.json") or {}
+        manifest_path = _exact_cycle_manifest(root, probe)
+        if manifest_path is not None:
+            manifest = P._read_json(manifest_path) or {}
             cycle_id = (manifest.get("cycle") or {}).get("cycle_id")
             return cycle_id if isinstance(cycle_id, str) else None
         if probe == Path(root) or probe.parent == probe:

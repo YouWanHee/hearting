@@ -369,6 +369,9 @@ def read_admitted_cycle(
         raise LifecycleError("cycle-prior-descriptor-unverified", str(exc)) from exc
     if directory is None:
         return None
+    campaign_dir = directory.parent.parent if directory.parent.name == "cycles" else directory.parent
+    if artifact_locator._exact_cycle_manifest(Path(artifact_root), campaign_dir, directory) is None:
+        return None
     path = directory / "manifest.json"
     if not path.is_file():
         return None
@@ -448,19 +451,44 @@ def verify_artifact_revisions(
         if not isinstance(rel, str):
             failures.append("locator-missing")
             continue
-        path = (root / rel).resolve()
-        try:
-            path.relative_to(root)
-        except ValueError:
-            failures.append(f"locator-outside:{rel}")
+        classification = artifact_manifest.classify_artifact_path(
+            str(root), None, None, "locator", rel, "regular",
+        )
+        if not classification.allowed:
+            failures.append(f"locator-invalid:{rel}:{classification.reason}")
             continue
-        try:
-            info = path.stat()
-        except OSError:
+        path = root
+        components = rel.split("/")
+        info = None
+        unsafe = False
+        for index, component in enumerate(components):
+            path = path / component
+            try:
+                info = os.lstat(path)
+            except OSError:
+                failures.append(f"artifact-missing:{rel}")
+                unsafe = True
+                break
+            if stat.S_ISLNK(info.st_mode):
+                failures.append(f"artifact-symlink-forbidden:{rel}")
+                unsafe = True
+                break
+            if index < len(components) - 1 and not stat.S_ISDIR(info.st_mode):
+                failures.append(f"artifact-parent-not-directory:{rel}")
+                unsafe = True
+                break
+        if unsafe:
+            continue
+        if info is None:
             failures.append(f"artifact-missing:{rel}")
             continue
         if not stat.S_ISREG(info.st_mode):
             failures.append(f"artifact-not-regular:{rel}")
+            continue
+        try:
+            path.relative_to(root)
+        except ValueError:
+            failures.append(f"locator-outside:{rel}")
             continue
         if info.st_size != row.get("byte_size"):
             failures.append(f"artifact-size-mismatch:{rel}")

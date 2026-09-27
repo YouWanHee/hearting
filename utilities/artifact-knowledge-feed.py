@@ -32,6 +32,8 @@ from typing import Any, Iterable, NamedTuple, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import artifact_reader  # noqa: E402
+import artifact_locator  # noqa: E402
+import artifact_manifest  # noqa: E402
 
 
 SCHEMA = "hearting-artifact-knowledge-feed/v1"
@@ -610,7 +612,49 @@ def _cycle_inventory_rows(
             for row in rows
             if row["locator"] == prefix or str(row["locator"]).startswith(prefix)
         ]
+    producer_cycle = _producer_cycle_control(root, cycle.physical_dir)
+    if producer_cycle is not None:
+        cycle_dir, _manifest_path = producer_cycle
+        campaign_dir = cycle_dir.parent.parent if cycle_dir.parent.name == "cycles" else cycle_dir.parent
+        for row in selected:
+            if row.get("kind") != "file":
+                continue
+            result = artifact_manifest.classify_artifact_path(
+                str(root), campaign_dir.relative_to(root).as_posix(),
+                cycle_dir.relative_to(root).as_posix(), "payload",
+                str(row["locator"]).rstrip("/"), "regular",
+            )
+            if not result.allowed:
+                raise FeedError("invalid-locator", "producer cycle inventory contains an invalid payload path")
     return sorted(selected, key=lambda row: _utf8_key(str(row["locator"])))
+
+
+def _producer_cycle_control(root: Path, directory: Path) -> tuple[Path, Path] | None:
+    """Find the exact producer cycle owning a bucket entry, if it has one."""
+    root, directory = Path(root), Path(directory)
+    for candidate in (directory, *directory.parents):
+        if candidate == root:
+            break
+        campaign = candidate.parent.parent if candidate.parent.name == "cycles" else candidate.parent
+        if campaign.parent != root / "campaigns":
+            continue
+        if candidate not in {path for path, _layout in artifact_locator.iter_cycle_dirs(campaign)}:
+            continue
+        manifest = candidate / "manifest.json"
+        try:
+            mode = os.lstat(manifest).st_mode
+        except OSError:
+            continue
+        if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+            continue
+        result = artifact_manifest.classify_artifact_path(
+            str(root), campaign.relative_to(root).as_posix(),
+            candidate.relative_to(root).as_posix(), "control",
+            manifest.relative_to(root).as_posix(), "regular",
+        )
+        if result.allowed:
+            return candidate, manifest
+    return None
 
 
 def _row(
@@ -620,7 +664,11 @@ def _row(
     inventory: list[dict[str, Any]],
 ) -> dict[str, Any]:
     summary_path, summary_state, summary_digest, summary_mtime = _summary(cycle)
-    manifest_path = cycle.physical_dir / "manifest.json"
+    producer_cycle = _producer_cycle_control(root, cycle.physical_dir)
+    # In a producer layout, the logical feed entry may itself contain a
+    # payload named manifest.json.  Only the exact owning cycle path is control.
+    manifest_path = (producer_cycle[1] if producer_cycle is not None
+                     else cycle.physical_dir / "manifest.json")
     source_path = _source_candidate(cycle)
     manifest_state, manifest_digest, _ = _file_state(manifest_path)
     source_state, source_digest, source_mtime = _file_state(source_path)

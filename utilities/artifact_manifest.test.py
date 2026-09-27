@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import unittest
+import importlib.util
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -361,7 +362,6 @@ class TestLocatorSafety(unittest.TestCase):
             ("artifacts/.result\n", "locator-control-char"),
             ("/artifacts/.result", "locator-absolute"),
             ("artifacts/." + "a" * 128, "locator-invalid-component"),
-            ("artifacts/.cache/manifest.json", "locator-reserved-name"),
             ("artifacts-shadow/.result", "locator-hidden-component"),
             (".runtime/result", "locator-hidden-component"),
             (".cycle.json", "locator-hidden-component"),
@@ -373,10 +373,114 @@ class TestLocatorSafety(unittest.TestCase):
     def test_rejects_reserved_manifest_filename_locator(self):
         self.assertIn("locator-reserved-name", _codes(m.validate_locators(self._with_path("manifest.json"))))
 
+    def test_manifest_basename_is_payload_only_beneath_artifacts(self):
+        for path in ("artifacts/manifest.json", "artifacts/_internal/candidate/manifest.json",
+                     "artifacts/.cache/manifest.json"):
+            with self.subTest(path=path):
+                self.assertTrue(m.validate(self._with_path(path)).ok)
+                self.assertTrue(m.validate_locator_path(path).ok)
+
+    def test_context_classifier_keeps_control_authority_at_exact_paths(self):
+        root = "/private/artifacts"
+        campaign = "campaigns/camp"
+        cycle = "campaigns/camp/cyc"
+        controls = (
+            (campaign + "/campaign.json", "control"),
+            (campaign + "/campaign.events/000001.json", "control"),
+            (campaign + "/campaign.satisfied.json", "control"),
+            (cycle + "/.cycle.json", "control"),
+            (cycle + "/manifest.json", "control"),
+            (".runtime/artifact-producer/v1/cycles/cyc.json", "control"),
+        )
+        for path, namespace in controls:
+            with self.subTest(path=path):
+                self.assertTrue(m.classify_artifact_path(root, campaign, cycle, namespace,
+                                                         path, "regular").allowed)
+        spoof = m.classify_artifact_path(root, campaign, cycle, "control",
+                                         cycle + "/artifacts/plans/manifest.json", "regular")
+        self.assertFalse(spoof.allowed)
+        payload = m.classify_artifact_path(root, campaign, cycle, "payload",
+                                           cycle + "/artifacts/plans/manifest.json", "regular")
+        self.assertTrue(payload.allowed)
+        self.assertFalse(m.classify_artifact_path(root, campaign, cycle, "payload",
+                                                  cycle + "/artifacts/link", "symlink").allowed)
+        self.assertFalse(m.classify_artifact_path(root, campaign, cycle, "control",
+                                                  campaign + "/campaign.events/manifest.json",
+                                                  "regular").allowed)
+        event = campaign + "/campaign.events/000007.json"
+        self.assertTrue(m.classify_artifact_path(root, campaign, None, "control", event,
+                                                 "missing", prospective=True).allowed)
+        self.assertFalse(m.classify_artifact_path(root, campaign, None, "control", event,
+                                                  "symlink", prospective=True).allowed)
+        self.assertFalse(m.classify_artifact_path(root, campaign, "campaigns/other/cyc",
+                                                  "payload", cycle + "/artifacts/file", "regular").allowed)
+
+    def test_shared_control_and_payload_corpus_has_typed_results(self):
+        for namespace, relative, kind, prospective, allowed, reason, _surface_reasons in SHARED_PATH_CORPUS:
+            with self.subTest(namespace=namespace, path=relative):
+                result = m.classify_artifact_path(
+                    "/private/artifacts", "campaigns/camp", "campaigns/camp/cyc",
+                    namespace, relative, kind, prospective=prospective)
+                self.assertEqual((result.allowed, result.reason), (allowed, reason))
+                if namespace == "locator":
+                    report = m.validate_locator_path(relative)
+                    self.assertEqual(report.ok, allowed)
+                    self.assertEqual(_codes(report), set() if allowed else {reason})
+                    interim_doc = self._with_path(relative)
+                    interim_doc["cycle"]["state"] = "open"
+                    for route in interim_doc.get("routes", []):
+                        route["terminal_marker"] = "pending"
+                        route["terminal_evidence_id"] = ""
+                    interim = m.validate_interim(interim_doc)
+                    final = m.validate(self._with_path(relative))
+                    self.assertEqual(interim.ok, allowed, (relative, interim.violations))
+                    self.assertEqual(final.ok, allowed, (relative, final.violations))
+                    if not allowed:
+                        self.assertIn(reason, _codes(interim), relative)
+                        self.assertIn(reason, _codes(final), relative)
+
     def test_rejects_duplicate_locator_path(self):
         doc = _valid_document()
         doc["artifact_revisions"][1]["locator"]["path"] = doc["artifact_revisions"][0]["locator"]["path"]
         self.assertIn("locator-duplicate-path", _codes(m.validate_locators(doc)))
+
+
+# Single source of expected path decisions reused by the producer, lifecycle,
+# admission and reader suites. Paths are root-relative and bindings are fixed in
+# the fixture helper above so every surface compares identical typed results.
+SHARED_PATH_CORPUS = (
+    ("control", "campaigns/camp/campaign.json", "regular", False, True, None, {}),
+    ("control", "campaigns/camp/campaign.events/000001.json", "regular", False, True, None, {}),
+    ("control", "campaigns/camp/campaign.events/not-numbered.json", "regular", False, False, "campaign-event-path-invalid", {}),
+    ("control", "campaigns/camp/campaign.events/1.json", "regular", False, False, "campaign-event-path-invalid", {}),
+    ("control", "campaigns/camp/campaign.events/nested/000001.json", "regular", False, False, "campaign-event-path-invalid", {}),
+    ("control", "campaigns/camp/campaign.events/nested/notes/manifest.json", "regular", False, False, "campaign-event-path-invalid", {}),
+    ("control", "campaigns/camp/campaign.satisfied.json", "regular", False, True, None, {}),
+    ("control", "campaigns/camp/cyc/.cycle.json", "regular", False, True, None, {}),
+    ("control", "campaigns/camp/cyc/manifest.json", "regular", False, True, None, {}),
+    ("control", ".runtime/other/anything.json", "regular", False, True, None, {}),
+    ("payload", ".runtime/other/anything.json", "regular", False, False, "outside-cycle-artifacts", {"lifecycle": "locator-hidden-component", "admission": "locator-hidden-component", "producer": "file-outside-artifacts"}),
+    ("payload", "campaigns/camp/cyc/artifacts/plans/manifest.json", "regular", False, True, None, {}),
+    ("locator", "artifacts/manifest.json", "regular", False, True, None, {}),
+    ("locator", "artifacts/_internal/candidate/round_1/manifest.json", "regular", False, True, None, {}),
+    ("locator", "artifacts/_internal/candidate/round_2/manifest.json", "regular", False, True, None, {}),
+    ("locator", "artifacts/.cache/manifest.json", "regular", False, True, None, {}),
+    ("locator", ".runtime/spoof.json", "regular", False, False, "locator-hidden-component", {"producer": "file-outside-artifacts"}),
+    ("locator", "campaigns/camp/.hidden", "regular", False, False, "locator-hidden-component", {"producer": "file-outside-artifacts"}),
+    ("locator", "artifacts/../escape", "regular", False, False, "locator-dot-segment", {"producer": "file-outside-artifacts"}),
+    ("payload", "campaigns/camp/cyc/artifacts/plans/manifest.json", "regular", False, True, None, {}),
+    ("payload", "campaigns/camp/cyc/artifacts/plans/link", "symlink", False, False, "payload-node-not-regular", {"lifecycle": "artifact-symlink-forbidden", "admission": "staging-symlink-forbidden", "producer": "symlink-forbidden"}),
+    ("payload", "campaigns/camp/cyc/manifest.json", "regular", False, False, "outside-cycle-artifacts", {"lifecycle": "locator-reserved-name", "admission": "locator-reserved-name", "producer": "file-outside-artifacts"}),
+)
+
+
+def apply_shared_path_corpus(testcase):
+    for namespace, relative, kind, prospective, allowed, reason, _surface_reasons in SHARED_PATH_CORPUS:
+        with testcase.subTest(namespace=namespace, path=relative):
+            result = m.classify_artifact_path(
+                "/private/artifacts", "campaigns/camp", "campaigns/camp/cyc",
+                namespace, relative, kind, prospective=prospective)
+            testcase.assertEqual((result.allowed, result.reason), (allowed, reason))
 
 
 class TestOrphanAndCompleteness(unittest.TestCase):

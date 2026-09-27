@@ -12,6 +12,7 @@ recursive digest of the whole artifact root taken before and after the call.
 """
 
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
@@ -51,23 +52,13 @@ _ARTIFACT_ROOT = _resolve_artifact_root()
 
 
 def _scratch_root():
-    """Returns (path, is_local_fallback). Prefers the real artifact root."""
+    """Returns an isolated default root, or the explicit caller override."""
     env_root = os.environ.get("ARTIFACT_ADMISSION_TEST_ROOT")
     if env_root:
         Path(env_root).mkdir(parents=True, exist_ok=True)
-        return Path(env_root), False
-
-    if _ARTIFACT_ROOT.is_dir():
-        selftest = _ARTIFACT_ROOT / ".runtime" / "_selftest" / "adm-{0}-{1}".format(
-            os.getpid(), int(time.time() * 1000) % 1000000
-        )
-        try:
-            selftest.mkdir(parents=True)
-            return selftest, False
-        except OSError:
-            pass
-
-    return Path(tempfile.mkdtemp(prefix="artifact-admission-contract-")), True
+        return Path(env_root), False, None
+    private = tempfile.TemporaryDirectory(prefix="artifact-admission-contract-")
+    return Path(private.name), True, private
 
 
 def _make_valid_document(alloc, identity, *, camp_id=None, cyc_id=None, content=b"hello"):
@@ -169,13 +160,16 @@ def _make_valid_document(alloc, identity, *, camp_id=None, cyc_id=None, content=
 
 class AdmissionContractBase(unittest.TestCase):
     def setUp(self):
-        self.scratch, self.is_local_fallback = _scratch_root()
+        self.scratch, self.is_local_fallback, self._scratch_temp = _scratch_root()
         self.root = self.scratch / "root"
         self.root.mkdir(parents=True, exist_ok=True)
         self.alloc = idm.IdAllocator()
 
     def tearDown(self):
-        shutil.rmtree(str(self.scratch), ignore_errors=True)
+        if self._scratch_temp is not None:
+            self._scratch_temp.cleanup()
+        else:
+            shutil.rmtree(str(self.scratch), ignore_errors=True)
 
     # -- helpers ---------------------------------------------------------
 
@@ -266,6 +260,62 @@ class TestNoDurableOutput(AdmissionContractBase):
 
 
 class TestIdempotencyAndDeterminism(AdmissionContractBase):
+    def test_shared_classifier_corpus_matches_admission_payload_contract(self):
+        _CORPUS_SPEC = importlib.util.spec_from_file_location(
+            "shared_artifact_path_corpus_admission",
+            Path(__file__).with_name("artifact_manifest.test.py"))
+        corpus = importlib.util.module_from_spec(_CORPUS_SPEC)
+        _CORPUS_SPEC.loader.exec_module(corpus)
+        rows = [row for row in corpus.SHARED_PATH_CORPUS if row[0] in {"payload", "locator"}]
+        for index, (namespace, relative, kind, _prospective, allowed, reason, public_reasons) in enumerate(rows):
+            with self.subTest(namespace=namespace, path=relative), tempfile.TemporaryDirectory() as scratch:
+                root = Path(scratch) / "root"
+                root.mkdir()
+                identity = adm.ensure_root_identity(
+                    root, allocator=idm.IdAllocator(entropy=lambda n: b"\x22" * n))
+                data = b"corpus payload\n"
+                doc, _ = _make_valid_document(self.alloc, identity, content=data)
+                if namespace == "payload" and relative.startswith("campaigns/camp/cyc/"):
+                    locator = relative[len("campaigns/camp/cyc/"):]
+                else:
+                    locator = relative
+                doc["artifact_revisions"][0]["locator"]["path"] = locator
+                source = Path(scratch) / "staging-source"
+                target = source / locator
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if kind == "symlink":
+                    outside = Path(scratch) / "outside"
+                    outside.write_bytes(data)
+                    target.symlink_to(outside)
+                else:
+                    target.write_bytes(data)
+                outcome = adm.admit(
+                    root, adm.AdmissionRequest(
+                        idempotency_key="corpus-{}".format(index), document=doc, staging_source=source,
+                    ))
+                self.assertEqual(outcome.status == "admitted", allowed, outcome.to_payload())
+                if not allowed:
+                    codes = [violation.code for violation in outcome.violations]
+                    expected = public_reasons.get("admission", reason)
+                    self.assertIn(expected, codes, (relative, codes))
+
+    def test_nested_manifest_payload_is_admitted_and_preserved(self):
+        identity = self._identity()
+        data = b'{"ordinary":"admitted"}\n'
+        doc, _ = _make_valid_document(self.alloc, identity, content=data)
+        locator = "artifacts/_internal/candidate/round_1/manifest.json"
+        doc["artifact_revisions"][0]["locator"]["path"] = locator
+        source = self.scratch / "nested-manifest-source"
+        payload = source / locator
+        payload.parent.mkdir(parents=True)
+        payload.write_bytes(data)
+        outcome = self._admit(doc, source, "k-nested-manifest")
+        self.assertEqual(outcome.status, "admitted", outcome.to_payload())
+        published = self.root / outcome.cycle_path / locator
+        self.assertEqual(published.read_bytes(), data)
+        sealed = json.loads((self.root / outcome.cycle_path / "manifest.json").read_text(encoding="utf-8"))
+        self.assertTrue(m.validate(sealed).ok)
+
     def test_second_admission_with_same_key_and_digest_is_noop(self):
         doc, first = self._admit_valid(key="k-same")
         src = self._stage_source(b"hello")

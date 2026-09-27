@@ -94,6 +94,18 @@ class ResidueFixture(RT.RelayoutFixture):
 
 
 class ClassificationTests(ResidueFixture):
+    def test_payload_manifest_does_not_override_exact_cycle_ancestor(self):
+        campaign = self.root / "campaigns" / "camp_test"
+        cycle = campaign / "cycle_test"
+        nested = cycle / "artifacts" / "_internal" / "candidate"
+        nested.mkdir(parents=True)
+        cycle_id = "cyc_" + "1" * 32
+        (cycle / "manifest.json").write_text(json.dumps({"cycle": {"cycle_id": cycle_id}}), encoding="utf-8")
+        (nested / "manifest.json").write_text(json.dumps({"cycle": {"cycle_id": "cyc_" + "2" * 32}}), encoding="utf-8")
+        (nested / "result.md").write_text("payload", encoding="utf-8")
+        rel = (nested / "result.md").relative_to(self.root).as_posix()
+        self.assertEqual(RES._cycle_id_above(self.root, rel), cycle_id)
+
     def test_every_shape_gets_its_disposition(self):
         sealed, d1 = self.migrated_plan_cycle()
         self.seed(f"plans/{d1}/_internal/plan_reviews/round_1.md")
@@ -422,6 +434,17 @@ class ReviewRegressionTests(ResidueFixture):
         self.assertEqual(RES.status(self.root)["legacy_top_level"], "empty")
 
     def test_reserved_manifest_name_is_sanitized_and_seals(self):
+        self.assertEqual(RES.sanitize_component("manifest.json"), "manifest-ffa5b716.json")
+        historical, _historical_name = self.migrated_plan_cycle(
+            d1="2026-08-18_historical", files=("historical.md",))
+        historical_dir = P.cycle_dir(self.root, historical["campaign_id"], historical["cycle_id"])
+        historical_manifest = historical_dir / "manifest.json"
+        historical_payload = historical_dir / "artifacts" / "plans" / "2026-08-18_historical" / "historical.md"
+        historical_record = P.cycle_record_path(self.root, historical["cycle_id"])
+        compat_map = Path(C.load_map_state(self.root)["maps"][-1]["path"])
+        protected = (historical_record, historical_dir / ".cycle.json", historical_manifest,
+                     historical_payload, compat_map)
+        historical_before = {str(path): path.read_bytes() for path in protected}
         self.seed("plans/2026-08-19_pilot/evidence/staging/campaigns/x/cycles/y/manifest.json", "{}")
         plan = RES.build_plan(self.root)
         target = plan["cycles"][0]["files"][0]["target"]
@@ -431,6 +454,7 @@ class ReviewRegressionTests(ResidueFixture):
         self.assertEqual(result["status"], "complete", result)
         resolved = C.resolve_legacy(self.root, "plans/2026-08-19_pilot/evidence/staging/campaigns/x/cycles/y/manifest.json")
         self.assertEqual(resolved["resolution"], "mapped")
+        self.assertEqual({str(path): path.read_bytes() for path in protected}, historical_before)
 
     def test_cycles_are_dated_without_backdating_the_clock(self):
         from unittest import mock

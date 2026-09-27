@@ -119,7 +119,124 @@ _CYCLE_TERMINAL_EVENTS = {
     "superseded": "cycle.superseded",
 }
 
+# D-6-b display relocation only.  Live payload classification is handled by
+# classify_artifact_path below; keep this value stable for W7H compatibility.
 _RESERVED_LOCATOR_NAMES = frozenset({"manifest.json"})
+_LEGACY_RESERVED_LOCATOR_NAMES = _RESERVED_LOCATOR_NAMES
+
+
+@dataclass(frozen=True)
+class ArtifactPathClassification:
+    """Typed result of the shared artifact path classifier."""
+
+    namespace: str
+    allowed: bool
+    reason: Optional[str] = None
+
+
+def _locator_error(path_value: Any) -> Optional[Tuple[str, str]]:
+    """Return the stable locator error for a relative path, without I/O."""
+    if not isinstance(path_value, str):
+        return None
+    if path_value == "":
+        return "locator-empty", "empty locator path"
+    if path_value.startswith("/"):
+        return "locator-absolute", "absolute path"
+    if re.match(r"^[A-Za-z]:", path_value) or path_value.startswith("\\\\"):
+        return "locator-absolute", "drive/UNC path"
+    if "\\" in path_value:
+        return "locator-backslash", "backslash in path"
+    if _CONTROL_CHAR_RE.search(path_value):
+        return "locator-control-char", "control character in path"
+    if path_value.endswith("/"):
+        return "locator-trailing-slash", "trailing slash"
+    if len(path_value) > _MAX_LOCATOR_LENGTH:
+        return "locator-too-long", "path too long"
+    components = path_value.split("/")
+    if len(components) > _MAX_LOCATOR_COMPONENTS:
+        return "locator-too-many-components", "too many components"
+    payload = len(components) > 1 and components[0] == "artifacts"
+    component_re = _PAYLOAD_COMPONENT_RE if payload else _LOCATOR_COMPONENT_RE
+    for comp in components:
+        if comp == "":
+            return "locator-empty-component", "empty component"
+        if comp in (".", ".."):
+            return "locator-dot-segment", "dot segment"
+        if comp.startswith(".") and not payload:
+            return "locator-hidden-component", "hidden component"
+        if not component_re.fullmatch(comp):
+            return "locator-invalid-component", "invalid component"
+    if components[-1] in _LEGACY_RESERVED_LOCATOR_NAMES and not payload:
+        return "locator-reserved-name", "reserved locator name"
+    return None
+
+
+def classify_artifact_path(
+    artifact_root: Optional[str],
+    campaign_binding: Optional[str],
+    cycle_binding: Optional[str],
+    namespace: str,
+    root_relative_path: str,
+    node_kind: str,
+    *,
+    prospective: bool = False,
+) -> ArtifactPathClassification:
+    """Classify exact controls and cycle payloads from their bound context.
+
+    Binding paths are root-relative POSIX paths.  No filesystem lookup occurs;
+    callers that open a path must separately enforce containment, lstat/no-follow,
+    and regular-file checks.  ``root_relative_path`` is also the manifest
+    locator for payloads, preserving the existing D-6 grammar and typed errors.
+    """
+    if namespace not in {"control", "payload", "locator"}:
+        return ArtifactPathClassification("invalid", False, "namespace-invalid")
+    if namespace == "locator":
+        error = _locator_error(root_relative_path)
+        return ArtifactPathClassification("payload", error is None,
+                                          error[0] if error else None)
+
+    if not isinstance(artifact_root, str) or not artifact_root:
+        return ArtifactPathClassification("unclassified", False, "artifact-root-binding-required")
+    campaign = campaign_binding.rstrip("/") if campaign_binding else None
+    cycle = cycle_binding.rstrip("/") if cycle_binding else None
+    if campaign and not campaign.startswith("campaigns/"):
+        return ArtifactPathClassification("unclassified", False, "campaign-binding-invalid")
+    if cycle and (not campaign or not cycle.startswith(campaign + "/")):
+        return ArtifactPathClassification("unclassified", False, "cycle-binding-invalid")
+
+    controls = {".runtime/"}
+    if campaign:
+        controls.update({campaign + "/campaign.json", campaign + "/campaign.satisfied.json"})
+        if root_relative_path.startswith(campaign + "/campaign.events/"):
+            tail = root_relative_path[len(campaign + "/campaign.events/"):]
+            if re.fullmatch(r"[0-9]{6}\.json", tail):
+                controls.add(root_relative_path)
+            elif namespace == "control":
+                return ArtifactPathClassification("reserved", False, "campaign-event-path-invalid")
+    if cycle:
+        controls.update({cycle + "/.cycle.json", cycle + "/manifest.json"})
+    elif cycle_binding == "" and root_relative_path == "manifest.json":
+        # Admission's private staging directory is itself the exact cycle root;
+        # its single root manifest is control until the directory is published.
+        controls.add("manifest.json")
+    if namespace == "control":
+        if root_relative_path in controls or root_relative_path.startswith(".runtime/"):
+            allowed_kind = node_kind in {"regular", "prospective"} or (prospective and node_kind == "missing")
+            return ArtifactPathClassification("control", allowed_kind,
+                                              None if allowed_kind else "control-node-not-regular")
+        return ArtifactPathClassification("unclassified", False, "control-path-unrecognized")
+    if namespace != "payload":
+        return ArtifactPathClassification("invalid", False, "namespace-invalid")
+    prefix = (cycle + "/artifacts/") if cycle else "artifacts/"
+    if not root_relative_path.startswith(prefix):
+        return ArtifactPathClassification("unclassified", False, "outside-cycle-artifacts")
+    locator = root_relative_path[len(cycle) + 1:] if cycle else root_relative_path
+    error = _locator_error(locator)
+    if error:
+        return ArtifactPathClassification("payload", False, error[0])
+    if node_kind not in {"regular", "prospective"} and not (prospective and node_kind == "missing"):
+        return ArtifactPathClassification("payload", False, "payload-node-not-regular")
+    return ArtifactPathClassification("payload", True, None)
 
 
 # ---------------------------------------------------------------------------
@@ -722,62 +839,11 @@ def _locator_violation(code: str, path: str, detail: str) -> Violation:
 def _check_locator_path(path_value: Any, vpath: str, violations: List[Violation]) -> None:
     if not isinstance(path_value, str):
         return  # already reported by shape validation
-    if path_value == "":
-        violations.append(_locator_violation("locator-empty", vpath, "empty locator path"))
-        return
-    if path_value.startswith("/"):
-        violations.append(_locator_violation("locator-absolute", vpath, "absolute path"))
-        return
-    if re.match(r"^[A-Za-z]:", path_value) or path_value.startswith("\\\\"):
-        violations.append(_locator_violation("locator-absolute", vpath, "drive/UNC path"))
-        return
-    if "\\" in path_value:
-        violations.append(_locator_violation("locator-backslash", vpath, "backslash in path"))
-        return
-    if _CONTROL_CHAR_RE.search(path_value):
-        violations.append(
-            _locator_violation("locator-control-char", vpath, "control character in path")
-        )
-        return
-    if path_value.endswith("/"):
-        violations.append(_locator_violation("locator-trailing-slash", vpath, "trailing slash"))
-        return
-    if len(path_value) > _MAX_LOCATOR_LENGTH:
-        violations.append(_locator_violation("locator-too-long", vpath, "path too long"))
-        return
-    components = path_value.split("/")
-    if len(components) > _MAX_LOCATOR_COMPONENTS:
-        violations.append(
-            _locator_violation("locator-too-many-components", vpath, "too many components")
-        )
-        return
-    payload = len(components) > 1 and components[0] == "artifacts"
-    component_re = _PAYLOAD_COMPONENT_RE if payload else _LOCATOR_COMPONENT_RE
-    for comp in components:
-        if comp == "":
-            violations.append(
-                _locator_violation("locator-empty-component", vpath, "empty component")
-            )
-            return
-        if comp in (".", ".."):
-            violations.append(
-                _locator_violation("locator-dot-segment", vpath, "dot segment")
-            )
-            return
-        if comp.startswith(".") and not payload:
-            violations.append(
-                _locator_violation("locator-hidden-component", vpath, "hidden component")
-            )
-            return
-        if not component_re.fullmatch(comp):
-            violations.append(
-                _locator_violation("locator-invalid-component", vpath, "invalid component")
-            )
-            return
-    if components[-1] in _RESERVED_LOCATOR_NAMES:
-        violations.append(
-            _locator_violation("locator-reserved-name", vpath, "reserved locator name")
-        )
+    result = classify_artifact_path(None, None, None, "locator", path_value, "regular")
+    if result.reason:
+        detail = _locator_error(path_value)
+        violations.append(_locator_violation(result.reason, vpath,
+                                             detail[1] if detail else "invalid locator"))
 
 
 def validate_locator_path(path_value: str) -> ValidationReport:
