@@ -5314,15 +5314,32 @@ def require_cycle_output(
     if cycle_id and record is None:
         raise ProducerError("cycle-unknown", cycle_id)
     lineage_checked = False
-    if record is None and route_id:
-        route = _read_json(route_lineage.canonical_route_path(root, route_id))
+    route = None
+    if route_id:
+        if not isinstance(route_id, str) or not _ROUTE_ID_RE.fullmatch(route_id):
+            raise ProducerError("route-lineage-unverified", f"route={route_id}")
+        route_path = route_lineage.canonical_route_path(root, route_id)
+        try:
+            route_stat = route_path.lstat()
+        except OSError:
+            route_stat = None
+        if (route_stat is not None and (not stat.S_ISREG(route_stat.st_mode)
+                or route_path.is_symlink() or route_path.resolve() != route_path)):
+            raise ProducerError("route-lineage-unverified", f"route-kind={route_id}")
+        route = _read_json(route_path) if route_stat is not None else None
         if isinstance(route, dict) and route.get("route_id") == route_id:
-            record = route_cycle_for(root, route)
-            lineage_checked = True
+            if record is None:
+                record = route_cycle_for(root, route)
             if record is not None:
                 admission = cycle_route_admission(root, record, route)
                 if not admission.allow:
                     raise ProducerError(admission.reason, admission.detail)
+                lineage_checked = True
+        elif record is not None:
+            # An explicitly selected producer cycle is already route-bound;
+            # never downgrade it to a begin-route ID comparison when its
+            # canonical route proof is absent or malformed.
+            raise ProducerError("route-lineage-unverified", f"route={route_id}")
         else:
             candidates = [item for item in list_cycle_records(root) if item.get("route_id") == route_id]
             opened = [item for item in candidates if item.get("state") == "open"]
@@ -5390,7 +5407,9 @@ def check_write(root: Path, target: Path) -> Dict[str, Any]:
         try:
             require_cycle_output(
                 root, target, cycle_id=os.environ.get("AGENT_ARTIFACT_CYCLE_ID"),
-                route_id=os.environ.get("AGENT_ROUTE_ID") or os.environ.get("AGENT_OWNER_ROUTE_ID"),
+                # An owner binding names the authority for its explicit cycle.
+                # A nested/stale node route must not mask that owner identity.
+                route_id=os.environ.get("AGENT_OWNER_ROUTE_ID") or os.environ.get("AGENT_ROUTE_ID"),
             )
         except ProducerError as exc:
             return {**base, "verdict": "deny", "reason": exc.code, "detail": exc.detail, "layout": "cycle"}

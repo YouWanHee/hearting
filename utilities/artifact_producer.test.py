@@ -4257,6 +4257,59 @@ class RouteLineageBindingTest(ProducerTestBase):
         self.assertTrue(bound["bound"])
         self.assertEqual(self._route_ids(begun["cycle_id"]), [a["route_id"], b["route_id"]])
 
+    def test_explicit_cycle_check_write_admits_canonical_continuation_for_owner_and_worker(self):
+        self.activate()
+        a = self._root_route("explicit-cycle-begin")
+        self._publish_root(a)
+        begun = self._begin(a)
+        continuation = self._continuation(a)
+        foreign = self._root_route("explicit-cycle-foreign")
+        self._publish_root(foreign)
+        target = Path(begun["cycle_dir"]) / "artifacts" / "dev_logs" / "handoff.md"
+        before = P.read_cycle_record(self.root, begun["cycle_id"])
+        before_bytes = P.cycle_record_path(self.root, begun["cycle_id"]).read_bytes()
+
+        # A worker carries its current route directly.
+        with mock.patch.dict(os.environ, {
+            "AGENT_ARTIFACT_CYCLE_ID": begun["cycle_id"],
+            "AGENT_ROUTE_ID": continuation["route_id"],
+        }, clear=False):
+            os.environ.pop("AGENT_OWNER_ROUTE_ID", None)
+            verdict = P.check_write(self.root, target)
+        self.assertEqual(verdict["verdict"], "allow", verdict)
+
+        with mock.patch.dict(os.environ, {
+            "AGENT_ARTIFACT_CYCLE_ID": begun["cycle_id"],
+            "AGENT_OWNER_ROUTE_ID": continuation["route_id"],
+        }, clear=False):
+            os.environ.pop("AGENT_ROUTE_ID", None)
+            verdict = P.check_write(self.root, target)
+        self.assertEqual(verdict["verdict"], "allow", verdict)
+
+        # Owner authority wins when an unrelated/stale child route variable is
+        # also present; the explicit cycle is still judged by D-120 lineage.
+        with mock.patch.dict(os.environ, {
+            "AGENT_ARTIFACT_CYCLE_ID": begun["cycle_id"],
+            "AGENT_OWNER_ROUTE_ID": continuation["route_id"],
+            "AGENT_ROUTE_ID": foreign["route_id"],
+        }, clear=False):
+            verdict = P.check_write(self.root, target)
+        self.assertEqual(verdict["verdict"], "allow", verdict)
+        self.assertEqual(P.read_cycle_record(self.root, begun["cycle_id"]), before)
+        self.assertEqual(P.cycle_record_path(self.root, begun["cycle_id"]).read_bytes(), before_bytes)
+
+        # Wrong cycle, route or output path remains denied by the same checked
+        # canonical route and cycle record.
+        other = self._root_route("explicit-cycle-other")
+        self._publish_root(other)
+        other_begun = self._begin(other)
+        with self.assertRaises(P.ProducerError):
+            P.require_cycle_output(self.root, target, cycle_id=other_begun["cycle_id"],
+                                   route_id=continuation["route_id"])
+        with self.assertRaises(P.ProducerError):
+            P.require_cycle_output(self.root, self.root / "outside.md",
+                                   cycle_id=begun["cycle_id"], route_id=continuation["route_id"])
+
     # -- A-25.2 -------------------------------------------------------------
     def test_a25_2_foreign_route_refused(self):
         a = self._root_route("lineage-a2")

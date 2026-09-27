@@ -1138,27 +1138,11 @@ def build_continuation_route(
         )
     if requested_blocker or first_blocker:
         return result
-    reused_by_id={row["node_id"]:row for row in reused}
     route_nodes=[]
     descriptors=[]
     for offset,source_node in enumerate(source_nodes[resume_index:]):
-        node=json.loads(json.dumps(source_node))
-        original_dependencies=list(node.get("depends_on") or [])
-        satisfied=[dep for dep in original_dependencies if dep in reused_by_id]
-        if satisfied:
-            node["source_depends_on"]=original_dependencies
-            node["depends_on"]=[dep for dep in original_dependencies if dep not in reused_by_id]
-            node["reused_dependencies"]=[
-                {
-                    "node_id":dep,
-                    "contract_hash":reused_by_id[dep]["contract_hash"],
-                    "marker_digest":reused_by_id[dep]["marker_digest"],
-                    "terminal_attempt_id":reused_by_id[dep]["terminal_attempt_id"],
-                }
-                for dep in satisfied
-            ]
         source_contract_hash=_continuation_contract_hash(source_node)
-        node["source_contract_hash"]=source_contract_hash
+        node=_continuation_node_projection(source_node,reused)
         route_nodes.append(node)
         descriptors.append({
             "node_id":str(source_node["id"]),
@@ -6217,6 +6201,36 @@ def _owner_closure_eligibility(route, node, node_id, evidence, row_metadata, lin
     }
 
 
+def _continuation_node_projection(parent_node, reused_nodes):
+    """Project a reviewed node through the continuation builder's exact rewrite.
+
+    Dependency changes are authorized only by the source completion evidence,
+    not by provenance fields copied from the child route.  The caller verifies
+    those rows against the parent's canonical markers before using this view.
+    """
+    source_dependencies = list(parent_node.get("depends_on") or [])
+    reused_by_id = {
+        row.get("node_id"): row for row in reused_nodes
+        if isinstance(row, dict) and isinstance(row.get("node_id"), str)
+    }
+    satisfied = [dependency for dependency in source_dependencies if dependency in reused_by_id]
+    expected = json.loads(json.dumps(parent_node))
+    expected["depends_on"] = [dependency for dependency in source_dependencies if dependency not in reused_by_id]
+    if satisfied:
+        expected["source_depends_on"] = source_dependencies
+        expected["reused_dependencies"] = [
+            {
+                "node_id": dependency,
+                "contract_hash": reused_by_id[dependency].get("contract_hash"),
+                "marker_digest": reused_by_id[dependency].get("marker_digest"),
+                "terminal_attempt_id": reused_by_id[dependency].get("terminal_attempt_id"),
+            }
+            for dependency in satisfied
+        ]
+    expected["source_contract_hash"] = _continuation_contract_hash(parent_node)
+    return expected
+
+
 def review_lineage_routes(route, node_id):
     """Exact node ancestry shared by review admission and disposition.
 
@@ -6236,15 +6250,50 @@ def review_lineage_routes(route, node_id):
         child_node = next((n for n in current["nodes"] if n["id"] == node_id), None)
         parent_node = next((n for n in parent["nodes"] if n["id"] == node_id), None)
         edge = next((n for n in current.get("new_nodes", []) if n.get("node_id") == node_id), None)
-        if (not child_node or not parent_node or not edge
+        # Rebuild the reused-prefix evidence from the parent's canonical
+        # markers. A self-consistent child hash cannot authorize invented
+        # dependency provenance or a forged marker/attempt tuple.
+        reused = current.get("reused_nodes")
+        if not isinstance(reused, list):
+            raise ValueError("owner-closure-lineage-node-mismatch:reuse-evidence")
+        reused_ids = [row.get("node_id") for row in reused if isinstance(row, dict)]
+        parent_node_ids = [str(node.get("id")) for node in parent.get("nodes", [])]
+        resume_id = current.get("resume_from_node")
+        if resume_id not in parent_node_ids:
+            raise ValueError("owner-closure-lineage-node-mismatch:resume-boundary")
+        resume_index = parent_node_ids.index(resume_id)
+        if (reused_ids != parent_node_ids[:resume_index]
+                or [str(node.get("id")) for node in current.get("nodes", [])]
+                   != parent_node_ids[resume_index:]):
+            raise ValueError("owner-closure-lineage-node-mismatch:reuse-prefix")
+        try:
+            expected_reused, expected_digest, _turns = _source_evidence_snapshot(parent, reused_ids)
+        except (KeyError, ValueError) as exc:
+            raise ValueError("owner-closure-lineage-node-mismatch:reuse-evidence") from exc
+        if canonical(expected_reused) != canonical(reused) or current.get("source_evidence_digest") != expected_digest:
+            raise ValueError("owner-closure-lineage-node-mismatch:reuse-evidence")
+        if parent_node is None:
+            raise ValueError("owner-closure-lineage-node-mismatch")
+        if child_node is None:
+            # A later continuation can carry this review in its completed
+            # prefix rather than its runnable node list. Its exact marker row
+            # is the assignment evidence; continue walking to the generation
+            # that actually owns the review node so its attempt census remains
+            # part of the same budget.
+            reused_node = next((row for row in reused if row.get("node_id") == node_id), None)
+            if (reused_node is None
+                    or reused_node.get("contract_hash") != _continuation_contract_hash(parent_node)):
+                raise ValueError("owner-closure-lineage-node-mismatch")
+            continue
+        if (not edge
                 or edge.get("source_contract_hash") != _continuation_contract_hash(parent_node)
                 or child_node.get("source_contract_hash") != _continuation_contract_hash(parent_node)
                 or edge.get("realized_contract_hash") != _continuation_contract_hash(child_node)):
             raise ValueError("owner-closure-lineage-node-mismatch")
-        # Topology rewriting may re-root dependencies, but cannot replace the
-        # review's assignment, assurance, gate or permitted write domain.
-        expected_node = {**parent_node, "depends_on": child_node.get("depends_on", []),
-                         "source_contract_hash": _continuation_contract_hash(parent_node)}
+        # Topology rewriting may remove only dependencies proven by that exact
+        # reused prefix; all other assignment, assurance, gate and scope fields
+        # remain byte-for-byte equal to the source node.
+        expected_node = _continuation_node_projection(parent_node, reused)
         if expected_node != child_node:
             raise ValueError("owner-closure-lineage-node-mismatch:assignment")
     return lineage
