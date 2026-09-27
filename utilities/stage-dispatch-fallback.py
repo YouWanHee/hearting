@@ -1660,8 +1660,10 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
             args.jobs, route["route_id"], node["id"],
             route=route if node.get("kind") == "review-worker" else None,
         )
+        admission_options = {"record_auto_revisions": False} if args.action == "dry-run" else {}
         node_round_budget = DISPATCH_NODE.admit_round(
             route, node, args.jobs, owner_attempt_id=args.parent_attempt_id,
+            **admission_options,
         ).budget
         if node_round_budget.state == "blocked-live":
             return fail(
