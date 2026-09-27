@@ -317,6 +317,24 @@ class CompletionMarkerTest(unittest.TestCase):
                 result = subprocess.run(command, text=True, capture_output=True, env=self.base_env())
                 self.assertNotIn("reason=completion-marker-missing", result.stdout)
 
+    def test_corrupt_predecessor_marker_is_typed_refusal_before_spawn(self):
+        route = self.compile_route(intensity="standard")
+        route_path = self.write_route(route, "route-corrupt-predecessor.json")
+        evidence = self.base / "plan.md"
+        evidence.write_text("plan body\n", encoding="utf-8")
+        self.assertEqual(self.complete(route_path, "plan", evidence).returncode, 0)
+        marker = self.stable_dispatch / "completion" / route["route_id"] / "plan.json"
+        marker.write_text("{corrupt", encoding="utf-8")
+        result = subprocess.run(
+            self.wrapper_command("codex", "start", route_path, route, "plan-check"),
+            text=True, capture_output=True, env=self.base_env(),
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("reason=completion-marker-integrity-broken", result.stdout)
+        self.assertIn("completion-marker-unreadable", result.stdout)
+        self.assertIn("child_spawned=0", result.stdout)
+        self.assertFalse(self.jobs.exists())
+
     # SD-154/B-2 defect #2, M1 (real gate, not stubbed) ----------------------
     def test_a_sd154_2_real_gate_reports_next_action_for_route_state_refusal(self):
         """The real wrapper's `completion_marker_gate` -- the exact function
@@ -369,6 +387,141 @@ class CompletionMarkerTest(unittest.TestCase):
         self.assertEqual((canonical_dir / "plan.1.json").read_bytes(), plan_seq1_bytes)
         plan_canonical_now = json.loads((canonical_dir / "plan.json").read_text(encoding="utf-8"))
         self.assertEqual(plan_canonical_now["sequence"], 2)
+        self.assertTrue(D.completion_marker_is_current(route, next(
+            node for node in route["nodes"] if node["id"] == "plan"
+        ), canonical_dir / "plan.json", plan_canonical_now))
+        link = json.loads((canonical_dir / f"plan.{plan_canonical_now['attempt_id']}.attempt.json").read_text())
+        self.assertEqual(link["completion_marker"], str(canonical_dir / "plan.json"))
+
+    def test_a_sd154_revision_chain_seq3_keeps_official_link_and_live_evidence(self):
+        """Official revise supports seq2+ with a real original attempt-link.
+
+        Every revision points to immutable predecessor bytes, while all
+        revisions intentionally share the live evidence path that revise
+        updates. The complete predecessor chain must remain current.
+        """
+        route = self.compile_route(intensity="standard")
+        route_path = self.write_route(route, "route-revise-seq3.json")
+        evidence = self.base / "plan.md"
+        evidence.write_text("plan v1\n", encoding="utf-8")
+        self.assertEqual(self.complete(route_path, "plan", evidence).returncode, 0)
+        for sequence, content in ((2, "plan v2\n"), (3, "plan v3\n")):
+            evidence.write_text(content, encoding="utf-8")
+            result = self.revise(
+                route_path, "plan", evidence, basis="user-direction",
+                direction=f"gate-release-fixture-{sequence}",
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            marker = json.loads(result.stdout.strip().splitlines()[-1])
+            self.assertEqual(marker["sequence"], sequence)
+        canonical_dir = self.stable_dispatch / "completion" / route["route_id"]
+        latest = json.loads((canonical_dir / "plan.json").read_text())
+        self.assertEqual(latest["revision"]["of_sequence"], 2)
+        self.assertEqual(latest["evidence"]["path"], str(evidence.resolve()))
+        self.assertEqual(
+            D.gate_currency(route, next(n for n in route["nodes"] if n["id"] == "plan"),
+                            canonical_dir / "plan.json", latest).state,
+            "current",
+        )
+
+    def test_a_sd154_revision_chain_longer_than_legacy_ceiling_is_current(self):
+        route = self.compile_route(intensity="standard")
+        route_path = self.write_route(route, "route-revise-long-chain.json")
+        evidence = self.base / "plan-long-chain.md"
+        evidence.write_text("plan v1\n", encoding="utf-8")
+        self.assertEqual(self.complete(route_path, "plan", evidence).returncode, 0)
+        for sequence in range(2, 131):
+            evidence.write_text(f"plan v{sequence}\n", encoding="utf-8")
+            result = self.revise(
+                route_path, "plan", evidence, basis="user-direction",
+                direction=f"long-chain-{sequence}",
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        canonical_dir = self.stable_dispatch / "completion" / route["route_id"]
+        latest = json.loads((canonical_dir / "plan.json").read_text(encoding="utf-8"))
+        self.assertEqual(latest["sequence"], 130)
+        currency = D.gate_currency(
+            route, next(n for n in route["nodes"] if n["id"] == "plan"),
+            canonical_dir / "plan.json", latest,
+        )
+        self.assertEqual(currency.state, "current", currency)
+
+    def test_a_sd154_rejects_forged_revision_predecessor_history_and_link(self):
+        import shutil
+        for target in ("history", "link"):
+            with self.subTest(target=target):
+                route = self.compile_route(intensity="standard")
+                route_path = self.write_route(route, f"route-revise-forged-{target}.json")
+                directory = self.stable_dispatch / "completion" / route["route_id"]
+                if directory.exists():
+                    shutil.rmtree(directory)
+                evidence = self.base / f"plan-{target}.md"
+                evidence.write_text("plan v1\n", encoding="utf-8")
+                self.assertEqual(self.complete(route_path, "plan", evidence).returncode, 0)
+                evidence.write_text("plan v2\n", encoding="utf-8")
+                revised = self.revise(
+                    route_path, "plan", evidence, basis="user-direction",
+                    direction=f"forged-{target}",
+                )
+                self.assertEqual(revised.returncode, 0, revised.stdout + revised.stderr)
+                latest = json.loads((directory / "plan.json").read_text())
+                if target == "history":
+                    history = directory / "plan.1.json"
+                    forged = json.loads(history.read_text())
+                    forged["completion_gate"] = "forged-gate"
+                    history.write_text(json.dumps(forged), encoding="utf-8")
+                else:
+                    link_path = directory / f"plan.{latest['attempt_id']}.attempt.json"
+                    link = json.loads(link_path.read_text())
+                    link["completion_marker"] = str(directory / "forged.json")
+                    link_path.write_text(json.dumps(link), encoding="utf-8")
+                currency = D.gate_currency(
+                    route, next(n for n in route["nodes"] if n["id"] == "plan"),
+                    directory / "plan.json", latest,
+                )
+                self.assertTrue(currency.state.startswith("integrity-broken:"), currency)
+
+    def test_a_sd154_rejects_malformed_and_cyclic_revision_edges(self):
+        import hashlib
+        import shutil
+        for defect in ("malformed", "cycle"):
+            with self.subTest(defect=defect):
+                route = self.compile_route(intensity="standard")
+                route_path = self.write_route(route, f"route-revise-edge-{defect}.json")
+                directory = self.stable_dispatch / "completion" / route["route_id"]
+                if directory.exists():
+                    shutil.rmtree(directory)
+                evidence = self.base / f"plan-edge-{defect}.md"
+                evidence.write_text("plan v1\n", encoding="utf-8")
+                self.assertEqual(self.complete(route_path, "plan", evidence).returncode, 0)
+                for sequence in (2, 3):
+                    evidence.write_text(f"plan v{sequence}\n", encoding="utf-8")
+                    result = self.revise(
+                        route_path, "plan", evidence, basis="user-direction",
+                        direction=f"edge-{defect}-{sequence}",
+                    )
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                latest = json.loads((directory / "plan.json").read_text())
+                if defect == "malformed":
+                    latest["revision"]["of_sequence"] = "2"
+                else:
+                    prior = json.loads((directory / "plan.2.json").read_text())
+                    prior["revision"]["of_sequence"] = 3
+                    prior_bytes = json.dumps(prior, sort_keys=True, separators=(",", ":")).encode()
+                    # History is compared as parsed JSON; the digest in the
+                    # next edge seals these exact bytes, as official revise
+                    # does for its serialized marker.
+                    (directory / "plan.2.json").write_bytes(prior_bytes)
+                    latest["revision"]["of_marker_sha256"] = hashlib.sha256(prior_bytes).hexdigest()
+                latest_bytes = json.dumps(latest, sort_keys=True, separators=(",", ":")).encode()
+                (directory / "plan.3.json").write_bytes(latest_bytes)
+                (directory / "plan.json").write_bytes(latest_bytes)
+                currency = D.gate_currency(
+                    route, next(n for n in route["nodes"] if n["id"] == "plan"),
+                    directory / "plan.json", latest,
+                )
+                self.assertEqual(currency.state, "integrity-broken:identity-mismatch")
+                self.assertEqual(currency.reason, "revision-provenance-invalid")
 
     def test_a_sd154_3_revision_tombstones_downstream_marker(self):
         """A-SD154-3: a revision over N tombstones the canonical marker of
@@ -396,9 +549,24 @@ class CompletionMarkerTest(unittest.TestCase):
         self.assertEqual(tombstone.get("state"), "superseded-by-upstream-revision")
         self.assertEqual(tombstone.get("superseded_by"), {"node": "plan", "sequence": 2})
 
-        command = self.wrapper_command("claude", "start", route_path, route, "execute")
-        reopened = subprocess.run(command, text=True, capture_output=True, env=self.base_env())
-        self.assertIn("reason=completion-marker-missing", reopened.stdout)
+        for action in ("start", "dry-run"):
+            with self.subTest(action=action):
+                command = self.wrapper_command("claude", action, route_path, route, "execute")
+                refused = subprocess.run(command, text=True, capture_output=True, env=self.base_env())
+                self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
+                self.assertIn("reason=completion-evidence-superseded", refused.stdout)
+                self.assertIn("detail=plan-check:superseded-by=plan@2", refused.stdout)
+                self.assertIn("child_spawned=0", refused.stdout)
+                self.assertIn("next_action=rerun dependency node plan-check", refused.stdout)
+        (canonical_dir / "plan-check.json").unlink()
+        missing = subprocess.run(
+            self.wrapper_command("claude", "start", route_path, route, "execute"),
+            text=True, capture_output=True, env=self.base_env(),
+        )
+        self.assertNotEqual(missing.returncode, 0, missing.stdout + missing.stderr)
+        self.assertIn("reason=completion-marker-missing", missing.stdout)
+        self.assertIn("detail=plan-check", missing.stdout)
+        self.assertIn("child_spawned=0", missing.stdout)
 
     def test_a_sd154_5_integrity_refusals_publish_nothing(self):
         """A-SD154-5: kept refusals publish zero new markers."""
@@ -587,6 +755,30 @@ class CompletionMarkerTest(unittest.TestCase):
             )
         self.assertEqual(second.auto_revisions, ())
 
+    def test_a_sd154_dry_run_previews_auto_revision_without_mutation(self):
+        route, plan_check_node = self._a_sd154_10_fixture("route-a10-dry-run.json")
+        route_path = self.base / "route-a10-dry-run.json"
+        canonical_dir = self.stable_dispatch / "completion" / route["route_id"]
+        plan_marker_path = canonical_dir / "plan.json"
+        before_marker = plan_marker_path.read_bytes()
+        before_jobs = self.jobs.read_bytes()
+        with mock.patch.dict(os.environ, self.base_env(), clear=True):
+            admission = DISPATCH_NODE.admit_round(
+                route, plan_check_node, self.jobs, owner_attempt_id="att-owner-dry",
+                record_auto_revisions=False,
+            )
+        self.assertEqual(admission.auto_revisions, ())
+        self.assertEqual(admission.planned_revision_nodes, frozenset({"plan"}))
+        self.assertEqual(admission.budget.round_kind, "closure-check")
+        with mock.patch.dict(os.environ, self.base_env(), clear=True):
+            D.completion_marker_gate(
+                str(route_path), "plan-check", "dry-run", self.agent_home, self.jobs,
+                planned_revision_nodes=admission.planned_revision_nodes,
+            )
+        self.assertEqual(plan_marker_path.read_bytes(), before_marker)
+        self.assertEqual(self.jobs.read_bytes(), before_jobs)
+        self.assertFalse((canonical_dir / "plan.2.json").exists())
+
     def test_a_sd154_10_tampered_history_records_nothing(self):
         """A tampered `<N>.1.json` history file is `integrity-broken`, not
         `revised-unrecorded` -- `admit_round` must not paper over it."""
@@ -730,7 +922,7 @@ class CompletionMarkerTest(unittest.TestCase):
         self.assertEqual(offenders, [])
 
     def test_dependency_gate_rejects_schema_less_or_unlinked_marker(self):
-        route = self.compile_route()
+        route = self.compile_route(intensity="standard")
         route_path = self.write_route(route)
         evidence = self.base / "plan.md"
         evidence.write_text("plan body\n", encoding="utf-8")
@@ -742,11 +934,12 @@ class CompletionMarkerTest(unittest.TestCase):
         marker.pop("schema_version")
         canonical.write_text(json.dumps(marker), encoding="utf-8")
         result = subprocess.run(
-            self.wrapper_command("codex", "start", route_path, route, "execute"),
+            self.wrapper_command("codex", "start", route_path, route, "plan-check"),
             text=True, capture_output=True, env=self.base_env(),
         )
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("reason=completion-marker-missing", result.stdout)
+        self.assertIn("reason=completion-marker-integrity-broken", result.stdout)
+        self.assertIn("completion-marker-identity-mismatch", result.stdout)
 
     # fixture 9 ---------------------------------------------------------
     def test_reharvest_preserves_history_and_latest_is_authoritative(self):

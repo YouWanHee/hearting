@@ -324,16 +324,17 @@ class RoundAdmission:
  """The shared admission decision for a launch surface: budget AND SD-154
  auto-revision.
 
- `auto_revisions` is every revision marker this call recorded (13.59.3 rule
- 8) -- the launching surface does not need to report them separately, they
- already exist on disk before `budget` is computed.
+ `auto_revisions` contains every revision marker this call recorded (13.59.3
+ rule 8). A read-only preview leaves that tuple empty and reports eligible
+ nodes in `planned_revision_nodes`; the budget still accounts for them.
  """
  budget: object
  auto_revisions: tuple = ()
+ planned_revision_nodes: frozenset[str] = frozenset()
 
 
-def _auto_record_revisions(route, node, jobs, rows, *, owner_attempt_id):
- """SD-154 rule 8: before admitting D's next round, auto-record a revision
+def _auto_record_revisions(route, node, jobs, rows, *, owner_attempt_id, record=True):
+ """SD-154 rule 8: before admitting D's next round, auto-record or preview a revision
  on each upstream N that is `revised-unrecorded` when D's last round was a
  blocking FAIL that basis-verifies against N. Never launches anything --
  only `publish_revision_locked` writes, under its own node lock.
@@ -376,6 +377,13 @@ def _auto_record_revisions(route, node, jobs, rows, *, owner_attempt_id):
    ROUTE.revision_basis_verdict(route, dep_node, "review-findings", (last_attempt,), jobs=jobs)
   except ValueError:
    continue  # condition (3): basis verification failed -- next_action=revise stays manual.
+  if not record:
+   recorded.append({
+    "node_id": dep,
+    "stage_authority": "revision",
+    "revision": {"answers": [last_attempt], "basis": "review-findings"},
+   })
+   continue
   try:
    result = ROUTE.publish_revision_locked(
     route, dep, evidence_path, basis="review-findings",
@@ -388,7 +396,8 @@ def _auto_record_revisions(route, node, jobs, rows, *, owner_attempt_id):
  return tuple(recorded)
 
 
-def admit_round(route, node, jobs, *, owner_attempt_id=None, exclude_slug=None, exclude_attempt=None):
+def admit_round(route, node, jobs, *, owner_attempt_id=None, exclude_slug=None, exclude_attempt=None,
+                record_auto_revisions=True):
  """The one admission decision every registered launch surface reads.
 
  Replaces the three separate `len(prior)+1 > max_round` comparisons that
@@ -404,10 +413,24 @@ def admit_round(route, node, jobs, *, owner_attempt_id=None, exclude_slug=None, 
                              exclude_attempt=exclude_attempt,
                              route=route if node.get("kind") == "review-worker" else None)
  classified_rows = [(cols[1], meta) for cols, meta in rows]
- auto_revisions = _auto_record_revisions(route, node, jobs, classified_rows, owner_attempt_id=owner_attempt_id)
+ auto_revisions = _auto_record_revisions(
+  route, node, jobs, classified_rows, owner_attempt_id=owner_attempt_id,
+  record=record_auto_revisions,
+ )
  dependency_revisions = ROUTE._dependency_revisions(route, node, jobs)
+ dependency_ids = set(node.get("depends_on", ()))
+ dependency_revisions.extend(
+  revision.get("revision", {}) for revision in auto_revisions
+  if revision.get("node_id") in dependency_ids
+ )
  budget =REVIEW_ROUND_CAP.round_budget(route, node, classified_rows, revisions=dependency_revisions)
- return RoundAdmission(budget=budget, auto_revisions=auto_revisions)
+ return RoundAdmission(
+  budget=budget,
+  auto_revisions=auto_revisions if record_auto_revisions else (),
+  planned_revision_nodes=frozenset(
+   str(item["node_id"]) for item in auto_revisions if item.get("node_id")
+  ),
+ )
 
 
 max_review_rounds = REVIEW_ROUND_CAP.max_review_rounds
