@@ -27,6 +27,7 @@ from dispatch_completion_join import (
 from dispatch_parent_completion import default_parent_session_id, interactive_parent_identity
 from codex_managed_dispatch import ManagedDispatchError, probe_managed_codex_parent
 from parent_next_directive import parent_next
+import owner_write_advisory as OWNER_WRITE_ADVISORY
 
 ROOT = Path(__file__).resolve().parents[1]
 START_WINDOW_SECONDS = 600
@@ -623,6 +624,7 @@ def start_work(route, path, jobs, *, wait=False, interview=None, answers=None,
                decision="proceed", run=subprocess.run, sleep=time.sleep, clock=time.time):
     result = {"route_file": str(Path(path).resolve()), "route_id": route["route_id"],
               "launches": [], "owner_started": False,
+              "advisories": OWNER_WRITE_ADVISORY.advisories(route),
               "resume_command": shlex.join([sys.executable, str(ROOT / "utilities/capability-route.py"),
                   "start", "--route", str(Path(path).resolve()), "--jobs", str(Path(jobs).resolve())])}
     try:
@@ -653,4 +655,8 @@ def start_work(route, path, jobs, *, wait=False, interview=None, answers=None,
             "their runtime watcher and completion delivery. Correct the admission input or resolve the reported "
             "failure, then use resume_command; it automatically replaces one proven silent death per logical node. "
             "If the correction changes the requested work, ask the user before changing that work.")
+    for launch in result.get("launches", []):
+        for advisory in OWNER_WRITE_ADVISORY.receipt_advisories(launch.get("receipt", "")):
+            if advisory not in result["advisories"]:
+                result["advisories"].append(advisory)
     return result

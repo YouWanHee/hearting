@@ -19,6 +19,7 @@ import dispatch_runtime_support as RUNTIME_SUPPORT
 import dispatch_terminal_commit
 import model_profile as PROFILE
 import review_round_cap as REVIEW_ROUND_CAP
+import owner_write_advisory as OWNER_WRITE_ADVISORY
 from dispatch_continuation_budget import COMPATIBILITY_FLOOR, TERMINAL_RESERVE_DEFAULT
 from dispatch_contract import (
     row_is_subsession,
@@ -1421,17 +1422,8 @@ def _git_commit(cwd):
     return p.stdout.strip() if p.returncode == 0 else "unversioned"
 
 def worktree_mutating_scope(scope):
-    """Does this write scope let a node mutate the worktree?
-
-    The **one** definition of the rule. `worker-route-guard.py` imports this
-    module and calls this function, so the decline below classifies a node
-    exactly the way the guard that adjudicates it does. A second near-identical
-    copy would be two answers to one question, and the drift would be silent.
-    """
-    if scope in ("target-artifact","source-scoped"):
-        return True
-    root=scope[:-3] if str(scope).endswith("/**") else scope
-    return root=="source"
+    """Shared with the launch guard and the read-only owner advisory."""
+    return OWNER_WRITE_ADVISORY.worktree_mutating_scope(scope)
 
 def _node_mutates_worktree(node):
     return any(worktree_mutating_scope(scope) for scope in (node.get("write_scope") or []))
@@ -2837,7 +2829,7 @@ def _compose_campaign_line(selection):
     return f"  {text} · 활성 캠페인 {selection['active_count']}개" + (f": {shown}" if shown else "")
 
 
-def compose_card(route, plan=None, plan_source=None):
+def compose_card(route, plan=None, plan_source=None, *, owner_harness=None):
     """One-line `[경로]` notice the acting session pastes instead of a card."""
     shape = route.get("selection", {}).get("shape") or shape_for_intensity(route["effective_intensity"])
     ids = [node["id"] for node in route["nodes"]]
@@ -2852,6 +2844,8 @@ def compose_card(route, plan=None, plan_source=None):
     if plan:
         suffix = " (상속)" if plan_source == "inherited" else ""
         card += f"\n  계획 {' › '.join(plan)}{suffix}"
+    for advisory in OWNER_WRITE_ADVISORY.advisories(route, owner_harness=owner_harness):
+        card += "\n  " + advisory["message"]
     return card
 
 
@@ -6986,7 +6980,7 @@ def _compose_artifact_root(cwd):
     return root
 
 
-def compose_receipt(route, path):
+def compose_receipt(route, path, *, owner_harness=None):
     """The ordinary caller needs its choices and handle, not all sealed evidence."""
     return {
         "route_file": str(Path(path).resolve()), "route_id": route["route_id"],
@@ -6999,6 +6993,7 @@ def compose_receipt(route, path):
                   for node in route["nodes"]],
         "human_gates": route.get("human_gates", []),
         "campaign": compose_campaign_selection(route),
+        "advisories": OWNER_WRITE_ADVISORY.advisories(route, owner_harness=owner_harness),
     }
 
 
@@ -7307,7 +7302,7 @@ def _emit_compiled_route(a,route,artifact_root,output=None):
                         plan=plan, plan_source=plan_source)
     _compose_self_bind(a, route, output_path.resolve())
     print(f"route_file={output_path.resolve()}",file=sys.stderr)
-    result = (compose_receipt(route, output_path)
+    result = (compose_receipt(route, output_path, owner_harness=getattr(a, "owner", None))
               if a.command == "compose" and not getattr(a, "full_record", False) else route)
     if not getattr(a, "start", False):
         print(json.dumps(result,sort_keys=True))
@@ -7514,7 +7509,7 @@ def main():
             work_request={"text":a.prompt_file.read_text(),"owner_harness":a.owner} if a.prompt_file else None,
         )
         _plan_for_card, _plan_source_for_card = a._route_chain_plan
-        print(compose_card(route, _plan_for_card, _plan_source_for_card),file=sys.stderr)
+        print(compose_card(route, _plan_for_card, _plan_source_for_card, owner_harness=a.owner),file=sys.stderr)
         if a.explain:
             print("route_file_written=0 explain=1",file=sys.stderr)
             print(json.dumps({"route_id":route["route_id"],"capability":route["capability"],
@@ -7525,6 +7520,7 @@ def main():
                                        for n in route["nodes"]],
                               "human_gates":route.get("human_gates"),"parallel_groups":route.get("parallel_groups"),
                               "campaign":compose_campaign_selection(route),
+                              "advisories":OWNER_WRITE_ADVISORY.advisories(route, owner_harness=a.owner),
                               "tracked_gate_evidence":route.get("tracked_gate_evidence")},sort_keys=True))
             return 0
         path = _emit_compiled_route(a,route,artifact_root)
