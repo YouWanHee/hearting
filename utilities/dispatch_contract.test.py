@@ -3786,6 +3786,29 @@ def direct_extinct_metadata(attempt="att-extinct-fixture"):
 
 
 class ObserverNamespaceExtinctTest(unittest.TestCase):
+ def test_permission_denied_namespace_uses_only_proven_procfs_root_membership(self):
+  import errno
+  for status, self_status, expected in (
+   ("NSpid:\t7\n", f"NSpid:\t{os.getpid()}\n", "extinct"),
+   ("NSpid:\t7 1\n", f"NSpid:\t{os.getpid()}\n", "unverifiable"),
+   ("Name:\tunknown\n", f"NSpid:\t{os.getpid()}\n", "unverifiable"),
+   ("NSpid:\t7\nNSpid:\t7\n", f"NSpid:\t{os.getpid()}\n", "unverifiable"),
+   ("NSpid:\t8\n", f"NSpid:\t{os.getpid()}\n", "unverifiable"),
+   ("NSpid:\tgarbled\n", f"NSpid:\t{os.getpid()}\n", "unverifiable"),
+   ("NSpid:\t7\n", "Name:\tunknown\n", "unverifiable"),
+   ("NSpid:\t7\n", f"NSpid:\t{os.getpid()} 1\n", "unverifiable"),
+   (PermissionError(errno.EACCES,"denied"), f"NSpid:\t{os.getpid()}\n", "unverifiable"),
+  ):
+   def readlink(path):
+    if path == "/proc/self/ns/pid": return "pid:[999]"
+    raise PermissionError(errno.EACCES,"denied")
+   def read_text(path,*a,**kw):
+    if str(path) == "/proc/self/status": return self_status
+    if isinstance(status,Exception): raise status
+    return status
+   with self.subTest(status=status,self_status=self_status), mock.patch.object(D.os,"readlink",side_effect=readlink), mock.patch.object(D,"_current_observer_is_host_like",return_value=True), mock.patch.object(D.os,"listdir",return_value=["7"]), mock.patch.object(Path,"read_text",read_text):
+    self.assertEqual(D.observer_namespace_extinct(direct_extinct_metadata()),expected)
+
  def test_present_when_a_live_entry_matches_the_recorded_namespace(self):
   # C-1
   metadata=direct_extinct_metadata()

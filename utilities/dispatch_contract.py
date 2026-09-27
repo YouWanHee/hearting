@@ -2382,6 +2382,22 @@ def _current_observer_is_host_like() -> bool:
     return comm in {"systemd", "init"}
 
 
+def _procfs_root_namespace_member(path: Path, pid: int) -> bool:
+    """A single NSpid column proves membership in the procfs root namespace.
+
+    Linux fs/proc/array.c emits NSpid from the procfs mount namespace down to
+    the process namespace. This is kernel evidence even when ptrace policy
+    denies readlink(ns/pid) for a root-owned process; nested or hidden status
+    remains unknown. Both the observer and candidate must pass this check.
+    """
+    try:
+        entries = [line.split()[1:] for line in path.read_text().splitlines()
+                   if line.startswith("NSpid:")]
+    except (OSError, ValueError):
+        return False
+    return entries == [[str(pid)]] and pid > 0
+
+
 def observer_namespace_extinct(metadata: dict[str, str]) -> str:
     """Whether the row's recorded observer PID namespace still exists on the host.
 
@@ -2429,7 +2445,14 @@ def observer_namespace_extinct(metadata: dict[str, str]) -> str:
             candidate = os.readlink(f"/proc/{entry}/ns/pid")
         except (FileNotFoundError, ProcessLookupError):
             continue
-        except OSError:
+        except OSError as exc:
+            # Ordinary users cannot read root-owned namespace links. A
+            # readable single-column NSpid still proves that process belongs
+            # to our procfs-root namespace, not the recorded foreign one.
+            if (exc.errno in {errno.EACCES, errno.EPERM}
+                    and _procfs_root_namespace_member(Path("/proc/self/status"), os.getpid())
+                    and _procfs_root_namespace_member(Path(f"/proc/{entry}/status"), int(entry))):
+                continue
             return "unverifiable"
         if candidate == recorded_observer:
             return "present"

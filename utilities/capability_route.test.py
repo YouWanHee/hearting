@@ -4211,6 +4211,46 @@ class GroundingCwdLineageTest(unittest.TestCase):
   (root/"a").write_text("1"); git("add","."); git("commit","-q","-m","a")
   base=subprocess.run(["git","-C",str(root),"rev-parse","HEAD"],capture_output=True,text=True).stdout.strip()
   return root,git,base
+ def test_project_cwd_identity_does_not_hash_untracked_runtime_files(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   root,git,base=self._repo(tmp)
+   reports=root/"reports"; reports.mkdir(); (reports/"tracked").write_text("tracked")
+   git("add","."); git("commit","-qm","reports")
+   base=subprocess.check_output(["git","-C",str(root),"rev-parse","HEAD"],text=True).strip()
+   runtime=reports/".runtime"; runtime.mkdir()
+   for n in range(1000): (runtime/str(n)).write_text("mutable state")
+   R._forget_launch_path(root)
+   with mock.patch.object(R,"_launch_source_revision",side_effect=AssertionError("project content scan")):
+    identity=R._launch_root_identity("grounding_cwd",root)
+   self.assertEqual(identity["release_id"],base)
+   self.assertTrue(R._grounding_cwd_lineage_ok(root,base+"+dirty:legacy",identity["release_id"]))
+ def test_cwd_that_is_a_code_root_keeps_strict_release_identity(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   root,_,base=self._repo(tmp)
+   (root/"a").write_text("modified code")
+   R._forget_launch_path(root)
+   runtime=R._launch_root_identity("runtime_root",root)
+   cwd=R._launch_root_identity("grounding_cwd",root)
+   self.assertEqual(cwd["release_id"],runtime["release_id"])
+   self.assertTrue(cwd["release_id"].startswith(base+"+dirty:"))
+ def test_wrapper_code_root_is_hashed_before_grounding_cwd(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   root,git,base=self._repo(tmp)
+   adapters=root/"adapters"; adapters.mkdir(); (adapters/"source.py").write_text("old")
+   git("add","."); git("commit","-qm","adapters")
+   (adapters/"source.py").write_text("new")
+   R._forget_launch_path(root); R._forget_launch_path(adapters)
+   with mock.patch.object(R,"resolve_agent_home",return_value=str(root)):
+    result=R.launch_compatibility_tuple(artifact_root=Path(tmp)/"artifacts",cwd=adapters)
+   self.assertEqual(result["grounding_roots"]["cwd"]["release_id"],result["wrapper_root"]["release_id"])
+   self.assertIn("+dirty:",result["wrapper_root"]["release_id"])
+ def test_cwd_revision_timeout_does_not_fall_back_to_content_scan(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   root,_,_=self._repo(tmp); R._forget_launch_path(root)
+   with mock.patch.object(R.subprocess,"run",side_effect=subprocess.TimeoutExpired("git",10)), mock.patch.object(R,"_launch_source_revision") as scan:
+    with self.assertRaisesRegex(ValueError,"grounding-cwd-revision-unverifiable"):
+     R._launch_root_identity("grounding_cwd",root)
+    scan.assert_not_called()
  def test_same_head_with_dirty_suffix_is_accepted(self):
   with tempfile.TemporaryDirectory() as tmp:
    root,_,base=self._repo(tmp)

@@ -542,6 +542,15 @@ def cmd_start(args):
     except Exception:
         agent_block = None
     started = proc.returncode == 0 and not payload_error
+    # herdr can report an error body with exit 0 (e.g. agent_name_taken).
+    # Preserve its bounded machine-readable code instead of silently discarding
+    # the only explanation of a refused start. Do not echo arbitrary error text.
+    failure_reason = ""
+    if not started:
+        code = payload_error.get("code") if isinstance(payload_error, dict) else None
+        failure_reason = (code if isinstance(code, str)
+                          and re.fullmatch(r"[A-Za-z0-9_-]{1,80}", code)
+                          else "herdr-start-error" if payload_error else "herdr-start-failed")
     _record(
         to_harness=args.kind, to_name=args.name, kind="steer",
         summary_text=f"[start] {args.name} kind={args.kind} mode={mode}",
@@ -579,6 +588,7 @@ def cmd_start(args):
         f"started={str(started).lower()} agent={args.kind} name={args.name} "
         f"pane={args.pane} permission_mode={mode} session_id={started_sid or '-'} "
         f"managed={managed}"
+        + (f" reason={failure_reason} herdr_rc={proc.returncode}" if failure_reason else "")
         + (f" ingress={ingress_note}" if ingress_note else "")
         + (f" cwd={pane_cwd}" if pane_cwd else "")
     )

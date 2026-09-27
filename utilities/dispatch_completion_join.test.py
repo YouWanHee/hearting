@@ -167,6 +167,63 @@ class DispatchCompletionJoinTest(unittest.TestCase):
             "pid_scope": "namespace-local", "pid_observer_ns": "pid:[999999999]",
         })
 
+    def test_join_settles_exact_dead_stage_and_cleanup_in_shared_dirty_worktree(self):
+        shared=self.root / "shared"; shared.mkdir()
+        def git(*args):
+            subprocess.run(["git","-C",str(shared),*args],check=True,capture_output=True)
+        git("init","-q"); git("config","user.email","test@example.test"); git("config","user.name","Test")
+        (shared / "dirty").write_text("committed"); git("add","."); git("commit","-qm","initial")
+        (shared / "dirty").write_text("uncommitted")
+        owner=subprocess.Popen(["sleep","60"],cwd=shared)
+        worker=subprocess.Popen([sys.executable,"-c","import sys; sys.stdin.read()"],
+                                stdin=subprocess.PIPE,start_new_session=True)
+        identity=D.process_launch_identity(worker.pid)
+        identity.update(fallback_hop="same-harness-headless", worker_type="stage", pid_scope="namespace-local")
+        worker.stdin.close(); worker.wait(timeout=5)
+        self.jobs.write_text(row("open","att-silent-stage","att-parent","silent",
+                                 process_metadata=identity).replace("\t/wt\t",f"\t{shared}\t"))
+        try:
+            receipt=JOIN.join_batch(jobs=self.jobs,parent_attempt_id="att-parent",
+                                    timeout=5,interval=0.01,recover_receiptless=True)
+            self.assertEqual(receipt["state"],"ready",receipt)
+            saved=JOIN.current_attempt_row(self.jobs,"att-silent-stage")
+            self.assertEqual(saved.status,"done")
+            self.assertIn(saved.metadata["note"],{"dead-exact-pid","dead-namespace-absent"})
+            self.assertIn("cleanup_receipt_digest",saved.metadata)
+            self.assertIsNone(owner.poll())
+            self.assertEqual((shared/"dirty").read_text(),"uncommitted")
+        finally:
+            owner.terminate(); owner.wait(timeout=5)
+
+    def test_host_join_settles_extinct_foreign_namespace_without_silent_retry(self):
+        if not D._current_observer_is_host_like():
+            self.skipTest("requires a host procfs observer")
+        metadata={"pid":"99999999","pgid":"99999999","pid_start":"1",
+                  "pid_scope":"namespace-local","pid_observer_ns":"pid:[999999999]",
+                  "fallback_hop":"same-harness-headless","worker_type":"stage"}
+        proof=D.prove_attempt_quiescence(
+            {**metadata,"attempt_id":"att-extinct-stage","registered_worker":"1"},
+            max_wait_seconds=0,allow_namespace_extinct=True)
+        if not proof.proven:
+            self.skipTest("host procfs cannot prove foreign namespace extinction: " + proof.reason)
+        self.jobs.write_text(row("open","att-extinct-stage","att-parent","foreign",process_metadata=metadata))
+        receipt=JOIN.join_batch(jobs=self.jobs,parent_attempt_id="att-parent",
+                                timeout=10,interval=0.01,recover_receiptless=True)
+        self.assertEqual(receipt["state"],"ready",receipt)
+        saved=JOIN.current_attempt_row(self.jobs,"att-extinct-stage")
+        self.assertEqual(saved.metadata["note"],"cancelled-receipt-unavailable")
+        self.assertIn("cancellation_quiescence_receipt",saved.metadata)
+        self.assertEqual(len(self.jobs.read_text().splitlines()),1)
+
+    def test_exact_death_reply_requires_same_attempt_and_lock_revalidation(self):
+        self.jobs.write_text(self.receiptless_row())
+        child=JOIN.current_children(self.jobs,"att-parent")[0]
+        for aid, category, revalidated in (("foreign","exact-dead",True),(child.attempt_id,"merged",True),(child.attempt_id,"exact-dead",False)):
+            payload={"classifier_source":"tools.fleet.model.classify_attempt_evidence",
+                     "decisions":[{"attempt_id":aid,"category":category,"revalidated":revalidated,"closed":1}]}
+            with mock.patch.object(JOIN.subprocess,"run",return_value=mock.Mock(returncode=0,stdout=json.dumps(payload))):
+                self.assertFalse(JOIN.reconcile_exact_dead_attempt(self.jobs,child)["closed"])
+
     def test_receiptless_recovery_runs_before_timeout_and_rechecks_closure(self):
         for harness in ("claude", "codex", "opencode"):
             with self.subTest(harness=harness):

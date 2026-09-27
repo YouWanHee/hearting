@@ -702,6 +702,11 @@ def classify(row, args, newest_orders, rows=None, *, expected_binding=None):
     if all(key[:2]) and newest_orders.get(key) == row["order"]:
         proven, reason = terminal_marker(row, args.agent_home, args.jobs)
         if proven: return "stale-terminal", reason, "dead-stale-terminal"
+    # A shared dirty worktree and its live owner say nothing about this
+    # registered attempt's life. Cleanup eligibility belongs to folder removal,
+    # never to settling a worker row (2026-09-27 silent stage exit).
+    if meta.get("registered_worker") == "1" or getattr(args, "only_exact_dead", False):
+        return "unverifiable", "attempt-process-unverifiable", None
     worktree = Path(row["worktree"])
     if worktree.is_absolute() and worktree.is_dir():
         try: verdict = cleanup.evaluate(worktree.resolve(), args.jobs, args.integration_ref)
@@ -887,6 +892,7 @@ def repair_stale_row(rows, args):
 
 
 def reconcile(rows, args):
+    only_exact_dead = getattr(args, "only_exact_dead", False)
     selected = [row for row in rows if matches(row, args)]
     newest = {}
     for row in rows:
@@ -903,7 +909,7 @@ def reconcile(rows, args):
             row, args, newest, rows, expected_binding=selected_binding
         )
         terminal_cleanup = None
-        if row["status"] not in OPEN and row.get("attempt_contract_status") == "current":
+        if not only_exact_dead and row["status"] not in OPEN and row.get("attempt_contract_status") == "current":
             terminal_cleanup = resolve_attempt_cleanup(
                 args.jobs, row["meta"]["attempt_id"], apply=args.apply)
             category = "terminal-settled" if terminal_cleanup["settled"] else "terminal-cleanup-pending"
@@ -912,7 +918,8 @@ def reconcile(rows, args):
         cascade = []
         summary_owner = {"state": "not-applied", "reason": "dry-run"}
         revalidated = None
-        if args.apply and note and row["meta"].get("attempt_id"):
+        if (args.apply and note and row["meta"].get("attempt_id")
+                and (not only_exact_dead or category == "exact-dead")):
             fresh_decision = {}
 
             def still_safe(_fields):
@@ -957,7 +964,7 @@ def reconcile(rows, args):
             if closed and note == "dead-parent-orphaned":
                 route_id, _, _ = resolve_owner_route(row, rows, args.jobs)
                 cascade = cascade_orphan_children(row, route_id, args)
-        if (args.apply and not closed and row["status"] in OPEN
+        if (args.apply and not only_exact_dead and not closed and row["status"] in OPEN
                 and row["attempt_contract_status"] == "current"
                 and row["meta"].get("attempt_id")):
             summary_owner = ensure_attempt_owner(
@@ -971,7 +978,9 @@ def reconcile(rows, args):
               "apply": args.apply, "classifier_source": ATTEMPT_CLASSIFIER_SOURCE,
               "attempted": len(selected), "closed": sum(item["closed"] for item in decisions),
               "decisions": decisions[:256]}
-    if args.apply:
+    if only_exact_dead:
+        pass  # Exact join recovery never repairs unrelated delivery/owner state.
+    elif args.apply:
         # SD-111 P2 §2-b-2/§2-c: this `reconcile` call is the existing
         # bounded-cadence "dispatch reconcile path" -- the materialize
         # backstop and the single declared expiry actor share its cadence
@@ -2221,6 +2230,8 @@ def main(argv):
     p.add_argument("--expected-row-sha256")
     p.add_argument("--cancel-receiptless-namespace", action="store_true")
     p.add_argument("--automatic-cancel-receiptless", action="store_true")
+    p.add_argument("--only-exact-dead", action="store_true",
+                   help="settle only the selected attempt's exact death; never apply cleanup eligibility")
     p.add_argument("--recover-receiptless", action="store_true")
     p.add_argument("--seal-artifact-proof-receipt", action="store_true")
     p.add_argument("--route-file", type=Path)
@@ -2234,6 +2245,14 @@ def main(argv):
     p.add_argument("--from-ts"); p.add_argument("--to-ts")
     p.add_argument("--include-archive", action="store_true")
     args = p.parse_args(argv[1:]); args.agent_home = args.agent_home or resolve_agent_home()
+    if args.only_exact_dead and (
+        args.operation != "reconcile" or not args.attempt
+        or any((args.session, args.route, args.node, args.job, args.all,
+                args.global_jobs, args.local_jobs, args.cancel_receiptless_namespace,
+                args.automatic_cancel_receiptless, args.recover_receiptless,
+                args.seal_artifact_proof_receipt))
+    ):
+        print("check=failed\nreason=exact-attempt-death-required"); return 64
     from dispatch_terminal_commit import require_current_cleanup
     require_current_cleanup('registry')
     if args.cascade_grace < 0 or args.cascade_kill_wait < 0 or args.cancellation_wait < 0:
@@ -2302,6 +2321,7 @@ def main(argv):
     if args.operation not in ("liveness", "orphan-scan") and not any((args.session, args.route, args.node, args.attempt, args.job)):
         print("check=failed\nreason=current-filter-required"); return 64
     recovery_modes = sum(bool(value) for value in (
+        args.only_exact_dead,
         args.cancel_receiptless_namespace,
         args.automatic_cancel_receiptless,
         args.recover_receiptless,

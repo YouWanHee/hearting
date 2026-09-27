@@ -2985,6 +2985,33 @@ def write_join_observation(jobs: Path, identity: dict[str, str], children: list[
             pass
 
 
+def reconcile_exact_dead_attempt(jobs: Path, row: ChildRow) -> dict[str, object]:
+    """Delegate exact death to the registry's lock-revalidated classifier."""
+    command = [sys.executable, str(ROOT / "utilities" / "dispatch-registry.py"),
+               "reconcile", "--attempt", row.attempt_id, "--only-exact-dead",
+               "--apply", "--jobs", str(jobs)]
+    try:
+        result = subprocess.run(command, text=True, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, timeout=10, check=False)
+        record = json.loads(result.stdout)
+        decisions = record.get("decisions")
+        if (result.returncode != 0
+                or record.get("classifier_source") != "tools.fleet.model.classify_attempt_evidence"
+                or not isinstance(decisions, list) or len(decisions) != 1
+                or decisions[0].get("attempt_id") != row.attempt_id):
+            raise ValueError("exact-death-contract-invalid")
+        decision = decisions[0]
+        closed = decision.get("closed") == 1
+        if closed and (decision.get("category") != "exact-dead"
+                       or decision.get("revalidated") is not True):
+            raise ValueError("exact-death-proof-missing")
+        return {"attempt_id": row.attempt_id, "closed": closed,
+                "reason": str(decision.get("reason") or "exact-death-unproved")[:160]}
+    except (OSError, ValueError, TypeError, AttributeError, subprocess.TimeoutExpired):
+        return {"attempt_id": row.attempt_id, "closed": False,
+                "reason": "exact-death-recovery-failed"}
+
+
 def recover_receiptless_attempt(jobs: Path, row: ChildRow) -> dict[str, object]:
     """Ask the existing proof authority to settle one exact receiptless row.
 
@@ -2993,6 +3020,14 @@ def recover_receiptless_attempt(jobs: Path, row: ChildRow) -> dict[str, object]:
     """
     if row.status not in OPEN_STATES:
         return resolve_attempt_cleanup(jobs, row.attempt_id, apply=True)
+    exact = reconcile_exact_dead_attempt(jobs, row)
+    if exact["closed"]:
+        # A closed row can still lack its namespace cleanup proof. Settle the
+        # exact post-exit proof now, rather than sleeping another recovery tick.
+        resolve_attempt_cleanup(jobs, row.attempt_id, apply=True)
+        return exact
+    if row.metadata.get("pid_scope") != "namespace-local":
+        return exact
     command = [
         sys.executable, str(ROOT / "utilities" / "dispatch-registry.py"),
         "reconcile", "--attempt", row.attempt_id,
@@ -3013,6 +3048,8 @@ def recover_receiptless_attempt(jobs: Path, row: ChildRow) -> dict[str, object]:
         closed = decision.get("closed") == 1
         if closed and not str(decision.get("receipt_digest") or "").startswith("sha256:"):
             raise ValueError("recovery-proof-missing")
+        if closed:
+            resolve_attempt_cleanup(jobs, row.attempt_id, apply=True)
         return {"attempt_id": row.attempt_id, "closed": closed,
                 "reason": str(decision.get("reason") or "recovery-unavailable")[:160]}
     except (OSError, ValueError, TypeError, AttributeError, subprocess.TimeoutExpired):
@@ -3205,9 +3242,12 @@ def _join_snapshot(
                     else "terminal-commit-pending"
                 ), True
             if (recovery is not None and readiness == "pending"
-                    and reason == "process-unverifiable"
+                    and (reason == "process-unverifiable" or (
+                        reason == "terminal-commit-pending"
+                        and row.status in OPEN_STATES
+                        and row.metadata.get("pid", "").isdigit()
+                        and row.metadata.get("pid_start")))
                     and row.metadata.get("registered_worker") == "1"
-                    and row.metadata.get("pid_scope") == "namespace-local"
                     and time.monotonic() - last_recovery.get(row.attempt_id, float("-inf")) >= 30):
                 last_recovery[row.attempt_id] = time.monotonic()
                 outcome = recovery(row)

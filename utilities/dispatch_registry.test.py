@@ -547,6 +547,35 @@ class RegistryTest(unittest.TestCase):
    child.wait()
 
 
+ def test_exact_death_in_dirty_shared_worktree_ignores_live_owner_cwd(self):
+  module=self.load_registry_module("shared_death")
+  shared=self.base/"shared"; shared.mkdir(); (shared/"dirty").write_text("uncommitted")
+  owner=subprocess.Popen(["sleep","60"],cwd=shared)
+  try:
+   dead="att-dead-shared"
+   self.jobs.write_text(self.ghost_row(dead).replace("\t/w\t",f"\t{shared}\t")+"\n")
+   currentize_registry(self.jobs)
+   with mock.patch.object(module.cleanup,"evaluate",side_effect=AssertionError("cleanup used for liveness")), mock.patch.object(module,"ensure_attempt_owner",side_effect=AssertionError("unrelated repair")), mock.patch.object(module,"reconcile_pending_delivery",side_effect=AssertionError("global delivery mutation")), contextlib.redirect_stdout(io.StringIO()) as out:
+    self.assertEqual(module.main([str(SCRIPT),"reconcile","--jobs",str(self.jobs),"--agent-home",str(self.base),"--attempt",dead,"--only-exact-dead","--apply"]),0)
+   self.assertEqual(json.loads(out.getvalue())["closed"],1)
+   self.assertIsNone(owner.poll())
+   self.assertEqual((shared/"dirty").read_text(),"uncommitted")
+  finally:
+   owner.terminate();owner.wait(timeout=5)
+
+ def test_exact_death_mode_keeps_live_attempt_without_other_repairs(self):
+  module=self.load_registry_module("only_live")
+  before=self.jobs.read_bytes()
+  with mock.patch.object(module,"ensure_attempt_owner",side_effect=AssertionError("unrelated repair")), mock.patch.object(module,"reconcile_pending_delivery",side_effect=AssertionError("global delivery mutation")), contextlib.redirect_stdout(io.StringIO()) as out:
+   self.assertEqual(module.main([str(SCRIPT),"reconcile","--jobs",str(self.jobs),"--agent-home",str(self.base),"--attempt","att-active0001","--only-exact-dead","--apply"]),0)
+  self.assertEqual(json.loads(out.getvalue())["closed"],0)
+  self.assertEqual(self.jobs.read_bytes(),before)
+
+ def test_exact_death_mode_rejects_broad_or_conflicting_recovery(self):
+  for flags in (("--route","r1"),("--attempt","att-dead000001","--automatic-cancel-receiptless"),("--global-jobs",str(self.jobs),"--local-jobs",str(self.jobs))):
+   result=self.invoke("reconcile","--only-exact-dead",*flags,"--apply")
+   self.assertEqual(result.returncode,64,result.stdout+result.stderr)
+
  def ghost_row(self,attempt,extra=""):
   """A namespace-local row whose PID is unreadable here, with a fresh heartbeat.
 
@@ -1762,8 +1791,8 @@ class MixedRegistryTest(unittest.TestCase):
   self.assertEqual(dry["closed"],0);self.assertEqual(self.jobs.read_text(),before)
   applied=json.loads(self.invoke("reconcile","--route","r1","--apply").stdout)
   categories={item["slug"]:item["category"] for item in applied["decisions"]}
-  self.assertEqual(categories,{"active":"active","dead":"exact-dead","merged":"merged","stale":"stale-terminal","unsafe":"unsafe"})
-  text=self.jobs.read_text();self.assertIn("note=dead-exact-pid",text);self.assertIn("note=cleanup-merged",text);self.assertIn("note=dead-stale-terminal",text)
+  self.assertEqual(categories,{"active":"active","dead":"exact-dead","merged":"unverifiable","stale":"stale-terminal","unsafe":"unverifiable"})
+  text=self.jobs.read_text();self.assertIn("note=dead-exact-pid",text);self.assertNotIn("note=cleanup-merged",text);self.assertIn("note=dead-stale-terminal",text)
   self.assertIn("\topen\t"+str(self.primary)+"\t"+str(self.unsafe)+"\tunsafe\t",text)
   self.assertIn("\topen\t"+str(self.primary)+"\t/x\tunrelated\t",text)
   again=json.loads(self.invoke("reconcile","--route","r1","--apply").stdout);self.assertEqual(again["closed"],0)

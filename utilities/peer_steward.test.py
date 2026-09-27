@@ -566,6 +566,24 @@ class StartTest(_TmpRootMixin, unittest.TestCase):
         line = print_mock.call_args[0][0]
         self.assertIn("started=false", line)
 
+    def test_start_failure_explains_name_collision_and_bounded_fallbacks(self):
+        for error, rc, reason in (
+            ({"code": "agent_name_taken"}, 0, "agent_name_taken"),
+            ({"code": "bad code\nwith details"}, 0, "herdr-start-error"),
+            ("unstructured error", 0, "herdr-start-error"),
+            (None, 2, "herdr-start-failed"),
+        ):
+            with self.subTest(error=error), mock.patch("builtins.print") as output, \
+                 mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+                 mock.patch.object(peer_steward.subprocess, "run", return_value=subprocess.CompletedProcess(
+                     [], rc, stdout=json.dumps({"error": error}), stderr="private detail")):
+                self._start()
+                line = output.call_args[0][0]
+                self.assertIn("started=false", line)
+                self.assertIn(f"reason={reason} herdr_rc={rc}", line)
+                self.assertNotIn("private detail", line)
+                self.assertNotIn("\n", line)
+
     def test_agent_args_pass_through_after_prefix_flags(self):
         with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
              mock.patch.object(peer_steward.subprocess, "run",

@@ -362,7 +362,27 @@ def _launch_root_identity(kind, path, *, resolver_identity=None):
     key=(kind,str(resolved),resolver_key)
     if key not in _LAUNCH_ROOT_IDENTITY_CACHE:
         if resolver_identity is None:
-            release_id=_launch_source_revision(resolved)
+            # A mutable project cwd is compared by first-parent HEAD lineage,
+            # never by installer dirty-content hashes. On 2026-09-27 home-os
+            # had >100k untracked runtime files under a tracked directory;
+            # hashing them here exhausted the pre-claim fence's 60s budget.
+            # Code roots retain their complete release identity, including when
+            # a development checkout is also the grounding cwd.
+            if kind == "grounding_cwd" and str(resolved) not in _LAUNCH_SOURCE_REVISION_CACHE:
+                try:
+                    head=subprocess.run(
+                        ["git","-C",str(resolved),"rev-parse","--verify","HEAD"],
+                        capture_output=True,text=True,timeout=10,
+                        env={**os.environ,"GIT_OPTIONAL_LOCKS":"0"},
+                    )
+                except (OSError,subprocess.TimeoutExpired) as exc:
+                    raise ValueError("grounding-cwd-revision-unverifiable") from exc
+                if head.returncode == 0 and _GIT_SHA.fullmatch(head.stdout.strip()):
+                    release_id=head.stdout.strip()
+                else:
+                    release_id=_launch_source_revision(resolved)
+            else:
+                release_id=_launch_source_revision(resolved)
             content_digest=_launch_content_digest(resolved)
         else:
             release_id=resolver_identity["release_id"]
@@ -386,6 +406,9 @@ def launch_compatibility_tuple(*, artifact_root, jobs=None, cwd=None, refresh_cw
         # tuple comes from one reading of the tree.
         _forget_launch_path(grounding_cwd)
     runtime_identity=_launch_root_identity("runtime_root",runtime_root)
+    # Compute every executable root before the mutable cwd: a route may run
+    # inside adapters/, which is itself the wrapper code root.
+    wrapper_identity=_launch_root_identity("wrapper_root",runtime_root/"adapters")
     result={
         "tuple_version":LAUNCH_COMPATIBILITY_TUPLE_VERSION,
         "registry_root":_launch_root_identity("registry_root",TOPO.ROOT),
@@ -398,7 +421,7 @@ def launch_compatibility_tuple(*, artifact_root, jobs=None, cwd=None, refresh_cw
                 resolver_identity=runtime_identity,
             ),
         },
-        "wrapper_root":_launch_root_identity("wrapper_root",runtime_root/"adapters"),
+        "wrapper_root":wrapper_identity,
     }
     try:
         jobs_path=resolve_dispatch_state_root(resolve_agent_home(),jobs)/"jobs.log"
