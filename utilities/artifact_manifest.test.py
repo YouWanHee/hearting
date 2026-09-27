@@ -416,7 +416,7 @@ class TestLocatorSafety(unittest.TestCase):
                                                   "payload", cycle + "/artifacts/file", "regular").allowed)
 
     def test_shared_control_and_payload_corpus_has_typed_results(self):
-        for namespace, relative, kind, prospective, allowed, reason in SHARED_PATH_CORPUS:
+        for namespace, relative, kind, prospective, allowed, reason, _surface_reasons in SHARED_PATH_CORPUS:
             with self.subTest(namespace=namespace, path=relative):
                 result = m.classify_artifact_path(
                     "/private/artifacts", "campaigns/camp", "campaigns/camp/cyc",
@@ -449,33 +449,33 @@ class TestLocatorSafety(unittest.TestCase):
 # admission and reader suites. Paths are root-relative and bindings are fixed in
 # the fixture helper above so every surface compares identical typed results.
 SHARED_PATH_CORPUS = (
-    ("control", "campaigns/camp/campaign.json", "regular", False, True, None),
-    ("control", "campaigns/camp/campaign.events/000001.json", "regular", False, True, None),
-    ("control", "campaigns/camp/campaign.events/not-numbered.json", "regular", False, False, "campaign-event-path-invalid"),
-    ("control", "campaigns/camp/campaign.events/1.json", "regular", False, False, "campaign-event-path-invalid"),
-    ("control", "campaigns/camp/campaign.events/nested/000001.json", "regular", False, False, "campaign-event-path-invalid"),
-    ("control", "campaigns/camp/campaign.events/nested/notes/manifest.json", "regular", False, False, "campaign-event-path-invalid"),
-    ("control", "campaigns/camp/campaign.satisfied.json", "regular", False, True, None),
-    ("control", "campaigns/camp/cyc/.cycle.json", "regular", False, True, None),
-    ("control", "campaigns/camp/cyc/manifest.json", "regular", False, True, None),
-    ("control", ".runtime/other/anything.json", "regular", False, True, None),
-    ("payload", ".runtime/other/anything.json", "regular", False, False, "outside-cycle-artifacts"),
-    ("payload", "campaigns/camp/cyc/artifacts/plans/manifest.json", "regular", False, True, None),
-    ("locator", "artifacts/manifest.json", "regular", False, True, None),
-    ("locator", "artifacts/_internal/candidate/round_1/manifest.json", "regular", False, True, None),
-    ("locator", "artifacts/_internal/candidate/round_2/manifest.json", "regular", False, True, None),
-    ("locator", "artifacts/.cache/manifest.json", "regular", False, True, None),
-    ("locator", ".runtime/spoof.json", "regular", False, False, "locator-hidden-component"),
-    ("locator", "campaigns/camp/.hidden", "regular", False, False, "locator-hidden-component"),
-    ("locator", "artifacts/../escape", "regular", False, False, "locator-dot-segment"),
-    ("payload", "campaigns/camp/cyc/artifacts/plans/manifest.json", "regular", False, True, None),
-    ("payload", "campaigns/camp/cyc/artifacts/plans/link", "symlink", False, False, "payload-node-not-regular"),
-    ("payload", "campaigns/camp/cyc/manifest.json", "regular", False, False, "outside-cycle-artifacts"),
+    ("control", "campaigns/camp/campaign.json", "regular", False, True, None, {}),
+    ("control", "campaigns/camp/campaign.events/000001.json", "regular", False, True, None, {}),
+    ("control", "campaigns/camp/campaign.events/not-numbered.json", "regular", False, False, "campaign-event-path-invalid", {}),
+    ("control", "campaigns/camp/campaign.events/1.json", "regular", False, False, "campaign-event-path-invalid", {}),
+    ("control", "campaigns/camp/campaign.events/nested/000001.json", "regular", False, False, "campaign-event-path-invalid", {}),
+    ("control", "campaigns/camp/campaign.events/nested/notes/manifest.json", "regular", False, False, "campaign-event-path-invalid", {}),
+    ("control", "campaigns/camp/campaign.satisfied.json", "regular", False, True, None, {}),
+    ("control", "campaigns/camp/cyc/.cycle.json", "regular", False, True, None, {}),
+    ("control", "campaigns/camp/cyc/manifest.json", "regular", False, True, None, {}),
+    ("control", ".runtime/other/anything.json", "regular", False, True, None, {}),
+    ("payload", ".runtime/other/anything.json", "regular", False, False, "outside-cycle-artifacts", {"lifecycle": "locator-hidden-component", "admission": "locator-hidden-component", "producer": "file-outside-artifacts"}),
+    ("payload", "campaigns/camp/cyc/artifacts/plans/manifest.json", "regular", False, True, None, {}),
+    ("locator", "artifacts/manifest.json", "regular", False, True, None, {}),
+    ("locator", "artifacts/_internal/candidate/round_1/manifest.json", "regular", False, True, None, {}),
+    ("locator", "artifacts/_internal/candidate/round_2/manifest.json", "regular", False, True, None, {}),
+    ("locator", "artifacts/.cache/manifest.json", "regular", False, True, None, {}),
+    ("locator", ".runtime/spoof.json", "regular", False, False, "locator-hidden-component", {"producer": "file-outside-artifacts"}),
+    ("locator", "campaigns/camp/.hidden", "regular", False, False, "locator-hidden-component", {"producer": "file-outside-artifacts"}),
+    ("locator", "artifacts/../escape", "regular", False, False, "locator-dot-segment", {"producer": "file-outside-artifacts"}),
+    ("payload", "campaigns/camp/cyc/artifacts/plans/manifest.json", "regular", False, True, None, {}),
+    ("payload", "campaigns/camp/cyc/artifacts/plans/link", "symlink", False, False, "payload-node-not-regular", {"lifecycle": "artifact-symlink-forbidden", "admission": "staging-symlink-forbidden", "producer": "symlink-forbidden"}),
+    ("payload", "campaigns/camp/cyc/manifest.json", "regular", False, False, "outside-cycle-artifacts", {"lifecycle": "locator-reserved-name", "admission": "locator-reserved-name", "producer": "file-outside-artifacts"}),
 )
 
 
 def apply_shared_path_corpus(testcase):
-    for namespace, relative, kind, prospective, allowed, reason in SHARED_PATH_CORPUS:
+    for namespace, relative, kind, prospective, allowed, reason, _surface_reasons in SHARED_PATH_CORPUS:
         with testcase.subTest(namespace=namespace, path=relative):
             result = m.classify_artifact_path(
                 "/private/artifacts", "campaigns/camp", "campaigns/camp/cyc",

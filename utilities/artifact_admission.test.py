@@ -266,7 +266,38 @@ class TestIdempotencyAndDeterminism(AdmissionContractBase):
             Path(__file__).with_name("artifact_manifest.test.py"))
         corpus = importlib.util.module_from_spec(_CORPUS_SPEC)
         _CORPUS_SPEC.loader.exec_module(corpus)
-        corpus.apply_shared_path_corpus(self)
+        rows = [row for row in corpus.SHARED_PATH_CORPUS if row[0] in {"payload", "locator"}]
+        for index, (namespace, relative, kind, _prospective, allowed, reason, public_reasons) in enumerate(rows):
+            with self.subTest(namespace=namespace, path=relative), tempfile.TemporaryDirectory() as scratch:
+                root = Path(scratch) / "root"
+                root.mkdir()
+                identity = adm.ensure_root_identity(
+                    root, allocator=idm.IdAllocator(entropy=lambda n: b"\x22" * n))
+                data = b"corpus payload\n"
+                doc, _ = _make_valid_document(self.alloc, identity, content=data)
+                if namespace == "payload" and relative.startswith("campaigns/camp/cyc/"):
+                    locator = relative[len("campaigns/camp/cyc/"):]
+                else:
+                    locator = relative
+                doc["artifact_revisions"][0]["locator"]["path"] = locator
+                source = Path(scratch) / "staging-source"
+                target = source / locator
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if kind == "symlink":
+                    outside = Path(scratch) / "outside"
+                    outside.write_bytes(data)
+                    target.symlink_to(outside)
+                else:
+                    target.write_bytes(data)
+                outcome = adm.admit(
+                    root, adm.AdmissionRequest(
+                        idempotency_key="corpus-{}".format(index), document=doc, staging_source=source,
+                    ))
+                self.assertEqual(outcome.status == "admitted", allowed, outcome.to_payload())
+                if not allowed:
+                    codes = [violation.code for violation in outcome.violations]
+                    expected = public_reasons.get("admission", reason)
+                    self.assertIn(expected, codes, (relative, codes))
 
     def test_nested_manifest_payload_is_admitted_and_preserved(self):
         identity = self._identity()

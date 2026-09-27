@@ -210,14 +210,35 @@ def _cycle(**kw):
 
 class ArtifactLifecycleCycleTest(LifecycleTestBase):
     def test_shared_classifier_corpus_matches_lifecycle_payload_verification(self):
-        _CORPUS.apply_shared_path_corpus(self)
-        root = self.root
-        campaign = "campaigns/camp"
-        cycle = campaign + "/cyc"
-        for namespace, relative, kind, prospective, allowed, reason in _CORPUS.SHARED_PATH_CORPUS:
-            classified = m.classify_artifact_path(str(root), campaign, cycle,
-                                                  namespace, relative, kind, prospective=prospective)
-            self.assertEqual((classified.allowed, classified.reason), (allowed, reason), relative)
+        rows = [row for row in _CORPUS.SHARED_PATH_CORPUS if row[0] in {"payload", "locator"}]
+        for index, (namespace, relative, kind, _prospective, allowed, reason, public_reasons) in enumerate(rows):
+            with self.subTest(namespace=namespace, path=relative), tempfile.TemporaryDirectory() as scratch:
+                cycle_root = Path(scratch) / "cycle"
+                cycle_root.mkdir()
+                if namespace == "payload" and relative.startswith("campaigns/camp/cyc/"):
+                    locator = relative[len("campaigns/camp/cyc/"):]
+                else:
+                    locator = relative
+                target = cycle_root / locator
+                target.parent.mkdir(parents=True, exist_ok=True)
+                data = b"corpus payload\n"
+                if kind == "symlink":
+                    outside = Path(scratch) / "outside"
+                    outside.write_bytes(data)
+                    target.symlink_to(outside)
+                else:
+                    target.write_bytes(data)
+                document = {"artifact_revisions": [{
+                    "locator": {"path": locator}, "byte_size": len(data),
+                    "content_digest": m.digest_bytes(data), "media_type": "application/octet-stream",
+                }]}
+                decision = L.verify_published_payload(cycle_root, document)
+                self.assertEqual(decision.status == "verified", allowed, relative)
+                if not allowed:
+                    detail = decision.reasons[0].detail
+                    failure = detail.split(";")[0]
+                    typed_reason = failure.rsplit(":", 1)[-1] if failure.startswith("locator-invalid:") else failure.split(":", 1)[0]
+                    self.assertEqual(typed_reason, public_reasons.get("lifecycle", reason), (relative, detail))
 
     # P1 -- identical input_digest, compatible criterion, prior active.
     def test_compatible_unresolved_resume_preserves_cycle_id(self):
