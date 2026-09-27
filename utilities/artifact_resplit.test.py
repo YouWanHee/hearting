@@ -1867,14 +1867,18 @@ class HeartingCanaryRegressionTests(unittest.TestCase):
 
     def test_canary_run_still_reports_all_five_recorded_deviations(self):
         report = W.resplit_deviations(HEARTING_CANARY_ROOT, lump_cycle_id=HEARTING_CANARY_LUMP)
-        self.assertEqual(sorted(report["deviations"]), sorted(CANARY_RECORDED_DEVIATIONS))
+        historical = set(CANARY_RECORDED_DEVIATIONS)
+        self.assertEqual(sorted(set(report["deviations"]) & historical), sorted(historical))
         self.assertEqual(report["not_evaluated"], [])
         by_id = {c["id"]: c for c in report["checks"]}
-        # The two checks added by this cycle are clean on the canary and must stay so:
-        # its lump campaign still holds a live relocation cycle (so `active` is correct
-        # there), and it has no `plans/stage-sessions` residue at all.
-        self.assertEqual(by_id["campaign-state"]["status"], "ok")
-        self.assertEqual(by_id["stage-sessions"]["status"], "ok")
+        self.assertEqual(set(by_id), historical | {"campaign-state", "stage-sessions"})
+        for check_id in historical:
+            self.assertEqual(by_id[check_id]["status"], "deviation", check_id)
+        # These two checks read today's side records/disk, not the frozen run.
+        # Their correctness is covered by the hermetic Deviation* fixtures;
+        # finishing a real campaign must not change this historical assertion.
+        for check_id in ("campaign-state", "stage-sessions"):
+            self.assertIn(by_id[check_id]["status"], {"ok", "deviation"})
         self.assertEqual(len(by_id["cycle-state"]["rows"]), 16)
         self.assertEqual(len(by_id["started-on"]["rows"]), 16)
         self.assertTrue(all(r["observed"] == "active" for r in by_id["cycle-state"]["rows"]))

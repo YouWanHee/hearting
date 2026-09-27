@@ -36,14 +36,29 @@ class SpecTransactionTest(unittest.TestCase):
  def test_blocked_wait_rereads_and_snapshots_each_exact_preimage(self):
   with tempfile.TemporaryDirectory() as td:
    root=Path(td); artifact,spec,route=self.fixture(root); (spec/"prd.md").write_text("v0\n"); events=root/"events.jsonl"
-   code="import os,time; from pathlib import Path; Path(os.environ['AGENT_SPEC_ROOT'],'prd.md').write_text('v'+os.environ['AGENT_SPEC_NEXT_VERSION']+'\\n'); time.sleep(float(os.environ.get('HOLD','0')))"
+   release=root/"release-first"
+   code=("import os,time; from pathlib import Path; Path(os.environ['AGENT_SPEC_ROOT'],'prd.md').write_text('v'+os.environ['AGENT_SPEC_NEXT_VERSION']+'\\n')\n"
+         "release=os.environ.get('RELEASE_FILE'); deadline=time.monotonic()+10\n"
+         "while release and not Path(release).exists():\n"
+         " if time.monotonic()>=deadline: raise TimeoutError('test release was not signalled')\n"
+         " time.sleep(.01)\n")
    base=self.command(root,artifact,route,code,events=events)
-   first=subprocess.Popen(base,env={**HERMETIC_ENV,"HOLD":".4"},stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
-   deadline=time.time()+2
-   while time.time()<deadline and (not events.exists() or '"status": "acquired"' not in events.read_text()): time.sleep(.02)
-   second=subprocess.Popen(base,env={**HERMETIC_ENV,"HOLD":"0"},stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
-   out1,err1=first.communicate(timeout=4); out2,err2=second.communicate(timeout=4)
-   self.assertEqual(first.returncode,0,out1+err1); self.assertEqual(second.returncode,0,out2+err2)
+   def wait_event(status):
+    deadline=time.monotonic()+5
+    while time.monotonic()<deadline:
+     if events.exists() and f'"status": "{status}"' in events.read_text(): return True
+     time.sleep(.02)
+    return False
+   children=[]
+   try:
+    children.append(subprocess.Popen(base,env={**HERMETIC_ENV,"RELEASE_FILE":str(release)},stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True))
+    self.assertTrue(wait_event("acquired"),"first transaction did not acquire the lock")
+    children.append(subprocess.Popen(base,env=HERMETIC_ENV,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True))
+    self.assertTrue(wait_event("BLOCKED"),"second transaction did not observe contention")
+   finally:
+    release.touch()
+    results=[child.communicate(timeout=15) for child in children]
+   for child,(out,err) in zip(children,results): self.assertEqual(child.returncode,0,out+err)
    rows=[json.loads(line) for line in events.read_text().splitlines()]
    self.assertTrue(any(row["status"]=="BLOCKED" for row in rows))
    self.assertEqual((spec/"_internal/versions/v1/prd.md").read_text(),"v0\n")
