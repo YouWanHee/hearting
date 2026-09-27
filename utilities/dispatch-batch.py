@@ -1942,14 +1942,19 @@ def main(argv: list[str] | None = None) -> int:
         # dispatch-node.py's own admission (which the leg launch below still
         # goes through) must agree, so this no longer keeps its own
         # `len(prior)+1 > max_round` comparison.
+        planned_revision_nodes: set[str] = set()
         for capped_node in nodes:
             capped_node_id = str(capped_node["id"])
             if capped_node_id not in DISPATCH_NODE.ROUND_CAPPED_NODE_IDS:
                 continue
-            budget = DISPATCH_NODE.admit_round(
+            admission_options = {"record_auto_revisions": False} if args.action == "dry-run" else {}
+            admission = DISPATCH_NODE.admit_round(
                 route, capped_node, jobs,
                 owner_attempt_id=os.environ.get("AGENT_DISPATCH_ATTEMPT_ID"),
-            ).budget
+                **admission_options,
+            )
+            budget = admission.budget
+            planned_revision_nodes.update(admission.planned_revision_nodes)
             if budget.state == "blocked-live":
                 raise BatchError(
                     "prior-attempt-still-live",
@@ -2018,7 +2023,8 @@ def main(argv: list[str] | None = None) -> int:
             if str(node["id"]) not in gated_nodes:
                 continue
             completion_marker_gate(
-                str(route_path), str(node["id"]), args.action, agent_home, jobs
+                str(route_path), str(node["id"]), args.action, agent_home, jobs,
+                planned_revision_nodes=planned_revision_nodes,
             )
     except (
         BatchError,

@@ -102,8 +102,65 @@ class FallbackTest(unittest.TestCase):
    "status":native,"check_source":"fixture"}]}
   with mock.patch.dict(os.environ,self.launch_roots_env()):
    route=R.compile_route("autopilot-code","dev","strong",self.repo,self.art,signals=["shared-contract"],transport="headless",tracking="tracked",tracked_gate_evidence=gate,dispatch_evidence=evidence)
+  plan=next(node for node in route.get("nodes",[]) if node.get("id")=="plan")
+  if plan.get("depends_on"):
+   # These fallback-ranking fixtures do not test the frame entry gate.
+   plan["depends_on"]=[]
+   route["route_hash"]=R.route_hash(route)
+   route["route_id"]=R.ROUTE_IDENTITY.route_id_from_hash(route["route_hash"])
   path=Path(self.tmp.name)/"route.json"; path.write_text(json.dumps(route),encoding="utf-8"); return path
+ def seed_predecessor_markers(self,path,node_id):
+  """Publish real linked inline markers so dry-run tests exercise their
+  intended launch-selection behavior with the same gate state as --start."""
+  route=json.loads(Path(path).read_text(encoding="utf-8"))
+  nodes={node["id"]:node for node in route.get("nodes",[])}
+  target=nodes.get(node_id,{})
+  entry_gates={
+   binding.get("gate") for binding in route.get("human_gate_bindings",[])
+   if binding.get("node")==node_id and binding.get("position","entry")=="entry"
+   and any(node.get("continuation",{}).get("kind")=="human-gate"
+           and node.get("continuation",{}).get("gate")==binding.get("gate")
+           for node in route.get("nodes",[]))
+  }
+  if entry_gates:
+   import workflow_state as WS
+   self.jobs.parent.mkdir(parents=True,exist_ok=True)
+   self.jobs.touch(exist_ok=True)
+   ledger=WS.WorkflowLedger(route["route_id"],route["route_hash"],jobs=self.jobs)
+   for gate in sorted(entry_gates):
+    if ledger.read_only_state().get("workflow_state")=="RUNNING":
+     continue
+    with ledger.lock():
+     ledger.set_workflow_state("READY",evidence={},actor="dry-run-fixture")
+     ledger.set_workflow_state(
+      "BLOCKED_HUMAN_GATE",evidence={"gate":gate,"artifact":"fixture.md"},
+      actor="dry-run-fixture",
+     )
+     ledger.set_workflow_state(
+      "RUNNING",evidence={"released_gate":gate,"released_by":"fixture",
+                           "actor_kind":"user","decision":"proceed"},
+      actor="dry-run-fixture",
+     )
+  with mock.patch.dict(os.environ,self.launch_roots_env()):
+   for dep in target.get("depends_on",[]):
+    predecessor=nodes.get(dep)
+    if predecessor is None:
+     continue
+    evidence=self.art/"_internal"/"dry-run-predecessors"/f"{dep}.md"
+    evidence.parent.mkdir(parents=True,exist_ok=True)
+    evidence.write_text(f"fixture predecessor {dep}\n",encoding="utf-8")
+    R._publish_completion_locked(
+     route,predecessor,dep,evidence,jobs=self.jobs,
+     attempt_id=f"att-dry-run-{route['route_id']}-{dep}",
+     attempt_metadata={
+      "attempt_schema_version":2,
+      "dispatch_depth":predecessor.get("dispatch_depth",2),
+      "transport":"interactive","execution_surface":"inline",
+      "registered_worker":False,"fallback_hop":"inline",
+     },
+    )
  def run_chain(self,path,*extra,seed=True,**envkw):
+  self.seed_predecessor_markers(path,"plan")
   if seed:self.seed_parent()
   cmd=[sys.executable,str(ROOT/"utilities/stage-dispatch-fallback.py"),"--route",str(path),"--node","plan","--slug","fallback-plan","--parent","owner","--capability-mode","dev","--worker-mode","plan/plan-author","--model-role","deep maker","--jobs",str(self.jobs),"--dry-run",*extra]
   clean={k:v for k,v in os.environ.items() if not k.startswith("AGENT_DISPATCH_CURRENT_")}
@@ -133,6 +190,7 @@ class FallbackTest(unittest.TestCase):
   lets `mock.patch.object(F, ...)` (e.g. `_usage_states`) reach the code
   under test. Call inside `with self.dispatch_env(): ...`.
   """
+  self.seed_predecessor_markers(path,"plan")
   if seed:self.seed_parent()
   argv=["stage-dispatch-fallback.py","--route",str(path),"--node","plan","--slug","fallback-plan",
         "--parent","owner","--capability-mode","dev","--worker-mode","plan/plan-author",
@@ -144,6 +202,7 @@ class FallbackTest(unittest.TestCase):
  def run_inline_main(self,path,*extra,seed=True):
   """Like `run_inline()` but through `F.main()` -- exercises the try/finally
   report-only wrapper (B47-5), not just `_dispatch()`."""
+  self.seed_predecessor_markers(path,"plan")
   if seed:self.seed_parent()
   argv=["stage-dispatch-fallback.py","--route",str(path),"--node","plan","--slug","fallback-plan",
         "--parent","owner","--capability-mode","dev","--worker-mode","plan/plan-author",
@@ -168,6 +227,7 @@ class FallbackTest(unittest.TestCase):
   """`run_inline` for a capped review node (C-14). In-process like run_inline:
   the subprocess `run_chain` path additionally binds a launch runtime root,
   which is a separate axis this fixture does not need to exercise."""
+  self.seed_predecessor_markers(path,node_id)
   if seed:self.seed_parent()
   argv=["stage-dispatch-fallback.py","--route",str(path),"--node",node_id,"--slug",f"fallback-{node_id}",
         "--parent","owner","--capability-mode","dev","--worker-mode",worker_mode,
@@ -235,6 +295,7 @@ class FallbackTest(unittest.TestCase):
   with self.dispatch_env():
    path=self.route(same_status="supported")
    route=json.loads(path.read_text())
+   self.seed_predecessor_markers(path,"plan-check")
    self.seed_parent()
    self.seed_review_rounds(route["route_id"],"plan-check",1)
    prompt_file=self.repo/"plan-check-prompt.md"
@@ -723,6 +784,7 @@ class FallbackTest(unittest.TestCase):
   route["route_hash"]=R.route_hash(route); route["route_id"]="rt-"+route["route_hash"].split(":",1)[1][:16]; path.write_text(json.dumps(route))
   result=self.run_chain(path); self.assertEqual(result.returncode,76,result.stdout+result.stderr); self.assertIn("reason=legacy-broker-route-read-only",result.stdout)
  def run_node(self,path,node,action,*extra,**envkw):
+  self.seed_predecessor_markers(path,node)
   self.seed_parent()
   cmd=[sys.executable,str(ROOT/"utilities/stage-dispatch-fallback.py"),"--route",str(path),"--node",node,"--slug","fallback-"+node,"--parent","owner","--capability-mode","dev","--jobs",str(self.jobs),"--"+action,*extra]
   clean={k:v for k,v in os.environ.items() if not k.startswith("AGENT_DISPATCH_CURRENT_")}
@@ -1245,6 +1307,7 @@ class FallbackTest(unittest.TestCase):
      tracked_gate_evidence=gate,dispatch_evidence=evidence)
   path=Path(self.tmp.name)/"evidence-pair-route.json"
   path.write_text(json.dumps(route),encoding="utf-8")
+  self.seed_predecessor_markers(path,"plan-check")
   self.seed_parent()
   cmd=[sys.executable,str(ROOT/"utilities/stage-dispatch-fallback.py"),
        "--route",str(path),"--node","plan-check","--slug","fb-evidence-pair",
@@ -1308,6 +1371,7 @@ class FallbackTest(unittest.TestCase):
      tracked_gate_evidence=gate,dispatch_evidence=evidence)
   path=Path(self.tmp.name)/"sole-gate-route.json"
   path.write_text(json.dumps(route),encoding="utf-8")
+  self.seed_predecessor_markers(path,"plan-check")
   self.seed_parent()
   cmd=[sys.executable,str(ROOT/"utilities/stage-dispatch-fallback.py"),
        "--route",str(path),"--node","plan-check","--slug","fb-sole-gate",
@@ -1571,44 +1635,47 @@ class FallbackTest(unittest.TestCase):
   guardian keeps out of every file but `dispatch_contract.py` and the
   adapters' generic relay).
   """
-  stub_reason="completion-evidence-revised-unrecorded"
-  self.assertIn(stub_reason,F.ROUTE_STATE_REFUSAL_REASONS)
-  path=self.route()
-  real_run=subprocess.run
-  def fake_run(cmd,*args,**kwargs):
-   if any("dispatch-headless.py" in str(part) for part in cmd):
-    return SimpleNamespace(
-     returncode=65,
-     stdout=f"check=failed\nreason={stub_reason}\ndetail=plan\n",
-     stderr="",
-    )
-   return real_run(cmd,*args,**kwargs)
-  buf=io.StringIO()
-  with self.dispatch_env():
-   with mock.patch.object(F.subprocess,"run",side_effect=fake_run):
-    with contextlib.redirect_stdout(buf):
-     try:
-      code,_observation=self.run_inline(path)
-     except SystemExit as exc:
-      code=exc.code
-  output=buf.getvalue()
-  fields=F.output_fields(output)
-  self.assertEqual(code,65,output)
-  self.assertEqual(fields.get("reason"),stub_reason,output)
-  self.assertEqual(fields.get("child_spawned"),"0",output)
-  self.assertTrue(fields.get("next_action"),output)
-  self.assertNotIn("selected_hop=inline",output)
-  self.assertNotIn("runtime-unavailable",output)
+  for stub_reason in (
+      "completion-evidence-revised-unrecorded",
+      "completion-evidence-superseded",
+  ):
+   with self.subTest(reason=stub_reason):
+    self.assertIn(stub_reason,F.ROUTE_STATE_REFUSAL_REASONS)
+    path=self.route()
+    real_run=subprocess.run
+    def fake_run(cmd,*args,**kwargs):
+     if any("dispatch-headless.py" in str(part) for part in cmd):
+      return SimpleNamespace(
+       returncode=65,
+       stdout=f"check=failed\nreason={stub_reason}\ndetail=plan\nnext_action=repair-route-state\n",
+       stderr="",
+      )
+     return real_run(cmd,*args,**kwargs)
+    buf=io.StringIO()
+    with self.dispatch_env():
+     with mock.patch.object(F.subprocess,"run",side_effect=fake_run):
+      with contextlib.redirect_stdout(buf):
+       try:
+        code,_observation=self.run_inline(path)
+       except SystemExit as exc:
+        code=exc.code
+    output=buf.getvalue()
+    fields=F.output_fields(output)
+    self.assertEqual(code,65,output)
+    self.assertEqual(fields.get("reason"),stub_reason,output)
+    self.assertEqual(fields.get("child_spawned"),"0",output)
+    self.assertEqual(fields.get("next_action"),"repair-route-state",output)
+    self.assertNotIn("selected_hop=inline",output)
+    self.assertNotIn("runtime-unavailable",output)
 
  # M1's real (not stubbed) `completion_marker_gate` half lives in
  # `dispatch_completion_marker.test.py::CompletionMarkerTest::
  # test_a_sd154_2_real_gate_reports_next_action_for_route_state_refusal`,
  # which runs the real wrapper `--start` subprocess -- this file's own
- # helpers only ever drive the wrapper as `--dry-run`, which never reaches
- # `completion_marker_gate` (`action != "start"` returns immediately). This
- # class's test above proves the OTHER half of the same regression: a
- # fallback chain that receives that exact reason from a wrapper never
- # descends to inline.
+ # helpers drive the wrapper as `--dry-run` with real predecessor markers,
+ # so they share its read-only currency/readiness gate. This class's test
+ # above proves the OTHER half of the same regression: a fallback chain that
+ # receives that exact reason from a wrapper never descends to inline.
 
 
 class LaunchTupleReportOnlyTest(unittest.TestCase):
