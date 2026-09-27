@@ -4764,6 +4764,8 @@ def spawn_claimed_attempt(
 
         from dispatch_replacement import admission as replacement_admission
         replacement_admission(jobs, lines, child_meta)
+        from review_input import validate_launch as validate_review_input
+        validate_review_input(jobs, child_meta)
         if preclaim is not None:
             preclaim(lines)
 
@@ -7186,7 +7188,7 @@ def _marker_link_current(
     sequence = int(marker.get("sequence", 0))
     history_path = marker_path.parent / f"{node_id}.{sequence}.json"
     for key, expected_path in (
-        ("completion_marker", marker_path),
+        ("completion_marker", marker_path.parent / f"{node_id}.json"),
         ("completion_marker_history", history_path),
     ):
         recorded = link.get(key)
@@ -8970,6 +8972,8 @@ def claim_attempt_row(
         row, automatic_replacement = replacement_row(jobs, lines, row)
         row_fields = row.split("\t")
         row_metadata = parse_registry_metadata(row_fields[5])
+        from review_input import validate_launch as validate_review_input
+        validate_review_input(jobs, row_metadata)
         if mutation_precheck is not None:
             mutation_precheck(lines)
         # A serial successor consumes its predecessors just as a DAG edge

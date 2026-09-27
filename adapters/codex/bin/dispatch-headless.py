@@ -260,6 +260,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--worker-role", help="legacy compatibility metadata; not bootstrap identity")
     p.add_argument("--worker-type", choices=("owner", "stage", "review", "support", "frame"))
     p.add_argument("--review-output", help="exact durable report path for a route-free review worker")
+    from review_input import add_arguments as review_input_arguments
+    review_input_arguments(p)
     p.add_argument("--unit", default="", help="catalog unit ref for the assigned route node (roles/units/<unit>.md)")
     p.add_argument("--assigned-contract")
     p.add_argument("--owner", dest="capability_owner")
@@ -1703,6 +1705,8 @@ def append_job(jobs: Path, args: argparse.Namespace) -> bool:
     if is_no_commit_stage(args):
         pipe += ",no_commit=1"
     ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    from review_input import registration_fragment
+    pipe += registration_fragment(args)
     from dispatch_replacement import seal_launch_input
     args.replacement_runtime_sandbox = effective_runtime_sandbox(args)
     pipe += seal_launch_input(args, 'codex', getattr(args, "replacement_raw_task", ""))
@@ -2511,6 +2515,11 @@ def main(argv: list[str]) -> int:
         profile_type=profile_worker_type(ROOT, args.profile),
     )
     args.jobs_path = jobs
+    try:
+        from review_input import prepare_request as prepare_review_input
+        prepare_review_input(args)
+    except DispatchContractError as exc:
+        return fail(exc.reason, 65, detail=exc.detail, child_spawned="0", registry_mutation="0")
     args.completion_delivery_reason = "not-applicable"
     try:
         args.resolved_completion_delivery = resolve_completion_delivery(args)
@@ -2527,6 +2536,8 @@ def main(argv: list[str]) -> int:
     task_input = task_prompt(args)
     args.replacement_raw_task = task_input[0]
     prompt_text, prompt_source = dispatch_prompt(args, task_input)
+    from review_input import prompt_block as review_input_prompt
+    prompt_text += review_input_prompt(args)
     from dispatch_replacement import recovery_instructions
     prompt_text += recovery_instructions(args)
     assignment_sha256 = "sha256:" + hashlib.sha256(

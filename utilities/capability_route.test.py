@@ -4593,7 +4593,7 @@ class SourceCensusTest(unittest.TestCase):
  # inside `terminal_gate_observation`), an owner-executed terminal that has
  # no completion marker file at all (`_owner_terminal_observation`), a
  # review-artifact provenance sha for an owner-closure proof
- # (`continuation_owner_closure_plan`/`_publish_continuation_owner_closure`),
+ # (`continuation_owner_closure_plan`/`_continuation_closure_marker_compatible`),
  # and `source_evidence_digest` (route-reuse's own named exception). None of
  # these ever duplicated the completion-marker recompute B-1/A-2 unified --
  # each is the one place ITS OWN schema is hashed.
@@ -4608,7 +4608,7 @@ class SourceCensusTest(unittest.TestCase):
   # capability-route.py -- different schema, not a completion marker
   "_arbitration_observation","arbitrate_group","terminal_gate_observation",
   "_owner_terminal_observation",
-  "continuation_owner_closure_plan","_publish_continuation_owner_closure",
+  "continuation_owner_closure_plan","_continuation_closure_marker_compatible",
  })
 
  def test_a_sd154_8_evidence_digest_recomputed_only_in_gate_currency(self):

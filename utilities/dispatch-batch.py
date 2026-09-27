@@ -1968,6 +1968,8 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         help="official partial_group_continuation authorizing one exact gap replacement",
     )
+    from review_input import add_arguments, resolve_input, is_review_node
+    add_arguments(parser)
     args = parser.parse_args(argv)
     if args.parallel_group and args.replica_group and args.parallel_group != args.replica_group:
         parser.error("--parallel-group and --replica-group aliases must match")
@@ -2075,6 +2077,7 @@ def main(argv: list[str] | None = None) -> int:
         ).path
         if args.log_dir is not None:
             args.log_dir = validate_dispatch_log_dir(jobs, args.log_dir)
+        args.review_inputs = {}
         # C-14: dispatch-node.py caps plan-check/impl-review/test rounds, but a
         # realized parallel_group leg bypasses that wrapper entirely -- check
         # every capped leg here too, before the atomic reservation, so one leg
@@ -2086,7 +2089,7 @@ def main(argv: list[str] | None = None) -> int:
         # `len(prior)+1 > max_round` comparison.
         for capped_node in nodes:
             capped_node_id = str(capped_node["id"])
-            if capped_node_id not in DISPATCH_NODE.ROUND_CAPPED_NODE_IDS:
+            if not DISPATCH_NODE.REVIEW_ROUND_CAP.is_round_capped_node(capped_node):
                 continue
             if partial is not None and partial.get("automatic_replacement_evidence"):
                 # The claim has already validated the dead exact source. Reused
@@ -2095,6 +2098,7 @@ def main(argv: list[str] | None = None) -> int:
             budget = DISPATCH_NODE.admit_round(
                 route, capped_node, jobs,
                 owner_attempt_id=os.environ.get("AGENT_DISPATCH_ATTEMPT_ID"),
+                reviewed_evidence=args.reviewed_evidence if is_review_node(capped_node) else None,
             ).budget
             if budget.state == "blocked-live":
                 raise BatchError(
@@ -2185,6 +2189,7 @@ def main(argv: list[str] | None = None) -> int:
         BatchError,
         DispatchContractError,
         DISPATCH_NODE.DispatchNodeError,
+        ValueError,
         OSError,
         subprocess.SubprocessError,
     ) as exc:
@@ -2200,7 +2205,7 @@ def main(argv: list[str] | None = None) -> int:
         if reason in {"review-round-budget-exhausted", "review-verdictless-bound"}:
             capped = next((n for n in nodes if n["id"] == getattr(exc, "route_node", None)), {})
             state = "verdictless-bound" if reason == "review-verdictless-bound" else "exhausted"
-            extra.update(DISPATCH_NODE.review_budget_recovery_fields(capped.get("kind"), state))
+            extra.update(DISPATCH_NODE.review_budget_recovery_fields(capped.get("kind"), state, route=route, node=capped, jobs=jobs, route_file=args.route))
         # `ROUTE_STATE_REFUSAL_REASONS` membership, not literal reason
         # strings: the static guardian in `dispatch_completion_marker.test.py`
         # keeps the gate's own missing-dependency reason inside
@@ -2400,6 +2405,20 @@ def main(argv: list[str] | None = None) -> int:
             leg["independence"] = str(manifest["independence"])
 
     if args.action != "start":
+        try:
+            from review_input import is_review_node
+            for review_node in nodes:
+                if not is_review_node(review_node) or (partial and review_node["id"] != partial["gap_leg_id"]):
+                    continue
+                # Existing peers carry historical authority; a dry-run does not
+                # launch them or upgrade their old registration contract.
+                if prior_input is not None:
+                    continue
+                resolve_input(route, review_node, jobs, args.reviewed_evidence,
+                    retry_of=(partial.get("failed_source_attempt_id")
+                        if partial and partial.get("automatic_replacement_evidence") else None))
+        except DispatchContractError as exc:
+            return fail(exc.reason, 65, detail=exc.detail, admitted=0, spawned=0)
         print(json.dumps({
             "schema_version": 2,
             "state": "validated",
@@ -2425,14 +2444,6 @@ def main(argv: list[str] | None = None) -> int:
             ),
         }, separators=(",", ":"), sort_keys=True))
         return 0
-
-    try:
-        from dispatch_replacement_batch import seal_launch_input
-        if prior_input is None:
-            seal_launch_input(jobs, args, route, manifest, manifest_digest)
-    except (DispatchContractError, ReplicaBatchContractError) as exc:
-        return fail(getattr(exc, "reason", "replacement-batch-input-invalid"),
-                    65, detail=str(exc), admitted=0, spawned=0)
 
     governor = ROOT / "utilities" / "model-worker-governor.py"
     artifact_root = Path(
@@ -2523,6 +2534,33 @@ def main(argv: list[str] | None = None) -> int:
         receipt["degradation_ledger"] = _record_failed_legs(route, results, agent_home) or "-"
         print(json.dumps(receipt, separators=(",", ":"), sort_keys=True))
         return 70
+
+    # Only actual new starts require current input. Completed/live peers retain
+    # their sealed authority even after the reviewed file is edited or removed.
+    try:
+        from review_input import is_review_node
+        for leg in pending_legs:
+            review_node = next(node for node in nodes if node["id"] == leg["node"])
+            if not is_review_node(review_node):
+                continue
+            candidate = resolve_input(route, review_node, jobs, args.reviewed_evidence,
+                retry_of=(partial.get("failed_source_attempt_id")
+                    if partial and partial.get("automatic_replacement_evidence") else None))
+            args.review_inputs[leg["node"]] = candidate
+        if args.review_inputs:
+            args.reviewed_evidence = next(iter(args.review_inputs.values()))["path"]
+        if args.reviewed_evidence and not any(is_review_node(node) for node in nodes):
+            raise DispatchContractError("reviewed-evidence-node-invalid", args.parallel_group)
+    except DispatchContractError as exc:
+        return fail(exc.reason, 65, detail=exc.detail, admitted=0, spawned=0)
+
+    try:
+        from dispatch_replacement_batch import seal_launch_input
+        if prior_input is None:
+            seal_launch_input(jobs, args, route, manifest, manifest_digest)
+    except (DispatchContractError, ReplicaBatchContractError) as exc:
+        return fail(getattr(exc, "reason", "replacement-batch-input-invalid"),
+                    65, detail=str(exc), admitted=0, spawned=0)
 
     # Replays preserve their original placement, but an unstarted exact leg
     # still owes current native hard-quota admission. Successful/live peers
@@ -2628,6 +2666,8 @@ def main(argv: list[str] | None = None) -> int:
                 args.parent,
                 "--prompt-text",
                 args.prompt_text,
+                *(["--reviewed-evidence", args.review_inputs[leg["node"]]["path"]]
+                  if leg["node"] in args.review_inputs else []),
                 "--attempt-id",
                 str(leg["attempt_id"]),
                 "--jobs",

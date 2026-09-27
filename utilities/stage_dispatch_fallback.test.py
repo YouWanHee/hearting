@@ -103,6 +103,18 @@ class FallbackTest(unittest.TestCase):
   with mock.patch.dict(os.environ,self.launch_roots_env()):
    route=R.compile_route("autopilot-code","dev","strong",self.repo,self.art,signals=["shared-contract"],transport="headless",tracking="tracked",tracked_gate_evidence=gate,dispatch_evidence=evidence)
   path=Path(self.tmp.name)/"route.json"; path.write_text(json.dumps(route),encoding="utf-8"); return path
+ def seed_plan_marker(self,route):
+  """Review placement fixtures have a genuine current producer input (SD-161)."""
+  plan=next(n for n in route["nodes"] if n["id"]=="plan")
+  evidence=self.art/"fixture-plan.md"
+  evidence.write_text("Fixture plan input.\n")
+  with mock.patch.dict(os.environ,self.launch_roots_env()), \
+       mock.patch.object(R,"_launch_open_cycle_checkpoint"):
+   R.complete_node(route,plan,"plan",evidence,attempt_id="att-fixture-plan",
+     explicit_attempt_metadata={"attempt_schema_version":2,"dispatch_depth":2,
+       "transport":"headless","execution_surface":"inline",
+       "registered_worker":False,"fallback_hop":"inline"})
+  return evidence
  def run_chain(self,path,*extra,seed=True,**envkw):
   if seed:self.seed_parent()
   cmd=[sys.executable,str(ROOT/"utilities/stage-dispatch-fallback.py"),"--route",str(path),"--node","plan","--slug","fallback-plan","--parent","owner","--capability-mode","dev","--worker-mode","plan/plan-author","--model-role","deep maker","--jobs",str(self.jobs),"--dry-run",*extra]
@@ -169,6 +181,7 @@ class FallbackTest(unittest.TestCase):
   the subprocess `run_chain` path additionally binds a launch runtime root,
   which is a separate axis this fixture does not need to exercise."""
   if seed:self.seed_parent()
+  if node_id=="plan-check":self.seed_plan_marker(json.loads(path.read_text()))
   argv=["stage-dispatch-fallback.py","--route",str(path),"--node",node_id,"--slug",f"fallback-{node_id}",
         "--parent","owner","--capability-mode","dev","--worker-mode",worker_mode,
         "--model-role",model_role,"--jobs",str(self.jobs),"--dry-run"]
@@ -237,6 +250,7 @@ class FallbackTest(unittest.TestCase):
    route=json.loads(path.read_text())
    self.seed_parent()
    self.seed_review_rounds(route["route_id"],"plan-check",1)
+   self.seed_plan_marker(route)
    prompt_file=self.repo/"plan-check-prompt.md"
    prompt_file.write_text("BASE PROMPT TEXT\n",encoding="utf-8")
    argv=["stage-dispatch-fallback.py","--route",str(path),"--node","plan-check","--slug","fallback-plan-check",
@@ -258,6 +272,53 @@ class FallbackTest(unittest.TestCase):
   augmented=sorted(Path(self.jobs).parent.glob("round-protocol-plan-check-*.md"))
   self.assertEqual(len(augmented),1,augmented)
   self.assertEqual(augmented[0].read_text(encoding="utf-8"),"BASE PROMPT TEXT\n"+expected_block)
+
+ def _producer_revision_entry(self,surface):
+  with self.dispatch_env():
+   path=self.route(same_status="supported")
+   route=json.loads(path.read_text())
+   self.seed_parent()
+   evidence=self.seed_plan_marker(route)
+   self.seed_review_rounds(route["route_id"],"plan-check",1)
+   evidence.write_text("Corrected plan v2.\n")
+   plan=next(n for n in route["nodes"] if n["id"]=="plan")
+   marker_path=R.completion_dir(route["route_id"],jobs=self.jobs)/"plan.json"
+   self.assertEqual(R.gate_currency(route,plan,marker_path).state,"revised-unrecorded")
+   observed=[];real_run=subprocess.run
+   def run(cmd,**kwargs):
+    if any(str(part).endswith("/bin/dispatch-headless.py") for part in cmd):
+     observed.append(cmd)
+     return SimpleNamespace(returncode=0,stdout="check=ok\nregistered=0\nstarted=0\nchild_spawned=0\n",stderr="")
+    return real_run(cmd,**kwargs)
+   if surface=="chain":
+    argv=["stage-dispatch-fallback.py","--route",str(path),"--node","plan-check",
+          "--slug","revised-plan-check","--parent","owner","--jobs",str(self.jobs),"--dry-run"]
+   else:
+    argv=["dispatch-node.py","--route",str(path),"--node","plan-check","--adapter","codex",
+          "--slug","revised-plan-check","--parent","owner","--jobs",str(self.jobs),"--action","dry-run"]
+   with mock.patch.object(sys,"argv",argv),mock.patch.object(subprocess,"run",side_effect=run), \
+        contextlib.redirect_stdout(io.StringIO()) as output:
+    if surface=="chain":
+     code=F._dispatch(F.LAUNCH_TUPLE.ReportOnlyObservation())
+    else:
+     with self.assertRaises(SystemExit) as stopped:F.DISPATCH_NODE.main()
+     code=stopped.exception.code
+   self.assertEqual(code,0,output.getvalue())
+   self.assertEqual(len(observed),1)
+   self.assertEqual(observed[0][observed[0].index("--reviewed-evidence")+1],str(evidence))
+   self.assertEqual(R.gate_currency(route,plan,marker_path).state,"current")
+   link_path=marker_path.parent/"plan.att-fixture-plan.attempt.json"
+   original_link=link_path.read_bytes();link=json.loads(original_link)
+   for wrong in (marker_path.parent/"other-node.json",self.art/"plan.json"):
+    link["completion_marker"]=str(wrong);link_path.write_text(json.dumps(link))
+    self.assertNotEqual(R.gate_currency(route,plan,marker_path).state,"current")
+   link_path.write_bytes(original_link)
+   self.assertEqual(R.gate_currency(route,plan,marker_path).state,"current")
+   self.assertEqual(json.loads(marker_path.read_text())["revision"]["recorded_by"],"runtime-auto")
+ def test_sd161_chain_auto_revises_producer_before_resolving_review_input(self):
+  self._producer_revision_entry("chain")
+ def test_sd161_node_auto_revises_producer_before_resolving_review_input(self):
+  self._producer_revision_entry("node")
 
  def test_cross_harness_direct_precedes_inline(self):
   result=self.run_chain(self.route()); self.assertEqual(result.returncode,0,result.stdout+result.stderr)
@@ -724,6 +785,7 @@ class FallbackTest(unittest.TestCase):
   result=self.run_chain(path); self.assertEqual(result.returncode,76,result.stdout+result.stderr); self.assertIn("reason=legacy-broker-route-read-only",result.stdout)
  def run_node(self,path,node,action,*extra,**envkw):
   self.seed_parent()
+  if node=="plan-check":self.seed_plan_marker(json.loads(path.read_text()))
   cmd=[sys.executable,str(ROOT/"utilities/stage-dispatch-fallback.py"),"--route",str(path),"--node",node,"--slug","fallback-"+node,"--parent","owner","--capability-mode","dev","--jobs",str(self.jobs),"--"+action,*extra]
   clean={k:v for k,v in os.environ.items() if not k.startswith("AGENT_DISPATCH_CURRENT_")}
   env={**clean,"AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(self.art),"AGENT_MODEL_GOVERNOR_ROOT":str(self.art/".runtime/model-worker-governor"),"AGENT_DISPATCH_JOBS":str(self.jobs),"AGENT_DISPATCH_SELF_SLUG":"owner","AGENT_DISPATCH_ATTEMPT_ID":"att-fallback-parent",**envkw}
@@ -1279,6 +1341,7 @@ class FallbackTest(unittest.TestCase):
      tracked_gate_evidence=gate,dispatch_evidence=evidence)
   path=Path(self.tmp.name)/"evidence-pair-route.json"
   path.write_text(json.dumps(route),encoding="utf-8")
+  self.seed_plan_marker(route)
   self.seed_parent()
   cmd=[sys.executable,str(ROOT/"utilities/stage-dispatch-fallback.py"),
        "--route",str(path),"--node","plan-check","--slug","fb-evidence-pair",
@@ -1322,6 +1385,7 @@ class FallbackTest(unittest.TestCase):
      tracked_gate_evidence=gate,dispatch_evidence=evidence)
   path=Path(self.tmp.name)/"sole-gate-route.json"
   path.write_text(json.dumps(route),encoding="utf-8")
+  self.seed_plan_marker(route)
   self.seed_parent()
   cmd=[sys.executable,str(ROOT/"utilities/stage-dispatch-fallback.py"),
        "--route",str(path),"--node","plan-check","--slug","fb-sole-gate",

@@ -1271,6 +1271,7 @@ class CompletionMarkerTest(unittest.TestCase):
             extra = extra.replace("note=completed-review-blocking", f"note={note}")
         extra += f",log_file={log},artifact_root={self.artifact}"
         self.write_row("done", f"plan-check-r{round_no}", attempt_id, extra, node_id="plan-check")
+        self._reap_real_process(attempt_id)
         return review
 
     def owner_closure(self, route, name="round_2.owner-closure.md", *, attempts=(), artifacts=(),
@@ -1311,21 +1312,8 @@ class CompletionMarkerTest(unittest.TestCase):
             source_output = Path(issued["cycle_dir"]) / "artifacts"
             r1 = self.review_blocking_row("att-source-review-r1", 1, directory=source_output)
             r2 = self.review_blocking_row("att-source-review-r2", 2, directory=source_output)
-            # Real, reaped session leaders, observed from their own namespace.
-            # No namespace mismatch or missing PID is synthesized as proof.
-            for attempt in ("att-source-review-r1", "att-source-review-r2"):
-                child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
-                                         stdin=subprocess.PIPE, start_new_session=True)
-                start = D.process_start_ticks(child.pid)
-                namespace = D.process_namespace_identity(child.pid)
-                child.communicate(timeout=5)
-                self.assertIsNotNone(start)
-                self.assertIsNotNone(namespace)
-                rows = self.jobs.read_text().splitlines()
-                self.jobs.write_text("\n".join(
-                    line + (f",pid={child.pid},pid_start={start},pgid={child.pid},"
-                            f"pid_ns={namespace},pid_observer_ns={namespace}"
-                            if f"attempt_id={attempt}," in line else "") for line in rows) + "\n")
+            # review_blocking_row records a real reaped process for each
+            # terminal row, shared by same-route and continuation proof.
             continuation = ROUTE.build_continuation_route(
                 route, resume_from_node=route["nodes"][0]["id"], requested_boundary=route["nodes"][0]["id"],
                 reason="fixture continuation", artifact_root=self.artifact,
@@ -1843,10 +1831,296 @@ class CompletionMarkerTest(unittest.TestCase):
             self.assertTrue(D.completion_marker_is_current(route, node, target))
             self.assertEqual(self.jobs.read_bytes(), before)
 
+    def test_sd161_input_revision_partial_write_never_publishes_broken_history(self):
+        import artifact_receipt
+        route, node, output, owner = self.sd161_input_fixture()
+        evidence = output / "plan.md"
+        evidence.write_text("v1")
+        self.review_blocking_row("att-input-r1", 1, directory=output)
+        self.sd161_bind_row(route, "att-input-r1", evidence)
+        evidence.write_text("v2")
+        directory = self.jobs.parent / "review-input-revisions" / route["route_id"] / node["id"]
+        with mock.patch.dict(os.environ, self.base_env(), clear=True):
+            with mock.patch.object(artifact_receipt.os, "fsync", side_effect=OSError("interrupted temporary write")):
+                with self.assertRaisesRegex(OSError, "interrupted temporary write"):
+                    ROUTE.publish_review_input_revision(route, node["id"], evidence,
+                        answers=("att-input-r1",), author_attempt_id=owner, jobs=self.jobs)
+            self.assertFalse(list(directory.glob("*.json")))
+            # A process killed before finally cleanup may leave a private temp;
+            # history enumeration and the next sequence must ignore it.
+            (directory / ".interrupted.tmp").write_text('{"schema_version":')
+            self.assertEqual(ROUTE._review_input_revision_records(route, node["id"], self.jobs), [])
+            result = ROUTE.publish_review_input_revision(route, node["id"], evidence,
+                answers=("att-input-r1",), author_attempt_id=owner, jobs=self.jobs)
+            self.assertEqual(result["input_revision"]["sequence"], 1)
+            self.assertEqual(json.loads((directory / "000001.json").read_text()), result["input_revision"])
+
+    def test_sd161_check_and_writer_share_terminal_claim_fence_without_check_mutation(self):
+        source, route, path, node, memo, reviews = self.continuation_closure_fixture()
+        claim = D.terminal_claim_path(self.jobs, route["route_id"], "att-source-review-r2")
+        claim.parent.mkdir(parents=True, exist_ok=True)
+        claim.write_text(json.dumps({"schema_version": 1, "route_id": route["route_id"],
+                                    "owner_attempt_id": "att-source-review-r2"}))
+        with mock.patch.dict(os.environ, self.base_env(), clear=True):
+            before = {str(p): (p.read_bytes(), p.stat().st_mtime_ns)
+                      for p in self.base.rglob("*") if p.is_file()}
+            with self.assertRaises(D.DispatchContractError) as checked:
+                ROUTE.owner_closure_plan(route, node, memo, self.jobs, "att-source-review-r2")
+            self.assertEqual(checked.exception.reason, "terminal-claim-conflict")
+            self.assertEqual(before, {str(p): (p.read_bytes(), p.stat().st_mtime_ns)
+                                      for p in self.base.rglob("*") if p.is_file()})
+            with self.assertRaises(D.DispatchContractError) as written:
+                ROUTE.complete_node(route, node, node["id"], memo, self.jobs, "att-source-review-r2")
+            self.assertEqual(written.exception.reason, checked.exception.reason)
+            self.assertFalse((ROUTE.completion_dir(route["route_id"]) / "plan-check.json").exists())
+
+    def test_sd161_check_and_writer_share_stage_authority_and_metadata_seal_fences(self):
+        source, route, path, node, memo, reviews = self.continuation_closure_fixture()
+        source_node = next(n for n in source["nodes"] if n["id"] == node["id"])
+        original = self.jobs.read_text()
+        with mock.patch.dict(os.environ, self.base_env(), clear=True):
+            for suffix, reason in ((",stage_authority=0", "row-contract-invalid:stage-authority-zero-without-subsession"),
+                                   (",route_node=plan-check", "owner-closure-seal-refused:attempt-immutable-metadata-duplicate")):
+                self.jobs.write_text("\n".join(line + (suffix if "attempt_id=att-source-review-r2," in line else "")
+                                                for line in original.splitlines()) + "\n")
+                for action in (ROUTE.owner_closure_plan,
+                               lambda r,n,e,j,a: ROUTE.complete_node(r,n,n["id"],e,j,a)):
+                    with self.assertRaisesRegex(ValueError, reason):
+                        action(source, source_node, memo, self.jobs, "att-source-review-r2")
+            self.assertFalse((ROUTE.completion_dir(source["route_id"]) / "plan-check.json").exists())
+
+    def test_sd161_exact_completed_owner_closure_replay_is_read_only_and_evidence_bound(self):
+        source, route, path, node, memo, reviews = self.continuation_closure_fixture()
+        source_node = next(n for n in source["nodes"] if n["id"] == node["id"])
+        with mock.patch.dict(os.environ, self.base_env(), clear=True):
+            marker, _ = ROUTE.complete_node(source, source_node, node["id"], memo, self.jobs, "att-source-review-r2")
+            before = {str(p): (p.read_bytes(), p.stat().st_mtime_ns)
+                      for p in self.base.rglob("*") if p.is_file()}
+            proof = ROUTE.owner_closure_plan(source, source_node, memo, self.jobs, "att-source-review-r2")
+            self.assertTrue(proof["already_completed"])
+            self.assertEqual(proof["marker"], marker)
+            self.assertEqual(before, {str(p): (p.read_bytes(), p.stat().st_mtime_ns)
+                                      for p in self.base.rglob("*") if p.is_file()})
+            replayed, _ = ROUTE.complete_node(source, source_node, node["id"], memo, self.jobs, "att-source-review-r2")
+            self.assertEqual(replayed, marker)
+            memo.write_text(memo.read_text() + "\nchanged disposition\n")
+            for action in (ROUTE.owner_closure_plan,
+                           lambda r,n,e,j,a: ROUTE.complete_node(r,n,n["id"],e,j,a)):
+                with self.assertRaisesRegex(ValueError, "immutable attempt completion differs"):
+                    action(source, source_node, memo, self.jobs, "att-source-review-r2")
+            self.assertEqual(marker["review_independence"], "owner-overridden")
+
+    def test_sd161_same_route_check_is_read_only_and_matches_writer(self):
+        source, route, path, node, memo, reviews = self.continuation_closure_fixture()
+        source_path = ROUTE.canonical_route_path(self.artifact, source["route_id"])
+        source_node = next(n for n in source["nodes"] if n["id"] == "plan-check")
+        def snapshot():
+            return {str(p.relative_to(self.base)): (p.read_bytes(), p.stat().st_mtime_ns)
+                    for root in (self.artifact, self.stable_dispatch) for p in root.rglob("*") if p.is_file()}
+        before = snapshot()
+        command = [sys.executable, str(ROOT / "utilities/capability-route.py"), "complete", "--check",
+                   "--route", str(source_path), "--node", "plan-check", "--evidence", str(memo),
+                   "--jobs", str(self.jobs), "--attempt-id", "att-source-review-r2"]
+        result = subprocess.run(command, env=self.base_env(), capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(snapshot(), before)
+        checked = json.loads(result.stdout)["owner_closure_proof"]
+        self.assertIn("closure", checked)
+        with mock.patch.dict(os.environ, self.base_env(), clear=True):
+            marker, receipt = ROUTE.complete_node(source, source_node, "plan-check", memo,
+                                                  self.jobs, "att-source-review-r2")
+        self.assertEqual(marker["review_independence"], "owner-overridden")
+        self.assertEqual(receipt["blocking_attempts"], checked["closure"]["blocking_attempts"])
+        self.assertIn("note=completed-review-blocking", self.jobs.read_text())
+
+    def test_sd161_continuation_current_attempt_uses_same_route_proof(self):
+        source, route, path, node, memo, reviews = self.continuation_closure_fixture()
+        self.current_route = route
+        current_review = self.review_blocking_row("att-current-review-r3", 3, directory=reviews[0].parents[2])
+        memo = self.owner_closure(route, attempts=("att-source-review-r1", "att-source-review-r2", "att-current-review-r3"),
+                                  artifacts=tuple(p.name for p in reviews) + (current_review.name,), directory=memo.parent)
+        with mock.patch.dict(os.environ, self.base_env(), clear=True):
+            proof = ROUTE.owner_closure_plan(route, node, memo, self.jobs, "att-current-review-r3")
+            self.assertEqual(proof["rounds"], 3)
+            self.assertIn("closure", proof)
+            marker, receipt = ROUTE.complete_node(route, node, node["id"], memo, self.jobs, "att-current-review-r3")
+            self.assertTrue(marker["registered_worker"])
+            self.assertEqual(marker["review_independence"], "owner-overridden")
+            self.assertEqual(len(receipt["blocking_attempts"]), 3)
+            self.assertEqual(marker["round_census"]["verdict_rounds"], 3)
+
+    def sd161_input_fixture(self):
+        import artifact_producer as P
+        self.jobs = self.stable_dispatch / "jobs.log"
+        self.jobs.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.jobs.touch(mode=0o600)
+        base = self.compile_route("standard")
+        with mock.patch.dict(os.environ, self.base_env(), clear=True):
+            route = ROUTE.compose_route(
+                capability="autopilot-code", capability_mode="dev", shape="staged",
+                graph="plan-check,execute,impl-review,test,report", slug="sd161-input",
+                cwd=self.repo, artifact_root=self.artifact, intensity="standard", unassigned=True,
+                spec_read="fixture", dispatch_evidence=base["dispatch_evidence"], jobs=self.jobs,
+            )
+            path = ROUTE.canonical_route_path(self.artifact, route["route_id"])
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(route))
+            issued = P.begin(self.artifact, route_file=path, capability=route["capability"],
+                             intensity=route["effective_intensity"], require_cycle=True)
+        self.current_route = route
+        owner = "att-sd161-owner"
+        with self.jobs.open("a") as stream:
+            stream.write(f"2026-09-28T00:00:00Z\topen\t{self.repo}\t{self.repo}\towner\t"
+                         f"attempt_id={owner},worker_type=owner,dispatch_depth=1,registered_worker=1,"
+                         f"owner_route_file={path},owner_route_id={route['route_id']},owner_route_hash={route['route_hash']}\n")
+        return route, next(n for n in route["nodes"] if n["id"] == "plan-check"), Path(issued["cycle_dir"]) / "artifacts", owner
+
+    def sd161_bind_row(self, route, attempt, evidence):
+        import review_input
+        metadata = {"attempt_id": attempt, "route_id": route["route_id"],
+                    "route_hash": route["route_hash"], "route_node": "plan-check"}
+        candidate = review_input.resolve_input(route, next(n for n in route["nodes"] if n["id"] == "plan-check"),
+                                              self.jobs, evidence)
+        digest = review_input.seal_binding(self.jobs, metadata, candidate)
+        self.jobs.write_text("\n".join(line + (",review_input_digest=" + digest if f"attempt_id={attempt}," in line else "")
+                                      for line in self.jobs.read_text().splitlines()) + "\n")
+
+    def test_sd161_input_revision_is_not_completion_and_total_verdicts_are_bounded(self):
+        route, node, output, owner = self.sd161_input_fixture()
+        evidence = output / "plan.md"
+        evidence.write_text("plan v1\n")
+        with mock.patch.dict(os.environ, self.base_env(), clear=True):
+            for number in (1, 2, 3):
+                attempt = f"att-input-r{number}"
+                self.review_blocking_row(attempt, number, directory=output)
+                self.sd161_bind_row(route, attempt, evidence)
+                evidence.write_text(f"plan v{number + 1}\n")
+                original = self.jobs.read_bytes()
+                result = ROUTE.publish_revision_locked(route, node["id"], evidence, basis="review-findings",
+                    answers=(attempt,), author_attempt_id=owner, jobs=self.jobs)
+                self.assertNotIn("marker", result)
+                self.assertEqual(original, self.jobs.read_bytes())
+                self.assertFalse((ROUTE.completion_dir(route["route_id"], jobs=self.jobs) / "plan-check.json").exists())
+                history = self.jobs.parent / "review-input-revisions" / route["route_id"] / node["id"]
+                before = {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in history.glob("*.json")}
+                self.assertEqual(result, ROUTE.publish_review_input_revision(route, node["id"], evidence,
+                    answers=(attempt,), author_attempt_id=owner, jobs=self.jobs))
+                self.assertEqual(before, {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in history.glob("*.json")})
+                rows = ROUTE._review_round_rows(self.jobs.read_text().splitlines(), route["route_id"], node["id"], jobs=self.jobs)
+                budget = ROUTE.REVIEW_ROUND_CAP.round_budget(route, node, rows,
+                    revisions=ROUTE._dependency_revisions(route, node, self.jobs))
+                self.assertEqual(budget.state, "admit" if number < 3 else "exhausted")
+
+    def test_sd161_same_route_live_and_unverifiable_process_refuse_check_and_writer(self):
+        source, route, path, node, memo, reviews = self.continuation_closure_fixture()
+        source_node = next(n for n in source["nodes"] if n["id"] == "plan-check")
+        with mock.patch.dict(os.environ, self.base_env(), clear=True):
+            for state in ("live", "unverifiable"):
+                with mock.patch.object(D, "attempt_process_quiescence", return_value=D.ProcessQuiescence(state, "fixture")):
+                    before = {str(p): (p.read_bytes(), p.stat().st_mtime_ns)
+                              for p in self.base.rglob("*") if p.is_file()}
+                    with self.assertRaisesRegex(ValueError, f"owner-closure-round-{state}"):
+                        ROUTE.owner_closure_plan(source, source_node, memo, self.jobs, "att-source-review-r2")
+                    self.assertEqual(before, {str(p): (p.read_bytes(), p.stat().st_mtime_ns)
+                                              for p in self.base.rglob("*") if p.is_file()})
+                    with self.assertRaisesRegex(ValueError, f"owner-closure-round-{state}"):
+                        ROUTE.complete_node(source, source_node, node["id"], memo, self.jobs, "att-source-review-r2")
+            self.assertFalse((ROUTE.completion_dir(source["route_id"], jobs=self.jobs) / "plan-check.json").exists())
+
+    def test_sd161_input_revision_recovery_and_current_input_filter(self):
+        import review_input
+        route, node, output, owner = self.sd161_input_fixture()
+        evidence = output / "plan.md"
+        evidence.write_text("v1")
+        with mock.patch.dict(os.environ, self.base_env(), clear=True):
+            self.review_blocking_row("att-input-r1", 1, directory=output)
+            self.sd161_bind_row(route, "att-input-r1", evidence)
+            self.review_blocking_row("att-input-r2", 2, directory=output)
+            self.sd161_bind_row(route, "att-input-r2", evidence)
+            old = review_input.resolve_input(route, node, self.jobs, evidence)
+            evidence.write_text("v2")
+            revised = review_input.resolve_input(route, node, self.jobs, evidence)
+            ROUTE.publish_review_input_revision(route, node["id"], evidence, answers=("att-input-r2",),
+                                                author_attempt_id=owner, jobs=self.jobs)
+            self.assertEqual(ROUTE._dependency_revisions(route, node, self.jobs, reviewed_input=old), [])
+            self.assertEqual(len(ROUTE._dependency_revisions(route, node, self.jobs, reviewed_input=revised)), 1)
+            recovery = ROUTE.REVIEW_ROUND_CAP.recovery_fields("review-worker", route=route, node=node, jobs=self.jobs)
+            self.assertIn("--answers att-input-r2", recovery["recovery_revise_command"])
+            # An old FAIL without its sealed input can still use owner closure,
+            # but cannot invent an input revision from the review's output.
+            self.jobs.write_text(self.jobs.read_text().replace(",review_input_digest=", ",legacy_input_digest="))
+            recovery = ROUTE.REVIEW_ROUND_CAP.recovery_fields("review-worker", route=route, node=node, jobs=self.jobs)
+            self.assertNotIn("recovery_revise_command", recovery)
+            self.assertIn("recovery_check_command", recovery)
+            with self.assertRaisesRegex(ValueError, "review-input-revision-source-mismatch"):
+                ROUTE._dependency_revisions(route, node, self.jobs)
+
+    def test_sd161_continuation_cannot_reset_input_revision_budget(self):
+        import artifact_producer as P
+        route, node, output, owner = self.sd161_input_fixture()
+        evidence = output / "plan.md"
+        evidence.write_text("v1")
+        with mock.patch.dict(os.environ, self.base_env(), clear=True):
+            for number in (1, 2, 3):
+                attempt = f"att-lineage-r{number}"
+                self.review_blocking_row(attempt, number, directory=output)
+                self.sd161_bind_row(route, attempt, evidence)
+                evidence.write_text(f"v{number + 1}")
+                ROUTE.publish_review_input_revision(route, node["id"], evidence, answers=(attempt,),
+                                                    author_attempt_id=owner, jobs=self.jobs)
+            current = ROUTE.build_continuation_route(route, resume_from_node=node["id"],
+                requested_boundary=node["id"], reason="fixture correction", artifact_root=self.artifact)
+            path = ROUTE.canonical_route_path(self.artifact, current["route_id"])
+            path.write_text(json.dumps(current))
+            P.begin(self.artifact, route_file=path, capability=current["capability"],
+                    intensity=current["effective_intensity"], require_cycle=True)
+            current_node = next(n for n in current["nodes"] if n["id"] == node["id"])
+            admission = DISPATCH_NODE.admit_round(current, current_node, self.jobs)
+            self.assertEqual(admission.budget.state, "exhausted")
+            self.assertEqual(admission.budget.verdict_rounds, 3)
+            self.assertEqual(len(ROUTE._dependency_revisions(current, current_node, self.jobs)), 3)
+            recovery = ROUTE.REVIEW_ROUND_CAP.recovery_fields("review-worker", route=current,
+                node=current_node, jobs=self.jobs, route_file=path)
+            self.assertIn("att-lineage-r3", recovery["recovery_check_command"])
+            self.assertNotIn("recovery_revise_command", recovery)
+
+    def test_sd161_input_revision_refuses_wrong_answer_owner_unchanged_and_outside_cycle(self):
+        route, node, output, owner = self.sd161_input_fixture()
+        evidence = output / "plan.md"
+        evidence.write_text("v1")
+        self.review_blocking_row("att-input-r1", 1, directory=output)
+        self.sd161_bind_row(route, "att-input-r1", evidence)
+        with mock.patch.dict(os.environ, self.base_env(), clear=True):
+            def revise(path=evidence, answers=("att-input-r1",), author=owner):
+                return ROUTE.publish_review_input_revision(route, node["id"], path,
+                    answers=answers, author_attempt_id=author, jobs=self.jobs)
+            with self.assertRaisesRegex(ValueError, "revision-evidence-unchanged"):
+                revise()
+            evidence.write_text("v2")
+            with self.assertRaisesRegex(ValueError, "answer-not-current"):
+                revise(answers=("att-other",))
+            with self.assertRaisesRegex(ValueError, "owner-not-exact"):
+                revise(author="att-other")
+            with mock.patch.dict(os.environ, {"AGENT_DISPATCH_ATTEMPT_ID": "att-worker"}):
+                with self.assertRaisesRegex(ValueError, "owner-caller-mismatch"):
+                    revise()
+            outside = self.base / "outside.md"
+            outside.write_text("v2")
+            with self.assertRaises(Exception):
+                revise(path=outside)
+            binding = self.jobs.parent / "review-inputs/att-input-r1.json"
+            data = json.loads(binding.read_text())
+            data["sha256"] = "0" * 64
+            binding.write_text(json.dumps(data))
+            with self.assertRaises(D.DispatchContractError) as failure:
+                revise()
+            self.assertEqual(failure.exception.reason, "reviewed-evidence-binding-mismatch")
+        self.assertFalse((self.jobs.parent / "review-input-revisions").exists())
+
     def test_continuation_closure_check_cli_is_read_only(self):
         source, route, path, node, memo, reviews = self.continuation_closure_fixture()
         def snapshot():
-            return {str(p.relative_to(self.base)): p.read_bytes()
+            return {str(p.relative_to(self.base)): (p.read_bytes(), p.stat().st_mtime_ns)
                     for root in (self.artifact, self.stable_dispatch) for p in root.rglob("*") if p.is_file()}
         before = snapshot()
         result = subprocess.run([sys.executable, str(ROOT / "utilities/capability-route.py"),
@@ -1961,6 +2235,12 @@ class CompletionMarkerTest(unittest.TestCase):
         a row quiescent; a synthetic `done` row with none is `unverifiable`,
         not `ready`. No namespace mismatch or missing PID is synthesized.
         """
+        for line in self.jobs.read_text().splitlines():
+            columns = line.split("\t")
+            if len(columns) == 6:
+                metadata = D.parse_registry_metadata(columns[5])
+                if metadata.get("attempt_id") == attempt_id and metadata.get("pid"):
+                    return
         child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
                                  stdin=subprocess.PIPE, start_new_session=True)
         start = D.process_start_ticks(child.pid)

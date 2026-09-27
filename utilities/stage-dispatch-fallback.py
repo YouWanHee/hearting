@@ -1120,6 +1120,7 @@ def wrapper_command(
                 "--selection-source", "orchestrator-explicit",
             ]
     optional = (
+        (getattr(args, "reviewed_evidence", None), "--reviewed-evidence"),
         (args.prompt_file, "--prompt-file"),
         (os.environ.get("AGENT_DISPATCH_PARENT_SESSION_ID"), "--parent-session-id"),
         (os.environ.get("AGENT_DISPATCH_PARENT_CWD"), "--parent-cwd"),
@@ -1446,6 +1447,8 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
     p.add_argument("--worker-role")
     p.add_argument("--model-role")
     p.add_argument("--prompt-file", type=Path)
+    from review_input import add_arguments, resolve_input
+    add_arguments(p)
     p.add_argument("--jobs", type=Path)
     p.add_argument("--broker-root", type=Path, help=argparse.SUPPRESS)
     p.add_argument("--broker-timeout", type=float, help=argparse.SUPPRESS)
@@ -1579,14 +1582,18 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
     # admission decision every registered launch surface reads -- no surface
     # keeps its own `len(prior)+1 > max_round` comparison, or its own
     # auto-revision copy, any more.
-    if node["id"] in DISPATCH_NODE.ROUND_CAPPED_NODE_IDS:
+    if DISPATCH_NODE.REVIEW_ROUND_CAP.is_round_capped_node(node):
         round_rows = DISPATCH_NODE.prior_round_attempts(
             args.jobs, route["route_id"], node["id"],
             route=route if node.get("kind") == "review-worker" else None,
         )
-        node_round_budget = DISPATCH_NODE.admit_round(
-            route, node, args.jobs, owner_attempt_id=args.parent_attempt_id,
-        ).budget
+        try:
+            node_round_budget = DISPATCH_NODE.admit_round(
+                route, node, args.jobs, owner_attempt_id=args.parent_attempt_id,
+                reviewed_evidence=args.reviewed_evidence,
+            ).budget
+        except (DispatchContractError, ValueError) as exc:
+            return fail(getattr(exc, "reason", str(exc)), 65, child_spawned="0")
         if node_round_budget.state == "blocked-live":
             return fail(
                 "prior-attempt-still-live", 78,
@@ -1608,7 +1615,7 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                 round=str(node_round_budget.next_round), max_round=str(node_round_budget.cap),
                 child_spawned="0",
                 next_action=route_state_next_action("review-round-budget-exhausted", node["id"], str(args.route), node),
-                **DISPATCH_NODE.review_budget_recovery_fields(node.get("kind")),
+                **DISPATCH_NODE.review_budget_recovery_fields(node.get("kind"), route=route, node=node, jobs=args.jobs, route_file=args.route),
             )
         if node_round_budget.state == "verdictless-bound":
             # `review_budget_recovery_fields` already supplies its own
@@ -1621,7 +1628,7 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                 effective_intensity=route["effective_intensity"],
                 round=str(node_round_budget.next_round), max_round=str(node_round_budget.cap),
                 child_spawned="0",
-                **DISPATCH_NODE.review_budget_recovery_fields(node.get("kind"), "verdictless-bound"),
+                **DISPATCH_NODE.review_budget_recovery_fields(node.get("kind"), "verdictless-bound", route=route, node=node, jobs=args.jobs, route_file=args.route),
             )
         # B2: unlike dispatch-batch.py (which re-invokes dispatch-node.py for
         # the actual leg and gets the round protocol block for free), this
@@ -1759,6 +1766,13 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                     if isinstance(p3_result, tuple):
                         observation.note_unrecorded(p3_result[1])
                     continue
+                try:
+                    candidate = resolve_input(route, node, args.jobs, args.reviewed_evidence)
+                    if candidate is not None:
+                        args.reviewed_evidence = candidate["path"]
+                except DispatchContractError as exc:
+                    return fail(exc.reason, 65, detail=exc.detail, child_spawned="0")
+
                 pending_capacity = [
                     item for item in capacity_context(
                         args.jobs, route["route_id"], node["id"]

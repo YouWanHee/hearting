@@ -56,6 +56,18 @@ ROUND_CAPPED_NODE_IDS = frozenset({
     "test",
 })
 
+def is_round_capped_node(node):
+    """Keep historic capped anchors and include derived SD-161 review legs.
+
+    Parallel realization changes the node id; the sealed review kind and unit
+    retain its budget obligation. Each leg still counts only its own exact id.
+    """
+    return isinstance(node, Mapping) and (
+        node.get("id") in ROUND_CAPPED_NODE_IDS
+        or (node.get("kind") == "review-worker" and node.get("unit") == "qa/plan-review")
+    )
+
+
 # SD-153 rule 5 (13.59.2): every marker of a `ROUND_CAPPED_NODE_IDS` node --
 # registered, owner-closure, revision, and inline alike -- carries a round
 # census naming one of these closure classes. Closed vocabulary so every
@@ -133,7 +145,7 @@ def logical_round_records(rows, *, jobs=None):
             for fields, meta in rows if meta.get('attempt_id') not in consumed]
 
 
-def recovery_fields(node_kind, state="exhausted"):
+def _base_recovery_fields(node_kind, state="exhausted"):
     """A budget ends automatic review, not ownership of the findings.
 
     `state` selects between the two distinct outcomes `round_budget` can stop
@@ -173,6 +185,59 @@ def recovery_fields(node_kind, state="exhausted"):
             "recovery_surface": "capability-route continue",
             "recovery_hint": "Preserve the completed stages and exact failing verification evidence. "
                 "Hand back the remaining verification for an explicit continuation; do not infer PASS from a corrected plan."}
+
+
+def recovery_fields(node_kind, state="exhausted", *, route=None, node=None, jobs=None, route_file=None):
+    fields = _base_recovery_fields(node_kind, state)
+    if state != "exhausted" or node_kind != "review-worker" or not route or not node or jobs is None:
+        return fields
+    from pathlib import Path
+    import shlex
+    from route_lineage import verified_route_lineage, canonical_route_path
+    from dispatch_contract import parse_registry_metadata, DispatchContractError
+    import review_input
+    try:
+        lineage = verified_route_lineage(route)
+        identities = {(r["route_id"], r["route_hash"]) for r in lineage}
+        rows = []
+        for line in Path(jobs).read_text().splitlines():
+            cols = line.split("\t")
+            if len(cols) != 6:
+                continue
+            meta = parse_registry_metadata(cols[5])
+            if ((meta.get("route_id") or meta.get("route"), meta.get("route_hash")) in identities
+                    and (meta.get("route_node") or meta.get("node")) == node["id"]):
+                rows.append((cols, meta))
+        rows = [(cols[1], meta) for cols, meta in logical_round_records(rows, jobs=jobs)]
+        verdicts = [(status, meta) for status, meta in rows
+                    if classify_round_row(status, meta, worker_type="review") == "verdict"]
+        if not verdicts or verdicts[-1][1].get("note") != REVIEW_BLOCKING_NOTE:
+            return fields
+        latest = verdicts[-1][1]
+        route_path = route_file or canonical_route_path(route["artifact_root"], route["route_id"])
+        command = ["python3", str(Path(__file__).with_name("capability-route.py")), "complete",
+                   "--route", str(route_path), "--node", node["id"], "--jobs", str(Path(jobs).resolve()),
+                   "--attempt-id", latest["attempt_id"], "--evidence", "<current-cycle-file.owner-closure.md>"]
+        fields["recovery_check_command"] = shlex.join(command + ["--check"])
+        fields["recovery_complete_command"] = shlex.join(command)
+        if review_input.is_review_node(node) and not review_input.has_plan_producer(route, node):
+            try:
+                review_input.read_binding(jobs, latest)
+            except DispatchContractError as exc:
+                fields["revision_unavailable"] = exc.reason
+            else:
+                budget = round_budget(route, node, rows)
+                if budget.verdict_rounds < budget.cap + 1:
+                    fields["recovery_revise_command"] = shlex.join([
+                        "python3", str(Path(__file__).with_name("capability-route.py")), "revise",
+                        "--route", str(route_path), "--node", node["id"], "--jobs", str(Path(jobs).resolve()),
+                        "--basis", "review-findings", "--answers", latest["attempt_id"],
+                        "--evidence", "<current-cycle-corrected-plan-file>",
+                        "--author-attempt-id", "<current-owner-attempt-id>"])
+    except (OSError, ValueError, KeyError, TypeError):
+        # Recovery hints carry no authority and cannot weaken the original refusal.
+        return fields
+    return fields
 
 
 def max_review_rounds(effective_intensity):
@@ -297,16 +362,13 @@ def round_budget(route, node, rows: Sequence[tuple[str, Mapping]], *, revisions=
     correction_round = next_round if next_round >= 2 else 0
     round_kind = "first" if next_round < 2 else "correction"
     closure_check_used = False
-    # SD-154 rule 7: after the budget is spent (`state == "exhausted"`), a
-    # node whose last verdict round was a blocking FAIL and whose FAIL a
-    # revision names as its `answers` gets exactly one extra admitted round,
-    # `round_kind="closure-check"` -- eligibility is spent by that verdict
-    # attempt itself (the NEXT verdict round, if any, needs its OWN revision
-    # naming it), so this needs no separate "already used" bookkeeping.
-    # `state == "admit"` (budget still open) also gets the label when the
-    # same condition holds, matching P3's original forward-looking behavior.
-    if state in ("admit", "exhausted") and revisions and kinds and kinds[-1] == "verdict":
-        _last_status, last_meta = rows[-1]
+    # SD-161: labels on within-cap corrections do not spend the extra
+    # verdict. Only the lineage-wide verdict census does: at most cap + 1.
+    # A verdictless replacement tail can still answer the last real FAIL;
+    # live/unsettled rows and the verdictless bound always take precedence.
+    verdict_indexes = [index for index, kind in enumerate(kinds) if kind == "verdict"]
+    if state in ("admit", "exhausted") and verdict_rounds < cap + 1 and revisions and verdict_indexes:
+        _last_status, last_meta = rows[verdict_indexes[-1]]
         last_note = last_meta.get("note", "")
         last_blocking = last_note == REVIEW_BLOCKING_NOTE or (
             last_note == "dead-worker-fail" and last_meta.get("failure_class") == "fail"

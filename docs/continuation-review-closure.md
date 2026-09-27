@@ -1,29 +1,31 @@
-# Review closure across a continuation
+# Review closure in the current route or a continuation
 
 An owner can finish a review disposition after the original review cycle has
 ended. The original review remains FAIL; the disposition is the owner's
 decision, never an independent PASS. Requiring the new record beside the old
 review conflicts with the producer's current-cycle write boundary.
 
-The completion writer owns the handoff. An official continuation can name an
-ancestor's exact blocking review in the existing command:
+The completion writer owns the handoff. Select the exact blocking review from
+the current route or a verified ancestor. The check selects the matching proof
+from that attempt identity, not from the length of the continuation chain:
 
 ```text
-capability-route.py complete --route <continuation.json> --node <review-node> \
+capability-route.py complete --route <current-route.json> --node <review-node> \
   --jobs <canonical-jobs> --attempt-id <source-review-attempt> \
   --evidence <current-cycle>/<round>.owner-closure.md --check
 ```
 
 The check is read-only. The same command without `--check` revalidates and
-publishes only the continuation's gate. This is an operator completion action;
+publishes the selected route's gate. This is an operator completion action;
 it starts no model, grants no artifact write access, and does not replace an
 existing route's runtime pin.
 
 The shared admission proves:
 
-- The destination is an official continuation of the review's exact route and
-  hash, with the same artifact root, worktree and review-node contract. Merely
-  sharing a campaign, filename or repository is insufficient.
+- A current-route review has the exact route, hash and node identity. An
+  ancestor review additionally requires an official continuation with the same
+  artifact root, worktree and review-node contract. Merely sharing a campaign,
+  filename or repository is insufficient.
 - Review attempts throughout the relevant lineage have settled. Terminated
   rounds exhaust the inherited budget; a continuation does not create a new
   budget. A dead worker is not a completed blocking review.
@@ -44,6 +46,19 @@ source verdicts, source markers and sealed payload bytes. Existing completion
 history and node locking own idempotent replay; a conflicting disposition is
 not silently substituted. Same-route owner closure retains its existing
 registered-attempt completion contract and typed `owner-closure-*` refusals.
+
+For a plan-check without a plan producer, pass the exact input file through
+`--reviewed-evidence <file>` when dispatching the review. The runtime records
+its path and bytes digest against the attempt. A normal plan gate supplies this
+input automatically. Prompt text cannot replace the binding.
+
+After a blocking verdict, the current owner can record a changed input in its
+open cycle with `revise --node <review-node> --basis review-findings
+--answers <blocking-attempt> --evidence <changed-file>`. The next dispatch with
+an explicit changed input records the same revision automatically. This is
+input history, not a completion marker: it cannot open a downstream gate.
+Within-budget corrections retain the normal budget; the lineage permits only
+one extra verdict after the cap. Original FAIL records remain unchanged.
 
 This recovery concerns review gate authority only. It does not establish product
 test adequacy, physical-device coverage, release readiness or deployment success.
