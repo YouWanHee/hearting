@@ -220,7 +220,6 @@
             },
             "join_policy": "all",
             "independence_axes": [
-              "cross-harness",
               "model-profile",
               "perspective"
             ],
@@ -639,7 +638,6 @@
             },
             "join_policy": "all",
             "independence_axes": [
-              "cross-harness",
               "model-profile",
               "perspective"
             ],
@@ -676,7 +674,6 @@
             },
             "join_policy": "all",
             "independence_axes": [
-              "cross-harness",
               "model-profile",
               "perspective"
             ],
@@ -713,7 +710,6 @@
             },
             "join_policy": "all",
             "independence_axes": [
-              "cross-harness",
               "model-profile",
               "perspective"
             ],
@@ -1099,7 +1095,6 @@
             },
             "join_policy": "all",
             "independence_axes": [
-              "cross-harness",
               "model-profile",
               "perspective"
             ],
@@ -1130,7 +1125,6 @@
             },
             "join_policy": "all",
             "independence_axes": [
-              "cross-harness",
               "model-profile",
               "perspective"
             ],
@@ -1161,7 +1155,6 @@
             },
             "join_policy": "all",
             "independence_axes": [
-              "cross-harness",
               "model-profile",
               "perspective"
             ],
@@ -1541,7 +1534,6 @@
             },
             "join_policy": "all",
             "independence_axes": [
-              "cross-harness",
               "model-profile",
               "perspective"
             ],
@@ -1572,7 +1564,6 @@
             },
             "join_policy": "all",
             "independence_axes": [
-              "cross-harness",
               "model-profile",
               "perspective"
             ],
@@ -1603,7 +1594,6 @@
             },
             "join_policy": "all",
             "independence_axes": [
-              "cross-harness",
               "model-profile",
               "perspective"
             ],
@@ -1634,7 +1624,6 @@
             },
             "join_policy": "all",
             "independence_axes": [
-              "cross-harness",
               "model-profile",
               "perspective"
             ],
@@ -1942,7 +1931,6 @@
             },
             "join_policy": "all",
             "independence_axes": [
-              "cross-harness",
               "model-profile",
               "perspective"
             ],
@@ -1973,7 +1961,6 @@
             },
             "join_policy": "all",
             "independence_axes": [
-              "cross-harness",
               "model-profile",
               "perspective"
             ],
@@ -2337,7 +2324,6 @@
             },
             "join_policy": "all",
             "independence_axes": [
-              "cross-harness",
               "model-profile",
               "perspective"
             ],
@@ -2596,7 +2582,6 @@
             },
             "join_policy": "all",
             "independence_axes": [
-              "cross-harness",
               "model-profile",
               "perspective"
             ],
@@ -2859,7 +2844,6 @@
             },
             "join_policy": "all",
             "independence_axes": [
-              "cross-harness",
               "model-profile",
               "perspective"
             ],
@@ -2897,7 +2881,6 @@
             },
             "join_policy": "all",
             "independence_axes": [
-              "cross-harness",
               "model-profile",
               "perspective"
             ],
@@ -3186,7 +3169,6 @@
             },
             "join_policy": "all",
             "independence_axes": [
-              "cross-harness",
               "model-profile",
               "perspective"
             ],
@@ -3217,7 +3199,6 @@
             },
             "join_policy": "all",
             "independence_axes": [
-              "cross-harness",
               "model-profile",
               "perspective"
             ],
@@ -3527,7 +3508,6 @@
             },
             "join_policy": "all",
             "independence_axes": [
-              "cross-harness",
               "model-profile",
               "perspective"
             ],
@@ -3565,7 +3545,6 @@
             },
             "join_policy": "all",
             "independence_axes": [
-              "cross-harness",
               "model-profile",
               "perspective"
             ],

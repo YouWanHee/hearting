@@ -19,6 +19,7 @@ import dispatch_runtime_support as RUNTIME_SUPPORT
 import dispatch_terminal_commit
 import model_profile as PROFILE
 import review_round_cap as REVIEW_ROUND_CAP
+import owner_write_advisory as OWNER_WRITE_ADVISORY
 from dispatch_continuation_budget import COMPATIBILITY_FLOOR, TERMINAL_RESERVE_DEFAULT
 from dispatch_contract import (
     row_is_subsession,
@@ -1421,17 +1422,8 @@ def _git_commit(cwd):
     return p.stdout.strip() if p.returncode == 0 else "unversioned"
 
 def worktree_mutating_scope(scope):
-    """Does this write scope let a node mutate the worktree?
-
-    The **one** definition of the rule. `worker-route-guard.py` imports this
-    module and calls this function, so the decline below classifies a node
-    exactly the way the guard that adjudicates it does. A second near-identical
-    copy would be two answers to one question, and the drift would be silent.
-    """
-    if scope in ("target-artifact","source-scoped"):
-        return True
-    root=scope[:-3] if str(scope).endswith("/**") else scope
-    return root=="source"
+    """Shared with the launch guard and the read-only owner advisory."""
+    return OWNER_WRITE_ADVISORY.worktree_mutating_scope(scope)
 
 def _node_mutates_worktree(node):
     return any(worktree_mutating_scope(scope) for scope in (node.get("write_scope") or []))
@@ -1807,7 +1799,7 @@ _TERMINAL_PARALLEL_GROUP_GRANDFATHER = {("autopilot-research", "claim-verify")}
 
 
 def _expand_parallel_groups(nodes, parallel_groups, effective_intensity,
-                            capability, *, auxiliary_check_units=None):
+                            capability, *, auxiliary_check_units=None, persona_policy=True):
     """Expand registry-v6 groups into ordered 2..4-way sibling nodes.
 
     `capability` is required (N2). It was an optional kwarg defaulting to
@@ -1880,7 +1872,7 @@ def _expand_parallel_groups(nodes, parallel_groups, effective_intensity,
             leg["parallel_anchor"] = base["id"]
             # One-window compatibility fields for jobs/Fleet and old receipts.
             leg["replica_group"] = group["id"]
-            leg["independence_axis"] = "cross-harness"
+            leg["independence_axis"] = "perspective" if persona_policy else "cross-harness"
             members.append(leg)
         for node in nodes:
             if node is not base and base["id"] in node.get("depends_on", []):
@@ -2069,9 +2061,9 @@ def _quick_frame_diversity(candidates):
     separately, and a policy change on one side alone would have made every
     sealed single-harness route unverifiable).
 
-    Zero supported harnesses cannot frame at all. One is a recorded
-    degradation, not a refusal (user decision, 2026-09-10): both legs run on
-    that harness with their two perspectives and the route says so."""
+    Zero supported harnesses cannot frame at all. The supported harness set
+    is descriptive provenance, not an independence requirement (SD-160).
+    One harness with separate executions and two personas is normal."""
 
     harnesses = sorted({
         row.get("harness") for row in candidates or []
@@ -2083,7 +2075,7 @@ def _quick_frame_diversity(candidates):
             else "single-harness:" + harnesses[0])
 
 
-def _stamp_frame_profiles(nodes, owner_profile, owner_demand):
+def _stamp_frame_profiles(nodes, owner_profile, owner_demand, *, seal_persona=True):
     """Stamp every frame leg's `model_profile` from the one tier ladder.
 
     ONE function called by BOTH the compiler and `verify_route`'s expected-node
@@ -2100,6 +2092,11 @@ def _stamp_frame_profiles(nodes, owner_profile, owner_demand):
     for node in nodes:
         if not _frame_node(node):
             continue
+        # SD-160: seal the distinct personas; old routes retain their original
+        # bytes and admission resolves the same canonical frame roles.
+        if seal_persona:
+            node.setdefault("perspective", "primary-frame" if node.get("id") == "frame"
+                            else "alternative-frame")
         # `frame` is the anchor leg (the one raised a tier); every other leg of
         # the pair -- today only `frame-alternative` -- stays at the owner's
         # working tier so the pair keeps two genuinely different voices.
@@ -2832,7 +2829,7 @@ def _compose_campaign_line(selection):
     return f"  {text} · 활성 캠페인 {selection['active_count']}개" + (f": {shown}" if shown else "")
 
 
-def compose_card(route, plan=None, plan_source=None):
+def compose_card(route, plan=None, plan_source=None, *, owner_harness=None):
     """One-line `[경로]` notice the acting session pastes instead of a card."""
     shape = route.get("selection", {}).get("shape") or shape_for_intensity(route["effective_intensity"])
     ids = [node["id"] for node in route["nodes"]]
@@ -2847,6 +2844,8 @@ def compose_card(route, plan=None, plan_source=None):
     if plan:
         suffix = " (상속)" if plan_source == "inherited" else ""
         card += f"\n  계획 {' › '.join(plan)}{suffix}"
+    for advisory in OWNER_WRITE_ADVISORY.advisories(route, owner_harness=owner_harness):
+        card += "\n  " + advisory["message"]
     return card
 
 
@@ -2933,7 +2932,7 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
         registered_headless_candidates=_validate_registered_headless_evidence(
             registered_headless_evidence
         )
-        # Quick's cross-harness guarantee is carried entirely by this candidate
+        # Quick's supported harness inventory is carried entirely by this candidate
         # list -- `owner_route_binding._supported_owner_harnesses` reads it, and
         # `dispatch-owner.py` refuses an `--adapter` outside it. How many
         # harnesses it supports decides the pair's diversity, sealed on both
@@ -3077,6 +3076,7 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
       "requested_intensity":requested_intensity,"effective_intensity":effective,
       "owner_model_profile":owner_model_profile,
       "profile_selection_contract_version":1,
+      "persona_independence_contract_version":1,
       "profile_demands":profile_demands,"explicit_profiles":explicit_profiles,
       "owner_profile_demand":owner_demand,"owner_profile_selection":owner_profile_selection,
       "execution_topology":("inline" if effective=="direct" else recipe["quick"]["topology"] if effective=="quick" else recipe["topology_class"]),
@@ -3233,6 +3233,24 @@ def _validate_campaign_selection(key, value):
         raise ValueError(f"route-{key.replace('_', '-')}-invalid")
 
 
+def _sd160_legacy_registry(registry):
+    """Reconstruct only the immediately preceding cross-harness declaration.
+
+    This is an exact digest bridge, never a general stale-registry exemption.
+    Any changed node, width, budget, role or other registry byte changes its
+    digest and remains refused. Old sealed documents themselves are untouched.
+    """
+    legacy = json.loads(json.dumps(registry))
+    changed = False
+    for recipe in legacy["recipes"]:
+        for graph in (v for v in recipe.values() if isinstance(v, dict)):
+            for group in graph.get("parallel_groups", []):
+                if group.get("independence_axes") == ["model-profile", "perspective"]:
+                    group["independence_axes"] = ["cross-harness", "model-profile", "perspective"]
+                    changed = True
+    return legacy if changed else None
+
+
 def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
     """Verify a route for mutating/resume use.
 
@@ -3286,6 +3304,23 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
         units_digest_now=unit_catalog_digest(),
         registry_root_now=TOPO.ROOT, unit_catalog_root_now=ROOT,
     )
+    persona_version = route.get("persona_independence_contract_version")
+    if persona_version is not None and (type(persona_version) is not int or persona_version != 1):
+        raise ValueError("unsupported-persona-independence-contract-version")
+    if (classification["registry"]["verdict"] != "current"
+            and classification["unit_catalog"]["verdict"] == "current"
+            and persona_version is None):
+        legacy_registry = _sd160_legacy_registry(registry)
+        if (legacy_registry is not None
+                and route.get("registry_digest") == TOPO.registry_digest(legacy_registry)):
+            # Reconstruct the old graph under its exact authenticated declaration;
+            # launch/receipt consumers apply SD-160's effective persona policy.
+            registry = legacy_registry
+            classification = classify_validation_basis(
+                route, registry_digest_now=TOPO.registry_digest(registry),
+                units_digest_now=unit_catalog_digest(),
+                registry_root_now=TOPO.ROOT, unit_catalog_root_now=ROOT,
+            )
     if classification["verdict"] != "current":
         if not allow_stale_registry:
             raise ValueError(classification["message"])
@@ -3314,11 +3349,12 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
         expected_nodes=_expand_parallel_groups(
             expected_nodes, composed_recipe["standard_plus"].get("parallel_groups"),
             route.get("effective_intensity"), route.get("capability"),
-            auxiliary_check_units=registry.get("auxiliary_check_units"))
+            auxiliary_check_units=registry.get("auxiliary_check_units"),
+            persona_policy=persona_version == 1)
         if route.get("profile_selection_contract_version") == 1:
             # Same ladder, same order as the compiler: stamp, then seal.
             _stamp_frame_profiles(expected_nodes, route.get("owner_model_profile"),
-                                  route.get("owner_profile_demand"))
+                                  route.get("owner_profile_demand"), seal_persona=persona_version == 1)
             _seal_profile_demands(expected_nodes, route.get("profile_demands"),
                                   route.get("explicit_profiles"),
                                   legacy=_versioned_subgraph(registry, composed_recipe))
@@ -3335,11 +3371,12 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
             expected_nodes=_expand_parallel_groups(
                 expected_nodes, route_recipe["standard_plus"].get("parallel_groups"),
                 route.get("effective_intensity"), route.get("capability"),
-                auxiliary_check_units=registry.get("auxiliary_check_units"))
+                auxiliary_check_units=registry.get("auxiliary_check_units"),
+            persona_policy=persona_version == 1)
             if route.get("profile_selection_contract_version") == 1:
                 # Same ladder, same order as the compiler: stamp, then seal.
                 _stamp_frame_profiles(expected_nodes, route.get("owner_model_profile"),
-                                      route.get("owner_profile_demand"))
+                                      route.get("owner_profile_demand"), seal_persona=persona_version == 1)
                 _seal_profile_demands(expected_nodes, route.get("profile_demands"),
                                       route.get("explicit_profiles"), legacy=True)
                 by_id = {n["id"]: n for n in expected_nodes}
@@ -4512,7 +4549,7 @@ def _next_marker_sequence(directory, node_id):
                 maximum=max(maximum,int(middle))
     return maximum+1
 
-def _completion_marker_replay(route, node, node_id, evidence, axes, directory):
+def _completion_marker_replay(route, node, node_id, evidence, axes, directory, *, repair=True):
     """The one answer to "is this call a replay of the marker already on disk?".
 
     N2: this used to live only inside `write_completion_marker`, and the
@@ -4565,7 +4602,7 @@ def _completion_marker_replay(route, node, node_id, evidence, axes, directory):
         or json.loads(history_path.read_text(encoding="utf-8"))!=existing
     ):
         raise ValueError("canonical completion marker history conflict")
-    if recovering:
+    if recovering and repair:
         atomic_write(canonical_path, existing)
     return existing
 
@@ -4609,13 +4646,16 @@ def write_completion_marker(
     # real census (round_budget's own fail-soft on an unknown intensity is
     # the only `None` case) rather than the field being silently omitted.
     round_census=None
-    if node_id in REVIEW_ROUND_CAP.ROUND_CAPPED_NODE_IDS:
+    if REVIEW_ROUND_CAP.is_round_capped_node(node):
         rows=()
         if jobs is not None:
             jobs_path=Path(jobs)
             if jobs_path.is_file():
                 lines=jobs_path.read_text(encoding="utf-8",errors="replace").splitlines()
-                rows=_review_round_rows(lines,route["route_id"],node_id,jobs=jobs)
+                generations = (review_lineage_routes(route, node_id)
+                               if node.get("kind") == "review-worker" else [route])
+                rows = [row for generation in reversed(generations)
+                        for row in _review_round_rows(lines, generation["route_id"], node_id, jobs=jobs)]
         if owner_override:
             site="owner-closure"
         elif axes.get("registered_worker"):
@@ -4634,7 +4674,18 @@ def write_completion_marker(
             # what admission already decided.
             if attempt_id:
                 rows=tuple((status,meta) for status,meta in rows if meta.get("attempt_id")!=attempt_id)
-            revisions=_dependency_revisions(route,node,jobs)
+            reviewed_input = {}
+            if jobs is not None and attempt_id and Path(jobs).is_file():
+                import review_input
+                for line in lines:
+                    fields = line.split("\t")
+                    if len(fields) != 6:
+                        continue
+                    metadata = parse_registry_metadata(fields[5])
+                    if metadata.get("attempt_id") == attempt_id and metadata.get("review_input_digest"):
+                        reviewed_input = review_input.read_binding(jobs, metadata)
+                        break
+            revisions=_dependency_revisions(route,node,jobs,reviewed_input=reviewed_input)
         round_census=REVIEW_ROUND_CAP.marker_round_census(
             route,node,rows,site=site,revisions=revisions,
             independently_reviewed=review_identity.get("review_independence")=="independent",
@@ -5146,141 +5197,351 @@ def revision_basis_verdict(route, node, basis, answers, *, jobs=None, direction=
     return {"basis": basis, "answers": list(answers)}
 
 
-def publish_revision_locked(route, node_id, evidence, *, basis, answers=(), direction=None,
-                            reason=None, author_attempt_id, recorded_by="owner", jobs=None):
-    """SD-154 rule 1: the one writer for a gate-evidence revision.
+def _review_owner_authority(route, jobs, author_attempt_id):
+    """Prove the current registered owner without taking or creating locks."""
+    from owner_route_binding import resolve_owner_route_lifecycle
+    if not author_attempt_id:
+        raise ValueError("review-input-revision-owner-required")
+    caller = os.environ.get("AGENT_DISPATCH_ATTEMPT_ID")
+    if caller and caller != author_attempt_id:
+        raise ValueError("review-input-revision-owner-caller-mismatch")
+    matches = []
+    for line in Path(jobs).read_text(encoding="utf-8").splitlines():
+        fields = line.split("\t")
+        if len(fields) == 6:
+            meta = parse_registry_metadata(fields[5])
+            if meta.get("attempt_id") == author_attempt_id:
+                matches.append((fields, meta))
+    if len(matches) != 1:
+        raise ValueError("review-input-revision-owner-not-exact")
+    fields, meta = matches[0]
+    if (fields[1] not in _LIVE_ROW_STATUSES or meta.get("worker_type") != "owner"
+            or meta.get("dispatch_depth") != "1" or meta.get("registered_worker") != "1"):
+        raise ValueError("review-input-revision-owner-invalid")
+    binding, _ = resolve_owner_route_lifecycle(jobs, owner_attempt_id=author_attempt_id)
+    if binding is None or (binding.route_id, binding.route_hash) != (route["route_id"], route["route_hash"]):
+        raise ValueError("review-input-revision-owner-route-mismatch")
 
-    Reuses the node completion lock and the history-sequence writer
-    `write_completion_marker` already uses. Publishes marker k+1
-    (`stage_authority=revision`, `revision={...}` per rule 1) over `node_id`
-    and, in the same critical section, tombstones every downstream node's
-    canonical marker (rule 4: `<D>.<m+1>.json`,
-    `state=superseded-by-upstream-revision`). Every kept integrity refusal
-    (rule 6's "유지되는 거부") raises before any marker is touched -- "publish 0
-    markers" (A-SD154-5).
-    """
+
+def _review_input_revision_records(route, node_id, jobs):
+    """Read append-only input history; it never acts as a completion marker."""
+    if jobs is None:
+        return []
+    directory = Path(jobs).resolve().parent / "review-input-revisions" / route["route_id"] / node_id
+    if directory.is_symlink() or any(parent.is_symlink() for parent in (directory.parent, directory.parent.parent)):
+        raise ValueError("review-input-revision-history-invalid")
+    import review_input
+    records = []
+    for path in sorted(directory.glob("*.json")):
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+            if (not isinstance(record, dict) or record.get("schema_version") != 1 or record.get("route_id") != route["route_id"]
+                    or record.get("route_hash") != route["route_hash"] or record.get("node_id") != node_id
+                    or record.get("jobs") != str(Path(jobs).resolve())
+                    or path.name != f"{len(records) + 1:06d}.json"
+                    or record.get("previous_digest") != (_sha256_record(records[-1]) if records else None)):
+                raise ValueError("review-input-revision-history-invalid")
+        except (OSError, TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("review-input-revision-history-invalid") from exc
+        answers = record.get("answers")
+        if not isinstance(answers, list) or len(answers) != 1 or record.get("sequence") != len(records) + 1 or path.is_symlink():
+            raise ValueError("review-input-revision-history-invalid")
+        candidates = []
+        for line in Path(jobs).read_text(encoding="utf-8").splitlines():
+            cols = line.split("\t")
+            if len(cols) == 6:
+                meta = parse_registry_metadata(cols[5])
+                if meta.get("attempt_id") == answers[0]:
+                    candidates.append((cols, meta))
+        if len(candidates) != 1:
+            raise ValueError("review-input-revision-source-not-exact")
+        cols, meta = candidates[0]
+        if cols[1] != "done" or meta.get("note") != REVIEW_BLOCKING_NOTE or meta.get("review_input_digest") != record.get("input_binding_digest"):
+            raise ValueError("review-input-revision-source-mismatch")
+        original = review_input.read_binding(jobs, meta)
+        lineage = review_lineage_routes(route, node_id)
+        if ((original["route_id"], original["route_hash"]) not in {(r["route_id"], r["route_hash"]) for r in lineage}
+                or original["route_node"] != node_id
+                or record.get("of_evidence") != {"path": original["path"], "sha256": original["sha256"]}
+                or not isinstance(record.get("evidence"), dict)
+                or record["evidence"].get("sha256") == original["sha256"]):
+            raise ValueError("review-input-revision-source-mismatch")
+        records.append(record)
+    return records
+
+
+def _review_input_revision_plan(route, node_id, evidence, *, answers, author_attempt_id,
+                                recorded_by="owner", jobs):
+    """Pure SD-161 proof shared by preview and the serialized publisher."""
+    from artifact_producer import require_cycle_output
+    import review_input
+    if jobs is None:
+        raise ValueError("review-input-revision-jobs-required")
+    jobs = Path(jobs).resolve()
+    if jobs != _continuation_source_jobs(route).resolve():
+        raise ValueError("review-input-revision-registry-mismatch")
+    node = next((n for n in route["nodes"] if n["id"] == node_id), None)
+    if node is None or not review_input.is_review_node(node) or review_input.has_plan_producer(route, node):
+        raise ValueError("review-input-revision-node-ineligible")
+    _review_owner_authority(route, jobs, author_attempt_id)
+    evidence = Path(evidence).resolve()
+    if not evidence.is_file():
+        raise ValueError("review-input-revision-evidence-unreadable")
+    if require_cycle_output(Path(route["artifact_root"]), evidence, route_id=route["route_id"]) is None:
+        raise ValueError("review-input-revision-cycle-required")
+    lineage = review_lineage_routes(route, node_id)
+    lines = jobs.read_text(encoding="utf-8").splitlines()
+    rows = [row for generation in reversed(lineage)
+            for row in _review_round_rows(lines, generation["route_id"], node_id, jobs=jobs)]
+    budget = REVIEW_ROUND_CAP.round_budget(route, node, rows)
+    if budget.state in ("blocked-live", "blocked-unsettled"):
+        raise ValueError(f"review-input-revision-{budget.state}")
+    verdicts = [(status, meta) for status, meta in rows
+                if REVIEW_ROUND_CAP.classify_round_row(status, meta, worker_type="review") == "verdict"]
+    if not verdicts or verdicts[-1][1].get("note") != REVIEW_BLOCKING_NOTE:
+        raise ValueError("review-input-revision-blocking-verdict-required")
+    selected = verdicts[-1][1]
+    attempt = selected.get("attempt_id")
+    if tuple(answers) != (attempt,):
+        raise ValueError("review-input-revision-answer-not-current")
+    source = next(r for r in lineage if r["route_id"] == (selected.get("route_id") or selected.get("route")))
+    if ROUTE_IDENTITY.registered_node_identity(selected, node) != (source["route_id"], source["route_hash"], node_id):
+        raise ValueError("review-input-revision-source-route-mismatch")
+    terminal = inspect_terminal_attempt(selected.get("log_file"), worktree=route["cwd"],
+        artifact_root_metadata=selected.get("artifact_root") or route["artifact_root"], worker_type="review")
+    if terminal.get("state") != "valid" or terminal.get("verdict") != "FAIL" or terminal.get("artifact_state") != "readable":
+        raise ValueError("review-input-revision-verdict-unproven")
+    from dispatch_contract import attempt_process_quiescence
+    process = attempt_process_quiescence(selected, terminal_receipt=True)
+    if process.state != "quiescent":
+        raise ValueError(f"review-input-revision-process-{process.state}:{process.reason}")
+    original = review_input.read_binding(jobs, selected, verify_current=False)
+    if not original:
+        raise ValueError("review-input-revision-binding-required")
+    digest = hashlib.sha256(evidence.read_bytes()).hexdigest()
+    if digest == original["sha256"]:
+        raise ValueError("revision-evidence-unchanged")
+    records = _review_input_revision_records(route, node_id, jobs)
+    for record in records:
+        if record["answers"] == [attempt] and record["evidence"] == {"path": str(evidence), "sha256": digest}:
+            return {"input_revision": record, "tombstoned": []}, True
+    from datetime import datetime, timezone
+    record = {
+        "schema_version": 1, "route_id": route["route_id"], "route_hash": route["route_hash"],
+        "node_id": node_id, "jobs": str(jobs), "sequence": len(records) + 1,
+        "previous_digest": _sha256_record(records[-1]) if records else None,
+        "basis": "review-findings", "answers": [attempt],
+        "input_binding_digest": selected.get("review_input_digest"),
+        "of_evidence": {"path": original["path"], "sha256": original["sha256"]},
+        "evidence": {"path": str(evidence), "sha256": digest},
+        "author_attempt_id": author_attempt_id, "recorded_by": recorded_by,
+        "recorded_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+    return {"input_revision": record, "tombstoned": []}, False
+
+
+def preview_review_input_revision(route, node_id, evidence, *, answers, author_attempt_id,
+                                  recorded_by="owner", jobs):
+    """Check the exact writer authority without creating a lock or history file."""
+    result, _ = _review_input_revision_plan(
+        route, node_id, evidence, answers=answers, author_attempt_id=author_attempt_id,
+        recorded_by=recorded_by, jobs=jobs,
+    )
+    return result
+
+
+def publish_review_input_revision(route, node_id, evidence, *, answers, author_attempt_id,
+                                  recorded_by="owner", jobs):
+    """SD-161's sole writer: rerun the common proof under the existing jobs lock."""
+    options = dict(answers=answers, author_attempt_id=author_attempt_id,
+                   recorded_by=recorded_by, jobs=jobs)
+    # Refuse invalid authority before creating a lock, then prove it again in
+    # the critical section. Preview never enters the mutating branch below.
+    _review_input_revision_plan(route, node_id, evidence, **options)
+    jobs = Path(jobs).resolve()
+    with _exclusive_lock(Path(f"{jobs}.lock")):
+        result, existing = _review_input_revision_plan(route, node_id, evidence, **options)
+        if existing:
+            return result
+        record = result["input_revision"]
+        directory = jobs.parent / "review-input-revisions" / route["route_id"] / node_id
+        from artifact_receipt import _write_once
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"{record['sequence']:06d}.json"
+        encoded = (json.dumps(record, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+        if not _write_once(directory, path, encoded) and path.read_bytes() != encoded:
+            raise ValueError("review-input-revision-history-conflict")
+        return result
+
+
+def _revision_target(route, node_id, basis):
     node = next((n for n in route.get("nodes", []) if n.get("id") == node_id), None)
     if node is None:
         raise ValueError(f"unknown route node: {node_id}")
     if basis not in ("review-findings", "user-direction", "owner-correction"):
         raise ValueError(f"revision-basis-invalid:{basis}")
+    import review_input
+    if review_input.is_review_node(node) and not review_input.has_plan_producer(route, node):
+        if basis != "review-findings":
+            raise ValueError("review-input-revision-review-findings-required")
+        return node, True
+    return node, False
+
+
+def _producer_revision_plan(route, node_id, evidence, *, basis, answers=(), direction=None,
+                            reason=None, author_attempt_id, recorded_by="owner", jobs=None):
+    """Pure producer revision proof; publication reruns it inside its node lock."""
+    node, input_only = _revision_target(route, node_id, basis)
+    if input_only:
+        raise ValueError("revision-producer-required")
     directory = completion_dir(route["route_id"], jobs=jobs)
     canonical_path = directory / f"{node_id}.json"
-    node_lock = directory / f".{node_id}.completion.lock"
-    with _exclusive_lock(node_lock):
+    try:
+        marker = json.loads(canonical_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        # Not the gate's own missing-dependency reason (`dispatch_
+        # completion_marker.test.py`'s static guardian keeps that literal
+        # inside `dispatch_contract.py` and the adapters' relay) -- there
+        # is nothing to revise, a distinct fact from a dependent gate
+        # finding no marker for an unstarted node.
+        raise ValueError("revision-target-marker-absent")
+    currency = gate_currency(route, node, canonical_path, marker)
+    if currency.state == "current":
+        raise ValueError("revision-evidence-unchanged")
+    if currency.state != "revised-unrecorded":
+        # `superseded`, `completion-evidence-unreadable`, or any
+        # `integrity-broken:*` -- every one of these is a kept refusal
+        # (13.59.3 "유지되는 거부"), not something `revise` can record over.
+        raise ValueError(currency.reason)
+    evidence_path = Path(evidence).resolve()
+    if not (evidence_path.is_file() or evidence_path.is_dir()):
+        raise ValueError("completion-evidence-unreadable")
+    # D-120: a revision's new evidence is bound by the same admitted cycle
+    # write scope as an ordinary completion (`_publish_completion_locked`
+    # already requires this) -- an open neighbouring cycle, or a
+    # sealed/abandoned one, cannot certify a revision's evidence any more
+    # than it can an original completion's.
+    from artifact_producer import ProducerError, require_cycle_output
+    try:
+        require_cycle_output(Path(route["artifact_root"]), evidence_path, route_id=route["route_id"])
+    except ProducerError as exc:
+        raise ValueError(f"{exc.code}: {exc.detail}") from exc
+    evidence_sha = evidence_digest(evidence_path)
+    # Basis verification runs (and can raise `revision-basis-unverified`)
+    # before any write -- a refused revision must publish nothing.
+    revision_basis_verdict(route, node, basis, answers, jobs=jobs, direction=direction, reason=reason)
+    sequence = marker.get("sequence")
+    history_path = directory / f"{node_id}.{sequence}.json"
+    try:
+        prior_bytes = history_path.read_bytes()
+    except OSError:
+        raise ValueError("canonical completion marker history conflict")
+    prior_sha = hashlib.sha256(prior_bytes).hexdigest()
+    from datetime import datetime, timezone
+    new_sequence = _next_marker_sequence(directory, node_id)
+    revision_record = {
+        "of_sequence": sequence,
+        "of_marker_sha256": prior_sha,
+        "of_evidence_sha256": (marker.get("evidence") or {}).get("sha256"),
+        "evidence_sha256": evidence_sha,
+        "basis": basis,
+        "answers": list(answers),
+        "direction": direction,
+        "reason": reason,
+        "author_attempt_id": author_attempt_id,
+        "recorded_by": recorded_by,
+        "recorded_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+    if node_id == "execute":
+        # SD-154 A-2: an execute revision is a code change, not just new
+        # gate evidence -- record the descendant commit range SD-156's
+        # `source_lineage_verdict` proves, from execute's own most recent
+        # terminal `launch_head` to the current HEAD.
+        registry_jobs = Path(jobs) if jobs is not None else _continuation_source_jobs(route)
+        prior_head = _diff_attribution_execute_launch_head(registry_jobs, route)
+        cwd = route.get("cwd")
+        if prior_head and isinstance(cwd, str):
+            verdict = source_lineage_verdict(cwd, prior_head)
+            if verdict.kind == "descendant":
+                revision_record["commits"] = list(verdict.commits)
+    new_marker = dict(marker)
+    new_marker.pop("state", None)
+    new_marker.pop("superseded_by", None)
+    new_marker["stage_authority"] = "revision"
+    new_marker["evidence"] = {"path": str(evidence_path), "sha256": evidence_sha}
+    new_marker["sequence"] = new_sequence
+    new_marker["revision"] = revision_record
+    # SD-153 rule 5: a revision over a capped node gets its OWN fresh
+    # census (site="revision") -- the prior marker's census (if any)
+    # described a different write and must not survive the copy above.
+    new_marker.pop("round_census", None)
+    if REVIEW_ROUND_CAP.is_round_capped_node(node):
+        census_rows = ()
+        if jobs is not None:
+            census_jobs_path = Path(jobs)
+            if census_jobs_path.is_file():
+                census_lines = census_jobs_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                census_rows = _review_round_rows(census_lines, route["route_id"], node_id,jobs=jobs)
+        census = REVIEW_ROUND_CAP.marker_round_census(route, node, census_rows, site="revision")
+        if census:
+            new_marker["round_census"] = census
+    tombstones = {}
+    for downstream_id in sorted(_downstream_node_ids(route, node_id)):
+        downstream_canonical = directory / f"{downstream_id}.json"
+        if not downstream_canonical.is_file():
+            continue
         try:
-            marker = json.loads(canonical_path.read_text(encoding="utf-8"))
+            downstream_marker = json.loads(downstream_canonical.read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            # Not the gate's own missing-dependency reason (`dispatch_
-            # completion_marker.test.py`'s static guardian keeps that literal
-            # inside `dispatch_contract.py` and the adapters' relay) -- there
-            # is nothing to revise, a distinct fact from a dependent gate
-            # finding no marker for an unstarted node.
-            raise ValueError("revision-target-marker-absent")
-        currency = gate_currency(route, node, canonical_path, marker)
-        if currency.state == "current":
-            raise ValueError("revision-evidence-unchanged")
-        if currency.state != "revised-unrecorded":
-            # `superseded`, `completion-evidence-unreadable`, or any
-            # `integrity-broken:*` -- every one of these is a kept refusal
-            # (13.59.3 "유지되는 거부"), not something `revise` can record over.
-            raise ValueError(currency.reason)
-        evidence_path = Path(evidence).resolve()
-        if not (evidence_path.is_file() or evidence_path.is_dir()):
-            raise ValueError("completion-evidence-unreadable")
-        # D-120: a revision's new evidence is bound by the same admitted cycle
-        # write scope as an ordinary completion (`_publish_completion_locked`
-        # already requires this) -- an open neighbouring cycle, or a
-        # sealed/abandoned one, cannot certify a revision's evidence any more
-        # than it can an original completion's.
-        from artifact_producer import ProducerError, require_cycle_output
-        try:
-            require_cycle_output(Path(route["artifact_root"]), evidence_path, route_id=route["route_id"])
-        except ProducerError as exc:
-            raise ValueError(f"{exc.code}: {exc.detail}") from exc
-        evidence_sha = evidence_digest(evidence_path)
-        # Basis verification runs (and can raise `revision-basis-unverified`)
-        # before any write -- a refused revision must publish nothing.
-        revision_basis_verdict(route, node, basis, answers, jobs=jobs, direction=direction, reason=reason)
-        sequence = marker.get("sequence")
-        history_path = directory / f"{node_id}.{sequence}.json"
-        try:
-            prior_bytes = history_path.read_bytes()
-        except OSError:
-            raise ValueError("canonical completion marker history conflict")
-        prior_sha = hashlib.sha256(prior_bytes).hexdigest()
-        from datetime import datetime, timezone
-        new_sequence = _next_marker_sequence(directory, node_id)
-        revision_record = {
-            "of_sequence": sequence,
-            "of_marker_sha256": prior_sha,
-            "of_evidence_sha256": (marker.get("evidence") or {}).get("sha256"),
-            "evidence_sha256": evidence_sha,
-            "basis": basis,
-            "answers": list(answers),
-            "direction": direction,
-            "reason": reason,
-            "author_attempt_id": author_attempt_id,
-            "recorded_by": recorded_by,
-            "recorded_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        }
-        if node_id == "execute":
-            # SD-154 A-2: an execute revision is a code change, not just new
-            # gate evidence -- record the descendant commit range SD-156's
-            # `source_lineage_verdict` proves, from execute's own most recent
-            # terminal `launch_head` to the current HEAD.
-            registry_jobs = Path(jobs) if jobs is not None else _continuation_source_jobs(route)
-            prior_head = _diff_attribution_execute_launch_head(registry_jobs, route)
-            cwd = route.get("cwd")
-            if prior_head and isinstance(cwd, str):
-                verdict = source_lineage_verdict(cwd, prior_head)
-                if verdict.kind == "descendant":
-                    revision_record["commits"] = list(verdict.commits)
-        new_marker = dict(marker)
-        new_marker.pop("state", None)
-        new_marker.pop("superseded_by", None)
-        new_marker["stage_authority"] = "revision"
-        new_marker["evidence"] = {"path": str(evidence_path), "sha256": evidence_sha}
-        new_marker["sequence"] = new_sequence
-        new_marker["revision"] = revision_record
-        # SD-153 rule 5: a revision over a capped node gets its OWN fresh
-        # census (site="revision") -- the prior marker's census (if any)
-        # described a different write and must not survive the copy above.
-        new_marker.pop("round_census", None)
-        if node_id in REVIEW_ROUND_CAP.ROUND_CAPPED_NODE_IDS:
-            census_rows = ()
-            if jobs is not None:
-                census_jobs_path = Path(jobs)
-                if census_jobs_path.is_file():
-                    census_lines = census_jobs_path.read_text(encoding="utf-8", errors="replace").splitlines()
-                    census_rows = _review_round_rows(census_lines, route["route_id"], node_id,jobs=jobs)
-            census = REVIEW_ROUND_CAP.marker_round_census(route, node, census_rows, site="revision")
-            if census:
-                new_marker["round_census"] = census
-        new_history_path = directory / f"{node_id}.{new_sequence}.json"
-        write_once(new_history_path, new_marker)
-        atomic_write(canonical_path, new_marker)
-        tombstoned = []
-        for downstream_id in sorted(_downstream_node_ids(route, node_id)):
-            downstream_canonical = directory / f"{downstream_id}.json"
-            if not downstream_canonical.is_file():
-                continue
-            try:
-                downstream_marker = json.loads(downstream_canonical.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                continue
-            if downstream_marker.get("state") == "superseded-by-upstream-revision":
-                continue
-            downstream_sequence = _next_marker_sequence(directory, downstream_id)
-            tombstone_marker = dict(downstream_marker)
-            tombstone_marker["sequence"] = downstream_sequence
-            tombstone_marker["state"] = "superseded-by-upstream-revision"
-            tombstone_marker["superseded_by"] = {"node": node_id, "sequence": new_sequence}
-            downstream_history_path = directory / f"{downstream_id}.{downstream_sequence}.json"
-            write_once(downstream_history_path, tombstone_marker)
-            atomic_write(downstream_canonical, tombstone_marker)
-            tombstoned.append(downstream_id)
-    return {"marker": new_marker, "tombstoned": tombstoned}
+            continue
+        if downstream_marker.get("state") == "superseded-by-upstream-revision":
+            continue
+        downstream_sequence = _next_marker_sequence(directory, downstream_id)
+        tombstone_marker = dict(downstream_marker)
+        tombstone_marker["sequence"] = downstream_sequence
+        tombstone_marker["state"] = "superseded-by-upstream-revision"
+        tombstone_marker["superseded_by"] = {"node": node_id, "sequence": new_sequence}
+        tombstones[downstream_id] = tombstone_marker
+    return new_marker, tombstones
+
+
+def preview_revision(route, node_id, evidence, *, basis, answers=(), direction=None,
+                     reason=None, author_attempt_id, recorded_by="owner", jobs=None):
+    """The complete writer proof, without lock creation or marker publication."""
+    _, input_only = _revision_target(route, node_id, basis)
+    if input_only:
+        return preview_review_input_revision(
+            route, node_id, evidence, answers=answers, author_attempt_id=author_attempt_id,
+            recorded_by=recorded_by, jobs=jobs,
+        )
+    marker, tombstones = _producer_revision_plan(
+        route, node_id, evidence, basis=basis, answers=answers, direction=direction,
+        reason=reason, author_attempt_id=author_attempt_id, recorded_by=recorded_by, jobs=jobs,
+    )
+    return {"marker": marker, "tombstoned": list(tombstones)}
+
+
+def publish_revision_locked(route, node_id, evidence, *, basis, answers=(), direction=None,
+                            reason=None, author_attempt_id, recorded_by="owner", jobs=None):
+    """Publish the shared producer proof and downstream tombstones under one lock."""
+    _, input_only = _revision_target(route, node_id, basis)
+    if input_only:
+        return publish_review_input_revision(
+            route, node_id, evidence, answers=answers, author_attempt_id=author_attempt_id,
+            recorded_by=recorded_by, jobs=jobs,
+        )
+    directory = completion_dir(route["route_id"], jobs=jobs)
+    with _exclusive_lock(directory / f".{node_id}.completion.lock"):
+        marker, tombstones = _producer_revision_plan(
+            route, node_id, evidence, basis=basis, answers=answers, direction=direction,
+            reason=reason, author_attempt_id=author_attempt_id, recorded_by=recorded_by, jobs=jobs,
+        )
+        write_once(directory / f"{node_id}.{marker['sequence']}.json", marker)
+        atomic_write(directory / f"{node_id}.json", marker)
+        for downstream_id, tombstone in tombstones.items():
+            write_once(directory / f"{downstream_id}.{tombstone['sequence']}.json", tombstone)
+            atomic_write(directory / f"{downstream_id}.json", tombstone)
+    return {"marker": marker, "tombstoned": list(tombstones)}
 
 
 def _route_revisions(route, *, jobs=None):
@@ -5468,6 +5729,7 @@ def _publish_completion_locked(
     jobs=None,
     owner_override=False,
     owner_chain=False,
+    check_only=False,
 ):
     """Publish marker history, exact-attempt link, and canonical marker under one node lock."""
 
@@ -5554,6 +5816,13 @@ def _publish_completion_locked(
         )
     elif require_existing_link:
         raise ValueError("completed attempt row lacks immutable completion link")
+
+    if check_only:
+        # The read-only branch uses the same immutable link/history checks
+        # above and canonical replay proof below, without migration or repair.
+        return marker if marker is not None else _completion_marker_replay(
+            route, node, node_id, evidence, axes, completion_dir(route["route_id"]), repair=False,
+        )
 
     if marker is None:
         marker=write_completion_marker(
@@ -5748,17 +6017,27 @@ def _node_revision_records(route, node_id, jobs=None):
             revisions.append(marker.get("revision") or {})
     return revisions
 
-def _dependency_revisions(route, node, jobs=None):
+def _dependency_revisions(route, node, jobs=None, *, reviewed_input=None):
     """13.59.3 rule 7's closure-check eligibility set: every revision
     recorded on any node this one `depends_on`. `dispatch-node.py`'s
     `admit_round` calls this same function for its `round_budget`, so a
     marker published for a closure-check round is labeled
     `closure_class="closure-check"` the same way admission already saw it."""
+    lineage = (review_lineage_routes(route, node["id"])
+               if node.get("kind") == "review-worker" else [route])
     return [
         revision
-        for dep in node.get("depends_on",[])
-        for revision in _node_revision_records(route,dep,jobs)
+        for generation in reversed(lineage)
+        for dep in node.get("depends_on", [])
+        for revision in _node_revision_records(generation, dep, jobs)
+    ] + [
+        revision
+        for generation in reversed(lineage)
+        for revision in _review_input_revision_records(generation, node["id"], jobs)
+        if reviewed_input is None or revision.get("evidence") == {
+            "path": reviewed_input.get("path"), "sha256": reviewed_input.get("sha256")}
     ]
+
 
 def _owner_closure_eligibility(route, node, node_id, evidence, row_metadata, lines,
                                *, rounds=None, check_canonical=True, jobs=None):
@@ -5919,17 +6198,92 @@ def review_lineage_routes(route, node_id):
     return lineage
 
 
+def _continuation_closure_marker_compatible(route, node, evidence, jobs, proof):
+    path = completion_dir(route["route_id"], jobs=jobs) / f"{node['id']}.json"
+    if path.exists():
+        existing = json.loads(path.read_text(encoding="utf-8"))
+        if (existing.get("stage_authority") != "owner-closure"
+                or existing.get("owner_closure_proof") != proof
+                or existing.get("evidence") != {"path": str(evidence), "sha256": evidence_digest(evidence)}):
+            raise ValueError("owner-closure-node-already-complete")
+
+
+def _owner_closure_sealed_pipe(pipe, facts):
+    try:
+        return _updated_attempt_metadata(pipe, {
+            "gate_closure": "owner-closure", "owner_closure": facts["evidence"],
+            "review_artifact_b64": facts["review_artifact_b64"],
+        }, terminal=True)
+    except DispatchContractError as exc:
+        raise ValueError(f"owner-closure-seal-refused:{exc.reason}") from exc
+
+
+def owner_closure_plan(route, node, evidence, jobs, attempt_id, *, lines=None):
+    """Select authority by the exact row, never by continuation depth.
+
+    Operator recovery remains available outside a registered worker context.
+    A registered caller must be the current owner of this route.
+    """
+    jobs = Path(jobs).resolve()
+    ensure_terminal_claim_absent(jobs, route["route_id"], attempt_id)
+    if lines is None:
+        lines = jobs.read_text(encoding="utf-8").splitlines()
+    matches = []
+    for line in lines:
+        fields = line.split("\t")
+        if len(fields) == 6:
+            meta = parse_registry_metadata(fields[5])
+            if meta.get("attempt_id") == attempt_id:
+                matches.append((fields, meta))
+    if len(matches) != 1:
+        raise ValueError("owner-closure-source-attempt-not-exact")
+    fields, selected = matches[0]
+    try:
+        validate_attempt_metadata(selected)
+    except DispatchContractError as exc:
+        raise ValueError(f"row-contract-invalid:{exc.reason}") from exc
+    if selected.get("subsession_id") or str(selected.get("stage_authority", "1")).lower() in {"0", "false"}:
+        raise ValueError("subsession-has-no-stage-gate-authority")
+    current = ROUTE_IDENTITY.registered_node_identity(selected, node) == (
+        route["route_id"], route["route_hash"], node["id"])
+    if current and fields[1] == "done" and selected.get("note") == "completed-marker":
+        marker = _publish_completion_locked(
+            route, node, node["id"], evidence, jobs=jobs, attempt_id=attempt_id,
+            attempt_metadata=selected, require_existing_link=True, check_only=True,
+        )
+        if owner_closure_shape(marker) != "registered-review":
+            raise ValueError("owner-closure-replay-not-owner-closure")
+        return {"schema_version": 1, "source_attempt_id": attempt_id, "jobs": str(jobs),
+                "already_completed": True, "marker": marker}
+    proof = continuation_owner_closure_plan(
+        route, node, evidence, jobs, attempt_id, lines=lines,
+        check_dependencies=not current, _same_route=current,
+    )
+    if current:
+        _owner_closure_sealed_pipe(fields[5], proof["closure"])
+        metadata = selected
+    else:
+        _continuation_closure_marker_compatible(route, node, evidence, jobs, proof)
+        metadata = {"stage_authority": "owner-closure", "owner_closure_proof": proof}
+    _publish_completion_locked(
+        route, node, node["id"], evidence, jobs=jobs, attempt_id=attempt_id,
+        attempt_metadata=metadata, owner_override=True, check_only=True,
+    )
+    return proof
+
+
 def continuation_owner_closure_plan(route, node, evidence, jobs, attempt_id, *,
-                                    lines=None, check_process=True, check_dependencies=True):
+                                    lines=None, check_process=True, check_dependencies=True,
+                                    _same_route=False):
     """Read-only authority shared by check, commit and downstream consumers."""
     from artifact_producer import require_cycle_output
     from dispatch_contract import attempt_process_quiescence, terminal_conflict_pending
 
     jobs = Path(jobs).resolve()
-    if jobs != _continuation_source_jobs(route).resolve():
+    if not _same_route and jobs != _continuation_source_jobs(route).resolve():
         raise ValueError("owner-closure-registry-mismatch")
     lineage = review_lineage_routes(route, node["id"])
-    if len(lineage) < 2:
+    if not _same_route and len(lineage) < 2:
         raise ValueError("owner-closure-official-continuation-required")
     route_by_id = {r["route_id"]: r for r in lineage}
     if lines is None:
@@ -5940,13 +6294,16 @@ def continuation_owner_closure_plan(route, node, evidence, jobs, attempt_id, *,
         raise ValueError("owner-closure-source-attempt-not-exact")
     status, selected = exact[0]
     source_id = selected.get("route_id") or selected.get("route")
-    if source_id == route["route_id"] or status != "done" or selected.get("note") != REVIEW_BLOCKING_NOTE:
-        raise ValueError("owner-closure-source-not-blocking-ancestor")
+    if (source_id == route["route_id"]) != _same_route or status != "done" or selected.get("note") != REVIEW_BLOCKING_NOTE:
+        raise ValueError("owner-closure-source-not-blocking-current" if _same_route else "owner-closure-source-not-blocking-ancestor")
+    caller = os.environ.get("AGENT_DISPATCH_ATTEMPT_ID")
+    if caller and check_process:
+        _review_owner_authority(route, jobs, caller)
     output = require_cycle_output(Path(route["artifact_root"]), Path(evidence), route_id=route["route_id"])
-    if output is None:
+    if output is None and not _same_route:
         raise ValueError("owner-closure-destination-cycle-missing")
     facts = _owner_closure_eligibility(route, node, node["id"], evidence, selected, lines,
-                                     rounds=rounds, check_canonical=False)
+                                     rounds=rounds, check_canonical=_same_route, jobs=jobs)
     reviews = []
     seen = set()
     for row_status, meta in rounds:
@@ -5984,8 +6341,9 @@ def continuation_owner_closure_plan(route, node, evidence, jobs, attempt_id, *,
                 raise ValueError(f"owner-closure-dependency-{ready.state}:{dependency}:{ready.reason}")
     return {"schema_version": 1, "source_attempt_id": attempt_id, "jobs": str(jobs),
             "lineage": [{"route_id": r["route_id"], "route_hash": r["route_hash"]} for r in lineage],
-            "output_dir": str(output), "reviews": reviews,
-            "rounds": facts["rounds"], "max_round": facts["max_round"]}
+            "output_dir": str(output) if output is not None else None, "reviews": reviews,
+            "rounds": facts["rounds"], "max_round": facts["max_round"],
+            **({"closure": facts} if _same_route else {})}
 
 
 def validate_continuation_owner_closure(route, node, marker, *, jobs=None, lines=None, check_process=False):
@@ -6004,14 +6362,8 @@ def validate_continuation_owner_closure(route, node, marker, *, jobs=None, lines
 
 
 def _publish_continuation_owner_closure(route, node, evidence, jobs, attempt_id, lines):
-    proof = continuation_owner_closure_plan(route, node, evidence, jobs, attempt_id, lines=lines)
-    path = completion_dir(route["route_id"], jobs=jobs) / f"{node['id']}.json"
-    if path.exists():
-        existing = json.loads(path.read_text(encoding="utf-8"))
-        if (existing.get("stage_authority") != "owner-closure"
-                or existing.get("owner_closure_proof") != proof
-                or existing.get("evidence") != {"path": str(evidence), "sha256": evidence_digest(evidence)}):
-            raise ValueError("owner-closure-node-already-complete")
+    proof = owner_closure_plan(route, node, evidence, jobs, attempt_id, lines=lines)
+    _continuation_closure_marker_compatible(route, node, evidence, jobs, proof)
     marker = _publish_completion_locked(
         route, node, node["id"], evidence, jobs=jobs, attempt_id=attempt_id,
         attempt_metadata={"stage_authority": "owner-closure", "owner_closure_proof": proof},
@@ -6145,26 +6497,15 @@ def _complete_node_locked(
             owner_closure=None
             sealed_pipe=None
             if already_closed and row_note==REVIEW_BLOCKING_NOTE:
-                owner_closure=_owner_closure_eligibility(
-                    route,node,node_id,evidence,row_metadata,lines,jobs=jobs_path,
-                )
+                owner_closure = owner_closure_plan(
+                    route, node, evidence, jobs_path, attempt_id, lines=lines,
+                )["closure"]
                 # Seal the closure facts through the one sanitizing writer
                 # every other terminal value uses (keys allowlisted in
                 # ATTEMPT_TERMINAL_EVIDENCE_KEYS, ',' -> ';', immutability
                 # checks) -- and compute it BEFORE the marker is published so a
                 # refused seal publishes nothing.
-                try:
-                    sealed_pipe=_updated_attempt_metadata(
-                        row_fields[5],
-                        {
-                            "gate_closure":"owner-closure",
-                            "owner_closure":owner_closure["evidence"],
-                            "review_artifact_b64":owner_closure["review_artifact_b64"],
-                        },
-                        terminal=True,
-                    )
-                except DispatchContractError as exc:
-                    raise ValueError(f"owner-closure-seal-refused:{exc.reason}") from exc
+                sealed_pipe = _owner_closure_sealed_pipe(row_fields[5], owner_closure)
                 marker_eligible=True
             if already_closed and row_note!="completed-marker" and not marker_eligible:
                 raise ValueError(
@@ -6686,7 +7027,7 @@ def _compose_artifact_root(cwd):
     return root
 
 
-def compose_receipt(route, path):
+def compose_receipt(route, path, *, owner_harness=None):
     """The ordinary caller needs its choices and handle, not all sealed evidence."""
     return {
         "route_file": str(Path(path).resolve()), "route_id": route["route_id"],
@@ -6699,6 +7040,7 @@ def compose_receipt(route, path):
                   for node in route["nodes"]],
         "human_gates": route.get("human_gates", []),
         "campaign": compose_campaign_selection(route),
+        "advisories": OWNER_WRITE_ADVISORY.advisories(route, owner_harness=owner_harness),
     }
 
 
@@ -7007,7 +7349,7 @@ def _emit_compiled_route(a,route,artifact_root,output=None):
                         plan=plan, plan_source=plan_source)
     _compose_self_bind(a, route, output_path.resolve())
     print(f"route_file={output_path.resolve()}",file=sys.stderr)
-    result = (compose_receipt(route, output_path)
+    result = (compose_receipt(route, output_path, owner_harness=getattr(a, "owner", None))
               if a.command == "compose" and not getattr(a, "full_record", False) else route)
     if not getattr(a, "start", False):
         print(json.dumps(result,sort_keys=True))
@@ -7111,7 +7453,7 @@ def main():
     d=sub.add_parser("complete"); d.add_argument("--route",required=True); d.add_argument("--node",required=True); d.add_argument("--evidence",required=True); d.add_argument("--output")
     d.add_argument("--jobs",help="canonical registry path for a registered attempt")
     d.add_argument("--attempt-id",help="exact current attempt, or an official continuation's blocking source review")
-    d.add_argument("--check",action="store_true",help="read-only check of continuation owner-closure authority; publishes nothing")
+    d.add_argument("--check",action="store_true",help="read-only check of exact current or ancestor owner-closure authority; publishes nothing")
     d.add_argument("--dispatch-depth",type=int)
     d.add_argument("--transport")
     d.add_argument("--execution-surface")
@@ -7214,7 +7556,7 @@ def main():
             work_request={"text":a.prompt_file.read_text(),"owner_harness":a.owner} if a.prompt_file else None,
         )
         _plan_for_card, _plan_source_for_card = a._route_chain_plan
-        print(compose_card(route, _plan_for_card, _plan_source_for_card),file=sys.stderr)
+        print(compose_card(route, _plan_for_card, _plan_source_for_card, owner_harness=a.owner),file=sys.stderr)
         if a.explain:
             print("route_file_written=0 explain=1",file=sys.stderr)
             print(json.dumps({"route_id":route["route_id"],"capability":route["capability"],
@@ -7225,6 +7567,7 @@ def main():
                                        for n in route["nodes"]],
                               "human_gates":route.get("human_gates"),"parallel_groups":route.get("parallel_groups"),
                               "campaign":compose_campaign_selection(route),
+                              "advisories":OWNER_WRITE_ADVISORY.advisories(route, owner_harness=a.owner),
                               "tracked_gate_evidence":route.get("tracked_gate_evidence")},sort_keys=True))
             return 0
         path = _emit_compiled_route(a,route,artifact_root)
@@ -7468,7 +7811,7 @@ def main():
                 author_attempt_id=author_attempt_id,recorded_by=a.recorded_by,
                 jobs=Path(a.jobs) if a.jobs else None,
             )
-            marker=result["marker"]
+            marker=result.get("marker") or result["input_revision"]
             if a.output: atomic_write(a.output, marker)
             print(json.dumps(marker,sort_keys=True))
             print(f"tombstoned={','.join(result['tombstoned']) or '-'}",file=sys.stderr)
@@ -7525,7 +7868,7 @@ def main():
                 if a.check:
                     if not a.jobs or not a.attempt_id or a.output or review_claim or explicit_attempt_metadata or a.subsession_manifest:
                         raise ValueError("owner-closure-check-requires-exact-jobs-attempt-and-no-overrides")
-                    proof = continuation_owner_closure_plan(route, node, evidence, a.jobs, a.attempt_id)
+                    proof = owner_closure_plan(route, node, evidence, a.jobs, a.attempt_id)
                     print(json.dumps({"result": "ready", "read_only": True, "route_id": route["route_id"],
                                       "node_id": a.node, "owner_closure_proof": proof}, sort_keys=True))
                     return

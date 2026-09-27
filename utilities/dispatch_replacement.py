@@ -140,7 +140,7 @@ def seal_launch_input(args, harness: str, task: str) -> str:
     defaults = {'--'+key.replace('_','-'): str(getattr(args,key))
                 for key in ('parent_session_id','parent_attempt_id','parent_harness',
                             'parent_transport','parent_sandbox','launch_authority',
-                            'sandbox','permission_mode') if getattr(args,key,None)}
+                            'sandbox','permission_mode','reviewed_evidence') if getattr(args,key,None)}
     normalized = _canonical_argv(_replace_options(list(argv), defaults, remove=INPUT_OPTIONS))
     payload = {
         'schema': SCHEMA, 'attempt_id': aid, 'harness': harness,
@@ -673,6 +673,14 @@ def admission(jobs, lines, metadata):
             raise DC.DispatchContractError('replacement-subsession-scope-mismatch')
     _, source, replay = validate_claim_source(jobs, lines, record)
     candidate = launch_input(jobs, metadata['attempt_id'], metadata)
+    if source.get('review_input_digest') or metadata.get('review_input_digest'):
+        from review_input import read_binding
+        original_input = read_binding(jobs, source, verify_current=True)
+        replacement_input = read_binding(jobs, metadata, verify_current=True)
+        if (any(replacement_input.get(k) != original_input.get(k) for k in ('path', 'sha256', 'producer'))
+                or replacement_input.get('source') != {
+                    'attempt_id': source['attempt_id'], 'binding_digest': source['review_input_digest']}):
+            raise DC.DispatchContractError('reviewed-evidence-replacement-mismatch')
     expected_task = _replacement_task(record, source, replay)
     for key in ('harness', 'jobs', 'worktree', 'launch_home', 'resolved', 'applied_permissions'):
         if candidate.get(key) != replay.get(key):

@@ -24,6 +24,13 @@ Adapters may expose this capability through native commands, skill files, prompt
 This sub-capability follows `core/CONVENTIONS.md §1`: plan-check and review rigor is derived from intensity rather than independently selected. `code-plan` is used for durable `standard+` code work cycles; `direct` skips it and `quick` is handled by one registered-headless dispatch-depth-1 one-shot conductor with its inline micro-plan plus `plan-check-lite`. Independent plan review is selected by intensity/risk and is not repeated after every sub-stage by default.
 
 
+When a composed graph omits the plan producer, its owner passes the exact plan
+file as `--reviewed-evidence` to the plan-check dispatch. A current plan gate
+supplies this binding automatically in the full graph. The runtime binds the
+input to the attempt before execution; prompt text is not input authority.
+Corrections use SD-161 input revisions when there is no producer marker, keeping
+review admission separate from PASS and retaining the cap+1 verdict ceiling.
+
 ## Artifact Ownership
 
 Use the shared artifact root rule: prefer `.agent_reports/`; use legacy `.claude_reports/` only when it already exists and `.agent_reports/` does not. Capability-specific output placement follows `core/CONVENTIONS.md` section 5 until this spec is expanded with a stricter per-capability artifact map.

@@ -96,6 +96,40 @@ class ClassifyRoundRowTest(unittest.TestCase):
 
 
 class RoundBudgetTest(unittest.TestCase):
+    def test_sd161_parallel_review_legs_keep_capped_identity_without_broadening_other_nodes(self):
+        for node_id in CAP.ROUND_CAPPED_NODE_IDS:
+            self.assertTrue(CAP.is_round_capped_node({"id": node_id}))
+        for node_id in ("plan-check", "plan-check-alternative", "plan-check-replica-2"):
+            node = {"id": node_id, "kind": "review-worker", "unit": "qa/plan-review"}
+            self.assertTrue(CAP.is_round_capped_node(node))
+            rows = [row("done", "completed-review-blocking", extra={"attempt_id": f"att-{i}"}) for i in (1, 2)]
+            self.assertEqual(CAP.round_budget(route(), node, rows).state, "exhausted")
+        self.assertFalse(CAP.is_round_capped_node({"id": "custom-review", "kind": "review-worker", "unit": "qa/custom"}))
+        self.assertFalse(CAP.is_round_capped_node({"id": "custom-stage", "kind": "pipeline-stage", "unit": "qa/plan-review"}))
+
+    def test_sd161_within_cap_revision_does_not_spend_extra_verdict(self):
+        rows = []
+        revisions = []
+        for number in (1, 2, 3):
+            attempt = f"att-review-{number}"
+            rows.append(row("done", "completed-review-blocking", extra={
+                "attempt_id": attempt, "round_kind": "closure-check"}))
+            revisions.append({"answers": [attempt]})
+            budget = CAP.round_budget(route(cap=2), review_node(), rows, revisions=revisions)
+            self.assertEqual(budget.state, "admit" if number < 3 else "exhausted")
+            self.assertEqual(budget.verdict_rounds, number)
+
+    def test_sd161_verdictless_tail_keeps_revision_but_bound_and_live_win(self):
+        rows = [row("done", "completed-review-blocking", extra={"attempt_id": f"att-r{i}"})
+                for i in (1, 2)]
+        revisions = [{"answers": ["att-r2"]}]
+        rows.append(row("dead", "dead-worker-silent-exit"))
+        self.assertEqual(CAP.round_budget(route(), review_node(), rows, revisions=revisions).state, "admit")
+        for status, note, expected in (("dead", "dead-worker-silent-exit", "verdictless-bound"),
+                                       ("open", "", "blocked-live")):
+            self.assertEqual(CAP.round_budget(route(), review_node(), rows + [row(status, note)],
+                                             revisions=revisions).state, expected)
+
     def test_empty_history_is_admit_at_round_one(self):
         budget = CAP.round_budget(route(cap=2), review_node(), [])
         self.assertEqual(budget.state, "admit")

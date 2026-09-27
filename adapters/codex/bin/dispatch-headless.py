@@ -24,6 +24,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "utilities"))
+from review_input import preview_request_nodes
 from dispatch_contract import (
     workflow_completion_receipt,  # noqa: E402
     DispatchContractError,
@@ -152,6 +153,7 @@ from codex_managed_dispatch import (  # noqa: E402
     registered_parent_delivery,
 )
 import dispatch_parent_completion as parent_completion
+import owner_write_advisory as OWNER_WRITE_ADVISORY
 from execution_access import (  # noqa: E402
     AccessContext,
     ExecutionAccessError,
@@ -260,6 +262,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--worker-role", help="legacy compatibility metadata; not bootstrap identity")
     p.add_argument("--worker-type", choices=("owner", "stage", "review", "support", "frame"))
     p.add_argument("--review-output", help="exact durable report path for a route-free review worker")
+    from review_input import add_arguments as review_input_arguments
+    review_input_arguments(p)
     p.add_argument("--unit", default="", help="catalog unit ref for the assigned route node (roles/units/<unit>.md)")
     p.add_argument("--assigned-contract")
     p.add_argument("--owner", dest="capability_owner")
@@ -813,6 +817,30 @@ def _worktree_git_dirs(worktree) -> tuple[Path, Path] | None:
         return values[0], values[1]
     except (OSError, subprocess.SubprocessError, ValueError):
         return None
+
+
+def owner_write_advisories(args):
+    """Observe the applied owner sandbox/grant without changing launch inputs."""
+    if getattr(args, "worker_type", None) != "owner":
+        return []
+    route_file = getattr(args, "route_file", None) or getattr(
+        getattr(args, "owner_route_binding", None), "route_file", None)
+    route = None
+    if route_file:
+        try:
+            route = json.loads(Path(route_file).read_text())
+        except (OSError, ValueError):
+            pass  # Advisory failure never becomes a new launch gate.
+    if not isinstance(route, dict):
+        route = {"cwd": str(args.worktree), "nodes": [
+            {"write_scope": (getattr(args, "write_scope", None) or "").split(";")}]}
+    grant = getattr(args, "execution_access_grant", None)
+    # build_grant preserves request.writable_roots, including roots absorbed
+    # by existing defaults; it never adds adapter default roots to this field.
+    return OWNER_WRITE_ADVISORY.advisories(
+        route, owner_harness="codex", sandbox=effective_runtime_sandbox(args),
+        git_writable_roots=linked_worktree_git_writable_dirs(args),
+        explicit_writable_roots=getattr(grant, "writable_roots", ()))
 
 
 def _is_linked_worktree(worktree, agent_home) -> bool:
@@ -1703,6 +1731,8 @@ def append_job(jobs: Path, args: argparse.Namespace) -> bool:
     if is_no_commit_stage(args):
         pipe += ",no_commit=1"
     ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    from review_input import registration_fragment
+    pipe += registration_fragment(args)
     from dispatch_replacement import seal_launch_input
     args.replacement_runtime_sandbox = effective_runtime_sandbox(args)
     pipe += seal_launch_input(args, 'codex', getattr(args, "replacement_raw_task", ""))
@@ -2190,6 +2220,7 @@ def validate_route_record(args: argparse.Namespace) -> int:
         completion_marker_gate(
             args.route_file, args.route_node, args.action, args.agent_home,
             early_jobs, attempt_id=args.attempt_id,
+            planned_revision_nodes=preview_request_nodes(args, early_jobs),
         )
     except DispatchContractError as e:
         e.detail = recover_preview_gate_after_refusal(
@@ -2461,6 +2492,7 @@ def main(argv: list[str]) -> int:
         completion_marker_gate(
             args.route_file, args.route_node, action, agent_home, jobs,
             attempt_id=args.attempt_id,
+            planned_revision_nodes=preview_request_nodes(args, jobs),
         )
     except DispatchContractError as e:
         e.detail = recover_preview_gate_after_refusal(
@@ -2511,6 +2543,11 @@ def main(argv: list[str]) -> int:
         profile_type=profile_worker_type(ROOT, args.profile),
     )
     args.jobs_path = jobs
+    try:
+        from review_input import prepare_request as prepare_review_input
+        prepare_review_input(args)
+    except DispatchContractError as exc:
+        return fail(exc.reason, 65, detail=exc.detail, child_spawned="0", registry_mutation="0")
     args.completion_delivery_reason = "not-applicable"
     try:
         args.resolved_completion_delivery = resolve_completion_delivery(args)
@@ -2527,6 +2564,8 @@ def main(argv: list[str]) -> int:
     task_input = task_prompt(args)
     args.replacement_raw_task = task_input[0]
     prompt_text, prompt_source = dispatch_prompt(args, task_input)
+    from review_input import prompt_block as review_input_prompt
+    prompt_text += review_input_prompt(args)
     from dispatch_replacement import recovery_instructions
     prompt_text += recovery_instructions(args)
     assignment_sha256 = "sha256:" + hashlib.sha256(
@@ -2589,6 +2628,9 @@ def main(argv: list[str]) -> int:
         )
     except ExecutionAccessError as exc:
         return fail(exc.reason, 64, detail=exc.detail, child_spawned="0")
+    for advisory in owner_write_advisories(args):
+        print(OWNER_WRITE_ADVISORY.RECEIPT_KEY + json.dumps(advisory, ensure_ascii=False), flush=True)
+        print(advisory["message"], file=sys.stderr, flush=True)
     try:
         validate_nested_owner_registry_projection(args)
     except DispatchContractError as e:

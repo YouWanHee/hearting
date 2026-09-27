@@ -432,7 +432,7 @@ def _source_batch_context(
     if len({str(member["perspective"]) for member in members}) == cardinality:
         realized_axes.append("perspective")
     degradation_reason = (
-        "" if independence == "cross-harness"
+        "" if independence in {"cross-harness", "persona"}
         else "cross-harness-unavailable-user-allowed"
     )
     try:

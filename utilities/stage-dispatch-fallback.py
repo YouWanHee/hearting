@@ -227,33 +227,6 @@ def _policy_by_profile(route, node):
     return by_profile
 
 
-def _parent_cross_cause(
-    affinity, ranked, eligible, limited, owner_family, quality_peer
-):
-    """Closed four-word cause for a parent-cross-same-harness degradation.
-
-    Precedence: an affinity pinned to the owner family wins; otherwise a
-    cross-quality-peer family that is usage-limited explains the miss; a
-    missing cross-quality-peer candidate is eligible-none; the residual case
-    (cross candidates exist but none was usable) is owner-family-only-peer.
-    """
-    if affinity == owner_family and affinity in ranked:
-        return "affinity-pinned"
-    cross_limited = [
-        harness for harness in limited
-        if harness != owner_family and harness in quality_peer
-    ]
-    if cross_limited:
-        return "cross-family-usage-limited"
-    cross_eligible = [
-        harness for harness in eligible
-        if harness != owner_family and harness in quality_peer
-    ]
-    if not cross_eligible:
-        return "cross-family-eligible-none"
-    return "owner-family-only-peer"
-
-
 def ordered_fallback_hops(
     route: dict, node: dict, jobs: Path, *, parent_identity: dict | None = None
 ) -> tuple[list[dict], dict | None]:
@@ -369,9 +342,10 @@ def ordered_fallback_hops(
                 ranked = [affinity] + [harness for harness in ranked if harness != affinity]
         else:
             ranked = [affinity] + [harness for harness in ranked if harness != affinity]
-    # SD-101 parent-cross stable partition (W2) + SD-100 ② sole-gate (W2),
-    # placed exactly between the affinity head-hoist and `ranked += limited`
-    # so usage-limited harnesses stay out of the partition (spec 13.30.3 ④).
+    # SD-160 supersedes the SD-101 cross-family preference, including old
+    # sealed parent_cross_preference fields. A separate reviewer persona is
+    # independent on the owner's harness too; placement keeps the capacity
+    # order. SD-100's quality-peer sole-gate protection remains in force.
     parent_cross = "not-applicable"
     parent_cross_cause = "-"
     sole_gate = "not-applicable"
@@ -381,28 +355,7 @@ def ordered_fallback_hops(
         quality_peer = quality_peer_families(_policy_by_profile(route, node))
         sole_gate = "ok"
         if quality_peer is not None and owner_family:
-            tail = ranked[1:] if affinity in ranked else ranked
-
-            def _cross(harness):
-                return (
-                    harness != owner_family
-                    and harness in quality_peer
-                    and harness in eligible
-                )
-
-            tail = [h for h in tail if _cross(h)] + [h for h in tail if not _cross(h)]
-            if affinity in ranked:
-                ranked = [affinity] + tail
-            else:
-                ranked = tail
             head = ranked[0] if ranked else None
-            # SD-100 ②: a gate-holding single checker must land on a quality-peer
-            # family when one is hard-eligible; otherwise the assignment proceeds
-            # but records sole-gate-non-peer-harness (13.30.2 proviso). A sealed
-            # literal affinity naming the head is a user override that is honored
-            # and degrades instead of being reordered (13.30.2). The reorder is
-            # derived from the sealed `ranked` order, not `eligible`, so a
-            # candidate outside the sealed band cannot be hoisted over it (G3).
             if head is not None and head not in quality_peer:
                 affinity_pinned_head = affinity in ranked and affinity == head
                 if affinity_pinned_head:
@@ -413,17 +366,6 @@ def ordered_fallback_hops(
                         ranked = qp_eligible + [h for h in ranked if h not in qp_eligible]
                     else:
                         sole_gate = "degraded"
-            # G3: the parent-cross verdict is taken from the FINAL head after the
-            # SD-100 ② reorder -- the head before it can be replaced by a
-            # quality-peer hoist, leaving a stale "ok" on an owner-family pick.
-            head = ranked[0] if ranked else None
-            if head is not None and head == owner_family:
-                parent_cross = "degraded"
-                parent_cross_cause = _parent_cross_cause(
-                    affinity, ranked, eligible, limited, owner_family, quality_peer
-                )
-            else:
-                parent_cross = "ok"
     ranked += limited
     ordered = []
     for harness in ranked:
@@ -469,24 +411,13 @@ def _recompute_verdicts_for_child(context, child_harness):
     """
     if context is None:
         return context
-    owner_family = context.get("owner_family")
-    quality_peer = context.get("quality_peer_set")
-    if owner_family is None or quality_peer is None:
-        return context
     updated = dict(context)
-    if child_harness == owner_family:
-        updated["parent_cross"] = "degraded"
-        updated["parent_cross_cause"] = _parent_cross_cause(
-            context.get("affinity"),
-            context.get("rank"),
-            context.get("eligible"),
-            context.get("limited"),
-            owner_family,
-            quality_peer,
-        )
-    else:
-        updated["parent_cross"] = "ok"
-        updated["parent_cross_cause"] = "-"
+    # Never carry an obsolete same-family degradation into a fallback receipt.
+    updated["parent_cross"] = "not-applicable"
+    updated["parent_cross_cause"] = "-"
+    quality_peer = context.get("quality_peer_set")
+    if context.get("owner_family") is None or quality_peer is None:
+        return updated
     updated["sole_gate"] = (
         "degraded" if child_harness not in quality_peer else "ok"
     )
@@ -572,7 +503,7 @@ TUPLE_FAILURE_CLASS = "launch-tuple"
 
 
 def _persist_parent_cross_ledger(args, route, node, context):
-    """Record SD-101/SD-100 typed degradations after a realized child start.
+    """Record SD-100 quality degradation after a realized child start.
 
     Best-effort (record_degradation swallows failures by design); the stdout
     receipt fields already carry the verdicts, so a ledger write failure cannot
@@ -588,13 +519,6 @@ def _persist_parent_cross_ledger(args, route, node, context):
         route_file=getattr(args, "route", None) and str(getattr(args, "route")),
         completion_gate=node.get("completion_gate"),
     )
-    if context.get("parent_cross") == "degraded":
-        record_degradation(
-            **common,
-            reason="parent-cross-same-harness",
-            cause=context.get("parent_cross_cause") or "-",
-            parent_cross="degraded",
-        )
     if context.get("sole_gate") == "degraded":
         record_degradation(
             **common,
@@ -1196,6 +1120,7 @@ def wrapper_command(
                 "--selection-source", "orchestrator-explicit",
             ]
     optional = (
+        (getattr(args, "reviewed_evidence", None), "--reviewed-evidence"),
         (args.prompt_file, "--prompt-file"),
         (os.environ.get("AGENT_DISPATCH_PARENT_SESSION_ID"), "--parent-session-id"),
         (os.environ.get("AGENT_DISPATCH_PARENT_CWD"), "--parent-cwd"),
@@ -1522,6 +1447,8 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
     p.add_argument("--worker-role")
     p.add_argument("--model-role")
     p.add_argument("--prompt-file", type=Path)
+    from review_input import add_arguments, resolve_input
+    add_arguments(p)
     p.add_argument("--jobs", type=Path)
     p.add_argument("--broker-root", type=Path, help=argparse.SUPPRESS)
     p.add_argument("--broker-timeout", type=float, help=argparse.SUPPRESS)
@@ -1655,16 +1582,22 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
     # admission decision every registered launch surface reads -- no surface
     # keeps its own `len(prior)+1 > max_round` comparison, or its own
     # auto-revision copy, any more.
-    if node["id"] in DISPATCH_NODE.ROUND_CAPPED_NODE_IDS:
+    node_round_admission = None
+    if DISPATCH_NODE.REVIEW_ROUND_CAP.is_round_capped_node(node):
         round_rows = DISPATCH_NODE.prior_round_attempts(
             args.jobs, route["route_id"], node["id"],
             route=route if node.get("kind") == "review-worker" else None,
         )
         admission_options = {"record_auto_revisions": False} if args.action == "dry-run" else {}
-        node_round_budget = DISPATCH_NODE.admit_round(
-            route, node, args.jobs, owner_attempt_id=args.parent_attempt_id,
-            **admission_options,
-        ).budget
+        try:
+            node_round_admission = DISPATCH_NODE.admit_round(
+                route, node, args.jobs, owner_attempt_id=args.parent_attempt_id,
+                reviewed_evidence=args.reviewed_evidence,
+                **admission_options,
+            )
+            node_round_budget = node_round_admission.budget
+        except (DispatchContractError, ValueError) as exc:
+            return fail(getattr(exc, "reason", str(exc)), 65, child_spawned="0")
         if node_round_budget.state == "blocked-live":
             return fail(
                 "prior-attempt-still-live", 78,
@@ -1686,7 +1619,7 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                 round=str(node_round_budget.next_round), max_round=str(node_round_budget.cap),
                 child_spawned="0",
                 next_action=route_state_next_action("review-round-budget-exhausted", node["id"], str(args.route), node),
-                **DISPATCH_NODE.review_budget_recovery_fields(node.get("kind")),
+                **DISPATCH_NODE.review_budget_recovery_fields(node.get("kind"), route=route, node=node, jobs=args.jobs, route_file=args.route),
             )
         if node_round_budget.state == "verdictless-bound":
             # `review_budget_recovery_fields` already supplies its own
@@ -1699,7 +1632,7 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                 effective_intensity=route["effective_intensity"],
                 round=str(node_round_budget.next_round), max_round=str(node_round_budget.cap),
                 child_spawned="0",
-                **DISPATCH_NODE.review_budget_recovery_fields(node.get("kind"), "verdictless-bound"),
+                **DISPATCH_NODE.review_budget_recovery_fields(node.get("kind"), "verdictless-bound", route=route, node=node, jobs=args.jobs, route_file=args.route),
             )
         # B2: unlike dispatch-batch.py (which re-invokes dispatch-node.py for
         # the actual leg and gets the round protocol block for free), this
@@ -1837,6 +1770,17 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                     if isinstance(p3_result, tuple):
                         observation.note_unrecorded(p3_result[1])
                     continue
+                try:
+                    candidate = (node_round_admission.reviewed_input
+                                 if args.action == "dry-run" and node_round_admission is not None
+                                 else None)
+                    if candidate is None:
+                        candidate = resolve_input(route, node, args.jobs, args.reviewed_evidence)
+                    if candidate is not None:
+                        args.reviewed_evidence = candidate["path"]
+                except DispatchContractError as exc:
+                    return fail(exc.reason, 65, detail=exc.detail, child_spawned="0")
+
                 pending_capacity = [
                     item for item in capacity_context(
                         args.jobs, route["route_id"], node["id"]

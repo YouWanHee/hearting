@@ -49,6 +49,8 @@ def seal_launch_input(jobs, args, route, manifest, digest):
         'allow_degraded_independence': args.allow_degraded_independence,
         'subdivision_manifest': getattr(args, 'subdivision_manifest', None),
     }
+    if getattr(args, 'reviewed_evidence', None):
+        options['reviewed_evidence'] = args.reviewed_evidence
     payload = {'schema': INPUT_SCHEMA, 'jobs': str(Path(jobs).resolve()),
                'route_id': route['route_id'], 'route_hash': route['route_hash'],
                'manifest': checked, 'manifest_digest': digest, 'options': options}
@@ -183,7 +185,7 @@ def command(jobs, record, source, replay):
             '--action', 'start', '--jobs', str(Path(jobs).resolve()),
             '--continuation', str(path)]
     for name in ('route', 'parallel_group', 'slug_prefix', 'parent', 'prompt_text',
-                 'qa', 'log_dir', 'subdivision_manifest'):
+                 'qa', 'log_dir', 'subdivision_manifest', 'reviewed_evidence'):
         if options.get(name) is not None:
             argv += ['--'+name.replace('_', '-'), str(options[name])]
     if options.get('allow_degraded_independence'):

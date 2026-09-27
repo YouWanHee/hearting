@@ -89,8 +89,10 @@ class QuotaEvidenceTests(unittest.TestCase):
             self.assertEqual(capacity.capacity_scores()["claude"], 0.0)
             with mock.patch.object(batch.DISPATCH_NODE, "resolve_checked_tuple", return_value=selection):
                 assignments, independence, diagnostic = batch.assign_harnesses(route, nodes, jobs=self.jobs, allow_degraded=False)
-            self.assertEqual({a[1] for a in assignments}, {"codex", "opencode"})
-            self.assertEqual(independence, "cross-harness")
+            self.assertEqual(len(assignments), 2)
+            self.assertTrue({a[1] for a in assignments} <= {"codex", "opencode"})
+            self.assertNotIn("claude", {a[1] for a in assignments})
+            self.assertEqual(independence, "persona")
             self.assertIn("claude", diagnostic["family_exclusions"])
 
     def test_reset_expiry_and_new_week_do_not_carry_old_rejection(self):

@@ -1039,8 +1039,8 @@ def _validate_recipe(recipe, registry, standard_plus_owner_profile):
             if (not isinstance(axes, list) or len(axes) != len(set(axes))
                     or not set(axes) <= set(registry["parallel_independence_axes"])):
                 raise TopologyError(f"{recipe['capability']}:{group_id}: invalid independence axes")
-            if "cross-harness" not in axes:
-                raise TopologyError(f"{recipe['capability']}:{group_id}: cross-harness axis required")
+            if "perspective" not in axes:
+                raise TopologyError(f"{recipe['capability']}:{group_id}: perspective axis required")
             minimum = group["min_intensity"]
             if minimum not in tiers or tiers.index(minimum) < tiers.index("standard"):
                 raise TopologyError(

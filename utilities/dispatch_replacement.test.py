@@ -113,6 +113,48 @@ class ReplacementTest(unittest.TestCase):
         with mock.patch.object(D,'attempt_process_quiescence',return_value=SimpleNamespace(state='live',reason='live-now')):
             with self.assertRaises(D.DispatchContractError):R.admission(self.jobs,lines,candidate)
 
+    def test_sd161_first_replacement_claim_keeps_semantic_round_at_bound(self):
+        import review_input
+        node={'id':'frame','kind':'review-worker','unit':'qa/plan-review','depends_on':[]}
+        self.route.update(nodes=[node],effective_intensity='standard')
+        self.path.write_text(json.dumps(self.route))
+        evidence=self.root/'plan.md';evidence.write_text('sealed review input')
+        self.meta.update(unit='qa/plan-review',route_file=str(self.path))
+        candidate_input=review_input.resolve_input(self.route,node,self.jobs,evidence)
+        self.meta[review_input.KEY]=review_input.seal_binding(self.jobs,self.meta,candidate_input)
+        # This fixture's original launch predates the test-specific review tuple.
+        (R._directory(self.jobs)/'inputs/att-source.json').unlink()
+        self.args.reviewed_evidence=str(evidence)
+        self.meta.update(D.parse_registry_metadata(R.seal_launch_input(self.args,'codex','the raw task')))
+        self.write(self.meta)
+        self.write(dict(self.meta,attempt_id='att-prior-crash'),'done',append=True)
+        (self.root/'review-input-revisions').mkdir()
+        record=self.claim();aid=record['replacement_attempt_id']
+        source=R._rows(self.jobs.read_text().splitlines())['att-source'][1]
+        replay=R.launch_input(self.jobs,'att-source',source)
+        args=SimpleNamespace(**vars(self.args));args.attempt_id=aid
+        args.replacement_input_argv=R._replacement_argv(record,source,replay)
+        candidate={**self.meta,'attempt_id':aid,'automatic_retry_of':'att-source'}
+        for key in ('note','failure_class','launch_outcome'):candidate.pop(key,None)
+        candidate[review_input.KEY]=review_input.seal_binding(self.jobs,candidate,candidate_input,
+            source={'attempt_id':'att-source','binding_digest':source[review_input.KEY]})
+        candidate.update(D.parse_registry_metadata(R.seal_launch_input(args,'codex','the raw task')))
+        rows=[(['now','done'],meta) for _,meta in R._rows(self.jobs.read_text().splitlines()).values()]
+        route_module=SimpleNamespace(review_lineage_routes=lambda route,node:[route],
+            review_round_records=lambda *args,**kw:rows,
+            _dependency_revisions=lambda *args,**kw:[], REVIEW_ROUND_CAP=__import__('review_round_cap'))
+        with mock.patch.object(review_input,'_route_module',return_value=route_module):
+            with self.assertRaises(D.DispatchContractError) as failure:
+                review_input.validate_revision_admission(self.jobs,candidate,candidate_input)
+            self.assertEqual(failure.exception.reason,'reviewed-evidence-revision-not-admitted')
+            row='now\topen\t'+str(self.root)+'\t'+str(self.root)+'\treview\t'+','.join(k+'='+v for k,v in candidate.items())
+            self.assertTrue(D.claim_attempt_row(self.jobs,aid,row,launch=False))
+            self.assertFalse(D.claim_attempt_row(self.jobs,aid,row,launch=False))
+        registered=R._rows(self.jobs.read_text().splitlines())[aid][1]
+        self.assertEqual(registered['replacement_family_id'],record['family_id'])
+        self.assertEqual(registered['launch_claimed'],'0')
+        self.assertEqual(R._rows(self.jobs.read_text().splitlines())['att-source'][1]['note'],'dead-exact-pid')
+
     def test_legacy_retry_consumes_same_budget(self):
         self.write({**self.meta,'automatic_retry_of':'att-earlier'})
         with self.assertRaises(D.DispatchContractError) as caught:self.claim()

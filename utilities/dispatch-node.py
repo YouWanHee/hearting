@@ -57,7 +57,7 @@ PROTECTED_ADAPTER_FLAGS = frozenset({
     "--subsession-id", "--subsession-index", "--subsession-count",
     "--subsession-mode", "--subsession-purpose", "--session-chain-id",
     "--phase-brief", "--stage-authority", "--fixed-file", "--narrow-verify",
-    "--expected-round-trips", "--state-dir", "--attempt-id",
+    "--expected-round-trips", "--state-dir", "--attempt-id", "--reviewed-evidence",
 })
 
 
@@ -331,6 +331,7 @@ class RoundAdmission:
  budget: object
  auto_revisions: tuple = ()
  planned_revision_nodes: frozenset[str] = frozenset()
+ reviewed_input: object = None
 
 
 def _auto_record_revisions(route, node, jobs, rows, *, owner_attempt_id, record=True):
@@ -339,7 +340,7 @@ def _auto_record_revisions(route, node, jobs, rows, *, owner_attempt_id, record=
  blocking FAIL that basis-verifies against N. Never launches anything --
  only `publish_revision_locked` writes, under its own node lock.
  """
- if node["id"] not in ROUND_CAPPED_NODE_IDS or not rows or not owner_attempt_id:
+ if not REVIEW_ROUND_CAP.is_round_capped_node(node) or not rows or not owner_attempt_id:
   return ()
  last_status, last_meta = rows[-1]
  worker_type = node.get("worker_type") or ("review" if node.get("kind") == "review-worker" else "test")
@@ -374,30 +375,20 @@ def _auto_record_revisions(route, node, jobs, rows, *, owner_attempt_id, record=
   except (OSError, ValueError):
    continue
   try:
-   ROUTE.revision_basis_verdict(route, dep_node, "review-findings", (last_attempt,), jobs=jobs)
-  except ValueError:
-   continue  # condition (3): basis verification failed -- next_action=revise stays manual.
-  if not record:
-   recorded.append({
-    "node_id": dep,
-    "stage_authority": "revision",
-    "revision": {"answers": [last_attempt], "basis": "review-findings"},
-   })
-   continue
-  try:
-   result = ROUTE.publish_revision_locked(
+   publish_or_preview = ROUTE.publish_revision_locked if record else ROUTE.preview_revision
+   result = publish_or_preview(
     route, dep, evidence_path, basis="review-findings",
     answers=(last_attempt,), author_attempt_id=owner_attempt_id,
     recorded_by="runtime-auto", jobs=jobs,
    )
   except ValueError:
-   continue  # A kept integrity refusal: no write, no auto-revision recorded.
+   continue  # Both paths apply the same complete revision proof.
   recorded.append(result["marker"])
  return tuple(recorded)
 
 
 def admit_round(route, node, jobs, *, owner_attempt_id=None, exclude_slug=None, exclude_attempt=None,
-                record_auto_revisions=True):
+                reviewed_evidence=None, record_auto_revisions=True):
  """The one admission decision every registered launch surface reads.
 
  Replaces the three separate `len(prior)+1 > max_round` comparisons that
@@ -417,19 +408,48 @@ def admit_round(route, node, jobs, *, owner_attempt_id=None, exclude_slug=None, 
   route, node, jobs, classified_rows, owner_attempt_id=owner_attempt_id,
   record=record_auto_revisions,
  )
- dependency_revisions = ROUTE._dependency_revisions(route, node, jobs)
+ from review_input import is_review_node, has_plan_producer, read_binding, resolve_input
+ if reviewed_evidence and is_review_node(node) and not has_plan_producer(route,node):
+  verdicts=[(cols,meta) for cols,meta in rows if REVIEW_ROUND_CAP.classify_round_row(
+      cols[1],meta,worker_type=meta.get("worker_type") or "review")=="verdict"]
+  if verdicts and verdicts[-1][1].get("note")=="completed-review-blocking":
+   previous=verdicts[-1][1]
+   original=read_binding(jobs,previous)
+   if original is None:
+    raise DispatchContractError("review-input-revision-binding-required")
+   current=resolve_input(route,node,jobs,reviewed_evidence)
+   if current["sha256"]!=original["sha256"]:
+    publish_or_preview = (ROUTE.publish_review_input_revision if record_auto_revisions
+                          else ROUTE.preview_review_input_revision)
+    result=publish_or_preview(route,node["id"],current["path"],
+        answers=[previous["attempt_id"]],author_attempt_id=owner_attempt_id,
+        recorded_by="dispatch-auto",jobs=jobs)
+    auto_revisions=(*auto_revisions,result["input_revision"])
+ producer_preview = next((item for item in auto_revisions
+                          if item.get("node_id")=="plan" and item.get("stage_authority")=="revision"),None)
+ input_options = {"producer_preview": producer_preview} if not record_auto_revisions and producer_preview else {}
+ reviewed_input = (resolve_input(route,node,jobs,reviewed_evidence,**input_options)
+                   if is_review_node(node) and (reviewed_evidence or producer_preview) else None)
+ dependency_revisions = ROUTE._dependency_revisions(route, node, jobs, reviewed_input=reviewed_input or {})
  dependency_ids = set(node.get("depends_on", ()))
  dependency_revisions.extend(
   revision.get("revision", {}) for revision in auto_revisions
   if revision.get("node_id") in dependency_ids
  )
- budget =REVIEW_ROUND_CAP.round_budget(route, node, classified_rows, revisions=dependency_revisions)
+ # A pure self-input preview has no on-disk history yet. Only its exact
+ # candidate input, proved by the same writer checks, may unlock cap+1.
+ if not record_auto_revisions and reviewed_input:
+  dependency_revisions.extend(item for item in auto_revisions
+      if item.get("node_id")==node["id"]
+      and item.get("evidence")=={k:reviewed_input[k] for k in ("path","sha256")})
+ budget = REVIEW_ROUND_CAP.round_budget(route, node, classified_rows, revisions=dependency_revisions)
  return RoundAdmission(
   budget=budget,
   auto_revisions=auto_revisions if record_auto_revisions else (),
   planned_revision_nodes=frozenset(
-   str(item["node_id"]) for item in auto_revisions if item.get("node_id")
+   str(item["node_id"]) for item in auto_revisions if item.get("node_id") in dependency_ids
   ),
+  reviewed_input=reviewed_input,
  )
 
 
@@ -582,6 +602,8 @@ def replacement_task(args, route, node, jobs):
 
 def main():
  p=argparse.ArgumentParser(); p.add_argument("--route",required=True); p.add_argument("--node",required=True); p.add_argument("--adapter",choices=("claude","codex","opencode"),required=True); p.add_argument("--action",choices=("dry-run","register","start"),default="dry-run"); p.add_argument("--slug",required=True); p.add_argument("--qa",default=None); p.add_argument("--parent"); p.add_argument("--jobs"); p.add_argument("--prompt-text",default="Execute the selected immutable route node and emit its completion evidence."); p.add_argument("--subsession-id"); p.add_argument("--subsession-index",type=int); p.add_argument("--subsession-count",type=int); p.add_argument("--subsession-mode",choices=("serial","parallel")); p.add_argument("--subsession-purpose",choices=("planned","gap-retry"),default="planned"); p.add_argument("--session-chain-id"); p.add_argument("--phase-brief"); p.add_argument("--stage-authority",choices=(0,1),type=int,default=1); p.add_argument("--fixed-file",action="append",default=[]); p.add_argument("--narrow-verify"); p.add_argument("--expected-round-trips",type=int); p.add_argument("--state-dir"); p.add_argument("--attempt-id"); p.add_argument("adapter_args",nargs=argparse.REMAINDER)
+ from review_input import add_arguments, resolve_input
+ add_arguments(p)
  a=p.parse_args(); route=json.loads(Path(a.route).read_text())
  verify=subprocess.run(
   [sys.executable,str(ROOT/"utilities/capability-route.py"),"verify","--route",a.route,
@@ -713,13 +735,17 @@ def main():
  # copy, any more. A subsession carries no stage-gate authority (common.md),
  # so it gets the same no-op budget the manual empty-`prior_rounds` call
  # always produced, without touching auto-revision at all.
- admission=(
-  admit_round(route,node,registry.path,owner_attempt_id=a.parent,exclude_slug=a.slug,exclude_attempt=a.attempt_id)
-  if not a.subsession_id and original_task is None
-  else RoundAdmission(budget=REVIEW_ROUND_CAP.round_budget(route,node,[],revisions=()))
- )
+ try:
+  admission=(
+   admit_round(route,node,registry.path,owner_attempt_id=os.environ.get("AGENT_DISPATCH_ATTEMPT_ID") or a.parent,exclude_slug=a.slug,exclude_attempt=a.attempt_id,reviewed_evidence=a.reviewed_evidence,record_auto_revisions=a.action!="dry-run")
+   if not a.subsession_id and original_task is None
+   else RoundAdmission(budget=REVIEW_ROUND_CAP.round_budget(route,node,[],revisions=()))
+  )
+ except (DispatchContractError, ValueError) as exc:
+  print("check=failed"); print("reason="+getattr(exc,"reason",str(exc))); print("child_spawned=0")
+  raise SystemExit(65)
  round_budget=admission.budget
- if a.node in ROUND_CAPPED_NODE_IDS and not a.subsession_id and original_task is None:
+ if REVIEW_ROUND_CAP.is_round_capped_node(node) and not a.subsession_id and original_task is None:
   if round_budget.state=="blocked-live":
    print("check=failed")
    print("reason=prior-attempt-still-live")
@@ -742,7 +768,7 @@ def main():
    print(f"effective_intensity={route['effective_intensity']}")
    print(f"round={round_budget.next_round}")
    print(f"max_round={round_budget.cap}")
-   for key,value in review_budget_recovery_fields(node.get("kind")).items():
+   for key,value in review_budget_recovery_fields(node.get("kind"), route=route, node=node, jobs=registry.path, route_file=a.route).items():
     print(f"{key}={value}")
    print("child_spawned=0")
    raise SystemExit(65)
@@ -754,14 +780,29 @@ def main():
    print(f"effective_intensity={route['effective_intensity']}")
    print(f"round={round_budget.next_round}")
    print(f"max_round={round_budget.cap}")
-   for key,value in review_budget_recovery_fields(node.get("kind"),"verdictless-bound").items():
+   for key,value in review_budget_recovery_fields(node.get("kind"),"verdictless-bound", route=route, node=node, jobs=registry.path, route_file=a.route).items():
     print(f"{key}={value}")
    print("child_spawned=0")
    raise SystemExit(65)
+ try:
+  retry_values=[]
+  extra=strip_leading_separator(a.adapter_args)
+  for index,token in enumerate(extra):
+   if token=="--automatic-retry-of" and index+1<len(extra): retry_values.append(extra[index+1])
+   elif token.startswith("--automatic-retry-of="): retry_values.append(token.split("=",1)[1])
+  if len(retry_values)>1: raise DispatchContractError("replacement-predecessor-invalid")
+  review_candidate=(admission.reviewed_input
+                    if a.action=="dry-run" and admission.reviewed_input is not None and not retry_values
+                    else resolve_input(route,node,registry.path,a.reviewed_evidence,
+                                       retry_of=retry_values[0] if retry_values else None))
+  if review_candidate is not None: a.reviewed_evidence=review_candidate["path"]
+ except DispatchContractError as e:
+  print("check=failed");print(f"reason={e.reason}");print(f"detail={e.detail}");print("child_spawned=0");raise SystemExit(65)
  prompt_text=(original_task if original_task is not None else
               a.prompt_text+round_protocol_block(round_budget,prior_rounds,worker_type,node["id"]))
  if round_budget.correction_round: print(f"correction_round={round_budget.correction_round}")
  argv=[sys.executable,str(wrapper),"--"+a.action,"--worktree",route["cwd"],"--slug",a.slug,"--capability",route["capability"],"--capability-mode",route["capability_mode"],"--intensity",route["effective_intensity"],"--dispatch-depth",str(node.get("dispatch_depth",1)),"--worker-type",worker_type,"--unit",node.get("unit",""),"--assigned-contract",contract,"--owner",route["capability"],"--route-file",str(Path(a.route).resolve()),"--route-id",route["route_id"],"--route-hash",route["route_hash"],"--route-node",node["id"],"--registry-digest",route["registry_digest"],"--write-scope",";".join(node["write_scope"]),"--completion-gate",node["completion_gate"],"--jobs",str(registry.path),"--prompt-text",prompt_text]
+ if a.reviewed_evidence: argv += ["--reviewed-evidence",a.reviewed_evidence]
  unit=node.get("unit","")
  if unit and not unit.startswith("_kernel/"):
   argv += ["--worker-mode",unit]

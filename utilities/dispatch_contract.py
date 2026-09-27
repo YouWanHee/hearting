@@ -4771,6 +4771,8 @@ def spawn_claimed_attempt(
 
         from dispatch_replacement import admission as replacement_admission
         replacement_admission(jobs, lines, child_meta)
+        from review_input import validate_launch as validate_review_input
+        validate_review_input(jobs, child_meta)
         if preclaim is not None:
             preclaim(lines)
 
@@ -5479,10 +5481,9 @@ def headless_attempt_policy(
         # The same-harness pin exists to keep quick's WORK pinned to one
         # harness, so its (nonexistent) fallback budget and artifact lineage do
         # not fragment. That reason applies to `one-shot` alone; the frame legs
-        # are an advisory pair ahead of the work, and cross-harness is the one
-        # MANDATORY independence axis for this bootstrap layer -- keeping the
-        # restriction system-wide would force both legs onto one harness and
-        # break the cycle's own acceptance criterion.
+        # are an advisory pair ahead of the work. SD-160 permits either
+        # harness hop; their separate attempts and frame personas establish
+        # independence, not the number of selected harnesses.
         if route_node == "one-shot" and effective_hop != "same-harness-headless":
             raise DispatchContractError("quick-fallback-forbidden", effective_hop)
         if route_node != "one-shot" and effective_hop not in (
@@ -6570,11 +6571,23 @@ def _frame_capacity_failures(route: dict, lines: list[str], harnesses: set[str])
 
 def frame_harness_admission(route: dict, jobs: Path, lines: list[str],
                             harnesses: list[str], profiles: list[str | None]) -> list[str]:
-    """Return accepted capacity proof IDs for a frame pair, or refuse it.
+    """Validate effective SD-160 frame personas, preserving sealed route bytes.
 
-    Called both before the alternative is launched and at its completion gate.
-    The caller records a degradation only when this returns proof IDs.
+    Historical frame nodes used the two canonical prompt roles without an
+    explicit perspective field. Their node IDs retain that meaning; an explicit
+    field must be nonempty and distinct, regardless of the selected harnesses.
+    The empty proof list is retained for callers of the old admission API.
     """
+    frames = [node for node in route.get("nodes", [])
+              if node.get("id") in {"frame", "frame-alternative"}]
+    if len(frames) != 2 or {node.get("id") for node in frames} != {"frame", "frame-alternative"}:
+        raise DispatchContractError("frame-pair-incomplete", str(route.get("route_id")))
+    perspectives = [node.get("perspective", {"frame": "primary-frame",
+                                           "frame-alternative": "alternative-frame"}[node["id"]])
+                    for node in frames]
+    if (any(not isinstance(value, str) or not value.strip() for value in perspectives)
+            or len({value.strip() for value in perspectives}) != 2):
+        raise DispatchContractError("frame-perspective-duplicate", str(perspectives))
     if route.get("effective_intensity") == "quick":
         candidates, field = route.get("registered_headless_candidates") or [], "harness"
     else:
@@ -6583,45 +6596,9 @@ def frame_harness_admission(route: dict, jobs: Path, lines: list[str],
     supported = {r.get(field) for r in candidates
                  if isinstance(r, dict) and r.get("status") == "supported"}
     supported &= {"codex", "claude", "opencode"}
-    if not supported or not set(harnesses).issubset(supported):
+    if len(harnesses) != 2 or not supported or not set(harnesses).issubset(supported):
         raise DispatchContractError("frame-harness-unsupported", str(harnesses))
-    if len(supported) <= 1 or len(set(harnesses)) == 2:
-        return []
-    missing = supported - set(harnesses)
-    unavailable = _frame_capacity_failures(route, lines, missing)
-    # Global quota evidence is valid only when both frame profiles are covered
-    # and its exact attempts are terminal and quiescent.
-    from dispatch_capacity_evidence import active_limits
-    quota_by_frame = [active_limits(jobs, profile=profile, registry_lines=lines)
-                      for profile in profiles]
-    quota_attempts = set()
-    for harness in missing - set(unavailable):
-        proofs = [limits.get(harness) for limits in quota_by_frame]
-        if not all(proofs):
-            continue
-        ids = {proof["attempt_id"] for proof in proofs}
-        exact = []
-        active_here = False
-        for line in lines:
-            fields = line.split("\t")
-            if len(fields) != 6:
-                continue
-            meta = parse_registry_metadata(fields[5])
-            if (meta.get("route_id") == route["route_id"] and meta.get("harness") == harness
-                    and fields[1] in {"open", "running"}):
-                active_here = True
-            if meta.get("attempt_id") in ids:
-                exact.append((fields, meta))
-        if active_here or len(exact) != len(ids) or any(
-                fields[1] != "done" or terminal_conflict_pending(meta)
-                or attempt_process_quiescence(meta, terminal_receipt=True).state != "quiescent"
-                for fields, meta in exact):
-            continue
-        unavailable[harness] = sorted(ids)[0]
-        quota_attempts.update(ids)
-    if set(unavailable) != missing:
-        raise DispatchContractError("frame-cross-harness-required", str(harnesses))
-    return sorted(set(unavailable.values()) | quota_attempts)
+    return []
 
 
 def record_frame_launch_degradation(route: dict, jobs: Path, proof_ids: list[str],
@@ -6680,17 +6657,8 @@ def _frame_pair_attempt_gate(route: dict, node: dict, markers: dict,
         harnesses.append(metadata["harness"])
     if len(set(attempts)) != 2:
         raise DispatchContractError("frame-attempt-duplicate", str(attempts))
-    proof_ids = frame_harness_admission(route, jobs, lines, harnesses,
-                                        [f.get("model_profile") for f in frames])
-    if proof_ids:
-        from dispatch_degradation import record_degradation
-        recorded = record_degradation(route_id=route["route_id"], route_hash=route["route_hash"],
-            route_node=node["id"], dispatch_depth=1, writer="dispatch_contract.py", jobs=jobs,
-            fallback_hop="same-harness-headless", execution_surface="registered-headless",
-            reason="frame-single-available-harness", prior_attempt_ids=proof_ids,
-            attempt_trace=attempts, harness=harnesses[0], detail=json.dumps({"proof_ids": proof_ids}))
-        if not recorded:
-            raise DispatchContractError("frame-degradation-record-pending", "retry the same gate after restoring state storage")
+    frame_harness_admission(route, jobs, lines, harnesses,
+                            [f.get("model_profile") for f in frames])
 
 
 def evidence_digest(evidence):
@@ -7359,7 +7327,9 @@ def gate_currency(
     `completion_marker_is_current`) and the consumers that reclassified
     `completion-evidence-hash-mismatch` by hand. Judgement order:
     `evidence_currency` (schema/identity/history-byte -> tombstone -> live
-    evidence digest) -> shape/attempt-link. Revision provenance then walks a
+    evidence digest) -> shape/attempt-link. A live digest mismatch alone does
+    not authorize revise: revised-unrecorded also passes the full provenance
+    proof below before it is returned. Revision provenance then walks a
     bounded, strictly decreasing chain of immutable historical markers. It
     does not compare historical evidence paths to live bytes: official revise
     updates that file by design.
@@ -7369,9 +7339,8 @@ def gate_currency(
     except (OSError, ValueError):
         return GateCurrency("integrity-broken:history-conflict", "completion-marker-unreadable")
     base = evidence_currency(route, node, marker_path, marker)
-    if base.state != "current":
+    if base.state not in {"current", "revised-unrecorded"}:
         return base
-    digest = base.evidence_digest
     node_id = str(node.get("id"))
     current = marker
     current_path = marker_path
@@ -7400,7 +7369,7 @@ def gate_currency(
                 link_ok = False
             if not link_ok:
                 return GateCurrency("integrity-broken:identity-mismatch", "revision-predecessor-link-invalid")
-            return GateCurrency("current", "completion-marker-verified", evidence_digest=digest)
+            return base
         revision = current.get("revision") or {}
         of_sequence = revision.get("of_sequence")
         of_marker_sha256 = revision.get("of_marker_sha256")
@@ -9072,6 +9041,8 @@ def claim_attempt_row(
         row, automatic_replacement = replacement_row(jobs, lines, row)
         row_fields = row.split("\t")
         row_metadata = parse_registry_metadata(row_fields[5])
+        from review_input import validate_launch as validate_review_input
+        validate_review_input(jobs, row_metadata)
         if mutation_precheck is not None:
             mutation_precheck(lines)
         # A serial successor consumes its predecessors just as a DAG edge

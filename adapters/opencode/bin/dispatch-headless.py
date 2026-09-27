@@ -24,6 +24,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "utilities"))
+from review_input import preview_request_nodes
 from dispatch_contract import (
     workflow_completion_receipt,  # noqa: E402
     DispatchContractError,
@@ -256,6 +257,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--worker-role", help="legacy compatibility metadata; not bootstrap identity")
     p.add_argument("--worker-type", choices=("owner", "stage", "review", "support", "frame"))
     p.add_argument("--review-output", help="exact durable report path for a route-free review worker")
+    from review_input import add_arguments as review_input_arguments
+    review_input_arguments(p)
     p.add_argument("--unit", default="", help="catalog unit ref for the assigned route node (roles/units/<unit>.md)")
     p.add_argument("--assigned-contract")
     p.add_argument("--owner", dest="capability_owner")
@@ -1129,6 +1132,8 @@ def append_job(jobs: Path, args: argparse.Namespace) -> bool:
     if args.broker_request_id:
         pipe += f",broker_request_id={args.broker_request_id}"
     ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    from review_input import registration_fragment
+    pipe += registration_fragment(args)
     from dispatch_replacement import seal_launch_input
     pipe += seal_launch_input(args, 'opencode', getattr(args, "replacement_raw_task", ""))
     row = f"{ts}\topen\t{repo}\t{args.worktree}\t{args.slug}\t{pipe}"
@@ -1516,6 +1521,7 @@ def validate_route_record(args: argparse.Namespace) -> int:
         completion_marker_gate(
             args.route_file, args.route_node, args.action, args.agent_home,
             early_jobs, attempt_id=args.attempt_id,
+            planned_revision_nodes=preview_request_nodes(args, early_jobs),
         )
     except DispatchContractError as e:
         e.detail = recover_preview_gate_after_refusal(
@@ -1705,6 +1711,8 @@ def main(argv: list[str]) -> int:
         registry = resolve_global_registry(agent_home, args.jobs, args.dispatch_depth, action)
         jobs = registry.path
         args.jobs_path = jobs
+        from review_input import prepare_request as prepare_review_input
+        prepare_review_input(args)
         args.attempt_id = new_attempt_id(args.attempt_id) if action in ("register", "start") else args.attempt_id
         if action in ("register", "start"):
             args.command_attempt_id = args.attempt_id
@@ -1727,6 +1735,7 @@ def main(argv: list[str]) -> int:
         completion_marker_gate(
             args.route_file, args.route_node, action, agent_home, jobs,
             attempt_id=args.attempt_id,
+            planned_revision_nodes=preview_request_nodes(args, jobs),
         )
     except DispatchContractError as e:
         e.detail = recover_preview_gate_after_refusal(
@@ -1818,6 +1827,8 @@ def main(argv: list[str]) -> int:
         else dispatch_state_root(args.jobs_path) / "logs"
     )
     prompt_text, prompt_source = prompt(args)
+    from review_input import prompt_block as review_input_prompt
+    prompt_text += review_input_prompt(args)
     from dispatch_replacement import recovery_instructions
     prompt_text += recovery_instructions(args)
     if action == "start" and args.replica_batch_expectation is not None:

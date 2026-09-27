@@ -46,6 +46,8 @@ from replica_batch_contract import (  # noqa: E402
     DIGEST,
     ReplicaBatchContractError,
     build_manifest,
+    effective_independence_axes,
+    verify_manifest,
 )
 from dispatch_degradation import record_degradation  # noqa: E402
 from dispatch_allocation_receipt import record_allocation_receipt  # noqa: E402
@@ -352,6 +354,134 @@ def partial_source_assignments(
     return assignments
 
 
+def registry_batch_input(rows: list[dict], route: dict, nodes: list[dict], group: str,
+                         parent_attempt: str, prompt: str):
+    """Prove a pre-SD-157 whole manifest from all exact original rows.
+
+    A missing member cannot be inferred from current capacity or a display
+    prefix. Such a partial registration requires the immutable launch input.
+    """
+    by_node = {node["id"]: node for node in nodes}
+    if (len(rows) != len(nodes) or {row.get("batch_route_node") for row in rows} != set(by_node)
+            or len({row.get("attempt_id") for row in rows}) != len(nodes)):
+        raise BatchError("batch-prior-manifest-proof-missing", group)
+    members = []
+    assignment = "sha256:" + hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    try:
+        for row in rows:
+            validate_attempt_metadata(row)
+            node = by_node[row["batch_route_node"]]
+            if (row.get("route_hash", route["route_hash"]) != route["route_hash"]
+                    or row.get("batch_route_id") != route["route_id"]
+                    or row.get("batch_parent_attempt_id") != parent_attempt
+                    or row.get("batch_attempt_id") != row["attempt_id"]
+                    or row.get("route_node") != node["id"]
+                    or row.get("batch_declared_size") != str(len(nodes))
+                    or row.get("batch_assignment_sha256") != assignment
+                    or row.get("batch_harness") != row.get("harness")
+                    or row.get("batch_fallback_hop") != row.get("fallback_hop")
+                    or row.get("batch_fallback_ordinal") != row.get("fallback_ordinal")
+                    or row.get("batch_model_profile") != str(node.get("model_profile"))
+                    or row.get("batch_perspective") != str(node.get("perspective"))
+                    or row.get("batch_parallel_leg_index") != str(node.get("parallel_leg_index"))):
+                raise BatchError("batch-prior-binding-drift", str(node["id"]))
+            leg_class = row.get("batch_leg_class", "peer")
+            if leg_class != node.get("leg_class", "peer"):
+                raise BatchError("batch-prior-binding-drift", str(node["id"]))
+            member = {
+                "assignment_sha256": assignment, "attempt_id": row["attempt_id"],
+                "route_node": node["id"], "harness": row["batch_harness"],
+                "fallback_hop": row["batch_fallback_hop"],
+                "fallback_ordinal": int(row["batch_fallback_ordinal"]),
+                "model_profile": row["batch_model_profile"], "perspective": row["batch_perspective"],
+                "parallel_leg_index": int(row["batch_parallel_leg_index"]), "leg_class": leg_class,
+            }
+            if leg_class == "auxiliary":
+                member["auxiliary_check"] = row["batch_auxiliary_check"]
+                if member["auxiliary_check"] != node.get("auxiliary_check"):
+                    raise BatchError("batch-prior-binding-drift", str(node["id"]))
+            if "profile_selection" in node:
+                member.update({key: node[key] for key in ("profile_selection", "profile_demand")})
+            members.append(member)
+        declared = list(nodes[0].get("parallel_independence_axes", ["cross-harness"]))
+        realized = []
+        if len({member["harness"] for member in members}) >= 2:
+            realized.append("cross-harness")
+        if len({member["model_profile"] for member in members}) >= 2:
+            realized.append("model-profile")
+        if len({member["perspective"] for member in members}) == len(members):
+            realized.append("perspective")
+        manifest, digest, leg_digests = source_manifest_for_digest(dict(
+            parallel_group=group, route_id=route["route_id"], parent_attempt_id=parent_attempt,
+            required_independence_axes=declared, realized_independence_axes=realized,
+            members=members), rows[0]["batch_manifest_sha256"])
+        if any(row.get("batch_independence") != manifest["independence"]
+               or row.get("batch_leg_sha256") != leg_digests[row["attempt_id"]] for row in rows):
+            raise BatchError("batch-prior-binding-drift", group)
+        return {"manifest": manifest, "manifest_digest": digest, "route_hash": route["route_hash"],
+                "options": {"prompt_text": prompt}, "source": "registry-manifest-proof"}
+    except (DispatchContractError, ReplicaBatchContractError, KeyError, TypeError, ValueError) as exc:
+        raise BatchError("batch-prior-binding-invalid", str(exc)) from exc
+
+
+def prior_batch_input(jobs: Path, route: dict, nodes: list[dict], group: str,
+                      parent_attempt: str, prompt: str):
+    """Reuse a previously sealed launch input before applying current ranking.
+
+    One exact registered member plus its verified immutable input proves the
+    whole original allocation. Final per-row checks still run before launch.
+    A pre-SD-157 registry proves the whole original manifest from its N rows.
+    """
+    if not parent_attempt or not jobs.exists():
+        return None
+    from dispatch_replacement_batch import _input, _input_path
+    candidates = []
+    for line in jobs.read_text(encoding="utf-8").splitlines():
+        fields = line.split("\t")
+        if len(fields) != 6:
+            continue
+        meta = parse_registry_metadata(fields[5])
+        if (meta.get("route_id") == route["route_id"]
+                and meta.get("batch_group") == group
+                and meta.get("parent_attempt_id") == parent_attempt
+                and meta.get("batch_manifest_sha256")):
+            candidates.append(meta)
+    if not candidates:
+        return None
+    digests = {meta["batch_manifest_sha256"] for meta in candidates}
+    if len(digests) != 1:
+        raise BatchError("batch-prior-binding-ambiguous", group)
+    first = candidates[0]
+    try:
+        if not _input_path(jobs, first["batch_manifest_sha256"]).is_file():
+            return registry_batch_input(candidates, route, nodes, group, parent_attempt, prompt)
+        payload = _input(jobs, first)
+        manifest = payload["manifest"]
+        if (payload.get("route_hash") != route.get("route_hash")
+                or payload["options"].get("prompt_text") != prompt
+                or {m["route_node"] for m in manifest["members"]} != {n["id"] for n in nodes}):
+            raise BatchError("batch-prior-binding-drift", group)
+        return payload
+    except (DispatchContractError, ReplicaBatchContractError) as exc:
+        raise BatchError("batch-prior-binding-invalid", str(exc)) from exc
+
+
+def prior_batch_assignments(payload: dict, route: dict, nodes: list[dict], parent_identity: dict):
+    members = {m["route_node"]: m for m in payload["manifest"]["members"]}
+    assignments = []
+    for node in nodes:
+        member = members[node["id"]]
+        selected = DISPATCH_NODE.resolve_checked_tuple(
+            route, node, member["harness"], parent_identity=parent_identity)
+        if (selected.fallback_hop != member["fallback_hop"]
+                or selected.ordinal != member["fallback_ordinal"]
+                or str(node.get("model_profile")) != member["model_profile"]
+                or str(node.get("perspective")) != member["perspective"]):
+            raise BatchError("batch-prior-binding-drift", str(node["id"]))
+        assignments.append((node, member["harness"], selected.fallback_hop, selected.ordinal))
+    return assignments
+
+
 def parallel_nodes(route: dict[str, object], group: str) -> list[dict[str, object]]:
     nodes = [
         node
@@ -372,6 +502,10 @@ def parallel_nodes(route: dict[str, object], group: str) -> list[dict[str, objec
     dependencies = {tuple(node.get("depends_on", [])) for node in nodes}
     if len(dependencies) != 1:
         raise BatchError("parallel-group-dependency-mismatch", group)
+    perspectives = [node.get("perspective") for node in nodes]
+    if (any(not isinstance(value, str) or not value.strip() for value in perspectives)
+            or len({value.strip() for value in perspectives}) != len(nodes)):
+        raise BatchError("parallel-group-perspective-duplicate", group)
     summaries = [
         row for row in route.get("parallel_groups", [])
         if isinstance(row, dict) and row.get("id") == group
@@ -604,13 +738,9 @@ def assign_harnesses(
     usable = sorted({adapter for choices in options for adapter, _hop, _ord in choices})
 
     combinations = list(itertools.product(*options))
-    distinct = [rows for rows in combinations if len({row[0] for row in rows}) >= 2]
-    # SD-100 ① peer-gate (W1b): a realized peer leg must land on a quality-peer
-    # family, otherwise the group's gate authority would rest entirely on
-    # non-quality-peer harnesses with zero ledger evidence (plan.md 1.2
-    # regression window). Placed between the `distinct` computation and the
-    # `elif allow_degraded:` branch; `allow_degraded` never bypasses it (AC 11).
-    # With no sealed harness_policy the gate is not-applicable (D8-①).
+    # SD-100 sole-gate authority remains independent of SD-160 placement.
+    # A peer leg must use a quality-peer family; a legacy degradation flag
+    # never overrides this gate.
     policy_by_profile = _policy_by_profile(route, nodes)
     quality_peer = (
         quality_peer_families(policy_by_profile) if policy_by_profile else None
@@ -628,10 +758,6 @@ def assign_harnesses(
             ]
             if gated:
                 combinations = gated
-                distinct = [
-                    rows for rows in gated
-                    if len({row[0] for row in rows}) >= 2
-                ]
             elif usable and (set(usable) & quality_peer):
                 raise BatchError(
                     "parallel-cross-harness-unavailable",
@@ -639,65 +765,16 @@ def assign_harnesses(
                     degradation_reason="sole-gate-non-peer-harness",
                 )
             else:
-                # No hard-eligible quality-peer family at all, so every realized
-                # peer leg would land outside the quality-peer set and this
-                # stage's whole gate authority would rest on a non-peer harness.
-                # AC 11 is explicit that this is row 0 / model process 0 "even
-                # with --allow-degraded-independence", and SD-100 13.30.2 says
-                # a general flag does not relax the sole-gate rule -- the only
-                # user override is an explicit per-node harness pinned into the
-                # route record at compile time. So the refusal is raised here,
-                # BEFORE the `allow_degraded` branch below can reach it, and it
-                # carries the sole-gate reason rather than the usable-family
-                # one: the cause is the rule, not a shortage of families.
-                # (no `sole_gate = "degraded"` here: the raise on the next line
-                # makes it unreachable, and a refusal produces the blocked
-                # receipt below, never the `selection_diagnostics` one. The
-                # typed record of this refusal is `degradation_reason`.)
+                # No hard-eligible quality-peer family can own this gate.
                 raise BatchError(
                     "parallel-cross-harness-unavailable",
                     "peer-gate:no-quality-peer-family-hard-eligible",
                     degradation_reason="sole-gate-non-peer-harness",
                 )
-    independence = "cross-harness"
-    if len(usable) >= 2:
-        # Group width is >= 2 and every leg holds >= 1 option, so two usable
-        # families always admit a two-family assignment: `not distinct` is
-        # exactly "fewer than two usable compatible harness families". The
-        # blanket --allow-degraded-independence boolean is therefore never
-        # consulted on this branch and cannot downgrade an achievable
-        # cross-harness group.
-        if not distinct:
-            # defensive: unreachable -- the equivalence above guarantees
-            # distinct != [] whenever len(usable) >= 2.
-            raise BatchError(
-                "cross-harness-equivalence-violated",
-                f"usable={','.join(usable)}",
-            )
-        combinations = distinct
-    elif allow_degraded:
-        independence = "degraded-same-harness"
-    else:
-        # G2: the sole-gate proviso permits a non-quality-peer assignment, but
-        # it never bypasses the cross-family admission gate. With fewer than
-        # two usable families the group cannot stay cross-harness; same-family
-        # placement is refused unless --allow-degraded-independence is given
-        # (spec 13.30.2 "현행 거동 정정"), and `sole_gate == "degraded"` must
-        # not short-circuit that fail-closed order (AC 11).
-        detail = f"usable={','.join(usable) or '-'}"
-        codes = _exclusion_codes(exclusions, exclude=set(usable))
-        if codes:
-            detail += f";{codes}"
-        raise BatchError(
-            "parallel-cross-harness-unavailable", detail,
-            degradation_reason="single-usable-harness-family",
-        )
-
-    degradation_cause = "" if independence == "cross-harness" else "single-usable-harness-family"
-    if degradation_cause and degradation_cause not in DEGRADATION_CAUSES:
-        # defensive: unreachable -- degradation_cause is only ever assigned
-        # the literal "single-usable-harness-family" two lines above.
-        raise BatchError("degradation-cause-not-in-vocabulary", degradation_cause)
+    # SD-160: independent attempts and different perspectives are sufficient.
+    # Keep every hard-eligible quality-gated combination for capacity ranking.
+    independence = "persona"
+    degradation_cause = ""
 
     allocation = route.get("dispatch_allocation")
     counts = {harness: 0 for harness in SUPPORTED_BATCH_HARNESSES}
@@ -820,18 +897,27 @@ def assign_harnesses(
                 -sum(CAPACITY.ordering_score(capacity, row[0]) for row in rows),
                 sum(counts.get(row[0], 0) for row in rows),
             )
-        # Strictly after independence, gate, band, and the sealed per-stage
-        # affinity cell, so a configured depth preference can never collapse the
-        # group onto one family, place a gated harness, cross a quality band, or
-        # override an explicit per-stage affinity.
+        # A soft depth preference stays inside usage and quality gates and
+        # never overrides an explicit per-stage affinity. Harness diversity
+        # is descriptive, not a ranking dimension (SD-160).
         depth_affinity_miss = (
             0 if not depth_affinity_active or depth_preferred in {row[0] for row in rows}
             else 1
         )
+        # Capacity-aware keeps its quality-band precedence, but an affinity
+        # inside that band cannot select a usage-gated family over a healthy
+        # peer. In scarcity, headroom wins before a soft affinity (SD-160).
+        within_band_gate = (0, 0.0)
+        if isinstance(allocation, dict) and allocation.get("strategy") == "capacity-aware":
+            gated = [CAPACITY.is_gated(capacity, row[0],
+                     usage_gate_used_percent=allocation.get("usage_gate_used_percent", 90))
+                     for row in rows]
+            within_band_gate = (sum(gated),
+                -sum(float(capacity.get(row[0]) or 0) for row in rows) if all(gated) else 0.0)
         return (
-            -len({row[0] for row in rows}),
             *gate_order,  # B-1: the balanced usage gate precedes quality band
             sum(band_rank(node, row[0]) for node, row in zip(nodes, rows)),
+            *within_band_gate,
             affinity_misses,
             depth_affinity_miss,
             *allocation_order,
@@ -926,6 +1012,26 @@ def manifest_members(legs: list[dict[str, object]]) -> list[dict[str, object]]:
         }
         for leg in legs
     ]
+
+
+def source_manifest_for_digest(kwargs: dict, expected_digest: str):
+    """Rebuild immutable source evidence, including pre-SD-160 manifests.
+
+    The sealed digest decides which historical encoding is authoritative.
+    Current successor manifests always use persona independence.
+    """
+    for independence, reason in (
+        ("persona", ""), ("cross-harness", ""),
+        ("degraded-same-harness", "cross-harness-unavailable-user-allowed"),
+    ):
+        try:
+            result = build_manifest(**kwargs, independence=independence,
+                                    degradation_reason=reason)
+        except ReplicaBatchContractError:
+            continue
+        if result[1] == expected_digest:
+            return result
+    raise ReplicaBatchContractError("sealed source manifest digest mismatch")
 
 
 def _write_once_json(path: Path, payload: dict[str, object]) -> None:
@@ -1393,6 +1499,7 @@ def existing_leg_result(
     manifest_digest: str,
     leg_digest: str,
     agent_home: Path,
+    replaced_attempt_id: str = "",
 ) -> dict[str, object] | None:
     """Classify one exact prior attempt before consuming governor capacity.
 
@@ -1418,6 +1525,17 @@ def existing_leg_result(
         if metadata.get("attempt_id") == leg["attempt_id"]:
             matches.append((fields, metadata))
     if not matches:
+        for line in lines:
+            fields = line.split("\t")
+            if len(fields) != 6:
+                continue
+            prior = parse_registry_metadata(fields[5])
+            if (prior.get("route_id") == route["route_id"]
+                    and prior.get("route_node") == leg["node"]
+                    and prior.get("parent_attempt_id") == parent_attempt_id
+                    and prior.get("batch_group") == parallel_group
+                    and prior.get("attempt_id") != replaced_attempt_id):
+                raise BatchError("batch-prior-binding-unproven", str(leg["node"]))
         return None
     if len(matches) != 1:
         raise BatchError(
@@ -1649,6 +1767,7 @@ def batch_receipt(
         "replica_group": args.parallel_group,
         "independence": independence,
         "required_independence_axes": required_axes,
+        "effective_required_independence_axes": effective_independence_axes(required_axes),
         "realized_independence_axes": realized_axes,
         "degradation_reason": degradation_reason,
         "concurrent_launch": int(started_count == len(legs)),
@@ -1849,6 +1968,8 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         help="official partial_group_continuation authorizing one exact gap replacement",
     )
+    from review_input import add_arguments, resolve_input, is_review_node
+    add_arguments(parser)
     args = parser.parse_args(argv)
     if args.parallel_group and args.replica_group and args.parallel_group != args.replica_group:
         parser.error("--parallel-group and --replica-group aliases must match")
@@ -1956,6 +2077,7 @@ def main(argv: list[str] | None = None) -> int:
         ).path
         if args.log_dir is not None:
             args.log_dir = validate_dispatch_log_dir(jobs, args.log_dir)
+        args.review_inputs = {}
         # C-14: dispatch-node.py caps plan-check/impl-review/test rounds, but a
         # realized parallel_group leg bypasses that wrapper entirely -- check
         # every capped leg here too, before the atomic reservation, so one leg
@@ -1966,9 +2088,10 @@ def main(argv: list[str] | None = None) -> int:
         # goes through) must agree, so this no longer keeps its own
         # `len(prior)+1 > max_round` comparison.
         planned_revision_nodes: set[str] = set()
+        round_admissions = {}
         for capped_node in nodes:
             capped_node_id = str(capped_node["id"])
-            if capped_node_id not in DISPATCH_NODE.ROUND_CAPPED_NODE_IDS:
+            if not DISPATCH_NODE.REVIEW_ROUND_CAP.is_round_capped_node(capped_node):
                 continue
             if partial is not None and partial.get("automatic_replacement_evidence"):
                 # The claim has already validated the dead exact source. Reused
@@ -1978,8 +2101,10 @@ def main(argv: list[str] | None = None) -> int:
             admission = DISPATCH_NODE.admit_round(
                 route, capped_node, jobs,
                 owner_attempt_id=os.environ.get("AGENT_DISPATCH_ATTEMPT_ID"),
+                reviewed_evidence=args.reviewed_evidence if is_review_node(capped_node) else None,
                 **admission_options,
             )
+            round_admissions[capped_node_id] = admission
             budget = admission.budget
             planned_revision_nodes.update(admission.planned_revision_nodes)
             if budget.state == "blocked-live":
@@ -2010,7 +2135,15 @@ def main(argv: list[str] | None = None) -> int:
                     f"round={budget.next_round} max_round={budget.cap}",
                     route_node=capped_node_id,
                 )
-        if partial is not None:
+        prior_input = None if partial is not None else prior_batch_input(
+            jobs, route, nodes, args.parallel_group,
+            os.environ.get("AGENT_DISPATCH_ATTEMPT_ID", ""), args.prompt_text)
+        if prior_input is not None:
+            assignments = prior_batch_assignments(prior_input, route, nodes, parent_identity)
+            independence = "persona"
+            diagnostics = {"allocation_source": "sealed-launch-input", "degradation_cause": "",
+                           "sole_gate": "not-applicable"}
+        elif partial is not None:
             assignments = partial_source_assignments(
                 jobs, route, nodes, partial, parent_identity
             )
@@ -2018,7 +2151,7 @@ def main(argv: list[str] | None = None) -> int:
             # fresh capacity. Reallocating the whole group could reject a dead
             # gap merely because its successful sibling's backend is now busy.
             families = sorted({adapter for _, adapter, _, _ in assignments})
-            independence = "cross-harness" if len(families) >= 2 else "degraded-same-harness"
+            independence = "persona"
             diagnostics = {"families_considered": families, "usable_families": families,
                            "family_exclusions": {}, "capacity": {},
                            "degradation_cause": "", "sole_gate": "not-applicable",
@@ -2064,6 +2197,7 @@ def main(argv: list[str] | None = None) -> int:
         BatchError,
         DispatchContractError,
         DISPATCH_NODE.DispatchNodeError,
+        ValueError,
         OSError,
         subprocess.SubprocessError,
     ) as exc:
@@ -2079,7 +2213,7 @@ def main(argv: list[str] | None = None) -> int:
         if reason in {"review-round-budget-exhausted", "review-verdictless-bound"}:
             capped = next((n for n in nodes if n["id"] == getattr(exc, "route_node", None)), {})
             state = "verdictless-bound" if reason == "review-verdictless-bound" else "exhausted"
-            extra.update(DISPATCH_NODE.review_budget_recovery_fields(capped.get("kind"), state))
+            extra.update(DISPATCH_NODE.review_budget_recovery_fields(capped.get("kind"), state, route=route, node=capped, jobs=jobs, route_file=args.route))
         # `ROUTE_STATE_REFUSAL_REASONS` membership, not literal reason
         # strings: the static guardian in `dispatch_completion_marker.test.py`
         # keeps the gate's own missing-dependency reason inside
@@ -2115,7 +2249,8 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     lifecycle = select_launch_lifecycle()
-    required_axes = list(nodes[0].get("parallel_independence_axes", ["cross-harness"]))
+    required_axes = list(nodes[0].get("parallel_independence_axes", ["perspective"]))
+    effective_axes = effective_independence_axes(required_axes)
     realized_axes = []
     if len({adapter for _, adapter, _, _ in assignments}) >= 2:
         realized_axes.append("cross-harness")
@@ -2123,13 +2258,11 @@ def main(argv: list[str] | None = None) -> int:
         realized_axes.append("model-profile")
     if len({str(node.get("perspective")) for node, _, _, _ in assignments}) == len(nodes):
         realized_axes.append("perspective")
+    diagnostics["effective_required_independence_axes"] = effective_axes
     diagnostics["independence_axis_delta"] = [
-        axis for axis in required_axes if axis not in realized_axes
+        axis for axis in effective_axes if axis not in realized_axes
     ]
-    degradation_reason = (
-        "" if independence == "cross-harness"
-        else "cross-harness-unavailable-user-allowed"
-    )
+    degradation_reason = ""
     assignment_digest = "sha256:" + hashlib.sha256(
         args.prompt_text.encode("utf-8")
     ).hexdigest()
@@ -2200,16 +2333,16 @@ def main(argv: list[str] | None = None) -> int:
         for leg in legs:
             leg["attempt_id"] = source_attempts[str(leg["node"])]
         try:
-            source_manifest, source_manifest_digest, source_leg_digests = build_manifest(
+            source_kwargs = dict(
                 parallel_group=args.parallel_group,
                 route_id=str(route["route_id"]),
                 parent_attempt_id=parent_attempt,
-                independence=independence,
                 required_independence_axes=required_axes,
                 realized_independence_axes=realized_axes,
-                degradation_reason=degradation_reason,
                 members=manifest_members(legs),
             )
+            source_manifest, source_manifest_digest, source_leg_digests = source_manifest_for_digest(
+                source_kwargs, str(partial.get("source_batch_manifest_digest", "")))
         except ReplicaBatchContractError as exc:
             return fail(
                 "partial-continuation-source-manifest-invalid",
@@ -2271,7 +2404,33 @@ def main(argv: list[str] | None = None) -> int:
         members=manifest_members(legs),
     )
 
+    if prior_input is not None:
+        original_manifest = prior_input["manifest"]
+        if manifest_members(legs) != original_manifest["members"]:
+            return fail("batch-prior-binding-drift", 65, admitted=0, spawned=0)
+        manifest, manifest_digest, leg_digests = verify_manifest(original_manifest)
+        for leg in legs:
+            leg["independence"] = str(manifest["independence"])
+
     if args.action != "start":
+        try:
+            from review_input import is_review_node
+            for review_node in nodes:
+                if not is_review_node(review_node) or (partial and review_node["id"] != partial["gap_leg_id"]):
+                    continue
+                # Existing peers carry historical authority; a dry-run does not
+                # launch them or upgrade their old registration contract.
+                if prior_input is not None:
+                    continue
+                admission = round_admissions.get(review_node["id"])
+                if args.action == "dry-run" and admission is not None and admission.reviewed_input is not None:
+                    args.review_inputs[review_node["id"]] = admission.reviewed_input
+                else:
+                    resolve_input(route, review_node, jobs, args.reviewed_evidence,
+                        retry_of=(partial.get("failed_source_attempt_id")
+                            if partial and partial.get("automatic_replacement_evidence") else None))
+        except DispatchContractError as exc:
+            return fail(exc.reason, 65, detail=exc.detail, admitted=0, spawned=0)
         print(json.dumps({
             "schema_version": 2,
             "state": "validated",
@@ -2280,6 +2439,7 @@ def main(argv: list[str] | None = None) -> int:
             "replica_group": args.parallel_group,
             "independence": independence,
             "required_independence_axes": required_axes,
+            "effective_required_independence_axes": effective_independence_axes(required_axes),
             "realized_independence_axes": realized_axes,
             "degradation_reason": degradation_reason,
             "launch_lifecycle": lifecycle,
@@ -2296,13 +2456,6 @@ def main(argv: list[str] | None = None) -> int:
             ),
         }, separators=(",", ":"), sort_keys=True))
         return 0
-
-    try:
-        from dispatch_replacement_batch import seal_launch_input
-        seal_launch_input(jobs, args, route, manifest, manifest_digest)
-    except (DispatchContractError, ReplicaBatchContractError) as exc:
-        return fail(getattr(exc, "reason", "replacement-batch-input-invalid"),
-                    65, detail=str(exc), admitted=0, spawned=0)
 
     governor = ROOT / "utilities" / "model-worker-governor.py"
     artifact_root = Path(
@@ -2341,6 +2494,7 @@ def main(argv: list[str] | None = None) -> int:
                 manifest_digest=manifest_digest,
                 leg_digest=leg_digests[str(leg["attempt_id"])],
                 agent_home=agent_home,
+                replaced_attempt_id=str(partial["failed_source_attempt_id"]) if partial else "",
             )
             if existing is None:
                 pending_legs.append(leg)
@@ -2392,6 +2546,44 @@ def main(argv: list[str] | None = None) -> int:
         receipt["degradation_ledger"] = _record_failed_legs(route, results, agent_home) or "-"
         print(json.dumps(receipt, separators=(",", ":"), sort_keys=True))
         return 70
+
+    # Only actual new starts require current input. Completed/live peers retain
+    # their sealed authority even after the reviewed file is edited or removed.
+    try:
+        from review_input import is_review_node
+        for leg in pending_legs:
+            review_node = next(node for node in nodes if node["id"] == leg["node"])
+            if not is_review_node(review_node):
+                continue
+            candidate = resolve_input(route, review_node, jobs, args.reviewed_evidence,
+                retry_of=(partial.get("failed_source_attempt_id")
+                    if partial and partial.get("automatic_replacement_evidence") else None))
+            args.review_inputs[leg["node"]] = candidate
+        if args.review_inputs:
+            args.reviewed_evidence = next(iter(args.review_inputs.values()))["path"]
+        if args.reviewed_evidence and not any(is_review_node(node) for node in nodes):
+            raise DispatchContractError("reviewed-evidence-node-invalid", args.parallel_group)
+    except DispatchContractError as exc:
+        return fail(exc.reason, 65, detail=exc.detail, admitted=0, spawned=0)
+
+    try:
+        from dispatch_replacement_batch import seal_launch_input
+        if prior_input is None:
+            seal_launch_input(jobs, args, route, manifest, manifest_digest)
+    except (DispatchContractError, ReplicaBatchContractError) as exc:
+        return fail(getattr(exc, "reason", "replacement-batch-input-invalid"),
+                    65, detail=str(exc), admitted=0, spawned=0)
+
+    # Replays preserve their original placement, but an unstarted exact leg
+    # still owes current native hard-quota admission. Successful/live peers
+    # require no spawn and therefore consume no fresh capacity (SD-157/160).
+    from dispatch_capacity_evidence import active_limits
+    for leg in pending_legs:
+        limits = active_limits(jobs, profile=leg.get("model_profile"))
+        if leg["adapter"] in limits:
+            proof = limits[leg["adapter"]]
+            return fail("batch-pending-hard-limit", 75, admitted=0, spawned=0,
+                        detail=f"node={leg['node']} harness={leg['adapter']} quota-until-{proof['reset_epoch']}")
 
     tokens: list[str] = []
     processes: list[tuple[dict[str, object], str, subprocess.Popen]] = []
@@ -2486,6 +2678,8 @@ def main(argv: list[str] | None = None) -> int:
                 args.parent,
                 "--prompt-text",
                 args.prompt_text,
+                *(["--reviewed-evidence", args.review_inputs[leg["node"]]["path"]]
+                  if leg["node"] in args.review_inputs else []),
                 "--attempt-id",
                 str(leg["attempt_id"]),
                 "--jobs",
@@ -2582,6 +2776,7 @@ def main(argv: list[str] | None = None) -> int:
                                 manifest_digest=manifest_digest,
                                 leg_digest=leg_digests[str(leg["attempt_id"])],
                                 agent_home=agent_home,
+                                replaced_attempt_id=str(partial["failed_source_attempt_id"]) if partial else "",
                             )
                             if checked is None:
                                 result.update(

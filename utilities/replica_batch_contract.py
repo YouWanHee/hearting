@@ -16,7 +16,7 @@ from typing import Any
 
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 SUPPORTED_HARNESSES = frozenset({"claude", "codex", "opencode"})
-SUPPORTED_INDEPENDENCE = frozenset({"cross-harness", "degraded-same-harness"})
+SUPPORTED_INDEPENDENCE = frozenset({"persona", "cross-harness", "degraded-same-harness"})
 SUPPORTED_AXES = frozenset({"cross-harness", "model-profile", "perspective"})
 SUPPORTED_PROFILES = frozenset({"top", "deep", "balanced-deep", "balanced", "light"})
 # At most one `top` leg per group. Two reasons, both structural: unbounded
@@ -35,6 +35,14 @@ class ReplicaBatchContractError(ValueError):
 def _digest(value: dict[str, Any]) -> str:
     raw = json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8")
     return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
+def effective_independence_axes(declared: list[str]) -> list[str]:
+    """SD-160 policy view; never rewrite the sealed declaration or its hash."""
+    axes = [axis for axis in declared if axis != "cross-harness"]
+    if "perspective" not in axes:
+        axes.append("perspective")
+    return axes
 
 
 def build_manifest(
@@ -63,7 +71,7 @@ def build_manifest(
     if not isinstance(members, list) or not MIN_WIDTH <= len(members) <= MAX_WIDTH:
         raise ReplicaBatchContractError("parallel batch must declare 2..4 members")
 
-    required_axes = required_independence_axes or ["cross-harness"]
+    required_axes = required_independence_axes or (["perspective"] if independence == "persona" else ["cross-harness"])
     realized_axes = realized_independence_axes or (
         ["cross-harness"] if independence == "cross-harness" else []
     )
@@ -71,7 +79,7 @@ def build_manifest(
         if (not isinstance(axes, list) or len(axes) != len(set(axes))
                 or not set(axes) <= SUPPORTED_AXES):
             raise ReplicaBatchContractError(f"invalid {label} independence axes")
-    if "cross-harness" not in required_axes:
+    if independence != "persona" and "cross-harness" not in required_axes:
         raise ReplicaBatchContractError("parallel batch requires cross-harness intent")
 
     required_member = {
@@ -147,7 +155,13 @@ def build_manifest(
         derived_axes.add("perspective")
     if set(realized_axes) != derived_axes:
         raise ReplicaBatchContractError("realized independence axes differ from member evidence")
-    if independence == "cross-harness":
+    if independence == "persona":
+        if (len({str(member["perspective"]).strip() for member in normalized}) != size
+                or any(not str(member["perspective"]).strip() for member in normalized)):
+            raise ReplicaBatchContractError("persona batch requires distinct perspectives")
+        if degradation_reason:
+            raise ReplicaBatchContractError("persona batch cannot degrade same-harness placement")
+    elif independence == "cross-harness":
         if harness_count < 2 or degradation_reason:
             raise ReplicaBatchContractError("cross-harness batch requires 2+ harnesses and no degradation")
     elif harness_count != 1 or not degradation_reason:

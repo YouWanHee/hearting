@@ -327,7 +327,7 @@ class DispatchRecoveryTest(unittest.TestCase):
   finally:
    services.cleanup()
 
- def production_fixture(self):
+ def production_fixture(self, independence="cross-harness"):
   artifact=self.base/"artifacts"
   route_path=artifact/".runtime"/"routes"/"rt-recovery.json"
   route_path.parent.mkdir(parents=True,exist_ok=True)
@@ -375,12 +375,15 @@ class DispatchRecoveryTest(unittest.TestCase):
     "perspective":"independent","parallel_leg_index":1,"leg_class":"peer",
    },
   ]
+  if independence != "cross-harness":
+   members[1].update(harness="codex",fallback_hop="same-harness-headless",fallback_ordinal=1)
   manifest,digest,legs=R.build_manifest(
    parallel_group="recovery-group",route_id="rt-recovery",
-   parent_attempt_id="att-owner",independence="cross-harness",
+   parent_attempt_id="att-owner",independence=independence,
    members=members,
    required_independence_axes=["cross-harness","model-profile","perspective"],
-   realized_independence_axes=["cross-harness","model-profile","perspective"],
+   realized_independence_axes=(["cross-harness"] if independence=="cross-harness" else [])+["model-profile","perspective"],
+   degradation_reason="cross-harness-unavailable-user-allowed" if independence=="degraded-same-harness" else "",
   )
   def metadata(member):
    return {
@@ -397,7 +400,7 @@ class DispatchRecoveryTest(unittest.TestCase):
     "batch_harness":member["harness"],
     "batch_fallback_hop":member["fallback_hop"],
     "batch_fallback_ordinal":str(member["fallback_ordinal"]),
-    "batch_independence":"cross-harness",
+    "batch_independence":independence,
     "batch_model_profile":member["model_profile"],
     "batch_perspective":member["perspective"],
     "batch_parallel_leg_index":str(member["parallel_leg_index"]),
@@ -498,6 +501,17 @@ class DispatchRecoveryTest(unittest.TestCase):
    "--output",str(route_path),
   ])
   return continuation,official,route_path
+
+ def test_sd160_persona_and_historical_source_manifests_keep_exact_digests(self):
+  for independence in ("persona","cross-harness","degraded-same-harness"):
+   with self.subTest(independence=independence):
+    request,recovery_id,manifest,digest,legs=self.production_fixture(independence)
+    source=R.exact_attempt(self.jobs,self.attempt)
+    before=self.jobs.read_bytes(),request.route_file.read_bytes()
+    context=R._source_batch_context(request,source)
+    self.assertEqual(context.manifest,manifest)
+    self.assertEqual(context.manifest_digest,digest)
+    self.assertEqual((self.jobs.read_bytes(),request.route_file.read_bytes()),before)
 
  def test_production_official_continuation_and_exact_gap_command_boundaries(self):
   request,recovery_id,manifest,digest,legs=self.production_fixture()

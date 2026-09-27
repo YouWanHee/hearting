@@ -961,11 +961,18 @@ class InstalledRuntimeRegistryTest(unittest.TestCase):
     def test_collect_classifies_both_parent_extinction_children_and_protects_sibling(self):
         with tempfile.TemporaryDirectory() as tmp:
             jobs_log = os.path.join(tmp, "jobs.log")
+            # The common parent proof scans real /proc tags beyond Fleet's
+            # mocks. Keep unrelated parallel fixtures out of this identity.
+            suffix = Path(tmp).name
+            parent_id = f"att-parent-{suffix}"
+            child_ids = (f"att-child-a-{suffix}", f"att-child-b-{suffix}")
+            sibling_id = f"att-sibling-{suffix}"
+            other_parent_id = f"att-other-{suffix}"
             contract = ("attempt_schema_version=2,dispatch_depth=2,transport=headless,"
                         "execution_surface=registered-headless,registered_worker=1,"
                         "fallback_hop=same-harness-headless")
             owner = ("2026-08-01T00:00:00Z\tdone\t/repo\t/wt\towner\t"
-                     f"{contract},dispatch_depth=1,worker_type=owner,attempt_id=att-parent,"
+                     f"{contract},dispatch_depth=1,worker_type=owner,attempt_id={parent_id},"
                      "note=fleet-kill,pid=99999991,pid_start=1,pgid=99999991,"
                      "pid_ns=pid:[fleet],pid_observer_ns=pid:[fleet],"
                      "launch_lifecycle=foreground-scoped,launch_outcome=governed-process-reaped,"
@@ -976,9 +983,9 @@ class InstalledRuntimeRegistryTest(unittest.TestCase):
                         "route_file=/route.json,"
                         f"parent=owner,parent_attempt_id={parent},pid=99999992,pid_start=1,"
                         "pid_scope=namespace-local,launch_lifecycle=foreground-scoped")
-            Path(jobs_log).write_text("\n".join((owner, child("att-child-a", "att-parent"),
-                                                   child("att-child-b", "att-parent"),
-                                                   child("att-sibling", "att-other"))) + "\n")
+            Path(jobs_log).write_text("\n".join((owner, child(child_ids[0], parent_id),
+                                                   child(child_ids[1], parent_id),
+                                                   child(sibling_id, other_parent_id))) + "\n")
             with mock.patch.object(dispatch, "_scan_processes", return_value=[]), \
                  mock.patch.object(dispatch, "_live_attempt_ids", return_value=set()), \
                  mock.patch.object(dispatch, "_attempt_heartbeat",
@@ -994,11 +1001,11 @@ class InstalledRuntimeRegistryTest(unittest.TestCase):
                  mock.patch.object(dispatch, "_attempt_terminal_observation", return_value=None):
                 jobs = dispatch.collect(jobs_path=jobs_log)
             by_attempt = {job.attempt_id: job for job in jobs}
-            for attempt in ("att-child-a", "att-child-b"):
+            for attempt in child_ids:
                 self.assertEqual(by_attempt[attempt].liveness, "dead")
                 self.assertEqual(by_attempt[attempt].state_evidence["attempt"]["source"], "parent")
-            self.assertEqual(by_attempt["att-sibling"].liveness, "working",
-                             by_attempt["att-sibling"].state_evidence)
+            self.assertEqual(by_attempt[sibling_id].liveness, "working",
+                             by_attempt[sibling_id].state_evidence)
 
     def test_collect_parent_proof_fails_closed_on_route_conflict_and_missing_binding(self):
         with tempfile.TemporaryDirectory() as tmp:

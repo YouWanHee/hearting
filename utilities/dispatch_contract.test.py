@@ -83,12 +83,12 @@ class FrameLaunchGateTest(unittest.TestCase):
   jobs=base/"jobs.log";jobs.write_text("\n".join(rows))
   return route,path,jobs,markers,rows
 
- def test_actual_pair_rejects_same_harness_and_allows_recorded_single_harness(self):
+ def test_actual_pair_allows_same_harness_personas_and_rejects_unsupported(self):
   with tempfile.TemporaryDirectory() as td:
    base=Path(td)
    for harnesses,candidates,reason in (
        (("codex","claude"),("codex","claude"),None),
-       (("codex","codex"),("codex","claude"),"frame-cross-harness-required"),
+       (("codex","codex"),("codex","claude"),None),
        (("codex","codex"),("codex",),None),
        (("codex","opencode"),("codex","claude"),"frame-harness-unsupported")):
     with self.subTest(harnesses=harnesses,candidates=candidates):
@@ -119,73 +119,41 @@ class FrameLaunchGateTest(unittest.TestCase):
     ledger.set_workflow_state("RUNNING",evidence={"released_gate":"frame-review",
       "decision":"proceed","actor_kind":"human","released_by":"test-person"},actor="gate")
     D.owner_frame_launch_gate(binding,"start",base,jobs)
-    # A substituted pair cannot use an earlier approval to bypass diversity.
+    # Same-harness personas remain valid after a real human release.
     self.fixture(base,("codex","codex"))
-    with self.assertRaises(D.DispatchContractError) as caught:
-     D.owner_frame_launch_gate(binding,"start",base,jobs)
-    self.assertEqual(caught.exception.reason,"frame-cross-harness-required")
+    D.owner_frame_launch_gate(binding,"start",base,jobs)
 
- def test_frame_quota_failure_allows_recorded_same_harness_pair_but_not_unknown_or_live_failure(self):
+ def test_legacy_same_harness_pair_needs_no_quota_proof_or_degradation(self):
   with tempfile.TemporaryDirectory() as td:
    base=Path(td);route,path,jobs,markers,rows=self.fixture(base,("codex","codex"))
-   root=base/".agent_reports";root.mkdir()
-   log=base/"quota.jsonl"
-   log.write_text(json.dumps({"type":"result","subtype":"error_during_execution","is_error":True,
-                             "errors":["429 usage limit reached"],"result":"weekly rate limit exceeded"})+"\n")
-   failed=(f"2026-09-12\tdone\t{base}\t{base}\tfailed-frame\tattempt_id=att-capacity,worker_type=frame,"
-      f"dispatch_depth=1,harness=claude,route_id={route['route_id']},route_hash={route['route_hash']},"
-      f"log_file={log},artifact_root={root},launch_outcome=reaped-before-publish")
-   lines=[failed,*rows]
-   self.assertEqual(D.frame_harness_admission(route,jobs,lines,["codex","codex"],
-                    [None,None]),["att-capacity"])
-   D._frame_pair_attempt_gate(route,route["nodes"][-1],markers,jobs,lines)
-   records=[json.loads(line) for p in (base/"degradations").glob("*.jsonl") for line in p.read_text().splitlines()]
-   self.assertTrue(any(r.get("reason")=="frame-single-available-harness" and r.get("prior_attempt_ids")==["att-capacity"] for r in records),records)
-   for replacement in (failed.replace("\tdone\t","\topen\t"),failed.replace("reaped-before-publish","unknown"),
-                       failed.replace("route_id=rt-frame-gate","route_id=rt-other"),
-                       failed+",failure_class=pass"):
-    with self.assertRaises(D.DispatchContractError):
-     D._frame_pair_attempt_gate(route,route["nodes"][-1],markers,jobs,[replacement,*rows])
-    with self.assertRaises(D.DispatchContractError):
-     D.frame_harness_admission(route,jobs,[replacement,*rows],["codex","codex"],[None,None])
-   log.write_text(json.dumps({"type":"result","is_error":True,"subtype":"error","result":"generic runtime failure"})+"\n")
-   with self.assertRaises(D.DispatchContractError):
-    D._frame_pair_attempt_gate(route,route["nodes"][-1],markers,jobs,lines)
+   for node in route["nodes"][:2]:
+    node["harness_diversity"]="cross-harness"
+   before=json.dumps(route,sort_keys=True)
+   with mock.patch.object(D,"_frame_capacity_failures",side_effect=AssertionError("unneeded quota proof")), \
+        mock.patch("dispatch_degradation.record_degradation") as record:
+    self.assertEqual(D.frame_harness_admission(route,jobs,rows,["codex","codex"],[None,None]),[])
+    D._frame_pair_attempt_gate(route,route["nodes"][-1],markers,jobs,rows)
+   record.assert_not_called()
+   self.assertEqual(json.dumps(route,sort_keys=True),before)
 
- def test_frame_global_quota_requires_current_account_all_profiles_and_cleanup(self):
-  import time
-  from datetime import datetime, timezone
-  import dispatch_capacity_evidence as Q
+ def test_duplicate_or_empty_frame_persona_is_refused_on_either_harness(self):
   with tempfile.TemporaryDirectory() as td:
-   base=Path(td); route,path,jobs,markers,rows=self.fixture(base,("codex","codex"))
-   env={"HOME":str(base),"PATH":os.environ["PATH"]}
-   account=base/".claude.json"
-   account.write_text(json.dumps({"oauthAccount":{"accountUuid":"a","organizationUuid":"org"}}))
-   now=int(time.time()); stamp=datetime.fromtimestamp(now,timezone.utc).isoformat()
-   log=base/"att-prior-quota.claude.jsonl"
-   events=[{"type":"rate_limit_event","session_id":"quota-session","rate_limit_info":{
-    "status":"rejected","rateLimitType":"seven_day","resetsAt":now+3600}},
-    {"type":"result","session_id":"quota-session","is_error":True,"api_error_status":429}]
-   log.write_text("".join(json.dumps(r)+"\n" for r in events))
-   scope=Q.launch_scope("claude",env)
-   failed=(f"{stamp}\tdone\t{base}\t{base}\tprior\tattempt_id=att-prior-quota,harness=claude,"
-           f"route_id=other-route,note=dead-launch-exit-1,log_file={log},launch_outcome=reaped-before-publish,"
-           +",".join(f"{k}={v}" for k,v in scope.items()))
-   with mock.patch.dict(os.environ,env,clear=True):
-    # Snapshot has the failure; jobs itself deliberately doesn't. The gate
-    # consumes its locked snapshot, not a second read behind the caller.
-    D._frame_pair_attempt_gate(route,route["nodes"][-1],markers,jobs,[failed,*rows])
-    for replacement in (failed.replace("reaped-before-publish","unknown"),
-                        failed.replace("\tdone\t","\topen\t"),failed.replace(scope["quota_scope"],"other-scope")):
-     with self.assertRaises(D.DispatchContractError):
-      D._frame_pair_attempt_gate(route,route["nodes"][-1],markers,jobs,[replacement,*rows])
-    active=failed.replace("\tdone\t","\topen\t").replace("att-prior-quota","att-active").replace("other-route",route["route_id"])
-    with self.assertRaises(D.DispatchContractError):
-     D._frame_pair_attempt_gate(route,route["nodes"][-1],markers,jobs,[failed,*rows,active])
-    events[0]["rate_limit_info"]["rateLimitType"]="seven_day_opus"
-    log.write_text("".join(json.dumps(r)+"\n" for r in events))
-    with self.assertRaises(D.DispatchContractError):
-     D._frame_pair_attempt_gate(route,route["nodes"][-1],markers,jobs,[failed,*rows])
+   base=Path(td)
+   for harnesses in (("codex","codex"),("codex","claude")):
+    route,path,jobs,markers,rows=self.fixture(base,harnesses)
+    for values in (("same","same"),(" ","other"),("same",None)):
+     for node,value in zip(route["nodes"],values):
+      node["perspective"]=value
+     with self.assertRaises(D.DispatchContractError) as caught:
+      D._frame_pair_attempt_gate(route,route["nodes"][-1],markers,jobs,rows)
+     self.assertEqual(caught.exception.reason,"frame-perspective-duplicate")
+
+ def test_same_attempt_cannot_supply_both_frame_personas(self):
+  with tempfile.TemporaryDirectory() as td:
+   base=Path(td);route,path,jobs,markers,rows=self.fixture(base,("codex","codex"))
+   markers["frame-alternative"]["attempt_id"]=markers["frame"]["attempt_id"]
+   with self.assertRaises(D.DispatchContractError):
+    D._frame_pair_attempt_gate(route,route["nodes"][-1],markers,jobs,rows)
 
 
 

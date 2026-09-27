@@ -419,7 +419,7 @@ class TestRoute(unittest.TestCase):
   alternative=next(n for n in strong["nodes"] if n["id"]=="impl-review-alternative")
   self.assertEqual(base["parallel_group"],"impl-review")
   self.assertEqual(alternative["parallel_group"],"impl-review")
-  self.assertEqual(alternative["parallel_independence_axes"],["cross-harness","model-profile","perspective"])
+  self.assertEqual(alternative["parallel_independence_axes"],["model-profile","perspective"])
   self.assertEqual(alternative["dispatch_depth"],2)
   self.assertEqual(alternative["unit"],base["unit"])
   self.assertEqual(alternative["outputs"],["_internal/dev_reviews-alternative/phase_review.md"])
@@ -4593,7 +4593,7 @@ class SourceCensusTest(unittest.TestCase):
  # inside `terminal_gate_observation`), an owner-executed terminal that has
  # no completion marker file at all (`_owner_terminal_observation`), a
  # review-artifact provenance sha for an owner-closure proof
- # (`continuation_owner_closure_plan`/`_publish_continuation_owner_closure`),
+ # (`continuation_owner_closure_plan`/`_continuation_closure_marker_compatible`),
  # and `source_evidence_digest` (route-reuse's own named exception). None of
  # these ever duplicated the completion-marker recompute B-1/A-2 unified --
  # each is the one place ITS OWN schema is hashed.
@@ -4602,13 +4602,13 @@ class SourceCensusTest(unittest.TestCase):
   "gate_currency","evidence_currency",
   # capability-route.py -- completion-marker writers
   "_completion_marker_replay","write_completion_marker",
-  "_publish_completion_locked","publish_revision_locked",
+  "_publish_completion_locked","_producer_revision_plan",
   # capability-route.py -- named exception, route-reuse digest
   "source_evidence_digest",
   # capability-route.py -- different schema, not a completion marker
   "_arbitration_observation","arbitrate_group","terminal_gate_observation",
   "_owner_terminal_observation",
-  "continuation_owner_closure_plan","_publish_continuation_owner_closure",
+  "continuation_owner_closure_plan","_continuation_closure_marker_compatible",
  })
 
  def test_a_sd154_8_evidence_digest_recomputed_only_in_gate_currency(self):
@@ -4724,7 +4724,7 @@ class SourceCensusTest(unittest.TestCase):
   # than reading `round_census`/`closure_class` out of thin air.
   route_text=(P.parents[1]/"utilities"/"capability-route.py").read_text(encoding="utf-8")
   self.assertEqual(route_text.count("REVIEW_ROUND_CAP.marker_round_census("),2,
-                    "expected exactly two call sites: write_completion_marker, publish_revision_locked")
+                    "expected exactly two call sites: write_completion_marker, _producer_revision_plan")
 
 
 class ContinuationSealedJobsFallbackTest(unittest.TestCase):

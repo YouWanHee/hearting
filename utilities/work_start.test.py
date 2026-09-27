@@ -311,10 +311,10 @@ class WorkStartTest(unittest.TestCase):
                     stamp_harness[0] = True
                 result = W.start_work(self.route, self.path, self.jobs, run=select)
                 self.assertEqual(result["state"], "preparing", result)
-                self.assertEqual(launched, ["codex", "claude"] if headroom < 50 else ["claude", "codex"])
+                self.assertEqual(launched, ["codex", "codex"] if headroom < 50 else ["claude", "claude"])
                 first_launch = pending["launches"][0] if headroom == 30 else result["launches"][0]
                 self.assertIn("selection_source=configured-balanced", first_launch["receipt"])
-                self.assertIn("selection_source=frame-cross-harness", result["launches"][-1]["receipt"])
+                self.assertIn("selection_source=configured-balanced", result["launches"][-1]["receipt"])
                 # No authorized capacity is a refusal before any model wrapper.
                 self.jobs.unlink(); self.calls.clear(); launched.clear()
                 with mock.patch.object(owner, "_usage", return_value=dict.fromkeys(("claude", "codex", "opencode"), "limited(reset)")):
