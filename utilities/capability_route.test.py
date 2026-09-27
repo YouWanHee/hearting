@@ -4483,6 +4483,77 @@ class VerifiedRouteLineageTest(TestContinuation):
    with self.assertRaisesRegex(ValueError,"owner-closure-lineage-node-mismatch"):
     R.review_lineage_routes(tampered,"report")
 
+ def test_review_lineage_accepts_exact_reused_plan_check_boundary_and_nested_resume(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   artifact=Path(tmp)/"artifacts"
+   source=self._source(artifact)
+   source_path=R.canonical_route_path(artifact,source["route_id"])
+   R.write_once(source_path,source)
+   self._complete_prefix(source,"plan-check",Path(tmp)/"evidence")
+   first=R.build_continuation_route(
+    source,resume_from_node="plan-check",requested_boundary="plan-check",
+    reason="resume-review-boundary",artifact_root=artifact,
+   )
+   first_path=R.canonical_route_path(artifact,first["route_id"])
+   R.publish_continuation_route(first,source,first_path)
+   plan_check=next(node for node in first["nodes"] if node["id"]=="plan-check")
+   self.assertEqual(plan_check["source_depends_on"],["plan","plan-alternative"])
+   self.assertEqual(plan_check["depends_on"],[])
+   self.assertEqual(R.review_lineage_routes(first,"plan-check")[0]["route_id"],first["route_id"])
+
+   # Reuse a larger prefix in the next generation. The earlier rewrite remains
+   # checked on the first edge, while the second edge keeps the same assignment.
+   self._complete_prefix(first,"impl-review",Path(tmp)/"evidence-second")
+   second=R.build_continuation_route(
+    first,resume_from_node="impl-review",requested_boundary="impl-review",
+    reason="nested-resume",artifact_root=artifact,
+   )
+   second_path=R.canonical_route_path(artifact,second["route_id"])
+   R.publish_continuation_route(second,first,second_path)
+   lineage=R.review_lineage_routes(second,"plan-check")
+   self.assertEqual([row["route_id"] for row in lineage],
+                    [second["route_id"],first["route_id"],source["route_id"]])
+
+   full_root=Path(tmp)/"full-prefix-artifacts"
+   full_source=self._source(full_root)
+   full_source_path=R.canonical_route_path(full_root,full_source["route_id"])
+   R.write_once(full_source_path,full_source)
+   self._complete_prefix(full_source,"test",Path(tmp)/"full-prefix-evidence")
+   full=R.build_continuation_route(
+    full_source,resume_from_node="test",requested_boundary="test",
+    reason="full-prefix-cut",artifact_root=full_root,
+   )
+   R.publish_continuation_route(full,full_source,
+                                R.canonical_route_path(full_root,full["route_id"]))
+   self.assertTrue(any(row["node_id"]=="plan-check" for row in full["reused_nodes"]))
+   self.assertEqual([row["route_id"] for row in R.review_lineage_routes(full,"plan-check")],
+                    [full["route_id"],full_source["route_id"]])
+
+   # Provenance edits remain invalid even after the child route hash is recomputed.
+   for mutate in (
+    lambda row: row.__setitem__("marker_digest","sha256:"+"0"*64),
+    lambda row: row.__setitem__("terminal_attempt_id","att-foreign"),
+    lambda row: row.__setitem__("node_id","foreign"),
+   ):
+    forged=json.loads(json.dumps(first))
+    evidence=forged["reused_nodes"][0]
+    mutate(evidence)
+    forged["source_evidence_digest"]=R._sha256_record(forged["reused_nodes"])
+    forged["route_hash"]=R.route_hash(forged)
+    forged["route_id"]="rt-"+forged["route_hash"].split(":",1)[1][:16]
+    with self.assertRaisesRegex(ValueError,"owner-closure-lineage-node-mismatch"):
+     R.review_lineage_routes(forged,"plan-check")
+
+   forged=json.loads(json.dumps(first))
+   node=next(row for row in forged["nodes"] if row["id"]=="plan-check")
+   node["reused_dependencies"][0]["terminal_attempt_id"]="att-foreign"
+   descriptor=next(row for row in forged["new_nodes"] if row["node_id"]=="plan-check")
+   descriptor["realized_contract_hash"]=R._continuation_contract_hash(node)
+   forged["route_hash"]=R.route_hash(forged)
+   forged["route_id"]="rt-"+forged["route_hash"].split(":",1)[1][:16]
+   with self.assertRaisesRegex(ValueError,"owner-closure-lineage-node-mismatch:assignment"):
+    R.review_lineage_routes(forged,"plan-check")
+
 
 class SourceCensusTest(unittest.TestCase):
  """A-SD156-6: the route-lineage consumers stay on the one shared probe.
