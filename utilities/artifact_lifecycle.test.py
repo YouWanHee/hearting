@@ -20,6 +20,11 @@ import artifact_admission as adm
 import artifact_identity as idm
 import artifact_manifest as m
 
+_CORPUS_SPEC = importlib.util.spec_from_file_location(
+    "shared_artifact_path_corpus_lifecycle", Path(__file__).with_name("artifact_manifest.test.py"))
+_CORPUS = importlib.util.module_from_spec(_CORPUS_SPEC)
+_CORPUS_SPEC.loader.exec_module(_CORPUS)
+
 P = Path(__file__).with_name("capability-route.py")
 _S = importlib.util.spec_from_file_location("route_for_lifecycle_test", P)
 R = importlib.util.module_from_spec(_S)
@@ -204,6 +209,16 @@ def _cycle(**kw):
 
 
 class ArtifactLifecycleCycleTest(LifecycleTestBase):
+    def test_shared_classifier_corpus_matches_lifecycle_payload_verification(self):
+        _CORPUS.apply_shared_path_corpus(self)
+        root = self.root
+        campaign = "campaigns/camp"
+        cycle = campaign + "/cyc"
+        for namespace, relative, kind, prospective, allowed, reason in _CORPUS.SHARED_PATH_CORPUS:
+            classified = m.classify_artifact_path(str(root), campaign, cycle,
+                                                  namespace, relative, kind, prospective=prospective)
+            self.assertEqual((classified.allowed, classified.reason), (allowed, reason), relative)
+
     # P1 -- identical input_digest, compatible criterion, prior active.
     def test_compatible_unresolved_resume_preserves_cycle_id(self):
         prior = _cycle()

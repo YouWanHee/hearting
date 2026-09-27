@@ -12,6 +12,7 @@ recursive digest of the whole artifact root taken before and after the call.
 """
 
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
@@ -51,23 +52,13 @@ _ARTIFACT_ROOT = _resolve_artifact_root()
 
 
 def _scratch_root():
-    """Returns (path, is_local_fallback). Prefers the real artifact root."""
+    """Returns an isolated default root, or the explicit caller override."""
     env_root = os.environ.get("ARTIFACT_ADMISSION_TEST_ROOT")
     if env_root:
         Path(env_root).mkdir(parents=True, exist_ok=True)
-        return Path(env_root), False
-
-    if _ARTIFACT_ROOT.is_dir():
-        selftest = _ARTIFACT_ROOT / ".runtime" / "_selftest" / "adm-{0}-{1}".format(
-            os.getpid(), int(time.time() * 1000) % 1000000
-        )
-        try:
-            selftest.mkdir(parents=True)
-            return selftest, False
-        except OSError:
-            pass
-
-    return Path(tempfile.mkdtemp(prefix="artifact-admission-contract-")), True
+        return Path(env_root), False, None
+    private = tempfile.TemporaryDirectory(prefix="artifact-admission-contract-")
+    return Path(private.name), True, private
 
 
 def _make_valid_document(alloc, identity, *, camp_id=None, cyc_id=None, content=b"hello"):
@@ -169,13 +160,16 @@ def _make_valid_document(alloc, identity, *, camp_id=None, cyc_id=None, content=
 
 class AdmissionContractBase(unittest.TestCase):
     def setUp(self):
-        self.scratch, self.is_local_fallback = _scratch_root()
+        self.scratch, self.is_local_fallback, self._scratch_temp = _scratch_root()
         self.root = self.scratch / "root"
         self.root.mkdir(parents=True, exist_ok=True)
         self.alloc = idm.IdAllocator()
 
     def tearDown(self):
-        shutil.rmtree(str(self.scratch), ignore_errors=True)
+        if self._scratch_temp is not None:
+            self._scratch_temp.cleanup()
+        else:
+            shutil.rmtree(str(self.scratch), ignore_errors=True)
 
     # -- helpers ---------------------------------------------------------
 
@@ -266,6 +260,14 @@ class TestNoDurableOutput(AdmissionContractBase):
 
 
 class TestIdempotencyAndDeterminism(AdmissionContractBase):
+    def test_shared_classifier_corpus_matches_admission_payload_contract(self):
+        _CORPUS_SPEC = importlib.util.spec_from_file_location(
+            "shared_artifact_path_corpus_admission",
+            Path(__file__).with_name("artifact_manifest.test.py"))
+        corpus = importlib.util.module_from_spec(_CORPUS_SPEC)
+        _CORPUS_SPEC.loader.exec_module(corpus)
+        corpus.apply_shared_path_corpus(self)
+
     def test_nested_manifest_payload_is_admitted_and_preserved(self):
         identity = self._identity()
         data = b'{"ordinary":"admitted"}\n'

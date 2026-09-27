@@ -4,6 +4,7 @@ order, and (D-77-a) surfaces a nonterminal resplit journal hold."""
 from __future__ import annotations
 
 import inspect
+import importlib.util
 import json
 import sys
 import tempfile
@@ -13,6 +14,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import artifact_cutover as C  # noqa: E402
 import artifact_reader as reader  # noqa: E402
+
+_CORPUS_SPEC = importlib.util.spec_from_file_location(
+    "shared_artifact_path_corpus_reader", Path(__file__).with_name("artifact_manifest.test.py"))
+_CORPUS = importlib.util.module_from_spec(_CORPUS_SPEC)
+_CORPUS_SPEC.loader.exec_module(_CORPUS)
 
 CAMP = "camp_" + "a" * 32
 CYC = "cyc_" + "b" * 32
@@ -77,6 +83,16 @@ class ReaderTests(unittest.TestCase):
                          payload_bytes)
         rows = reader.cycle_bucket_dirs(self.root, "plans")
         self.assertEqual([meta["cycle_id"] for _path, meta in rows].count(CYC), 1)
+
+    def test_shared_classifier_corpus_matches_reader_payload_contract(self):
+        _CORPUS.apply_shared_path_corpus(self)
+        cycle = self.root / "campaigns" / CAMP / "cycles" / CYC
+        payload = cycle / "artifacts" / "plans" / "entry" / "manifest.json"
+        payload.parent.mkdir(parents=True, exist_ok=True)
+        payload.write_bytes(b"ordinary payload\n")
+        rows = reader.cycle_bucket_dirs(self.root, "plans")
+        self.assertEqual(sum(meta.get("cycle_id") == CYC for _path, meta in rows), 1)
+        self.assertEqual(payload.read_bytes(), b"ordinary payload\n")
 
     def test_glob_spans_layouts_and_skips_hidden(self):
         names = [p.name for p in reader.glob_bucket(self.root, "plans", "*plan")]
