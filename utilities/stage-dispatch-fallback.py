@@ -76,6 +76,7 @@ from dispatch_mode_contract import (  # noqa: E402
 from worker_bootstrap import assigned_contract, worker_type_for_kind  # noqa: E402
 from dispatch_attempt_policy import decide_attempt, committed_outcome
 from codex_dispatch_terminal import REVIEW_BLOCKING_NOTE  # noqa: E402
+from review_round_cap import classify_round_row  # noqa: E402
 from dispatch_degradation import record_degradation  # noqa: E402
 from dispatch_allocation_receipt import record_allocation_receipt  # noqa: E402
 from dispatch_allocation import inert_allocation_keys  # noqa: E402
@@ -690,6 +691,58 @@ def registry_has_attempt(jobs: Path, attempt_id: str) -> bool:
         if metadata.get("attempt_id") == attempt_id:
             return True
     return False
+
+
+def _report_launched(args, route, node, allocation_context, row, hop, ordinal, attempt_id,
+                     attempts, prior_failures, output, *, terminal_note=None,
+                     review_verdict=None, watch_fields=None) -> int:
+    """The one success receipt of a launched attempt -- a plain start, or a
+    worker that already finished with a verdict."""
+    watch_fields = watch_fields or {}
+    print("check=ok")
+    _emit_child_success(
+        args, route, node, allocation_context, row,
+        attempt_id=attempt_id, fallback_hop=hop["fallback_hop"],
+    )
+    print(f"selected_hop={hop['fallback_hop']}")
+    print(f"fallback_ordinal={ordinal}")
+    print(f"child_harness={row['child_harness']}")
+    print("launch_authority=conductor")
+    print("broker_lifecycle=retired")
+    print(f"attempt_id={attempt_id}")
+    if review_verdict:
+        print(f"terminal_note={terminal_note or REVIEW_BLOCKING_NOTE}")
+        print(f"review_verdict={review_verdict}")
+    if watch_fields.get("watchdog_verdict") == "advisory":
+        # SD-OPEN-38 (#9): the progress tool failed while the
+        # child was verified alive -- advisory, not a verdict.
+        for key in ("watchdog_verdict", "watchdog_advisory_tool",
+                    "watchdog_advisory_reason", "watchdog_advisory_detail"):
+            print(f"{key}={watch_fields.get(key, '-')}")
+    print(f"job_registry={args.jobs}")
+    print("attempt_trace=" + "|".join(attempts))
+    print("prior_attempt_ids=" + ",".join(x for values in prior_failures.values() for x in values))
+    if output:
+        print(output)
+    return 0
+
+
+def finished_verdict_row(jobs: Path, route_id: str, node_id: str, attempt_id: str):
+    """The launched attempt's own final row when it already carries a verdict.
+
+    A foreground reviewer that finished FAIL comes back from the wrapper as
+    `worker_failure=completed-review-blocking`. That is this round's result,
+    not a failed launch: retrying it on the next hop reran the same unchanged
+    artifact and spent another review round before the owner could correct it
+    (home-os rt-96dd5b62, 2026-09-27). `classify_round_row` is the one
+    definition of "this row is a verdict" the round budget also counts.
+    """
+    for row in reversed(registry_rows(jobs, route_id, node_id)):
+        if row.get("attempt_id") != attempt_id or row.get("_status") != "done":
+            continue
+        worker_type = row.get("worker_type", "")
+        return row if classify_round_row("done", row, worker_type=worker_type) == "verdict" else None
+    return None
 
 
 def terminal_attempt_state(
@@ -1488,6 +1541,11 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
     action.add_argument("--register", dest="action", action="store_const", const="register")
     action.add_argument("--start", dest="action", action="store_const", const="start")
     args = p.parse_args()
+    # The wrappers run with cwd=ROOT, so a relative prompt path would be read
+    # against the harness tree instead of the caller's directory (home-os,
+    # 2026-09-27: three launches fell through to "inline, runtime-unavailable").
+    if args.prompt_file is not None:
+        args.prompt_file = args.prompt_file.expanduser().resolve()
     args.launch_lifecycle = select_launch_lifecycle()
     self_slug = os.environ.get("AGENT_DISPATCH_SELF_SLUG")
     if args.parent and self_slug and args.parent != self_slug:
@@ -1843,6 +1901,17 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                     early = fields.get("early_death", "-")
                     worker_failure = fields.get("worker_failure", "-")
                     attempts.append(f"{ordinal}:{key}:direct:exit-{result.returncode}:attempt-{attempt_id}")
+                    verdict_row = (finished_verdict_row(args.jobs, route["route_id"], node["id"], attempt_id)
+                                   if worker_failure != "-" else None)
+                    if verdict_row is not None:
+                        note = verdict_row.get("note", worker_failure)
+                        return _report_launched(
+                            args, route, node, allocation_context, row, hop, ordinal, attempt_id,
+                            attempts, prior_failures, output,
+                            terminal_note=note,
+                            review_verdict=("PASS" if note not in (REVIEW_BLOCKING_NOTE, "dead-worker-fail")
+                                            else "FAIL"),
+                        )
                     if (result.returncode != 0 or fields.get("check") == "failed"
                             or worker_failure != "-"):
                         failure_reason = (
@@ -1915,35 +1984,17 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                                         watchdog_action=watch_fields.get("action", "unknown"),
                                         attempt_trace="|".join(attempts))
                     if early != "capacity":
-                        print("check=ok")
-                        _emit_child_success(
-                            args, route, node, allocation_context, row,
-                            attempt_id=attempt_id, fallback_hop=hop["fallback_hop"],
-                        )
-                        print(f"selected_hop={hop['fallback_hop']}")
-                        print(f"fallback_ordinal={ordinal}")
-                        print(f"child_harness={row['child_harness']}")
-                        print("launch_authority=conductor")
-                        print("broker_lifecycle=retired")
-                        print(f"attempt_id={attempt_id}")
-                        if watch_fields.get("review_verdict"):
+                        return _report_launched(
+                            args, route, node, allocation_context, row, hop, ordinal, attempt_id,
+                            attempts, prior_failures, output,
                             # OPERATIONS §5.10: a reviewer that finished with
                             # blocking findings inside the launch-confirm window
                             # is reported as such, not swallowed as a plain start.
-                            print(f"terminal_note={watch_fields.get('note', REVIEW_BLOCKING_NOTE)}")
-                            print(f"review_verdict={watch_fields['review_verdict']}")
-                        if watch_fields.get("watchdog_verdict") == "advisory":
-                            # SD-OPEN-38 (#9): the progress tool failed while the
-                            # child was verified alive -- advisory, not a verdict.
-                            for key in ("watchdog_verdict", "watchdog_advisory_tool",
-                                        "watchdog_advisory_reason", "watchdog_advisory_detail"):
-                                print(f"{key}={watch_fields.get(key, '-')}")
-                        print(f"job_registry={args.jobs}")
-                        print("attempt_trace=" + "|".join(attempts))
-                        print("prior_attempt_ids=" + ",".join(x for values in prior_failures.values() for x in values))
-                        if output:
-                            print(output)
-                        return 0
+                            terminal_note=(watch_fields.get("note", REVIEW_BLOCKING_NOTE)
+                                           if watch_fields.get("review_verdict") else None),
+                            review_verdict=watch_fields.get("review_verdict"),
+                            watch_fields=watch_fields,
+                        )
                 if registry_has_attempt(args.jobs, attempt_id):
                     args.automatic_retry_of = attempt_id
                 if early == "capacity":

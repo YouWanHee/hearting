@@ -580,6 +580,38 @@ class FallbackTest(unittest.TestCase):
   state,fields=F.terminal_attempt_state(self.jobs,"rt-q","plan-check","att-rb")
   self.assertEqual(state,"fallback")
   self.assertNotIn("review_verdict",fields)
+ def test_finished_verdict_row_stops_the_chain_instead_of_retrying(self):
+  # home-os rt-96dd5b62 (2026-09-27): a foreground reviewer's blocking FAIL came
+  # back as worker_failure=completed-review-blocking, the chain retried the same
+  # unchanged plan on the next hop, and the round budget was spent twice before
+  # the owner could correct it. A verdict row is this round's result.
+  base=("2026-09-27T00:00:00Z\t{status}\t/repo\t/wt\tplan-check\t"
+        "route_id=rt-q,route_node=plan-check,attempt_id={aid},worker_type={wt},note={note}{extra}\n")
+  rows=[base.format(status="done",aid="att-fail",wt="review",note="completed-review-blocking",extra=""),
+        base.format(status="done",aid="att-crash",wt="review",note="dead-worker-fail",extra=",failure_class=fail"),
+        base.format(status="done",aid="att-stage",wt="stage",note="dead-worker-fail",extra=",failure_class=fail"),
+        base.format(status="done",aid="att-envelope",wt="review",note="dead-invalid-envelope",extra=""),
+        base.format(status="open",aid="att-live",wt="review",note="-",extra="")]
+  self.jobs.write_text("".join(rows))
+  self.assertEqual(F.finished_verdict_row(self.jobs,"rt-q","plan-check","att-fail")["note"],"completed-review-blocking")
+  self.assertEqual(F.finished_verdict_row(self.jobs,"rt-q","plan-check","att-stage")["note"],"dead-worker-fail")
+  for aid in ("att-crash","att-envelope","att-live","att-missing"):
+   with self.subTest(aid=aid):
+    self.assertIsNone(F.finished_verdict_row(self.jobs,"rt-q","plan-check",aid))
+ def test_launched_report_carries_the_verdict_once(self):
+  args=SimpleNamespace(jobs=self.jobs)
+  out=io.StringIO()
+  with mock.patch.object(F,"_emit_child_success") as emitted, contextlib.redirect_stdout(out):
+   rc=F._report_launched(args,{"route_id":"rt-q"},{"id":"plan-check"},{},{"child_harness":"codex"},
+                         {"fallback_hop":"same-harness-headless"},1,"att-fail",["1:k:direct:exit-0:attempt-att-fail"],
+                         {},"",terminal_note="completed-review-blocking",review_verdict="FAIL")
+  self.assertEqual(rc,0)
+  emitted.assert_called_once()
+  lines=out.getvalue().splitlines()
+  self.assertEqual(lines[0],"check=ok")
+  self.assertIn("review_verdict=FAIL",lines)
+  self.assertIn("terminal_note=completed-review-blocking",lines)
+  self.assertEqual(sum(line.startswith("selected_hop=") for line in lines),1)
  def test_terminal_fallback_consumes_portable_receipt_after_observer_exit(self):
   import dispatch_contract as D
   for harness in ("claude","codex","opencode"):
