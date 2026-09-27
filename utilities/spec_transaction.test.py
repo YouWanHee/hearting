@@ -353,8 +353,90 @@ class CycleLayoutTest(unittest.TestCase):
   record=json.loads(ref.read_text()); record["latest_revision_id"]="rrev_"+"f"*32
   ref.write_text(json.dumps(record))
   with self.assertRaises(TX.PRODUCER.ProducerError) as ctx: TX.seed_cycle_spec(base,self.artifact)
-  self.assertEqual(ctx.exception.code,"shared-base-mismatch")
+  self.assertEqual(ctx.exception.code,"shared-base-invalid")
   self.assertEqual((base/TX.PRODUCER.SPEC_BASE_RECEIPT).read_bytes(),receipt)
+
+ def test_completed_seed_preserves_edits_and_deletions_after_latest_moves(self):
+  first=self._shared_v1()
+  _r,_f,begun=self._cycle("editing-original")
+  base=Path(begun["cycle_dir"])/"artifacts/spec"
+  TX.seed_cycle_spec(base,self.artifact)
+  receipt=(base/TX.PRODUCER.SPEC_BASE_RECEIPT).read_bytes()
+  (base/"prd.md").write_text("my change\n")
+  (base/"pipeline_state.yaml").unlink()
+  route,route_file,new=self._cycle("new-publisher")
+  output=Path(new["cycle_dir"])/"artifacts/spec"
+  TX.seed_cycle_spec(output,self.artifact)
+  (output/"prd.md").write_text("other change\n")
+  self._close(route,route_file); self.P.finalize(self.artifact,cycle_id=new["cycle_id"])
+  latest=self.P.admit_shared(self.artifact,cycle_id=new["cycle_id"],kind="spec",source="spec",key="spec")
+  result=TX.seed_cycle_spec(base,self.artifact)
+  self.assertEqual(result["latest_revision_id"],latest["shared_reference_revision_id"])
+  self.assertEqual((base/"prd.md").read_text(),"my change\n")
+  self.assertFalse((base/"pipeline_state.yaml").exists())
+  self.assertEqual((base/TX.PRODUCER.SPEC_BASE_RECEIPT).read_bytes(),receipt)
+  self.assertEqual(json.loads(receipt)["revision_id"],first["shared_reference_revision_id"])
+
+ def test_partial_seed_recovery_keeps_original_base_after_real_publish(self):
+  from unittest import mock
+  first=self._shared_v1()
+  _r,_f,begun=self._cycle("partial-original")
+  base=Path(begun["cycle_dir"])/"artifacts/spec"
+  original=Path.write_bytes
+  def interrupt(path,data):
+   if path.name=="prd.md": raise OSError("interrupted")
+   return original(path,data)
+  with mock.patch.object(Path,"write_bytes",interrupt):
+   with self.assertRaises(OSError): TX.seed_cycle_spec(base,self.artifact)
+  route,route_file,new=self._cycle("other-publisher")
+  output=Path(new["cycle_dir"])/"artifacts/spec"
+  TX.seed_cycle_spec(output,self.artifact); (output/"prd.md").write_text("v2\n")
+  self._close(route,route_file); self.P.finalize(self.artifact,cycle_id=new["cycle_id"])
+  self.P.admit_shared(self.artifact,cycle_id=new["cycle_id"],kind="spec",source="spec",key="spec")
+  TX.seed_cycle_spec(base,self.artifact)
+  self.assertEqual((base/"prd.md").read_text(),"v1\n")
+  receipt=json.loads((base/TX.PRODUCER.SPEC_BASE_RECEIPT).read_text())
+  self.assertEqual(receipt["revision_id"],first["shared_reference_revision_id"])
+  self.assertTrue(receipt["seed_complete"])
+
+ def test_new_seed_refuses_corrupt_latest_before_receipt_or_copy(self):
+  first=self._shared_v1()
+  (Path(first["revision_dir"])/"prd.md").write_text("tampered current")
+  _r,_f,begun=self._cycle("corrupt-current")
+  base=Path(begun["cycle_dir"])/"artifacts/spec"
+  with self.assertRaises(self.P.ProducerError) as exc: TX.seed_cycle_spec(base,self.artifact)
+  self.assertEqual(exc.exception.code,"shared-revision-integrity")
+  self.assertFalse((base/TX.PRODUCER.SPEC_BASE_RECEIPT).exists())
+  self.assertFalse((base/"prd.md").exists())
+
+ def test_legacy_seed_missing_file_is_not_silently_resurrected(self):
+  self._shared_v1()
+  _r,_f,begun=self._cycle("legacy-seed")
+  base=Path(begun["cycle_dir"])/"artifacts/spec"
+  TX.seed_cycle_spec(base,self.artifact)
+  receipt_path=base/TX.PRODUCER.SPEC_BASE_RECEIPT
+  receipt=json.loads(receipt_path.read_text()); receipt.pop("seed_complete")
+  receipt_path.write_text(json.dumps(receipt))
+  (base/"pipeline_state.yaml").unlink()
+  with self.assertRaises(self.P.ProducerError) as exc: TX.seed_cycle_spec(base,self.artifact)
+  self.assertEqual(exc.exception.code,"shared-seed-state-unproven")
+  self.assertFalse((base/"pipeline_state.yaml").exists())
+
+ def test_edited_partial_seed_refuses_instead_of_overwriting(self):
+  from unittest import mock
+  self._shared_v1()
+  _r,_f,begun=self._cycle("edited-partial")
+  base=Path(begun["cycle_dir"])/"artifacts/spec"
+  original=Path.write_bytes
+  def interrupt(path,data):
+   if path.name=="prd.md": raise OSError("interrupted")
+   return original(path,data)
+  with mock.patch.object(Path,"write_bytes",interrupt):
+   with self.assertRaises(OSError): TX.seed_cycle_spec(base,self.artifact)
+  (base/"prd.md").write_text("user edit\n")
+  with self.assertRaises(self.P.ProducerError) as exc: TX.seed_cycle_spec(base,self.artifact)
+  self.assertEqual(exc.exception.code,"shared-seed-state-unproven")
+  self.assertEqual((base/"prd.md").read_text(),"user edit\n")
 
  def test_malformed_seed_receipt_is_not_replaced(self):
   with tempfile.TemporaryDirectory() as td:

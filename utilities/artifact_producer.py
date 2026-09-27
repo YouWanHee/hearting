@@ -4226,12 +4226,20 @@ def _recover_locked(root: Path, *, now: Optional[float] = None,
     if shared_dir.is_dir():
         for entry in sorted(shared_dir.glob("*.json")):
             journal = _read_json(entry)
-            if journal is None:
-                entry.unlink()
+            try:
+                _validate_shared_journal(root, entry, journal)
+            except ProducerError as exc:
+                result["unresolved"].append({"revision_id": entry.stem, "code": exc.code,
+                                             "detail": exc.detail, "phase": "shared"})
                 continue
-            staging = root / str(journal.get("staging", ""))
-            target = root / str(journal.get("target", ""))
+            staging = root / journal["staging"]
+            target = root / journal["target"]
             if journal.get("state") == "staging" and staging.is_dir():
+                reference = _read_json(_reference_path(root, journal["kind"], journal["reference_id"])) or {}
+                if target.exists() or journal["expected_previous_revision_id"] != reference.get("latest_revision_id"):
+                    result["unresolved"].append({"revision_id": entry.stem, "code": "shared-base-mismatch",
+                                                 "detail": "staging ownership or base changed", "phase": "shared"})
+                    continue
                 shutil.rmtree(str(staging))
                 entry.unlink()
                 result["rolled_back"].append(journal.get("revision_id", entry.stem))
@@ -4243,6 +4251,9 @@ def _recover_locked(root: Path, *, now: Optional[float] = None,
                                                  "code": exc.code, "detail": exc.detail, "phase": "shared"})
                     continue
                 result["rolled_forward"].append(journal.get("revision_id", entry.stem))
+            elif journal.get("state") == "published":
+                result["unresolved"].append({"revision_id": entry.stem, "code": "shared-journal-mismatch",
+                                             "detail": "published target missing", "phase": "shared"})
             else:
                 entry.unlink()
                 result["rolled_back"].append(journal.get("revision_id", entry.stem))
@@ -4519,6 +4530,193 @@ def _spec_admission_base(root: Path, source_path: Path, reference_id: str,
     return base
 
 
+def _spec_bytes(directory: Path, *, revision: bool = False) -> Dict[str, bytes]:
+    """Read a complete regular-file tree, rejecting links and special files."""
+    if directory.is_symlink() or not directory.is_dir():
+        raise ProducerError("shared-base-invalid", str(directory))
+    result = {}
+    for path in _walk_files(directory):
+        rel = path.relative_to(directory).as_posix()
+        if path.is_symlink() or not path.is_file():
+            raise ProducerError("shared-base-invalid", rel)
+        if revision and rel == REVISION_RECORD_NAME:
+            continue
+        result[rel] = path.read_bytes()
+    return result
+
+
+def _spec_inventory(tree: Mapping[str, bytes]) -> List[Dict[str, Any]]:
+    return [{"path": p, "sha256": _digest(data), "byte_size": len(data)}
+            for p, data in sorted(tree.items())]
+
+
+def _spec_inventory_digest(rows: Sequence[Mapping[str, Any]]) -> str:
+    return _digest(_canonical([[r["path"], r["sha256"], r["byte_size"]] for r in rows]))
+
+
+def _verified_shared_spec(root: Path, ref_id: str, revision_id: str):
+    """Validate each immutable input against its own inventory, including bytes."""
+    if not artifact_identity.is_well_formed(revision_id, "shared_reference_revision"):
+        raise ProducerError("shared-base-invalid", str(revision_id))
+    directory = root / "shared/spec" / ref_id / "revisions" / revision_id
+    for parent in (directory, directory.parent, directory.parent.parent):
+        if parent.is_symlink():
+            raise ProducerError("shared-base-invalid", str(parent))
+    record = _read_json(directory / REVISION_RECORD_NAME)
+    if (not isinstance(record, dict) or record.get("shared_reference_id") != ref_id
+            or record.get("shared_reference_revision_id") != revision_id):
+        raise ProducerError("shared-base-invalid", revision_id)
+    tree = _spec_bytes(directory, revision=True)
+    rows = record.get("files")
+    try:
+        valid = (isinstance(rows, list)
+                 and sorted(rows, key=lambda r: r["path"]) == _spec_inventory(tree)
+                 and record.get("content_digest") == _spec_inventory_digest(rows))
+    except (KeyError, TypeError, ValueError):
+        valid = False
+    if not valid:
+        raise ProducerError("shared-revision-integrity", revision_id)
+    return tree, record
+
+
+def _merge_spec_publication(root: Path, reference: Mapping[str, Any], base_id: str,
+                            latest_id: str, source_tree: Mapping[str, bytes], drop_decisions: Sequence[Mapping[str, str]] = ()):
+    import spec_merge
+    ids = reference.get("revisions", [])
+    if (not base_id or not latest_id or base_id not in ids or latest_id not in ids
+            or len(ids) != len(set(ids)) or ids.index(base_id) >= ids.index(latest_id)):
+        raise ProducerError("shared-base-mismatch", f"unproven ancestry: {base_id} -> {latest_id}")
+    ref_id = reference["shared_reference_id"]
+    base, base_record = _verified_shared_spec(root, ref_id, base_id)
+    latest, latest_record = _verified_shared_spec(root, ref_id, latest_id)
+    dropped = {row["name"] for row in drop_decisions}
+    missing = component_set(base) - component_set(source_tree) - dropped
+    if missing:
+        raise ProducerError("component-set-regressed", ",".join(sorted(missing)))
+    if dropped - component_set(latest):
+        raise ProducerError("drop-component-unknown", ",".join(sorted(dropped - component_set(latest))))
+    # A component deletion also conflicts with additions to that component.
+    # File-wise merge alone could leave only the newly added files alive.
+    for component in component_set(base):
+        def subtree(tree):
+            return {p: b for p, b in tree.items() if p.split("/", 1)[0] == component}
+        b, o, l = subtree(base), subtree(source_tree), subtree(latest)
+        if (not o and l and l != b) or (not l and o and o != b):
+            raise ProducerError("shared-spec-conflict", f"{component}: component-delete-modify")
+    try:
+        merged, evidence = spec_merge.merge_trees(base, dict(source_tree), latest)
+    except spec_merge.MergeConflict as exc:
+        raise ProducerError("shared-spec-conflict", str(exc)) from exc
+    source_files = _spec_inventory(source_tree)
+    proof = {"schema_version": 1, "base_revision_id": base_id,
+             "base_content_digest": base_record["content_digest"],
+             "latest_revision_id": latest_id,
+             "latest_content_digest": latest_record["content_digest"],
+             "source_files": source_files, "source_content_digest": _spec_inventory_digest(source_files),
+             "dropped_components": list(drop_decisions),
+             "evidence": evidence, "output_content_digest": _spec_inventory_digest(_spec_inventory(merged))}
+    return merged, proof
+
+
+def _verify_spec_publication(root: Path, reference: Mapping[str, Any], revision: Mapping[str, Any]):
+    """Recompute a derived publication for recovery and exact retry; never rebase it."""
+    proof = revision.get("spec_merge")
+    if not isinstance(proof, dict):
+        raise ProducerError("shared-merge-proof-invalid", "missing merge proof")
+    source = revision.get("source", {})
+    record = read_cycle_record(root, source.get("cycle_id", ""))
+    if record is None or record.get("state") != "sealed" or record.get("manifest_digest") != source.get("manifest_digest"):
+        raise ProducerError("shared-merge-proof-invalid", "source identity")
+    directory = cycle_dir(root, record["campaign_id"], record["cycle_id"], record)
+    rel = source.get("path", "")
+    if not rel.startswith("artifacts/") or ".." in rel.split("/"):
+        raise ProducerError("shared-merge-proof-invalid", "source path")
+    source_rows = _sealed_source_files(directory, record, rel, directory / rel)
+    source_tree = _spec_bytes(directory / rel)
+    if source_rows != [(r["path"], r["sha256"], r["byte_size"]) for r in _spec_inventory(source_tree)]:
+        raise ProducerError("source-manifest-mismatch", rel)
+    recorded_base = _spec_admission_base(root, directory / rel, reference["shared_reference_id"],
+                                         proof.get("base_revision_id"))
+    merged, expected = _merge_spec_publication(root, reference, recorded_base,
+                                              proof.get("latest_revision_id"), source_tree, revision.get("dropped_components", []))
+    output, _ = _verified_shared_spec(root, reference["shared_reference_id"],
+                                      revision["shared_reference_revision_id"])
+    if proof != expected or output != merged:
+        raise ProducerError("shared-merge-proof-invalid", revision["shared_reference_revision_id"])
+
+
+def _verify_exact_spec_publication(root: Path, reference: Mapping[str, Any], revision: Mapping[str, Any]):
+    """Absence of a merge proof must mean an exact source copy, not lost proof."""
+    ids = reference.get("revisions", [])
+    revision_id = revision["shared_reference_revision_id"]
+    if revision_id in ids:
+        index = ids.index(revision_id)
+        base_id = ids[index - 1] if index else None
+    else:
+        base_id = reference.get("latest_revision_id")
+    if "spec_base_revision_id" in revision and revision["spec_base_revision_id"] != base_id:
+        raise ProducerError("shared-journal-mismatch", "publication ancestry")
+    if base_id and not _legacy_adopted_spec_base(root, reference, base_id):
+        _verified_shared_spec(root, reference["shared_reference_id"], base_id)
+    source = revision.get("source", {})
+    record = read_cycle_record(root, source.get("cycle_id", ""))
+    if record is None or record.get("manifest_digest") != source.get("manifest_digest"):
+        raise ProducerError("shared-journal-mismatch", "source identity")
+    rel = source.get("path", "")
+    if not rel.startswith("artifacts/") or ".." in rel.split("/"):
+        raise ProducerError("shared-journal-mismatch", "source path")
+    directory = cycle_dir(root, record["campaign_id"], record["cycle_id"], record)
+    if os.path.lexists(directory / rel / SPEC_BASE_RECEIPT):
+        source_base = _spec_admission_base(root, directory / rel, reference["shared_reference_id"], None)
+        _check_shared_base(source_base, base_id)
+    rows = _sealed_source_files(directory, record, rel, directory / rel)
+    output, _ = _verified_shared_spec(root, reference["shared_reference_id"],
+                                     revision["shared_reference_revision_id"])
+    if rows != [(r["path"], r["sha256"], r["byte_size"]) for r in _spec_inventory(output)]:
+        raise ProducerError("shared-merge-proof-invalid", "nonexact publication lacks merge proof")
+
+
+def _legacy_adopted_spec_base(root: Path, reference: Mapping[str, Any], base_id: str) -> bool:
+    # Missing/malformed canonical metadata is corruption, not legacy evidence.
+    # Old adoptions without an exact captured roster remain unproven.
+    return (reference.get("adopted_from") == "w7-e2-e3-relocation"
+            and base_id in reference.get("adopted_revision_ids", [])
+            and base_id in reference.get("revisions", [])
+            and not os.path.lexists(root / "shared/spec" / reference["shared_reference_id"]
+                                   / "revisions" / base_id / REVISION_RECORD_NAME))
+
+
+def _validate_shared_journal(root: Path, entry: Path, journal) -> None:
+    """A malformed recovery record grants no deletion or publication authority."""
+    if not isinstance(journal, dict):
+        raise ProducerError("shared-journal-mismatch", "unreadable journal")
+    kind, ref, rev = (journal.get(k) for k in ("kind", "reference_id", "revision_id"))
+    if (not isinstance(kind, str) or kind not in SHARED_KINDS or not artifact_identity.is_well_formed(ref, "shared_reference")
+            or not artifact_identity.is_well_formed(rev, "shared_reference_revision") or entry.stem != rev
+            or not isinstance(journal.get("state"), str) or journal.get("state") not in {"staging", "published"}
+            or "expected_previous_revision_id" not in journal):
+        raise ProducerError("shared-journal-mismatch", entry.name)
+    prefix = Path("shared") / kind / ref / "revisions"
+    staging, target = journal.get("staging"), journal.get("target")
+    if (not isinstance(staging, str) or Path(staging).parent != prefix
+            or not re.fullmatch(r"\.admitting-[0-9a-f]{16}", Path(staging).name)
+            or target != (prefix / rev).as_posix()):
+        raise ProducerError("shared-journal-mismatch", "recovery paths")
+    for rel in (Path(staging), Path(target)):
+        for part in (rel, *rel.parents):
+            if (root / part).is_symlink():
+                raise ProducerError("shared-journal-mismatch", "symlink recovery path")
+    source = journal.get("source_path", "")
+    record = read_cycle_record(root, journal.get("cycle_id", ""))
+    if (record is None or record.get("manifest_digest") != journal.get("source_manifest_digest")
+            or not isinstance(source, str) or not source.startswith("artifacts/")
+            or ".." in source.split("/")):
+        raise ProducerError("shared-journal-mismatch", "source identity")
+    if kind == "spec":
+        directory = cycle_dir(root, record["campaign_id"], record["cycle_id"], record)
+        _sealed_source_files(directory, record, source, directory / source)
+
+
 def _commit_shared(root: Path, journal: Mapping[str, Any]) -> None:
     kind = journal["kind"]
     ref_id = journal["reference_id"]
@@ -4536,6 +4734,20 @@ def _commit_shared(root: Path, journal: Mapping[str, Any]) -> None:
             or revision.get("source", {}).get("path") != journal.get("source_path")
             or revision.get("source", {}).get("manifest_digest") != journal.get("source_manifest_digest")):
         raise ProducerError("shared-journal-mismatch", journal["revision_id"])
+    if journal["revision_id"] not in reference["revisions"]:
+        if "expected_previous_revision_id" not in journal:
+            raise ProducerError("shared-base-required", "recovery journal lacks base revision")
+        _check_shared_base(journal["expected_previous_revision_id"], reference.get("latest_revision_id"))
+    if "spec_merge" in journal or "spec_merge" in revision:
+        if journal.get("spec_merge") != revision.get("spec_merge"):
+            raise ProducerError("shared-journal-mismatch", "merge proof")
+        _verify_spec_publication(root, reference, revision)
+        if journal.get("expected_previous_revision_id") != revision["spec_merge"]["latest_revision_id"]:
+            raise ProducerError("shared-journal-mismatch", "merge parent")
+    elif kind == "spec":
+        _verify_exact_spec_publication(root, reference, revision)
+        if "spec_base_revision_id" in revision and revision["spec_base_revision_id"] != journal.get("expected_previous_revision_id"):
+            raise ProducerError("shared-journal-mismatch", "source base")
     if journal["revision_id"] not in reference["revisions"]:
         if "expected_previous_revision_id" not in journal:
             raise ProducerError("shared-base-required", "recovery journal lacks base revision")
@@ -4644,7 +4856,23 @@ def admit_shared(
         else:
             reference_id = reference["shared_reference_id"]
             created = False
+        # An unresolved publication intent for this exact source cannot be
+        # replaced by a second publication. Preserve it for checked recovery.
+        for issue in sweep_unresolved:
+            pending_id = issue.get("revision_id")
+            if not pending_id:
+                continue
+            pending = _read_json(shared_journal_path(root, pending_id))
+            if (pending is None or not all(pending.get(k) for k in
+                    ("reference_id", "cycle_id", "source_path", "source_manifest_digest")) or (pending.get("reference_id") == reference_id
+                    and pending.get("cycle_id") == cycle_id and pending.get("source_path") == source_rel
+                    and pending.get("source_manifest_digest") == record.get("manifest_digest"))):
+                raise ProducerError("shared-publication-unresolved", str(pending_id))
+        dropped = sorted({str(name) for name in drop_components if str(name)})
+        drop_decisions = [{"name": name, "reason": drop_reason or "unspecified"} for name in dropped]
         source_rows = _sealed_source_files(directory, record, source_rel, source_path) if kind == "spec" else None
+        merged_tree = None
+        merge_proof = None
         if kind == "spec":
             # Exact publication retry is idempotent, even after another cycle won.
             for prior_id in (reference or {}).get("revisions", []):
@@ -4654,28 +4882,56 @@ def admit_shared(
                 if (provenance.get("cycle_id") == cycle_id and provenance.get("path") == source_rel
                         and provenance.get("manifest_digest") == record.get("manifest_digest")):
                     digest = prior.get("content_digest")
-                    if source_rows != sorted((r["path"], r["sha256"], r["byte_size"]) for r in prior.get("files", [])):
+                    comparison = prior.get("spec_merge", {}).get("source_files", prior.get("files", []))
+                    if source_rows != sorted((r["path"], r["sha256"], r["byte_size"]) for r in comparison):
                         raise ProducerError("source-manifest-mismatch", source_rel)
+                    if "spec_merge" in prior:
+                        _verify_spec_publication(root, reference, prior)
+                    else:
+                        _verify_exact_spec_publication(root, reference, prior)
                     return {"status": "reused", "kind": SHARED_KINDS[kind],
                             "shared_reference_id": reference_id, "shared_reference_revision_id": prior_id,
                             "reference_created": False, "revision_dir": str(prior_dir),
-                            "content_digest": digest, "file_count": len(source_rows), "promotion": prior["promotion"]}
+                            "content_digest": digest, "file_count": prior["file_count"], "promotion": prior["promotion"],
+                            **({"spec_merge": prior["spec_merge"]} if "spec_merge" in prior else {})}
             # Initial unseeded publications have no predecessor to overwrite.
             expected = (_spec_admission_base(root, source_path, reference_id, base_revision)
                         if reference is not None or base_revision is not None or (source_path / SPEC_BASE_RECEIPT).exists()
                         else None)
-            _check_shared_base(expected, (reference or {}).get("latest_revision_id"))
+            latest_id = (reference or {}).get("latest_revision_id")
+            # Canonical revisions with an inventory are verified even on the
+            # exact-base path; legacy adopted revisions retain their old path.
+            if expected:
+                if not _legacy_adopted_spec_base(root, reference or {}, expected):
+                    _verified_shared_spec(root, reference_id, expected)
+            if expected != latest_id:
+                if not expected or not latest_id:
+                    _check_shared_base(expected, latest_id)
+                if expected not in reference.get("revisions", []) or latest_id not in reference.get("revisions", []):
+                    _check_shared_base(expected, latest_id)
+                source_tree = _spec_bytes(source_path)
+                if source_rows != [(r["path"], r["sha256"], r["byte_size"])
+                                   for r in _spec_inventory(source_tree)]:
+                    raise ProducerError("source-manifest-mismatch", source_rel)
+                base_tree, _ = _verified_shared_spec(root, reference_id, expected)
+                # Preserve the original omission guard relative to the actual
+                # base. Only additions from latest have carry-forward authority.
+                missing_base = component_set(base_tree) - component_set(source_tree) - set(drop_components)
+                if missing_base:
+                    raise ProducerError("component-set-regressed", ",".join(sorted(missing_base)))
+                merged_tree, merge_proof = _merge_spec_publication(root, reference, expected, latest_id, source_tree, drop_decisions)
         # D-87 (a): refuse before anything exists.  This sits above the id
         # allocation, the journal write and the staging directory on purpose --
         # the contract requires a refused admit to leave no revision, no journal
         # and no staging behind.
-        dropped = sorted({str(name) for name in drop_components if str(name)})
         previous = _latest_component_set(root, kind, reference)
         if previous is not None:
             unknown = sorted(set(dropped) - previous)
             if unknown:
                 raise ProducerError("drop-component-unknown", ",".join(unknown))
-            missing = sorted(previous - _scan_component_set(source_path) - set(dropped))
+            incoming_components = (component_set(merged_tree) if merged_tree is not None
+                                   else _scan_component_set(source_path))
+            missing = sorted(previous - incoming_components - set(dropped))
             if missing:
                 raise ProducerError(
                     "component-set-regressed",
@@ -4701,16 +4957,28 @@ def admit_shared(
             "expected_previous_revision_id": (reference or {}).get("latest_revision_id"),
             "source_path": source_rel, "source_manifest_digest": record.get("manifest_digest"),
         }
+        if merge_proof is not None:
+            journal["spec_merge"] = merge_proof
         _ensure_dir(shared_journal_path(root, revision_id).parent)
         _write_exclusive(shared_journal_path(root, revision_id), _json_bytes(journal), 0o600)
         os.makedirs(str(staging))
         try:
-            rows, violations = _copy_tree_files(source_path, staging)
+            if merged_tree is None:
+                rows, violations = _copy_tree_files(source_path, staging)
+            else:
+                rows, violations = [], []
+                for rel, data in sorted(merged_tree.items()):
+                    dst = staging / rel
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    _write_exclusive(dst, data)
+                    rows.append((rel, _digest(data), len(data)))
+                for current, _, _ in os.walk(staging):
+                    _fsync_dir(Path(current))
             if violations:
                 raise ProducerError("source-invalid", ";".join(violations))
             if not rows:
                 raise ProducerError("source-empty", source_rel)
-            if source_rows is not None and sorted(rows) != source_rows:
+            if source_rows is not None and merged_tree is None and sorted(rows) != source_rows:
                 raise ProducerError("source-manifest-mismatch", source_rel)
             content_digest = _digest(_canonical([[rel, digest, size] for rel, digest, size in rows]))
             sequence = len((reference or {}).get("revisions", [])) + 1
@@ -4731,15 +4999,17 @@ def admit_shared(
                 ),
                 "files": [{"path": rel, "sha256": digest, "byte_size": size} for rel, digest, size in rows],
             }
+            if merge_proof is not None:
+                revision["spec_merge"] = merge_proof
+            elif kind == "spec":
+                revision["spec_base_revision_id"] = expected
             # D-87 (b): an explicit removal is named and reasoned in the record.
             # The key is omitted entirely when nothing was dropped, so an
             # ordinary admit's revision record is byte-identical to before
             # (A17-4). `content_digest` covers `files[]` only, so this key never
             # moves the digest either way.
             if dropped:
-                revision["dropped_components"] = [
-                    {"name": name, "reason": drop_reason or "unspecified"} for name in dropped
-                ]
+                revision["dropped_components"] = drop_decisions
             _write_exclusive(staging / REVISION_RECORD_NAME, _json_bytes(revision))
             _fsync_dir(staging)
         except BaseException:
@@ -4764,6 +5034,8 @@ def admit_shared(
             "revision_dir": str(target), "content_digest": content_digest, "file_count": len(rows),
             "promotion": revision["promotion"],
         }
+        if merge_proof is not None:
+            result["spec_merge"] = merge_proof
         if sweep_unresolved:
             result["recovery_unresolved"] = sweep_unresolved
         return result

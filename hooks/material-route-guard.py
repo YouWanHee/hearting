@@ -36,15 +36,75 @@ from typing import Any, Iterable, NamedTuple
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
-from dispatch_contract import (  # noqa: E402
-    DispatchContractError,
-    installed_source_layout,
-    resolve_agent_home as _resolve_agent_home,
-    resolve_dispatch_state_root,
-    route_grounding_state_dir,
-)
-from artifact_producer import review_output_write_authorized_from_cycle  # noqa: E402
-from transcript_turn import transcript_turn_id  # noqa: E402
+
+
+def _load_runtime_dependencies() -> None:
+    # An approved conflict edit must be checkable even when one of these
+    # development sources contains Git conflict markers. Normal calls keep
+    # using the same runtime contracts; no failed import grants permission.
+    global DispatchContractError, installed_source_layout, _resolve_agent_home
+    global resolve_dispatch_state_root, route_grounding_state_dir
+    global review_output_write_authorized_from_cycle, transcript_turn_id
+    from dispatch_contract import (
+        DispatchContractError, installed_source_layout,
+        resolve_agent_home as _resolve_agent_home,
+        resolve_dispatch_state_root, route_grounding_state_dir,
+    )
+    from artifact_producer import review_output_write_authorized_from_cycle
+    from transcript_turn import transcript_turn_id
+
+
+def approved_conflict_edit(tool: str, cwd: Path, file_path: str) -> bool:
+    """Recognize only the existing approval marker's unresolved-file scope.
+
+    OPERATIONS §5.9 owns authority and the manual three-way review. This is
+    not an additive-conflict classifier and never creates an approval marker.
+    It deliberately uses only stdlib and Git, before runtime-source imports.
+    """
+    if tool not in {"Edit", "Write", "edit", "write"} or not file_path:
+        return False
+    # Registered workers retain their stage/cleanup/route fences. Integration
+    # recovery belongs to the acting main session, not a dispatch permission.
+    if os.environ.get("AGENT_DISPATCH_ATTEMPT_ID"):
+        return False
+    try:
+        target = Path(os.path.abspath(Path(cwd) / file_path))
+        if target.resolve(strict=True) != target or not stat.S_ISREG(target.lstat().st_mode):
+            return False
+        env = {key: value for key, value in os.environ.items()
+               if key not in {"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"}}
+
+        def git(*args: str) -> bytes:
+            result = subprocess.run(
+                ["git", "--literal-pathspecs", "-C", str(cwd), *args],
+                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=5, check=True,
+            )
+            return result.stdout
+
+        root = Path(os.fsdecode(git("rev-parse", "--show-toplevel")).strip()).resolve(strict=True)
+        relative = target.relative_to(root)
+        git_dir = Path(os.fsdecode(git("rev-parse", "--absolute-git-dir")).strip())
+        marker = git_dir / "CLAUDE_MERGE_EDIT_OK"
+        if not stat.S_ISREG(marker.lstat().st_mode):
+            return False
+        operation = any((git_dir / name).is_file() for name in ("MERGE_HEAD", "CHERRY_PICK_HEAD"))
+        operation = operation or any((git_dir / name).is_dir() for name in ("rebase-merge", "rebase-apply"))
+        if not operation:
+            return False
+        entries = git("ls-files", "--unmerged", "-z", "--", relative.as_posix()).split(b"\0")
+        entries = [entry for entry in entries if entry]
+        if not entries:
+            return False
+        for entry in entries:
+            metadata, name = entry.split(b"\t", 1)
+            mode, _object_id, stage = metadata.split()
+            if (name != os.fsencode(relative.as_posix()) or mode not in {b"100644", b"100755"}
+                    or stage not in {b"1", b"2", b"3"}):
+                return False
+        return True
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
 
 STATE_DIR_NAME = ".route-grounding"
 MARKER_SCHEMA = 1
@@ -1428,6 +1488,8 @@ def check_action(
     command: str = "",
     turn_id: str = "",
 ) -> None:
+    if approved_conflict_edit(tool, cwd, file_path):
+        return
     # Terminal cleanup is a narrower capability than the ordinary cycle route.
     # Evaluate it first so a valid material route cannot widen an active
     # cleanup scope (the hook and direct writers share this oracle).
@@ -1751,6 +1813,9 @@ def cli(argv: list[str]) -> int:
     clear = sub.add_parser("clear")
     clear.add_argument("--session", required=True)
     args = parser.parse_args(argv)
+    if args.action == "check" and approved_conflict_edit(args.tool, Path(args.cwd), args.file):
+        return 0
+    _load_runtime_dependencies()
     agent_home = resolve_agent_home(args.agent_home)
     cwd = Path(getattr(args, "cwd", None) or os.getcwd())
     session_id = getattr(args, "session", "")
@@ -1792,8 +1857,18 @@ def main() -> int:
         return 0
     if not isinstance(payload, dict):
         return 0
+    tool_input = payload.get("tool_input")
+    if (payload.get("hook_event_name") == "PreToolUse" and isinstance(tool_input, dict)
+            and approved_conflict_edit(
+                str(payload.get("tool_name") or ""), Path(str(payload.get("cwd") or os.getcwd())),
+                str(tool_input.get("file_path") or tool_input.get("path") or ""))):
+        return 0
+    _load_runtime_dependencies()
     return hook_main(payload, resolve_agent_home())
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
+else:
+    # In-process users retain the module's established dependency surface.
+    _load_runtime_dependencies()
