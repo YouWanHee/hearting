@@ -530,17 +530,10 @@ def publish_producer_binding(*, artifact_root: Path, jobs: Path, route_file: Pat
         raise TerminalCommitError("producer-binding-mismatch", f"cycle:{cycle_id}") from exc
     if not isinstance(record, dict) or record.get("cycle_id") != cycle_id or record.get("state") != "open":
         raise TerminalCommitError("producer-binding-mismatch", f"cycle:{cycle_id}")
-    if record.get("route_id") != owner.route_id or record.get("route_hash") != owner.route_hash:
-        # D-120: a continuation owner resumes the cycle a verified ancestor
-        # began, so the begin route must sit in this route's hash-checked
-        # lineage with the hash the cycle recorded -- not be this route.
-        try:
-            lineage = route_lineage.verified_route_lineage(route, artifact_root=root)
-        except route_lineage.RouteLineageError as exc:
-            raise TerminalCommitError("producer-binding-mismatch", "cycle-route") from exc
-        begin = next((node for node in lineage if node.get("route_id") == record.get("route_id")), None)
-        if begin is None or begin.get("route_hash") != record.get("route_hash"):
-            raise TerminalCommitError("producer-binding-mismatch", "cycle-route")
+    producer = __import__("artifact_producer")
+    admission = producer.cycle_route_admission(root, record, route)
+    if not admission.allow:
+        raise TerminalCommitError("producer-binding-mismatch", "cycle-route")
     if identity is None:
         raise TerminalCommitError("producer-binding-mismatch", "root-identity")
     binding = {
@@ -760,11 +753,14 @@ def prove_terminal_authority(request: TerminalCommitRequest) -> TerminalProof:
                 return _proof_failure("producer-binding-mismatch")
             cycle_path = Path(request.artifact_root).resolve() / ".runtime/artifact-producer/v1/cycles" / f"{binding.binding['cycle_id']}.json"
             cycle = json.loads(cycle_path.read_text(encoding="utf-8"))
-            if cycle.get("state") != "open" or cycle.get("route_hash") not in (None, route["route_hash"]):
+            if cycle.get("state") != "open":
                 return _proof_failure("binding-cycle-not-open")
             if cycle_identity_digest(cycle) != binding.binding.get("cycle_record_digest"):
                 return _proof_failure("producer-binding-mismatch", "cycle-identity-drift")
             producer = __import__("artifact_producer")
+            admission = producer.cycle_route_admission(Path(request.artifact_root).resolve(), cycle, route)
+            if not admission.allow:
+                return _proof_failure("producer-binding-mismatch", "cycle-route")
             if _producer_operation(producer._live_review_lease,
                     Path(request.artifact_root), binding.binding["cycle_id"]):
                 return _proof_failure("active-review-lease")

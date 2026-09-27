@@ -760,8 +760,8 @@ def route_cycle_for(root: Path, route: Mapping[str, Any]) -> Optional[Dict[str, 
 
 
 def cycle_route_admission(root: Path, record: Mapping[str, Any], route: Mapping[str, Any],
-                          *, finalize: bool = False) -> Admission:
-    """D-120's one admission judgment: may ``route`` write (or seal) ``record``'s cycle?
+                          *, finalize: bool = False, validation_only: bool = False) -> Admission:
+    """D-120's one lineage judgment for a cycle route.
 
     Steps 0-4 exactly as spelled out in artifact-path-contract §42: cycle
     open, ``route``'s hash-verified lineage, the begin route's membership and
@@ -769,11 +769,14 @@ def cycle_route_admission(root: Path, record: Mapping[str, Any], route: Mapping[
     the path, and sibling-fork detection at every path node but ``route``
     itself. ``finalize=True`` adds D-120's finalize-only rule: a route with a
     still-attached T(C) continuation child cannot seal
-    (`...:superseded-route`).
+    (`...:superseded-route`). ``validation_only`` is read-only manifest
+    verification: it permits an already sealed record but never grants write
+    authority or changes the record.
     """
-    if record.get("state") != "open":
+    state = record.get("state")
+    if state != "open" and not (validation_only and state == "sealed"):
         reason = "cycle-not-open"
-        return Admission(False, reason, str(record.get("state")), [], _d120_next_action(reason))
+        return Admission(False, reason, str(state), [], _d120_next_action(reason))
     try:
         lineage = route_lineage.verified_route_lineage(dict(route), artifact_root=root)
     except route_lineage.RouteLineageError as exc:
@@ -813,6 +816,48 @@ def cycle_route_admission(root: Path, record: Mapping[str, Any], route: Mapping[
             reason = "cycle-route-binding-mismatch:superseded-route"
             return Admission(False, reason, route["route_id"], path, _d120_next_action(reason))
     return Admission(True, None, "", path, None)
+
+
+def resolve_cycle_manifest_route(root: Path, record: Mapping[str, Any],
+                                 document: Mapping[str, Any]) -> Tuple[Path, Dict[str, Any]]:
+    """Resolve and read-only admit the one route sealed by a cycle manifest.
+
+    The cycle record's route tuple remains the begin identity.  A manifest may
+    name its verified continuation leaf, so its sole route row is resolved
+    through the canonical route directory and admitted against that begin
+    identity.  This helper is safe for both pre-seal recovery and sealed replay;
+    it never changes cycle state or consults ``route_bindings``.
+    """
+    rows = document.get("routes") if isinstance(document, Mapping) else None
+    if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], Mapping):
+        raise ProducerError("completion-route-composite-mismatch", str(record.get("cycle_id", "")))
+    row = rows[0]
+    identity = artifact_lifecycle.read_root_identity(Path(root))
+    if (identity is None or row.get("artifact_root_id") != identity.artifact_root_id
+            or document.get("artifact_root_id") != identity.artifact_root_id
+            or document.get("cycle", {}).get("cycle_id") != record.get("cycle_id")):
+        raise ProducerError("completion-route-composite-mismatch", str(record.get("cycle_id", "")))
+    route_id = row.get("route_id")
+    if not isinstance(route_id, str) or not re.fullmatch(r"rt-[A-Za-z0-9][A-Za-z0-9._-]{0,126}", route_id):
+        raise ProducerError("completion-route-composite-mismatch", "route-id")
+    route_path = route_lineage.canonical_route_path(root, route_id)
+    try:
+        info = route_path.lstat()
+    except OSError as exc:
+        raise ProducerError("route-lineage-unverified", f"canonical-route-missing:{route_id}") from exc
+    if not stat.S_ISREG(info.st_mode) or route_path.is_symlink() or route_path.resolve() != route_path:
+        raise ProducerError("route-lineage-unverified", f"canonical-route-kind:{route_id}")
+    target_check = artifact_lifecycle.validate_route_target(route_path, Path(root), route_id)
+    if not target_check.ok:
+        reason = target_check.reasons[0]
+        raise ProducerError(reason.code, reason.detail)
+    route = load_route(Path(root), route_path)
+    if route.get("route_id") != route_id or route.get("route_hash") != row.get("route_hash"):
+        raise ProducerError("completion-route-hash-mismatch", route_id)
+    admission = cycle_route_admission(Path(root), record, route, finalize=True, validation_only=True)
+    if not admission.allow:
+        raise ProducerError(admission.reason or "route-lineage-unverified", admission.detail)
+    return route_path, route
 
 
 def _route_binding_entry(route_row: Mapping[str, Any], root: Path, *, is_begin: bool) -> Dict[str, Any]:
@@ -3952,8 +3997,9 @@ def _recover_exact_cycle_locked(root: Path, cycle_id: str, expected_binding: Opt
                 or artifact_manifest.manifest_digest(document) != journal.get("manifest_digest")):
             raise ProducerError("cycle-journal-manifest-mismatch", cycle_id)
         identity = artifact_lifecycle.read_root_identity(root)
+        manifest_route_file, _manifest_route = resolve_cycle_manifest_route(root, record, document)
         completion = artifact_lifecycle.evaluate_cycle_completion(
-            document, content_root=directory, route_file=Path(record["route_file"]),
+            document, content_root=directory, route_file=manifest_route_file,
             expected_root_id=identity.artifact_root_id if identity else None)
         if not completion.ok:
             raise ProducerError("completion-rejected", ";".join(v.code for v in completion.reasons))
@@ -4015,8 +4061,10 @@ def _verify_sealed_cycle_locked(root: Path, record: Mapping[str, Any],
         if (row != expected_index.manifests[cycle_id]
                 or index.cycles.get(cycle_id) != expected_index.cycles[cycle_id]):
             raise ProducerError("already-sealed-mismatch", "index-projection")
+    manifest_route_file, _manifest_route = resolve_cycle_manifest_route(root, record, document)
+    if document.get("cycle", {}).get("state") == "completed":
         completion = artifact_lifecycle.evaluate_cycle_completion(
-            document, content_root=directory, route_file=Path(record["route_file"]),
+            document, content_root=directory, route_file=manifest_route_file,
             expected_root_id=identity.artifact_root_id if identity else None)
         if not completion.ok:
             raise ProducerError("already-sealed-mismatch", "completion-evidence")
