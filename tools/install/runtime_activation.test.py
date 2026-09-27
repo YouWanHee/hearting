@@ -560,5 +560,90 @@ class RuntimeActivationConflictPreflightTest(unittest.TestCase):
                 with self.assertRaisesRegex(activation.ActivationError, "hearting-codex"):
                     activation.validate_request("codex", "refresh")
 
+class ClaudeHookGroupIdentityTest(unittest.TestCase):
+    """A hook group the user tuned is the same group, not a foreign one."""
+
+    PROJECTION = {"type": "command", "command": "python3 \"$HOME/.claude/hooks/projection.py\"", "timeout": 5}
+    NUDGE = {"type": "command", "command": "bash \"$HOME/.claude/hooks/nudge.sh\"", "timeout": 10}
+
+    def _release(self, root: Path, name: str, prompt_groups: list) -> Path:
+        release = root / name
+        (release / "adapters/claude").mkdir(parents=True)
+        (release / "adapters/claude/settings.json").write_text(json.dumps({
+            "hooks": {"UserPromptSubmit": prompt_groups},
+            "statusLine": {"type": "command", "command": activation.CLAUDE_STATUSLINE_COMMAND},
+            "env": {key: "1" for key in activation.CLAUDE_MANAGED_ENV_KEYS},
+        }), encoding="utf-8")
+        return release
+
+    def _merge(self, config: Path, release: Path, previous_release: Path) -> dict:
+        previous = {"managed_config": {"claude_hooks": json.loads(
+            (previous_release / "adapters/claude/settings.json").read_text(encoding="utf-8")
+        )["hooks"]}}
+        original = activation._config_path
+        activation._config_path = lambda *_args, **_kwargs: config
+        try:
+            return activation._merge_claude_settings(release, previous)
+        finally:
+            activation._config_path = original
+
+    def test_a_tuned_group_is_kept_once_and_a_retired_one_leaves(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            old = self._release(root, "old", [{"hooks": [self.PROJECTION]}, {"hooks": [self.NUDGE]}])
+            new = self._release(root, "new", [{"hooks": [self.PROJECTION]}])
+            tuned_projection = {"hooks": [dict(self.PROJECTION, timeout=30, **{"async": True})]}
+            tuned_nudge = {"hooks": [dict(self.NUDGE, timeout=30)]}
+            user_group = {"hooks": [{"type": "command", "command": "my-own-hook"}]}
+            config = root / "settings.json"
+            config.write_text(json.dumps({"hooks": {"UserPromptSubmit": [
+                tuned_projection, tuned_nudge, user_group,
+            ]}}), encoding="utf-8")
+
+            result = self._merge(config, new, old)
+
+            groups = json.loads(config.read_text(encoding="utf-8"))["hooks"]["UserPromptSubmit"]
+            # The tuned projection group stays as the user left it and the
+            # release copy is not appended beside it.
+            self.assertEqual(groups, [tuned_projection, user_group])
+            self.assertEqual(result["added"], 0)
+
+            # A second install of the same release changes nothing.
+            self._merge(config, new, new)
+            self.assertEqual(
+                json.loads(config.read_text(encoding="utf-8"))["hooks"]["UserPromptSubmit"],
+                [tuned_projection, user_group],
+            )
+
+    def test_an_untuned_group_still_takes_the_new_release_values(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            old = self._release(root, "old", [{"hooks": [self.PROJECTION]}])
+            changed = {"hooks": [dict(self.PROJECTION, timeout=12)]}
+            new = self._release(root, "new", [changed])
+            config = root / "settings.json"
+            config.write_text(json.dumps({"hooks": {"UserPromptSubmit": [
+                {"hooks": [self.PROJECTION]},
+            ]}}), encoding="utf-8")
+
+            self._merge(config, new, old)
+
+            self.assertEqual(
+                json.loads(config.read_text(encoding="utf-8"))["hooks"]["UserPromptSubmit"],
+                [changed],
+            )
+
+    def test_identity_is_matcher_plus_commands(self):
+        tuned = {"matcher": "Bash", "hooks": [dict(self.PROJECTION, timeout=99)]}
+        self.assertEqual(
+            activation._hook_group_identity({"matcher": "Bash", "hooks": [self.PROJECTION]}),
+            activation._hook_group_identity(tuned),
+        )
+        self.assertNotEqual(
+            activation._hook_group_identity({"matcher": "Edit", "hooks": [self.PROJECTION]}),
+            activation._hook_group_identity(tuned),
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

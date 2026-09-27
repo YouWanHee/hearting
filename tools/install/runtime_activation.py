@@ -1292,6 +1292,24 @@ def _claude_managed_values(source: dict) -> dict:
     return {"statusLine": statusline, "env": managed_env}
 
 
+def _hook_group_identity(item) -> str:
+    """Which hook group this is, ignoring values a user may tune.
+
+    A group is the hooks it runs under one matcher. Timeout, async and other
+    per-hook knobs are the user's to change; comparing whole groups made every
+    tuned group look foreign, so each install appended the template copy again
+    and the hook ran twice.
+    """
+    if not isinstance(item, dict):
+        return json.dumps(item, sort_keys=True)
+    hooks = item.get("hooks")
+    commands = sorted(
+        str(hook.get("command", "")) if isinstance(hook, dict) else json.dumps(hook, sort_keys=True)
+        for hook in (hooks if isinstance(hooks, list) else [])
+    )
+    return json.dumps([item.get("matcher"), commands])
+
+
 def _merge_claude_settings(
     active_root: Path, previous: Optional[dict], scope: str = "global"
 ) -> dict:
@@ -1326,7 +1344,21 @@ def _merge_claude_settings(
             if not isinstance(current, list) or not isinstance(old_entries, list):
                 continue
             old = {json.dumps(item, sort_keys=True) for item in old_entries}
-            kept = [item for item in current if json.dumps(item, sort_keys=True) not in old]
+            # A group the user tuned keeps its values while the release still
+            # ships that hook; once the release drops it, the tuned copy goes
+            # too instead of pointing at a script that no longer exists.
+            new_entries = source_hooks.get(event)
+            still_shipped = {
+                _hook_group_identity(item)
+                for item in (new_entries if isinstance(new_entries, list) else [])
+            }
+            retired = {_hook_group_identity(item) for item in old_entries} - still_shipped
+            kept = [
+                item
+                for item in current
+                if json.dumps(item, sort_keys=True) not in old
+                and _hook_group_identity(item) not in retired
+            ]
             if len(kept) != len(current):
                 hooks[event] = kept
                 changed = True
@@ -1336,9 +1368,9 @@ def _merge_claude_settings(
         current = hooks.setdefault(event, [])
         if not isinstance(current, list):
             raise ActivationError(f"Claude settings hook event is not a list: {event}")
-        known = {json.dumps(item, sort_keys=True) for item in current}
+        known = {_hook_group_identity(item) for item in current}
         for item in entries:
-            marker = json.dumps(item, sort_keys=True)
+            marker = _hook_group_identity(item)
             if marker in known:
                 continue
             current.append(item)
@@ -1434,8 +1466,8 @@ def _claude_settings_health(
             if not isinstance(entries, list) or not isinstance(actual.get(event), list):
                 missing = True
                 continue
-            present = {json.dumps(item, sort_keys=True) for item in actual[event]}
-            if any(json.dumps(item, sort_keys=True) not in present for item in entries):
+            present = {_hook_group_identity(item) for item in actual[event]}
+            if any(_hook_group_identity(item) not in present for item in entries):
                 missing = True
         if not _hook_command_files_present(actual):
             missing = True
@@ -2684,7 +2716,11 @@ def refresh(runtime: str, scope: str = "global") -> dict:
 def _unmerge_claude_settings(
     state: dict, scope: str, dry_run: bool = False
 ) -> List[str]:
-    """Remove only exact values the activation record still proves it owns."""
+    """Remove what the activation record still proves it owns.
+
+    Hook groups match by matcher and commands, so a copy the user tuned leaves
+    with the hooks it runs; statusLine and env values must still match exactly.
+    """
     managed_config = state.get("managed_config", {})
     if not isinstance(managed_config, dict):
         return []
@@ -2710,11 +2746,11 @@ def _unmerge_claude_settings(
             current = hooks.get(event)
             if not isinstance(current, list) or not isinstance(entries, list):
                 continue
-            managed_set = {json.dumps(item, sort_keys=True) for item in entries}
+            managed_set = {_hook_group_identity(item) for item in entries}
             kept = [
                 item
                 for item in current
-                if json.dumps(item, sort_keys=True) not in managed_set
+                if _hook_group_identity(item) not in managed_set
             ]
             if len(kept) != len(current):
                 changed = True
