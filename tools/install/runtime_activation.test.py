@@ -572,6 +572,7 @@ class ClaudeHookGroupIdentityTest(unittest.TestCase):
         (release / "adapters/claude/settings.json").write_text(json.dumps({
             "hooks": {"UserPromptSubmit": prompt_groups},
             "statusLine": {"type": "command", "command": activation.CLAUDE_STATUSLINE_COMMAND},
+            "autoMemoryEnabled": False,
             "env": {key: "1" for key in activation.CLAUDE_MANAGED_ENV_KEYS},
         }), encoding="utf-8")
         return release
