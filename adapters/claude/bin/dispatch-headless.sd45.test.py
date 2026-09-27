@@ -1020,15 +1020,17 @@ class HeadlessForegroundEnv(unittest.TestCase):
     for the background notification" with no handoff, and two owners died on a
     backgrounded call's own turn)."""
 
-    def test_background_tasks_are_disabled_and_long_commands_allowed(self):
+    def test_background_tasks_are_disabled_and_timeouts_fit_the_turn(self):
         env = WH.apply_headless_foreground_env({})
         self.assertEqual(env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"], "1")
-        self.assertGreaterEqual(int(env["BASH_MAX_TIMEOUT_MS"]), 3_600_000)
+        self.assertGreaterEqual(int(env["BASH_DEFAULT_TIMEOUT_MS"]), 600_000)
+        # Below the 1-hour foreground-scoped launch limit and the turn timeout.
+        self.assertLess(int(env["BASH_MAX_TIMEOUT_MS"]), 3_600_000)
 
-    def test_an_explicit_caller_value_wins(self):
+    def test_backgrounding_stays_off_but_caller_timeouts_win(self):
         env = WH.apply_headless_foreground_env({"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "0",
                                                 "BASH_MAX_TIMEOUT_MS": "900000"})
-        self.assertEqual(env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"], "0")
+        self.assertEqual(env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"], "1")
         self.assertEqual(env["BASH_MAX_TIMEOUT_MS"], "900000")
 
     def test_the_start_launch_env_applies_it(self):

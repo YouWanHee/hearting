@@ -849,16 +849,20 @@ PERMISSION_MODE_FLAG_VALUES = {"bypass": "bypassPermissions", "allowlist": "acce
 # worker logs ended "waiting for the background notification" with no handoff,
 # and an owner's backgrounded call later started a turn of its own whose reply
 # the supervisor took for the resume answer (2026-09-27). Headless runs keep
-# every command in the foreground and may give a long command up to two hours.
-HEADLESS_FOREGROUND_ENV = {
-    "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
-    "BASH_MAX_TIMEOUT_MS": "7200000",
+# every command in the foreground: backgrounding is always off, a command runs
+# 10 minutes unless it asks for more, and at most 50 minutes -- below the
+# 1-hour foreground-scoped launch limit and the supervisor's turn timeout.
+HEADLESS_BACKGROUND_OFF = {"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1"}
+HEADLESS_BASH_TIMEOUT_DEFAULTS = {
+    "BASH_DEFAULT_TIMEOUT_MS": "600000",
+    "BASH_MAX_TIMEOUT_MS": "3000000",
 }
 
 
 def apply_headless_foreground_env(env):
-    """Default the foreground-only settings; an explicit caller value wins."""
-    for key, value in HEADLESS_FOREGROUND_ENV.items():
+    """Force backgrounding off; default the timeouts (a caller value wins)."""
+    env.update(HEADLESS_BACKGROUND_OFF)
+    for key, value in HEADLESS_BASH_TIMEOUT_DEFAULTS.items():
         env.setdefault(key, value)
     return env
 # The allow rules a registered owner/worker contractually needs: its own

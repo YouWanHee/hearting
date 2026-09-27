@@ -447,6 +447,10 @@ class ClaudeSessionSupervisorTest(unittest.TestCase):
         folded = dict(stale, user_message_uuids=["other", mine])
         self.assertTrue(supervisor.result_answers_turn(folded, mine))
         self.assertFalse(supervisor.result_answers_turn(dict(stale, user_message_uuids=["other"]), mine))
+        # Older runtimes echo a single `user_message_uuid`.
+        self.assertTrue(supervisor.result_answers_turn(dict(stale, user_message_uuid=mine), mine))
+        peer = {"type": "result", "origin": {"kind": "peer", "name": "home-os-21"}}
+        self.assertFalse(supervisor.result_answers_turn(peer, mine))
 
     def test_terminal_marker_closes_stream_without_final_owner_turn(self):
         route = self.base / "terminal-route.json"

@@ -976,7 +976,8 @@ def result_answers_turn(result: dict[str, Any], turn_uuid: str | None = None) ->
     turn; otherwise a result with an origin belongs to a turn we did not start.
     """
     echoed = result.get("user_message_uuids")
-    if turn_uuid and isinstance(echoed, list) and turn_uuid in echoed:
+    if turn_uuid and ((isinstance(echoed, list) and turn_uuid in echoed)
+                      or result.get("user_message_uuid") == turn_uuid):
         return True
     return not result.get("origin")
 
