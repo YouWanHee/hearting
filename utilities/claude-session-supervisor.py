@@ -65,6 +65,7 @@ from dispatch_supervisor_terminal import (
     classify_session_result,
     classify_supervisor_abandonment_terminal,
     classify_supervisor_error,
+    classify_escaped_terminal_commit_error,
     reconcile_supervisor_terminal,
 )
 
@@ -193,10 +194,17 @@ def prepare_cleanup_handoff(args, ledger, claim, rows):
     # member or turn a partial report into the terminal marker's PASS evidence.
     report = slot / "cleanup" / "partial-report.md"
     cycle_id = None
+    binding_refusal = None
     if terminal.producer_lifecycle_applies(route):
-        binding = terminal.load_producer_binding(artifact_root=root, route_id=args.route_id,
-                                                 owner_attempt_id=args.parent_attempt_id)
-        cycle_id = binding.binding["cycle_id"]
+        try:
+            binding = terminal.load_producer_binding(
+                artifact_root=root, route_id=args.route_id,
+                owner_attempt_id=args.parent_attempt_id)
+            cycle_id = binding.binding["cycle_id"]
+        except terminal.TerminalCommitError as exc:
+            binding_refusal = exc.code
+            emit({"type": "dispatch.supervisor.terminal-handoff-binding-unavailable",
+                  "reason": exc.code, "detail": exc.detail})
     commit = {}
     if (slot / "terminal-commit.json").is_file():
         commit = json.loads((slot / "terminal-commit.json").read_text())
@@ -205,17 +213,24 @@ def prepare_cleanup_handoff(args, ledger, claim, rows):
                  terminal_commit_id=commit.get("terminal_commit_id", ""),
                  allowed_write_roots=[str(report)], allowed_read_roots=[str(slot)],
                  allowed_recovery_targets=[str(Path(args.route_file).resolve()), str(root.resolve())],
-                 allowed_operations=["partial-report", "read", "verify", "close-forward-recovery",
-                                     "finalize-forward-recovery"], one_use=True,
+                 allowed_operations=(["partial-report", "read", "verify"] if binding_refusal else
+                                     ["partial-report", "read", "verify", "close-forward-recovery",
+                                      "finalize-forward-recovery"]), one_use=True,
                  # Expiration is tied to a real bound submission lifetime.
                  expires_at=time.time() + args.turn_timeout + 60)
+    if binding_refusal:
+        scope["producer_binding_refusal"] = binding_refusal
     prompt = (budget_record.render_notice("budget-exhausted", remaining=0,
               threshold=args.continuation_warning_threshold)
               + f"\nUse Write only for this partial report: {report}\n"
               + "Read only the bound transaction evidence. New work and shell commands are denied. "
-              + "If forward settlement is needed, the sole shell command allowed is: "
-              + f"python3 {shlex.quote(str(ROOT / 'utilities/dispatch_terminal_commit.py'))} cleanup-recover\n"
-              + "Finish honestly with a partial/BLOCKED report if settlement cannot be proved.")
+              + ("If forward settlement is needed, the sole shell command allowed is: "
+                 + f"python3 {shlex.quote(str(ROOT / 'utilities/dispatch_terminal_commit.py'))} cleanup-recover\n"
+                 if not binding_refusal else "")
+              + (f"Producer binding unavailable ({binding_refusal}); settlement cannot be proved. "
+                 "Finish with a partial/BLOCKED report."
+                 if binding_refusal else
+                 "Finish honestly with a partial/BLOCKED report if settlement cannot be proved."))
     remaining = dict(gross_remaining=ledger.gross_remaining, stall_remaining=ledger.stall_remaining,
                      reserved_remaining=ledger.reserved_remaining)
     intent = budget_record.convert_claim_to_prompt_intent(
@@ -1981,6 +1996,16 @@ def main(argv: list[str] | None = None) -> int:
             stream_session.close()
             stream_session = None
         lease_exit = (type(exc), exc, exc.__traceback__)
+        classified = classify_escaped_terminal_commit_error(
+            exc, route_file=getattr(args, "route_file", None),
+            route_id=getattr(args, "route_id", ""),
+            owner_attempt_id=getattr(args, "parent_attempt_id", ""))
+        if classified is not None:
+            terminal, event = classified
+            if not reconcile(args, terminal):
+                return 70
+            emit(event)
+            return 70
         terminal = classify_supervisor_error(
             args.runtime_harness, f"supervisor-internal-{type(exc).__name__}"
         )

@@ -184,6 +184,28 @@ def terminal_slot(artifact_root: Path, route_id: str, owner_attempt_id: str) -> 
     return Path(artifact_root).resolve() / ".runtime" / "terminal-commits" / "v1" / _component(route_id, "route") / _component(owner_attempt_id, "owner")
 
 
+def terminal_commit_error_evidence(exc: "TerminalCommitError", *, route_file: Path | None,
+                                   route_id: str, owner_attempt_id: str) -> dict[str, str]:
+    """Best-effort next-action fields for a `TerminalCommitError` a session
+    supervisor's top-level handler is about to report (D2).
+
+    Never raises: a handler that is already reporting one failure must not
+    be able to fail a second time while trying to explain the first. The
+    terminal slot path is the one place that failure's own attempt records
+    (`_record_attempt`) already live, so it is exactly the "next action"
+    evidence a human or later reader needs -- read-only, no mutation here.
+    """
+    evidence = {"code": exc.code, "detail": (exc.detail or "")[:240]}
+    try:
+        if route_file is None:
+            return evidence
+        route = json.loads(Path(route_file).read_text(encoding="utf-8"))
+        evidence["terminal_slot"] = str(terminal_slot(Path(route["artifact_root"]), route_id, owner_attempt_id))
+    except (OSError, UnicodeError, ValueError, KeyError, TypeError):
+        pass
+    return evidence
+
+
 def _atomic_json(path: Path, value: Mapping[str, Any], *, exclusive: bool = False) -> None:
     data = _canonical(dict(value)) + b"\n"
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -394,7 +416,11 @@ def load_producer_binding(*, artifact_root: Path, route_id: str, owner_attempt_i
         value = json.loads(raw.decode())
     except (OSError, UnicodeError, ValueError) as exc:
         if not path.exists():
-            raise TerminalCommitError("producer-binding-required", str(path)) from exc
+            raise TerminalCommitError(
+                "producer-binding-required",
+                "not published at owner launch; next: the owner re-runs artifact_producer.py "
+                f"begin --require-cycle for this route, or close the route and finalize the cycle by hand: {path}",
+            ) from exc
         raise TerminalCommitError("producer-binding-mismatch", str(path)) from exc
     if not isinstance(value, dict) or value.get("contract") != CONTRACT:
         raise TerminalCommitError("producer-binding-mismatch", str(path))
@@ -1339,15 +1365,9 @@ def settle_owner_completion(jobs, status, metadata) -> TerminalCommitResult | No
         if process.state != "quiescent":
             return TerminalCommitResult("recoverable", "child-not-quiescent", process.reason)
         route = json.loads(request.route_file.read_text())
-        import artifact_producer as producer
         import workflow_state as workflow
-        # Reuse an existing immutable binding during forward recovery, including
-        # a cycle already sealed by the prior invocation.
-        binding_path = producer_binding_path(request.artifact_root, route["route_id"], request.owner_attempt_id)
-        if producer_lifecycle_applies(route) and not binding_path.exists():
-            producer.begin(request.artifact_root, route_file=request.route_file,
-                           capability=route["capability"], intensity=route["effective_intensity"],
-                           require_cycle=True, jobs=request.jobs, owner_attempt_id=request.owner_attempt_id)
+        # The binding is published at owner launch by artifact_producer.bind_owner_launch,
+        # or by the owner's own begin; settlement remains read-only (§13.53.3).
         ledger = workflow.WorkflowLedger(route["route_id"], route["route_hash"], jobs=request.jobs)
         gates = _route_module().terminal_gate_observation(route, jobs=request.jobs, exact_terminal=True)
         missing = {node: proof.get("reason", "unproven") for node, proof in gates.items() if not proof.get("passed")}

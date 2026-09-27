@@ -11,6 +11,18 @@ from replica_batch_contract import build_manifest
 
 CURRENT="attempt_schema_version=2,dispatch_depth=2,transport=headless,execution_surface=registered-headless,registered_worker=1,fallback_hop=same-harness-headless"
 
+class RuntimeOwnerLaunchPredicateTest(unittest.TestCase):
+ def test_workflow_receipt_uses_the_shared_exact_predicate(self):
+  args=type("Args",(),dict(worker_type="owner",owner_route_binding=None,
+      route_file="/route.json",dispatch_depth=1))()
+  self.assertTrue(D.is_runtime_owner_launch(args))
+  self.assertEqual(D.workflow_completion_receipt(args),",workflow_completion=runtime-v1")
+  args.dispatch_depth=2
+  self.assertFalse(D.is_runtime_owner_launch(args))
+  self.assertEqual(D.workflow_completion_receipt(args),"")
+  args.dispatch_depth=1;args.worker_type="stage"
+  self.assertFalse(D.is_runtime_owner_launch(args))
+
 def cancellation_metadata(attempt="att-cancellation-proof",portable=False):
  metadata={
   "attempt_id":attempt,"route_id":"rt-recovery",

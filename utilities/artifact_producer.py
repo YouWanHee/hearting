@@ -61,6 +61,7 @@ import artifact_manifest  # noqa: E402
 import artifact_campaign  # noqa: E402
 import route_identity  # noqa: E402
 import route_lineage  # noqa: E402
+import dispatch_contract  # noqa: E402
 import dispatch_lock_order  # noqa: E402
 import dispatch_terminal_commit  # noqa: E402
 from dispatch_contract import (  # noqa: E402
@@ -1181,6 +1182,44 @@ def _env_for(root: Path, record: Mapping[str, Any]) -> Dict[str, str]:
     }
 
 
+def bind_owner_launch(args, jobs: Path, *, environ=None) -> Optional[Dict[str, Any]]:
+    """Publish the owner binding at the registered launch seam (§13.53.3).
+
+    The wrapper has claimed the owner row but has not spawned it yet. Reusing
+    begin's resume-only success path preserves every admission check and keeps
+    settlement read-only.
+    """
+    environ = os.environ if environ is None else environ
+    if not dispatch_contract.is_runtime_owner_launch(args) or not environ.get("AGENT_ARTIFACT_CYCLE_ID"):
+        return None
+    owner_binding = getattr(args, "owner_route_binding", None)
+    route_file = (owner_binding.get("route_file") if isinstance(owner_binding, Mapping)
+                  else getattr(owner_binding, "route_file", None)) or getattr(args, "route_file", None)
+    if not route_file:
+        return None
+    try:
+        route = json.loads(Path(route_file).read_text(encoding="utf-8"))
+        root = Path(route["artifact_root"]).resolve()
+        validated_route = load_route(root, Path(route_file))
+        existing_open = route_cycle_for(root, validated_route)
+        env_cycle = environ["AGENT_ARTIFACT_CYCLE_ID"]
+        if existing_open is not None and existing_open["cycle_id"] != env_cycle:
+            raise ProducerError("producer-binding-mismatch",
+                                f"launch-cycle={env_cycle} bound={existing_open['cycle_id']}")
+        result = begin(root, route_file=Path(route_file), capability=route["capability"],
+                       intensity=route["effective_intensity"], require_cycle=True,
+                       jobs=Path(jobs), owner_attempt_id=args.attempt_id, resume_only=True)
+        if result.get("cycle_id") != env_cycle:
+            raise ProducerError("producer-binding-mismatch",
+                                f"launch-cycle={env_cycle} bound={result.get('cycle_id', '')}")
+        return result
+    except ProducerError:
+        raise
+    except Exception as exc:
+        detail = str(getattr(exc, "detail", "") or exc)
+        raise ProducerError(getattr(exc, "code", type(exc).__name__), detail) from exc
+
+
 def prepare_route_artifact_env(route_file: Path, *, start: bool, jobs: Path) -> Dict[str, str]:
     """Resolve the route's own output context; callers need not copy begin's env.
 
@@ -1540,6 +1579,7 @@ def begin(
     now: Optional[float] = None,
     jobs: Optional[Path] = None,
     owner_attempt_id: Optional[str] = None,
+    resume_only: bool = False,
 ) -> Dict[str, Any]:
     dispatch_terminal_commit.require_current_cleanup("producer-begin", jobs=jobs)
     root = Path(root).resolve()
@@ -1572,6 +1612,8 @@ def begin(
     if klass["state"] == "malformed":
         raise ProducerError("cutover-record-malformed", klass["reason"])
     if klass["state"] == "inactive-empty":
+        if resume_only:
+            raise ProducerError("producer-binding-required", "route-cycle-absent")
         # D-73: bootstrap-first identity. MUST stay above the admission lock at
         # :547 -- activate() acquires the same lock and would self-deadlock.
         activate(root,
@@ -1635,6 +1677,9 @@ def begin(
         if resplit_lock.exists() or resplit_lock.is_symlink():
             detail = _read_json(resplit_lock)
             raise ProducerError("resplit-in-progress", json.dumps(detail or {}, sort_keys=True))
+        resumable = route_cycle_for(root, route)
+        if resume_only and resumable is None:
+            raise ProducerError("producer-binding-required", "route-cycle-absent")
         campaign: Optional[Dict[str, Any]] = None
         parent = None
         campaign_reopen_event_id = None
@@ -1679,7 +1724,6 @@ def begin(
         # Idempotent per route: one open cycle per verified lineage (D-120). A
         # continuation resuming an ancestor's open cycle is the same idempotent
         # path with `rebound=True` and an extended audit record.
-        resumable = route_cycle_for(root, route)
         if resumable is not None:
             record = resumable
             admission = cycle_route_admission(root, record, route)
@@ -2708,7 +2752,12 @@ def checkpoint(
     if trigger not in CHECKPOINT_TRIGGERS:
         raise ProducerError("checkpoint-trigger-invalid", trigger)
     clock = time.time() if now is None else float(now)
-    record = _checkpoint_target(root, cycle_id, route_file)
+    try:
+        record = _checkpoint_target(root, cycle_id, route_file)
+    except ProducerError as exc:
+        if exc.code == "route-hash-drift":
+            return {"status": "skipped", "reason": "route-hash-drift", "trigger": trigger}
+        raise
     if record is None:
         return {"status": "skipped", "reason": "no-open-cycle", "trigger": trigger}
     cid = record["cycle_id"]
