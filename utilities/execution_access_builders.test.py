@@ -165,6 +165,11 @@ class ExecutionAccessBuilderTest(unittest.TestCase):
         for delivery in ("one-shot", "app-server-supervised"):
             current = self.codex.shell_command(self.codex_args(delivery), prompt, log)
             base = self.codex_base.shell_command(self.codex_args(delivery), prompt, log)
+            if delivery == "one-shot":
+                # Session persistence changed independently of access grants.
+                # Keep every permission/sandbox/path byte pinned to the base.
+                self.assertIn("codex exec --cd", base)
+                base = base.replace("codex exec --cd", "codex exec --ephemeral --cd", 1)
             self.assertEqual(base, current)
         for delivery in ("one-shot", "session-resume-supervised"):
             current = self.claude.shell_command(self.claude_args(delivery), prompt, log)
