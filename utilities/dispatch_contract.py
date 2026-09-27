@@ -375,6 +375,10 @@ ATTEMPT_TERMINAL_EVIDENCE_KEYS = {
     "terminal_conflicts_b64",
     "receipt_state",
     "marker_state",
+    # Bounded, sanitized diagnostics written only when an escaped terminal
+    # commit error is classified; these carry no route authority.
+    "terminal_commit_detail",
+    "terminal_commit_slot",
     # SD-111 P2 (D-4): the delivery-intent 8-field allowlist. Stamped once by
     # `_delivery_intent_values()` at the one `open|running -> done` edge a row
     # actually takes (W1-W4); immutable afterward (§4.4) -- a later
@@ -9387,10 +9391,16 @@ def resolve_terminal_conflict(
     return values
 
 
+def is_runtime_owner_launch(args) -> bool:
+    """Whether this launch is a registered depth-1 route owner."""
+    bound = getattr(args, "owner_route_binding", None) or getattr(args, "route_file", None)
+    return bool(getattr(args, "worker_type", None) == "owner" and bound
+                and int(getattr(args, "dispatch_depth", 0)) == 1)
+
+
 def workflow_completion_receipt(args) -> str:
     """Seal who finishes a newly launched route owner, across all adapters."""
-    bound = getattr(args, "owner_route_binding", None) or getattr(args, "route_file", None)
-    if getattr(args, "worker_type", None) == "owner" and bound and int(args.dispatch_depth) == 1:
+    if is_runtime_owner_launch(args):
         return ",workflow_completion=runtime-v1"
     return ""
 

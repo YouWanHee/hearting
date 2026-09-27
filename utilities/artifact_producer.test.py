@@ -2815,6 +2815,18 @@ class QuickOwnerBindingIntegrationTest(ProducerTestBase):
         self.assertEqual(binding.binding["cycle_id"], result["cycle_id"])
         self.assertEqual(P.begin(self.root, **kwargs)["cycle_id"], result["cycle_id"])
         self.assertEqual(len(P.list_cycle_records(self.root)), 1)
+        import worker_bootstrap
+        scope = worker_bootstrap.resolve_node_scope(route, node["id"], {}, parent_attempt_id=owner)
+        self.assertEqual(scope.source, "producer-binding")
+
+    def test_all_launch_wrappers_bind_after_claim_before_spawn(self):
+        root = Path(__file__).resolve().parents[1]
+        for harness in ("claude", "codex", "opencode"):
+            source = (root / "adapters" / harness / "bin" / "dispatch-headless.py").read_text()
+            self.assertIn("bind_owner_launch,", source)
+            call = source.index("bind_owner_launch(args, jobs)")
+            self.assertLess(source.index("prompt_path.write_text(prompt_text"), call)
+            self.assertLess(call, source.index("spawn_claimed_attempt(", call))
 
 
 class TerminalTransactionIntegrationTest(ProducerTestBase):
@@ -3255,6 +3267,146 @@ class RouteLaunchContextTest(ProducerTestBase):
         self.assertEqual(len(list(P.list_cycle_records(self.root))), 1)
         self.assertEqual(P.read_cycle_record(self.root, env["AGENT_ARTIFACT_CYCLE_ID"])["route_id"], route["route_id"])
         self.assertEqual(Path(env["AGENT_ARTIFACT_OUTPUT_DIR"]), Path(env["AGENT_ARTIFACT_CYCLE_DIR"]) / "artifacts")
+
+
+class OwnerLaunchBindingTest(ProducerTestBase):
+    def _prepared_owner(self):
+        from types import SimpleNamespace
+        self.activate()
+        route, route_file = self.route("quick")
+        launch_env = P.prepare_route_artifact_env(route_file, start=True, jobs=self.jobs)
+        owner = "att-launch-binding"
+        node = route["nodes"][0]
+        metadata = dict(attempt_id=owner, worker_type="owner", dispatch_depth="1",
+            registered_worker="1", harness="codex", capability="autopilot-code",
+            capability_mode="dev", intensity="quick", route_file=str(route_file),
+            route_id=route["route_id"], route_hash=route["route_hash"], route_node=node["id"],
+            registry_digest=route["registry_digest"], completion_gate=node["completion_gate"],
+            write_scope=";".join(node["write_scope"]))
+        self.jobs.write_text("2026-09-27T00:00:00Z\topen\t" + str(R.ROOT) + "\t" + str(R.ROOT)
+            + "\towner\t" + ",".join(f"{k}={v}" for k,v in metadata.items()) + "\n", encoding="utf-8")
+        args = SimpleNamespace(worker_type="owner", dispatch_depth=1, route_file=str(route_file),
+                               owner_route_binding=None, attempt_id=owner)
+        return route, route_file, launch_env, owner, args
+
+    def test_resume_only_owner_launch_publishes_and_replays_binding(self):
+        route, route_file, launch_env, owner, args = self._prepared_owner()
+        self.assertFalse(P.dispatch_terminal_commit.producer_binding_path(
+            self.root, route["route_id"], "att-launch-binding").exists())
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(self.jobs)}):
+            result = P.bind_owner_launch(args, self.jobs, environ=launch_env)
+            binding_path = P.dispatch_terminal_commit.producer_binding_path(self.root, route["route_id"], owner)
+            first = binding_path.read_bytes()
+            replay = P.bind_owner_launch(args, self.jobs, environ=launch_env)
+            self.assertEqual(replay["status"], "resumed")
+            self.assertEqual(binding_path.read_bytes(), first)
+            self.assertEqual(result["cycle_id"], launch_env["AGENT_ARTIFACT_CYCLE_ID"])
+            import worker_bootstrap
+            scope = worker_bootstrap.resolve_node_scope(
+                route, route["nodes"][0]["id"], {}, parent_attempt_id=owner)
+            self.assertEqual(scope.source, "producer-binding")
+            owner_env = {"AGENT_DISPATCH_ATTEMPT_ID": owner, "AGENT_DISPATCH_JOBS": str(self.jobs)}
+            with mock.patch.dict(os.environ, owner_env):
+                P.begin(self.root, route_file=route_file, capability="autopilot-code", intensity="quick",
+                        jobs=self.jobs, owner_attempt_id=owner)
+            self.assertEqual(binding_path.read_bytes(), first)
+        self.assertEqual(len(P.list_cycle_records(self.root)), 1)
+
+    def test_resume_only_refusals_never_write_binding_or_open_another_cycle(self):
+        import artifact_lifecycle
+        scenarios = ("route-closed", "campaign-inactive", "resplit", "no-open-cycle",
+                     "sealed-only", "duplicate-open", "cycle-mismatch", "foreign-owner")
+        for scenario in scenarios:
+            with self.subTest(scenario=scenario):
+                fixture = OwnerLaunchBindingTest(); fixture.setUp()
+                try:
+                    route, route_file, launch_env, owner, args = fixture._prepared_owner()
+                    binding = P.dispatch_terminal_commit.producer_binding_path(fixture.root, route["route_id"], owner)
+                    expected = None
+                    record = P.read_cycle_record(fixture.root, launch_env["AGENT_ARTIFACT_CYCLE_ID"])
+                    if scenario == "route-closed":
+                        outcome = artifact_lifecycle.canonical_outcome_path(fixture.root, route["route_id"])
+                        outcome.parent.mkdir(parents=True, exist_ok=True); outcome.write_text("{}")
+                        expected = "route-already-closed"
+                    elif scenario == "campaign-inactive":
+                        campaign = P.read_campaign(fixture.root, record["campaign_id"])
+                        campaign["state"] = "abandoned"
+                        P._campaign_path(fixture.root, record["campaign_id"], campaign).write_text(json.dumps(campaign))
+                        expected = "campaign-not-active"
+                    elif scenario == "resplit":
+                        (P.producer_dir(fixture.root) / "resplit.lock").write_text("{}")
+                        expected = "resplit-in-progress"
+                    elif scenario == "no-open-cycle":
+                        (P.producer_dir(fixture.root) / "cycles" / f"{record['cycle_id']}.json").unlink()
+                        expected = "producer-binding-required"
+                    elif scenario == "sealed-only":
+                        record["state"] = "sealed"
+                        (P.producer_dir(fixture.root) / "cycles" / f"{record['cycle_id']}.json").write_text(json.dumps(record))
+                        expected = "producer-binding-required"
+                    elif scenario == "duplicate-open":
+                        duplicate = dict(record, cycle_id="cyc_" + "e" * 32)
+                        (P.producer_dir(fixture.root) / "cycles" / f"{duplicate['cycle_id']}.json").write_text(json.dumps(duplicate))
+                        expected = "route-cycle-binding-ambiguous"
+                    elif scenario == "cycle-mismatch":
+                        launch_env = dict(launch_env, AGENT_ARTIFACT_CYCLE_ID="cyc_" + "e" * 32)
+                        expected = "producer-binding-mismatch"
+                    elif scenario == "foreign-owner":
+                        _other_route, other_file = fixture.route("quick", slug="other-owner-route")
+                        meta = D.parse_registry_metadata(fixture.jobs.read_text().split("\t", 5)[5])
+                        meta.update(route_file=str(other_file), route_id="other", route_hash="sha256:" + "a" * 64)
+                        fields = fixture.jobs.read_text().strip().split("\t"); fields[5] = ",".join(f"{k}={v}" for k,v in meta.items())
+                        fixture.jobs.write_text("\t".join(fields) + "\n")
+                        expected = "route-identity-unverified"
+                    with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(fixture.jobs)}):
+                        with self.assertRaises(P.ProducerError) as caught:
+                            P.bind_owner_launch(args, fixture.jobs, environ=launch_env)
+                    self.assertEqual(caught.exception.code, expected)
+                    self.assertFalse(binding.exists())
+                    expected_cycles = 0 if scenario == "no-open-cycle" else 2 if scenario == "duplicate-open" else 1
+                    self.assertEqual(len(P.list_cycle_records(fixture.root)), expected_cycles)
+                finally:
+                    fixture.doCleanups()
+
+    def test_nonowner_or_missing_cycle_context_is_a_noop(self):
+        route, route_file, launch_env, owner, args = self._prepared_owner()
+        binding = P.dispatch_terminal_commit.producer_binding_path(self.root, route["route_id"], owner)
+        args.worker_type = "stage"
+        self.assertIsNone(P.bind_owner_launch(args, self.jobs, environ=launch_env))
+        args.worker_type = "owner"
+        self.assertIsNone(P.bind_owner_launch(args, self.jobs, environ={}))
+        self.assertFalse(binding.exists())
+        self.assertEqual(len(P.list_cycle_records(self.root)), 1)
+
+    def test_resume_only_on_inactive_empty_root_does_not_activate_or_create_cycle(self):
+        route, route_file = self.route("quick")
+        with self.assertRaises(P.ProducerError) as caught:
+            P.begin(self.root, route_file=route_file, capability="autopilot-code", intensity="quick",
+                    jobs=self.jobs, require_cycle=True, resume_only=True)
+        self.assertEqual((caught.exception.code, caught.exception.detail),
+                         ("producer-binding-required", "route-cycle-absent"))
+        self.assertEqual(P.classify_root(self.root)["state"], "inactive-empty")
+        self.assertEqual(list(P.list_cycle_records(self.root)), [])
+
+    def test_open_cycle_selector_distinguishes_drift_and_duplicate_records(self):
+        self.activate()
+        route, route_file = self.route()
+        result = P.begin(self.root, route_file=route_file, capability="autopilot-code", intensity="direct")
+        record = P.route_cycle_for(self.root, route)
+        self.assertEqual(record["cycle_id"], result["cycle_id"])
+        drift = dict(route, route_hash="sha256:" + "f" * 64)
+        record_path = P.producer_dir(self.root) / "cycles" / f"{result['cycle_id']}.json"
+        original = record_path.read_bytes()
+        changed = dict(record, route_hash=drift["route_hash"])
+        record_path.write_text(json.dumps(changed), encoding="utf-8")
+        checkpoint = P.checkpoint(self.root, route_file=route_file, trigger="explicit")
+        self.assertEqual((checkpoint["status"], checkpoint["reason"]), ("skipped", "route-hash-drift"))
+        record_path.write_bytes(original)
+        duplicate = dict(record, cycle_id="cyc_" + "f" * 32)
+        (P.producer_dir(self.root) / "cycles" / f"{duplicate['cycle_id']}.json").write_text(
+            json.dumps(duplicate), encoding="utf-8")
+        with self.assertRaises(P.ProducerError) as caught:
+            P.route_cycle_for(self.root, route)
+        self.assertEqual(caught.exception.code, "route-cycle-binding-ambiguous")
 
 
 class CycleBindingAndIndexOrderTest(ProducerTestBase):

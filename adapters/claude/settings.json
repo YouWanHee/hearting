@@ -447,7 +447,8 @@
           {
             "type": "command",
             "command": "python3 \"$HOME/.claude/hooks/herdr-session-projection.py\"",
-            "timeout": 5
+            "timeout": 30,
+            "async": true
           }
         ]
       },
@@ -456,7 +457,7 @@
           {
             "type": "command",
             "command": "bash \"$HOME/.claude/hooks/mem-recall-inject.sh\"",
-            "timeout": 3
+            "timeout": 10
           }
         ]
       },

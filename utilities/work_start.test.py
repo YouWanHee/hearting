@@ -449,6 +449,20 @@ class WorkStartTest(unittest.TestCase):
         self.assertEqual(result["reason"], "work-parent-recovery-required", result)
         self.assertEqual(self.calls, [])
 
+    def test_successor_session_harvests_a_finished_route_but_not_a_live_one(self):
+        # A supervisor hands the route to another session: finished attempts
+        # carry only a result, so the successor reads it instead of being told
+        # to recover a parent it can never become.
+        self.start(); self.ready = self.released = True; self.start()
+        self.assertEqual(len(self.calls), 3)
+        W.default_parent_session_id.return_value = "successor"
+        live = self.start()
+        self.assertEqual(live["reason"], "work-parent-recovery-required", live)
+        self.jobs.write_text(self.jobs.read_text().replace("\topen\t", "\tdone\t"))
+        result = self.start()
+        self.assertEqual(result["state"], "completed", result)
+        self.assertEqual(len(self.calls), 3)
+
     def test_resume_reuses_witnessed_parent_and_refuses_sibling_or_missing_proof(self):
         self.start()
         W.default_parent_session_id.return_value = "inherited"
