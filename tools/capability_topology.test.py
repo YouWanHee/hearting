@@ -17,6 +17,8 @@ S = importlib.util.spec_from_file_location("topology", P); T = importlib.util.mo
 # `autopilot-design`, `autopilot-draft`, `autopilot-refine`, `autopilot-spec`
 # also changed intentionally in this cycle (two explicit frame-leg sibling
 # nodes replacing the removed `frame`/`frame-contrarian` parallel group).
+# 2026-09-27 SD-160: only group digests re-frozen after removing required
+# cross-harness axes; node fields, width, persona and budget remain unchanged.
 PRESERVED_FULL_FIELD_DIGESTS = {
     ('analyze-project', ('code', 'doc', 'paper')): (
         "75b8d6819bd9c94e787225b3c9673901037f95e9d7a80bd4fd774a0a4fdc7214",
@@ -32,46 +34,46 @@ PRESERVED_FULL_FIELD_DIGESTS = {
     ),
     ("autopilot-apply", ('default',)): (
         "eb9d1ee50cf6d9c88b96a08bace1f06985cdfccaa87be448aa85307174632eac",
-        "926c9eff35134529d23574f9052da464493b09fd52cb98da03785ff7798669d7",
+        "a9b802f929cb1efdf839e4bae6f9f7c03bad3466d6193b9ff23d22a4ba9faaa9",
     ),
     ("autopilot-code", ('audit', 'debug', 'dev')): (
         "98bbd87ff7440870fc16e8a1dd8beb6cf13bf3c2385a3fb8d17b848674078f4a",
-        "3275d7d0fe9e8295fe761e5f3673070f3182ac0535ceb98a3935438848623ffe",
+        "c04f23733b6f6ad650d53b8997143b735c771631b5eaa8fb8679bb2f38555cbc",
     ),
     ("autopilot-design", ('default',)): (
         "6417f8e67ea088edc2ee40703ea44e5aae2c0c27c7ca623d1deb408ebf00b1e8",
-        "523b32502063400fd601697545d5cd4ae859308588b7176c0fa648f525e5be5e",
+        "535ac7afb655d7d8040841733ed2b46bb7cb7d467279b7ed83cf34496659fca5",
     ),
     ("autopilot-draft", ('doc', 'paper', 'presentation')): (
         "948eae0caa20b7f15d45cf51635fc2d58d8bf13b96edc2325a0061570a2caa77",
-        "1bb17c28bdb34877667242530f1f0af2c3a330caa77620f1b60734f663f5f72f",
+        "e51f3d86b5ead6ac1573610fe55fb0994de2b86658fb1ef09a6c227bc487b0cb",
     ),
     ("autopilot-lab", ('setup',)): (
         "5b2a8597888c3e3ffed75c389af2b4b5e01d14503e883b2a684be2d0ecb45178",
-        "dd5e1116e2b49489adc69f022cc69f8f91337688de5ab08e4963a70c20e1f85a",
+        "d06d03e9406c69a6d152d7c828ae6f271f5a3bf6588790d6d7b9d8509b7df964",
     ),
     ("autopilot-lab", ('eval',)): (
         "df6ae2485880a9b4edd9c284409c3a3491862d2a8aeb4de274d685870dc83527",
-        "07c9f4e193ff843ba33a1da2a7d4af662070b4d3ebf235f07173802d2e928b51",
+        "0a81c46ba217f0b843cf8f2b2386c8fe1412c0029f59b3c112f13b1f7e19edda",
     ),
     # refine re-frozen again the same cycle: `review` keeps its
     # `preview-disposition` human-gate continuation (user decision 2026-09-10 --
     # an approval before the edit applies, not a direction gate to absorb).
     ("autopilot-refine", ('default',)): (
         "f0aa0bf8bbbb0c9dff3ab060674bc0a9c7d23a40e46d823e48817aef0ae5206f",
-        "17e5d03f2aaba86c476743ee29b453e0961455973c3c347cac6a9634c217b529",
+        "e3ccd3e7ac35fe27b3fa77ae5a9744d8dbee11c8ccf223a1c258aaaf905d889d",
     ),
     ("autopilot-research", ('academic', 'market', 'technology')): (
         "8b9ddb8934f860c3ecd1cc53cbd25435e4516b82b2b2f5a0de5c40f45032a0b2",
-        "637d726f855db89ed54a3fd48362488d5e90a4d3a1b59919447f5b040075807f",
+        "200eacddabdd14d82ffc0da1233434eb9d78ed3a64a0f9ee3f925523559543e9",
     ),
     ("autopilot-ship", ('default',)): (
         "9082445b19699eee098dbbb307b8edf3339a3f3ea65ef84f8c1e688c1f16799c",
-        "913de8c5f6200a539e6fe19ec488c42120dc6e4e0a0cb2149f33a3aa8cd4f326",
+        "228bb08fccc6ebc2dd7ab6dc77e9714c52cb8d7f12b0a283e61cac3613532f5e",
     ),
     ("autopilot-spec", ('api', 'app', 'cli', 'library', 'research', 'update')): (
         "75c2f90d642e06e0de837d66e96b250218937c14b4fdea590811ba6ab6dd4226",
-        "f7bf589ba369a08a7031c71db8a2523b250af84be5ef6e0e4d9b00a1cdcb897c",
+        "e70da359341bbe7261db03b9d4c9bbeebb72f7ce46dd4ed7c8e05174eb76cf4d",
     ),
 }
 
@@ -232,7 +234,7 @@ class TestTopology(unittest.TestCase):
                 "strong":2,"thorough":3,"adversarial":3})
         for group in groups:
             self.assertEqual(group["join_policy"],"all")
-            self.assertEqual(group["independence_axes"],["cross-harness","model-profile","perspective"])
+            self.assertEqual(group["independence_axes"],["model-profile","perspective"])
             self.assertEqual(group["legs"][0]["suffix"],"anchor")
         # Framing anchors (2-way from standard) exist exactly on the generative
         # recipes whose direction is set in-pipeline; prescriptive/bounded
@@ -275,8 +277,8 @@ class TestTopology(unittest.TestCase):
             "requires a direct review arbiter": lambda g: g["parallel_groups"][0].update(node="test"),
             "standard\\+ tier": lambda g: g["parallel_groups"][2].update(min_intensity="quick"),
             "widths must be monotonic integers": lambda g: g["parallel_groups"][2]["width_by_intensity"].update(strong=5),
-            "cross-harness axis required":
-                lambda g: g["parallel_groups"][2].update(independence_axes=["model-profile","perspective"]),
+            "perspective axis required":
+                lambda g: g["parallel_groups"][2].update(independence_axes=["cross-harness","model-profile"]),
         }
         for pattern,mutate in code_cases.items():
             with self.subTest(pattern=pattern):

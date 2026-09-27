@@ -1066,23 +1066,98 @@ class FallbackTest(unittest.TestCase):
  def _usage_states(self,limited=()):
   return {h:("limited" if h in limited else "ok")
           for h in ("claude","codex","opencode")}
- def test_ac13_parent_cross_never_overrides_affinity_or_eligibility(self):
-  # Precedence: sealed affinity (step 3) beats parent-cross (step 4), so an
-  # owner-family affinity keeps its head and the tail alone is partitioned.
+ def test_sd160_same_family_affinity_keeps_sole_gate_diagnostic(self):
   node=self._gate_node(affinity="opencode")
   route=self._gate_route(owner="opencode")
   with mock.patch.object(F,"_usage_states",return_value=self._usage_states()):
    hops,context=F.ordered_fallback_hops(route,node,self.jobs,
      parent_identity={"parent_harness":"opencode","parent_transport":"headless","parent_sandbox":"workspace-write"})
   self.assertEqual(hops[0]["candidates"][0]["child_harness"],"opencode")
-  self.assertEqual(context["parent_cross"],"degraded")
-  self.assertEqual(context["parent_cross_cause"],"affinity-pinned")
+  self.assertEqual(context["parent_cross"],"not-applicable")
+  self.assertEqual(context["parent_cross_cause"],"-")
  def _counts(self,**counts):
   return {h:counts.get(h,0) for h in ("claude","codex","opencode")}
- def test_ac13_selection_precedence_seven_steps(self):
-  # AC 13: SD-101 declares seven ordered selection steps and the fixture set
-  # only ever covered step 3 beating step 4. Each subtest below sets a LOWER
-  # step to prefer a different harness and asserts the higher step still wins.
+ def _sd160_review_context(self,*,codex=71,counts=(3,27),affinity="unspecified",
+                           limited=(),kind="review-worker",legacy_cross=False):
+  parent={"parent_harness":"codex","parent_transport":"headless",
+          "parent_sandbox":"workspace-write"}
+  node=self._gate_node(kind=kind,affinity=affinity)
+  node.update(id="review",unit="research/plan-review",dispatch_depth=2,
+              model_profile="balanced-deep",parent_cross_preference=legacy_cross)
+  node["harness_policy"]={"primary":["claude","codex"],"relief":[],
+                          "last_resort":[],"promote_relief_below":0}
+  node["fallback_hops"]=[
+   {"ordinal":1,"fallback_hop":"same-harness-headless","candidates":[
+    {**parent,"child_harness":"codex","status":"supported"}]},
+   {"ordinal":2,"fallback_hop":"cross-harness-headless","candidates":[
+    {**parent,"child_harness":"claude","status":"supported"}]},
+  ]
+  route=self._gate_route()
+  route["dispatch_allocation"].update(strategy="balanced",usage_gate_used_percent=85,
+    depth_affinity={"owner":"claude","worker":"codex"},
+    depth_affinity_weight=0.65,usage_headroom_exponent=2)
+  before=json.dumps((route,node),sort_keys=True)
+  with mock.patch.object(F,"_usage_states",return_value=self._usage_states(limited)), \
+       mock.patch.object(F,"attempt_counts",return_value=self._counts(claude=counts[0],codex=counts[1])), \
+       mock.patch.object(F.CAPACITY,"capacity_scores",return_value={"claude":8.,"codex":float(codex),"opencode":0.}):
+   hops,context=F.ordered_fallback_hops(route,node,self.jobs,parent_identity=parent)
+  self.assertEqual(json.dumps((route,node),sort_keys=True),before)
+  return route,node,hops,context
+
+ def test_sd160_real_incidents_keep_capacity_order_for_independent_review(self):
+  for codex,counts,affinity in [(71,(3,27),"unspecified"),(77,(9,21),"diverse")]:
+   for kind,legacy in [("review-worker",False),("pipeline-stage",True)]:
+    with self.subTest(codex=codex,kind=kind,legacy=legacy):
+     _,_,hops,context=self._sd160_review_context(codex=codex,counts=counts,
+       affinity=affinity,kind=kind,legacy_cross=legacy)
+     self.assertEqual(context["rank"],["codex","claude"])
+     self.assertEqual(hops[0]["fallback_hop"],"same-harness-headless")
+     self.assertEqual(context["parent_cross"],"not-applicable")
+     self.assertEqual(context["sole_gate"],"ok")
+
+ def test_sd160_review_affinity_cannot_lift_gated_harness(self):
+  _,_,_,context=self._sd160_review_context(affinity="claude")
+  self.assertEqual(context["rank"],["codex","claude"])
+  # Both candidates gated: preserve the maximum-headroom scarcity fallback.
+  _,_,_,context=self._sd160_review_context(codex=12,affinity="claude")
+  self.assertEqual(context["rank"],["codex","claude"])
+
+ def test_sd160_review_hard_limit_still_excludes_roomy_harness(self):
+  _,_,hops,context=self._sd160_review_context(limited=("codex",))
+  self.assertEqual(context["rank"],["claude","codex"])
+  self.assertEqual(hops[1]["candidates"][0]["_allocation_skip"],"usage-limited")
+  self.assertEqual(context["sole_gate"],"ok")
+
+ def test_sd160_final_fallback_receipt_records_actual_child_without_cross_degradation(self):
+  path=self.route(same_status="supported"); route=json.loads(path.read_text())
+  node=next(n for n in route["nodes"] if n["id"]=="plan-check")
+  _,_,_,context=self._sd160_review_context()
+  # Model a failed ranked head followed by a successful later candidate.
+  # Historical context must not revive obsolete same-harness degradation.
+  context.update(parent_cross="degraded",parent_cross_cause="affinity-pinned")
+  args=SimpleNamespace(action="start",slug="actual-review",jobs=self.jobs,route=path)
+  for harness,sole in [("claude","ok"),("codex","ok"),("opencode","degraded")]:
+   with self.subTest(harness=harness):
+    out=io.StringIO()
+    with mock.patch.dict(os.environ,{"AGENT_HOME":str(ROOT),"AGENT_DISPATCH_JOBS":str(self.jobs)}), contextlib.redirect_stdout(out):
+     F._emit_child_success(args,route,node,context,self.tuple(harness,"supported"),
+       attempt_id="att-final-"+harness,fallback_hop="same-harness-headless" if harness=="codex" else "cross-harness-headless")
+    receipt=self.cli_verdict(out.getvalue())
+    self.assertEqual(receipt["parent_cross"],"not-applicable")
+    self.assertEqual(receipt["parent_cross_cause"],"-")
+    self.assertEqual(receipt["sole_gate"],sole)
+    saved=[json.loads(line) for line in Path(receipt["allocation_ledger"]).read_text().splitlines()]
+    actual=next(row for row in saved if row["attempt_id"]=="att-final-"+harness)
+    self.assertEqual(actual["child_harness"],harness)
+    self.assertEqual(actual["unit"],node["unit"])
+    self.assertEqual(actual["capacity"],context["capacity"])
+    self.assertEqual(actual["parent_cross"],"not-applicable")
+    self.assertEqual(actual["sole_gate"],sole)
+  ledger=Path(self.tmp.name)/"degradations"/f"{route['route_id']}.jsonl"
+  rows=[json.loads(line) for line in ledger.read_text().splitlines()]
+  self.assertFalse([row for row in rows if row.get("reason")=="parent-cross-same-harness"])
+  self.assertEqual(len([row for row in rows if row.get("reason")=="sole-gate-non-peer-harness"]),1)
+ def test_sd160_existing_eligibility_quality_and_allocation_precedence(self):
   parent={"parent_harness":"opencode","parent_transport":"headless",
           "parent_sandbox":"workspace-write"}
   def ranked(node,route,*,counts=None,identity=parent,states=None):
@@ -1093,12 +1168,6 @@ class FallbackTest(unittest.TestCase):
     _hops,context=F.ordered_fallback_hops(route,node,self.jobs,parent_identity=identity)
    return context
 
-  # 1 explicit target: an explicit per-node harness pin in dispatch-defaults is
-  # sealed into the route as a literal `harness_affinity` at compile time, and
-  # is the only user override SD-100 recognizes. This asserts PRECEDENCE, not
-  # just that sealing happened: the pinned family stays the head while every
-  # lower step -- band, capacity, least-recent, declared order -- is set to
-  # prefer a different one, and the same node WITHOUT the pin follows them.
   with self.subTest(step=1,rule="explicit target"):
    with dispatch_defaults_config_text(
      "schema_version: 1\ndepth1_owner: [claude, codex]\nopencode:\n  relief_only: true\n"
@@ -1113,47 +1182,31 @@ class FallbackTest(unittest.TestCase):
    lower=self._counts(claude=1,codex=9,opencode=0)
    context=ranked(pinned,self._gate_route(),counts=lower,identity=None)
    self.assertEqual(context["rank"][0],"codex")
-   # discriminating: without the seal the lower steps really do choose another
    unpinned=self._gate_node()
    unpinned["harness_policy"]=pinned["harness_policy"]
    context=ranked(unpinned,self._gate_route(),counts=lower,identity=None)
    self.assertNotEqual(context["rank"][0],"codex")
 
   with self.subTest(step=2,rule="hard eligibility"):
-   # 2 hard eligibility over everything below it: a harness whose checked tuple
-   # is not `supported` is not a candidate at all, so neither a sealed affinity
-   # naming it nor the parent-cross partition can hoist it into the band.
    node=self._gate_node(affinity="codex")
    node["fallback_hops"][1]["candidates"][0]["status"]="unsupported"
    context=ranked(node,self._gate_route())
    self.assertNotIn("codex",context["rank"])
    self.assertEqual(context["rank"][0],"claude")
 
-  with self.subTest(step=3,rule="affinity over parent-cross"):
-   # 3 sealed literal affinity over parent-cross: the affinity names the OWNER
-   # family, which step 4 would move to the tail; the head is kept and the
-   # degradation is recorded instead of being reordered away.
+  with self.subTest(step=3,rule="same-family affinity"):
    context=ranked(self._gate_node(affinity="opencode"),self._gate_route())
    self.assertEqual(context["rank"][0],"opencode")
-   self.assertEqual(context["parent_cross"],"degraded")
-   self.assertEqual(context["parent_cross_cause"],"affinity-pinned")
+   self.assertEqual(context["parent_cross"],"not-applicable")
+   self.assertEqual(context["parent_cross_cause"],"-")
 
-  with self.subTest(step=4,rule="parent-cross over band"):
-   # 4 parent-cross over quality band / capacity and least-recent: claude and
-   # codex are both cross+quality-peer, opencode is the owner family. Even with
-   # opencode holding the fewest recent attempts (step 6 would put it first),
-   # the cross block stays ahead of it.
+  with self.subTest(step=4,rule="quality peer over non-peer"):
    context=ranked(self._gate_node(),self._gate_route(),
                   counts=self._counts(claude=5,codex=6,opencode=0))
    self.assertEqual(context["rank"],["claude","codex","opencode"])
-   self.assertEqual(context["parent_cross"],"ok")
+   self.assertEqual(context["parent_cross"],"not-applicable")
 
   with self.subTest(step=5,rule="band over least-recent"):
-   # 5 quality band / capacity over least-recent: under the capacity-aware
-   # strategy the node's own band is consulted before attempt counts, so a
-   # last_resort harness with zero recent attempts stays behind the band.
-   # `identity=None` removes step 4 from the picture so this isolates 5 vs 6 --
-   # least-recent alone would rank [opencode, codex, claude].
    node=self._gate_node()
    node["harness_policy"]={"primary":["claude"],"relief":["codex"],
                            "last_resort":["opencode"],"promote_relief_below":0}
@@ -1167,9 +1220,6 @@ class FallbackTest(unittest.TestCase):
    self.assertEqual(context["quality_band"],"primary")
 
   with self.subTest(step=6,rule="least-recent over declared order"):
-   # 6 least-recent over declared order: the declared order is
-   # [claude, codex, opencode], so codex only precedes claude because it holds
-   # fewer recent attempts. Step 7 alone would have kept claude first.
    node=self._gate_node()
    context=ranked(node,self._gate_route(),
                   counts=self._counts(claude=3,codex=1,opencode=0),
@@ -1177,8 +1227,6 @@ class FallbackTest(unittest.TestCase):
    self.assertEqual(context["rank"],["opencode","codex","claude"])
 
   with self.subTest(step=7,rule="declared order tie-break"):
-   # 7 declared order as the final tie-break: with every count equal, only the
-   # declared order decides, and reversing it reverses the rank.
    route=self._gate_route()
    context=ranked(node,route,identity=None)
    self.assertEqual(context["rank"],["claude","codex","opencode"])
@@ -1186,49 +1234,38 @@ class FallbackTest(unittest.TestCase):
    route["dispatch_allocation"]["harness_order"]=["opencode","codex","claude"]
    context=ranked(node,route,identity=None)
    self.assertEqual(context["rank"],["opencode","codex","claude"])
- def test_ac14_stable_partition_preserves_block_internal_order(self):
-  # Cross block [claude, codex] and non-cross [opencode] keep their internal
-  # least-recent order; only the two blocks are concatenated.
+ def test_sd160_quality_peer_order_preserves_allocation_order(self):
   node=self._gate_node()
   route=self._gate_route(owner="opencode")
   with mock.patch.object(F,"_usage_states",return_value=self._usage_states()):
    hops,context=F.ordered_fallback_hops(route,node,self.jobs,
      parent_identity={"parent_harness":"opencode","parent_transport":"headless","parent_sandbox":"workspace-write"})
   selected=[hop["candidates"][0]["child_harness"] for hop in hops[:len(context["rank"])]]
-  self.assertEqual(context["parent_cross"],"ok")
+  self.assertEqual(context["parent_cross"],"not-applicable")
   self.assertEqual(selected,["claude","codex","opencode"])
   self.assertEqual([h for h in selected if h in {"claude","codex"}],
                    ["claude","codex"])
   self.assertEqual([h for h in selected if h not in {"claude","codex"}],
                    ["opencode"])
- def test_ac15_affinity_head_is_kept_and_tail_only_partitioned(self):
+ def test_sd160_affinity_head_is_normal_on_owner_family(self):
   node=self._gate_node(affinity="opencode")
   route=self._gate_route(owner="opencode")
   with mock.patch.object(F,"_usage_states",return_value=self._usage_states()):
    hops,context=F.ordered_fallback_hops(route,node,self.jobs,
      parent_identity={"parent_harness":"opencode","parent_transport":"headless","parent_sandbox":"workspace-write"})
   self.assertEqual(hops[0]["candidates"][0]["child_harness"],"opencode")
-  self.assertEqual(context["parent_cross"],"degraded")
-  self.assertEqual(context["parent_cross_cause"],"affinity-pinned")
- def test_ac16_cross_usage_limited_degrades_with_closed_cause(self):
+  self.assertEqual(context["parent_cross"],"not-applicable")
+  self.assertEqual(context["parent_cross_cause"],"-")
+ def test_sd160_cross_usage_limited_does_not_degrade_parent_family(self):
   node=self._gate_node()
   route=self._gate_route(owner="opencode")
   with mock.patch.object(F,"_usage_states",
        return_value=self._usage_states(limited=("claude","codex"))):
    hops,context=F.ordered_fallback_hops(route,node,self.jobs,
      parent_identity={"parent_harness":"opencode","parent_transport":"headless","parent_sandbox":"workspace-write"})
-  self.assertEqual(context["parent_cross"],"degraded")
-  self.assertIn(context["parent_cross_cause"],
-    {"affinity-pinned","cross-family-eligible-none",
-     "cross-family-usage-limited","owner-family-only-peer"})
-  self.assertEqual(context["parent_cross_cause"],"cross-family-usage-limited")
- def test_ac12_16_receipt_and_ledger_evidence_pair_at_the_cli(self):
-  # AC 12/16 say a degradation must leave BOTH a receipt field and an SD-93
-  # ledger record, and "두 증거가 모두 없으면 실패". The two existing fixtures
-  # check `ordered_fallback_hops` and `_recompute_verdicts_for_child` as
-  # functions; neither runs the CLI, so nothing held the PAIR together. This
-  # drives the real process: only codex is hard-eligible and codex is also the
-  # owner family, so the single gate-holding checker lands on the owner family.
+  self.assertEqual(context["parent_cross"],"not-applicable")
+  self.assertEqual(context["parent_cross_cause"],"-")
+ def test_sd160_same_harness_receipt_and_allocation_ledger_at_the_cli(self):
   gate={"spec_read":{"satisfied":True,"source":"fixture"},"drift_verdict":"within-spec",
         "workflow_mode":"tracked","artifact_guard":{"satisfied":True,"source":"fixture"}}
   evidence={"tuples":[self.tuple("codex","supported"),self.tuple("claude","unsupported")],
@@ -1236,9 +1273,6 @@ class FallbackTest(unittest.TestCase):
                                 "execution_surface":"codex-native-subagent",
                                 "registered_worker":False,"status":"unsupported",
                                 "check_source":"fixture"}]}
-  # Same seal-and-launch pairing as `route()`: this fixture compiles here and
-  # launches the CLI below, so both sides must name one runtime/artifact/registry
-  # root or the dry run refuses with launch-runtime-root-mismatch.
   with mock.patch.dict(os.environ,self.launch_roots_env()):
    route=R.compile_route("autopilot-code","dev","strong",self.repo,self.art,
      signals=["shared-contract"],transport="headless",tracking="tracked",
@@ -1260,36 +1294,19 @@ class FallbackTest(unittest.TestCase):
   result=subprocess.run(cmd,text=True,capture_output=True,env=env)
   self.assertEqual(result.returncode,0,result.stdout+result.stderr)
   receipt=self.cli_verdict(result.stdout)
-  # evidence 1: the stdout receipt fields
   self.assertEqual(receipt["child_harness"],"codex")
-  self.assertEqual(receipt["parent_cross"],"degraded")
-  self.assertEqual(receipt["parent_cross_cause"],"cross-family-eligible-none")
-  self.assertIn(receipt["parent_cross_cause"],
-    {"affinity-pinned","cross-family-eligible-none",
-     "cross-family-usage-limited","owner-family-only-peer"})
-  # evidence 2: the SD-93 ledger record left by the SAME process run
+  self.assertEqual(receipt["parent_cross"],"not-applicable")
+  self.assertEqual(receipt["parent_cross_cause"],"-")
+  self.assertEqual(receipt["sole_gate"],"ok")
   ledger=Path(self.tmp.name)/"degradations"/f"{route['route_id']}.jsonl"
-  self.assertTrue(ledger.is_file(),sorted(p.name for p in (Path(self.tmp.name)/"degradations").glob("*")) if (Path(self.tmp.name)/"degradations").is_dir() else "no ledger dir")
-  rows=[json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines() if line.strip()]
-  cross=[row for row in rows if row.get("reason")=="parent-cross-same-harness"]
-  self.assertEqual(len(cross),1,rows)
-  self.assertEqual(cross[0]["parent_cross"],"degraded")
-  self.assertEqual(cross[0]["cause"],receipt["parent_cross_cause"])
-  self.assertEqual(cross[0]["route_node"],"plan-check")
-  self.assertEqual(cross[0]["writer"],"stage-dispatch-fallback.py")
+  rows=[json.loads(line) for line in ledger.read_text().splitlines()] if ledger.exists() else []
+  self.assertFalse([row for row in rows if row.get("reason")=="parent-cross-same-harness"])
+  allocation=Path(self.tmp.name)/"allocation"/f"{route['route_id']}.jsonl"
+  saved=[json.loads(line) for line in allocation.read_text().splitlines()]
+  self.assertEqual(saved[-1]["child_harness"],"codex")
+  self.assertEqual(saved[-1]["parent_cross"],"not-applicable")
+  self.assertEqual(saved[-1]["sole_gate"],"ok")
  def test_ac12_sole_gate_receipt_and_ledger_evidence_pair_at_the_cli(self):
-  # M5 / AC 12: the CLI evidence pair for the SOLE-GATE degradation was never
-  # actually created -- the fixture above asserts `parent_cross`, which is AC 16.
-  # AC 12 requires the `sole_gate` receipt field and the
-  # `sole-gate-non-peer-harness` SD-93 record TOGETHER ("두 증거가 모두 없으면
-  # 실패"), and every existing sole_gate assertion is on the `context` dict a
-  # function returns, never on what a process leaves behind. This drives the
-  # real process: only opencode is hard-eligible while the derived quality-peer
-  # set is {claude, codex}, so the single gate-holding checker lands off the
-  # quality-peer families and the assignment proceeds with the degradation
-  # recorded (13.30.2 ② proviso). The owner family stays codex so the head is
-  # NOT the owner and `parent_cross` reads "ok" -- this pins the sole-gate pair
-  # on its own, not on the back of AC 16's.
   gate={"spec_read":{"satisfied":True,"source":"fixture"},"drift_verdict":"within-spec",
         "workflow_mode":"tracked","artifact_guard":{"satisfied":True,"source":"fixture"}}
   evidence={"tuples":[self.tuple("opencode","supported"),
@@ -1299,9 +1316,6 @@ class FallbackTest(unittest.TestCase):
                                 "execution_surface":"codex-native-subagent",
                                 "registered_worker":False,"status":"unsupported",
                                 "check_source":"fixture"}]}
-  # Same seal-and-launch pairing as `route()`: this fixture compiles here and
-  # launches the CLI below, so both sides must name one runtime/artifact/registry
-  # root or the dry run refuses with launch-runtime-root-mismatch.
   with mock.patch.dict(os.environ,self.launch_roots_env()):
    route=R.compile_route("autopilot-code","dev","strong",self.repo,self.art,
      signals=["shared-contract"],transport="headless",tracking="tracked",
@@ -1323,11 +1337,9 @@ class FallbackTest(unittest.TestCase):
   result=subprocess.run(cmd,text=True,capture_output=True,env=env)
   self.assertEqual(result.returncode,0,result.stdout+result.stderr)
   receipt=self.cli_verdict(result.stdout)
-  # evidence 1: the stdout receipt field
   self.assertEqual(receipt["sole_gate"],"degraded")
   self.assertEqual(receipt["child_harness"],"opencode")
-  self.assertEqual(receipt["parent_cross"],"ok")
-  # evidence 2: the SD-93 ledger record left by the SAME process run
+  self.assertEqual(receipt["parent_cross"],"not-applicable")
   ledger=Path(self.tmp.name)/"degradations"/f"{route['route_id']}.jsonl"
   self.assertTrue(ledger.is_file(),result.stdout)
   rows=[json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines()
@@ -1352,11 +1364,8 @@ class FallbackTest(unittest.TestCase):
      parent_identity={"parent_harness":"opencode","parent_transport":"headless","parent_sandbox":"workspace-write"})
   self.assertEqual([hop["candidates"][0]["child_harness"] for hop in hops2[:len(context2["rank"])]],
                    ["claude","codex","opencode"])
-  # ledger write failures must never change exit/receipt/child (AC 17 / R5)
   self.assertIsNone(F._persist_parent_cross_ledger(None, route, node, None))
  def test_ac18_non_target_node_keeps_six_repeat_rotation(self):
-  # A non-gate node (no review-worker kind, no parent_cross_preference) never
-  # partitions: the SD-66 v39 six-repeat 3-harness rotation is preserved.
   parent={"parent_harness":"opencode","parent_transport":"headless","parent_sandbox":"workspace-write"}
   node={
    "kind":"pipeline-stage",
@@ -1381,23 +1390,17 @@ class FallbackTest(unittest.TestCase):
   self.assertEqual(context["parent_cross"],"not-applicable")
   selected=[hop["candidates"][0]["child_harness"] for hop in hops[:len(context["rank"])]]
   self.assertEqual(set(selected),{"claude","codex","opencode"})
- def test_ac19_opencode_owner_prefers_cross_quality_peer(self):
-  # OpenCode owner: cross candidates go to the hard-eligible {claude, codex}
-  # and SD-100 ② is simultaneously satisfied (head is a quality-peer family).
+ def test_sd160_opencode_owner_retains_quality_peer_sole_gate(self):
   node=self._gate_node()
   route=self._gate_route(owner="opencode")
   with mock.patch.object(F,"_usage_states",return_value=self._usage_states()):
    hops,context=F.ordered_fallback_hops(route,node,self.jobs,
      parent_identity={"parent_harness":"opencode","parent_transport":"headless","parent_sandbox":"workspace-write"})
-  self.assertEqual(context["parent_cross"],"ok")
+  self.assertEqual(context["parent_cross"],"not-applicable")
   self.assertEqual(context["sole_gate"],"ok")
   self.assertEqual(context["quality_peer_families"],["claude","codex"])
   self.assertEqual(hops[0]["candidates"][0]["child_harness"],"claude")
  def test_ac100b_sole_gate_degraded_when_no_quality_peer_eligible(self):
-  # SD-100 ② proviso: when no quality-peer family is hard-eligible the
-  # assignment proceeds with sole-gate-non-peer-harness recorded. The deep and
-  # balanced-deep primary bands have an empty intersection, so the derived
-  # quality-peer set is empty.
   node=self._gate_node()
   node["harness_policy"]={"primary":["claude","codex"],"relief":["opencode"],
                           "last_resort":[],"promote_relief_below":0}
@@ -1417,12 +1420,7 @@ class FallbackTest(unittest.TestCase):
      parent_identity={"parent_harness":"opencode","parent_transport":"headless","parent_sandbox":"workspace-write"})
   self.assertEqual(context["quality_peer_families"],[])
   self.assertEqual(context["sole_gate"],"degraded")
- def test_g3_parent_cross_verdict_taken_after_sole_gate_reorder(self):
-  # G3: the parent-cross verdict must describe the FINAL head after the SD-100
-  # ② quality-peer reorder. Least-recent favors opencode, so the pre-reorder
-  # head is opencode (owner=claude, codex unsupported) and the old code froze
-  # parent_cross="ok" before the hoist moved claude (the owner family) to the
-  # head. The verdict must be "degraded" with a closed cause.
+ def test_sd160_sole_gate_reorder_can_choose_owner_family_normally(self):
   parent={"parent_harness":"claude","parent_transport":"headless","parent_sandbox":"workspace-write"}
   node={
    "kind":"review-worker",
@@ -1456,14 +1454,10 @@ class FallbackTest(unittest.TestCase):
   with mock.patch.object(F,"_usage_states",return_value=self._usage_states()):
    hops,context=F.ordered_fallback_hops(route,node,self.jobs,parent_identity=parent)
   self.assertEqual(hops[0]["candidates"][0]["child_harness"],"claude")
-  self.assertEqual(context["parent_cross"],"degraded")
-  self.assertEqual(context["parent_cross_cause"],"cross-family-eligible-none")
+  self.assertEqual(context["parent_cross"],"not-applicable")
+  self.assertEqual(context["parent_cross_cause"],"-")
   self.assertEqual(context["sole_gate"],"ok")
  def test_g3_verdicts_recomputed_for_actual_launched_child(self):
-  # G3: the receipt and ledger must describe the actually launched child, not
-  # the ranked head. A head whose launch-tuple dies and a later hop that wins
-  # (opencode -- non-quality-peer, or claude -- the owner family) must flip
-  # sole_gate / parent_cross accordingly.
   context={
    "parent_cross":"ok","parent_cross_cause":"-","sole_gate":"ok",
    "affinity":None,"rank":["claude","codex"],
@@ -1471,14 +1465,14 @@ class FallbackTest(unittest.TestCase):
    "owner_family":"claude","quality_peer_set":frozenset({"claude","codex"}),
   }
   reopened=F._recompute_verdicts_for_child(context,"opencode")
-  self.assertEqual(reopened["parent_cross"],"ok")
+  self.assertEqual(reopened["parent_cross"],"not-applicable")
   self.assertEqual(reopened["sole_gate"],"degraded")
   same_family=F._recompute_verdicts_for_child(context,"claude")
-  self.assertEqual(same_family["parent_cross"],"degraded")
+  self.assertEqual(same_family["parent_cross"],"not-applicable")
   self.assertEqual(same_family["sole_gate"],"ok")
-  self.assertEqual(same_family["parent_cross_cause"],"owner-family-only-peer")
+  self.assertEqual(same_family["parent_cross_cause"],"-")
   cross=F._recompute_verdicts_for_child(context,"codex")
-  self.assertEqual(cross["parent_cross"],"ok")
+  self.assertEqual(cross["parent_cross"],"not-applicable")
   self.assertEqual(cross["sole_gate"],"ok")
  def test_foreign_only_evidence_still_traces_the_parent_runtime_mismatch(self):
   # Keeping the foreign row in the trailing band (rather than dropping it) is

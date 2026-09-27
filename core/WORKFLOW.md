@@ -632,13 +632,13 @@ Autopilot entrypoints choose `intensity`; verification rigor is derived from it 
 | Request shape | Default | Routing |
 |---|---|---|
 | One-off answer, typo, rename, or explicit no-artifact work | `direct` | No plan stage, plan check, or durable plan |
-| Small localized change that misses at least one atomic-direct predicate and has no promotion signal | `quick` | A depth-0-run bootstrap layer runs first — two frame legs, cross-harness when available, joined and interviewed directly by the depth-0 session, the anchor a tier above the owner's own model profile. Then a registered-headless dispatch-depth-1 one-shot conductor with orient-lite, micro-plan, plan-check-lite, focused verification, and concise report; no dispatch depth 2 |
+| Small localized change that misses at least one atomic-direct predicate and has no promotion signal | `quick` | A depth-0-run bootstrap layer runs first — two frame legs with distinct personas and usage-aware harness selection, joined and interviewed directly by the depth-0 session, the anchor a tier above the owner's own model profile. Then a registered-headless dispatch-depth-1 one-shot conductor with orient-lite, micro-plan, plan-check-lite, focused verification, and concise report; no dispatch depth 2 |
 | Work with a promotion signal or separable durable stages | `standard` | Same depth-0-run bootstrap frame layer as `quick`, then durable plan/checklist; a dispatch-depth-1 conductor (default `deep`) dispatches selected stages with file-only handoff and realizes only registry-declared parallel groups (plan/implementation-review, not frame) |
 | Important multi-file or risk-bearing work | `strong` | A `deep` owner plus the declared plan/review groups; selected high-value anchors may widen to a third profile/perspective leg while other groups remain width two |
 | Complex cross-domain or cross-harness work | `thorough` | Bounded dispatch-depth-2 perspective and verifier workers |
 | High-stakes, irreversible, security, or external-facing work | `adversarial` | Thorough plus an explicit adversary, failure-mode, or security pass |
 
-Only `direct` has no plan. Every other autopilot graph includes a plan check, but independent QA is not repeated after every sub-stage by default. Independent passes use route-declared bounded groups with cross-harness first and model-profile/perspective asymmetry where useful; every review — down to a `direct`/`quick` self-check — carries the refute-by-default adversarial stance. `CONVENTIONS §1` is canonical for the graph.
+Only `direct` has no plan. Every other autopilot graph includes a plan check, but independent QA is not repeated after every sub-stage by default. Independent passes use route-declared bounded groups with separate execution contexts and distinct personas, retaining model-profile/perspective asymmetry where declared; every review — down to a `direct`/`quick` self-check — carries the refute-by-default adversarial stance. `CONVENTIONS §1` is canonical for the graph.
 
 ## 2. Work-Nature Map
 
@@ -708,7 +708,7 @@ under §0.4, and internal routing is automatic. Portable model roles come from
 | `autopilot-lab` | Setup uses research plan review, implementation scaffold, and QA smoke tests. Evaluation uses functional QA, figure generation, and research survey; at `standard+`, checkpoint evaluation, media generation, report assembly, and independent verification dispatch as stage workers under the eval execution topology in `capabilities/autopilot-lab.md`. The actual long-running training run is asynchronous and human-gated through RUNLOG ⏳ rather than a stage-worker dispatch. |
 | `analyze-user` | Cross-project material collection plus editorial review |
 
-For every durable stage at `standard+`, use an independent headless session under `OPERATIONS §5.10`; the named team roles run inside that session, and the dispatch-depth-1 conductor passes only artifact paths. Direct stays dispatch depth 0, and a depth-0-run bootstrap layer — two frame legs, cross-harness when available, joined and interviewed directly by the depth-0 session, the anchor a tier above the owner's own model profile — runs ahead of quick, which stays one registered-headless dispatch-depth-1 one-shot conductor.
+For every durable stage at `standard+`, use an independent headless session under `OPERATIONS §5.10`; the named team roles run inside that session, and the dispatch-depth-1 conductor passes only artifact paths. Direct stays dispatch depth 0, and a depth-0-run bootstrap layer — two frame legs with distinct personas and usage-aware harness selection, joined and interviewed directly by the depth-0 session, the anchor a tier above the owner's own model profile — runs ahead of quick, which stays one registered-headless dispatch-depth-1 one-shot conductor.
 
 Each entrypoint is an explicit unit of intent. The §0.4 confirmation is the
 single top-level route handshake. Capability-local review controls such as

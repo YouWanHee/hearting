@@ -1807,7 +1807,7 @@ _TERMINAL_PARALLEL_GROUP_GRANDFATHER = {("autopilot-research", "claim-verify")}
 
 
 def _expand_parallel_groups(nodes, parallel_groups, effective_intensity,
-                            capability, *, auxiliary_check_units=None):
+                            capability, *, auxiliary_check_units=None, persona_policy=True):
     """Expand registry-v6 groups into ordered 2..4-way sibling nodes.
 
     `capability` is required (N2). It was an optional kwarg defaulting to
@@ -1880,7 +1880,7 @@ def _expand_parallel_groups(nodes, parallel_groups, effective_intensity,
             leg["parallel_anchor"] = base["id"]
             # One-window compatibility fields for jobs/Fleet and old receipts.
             leg["replica_group"] = group["id"]
-            leg["independence_axis"] = "cross-harness"
+            leg["independence_axis"] = "perspective" if persona_policy else "cross-harness"
             members.append(leg)
         for node in nodes:
             if node is not base and base["id"] in node.get("depends_on", []):
@@ -2069,9 +2069,9 @@ def _quick_frame_diversity(candidates):
     separately, and a policy change on one side alone would have made every
     sealed single-harness route unverifiable).
 
-    Zero supported harnesses cannot frame at all. One is a recorded
-    degradation, not a refusal (user decision, 2026-09-10): both legs run on
-    that harness with their two perspectives and the route says so."""
+    Zero supported harnesses cannot frame at all. The supported harness set
+    is descriptive provenance, not an independence requirement (SD-160).
+    One harness with separate executions and two personas is normal."""
 
     harnesses = sorted({
         row.get("harness") for row in candidates or []
@@ -2083,7 +2083,7 @@ def _quick_frame_diversity(candidates):
             else "single-harness:" + harnesses[0])
 
 
-def _stamp_frame_profiles(nodes, owner_profile, owner_demand):
+def _stamp_frame_profiles(nodes, owner_profile, owner_demand, *, seal_persona=True):
     """Stamp every frame leg's `model_profile` from the one tier ladder.
 
     ONE function called by BOTH the compiler and `verify_route`'s expected-node
@@ -2100,6 +2100,11 @@ def _stamp_frame_profiles(nodes, owner_profile, owner_demand):
     for node in nodes:
         if not _frame_node(node):
             continue
+        # SD-160: seal the distinct personas; old routes retain their original
+        # bytes and admission resolves the same canonical frame roles.
+        if seal_persona:
+            node.setdefault("perspective", "primary-frame" if node.get("id") == "frame"
+                            else "alternative-frame")
         # `frame` is the anchor leg (the one raised a tier); every other leg of
         # the pair -- today only `frame-alternative` -- stays at the owner's
         # working tier so the pair keeps two genuinely different voices.
@@ -2933,7 +2938,7 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
         registered_headless_candidates=_validate_registered_headless_evidence(
             registered_headless_evidence
         )
-        # Quick's cross-harness guarantee is carried entirely by this candidate
+        # Quick's supported harness inventory is carried entirely by this candidate
         # list -- `owner_route_binding._supported_owner_harnesses` reads it, and
         # `dispatch-owner.py` refuses an `--adapter` outside it. How many
         # harnesses it supports decides the pair's diversity, sealed on both
@@ -3077,6 +3082,7 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
       "requested_intensity":requested_intensity,"effective_intensity":effective,
       "owner_model_profile":owner_model_profile,
       "profile_selection_contract_version":1,
+      "persona_independence_contract_version":1,
       "profile_demands":profile_demands,"explicit_profiles":explicit_profiles,
       "owner_profile_demand":owner_demand,"owner_profile_selection":owner_profile_selection,
       "execution_topology":("inline" if effective=="direct" else recipe["quick"]["topology"] if effective=="quick" else recipe["topology_class"]),
@@ -3233,6 +3239,24 @@ def _validate_campaign_selection(key, value):
         raise ValueError(f"route-{key.replace('_', '-')}-invalid")
 
 
+def _sd160_legacy_registry(registry):
+    """Reconstruct only the immediately preceding cross-harness declaration.
+
+    This is an exact digest bridge, never a general stale-registry exemption.
+    Any changed node, width, budget, role or other registry byte changes its
+    digest and remains refused. Old sealed documents themselves are untouched.
+    """
+    legacy = json.loads(json.dumps(registry))
+    changed = False
+    for recipe in legacy["recipes"]:
+        for graph in (v for v in recipe.values() if isinstance(v, dict)):
+            for group in graph.get("parallel_groups", []):
+                if group.get("independence_axes") == ["model-profile", "perspective"]:
+                    group["independence_axes"] = ["cross-harness", "model-profile", "perspective"]
+                    changed = True
+    return legacy if changed else None
+
+
 def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
     """Verify a route for mutating/resume use.
 
@@ -3286,6 +3310,23 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
         units_digest_now=unit_catalog_digest(),
         registry_root_now=TOPO.ROOT, unit_catalog_root_now=ROOT,
     )
+    persona_version = route.get("persona_independence_contract_version")
+    if persona_version is not None and (type(persona_version) is not int or persona_version != 1):
+        raise ValueError("unsupported-persona-independence-contract-version")
+    if (classification["registry"]["verdict"] != "current"
+            and classification["unit_catalog"]["verdict"] == "current"
+            and persona_version is None):
+        legacy_registry = _sd160_legacy_registry(registry)
+        if (legacy_registry is not None
+                and route.get("registry_digest") == TOPO.registry_digest(legacy_registry)):
+            # Reconstruct the old graph under its exact authenticated declaration;
+            # launch/receipt consumers apply SD-160's effective persona policy.
+            registry = legacy_registry
+            classification = classify_validation_basis(
+                route, registry_digest_now=TOPO.registry_digest(registry),
+                units_digest_now=unit_catalog_digest(),
+                registry_root_now=TOPO.ROOT, unit_catalog_root_now=ROOT,
+            )
     if classification["verdict"] != "current":
         if not allow_stale_registry:
             raise ValueError(classification["message"])
@@ -3314,11 +3355,12 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
         expected_nodes=_expand_parallel_groups(
             expected_nodes, composed_recipe["standard_plus"].get("parallel_groups"),
             route.get("effective_intensity"), route.get("capability"),
-            auxiliary_check_units=registry.get("auxiliary_check_units"))
+            auxiliary_check_units=registry.get("auxiliary_check_units"),
+            persona_policy=persona_version == 1)
         if route.get("profile_selection_contract_version") == 1:
             # Same ladder, same order as the compiler: stamp, then seal.
             _stamp_frame_profiles(expected_nodes, route.get("owner_model_profile"),
-                                  route.get("owner_profile_demand"))
+                                  route.get("owner_profile_demand"), seal_persona=persona_version == 1)
             _seal_profile_demands(expected_nodes, route.get("profile_demands"),
                                   route.get("explicit_profiles"),
                                   legacy=_versioned_subgraph(registry, composed_recipe))
@@ -3335,11 +3377,12 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
             expected_nodes=_expand_parallel_groups(
                 expected_nodes, route_recipe["standard_plus"].get("parallel_groups"),
                 route.get("effective_intensity"), route.get("capability"),
-                auxiliary_check_units=registry.get("auxiliary_check_units"))
+                auxiliary_check_units=registry.get("auxiliary_check_units"),
+            persona_policy=persona_version == 1)
             if route.get("profile_selection_contract_version") == 1:
                 # Same ladder, same order as the compiler: stamp, then seal.
                 _stamp_frame_profiles(expected_nodes, route.get("owner_model_profile"),
-                                      route.get("owner_profile_demand"))
+                                      route.get("owner_profile_demand"), seal_persona=persona_version == 1)
                 _seal_profile_demands(expected_nodes, route.get("profile_demands"),
                                       route.get("explicit_profiles"), legacy=True)
                 by_id = {n["id"]: n for n in expected_nodes}

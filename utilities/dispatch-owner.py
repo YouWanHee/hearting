@@ -14,7 +14,6 @@ import sys
 from owner_route_binding import OwnerRouteBindingError, validate_owner_route_binding, derive_quick_owner_binding, derive_frame_route_binding
 from dispatch_mode_contract import DispatchModeContractError, resolve_qa
 from dispatch_contract import (DispatchContractError, frame_harness_admission,
-                               record_frame_launch_degradation,
                                parse_registry_metadata)
 
 
@@ -291,30 +290,8 @@ def _first_frame_attempt(route, jobs):
 def _prefer_other_frame_harness(first_harness, selected, explicit, config_version,
                                 policy, states, counts, allocation, capacity,
                                 configured, ranked, automatically_available):
-    """Keep normal selection unless the second frame would repeat the first."""
-    if selected != first_harness:
-        return selected, None, False
-    alternate_policy = {
-        **policy,
-        **{band: [h for h in policy[band] if h != first_harness]
-           for band in _defaults.QUALITY_BANDS},
-    }
-    if config_version == 3:
-        alternate, band, _, relief = _capacity.select(
-            alternate_policy, states, counts, allocation["harness_order"], capacity,
-            strategy=allocation["strategy"],
-            usage_gate_used_percent=allocation.get("usage_gate_used_percent", 90),
-            preferred=_capacity.preferred_for_depth(allocation, 1),
-            affinity_weight=allocation.get("depth_affinity_weight", 0.5),
-            headroom_exponent=allocation.get("usage_headroom_exponent", 1),
-        )
-    else:
-        alternate = next((h for h in ranked(configured)
-                          if h != first_harness and automatically_available(h)), None)
-        band, relief = "primary", False
-    if alternate and explicit:
-        raise OwnerError("frame-cross-harness-required:explicit-same-harness")
-    return (alternate, band, relief) if alternate else (selected, None, False)
+    """Compatibility helper: SD-160 never overrides capacity for diversity."""
+    return selected, None, False
 
 
 def export_owner_route_env(child_env, binding):
@@ -884,24 +861,14 @@ def main(argv):
                 print("check=deferred\nreason=frame-first-attempt-pending\nchild_spawned=0")
                 return 75
             first_harness = first["harness"]
-            preferred, alternate_band, alternate_relief = _prefer_other_frame_harness(
-                first_harness, selected, explicit, config_version, policy, states,
-                counts, allocation, capacity, configured, ranked, automatically_available)
-            if preferred != selected:
-                selected, quality_band = preferred, alternate_band
-                relief_promoted = alternate_relief
-                source = "frame-cross-harness"
             try:
-                proof_ids = frame_harness_admission(
+                frame_harness_admission(
                     route, Path(jobs), lines, [first_harness, selected],
                     [next((n.get("model_profile") for n in route["nodes"] if n.get("id") == name), None)
                      for name in ("frame", "frame-alternative")],
                 )
             except DispatchContractError as exc:
                 raise OwnerError(f"{exc.reason}:{exc.detail}") from exc
-            if proof_ids and "--start" in forwarded:
-                record_frame_launch_degradation(route, Path(jobs), proof_ids,
-                                                first["attempt_id"], selected)
         wrapper = ROOT / "adapters" / selected / "bin" / "dispatch-headless.py"
         if not os.access(wrapper, os.X_OK):
             print("\n".join(_audit("unavailable", selected, source, configured, explicit, states,

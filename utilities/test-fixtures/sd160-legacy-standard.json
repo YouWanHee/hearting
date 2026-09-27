@@ -1,0 +1,1627 @@
+{
+  "schema_version": 2,
+  "capability": "autopilot-code",
+  "capability_mode": "dev",
+  "requested_intensity": "standard",
+  "effective_intensity": "standard",
+  "owner_model_profile": "deep",
+  "profile_selection_contract_version": 1,
+  "profile_demands": {},
+  "explicit_profiles": {},
+  "owner_profile_demand": null,
+  "owner_profile_selection": {
+    "schema_version": 1,
+    "source": "legacy",
+    "resolver_version": "profile-demand/v1",
+    "demand_digest": null,
+    "resolved_profile": "deep",
+    "judgment_floor": "unknown",
+    "reason": "unannotated-existing-stage"
+  },
+  "execution_topology": "staged",
+  "owner_dispatch_depth": 1,
+  "max_dispatch_depth": 2,
+  "tracking": "tracked",
+  "tracked_gate_evidence": {
+    "spec_read": {
+      "satisfied": true,
+      "source": "fixture"
+    },
+    "drift_verdict": "within-spec",
+    "workflow_mode": "tracked",
+    "artifact_guard": {
+      "satisfied": true,
+      "source": "fixture"
+    }
+  },
+  "spec_touch": false,
+  "cwd": "/home/nas/user/Uihyeop/personal/hearting-wt/capacity-review-routing-0927",
+  "artifact_root": "/tmp/tmpqeb9l_3d",
+  "source_commit": "63a929740b256f7515098fe50c47b999b7e503e7",
+  "registry_digest": "sha256:4260c26aebc1ab2f5bbb722d1b77a0d3fe555504a4122ec5dd3c891dd8071f10",
+  "dispatch_defaults_digest": "sha256:1dc96ce302b15bc5c9b26365f44ffca9d9d8d5cdae90e2deab0cebde52849a6e",
+  "dispatch_allocation": {
+    "strategy": "balanced",
+    "window": 30,
+    "usage_gate_used_percent": 85,
+    "harness_order": [
+      "claude",
+      "codex",
+      "opencode"
+    ],
+    "depth_affinity": {
+      "owner": "claude",
+      "worker": "codex"
+    },
+    "depth_affinity_weight": 0.65,
+    "usage_headroom_exponent": 2
+  },
+  "owner_harness_policy": {
+    "primary": [
+      "claude",
+      "codex"
+    ],
+    "relief": [],
+    "last_resort": [
+      "opencode"
+    ],
+    "promote_relief_below": 0
+  },
+  "confirmation_mode": "hybrid",
+  "small_work_confirmation": "notice",
+  "selection": {
+    "direct_predicates": [],
+    "promotion_signals": [],
+    "selection_basis": [],
+    "escalation_basis": [],
+    "transport": "headless",
+    "transport_evidence": "compose-default",
+    "inline_reason": null,
+    "route_origin": "compose",
+    "shape": "staged"
+  },
+  "continuation_budget": {
+    "contract_version": 1,
+    "declared_nodes": 8,
+    "review_round_cap": 2,
+    "gap": 1,
+    "retry": 1,
+    "reserved": 1,
+    "ordinary": 16,
+    "limit": 17
+  },
+  "nodes": [
+    {
+      "id": "frame",
+      "kind": "map-worker",
+      "depends_on": [],
+      "role": "deep maker",
+      "inputs": [
+        "task",
+        "spec",
+        "source"
+      ],
+      "outputs": [
+        "shards/frame/direction-brief.md"
+      ],
+      "write_scope": [
+        "shards/frame/**"
+      ],
+      "resource_class": "normal",
+      "completion_gate": "code-frame",
+      "dispatch_depth": 1,
+      "launch_authority": "depth-0",
+      "worker_type": "frame",
+      "unit": "plan/frame",
+      "model_profile": "top",
+      "advance_class": "runtime-eligible",
+      "commit_expected": false,
+      "continuation": {
+        "kind": "human-gate",
+        "gate": "frame-review"
+      },
+      "profile_explicit": true,
+      "profile_demand": {
+        "schema_version": 1,
+        "judgment_requirement": "difficult-uncertain",
+        "execution_scope": "short-local",
+        "judgment_reason": "framing is the route's one irreversible judgment: every later node inherits the direction this leg picks, and no later stage is scoped to re-open it",
+        "execution_reason": "one direction brief, written once, with no multi-step execution of its own",
+        "evidence_refs": [
+          "roles/units/plan/frame.md"
+        ]
+      },
+      "profile_selection": {
+        "schema_version": 1,
+        "source": "explicit",
+        "resolver_version": "profile-demand/v1",
+        "demand_digest": "sha256:15ee5db7f0d5caf619b6b2b55a70dfa889228f28e64fefa6410cddb64b218219",
+        "resolved_profile": "top",
+        "judgment_floor": "deep",
+        "reason": "explicit-top-exception"
+      }
+    },
+    {
+      "id": "frame-alternative",
+      "kind": "map-worker",
+      "depends_on": [],
+      "role": "deep maker",
+      "inputs": [
+        "task",
+        "spec",
+        "source"
+      ],
+      "outputs": [
+        "shards/frame-alternative/direction-brief.md"
+      ],
+      "write_scope": [
+        "shards/frame-alternative/**"
+      ],
+      "resource_class": "normal",
+      "completion_gate": "code-frame",
+      "dispatch_depth": 1,
+      "launch_authority": "depth-0",
+      "worker_type": "frame",
+      "unit": "plan/frame",
+      "model_profile": "deep",
+      "advance_class": "runtime-eligible",
+      "commit_expected": false,
+      "continuation": {
+        "kind": "human-gate",
+        "gate": "frame-review"
+      },
+      "profile_demand": null,
+      "profile_selection": {
+        "schema_version": 1,
+        "source": "legacy",
+        "resolver_version": "profile-demand/v1",
+        "demand_digest": null,
+        "resolved_profile": "deep",
+        "judgment_floor": "unknown",
+        "reason": "unannotated-existing-stage"
+      }
+    },
+    {
+      "id": "plan",
+      "kind": "pipeline-stage",
+      "depends_on": [
+        "frame",
+        "frame-alternative"
+      ],
+      "role": "deep maker",
+      "inputs": [
+        "task",
+        "spec",
+        "source",
+        "shards/frame/direction-brief.md",
+        "shards/frame-alternative/direction-brief.md"
+      ],
+      "outputs": [
+        "plan.md",
+        "checklist.md"
+      ],
+      "write_scope": [
+        "plan.md",
+        "checklist.md"
+      ],
+      "resource_class": "normal",
+      "completion_gate": "code-plan",
+      "dispatch_depth": 2,
+      "unit": "plan/plan-author",
+      "model_profile": "balanced-deep",
+      "advance_class": "runtime-eligible",
+      "commit_expected": false,
+      "continuation": {
+        "kind": "inline-next"
+      },
+      "fallback_hops": [
+        {
+          "ordinal": 1,
+          "fallback_hop": "same-harness-headless",
+          "candidates": [
+            {
+              "child_harness": "codex",
+              "failure_class": "",
+              "launch_authority": "conductor",
+              "parent_harness": "codex",
+              "parent_sandbox": "workspace-write",
+              "parent_transport": "headless",
+              "probe_source": "frozen-old-compiler",
+              "probe_time": "2026-09-27T00:00:00Z",
+              "status": "supported",
+              "checked_worktree": "/home/nas/user/Uihyeop/personal/hearting-wt/capacity-review-routing-0927",
+              "codex_command": "ok",
+              "failure_scope": "none",
+              "retry_on_isolated_worktree": 0
+            }
+          ]
+        },
+        {
+          "ordinal": 2,
+          "fallback_hop": "cross-harness-headless",
+          "candidates": [
+            {
+              "child_harness": "claude",
+              "failure_class": "",
+              "launch_authority": "conductor",
+              "parent_harness": "codex",
+              "parent_sandbox": "workspace-write",
+              "parent_transport": "headless",
+              "probe_source": "frozen-old-compiler",
+              "probe_time": "2026-09-27T00:00:00Z",
+              "status": "supported",
+              "checked_worktree": "/home/nas/user/Uihyeop/personal/hearting-wt/capacity-review-routing-0927",
+              "codex_command": "not-applicable",
+              "failure_scope": "none",
+              "retry_on_isolated_worktree": 0
+            }
+          ]
+        },
+        {
+          "ordinal": 3,
+          "fallback_hop": "native-subagent",
+          "candidates": [],
+          "fleet_visibility": "degraded"
+        },
+        {
+          "ordinal": 4,
+          "fallback_hop": "inline",
+          "status": "eligible-after-prior-hop-exhaustion",
+          "reason_enum": "runtime-unavailable",
+          "fleet_visibility": "none"
+        }
+      ],
+      "profile_demand": null,
+      "profile_selection": {
+        "schema_version": 1,
+        "source": "legacy",
+        "resolver_version": "profile-demand/v1",
+        "demand_digest": null,
+        "resolved_profile": "balanced-deep",
+        "judgment_floor": "unknown",
+        "reason": "unannotated-existing-stage"
+      },
+      "harness_affinity": "diverse",
+      "harness_policy": {
+        "primary": [
+          "claude",
+          "codex"
+        ],
+        "relief": [],
+        "last_resort": [
+          "opencode"
+        ],
+        "promote_relief_below": 0
+      }
+    },
+    {
+      "id": "plan-check",
+      "kind": "review-worker",
+      "depends_on": [
+        "plan"
+      ],
+      "role": "fast reviewer",
+      "unit": "qa/plan-review",
+      "inputs": [
+        "plan.md",
+        "checklist.md"
+      ],
+      "outputs": [
+        "_internal/plan_reviews/round_1.md"
+      ],
+      "write_scope": [
+        "_internal/plan_reviews/**"
+      ],
+      "resource_class": "normal",
+      "completion_gate": "code-plan-check",
+      "dispatch_depth": 2,
+      "model_profile": "light",
+      "advance_class": "runtime-eligible",
+      "commit_expected": false,
+      "continuation": {
+        "kind": "inline-next"
+      },
+      "fallback_hops": [
+        {
+          "ordinal": 1,
+          "fallback_hop": "same-harness-headless",
+          "candidates": [
+            {
+              "child_harness": "codex",
+              "failure_class": "",
+              "launch_authority": "conductor",
+              "parent_harness": "codex",
+              "parent_sandbox": "workspace-write",
+              "parent_transport": "headless",
+              "probe_source": "frozen-old-compiler",
+              "probe_time": "2026-09-27T00:00:00Z",
+              "status": "supported",
+              "checked_worktree": "/home/nas/user/Uihyeop/personal/hearting-wt/capacity-review-routing-0927",
+              "codex_command": "ok",
+              "failure_scope": "none",
+              "retry_on_isolated_worktree": 0
+            }
+          ]
+        },
+        {
+          "ordinal": 2,
+          "fallback_hop": "cross-harness-headless",
+          "candidates": [
+            {
+              "child_harness": "claude",
+              "failure_class": "",
+              "launch_authority": "conductor",
+              "parent_harness": "codex",
+              "parent_sandbox": "workspace-write",
+              "parent_transport": "headless",
+              "probe_source": "frozen-old-compiler",
+              "probe_time": "2026-09-27T00:00:00Z",
+              "status": "supported",
+              "checked_worktree": "/home/nas/user/Uihyeop/personal/hearting-wt/capacity-review-routing-0927",
+              "codex_command": "not-applicable",
+              "failure_scope": "none",
+              "retry_on_isolated_worktree": 0
+            }
+          ]
+        },
+        {
+          "ordinal": 3,
+          "fallback_hop": "native-subagent",
+          "candidates": [],
+          "fleet_visibility": "degraded"
+        },
+        {
+          "ordinal": 4,
+          "fallback_hop": "inline",
+          "status": "eligible-after-prior-hop-exhaustion",
+          "reason_enum": "runtime-unavailable",
+          "fleet_visibility": "none"
+        }
+      ],
+      "profile_demand": null,
+      "profile_selection": {
+        "schema_version": 1,
+        "source": "legacy",
+        "resolver_version": "profile-demand/v1",
+        "demand_digest": null,
+        "resolved_profile": "light",
+        "judgment_floor": "unknown",
+        "reason": "unannotated-existing-stage"
+      },
+      "harness_affinity": "diverse",
+      "harness_policy": {
+        "primary": [
+          "claude",
+          "codex",
+          "opencode"
+        ],
+        "relief": [],
+        "last_resort": [],
+        "promote_relief_below": 0
+      }
+    },
+    {
+      "id": "execute",
+      "kind": "pipeline-stage",
+      "depends_on": [
+        "plan-check"
+      ],
+      "role": "fast implementer",
+      "inputs": [
+        "plan.md",
+        "checklist.md"
+      ],
+      "outputs": [
+        "source-diff",
+        "dev_logs/**"
+      ],
+      "write_scope": [
+        "source/**",
+        "checklist.md",
+        "dev_logs/**",
+        "evidence/**"
+      ],
+      "resource_class": "normal",
+      "completion_gate": "code-execute",
+      "dispatch_depth": 2,
+      "unit": "dev/backend",
+      "unit_choices": [
+        "dev/backend",
+        "dev/frontend",
+        "dev/new-lib",
+        "dev/refactor"
+      ],
+      "model_profile": "balanced",
+      "subdivision": {
+        "min_intensity": "standard",
+        "max_slices": 4,
+        "disjointness": "exact-fixed-files"
+      },
+      "advance_class": "runtime-eligible",
+      "commit_expected": true,
+      "profile_demand": {
+        "schema_version": 1,
+        "judgment_requirement": "predetermined",
+        "execution_scope": "extended-multistep",
+        "judgment_reason": "The accepted plan and completed checks fix the decisions; new judgment returns to the owner.",
+        "execution_reason": "Apply the approved plan across source and verification steps.",
+        "evidence_refs": [
+          "capabilities/autopilot-code.md#portable-procedure",
+          "plan.md"
+        ]
+      },
+      "continuation": {
+        "kind": "inline-next"
+      },
+      "fallback_hops": [
+        {
+          "ordinal": 1,
+          "fallback_hop": "same-harness-headless",
+          "candidates": [
+            {
+              "child_harness": "codex",
+              "failure_class": "",
+              "launch_authority": "conductor",
+              "parent_harness": "codex",
+              "parent_sandbox": "workspace-write",
+              "parent_transport": "headless",
+              "probe_source": "frozen-old-compiler",
+              "probe_time": "2026-09-27T00:00:00Z",
+              "status": "supported",
+              "checked_worktree": "/home/nas/user/Uihyeop/personal/hearting-wt/capacity-review-routing-0927",
+              "codex_command": "ok",
+              "failure_scope": "none",
+              "retry_on_isolated_worktree": 0
+            }
+          ]
+        },
+        {
+          "ordinal": 2,
+          "fallback_hop": "cross-harness-headless",
+          "candidates": [
+            {
+              "child_harness": "claude",
+              "failure_class": "",
+              "launch_authority": "conductor",
+              "parent_harness": "codex",
+              "parent_sandbox": "workspace-write",
+              "parent_transport": "headless",
+              "probe_source": "frozen-old-compiler",
+              "probe_time": "2026-09-27T00:00:00Z",
+              "status": "supported",
+              "checked_worktree": "/home/nas/user/Uihyeop/personal/hearting-wt/capacity-review-routing-0927",
+              "codex_command": "not-applicable",
+              "failure_scope": "none",
+              "retry_on_isolated_worktree": 0
+            }
+          ]
+        },
+        {
+          "ordinal": 3,
+          "fallback_hop": "native-subagent",
+          "candidates": [],
+          "fleet_visibility": "degraded"
+        },
+        {
+          "ordinal": 4,
+          "fallback_hop": "inline",
+          "status": "eligible-after-prior-hop-exhaustion",
+          "reason_enum": "runtime-unavailable",
+          "fleet_visibility": "none"
+        }
+      ],
+      "profile_selection": {
+        "schema_version": 1,
+        "source": "matrix",
+        "resolver_version": "profile-demand/v1",
+        "demand_digest": "sha256:e99aa8dbdfa3f3597da4f33d9041ac04336a525424ee4642c7c8ae0e75492c26",
+        "resolved_profile": "balanced",
+        "judgment_floor": "none",
+        "reason": "matrix-cell"
+      },
+      "harness_affinity": "diverse",
+      "harness_policy": {
+        "primary": [
+          "claude",
+          "codex"
+        ],
+        "relief": [],
+        "last_resort": [
+          "opencode"
+        ],
+        "promote_relief_below": 0
+      }
+    },
+    {
+      "id": "impl-review",
+      "kind": "review-worker",
+      "depends_on": [
+        "execute"
+      ],
+      "role": "fast reviewer",
+      "unit": "qa/code-review",
+      "inputs": [
+        "plan.md",
+        "source-diff",
+        "dev_logs/**"
+      ],
+      "outputs": [
+        "_internal/dev_reviews/phase_review.md"
+      ],
+      "write_scope": [
+        "_internal/dev_reviews/**"
+      ],
+      "resource_class": "normal",
+      "completion_gate": "code-impl-review",
+      "dispatch_depth": 2,
+      "model_profile": "light",
+      "advance_class": "runtime-eligible",
+      "commit_expected": false,
+      "continuation": {
+        "kind": "inline-next"
+      },
+      "fallback_hops": [
+        {
+          "ordinal": 1,
+          "fallback_hop": "same-harness-headless",
+          "candidates": [
+            {
+              "child_harness": "codex",
+              "failure_class": "",
+              "launch_authority": "conductor",
+              "parent_harness": "codex",
+              "parent_sandbox": "workspace-write",
+              "parent_transport": "headless",
+              "probe_source": "frozen-old-compiler",
+              "probe_time": "2026-09-27T00:00:00Z",
+              "status": "supported",
+              "checked_worktree": "/home/nas/user/Uihyeop/personal/hearting-wt/capacity-review-routing-0927",
+              "codex_command": "ok",
+              "failure_scope": "none",
+              "retry_on_isolated_worktree": 0
+            }
+          ]
+        },
+        {
+          "ordinal": 2,
+          "fallback_hop": "cross-harness-headless",
+          "candidates": [
+            {
+              "child_harness": "claude",
+              "failure_class": "",
+              "launch_authority": "conductor",
+              "parent_harness": "codex",
+              "parent_sandbox": "workspace-write",
+              "parent_transport": "headless",
+              "probe_source": "frozen-old-compiler",
+              "probe_time": "2026-09-27T00:00:00Z",
+              "status": "supported",
+              "checked_worktree": "/home/nas/user/Uihyeop/personal/hearting-wt/capacity-review-routing-0927",
+              "codex_command": "not-applicable",
+              "failure_scope": "none",
+              "retry_on_isolated_worktree": 0
+            }
+          ]
+        },
+        {
+          "ordinal": 3,
+          "fallback_hop": "native-subagent",
+          "candidates": [],
+          "fleet_visibility": "degraded"
+        },
+        {
+          "ordinal": 4,
+          "fallback_hop": "inline",
+          "status": "eligible-after-prior-hop-exhaustion",
+          "reason_enum": "runtime-unavailable",
+          "fleet_visibility": "none"
+        }
+      ],
+      "profile_demand": null,
+      "profile_selection": {
+        "schema_version": 1,
+        "source": "legacy",
+        "resolver_version": "profile-demand/v1",
+        "demand_digest": null,
+        "resolved_profile": "light",
+        "judgment_floor": "unknown",
+        "reason": "unannotated-existing-stage"
+      },
+      "harness_affinity": "diverse",
+      "harness_policy": {
+        "primary": [
+          "claude",
+          "codex",
+          "opencode"
+        ],
+        "relief": [],
+        "last_resort": [],
+        "promote_relief_below": 0
+      }
+    },
+    {
+      "id": "test",
+      "kind": "pipeline-stage",
+      "depends_on": [
+        "impl-review"
+      ],
+      "role": "fast reviewer",
+      "inputs": [
+        "plan.md",
+        "checklist.md",
+        "source-diff"
+      ],
+      "outputs": [
+        "test_logs/**"
+      ],
+      "write_scope": [
+        "test_logs/**",
+        "_internal/test_reviews/**",
+        "evidence/**"
+      ],
+      "resource_class": "normal",
+      "completion_gate": "code-test",
+      "dispatch_depth": 2,
+      "unit": "qa/test",
+      "model_profile": "light",
+      "parent_cross_preference": true,
+      "advance_class": "runtime-eligible",
+      "commit_expected": false,
+      "continuation": {
+        "kind": "inline-next"
+      },
+      "fallback_hops": [
+        {
+          "ordinal": 1,
+          "fallback_hop": "same-harness-headless",
+          "candidates": [
+            {
+              "child_harness": "codex",
+              "failure_class": "",
+              "launch_authority": "conductor",
+              "parent_harness": "codex",
+              "parent_sandbox": "workspace-write",
+              "parent_transport": "headless",
+              "probe_source": "frozen-old-compiler",
+              "probe_time": "2026-09-27T00:00:00Z",
+              "status": "supported",
+              "checked_worktree": "/home/nas/user/Uihyeop/personal/hearting-wt/capacity-review-routing-0927",
+              "codex_command": "ok",
+              "failure_scope": "none",
+              "retry_on_isolated_worktree": 0
+            }
+          ]
+        },
+        {
+          "ordinal": 2,
+          "fallback_hop": "cross-harness-headless",
+          "candidates": [
+            {
+              "child_harness": "claude",
+              "failure_class": "",
+              "launch_authority": "conductor",
+              "parent_harness": "codex",
+              "parent_sandbox": "workspace-write",
+              "parent_transport": "headless",
+              "probe_source": "frozen-old-compiler",
+              "probe_time": "2026-09-27T00:00:00Z",
+              "status": "supported",
+              "checked_worktree": "/home/nas/user/Uihyeop/personal/hearting-wt/capacity-review-routing-0927",
+              "codex_command": "not-applicable",
+              "failure_scope": "none",
+              "retry_on_isolated_worktree": 0
+            }
+          ]
+        },
+        {
+          "ordinal": 3,
+          "fallback_hop": "native-subagent",
+          "candidates": [],
+          "fleet_visibility": "degraded"
+        },
+        {
+          "ordinal": 4,
+          "fallback_hop": "inline",
+          "status": "eligible-after-prior-hop-exhaustion",
+          "reason_enum": "runtime-unavailable",
+          "fleet_visibility": "none"
+        }
+      ],
+      "profile_demand": null,
+      "profile_selection": {
+        "schema_version": 1,
+        "source": "legacy",
+        "resolver_version": "profile-demand/v1",
+        "demand_digest": null,
+        "resolved_profile": "light",
+        "judgment_floor": "unknown",
+        "reason": "unannotated-existing-stage"
+      },
+      "harness_affinity": "diverse",
+      "harness_policy": {
+        "primary": [
+          "claude",
+          "codex",
+          "opencode"
+        ],
+        "relief": [],
+        "last_resort": [],
+        "promote_relief_below": 0
+      }
+    },
+    {
+      "id": "report",
+      "kind": "pipeline-stage",
+      "depends_on": [
+        "test"
+      ],
+      "role": "fast writer",
+      "inputs": [
+        "plan.md",
+        "checklist.md",
+        "dev_logs/**",
+        "test_logs/**"
+      ],
+      "outputs": [
+        "pipeline_summary.md",
+        "final_report.md"
+      ],
+      "write_scope": [
+        "pipeline_summary.md",
+        "final_report.md",
+        "analysis_project/code/**"
+      ],
+      "resource_class": "normal",
+      "completion_gate": "code-report",
+      "dispatch_depth": 2,
+      "unit": "editorial/report",
+      "model_profile": "balanced",
+      "advance_class": "model-required",
+      "model_required_reason": "terminal-report",
+      "commit_expected": false,
+      "profile_demand": {
+        "schema_version": 1,
+        "judgment_requirement": "predetermined",
+        "execution_scope": "extended-multistep",
+        "judgment_reason": "The accepted plan and completed checks fix the decisions; new judgment returns to the owner.",
+        "execution_reason": "Assemble verified implementation and test artifacts into the final reports.",
+        "evidence_refs": [
+          "capabilities/autopilot-code.md#portable-procedure",
+          "test_logs/"
+        ]
+      },
+      "terminal": true,
+      "terminal_gate": "code-report",
+      "fallback_hops": [
+        {
+          "ordinal": 1,
+          "fallback_hop": "same-harness-headless",
+          "candidates": [
+            {
+              "child_harness": "codex",
+              "failure_class": "",
+              "launch_authority": "conductor",
+              "parent_harness": "codex",
+              "parent_sandbox": "workspace-write",
+              "parent_transport": "headless",
+              "probe_source": "frozen-old-compiler",
+              "probe_time": "2026-09-27T00:00:00Z",
+              "status": "supported",
+              "checked_worktree": "/home/nas/user/Uihyeop/personal/hearting-wt/capacity-review-routing-0927",
+              "codex_command": "ok",
+              "failure_scope": "none",
+              "retry_on_isolated_worktree": 0
+            }
+          ]
+        },
+        {
+          "ordinal": 2,
+          "fallback_hop": "cross-harness-headless",
+          "candidates": [
+            {
+              "child_harness": "claude",
+              "failure_class": "",
+              "launch_authority": "conductor",
+              "parent_harness": "codex",
+              "parent_sandbox": "workspace-write",
+              "parent_transport": "headless",
+              "probe_source": "frozen-old-compiler",
+              "probe_time": "2026-09-27T00:00:00Z",
+              "status": "supported",
+              "checked_worktree": "/home/nas/user/Uihyeop/personal/hearting-wt/capacity-review-routing-0927",
+              "codex_command": "not-applicable",
+              "failure_scope": "none",
+              "retry_on_isolated_worktree": 0
+            }
+          ]
+        },
+        {
+          "ordinal": 3,
+          "fallback_hop": "native-subagent",
+          "candidates": [],
+          "fleet_visibility": "degraded"
+        },
+        {
+          "ordinal": 4,
+          "fallback_hop": "inline",
+          "status": "eligible-after-prior-hop-exhaustion",
+          "reason_enum": "runtime-unavailable",
+          "fleet_visibility": "none"
+        }
+      ],
+      "profile_selection": {
+        "schema_version": 1,
+        "source": "matrix",
+        "resolver_version": "profile-demand/v1",
+        "demand_digest": "sha256:c9399f22a656dc5e7948fc80f4be311fcd2b8f94bd7510f961acc9dccf43fc58",
+        "resolved_profile": "balanced",
+        "judgment_floor": "none",
+        "reason": "matrix-cell"
+      },
+      "harness_affinity": "diverse",
+      "harness_policy": {
+        "primary": [
+          "claude",
+          "codex"
+        ],
+        "relief": [],
+        "last_resort": [
+          "opencode"
+        ],
+        "promote_relief_below": 0
+      }
+    }
+  ],
+  "parallel_groups": [],
+  "conditional_extensions": [
+    {
+      "id": "offer-artifact",
+      "extension": "artifact-sink",
+      "activation_condition": "artifact-sink-available",
+      "after": [
+        "report"
+      ],
+      "source_outputs": [
+        {
+          "node": "report",
+          "output": "final_report.md"
+        }
+      ],
+      "on_unavailable": "skip"
+    }
+  ],
+  "completion_gates": [
+    "code-execute",
+    "code-frame",
+    "code-impl-review",
+    "code-plan",
+    "code-plan-check",
+    "code-report",
+    "code-test"
+  ],
+  "human_gates": [
+    "frame-review"
+  ],
+  "human_gate_bindings": [
+    {
+      "gate": "frame-review",
+      "node": "plan",
+      "position": "entry"
+    }
+  ],
+  "workflow_contract": {
+    "schema_version": 1,
+    "states": [
+      "CREATED",
+      "READY",
+      "RUNNING",
+      "STAGE_SUCCEEDED",
+      "NEXT_REGISTERED",
+      "NEXT_RUNNING",
+      "TERMINAL_VERIFY",
+      "COMPLETE"
+    ],
+    "failure_states": [
+      "BLOCKED_HUMAN_GATE",
+      "FAILED_RETRYABLE",
+      "FAILED_TERMINAL",
+      "CANCELLED"
+    ],
+    "terminal_nodes": [
+      "report"
+    ],
+    "continuations": {
+      "frame": "human-gate",
+      "frame-alternative": "human-gate",
+      "plan": "inline-next",
+      "plan-check": "inline-next",
+      "execute": "inline-next",
+      "impl-review": "inline-next",
+      "test": "inline-next"
+    },
+    "human_gate_bindings": [
+      {
+        "gate": "frame-review",
+        "node": "plan",
+        "position": "entry"
+      }
+    ]
+  },
+  "resume_retry_boundaries": [
+    "frame",
+    "frame-alternative",
+    "plan",
+    "plan-check",
+    "execute",
+    "impl-review",
+    "test",
+    "report"
+  ],
+  "dispatch_evidence": {
+    "tuples": [
+      {
+        "child_harness": "codex",
+        "failure_class": "",
+        "launch_authority": "conductor",
+        "parent_harness": "codex",
+        "parent_sandbox": "workspace-write",
+        "parent_transport": "headless",
+        "probe_source": "frozen-old-compiler",
+        "probe_time": "2026-09-27T00:00:00Z",
+        "status": "supported",
+        "checked_worktree": "/home/nas/user/Uihyeop/personal/hearting-wt/capacity-review-routing-0927",
+        "codex_command": "ok",
+        "failure_scope": "none",
+        "retry_on_isolated_worktree": 0
+      },
+      {
+        "child_harness": "claude",
+        "failure_class": "",
+        "launch_authority": "conductor",
+        "parent_harness": "codex",
+        "parent_sandbox": "workspace-write",
+        "parent_transport": "headless",
+        "probe_source": "frozen-old-compiler",
+        "probe_time": "2026-09-27T00:00:00Z",
+        "status": "supported",
+        "checked_worktree": "/home/nas/user/Uihyeop/personal/hearting-wt/capacity-review-routing-0927",
+        "codex_command": "not-applicable",
+        "failure_scope": "none",
+        "retry_on_isolated_worktree": 0
+      }
+    ],
+    "native_subagent": []
+  },
+  "dispatch_contract_version": 3,
+  "registered_headless_candidates": null,
+  "registered_headless_policy": null,
+  "unit_catalog_digest": "sha256:a565c51b6d07e301836027295e3e49d01dcb2b2bdacb98845441711c73188314",
+  "validation_basis": {
+    "basis_version": 1,
+    "registry_root": "/home/nas/user/Uihyeop/personal/hearting-wt/capacity-review-routing-0927",
+    "unit_catalog_root": "/home/nas/user/Uihyeop/personal/hearting-wt/capacity-review-routing-0927",
+    "runtime_root": "/home/nas/user/Uihyeop/personal/hearting-wt/capacity-review-routing-0927",
+    "runtime_root_validated": true,
+    "runtime_root_match": true
+  },
+  "launch_compatibility_tuple": {
+    "contract_version": 1,
+    "tuple_version": 1,
+    "registry_root": {
+      "kind": "registry_root",
+      "path": "/home/nas/user/Uihyeop/personal/hearting-wt/capacity-review-routing-0927",
+      "release_id": "63a929740b256f7515098fe50c47b999b7e503e7+dirty:324acb544629",
+      "content_digest": "sha256:9250faa77d5cfe296f0ac30e3b000876b004c80513017fa4260395c4d16b843c",
+      "binding_digest": "sha256:126fd660187fe265eef98a4b2630d989e354e832bfa95f37d70d16009ed25937"
+    },
+    "launch_home": {
+      "kind": "launch_home",
+      "path": "/home/nas/user/Uihyeop/personal/hearting-wt/capacity-review-routing-0927",
+      "release_id": "63a929740b256f7515098fe50c47b999b7e503e7+dirty:324acb544629",
+      "content_digest": "sha256:9250faa77d5cfe296f0ac30e3b000876b004c80513017fa4260395c4d16b843c",
+      "binding_digest": "sha256:970402ec332696640af54dfbe320a96e101a02960cdd9ebe3f12f0f771ee6c25"
+    },
+    "runtime_root": {
+      "kind": "runtime_root",
+      "path": "/home/nas/user/Uihyeop/personal/hearting-wt/capacity-review-routing-0927",
+      "release_id": "63a929740b256f7515098fe50c47b999b7e503e7+dirty:324acb544629",
+      "content_digest": "sha256:9250faa77d5cfe296f0ac30e3b000876b004c80513017fa4260395c4d16b843c",
+      "binding_digest": "sha256:64addb69afa7eb50857277e5f55b19a0a3e240756e826b1f744b0323236147eb"
+    },
+    "grounding_roots": {
+      "cwd": {
+        "kind": "grounding_cwd",
+        "path": "/home/nas/user/Uihyeop/personal/hearting-wt/capacity-review-routing-0927",
+        "release_id": "63a929740b256f7515098fe50c47b999b7e503e7+dirty:324acb544629",
+        "content_digest": "sha256:9250faa77d5cfe296f0ac30e3b000876b004c80513017fa4260395c4d16b843c",
+        "binding_digest": "sha256:5dc93a744df95cc4195c65f87b203c02ccd7c802161734a14bd92cd289597684"
+      },
+      "artifact_root": {
+        "kind": "grounding_artifact_root",
+        "path": "/tmp/tmpqeb9l_3d",
+        "release_id": "63a929740b256f7515098fe50c47b999b7e503e7+dirty:324acb544629",
+        "content_digest": "sha256:9250faa77d5cfe296f0ac30e3b000876b004c80513017fa4260395c4d16b843c",
+        "binding_digest": "sha256:48774675f2991cf72987c3b42d306dafbab33fc099cae80931dcdc7fb748f65f"
+      }
+    },
+    "wrapper_root": {
+      "kind": "wrapper_root",
+      "path": "/home/nas/user/Uihyeop/personal/hearting-wt/capacity-review-routing-0927/adapters",
+      "release_id": "63a929740b256f7515098fe50c47b999b7e503e7+dirty:dfd266de887a",
+      "content_digest": "sha256:4c2bf7a6d0708bb7a9e07b9f38cca6ebd6a39c1236695f64815b99e4a27485bd",
+      "binding_digest": "sha256:5956b1278956ea9eb22803a799ff106e705ceb432fbf85d97362fc82ec3b3b07"
+    },
+    "jobs_path": {
+      "kind": "jobs_path",
+      "path": "/tmp/tmpqeb9l_3d/jobs.log",
+      "release_id": "63a929740b256f7515098fe50c47b999b7e503e7+dirty:324acb544629",
+      "content_digest": "sha256:9250faa77d5cfe296f0ac30e3b000876b004c80513017fa4260395c4d16b843c",
+      "binding_digest": "sha256:799447ab627786db04b79c1b6341f382888924fc9a2138b0910c46d620a1dd1a"
+    }
+  },
+  "advance_generation": 0,
+  "runtime_support": {
+    "terminal_commit": true,
+    "terminal_commit_contract": "terminal_commit_v1",
+    "terminal_handoff_contract": "terminal_handoff_claim_v1",
+    "producer_binding_contract": "producer_binding_v1"
+  },
+  "slug": "legacy-sd160-standard",
+  "slug_truncated": false,
+  "dispatch_evidence_scope_version": 1,
+  "composed": true,
+  "composed_recipe": {
+    "capability": "autopilot-code",
+    "modes": [
+      "audit",
+      "debug",
+      "dev"
+    ],
+    "topology_class": "staged",
+    "direct_predicates": [
+      "atomic-outcome",
+      "known-scope",
+      "no-shared-contract",
+      "no-resource-run",
+      "no-artifact-handoff",
+      "no-independent-verifier",
+      "focused-verification"
+    ],
+    "promotion_signals": [
+      "multi-write-scope",
+      "shared-contract",
+      "public-api",
+      "schema-change",
+      "independent-verifier",
+      "stage-resume",
+      "multi-runtime-parity"
+    ],
+    "artifact_scope": {
+      "cycle_anchors": [
+        "plans/<cycle>"
+      ],
+      "root_anchors": [
+        "analysis_project/code"
+      ],
+      "external_scopes": [
+        "source/**",
+        "source-scoped"
+      ],
+      "map_anchor": "shards",
+      "review_anchor": "_internal"
+    },
+    "quick": {
+      "topology": "one-shot-owner",
+      "worker_kind": "capability-owner",
+      "write_scope": [
+        "source-scoped",
+        "plans/<cycle>/**"
+      ],
+      "owner_dispatch_depth": 1,
+      "max_dispatch_depth": 1,
+      "model_profile": "balanced-deep"
+    },
+    "standard_plus": {
+      "topology": "staged",
+      "owner_dispatch_depth": 1,
+      "max_dispatch_depth": 2,
+      "nodes": [
+        {
+          "id": "frame",
+          "kind": "map-worker",
+          "depends_on": [],
+          "role": "deep maker",
+          "inputs": [
+            "task",
+            "spec",
+            "source"
+          ],
+          "outputs": [
+            "shards/frame/direction-brief.md"
+          ],
+          "write_scope": [
+            "shards/frame/**"
+          ],
+          "resource_class": "normal",
+          "completion_gate": "code-frame",
+          "dispatch_depth": 1,
+          "launch_authority": "depth-0",
+          "worker_type": "frame",
+          "unit": "plan/frame",
+          "model_profile": "balanced-deep",
+          "advance_class": "runtime-eligible",
+          "commit_expected": false,
+          "continuation": {
+            "kind": "human-gate",
+            "gate": "frame-review"
+          }
+        },
+        {
+          "id": "frame-alternative",
+          "kind": "map-worker",
+          "depends_on": [],
+          "role": "deep maker",
+          "inputs": [
+            "task",
+            "spec",
+            "source"
+          ],
+          "outputs": [
+            "shards/frame-alternative/direction-brief.md"
+          ],
+          "write_scope": [
+            "shards/frame-alternative/**"
+          ],
+          "resource_class": "normal",
+          "completion_gate": "code-frame",
+          "dispatch_depth": 1,
+          "launch_authority": "depth-0",
+          "worker_type": "frame",
+          "unit": "plan/frame",
+          "model_profile": "light",
+          "advance_class": "runtime-eligible",
+          "commit_expected": false,
+          "continuation": {
+            "kind": "human-gate",
+            "gate": "frame-review"
+          }
+        },
+        {
+          "id": "plan",
+          "kind": "pipeline-stage",
+          "depends_on": [
+            "frame",
+            "frame-alternative"
+          ],
+          "role": "deep maker",
+          "inputs": [
+            "task",
+            "spec",
+            "source",
+            "shards/frame/direction-brief.md",
+            "shards/frame-alternative/direction-brief.md"
+          ],
+          "outputs": [
+            "plan.md",
+            "checklist.md"
+          ],
+          "write_scope": [
+            "plan.md",
+            "checklist.md"
+          ],
+          "resource_class": "normal",
+          "completion_gate": "code-plan",
+          "dispatch_depth": 2,
+          "fallback_hops": [
+            "same-harness-headless",
+            "cross-harness-headless",
+            "inline"
+          ],
+          "unit": "plan/plan-author",
+          "model_profile": "balanced-deep",
+          "advance_class": "runtime-eligible",
+          "commit_expected": false,
+          "continuation": {
+            "kind": "inline-next"
+          }
+        },
+        {
+          "id": "plan-check",
+          "kind": "review-worker",
+          "depends_on": [
+            "plan"
+          ],
+          "role": "fast reviewer",
+          "unit": "qa/plan-review",
+          "inputs": [
+            "plan.md",
+            "checklist.md"
+          ],
+          "outputs": [
+            "_internal/plan_reviews/round_1.md"
+          ],
+          "write_scope": [
+            "_internal/plan_reviews/**"
+          ],
+          "resource_class": "normal",
+          "completion_gate": "code-plan-check",
+          "dispatch_depth": 2,
+          "fallback_hops": [
+            "same-harness-headless",
+            "cross-harness-headless",
+            "native-subagent",
+            "inline"
+          ],
+          "model_profile": "light",
+          "advance_class": "runtime-eligible",
+          "commit_expected": false,
+          "continuation": {
+            "kind": "inline-next"
+          }
+        },
+        {
+          "id": "execute",
+          "kind": "pipeline-stage",
+          "depends_on": [
+            "plan-check"
+          ],
+          "role": "fast implementer",
+          "inputs": [
+            "plan.md",
+            "checklist.md"
+          ],
+          "outputs": [
+            "source-diff",
+            "dev_logs/**"
+          ],
+          "write_scope": [
+            "source/**",
+            "checklist.md",
+            "dev_logs/**",
+            "evidence/**"
+          ],
+          "resource_class": "normal",
+          "completion_gate": "code-execute",
+          "dispatch_depth": 2,
+          "fallback_hops": [
+            "same-harness-headless",
+            "cross-harness-headless",
+            "inline"
+          ],
+          "unit": "dev/backend",
+          "unit_choices": [
+            "dev/backend",
+            "dev/frontend",
+            "dev/new-lib",
+            "dev/refactor"
+          ],
+          "model_profile": "balanced",
+          "subdivision": {
+            "min_intensity": "standard",
+            "max_slices": 4,
+            "disjointness": "exact-fixed-files"
+          },
+          "advance_class": "runtime-eligible",
+          "commit_expected": true,
+          "profile_demand": {
+            "schema_version": 1,
+            "judgment_requirement": "predetermined",
+            "execution_scope": "extended-multistep",
+            "judgment_reason": "The accepted plan and completed checks fix the decisions; new judgment returns to the owner.",
+            "execution_reason": "Apply the approved plan across source and verification steps.",
+            "evidence_refs": [
+              "capabilities/autopilot-code.md#portable-procedure",
+              "plan.md"
+            ]
+          },
+          "continuation": {
+            "kind": "inline-next"
+          }
+        },
+        {
+          "id": "impl-review",
+          "kind": "review-worker",
+          "depends_on": [
+            "execute"
+          ],
+          "role": "fast reviewer",
+          "unit": "qa/code-review",
+          "inputs": [
+            "plan.md",
+            "source-diff",
+            "dev_logs/**"
+          ],
+          "outputs": [
+            "_internal/dev_reviews/phase_review.md"
+          ],
+          "write_scope": [
+            "_internal/dev_reviews/**"
+          ],
+          "resource_class": "normal",
+          "completion_gate": "code-impl-review",
+          "dispatch_depth": 2,
+          "fallback_hops": [
+            "same-harness-headless",
+            "cross-harness-headless",
+            "native-subagent",
+            "inline"
+          ],
+          "model_profile": "light",
+          "advance_class": "runtime-eligible",
+          "commit_expected": false,
+          "continuation": {
+            "kind": "inline-next"
+          }
+        },
+        {
+          "id": "test",
+          "kind": "pipeline-stage",
+          "depends_on": [
+            "impl-review"
+          ],
+          "role": "fast reviewer",
+          "inputs": [
+            "plan.md",
+            "checklist.md",
+            "source-diff"
+          ],
+          "outputs": [
+            "test_logs/**"
+          ],
+          "write_scope": [
+            "test_logs/**",
+            "_internal/test_reviews/**",
+            "evidence/**"
+          ],
+          "resource_class": "normal",
+          "completion_gate": "code-test",
+          "dispatch_depth": 2,
+          "fallback_hops": [
+            "same-harness-headless",
+            "cross-harness-headless",
+            "native-subagent",
+            "inline"
+          ],
+          "unit": "qa/test",
+          "model_profile": "light",
+          "parent_cross_preference": true,
+          "advance_class": "runtime-eligible",
+          "commit_expected": false,
+          "continuation": {
+            "kind": "inline-next"
+          }
+        },
+        {
+          "id": "report",
+          "kind": "pipeline-stage",
+          "depends_on": [
+            "test"
+          ],
+          "role": "fast writer",
+          "inputs": [
+            "plan.md",
+            "checklist.md",
+            "dev_logs/**",
+            "test_logs/**"
+          ],
+          "outputs": [
+            "pipeline_summary.md",
+            "final_report.md"
+          ],
+          "write_scope": [
+            "pipeline_summary.md",
+            "final_report.md",
+            "analysis_project/code/**"
+          ],
+          "resource_class": "normal",
+          "completion_gate": "code-report",
+          "dispatch_depth": 2,
+          "fallback_hops": [
+            "same-harness-headless",
+            "cross-harness-headless",
+            "inline"
+          ],
+          "unit": "editorial/report",
+          "model_profile": "balanced",
+          "advance_class": "model-required",
+          "model_required_reason": "terminal-report",
+          "commit_expected": false,
+          "profile_demand": {
+            "schema_version": 1,
+            "judgment_requirement": "predetermined",
+            "execution_scope": "extended-multistep",
+            "judgment_reason": "The accepted plan and completed checks fix the decisions; new judgment returns to the owner.",
+            "execution_reason": "Assemble verified implementation and test artifacts into the final reports.",
+            "evidence_refs": [
+              "capabilities/autopilot-code.md#portable-procedure",
+              "test_logs/"
+            ]
+          },
+          "terminal": true,
+          "terminal_gate": "code-report"
+        }
+      ],
+      "parallel_groups": [
+        {
+          "id": "plan",
+          "node": "plan",
+          "kind": "explore",
+          "min_intensity": "strong",
+          "width_by_intensity": {
+            "strong": 2,
+            "thorough": 3,
+            "adversarial": 3
+          },
+          "join_policy": "all",
+          "independence_axes": [
+            "cross-harness",
+            "model-profile",
+            "perspective"
+          ],
+          "legs": [
+            {
+              "suffix": "anchor",
+              "perspective": "primary-plan",
+              "model_profile": "deep",
+              "leg_class": "peer"
+            },
+            {
+              "suffix": "alternative",
+              "perspective": "independent-plan",
+              "model_profile": "balanced-deep",
+              "leg_class": "peer"
+            },
+            {
+              "suffix": "implementation-risk",
+              "perspective": "implementation-risk-scout",
+              "model_profile": "light",
+              "leg_class": "peer"
+            }
+          ]
+        },
+        {
+          "id": "impl-review",
+          "node": "impl-review",
+          "kind": "verify",
+          "min_intensity": "strong",
+          "width_by_intensity": {
+            "strong": 2,
+            "thorough": 3,
+            "adversarial": 3
+          },
+          "join_policy": "all",
+          "independence_axes": [
+            "cross-harness",
+            "model-profile",
+            "perspective"
+          ],
+          "legs": [
+            {
+              "suffix": "anchor",
+              "perspective": "primary-code-review",
+              "model_profile": "balanced-deep",
+              "leg_class": "peer"
+            },
+            {
+              "suffix": "alternative",
+              "perspective": "independent-code-review",
+              "model_profile": "light",
+              "leg_class": "peer"
+            },
+            {
+              "suffix": "failure-mode",
+              "perspective": "failure-mode-review",
+              "model_profile": "deep",
+              "leg_class": "peer"
+            }
+          ]
+        },
+        {
+          "id": "plan-check",
+          "node": "plan-check",
+          "kind": "verify",
+          "min_intensity": "strong",
+          "width_by_intensity": {
+            "strong": 2,
+            "thorough": 3,
+            "adversarial": 3
+          },
+          "join_policy": "all",
+          "independence_axes": [
+            "cross-harness",
+            "model-profile",
+            "perspective"
+          ],
+          "legs": [
+            {
+              "suffix": "anchor",
+              "perspective": "primary-plan-check",
+              "model_profile": "light",
+              "leg_class": "peer"
+            },
+            {
+              "suffix": "alternative",
+              "perspective": "independent-plan-check",
+              "model_profile": "balanced-deep",
+              "leg_class": "peer"
+            },
+            {
+              "suffix": "simplicity",
+              "perspective": "simplicity-check",
+              "model_profile": "light",
+              "leg_class": "auxiliary",
+              "auxiliary_check": "simplicity-check"
+            }
+          ]
+        }
+      ]
+    },
+    "conditional_extensions": [
+      {
+        "id": "offer-artifact",
+        "extension": "artifact-sink",
+        "activation_condition": "artifact-sink-available",
+        "after": [
+          "report"
+        ],
+        "source_outputs": [
+          {
+            "node": "report",
+            "output": "final_report.md"
+          }
+        ],
+        "on_unavailable": "skip"
+      }
+    ],
+    "completion_gates": [
+      "code-execute",
+      "code-frame",
+      "code-impl-review",
+      "code-plan",
+      "code-plan-check",
+      "code-report",
+      "code-test"
+    ],
+    "human_gates": [
+      "frame-review"
+    ],
+    "human_gate_bindings": [
+      {
+        "gate": "frame-review",
+        "node": "plan",
+        "position": "entry"
+      }
+    ],
+    "resume_retry_boundaries": [
+      "frame",
+      "frame-alternative",
+      "plan",
+      "plan-check",
+      "execute",
+      "impl-review",
+      "test",
+      "report"
+    ],
+    "compose": {
+      "origin": "compose",
+      "shape": "staged",
+      "graph": [
+        "frame",
+        "frame-alternative",
+        "plan",
+        "plan-check",
+        "execute",
+        "impl-review",
+        "test",
+        "report"
+      ],
+      "unit_overrides": {},
+      "base_capability": "autopilot-code"
+    }
+  },
+  "route_hash": "sha256:f795515cd1c9eaaf676eb1adca3fa22436db3b2a0cf3f13203d1ad44b1beda80",
+  "route_id": "rt-f795515cd1c9eaaf",
+  "owner_attempt_id": "-",
+  "route_family_key": "sha256:9d8af9c10f7439604543e54a7c791a5cb67e5aea597f2351ba06c7979335f23b",
+  "campaign_unassigned": true
+}

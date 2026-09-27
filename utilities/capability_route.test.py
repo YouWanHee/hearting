@@ -419,7 +419,7 @@ class TestRoute(unittest.TestCase):
   alternative=next(n for n in strong["nodes"] if n["id"]=="impl-review-alternative")
   self.assertEqual(base["parallel_group"],"impl-review")
   self.assertEqual(alternative["parallel_group"],"impl-review")
-  self.assertEqual(alternative["parallel_independence_axes"],["cross-harness","model-profile","perspective"])
+  self.assertEqual(alternative["parallel_independence_axes"],["model-profile","perspective"])
   self.assertEqual(alternative["dispatch_depth"],2)
   self.assertEqual(alternative["unit"],base["unit"])
   self.assertEqual(alternative["outputs"],["_internal/dev_reviews-alternative/phase_review.md"])

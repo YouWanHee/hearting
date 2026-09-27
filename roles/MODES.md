@@ -32,8 +32,9 @@ already encoded in the fragment and the unit contracts:
   `research/claim-verify`, which is default-refute with quorum aggregation.
 
 This stance is a posture inside whatever check runs — distinct from the separate
-cross-harness adversary *pass* that only higher intensities add, which is realized by
-dispatching the relevant review unit to a different harness.
+independent adversary *pass* that only higher intensities add, which is realized by
+dispatching the relevant review persona into a separate execution. The same harness
+is sufficient (SD-160); usage-aware allocation does not require a cross-harness pass.
 
 ## Adapter realization
 
