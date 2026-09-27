@@ -843,6 +843,24 @@ PERMISSION_POSTURES = ("bypass", "allowlist")
 # denied command is a plain tool refusal the model can route around, never a
 # classifier cascade.
 PERMISSION_MODE_FLAG_VALUES = {"bypass": "bypassPermissions", "allowlist": "acceptEdits"}
+
+# A headless session ends when its turn ends, so a Bash call Claude Code moves
+# to the background (at the tool timeout, or on request) is lost with it: ~22
+# worker logs ended "waiting for the background notification" with no handoff,
+# and an owner's backgrounded call later started a turn of its own whose reply
+# the supervisor took for the resume answer (2026-09-27). Headless runs keep
+# every command in the foreground and may give a long command up to two hours.
+HEADLESS_FOREGROUND_ENV = {
+    "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
+    "BASH_MAX_TIMEOUT_MS": "7200000",
+}
+
+
+def apply_headless_foreground_env(env):
+    """Default the foreground-only settings; an explicit caller value wins."""
+    for key, value in HEADLESS_FOREGROUND_ENV.items():
+        env.setdefault(key, value)
+    return env
 # The allow rules a registered owner/worker contractually needs: its own
 # gate-recording utilities, read-only git, the harness test runners, and
 # Edit (which also governs Write) scoped to the worktree and the artifact
@@ -2431,6 +2449,7 @@ def main(argv: list[str]) -> int:
                 else "poll"
             ),
         })
+        apply_headless_foreground_env(env)
         if args.worker_role:
             env["AGENT_DISPATCH_WORKER_ROLE"] = args.worker_role
         else:

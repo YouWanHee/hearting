@@ -963,6 +963,24 @@ def claude_command(
     return command
 
 
+def result_answers_turn(result: dict[str, Any], turn_uuid: str | None = None) -> bool:
+    """Whether a Claude `result` answers the prompt this supervisor submitted.
+
+    Claude Code also starts turns of its own -- a Bash call it backgrounded at
+    the tool timeout finishes, a peer message arrives -- and their results
+    carry an `origin`. Taking the first `result` read after a write as the
+    answer let such a turn's reply stand in for the resume prompt's: on
+    2026-09-27 two owners "finished" a resumed turn in 0 s with the previous
+    turn's `runtime_wait` text and died dead-contract. A result that echoes the
+    submitted uuid is ours even when the prompt was folded into a running
+    turn; otherwise a result with an origin belongs to a turn we did not start.
+    """
+    echoed = result.get("user_message_uuids")
+    if turn_uuid and isinstance(echoed, list) and turn_uuid in echoed:
+        return True
+    return not result.get("origin")
+
+
 class ClaudeStreamSession:
     """One long-lived realtime-input Claude process for every owner boundary."""
 
@@ -993,12 +1011,16 @@ class ClaudeStreamSession:
         self.selector.register(self.process.stdout, selectors.EVENT_READ)
         self.output_buffer = b""
         self.closed = False
+        # Origins of results skipped as answers to turns Claude started itself.
+        self.skipped_result_origins: list[str] = []
 
     def run_turn(self, prompt: str, timeout: float) -> tuple[dict[str, Any], int]:
         if self.closed or self.process.stdin is None or self.process.stdout is None:
             raise SubmissionNotStarted("claude-stream-closed")
+        turn_uuid = str(uuid.uuid4())
         payload = {
             "type": "user",
+            "uuid": turn_uuid,
             "message": {
                 "role": "user",
                 "content": [{"type": "text", "text": prompt}],
@@ -1043,7 +1065,11 @@ class ClaudeStreamSession:
                 except (UnicodeDecodeError, ValueError):
                     continue
                 if isinstance(value, dict) and value.get("type") == "result":
-                    return value, self.process.poll() or 0
+                    if result_answers_turn(value, turn_uuid):
+                        return value, self.process.poll() or 0
+                    origin = value.get("origin")
+                    self.skipped_result_origins.append(
+                        str(origin.get("kind")) if isinstance(origin, dict) else str(origin))
 
     def submit(self, prompt: str, *, timeout: float = 60) -> tuple[dict[str, Any], int]:
         """Expose the common submission seam for the stream transport."""
@@ -1164,13 +1190,19 @@ def run_turn(
             process.communicate()
             raise
         final: dict[str, Any] | None = None
+        fallback: dict[str, Any] | None = None
         for line in output.splitlines():
             try:
                 value = json.loads(line)
             except ValueError:
                 continue
             if isinstance(value, dict) and value.get("type") == "result":
-                final = value
+                fallback = value
+                # Same rule as the stream: a turn Claude started itself (origin)
+                # is not the answer to this prompt.
+                if result_answers_turn(value):
+                    final = value
+        final = final or fallback
         if final is None:
             raise SupervisorError("claude-result-missing")
         return final, process.returncode
@@ -1450,6 +1482,13 @@ def main(argv: list[str] | None = None) -> int:
                     ),
                 }
             )
+            if stream_session is not None and stream_session.skipped_result_origins:
+                # Control row only: the skipped turns' model text never leaves the stream.
+                emit({"type": "dispatch.supervisor.result-skipped",
+                      "parent_attempt_id": args.parent_attempt_id,
+                      "turn_ordinal": turn_ordinal,
+                      "origins": list(stream_session.skipped_result_origins)})
+                stream_session.skipped_result_origins.clear()
             if (
                 process_rc != 0
                 or result.get("is_error") is True
@@ -1889,7 +1928,10 @@ def main(argv: list[str] | None = None) -> int:
                     {
                         "type": "dispatch.supervisor.teardown-completed",
                         "parent_attempt_id": args.parent_attempt_id,
-                        "reason": "route-terminal",
+                        # A failed final result is not a finished route (2026-09-27 dead-contract
+                        # exits were logged as route-terminal).
+                        "reason": ("route-terminal" if terminal.failure_class == "pass"
+                                   else f"final-result-{terminal.failure_class}"),
                         "monotonic_ns": teardown_completed_ns,
                         "duration_seconds": round(
                             (teardown_completed_ns - teardown_started_ns)

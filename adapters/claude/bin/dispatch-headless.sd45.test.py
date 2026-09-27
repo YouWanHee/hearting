@@ -1013,4 +1013,28 @@ class ClaudeHeadlessPermissionPosture(unittest.TestCase):
         self.assertNotIn("review_artifact_b64", dead)
 
 
+
+class HeadlessForegroundEnv(unittest.TestCase):
+    """A headless session dies when its turn ends, so it must never leave a
+    command running in the background (2026-09-27: ~22 workers ended "waiting
+    for the background notification" with no handoff, and two owners died on a
+    backgrounded call's own turn)."""
+
+    def test_background_tasks_are_disabled_and_long_commands_allowed(self):
+        env = WH.apply_headless_foreground_env({})
+        self.assertEqual(env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"], "1")
+        self.assertGreaterEqual(int(env["BASH_MAX_TIMEOUT_MS"]), 3_600_000)
+
+    def test_an_explicit_caller_value_wins(self):
+        env = WH.apply_headless_foreground_env({"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "0",
+                                                "BASH_MAX_TIMEOUT_MS": "900000"})
+        self.assertEqual(env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"], "0")
+        self.assertEqual(env["BASH_MAX_TIMEOUT_MS"], "900000")
+
+    def test_the_start_launch_env_applies_it(self):
+        source = Path(__file__).with_name("dispatch-headless.py").read_text(encoding="utf-8")
+        start = source.index('if action == "start" and args.attempt_claimed:')
+        self.assertIn("apply_headless_foreground_env(env)", source[start:start + 6000])
+
+
 if __name__=="__main__": unittest.main()

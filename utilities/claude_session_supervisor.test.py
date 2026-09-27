@@ -157,11 +157,22 @@ class ClaudeSessionSupervisorTest(unittest.TestCase):
                     with open(os.environ['FAKE_TRACE'], 'a', encoding='utf-8') as h:
                         h.write(json.dumps({'event':'turn-start','pid':os.getpid(),
                                             'time':time.monotonic(),'session':session,
-                                            'prompt':prompt,'delivered':delivered}) + '\\n')
+                                            'prompt':prompt,'delivered':delivered,
+                                            'uuid':payload.get('uuid')}) + '\\n')
                     text = ('artifact: -\\nverdict: PASS\\nblocker: none'
                             if delivered else 'runtime_wait: registered-children')
-                    print(json.dumps({'type':'result','subtype':'success','is_error':False,
-                                      'result':text}), flush=True)
+                    result = {'type':'result','subtype':'success','is_error':False,'result':text}
+                    if os.environ.get('FAKE_ECHO_UUID') == '1':
+                        result['user_message_uuids'] = [payload.get('uuid')]
+                    print(json.dumps(result), flush=True)
+                    if os.environ.get('FAKE_STALE_NOTIFICATION') == '1' and not delivered:
+                        # A Bash call Claude Code backgrounded finishes while the
+                        # owner is parked: Claude starts a turn of its own and its
+                        # reply sits in the pipe ahead of the next prompt's.
+                        stale = {'type':'result','subtype':'success','is_error':False,
+                                 'origin':{'kind':'task-notification'},
+                                 'result':'runtime_wait: registered-children'}
+                        print(json.dumps(stale), flush=True)
                 """
             ),
             encoding="utf-8",
@@ -394,6 +405,48 @@ class ClaudeSessionSupervisorTest(unittest.TestCase):
         self.assertTrue(all(row["transport"] == "stream-json" for row in starts))
         self.assertTrue(all(row["duration_seconds"] >= 0 for row in completed + joins + teardowns))
         self.assertEqual(rows[-1]["type"], "result")
+
+    def _run_with_stale_notification(self, echo_uuid):
+        # 2026-09-27: two owners resumed into a 0 s turn that returned the
+        # previous runtime_wait (a backgrounded call's own turn) and died
+        # dead-contract. The stale origin-bearing result must be skipped.
+        self.jobs.write_text(owner_row(self.lease) + child_row(), encoding="utf-8")
+        result = subprocess.run(
+            self.command(self.stream_claude) + ["--turn-transport", "stream-json"],
+            input="initial assignment", text=True, capture_output=True,
+            env=self.child_env(FAKE_TRACE=str(self.trace), FAKE_STALE_NOTIFICATION="1",
+                               FAKE_ECHO_UUID=echo_uuid),
+            timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        rows = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual(rows[-1]["type"], "result")
+        self.assertIn("verdict: PASS", rows[-1]["result"])
+        skipped = [row for row in rows if row.get("type") == "dispatch.supervisor.result-skipped"]
+        self.assertEqual([row["origins"] for row in skipped], [["task-notification"]], rows)
+        teardowns = [row for row in rows if row.get("type") == "dispatch.supervisor.teardown-completed"]
+        self.assertEqual([row["reason"] for row in teardowns], ["route-terminal"])
+        turns = [json.loads(line) for line in self.trace.read_text().splitlines()
+                 if json.loads(line).get("event") == "turn-start"]
+        uuids = [turn["uuid"] for turn in turns]
+        self.assertEqual(len(uuids), 2)
+        self.assertTrue(all(uuids) and len(set(uuids)) == 2, uuids)
+
+    def test_stale_notification_result_is_skipped_without_uuid_echo(self):
+        self._run_with_stale_notification("0")
+
+    def test_stale_notification_result_is_skipped_with_uuid_echo(self):
+        self._run_with_stale_notification("1")
+
+    def test_result_answers_turn_rule(self):
+        mine = "5f0c8a2e-0000-4000-8000-000000000001"
+        self.assertTrue(supervisor.result_answers_turn({"type": "result"}, mine))
+        stale = {"type": "result", "origin": {"kind": "task-notification"}}
+        self.assertFalse(supervisor.result_answers_turn(stale, mine))
+        self.assertFalse(supervisor.result_answers_turn(stale))
+        folded = dict(stale, user_message_uuids=["other", mine])
+        self.assertTrue(supervisor.result_answers_turn(folded, mine))
+        self.assertFalse(supervisor.result_answers_turn(dict(stale, user_message_uuids=["other"]), mine))
 
     def test_terminal_marker_closes_stream_without_final_owner_turn(self):
         route = self.base / "terminal-route.json"
