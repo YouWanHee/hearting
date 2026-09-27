@@ -62,10 +62,8 @@ from dispatch_supervisor_terminal import (
     SupervisorTerminal,
     classify_codex_result,
     classify_supervisor_error,
-    classify_terminal_commit_error,
     codex_turn_failure_terminal,
     reconcile_supervisor_terminal,
-    terminal_commit_error_event,
 )
 
 
@@ -1451,26 +1449,6 @@ def main(argv: list[str] | None = None) -> int:
         return 70
     except Exception as exc:  # fail closed without leaking protocol/model content
         lease_exit = (type(exc), exc, exc.__traceback__)
-        # Lazy: see the identical comment in claude-session-supervisor.py --
-        # importing here, only on an already-abnormal exit, does not touch
-        # the module-load-order gate (A49-13b) the normal success path relies on.
-        from dispatch_terminal_commit import TerminalCommitError, terminal_commit_error_evidence
-        if isinstance(exc, TerminalCommitError):
-            evidence = terminal_commit_error_evidence(
-                exc, route_file=Path(args.route_file), route_id=args.route_id,
-                owner_attempt_id=args.parent_attempt_id,
-            )
-            terminal = classify_terminal_commit_error(
-                evidence["code"], evidence["detail"],
-                terminal_slot=evidence.get("terminal_slot", ""), route_file=evidence["route_file"],
-            )
-            if not reconcile(args, terminal):
-                return 70
-            emit(terminal_commit_error_event(
-                evidence["code"], evidence["detail"],
-                terminal_slot=evidence.get("terminal_slot", ""), route_file=evidence["route_file"],
-            ))
-            return 70
         terminal = classify_supervisor_error(
             "codex", f"supervisor-internal-{type(exc).__name__}"
         )

@@ -60,6 +60,7 @@ import artifact_locator  # noqa: E402
 import artifact_manifest  # noqa: E402
 import artifact_campaign  # noqa: E402
 import route_identity  # noqa: E402
+import dispatch_contract  # noqa: E402
 import dispatch_lock_order  # noqa: E402
 import dispatch_terminal_commit  # noqa: E402
 from dispatch_contract import (  # noqa: E402
@@ -964,21 +965,57 @@ def _env_for(root: Path, record: Mapping[str, Any]) -> Dict[str, str]:
 def select_route_open_cycle(root: Path, route: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     """Return the route's own open cycle record, or ``None`` if it has none.
 
-    At most one open cycle may exist per ``route_id``; a second one, or an
-    open cycle whose ``route_hash`` no longer matches this route, is a bound
-    selection ambiguity -- never a "pick the newest/freshest directory"
-    guess (PRD SS13.36.2(1)-5). This is the one reader every caller that
-    needs "the route's open cycle" shares (LOOP SS5): `prepare_route_artifact_env`
-    and the terminal-commit binding writer (`dispatch_terminal_commit.
-    ensure_producer_binding`) must never each grow their own copy.
+    This is the one reader every caller that needs the route's open cycle
+    shares: begin, route environment preparation, and checkpoint selection.
+    No caller guesses from directory recency.
     """
     records = [record for record in list_cycle_records(root)
                if record.get("route_id") == route.get("route_id") and record.get("state") == "open"]
     if not records:
         return None
-    if len(records) != 1 or records[0].get("route_hash") != route.get("route_hash"):
+    if len(records) > 1:
         raise ProducerError("route-cycle-binding-ambiguous", str(route.get("route_id", "")))
+    if records[0].get("route_hash") != route.get("route_hash"):
+        raise ProducerError("route-hash-drift", str(records[0].get("cycle_id", "")))
     return records[0]
+
+
+def bind_owner_launch(args, jobs: Path, *, environ=None) -> Optional[Dict[str, Any]]:
+    """Publish the owner binding at the registered launch seam (§13.53.3).
+
+    The wrapper has claimed the owner row but has not spawned it yet. Reusing
+    begin's resume-only success path preserves every admission check and keeps
+    settlement read-only.
+    """
+    environ = os.environ if environ is None else environ
+    if not dispatch_contract.is_runtime_owner_launch(args) or not environ.get("AGENT_ARTIFACT_CYCLE_ID"):
+        return None
+    owner_binding = getattr(args, "owner_route_binding", None)
+    route_file = (owner_binding.get("route_file") if isinstance(owner_binding, Mapping)
+                  else getattr(owner_binding, "route_file", None)) or getattr(args, "route_file", None)
+    if not route_file:
+        return None
+    try:
+        route = json.loads(Path(route_file).read_text(encoding="utf-8"))
+        root = Path(route["artifact_root"]).resolve()
+        validated_route = load_route(root, Path(route_file))
+        existing_open = select_route_open_cycle(root, validated_route)
+        env_cycle = environ["AGENT_ARTIFACT_CYCLE_ID"]
+        if existing_open is not None and existing_open["cycle_id"] != env_cycle:
+            raise ProducerError("producer-binding-mismatch",
+                                f"launch-cycle={env_cycle} bound={existing_open['cycle_id']}")
+        result = begin(root, route_file=Path(route_file), capability=route["capability"],
+                       intensity=route["effective_intensity"], require_cycle=True,
+                       jobs=Path(jobs), owner_attempt_id=args.attempt_id, resume_only=True)
+        if result.get("cycle_id") != env_cycle:
+            raise ProducerError("producer-binding-mismatch",
+                                f"launch-cycle={env_cycle} bound={result.get('cycle_id', '')}")
+        return result
+    except ProducerError:
+        raise
+    except Exception as exc:
+        detail = str(getattr(exc, "detail", "") or exc)
+        raise ProducerError(getattr(exc, "code", type(exc).__name__), detail) from exc
 
 
 def prepare_route_artifact_env(route_file: Path, *, start: bool, jobs: Path) -> Dict[str, str]:
@@ -1340,6 +1377,7 @@ def begin(
     now: Optional[float] = None,
     jobs: Optional[Path] = None,
     owner_attempt_id: Optional[str] = None,
+    resume_only: bool = False,
 ) -> Dict[str, Any]:
     dispatch_terminal_commit.require_current_cleanup("producer-begin", jobs=jobs)
     root = Path(root).resolve()
@@ -1372,6 +1410,8 @@ def begin(
     if klass["state"] == "malformed":
         raise ProducerError("cutover-record-malformed", klass["reason"])
     if klass["state"] == "inactive-empty":
+        if resume_only:
+            raise ProducerError("producer-binding-required", "route-cycle-absent")
         # D-73: bootstrap-first identity. MUST stay above the admission lock at
         # :547 -- activate() acquires the same lock and would self-deadlock.
         activate(root,
@@ -1413,8 +1453,7 @@ def begin(
         try:
             owner_binding = dispatch_terminal_commit.validate_owner_route(
                 jobs=binding_jobs, route_file=resolved_route_file, owner_attempt_id=binding_owner)
-            existing_open = next((row for row in list_cycle_records(root)
-                                  if row.get("route_id") == route["route_id"] and row.get("state") == "open"), None)
+            existing_open = select_route_open_cycle(root, route)
             binding_path = dispatch_terminal_commit.producer_binding_path(
                 root, owner_binding.route_id, binding_owner)
             if binding_path.exists():
@@ -1436,6 +1475,9 @@ def begin(
         if resplit_lock.exists() or resplit_lock.is_symlink():
             detail = _read_json(resplit_lock)
             raise ProducerError("resplit-in-progress", json.dumps(detail or {}, sort_keys=True))
+        record = select_route_open_cycle(root, route)
+        if resume_only and record is None:
+            raise ProducerError("producer-binding-required", "route-cycle-absent")
         campaign: Optional[Dict[str, Any]] = None
         parent = None
         campaign_reopen_event_id = None
@@ -1478,32 +1520,29 @@ def begin(
             if campaign_key is not None and campaign.get("key") != campaign_key:
                 raise ProducerError("campaign-key-mismatch", campaign_key)
         # Idempotent per route: one open cycle per route.
-        for record in list_cycle_records(root):
-            if record.get("route_id") == route["route_id"] and record.get("state") == "open":
-                if record.get("route_hash") != route["route_hash"]:
-                    raise ProducerError("route-hash-drift", record["cycle_id"])
-                bound_campaign = read_campaign(root, record["campaign_id"])
-                if bound_campaign is None or bound_campaign.get("state") != "active":
-                    raise ProducerError("campaign-not-active", record["campaign_id"])
-                if ((campaign is not None and campaign["campaign_id"] != record["campaign_id"])
-                        or (campaign_key is not None and campaign_key != bound_campaign.get("key"))
-                        or (parent_cycle_id is not None and parent_cycle_id != record.get("parent_cycle_id"))):
-                    raise ProducerError("cycle-campaign-selection-conflict", record["cycle_id"])
-                if binding_jobs is not None and binding_owner:
-                    try:
-                        dispatch_terminal_commit.publish_producer_binding(
-                            artifact_root=root, jobs=binding_jobs, route_file=resolved_route_file,
-                            owner_attempt_id=binding_owner, cycle_id=record["cycle_id"],
-                            owner_begin=owner_begin)
-                    except dispatch_terminal_commit.TerminalCommitError as exc:
-                        raise ProducerError(exc.code, exc.detail) from exc
-                return {
-                    "status": "resumed", "layout": "cycle", "campaign_id": record["campaign_id"],
-                    "cycle_id": record["cycle_id"], "producer_id": record["producer_id"],
-                    "cycle_dir": str(cycle_dir(root, record["campaign_id"], record["cycle_id"], record)),
-                    "env": _env_for(root, record),
-                    **_campaign_degradation(bound_campaign),
-                }
+        if record is not None:
+            bound_campaign = read_campaign(root, record["campaign_id"])
+            if bound_campaign is None or bound_campaign.get("state") != "active":
+                raise ProducerError("campaign-not-active", record["campaign_id"])
+            if ((campaign is not None and campaign["campaign_id"] != record["campaign_id"])
+                    or (campaign_key is not None and campaign_key != bound_campaign.get("key"))
+                    or (parent_cycle_id is not None and parent_cycle_id != record.get("parent_cycle_id"))):
+                raise ProducerError("cycle-campaign-selection-conflict", record["cycle_id"])
+            if binding_jobs is not None and binding_owner:
+                try:
+                    dispatch_terminal_commit.publish_producer_binding(
+                        artifact_root=root, jobs=binding_jobs, route_file=resolved_route_file,
+                        owner_attempt_id=binding_owner, cycle_id=record["cycle_id"],
+                        owner_begin=owner_begin)
+                except dispatch_terminal_commit.TerminalCommitError as exc:
+                    raise ProducerError(exc.code, exc.detail) from exc
+            return {
+                "status": "resumed", "layout": "cycle", "campaign_id": record["campaign_id"],
+                "cycle_id": record["cycle_id"], "producer_id": record["producer_id"],
+                "cycle_dir": str(cycle_dir(root, record["campaign_id"], record["cycle_id"], record)),
+                "env": _env_for(root, record),
+                **_campaign_degradation(bound_campaign),
+            }
         if campaign is not None:
             artifact_locator.prepare_index_update(root, [campaign["campaign_id"]])
         index = artifact_admission.load_index(root)
@@ -2462,13 +2501,7 @@ def _checkpoint_target(root: Path, cycle_id: Optional[str], route_file: Optional
     if route_file is None:
         raise ProducerError("checkpoint-target-required", "--cycle or --route")
     route = load_route(root, route_file)
-    records = [row for row in list_cycle_records(root)
-               if row.get("route_id") == route["route_id"] and row.get("state") == "open"]
-    if not records:
-        return None
-    if len(records) != 1:
-        raise ProducerError("route-cycle-binding-ambiguous", route["route_id"])
-    return records[0]
+    return select_route_open_cycle(root, route)
 
 
 def checkpoint(
@@ -2496,7 +2529,12 @@ def checkpoint(
     if trigger not in CHECKPOINT_TRIGGERS:
         raise ProducerError("checkpoint-trigger-invalid", trigger)
     clock = time.time() if now is None else float(now)
-    record = _checkpoint_target(root, cycle_id, route_file)
+    try:
+        record = _checkpoint_target(root, cycle_id, route_file)
+    except ProducerError as exc:
+        if exc.code == "route-hash-drift":
+            return {"status": "skipped", "reason": "route-hash-drift", "trigger": trigger}
+        raise
     if record is None:
         return {"status": "skipped", "reason": "no-open-cycle", "trigger": trigger}
     cid = record["cycle_id"]

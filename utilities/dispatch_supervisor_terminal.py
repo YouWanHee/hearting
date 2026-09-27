@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 import json
 from pathlib import Path
 import re
+import sys
 from typing import Any
 
 import opencode_server_log
@@ -51,6 +52,10 @@ _PERMISSION_AUTO_REJECT_RE = re.compile(
 _TRUNCATION_TAIL_LINES = 25
 
 
+def _terminal_field(value: object, limit: int = 240) -> str:
+    return re.sub(r"[\t\r\n,]+", " ", str(value or ""))[:limit]
+
+
 @dataclass(frozen=True)
 class SupervisorTerminal:
     note: str
@@ -63,12 +68,10 @@ class SupervisorTerminal:
     # upgrades a missing result to a typed capacity/auth verdict -- the path
     # to the evidence a human or later reader would need to check the read.
     capacity_log: str = ""
-    # Set only by classify_terminal_commit_error: an escaped TerminalCommitError's
-    # own detail, plus enough of the durable transaction's location that a
-    # human or later reader has a next action instead of a bare type name.
-    detail: str = ""
-    terminal_slot: str = ""
-    route_file: str = ""
+    # Set only for an escaped terminal-commit error. The dedicated evidence
+    # keys are registered terminal diagnostics, never route authority.
+    commit_detail: str = ""
+    commit_slot: str = ""
 
     def evidence(self) -> dict[str, str]:
         values = {
@@ -76,19 +79,17 @@ class SupervisorTerminal:
             "detected_by": "completion-supervisor",
             "failure_class": self.failure_class,
             "terminal_event": self.terminal_event,
-            "reconcile_reason": self.reconcile_reason,
+            "reconcile_reason": _terminal_field(self.reconcile_reason),
             "process_exit": self.process_exit,
         }
         if self.api_status:
             values["api_status"] = self.api_status
         if self.capacity_log:
             values["capacity_log"] = self.capacity_log
-        if self.detail:
-            values["detail"] = self.detail
-        if self.terminal_slot:
-            values["terminal_slot"] = self.terminal_slot
-        if self.route_file:
-            values["route_file"] = self.route_file
+        if self.commit_detail:
+            values["terminal_commit_detail"] = _terminal_field(self.commit_detail)
+        if self.commit_slot:
+            values["terminal_commit_slot"] = _terminal_field(self.commit_slot)
         return values
 
 
@@ -343,7 +344,6 @@ def classify_terminal_commit_error(
     detail: str,
     *,
     terminal_slot: str = "",
-    route_file: str = "",
 ) -> SupervisorTerminal:
     """Classify an escaped `dispatch_terminal_commit.TerminalCommitError`.
 
@@ -363,9 +363,8 @@ def classify_terminal_commit_error(
         "dispatch.supervisor.error",
         code,
         "70",
-        detail=detail[:240],
-        terminal_slot=terminal_slot,
-        route_file=route_file,
+        commit_detail=_terminal_field(detail),
+        commit_slot=_terminal_field(terminal_slot),
     )
 
 
@@ -374,19 +373,34 @@ def terminal_commit_error_event(
     detail: str,
     *,
     terminal_slot: str = "",
-    route_file: str = "",
 ) -> dict[str, str]:
     """The shared `dispatch.supervisor.error` payload for the case above.
 
     One builder for both harness supervisors (LOOP SS3: no per-harness
     copy-paste of the field set a later reader has to reconcile).
     """
-    event = {"type": "dispatch.supervisor.error", "reason": code, "detail": detail[:240]}
+    event = {"type": "dispatch.supervisor.error", "reason": _terminal_field(code),
+             "detail": _terminal_field(detail)}
     if terminal_slot:
-        event["terminal_slot"] = terminal_slot
-    if route_file:
-        event["route_file"] = route_file
+        event["terminal_slot"] = _terminal_field(terminal_slot)
     return event
+
+
+def classify_escaped_terminal_commit_error(exc, *, route_file, route_id, owner_attempt_id):
+    """Classify only a TerminalCommitError from an already-loaded module."""
+    module = sys.modules.get("dispatch_terminal_commit")
+    error_type = getattr(module, "TerminalCommitError", None) if module is not None else None
+    if error_type is None or not isinstance(exc, error_type):
+        return None
+    evidence = module.terminal_commit_error_evidence(
+        exc, route_file=route_file, route_id=route_id, owner_attempt_id=owner_attempt_id)
+    terminal = classify_terminal_commit_error(
+        evidence.get("code", getattr(exc, "code", type(exc).__name__)),
+        evidence.get("detail", str(exc)), terminal_slot=evidence.get("terminal_slot", ""))
+    event = terminal_commit_error_event(
+        evidence.get("code", getattr(exc, "code", type(exc).__name__)),
+        evidence.get("detail", str(exc)), terminal_slot=evidence.get("terminal_slot", ""))
+    return terminal, event
 
 
 def classify_supervisor_error(

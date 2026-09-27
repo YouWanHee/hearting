@@ -2073,19 +2073,11 @@ class TerminalHandoffCleanupTurnBoundaryTest(unittest.TestCase):
             self.assertEqual(1, len(ordinary_at_ordinal_2))
 
 
-class TerminalHandoffProducerBindingSelfHealTest(unittest.TestCase):
+class TerminalHandoffProducerBindingDegradeTest(unittest.TestCase):
     """R1 (2026-09-27 owner decision, evidence E1-E8): a runtime-v1
     launcher's `prepare_route_artifact_env(start=True)` opens the route's
-    cycle before the owner attempt row exists, so the owner's own
-    `producer.begin()` never runs its "publish immediately after begin" step.
-    Before the fix, `prepare_cleanup_handoff`'s own direct
-    `terminal.load_producer_binding` call raised
-    `TerminalCommitError("producer-binding-required")` uncaught here -- the
-    exact incident: every route node PASS, the owner still dead with
-    `supervisor-internal-TerminalCommitError` and no diagnosable reason on
-    the row, and the route/cycle never closing. After the fix,
-    `ensure_producer_binding` self-heals from the route's own already-open
-    cycle instead."""
+    cycle before the owner attempt row exists. A missing launch binding now
+    degrades to a partial-report-only cleanup handoff."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -2160,17 +2152,92 @@ class TerminalHandoffProducerBindingSelfHealTest(unittest.TestCase):
         self.validate_patch.start()
         self.addCleanup(self.validate_patch.stop)
 
-    def test_missing_binding_is_self_healed_not_raised(self):
+    def test_missing_binding_degrades_to_partial_report_scope(self):
         binding_path = self.terminal.producer_binding_path(
             self.root, self.route["route_id"], self.args.parent_attempt_id)
         self.assertFalse(binding_path.exists())
         prompt, intent = supervisor.prepare_cleanup_handoff(self.args, self.ledger, self.claim, self.rows)
         self.assertIsInstance(prompt, str)
-        self.assertTrue(binding_path.exists())
-        published = json.loads(binding_path.read_text())
-        self.assertEqual(published["cycle_id"], self.cycle_id)
-        self.assertEqual(published["owner_attempt_id"], self.args.parent_attempt_id)
-        self.assertEqual(intent["cleanup_scope"]["cycle_id"], self.cycle_id)
+        self.assertFalse(binding_path.exists())
+        scope = intent["cleanup_scope"]
+        self.assertIsNone(scope["cycle_id"])
+        self.assertEqual(scope["allowed_operations"], ["partial-report", "read", "verify"])
+        self.assertEqual(scope["producer_binding_refusal"], "producer-binding-required")
+        self.assertNotIn("cleanup-recover", prompt)
+        self.assertIn("settlement cannot be proved", prompt)
+        self.assertIn("partial/BLOCKED report", prompt)
+
+        loaded = SimpleNamespace(binding={"cycle_id": self.cycle_id})
+        normal_args = SimpleNamespace(**vars(self.args))
+        normal_args.parent_attempt_id = "att-normal-binding"
+        normal_claim = supervisor.budget_record.claim_terminal_handoff(
+            self.root, owner_attempt_id=normal_args.parent_attempt_id,
+            route_hash=self.route["route_hash"], child_attempt_ids=["att-execute"])
+        with mock.patch.object(self.terminal, "load_producer_binding", return_value=loaded):
+            normal_prompt, normal_intent = supervisor.prepare_cleanup_handoff(
+                normal_args, self.ledger, normal_claim, self.rows)
+        self.assertIn("cleanup-recover", normal_prompt)
+        self.assertEqual(normal_intent["cleanup_scope"]["cycle_id"], self.cycle_id)
+
+
+class EscapedTerminalCommitRegistryRegressionTest(ClaudeSessionSupervisorTest):
+    def test_escaped_error_closes_real_owner_row_with_sanitized_evidence(self):
+        import io
+        import dispatch_terminal_commit as terminal
+        route = self.base / "error-route.json"
+        value = dict(cwd=str(self.base), artifact_root=str(self.artifact_root),
+            nodes=[dict(id="report", terminal=True)],
+            workflow_contract=dict(terminal_nodes=["report"]),
+            runtime_support=dict(terminal_commit=True))
+        value["route_hash"] = supervisor.canonical_route_hash(value)
+        value["route_id"] = supervisor.route_id_from_hash(value["route_hash"])
+        route.write_text(json.dumps(value), encoding="utf-8")
+        self.jobs.write_text(owner_row(self.lease) + child_row(), encoding="utf-8")
+        events = []
+        args = self.command()[2:] + ["--route-file", str(route), "--route-id", value["route_id"],
+            "--route-hash", value["route_hash"], "--enable-terminal-commit", "--max-continuations", "1"]
+        error = terminal.TerminalCommitError("producer-binding-required", "one\ttwo,three\nfour")
+        with mock.patch.dict(os.environ, self.child_env(FAKE_TRACE=str(self.trace))), \
+             mock.patch.object(supervisor.sys, "stdin", io.StringIO("initial assignment")), \
+             mock.patch.object(supervisor, "emit", events.append), \
+             mock.patch.object(supervisor, "terminal_commit_adapter", side_effect=error):
+            self.assertEqual(supervisor.main(args), 70, events)
+        fields = self.jobs.read_text(encoding="utf-8").splitlines()[0].split("\t")
+        self.assertEqual(len(fields), 6)
+        self.assertEqual(fields[1], "done")
+        meta = __import__("dispatch_contract").parse_registry_metadata(fields[5])
+        self.assertEqual(meta["note"], "dead-terminal-commit")
+        self.assertEqual(meta["reconcile_reason"], "producer-binding-required")
+        self.assertEqual(meta["terminal_commit_detail"], "one two three four")
+        self.assertNotIn("detail", meta)
+        self.assertNotIn("terminal_slot", meta)
+        self.assertNotIn("route_file", meta)
+        self.assertEqual(events[-1]["reason"], "producer-binding-required")
+
+    def test_generic_exception_closes_row_when_commit_module_is_absent(self):
+        import io
+        route = self.base / "generic-route.json"
+        value = dict(cwd=str(self.base), artifact_root=str(self.artifact_root),
+            nodes=[dict(id="report", terminal=True)],
+            workflow_contract=dict(terminal_nodes=["report"]),
+            runtime_support=dict(terminal_commit=True))
+        value["route_hash"] = supervisor.canonical_route_hash(value)
+        value["route_id"] = supervisor.route_id_from_hash(value["route_hash"])
+        route.write_text(json.dumps(value), encoding="utf-8")
+        self.jobs.write_text(owner_row(self.lease) + child_row(), encoding="utf-8")
+        events = []
+        args = self.command()[2:] + ["--route-file", str(route), "--route-id", value["route_id"],
+            "--route-hash", value["route_hash"], "--enable-terminal-commit", "--max-continuations", "1"]
+        with mock.patch.dict(os.environ, self.child_env(FAKE_TRACE=str(self.trace))), \
+             mock.patch.object(supervisor.sys, "stdin", io.StringIO("initial assignment")), \
+             mock.patch.object(supervisor, "emit", events.append), \
+             mock.patch.object(supervisor, "terminal_commit_adapter", side_effect=RuntimeError("generic")), \
+             mock.patch.dict(supervisor.sys.modules, {"dispatch_terminal_commit": None}):
+            self.assertEqual(supervisor.main(args), 70, events)
+        row = self.jobs.read_text(encoding="utf-8").splitlines()[0]
+        self.assertIn("\tdone\t", row)
+        self.assertIn("note=dead-runtime-exit", row)
+        self.assertNotIn("terminal_commit_detail", row)
 
 
 def supervisor_budget_module():

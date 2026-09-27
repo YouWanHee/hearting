@@ -78,6 +78,7 @@ from parent_next_directive import receipt_lines as parent_next_receipt_lines  # 
 from dispatch_summary import launch_summary_owner  # noqa: E402
 from artifact_producer import (  # noqa: E402
     ProducerError,
+    bind_owner_launch,
     prepare_review_output_binding,
     review_lease_acquire,
 )
@@ -2292,6 +2293,14 @@ def main(argv: list[str]) -> int:
                     "prompt-materialization-failed", 73,
                     detail=str(exc), child_spawned="0",
                 )
+            if action == "start":
+                try:
+                    bind_owner_launch(args, jobs)
+                except ProducerError as exc:
+                    annotate_attempt_row(jobs, args.attempt_id, {"launch_outcome": "never-launched"})
+                    cancel_governor_reservation(governor, governor_root, reservation_token)
+                    close_job_row(jobs, args.slug, args.worktree, "producer-binding-failed", "", args.attempt_id)
+                    return fail(exc.code, 73, detail=exc.detail, child_spawned="0")
     else:
         args.attempt_claimed = False
 

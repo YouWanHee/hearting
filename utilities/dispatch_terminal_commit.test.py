@@ -615,13 +615,21 @@ class TerminalCommitErrorEvidenceTest(_TerminalCommitFixture):
     `TerminalCommitError`, instead of discarding `code`/`detail`."""
 
     def test_evidence_includes_the_terminal_slot_when_the_route_is_readable(self):
-        exc = T.TerminalCommitError("producer-binding-required", str(self.root / "x" / "producer-binding.json"))
+        with self.assertRaises(T.TerminalCommitError) as caught:
+            T.load_producer_binding(artifact_root=self.root, route_id=self.route["route_id"],
+                                    owner_attempt_id="att-a3fixture")
+        exc = caught.exception
+        binding_path = T.producer_binding_path(self.root, self.route["route_id"], "att-a3fixture")
+        self.assertTrue(exc.detail.startswith(
+            "not published at owner launch; next: the owner re-runs artifact_producer.py begin --require-cycle"))
+        self.assertTrue(exc.detail.endswith(str(binding_path)))
         evidence = T.terminal_commit_error_evidence(
             exc, route_file=self.route_file, route_id=self.route["route_id"],
             owner_attempt_id="att-a3fixture")
         self.assertEqual(evidence["code"], "producer-binding-required")
-        self.assertEqual(evidence["detail"], str(self.root / "x" / "producer-binding.json"))
-        self.assertEqual(evidence["route_file"], str(self.route_file))
+        self.assertTrue(evidence["detail"].startswith(
+            "not published at owner launch; next: the owner re-runs artifact_producer.py begin --require-cycle"))
+        self.assertNotIn("route_file", evidence)
         self.assertEqual(evidence["terminal_slot"],
                          str(T.terminal_slot(self.root, self.route["route_id"], "att-a3fixture")))
 
@@ -632,7 +640,7 @@ class TerminalCommitErrorEvidenceTest(_TerminalCommitFixture):
             exc, route_file=missing_route, route_id="rt-whatever", owner_attempt_id="att-whatever")
         self.assertEqual(evidence["code"], "transaction-conflict")
         self.assertEqual(evidence["detail"], "fixture-detail")
-        self.assertEqual(evidence["route_file"], str(missing_route))
+        self.assertNotIn("route_file", evidence)
         self.assertNotIn("terminal_slot", evidence)
 
     def test_detail_is_truncated_to_240_chars(self):
@@ -930,88 +938,19 @@ class LauncherPreparedCycleBindingTest(_TerminalCommitFixture):
             route_module.return_value.terminal_gate_observation.return_value = self.gates
             return T.settle_terminal_commit(self.request(), services)
 
-    def test_missing_binding_without_the_fix_stays_ineligible_forever(self):
-        """Pins the pre-D1 baseline: with `ensure_producer_binding` bypassed
-        (simulating the code before D1 -- nothing publishes the binding
-        before `load_producer_binding` runs), settlement's own real
-        `load_producer_binding` call fails and the pre-existing outer
-        `except TerminalCommitError` classifies it `ineligible` -- proven,
-        with every node PASS, yet never able to close (D1's root cause)."""
-        services, _ = self.services()
-        with mock.patch.object(T, "ensure_producer_binding", return_value=None):
-            result = self._settle(services)
-        self.assertEqual((result.result, result.reason), ("ineligible", "producer-binding-required"))
-
-    def test_missing_binding_is_self_healed_not_raised(self):
+    def test_missing_binding_is_ineligible_without_settlement_write(self):
         binding_path = T.producer_binding_path(self.root, self.route["route_id"], "att-a3fixture")
         self.assertFalse(binding_path.exists())
         services, _ = self.services()
         result = self._settle(services)
-        self.assertEqual((result.result, result.reason, result.detail), ("completed", None, None))
-        self.assertTrue(binding_path.exists())
-        published = json.loads(binding_path.read_text())
-        self.assertEqual(published["cycle_id"], self.cycle_id)
-        self.assertEqual(published["owner_attempt_id"], "att-a3fixture")
-        first_bytes = binding_path.read_bytes()
-        # Re-entry (a second settlement/replay call) must not create a second
-        # binding, mutate the existing one, or open a second cycle.
-        result2 = self._settle(services)
-        self.assertEqual(result2.result, "completed")
-        self.assertEqual(binding_path.read_bytes(), first_bytes)
+        self.assertEqual((result.result, result.reason), ("ineligible", "producer-binding-required"))
+        self.assertFalse(binding_path.exists())
         cycles = list((self.root / ".runtime/artifact-producer/v1/cycles").glob("*.json"))
         self.assertEqual(len(cycles), 1)
 
 
-class EnsureProducerBindingAbsentCycleTest(unittest.TestCase):
-    """R2: no open cycle for the route -> a typed refusal, zero mutation, and
-    no cycle is ever created here (D1/D3: "cycle을 새로 만들지 않는다")."""
-
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name)
-        self.route_file = self.root / "route.json"
-        self.jobs = self.root / "jobs.log"
-        self.jobs.write_text("", encoding="utf-8")
-        self.route = {"route_id": "rt-no-open-cycle", "route_hash": "sha256:" + "7" * 64}
-        self.route_file.write_text(json.dumps(self.route), encoding="utf-8")
-        self.request = T.TerminalCommitRequest(self.route_file, "att-owner", self.jobs, self.root)
-
-    def _files(self):
-        return sorted((str(p.relative_to(self.root)), p.read_bytes())
-                      for p in self.root.rglob("*") if p.is_file())
-
-    def test_absent_open_cycle_is_typed_refusal_with_zero_mutation(self):
-        before = self._files()
-        with mock.patch.object(T, "producer_lifecycle_applies", return_value=True), \
-             mock.patch.object(T, "load_producer_binding",
-                               side_effect=T.TerminalCommitError("producer-binding-required")):
-            with self.assertRaises(T.TerminalCommitError) as caught:
-                T.ensure_producer_binding(self.request, self.route)
-        self.assertEqual((caught.exception.code, caught.exception.detail),
-                         ("producer-binding-required", "route-cycle-absent"))
-        self.assertEqual(before, self._files())
-
-    def test_ambiguous_open_cycle_is_producer_binding_mismatch_with_zero_mutation(self):
-        import artifact_producer
-        _open_cycle_fixture(self.root, self.route, "cyc_" + "1" * 32)
-        stale = dict(self.route, route_hash="sha256:" + "8" * 64)
-        _open_cycle_fixture(self.root, stale, "cyc_" + "2" * 32)
-        before = self._files()
-        with mock.patch.object(T, "producer_lifecycle_applies", return_value=True), \
-             mock.patch.object(T, "load_producer_binding",
-                               side_effect=T.TerminalCommitError("producer-binding-required")):
-            with self.assertRaises(T.TerminalCommitError) as caught:
-                T.ensure_producer_binding(self.request, self.route)
-        self.assertEqual(caught.exception.code, "producer-binding-mismatch")
-        self.assertEqual(before, self._files())
-
-
 class SettleOwnerCompletionLauncherShapeTest(_TerminalCommitFixture):
-    """R3: `settle_owner_completion`'s own writer is now the shared
-    `ensure_producer_binding` (its inline `producer.begin()` call is gone) --
-    a launcher-prepared cycle with no owner-side `begin()` publish must still
-    reach `completed` through this single writer path."""
+    """Settlement does not publish a binding, even on the owner path."""
 
     def setUp(self):
         super().setUp()
@@ -1039,27 +978,14 @@ class SettleOwnerCompletionLauncherShapeTest(_TerminalCommitFixture):
         from dispatch_completion_join import exact_attempt_row
         self.owner_meta = exact_attempt_row(self.jobs, "att-a3fixture").metadata
 
-    def test_launcher_shape_reaches_completed_with_single_writer(self):
-        # `settle_terminal_commit`'s own real behavior (the produced binding
-        # actually being usable end to end) is covered exhaustively by
-        # `LauncherPreparedCycleBindingTest` above; this test isolates the
-        # one thing `settle_owner_completion` itself changed for D1 -- its
-        # inline `producer.begin()` call is gone, replaced by the shared
-        # `ensure_producer_binding` writer, called before `settle_terminal_commit`
-        # runs at all.
+    def test_launcher_shape_does_not_write_binding(self):
         binding_path = T.producer_binding_path(self.root, self.route["route_id"], "att-a3fixture")
         self.assertFalse(binding_path.exists())
-        completed = T.TerminalCommitResult("completed", None, None, ("execute",), "artifact: -\nverdict: PASS\nblocker: none\n")
-        with mock.patch.object(T, "producer_lifecycle_applies", return_value=True), \
-             mock.patch.object(T, "_route_module") as route_module, \
-             mock.patch.object(T, "settle_terminal_commit", return_value=completed) as settle:
-            route_module.return_value.terminal_gate_observation.return_value = self.gates
-            result = T.settle_owner_completion(self.jobs, "done", self.owner_meta)
-        settle.assert_called_once()
-        self.assertEqual(result.result, "completed", result)
-        self.assertTrue(binding_path.exists())
-        published = json.loads(binding_path.read_text())
-        self.assertEqual(published["cycle_id"], self.cycle_id)
+        result = T.settle_owner_completion(self.jobs, "done", self.owner_meta)
+        self.assertIsNotNone(result)
+        self.assertNotEqual(result.result, "completed", result)
+        self.assertFalse(binding_path.exists())
+        self.assertEqual(len(list((self.root / ".runtime/artifact-producer/v1/cycles").glob("*.json"))), 1)
 
 
 class QuickWorkerTypeAxesTest(unittest.TestCase):
