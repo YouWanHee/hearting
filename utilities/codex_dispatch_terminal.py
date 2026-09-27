@@ -59,7 +59,9 @@ _SANDBOX_INIT_RE = re.compile(
 # `redelivery-suppressed`, `reconciled`, `join-observed`) is followed by a
 # `continue` that starts a new turn, and `delivery-timing` is emitted after
 # `turn.completed`; none of them can land inside this window. Keep this an
-# exact allowlist rather than a `dispatch.supervisor.` prefix rule: a prefix
+# A completed input receipt can also follow that checked boundary. It is
+# validated against the boundary below, not treated as generic telemetry.
+# Keep an exact allowlist rather than a `dispatch.supervisor.` prefix rule: a prefix
 # would also skip a future observation row that is emitted for a reason we have
 # not checked, and hide a real work item behind it.
 _TERMINAL_TELEMETRY_TYPES = frozenset({"dispatch.supervisor.token_usage"})
@@ -151,19 +153,43 @@ def _codex_final_agent_message(
     for a missing final one.
     """
 
+    completed_inputs: list[dict] = []
     for index in range(terminal_index - 1, -1, -1):
         row = rows[index]
+        if row.get("type") == "dispatch.supervisor.input":
+            requests = row.get("request_ids")
+            if (row.get("state") != "turn-completed"
+                    or not isinstance(row.get("attempt_id"), str) or not row["attempt_id"]
+                    or not isinstance(row.get("turn_id"), str) or not row["turn_id"]
+                    or not isinstance(requests, list) or not requests
+                    or any(not isinstance(value, str) or not value for value in requests)
+                    or len(set(requests)) != len(requests)):
+                return None
+            completed_inputs.append(row)
+            continue
         if row.get("type") == "dispatch.supervisor.turn.completed":
             # The runtime boundary is distinct from the owner's terminal
             # envelope. Failed/malformed boundaries cannot bridge a handoff.
             if (row.get("status") == "completed"
                     and isinstance(row.get("thread_id"), str) and row["thread_id"]
                     and isinstance(row.get("turn_id"), str) and row["turn_id"]):
+                if completed_inputs:
+                    # The caller selects the exact attempt log. Within it this
+                    # acknowledgement must belong to the completed turn, not
+                    # merely resemble a supervisor observation.
+                    terminal_thread = rows[terminal_index].get("thread_id")
+                    if (terminal_thread is not None and terminal_thread != row["thread_id"]
+                            or any(receipt["turn_id"] != row["turn_id"]
+                                   or receipt.get("thread_id", row["thread_id"]) != row["thread_id"]
+                                   for receipt in completed_inputs)
+                            or len({receipt["attempt_id"] for receipt in completed_inputs}) != 1):
+                        return None
+                    completed_inputs.clear()
                 continue
             return None
         if row.get("type") in _TERMINAL_TELEMETRY_TYPES:
             continue
-        if row.get("type") != "item.completed":
+        if completed_inputs or row.get("type") != "item.completed":
             return None
         item = row.get("item")
         if not isinstance(item, dict) or item.get("type") != "agent_message":

@@ -495,6 +495,56 @@ class CodexDispatchTerminalTest(unittest.TestCase):
                 self.assertEqual(rejected["exit_code"], 3)
                 self.assertNotIn("WALKBACK_RAW_SENTINEL", repr(rejected))
 
+    def test_completed_owner_input_receipt_keeps_exact_pass_handoff(self):
+        # rt-73b900d0187892c7: the supervisor acknowledged four accepted
+        # corrections after the final PASS and before its terminal event.
+        report = self.root / "owner_report.md"
+        report.write_text("# verified spec transaction\n")
+        boundary = {"type": "dispatch.supervisor.turn.completed", "thread_id": "th1",
+                    "turn_id": "t1", "status": "completed"}
+        receipt = {"type": "dispatch.supervisor.input", "attempt_id": "att-owner",
+                   "turn_id": "t1", "state": "turn-completed",
+                   "request_ids": ["input-1", "input-2", "input-3", "input-4"]}
+        log = self.write_log(verdict="PASS", blocker="none", artifact=str(report), sandbox=False,
+                             between=[{"type": "dispatch.supervisor.token_usage"}, boundary, receipt])
+        result = self.inspect(log)
+        self.assertEqual((result["state"], result["verdict"], result["artifact_state"]),
+                         ("valid", "PASS", "readable"), result)
+        self.assertEqual(result["artifact_path_b64"],
+                         base64.urlsafe_b64encode(str(report).encode()).decode().rstrip("="))
+
+        invalid_windows = {
+            "no-completed-boundary": [receipt],
+            "receipt-before-boundary": [receipt, boundary],
+            "failed-boundary": [dict(boundary, status="failed"), receipt],
+            "foreign-turn": [boundary, dict(receipt, turn_id="t2")],
+            "foreign-thread": [boundary, dict(receipt, thread_id="th2")],
+            "unsettled-input": [boundary, dict(receipt, state="accepted")],
+            "missing-attempt": [boundary, dict(receipt, attempt_id=None)],
+            "mixed-attempts": [boundary, receipt, dict(receipt, attempt_id="att-other")],
+            "missing-requests": [boundary, dict(receipt, request_ids=[])],
+            "bad-requests": [boundary, dict(receipt, request_ids=[{}])],
+            "duplicate-requests": [boundary, dict(receipt, request_ids=["input-1", "input-1"])],
+            "later-work": [boundary, receipt, {"type": "item.completed",
+                                                "item": {"type": "command_execution"}}],
+            "later-turn": [boundary, receipt, {"type": "dispatch.supervisor.turn.started"}],
+        }
+        for case, between in invalid_windows.items():
+            with self.subTest(case=case):
+                result = self.inspect(self.write_log(verdict="PASS", blocker="none",
+                    artifact=str(report), sandbox=False, between=between))
+                self.assertEqual(result["reason"], "missing-final-agent-message", result)
+
+        # Even a valid receipt cannot manufacture an absent final message or
+        # hide an unreadable artifact / contradictory PASS envelope.
+        for changes, reason in [({"artifact": str(self.root / "missing.md")}, "artifact-missing"),
+                                ({"blocker": "still blocked"}, "pass-blocker-not-none"),
+                                ({"final_text": "no handoff"}, "malformed-handoff")]:
+            args = dict(verdict="PASS", blocker="none", artifact=str(report), sandbox=False,
+                        between=[boundary, receipt])
+            result = self.inspect(self.write_log(**(args | changes)))
+            self.assertEqual(result["reason"], reason, result)
+
     def test_walkback_never_promotes_an_older_agent_message(self):
         stale = {
             "type": "item.completed",
