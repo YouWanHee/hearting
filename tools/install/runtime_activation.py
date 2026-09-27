@@ -1535,7 +1535,8 @@ def _hook_command_files_present(hooks: dict) -> bool:
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
-            for hook in entry.get("hooks", []):
+            hooks_list = entry.get("hooks")
+            for hook in hooks_list if isinstance(hooks_list, list) else []:
                 if not isinstance(hook, dict):
                     continue
                 command = hook.get("command")
