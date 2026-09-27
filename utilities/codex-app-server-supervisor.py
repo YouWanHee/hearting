@@ -1251,11 +1251,16 @@ def main(argv: list[str] | None = None) -> int:
                     phase="parked",
                 )
                 from dispatch_supervision import wait_for_batch
+                from dispatch_replacement import advance_batch, adopt_receipt
                 receipt = wait_for_batch(
                     join=lambda attempts: run_join(args, attempts),
                     attempts=set(park_attempts), jobs=Path(args.jobs),
                     parent_attempt_id=args.parent_attempt_id, emit=emit,
+                    replacement_checkpoint=lambda selected: advance_batch(Path(args.jobs), selected)
+                        if not control.pending() else (selected, [], []),
                 )
+                park_attempts, replaced_attempts = adopt_receipt(Path(args.jobs), set(park_attempts), receipt)
+                delivered.update(replaced_attempts)
                 joined_rows = current_children(
                     Path(args.jobs), args.parent_attempt_id, park_attempts
                 )

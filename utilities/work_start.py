@@ -517,6 +517,17 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
             timeout=max(0, START_WINDOW_SECONDS - result.get("capacity_waited_seconds", 0)) if wait else 0,
             recover=True)
         result["observation"] = joined
+        from dispatch_replacement import advance_batch
+        effective, lineage, attention = advance_batch(jobs, attempts, run=run)
+        if lineage and effective != attempts:
+            result["replacement_lineage"] = lineage
+            return _advance(route, path, jobs, result, wait=wait, interview=interview,
+                            answers=answers, decision=decision, run=run, sleep=sleep, clock=clock)
+        if attention:
+            result["replacement_attention"] = attention
+            if joined["state"] == "ready":
+                return {**result, "state": "needs-attention", "reason": attention[0]["reason"],
+                        "node": attention[0].get("node", "")}
         if joined["state"] != "ready":
             if wait:
                 return _wait_expired(result)
@@ -572,6 +583,19 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
         jobs=jobs, expected_attempts={aid},
         timeout=max(0, START_WINDOW_SECONDS - result.get("capacity_waited_seconds", 0)) if wait else 0,
         recover=True)
+    from dispatch_replacement import advance, effective_attempts
+    replacement = advance(jobs, aid, run=run)
+    if replacement.get("state") in {"running", "reused"}:
+        result["replacement_lineage"] = effective_attempts(jobs, {aid})[1]
+        current_path = Path(replacement["record"]["route_file"])
+        current_route = json.loads(current_path.read_text())
+        return _advance(current_route, current_path, jobs, result, wait=wait, interview=interview,
+                        answers=answers, decision=decision, run=run, sleep=sleep, clock=clock)
+    if replacement.get("state") == "needs-attention":
+        result["replacement_attention"] = [replacement]
+        if joined["state"] == "ready":
+            return {**result, "state": "needs-attention", "reason": replacement["reason"],
+                    "node": replacement.get("node", "")}
     if joined["state"] == "ready":
         outcome = _outcome(jobs, aid)
         return {**result, "state": "completed" if outcome["classification"] == "success" else "needs-attention",
@@ -627,6 +651,6 @@ def start_work(route, path, jobs, *, wait=False, interview=None, answers=None,
                                                 "start", "--route", str(path), "--jobs", str(jobs)])
         result.setdefault("next_step", "Inspect the exact diagnostic or result recovery_command. Existing workers retain "
             "their runtime watcher and completion delivery. Correct the admission input or resolve the reported "
-            "failure, then use resume_command; it does not create a replacement for a failed attempt. "
+            "failure, then use resume_command; it automatically replaces one proven silent death per logical node. "
             "If the correction changes the requested work, ask the user before changing that work.")
     return result

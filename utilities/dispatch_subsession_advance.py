@@ -344,7 +344,10 @@ def resume_index(jobs: Path, manifest: dict) -> int:
     census helper."""
 
     terminal_indexes: set[int] = set()
-    for row in _registry_rows_for_chain(jobs, manifest.get("chain_id", "")):
+    from dispatch_replacement_subsession import project
+    rows, _mapping = project(jobs, manifest,
+                            _registry_rows_for_chain(jobs, manifest.get("chain_id", "")))
+    for row in rows:
         if row["status"] not in TERMINAL_STATUSES:
             continue
         raw_index = row["metadata"].get("subsession_index")
@@ -419,6 +422,11 @@ def prove_serial_chain(
     if all_lines is None:
         return _proof_refusal("serial-chain-registry-unreadable")
     rows = _rows_from_snapshot(all_lines, chain_id)
+    try:
+        from dispatch_replacement_subsession import project
+        rows, effective_attempts = project(jobs, manifest, rows)
+    except (DC.DispatchContractError, OSError, ValueError):
+        return _proof_refusal("serial-chain-replacement-invalid")
     owner_rows = []
     for line in all_lines:
         fields = line.split("\t")
@@ -458,7 +466,7 @@ def prove_serial_chain(
         if any(meta.get(key) != value for key, value in required.items()):
             return _proof_refusal("serial-chain-row-identity-mismatch")
         expected = {
-            "attempt_id": session["attempt_id"],
+            "attempt_id": effective_attempts[session["attempt_id"]],
             "subsession_id": session["subsession_id"],
             "subsession_count": str(len(expected_sessions)),
             "phase_brief": session["phase_brief"],
@@ -612,7 +620,10 @@ def coordinate_chain_advance_from_joined_rows(
     except ValueError:
         return None
 
-    successor_index = resume_index(jobs, manifest)
+    try:
+        successor_index = resume_index(jobs, manifest)
+    except (DC.DispatchContractError, OSError, ValueError):
+        return None
     if successor_index > len(manifest["sessions"]) or successor_index <= predecessor_index:
         return None
     successor_session = next(
@@ -620,6 +631,14 @@ def coordinate_chain_advance_from_joined_rows(
     )
     if successor_session is None:
         return None
+    if isinstance(proof, ProvenSerialChain):
+        effective = proof.rows_by_index[successor_index]
+        effective_id = effective["metadata"].get("attempt_id")
+        if effective_id != successor_session["attempt_id"]:
+            # Replaying the predecessor's receipt must follow the already
+            # registered replacement. The common checkpoint owns any unfinished
+            # register/start transaction; the chain never starts the old ID.
+            return effective_id
     successor_metadata = {}
     for candidate in _registry_rows_for_chain(jobs, chain_id):
         if candidate["metadata"].get("attempt_id") == successor_session["attempt_id"]:
@@ -675,7 +694,12 @@ def advance_chain_step(jobs: Path, parent_attempt_id: str, joined: dict) -> Chai
     if isinstance(proof, ChainProofRefusal):
         return ChainAdvanceStep("refused", chain_id=chain_id, predecessor_index=predecessor_index,
                                 reason="subsession-chain-proof-failed:" + proof.reason)
-    successor_index = resume_index(jobs, proof.manifest)
+    try:
+        successor_index = resume_index(jobs, proof.manifest)
+    except (DC.DispatchContractError, OSError, ValueError):
+        return ChainAdvanceStep("refused", chain_id=chain_id,
+                                predecessor_index=predecessor_index,
+                                reason="subsession-chain-replacement-invalid")
     if successor_index > len(proof.manifest["sessions"]):
         return ChainAdvanceStep("complete", chain_id=chain_id, predecessor_index=predecessor_index,
                                 successor_index=successor_index)
@@ -745,6 +769,7 @@ def drive_serial_chain(
     on_advance: Callable[[str, frozenset[str]], None] | None = None,
     allow_advance: Callable[[], bool] | None = None,
     emit: Callable[[dict], None] | None = None,
+    replacement_checkpoint: Callable | None = None,
 ) -> ChainDriveResult:
     """Run every serial successor at one non-model supervisor checkpoint."""
 
@@ -770,6 +795,11 @@ def drive_serial_chain(
     refusal = None
     closed: tuple[str, ...] = ()
     unclosed: tuple[str, ...] = ()
+    if replacement_checkpoint is None:
+        from dispatch_replacement import advance_batch
+        replacement_checkpoint = lambda selected: (
+            advance_batch(jobs, selected) if allow_advance is None or allow_advance()
+            else (selected, [], []))
     while True:
         open_chain = {
             row.attempt_id for row in joined.values()
@@ -781,7 +811,16 @@ def drive_serial_chain(
             joined = {row.attempt_id: row for row in joined_rows}
         if allow_advance is not None and not allow_advance():
             break
-        step = advance_chain_step(jobs, parent_attempt_id, joined)
+        attention = receipt.get("replacement_attention") or []
+        if attention:
+            failed = next((row for row in joined.values()
+                           if row.attempt_id == attention[0].get("source_attempt_id")), chain_rows[0])
+            index = int(failed.metadata.get("subsession_index") or 0)
+            step = ChainAdvanceStep("refused", chain_id=chain_id,
+                                    predecessor_index=index, successor_index=index+1,
+                                    reason=attention[0].get("reason") or "replacement-needs-attention")
+        else:
+            step = advance_chain_step(jobs, parent_attempt_id, joined)
         if step.outcome != "advanced":
             refusal = step if step.outcome == "refused" else None
             if refusal is not None:
@@ -808,7 +847,16 @@ def drive_serial_chain(
         from dispatch_supervision import wait_for_batch
         receipt = wait_for_batch(join=join, attempts=set(attempts), jobs=jobs,
                                  parent_attempt_id=parent_attempt_id, emit=emit,
-                                 on_timeout=on_timeout)
+                                 on_timeout=on_timeout,
+                                 replacement_checkpoint=replacement_checkpoint)
+        from dispatch_replacement import adopt_receipt
+        attempts, replaced = adopt_receipt(jobs, set(attempts), receipt)
+        traversed.update(replaced)
+        traversed.update(attempts)
+        if replaced:
+            last = next(iter(attempts))
+            if on_advance:
+                on_advance(last, frozenset(sibling_attempts))
         joined_rows = refresh(set(attempts))
         joined = {row.attempt_id: row for row in joined_rows}
     if sibling_attempts:

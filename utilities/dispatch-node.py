@@ -300,7 +300,7 @@ def prior_round_attempts(jobs, route_id, node_id, *, exclude_slug=None, exclude_
   lines=Path(jobs).read_text(encoding="utf-8",errors="replace").splitlines()
  except OSError:
   return prior
- for cols, meta in ROUTE.review_round_records(lines, route_ids, node_id):
+ for cols, meta in ROUTE.review_round_records(lines, route_ids, node_id,jobs=jobs):
   if exclude_slug and cols[4]==exclude_slug and (meta.get("route_id") or meta.get("route"))==route_id: continue
   if exclude_attempt and meta.get("attempt_id")==exclude_attempt: continue
   prior.append((cols,meta))
@@ -528,6 +528,35 @@ def bind_dispatch_evidence(route, node, adapter, adapter_args, parent_identity=N
     return extra
 
 
+def replacement_task(args, route, node, jobs):
+ """A verified death replacement replays its original semantic round verbatim."""
+ import dispatch_replacement as replacement
+ values=[]
+ extra=strip_leading_separator(args.adapter_args)
+ for index,token in enumerate(extra):
+  if token=="--automatic-retry-of":
+   if index+1>=len(extra): raise DispatchContractError("replacement-predecessor-invalid")
+   values.append(extra[index+1])
+  elif token.startswith("--automatic-retry-of="):
+   values.append(token.split("=",1)[1])
+ if not values: return None
+ if len(values)!=1: raise DispatchContractError("replacement-predecessor-invalid")
+ with replacement._locked(jobs) as lines:
+  reservation=replacement.source_reservation(jobs,values[0])
+  if not reservation: return None  # Existing non-SD157 retry semantics are unchanged.
+  record=replacement._read(replacement._record_path(jobs,reservation['family_id']))
+  _fields,source,replay=replacement.validate_claim_source(jobs,lines,record)
+  if (record['replacement_attempt_id']!=args.attempt_id
+      or record['original_attempt_id']!=values[0]
+      or record['route_id']!=route['route_id']
+      or record['route_hash']!=route['route_hash']
+      or source.get('route_node')!=node['id']
+      or source.get('harness')!=args.adapter
+      or source.get('parent')!=args.parent):
+   raise DispatchContractError('replacement-launch-binding-mismatch')
+  return replay['task']
+
+
 def main():
  p=argparse.ArgumentParser(); p.add_argument("--route",required=True); p.add_argument("--node",required=True); p.add_argument("--adapter",choices=("claude","codex","opencode"),required=True); p.add_argument("--action",choices=("dry-run","register","start"),default="dry-run"); p.add_argument("--slug",required=True); p.add_argument("--qa",default=None); p.add_argument("--parent"); p.add_argument("--jobs"); p.add_argument("--prompt-text",default="Execute the selected immutable route node and emit its completion evidence."); p.add_argument("--subsession-id"); p.add_argument("--subsession-index",type=int); p.add_argument("--subsession-count",type=int); p.add_argument("--subsession-mode",choices=("serial","parallel")); p.add_argument("--subsession-purpose",choices=("planned","gap-retry"),default="planned"); p.add_argument("--session-chain-id"); p.add_argument("--phase-brief"); p.add_argument("--stage-authority",choices=(0,1),type=int,default=1); p.add_argument("--fixed-file",action="append",default=[]); p.add_argument("--narrow-verify"); p.add_argument("--expected-round-trips",type=int); p.add_argument("--state-dir"); p.add_argument("--attempt-id"); p.add_argument("adapter_args",nargs=argparse.REMAINDER)
  a=p.parse_args(); route=json.loads(Path(a.route).read_text())
@@ -647,8 +676,13 @@ def main():
  except ValueError as e:
   raise SystemExit(str(e))
  contract=assigned_contract(capability=route["capability"],worker_type=worker_type,route_node=node["id"],completion_gate=node.get("completion_gate"),root=ROOT)
+ try:
+  original_task=replacement_task(a,route,node,registry.path)
+ except DispatchContractError as exc:
+  print("check=failed"); print(f"reason={exc.reason}"); print("child_spawned=0")
+  raise SystemExit(65)
  prior_rounds=prior_round_attempts(registry.path,route["route_id"],node["id"],exclude_slug=a.slug,exclude_attempt=a.attempt_id,
-                                  route=route if node.get("kind")=="review-worker" else None) if not a.subsession_id else []
+                                  route=route if node.get("kind")=="review-worker" else None) if not a.subsession_id and original_task is None else []
  # SD-153/SD-154: `admit_round` (budget + rule-8 auto-revision) is the one
  # admission decision every registered launch surface (this main(),
  # dispatch-batch.py, stage-dispatch-fallback.py) reads -- no surface keeps
@@ -658,11 +692,11 @@ def main():
  # always produced, without touching auto-revision at all.
  admission=(
   admit_round(route,node,registry.path,owner_attempt_id=a.parent,exclude_slug=a.slug,exclude_attempt=a.attempt_id)
-  if not a.subsession_id
+  if not a.subsession_id and original_task is None
   else RoundAdmission(budget=REVIEW_ROUND_CAP.round_budget(route,node,[],revisions=()))
  )
  round_budget=admission.budget
- if a.node in ROUND_CAPPED_NODE_IDS and not a.subsession_id:
+ if a.node in ROUND_CAPPED_NODE_IDS and not a.subsession_id and original_task is None:
   if round_budget.state=="blocked-live":
    print("check=failed")
    print("reason=prior-attempt-still-live")
@@ -701,7 +735,8 @@ def main():
     print(f"{key}={value}")
    print("child_spawned=0")
    raise SystemExit(65)
- prompt_text=a.prompt_text+round_protocol_block(round_budget,prior_rounds,worker_type,node["id"])
+ prompt_text=(original_task if original_task is not None else
+              a.prompt_text+round_protocol_block(round_budget,prior_rounds,worker_type,node["id"]))
  if round_budget.correction_round: print(f"correction_round={round_budget.correction_round}")
  argv=[sys.executable,str(wrapper),"--"+a.action,"--worktree",route["cwd"],"--slug",a.slug,"--capability",route["capability"],"--capability-mode",route["capability_mode"],"--intensity",route["effective_intensity"],"--dispatch-depth",str(node.get("dispatch_depth",1)),"--worker-type",worker_type,"--unit",node.get("unit",""),"--assigned-contract",contract,"--owner",route["capability"],"--route-file",str(Path(a.route).resolve()),"--route-id",route["route_id"],"--route-hash",route["route_hash"],"--route-node",node["id"],"--registry-digest",route["registry_digest"],"--write-scope",";".join(node["write_scope"]),"--completion-gate",node["completion_gate"],"--jobs",str(registry.path),"--prompt-text",prompt_text]
  unit=node.get("unit","")

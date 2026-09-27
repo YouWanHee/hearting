@@ -115,6 +115,24 @@ class ControlServer:
         self.thread.join(timeout=2)
 
 
+class ReplacementAuthorityTest(unittest.TestCase):
+    def test_requires_current_epoch_generation_and_exact_parent(self):
+        from argparse import Namespace
+        module = load_completion_module()
+        args = Namespace(jobs=Path("/tmp/jobs.log"), parent_session_id="sid", control_socket=Path("/tmp/socket"),
+                         gateway_epoch=7, binding_generation=3)
+        metadata = {"dispatch_depth": "1", "parent_sid": "sid", "parent_completion_delivery": module.MANAGED_SESSION_PARENT_DELIVERY}
+        status = {"status": "ready", "tui_connected": True, "thread_id": "sid", "epoch": 7, "binding_generation": 3}
+        with mock.patch.object(module, "gateway_request", return_value=status):
+            self.assertTrue(module.replacement_authority(args, args.jobs, "att-old", metadata))
+            self.assertFalse(module.replacement_authority(args, args.jobs, "att-old", dict(metadata, parent_sid="foreign")))
+            status["binding_generation"] = 4
+            self.assertFalse(module.replacement_authority(args, args.jobs, "att-old", metadata))
+            status["binding_generation"] = 3
+            status["tui_connected"] = False
+            self.assertFalse(module.replacement_authority(args, args.jobs, "att-old", metadata))
+
+
 class ManagedCompletionTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -657,6 +675,15 @@ class NormalizeReceiptStageAdvanceNegotiationTest(unittest.TestCase):
         masked = dict(value)
         masked["delivery_timing"] = "MASKED"
         return masked
+
+    def test_attention_cannot_borrow_failure_from_another_batch(self):
+        self.jobs.write_text(self.jobs.read_text() + row("att-foreign", harness="codex"))
+        receipt = self._raw_receipt()
+        receipt["replacement_attention"] = [{"source_attempt_id": "att-foreign", "state": "needs-attention",
+            "node": "__owner__", "reason": "replacement-input-unproven"}]
+        with self.assertRaisesRegex(ValueError, "replacement-attention-scope"):
+            self.module.normalize_receipt(receipt, jobs=self.jobs, parent_attempt_id=PARENT,
+                parent_session_id=None, delivery_parent_id=PARENT, attempts={"att-child"})
 
     def test_default_call_is_byte_identical_to_pre_sd110(self):
         normalized = self._normalize()

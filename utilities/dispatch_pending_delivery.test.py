@@ -128,6 +128,72 @@ class CreateTest(IsolatedRootMixin, unittest.TestCase):
         kwargs.update(overrides)
         return kwargs, PD.create(**kwargs)
 
+    def test_original_failure_is_deferred_until_successor_real_ack(self):
+        import dispatch_replacement as replacement
+        self.root.mkdir(parents=True, exist_ok=True)
+        jobs = self.root / "jobs.log"
+        jobs.write_text("fixture")
+        receipt = _receipt(job_registry=str(jobs))
+        kwargs, original = self._create(receipt=receipt, attempt_ids=["att-old"])
+        target_receipt = _receipt(job_registry=str(jobs), children=[{"attempt_id": "att-new"}])
+        target_kwargs, target = self._create(receipt=target_receipt, attempt_ids=["att-new"], delivery_id="delivery-new")
+        rows = {"att-new": ([], {"parent_sid": "sess-abc", "delivery_id": "delivery-new"})}
+        edge = {"original_attempt_id": "att-old", "replacement_attempt_id": "att-new"}
+        with unittest.mock.patch.object(replacement, "effective_attempts", side_effect=lambda jobs, attempts:
+                ({"att-new"}, [edge]) if attempts == {"att-old"} else (attempts, [])), \
+             unittest.mock.patch.object(replacement, "_rows", return_value=rows):
+            for expected in ("pending", "sent-ambiguous"):
+                if expected == "sent-ambiguous":
+                    PD.claim(self.root, "sess-abc", "delivery-new", claim_owner="test", lease_seconds=30)
+                    PD.mark_sent_ambiguous(self.root, "sess-abc", "delivery-new", claim_owner="test")
+                with self.assertRaises(PD.PendingDeliveryError):
+                    PD.claim(self.root, "sess-abc", kwargs["delivery_id"], claim_owner="sweep", lease_seconds=30)
+                self.assertEqual(PD.read(self.root, "sess-abc", kwargs["delivery_id"])["state"], "pending")
+            PD.ack(self.root, "sess-abc", "delivery-new", acked_by="recipient-inference")
+            with self.assertRaises(PD.PendingDeliveryError):
+                PD.claim(self.root, "sess-abc", kwargs["delivery_id"], claim_owner="sweep", lease_seconds=30)
+        retired = PD.read(self.root, "sess-abc", kwargs["delivery_id"])
+        self.assertEqual((retired["state"], retired["expiry_reason"]), ("rejected", "replacement-consumed"))
+        self.assertIsNone(retired["acked_at_ns"])
+        self.assertEqual(retired["receipt"], original["receipt"])
+
+    def test_human_gate_is_not_deferred_with_its_replaced_attempt(self):
+        import dispatch_replacement as replacement
+        self.root.mkdir(parents=True, exist_ok=True)
+        jobs = self.root / "jobs.log"
+        jobs.write_text("")
+        receipt = _receipt(job_registry=str(jobs), children=[{"attempt_id": "att-old", "required_action": "human-gate:answer"}])
+        kwargs, _ = self._create(receipt=receipt, attempt_ids=["att-old"])
+        with unittest.mock.patch.object(replacement, "effective_attempts", side_effect=AssertionError("gates never use replacement mapping")):
+            claimed = PD.claim(self.root, "sess-abc", kwargs["delivery_id"], claim_owner="sweep", lease_seconds=30)
+        self.assertEqual(claimed["state"], "claimed")
+
+    def test_gateway_consumption_requires_durable_accept_and_replays_after_restart(self):
+        import dispatch_replacement as replacement
+        self.root.mkdir(parents=True, exist_ok=True)
+        jobs = self.root / "jobs.log"
+        jobs.write_text("")
+        receipt = _receipt(job_registry=str(jobs), children=[{"attempt_id": "att-new"}],
+            replacement_lineage=[{"original_attempt_id": "att-old", "replacement_attempt_id": "att-new"}])
+        ledger = self.root / "gateway.json"
+        import hashlib
+        digest = "sha256:" + hashlib.sha256(json.dumps(receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+        value = {"deliveries": {"dlv-proof": {"state": "sent", "thread_id": "sess-abc", "receipt_digest": digest}}}
+        ledger.write_text(json.dumps(value))
+        with unittest.mock.patch.object(replacement, "adopt_receipt", return_value=({"att-new"}, {"att-old"})):
+            with self.assertRaises(ValueError):
+                PD.record_replacement_consumption(self.root, "sess-abc", receipt, ledger_path=ledger, delivery_id="dlv-proof")
+            value["deliveries"]["dlv-proof"]["state"] = "accepted"
+            ledger.write_text(json.dumps(value))
+            PD.record_replacement_consumption(self.root, "sess-abc", receipt, ledger_path=ledger, delivery_id="dlv-proof")
+            PD.record_replacement_consumption(self.root, "sess-abc", receipt, ledger_path=ledger, delivery_id="dlv-proof")
+            self.assertTrue(PD._gateway_consumed(self.root, "sess-abc", "att-old"))
+            self.assertFalse(PD._gateway_consumed(self.root, "foreign", "att-old"))
+            value["deliveries"]["dlv-proof"]["state"] = "sent"
+            ledger.write_text(json.dumps(value))
+            with self.assertRaises(ValueError):
+                PD._gateway_consumed(self.root, "sess-abc", "att-old")
+
     def test_create_persists_schema_v1_record(self):
         kwargs, record = self._create()
         self.assertEqual(record["schema_version"], 1)

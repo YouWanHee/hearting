@@ -1703,6 +1703,9 @@ def append_job(jobs: Path, args: argparse.Namespace) -> bool:
     if is_no_commit_stage(args):
         pipe += ",no_commit=1"
     ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    from dispatch_replacement import seal_launch_input
+    args.replacement_runtime_sandbox = effective_runtime_sandbox(args)
+    pipe += seal_launch_input(args, 'codex', getattr(args, "replacement_raw_task", ""))
     row = f"{ts}\topen\t{repo}\t{args.worktree}\t{args.slug}\t{pipe}"
     exclusive = ({"route_id": args.route_id, "route_node": args.route_node,
                   "capacity_retry": "1"} if args.capacity_retry else None)
@@ -2201,6 +2204,7 @@ def validate_route_record(args: argparse.Namespace) -> int:
 
 def main(argv: list[str]) -> int:
     args = parser().parse_args(argv[1:])
+    args.replacement_input_argv = list(argv[1:])
     # parent_sandbox is used here only to tighten the override gate, never to
     # loosen it, so consuming it before the tuple-validity check at :1939 is
     # safe even though it has not yet been validated.
@@ -2521,7 +2525,10 @@ def main(argv: list[str]) -> int:
         else dispatch_state_root(args.jobs_path) / "logs"
     )
     task_input = task_prompt(args)
+    args.replacement_raw_task = task_input[0]
     prompt_text, prompt_source = dispatch_prompt(args, task_input)
+    from dispatch_replacement import recovery_instructions
+    prompt_text += recovery_instructions(args)
     assignment_sha256 = "sha256:" + hashlib.sha256(
         task_input[0].encode("utf-8")
     ).hexdigest()

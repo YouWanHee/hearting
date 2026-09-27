@@ -21,6 +21,8 @@ ran out on real verdicts"."""
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import re
 from typing import Mapping, Sequence
 
 from dispatch_attempt_policy import (
@@ -70,6 +72,65 @@ CLOSURE_CLASSES = frozenset({
     "owner-override-unlinked",   # inline completion over an unresolved blocking FAIL (SD-134 A75-9)
     "inline-no-unresolved-fail", # plain inline completion, no unresolved blocking verdict in history
 })
+
+
+def logical_round_records(rows, *, jobs=None):
+    """Project reciprocal, registry-sealed SD-157 rows onto one semantic round.
+
+    These immutable fields are added only by the common registration fence
+    after checking the canonical claim. A one-sided, malformed, or mismatched
+    declaration leaves both rows visible. The registry and failure history are
+    never changed; only the admission/marker census uses this projection.
+    """
+    if jobs is None:
+        return rows  # No registry binding grants no census-reduction authority.
+    by_id = {}
+    for fields, meta in rows:
+        by_id.setdefault(meta.get('attempt_id'), []).append((fields, meta))
+    replaced = {}
+    consumed = set()
+    for fields, source in rows:
+        family = source.get('replacement_family_id', '')
+        digest = source.get('replacement_claim_digest', '')
+        original = source.get('attempt_id')
+        target = source.get('replacement_attempt_id')
+        if (not re.fullmatch(r'[0-9a-f]{64}', family)
+                or not re.fullmatch(r'[0-9a-f]{64}', digest)
+                or not original or len(by_id.get(original, [])) != 1
+                or target != 'att-'+hashlib.sha256(('replacement:'+family).encode()).hexdigest()[:48]
+                or len(by_id.get(target, [])) != 1
+                or source.get('replacement_ordinal') != '1'
+                or fields[1] not in {'done', 'cancelled', 'killed'}
+                or classify_round_row(fields[1], source,
+                                      worker_type=source.get('worker_type', 'review')) != 'verdict-less'):
+            continue
+        candidate_fields, candidate = by_id[target][0]
+        if (candidate.get('replacement_original_attempt_id') != original
+                or candidate.get('automatic_retry_of') != original
+                or candidate.get('replacement_family_id') != family
+                or candidate.get('replacement_claim_digest') != digest
+                or candidate.get('replacement_ordinal') != '1'
+                or candidate_fields[2:4] != fields[2:4]
+                or any(candidate.get(key) != source.get(key) for key in
+                       ('route_node', 'parent_attempt_id', 'parent_sid', 'worker_type', 'dispatch_depth'))):
+            continue
+        # Metadata is reciprocal, but the immutable canonical claim must still
+        # agree. Read-only and lock-free: callers may already hold the jobs lock.
+        import dispatch_replacement as replacement
+        try:
+            record = replacement._check_record(
+                replacement._read(replacement._record_path(jobs, family)), family, source)
+            if (replacement._digest(record) != digest
+                    or record['original_attempt_id'] != original
+                    or record['replacement_attempt_id'] != target
+                    or (replacement.source_reservation(jobs, original) or {}).get('family_id') != family):
+                continue
+        except (replacement.DC.DispatchContractError, KeyError):
+            continue
+        replaced[original] = (candidate_fields, candidate)
+        consumed.add(target)
+    return [replaced.get(meta.get('attempt_id'), (fields, meta))
+            for fields, meta in rows if meta.get('attempt_id') not in consumed]
 
 
 def recovery_fields(node_kind, state="exhausted"):

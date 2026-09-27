@@ -331,6 +331,7 @@ class SerialChainFlowMixin:
                         refresh=lambda attempts: [rows[int(next(iter(attempts)).split("-")[-1]) - 1]],
                         join=lambda attempts: joins.append(set(attempts)) or {"state": "delivered", "children": []},
                         reconcile=lambda joined, attempts: False, max_reparks=1,
+                        replacement_checkpoint=lambda selected: (selected, [], []),
                     )
                 self.assertEqual(len(joins), count - 1)
                 self.assertEqual(result.last_advanced_attempt_id, f"att-{count}")
@@ -362,6 +363,7 @@ class SerialChainFlowMixin:
                     "state": "delivered", "children": [{"attempt_id": next(iter(attempts))}]
                 },
                 reconcile=lambda joined, attempts: False, max_reparks=1,
+                replacement_checkpoint=lambda selected: (selected, [], []),
             )
         self.assertEqual(len(joins), 1)
         self.assertEqual(result.attempts, frozenset({"att-2", "att-sibling"}))

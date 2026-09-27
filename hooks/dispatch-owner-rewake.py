@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import fcntl
 import json
@@ -167,6 +167,7 @@ class ArmClaim:
     session_id: str
     arms: int
     holder: tuple[str, str, str]
+    predecessors: tuple[ArmClaim, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -695,6 +696,8 @@ def settle_arm(claim: ArmClaim, state: str, *, gate_delivery_id: str | None = No
         return False
     finally:
         os.close(lock)
+    for predecessor in claim.predecessors:
+        settle_arm(predecessor, state, gate_delivery_id=gate_delivery_id)
     return True
 
 
@@ -766,6 +769,56 @@ def wait_for_attempt(
         if gate_probe is not None and gate_probe():
             return "gate", "human-gate-open"
         time.sleep(interval)
+
+
+
+def replacement_authority(launch: Launch, claim: ArmClaim, jobs: Path, aid: str, metadata: dict) -> bool:
+    """The native incarnation and held arm grant this carrier its exact scope."""
+    trusted = _trusted_jobs()
+    held = _read_arm(claim.path)
+    return bool(
+        trusted is not None and Path(jobs).resolve() == trusted.resolve() == launch.jobs.resolve()
+        and aid == launch.attempt_id == claim.attempt_id
+        and claim.session_id == launch.session_id == metadata.get("parent_sid")
+        and held and held.get("holder") == list(claim.holder)
+        and held.get("state") == "waiting" and held.get("attempt_id") == aid
+        and held.get("session_id") == launch.session_id
+        and _process_identity(os.getpid()) == claim.holder
+        and all(metadata.get(key) == value for key, value in REGISTRY_DEPTH1_START.items())
+        and _worker_type_is_depth1(metadata.get("worker_type"))
+        and _incarnation_binding_matches(metadata)
+    )
+
+
+@dataclass(frozen=True)
+class ReplacementPending:
+    attempt_id: str
+
+
+def follow_replacement(launch: Launch, claim: ArmClaim) -> tuple[Launch, ArmClaim] | ArmRefusal | ReplacementPending | None:
+    """Resume the same durable replacement after a carrier restart or lost reply."""
+    from dispatch_replacement import advance_batch
+    selected, edges, _attention = advance_batch(
+        launch.jobs, {launch.attempt_id},
+        authority_check=lambda jobs, aid, metadata: replacement_authority(launch, claim, jobs, aid, metadata),
+    )
+    if selected == {launch.attempt_id}:
+        return None
+    if len(selected) != 1 or len(edges) != 1 or edges[0].get("original_attempt_id") != launch.attempt_id:
+        raise DispatchContractError("replacement-receipt-lineage-mismatch")
+    target = next(iter(selected))
+    if target != edges[0].get("replacement_attempt_id"):
+        raise DispatchContractError("replacement-receipt-attempt-mismatch")
+    row = current_attempt_row(launch.jobs, target)
+    if row is None or (row.status in {"open", "running"} and row.metadata.get("launch_claimed") != "1"):
+        # Registration is not a launch. Keep the original arm so a lost
+        # launcher reply can resume the same claim under its original authority.
+        return ReplacementPending(target)
+    successor = claim_arm(launch.jobs, target, launch.session_id, fresh=True)
+    if isinstance(successor, ArmRefusal):
+        return successor
+    return (replace(launch, attempt_id=target, armed="automatic-replacement"),
+            replace(successor, predecessors=(claim,)))
 
 
 def _completion_evidence_current(state: CurrentDeliveryState) -> bool:
@@ -1341,6 +1394,23 @@ def main() -> int:
                 launch, readiness, gate_probe=lambda: _open_gate_pending(launch),
                 deadline=deadline,
             )
+            if wait_state in {"ready", "attention"}:
+                try:
+                    successor = follow_replacement(launch, claim)
+                except (DispatchContractError, OSError, ValueError):
+                    successor = None  # Preserve the exact original failure on refusal.
+                if isinstance(successor, ReplacementPending):
+                    if time.monotonic() >= deadline:
+                        wait_state, wait_reason = "timeout", "replacement-launch-pending"
+                        break
+                    time.sleep(min(interval, max(0.0, deadline - time.monotonic())))
+                    continue
+                if isinstance(successor, ArmRefusal):
+                    settle_arm(claim, "ended" if successor.watched else "lapsed")
+                    return 0 if successor.watched else no_arm_notice(payload, reason=successor.reason)
+                if successor is not None:
+                    launch, claim = successor
+                    continue  # Same deadline; one registry-bound successor only.
             if wait_state != "gate":
                 break
             # SD-129: the owner is alive at its gate. Wake the person now with
@@ -1363,6 +1433,14 @@ def main() -> int:
         if wait_state not in {"ready", "attention"}:
             settle_arm(claim, "lapsed")
         state, message = classified_receipt(launch, wait_state, wait_reason, root)
+        if state == "attention":
+            try:
+                row = current_attempt_row(launch.jobs, launch.attempt_id)
+                if row and row.metadata.get("replacement_original_attempt_id"):
+                    node = re.sub(r"[^A-Za-z0-9_.:/-]", "?", row.metadata.get("route_node") or "owner")[:120]
+                    message += f" Automatic replacement exhausted: {node} failed again; parent attention is required."
+            except (JoinContractError, OSError):
+                pass
     # `ended` is sealed only once the receipt has actually gone out (review
     # R2 B2), or once another carrier owns the completion: a crash between
     # classification and emission leaves the claim `waiting` under a dead

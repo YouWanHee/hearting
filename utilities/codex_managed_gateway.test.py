@@ -1917,6 +1917,61 @@ class ValidateDeliveryStageAdvanceNegotiationTest(unittest.TestCase):
             accept_stage_advance=True,
         )
 
+    def test_replacement_receipt_preserves_verified_lineage_and_original_batch(self):
+        import dispatch_replacement as replacement
+        request = receipt_request(gateway_epoch=0, binding_generation=0)
+        edge = {"original_attempt_id": "att-old", "replacement_attempt_id": "att-batch-1",
+                "family_id": "family", "claim_digest": "digest"}
+        request["receipt"]["replacement_lineage"] = [edge]
+        rows = {aid: ([], {"dispatch_depth": "2", "parent_attempt_id": "att-parent"})
+                for aid in ("att-old", "att-batch-1")}
+        with mock.patch.object(replacement, "adopt_receipt", return_value=({"att-batch-1"}, {"att-old"})) as adopt, \
+             mock.patch.object(replacement, "_rows", return_value=rows):
+            result = self.gateway._validate_delivery(request)
+        self.assertEqual(result[2], "batch-1")
+        self.assertEqual(result[3]["replacement_lineage"], [edge])
+        self.assertEqual(adopt.call_args.args[1], {"att-old"})
+
+    def test_four_verified_replacement_edges_have_bounded_larger_envelope(self):
+        import dispatch_replacement as replacement
+        request = receipt_request(gateway_epoch=0, binding_generation=0)
+        child = request["receipt"]["children"][0]
+        targets = {"att-new-" + str(i) + "a" * 45 for i in range(4)}
+        originals = {"att-old-" + str(i) + "b" * 45 for i in range(4)}
+        request["receipt"]["children"] = [dict(child, attempt_id=aid) for aid in sorted(targets)]
+        request["receipt"]["replacement_lineage"] = [{"original_attempt_id": old, "replacement_attempt_id": new,
+            "family_id": "f" * 64, "claim_digest": "d" * 64} for old, new in zip(sorted(originals), sorted(targets))]
+        rows = {aid: ([], {"dispatch_depth": "2", "parent_attempt_id": "att-parent"}) for aid in originals | targets}
+        with mock.patch.object(replacement, "adopt_receipt", return_value=(targets, originals)), \
+             mock.patch.object(replacement, "_rows", return_value=rows):
+            result = self.gateway._validate_delivery(request)
+            self.assertGreater(len(GATEWAY.canonical(result[3]).encode()), 2048)
+            request["receipt"]["replacement_lineage"][0]["claim_digest"] = "d" * 9000
+            with self.assertRaisesRegex(GATEWAY.GatewayError, "receipt-oversized"):
+                self.gateway._validate_delivery(request)
+
+    def test_attention_without_lineage_rejects_other_parent_and_other_batch(self):
+        jobs = Path(self.temp.name) / "attention-jobs.log"
+        for source, depth, parent in (("att-batch-1", "1", "foreign-session"),
+                                      ("att-foreign", "2", "att-parent")):
+            with self.subTest(source=source):
+                parent_key = "parent_sid" if depth == "1" else "parent_attempt_id"
+                jobs.write_text(f"now\tdone\t/repo\t/wt\tfailed\tattempt_id={source},dispatch_depth={depth},{parent_key}={parent},note=dead-exact-pid\n")
+                request = receipt_request(gateway_epoch=0, binding_generation=0)
+                request["receipt"]["job_registry"] = str(jobs)
+                request["receipt"]["replacement_attention"] = [{"source_attempt_id": source,
+                    "state": "needs-attention", "node": "__owner__", "reason": "replacement-input-unproven"}]
+                with self.assertRaisesRegex(GATEWAY.GatewayError, "receipt-replacement-invalid"):
+                    self.gateway._validate_delivery(request)
+
+    def test_replacement_receipt_rejects_unproven_lineage(self):
+        import dispatch_replacement as replacement
+        request = receipt_request(gateway_epoch=0, binding_generation=0)
+        request["receipt"]["replacement_lineage"] = [{"original_attempt_id": "att-old", "replacement_attempt_id": "att-batch-1"}]
+        with mock.patch.object(replacement, "adopt_receipt", side_effect=ValueError("bad proof")):
+            with self.assertRaisesRegex(GATEWAY.GatewayError, "receipt-replacement-invalid"):
+                self.gateway._validate_delivery(request)
+
     def _record(self):
         return {
             "schema_version": 1,

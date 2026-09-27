@@ -755,6 +755,7 @@ def prompt(args: argparse.Namespace) -> tuple[str, str]:
         task, source = args.prompt_text, "inline"
     else:
         task, source = "Run the requested portable harness work.", "generated"
+    args.replacement_raw_task = task
     args.assignment_sha256 = "sha256:" + hashlib.sha256(task.encode("utf-8")).hexdigest()
     args.worker_type = resolve_worker_type(
         explicit=args.worker_type,
@@ -1128,6 +1129,8 @@ def append_job(jobs: Path, args: argparse.Namespace) -> bool:
     if args.broker_request_id:
         pipe += f",broker_request_id={args.broker_request_id}"
     ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    from dispatch_replacement import seal_launch_input
+    pipe += seal_launch_input(args, 'opencode', getattr(args, "replacement_raw_task", ""))
     row = f"{ts}\topen\t{repo}\t{args.worktree}\t{args.slug}\t{pipe}"
     exclusive = ({"route_id": args.route_id, "route_node": args.route_node,
                   "capacity_retry": "1"} if args.capacity_retry else None)
@@ -1527,6 +1530,7 @@ def validate_route_record(args: argparse.Namespace) -> int:
 
 def main(argv: list[str]) -> int:
     args = parser().parse_args(argv[1:])
+    args.replacement_input_argv = list(argv[1:])
     # parent_sandbox is used here only to tighten the override gate, never to
     # loosen it, so consuming it before the tuple-validity check at :1136 is
     # safe even though it has not yet been validated.
@@ -1814,6 +1818,8 @@ def main(argv: list[str]) -> int:
         else dispatch_state_root(args.jobs_path) / "logs"
     )
     prompt_text, prompt_source = prompt(args)
+    from dispatch_replacement import recovery_instructions
+    prompt_text += recovery_instructions(args)
     if action == "start" and args.replica_batch_expectation is not None:
         try:
             args.replica_batch_expectation = replica_batch_expectation(

@@ -8,7 +8,7 @@ import base64
 
 CANONICAL_RECEIPT_KEYS = frozenset({
     "schema_version", "state", "parent_attempt_id", "job_registry", "children",
-    "delivery_classification",
+    "delivery_classification", "replacement_lineage", "replacement_attention",
 })
 CANONICAL_CHILD_KEYS = frozenset({
     "attempt_id", "status", "readiness", "reason", "required_action", "harness",

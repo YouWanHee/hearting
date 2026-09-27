@@ -198,6 +198,18 @@ def load_partial_continuation(
 ) -> tuple[dict[str, object], dict[str, object]]:
     """Load one official continuation and bind it to the exact source group."""
 
+    # An SD-157 claim keeps the current route. Its durable family authority is
+    # checked independently; it must not masquerade as a compiled SD-104 route.
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raw = None
+    if isinstance(raw, dict) and raw.get("schema") == "automatic-parallel-replacement-v1":
+        from dispatch_replacement_batch import load_evidence
+        try:
+            return load_evidence(path, source_route, parallel_group)
+        except DispatchContractError as exc:
+            raise BatchError(exc.reason, exc.detail) from exc
     continuation = load_route(path.resolve(), launch_phase)
     partial = continuation.get("partial_group_continuation")
     if (
@@ -998,18 +1010,27 @@ def prepare_partial_replacement(
             ]
             if (
                 mismatches
-                or fields[1] != "done"
+                or (fields[1] not in {"done", "cancelled", "killed"}
+                    if partial.get("automatic_replacement_evidence") else fields[1] != "done")
                 or metadata.get("note") == "completed-marker"
             ):
                 raise BatchError(
                     "partial-continuation-gap-source-invalid",
                     ",".join(mismatches) or f"status={fields[1]}:note={metadata.get('note','')}",
                 )
-            retry_attempt = _recovery_replacement_attempt(metadata)
+            if partial.get("automatic_replacement_evidence"):
+                from dispatch_replacement_batch import validate_evidence
+                record, _input = validate_evidence(
+                    jobs, lines, partial["automatic_replacement_evidence"], route
+                )
+                replacement_attempt = record["replacement_attempt_id"]
+                retry_attempt = ""
+            else:
+                retry_attempt = _recovery_replacement_attempt(metadata)
             retry_claim_reused = bool(retry_attempt)
             if retry_claim_reused:
                 replacement_attempt = retry_attempt
-            else:
+            elif not partial.get("automatic_replacement_evidence"):
                 replacement_attempt = stable_attempt_id(
                     route,
                     next(
@@ -1868,6 +1889,8 @@ def main(argv: list[str] | None = None) -> int:
                 **partial,
                 "continuation_id": continuation_record["continuation_id"],
             }
+            if continuation_record.get("schema") == "automatic-parallel-replacement-v1":
+                partial["automatic_replacement_evidence"] = continuation_record
         if getattr(args, "subdivision_manifest", None):
             node = next(
                 (candidate for candidate in nodes if candidate.get("id") == args.parallel_group),
@@ -1946,6 +1969,10 @@ def main(argv: list[str] | None = None) -> int:
             capped_node_id = str(capped_node["id"])
             if capped_node_id not in DISPATCH_NODE.ROUND_CAPPED_NODE_IDS:
                 continue
+            if partial is not None and partial.get("automatic_replacement_evidence"):
+                # The claim has already validated the dead exact source. Reused
+                # peers and its one replacement consume no new semantic round.
+                continue
             budget = DISPATCH_NODE.admit_round(
                 route, capped_node, jobs,
                 owner_attempt_id=os.environ.get("AGENT_DISPATCH_ATTEMPT_ID"),
@@ -1978,16 +2005,23 @@ def main(argv: list[str] | None = None) -> int:
                     f"round={budget.next_round} max_round={budget.cap}",
                     route_node=capped_node_id,
                 )
-        assignments, independence, diagnostics = assign_harnesses(
-            route,
-            nodes,
-            allow_degraded=args.allow_degraded_independence,
-            parent_identity=parent_identity,
-            jobs=jobs,
-        )
         if partial is not None:
             assignments = partial_source_assignments(
                 jobs, route, nodes, partial, parent_identity
+            )
+            # Successful peers retain their sealed placement and consume no
+            # fresh capacity. Reallocating the whole group could reject a dead
+            # gap merely because its successful sibling's backend is now busy.
+            families = sorted({adapter for _, adapter, _, _ in assignments})
+            independence = "cross-harness" if len(families) >= 2 else "degraded-same-harness"
+            diagnostics = {"families_considered": families, "usable_families": families,
+                           "family_exclusions": {}, "capacity": {},
+                           "degradation_cause": "", "sole_gate": "not-applicable",
+                           "allocation_source": "sealed-source-manifest"}
+        else:
+            assignments, independence, diagnostics = assign_harnesses(
+                route, nodes, allow_degraded=args.allow_degraded_independence,
+                parent_identity=parent_identity, jobs=jobs,
             )
         self_slug = os.environ.get("AGENT_DISPATCH_SELF_SLUG", "")
         parent_attempt = os.environ.get("AGENT_DISPATCH_ATTEMPT_ID", "")
@@ -2209,6 +2243,16 @@ def main(argv: list[str] | None = None) -> int:
             leg for leg in legs if leg["node"] == partial["gap_leg_id"]
         )
         gap_leg["attempt_id"] = replacement_seal["replacement_attempt_id"]
+        if partial.get("automatic_replacement_evidence"):
+            # A failed pre-admission caller may have used a different display
+            # prefix. The actual registered source, not that earlier label,
+            # owns the wrapper's immutable --slug input.
+            import dispatch_replacement as replacement
+            source_row = replacement._rows(jobs.read_text().splitlines()).get(
+                str(partial["failed_source_attempt_id"]))
+            if source_row is None:
+                return fail("replacement-source-missing", 65, admitted=0, spawned=0)
+            gap_leg["slug"] = source_row[0][4]
 
     manifest, manifest_digest, leg_digests = build_manifest(
         parallel_group=args.parallel_group,
@@ -2246,6 +2290,13 @@ def main(argv: list[str] | None = None) -> int:
             ),
         }, separators=(",", ":"), sort_keys=True))
         return 0
+
+    try:
+        from dispatch_replacement_batch import seal_launch_input
+        seal_launch_input(jobs, args, route, manifest, manifest_digest)
+    except (DispatchContractError, ReplicaBatchContractError) as exc:
+        return fail(getattr(exc, "reason", "replacement-batch-input-invalid"),
+                    65, detail=str(exc), admitted=0, spawned=0)
 
     governor = ROOT / "utilities" / "model-worker-governor.py"
     artifact_root = Path(
@@ -2452,6 +2503,8 @@ def main(argv: list[str] | None = None) -> int:
                 # Omitted when unset: dispatch-node.py's wrapper derives it
                 # from --intensity (dispatch_mode_contract.resolve_qa).
                 command += ["--qa", args.qa]
+            if partial is not None and partial.get("automatic_replacement_evidence"):
+                command += ["--automatic-retry-of", str(partial["failed_source_attempt_id"])]
             env = {
                 # This launches a depth-2 node (dispatch-node.py), which
                 # always supplies its own --route via `command` above. An

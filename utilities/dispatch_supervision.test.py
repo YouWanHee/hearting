@@ -348,6 +348,33 @@ except d.DispatchContractError as e: print(json.dumps({'reason':e.reason}))
         self.assertEqual(len(list(pending.record_directory(self.root,"parent-test").glob("delivery-*.json"))), 1)
         self.assertTrue(all(event["responsible"] == "supervision-controller" for event in events))
 
+    def test_replacement_wait_joins_effective_once_and_retains_second_failure(self):
+        edge = {"original_attempt_id": "att-child", "replacement_attempt_id": "att-retry"}
+        attention = {"source_attempt_id": "att-retry", "reason": "automatic-replacement-exhausted"}
+        seen = []
+        def join(attempts):
+            seen.append(attempts)
+            return {"state": "ready", "children": [{"attempt_id": next(iter(attempts))}]}
+        def checkpoint(attempts):
+            return ({"att-retry"}, [edge], []) if attempts == {"att-child"} else (attempts, [], [attention])
+        result = supervision.wait_for_batch(join=join, attempts={"att-child"}, jobs=self.jobs,
+                                            replacement_checkpoint=checkpoint)
+        self.assertEqual(seen, [{"att-child"}, {"att-retry"}])
+        self.assertEqual(result["replacement_lineage"], [edge])
+        self.assertEqual(result["replacement_attention"], [attention])
+        self.assertEqual(result["children"], [{"attempt_id": "att-retry"}])
+
+    def test_replacement_watch_expiry_keeps_effective_scope(self):
+        edge = {"original_attempt_id": "att-child", "replacement_attempt_id": "att-retry"}
+        with mock.patch.object(supervision, "materialize", return_value=[]):
+            result = supervision.wait_for_batch(
+                join=lambda attempts: {"state": "timeout"}, attempts={"att-child"}, jobs=self.jobs,
+                deadline=0, replacement_checkpoint=lambda attempts:
+                    ({"att-retry"}, [edge], []) if attempts == {"att-child"} else (attempts, [], []))
+        self.assertEqual(result["state"], "watch-expired")
+        self.assertEqual(result["replacement_lineage"], [edge])
+        self.assertEqual(result["children"], [{"attempt_id": "att-retry"}])
+
     def test_wait_for_batch_deadline_records_once_and_returns(self):
         # plan.md item 8: a caller that supplies its own `deadline` (the
         # unfinishable-watch budget) stops after that deadline instead of

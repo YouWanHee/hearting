@@ -669,8 +669,9 @@ class DispatchContractTest(unittest.TestCase):
    fields=jobs.read_text().strip().split("\t",5)
    sealed=D.parse_registry_metadata(fields[5])
    self.assertEqual(fields[1],"done")
-   self.assertEqual(sealed["note"],"receipt-unavailable-retry-exhausted")
-   self.assertEqual(sealed["failure_class"],"blocked")
+   self.assertEqual(sealed.get("note"),metadata.get("note"))
+   self.assertEqual(sealed["recovery_exhausted"],"1")
+   self.assertEqual(sealed.get("failure_class"),metadata.get("failure_class"))
    self.assertNotIn("retry_attempt_id",sealed)
    self.assertFalse(D.attempt_launch_is_available(jobs,metadata["attempt_id"]))
 
@@ -4695,8 +4696,7 @@ class DeliveryIntentWiringTest(unittest.TestCase):
         #     _delivery_intent_values(...) first (marker_bound_delivery_
         #     transaction's advance branch, close_attempt_row,
         #     reconcile_attempt_terminal's `closed` branch, close_attempt_row_if).
-        #   - every other site (seal_recovery_blocked-style already-terminal
-        #     sealers, and reconcile_attempt_terminal's `repaired-terminal`/
+        #   - the remaining reconcile_attempt_terminal `repaired-terminal`/
         #     `terminal-conflict` branches, §4.3 exclusion table): MUST NOT.
         source = (Path(__file__).with_name("dispatch_contract.py")).read_text(encoding="utf-8")
         lines = source.splitlines()
@@ -4704,7 +4704,7 @@ class DeliveryIntentWiringTest(unittest.TestCase):
             index for index, line in enumerate(lines)
             if "terminal=True" in line and "`" not in line  # skip the one docstring mention
         ]
-        self.assertEqual(len(sites), 8, "unexpected count of terminal=True call sites -- "
+        self.assertEqual(len(sites), 6, "unexpected count of terminal=True call sites -- "
                           "a new one was added without updating this fixture's bucket split")
         wired = 0
         for index in sites:

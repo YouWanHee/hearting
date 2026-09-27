@@ -418,6 +418,39 @@ class WorkStartTest(unittest.TestCase):
             self.assertEqual(self.start()["state"],"completed")
         self.assertEqual(len(self.calls),3)
 
+    def test_frame_replacement_keeps_successful_sibling_and_gate_release(self):
+        self.start(); self.ready=True; self.released=True
+        source=W.attempt_id(self.route,'frame');success=W.attempt_id(self.route,'frame-alternative')
+        self.jobs.write_text(self.jobs.read_text().replace('\topen\t','\tdone\t'))
+        calls=[]
+        def advance(jobs,attempts,**kwargs):
+            calls.append(set(attempts))
+            if source not in attempts:return set(attempts),[],[]
+            row=next(line for line in jobs.read_text().splitlines() if 'attempt_id='+source+',' in line)
+            with jobs.open('a') as f:f.write(row.replace(source,'att-frame-replacement')+'\n')
+            return {success,'att-frame-replacement'},[{'original_attempt_id':source,'replacement_attempt_id':'att-frame-replacement'}],[]
+        with mock.patch('dispatch_replacement.advance_batch',side_effect=advance):
+            result=self.start()
+        self.assertIn('att-frame-replacement',result['frame_attempts'])
+        self.assertIn(success,result['frame_attempts'])
+        self.assertEqual(len(self.calls),3)  # initial two frames, then the owner
+        self.assertEqual(len(calls),2)
+        self.assertNotIn('frame_interview',result)
+
+    def test_owner_registered_replacement_is_resumed_without_new_owner_launch(self):
+        self.start();self.ready=True;self.released=True;self.start()
+        owner=W.attempt_id(self.route,'owner')
+        row=next(line for line in self.jobs.read_text().splitlines() if 'attempt_id='+owner+',' in line)
+        self.jobs.write_text(self.jobs.read_text().replace(row,row.replace('\topen\t','\tdone\t')+',note=dead-exact-pid'))
+        with self.jobs.open('a') as f:f.write(row.replace(owner,'att-owner-replacement')+',replacement_original_attempt_id='+owner+',launch_claimed=0\n')
+        self.ready=False;observed=[]
+        def resume(jobs,aid,**kwargs):
+            observed.append(aid);return {'state':'not-applicable'}
+        with mock.patch('dispatch_replacement.advance',side_effect=resume):result=self.start()
+        self.assertEqual(observed,['att-owner-replacement'])
+        self.assertEqual(len(self.calls),3)
+        self.assertEqual(result['owner_attempt_id'],'att-owner-replacement')
+
     def test_unknown_process_retains_runtime_wait_without_replacement(self):
         self.start()
         for _ in range(3):

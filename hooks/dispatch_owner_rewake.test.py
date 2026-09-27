@@ -97,6 +97,64 @@ def _wait_for_attempt_bridge_states() -> frozenset[str]:
     return frozenset(states)
 
 
+class ReplacementCarrierTest(unittest.TestCase):
+    def test_authority_requires_native_binding_and_current_arm_holder(self):
+        with tempfile.TemporaryDirectory() as directory:
+            jobs = Path(directory) / "jobs.log"
+            jobs.write_text("")
+            claim = rewake.ArmClaim(Path(directory) / "arm.json", "att-old", "sid", 1, ("7", "8", "ns"))
+            launch = rewake.Launch("att-old", jobs, "sid")
+            held = {"holder": list(claim.holder), "state": "waiting", "attempt_id": "att-old", "session_id": "sid"}
+            metadata = {**rewake.REGISTRY_DEPTH1_START, "parent_sid": "sid", "worker_type": "owner"}
+            with mock.patch.object(rewake, "_trusted_jobs", return_value=jobs), \
+                 mock.patch.object(rewake, "_read_arm", return_value=held), \
+                 mock.patch.object(rewake, "_process_identity", return_value=claim.holder), \
+                 mock.patch.object(rewake, "_incarnation_binding_matches", return_value=True) as native:
+                self.assertTrue(rewake.replacement_authority(launch, claim, jobs, "att-old", metadata))
+                self.assertFalse(rewake.replacement_authority(launch, claim, jobs, "att-old", dict(metadata, parent_sid="foreign")))
+                held["state"] = "ended"
+                self.assertFalse(rewake.replacement_authority(launch, claim, jobs, "att-old", metadata))
+                held["state"] = "waiting"
+                native.return_value = False
+                self.assertFalse(rewake.replacement_authority(launch, claim, jobs, "att-old", metadata))
+
+    def test_restarted_carrier_follows_same_registered_successor(self):
+        import dispatch_replacement as replacement
+        jobs = Path("/tmp/jobs.log")
+        source = rewake.Launch("att-old", jobs, "sid")
+        claim = rewake.ArmClaim(Path("/tmp/old.json"), "att-old", "sid", 2, ("7", "8", "ns"))
+        target = rewake.ArmClaim(Path("/tmp/new.json"), "att-new", "sid", 2, claim.holder)
+        edge = {"original_attempt_id": "att-old", "replacement_attempt_id": "att-new"}
+        from types import SimpleNamespace
+        with mock.patch.object(replacement, "advance_batch", return_value=({"att-new"}, [edge], [])), \
+             mock.patch.object(rewake, "current_attempt_row", return_value=SimpleNamespace(status="open", metadata={"launch_claimed": "1"})), \
+             mock.patch.object(rewake, "claim_arm", return_value=target):
+            launch, held = rewake.follow_replacement(source, claim)
+            self.assertEqual(launch.attempt_id, "att-new")
+            self.assertEqual(held.predecessors, (claim,))
+
+
+    def test_lost_reply_register_only_retains_original_authority_until_spawn(self):
+        from types import SimpleNamespace
+        import dispatch_replacement as replacement
+        jobs = Path("/tmp/jobs.log")
+        source = rewake.Launch("att-old", jobs, "sid")
+        claim = rewake.ArmClaim(Path("/tmp/old.json"), "att-old", "sid", 2, ("7", "8", "ns"))
+        target = rewake.ArmClaim(Path("/tmp/new.json"), "att-new", "sid", 1, claim.holder)
+        edge = {"original_attempt_id": "att-old", "replacement_attempt_id": "att-new"}
+        row = SimpleNamespace(status="open", metadata={"launch_claimed": "0"})
+        with mock.patch.object(replacement, "advance_batch", return_value=({"att-new"}, [edge], [])) as advance, \
+             mock.patch.object(rewake, "current_attempt_row", return_value=row), \
+             mock.patch.object(rewake, "claim_arm", return_value=target) as arm:
+            self.assertIsInstance(rewake.follow_replacement(source, claim), rewake.ReplacementPending)
+            arm.assert_not_called()
+            row.metadata["launch_claimed"] = "1"
+            launch, held = rewake.follow_replacement(source, claim)
+            self.assertEqual(launch.attempt_id, "att-new")
+            self.assertEqual(held.predecessors, (claim,))
+            self.assertEqual([call.args[1] for call in advance.call_args_list], [{"att-old"}, {"att-old"}])
+
+
 class DispatchOwnerRewakeTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()

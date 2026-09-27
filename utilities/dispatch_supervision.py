@@ -314,7 +314,8 @@ def wait_for_batch(*, join: Callable[[set[str]], dict], attempts: set[str],
                    jobs: Path, parent_attempt_id: str = "", emit: Callable[[dict], None] | None = None,
                    on_timeout: Callable[[set[str]], None] | None = None,
                    deadline: float | None = None,
-                   stop_check: Callable[[], str] | None = None) -> dict:
+                   stop_check: Callable[[], str] | None = None,
+                   replacement_checkpoint: Callable | None = None) -> dict:
     """One shared wait loop. Join deadlines are checkpoints, never death votes.
 
     Execution boundaries retain their finite budgets. The parent receives one
@@ -333,11 +334,23 @@ def wait_for_batch(*, join: Callable[[set[str]], dict], attempts: set[str],
     `join-deadline` notice already used.
     """
     ordinal = 0
+    lineage = []
+    attention = []
     while True:
         observer_error = ""
         try:
             receipt = join(set(attempts))
+            if replacement_checkpoint is not None:
+                effective, edges, attention = replacement_checkpoint(set(attempts))
+                lineage.extend(edge for edge in edges if edge not in lineage)
+                if set(effective) != set(attempts):
+                    attempts = set(effective)
+                    continue
             if receipt.get("state") != "timeout":
+                if lineage:
+                    receipt = {**receipt, "replacement_lineage": sorted(lineage, key=lambda edge: edge["original_attempt_id"])}
+                if attention:
+                    receipt = {**receipt, "replacement_attention": attention}
                 return receipt
         except Exception as exc:
             # Observation failure is not worker failure. Keep the exact wait
@@ -358,7 +371,13 @@ def wait_for_batch(*, join: Callable[[set[str]], dict], attempts: set[str],
                 records = materialize(jobs, attempts, reason=halt_reason)
             except (OSError, ValueError, pending_delivery.PendingDeliveryError):
                 records = []
-            return {"state": "watch-expired", "reason": halt_reason, "delivery_records": records}
+            result = {"state": "watch-expired", "reason": halt_reason, "delivery_records": records}
+            if lineage:
+                result["replacement_lineage"] = sorted(lineage, key=lambda edge: edge["original_attempt_id"])
+                result["children"] = [{"attempt_id": aid} for aid in sorted(attempts)]
+            if attention:
+                result["replacement_attention"] = attention
+            return result
         notice_error = ""
         try:
             materialize(jobs, attempts,

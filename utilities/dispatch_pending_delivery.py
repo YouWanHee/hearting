@@ -286,7 +286,25 @@ def create(
     body_bytes = len(
         json.dumps(receipt, separators=(",", ":"), sort_keys=True).encode("utf-8")
     )
-    if body_bytes > MAX_RECEIPT_BYTES:
+    limit = MAX_RECEIPT_BYTES
+    if receipt.get("replacement_lineage") or receipt.get("replacement_attention"):
+        try:
+            from dispatch_replacement import adopt_receipt, validate_attention
+            jobs = Path(receipt["job_registry"])
+            if jobs.resolve().parent != Path(root).resolve():
+                raise ValueError("replacement-registry-scope-invalid")
+            original = {child["attempt_id"] for child in receipt["children"]}
+            if receipt.get("replacement_lineage"):
+                for edge in receipt["replacement_lineage"]:
+                    original.discard(edge["replacement_attempt_id"])
+                    original.add(edge["original_attempt_id"])
+                adopt_receipt(jobs, original, receipt)
+            if receipt.get("replacement_attention"):
+                validate_attention(jobs, receipt["replacement_attention"], allowed_attempts=original | {child["attempt_id"] for child in receipt["children"]})
+            limit = 8192  # Four checked edges plus the unchanged four-child receipt.
+        except (ValueError, OSError, KeyError, TypeError) as exc:
+            raise PendingDeliveryError("pending-delivery-identity-conflict", "replacement-proof-invalid") from exc
+    if body_bytes > limit:
         raise PendingDeliveryError("pending-delivery-oversized")
 
     digest = recipient_digest(recipient_key)
@@ -334,6 +352,95 @@ def _verify_identity(existing: dict, candidate: dict) -> None:
             raise PendingDeliveryError("pending-delivery-identity-conflict", key)
 
 
+def _verified_gateway_consumption(proof: dict, recipient_key: str) -> set[str]:
+    """A durable accepted gateway transaction, never a send or timeout, is proof."""
+    from dispatch_replacement import adopt_receipt
+    receipt = proof["receipt"]
+    jobs = Path(receipt["job_registry"])
+    ledger_path = Path(proof["ledger_path"])
+    if ledger_path.is_symlink():
+        raise ValueError("replacement-consumption-ledger-unsafe")
+    ledger = json.loads(ledger_path.read_text())
+    entry = ledger["deliveries"][proof["delivery_id"]]
+    digest = "sha256:" + hashlib.sha256(json.dumps(receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+    if (entry.get("state") != "accepted" or entry.get("thread_id") != recipient_key
+            or entry.get("receipt_digest") != digest or proof.get("recipient_key") != recipient_key):
+        raise ValueError("replacement-consumption-unproven")
+    originals = {child["attempt_id"] for child in receipt["children"]}
+    for edge in receipt["replacement_lineage"]:
+        originals.discard(edge["replacement_attempt_id"])
+        originals.add(edge["original_attempt_id"])
+    _, consumed = adopt_receipt(jobs, originals, receipt)
+    return consumed
+
+
+def record_replacement_consumption(root: Path, recipient_key: str, receipt: dict, *, ledger_path: Path, delivery_id: str) -> None:
+    """Persist a replayable acknowledgement proof without acking a failure row."""
+    if not receipt.get("replacement_lineage"):
+        return
+    from artifact_receipt import _write_once
+    proof = {"receipt": receipt, "recipient_key": recipient_key,
+             "ledger_path": str(ledger_path.resolve()), "delivery_id": delivery_id}
+    consumed = _verified_gateway_consumption(proof, recipient_key)
+    directory = Path(root) / "replacement-delivery-consumed"
+    directory.mkdir(parents=True, exist_ok=True)
+    for aid in consumed:
+        path = directory / (hashlib.sha256((recipient_key + "\0" + aid).encode()).hexdigest() + ".json")
+        if path.is_symlink():
+            raise ValueError("replacement-consumption-unsafe")
+        _write_once(directory, path, (json.dumps(proof, sort_keys=True) + "\n").encode())
+
+
+def _gateway_consumed(root: Path, recipient_key: str, aid: str) -> bool:
+    path = Path(root) / "replacement-delivery-consumed" / (hashlib.sha256((recipient_key + "\0" + aid).encode()).hexdigest() + ".json")
+    if not path.is_file() or path.is_symlink():
+        return False
+    return aid in _verified_gateway_consumption(json.loads(path.read_text()), recipient_key)
+
+
+def _replacement_disposition(root: Path, recipient_key: str, value: dict) -> str:
+    """Original completion is deferred until its proven successor is consumed.
+
+    This never treats a replacement claim as a launch or an async emit as ack.
+    Human gates retain their original delivery contract and are never retired.
+    """
+    receipt = value.get("receipt") or {}
+    if (receipt.get("kind") in {"human-gate", "supervision"}
+            or any(isinstance(child, dict) and str(child.get("required_action", "")).startswith("human-gate:")
+                   for child in receipt.get("children", []))):
+        return ""
+    raw_jobs = receipt.get("job_registry")
+    if not isinstance(raw_jobs, str):
+        return ""
+    jobs = Path(raw_jobs)
+    if not jobs.is_file() or jobs.is_symlink() or jobs.resolve().parent != Path(root).resolve():
+        return ""
+    try:
+        from dispatch_replacement import effective_attempts, _rows
+        selected = set(value.get("attempt_ids") or [])
+        effective, edges = effective_attempts(jobs, selected)
+        if not edges:
+            return ""
+        if all(_gateway_consumed(root, recipient_key, edge["original_attempt_id"]) for edge in edges):
+            return "consumed"
+        rows = _rows(jobs.read_text().splitlines())
+        # Mixed aggregate records require every effective completion to be
+        # consumed; a successful sibling never makes a dead leg disappear.
+        consumed = True
+        for aid in effective:
+            metadata = rows[aid][1]
+            if metadata.get("parent_sid") != recipient_key:
+                return "defer"
+            target_id = metadata.get("delivery_id")
+            target = read(root, recipient_key, target_id) if target_id else None
+            if target is None or target.get("state") != "acked" or aid not in target.get("attempt_ids", []):
+                consumed = False
+        return "consumed" if consumed else "defer"
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+        # An unreadable lineage cannot grant delivery of a stale failure.
+        return "defer"
+
+
 def claim(
     root: Path,
     recipient_key: str,
@@ -378,6 +485,12 @@ def claim(
             raise PendingDeliveryError(
                 "pending-delivery-claim-refused", f"state={value['state']}"
             )
+        disposition = _replacement_disposition(root, recipient_key, value)
+        if disposition:
+            if disposition == "consumed":
+                retired = dict(value, state="rejected", expiry_reason="replacement-consumed")
+                _write_unlocked(path, retired)
+            raise PendingDeliveryError("pending-delivery-claim-refused", "replacement-" + disposition)
         now = time.monotonic_ns()
         updated = dict(value)
         if live_recipient_generation is not None:

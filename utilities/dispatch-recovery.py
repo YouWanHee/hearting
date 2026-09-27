@@ -575,7 +575,7 @@ def _claim_from_source(
     metadata = source.metadata
     if metadata.get("recovery_id") != recovery_identity:
         return None
-    if metadata.get("note") == "receipt-unavailable-retry-exhausted":
+    if metadata.get("recovery_exhausted") == "1" or metadata.get("note") == "receipt-unavailable-retry-exhausted":
         return RecoveryRetryClaim(
             recovery_identity,
             metadata["attempt_id"],

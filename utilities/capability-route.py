@@ -1177,7 +1177,7 @@ def build_continuation_route(
     }
     inherited_keys=(
         "schema_version","capability","capability_mode","slug","slug_truncated",
-        "campaign_key","parent_cycle_id","campaign_unassigned",
+        "campaign_key","parent_cycle_id","campaign_unassigned","work_request",
         "requested_intensity",
         "effective_intensity","owner_model_profile","execution_topology",
         "owner_dispatch_depth","max_dispatch_depth","tracking",
@@ -4615,7 +4615,7 @@ def write_completion_marker(
             jobs_path=Path(jobs)
             if jobs_path.is_file():
                 lines=jobs_path.read_text(encoding="utf-8",errors="replace").splitlines()
-                rows=_review_round_rows(lines,route["route_id"],node_id)
+                rows=_review_round_rows(lines,route["route_id"],node_id,jobs=jobs)
         if owner_override:
             site="owner-closure"
         elif axes.get("registered_worker"):
@@ -5132,7 +5132,7 @@ def revision_basis_verdict(route, node, basis, answers, *, jobs=None, direction=
         )
         if worker_type not in ("review", "test"):
             continue
-        for cols, meta in review_round_records(lines, {route["route_id"]}, candidate_id):
+        for cols, meta in review_round_records(lines, {route["route_id"]}, candidate_id,jobs=jobs):
             attempt = meta.get("attempt_id")
             if not attempt or attempt not in answers:
                 continue
@@ -5253,7 +5253,7 @@ def publish_revision_locked(route, node_id, evidence, *, basis, answers=(), dire
                 census_jobs_path = Path(jobs)
                 if census_jobs_path.is_file():
                     census_lines = census_jobs_path.read_text(encoding="utf-8", errors="replace").splitlines()
-                    census_rows = _review_round_rows(census_lines, route["route_id"], node_id)
+                    census_rows = _review_round_rows(census_lines, route["route_id"], node_id,jobs=jobs)
             census = REVIEW_ROUND_CAP.marker_round_census(route, node, census_rows, site="revision")
             if census:
                 new_marker["round_census"] = census
@@ -5707,7 +5707,7 @@ def _mentions(text, token):
     """Whole-token mention: `att-r1` must not be satisfied by `att-r10`."""
     return re.search(r"(?<![A-Za-z0-9_./-])"+re.escape(token)+r"(?![A-Za-z0-9_-])",text) is not None
 
-def review_round_records(lines, route_ids, node_id):
+def review_round_records(lines, route_ids, node_id, *, jobs=None):
     """One round census for admission and closure, including every status."""
     rows=[]
     for line in lines:
@@ -5722,10 +5722,10 @@ def review_round_records(lines, route_ids, node_id):
         if str(metadata.get("stage_authority","1")).lower() in {"0", "false"}:
             continue
         rows.append((fields,metadata))
-    return rows
+    return REVIEW_ROUND_CAP.logical_round_records(rows,jobs=jobs)
 
-def _review_round_rows(lines, route_id, node_id):
-    return [(fields[1], meta) for fields, meta in review_round_records(lines, {route_id}, node_id)]
+def _review_round_rows(lines, route_id, node_id, *, jobs=None):
+    return [(fields[1], meta) for fields, meta in review_round_records(lines, {route_id}, node_id,jobs=jobs)]
 
 def _node_revision_records(route, node_id, jobs=None):
     """Every SD-154 `revision` record in one node's own completion-dir
@@ -5761,7 +5761,7 @@ def _dependency_revisions(route, node, jobs=None):
     ]
 
 def _owner_closure_eligibility(route, node, node_id, evidence, row_metadata, lines,
-                               *, rounds=None, check_canonical=True):
+                               *, rounds=None, check_canonical=True, jobs=None):
     """Admit `complete` on a `completed-review-blocking` row, or raise a typed refusal.
 
     Returns the closure facts the caller seals on the row. Checks, in order:
@@ -5781,7 +5781,7 @@ def _owner_closure_eligibility(route, node, node_id, evidence, row_metadata, lin
         refuse("node-not-review",
                f"kind={node.get('kind') or '-'};worker_type={row_metadata.get('worker_type') or '-'}")
     if rounds is None:
-        rounds=_review_round_rows(lines,route["route_id"],node_id)
+        rounds=_review_round_rows(lines,route["route_id"],node_id,jobs=jobs)
     # SD-153: `round_budget` is the one admission/closure decision every
     # surface reads. Owner-closure is admitted once a real round budget is
     # spent (`state="exhausted"`) OR two rounds in a row produced no verdict
@@ -5934,7 +5934,7 @@ def continuation_owner_closure_plan(route, node, evidence, jobs, attempt_id, *,
     route_by_id = {r["route_id"]: r for r in lineage}
     if lines is None:
         lines = jobs.read_text(encoding="utf-8").splitlines()
-    rounds = [row for r in reversed(lineage) for row in _review_round_rows(lines, r["route_id"], node["id"])]
+    rounds = [row for r in reversed(lineage) for row in _review_round_rows(lines, r["route_id"], node["id"],jobs=jobs)]
     exact = [(status, meta) for status, meta in rounds if meta.get("attempt_id") == attempt_id]
     if len(exact) != 1:
         raise ValueError("owner-closure-source-attempt-not-exact")
@@ -6146,7 +6146,7 @@ def _complete_node_locked(
             sealed_pipe=None
             if already_closed and row_note==REVIEW_BLOCKING_NOTE:
                 owner_closure=_owner_closure_eligibility(
-                    route,node,node_id,evidence,row_metadata,lines,
+                    route,node,node_id,evidence,row_metadata,lines,jobs=jobs_path,
                 )
                 # Seal the closure facts through the one sanitizing writer
                 # every other terminal value uses (keys allowlisted in
@@ -6511,8 +6511,17 @@ def complete_subsession_stage(route, node, node_id, evidence, manifest_path, job
         attempt_id=metadata.get("attempt_id")
         if attempt_id:
             rows.setdefault(attempt_id,[]).append((fields,metadata))
+    from dispatch_replacement_subsession import project
+    projected, effective_attempts = project(jobs_path, manifest, [
+        {"fields": fields, "metadata": metadata, "status": fields[1]}
+        for matches in rows.values() for fields, metadata in matches
+        if metadata.get("session_chain_id") == manifest["chain_id"]
+    ])
+    rows = {}
+    for item in projected:
+        rows.setdefault(item["metadata"]["attempt_id"], []).append((item["fields"], item["metadata"]))
     for session in manifest["sessions"]:
-        matches=rows.get(session["attempt_id"],[])
+        matches=rows.get(effective_attempts[session["attempt_id"]],[])
         if len(matches)!=1:
             raise ValueError(f"subsession attempt row count invalid:{session['attempt_id']}:{len(matches)}")
         fields,metadata=matches[0]

@@ -338,6 +338,8 @@ ATTEMPT_MUTABLE_METADATA = {
     "retry_ordinal",
     "retry_attempt_id",
     "retry_claimed_at",
+    "recovery_exhausted",
+    "recovery_exhaustion_reason",
     "start_permitted",
     "cleanup_receipt_b64",
     "cleanup_receipt_digest",
@@ -4760,6 +4762,8 @@ def spawn_claimed_attempt(
                     "parent-attempt-not-live", parent_binding.attempt_id
                 )
 
+        from dispatch_replacement import admission as replacement_admission
+        replacement_admission(jobs, lines, child_meta)
         if preclaim is not None:
             preclaim(lines)
 
@@ -7986,7 +7990,7 @@ def _existing_recovery_claim(
     recovery_identity = metadata.get("recovery_id", "")
     if metadata.get("attempt_id") != original_attempt_id:
         raise DispatchContractError("recovery-claim-original-attempt-mismatch")
-    if metadata.get("note") == "receipt-unavailable-retry-exhausted":
+    if metadata.get("recovery_exhausted") == "1" or metadata.get("note") == "receipt-unavailable-retry-exhausted":
         retry_attempt_id = metadata.get("retry_attempt_id", "")
         retry_ordinal = 1 if metadata.get("retry_ordinal") == "1" else 0
         return RecoveryRetryClaim(
@@ -8061,6 +8065,10 @@ def claim_recovery_retry(
             )
         index, fields, metadata = rows[0]
         validate_attempt_metadata(metadata)
+        from dispatch_replacement import source_reservation
+        if (source_reservation(jobs, original_attempt_id) or metadata.get("replacement_family_id")
+                or metadata.get("automatic_retry_of")):
+            raise DispatchContractError("automatic-replacement-exhausted", original_attempt_id)
         if metadata.get("recovery_id"):
             raise DispatchContractError("recovery-claim-conflict")
         if (
@@ -8107,24 +8115,13 @@ def claim_recovery_retry(
         effective_remaining = max(0, remaining_cascade - len(route_claims))
         claimed_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         if effective_remaining < 1:
-            prior = {
-                "prior_terminal_note": metadata.get("note", ""),
-                "prior_classifier_source": metadata.get("classifier_source", ""),
-                "prior_failure_class": metadata.get("failure_class", ""),
-            }
-            fields[1] = "done"
+            _write_recovery_attention(jobs, original_attempt_id, recovery_id,
+                                      "receipt-unavailable-retry-exhausted")
             fields[5] = _updated_attempt_metadata(
                 fields[5],
-                {
-                    "recovery_id": recovery_id,
-                    "retry_claimed_at": claimed_at,
-                    "note": "receipt-unavailable-retry-exhausted",
-                    "failure_class": "blocked",
-                    "classifier_source": AUTOMATIC_RECEIPTLESS_CLASSIFIER,
-                    "reconcile_reason": "receipt-unavailable-retry-exhausted",
-                    **{key: value for key, value in prior.items() if value},
-                },
-                terminal=True,
+                {"recovery_id": recovery_id, "retry_claimed_at": claimed_at,
+                 "recovery_exhausted": "1", "start_permitted": "0",
+                 "recovery_exhaustion_reason": "receipt-unavailable-retry-exhausted"},
             )
             result = RecoveryRetryClaim(
                 recovery_id,
@@ -8347,6 +8344,22 @@ def claim_subsession_advance(
     )
 
 
+def _write_recovery_attention(jobs, attempt_id, recovery_id, reason):
+    from dispatch_replacement import _once, _read
+    path = Path(jobs).parent / "recovery-attention" / (hashlib.sha256(recovery_id.encode()).hexdigest()+".json")
+    # First durable write: death after this point must not restore the budget.
+    from dispatch_replacement import _id
+    _once(Path(jobs).parent / "recovery-attention" / "by-source" / (_id(attempt_id)+".json"),
+          {"original_attempt_id": attempt_id, "recovery_id": recovery_id})
+    old = _read(path)
+    if old is not None:
+        if old.get("original_attempt_id") != attempt_id or old.get("recovery_id") != recovery_id:
+            raise DispatchContractError("recovery-attention-conflict")
+        return
+    _once(path, {"schema": "recovery-attention-v1", "original_attempt_id": attempt_id,
+                 "recovery_id": recovery_id, "state": "needs-attention", "reason": reason})
+
+
 def seal_recovery_blocked(
     jobs: Path,
     *,
@@ -8379,26 +8392,14 @@ def seal_recovery_blocked(
         validate_attempt_metadata(metadata)
         if metadata.get("recovery_id") not in {None, "", recovery_id}:
             raise DispatchContractError("recovery-block-identity-conflict")
-        if (
-            fields[1] == "done"
-            and metadata.get("recovery_id") == recovery_id
-            and metadata.get("note") == "receipt-unavailable-retry-exhausted"
-            and metadata.get("failure_class") == "blocked"
-            and metadata.get("start_permitted") == "0"
-        ):
+        if metadata.get("recovery_exhausted") == "1" and metadata.get("start_permitted") == "0":
             return False
-        fields[1] = "done"
+        _write_recovery_attention(jobs, original_attempt_id, recovery_id, reason)
         fields[5] = _updated_attempt_metadata(
             fields[5],
-            {
-                "recovery_id": recovery_id,
-                "note": "receipt-unavailable-retry-exhausted",
-                "failure_class": "blocked",
-                "classifier_source": AUTOMATIC_RECEIPTLESS_CLASSIFIER,
-                "reconcile_reason": reason or "receipt-unavailable-retry-exhausted",
-                "start_permitted": "0",
-            },
-            terminal=True,
+            {"recovery_id": recovery_id, "recovery_exhausted": "1",
+             "recovery_exhaustion_reason": reason or "receipt-unavailable-retry-exhausted",
+             "start_permitted": "0"},
         )
         lines[index] = "\t".join(fields)
         _atomic_registry_replace(jobs, lines)
@@ -8933,6 +8934,13 @@ def _automatic_retry_admission(lines: list[str], metadata: dict[str, str]) -> No
     if predecessor is None:
         raise DispatchContractError("retry-predecessor-missing", prior)
     status, source = predecessor
+    if source.get("replacement_family_id"):
+        if (source.get("replacement_attempt_id") != metadata.get("attempt_id")
+                or metadata.get("replacement_family_id") != source["replacement_family_id"]):
+            raise DispatchContractError("automatic-replacement-exhausted", prior)
+        return
+    if source.get("automatic_retry_of") or source.get("retry_ordinal") == "1":
+        raise DispatchContractError("automatic-replacement-exhausted", prior)
     if any(source.get(k) != metadata.get(k) for k in ("route_id", "route_node", "parent_attempt_id")):
         raise DispatchContractError("retry-predecessor-binding-mismatch", prior)
     proof = attempt_process_quiescence(source, terminal_receipt=status in {"done", "killed", "cancelled"})
@@ -8989,6 +8997,10 @@ def claim_attempt_row(
         for terminal_route_id in sorted(terminal_route_ids):
             ensure_terminal_claim_absent(jobs, terminal_route_id,
                 terminal_owner)
+        from dispatch_replacement import replacement_row
+        row, automatic_replacement = replacement_row(jobs, lines, row)
+        row_fields = row.split("\t")
+        row_metadata = parse_registry_metadata(row_fields[5])
         if mutation_precheck is not None:
             mutation_precheck(lines)
         # A serial successor consumes its predecessors just as a DAG edge
@@ -9059,14 +9071,15 @@ def claim_attempt_row(
                     else:
                         matching_terminal_attempts.add(metadata["attempt_id"])
             if (
-                terminal_attempt_limit is not None
+                not automatic_replacement
+                and terminal_attempt_limit is not None
                 and len(matching_terminal_attempts) >= terminal_attempt_limit
             ):
                 raise DispatchContractError(
                     "quick-registered-headless-exhausted",
                     f"terminal_attempts={len(matching_terminal_attempts)} limit={terminal_attempt_limit}",
                 )
-            if len(replacement_attempts) > replacement_attempt_limit:
+            if not automatic_replacement and len(replacement_attempts) > replacement_attempt_limit:
                 raise DispatchContractError(
                     "quick-replacement-attempts-exhausted",
                     f"replacement_attempts={len(replacement_attempts)} limit={replacement_attempt_limit}",

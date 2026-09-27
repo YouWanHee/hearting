@@ -776,6 +776,7 @@ def _validate_partial_replacement(
     if not isinstance(continuation, dict) or not isinstance(replacement_seal, dict):
         raise ValueError("partial continuation replacement evidence incomplete")
     partial = continuation.get("partial_group_continuation")
+    automatic = continuation.get("schema") == "automatic-parallel-replacement-v1"
     if (
         continuation.get("continuation_contract_version") != 1
         or not isinstance(partial, dict)
@@ -810,8 +811,8 @@ def _validate_partial_replacement(
     })
     if (
         partial.get("replacement_leg_identity") != replacement_identity
-        or partial.get("replacement_attempt_id")
-        != "att-" + replacement_identity.split(":", 1)[1][:48]
+        or (not automatic and partial.get("replacement_attempt_id")
+            != "att-" + replacement_identity.split(":", 1)[1][:48])
     ):
         raise ValueError("partial continuation replacement identity invalid")
 
@@ -881,6 +882,11 @@ def _validate_partial_replacement(
         with Path(f"{jobs}.lock").open("a", encoding="utf-8") as lock:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             lines = jobs.read_text(encoding="utf-8", errors="replace").splitlines()
+            if automatic:
+                from dispatch_replacement_batch import validate_evidence
+                record, _input = validate_evidence(jobs, lines, continuation)
+                if replacement_attempt != record["replacement_attempt_id"]:
+                    raise ValueError("automatic replacement family attempt mismatch")
     except OSError as exc:
         raise ValueError(f"partial continuation gap registry unreadable: {exc}") from exc
     rows = []
@@ -896,7 +902,7 @@ def _validate_partial_replacement(
     fields, metadata = rows[0]
     validate_attempt_metadata(metadata)
     if (
-        fields[1] != "done"
+        (fields[1] not in {"done", "cancelled", "killed"} if automatic else fields[1] != "done")
         or metadata.get("note") == "completed-marker"
         or metadata.get("route_id") != source_manifest["route_id"]
         or metadata.get("route_node") != gap
@@ -904,7 +910,10 @@ def _validate_partial_replacement(
         or metadata.get("batch_leg_sha256") != source_leg_digests[source_attempt]
     ):
         raise ValueError("partial continuation gap source row invalid")
-    if replacement_seal["retry_claim_reused"]:
+    if automatic:
+        if replacement_seal["retry_claim_reused"] or metadata.get("retry_attempt_id"):
+            raise ValueError("automatic replacement must not borrow legacy retry claim")
+    elif replacement_seal["retry_claim_reused"]:
         if (
             metadata.get("retry_ordinal") != "1"
             or not metadata.get("recovery_id")

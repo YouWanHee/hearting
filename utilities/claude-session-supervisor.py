@@ -1679,11 +1679,16 @@ def main(argv: list[str] | None = None) -> int:
                     phase="parked",
                 )
                 from dispatch_supervision import wait_for_batch
+                from dispatch_replacement import advance_batch, adopt_receipt
                 receipt = wait_for_batch(
                     join=lambda attempts: run_join(args, attempts),
                     attempts=set(park_attempts), jobs=Path(args.jobs),
                     parent_attempt_id=args.parent_attempt_id, emit=emit,
+                    replacement_checkpoint=lambda selected: advance_batch(Path(args.jobs), selected)
+                        if not control.pending() else (selected, [], []),
                 )
+                park_attempts, replaced_attempts = adopt_receipt(Path(args.jobs), set(park_attempts), receipt)
+                delivered.update(replaced_attempts)
                 joined_rows = current_children(
                     Path(args.jobs), args.parent_attempt_id, park_attempts
                 )
@@ -1702,6 +1707,9 @@ def main(argv: list[str] | None = None) -> int:
                             child_attempt_ids=sorted({attempt_id, *carried_siblings}),
                             predecessor_claim_id=handoff_claim["claim_id"],
                         )
+                if replaced_attempts:
+                    replacement_first = sorted(park_attempts)[0]
+                    _advance_claim(replacement_first, frozenset(park_attempts - {replacement_first}))
                 try:
                     drive = subsession_advance.drive_serial_chain(
                         jobs=Path(args.jobs), parent_attempt_id=args.parent_attempt_id,

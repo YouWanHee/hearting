@@ -492,12 +492,23 @@ def normalize_receipt(
         )
     except JoinContractError as exc:
         raise CompletionError("delivery-classification-failed") from exc
+    originals = set(attempts)
+    if receipt.get("replacement_lineage"):
+        from dispatch_replacement import adopt_receipt
+        for edge in receipt["replacement_lineage"]:
+            originals.discard(edge["replacement_attempt_id"])
+            originals.add(edge["original_attempt_id"])
+        adopt_receipt(jobs, originals, receipt)
+        normalized["replacement_lineage"] = receipt["replacement_lineage"]
+    if receipt.get("replacement_attention"):
+        from dispatch_replacement import validate_attention
+        normalized["replacement_attention"] = validate_attention(jobs, receipt["replacement_attention"], allowed_attempts=originals | set(attempts))
     if accept_stage_advance:
         normalized = receipt_with_stage_advance(
             normalized,
             stage_advance_record=stage_advance_record,
         )
-    if len(canonical(normalized).encode("utf-8")) > MAX_RECEIPT_BYTES:
+    if len(canonical(normalized).encode("utf-8")) > (8192 if normalized.get("replacement_lineage") or normalized.get("replacement_attention") else MAX_RECEIPT_BYTES):
         raise CompletionError("typed-receipt-oversized")
     return normalized
 
@@ -666,6 +677,23 @@ def _receiver_unavailable_reason(args: argparse.Namespace, attempts: set[str]) -
     return "receiver-unavailable"
 
 
+def replacement_authority(args: argparse.Namespace, jobs: Path, aid: str, metadata: dict) -> bool:
+    """Only the still-current managed TUI binding can replace its child."""
+    if (Path(jobs).resolve() != args.jobs.resolve()
+            or metadata.get("dispatch_depth") != "1"
+            or metadata.get("parent_sid") != args.parent_session_id
+            or metadata.get("parent_completion_delivery") != MANAGED_SESSION_PARENT_DELIVERY):
+        return False
+    try:
+        status = gateway_request(args.control_socket, {"schema_version": 1, "op": "status"})
+    except CompletionError:
+        return False
+    return bool(status.get("status") == "ready" and status.get("tui_connected") is True
+        and status.get("thread_id") == args.parent_session_id
+        and type(args.gateway_epoch) is int and status.get("epoch") == args.gateway_epoch
+        and type(args.binding_generation) is int and status.get("binding_generation") == args.binding_generation)
+
+
 def _await_notice_ack(
     root: Path, recipient_key: str, delivery_records: list[dict[str, Any]], *, timeout: float
 ) -> None:
@@ -734,11 +762,25 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         # gives up sooner, without waiting out the full deadline, once the
         # delivery gateway is provably gone and nothing is left to deliver
         # for anyway.
+        monitored = set(attempts)
+        def replacement_checkpoint(selected):
+            from dispatch_replacement import advance_batch
+            nonlocal monitored
+            result = advance_batch(args.jobs, selected,
+                authority_check=(lambda jobs, aid, metadata: replacement_authority(args, jobs, aid, metadata))
+                    if args.parent_session_id else None)
+            monitored = set(result[0])
+            if watcher is not None:
+                watcher.attempts = set(monitored)
+            return result
         receipt = wait_for_batch(join=lambda selected: run_join(args, selected),
                                  attempts=attempts, jobs=args.jobs,
                                  parent_attempt_id=delivery_parent_id(args),
                                  deadline=time.monotonic() + max(0.0, args.timeout),
-                                 stop_check=lambda: _receiver_unavailable_reason(args, attempts))
+                                 stop_check=lambda: _receiver_unavailable_reason(args, monitored),
+                                 replacement_checkpoint=replacement_checkpoint)
+        from dispatch_replacement import adopt_receipt
+        attempts, replaced_attempts = adopt_receipt(args.jobs, attempts, receipt)
         if receipt.get("state") == "watch-expired":
             reason = receipt.get("reason") or "watch-deadline"
             if reason == "watch-deadline" and args.parent_session_id:

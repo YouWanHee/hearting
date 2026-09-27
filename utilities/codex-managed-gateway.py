@@ -1856,12 +1856,52 @@ class ManagedGateway:
             "delivery_classification": aggregate,
             "delivery_timing": delivery_timing,
         }
+        lineage = receipt.get("replacement_lineage")
+        attention = receipt.get("replacement_attention")
+        if lineage or attention:
+            try:
+                from dispatch_replacement import adopt_receipt, validate_attention, _rows
+                originals = set(observed)
+                if lineage:
+                    if not isinstance(lineage, list) or not 1 <= len(lineage) <= 4:
+                        raise ValueError("replacement-lineage-invalid")
+                    originals = set(observed)
+                    for edge in lineage:
+                        if not isinstance(edge, dict) or edge.get("replacement_attempt_id") not in observed:
+                            raise ValueError("replacement-lineage-invalid")
+                        originals.discard(edge["replacement_attempt_id"])
+                        originals.add(edge["original_attempt_id"])
+                    effective, consumed = adopt_receipt(jobs, originals, receipt)
+                    if effective != observed:
+                        raise ValueError("replacement-scope-invalid")
+                    rows = _rows(jobs.read_text().splitlines())
+                    for aid in originals | observed:
+                        metadata = rows[aid][1]
+                        if metadata.get("dispatch_depth") == "1":
+                            if metadata.get("parent_sid") != thread_id:
+                                raise ValueError("replacement-parent-invalid")
+                        elif metadata.get("parent_attempt_id") != parent_attempt_id:
+                            raise ValueError("replacement-parent-invalid")
+                    normalized["replacement_lineage"] = lineage
+                if attention:
+                    checked_attention = validate_attention(jobs, attention, allowed_attempts=originals | observed)
+                    rows = _rows(jobs.read_text().splitlines())
+                    for item in checked_attention:
+                        metadata = rows[item["source_attempt_id"]][1]
+                        if metadata.get("dispatch_depth") == "1":
+                            if metadata.get("parent_sid") != thread_id:
+                                raise ValueError("replacement-parent-invalid")
+                        elif metadata.get("parent_attempt_id") != parent_attempt_id:
+                            raise ValueError("replacement-parent-invalid")
+                    normalized["replacement_attention"] = checked_attention
+            except (ValueError, OSError, KeyError, RuntimeError) as exc:
+                raise GatewayError("receipt-replacement-invalid") from exc
         if stage_advance is not None:
             normalized = receipt_with_stage_advance(
                 normalized, stage_advance_record=stage_advance,
             )
         receipt_bytes = canonical(normalized).encode("utf-8")
-        if len(receipt_bytes) > MAX_RECEIPT_BYTES:
+        if len(receipt_bytes) > (8192 if normalized.get("replacement_lineage") or normalized.get("replacement_attention") else MAX_RECEIPT_BYTES):
             raise GatewayError("receipt-oversized")
         receipt_digest = (
             "sha256:" + hashlib.sha256(receipt_bytes).hexdigest()
@@ -2215,6 +2255,13 @@ class ManagedGateway:
                         "delivery_id": delivery_id, "reason": "transition-unproved"}
             existing = self.ledger.get(delivery_id)
             if existing and existing.get("state") == "accepted":
+                if receipt.get("replacement_lineage"):
+                    try:
+                        from dispatch_pending_delivery import record_replacement_consumption
+                        record_replacement_consumption(Path(receipt["job_registry"]).resolve().parent,
+                            thread_id, receipt, ledger_path=self.ledger.path, delivery_id=delivery_id)
+                    except (OSError, ValueError, KeyError):
+                        pass
                 return {
                     "schema_version": 1,
                     "status": "accepted",
@@ -2404,6 +2451,15 @@ class ManagedGateway:
             if previous is not None:
                 self.ledger.value["deliveries"][pending.delivery_id] = {
                     **previous, "storage_failure": dict(outcome)}
+        if outcome.get("status") == "accepted" and pending.receipt.get("replacement_lineage"):
+            try:
+                from dispatch_pending_delivery import record_replacement_consumption
+                record_replacement_consumption(Path(pending.receipt["job_registry"]).resolve().parent,
+                    pending.thread_id, pending.receipt, ledger_path=self.ledger.path, delivery_id=pending.delivery_id)
+            except (OSError, ValueError, KeyError):
+                # The accepted ledger remains authoritative; replay repairs
+                # a lost proof write without resending the completion.
+                pass
         self._delivery_pending.pop(pending.delivery_id, None)
         pending.outcome = outcome
         pending.event.set()
