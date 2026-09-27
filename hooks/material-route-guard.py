@@ -793,11 +793,10 @@ def _route_reuse_proven(route: dict[str, Any], marker: dict[str, Any], target: P
             return True
     result = intent.get("merge_result") if isinstance(intent, dict) else None
     if (intent and isinstance(result, dict) and result.get("exit_code") == 0
-            and result.get("target_new_head") == base and head == base
+            and result.get("target_new_head") == base and base in commits
             and target_branch == intent.get("target_branch") and target_branch != branch):
         old = intent.get("target_old_head")
-        if (old and subprocess.run(["git", "-C", str(target), "merge-base", "--is-ancestor", old, base]).returncode == 0
-                and base in commits):
+        if old and subprocess.run(["git", "-C", str(target), "merge-base", "--is-ancestor", old, base]).returncode == 0:
             return True
     return False
 
