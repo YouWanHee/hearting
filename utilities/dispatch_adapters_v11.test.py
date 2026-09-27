@@ -14,6 +14,12 @@ ADAPTERS={
  "opencode":([sys.executable,str(ROOT/"adapters/opencode/bin/dispatch-headless.py")],["--model","provider/test","--variant","low"]),
 }
 
+# The fake workers exit at once; this only bounds a hung one. Two seconds was
+# shorter than a process start on a loaded shared host, so a healthy launch was
+# killed (worker_exit=-15, worker_failure=timeout) and the test failed at random.
+FAKE_WORKER_TIMEOUT="30"
+
+
 class AdapterV11Test(unittest.TestCase):
  def test_owner_binding_tuple_refusal_details_reach_all_wrappers(self):
   for harness in ADAPTERS:
@@ -475,7 +481,7 @@ class AdapterV11Test(unittest.TestCase):
      root=Path(td); repo,art=self.fixture(root); jobs=root/"jobs.log"; logs=root/"logs"; fakebin=root/"bin"; fakebin.mkdir()
      fake=fakebin/harness; fake.write_text("#!/bin/sh\nexit 0\n",encoding="utf-8"); fake.chmod(0o755)
      self.seed_parent(jobs,repo,harness=harness)
-     command=self.command(harness,"start",repo,jobs,logs)+["--foreground-timeout","2"]
+     command=self.command(harness,"start",repo,jobs,logs)+["--foreground-timeout",FAKE_WORKER_TIMEOUT]
      wrapper=self.load_wrapper(harness); argv=["dispatch-headless.py",*command[2:]]
      resolution=wrapper.reconcile_launch_lifecycle(
       wrapper.DETACHED,{},evidence={
@@ -530,7 +536,7 @@ class AdapterV11Test(unittest.TestCase):
           "--assigned-contract","autopilot-code","--owner-harness","opencode",
           "--model","provider/test","--variant","low","--jobs",str(jobs),
           "--log-dir",str(logs),"--attempt-id",f"att-opencode-owner-{repetition}",
-          "--foreground-timeout","2","--prompt-text","ok"]
+          "--foreground-timeout",FAKE_WORKER_TIMEOUT,"--prompt-text","ok"]
     resolution=wrapper.reconcile_launch_lifecycle(
      wrapper.DETACHED,{},evidence={
       "lifecycle_selector_source":"pid1-class",
@@ -730,7 +736,7 @@ class AdapterV11Test(unittest.TestCase):
     root=Path(td); repo,art=self.fixture(root); jobs=root/"jobs.log"; logs=root/"logs"; fakebin=root/"bin"; fakebin.mkdir()
     fake=fakebin/harness; fake.write_text("#!/bin/sh\nexit 0\n",encoding="utf-8"); fake.chmod(0o755)
     self.seed_parent(jobs,repo,harness=harness)
-    command=self.command(harness,"start",repo,jobs,logs)+["--foreground-timeout","2"]
+    command=self.command(harness,"start",repo,jobs,logs)+["--foreground-timeout",FAKE_WORKER_TIMEOUT]
     wrapper=self.load_wrapper(harness); argv=["dispatch-headless.py",*command[2:]]
     resolution=wrapper.reconcile_launch_lifecycle(
      wrapper.DETACHED,{"AGENT_DISPATCH_ALLOW_NAMESPACED_SPAWN":"1"},
@@ -766,7 +772,7 @@ class AdapterV11Test(unittest.TestCase):
     root=Path(td); repo,art=self.fixture(root); jobs=root/"jobs.log"; logs=root/"logs"; fakebin=root/"bin"; fakebin.mkdir()
     fake=fakebin/harness; fake.write_text("#!/bin/sh\nexit 0\n",encoding="utf-8"); fake.chmod(0o755)
     self.seed_parent(jobs,repo,harness=harness)
-    command=self.command(harness,"start",repo,jobs,logs)+["--foreground-timeout","2"]
+    command=self.command(harness,"start",repo,jobs,logs)+["--foreground-timeout",FAKE_WORKER_TIMEOUT]
     wrapper=self.load_wrapper(harness); argv=["dispatch-headless.py",*command[2:]]
     resolution=wrapper.reconcile_launch_lifecycle(
      wrapper.DETACHED,{},evidence={
