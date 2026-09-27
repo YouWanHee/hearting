@@ -7,6 +7,10 @@ hearting_test_isolate
 set -u
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+# The no-mutation snapshots also read this checkout. Exclude projection and
+# guard suites while they temporarily rewrite its files.
+. "$ROOT/tools/worktree-lock.sh"
+worktree_lock_acquire "$ROOT" 900 || exit 70
 MEM="$ROOT/tools/memory/mem.py"
 [ -f "$MEM" ] || { echo "FAIL: mem.py not found at $MEM"; exit 1; }
 
