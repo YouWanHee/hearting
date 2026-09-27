@@ -128,7 +128,7 @@ PY
 import json, sys
 settings = json.load(open(sys.argv[1]))
 assert settings["statusLine"]["command"] == "bash $HOME/.claude/statusline.sh", settings
-assert settings["env"]["MEM_DISTILL_ENABLE"] == "1", settings
+assert settings["autoMemoryEnabled"] is False, settings
 PY
 
   harness runtime status --runtime all --json > "$TMP/$mode-status.json"

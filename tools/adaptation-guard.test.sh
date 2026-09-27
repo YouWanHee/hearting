@@ -77,22 +77,35 @@ backup() {  # $1 = repo-relative path
 
 run_guard() { sh "$GUARD" 2>&1; }
 
+# D-78 retired the repo's one real 'delta' exemption (mem-distill-dispatch.sh),
+# so Cases 1/2 exercise the delta contract through a throwaway synthetic
+# canonical/adapter pair instead of a real classified file.
+NEG_DELTA_CANON="hooks/_zz-negtest-delta-canonical.sh"
+NEG_DELTA_ADAPTER="adapters/claude/hooks/_zz-negtest-delta-canonical.sh"
+CREATED="$CREATED $NEG_DELTA_CANON $NEG_DELTA_ADAPTER"
+printf '#!/usr/bin/env sh\necho canonical\n' > "$NEG_DELTA_CANON"; chmod +x "$NEG_DELTA_CANON"
+printf '#!/usr/bin/env sh\necho canonical\necho claude-delta-patch\n' > "$NEG_DELTA_ADAPTER"; chmod +x "$NEG_DELTA_ADAPTER"
+neg_delta_hash=$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$NEG_DELTA_CANON")
+backup tools/adaptation-exemptions.tsv
+printf '%s\tdelta\tnegative-test fixture (adaptation-guard.test.sh)\t%s\n' \
+  "$NEG_DELTA_ADAPTER" "$neg_delta_hash" >> tools/adaptation-exemptions.tsv
+
 # --- Case 1: delta baseline drift → red ---
-backup hooks/mem-distill-dispatch.sh
-printf '\n# negative-test canonical drift marker\n' >> hooks/mem-distill-dispatch.sh
+printf '\n# negative-test canonical drift marker\n' >> "$NEG_DELTA_CANON"
 out=$(run_guard); rc=$?
 if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'delta baseline DRIFT'; then
   ok "delta baseline drift → guard red"
 else
   bad "expected delta-baseline-DRIFT red; rc=$rc"
 fi
-cp -p "$TMP/hooks-mem-distill-dispatch-sh.bak" hooks/mem-distill-dispatch.sh
+printf '#!/usr/bin/env sh\necho canonical\n' > "$NEG_DELTA_CANON"
 
 # --- Case 2: delta baseline unset/invalid → red ---
-backup tools/adaptation-exemptions.tsv
-# 4번째 필드를 '-' 로 되돌려 미설정 상태 재현
 awk -F'\t' 'BEGIN{OFS="\t"} $0!~/^#/ && $2=="delta"{$4="-"} {print}' \
-  "$TMP/tools-adaptation-exemptions-tsv.bak" > tools/adaptation-exemptions.tsv
+  "$TMP/tools-adaptation-exemptions-tsv.bak" > "$TMP/exemptions-with-unset-negtest.tsv"
+printf '%s\tdelta\tnegative-test fixture (adaptation-guard.test.sh)\t-\n' "$NEG_DELTA_ADAPTER" \
+  >> "$TMP/exemptions-with-unset-negtest.tsv"
+cp "$TMP/exemptions-with-unset-negtest.tsv" tools/adaptation-exemptions.tsv
 out=$(run_guard); rc=$?
 if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'no valid canonical baseline hash'; then
   ok "delta baseline unset → guard red"
@@ -100,6 +113,8 @@ else
   bad "expected unset-baseline red; rc=$rc"
 fi
 cp -p "$TMP/tools-adaptation-exemptions-tsv.bak" tools/adaptation-exemptions.tsv
+rm -f "$NEG_DELTA_CANON" "$NEG_DELTA_ADAPTER"
+CREATED=$(printf '%s' "$CREATED" | sed "s#$NEG_DELTA_CANON##; s#$NEG_DELTA_ADAPTER##")
 
 # --- Case 3: bootstrap byte-budget over ceiling → red ---
 backup adapters/claude/CLAUDE.md

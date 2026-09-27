@@ -52,7 +52,7 @@ if ROOT=$(resolve_source_root 2>/dev/null); then :; else typed_root_refusal; fi
 checked_guard_target() {
   relative_guard=$1
   case "$relative_guard" in
-    hooks/git-state-guard.sh|hooks/core-first-guard.sh|hooks/artifact-guard.sh|hooks/builtin-memory-guard.sh|hooks/material-route-guard.py|hooks/worktree-path-guard.sh) :;;
+    hooks/git-state-guard.sh|hooks/core-first-guard.sh|hooks/artifact-guard.sh|hooks/material-route-guard.py|hooks/worktree-path-guard.sh) :;;
     *) printf 'check=failed\nreason=guard-target-unresolved\n' >&2; exit 69;;
   esac
   expected=$ROOT/$relative_guard
@@ -165,8 +165,6 @@ usage: preflight.sh write <file> [session-id] [turn-id]
        preflight.sh verification-runner [--check] [--timeout seconds] -- <command> [args...]
        preflight.sh design <file>
        preflight.sh visual-harness [file.html]
-       preflight.sh distill-delta <session-id>
-       preflight.sh distill-propose <session-id> [cwd]
        preflight.sh role <portable-role>
        preflight.sh capability-info <capability>
        preflight.sh mode-info <family/mode>
@@ -311,7 +309,6 @@ case "$cmd" in
     run_guard hooks/git-state-guard.sh --file "$file"
     run_guard hooks/core-first-guard.sh --file "$file" --session "$sid"
     run_guard hooks/artifact-guard.sh --file "$file" --session "$sid"
-    run_guard hooks/builtin-memory-guard.sh --file "$file"
     material_tool=Write
     [ -n "${AGENT_REVIEW_OUTPUT:-}" ] && material_tool=ArtifactWrite
     if [ -n "$turn" ]; then
@@ -361,7 +358,7 @@ case "$cmd" in
     printf 'routing_contract=core/WORKFLOW.md\n'
     printf 'routing_action=read-workflow-and-select-opencode-skill-or-command\n'
     printf 'capability_entrypoints=opencode-native-skills-commands\n'
-    printf 'enforced_hooks=plugin-write-guards,core-first-guard,plugin-command-spec-gate,plugin-read-markers,plugin-design-check,session-memory,prompt-recall,session-idle-distill\n'
+    printf 'enforced_hooks=plugin-write-guards,core-first-guard,plugin-command-spec-gate,plugin-read-markers,plugin-design-check,session-memory,prompt-recall,session-idle-sync\n'
     printf 'hook_boundary=plugin-tool-command-event-bridges\n'
     ;;
   ui-info)
@@ -834,68 +831,12 @@ portable_source=capabilities/autopilot-design.md
 note=OpenCode design capabilities have native Skill/Command guidance and an adapter-owned render/screenshot/console harness. Run it for every design HTML output, then inspect the screenshot before claiming visual completion.
 EOF
     ;;
-  distill-delta)
-    [ "$#" -ge 2 ] || { echo "opencode preflight: distill-delta requires a session id" >&2; exit 64; }
-    sid=$2
-    AGENT_HOME="$AGENT_ROOT" python3 "$ROOT/tools/memory/mem.py" distill "$sid" --source opencode
-    ;;
-  distill-propose)
-    [ "$#" -ge 2 ] || { echo "opencode preflight: distill-propose requires a session id" >&2; exit 64; }
-    sid=$2
-    cwd=${3:-$PWD}
-    # The explicit, user-facing proposal stays an opt-in preview (mirrors codex):
-    # the no-tools worker is verified, but you enable the explicit run with
-    # OPENCODE_DISTILL_ENABLE=1. The automatic session-end path defaults it on.
-    if [ "${OPENCODE_DISTILL_ENABLE:-0}" != "1" ]; then
-      cat <<EOF
-adapter=opencode
-status=tool-contract
-tool_contract=no-tools-distill-worker
-runtime_surface=opencode-run-pure-notools-agent
-reason=distill-proposal-disabled
-delta_surface=adapters/opencode/bin/preflight.sh distill-delta <session-id>
-enable=OPENCODE_DISTILL_ENABLE=1
-apply_gate=OPENCODE_DISTILL_APPLY=1
-auto=plugin-session-idle-to-session-end-default-on
-fallback=inspect-distill-delta-or-enable-explicit-proposal
-cwd=$cwd
-session_id=$sid
-EOF
-      exit 69
-    fi
-    AGENT_HOME="$AGENT_ROOT" "$ROOT/adapters/opencode/bin/distill-worker.sh" "$sid" "$cwd"
-    ;;
   session-end)
     cwd=${2:-$PWD}
     sid=${3:-opencode}
-    # D-42 defense in depth: workers never create a debounce stamp, sync, or
-    # start another distiller from session.idle/session-end.
+    # D-42 defense in depth: workers never sync from session.idle/session-end.
     is_worker_session && exit 0
-    # Debounce: the OpenCode plugin fires this on session.idle, which occurs after
-    # every turn. Rate-limit per session so a long TUI session triggers at most
-    # one worker per OPENCODE_DISTILL_MIN_INTERVAL seconds (default 600).
-    default_store="$AGENT_ROOT/memory"
-    [ -e "$default_store" ] || [ -L "$default_store" ] \
-      || default_store="${XDG_DATA_HOME:-$HOME/.local/share}/hearting/memory"
-    store=${MEM_STORE:-$default_store}
-    mkdir -p "$store" 2>/dev/null || true
-    stamp="$store/.opencode-distill-stamp-$sid"
-    interval=${OPENCODE_DISTILL_MIN_INTERVAL:-600}
-    now=$(date +%s 2>/dev/null || echo 0)
-    if [ -f "$stamp" ] && [ "$now" -gt 0 ]; then
-      last=$(cat "$stamp" 2>/dev/null || echo 0)
-      [ "$last" -gt 0 ] && [ "$((now - last))" -lt "$interval" ] && exit 0
-    fi
-    printf '%s\n' "$now" > "$stamp" 2>/dev/null || true
-    # Absorb any stray native writes, then run the auto-distiller. Enabled by
-    # default (parity with the codex/claude session-end distillers); opt out with
-    # OPENCODE_DISTILL_ENABLE=0. The worker is no-tools verified and timeout-
-    # guarded, so a slow/unreachable model can never stall this path.
     (cd "$cwd" && AGENT_HOME="$AGENT_ROOT" python3 "$ROOT/tools/memory/mem.py" sync --json >/dev/null) || true
-    AGENT_HOME="$AGENT_ROOT" \
-      OPENCODE_DISTILL_ENABLE="${OPENCODE_DISTILL_ENABLE:-1}" \
-      OPENCODE_DISTILL_APPLY="${OPENCODE_DISTILL_APPLY:-1}" \
-      "$ROOT/adapters/opencode/bin/distill-worker.sh" "$sid" "$cwd" curate
     ;;
   role)
     [ "$#" -ge 2 ] || { echo "opencode preflight: role requires a portable role" >&2; exit 64; }

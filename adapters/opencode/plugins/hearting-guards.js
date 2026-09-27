@@ -329,9 +329,8 @@ export const AgentHarnessGuards = async (ctx) => {
       runWorkerState("compact-after", event)
     }
     // session.idle fires after each turn (the session is waiting for the user).
-    // Use it as the auto-distillation trigger; preflight session-end debounces
-    // per session and the --pure worker never re-enters this plugin. Mirrors the
-    // Claude SessionEnd + codex session-end detached distiller.
+    // Use it as the memory-sync trigger; preflight session-end debounces per
+    // session. Mirrors the Claude SessionEnd and Codex session-end detached sync.
     if (event && event.type === "session.idle") {
       const eventSid = (event.properties && event.properties.sessionID) || ""
       const sid = eventSid || "opencode-plugin"

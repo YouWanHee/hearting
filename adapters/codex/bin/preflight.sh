@@ -74,7 +74,7 @@ if ROOT=$(resolve_source_root 2>/dev/null); then :; else typed_root_refusal; fi
 checked_guard_target() {
   relative_guard=$1
   case "$relative_guard" in
-    hooks/git-state-guard.sh|hooks/core-first-guard.sh|hooks/artifact-guard.sh|hooks/builtin-memory-guard.sh|hooks/material-route-guard.py|hooks/worktree-path-guard.sh) :;;
+    hooks/git-state-guard.sh|hooks/core-first-guard.sh|hooks/artifact-guard.sh|hooks/material-route-guard.py|hooks/worktree-path-guard.sh) :;;
     *) printf 'check=failed\nreason=guard-target-unresolved\n' >&2; exit 69;;
   esac
   expected=$ROOT/$relative_guard
@@ -133,24 +133,15 @@ is_worker_session() {
 # Memory lifecycle inside a hook, and a hook has a wall clock. Codex clamps the
 # SessionEnd hook to 3 seconds whatever hooks.json asks for, and it says so on
 # every session ("clamping SessionEnd hook timeout to 3s", measured 2026-09-09).
-# Nothing on this path fits that: a live curate measured 21.9s, and the `mem sync`
-# that runs BEFORE it measured 54.8s on the real store — so the sync was killed
-# every time and the curate behind it was never reached at all.
+# `mem sync` alone measured 54.8s on the real store, so the hook was killed
+# every time it ran synchronously.
 #
 # So the CALLER detaches, and it detaches the whole branch rather than its last
 # step: the hook returns in milliseconds and the work finishes outside the budget,
-# the same shape Claude (`mem-distill-dispatch.sh`) and OpenCode (plugin
-# `session.idle` → detached `preflight session-end`) already use. `detach_self`
-# re-enters this script with the marker set; setsid + nohup so the child outlives
-# the reaped hook.
+# the same shape OpenCode (plugin `session.idle` → detached `preflight session-end`)
+# already uses. `detach_self` re-enters this script with the marker set; setsid +
+# nohup so the child outlives the reaped hook.
 #
-# `run_distill` is therefore a plain synchronous runner. It used to branch on
-# `is_worker_session` and run synchronously for a worker — dead code from the
-# start, because BOTH call sites `exit 0` on a worker session several lines before
-# reaching it (D-42).
-#
-# The 2-tier contract, the shared curate-snapshot, and the whitelist applier are
-# untouched; only who waits changes.
 detach_self() {
   # Re-run this same subcommand outside the hook's wall clock. `$CODEX_PREFLIGHT_DETACHED`
   # is the recursion guard AND what the re-entered branch tests to know it may
@@ -158,18 +149,6 @@ detach_self() {
   CODEX_PREFLIGHT_DETACHED=1 setsid nohup "$ROOT/adapters/codex/bin/preflight.sh" "$@" \
     >/dev/null 2>&1 &
   return 0
-}
-
-run_distill() {
-  distill_mode=$1
-  distill_sid=$2
-  distill_cwd=$3
-  AGENT_HOME="$AGENT_ROOT" \
-    CODEX_DISTILL_ENABLE="${CODEX_DISTILL_ENABLE:-1}" \
-    CODEX_DISTILL_APPLY="${CODEX_DISTILL_APPLY:-1}" \
-    CODEX_DISTILL_CONTRACT_ACCEPTED="${CODEX_DISTILL_CONTRACT_ACCEPTED:-1}" \
-    "$ROOT/adapters/codex/bin/distill-worker.sh" \
-      "$distill_sid" "$distill_cwd" "$distill_mode"
 }
 
 guard_identity_hard_fail_if_worker() {
@@ -189,8 +168,6 @@ usage: preflight.sh write <file> [session-id] [turn-id]
        preflight.sh skill <name> [cwd] [session-id]
        preflight.sh session-end [cwd] [session-id]
        preflight.sh prompt-signal [cwd] [session-id]
-       preflight.sh turn-nudge [cwd] [session-id]
-       preflight.sh turn-nudge-distill [cwd] [session-id]   (internal: detached half)
        preflight.sh token-budget [cwd] [session-id] [kv|json|hook]
        preflight.sh memory [cwd]
        preflight.sh candidates <prompt> <cwd> <session-id> [turn-id]
@@ -239,8 +216,6 @@ usage: preflight.sh write <file> [session-id] [turn-id]
        preflight.sh design <file>
        preflight.sh visual-harness [file.html]
        preflight.sh convert [pdf|bundle|pptx] <file.html> [out]
-       preflight.sh distill-delta <session-id>
-       preflight.sh distill-propose <session-id> [cwd]
        preflight.sh role <portable-role|role-profile|pipeline-stage>
        preflight.sh capability-info <capability>
        preflight.sh mode-info <family/mode>
@@ -412,7 +387,6 @@ case "$cmd" in
     run_guard hooks/git-state-guard.sh --file "$file"
     run_guard hooks/core-first-guard.sh --file "$file" --session "$sid"
     run_guard hooks/artifact-guard.sh --file "$file" --session "$sid"
-    run_guard hooks/builtin-memory-guard.sh --file "$file"
     # Spec read gate, fitted to Codex's interception point. Claude hard-denies the
     # ungrounded autopilot-code/spec *Skill* (PreToolUse[Skill]); Codex has no
     # skill-invocation event (skills are implicitly selected), so the equivalent
@@ -542,24 +516,13 @@ case "$cmd" in
     # SessionEnd sync contract (core/MEMORY.md §7): local sync is the default.
     # Pass the user's MEM_SYNC_REMOTE / deprecated MEM_DUMP_PUSH environment
     # unchanged; the adapter never opts the session into remote exchange and
-    # the compatibility flag never means dump push. Preserve the typed sync
-    # exit after the bounded curator fallback has had its chance to run.
+    # the compatibility flag never means dump push.
     sync_status=0
     (cd "$cwd" && AGENT_HOME="$AGENT_ROOT" python3 "$ROOT/tools/memory/mem.py" sync --json >/dev/null) || sync_status=$?
     if [ "$sync_status" -ne 0 ]; then
-      printf 'codex preflight: session-end memory sync status=%s; continuing bounded curator fallback\n' "$sync_status" >&2
+      printf 'codex preflight: session-end memory sync status=%s\n' "$sync_status" >&2
     fi
-    # Automatic session-end distillation is enabled: the codex exec read-only
-    # sandbox was verified tool-free (adapters/codex/ADAPTATION.md Distillation
-    # Boundary), so default the worker to apply mode. Opt out with
-    # CODEX_DISTILL_ENABLE=0. session-end runs the *curate* (deep) tier —
-    # snapshot-grounded prune/merge/graduate via the shared curate-snapshot +
-    # whitelist applier (D-30/D-32); turn-nudge runs increment. Synchronous here on
-    # purpose: this process is already detached, so it is the one that must wait.
-    curator_status=0
-    run_distill curate "$sid" "$cwd" || curator_status=$?
-    [ "$sync_status" -eq 0 ] || exit "$sync_status"
-    exit "$curator_status"
+    exit "$sync_status"
     ;;
   prompt-signal)
     cwd=${2:-$PWD}
@@ -587,53 +550,9 @@ case "$cmd" in
     printf 'routing_contract=core/WORKFLOW.md\n'
     printf 'routing_action=read-workflow-and-select-codex-skill\n'
     printf 'capability_entrypoints=codex-native-skills\n'
-    printf 'enforced_hooks=structured-write-guards,core-first-guard,posttool-read-markers,posttool-design-check,session-memory,turn-nudge\n'
+    printf 'enforced_hooks=structured-write-guards,core-first-guard,posttool-read-markers,posttool-design-check,session-memory\n'
     printf 'hook_boundary=shell-read-write-targeted-detection-explicit-preflight-fallback\n'
     printf 'shell_fallback=run-preflight-for-ambiguous-shell-io\n'
-    ;;
-  turn-nudge)
-    cwd=${2:-$PWD}
-    sid=${3:-${CODEX_THREAD_ID:-codex}}
-    # Return before creating or advancing any worker turn state (D-42).
-    is_worker_session && exit 0
-    [ -n "$sid" ] && [ "$sid" != "default" ] || exit 0
-    interval=${MEM_NUDGE_INTERVAL:-10}
-    case "$interval" in (*[!0-9]*|"") interval=10 ;; esac
-    [ "$interval" -gt 0 ] || interval=10
-    default_store="$AGENT_ROOT/memory"
-    [ -e "$default_store" ] || [ -L "$default_store" ] \
-      || default_store="${XDG_DATA_HOME:-$HOME/.local/share}/hearting/memory"
-    store=${MEM_STORE:-$default_store}
-    mkdir -p "$store" 2>/dev/null || true
-    state="$store/.codex-turn-state-$sid"
-    counter=0
-    if [ -f "$state" ]; then
-      counter=$(sed -n '1p' "$state" 2>/dev/null || echo 0)
-    fi
-    case "$counter" in (*[!0-9]*|"") counter=0 ;; esac
-    counter=$((counter + 1))
-    if [ "$counter" -ge "$interval" ]; then
-      counter=0
-      # Detached for the same reason session-end is, and one more: this fires while
-      # the user is waiting for their own prompt to be accepted. Nobody waits 20s
-      # for a memory increment.
-      if [ "${CODEX_PREFLIGHT_DETACHED:-0}" = "1" ]; then
-        run_distill increment "$sid" "$cwd" >/dev/null 2>/dev/null || true
-      else
-        detach_self turn-nudge-distill "$cwd" "$sid"
-      fi
-    fi
-    printf '%s\n' "$counter" > "$state" 2>/dev/null || true
-    find "$store" -maxdepth 1 -name '.codex-turn-state-*' -mmin +4320 -delete 2>/dev/null || true
-    ;;
-  turn-nudge-distill)
-    # Internal: the detached half of `turn-nudge`. Never a hook entry point — it does
-    # not touch the turn counter, only the distillation the counter asked for.
-    cwd=${2:-$PWD}
-    sid=${3:-codex}
-    is_worker_session && exit 0
-    run_distill increment "$sid" "$cwd" >/dev/null 2>/dev/null || true
-    exit 0
     ;;
   token-budget)
     cwd=${2:-$PWD}
@@ -1280,33 +1199,6 @@ fallback=preflight.sh convert <pdf|bundle|pptx> <file.html>
 portable_source=capabilities/autopilot-design.md
 note=Codex-owned wrapper around the shared design converter (PDF/PPTX/bundle export). bundle is pure-Node; pdf/pptx report a tool-contract when Playwright/pptxgenjs are unavailable. Use it for design-handoff export where the visual harness only renders.
 EOF
-    ;;
-  distill-delta)
-    [ "$#" -ge 2 ] || { echo "codex preflight: distill-delta requires a session id" >&2; exit 64; }
-    sid=$2
-    AGENT_HOME="$AGENT_ROOT" python3 "$ROOT/tools/memory/mem.py" distill "$sid" --source codex
-    ;;
-  distill-propose)
-    [ "$#" -ge 2 ] || { echo "codex preflight: distill-propose requires a session id" >&2; exit 64; }
-    sid=$2
-    cwd=${3:-$PWD}
-    if [ "${CODEX_DISTILL_ENABLE:-0}" != "1" ]; then
-      cat <<EOF
-adapter=codex
-status=tool-contract
-tool_contract=no-tools-distill-worker
-runtime_surface=codex-exec-constrained-proposal
-reason=distill-proposal-disabled
-delta_surface=adapters/codex/bin/preflight.sh distill-delta <session-id>
-enable=CODEX_DISTILL_ENABLE=1
-apply_gate=CODEX_DISTILL_APPLY=1+CODEX_DISTILL_CONTRACT_ACCEPTED=1
-fallback=inspect-distill-delta-or-enable-after-contract-review
-cwd=$cwd
-session_id=$sid
-EOF
-      exit 69
-    fi
-    AGENT_HOME="$AGENT_ROOT" "$ROOT/adapters/codex/bin/distill-worker.sh" "$sid" "$cwd"
     ;;
   role)
     [ "$#" -ge 2 ] || { echo "codex preflight: role requires a portable role" >&2; exit 64; }

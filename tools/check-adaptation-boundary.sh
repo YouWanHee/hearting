@@ -346,7 +346,6 @@ check_non_claude_adapter_symlink_boundaries() {
       target=$(readlink "$link")
       case "$link:$target" in
         adapters/codex/plugin-marketplace/plugins/hearting-codex:../../plugins/hearting-codex|\
-        adapters/codex/tools/memory/apply-distill-actions.py:../../../../tools/memory/apply-distill-actions.py|\
         adapters/codex/utilities/agent-worklog-state.sh:../../../utilities/agent-worklog-state.sh|\
         adapters/codex/utilities/artifact-root.sh:../../../utilities/artifact-root.sh|\
         adapters/codex/utilities/harness-status.sh:../../../utilities/harness-status.sh|\
@@ -356,7 +355,6 @@ check_non_claude_adapter_symlink_boundaries() {
         adapters/codex/utilities/token-budget.py:../../../utilities/token-budget.py|\
         adapters/codex/utilities/token-budget-experiment.py:../../../utilities/token-budget-experiment.py|\
         adapters/codex/utilities/worker_bootstrap.py:../../../utilities/worker_bootstrap.py|\
-        adapters/opencode/tools/memory/apply-distill-actions.py:../../../../tools/memory/apply-distill-actions.py|\
         adapters/opencode/utilities/agent-worklog-state.sh:../../../utilities/agent-worklog-state.sh|\
         adapters/opencode/utilities/artifact-root.sh:../../../utilities/artifact-root.sh|\
         adapters/opencode/utilities/harness-status.sh:../../../utilities/harness-status.sh|\
@@ -596,12 +594,6 @@ check_install_layout_codex_projection() {
     || ! grep -Fq "rg '^fallback=worklog-board-or-manual-post-it-flow$' /tmp/codex-loop-note.txt" INSTALL_LAYOUT.md; then
     fail_msg "INSTALL_LAYOUT.md must validate Codex loop-info manual/unsupported contracts"
   fi
-  if ! grep -Fq 'codex_setting/bin/preflight.sh distill-propose install-check "$PWD" >/tmp/codex-distill-propose.txt' INSTALL_LAYOUT.md \
-    || ! grep -Fq "rg '^status=tool-contract$' /tmp/codex-distill-propose.txt" INSTALL_LAYOUT.md \
-    || ! grep -Fq "rg '^reason=distill-proposal-disabled$' /tmp/codex-distill-propose.txt" INSTALL_LAYOUT.md \
-    || ! grep -Fq "rg '^enable=CODEX_DISTILL_ENABLE=1$' /tmp/codex-distill-propose.txt" INSTALL_LAYOUT.md; then
-    fail_msg "INSTALL_LAYOUT.md must validate Codex distill-propose disabled tool-contract"
-  fi
   if ! grep -Fq 'codex_setting/bin/preflight.sh mode-info material/browser-fetch >/tmp/codex-browser-fetch-mode.txt' INSTALL_LAYOUT.md \
     || ! grep -Fq "rg '^tool_contract=browser-fetch$' /tmp/codex-browser-fetch-mode.txt" INSTALL_LAYOUT.md \
     || ! grep -Fq "rg '^runtime_surface=adapter-owned-browser-fetch$' /tmp/codex-browser-fetch-mode.txt" INSTALL_LAYOUT.md \
@@ -711,12 +703,6 @@ check_install_layout_opencode_projection() {
     || ! grep -Fq "rg '^fallback=worklog-board-or-manual-post-it-flow$' /tmp/opencode-loop-note.txt" INSTALL_LAYOUT.md; then
     fail_msg "INSTALL_LAYOUT.md must validate OpenCode loop-info manual/unsupported contracts"
   fi
-  if ! grep -Fq 'opencode_setting/bin/preflight.sh distill-propose install-check "$PWD" >/tmp/opencode-distill-propose.txt' INSTALL_LAYOUT.md \
-    || ! grep -Fq "rg '^status=tool-contract$' /tmp/opencode-distill-propose.txt" INSTALL_LAYOUT.md \
-    || ! grep -Fq "rg '^reason=distill-proposal-disabled$' /tmp/opencode-distill-propose.txt" INSTALL_LAYOUT.md \
-    || ! grep -Fq "rg '^tool_contract=no-tools-distill-worker$' /tmp/opencode-distill-propose.txt" INSTALL_LAYOUT.md; then
-    fail_msg "INSTALL_LAYOUT.md must validate OpenCode distill-propose opt-in preview tool-contract"
-  fi
   if ! grep -Fq 'opencode_setting/bin/preflight.sh mode-info material/browser-fetch >/tmp/opencode-browser-fetch-mode.txt' INSTALL_LAYOUT.md \
     || ! grep -Fq "rg '^tool_contract=browser-fetch$' /tmp/opencode-browser-fetch-mode.txt" INSTALL_LAYOUT.md \
     || ! grep -Fq "rg '^runtime_surface=adapter-owned-browser-fetch$' /tmp/opencode-browser-fetch-mode.txt" INSTALL_LAYOUT.md \
@@ -772,7 +758,7 @@ check_codex_bin_wrappers() {
     fail_msg "codex_setting/bin points to $target; expected ../adapters/codex/bin"
   fi
 
-  for p in preflight.sh role-map.sh capability-map.sh mode-map.sh dispatch-headless.py dispatch-liveness.py dispatch-harvest.py distill-worker.sh sync-native-skills.py sync-native-agents.py sync-native-modes.py; do
+  for p in preflight.sh role-map.sh capability-map.sh mode-map.sh dispatch-headless.py dispatch-liveness.py dispatch-harvest.py sync-native-skills.py sync-native-agents.py sync-native-modes.py; do
     if [ ! -x "adapters/codex/bin/$p" ]; then
       fail_msg "adapters/codex/bin/$p is missing or not executable"
     fi
@@ -797,20 +783,6 @@ check_codex_bin_wrappers() {
     || ! grep -Fq '"$ROOT/adapters/codex/utilities/agent-home.sh"' adapters/codex/bin/preflight.sh \
     || grep -Fq 'AGENT_HOME="${AGENT_HOME:-$ROOT}"' adapters/codex/bin/preflight.sh; then
     fail_msg "adapters/codex/bin/preflight.sh must validate explicit AGENT_HOME and otherwise use the Codex-owned canonical resolver"
-  fi
-  if ! grep -Fq 'AGENT_HOME="$AGENT_ROOT" "$ROOT/adapters/codex/bin/distill-worker.sh"' adapters/codex/bin/preflight.sh; then
-    fail_msg "adapters/codex/bin/preflight.sh must pass a validated harness root to the distill worker"
-  fi
-  if ! grep -Fq 'AGENT_ROOT=$(agent_home)' adapters/codex/bin/distill-worker.sh \
-    || ! grep -Fq '[ -f "$AGENT_HOME/core/CORE.md" ]' adapters/codex/bin/distill-worker.sh \
-    || grep -Fq 'AGENT_HOME="${AGENT_HOME:-$ROOT}"' adapters/codex/bin/distill-worker.sh; then
-    fail_msg "adapters/codex/bin/distill-worker.sh must validate AGENT_HOME before using it as the harness root"
-  fi
-  if ! grep -Fq 'reason=distill-proposal-disabled' adapters/codex/bin/preflight.sh \
-    || ! grep -Fq 'tool_contract=no-tools-distill-worker' adapters/codex/bin/preflight.sh \
-    || ! grep -Fq 'enable=CODEX_DISTILL_ENABLE=1' adapters/codex/bin/preflight.sh \
-    || ! grep -Fq 'CODEX_DISTILL_APPLY=1+CODEX_DISTILL_CONTRACT_ACCEPTED=1' adapters/codex/bin/preflight.sh; then
-    fail_msg "adapters/codex/bin/preflight.sh must report disabled distill-propose as an explicit no-tools worker tool-contract"
   fi
   if ! grep -Fq 'runtime_surface=codex-native-approval-sandbox' adapters/codex/bin/preflight.sh \
     || ! grep -Fq 'claude_allowed_tools=unsupported' adapters/codex/bin/preflight.sh; then
@@ -930,7 +902,7 @@ check_codex_bin_wrappers() {
     fi
   done
 
-  for p in 'preflight.sh session-end' 'preflight.sh prompt-signal' 'preflight.sh turn-nudge' 'preflight.sh token-budget' 'preflight.sh memory' 'preflight.sh recall' 'preflight.sh briefing' 'preflight.sh worklog' 'preflight.sh ui-info' 'preflight.sh tui-config' 'preflight.sh subagent-info' 'preflight.sh loop-info' 'preflight.sh qa-policy' 'preflight.sh distill-delta' 'preflight.sh distill-propose'; do
+  for p in 'preflight.sh session-end' 'preflight.sh prompt-signal' 'preflight.sh token-budget' 'preflight.sh memory' 'preflight.sh recall' 'preflight.sh briefing' 'preflight.sh worklog' 'preflight.sh ui-info' 'preflight.sh tui-config' 'preflight.sh subagent-info' 'preflight.sh loop-info' 'preflight.sh qa-policy'; do
     if ! grep -Fq "$p" adapters/codex/AGENTS.md; then
       fail_msg "adapters/codex/AGENTS.md must document manual Codex lifecycle wrapper $p"
     fi
@@ -1030,7 +1002,6 @@ check_codex_bin_wrappers() {
     || ! grep -Fq 'record_accounting(sid, event, adapter="codex")' adapters/codex/hooks/userprompt-lifecycle.py \
     || ! grep -Fq 'timeout_seconds=token_budget_timeout()' adapters/codex/hooks/userprompt-lifecycle.py \
     || ! grep -Fq 'CODEX_TOKEN_BUDGET_HOOK_TIMEOUT_SECONDS' adapters/codex/hooks/userprompt-lifecycle.py \
-    || ! grep -Fq 'run_preflight("turn-nudge"' adapters/codex/hooks/userprompt-lifecycle.py \
     || ! grep -Fq 'emit_context("UserPromptSubmit"' adapters/codex/hooks/userprompt-lifecycle.py \
     || ! grep -Fq 'hookSpecificOutput' adapters/codex/hooks/userprompt-lifecycle.py; then
     fail_msg "Codex lifecycle hook bridges must route through preflight.sh lifecycle commands"
@@ -1040,7 +1011,6 @@ check_codex_bin_wrappers() {
     || ! grep -Fq 'CODEX_SESSION_MEMORY_INJECT=1' hooks/portable-guards.test.sh \
     || ! grep -Fq 'out["hookEventName"]=="SessionStart"' hooks/portable-guards.test.sh \
     || ! grep -Fq 'injects no workflow-mode banner (retired)' hooks/portable-guards.test.sh \
-    || ! grep -Fq 'resets the turn-nudge counter on every prompt' hooks/portable-guards.test.sh \
     || ! grep -Fq 'injects token budget only on pressure-band transition' hooks/portable-guards.test.sh \
     || ! grep -Fq 'out["hookEventName"]=="UserPromptSubmit"' hooks/portable-guards.test.sh \
     || ! grep -Fq 'silent success output' hooks/portable-guards.test.sh \
@@ -1090,7 +1060,7 @@ check_codex_bin_wrappers() {
     || ! grep -Fq 'routing_contract=core/WORKFLOW.md' adapters/codex/bin/preflight.sh \
     || ! grep -Fq 'routing_action=read-workflow-and-select-codex-skill' adapters/codex/bin/preflight.sh \
     || ! grep -Fq 'capability_entrypoints=codex-native-skills' adapters/codex/bin/preflight.sh \
-    || ! grep -Fq 'enforced_hooks=structured-write-guards,core-first-guard,posttool-read-markers,posttool-design-check,session-memory,turn-nudge' adapters/codex/bin/preflight.sh; then
+    || ! grep -Fq 'enforced_hooks=structured-write-guards,core-first-guard,posttool-read-markers,posttool-design-check,session-memory' adapters/codex/bin/preflight.sh; then
     fail_msg "Codex UserPromptSubmit hook must expose a structured workflow/autopilot signal"
   fi
   if ! grep -Fq 'codex route wrapper combines status, prompt signal, capability-info, and spec gate' hooks/portable-guards.test.sh; then
@@ -1314,11 +1284,7 @@ check_codex_utility_projection() {
   # top-level utilities/* entry must be classified projected or deferred, else fail loud (closes the
   # leak window where a newly added utility silently has no projection decision).
   UTILITY_PROJECTED="agent-home.sh artifact-root.sh agent-worklog-state.sh harness-status.sh worktree-cleanup.py dispatch-route.sh dispatch-defaults.py token-budget.py token-budget-experiment.py worker_bootstrap.py"
-  # mem-periodic-curate.sh is deferred, not projected: the opt-in nightly curator
-  # ships Claude-first and default-off (2026-08-13, E axis). Codex/OpenCode keep
-  # their own distill workers, so a projected counterpart would assert a parity
-  # that does not exist yet. Revisit when the gate is enabled for real.
-  UTILITY_DEFERRED="mem-periodic-curate.sh compute-hosts.py codex_hook_definition_age.py model_profile.py model-config.sh model_config.py harness-capacity.py dispatch_degradation.py dispatch_allocation_receipt.py dispatch_quality_peer.py ripple-map.py stage-session-chain.py stage_session_contract.py stage_session_runtime.py worker-state-hook.py worker-state-ledger.py artifact-root.test.sh artifact-snapshot.py artifact-sink.sh artifact-sink.test.sh artifact_identity.py artifact_manifest.py artifact_index.py artifact_locator.py artifact_admission.py artifact_lifecycle.py artifact_receipt.py artifact_producer.py artifact_checkpoint_trigger.py artifact_cutover.py artifact_resplit.py artifact_reader.py artifact_relayout.py artifact_residue.py artifact_reader.test.py stage_session_runtime.test.py dispatch-artifact-root.test.py worktree-cleanup.test.py dispatch-liveness.sh dispatch-state-root.sh dispatch-liveness.test.sh dispatch_liveness_matrix.test.py dispatch-wait.sh dispatch-wait.test.sh dispatch-concurrency.test.sh usage-check.sh usage-check.test.sh dispatch-route.test.sh extract_web_figures.py capability-route.py capability_route.test.py compose-route.py compose_route.test.py dispatch-broker.py dispatch_broker.test.py dispatch-node.py dispatch_node.test.py dispatch-owner.py owner_route_binding.py dispatch-progress.py dispatch_progress.test.py dispatch-registry.py dispatch-recovery.py dispatch_registry.test.py dispatch_summary.py session_summary_trigger.py dispatch-orphan-watch.py dispatch_orphan_watch.test.py dispatch_adapters_v11.test.py dispatch_contract.py dispatch_stage_advance.py dispatch-reap-watch.py dispatch_allocation.py dispatch_mode_contract.py dispatch-observed-liveness.py dispatch_supervisor_terminal.py dispatch_contract.test.py dispatch_completion_marker.test.py dispatch_harvest.test.py dispatch_v20.test.py dispatch_lifecycle.py dispatch_continuation_budget.py dispatch_lifecycle.test.py dispatch-attempt-ready.py dispatch-batch.py launch-fence.py replica_batch_contract.py nested-dispatch-eligibility.py nested_dispatch_eligibility.test.py stage-dispatch-fallback.py stage_dispatch_fallback.test.py stage_dispatch_capacity.test.py spec-transaction.py spec_transaction.test.py worker-route-guard.py worker_route_guard.test.py model-worker-governor.py model_worker_governor.test.py resource-runner.py resource_run_registry.py resource_runner.test.py workflow_state.py workflow-supervisor.py workflow_supervisor.test.py worker_bootstrap.test.py worker_dispatch_prompt.test.py verify-files.sh verify-files.test.sh worktree-residue.py worktree_residue.test.py dispatch_codex_nocommit_fixture.test.py codex_dispatch_terminal.py codex_dispatch_terminal.test.py claude-session-supervisor.py claude_session_supervisor.test.py codex-app-server-supervisor.py codex_app_server_supervisor.test.py dispatch_completion_join.py dispatch_completion_join.test.py registered_parent_park.test.py capability-grounding.sh codex-managed-completion.py codex-managed-entry.py codex-managed-gateway.py codex_managed_dispatch.py codex-launcher.py codex-jsonl-writer.py spec_gate_evidence.py dispatch_pending_delivery.py dispatch_session_sweep.py artifact-postscan.py dispatch_launch_tuple.py dispatch_registry_inventory.py dispatch_budget_record.py dispatch_subsession_advance.py dispatch_subsession_resume_record.py dispatch_subsession_handoff.py subdivision_batch_admission.py route_identity.py route_lineage.py route_lineage.test.py review_round_cap.py review_round_cap.test.py fleet_cutover_gate.py peer-message.py peer-steward.py frame_interview.py dispatch_terminal_commit.py dispatch_lock_order.py dispatch_runtime_support.py human_gate_receipt.py parent_next_directive.py dispatch_registry_cache.py opencode_server_log.py"
+  UTILITY_DEFERRED="compute-hosts.py codex_hook_definition_age.py model_profile.py model-config.sh model_config.py harness-capacity.py dispatch_degradation.py dispatch_allocation_receipt.py dispatch_quality_peer.py ripple-map.py stage-session-chain.py stage_session_contract.py stage_session_runtime.py worker-state-hook.py worker-state-ledger.py artifact-root.test.sh artifact-snapshot.py artifact-sink.sh artifact-sink.test.sh artifact_identity.py artifact_manifest.py artifact_index.py artifact_locator.py artifact_admission.py artifact_lifecycle.py artifact_receipt.py artifact_producer.py artifact_checkpoint_trigger.py artifact_cutover.py artifact_resplit.py artifact_reader.py artifact_relayout.py artifact_residue.py artifact_reader.test.py stage_session_runtime.test.py dispatch-artifact-root.test.py worktree-cleanup.test.py dispatch-liveness.sh dispatch-state-root.sh dispatch-liveness.test.sh dispatch_liveness_matrix.test.py dispatch-wait.sh dispatch-wait.test.sh dispatch-concurrency.test.sh usage-check.sh usage-check.test.sh dispatch-route.test.sh extract_web_figures.py capability-route.py capability_route.test.py compose-route.py compose_route.test.py dispatch-broker.py dispatch_broker.test.py dispatch-node.py dispatch_node.test.py dispatch-owner.py owner_route_binding.py dispatch-progress.py dispatch_progress.test.py dispatch-registry.py dispatch-recovery.py dispatch_registry.test.py dispatch_summary.py session_summary_trigger.py dispatch-orphan-watch.py dispatch_orphan_watch.test.py dispatch_adapters_v11.test.py dispatch_contract.py dispatch_stage_advance.py dispatch-reap-watch.py dispatch_allocation.py dispatch_mode_contract.py dispatch-observed-liveness.py dispatch_supervisor_terminal.py dispatch_contract.test.py dispatch_completion_marker.test.py dispatch_harvest.test.py dispatch_v20.test.py dispatch_lifecycle.py dispatch_continuation_budget.py dispatch_lifecycle.test.py dispatch-attempt-ready.py dispatch-batch.py launch-fence.py replica_batch_contract.py nested-dispatch-eligibility.py nested_dispatch_eligibility.test.py stage-dispatch-fallback.py stage_dispatch_fallback.test.py stage_dispatch_capacity.test.py spec-transaction.py spec_transaction.test.py worker-route-guard.py worker_route_guard.test.py model-worker-governor.py model_worker_governor.test.py resource-runner.py resource_run_registry.py resource_runner.test.py workflow_state.py workflow-supervisor.py workflow_supervisor.test.py worker_bootstrap.test.py worker_dispatch_prompt.test.py verify-files.sh verify-files.test.sh worktree-residue.py worktree_residue.test.py dispatch_codex_nocommit_fixture.test.py codex_dispatch_terminal.py codex_dispatch_terminal.test.py claude-session-supervisor.py claude_session_supervisor.test.py codex-app-server-supervisor.py codex_app_server_supervisor.test.py dispatch_completion_join.py dispatch_completion_join.test.py registered_parent_park.test.py capability-grounding.sh codex-managed-completion.py codex-managed-entry.py codex-managed-gateway.py codex_managed_dispatch.py codex-launcher.py codex-jsonl-writer.py spec_gate_evidence.py dispatch_pending_delivery.py dispatch_session_sweep.py artifact-postscan.py dispatch_launch_tuple.py dispatch_registry_inventory.py dispatch_budget_record.py dispatch_subsession_advance.py dispatch_subsession_resume_record.py dispatch_subsession_handoff.py subdivision_batch_admission.py route_identity.py route_lineage.py route_lineage.test.py review_round_cap.py review_round_cap.test.py fleet_cutover_gate.py peer-message.py peer-steward.py frame_interview.py dispatch_terminal_commit.py dispatch_lock_order.py dispatch_runtime_support.py human_gate_receipt.py parent_next_directive.py dispatch_registry_cache.py opencode_server_log.py"
   UTILITY_DEFERRED_EXTRA="codex_hook_definition_age.py model_profile.py model-config.sh model_config.py harness-capacity.py dispatch_degradation.py dispatch_allocation_receipt.py dispatch_quality_peer.py ripple-map.py stage-session-chain.py stage_session_contract.py stage_session_runtime.py worker-state-hook.py worker-state-ledger.py artifact-root.test.sh dispatch-artifact-root.test.py worktree-cleanup.test.py dispatch-liveness.sh dispatch-state-root.sh dispatch-liveness.test.sh dispatch_liveness_matrix.test.py dispatch-wait.sh dispatch-wait.test.sh dispatch-concurrency.test.sh usage-check.sh usage-check.test.sh dispatch-route.test.sh extract_web_figures.py token-budget.py token-budget-experiment.py capability-route.py capability_route.test.py compose-route.py compose_route.test.py dispatch-broker.py dispatch_broker.test.py dispatch-node.py dispatch_node.test.py dispatch-owner.py owner_route_binding.py dispatch-progress.py dispatch_progress.test.py dispatch-registry.py dispatch_registry.test.py dispatch-orphan-watch.py dispatch_orphan_watch.test.py dispatch_adapters_v11.test.py dispatch_contract.py dispatch_stage_advance.py dispatch-reap-watch.py dispatch_allocation.py dispatch_mode_contract.py dispatch-observed-liveness.py dispatch_supervisor_terminal.py dispatch_contract.test.py dispatch_completion_marker.test.py dispatch_harvest.test.py dispatch_v20.test.py dispatch_lifecycle.py dispatch_continuation_budget.py dispatch_lifecycle.test.py dispatch-attempt-ready.py dispatch-batch.py launch-fence.py replica_batch_contract.py nested-dispatch-eligibility.py nested_dispatch_eligibility.test.py stage-dispatch-fallback.py stage_dispatch_fallback.test.py stage_dispatch_capacity.test.py spec-transaction.py spec_transaction.test.py worker-route-guard.py worker_route_guard.test.py model-worker-governor.py model_worker_governor.test.py resource-runner.py resource_run_registry.py resource_runner.test.py workflow_state.py workflow-supervisor.py workflow_supervisor.test.py worker_bootstrap.test.py worker_dispatch_prompt.test.py verify-files.sh verify-files.test.sh worktree-residue.py worktree_residue.test.py dispatch_codex_nocommit_fixture.test.py codex_dispatch_terminal.py codex_dispatch_terminal.test.py claude-session-supervisor.py claude_session_supervisor.test.py codex-app-server-supervisor.py codex_app_server_supervisor.test.py dispatch_completion_join.py dispatch_completion_join.test.py registered_parent_park.test.py capability-grounding.sh codex-managed-completion.py codex-managed-entry.py codex-managed-gateway.py codex_managed_dispatch.py"
   utility_count=0
   for f in utilities/*; do
@@ -1370,17 +1336,6 @@ check_codex_tool_projection() {
     elif ! grep -Fq '[ -f "$AGENT_HOME/tools/memory/mem.py" ]' "adapters/codex/tools/memory/$p" \
       || grep -Fq 'if [ "${AGENT_HOME:-}" ]; then' "adapters/codex/tools/memory/$p"; then
       fail_msg "adapters/codex/tools/memory/$p must validate AGENT_HOME before using it as the harness root"
-    fi
-  done
-
-  for p in apply-distill-actions.py; do
-    if [ ! -L "adapters/codex/tools/memory/$p" ]; then
-      fail_msg "adapters/codex/tools/memory/$p must be a selective portable memory tool projection"
-      continue
-    fi
-    link=$(readlink "adapters/codex/tools/memory/$p")
-    if [ "$link" != "../../../../tools/memory/$p" ]; then
-      fail_msg "adapters/codex/tools/memory/$p points to $link; expected ../../../../tools/memory/$p"
     fi
   done
 
@@ -1458,7 +1413,7 @@ check_codex_tool_projection() {
     :
   fi
 
-  extra=$(find adapters/codex/tools -mindepth 1 ! -name __pycache__ ! -path '*/__pycache__/*' ! -name '*.py[co]' ! \( -path adapters/codex/tools/memory -o -path adapters/codex/tools/memory/mem.py -o -path adapters/codex/tools/memory/apply-distill-actions.py -o -path adapters/codex/tools/memory/recall.sh -o -path adapters/codex/tools/design -o -path adapters/codex/tools/design/visual-harness.sh -o -path adapters/codex/tools/design/convert-harness.sh -o -path adapters/codex/tools/material -o -path adapters/codex/tools/material/browser-fetch.sh -o -path adapters/codex/tools/material/data-script.sh -o -path adapters/codex/tools/material/figure-gen.sh -o -path adapters/codex/tools/material/pdf-extract.sh -o -path adapters/codex/tools/material/web-image-search.sh -o -path adapters/codex/tools/qa -o -path adapters/codex/tools/qa/verification-runner.sh -o -path adapters/codex/tools/research -o -path adapters/codex/tools/research/claim-verify.sh \) -print 2>/dev/null || true)
+  extra=$(find adapters/codex/tools -mindepth 1 ! -name __pycache__ ! -path '*/__pycache__/*' ! -name '*.py[co]' ! \( -path adapters/codex/tools/memory -o -path adapters/codex/tools/memory/mem.py -o -path adapters/codex/tools/memory/recall.sh -o -path adapters/codex/tools/design -o -path adapters/codex/tools/design/visual-harness.sh -o -path adapters/codex/tools/design/convert-harness.sh -o -path adapters/codex/tools/material -o -path adapters/codex/tools/material/browser-fetch.sh -o -path adapters/codex/tools/material/data-script.sh -o -path adapters/codex/tools/material/figure-gen.sh -o -path adapters/codex/tools/material/pdf-extract.sh -o -path adapters/codex/tools/material/web-image-search.sh -o -path adapters/codex/tools/qa -o -path adapters/codex/tools/qa/verification-runner.sh -o -path adapters/codex/tools/research -o -path adapters/codex/tools/research/claim-verify.sh \) -print 2>/dev/null || true)
   if [ -n "$extra" ]; then
     fail_msg "adapters/codex/tools contains unapproved entries:"
     printf '%s\n' "$extra"
@@ -2115,9 +2070,6 @@ check_claude_bin_wrappers() {
     fail_msg "claude_setting/bin points to $target; expected ../adapters/claude/bin"
   fi
 
-  if [ ! -x adapters/claude/bin/mem-distill-worker.sh ]; then
-    fail_msg "adapters/claude/bin/mem-distill-worker.sh is missing or not executable"
-  fi
   if ! grep -Fq 'AGENT_DISPATCH_JOBS' adapters/claude/bin/dispatch-headless.py; then
     fail_msg "adapters/claude/bin/dispatch-headless.py must honor the shared dispatch registry override"
   fi
@@ -2134,7 +2086,7 @@ check_opencode_bin_wrappers() {
     fail_msg "opencode_setting/bin points to $target; expected ../adapters/opencode/bin"
   fi
 
-  for p in preflight.sh role-map.sh capability-map.sh mode-map.sh dispatch-headless.py dispatch-liveness.py dispatch-harvest.py distill-worker.sh sync-native-skills.py sync-native-agents.py sync-native-commands.py; do
+  for p in preflight.sh role-map.sh capability-map.sh mode-map.sh dispatch-headless.py dispatch-liveness.py dispatch-harvest.py sync-native-skills.py sync-native-agents.py sync-native-commands.py; do
     if [ ! -x "adapters/opencode/bin/$p" ]; then
       fail_msg "adapters/opencode/bin/$p is missing or not executable"
     fi
@@ -2158,9 +2110,6 @@ check_opencode_bin_wrappers() {
     || ! grep -Fq '[ -f "$AGENT_HOME/core/CORE.md" ]' adapters/opencode/bin/preflight.sh \
     || grep -Fq 'AGENT_HOME="${AGENT_HOME:-$ROOT}"' adapters/opencode/bin/preflight.sh; then
     fail_msg "adapters/opencode/bin/preflight.sh must validate AGENT_HOME before using it as the harness root"
-  fi
-  if ! grep -Fq 'AGENT_HOME="$AGENT_ROOT" "$ROOT/adapters/opencode/bin/distill-worker.sh"' adapters/opencode/bin/preflight.sh; then
-    fail_msg "adapters/opencode/bin/preflight.sh must pass a validated harness root to the distill worker"
   fi
   if ! grep -Fq 'runtime_surface=opencode-native-permission-config' adapters/opencode/bin/preflight.sh \
     || ! grep -Fq 'claude_allowed_tools=unsupported' adapters/opencode/bin/preflight.sh; then
@@ -2213,7 +2162,7 @@ check_opencode_bin_wrappers() {
     fi
   done
 
-  for p in 'preflight.sh memory' 'preflight.sh recall' 'preflight.sh briefing' 'preflight.sh worklog' 'preflight.sh distill-delta' 'preflight.sh distill-propose'; do
+  for p in 'preflight.sh memory' 'preflight.sh recall' 'preflight.sh briefing' 'preflight.sh worklog'; do
     if ! grep -Fq "$p" adapters/opencode/AGENTS.md; then
       fail_msg "adapters/opencode/AGENTS.md must document manual OpenCode lifecycle wrapper $p"
     fi
@@ -2383,11 +2332,7 @@ check_opencode_utility_projection() {
   # top-level utilities/* entry must be classified projected or deferred, else fail loud (closes the
   # leak window where a newly added utility silently has no projection decision).
   UTILITY_PROJECTED="agent-home.sh artifact-root.sh agent-worklog-state.sh harness-status.sh worktree-cleanup.py dispatch-route.sh dispatch-defaults.py worker_bootstrap.py"
-  # mem-periodic-curate.sh is deferred, not projected: the opt-in nightly curator
-  # ships Claude-first and default-off (2026-08-13, E axis). Codex/OpenCode keep
-  # their own distill workers, so a projected counterpart would assert a parity
-  # that does not exist yet. Revisit when the gate is enabled for real.
-  UTILITY_DEFERRED="mem-periodic-curate.sh compute-hosts.py codex_hook_definition_age.py model_profile.py model-config.sh model_config.py harness-capacity.py dispatch_degradation.py dispatch_allocation_receipt.py dispatch_quality_peer.py ripple-map.py stage-session-chain.py stage_session_contract.py stage_session_runtime.py worker-state-hook.py worker-state-ledger.py artifact-root.test.sh artifact-snapshot.py artifact-sink.sh artifact-sink.test.sh artifact_identity.py artifact_manifest.py artifact_index.py artifact_locator.py artifact_admission.py artifact_lifecycle.py artifact_receipt.py artifact_producer.py artifact_checkpoint_trigger.py artifact_cutover.py artifact_resplit.py artifact_reader.py artifact_relayout.py artifact_residue.py artifact_reader.test.py stage_session_runtime.test.py dispatch-artifact-root.test.py worktree-cleanup.test.py dispatch-liveness.sh dispatch-state-root.sh dispatch-liveness.test.sh dispatch_liveness_matrix.test.py dispatch-wait.sh dispatch-wait.test.sh dispatch-concurrency.test.sh usage-check.sh usage-check.test.sh dispatch-route.test.sh extract_web_figures.py token-budget.py token-budget-experiment.py capability-route.py capability_route.test.py compose-route.py compose_route.test.py dispatch-broker.py dispatch_broker.test.py dispatch-node.py dispatch_node.test.py dispatch-owner.py owner_route_binding.py dispatch-progress.py dispatch_progress.test.py dispatch-registry.py dispatch-recovery.py dispatch_registry.test.py dispatch_summary.py session_summary_trigger.py dispatch-orphan-watch.py dispatch_orphan_watch.test.py dispatch_adapters_v11.test.py dispatch_contract.py dispatch_stage_advance.py dispatch-reap-watch.py dispatch_allocation.py dispatch_mode_contract.py dispatch-observed-liveness.py dispatch_supervisor_terminal.py dispatch_contract.test.py dispatch_completion_marker.test.py dispatch_harvest.test.py dispatch_v20.test.py dispatch_lifecycle.py dispatch_continuation_budget.py dispatch_lifecycle.test.py dispatch-attempt-ready.py dispatch-batch.py launch-fence.py replica_batch_contract.py nested-dispatch-eligibility.py nested_dispatch_eligibility.test.py stage-dispatch-fallback.py stage_dispatch_fallback.test.py stage_dispatch_capacity.test.py spec-transaction.py spec_transaction.test.py worker-route-guard.py worker_route_guard.test.py model-worker-governor.py model_worker_governor.test.py resource-runner.py resource_run_registry.py resource_runner.test.py workflow_state.py workflow-supervisor.py workflow_supervisor.test.py worker_bootstrap.test.py worker_dispatch_prompt.test.py verify-files.sh verify-files.test.sh worktree-residue.py worktree_residue.test.py dispatch_codex_nocommit_fixture.test.py codex_dispatch_terminal.py codex_dispatch_terminal.test.py claude-session-supervisor.py claude_session_supervisor.test.py codex-app-server-supervisor.py codex_app_server_supervisor.test.py dispatch_completion_join.py dispatch_completion_join.test.py registered_parent_park.test.py capability-grounding.sh codex-managed-completion.py codex-managed-entry.py codex-managed-gateway.py codex_managed_dispatch.py codex-launcher.py codex-jsonl-writer.py spec_gate_evidence.py dispatch_pending_delivery.py dispatch_session_sweep.py artifact-postscan.py dispatch_launch_tuple.py dispatch_registry_inventory.py dispatch_budget_record.py dispatch_subsession_advance.py dispatch_subsession_resume_record.py dispatch_subsession_handoff.py subdivision_batch_admission.py route_identity.py route_lineage.py route_lineage.test.py review_round_cap.py review_round_cap.test.py fleet_cutover_gate.py peer-message.py peer-steward.py frame_interview.py dispatch_terminal_commit.py dispatch_lock_order.py dispatch_runtime_support.py human_gate_receipt.py parent_next_directive.py dispatch_registry_cache.py opencode_server_log.py"
+  UTILITY_DEFERRED="compute-hosts.py codex_hook_definition_age.py model_profile.py model-config.sh model_config.py harness-capacity.py dispatch_degradation.py dispatch_allocation_receipt.py dispatch_quality_peer.py ripple-map.py stage-session-chain.py stage_session_contract.py stage_session_runtime.py worker-state-hook.py worker-state-ledger.py artifact-root.test.sh artifact-snapshot.py artifact-sink.sh artifact-sink.test.sh artifact_identity.py artifact_manifest.py artifact_index.py artifact_locator.py artifact_admission.py artifact_lifecycle.py artifact_receipt.py artifact_producer.py artifact_checkpoint_trigger.py artifact_cutover.py artifact_resplit.py artifact_reader.py artifact_relayout.py artifact_residue.py artifact_reader.test.py stage_session_runtime.test.py dispatch-artifact-root.test.py worktree-cleanup.test.py dispatch-liveness.sh dispatch-state-root.sh dispatch-liveness.test.sh dispatch_liveness_matrix.test.py dispatch-wait.sh dispatch-wait.test.sh dispatch-concurrency.test.sh usage-check.sh usage-check.test.sh dispatch-route.test.sh extract_web_figures.py token-budget.py token-budget-experiment.py capability-route.py capability_route.test.py compose-route.py compose_route.test.py dispatch-broker.py dispatch_broker.test.py dispatch-node.py dispatch_node.test.py dispatch-owner.py owner_route_binding.py dispatch-progress.py dispatch_progress.test.py dispatch-registry.py dispatch-recovery.py dispatch_registry.test.py dispatch_summary.py session_summary_trigger.py dispatch-orphan-watch.py dispatch_orphan_watch.test.py dispatch_adapters_v11.test.py dispatch_contract.py dispatch_stage_advance.py dispatch-reap-watch.py dispatch_allocation.py dispatch_mode_contract.py dispatch-observed-liveness.py dispatch_supervisor_terminal.py dispatch_contract.test.py dispatch_completion_marker.test.py dispatch_harvest.test.py dispatch_v20.test.py dispatch_lifecycle.py dispatch_continuation_budget.py dispatch_lifecycle.test.py dispatch-attempt-ready.py dispatch-batch.py launch-fence.py replica_batch_contract.py nested-dispatch-eligibility.py nested_dispatch_eligibility.test.py stage-dispatch-fallback.py stage_dispatch_fallback.test.py stage_dispatch_capacity.test.py spec-transaction.py spec_transaction.test.py worker-route-guard.py worker_route_guard.test.py model-worker-governor.py model_worker_governor.test.py resource-runner.py resource_run_registry.py resource_runner.test.py workflow_state.py workflow-supervisor.py workflow_supervisor.test.py worker_bootstrap.test.py worker_dispatch_prompt.test.py verify-files.sh verify-files.test.sh worktree-residue.py worktree_residue.test.py dispatch_codex_nocommit_fixture.test.py codex_dispatch_terminal.py codex_dispatch_terminal.test.py claude-session-supervisor.py claude_session_supervisor.test.py codex-app-server-supervisor.py codex_app_server_supervisor.test.py dispatch_completion_join.py dispatch_completion_join.test.py registered_parent_park.test.py capability-grounding.sh codex-managed-completion.py codex-managed-entry.py codex-managed-gateway.py codex_managed_dispatch.py codex-launcher.py codex-jsonl-writer.py spec_gate_evidence.py dispatch_pending_delivery.py dispatch_session_sweep.py artifact-postscan.py dispatch_launch_tuple.py dispatch_registry_inventory.py dispatch_budget_record.py dispatch_subsession_advance.py dispatch_subsession_resume_record.py dispatch_subsession_handoff.py subdivision_batch_admission.py route_identity.py route_lineage.py route_lineage.test.py review_round_cap.py review_round_cap.test.py fleet_cutover_gate.py peer-message.py peer-steward.py frame_interview.py dispatch_terminal_commit.py dispatch_lock_order.py dispatch_runtime_support.py human_gate_receipt.py parent_next_directive.py dispatch_registry_cache.py opencode_server_log.py"
   utility_count=0
   for f in utilities/*; do
     [ -f "$f" ] || continue
@@ -2438,17 +2383,6 @@ check_opencode_tool_projection() {
     elif ! grep -Fq '[ -f "$AGENT_HOME/tools/memory/mem.py" ]' "adapters/opencode/tools/memory/$p" \
       || grep -Fq 'if [ "${AGENT_HOME:-}" ]; then' "adapters/opencode/tools/memory/$p"; then
       fail_msg "adapters/opencode/tools/memory/$p must validate AGENT_HOME before using it as the harness root"
-    fi
-  done
-
-  for p in apply-distill-actions.py; do
-    if [ ! -L "adapters/opencode/tools/memory/$p" ]; then
-      fail_msg "adapters/opencode/tools/memory/$p must be a selective portable memory tool projection"
-      continue
-    fi
-    link=$(readlink "adapters/opencode/tools/memory/$p")
-    if [ "$link" != "../../../../tools/memory/$p" ]; then
-      fail_msg "adapters/opencode/tools/memory/$p points to $link; expected ../../../../tools/memory/$p"
     fi
   done
 
@@ -2518,7 +2452,7 @@ check_opencode_tool_projection() {
     :
   fi
 
-  extra=$(find adapters/opencode/tools -mindepth 1 ! -name __pycache__ ! -path '*/__pycache__/*' ! -name '*.py[co]' ! \( -path adapters/opencode/tools/memory -o -path adapters/opencode/tools/memory/mem.py -o -path adapters/opencode/tools/memory/apply-distill-actions.py -o -path adapters/opencode/tools/memory/recall.sh -o -path adapters/opencode/tools/design -o -path adapters/opencode/tools/design/visual-harness.sh -o -path adapters/opencode/tools/material -o -path adapters/opencode/tools/material/browser-fetch.sh -o -path adapters/opencode/tools/material/data-script.sh -o -path adapters/opencode/tools/material/figure-gen.sh -o -path adapters/opencode/tools/material/pdf-extract.sh -o -path adapters/opencode/tools/material/web-image-search.sh -o -path adapters/opencode/tools/qa -o -path adapters/opencode/tools/qa/verification-runner.sh -o -path adapters/opencode/tools/research -o -path adapters/opencode/tools/research/claim-verify.sh \) -print 2>/dev/null || true)
+  extra=$(find adapters/opencode/tools -mindepth 1 ! -name __pycache__ ! -path '*/__pycache__/*' ! -name '*.py[co]' ! \( -path adapters/opencode/tools/memory -o -path adapters/opencode/tools/memory/mem.py -o -path adapters/opencode/tools/memory/recall.sh -o -path adapters/opencode/tools/design -o -path adapters/opencode/tools/design/visual-harness.sh -o -path adapters/opencode/tools/material -o -path adapters/opencode/tools/material/browser-fetch.sh -o -path adapters/opencode/tools/material/data-script.sh -o -path adapters/opencode/tools/material/figure-gen.sh -o -path adapters/opencode/tools/material/pdf-extract.sh -o -path adapters/opencode/tools/material/web-image-search.sh -o -path adapters/opencode/tools/qa -o -path adapters/opencode/tools/qa/verification-runner.sh -o -path adapters/opencode/tools/research -o -path adapters/opencode/tools/research/claim-verify.sh \) -print 2>/dev/null || true)
   if [ -n "$extra" ]; then
     fail_msg "adapters/opencode/tools contains unapproved entries:"
     printf '%s\n' "$extra"
@@ -3351,18 +3285,6 @@ check_adaptation_inventory_native_surfaces() {
     || ! grep -Fq 'adapter liveness wrapper' core/OPERATIONS.md; then
     fail_msg "core/OPERATIONS.md must describe adapter-native liveness wrappers, not only the shared Claude-compatible dispatch-liveness helper"
   fi
-  if ! grep -Fq 'Codex and OpenCode expose `preflight.sh distill-propose` as a no-tools worker tool-contract by default' core/ADAPTATION_INVENTORY.md \
-    || ! grep -Fq 'Codex exits 69 until `CODEX_DISTILL_ENABLE=1`' core/ADAPTATION_INVENTORY.md \
-    || ! grep -Fq 'OpenCode exits 69 until `OPENCODE_DISTILL_ENABLE=1`' core/ADAPTATION_INVENTORY.md; then
-    fail_msg "core/ADAPTATION_INVENTORY.md must describe adapter distill-propose tool-contract boundaries"
-  fi
-  if ! grep -Fq 'SessionEnd and turn-counter triggers may launch a no-tools distiller agent' core/MEMORY.md \
-    || ! grep -Fq 'Codex adapter-owned `session-end` and' core/HOOKS.md \
-    || ! grep -Fq 'read-only `codex exec` tool-free proof' core/HOOKS.md \
-    || ! grep -Fq 'verified automatic distill worker' adapters/codex/ADAPTATION.md \
-    || grep -Fq 'opt-in distill proposal worker' adapters/codex/ADAPTATION.md; then
-    fail_msg "core memory/hooks docs and Codex adaptation docs must distinguish user-facing distill-propose preview from verified automatic lifecycle distillation"
-  fi
   if ! grep -Fq 'Codex, leave `/statusline`' core/ADAPTATION_INVENTORY.md \
     || ! grep -Fq '`/title` as native built-in item configuration surfaces' core/ADAPTATION_INVENTORY.md \
     || ! grep -Fq 'preflight.sh ui-info' core/ADAPTATION_INVENTORY.md; then
@@ -3998,15 +3920,6 @@ check_language_neutrality_contract() {
     fail_msg "institutionalization review must expose durable evidence without a fixed semantic type gate"
   fi
 
-  for distiller in hooks/mem-distill-dispatch.sh \
-    adapters/claude/hooks/mem-distill-dispatch.sh \
-    adapters/codex/bin/distill-worker.sh \
-    adapters/opencode/bin/distill-worker.sh; do
-    if ! grep -Fq 'decision|user-correction|unresolved-obligation|artifact-pointer' "$distiller" \
-      || ! grep -Fq 'artifact_refs' "$distiller"; then
-      fail_msg "$distiller must enforce purpose-limited, pointer-first automatic memory ingress"
-    fi
-  done
 }
 
 check_fleet_depth2_liveness_regression() {

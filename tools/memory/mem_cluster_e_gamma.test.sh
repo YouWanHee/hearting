@@ -2,7 +2,8 @@
 . "$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/test-isolation.sh"
 hearting_test_isolate
 # Cluster E Phase γ — isolated test suite (curator subcommands + anti-bloat + graduate).
-# Maps to Verification ②③⑤⑥⑦ (dispatch ①④⑧ live in mem-distill-dispatch.test.sh).
+# Maps to Verification ②③⑤⑥⑦ (dispatch ①④⑧ covered the retired distillation
+# dispatcher; D-78 retired that suite along with the dispatcher itself).
 #
 # ABSOLUTE: every case uses isolated MEM_STORE/MEM_PROJECTS (mktemp -d). NEVER writes real runtime memory.
 # This suite spawns NO `claude` (ISO-2): it exercises mem.py subcommands directly via `python3 "$MEM"`.

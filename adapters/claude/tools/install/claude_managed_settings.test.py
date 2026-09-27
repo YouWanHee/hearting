@@ -1,0 +1,1 @@
+../../../../tools/install/claude_managed_settings.test.py

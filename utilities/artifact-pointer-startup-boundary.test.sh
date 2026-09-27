@@ -70,35 +70,6 @@ done
 export CAIRN_READ_ENDPOINT="http://127.0.0.1:$(cat "$W5_STARTUP_TMP/http.port")/read"
 export CAIRN_READ_TOKEN="w5-startup-fixture-token"
 
-# The distiller uses a deterministic, no-network worker and a synchronous
-# governor shim. The dispatcher still exercises its real detached-child path;
-# strace follows it and the worker-owned call log proves completion.
-cat > "$W5_STARTUP_TMP/governor.py" <<'PY'
-import subprocess, sys
-cut = sys.argv.index("--")
-raise SystemExit(subprocess.run(sys.argv[cut + 1:]).returncode)
-PY
-cat > "$W5_STARTUP_TMP/distill-worker" <<'SH'
-#!/bin/sh
-printf '%s\n' "$1" >> "$W5_STARTUP_TMP/worker.calls"
-exit 0
-SH
-chmod 700 "$W5_STARTUP_TMP/distill-worker"
-export MEM_DISTILL_ENABLE=1 MEM_PERIODIC_CURATE_ENABLE=1
-export MEM_DISTILL_WORKER="$W5_STARTUP_TMP/distill-worker"
-export MODEL_WORKER_GOVERNOR="$W5_STARTUP_TMP/governor.py"
-export MEM_PY="$ROOT/tools/memory/mem.py" AGENT_HOME="$ROOT"
-export MEM_SESSION_SOURCE=codex CODEX_SESSIONS="$W5_STARTUP_TMP/codex-sessions"
-export MEM_PROJECTS="$W5_STARTUP_TMP/projects"
-export MEM_PERIODIC_CURATE_MAX_PROJECTS=1
-export MEM_PERIODIC_CURATE_PROJECT_TIMEOUT=10 MEM_PERIODIC_CURATE_TIMEOUT=10
-mkdir -p "$CODEX_SESSIONS" "$MEM_PROJECTS"
-cat > "$CODEX_SESSIONS/w5-startup.jsonl" <<'JSONL'
-{"timestamp":"2026-08-24T00:00:00Z","type":"event_msg","payload":{"type":"user_message","id":"w5-startup-user","message":"startup distill sentinel"}}
-JSONL
-encoded=$(printf '%s' "$ROOT" | sed 's#/#-#g')
-mkdir -p "$MEM_PROJECTS/$encoded"
-
 run_real() {
   mode=$1; shift
   out="$W5_STARTUP_TMP/$mode.out"
@@ -140,14 +111,6 @@ assert 0 < len(candidates) <= mem.CANDIDATE_MAX_RESULTS
 assert len(data) <= mem.CANDIDATE_MAX_UTF8_BYTES
 PY
 
-run_real distill bash "$ROOT/hooks/mem-distill-dispatch.sh" distill w5-startup "$ROOT"
-test "$(grep -c '^increment$' "$W5_STARTUP_TMP/worker.calls")" = 1
-test ! -d "$MEM_STORE/.distill-lock-w5-startup"
-
-run_real periodic-curate bash "$ROOT/utilities/mem-periodic-curate.sh"
-rg -q '^mem-periodic-curate project=.* status=complete$' "$W5_STARTUP_TMP/periodic-curate.err"
-test "$(grep -c '^curate$' "$W5_STARTUP_TMP/worker.calls")" = 1
-
 # Command-owned sentinels are all established before the zero-call assertions.
 test "$(cat "$path_count")" = 0
 test ! -s "$http_count"
@@ -168,4 +131,4 @@ http_pid=
 rm -rf -- "$W5_STARTUP_TMP"
 test ! -e "$W5_STARTUP_TMP"
 trap - EXIT HUP INT TERM
-echo "startup boundary: PASS (four real paths, three transport oracles, isolated telemetry, explicit cleanup)"
+echo "startup boundary: PASS (two real paths, three transport oracles, isolated telemetry, explicit cleanup)"

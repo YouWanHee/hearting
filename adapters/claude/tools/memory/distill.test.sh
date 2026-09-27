@@ -1,1 +1,0 @@
-../../../../tools/memory/distill.test.sh

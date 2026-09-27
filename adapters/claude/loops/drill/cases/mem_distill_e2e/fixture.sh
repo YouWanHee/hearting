@@ -1,1 +1,0 @@
-../../../../../../loops/drill/cases/mem_distill_e2e/fixture.sh

@@ -1,7 +1,5 @@
 {
-  "env": {
-    "MEM_DISTILL_ENABLE": "1"
-  },
+  "autoMemoryEnabled": false,
   "permissions": {
     "allow": [
       "Bash",
@@ -138,16 +136,6 @@
           {
             "type": "command",
             "command": "sh \"$HOME/.claude/hooks/stage-dispatch-reminder.sh\"",
-            "timeout": 10
-          }
-        ]
-      },
-      {
-        "matcher": "Write|Edit|MultiEdit",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "sh \"$HOME/.claude/hooks/builtin-memory-guard.sh\"",
             "timeout": 10
           }
         ]
@@ -355,16 +343,6 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"$HOME/.claude/hooks/mem-distill-dispatch.sh\"",
-            "timeout": 30
-          }
-        ]
-      },
-      {
-        "matcher": "*",
-        "hooks": [
-          {
-            "type": "command",
             "command": "python3 \"$HOME/.claude/hooks/material-route-guard.py\"",
             "timeout": 10
           }
@@ -487,15 +465,6 @@
           {
             "type": "command",
             "command": "python3 \"$HOME/.claude/hooks/dispatch-session-sweep.py\"",
-            "timeout": 10
-          }
-        ]
-      },
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash \"$HOME/.claude/hooks/mem-turn-nudge.sh\"",
             "timeout": 10
           }
         ]

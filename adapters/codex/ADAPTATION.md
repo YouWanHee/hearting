@@ -306,19 +306,16 @@ The `SessionStart` bridge keeps memory injection off by
 default because Codex `SessionStart` can run on startup, resume, clear, and
 compact; `CODEX_SESSION_MEMORY_INJECT=1` restores `memory` output as
 `hookSpecificOutput.additionalContext`. The `SessionEnd` bridge calls
-`session-end` for typed `mem sync --json` plus the verified automatic distill
-worker (default on; `CODEX_DISTILL_ENABLE=0` opt-out). It does not synthesize
+`session-end` for typed `mem sync --json` (D-78: no automatic distiller). It does not synthesize
 `MEM_DUMP_PUSH=1`: local sync remains the default, the user's
 `MEM_SYNC_REMOTE`/deprecated-alias environment passes through unchanged, and
 the alias can select only immutable protocol-v2 exchange, never a dump push.
-A nonzero sync class is reported and preserved after the bounded curator
-fallback rather than suppressing that fallback. The separate `Stop` bridge
-silently clears only an exact Fleet interaction marker. It never starts
-distillation, reads the dispatch registry, joins a child, or emits a blocking continuation. The
+A nonzero sync class is reported plainly. The separate `Stop` bridge
+silently clears only an exact Fleet interaction marker. It never
+reads the dispatch registry, joins a child, or emits a blocking continuation. The
 `UserPromptSubmit` bridge calls the portable capsule-only candidate bridge and
-`briefing` when they have content, a transition-only `token-budget ... hook`
-response, and
-the `turn-nudge` side effect. Token-budget output is byte-identical to Phase 1:
+`briefing` when they have content, and a transition-only `token-budget ... hook`
+response. Token-budget output is byte-identical to Phase 1:
 it is empty for normal, unknown, repeated-band, degraded/failure, and
 validated-native states; only entry into `tight`/`critical` adds one compact
 directive. The parent lifecycle records exactly one content-free receipt-derived
@@ -473,7 +470,6 @@ is observed.
 | local evidence exposure | Codex `SessionStart` runs the portable `hooks/local-evidence-inject.sh` presence probe for the session cwd: research/documents/analysis bucket counts plus at most nine newest entry paths from the canonical artifact root, round-robined across buckets and deduplicated per artifact (2,400-UTF-8-byte bound, no body reads, no prompt classifier, silent when empty, worker-exempt, fail-open). It moved off `UserPromptSubmit` in both directions: the block never changes between prompts, and `userprompt-lifecycle.py` fenced it at a 3-second subprocess timeout that a real store exceeded on every prompt, so Codex discarded the context silently rather than injecting it. `preflight.sh local-evidence [cwd]` is the manual path |
 | oncall briefing | Run `adapters/codex/bin/preflight.sh briefing [cwd]` before prompt handling on the dedicated agent desk |
 | loop guidance | Run `adapters/codex/bin/preflight.sh loop-info <oncall|note|study|drill|runtime-watch>` before following loop guides; Codex reports manual contracts, missing implementations, and drill auto-run restrictions without executing loop scripts. The `note` loop and note semantics are application-owned; the harness exposes only the optional app-neutral `artifact-sink` port |
-| memory distill | Transcript delta extraction exists via `adapters/codex/bin/preflight.sh distill-delta <session-id>`. The user-facing `distill-propose` stays an explicit opt-in preview (reports `status=tool-contract`, exits 69 until `CODEX_DISTILL_ENABLE=1`). The verified automatic distill worker remains owned by actual `SessionEnd` and `UserPromptSubmit` turn nudges: the `codex exec --sandbox read-only` worker is verified tool-free (see Distillation Boundary) and applies through `apply-distill-actions.py`; Stop has no distillation authority; opt out with `CODEX_DISTILL_ENABLE=0` |
 | worklog state signal | Run `adapters/codex/bin/preflight.sh worklog [cwd]` to inspect configured `<agent-notes-root>` / `<worklog-board-app>` paths read-only before Codex updates notes or diagnoses board state |
 | role profiles | Read `roles/README.md`, then run `adapters/codex/bin/preflight.sh role <portable-role|role-profile|pipeline-stage>` for behavioral-role or native-agent profile resolution. Registered routes separately seal `model_profile=deep|balanced-deep|light|mini`, resolved from the adapter config |
 | permission mapping | Run `adapters/codex/bin/preflight.sh permissions` to inspect the Codex approval/sandbox contract and confirm Claude `allowedTools` is unsupported |
@@ -581,7 +577,6 @@ adapter. That projection exposes only `.agents/plugins/marketplace.json` and
 `tools/` directory. The current allowlist is:
 
 - `memory/mem.py` (Codex-owned launcher for the shared memory CLI)
-- `memory/apply-distill-actions.py`
 - `memory/recall.sh` (Codex-owned launcher for recall)
 - `material/browser-fetch.sh` (Codex-owned launcher for rendered web page extraction)
 - `material/data-script.sh` (Codex-owned launcher for Python data-analysis scripts)
@@ -756,89 +751,6 @@ stream-json `result` events into the same three-line handoff contract. Codex
 liveness and harvest accept either registered harness while keeping runtime
 native subagents, Claude subagents, and agent-team sessions outside this parity
 claim.
-
-## Distillation Boundary
-
-Claude's adapter runs a detached `claude -p` worker with tool use denied by
-runtime flags. Codex has no equivalent no-tools worker flag, but a
-`codex exec --sandbox read-only` worker is physically tool-free (every write
-mechanism, shell or `apply_patch`, hits the OS read-only wall), so the adapter
-realizes the **same portable 2-tier distillation contract**
-(`core/MEMORY.md` §7, D-30/D-32) rather than only an add-only subset.
-
-The adapter reimplements the portable `hooks/mem-distill-dispatch.sh` pipeline in
-`adapters/codex/bin/distill-worker.sh` (the D-32 "reimplement + preserve" path).
-Crucially the **safety layers are the shared code, not a divergent copy**: `mem.py
-curate-snapshot` / `curate-artifacts` (snapshot + `IDS:` membership) and
-`tools/memory/apply-distill-actions.py --mode/--snapshot-ids` (the whitelist
-gate). Only the orchestration shell and the prompts are Codex-owned.
-
-**Who waits.** The worker itself runs synchronously; the hook-facing branch that
-calls it does not. Codex clamps the SessionEnd hook to 3 seconds whatever
-`hooks.json` declares — and says so at every session end — while a live curate
-measured 21.9s and the `mem sync` ahead of it measured 54.8s on the real store. So
-`preflight.sh session-end` and `turn-nudge` re-enter themselves through
-`detach_self` (`CODEX_PREFLIGHT_DETACHED=1 setsid nohup …`), return in milliseconds, and do
-the work outside the clock. Raising the declared timeout was tried in v2.128.0 and
-is inert.
-
-An earlier note here said the synchronous shape existed so a headless `codex exec`
-session could capture memory before exiting. It never did: both branches `exit 0`
-for a worker session several lines earlier (D-42 — a worker owns no sync/curator
-lifecycle), so that path was unreachable from the day it was written.
-
-Two tiers + one manual surface:
-
-1. `distill-delta` reads Codex JSONL session logs and emits transcript delta text.
-2. **turn-nudge = increment (mini tier via `config/models.conf`)** — add-only. The prompt
-   is add-only, and the shared applier now **enforces** add-only in `increment`
-   mode (id-mutations `prune/merge/graduate/reattribute/reinforce` are rejected
-   outside `curate`), so a prompt-injected transcript cannot bypass the snapshot
-   whitelist (P-25).
-3. **session-end = curate (light tier via `config/models.conf`)** — snapshot-grounded
-   `prune/merge/graduate/consolidate`. The worker captures the current-project
-   snapshot + artifact state, and id-mutations are gated by the `--snapshot-ids`
-   membership whitelist (`member()` in the shared applier). Per-mode model tiers
-   (P-36) override with `CODEX_DISTILL_MODEL` (global) /
-   `CODEX_DISTILL_MODEL_INCREMENT` / `CODEX_DISTILL_MODEL_CURATE` /
-   `AGENT_MODEL_FAST` / `AGENT_MODEL_DEEP`.
-4. `preflight.sh session-end` invokes the worker in `curate` mode and
-   `turn-nudge` in `increment` mode, both enabled by default
-   (`CODEX_DISTILL_ENABLE`/`CODEX_DISTILL_APPLY`/`CODEX_DISTILL_CONTRACT_ACCEPTED`
-   default to `1`, each overridable to `0`). Because session-end now realizes the
-   curate tier (not just add), **Codex matches Claude's automatic session-end
-   distillation on the curate axis** (both run increment+curate). The worker
-   advances the distill marker only after a successful apply (a preview or a
-   timed-out exec keeps the delta), holds a per-sid `mkdir` lock against
-   concurrent turn/session runs, and carries the `MEM_DISTILL` recursion guard at
-   both dispatch sites and inside the worker.
-5. User-facing `preflight.sh distill-propose` stays the **add-only manual
-   preview** surface: it reports `status=tool-contract` and exits 69 while
-   disabled, and with `CODEX_DISTILL_ENABLE=1` writes a JSON-lines proposal that
-   the shared applier consumes only when both `CODEX_DISTILL_APPLY=1` and
-   `CODEX_DISTILL_CONTRACT_ACCEPTED=1` are explicitly set. It never advances the
-   marker without applying.
-
-Verification (codex-cli 0.142.5):
-- Tool-free: an adversarial write probe under the exact worker flags
-  (`codex exec --sandbox read-only --ephemeral --ignore-rules`) proved tool-free
-  execution. Every model-attempted write — sentinel creation inside and outside
-  the working root, overwriting an existing file, and creating a new file —
-  failed with an OS-level `Read-only file system` error, so no write mechanism
-  (shell command or `apply_patch`) can mutate state.
-- No recursion: an isolated `CODEX_HOME` canary confirmed `codex exec` fires
-  `SessionStart` but not `SessionEnd` hooks, so the worker's exec cannot
-  re-trigger the session-end distill path. The `MEM_DISTILL=1` guard on the exec
-  call plus the `session-end`/worker `MEM_DISTILL` early-exit are defense in depth.
-- End-to-end: the enabled `preflight.sh session-end` against a throwaway store
-  applies distilled records from a real `codex exec` JSON-lines proposal through
-  the shared applier and terminates cleanly (no fork-bomb). Increment
-  add-only enforcement and curate `--snapshot-ids` membership are exercised by
-  `tools/memory/apply-distill-actions.py` unit coverage and
-  `hooks/portable-guards.test.sh`.
-
-Automatic session-end (curate) and turn-nudge (increment) distillation is
-therefore enabled by default; opt out by exporting `CODEX_DISTILL_ENABLE=0`.
 
 ## Worklog Boundary
 

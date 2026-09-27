@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # installed-layout-home.test.sh — F-2 (plan §6 Phase 1) 설치 레이아웃 워커 홈 해석 회귀.
-#   증명 대상: mem-distill-worker.sh / model-map.sh / worktree-cleanup.sh 가 설치 레이아웃
+#   증명 대상: model-map.sh / worktree-cleanup.sh 가 설치 레이아웃
 #   (~/.claude/bin, 고정 3단 hop 이 잘못된 루트를 잡는 위치)에서도 harness root 를 정확히
 #   찾는지. 두 픽스처 형태 (a) 디렉토리 심링크, (b) 실파일 복사 를 모두 검증한다.
 #   EXPECT_RED=1 이면 수정 전 코드의 실패를 단정하는 red 모드로 동작하고,
@@ -50,7 +50,7 @@ print("WT-BUNDLE")
 EOF
 chmod +x "$TMP/bundle/source/utilities/worktree-cleanup.py"
 
-for f in mem-distill-worker.sh model-map.sh worktree-cleanup.sh; do
+for f in model-map.sh worktree-cleanup.sh; do
   cp "$REPO_ROOT/adapters/claude/bin/$f" "$TMP/bundle/source/adapters/claude/bin/$f"
   chmod +x "$TMP/bundle/source/adapters/claude/bin/$f"
 done
@@ -93,8 +93,6 @@ EOF
 chmod +x "$TMP/release/utilities/worktree-cleanup.py"
 mkdir -p "$TMP/xdg/hearting"
 ln -s "$TMP/release" "$TMP/xdg/hearting/current"
-
-: > "$TMP/prompt.txt"
 
 # --- 형태 (a): 디렉토리 심링크 (현 실배포) ----------------------------------
 mkdir -p "$TMP/homeA/.claude"
@@ -179,11 +177,9 @@ assert_green_call() {  # $1=label $2=home $3...=command
 RED=${EXPECT_RED:-}
 
 if [ -n "$RED" ]; then
-  echo "== red mode (EXPECT_RED=1) — 실스크립트 3종 x 픽스처 2형태 = 6 단정 =="
-  assert_red "(a) mem-distill-worker.sh" "$TMP/homeA" 'CFG_LIFECYCLE_NUDGE' '' "$TMP/homeA/.claude/bin/mem-distill-worker.sh" increment fast-distiller "$TMP/prompt.txt"
+  echo "== red mode (EXPECT_RED=1) — 실스크립트 2종 x 픽스처 2형태 = 4 단정 =="
   assert_red "(a) model-map.sh"          "$TMP/homeA" 'CFG_ROLES_DEEP' '' "$TMP/homeA/.claude/bin/model-map.sh" 'deep maker'
   assert_red "(a) worktree-cleanup.sh"   "$TMP/homeA" 'worktree-cleanup\.py' "can't open file|No such file" "$TMP/homeA/.claude/bin/worktree-cleanup.sh" --help
-  assert_red "(b) mem-distill-worker.sh" "$TMP/homeB" 'CFG_LIFECYCLE_NUDGE' '' "$TMP/homeB/.claude/bin/mem-distill-worker.sh" increment fast-distiller "$TMP/prompt.txt"
   assert_red "(b) model-map.sh"          "$TMP/homeB" 'CFG_ROLES_DEEP' '' "$TMP/homeB/.claude/bin/model-map.sh" 'deep maker'
   assert_red "(b) worktree-cleanup.sh"   "$TMP/homeB" 'worktree-cleanup\.py' "can't open file|No such file" "$TMP/homeB/.claude/bin/worktree-cleanup.sh" --help
 
@@ -191,11 +187,9 @@ if [ -n "$RED" ]; then
   assert_red "(a) _legacy_probe.sh" "$TMP/homeA" 'CFG_LIFECYCLE_NUDGE' '' "$TMP/homeA/.claude/bin/_legacy_probe.sh"
   assert_red "(b) _legacy_probe.sh" "$TMP/homeB" 'CFG_LIFECYCLE_NUDGE' '' "$TMP/homeB/.claude/bin/_legacy_probe.sh"
 else
-  echo "== green mode — 실스크립트 3종 x 픽스처 2형태 = 6 단정 + 센티널 판별 =="
-  assert_green_call "(a) mem-distill-worker.sh" "$TMP/homeA" "$TMP/homeA/.claude/bin/mem-distill-worker.sh" increment fast-distiller "$TMP/prompt.txt"
+  echo "== green mode — 실스크립트 2종 x 픽스처 2형태 = 4 단정 + 센티널 판별 =="
   assert_green_call "(a) model-map.sh"          "$TMP/homeA" "$TMP/homeA/.claude/bin/model-map.sh" 'deep maker'
   assert_green_call "(a) worktree-cleanup.sh"   "$TMP/homeA" "$TMP/homeA/.claude/bin/worktree-cleanup.sh" --help
-  assert_green_call "(b) mem-distill-worker.sh" "$TMP/homeB" "$TMP/homeB/.claude/bin/mem-distill-worker.sh" increment fast-distiller "$TMP/prompt.txt"
   assert_green_call "(b) model-map.sh"          "$TMP/homeB" "$TMP/homeB/.claude/bin/model-map.sh" 'deep maker'
   assert_green_call "(b) worktree-cleanup.sh"   "$TMP/homeB" "$TMP/homeB/.claude/bin/worktree-cleanup.sh" --help
 
@@ -227,10 +221,6 @@ else
     *RELEASE-SENTINEL*) ok "partial AGENT_HOME: copy layout falls back to managed release model config" ;;
     *) bad "partial AGENT_HOME: copy layout did not reach release config: $_partial_map_b" ;;
   esac
-  assert_green_call "partial AGENT_HOME: worker symlink layout" "$TMP/homeA" \
-    env AGENT_HOME="$TMP/partial-agent-home" "$TMP/homeA/.claude/bin/mem-distill-worker.sh" increment fast-distiller "$TMP/prompt.txt"
-  assert_green_call "partial AGENT_HOME: worker copy layout" "$TMP/homeB" \
-    env AGENT_HOME="$TMP/partial-agent-home" "$TMP/homeB/.claude/bin/mem-distill-worker.sh" increment fast-distiller "$TMP/prompt.txt"
   _partial_wt_a=$(runenv_partial "$TMP/homeA" "$TMP/homeA/.claude/bin/worktree-cleanup.sh" --help 2>/dev/null)
   case "$_partial_wt_a" in
     *WT-BUNDLE*) ok "partial AGENT_HOME: cleanup symlink layout falls back to bundle" ;;
@@ -242,7 +232,7 @@ else
     *) bad "partial AGENT_HOME: cleanup copy layout did not reach release: $_partial_wt_b" ;;
   esac
 
-  for f in mem-distill-worker.sh model-map.sh worktree-cleanup.sh; do
+  for f in model-map.sh worktree-cleanup.sh; do
     if grep -q '_harness_root' "$REPO_ROOT/adapters/claude/bin/$f"; then
       ok "$f: _harness_root resolver present (drift guard)"
     else

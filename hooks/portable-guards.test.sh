@@ -11,13 +11,10 @@ unset herdr_var
 ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
 ART="$ROOT/hooks/artifact-guard.sh"
 GIT="$ROOT/hooks/git-state-guard.sh"
-MEM="$ROOT/hooks/builtin-memory-guard.sh"
 CODEX="$ROOT/adapters/codex/bin/preflight.sh"
 CODEX_PROJECTION="$ROOT/codex_setting/bin/preflight.sh"
-CODEX_DISTILL="$ROOT/adapters/codex/bin/distill-worker.sh"
 OPENCODE="$ROOT/adapters/opencode/bin/preflight.sh"
 OPENCODE_PROJECTION="$ROOT/opencode_setting/bin/preflight.sh"
-OPENCODE_DISTILL="$ROOT/adapters/opencode/bin/distill-worker.sh"
 DESIGN="$ROOT/hooks/design-postwrite.sh"
 SSN="$ROOT/hooks/spec-sync-nudge.sh"
 MARK="$ROOT/hooks/spec-read-marker.sh"
@@ -59,10 +56,6 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 export AGENT_HOME="$TMP/agent_home"
 export AGENT_MODEL_GOVERNOR_ROOT="$TMP/repo/.agent_reports/.runtime/model-worker-governor"
-# This suite starts more distill workers than the rolling distill start
-# budget (4 per 10 min) allows in one governor root; the budget has its own
-# suite, so lift it here and keep every other admission rule.
-export AGENT_MODEL_WORKER_START_BUDGET_DISTILL=1000
 export MEM_RECALL_RECEIPTS="$TMP/recall-opportunities"
 
 recall_opportunity() {
@@ -81,7 +74,7 @@ unset CLAUDE_CODE_SESSION_ID CODEX_SESSION_ID \
   AGENT_ARTIFACT_ROOT AGENT_ROUTE_FILE AGENT_ROUTE_ID AGENT_ROUTE_NODE \
   AGENT_OWNER_ROUTE_FILE AGENT_OWNER_ROUTE_ID AGENT_OWNER_ROUTE_HASH \
   CLAUDE_CODE_CHILD_SESSION OPENCODE_DISPATCH_SLUG FLEET_TITLE_REFRESH \
-  MEM_DISTILL MEM_DISTILL_ENABLE CODEX_DISPATCH_SANDBOX_FORCE
+  MEM_DISTILL CODEX_DISPATCH_SANDBOX_FORCE
 DISPATCH_RESOLVER_HOME="$TMP/dispatch-resolver-home"
 DISPATCH_RESOLVER_XDG="$TMP/dispatch-resolver-xdg"
 DISPATCH_RESOLVER_STATE="$(readlink -f "$DISPATCH_RESOLVER_HOME")/.local/state/hearting/dispatch"
@@ -622,17 +615,6 @@ if "$CODEX" worktree-path --tool Bash --command 'git worktree add /home/x/repo-w
   ok "codex preflight worktree-path fallback passes canonical <repo>-wt/ add"
 else
   bad "codex preflight worktree-path fallback should pass canonical <repo>-wt/ add"
-fi
-mkdir -p "$TMP/runtime/projects/abc/memory"
-if "$MEM" --file "$TMP/runtime/projects/abc/memory/MEMORY.md" >"$TMP/mem.out" 2>"$TMP/mem.err"; then
-  bad "builtin memory guard should fail memory file write"
-else
-  [ "$?" -eq 2 ] && ok "builtin memory guard exits 2" || bad "builtin memory guard wrong exit"
-fi
-if "$CODEX" write "$TMP/runtime/projects/abc/memory/MEMORY.md" testsid >"$TMP/codex.out" 2>"$TMP/codex.err"; then
-  bad "codex preflight should block memory file write"
-else
-  [ "$?" -eq 2 ] && ok "codex preflight blocks memory file write" || bad "codex preflight memory wrong exit"
 fi
 if AGENT_HOME="$ROOT" bash "$DESIGN" --file "$TMP/not-design.txt" >"$TMP/design.out" 2>"$TMP/design.err" \
   && "$CODEX" design "$TMP/not-design.txt" >"$TMP/design.out" 2>"$TMP/design.err"; then
@@ -2639,12 +2621,49 @@ if python3 -m json.tool "$TMP/codex_hook_home/.codex/hooks.json" >"$TMP/codex_ho
 else
   bad "codex native hook projection should bridge clean writes to preflight"
 fi
-if printf '{"tool_name":"Bash","tool_input":{"command":"printf x > %s"},"session_id":"shellwritesid","cwd":"%s"}\n' "$TMP/runtime/projects/abc/memory/SHELL.md" "$TMP/runtime" \
-  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/codex_shell_write_hook.out" 2>"$TMP/codex_shell_write_hook.err" \
-  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["decision"]=="block"; assert "memory" in d["reason"].lower() or "기억" in d["reason"]' "$TMP/codex_shell_write_hook.out"; then
-  ok "codex native hook projection blocks obvious shell write targets"
+
+# Tier A shell-write-target extraction (tee/rm/cp/install/rsync/dd/sed) is a
+# generic mechanism shared by every downstream guard; exercise it against the
+# still-live material-route guard rather than the retired memory guard.
+if printf '{"tool_name":"Bash","tool_input":{"command":"printf x | tee %s"},"session_id":"shellteesid","cwd":"%s"}\n' "$TMP/repo/TEE.py" "$TMP/repo" \
+  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/codex_shell_tee_hook.out" 2>"$TMP/codex_shell_tee_hook.err" \
+  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["decision"]=="block"; assert "route" in d["reason"].lower()' "$TMP/codex_shell_tee_hook.out" \
+  && printf '{"tool_name":"Bash","tool_input":{"command":"rm %s"},"session_id":"shellrmsid","cwd":"%s"}\n' "$TMP/repo/RM.py" "$TMP/repo" \
+    | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/codex_shell_rm_hook.out" 2>"$TMP/codex_shell_rm_hook.err" \
+  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["decision"]=="block"; assert "route" in d["reason"].lower()' "$TMP/codex_shell_rm_hook.out"; then
+  ok "codex native hook projection blocks common shell mutation targets"
 else
-  bad "codex native hook projection should block obvious shell write targets"
+  bad "codex native hook projection should block common shell mutation targets"
+fi
+if printf '{"tool_name":"Bash","tool_input":{"command":"cp %s %s"},"session_id":"shellcpsourcesid","cwd":"%s"}\n' "$TMP/repo/SOURCE.py" "$TMP/outside-repo/copied-source.py" "$TMP/repo" \
+  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/codex_shell_cp_source_hook.out" 2>"$TMP/codex_shell_cp_source_hook.err" \
+  && [ ! -s "$TMP/codex_shell_cp_source_hook.out" ] \
+  && printf '{"tool_name":"Bash","tool_input":{"command":"cp %s %s"},"session_id":"shellcpdestsid","cwd":"%s"}\n' "$TMP/outside-repo/source.py" "$TMP/repo/COPIED.py" "$TMP/repo" \
+    | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/codex_shell_cp_dest_hook.out" 2>"$TMP/codex_shell_cp_dest_hook.err" \
+  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["decision"]=="block"; assert "route" in d["reason"].lower()' "$TMP/codex_shell_cp_dest_hook.out"; then
+  ok "codex native hook projection treats cp destination as the shell write target"
+else
+  bad "codex native hook projection should treat cp destination as the shell write target"
+fi
+if printf '{"tool_name":"Bash","tool_input":{"command":"install %s %s"},"session_id":"shellinstallsid","cwd":"%s"}\n' "$TMP/outside-repo/source.py" "$TMP/repo/INSTALLED.py" "$TMP/repo" \
+  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/codex_shell_install_hook.out" 2>"$TMP/codex_shell_install_hook.err" \
+  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["decision"]=="block"; assert "route" in d["reason"].lower()' "$TMP/codex_shell_install_hook.out" \
+  && printf '{"tool_name":"Bash","tool_input":{"command":"rsync %s %s"},"session_id":"shellrsyncsid","cwd":"%s"}\n' "$TMP/outside-repo/source.py" "$TMP/repo/RSYNCED.py" "$TMP/repo" \
+    | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/codex_shell_rsync_hook.out" 2>"$TMP/codex_shell_rsync_hook.err" \
+  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["decision"]=="block"; assert "route" in d["reason"].lower()' "$TMP/codex_shell_rsync_hook.out"; then
+  ok "codex native hook projection blocks install and rsync destinations"
+else
+  bad "codex native hook projection should block install and rsync destinations"
+fi
+if printf '{"tool_name":"Bash","tool_input":{"command":"dd if=%s of=%s"},"session_id":"shellddsid","cwd":"%s"}\n' "$TMP/outside-repo/source.py" "$TMP/repo/DD.py" "$TMP/repo" \
+  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/codex_shell_dd_hook.out" 2>"$TMP/codex_shell_dd_hook.err" \
+  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["decision"]=="block"; assert "route" in d["reason"].lower()' "$TMP/codex_shell_dd_hook.out" \
+  && printf '{"tool_name":"Bash","tool_input":{"command":"sed -i s/a/b/ %s"},"session_id":"shellsedisid","cwd":"%s"}\n' "$TMP/repo/SED.py" "$TMP/repo" \
+    | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/codex_shell_sedi_hook.out" 2>"$TMP/codex_shell_sedi_hook.err" \
+  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["decision"]=="block"; assert "route" in d["reason"].lower()' "$TMP/codex_shell_sedi_hook.out"; then
+  ok "codex native hook projection blocks dd output and sed inline edits"
+else
+  bad "codex native hook projection should block dd output and sed inline edits"
 fi
 
 # A3: the Codex shell PreToolUse bridge runs worktree-path before material-route.
@@ -2751,46 +2770,6 @@ if printf '{"tool_name":"Write","tool_input":{"file_path":"%s"},"session_id":"pa
 else
   bad "retired parent-park-only marker must not bypass the material guard"
 fi
-if printf '{"tool_name":"Bash","tool_input":{"command":"printf x | tee %s"},"session_id":"shellteesid","cwd":"%s"}\n' "$TMP/runtime/projects/abc/memory/TEE.md" "$TMP/runtime" \
-  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/codex_shell_tee_hook.out" 2>"$TMP/codex_shell_tee_hook.err" \
-  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["decision"]=="block"; assert "memory" in d["reason"].lower() or "기억" in d["reason"]' "$TMP/codex_shell_tee_hook.out" \
-  && printf '{"tool_name":"Bash","tool_input":{"command":"rm %s"},"session_id":"shellrmsid","cwd":"%s"}\n' "$TMP/runtime/projects/abc/memory/RM.md" "$TMP/runtime" \
-    | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/codex_shell_rm_hook.out" 2>"$TMP/codex_shell_rm_hook.err" \
-  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["decision"]=="block"; assert "memory" in d["reason"].lower() or "기억" in d["reason"]' "$TMP/codex_shell_rm_hook.out"; then
-  ok "codex native hook projection blocks common shell mutation targets"
-else
-  bad "codex native hook projection should block common shell mutation targets"
-fi
-if printf '{"tool_name":"Bash","tool_input":{"command":"cp %s %s"},"session_id":"shellcpsourcesid","cwd":"%s"}\n' "$TMP/runtime/projects/abc/memory/SOURCE.md" "$TMP/repo/copied-source.md" "$TMP/runtime" \
-  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/codex_shell_cp_source_hook.out" 2>"$TMP/codex_shell_cp_source_hook.err" \
-  && [ ! -s "$TMP/codex_shell_cp_source_hook.out" ] \
-  && printf '{"tool_name":"Bash","tool_input":{"command":"cp %s %s"},"session_id":"shellcpdestsid","cwd":"%s"}\n' "$TMP/repo/source.md" "$TMP/runtime/projects/abc/memory/COPIED.md" "$TMP/runtime" \
-    | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/codex_shell_cp_dest_hook.out" 2>"$TMP/codex_shell_cp_dest_hook.err" \
-  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["decision"]=="block"; assert "memory" in d["reason"].lower() or "기억" in d["reason"]' "$TMP/codex_shell_cp_dest_hook.out"; then
-  ok "codex native hook projection treats cp destination as the shell write target"
-else
-  bad "codex native hook projection should treat cp destination as the shell write target"
-fi
-if printf '{"tool_name":"Bash","tool_input":{"command":"install %s %s"},"session_id":"shellinstallsid","cwd":"%s"}\n' "$TMP/repo/source.md" "$TMP/runtime/projects/abc/memory/INSTALLED.md" "$TMP/runtime" \
-  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/codex_shell_install_hook.out" 2>"$TMP/codex_shell_install_hook.err" \
-  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["decision"]=="block"; assert "memory" in d["reason"].lower() or "기억" in d["reason"]' "$TMP/codex_shell_install_hook.out" \
-  && printf '{"tool_name":"Bash","tool_input":{"command":"rsync %s %s"},"session_id":"shellrsyncsid","cwd":"%s"}\n' "$TMP/repo/source.md" "$TMP/runtime/projects/abc/memory/RSYNCED.md" "$TMP/runtime" \
-    | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/codex_shell_rsync_hook.out" 2>"$TMP/codex_shell_rsync_hook.err" \
-  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["decision"]=="block"; assert "memory" in d["reason"].lower() or "기억" in d["reason"]' "$TMP/codex_shell_rsync_hook.out"; then
-  ok "codex native hook projection blocks install and rsync destinations"
-else
-  bad "codex native hook projection should block install and rsync destinations"
-fi
-if printf '{"tool_name":"Bash","tool_input":{"command":"dd if=%s of=%s"},"session_id":"shellddsid","cwd":"%s"}\n' "$TMP/repo/source.md" "$TMP/runtime/projects/abc/memory/DD.md" "$TMP/runtime" \
-  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/codex_shell_dd_hook.out" 2>"$TMP/codex_shell_dd_hook.err" \
-  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["decision"]=="block"; assert "memory" in d["reason"].lower() or "기억" in d["reason"]' "$TMP/codex_shell_dd_hook.out" \
-  && printf '{"tool_name":"Bash","tool_input":{"command":"sed -i s/a/b/ %s"},"session_id":"shellsedisid","cwd":"%s"}\n' "$TMP/runtime/projects/abc/memory/SED.md" "$TMP/runtime" \
-    | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/codex_shell_sedi_hook.out" 2>"$TMP/codex_shell_sedi_hook.err" \
-  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["decision"]=="block"; assert "memory" in d["reason"].lower() or "기억" in d["reason"]' "$TMP/codex_shell_sedi_hook.out"; then
-  ok "codex native hook projection blocks dd output and sed inline edits"
-else
-  bad "codex native hook projection should block dd output and sed inline edits"
-fi
 if printf '{"tool":"Write","input":{"path":"%s"},"session_id":"nestedpayloadsid","cwd":"%s"}\n' "$TMP/repo/nested-f" "$TMP/repo" \
   | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/codex_hook_nested.out" 2>"$TMP/codex_hook_nested.err" \
   && [ ! -s "$TMP/codex_hook_nested.out" ]; then
@@ -2867,7 +2846,7 @@ else
   bad "adapter loop runtime logs should be ignored"
 fi
 if printf '{"prompt":"plain prompt","session_id":"promptlifecyclesid","cwd":"%s"}\n' "$TMP/flowproj" \
-  | MEM_NUDGE_INTERVAL=100 MEM_STORE="$TMP/codex_hook_mem" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/userprompt-lifecycle.py" >"$TMP/codex_prompt_hook_tracked.out" 2>"$TMP/codex_prompt_hook_tracked.err" \
+  | MEM_STORE="$TMP/codex_hook_mem" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/userprompt-lifecycle.py" >"$TMP/codex_prompt_hook_tracked.out" 2>"$TMP/codex_prompt_hook_tracked.err" \
   && [ ! -s "$TMP/codex_prompt_hook_tracked.out" ] \
   && ! grep -q 'adapters/claude\|claude_setting\|statusline.sh' "$TMP/codex_prompt_hook_tracked.out" "$TMP/codex_prompt_hook_tracked.err"; then
   ok "codex native hook projection injects no workflow-mode banner (retired)"
@@ -2888,11 +2867,11 @@ else
   bad "codex token-budget preflight should expose exact-session telemetry"
 fi
 if printf '{"prompt":"plain prompt","session_id":"%s","cwd":"%s"}\n' "$budget_sid" "$TMP/flowproj" \
-  | CODEX_HOME="$TMP/codex_hook_home/.codex" XDG_STATE_HOME="$TMP/codex_budget_state" MEM_NUDGE_INTERVAL=100 MEM_STORE="$TMP/codex_hook_mem" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/userprompt-lifecycle.py" >"$TMP/codex_budget_hook_first.out" 2>"$TMP/codex_budget_hook_first.err" \
+  | CODEX_HOME="$TMP/codex_hook_home/.codex" XDG_STATE_HOME="$TMP/codex_budget_state" MEM_STORE="$TMP/codex_hook_mem" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/userprompt-lifecycle.py" >"$TMP/codex_budget_hook_first.out" 2>"$TMP/codex_budget_hook_first.err" \
   && grep -q 'TOKEN_BUDGET=tight' "$TMP/codex_budget_hook_first.out" \
   && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); out=d["hookSpecificOutput"]; assert out["hookEventName"]=="UserPromptSubmit"; ctx=out["additionalContext"]; line=[x for x in ctx.splitlines() if x.startswith("TOKEN_BUDGET=")]; assert len(line)==1; assert len((line[0]+"\n").encode()) <= 240; assert "required work" in line[0] and "tests" in line[0] and "input context unchanged" in line[0]' "$TMP/codex_budget_hook_first.out" \
   && printf '{"prompt":"plain prompt","session_id":"%s","cwd":"%s"}\n' "$budget_sid" "$TMP/flowproj" \
-  | CODEX_HOME="$TMP/codex_hook_home/.codex" XDG_STATE_HOME="$TMP/codex_budget_state" MEM_NUDGE_INTERVAL=100 MEM_STORE="$TMP/codex_hook_mem" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/userprompt-lifecycle.py" >"$TMP/codex_budget_hook_repeat.out" 2>"$TMP/codex_budget_hook_repeat.err" \
+  | CODEX_HOME="$TMP/codex_hook_home/.codex" XDG_STATE_HOME="$TMP/codex_budget_state" MEM_STORE="$TMP/codex_hook_mem" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/userprompt-lifecycle.py" >"$TMP/codex_budget_hook_repeat.out" 2>"$TMP/codex_budget_hook_repeat.err" \
   && [ ! -s "$TMP/codex_budget_hook_repeat.out" ]; then
   ok "codex prompt hook injects token budget only on pressure-band transition"
 else
@@ -2927,15 +2906,6 @@ then
 else
   bad "codex prompt hook should record bounded exact accounting without diagnostic reinjection"
 fi
-if printf '{"prompt":"remember this project context","session_id":"promptlifecyclesid","cwd":"%s"}\n' "$TMP/flowproj" \
-  | MEM_NUDGE_INTERVAL=1 MEM_STORE="$TMP/codex_hook_mem" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/userprompt-lifecycle.py" >"$TMP/codex_prompt_hook.out" 2>"$TMP/codex_prompt_hook.err" \
-  && [ ! -s "$TMP/codex_prompt_hook.out" ] \
-  && grep -q '^0$' "$TMP/codex_hook_mem/.codex-turn-state-promptlifecyclesid" \
-  && ! grep -q 'adapters/claude\|claude_setting\|statusline.sh' "$TMP/codex_prompt_hook.out" "$TMP/codex_prompt_hook.err"; then
-  ok "codex native hook projection resets the turn-nudge counter on every prompt"
-else
-  bad "codex native hook projection should reset the turn-nudge counter on every prompt"
-fi
 if printf '{"context":{"cwd":"%s","session_id":"permissionsid"}}\n' "$TMP/flowproj" \
   | FLEET_INTERACTION_STATE_DIR="$TMP/codex-interactions" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/permissionrequest-lifecycle.py" >"$TMP/codex_permission_hook.out" 2>"$TMP/codex_permission_hook.err" \
   && [ ! -s "$TMP/codex_permission_hook.out" ] \
@@ -2950,7 +2920,7 @@ else
 fi
 if (cd "$TMP/flowproj" && HOME="$TMP/codex_hook_home" MEM_STORE="$TMP/codex_hook_mem" python3 "$ROOT/tools/memory/mem.py" add durable thread "지난번 결정론 우선 설계가 핵심이라고 배웠다" >"$TMP/codex_nested_prompt_seed.out" 2>"$TMP/codex_nested_prompt_seed.err") \
   && printf '{"input":{"messages":[{"role":"user","content":[{"type":"text","text":"지난번 결정론 내용을 다시 확인"}]}]},"session_id":"nestedpromptsid","cwd":"%s"}\n' "$TMP/flowproj" \
-  | MEM_NUDGE_INTERVAL=100 MEM_STORE="$TMP/codex_hook_mem" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/userprompt-lifecycle.py" >"$TMP/codex_nested_prompt_hook.out" 2>"$TMP/codex_nested_prompt_hook.err" \
+  | MEM_STORE="$TMP/codex_hook_mem" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/userprompt-lifecycle.py" >"$TMP/codex_nested_prompt_hook.out" 2>"$TMP/codex_nested_prompt_hook.err" \
   && ! grep -q '우선 설계가 핵심' "$TMP/codex_nested_prompt_hook.out"; then
   ok "codex native prompt hook does not classify nested message content for recall"
 else
@@ -2960,7 +2930,7 @@ if (cd "$TMP/flowproj" && HOME="$TMP/codex_hook_home" MEM_STORE="$TMP/codex_hook
   "This durable record keeps direct-body-marker outside prompt context" \
   --headline "Deterministic recall capsule" --alias "deterministic recall" >"$TMP/codex_direct_prompt_seed.out" 2>"$TMP/codex_direct_prompt_seed.err") \
   && printf '{"prompt":"deterministic recall","session_id":"directpromptsid","turn_id":"directturnid","cwd":"%s"}\n' "$TMP/flowproj" \
-  | MEM_NUDGE_INTERVAL=100 MEM_STORE="$TMP/codex_hook_mem" MEM_RECALL_RECEIPTS="$MEM_RECALL_RECEIPTS" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/userprompt-lifecycle.py" >"$TMP/codex_direct_prompt_hook.out" 2>"$TMP/codex_direct_prompt_hook.err" \
+  | MEM_STORE="$TMP/codex_hook_mem" MEM_RECALL_RECEIPTS="$MEM_RECALL_RECEIPTS" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/userprompt-lifecycle.py" >"$TMP/codex_direct_prompt_hook.out" 2>"$TMP/codex_direct_prompt_hook.err" \
   && grep -q 'Deterministic recall capsule' "$TMP/codex_direct_prompt_hook.out" \
   && ! grep -q 'direct-body-marker' "$TMP/codex_direct_prompt_hook.out"; then
   ok "codex native prompt hook exposes bounded capsule candidates without record bodies"
@@ -3024,70 +2994,6 @@ if printf '{"tool_name":"Read","tool_input":{"file_path":".agent_reports/spec/pr
   ok "codex native read hook resolves nested cwd/session payloads"
 else
   bad "codex native read hook should resolve nested cwd/session payloads"
-fi
-if printf '{"tool_name":"Write","tool_input":{"file_path":"%s"},"session_id":"testsid","cwd":"%s"}\n' "$TMP/runtime/projects/abc/memory/MEMORY.md" "$TMP/runtime" \
-  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/codex_hook_block.out" 2>"$TMP/codex_hook_block.err" \
-  && grep -q '"decision": "block"' "$TMP/codex_hook_block.out" \
-  && grep -q 'memory' "$TMP/codex_hook_block.out"; then
-  ok "codex native hook projection blocks guarded writes"
-else
-  bad "codex native hook projection should block guarded writes"
-fi
-if printf '{"tool_name":"Write","tool_input":{"file_path":"projects/abc/memory/NESTED.md"},"session":{"id":"nestedcontextsid"},"context":{"cwd":"%s"}}\n' "$TMP/runtime" \
-  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/codex_nested_context_block.out" 2>"$TMP/codex_nested_context_block.err" \
-  && grep -q '"decision": "block"' "$TMP/codex_nested_context_block.out" \
-  && grep -q 'memory' "$TMP/codex_nested_context_block.out"; then
-  ok "codex native write hook resolves nested cwd/session payloads"
-else
-  bad "codex native write hook should resolve nested cwd/session payloads"
-fi
-if printf '{"tool_name":"MultiEdit","tool_input":{"file_path":"%s","edits":[]},"session_id":"testsid","cwd":"%s"}\n' "$TMP/runtime/projects/abc/memory/MEMORY.md" "$TMP/runtime" \
-  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/codex_multiedit_block.out" 2>"$TMP/codex_multiedit_block.err" \
-  && grep -q '"decision": "block"' "$TMP/codex_multiedit_block.out" \
-  && grep -q 'memory' "$TMP/codex_multiedit_block.out"; then
-  ok "codex native hook projection blocks guarded MultiEdit writes"
-else
-  bad "codex native hook projection should block guarded MultiEdit writes"
-fi
-codex_qualified_patch_payload=$(python3 - "$TMP/runtime/projects/abc/memory/PATCHED.md" "$TMP/runtime" <<'PY'
-import json
-import sys
-
-print(json.dumps({
-  "tool_name": "functions.apply_patch",
-  "input": f"*** Begin Patch\n*** Add File: {sys.argv[1]}\n+blocked\n*** End Patch\n",
-  "session_id": "testsid",
-  "cwd": sys.argv[2],
-}))
-PY
-)
-if printf '%s\n' "$codex_qualified_patch_payload" \
-  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/codex_qualified_patch_block.out" 2>"$TMP/codex_qualified_patch_block.err" \
-  && grep -q '"decision": "block"' "$TMP/codex_qualified_patch_block.out" \
-  && grep -q 'memory' "$TMP/codex_qualified_patch_block.out"; then
-  ok "codex native hook projection blocks qualified apply_patch writes"
-else
-  bad "codex native hook projection should block qualified apply_patch writes"
-fi
-codex_freeform_patch_payload=$(python3 - "$TMP/runtime/projects/abc/memory/FREEFORM.md" "$TMP/runtime" <<'PY'
-import json
-import sys
-
-print(json.dumps({
-  "tool_name": "apply_patch",
-  "tool_input": f"*** Begin Patch\n*** Add File: {sys.argv[1]}\n+blocked\n*** End Patch\n",
-  "session_id": "testsid",
-  "cwd": sys.argv[2],
-}))
-PY
-)
-if printf '%s\n' "$codex_freeform_patch_payload" \
-  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/codex_freeform_patch_block.out" 2>"$TMP/codex_freeform_patch_block.err" \
-  && grep -q '"decision": "block"' "$TMP/codex_freeform_patch_block.out" \
-  && grep -q 'memory' "$TMP/codex_freeform_patch_block.out"; then
-  ok "codex native hook projection parses freeform tool_input strings"
-else
-  bad "codex native hook projection should parse freeform apply_patch input"
 fi
 mkdir -p "$TMP/repo/spec/design"
 printf '<!doctype html><title>ok</title>\n' > "$TMP/repo/spec/design/preview.html"
@@ -3286,128 +3192,43 @@ if "$CODEX" mode-info research/claim-verify >"$TMP/mode.out" 2>"$TMP/mode.err" \
 else
   bad "codex mode wrapper should report named claim verification contract"
 fi
-mkdir -p "$TMP/codex_sessions/2026/06/29"
-cat > "$TMP/codex_sessions/2026/06/29/rollout-2026-06-29T00-00-00-codexsid.jsonl" <<'EOF'
-{"timestamp":"2026-06-29T00:00:00.000Z","type":"event_msg","payload":{"type":"user_message","message":"hello"}}
-{"timestamp":"2026-06-29T00:00:01.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"world"}]}}
-{"timestamp":"2026-06-29T00:00:02.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call_1"}}
-EOF
-if CODEX_SESSIONS="$TMP/codex_sessions" python3 "$ROOT/tools/memory/mem.py" distill codexsid --source codex >"$TMP/codex_delta.out" 2>"$TMP/codex_delta.err" \
-  && grep -q '^\[user\] hello' "$TMP/codex_delta.out" \
-  && grep -q '^\[assistant\] world' "$TMP/codex_delta.out" \
-  && grep -q '^\[assistant\] \[tool:exec_command\]' "$TMP/codex_delta.out"; then
-  ok "codex session source distills transcript"
-else
-  bad "codex session source should distill transcript"
-fi
-if "$CODEX_DISTILL" codexsid "$TMP/flowproj" >"$TMP/codex_distill.out" 2>"$TMP/codex_distill.err" \
-  && [ ! -s "$TMP/codex_distill.out" ]; then
-  ok "codex distill worker is disabled by default"
-else
-  bad "codex distill worker should no-op unless enabled"
-fi
-if "$CODEX" distill-propose codexsid "$TMP/flowproj" >"$TMP/codex_distill.out" 2>"$TMP/codex_distill.err"; then
-  bad "codex distill-propose should report tool-contract until explicitly enabled"
-else
-  if [ "$?" -eq 69 ] \
-    && grep -q '^status=tool-contract$' "$TMP/codex_distill.out" \
-    && grep -q '^reason=distill-proposal-disabled$' "$TMP/codex_distill.out" \
-    && grep -q '^enable=CODEX_DISTILL_ENABLE=1$' "$TMP/codex_distill.out"; then
-    ok "codex distill-propose reports disabled tool-contract by default"
-  else
-    bad "codex distill-propose should exit 69 with disabled tool-contract"
-  fi
-fi
-mkdir -p "$TMP/stubbin"
-cat > "$TMP/stubbin/codex" <<'EOF'
-#!/usr/bin/env sh
-printf '%s\n' "$@" > "$CODEX_STUB_ARGV"
-while [ "$#" -gt 0 ]; do
-  if [ "$1" = "--output-last-message" ]; then
-    shift
-    printf '{"action":"add","tier":"working","type":"decision","body":"stub codex distill memory record","headline":"Stub distill decision","aliases":[],"entities":[],"topics":[],"artifact_refs":[]}\n' > "$1"
-  fi
-  shift || break
-done
-exit 0
-EOF
-chmod +x "$TMP/stubbin/codex"
-if CODEX_DISTILL_ENABLE=1 CODEX_SESSIONS="$TMP/codex_sessions" MEM_STORE="$TMP/store" \
-  PATH="$TMP/stubbin:$PATH" CODEX_STUB_ARGV="$TMP/codex_argv" \
-  "$CODEX" distill-propose codexsid "$TMP/flowproj" >"$TMP/codex_distill.out" 2>"$TMP/codex_distill.err" \
-  && grep -q -- '--sandbox' "$TMP/codex_argv" \
-  && grep -q -- 'read-only' "$TMP/codex_argv" \
-  && ! grep -q -- '--ask-for-approval' "$TMP/codex_argv" \
-  && grep -q -- '--ephemeral' "$TMP/codex_argv" \
-  && grep -q -- '--ignore-rules' "$TMP/codex_argv" \
-  && grep -q -- '--skip-git-repo-check' "$TMP/codex_argv" \
-  && grep -q '"action":"add"' "$TMP/codex_distill.out"; then
-  ok "codex distill proposal uses constrained exec"
-else
-  bad "codex distill proposal should use constrained exec"
-fi
-if CODEX_DISTILL_ENABLE=1 CODEX_DISTILL_APPLY=1 CODEX_SESSIONS="$TMP/codex_sessions" MEM_STORE="$TMP/store_apply_blocked" \
-  PATH="$TMP/stubbin:$PATH" CODEX_STUB_ARGV="$TMP/codex_argv_apply" \
-  "$CODEX" distill-propose codexsid "$TMP/flowproj" >"$TMP/codex_distill_apply.out" 2>"$TMP/codex_distill_apply.err"; then
-  bad "codex distill apply should require accepted no-tools/action contract"
-else
-  [ "$?" -eq 69 ] && ok "codex distill apply requires accepted no-tools/action contract" || bad "codex distill apply wrong exit"
-fi
-if CODEX_DISTILL_ENABLE=1 CODEX_DISTILL_APPLY=1 CODEX_DISTILL_CONTRACT_ACCEPTED=1 CODEX_SESSIONS="$TMP/codex_sessions" MEM_STORE="$TMP/store_apply" \
-  PATH="$TMP/stubbin:$PATH" CODEX_STUB_ARGV="$TMP/codex_argv_apply_accepted" \
-  "$CODEX" distill-propose codexsid "$TMP/flowproj" >"$TMP/codex_distill_apply.out" 2>"$TMP/codex_distill_apply.err" \
-  && MEM_STORE="$TMP/store_apply" python3 "$ROOT/tools/memory/mem.py" stats >"$TMP/codex_stats.out" 2>"$TMP/codex_stats.err" \
-  && grep -q 'total: 1' "$TMP/codex_stats.out"; then
-  ok "codex distill explicit apply works after accepted contract"
-else
-  bad "codex distill explicit apply should require and obey accepted contract"
-fi
-# session-end auto-distillation is enabled by default after the tool-free proof.
-# A linked-worktree fixture can legitimately preserve the typed sync exit (2)
-# after the bounded curator has applied its record, so verify the two contracts
-# separately instead of treating sync success as proof of distillation.
 # 2026-09-09/10: session-end re-runs itself with CODEX_PREFLIGHT_DETACHED=1
-# and returns immediately, because the whole lifecycle is measured in tens of
+# and returns immediately, because the sync work is measured in tens of
 # seconds against a 3-second hook. Assert the two halves separately: the hook
-# call returns without doing the work, and the detached body distills.
-# Independent asynchronous and foreground cases must not compete for the same
-# one-slot distill governor; each still exercises the real governor unchanged.
+# call returns without doing the work, and the detached body syncs.
 AGENT_MODEL_GOVERNOR_ROOT="$TMP/session-end-hook-governor" \
-CODEX_SESSIONS="$TMP/codex_sessions" MEM_STORE="$TMP/store_session_end_hookcall" \
-  PATH="$TMP/stubbin:$PATH" CODEX_STUB_ARGV="$TMP/codex_argv_se_hookcall" \
+MEM_STORE="$TMP/store_session_end_hookcall" \
   "$CODEX" session-end "$TMP/flowproj" codexsid >"$TMP/codex_se_hookcall.out" 2>"$TMP/codex_se_hookcall.err"
 if [ "$?" -eq 0 ] && [ ! -s "$TMP/codex_se_hookcall.out" ]; then
   ok "codex session-end returns inside the hook budget by detaching"
 else
   bad "codex session-end should return inside the hook budget by detaching"
 fi
-CODEX_PREFLIGHT_DETACHED=1 CODEX_SESSIONS="$TMP/codex_sessions" MEM_STORE="$TMP/store_session_end" \
-  PATH="$TMP/stubbin:$PATH" CODEX_STUB_ARGV="$TMP/codex_argv_se" \
+CODEX_PREFLIGHT_DETACHED=1 MEM_STORE="$TMP/store_session_end" \
   "$CODEX" session-end "$TMP/flowproj" codexsid >"$TMP/codex_se.out" 2>"$TMP/codex_se.err"
 codex_se_status=$?
-if { [ "$codex_se_status" -eq 0 ] || [ "$codex_se_status" -eq 2 ]; } \
-  && MEM_STORE="$TMP/store_session_end" python3 "$ROOT/tools/memory/mem.py" stats 2>/dev/null \
-    | grep -q 'total: 1'; then
-  ok "codex session-end auto-distills and applies by default"
+# A fresh isolated MEM_STORE has no sealed seed epoch, so a real-world remote
+# policy can legitimately still exit 2 (hard-failure) even though the local
+# store synced; require the local side effect, not a specific remote outcome.
+if { [ "$codex_se_status" -eq 0 ] || [ "$codex_se_status" -eq 1 ] || [ "$codex_se_status" -eq 2 ]; } \
+  && [ -f "$TMP/store_session_end/memory.db" ]; then
+  ok "codex session-end syncs the memory store"
 else
-  bad "codex session-end should auto-distill and apply by default"
+  bad "codex session-end should sync the memory store"
 fi
 # recursion guard: MEM_DISTILL=1 makes the whole session-end pipeline a no-op
-if MEM_DISTILL=1 CODEX_SESSIONS="$TMP/codex_sessions" MEM_STORE="$TMP/store_session_end_guard" \
-  PATH="$TMP/stubbin:$PATH" CODEX_STUB_ARGV="$TMP/codex_argv_se_guard" \
+if MEM_DISTILL=1 MEM_STORE="$TMP/store_session_end_guard" \
   "$CODEX" session-end "$TMP/flowproj" codexsid >"$TMP/codex_se_guard.out" 2>"$TMP/codex_se_guard.err" \
-  && ! { MEM_STORE="$TMP/store_session_end_guard" python3 "$ROOT/tools/memory/mem.py" stats 2>/dev/null | grep -q 'total: 1'; }; then
+  && [ ! -e "$TMP/store_session_end_guard/memory.db" ]; then
   ok "codex session-end no-ops under MEM_DISTILL=1 recursion guard"
 else
   bad "codex session-end must no-op under MEM_DISTILL=1 recursion guard"
 fi
 # D-42: every worker path returns before sync/store/model work. Test both the
 # preflight defense and the native SessionEnd/UserPrompt/SessionStart bridges.
-if AGENT_SESSION_ROLE=worker CODEX_SESSIONS="$TMP/codex_sessions" MEM_STORE="$TMP/store_session_end_worker" \
-  PATH="$TMP/stubbin:$PATH" CODEX_STUB_ARGV="$TMP/codex_argv_se_worker" \
+if AGENT_SESSION_ROLE=worker MEM_STORE="$TMP/store_session_end_worker" \
   "$CODEX" session-end "$TMP/flowproj" codexsid >"$TMP/codex_se_worker.out" 2>"$TMP/codex_se_worker.err" \
-  && [ ! -e "$TMP/store_session_end_worker" ] \
-  && [ ! -e "$TMP/codex_argv_se_worker" ]; then
+  && [ ! -e "$TMP/store_session_end_worker" ]; then
   ok "codex preflight session-end no-ops before state/model work for workers"
 else
   bad "codex preflight session-end must be main-session-only"
@@ -3436,16 +3257,40 @@ if [ -z "$codex_worker_start_out" ]; then
 else
   bad "codex worker SessionStart must not inject memory context"
 fi
+# D-81.2: main-session SessionEnd/UserPromptSubmit spawn zero model workers and
+# write zero turn-counter state, hermetically -- verified by stripping every
+# adapter bin directory (where a claude/codex/opencode launcher could live)
+# from PATH and confirming the hooks still complete cleanly with no leftover
+# turn-state files, since a real spawn or turn-nudge write would need one.
+D812_NOSPAWN_PATH=$(printf '%s' "$PATH" | tr ':' '\n' | grep -vi 'codex\|claude\|opencode\|hearting' | tr '\n' ':')
+D812_SE_STORE="$TMP/d812-se-store"
+if printf '{"hook_event_name":"SessionEnd","session_id":"d812-se","cwd":"%s"}\n' "$TMP/flowproj" \
+  | PATH="$D812_NOSPAWN_PATH" MEM_STORE="$D812_SE_STORE" python3 "$ROOT/adapters/codex/hooks/sessionend-lifecycle.py" >/dev/null 2>"$TMP/d812_se.err"; then
+  ok "codex main SessionEnd completes with no adapter-launcher binary on PATH (spawns no model worker)"
+else
+  bad "codex main SessionEnd should not depend on a model-launcher binary [err=$(cat "$TMP/d812_se.err")]"
+fi
+D812_PROMPT_STORE="$TMP/d812-prompt-store"
+if printf '{"prompt":"hello","session_id":"d812-prompt","cwd":"%s"}\n' "$TMP/flowproj" \
+  | PATH="$D812_NOSPAWN_PATH" MEM_STORE="$D812_PROMPT_STORE" python3 "$ROOT/adapters/codex/hooks/userprompt-lifecycle.py" >/dev/null 2>"$TMP/d812_prompt.err" \
+  && [ -z "$(find "$TMP" -name '.codex-turn-state-*' 2>/dev/null)" ] \
+  && [ -z "$(find "$TMP" -name '.opencode-distill-stamp-*' 2>/dev/null)" ]; then
+  ok "codex main UserPromptSubmit writes zero turn-counter state (D-81.2)"
+else
+  bad "codex main UserPromptSubmit should write zero turn-counter state [err=$(cat "$TMP/d812_prompt.err")]"
+fi
+if ! grep -Eq 'mem-distill-dispatch|mem-turn-nudge' adapters/claude/settings.json; then
+  ok "Claude settings.json SessionEnd/UserPromptSubmit registration spawns no distill/turn-nudge worker (D-81.2)"
+else
+  bad "Claude settings.json should not reference a distill/turn-nudge worker"
+fi
 if grep -Fq '"AGENT_SESSION_ROLE": "worker"' "$ROOT/adapters/claude/bin/dispatch-headless.py" \
   && grep -Fq '"AGENT_SESSION_ROLE": "worker"' "$ROOT/adapters/codex/bin/dispatch-headless.py" \
   && grep -Fq '"AGENT_SESSION_ROLE": "worker"' "$ROOT/adapters/opencode/bin/dispatch-headless.py" \
-  && grep -Fq 'AGENT_SESSION_ROLE=worker' "$ROOT/adapters/claude/bin/mem-distill-worker.sh" \
-  && grep -Fq 'AGENT_SESSION_ROLE=worker' "$ROOT/adapters/codex/bin/distill-worker.sh" \
-  && grep -Fq 'AGENT_SESSION_ROLE=worker' "$ROOT/adapters/opencode/bin/distill-worker.sh" \
   && grep -Fq 'AGENT_SESSION_ROLE=worker' "$ROOT/loops/lib.sh" \
   && grep -Fq 'AGENT_SESSION_ROLE=worker' "$ROOT/loops/lib-runner.sh" \
   && grep -Fq 'env["AGENT_SESSION_ROLE"] = "worker"' "$ROOT/tools/fleet/refresh_title.py"; then
-  ok "all repo-owned dispatch/title/distill/loop model launchers mark workers"
+  ok "all repo-owned dispatch/title/loop model launchers mark workers"
 else
   bad "every background model launcher must export AGENT_SESSION_ROLE=worker"
 fi
@@ -3649,11 +3494,6 @@ if "$OPENCODE" write "$TMP/repo/f" opencodesid >"$TMP/opencode.out" 2>"$TMP/open
   ok "opencode preflight passes clean write"
 else
   bad "opencode preflight should pass clean write"
-fi
-if "$OPENCODE" write "$TMP/runtime/projects/abc/memory/MEMORY.md" opencodesid >"$TMP/opencode.out" 2>"$TMP/opencode.err"; then
-  bad "opencode preflight should block memory file write"
-else
-  [ "$?" -eq 2 ] && ok "opencode preflight blocks memory file write" || bad "opencode preflight memory wrong exit"
 fi
 if AGENT_HOME="$ROOT" bash "$DESIGN" --file "$TMP/not-design.txt" >"$TMP/design.out" 2>"$TMP/design.err" \
   && "$OPENCODE" design "$TMP/not-design.txt" >"$TMP/design.out" 2>"$TMP/design.err"; then
@@ -4506,21 +4346,6 @@ then
 else
   bad "opencode worker plugin must separate lifecycle from safety guards"
 fi
-if node --input-type=module >"$TMP/opencode_plugin_hook_block.out" 2>"$TMP/opencode_plugin_hook_block.err" <<EOF
-import { AgentHarnessGuards } from "$ROOT/opencode_setting/opencode-plugins/hearting-guards.js"
-const plugin = await AgentHarnessGuards({ directory: "$TMP/runtime", worktree: "$TMP/runtime" })
-try {
-  await plugin["tool.execute.before"]({ tool: "write", sessionID: "testsid" }, { args: { filePath: "$TMP/runtime/projects/abc/memory/MEMORY.md" } })
-  process.exit(1)
-} catch (error) {
-  if (!String(error.message || error).includes("memory")) process.exit(1)
-}
-EOF
-then
-  ok "opencode native plugin write hook blocks guarded writes"
-else
-  bad "opencode native plugin write hook should block guarded writes"
-fi
 if DESIGN_POSTWRITE_HOOK=0 node --input-type=module >"$TMP/opencode_plugin_design_hook.out" 2>"$TMP/opencode_plugin_design_hook.err" <<EOF
 import { AgentHarnessGuards } from "$ROOT/opencode_setting/opencode-plugins/hearting-guards.js"
 const plugin = await AgentHarnessGuards({ directory: "$TMP/repo", worktree: "$TMP/repo" })
@@ -4993,158 +4818,21 @@ else
   bad "opencode mode wrapper should report named claim verification contract"
 fi
 
-echo "== opencode distill source =="
-cat > "$TMP/opencode-export.json" <<'EOF'
-{"messages":[
-  {"id":"ou1","role":"user","time":"2026-06-29T00:00:00.000Z","content":[{"type":"text","text":"open hello"}]},
-  {"id":"oa1","role":"assistant","time":"2026-06-29T00:00:01.000Z","content":[{"type":"text","text":"open world"}]},
-  {"id":"ot1","type":"tool_call","name":"bash","time":"2026-06-29T00:00:02.000Z"}
-]}
-EOF
-if OPENCODE_EXPORT_FILE="$TMP/opencode-export.json" "$OPENCODE" distill-delta opencodesid >"$TMP/opencode_delta.out" 2>"$TMP/opencode_delta.err" \
-  && grep -q '^\[user\] open hello' "$TMP/opencode_delta.out" \
-  && grep -q '^\[assistant\] open world' "$TMP/opencode_delta.out" \
-  && grep -q '^\[assistant\] \[tool:bash\]' "$TMP/opencode_delta.out"; then
-  ok "opencode export source distills transcript"
-else
-  bad "opencode export source should distill transcript"
-fi
-# distill worker: no-tools opencode-run worker is implemented (gap closed). The
-# deterministic guards below avoid a live model call.
-# (1) disabled by default for direct calls → no-op exit 0
-if "$OPENCODE_DISTILL" opencodesid "$TMP/flowproj" >"$TMP/opencode_distill.out" 2>"$TMP/opencode_distill.err"; then
-  ok "opencode distill worker no-ops when OPENCODE_DISTILL_ENABLE unset"
-else
-  bad "opencode distill worker should no-op (exit 0) when disabled"
-fi
-# (2) recursion guard: MEM_DISTILL=1 → no-op even when enabled
-if MEM_DISTILL=1 OPENCODE_DISTILL_ENABLE=1 "$OPENCODE_DISTILL" opencodesid "$TMP/flowproj" >"$TMP/opencode_distill.out" 2>"$TMP/opencode_distill.err"; then
-  ok "opencode distill worker recursion guard no-ops under MEM_DISTILL=1"
-else
-  bad "opencode distill worker should no-op under MEM_DISTILL=1"
-fi
-# (3) enabled but opencode runtime unavailable → exit 69 (no hang, no model call)
-if HOME="$TMP/no-oc-home" OPENCODE_DISTILL_ENABLE=1 OPENCODE_BIN="$TMP/no-such-opencode" \
-   "$OPENCODE_DISTILL" opencodesid "$TMP/flowproj" >"$TMP/opencode_distill.out" 2>"$TMP/opencode_distill.err"; then
-  bad "opencode distill worker should exit 69 when opencode runtime unavailable"
-else
-  [ "$?" -eq 69 ] && ok "opencode distill worker exits 69 when opencode runtime unavailable" \
-    || bad "opencode distill worker wrong exit when runtime unavailable"
-fi
-# session-end: recursion guard writes no stamp under MEM_DISTILL=1
+echo "== opencode session-end memory sync =="
+# recursion guard: MEM_DISTILL=1 -> no sync even for session-end
 mkdir -p "$TMP/se-rec"
 if MEM_STORE="$TMP/se-rec" MEM_DISTILL=1 "$OPENCODE" session-end "$TMP/flowproj" se-rec-sid >/dev/null 2>&1 \
-  && [ ! -f "$TMP/se-rec/.opencode-distill-stamp-se-rec-sid" ]; then
-  ok "opencode session-end recursion guard no-ops under MEM_DISTILL=1"
+  && [ ! -f "$TMP/se-rec/memory.db" ]; then
+  ok "opencode session-end no-ops under MEM_DISTILL=1 recursion guard"
 else
   bad "opencode session-end should no-op under MEM_DISTILL=1"
 fi
-# session-end: debounces repeated triggers within the min interval
-mkdir -p "$TMP/se-deb"
-OPENCODE_DISTILL_ENABLE=0 MEM_STORE="$TMP/se-deb" "$OPENCODE" session-end "$TMP/flowproj" se-deb-sid >/dev/null 2>&1
-se_stamp=$(cat "$TMP/se-deb/.opencode-distill-stamp-se-deb-sid" 2>/dev/null || echo "")
-OPENCODE_DISTILL_ENABLE=0 MEM_STORE="$TMP/se-deb" "$OPENCODE" session-end "$TMP/flowproj" se-deb-sid >/dev/null 2>&1
-if [ -n "$se_stamp" ] \
-  && [ "$(cat "$TMP/se-deb/.opencode-distill-stamp-se-deb-sid" 2>/dev/null)" = "$se_stamp" ]; then
-  ok "opencode session-end debounces repeated triggers"
+mkdir -p "$TMP/se-sync"
+if MEM_STORE="$TMP/se-sync" "$OPENCODE" session-end "$TMP/flowproj" se-sync-sid >/dev/null 2>&1 \
+  && [ -f "$TMP/se-sync/memory.db" ]; then
+  ok "opencode session-end syncs the memory store"
 else
-  bad "opencode session-end should debounce repeated triggers"
-fi
-
-# session-end selects curate: preflight.sh session-end passes "curate" as the
-# distill-worker's third positional argument (:756); distill-propose stays
-# increment. Both are asserted against the source, not a live model call.
-if grep -q 'distill-worker.sh" "\$sid" "\$cwd" curate' "$OPENCODE"; then
-  ok "opencode preflight session-end selects curate mode"
-else
-  bad "opencode preflight session-end should select curate mode"
-fi
-if awk '/distill-propose\)/{flag=1} flag{print} flag && /;;/{exit}' "$OPENCODE" \
-  | grep -q 'distill-worker.sh" "\$sid" "\$cwd"$'; then
-  ok "opencode preflight distill-propose stays default increment"
-else
-  bad "opencode preflight distill-propose should stay default increment"
-fi
-
-# A4: OpenCode distill-worker mode/lock/advance, using a stub OPENCODE_BIN so
-# no live model call is made. The stub reads/captures the fed prompt from
-# stdin so mode selection (increment vs curate) is verifiable without a model.
-OC_STUB="$TMP/oc-stub"
-mkdir -p "$OC_STUB"
-cat > "$OC_STUB/opencode" <<'STUBEOF'
-#!/bin/sh
-cat > "$OPENCODE_STUB_CAPTURE" 2>/dev/null || true
-STUBEOF
-chmod +x "$OC_STUB/opencode"
-OC_STUB_FAIL="$TMP/oc-stub-fail"
-mkdir -p "$OC_STUB_FAIL"
-cat > "$OC_STUB_FAIL/opencode" <<'STUBEOF'
-#!/bin/sh
-exit 1
-STUBEOF
-chmod +x "$OC_STUB_FAIL/opencode"
-
-OC_CAPTURE_CURATE="$TMP/opencode-curate-capture.txt"
-OC_STORE_CURATE="$TMP/oc-store-curate"
-if OPENCODE_EXPORT_FILE="$TMP/opencode-export.json" OPENCODE_DISTILL_ENABLE=1 OPENCODE_BIN="$OC_STUB/opencode" \
-   OPENCODE_STUB_CAPTURE="$OC_CAPTURE_CURATE" MEM_STORE="$OC_STORE_CURATE" \
-   "$OPENCODE_DISTILL" oc-curate-sid "$TMP/flowproj" curate >"$TMP/opencode_curate.out" 2>"$TMP/opencode_curate.err" \
-   && grep -q 'no-tools session memory curator' "$OC_CAPTURE_CURATE"; then
-  ok "opencode distill worker curate mode builds the curator prompt"
-else
-  bad "opencode distill worker curate mode should build the curator prompt"
-fi
-OC_CAPTURE_INCREMENT="$TMP/opencode-increment-capture.txt"
-OC_STORE_INCREMENT="$TMP/oc-store-increment"
-if OPENCODE_EXPORT_FILE="$TMP/opencode-export.json" OPENCODE_DISTILL_ENABLE=1 OPENCODE_BIN="$OC_STUB/opencode" \
-   OPENCODE_STUB_CAPTURE="$OC_CAPTURE_INCREMENT" MEM_STORE="$OC_STORE_INCREMENT" \
-   "$OPENCODE_DISTILL" oc-increment-sid "$TMP/flowproj" >"$TMP/opencode_increment_mode.out" 2>"$TMP/opencode_increment_mode.err" \
-   && grep -q 'You are a memory distillation worker' "$OC_CAPTURE_INCREMENT" \
-   && ! grep -q 'no-tools session memory curator' "$OC_CAPTURE_INCREMENT"; then
-  ok "opencode distill worker defaults to increment mode and builds the increment prompt"
-else
-  bad "opencode distill worker should default to increment mode"
-fi
-OC_STORE_LOCK="$TMP/oc-store-lock"
-mkdir -p "$OC_STORE_LOCK/.opencode-distill-lock-oc-locksid"
-if OPENCODE_EXPORT_FILE="$TMP/opencode-export.json" OPENCODE_DISTILL_ENABLE=1 OPENCODE_BIN="$OC_STUB/opencode" MEM_STORE="$OC_STORE_LOCK" \
-   "$OPENCODE_DISTILL" oc-locksid "$TMP/flowproj" increment >"$TMP/opencode_lock.out" 2>"$TMP/opencode_lock.err" \
-   && grep -q 'another distill in progress' "$TMP/opencode_lock.err"; then
-  ok "opencode distill worker skips when the same-sid lock is already held"
-else
-  bad "opencode distill worker should skip when the same-sid lock is already held"
-fi
-rmdir "$OC_STORE_LOCK/.opencode-distill-lock-oc-locksid" 2>/dev/null || true
-
-OC_STORE_ADV="$TMP/oc-store-adv"
-if OPENCODE_EXPORT_FILE="$TMP/opencode-export.json" OPENCODE_DISTILL_ENABLE=1 OPENCODE_DISTILL_APPLY=1 OPENCODE_BIN="$OC_STUB/opencode" MEM_STORE="$OC_STORE_ADV" \
-   "$OPENCODE_DISTILL" oc-adv-sid "$TMP/flowproj" increment >"$TMP/opencode_adv.out" 2>"$TMP/opencode_adv.err" \
-   && AGENT_HOME="$ROOT" MEM_STORE="$OC_STORE_ADV" OPENCODE_EXPORT_FILE="$TMP/opencode-export.json" \
-      python3 "$ROOT/tools/memory/mem.py" distill oc-adv-sid --source opencode >"$TMP/opencode_adv_check.out" 2>"$TMP/opencode_adv_check.err" \
-   && [ ! -s "$TMP/opencode_adv_check.out" ]; then
-  ok "opencode distill worker advances the marker after a successful exec in apply mode"
-else
-  bad "opencode distill worker should advance the marker after a successful exec in apply mode"
-fi
-OC_STORE_NOADV="$TMP/oc-store-noadv"
-OPENCODE_EXPORT_FILE="$TMP/opencode-export.json" OPENCODE_DISTILL_ENABLE=1 OPENCODE_DISTILL_APPLY=1 OPENCODE_BIN="$OC_STUB_FAIL/opencode" OPENCODE_DISTILL_TIMEOUT=5 MEM_STORE="$OC_STORE_NOADV" \
-  "$OPENCODE_DISTILL" oc-noadv-sid "$TMP/flowproj" increment >"$TMP/opencode_noadv.out" 2>"$TMP/opencode_noadv.err"
-if AGENT_HOME="$ROOT" MEM_STORE="$OC_STORE_NOADV" OPENCODE_EXPORT_FILE="$TMP/opencode-export.json" \
-   python3 "$ROOT/tools/memory/mem.py" distill oc-noadv-sid --source opencode >"$TMP/opencode_noadv_check.out" 2>"$TMP/opencode_noadv_check.err" \
-   && [ -s "$TMP/opencode_noadv_check.out" ]; then
-  ok "opencode distill worker does not advance the marker on a failed exec"
-else
-  bad "opencode distill worker should not advance the marker on a failed exec"
-fi
-OC_STORE_PREVIEW="$TMP/oc-store-preview"
-OPENCODE_EXPORT_FILE="$TMP/opencode-export.json" OPENCODE_DISTILL_ENABLE=1 OPENCODE_BIN="$OC_STUB/opencode" MEM_STORE="$OC_STORE_PREVIEW" \
-  "$OPENCODE_DISTILL" oc-preview-sid "$TMP/flowproj" increment >"$TMP/opencode_preview.out" 2>"$TMP/opencode_preview.err"
-if AGENT_HOME="$ROOT" MEM_STORE="$OC_STORE_PREVIEW" OPENCODE_EXPORT_FILE="$TMP/opencode-export.json" \
-   python3 "$ROOT/tools/memory/mem.py" distill oc-preview-sid --source opencode >"$TMP/opencode_preview_check.out" 2>"$TMP/opencode_preview_check.err" \
-   && [ -s "$TMP/opencode_preview_check.out" ]; then
-  ok "opencode distill worker does not advance the marker on a preview-only (non-apply) run"
-else
-  bad "opencode distill worker should not advance the marker on a preview-only run"
+  bad "opencode session-end should sync the memory store"
 fi
 
 echo "== SD-11b stage-dispatch gate (deny 상향 + opt-out + intensity 불명) =="

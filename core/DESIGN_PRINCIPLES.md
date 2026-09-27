@@ -221,11 +221,11 @@ Project memory distinguishes explicit user-directed notes from agent-learned rec
 | Layer | Location | Owner | Purpose |
 |---|---|---|---|
 | Explicit user note | DB working tier through `/post-it` and `mem note` or `mem add`; the former five categories remain as type taxonomy | User-directed `/post-it` | Conventions, resources, open threads, decisions, and next-session hints the user wants retained |
-| Agent learning | DB working or durable tier populated by an external distiller from session deltas | Detached distiller triggered by turn count or SessionEnd | Reusable procedures, corrections, conventions, and lessons selected contextually by the agent |
+| Agent learning | DB working or durable tier populated by the main session in the current turn | Main session, in the moment it decides something is worth keeping | Reusable procedures, corrections, conventions, and lessons selected contextually by the agent |
 
-- Main, distiller, or curator owns semantic decisions. Scripts expose candidates and mechanical safety rather than keyword rules or automatic prompt classification.
-- Direct writes to built-in file memory under `<agent-home>/projects/*/memory/` are hard-blocked. `mem sync` only absorbs stray writes from other sessions or harnesses; `mem` is the unified write path.
-- The session-end deep curator owns deletion, pruning, consolidation, merge, and graduation through no-tools action JSON plus guarded script execution. The N-turn distiller is add-only. Main performs no housekeeping, and a 21-day working TTL is a deterministic backstop.
+- Main or a manual cleanup pass owns semantic decisions. Scripts expose candidates and mechanical safety rather than keyword rules or automatic prompt classification.
+- Built-in file memory is disabled per adapter where the runtime supports it (D-79); `mem` is the unified write path. An explicit `mem migrate --all-projects` remains the one-time recovery path for files a prior enabled period left behind.
+- Deletion, pruning, consolidation, merge, and graduation go through a manual cleanup pass (D-80) using `curate-snapshot` plus the guarded mutation commands directly — there is no automatic distiller or session-end curator. Main performs no housekeeping, and a 21-day working TTL is a deterministic backstop.
 - Session injection uses `mem inject --hook`. `core/MEMORY.md §7` and adapter bootstraps own details.
 
 The separation prevents automatic learning noise from burying information the user deliberately chose to retain.

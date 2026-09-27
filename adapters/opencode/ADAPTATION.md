@@ -66,8 +66,6 @@ documentation.
 | Model selection (`model`, `small_model`, per-agent `model`, `variant`) | yes | `adapters/opencode/bin/role-map.sh` resolves portable roles to model/variant |
 | Statusline / footer | no user shell surface | TUI footer is native; harness status signals stay instruction-only/preflight |
 | Shell hooks (Claude-style `settings.json` hook events) | no | harness guards run as explicit preflight wrappers |
-| Session transcript | SQLite at `~/.local/share/opencode/opencode.db`, `opencode export <sid>` | `distill-delta` uses the shared OpenCode export source reader |
-| No-tools worker flag | yes (verified) | `opencode run --pure --agent <distiller>` with every built-in tool set to `false` — zero tools, so no execution and no tool-retry hang (D-14 acceptance passed); distill auto-apply enabled by default |
 
 ## Native Skill, Command, And Agent Surface Debt
 
@@ -193,10 +191,9 @@ When changing the plugin:
    when plugins are disabled.
 
 The plugin covers prompt lifecycle context, write guard enforcement, spec
-read-gate enforcement, design post-write console checks, and auto-distillation
-(the `event` hook fires `session-end` on `session.idle`). The no-tools worker
-contract is verified, so distillation is enabled by default — see the
-"Auto-Distillation" section.
+read-gate enforcement, design post-write console checks, and memory sync
+(the `event` hook fires `session-end` on `session.idle`, D-78: no automatic
+distiller).
 
 ## Parity Status vs Claude
 
@@ -209,20 +206,17 @@ injections are auto-applied. The table records the current state.
 |---|---|---|
 | `PreToolUse` git-state guard (deny) | plugin `tool.execute.before` → `preflight write` (throws) | full — auto enforced |
 | `PreToolUse` artifact-order guard (deny) | plugin `tool.execute.before` → `preflight write` (throws) | full — auto enforced |
-| `PreToolUse` builtin-memory guard (deny) | plugin `tool.execute.before` → `preflight write` (throws) | full — auto enforced |
 | `PreToolUse[Skill]` spec-skill gate (deny) | plugin `command.execute.before` → `preflight capability` (throws) | full — auto enforced (command path) |
 | `PostToolUse[Read]` spec-read marker | plugin `tool.execute.after` on `read` → `preflight read` | full — auto enforced |
 | `PostToolUse` design post-write | plugin `tool.execute.after` → `preflight design` | full — auto enforced |
 | `SessionStart`-equivalent memory inject | plugin `experimental.chat.system.transform` → `memory`, computed once per session and re-emitted on every model call | full — auto injected, persists for the whole session |
 | `UserPromptSubmit` capsule candidates / routing-contract signal / briefing | plugin `chat.message` → prompt/turn capture, then `experimental.chat.system.transform` → `candidates` / `prompt-signal` / `briefing`, computed once per user turn and re-emitted on every model call of that turn | full — candidate output is active current-project/global capsule-only, maximum six / 2,400 UTF-8 bytes; the prompt is held in plugin memory only (never written) and dropped at `session.deleted` |
-| `SessionEnd` + `UserPromptSubmit` auto-distillation | plugin `event` (`session.idle`) → detached `preflight session-end` → no-tools `opencode run` worker | full — auto applied by default (opt out `OPENCODE_DISTILL_ENABLE=0`) |
+| `SessionEnd` memory sync | plugin `event` (`session.idle`) → detached `preflight session-end` → `mem sync --json` | full — auto applied (D-78: no automatic distiller) |
 | `PreToolUse` material-route guard (deny) | plugin `tool.execute.before` → `preflight write` (structured), plugin `tool.execute.before` on `bash` → `preflight material-route check --tool Bash` (verbatim command), `preflight route` binds after a checked compile | structured: full for a resolvable target — a recognized mutation tool whose target does not resolve (`normalizeFile()` returns `""`, `targetFiles()` yields `[]`) still reaches no guard (see Codex's stricter `pretooluse-write-guard.py:291-293`); bash: full for documented commands. Automatic final-session clear is **not** claimed — `session.idle` is per-turn and `session.deleted` means deletion, not exit. |
 | `PreToolUse[Bash]` worktree-path guard (deny) | plugin `tool.execute.before` on `bash` → `preflight worktree-path`, `preflight worktree-path` explicit fallback | portable `git worktree add` path check only — the built-in-worktree-tool deny is Claude-native and has **no** OpenCode counterpart (`core/HOOKS.md:45`) |
 
-Auto-distillation, previously the one functional gap, is now closed (see the
-"Auto-Distillation" section below). Two items remain that cannot reach
-byte-for-byte Claude parity; they are OpenCode runtime surface limits, not
-adapter debt:
+Two items remain that cannot reach byte-for-byte Claude parity; they are
+OpenCode runtime surface limits, not adapter debt:
 
 1. **No persistent statusline.** OpenCode has a native TUI footer (model,
    context, tokens, session) but no user shell statusline surface. Harness
@@ -259,38 +253,6 @@ caps or the process count per turn. Regression evidence: the original
 `mm`-access failure — the model concluded "no mmctl, no MCP server, no API
 token" while the matching capsule candidate existed — reproduces before the fix
 and disappears after it (`mem show` → `mm me/teams/channels/read`).
-
-### Auto-Distillation
-
-Session auto-distillation reaches behavior parity with the Claude/codex
-session-end distillers. The earlier "worker hangs" finding was a measurement
-artifact: the hangs came from running several `opencode run` invocations
-concurrently (provider/local-server contention) and from a dead free model, not
-from tool-disable. Run serially with a working model, a fully tool-stripped
-agent does not hang.
-
-- **No-tools worker (verified).** `adapters/opencode/bin/distill-worker.sh` runs
-  `opencode run --pure --agent <distiller>` where the distiller agent sets every
-  built-in tool to `false`. With zero tools the model cannot execute or retry a
-  tool: an adversarial "run `date >> file`" prompt produced no file and exited 0
-  (D-14 acceptance). `--pure` also disables external plugins so the worker never
-  re-enters the guard plugin, and `MEM_DISTILL=1` guards every lifecycle
-  re-entry. The whole run is `timeout`-guarded so a slow/unreachable model can
-  never stall the caller.
-- **Trigger.** The plugin `event` hook fires on `session.idle` and detaches
-  `preflight session-end`, which debounces per session
-  (`OPENCODE_DISTILL_MIN_INTERVAL`, default 600s), then runs the worker. Enabled
-  by default (`OPENCODE_DISTILL_ENABLE` defaults to 1 on that path), opt out with
-  `OPENCODE_DISTILL_ENABLE=0`. Set `OPENCODE_DISTILL_MODEL` to a capable model
-  for quality.
-- **Delta extraction fix.** `opencode export` truncates its stdout at a
-  pipe-buffer boundary (~64-80KB) when the consumer is a pipe, so the shared
-  `OpenCodeExportSource` now redirects export to a temp file and parses that —
-  without this, any session larger than the buffer silently distilled to nothing.
-- **Apply.** Worker output is parsed by the shared
-  `tools/memory/apply-distill-actions.py` (skips non-JSON / fenced lines), which
-  argv-calls `mem.py`. End-to-end verified: an isolated run wrote a real record
-  to a test DB.
 
 ## Explicit Non-Support
 
@@ -342,7 +304,6 @@ Harness-specific status signals need OpenCode-native realization:
 | local evidence exposure | The **once-per-session** context blocks run `preflight.sh local-evidence [cwd]`, the portable `hooks/local-evidence-inject.sh` presence probe: research/documents/analysis bucket counts plus at most nine newest entry paths from the canonical artifact root, round-robined across buckets and deduplicated per artifact (2,400-UTF-8-byte bound, no body reads, no prompt classifier, silent when empty, worker-exempt, fail-open). OpenCode has no session-start context event, so `localEvidenceBySession` is the equivalent: computed once and re-emitted on every model call, the same shape `memoryBySession` already uses |
 | oncall briefing | OpenCode plugin system transform runs `adapters/opencode/bin/preflight.sh briefing [cwd]`; run it manually when plugins are unavailable |
 | loop guidance | Run `adapters/opencode/bin/preflight.sh loop-info <oncall|note|study|drill|runtime-watch>` before following loop guides; OpenCode reports manual contracts, missing implementations, and drill auto-run restrictions without executing loop scripts. The `note` loop and note semantics are application-owned; the harness exposes only the optional app-neutral `artifact-sink` port |
-| memory distill | The plugin `event` hook auto-distills on `session.idle` via detached `preflight session-end` → no-tools `opencode run` worker (verified); enabled by default, opt out `OPENCODE_DISTILL_ENABLE=0`, set `OPENCODE_DISTILL_MODEL` for quality. Manual: `preflight.sh distill-delta <sid>` extracts the delta, `preflight.sh distill-propose <sid>` runs a proposal |
 | worklog state signal | Run `adapters/opencode/bin/preflight.sh worklog [cwd]` to inspect configured `<agent-notes-root>` / `<worklog-board-app>` paths read-only before OpenCode updates notes or diagnoses board state |
 | role profiles | Read `roles/README.md`, then run `adapters/opencode/bin/preflight.sh role <portable-role>` to resolve OpenCode model/variant settings |
 | permission mapping | Run `adapters/opencode/bin/preflight.sh permissions` to inspect the OpenCode native permission contract and confirm Claude `allowedTools` is unsupported |
@@ -355,8 +316,7 @@ Harness-specific status signals need OpenCode-native realization:
 | material route participation | Structured plugin writes transit `preflight write`, which now ends with the material-route check, **for a resolvable target** — a recognized mutation tool whose target does not resolve still reaches no guard (`hearting-guards.js` `normalizeFile()`/`targetFiles()`; see Codex's stricter `adapters/codex/hooks/pretooluse-write-guard.py:291-293`). Documented `bash` commands are passed verbatim to `preflight.sh material-route check --tool Bash`. A successful checked `preflight.sh route --capability ...` compile binds using the `shell.env`-supplied `OPENCODE_SESSION_ID`; explicit `preflight.sh material-route check|bind|clear` remains the fallback. **Automatic final-session clear is not claimed** — `session.idle` is per-turn and `session.deleted` means deletion, not exit |
 | material route caller trust (disclosure) | Direct `preflight.sh material-route bind` verifies route schema/hash, cwd, source commit, and registry/unit digests, but does **not** authenticate the calling process; any local caller able to present a valid route record can create the session marker. Same trust shape as Codex's PostToolUse auto-bind (`hooks/material-route-guard.py:801-812`) — disclosed, not defended against |
 | worktree path isolation | Documented `bash` commands are passed unchanged to `hooks/worktree-path-guard.sh` through the plugin's `tool.execute.before`; `adapters/opencode/bin/preflight.sh worktree-path` is the explicit fallback. The built-in-worktree-tool deny is Claude-native and has **no** OpenCode counterpart (`core/HOOKS.md:45`, `core/ADAPTATION_INVENTORY.md:64`) |
-| residual bash-write gap (mandatory) | Tranche A covers material commits and worktree add on the bash surface. Other bash-mediated writes do not transit `preflight write`, so the artifact, git-state, core-first, and builtin-memory guards do not run on them. **This matches the Claude Bash surface**, which also wires only worktree-path and material-route; it is a gap only against Codex's broader shell heuristic (`adapters/codex/hooks/pretooluse-write-guard.py:140-230,245-246`). The portable classifiers themselves have known limits that define "denied" vs "should have been denied" here: a quoted `git worktree add` string inside another command, a `-wt/` decoy token anywhere in the command line, and inert `echo git commit` text can all be matched or missed by the classifiers, independent of this tranche |
-| memory curate tier | `session.idle` remains debounce-only; `session-end` alone selects `curate` (`adapters/opencode/bin/preflight.sh`); `increment` remains the default everywhere else (`distill-propose`, direct calls). The `AGENT_SESSION_ROLE=worker` no-op and the debounce/`session-end`-only gating are realized in `adapters/opencode/bin/preflight.sh` (`session-end)`, `is_worker_session()` at `:21`, checked at `:746`); the `MEM_DISTILL=1` recursion guard, per-sid lock, mode defaulting, and exec-gated advance are realized in `adapters/opencode/bin/distill-worker.sh`; the six allowed actions (`add\|reinforce\|merge\|prune\|graduate\|reattribute`) and the snapshot-id whitelist, and mode-aware apply (`--mode`/`--snapshot-ids`), are enforced in `tools/memory/apply-distill-actions.py`. Mirrors Codex's shape. OpenCode's increment and curate tiers intentionally share one model knob (`OPENCODE_DISTILL_MODEL`) in this tranche, unlike Codex's per-tier `models.conf` split |
+| residual bash-write gap (mandatory) | Tranche A covers material commits and worktree add on the bash surface. Other bash-mediated writes do not transit `preflight write`, so the artifact and git-state/core-first guards do not run on them. **This matches the Claude Bash surface**, which also wires only worktree-path and material-route; it is a gap only against Codex's broader shell heuristic (`adapters/codex/hooks/pretooluse-write-guard.py:140-230,245-246`). The portable classifiers themselves have known limits that define "denied" vs "should have been denied" here: a quoted `git worktree add` string inside another command, a `-wt/` decoy token anywhere in the command line, and inert `echo git commit` text can all be matched or missed by the classifiers, independent of this tranche |
 | runtime qualifiers (unverified/unsupported) | The installed OpenCode version is unpinned. `shell.env`'s `sessionID` is **undocumented in the published plugin docs** and only typed `sessionID?` in the upstream `dev` source, so its runtime availability is unverified; the sessionless-compile path is the designed fallback. The `shell` tool alias, stable `tool.execute.after` exit metadata, and plugin coverage of `task`-spawned subagent tool calls remain unverified. The returned-hook-map shape this work targets is the current/legacy OpenCode plugin API; an OpenCode V2 plugin API with a different beta registration shape is a distinct, unverified migration risk, alongside the existing "installed OpenCode version is unpinned" qualifier |
 
 ## Model Mapping
@@ -403,7 +363,6 @@ OpenCode could consume them.
 shared `tools/` directory. The current allowlist is:
 
 - `memory/mem.py` (OpenCode-owned launcher for the shared memory CLI)
-- `memory/apply-distill-actions.py`
 - `memory/recall.sh` (OpenCode-owned launcher for recall)
 - `material/browser-fetch.sh` (OpenCode-owned launcher for rendered web page extraction)
 - `material/data-script.sh` (OpenCode-owned launcher for Python data-analysis scripts)
@@ -519,29 +478,6 @@ dispatch-depth-2 parity.
 The retired broker exposes diagnostic `status`/`stop` only; v1/v2 broker routes
 remain inspectable but cannot register or start new workers. Registered
 standard+ dispatch-depth-2 requests remain explicitly unsupported as described above.
-
-## Distillation Boundary
-
-Claude's adapter runs a detached `claude -p` worker with tool use denied by
-runtime flags. OpenCode's verified equivalent is `opencode run --pure --agent
-<distiller>` with a fully tool-stripped agent (every built-in tool `false`).
-The pipeline is implemented and enabled by default:
-
-1. `distill-delta` is supported through the shared memory CLI's
-   `OpenCodeExportSource`, which normalizes `opencode export <session-id>` JSON
-   into the `.messages()` interface (`Msg(role, ts, text, uuid, is_sidechain)`).
-   Export is captured to a temp file, not a pipe, because `opencode export`
-   truncates piped stdout at a buffer boundary.
-2. `distill-propose` / the `session-end` path run the no-tools worker
-   (`distill-worker.sh`): `opencode run --pure --agent <distiller>`, timeout-
-   guarded, `MEM_DISTILL=1` recursion guard. The D-14 acceptance (adversarial
-   shell-exec prompt produces no execution, no hang) passed.
-3. Worker output is parsed by the shared
-   `tools/memory/apply-distill-actions.py` applier when `OPENCODE_DISTILL_APPLY=1`
-   (the `session-end` path defaults it on).
-4. Automatic distillation is enabled by default through the plugin
-   `event`/`session.idle` trigger (debounced per session). Opt out with
-   `OPENCODE_DISTILL_ENABLE=0`; set `OPENCODE_DISTILL_MODEL` for quality.
 
 ## Worklog Boundary
 

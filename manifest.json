@@ -855,13 +855,6 @@
       "hard_block": true
     },
     {
-      "slug": "hook__builtin-memory-guard__PreToolUse",
-      "name": "builtin-memory-guard",
-      "mono": "builtin-memory-guard",
-      "event": "PreToolUse",
-      "hard_block": true
-    },
-    {
       "slug": "hook__core-first-guard__PreToolUse",
       "name": "core-first-guard",
       "mono": "core-first-guard",
@@ -967,13 +960,6 @@
       "hard_block": false
     },
     {
-      "slug": "hook__mem-distill-dispatch__SessionEnd",
-      "name": "mem-distill-dispatch",
-      "mono": "mem-distill-dispatch",
-      "event": "SessionEnd",
-      "hard_block": false
-    },
-    {
       "slug": "hook__-c__SessionStart",
       "name": "-c",
       "mono": "-c",
@@ -1075,13 +1061,6 @@
       "slug": "hook__mem-recall-inject__UserPromptSubmit",
       "name": "mem-recall-inject",
       "mono": "mem-recall-inject",
-      "event": "UserPromptSubmit",
-      "hard_block": false
-    },
-    {
-      "slug": "hook__mem-turn-nudge__UserPromptSubmit",
-      "name": "mem-turn-nudge",
-      "mono": "mem-turn-nudge",
       "event": "UserPromptSubmit",
       "hard_block": false
     },

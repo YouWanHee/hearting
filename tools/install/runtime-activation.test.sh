@@ -97,7 +97,7 @@ make_fixture() {
   printf '%s\n' '# fixture loop' > "$root/adapters/claude/loops/demo.md"
   printf '%s\n' 'fixture' > "$root/adapters/claude/scaffolds/README.md"
   printf '%s\n' \
-    '{"env":{"MEM_DISTILL_ENABLE":"1"},"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"sh $HOME/.claude/utilities/fixture.sh"}]}]},"statusLine":{"type":"command","command":"bash $HOME/.claude/statusline.sh","refreshInterval":60}}' \
+    '{"autoMemoryEnabled":false,"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"sh $HOME/.claude/utilities/fixture.sh"}]}]},"statusLine":{"type":"command","command":"bash $HOME/.claude/statusline.sh","refreshInterval":60}}' \
     > "$root/adapters/claude/settings.json"
   printf '%s\n' '{"name":"hearting-claude","version":"1.0.0"}' \
     > "$root/adapters/claude/plugin-marketplace/plugins/hearting-claude/.claude-plugin/plugin.json"
@@ -123,7 +123,7 @@ make_fixture() {
 make_fixture "$SRC"
 mkdir -p "$HOME/.claude"
 printf '%s\n' \
-  '{"theme":"user","env":{"MEM_DISTILL_ENABLE":"custom","USER_FLAG":"keep"},"statusLine":{"type":"command","command":"custom-statusline"}}' \
+  '{"theme":"user","autoMemoryEnabled":true,"env":{"USER_FLAG":"keep"},"statusLine":{"type":"command","command":"custom-statusline"}}' \
   > "$HOME/.claude/settings.json"
 
 for command in curl wget npm bun codex claude opencode; do
@@ -194,10 +194,11 @@ import json, sys
 row = json.load(open(sys.argv[1]))
 settings = json.load(open(sys.argv[2]))
 assert row["freshness"] == "duplicate", row
-assert row["config_conflicts"] == ["statusLine", "env.MEM_DISTILL_ENABLE"], row
+assert row["config_conflicts"] == ["statusLine", "autoMemoryEnabled"], row
 assert "config-conflict:statusLine" in row["duplicate_sources"], row
+assert "config-conflict:autoMemoryEnabled" in row["duplicate_sources"], row
 assert settings["statusLine"]["command"] == "custom-statusline", settings
-assert settings["env"]["MEM_DISTILL_ENABLE"] == "custom", settings
+assert settings["autoMemoryEnabled"] is True, settings
 assert settings["env"]["USER_FLAG"] == "keep", settings
 PY
 test -L "$HOME/.claude/statusline.sh" || fail "fresh conflict lost Claude statusline projection"
@@ -212,10 +213,10 @@ import json, sys
 path = sys.argv[1]
 settings = json.load(open(path))
 assert settings["statusLine"]["command"] == "custom-statusline", settings
-assert settings["env"]["MEM_DISTILL_ENABLE"] == "custom", settings
+assert settings["autoMemoryEnabled"] is True, settings
 assert settings["env"]["USER_FLAG"] == "keep", settings
 settings.pop("statusLine")
-settings["env"].pop("MEM_DISTILL_ENABLE")
+settings.pop("autoMemoryEnabled")
 with open(path, "w", encoding="utf-8") as handle:
     json.dump(settings, handle)
 PY
@@ -399,7 +400,7 @@ assert data["theme"] == "user"
 assert data["hooks"]["SessionStart"]
 assert data["statusLine"]["command"] == "bash $HOME/.claude/statusline.sh"
 assert data["statusLine"]["refreshInterval"] == 60
-assert data["env"]["MEM_DISTILL_ENABLE"] == "1"
+assert data["autoMemoryEnabled"] is False
 assert data["env"]["USER_FLAG"] == "keep"
 PY
 ok "offline linked activation/status/doctor for all runtimes"

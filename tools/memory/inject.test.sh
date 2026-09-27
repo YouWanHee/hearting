@@ -3,12 +3,7 @@
 hearting_test_isolate
 # Isolated test for `mem inject` D-16 (QA ② + ③) + lifecycle() equivalence (Step 1.1).
 # Fully isolated via MEM_STORE + MEM_PROJECTS temp dirs — never touches real runtime state.
-# All mem calls via `python3 "$MEM" ...` (worktree copy, matches distill.test.sh convention).
-#
-# NOTE: The existing suites (hooks/mem-turn-nudge.test.sh, hooks/mem-distill-dispatch.test.sh,
-#       tools/memory/distill.test.sh) must still pass unchanged — they are run separately by
-#       code-test, not from within this file. In particular distill.test.sh:97 hard-asserts
-#       mem-turn-nudge.test.sh prints "RESULT: PASS=12 FAIL=0". Do NOT touch those files.
+# All mem calls via `python3 "$MEM" ...` (worktree copy).
 #
 # QA cases:
 #   T1   near-dup seed → inject output contains 정리 신호 section with both ids
