@@ -4524,6 +4524,10 @@ class SourceCensusTest(unittest.TestCase):
   # Inline finish's exact-cycle binding validates the already-admitted route
   # tuple; it does not choose which cycle the route owns.
   "finalize_exact_cycle",
+  # The producer's inline binding check calls cycle_route_admission above,
+  # then compares the pending finish intent's route ID with that admitted
+  # binding. This is finish-tuple integrity, not another cycle selection.
+  "_inline_producer_binding_check",
  })
 
  def test_a25_7_cycle_ownership_and_lineage_single_site(self):

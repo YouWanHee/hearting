@@ -5677,11 +5677,18 @@ def complete_node(
     intent at all, so a quick one-shot owner's completion left no record and
     no carrier could ever deliver it.
     """
-    try:
-        import inline_finish
-        pending=inline_finish.pending_state(Path(route["artifact_root"]),route["route_id"])
-    except (OSError,ValueError) as exc:
-        raise ValueError("finish-state-unreadable") from exc
+    artifact_root=route.get("artifact_root")
+    route_id=route.get("route_id")
+    pending=None
+    # Legacy and subdivision routes may omit the inline-finish tuple entirely.
+    # Only routes carrying both identifiers are in that fence's domain; once a
+    # tuple is present, malformed or unreadable state remains a strict refusal.
+    if artifact_root not in (None, "") and isinstance(route_id,str) and route_id:
+        try:
+            import inline_finish
+            pending=inline_finish.pending_state(Path(artifact_root),route_id)
+        except (OSError,ValueError) as exc:
+            raise ValueError("finish-state-unreadable") from exc
     supplied_finish=os.environ.get("AGENT_INLINE_FINISH_ID")
     if pending and pending.get("state")!="finished" and pending.get("inline_finish_id")!=supplied_finish:
         raise ValueError("finish-in-progress")

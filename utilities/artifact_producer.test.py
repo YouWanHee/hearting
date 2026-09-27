@@ -4208,6 +4208,16 @@ class RouteLineageBindingTest(ProducerTestBase):
         }))
         self.assertNotEqual(record["route_id"], continuation["route_id"])
         P._inline_producer_binding_check(self.root, record["cycle_id"], binding)
+        # A second qualifying child makes the continuation's cycle admission
+        # ambiguous. The finish binding must defer to D-120 and refuse it,
+        # rather than treating the matching finish tuple as cycle ownership.
+        sibling = self._continuation(begin, reason="inline-binding-sibling")
+        self.assertEqual(
+            P.cycle_route_admission(self.root, record, continuation, finalize=True).reason,
+            "cycle-route-binding-mismatch:lineage-fork",
+        )
+        with self.assertRaisesRegex(P.ProducerError, "lineage-fork"):
+            P._inline_producer_binding_check(self.root, record["cycle_id"], binding)
         wrong = dict(binding, route_hash=begin["route_hash"])
         with self.assertRaises(P.ProducerError):
             P._inline_producer_binding_check(self.root, record["cycle_id"], wrong)

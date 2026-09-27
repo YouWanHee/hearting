@@ -485,7 +485,7 @@ with one public command. Supply a readable, nonempty artifact from the route's
 exact open cycle and the final summary; the command records terminal proof,
 closes the route, seals that cycle and returns a receipt only after rechecking
 all three. A partial transaction remains `finish-pending` and is resumed with
-the same intent. Session exit alone never finishes the route.
+the same intent. Session exit alone does not finish the route.
 
 ```text
 python3 utilities/capability-route.py finish --route <route.json> --evidence <cycle-local-file> --summary-file <file> [--commit <full-sha>]
