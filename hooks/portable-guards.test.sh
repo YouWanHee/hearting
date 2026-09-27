@@ -3279,7 +3279,8 @@ if printf '{"prompt":"hello","session_id":"d812-prompt","cwd":"%s"}\n' "$TMP/flo
 else
   bad "codex main UserPromptSubmit should write zero turn-counter state [err=$(cat "$TMP/d812_prompt.err")]"
 fi
-if ! grep -Eq 'mem-distill-dispatch|mem-turn-nudge' adapters/claude/settings.json; then
+if [ -f "$ROOT/adapters/claude/settings.json" ] \
+  && ! grep -Eq 'mem-distill-dispatch|mem-turn-nudge' "$ROOT/adapters/claude/settings.json"; then
   ok "Claude settings.json SessionEnd/UserPromptSubmit registration spawns no distill/turn-nudge worker (D-81.2)"
 else
   bad "Claude settings.json should not reference a distill/turn-nudge worker"
