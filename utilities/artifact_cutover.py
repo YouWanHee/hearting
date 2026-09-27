@@ -1471,19 +1471,30 @@ def _capture_migration_spec_bases(root: Path, cycle: Path) -> None:
     P._write_exclusive(path, P._json_bytes({"schema_version": 1, "spec": bases}))
 
 
-def _migration_spec_base(root: Path, cycle: Path, cycle_id: str, reference_id: Optional[str]) -> str:
-    record = P.read_cycle_record(root, cycle_id)
+def _read_migration_spec_base(root: Path, cycle: Path, reference_id: Optional[str]) -> str:
+    """Check the captured base before making the migration immutable."""
     path = cycle / MIGRATION_SPEC_BASES
     if not path.is_file() or path.is_symlink():
         raise CutoverError("shared-base-required", "migration needs a base captured before copying")
-    P._sealed_source_files(cycle, record, MIGRATION_SPEC_BASES, path)
     receipt = P._read_json(path)
-    if receipt is None or receipt.get("schema_version") != 1 or not isinstance(receipt.get("spec"), dict):
+    if (receipt is None or type(receipt.get("schema_version")) is not int
+            or receipt["schema_version"] != 1 or not isinstance(receipt.get("spec"), dict)):
         raise CutoverError("shared-base-invalid", MIGRATION_SPEC_BASES)
+    for value in receipt["spec"].values():
+        if value is not None and (not isinstance(value, str)
+                or not artifact_identity.is_well_formed(value, "shared_reference_revision")):
+            raise CutoverError("shared-base-invalid", MIGRATION_SPEC_BASES)
     selected = reference_id or (P.find_reference_by_key(root, "spec", "spec") or {}).get("shared_reference_id")
     if reference_id is not None and selected not in receipt["spec"]:
         raise CutoverError("shared-base-reference-mismatch", selected)
-    return receipt["spec"].get(selected) or "none"
+    base = receipt["spec"].get(selected)
+    return "none" if base is None else base
+
+
+def _migration_spec_base(root: Path, cycle: Path, cycle_id: str, reference_id: Optional[str]) -> str:
+    record = P.read_cycle_record(root, cycle_id)
+    P._sealed_source_files(cycle, record, MIGRATION_SPEC_BASES, cycle / MIGRATION_SPEC_BASES)
+    return _read_migration_spec_base(root, cycle, reference_id)
 
 
 def migrate_delta(root: Path, *, census_rows: Path, route_file: Path, capability: str, intensity: str,
@@ -1633,6 +1644,17 @@ def migrate_seal(root: Path, *, run_dir: Path, primary: Optional[str] = None,
         return report
     identity = P.artifact_lifecycle.read_root_identity(root)
     cycle_id = report["cycle_id"]
+    cycle_dir = Path(report["cycle_dir"])
+    # Published manifests (including crash recovery) must go through finalize's
+    # sealed-payload check. Before publication, refuse an unusable base while
+    # the caller can still restore its captured receipt.
+    if (not (cycle_dir / "manifest.json").exists()
+            and (cycle_dir / "artifacts/shared-input/spec").is_dir()):
+        # Resolve implicit selection before sealing too. After sealing, an
+        # admission retry may see the reference created by its own first try;
+        # that legitimately had no captured prior revision.
+        selected_spec = spec_reference or (P.find_reference_by_key(root, "spec", "spec") or {}).get("shared_reference_id")
+        _read_migration_spec_base(root, cycle_dir, selected_spec)
     report["pruned_hidden_copies"] = _prune_hidden_copies(root, run_dir, report)
     sealed = P.finalize(root, cycle_id=cycle_id, primary=primary)
     if sealed["status"] not in ("sealed", "already-sealed"):
@@ -1640,7 +1662,6 @@ def migrate_seal(root: Path, *, run_dir: Path, primary: Optional[str] = None,
     report["finalize"] = sealed
     admitted: Dict[str, Any] = {}
     references = {"spec": spec_reference, "analysis": analysis_reference}
-    cycle_dir = Path(report["cycle_dir"])
     for kind in ("spec", "analysis"):
         staged = cycle_dir / "artifacts" / "shared-input" / kind
         if not staged.is_dir():
