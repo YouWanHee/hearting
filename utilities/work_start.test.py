@@ -449,6 +449,16 @@ class WorkStartTest(unittest.TestCase):
         self.assertEqual(result["reason"], "work-parent-recovery-required", result)
         self.assertEqual(self.calls, [])
 
+    def test_legacy_closure_cannot_hide_runtime_owner_pending_settlement(self):
+        import dispatch_terminal_commit as terminal
+        self.path.with_suffix(".outcome.json").write_text(json.dumps({
+            "route_id": self.route["route_id"], "route_hash": self.route["route_hash"], "terminal_gate_proven": True}))
+        with mock.patch.object(W, "_rows", return_value={"att-owner": ("done", {
+            "workflow_completion": "runtime-v1", "owner_route_id": self.route["route_id"]})}), \
+                mock.patch.object(terminal, "owner_completion_state", return_value=terminal.CompletionState("pending")):
+            self.assertEqual(self.start()["reason"], "workflow-completion-pending")
+        self.assertEqual(self.calls, [])
+
     def test_successor_session_harvests_a_finished_route_but_not_a_live_one(self):
         # A supervisor hands the route to another session: finished attempts
         # carry only a result, so the successor reads it instead of being told
@@ -515,7 +525,38 @@ class WorkStartTest(unittest.TestCase):
 
     def test_direct_never_spawns(self):
         self.route["effective_intensity"] = "direct"
-        self.assertEqual(self.start()["state"], "inline")
+        import artifact_producer
+        with mock.patch.object(artifact_producer, "prepare_route_artifact_env",
+                               return_value={"AGENT_ARTIFACT_OUTPUT_DIR": "/exact/artifacts"}) as prepare:
+            result = self.start()
+        self.assertEqual(result["state"], "inline")
+        self.assertEqual(result["artifact_env"]["AGENT_ARTIFACT_OUTPUT_DIR"], "/exact/artifacts")
+        prepare.assert_called_once_with(self.path, start=True, jobs=self.jobs)
+        self.assertEqual(self.calls, [])
+
+    def test_closed_request_replay_never_launches_or_prepares_artifacts(self):
+        import artifact_producer
+        outcome = {"route_id": self.route["route_id"], "route_hash": self.route["route_hash"],
+                   "terminal_gate_proven": True}
+        self.path.with_suffix(".outcome.json").write_text(json.dumps(outcome))
+        with mock.patch.object(artifact_producer, "prepare_route_artifact_env", side_effect=AssertionError("reopen")):
+            for intensity in ("direct", "standard"):
+                self.route["effective_intensity"] = intensity
+                self.assertEqual(self.start()["state"], "completed")
+        self.assertEqual(self.calls, [])
+        outcome["terminal_gate_proven"] = False
+        self.path.with_suffix(".outcome.json").write_text(json.dumps(outcome))
+        self.assertEqual(self.start()["reason"], "route-closed-unproven")
+
+    def test_closed_runtime_owner_requires_complete_settlement(self):
+        import dispatch_terminal_commit as terminal
+        outcome = {"route_id": self.route["route_id"], "route_hash": self.route["route_hash"],
+                   "terminal_gate_proven": True, "terminal_owner_attempt_id": "att-owner"}
+        self.path.with_suffix(".outcome.json").write_text(json.dumps(outcome))
+        with mock.patch.object(W, "_rows", return_value={"att-owner": ("done", {"workflow_completion": "runtime-v1"})}):
+            for state in ("pending", "blocked", "unknown", "complete"):
+                with mock.patch.object(terminal, "owner_completion_state", return_value=terminal.CompletionState(state)):
+                    self.assertEqual(self.start()["state"], "completed" if state == "complete" else "needs-attention")
         self.assertEqual(self.calls, [])
 
     def test_production_selector_and_three_adapter_parsers_accept_the_public_request(self):

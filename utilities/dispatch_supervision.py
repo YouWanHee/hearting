@@ -78,6 +78,12 @@ def _pending(rows: dict, attempts: list[str], jobs: Path, reason=None) -> bool:
         if aid not in rows:
             raise SupervisionError("supervision-attempt-missing")
         status, meta = rows[aid]
+        # A supervisor can exit normally after route close while the ledger's
+        # final settlement is still being flushed. Its old wait obligation is
+        # over; a genuine closure-blocked notice remains a separate obligation.
+        from dispatch_notice_state import route_obligation_closed
+        if reason == "supervisor-exited" and route_obligation_closed(meta, jobs):
+            continue
         if meta.get("workflow_completion") == "runtime-v1":
             from dispatch_terminal_commit import owner_completion_pending
             if owner_completion_pending(jobs, status, meta):

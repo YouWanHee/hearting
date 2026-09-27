@@ -59,8 +59,9 @@ binds `direct`, `quick`, and `standard+`; only the acting owner differs.
 
 1. **prepare the route's cycle.** Registered frame/owner launch prepares or
    resumes the route's cycle and carries its exact `AGENT_ARTIFACT_*` context.
-   Inline work uses `artifact_producer.py begin --artifact-root <root>
-   --route <route file> --capability autopilot-code --intensity direct`.
+   Inline `compose --start` / `start` prepares the same cycle and returns
+   `artifact_env` with its exact output path; no separate `begin` is needed.
+   Compile-only legacy routes can still use explicit producer `begin`.
 2. **write only inside the open cycle.** Every durable artifact goes under
    `<cycle_dir>/artifacts/plans/...` (`AGENT_ARTIFACT_OUTPUT_DIR`).
    `artifact_producer.py check-write` is the single allow/deny oracle used by

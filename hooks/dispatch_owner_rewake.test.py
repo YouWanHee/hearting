@@ -42,6 +42,43 @@ sys.modules[_JOIN_SPEC.name] = JOIN
 _JOIN_SPEC.loader.exec_module(JOIN)
 
 
+def _gate_authority(jobs, recipient, delivery_id):
+    """An outstanding receipt alone is not proof that a human gate exists."""
+    from route_identity import route_hash
+    from workflow_state import WorkflowLedger
+    from dispatch_contract import parse_registry_metadata
+    record = rewake.pending_delivery.read(jobs.parent, recipient, delivery_id)
+    child = record["receipt"]["children"][0]
+    Path(child["reason"]).write_text("{}")
+    aid = child["attempt_id"]
+    route = {"route_id": record["route_id"], "nodes": [{"id": record["route_node"],
+        "continuation": {"kind": "human-gate", "gate": "frame-review"}}]}
+    route["route_hash"] = route_hash(route)
+    path = jobs.parent / (route["route_id"] + ".json")
+    path.write_text(json.dumps(route))
+    lines = jobs.read_text().splitlines()
+    found = False
+    for index, line in enumerate(lines):
+        fields = line.split("\t")
+        meta = parse_registry_metadata(fields[5])
+        if meta.get("attempt_id") != aid:
+            continue
+        found = True
+        meta.update(route_file=str(path), route_id=route["route_id"], route_hash=route["route_hash"])
+        fields[5] = ",".join(k+"="+v for k,v in meta.items())
+        lines[index] = "\t".join(fields)
+    if not found:
+        lines.append("now\tdone\t/r\t/w\tgate\t" + ",".join(f"{k}={v}" for k,v in dict(
+            attempt_id=aid, parent_sid=recipient, route_file=str(path), route_id=route["route_id"],
+            route_hash=route["route_hash"]).items()))
+    jobs.write_text("\n".join(lines) + "\n")
+    journal = WorkflowLedger(route["route_id"], route["route_hash"], jobs=jobs).journal_path
+    journal.parent.mkdir(parents=True, exist_ok=True)
+    journal.write_text(json.dumps({"workflow_state": "BLOCKED_HUMAN_GATE", "evidence": {
+        "gate": "frame-review", "artifact": child["reason"], "delivery": str(
+            rewake.pending_delivery.record_path(jobs.parent, recipient, delivery_id))}}) + "\n")
+
+
 def _wait_for_attempt_bridge_states() -> frozenset[str]:
     """Walk the module source for every state literal `wait_for_attempt`
     can hand to `classified_receipt`/`emit_receipt`. Reading the AST instead
@@ -1615,7 +1652,7 @@ class LosingCarrierLeavesGatesTest(CarrierOneClaimGateTest):
         receipt = {"schema_version": 2, "state": "attention", "parent_attempt_id": owner,
                    "job_registry": str(self.jobs), "delivery_classification": "attention",
                    "children": [{"attempt_id": owner, "status": "open", "readiness": "human-gate",
-                                 "reason": "shards/frame/interview.json",
+                                 "reason": str(self.root / "interview.json"),
                                  "required_action": "human-gate:frame-review", "harness": "claude",
                                  "delivery_classification": "attention"}]}
         rewake.pending_delivery.create(
@@ -1624,6 +1661,7 @@ class LosingCarrierLeavesGatesTest(CarrierOneClaimGateTest):
             attempt_ids=[owner], parent_attempt_id=owner, route_id="rt-parallel", route_node="frame",
             receipt=receipt, receipt_digest=rewake.pending_delivery._canonical_receipt_digest(receipt),
             row_revisions={owner: "human-gate:frame-review"})
+        _gate_authority(self.jobs, "session-1", delivery_id)
         rewake._RECIPIENT_KEY_CACHE.clear()
         return delivery_id
 
@@ -1674,7 +1712,7 @@ class LosingCarrierLeavesGatesTest(CarrierOneClaimGateTest):
                 self._gate(f"delivery-foreign-{label}", owner="att-someone-else")
                 code, _out, err = self._run_main_patched(**patches)
                 self.assertEqual(code, 2)             # the gate is worth waking for
-                self.assertIn("human gate is open", err)
+                self.assertIn("required_action=human-gate:frame-review", err)
                 ledger = rewake._read_arm(rewake.arm_path(self.jobs, "att-owner-1"))
                 self.assertEqual(ledger["state"], "lapsed")   # not `ended`
                 rewake.arm_path(self.jobs, "att-owner-1").unlink()
@@ -1693,7 +1731,7 @@ class LosingCarrierLeavesGatesTest(CarrierOneClaimGateTest):
         with mock.patch.object(rewake, "runtime_ancestry_binding", return_value=self.ANCESTRY):
             code, out, err = self._run_main()
         self.assertEqual(code, 2)
-        self.assertIn("human gate is open", err)
+        self.assertIn("required_action=human-gate:frame-review", err)
         self.assertEqual(rewake.pending_delivery.read(self.root, "session-1", gate_id)["state"], "acked")
         # and when the emit itself fails, the gate stays retryable
         rewake.arm_path(self.jobs, "att-owner-1").unlink()   # a fresh claim for the second run
@@ -1944,7 +1982,7 @@ class GateCarrierTest(unittest.TestCase):
             "delivery_classification": "attention",
             "children": [{
                 "attempt_id": "att-gate-owner", "status": "open",
-                "readiness": "human-gate", "reason": "shards/frame/frame-summary.json",
+                "readiness": "human-gate", "reason": str(self.root / "frame-summary.json"),
                 "required_action": "human-gate:frame-review", "harness": "claude",
                 "delivery_classification": "attention",
             }],
@@ -1959,6 +1997,7 @@ class GateCarrierTest(unittest.TestCase):
             receipt_digest=rewake.pending_delivery._canonical_receipt_digest(receipt),
             row_revisions={"att-gate-owner": "human-gate:frame-review"},
         )
+        _gate_authority(self.jobs, "session-gate", delivery_id)
         if state in {"claimed", "sent-ambiguous"}:
             rewake.pending_delivery.claim(
                 self.state, "session-gate", delivery_id,
@@ -1989,6 +2028,17 @@ class GateCarrierTest(unittest.TestCase):
         notices = rewake._gate_notices(self._launch())
         self.assertEqual(len(notices), 1)
         self.assertIn("human-gate:frame-review", notices[0])
+
+    def test_supervision_is_never_introduced_as_a_human_gate(self):
+        notice = "Hearting supervision needs attention. reason=supervisor-exited required_action=inspect-recovery"
+        with mock.patch.object(rewake, "_gate_notices", return_value=[notice]), \
+                mock.patch.object(rewake, "emit_receipt", return_value=2) as emit, \
+                mock.patch.object(rewake, "_ended", return_value=2):
+            rewake._emit_with_gates(self._launch(), None, "success", "Finished.", block=False)
+        message = emit.call_args.args[1]
+        self.assertIn(notice, message)
+        self.assertNotIn("human gate", message)
+        self.assertNotIn("your decision", message)
 
     def test_gate_notices_survives_an_expired_claim(self):
         """The regression, executed rather than inspected. `reclaim` is
@@ -2073,7 +2123,7 @@ class GateCarrierTest(unittest.TestCase):
             "delivery_classification": "attention",
             "children": [{
                 "attempt_id": "att-foreign", "status": "open",
-                "readiness": "human-gate", "reason": "x.json",
+                "readiness": "human-gate", "reason": str(self.root / "foreign.json"),
                 "required_action": "human-gate:frame-review", "harness": "claude",
                 "delivery_classification": "attention",
             }],
@@ -2087,6 +2137,7 @@ class GateCarrierTest(unittest.TestCase):
             receipt_digest=rewake.pending_delivery._canonical_receipt_digest(receipt),
             row_revisions={"att-foreign": "human-gate:frame-review"},
         )
+        _gate_authority(self.jobs, "session-gate", "delivery-foreign-gate")
         self.assertEqual(rewake._gate_notices(self._launch(), attempt_only=True), [])
         # the terminal wake still folds every open gate for the recipient in
         self.assertEqual(len(rewake._gate_notices(self._launch())), 1)

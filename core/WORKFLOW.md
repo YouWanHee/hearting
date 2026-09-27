@@ -204,6 +204,9 @@ it records intent, releases the gate, and starts the owner. Already answered
 questions can supply both files without asking again. `--decision revise|stop`
 records those choices; repeated answers reuse the recorded decision.
 Runtime settlement closes the route and cycle before owner success is delivered.
+Direct start also prepares the inline cycle and returns its `artifact_env`;
+use that output path without a separate producer `begin`. Replaying start on a
+proven closed route returns its outcome without launching or reopening work.
 The model does not assemble launch tuples or artifact variables, harvest, or
 finalize ordinary work. Recovery commands name the exact
 attempt; a changed scope still belongs to the user.

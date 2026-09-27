@@ -1023,7 +1023,7 @@ def _carrier_one_claim(launch: Launch, metadata: dict[str, str]) -> ClaimWin | N
     root = launch.jobs.resolve(strict=False).parent
     claim_owner = f"claude-async-rewake:{os.getpid()}:{time.monotonic_ns()}"
     try:
-        pending_delivery.claim(
+        record = pending_delivery.claim(
             root,
             recipient_key,
             delivery_id,
@@ -1032,6 +1032,9 @@ def _carrier_one_claim(launch: Launch, metadata: dict[str, str]) -> ClaimWin | N
             require_generation_proof=False,
         )
     except pending_delivery.PendingDeliveryError:
+        return None
+    from dispatch_notice_state import keep_claim
+    if not keep_claim(root, recipient_key, delivery_id, record, claim_owner, jobs=launch.jobs):
         return None
     return ClaimWin(claim_owner, recipient_key, delivery_id, root)
 
@@ -1204,15 +1207,9 @@ def _gate_notices(
             )
         except pending_delivery.PendingDeliveryError:
             continue
-        if record.get("receipt", {}).get("kind") == "supervision":
-            try:
-                from dispatch_supervision import notice_is_current
-                if not notice_is_current(record):
-                    pending_delivery.reject_claimed(root, recipient_key, delivery_id,
-                        claim_owner=claim_owner, reason="supervision-resolved")
-                    continue
-            except (OSError, ValueError, pending_delivery.PendingDeliveryError):
-                continue
+        from dispatch_notice_state import keep_claim
+        if not keep_claim(root, recipient_key, delivery_id, record, claim_owner, jobs=launch.jobs):
+            continue
         notices.append(_bounded_receipt_text(record))
         if announced is not None:
             announced.append(delivery_id)
@@ -1438,7 +1435,7 @@ def _emit_with_gates(launch: Launch, claim: ArmClaim, state: str, message: str, 
         state = "attention"
         message = (
             message
-            + " A human gate is open and awaiting your decision; it is answered, not harvested. "
+            + " Current runtime notices: "
             + " ".join(gates)
         )
     exit_code = emit_receipt(state, message, block=block)

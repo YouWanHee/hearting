@@ -225,6 +225,14 @@ class HumanGateReceiptTest(unittest.TestCase):
             self.assertEqual(fixture.validate(), fixture.receipt)
             self.assertEqual(fixture.validate_record()["delivery_id"], fixture.delivery_id)
 
+    def test_closed_route_cannot_deliver_an_old_still_blocked_gate(self) -> None:
+        fixture = self.fixture
+        fixture.route_file.with_suffix(".outcome.json").write_text(json.dumps({
+            "route_id": fixture.route["route_id"], "route_hash": fixture.route["route_hash"],
+            "terminal_gate_proven": False}))
+        with self.assertRaisesRegex(self.module.HumanGateReceiptError, "route-already-closed"):
+            fixture.validate()
+
     def test_explicit_jobs_selects_journal_not_environment_override(self) -> None:
         foreign = self.fixture.root / "foreign-workflow"
         foreign.mkdir()

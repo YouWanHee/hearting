@@ -445,9 +445,32 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
     resume = shlex.join([sys.executable, str(ROOT / "utilities/capability-route.py"),
                          "start", "--route", str(path), "--jobs", str(jobs)])
     result["resume_command"] = resume
+    from dispatch_notice_state import closed_outcome
+    closed = closed_outcome(path, route)
+    if closed:
+        # Replaying a finished request cannot prepare frames or reopen a cycle.
+        # A closure with an explicitly unproven gate is not successful work.
+        if closed.get("terminal_gate_proven") is not True:
+            return {**result, "state": "needs-attention", "reason": "route-closed-unproven",
+                    "required_action": "inspect-closed-route", "outcome": closed}
+        owner = closed.get("terminal_owner_attempt_id")
+        rows = _rows(jobs)
+        if owner and owner not in rows:
+            raise ValueError("closed-route-owner-missing")
+        for aid, (status, meta) in rows.items():
+            if meta.get("workflow_completion") == "runtime-v1" and (
+                    aid == owner or route["route_id"] in {meta.get("route_id"), meta.get("owner_route_id")}):
+                from dispatch_terminal_commit import owner_completion_state
+                settlement = owner_completion_state(jobs, status, meta)
+                if settlement.state != "complete":
+                    return {**result, "state": "needs-attention", "reason": "workflow-completion-pending",
+                            "required_action": "inspect-recovery", "outcome": closed}
+        return {**result, "state": "completed", "required_action": "advance-completed", "outcome": closed}
     if route["effective_intensity"] == "direct":
+        from artifact_producer import prepare_route_artifact_env
         return {**result, "state": "inline", "required_action": "execute-inline",
-                "task": request["text"]}
+                "task": request["text"],
+                "artifact_env": prepare_route_artifact_env(path, start=True, jobs=jobs)}
     rows = _rows(jobs)
     existing_owner = _slot(route, "owner", rows)
     frames = ([] if existing_owner in rows and not (interview or answers) else

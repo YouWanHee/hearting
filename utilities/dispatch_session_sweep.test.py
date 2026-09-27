@@ -101,6 +101,9 @@ def _receipt(**overrides):
 class SweepTest(IsolatedRootMixin, unittest.TestCase):
     def _seed(self, session_id="sess-owner", **overrides):
         receipt = overrides.pop("receipt", _receipt())
+        self.root.mkdir(parents=True, exist_ok=True)
+        (self.root / "jobs.log").touch()
+        receipt["job_registry"] = str(self.root / "jobs.log")
         kwargs = dict(
             root=self.root,
             recipient_kind="claude-parent-runtime",
@@ -189,6 +192,8 @@ class SweepTest(IsolatedRootMixin, unittest.TestCase):
         context = payload["hookSpecificOutput"]["additionalContext"]
         self.assertEqual(payload["hookSpecificOutput"]["hookEventName"], "UserPromptSubmit")
         self.assertIn("att-0000000000000000000000000000bbbb", context)
+        self.assertNotIn("Harvest each attempt", context)
+        self.assertIn("Follow each receipt's required_action", context)
         state = PD.read(self.root, "sess-owner", "delivery-" + "a" * 32)["state"]
         self.assertEqual(state, "acked")
 

@@ -264,6 +264,9 @@ def _load_route(receipt: dict[str, Any]) -> dict[str, Any]:
         or computed_route_hash(route) != receipt["route_hash"]
     ):
         raise HumanGateReceiptError("route-identity-mismatch")
+    from dispatch_notice_state import closed_outcome
+    if closed_outcome(path, route):
+        raise HumanGateReceiptError("route-already-closed")
     node = next(
         (
             row

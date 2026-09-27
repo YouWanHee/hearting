@@ -110,11 +110,15 @@ def main() -> int:
         )
     if lines:
         blocks.append(
-            "Hearting dispatch completion delivery (SD-111 durable pending records for this "
-            "session; a record may repeat one earlier async notice -- if that attempt was already "
-            "harvested, ignore it). Harvest each attempt with the exact checked surface "
-            "(`dispatch-attempt-ready.py --attempt <id>` or `preflight.sh harvest`), then continue "
-            "the owning route. Do not start Monitor, dispatch-wait, or a polling loop.\n"
+            "Hearting runtime delivery (SD-111 durable pending records for this session). "
+            "Follow each receipt's required_action. advance-completed confirms that attempt's "
+            "completion: consume its result without another harvest, then follow the owning "
+            "route's next-action receipt for any remaining stages. Runtime-v1 owners have "
+            "runtime-owned close/finalize; a closed route needs no restart. "
+            "inspect-recovery is a runtime diagnostic, not a request for a user decision. "
+            "For other unresolved actions use the exact checked recovery surface. "
+            "A receipt may repeat an earlier async notice; do not repeat an already handled action. "
+            "Do not start Monitor, dispatch-wait, or a polling loop.\n"
             + "\n".join(f"- {line}" for line in lines)
         )
     context = "\n\n".join(blocks)

@@ -3595,6 +3595,24 @@ class LocatorDateDuplicationTest(ProducerTestBase):
 
 
 class RouteLaunchContextTest(ProducerTestBase):
+    def test_direct_start_returns_one_real_cycle_even_with_foreign_inherited_env(self):
+        import work_start
+        self.activate()
+        from route_identity import route_hash, route_id_from_hash
+        route = compile_for("direct", self.root)
+        route["work_request"] = {"text": "Apply the approved small fix", "owner_harness": None}
+        route["route_hash"] = route_hash(route)
+        route["route_id"] = route_id_from_hash(route["route_hash"])
+        path = Path(L.admit_runtime_route(self.root, route).route_file)
+        with mock.patch.dict(os.environ, {"AGENT_ARTIFACT_CYCLE_ID": "cyc_foreign",
+                                        "AGENT_ARTIFACT_OUTPUT_DIR": "/foreign/artifacts"}):
+            first = work_start.start_work(route, path, self.jobs)
+            second = work_start.start_work(route, path, self.jobs)
+        self.assertEqual(first["state"], "inline", first)
+        self.assertEqual(second["artifact_env"], first["artifact_env"])
+        self.assertEqual(len(list(P.list_cycle_records(self.root))), 1)
+        self.assertTrue(Path(first["artifact_env"]["AGENT_ARTIFACT_OUTPUT_DIR"]).is_dir())
+
     def test_route_launch_prepares_exact_context_once_without_copied_env(self):
         self.activate()
         route, path = self.route()

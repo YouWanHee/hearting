@@ -186,15 +186,9 @@ def sweep_deliver(
                 )
             except pending_delivery.PendingDeliveryError:
                 continue
-            if record.get("receipt", {}).get("kind") == "supervision":
-                try:
-                    from dispatch_supervision import notice_is_current
-                    if not notice_is_current(record):
-                        pending_delivery.reject_claimed(root, session_id, delivery_id,
-                            claim_owner=claim_owner, reason="supervision-resolved")
-                        continue
-                except (OSError, ValueError, pending_delivery.PendingDeliveryError):
-                    continue  # Preserve the lease and retry through the existing queue.
+            from dispatch_notice_state import keep_claim
+            if not keep_claim(root, session_id, delivery_id, record, claim_owner):
+                continue
             claimed.append(record)
     except OSError:
         pass
