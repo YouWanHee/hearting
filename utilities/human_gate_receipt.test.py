@@ -233,6 +233,32 @@ class HumanGateReceiptTest(unittest.TestCase):
         with self.assertRaisesRegex(self.module.HumanGateReceiptError, "route-already-closed"):
             fixture.validate()
 
+    def test_pending_gate_survives_first_publication_and_reissue_window(self) -> None:
+        import dispatch_session_sweep as sweep
+        for reissue in (False, True):
+            with self.subTest(reissue=reissue), tempfile.TemporaryDirectory() as directory:
+                f = Fixture(Path(directory), self.module)
+                committed = f.journal.read_text()
+                previous = json.loads(committed)
+                previous["evidence"]["delivery"] = "/previous/delivery.json"
+                prior = (json.dumps(previous) + "\n") if reissue else ""
+                prior += json.dumps({"workflow_state": "RUNNING", "evidence": {"released_gate": f.gate}}) + "\n"
+                f.journal.write_text(prior)
+                f.receipt["gate_epoch"] = 2 if reissue else 1
+                pending.create(f.jobs.parent, delivery_id=f.delivery_id, recipient_kind="codex-managed-gateway",
+                    recipient_key=f.thread_id, session_generation=str(f.gateway_epoch), session_generation_supported="1",
+                    attempt_ids=[f.owner_attempt], parent_attempt_id=f.owner_attempt,
+                    route_id=f.route["route_id"], route_node=f.route_node, receipt=f.receipt,
+                    receipt_digest=self.module.receipt_digest(f.receipt),
+                    row_revisions={f.owner_attempt: f"human-gate:{f.gate}:{f.receipt['gate_epoch']}"})
+                self.assertEqual(sweep.sweep_deliver(f.jobs.parent, "codex-managed-gateway", f.thread_id)[0], [])
+                claimed = pending.read(f.jobs.parent, f.thread_id, f.delivery_id)
+                self.assertEqual(claimed["state"], "claimed")
+                f.journal.write_text(prior + committed)
+                records, _ = sweep.sweep_deliver(f.jobs.parent, "codex-managed-gateway", f.thread_id,
+                                                now_ns=claimed["claim_deadline_ns"] + 1)
+                self.assertEqual([r["delivery_id"] for r in records], [f.delivery_id])
+
     def test_explicit_jobs_selects_journal_not_environment_override(self) -> None:
         foreign = self.fixture.root / "foreign-workflow"
         foreign.mkdir()

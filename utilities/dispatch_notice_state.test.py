@@ -94,7 +94,8 @@ class NoticeTest(unittest.TestCase):
         self.journal(record)
         self.assertTrue(notice.notice_is_current(record))  # owner row is already done
         path = self.journal(record, delivery="/another/delivery.json")
-        self.assertFalse(notice.notice_is_current(record))
+        with self.assertRaisesRegex(ValueError, "publication-pending"):
+            notice.notice_is_current(record)
         self.journal(record)
         with path.open("a") as stream:
             stream.write(json.dumps({"workflow_state": "RUNNING", "evidence": {"released_gate": "review"}}) + "\n")
@@ -115,6 +116,35 @@ class NoticeTest(unittest.TestCase):
         self.artifact.unlink()
         self.assertEqual(sweep.sweep_deliver(self.root, "claude-parent-runtime", "parent")[0], [])
         self.assertEqual(pending.read(self.root, "parent", "delivery-notice")["state"], "claimed")
+
+    def publication_race(self, *, reissue=False):
+        record = self.seed("human-gate:review")
+        path = self.journal(record, delivery="/previous/delivery.json")
+        prior = path.read_text() if reissue else ""
+        prior += json.dumps({"workflow_state": "RUNNING", "evidence": {"released_gate": "review"}}) + "\n"
+        path.write_text(prior)
+        self.assertEqual(sweep.sweep_deliver(self.root, "claude-parent-runtime", "parent")[0], [])
+        claimed = pending.read(self.root, "parent", "delivery-notice")
+        self.assertEqual(claimed["state"], "claimed")
+        self.journal(record)
+        path.write_text(prior + path.read_text())
+        records, _ = sweep.sweep_deliver(self.root, "claude-parent-runtime", "parent",
+                                        now_ns=claimed["claim_deadline_ns"] + 1)
+        self.assertEqual([r["delivery_id"] for r in records], [record["delivery_id"]])
+
+    def test_first_gate_published_after_sweep_remains_deliverable(self):
+        self.publication_race()
+
+    def test_reissued_gate_does_not_inherit_previous_release(self):
+        self.publication_race(reissue=True)
+
+    def test_exact_old_release_remains_resolved_after_next_raise(self):
+        record = self.seed("human-gate:review")
+        path = self.journal(record)
+        prior = path.read_text() + json.dumps({"workflow_state": "RUNNING", "evidence": {"released_gate": "review"}}) + "\n"
+        self.journal(record, delivery="/new/delivery.json")
+        path.write_text(prior + path.read_text())
+        self.assertFalse(notice.notice_is_current(record))
 
 
 if __name__ == "__main__":

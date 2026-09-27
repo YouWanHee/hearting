@@ -49,9 +49,36 @@ def route_obligation_closed(metadata: dict, jobs: Path) -> bool:
     return bool(bound and closed_outcome(*bound))
 
 
+def _gate_resolution(entries: list, gate: str, delivery: str) -> dict:
+    """Resolve this delivery's raise, never a previous or future question.
+
+    The producer writes pending before BLOCKED_HUMAN_GATE. Absence of that
+    exact raise is still publication in progress, not proof of resolution.
+    Keep earlier resolved raises readable after a later question was raised.
+    """
+    from workflow_state import human_gate_resolution
+    found = False
+    end = len(entries)
+    for index, entry in enumerate(entries):
+        evidence = entry.get("evidence") or {}
+        if not isinstance(evidence, dict):
+            raise ValueError("notice-gate-journal-invalid")
+        if entry.get("workflow_state") == "BLOCKED_HUMAN_GATE" and evidence.get("gate") == gate:
+            if found:
+                end = index
+                break
+            found = evidence.get("delivery") == delivery
+    if not found:
+        raise ValueError("notice-gate-publication-pending")
+    resolution = human_gate_resolution(entries[:end], gate)
+    if end < len(entries) and resolution["status"] == "blocked":
+        raise ValueError("notice-gate-journal-conflict")
+    return resolution
+
+
 def _legacy_gate_current(record: dict, jobs: Path, child: dict, metadata: dict) -> bool:
     import dispatch_pending_delivery as pending
-    from workflow_state import WorkflowLedger, human_gate_resolution, node_raises_human_gate
+    from workflow_state import WorkflowLedger, node_raises_human_gate
     bound = bound_route(metadata, jobs, record.get("route_id", ""))
     if bound is None:
         raise ValueError("notice-gate-route-unbound")
@@ -67,12 +94,12 @@ def _legacy_gate_current(record: dict, jobs: Path, child: dict, metadata: dict) 
     entries = [json.loads(line) for line in journal.read_text().splitlines() if line.strip()]
     if any(not isinstance(entry, dict) for entry in entries):
         raise ValueError("notice-gate-journal-invalid")
-    resolution = human_gate_resolution(entries, gate)
     expected = pending.record_directory(jobs.parent, metadata["parent_sid"]) / (record["delivery_id"] + ".json")
-    current = (resolution["status"] == "blocked"
-            and resolution.get("delivery") == str(expected)
-            and resolution.get("artifact") == child.get("reason"))
+    resolution = _gate_resolution(entries, gate, str(expected))
+    current = resolution["status"] == "blocked"
     if current:
+        if resolution.get("artifact") != child.get("reason"):
+            raise ValueError("notice-gate-artifact-mismatch")
         from human_gate_receipt import _absolute_regular
         _absolute_regular(child["reason"], "artifact")
         if resolution.get("artifact_sha256"):
@@ -95,11 +122,12 @@ def notice_is_current(record: dict, *, jobs: Path | None = None) -> bool:
                 return False
             raise
         gate._validate_shape(receipt)
-        resolution = __import__("workflow_state").human_gate_resolution(
-            gate._load_journal(receipt, Path(receipt["job_registry"])), receipt["gate"])
-        return (resolution["status"] == "blocked" and resolution["epoch"] == receipt["gate_epoch"]
-                and resolution.get("delivery") == str(gate.pending_delivery.record_path(
-                    Path(receipt["job_registry"]).parent, receipt["recipient_thread_id"], record["delivery_id"])))
+        resolution = _gate_resolution(gate._load_journal(receipt, Path(receipt["job_registry"])),
+            receipt["gate"], str(gate.pending_delivery.record_path(Path(receipt["job_registry"]).parent,
+                receipt["recipient_thread_id"], record["delivery_id"])))
+        if resolution["epoch"] != receipt["gate_epoch"]:
+            raise ValueError("notice-gate-epoch-unproved")
+        return resolution["status"] == "blocked"
     from dispatch_supervision import _rows
     # Terminal-intent receipts deliberately omit job_registry. The carrier
     # already owns the exact queue root; never resolve an empty string to cwd.
