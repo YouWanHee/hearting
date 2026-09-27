@@ -1940,6 +1940,18 @@ class RouteReuseProofTest(unittest.TestCase):
         self.assertTrue(self._proof(target))
         recorded = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(recorded["merge_result"]["proof"], "exact-fast-forward-reflog")
+        # The exact fast-forward result remains a valid integration anchor
+        # while the same target branch advances along its first-parent line.
+        subprocess.run(["git", "-C", str(target), "commit", "--allow-empty", "-qm", "follow-up"],
+                       check=True)
+        self.assertTrue(self._proof(target))
+        foreign_result = dict(recorded, merge_result=dict(
+            recorded["merge_result"], target_new_head=old))
+        path.write_text(json.dumps(foreign_result), encoding="utf-8")
+        self.assertFalse(self._proof(target))
+        path.write_text(json.dumps(recorded), encoding="utf-8")
+        subprocess.run(["git", "-C", str(target), "switch", "-qc", "unrelated-target"], check=True)
+        self.assertFalse(self._proof(target))
 
     def test_in_progress_merge_head_passes_through_public_guard_cli(self):
         target = self.base / "merge-head-target"

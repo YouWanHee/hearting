@@ -3139,6 +3139,7 @@ class InlineProducerBindingAdmissionLockTest(ProducerTestBase):
                                           "AGENT_ROUTE_ID":"", "AGENT_ROUTE_NODE":""}):
             started = P.begin(self.root, route_file=route_file, capability="autopilot-code",
                               intensity="direct", jobs=self.jobs)
+        self.close(route, route_file)
         record = P.read_cycle_record(self.root, started["cycle_id"])
         campaign = P.read_campaign(self.root, record["campaign_id"])
         binding = {
@@ -3150,10 +3151,23 @@ class InlineProducerBindingAdmissionLockTest(ProducerTestBase):
             "terminal_marker_digest": "a" * 64, "evidence_sha256": "b" * 64,
             "inline_finish_id": "c" * 64,
         }
+        slot = self.root / ".runtime/inline-finish/v1" / route["route_id"] / "finish.json"
+        slot.parent.mkdir(parents=True)
+        slot.write_text(json.dumps({
+            "schema": "inline_finish_v1", "inline_finish_id": binding["inline_finish_id"],
+            "terminal_marker_digest": binding["terminal_marker_digest"], "state": "route-closed",
+            "intent": {key: binding[key] for key in (
+                "route_id", "route_hash", "artifact_root_id", "campaign_key",
+                "campaign_id", "cycle_id", "producer_id", "evidence_sha256")},
+        }))
+        # The first check must pass before the mocked lock changes the record.
+        P._inline_producer_binding_check(self.root, record["cycle_id"], binding)
         acquire = adm._acquire_lock
+        acquired = []
 
         def acquire_then_rebind(root, *args, **kwargs):
             fd = acquire(root, *args, **kwargs)
+            acquired.append(fd)
             changed = dict(P.read_cycle_record(self.root, record["cycle_id"]))
             changed["route_hash"] = "sha256:" + "f" * 64
             P._write_cycle_record(self.root, changed, exclusive=False)
@@ -3162,6 +3176,7 @@ class InlineProducerBindingAdmissionLockTest(ProducerTestBase):
         with mock.patch.object(adm, "_acquire_lock", side_effect=acquire_then_rebind):
             with self.assertRaisesRegex(P.ProducerError, "inline-producer-binding-mismatch"):
                 P.finalize_exact_cycle(self.root, cycle_id=record["cycle_id"], expected_binding=binding)
+        self.assertEqual(len(acquired), 1, "finalize must reach and recheck under the admission lock")
         self.assertFalse((Path(started["cycle_dir"]) / "manifest.json").exists())
         self.assertEqual(P.read_cycle_record(self.root, record["cycle_id"])["state"], "open")
 
