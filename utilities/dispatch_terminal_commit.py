@@ -19,6 +19,7 @@ from contextlib import contextmanager
 
 import artifact_lifecycle
 import route_identity
+import route_lineage
 import dispatch_contract
 import dispatch_lock_order
 from dispatch_attempt_policy import verdict_pass
@@ -530,7 +531,16 @@ def publish_producer_binding(*, artifact_root: Path, jobs: Path, route_file: Pat
     if not isinstance(record, dict) or record.get("cycle_id") != cycle_id or record.get("state") != "open":
         raise TerminalCommitError("producer-binding-mismatch", f"cycle:{cycle_id}")
     if record.get("route_id") != owner.route_id or record.get("route_hash") != owner.route_hash:
-        raise TerminalCommitError("producer-binding-mismatch", "cycle-route")
+        # D-120: a continuation owner resumes the cycle a verified ancestor
+        # began, so the begin route must sit in this route's hash-checked
+        # lineage with the hash the cycle recorded -- not be this route.
+        try:
+            lineage = route_lineage.verified_route_lineage(route, artifact_root=root)
+        except route_lineage.RouteLineageError as exc:
+            raise TerminalCommitError("producer-binding-mismatch", "cycle-route") from exc
+        begin = next((node for node in lineage if node.get("route_id") == record.get("route_id")), None)
+        if begin is None or begin.get("route_hash") != record.get("route_hash"):
+            raise TerminalCommitError("producer-binding-mismatch", "cycle-route")
     if identity is None:
         raise TerminalCommitError("producer-binding-mismatch", "root-identity")
     binding = {

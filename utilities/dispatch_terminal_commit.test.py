@@ -61,6 +61,46 @@ class ProducerBindingTests(unittest.TestCase):
                                        owner_attempt_id="att-owner", cycle_id="cyc_" + "d" * 32, owner_begin=True)
         self.assertEqual(caught.exception.code, "producer-binding-mismatch")
 
+    def _record_begun_by(self, route_id, route_hash):
+        path = self.root / ".runtime/artifact-producer/v1/cycles" / (self.cycle_id + ".json")
+        record = json.loads(path.read_text())
+        record.update(route_id=route_id, route_hash=route_hash)
+        path.write_bytes(json.dumps(record, sort_keys=True, separators=(",", ":")).encode())
+
+    @mock.patch.object(T.artifact_lifecycle, "read_root_identity", return_value=SimpleNamespace(repository_id="repo_x", artifact_root_id="root_y"))
+    @mock.patch.object(owner_route_binding, "resolve_owner_route_lifecycle")
+    def test_continuation_owner_binds_the_cycle_its_verified_ancestor_began(self, resolve, _identity):
+        resolve.return_value = (owner_route_binding.OwnerRouteBinding(str(self.route_file), "rt-abcdef12", "sha256:" + "a" * 64), "current")
+        parent = {"route_id": "rt-parent01", "route_hash": "sha256:" + "p" * 64}
+        self._record_begun_by(parent["route_id"], parent["route_hash"])
+        own = {"route_id": "rt-abcdef12", "route_hash": "sha256:" + "a" * 64}
+        with mock.patch.object(T.route_lineage, "verified_route_lineage", return_value=[own, parent]):
+            result = T.publish_producer_binding(artifact_root=self.root, jobs=self.jobs, route_file=self.route_file,
+                                                owner_attempt_id="att-owner", cycle_id=self.cycle_id, owner_begin=True)
+        self.assertEqual(result.binding["route_id"], "rt-abcdef12")
+        self.assertEqual(result.binding["cycle_id"], self.cycle_id)
+
+    @mock.patch.object(T.artifact_lifecycle, "read_root_identity", return_value=SimpleNamespace(repository_id="repo_x", artifact_root_id="root_y"))
+    @mock.patch.object(owner_route_binding, "resolve_owner_route_lifecycle")
+    def test_a_cycle_begun_outside_the_lineage_or_under_another_hash_stays_refused(self, resolve, _identity):
+        resolve.return_value = (owner_route_binding.OwnerRouteBinding(str(self.route_file), "rt-abcdef12", "sha256:" + "a" * 64), "current")
+        own = {"route_id": "rt-abcdef12", "route_hash": "sha256:" + "a" * 64}
+        parent = {"route_id": "rt-parent01", "route_hash": "sha256:" + "p" * 64}
+        cases = (
+            ("rt-stranger", "sha256:" + "s" * 64, [own, parent]),
+            ("rt-parent01", "sha256:" + "x" * 64, [own, parent]),
+            ("rt-parent01", "sha256:" + "p" * 64, T.route_lineage.RouteLineageError("route-lineage-unverified", "x")),
+        )
+        for begin_id, begin_hash, lineage in cases:
+            with self.subTest(begin=begin_id, hash=begin_hash[-4:]):
+                self._record_begun_by(begin_id, begin_hash)
+                effect = {"side_effect": lineage} if isinstance(lineage, Exception) else {"return_value": lineage}
+                with mock.patch.object(T.route_lineage, "verified_route_lineage", **effect), \
+                        self.assertRaises(T.TerminalCommitError) as caught:
+                    T.publish_producer_binding(artifact_root=self.root, jobs=self.jobs, route_file=self.route_file,
+                                               owner_attempt_id="att-owner", cycle_id=self.cycle_id, owner_begin=True)
+                self.assertEqual((caught.exception.code, caught.exception.detail), ("producer-binding-mismatch", "cycle-route"))
+
     def test_path_is_single_safe_derivation_and_digest_is_bytes(self):
         path = T.producer_binding_path(self.root, "rt-abcdef12", "att-owner")
         self.assertEqual(path, self.root / ".runtime/terminal-commits/v1/rt-abcdef12/att-owner/producer-binding.json")
