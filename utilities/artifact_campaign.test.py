@@ -602,10 +602,9 @@ class CampaignTest(F.ProducerTestBase):
         self.assertEqual(hits, [])
 
     def test_a24_12_old_reader_compatibility_boundaries(self):
-        # The isolated runner swaps HOME, so the caller's safe.directory no
-        # longer covers a checkout owned by another uid; without this the
-        # test skipped locally while CI (same-owner checkout) ran it.
-        git = ["git", "-c", "safe.directory=*"]
+        # The isolated runner trusts the checkout under test through its own
+        # GIT_CONFIG_GLOBAL, so this runs (not skips) there as it does in CI.
+        git = ["git"]
         repo = Path(__file__).resolve().parents[1]
         if subprocess.run(git + ["cat-file", "-e", "307a4b3a^{commit}"],
                           cwd=repo, capture_output=True).returncode:

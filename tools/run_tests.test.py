@@ -791,6 +791,27 @@ class CiLikeProfileFixture(unittest.TestCase):
         self.assertTrue(gitconfig.is_file())
         self.assertIn(str(self.root), gitconfig.read_text(encoding="utf-8"))
 
+    def test_isolated_env_trusts_only_the_checkout_under_test(self):
+        # A fresh HOME has no safe.directory, so git refused a checkout owned
+        # by another uid and git-using suites skipped locally (2026-09-26).
+        repo = self.root / "repo"
+        repo.mkdir()
+        env = self.mod.build_isolated_env(self.root / "iso", repo)
+        gitconfig = Path(env["GIT_CONFIG_GLOBAL"])
+        self.assertEqual(gitconfig.read_text(encoding="utf-8"), f"[safe]\n\tdirectory = {repo}\n")
+        self.assertTrue(str(gitconfig).startswith(str(self.root / "iso")))
+        default_env = self.mod.build_isolated_env(self.root / "default")
+        self.assertIn(str(self.mod.ROOT), Path(default_env["GIT_CONFIG_GLOBAL"]).read_text(encoding="utf-8"))
+        subprocess.run(["git", "init", "-q", str(repo)], check=True, env=env)
+        listed = subprocess.run(["git", "config", "--global", "--get-all", "safe.directory"],
+                                capture_output=True, text=True, env=env)
+        self.assertEqual(listed.stdout.strip(), str(repo))
+
+    def test_ci_like_reuses_the_isolated_trust_entry(self):
+        env = self.mod.build_ci_like_env(self.root / "ci", self.root)
+        self.assertEqual(Path(env["GIT_CONFIG_GLOBAL"]).read_text(encoding="utf-8"),
+                         f"[safe]\n\tdirectory = {self.root}\n")
+
     def test_equals_form_isolation_flag_overrides_declared_needs(self):
         write_suite(self.root, "needs_installed.test.py", "import sys\nsys.exit(0)\n")
         baseline = write_baseline(self.root, [])

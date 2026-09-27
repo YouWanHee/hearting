@@ -19,11 +19,10 @@ FLAG_RE = re.compile(
 
 
 def tracked_py_files():
-    # -c safe.directory=ROOT: the isolated test runner launches this suite
-    # under a fresh $HOME, which trips git's dubious-ownership refusal for a
-    # repository owned by a different (real) user than that empty profile.
+    # The isolated runner's GIT_CONFIG_GLOBAL trusts the checkout under test,
+    # so no per-suite safe.directory override is needed here.
     out = subprocess.run(
-        ["git", "-c", f"safe.directory={ROOT}", "-C", str(ROOT), "ls-files", "--", "*.py"],
+        ["git", "-C", str(ROOT), "ls-files", "--", "*.py"],
         capture_output=True, text=True, check=True,
     ).stdout
     return sorted(

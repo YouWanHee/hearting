@@ -135,7 +135,7 @@ _EXPLICIT_UNSET_KEYS = (
 )
 
 
-def build_isolated_env(tmpdir: Path) -> dict[str, str]:
+def build_isolated_env(tmpdir: Path, repo_root: Path = ROOT) -> dict[str, str]:
     """The single owner of the isolation definition (Q4). No caller-ambient
     execution path exists anywhere in this runner; every subprocess gets an
     environment built by this function (or build_installed_layout_env, which
@@ -162,6 +162,15 @@ def build_isolated_env(tmpdir: Path) -> dict[str, str]:
     # Admission contract suites otherwise prefer the repository's canonical
     # artifact root. Full-suite verification must remain fixture-only.
     env["ARTIFACT_ADMISSION_TEST_ROOT"] = str(tmpdir / "artifact-admission")
+    # The fresh HOME carries no safe.directory, so git refuses a checkout
+    # owned by another uid (a shared NAS checkout) and every git call a suite
+    # makes fails: git-using suites skipped or no-oped locally while CI, whose
+    # checkout has the runner's own owner, ran them (2026-09-26: an unrun
+    # campaign test reached main, and bytecode-cache-tolerance seeded nothing).
+    # Trust exactly the checkout under test -- no ambient config leaks in.
+    gitconfig = tmpdir / "gitconfig"
+    gitconfig.write_text(f"[safe]\n\tdirectory = {repo_root}\n", encoding="utf-8")
+    env["GIT_CONFIG_GLOBAL"] = str(gitconfig)
     # _EXPLICIT_UNSET_KEYS are simply omitted from `env` (env -i semantics: a
     # subprocess launched with this dict as its full environment never sees
     # them, regardless of what the caller's ambient shell has set).
@@ -192,7 +201,7 @@ def build_ci_like_env(tmpdir: Path, repo_root: Path) -> dict[str, str]:
     single-owner pattern as build_installed_layout_env: everything starts
     from build_isolated_env() and this function only adds to it.
     """
-    env = build_isolated_env(tmpdir)
+    env = build_isolated_env(tmpdir, repo_root)
     env["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
     home = Path(env["HOME"])
     for d in (home / ".local" / "bin", home / ".local" / "share", home / ".local" / "state"):
@@ -200,9 +209,6 @@ def build_ci_like_env(tmpdir: Path, repo_root: Path) -> dict[str, str]:
     runner_temp = home / "work" / "_temp"
     runner_temp.mkdir(parents=True, exist_ok=True)
     env["RUNNER_TEMP"] = str(runner_temp)
-    gitconfig = tmpdir / "gitconfig"
-    gitconfig.write_text(f"[safe]\n\tdirectory = {repo_root}\n", encoding="utf-8")
-    env["GIT_CONFIG_GLOBAL"] = str(gitconfig)
     env["HEARTING_ENV_LAYOUT"] = "github-runner"
     return env
 
@@ -1336,12 +1342,12 @@ def run_profile(
         tmp_roots.append(tmp)
         register_fixture_root(tmp)
         if profile == "isolated":
-            return build_isolated_env(tmp)
+            return build_isolated_env(tmp, root)
         if profile == "installed-layout":
             assert install_prefix is not None
             return build_installed_layout_env(tmp, install_prefix)
         if profile == "live-registry":
-            env = build_isolated_env(tmp)
+            env = build_isolated_env(tmp, root)
             env["HOME"] = os.environ.get("HOME", env["HOME"])
             return env
         if profile == "ci-like":
@@ -1398,7 +1404,7 @@ def main(argv: list[str]) -> int:
         if args.isolation == "ci-like":
             fp_env = build_ci_like_env(fp_root, args.root.resolve())
         else:
-            fp_env = build_isolated_env(fp_root)
+            fp_env = build_isolated_env(fp_root, args.root.resolve())
         run_fingerprint = environment_fingerprint(fp_env, args.isolation)
         fp_inputs = fingerprint_inputs(fp_env, args.isolation)
 
