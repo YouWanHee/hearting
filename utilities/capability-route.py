@@ -5270,9 +5270,9 @@ def _review_input_revision_records(route, node_id, jobs):
     return records
 
 
-def publish_review_input_revision(route, node_id, evidence, *, answers, author_attempt_id,
-                                  recorded_by="owner", jobs):
-    """SD-161's sole writer: changed input admits review, never publishes PASS."""
+def _review_input_revision_plan(route, node_id, evidence, *, answers, author_attempt_id,
+                                recorded_by="owner", jobs):
+    """Pure SD-161 proof shared by preview and the serialized publisher."""
     from artifact_producer import require_cycle_output
     import review_input
     if jobs is None:
@@ -5289,82 +5289,92 @@ def publish_review_input_revision(route, node_id, evidence, *, answers, author_a
         raise ValueError("review-input-revision-evidence-unreadable")
     if require_cycle_output(Path(route["artifact_root"]), evidence, route_id=route["route_id"]) is None:
         raise ValueError("review-input-revision-cycle-required")
-    directory = jobs.parent / "review-input-revisions" / route["route_id"] / node_id
+    lineage = review_lineage_routes(route, node_id)
+    lines = jobs.read_text(encoding="utf-8").splitlines()
+    rows = [row for generation in reversed(lineage)
+            for row in _review_round_rows(lines, generation["route_id"], node_id, jobs=jobs)]
+    budget = REVIEW_ROUND_CAP.round_budget(route, node, rows)
+    if budget.state in ("blocked-live", "blocked-unsettled"):
+        raise ValueError(f"review-input-revision-{budget.state}")
+    verdicts = [(status, meta) for status, meta in rows
+                if REVIEW_ROUND_CAP.classify_round_row(status, meta, worker_type="review") == "verdict"]
+    if not verdicts or verdicts[-1][1].get("note") != REVIEW_BLOCKING_NOTE:
+        raise ValueError("review-input-revision-blocking-verdict-required")
+    selected = verdicts[-1][1]
+    attempt = selected.get("attempt_id")
+    if tuple(answers) != (attempt,):
+        raise ValueError("review-input-revision-answer-not-current")
+    source = next(r for r in lineage if r["route_id"] == (selected.get("route_id") or selected.get("route")))
+    if ROUTE_IDENTITY.registered_node_identity(selected, node) != (source["route_id"], source["route_hash"], node_id):
+        raise ValueError("review-input-revision-source-route-mismatch")
+    terminal = inspect_terminal_attempt(selected.get("log_file"), worktree=route["cwd"],
+        artifact_root_metadata=selected.get("artifact_root") or route["artifact_root"], worker_type="review")
+    if terminal.get("state") != "valid" or terminal.get("verdict") != "FAIL" or terminal.get("artifact_state") != "readable":
+        raise ValueError("review-input-revision-verdict-unproven")
+    from dispatch_contract import attempt_process_quiescence
+    process = attempt_process_quiescence(selected, terminal_receipt=True)
+    if process.state != "quiescent":
+        raise ValueError(f"review-input-revision-process-{process.state}:{process.reason}")
+    original = review_input.read_binding(jobs, selected, verify_current=False)
+    if not original:
+        raise ValueError("review-input-revision-binding-required")
+    digest = hashlib.sha256(evidence.read_bytes()).hexdigest()
+    if digest == original["sha256"]:
+        raise ValueError("revision-evidence-unchanged")
+    records = _review_input_revision_records(route, node_id, jobs)
+    for record in records:
+        if record["answers"] == [attempt] and record["evidence"] == {"path": str(evidence), "sha256": digest}:
+            return {"input_revision": record, "tombstoned": []}, True
+    from datetime import datetime, timezone
+    record = {
+        "schema_version": 1, "route_id": route["route_id"], "route_hash": route["route_hash"],
+        "node_id": node_id, "jobs": str(jobs), "sequence": len(records) + 1,
+        "previous_digest": _sha256_record(records[-1]) if records else None,
+        "basis": "review-findings", "answers": [attempt],
+        "input_binding_digest": selected.get("review_input_digest"),
+        "of_evidence": {"path": original["path"], "sha256": original["sha256"]},
+        "evidence": {"path": str(evidence), "sha256": digest},
+        "author_attempt_id": author_attempt_id, "recorded_by": recorded_by,
+        "recorded_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+    return {"input_revision": record, "tombstoned": []}, False
+
+
+def preview_review_input_revision(route, node_id, evidence, *, answers, author_attempt_id,
+                                  recorded_by="owner", jobs):
+    """Check the exact writer authority without creating a lock or history file."""
+    result, _ = _review_input_revision_plan(
+        route, node_id, evidence, answers=answers, author_attempt_id=author_attempt_id,
+        recorded_by=recorded_by, jobs=jobs,
+    )
+    return result
+
+
+def publish_review_input_revision(route, node_id, evidence, *, answers, author_attempt_id,
+                                  recorded_by="owner", jobs):
+    """SD-161's sole writer: rerun the common proof under the existing jobs lock."""
+    options = dict(answers=answers, author_attempt_id=author_attempt_id,
+                   recorded_by=recorded_by, jobs=jobs)
+    # Refuse invalid authority before creating a lock, then prove it again in
+    # the critical section. Preview never enters the mutating branch below.
+    _review_input_revision_plan(route, node_id, evidence, **options)
+    jobs = Path(jobs).resolve()
     with _exclusive_lock(Path(f"{jobs}.lock")):
-        # Serialize against registered next rounds and owner transition writers.
-        _review_owner_authority(route, jobs, author_attempt_id)
-        lineage = review_lineage_routes(route, node_id)
-        lines = jobs.read_text(encoding="utf-8").splitlines()
-        rows = [row for generation in reversed(lineage)
-                for row in _review_round_rows(lines, generation["route_id"], node_id, jobs=jobs)]
-        budget = REVIEW_ROUND_CAP.round_budget(route, node, rows)
-        if budget.state in ("blocked-live", "blocked-unsettled"):
-            raise ValueError(f"review-input-revision-{budget.state}")
-        verdicts = [(status, meta) for status, meta in rows
-                    if REVIEW_ROUND_CAP.classify_round_row(status, meta, worker_type="review") == "verdict"]
-        if not verdicts or verdicts[-1][1].get("note") != REVIEW_BLOCKING_NOTE:
-            raise ValueError("review-input-revision-blocking-verdict-required")
-        selected = verdicts[-1][1]
-        attempt = selected.get("attempt_id")
-        if tuple(answers) != (attempt,):
-            raise ValueError("review-input-revision-answer-not-current")
-        source = next(r for r in lineage if r["route_id"] == (selected.get("route_id") or selected.get("route")))
-        if ROUTE_IDENTITY.registered_node_identity(selected, node) != (source["route_id"], source["route_hash"], node_id):
-            raise ValueError("review-input-revision-source-route-mismatch")
-        terminal = inspect_terminal_attempt(selected.get("log_file"), worktree=route["cwd"],
-            artifact_root_metadata=selected.get("artifact_root") or route["artifact_root"], worker_type="review")
-        if terminal.get("state") != "valid" or terminal.get("verdict") != "FAIL" or terminal.get("artifact_state") != "readable":
-            raise ValueError("review-input-revision-verdict-unproven")
-        from dispatch_contract import attempt_process_quiescence
-        process = attempt_process_quiescence(selected, terminal_receipt=True)
-        if process.state != "quiescent":
-            raise ValueError(f"review-input-revision-process-{process.state}:{process.reason}")
-        original = review_input.read_binding(jobs, selected, verify_current=False)
-        if not original:
-            raise ValueError("review-input-revision-binding-required")
-        digest = hashlib.sha256(evidence.read_bytes()).hexdigest()
-        if digest == original["sha256"]:
-            raise ValueError("revision-evidence-unchanged")
-        records = _review_input_revision_records(route, node_id, jobs)
-        for record in records:
-            if record["answers"] == [attempt] and record["evidence"] == {"path": str(evidence), "sha256": digest}:
-                return {"input_revision": record, "tombstoned": []}
-        from datetime import datetime, timezone
-        record = {
-            "schema_version": 1, "route_id": route["route_id"], "route_hash": route["route_hash"],
-            "node_id": node_id, "jobs": str(jobs), "sequence": len(records) + 1,
-            "previous_digest": _sha256_record(records[-1]) if records else None,
-            "basis": "review-findings", "answers": [attempt],
-            "input_binding_digest": selected.get("review_input_digest"),
-            "of_evidence": {"path": original["path"], "sha256": original["sha256"]},
-            "evidence": {"path": str(evidence), "sha256": digest},
-            "author_attempt_id": author_attempt_id, "recorded_by": recorded_by,
-            "recorded_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        }
-        # Publish only a complete fsynced record. A crash while writing the
-        # private temporary file cannot poison the numbered history forever.
+        result, existing = _review_input_revision_plan(route, node_id, evidence, **options)
+        if existing:
+            return result
+        record = result["input_revision"]
+        directory = jobs.parent / "review-input-revisions" / route["route_id"] / node_id
         from artifact_receipt import _write_once
         directory.mkdir(parents=True, exist_ok=True)
-        path = directory / f"{len(records) + 1:06d}.json"
+        path = directory / f"{record['sequence']:06d}.json"
         encoded = (json.dumps(record, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
         if not _write_once(directory, path, encoded) and path.read_bytes() != encoded:
             raise ValueError("review-input-revision-history-conflict")
-        return {"input_revision": record, "tombstoned": []}
+        return result
 
 
-def publish_revision_locked(route, node_id, evidence, *, basis, answers=(), direction=None,
-                            reason=None, author_attempt_id, recorded_by="owner", jobs=None):
-    """SD-154 rule 1: the one writer for a gate-evidence revision.
-
-    Reuses the node completion lock and the history-sequence writer
-    `write_completion_marker` already uses. Publishes marker k+1
-    (`stage_authority=revision`, `revision={...}` per rule 1) over `node_id`
-    and, in the same critical section, tombstones every downstream node's
-    canonical marker (rule 4: `<D>.<m+1>.json`,
-    `state=superseded-by-upstream-revision`). Every kept integrity refusal
-    (rule 6's "유지되는 거부") raises before any marker is touched -- "publish 0
-    markers" (A-SD154-5).
-    """
+def _revision_target(route, node_id, basis):
     node = next((n for n in route.get("nodes", []) if n.get("id") == node_id), None)
     if node is None:
         raise ValueError(f"unknown route node: {node_id}")
@@ -5374,127 +5384,164 @@ def publish_revision_locked(route, node_id, evidence, *, basis, answers=(), dire
     if review_input.is_review_node(node) and not review_input.has_plan_producer(route, node):
         if basis != "review-findings":
             raise ValueError("review-input-revision-review-findings-required")
+        return node, True
+    return node, False
+
+
+def _producer_revision_plan(route, node_id, evidence, *, basis, answers=(), direction=None,
+                            reason=None, author_attempt_id, recorded_by="owner", jobs=None):
+    """Pure producer revision proof; publication reruns it inside its node lock."""
+    node, input_only = _revision_target(route, node_id, basis)
+    if input_only:
+        raise ValueError("revision-producer-required")
+    directory = completion_dir(route["route_id"], jobs=jobs)
+    canonical_path = directory / f"{node_id}.json"
+    try:
+        marker = json.loads(canonical_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        # Not the gate's own missing-dependency reason (`dispatch_
+        # completion_marker.test.py`'s static guardian keeps that literal
+        # inside `dispatch_contract.py` and the adapters' relay) -- there
+        # is nothing to revise, a distinct fact from a dependent gate
+        # finding no marker for an unstarted node.
+        raise ValueError("revision-target-marker-absent")
+    currency = gate_currency(route, node, canonical_path, marker)
+    if currency.state == "current":
+        raise ValueError("revision-evidence-unchanged")
+    if currency.state != "revised-unrecorded":
+        # `superseded`, `completion-evidence-unreadable`, or any
+        # `integrity-broken:*` -- every one of these is a kept refusal
+        # (13.59.3 "유지되는 거부"), not something `revise` can record over.
+        raise ValueError(currency.reason)
+    evidence_path = Path(evidence).resolve()
+    if not (evidence_path.is_file() or evidence_path.is_dir()):
+        raise ValueError("completion-evidence-unreadable")
+    # D-120: a revision's new evidence is bound by the same admitted cycle
+    # write scope as an ordinary completion (`_publish_completion_locked`
+    # already requires this) -- an open neighbouring cycle, or a
+    # sealed/abandoned one, cannot certify a revision's evidence any more
+    # than it can an original completion's.
+    from artifact_producer import ProducerError, require_cycle_output
+    try:
+        require_cycle_output(Path(route["artifact_root"]), evidence_path, route_id=route["route_id"])
+    except ProducerError as exc:
+        raise ValueError(f"{exc.code}: {exc.detail}") from exc
+    evidence_sha = evidence_digest(evidence_path)
+    # Basis verification runs (and can raise `revision-basis-unverified`)
+    # before any write -- a refused revision must publish nothing.
+    revision_basis_verdict(route, node, basis, answers, jobs=jobs, direction=direction, reason=reason)
+    sequence = marker.get("sequence")
+    history_path = directory / f"{node_id}.{sequence}.json"
+    try:
+        prior_bytes = history_path.read_bytes()
+    except OSError:
+        raise ValueError("canonical completion marker history conflict")
+    prior_sha = hashlib.sha256(prior_bytes).hexdigest()
+    from datetime import datetime, timezone
+    new_sequence = _next_marker_sequence(directory, node_id)
+    revision_record = {
+        "of_sequence": sequence,
+        "of_marker_sha256": prior_sha,
+        "of_evidence_sha256": (marker.get("evidence") or {}).get("sha256"),
+        "evidence_sha256": evidence_sha,
+        "basis": basis,
+        "answers": list(answers),
+        "direction": direction,
+        "reason": reason,
+        "author_attempt_id": author_attempt_id,
+        "recorded_by": recorded_by,
+        "recorded_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+    if node_id == "execute":
+        # SD-154 A-2: an execute revision is a code change, not just new
+        # gate evidence -- record the descendant commit range SD-156's
+        # `source_lineage_verdict` proves, from execute's own most recent
+        # terminal `launch_head` to the current HEAD.
+        registry_jobs = Path(jobs) if jobs is not None else _continuation_source_jobs(route)
+        prior_head = _diff_attribution_execute_launch_head(registry_jobs, route)
+        cwd = route.get("cwd")
+        if prior_head and isinstance(cwd, str):
+            verdict = source_lineage_verdict(cwd, prior_head)
+            if verdict.kind == "descendant":
+                revision_record["commits"] = list(verdict.commits)
+    new_marker = dict(marker)
+    new_marker.pop("state", None)
+    new_marker.pop("superseded_by", None)
+    new_marker["stage_authority"] = "revision"
+    new_marker["evidence"] = {"path": str(evidence_path), "sha256": evidence_sha}
+    new_marker["sequence"] = new_sequence
+    new_marker["revision"] = revision_record
+    # SD-153 rule 5: a revision over a capped node gets its OWN fresh
+    # census (site="revision") -- the prior marker's census (if any)
+    # described a different write and must not survive the copy above.
+    new_marker.pop("round_census", None)
+    if REVIEW_ROUND_CAP.is_round_capped_node(node):
+        census_rows = ()
+        if jobs is not None:
+            census_jobs_path = Path(jobs)
+            if census_jobs_path.is_file():
+                census_lines = census_jobs_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                census_rows = _review_round_rows(census_lines, route["route_id"], node_id,jobs=jobs)
+        census = REVIEW_ROUND_CAP.marker_round_census(route, node, census_rows, site="revision")
+        if census:
+            new_marker["round_census"] = census
+    tombstones = {}
+    for downstream_id in sorted(_downstream_node_ids(route, node_id)):
+        downstream_canonical = directory / f"{downstream_id}.json"
+        if not downstream_canonical.is_file():
+            continue
+        try:
+            downstream_marker = json.loads(downstream_canonical.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if downstream_marker.get("state") == "superseded-by-upstream-revision":
+            continue
+        downstream_sequence = _next_marker_sequence(directory, downstream_id)
+        tombstone_marker = dict(downstream_marker)
+        tombstone_marker["sequence"] = downstream_sequence
+        tombstone_marker["state"] = "superseded-by-upstream-revision"
+        tombstone_marker["superseded_by"] = {"node": node_id, "sequence": new_sequence}
+        tombstones[downstream_id] = tombstone_marker
+    return new_marker, tombstones
+
+
+def preview_revision(route, node_id, evidence, *, basis, answers=(), direction=None,
+                     reason=None, author_attempt_id, recorded_by="owner", jobs=None):
+    """The complete writer proof, without lock creation or marker publication."""
+    _, input_only = _revision_target(route, node_id, basis)
+    if input_only:
+        return preview_review_input_revision(
+            route, node_id, evidence, answers=answers, author_attempt_id=author_attempt_id,
+            recorded_by=recorded_by, jobs=jobs,
+        )
+    marker, tombstones = _producer_revision_plan(
+        route, node_id, evidence, basis=basis, answers=answers, direction=direction,
+        reason=reason, author_attempt_id=author_attempt_id, recorded_by=recorded_by, jobs=jobs,
+    )
+    return {"marker": marker, "tombstoned": list(tombstones)}
+
+
+def publish_revision_locked(route, node_id, evidence, *, basis, answers=(), direction=None,
+                            reason=None, author_attempt_id, recorded_by="owner", jobs=None):
+    """Publish the shared producer proof and downstream tombstones under one lock."""
+    _, input_only = _revision_target(route, node_id, basis)
+    if input_only:
         return publish_review_input_revision(
             route, node_id, evidence, answers=answers, author_attempt_id=author_attempt_id,
             recorded_by=recorded_by, jobs=jobs,
         )
     directory = completion_dir(route["route_id"], jobs=jobs)
-    canonical_path = directory / f"{node_id}.json"
-    node_lock = directory / f".{node_id}.completion.lock"
-    with _exclusive_lock(node_lock):
-        try:
-            marker = json.loads(canonical_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            # Not the gate's own missing-dependency reason (`dispatch_
-            # completion_marker.test.py`'s static guardian keeps that literal
-            # inside `dispatch_contract.py` and the adapters' relay) -- there
-            # is nothing to revise, a distinct fact from a dependent gate
-            # finding no marker for an unstarted node.
-            raise ValueError("revision-target-marker-absent")
-        currency = gate_currency(route, node, canonical_path, marker)
-        if currency.state == "current":
-            raise ValueError("revision-evidence-unchanged")
-        if currency.state != "revised-unrecorded":
-            # `superseded`, `completion-evidence-unreadable`, or any
-            # `integrity-broken:*` -- every one of these is a kept refusal
-            # (13.59.3 "유지되는 거부"), not something `revise` can record over.
-            raise ValueError(currency.reason)
-        evidence_path = Path(evidence).resolve()
-        if not (evidence_path.is_file() or evidence_path.is_dir()):
-            raise ValueError("completion-evidence-unreadable")
-        # D-120: a revision's new evidence is bound by the same admitted cycle
-        # write scope as an ordinary completion (`_publish_completion_locked`
-        # already requires this) -- an open neighbouring cycle, or a
-        # sealed/abandoned one, cannot certify a revision's evidence any more
-        # than it can an original completion's.
-        from artifact_producer import ProducerError, require_cycle_output
-        try:
-            require_cycle_output(Path(route["artifact_root"]), evidence_path, route_id=route["route_id"])
-        except ProducerError as exc:
-            raise ValueError(f"{exc.code}: {exc.detail}") from exc
-        evidence_sha = evidence_digest(evidence_path)
-        # Basis verification runs (and can raise `revision-basis-unverified`)
-        # before any write -- a refused revision must publish nothing.
-        revision_basis_verdict(route, node, basis, answers, jobs=jobs, direction=direction, reason=reason)
-        sequence = marker.get("sequence")
-        history_path = directory / f"{node_id}.{sequence}.json"
-        try:
-            prior_bytes = history_path.read_bytes()
-        except OSError:
-            raise ValueError("canonical completion marker history conflict")
-        prior_sha = hashlib.sha256(prior_bytes).hexdigest()
-        from datetime import datetime, timezone
-        new_sequence = _next_marker_sequence(directory, node_id)
-        revision_record = {
-            "of_sequence": sequence,
-            "of_marker_sha256": prior_sha,
-            "of_evidence_sha256": (marker.get("evidence") or {}).get("sha256"),
-            "evidence_sha256": evidence_sha,
-            "basis": basis,
-            "answers": list(answers),
-            "direction": direction,
-            "reason": reason,
-            "author_attempt_id": author_attempt_id,
-            "recorded_by": recorded_by,
-            "recorded_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        }
-        if node_id == "execute":
-            # SD-154 A-2: an execute revision is a code change, not just new
-            # gate evidence -- record the descendant commit range SD-156's
-            # `source_lineage_verdict` proves, from execute's own most recent
-            # terminal `launch_head` to the current HEAD.
-            registry_jobs = Path(jobs) if jobs is not None else _continuation_source_jobs(route)
-            prior_head = _diff_attribution_execute_launch_head(registry_jobs, route)
-            cwd = route.get("cwd")
-            if prior_head and isinstance(cwd, str):
-                verdict = source_lineage_verdict(cwd, prior_head)
-                if verdict.kind == "descendant":
-                    revision_record["commits"] = list(verdict.commits)
-        new_marker = dict(marker)
-        new_marker.pop("state", None)
-        new_marker.pop("superseded_by", None)
-        new_marker["stage_authority"] = "revision"
-        new_marker["evidence"] = {"path": str(evidence_path), "sha256": evidence_sha}
-        new_marker["sequence"] = new_sequence
-        new_marker["revision"] = revision_record
-        # SD-153 rule 5: a revision over a capped node gets its OWN fresh
-        # census (site="revision") -- the prior marker's census (if any)
-        # described a different write and must not survive the copy above.
-        new_marker.pop("round_census", None)
-        if REVIEW_ROUND_CAP.is_round_capped_node(node):
-            census_rows = ()
-            if jobs is not None:
-                census_jobs_path = Path(jobs)
-                if census_jobs_path.is_file():
-                    census_lines = census_jobs_path.read_text(encoding="utf-8", errors="replace").splitlines()
-                    census_rows = _review_round_rows(census_lines, route["route_id"], node_id,jobs=jobs)
-            census = REVIEW_ROUND_CAP.marker_round_census(route, node, census_rows, site="revision")
-            if census:
-                new_marker["round_census"] = census
-        new_history_path = directory / f"{node_id}.{new_sequence}.json"
-        write_once(new_history_path, new_marker)
-        atomic_write(canonical_path, new_marker)
-        tombstoned = []
-        for downstream_id in sorted(_downstream_node_ids(route, node_id)):
-            downstream_canonical = directory / f"{downstream_id}.json"
-            if not downstream_canonical.is_file():
-                continue
-            try:
-                downstream_marker = json.loads(downstream_canonical.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                continue
-            if downstream_marker.get("state") == "superseded-by-upstream-revision":
-                continue
-            downstream_sequence = _next_marker_sequence(directory, downstream_id)
-            tombstone_marker = dict(downstream_marker)
-            tombstone_marker["sequence"] = downstream_sequence
-            tombstone_marker["state"] = "superseded-by-upstream-revision"
-            tombstone_marker["superseded_by"] = {"node": node_id, "sequence": new_sequence}
-            downstream_history_path = directory / f"{downstream_id}.{downstream_sequence}.json"
-            write_once(downstream_history_path, tombstone_marker)
-            atomic_write(downstream_canonical, tombstone_marker)
-            tombstoned.append(downstream_id)
-    return {"marker": new_marker, "tombstoned": tombstoned}
+    with _exclusive_lock(directory / f".{node_id}.completion.lock"):
+        marker, tombstones = _producer_revision_plan(
+            route, node_id, evidence, basis=basis, answers=answers, direction=direction,
+            reason=reason, author_attempt_id=author_attempt_id, recorded_by=recorded_by, jobs=jobs,
+        )
+        write_once(directory / f"{node_id}.{marker['sequence']}.json", marker)
+        atomic_write(directory / f"{node_id}.json", marker)
+        for downstream_id, tombstone in tombstones.items():
+            write_once(directory / f"{downstream_id}.{tombstone['sequence']}.json", tombstone)
+            atomic_write(directory / f"{downstream_id}.json", tombstone)
+    return {"marker": marker, "tombstoned": list(tombstones)}
 
 
 def _route_revisions(route, *, jobs=None):

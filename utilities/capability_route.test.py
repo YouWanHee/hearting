@@ -4602,7 +4602,7 @@ class SourceCensusTest(unittest.TestCase):
   "gate_currency","evidence_currency",
   # capability-route.py -- completion-marker writers
   "_completion_marker_replay","write_completion_marker",
-  "_publish_completion_locked","publish_revision_locked",
+  "_publish_completion_locked","_producer_revision_plan",
   # capability-route.py -- named exception, route-reuse digest
   "source_evidence_digest",
   # capability-route.py -- different schema, not a completion marker
@@ -4724,7 +4724,7 @@ class SourceCensusTest(unittest.TestCase):
   # than reading `round_census`/`closure_class` out of thin air.
   route_text=(P.parents[1]/"utilities"/"capability-route.py").read_text(encoding="utf-8")
   self.assertEqual(route_text.count("REVIEW_ROUND_CAP.marker_round_census("),2,
-                    "expected exactly two call sites: write_completion_marker, publish_revision_locked")
+                    "expected exactly two call sites: write_completion_marker, _producer_revision_plan")
 
 
 class ContinuationSealedJobsFallbackTest(unittest.TestCase):

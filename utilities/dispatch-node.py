@@ -324,16 +324,18 @@ class RoundAdmission:
  """The shared admission decision for a launch surface: budget AND SD-154
  auto-revision.
 
- `auto_revisions` is every revision marker this call recorded (13.59.3 rule
- 8) -- the launching surface does not need to report them separately, they
- already exist on disk before `budget` is computed.
+ `auto_revisions` contains every revision marker this call recorded (13.59.3
+ rule 8). A read-only preview leaves that tuple empty and reports eligible
+ nodes in `planned_revision_nodes`; the budget still accounts for them.
  """
  budget: object
  auto_revisions: tuple = ()
+ planned_revision_nodes: frozenset[str] = frozenset()
+ reviewed_input: object = None
 
 
-def _auto_record_revisions(route, node, jobs, rows, *, owner_attempt_id):
- """SD-154 rule 8: before admitting D's next round, auto-record a revision
+def _auto_record_revisions(route, node, jobs, rows, *, owner_attempt_id, record=True):
+ """SD-154 rule 8: before admitting D's next round, auto-record or preview a revision
  on each upstream N that is `revised-unrecorded` when D's last round was a
  blocking FAIL that basis-verifies against N. Never launches anything --
  only `publish_revision_locked` writes, under its own node lock.
@@ -373,22 +375,20 @@ def _auto_record_revisions(route, node, jobs, rows, *, owner_attempt_id):
   except (OSError, ValueError):
    continue
   try:
-   ROUTE.revision_basis_verdict(route, dep_node, "review-findings", (last_attempt,), jobs=jobs)
-  except ValueError:
-   continue  # condition (3): basis verification failed -- next_action=revise stays manual.
-  try:
-   result = ROUTE.publish_revision_locked(
+   publish_or_preview = ROUTE.publish_revision_locked if record else ROUTE.preview_revision
+   result = publish_or_preview(
     route, dep, evidence_path, basis="review-findings",
     answers=(last_attempt,), author_attempt_id=owner_attempt_id,
     recorded_by="runtime-auto", jobs=jobs,
    )
   except ValueError:
-   continue  # A kept integrity refusal: no write, no auto-revision recorded.
+   continue  # Both paths apply the same complete revision proof.
   recorded.append(result["marker"])
  return tuple(recorded)
 
 
-def admit_round(route, node, jobs, *, owner_attempt_id=None, exclude_slug=None, exclude_attempt=None, reviewed_evidence=None):
+def admit_round(route, node, jobs, *, owner_attempt_id=None, exclude_slug=None, exclude_attempt=None,
+                reviewed_evidence=None, record_auto_revisions=True):
  """The one admission decision every registered launch surface reads.
 
  Replaces the three separate `len(prior)+1 > max_round` comparisons that
@@ -404,26 +404,53 @@ def admit_round(route, node, jobs, *, owner_attempt_id=None, exclude_slug=None, 
                              exclude_attempt=exclude_attempt,
                              route=route if node.get("kind") == "review-worker" else None)
  classified_rows = [(cols[1], meta) for cols, meta in rows]
- auto_revisions = _auto_record_revisions(route, node, jobs, classified_rows, owner_attempt_id=owner_attempt_id)
- if reviewed_evidence:
-  from review_input import is_review_node, has_plan_producer, read_binding, resolve_input
-  if is_review_node(node) and not has_plan_producer(route,node):
-   verdicts=[(cols,meta) for cols,meta in rows if REVIEW_ROUND_CAP.classify_round_row(
-       cols[1],meta,worker_type=meta.get("worker_type") or "review")=="verdict"]
-   if verdicts and verdicts[-1][1].get("note")=="completed-review-blocking":
-    previous=verdicts[-1][1]
-    original=read_binding(jobs,previous)
-    current=resolve_input(route,node,jobs,reviewed_evidence)
-    if current["sha256"]!=original["sha256"]:
-     result=ROUTE.publish_review_input_revision(route,node["id"],current["path"],
-         answers=[previous["attempt_id"]],author_attempt_id=owner_attempt_id,
-         recorded_by="dispatch-auto",jobs=jobs)
-     auto_revisions=(*auto_revisions,result["input_revision"])
- from review_input import resolve_input
- reviewed_input = resolve_input(route,node,jobs,reviewed_evidence) if reviewed_evidence else {}
+ auto_revisions = _auto_record_revisions(
+  route, node, jobs, classified_rows, owner_attempt_id=owner_attempt_id,
+  record=record_auto_revisions,
+ )
+ from review_input import is_review_node, has_plan_producer, read_binding, resolve_input
+ if reviewed_evidence and is_review_node(node) and not has_plan_producer(route,node):
+  verdicts=[(cols,meta) for cols,meta in rows if REVIEW_ROUND_CAP.classify_round_row(
+      cols[1],meta,worker_type=meta.get("worker_type") or "review")=="verdict"]
+  if verdicts and verdicts[-1][1].get("note")=="completed-review-blocking":
+   previous=verdicts[-1][1]
+   original=read_binding(jobs,previous)
+   if original is None:
+    raise DispatchContractError("review-input-revision-binding-required")
+   current=resolve_input(route,node,jobs,reviewed_evidence)
+   if current["sha256"]!=original["sha256"]:
+    publish_or_preview = (ROUTE.publish_review_input_revision if record_auto_revisions
+                          else ROUTE.preview_review_input_revision)
+    result=publish_or_preview(route,node["id"],current["path"],
+        answers=[previous["attempt_id"]],author_attempt_id=owner_attempt_id,
+        recorded_by="dispatch-auto",jobs=jobs)
+    auto_revisions=(*auto_revisions,result["input_revision"])
+ producer_preview = next((item for item in auto_revisions
+                          if item.get("node_id")=="plan" and item.get("stage_authority")=="revision"),None)
+ input_options = {"producer_preview": producer_preview} if not record_auto_revisions and producer_preview else {}
+ reviewed_input = (resolve_input(route,node,jobs,reviewed_evidence,**input_options)
+                   if is_review_node(node) and (reviewed_evidence or producer_preview) else None)
  dependency_revisions = ROUTE._dependency_revisions(route, node, jobs, reviewed_input=reviewed_input or {})
- budget =REVIEW_ROUND_CAP.round_budget(route, node, classified_rows, revisions=dependency_revisions)
- return RoundAdmission(budget=budget, auto_revisions=auto_revisions)
+ dependency_ids = set(node.get("depends_on", ()))
+ dependency_revisions.extend(
+  revision.get("revision", {}) for revision in auto_revisions
+  if revision.get("node_id") in dependency_ids
+ )
+ # A pure self-input preview has no on-disk history yet. Only its exact
+ # candidate input, proved by the same writer checks, may unlock cap+1.
+ if not record_auto_revisions and reviewed_input:
+  dependency_revisions.extend(item for item in auto_revisions
+      if item.get("node_id")==node["id"]
+      and item.get("evidence")=={k:reviewed_input[k] for k in ("path","sha256")})
+ budget = REVIEW_ROUND_CAP.round_budget(route, node, classified_rows, revisions=dependency_revisions)
+ return RoundAdmission(
+  budget=budget,
+  auto_revisions=auto_revisions if record_auto_revisions else (),
+  planned_revision_nodes=frozenset(
+   str(item["node_id"]) for item in auto_revisions if item.get("node_id") in dependency_ids
+  ),
+  reviewed_input=reviewed_input,
+ )
 
 
 max_review_rounds = REVIEW_ROUND_CAP.max_review_rounds
@@ -710,7 +737,7 @@ def main():
  # always produced, without touching auto-revision at all.
  try:
   admission=(
-   admit_round(route,node,registry.path,owner_attempt_id=os.environ.get("AGENT_DISPATCH_ATTEMPT_ID") or a.parent,exclude_slug=a.slug,exclude_attempt=a.attempt_id,reviewed_evidence=a.reviewed_evidence)
+   admit_round(route,node,registry.path,owner_attempt_id=os.environ.get("AGENT_DISPATCH_ATTEMPT_ID") or a.parent,exclude_slug=a.slug,exclude_attempt=a.attempt_id,reviewed_evidence=a.reviewed_evidence,record_auto_revisions=a.action!="dry-run")
    if not a.subsession_id and original_task is None
    else RoundAdmission(budget=REVIEW_ROUND_CAP.round_budget(route,node,[],revisions=()))
   )
@@ -764,8 +791,10 @@ def main():
    if token=="--automatic-retry-of" and index+1<len(extra): retry_values.append(extra[index+1])
    elif token.startswith("--automatic-retry-of="): retry_values.append(token.split("=",1)[1])
   if len(retry_values)>1: raise DispatchContractError("replacement-predecessor-invalid")
-  review_candidate=resolve_input(route,node,registry.path,a.reviewed_evidence,
-                                retry_of=retry_values[0] if retry_values else None)
+  review_candidate=(admission.reviewed_input
+                    if a.action=="dry-run" and admission.reviewed_input is not None and not retry_values
+                    else resolve_input(route,node,registry.path,a.reviewed_evidence,
+                                       retry_of=retry_values[0] if retry_values else None))
   if review_candidate is not None: a.reviewed_evidence=review_candidate["path"]
  except DispatchContractError as e:
   print("check=failed");print(f"reason={e.reason}");print(f"detail={e.detail}");print("child_spawned=0");raise SystemExit(65)

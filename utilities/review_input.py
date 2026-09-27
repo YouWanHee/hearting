@@ -52,7 +52,8 @@ def _file(path):
     return {"path": str(resolved), "sha256": hashlib.sha256(data).hexdigest()}
 
 
-def resolve_input(route, node, jobs, reviewed_evidence=None, *, retry_of=None):
+def resolve_input(route, node, jobs, reviewed_evidence=None, *, retry_of=None,
+                  producer_preview=None):
     """Resolve explicit authority or the current primary plan gate, read-only."""
     if not is_review_node(node):
         if reviewed_evidence:
@@ -72,9 +73,27 @@ def resolve_input(route, node, jobs, reviewed_evidence=None, *, retry_of=None):
     marker_path = DC.resolve_dispatch_state_root(ROOT, Path(jobs)) / "completion" / route["route_id"] / "plan.json"
     try:
         marker = json.loads(marker_path.read_text())
-        if not DC.completion_marker_is_current(route, producer, marker_path, marker):
-            raise ValueError("plan marker is not current")
-        evidence = marker["evidence"]
+        if producer_preview is not None:
+            # Internal, read-only admission result; never an argv/environment
+            # override. Bind the projection to the exact original history and
+            # current bytes before using it to render a dry-run assignment.
+            revision = producer_preview.get("revision") or {}
+            history = marker_path.parent / f"plan.{marker['sequence']}.json"
+            if (DC.gate_currency(route, producer, marker_path, marker).state != "revised-unrecorded"
+                    or any(producer_preview.get(key) != marker.get(key)
+                           for key in ("route_id", "route_hash", "node_id", "attempt_id"))
+                    or producer_preview.get("stage_authority") != "revision"
+                    or revision.get("of_sequence") != marker.get("sequence")
+                    or revision.get("of_marker_sha256") != hashlib.sha256(history.read_bytes()).hexdigest()
+                    or revision.get("of_evidence_sha256") != marker["evidence"]["sha256"]):
+                raise ValueError("plan preview does not bind original marker")
+            evidence = producer_preview["evidence"]
+            if Path(evidence["path"]).resolve() != Path(marker["evidence"]["path"]).resolve():
+                raise ValueError("plan preview changed evidence path")
+        else:
+            if not DC.completion_marker_is_current(route, producer, marker_path, marker):
+                raise ValueError("plan marker is not current")
+            evidence = marker["evidence"]
         candidate = _file(evidence["path"])
         if candidate["sha256"] != evidence["sha256"]:
             raise ValueError("plan evidence changed")
@@ -83,7 +102,7 @@ def resolve_input(route, node, jobs, reviewed_evidence=None, *, retry_of=None):
     if explicit is not None and explicit != candidate:
         raise DC.DispatchContractError("reviewed-evidence-producer-mismatch", str(node["id"]))
     return {**candidate, "producer": {"route_id": route["route_id"], "route_node": "plan",
-            "attempt_id": marker.get("attempt_id"), "marker_digest": _digest(marker)}}
+            "attempt_id": marker.get("attempt_id"), "marker_digest": _digest(producer_preview or marker)}}
 
 
 def _path(jobs, attempt_id):
@@ -173,6 +192,52 @@ def predecessor_binding(jobs, attempt_id, route, node):
     return metadata, read_binding(jobs, metadata, verify_current=True)
 
 
+def _dispatch_node_module():
+    import importlib.util
+    import sys
+    name = "_review_input_dispatch_node"
+    if name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(name, ROOT / "utilities" / "dispatch-node.py")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+    return sys.modules[name]
+
+
+def preview_request_admission(args, jobs):
+    """Recompute dry-run admission; caller-supplied preview flags are not proof."""
+    if getattr(args, "action", None) != "dry-run" or not getattr(args, "route_file", None):
+        return None
+    if getattr(args, "automatic_retry_of", None):
+        # SD157 reuses the source round and its exact input. It receives no
+        # revision-preview exception; predecessor and normal gates still apply.
+        return None
+    metadata = {key: getattr(args, key, None) for key in
+                ("attempt_id", "route_file", "route_id", "route_hash", "route_node")}
+    route, node = _route_node(metadata)
+    module = _dispatch_node_module()
+    if not module.REVIEW_ROUND_CAP.is_round_capped_node(node):
+        return None
+    try:
+        admission = module.admit_round(
+            route, node, jobs, owner_attempt_id=getattr(args, "parent_attempt_id", None),
+            exclude_attempt=getattr(args, "command_attempt_id", None) or getattr(args, "attempt_id", None),
+            reviewed_evidence=getattr(args, "reviewed_evidence", None), record_auto_revisions=False,
+        )
+    except (ValueError, OSError) as exc:
+        if isinstance(exc, DC.DispatchContractError):
+            raise
+        raise DC.DispatchContractError("reviewed-evidence-preview-unproven", str(exc)) from exc
+    if admission.budget.state != "admit":
+        raise DC.DispatchContractError("reviewed-evidence-revision-not-admitted", admission.budget.state)
+    return admission
+
+
+def preview_request_nodes(args, jobs):
+    admission = preview_request_admission(args, jobs)
+    return admission.planned_revision_nodes if admission is not None else frozenset()
+
+
 def prepare_request(args):
     """Wrapper preview/registration validation; no side effects or inferred input."""
     if getattr(args, "unit", None) != "qa/plan-review" and not getattr(args, "reviewed_evidence", None):
@@ -188,8 +253,11 @@ def prepare_request(args):
     if not is_review_node(node):
         return resolve_input(route, node, args.jobs_path, getattr(args, "reviewed_evidence", None))
     prior = getattr(args, "automatic_retry_of", None)
-    candidate = resolve_input(route, node, args.jobs_path,
-                              getattr(args, "reviewed_evidence", None), retry_of=prior)
+    admission = preview_request_admission(args, args.jobs_path) if not prior else None
+    candidate = admission.reviewed_input if admission is not None else None
+    if candidate is None:
+        candidate = resolve_input(route, node, args.jobs_path,
+                                  getattr(args, "reviewed_evidence", None), retry_of=prior)
     if prior:
         source_meta, _ = predecessor_binding(args.jobs_path, prior, route, node)
         args.review_input_source = {"attempt_id": prior, "binding_digest": source_meta[KEY]}

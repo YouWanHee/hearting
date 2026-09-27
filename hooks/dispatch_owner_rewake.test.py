@@ -395,7 +395,7 @@ class DispatchOwnerRewakeTest(unittest.TestCase):
             }],
         }
         route.write_text(json.dumps(route_value), encoding="utf-8")
-        marker = self.root / "owner-marker.json"
+        marker = self.root / "report.json"
         marker_value = {
             "schema_version": 2,
             "sequence": 1,

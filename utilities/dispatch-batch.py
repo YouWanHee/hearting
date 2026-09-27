@@ -2087,6 +2087,8 @@ def main(argv: list[str] | None = None) -> int:
         # dispatch-node.py's own admission (which the leg launch below still
         # goes through) must agree, so this no longer keeps its own
         # `len(prior)+1 > max_round` comparison.
+        planned_revision_nodes: set[str] = set()
+        round_admissions = {}
         for capped_node in nodes:
             capped_node_id = str(capped_node["id"])
             if not DISPATCH_NODE.REVIEW_ROUND_CAP.is_round_capped_node(capped_node):
@@ -2095,11 +2097,16 @@ def main(argv: list[str] | None = None) -> int:
                 # The claim has already validated the dead exact source. Reused
                 # peers and its one replacement consume no new semantic round.
                 continue
-            budget = DISPATCH_NODE.admit_round(
+            admission_options = {"record_auto_revisions": False} if args.action == "dry-run" else {}
+            admission = DISPATCH_NODE.admit_round(
                 route, capped_node, jobs,
                 owner_attempt_id=os.environ.get("AGENT_DISPATCH_ATTEMPT_ID"),
                 reviewed_evidence=args.reviewed_evidence if is_review_node(capped_node) else None,
-            ).budget
+                **admission_options,
+            )
+            round_admissions[capped_node_id] = admission
+            budget = admission.budget
+            planned_revision_nodes.update(admission.planned_revision_nodes)
             if budget.state == "blocked-live":
                 raise BatchError(
                     "prior-attempt-still-live",
@@ -2183,7 +2190,8 @@ def main(argv: list[str] | None = None) -> int:
             if str(node["id"]) not in gated_nodes:
                 continue
             completion_marker_gate(
-                str(route_path), str(node["id"]), args.action, agent_home, jobs
+                str(route_path), str(node["id"]), args.action, agent_home, jobs,
+                planned_revision_nodes=planned_revision_nodes,
             )
     except (
         BatchError,
@@ -2414,9 +2422,13 @@ def main(argv: list[str] | None = None) -> int:
                 # launch them or upgrade their old registration contract.
                 if prior_input is not None:
                     continue
-                resolve_input(route, review_node, jobs, args.reviewed_evidence,
-                    retry_of=(partial.get("failed_source_attempt_id")
-                        if partial and partial.get("automatic_replacement_evidence") else None))
+                admission = round_admissions.get(review_node["id"])
+                if args.action == "dry-run" and admission is not None and admission.reviewed_input is not None:
+                    args.review_inputs[review_node["id"]] = admission.reviewed_input
+                else:
+                    resolve_input(route, review_node, jobs, args.reviewed_evidence,
+                        retry_of=(partial.get("failed_source_attempt_id")
+                            if partial and partial.get("automatic_replacement_evidence") else None))
         except DispatchContractError as exc:
             return fail(exc.reason, 65, detail=exc.detail, admitted=0, spawned=0)
         print(json.dumps({

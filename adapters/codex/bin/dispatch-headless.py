@@ -24,6 +24,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "utilities"))
+from review_input import preview_request_nodes
 from dispatch_contract import (
     workflow_completion_receipt,  # noqa: E402
     DispatchContractError,
@@ -2219,6 +2220,7 @@ def validate_route_record(args: argparse.Namespace) -> int:
         completion_marker_gate(
             args.route_file, args.route_node, args.action, args.agent_home,
             early_jobs, attempt_id=args.attempt_id,
+            planned_revision_nodes=preview_request_nodes(args, early_jobs),
         )
     except DispatchContractError as e:
         e.detail = recover_preview_gate_after_refusal(
@@ -2490,6 +2492,7 @@ def main(argv: list[str]) -> int:
         completion_marker_gate(
             args.route_file, args.route_node, action, agent_home, jobs,
             attempt_id=args.attempt_id,
+            planned_revision_nodes=preview_request_nodes(args, jobs),
         )
     except DispatchContractError as e:
         e.detail = recover_preview_gate_after_refusal(

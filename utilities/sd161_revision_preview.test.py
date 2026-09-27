@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+"""Merge regression candidates: revision previews use writer proof, mutate nothing."""
+import importlib.util
+import os
+from pathlib import Path
+import sys
+import unittest
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parents[1]
+spec = importlib.util.spec_from_file_location('sd161_marker_fixture', ROOT/'utilities/dispatch_completion_marker.test.py')
+FIX = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(FIX)
+R, N = FIX.ROUTE, FIX.DISPATCH_NODE
+
+class RevisionPreviewTest(FIX.CompletionMarkerTest):
+    def snapshot(self):
+        return {str(p.relative_to(self.base)): (p.is_dir(), p.stat().st_mtime_ns,
+                None if p.is_dir() else p.read_bytes()) for p in self.base.rglob('*')}
+
+    def input_case(self, rounds=1):
+        route,node,output,owner = self.sd161_input_fixture()
+        evidence = output/'preview-plan.md';evidence.write_text('input A\n')
+        for i in range(1,rounds+1):
+            attempt=f'att-preview-r{i}'
+            self.review_blocking_row(attempt,i,directory=output)
+            self.sd161_bind_row(route,attempt,evidence)
+        evidence.write_text('input B\n')
+        return route,node,evidence,owner,attempt
+
+    def test_preview_producer_complete_proof_leaves_no_lock_or_marker(self):
+        route,node=self._a_sd154_10_fixture('preview-producer.json')
+        (R.completion_dir(route['route_id'],jobs=self.jobs)/'.plan.completion.lock').unlink(missing_ok=True)
+        with mock.patch.dict(os.environ,self.base_env(),clear=True):
+            before=self.snapshot()
+            opts=dict(basis='review-findings',answers=('att-plancheck-1',),
+                      author_attempt_id='att-owner-preview',jobs=self.jobs)
+            preview=R.preview_revision(route,'plan',self.base/'plan.md',**opts)
+            self.assertEqual(before,self.snapshot())
+            written=R.publish_revision_locked(route,'plan',self.base/'plan.md',**opts)
+            for result in (preview,written):
+                result['marker']['revision'].pop('recorded_at')
+            self.assertEqual(preview,written)
+
+    def test_preview_producer_cycle_scope_refuses_like_writer(self):
+        import artifact_producer as P
+        route,node=self._a_sd154_10_fixture('preview-cycle.json')
+        with mock.patch.dict(os.environ,self.base_env(),clear=True):
+            P.begin(self.artifact,route_file=self.base/'preview-cycle.json',
+                    capability=route['capability'],intensity=route['effective_intensity'],require_cycle=True)
+            errors=[]
+            for action in (R.preview_revision,R.publish_revision_locked):
+                with self.assertRaisesRegex(ValueError,'artifact-outside-bound-cycle') as raised:
+                    action(route,'plan',self.base/'plan.md',basis='review-findings',
+                           answers=('att-plancheck-1',),author_attempt_id='att-owner-preview',jobs=self.jobs)
+                errors.append(str(raised.exception))
+            self.assertEqual(errors[0],errors[1])
+            before=self.snapshot()
+            admission=N.admit_round(route,node,self.jobs,owner_attempt_id='att-owner-preview',record_auto_revisions=False)
+            self.assertEqual(admission.planned_revision_nodes,frozenset())
+            self.assertEqual(before,self.snapshot())
+
+    def test_preview_self_input_cap_plus_one_and_writer_agree_without_mutation(self):
+        route,node,evidence,owner,attempt=self.input_case(rounds=2)
+        Path(f'{self.jobs}.lock').unlink(missing_ok=True)
+        with mock.patch.dict(os.environ,self.base_env(),clear=True):
+            before=self.snapshot()
+            preview=R.preview_review_input_revision(route,node['id'],evidence,
+                answers=(attempt,),author_attempt_id=owner,jobs=self.jobs)
+            admission=N.admit_round(route,node,self.jobs,owner_attempt_id=owner,
+                reviewed_evidence=str(evidence),record_auto_revisions=False)
+            self.assertEqual(admission.auto_revisions,())
+            self.assertEqual(admission.budget.state,'admit')
+            self.assertEqual(admission.budget.round_kind,'closure-check')
+            self.assertEqual(admission.reviewed_input['path'],str(evidence))
+            self.assertEqual(before,self.snapshot())
+            written=R.publish_review_input_revision(route,node['id'],evidence,
+                answers=(attempt,),author_attempt_id=owner,jobs=self.jobs)
+            for result in (preview,written):result['input_revision'].pop('recorded_at')
+            self.assertEqual(preview,written)
+            started=N.admit_round(route,node,self.jobs,owner_attempt_id=owner,
+                reviewed_evidence=str(evidence),record_auto_revisions=True)
+            self.assertEqual(admission.budget,started.budget)
+
+    def test_preview_self_input_third_verdict_cannot_authorize_fourth(self):
+        route,node,evidence,owner,attempt=self.input_case(rounds=3)
+        with mock.patch.dict(os.environ,self.base_env(),clear=True):
+            before=self.snapshot()
+            admission=N.admit_round(route,node,self.jobs,owner_attempt_id=owner,
+                reviewed_evidence=str(evidence),record_auto_revisions=False)
+            self.assertEqual(admission.budget.state,'exhausted')
+            self.assertEqual(before,self.snapshot())
+
+    def test_preview_self_input_refusals_share_writer_without_mutation(self):
+        route,node,evidence,owner,attempt=self.input_case()
+        outside=self.base/'outside.md';outside.write_text('outside input\n')
+        opts=dict(answers=(attempt,),author_attempt_id=owner,jobs=self.jobs)
+        with mock.patch.dict(os.environ,self.base_env(),clear=True):
+            for changes,path in (({'author_attempt_id':'att-wrong'},evidence),
+                                 ({'answers':('att-wrong',)},evidence),({},outside)):
+                errors=[]
+                before=self.snapshot()
+                for action in (R.preview_review_input_revision,R.publish_review_input_revision):
+                    with self.assertRaises(Exception) as raised:
+                        action(route,node['id'],path,**(opts|changes))
+                    errors.append((type(raised.exception),str(raised.exception)))
+                self.assertEqual(errors[0],errors[1])
+                self.assertEqual(before,self.snapshot())
+            binding=self.jobs.parent/f'review-inputs/{attempt}.json'
+            payload=FIX.json.loads(binding.read_text());payload['sha256']='0'*64
+            binding.write_text(FIX.json.dumps(payload))
+            before=self.snapshot()
+            for action in (R.preview_review_input_revision,R.publish_review_input_revision):
+                with self.assertRaises(FIX.D.DispatchContractError) as raised:
+                    action(route,node['id'],evidence,**opts)
+                self.assertEqual(raised.exception.reason,'reviewed-evidence-binding-mismatch')
+            self.assertEqual(before,self.snapshot())
+
+    def test_preview_self_input_terminal_and_history_refusals_match_writer(self):
+        route,node,evidence,owner,attempt=self.input_case()
+        opts=dict(answers=(attempt,),author_attempt_id=owner,jobs=self.jobs)
+        log=self.logs/f'{attempt}.claude.jsonl';original=log.read_bytes()
+        with mock.patch.dict(os.environ,self.base_env(),clear=True):
+            log.write_text('truncated terminal envelope\n')
+            before=self.snapshot()
+            for action in (R.preview_review_input_revision,R.publish_review_input_revision):
+                with self.assertRaisesRegex(ValueError,'verdict-unproven'):
+                    action(route,node['id'],evidence,**opts)
+            self.assertEqual(before,self.snapshot())
+            log.write_bytes(original)
+            history=self.jobs.parent/'review-input-revisions'/route['route_id']/node['id']
+            history.mkdir(parents=True)
+            (history/'000001.json').write_text('{"partial":')
+            before=self.snapshot()
+            for action in (R.preview_review_input_revision,R.publish_review_input_revision):
+                with self.assertRaisesRegex(ValueError,'history-invalid'):
+                    action(route,node['id'],evidence,**opts)
+            self.assertEqual(before,self.snapshot())
+
+    def assert_changed_evidence_broken_link(self, *, forge=False, revised=False):
+        route,node=self._a_sd154_10_fixture('preview-broken-link.json')
+        evidence=self.base/'plan.md'
+        opts=dict(basis='review-findings',answers=('att-plancheck-1',),
+                  author_attempt_id='att-owner-preview',jobs=self.jobs)
+        with mock.patch.dict(os.environ,self.base_env(),clear=True):
+            if revised:
+                R.publish_revision_locked(route,'plan',evidence,**opts)
+                evidence.write_text('plan v3 changed again\n')
+            directory=R.completion_dir(route['route_id'],jobs=self.jobs)
+            link=directory/'plan.att-plan-1.attempt.json'
+            if forge:
+                value=FIX.json.loads(link.read_text())
+                value['completion_marker_history']=str(directory/'plan.999.json')
+                link.write_text(FIX.json.dumps(value))
+            else:
+                link.unlink()
+            before=self.snapshot()
+            plan=next(n for n in route['nodes'] if n['id']=='plan')
+            currency=FIX.D.gate_currency(route,plan,directory/'plan.json')
+            self.assertEqual(currency.reason,'revision-predecessor-link-invalid')
+            with self.assertRaisesRegex(ValueError,'revision-predecessor-link-invalid'):
+                R.preview_revision(route,'plan',evidence,**opts)
+            self.assertEqual(before,self.snapshot())
+            markers_before={p.name:p.read_bytes() for p in directory.glob('*.json')}
+            with self.assertRaisesRegex(ValueError,'revision-predecessor-link-invalid'):
+                R.publish_revision_locked(route,'plan',evidence,**opts)
+            self.assertEqual(markers_before,{p.name:p.read_bytes() for p in directory.glob('*.json')})
+            # The real writer may create its ordinary serialization lock;
+            # only preview is required to create no lock at all.
+            before=self.snapshot()
+            admission=N.admit_round(route,node,self.jobs,
+                owner_attempt_id='att-owner-preview',record_auto_revisions=False)
+            self.assertEqual(admission.planned_revision_nodes,frozenset())
+            gate_reasons=[]
+            for action in ('dry-run','start'):
+                with self.assertRaises(FIX.D.DispatchContractError) as raised:
+                    FIX.D.completion_marker_gate(str(self.base/'preview-broken-link.json'),
+                        node['id'],action,self.agent_home,self.jobs,
+                        planned_revision_nodes=admission.planned_revision_nodes)
+                gate_reasons.append(raised.exception.reason)
+            self.assertEqual(gate_reasons,['completion-marker-integrity-broken']*2)
+            self.assertEqual(before,self.snapshot())
+
+    def test_preview_changed_evidence_missing_original_link_refuses_both_actions(self):
+        self.assert_changed_evidence_broken_link()
+
+    def test_preview_changed_evidence_forged_original_link_refuses_both_actions(self):
+        self.assert_changed_evidence_broken_link(forge=True)
+
+    def test_preview_changed_revision_checks_original_historical_link(self):
+        self.assert_changed_evidence_broken_link(forge=True,revised=True)
+
+if __name__=='__main__':
+    # Only the added regressions; inherited tests remain in their own suite.
+    names=[name for name in RevisionPreviewTest.__dict__ if name.startswith('test_preview_')]
+    result=unittest.TextTestRunner(verbosity=2).run(unittest.TestSuite(RevisionPreviewTest(n) for n in names))
+    sys.exit(not result.wasSuccessful())

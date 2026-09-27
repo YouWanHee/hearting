@@ -1582,16 +1582,20 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
     # admission decision every registered launch surface reads -- no surface
     # keeps its own `len(prior)+1 > max_round` comparison, or its own
     # auto-revision copy, any more.
+    node_round_admission = None
     if DISPATCH_NODE.REVIEW_ROUND_CAP.is_round_capped_node(node):
         round_rows = DISPATCH_NODE.prior_round_attempts(
             args.jobs, route["route_id"], node["id"],
             route=route if node.get("kind") == "review-worker" else None,
         )
+        admission_options = {"record_auto_revisions": False} if args.action == "dry-run" else {}
         try:
-            node_round_budget = DISPATCH_NODE.admit_round(
+            node_round_admission = DISPATCH_NODE.admit_round(
                 route, node, args.jobs, owner_attempt_id=args.parent_attempt_id,
                 reviewed_evidence=args.reviewed_evidence,
-            ).budget
+                **admission_options,
+            )
+            node_round_budget = node_round_admission.budget
         except (DispatchContractError, ValueError) as exc:
             return fail(getattr(exc, "reason", str(exc)), 65, child_spawned="0")
         if node_round_budget.state == "blocked-live":
@@ -1767,7 +1771,11 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                         observation.note_unrecorded(p3_result[1])
                     continue
                 try:
-                    candidate = resolve_input(route, node, args.jobs, args.reviewed_evidence)
+                    candidate = (node_round_admission.reviewed_input
+                                 if args.action == "dry-run" and node_round_admission is not None
+                                 else None)
+                    if candidate is None:
+                        candidate = resolve_input(route, node, args.jobs, args.reviewed_evidence)
                     if candidate is not None:
                         args.reviewed_evidence = candidate["path"]
                 except DispatchContractError as exc:

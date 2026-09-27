@@ -2713,6 +2713,8 @@ PRELAUNCH_PROCESS_BLOCK_REASONS = (
 # an unclassified reason cannot silently fall through to the descent path.
 ROUTE_STATE_REFUSAL_REASONS = (
     "completion-marker-missing",
+    "completion-marker-integrity-broken",
+    "completion-evidence-superseded",
     "completion-evidence-revised-unrecorded",
     "review-round-budget-exhausted",
     "review-verdictless-bound",
@@ -2743,6 +2745,11 @@ def route_state_next_action(reason: str, detail: str, route_file: str | None,
             f"gate evidence already changed run: capability-route.py revise {route_arg} "
             f"--node {target} --evidence <evidence-path> "
             "--basis review-findings|user-direction|owner-correction"
+        )
+    if reason == "completion-evidence-superseded":
+        return (
+            f"rerun dependency node {target} to publish fresh completion evidence "
+            "after its upstream revision, then retry this launch"
         )
     if reason == "review-round-budget-exhausted":
         return "close the node via owner-closure (review) or report the FAIL and open an SD-116 continuation (test)"
@@ -6729,11 +6736,13 @@ def completion_marker_gate(
     *,
     registry_lines: list[str] | None = None,
     attempt_id: str | None = None,
+    planned_revision_nodes: set[str] | frozenset[str] = frozenset(),
     _raising_frame_gate: bool = False,
 ) -> None:
-    """SD-56 decision gate: a record-bound ``--start`` must not spawn a node
-    whose ``depends_on`` predecessors have no completion marker, nor one whose
-    own previous attempt has not actually stopped.
+    """SD-56 decision gate for start and its read-only dry-run preview.
+
+    Neither may admit a node whose ``depends_on`` predecessors lack current,
+    linked completion evidence or whose own previous attempt has not stopped.
 
     ``agent_home`` is an explicit argument, not re-read from the environment,
     so the writer (capability-route.py complete) and every reader (this gate,
@@ -6754,7 +6763,7 @@ def completion_marker_gate(
             "legacy-broker-route-read-only",
             f"dispatch contract v{contract_version} cannot register or start workers",
         )
-    if action != "start" or contract_version != 3:
+    if action not in {"start", "dry-run"} or contract_version != 3:
         return
     node = next((row for row in route.get("nodes", []) if row.get("id") == route_node), None)
     if node is None:
@@ -6780,8 +6789,10 @@ def completion_marker_gate(
         try:
             marker = json.loads(marker_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            missing.append(dep)
-            continue
+            raise DispatchContractError(
+                "completion-marker-integrity-broken",
+                f"{dep}:completion-marker-unreadable",
+            )
         dep_node = next((row for row in route.get("nodes", []) if row.get("id") == dep), None)
         if dep_node is None:
             missing.append(dep)
@@ -6793,12 +6804,41 @@ def completion_marker_gate(
         if not completion_marker_is_current(route, dep_node, marker_path, marker):
             currency = gate_currency(route, dep_node, marker_path, marker)
             if currency.state == "revised-unrecorded":
+                if action == "dry-run" and dep in planned_revision_nodes:
+                    # Round admission proved the same review basis that the
+                    # start path uses to publish this revision. Treat that
+                    # exact predecessor as current for the read-only preview;
+                    # no marker or registry state is changed here.
+                    markers[dep] = marker
+                    readiness = completion_attempt_readiness(
+                        route,
+                        dep_node,
+                        marker,
+                        jobs or (resolve_dispatch_state_root(agent_home) / "jobs.log"),
+                        registry_lines=registry_lines,
+                    )
+                    if readiness.state != "ready":
+                        blocked.append((dep, readiness))
+                    continue
                 # SD-154 rule 6: a route-state refusal, not "missing" -- the
                 # dependency's gate evidence changed and needs `revise`, not
                 # another launch of a predecessor that already ran.
                 raise DispatchContractError(
                     "completion-evidence-revised-unrecorded", dep,
                     next_action=currency.next_action,
+                )
+            if currency.state == "superseded":
+                superseded_by = marker.get("superseded_by") or {}
+                upstream = superseded_by.get("node") if isinstance(superseded_by, dict) else None
+                sequence = superseded_by.get("sequence") if isinstance(superseded_by, dict) else None
+                cause = f"{dep}:superseded-by={upstream}@{sequence}" if upstream and sequence else dep
+                raise DispatchContractError(
+                    currency.reason, cause, next_action=currency.next_action,
+                )
+            if currency.state.startswith("integrity-broken:") or currency.state == "completion-evidence-unreadable":
+                raise DispatchContractError(
+                    "completion-marker-integrity-broken",
+                    f"{dep}:{currency.state}:{currency.reason}",
                 )
             missing.append(dep)
             continue
@@ -7187,8 +7227,9 @@ def _marker_link_current(
     # comparison-site normalizer this module defines for exactly this.
     sequence = int(marker.get("sequence", 0))
     history_path = marker_path.parent / f"{node_id}.{sequence}.json"
+    canonical_path = marker_path.parent / f"{node_id}.json"
     for key, expected_path in (
-        ("completion_marker", marker_path.parent / f"{node_id}.json"),
+        ("completion_marker", canonical_path),
         ("completion_marker_history", history_path),
     ):
         recorded = link.get(key)
@@ -7204,7 +7245,7 @@ class GateCurrency(NamedTuple):
 
     ``state`` is one of ``current`` | ``superseded`` | ``revised-unrecorded``
     | ``integrity-broken:<reason>`` | ``completion-evidence-unreadable``.
-    ``next_action`` is set only for ``revised-unrecorded`` (13.59.3 rule 6).
+    ``next_action`` is set for route-state evidence refusals.
     """
 
     state: str
@@ -7240,7 +7281,16 @@ def evidence_currency(
     if not schema_ok:
         return GateCurrency("integrity-broken:identity-mismatch", "completion-marker-identity-mismatch")
     if marker.get("state") == "superseded-by-upstream-revision":
-        return GateCurrency("superseded", "completion-evidence-superseded")
+        superseded_by = marker.get("superseded_by") or {}
+        upstream = superseded_by.get("node") if isinstance(superseded_by, dict) else None
+        sequence = superseded_by.get("sequence") if isinstance(superseded_by, dict) else None
+        detail = f"{upstream}@{sequence}" if upstream and sequence else node.get("id")
+        action = route_state_next_action(
+            "completion-evidence-superseded", str(node.get("id")), None, node,
+        )
+        if detail != node.get("id"):
+            action += f" (upstream revision {detail})"
+        return GateCurrency("superseded", "completion-evidence-superseded", action)
     evidence_record = marker.get("evidence")
     if not isinstance(evidence_record, dict):
         return GateCurrency("integrity-broken:identity-mismatch", "completion-marker-evidence-missing")
@@ -7277,61 +7327,80 @@ def gate_currency(
     `completion_marker_is_current`) and the consumers that reclassified
     `completion-evidence-hash-mismatch` by hand. Judgement order:
     `evidence_currency` (schema/identity/history-byte -> tombstone -> live
-    evidence digest) -> shape/attempt-link -> (revision marker only) the
-    prior marker's own identity/link, recursively one step (I-4; a revision
-    chain is walked one link at a time, never more, since each revision's
-    `of_sequence` names an exact prior sequence and the chain cannot cycle).
+    evidence digest) -> shape/attempt-link. A live digest mismatch alone does
+    not authorize revise: revised-unrecorded also passes the full provenance
+    proof below before it is returned. Revision provenance then walks a
+    bounded, strictly decreasing chain of immutable historical markers. It
+    does not compare historical evidence paths to live bytes: official revise
+    updates that file by design.
     """
     try:
         marker = marker or json.loads(marker_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return GateCurrency("integrity-broken:history-conflict", "completion-marker-unreadable")
     base = evidence_currency(route, node, marker_path, marker)
-    if base.state != "current":
+    if base.state not in {"current", "revised-unrecorded"}:
         return base
-    evidence_record = marker.get("evidence") or {}
-    digest = base.evidence_digest
-    is_revision = marker.get("stage_authority") == "revision"
-    if not is_revision:
-        try:
-            link_ok = _marker_link_current(route, node, marker, marker_path)
-        except (DispatchContractError, KeyError, OSError, TypeError, ValueError):
-            link_ok = False
-        if not link_ok:
-            return GateCurrency("integrity-broken:identity-mismatch", "completion-marker-link-invalid")
-        return GateCurrency("current", "completion-marker-verified", evidence_digest=digest)
-
-    # SD-154 I-4: a revision marker carries no new attempt-link of its own
-    # (`attempt_id` is the original authoring attempt, provenance only) -- its
-    # own currentness rests on (a) the live evidence digest already matched
-    # above and (b) the marker it revised (`of_sequence`) still proving its
-    # OWN identity/link, recursively, one step.
-    revision = marker.get("revision") or {}
-    of_sequence = revision.get("of_sequence")
-    of_marker_sha256 = revision.get("of_marker_sha256")
-    if (
-        not isinstance(of_sequence, int)
-        or not isinstance(of_marker_sha256, str)
-        or revision.get("evidence_sha256") != evidence_record.get("sha256")
-    ):
-        return GateCurrency("integrity-broken:identity-mismatch", "revision-provenance-invalid")
     node_id = str(node.get("id"))
-    prior_history_path = marker_path.parent / f"{node_id}.{of_sequence}.json"
-    try:
-        prior_bytes = prior_history_path.read_bytes()
-    except OSError:
-        return GateCurrency("integrity-broken:history-conflict", "canonical completion marker history conflict")
-    if hashlib.sha256(prior_bytes).hexdigest() != of_marker_sha256:
-        return GateCurrency("integrity-broken:history-conflict", "canonical completion marker history conflict")
-    try:
-        prior_marker = json.loads(prior_bytes)
-        prior_schema_ok, _ = _marker_schema_identity_ok(route, node, prior_marker, prior_history_path)
-        prior_link_ok = prior_schema_ok and _marker_link_current(route, node, prior_marker, prior_history_path)
-    except (DispatchContractError, KeyError, OSError, TypeError, ValueError):
-        prior_link_ok = False
-    if not prior_link_ok:
-        return GateCurrency("integrity-broken:identity-mismatch", "revision-predecessor-link-invalid")
-    return GateCurrency("current", "completion-marker-verified", evidence_digest=digest)
+    current = marker
+    current_path = marker_path
+    initial_sequence = marker.get("sequence")
+    if not isinstance(initial_sequence, int) or isinstance(initial_sequence, bool) or initial_sequence < 1:
+        return GateCurrency("integrity-broken:identity-mismatch", "revision-provenance-invalid")
+    # A valid chain can contain every sequence from the canonical marker down
+    # to 1. Bound traversal by that sequence and the available predecessor
+    # history, without imposing an arbitrary revision-count ceiling.
+    available_predecessors = 0
+    sequence_prefix = f"{node_id}."
+    for child in marker_path.parent.iterdir():
+        if not child.is_file() or not child.name.startswith(sequence_prefix) or child.suffix != ".json":
+            continue
+        suffix = child.name[len(sequence_prefix):-len(".json")]
+        if suffix.isdecimal() and 1 <= int(suffix) < initial_sequence:
+            available_predecessors += 1
+    max_steps = min(initial_sequence, available_predecessors + 1)
+    seen: set[int] = set()
+    for _depth in range(max_steps):
+        sequence = current.get("sequence")
+        if current.get("stage_authority") != "revision":
+            try:
+                link_ok = _marker_link_current(route, node, current, current_path)
+            except (DispatchContractError, KeyError, OSError, TypeError, ValueError):
+                link_ok = False
+            if not link_ok:
+                return GateCurrency("integrity-broken:identity-mismatch", "revision-predecessor-link-invalid")
+            return base
+        revision = current.get("revision") or {}
+        of_sequence = revision.get("of_sequence")
+        of_marker_sha256 = revision.get("of_marker_sha256")
+        recorded_evidence = (current.get("evidence") or {}).get("sha256")
+        if (
+            not isinstance(sequence, int) or isinstance(sequence, bool)
+            or not isinstance(of_sequence, int) or isinstance(of_sequence, bool)
+            or of_sequence < 1 or of_sequence >= sequence or of_sequence in seen
+            or not isinstance(of_marker_sha256, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", of_marker_sha256)
+            or revision.get("evidence_sha256") != recorded_evidence
+        ):
+            return GateCurrency("integrity-broken:identity-mismatch", "revision-provenance-invalid")
+        seen.add(sequence)
+        prior_path = marker_path.parent / f"{node_id}.{of_sequence}.json"
+        try:
+            prior_bytes = prior_path.read_bytes()
+        except OSError:
+            return GateCurrency("integrity-broken:history-conflict", "canonical completion marker history conflict")
+        if hashlib.sha256(prior_bytes).hexdigest() != of_marker_sha256:
+            return GateCurrency("integrity-broken:history-conflict", "canonical completion marker history conflict")
+        try:
+            prior_marker = json.loads(prior_bytes)
+            prior_schema_ok, _ = _marker_schema_identity_ok(route, node, prior_marker, prior_path)
+        except (DispatchContractError, KeyError, OSError, TypeError, ValueError):
+            prior_schema_ok = False
+            prior_marker = {}
+        if not prior_schema_ok or prior_marker.get("sequence") != of_sequence:
+            return GateCurrency("integrity-broken:identity-mismatch", "revision-predecessor-identity-invalid")
+        current, current_path = prior_marker, prior_path
+    return GateCurrency("integrity-broken:identity-mismatch", "revision-provenance-invalid")
 
 
 def completion_marker_is_current(
