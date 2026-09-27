@@ -509,16 +509,38 @@ def load_outcome(route_file, expect_id=None, expect_hash=None):
         st = os.stat(path)
         key = (st.st_mtime, st.st_size)
     except (OSError, TypeError, ValueError):
-        return {"present": False}
-    cached = _OUTCOME_CACHE.get(path)
-    if cached is not None and (cached[0], cached[1]) == key:
-        outcome = cached[2]
+        path = _outcome_path(route_file)
+        key = None
+        outcome = None
     else:
-        outcome = _load_outcome_uncached(path)
-        _OUTCOME_CACHE[path] = (key[0], key[1], outcome)
+        cached = _OUTCOME_CACHE.get(path)
+        if cached is not None and (cached[0], cached[1]) == key:
+            outcome = cached[2]
+        else:
+            outcome = _load_outcome_uncached(path)
+            _OUTCOME_CACHE[path] = (key[0], key[1], outcome)
+    finish_pending = None
+    try:
+        route = json.loads(Path(route_file).read_text(encoding="utf-8"))
+        if route.get("route_id") == expect_id or expect_id is None:
+            import sys
+            sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "utilities"))
+            import inline_finish
+            pending = inline_finish.pending_state(Path(route.get("artifact_root", "")), route.get("route_id", ""))
+            if pending and pending.get("state") != "finished":
+                finish_pending = pending.get("state")
+    except (OSError, ValueError, TypeError):
+        finish_pending = None
     if outcome is None:
+        if finish_pending:
+            return {"present": True, "match": True, "terminal_gate_proven": False,
+                    "finish_pending": True, "finish_state": finish_pending}
         return {"present": False}
     result = dict(outcome)
+    if finish_pending:
+        result["finish_pending"] = True
+        result["finish_state"] = finish_pending
+        result["terminal_gate_proven"] = False
     match = True
     if expect_id is not None and result.get("route_id") != expect_id:
         match = False

@@ -4024,11 +4024,19 @@ def _head_commit(cwd):
 def _outcome_replay_matches(existing, *, route_id, route_hash,
                             terminal_commit_id=None, owner_attempt_id=None,
                             producer_binding_digest=None,
-                            terminal_marker_digest=None):
+                            terminal_marker_digest=None,
+                            inline_finish_id=None, summary_digest=None,
+                            inline_commit=None):
     if not isinstance(existing, dict):
         return False
     if existing.get("route_id") != route_id or existing.get("route_hash") != route_hash:
         return False
+    if inline_finish_id is not None:
+        return (existing.get("inline_finish_id") == inline_finish_id
+                and existing.get("terminal_marker_digest") == terminal_marker_digest
+                and existing.get("producer_binding_digest") == producer_binding_digest
+                and existing.get("summary_digest") == summary_digest
+                and existing.get("head_commit") == inline_commit)
     if terminal_commit_id is None and owner_attempt_id is None and producer_binding_digest is None:
         # Legacy callers retain the historical route/hash/optional-marker rule.
         return (terminal_marker_digest is None
@@ -4044,7 +4052,16 @@ def _outcome_replay_matches(existing, *, route_id, route_hash,
 def close_route(route, route_file, commit=None, summary=None, publication=None,
                 allow_unproven=True, jobs=None, expected_terminal_marker_digest=None,
                 terminal_commit_id=None, expected_owner_attempt_id=None,
-                expected_producer_binding_digest=None):
+                expected_producer_binding_digest=None, inline_finish_id=None,
+                expected_summary_digest=None, inline_commit=None):
+    try:
+        import inline_finish
+        pending=inline_finish.pending_state(Path(route["artifact_root"]),route["route_id"])
+    except (OSError,ValueError) as exc:
+        raise ValueError("finish-state-unreadable") from exc
+    if pending and pending.get("state")!="finished" and (
+            pending.get("inline_finish_id")!=inline_finish_id or not inline_finish_id):
+        raise ValueError("finish-in-progress")
     from datetime import datetime, timezone
     cleanup_scope = dispatch_terminal_commit.require_current_cleanup(
         "close-forward-recovery", target=Path(route_file), jobs=jobs)
@@ -4078,7 +4095,9 @@ def close_route(route, route_file, commit=None, summary=None, publication=None,
         if not _outcome_replay_matches(existing, route_id=route["route_id"], route_hash=route["route_hash"],
                 terminal_commit_id=terminal_commit_id, owner_attempt_id=expected_owner_attempt_id,
                 producer_binding_digest=expected_producer_binding_digest,
-                terminal_marker_digest=expected_terminal_marker_digest):
+                terminal_marker_digest=expected_terminal_marker_digest,
+                inline_finish_id=inline_finish_id, summary_digest=expected_summary_digest,
+                inline_commit=inline_commit):
             raise ValueError("route-close-outcome-conflict")
         return existing, False
     # Live, not stored: every close computes gate truth fresh from the completion
@@ -4110,6 +4129,9 @@ def close_route(route, route_file, commit=None, summary=None, publication=None,
         outcome["terminal_owner_attempt_id"] = expected_owner_attempt_id
     if expected_producer_binding_digest is not None:
         outcome["producer_binding_digest"] = expected_producer_binding_digest
+    if inline_finish_id is not None:
+        outcome["inline_finish_id"] = inline_finish_id
+        outcome["summary_digest"] = expected_summary_digest
     # A-SD154-7: a route's closed outcome names every SD-154 revision recorded
     # under it, so a reader never has to walk completion-dir history by hand
     # to learn a gate's evidence was corrected mid-route.
@@ -4147,7 +4169,9 @@ def close_route(route, route_file, commit=None, summary=None, publication=None,
             if not _outcome_replay_matches(existing, route_id=route["route_id"], route_hash=route["route_hash"],
                     terminal_commit_id=terminal_commit_id, owner_attempt_id=expected_owner_attempt_id,
                     producer_binding_digest=expected_producer_binding_digest,
-                    terminal_marker_digest=expected_terminal_marker_digest):
+                    terminal_marker_digest=expected_terminal_marker_digest,
+                    inline_finish_id=inline_finish_id, summary_digest=expected_summary_digest,
+                    inline_commit=inline_commit):
                 raise ValueError("route-close-outcome-conflict")
             return existing, False
         dfd=os.open(str(target.parent),os.O_RDONLY)
@@ -4288,6 +4312,16 @@ def route_status(artifact_root, *, diagnostics=None):
                  "source_commit":raw.get("source_commit"),"closed":target.is_file(),
                  "location":location,"drift":location != "canonical",
                  "read_only":location in _LEGACY_LOCATIONS}
+            try:
+                import inline_finish
+                finish_state=inline_finish.pending_state(Path(raw.get("artifact_root", "")), raw.get("route_id", ""))
+                if finish_state and finish_state.get("state") != "finished":
+                    row["finish_pending"]=True
+                    row["finish_state"]=finish_state.get("state")
+                    row["state"]="finish-pending"
+            except (OSError, ValueError, TypeError):
+                row["finish_pending"]=True
+                row["state"]="finish-pending-unreadable"
             row["alias_basename"]=(location=="canonical" and not route_path_is_exact(
                 path,artifact_root,row["route_id"]))
             row["drift"]=row["drift"] or row["alias_basename"]
@@ -5912,6 +5946,24 @@ def complete_node(
     intent at all, so a quick one-shot owner's completion left no record and
     no carrier could ever deliver it.
     """
+    artifact_root=route.get("artifact_root")
+    route_id=route.get("route_id")
+    pending=None
+    # Legacy and subdivision routes may omit the inline-finish tuple entirely.
+    # Only routes carrying both identifiers are in that fence's domain; once a
+    # tuple is present, malformed or unreadable state remains a strict refusal.
+    if artifact_root not in (None, "") and isinstance(route_id,str) and route_id:
+        try:
+            import inline_finish
+            pending=inline_finish.pending_state(Path(artifact_root),route_id)
+        except (OSError,ValueError) as exc:
+            raise ValueError("finish-state-unreadable") from exc
+    supplied_finish=os.environ.get("AGENT_INLINE_FINISH_ID")
+    if pending and pending.get("state")!="finished" and pending.get("inline_finish_id")!=supplied_finish:
+        raise ValueError("finish-in-progress")
+    if pending and supplied_finish and pending.get("intent",{}).get("evidence_sha256"):
+        if not inline_finish.evidence_matches(Path(evidence),pending["intent"]["evidence_sha256"]):
+            raise ValueError("finish-evidence-drift")
     marker, row = _complete_node_locked(
         route, node, node_id, evidence,
         jobs=jobs, attempt_id=attempt_id,
@@ -7425,6 +7477,11 @@ def main():
     start.add_argument("--interview",type=Path,help="semantic frame question; runtime owns its registration and cycle fields")
     start.add_argument("--answers",type=Path,help="actual native answers; runtime records intent and releases the gate")
     start.add_argument("--decision",choices=("proceed","revise","stop"),default="proceed")
+    finish=sub.add_parser("finish",help="finish one current-session direct route and seal its exact producer cycle")
+    finish.add_argument("--route",required=True,type=Path)
+    finish.add_argument("--evidence",required=True,type=Path)
+    finish.add_argument("--summary-file",required=True,type=Path)
+    finish.add_argument("--commit",help="full result commit; defaults to current HEAD on first claim")
     correction=sub.add_parser("correct", help="deliver a correction to one existing owner; without a message file, inspect its receipts")
     correction.add_argument("--attempt-id", required=True)
     correction.add_argument("--jobs", type=Path)
@@ -7494,7 +7551,7 @@ def main():
     sg.add_argument("--capability",default=None,help="default: every capability")
     sg.add_argument("--json",action="store_true")
     a=p.parse_args()
-    if a.command not in {"verify", "node", "status", "close", "stages"} and not (a.command == "complete" and a.check):
+    if a.command not in {"verify", "node", "status", "close", "finish", "stages"} and not (a.command == "complete" and a.check):
         dispatch_terminal_commit.require_current_cleanup("route-" + a.command)
     if a.command=="stages":
         registry=TOPO.load_registry()
@@ -7750,6 +7807,12 @@ def main():
         rows=route_status(a.artifact_root)
         if a.open_only: rows=[row for row in rows if not row["closed"]]
         print(json.dumps(rows,sort_keys=True,indent=2))
+    elif a.command=="finish":
+        raw=json.loads(a.route.read_text(encoding="utf-8"))
+        route=verify_route(raw, raw.get("cwd"))
+        import inline_finish
+        receipt=inline_finish.finish(a,route,a.route,sys.modules[__name__])
+        print(json.dumps(receipt,sort_keys=True))
     else:
         route=verify_route(
             json.loads(Path(a.route).read_text()), getattr(a,"cwd",None),

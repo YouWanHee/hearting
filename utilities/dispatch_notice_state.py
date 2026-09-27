@@ -22,6 +22,14 @@ def closed_outcome(path: Path, route: dict) -> dict | None:
             or outcome.get("route_id") != route.get("route_id")
             or outcome.get("route_hash") != route.get("route_hash")):
         raise ValueError("notice-route-outcome-mismatch")
+    if outcome.get("inline_finish_id"):
+        import inline_finish
+        pending = inline_finish.pending_state(Path(route.get("artifact_root", "")), route["route_id"])
+        if not pending or pending.get("inline_finish_id") != outcome.get("inline_finish_id"):
+            raise ValueError("notice-inline-finish-state-mismatch")
+        if pending.get("state") != "finished":
+            outcome = dict(outcome, finish_pending=True, finish_state=pending.get("state"),
+                           terminal_gate_proven=False)
     return outcome
 
 
@@ -46,7 +54,8 @@ def bound_route(metadata: dict, jobs: Path, expected_id: str = ""):
 
 def route_obligation_closed(metadata: dict, jobs: Path) -> bool:
     bound = bound_route(metadata, jobs)
-    return bool(bound and closed_outcome(*bound))
+    outcome = closed_outcome(*bound) if bound else None
+    return bool(outcome and not outcome.get("finish_pending"))
 
 
 def _gate_resolution(entries: list, gate: str, delivery: str) -> dict:

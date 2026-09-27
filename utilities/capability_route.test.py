@@ -4514,10 +4514,20 @@ class SourceCensusTest(unittest.TestCase):
  # surfaces -- never by admission, finalize or manifest building.
  _CYCLE_OWNERSHIP_ALLOWED_FUNCTIONS=frozenset({
   "route_cycle_for","cycle_route_admission","_finalize_route","require_cycle_output",
+  # Resolving one manifest's sealed route file checks its canonical id/hash;
+  # this identity comparison does not select an owning cycle.
+  "resolve_cycle_manifest_route",
   # Self-consistency, not cycle ownership (plan A-4 "비대상" list): route
   # id/hash derivation, the `rebound` display flag, the reservation ledger's
   # own identity check, and review-output-binding's capability/route parity.
   "load_route","begin","read_interim_reservation","prepare_review_output_binding",
+  # Inline finish's exact-cycle binding validates the already-admitted route
+  # tuple; it does not choose which cycle the route owns.
+  "finalize_exact_cycle",
+  # The producer's inline binding check calls cycle_route_admission above,
+  # then compares the pending finish intent's route ID with that admitted
+  # binding. This is finish-tuple integrity, not another cycle selection.
+  "_inline_producer_binding_check",
  })
 
  def test_a25_7_cycle_ownership_and_lineage_single_site(self):

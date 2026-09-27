@@ -20,6 +20,7 @@ Skill invocation and capability-grounding/spec markers are intentionally not rea
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import hashlib
 import json
 import os
@@ -589,6 +590,246 @@ def bind_route(
     return marker
 
 
+def _git_text(cwd: Path, *args: str) -> str | None:
+    result = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True)
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _artifact_root_for(cwd: Path) -> Path | None:
+    result = subprocess.run([str(ROOT / "utilities/artifact-root.sh"), str(cwd)],
+                            capture_output=True, text=True)
+    return Path(result.stdout.strip()).resolve(strict=False) if result.returncode == 0 else None
+
+
+def _route_merge_event_path(root: Path, session_id: str) -> Path:
+    return root / ".runtime" / "material-route-reuse" / "v1" / (session_key(session_id) + ".json")
+
+
+def _parse_exact_merge(command: str) -> str | None:
+    if not command or any(ch in command for ch in (";", "|", "&", "$", chr(96), "\n", "\r", "#", "'", '"')):
+        return None
+    try:
+        words = shlex.split(command, comments=True, posix=True)
+    except ValueError:
+        return None
+    if len(words) != 3 or Path(words[0]).name != "git" or words[1] != "merge":
+        return None
+    ref = words[2]
+    if not ref or ref.startswith("-") or any(ch in ref for ch in ("'", '"', "$", chr(96))):
+        return None
+    return ref
+
+
+def _current_route_for_session(session_id: str, agent_home: Path):
+    marker = _load_session_marker(session_id, agent_home)
+    route_file = Path(str(marker.get("route_file", "")))
+    cwd = Path(str(marker.get("cwd", ""))).resolve(strict=False)
+    route = verify_route(route_file, cwd, agent_home,
+                         expected_route_id=str(marker.get("route_id", "")),
+                         accepted_capabilities=ROUTABLE_CAPABILITIES)
+    if route.get("route_hash") != marker.get("route_hash"):
+        raise RouteError("session-marker-route-hash-mismatch")
+    return marker, route
+
+
+def _record_route_merge_intent(session_id: str, agent_home: Path, target: Path, command: str) -> None:
+    ref = _parse_exact_merge(command)
+    if ref is None:
+        return
+    try:
+        marker, route = _current_route_for_session(session_id, agent_home)
+        route_cwd = Path(route["cwd"]).resolve()
+        target = target.resolve()
+        if route_cwd == target or _git_common_dir(route_cwd) != _git_common_dir(target):
+            return
+        if not route.get("campaign_key") or route.get("campaign_key") == "_unassigned":
+            return
+        branch = _git_text(route_cwd, "symbolic-ref", "--short", "HEAD")
+        if not branch:
+            return
+        branch_ref = "refs/heads/" + branch
+        base = _git_text(route_cwd, "rev-parse", branch_ref + "^{commit}")
+        source = route.get("source_commit")
+        if not base or not source or subprocess.run(["git", "-C", str(route_cwd), "merge-base", "--is-ancestor", source, base]).returncode:
+            return
+        if _git_text(target, "rev-parse", ref + "^{commit}") != base:
+            return
+        target_branch = _git_text(target, "symbolic-ref", "--short", "HEAD")
+        target_head = _git_text(target, "rev-parse", "HEAD")
+        if not target_branch or not target_head or target_branch == branch:
+            return
+        row = {"schema":"route_merge_intent_v1", "session_key":session_key(session_id),
+               "route_id":route["route_id"], "route_hash":route["route_hash"],
+               "campaign_key":route["campaign_key"], "route_branch":branch, "branch_ref":branch_ref,
+               "route_head":base, "target_cwd":str(target), "target_branch":target_branch,
+               "target_old_head":target_head, "merge_ref":ref}
+        _atomic_json(_route_merge_event_path(Path(route["artifact_root"]).resolve(), session_id), row)
+    except (OSError, ValueError, RouteError, subprocess.SubprocessError):
+        return
+
+
+def _record_route_merge_result(session_id: str, agent_home: Path, target: Path,
+                               command: str, tool_response: object) -> None:
+    """Seal the successful result of the exact merge command observed pre-call."""
+    ref = _parse_exact_merge(command)
+    if ref is None or not isinstance(tool_response, dict):
+        return
+    code = tool_response.get("exit_code", tool_response.get("code"))
+    if code != 0:
+        return
+    try:
+        path = _route_merge_event_path(_artifact_root_for(target), session_id)
+        row = json.loads(path.read_text())
+        head = _git_text(target, "rev-parse", "HEAD")
+        route_head = row.get("route_head")
+        if (row.get("merge_ref") != ref or row.get("target_cwd") != str(target.resolve())
+                or not head or head != route_head):
+            return
+        row["merge_result"] = {"exit_code": 0, "target_new_head": head}
+        _atomic_json(path, row)
+    except (OSError, ValueError, TypeError, RouteError, subprocess.SubprocessError):
+        return
+
+
+def _record_route_merge_result_from_reflog(path: Path, target: Path, intent: dict[str, Any],
+                                           route_head: str) -> dict[str, Any] | None:
+    """Recover the automatic result event from Git's exact fast-forward reflog.
+
+    This keeps the shared guard usable on adapters without a proven post-tool
+    response hook. The result must be the current target head, the preceding
+    reflog entry must equal the pre-command head, and Git's action text must
+    name the exact previously observed merge ref.
+    """
+    old = intent.get("target_old_head")
+    ref = intent.get("merge_ref")
+    if not old or not ref:
+        return None
+    result = subprocess.run(
+        ["git", "-C", str(target), "reflog", "-2", "--format=%H%x09%gs", "HEAD"],
+        capture_output=True, text=True)
+    if result.returncode:
+        return None
+    rows = result.stdout.splitlines()
+    if len(rows) < 2:
+        return None
+    latest = rows[0].split("\t", 1)
+    previous = rows[1].split("\t", 1)
+    if (len(latest) != 2 or len(previous) != 2
+            or latest[0] != route_head or previous[0] != old
+            or latest[1] != f"merge {ref}: Fast-forward"
+            or _git_text(target, "rev-parse", "HEAD") != route_head):
+        return None
+    event = dict(intent)
+    event["merge_result"] = {"exit_code": 0, "target_new_head": route_head,
+                             "proof": "exact-fast-forward-reflog"}
+    try:
+        _atomic_json(path, event)
+    except (OSError, ValueError):
+        return None
+    return event
+
+
+def _route_reuse_proven(route: dict[str, Any], marker: dict[str, Any], target: Path,
+                        agent_home: Path, session_id: str, command: str = "") -> bool:
+    route_cwd = Path(str(route.get("cwd", ""))).resolve(strict=False)
+    if not route.get("campaign_key") or route.get("campaign_key") == "_unassigned":
+        return False
+    if marker.get("route_id") != route.get("route_id") or marker.get("route_hash") != route.get("route_hash"):
+        return False
+    common = _git_common_dir(route_cwd)
+    if common is None or common != _git_common_dir(target):
+        return False
+    route_artifact = Path(str(route.get("artifact_root", ""))).resolve(strict=False)
+    if _artifact_root_for(route_cwd) != route_artifact or _artifact_root_for(target) != route_artifact:
+        return False
+    try:
+        import artifact_producer
+        cycle = artifact_producer.route_cycle_for(route_artifact, route)
+        campaign = artifact_producer.read_campaign(route_artifact, cycle["campaign_id"]) if cycle else None
+        if not cycle or cycle.get("state") != "open" or not campaign or campaign.get("key") != route.get("campaign_key"):
+            return False
+    except Exception:
+        return False
+    branch = _git_text(route_cwd, "symbolic-ref", "--short", "HEAD")
+    if not branch:
+        return False
+    branch_ref = "refs/heads/" + branch
+    base = _git_text(route_cwd, "rev-parse", branch_ref + "^{commit}")
+    source = route.get("source_commit")
+    if not base or not source or base == source:
+        return False
+    if subprocess.run(["git", "-C", str(route_cwd), "merge-base", "--is-ancestor", source, base]).returncode:
+        return False
+    event_path = _route_merge_event_path(route_artifact, session_id)
+    try: intent = json.loads(event_path.read_text())
+    except (OSError, ValueError): intent = None
+    if intent and (intent.get("route_id") != route["route_id"] or intent.get("route_hash") != route["route_hash"]
+                   or intent.get("campaign_key") != route["campaign_key"] or intent.get("route_head") != base):
+        intent = None
+    if command and _parse_exact_merge(command):
+        _record_route_merge_intent(session_id, agent_home, target, command)
+        try: intent = json.loads(event_path.read_text())
+        except (OSError, ValueError): intent = None
+    target_branch = _git_text(target, "symbolic-ref", "--short", "HEAD")
+    merge_head = _git_text(target, "rev-parse", "--verify", "MERGE_HEAD")
+    if merge_head == base and target_branch and target_branch != branch:
+        return True
+    head = _git_text(target, "rev-parse", "HEAD")
+    if not head:
+        return False
+    if intent and not intent.get("merge_result") and head == base:
+        intent = _record_route_merge_result_from_reflog(event_path, target, intent, base) or intent
+    commits = []
+    current = head
+    seen = set()
+    while current and current not in seen:
+        seen.add(current)
+        commits.append(current)
+        parent = _git_text(target, "rev-parse", "--verify", current + "^1")
+        current = parent if parent and re.fullmatch(r"[0-9a-f]{40,64}", parent) else None
+    for commit in commits:
+        parents = (_git_text(target, "show", "-s", "--format=%P", commit) or "").split()
+        if len(parents) == 2 and parents[1] == base:
+            return True
+    result = intent.get("merge_result") if isinstance(intent, dict) else None
+    if (intent and isinstance(result, dict) and result.get("exit_code") == 0
+            and result.get("target_new_head") == base and head == base
+            and target_branch == intent.get("target_branch") and target_branch != branch):
+        old = intent.get("target_old_head")
+        if (old and subprocess.run(["git", "-C", str(target), "merge-base", "--is-ancestor", old, base]).returncode == 0
+                and base in commits):
+            return True
+    return False
+
+
+def _route_scope_allows(route: dict[str, Any], target: Path) -> bool:
+    repo = git_root(target)
+    if repo is None:
+        return False
+    try:
+        relative = target.resolve(strict=False).relative_to(repo.resolve()).as_posix()
+    except ValueError:
+        return False
+    node_id = os.environ.get("AGENT_ROUTE_NODE", "")
+    node = next((row for row in route.get("nodes", [])
+                 if (row.get("id") == node_id if node_id else row.get("terminal"))), None)
+    if not node:
+        return False
+    for scope in node.get("write_scope") or []:
+        if scope == "source-scoped":
+            if is_material_source(target, repo):
+                return True
+            continue
+        if scope.startswith("/") or ":" in scope:
+            continue
+        prefix = scope.removesuffix("/**")
+        if relative == prefix or relative.startswith(prefix.rstrip("/") + "/"):
+            return True
+        if fnmatch.fnmatchcase(relative, scope):
+            return True
+    return False
+
+
 def clear_route(session_id: str, agent_home: Path) -> None:
     try:
         path = marker_path(agent_home, session_id)
@@ -618,6 +859,7 @@ def session_route(
     agent_home: Path,
     *,
     accepted_capabilities: set[str] | None = None,
+    command: str = "",
 ) -> dict[str, Any]:
     try:
         marker = _load_session_marker(session_id, agent_home)
@@ -628,10 +870,18 @@ def session_route(
         raise
     marker_cwd = Path(str(marker.get("cwd", ""))).resolve(strict=False)
     if marker_cwd != root.resolve():
-        raise RouteError(
-            "session-marker-cwd-mismatch",
-            context={"marker_cwd": str(marker_cwd), "target_cwd": str(root.resolve())},
+        route_file = Path(str(marker.get("route_file", "")))
+        route = verify_route(
+            route_file, marker_cwd, agent_home,
+            expected_route_id=str(marker.get("route_id", "")),
+            accepted_capabilities=accepted_capabilities,
         )
+        if route.get("route_hash") != marker.get("route_hash"):
+            raise RouteError("session-marker-route-hash-mismatch")
+        if not _route_reuse_proven(route, marker, root.resolve(), agent_home, session_id, command):
+            raise RouteError("session-route-reuse-unproven", context={
+                "marker_cwd": str(marker_cwd), "target_cwd": str(root.resolve())})
+        return route
     route = verify_route(
         Path(str(marker.get("route_file", ""))),
         root,
@@ -761,6 +1011,7 @@ def active_route(
     agent_home: Path,
     *,
     accepted_capabilities: set[str] | None = None,
+    command: str = "",
 ) -> tuple[dict[str, Any], bool]:
     worker = worker_route(
         root,
@@ -775,6 +1026,7 @@ def active_route(
             root,
             agent_home,
             accepted_capabilities=accepted_capabilities,
+            command=command,
         ),
         False,
     )
@@ -786,12 +1038,14 @@ def require_route(
     agent_home: Path,
     *,
     accepted_capabilities: set[str] | None = None,
+    command: str = "",
 ) -> bool:
     _route, is_worker = active_route(
         session_id,
         root,
         agent_home,
         accepted_capabilities=accepted_capabilities,
+        command=command,
     )
     return is_worker
 
@@ -1547,17 +1801,21 @@ def check_action(
         if not is_material_source(target, repo):
             return
         root = project_root(cwd, target)
-        is_worker = require_route(
+        route, is_worker = active_route(
             session_id,
             root,
             agent_home,
             accepted_capabilities={"autopilot-code"},
+            command=command,
         )
+        if not _route_scope_allows(route, target):
+            raise RouteError("session-route-write-scope-mismatch")
         if not is_worker:
             require_recall_opportunity(session_id, turn_id, root)
         return
     if tool not in {"Bash", "bash", "Shell", "shell"} or not command:
         return
+    _record_route_merge_intent(session_id, agent_home, cwd, command)
     for command_cwd, all_tracked, path_mode, paths in _git_commit_segments(command, cwd):
         repo = git_root(command_cwd)
         if repo is None or not commit_has_material(repo, all_tracked, path_mode, paths):
@@ -1567,6 +1825,7 @@ def check_action(
             repo,
             agent_home,
             accepted_capabilities={"autopilot-code"},
+            command=command,
         )
         if not is_worker:
             require_recall_opportunity(session_id, turn_id, repo)
@@ -1750,6 +2009,10 @@ def hook_main(payload: dict[str, Any], agent_home: Path) -> int:
         tool in {"Bash", "bash", "Shell", "shell", "exec_command", "functions.exec_command"}
         or tool.endswith(".exec_command")
     ):
+        _record_route_merge_result(
+            session_id, agent_home, cwd,
+            str(tool_input.get("command") or ""), payload.get("tool_response"),
+        )
         warning = bind_after_compile(
             str(tool_input.get("command") or ""),
             cwd,
