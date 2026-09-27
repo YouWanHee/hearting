@@ -254,10 +254,14 @@ def _slot(route, node, rows):
     if aid in rows:
         if not matches:
             raise DispatchContractError("work-attempt-identity-conflict", aid)
-        meta = rows[aid][1]
-        parent = _current_parent_session_id()
-        if not parent or meta.get("parent_sid") != parent:
-            raise DispatchContractError("work-parent-recovery-required", aid)
+        status, meta = rows[aid]
+        # A live attempt delivers to the session that launched it, so another
+        # session cannot adopt it. A finished one only has a result to read:
+        # the session a supervisor handed the route to may harvest it.
+        if status != "done":
+            parent = _current_parent_session_id()
+            if not parent or meta.get("parent_sid") != parent:
+                raise DispatchContractError("work-parent-recovery-required", aid)
         digest = (meta.get("owner_route_hash") or meta.get("route_hash")) if node == "owner" else meta.get("route_hash")
         if digest != route["route_hash"]:
             raise DispatchContractError("work-attempt-identity-conflict", aid)
