@@ -534,6 +534,7 @@ class CodexSD78CompletionDelivery(unittest.TestCase):
         args = _prompt_args(attempt_id="att-parent")
         command = WH.shell_command(args, Path("/tmp/p.txt"), Path("/tmp/l.log"))
         self.assertIn("codex-app-server-supervisor.py", command)
+        self.assertNotIn("--ephemeral", command)
         self.assertIn("--parent-attempt-id att-parent", command)
         self.assertIn(
             "--state-file /tmp/fixture-agent-home/.dispatch/supervisor-state/att-parent.json",
@@ -578,6 +579,7 @@ class CodexSD78CompletionDelivery(unittest.TestCase):
                 resolved_completion_delivery=delivery,
             )
             command = WH.shell_command(args, Path("/tmp/p.txt"), Path("/tmp/l.log"))
+            self.assertIn("codex exec --ephemeral --cd", command, delivery)
             self.assertIn(f"--add-dir {state_root}/heartbeats", command, delivery)
             self.assertIn(f"--add-dir {state_root}/watchdog", command, delivery)
             self.assertNotIn(f"--add-dir {state_root} ", command + " ", delivery)

@@ -537,6 +537,14 @@ them; only a negotiated v3 consumer can ever receive the separate
 the negotiation that gates that block's delivery are the same single
 decision, never two independently toggled ones.
 
+Registered one-shot Codex `exec` workers use `--ephemeral`: their stdout JSONL,
+attempt records and completion markers remain durable, while Codex does not save
+a resumable session. Route continuation validates those harness records rather
+than resuming a worker rollout. The App Server owner keeps its existing live
+ephemeral thread across turns; this policy does not change owner supervision or
+interactive sessions. Fleet reports unavailable worker context-window telemetry
+as unknown when only a saved rollout could have supplied it.
+
 ### §5.10a. Completion Delivery (model-visible contract)
 
 The parent carries one field, not the carrier taxonomy: every launch receipt that

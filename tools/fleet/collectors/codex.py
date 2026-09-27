@@ -198,6 +198,7 @@ class _LifecycleCursor:
     carry: bytes
     lifecycle: object
     boundary: bytes
+    pending_calls: object = None
 
 
 def _advance_task_lifecycle(lifecycle, raw_line):
@@ -222,16 +223,58 @@ def _advance_task_lifecycle(lifecycle, raw_line):
     return None
 
 
-def _consume_lifecycle_bytes(lifecycle, carry, data):
+def _advance_pending_input(open_calls, lifecycle, row):
+    """Track only call/turn identity/time; never retain question/answer content."""
+    if not isinstance(row, dict):
+        return
+    payload = row.get("payload")
+    if not isinstance(payload, dict):
+        return
+    if row.get("type") == "event_msg":
+        kind = payload.get("type")
+        if kind == "task_started":
+            open_calls.clear()
+        elif kind in {"task_complete", "turn_aborted"}:
+            # Task lifecycle can become ambiguous after an unrelated terminal.
+            # Keep each question's own turn binding until it is answered/ended.
+            for call_id, (_since, turn_id) in list(open_calls.items()):
+                if turn_id is None or turn_id == payload.get("turn_id"):
+                    open_calls.pop(call_id)
+        return
+    if row.get("type") != "response_item":
+        return
+    call_id = payload.get("call_id")
+    if not isinstance(call_id, str) or not call_id:
+        return
+    kind = payload.get("type")
+    if kind == "function_call" and payload.get("name") == "request_user_input":
+        # Reinsertion preserves most-recent-call order when an id is reused.
+        open_calls.pop(call_id, None)
+        open_calls[call_id] = (
+            _event_timestamp(row.get("timestamp"), None),
+            lifecycle[1] if lifecycle and lifecycle[0] == "task_started" else None,
+        )
+    elif kind == "function_call_output":
+        open_calls.pop(call_id, None)
+
+
+def _consume_lifecycle_bytes(lifecycle, carry, data, pending_calls=None):
     """Consume complete newline-delimited rows, retaining an incomplete suffix."""
     parts = (carry + data).split(b"\n")
     carry = parts.pop()
     for raw_line in parts:
+        if pending_calls is not None:
+            try:
+                row = json.loads(raw_line)
+            except (ValueError, UnicodeError):
+                row = None
+            _advance_pending_input(pending_calls, lifecycle, row)
         lifecycle = _advance_task_lifecycle(lifecycle, raw_line.rstrip(b"\r"))
     return lifecycle, carry
 
 
-def _read_lifecycle_range(handle, start, end, chunk, lifecycle=None, carry=b""):
+def _read_lifecycle_range(handle, start, end, chunk, lifecycle=None, carry=b"",
+                          pending_calls=None):
     if not isinstance(chunk, int) or chunk <= 0:
         raise ValueError("chunk must be a positive integer")
     handle.seek(start)
@@ -240,7 +283,7 @@ def _read_lifecycle_range(handle, start, end, chunk, lifecycle=None, carry=b""):
         data = handle.read(min(chunk, remaining))
         if not data:
             raise OSError("short lifecycle read")
-        lifecycle, carry = _consume_lifecycle_bytes(lifecycle, carry, data)
+        lifecycle, carry = _consume_lifecycle_bytes(lifecycle, carry, data, pending_calls)
         remaining -= len(data)
     return lifecycle, carry
 
@@ -278,7 +321,9 @@ def _initialize_lifecycle_cursor(canonical_path, chunk=65536):
     with open(canonical_path, "rb") as handle:
         opened = os.fstat(handle.fileno())
         endpoint = opened.st_size
-        lifecycle, carry = _read_lifecycle_range(handle, 0, endpoint, chunk)
+        pending_calls = {}
+        lifecycle, carry = _read_lifecycle_range(
+            handle, 0, endpoint, chunk, pending_calls=pending_calls)
         current = _stable_path_stat(canonical_path, handle, endpoint)
         boundary = _cursor_boundary(handle, endpoint)
     return _LifecycleCursor(
@@ -290,6 +335,7 @@ def _initialize_lifecycle_cursor(canonical_path, chunk=65536):
         carry=carry,
         lifecycle=lifecycle,
         boundary=boundary,
+        pending_calls=pending_calls,
     )
 
 
@@ -370,9 +416,10 @@ def _latest_task_lifecycle(rollout_path, chunk=65536, max_scan=1048576):
                     raise OSError("lifecycle timestamps regressed before append read")
                 if _cursor_boundary(handle, cached.offset) != cached.boundary:
                     raise OSError("saved lifecycle boundary changed before append read")
+                pending_calls = dict(cached.pending_calls or {})
                 lifecycle, carry = _read_lifecycle_range(
                     handle, cached.offset, endpoint, chunk,
-                    cached.lifecycle, cached.carry,
+                    cached.lifecycle, cached.carry, pending_calls=pending_calls,
                 )
                 current = _stable_path_stat(canonical_path, handle, endpoint)
                 if _lifecycle_timestamps_regressed(cached, current):
@@ -387,6 +434,7 @@ def _latest_task_lifecycle(rollout_path, chunk=65536, max_scan=1048576):
                 carry=carry,
                 lifecycle=lifecycle,
                 boundary=boundary,
+                pending_calls=pending_calls,
             )
     except (OSError, ValueError):
         _LIFECYCLE_CACHE.pop(canonical_path, None)
@@ -1320,53 +1368,21 @@ def _event_timestamp(value, fallback):
 
 
 def _tail_pending_request_user_input(path, chunk=65536):
-    """Newest structured request_user_input call not closed by a later output.
+    """Full-history, append-cached pending input independent of the gateway.
 
-    Parsing is shape-only after JSON decoding. Prompt prose and tool
-    descriptions are never searched. The ordered state machine deliberately
-    supports call-id reuse: a later call reopens an id closed earlier.
+    The lifecycle cursor pairs calls/outputs and clears abandoned turn requests.
+    A question older than the last read chunk remains visible without rescanning
+    history on each Fleet tick. Partial lines and changed file identities fail
+    closed under the same cursor contract as task lifecycle observation.
     """
-    try:
-        size = os.path.getsize(path)
-        start = max(0, size - chunk)
-        fallback = os.path.getmtime(path)
-        with open(path, "rb") as handle:
-            handle.seek(start)
-            data = handle.read().decode("utf-8", "replace")
-    except OSError:
+    _latest_task_lifecycle(path, chunk=chunk)
+    canonical_path = os.path.realpath(os.path.abspath(path))
+    cursor = _LIFECYCLE_CACHE.get(canonical_path)
+    if cursor is None or not cursor.pending_calls:
         return None
-    lines = data.splitlines()
-    if start > 0 and lines:
-        lines = lines[1:]
-    open_calls = {}
-    sequence = 0
-    for line in lines:
-        try:
-            record = json.loads(line)
-        except Exception:
-            continue
-        if not isinstance(record, dict) or record.get("type") != "response_item":
-            continue
-        payload = record.get("payload")
-        if not isinstance(payload, dict):
-            continue
-        call_id = payload.get("call_id")
-        if not isinstance(call_id, str) or not call_id:
-            continue
-        kind = payload.get("type")
-        if kind == "function_call" and payload.get("name") == "request_user_input":
-            sequence += 1
-            open_calls[call_id] = {
-                "call_id": call_id,
-                "waiting_since": _event_timestamp(record.get("timestamp"), fallback),
-                "sequence": sequence,
-            }
-        elif kind == "function_call_output":
-            open_calls.pop(call_id, None)
-    if not open_calls:
-        return None
-    latest = max(open_calls.values(), key=lambda item: item["sequence"])
-    return {"call_id": latest["call_id"], "waiting_since": latest["waiting_since"]}
+    call_id = next(reversed(cursor.pending_calls))
+    since, _turn_id = cursor.pending_calls[call_id]
+    return {"call_id": call_id, "waiting_since": since if since is not None else cursor.mtime_ns / 1e9}
 
 
 def _apply_token_count(sess, line):

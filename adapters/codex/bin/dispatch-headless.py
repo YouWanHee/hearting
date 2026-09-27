@@ -1353,6 +1353,7 @@ def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -
     cmd = [
         "codex",
         "exec",
+        "--ephemeral",
         "--cd",
         args.worktree,
         "--add-dir",
