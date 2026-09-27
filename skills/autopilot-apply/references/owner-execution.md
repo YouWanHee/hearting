@@ -45,7 +45,7 @@ An explicit `/autopilot-apply <args>` invocation supplies the routing choice dir
 Enforce all checks in Stage A. If any check fails, do not create a branch, edit a file, or commit.
 
 1. **Git tracking**: `--source` must resolve inside a git repository and be tracked. Otherwise, explain that the repository needs an initial commit before retrying.
-2. **Clean working state**: apply OPERATIONS §5.9 (`<agent-home>/core/OPERATIONS.md#59-git-working-state-preflight`). Abort on dirty source edits, an active merge/rebase/cherry-pick, or detached HEAD. Report the condition; do not abort the user's operation automatically.
+2. **Clean working state**: apply OPERATIONS §5.9 (`<agent-home>/core/OPERATIONS.md#59-git-working-state-preflight`) for active operations, conflict-resolution authority, and detached HEAD. Stop this apply step on unrelated dirty source edits; do not abort the user's operation automatically.
 3. **Unique cheatsheet**: resolve exactly one fuzzy match. List multiple matches and report zero matches with guidance.
 4. **Build tools**: for `latex`, require `latexmk` or `pdflatex`. Recommend `latexdiff`, but fall back to text diff when it is unavailable.
 

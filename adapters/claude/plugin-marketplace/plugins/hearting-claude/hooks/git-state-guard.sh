@@ -2,9 +2,8 @@
 # PreToolUse(Edit|Write|MultiEdit|NotebookEdit): deny file edits while a git
 # repository is merging, rebasing, or cherry-picking (OPERATIONS §5.9).
 # This also covers direct edit paths that bypass workflow ceremony.
-# Escape hatch: only after the user explicitly requests conflict resolution,
-# create $GITDIR/CLAUDE_MERGE_EDIT_OK, perform the work, then delete it. The
-# agent must not create the marker on its own.
+# Conflict-resolution authority and marker lifecycle are defined only in
+# core/OPERATIONS.md §5.9; this guard enforces that existing marker mechanism.
 # POSIX sh, no jq. Also supports portable CLI mode:
 #   git-state-guard.sh --file <path>
 
@@ -49,10 +48,10 @@ op=""
 [ -z "$op" ] && ! git -C "$dir" symbolic-ref --quiet HEAD >/dev/null 2>&1 && op="detached-HEAD"
 [ -z "$op" ] && exit 0
 
-# Explicit-request escape hatch.
+# Authority marker governed by OPERATIONS §5.9.
 [ -f "$gd/CLAUDE_MERGE_EDIT_OK" ] && exit 0
 
-reason="$op is in progress in this repository. Stop edits and commits and report the state (OPERATIONS §5.9). Do not resolve conflicts or complete the operation without an explicit user request. After such a request, touch $gd/CLAUDE_MERGE_EDIT_OK, perform the work, then remove the marker."
+reason="$op is in progress in this repository. Apply core/OPERATIONS.md §5.9 for conflict-resolution authority and its marker lifecycle before editing. Ordinary edits and commits remain stopped; do not auto-abort or force-checkout."
 if [ "$hook_mode" -eq 1 ]; then
   printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"%s"}}\n' "$reason"
   exit 0

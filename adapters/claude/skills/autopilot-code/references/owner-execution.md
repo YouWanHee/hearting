@@ -6,7 +6,7 @@ Code-work entrypoint. Detect spec context and close the `plan → execute → te
 
 - Default output: `<artifact-root>/plans/<date>_<slug>/`. `direct` creates no durable plan; `quick` uses a micro-plan; `standard+` writes the selected graph’s declared outputs; plan/checklist belong only to selected planning work.
 - When a spec exists, emit a one-line `spec-significance` judgment before editing code. Route spec-significant changes through an `autopilot-spec` update first.
-- Recheck git and worktree state at entry and immediately before durable write-back or commit. Stop on an active merge/rebase, detached HEAD, or an unexpected HEAD change.
+- Recheck git and worktree state at entry and immediately before durable write-back or commit. Follow `<agent-home>/core/OPERATIONS.md §5.9` for active operations, conflict-resolution authority, detached HEAD, and unexpected HEAD changes.
 - Do not parallelize QA at every stage. Scale `plan-check` and final `code-test` from the rigor derived from intensity (CONVENTIONS §1.1).
 - Follow an explicit artifact or audience language for user-facing reports. Otherwise, use the conversation language.
 

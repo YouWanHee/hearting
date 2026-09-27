@@ -31,14 +31,14 @@ metadata:
 Before source changes, establish a recoverable working state.
 
 0. Run the [git working-state preflight](../../core/OPERATIONS.md#59-git-working-state-preflight) before the safety checkpoint and again before every success commit.
-   - Stop and report an active merge, rebase, or cherry-pick, or a detached HEAD. Do not abort it automatically.
+   - Apply OPERATIONS §5.9 for active operations, conflict-resolution authority, and detached HEAD handling.
    - Warn about a dirty entry state, an upstream-ahead branch, or the same branch checked out in another worktree.
    - Record entry `HEAD`. Before committing, stop if `HEAD` changed unexpectedly or a new `MERGE_HEAD` appeared.
 1. Run `git fetch && git pull` when the active workflow authorizes remote synchronization.
-   - If the pull creates conflicts, run `git merge --abort`, report the conflict, and stop execution.
+   - If the pull creates conflicts, follow OPERATIONS §5.9 before further edits; do not abort automatically.
 2. Run `git status` and inspect all uncommitted changes.
 3. If changes exist, first check `git rev-parse -q --verify MERGE_HEAD` and `$(git rev-parse --git-dir)/rebase-merge` or `rebase-apply`.
-   - If any merge or rebase is active, do not run `git add -A && git commit`; stop and report the state.
+   - If any merge or rebase is active, apply OPERATIONS §5.9; a safety checkpoint never completes the operation implicitly.
    - Otherwise, create an accurately described checkpoint with `git add -A && git commit` only when every included change is understood and in scope. Stop instead of sweeping unrelated user changes into the checkpoint.
 4. Run `git rev-parse HEAD`, save it as `$SAFETY_COMMIT`, and persist it in the checklist header.
 

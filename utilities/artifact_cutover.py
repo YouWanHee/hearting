@@ -1811,6 +1811,7 @@ def _adopt_reference(root: Path, kind: str, ref_id: str, *, title: str) -> Dict[
     record = {
         "schema_version": 1, "contract": P.CONTRACT, "shared_reference_id": ref_id, "kind": P.SHARED_KINDS[kind],
         "key": kind, "title": title, "created_on": _now(), "adopted_from": "w7-e2-e3-relocation",
+        "adopted_revision_ids": revisions,
         "latest_revision_id": revisions[-1] if revisions else None, "revisions": revisions,
     }
     P._write_exclusive(path, P._json_bytes(record))

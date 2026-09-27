@@ -66,7 +66,41 @@ def seed_cycle_spec(spec_base: Path, artifact: Path, spec_root: Path | None = No
     revision=artifact/"shared"/"spec"/ref_id/"revisions"/latest if ref_id and latest else None
     if receipt is not None:
         base=PRODUCER._spec_admission_base(artifact,spec_base,ref_id,None)
-        PRODUCER._check_shared_base(base,latest)
+        # The receipt is the original input, not a pin to today's pointer.
+        # A completed seed must never resurrect a candidate's intentional deletion.
+        if reference and latest not in reference.get("revisions", []):
+            raise PRODUCER.ProducerError("shared-base-invalid",str(latest))
+        revision=artifact/"shared/spec"/ref_id/"revisions"/base if ref_id and base else None
+        original_tree=(PRODUCER._verified_shared_spec(artifact,ref_id,base)[0] if revision else {})
+        if receipt.get("seed_complete") is True:
+            return {"status":"seed-skipped","reason":"prd-present" if has_prd else "seed-complete",
+                    "prd_present":has_prd,"preexisting_files":preexisting,"spec_base":str(spec_base),
+                    "kept_existing":max(0,preexisting-1),"kept_existing_paths":[],
+                    "base_revision_id":base,"latest_revision_id":latest}
+        if "seed_complete" not in receipt:
+            # Legacy receipts do not distinguish half-copy from later deletion.
+            # A complete old tree can be adopted without copying any bytes.
+            missing=[p for p in original_tree if p!=PRODUCER.SPEC_BASE_RECEIPT and not (spec_base/p).is_file()]
+            if missing:
+                raise PRODUCER.ProducerError("shared-seed-state-unproven",",".join(sorted(missing)))
+            receipt["seed_complete"]=True
+            PRODUCER._write_atomic(receipt_path,PRODUCER._json_bytes(receipt))
+            return {"status":"seed-skipped","reason":"prd-present" if has_prd else "seed-complete",
+                    "prd_present":has_prd,"preexisting_files":preexisting,"spec_base":str(spec_base),
+                    "kept_existing":max(0,preexisting-1),"kept_existing_paths":[]}
+        if receipt.get("seed_complete") is not False:
+            raise PRODUCER.ProducerError("shared-base-invalid","seed_complete")
+        for path in spec_base.rglob("*"):
+            rel=path.relative_to(spec_base).as_posix()
+            if path.is_symlink():
+                raise PRODUCER.ProducerError("shared-base-unproven",rel)
+            if not path.is_file() or rel==PRODUCER.SPEC_BASE_RECEIPT or "_internal/research/" in rel:
+                continue
+            if rel in original_tree and path.read_bytes()==original_tree[rel]:
+                continue
+            if "/_internal/versions/" in "/"+rel:
+                continue
+            raise PRODUCER.ProducerError("shared-seed-state-unproven",rel)
     else:
         # Only known unchanged seed files and explicit worker research can
         # predate the receipt. Unknown/deleted old files must not be resurrected.
@@ -83,11 +117,15 @@ def seed_cycle_spec(spec_base: Path, artifact: Path, spec_root: Path | None = No
         if revision is not None and (metadata is None or metadata.get("shared_reference_revision_id")!=latest
                                      or metadata.get("shared_reference_id")!=ref_id):
             raise PRODUCER.ProducerError("shared-base-invalid",str(revision))
+        if revision is not None:
+            PRODUCER._verified_shared_spec(artifact,ref_id,latest)
         receipt={"schema_version":1,"reference_id":ref_id,"revision_id":latest,
-                 "content_digest":metadata["content_digest"] if metadata else None}
+                 "content_digest":metadata["content_digest"] if metadata else None,"seed_complete":False}
         receipt_path.parent.mkdir(parents=True,exist_ok=True)
         PRODUCER._write_atomic(receipt_path,PRODUCER._json_bytes(receipt))
     if revision is None:
+        receipt["seed_complete"]=True
+        PRODUCER._write_atomic(receipt_path,PRODUCER._json_bytes(receipt))
         return {"status":"seed-skipped","reason":"prd-present" if has_prd else "no-shared-revision","prd_present":has_prd,"preexisting_files":preexisting,"spec_base":str(spec_base)}
     copied=0; kept=0; kept_paths=[]
     for src in sorted(revision.rglob("*")):
@@ -122,6 +160,8 @@ def seed_cycle_spec(spec_base: Path, artifact: Path, spec_root: Path | None = No
                 if dst.exists() or src.is_symlink() or not src.is_file():
                     continue
                 dst.parent.mkdir(parents=True,exist_ok=True); dst.write_bytes(src.read_bytes()); history+=1
+    receipt["seed_complete"]=True
+    PRODUCER._write_atomic(receipt_path,PRODUCER._json_bytes(receipt))
     if has_prd and copied==0 and history==0:
         return {"status":"seed-skipped","reason":"prd-present","prd_present":True,"preexisting_files":preexisting,
                 "kept_existing":kept,"kept_existing_paths":kept_paths,"source":str(revision),"spec_base":str(spec_base)}

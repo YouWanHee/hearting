@@ -2851,7 +2851,7 @@ class SharedBaseGuardTest(ProducerTestBase):
         before = self._reference(first["shared_reference_id"])
         with self.assertRaises(P.ProducerError) as ctx:
             self._admit(cycle, 2, base_revision=base)
-        self.assertEqual(ctx.exception.code, "shared-base-mismatch")
+        self.assertEqual(ctx.exception.code, "shared-spec-conflict")
         self.assertEqual(self._reference(first["shared_reference_id"]), before)
         self.assertEqual(self._journals(), [])
         retry = self._admit(cycle, 0)
@@ -4431,6 +4431,259 @@ class PrimarySupportExclusionTest(unittest.TestCase):
     def test_explicit_primary_inside_support_still_wins(self):
         rows = [("artifacts/_internal/notes.md", b""), ("artifacts/plans/report.md", b"")]
         self.assertEqual(P._choose_primary(rows, "_internal/notes.md"), "artifacts/_internal/notes.md")
+
+
+class SharedSpecMergeTest(SharedBaseGuardTest):
+    """D-122 integration: immutable inputs, derived publication and exact CAS."""
+    def trees(self, *trees):
+        self.activate()
+        route, route_file, result = self.begin("direct", "autopilot-spec", "update")
+        for n, tree in enumerate(trees):
+            for path, data in tree.items():
+                self.write_output(result, f"gen{n}/{path}", data)
+        self.close(route, route_file)
+        P.finalize(self.root, cycle_id=result["cycle_id"])
+        return result
+
+    def fixture(self):
+        base = {"a/prd.md": b"# A\n\n## One\none\n\n## Two\ntwo\n", "b/prd.md": b"# B\nold\n"}
+        first = {**base, "a/prd.md": base["a/prd.md"].replace(b"one\n", b"ONE\n")}
+        second = {**base, "a/prd.md": base["a/prd.md"].replace(b"two\n", b"TWO\n")}
+        cycle = self.trees(base, first, second, {**second, "b/prd.md": b"# B\nnew\n"})
+        initial = self._admit(cycle, 0)
+        winner = self._admit(cycle, 1, base_revision=initial["shared_reference_revision_id"])
+        return cycle, initial, winner
+
+    def test_disjoint_sections_merge_source_stays_sealed_and_exact_retry_reuses(self):
+        cycle, initial, winner = self.fixture()
+        source = Path(cycle["cycle_dir"]) / "artifacts/gen2"
+        before = P._spec_bytes(source)
+        merged = self._admit(cycle, 2, base_revision=initial["shared_reference_revision_id"])
+        result = P._spec_bytes(Path(merged["revision_dir"]), revision=True)
+        self.assertIn(b"ONE\n", result["a/prd.md"])
+        self.assertIn(b"TWO\n", result["a/prd.md"])
+        self.assertEqual(P._spec_bytes(source), before)
+        self.assertEqual(merged["spec_merge"]["latest_revision_id"], winner["shared_reference_revision_id"])
+        later = self._admit(cycle, 3, base_revision=initial["shared_reference_revision_id"])
+        retry = self._admit(cycle, 2)
+        self.assertEqual(retry["status"], "reused")
+        self.assertEqual(retry["shared_reference_revision_id"], merged["shared_reference_revision_id"])
+        self.assertEqual(self._reference(initial["shared_reference_id"])["latest_revision_id"], later["shared_reference_revision_id"])
+        self.assertEqual(self._journals(), [])
+
+    def test_new_latest_component_is_kept_and_old_omission_still_refuses(self):
+        base = {"a/prd.md": b"a", "b/prd.md": b"b"}
+        cycle = self.trees(base, {**base, "c/prd.md": b"c"}, {**base, "b/prd.md": b"B"}, {"b/prd.md": b"B"})
+        initial = self._admit(cycle, 0)
+        self._admit(cycle, 1, base_revision=initial["shared_reference_revision_id"])
+        merged = self._admit(cycle, 2, base_revision=initial["shared_reference_revision_id"])
+        self.assertEqual((Path(merged["revision_dir"]) / "c/prd.md").read_bytes(), b"c")
+        with self.assertRaises(P.ProducerError) as exc:
+            self._admit(cycle, 3, base_revision=initial["shared_reference_revision_id"])
+        self.assertEqual(exc.exception.code, "component-set-regressed")
+        self.assertEqual(self._journals(), [])
+
+    def test_same_section_conflict_has_no_publication_residue(self):
+        base = {"a/prd.md": b"# A\n## One\nold\n"}
+        cycle = self.trees(base, {"a/prd.md": b"# A\n## One\nleft\n"}, {"a/prd.md": b"# A\n## One\nright\n"})
+        initial = self._admit(cycle, 0)
+        self._admit(cycle, 1, base_revision=initial["shared_reference_revision_id"])
+        before = self._reference(initial["shared_reference_id"])
+        with self.assertRaises(P.ProducerError) as exc:
+            self._admit(cycle, 2, base_revision=initial["shared_reference_revision_id"])
+        self.assertEqual(exc.exception.code, "shared-spec-conflict")
+        self.assertIn("One", exc.exception.detail)
+        self.assertEqual(self._reference(initial["shared_reference_id"]), before)
+        self.assertEqual(self._journals(), [])
+        self.assertEqual(ComponentSetPreservation._staging_leftovers(self, initial["shared_reference_id"]), [])
+
+    def test_drop_component_conflicts_with_concurrent_new_file(self):
+        base = {"a/prd.md": b"a", "b/prd.md": b"b"}
+        cycle = self.trees(base, {**base, "a/new.md": b"new"}, {"b/prd.md": b"b"})
+        initial = self._admit(cycle, 0)
+        self._admit(cycle, 1, base_revision=initial["shared_reference_revision_id"])
+        with self.assertRaises(P.ProducerError) as exc:
+            self._admit(cycle, 2, base_revision=initial["shared_reference_revision_id"], drop_components=["a"])
+        self.assertEqual(exc.exception.code, "shared-spec-conflict")
+        self.assertEqual(self._journals(), [])
+
+    def test_base_and_latest_bytes_are_verified_before_admission(self):
+        cycle, initial, winner = self.fixture()
+        for record in (initial, winner):
+            path = Path(record["revision_dir"]) / "b/prd.md"
+            old = path.read_bytes()
+            path.write_bytes(b"tampered")
+            try:
+                with self.assertRaises(P.ProducerError) as exc:
+                    self._admit(cycle, 2, base_revision=initial["shared_reference_revision_id"])
+                self.assertEqual(exc.exception.code, "shared-revision-integrity")
+                self.assertEqual(self._journals(), [])
+            finally:
+                path.write_bytes(old)
+
+    def test_publish_interruption_recovers_exact_proof_and_rejects_corruption(self):
+        from unittest import mock
+        cycle, initial, winner = self.fixture()
+        with mock.patch.object(P, "_commit_shared", side_effect=RuntimeError("crash")):
+            with self.assertRaises(RuntimeError):
+                self._admit(cycle, 2, base_revision=initial["shared_reference_revision_id"])
+        journal_path = next(P.shared_journal_path(self.root, "probe").parent.glob("*.json"))
+        journal = json.loads(journal_path.read_text())
+        output = self.root / journal["target"] / "a/prd.md"
+        original = output.read_bytes()
+        output.write_bytes(b"corruption")
+        self.assertTrue(P._recover_locked(self.root)["unresolved"])
+        self.assertEqual(self._reference(initial["shared_reference_id"])["latest_revision_id"], winner["shared_reference_revision_id"])
+        output.write_bytes(original)
+        recovered = P._recover_locked(self.root)
+        self.assertEqual(recovered["unresolved"], [])
+        self.assertFalse(journal_path.exists())
+        self.assertEqual(self._admit(cycle, 2)["shared_reference_revision_id"], journal["revision_id"])
+
+    def test_retry_validates_proof_and_published_bytes(self):
+        cycle, initial, _ = self.fixture()
+        merged = self._admit(cycle, 2, base_revision=initial["shared_reference_revision_id"])
+        record_path = Path(merged["revision_dir"]) / P.REVISION_RECORD_NAME
+        record = json.loads(record_path.read_text())
+        record["spec_merge"]["source_content_digest"] = "sha256:" + "0" * 64
+        record_path.write_text(json.dumps(record))
+        with self.assertRaises(P.ProducerError) as exc:
+            self._admit(cycle, 2)
+        self.assertEqual(exc.exception.code, "shared-merge-proof-invalid")
+
+    def test_exact_base_and_exact_retry_reject_corrupt_base(self):
+        cycle, initial, winner = self.fixture()
+        for base, operation in ((winner, lambda: self._admit(cycle, 2, base_revision=winner["shared_reference_revision_id"])),
+                                (initial, lambda: self._admit(cycle, 1))):
+            path = Path(base["revision_dir"]) / "b/prd.md"
+            data = path.read_bytes(); path.write_bytes(b"tampered base")
+            try:
+                with self.assertRaises(P.ProducerError) as exc: operation()
+                self.assertEqual(exc.exception.code, "shared-revision-integrity")
+                self.assertEqual(self._journals(), [])
+            finally:
+                path.write_bytes(data)
+
+    def test_missing_or_malformed_canonical_base_is_never_legacy(self):
+        cycle, initial, winner = self.fixture()
+        for base, operation in ((winner, lambda: self._admit(cycle, 2, base_revision=winner["shared_reference_revision_id"])),
+                                (initial, lambda: self._admit(cycle, 1))):
+            path = Path(base["revision_dir"]) / P.REVISION_RECORD_NAME
+            original = path.read_bytes()
+            for bad in (None, b"not-json"):
+                if bad is None: path.unlink()
+                else: path.write_bytes(bad)
+                try:
+                    with self.assertRaises(P.ProducerError) as exc: operation()
+                    self.assertEqual(exc.exception.code, "shared-base-invalid")
+                finally:
+                    path.write_bytes(original)
+
+    def test_removed_exact_base_field_still_verifies_parent_bytes(self):
+        cycle, initial, winner = self.fixture()
+        record_path = Path(winner["revision_dir"]) / P.REVISION_RECORD_NAME
+        record = json.loads(record_path.read_text()); record.pop("spec_base_revision_id")
+        record_path.write_text(json.dumps(record))
+        (Path(initial["revision_dir"]) / "b/prd.md").write_bytes(b"tampered parent")
+        with self.assertRaises(P.ProducerError) as exc: self._admit(cycle, 1)
+        self.assertEqual(exc.exception.code, "shared-revision-integrity")
+
+    def test_unresolved_publication_blocks_duplicate_attempt(self):
+        from unittest import mock
+        cycle, initial, winner = self.fixture()
+        with mock.patch.object(P, "_commit_shared", side_effect=RuntimeError("crash")):
+            with self.assertRaises(RuntimeError):
+                self._admit(cycle, 2, base_revision=initial["shared_reference_revision_id"])
+        journal_path = next(P.shared_journal_path(self.root, "probe").parent.glob("*.json"))
+        journal = json.loads(journal_path.read_text())
+        (self.root / journal["target"] / "a/prd.md").write_bytes(b"corruption")
+        before = sorted(p.name for p in (self.root / journal["target"]).parent.iterdir())
+        with self.assertRaises(P.ProducerError) as exc:
+            self._admit(cycle, 2, base_revision=initial["shared_reference_revision_id"])
+        self.assertEqual(exc.exception.code, "shared-publication-unresolved")
+        self.assertEqual(sorted(p.name for p in (self.root / journal["target"]).parent.iterdir()), before)
+        self.assertTrue(journal_path.exists())
+
+    def test_drop_metadata_is_bound_to_crash_recovery(self):
+        from unittest import mock
+        base = {"a/prd.md": b"a", "b/prd.md": b"b"}
+        cycle = self.trees(base, {**base, "b/prd.md": b"B"}, {"b/prd.md": b"b"})
+        initial = self._admit(cycle, 0)
+        self._admit(cycle, 1, base_revision=initial["shared_reference_revision_id"])
+        with mock.patch.object(P, "_commit_shared", side_effect=RuntimeError("crash")):
+            with self.assertRaises(RuntimeError):
+                self._admit(cycle, 2, base_revision=initial["shared_reference_revision_id"],
+                            drop_components=["a"], drop_reason="retired")
+        journal_path = next(P.shared_journal_path(self.root, "probe").parent.glob("*.json"))
+        journal = json.loads(journal_path.read_text())
+        record_path = self.root / journal["target"] / P.REVISION_RECORD_NAME
+        original = record_path.read_bytes(); record = json.loads(original)
+        record.pop("dropped_components"); record_path.write_text(json.dumps(record))
+        self.assertTrue(P._recover_locked(self.root)["unresolved"])
+        record_path.write_bytes(original)
+        self.assertEqual(P._recover_locked(self.root)["unresolved"], [])
+
+    def test_malformed_and_unsafe_journals_are_preserved_without_deletion(self):
+        cycle, initial, winner = self.fixture()
+        directory = P.shared_journal_path(self.root, "probe").parent
+        directory.mkdir(parents=True, exist_ok=True)
+        bad = directory / ("rrev_" + "e" * 32 + ".json")
+        sentinel = self.root / "keep.txt"; sentinel.write_text("keep")
+        for payload in (b"not json", P._json_bytes({"kind": "spec", "revision_id": bad.stem,
+                "reference_id": initial["shared_reference_id"], "state": "staging", "staging": "",
+                "target": "", "expected_previous_revision_id": winner["shared_reference_revision_id"]})):
+            bad.write_bytes(payload)
+            result = P._recover_locked(self.root)
+            self.assertTrue(result["unresolved"])
+            self.assertEqual(bad.read_bytes(), payload)
+            self.assertEqual(sentinel.read_text(), "keep")
+
+    def test_stripped_merge_proof_cannot_be_recovered_as_exact_copy(self):
+        from unittest import mock
+        cycle, initial, winner = self.fixture()
+        with mock.patch.object(P, "_commit_shared", side_effect=RuntimeError("crash")):
+            with self.assertRaises(RuntimeError):
+                self._admit(cycle, 2, base_revision=initial["shared_reference_revision_id"])
+        journal_path = next(P.shared_journal_path(self.root, "probe").parent.glob("*.json"))
+        journal = json.loads(journal_path.read_text())
+        record_path = self.root / journal["target"] / P.REVISION_RECORD_NAME
+        record = json.loads(record_path.read_text()); record.pop("spec_merge")
+        record_path.write_text(json.dumps(record)); journal.pop("spec_merge")
+        journal_path.write_text(json.dumps(journal))
+        self.assertEqual(P._recover_locked(self.root)["unresolved"][0]["code"], "shared-merge-proof-invalid")
+
+    def test_parallel_publishers_preserve_both_deltas(self):
+        import multiprocessing
+        ctx = multiprocessing.get_context("fork")
+        base = {"a/prd.md": b"a", "b/prd.md": b"b"}
+        cycle = self.trees(base, {**base, "a/prd.md": b"A"}, {**base, "b/prd.md": b"B"})
+        initial = self._admit(cycle, 0)
+        queue = ctx.Queue()
+        def publish(n):
+            try:
+                row = self._admit(cycle, n, base_revision=initial["shared_reference_revision_id"])
+                queue.put(("ok", row["shared_reference_revision_id"]))
+            except Exception as exc:
+                queue.put(("error", str(exc)))
+        children = [ctx.Process(target=publish, args=(n,)) for n in (1, 2)]
+        try:
+            for child in children: child.start()
+            for child in children:
+                child.join(20)
+                self.assertFalse(child.is_alive(), "publisher failed bounded join")
+                self.assertEqual(child.exitcode, 0)
+            rows = [queue.get(timeout=3) for _ in children]
+            self.assertTrue(all(r[0] == "ok" for r in rows), rows)
+            ref = self._reference(initial["shared_reference_id"])
+            tree, _ = P._verified_shared_spec(self.root, initial["shared_reference_id"], ref["latest_revision_id"])
+            self.assertEqual(tree, {"a/prd.md": b"A", "b/prd.md": b"B"})
+            self.assertEqual(len(ref["revisions"]), 3)
+        finally:
+            for child in children:
+                if child.is_alive(): child.terminate()
+                child.join(3)
+            queue.close()
+            queue.join_thread()
 
 
 if __name__ == "__main__":
