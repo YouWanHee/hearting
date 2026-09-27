@@ -63,6 +63,12 @@ class SupervisorTerminal:
     # upgrades a missing result to a typed capacity/auth verdict -- the path
     # to the evidence a human or later reader would need to check the read.
     capacity_log: str = ""
+    # Set only by classify_terminal_commit_error: an escaped TerminalCommitError's
+    # own detail, plus enough of the durable transaction's location that a
+    # human or later reader has a next action instead of a bare type name.
+    detail: str = ""
+    terminal_slot: str = ""
+    route_file: str = ""
 
     def evidence(self) -> dict[str, str]:
         values = {
@@ -77,6 +83,12 @@ class SupervisorTerminal:
             values["api_status"] = self.api_status
         if self.capacity_log:
             values["capacity_log"] = self.capacity_log
+        if self.detail:
+            values["detail"] = self.detail
+        if self.terminal_slot:
+            values["terminal_slot"] = self.terminal_slot
+        if self.route_file:
+            values["route_file"] = self.route_file
         return values
 
 
@@ -324,6 +336,57 @@ def missing_result_terminal(metadata: dict[str, Any]) -> SupervisorTerminal:
         _MISSING_RESULT_RECONCILE_REASON,
         "0",
     )
+
+
+def classify_terminal_commit_error(
+    code: str,
+    detail: str,
+    *,
+    terminal_slot: str = "",
+    route_file: str = "",
+) -> SupervisorTerminal:
+    """Classify an escaped `dispatch_terminal_commit.TerminalCommitError`.
+
+    Both session supervisors' top-level `except Exception` used to collapse
+    this into the generic `supervisor-internal-TerminalCommitError` note,
+    discarding `code`/`detail` -- the defect that let an owner die with
+    every route node already PASS and no diagnosable reason on the row.
+    `code` is one of `dispatch_terminal_commit.TERMINAL_REASONS`' nine
+    closed values; importing that module here to assert membership would
+    reintroduce the eager import this classifier exists to avoid, so the
+    caller (which already did an `isinstance` check against the real class
+    to get here) is trusted to pass its own `exc.code`/`exc.detail`.
+    """
+    return SupervisorTerminal(
+        "dead-terminal-commit",
+        "runtime",
+        "dispatch.supervisor.error",
+        code,
+        "70",
+        detail=detail[:240],
+        terminal_slot=terminal_slot,
+        route_file=route_file,
+    )
+
+
+def terminal_commit_error_event(
+    code: str,
+    detail: str,
+    *,
+    terminal_slot: str = "",
+    route_file: str = "",
+) -> dict[str, str]:
+    """The shared `dispatch.supervisor.error` payload for the case above.
+
+    One builder for both harness supervisors (LOOP SS3: no per-harness
+    copy-paste of the field set a later reader has to reconcile).
+    """
+    event = {"type": "dispatch.supervisor.error", "reason": code, "detail": detail[:240]}
+    if terminal_slot:
+        event["terminal_slot"] = terminal_slot
+    if route_file:
+        event["route_file"] = route_file
+    return event
 
 
 def classify_supervisor_error(

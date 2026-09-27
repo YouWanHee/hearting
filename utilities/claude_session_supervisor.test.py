@@ -2073,6 +2073,106 @@ class TerminalHandoffCleanupTurnBoundaryTest(unittest.TestCase):
             self.assertEqual(1, len(ordinary_at_ordinal_2))
 
 
+class TerminalHandoffProducerBindingSelfHealTest(unittest.TestCase):
+    """R1 (2026-09-27 owner decision, evidence E1-E8): a runtime-v1
+    launcher's `prepare_route_artifact_env(start=True)` opens the route's
+    cycle before the owner attempt row exists, so the owner's own
+    `producer.begin()` never runs its "publish immediately after begin" step.
+    Before the fix, `prepare_cleanup_handoff`'s own direct
+    `terminal.load_producer_binding` call raised
+    `TerminalCommitError("producer-binding-required")` uncaught here -- the
+    exact incident: every route node PASS, the owner still dead with
+    `supervisor-internal-TerminalCommitError` and no diagnosable reason on
+    the row, and the route/cycle never closing. After the fix,
+    `ensure_producer_binding` self-heals from the route's own already-open
+    cycle instead."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.route_file = self.root / "route.json"
+        self.jobs = self.root / "jobs.log"
+        import route_identity
+        self.route = {
+            "route_id": "placeholder", "route_hash": "placeholder",
+            "nodes": [{"id": "execute", "terminal": True}],
+            "workflow_contract": {"terminal_nodes": ["execute"]},
+            "artifact_root": str(self.root),
+        }
+        route_hash = route_identity.route_hash(self.route)
+        self.route["route_hash"] = route_hash
+        self.route["route_id"] = route_identity.route_id_from_hash(route_hash)
+        self.route_file.write_text(json.dumps(self.route), encoding="utf-8")
+        owner = "att-launcher-owner"
+        self.jobs.write_text(
+            f"2026-09-27T00:00:00Z\topen\t{self.root}\t{self.root}\towner\t"
+            f"attempt_id={owner},worker_type=owner,dispatch_depth=1,registered_worker=1,harness=claude,"
+            f"owner_route_id={self.route['route_id']},owner_route_hash={self.route['route_hash']},"
+            f"owner_route_file={self.route_file}\n",
+            encoding="utf-8",
+        )
+        self.args = SimpleNamespace(
+            route_file=str(self.route_file), route_id=self.route["route_id"],
+            route_hash=self.route["route_hash"], parent_attempt_id=owner,
+            jobs=str(self.jobs), turn_timeout=600, continuation_warning_threshold=3,
+        )
+        self.ledger = SimpleNamespace(gross_remaining=0, stall_remaining=0, reserved_remaining=1)
+        row = join.ChildRow(
+            order=0, status="done", slug="execute", attempt_id="att-execute", raw="",
+            metadata={
+                "attempt_id": "att-execute", "parent_attempt_id": owner,
+                "route_id": self.route["route_id"], "route_node": "execute",
+                "attempt_schema_version": "2", "dispatch_depth": "2", "registered_worker": "1",
+                "transport": "headless", "execution_surface": "registered-headless",
+                "fallback_hop": "same-harness-headless", "harness": "codex",
+                "note": "completed-marker", "failure_class": "pass",
+                "launch_outcome": "reaped-before-publish",
+            },
+        )
+        self.rows = [row]
+        self.claim = supervisor.budget_record.claim_terminal_handoff(
+            self.root, owner_attempt_id=owner, route_hash=self.route["route_hash"],
+            child_attempt_ids=["att-execute"])
+        self.cycle_id = "cyc_" + "9" * 32
+        cycle_dir = self.root / ".runtime/artifact-producer/v1/cycles"
+        cycle_dir.mkdir(parents=True, exist_ok=True)
+        (cycle_dir / f"{self.cycle_id}.json").write_text(json.dumps({
+            "route_id": self.route["route_id"], "route_hash": self.route["route_hash"],
+            "cycle_id": self.cycle_id, "state": "open",
+            "campaign_id": "camp_" + "9" * 32, "producer_id": "prod_" + "9" * 32,
+        }), encoding="utf-8")
+        import dispatch_terminal_commit as terminal
+        self.terminal = terminal
+        self.identity_patch = mock.patch.object(
+            terminal.artifact_lifecycle, "read_root_identity",
+            return_value=SimpleNamespace(repository_id="repo_x", artifact_root_id="root_y"),
+        )
+        self.identity_patch.start()
+        self.addCleanup(self.identity_patch.stop)
+        self.lifecycle_patch = mock.patch.object(terminal, "producer_lifecycle_applies", return_value=True)
+        self.lifecycle_patch.start()
+        self.addCleanup(self.lifecycle_patch.stop)
+        import owner_route_binding
+        owner_binding = owner_route_binding.OwnerRouteBinding(
+            str(self.route_file), self.route["route_id"], self.route["route_hash"])
+        self.validate_patch = mock.patch.object(terminal, "validate_owner_route", return_value=owner_binding)
+        self.validate_patch.start()
+        self.addCleanup(self.validate_patch.stop)
+
+    def test_missing_binding_is_self_healed_not_raised(self):
+        binding_path = self.terminal.producer_binding_path(
+            self.root, self.route["route_id"], self.args.parent_attempt_id)
+        self.assertFalse(binding_path.exists())
+        prompt, intent = supervisor.prepare_cleanup_handoff(self.args, self.ledger, self.claim, self.rows)
+        self.assertIsInstance(prompt, str)
+        self.assertTrue(binding_path.exists())
+        published = json.loads(binding_path.read_text())
+        self.assertEqual(published["cycle_id"], self.cycle_id)
+        self.assertEqual(published["owner_attempt_id"], self.args.parent_attempt_id)
+        self.assertEqual(intent["cleanup_scope"]["cycle_id"], self.cycle_id)
+
+
 def supervisor_budget_module():
     sys.path.insert(0, str(ROOT / "utilities"))
     import dispatch_continuation_budget as BUDGET

@@ -184,6 +184,26 @@ def terminal_slot(artifact_root: Path, route_id: str, owner_attempt_id: str) -> 
     return Path(artifact_root).resolve() / ".runtime" / "terminal-commits" / "v1" / _component(route_id, "route") / _component(owner_attempt_id, "owner")
 
 
+def terminal_commit_error_evidence(exc: "TerminalCommitError", *, route_file: Path,
+                                   route_id: str, owner_attempt_id: str) -> dict[str, str]:
+    """Best-effort next-action fields for a `TerminalCommitError` a session
+    supervisor's top-level handler is about to report (D2).
+
+    Never raises: a handler that is already reporting one failure must not
+    be able to fail a second time while trying to explain the first. The
+    terminal slot path is the one place that failure's own attempt records
+    (`_record_attempt`) already live, so it is exactly the "next action"
+    evidence a human or later reader needs -- read-only, no mutation here.
+    """
+    evidence = {"code": exc.code, "detail": (exc.detail or "")[:240], "route_file": str(route_file)}
+    try:
+        route = json.loads(Path(route_file).read_text(encoding="utf-8"))
+        evidence["terminal_slot"] = str(terminal_slot(Path(route["artifact_root"]), route_id, owner_attempt_id))
+    except (OSError, UnicodeError, ValueError, KeyError, TypeError):
+        pass
+    return evidence
+
+
 def _atomic_json(path: Path, value: Mapping[str, Any], *, exclusive: bool = False) -> None:
     data = _canonical(dict(value)) + b"\n"
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -535,6 +555,65 @@ def publish_producer_binding(*, artifact_root: Path, jobs: Path, route_file: Pat
         raise TerminalCommitError("transaction-conflict", str(path))
 
 
+def ensure_producer_binding(request: TerminalCommitRequest,
+                            route: Mapping[str, Any]) -> Optional[ProducerBindingResult]:
+    """The one producer-binding writer every settlement entry point shares (D1).
+
+    `load_producer_binding` is tried first; a successful load (or any code
+    other than the file simply being absent) returns/propagates exactly as
+    before. Only `producer-binding-required` falls through to a bounded
+    publish against the route's own already-open cycle -- selected through
+    the identical single reader `prepare_route_artifact_env(start=False)`
+    uses (`artifact_producer.select_route_open_cycle`), never a "latest
+    directory" guess. No cycle is ever created here: an absent or ambiguous
+    open cycle is a typed refusal, matching `publish_producer_binding`'s own
+    exclusive-create/replay contract for the actual write.
+
+    Before runtime-v1 moved cycle preparation into the launcher, an owner's
+    own `producer.begin()` call published this binding immediately after its
+    attempt row existed. That "begin-then-publish" moment no longer runs for
+    a launcher-prepared cycle, so every settlement path that reads this
+    binding also had to become a path that can (idempotently) write it.
+    """
+    if not producer_lifecycle_applies(route):
+        return None
+    root = Path(request.artifact_root).resolve()
+    route_id, route_hash = route.get("route_id"), route.get("route_hash")
+    try:
+        return load_producer_binding(artifact_root=root, route_id=route_id,
+                                     owner_attempt_id=request.owner_attempt_id)
+    except TerminalCommitError as exc:
+        if exc.code != "producer-binding-required":
+            raise
+    import artifact_admission
+    import artifact_producer
+    # Rank 3 of the canonical table (PRD SS13.53.4(3)): acquired and fully
+    # released here, before any caller of this function takes the jobs lock
+    # (rank 2) -- never nested inside it. `_acquire_lock`/`_release_lock`
+    # register with `dispatch_lock_order` themselves.
+    lock_fd = artifact_admission._acquire_lock(root, artifact_admission.LOCK_TIMEOUT_DEFAULT)
+    try:
+        # A concurrent publisher may have landed the binding between the
+        # unlocked read above and this admission lock.
+        try:
+            return load_producer_binding(artifact_root=root, route_id=route_id,
+                                         owner_attempt_id=request.owner_attempt_id)
+        except TerminalCommitError as exc:
+            if exc.code != "producer-binding-required":
+                raise
+        try:
+            record = artifact_producer.select_route_open_cycle(root, route)
+        except artifact_producer.ProducerError as exc:
+            raise TerminalCommitError("producer-binding-mismatch", str(exc)) from exc
+        if record is None:
+            raise TerminalCommitError("producer-binding-required", "route-cycle-absent")
+        return publish_producer_binding(artifact_root=root, jobs=request.jobs, route_file=request.route_file,
+                                        owner_attempt_id=request.owner_attempt_id, cycle_id=record["cycle_id"],
+                                        owner_begin=True)
+    finally:
+        artifact_admission._release_lock(root, lock_fd)
+
+
 def producer_binding_digest(binding_path: Path) -> str:
     try:
         return _digest(Path(binding_path).read_bytes())
@@ -832,6 +911,22 @@ def settle_terminal_commit(request: TerminalCommitRequest, services: Any = None)
             existing_state_value = json.loads(existing_hint.read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError):
         existing_state_value = None
+    # D1: ensure the single producer binding exists before either proof path
+    # reads it. A malformed/unreadable route is left to `prove_terminal_authority`
+    # (or the forward-recovery reverify below) -- both already classify that
+    # case as `route-identity-unverified` without this helper's involvement.
+    try:
+        route_for_binding = json.loads(Path(request.route_file).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError, TypeError):
+        route_for_binding = None
+    if (isinstance(route_for_binding, dict) and route_for_binding.get("route_id")
+            and route_for_binding.get("route_hash")):
+        try:
+            ensure_producer_binding(request, route_for_binding)
+        except TerminalCommitError as exc:
+            _record_attempt(request, exc.code, exc.detail)
+            result_kind = "recoverable" if exc.code == "transaction-conflict" else "ineligible"
+            return TerminalCommitResult(result_kind, exc.code, exc.detail)
     if existing_state_value is not None and existing_state_value.get("state") != "claimed":
         proof = _reverify_forward_recovery(request, existing_state_value)
     else:
@@ -1330,15 +1425,11 @@ def settle_owner_completion(jobs, status, metadata) -> TerminalCommitResult | No
         if process.state != "quiescent":
             return TerminalCommitResult("recoverable", "child-not-quiescent", process.reason)
         route = json.loads(request.route_file.read_text())
-        import artifact_producer as producer
         import workflow_state as workflow
-        # Reuse an existing immutable binding during forward recovery, including
-        # a cycle already sealed by the prior invocation.
-        binding_path = producer_binding_path(request.artifact_root, route["route_id"], request.owner_attempt_id)
-        if producer_lifecycle_applies(route) and not binding_path.exists():
-            producer.begin(request.artifact_root, route_file=request.route_file,
-                           capability=route["capability"], intensity=route["effective_intensity"],
-                           require_cycle=True, jobs=request.jobs, owner_attempt_id=request.owner_attempt_id)
+        # D1: the single shared writer. Reuses an existing immutable binding
+        # during forward recovery, including a cycle already sealed by the
+        # prior invocation; never allocates a new cycle.
+        ensure_producer_binding(request, route)
         ledger = workflow.WorkflowLedger(route["route_id"], route["route_hash"], jobs=request.jobs)
         gates = _route_module().terminal_gate_observation(route, jobs=request.jobs, exact_terminal=True)
         missing = {node: proof.get("reason", "unproven") for node, proof in gates.items() if not proof.get("passed")}

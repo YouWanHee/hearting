@@ -371,5 +371,48 @@ class RuntimeFailureClassifierTest(unittest.TestCase):
             self.assertEqual(fallback.capacity_log, "")
 
 
+class TerminalCommitErrorClassificationTest(unittest.TestCase):
+    """D2 (2026-09-27 owner decision): an escaped `TerminalCommitError` used
+    to collapse into the generic `supervisor-internal-TerminalCommitError`
+    note in both session supervisors' top-level `except Exception`,
+    discarding `code`/`detail` -- the defect that let an owner die with
+    every route node already PASS and no diagnosable reason on the row.
+    `classify_terminal_commit_error`/`terminal_commit_error_event` are the
+    one shared classifier and event builder both supervisors now call."""
+
+    def test_registry_reason_is_the_closed_code_not_a_free_text_type_name(self):
+        terminal = SUPERVISOR.classify_terminal_commit_error(
+            "producer-binding-required", "some/path/producer-binding.json",
+            terminal_slot="/root/.runtime/terminal-commits/v1/rt-x/att-y",
+            route_file="/root/route.json",
+        )
+        self.assertEqual(terminal.note, "dead-terminal-commit")
+        self.assertEqual(terminal.reconcile_reason, "producer-binding-required")
+        evidence = terminal.evidence()
+        self.assertEqual(evidence["reconcile_reason"], "producer-binding-required")
+        self.assertEqual(evidence["detail"], "some/path/producer-binding.json")
+        self.assertEqual(evidence["terminal_slot"], "/root/.runtime/terminal-commits/v1/rt-x/att-y")
+        self.assertEqual(evidence["route_file"], "/root/route.json")
+
+    def test_detail_is_length_bounded_and_carries_no_optional_fields_when_absent(self):
+        terminal = SUPERVISOR.classify_terminal_commit_error("transaction-conflict", "x" * 5000)
+        self.assertEqual(len(terminal.evidence()["detail"]), 240)
+        self.assertNotIn("terminal_slot", terminal.evidence())
+        self.assertNotIn("route_file", terminal.evidence())
+
+    def test_event_payload_matches_between_both_supervisor_call_sites(self):
+        event = SUPERVISOR.terminal_commit_error_event(
+            "producer-binding-mismatch", "root-identity",
+            terminal_slot="/root/.runtime/terminal-commits/v1/rt-x/att-y", route_file="/root/route.json",
+        )
+        self.assertEqual(event, {
+            "type": "dispatch.supervisor.error", "reason": "producer-binding-mismatch",
+            "detail": "root-identity", "terminal_slot": "/root/.runtime/terminal-commits/v1/rt-x/att-y",
+            "route_file": "/root/route.json",
+        })
+        bare = SUPERVISOR.terminal_commit_error_event("recovery-unavailable", "")
+        self.assertEqual(bare, {"type": "dispatch.supervisor.error", "reason": "recovery-unavailable", "detail": ""})
+
+
 if __name__ == "__main__":
     unittest.main()

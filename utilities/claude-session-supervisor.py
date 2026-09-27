@@ -65,7 +65,9 @@ from dispatch_supervisor_terminal import (
     classify_session_result,
     classify_supervisor_abandonment_terminal,
     classify_supervisor_error,
+    classify_terminal_commit_error,
     reconcile_supervisor_terminal,
+    terminal_commit_error_event,
 )
 
 
@@ -194,8 +196,13 @@ def prepare_cleanup_handoff(args, ledger, claim, rows):
     report = slot / "cleanup" / "partial-report.md"
     cycle_id = None
     if terminal.producer_lifecycle_applies(route):
-        binding = terminal.load_producer_binding(artifact_root=root, route_id=args.route_id,
-                                                 owner_attempt_id=args.parent_attempt_id)
+        # D1: the single shared writer -- a launcher-prepared cycle never got
+        # an owner-side `begin()` publish, so this is a write path, not a
+        # plain read, whenever the binding is still absent.
+        request = terminal.TerminalCommitRequest(
+            route_file=Path(args.route_file), owner_attempt_id=args.parent_attempt_id,
+            jobs=Path(args.jobs), artifact_root=root)
+        binding = terminal.ensure_producer_binding(request, route)
         cycle_id = binding.binding["cycle_id"]
     commit = {}
     if (slot / "terminal-commit.json").is_file():
@@ -1938,6 +1945,27 @@ def main(argv: list[str] | None = None) -> int:
             stream_session.close()
             stream_session = None
         lease_exit = (type(exc), exc, exc.__traceback__)
+        # Lazy: importing dispatch_terminal_commit only on an already-abnormal
+        # exit does not touch the module-load-order gate an enabled terminal-
+        # commit path depends on (A49-13b) -- that gate concerns the normal
+        # success-path branch, not this handler.
+        from dispatch_terminal_commit import TerminalCommitError, terminal_commit_error_evidence
+        if isinstance(exc, TerminalCommitError):
+            evidence = terminal_commit_error_evidence(
+                exc, route_file=Path(args.route_file), route_id=args.route_id,
+                owner_attempt_id=args.parent_attempt_id,
+            )
+            terminal = classify_terminal_commit_error(
+                evidence["code"], evidence["detail"],
+                terminal_slot=evidence.get("terminal_slot", ""), route_file=evidence["route_file"],
+            )
+            if not reconcile(args, terminal):
+                return 70
+            emit(terminal_commit_error_event(
+                evidence["code"], evidence["detail"],
+                terminal_slot=evidence.get("terminal_slot", ""), route_file=evidence["route_file"],
+            ))
+            return 70
         terminal = classify_supervisor_error(
             args.runtime_harness, f"supervisor-internal-{type(exc).__name__}"
         )

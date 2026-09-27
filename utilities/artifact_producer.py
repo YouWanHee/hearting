@@ -961,6 +961,26 @@ def _env_for(root: Path, record: Mapping[str, Any]) -> Dict[str, str]:
     }
 
 
+def select_route_open_cycle(root: Path, route: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return the route's own open cycle record, or ``None`` if it has none.
+
+    At most one open cycle may exist per ``route_id``; a second one, or an
+    open cycle whose ``route_hash`` no longer matches this route, is a bound
+    selection ambiguity -- never a "pick the newest/freshest directory"
+    guess (PRD SS13.36.2(1)-5). This is the one reader every caller that
+    needs "the route's open cycle" shares (LOOP SS5): `prepare_route_artifact_env`
+    and the terminal-commit binding writer (`dispatch_terminal_commit.
+    ensure_producer_binding`) must never each grow their own copy.
+    """
+    records = [record for record in list_cycle_records(root)
+               if record.get("route_id") == route.get("route_id") and record.get("state") == "open"]
+    if not records:
+        return None
+    if len(records) != 1 or records[0].get("route_hash") != route.get("route_hash"):
+        raise ProducerError("route-cycle-binding-ambiguous", str(route.get("route_id", "")))
+    return records[0]
+
+
 def prepare_route_artifact_env(route_file: Path, *, start: bool, jobs: Path) -> Dict[str, str]:
     """Resolve the route's own output context; callers need not copy begin's env.
 
@@ -975,15 +995,12 @@ def prepare_route_artifact_env(route_file: Path, *, start: bool, jobs: Path) -> 
     if start:
         return begin(root, route_file=route_file, capability=route["capability"],
                      intensity=route["effective_intensity"], require_cycle=True, jobs=jobs)["env"]
-    records = [record for record in list_cycle_records(root)
-               if record.get("route_id") == route["route_id"] and record.get("state") == "open"]
-    if not records:
+    record = select_route_open_cycle(root, route)
+    if record is None:
         return {"AGENT_ARTIFACT_ROOT": str(root), **{name: "" for name in (
             "AGENT_ARTIFACT_CAMPAIGN_ID", "AGENT_ARTIFACT_CYCLE_ID", "AGENT_ARTIFACT_PRODUCER_ID",
             "AGENT_ARTIFACT_CYCLE_DIR", "AGENT_ARTIFACT_OUTPUT_DIR")}}
-    if len(records) != 1 or records[0].get("route_hash") != route["route_hash"]:
-        raise ProducerError("route-cycle-binding-ambiguous", route["route_id"])
-    return _env_for(root, records[0])
+    return _env_for(root, record)
 
 
 def _route_naming(
