@@ -210,7 +210,7 @@ class IdempotentRepublishAcrossSpellingTest(unittest.TestCase):
         self.evidence.write_text("evidence\n", encoding="utf-8")
         self.route = {
             "artifact_root": str(self.base / ".agent_reports"),
-            "route_id": "rt-p1",
+            "route_id": "rt-0000000000000001",
             "route_hash": "h" * 8,
             "registry_digest": "d" * 8,
         }
@@ -237,7 +237,7 @@ class IdempotentRepublishAcrossSpellingTest(unittest.TestCase):
         os.environ["HOME"] = str(self.stable_home)
         self.stable_completion = (
             self.stable_home / ".local" / "state" / "hearting" / "dispatch"
-            / "completion" / "rt-p1"
+            / "completion" / "rt-0000000000000001"
         )
 
     def tearDown(self):
@@ -298,7 +298,7 @@ class FleetGateMarkSpellingFlipTest(unittest.TestCase):
         self.evidence.write_text("evidence\n", encoding="utf-8")
         self.route = {
             "artifact_root": str(self.base / ".agent_reports"),
-            "route_id": "rt-gm1",
+            "route_id": "rt-0000000000000002",
             "route_hash": "h" * 8,
             "registry_digest": "d" * 8,
             "schema_version": 2,
@@ -343,7 +343,7 @@ class FleetGateMarkSpellingFlipTest(unittest.TestCase):
         )
         sidecar = (
             self.stable_home / ".local" / "state" / "hearting" / "dispatch"
-            / "completion" / "rt-gm1" / "plan.att-gm1.attempt.json"
+            / "completion" / "rt-0000000000000002" / "plan.att-gm1.attempt.json"
         )
         self.assertTrue(sidecar.is_file())
         recorded = json.loads(sidecar.read_text())
@@ -479,7 +479,7 @@ class IdempotentRepublishAcrossRotationSuccessionTest(unittest.TestCase):
         self.evidence.write_text("evidence\n", encoding="utf-8")
         self.route = {
             "artifact_root": str(self.base / ".agent_reports"),
-            "route_id": "rt-succ",
+            "route_id": "rt-0000000000000003",
             "route_hash": "h" * 8,
             "registry_digest": "d" * 8,
         }
@@ -513,7 +513,7 @@ class IdempotentRepublishAcrossRotationSuccessionTest(unittest.TestCase):
         # 1. chain-(3) session publishes while `current` -> release A.
         self._publish(self.release_a)
         sidecar = (
-            self.release_a / ".dispatch" / "completion" / "rt-succ"
+            self.release_a / ".dispatch" / "completion" / "rt-0000000000000003"
             / "plan.att-succ.attempt.json"
         )
         self.assertTrue(sidecar.is_file())
@@ -528,7 +528,7 @@ class IdempotentRepublishAcrossRotationSuccessionTest(unittest.TestCase):
         self.assertTrue(DISTRIBUTION._succeed_dispatch_state(self.release_a))
 
         migrated_sidecar = (
-            self.release_b / ".dispatch" / "completion" / "rt-succ"
+            self.release_b / ".dispatch" / "completion" / "rt-0000000000000003"
             / "plan.att-succ.attempt.json"
         )
         self.assertTrue(migrated_sidecar.is_file())
@@ -666,7 +666,7 @@ class PrefixCollisionRotationSuccessionTest(unittest.TestCase):
         self.evidence.write_text("evidence\n", encoding="utf-8")
         self.route = {
             "artifact_root": str(self.base / ".agent_reports"),
-            "route_id": "rt-pfx",
+            "route_id": "rt-0000000000000004",
             "route_hash": "h" * 8,
             "registry_digest": "d" * 8,
         }
@@ -695,7 +695,7 @@ class PrefixCollisionRotationSuccessionTest(unittest.TestCase):
         )
 
     def test_live_sidecar_survives_rotation_succession_with_prefix_collision(self):
-        # 1. chain-(3) session publishes route rt-pfx's "plan" node while
+        # 1. chain-(3) session publishes route rt-0000000000000004's "plan" node while
         # `current` -> v0.9 (about to be pruned).
         self._publish(self.release_a, "plan")
 
@@ -705,12 +705,12 @@ class PrefixCollisionRotationSuccessionTest(unittest.TestCase):
         current.parent.mkdir(parents=True, exist_ok=True)
         current.symlink_to(self.release_b)
 
-        # 3. the live release publishes rt-pfx's "execute" node under its own
+        # 3. the live release publishes rt-0000000000000004's "execute" node under its own
         # power -- this sidecar was never copied from v0.9 and must not be
         # touched by v0.9's carry-forward.
         self._publish(self.release_b, "execute")
         live_sidecar = (
-            self.release_b / ".dispatch" / "completion" / "rt-pfx"
+            self.release_b / ".dispatch" / "completion" / "rt-0000000000000004"
             / "execute.att-execute.attempt.json"
         )
         self.assertTrue(live_sidecar.is_file())
@@ -732,7 +732,7 @@ class PrefixCollisionRotationSuccessionTest(unittest.TestCase):
         # The carried-forward "plan" sidecar must still be re-anchored to
         # its new (real) location.
         migrated_sidecar = (
-            self.release_b / ".dispatch" / "completion" / "rt-pfx"
+            self.release_b / ".dispatch" / "completion" / "rt-0000000000000004"
             / "plan.att-plan.attempt.json"
         )
         self.assertTrue(migrated_sidecar.is_file())
@@ -744,7 +744,7 @@ class PrefixCollisionRotationSuccessionTest(unittest.TestCase):
         # marker must actually live under release_b, not merely mention it.
         self.assertEqual(
             Path(migrated["completion_marker"]).relative_to(self.release_b),
-            Path(".dispatch/completion/rt-pfx/plan.json"),
+            Path(".dispatch/completion/rt-0000000000000004/plan.json"),
         )
 
 
@@ -793,7 +793,7 @@ class SymlinkedDataRootRotationSuccessionTest(unittest.TestCase):
         self.evidence.write_text("evidence\n", encoding="utf-8")
         self.route = {
             "artifact_root": str(self.base / ".agent_reports"),
-            "route_id": "rt-symroot",
+            "route_id": "rt-0000000000000005",
             "route_hash": "h" * 8,
             "registry_digest": "d" * 8,
         }
@@ -824,7 +824,7 @@ class SymlinkedDataRootRotationSuccessionTest(unittest.TestCase):
     def test_republish_after_succession_through_symlinked_data_root(self):
         self._publish(self.release_a)
         sidecar = (
-            self.release_a / ".dispatch" / "completion" / "rt-symroot"
+            self.release_a / ".dispatch" / "completion" / "rt-0000000000000005"
             / "plan.att-symroot.attempt.json"
         )
         self.assertTrue(sidecar.is_file())
@@ -835,7 +835,7 @@ class SymlinkedDataRootRotationSuccessionTest(unittest.TestCase):
         self.assertTrue(DISTRIBUTION._succeed_dispatch_state(self.release_a))
 
         migrated_sidecar = (
-            self.release_b / ".dispatch" / "completion" / "rt-symroot"
+            self.release_b / ".dispatch" / "completion" / "rt-0000000000000005"
             / "plan.att-symroot.attempt.json"
         )
         self.assertTrue(migrated_sidecar.is_file())
@@ -849,7 +849,7 @@ class SymlinkedDataRootRotationSuccessionTest(unittest.TestCase):
         self.assertEqual(
             resolved_marker,
             (self.release_b.resolve(strict=False) / ".dispatch" / "completion"
-             / "rt-symroot" / "plan.json"),
+             / "rt-0000000000000005" / "plan.json"),
         )
 
         shutil.rmtree(self.release_a)
@@ -1074,10 +1074,10 @@ class RegistryRepairStaleRowTest(unittest.TestCase):
         return code, buffer.getvalue()
 
     def test_positive_marker_backed_repair(self):
-        self._publish("rt-a", "frame", "att-good")
+        self._publish("rt-0000000000000006", "frame", "att-good")
         row = self._row(
             "open", "att-good",
-            ",route_id=rt-a,route_node=frame,dispatch_depth=2,transport=headless,"
+            ",route_id=rt-0000000000000006,route_node=frame,dispatch_depth=2,transport=headless,"
             "execution_surface=registered-headless,fallback_hop=same-harness-headless,"
             "route_hash=hhhhhhhh,registry_digest=dddddddd,completion_gate=artifact",
         )
@@ -1102,7 +1102,7 @@ class RegistryRepairStaleRowTest(unittest.TestCase):
     def test_negative_marker_missing(self):
         row = self._row(
             "open", "att-nomarker",
-            ",route_id=rt-b,route_node=frame,dispatch_depth=2,transport=headless,"
+            ",route_id=rt-0000000000000007,route_node=frame,dispatch_depth=2,transport=headless,"
             "execution_surface=registered-headless,fallback_hop=same-harness-headless",
         )
         self.jobs.write_text(row + "\n", encoding="utf-8")
@@ -1114,10 +1114,10 @@ class RegistryRepairStaleRowTest(unittest.TestCase):
         self.assertFalse((self.jobs.parent / "repair" / "registry-repair.jsonl").exists())
 
     def test_negative_axis_skew(self):
-        self._publish("rt-c", "frame", "att-skew", dispatch_depth=2)
+        self._publish("rt-0000000000000008", "frame", "att-skew", dispatch_depth=2)
         row = self._row(
             "open", "att-skew",
-            ",route_id=rt-c,route_node=frame,dispatch_depth=1,transport=headless,"
+            ",route_id=rt-0000000000000008,route_node=frame,dispatch_depth=1,transport=headless,"
             "execution_surface=registered-headless,fallback_hop=same-harness-headless,"
             "route_hash=hhhhhhhh,registry_digest=dddddddd,completion_gate=artifact",
         )
@@ -1155,10 +1155,10 @@ class RegistryRepairStaleRowTest(unittest.TestCase):
         self.assertEqual(self.jobs.read_text(encoding="utf-8"), before)
 
     def test_repeat_apply_is_idempotent(self):
-        self._publish("rt-d", "frame", "att-idem")
+        self._publish("rt-0000000000000009", "frame", "att-idem")
         row = self._row(
             "open", "att-idem",
-            ",route_id=rt-d,route_node=frame,dispatch_depth=2,transport=headless,"
+            ",route_id=rt-0000000000000009,route_node=frame,dispatch_depth=2,transport=headless,"
             "execution_surface=registered-headless,fallback_hop=same-harness-headless,"
             "route_hash=hhhhhhhh,registry_digest=dddddddd,completion_gate=artifact",
         )
