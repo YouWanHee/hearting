@@ -673,6 +673,16 @@ def classify(row, args, newest_orders, rows=None, *, expected_binding=None):
             )
             return "terminal-handoff", f"{reason}:marker-missing", note
         return "terminal-draining", f"{reason}:marker-missing-{observed.reason}", None
+    if getattr(args, "only_exact_dead", False):
+        # Silent-exit recovery cannot replace a pending result with generic
+        # PID death. This also runs under the closure lock, so a handoff that
+        # arrives after the first observation retains its settlement path.
+        attempt_view = inspect_terminal_attempt(
+            meta.get("log_file"), worktree=row.get("worktree"),
+            artifact_root_metadata=meta.get("artifact_root"),
+        )
+        if attempt_view.get("state") != "absent":
+            return "terminal-pending", "terminal-handoff-settlement-required", None
     exact = classify_attempt_evidence(
         proc_inputs(row, args.agent_home, args.jobs, rows, args),
         getattr(args, "now", time.time()),

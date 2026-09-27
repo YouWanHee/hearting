@@ -195,17 +195,22 @@ class DispatchCompletionJoinTest(unittest.TestCase):
         finally:
             owner.terminate(); owner.wait(timeout=5)
 
-    def test_host_join_settles_extinct_foreign_namespace_without_silent_retry(self):
+    def extinct_foreign_namespace_metadata(self):
         if not D._current_observer_is_host_like():
             self.skipTest("requires a host procfs observer")
         metadata={"pid":"99999999","pgid":"99999999","pid_start":"1",
                   "pid_scope":"namespace-local","pid_observer_ns":"pid:[999999999]",
+                  "pid_ns":"pid:[999999999]",
                   "fallback_hop":"same-harness-headless","worker_type":"stage"}
         proof=D.prove_attempt_quiescence(
             {**metadata,"attempt_id":"att-extinct-stage","registered_worker":"1"},
             max_wait_seconds=0,allow_namespace_extinct=True)
         if not proof.proven:
             self.skipTest("host procfs cannot prove foreign namespace extinction: " + proof.reason)
+        return metadata
+
+    def test_host_join_settles_extinct_foreign_namespace_without_silent_retry(self):
+        metadata = self.extinct_foreign_namespace_metadata()
         self.jobs.write_text(row("open","att-extinct-stage","att-parent","foreign",process_metadata=metadata))
         receipt=JOIN.join_batch(jobs=self.jobs,parent_attempt_id="att-parent",
                                 timeout=10,interval=0.01,recover_receiptless=True)
@@ -214,6 +219,41 @@ class DispatchCompletionJoinTest(unittest.TestCase):
         self.assertEqual(saved.metadata["note"],"cancelled-receipt-unavailable")
         self.assertIn("cancellation_quiescence_receipt",saved.metadata)
         self.assertEqual(len(self.jobs.read_text().splitlines()),1)
+
+    def test_closed_foreign_namespace_settles_across_operational_surfaces(self):
+        metadata = {**self.extinct_foreign_namespace_metadata(), "failure_class": "contract"}
+        for surface in ("join", "reconcile", "attempt-ready"):
+            with self.subTest(surface=surface):
+                jobs = self.root / f"{surface}.jobs.log"
+                attempt = f"att-closed-{surface}"
+                jobs.write_text(row("done", attempt, "att-parent", "closed",
+                                    sentinel="dead-worker-silent-exit", process_metadata=metadata))
+                if surface == "join":
+                    receipt = JOIN.join_batch(jobs=jobs, parent_attempt_id="att-parent",
+                                              timeout=5, interval=0.01, recover_receiptless=True)
+                    self.assertEqual(receipt["state"], "ready", receipt)
+                else:
+                    command = ([sys.executable, str(HERE / "dispatch-registry.py"),
+                                "reconcile", "--attempt", attempt, "--apply"]
+                               if surface == "reconcile" else
+                               [sys.executable, str(HERE / "dispatch-attempt-ready.py"),
+                                "--attempt-id", attempt, "--settle"])
+                    result = subprocess.run(command + ["--jobs", str(jobs)],
+                                            capture_output=True, text=True, timeout=15)
+                    self.assertEqual(result.returncode, 0 if surface == "reconcile" else 3,
+                                     result.stdout + result.stderr)
+                saved = JOIN.current_attempt_row(jobs, attempt)
+                self.assertEqual(saved.status, "done")
+                self.assertEqual(saved.metadata["note"], "dead-worker-silent-exit")
+                self.assertEqual(saved.metadata["failure_class"], "contract")
+                self.assertIn("cleanup_receipt_digest", saved.metadata)
+                self.assertNotIn("cancellation_quiescence_receipt", saved.metadata)
+                result = subprocess.run(
+                    [sys.executable, str(HERE / "dispatch-attempt-ready.py"),
+                     "--attempt-id", attempt, "--jobs", str(jobs)],
+                    capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+                self.assertEqual(json.loads(result.stdout)["state"], "terminal")
 
     def test_exact_death_reply_requires_same_attempt_and_lock_revalidation(self):
         self.jobs.write_text(self.receiptless_row())

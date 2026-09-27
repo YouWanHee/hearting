@@ -869,7 +869,14 @@ class SharedReceiptlessRecoveryTest(unittest.TestCase):
         load_supervisor_module()
         import dispatch_completion_join
         self.module = dispatch_completion_join
-        self.child = argparse.Namespace(attempt_id="att-child", status="open")
+        self.child = argparse.Namespace(attempt_id="att-child", status="open",
+                                        metadata={"pid_scope": "namespace-local"})
+        # These cases exercise the cancellation receipt contract after the
+        # separate exact-death classifier has declined to close the row.
+        exact = mock.patch.object(self.module, "reconcile_exact_dead_attempt",
+                                  return_value={"closed": False})
+        exact.start()
+        self.addCleanup(exact.stop)
 
     def response(self, *, closed=0, reason="namespace-not-extinct", digest=None):
         return fake_run_result(0, json.dumps({

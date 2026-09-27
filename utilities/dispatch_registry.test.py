@@ -576,6 +576,22 @@ class RegistryTest(unittest.TestCase):
    result=self.invoke("reconcile","--only-exact-dead",*flags,"--apply")
    self.assertEqual(result.returncode,64,result.stdout+result.stderr)
 
+ def test_exact_death_mode_preserves_handoff_and_rechecks_before_close(self):
+  module=self.load_registry_module("handoff_pending")
+  for initial in ("valid", "invalid", "error", "absent"):
+   with self.subTest(initial=initial):
+    attempt="att-handoff-pending"
+    self.jobs.write_text(self.ghost_row(attempt)+"\n")
+    currentize_registry(self.jobs)
+    before=self.jobs.read_bytes()
+    observations=iter((initial,"valid"))
+    def handoff(*args,**kwargs):
+     return {"state":next(observations,"valid")}
+    with mock.patch.object(module,"carrier_terminal",return_value=(None,None)), mock.patch.object(module,"inspect_terminal_attempt",side_effect=handoff), contextlib.redirect_stdout(io.StringIO()) as out:
+     self.assertEqual(module.main([str(SCRIPT),"reconcile","--jobs",str(self.jobs),"--agent-home",str(self.base),"--attempt",attempt,"--only-exact-dead","--apply"]),0)
+    self.assertEqual(json.loads(out.getvalue())["closed"],0)
+    self.assertEqual(self.jobs.read_bytes(),before)
+
  def ghost_row(self,attempt,extra=""):
   """A namespace-local row whose PID is unreadable here, with a fresh heartbeat.
 
