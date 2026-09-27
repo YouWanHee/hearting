@@ -62,6 +62,22 @@ class ReaderTests(unittest.TestCase):
         shared = [p for p, m in reader.bucket_dirs(self.root, "spec") if m["layout"] == "shared"][0]
         self.assertEqual(shared.name, RREV_NEW)
 
+    def test_nested_manifest_remains_payload_and_does_not_change_cycle_identity(self):
+        cycle = self.root / "campaigns" / CAMP / "cycles" / CYC
+        payload = cycle / "artifacts" / "plans" / "entry" / "_internal" / "candidate" / "manifest.json"
+        payload.parent.mkdir(parents=True)
+        payload_bytes = json.dumps({
+            "cycle": {"campaign_id": CAMP, "cycle_id": "cyc_" + "f" * 32},
+        }).encode("utf-8")
+        payload.write_bytes(payload_bytes)
+        candidates = reader.bucket_dirs(self.root, "plans")
+        candidate, metadata = next((path, meta) for path, meta in candidates if meta.get("cycle_id") == CYC)
+        self.assertEqual(metadata["cycle_state"], "sealed")
+        self.assertEqual((candidate / "entry" / "_internal" / "candidate" / "manifest.json").read_bytes(),
+                         payload_bytes)
+        rows = reader.cycle_bucket_dirs(self.root, "plans")
+        self.assertEqual([meta["cycle_id"] for _path, meta in rows].count(CYC), 1)
+
     def test_glob_spans_layouts_and_skips_hidden(self):
         names = [p.name for p in reader.glob_bucket(self.root, "plans", "*plan")]
         self.assertEqual(names, ["2026-08-26_cycle-plan", "2026-01-01_legacy-plan"])

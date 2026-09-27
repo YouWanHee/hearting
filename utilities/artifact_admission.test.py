@@ -266,6 +266,23 @@ class TestNoDurableOutput(AdmissionContractBase):
 
 
 class TestIdempotencyAndDeterminism(AdmissionContractBase):
+    def test_nested_manifest_payload_is_admitted_and_preserved(self):
+        identity = self._identity()
+        data = b'{"ordinary":"admitted"}\n'
+        doc, _ = _make_valid_document(self.alloc, identity, content=data)
+        locator = "artifacts/_internal/candidate/round_1/manifest.json"
+        doc["artifact_revisions"][0]["locator"]["path"] = locator
+        source = self.scratch / "nested-manifest-source"
+        payload = source / locator
+        payload.parent.mkdir(parents=True)
+        payload.write_bytes(data)
+        outcome = self._admit(doc, source, "k-nested-manifest")
+        self.assertEqual(outcome.status, "admitted", outcome.to_payload())
+        published = self.root / outcome.cycle_path / locator
+        self.assertEqual(published.read_bytes(), data)
+        sealed = json.loads((self.root / outcome.cycle_path / "manifest.json").read_text(encoding="utf-8"))
+        self.assertTrue(m.validate(sealed).ok)
+
     def test_second_admission_with_same_key_and_digest_is_noop(self):
         doc, first = self._admit_valid(key="k-same")
         src = self._stage_source(b"hello")

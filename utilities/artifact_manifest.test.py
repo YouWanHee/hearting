@@ -361,7 +361,6 @@ class TestLocatorSafety(unittest.TestCase):
             ("artifacts/.result\n", "locator-control-char"),
             ("/artifacts/.result", "locator-absolute"),
             ("artifacts/." + "a" * 128, "locator-invalid-component"),
-            ("artifacts/.cache/manifest.json", "locator-reserved-name"),
             ("artifacts-shadow/.result", "locator-hidden-component"),
             (".runtime/result", "locator-hidden-component"),
             (".cycle.json", "locator-hidden-component"),
@@ -372,6 +371,48 @@ class TestLocatorSafety(unittest.TestCase):
 
     def test_rejects_reserved_manifest_filename_locator(self):
         self.assertIn("locator-reserved-name", _codes(m.validate_locators(self._with_path("manifest.json"))))
+
+    def test_manifest_basename_is_payload_only_beneath_artifacts(self):
+        for path in ("artifacts/manifest.json", "artifacts/_internal/candidate/manifest.json",
+                     "artifacts/.cache/manifest.json"):
+            with self.subTest(path=path):
+                self.assertTrue(m.validate(self._with_path(path)).ok)
+                self.assertTrue(m.validate_locator_path(path).ok)
+
+    def test_context_classifier_keeps_control_authority_at_exact_paths(self):
+        root = "/private/artifacts"
+        campaign = "campaigns/camp"
+        cycle = "campaigns/camp/cyc"
+        controls = (
+            (campaign + "/campaign.json", "control"),
+            (campaign + "/campaign.events/000001.json", "control"),
+            (campaign + "/campaign.satisfied.json", "control"),
+            (cycle + "/.cycle.json", "control"),
+            (cycle + "/manifest.json", "control"),
+            (".runtime/artifact-producer/v1/cycles/cyc.json", "control"),
+        )
+        for path, namespace in controls:
+            with self.subTest(path=path):
+                self.assertTrue(m.classify_artifact_path(root, campaign, cycle, namespace,
+                                                         path, "regular").allowed)
+        spoof = m.classify_artifact_path(root, campaign, cycle, "control",
+                                         cycle + "/artifacts/plans/manifest.json", "regular")
+        self.assertFalse(spoof.allowed)
+        payload = m.classify_artifact_path(root, campaign, cycle, "payload",
+                                           cycle + "/artifacts/plans/manifest.json", "regular")
+        self.assertTrue(payload.allowed)
+        self.assertFalse(m.classify_artifact_path(root, campaign, cycle, "payload",
+                                                  cycle + "/artifacts/link", "symlink").allowed)
+        self.assertFalse(m.classify_artifact_path(root, campaign, cycle, "control",
+                                                  campaign + "/campaign.events/manifest.json",
+                                                  "regular").allowed)
+        event = campaign + "/campaign.events/000007.json"
+        self.assertTrue(m.classify_artifact_path(root, campaign, None, "control", event,
+                                                 "missing", prospective=True).allowed)
+        self.assertFalse(m.classify_artifact_path(root, campaign, None, "control", event,
+                                                  "symlink", prospective=True).allowed)
+        self.assertFalse(m.classify_artifact_path(root, campaign, "campaigns/other/cyc",
+                                                  "payload", cycle + "/artifacts/file", "regular").allowed)
 
     def test_rejects_duplicate_locator_path(self):
         doc = _valid_document()

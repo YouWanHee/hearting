@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import (Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional,
@@ -41,6 +42,26 @@ _BINDING_REQUIRED = frozenset({"schema_version", "kind", "campaign_id", "cycle_i
 # whose work predates the producer (W7G resplit, W7H residue) knows only the
 # work's date, so a date-only value is allowed and means exactly that.
 _BINDING_OPTIONAL = frozenset({"started_on"})
+
+
+def _exact_cycle_manifest(root: Path, campaign: Path, cycle: Path) -> Optional[Dict[str, Any]]:
+    """Read only the exact, regular `<cycle>/manifest.json` control record."""
+    import artifact_manifest
+
+    path = Path(cycle) / "manifest.json"
+    try:
+        observed = os.lstat(path)
+        if stat.S_ISLNK(observed.st_mode) or not stat.S_ISREG(observed.st_mode):
+            return None
+        campaign_rel = Path(campaign).relative_to(root).as_posix()
+        cycle_rel = Path(cycle).relative_to(root).as_posix()
+        path_rel = path.relative_to(root).as_posix()
+    except (OSError, ValueError):
+        return None
+    result = artifact_manifest.classify_artifact_path(
+        str(root), campaign_rel, cycle_rel, "control", path_rel, "regular",
+    )
+    return _read_json(path) if result.allowed else None
 
 
 def started_on_is_valid(value: Any) -> bool:
@@ -184,13 +205,25 @@ def campaigns_dir(root: Path) -> Path:
 
 
 def iter_campaign_dirs(root: Path) -> Iterator[Path]:
+    import artifact_manifest
+
     base = campaigns_dir(root)
     if not base.is_dir() or base.is_symlink():
         return
     for entry in sorted(base.iterdir(), key=lambda p: p.name):
         if entry.name.startswith(".") or entry.is_symlink() or not entry.is_dir():
             continue
-        if (entry / "campaign.json").is_file() or _campaign_from_manifests(entry) is not None:
+        record_path = entry / "campaign.json"
+        try:
+            mode = os.lstat(record_path).st_mode
+        except OSError:
+            mode = 0
+        record_control = (stat.S_ISREG(mode) and not stat.S_ISLNK(mode)
+                          and artifact_manifest.classify_artifact_path(
+                              str(root), entry.relative_to(root).as_posix(), None,
+                              "control", record_path.relative_to(root).as_posix(), "regular",
+                          ).allowed)
+        if record_control or _campaign_from_manifests(entry) is not None:
             yield entry
 
 
@@ -231,8 +264,8 @@ def read_cycle_record(root: Path, cycle_id: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def _manifest_cycle_id(path: Path) -> Optional[str]:
-    manifest = _read_json(path / "manifest.json")
+def _manifest_cycle_id(root: Path, campaign: Path, path: Path) -> Optional[str]:
+    manifest = _exact_cycle_manifest(root, campaign, path)
     cycle = manifest.get("cycle") if manifest else None
     value = cycle.get("cycle_id") if isinstance(cycle, dict) else None
     if value is None:
@@ -290,7 +323,7 @@ def _campaign_from_manifests(path: Path) -> Optional[Dict[str, Any]]:
     campaign_rows = []
     cycle_ids = []
     for cycle_path, _layout in iter_cycle_dirs(path):
-        manifest = _read_json(cycle_path / "manifest.json")
+        manifest = _exact_cycle_manifest(path.parent.parent, path, cycle_path)
         campaign = manifest.get("campaign") if manifest else None
         cycle = manifest.get("cycle") if manifest else None
         campaign_id = campaign.get("campaign_id") if isinstance(campaign, dict) else None
@@ -377,7 +410,8 @@ def _cycle_entry_id(root: Path, campaign: Mapping[str, Any], campaign_id: str,
     binding = read_cycle_binding(cycle_path) if layout == "readable" else None
     if binding is not None and binding.get("campaign_id") != campaign_id:
         raise LocatorError("locator-cycle-binding-campaign-mismatch", cycle_path.as_posix())
-    cycle_id = _manifest_cycle_id(cycle_path)
+    campaign_path = cycle_path.parent.parent if cycle_path.parent.name == "cycles" else cycle_path.parent
+    cycle_id = _manifest_cycle_id(root, campaign_path, cycle_path)
     if cycle_id is not None and binding is not None and binding.get("cycle_id") != cycle_id:
         raise LocatorError("locator-cycle-binding-id-mismatch", cycle_path.as_posix())
     if cycle_id is None and binding is not None:
@@ -451,7 +485,7 @@ def scan_campaign(root: Path, campaign_path: Path) -> Optional[Rows]:
             cycle_path,
             title=str(record.get("title") or record.get("slug") or campaign_title),
             started=display_started_on(record) or "",
-            status=str(record.get("state") or ("sealed" if (cycle_path / "manifest.json").is_file() else "open")),
+            status=str(record.get("state") or ("sealed" if _manifest_cycle_id(root, campaign_path, cycle_path) else "open")),
         )
     # A manual rename changes only the display locator. For an open cycle
     # there is no manifest yet, so bind the sole remaining record to the
@@ -1060,7 +1094,7 @@ def _verify_candidate(root: Path, path: Path, identifier: str) -> bool:
             campaign_id = campaign.get("campaign_id")
             if _cycle_entry_id(root, campaign, campaign_id, path, "readable") != identifier:
                 return False
-            manifest = _read_json(path / "manifest.json")
+            manifest = _exact_cycle_manifest(root, campaign_path, path)
             if manifest is not None:
                 manifest_campaign = manifest.get("campaign")
                 if not isinstance(manifest_campaign, dict) or manifest_campaign.get("campaign_id") != campaign_id:
@@ -1072,7 +1106,7 @@ def _verify_candidate(root: Path, path: Path, identifier: str) -> bool:
             if campaign is None:
                 return False
             campaign_id = campaign.get("campaign_id")
-            manifest_cycle_id = _manifest_cycle_id(path)
+            manifest_cycle_id = _manifest_cycle_id(root, campaign_path, path)
             if manifest_cycle_id is not None:
                 return manifest_cycle_id == identifier
             record = read_cycle_record(root, identifier)

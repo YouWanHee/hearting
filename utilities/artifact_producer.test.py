@@ -24,6 +24,7 @@ import artifact_identity as idm  # noqa: E402
 import artifact_lifecycle as L  # noqa: E402
 import artifact_manifest as m  # noqa: E402
 import artifact_producer as P  # noqa: E402
+import artifact_reader as reader  # noqa: E402
 import dispatch_contract as D  # noqa: E402
 
 _P = Path(__file__).with_name("capability-route.py")
@@ -1024,8 +1025,18 @@ class CheckWriteTest(ProducerTestBase):
         base = Path(result["cycle_dir"])
         self.assertEqual(P.check_write(self.root, base.parent / "campaign.json")["reason"], "campaign-record-machine-managed")
         self.assertEqual(P.check_write(self.root, base / "manifest.json")["reason"], "outside-cycle-artifacts")
+        for control in (base / ".cycle.json", base.parent / "campaign.events" / "000001.json",
+                        base.parent / "campaign.satisfied.json"):
+            with self.subTest(control=control):
+                self.assertEqual(P.check_write(self.root, control)["verdict"], "deny")
         ok = P.check_write(self.root, base / "artifacts" / "plans" / "plan.md")
         self.assertEqual((ok["verdict"], ok["reason"], ok["bucket"]), ("allow", "open-cycle-artifacts", "plans"))
+        for locator in ("manifest.json", ".cache/manifest.json",
+                        "_internal/candidate/round_1/manifest.json"):
+            with self.subTest(locator=locator):
+                payload = P.check_write(self.root, base / "artifacts" / locator)
+                self.assertEqual((payload["verdict"], payload["reason"]),
+                                 ("allow", "open-cycle-artifacts"))
         unknown = P.check_write(self.root, base.parent / "2026-09-04_unknown" / "artifacts" / "x.md")
         self.assertEqual(unknown["reason"], "cycle-unknown")
         self.assertEqual(P.cycle_bucket(self.root, base / "artifacts" / "spec" / "prd.md"), ("spec", cyc))
@@ -1109,6 +1120,41 @@ class CheckWriteTest(ProducerTestBase):
 
 
 class FinalizeTest(ProducerTestBase):
+    def test_nested_manifest_payload_survives_write_finalize_and_reader(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        data = b'{"ordinary":"payload"}\n'
+        locators = (
+            "artifacts/manifest.json",
+            "artifacts/.cache/manifest.json",
+            "artifacts/_internal/candidate/round_1/manifest.json",
+            "artifacts/plans/cycle/manifest.json",
+        )
+        payloads = []
+        for locator in locators:
+            payload = Path(result["cycle_dir"]) / locator
+            admission = P.check_write(self.root, payload)
+            self.assertEqual((admission["verdict"], admission["reason"]),
+                             ("allow", "open-cycle-artifacts"), locator)
+            payload.parent.mkdir(parents=True, exist_ok=True)
+            payload.write_bytes(data)
+            payloads.append(payload)
+        self.write_output(result, "plans/cycle/plan.md", b"plan\n")
+        self.close(route, route_file)
+        sealed = P.finalize(self.root, cycle_id=result["cycle_id"])
+        document = json.loads((Path(result["cycle_dir"]) / "manifest.json").read_text(encoding="utf-8"))
+        rows = {row["locator"]["path"]: row for row in document["artifact_revisions"]}
+        for locator, payload in zip(locators, payloads):
+            row = rows[locator]
+            self.assertEqual(payload.read_bytes(), data)
+            self.assertEqual(row["content_digest"], m.digest_bytes(data))
+            self.assertEqual(row["byte_size"], len(data))
+            self.assertNotEqual(row["artifact_id"], document["manifest_id"])
+        self.assertEqual(sealed["status"], "sealed")
+        buckets = reader.bucket_dirs(self.root, "plans", include_legacy=False)
+        self.assertTrue(any((base / "cycle" / "manifest.json").read_bytes() == data
+                            for base, _meta in buckets))
+
     def test_finalize_seals_manifest_index_and_record(self):
         self.activate()
         route, route_file, result = self.begin()

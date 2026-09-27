@@ -4558,6 +4558,24 @@ def check_write(root: Path, target: Path) -> Dict[str, Any]:
         if len(parts) <= artifacts_index or parts[artifacts_index] != "artifacts":
             return {**base, "verdict": "deny", "reason": "outside-cycle-artifacts", "layout": "cycle",
                     "cycle_id": cycle_id}
+        try:
+            observed = os.lstat(target)
+            node_kind = ("symlink" if stat.S_ISLNK(observed.st_mode) else
+                         "regular" if stat.S_ISREG(observed.st_mode) else
+                         "directory" if stat.S_ISDIR(observed.st_mode) else "special")
+        except FileNotFoundError:
+            node_kind = "missing"
+        except OSError:
+            node_kind = "special"
+        classification = artifact_manifest.classify_artifact_path(
+            str(root), campaign_path.relative_to(root).as_posix(),
+            cycle_path.relative_to(root).as_posix(), "payload", rel, node_kind,
+            prospective=True,
+        )
+        if not classification.allowed:
+            reason = classification.reason or "outside-cycle-artifacts"
+            return {**base, "verdict": "deny", "reason": reason,
+                    "layout": "cycle", "cycle_id": cycle_id}
         sealed_on_disk = manifest is not None
         if record is None:
             reason = "cycle-sealed" if sealed_on_disk else "cycle-unknown"

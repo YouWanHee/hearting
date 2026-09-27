@@ -300,6 +300,32 @@ class ArtifactLifecycleCompletionTest(LifecycleTestBase):
     """Baseline-and-mutate: one fully wired `complete` fixture (route, marker,
     outcome, manifest) plus targeted mutations for each N9-N16/P2/P6 case."""
 
+    def test_nested_manifest_payload_is_verified_and_symlink_ancestor_is_rejected(self):
+        content = Path(self._tmp.name) / "payload-root"
+        locator = "artifacts/_internal/candidate/round_1/manifest.json"
+        payload = content / locator
+        payload.parent.mkdir(parents=True)
+        data = b'{"ordinary":"payload"}\n'
+        payload.write_bytes(data)
+        document = {"artifact_revisions": [{
+            "locator": {"path": locator}, "byte_size": len(data),
+            "content_digest": m.digest_bytes(data), "media_type": "application/json",
+        }]}
+        self.assertTrue(m.validate_locator_path(locator).ok)
+        self.assertEqual(L.verify_published_payload(content, document).status, "verified")
+
+        outside = Path(self._tmp.name) / "outside"
+        outside.mkdir()
+        (outside / "manifest.json").write_bytes(data)
+        (content / "artifacts" / ".cache").symlink_to(outside, target_is_directory=True)
+        unsafe = json.loads(json.dumps(document))
+        unsafe["artifact_revisions"][0]["locator"]["path"] = "artifacts/.cache/manifest.json"
+        unsafe["artifact_revisions"][0]["content_digest"] = m.digest_bytes(data)
+        decision = L.verify_published_payload(content, unsafe)
+        self.assertEqual(decision.status, "reject")
+        self.assertIn("artifact-symlink-forbidden:artifacts/.cache/manifest.json",
+                      decision.reasons[0].detail)
+
     def _fixture(self, *, decision_required=True):
         identity = adm.ensure_root_identity(self.root)
         route = self.compile_route()

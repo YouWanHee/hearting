@@ -106,6 +106,17 @@ class CampaignTitleRepairTest(unittest.TestCase):
         repair.apply(package)
         self.assertEqual(repair.verify(package)["status"], "verified")
 
+    def test_nested_payload_manifest_is_not_discovered_as_cycle_control(self):
+        payload = self.manifest.parent / "artifacts" / "_internal" / "candidate"
+        payload.mkdir(parents=True)
+        (payload / "manifest.json").write_text(json.dumps({
+            "manifest_id": "man_spoof", "manifest_revision_id": "mrev_spoof",
+            "campaign": {"campaign_id": "camp_demo", "title": "Spoof"},
+            "cycle": {"cycle_id": "cyc_demo"},
+        }), encoding="utf-8")
+        rows = repair.manifest_rows(self.manifest.parents[1])
+        self.assertEqual([row["manifest_id"] for row in rows], ["man_demo"])
+
     def test_transaction_failure_restores_pre_apply_bytes_separately_from_full_rollback(self):
         package = repair.prepare(self.roots, self.proposals)
         package["transaction_journal_path"] = str(Path(self.tmp.name) / "failure-journal.json")
