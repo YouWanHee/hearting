@@ -444,7 +444,28 @@ class DispatchV44ProjectionTest(unittest.TestCase):
         self.assertEqual(MANAGED_GATEWAY.ALLOWED_RECEIPT_KEYS, {
             "schema_version", "state", "parent_attempt_id", "job_registry",
             "children", "delivery_timing", "delivery_classification",
+            "replacement_lineage", "replacement_attention",
         })
+        optional = {
+            "replacement_lineage": [{"original_attempt_id": "att-original",
+                "replacement_attempt_id": "att-v44", "family_id": "a" * 64,
+                "claim_digest": "b" * 64}],
+            "replacement_attention": [{"source_attempt_id": "att-v44",
+                "state": "needs-attention", "node": "execute",
+                "reason": "automatic-replacement-exhausted"}],
+        }
+        for key, value in optional.items():
+            with self.subTest(optional_key=key):
+                extended = dict(receipt, **{key: value})
+                # CLI join JSON does not grant replacement authority. Both
+                # native decoders keep the same base shape; the checked wait
+                # controller attaches registry-proved metadata afterwards.
+                self.assertEqual(CLAUDE_SUPERVISOR.typed_receipt(extended, "att-parent", {"att-v44"}), claude)
+                self.assertEqual(CODEX_SUPERVISOR._typed_receipt(extended, "att-parent", {"att-v44"}), codex)
+                canonical = JOIN.canonical_delivery_receipt(extended)
+                self.assertEqual(canonical[key], value)
+                self.assertEqual(JOIN.unseal_delivery_receipt(JOIN.seal_delivery_receipt(canonical)), canonical)
+                self.assertTrue(set(canonical) <= MANAGED_GATEWAY.ALLOWED_RECEIPT_KEYS)
         self.assertEqual(MANAGED_GATEWAY.ALLOWED_CHILD_KEYS, {
             "attempt_id", "status", "readiness", "reason", "required_action",
             "harness", "delivery_classification",

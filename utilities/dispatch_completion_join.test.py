@@ -2844,9 +2844,28 @@ class CanonicalReceiptAndSealTest(unittest.TestCase):
         self.assertNotIn("armed", canonical)
         self.assertNotIn("launch_home", canonical)
         self.assertNotIn("harvest_command", canonical)
-        self.assertEqual(set(canonical) - {"children"}, JOIN.CANONICAL_RECEIPT_KEYS - {"children"})
+        optional_keys = {"replacement_lineage", "replacement_attention"}
+        self.assertEqual(set(canonical), JOIN.CANONICAL_RECEIPT_KEYS - optional_keys)
+        self.assertEqual(canonical, self._receipt())
         body = json.dumps(canonical, separators=(",", ":"), sort_keys=True)
         self.assertNotIn("armed=", body)
+        # Optional runtime proof belongs to receipt identity only when supplied;
+        # it must not inject empty fields into pre-replacement receipts.
+        optional = {
+            "replacement_lineage": [{"original_attempt_id": "att-original",
+                "replacement_attempt_id": "att-replacement", "family_id": "a" * 64,
+                "claim_digest": "b" * 64}],
+            "replacement_attention": [{"source_attempt_id": "att-replacement",
+                "state": "needs-attention", "node": "execute",
+                "reason": "automatic-replacement-exhausted"}],
+        }
+        for key, value in optional.items():
+            with self.subTest(optional_key=key):
+                projected = JOIN.canonical_delivery_receipt(dict(receipt, **{key: value}))
+                self.assertEqual(projected, dict(self._receipt(), **{key: value}))
+                self.assertNotEqual(JOIN.canonical_receipt_digest(projected),
+                                    JOIN.canonical_receipt_digest(canonical))
+                self.assertEqual(JOIN.unseal_delivery_receipt(JOIN.seal_delivery_receipt(projected)), projected)
 
     def test_d_seal_unseal_round_trips_the_worst_case_2048_byte_body(self):
         # Build a receipt whose canonical JSON encoding is exactly

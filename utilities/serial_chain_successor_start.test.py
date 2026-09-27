@@ -135,7 +135,9 @@ class SerialDriverControlFlowTest(unittest.TestCase):
         ])
         joins = []
         timeouts = []
-        with mock.patch.object(advance, "advance_chain_step", side_effect=lambda *args: next(steps)):
+        with mock.patch.object(advance, "advance_chain_step", side_effect=lambda *args: next(steps)), \
+             mock.patch("dispatch_replacement.advance_batch",
+                        side_effect=lambda jobs, selected: (selected, [], [])) as checkpoint:
             result = advance.drive_serial_chain(
                 jobs=Path("/unused/jobs"), parent_attempt_id="owner", attempts={"att-1"},
                 receipt={"state": "completed"}, refresh=lambda attempts: rows,
@@ -147,6 +149,10 @@ class SerialDriverControlFlowTest(unittest.TestCase):
         self.assertEqual(result.attempts, frozenset({"att-3"}))
         self.assertEqual(result.traversed, frozenset({"att-1", "att-2"}))
         self.assertEqual(joins, [{"att-2"}, {"att-3"}])
+        self.assertEqual(checkpoint.call_args_list, [
+            mock.call(Path("/unused/jobs"), {"att-2"}),
+            mock.call(Path("/unused/jobs"), {"att-3"}),
+        ])
         self.assertEqual(timeouts, [])
 
 

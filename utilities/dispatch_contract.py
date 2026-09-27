@@ -8071,6 +8071,9 @@ def claim_recovery_retry(
             raise DispatchContractError("automatic-replacement-exhausted", original_attempt_id)
         if metadata.get("recovery_id"):
             raise DispatchContractError("recovery-claim-conflict")
+        from dispatch_replacement import legacy_budget_exhausted
+        if legacy_budget_exhausted(jobs, lines, metadata, include_family=True):
+            raise DispatchContractError("automatic-replacement-exhausted", original_attempt_id)
         if (
             metadata.get("cancellation_quiescence_receipt")
             != ATTEMPT_CANCELLATION_QUIESCENCE_RECEIPT

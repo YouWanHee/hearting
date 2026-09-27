@@ -272,7 +272,154 @@ def _check_record(record, family, source=None):
     return record
 
 
-def _budget_exhausted(jobs, source):
+def legacy_budget_exhausted(jobs, lines, source, *, route=None, include_family=False):
+    """Read SD106 and SD157 consumption from the caller's jobs-lock snapshot.
+
+    Do not move this check ahead of SD106's exact existing-recovery-id replay.
+    SD157 permits its own by-source reservation to resume; SD106 calls with
+    include_family=True and must not consume even that reservation again.
+    No registry, route, or index is written and no second jobs lock is taken.
+    """
+    rows = _rows(lines)
+    aid = _id(source.get('attempt_id'))
+    references = [(fields, meta) for fields, meta in rows.values()
+                  if meta.get('retry_attempt_id') == aid]
+    if len(references) > 1:
+        raise DC.DispatchContractError('replacement-legacy-budget-ambiguous')
+    if references:
+        _, prior = references[0]
+        if (prior.get('retry_ordinal') != '1' or not prior.get('recovery_id')
+                or DC._stable_recovery_attempt_id(prior['recovery_id']) != aid
+                or any(prior.get(key) != source.get(key) for key in
+                       ('route_node', 'parent_attempt_id', 'parent_sid',
+                        'worker_type', 'dispatch_depth'))):
+            raise DC.DispatchContractError('replacement-legacy-budget-link-unproven')
+        # The current SD104/106 gap executes on the original source route.
+        if (prior.get('route_id') and prior.get('route_hash')
+                and (prior['route_id'], prior['route_hash'])
+                == (source.get('route_id'), source.get('route_hash'))):
+            return True
+
+    reference_ids = {meta.get('attempt_id') for _, meta in references}
+    candidates = []
+    for fields, meta in rows.values():
+        other = meta.get('attempt_id')
+        same_node = (meta.get('worker_type') == 'owner'
+                     if source.get('worker_type') == 'owner'
+                     else meta.get('worker_type') != 'owner'
+                     and meta.get('route_node') == source.get('route_node'))
+        if not same_node and other not in reference_ids:
+            continue
+        # The original row can be unchanged after an index-first crash.
+        # Delay unrelated index errors until the row's lineage is established.
+        attention = reservation = None
+        index_error = None
+        try:
+            attention = _read(Path(jobs).parent / 'recovery-attention' /
+                              'by-source' / (_id(other) + '.json'))
+            if attention is not None and (
+                    attention.get('original_attempt_id') != other
+                    or not attention.get('recovery_id')):
+                raise DC.DispatchContractError('replacement-recovery-attention-invalid')
+            reservation = source_reservation(jobs, other)
+        except (DC.DispatchContractError, OSError, ValueError, TypeError) as exc:
+            index_error = exc
+        legacy = (meta.get('retry_ordinal') == '1'
+                  or meta.get('recovery_exhausted') == '1'
+                  or (meta.get('start_permitted') == '0' and meta.get('recovery_id'))
+                  or attention is not None)
+        family_hint = (reservation or {}).get('family_id')
+        # SD157's own reservation is a replay, not a second consumption.
+        # Its own SD106 exhaustion, however, is always a veto.
+        family_consumes = bool(family_hint) and (other != aid or include_family)
+        if legacy or family_consumes or index_error or other in reference_ids:
+            candidates.append((fields, meta, bool(legacy), family_hint,
+                               family_consumes, index_error))
+    if not candidates and not references:
+        # Preserve legacy route-less first-claim callers: no consumption
+        # evidence means no reason to require a historical route here.
+        return False
+
+    from route_lineage import verified_route_lineage
+
+    def historical_route(meta):
+        path = meta.get('owner_route_file') or meta.get('route_file')
+        if not path:
+            return None
+        value = _read(Path(path))
+        if value is None:
+            return None
+        expected_id = meta.get('owner_route_id') or meta.get('route_id')
+        expected_hash = meta.get('owner_route_hash') or meta.get('route_hash')
+        if value.get('route_id') != expected_id or value.get('route_hash') != expected_hash:
+            raise DC.DispatchContractError('replacement-legacy-budget-route-unproven')
+        verified_route_lineage(value)
+        return value
+
+    if route is None:
+        route = historical_route(source)
+    if route is None:
+        # An exact predecessor reference cannot be waved away as unrelated.
+        if references or any(meta.get('attempt_id') == aid and
+                             (legacy or family_consumes or error)
+                             for _, meta, legacy, _, family_consumes, error in candidates):
+            raise DC.DispatchContractError('replacement-legacy-budget-link-unproven')
+        return False
+    logical = _logical_key(route, source)
+    family = _digest(logical)
+    lineage = {r['route_id']: r for r in verified_route_lineage(route)}
+    if include_family:
+        record = _read(_record_path(jobs, family))
+        if record is not None:
+            _check_record(record, family)
+            return True
+
+    for _, prior, legacy, family_hint, family_consumes, index_error in candidates:
+        other = prior.get('attempt_id')
+        # A checked by-source index is already a durable exact family binding;
+        # no family record or original-row annotation need exist yet.
+        if family_consumes and family_hint == family:
+            if index_error:
+                raise DC.DispatchContractError('replacement-legacy-budget-link-unproven') from index_error
+            return True
+        prior_id = prior.get('owner_route_id') or prior.get('route_id')
+        prior_hash = prior.get('owner_route_hash') or prior.get('route_hash')
+        previous = lineage.get(prior_id)
+        direct = previous is not None or other in reference_ids or other == aid
+        try:
+            if previous is not None:
+                if previous['route_hash'] != prior_hash:
+                    raise DC.DispatchContractError('replacement-legacy-budget-route-unproven')
+            else:
+                # Other streams share both a registry and common node names.
+                # Their unavailable/corrupt history does not poison this stream.
+                previous = historical_route(prior)
+            if previous is None:
+                if direct:
+                    raise DC.DispatchContractError('replacement-legacy-budget-link-unproven')
+                continue
+            same_logical = _logical_key(previous, prior) == logical
+        except (DC.DispatchContractError, OSError, ValueError, TypeError) as exc:
+            if direct:
+                raise DC.DispatchContractError('replacement-legacy-budget-link-unproven') from exc
+            continue
+        if not same_logical:
+            if other in reference_ids:
+                raise DC.DispatchContractError('replacement-legacy-budget-link-unproven')
+            continue
+        # From here on the prior row belongs to this exact logical family.
+        if index_error:
+            raise DC.DispatchContractError('replacement-legacy-budget-link-unproven') from index_error
+        if family_consumes and family_hint != family:
+            raise DC.DispatchContractError('replacement-legacy-budget-link-unproven')
+        if legacy or family_consumes:
+            return True
+    if references:
+        raise DC.DispatchContractError('replacement-legacy-budget-link-unproven')
+    return False
+
+
+def _budget_exhausted(jobs, source, *, lines=None, route=None):
     aid = _id(source.get('attempt_id'))
     index = _read(Path(jobs).parent/'recovery-attention/by-source'/(aid+'.json'))
     if index is not None:
@@ -290,7 +437,9 @@ def _budget_exhausted(jobs, source):
             if record.get('recovery_id') != recovery or record.get('original_attempt_id') != source.get('attempt_id'):
                 raise DC.DispatchContractError('replacement-recovery-attention-invalid')
             return True
-    return False
+    if lines is None:
+        lines = Path(jobs).read_text().splitlines()
+    return legacy_budget_exhausted(jobs, lines, source, route=route)
 
 
 def _no_competing_successor(rows, aid, replacement=None):
@@ -331,7 +480,7 @@ def claim(jobs: Path, aid: str) -> dict:
             _reserve_source(jobs, aid, family)
             _bind_source(jobs, lines, aid, old)
             return old
-        if _budget_exhausted(jobs, meta):
+        if _budget_exhausted(jobs, meta, lines=lines, route=route):
             raise DC.DispatchContractError('automatic-replacement-exhausted', logical['node'])
         _no_competing_successor(rows, aid)
         owner = aid if meta.get('worker_type') == 'owner' else meta.get('parent_attempt_id') or aid
@@ -468,7 +617,7 @@ def validate_claim_source(jobs, lines, record):
             or (source_reservation(jobs, prior) or {}).get('family_id') != family):
         raise DC.DispatchContractError('replacement-claim-pending')
     _no_competing_successor(rows, prior, record['replacement_attempt_id'])
-    if _budget_exhausted(jobs, source):
+    if _budget_exhausted(jobs, source, lines=lines):
         raise DC.DispatchContractError('automatic-replacement-exhausted', prior)
     death_proof(fields, source)
     _source_fences(jobs, source, record['route_id'], prior)
@@ -502,7 +651,7 @@ def admission(jobs, lines, metadata):
     if reservation and not source.get('replacement_claim_digest'):
         raise DC.DispatchContractError('replacement-claim-pending', prior)
     if not family:
-        if _budget_exhausted(jobs, source):
+        if _budget_exhausted(jobs, source, lines=lines):
             raise DC.DispatchContractError('automatic-replacement-exhausted', prior)
         return None
     record = _check_record(_read(_record_path(jobs, family)), family, source)

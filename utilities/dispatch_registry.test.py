@@ -1194,6 +1194,8 @@ class RegistryTest(unittest.TestCase):
        mock.patch.object(module,"observer_namespace_extinct",return_value="extinct"), \
        contextlib.redirect_stdout(io.StringIO()):
    module.automatic_cancel_receiptless(module.read_rows(self.jobs),args)
+  original=self.jobs.read_text().strip().split("\t",5)
+  original_meta=D.parse_registry_metadata(original[5])
   budget=types.SimpleNamespace(retry_slots=0,source="bound-route")
   outputs=[]
   with mock.patch.object(module,"resolve_continuation_budget",return_value=budget), \
@@ -1207,8 +1209,16 @@ class RegistryTest(unittest.TestCase):
   self.assertEqual(outputs[0]["reason"],"receipt-unavailable-retry-exhausted")
   self.assertEqual(outputs[1]["recovery_id"],outputs[0]["recovery_id"])
   metadata=D.parse_registry_metadata(self.jobs.read_text().strip().split("\t",5)[5])
-  self.assertEqual(metadata["failure_class"],"blocked")
-  self.assertEqual(metadata["note"],"receipt-unavailable-retry-exhausted")
+  self.assertEqual(metadata["failure_class"],original_meta["failure_class"])
+  self.assertEqual(metadata["note"],original_meta["note"])
+  self.assertEqual(self.jobs.read_text().strip().split("\t",5)[1],original[1])
+  self.assertEqual(metadata["recovery_exhausted"],"1")
+  self.assertEqual(metadata["start_permitted"],"0")
+  attention_path=self.jobs.parent/"recovery-attention"/(hashlib.sha256(outputs[0]["recovery_id"].encode()).hexdigest()+".json")
+  attention=json.loads(attention_path.read_text())
+  self.assertEqual(attention["original_attempt_id"],attempt)
+  self.assertEqual(attention["state"],"needs-attention")
+  self.assertEqual(attention["reason"],"receipt-unavailable-retry-exhausted")
   self.assertNotIn("retry_attempt_id",metadata)
 
  def test_recover_receiptless_rejects_jobs_not_sealed_by_route(self):

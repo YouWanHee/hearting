@@ -330,5 +330,200 @@ class ReplacementTest(unittest.TestCase):
         self.assertEqual(Path(cmd[cmd.index('--prompt-file')+1]).read_text(),'the raw task')
         self.assertEqual(cmd.count('--start'),1)
 
+    # SD106 writes retry_attempt_id on the original row only. These fixtures
+    # deliberately retain that production shape, with no automatic_retry_of.
+    def _legacy_real_route(self, name, parent=None):
+        import route_lineage
+        self.logical.stop()  # Exercise the real hash-verified family key.
+        route = {'artifact_root': str(self.root), 'cwd': str(self.root),
+                 'capability': 'autopilot-code', 'nodes': [], 'fixture_name': name}
+        if parent is not None:
+            route.update(continuation_contract_version=1,
+                         source_route_id=parent['route_id'],
+                         source_route_hash=parent['route_hash'])
+        route['route_hash'] = route_identity.route_hash(route)
+        route['route_id'] = route_identity.route_id_from_hash(route['route_hash'])
+        path = route_lineage.canonical_route_path(self.root, route['route_id'])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(route))
+        lineage = route_lineage.verified_route_lineage(route)
+        self.assertEqual(lineage[0]['route_id'], route['route_id'])
+        if parent is not None:
+            self.assertEqual(lineage[1]['route_id'], parent['route_id'])
+        return route, path
+
+    def _legacy_row(self, aid, route, path, node='frame'):
+        meta = {key: value for key, value in self.meta.items()
+                if key != 'replacement_input_digest'}
+        meta.update(attempt_id=aid, route_id=route['route_id'],
+                    route_hash=route['route_hash'], route_file=str(path), route_node=node,
+                    cancellation_quiescence_receipt=D.ATTEMPT_CANCELLATION_QUIESCENCE_RECEIPT,
+                    quiescence_pgid_proof=D.GROUP_REAP_PROOF,
+                    quiescence_descendant_proof=D.ATTEMPT_DESCENDANT_PROOF,
+                    cancellation_receipt_digest='sha256:' + 'b' * 64)
+        args = SimpleNamespace(attempt_id=aid, jobs_path=self.jobs,
+                               worktree=str(self.root), route_id=route['route_id'],
+                               route_node=node, replacement_input_argv=[
+                                   '--start', '--attempt-id', aid, '--prompt-text', 'the raw task'])
+        meta.update(D.parse_registry_metadata(R.seal_launch_input(args, 'codex', 'the raw task')))
+        return meta
+
+    def _legacy_retry_claim(self, meta, remaining=8):
+        identity = {'source_route_id': meta['route_id'],
+                    'source_route_hash': meta['route_hash'],
+                    'node_or_group_leg': meta['route_node'],
+                    'original_attempt_id': meta['attempt_id'],
+                    'cancellation_receipt_digest': meta['cancellation_receipt_digest']}
+        return D.claim_recovery_retry(self.jobs,
+            recovery_id=D._recovery_identity_digest(identity),
+            source_route_id=identity['source_route_id'],
+            source_route_hash=identity['source_route_hash'],
+            node_or_group_leg=identity['node_or_group_leg'],
+            original_attempt_id=identity['original_attempt_id'], remaining_cascade=remaining)
+
+    def _legacy_claimed_pair(self):
+        route, path = self._legacy_real_route('legacy-root')
+        original = self._legacy_row('att-legacy-original', route, path)
+        self.write(original)
+        first = self._legacy_retry_claim(original)
+        self.assertTrue(first.start_permitted)
+        self.assertEqual(first.retry_ordinal, 1)
+        self.assertEqual(first.retry_attempt_id, D._stable_recovery_attempt_id(first.recovery_id))
+        # Existing SD106 idempotence must survive the shared-budget guard.
+        self.assertEqual(self._legacy_retry_claim(original), first)
+        original = R._rows(self.jobs.read_text().splitlines())[original['attempt_id']][1]
+        target = self._legacy_row(first.retry_attempt_id, route, path)
+        self.assertNotIn('automatic_retry_of', target)
+        self.assertNotIn('retry_ordinal', target)
+        self.write(target, append=True)
+        R._route.return_value = (path, route)
+        return route, path, original, target
+
+    def _legacy_assert_exhausted(self, callback):
+        before = self.jobs.read_text()
+        with self.assertRaises(D.DispatchContractError) as caught:
+            callback()
+        self.assertEqual(caught.exception.reason, 'automatic-replacement-exhausted')
+        self.assertEqual(self.jobs.read_text(), before)
+
+    def test_sd106_stable_target_cannot_claim_automatic_replacement(self):
+        _, _, original, target = self._legacy_claimed_pair()
+        self._legacy_assert_exhausted(lambda: R.claim(self.jobs, target['attempt_id']))
+        self.assertFalse((R._directory(self.jobs) / 'claims').exists())
+        self.assertEqual(R._rows(self.jobs.read_text().splitlines())[original['attempt_id']][1]['note'],
+                         'dead-exact-pid')
+
+    def test_sd106_stable_target_cannot_admit_another_successor(self):
+        _, _, _, target = self._legacy_claimed_pair()
+        for predecessor_key in ('automatic_retry_of', 'prior_attempt_id'):
+            with self.subTest(predecessor_key=predecessor_key):
+                self._legacy_assert_exhausted(lambda: R.admission(
+                    self.jobs, self.jobs.read_text().splitlines(),
+                    {**target, 'attempt_id': 'att-second-retry', predecessor_key: target['attempt_id']}))
+
+    def test_sd106_stable_target_cannot_claim_another_sd106_retry(self):
+        _, _, _, target = self._legacy_claimed_pair()
+        self._legacy_assert_exhausted(lambda: self._legacy_retry_claim(target))
+
+    def test_sd106_malformed_exact_backlink_fails_closed(self):
+        route, _, original, target = self._legacy_claimed_pair()
+        mutations = ({'retry_ordinal': '0'}, {'recovery_id': 'wrong-recovery'},
+                     {'parent_sid': 'foreign-parent'}, {'route_node': 'foreign-node'})
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                self.write({**original, **mutation}); self.write(target, append=True)
+                before = self.jobs.read_text()
+                with self.assertRaises(D.DispatchContractError) as caught:
+                    R.legacy_budget_exhausted(self.jobs, before.splitlines(), target, route=route)
+                self.assertEqual(caught.exception.reason, 'replacement-legacy-budget-link-unproven')
+                self.assertEqual(self.jobs.read_text(), before)
+
+    def test_sd106_duplicate_exact_backlink_fails_closed(self):
+        route, _, original, target = self._legacy_claimed_pair()
+        self.write({**original, 'attempt_id': 'att-duplicate-original'}, append=True)
+        with self.assertRaises(D.DispatchContractError) as caught:
+            R.legacy_budget_exhausted(self.jobs, self.jobs.read_text().splitlines(), target, route=route)
+        self.assertEqual(caught.exception.reason, 'replacement-legacy-budget-ambiguous')
+
+    def test_sd106_verified_continuation_same_node_is_exhausted(self):
+        root, _, _, _ = self._legacy_claimed_pair()
+        route, path = self._legacy_real_route('continuation', root)
+        current = self._legacy_row('att-continuation-frame', route, path)
+        self.write(current, append=True); R._route.return_value = (path, route)
+        self.assertTrue(R.legacy_budget_exhausted(
+            self.jobs, self.jobs.read_text().splitlines(), current, route=route))
+        self._legacy_assert_exhausted(lambda: R.claim(self.jobs, current['attempt_id']))
+        self._legacy_assert_exhausted(lambda: self._legacy_retry_claim(current))
+
+    def test_sd106_other_node_in_verified_continuation_has_own_budget(self):
+        root, _, _, _ = self._legacy_claimed_pair()
+        route, path = self._legacy_real_route('other-node-continuation', root)
+        current = self._legacy_row('att-other-node', route, path, node='other-frame')
+        self.write(current, append=True); R._route.return_value = (path, route)
+        self.assertFalse(R.legacy_budget_exhausted(
+            self.jobs, self.jobs.read_text().splitlines(), current, route=route))
+        self.assertEqual(R.claim(self.jobs, current['attempt_id'])['original_attempt_id'], current['attempt_id'])
+
+    def test_sd106_same_named_node_on_other_root_has_own_budget(self):
+        self._legacy_claimed_pair()
+        route, path = self._legacy_real_route('unrelated-root')
+        current = self._legacy_row('att-other-root', route, path)
+        self.write(current, append=True); R._route.return_value = (path, route)
+        self.assertFalse(R.legacy_budget_exhausted(
+            self.jobs, self.jobs.read_text().splitlines(), current, route=route))
+        self.assertEqual(R.claim(self.jobs, current['attempt_id'])['original_attempt_id'], current['attempt_id'])
+
+    def test_sd106_attention_first_write_crash_consumes_continuation_budget(self):
+        root, path = self._legacy_real_route('attention-root')
+        original = self._legacy_row('att-attention-original', root, path)
+        self.write(original)
+        real_once = R._once
+        def crash_after_index(path, value):
+            if path.parent.name == 'recovery-attention':
+                raise RuntimeError('crash before attention record and row annotation')
+            return real_once(path, value)
+        with mock.patch.object(R, '_once', side_effect=crash_after_index):
+            with self.assertRaisesRegex(RuntimeError, 'crash before'):
+                self._legacy_retry_claim(original, remaining=0)
+        self.assertNotIn('recovery_exhausted', self.jobs.read_text())
+        self.assertEqual(len(list((self.jobs.parent / 'recovery-attention/by-source').glob('*.json'))), 1)
+        route, path = self._legacy_real_route('attention-continuation', root)
+        current = self._legacy_row('att-after-attention-crash', route, path)
+        self.write(current, append=True); R._route.return_value = (path, route)
+        self._legacy_assert_exhausted(lambda: R.claim(self.jobs, current['attempt_id']))
+        self._legacy_assert_exhausted(lambda: self._legacy_retry_claim(current))
+
+    def test_sd157_reservation_first_write_crash_consumes_continuation_budget(self):
+        root, path = self._legacy_real_route('reservation-root')
+        original = self._legacy_row('att-reserved-original', root, path)
+        self.write(original); R._route.return_value = (path, root)
+        real_once = R._once
+        def crash_before_record(path, value):
+            if path.parent.name == 'claims':
+                raise RuntimeError('crash before family record')
+            return real_once(path, value)
+        with mock.patch.object(R, '_once', side_effect=crash_before_record):
+            with self.assertRaisesRegex(RuntimeError, 'crash before'):
+                R.claim(self.jobs, original['attempt_id'])
+        self.assertIsNotNone(R.source_reservation(self.jobs, original['attempt_id']))
+        self.assertNotIn('replacement_family_id', self.jobs.read_text())
+        self.assertFalse(list((R._directory(self.jobs) / 'claims').glob('*.json')))
+        route, path = self._legacy_real_route('reservation-continuation', root)
+        current = self._legacy_row('att-after-reservation-crash', route, path)
+        self.write(current, append=True); R._route.return_value = (path, route)
+        self._legacy_assert_exhausted(lambda: R.claim(self.jobs, current['attempt_id']))
+        self._legacy_assert_exhausted(lambda: self._legacy_retry_claim(current))
+
+    def test_unrelated_corrupt_historical_route_does_not_block_healthy_stream(self):
+        _, foreign_path, _, _ = self._legacy_claimed_pair()
+        foreign = json.loads(foreign_path.read_text()); foreign['fixture_name'] = 'tampered'
+        foreign_path.write_text(json.dumps(foreign))
+        route, path = self._legacy_real_route('healthy-other-root')
+        current = self._legacy_row('att-healthy', route, path)
+        self.write(current, append=True); R._route.return_value = (path, route)
+        self.assertFalse(R.legacy_budget_exhausted(
+            self.jobs, self.jobs.read_text().splitlines(), current, route=route))
+        self.assertEqual(R.claim(self.jobs, current['attempt_id'])['original_attempt_id'], current['attempt_id'])
+
 
 if __name__=='__main__':unittest.main()
