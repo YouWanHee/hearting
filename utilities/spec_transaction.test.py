@@ -315,20 +315,59 @@ class CycleLayoutTest(unittest.TestCase):
    again=TX.seed_cycle_spec(base,self.artifact)
    self.assertEqual((again["status"],again["reason"],again["kept_existing"]),("seed-skipped","prd-present",3))
    scoped=Path(td)/"scoped"; (scoped/"componentB").mkdir(parents=True); (scoped/"componentB"/"prd.md").write_text("b\n")
-   result=TX.seed_cycle_spec(scoped,self.artifact,spec_root=scoped/"componentA")
-   self.assertEqual((result["status"],result["prd_present"],result["files"]),("seeded",False,3))
+   with self.assertRaises(TX.PRODUCER.ProducerError) as ctx:
+    TX.seed_cycle_spec(scoped,self.artifact,spec_root=scoped/"componentA")
+   self.assertEqual(ctx.exception.code,"shared-base-unproven")
    self.assertEqual((scoped/"componentB"/"prd.md").read_text(),"b\n")
+
+ def test_seed_receipt_precedes_copy_and_stale_retry_never_relabels_base(self):
+  from unittest import mock
+  first=self._shared_v1()
+  _r,_f,begun=self._cycle("interrupted-seed")
+  base=Path(begun["cycle_dir"])/"artifacts/spec"
+  original=Path.write_bytes
+  def interrupt(path,data):
+   if path.name=="prd.md": raise OSError("interrupted")
+   return original(path,data)
+  with mock.patch.object(Path,"write_bytes",interrupt):
+   with self.assertRaises(OSError): TX.seed_cycle_spec(base,self.artifact)
+  receipt=(base/TX.PRODUCER.SPEC_BASE_RECEIPT).read_bytes()
+  self.assertEqual(json.loads(receipt)["revision_id"],first["shared_reference_revision_id"])
+  # Simulate a later publisher advancing the authoritative pointer.
+  ref=TX.PRODUCER._reference_path(self.artifact,"spec",first["shared_reference_id"])
+  record=json.loads(ref.read_text()); record["latest_revision_id"]="rrev_"+"f"*32
+  ref.write_text(json.dumps(record))
+  with self.assertRaises(TX.PRODUCER.ProducerError) as ctx: TX.seed_cycle_spec(base,self.artifact)
+  self.assertEqual(ctx.exception.code,"shared-base-mismatch")
+  self.assertEqual((base/TX.PRODUCER.SPEC_BASE_RECEIPT).read_bytes(),receipt)
+
+ def test_malformed_seed_receipt_is_not_replaced(self):
+  with tempfile.TemporaryDirectory() as td:
+   base=Path(td); receipt=base/TX.PRODUCER.SPEC_BASE_RECEIPT; receipt.parent.mkdir()
+   receipt.write_text("null")
+   with self.assertRaises(TX.PRODUCER.ProducerError) as ctx: TX.seed_cycle_spec(base,self.artifact)
+   self.assertEqual(ctx.exception.code,"shared-base-invalid")
+   self.assertEqual(receipt.read_text(),"null")
+
+ def test_unproven_changed_or_deleted_old_file_is_rejected_before_receipt(self):
+  self._shared_v1()
+  for relative in ("prd.md","retired/prd.md"):
+   with tempfile.TemporaryDirectory() as td:
+    base=Path(td); path=base/relative; path.parent.mkdir(parents=True,exist_ok=True); path.write_text("old work")
+    with self.assertRaises(TX.PRODUCER.ProducerError) as ctx: TX.seed_cycle_spec(base,self.artifact)
+    self.assertEqual(ctx.exception.code,"shared-base-unproven")
+    self.assertFalse((base/TX.PRODUCER.SPEC_BASE_RECEIPT).exists())
 
  def test_seed_unions_version_history_across_revisions(self):
   # Latest revision carries the PRD but no history (cairn's rrev_511a shape);
   # an earlier revision holds _internal/versions/v3. The counter must continue at 4.
-  self._shared_v1()
+  first=self._shared_v1()
   route,route_file,begun=self._cycle("seed-source-2")
   spec=Path(begun["cycle_dir"])/"artifacts"/"spec"; spec.mkdir(parents=True)
   (spec/"prd.md").write_text("v3\n"); (spec/"pipeline_state.yaml").write_text("s\n")
   self._close(route,route_file); self.P.finalize(self.artifact,cycle_id=begun["cycle_id"])
   # cairn's rrev_511a shape (3 files, history dropped) predates D-87; model it explicitly.
-  self.P.admit_shared(self.artifact,cycle_id=begun["cycle_id"],kind="spec",source="spec",key="spec",drop_components=["_internal"],drop_reason="fixture: pre-D-87 shape")
+  self.P.admit_shared(self.artifact,cycle_id=begun["cycle_id"],kind="spec",source="spec",key="spec",base_revision=first["shared_reference_revision_id"],drop_components=["_internal"],drop_reason="fixture: pre-D-87 shape")
   _r,_f,begun=self._cycle("spec-edit-3"); cycle_dir=Path(begun["cycle_dir"]); events=Path(self._tmp.name)/"ev3.jsonl"
   code="import os; from pathlib import Path; Path(os.environ['AGENT_SPEC_ROOT'],'prd.md').write_text('v4\\n')"
   result=self._run(cycle_dir,code,events)
@@ -377,7 +416,7 @@ class CycleLayoutTest(unittest.TestCase):
   released=[r for r in rows if r["status"]=="released"][0]
   self.assertEqual((released["version"],released["snapshot"]),(169,"not-required-new"))
   self.assertEqual((cycle_dir/"artifacts"/"spec"/"prd.md").read_text(),"v169\n")
-  self.assertFalse((cycle_dir/"artifacts"/"spec"/"_internal").exists(),"no pre-image, no snapshot; the number alone continues")
+  self.assertFalse((cycle_dir/"artifacts"/"spec"/"_internal"/"versions").exists(),"no pre-image, no snapshot; the number alone continues")
 
 
  def test_unadmitted_sealed_cycle_still_advances_the_chain(self):

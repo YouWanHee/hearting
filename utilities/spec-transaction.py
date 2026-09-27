@@ -19,7 +19,6 @@ SPEC=importlib.util.spec_from_file_location("worker_route_guard",ROOT/"utilities
 GUARD=importlib.util.module_from_spec(SPEC); SPEC.loader.exec_module(GUARD)
 sys.path.insert(0,str(ROOT/"utilities"))
 import artifact_producer as PRODUCER  # noqa: E402
-import artifact_cutover as CUTOVER  # noqa: E402
 
 
 def emit(event, events=None):
@@ -43,7 +42,8 @@ def seed_cycle_spec(spec_base: Path, artifact: Path, spec_root: Path | None = No
     # old any-file test skipped the seed on a bucket that held research notes
     # and no PRD: no pre-image, `next_version=1`, no snapshot (cairn v173,
     # 2026-09-07 -- the owner worked around it by mv -> staging -> restore).
-    # Worker residue is preserved: seeding never overwrites an existing file.
+    # Research residue is preserved. Other existing files require a recorded
+    # base or an exact match to the canonical seed; seeding never overwrites.
     # `prd_present` is judged where the transaction writes (`spec_root`: the
     # component subtree for a scoped transaction, else the bucket top), and it
     # is an event label, not an early return: the copy loop always runs and
@@ -53,7 +53,40 @@ def seed_cycle_spec(spec_base: Path, artifact: Path, spec_root: Path | None = No
     scope=spec_root if spec_root is not None else spec_base
     has_prd=(scope/"prd.md").is_file() or (spec_root is None and any(p.name=="prd.md" and p.parent.parent==spec_base for p in spec_base.rglob("prd.md")))
     preexisting=sum(1 for p in spec_base.rglob("*") if p.is_file()) if spec_base.is_dir() else 0
-    revision=CUTOVER.latest_shared_revision(artifact,"spec")
+    receipt_path=spec_base/PRODUCER.SPEC_BASE_RECEIPT
+    receipt=PRODUCER._read_json(receipt_path)
+    if receipt is None and os.path.lexists(receipt_path):
+        raise PRODUCER.ProducerError("shared-base-invalid",PRODUCER.SPEC_BASE_RECEIPT)
+    references=PRODUCER.list_references(artifact,"spec")
+    if len(references)>1:
+        raise PRODUCER.ProducerError("shared-reference-ambiguous","seed requires one canonical spec reference")
+    reference=references[0] if references else None
+    latest=(reference or {}).get("latest_revision_id")
+    ref_id=(reference or {}).get("shared_reference_id")
+    revision=artifact/"shared"/"spec"/ref_id/"revisions"/latest if ref_id and latest else None
+    if receipt is not None:
+        base=PRODUCER._spec_admission_base(artifact,spec_base,ref_id,None)
+        PRODUCER._check_shared_base(base,latest)
+    else:
+        # Only known unchanged seed files and explicit worker research can
+        # predate the receipt. Unknown/deleted old files must not be resurrected.
+        for path in spec_base.rglob("*"):
+            rel=path.relative_to(spec_base)
+            if path.is_symlink():
+                raise PRODUCER.ProducerError("shared-base-unproven",str(rel))
+            if not path.is_file() or "_internal/research/" in rel.as_posix():
+                continue
+            original=revision/rel if revision is not None else artifact/"spec"/rel
+            if original is None or not original.is_file() or path.read_bytes()!=original.read_bytes():
+                raise PRODUCER.ProducerError("shared-base-unproven",str(rel))
+        metadata=PRODUCER._read_json(revision/PRODUCER.REVISION_RECORD_NAME) if revision else None
+        if revision is not None and (metadata is None or metadata.get("shared_reference_revision_id")!=latest
+                                     or metadata.get("shared_reference_id")!=ref_id):
+            raise PRODUCER.ProducerError("shared-base-invalid",str(revision))
+        receipt={"schema_version":1,"reference_id":ref_id,"revision_id":latest,
+                 "content_digest":metadata["content_digest"] if metadata else None}
+        receipt_path.parent.mkdir(parents=True,exist_ok=True)
+        PRODUCER._write_atomic(receipt_path,PRODUCER._json_bytes(receipt))
     if revision is None:
         return {"status":"seed-skipped","reason":"prd-present" if has_prd else "no-shared-revision","prd_present":has_prd,"preexisting_files":preexisting,"spec_base":str(spec_base)}
     copied=0; kept=0; kept_paths=[]
@@ -61,7 +94,7 @@ def seed_cycle_spec(spec_base: Path, artifact: Path, spec_root: Path | None = No
         if not src.is_file() or src.is_symlink():
             continue
         rel=src.relative_to(revision)
-        if rel.as_posix()=="revision.json":
+        if rel.as_posix() in {"revision.json",PRODUCER.SPEC_BASE_RECEIPT}:
             continue
         dst=spec_base/rel
         if dst.exists():
@@ -352,7 +385,12 @@ def main():
             # Seed only once the route contract passed and the spec lock is ours:
             # a refused run must leave no admittable content behind, and two
             # transactions on one cycle must not interleave a half copy.
-            seeded=seed_cycle_spec(spec_base,artifact,spec_root if spec_root!=spec_base else None)
+            try:
+                seeded=seed_cycle_spec(spec_base,artifact,spec_root if spec_root!=spec_base else None)
+            except PRODUCER.ProducerError as exc:
+                emit({"status":"blocked","reason":exc.code,"detail":exc.detail,"route_id":route["route_id"]},args.events)
+                lock.seek(0); lock.truncate(); lock.flush(); os.fsync(lock.fileno())
+                return 65
             emit({**seeded,"route_id":route["route_id"]},args.events)
         if spec_layout=="cycle" and version==1 and (spec_root/"prd.md").is_file():
             # A pre-image with no history in ANY tree of this spec's chain

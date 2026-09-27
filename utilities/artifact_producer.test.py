@@ -1633,12 +1633,12 @@ class SharedAdmissionTest(ProducerTestBase):
         reference = json.loads((revision_dir.parent.parent / "reference.json").read_text())
         self.assertEqual(reference["latest_revision_id"], admitted["shared_reference_revision_id"])
         self.assertEqual(P.check_write(self.root, revision_dir / "prd.md")["reason"], "shared-revision-immutable")
-        # Second admission under the same key appends a revision; never rewrites.
+        # An exact retry reuses its revision without publishing or rewinding latest.
         second = P.admit_shared(self.root, cycle_id=result["cycle_id"], kind="spec", source="spec", key="prd")
         self.assertFalse(second["reference_created"])
         self.assertEqual(second["shared_reference_id"], admitted["shared_reference_id"])
-        self.assertNotEqual(second["shared_reference_revision_id"], admitted["shared_reference_revision_id"])
-        self.assertEqual(json.loads((Path(second["revision_dir"]) / "revision.json").read_text())["sequence"], 2)
+        self.assertEqual(second["shared_reference_revision_id"], admitted["shared_reference_revision_id"])
+        self.assertEqual(json.loads((Path(second["revision_dir"]) / "revision.json").read_text())["sequence"], 1)
 
     def test_admit_requires_sealed_cycle(self):
         self.activate()
@@ -2737,6 +2737,8 @@ class ComponentSetPreservation(ProducerTestBase):
         return result
 
     def _admit(self, result, generation, **kw):
+        reference = P.find_reference_by_key(self.root, "spec", "prd")
+        kw.setdefault("base_revision", reference["latest_revision_id"] if reference else "none")
         return P.admit_shared(self.root, cycle_id=result["cycle_id"], kind="spec",
                               source=f"gen{generation}", key="prd", **kw)
 
@@ -2832,6 +2834,119 @@ class ComponentSetPreservation(ProducerTestBase):
         self.assertEqual(P.component_set(["prd.md", "a/b.md", "revision.json"]), {"prd.md", "a"})
 
 
+class SharedBaseGuardTest(ProducerTestBase):
+    _cycle = ComponentSetPreservation._cycle
+    _reference = ComponentSetPreservation._reference
+    _journals = ComponentSetPreservation._journals
+
+    def _admit(self, result, generation, **kw):
+        return P.admit_shared(self.root, cycle_id=result["cycle_id"], kind="spec",
+                              source=f"gen{generation}", key="prd", **kw)
+
+    def test_same_base_second_writer_refused_without_any_admission_residue(self):
+        cycle = self._cycle([["a"], ["a"], ["a"]])
+        first = self._admit(cycle, 0)
+        base = first["shared_reference_revision_id"]
+        winner = self._admit(cycle, 1, base_revision=base)
+        before = self._reference(first["shared_reference_id"])
+        with self.assertRaises(P.ProducerError) as ctx:
+            self._admit(cycle, 2, base_revision=base)
+        self.assertEqual(ctx.exception.code, "shared-base-mismatch")
+        self.assertEqual(self._reference(first["shared_reference_id"]), before)
+        self.assertEqual(self._journals(), [])
+        retry = self._admit(cycle, 0)
+        self.assertEqual(retry["status"], "reused")
+        self.assertEqual(self._reference(first["shared_reference_id"])["latest_revision_id"],
+                         winner["shared_reference_revision_id"])
+
+    def test_existing_reference_needs_an_explicit_or_sealed_base(self):
+        cycle = self._cycle([["a"], ["a"]])
+        self._admit(cycle, 0)
+        with self.assertRaises(P.ProducerError) as ctx:
+            self._admit(cycle, 1)
+        self.assertEqual(ctx.exception.code, "shared-base-required")
+        with self.assertRaises(P.ProducerError) as ctx:
+            self._admit(cycle, 1, base_revision="none")
+        self.assertEqual(ctx.exception.code, "shared-base-mismatch")
+
+    def test_payload_or_receipt_cannot_be_added_or_changed_after_sealing(self):
+        cycle = self._cycle([["a"], ["a"]])
+        first = self._admit(cycle, 0)
+        base = Path(cycle["cycle_dir"]) / "artifacts/gen1"
+        for relative in ("a/prd.md", P.SPEC_BASE_RECEIPT):
+            path = base / relative
+            original = path.read_bytes() if path.exists() else None
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("tampered")
+            with self.assertRaises(P.ProducerError) as ctx:
+                self._admit(cycle, 1, base_revision=first["shared_reference_revision_id"])
+            self.assertEqual(ctx.exception.code, "source-manifest-mismatch")
+            if original is None:
+                path.unlink()
+            else:
+                path.write_bytes(original)
+
+    def test_sealed_receipt_cannot_be_overridden_and_matches_actual_base(self):
+        first_cycle = self._cycle([["a"]])
+        first = self._admit(first_cycle, 0)
+        route, route_file = self.route("direct", "autopilot-spec", "update", slug="receipt")
+        cycle = P.begin(self.root, route_file=route_file, capability="autopilot-spec", intensity="direct")
+        self.write_output(cycle, "gen0/a/prd.md", b"updated\n")
+        receipt = {"schema_version": 1, "reference_id": first["shared_reference_id"],
+                   "revision_id": first["shared_reference_revision_id"], "content_digest": first["content_digest"]}
+        self.write_output(cycle, "gen0/" + P.SPEC_BASE_RECEIPT, json.dumps(receipt).encode())
+        self.close(route, route_file)
+        P.finalize(self.root, cycle_id=cycle["cycle_id"])
+        with self.assertRaises(P.ProducerError) as ctx:
+            self._admit(cycle, 0, base_revision="none")
+        self.assertEqual(ctx.exception.code, "shared-base-mismatch")
+        self.assertEqual(self._admit(cycle, 0)["status"], "admitted")
+
+    def test_malformed_sealed_receipt_cannot_fall_back_to_cli_base(self):
+        self.activate()
+        route, route_file, cycle = self.begin("direct", "autopilot-spec", "update")
+        for index, raw in enumerate((b"not json", b"null", b"[]", b"{}")):
+            self.write_output(cycle, f"gen{index}/a/prd.md", b"a\n")
+            self.write_output(cycle, f"gen{index}/" + P.SPEC_BASE_RECEIPT, raw)
+        self.close(route, route_file)
+        P.finalize(self.root, cycle_id=cycle["cycle_id"])
+        for index in range(4):
+            with self.subTest(index=index), self.assertRaises(P.ProducerError) as ctx:
+                self._admit(cycle, index, base_revision="none")
+            self.assertEqual(ctx.exception.code, "shared-base-invalid")
+        self.assertEqual(P.list_references(self.root, "spec"), [])
+        self.assertEqual(self._journals(), [])
+
+    def test_crash_recovery_and_old_journal_replay_never_rewind_latest(self):
+        from unittest import mock
+        cycle = self._cycle([["a"], ["a"], ["a"]])
+        first = self._admit(cycle, 0)
+        base = first["shared_reference_revision_id"]
+        with mock.patch.object(P, "_commit_shared", side_effect=RuntimeError("crash")):
+            with self.assertRaises(RuntimeError):
+                self._admit(cycle, 1, base_revision=base)
+        journal_path = P.shared_journal_path(self.root, "probe").parent
+        journal_file = next(journal_path.glob("*.json"))
+        journal_bytes = journal_file.read_bytes()
+        journal = json.loads(journal_bytes)
+        P._recover_locked(self.root)
+        winner = self._admit(cycle, 2, base_revision=journal["revision_id"])
+        journal_file.write_bytes(journal_bytes)
+        P._recover_locked(self.root)
+        self.assertFalse(journal_file.exists())
+        self.assertEqual(self._reference(first["shared_reference_id"])["latest_revision_id"],
+                         winner["shared_reference_revision_id"])
+        # Model an uncommitted stale published journal. Keep it for inspection.
+        reference = self._reference(first["shared_reference_id"])
+        reference["revisions"].remove(journal["revision_id"])
+        P._write_atomic(P._reference_path(self.root, "spec", first["shared_reference_id"]), P._json_bytes(reference))
+        journal_file.write_bytes(journal_bytes)
+        recovered = P._recover_locked(self.root)
+        self.assertEqual(recovered["unresolved"][0]["code"], "shared-base-mismatch")
+        self.assertTrue(journal_file.exists())
+        self.assertEqual(self._reference(first["shared_reference_id"]), reference)
+
+
 class ComponentSetCheckSurface(ProducerTestBase):
     """D-87 (d): read-only adjacent-pair check, `components(new) >= components(old) - dropped(new)`."""
 
@@ -2852,7 +2967,7 @@ class ComponentSetCheckSurface(ProducerTestBase):
             previous = generations[index - 1] if index else []
             admitted = P.admit_shared(
                 self.root, cycle_id=result["cycle_id"], kind="spec", source=f"gen{index}",
-                key="prd",
+                key="prd", base_revision=admitted["shared_reference_revision_id"] if admitted else "none",
                 drop_components=[name for name in previous if name not in components],
             )
             ids.append(admitted["shared_reference_revision_id"])
@@ -2899,7 +3014,7 @@ class ComponentSetCheckSurface(ProducerTestBase):
         admitted = P.admit_shared(self.root, cycle_id=result["cycle_id"], kind="spec",
                                   source="gen0", key="prd")
         P.admit_shared(self.root, cycle_id=result["cycle_id"], kind="spec", source="gen1",
-                       key="prd", drop_components=["b"], drop_reason="retired")
+                       key="prd", base_revision=admitted["shared_reference_revision_id"], drop_components=["b"], drop_reason="retired")
         report = P.check_component_sets(self.root, "spec", admitted["shared_reference_id"])
         self.assertEqual(report["violations"], 0)
         self.assertEqual(report["pairs"][-1]["dropped"], ["b"])

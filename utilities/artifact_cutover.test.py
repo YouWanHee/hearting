@@ -124,6 +124,68 @@ class CutoverTest(unittest.TestCase):
         sealed = C.migrate_seal(self.root, run_dir=Path(report["run_dir"]), spec_reference=W7_REF)
         return report, sealed
 
+    def test_migration_rejects_a_newer_admission_after_copy(self):
+        route, route_file = self.route()
+        report = C.migrate_delta(self.root, census_rows=self.rows, route_file=route_file,
+                                 capability="autopilot-code", intensity="direct", excludes=[],
+                                 approval_receipt_sha256=None, campaign_id=None)
+        receipt = Path(report["cycle_dir"]) / C.MIGRATION_SPEC_BASES
+        self.assertEqual(json.loads(receipt.read_text())["spec"][W7_REF], W7_RREV)
+        reference = C._adopt_reference(self.root, "spec", W7_REF, title="fixture")
+        reference["latest_revision_id"] = "rrev_" + "f" * 32
+        P._write_atomic(P._reference_path(self.root, "spec", W7_REF), P._json_bytes(reference))
+        self.close(route, route_file)
+        with self.assertRaises(P.ProducerError) as ctx:
+            C.migrate_seal(self.root, run_dir=Path(report["run_dir"]), spec_reference=W7_REF)
+        self.assertEqual(ctx.exception.code, "shared-base-mismatch")
+        self.assertEqual(P._read_json(P._reference_path(self.root, "spec", W7_REF)), reference)
+
+    def test_migration_partial_seal_retry_does_not_rewind_latest(self):
+        from unittest import mock
+        route, route_file = self.route()
+        report = C.migrate_delta(self.root, census_rows=self.rows, route_file=route_file,
+                                 capability="autopilot-code", intensity="direct", excludes=[],
+                                 approval_receipt_sha256=None, campaign_id=None)
+        self.close(route, route_file)
+        original = P.admit_shared
+        def interrupt(*args, **kw):
+            if kw["kind"] == "analysis":
+                raise RuntimeError("crash after spec publication")
+            return original(*args, **kw)
+        with mock.patch.object(P, "admit_shared", side_effect=interrupt):
+            with self.assertRaises(RuntimeError):
+                C.migrate_seal(self.root, run_dir=Path(report["run_dir"]))
+        reference = P.find_reference_by_key(self.root, "spec", "spec")
+        published = reference["latest_revision_id"]
+        reference["latest_revision_id"] = "rrev_" + "f" * 32
+        path = P._reference_path(self.root, "spec", reference["shared_reference_id"])
+        P._write_atomic(path, P._json_bytes(reference))
+        retry = C.migrate_seal(self.root, run_dir=Path(report["run_dir"]))
+        self.assertEqual(retry["shared_admissions"]["spec"]["shared_reference_revision_id"], published)
+        self.assertEqual(P._read_json(path), reference)
+
+    def test_migration_support_receipt_is_required_and_sealed(self):
+        route, route_file = self.route()
+        report = C.migrate_delta(self.root, census_rows=self.rows, route_file=route_file,
+                                 capability="autopilot-code", intensity="direct", excludes=[],
+                                 approval_receipt_sha256=None, campaign_id=None)
+        self.close(route, route_file)
+        P.finalize(self.root, cycle_id=report["cycle_id"])
+        receipt = Path(report["cycle_dir"]) / C.MIGRATION_SPEC_BASES
+        before = receipt.read_bytes()
+        receipt.write_text('{"schema_version":1,"spec":{}}')
+        with self.assertRaises(P.ProducerError) as ctx:
+            C.migrate_seal(self.root, run_dir=Path(report["run_dir"]), spec_reference=W7_REF)
+        self.assertEqual(ctx.exception.code, "source-manifest-mismatch")
+        receipt.write_bytes(before)
+        with self.assertRaises(C.CutoverError) as ctx:
+            C.migrate_seal(self.root, run_dir=Path(report["run_dir"]), spec_reference="ref_" + "f" * 32)
+        self.assertEqual(ctx.exception.code, "shared-base-reference-mismatch")
+        receipt.unlink()
+        with self.assertRaises(C.CutoverError) as ctx:
+            C.migrate_seal(self.root, run_dir=Path(report["run_dir"]), spec_reference=W7_REF)
+        self.assertEqual(ctx.exception.code, "shared-base-required")
+
     def test_migrate_delta_copies_candidates_and_snapshots_shared(self):
         report, sealed = self.migrate()
         self.assertEqual(report["copied_by_bucket"], {"plans": 2, "research": 2})  # w7-source-preserved rows are not re-copied

@@ -4185,7 +4185,12 @@ def _recover_locked(root: Path, *, now: Optional[float] = None,
                 entry.unlink()
                 result["rolled_back"].append(journal.get("revision_id", entry.stem))
             elif target.is_dir():
-                _commit_shared(root, journal)
+                try:
+                    _commit_shared(root, journal)
+                except ProducerError as exc:
+                    result["unresolved"].append({"revision_id": journal.get("revision_id"),
+                                                 "code": exc.code, "detail": exc.detail, "phase": "shared"})
+                    continue
                 result["rolled_forward"].append(journal.get("revision_id", entry.stem))
             else:
                 entry.unlink()
@@ -4396,6 +4401,73 @@ def check_component_sets(
             "pairs": pairs, "violations": violations, "unreadable": sorted(unreadable)}
 
 
+SPEC_BASE_RECEIPT = "_internal/shared-base.json"
+
+
+def _check_shared_base(expected: Optional[str], actual: Optional[str]) -> None:
+    if expected != actual:
+        raise ProducerError("shared-base-mismatch",
+                            f"base={expected or 'none'} latest={actual or 'none'}; "
+                            "merge against latest in a new cycle before admission")
+
+
+def _sealed_source_files(directory: Path, record: Mapping[str, Any], source_rel: str,
+                         source_path: Path) -> List[Tuple[str, str, int]]:
+    """Bind both the receipt and payload to the sealed manifest, not mutable disk."""
+    document = _read_json(directory / "manifest.json")
+    if document is None or artifact_manifest.manifest_digest(document) != record.get("manifest_digest"):
+        raise ProducerError("source-manifest-mismatch", source_rel)
+    expected = {}
+    for row in document.get("artifact_revisions", []):
+        path = row.get("locator", {}).get("path", "")
+        if path == source_rel or path.startswith(source_rel + "/"):
+            rel = path[len(source_rel) + 1:] if path != source_rel else source_path.name
+            expected[rel] = (row["content_digest"], row["byte_size"])
+    paths = sorted(source_path.rglob("*")) if source_path.is_dir() else [source_path]
+    actual = {}
+    for path in paths:
+        if path.is_symlink():
+            raise ProducerError("source-invalid", str(path))
+        if path.is_file():
+            rel = path.relative_to(source_path).as_posix() if source_path.is_dir() else path.name
+            data = path.read_bytes()
+            actual[rel] = (_digest(data), len(data))
+    if actual != expected:
+        raise ProducerError("source-manifest-mismatch", source_rel)
+    return [(rel, digest, size) for rel, (digest, size) in sorted(actual.items())]
+
+
+def _spec_admission_base(root: Path, source_path: Path, reference_id: str,
+                         base_revision: Optional[str]) -> Optional[str]:
+    receipt_path = source_path / SPEC_BASE_RECEIPT
+    receipt = _read_json(receipt_path) if source_path.is_dir() else None
+    if receipt is None and os.path.lexists(receipt_path):
+        raise ProducerError("shared-base-invalid", SPEC_BASE_RECEIPT)
+    if receipt is None:
+        if base_revision is None:
+            raise ProducerError("shared-base-required", "spec admission needs a seeded receipt or --base-revision")
+        base = None if base_revision == "none" else base_revision
+    else:
+        if receipt.get("schema_version") != 1 or not all(k in receipt for k in ("reference_id", "revision_id", "content_digest")):
+            raise ProducerError("shared-base-invalid", SPEC_BASE_RECEIPT)
+        base = receipt["revision_id"]
+        if base is not None and not artifact_identity.is_well_formed(base, "shared_reference_revision"):
+            raise ProducerError("shared-base-invalid", str(base))
+        if base is not None:
+            if receipt["reference_id"] != reference_id:
+                raise ProducerError("shared-base-reference-mismatch", reference_id)
+            revision = _read_json(root / "shared/spec" / reference_id / "revisions" / str(base) / REVISION_RECORD_NAME)
+            if revision is None or revision.get("content_digest") != receipt["content_digest"]:
+                raise ProducerError("shared-base-invalid", str(base))
+        elif receipt["reference_id"] is not None or receipt["content_digest"] is not None:
+            raise ProducerError("shared-base-invalid", SPEC_BASE_RECEIPT)
+        if base_revision is not None:
+            _check_shared_base(None if base_revision == "none" else base_revision, base)
+    if base is not None and not artifact_identity.is_well_formed(base, "shared_reference_revision"):
+        raise ProducerError("shared-base-invalid", str(base))
+    return base
+
+
 def _commit_shared(root: Path, journal: Mapping[str, Any]) -> None:
     kind = journal["kind"]
     ref_id = journal["reference_id"]
@@ -4406,13 +4478,24 @@ def _commit_shared(root: Path, journal: Mapping[str, Any]) -> None:
             "kind": SHARED_KINDS[kind], "key": journal.get("key"), "title": journal.get("title"),
             "created_on": journal.get("created_on"), "latest_revision_id": None, "revisions": [],
         }
+    revision = _read_json(root / "shared" / kind / ref_id / "revisions" / journal["revision_id"] / REVISION_RECORD_NAME)
+    if (revision is None or revision.get("shared_reference_id") != ref_id
+            or revision.get("shared_reference_revision_id") != journal["revision_id"]
+            or revision.get("source", {}).get("cycle_id") != journal.get("cycle_id")
+            or revision.get("source", {}).get("path") != journal.get("source_path")
+            or revision.get("source", {}).get("manifest_digest") != journal.get("source_manifest_digest")):
+        raise ProducerError("shared-journal-mismatch", journal["revision_id"])
     if journal["revision_id"] not in reference["revisions"]:
+        if "expected_previous_revision_id" not in journal:
+            raise ProducerError("shared-base-required", "recovery journal lacks base revision")
+        _check_shared_base(journal["expected_previous_revision_id"], reference.get("latest_revision_id"))
         reference["revisions"] = list(reference["revisions"]) + [journal["revision_id"]]
-    reference["latest_revision_id"] = journal["revision_id"]
-    reference["updated_on"] = journal.get("created_on")
-    path = _reference_path(root, kind, ref_id)
-    _ensure_dir(path.parent)
-    _write_atomic(path, _json_bytes(reference))
+        reference["latest_revision_id"] = journal["revision_id"]
+        reference["updated_on"] = journal.get("created_on")
+        path = _reference_path(root, kind, ref_id)
+        _ensure_dir(path.parent)
+        _write_atomic(path, _json_bytes(reference))
+    # An already committed journal is cleanup only: never rewind a newer latest.
     try:
         shared_journal_path(root, journal["revision_id"]).unlink()
     except FileNotFoundError:
@@ -4434,6 +4517,7 @@ def admit_shared(
     drop_components: Sequence[str] = (),
     drop_reason: Optional[str] = None,
     allow_new_reference: bool = False,
+    base_revision: Optional[str] = None,
     now: Optional[float] = None,
 ) -> Dict[str, Any]:
     root = Path(root).resolve()
@@ -4509,6 +4593,27 @@ def admit_shared(
         else:
             reference_id = reference["shared_reference_id"]
             created = False
+        source_rows = _sealed_source_files(directory, record, source_rel, source_path) if kind == "spec" else None
+        if kind == "spec":
+            # Exact publication retry is idempotent, even after another cycle won.
+            for prior_id in (reference or {}).get("revisions", []):
+                prior_dir = root / "shared" / kind / reference_id / "revisions" / prior_id
+                prior = _read_json(prior_dir / REVISION_RECORD_NAME) or {}
+                provenance = prior.get("source", {})
+                if (provenance.get("cycle_id") == cycle_id and provenance.get("path") == source_rel
+                        and provenance.get("manifest_digest") == record.get("manifest_digest")):
+                    digest = prior.get("content_digest")
+                    if source_rows != sorted((r["path"], r["sha256"], r["byte_size"]) for r in prior.get("files", [])):
+                        raise ProducerError("source-manifest-mismatch", source_rel)
+                    return {"status": "reused", "kind": SHARED_KINDS[kind],
+                            "shared_reference_id": reference_id, "shared_reference_revision_id": prior_id,
+                            "reference_created": False, "revision_dir": str(prior_dir),
+                            "content_digest": digest, "file_count": len(source_rows), "promotion": prior["promotion"]}
+            # Initial unseeded publications have no predecessor to overwrite.
+            expected = (_spec_admission_base(root, source_path, reference_id, base_revision)
+                        if reference is not None or base_revision is not None or (source_path / SPEC_BASE_RECEIPT).exists()
+                        else None)
+            _check_shared_base(expected, (reference or {}).get("latest_revision_id"))
         # D-87 (a): refuse before anything exists.  This sits above the id
         # allocation, the journal write and the staging directory on purpose --
         # the contract requires a refused admit to leave no revision, no journal
@@ -4542,6 +4647,8 @@ def admit_shared(
             "title": title or (reference or {}).get("title") or source_rel,
             "created_on": _rfc3339(now), "staging": os.path.relpath(str(staging), str(root)),
             "target": os.path.relpath(str(target), str(root)), "cycle_id": cycle_id,
+            "expected_previous_revision_id": (reference or {}).get("latest_revision_id"),
+            "source_path": source_rel, "source_manifest_digest": record.get("manifest_digest"),
         }
         _ensure_dir(shared_journal_path(root, revision_id).parent)
         _write_exclusive(shared_journal_path(root, revision_id), _json_bytes(journal), 0o600)
@@ -4552,6 +4659,8 @@ def admit_shared(
                 raise ProducerError("source-invalid", ";".join(violations))
             if not rows:
                 raise ProducerError("source-empty", source_rel)
+            if source_rows is not None and sorted(rows) != source_rows:
+                raise ProducerError("source-manifest-mismatch", source_rel)
             content_digest = _digest(_canonical([[rel, digest, size] for rel, digest, size in rows]))
             sequence = len((reference or {}).get("revisions", [])) + 1
             revision = {
@@ -5143,6 +5252,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                    help="D-87 (b): drop this top-level component from the reference "
                         "(repeatable); the only way to shrink the component set")
     p.add_argument("--drop-reason", help="reason recorded with --drop-component")
+    p.add_argument("--base-revision", help="actual base revision of an unseeded spec, or none for initial publication")
     p.add_argument("--new-reference", action="store_true",
                    help="allow a second reference of a canonical-singular kind (spec) when neither --reference nor --key matches")
 
@@ -5271,7 +5381,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                   promotion_evidence=args.promotion_evidence,
                                   drop_components=args.drop_component,
                                   drop_reason=args.drop_reason,
-                                  allow_new_reference=args.new_reference)
+                                  allow_new_reference=args.new_reference, base_revision=args.base_revision)
         elif args.command == "check-components":
             result = check_component_sets(root, args.kind, args.reference,
                                           from_revision=args.from_revision,

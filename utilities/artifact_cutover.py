@@ -1438,6 +1438,54 @@ def _identity_refs(identity, campaign_id: Optional[str], cycle_id: Optional[str]
     return rows
 
 
+MIGRATION_SPEC_BASES = "artifacts/shared-input/_internal/migration-shared-bases.json"
+
+
+def _capture_migration_spec_bases(root: Path, cycle: Path) -> None:
+    """Capture before copying, including W7 references not yet adopted.
+
+    This protects the migration window, not the legacy author's edit history.
+    A retry retains its first capture, just as an ordinary spec seed does.
+    """
+    path = cycle / MIGRATION_SPEC_BASES
+    if os.path.lexists(path):
+        if P._read_json(path) is None:
+            raise CutoverError("shared-base-invalid", MIGRATION_SPEC_BASES)
+        return
+    bases = {}
+    shared = root / "shared/spec"
+    if shared.is_dir():
+        for directory in sorted(shared.iterdir()):
+            if not directory.is_dir() or directory.is_symlink() or not artifact_identity.is_well_formed(directory.name, "shared_reference"):
+                continue
+            reference = P._read_json(directory / "reference.json")
+            if reference is not None:
+                bases[directory.name] = reference.get("latest_revision_id")
+            else:
+                # Same legacy selection as _adopt_reference, frozen before copy.
+                revisions = directory / "revisions"
+                ids = sorted(p.name for p in revisions.iterdir()
+                             if p.is_dir() and artifact_identity.is_well_formed(p.name, "shared_reference_revision")) if revisions.is_dir() else []
+                bases[directory.name] = ids[-1] if ids else None
+    path.parent.mkdir(parents=True, exist_ok=True)
+    P._write_exclusive(path, P._json_bytes({"schema_version": 1, "spec": bases}))
+
+
+def _migration_spec_base(root: Path, cycle: Path, cycle_id: str, reference_id: Optional[str]) -> str:
+    record = P.read_cycle_record(root, cycle_id)
+    path = cycle / MIGRATION_SPEC_BASES
+    if not path.is_file() or path.is_symlink():
+        raise CutoverError("shared-base-required", "migration needs a base captured before copying")
+    P._sealed_source_files(cycle, record, MIGRATION_SPEC_BASES, path)
+    receipt = P._read_json(path)
+    if receipt is None or receipt.get("schema_version") != 1 or not isinstance(receipt.get("spec"), dict):
+        raise CutoverError("shared-base-invalid", MIGRATION_SPEC_BASES)
+    selected = reference_id or (P.find_reference_by_key(root, "spec", "spec") or {}).get("shared_reference_id")
+    if reference_id is not None and selected not in receipt["spec"]:
+        raise CutoverError("shared-base-reference-mismatch", selected)
+    return receipt["spec"].get(selected) or "none"
+
+
 def migrate_delta(root: Path, *, census_rows: Path, route_file: Path, capability: str, intensity: str,
                   excludes: Sequence[str], approval_receipt_sha256: Optional[str], campaign_id: Optional[str],
                   campaign_key: Optional[str] = "w7c-delta-migration") -> Dict[str, Any]:
@@ -1530,6 +1578,8 @@ def migrate_delta(root: Path, *, census_rows: Path, route_file: Path, capability
         target_rel = os.path.relpath(str(cycle_dir / "artifacts" / rel), str(root))
         copy_one(rel, target_rel, cycle_refs)
         per_bucket[bucket] = per_bucket.get(bucket, 0) + 1
+    # Capture before any shared snapshot bytes, never at seal/admission time.
+    _capture_migration_spec_bases(root, cycle_dir)
     # Full snapshots of the current shared-kind trees (a revision is a whole copy).
     snapshot_counts: Dict[str, int] = {}
     for bucket, kind in SHARED_SNAPSHOT.items():
@@ -1596,10 +1646,12 @@ def migrate_seal(root: Path, *, run_dir: Path, primary: Optional[str] = None,
         if not staged.is_dir():
             continue
         ref = references.get(kind)
+        base_revision = _migration_spec_base(root, cycle_dir, cycle_id, ref) if kind == "spec" else None
         if ref:
             _adopt_reference(root, kind, ref, title=f"{kind} (W7 reference)")
         admitted[kind] = P.admit_shared(root, cycle_id=cycle_id, kind=kind, source=f"shared-input/{kind}",
-                                        reference_id=ref, key=None if ref else kind, title=f"{kind} snapshot (W7C delta)")
+                                        reference_id=ref, key=None if ref else kind, title=f"{kind} snapshot (W7C delta)",
+                                        base_revision=base_revision)
     report["shared_admissions"] = admitted
     # Rewrite the map: shared snapshot rows now point at the immutable revision.
     mapping = _read_jsonl(run_dir / "compatibility-map.jsonl")

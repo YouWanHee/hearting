@@ -107,12 +107,15 @@ Each clause is one contract line plus the signal that it was violated.
   "camera-ready" request does not by itself add a pause). The one-time entry
   confirmation above is a separate pre-execution contract. *Violation signal:*
   a pause flag added because the task merely feels important.
-- **Proceed autonomously on no answer** — when a question goes unanswered,
-  proceed in the recommended direction with a one-line report; do not ask the
-  same question twice. Reserve a scheduled wake-up for genuinely long waits or
-  large decisions. The required primary-route handshake waits for approval
-  unless the route and scope were already approved. *Violation signal:*
-  blocking on an ordinary question whose answer is obvious or already agreed.
+- **An empty answer is not a decision** — an empty answer or no response from a
+  structured question (`request_user_input`, `AskUserQuestion`, or equivalent)
+  never counts as the user's decision. For a simple, reversible confirmation,
+  proceed with the recommended option and report it briefly. If the work needs
+  a user decision about goals, architecture, destructive actions, external
+  effects, or a large scope, do not proceed with that work: state in one line
+  what decision is pending and end the turn. Previously authorized work remains
+  authorized. *Violation signal:* silence or an empty answer is treated as
+  approval for a consequential choice.
 - **Do not ask what is certain** — reserve questions for genuinely non-obvious
   design, format, destructive, or large-scope decisions, and prefer pre-commit
   exposure over asking. *Violation signal:* over-confirmation on self-evident or
