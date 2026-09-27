@@ -176,15 +176,55 @@ class CutoverTest(unittest.TestCase):
         receipt.write_text('{"schema_version":1,"spec":{}}')
         with self.assertRaises(P.ProducerError) as ctx:
             C.migrate_seal(self.root, run_dir=Path(report["run_dir"]), spec_reference=W7_REF)
-        self.assertEqual(ctx.exception.code, "source-manifest-mismatch")
+        # Finalize replay now verifies the sealed payload before shared admission.
+        self.assertEqual(ctx.exception.code, "already-sealed-mismatch")
+        self.assertEqual(ctx.exception.detail, "completion-evidence")
         receipt.write_bytes(before)
         with self.assertRaises(C.CutoverError) as ctx:
             C.migrate_seal(self.root, run_dir=Path(report["run_dir"]), spec_reference="ref_" + "f" * 32)
         self.assertEqual(ctx.exception.code, "shared-base-reference-mismatch")
         receipt.unlink()
-        with self.assertRaises(C.CutoverError) as ctx:
+        with self.assertRaises(P.ProducerError) as ctx:
             C.migrate_seal(self.root, run_dir=Path(report["run_dir"]), spec_reference=W7_REF)
-        self.assertEqual(ctx.exception.code, "shared-base-required")
+        self.assertEqual(ctx.exception.code, "already-sealed-mismatch")
+        self.assertEqual(ctx.exception.detail, "completion-evidence")
+
+    def test_migration_support_receipt_invalid_before_seal_is_recoverable(self):
+        route, route_file = self.route()
+        report = C.migrate_delta(self.root, census_rows=self.rows, route_file=route_file,
+                                 capability="autopilot-code", intensity="direct", excludes=[],
+                                 approval_receipt_sha256=None, campaign_id=None)
+        self.close(route, route_file)
+        receipt = Path(report["cycle_dir"]) / C.MIGRATION_SPEC_BASES
+        before = receipt.read_bytes()
+        cases = [(None, "shared-base-required"),
+                 (b"{}", "shared-base-invalid"),
+                 (b'{"schema_version":1,"spec":{}}', "shared-base-reference-mismatch")]
+        cases.extend((json.dumps({"schema_version": 1, "spec": {W7_REF: value}}).encode(),
+                      "shared-base-invalid") for value in ("", 0, {}, "bad-revision"))
+        cases.extend((json.dumps({"schema_version": version, "spec": {W7_REF: None}}).encode(),
+                      "shared-base-invalid") for version in (True, 1.0))
+        for contents, reason in cases:
+            with self.subTest(reason=reason):
+                if contents is None:
+                    receipt.unlink()
+                else:
+                    receipt.write_bytes(contents)
+                with self.assertRaises(C.CutoverError) as ctx:
+                    C.migrate_seal(self.root, run_dir=Path(report["run_dir"]), spec_reference=W7_REF)
+                self.assertEqual(ctx.exception.code, reason)
+                self.assertEqual(P.read_cycle_record(self.root, report["cycle_id"])["state"], "open")
+                self.assertFalse((Path(report["cycle_dir"]) / "manifest.json").exists())
+        with mock.patch.object(P, "find_reference_by_key", return_value={"shared_reference_id": W7_REF}):
+            receipt.write_text('{"schema_version":1,"spec":{}}')
+            with self.assertRaises(C.CutoverError) as ctx:
+                C.migrate_seal(self.root, run_dir=Path(report["run_dir"]))
+            self.assertEqual(ctx.exception.code, "shared-base-reference-mismatch")
+            self.assertEqual(P.read_cycle_record(self.root, report["cycle_id"])["state"], "open")
+            self.assertFalse((Path(report["cycle_dir"]) / "manifest.json").exists())
+        receipt.write_bytes(before)
+        self.assertEqual(C.migrate_seal(self.root, run_dir=Path(report["run_dir"]),
+                                      spec_reference=W7_REF)["state"], "sealed")
 
     def test_migrate_delta_copies_candidates_and_snapshots_shared(self):
         report, sealed = self.migrate()

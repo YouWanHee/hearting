@@ -851,9 +851,7 @@ def resolve_cycle_manifest_route(root: Path, record: Mapping[str, Any],
     if not target_check.ok:
         reason = target_check.reasons[0]
         raise ProducerError(reason.code, reason.detail)
-    route = load_route(Path(root), route_path)
-    if route.get("route_id") != route_id or route.get("route_hash") != row.get("route_hash"):
-        raise ProducerError("completion-route-hash-mismatch", route_id)
+    route = load_route(Path(root), route_path, expected_identity=row)
     admission = cycle_route_admission(Path(root), record, route, finalize=True, validation_only=True)
     if not admission.allow:
         raise ProducerError(admission.reason or "route-lineage-unverified", admission.detail)
@@ -979,7 +977,8 @@ def resolve_route_argument(root: Path, value: "str | Path") -> Path:
     return Path(value)
 
 
-def load_route(root: Path, route_file: Path) -> Dict[str, Any]:
+def load_route(root: Path, route_file: Path, *,
+               expected_identity: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
     route_file = resolve_route_argument(root, route_file)
     route = _read_json(Path(route_file))
     if route is None:
@@ -1013,6 +1012,10 @@ def load_route(root: Path, route_file: Path) -> Dict[str, Any]:
             raise ProducerError("route-invalid", "slug is not canonical")
     elif "slug_truncated" in route:
         raise ProducerError("route-invalid", "slug metadata incomplete")
+    if expected_identity is not None and (
+            route.get("route_id") != expected_identity.get("route_id")
+            or route.get("route_hash") != expected_identity.get("route_hash")):
+        raise ProducerError("completion-route-hash-mismatch", str(expected_identity.get("route_id", "")))
     return route
 
 
