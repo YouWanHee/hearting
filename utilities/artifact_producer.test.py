@@ -3273,6 +3273,87 @@ class TerminalTransactionIntegrationTest(ProducerTestBase):
         jobs.write_text("\n".join(lines)+"\n")
         return meta
 
+    def test_official_continuation_owner_settlement_recovers_published_manifest_before_seal(self):
+        import dispatch_terminal_commit as terminal
+
+        source, source_file, jobs, _source_owner, begun, artifact, _source_request = self._prepare_fixture()
+        begin_record = P.read_cycle_record(self.root, begun["cycle_id"])
+        begin_identity = {key: begin_record[key] for key in ("route_id", "route_hash", "route_file")}
+        expected_input_digest = P._digest(P._canonical({
+            "route_id": begin_record["route_id"], "route_hash": begin_record["route_hash"],
+            "capability": begin_record["capability"], "intensity": begin_record["intensity"],
+        }))
+        terminal_node = next(node for node in source["nodes"] if node.get("terminal") is True)
+        first_node = source["nodes"][0]
+        continuation = R.build_continuation_route(
+            source, resume_from_node=first_node["id"], requested_boundary=first_node["id"],
+            reason="terminal-settlement-regression", artifact_root=self.root,
+        )
+        continuation_file = R.canonical_route_path(self.root, continuation["route_id"])
+        R.publish_continuation_route(continuation, source, continuation_file)
+        self.assertTrue(R.bind_continuation_cycle(self.root, source, continuation)["bound"])
+
+        owner = "att-continuation-owner"
+        child = "att-continuation-report"
+        def row(status, slug, metadata):
+            return (f"2026-09-08T00:00:00Z\t{status}\t{R.ROOT}\t{R.ROOT}\t{slug}\t" +
+                    ",".join(f"{key}={value}" for key, value in metadata.items()) + "\n")
+        owner_meta = dict(attempt_id=owner, worker_type="owner", unit="_kernel/owner", dispatch_depth="1",
+            registered_worker="1", harness="claude", owner_route_file=str(continuation_file),
+            owner_route_id=continuation["route_id"], owner_route_hash=continuation["route_hash"])
+        child_meta = dict(attempt_schema_version="2", attempt_id=child, parent_attempt_id=owner,
+            dispatch_depth="2", transport="headless", execution_surface="registered-headless",
+            registered_worker="1", fallback_hop="same-harness-headless", harness="codex",
+            route_id=continuation["route_id"], route_hash=continuation["route_hash"],
+            route_node=terminal_node["id"], failure_class="pass", launch_outcome="reaped-before-publish")
+        jobs.write_text(jobs.read_text() + row("open", "continuation-owner", owner_meta)
+                        + row("open", "continuation-report", child_meta))
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs), "AGENT_ARTIFACT_ROOT": str(self.root)}):
+            resumed = P.begin(self.root, route_file=continuation_file, capability="autopilot-code",
+                               intensity="standard", jobs=jobs, owner_attempt_id=owner)
+            self.assertEqual((resumed["status"], resumed.get("rebound"), resumed["cycle_id"]),
+                             ("resumed", True, begun["cycle_id"]))
+            self.assertEqual(len(P.list_cycle_records(self.root)), 1)
+            self.assertTrue(terminal.load_producer_binding(
+                artifact_root=self.root, route_id=continuation["route_id"], owner_attempt_id=owner).binding)
+            self.assertEqual({key: P.read_cycle_record(self.root, begun["cycle_id"])[key]
+                              for key in begin_identity}, begin_identity)
+
+            continuation_node = next(node for node in continuation["nodes"] if node.get("terminal") is True)
+            R.complete_node(continuation, continuation_node, continuation_node["id"], artifact,
+                            jobs=jobs, attempt_id=child)
+            self._closed_owner(jobs, owner)
+            request = terminal.TerminalCommitRequest(continuation_file, owner, jobs, self.root)
+            proof = terminal.prove_terminal_authority(request)
+            self.assertEqual(proof.status, "proved", proof)
+            commit_path = terminal._commit_state_path(request)
+
+            with mock.patch.object(P, "_commit_sealed", side_effect=RuntimeError("crash-before-seal")):
+                interrupted = terminal.settle_terminal_commit(request)
+            self.assertNotEqual(interrupted.result, "completed", interrupted)
+            manifest = Path(begun["cycle_dir"]) / "manifest.json"
+            published_bytes = manifest.read_bytes()
+            published = json.loads(published_bytes)
+            self.assertEqual(len(published["routes"]), 1)
+            self.assertEqual(published["routes"][0]["route_id"], continuation["route_id"])
+            self.assertEqual(published["cycle"]["input_digest"], expected_input_digest)
+            open_record = P.read_cycle_record(self.root, begun["cycle_id"])
+            self.assertEqual(open_record["state"], "open")
+            self.assertEqual((open_record["route_id"], open_record["route_hash"]),
+                             (begin_identity["route_id"], begin_identity["route_hash"]))
+            self.assertEqual(open_record["route_file"], begin_identity["route_file"])
+
+            recovered = terminal.settle_terminal_commit(request)
+            self.assertEqual(recovered.result, "completed", recovered)
+            sealed_bytes = manifest.read_bytes()
+            commit_id = json.loads(commit_path.read_text())["terminal_commit_id"]
+            self.assertEqual(P.read_cycle_record(self.root, begun["cycle_id"])["state"], "sealed")
+            replay = terminal.settle_terminal_commit(request)
+            self.assertEqual(replay.result, "completed", replay)
+            self.assertEqual(manifest.read_bytes(), sealed_bytes)
+            self.assertEqual(json.loads(commit_path.read_text())["terminal_commit_id"], commit_id)
+            self.assertEqual(json.loads(manifest.read_text())["routes"][0]["route_id"], continuation["route_id"])
+
     def test_executing_owner_uses_same_terminal_proof_before_and_after_settlement(self):
         import dispatch_terminal_commit as terminal
         for harness in ("claude", "codex", "opencode"):
@@ -4122,6 +4203,50 @@ class RouteLineageBindingTest(ProducerTestBase):
             drifted = dict(record, route_hash="sha256:" + "1" * 64)
             admission = P.cycle_route_admission(self.root, drifted, b)
             self.assertEqual(admission.reason, "route-hash-drift")
+
+    def test_manifest_route_resolution_rejects_hash_mismatch_and_symlink_kind(self):
+        source = self._root_route("lineage-manifest-route")
+        source_path = self._publish_root(source)
+        begun = self._begin(source)
+        record = P.read_cycle_record(self.root, begun["cycle_id"])
+        root_identity = L.read_root_identity(self.root)
+        document = {"artifact_root_id": root_identity.artifact_root_id,
+            "cycle": {"cycle_id": begun["cycle_id"]},
+            "routes": [{"artifact_root_id": root_identity.artifact_root_id,
+                "route_id": source["route_id"], "route_hash": source["route_hash"]}]}
+        drifted = json.loads(json.dumps(document))
+        drifted["routes"][0]["route_hash"] = "sha256:" + "f" * 64
+        with self.assertRaises(P.ProducerError) as caught:
+            P.resolve_cycle_manifest_route(self.root, record, drifted)
+        self.assertEqual(caught.exception.code, "completion-route-hash-mismatch")
+
+        backup = source_path.with_suffix(".json.backup")
+        source_path.replace(backup)
+        try:
+            source_path.symlink_to(backup)
+            with self.assertRaises(P.ProducerError) as caught:
+                P.resolve_cycle_manifest_route(self.root, record, document)
+            self.assertEqual(caught.exception.code, "route-lineage-unverified")
+        finally:
+            source_path.unlink(missing_ok=True)
+            backup.replace(source_path)
+
+        child = self._continuation(source)
+        child_document = {"artifact_root_id": root_identity.artifact_root_id,
+            "cycle": {"cycle_id": begun["cycle_id"]},
+            "routes": [{"artifact_root_id": root_identity.artifact_root_id,
+                "route_id": child["route_id"], "route_hash": child["route_hash"]}]}
+        source_backup = source_path.with_suffix(".json.parent-backup")
+        source_path.replace(source_backup)
+        try:
+            source_path.symlink_to(source_backup)
+            with self.assertRaises(P.ProducerError) as caught:
+                P.resolve_cycle_manifest_route(self.root, record, child_document)
+            self.assertEqual(caught.exception.code, "route-lineage-unverified")
+        finally:
+            source_path.unlink(missing_ok=True)
+            source_backup.replace(source_path)
+        self.assertEqual(P.read_cycle_record(self.root, begun["cycle_id"]), record)
 
     # -- A-25.4 -----------------------------------------------------------
     def test_a25_4_owner_begin_on_continuation_rebinds(self):

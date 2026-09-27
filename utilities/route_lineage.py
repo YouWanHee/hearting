@@ -19,6 +19,7 @@ subprocess calls.
 from __future__ import annotations
 
 import json
+import stat
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -62,6 +63,13 @@ def verified_route_lineage(route: Dict[str, Any], *, artifact_root: Optional[Any
         if not isinstance(parent_id, str) or not parent_id or parent_id in seen:
             raise RouteLineageError("route-lineage-unverified", f"cycle-or-missing-parent:{parent_id}")
         parent_path = canonical_route_path(root, parent_id)
+        try:
+            parent_stat = parent_path.lstat()
+        except OSError as exc:
+            raise RouteLineageError("route-lineage-unverified", f"parent-unreadable:{parent_id}") from exc
+        if (not stat.S_ISREG(parent_stat.st_mode) or parent_path.is_symlink()
+                or parent_path.resolve() != parent_path):
+            raise RouteLineageError("route-lineage-unverified", f"parent-kind-or-path:{parent_id}")
         try:
             raw = parent_path.read_text(encoding="utf-8")
         except OSError as exc:

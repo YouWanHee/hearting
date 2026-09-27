@@ -9,6 +9,7 @@ from unittest import mock
 
 import dispatch_terminal_commit as T
 import owner_route_binding
+import artifact_producer
 
 # The one already-loaded handle on capability-route.py; the quick-branch tests
 # below compile a real quick route rather than hand-rolling one, so the route
@@ -50,16 +51,61 @@ class ProducerBindingTests(unittest.TestCase):
     @mock.patch.object(owner_route_binding, "resolve_owner_route_lifecycle")
     def test_publish_replay_and_conflict(self, resolve, _identity):
         resolve.return_value = (owner_route_binding.OwnerRouteBinding(str(self.route_file), "rt-abcdef12", "sha256:" + "a" * 64), "current")
-        first = T.publish_producer_binding(artifact_root=self.root, jobs=self.jobs, route_file=self.route_file,
-                                           owner_attempt_id="att-owner", cycle_id=self.cycle_id, owner_begin=True)
-        second = T.publish_producer_binding(artifact_root=self.root, jobs=self.jobs, route_file=self.route_file,
-                                            owner_attempt_id="att-owner", cycle_id=self.cycle_id, owner_begin=True)
+        with mock.patch.object(artifact_producer, "cycle_route_admission",
+                               return_value=SimpleNamespace(allow=True)):
+            first = T.publish_producer_binding(artifact_root=self.root, jobs=self.jobs, route_file=self.route_file,
+                                               owner_attempt_id="att-owner", cycle_id=self.cycle_id, owner_begin=True)
+            second = T.publish_producer_binding(artifact_root=self.root, jobs=self.jobs, route_file=self.route_file,
+                                                owner_attempt_id="att-owner", cycle_id=self.cycle_id, owner_begin=True)
         self.assertEqual(first.digest, second.digest)
         self.assertTrue(second.replay)
         with self.assertRaises(T.TerminalCommitError) as caught:
             T.publish_producer_binding(artifact_root=self.root, jobs=self.jobs, route_file=self.route_file,
                                        owner_attempt_id="att-owner", cycle_id="cyc_" + "d" * 32, owner_begin=True)
         self.assertEqual(caught.exception.code, "producer-binding-mismatch")
+
+    def _record_begun_by(self, route_id, route_hash):
+        path = self.root / ".runtime/artifact-producer/v1/cycles" / (self.cycle_id + ".json")
+        record = json.loads(path.read_text())
+        record.update(route_id=route_id, route_hash=route_hash)
+        path.write_bytes(json.dumps(record, sort_keys=True, separators=(",", ":")).encode())
+
+    @mock.patch.object(T.artifact_lifecycle, "read_root_identity", return_value=SimpleNamespace(repository_id="repo_x", artifact_root_id="root_y"))
+    @mock.patch.object(owner_route_binding, "resolve_owner_route_lifecycle")
+    def test_continuation_owner_binds_the_cycle_its_verified_ancestor_began(self, resolve, _identity):
+        resolve.return_value = (owner_route_binding.OwnerRouteBinding(str(self.route_file), "rt-abcdef12", "sha256:" + "a" * 64), "current")
+        parent = {"route_id": "rt-parent01", "route_hash": "sha256:" + "p" * 64}
+        self._record_begun_by(parent["route_id"], parent["route_hash"])
+        own = {"route_id": "rt-abcdef12", "route_hash": "sha256:" + "a" * 64}
+        with mock.patch.object(artifact_producer, "cycle_route_admission",
+                               return_value=SimpleNamespace(allow=True)) as admission:
+            result = T.publish_producer_binding(artifact_root=self.root, jobs=self.jobs, route_file=self.route_file,
+                                                owner_attempt_id="att-owner", cycle_id=self.cycle_id, owner_begin=True)
+        self.assertEqual(admission.call_args.args[2], own)
+        self.assertEqual(admission.call_args.args[1]["route_id"], parent["route_id"])
+        self.assertEqual(result.binding["route_id"], "rt-abcdef12")
+        self.assertEqual(result.binding["cycle_id"], self.cycle_id)
+
+    @mock.patch.object(T.artifact_lifecycle, "read_root_identity", return_value=SimpleNamespace(repository_id="repo_x", artifact_root_id="root_y"))
+    @mock.patch.object(owner_route_binding, "resolve_owner_route_lifecycle")
+    def test_a_cycle_begun_outside_the_lineage_or_under_another_hash_stays_refused(self, resolve, _identity):
+        resolve.return_value = (owner_route_binding.OwnerRouteBinding(str(self.route_file), "rt-abcdef12", "sha256:" + "a" * 64), "current")
+        own = {"route_id": "rt-abcdef12", "route_hash": "sha256:" + "a" * 64}
+        parent = {"route_id": "rt-parent01", "route_hash": "sha256:" + "p" * 64}
+        cases = (
+            ("rt-stranger", "sha256:" + "s" * 64, [own, parent]),
+            ("rt-parent01", "sha256:" + "x" * 64, [own, parent]),
+            ("rt-parent01", "sha256:" + "p" * 64, T.route_lineage.RouteLineageError("route-lineage-unverified", "x")),
+        )
+        for begin_id, begin_hash, lineage in cases:
+            with self.subTest(begin=begin_id, hash=begin_hash[-4:]):
+                self._record_begun_by(begin_id, begin_hash)
+                denied = SimpleNamespace(allow=False, reason="cycle-route-binding-mismatch", detail="fixture")
+                with mock.patch.object(artifact_producer, "cycle_route_admission", return_value=denied), \
+                        self.assertRaises(T.TerminalCommitError) as caught:
+                    T.publish_producer_binding(artifact_root=self.root, jobs=self.jobs, route_file=self.route_file,
+                                               owner_attempt_id="att-owner", cycle_id=self.cycle_id, owner_begin=True)
+                self.assertEqual((caught.exception.code, caught.exception.detail), ("producer-binding-mismatch", "cycle-route"))
 
     def test_path_is_single_safe_derivation_and_digest_is_bytes(self):
         path = T.producer_binding_path(self.root, "rt-abcdef12", "att-owner")
@@ -173,6 +219,7 @@ class ProducerBindingTests(unittest.TestCase):
              mock.patch.object(T, "producer_lifecycle_applies", return_value=True), \
              mock.patch.object(T, "_route_module") as route_module, \
              mock.patch.object(T, "load_producer_binding", return_value=binding), \
+             mock.patch.object(artifact_producer, "cycle_route_admission", return_value=SimpleNamespace(allow=True)), \
              mock.patch("artifact_producer._live_review_lease", return_value=None):
             route_module.return_value.terminal_gate_observation.return_value = {"route": {"passed": True}}
             proof = T.prove_terminal_authority(T.TerminalCommitRequest(
@@ -189,6 +236,53 @@ class ProducerBindingTests(unittest.TestCase):
             rejected = T.prove_terminal_authority(T.TerminalCommitRequest(
                 self.route_file, "att-owner", self.jobs, self.root))
         self.assertEqual((rejected.status, rejected.reason), ("rejected", "producer-binding-mismatch"))
+        after = sorted((str(path.relative_to(self.root)), path.read_bytes())
+                       for path in self.root.rglob("*") if path.is_file())
+        self.assertEqual(before, after)
+
+
+class ContinuationTerminalSettlementTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.route_file = self.root / "route.json"
+        self.jobs = self.root / "jobs.log"
+        self.jobs.write_text("", encoding="utf-8")
+        self.route = {"route_id": "rt-a3fixture", "route_hash": "sha256:" + "a" * 64,
+            "nodes": [{"id": "execute", "terminal": True}],
+            "workflow_contract": {"terminal_nodes": ["execute"]},
+            "capability": "fixture-cap", "capability_mode": "default"}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_terminal_proof_uses_shared_lineage_admission_before_any_settlement_mutation(self):
+        route = dict(self.route, capability="autopilot-code", effective_intensity="standard")
+        seal_fixture_route(route, self.route_file, self.root, self.jobs, "att-a3fixture")
+        owner = owner_route_binding.OwnerRouteBinding(
+            str(self.route_file), route["route_id"], route["route_hash"])
+        cycle_id = "cyc_" + "d" * 32
+        cycle = {"cycle_id": cycle_id, "campaign_id": "camp_" + "b" * 32,
+            "producer_id": "prod_" + "c" * 32, "route_id": route["route_id"],
+            "route_hash": route["route_hash"], "route_file": str(self.route_file),
+            "capability": route["capability"], "intensity": route["effective_intensity"], "state": "open"}
+        cycle_path = self.root / ".runtime/artifact-producer/v1/cycles" / f"{cycle_id}.json"
+        cycle_path.parent.mkdir(parents=True, exist_ok=True)
+        cycle_path.write_text(json.dumps(cycle), encoding="utf-8")
+        binding = SimpleNamespace(binding={"route_hash": route["route_hash"], "cycle_id": cycle_id,
+            "cycle_record_digest": T.cycle_identity_digest(cycle)})
+        before = sorted((str(path.relative_to(self.root)), path.read_bytes())
+                        for path in self.root.rglob("*") if path.is_file())
+        denied = SimpleNamespace(allow=False, reason="cycle-route-binding-mismatch:lineage-fork", detail="fork")
+        with mock.patch.object(T, "validate_owner_route", return_value=owner), \
+             mock.patch.object(T, "producer_lifecycle_applies", return_value=True), \
+             mock.patch.object(T, "load_producer_binding", return_value=binding), \
+             mock.patch.object(T, "_route_module") as route_module, \
+             mock.patch.object(artifact_producer, "cycle_route_admission", return_value=denied):
+            route_module.return_value.terminal_gate_observation.return_value = {"execute": {"passed": True}}
+            proof = T.prove_terminal_authority(T.TerminalCommitRequest(
+                self.route_file, "att-a3fixture", self.jobs, self.root))
+        self.assertEqual((proof.status, proof.reason), ("rejected", "producer-binding-mismatch"))
         after = sorted((str(path.relative_to(self.root)), path.read_bytes())
                        for path in self.root.rglob("*") if path.is_file())
         self.assertEqual(before, after)

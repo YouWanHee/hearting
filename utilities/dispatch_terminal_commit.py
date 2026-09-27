@@ -19,6 +19,7 @@ from contextlib import contextmanager
 
 import artifact_lifecycle
 import route_identity
+import route_lineage
 import dispatch_contract
 import dispatch_lock_order
 from dispatch_attempt_policy import verdict_pass
@@ -529,7 +530,9 @@ def publish_producer_binding(*, artifact_root: Path, jobs: Path, route_file: Pat
         raise TerminalCommitError("producer-binding-mismatch", f"cycle:{cycle_id}") from exc
     if not isinstance(record, dict) or record.get("cycle_id") != cycle_id or record.get("state") != "open":
         raise TerminalCommitError("producer-binding-mismatch", f"cycle:{cycle_id}")
-    if record.get("route_id") != owner.route_id or record.get("route_hash") != owner.route_hash:
+    producer = __import__("artifact_producer")
+    admission = producer.cycle_route_admission(root, record, route)
+    if not admission.allow:
         raise TerminalCommitError("producer-binding-mismatch", "cycle-route")
     if identity is None:
         raise TerminalCommitError("producer-binding-mismatch", "root-identity")
@@ -750,11 +753,14 @@ def prove_terminal_authority(request: TerminalCommitRequest) -> TerminalProof:
                 return _proof_failure("producer-binding-mismatch")
             cycle_path = Path(request.artifact_root).resolve() / ".runtime/artifact-producer/v1/cycles" / f"{binding.binding['cycle_id']}.json"
             cycle = json.loads(cycle_path.read_text(encoding="utf-8"))
-            if cycle.get("state") != "open" or cycle.get("route_hash") not in (None, route["route_hash"]):
+            if cycle.get("state") != "open":
                 return _proof_failure("binding-cycle-not-open")
             if cycle_identity_digest(cycle) != binding.binding.get("cycle_record_digest"):
                 return _proof_failure("producer-binding-mismatch", "cycle-identity-drift")
             producer = __import__("artifact_producer")
+            admission = producer.cycle_route_admission(Path(request.artifact_root).resolve(), cycle, route)
+            if not admission.allow:
+                return _proof_failure("producer-binding-mismatch", "cycle-route")
             if _producer_operation(producer._live_review_lease,
                     Path(request.artifact_root), binding.binding["cycle_id"]):
                 return _proof_failure("active-review-lease")

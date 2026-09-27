@@ -593,20 +593,42 @@ def evaluate_cycle_completion(
     if not payload_check.ok:
         return payload_check
     root = Path(route_file).resolve().parents[2]
+    rows = document.get("routes", []) if isinstance(document, Mapping) else []
+    if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], Mapping):
+        return Decision("reject", (_violation("completion-route-composite-mismatch"),))
+    selected_route_file = Path(route_file)
+    cycle_id = cycle.get("cycle_id") if isinstance(cycle, Mapping) else None
+    if isinstance(cycle_id, str) and artifact_identity.is_well_formed(cycle_id, "cycle"):
+        record_path = root / ".runtime" / "artifact-producer" / "v1" / "cycles" / f"{cycle_id}.json"
+        try:
+            record_present = record_path.lstat() is not None
+        except FileNotFoundError:
+            record_present = False
+        except OSError as exc:
+            return Decision("reject", (_violation("cycle-prior-descriptor-unverified", detail=str(exc)),))
+        if record_present:
+            try:
+                import artifact_producer
+                record = artifact_producer.read_cycle_record(root, cycle_id)
+                if record is None:
+                    raise artifact_producer.ProducerError("cycle-record-unreadable", cycle_id)
+                selected_route_file, _selected_route = artifact_producer.resolve_cycle_manifest_route(
+                    root, record, document)
+            except Exception as exc:  # noqa: BLE001 -- lineage failures are a closed lifecycle rejection
+                code = getattr(exc, "code", "completion-route-lineage-unverified")
+                detail = getattr(exc, "detail", str(exc))
+                return Decision("reject", (_violation(code, detail=detail),))
     try:
         binding, route = bind_existing_runtime_route(
             root,
-            route_file,
+            selected_route_file,
             expected_root_id=expected_root_id or document.get("artifact_root_id"),
         )
     except LifecycleError as exc:
         return Decision("reject", (_violation(exc.code, detail=exc.detail),))
-    route_rows = [
-        row
-        for row in document.get("routes", [])
-        if row.get("artifact_root_id") == binding.artifact_root_id
-        and row.get("route_id") == binding.route_id
-    ]
+    route_rows = [row for row in rows
+                  if row.get("artifact_root_id") == binding.artifact_root_id
+                  and row.get("route_id") == binding.route_id]
     if len(route_rows) != 1:
         return Decision("reject", (_violation("completion-route-composite-mismatch"),))
     route_row = route_rows[0]
