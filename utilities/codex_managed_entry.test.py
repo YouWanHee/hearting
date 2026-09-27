@@ -65,7 +65,15 @@ class ManagedEntryTest(unittest.TestCase):
                 listen = sys.argv[sys.argv.index('--listen') + 1]
                 path = listen[len('unix://'):] if listen.startswith('unix://') else listen
                 server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                server.bind(path)
+                daemon = os.environ.get('FAKE_DAEMON_DIR')
+                if daemon:
+                    # Codex 0.157: bind in a private short-path daemon dir and
+                    # leave a symlink at the requested --listen path.
+                    real = os.path.join(daemon, 'bound.sock')
+                    server.bind(real)
+                    os.symlink(real, path)
+                else:
+                    server.bind(path)
                 server.listen(1)
                 stop = False
                 def end(*_args):
@@ -75,6 +83,8 @@ class ManagedEntryTest(unittest.TestCase):
                 while not stop:
                     time.sleep(0.02)
                 server.close()
+                if daemon:
+                    os.unlink(real)
                 """
             ).replace("__ARGV_LOG__", repr(str(self.argv_log))),
             encoding="utf-8",
@@ -175,6 +185,50 @@ class ManagedEntryTest(unittest.TestCase):
                 for name in ("app-server.sock", "managed-tui.sock", "managed-control.sock"):
                     self.assertFalse((self.state / name).exists())
                 self.assertEqual(sentinel.read_bytes(), b"preserve\n")
+
+    def test_app_server_socket_behind_a_symlink_is_ready_and_cleaned(self) -> None:
+        # 2026-09-27 (Codex 0.157.1): the App Server bound its socket under
+        # /tmp/codex-daemon-<uid>/ and linked the requested path to it; the
+        # entry timed out on the link and killed a healthy App Server.
+        daemon = self.base / "daemon"
+        daemon.mkdir(mode=0o700)
+        with mock.patch.dict(os.environ, {"FAKE_DAEMON_DIR": str(daemon)}, clear=False):
+            result = subprocess.run(self.command(), text=True, capture_output=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertTrue(self.result.exists())
+        for name in ("app-server.sock", "managed-tui.sock", "managed-control.sock"):
+            self.assertFalse(os.path.lexists(self.state / name), name)
+
+    def test_socket_ready_accepts_only_a_link_to_our_private_socket(self) -> None:
+        import importlib.util
+        import socket
+        spec = importlib.util.spec_from_file_location("codex_managed_entry_mod", ENTRY)
+        entry = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(entry)
+        private = self.base / "private"
+        private.mkdir(mode=0o700)
+        shared = self.base / "shared"
+        shared.mkdir()
+        os.chmod(shared, 0o777)
+        servers = []
+        for directory in (private, shared):
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.bind(str(directory / "s.sock"))
+            servers.append(server)
+        self.addCleanup(lambda: [server.close() for server in servers])
+        (self.base / "file").write_text("x", encoding="utf-8")
+        cases = {
+            "direct-socket": (private / "s.sock", None, True),
+            "link-private": (self.state / "a.sock", private / "s.sock", True),
+            "link-shared-dir": (self.state / "b.sock", shared / "s.sock", False),
+            "link-regular-file": (self.state / "c.sock", self.base / "file", False),
+            "link-relative": (self.state / "d.sock", Path("s.sock"), False),
+        }
+        for name, (path, target, expected) in cases.items():
+            with self.subTest(name):
+                if target is not None:
+                    os.symlink(target, path)
+                self.assertEqual(entry.socket_ready(path), expected)
 
     def test_nonprivate_state_dir_fails_before_process_start(self) -> None:
         os.chmod(self.state, 0o755)

@@ -229,13 +229,39 @@ def check_runtime(codex: str, workspace: Path, environment: dict[str, str]) -> s
     return feature_capability(codex, workspace, environment)
 
 
+def socket_ready(path: Path) -> bool:
+    """Whether `path` is the App Server's listening socket.
+
+    Codex 0.157 binds the socket in its own short-path daemon directory
+    (e.g. /tmp/codex-daemon-<uid>/<hash>) and leaves a symlink at the
+    requested --listen path; an lstat-only check never saw a socket there and
+    the entry killed a healthy App Server after 20 s (2026-09-27). A link is
+    accepted only when it and its target are ours: the link is owned by this
+    user, the target is an absolute path to a socket owned by this user, and
+    the target's directory is owned by this user and not group/other writable.
+    """
+    info = path.lstat()
+    if stat.S_ISSOCK(info.st_mode):
+        return True
+    if not stat.S_ISLNK(info.st_mode) or info.st_uid != os.geteuid():
+        return False
+    target = Path(os.readlink(path))
+    if not target.is_absolute():
+        return False
+    target_info = target.lstat()
+    parent_info = target.parent.lstat()
+    return (stat.S_ISSOCK(target_info.st_mode) and target_info.st_uid == os.geteuid()
+            and stat.S_ISDIR(parent_info.st_mode) and parent_info.st_uid == os.geteuid()
+            and not parent_info.st_mode & 0o022)
+
+
 def wait_socket(path: Path, process: subprocess.Popen[Any], timeout: float) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if process.poll() is not None:
             raise EntryError(f"process-exited-before-socket:{process.returncode}")
         try:
-            if stat.S_ISSOCK(path.lstat().st_mode):
+            if socket_ready(path):
                 return
         except FileNotFoundError:
             pass
@@ -261,13 +287,14 @@ def terminate(process: subprocess.Popen[Any] | None) -> None:
 
 
 def cleanup_socket(path: Path) -> None:
-    """Remove only an exact leftover socket inside the explicit state dir."""
+    """Remove only an exact leftover socket, or the App Server's link to its
+    socket, inside the explicit state dir -- never a link's target."""
 
     try:
         info = path.lstat()
     except FileNotFoundError:
         return
-    if stat.S_ISSOCK(info.st_mode):
+    if stat.S_ISSOCK(info.st_mode) or stat.S_ISLNK(info.st_mode):
         path.unlink()
 
 
