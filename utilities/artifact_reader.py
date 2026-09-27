@@ -45,8 +45,8 @@ def _is_real_dir(path: Path) -> bool:
     return path.is_dir() and not os.path.islink(str(path))
 
 
-def _cycle_state(cycle_dir: Path) -> str:
-    return "sealed" if (cycle_dir / "manifest.json").is_file() else "open"
+def _cycle_state(root: Path, campaign_dir: Path, cycle_dir: Path) -> str:
+    return "sealed" if artifact_locator._exact_cycle_manifest(root, campaign_dir, cycle_dir) is not None else "open"
 
 
 class _ReadScope:
@@ -137,7 +137,7 @@ def _cycle_bucket_dirs(root: Path, bucket: str) -> List[Tuple[Path, Dict[str, st
             target = cyc / "artifacts" / bucket
             if _is_real_dir(target):
                 out.append((target, {"layout": LAYOUT_CYCLE, "campaign_id": campaign_id, "cycle_id": cycle_id,
-                                     "cycle_state": _cycle_state(cyc)}))
+                                     "cycle_state": _cycle_state(root, camp, cyc)}))
     return out
 
 

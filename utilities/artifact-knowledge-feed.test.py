@@ -72,6 +72,40 @@ def run_main(argv: list[str]) -> tuple[int, str, str]:
 
 
 class FeedUnitTests(unittest.TestCase):
+    def test_nested_manifest_is_inventory_payload_with_exact_cycle_control_binding(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "root"
+            campaign = root / "campaigns" / "camp_fixture"
+            cycle_dir = campaign / "cyc_fixture"
+            entry = cycle_dir / "artifacts" / "plans" / "entry"
+            payload_dir = entry / "_internal" / "candidate" / "round_1"
+            payload_dir.mkdir(parents=True)
+            control_manifest = cycle_dir / "manifest.json"
+            control_manifest.write_text(json.dumps({"cycle": {"cycle_id": "cyc_fixture"}}),
+                                        encoding="utf-8")
+            payload = payload_dir / "manifest.json"
+            payload_bytes = b'{"cycle":{"cycle_id":"cyc_spoof"}}\n'
+            payload.write_bytes(payload_bytes)
+            (entry / "final_report.md").write_text("summary", encoding="utf-8")
+            cycle = feed.Cycle(feed._locator(root, entry, directory=True), "plans", entry, False, ())
+            inventory = [{
+                "locator": feed._locator(root, payload), "kind": "file",
+                "mode": 0o644, "mtime_ns": 1, "size": len(payload_bytes),
+                "digest": feed.digest(payload_bytes),
+            }]
+            selected = feed._cycle_inventory_rows(root, inventory, cycle)
+            self.assertEqual(selected, inventory)
+            row = feed._row(root, cycle, {
+                "legacy_key_id": "lk_" + "1" * 32,
+                "migration_id": "mig_" + "2" * 32,
+            }, inventory)
+            self.assertEqual(Path(row["manifest_path"]),
+                             Path(feed._locator(root, control_manifest)))
+            self.assertEqual(row["producer_evidence"]["manifest_digest"],
+                             feed.digest(control_manifest.read_bytes()))
+            self.assertEqual(row["integrity"]["source_digest"],
+                             feed.digest(feed.canonical(inventory)))
+
     def test_opaque_migration_identity_does_not_use_locator(self):
         key = "lk_" + "ab" * 16
         self.assertEqual(feed.migration_id(key), feed.migration_id(key))

@@ -33,6 +33,39 @@ CONTRACT = "artifact-campaign-closure/v2"
 LEGACY_EVENT_NAME = "campaign.satisfied.json"
 EVENTS_DIR = locator.CAMPAIGN_EVENTS_DIR
 DEFAULT_COMPLETION_CRITERION = "every cycle sealed with a manifest"
+
+
+def _exact_cycle_control(root: Path, campaign_dir: Path, cycle_dir: Path, name: str) -> bool:
+    path = cycle_dir / name
+    try:
+        mode = os.lstat(path).st_mode
+    except OSError:
+        return False
+    if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+        return False
+    return manifest.classify_artifact_path(
+        str(root), campaign_dir.relative_to(root).as_posix(),
+        cycle_dir.relative_to(root).as_posix(), "control",
+        path.relative_to(root).as_posix(), "regular",
+    ).allowed
+
+
+def _exact_campaign_control(root: Path, campaign_path_value: Path, path: Path,
+                            *, prospective: bool = False) -> bool:
+    campaign_dir = Path(campaign_path_value).parent
+    try:
+        mode = os.lstat(path).st_mode
+        node_kind = ("symlink" if stat.S_ISLNK(mode) else
+                    "regular" if stat.S_ISREG(mode) else
+                    "directory" if stat.S_ISDIR(mode) else "special")
+    except FileNotFoundError:
+        node_kind = "missing"
+    except OSError:
+        node_kind = "special"
+    return manifest.classify_artifact_path(
+        str(root), campaign_dir.relative_to(root).as_posix(), None, "control",
+        Path(path).relative_to(root).as_posix(), node_kind, prospective=prospective,
+    ).allowed
 STATE_FIELDS = ("state", "satisfied_on", "satisfaction_event_id")
 _RUNTIME_SESSION_ENV = (("CLAUDE_CODE_SESSION_ID", "claude"),
                         ("CODEX_THREAD_ID", "codex"),
@@ -185,6 +218,8 @@ def _validate_v1(root, path, record):
         raise CampaignError("campaign-symlink", event_path)
     if not event_path.exists():
         return None
+    if not _exact_campaign_control(root, path, event_path):
+        raise CampaignError("campaign-event-invalid", {"path": str(event_path), "detail": "control-path-required"})
     event, raw = read_json(root, event_path)
     violations = []
     manifest._v_event_row(event, "$", violations)
@@ -227,6 +262,8 @@ def _read_stream(root, path, record, start_sequence, stream_id):
         sequence = int(match.group(1))
         if entry.is_symlink():
             raise CampaignError("campaign-symlink", entry)
+        if not _exact_campaign_control(root, path, entry):
+            raise CampaignError("campaign-event-invalid", {"path": str(entry), "detail": "control-path-required"})
         event, raw = read_json(root, entry)
         _validate_event_row(root, entry, event, raw, sequence, record.get("campaign_id"), stream_id)
         payload = event.get("payload")
@@ -455,9 +492,9 @@ def _cycle_rows(root, path, campaign):
     directories = {}
     for entry, layout in locator.iter_cycle_dirs(path.parent):
         _safe(path.parent, entry)
-        if (entry / ".cycle.json").exists():
+        if _exact_cycle_control(root, path.parent, entry, ".cycle.json"):
             binding, _ = read_json(root, entry / ".cycle.json")
-        elif (entry / "manifest.json").exists():
+        elif _exact_cycle_control(root, path.parent, entry, "manifest.json"):
             # Historical sealed cycles predate .cycle.json. Their immutable
             # manifest plus producer record and index still prove the binding.
             document, _ = read_json(root, entry / "manifest.json")
@@ -492,6 +529,8 @@ def _cycle_rows(root, path, campaign):
                               else path.parent / "cycles" / cid)
         if directory != expected_directory:
             raise CampaignError("campaign-cycle-locator-invalid", cid)
+        if not _exact_cycle_control(root, path.parent, directory, "manifest.json"):
+            raise CampaignError("campaign-manifest-invalid", cid + ": exact-control-path-required")
         document, raw = read_json(root, directory / "manifest.json")
         report = manifest.validate(document)
         if not report.ok:
@@ -628,6 +667,8 @@ def _publish_event(root, path, event):
             os.close(parent_fd)
     target = directory / ("%06d.json" % event["stream_sequence"])
     _safe(root, target)
+    if not _exact_campaign_control(root, path, target, prospective=True):
+        raise CampaignError("campaign-event-invalid", {"path": str(target), "detail": "control-path-required"})
     fd, tmp = tempfile.mkstemp(prefix=".campaign-event-", dir=directory)
     try:
         with os.fdopen(fd, "wb") as stream:

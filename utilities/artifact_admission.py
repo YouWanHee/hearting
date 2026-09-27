@@ -471,7 +471,10 @@ def _verify_staging_source(
                 )
             )
             continue
-        if rel != "manifest.json" and rel not in declared_paths:
+        root_manifest = artifact_manifest.classify_artifact_path(
+            str(source), None, "", "control", rel, "regular",
+        ).allowed
+        if not root_manifest and rel not in declared_paths:
             violations.append(
                 Violation(
                     "staging-undeclared-extra-file",
@@ -545,7 +548,10 @@ def _verify_staged_files(
         if entry.is_file() and not os.path.islink(str(entry)):
             rel = os.path.relpath(str(entry), str(cycle_content_dir))
             rel = rel.replace(os.sep, "/")
-            if rel == "manifest.json":
+            root_manifest = artifact_manifest.classify_artifact_path(
+                str(cycle_content_dir), None, "", "control", rel, "regular",
+            ).allowed
+            if root_manifest:
                 continue
             all_files.add(rel)
     extra = all_files - declared_paths

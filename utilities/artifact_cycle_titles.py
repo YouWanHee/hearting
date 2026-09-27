@@ -495,6 +495,7 @@ def _cycle_record(root: Path, cycle_id: str) -> Optional[Dict[str, Any]]:
 
 
 def _walk_manifests(root: Path) -> Dict[str, List[Path]]:
+    found: Dict[str, List[Path]] = {}
     campaigns = root / "campaigns"
     try:
         info = campaigns.lstat()
@@ -502,32 +503,25 @@ def _walk_manifests(root: Path) -> Dict[str, List[Path]]:
         raise CycleTitlesError("campaigns-directory-required")
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
         raise CycleTitlesError("campaigns-directory-required")
-    found: Dict[str, List[Path]] = {}
-    stack = [campaigns]
-    while stack:
-        current = stack.pop()
-        try:
-            entries = list(os.scandir(current))
-        except OSError:
-            continue
-        for entry in entries:
-            try:
-                is_real_dir = entry.is_dir(follow_symlinks=False)
-            except OSError:
-                continue
-            if is_real_dir:
-                stack.append(Path(entry.path))
-                continue
-            if entry.name != "manifest.json":
-                continue
-            path = Path(entry.path)
+    # Cycle identity is discovered only through the canonical campaign/cycle
+    # layout.  Recursive basename search lets payload manifests spoof cycles.
+    for campaign in artifact_locator.iter_campaign_dirs(root):
+        campaign_rel = campaign.relative_to(root).as_posix()
+        for cycle_path, _layout in artifact_locator.iter_cycle_dirs(campaign):
+            cycle_rel = cycle_path.relative_to(root).as_posix()
+            path = cycle_path / "manifest.json"
             try:
                 lst = path.lstat()
             except OSError:
-                found.setdefault("__unparseable__", []).append(path)
                 continue
             if stat.S_ISLNK(lst.st_mode) or not stat.S_ISREG(lst.st_mode):
                 found.setdefault("__unparseable__", []).append(path)
+                continue
+            classification = artifact_manifest.classify_artifact_path(
+                str(root), campaign_rel, cycle_rel, "control",
+                path.relative_to(root).as_posix(), "regular",
+            )
+            if not classification.allowed:
                 continue
             parsed = _read_json(path)
             cycle = parsed.get("cycle") if isinstance(parsed, dict) else None

@@ -20,6 +20,11 @@ import artifact_admission as adm
 import artifact_identity as idm
 import artifact_manifest as m
 
+_CORPUS_SPEC = importlib.util.spec_from_file_location(
+    "shared_artifact_path_corpus_lifecycle", Path(__file__).with_name("artifact_manifest.test.py"))
+_CORPUS = importlib.util.module_from_spec(_CORPUS_SPEC)
+_CORPUS_SPEC.loader.exec_module(_CORPUS)
+
 P = Path(__file__).with_name("capability-route.py")
 _S = importlib.util.spec_from_file_location("route_for_lifecycle_test", P)
 R = importlib.util.module_from_spec(_S)
@@ -204,6 +209,37 @@ def _cycle(**kw):
 
 
 class ArtifactLifecycleCycleTest(LifecycleTestBase):
+    def test_shared_classifier_corpus_matches_lifecycle_payload_verification(self):
+        rows = [row for row in _CORPUS.SHARED_PATH_CORPUS if row[0] in {"payload", "locator"}]
+        for index, (namespace, relative, kind, _prospective, allowed, reason, public_reasons) in enumerate(rows):
+            with self.subTest(namespace=namespace, path=relative), tempfile.TemporaryDirectory() as scratch:
+                cycle_root = Path(scratch) / "cycle"
+                cycle_root.mkdir()
+                if namespace == "payload" and relative.startswith("campaigns/camp/cyc/"):
+                    locator = relative[len("campaigns/camp/cyc/"):]
+                else:
+                    locator = relative
+                target = cycle_root / locator
+                target.parent.mkdir(parents=True, exist_ok=True)
+                data = b"corpus payload\n"
+                if kind == "symlink":
+                    outside = Path(scratch) / "outside"
+                    outside.write_bytes(data)
+                    target.symlink_to(outside)
+                else:
+                    target.write_bytes(data)
+                document = {"artifact_revisions": [{
+                    "locator": {"path": locator}, "byte_size": len(data),
+                    "content_digest": m.digest_bytes(data), "media_type": "application/octet-stream",
+                }]}
+                decision = L.verify_published_payload(cycle_root, document)
+                self.assertEqual(decision.status == "verified", allowed, relative)
+                if not allowed:
+                    detail = decision.reasons[0].detail
+                    failure = detail.split(";")[0]
+                    typed_reason = failure.rsplit(":", 1)[-1] if failure.startswith("locator-invalid:") else failure.split(":", 1)[0]
+                    self.assertEqual(typed_reason, public_reasons.get("lifecycle", reason), (relative, detail))
+
     # P1 -- identical input_digest, compatible criterion, prior active.
     def test_compatible_unresolved_resume_preserves_cycle_id(self):
         prior = _cycle()
@@ -299,6 +335,32 @@ class ArtifactLifecycleCycleTest(LifecycleTestBase):
 class ArtifactLifecycleCompletionTest(LifecycleTestBase):
     """Baseline-and-mutate: one fully wired `complete` fixture (route, marker,
     outcome, manifest) plus targeted mutations for each N9-N16/P2/P6 case."""
+
+    def test_nested_manifest_payload_is_verified_and_symlink_ancestor_is_rejected(self):
+        content = Path(self._tmp.name) / "payload-root"
+        locator = "artifacts/_internal/candidate/round_1/manifest.json"
+        payload = content / locator
+        payload.parent.mkdir(parents=True)
+        data = b'{"ordinary":"payload"}\n'
+        payload.write_bytes(data)
+        document = {"artifact_revisions": [{
+            "locator": {"path": locator}, "byte_size": len(data),
+            "content_digest": m.digest_bytes(data), "media_type": "application/json",
+        }]}
+        self.assertTrue(m.validate_locator_path(locator).ok)
+        self.assertEqual(L.verify_published_payload(content, document).status, "verified")
+
+        outside = Path(self._tmp.name) / "outside"
+        outside.mkdir()
+        (outside / "manifest.json").write_bytes(data)
+        (content / "artifacts" / ".cache").symlink_to(outside, target_is_directory=True)
+        unsafe = json.loads(json.dumps(document))
+        unsafe["artifact_revisions"][0]["locator"]["path"] = "artifacts/.cache/manifest.json"
+        unsafe["artifact_revisions"][0]["content_digest"] = m.digest_bytes(data)
+        decision = L.verify_published_payload(content, unsafe)
+        self.assertEqual(decision.status, "reject")
+        self.assertIn("artifact-symlink-forbidden:artifacts/.cache/manifest.json",
+                      decision.reasons[0].detail)
 
     def _fixture(self, *, decision_required=True):
         identity = adm.ensure_root_identity(self.root)

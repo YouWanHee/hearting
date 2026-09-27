@@ -24,7 +24,13 @@ import artifact_identity as idm  # noqa: E402
 import artifact_lifecycle as L  # noqa: E402
 import artifact_manifest as m  # noqa: E402
 import artifact_producer as P  # noqa: E402
+import artifact_reader as reader  # noqa: E402
 import dispatch_contract as D  # noqa: E402
+
+_CORPUS_SPEC = importlib.util.spec_from_file_location(
+    "shared_artifact_path_corpus", Path(__file__).with_name("artifact_manifest.test.py"))
+_CORPUS = importlib.util.module_from_spec(_CORPUS_SPEC)
+_CORPUS_SPEC.loader.exec_module(_CORPUS)
 
 _P = Path(__file__).with_name("capability-route.py")
 _S = importlib.util.spec_from_file_location("route_for_producer_test", _P)
@@ -1024,11 +1030,56 @@ class CheckWriteTest(ProducerTestBase):
         base = Path(result["cycle_dir"])
         self.assertEqual(P.check_write(self.root, base.parent / "campaign.json")["reason"], "campaign-record-machine-managed")
         self.assertEqual(P.check_write(self.root, base / "manifest.json")["reason"], "outside-cycle-artifacts")
+        for control in (base / ".cycle.json", base.parent / "campaign.events" / "000001.json",
+                        base.parent / "campaign.satisfied.json", base.parent / "campaign.json",
+                        base / "manifest.json"):
+            with self.subTest(control=control):
+                self.assertEqual(P.check_write(self.root, control)["verdict"], "deny")
+        for spoof in (base.parent / "campaign.events" / "notes.json",
+                      base.parent / "campaign.events" / "nested" / "000002.json",
+                      base.parent / "campaign.events" / "nested" / "notes" / "manifest.json"):
+            with self.subTest(spoof=spoof):
+                self.assertEqual(P.check_write(self.root, spoof)["verdict"], "deny")
+                relative = spoof.relative_to(self.root).as_posix()
+                classification = m.classify_artifact_path(str(self.root),
+                    f"campaigns/{P.read_campaign(self.root, camp)['locator']}",
+                    base.relative_to(self.root).as_posix(), "control", relative, "prospective", prospective=True)
+                self.assertEqual((classification.allowed, classification.reason),
+                                 (False, "campaign-event-path-invalid"))
+        self.assertEqual(P.check_write(self.root, self.root / ".runtime" / "spoof" / "manifest.json")["verdict"], "allow")
         ok = P.check_write(self.root, base / "artifacts" / "plans" / "plan.md")
         self.assertEqual((ok["verdict"], ok["reason"], ok["bucket"]), ("allow", "open-cycle-artifacts", "plans"))
+        for locator in ("manifest.json", ".cache/manifest.json",
+                        "_internal/candidate/round_1/manifest.json",
+                        "_internal/candidate/round_2/manifest.json"):
+            with self.subTest(locator=locator):
+                payload = P.check_write(self.root, base / "artifacts" / locator)
+                self.assertEqual((payload["verdict"], payload["reason"]),
+                                 ("allow", "open-cycle-artifacts"))
         unknown = P.check_write(self.root, base.parent / "2026-09-04_unknown" / "artifacts" / "x.md")
         self.assertEqual(unknown["reason"], "cycle-unknown")
         self.assertEqual(P.cycle_bucket(self.root, base / "artifacts" / "spec" / "prd.md"), ("spec", cyc))
+
+    def test_shared_classifier_corpus_matches_check_write_namespace(self):
+        self.activate()
+        _route, _route_file, result = self.begin()
+        base = Path(result["cycle_dir"])
+        for namespace, relative, kind, prospective, allowed, _reason, _surface_reasons in _CORPUS.SHARED_PATH_CORPUS:
+            if namespace not in {"control", "payload"} or kind == "symlink":
+                continue
+            # check-write owns exact campaign/cycle and payload path decisions;
+            # .runtime remains outside this artifact-path gate by approved scope.
+            if relative.startswith(".runtime/"):
+                continue
+            actual = relative.replace("campaigns/camp/cyc", base.relative_to(self.root).as_posix())
+            actual = actual.replace("campaigns/camp", base.parent.relative_to(self.root).as_posix())
+            target = self.root / actual
+            decision = P.check_write(self.root, target)
+            expected = "allow" if allowed and namespace == "payload" else "deny"
+            if namespace == "control":
+                expected = "deny"
+            self.assertEqual(decision["verdict"], expected, relative)
+        _CORPUS.apply_shared_path_corpus(self)
 
     def test_sealed_cycle_denies_new_writes(self):
         self.activate()
@@ -1109,6 +1160,106 @@ class CheckWriteTest(ProducerTestBase):
 
 
 class FinalizeTest(ProducerTestBase):
+    def test_shared_path_corpus_runs_producer_final_collection(self):
+        rows = [row for row in _CORPUS.SHARED_PATH_CORPUS if row[0] in {"payload", "locator"}]
+        for namespace, relative, kind, _prospective, allowed, reason, public_reasons in rows:
+            with self.subTest(namespace=namespace, path=relative), tempfile.TemporaryDirectory() as scratch:
+                cycle_dir = Path(scratch) / "cycle"
+                (cycle_dir / "artifacts").mkdir(parents=True)
+                if namespace == "payload" and relative.startswith("campaigns/camp/cyc/"):
+                    cycle_relative = relative[len("campaigns/camp/cyc/"):]
+                else:
+                    cycle_relative = relative
+                target = cycle_dir / cycle_relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if kind == "symlink":
+                    outside = Path(scratch) / "outside"
+                    outside.write_bytes(b"corpus payload\n")
+                    target.symlink_to(outside)
+                else:
+                    target.write_bytes(b"corpus payload\n")
+                collected, violations = P._enumerate_output(cycle_dir)
+                self.assertEqual(not violations, allowed, (relative, violations))
+                if allowed:
+                    self.assertIn((cycle_relative, b"corpus payload\n"), collected)
+                else:
+                    typed_reason = violations[0].split(":", 1)[0]
+                    expected = public_reasons.get("producer", reason)
+                    self.assertEqual(typed_reason, expected, (relative, violations))
+
+    def test_nested_manifest_payload_survives_write_finalize_and_reader(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        data = b'{"ordinary":"payload"}\n'
+        locators = (
+            "artifacts/manifest.json",
+            "artifacts/.cache/manifest.json",
+            "artifacts/_internal/candidate/round_1/manifest.json",
+            "artifacts/plans/cycle/manifest.json",
+        )
+        payloads = []
+        for locator in locators:
+            payload = Path(result["cycle_dir"]) / locator
+            admission = P.check_write(self.root, payload)
+            self.assertEqual((admission["verdict"], admission["reason"]),
+                             ("allow", "open-cycle-artifacts"), locator)
+            payload.parent.mkdir(parents=True, exist_ok=True)
+            payload.write_bytes(data)
+            payloads.append(payload)
+        self.write_output(result, "plans/cycle/plan.md", b"plan\n")
+        self.close(route, route_file)
+        sealed = P.finalize(self.root, cycle_id=result["cycle_id"])
+        document = json.loads((Path(result["cycle_dir"]) / "manifest.json").read_text(encoding="utf-8"))
+        rows = {row["locator"]["path"]: row for row in document["artifact_revisions"]}
+        for locator, payload in zip(locators, payloads):
+            row = rows[locator]
+            self.assertEqual(payload.read_bytes(), data)
+            self.assertEqual(row["content_digest"], m.digest_bytes(data))
+            self.assertEqual(row["byte_size"], len(data))
+            self.assertNotEqual(row["artifact_id"], document["manifest_id"])
+        self.assertEqual(sealed["status"], "sealed")
+        buckets = reader.bucket_dirs(self.root, "plans", include_legacy=False)
+        self.assertTrue(any((base / "cycle" / "manifest.json").read_bytes() == data
+                            for base, _meta in buckets))
+
+    def test_runtime_spoof_is_not_collected_and_nested_manifest_is_payload(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        cycle_dir = Path(result["cycle_dir"])
+        runtime_spoof = self.root / ".runtime" / "spoof" / "manifest.json"
+        runtime_spoof.parent.mkdir(parents=True)
+        runtime_bytes = b'{"spoof":"runtime"}\n'
+        runtime_spoof.write_bytes(runtime_bytes)
+        nested = cycle_dir / "artifacts" / "_internal" / "candidate" / "manifest.json"
+        nested.parent.mkdir(parents=True)
+        nested_bytes = b'{"ordinary":"nested payload"}\n'
+        nested.write_bytes(nested_bytes)
+        root_identity = L.read_root_identity(self.root).artifact_root_id
+        open_record = P.read_cycle_record(self.root, result["cycle_id"])
+        self.assertEqual(open_record["state"], "open")
+        self.assertEqual(open_record["cycle_id"], result["cycle_id"])
+        self.assertFalse((cycle_dir / "manifest.json").exists())
+        self.write_output(result, "plans/cycle/plan.md", b"plan\n")
+        self.close(route, route_file)
+
+        sealed = P.finalize(self.root, cycle_id=result["cycle_id"])
+        manifest_path = cycle_dir / "manifest.json"
+        document = json.loads(manifest_path.read_text(encoding="utf-8"))
+        record = P.read_cycle_record(self.root, result["cycle_id"])
+        rows = {row["locator"]["path"]: row for row in document["artifact_revisions"]}
+        self.assertEqual(sealed["status"], "sealed")
+        self.assertEqual(Path(sealed["manifest_path"]).resolve(), manifest_path.resolve())
+        self.assertEqual(sealed["manifest_digest"], m.manifest_digest(document))
+        self.assertEqual(document["cycle"]["cycle_id"], result["cycle_id"])
+        self.assertEqual(document["cycle"]["state"], "completed")
+        self.assertEqual(record["state"], "sealed")
+        self.assertEqual(L.read_root_identity(self.root).artifact_root_id, root_identity)
+        self.assertNotIn(".runtime/spoof/manifest.json", rows)
+        self.assertIn("artifacts/_internal/candidate/manifest.json", rows)
+        self.assertNotEqual(rows["artifacts/_internal/candidate/manifest.json"]["artifact_id"], document["manifest_id"])
+        self.assertEqual(rows["artifacts/_internal/candidate/manifest.json"]["content_digest"], m.digest_bytes(nested_bytes))
+        self.assertEqual(runtime_spoof.read_bytes(), runtime_bytes)
+
     def test_finalize_seals_manifest_index_and_record(self):
         self.activate()
         route, route_file, result = self.begin()
@@ -1347,6 +1498,84 @@ class RecoveryTest(ProducerTestBase):
         result = self._sealing_crash()
         outcome = P.finalize(self.root, cycle_id=result["cycle_id"])
         self.assertEqual(outcome["status"], "already-sealed")
+
+    def test_route_closed_nested_manifest_recovers_before_and_after_commit_idempotently(self):
+        self.activate()
+        for fault in ("before-manifest", "after-manifest"):
+            with self.subTest(fault=fault):
+                route, route_file = self.route(slug=f"nested-recovery-{fault}")
+                result = P.begin(self.root, route_file=route_file, capability="autopilot-code",
+                                 intensity="direct", campaign_key=f"nested-recovery-{fault}")
+                payload_rel = "_internal/candidate/round_1/manifest.json"
+                payload = self.write_output(result, payload_rel, b'{"round":1}\n')
+                self.write_output(result, "_internal/candidate/round_2/manifest.json", b'{"round":2}\n')
+                self.close(route, route_file)
+                if fault == "before-manifest":
+                    P._write_journal(self.root, result["cycle_id"], state="sealing",
+                                     manifest_digest="sha256:" + "0" * 64,
+                                     cycle_path=os.path.relpath(result["cycle_dir"], self.root))
+                    recovered = P.recover(self.root)
+                    self.assertEqual(recovered["producer"]["rolled_back"], [result["cycle_id"]])
+                    self.assertFalse((Path(result["cycle_dir"]) / "manifest.json").exists())
+                else:
+                    with self.assertRaises(adm.AdmissionRecoveryRequired):
+                        P.finalize(self.root, cycle_id=result["cycle_id"], crash_after_manifest=True)
+                    recovered = P.recover(self.root)
+                    self.assertEqual(recovered["producer"]["rolled_forward"], [result["cycle_id"]])
+                sealed = P.finalize(self.root, cycle_id=result["cycle_id"])
+                self.assertIn(sealed["status"], {"sealed", "already-sealed"})
+                self.assertEqual(payload.read_bytes(), b'{"round":1}\n')
+                document = json.loads((Path(result["cycle_dir"]) / "manifest.json").read_text())
+                rows = {row["locator"]["path"]: row for row in document["artifact_revisions"]}
+                for rel in (payload_rel, "_internal/candidate/round_2/manifest.json"):
+                    self.assertEqual(rows["artifacts/" + rel]["content_digest"],
+                                     m.digest_bytes((Path(result["cycle_dir"]) / "artifacts" / rel).read_bytes()))
+                replay = P.recover(self.root)
+                self.assertEqual(replay["producer"]["rolled_forward"], [])
+                self.assertEqual(P.finalize(self.root, cycle_id=result["cycle_id"])["status"], "already-sealed")
+
+    def test_unrelated_cycle_and_index_identity_snapshot_survives_success_and_faults(self):
+        self.activate()
+        route, route_file, unrelated = self.begin(campaign_key="unrelated-snapshot")
+        protected_payload = self.write_output(unrelated, "plans/protected.md", b"protected bytes\n")
+        self.close(route, route_file)
+        P.finalize(self.root, cycle_id=unrelated["cycle_id"])
+        campaign = P.read_campaign(self.root, unrelated["campaign_id"])
+        protected_cycle = Path(unrelated["cycle_dir"])
+        protected_files = (
+            P.cycle_record_path(self.root, unrelated["cycle_id"]),
+            protected_cycle / ".cycle.json", protected_cycle / "manifest.json", protected_payload,
+            Path(route_file), adm._root_identity_path(self.root),
+            self.root / "campaigns" / campaign["locator"] / "campaign.json",
+        )
+
+        def snapshot():
+            paths = {str(path): path.read_bytes() for path in protected_files}
+            index = json.loads(adm._index_path(self.root).read_text())
+            unrelated_rows = sorted((key, row) for key, row in index["manifests"].items()
+                                    if row.get("cycle_id") == unrelated["cycle_id"])
+            return paths, unrelated_rows, m.digest_bytes(protected_payload.read_bytes())
+
+        before = snapshot()
+        for outcome in ("success", "before-manifest", "after-manifest"):
+            with self.subTest(outcome=outcome):
+                target_route, target_route_file = self.route(slug=f"snapshot-{outcome}")
+                target = P.begin(self.root, route_file=target_route_file, capability="autopilot-code",
+                                 intensity="direct", campaign_key=f"snapshot-{outcome}")
+                self.write_output(target, "_internal/candidate/manifest.json", b"candidate\n")
+                self.close(target_route, target_route_file)
+                if outcome == "success":
+                    P.finalize(self.root, cycle_id=target["cycle_id"])
+                elif outcome == "before-manifest":
+                    P._write_journal(self.root, target["cycle_id"], state="sealing",
+                                     manifest_digest="sha256:" + "0" * 64,
+                                     cycle_path=os.path.relpath(target["cycle_dir"], self.root))
+                    P.recover(self.root)
+                else:
+                    with self.assertRaises(adm.AdmissionRecoveryRequired):
+                        P.finalize(self.root, cycle_id=target["cycle_id"], crash_after_manifest=True)
+                    P.recover(self.root)
+                self.assertEqual(snapshot(), before)
 
 
 class SharedAdmissionTest(ProducerTestBase):

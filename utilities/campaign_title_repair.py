@@ -14,9 +14,15 @@ import hashlib
 import json
 import os
 import stat
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Sequence
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import artifact_locator  # noqa: E402
+import artifact_manifest  # noqa: E402
 
 DISPLAY_TITLE_REL = Path(".runtime/artifact-producer/v1/campaign-display-titles.json")
 PACKAGE_SCHEMA = "hearting-campaign-title-repair/v1"
@@ -124,7 +130,24 @@ def render_review(review: Mapping[str, Any]) -> str:
 
 def manifest_rows(campaign_dir: Path) -> list[Dict[str, Any]]:
     rows: list[Dict[str, Any]] = []
-    for manifest_path in sorted(campaign_dir.rglob("manifest.json")):
+    campaign_dir = Path(campaign_dir)
+    artifact_root = campaign_dir.parent.parent
+    campaign_binding = campaign_dir.relative_to(artifact_root).as_posix()
+    for cycle_dir, _layout in artifact_locator.iter_cycle_dirs(campaign_dir):
+        manifest_path = cycle_dir / "manifest.json"
+        try:
+            observed = os.lstat(manifest_path)
+        except OSError:
+            continue
+        if stat.S_ISLNK(observed.st_mode) or not stat.S_ISREG(observed.st_mode):
+            continue
+        classification = artifact_manifest.classify_artifact_path(
+            str(artifact_root), campaign_binding,
+            cycle_dir.relative_to(artifact_root).as_posix(), "control",
+            manifest_path.relative_to(artifact_root).as_posix(), "regular",
+        )
+        if not classification.allowed:
+            continue
         raw = manifest_path.read_bytes()
         manifest = json.loads(raw.decode("utf-8"))
         if not isinstance(manifest, dict) or not isinstance(manifest.get("campaign"), dict):
