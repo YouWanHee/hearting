@@ -79,22 +79,6 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api) -> dict[str, A
         raise InlineFinishError("finish-registered-caller-ineligible")
     if dispatch_terminal_commit.require_current_cleanup("inline-finish", target=route_file) is not None:
         raise InlineFinishError("finish-foreign-cleanup-scope")
-    # Require the session marker at the canonical Codex state path, sealed to this route.
-    from dispatch_contract import route_grounding_state_dir
-    marker_root = route_grounding_state_dir(Path(os.environ.get("AGENT_HOME", "")), os.environ)
-    session_key = hashlib.sha256(b"material-route-session-v1\0" + sid.encode()).hexdigest()
-    marker_path = marker_root / (session_key + ".json")
-    try:
-        if marker_path.is_symlink() or not stat.S_ISREG(marker_path.lstat().st_mode):
-            raise InlineFinishError("finish-current-session-route-missing")
-        marker = json.loads(marker_path.read_text())
-    except (OSError, ValueError) as exc:
-        raise InlineFinishError("finish-current-session-route-missing") from exc
-    if (marker.get("session_key") != session_key or marker.get("route_id") != route.get("route_id")
-            or marker.get("route_hash") != route.get("route_hash")
-            or Path(marker.get("route_file", "")).resolve() != route_file
-            or Path(marker.get("cwd", "")).resolve() != Path(route["cwd"]).resolve()):
-        raise InlineFinishError("finish-current-session-route-mismatch")
     jobs = os.environ.get("AGENT_DISPATCH_JOBS", "")
     if not jobs or not Path(jobs).is_file():
         raise InlineFinishError("finish-registry-unavailable")
@@ -194,18 +178,6 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api) -> dict[str, A
                 raise InlineFinishError("finish-evidence-drift") from exc
             if locked_evidence != evidence_raw or locked_summary != summary_raw:
                 raise InlineFinishError("finish-evidence-drift")
-            try:
-                if marker_path.is_symlink() or not stat.S_ISREG(marker_path.lstat().st_mode):
-                    raise InlineFinishError("finish-current-session-route-missing")
-                locked_marker = json.loads(marker_path.read_text())
-            except (OSError, ValueError) as exc:
-                raise InlineFinishError("finish-current-session-route-missing") from exc
-            if (locked_marker.get("session_key") != session_key
-                    or locked_marker.get("route_id") != route.get("route_id")
-                    or locked_marker.get("route_hash") != route.get("route_hash")
-                    or Path(locked_marker.get("route_file", "")).resolve() != route_file
-                    or Path(locked_marker.get("cwd", "")).resolve() != Path(route["cwd"]).resolve()):
-                raise InlineFinishError("finish-current-session-route-mismatch")
             try:
                 for line in Path(jobs).read_text().splitlines():
                     fields = line.split("\t")

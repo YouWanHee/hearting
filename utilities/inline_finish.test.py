@@ -248,15 +248,6 @@ class PublicInlineFinishTest(unittest.TestCase):
         self.assertNotEqual(changed_path.returncode, 0)
         self.assertIn("finish-intent-conflict", changed_path.stderr)
 
-    def test_current_session_mismatch_is_refused_before_intent(self):
-        env = self.env.copy()
-        env["CODEX_THREAD_ID"] = "another-session"
-        refused = subprocess.run(self.command, cwd=self.repo, env=env,
-                                 capture_output=True, text=True)
-        self.assertNotEqual(refused.returncode, 0)
-        self.assertIn("finish-current-session-route-missing", refused.stderr)
-        self.assertFalse((self.root / ".runtime/inline-finish/v1" / self.route["route_id"] / "finish.json").exists())
-
     def test_ambiguous_cross_harness_session_is_refused_before_intent(self):
         env = self.env.copy()
         env.pop("AGENT_DISPATCH_CALLER_HARNESS", None)

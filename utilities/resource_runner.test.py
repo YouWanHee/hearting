@@ -18,6 +18,7 @@ CLEAN_ENV = {k: v for k, v in os.environ.items() if not (
     or k.startswith("AGENT_DISPATCH_") or k.startswith("AGENT_ROUTE_")
     or k.startswith("AGENT_ARTIFACT_")
 )}
+CLEAN_ENV["AGENT_HOME"] = str(ROOT)
 RUNNER = ROOT / "utilities" / "resource-runner.py"
 ROUTER = ROOT / "utilities" / "capability-route.py"
 SMOKE = ROOT / "tools" / "smoke-attestation.py"
@@ -42,10 +43,6 @@ class TestRunner(unittest.TestCase):
         subprocess.run(["git", "-C", str(self.repo), "commit", "-qm", "initial"], check=True)
         self.artifacts = self.base / "artifacts"
         self.artifacts.mkdir()
-        self.home = self.base / "agent-home"
-        (self.home / "core").mkdir(parents=True)
-        (self.home / "core" / "CORE.md").write_text("core\n")
-        (self.home / "utilities").symlink_to(ROOT / "utilities", target_is_directory=True)
         evidence = self.base / "dispatch-evidence.json"
         evidence.write_text(json.dumps({"tuples": [{
             "harness": "codex", "parent_harness": "codex", "parent_transport": "headless",
@@ -84,7 +81,7 @@ class TestRunner(unittest.TestCase):
         return subprocess.run([
             sys.executable, str(RUNNER), "--registry", str(self.registry), *args,
         ], cwd=cwd, text=True, capture_output=True,
-           env={**CLEAN_ENV, "AGENT_HOME": str(self.home),
+           env={**CLEAN_ENV, "AGENT_HOME": str(ROOT),
                 "AGENT_RESOURCE_RUN_INDEX": str(self.index)})
 
     def start_args(self, route=None, node="full-run", smoke=None, run_id="case", config_manifest=None):
