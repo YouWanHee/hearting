@@ -46,8 +46,9 @@ HOOKS_SOURCE = ROOT / "hooks"
 UTILITIES_SOURCE = ROOT / "utilities"
 UTIL_BUNDLE = ["agent-home.sh", "artifact-root.sh"]
 
-# Non-blocking spec read observations and sync nudges.
+# The two kept write gates, plus non-blocking spec read observations and sync nudges.
 HOOK_ADOPT = [
+    "core-write-guard.py",
     "spec-read-marker.sh",
     "spec-sync-nudge.sh",
 ]
@@ -60,14 +61,17 @@ HOOK_HELPER_FILES = []
 
 # event/matcher/shell taken verbatim from adapters/claude/settings.json registration.
 _HOOK_EVENTS = {
+    "core-write-guard.py": "PreToolUse",
     "spec-read-marker.sh": "PostToolUse",
     "spec-sync-nudge.sh": "PostToolUse",
 }
 _HOOK_MATCHERS = {
+    "core-write-guard.py": "Edit|Write|MultiEdit|NotebookEdit",
     "spec-read-marker.sh": "Read",
     "spec-sync-nudge.sh": "Edit|Write|MultiEdit",
 }
 _HOOK_SHELLS = {
+    "core-write-guard.py": "python3",
     "spec-read-marker.sh": "sh",
     "spec-sync-nudge.sh": "bash",
 }

@@ -1,5 +1,16 @@
 {
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/core-write-guard.py\""
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "Read",

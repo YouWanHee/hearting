@@ -71,6 +71,16 @@
         ]
       },
       {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$HOME/.claude/hooks/core-write-guard.py\"",
+            "timeout": 10
+          }
+        ]
+      },
+      {
         "matcher": "AskUserQuestion",
         "hooks": [
           {

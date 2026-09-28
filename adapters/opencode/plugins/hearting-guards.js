@@ -14,6 +14,7 @@ const root = isHarnessRoot(envRoot) ? envRoot : pluginRoot
 const preflight = path.join(root, "adapters", "opencode", "bin", "preflight.sh")
 const summaryTrigger = path.join(root, "utilities", "session_summary_trigger.py")
 const herdrProjection = path.join(root, "tools", "fleet", "herdr_projection.py")
+const coreWriteGuard = path.join(root, "hooks", "core-write-guard.py")
 const designPattern = /(designs?\/|\/design\/|spec\/design|preview\.html$|slides?\.html$|03_components|scaffolds\/)/
 const promptBySession = new Map()
 const turnBySession = new Map()
@@ -419,6 +420,16 @@ export const AgentHarnessGuards = async (ctx) => {
     if (!sid || !output) return
     if (!output.env) output.env = {}
     output.env.OPENCODE_SESSION_ID = sid
+  },
+  // The two kept write gates (hooks/core-write-guard.py): installed release copies
+  // and the shared checkout seen from a linked worktree. Anything else is allowed.
+  "tool.execute.before": async (input, output) => {
+    for (const file of targetFiles(ctx, input.tool || {}, output.args || {})) {
+      const result = spawnSync("python3", [coreWriteGuard, "--check", file, "--cwd", baseDir(ctx)], {
+        encoding: "utf8",
+      })
+      if (result.status === 1) throw new Error((result.stdout || "").trim())
+    }
   },
   "tool.execute.after": async (input, output) => {
     const args = input.args || output.args || {}
