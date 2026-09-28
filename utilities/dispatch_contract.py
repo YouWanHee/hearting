@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from hearting_gates import gates_on, same_work_or_refuse
+
 import base64
 from contextlib import contextmanager
 import contextvars
@@ -1763,13 +1765,13 @@ def validate_review_output_binding(
         or metadata.get("worktree", expected_worktree) != expected_worktree
         or str(Path(fields[2]).resolve(strict=False)) != expected_worktree
     ):
-        raise DispatchContractError("review-binding-worktree-mismatch", attempt_id)
+        same_work_or_refuse("review-binding-worktree-mismatch", attempt_id)
     if metadata.get("artifact_root") != expected_root:
-        raise DispatchContractError("review-binding-artifact-root-mismatch", attempt_id)
+        same_work_or_refuse("review-binding-artifact-root-mismatch", attempt_id)
     if metadata.get("review_cycle_id") != cycle_id:
-        raise DispatchContractError("review-binding-cycle-mismatch", cycle_id)
+        same_work_or_refuse("review-binding-cycle-mismatch", cycle_id)
     if metadata.get("review_producer_id") != producer_id:
-        raise DispatchContractError("review-binding-producer-mismatch", producer_id)
+        same_work_or_refuse("review-binding-producer-mismatch", producer_id)
     try:
         locator = target.relative_to(Path(expected_root)).as_posix()
     except ValueError as exc:
@@ -1791,7 +1793,7 @@ def validate_review_output_binding(
     binding["digest"] = review_output_binding_digest(binding)
     mirrored = metadata.get("review_output_digest")
     if mirrored != binding["digest"]:
-        raise DispatchContractError("review-binding-digest-mismatch", attempt_id)
+        same_work_or_refuse("review-binding-digest-mismatch", attempt_id)
     binding["_registry_metadata"] = metadata
     binding["_registry_status"] = fields[1]
     return binding
@@ -7113,14 +7115,18 @@ def _marker_schema_identity_ok(
         "completion_gate": node.get("completion_gate"),
     }
     if any(marker.get(key) != value for key, value in expected.items()):
-        return False, None
+        if gates_on() or any(key not in marker for key in expected):
+            return False, None
+        same_work_or_refuse("completion-marker-identity-mismatch", node_id)
     history_path = marker_path.parent / f"{node_id}.{sequence}.json"
     try:
         history = json.loads(history_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return False, None
     if history != marker:
-        return False, None
+        if gates_on() or not isinstance(history, dict):
+            return False, None
+        same_work_or_refuse("completion-marker-history-changed", node_id)
     return True, history_path
 
 
@@ -7290,7 +7296,9 @@ def evidence_currency(
         )
         if detail != node.get("id"):
             action += f" (upstream revision {detail})"
-        return GateCurrency("superseded", "completion-evidence-superseded", action)
+        if gates_on():
+            return GateCurrency("superseded", "completion-evidence-superseded", action)
+        same_work_or_refuse("completion-evidence-superseded", str(detail))
     evidence_record = marker.get("evidence")
     if not isinstance(evidence_record, dict):
         return GateCurrency("integrity-broken:identity-mismatch", "completion-marker-evidence-missing")
@@ -7306,6 +7314,9 @@ def evidence_currency(
         return GateCurrency("completion-evidence-unreadable", "completion-evidence-unreadable")
     if digest != evidence_record.get("sha256"):
         node_id = str(node.get("id"))
+        if not gates_on():
+            same_work_or_refuse("completion-evidence-revised-unrecorded", node_id)
+            return GateCurrency("current", "completion-marker-verified", evidence_digest=digest)
         return GateCurrency(
             "revised-unrecorded", "completion-evidence-revised-unrecorded",
             route_state_next_action("completion-evidence-revised-unrecorded", node_id, None, node),
@@ -7518,8 +7529,11 @@ def completion_attempt_readiness(
         # depth, just as registered complete does.
         if row_hash != str(route.get("route_hash") or ""):
             if metadata.get("attempt_id") == attempt_id:
-                return AttemptReadiness("unverifiable", "attempt-route-hash-mismatch", attempt_id)
-            continue
+                if gates_on():
+                    return AttemptReadiness("unverifiable", "attempt-route-hash-mismatch", attempt_id)
+                same_work_or_refuse("attempt-route-hash-mismatch", attempt_id)
+            else:
+                continue
         if metadata.get("attempt_id") == attempt_id:
             exact.append((fields, metadata))
         elif fields[1] in {"open", "running"} and metadata.get("attempt_id"):

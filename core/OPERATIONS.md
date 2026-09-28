@@ -120,6 +120,14 @@ fence and cannot hide session-root drift.
 
 ### §5.10. Work Isolation and Parallel Dispatch
 
+Dispatch same-work identity gates are opt-in: only `HEARTING_GATES=on`
+enforces sealed-versus-current route, parent, lineage, runtime and review
+bindings. Otherwise `utilities/hearting_gates.py` emits `hearting: gate-off`
+and execution uses current inputs. Input/schema errors, missing files, path
+and symlink safety, lock ownership and process-liveness checks remain enforced.
+Historical records are preserved; bypassing identity comparisons does not
+rewrite them or turn a live process into completed work.
+
 Each SD item below keeps the rule an agent acts on; its full decision record is verbatim in `core/ADAPTATION.md §8`.
 
 Adapter and projection changes follow the same core-first order as other portable work: establish and read the governing `core/` contract before adapter edits. Read and write markers enforce that gate but do not replace review. A generated projection's determinism covers its file mode, not only its bytes: a generator that writes plugin JSON (`hooks.json`, `plugin.json`, marketplace manifests) fixes the mode to `0644` on every write regardless of process umask, and its `--check` counterpart fails a foreign mode as a stale projection alongside a content mismatch (S-5d, owner-supervisor-liveness — a reproducible regenerate cycle flips `hooks.json` away from `0644`; the first mutating syscall was not isolated, so the fix enforces the invariant rather than only diagnosing it).

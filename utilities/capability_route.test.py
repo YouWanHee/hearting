@@ -10,9 +10,6 @@ GUARD_S=importlib.util.spec_from_file_location("guard",GUARD_P); G=importlib.uti
 FLEET_P=P.parent.parent/"tools"/"fleet"/"route.py"
 FLEET_S=importlib.util.spec_from_file_location("fleet_route",FLEET_P)
 FLEET_ROUTE=importlib.util.module_from_spec(FLEET_S); FLEET_S.loader.exec_module(FLEET_ROUTE)
-MATERIAL_GUARD_P=P.parent.parent/"hooks"/"material-route-guard.py"
-MATERIAL_GUARD_S=importlib.util.spec_from_file_location("material_route_guard_for_compose_test",MATERIAL_GUARD_P)
-MATERIAL_ROUTE_GUARD=importlib.util.module_from_spec(MATERIAL_GUARD_S); MATERIAL_GUARD_S.loader.exec_module(MATERIAL_ROUTE_GUARD)
 sys.path.insert(0,str(P.parent))
 import dispatch_contract as D
 import dispatch_runtime_support as RUNTIME_SUPPORT
@@ -2310,6 +2307,23 @@ class TestContinuation(unittest.TestCase):
    with_link=R.evidence_digest(renamed)
    outside.write_text("changed\n",encoding="utf-8")
    self.assertEqual(with_link,R.evidence_digest(renamed))
+
+ def test_gate_off_continuation_reuses_current_evidence_after_edit(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   root=Path(tmp)
+   source=self._source(root/"artifacts")
+   evidence=self._complete_prefix(source,"test",root/"evidence")
+   evidence["plan"].write_text("revised plan\n")
+   with mock.patch.dict(os.environ,{"HEARTING_GATES":"off"}), contextlib.redirect_stderr(io.StringIO()):
+    continuation=self._build(source,last_turn_id="current-turn")
+    self.assertIsNone(continuation["first_runnable_blocker"])
+    self.assertIsNone(continuation["requested_boundary_blocker"])
+    reused=next(row for row in continuation["reused_nodes"] if row["node_id"]=="plan")
+    self.assertEqual(reused["output_evidence_digest"],R.evidence_digest(evidence["plan"]))
+    R.verify_route(continuation,R.ROOT)
+    output=R.canonical_route_path(root/"artifacts",continuation["route_id"])
+    R.publish_continuation_route(continuation,source,output)
+    self.assertTrue(output.is_file())
 
  def test_slug_metadata_is_inherited_by_continuation(self):
   with tempfile.TemporaryDirectory() as tmp:
@@ -6091,70 +6105,24 @@ class ComposeRouteTest(TestRoute):
   self.assertEqual(route["selection"]["route_origin"],"preset"); self.assertEqual(route["selection"]["shape"],"direct")
   self.assertEqual(R.shape_for_intensity("quick"),"solo"); self.assertEqual(R.shape_for_intensity("thorough"),"staged")
   with self.assertRaisesRegex(ValueError,"invalid route origin"): R.compile_route(**self.args(route_origin="guess"))
- def _clear_self_bind_identity(self):
-  # D5 self-bind reads real ambient identity/dispatch env; every test process
-  # in this file inherits the running worker's OWN AGENT_ROUTE_*/session env,
-  # so the fixture below explicitly clears and restores it to get a clean slate.
-  keys=("AGENT_ROUTE_FILE","AGENT_ROUTE_ID","AGENT_ROUTE_NODE","AGENT_DISPATCH_DEPTH",
-        "AGENT_DISPATCH_CALLER_HARNESS","AGENT_DISPATCH_CURRENT_HARNESS",
-        "CLAUDE_CODE_SESSION_ID","CLAUDE_SESSION_ID","CODEX_THREAD_ID","CODEX_SESSION_ID",
-        "OPENCODE_SESSION_ID","AGENT_HOME")
-  saved={k:os.environ.get(k) for k in keys}
-  def restore():
-   for k,v in saved.items():
-    if v is None: os.environ.pop(k,None)
-    else: os.environ[k]=v
-  self.addCleanup(restore)
-  for k in keys: os.environ.pop(k,None)
- def test_compose_self_binds_the_calling_session_directly(self):
-  # D5: bind is a direct file write inside `_emit_compiled_route`, not a
-  # parse of whatever the caller's shell let through -- so it survives a
-  # command shaped like `compose ... | tail -1`, which the old PostToolUse
-  # hook path (parsing captured stdout) could not.
-  self._clear_self_bind_identity()
-  fixture_home=Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree,fixture_home,ignore_errors=True)
-  (fixture_home/"core").mkdir(parents=True); (fixture_home/"core"/"CORE.md").write_text("core\n",encoding="utf-8")
-  (fixture_home/"utilities").symlink_to(R.ROOT/"utilities",target_is_directory=True)
-  artifact_root=Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree,artifact_root,ignore_errors=True)
-  route=self.compose(artifact_root=artifact_root,cwd=R.ROOT)
-  output_path=artifact_root/".runtime"/"routes"/f"{route['route_id']}.json"
-  output_path.parent.mkdir(parents=True); output_path.write_text(json.dumps(route))
-  os.environ["AGENT_HOME"]=str(fixture_home)
-  os.environ["CLAUDE_CODE_SESSION_ID"]="fixture-self-bind-session"
+ def test_compose_publication_does_not_load_deleted_material_guard(self):
   import types
-  captured=io.StringIO()
-  with contextlib.redirect_stderr(captured):
-   R._compose_self_bind(types.SimpleNamespace(command="compose"),route,output_path)
-  self.assertIn(f"session_route_bound=1 harness=claude route_id={route['route_id']}",captured.getvalue())
-  marker=MATERIAL_ROUTE_GUARD.marker_path(fixture_home,"fixture-self-bind-session")
-  self.assertTrue(marker.is_file())
-  self.assertEqual(json.loads(marker.read_text())["route_id"],route["route_id"])
-  # `compile` never self-binds (D5): only `compose` may.
-  captured2=io.StringIO()
-  with contextlib.redirect_stderr(captured2):
-   R._compose_self_bind(types.SimpleNamespace(command="compile"),route,output_path)
-  self.assertEqual(captured2.getvalue(),"")
- def test_compose_self_bind_skips_when_marker_dir_is_not_also_tmp(self):
-  # A throwaway/test route under a tmp artifact root must never overwrite a
-  # REAL session's marker just because both realpaths happen to sit under the
-  # OS temp dir; the guard only skips when the marker directory is NOT also
-  # under (the patched) tmp -- same test `_record_route_chain` already uses.
-  self._clear_self_bind_identity()
-  sandbox=Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree,sandbox,ignore_errors=True)
-  fake_tmp=sandbox/"fake-tmp"; (fake_tmp/"artifacts").mkdir(parents=True)
-  fixture_home=sandbox/"agent-home"  # sibling of fake-tmp, NOT under it
-  (fixture_home/"core").mkdir(parents=True); (fixture_home/"core"/"CORE.md").write_text("core\n",encoding="utf-8")
-  route=self.compose(artifact_root=fake_tmp/"artifacts",cwd=R.ROOT)
-  output_path=(fake_tmp/"artifacts")/".runtime"/"routes"/f"{route['route_id']}.json"
-  os.environ["AGENT_HOME"]=str(fixture_home)
-  os.environ["CLAUDE_CODE_SESSION_ID"]="fixture-tmp-guard-session"
-  import types
-  captured=io.StringIO()
-  with mock.patch("tempfile.gettempdir",return_value=str(fake_tmp)), contextlib.redirect_stderr(captured):
-   R._compose_self_bind(types.SimpleNamespace(command="compose"),route,output_path)
-  self.assertIn("session_route_bound=0 reason=tmp-artifact-root",captured.getvalue())
-  marker=MATERIAL_ROUTE_GUARD.marker_path(fixture_home,"fixture-tmp-guard-session")
-  self.assertFalse(marker.exists())
+  with tempfile.TemporaryDirectory() as td:
+   root=Path(td)
+   with mock.patch.dict(os.environ, {"AGENT_HOME":str(R.ROOT)}):
+    route=self.compose(artifact_root=root,cwd=R.ROOT)
+   original=importlib.util.spec_from_file_location
+   def without_guard(name,path,*args,**kwargs):
+    if Path(path).name == "material-route-guard.py":
+     raise FileNotFoundError(path)
+    return original(name,path,*args,**kwargs)
+   with mock.patch.dict(os.environ, {"AGENT_DISPATCH_ATTEMPT_ID":""}), \
+        mock.patch.object(R,"_record_route_chain"), \
+        mock.patch("importlib.util.spec_from_file_location",side_effect=without_guard), \
+        contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+    R._emit_compiled_route(types.SimpleNamespace(command="compose",full_record=True),route,root)
+   path=R.canonical_route_path(root,route["route_id"])
+   self.assertEqual(json.loads(path.read_text()),route)
  def test_graph_order_refuses_consumer_before_producer(self):
   # D9: a caller-supplied `--graph` order may not place a node before a
   # producer it transitively `depends_on` in the base recipe; siblings with

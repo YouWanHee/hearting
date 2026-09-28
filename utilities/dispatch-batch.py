@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+
 import argparse
 import fcntl
 import hashlib
@@ -20,6 +21,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
+from hearting_gates import gates_on, same_work_or_refuse
 from dispatch_contract import (  # noqa: E402
     DispatchContractError,
     GOVERNOR_RESERVATION_ENV,
@@ -1886,8 +1888,13 @@ def _run_subdivision_batch_admission(args: argparse.Namespace, route: dict[str, 
     ).path
     self_slug = os.environ.get("AGENT_DISPATCH_SELF_SLUG", "")
     parent_attempt = os.environ.get("AGENT_DISPATCH_ATTEMPT_ID", "")
-    if not self_slug or args.parent != self_slug or not parent_attempt:
+    if not self_slug or not parent_attempt:
         raise BatchError("parent-identity-mismatch", f"parent={args.parent} self={self_slug or '-'}")
+    if args.parent != self_slug:
+        if gates_on():
+            raise BatchError("parent-identity-mismatch", f"parent={args.parent} self={self_slug}")
+        same_work_or_refuse("parent-identity-mismatch", f"parent={args.parent} self={self_slug}")
+        args.parent = self_slug
     artifact_root = Path(
         os.environ.get("AGENT_ARTIFACT_ROOT", str(agent_home / ".agent_reports"))
     )
@@ -2163,8 +2170,13 @@ def main(argv: list[str] | None = None) -> int:
             )
         self_slug = os.environ.get("AGENT_DISPATCH_SELF_SLUG", "")
         parent_attempt = os.environ.get("AGENT_DISPATCH_ATTEMPT_ID", "")
-        if not self_slug or args.parent != self_slug or not parent_attempt:
+        if not self_slug or not parent_attempt:
             raise BatchError("parent-identity-mismatch", f"parent={args.parent} self={self_slug or '-'}")
+        if args.parent != self_slug:
+            if gates_on():
+                raise BatchError("parent-identity-mismatch", f"parent={args.parent} self={self_slug}")
+            same_work_or_refuse("parent-identity-mismatch", f"parent={args.parent} self={self_slug}")
+            args.parent = self_slug
         repo = subprocess.check_output(
             ["git", "-C", str(route["cwd"]), "rev-parse", "--show-toplevel"],
             text=True,

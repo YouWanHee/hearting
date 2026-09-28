@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+
 import argparse
 import hashlib
 import importlib.util
@@ -17,6 +18,7 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
+from hearting_gates import gates_on, same_work_or_refuse
 from model_config import ModelConfigError, resolve_config  # noqa: E402
 
 
@@ -1476,10 +1478,13 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
     args.launch_lifecycle = select_launch_lifecycle()
     self_slug = os.environ.get("AGENT_DISPATCH_SELF_SLUG")
     if args.parent and self_slug and args.parent != self_slug:
-        return fail(
-            "parent-identity-mismatch", 73, explicit=args.parent,
-            current=self_slug, child_spawned="0",
-        )
+        if gates_on():
+            return fail(
+                "parent-identity-mismatch", 73, explicit=args.parent,
+                current=self_slug, child_spawned="0",
+            )
+        same_work_or_refuse("parent-identity-mismatch", f"parent={args.parent} self={self_slug}")
+        args.parent = self_slug
     args.parent = args.parent or self_slug
     if not args.parent:
         return fail("parent-identity-missing", 73, child_spawned="0")

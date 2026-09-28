@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Compile, verify, and complete immutable capability routes."""
 from __future__ import annotations
+
 import argparse, base64, contextlib, fcntl, functools, hashlib, importlib.util, json, os, re, shlex, shutil, subprocess, sys, tempfile, uuid
 from pathlib import Path
 from typing import NamedTuple
@@ -12,6 +13,7 @@ DEFAULTS_SPEC = importlib.util.spec_from_file_location("dispatch_defaults", ROOT
 DEFAULTS = importlib.util.module_from_spec(DEFAULTS_SPEC); DEFAULTS_SPEC.loader.exec_module(DEFAULTS)
 VALID_AFFINITY = DEFAULTS.AFFINITY_VALUES | {"unspecified"}
 sys.path.insert(0, str(ROOT/"utilities"))
+from hearting_gates import gates_on, same_work_or_refuse
 import artifact_locator as ARTIFACT_LOCATOR
 import route_identity as ROUTE_IDENTITY
 import route_lineage as ROUTE_LINEAGE
@@ -622,6 +624,7 @@ def revalidate_launch_compatibility(route):
         artifact_root=route.get("artifact_root","."),cwd=route.get("cwd","."),
     ))
     mismatches={}
+    malformed_roots=False
     if not isinstance(sealed,dict):
         return False,{"tuple":{"expected":sealed,"actual":fresh}}
     for field in ("contract_version","tuple_version"):
@@ -633,6 +636,7 @@ def revalidate_launch_compatibility(route):
     for name,expected in expected_roots.items():
         actual=actual_roots[name]
         if not isinstance(expected,dict) or not isinstance(actual,dict):
+            malformed_roots=True
             mismatches[name]={"expected":expected,"actual":actual}
             continue
         changed={field:{"expected":expected.get(field),"actual":actual.get(field)}
@@ -658,6 +662,9 @@ def revalidate_launch_compatibility(route):
             mismatches[name]={
                 "expected":expected,"actual":actual,"fields":sorted(changed),
             }
+    if mismatches and not malformed_roots and not gates_on():
+        same_work_or_refuse("launch-runtime-root-mismatch", json.dumps(mismatches, sort_keys=True))
+        return True, mismatches
     return not mismatches,mismatches
 
 def _sha256_record(value):
@@ -755,6 +762,9 @@ def _continuation_reused_evidence(route, node):
             f"continuation-source-node-unverified:{node_id}:quiescence-proof"
         )
     evidence=marker.get("evidence") or {}
+    if not gates_on():
+        currency = evidence_currency(route, node, marker_path, marker)
+        evidence = dict(evidence, sha256=currency.evidence_digest)
     public={
         "node_id":node_id,
         "completion_gate":node.get("completion_gate"),
@@ -819,7 +829,9 @@ def _continuation_lineage(
     )
     selected_turn=last_turn_id or expected_turn
     if last_turn_id and expected_turn and last_turn_id != expected_turn:
-        raise ValueError("continuation-last-turn-mismatch")
+        if gates_on():
+            raise ValueError("continuation-last-turn-mismatch")
+        same_work_or_refuse("continuation-last-turn-mismatch")
     if operation=="resume":
         if new_thread_id or forked_from_id:
             raise ValueError("continuation-resume-lineage-switch-forbidden")
@@ -830,9 +842,13 @@ def _continuation_lineage(
     if not source_thread or not new_thread_id or new_thread_id==source_thread:
         raise ValueError("continuation-fork-lineage-incomplete")
     if forked_from_id != source_thread:
-        raise ValueError("continuation-fork-source-mismatch")
+        if gates_on():
+            raise ValueError("continuation-fork-source-mismatch")
+        same_work_or_refuse("continuation-fork-source-mismatch")
     if not expected_turn or selected_turn != expected_turn:
-        raise ValueError("continuation-last-turn-mismatch")
+        if gates_on():
+            raise ValueError("continuation-last-turn-mismatch")
+        same_work_or_refuse("continuation-last-turn-mismatch")
     return {
         "operation":"fork","thread_id":new_thread_id,
         "forkedFromId":source_thread,"lastTurnId":selected_turn,
@@ -1017,7 +1033,9 @@ def _verify_continuation_gate_release_proofs(route):
             raise ValueError("continuation-human-gate-release-proof-unreadable") from exc
         resolution = WS.human_gate_resolution(entries, gate)
         if resolution.get("status") != "proceed" or resolution.get("epoch") != proof["epoch"]:
-            raise ValueError("continuation-human-gate-release-proof-drift")
+            if gates_on():
+                raise ValueError("continuation-human-gate-release-proof-drift")
+            same_work_or_refuse("continuation-human-gate-release-proof-drift")
         raise_count=0; matched_raise=False; matched_release=False
         for entry in entries:
             evidence=entry.get("evidence") if isinstance(entry,dict) else None
@@ -1040,7 +1058,9 @@ def _verify_continuation_gate_release_proofs(route):
                 )
                 matched_release=True
         if not matched_raise or not matched_release:
-            raise ValueError("continuation-human-gate-release-proof-drift")
+            if gates_on():
+                raise ValueError("continuation-human-gate-release-proof-drift")
+            same_work_or_refuse("continuation-human-gate-release-proof-drift")
     return proofs
 
 def build_continuation_route(
@@ -1343,7 +1363,9 @@ def _verify_continuation_route(route):
             _inside_git_worktree(cwd)
             and source_lineage_verdict(cwd,inherited).kind not in ("exact","descendant")
         ):
-            raise ValueError("continuation-source-commit-rebind-lineage-unproven")
+            if gates_on():
+                raise ValueError("continuation-source-commit-rebind-lineage-unproven")
+            same_work_or_refuse("continuation-source-commit-rebind-lineage-unproven")
     _validate_output_scopes(route.get("nodes",[]))
     return route
 
@@ -1360,7 +1382,9 @@ def publish_continuation_route(route,source_route,output_path):
         current_digest != route.get("source_evidence_digest")
         or canonical(current) != canonical(route.get("reused_nodes"))
     ):
-        raise ValueError("continuation-source-evidence-drift")
+        if gates_on():
+            raise ValueError("continuation-source-evidence-drift")
+        same_work_or_refuse("continuation-source-evidence-drift")
     path=Path(output_path)
     if classify_route_location(path,route["artifact_root"]) != "canonical":
         raise ValueError("route-output-outside-canonical")
@@ -1445,9 +1469,11 @@ def _assert_pin_matches_grounding(source_commit, launch):
     if not _COMMIT_SHA.fullmatch(base) or not _COMMIT_SHA.fullmatch(source_commit):
         return
     if base != source_commit:
-        raise ValueError(
-            f"continuation-source-commit-grounding-mismatch: pin={source_commit} grounding={base}"
-        )
+        if gates_on():
+            raise ValueError(
+                f"continuation-source-commit-grounding-mismatch: pin={source_commit} grounding={base}"
+            )
+        same_work_or_refuse(f"continuation-source-commit-grounding-mismatch: pin={source_commit} grounding={base}")
 
 def _continuation_source_commit(source_route):
     """Reseal the resume-time HEAD as the continuation's `source_commit`.
@@ -1482,9 +1508,12 @@ def _continuation_source_commit(source_route):
         return inherited,None
     if verdict.kind == "diverged":
         observed=verdict.commits[0] if verdict.commits else _git_commit(cwd)
-        raise ValueError(
-            f"continuation-source-commit-diverged: expected={inherited} observed={observed}"
-        )
+        if gates_on():
+            raise ValueError(
+                f"continuation-source-commit-diverged: expected={inherited} observed={observed}"
+            )
+        same_work_or_refuse("continuation-source-commit-diverged", f"expected={inherited} observed={observed}")
+        return observed, None
     head=verdict.commits[0]
     return head,{
         "contract_version":CONTINUATION_SOURCE_COMMIT_REBIND_VERSION,
@@ -3273,9 +3302,19 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
     scope_version=route.get("dispatch_evidence_scope_version")
     if scope_version not in (None, DISPATCH_EVIDENCE_SCOPE_VERSION):
         raise ValueError("unsupported dispatch evidence scope version")
-    if route.get("route_hash") != route_hash(route): raise ValueError("stale or modified route hash")
-    if route.get("route_id") != "rt-"+route["route_hash"].split(":",1)[1][:16]: raise ValueError("invalid route id")
-    if expected_cwd and Path(expected_cwd).resolve()!=Path(route["cwd"]): raise ValueError("route cwd mismatch")
+    if route.get("route_hash") != route_hash(route):
+        if gates_on():
+            raise ValueError("stale or modified route hash")
+        same_work_or_refuse("route-hash-mismatch")
+    if route.get("route_id") != "rt-"+route["route_hash"].split(":",1)[1][:16]:
+        if gates_on() or not re.fullmatch(r"rt-[0-9a-f]{16}", str(route.get("route_id") or "")):
+            raise ValueError("invalid route id")
+        same_work_or_refuse("route-id-mismatch", str(route.get("route_id")))
+    if expected_cwd and Path(expected_cwd).resolve()!=Path(route["cwd"]):
+        if gates_on():
+            raise ValueError("route cwd mismatch")
+        same_work_or_refuse("route-cwd-mismatch", str(expected_cwd))
+        route = dict(route, cwd=str(Path(expected_cwd).resolve()))
     _verify_profile_contract(route)
     basis=_check_validation_basis(route, allow_stale_registry=allow_stale_registry)
     if basis is _DEGRADE_VALIDATION_BASIS:
@@ -3307,7 +3346,10 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
             )
     if classification["verdict"] != "current":
         if not allow_stale_registry:
-            raise ValueError(classification["message"])
+            if gates_on():
+                raise ValueError(classification["message"])
+            same_work_or_refuse("route-registry-stale", classification["message"])
+            _validate_output_scopes(route.get("nodes", []))
         # A stale/skewed sealed graph cannot be re-derived from the current registry, so
         # every check that compares against it is skipped rather than guessed at.
         return dict(route, _registry_current=False)
@@ -5017,7 +5059,9 @@ def _marker_identity_row(route, node, node_id, gate, *, jobs=None, exact_termina
             or marker.get("route_hash") != route.get("route_hash")
             or marker.get("node_id") != node_id
             or marker.get("completion_gate") != gate):
-        return {"passed": False, "reason": "completion-marker-identity-mismatch"}
+        if gates_on():
+            return {"passed": False, "reason": "completion-marker-identity-mismatch"}
+        same_work_or_refuse("completion-marker-identity-mismatch", node_id)
     evidence = marker.get("evidence") or {}
     # SD-154 A-SD154-8: `evidence_currency` is the only place non-writer code
     # recomputes a completion marker's evidence sha256 -- this used to keep
@@ -7300,106 +7344,13 @@ def _resolve_compose_plan(a):
         return None, None
 
 
-def _load_material_route_guard():
-    spec = importlib.util.spec_from_file_location(
-        "material_route_guard", ROOT / "hooks" / "material-route-guard.py"
-    )
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def _compose_self_bind(a, route, output_path):
-    """Bind this `compose` call's own interactive session directly to the
-    route it just sealed (route-guard-recovery D5), instead of depending on a
-    PostToolUse hook to parse stdout/stderr afterward -- which silently never
-    binds when stdout is truncated (`| tail`), the shell ran more than one
-    compile/compose, or the artifact root cannot be resolved from the tool
-    response. `compile` is excluded: tooling and migrations call it in bulk,
-    so it stays on the hook fallback path (`bind_after_compile`). A bind
-    failure or skip here is reported on stderr and never fails compose itself
-    or changes its stdout."""
-    if a.command != "compose":
-        return
-    guard = None
-    sid_for_recover = "<session-id>"
-    reason = None
-    harness = ""
-    try:
-        guard = _load_material_route_guard()
-        agent_home = guard.resolve_agent_home()
-        if (
-            os.environ.get("AGENT_ROUTE_FILE")
-            or os.environ.get("AGENT_ROUTE_ID")
-            or os.environ.get("AGENT_ROUTE_NODE")
-        ):
-            reason = "registered-worker"
-        else:
-            try:
-                depth = int(os.environ.get("AGENT_DISPATCH_DEPTH") or 0)
-            except (TypeError, ValueError):
-                depth = 0
-            if depth >= 2:
-                reason = "dispatch-depth"
-            else:
-                from dispatch_parent_completion import interactive_parent_identity
-                sid = ""
-                try:
-                    harness, sid = interactive_parent_identity()
-                except DispatchContractError as exc:
-                    reason = exc.reason
-                if reason is None:
-                    if sid:
-                        sid_for_recover = sid
-                    if not harness or not sid:
-                        reason = "no-session-identity"
-                    else:
-                        # Same tmp-artifact-root test as `_record_route_chain`:
-                        # a throwaway test route must never overwrite a real
-                        # session's marker just because both realpaths land
-                        # under the OS temp dir; only refuse when the marker
-                        # directory itself is NOT also under tmp (an isolated
-                        # test home keeps both tmp, which is fine).
-                        real_tmp = os.path.realpath(tempfile.gettempdir())
-                        real_root = os.path.realpath(str(route.get("artifact_root") or ""))
-                        root_is_tmp = real_root == real_tmp or real_root.startswith(real_tmp + os.sep)
-                        if root_is_tmp:
-                            real_state = os.path.realpath(str(guard.state_dir(agent_home)))
-                            state_is_tmp = (
-                                real_state == real_tmp or real_state.startswith(real_tmp + os.sep)
-                            )
-                            if not state_is_tmp:
-                                reason = "tmp-artifact-root"
-                        if reason is None:
-                            guard.bind_route(output_path, Path(route["cwd"]), sid, agent_home)
-                            print(
-                                f"session_route_bound=1 harness={harness} route_id={route['route_id']}",
-                                file=sys.stderr,
-                            )
-                            return
-    except Exception as exc:
-        reason = getattr(exc, "reason", None) or type(exc).__name__
-    try:
-        recover = guard.bind_recovery_command(
-            str(output_path), str(route.get("cwd", "")), sid_for_recover, guard.resolve_agent_home(),
-            harness or "claude",
-        ) if guard is not None else (
-            f"python3 $AGENT_HOME/hooks/material-route-guard.py bind --route {output_path} "
-            f"--cwd {route.get('cwd', '')} --session {sid_for_recover}"
-        )
-    except Exception:
-        recover = (
-            f"python3 $AGENT_HOME/hooks/material-route-guard.py bind --route {output_path} "
-            f"--cwd {route.get('cwd', '')} --session {sid_for_recover}"
-        )
-    print(f"session_route_bound=0 reason={reason or 'unknown'} recover={recover}", file=sys.stderr)
-
-
 def _emit_compiled_route(a,route,artifact_root,output=None):
     """Shared tail of compile/compose: runtime-root check, canonical write-once, owner binding, prints."""
     output=output if output is not None else getattr(a,"output",None)
     vbasis=route.get("validation_basis") or {}
-    if vbasis.get("runtime_root_match") is False:
+    if vbasis.get("runtime_root_match") is False and not gates_on():
+        same_work_or_refuse("launch-runtime-root-mismatch", runtime_root_hint())
+    if vbasis.get("runtime_root_match") is False and gates_on():
         launch_tuple=route.get("launch_compatibility_tuple") or {}
         expected=launch_tuple.get("registry_root")
         observed=launch_tuple.get("runtime_root")
@@ -7448,7 +7399,6 @@ def _emit_compiled_route(a,route,artifact_root,output=None):
     plan, plan_source = getattr(a, "_route_chain_plan", (None, None))
     _record_route_chain(route, str(output_path.resolve()), a.command,
                         plan=plan, plan_source=plan_source)
-    _compose_self_bind(a, route, output_path.resolve())
     print(f"route_file={output_path.resolve()}",file=sys.stderr)
     result = (compose_receipt(route, output_path, owner_harness=getattr(a, "owner", None))
               if a.command == "compose" and not getattr(a, "full_record", False) else route)

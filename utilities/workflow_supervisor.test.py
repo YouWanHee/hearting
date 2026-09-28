@@ -2747,7 +2747,7 @@ class TestInteractiveFrameGate(WorkflowFixture):
         jobs.write_text("\n".join(lines))
         with mock.patch.dict(os.environ, {session_key: "test-depth0", "AGENT_DISPATCH_CALLER_HARNESS": harness,
                 "AGENT_DISPATCH_ATTEMPT_ID": "", "AGENT_DISPATCH_REGISTERED_WORKER": "",
-                "AGENT_CODEX_MANAGED_CONTROL_SOCKET": "/tmp/test-control"}, clear=True), \
+                "AGENT_CODEX_MANAGED_CONTROL_SOCKET": "/tmp/test-control", "HEARTING_GATES": "on"}, clear=True), \
              mock.patch.object(SUP.HUMAN_GATE, "probe_consumer", return_value={"epoch": 1}), \
              mock.patch.object(DC, "completion_marker_is_current", return_value=True), \
              mock.patch.object(DC, "completion_attempt_readiness", return_value=DC.AttemptReadiness("ready", "fixture")):
@@ -2769,6 +2769,11 @@ class TestInteractiveFrameGate(WorkflowFixture):
             with mock.patch.dict(os.environ, {session_key: "other-parent"}):
                 with self.assertRaisesRegex(SUP.SupervisorError, "frame-gate-parent-binding-mismatch"):
                     SUP.create_gate_delivery(route, "frame-review", str(artifact), jobs, 1, **kwargs)
+                with mock.patch.dict(os.environ, {"HEARTING_GATES": "off"}):
+                    current_path, created = SUP.create_gate_delivery(
+                        route, "frame-review", str(artifact), jobs, 1, **kwargs)
+                self.assertTrue(created)
+                self.assertEqual(json.loads(current_path.read_text())["recipient_session"], "other-parent")
 
 
 class TestGateRecipientIsNeverAFrameLeg(WorkflowFixture):

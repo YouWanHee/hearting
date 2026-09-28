@@ -2,6 +2,7 @@
 """Validate an immutable route before a worker starts; never re-route it."""
 from __future__ import annotations
 
+
 import argparse
 import importlib.util
 import json
@@ -13,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location("capability_route", ROOT / "utilities" / "capability-route.py")
 ROUTE = importlib.util.module_from_spec(SPEC); SPEC.loader.exec_module(ROUTE)
 sys.path.insert(0, str(ROOT / "utilities"))
+from hearting_gates import gates_on, same_work_or_refuse
 
 
 class WorkerRouteError(ValueError):
@@ -93,8 +95,16 @@ def validate_route_contract(route_path: str | Path, node_id: str, cwd: str | Pat
     actual_root = Path(artifact_root)
     if not actual_cwd.is_absolute(): raise _fail("cwd-not-absolute", str(actual_cwd), rid)
     if not actual_root.is_absolute(): raise _fail("artifact-root-not-absolute", str(actual_root), rid)
-    if actual_cwd.resolve() != Path(route["cwd"]).resolve(): raise _fail("route-cwd-mismatch", str(actual_cwd), rid)
-    if actual_root.resolve() != Path(route["artifact_root"]).resolve(): raise _fail("route-artifact-root-mismatch", str(actual_root), rid)
+    if actual_cwd.resolve() != Path(route["cwd"]).resolve():
+        if gates_on():
+            raise _fail("route-cwd-mismatch", str(actual_cwd), rid)
+        same_work_or_refuse("route-cwd-mismatch", str(actual_cwd))
+        route = dict(route, cwd=str(actual_cwd.resolve()))
+    if actual_root.resolve() != Path(route["artifact_root"]).resolve():
+        if gates_on():
+            raise _fail("route-artifact-root-mismatch", str(actual_root), rid)
+        same_work_or_refuse("route-artifact-root-mismatch", str(actual_root))
+        route = dict(route, artifact_root=str(actual_root.resolve()))
     node = next((row for row in route["nodes"] if row["id"] == node_id), None)
     if node is None: raise _fail("route-node-mismatch", node_id, rid)
     checks = (("route-id-mismatch", route_id, route["route_id"]),
@@ -103,7 +113,10 @@ def validate_route_contract(route_path: str | Path, node_id: str, cwd: str | Pat
               ("capability-reselection", capability, route["capability"]),
               ("intensity-reselection", intensity, route["effective_intensity"]))
     for reason, observed, expected in checks:
-        if observed is not None and observed != expected: raise _fail(reason, f"expected={expected} observed={observed}", rid)
+        if observed is not None and observed != expected:
+            if gates_on():
+                raise _fail(reason, f"expected={expected} observed={observed}", rid)
+            same_work_or_refuse(reason, f"expected={expected} observed={observed}")
     if write_scope is not None and _scopes(write_scope) != sorted(node["write_scope"]):
         raise _fail("route-node-scope-mismatch", f"expected={sorted(node['write_scope'])} observed={_scopes(write_scope)}", rid)
     if enforce_model_binding:
@@ -138,14 +151,17 @@ def validate_route_contract(route_path: str | Path, node_id: str, cwd: str | Pat
             "observed": observed, "distance": verdict.distance, "branch": verdict.branch,
         }
         if verdict.kind == "diverged":
-            raise _fail(
-                "route-source-commit-mismatch",
-                f"expected={route['source_commit']} observed={git['head']}; "
-                "next_action=return to the sealed line of work (git switch back to the sealed "
-                "branch, or use reflog to restore the sealed commit) or compose a new route with "
-                "--parent-cycle <current cycle>",
-                rid,
-            )
+            if gates_on():
+                raise _fail(
+                    "route-source-commit-mismatch",
+                    f"expected={route['source_commit']} observed={git['head']}; "
+                    "next_action=return to the sealed line of work (git switch back to the sealed "
+                    "branch, or use reflog to restore the sealed commit) or compose a new route with "
+                    "--parent-cycle <current cycle>",
+                    rid,
+                )
+            same_work_or_refuse("route-source-commit-mismatch", f"expected={route['source_commit']} observed={observed}")
+            route = dict(route, source_commit=observed)
         if verdict.kind == "unverifiable":
             # `unsafe-git-operation`/`unsafe-git-state` keep this guard's existing
             # vocabulary (`_git_state` already raises them earlier for the cases

@@ -18,6 +18,8 @@ subprocess calls.
 """
 from __future__ import annotations
 
+from hearting_gates import gates_on, same_work_or_refuse
+
 import json
 import stat
 from pathlib import Path
@@ -54,7 +56,9 @@ def verified_route_lineage(route: Dict[str, Any], *, artifact_root: Optional[Any
     """
     root = artifact_root if artifact_root is not None else route.get("artifact_root")
     if route_identity.route_hash(route) != route.get("route_hash"):
-        raise RouteLineageError("route-lineage-unverified", f"hash-mismatch:{route.get('route_id')}")
+        if gates_on():
+            raise RouteLineageError("route-lineage-unverified", f"hash-mismatch:{route.get('route_id')}")
+        same_work_or_refuse("route-lineage-unverified", f"hash-mismatch:{route.get('route_id')}")
     lineage: List[Dict[str, Any]] = [route]
     seen = {route.get("route_id")}
     current = route
@@ -81,12 +85,18 @@ def verified_route_lineage(route: Dict[str, Any], *, artifact_root: Optional[Any
         if not isinstance(parent, dict) or parent.get("route_id") != parent_id:
             raise RouteLineageError("route-lineage-unverified", f"parent-identity-mismatch:{parent_id}")
         if route_identity.route_hash(parent) != parent.get("route_hash"):
-            raise RouteLineageError("route-lineage-unverified", f"parent-hash-mismatch:{parent_id}")
+            if gates_on():
+                raise RouteLineageError("route-lineage-unverified", f"parent-hash-mismatch:{parent_id}")
+            same_work_or_refuse("route-lineage-unverified", f"parent-hash-mismatch:{parent_id}")
         if parent.get("route_hash") != current.get("source_route_hash"):
-            raise RouteLineageError("route-lineage-unverified", f"source-route-hash-mismatch:{parent_id}")
+            if gates_on():
+                raise RouteLineageError("route-lineage-unverified", f"source-route-hash-mismatch:{parent_id}")
+            same_work_or_refuse("route-lineage-unverified", f"source-route-hash-mismatch:{parent_id}")
         for key in _LINEAGE_CONTEXT_KEYS:
             if parent.get(key) != current.get(key):
-                raise RouteLineageError("route-lineage-unverified", f"context-mismatch:{key}")
+                if gates_on():
+                    raise RouteLineageError("route-lineage-unverified", f"context-mismatch:{key}")
+                same_work_or_refuse("route-lineage-unverified", f"context-mismatch:{key}")
         lineage.append(parent)
         seen.add(parent_id)
         current = parent

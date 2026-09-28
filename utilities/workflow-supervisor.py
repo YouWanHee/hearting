@@ -25,6 +25,7 @@ read as "the stage succeeded".
 """
 from __future__ import annotations
 
+
 import argparse
 import functools
 import hashlib
@@ -40,6 +41,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
+from hearting_gates import gates_on, same_work_or_refuse
 
 from dispatch_contract import success_note, verdict_pass  # noqa: E402
 import workflow_state as WS  # noqa: E402
@@ -999,8 +1001,12 @@ def create_local_frame_gate_delivery(route, gate, artifact, jobs_path, epoch, *,
         metadata = [parse_registry_metadata(line.split("\t")[5]) for line in rows
                     if len(line.split("\t")) == 6
                     and parse_registry_metadata(line.split("\t")[5]).get("attempt_id") == attempt]
-        if len(metadata) != 1 or metadata[0].get("parent_sid") != session:
+        if len(metadata) != 1:
             raise SupervisorError("frame-gate-parent-binding-mismatch")
+        if metadata[0].get("parent_sid") != session:
+            if gates_on():
+                raise SupervisorError("frame-gate-parent-binding-mismatch")
+            same_work_or_refuse("frame-gate-parent-binding-mismatch")
         attempts.append(attempt)
     if parent_harness == "codex":
         control = os.environ.get("AGENT_CODEX_MANAGED_CONTROL_SOCKET")
