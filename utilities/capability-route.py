@@ -2689,13 +2689,18 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
     if shape != "staged" and graph:
         raise ValueError(f"compose-graph-only-staged:{shape}")
     registry = TOPO.load_registry()
-    base = next((r for r in registry["recipes"] if r["capability"] == capability), None)
-    if base is None:
+    # A capability may own several recipes (autopilot-lab: setup, eval); the
+    # requested mode picks the recipe that declares it.
+    candidates = [r for r in registry["recipes"] if r["capability"] == capability]
+    if not candidates:
         raise ValueError(f"compose-capability-unknown:{capability}")
     if capability_mode is None:
+        base = next((r for r in candidates if "dev" in r["modes"]), candidates[0])
         capability_mode = "dev" if "dev" in base["modes"] else sorted(base["modes"])[0]
-    if capability_mode not in base["modes"]:
-        raise ValueError(f"compose-mode-unknown:{capability_mode} (modes: {','.join(sorted(base['modes']))})")
+    base = next((r for r in candidates if capability_mode in r["modes"]), None)
+    if base is None:
+        modes = sorted({mode for r in candidates for mode in r["modes"]})
+        raise ValueError(f"compose-mode-unknown:{capability_mode} (modes: {','.join(modes)})")
     requested = intensity or SHAPE_INTENSITY[shape]
     if requested not in ORDER:
         raise ValueError("invalid intensity")

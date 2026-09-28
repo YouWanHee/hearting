@@ -1,16 +1,16 @@
 #!/bin/sh
-# Refuse a push whose generated core projections are stale.
+# Refuse a push that the Checks "adaptation-boundary" job would fail.
 #
-# CI runs `python3 tools/generate.py --check` and fails the whole run when a
-# projection drifted. That signal arrives minutes after the push, on a commit
-# that is already public and already tagged by the release workflow. This runs
-# the same check locally, before the push leaves the machine.
+# CI runs these static checks and fails the whole run when one of them does.
+# That signal arrives many minutes after the push, on a commit that is already
+# public. This runs the same checks locally, in parallel, before the push
+# leaves the machine (about as long as the slowest one, ~1-2 min).
 #
 # Enable:  git config core.hooksPath tools/git-hooks
 # Bypass:  git push --no-verify
 #
-# Deliberately not a pre-commit hook: the full check takes ~17s, which is real
-# friction per commit but negligible once per push.
+# Deliberately not a pre-commit hook: real friction per commit, negligible
+# once per push.
 
 root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
 [ -f "$root/tools/generate.py" ] || exit 0
@@ -26,19 +26,41 @@ if [ -n "$git_local_env" ]; then
 fi
 
 command -v python3 >/dev/null 2>&1 || {
-    echo "pre-push: python3 not found; skipping the generated-projection check" >&2
+    echo "pre-push: python3 not found; skipping the pre-push checks" >&2
     exit 0
 }
 
-if python3 "$root/tools/generate.py" --check; then
-    exit 0
-fi
+logs=$(mktemp -d) || exit 0
+trap 'rm -rf "$logs"' EXIT HUP INT TERM
+set -- \
+    "generate|python3 tools/generate.py --check" \
+    "landing|python3 tools/render-landing.py --check" \
+    "adaptation-boundary|./tools/check-adaptation-boundary.sh" \
+    "model-config|python3 tools/check-model-config.py" \
+    "unit-config|python3 tools/check-unit-config.py" \
+    "scope-placeholders|python3 tools/check-scope-placeholders.py"
+for check in "$@"; do
+    name=${check%%|*}
+    (cd "$root" && sh -c "${check#*|}" >"$logs/$name.log" 2>&1; echo $? >"$logs/$name.rc") &
+done
+wait
 
-cat >&2 <<'MSG'
+failed=""
+for check in "$@"; do
+    name=${check%%|*}
+    rc=$(cat "$logs/$name.rc" 2>/dev/null || echo 1)
+    if [ "$rc" != 0 ]; then
+        failed="$failed $name"
+        echo "--- pre-push: $name failed ---" >&2
+        grep -E 'FAIL|ERROR|Error|stale|missing' "$logs/$name.log" | head -20 >&2
+    fi
+done
+[ -z "$failed" ] && exit 0
 
-pre-push: generated core projections are stale — CI would fail this push.
+cat >&2 <<MSG
 
-  fix:    python3 tools/generate.py && git add -u && git commit --amend --no-edit
-  bypass: git push --no-verify
+pre-push: CI's adaptation-boundary job would fail this push:$failed
+  stale projections: python3 tools/generate.py && git add -u && git commit --amend --no-edit
+  bypass:            git push --no-verify
 MSG
 exit 1

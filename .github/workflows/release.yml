@@ -15,6 +15,9 @@ permissions:
 
 jobs:
   admission:
+    # A failed or superseded (cancelled) Checks run is not a release candidate;
+    # skip instead of failing so it does not raise a second failure notice.
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:

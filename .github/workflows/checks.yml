@@ -132,8 +132,11 @@ jobs:
       - name: Run the full isolated test suite (C-3/C-4)
         # --seed-baseline uploads the proposed rows stamped with this runner's
         # fingerprint; adopting them is a human decision, never automatic.
+        # A known failure that now passes is reported, not failed: a fix
+        # should not turn the build red until its baseline row is dropped.
         run: |
           python3 tools/run-tests.py --retries 1 \
+            --xpass-nonfatal \
             --strict-leak-sweep \
             --report ${{ runner.temp }}/run-tests-report.tsv \
             --diagnostics-dir ${{ runner.temp }}/run-tests-diagnostics \

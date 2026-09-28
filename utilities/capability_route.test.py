@@ -5935,6 +5935,11 @@ class ComposeRouteTest(TestRoute):
     unresolved=R.compose_campaign_selection(joined)
     self.assertEqual((unresolved["mode"],unresolved["active_keys_unavailable"]),("unresolved",True))
     self.assertIn("확인 불가",R.compose_card(joined))
+ def test_mode_selects_the_capability_recipe_that_declares_it(self):
+  route=self.compose(capability="autopilot-lab",capability_mode="eval",graph="eval-run,metrics,report")
+  self.assertEqual([n["id"] for n in route["nodes"]],["eval-run","metrics","report"])
+  with self.assertRaisesRegex(ValueError,r"compose-mode-unknown:nosuch \(modes: eval,setup\)"):
+   self.compose(capability="autopilot-lab",capability_mode="nosuch")
  def test_graph_spec_parsing(self):
   self.assertEqual(R.parse_graph_spec("execute,test:qa/test , report"),[("execute",None),("test","qa/test"),("report",None)])
   for bad in ("", " , ", "execute,execute", "Bad!"):
