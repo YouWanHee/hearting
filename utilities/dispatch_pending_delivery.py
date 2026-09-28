@@ -58,6 +58,7 @@ RECIPIENT_KINDS = frozenset({
     "claude-parent-runtime",
     "codex-stop-hook",
     "codex-managed-gateway",
+    "codex-native-queue",
     "opencode-turn",
 })
 
@@ -585,6 +586,21 @@ def reclaim(root: Path, recipient_key: str, delivery_id: str, *, now_ns: int) ->
         updated["state"] = "pending"
         updated["claim_owner"] = None
         updated["claim_deadline_ns"] = None
+        _write_unlocked(path, updated)
+        return updated
+
+
+def release_claim(root: Path, recipient_key: str, delivery_id: str, *, claim_owner: str) -> dict:
+    """Return only this carrier's claim, preserving any successor or real ack."""
+    path = record_path(root, recipient_key, delivery_id)
+    with _record_lock(path):
+        value = _read_unlocked(path)
+        if value is None:
+            raise PendingDeliveryError("pending-delivery-identity-conflict", "record-missing")
+        if value.get("state") not in {"claimed", "sent-ambiguous"} or value.get("claim_owner") != claim_owner:
+            return value
+        updated = dict(value)
+        updated.update(state="pending", claim_owner=None, claim_deadline_ns=None)
         _write_unlocked(path, updated)
         return updated
 

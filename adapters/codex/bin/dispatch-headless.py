@@ -148,10 +148,10 @@ from dispatch_completion_join import (  # noqa: E402
 from codex_managed_dispatch import (  # noqa: E402
     MANAGED_PARENT_DELIVERY,
     ManagedDispatchError,
-    launch_managed_completion_sidecar,
     probe_managed_codex_parent,
     registered_parent_delivery,
 )
+from codex_queue_dispatch import launch_codex_queue_completion_sidecar
 import dispatch_parent_completion as parent_completion
 import owner_write_advisory as OWNER_WRITE_ADVISORY
 from execution_access import (  # noqa: E402
@@ -407,7 +407,7 @@ def validate_interactive_parent_launch(args: argparse.Namespace) -> None:
 
 def launch_parent_completion_sidecar(args: argparse.Namespace, jobs: Path) -> None:
     parent_completion.launch_parent_completion_sidecar(
-        args, jobs, launch=launch_managed_completion_sidecar, annotate=annotate_attempt_row)
+        args, jobs, launch=launch_codex_queue_completion_sidecar, annotate=annotate_attempt_row)
 
 
 def fail(reason: str, code: int, **fields: str) -> int:

@@ -180,7 +180,6 @@ usage: preflight.sh write <file> [session-id] [turn-id]
        preflight.sh tui-config
        preflight.sh interactive-main-recovery --check --pane <herdr-pane-id>
        preflight.sh interactive-main-recovery --start --pane <herdr-pane-id> --workspace <dir>
-       preflight.sh managed-entry [--check] --codex-home <private-dir> --state-dir <private-dir> --workspace <dir> [--jobs <jobs.log>] [-- client-args...]
        preflight.sh subagent-info [--check]
        preflight.sh headless [--check] [--require-hook-trust] <worktree>
        preflight.sh nested-headless --parent-harness <h> --parent-transport <t> --parent-sandbox <s> --child-harness <h> --launch-authority <authority> --worktree <path> [--prospective-standard-owner --jobs <canonical-jobs.log>] [--user-disabled] [--json]
@@ -640,7 +639,8 @@ EOF
     ;;
   managed-entry)
     shift
-    exec python3 "$ROOT/utilities/codex-managed-entry.py" "$@"
+    printf "%s\n" "managed-entry is retired; start the native codex CLI directly" >&2
+    exit 69
     ;;
   headless)
     shift

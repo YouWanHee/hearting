@@ -2,7 +2,7 @@
 """The launch receipt states the parent's next action (one model-visible contract).
 
 Completion delivery has several runtime realizations -- an interactive Claude
-parent's `asyncRewake` carrier, a managed Codex single-ingress gateway, a
+parent's `asyncRewake` carrier, a native Codex per-thread queue, a
 registered owner's session supervisor, the legacy Codex Stop hook, and the
 disclosed `poll-fallback`. Which one applies is a *runtime* selection made from
 the parent runtime (`resolve_parent_completion_delivery` in each adapter
@@ -35,6 +35,7 @@ NEXT_VALUES = frozenset({NEXT_END_TURN, NEXT_BOUNDED_WAIT})
 # Every value the three adapter wrappers' `resolve_parent_completion_delivery`
 # returns, plus the two legacy recipient kinds older rows still carry.
 CARRIER_DELIVERIES = {
+    "codex-native-queue": "carrier-codex-native-queue",
     "claude-parent-runtime": "carrier-claude-async-rewake",
     "codex-managed-gateway": "carrier-codex-managed-gateway",
     "codex-stop-hook": "carrier-codex-stop-hook",

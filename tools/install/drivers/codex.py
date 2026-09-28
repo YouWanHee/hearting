@@ -15,9 +15,9 @@ import paths
 import projector
 import manifest
 import verifier
-import codex_launcher
 import user_model_config
 import safe_fs
+import codex_launcher
 
 RUNTIME = "codex"
 
@@ -213,24 +213,15 @@ def install(scope="global", plugin=False, dry_run=False):
 
     if plugin:
         actions.append(_plugin_action(dry_run))
-        try:
-            actions.append(codex_launcher.install(dry_run=dry_run))
-        except codex_launcher.CodexUnavailableError as exc:
-            actions.append(
-                {
-                    "action": "managed-launcher",
-                    "status": "skipped-unavailable",
-                    "detail": str(exc),
-                }
-            )
-        except codex_launcher.CodexLauncherError as exc:
-            actions.append(
-                {
-                    "action": "managed-launcher",
-                    "status": "blocked",
-                    "detail": str(exc),
-                }
-            )
+    # Restore only the launcher recorded by its ownership manifest. The
+    # launcher transaction preserves foreign successors and rolls back errors.
+    try:
+        actions.append(codex_launcher.uninstall(
+            codex_home=paths.runtime_home(RUNTIME, scope), dry_run=dry_run))
+    except codex_launcher.CodexLauncherError as exc:
+        actions.append({"action": "managed-launcher", "status": "blocked",
+                        "detail": str(exc)})
+
 
     manifest_result = None
     if not dry_run:

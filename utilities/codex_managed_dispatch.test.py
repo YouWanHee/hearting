@@ -396,12 +396,12 @@ class ManagedDispatchTest(unittest.TestCase):
                     result.returncode, 0, result.stderr + result.stdout
                 )
                 self.assertIn(
-                    "parent_completion_delivery=codex-managed-gateway",
+                    "parent_completion_delivery=codex-native-queue",
                     result.stdout,
                 )
                 registry = jobs.read_text(encoding="utf-8")
                 self.assertIn(
-                    "parent_completion_delivery=codex-managed-gateway",
+                    "parent_completion_delivery=codex-native-queue",
                     registry,
                 )
                 self.assertIn(f"harness={adapter}", registry)

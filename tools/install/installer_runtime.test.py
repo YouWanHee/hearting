@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Installer-level fault injection at the Codex launcher commit boundary.
+"""Installer-level fault injection at the Codex launcher retirement boundary.
 
 `runtime_activation.test.py` and `runtime-activation.test.sh` already prove
 `runtime_activation.py`'s own multi-runtime rollback and the end-to-end
@@ -7,10 +7,8 @@ protected-ingress lifecycle against a full adapter fixture. This module
 isolates `installer.py`'s `cmd_runtime` rollback wiring instead: it stubs the
 runtime-projection collaborator (`runtime_activation.capture_runtime_state` /
 `activate` / `refresh` / `restore_runtime_state` / `discard_runtime_state`) so
-a failure can be injected precisely at the launcher-commit boundary added by
-this plan (`HARNESS_INSTALLER_FAIL_AFTER_LAUNCHER=1`, right after
-`codex_launcher.install()` returns but before the transaction is reported as
-durable), and asserts the real `codex_launcher` state/wrapper on disk is
+a failure can be injected precisely after legacy launcher removal
+(`HARNESS_INSTALLER_FAIL_AFTER_LAUNCHER=1`) and asserts the launcher state is
 restored to its exact pre-transaction bytes.
 """
 import os
@@ -120,6 +118,10 @@ class LauncherCommitBoundaryTest(unittest.TestCase):
                 f"protected user-owned surface was mutated: {path}",
             )
 
+    def _install_legacy_launcher(self):
+        result = codex_launcher.install(dry_run=False)
+        self.assertEqual(result["status"], "created")
+
     def _args(self, command):
         return Namespace(
             runtime=["codex"],
@@ -139,9 +141,13 @@ class LauncherCommitBoundaryTest(unittest.TestCase):
             dry_run=False,
         )
 
-    def test_injected_failure_after_launcher_commit_restores_exact_prior_state(self):
+    def test_injected_failure_after_launcher_retirement_restores_exact_prior_state(self):
+        self._install_legacy_launcher()
         with _stubbed_runtime_projection():
             first = installer.cmd_runtime(self._args("activate"))
+        # Activation itself retires the pre-existing launcher, so seed it
+        # again to exercise rollback at the retirement boundary.
+        self._install_legacy_launcher()
         self.assertEqual(first["exit"], installer.EXIT_OK)
 
         state_path = codex_launcher.state_path(self.codex_home)
@@ -162,10 +168,8 @@ class LauncherCommitBoundaryTest(unittest.TestCase):
             {"fake": "snapshot", "_sealed": True}
         )
 
-        # The launcher install() call inside the injected attempt ran and
-        # committed (it is a real, unmocked transaction); the installer's
-        # rollback must have driven codex_launcher.restore_snapshot() to put
-        # the wrapper and state back to the pre-refresh committed bytes.
+        # The installer's rollback restores the legacy wrapper and state to
+        # their exact pre-refresh bytes.
         self.assertEqual(state_path.read_bytes(), committed_state_bytes)
         self.assertEqual(wrapper_target.read_bytes(), committed_wrapper_bytes)
         status = codex_launcher.status(codex_home=self.codex_home)
@@ -174,6 +178,7 @@ class LauncherCommitBoundaryTest(unittest.TestCase):
         self._assert_protected_surfaces_untouched()
 
     def test_no_injection_leaves_refresh_committed(self):
+        self._install_legacy_launcher()
         for command in ("activate", "refresh"):
             with _stubbed_runtime_projection() as mocks:
                 result = installer.cmd_runtime(self._args(command))
@@ -185,18 +190,18 @@ class LauncherCommitBoundaryTest(unittest.TestCase):
             )
             restore_runtime_state.assert_not_called()
         status = codex_launcher.status(codex_home=self.codex_home)
-        self.assertTrue(status["installed"])
-        self.assertEqual(status["real_command"], str(self.vendor_codex))
+        self.assertFalse(status["installed"])
         self._assert_protected_surfaces_untouched()
 
     def test_reinstall_after_activate_is_idempotent_at_installer_level(self):
+        self._install_legacy_launcher()
         with _stubbed_runtime_projection():
             first = installer.cmd_runtime(self._args("activate"))
         self.assertEqual(first["exit"], installer.EXIT_OK)
         state_path = codex_launcher.state_path(self.codex_home)
         wrapper_target = codex_launcher.wrapper_path(codex_launcher.default_bin_dir())
-        committed_state_bytes = state_path.read_bytes()
-        committed_wrapper_bytes = wrapper_target.read_bytes()
+        self.assertFalse(state_path.exists())
+        self.assertFalse(wrapper_target.exists())
 
         # Reinstall: activate again over an already-activated runtime.
         with _stubbed_runtime_projection() as mocks:
@@ -204,17 +209,15 @@ class LauncherCommitBoundaryTest(unittest.TestCase):
             mocks["restore_runtime_state"].assert_not_called()
 
         self.assertEqual(second["exit"], installer.EXIT_OK)
-        self.assertEqual(state_path.read_bytes(), committed_state_bytes)
-        self.assertEqual(wrapper_target.read_bytes(), committed_wrapper_bytes)
         status = codex_launcher.status(codex_home=self.codex_home)
-        self.assertTrue(status["installed"])
-        self.assertEqual(status["real_command"], str(self.vendor_codex))
+        self.assertFalse(status["installed"])
         self._assert_protected_surfaces_untouched()
 
     def test_full_uninstall_removes_managed_launcher(self):
         with _stubbed_runtime_projection():
             first = installer.cmd_runtime(self._args("activate"))
         self.assertEqual(first["exit"], installer.EXIT_OK)
+        self._install_legacy_launcher()
         wrapper_target = codex_launcher.wrapper_path(codex_launcher.default_bin_dir())
         self.assertTrue(wrapper_target.exists())
 
@@ -229,6 +232,7 @@ class LauncherCommitBoundaryTest(unittest.TestCase):
         with _stubbed_runtime_projection():
             first = installer.cmd_runtime(self._args("activate"))
         self.assertEqual(first["exit"], installer.EXIT_OK)
+        self._install_legacy_launcher()
 
         state_path = codex_launcher.state_path(self.codex_home)
         wrapper_target = codex_launcher.wrapper_path(codex_launcher.default_bin_dir())

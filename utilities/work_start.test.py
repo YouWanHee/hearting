@@ -506,19 +506,20 @@ class WorkStartTest(unittest.TestCase):
         self.assertEqual(result["state"], "completed", result)
         self.assertEqual(len(self.calls), 3)
 
-    def test_resume_reuses_witnessed_parent_and_refuses_sibling_or_missing_proof(self):
+    def test_resume_keeps_native_parent_when_gateway_transport_has_advanced(self):
         self.start()
-        W.default_parent_session_id.return_value = "inherited"
         with mock.patch.dict(os.environ, {"AGENT_CODEX_MANAGED_GATEWAY": "1", "AGENT_DISPATCH_CHILD": "0"}), \
-             mock.patch.object(W, "interactive_parent_identity", return_value=("codex", "inherited")), \
-             mock.patch.object(W, "probe_managed_codex_parent", return_value=SimpleNamespace(thread_id="parent")) as probe:
+             mock.patch.object(W, "interactive_parent_identity", return_value=("codex", "parent")), \
+             mock.patch.object(W, "probe_managed_codex_parent", return_value=SimpleNamespace(thread_id="gateway-successor")) as probe:
             self.assertEqual(self.start()["state"], "preparing")
             self.assertEqual(len(self.calls), 2)
-            probe.assert_called_with(parent_harness="codex", parent_session_id="inherited")
+            probe.assert_not_called()
             probe.return_value = SimpleNamespace(thread_id="sibling")
-            self.assertEqual(self.start()["reason"], "work-parent-recovery-required")
+            self.assertEqual(self.start()["state"], "preparing")
+            self.assertEqual(len(self.calls), 2)
             probe.side_effect = W.ManagedDispatchError("managed-gateway-not-ready")
-            self.assertEqual(self.start()["reason"], "work-parent-recovery-required")
+            self.assertEqual(self.start()["state"], "preparing")
+            probe.assert_not_called()
             self.assertEqual(len(self.calls), 2)
 
     def test_route_hash_collision_is_never_adopted(self):

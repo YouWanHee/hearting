@@ -17,6 +17,7 @@ import stat
 from typing import Any
 
 from dispatch_completion_join import (
+    CODEX_QUEUE_PARENT_DELIVERY,
     JoinContractError,
     MANAGED_SESSION_PARENT_DELIVERY,
     OPEN_STATES,
@@ -37,7 +38,8 @@ SCHEMA_VERSION = 1
 KIND = "human-gate"
 STATE = "blocked"
 REQUIRED_ACTION = "inspect-release"
-RECIPIENT_KIND = MANAGED_SESSION_PARENT_DELIVERY
+RECIPIENT_KIND = CODEX_QUEUE_PARENT_DELIVERY
+LEGACY_RECIPIENT_KIND = MANAGED_SESSION_PARENT_DELIVERY
 CAPABILITY = {
     "schema_version": SCHEMA_VERSION,
     "recipient_kind": RECIPIENT_KIND,
@@ -221,8 +223,12 @@ def make_receipt(
     interview: bool,
     questions: int,
     pending_delivery_id: str,
+    recipient_kind: str = RECIPIENT_KIND,
 ) -> dict[str, Any]:
     """Build bytes for one raise; live journal validation happens after commit."""
+
+    if recipient_kind not in {RECIPIENT_KIND, LEGACY_RECIPIENT_KIND}:
+        raise HumanGateReceiptError("recipient-kind-invalid")
 
     receipt = {
         "schema_version": SCHEMA_VERSION,
@@ -331,15 +337,17 @@ def _validate_live_row(
     owner_attempt = receipt["owner_attempt_id"]
     if owner_attempt not in expected_attempts:
         raise HumanGateReceiptError("batch-attempt-mismatch")
-    try:
-        rows = current_session_children(
-            jobs,
-            receipt["recipient_thread_id"],
-            {owner_attempt},
-            RECIPIENT_KIND,
-        )
-    except JoinContractError as exc:
-        raise HumanGateReceiptError("registry-owner-invalid") from exc
+    rows = []
+    errors = []
+    for kind in (RECIPIENT_KIND, LEGACY_RECIPIENT_KIND):
+        try:
+            rows.extend(current_session_children(
+                jobs, receipt["recipient_thread_id"], {owner_attempt}, kind,
+            ))
+        except JoinContractError as exc:
+            errors.append(exc)
+    if not rows:
+        raise HumanGateReceiptError("registry-owner-invalid") from (errors[-1] if errors else None)
     if len(rows) != 1 or rows[0].status not in OPEN_STATES:
         raise HumanGateReceiptError("registry-owner-not-live")
     metadata = rows[0].metadata
@@ -420,6 +428,9 @@ def validate_pending_record(
         "sent-ambiguous",
     }:
         raise HumanGateReceiptError("pending-record-invalid")
+    recipient_kind = record.get("recipient_kind")
+    if recipient_kind not in {RECIPIENT_KIND, LEGACY_RECIPIENT_KIND}:
+        raise HumanGateReceiptError("pending-record-recipient-invalid")
     receipt = validate_receipt(
         record.get("receipt"),
         jobs=jobs,
@@ -431,7 +442,6 @@ def validate_pending_record(
     owner_attempt = receipt["owner_attempt_id"]
     if (
         record.get("delivery_id") != receipt["pending_delivery_id"]
-        or record.get("recipient_kind") != RECIPIENT_KIND
         or record.get("recipient_digest")
         != pending_delivery.recipient_digest(expected_thread_id)
         or record.get("session_generation") != str(expected_epoch)

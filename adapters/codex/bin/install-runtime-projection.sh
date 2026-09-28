@@ -204,22 +204,15 @@ else
   printf 'plugin_install=not-requested hint=rerun-with---install-plugin\n'
 fi
 
-default_codex_home=$HOME/.codex
-if [ -z "${HARNESS_BIN_DIR:-}" ] && [ "$(real "$CODEX_HOME")" != "$(real "$default_codex_home")" ]; then
-  # A temporary/private CODEX_HOME must not silently replace the user's global
-  # CLI ingress. Operators can opt in with an explicit HARNESS_BIN_DIR.
-  printf 'managed_launcher=skipped reason=non-default-codex-home-without-harness-bin-dir\n'
-elif [ -n "$vendor_codex_command" ]; then
-  launcher_result=$(python3 "$AGENT_HOME/tools/install/codex_launcher.py" install \
-    --codex-home "$CODEX_HOME" --real-command "$vendor_codex_command" --json) || {
-      printf '%s\n' "$launcher_result" >&2
-      echo "install-runtime-projection: managed Codex launcher installation failed" >&2
-      exit 3
-    }
-  printf 'managed_launcher=%s\n' "$launcher_result"
-else
-  printf 'managed_launcher=skipped-unavailable reason=codex-command-not-found\n'
-fi
+# Retirement follows the exact recorded owner and restoration metadata; it
+# needs no vendor CLI lookup and never removes an unowned PATH entry.
+launcher_result=$(python3 "$AGENT_HOME/tools/install/codex_launcher.py" uninstall \
+  --codex-home "$CODEX_HOME" --json) || {
+    printf '%s\n' "$launcher_result" >&2
+    echo "install-runtime-projection: managed Codex launcher retirement failed" >&2
+    exit 3
+  }
+printf 'managed_launcher=%s\n' "$launcher_result"
 
 printf 'status=ok\n'
 printf 'codex_home=%s\n' "$CODEX_HOME"

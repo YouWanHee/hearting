@@ -105,29 +105,10 @@ posture only — no secrets and no machine-specific absolute project paths (the
 merge the relevant lines into `$CODEX_HOME/config.toml` on the target machine.
 (codex-adapter-parity audit P-15: gap closed.)
 
-A **managed interactive** Codex session — one this harness launches through
-`utilities/codex-launcher.py`, meaning bare `codex`, `codex resume`, and
-`codex fork` — starts in bypass by default: the launcher prepends
-`--dangerously-bypass-approvals-and-sandbox` (the `--yolo` alias) ahead of the
-invocation, so it stays a root option even before a subcommand. This is the same
-user decision that already starts a steward-launched child Codex root with that
-flag (`peer-steward.py start`, stage-dispatch SD-122 (9)) and a registered Claude
-worker in `bypassPermissions`: a session the harness starts is unattended by
-design and should come up ready to work. Two things turn it off — the environment
-variable `AGENT_CODEX_INTERACTIVE_PERMISSION_MODE=inherit`, and any invocation
-that already states a posture of its own (`-s/--sandbox`, `-a/--ask-for-approval`,
-`--approve-for-me`, the bypass flag itself, `-p/--profile`, or a
-`-c approval_policy=…`/`sandbox_mode=…`/`sandbox_permissions=…` override), which
-is passed through untouched.
-
-The boundary this does **not** cross is registered dispatch. `codex exec` is a
-passthrough surface that never reaches the managed path, so a registered worker
-keeps `approval_policy=never` with a real sandbox as its security boundary
-(`core/OPERATIONS.md` §5.10, stage-dispatch SD-125 (5)) and never receives the
-bypass flag. Measured 2026-09-03 in `~/.codex/sessions/**/rollout-*.jsonl`
-`turn_context`: launcher default → `never` + `danger-full-access`; launcher with
-`-s read-only -a on-request` → `on-request` + `read-only`; every `codex_exec`
-session in the same window → `never` + `workspace-write`.
+Interactive Codex uses its native launcher and user-owned permission settings.
+Hearting no longer inserts a managed gateway or changes interactive permission
+posture. Registered headless work keeps its separately checked permission and
+sandbox contract (`core/OPERATIONS.md` §5.10).
 
 ## Native Skill And Plugin Surface
 
@@ -475,8 +456,8 @@ is observed.
 | permission mapping | Run `adapters/codex/bin/preflight.sh permissions` to inspect the Codex approval/sandbox contract and confirm Claude `allowedTools` is unsupported |
 | MCP mapping | Run `adapters/codex/bin/preflight.sh mcp --check` to inspect Codex's native MCP CLI/config surface; do not copy Claude `settings.json` MCP registrations or project `tools/design-mcp` wholesale |
 | dispatch-owner selection | An ordinary dispatch-depth-1 owner uses `dispatch-owner [--adapter <harness>] --dry-run|--register|--start`, a separate mapping row from `headless dispatch` below. It delegates to portable `utilities/dispatch-owner.py`, which prefers the user-local routing policy and runs explicit target → hard eligibility → sealed affinity → profile quality band → fresh headroom → recent-attempt tie-break. Capacity reorders peers or crosses a declared relief threshold but never silently makes OpenCode a deep quality peer. The selector execs only the chosen `adapters/<selected>/bin/dispatch-headless.py`, preserves actual caller runtime separately from selected owner adapter, and forbids completion-policy or unmanaged-poll flags |
-| headless dispatch | Run `preflight.sh headless --check <worktree>` before launch; it verifies native Skills, native Agents, and native Modes. Use `dispatch --dry-run|--register|--start` for registered work. Standard+ dispatch-depth-1 owners use `--completion-delivery auto`: a checked App Server probe selects an ephemeral same-thread supervisor, forced `supervised` fails before registration when unavailable, and explicit/unavailable fallback is reported as `poll-fallback`. Quick and dispatch-depth-2 workers stay one-shot `codex exec`. A direct registered dispatch-depth-1 start binds `parent_completion_delivery` to the actual parent runtime, not the child: checked managed Codex → `codex-managed-gateway`, Claude → `claude-parent-runtime`; an unmanaged interactive Codex candidate fails with `managed-entry-required` before registry mutation or spawn. A low-level operator may explicitly authorize finite recovery with `--allow-unmanaged-parent-poll`, but `dispatch-owner` and model routes cannot select it. The path never creates new Stop state or requires hook trust. The wrapper validates the scalar `capability_mode`, optional non-owner `worker_mode`, behavioral `model_role`, and execution `model_profile` as separate axes; `_kernel/owner` rejects a worker mode. Profiles resolve through `config/models.conf`, caller model/reasoning replacement and substantive registered `mini` are denied, and rows expose resolved tier/granularity for Fleet. Registration materializes the portable kernel, one worker type, route metadata, and assigned Skill/unit. Registry serialization, approval, harvest, and cleanup contracts remain unchanged |
-| completion delivery | A registered Codex headless owner keeps its private App Server supervisor. After GitHub/runtime installation, interactive `codex`, `resume`, and `fork` enter `utilities/codex-managed-entry.py` transparently through a reversible launcher; `preflight.sh managed-entry` remains the explicit diagnostic/operator surface. The owner-only gateway is the single upstream App Server client, its remote TUI is the sole subscription/approval authority, and its control-only sidecar is prelaunched between immutable registration and the exact worker spawn claim. The entry exports one exact registry, private by default and explicitly replaceable with the canonical registry for an enrolled session. The sidecar waits for that claim, joins only the sealed terminal+quiescent attempt set, and sends one bounded typed receipt without raw output. The gateway atomically serializes manual input and completion, deduplicates by its durable sealed-batch ledger rather than `clientUserMessageId`, replays accepted results, and treats post-send disconnect as non-retryable `sent-ambiguous`. Managed entry checks the exact effective `default_mode_request_user_input` row and process-locally enables it in both App Server and remote TUI processes; explicit per-launch disable wins, unsupported builds warn and continue, and runtime-owned config/trust/auth state is untouched. The gateway persists only typed request identity and time as exact `codex-appserver` Fleet evidence, projects native question wait policy (`isBlocking=true`, legacy `autoResolutionMs=null`) to disable automatic empty answers, preserves request identity/content and every real response or cancellation, and clears only gateway-owned evidence on exact resolution, turn completion/interruption, or disconnect. Stop is silent and no wildcard PreToolUse park exists; new unmanaged interactive parents are rejected before spawn instead of entering model-owned polling. Low-level operator-only and existing open/legacy attempts retain bounded finite recovery, while old `codex-stop-hook` state is exact-harvest migration only. Parent runtime remains decisive across child runtimes: Claude parents use one exact owner `asyncRewake` and registered owners use `--resume`; Codex parents use the gateway for either Codex or Claude children. Sidecars never subscribe upstream or own approvals |
+| headless dispatch | Run `preflight.sh headless --check <worktree>` before launch; it verifies native Skills, native Agents, and native Modes. Use `dispatch --dry-run|--register|--start` for registered work. Standard+ dispatch-depth-1 owners use `--completion-delivery auto`: a checked App Server probe selects an ephemeral same-thread supervisor, forced `supervised` fails before registration when unavailable, and explicit/unavailable fallback is reported as `poll-fallback`. Quick and dispatch-depth-2 workers stay one-shot `codex exec`. A direct registered dispatch-depth-1 start binds `parent_completion_delivery` to the actual parent runtime, not the child: native Codex → `codex-native-queue`, Claude → `claude-parent-runtime`; a gateway-free Codex parent is admitted with its calling CODEX_THREAD_ID. A low-level operator may explicitly authorize finite recovery with `--allow-unmanaged-parent-poll`, but `dispatch-owner` and model routes cannot select it. The path never creates new Stop state or requires hook trust. The wrapper validates the scalar `capability_mode`, optional non-owner `worker_mode`, behavioral `model_role`, and execution `model_profile` as separate axes; `_kernel/owner` rejects a worker mode. Profiles resolve through `config/models.conf`, caller model/reasoning replacement and substantive registered `mini` are denied, and rows expose resolved tier/granularity for Fleet. Registration materializes the portable kernel, one worker type, route metadata, and assigned Skill/unit. Registry serialization, approval, harvest, and cleanup contracts remain unchanged |
+| completion delivery | Native Codex queue delivery uses the caller CODEX_THREAD_ID, at-least-once submission and exact pending/history checks. The interactive launcher and gateway are retired. Registered headless owners keep their separate App Server supervisor. Native question timing is preserved; empty answers are not user decisions. |
 | role modes | Read `roles/MODES.md`, then run `adapters/codex/bin/preflight.sh mode-info <family/mode>`; read the reported `native_mode_path`, obey `fallback=reference-only` only for unsupported modes, and satisfy any named `tool_contract` / `tool_contract_check` before claiming tool-contract modes |
 | mode guides | Use `adapters/codex/modes/<family>/<mode>.md` as the Codex-native realization guide reported by `mode-info`; satisfy named tool contracts or report unavailable before claiming support |
 | design modes | Use `adapters/codex/modes/design/<mode>.md` as the Codex-native realization guide; satisfy `visual-harness` or report unavailable before claiming rendered visual verification |
@@ -490,28 +471,12 @@ the verified owner route: declared node count plus one slot for every unique
 `--max-continuations` owner-launch value is an explicit replacement; missing or
 mismatched route evidence stays at the finite floor.
 
-For a manual/completion race, a managed Codex gateway accepts same-turn
-`turn/steer` when App Server permits it. An explicit not-steerable error is
-proof that the receipt was not accepted: the gateway serializes that exact
-delivery into one `turn/start` after idle. A crash during this in-memory defer
-is durable `sent-ambiguous`, so retry cannot create a duplicate wake.
-
-Visible-main transitions are a separate local projection: initial binding,
-successful same-TUI `thread/start`, successful same-TUI `thread/resume`, and a
-direct fork of the current binding are distinct from tool/native-subagent
-threads and diagnostic siblings. Only an exact successful TUI request/response
-in the current epoch advances the binding, with monotonic last-requested-wins
-sequencing. Present `sessionId`/`forkedFromId` contradictions fail closed;
-documented optional absence is recorded as unverified. Delivery is fenced by
-thread, epoch, binding generation, transition chain, parent/session, canonical
-jobs identity, attempts, and batch. `utilities/interactive-main-recovery.py`
-is the narrow Herdr-only recovery surface: `preflight.sh
-interactive-main-recovery --check` reads pane evidence, while explicit
-`--start` rechecks the source workspace/tab/pane, creates a visible pane with
-`herdr pane split`, validates its workspace/tab/cwd, and then runs `herdr agent
-start`; it has no tmux fallback. A post-split failure reports the created pane
-for operator cleanup. Herdr IDs are optional provenance and never transition
-authority.
+Interactive completion is at-least-once through `thread/queue/add`, with stable
+client identity and consumed/pending checks before retransmission. Only one
+exact pending Hearting item may restart an interrupted thread. Native TUI
+subscriptions and approvals remain untouched; no `thread/resume` workaround is
+used. A refusal remains in the durable ledger and is rendered on the next real
+prompt before acknowledgement. Parent identity is the caller's CODEX_THREAD_ID.
 
 The wrapper validates the capability catalog, validates an optional non-owner
 `worker_mode` through `mode-info`, and `_kernel/owner` rejects a worker mode

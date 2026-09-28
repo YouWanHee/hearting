@@ -490,31 +490,13 @@ starts no subprocess or SessionEnd work, and emits no continuation. This
 supersedes older `native-Stop` and ordinary interactive park wording in this
 section; those shapes are migration history only.
 
-The SD-92 advanced-thread clause accepts an exact same-epoch visible-TUI
-`thread/start` or `thread/resume`, or a gateway-witnessed direct fork of the
-current binding (or the exact requested source at initial fork entry). Persisted
-fork ancestry on a resumed thread is valid metadata, not transition authority.
-An immutable witnessed launcher root and bounded transition history survive
-conversation revisits; an identity-preserving same-epoch resume keeps the batch
-generation. A tool/native-subagent thread, unrelated sibling, response from
-another TUI, failed newest request, and stale older response remain diagnostic
-only. Present `thread.sessionId`/`forkedFromId` contradictions fail closed;
-documented-but-absent optional evidence is recorded as unverified. Completion
-delivery is sealed to the exact thread, epoch, binding generation, transition
-chain, parent/session, canonical jobs identity, attempts, and batch, then
-revalidated immediately before send. Typed parent outcomes distinguish
-`managed-entry-required`, `transition-unproved`, `binding-generation-mismatch`,
-`tui-disconnected`, and `approval-owner-mismatch`.
-
-Interactive-main recovery is distinct from registered headless work. It first
-proves the current terminal host, workspace, tab, source pane, and cwd from
-that host's live evidence, then uses only the host's supported native API to
-create a visible pane in the same workspace/tab and start the protected managed
-launcher. A read-only check creates nothing. A partial mutation reports the
-created pane for operator cleanup; it neither guesses another pane nor silently
-falls back to hidden tmux. Host environment identifiers are provenance, not
-managed-thread transition authority. Every host API call uses the validated
-socket. Command submission is reported separately from native readiness.
+SD-92 completion binds to the calling `CODEX_THREAD_ID`, never a thread observed
+by a gateway. The interactive launcher and gateway are retired. Native queue
+submission is at-least-once; pending/history checks suppress known duplicates.
+Interrupted-parent restart requires one exact pending Hearting item. Transport
+refusal preserves the delivery obligation independently of child completion.
+The native TUI owns subscriptions, questions, and approvals. Headless owners keep
+their separate supervisor. See ADAPTATION §7.1 for the carrier contract.
 
 **SD-110 runtime-owned deterministic stage advance.** At an eligible-linear
 boundary — completion gate proven, exactly one non-terminal runnable
@@ -559,8 +541,8 @@ wait, poll, re-arm, or recap) or `parent_next=bounded-wait` with the exact bound
 filter launch stdout. Completion names the next authorized action; normal success
 requires no harvest. For new registered owners, the completion controller also
 closes the workflow and route and seals the exact cycle. Pending closure preserves
-PASS and carries a supervision notice with exact transaction recovery. Carrier mechanics — the Claude `asyncRewake` hook, the Codex managed
-gateway and sidecar, human-gate-in-flight wakes, receipt schema, refusal classes,
+PASS and carries a supervision notice with exact transaction recovery. Carrier mechanics — the Claude `asyncRewake` hook, the Codex native
+queue and sidecar, human-gate-in-flight wakes, receipt schema, refusal classes,
 and recovery — are runtime-owned and live in `core/ADAPTATION.md §7`.
 
 ### §5.10b. Depth-0 Frame Bootstrap — Launch, Join, Interview

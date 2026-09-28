@@ -135,9 +135,10 @@ from model_profile import (  # noqa: E402
 )
 from codex_managed_dispatch import (
     MANAGED_PARENT_DELIVERY, ManagedDispatchError, probe_managed_codex_parent,
-    launch_managed_completion_sidecar, registered_parent_delivery,
+    registered_parent_delivery,
 )
 import dispatch_parent_completion as parent_completion
+from codex_queue_dispatch import launch_codex_queue_completion_sidecar
 from execution_access import (  # noqa: E402
     AccessContext,
     ExecutionAccessError,
@@ -874,7 +875,7 @@ def validate_interactive_parent_launch(args: argparse.Namespace) -> None:
 
 def launch_parent_completion_sidecar(args: argparse.Namespace, jobs: Path) -> None:
     parent_completion.launch_parent_completion_sidecar(
-        args, jobs, launch=launch_managed_completion_sidecar, annotate=annotate_attempt_row)
+        args, jobs, launch=launch_codex_queue_completion_sidecar, annotate=annotate_attempt_row)
 
 
 def _route_node_leg_fields(args):

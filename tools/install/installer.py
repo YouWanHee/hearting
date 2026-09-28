@@ -1101,7 +1101,7 @@ def cmd_runtime(args):
             source = args.source if args.runtime_command == "activate" else None
             if "codex" in targets:
                 launcher_snapshot = codex_launcher.capture_snapshot(
-                    operation="activation"
+                    operation="uninstall"
                 )
             for runtime in targets:
                 snapshot = runtime_activation.capture_runtime_state(
@@ -1140,11 +1140,10 @@ def cmd_runtime(args):
             if runtime == "codex" and args.runtime_command in {"status", "doctor"}:
                 launcher_report = codex_launcher.status()
                 report["managed_launcher"] = launcher_report
-                if args.runtime_command == "doctor" and args.strict and launcher_report.get("installed"):
-                    if launcher_report.get("protected") and launcher_report.get("path_precedence") != "first":
-                        report["ok"] = False
-                        exit_code = EXIT_VERIFY_FAIL
-                        report["next_action"] = "put the protected Codex ingress first on PATH"
+                if args.runtime_command == "doctor" and launcher_report.get("installed"):
+                    report["ok"] = False
+                    exit_code = EXIT_VERIFY_FAIL
+                    report["next_action"] = "harness runtime refresh --runtime codex to retire the managed launcher"
             reports.append(report)
             freshness = report.get("freshness")
             if freshness is None and isinstance(report.get("status"), dict):
@@ -1198,13 +1197,13 @@ def cmd_runtime(args):
                 report["surface_skew"] = skew
         if args.runtime_command in {"activate", "refresh"} and "codex" in targets:
             try:
-                launcher_result = codex_launcher.install(
+                launcher_result = codex_launcher.uninstall(
                     transaction_snapshot=launcher_snapshot
                 )
             except codex_launcher.CodexUnavailableError as exc:
                 launcher_result = {
                     "action": "managed-launcher",
-                    "status": "skipped-unavailable",
+                    "status": "already-retired",
                     "target": str(codex_launcher.wrapper_path(codex_launcher.default_bin_dir())),
                     "detail": str(exc),
                 }
@@ -1224,7 +1223,7 @@ def cmd_runtime(args):
                 )
             lines.append(
                 "codex: managed-launcher "
-                f"status={launcher_result['status']} target={launcher_result['target']}"
+                f"status={launcher_result['status']} target={launcher_result.get('target', '-') }"
             )
             for report in reports:
                 if report.get("runtime") == "codex":
