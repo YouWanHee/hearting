@@ -24,6 +24,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 
 import paths
+import native_agent_payload
 import projector
 import manifest
 import verifier
@@ -962,7 +963,14 @@ def cmd_uninstall(args):
                         raw_target if raw_target.is_absolute() else d.parent / raw_target
                     ).resolve(strict=False)
                     expected_target = Path(entry["source"]).resolve(strict=False)
-                    if resolved != expected_target:
+                    # A Codex native agent link follows the user model config,
+                    # so an earlier payload or the shipped profile is still ours.
+                    if resolved != expected_target and not (
+                        entry.get("native_agent")
+                        and native_agent_payload.owned_agent_target(
+                            runtime_home, paths.agent_home(), d.name, resolved
+                        )
+                    ):
                         raise RuntimeError(
                             f"expected-state-mismatch: repointed projection preserved: {d}"
                         )
