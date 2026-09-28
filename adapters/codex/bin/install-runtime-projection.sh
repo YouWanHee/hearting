@@ -182,14 +182,41 @@ printf 'skills_mode=%s\n' "$skills_mode"
 printf 'skills_linked=%s\n' "$skills_linked"
 [ "$skills_mode" = "plugin" ] && printf 'skills_unlinked=%s\n' "$skills_unlinked"
 
-# Native Codex custom-agent discovery: one symlink per generated TOML.
+# Native Codex custom-agent discovery: one symlink per generated TOML. When the
+# user model config seeded above renders different agents, link this home's
+# installed payload instead (tools/install/native_agent_payload.py); empty
+# link output means the shipped profiles apply.
+payload_script="$AGENT_HOME/tools/install/native_agent_payload.py"
+payload_result=$(python3 "$payload_script" materialize \
+  --runtime-home "$CODEX_HOME" --source-root "$AGENT_HOME") || {
+    printf '%s\n' "$payload_result" >&2
+    echo "install-runtime-projection: native agent payload install failed" >&2
+    exit 3
+  }
+printf 'native_agent_payload=%s\n' "$payload_result"
+payload_links=$(python3 "$payload_script" links \
+  --runtime-home "$CODEX_HOME" --source-root "$AGENT_HOME") || {
+    echo "install-runtime-projection: native agent payload links failed" >&2
+    exit 3
+  }
 agents_linked=0
 mkdir -p "$CODEX_HOME/agents"
-for f in "$S/codex-agents"/*.toml; do
-  [ -f "$f" ] || continue
-  ln -sfn "$f" "$CODEX_HOME/agents/$(basename "$f")"
-  agents_linked=$((agents_linked + 1))
-done
+if [ -n "$payload_links" ]; then
+  tab=$(printf '\t')
+  while IFS="$tab" read -r agent_name agent_path; do
+    [ -n "$agent_name" ] || continue
+    ln -sfn "$agent_path" "$CODEX_HOME/agents/$agent_name"
+    agents_linked=$((agents_linked + 1))
+  done <<EOF
+$payload_links
+EOF
+else
+  for f in "$S/codex-agents"/*.toml; do
+    [ -f "$f" ] || continue
+    ln -sfn "$f" "$CODEX_HOME/agents/$(basename "$f")"
+    agents_linked=$((agents_linked + 1))
+  done
+fi
 printf 'agents_linked=%s\n' "$agents_linked"
 
 if [ "$install_plugin" = "1" ]; then

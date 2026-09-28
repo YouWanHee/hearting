@@ -2,7 +2,9 @@
 """The Codex driver no longer installs the interactive managed launcher."""
 from __future__ import annotations
 
+import contextlib
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -10,6 +12,7 @@ from unittest import mock
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
+import fixture_env  # noqa: E402
 from drivers import codex as codex_driver  # noqa: E402
 
 
@@ -19,6 +22,12 @@ def _no_plan_entries(_runtimes, scope="global"):
 
 class CodexDriverLauncherRetirementTest(unittest.TestCase):
     def setUp(self) -> None:
+        # install() retires hook registrations and plans native agents against
+        # CODEX_HOME, so every run gets a private fixture home.
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        fixture = stack.enter_context(tempfile.TemporaryDirectory())
+        stack.enter_context(fixture_env.patched_environment(fixture, HERE.parents[1]))
         self.addCleanup(mock.patch.stopall)
         mock.patch.object(codex_driver.projector, "plan", side_effect=_no_plan_entries).start()
         mock.patch.object(codex_driver, "_plugin_action", return_value={"action": "plugin", "status": "skipped", "detail": "fixture"}).start()

@@ -317,13 +317,25 @@ if [ "$native_managed" -eq 1 ]; then
   printf 'agents_linked=%s\n' "$linked_agents"
   printf 'check=agents-linked:ok reason=runtime-activation-verified\n'
 else
-projected_agents=$(find -L "$S/codex-agents" -mindepth 1 -maxdepth 1 -type f -name '*.toml' 2>/dev/null | wc -l | tr -d ' ')
+# Expected targets: this home's native-agent payload when its user model config
+# renders different agents (read-only `links`, empty output otherwise), else
+# the shipped profiles.
+expected_agents=$(python3 "$AGENT_HOME/tools/install/native_agent_payload.py" links \
+  --runtime-home "$CODEX_HOME" --source-root "$AGENT_HOME" 2>/dev/null || true)
+if [ -z "$expected_agents" ]; then
+  for f in "$S/codex-agents"/*.toml; do
+    [ -f "$f" ] || continue
+    expected_agents="${expected_agents}$(basename "$f")$(printf '\t')$f
+"
+  done
+fi
+projected_agents=0
 linked_agents=$(find "$CODEX_HOME/agents" -mindepth 1 -maxdepth 1 -type l 2>/dev/null | wc -l | tr -d ' ')
-printf 'agents_projected=%s agents_linked=%s\n' "$projected_agents" "$linked_agents"
 agent_link_fails=0
-for f in "$S/codex-agents"/*.toml; do
-  [ -f "$f" ] || continue
-  name=$(basename "$f")
+tab=$(printf '\t')
+while IFS="$tab" read -r name f; do
+  [ -n "$name" ] || continue
+  projected_agents=$((projected_agents + 1))
   linkpath="$CODEX_HOME/agents/$name"
   if [ -L "$linkpath" ] && [ -n "$(real "$linkpath")" ] && [ "$(real "$linkpath")" = "$(real "$f")" ]; then
     printf 'check=agent-link:%s:ok\n' "$name"
@@ -331,7 +343,10 @@ for f in "$S/codex-agents"/*.toml; do
     printf 'check=agent-link:%s:failed reason=expected-symlink-to:%s\n' "$name" "$f"
     agent_link_fails=$((agent_link_fails + 1))
   fi
-done
+done <<EOF
+$expected_agents
+EOF
+printf 'agents_projected=%s agents_linked=%s\n' "$projected_agents" "$linked_agents"
 if [ "$agent_link_fails" -eq 0 ] && [ "$projected_agents" -gt 0 ]; then
   printf 'check=agents-linked:ok\n'
 else

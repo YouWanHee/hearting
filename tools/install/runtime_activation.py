@@ -36,6 +36,7 @@ if str(UTILITIES_ROOT) not in sys.path:
 import harness_manifest
 import dispatch_contract
 import model_config
+import native_agent_payload
 import projector
 import retired_memory_state
 import safe_fs
@@ -637,6 +638,9 @@ def _linked_entries(
 ) -> List[dict]:
     home = paths.runtime_home(runtime, scope)
     entries: List[dict] = []
+    # Payload links are derived from this home's model config and are kept even
+    # before the payload exists, so status reports a stale payload as stale.
+    derived: List[dict] = []
     # Kernel helpers plus the adapter's native subagent type catalog; both are
     # projected into every activation. Retired team agents stay excluded.
     projected_agents = _kernel_agents(source_root) | _native_agent_catalog(
@@ -668,15 +672,28 @@ def _linked_entries(
                 "skill",
             )
         )
-        entries.extend(
-            _children(
-                source_root / "adapters/codex/agents",
-                home / "agents",
-                "agent",
-                "*.toml",
-                allowed=projected_agents,
+        # The shipped profiles, unless this home's effective model config
+        # renders different native agents (native_agent_payload.py). Computing
+        # the links never writes; activate() installs the payload first.
+        try:
+            agent_links = native_agent_payload.agent_links(home, source_root=source_root)
+        except native_agent_payload.PayloadError:
+            agent_links = {}
+        if agent_links:
+            derived.extend(
+                _entry(path, home / "agents" / name, "agent")
+                for name, path in agent_links.items()
             )
-        )
+        else:
+            entries.extend(
+                _children(
+                    source_root / "adapters/codex/agents",
+                    home / "agents",
+                    "agent",
+                    "*.toml",
+                    allowed=projected_agents,
+                )
+            )
 
     elif runtime == "claude":
         fixed = [
@@ -770,6 +787,7 @@ def _linked_entries(
         raise ActivationError(f"unsupported runtime: {runtime}")
 
     existing = [entry for entry in entries if Path(entry["source"]).exists()]
+    existing.extend(derived)
     if runtime == "claude" and not (
         source_root / "adapters/claude/statusline.sh"
     ).is_file():
@@ -954,17 +972,29 @@ def _native_present(runtime: str, scope: str = "global") -> bool:
     for candidate in candidates:
         if not candidate.is_symlink():
             continue
-        if _native_harness_target(runtime, candidate):
+        if _native_harness_target(runtime, candidate, home):
             return True
     return False
 
 
-def _native_harness_target(runtime: str, candidate: Path) -> bool:
-    """Recognize only a canonical harness projection, never a path substring."""
+def _native_harness_target(
+    runtime: str, candidate: Path, home: Optional[Path] = None
+) -> bool:
+    """Recognize only a canonical harness projection, never a path substring.
+
+    A Codex agent link may also resolve into this runtime home's own installed
+    native-agent payload, proved by containment plus digest/checksum agreement.
+    """
     try:
         target = candidate.resolve(strict=False)
     except RuntimeError:
         return False
+    if (
+        runtime == "codex"
+        and home is not None
+        and native_agent_payload.owned_payload_file(home, target)
+    ):
+        return True
     for root in (target, *target.parents):
         if not (root / "harness-manifest.json").is_file():
             continue
@@ -1011,7 +1041,7 @@ def _discovered_harness_links(runtime: str, scope: str = "global") -> set[Path]:
     found: set[Path] = set()
     for pattern in patterns:
         for candidate in home.glob(pattern):
-            if candidate.is_symlink() and _native_harness_target(runtime, candidate):
+            if candidate.is_symlink() and _native_harness_target(runtime, candidate, home):
                 found.add(candidate)
     return found
 
@@ -2936,6 +2966,18 @@ def activate(
     except user_model_config.UserModelConfigError as exc:
         raise ActivationError(str(exc)) from exc
 
+    # Install the effective native-agent payload (if any) against the seeded
+    # config before the desired links below point at it.
+    if runtime == "codex":
+        try:
+            native_agent_payload.materialize_payload(
+                native_agent_payload.plan_payload(
+                    paths.runtime_home(runtime, scope), source_root=active_root
+                )
+            )
+        except native_agent_payload.PayloadError as exc:
+            raise ActivationError(f"native agent payload: {exc}") from exc
+
     desired = _desired_entries(runtime, mode, source_root, active_root, revision, scope)
     digest = _projection_digest(desired)
     packaged_checksum = _bundle_checksum(active_root) if mode == "packaged" else None
@@ -3118,6 +3160,14 @@ def status(runtime: str, scope: str = "global") -> dict:
         model_config_source = "unavailable"
         model_config_reason = f"shipped-unusable:{exc}"
         missing = True
+    native_agents = None
+    if runtime == "codex":
+        try:
+            native_agents = native_agent_payload.plan_payload(
+                paths.runtime_home(runtime, scope), source_root=active_root
+            ).report()
+        except native_agent_payload.PayloadError as exc:
+            native_agents = {"active": False, "reason": f"unavailable: {exc}"}
     bundle_stale = False
     if state.get("mode") == "packaged":
         current_bundle_checksum = _bundle_checksum(active_root)
@@ -3178,6 +3228,7 @@ def status(runtime: str, scope: str = "global") -> dict:
         "model_config_present": model_config_present,
         "model_config_source": model_config_source,
         "model_config_reason": model_config_reason,
+        **({"native_agent_payload": native_agents} if native_agents is not None else {}),
         "freshness": freshness,
         "session_action": SESSION_ACTIONS[runtime],
         "external_dependencies": [],
