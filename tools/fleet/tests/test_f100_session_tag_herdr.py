@@ -17,6 +17,7 @@ import tempfile
 import time
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 _TOOLS_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _TOOLS_DIR not in sys.path:
@@ -247,6 +248,46 @@ class HerdrCollectorTest(unittest.TestCase):
         shells, fg = herdr.pane_pids(panes, runner=runner)
         self.assertEqual((shells, fg), ({3109434}, {3110298}))
         self.assertEqual(calls, [["herdr", "pane", "process-info", "--pane", "w2:p4"]])  # agent panes only
+
+    def test_codex_thread_requires_live_foreground_pid_not_stale_pane_metadata(self):
+        sid = "01a0e579-d313-7be1-af70-de4ed1194e49"
+        panes = [
+            {"pane_id": "wB:p0", "agent": None, "cwd": "/project",
+             "agent_session": {"agent": "codex", "value": sid}},
+            {"pane_id": "wB:p13", "agent": "codex", "cwd": "/project",
+             "agent_session": {"agent": "codex", "value": sid}},
+        ]
+        calls = []
+
+        def runner(argv, **_kw):
+            calls.append(argv[-1])
+            return SimpleNamespace(returncode=0, stdout=json.dumps({"result": {"process_info": {
+                "shell_pid": 2437902,
+                "foreground_processes": [{"pid": 2438296, "name": "codex"}]}}}))
+
+        tui = Session(harness="codex", pid=2438296, cwd="/project", proc_start="123")
+        with mock.patch.object(procscan, "read_proc_start", return_value="123"):
+            found = herdr.codex_pane_sessions([tui], panes=panes, runner=runner)
+        self.assertEqual(found, {2438296: sid})
+        self.assertEqual(calls, ["wB:p13"])
+        with mock.patch.object(procscan, "read_proc_start", return_value="new-process"):
+            self.assertEqual(herdr.codex_pane_sessions([tui], panes=panes, runner=runner), {})
+
+    def test_codex_pane_lookup_reuses_unchanged_pid_probe(self):
+        tui = Session(harness="codex", pid=2438296, cwd="/project", proc_start="123")
+        old = dict(herdr._CODEX_PANE_CACHE)
+        herdr._CODEX_PANE_CACHE.update(key=None, until=0.0, identities={})
+        try:
+            with mock.patch.object(herdr, "list_panes", return_value=[]) as panes, \
+                 mock.patch.object(herdr, "pane_evidence", return_value=(set(), set(), {})) as evidence, \
+                 mock.patch.object(procscan, "read_proc_start", return_value="123"):
+                self.assertEqual(herdr.codex_pane_sessions([tui]), {})
+                self.assertEqual(herdr.codex_pane_sessions([tui]), {})
+                panes.assert_called_once()
+                evidence.assert_called_once()
+        finally:
+            herdr._CODEX_PANE_CACHE.clear()
+            herdr._CODEX_PANE_CACHE.update(old)
 
     def test_absent_herdr_falls_back_to_lineage_and_only_ever_promotes(self):
         sessions = self._sessions()[:4]

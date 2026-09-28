@@ -877,7 +877,12 @@ def _proc_rollout(pid, cwd, home):
             continue
         candidates.append((1 if _is_subagent(meta) else 0, real))
     if candidates:
-        return min(candidates)[1]
+        # A shared App Server can hold many root threads from the same cwd.
+        # Prefer a root over a subagent only when that preference identifies
+        # exactly one rollout; lexical order is never session ownership proof.
+        roots = {path for rank, path in candidates if rank == 0}
+        preferred = roots or {path for _rank, path in candidates}
+        return next(iter(preferred)) if len(preferred) == 1 else None
     # No cwd match, but the process holds exactly ONE rollout open: the fd itself is the
     # ownership proof. This is the `codex exec --cd <worktree>` shape (2026-07-19): the
     # PROCESS cwd stays where the wrapper launched it while session_meta records the
@@ -909,10 +914,12 @@ def session_id_of_process(pid, live_codex=None):
         cwd = os.readlink("/proc/%d/cwd" % pid)
     except (OSError, ValueError):
         return None
+    from . import procscan
+    if procscan.is_shared_codex_daemon(pid):
+        return None
     path = _proc_rollout(pid, cwd, _home())
     if path:
         return _sid(path)
-    from . import procscan
     if procscan._comm_of(pid) != "codex":
         return None                     # procscan lists only `codex` itself as a runtime
     env = procscan.read_environ(pid)
@@ -1226,11 +1233,38 @@ def prepare_tick(sessions):
     # Running it after the start match changes nothing: that match skips every row with
     # a managed dir, which is every row this transfer touches.
     donated = _transfer_managed_rollouts(sessions, paths)
+    # Newer native Codex TUIs may have no rollout fd while the user-wide daemon
+    # holds many. Only herdr's live foreground PID → thread ID can disambiguate
+    # those same-cwd sessions. Probe unresolved direct TUIs, then open the exact
+    # thread's rollout; a missing rollout still reserves the identity against a
+    # same-cwd fallback.
+    unresolved = [s for s in sessions
+                  if getattr(s, "harness", None) == "codex"
+                  and not getattr(s, "app_server", False)
+                  and not getattr(s, "managed_dir", None)
+                  and not getattr(s, "is_child", False)
+                  and s.pid not in paths and getattr(s, "cwd", None)]
+    pane_ids = {}
+    if unresolved:
+        from . import herdr, procscan
+        pane_ids = herdr.codex_pane_sessions(unresolved)
+        for sess in unresolved:
+            sid = pane_ids.get(sess.pid)
+            if (not sid or _sid("rollout-x-%s.jsonl" % sid) != sid
+                    or sid in claimed):
+                continue
+            sess._herdr_session_id = sid
+            claimed.add(sid)
+            runtime_home = procscan.read_environ(sess.pid).get("CODEX_HOME")
+            homes = (home, runtime_home) if runtime_home else (home,)
+            path = exact_rollout_for_session_id(sid, homes=homes)
+            if path:
+                paths[sess.pid] = path
     _PROC_PATHS.clear()
     _PROC_PATHS.update(paths)
     _FALLBACK_CLAIMS.update(ts=time.time(), sids=claimed)
     tick = _CodexTick(default_home=home, proc_paths=dict(paths), subagents_by_home={},
-                      no_fallback_pids=frozenset(donated))
+                      no_fallback_pids=frozenset(donated | set(pane_ids)))
     homes = {home} if eligible else set()
     homes.update(
         rollout_home for rollout_home in (_rollout_home(path) for path in paths.values())
@@ -1613,6 +1647,8 @@ def enrich(sess, tick=None):
             session_registry.apply_to_session(sess, rec, "codex")
     except Exception:
         pass
+    if getattr(sess, "_herdr_session_id", None):
+        sess.session_id = sess._herdr_session_id
     if not sess.cwd:
         return
     if tick is None:
@@ -1626,6 +1662,9 @@ def enrich(sess, tick=None):
         if not path and sess.pid not in tick.no_fallback_pids:
             path = _fallback_rollout(sess, home)
     if not path:
+        if sess.session_id:
+            from fleet.session_handle import minted_tag
+            sess.session_tag = minted_tag(sess.session_id)
         return                           # no rollout-specific telemetry for this session
     rollout_model, rollout_effort = _rollout_model_effort(path)
     if rollout_model:

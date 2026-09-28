@@ -31,6 +31,29 @@ def _managed_dir(args):
     return match.group(1) if match else None
 
 
+def _shared_codex_daemon(args):
+    """The user-wide App Server service, which is not a session process.
+
+    Per-session managed app servers have a concrete managed-sessions socket and
+    remain visible to the existing exact server/client transfer.
+    """
+    words = (args or "").split()
+    if len(words) < 2 or words[1] != "app-server":
+        return False
+    tail = words[2:]
+    return bool(tail and (tail[0] == "daemon" or "--managed-daemon" in tail))
+
+
+def is_shared_codex_daemon(pid):
+    """Read-only live argv check for callers that start from a PID, not ``scan``."""
+    try:
+        with open("/proc/%d/cmdline" % int(pid), "rb") as handle:
+            args = handle.read(16384).decode("utf-8", "replace").replace("\0", " ")
+    except (OSError, TypeError, ValueError):
+        return False
+    return _shared_codex_daemon(args)
+
+
 def _user_ps_args(columns):
     """GNU ps argv scoped to Fleet's current effective UID, or None.
 
@@ -579,6 +602,8 @@ def scan(harness_filter=None):
         if comm not in HARNESSES:
             continue
         if harness_filter and comm not in harness_filter:
+            continue
+        if comm == "codex" and _shared_codex_daemon(args):
             continue
         try:
             pid = int(pid_s)

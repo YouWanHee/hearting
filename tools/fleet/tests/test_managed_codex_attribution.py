@@ -24,8 +24,9 @@ _TOOLS_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__f
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 
-from fleet.collectors import codex, procscan  # noqa: E402
+from fleet.collectors import codex, herdr, procscan  # noqa: E402
 from fleet.model import Session  # noqa: E402
+from fleet.session_handle import minted_tag  # noqa: E402
 
 _SID = "019facc9-fe83-7480-89f6-9e64fbebf0ca"
 _REAL_LISTDIR = os.listdir
@@ -140,6 +141,65 @@ class ManagedCodexAttributionTest(unittest.TestCase):
             self.assertEqual(tick.proc_paths, {100: rollout})
             self.assertEqual(tick.no_fallback_pids, frozenset())
 
+    def test_shared_daemon_with_two_same_cwd_rollouts_has_no_owner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home, cwd = os.path.join(tmp, "dot-codex"), os.path.join(tmp, "project")
+            os.makedirs(cwd)
+            first = _make_rollout(home, cwd)
+            second = _make_rollout(home, cwd, sid="019facc9-fe83-7480-89f6-9e64fbebf0cb")
+            stub = _FdStub({100: [first, second]})
+            with mock.patch.object(codex.os, "listdir", side_effect=stub.listdir), \
+                 mock.patch.object(codex.os, "readlink", side_effect=stub.readlink):
+                self.assertIsNone(codex._proc_rollout(100, cwd, home))
+
+    def test_unresolved_tui_uses_exact_herdr_thread(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home, cwd = os.path.join(tmp, "dot-codex"), os.path.join(tmp, "project")
+            os.makedirs(cwd)
+            rollout = _make_rollout(home, cwd)
+            tui = _session(200, cwd, None)
+            with mock.patch.object(herdr, "codex_pane_sessions", return_value={200: _SID}), \
+                 mock.patch.object(procscan, "read_environ", return_value={}):
+                tick = self._prepare([tui], {200: []}, home)
+            self.assertEqual(tick.proc_paths, {200: rollout})
+            with mock.patch.dict(os.environ, {"CODEX_HOME": home}):
+                codex.enrich(tui, tick=tick)
+            self.assertEqual(tui.session_id, _SID)
+            self.assertEqual(tui.session_tag, minted_tag(_SID))
+
+    def test_herdr_thread_without_rollout_never_claims_other_cwd_rollout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home, cwd = os.path.join(tmp, "dot-codex"), os.path.join(tmp, "project")
+            os.makedirs(cwd)
+            _make_rollout(home, cwd)
+            tui = _session(200, cwd, None)
+            other_sid = "019facc9-fe83-7480-89f6-9e64fbebf0cb"
+            with mock.patch.object(herdr, "codex_pane_sessions", return_value={200: other_sid}), \
+                 mock.patch.object(procscan, "read_environ", return_value={}):
+                tick = self._prepare([tui], {200: []}, home)
+            self.assertIsNone(tick.proc_paths.get(200))
+            self.assertIn(200, tick.no_fallback_pids)
+            with mock.patch.dict(os.environ, {"CODEX_HOME": home}):
+                codex.enrich(tui, tick=tick)
+            self.assertEqual(tui.session_id, other_sid)
+
+    def test_duplicate_pane_thread_is_not_stamped_on_two_tuis(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home, cwd = os.path.join(tmp, "dot-codex"), os.path.join(tmp, "project")
+            os.makedirs(cwd)
+            rollout = _make_rollout(home, cwd)
+            first, second = _session(200, cwd, None), _session(201, cwd, None)
+            with mock.patch.object(herdr, "codex_pane_sessions",
+                                   return_value={200: _SID, 201: _SID}), \
+                 mock.patch.object(procscan, "read_environ", return_value={}):
+                tick = self._prepare([first, second], {200: [], 201: []}, home)
+            self.assertEqual(tick.proc_paths, {200: rollout})
+            with mock.patch.dict(os.environ, {"CODEX_HOME": home}):
+                codex.enrich(first, tick=tick)
+                codex.enrich(second, tick=tick)
+            self.assertEqual(first.session_id, _SID)
+            self.assertIsNone(second.session_id)
+
 
 class ManagedDirParseTest(unittest.TestCase):
     def test_listen_and_remote_argv_yield_the_same_dir(self):
@@ -156,6 +216,38 @@ class ManagedDirParseTest(unittest.TestCase):
         self.assertIsNone(procscan._managed_dir("codex exec --cd /repo 'do a thing'"))
         self.assertIsNone(procscan._managed_dir(""))
         self.assertIsNone(procscan._managed_dir(None))
+
+    def test_shared_service_argv_is_distinct_from_per_session_server(self):
+        self.assertTrue(procscan._shared_codex_daemon(
+            "codex app-server --listen unix:// --managed-daemon"))
+        self.assertTrue(procscan._shared_codex_daemon(
+            "codex app-server daemon pid-update-loop"))
+        self.assertFalse(procscan._shared_codex_daemon(
+            "codex app-server --listen unix:///tmp/managed-sessions/x/app-server.sock"))
+        self.assertFalse(procscan._shared_codex_daemon(
+            "codex exec app-server --managed-daemon"))
+
+    def test_scan_keeps_tui_and_legacy_server_but_excludes_shared_service(self):
+        lines = [
+            "137 codex 01:00 codex app-server daemon pid-update-loop",
+            "149 codex 01:00 codex app-server --listen unix:// --managed-daemon",
+            "243 codex 01:00 codex --dangerously-bypass-approvals-and-sandbox",
+            "100 codex 01:00 codex app-server --listen unix:///tmp/managed-sessions/x/app-server.sock",
+        ]
+        with mock.patch.object(procscan, "_ps_lines", return_value=lines), \
+             mock.patch.object(procscan, "_pid_ttys", return_value={}), \
+             mock.patch.object(procscan, "_detached_ttys", return_value=set()), \
+             mock.patch.object(procscan, "proc_tree", return_value={}), \
+             mock.patch.object(procscan, "children_index", return_value={}), \
+             mock.patch.object(procscan, "_read_cwd", return_value=("/project", False)), \
+             mock.patch.object(procscan, "read_environ", return_value={}), \
+             mock.patch.object(procscan, "read_proc_start", return_value="123"), \
+             mock.patch.object(procscan, "exec_child", return_value=None) as child, \
+             mock.patch.object(procscan, "_orca_dead_socks", return_value=set()):
+            rows = procscan.scan(harness_filter={"codex"})
+        self.assertEqual({s.pid for s in rows}, {243, 100})
+        self.assertEqual({s.pid for s in rows if s.app_server}, {100})
+        self.assertEqual({call.args[0] for call in child.call_args_list}, {243, 100})
 
 
 if __name__ == "__main__":

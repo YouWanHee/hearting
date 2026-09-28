@@ -22,6 +22,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 
 _TIMEOUT_S = 2.0
 # Harnesses whose Fleet session_id is known to equal herdr's ``agent_session.value``
@@ -29,6 +30,8 @@ _TIMEOUT_S = 2.0
 # ``01a064d8-…`` ↔ the rollout session_id, F-100 comms test). A harness outside this
 # set can be promoted to True by a match but never demoted to False.
 VERIFIED_ID_HARNESSES = frozenset({"claude", "codex"})
+_CODEX_PANE_CACHE = {"key": None, "until": 0.0, "identities": {}}
+_CODEX_PANE_TTL_S = 10.0
 
 
 def list_agents(runner=subprocess.run, which=shutil.which):
@@ -73,11 +76,15 @@ def list_panes(runner=subprocess.run, which=shutil.which):
     return [p for p in panes if isinstance(p, dict)]
 
 
-def pane_pids(panes, runner=subprocess.run):
-    """F-100c — ``(shell_pids, foreground_pids)`` over the panes herdr tags with an
-    ``agent`` (one ``pane process-info --pane`` each; measured instant). A pane without
-    an agent is skipped: the probe exists to place harness sessions, not shells."""
+def pane_evidence(panes, runner=subprocess.run):
+    """Return shell PIDs, foreground PIDs, and exact Codex PID → thread IDs.
+
+    A pane's session metadata alone can outlive its foreground process. Only a live
+    foreground ``codex`` process reported by that same pane may supply an identity;
+    conflicting pane claims for one PID are discarded.
+    """
     shells, fg = set(), set()
+    identities = {}
     for pane in panes or []:
         if not pane.get("agent"):
             continue
@@ -87,6 +94,8 @@ def pane_pids(panes, runner=subprocess.run):
         try:
             proc = runner(["herdr", "pane", "process-info", "--pane", str(pane_id)],
                           capture_output=True, text=True, timeout=_TIMEOUT_S)
+            if getattr(proc, "returncode", 1) != 0:
+                continue
             info = (json.loads(proc.stdout or "").get("result") or {}).get("process_info") or {}
         except Exception:
             continue
@@ -95,10 +104,61 @@ def pane_pids(panes, runner=subprocess.run):
                 shells.add(int(info["shell_pid"]))
             for proc_rec in info.get("foreground_processes") or []:
                 if isinstance(proc_rec, dict) and proc_rec.get("pid"):
-                    fg.add(int(proc_rec["pid"]))
+                    pid = int(proc_rec["pid"])
+                    fg.add(pid)
+                    agent_session = pane.get("agent_session") or {}
+                    if (pane.get("agent") == "codex"
+                            and isinstance(agent_session, dict)
+                            and agent_session.get("agent") == "codex"
+                            and isinstance(agent_session.get("value"), str)
+                            and proc_rec.get("name") == "codex"):
+                        identities.setdefault(pid, set()).add(agent_session["value"])
         except (TypeError, ValueError):
             continue
+    return shells, fg, {pid: next(iter(sids)) for pid, sids in identities.items()
+                        if len(sids) == 1}
+
+
+def pane_pids(panes, runner=subprocess.run):
+    """F-100c — ``(shell_pids, foreground_pids)`` for agent panes."""
+    shells, fg, _identities = pane_evidence(panes, runner=runner)
     return shells, fg
+
+
+def codex_pane_sessions(sessions, panes=None, runner=subprocess.run):
+    """Exact thread IDs for unresolved Codex TUIs, bounded by cwd and cached by PID.
+
+    Herdr pane metadata can be stale (a closed pane may retain a thread ID), so a
+    matching live foreground Codex PID and its original process start are required.
+    This is called only for TUIs still missing a rollout after process attribution.
+    """
+    from . import procscan
+
+    targets = {
+        int(s.pid): s for s in sessions
+        if getattr(s, "pid", None) is not None and getattr(s, "proc_start", None)
+    }
+    if not targets:
+        return {}
+    key = tuple(sorted((pid, str(s.proc_start), os.path.realpath(s.cwd or ""))
+                       for pid, s in targets.items()))
+    now = time.monotonic()
+    if panes is None and runner is subprocess.run and key == _CODEX_PANE_CACHE["key"] \
+            and now < _CODEX_PANE_CACHE["until"]:
+        found = _CODEX_PANE_CACHE["identities"]
+    else:
+        if panes is None:
+            panes = list_panes()
+        cwds = {os.path.realpath(s.cwd or "") for s in targets.values()}
+        selected = [p for p in panes or []
+                    if p.get("agent") == "codex"
+                    and os.path.realpath(p.get("cwd") or "") in cwds]
+        _shells, _fg, found = pane_evidence(selected, runner=runner)
+        if runner is subprocess.run:
+            _CODEX_PANE_CACHE.update(key=key, until=now + _CODEX_PANE_TTL_S,
+                                     identities=found)
+    return {pid: sid for pid, sid in found.items()
+            if pid in targets and procscan.read_proc_start(pid) == targets[pid].proc_start}
 
 
 def _ppid_of(pid):
