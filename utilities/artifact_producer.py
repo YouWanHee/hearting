@@ -1676,7 +1676,7 @@ def _campaign_degradation(campaign: Mapping[str, Any]) -> Dict[str, Any]:
     return {}
 
 
-def begin(
+def _begin_cycle_record(
     root: Path,
     *,
     route_file: Path,
@@ -2002,6 +2002,23 @@ def begin(
         }
     finally:
         artifact_admission._release_lock(root, lock_fd)
+
+
+def begin(root: Path, **kwargs: Any) -> Dict[str, Any]:
+    result = _begin_cycle_record(root, **kwargs)
+    if (kwargs.get("node_id") is None and result.get("layout") == "cycle"
+            and kwargs.get("capability") == "autopilot-spec"):
+        # The admission lock has been released. Seed before a review worker can
+        # write verdict.json; the later transaction retries the same receipt.
+        route = load_route(Path(root).resolve(), resolve_route_argument(Path(root).resolve(), Path(kwargs["route_file"])))
+        if route.get("spec_touch"):
+            import importlib.util
+            module_path = Path(__file__).with_name("spec-transaction.py")
+            spec = importlib.util.spec_from_file_location("spec_transaction_preseed", module_path)
+            transaction = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(transaction)
+            transaction.preseed_owner_cycle(Path(root).resolve(), Path(result["cycle_dir"]))
+    return result
 
 
 # ---------------------------------------------------------------------------

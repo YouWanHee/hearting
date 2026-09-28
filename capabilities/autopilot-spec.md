@@ -110,6 +110,9 @@ binds `direct`, `quick`, and `standard+`; only the acting owner differs.
    `<artifact-root>/spec/` layout stays writable; once active it
    issues `campaign_id`/`cycle_id`/`producer_id` and the cycle directory
    `campaigns/<campaign-locator>/<cycle-locator>/artifacts/` before any artifact exists.
+   For a spec-touching owner route, the same begin call seeds the selected
+   shared spec revision under the spec lock before research or review writes.
+   A resumed begin keeps the receipt's original reference and revision.
 2. **write only inside the open cycle.** Every durable artifact goes under
    `<cycle_dir>/artifacts/spec/...` (`AGENT_ARTIFACT_OUTPUT_DIR`).
    `artifact_producer.py` owns cycle output paths and shared revisions.
@@ -123,7 +126,7 @@ binds `direct`, `quick`, and `standard+`; only the acting owner differs.
    the workflow, closes the route and seals the exact cycle. Inline work and
    legacy recovery retain explicit complete/close/finalize. Shared admission
    follows the sealed cycle; it cannot stand in for terminal evidence.
-5. **shared admission.** `spec` output is admitted to `shared/spec/` by `admit-shared --kind spec` after the cycle is sealed (canonical shared kind). A root holds one canonical `spec` reference: a repeat admit without `--reference`/`--key` lands on that single reference (several references without a selector is `shared-reference-ambiguous`); a `--key` that matches none of the existing references is refused (`shared-reference-exists`) and a second reference is only ever created with `--new-reference`.
+5. **shared admission.** `spec` output is admitted to `shared/spec/` by `admit-shared --kind spec` after the cycle is sealed (canonical shared kind). Seed selects the unique reference keyed `spec` when older references coexist; an existing seed receipt keeps its original reference and revision. An ambiguous selection is refused without writing, and an older reference remains available through the existing reference selector. Shared admission retains its own selector and base-receipt checks; a `--key` that matches none of the existing references is refused (`shared-reference-exists`) and a second reference is only ever created with `--new-reference`.
 
 ## Role Requirements
 

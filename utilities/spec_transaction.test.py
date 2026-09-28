@@ -262,9 +262,96 @@ class CycleLayoutTest(unittest.TestCase):
   self._close(route,route_file); self.P.finalize(self.artifact,cycle_id=begun["cycle_id"])
   return self.P.admit_shared(self.artifact,cycle_id=begun["cycle_id"],kind="spec",source="spec",key="spec")
 
- def _run(self, cycle_dir, code, events):
+ def _second_reference(self, key="cairn-spec"):
+  route,route_file,begun=self._cycle("older-reference")
+  spec=Path(begun["cycle_dir"])/"artifacts/spec"; spec.mkdir(parents=True)
+  (spec/"prd.md").write_text("old reference\n")
+  self._close(route,route_file); self.P.finalize(self.artifact,cycle_id=begun["cycle_id"])
+  return self.P.admit_shared(self.artifact,cycle_id=begun["cycle_id"],kind="spec",source="spec",key=key,allow_new_reference=True)
+
+ def test_canonical_key_is_selected_without_retiring_old_reference(self):
+  current=self._shared_v1(); old=self._second_reference()
+  _r,_f,begun=self._cycle("two-references")
+  base=Path(begun["cycle_dir"])/"artifacts/spec"
+  TX.seed_cycle_spec(base,self.artifact)
+  receipt=json.loads((base/TX.PRODUCER.SPEC_BASE_RECEIPT).read_text())
+  self.assertEqual(receipt["reference_id"],current["shared_reference_id"])
+  self.assertEqual(receipt["revision_id"],current["shared_reference_revision_id"])
+  self.assertEqual((base/"prd.md").read_text(),"v1\n")
+  self.assertTrue(self.P._reference_path(self.artifact,"spec",old["shared_reference_id"]).is_file())
+  with self.assertRaises(self.P.ProducerError) as ctx:
+   TX.seed_cycle_spec(base,self.artifact,reference_id=old["shared_reference_id"])
+  self.assertEqual(ctx.exception.code,"shared-base-reference-mismatch")
+  self.assertEqual(json.loads((base/TX.PRODUCER.SPEC_BASE_RECEIPT).read_text()),receipt)
+
+ def test_explicit_reference_selects_existing_noncanonical_and_missing_ref_refuses_without_writes(self):
+  self._shared_v1(); old=self._second_reference()
+  _r,_f,begun=self._cycle("explicit-reference")
+  base=Path(begun["cycle_dir"])/"artifacts/spec"
+  with self.assertRaises(self.P.ProducerError) as ctx:
+   TX.seed_cycle_spec(base,self.artifact,reference_id="ref_"+"f"*32)
+  self.assertEqual(ctx.exception.code,"reference-unknown")
+  self.assertFalse(base.exists())
+  TX.seed_cycle_spec(base,self.artifact,reference_id=old["shared_reference_id"])
+  self.assertEqual((base/"prd.md").read_text(),"old reference\n")
+  self.assertEqual(json.loads((base/TX.PRODUCER.SPEC_BASE_RECEIPT).read_text())["reference_id"],old["shared_reference_id"])
+
+ def test_transaction_cli_reference_selects_existing_reference(self):
+  self._shared_v1(); old=self._second_reference()
+  _r,_f,begun=self._cycle("cli-reference")
+  cycle_dir=Path(begun["cycle_dir"]); events=Path(self._tmp.name)/"cli-reference-events.jsonl"
+  result=self._run(cycle_dir,"pass",events,selector=("--reference",old["shared_reference_id"]))
+  self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+  base=cycle_dir/"artifacts/spec"
+  self.assertEqual((base/"prd.md").read_text(),"old reference\n")
+  self.assertEqual(json.loads((base/TX.PRODUCER.SPEC_BASE_RECEIPT).read_text())["reference_id"],old["shared_reference_id"])
+
+ def test_multiple_noncanonical_references_remain_ambiguous(self):
+  self._shared_v1(); self._second_reference("another-spec")
+  current=self.P.find_reference_by_key(self.artifact,"spec","spec")
+  path=self.P._reference_path(self.artifact,"spec",current["shared_reference_id"])
+  row=json.loads(path.read_text()); row["key"]="renamed-spec"; path.write_text(json.dumps(row))
+  _r,_f,begun=self._cycle("ambiguous-reference")
+  base=Path(begun["cycle_dir"])/"artifacts/spec"
+  with self.assertRaises(self.P.ProducerError) as ctx: TX.seed_cycle_spec(base,self.artifact)
+  self.assertEqual(ctx.exception.code,"shared-reference-ambiguous")
+  self.assertFalse(base.exists())
+
+ def test_owner_begin_seeds_before_review_and_transaction_reuses_receipt(self):
+  current=self._shared_v1(); self._second_reference()
+  begun=self.P.begin(self.artifact,route_file=self.spec_route,capability="autopilot-spec",intensity="strong")
+  cycle_dir=Path(begun["cycle_dir"]); base=cycle_dir/"artifacts/spec"
+  receipt=(base/TX.PRODUCER.SPEC_BASE_RECEIPT).read_bytes()
+  self.assertEqual(json.loads(receipt)["reference_id"],current["shared_reference_id"])
+  verdict=base/"_internal/reviews/verdict.json"; verdict.parent.mkdir(parents=True,exist_ok=True); verdict.write_text('{"verdict":"PASS"}\n')
+  events=Path(self._tmp.name)/"preseed-events.jsonl"
+  result=self._run(cycle_dir,"pass",events)
+  self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+  self.assertEqual((base/TX.PRODUCER.SPEC_BASE_RECEIPT).read_bytes(),receipt)
+  self.assertEqual(verdict.read_text(),'{"verdict":"PASS"}\n')
+  again=self.P.begin(self.artifact,route_file=self.spec_route,capability="autopilot-spec",intensity="strong")
+  self.assertEqual(again["cycle_id"],begun["cycle_id"])
+  self.assertEqual((base/TX.PRODUCER.SPEC_BASE_RECEIPT).read_bytes(),receipt)
+
+ def test_failed_owner_preseed_retries_same_open_cycle(self):
+  current=self._shared_v1(); self._second_reference()
+  path=self.P._reference_path(self.artifact,"spec",current["shared_reference_id"])
+  row=json.loads(path.read_text()); row["key"]="renamed-spec"; path.write_text(json.dumps(row))
+  with self.assertRaises(self.P.ProducerError) as ctx:
+   self.P.begin(self.artifact,route_file=self.spec_route,capability="autopilot-spec",intensity="strong")
+  self.assertEqual(ctx.exception.code,"shared-reference-ambiguous")
+  opened=self.P.route_cycle_for(self.artifact,json.loads(self.spec_route.read_text()))
+  self.assertIsNotNone(opened)
+  base=self.P.cycle_dir(self.artifact,opened["campaign_id"],opened["cycle_id"],opened)/"artifacts/spec"
+  self.assertFalse((base/TX.PRODUCER.SPEC_BASE_RECEIPT).exists())
+  row["key"]="spec"; path.write_text(json.dumps(row))
+  result=self.P.begin(self.artifact,route_file=self.spec_route,capability="autopilot-spec",intensity="strong")
+  self.assertEqual(result["cycle_id"],opened["cycle_id"])
+  self.assertEqual(json.loads((base/TX.PRODUCER.SPEC_BASE_RECEIPT).read_text())["reference_id"],current["shared_reference_id"])
+
+ def _run(self, cycle_dir, code, events, *, selector=()):
   env={**HERMETIC_ENV,"AGENT_ARTIFACT_CYCLE_DIR":str(cycle_dir),"AGENT_ARTIFACT_ROOT":str(self.artifact)}
-  cmd=[sys.executable,str(ROOT/"utilities/spec-transaction.py"),"run","--artifact-root",str(self.artifact),"--worktree",str(self.repo),"--route",str(self.spec_route),"--node","prd-transaction","--events",str(events),"--",sys.executable,"-c",code]
+  cmd=[sys.executable,str(ROOT/"utilities/spec-transaction.py"),"run","--artifact-root",str(self.artifact),"--worktree",str(self.repo),"--route",str(self.spec_route),"--node","prd-transaction","--events",str(events),*selector,"--",sys.executable,"-c",code]
   return subprocess.run(cmd,text=True,capture_output=True,env=env)
 
  def test_cycle_spec_is_seeded_and_snapshot_comes_from_the_tool(self):

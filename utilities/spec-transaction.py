@@ -28,7 +28,51 @@ def emit(event, events=None):
         with open(events,"a",encoding="utf-8") as fh: fh.write(line+"\n")
 
 
-def seed_cycle_spec(spec_base: Path, artifact: Path, spec_root: Path | None = None):
+def select_seed_reference(artifact: Path, receipt: dict | None, *, reference_id: str | None = None,
+                          key: str | None = None):
+    """Resolve a shared spec once; an existing receipt owns its original base."""
+    references=PRODUCER.list_references(artifact,"spec")
+    by_id={row["shared_reference_id"]:row for row in references}
+    if receipt is not None:
+        pinned=receipt.get("reference_id")
+        if reference_id is not None and reference_id!=pinned:
+            raise PRODUCER.ProducerError("shared-base-reference-mismatch",reference_id)
+        if pinned is None:
+            if key is not None:
+                raise PRODUCER.ProducerError("shared-base-reference-mismatch",key)
+            return None
+        selected=by_id.get(pinned)
+        if selected is None:
+            raise PRODUCER.ProducerError("reference-unknown",str(pinned))
+        if key is not None and selected.get("key")!=key:
+            raise PRODUCER.ProducerError("shared-base-reference-mismatch",key)
+        return selected
+    if reference_id is not None:
+        selected=by_id.get(reference_id)
+        if selected is None:
+            raise PRODUCER.ProducerError("reference-unknown",reference_id)
+        if key is not None and selected.get("key")!=key:
+            raise PRODUCER.ProducerError("shared-reference-selector-conflict",key)
+        return selected
+    if key is not None:
+        matching=[row for row in references if row.get("key")==key]
+        if not matching:
+            raise PRODUCER.ProducerError("shared-reference-exists",key)
+        if len(matching)>1:
+            raise PRODUCER.ProducerError("shared-reference-ambiguous",key)
+        return matching[0]
+    canonical=[row for row in references if row.get("key")=="spec"]
+    if len(canonical)==1:
+        return canonical[0]
+    if len(references)==1:
+        return references[0]
+    if references:
+        raise PRODUCER.ProducerError("shared-reference-ambiguous","seed requires one canonical spec reference")
+    return None
+
+
+def seed_cycle_spec(spec_base: Path, artifact: Path, spec_root: Path | None = None,
+                    *, reference_id: str | None = None, key: str | None = None):
     """W7C cycle layout: a fresh cycle's `artifacts/spec` is empty, so the
     transaction would see no pre-image and write no `_internal/versions/vN`
     snapshot -- which is why operators copied the previous version by hand
@@ -57,10 +101,9 @@ def seed_cycle_spec(spec_base: Path, artifact: Path, spec_root: Path | None = No
     receipt=PRODUCER._read_json(receipt_path)
     if receipt is None and os.path.lexists(receipt_path):
         raise PRODUCER.ProducerError("shared-base-invalid",PRODUCER.SPEC_BASE_RECEIPT)
-    references=PRODUCER.list_references(artifact,"spec")
-    if len(references)>1:
-        raise PRODUCER.ProducerError("shared-reference-ambiguous","seed requires one canonical spec reference")
-    reference=references[0] if references else None
+    if receipt is not None and not isinstance(receipt,dict):
+        raise PRODUCER.ProducerError("shared-base-invalid",PRODUCER.SPEC_BASE_RECEIPT)
+    reference=select_seed_reference(artifact,receipt,reference_id=reference_id,key=key)
     latest=(reference or {}).get("latest_revision_id")
     ref_id=(reference or {}).get("shared_reference_id")
     revision=artifact/"shared"/"spec"/ref_id/"revisions"/latest if ref_id and latest else None
@@ -167,6 +210,27 @@ def seed_cycle_spec(spec_base: Path, artifact: Path, spec_root: Path | None = No
                 "kept_existing":kept,"kept_existing_paths":kept_paths,"source":str(revision),"spec_base":str(spec_base)}
     return {"status":"seeded","source":str(revision),"files":copied,"history_versions":history,"prd_present":has_prd,
             "preexisting_files":preexisting,"kept_existing":kept,"kept_existing_paths":kept_paths,"spec_base":str(spec_base)}
+
+
+def preseed_owner_cycle(artifact: Path, cycle_dir: Path, *, wait_timeout: float = 600):
+    """Seed before research/review, outside producer admission's lock.
+
+    The transaction also takes this lock before reading producer state. Begin
+    must have released its admission lock before calling here, so neither
+    path can hold the locks in opposite orders.
+    """
+    lock_path=artifact/".pipeline-lock"
+    with lock_path.open("a+",encoding="utf-8") as lock:
+        deadline=time.monotonic()+wait_timeout
+        while True:
+            try:
+                fcntl.flock(lock.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic()>=deadline:
+                    raise PRODUCER.ProducerError("spec-lock-timeout",str(lock_path))
+                time.sleep(.05)
+        return seed_cycle_spec(cycle_dir/"artifacts/spec",artifact)
 
 
 def legacy_spec_state(artifact: Path):
@@ -363,6 +427,8 @@ def main():
     run.add_argument("--artifact-root",required=True); run.add_argument("--worktree",required=True)
     run.add_argument("--route",required=True); run.add_argument("--node",required=True)
     run.add_argument("--spec-root",help="component spec root under <artifact-root>/spec")
+    run.add_argument("--reference",help="existing shared spec reference ID")
+    run.add_argument("--key",help="existing shared spec reference key")
     run.add_argument("--wait-timeout",type=float,default=600); run.add_argument("--poll",type=float,default=.05)
     run.add_argument("--events")
     run.add_argument("--require-snapshot",action="store_true",help=argparse.SUPPRESS)
@@ -426,7 +492,8 @@ def main():
             # a refused run must leave no admittable content behind, and two
             # transactions on one cycle must not interleave a half copy.
             try:
-                seeded=seed_cycle_spec(spec_base,artifact,spec_root if spec_root!=spec_base else None)
+                seeded=seed_cycle_spec(spec_base,artifact,spec_root if spec_root!=spec_base else None,
+                                       reference_id=args.reference,key=args.key)
             except PRODUCER.ProducerError as exc:
                 emit({"status":"blocked","reason":exc.code,"detail":exc.detail,"route_id":route["route_id"]},args.events)
                 lock.seek(0); lock.truncate(); lock.flush(); os.fsync(lock.fileno())
