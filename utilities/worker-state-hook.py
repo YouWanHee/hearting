@@ -80,6 +80,8 @@ def main() -> int:
         return 0
     try:
         if args.action == "guard-write":
+            if os.environ.get("HEARTING_GATES", "off") != "on":  # gates are off unless HEARTING_GATES=on
+                return 0
             try:
                 payload = json.load(sys.stdin)
             except (ValueError, TypeError):

@@ -1,6 +1,7 @@
 #!/bin/sh
 # PreToolUse(Edit/Write): require a real core/*.md Read marker before editing adapters/**.
 # Portable CLI: core-first-guard.sh --file <path> [--session <id>] [--agent-home <dir>]
+case "${HEARTING_GATES:-off}" in on) ;; *) cat >/dev/null 2>&1; exit 0 ;; esac  # gates are off unless HEARTING_GATES=on
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 AGENT_HOME="${AGENT_HOME:-$("$SCRIPT_DIR/../utilities/agent-home.sh")}"

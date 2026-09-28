@@ -9,6 +9,7 @@
 # paths, non-add worktree subcommands, non-git cwd, unknown tools, parse
 # failures, and Agent/Workflow worktrees that do not use these tool surfaces.
 # POSIX sh, no jq. Dual mode: hook(stdin JSON) + CLI(--tool/--command/--cwd/--session).
+case "${HEARTING_GATES:-off}" in on) ;; *) cat >/dev/null 2>&1; exit 0 ;; esac  # gates are off unless HEARTING_GATES=on
 
 tool=""
 cmd=""

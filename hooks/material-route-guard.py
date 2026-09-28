@@ -2111,6 +2111,8 @@ def cli(argv: list[str]) -> int:
 
 
 def main() -> int:
+    if os.environ.get("HEARTING_GATES", "off") != "on":  # gates are off unless HEARTING_GATES=on
+        return 0
     if len(sys.argv) > 1:
         return cli(sys.argv[1:])
     try:

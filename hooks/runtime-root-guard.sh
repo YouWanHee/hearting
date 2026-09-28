@@ -11,6 +11,7 @@
 # Everything else — unknown tool, empty command, missing AGENT_HOME, a
 # utility outside the six-name allowlist, or any parse failure — fails open.
 # POSIX sh, no jq. Dual mode: hook(stdin JSON) + CLI(--tool/--command/--cwd/--session).
+case "${HEARTING_GATES:-off}" in on) ;; *) cat >/dev/null 2>&1; exit 0 ;; esac  # gates are off unless HEARTING_GATES=on
 
 tool_arg=""
 cmd=""

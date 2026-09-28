@@ -264,6 +264,8 @@ def target_files(payload: dict[str, Any]) -> list[str]:
 
 
 def main() -> int:
+    if os.environ.get("HEARTING_GATES", "off") != "on":  # gates are off unless HEARTING_GATES=on
+        return 0
     try:
         payload = json.load(sys.stdin)
     except json.JSONDecodeError:

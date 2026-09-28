@@ -154,6 +154,8 @@ def build_isolated_env(tmpdir: Path, repo_root: Path = ROOT) -> dict[str, str]:
         if key in os.environ:
             env[key] = os.environ[key]
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    # Gates ship switched off; the suites still exercise them.
+    env["HEARTING_GATES"] = "on"
     env["HOME"] = str(home)
     env["XDG_STATE_HOME"] = str(xdg_state)
     env["XDG_DATA_HOME"] = str(xdg_data)

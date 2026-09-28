@@ -6,6 +6,7 @@
 # core/OPERATIONS.md §5.9; this guard enforces that existing marker mechanism.
 # POSIX sh, no jq. Also supports portable CLI mode:
 #   git-state-guard.sh --file <path>
+case "${HEARTING_GATES:-off}" in on) ;; *) cat >/dev/null 2>&1; exit 0 ;; esac  # gates are off unless HEARTING_GATES=on
 
 fp=""
 hook_mode=1

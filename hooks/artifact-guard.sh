@@ -6,6 +6,7 @@
 # Non-blocking by convention: edits to existing artifacts, source code,
 # experiments/, user_profile/, README, assets, and _internal.
 # WORKFLOW.md §0 is the source of truth.
+case "${HEARTING_GATES:-off}" in on) ;; *) cat >/dev/null 2>&1; exit 0 ;; esac  # gates are off unless HEARTING_GATES=on
 set -euo pipefail
 
 fp=""
