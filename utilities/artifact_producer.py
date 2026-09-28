@@ -2897,7 +2897,7 @@ def checkpoint(
     scan = _checkpoint_scan(directory, previous_stats, limits)
     try:
         with _checkpoint_lock(root, cid, timeout=0.0):
-            return _checkpoint_commit(
+            result = _checkpoint_commit(
                 root, record, route, directory, scan, observed_scan=observed_scan, clock=clock,
                 trigger=trigger, limits=limits, interval=interval, base=base,
                 allocator=allocator or artifact_identity.IdAllocator(),
@@ -2906,6 +2906,9 @@ def checkpoint(
         if exc.code == "checkpoint-lock-busy":
             return skipped("busy")
         raise
+    if result["status"] in {"emitted", "unchanged"}:
+        artifact_cycle_titles.emit_after_checkpoint(root, record)
+    return result
 
 
 def _checkpoint_commit(

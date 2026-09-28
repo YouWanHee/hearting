@@ -12,6 +12,7 @@ import time
 import unittest
 from unittest import mock
 
+import artifact_cycle_titles as CT
 import artifact_checkpoint_trigger as T
 import artifact_manifest as m
 import artifact_producer as P
@@ -277,6 +278,72 @@ class InterimManifestTest(CheckpointTestBase):
             code = P.main(["checkpoint"])
         self.assertEqual(code, P.OK)
         self.assertEqual(json.loads(out.getvalue())["status"], "emitted")
+
+
+class CheckpointDisplayTitleTest(CheckpointTestBase):
+    def titles(self):
+        path = self.root / CT.CYCLE_TITLES_REL
+        return json.loads(path.read_text())["entries"] if path.exists() else []
+
+    def test_heading_refresh_rebinds_current_manifest_and_seal(self):
+        self.write_output(self.result, data="# 열린 사이클의 첫 제목\n".encode())
+        first = P.checkpoint(self.root, cycle_id=self.cycle_id)
+        self.assertEqual(first["status"], "emitted")
+        self.assertEqual(self.titles()[0]["display_title"], "열린 사이클의 첫 제목")
+        self.write_output(self.result, data="# 열린 사이클의 고친 제목\n".encode())
+        self.assertEqual(P.checkpoint(self.root, cycle_id=self.cycle_id)["status"], "emitted")
+        entry = self.titles()[0]
+        self.assertEqual(entry["display_title"], "열린 사이클의 고친 제목")
+        self.assertEqual(entry["manifest_bindings"], [{
+            "manifest_revision_id": self.interim()["manifest_revision_id"],
+            "manifest_digest": CT.binding_digest(self.interim())}])
+        before = (self.root / CT.CYCLE_TITLES_REL).read_bytes()
+        self.assertEqual(P.checkpoint(self.root, cycle_id=self.cycle_id)["status"], "unchanged")
+        self.assertEqual((self.root / CT.CYCLE_TITLES_REL).read_bytes(), before)
+        _, sealed = self.seal()
+        self.assertEqual(self.titles()[0]["manifest_bindings"][0]["manifest_digest"], CT.binding_digest(sealed))
+
+    def test_no_output_or_only_slug_never_creates_title(self):
+        record = P.read_cycle_record(self.root, self.cycle_id)
+        record["title"] = "사람이 읽을 수 있는 제목"
+        P._write_cycle_record(self.root, record, exclusive=False)
+        self.assertEqual(P.checkpoint(self.root, cycle_id=self.cycle_id)["reason"], "no-output")
+        self.assertEqual(self.titles(), [])
+        record["title"] = "fixture-slug"
+        P._write_cycle_record(self.root, record, exclusive=False)
+        self.write_output(self.result, data=b"plain body without a heading\n")
+        self.assertEqual(P.checkpoint(self.root, cycle_id=self.cycle_id)["status"], "emitted")
+        self.assertEqual(self.titles(), [])
+        self.write_output(self.result, data="# 제목이 있는 중간 산출물\n".encode())
+        P.checkpoint(self.root, cycle_id=self.cycle_id)
+        self.assertEqual(len(self.titles()), 1)
+        self.write_output(self.result, data=b"heading removed\n")
+        P.checkpoint(self.root, cycle_id=self.cycle_id)
+        self.assertEqual(self.titles(), [])
+
+    def test_title_write_failure_does_not_block_and_unchanged_checkpoint_retries(self):
+        self.write_output(self.result, data="# 다음 체크포인트에서 재시도\n".encode())
+        with mock.patch.object(CT, "_upsert_title_locked", side_effect=OSError("fixture")):
+            self.assertEqual(P.checkpoint(self.root, cycle_id=self.cycle_id)["status"], "emitted")
+        self.assertEqual(self.titles(), [])
+        self.assertEqual(P.checkpoint(self.root, cycle_id=self.cycle_id)["status"], "unchanged")
+        self.assertEqual(self.titles()[0]["display_title"], "다음 체크포인트에서 재시도")
+
+    def test_other_cycles_and_backfill_preserve_open_title(self):
+        self.write_output(self.result, data="# 첫 사이클의 제목 유지\n".encode())
+        P.checkpoint(self.root, cycle_id=self.cycle_id)
+        first = self.titles()[0]
+        _, _, other = self.begin(mode="debug")
+        self.write_output(other, data="# 다른 사이클의 제목 유지\n".encode())
+        P.checkpoint(self.root, cycle_id=other["cycle_id"])
+        self.assertIn(first, self.titles())
+        self.assertEqual(len(self.titles()), 2)
+        def reader(raw, *_args, **_kwargs):
+            return CT.ReaderResult("accepted", frozenset(row["cycle_id"] for row in json.loads(raw)["entries"]), "", None)
+        result = CT.backfill(self.root, reader=reader)
+        self.assertEqual(result["counts"]["existing_kept"], 2)
+        self.assertEqual(result["counts"]["existing_dropped"], 0)
+        self.assertEqual(result["post_digest"], result["pre_digest"])
 
 
 class FinalizeContinuityTest(CheckpointTestBase):

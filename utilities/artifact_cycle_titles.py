@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Cycle display-title declaration: seal-time emission and retroactive backfill.
+"""Cycle display-title declaration: checkpoints, sealing and retroactive backfill.
 
 Writes `.runtime/artifact-producer/v1/cycle-display-titles.json` (PRD §37.1 B)
 so Cairn can show a human title instead of a folder name. `emit_after_seal_locked`
 is called once, at the tail of the producer's `_commit_sealed`, and never blocks
 sealing: any failure becomes a deferred marker, drained on a later seal or by
 `backfill`. `backfill` replays the same rule set across every sealed cycle
-already on disk, gated by the deployed Cairn reader so no rejected byte is ever
-written.
+already on disk, preserving current checkpoint declarations. Checkpoints refresh
+titles after publishing their interim manifest; title failures never block output.
+Backfill applies only bytes accepted by the deployed Cairn reader.
 """
 from __future__ import annotations
 
@@ -573,6 +574,14 @@ def _emit_single_locked(root: Path, record: Mapping[str, Any], manifest_path: Pa
     parsed = json.loads(raw.decode("utf-8"))
     if _eligibility_check(record, raw, parsed, identity) is not None:
         return
+    _upsert_title_locked(root, record, parsed, manifest_path, identity,
+                         cycle_directory=manifest_path.parent)
+
+
+def _upsert_title_locked(root: Path, record: Mapping[str, Any], parsed: Mapping[str, Any],
+                         manifest_path: Path, identity: artifact_identity.RootIdentity, *,
+                         cycle_directory: Path, refresh: bool = False) -> None:
+    cycle_id = record.get("cycle_id")
     declaration_path = root / CYCLE_TITLES_REL
     try:
         pre_doc = check_declaration_file(declaration_path, root_id=identity.artifact_root_id,
@@ -582,26 +591,60 @@ def _emit_single_locked(root: Path, record: Mapping[str, Any], manifest_path: Pa
         return
     pre_bytes = render_declaration(identity.artifact_root_id, identity.repository_id, pre_doc["entries"])
     ctx = CycleContext(
-        record=record, manifest=parsed, cycle_dir=manifest_path.parent,
-        campaign=_campaign_json_for(manifest_path), v2_title=_v2_title(root, str(record.get("campaign_id"))),
+        record=record, manifest=parsed, cycle_dir=cycle_directory,
+        campaign=_campaign_json_for(cycle_directory / "manifest.json"), v2_title=_v2_title(root, str(record.get("campaign_id"))),
         route_text=_route_text(root, record),
     )
     existing = next((row for row in pre_doc["entries"] if row["cycle_id"] == cycle_id), None)
     reserved = {_norm(row["display_title"]) for row in pre_doc["entries"]
                if row["campaign_id"] == record.get("campaign_id") and row["cycle_id"] != cycle_id}
-    decision = derive_display_title(ctx, existing_title=(existing["display_title"] if existing else None),
+    decision = derive_display_title(ctx, existing_title=(existing["display_title"] if existing and not refresh else None),
                                     reserved=reserved)
-    if decision.title is None:
+    if decision.title is None and not refresh:
         return
     binding = {"manifest_revision_id": str(parsed.get("manifest_revision_id")), "manifest_digest": binding_digest(parsed)}
     new_entries = [row for row in pre_doc["entries"] if row["cycle_id"] != cycle_id]
-    new_entries.append({"campaign_id": record.get("campaign_id"), "cycle_id": cycle_id,
-                        "display_title": decision.title, "manifest_bindings": [binding]})
+    if decision.title is not None:
+        new_entries.append({"campaign_id": record.get("campaign_id"), "cycle_id": cycle_id,
+                            "display_title": decision.title, "manifest_bindings": [binding]})
     post_bytes = render_declaration(identity.artifact_root_id, identity.repository_id, new_entries)
     validate_declaration(post_bytes, root_id=identity.artifact_root_id, repository_id=identity.repository_id)
     if post_bytes != pre_bytes:
         CTR.write_atomic_bytes(declaration_path, post_bytes)
     _remove_marker(root, cycle_id)
+
+
+def emit_after_checkpoint(root: Path, record: Mapping[str, Any]) -> None:
+    """Refresh titles after releasing the publishing checkpoint's lock.
+
+    Use the existing admission -> checkpoint lock order and reread the latest
+    document so a concurrent checkpoint or seal cannot leave an obsolete binding.
+    A busy or failed update never changes checkpoint success; unchanged-output
+    checkpoints retry title publication too.
+    """
+    import artifact_producer as producer
+
+    cycle_id = record["cycle_id"]
+    manifest_path = producer.open_manifest_path(root, cycle_id)
+    lock_fd = None
+    try:
+        lock_fd = artifact_admission._acquire_lock(root, 0.0)
+        with producer._checkpoint_lock(root, cycle_id, timeout=0.0):
+            fresh = _cycle_record(root, cycle_id)
+            if fresh is None or fresh.get("state") != "open":
+                return
+            document = _read_json(manifest_path)
+            if not document or not document.get("artifacts"):
+                return
+            identity = _load_root_identity(root)
+            directory = producer.cycle_dir(root, fresh["campaign_id"], cycle_id, fresh)
+            _upsert_title_locked(root, fresh, document, manifest_path, identity,
+                                 cycle_directory=directory, refresh=True)
+    except Exception as exc:
+        _write_marker_quiet(root, cycle_id, f"deferred:{type(exc).__name__}", manifest_path)
+    finally:
+        if lock_fd is not None:
+            artifact_admission._release_lock(root, lock_fd)
 
 
 def _drain_pending(root: Path, *, exclude_cycle_id: Optional[str], limit: int) -> None:
@@ -800,8 +843,24 @@ def backfill(root: Path, *, apply: bool = False, report_path: Optional[Path] = N
             "manifest_path": manifest_path, "parsed": parsed, "sealed_on": sealed_on or "~",
         })
 
+    # A sealed-cycle backfill must not erase a current checkpoint declaration.
+    open_entries: List[Dict[str, Any]] = []
     for cycle_id, existing in existing_by_cycle.items():
         if cycle_id not in handled:
+            record = _cycle_record(root, cycle_id)
+            if record is not None and record.get("state") == "open":
+                import artifact_producer as producer
+                interim = _read_json(producer.open_manifest_path(root, cycle_id))
+                if (interim and interim.get("artifacts")
+                        and existing["campaign_id"] == record.get("campaign_id")
+                        and existing["manifest_bindings"] == [{
+                            "manifest_revision_id": interim.get("manifest_revision_id"),
+                            "manifest_digest": binding_digest(interim)}]):
+                    open_entries.append(existing)
+                    counts["existing_kept"] += 1
+                    rows.append({"cycle_id": cycle_id, "campaign_id": existing["campaign_id"],
+                                 "source": "existing", "title": existing["display_title"], "verdict": "kept"})
+                    continue
             _drop_existing(cycle_id, existing.get("campaign_id"))
 
     eligible_items.sort(key=lambda item: (item["sealed_on"], item["cycle_id"]))
@@ -812,7 +871,9 @@ def backfill(root: Path, *, apply: bool = False, report_path: Optional[Path] = N
         if existing is not None:
             reserved.setdefault(existing["campaign_id"], set()).add(_norm(existing["display_title"]))
 
-    new_entries: List[Dict[str, Any]] = []
+    for entry in open_entries:
+        reserved.setdefault(entry["campaign_id"], set()).add(_norm(entry["display_title"]))
+    new_entries: List[Dict[str, Any]] = list(open_entries)
     for item in eligible_items:
         cycle_id = item["cycle_id"]
         campaign_id = item["campaign_id"]

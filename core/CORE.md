@@ -257,6 +257,13 @@ remaining file; an explicit `--primary` is kept as given.
 | `user_profile/` | the evidence and report behind a cross-project user-preference profile (`analyze-user`) | `C-DUR` |
 | `reviews/` | audit and review reports (`audit`, stage reviews); a root-level `reviews/` stays support material | `C-DUR` |
 
+**Cycle display titles.** Checkpoints publish human-readable display titles for
+open cycles alongside their interim manifest, using the same record, request,
+and primary Markdown-heading rules as sealing. Updated outputs refresh both
+the title and its manifest binding. No-output cycles and cycles without a usable
+title publish no new declaration. Title publication is best-effort and never
+blocks the checkpoint; a later checkpoint retries it automatically.
+
 **Campaign closure.** `artifact_producer.py campaign-status|campaign-close|campaign-reopen|campaign-recover`
 reports, closes, reopens, and repairs a campaign. An agent that judges the
 recorded completion condition met runs `campaign-close` (`--reason` when the
