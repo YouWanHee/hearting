@@ -6,7 +6,7 @@ FA=$T/source; mkdir -p "$FA/tools" "$FA/adapters/codex/bin" "$FA/core" "$FA/adap
 cp "$ROOT/adapters/codex/bin/preflight.sh" "$FA/adapters/codex/bin/preflight.sh"; cp "$ROOT/core/CORE.md" "$FA/core/CORE.md"; cp "$ROOT/core/ADAPTATION.md" "$FA/core/ADAPTATION.md"
 cp "$ROOT/adapters/codex/utilities/agent-home.sh" "$FA/adapters/codex/utilities/agent-home.sh"; cp "$ROOT/utilities/artifact-root.sh" "$FA/utilities/artifact-root.sh"
 cp -R "$ROOT/roles/." "$FA/roles/"; cp -R "$ROOT/capabilities/." "$FA/capabilities/"; cp -R "$ROOT/hooks/." "$FA/hooks/"
-chmod +x "$FA/adapters/codex/utilities/agent-home.sh" "$FA/hooks/core-first-guard.sh"
+chmod +x "$FA/adapters/codex/utilities/agent-home.sh"
 printf 'import sys\nprint()\nprint("status=failed")\nprint()\nprint("reason=selected-signal")\nfor i in range(10): print("diff-line-" + str(i))\nsys.exit(1)\n' > "$FA/tools/generate.py"
 cat > "$FA/adapters/codex/bin/check-runtime-projection.sh" <<'STUB'
 #!/usr/bin/env sh
