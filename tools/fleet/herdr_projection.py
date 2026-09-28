@@ -336,6 +336,27 @@ _PROOF_WAIT_S = 90
 _THREAD_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 
+def _in_shared_codex_service() -> bool:
+    """True when this hook runs inside the shared background Codex service.
+
+    That service inherits the environment of whichever pane or shell first started
+    it, so its HERDR_PANE_ID names that pane, not the session whose hook is running.
+    """
+    pid = os.getpid()
+    for _ in range(_MAX_ANCESTORS):
+        if not pid or pid <= 1:
+            return False
+        if _comm(pid) == "codex":
+            try:
+                with open("/proc/%d/cmdline" % pid, "rb") as handle:
+                    args = handle.read().split(b"\0")
+            except OSError:
+                return False
+            return b"app-server" in args and not any(b"managed-sessions" in arg for arg in args)
+        pid = _parent(pid)
+    return False
+
+
 def _defer_until_proven(session_id: str, report_session: bool) -> None:
     """Report a Codex session its own hook could not prove, once its TUI is proven.
 
@@ -411,6 +432,8 @@ def project(harness: str, session_id: str, *, pane_id=None, worker=None,
         return True
     codex_main = harness == "codex" and not (
         worker if worker is not None else is_worker())
+    if codex_main and not pane_id and _in_shared_codex_service():
+        pane = ""
     if not pane:
         if codex_main:
             _defer_until_proven(session_id, report_session)
