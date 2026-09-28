@@ -911,6 +911,25 @@ class WatcherReceiptTest(_WatchMixin, unittest.TestCase):
         self._release()
         receipt = self._wait_for_receipt(watch_id)
 
+        # Receipt publication precedes the notice write and process exit.
+        # Wait for the real lock release before asserting either one; seeing
+        # the receipt is not proof that the watcher has already exited.
+        lock = self.watch_root / f"{watch_id}.lock"
+        fd = os.open(str(lock), os.O_RDWR | os.O_CREAT)
+        try:
+            deadline = time.monotonic() + 30
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        self.fail(f"watcher did not release its lock for {watch_id}")
+                    time.sleep(0.02)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
         self.assertEqual(set(receipt), {
             "schema_version", "watch_id", "target", "steward", "armed_ts", "done_ts",
             "state", "agent", "herdr_exit", "watcher", "rearmed_from", "refs",
@@ -929,14 +948,6 @@ class WatcherReceiptTest(_WatchMixin, unittest.TestCase):
         self.assertEqual(notices[0]["delivery"]["status"], "received")
         self.assertEqual(notices[0]["delivery"]["receipt"], watch_id)
         self.assertEqual(notices[0]["from"]["session_id"], "steward-1")
-
-        lock = self.watch_root / f"{watch_id}.lock"
-        fd = os.open(str(lock), os.O_RDWR | os.O_CREAT)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)   # released by exit
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
 
     def test_uninterpretable_herdr_yields_a_receipt_not_an_endless_wait(self):
         proc = self._run("watch", "peer-a", env=self._env("timeout"))

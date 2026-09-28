@@ -1551,7 +1551,12 @@ class ClaudeSessionSupervisorTest(unittest.TestCase):
                 # The fixture now supplies terminal/quiescence evidence. The
                 # controller, not another model bookkeeping turn, observes it.
                 settled = child_row(status="done").rstrip("\n") + ",launch_outcome=never-launched,note=dead-launch-error,failure_class=runtime\n"
-                self.jobs.write_text(parent + settled)
+                # The controller reads concurrently. Truncate/write briefly
+                # removes the attempt and legitimately enters its 30s observer
+                # backoff; publish the fixture just like the atomic real writer.
+                staged = self.jobs.with_suffix(".settled")
+                staged.write_text(parent + settled)
+                staged.replace(self.jobs)
                 self.assertEqual(process.wait(timeout=10), 0, output.read_text())
                 turns = [json.loads(line) for line in self.trace.read_text().splitlines()
                          if json.loads(line)["event"] == "turn-start"]
