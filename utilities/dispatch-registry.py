@@ -71,7 +71,9 @@ from codex_dispatch_terminal import (  # noqa: E402
     REVIEW_BLOCKING_NOTE,
     carrier_terminal_note,
     inspect_terminal_attempt,
+    inspect_terminal_log,
 )
+from route_identity import route_hash  # noqa: E402
 from dispatch_completion_join import (  # noqa: E402
     ChildRow,
     JoinContractError,
@@ -679,6 +681,127 @@ def _same_host_foreground_stage_receipt(row):
     }
 
 
+def _same_host_foreground_review_failure(row):
+    """Prove one route-bound review FAIL without trusting its outside-root path.
+
+    The wrapper's post-exit receipt and the typed failure must be committed in
+    one registry CAS. Publishing the receipt first lets an older parked owner
+    race in and close the invalid artifact path as an invalid envelope.
+    """
+    meta = row["meta"]
+    if (row["status"] not in OPEN or row.get("attempt_contract_status") != "current"
+            or meta.get("registered_worker") != "1"
+            or meta.get("worker_type") != "review"
+            or meta.get("dispatch_depth") != "2"
+            or meta.get("launch_lifecycle") != "foreground-scoped"
+            or meta.get("pid_scope") != "namespace-local"
+            or post_exit_receipt_reason(meta)):
+        return None
+    attempt = meta.get("attempt_id", "")
+    pid = meta.get("pid", "")
+    namespace = process_namespace_identity()
+    if (not attempt or not pid.isdigit() or not meta.get("pid_start")
+            or meta.get("pgid") != pid or not namespace
+            or meta.get("pid_ns") != namespace
+            or meta.get("pid_observer_ns") != namespace
+            or not attempt_scan_namespace_authority(meta)):
+        return None
+    identities = authoritative_process_identities(meta)
+    if (len(identities) != 1 or identities[0].source != "local"
+            or identities[0].pid != int(pid)
+            or identities[0].expected_start != meta["pid_start"]):
+        return None
+    log_file = Path(meta.get("log_file") or "")
+    if (not log_file.is_absolute() or log_file.is_symlink()
+            or not log_file.name.endswith(f".{attempt}.codex.jsonl")):
+        return None
+    route_file = Path(meta.get("route_file") or "")
+    if not route_file.is_absolute() or route_file.is_symlink():
+        return None
+    try:
+        route = json.loads(route_file.read_text(encoding="utf-8"))
+        if (not isinstance(route, dict)
+                or route.get("route_id") != meta.get("route_id")
+                or route.get("route_hash") != meta.get("route_hash")
+                or route.get("route_hash") != route_hash(route)
+                or len([node for node in route.get("nodes", [])
+                        if isinstance(node, dict) and node.get("id") == meta.get("route_node")
+                        and node.get("kind") == "review-worker"]) != 1):
+            return None
+        digest = hashlib.sha256(log_file.read_bytes()).hexdigest()
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+    terminal = inspect_terminal_attempt(
+        log_file, worktree=row.get("worktree"),
+        artifact_root_metadata=meta.get("artifact_root"),
+        worker_type="review",
+    )
+    raw_terminal = inspect_terminal_log(log_file)
+    if (terminal.get("state") != "invalid"
+            or terminal.get("source") != "exact-turn-completed"
+            or terminal.get("reason") != "artifact-outside-root"
+            or not raw_terminal
+            or raw_terminal.get("verdict") != "FAIL"
+            or raw_terminal.get("terminal_event") != "turn.completed"
+            or raw_terminal.get("failure_note") != "dead-worker-fail"
+            or not Path(raw_terminal.get("artifact") or "").is_absolute()
+            or any(ord(char) < 32 or ord(char) == 127
+                   for char in raw_terminal.get("artifact", ""))):
+        return None
+    try:
+        if hashlib.sha256(log_file.read_bytes()).hexdigest() != digest:
+            return None
+    except OSError:
+        return None
+    governed = attempt_governed_process_quiescence(meta)
+    if governed.state != "quiescent" or governed.reason != "local-pid-gone":
+        return None
+    proof = prove_attempt_quiescence(meta, max_wait_seconds=0)
+    if (not proof.proven or proof.source != "exact-teardown"
+            or proof.process_group_state != "empty"
+            or proof.descendant_state != "empty" or not proof.namespace_authority):
+        return None
+    return {
+        "launch_outcome": "governed-process-reaped",
+        "group_reap_proof": GROUP_REAP_PROOF,
+        "group_reap_pgid": pid,
+        "attempt_descendant_proof": ATTEMPT_DESCENDANT_PROOF,
+        "attempt_descendant_observer_ns": namespace,
+        "failure_class": "fail",
+        "classifier_source": "same-host-foreground-review-failure-v1",
+        "reconcile_reason": "terminal-invalid:artifact-outside-root",
+        "terminal_event": "turn.completed",
+        "detected_by": "exact-review-failure-reconcile",
+        "_log_digest": digest,
+    }
+
+
+def _untrusted_foreground_review_failure(row):
+    """Recognize the exact outside-root FAIL that must not fall through.
+
+    This is only a hold predicate, never evidence for closure. The full route,
+    process, and terminal proof above alone grants the atomic typed failure.
+    """
+    meta = row["meta"]
+    if (row["status"] not in OPEN or row.get("attempt_contract_status") != "current"
+            or meta.get("worker_type") != "review"
+            or meta.get("dispatch_depth") != "2"
+            or meta.get("launch_lifecycle") != "foreground-scoped"
+            or not meta.get("route_id") or not meta.get("route_node")):
+        return False
+    raw_terminal = inspect_terminal_log(meta.get("log_file"))
+    if (not raw_terminal or raw_terminal.get("verdict") != "FAIL"
+            or raw_terminal.get("terminal_event") != "turn.completed"):
+        return False
+    terminal = inspect_terminal_attempt(
+        meta.get("log_file"), worktree=row.get("worktree"),
+        artifact_root_metadata=meta.get("artifact_root"), worker_type="review",
+    )
+    return (terminal.get("state") == "invalid"
+            and terminal.get("source") == "exact-turn-completed"
+            and terminal.get("reason") == "artifact-outside-root")
+
+
 def _recorded_move_correction_proof(row, rows, args):
     """Preview only this exact attempt's already-committed artifact false negative."""
     meta = row["meta"]
@@ -1019,6 +1142,9 @@ def repair_stale_row(rows, args):
 def reconcile(rows, args):
     only_exact_dead = getattr(args, "only_exact_dead", False)
     selected = [row for row in rows if matches(row, args)]
+    exact_selection = bool(args.attempt and len(selected) == 1 and
+                           sum(item["meta"].get("attempt_id") == args.attempt
+                               for item in rows) == 1)
     exact_repair_only = False
     newest = {}
     for row in rows:
@@ -1026,6 +1152,26 @@ def reconcile(rows, args):
         if all(key[:2]): newest[key] = row["order"]
     decisions = []
     for row in selected:
+        meta = row["meta"]
+        if (exact_selection and row["status"] == "done"
+                and meta.get("classifier_source") == "same-host-foreground-review-failure-v1"):
+            exact_repair_only = True
+            verified = (meta.get("note") == "dead-worker-fail"
+                        and meta.get("failure_class") == "fail"
+                        and meta.get("terminal_event") == "turn.completed"
+                        and meta.get("reconcile_reason") == "terminal-invalid:artifact-outside-root"
+                        and post_exit_receipt_reason(meta) == "governed-process-group-reaped"
+                        and not meta.get("review_artifact_b64"))
+            decisions.append({
+                "attempt_id": meta["attempt_id"], "slug": row["slug"],
+                "category": "terminal-review-failure-already-settled" if verified
+                            else "terminal-review-failure-unverified",
+                "reason": "same-host-foreground-review-failure",
+                "closed": False, "proposed_note": None, "revalidated": verified,
+                "cascade": [], "cleanup": None,
+                "summary_owner": {"state": "not-applied", "reason": "exact-attempt-only"},
+            })
+            continue
         # An exact recorded-move correction remains an exact-only repair on
         # re-entry. Otherwise the now-completed row bypasses the correction
         # branch and this call could deliver unrelated pending attempts.
@@ -1084,6 +1230,38 @@ def reconcile(rows, args):
                 "proposed_note": None, "revalidated": completed if args.apply else None,
                 "cascade": [], "cleanup": None,
                 "summary_owner": {"state": "not-applied", "reason": "exact-correction-only"},
+            })
+            continue
+        review_failure = (exact_selection and not only_exact_dead
+                          and category == "terminal-handoff"
+                          and _untrusted_foreground_review_failure(row))
+        if review_failure:
+            failure = _same_host_foreground_review_failure(row)
+            exact_repair_only = True
+            closed = False
+            if args.apply and failure is not None:
+                closed = close_attempt_row_if(
+                    args.jobs, meta["attempt_id"], "dead-worker-fail",
+                    lambda fields: (
+                        fields == row["raw"].split("\t")
+                        and _same_host_foreground_review_failure(row) == failure
+                    ),
+                    evidence={key: value for key, value in failure.items()
+                              if key != "_log_digest"},
+                )
+                if closed:
+                    materialize_after_terminal_close(args.jobs, meta["attempt_id"])
+            decisions.append({
+                "attempt_id": meta["attempt_id"], "slug": row["slug"],
+                "category": "terminal-review-failure-settled" if closed else
+                            "terminal-review-failure-ready" if failure is not None and not args.apply else
+                            "terminal-review-failure-proof-unavailable" if failure is None else
+                            "terminal-review-failure-revalidation-veto",
+                "reason": "same-host-foreground-review-failure",
+                "closed": closed, "proposed_note": "dead-worker-fail" if failure is not None else None,
+                "revalidated": closed if args.apply else None,
+                "cascade": [], "cleanup": None,
+                "summary_owner": {"state": "not-applied", "reason": "exact-attempt-only"},
             })
             continue
         # A same-host foreground stage can outlive the wrapper that normally

@@ -1674,6 +1674,184 @@ class SameHostForegroundStageReceiptTest(unittest.TestCase):
   self.assertEqual(self.jobs.read_bytes(),original)
 
 
+class SameHostForegroundReviewFailureTest(unittest.TestCase):
+ def setUp(self):
+  self.tmp=tempfile.TemporaryDirectory();self.base=Path(self.tmp.name)
+  self.repo=self.base/"repo";self.repo.mkdir()
+  self.root=self.repo/".agent_reports";self.root.mkdir()
+  self.real_review=self.root/"round_1.md";self.real_review.write_text("## verdict: FAIL\nactual finding\n")
+  self.wrong_review=self.base/"wrong-root"/"round_1.md"
+  self.wrong_review.parent.mkdir();self.wrong_review.write_text("another file\n")
+  self.route_file=self.base/"route.json"
+  from route_identity import route_hash
+  route={"route_id":"rt-review","nodes":[{"id":"plan-check","kind":"review-worker"}]}
+  route["route_hash"]=route_hash(route)
+  self.route_file.write_text(json.dumps(route))
+  self.route_hash=route["route_hash"]
+  self.jobs=self.base/"jobs.log";self.attempt="att-review-fail-exact"
+  self.parent="att-owner-review-fail"
+  self.log=self.base/f"plan-check.{self.attempt}.codex.jsonl"
+  self.ns=os.readlink("/proc/self/ns/pid")
+  self.pid=99999996;self.start="1";self.live=None
+  self.write_log();self.write_row()
+
+ def tearDown(self):
+  if self.live is not None:
+   self.live.terminate();self.live.wait(timeout=5)
+  self.tmp.cleanup()
+
+ def write_log(self,*,verdict="FAIL",turn=True,artifact=None):
+  artifact=artifact or self.wrong_review
+  rows=[{"type":"item.completed","item":{"type":"agent_message",
+         "text":f"artifact: {artifact}\nverdict: {verdict}\nblocker: source provenance risk"}}]
+  if turn:rows.append({"type":"turn.completed"})
+  self.log.write_text("\n".join(json.dumps(r) for r in rows)+"\n")
+
+ def write_row(self,*,extra="",pid=None,start=None,ns=None,route_id="rt-review"):
+  pid=self.pid if pid is None else pid
+  start=self.start if start is None else start
+  ns=self.ns if ns is None else ns
+  self.jobs.write_text(
+   f"2026-09-28T10:00:00Z\topen\t{self.repo}\t{self.repo}\tplan-check\t"
+   f"{CURRENT_ATTEMPT_CONTRACT},worker_type=review,route_id={route_id},"
+   f"route_hash={self.route_hash},route_node=plan-check,route_file={self.route_file},"
+   f"attempt_id={self.attempt},parent_attempt_id={self.parent},pid={pid},pid_start={start},"
+   f"pgid={pid},pid_scope=namespace-local,pid_ns={ns},pid_observer_ns={ns},"
+   f"launch_lifecycle=foreground-scoped,artifact_root={self.root},"
+   f"log_file={self.log},parent_completion_delivery=parent-runtime-supervised{extra}\n")
+
+ def invoke(self,*args):
+  return subprocess.run([sys.executable,str(SCRIPT),"reconcile","--jobs",str(self.jobs),
+                         "--attempt",self.attempt,*args],capture_output=True,text=True)
+
+ def decision(self,*args):
+  result=self.invoke(*args)
+  self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+  return json.loads(result.stdout)
+
+ def test_exact_fail_is_atomic_and_joins_without_review_authority(self):
+  self.write_row(extra=",prior_terminal_note=dead-missing-result,prior_failure_class=runtime,"
+                       "prior_reconcile_reason=older-diagnostic")
+  before=self.jobs.read_bytes()
+  self.assertEqual(self.decision()["decisions"][0]["category"],"terminal-review-failure-ready")
+  self.assertEqual(self.jobs.read_bytes(),before)
+  result=self.decision("--apply")
+  self.assertEqual(result["pending_delivery"],{"skipped":"exact-attempt-only"})
+  self.assertEqual(result["decisions"][0]["category"],"terminal-review-failure-settled")
+  row=self.jobs.read_text().strip().split("\t",5)
+  self.assertEqual(row[1],"done")
+  meta=parse_registry_metadata(row[5])
+  self.assertEqual((meta["note"],meta["failure_class"]),("dead-worker-fail","fail"))
+  self.assertEqual(meta["terminal_event"],"turn.completed")
+  self.assertEqual(meta["reconcile_reason"],"terminal-invalid:artifact-outside-root")
+  self.assertEqual(meta["prior_terminal_note"],"dead-missing-result")
+  self.assertEqual(meta["prior_failure_class"],"runtime")
+  self.assertEqual(meta["prior_reconcile_reason"],"older-diagnostic")
+  self.assertEqual(post_exit_receipt_reason(meta),"governed-process-group-reaped")
+  self.assertNotIn("review_artifact_b64",meta)
+  self.assertNotIn("completion_marker",meta)
+  self.assertNotIn(str(self.real_review),row[5])
+  from dispatch_completion_join import join_batch
+  joined=join_batch(jobs=self.jobs,parent_attempt_id=self.parent,
+                    expected_attempts={self.attempt},interval=.05,timeout=.2)
+  self.assertEqual(joined["state"],"ready",joined)
+  self.assertEqual(joined["children"][0]["readiness"],"ready")
+  self.assertEqual(joined["children"][0]["required_action"],"inspect-done-failure")
+  after=self.jobs.read_bytes()
+  again=self.decision("--apply")
+  self.assertEqual(again["pending_delivery"],{"skipped":"exact-attempt-only"})
+  self.assertEqual(again["decisions"][0]["category"],"terminal-review-failure-already-settled")
+  self.assertEqual(self.jobs.read_bytes(),after)
+
+ def test_pid_namespace_route_and_terminal_refusals_leave_registry_unchanged(self):
+  module=self._module()
+  def refused(*, exact_apply=False):
+   before=self.jobs.read_bytes()
+   self.assertIsNone(module._same_host_foreground_review_failure(module.read_rows(self.jobs)[0]))
+   if exact_apply:
+    result=self.decision("--apply")
+    self.assertEqual(result["decisions"][0]["category"],
+                     "terminal-review-failure-proof-unavailable")
+    self.assertEqual(result["pending_delivery"],{"skipped":"exact-attempt-only"})
+   self.assertEqual(self.jobs.read_bytes(),before)
+  self.live=subprocess.Popen(["sleep","60"],start_new_session=True)
+  actual=Path(f"/proc/{self.live.pid}/stat").read_text().rsplit(") ",1)[1].split()[19]
+  self.write_row(pid=self.live.pid,start=actual);refused(exact_apply=True)
+  self.write_row(pid=self.live.pid,start=str(int(actual)+1));refused(exact_apply=True)
+  self.write_row(ns="pid:[987654321]");refused(exact_apply=True)
+  self.write_row(route_id="rt-other");refused(exact_apply=True)
+  self.write_row()
+  self.write_log(turn=False);refused()
+  self.write_log(verdict="PASS");refused()
+  self.write_log(artifact=Path("relative-review.md"));refused(exact_apply=True)
+
+ def test_group_or_descendant_residue_and_revalidation_race_refuse(self):
+  module=self._module()
+  row=module.read_rows(self.jobs)[0]
+  before=self.jobs.read_bytes()
+  populated=D.ProcessGroupObservation("populated",((424242,"1","S"),))
+  with mock.patch.object(D,"process_group_observation",return_value=populated):
+   self.assertIsNone(module._same_host_foreground_review_failure(row))
+  with mock.patch.object(D,"attempt_tagged_descendants",return_value=populated):
+   self.assertIsNone(module._same_host_foreground_review_failure(row))
+  self.assertEqual(self.jobs.read_bytes(),before)
+  args=types.SimpleNamespace(jobs=self.jobs,attempt=self.attempt,session=None,route=None,
+                             node=None,job=None,all=False,apply=True,agent_home=self.base,
+                             only_exact_dead=False,audit=None)
+  with mock.patch.object(D,"attempt_tagged_descendants",return_value=populated), \
+       mock.patch.object(module,"reconcile_pending_delivery",side_effect=AssertionError("broad delivery")):
+   stream=io.StringIO()
+   with contextlib.redirect_stdout(stream):module.reconcile(module.read_rows(self.jobs),args)
+  self.assertEqual(json.loads(stream.getvalue())["decisions"][0]["category"],
+                   "terminal-review-failure-proof-unavailable")
+  self.assertEqual(self.jobs.read_bytes(),before)
+  original=module._same_host_foreground_review_failure
+  calls=0
+  def changed(fresh):
+   nonlocal calls
+   calls+=1
+   if calls==2:self.write_log(verdict="PASS")
+   return original(fresh)
+  with mock.patch.object(module,"_same_host_foreground_review_failure",side_effect=changed), \
+       mock.patch.object(module,"reconcile_pending_delivery",side_effect=AssertionError("broad delivery")):
+   stream=io.StringIO()
+   with contextlib.redirect_stdout(stream):module.reconcile(module.read_rows(self.jobs),args)
+  self.assertEqual(json.loads(stream.getvalue())["decisions"][0]["category"],
+                   "terminal-review-failure-revalidation-veto")
+  self.assertEqual(self.jobs.read_bytes(),before)
+
+ def test_terminal_changed_between_inspector_reads_or_after_commit_is_idempotent(self):
+  module=self._module()
+  row=module.read_rows(self.jobs)[0]
+  original=module.inspect_terminal_log
+  def alter(path):
+   self.write_log(verdict="PASS")
+   return original(path)
+  with mock.patch.object(module,"inspect_terminal_log",side_effect=alter):
+   self.assertIsNone(module._same_host_foreground_review_failure(row))
+  self.assertEqual(self.jobs.read_text().split("\t")[1],"open")
+  self.write_log()
+  args=types.SimpleNamespace(jobs=self.jobs,attempt=self.attempt,session=None,route=None,
+                             node=None,job=None,all=False,apply=True,agent_home=self.base,
+                             only_exact_dead=False,audit=None)
+  with mock.patch.object(module,"materialize_after_terminal_close",side_effect=OSError("interrupted")):
+   with self.assertRaises(OSError):module.reconcile(module.read_rows(self.jobs),args)
+  committed=self.jobs.read_bytes()
+  self.assertIn(b"note=dead-worker-fail",committed)
+  with mock.patch.object(module,"reconcile_pending_delivery",side_effect=AssertionError("broad delivery")), \
+       mock.patch.object(module,"close_attempt_row_if",side_effect=AssertionError("duplicate close")):
+   stream=io.StringIO()
+   with contextlib.redirect_stdout(stream):module.reconcile(module.read_rows(self.jobs),args)
+  self.assertEqual(json.loads(stream.getvalue())["decisions"][0]["category"],
+                   "terminal-review-failure-already-settled")
+  self.assertEqual(self.jobs.read_bytes(),committed)
+
+ def _module(self):
+  spec=importlib.util.spec_from_file_location("registry_review_failure_fixture",SCRIPT)
+  module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+  return module
+
+
 class ArtifactProofReceiptSealTest(unittest.TestCase):
  """A PASS worker whose post-exit receipt can never be issued must be recoverable.
 
