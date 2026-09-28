@@ -190,12 +190,12 @@ class GpuProcessAndResourceRenderTest(unittest.TestCase):
                     "index": 0, "name": "NVIDIA A100", "utilization_gpu_pct": 80,
                     "memory_used_mib": 12288, "memory_total_mib": 40960,
                     "processes": [
-                        {"pid": 300, "used_memory_mib": 8192,
+                        {"pid": 300, "proc_start": 42, "used_memory_mib": 8192,
                          "command": "python train.py --epochs 10",
                          "owner": {"kind": "job", "id": "att-one", "label": "job:train"},
                          "session_owner": {"kind": "session", "harness": "codex",
                                            "id": "sid-exact"}},
-                        {"pid": 301, "used_memory_mib": 4096,
+                        {"pid": 301, "proc_start": 43, "used_memory_mib": 4096,
                          "command": "python worker.py",
                          "owner": {"kind": "run", "id": "run-one", "label": "run:one"},
                          "session_owner": {"kind": "session", "harness": "codex",
@@ -205,7 +205,8 @@ class GpuProcessAndResourceRenderTest(unittest.TestCase):
                     "index": 1, "name": "NVIDIA L40S", "utilization_gpu_pct": 20,
                     "memory_used_mib": 1024, "memory_total_mib": 49152,
                     "processes": [{
-                        "pid": 302, "used_memory_mib": 1024, "command": "python eval.py",
+                        "pid": 302, "proc_start": 44,
+                        "used_memory_mib": 1024, "command": "python eval.py",
                         "owner": None,
                         "session_owner": {"kind": "session", "harness": "codex",
                                           "id": "sid-exact"},
@@ -239,11 +240,67 @@ class GpuProcessAndResourceRenderTest(unittest.TestCase):
                          [("cnn", 0), ("cnn", 1)])
         self.assertEqual(linked[0]["process_count"], 2)
         self.assertEqual(linked[0]["used_memory_mib"], 12288)
+        self.assertEqual(render._gpu_run_rows(linked), [])  # existing job/run rows own these
         near = Session(harness="codex", pid=102, session_id="sid-exact-other")
         self.assertEqual(render._gpu_resources_for_session(near, resources), [])
         job = DispatchJob(key="autopilot-code", harness="codex")
         job._runtime_session_id = "sid-exact"
         self.assertEqual(render._gpu_resources_for_session(job, resources), linked)
+
+    def test_claimed_training_processes_become_run_rows_under_exact_session(self):
+        codex = Session(harness="codex", pid=101, proc_start="11",
+                        cwd="/tmp/f88-project", session_id="sid-exact",
+                        title="Codex [92]", liveness="working")
+        old = Session(harness="claude", pid=102, proc_start="12",
+                      cwd="/tmp/f88-project", session_id="old-claude",
+                      title="old Claude", liveness="working")
+        claimed = {"kind": "session", "harness": "codex", "id": "sid-exact",
+                   "source": "persistent-claim+ancestry"}
+        snapshot = {"configured": True, "hosts": [{"host": "moving4", "gpus": [
+            {"index": 0, "processes": [
+                {"pid": 3697573, "proc_start": 90,
+                 "command": "python run.py --engine_mode train --config _m6_lx3nx4.yaml",
+                 "owner": claimed, "session_owner": claimed},
+                {"pid": 1416464, "proc_start": 91,
+                 "command": "python run.py --engine_mode train_ft --config _ft09__m3_lx3nx4.yaml",
+                 "owner": claimed, "session_owner": claimed},
+            ]},
+            {"index": 1, "processes": [
+                {"pid": 3697573, "proc_start": 90,
+                 "command": "python run.py --engine_mode train --config _m6_lx3nx4.yaml",
+                 "owner": claimed, "session_owner": claimed},
+            ]},
+        ]}]}
+        render.set_compute_hosts(snapshot)
+        resources = render._gpu_session_resources()
+        linked = render._gpu_resources_for_session(codex, resources)
+        self.assertEqual(render._gpu_resources_for_session(old, resources), [])
+        for width in (168, 100, 60):
+            rows = render._gpu_run_rows(linked, term_width=width)
+            text = [render._plain(row) for row in rows]
+            self.assertEqual(len(rows), 2)
+            self.assertTrue(all(render._dw(line) <= width for line in text))
+            self.assertTrue(all(" RUN " in line for line in text))
+            self.assertIn("RUN train _m6_lx3nx4.yaml", text[0])
+            self.assertIn("RUN train_ft _ft09__m3_lx3nx4.yaml", text[1])
+        for lines in (
+            render._build_lines([codex, old], [], "both", False, 0,
+                                layout="wide", term_width=120),
+            render._build_process_lines([codex, old], [], {}, 0, None, 120, "wide"),
+        ):
+            text = [render._plain(line) for line in lines if line]
+            run_rows = [line for line in text if " RUN " in line]
+            self.assertEqual(len(run_rows), 2)
+            self.assertTrue(any("_m6_lx3nx4.yaml" in line for line in run_rows))
+            self.assertTrue(any("_ft09__m3_lx3nx4.yaml" in line for line in run_rows))
+            self.assertLess(next(i for i, line in enumerate(text) if "Codex [92]" in line),
+                            next(i for i, line in enumerate(text) if " RUN " in line))
+        render._COMPUTE_HOSTS_SET_AT -= 3 * render._COMPUTE_HOST_INTERVAL + 1
+        self.assertEqual(render._gpu_session_resources(), {})
+        stale_lines = render._build_lines([codex], [], "both", False, 0,
+                                          layout="wide", term_width=120)
+        self.assertFalse(any(" RUN " in render._plain(line)
+                             for line in stale_lines if line))
 
     def test_managed_run_fences_stale_ancestor_sessions_end_to_end(self):
         module = _compute_hosts_module()

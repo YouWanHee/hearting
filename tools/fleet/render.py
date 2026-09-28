@@ -33,6 +33,7 @@ import glob
 import math
 import os
 import re
+import shlex
 import sys
 import time
 
@@ -4390,6 +4391,7 @@ def set_api_disabled(v):
 _HEARTING = None   # resolved once by fleet.main; render ticks never inspect installer/git state
 _COMPUTE_HOSTS = None  # F-83: atomic last-good from the independent GPU/SSH refresh pump
 _COMPUTE_HOST_INTERVAL = 10.0
+_COMPUTE_HOSTS_SET_AT = None
 
 
 def set_hearting(value):
@@ -4398,8 +4400,9 @@ def set_hearting(value):
 
 
 def set_compute_hosts(value):
-    global _COMPUTE_HOSTS
+    global _COMPUTE_HOSTS, _COMPUTE_HOSTS_SET_AT
     _COMPUTE_HOSTS = dict(value) if isinstance(value, dict) else None
+    _COMPUTE_HOSTS_SET_AT = time.monotonic() if _COMPUTE_HOSTS is not None else None
 
 
 # F-71b: the header's own honesty about the two RefreshPump workers (tools/fleet/refresh.py).
@@ -4572,7 +4575,13 @@ def _gpu_process_rows(gpu, indent, width):
 
 def _gpu_session_resources(snapshot=None):
     """Exact full-session-id GPU relations, normalized once for every Fleet view."""
-    snapshot = _COMPUTE_HOSTS if snapshot is None else snapshot
+    if snapshot is None:
+        snapshot = _COMPUTE_HOSTS
+        # The refresh pump retains its last good host sample during a stall.
+        # That sample no longer proves the process is still running.
+        if (_COMPUTE_HOSTS_SET_AT is None or
+                time.monotonic() - _COMPUTE_HOSTS_SET_AT > 3 * _COMPUTE_HOST_INTERVAL):
+            return {}
     if not isinstance(snapshot, dict):
         return {}
     index = {}
@@ -4599,9 +4608,21 @@ def _gpu_session_resources(snapshot=None):
                     "host": host_name, "index": gpu_index,
                     "model": _gpu_safe_text(gpu.get("name")).replace("NVIDIA ", ""),
                     "process_count": 0, "used_memory_mib": 0,
-                    "has_memory": False,
+                    "has_memory": False, "processes": [],
                 })
                 resource["process_count"] += 1
+                pid, proc_start = process.get("pid"), process.get("proc_start")
+                primary = process.get("owner")
+                if (isinstance(primary, dict) and primary.get("kind") == "session"
+                        and primary.get("harness") == owner["harness"]
+                        and primary.get("id") == owner["id"]
+                        and isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
+                        and isinstance(proc_start, int) and not isinstance(proc_start, bool)):
+                    resource["processes"].append({
+                        "pid": pid, "proc_start": proc_start,
+                        "command": _gpu_safe_text(process.get("command")
+                                                  or process.get("process_name") or "process"),
+                    })
                 used = process.get("used_memory_mib")
                 if isinstance(used, int) and not isinstance(used, bool):
                     resource["used_memory_mib"] += max(0, used)
@@ -4648,6 +4669,55 @@ def _gpu_resource_strip(resources, term_width=None, depth=0, in_card=False):
     # F-89: drop model, then memory while preserving pulse + every GPU identity.
     return [_fit_strip([lambda: build(True, True), lambda: build(False, True),
                         lambda: build(False, False)], width)]
+
+
+def _gpu_run_title(command):
+    """Use explicit command arguments as the compact run title when present."""
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        words = command.split()
+    def value_of(option):
+        for index, word in enumerate(words):
+            if word.startswith(option + "="):
+                return word.split("=", 1)[1]
+            if word == option and index + 1 < len(words):
+                return words[index + 1]
+        return None
+
+    mode = value_of("--engine_mode")
+    for option in ("--run-id", "--name", "--config"):
+        value = value_of(option)
+        if value:
+            title = os.path.basename(value)
+            return mode + " " + title if mode else title
+    return command
+
+
+def _gpu_run_rows(resources, term_width=None, depth=0, in_card=False):
+    """Live GPU processes under their exact session, once per host/PID/start."""
+    width = max(20, int(term_width or 200))
+    indent = _conn_indent(depth, in_card)
+    seen = set()
+    rows = []
+    for resource in resources:
+        for process in resource.get("processes") or ():
+            identity = (resource["host"], process["pid"], process["proc_start"])
+            if identity in seen:
+                continue
+            seen.add(identity)
+            title = _gpu_run_title(process["command"])
+            row = [(indent, None), ("●", "g_work" if _BLINK_ON else "g_work_off"),
+                   (" RUN ", "name_dim"),
+                   (title, "name_dim"),
+                   (" · %s pid %s" % (resource["host"], process["pid"]), "dim")]
+            rows.append(_clip_segs(row, width)[0])
+    return rows
+
+
+def _gpu_session_rows(resources, term_width=None, depth=0, in_card=False):
+    return (_gpu_resource_strip(resources, term_width, depth, in_card)
+            + _gpu_run_rows(resources, term_width, depth, in_card))
 
 
 def _gpu_state(gpu):
@@ -5331,7 +5401,7 @@ def _route_card(view, session_by_identity, term_width, now, gpu_resources=None):
             resources = (_gpu_resources_for_session(session, gpu_resources or {})
                          if session else [])
         if resources:
-            out.extend(_gpu_resource_strip(resources, term_width=term_width))
+            out.extend(_gpu_session_rows(resources, term_width=term_width))
 
     if _SHOW_ALL:
         # prd.md:310 — completion gates stay behind the `a` toggle, never on the base screen.
@@ -5426,7 +5496,7 @@ def _degrade_card(job, session_by_identity, term_width, gpu_resources=None):
         resources = (_gpu_resources_for_session(session, gpu_resources or {})
                      if session else [])
     if resources:
-        out.extend(_gpu_resource_strip(resources, term_width=term_width))
+        out.extend(_gpu_session_rows(resources, term_width=term_width))
     return out, {"card_key": card_key, "fold_line": 0, "job_rows": [], "folded": folded}
 
 
@@ -5582,7 +5652,7 @@ def _build_process_lines(sessions, jobs, route_views_by_id, malformed, memory, t
         if s_subs:
             lines.extend(_subagent_strip(s_subs, term_width=term_width))
         if session_resources and not covered:
-            lines.extend(_gpu_resource_strip(session_resources, term_width=term_width))
+            lines.extend(_gpu_session_rows(session_resources, term_width=term_width))
         for plugin_job in plugin_subs:
             lines.extend(_plugin_agent_row(plugin_job, term_width=term_width))
 
@@ -6387,7 +6457,7 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
                 job_resources = (_gpu_resources_for_session(job_session, gpu_resources)
                                  if job_session else [])
             if job_resources:
-                lines.extend(_gpu_resource_strip(
+                lines.extend(_gpu_session_rows(
                     job_resources, term_width=term_width, depth=depth, in_card=in_card))
             # Everything emitted above belongs to the owner itself (identity row, its
             # NOW line, its own sub-agent strip). Descendants start here, so this index
@@ -6574,7 +6644,7 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
                 lines.extend(_subagent_strip(shown_subs, term_width=term_width))
             session_resources = _gpu_resources_for_session(s, gpu_resources)
             if session_resources:
-                lines.extend(_gpu_resource_strip(session_resources, term_width=term_width))
+                lines.extend(_gpu_session_rows(session_resources, term_width=term_width))
             # Two relation lines at most: one for messages, one for stewarding. Each
             # carries both of its directions (user 2026-09-10).
             lines.extend(_peer_link_strip(getattr(s, "peer_last_sent", None), _peer_last,
