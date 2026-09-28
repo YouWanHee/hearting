@@ -21,7 +21,7 @@ source.
 
 | Layer | Location | Git | Purpose |
 |---|---|---|---|
-| Local serving truth | `${XDG_DATA_HOME:-$HOME/.local/share}/hearting/memory/memory.db` (SQLite WAL; existing `<agent-home>/memory` remains compatible) | ignored binary; never exchanged | semantic records, transactional outbox/applied/frontier/conflict state, local replica identity and counter, peer/migration evidence, graveyard, and rebuildable indexes |
+| Local serving truth | `${XDG_DATA_HOME:-$HOME/.local/share}/hearting/memory/memory.db` (SQLite WAL; an existing store at another R1 location remains compatible — see below) | ignored binary; never exchanged | semantic records, transactional outbox/applied/frontier/conflict state, local replica identity and counter, peer/migration evidence, graveyard, and rebuildable indexes |
 | Immutable exchange | Bare repository at `${XDG_STATE_HOME:-$HOME/.local/state}/hearting/memory-sync/exchange`; Git tree path `protocol/v2/ops/<prefix>/<op_id>.json` | private dedicated Git repository, never checked out | canonical operation objects only; one semantic transaction per immutable path |
 | Compatibility projection | `<memory-store>/dump.jsonl` (one ID-sorted record per line) | optionally tracked for old readers | materialized v1-compatible view; never a routine v2 push/fold input and not a complete v2 recovery source |
 | Harness projection | `<agent-home>/projects/<cwd>/memory/` | ignored | built-in file memory, disabled by default (D-79); `mem migrate --all-projects` is the one-time recovery path for files a prior enabled period left behind, and `mem project` can rebuild the projection |
@@ -290,6 +290,14 @@ store; `harness memory status` reports the recorded policy.
 ## Environment overrides
 
 - `MEM_STORE` controls both `memory.db` and `dump.jsonl` location.
+  Without it, every consumer resolves the store through `store_resolve.py`
+  (Python) or `utilities/memory-store.sh` (shell) under core/MEMORY.md §7.0
+  R0-R5: the one populated `memory.db` among `$AGENT_HOME/memory`,
+  `$CLAUDE_HOME/memory`, `~/hearting/memory`, `~/agent_setting/memory`,
+  `~/.claude/memory`, `$XDG_DATA_HOME/hearting/current/memory` and
+  `$XDG_DATA_HOME/hearting/memory` wins; several distinct databases exit 3
+  and ask for `MEM_STORE`; with none, the first existing ordinary candidate
+  directory, else the XDG path. Resolution never moves or copies a store.
 - `MEM_SYNC_REMOTE=1` is the canonical explicit opt-in for immutable protocol-v2
   remote exchange. Unset or `0` keeps synchronization local.
 - `MEM_DUMP_PUSH=1` is a deprecated compatibility alias used only when
