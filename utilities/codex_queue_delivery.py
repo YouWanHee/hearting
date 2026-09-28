@@ -317,7 +317,10 @@ def find_turn_by_client_message_id(
         cursor = response.get("nextCursor")
         if not cursor:
             return None
-    raise QueueDeliveryError("queue-turns-page-limit-exceeded")
+    # A bounded history miss is ambiguous, not a reason to strand a new
+    # receipt in a long conversation. At-least-once permits another send;
+    # the independent exact pending-queue check still suppresses duplicates.
+    return None
 
 
 def _start_interrupted_owned_item(
@@ -351,6 +354,16 @@ def _pending_item(items, client_message_id):
     return True, item_id if isinstance(item_id, str) and item_id else None
 
 
+def _known_consumed(path, thread_id, client_message_id, *, timeout):
+    try:
+        return find_turn_by_client_message_id(path, thread_id, client_message_id, timeout=timeout)
+    except QueueDeliveryError:
+        # History can be unavailable or oversized on a long coding turn.
+        # That is an ambiguous result under the accepted at-least-once policy,
+        # never evidence of consumption. Exact pending lookup still follows.
+        return None
+
+
 def send_at_least_once(
     path: Path, *, thread_id: str, client_message_id: str, message: str,
     timeout: float = 5.0,
@@ -361,7 +374,7 @@ def send_at_least_once(
     if not isinstance(message, str) or not message.strip() or len(message.encode("utf-8")) > 16 * 1024:
         raise QueueDeliveryError("queue-message-invalid")
     for retry in range(2):
-        consumed = find_turn_by_client_message_id(path, thread_id, client_message_id, timeout=timeout)
+        consumed = _known_consumed(path, thread_id, client_message_id, timeout=timeout)
         if consumed is not None:
             return {"status": "consumed", "queued_submission_id": None,
                     "already_pending": False, "started_after_interrupt": False}
@@ -374,7 +387,7 @@ def send_at_least_once(
                     "already_pending": True, "started_after_interrupt": started}
         # Close the common consume-between-history-and-list race. Another
         # writer may still win after this read; accepted duplicates are benign.
-        if find_turn_by_client_message_id(path, thread_id, client_message_id, timeout=timeout) is not None:
+        if _known_consumed(path, thread_id, client_message_id, timeout=timeout) is not None:
             return {"status": "consumed", "queued_submission_id": None,
                     "already_pending": False, "started_after_interrupt": False}
         interrupted = _latest_turn_status(path, thread_id, timeout=timeout) == "interrupted"

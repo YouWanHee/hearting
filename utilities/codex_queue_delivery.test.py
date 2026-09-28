@@ -92,6 +92,15 @@ class QueueDeliveryTest(unittest.TestCase):
                 self.assertIsNone(result["queued_submission_id"])
                 rpc.assert_not_called()
 
+    def test_unavailable_history_does_not_prevent_queueing_or_claim_consumption(self):
+        self.history.side_effect = QUEUE.QueueDeliveryError("queue-websocket-message-oversized")
+        with mock.patch.object(QUEUE, "list_queue", return_value=[]), \
+             mock.patch.object(QUEUE, "_latest_turn_status", return_value="completed"), \
+             mock.patch.object(QUEUE, "_rpc", return_value={"queuedSubmission": ITEM}):
+            result = QUEUE.send_at_least_once(SOCKET, thread_id=THREAD,
+                client_message_id=CLIENT_ID, message="fixture")
+        self.assertEqual(result["status"], "queued")
+
     def test_add_success_without_item_identity_is_accepted(self):
         with mock.patch.object(QUEUE, "list_queue", return_value=[]), \
              mock.patch.object(QUEUE, "_latest_turn_status", return_value="completed"), \
@@ -139,6 +148,15 @@ class QueueDeliveryTest(unittest.TestCase):
         self.assertEqual(listing.call_count, 2)
         self.assertEqual([call.args[1] for call in rpc.call_args_list],
                          ["thread/queue/add", "thread/queue/add"])
+
+
+class QueueHistoryBoundTest(unittest.TestCase):
+    def test_long_history_does_not_block_a_new_receipt(self):
+        with mock.patch.object(QUEUE, "MAX_QUEUE_PAGES", 2), \
+             mock.patch.object(QUEUE, "_rpc", return_value={"data": [], "nextCursor": "older"}) as rpc:
+            self.assertIsNone(QUEUE.find_turn_by_client_message_id(SOCKET, THREAD, CLIENT_ID))
+        self.assertEqual(rpc.call_count, 2)
+        self.assertTrue(all(c.args[2]["itemsView"] == "full" for c in rpc.call_args_list))
 
 
 if __name__ == "__main__":
