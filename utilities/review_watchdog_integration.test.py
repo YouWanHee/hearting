@@ -106,10 +106,13 @@ class ReviewWatchdogIntegrationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             marker = Path(td) / "marker"
             jobs = Path(td) / "jobs.log"
-            handle, gate_write = self._launch(marker, 0.15, jobs=jobs)
+            # The readiness receipt supplies the PID identities for the jobs
+            # row. Leave enough time to write that row under a loaded CI host;
+            # otherwise the watchdog correctly exits 126 before admission.
+            handle, gate_write = self._launch(marker, 2.0, jobs=jobs)
             receipt = handle.read_ready(1.0)
             self._write_timeout_row(jobs, receipt)
-            self.assertEqual(handle.process.wait(timeout=2), 124)
+            self.assertEqual(handle.process.wait(timeout=4), 124)
             os.close(gate_write)
             self.assertFalse(marker.exists())
 
