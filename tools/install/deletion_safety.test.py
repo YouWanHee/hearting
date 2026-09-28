@@ -384,24 +384,33 @@ class ReleaseScanSelectsRouteRecordsTest(unittest.TestCase):
             self.assertEqual(reason, "", "one sidecar must not poison the scan")
             self.assertEqual([route_id for route_id, _ in results], [self.ROUTE_ID])
 
-    def test_paired_canonical_outcome_is_not_read_as_a_second_route(self):
+    def test_paired_outcome_with_route_fields_still_fails_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             routes = self._routes_dir(base)
             record = routes / f"{self.ROUTE_ID}.json"
             outcome = routes / f"{self.ROUTE_ID}.outcome.json"
             self._record(record, str(base / "release"))
-            outcome.write_text("{}", encoding="utf-8")
-            read_text = Path.read_text
+            self._record(outcome, str(base / "other-release"))
+            results, reason = self._scan(base)
+            self.assertEqual(results, [])
+            self.assertTrue(reason.startswith("route-record-unrecognised-name:"), reason)
 
-            def read_without_outcome(path, *args, **kwargs):
-                if path == outcome:
-                    raise AssertionError("paired outcome sidecar was opened")
-                return read_text(path, *args, **kwargs)
-
-            with mock.patch.object(Path, "read_text", read_without_outcome):
+    def test_bad_canonical_base_cannot_hide_a_route_shaped_outcome(self):
+        for base_kind in ("directory", "invalid-json"):
+            with self.subTest(base_kind), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp)
+                routes = self._routes_dir(base)
+                record = routes / f"{self.ROUTE_ID}.json"
+                outcome = routes / f"{self.ROUTE_ID}.outcome.json"
+                if base_kind == "directory":
+                    record.mkdir()
+                else:
+                    record.write_text("{ invalid", encoding="utf-8")
+                self._record(outcome, str(base / "release"))
                 results, reason = self._scan(base)
-            self.assertEqual((results, reason), ([], ""))
+                self.assertEqual(results, [])
+                self.assertTrue(reason.startswith("route-record-unrecognised-name:"), reason)
 
     def test_unpaired_outcome_shaped_route_still_fails_closed(self):
         with tempfile.TemporaryDirectory() as tmp:

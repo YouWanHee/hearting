@@ -2640,7 +2640,7 @@ def _route_record_launch_home(
 _CANONICAL_ROUTE_NAME_RE = re.compile(r"^rt-[0-9a-f]{16}\.json$")
 
 
-def _unrecognised_open_route_record(path: Path) -> bool:
+def _unrecognised_open_route_record(path: Path, listed_names: set[str] | None = None) -> bool:
     """Does this non-canonically-named file still look like an OPEN route record?
 
     The discriminator is content, not name: a real record carries `nodes` or a
@@ -2654,12 +2654,23 @@ def _unrecognised_open_route_record(path: Path) -> bool:
     record is deleting a release out from under it.
     """
 
-    if path.with_name(path.stem + ".outcome.json").exists():
+    outcome_name = path.stem + ".outcome.json"
+    # A missing name in a completed directory listing may have appeared since
+    # the listing; treating that route as open can only retain a release. When
+    # the sibling was listed, still check its current existence before closing.
+    if (
+        (listed_names is None or outcome_name in listed_names)
+        and path.with_name(outcome_name).exists()
+    ):
         return False
     try:
-        if path.stat().st_size > _ROUTE_RECORD_MAX_BYTES:
+        with path.open("rb") as handle:
+            if os.fstat(handle.fileno()).st_size > _ROUTE_RECORD_MAX_BYTES:
+                return True
+            raw = handle.read(_ROUTE_RECORD_MAX_BYTES + 1)
+        if len(raw) > _ROUTE_RECORD_MAX_BYTES:
             return True
-        record = json.loads(path.read_text(encoding="utf-8"))
+        record = json.loads(raw.decode("utf-8"))
     except (OSError, UnicodeDecodeError):
         return True
     except json.JSONDecodeError:
@@ -2717,16 +2728,6 @@ def _open_route_launch_homes(environ: dict[str, str]) -> tuple[list[tuple[str, s
             return [], f"route-discovery-unreliable:{routes_dir}"
         names = {entry.name for entry, _is_file in entries}
         for entry, is_file in entries:
-            # A canonical route's paired outcome is a sidecar, not a second
-            # route record. On NAS, opening thousands of these only to reject
-            # their noncanonical names dominates release cleanup. Unknown
-            # sidecars and unpaired outcome-shaped files still get the full
-            # content check below, so a real route under an unexpected name
-            # cannot silently lose its release pin.
-            if entry.name.endswith(".outcome.json"):
-                base_name = entry.name[: -len(".outcome.json")] + ".json"
-                if base_name in names and _CANONICAL_ROUTE_NAME_RE.fullmatch(base_name):
-                    continue
             if not _CANONICAL_ROUTE_NAME_RE.fullmatch(entry.name):
                 # Select route records by the name `canonical_route_path()`
                 # actually writes, rather than skipping the sidecar shapes we
@@ -2748,7 +2749,7 @@ def _open_route_launch_homes(environ: dict[str, str]) -> tuple[list[tuple[str, s
                 # as an unparsable canonical record does. 79 legacy
                 # alias-basename records exist on this machine from before the
                 # `rt-` generator; every one is closed, so they cost nothing.
-                if _unrecognised_open_route_record(entry):
+                if _unrecognised_open_route_record(entry, listed_names=names):
                     return [], f"route-record-unrecognised-name:{entry}"
                 continue
             scanned += 1
