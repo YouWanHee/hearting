@@ -25,6 +25,7 @@ import git_exchange_v2
 import migration_v2
 import protocol_v2
 import sync_v2
+from store_resolve import StoreResolutionError, resolve_store
 
 HOME = Path.home()
 def default_agent_home() -> Path:
@@ -38,16 +39,14 @@ def default_agent_home() -> Path:
     return HOME / ".claude"
 
 
+# AGENT_HOME still serves profile, project-key and diagnostic paths; the store
+# itself resolves through the shared R0-R5 contract (core/MEMORY.md §7.0).
 AGENT_HOME = default_agent_home()
-def default_store() -> Path:
-    legacy = AGENT_HOME / "memory"
-    if legacy.exists() or legacy.is_symlink():
-        return legacy
-    data_home = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local" / "share"))
-    return data_home / "hearting" / "memory"
-
-
-STORE = Path(os.environ["MEM_STORE"]) if os.environ.get("MEM_STORE") else default_store()
+try:
+    STORE = resolve_store()
+except StoreResolutionError as _store_resolution_exc:
+    print(str(_store_resolution_exc), file=sys.stderr)
+    sys.exit(3)
 DB = STORE / "memory.db"
 DUMP = STORE / "dump.jsonl"
 # ``projects`` is Claude's runtime session store. AGENT_HOME is the repository
@@ -106,7 +105,7 @@ RECALL_RECEIPT_MAX_AGE_SECONDS = 14 * 24 * 60 * 60
 # path, then a sidecar beside an overridden store, then XDG state.
 if "MEM_WRITE_EVENTS" in os.environ:
     WRITE_EVENTS = Path(os.environ["MEM_WRITE_EVENTS"])
-elif "MEM_STORE" in os.environ:
+elif os.environ.get("MEM_STORE"):
     WRITE_EVENTS = STORE / "write-events.jsonl"
 else:
     WRITE_EVENTS = (
@@ -1371,7 +1370,7 @@ def get_con():
     # silently fabricating an empty store — a worktree/mis-resolved AGENT_HOME would
     # otherwise report "knowledge does not exist" with full confidence. Explicit
     # MEM_STORE (tests, isolated envs) or MEM_INIT=1 (genuine first install) may create.
-    if (not DB.exists()) and "MEM_STORE" not in os.environ \
+    if (not DB.exists()) and not os.environ.get("MEM_STORE") \
             and os.environ.get("MEM_INIT") != "1":
         sys.stderr.write(
             "mem: refusing to create a NEW empty store at a derived path.\n"

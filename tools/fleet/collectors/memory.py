@@ -29,27 +29,23 @@ _SELECT_RE = re.compile(r"^select\s+origin=\S+\s+active=\d+.*?\bcwd=(.+?)\s*$")
 _DONE_RE = re.compile(r"^project=(.+?)\s+elapsed=(\d+)s\s+status=(\S+)")
 
 
-def _agent_home():
-    if os.environ.get("AGENT_HOME"):
-        return Path(os.environ["AGENT_HOME"])
-    if os.environ.get("CLAUDE_HOME"):
-        return Path(os.environ["CLAUDE_HOME"])
-    xdg = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
-    managed = xdg / "hearting" / "current"
-    for neutral in (managed, Path.home() / "hearting", Path.home() / "agent_setting"):
-        if neutral.exists():
-            return neutral
-    return managed
-
-
 def _store():
-    if os.environ.get("MEM_STORE"):
-        return Path(os.environ["MEM_STORE"])
-    legacy = _agent_home() / "memory"
-    if legacy.exists() or legacy.is_symlink():
-        return legacy
-    return (Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share")))
-            / "hearting" / "memory")
+    """The one memory store, via the shared R0-R5 resolver (core/MEMORY.md §7.0).
+
+    The resolver is loaded by file path because the collector must not import mem.py.
+    It only compares paths and never opens a DB. A resolution conflict or a missing
+    resolver degrades to a path that can never exist, so every reader below reports
+    an empty/partial panel instead of raising or guessing between databases.
+    """
+    try:
+        import importlib.util
+        resolver_path = Path(__file__).resolve().parents[2] / "memory" / "store_resolve.py"
+        spec = importlib.util.spec_from_file_location("_fleet_store_resolve", resolver_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.resolve_store()
+    except Exception:
+        return Path(os.devnull) / "unresolved-memory-store"
 
 
 def _write_events_path():

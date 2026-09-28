@@ -1,0 +1,1 @@
+../../../../tools/memory/store-resolve-parity.test.sh
