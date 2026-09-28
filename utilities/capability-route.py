@@ -799,6 +799,165 @@ def _source_evidence_snapshot(route, node_ids):
             turns[str(node_id)]=last_turn_id
     return rows,_sha256_record(rows),turns
 
+def _terminal_owner_for_revised_ancestor(route, jobs):
+    """The ended owner of the continuation being superseded, not a review verdict."""
+    from owner_route_binding import resolve_owner_route_lifecycle
+    matches=[]
+    for line in Path(jobs).read_text(encoding="utf-8").splitlines():
+        fields=line.split("\t")
+        if len(fields)!=6:
+            continue
+        meta=parse_registry_metadata(fields[5])
+        if (meta.get("worker_type")=="owner"
+                and meta.get("owner_route_id")==route["route_id"]
+                and meta.get("owner_route_hash")==route["route_hash"]):
+            matches.append((fields,meta))
+    if len(matches)!=1:
+        raise ValueError("ancestor-revision-source-owner-not-exact")
+    fields,meta=matches[0]
+    if (fields[1]!="done" or meta.get("dispatch_depth")!="1"
+            or meta.get("registered_worker")!="1"
+            or meta.get("terminal_event")!="turn.completed"):
+        raise ValueError("ancestor-revision-source-owner-not-terminal")
+    binding,_=resolve_owner_route_lifecycle(jobs,owner_attempt_id=meta["attempt_id"])
+    if (binding is None or (binding.route_id,binding.route_hash)
+            != (route["route_id"],route["route_hash"])):
+        raise ValueError("ancestor-revision-source-owner-binding-mismatch")
+    if attempt_process_quiescence(meta,terminal_receipt=True).state!="quiescent":
+        raise ValueError("ancestor-revision-source-owner-not-quiescent")
+    terminal=inspect_terminal_attempt(
+        meta.get("log_file"),worktree=route["cwd"],
+        artifact_root_metadata=route["artifact_root"],worker_type="owner",
+    )
+    if (terminal.get("state")!="valid" or terminal.get("verdict") not in {"FAIL","BLOCKED"}
+            or terminal.get("artifact_state")!="readable"
+            or terminal.get("failure_class")!=meta.get("failure_class")
+            or terminal.get("failure_note")!=meta.get("note")):
+        raise ValueError("ancestor-revision-source-owner-terminal-unverified")
+    return meta["attempt_id"]
+
+def _verified_ancestor_plan_refresh(source_route, *, expected=None):
+    """Derive one revised plan reuse from canonical history; never amend an old route."""
+    if (source_route.get("continuation_contract_version")!=CONTINUATION_CONTRACT_VERSION
+            or source_route.get("resume_from_node")!="plan-check"):
+        return None
+    old_rows=source_route.get("reused_nodes") or []
+    plan_rows=[row for row in old_rows if isinstance(row,dict) and row.get("node_id")=="plan"]
+    if len(plan_rows)!=1 or old_rows[-1].get("node_id")!="plan":
+        return None
+    if (not source_route.get("nodes")
+            or source_route["nodes"][0].get("id")!="plan-check"):
+        raise ValueError("ancestor-revision-review-boundary-invalid")
+    if any(node.get("unit")=="qa/plan-review" and node.get("kind")=="review-worker"
+           and node.get("id")!="plan-check" for node in source_route["nodes"]):
+        raise ValueError("ancestor-revision-review-boundary-invalid")
+    review=source_route["nodes"][0]
+    dependencies=review.get("reused_dependencies") or []
+    if ("plan" not in (review.get("source_depends_on") or [])
+            or len(dependencies)!=1 or dependencies[0].get("node_id")!="plan"
+            or dependencies[0].get("marker_digest")!=plan_rows[0].get("marker_digest")):
+        raise ValueError("ancestor-revision-review-dependency-invalid")
+    try:
+        lineage=verified_route_lineage(source_route,artifact_root=source_route["artifact_root"])
+    except RouteLineageError as exc:
+        raise ValueError(exc.code) from exc
+    if len(lineage)!=2:
+        return None
+    ancestor=lineage[1]
+    plan=next((n for n in ancestor["nodes"] if n.get("id")=="plan"),None)
+    if plan is None:
+        raise ValueError("ancestor-revision-plan-absent")
+    other_rows,_digest,_turns=_source_evidence_snapshot(
+        ancestor,[row["node_id"] for row in old_rows[:-1]])
+    if canonical(other_rows)!=canonical(old_rows[:-1]):
+        raise ValueError("ancestor-revision-other-reuse-drift")
+    current,_turn=_continuation_reused_evidence(ancestor,plan)
+    old=plan_rows[0]
+    if current["marker_digest"]==old.get("marker_digest"):
+        return None
+    jobs=_continuation_source_jobs(ancestor)
+    directory=completion_dir(ancestor["route_id"],jobs=jobs)
+    marker_path=directory/"plan.json"
+    marker=json.loads(marker_path.read_text(encoding="utf-8"))
+    revision=marker.get("revision") or {}
+    old_sequence=revision.get("of_sequence")
+    if not isinstance(old_sequence,int) or old_sequence<1 or marker.get("sequence")!=old_sequence+1:
+        raise ValueError("ancestor-revision-history-gap")
+    old_path=directory/f"plan.{old_sequence}.json"
+    new_path=directory/f"plan.{marker['sequence']}.json"
+    for path in (marker_path,old_path,new_path):
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("ancestor-revision-history-invalid")
+    old_bytes=old_path.read_bytes()
+    new_bytes=new_path.read_bytes()
+    old_marker=json.loads(old_bytes)
+    old_digest="sha256:"+hashlib.sha256(old_bytes).hexdigest()
+    new_digest="sha256:"+hashlib.sha256(new_bytes).hexdigest()
+    link_path=_attempt_completion_path(
+        ancestor,"plan",old.get("terminal_attempt_id"),jobs=jobs)
+    link_bytes=link_path.read_bytes()
+    link=json.loads(link_bytes)
+    old_quiescence=(link.get("quiescence_proof_digest")
+        or old_marker.get("quiescence_proof_digest")
+        or _sha256_record({
+            "attempt_id":old.get("terminal_attempt_id"),
+            "attempt_sidecar_digest":"sha256:"+hashlib.sha256(link_bytes).hexdigest(),
+            "marker_history_digest":old_digest,"terminal_marker_current":True,
+        }))
+    if (new_bytes!=marker_path.read_bytes() or old_digest!=old.get("marker_digest")
+            or new_digest!=current["marker_digest"]
+            or revision.get("of_marker_sha256")!=old_digest.split(":",1)[1]
+            or revision.get("of_evidence_sha256")!=(old_marker.get("evidence") or {}).get("sha256")
+            or revision.get("evidence_sha256")!=(marker.get("evidence") or {}).get("sha256")
+            or marker.get("stage_authority")!="revision"
+            or old_marker.get("sequence")!=old_sequence
+            or old_marker.get("route_id")!=ancestor["route_id"]
+            or marker.get("route_id")!=ancestor["route_id"]
+            or old_marker.get("route_hash")!=ancestor["route_hash"]
+            or marker.get("route_hash")!=ancestor["route_hash"]
+            or old_marker.get("node_id")!="plan" or marker.get("node_id")!="plan"
+            or old.get("marker_path")!=str(marker_path.resolve(strict=False))
+            or old_marker.get("attempt_id")!=old.get("terminal_attempt_id")
+            or marker.get("attempt_id")!=old.get("terminal_attempt_id")
+            or (old_marker.get("evidence") or {}).get("sha256")!=old.get("output_evidence_digest")
+            or old.get("contract_hash")!=current.get("contract_hash")
+            or old.get("completion_gate")!=current.get("completion_gate")
+            or old.get("quiescence_proof_digest")!=old_quiescence
+            or old.get("verdict")!="PASS" or current.get("verdict")!="PASS"
+            or source_route.get("source_evidence_digest")!=_sha256_record(old_rows)):
+        raise ValueError("ancestor-revision-history-mismatch")
+    author=_terminal_owner_for_revised_ancestor(source_route,jobs)
+    if revision.get("author_attempt_id")!=author or revision.get("basis")!="owner-correction":
+        raise ValueError("ancestor-revision-author-unverified")
+    proof={
+        "version":1,"source_route_id":source_route["route_id"],
+        "ancestor_route_id":ancestor["route_id"],"ancestor_route_hash":ancestor["route_hash"],
+        "node_id":"plan","old_marker_digest":old_digest,
+        "current_marker_digest":new_digest,
+        "current_evidence":dict(marker["evidence"]),
+        "terminal_attempt_id":current["terminal_attempt_id"],
+        "revision_author_attempt_id":author,
+    }
+    if expected is not None and proof!=expected:
+        raise ValueError("ancestor-revision-refresh-drift")
+    return proof
+
+def verified_ancestor_plan_refresh(route):
+    """Reprove a successor's sealed refresh against live marker and terminal history."""
+    proof=route.get("ancestor_plan_refresh")
+    if proof is None:
+        return None
+    try:
+        lineage=verified_route_lineage(route,artifact_root=route["artifact_root"])
+    except RouteLineageError as exc:
+        raise ValueError(exc.code) from exc
+    source=next((row for row in lineage[1:] if row["route_id"]==proof.get("source_route_id")),None)
+    if source is None:
+        raise ValueError("ancestor-revision-source-route-mismatch")
+    if _verified_ancestor_plan_refresh(source,expected=proof) is None:
+        raise ValueError("ancestor-revision-refresh-absent")
+    return proof
+
 def source_evidence_digest(route, reused_node_ids=None):
     """Canonical digest of an exact reusable marker/attempt prefix."""
     if reused_node_ids is None:
@@ -1084,6 +1243,13 @@ def build_continuation_route(
         resume_index=None
     else:
         resume_index=node_ids.index(resume_from_node)
+    inherited_refresh=source_route.get("ancestor_plan_refresh")
+    if inherited_refresh is not None:
+        verified_ancestor_plan_refresh(source_route)
+    else:
+        inherited_refresh=_verified_ancestor_plan_refresh(source_route)
+        if inherited_refresh is not None and resume_from_node!="plan-check":
+            first_blocker="ancestor-revision-affected-node-skipped"
     reused_ids=node_ids[:resume_index] if resume_index is not None else []
     reused=[]; reused_turns={}; evidence_digest=_sha256_record([])
     if first_blocker is None:
@@ -1119,6 +1285,8 @@ def build_continuation_route(
         "source_evidence_digest":evidence_digest,
         "lineage":lineage,
     }
+    if inherited_refresh is not None:
+        identity["ancestor_revision_digest"]=_sha256_record(inherited_refresh)
     continuation_id=_continuation_id(identity)
     edge={
         "edge_version":1,
@@ -1155,6 +1323,8 @@ def build_continuation_route(
         "new_nodes":[],
         "partial_group_continuation":None,
     }
+    if inherited_refresh is not None:
+        result["ancestor_plan_refresh"]=json.loads(json.dumps(inherited_refresh))
     if partial_group is not None and first_blocker is None:
         result["partial_group_continuation"]=partial_group_continuation(
             source_route,**partial_group
@@ -1166,6 +1336,14 @@ def build_continuation_route(
     for offset,source_node in enumerate(source_nodes[resume_index:]):
         source_contract_hash=_continuation_contract_hash(source_node)
         node=_continuation_node_projection(source_node,reused)
+        if (inherited_refresh is not None
+                and source_route["route_id"]==inherited_refresh["source_route_id"]
+                and node["id"]=="plan-check"):
+            dependencies=node.get("reused_dependencies") or []
+            if (len(dependencies)!=1 or dependencies[0].get("node_id")!="plan"
+                    or dependencies[0].get("marker_digest")!=inherited_refresh["old_marker_digest"]):
+                raise ValueError("ancestor-revision-review-dependency-invalid")
+            dependencies[0]["marker_digest"]=inherited_refresh["current_marker_digest"]
         route_nodes.append(node)
         descriptors.append({
             "node_id":str(source_node["id"]),
@@ -1326,7 +1504,12 @@ def _verify_continuation_route(route):
         "reason":route.get("reason"),
         "source_evidence_digest":route.get("source_evidence_digest"),
         "lineage":route.get("runtime_lineage"),
+        **({"ancestor_revision_digest":route.get("ancestor_revision_digest")}
+           if route.get("ancestor_plan_refresh") is not None else {}),
     })
+    if route.get("ancestor_plan_refresh") is not None:
+        if route.get("ancestor_revision_digest")!=_sha256_record(route["ancestor_plan_refresh"]):
+            raise ValueError("ancestor-revision-digest-invalid")
     if route.get("continuation_id") != expected_continuation_id:
         raise ValueError("continuation-id-invalid")
     edge=route.get("source_route_supersession") or {}
@@ -1376,25 +1559,34 @@ def publish_continuation_route(route,source_route,output_path):
     """Recheck source bytes immediately before the one immutable publication."""
     if route.get("requested_boundary_blocker") or route.get("first_runnable_blocker"):
         raise ValueError("continuation-boundary-blocked")
-    node_ids=[row["node_id"] for row in route.get("reused_nodes",[])]
-    try:
-        current,current_digest,_turns=_source_evidence_snapshot(source_route,node_ids)
-    except ValueError as exc:
-        raise ValueError("continuation-source-evidence-drift") from exc
-    if (
-        current_digest != route.get("source_evidence_digest")
-        or canonical(current) != canonical(route.get("reused_nodes"))
-    ):
-        if gates_on():
-            raise ValueError("continuation-source-evidence-drift")
-        same_work_or_refuse("continuation-source-evidence-drift")
-    path=Path(output_path)
-    if classify_route_location(path,route["artifact_root"]) != "canonical":
-        raise ValueError("route-output-outside-canonical")
-    if not route_path_is_exact(path,route["artifact_root"],route["route_id"]):
-        raise ValueError("route-output-alias-basename")
-    write_once(path,route)
-    return path
+    def checked_write():
+        if route.get("ancestor_plan_refresh") is not None:
+            verified_ancestor_plan_refresh(route)
+        node_ids=[row["node_id"] for row in route.get("reused_nodes",[])]
+        try:
+            current,current_digest,_turns=_source_evidence_snapshot(source_route,node_ids)
+        except ValueError as exc:
+            raise ValueError("continuation-source-evidence-drift") from exc
+        if (
+            current_digest != route.get("source_evidence_digest")
+            or canonical(current) != canonical(route.get("reused_nodes"))
+        ):
+            if gates_on():
+                raise ValueError("continuation-source-evidence-drift")
+            same_work_or_refuse("continuation-source-evidence-drift")
+        path=Path(output_path)
+        if classify_route_location(path,route["artifact_root"]) != "canonical":
+            raise ValueError("route-output-outside-canonical")
+        if not route_path_is_exact(path,route["artifact_root"],route["route_id"]):
+            raise ValueError("route-output-alias-basename")
+        write_once(path,route)
+        return path
+    proof=route.get("ancestor_plan_refresh")
+    if proof is None:
+        return checked_write()
+    lock=completion_dir(proof["ancestor_route_id"],jobs=_continuation_source_jobs(source_route)) / ".plan.completion.lock"
+    with _exclusive_lock(lock):
+        return checked_write()
 
 def bind_continuation_cycle(artifact_root,source_route,route):
     """D-120: extend the source route's open cycle binding to a fresh continuation.
@@ -6146,10 +6338,14 @@ def _dependency_revisions(route, node, jobs=None, *, reviewed_input=None):
     `closure_class="closure-check"` the same way admission already saw it."""
     lineage = (review_lineage_routes(route, node["id"])
                if node.get("kind") == "review-worker" else [route])
+    dependencies = list(node.get("depends_on", []))
+    if (node.get("id")=="plan-check" and route.get("ancestor_plan_refresh") is not None):
+        verified_ancestor_plan_refresh(route)
+        dependencies = list(node.get("source_depends_on") or [])
     return [
         revision
         for generation in reversed(lineage)
-        for dep in node.get("depends_on", [])
+        for dep in dependencies
         for revision in _node_revision_records(generation, dep, jobs)
     ] + [
         revision
@@ -6329,6 +6525,7 @@ def review_lineage_routes(route, node_id):
         lineage = verified_route_lineage(route, artifact_root=route.get("artifact_root"))
     except RouteLineageError as exc:
         raise ValueError(exc.code) from exc
+    refresh=verified_ancestor_plan_refresh(route)
     for current, parent in zip(lineage, lineage[1:]):
         if parent.get("effective_intensity") != current.get("effective_intensity"):
             raise ValueError("owner-closure-lineage-context-mismatch:effective_intensity")
@@ -6356,7 +6553,18 @@ def review_lineage_routes(route, node_id):
         except (KeyError, ValueError) as exc:
             raise ValueError("owner-closure-lineage-node-mismatch:reuse-evidence") from exc
         if canonical(expected_reused) != canonical(reused) or current.get("source_evidence_digest") != expected_digest:
-            raise ValueError("owner-closure-lineage-node-mismatch:reuse-evidence")
+            # The immutable older continuation still names its historical
+            # marker. Only a successor carrying a reverified official plan
+            # revision may cross this one stale edge, and only after resuming
+            # at the first affected review node.
+            if not (refresh is not None
+                    and current["route_id"]==refresh["source_route_id"]
+                    and parent["route_id"]==refresh["ancestor_route_id"]
+                    and reused_ids and reused_ids[-1]=="plan"
+                    and canonical(expected_reused[:-1])==canonical(reused[:-1])
+                    and expected_reused[-1].get("marker_digest")==refresh["current_marker_digest"]
+                    and reused[-1].get("marker_digest")==refresh["old_marker_digest"]):
+                raise ValueError("owner-closure-lineage-node-mismatch:reuse-evidence")
         if parent_node is None:
             raise ValueError("owner-closure-lineage-node-mismatch")
         if child_node is None:
@@ -6379,6 +6587,15 @@ def review_lineage_routes(route, node_id):
         # reused prefix; all other assignment, assurance, gate and scope fields
         # remain byte-for-byte equal to the source node.
         expected_node = _continuation_node_projection(parent_node, reused)
+        if (refresh is not None
+                and parent["route_id"]==refresh["source_route_id"]
+                and current.get("resume_from_node")=="plan-check"
+                and node_id=="plan-check"):
+            dependencies=expected_node.get("reused_dependencies") or []
+            if (len(dependencies)!=1 or dependencies[0].get("node_id")!="plan"
+                    or dependencies[0].get("marker_digest")!=refresh["old_marker_digest"]):
+                raise ValueError("owner-closure-lineage-node-mismatch:assignment")
+            dependencies[0]["marker_digest"]=refresh["current_marker_digest"]
         if expected_node != child_node:
             raise ValueError("owner-closure-lineage-node-mismatch:assignment")
     return lineage

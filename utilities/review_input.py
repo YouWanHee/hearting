@@ -69,6 +69,23 @@ def resolve_input(route, node, jobs, reviewed_evidence=None, *, retry_of=None,
             original = {**original, **explicit}
         return {k: original[k] for k in ("path", "sha256", "producer") if k in original}
     if not has_plan_producer(route, node):
+        if route.get("ancestor_plan_refresh") is not None and node.get("id")=="plan-check":
+            try:
+                module = _route_module()
+                proof = module.verified_ancestor_plan_refresh(route)
+                module.review_lineage_routes(route, node["id"])
+                candidate = _file(proof["current_evidence"]["path"])
+                if candidate != proof["current_evidence"]:
+                    raise ValueError("revised ancestor plan changed")
+            except (OSError, ValueError, KeyError, TypeError, DC.DispatchContractError) as exc:
+                raise DC.DispatchContractError("reviewed-evidence-ancestor-unproven", "plan") from exc
+            if explicit is not None and explicit != candidate:
+                raise DC.DispatchContractError("reviewed-evidence-ancestor-mismatch", str(node["id"]))
+            return {**candidate, "producer": {
+                "route_id": proof["ancestor_route_id"], "route_node": "plan",
+                "attempt_id": proof["terminal_attempt_id"],
+                "marker_digest": proof["current_marker_digest"],
+            }}
         if explicit is None:
             raise DC.DispatchContractError("reviewed-evidence-required", str(node.get("id")))
         return explicit

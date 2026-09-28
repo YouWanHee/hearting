@@ -429,7 +429,8 @@ def admit_round(route, node, jobs, *, owner_attempt_id=None, exclude_slug=None, 
                           if item.get("node_id")=="plan" and item.get("stage_authority")=="revision"),None)
  input_options = {"producer_preview": producer_preview} if not record_auto_revisions and producer_preview else {}
  reviewed_input = (resolve_input(route,node,jobs,reviewed_evidence,**input_options)
-                   if is_review_node(node) and (reviewed_evidence or producer_preview) else None)
+                   if is_review_node(node) and (reviewed_evidence or producer_preview
+                                                or route.get("ancestor_plan_refresh")) else None)
  dependency_revisions = ROUTE._dependency_revisions(route, node, jobs, reviewed_input=reviewed_input or {})
  dependency_ids = set(node.get("depends_on", ()))
  dependency_revisions.extend(

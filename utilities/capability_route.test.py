@@ -4410,6 +4410,244 @@ class GroundingCwdLineageTest(unittest.TestCase):
   self.assertFalse(ok); self.assertIn("grounding_roots.cwd",mismatches)
 
 
+class RevisedAncestorSuccessorTest(unittest.TestCase):
+ def setUp(self):
+  TestContinuation.setUp(self)
+  gates=mock.patch.dict(os.environ,{"HEARTING_GATES":"on"})
+  gates.start()
+  self.addCleanup(gates.stop)
+ _restore=TestContinuation._restore
+ _dispatch=TestContinuation._dispatch
+ _source=TestContinuation._source
+ _complete_node=TestContinuation._complete_node
+ _complete_prefix=TestContinuation._complete_prefix
+ _write_attempt_row=TestContinuation._write_attempt_row
+ _is_fixture_registry=staticmethod(TestContinuation._is_fixture_registry)
+ def _terminal_owner(self, route, cycle_dir):
+  attempt="att-fixture-owner"
+  report=Path(cycle_dir)/"artifacts"/"plans"/"owner-blocked.md"
+  report.write_text("# Blocked\n",encoding="utf-8")
+  log=Path(self._tmp_home.name)/"owner.jsonl"
+  log.write_text("\n".join(json.dumps(row) for row in (
+   {"type":"turn.started"},
+   {"type":"item.completed","item":{"type":"agent_message",
+      "text":f"artifact: {report}\nverdict: BLOCKED\nblocker: plan review needs correction"}},
+   {"type":"turn.completed"},
+  ))+"\n",encoding="utf-8")
+  metadata={
+   "attempt_id":attempt,"worker_type":"owner","dispatch_depth":"1",
+   "registered_worker":"1","owner_route_file":str(R.canonical_route_path(
+      Path(route["artifact_root"]),route["route_id"])),
+   "owner_route_id":route["route_id"],"owner_route_hash":route["route_hash"],
+   "pid":"99999999","pid_start":"1","pid_scope":"host-visible",
+   "pgid":"99999999","terminal_event":"turn.completed",
+   "failure_class":"blocked","note":"dead-worker-blocked",
+   "log_file":str(log),
+  }
+  with self._jobs.open("a",encoding="utf-8") as handle:
+   handle.write("\t".join(["2026-09-28T00:00:00Z","done",str(R.ROOT),
+      str(R.ROOT),"fixture-owner",",".join(f"{key}={value}" for key,value in metadata.items())])+"\n")
+  return attempt
+ def _revised_fixture(self, root, *, revision_author=None):
+  import artifact_producer as AP
+  previous_root=os.environ.get("AGENT_ARTIFACT_ROOT")
+  os.environ["AGENT_ARTIFACT_ROOT"]=str(root)
+  self.addCleanup(lambda: (os.environ.pop("AGENT_ARTIFACT_ROOT",None)
+                           if previous_root is None
+                           else os.environ.__setitem__("AGENT_ARTIFACT_ROOT",previous_root)))
+  gate={"spec_read":{"satisfied":True,"source":"canonical-prd-sha256"},
+        "drift_verdict":"within-spec","workflow_mode":"tracked",
+        "artifact_guard":{"satisfied":True,"source":"conductor-prechecked"}}
+  source=R.compile_route(
+   "autopilot-code","dev","standard",R.ROOT,root,predicates=[],
+   signals=["shared-contract"],transport="headless",tracking="tracked",
+   tracked_gate_evidence=gate,dispatch_evidence=self._dispatch(),
+   campaign_key="revised-ancestor-fixture",
+  )
+  source["runtime_lineage"]={"runtime":"codex","thread_id":"thread-source",
+     "node_turn_ids":{str(node["id"]):f"turn-{node['id']}" for node in source["nodes"]}}
+  source["route_hash"]=R.route_hash(source)
+  source["route_id"]="rt-"+source["route_hash"].split(":",1)[1][:16]
+  source_path=R.canonical_route_path(root,source["route_id"])
+  R.write_once(source_path,source)
+  begun=AP.begin(root,route_file=source_path,capability=source["capability"],
+                 intensity=source["effective_intensity"])
+  evidence=self._complete_prefix(
+   source,"plan-check",Path(begun["cycle_dir"])/"artifacts"/"plans"
+  )["plan"]
+  prior=R.build_continuation_route(
+   source,resume_from_node="plan-check",requested_boundary="plan-check",
+   reason="initial-review",artifact_root=root,
+  )
+  self.assertIsNone(prior.get("first_runnable_blocker"),prior.get("first_runnable_blocker"))
+  R.publish_continuation_route(prior,source,R.canonical_route_path(root,prior["route_id"]))
+  AP.bind_cycle_route(root,begun["cycle_id"],prior)
+  owner=self._terminal_owner(prior,begun["cycle_dir"])
+  evidence.write_text("revised plan after owner correction\n",encoding="utf-8")
+  R.publish_revision_locked(source,"plan",evidence,basis="owner-correction",
+     reason="correct the plan",author_attempt_id=revision_author or owner,jobs=self._jobs)
+  return source,prior,begun,evidence
+
+ def test_revised_plan_successor_reuses_only_current_plan_and_restarts_review(self):
+  import artifact_producer as AP
+  import review_input
+  dn_spec=importlib.util.spec_from_file_location("revised_ancestor_dispatch_node",P.with_name("dispatch-node.py"))
+  DN=importlib.util.module_from_spec(dn_spec); dn_spec.loader.exec_module(DN)
+  with tempfile.TemporaryDirectory() as tmp:
+   root=Path(tmp)/".agent_reports"
+   source,prior,begun,evidence=self._revised_fixture(root)
+   with mock.patch.object(review_input,"_route_module",return_value=R):
+    successor=R.build_continuation_route(
+     prior,resume_from_node="plan-check",requested_boundary="plan-check",
+     reason="review revised plan",artifact_root=root,
+    )
+    self.assertIn("ancestor_plan_refresh",successor,
+                  [row["node_id"] for row in prior["reused_nodes"]])
+    self.assertIsNone(successor["first_runnable_blocker"])
+    proof=successor["ancestor_plan_refresh"]
+    self.assertEqual(proof["current_evidence"]["sha256"],R.evidence_digest(evidence))
+    self.assertEqual([route["route_id"] for route in R.review_lineage_routes(successor,"plan-check")],
+                     [successor["route_id"],prior["route_id"],source["route_id"]])
+    self.assertEqual(successor["nodes"][0]["reused_dependencies"][0]["marker_digest"],
+                     proof["current_marker_digest"])
+    self.assertEqual(review_input.resolve_input(successor,successor["nodes"][0],self._jobs)["sha256"],
+                     proof["current_evidence"]["sha256"])
+    other=Path(tmp)/"unreviewed.md"
+    other.write_text("other plan\n",encoding="utf-8")
+    with self.assertRaisesRegex(D.DispatchContractError,"plan-check"):
+     review_input.resolve_input(successor,successor["nodes"][0],self._jobs,other)
+    admission=DN.admit_round(successor,successor["nodes"][0],self._jobs,
+                             record_auto_revisions=False)
+    self.assertEqual(admission.budget.state,"admit")
+    self.assertEqual(admission.reviewed_input["sha256"],proof["current_evidence"]["sha256"])
+    record=AP.route_cycle_for(root,successor)
+    self.assertEqual(record["cycle_id"],begun["cycle_id"])
+    self.assertTrue(AP.cycle_route_admission(root,record,successor,validation_only=True).allow)
+    successor_path=R.canonical_route_path(root,successor["route_id"])
+    R.publish_continuation_route(successor,prior,successor_path)
+    self.assertEqual(R.verify_route(json.loads(successor_path.read_text()),successor["cwd"])["route_id"],
+                     successor["route_id"])
+    self.assertTrue(R.bind_continuation_cycle(root,prior,successor)["bound"])
+    self.assertEqual(AP.begin(root,route_file=successor_path,capability=successor["capability"],
+                              intensity=successor["effective_intensity"])["status"],"resumed")
+    review_evidence=self._complete_node(successor,successor["nodes"][0],
+        Path(begun["cycle_dir"])/"artifacts"/"_internal"/"plan_reviews")
+    self.assertTrue(review_evidence.is_file())
+    lines=self._jobs.read_text().splitlines()
+    lines=[line+(",route_hash="+successor["route_hash"]
+                 +",attempt_schema_version=2,dispatch_depth=2,transport=headless"
+                 +",execution_surface=registered-headless,fallback_hop=same-harness-headless"
+                 +",registered_worker=1,worker_type=review,unit=qa/plan-review"
+                 +",note=completed-marker,pid=99999999,pid_start=1,pid_scope=host-visible"
+                 +",pgid=99999999"
+                 if "attempt_id=att-continuation-plan-check" in line else "") for line in lines]
+    self._jobs.write_text("\n".join(lines)+"\n")
+    self.assertTrue(R._marker_identity_row(successor,successor["nodes"][0],"plan-check",
+                    successor["nodes"][0]["completion_gate"],jobs=self._jobs)["passed"])
+    D.completion_marker_gate(str(successor_path),"execute","dry-run",
+                             Path(self._tmp_home.name),self._jobs)
+    implementation=R.build_continuation_route(successor,resume_from_node="execute",
+       requested_boundary="execute",reason="continue after fresh review",artifact_root=root)
+    self.assertIsNone(implementation["first_runnable_blocker"])
+    self.assertEqual(implementation["ancestor_plan_refresh"],proof)
+    self.assertEqual([row["route_id"] for row in R.review_lineage_routes(implementation,"impl-review")],
+       [implementation["route_id"],successor["route_id"],prior["route_id"],source["route_id"]])
+    self.assertTrue(AP.cycle_route_admission(root,AP.read_cycle_record(root,begun["cycle_id"]),
+                                             implementation,validation_only=True).allow)
+    self.assertTrue(AP.cycle_route_admission(root,AP.read_cycle_record(root,begun["cycle_id"]),
+                                             successor,finalize=True,validation_only=True).allow)
+    sealed=AP.finalize(root,cycle_id=begun["cycle_id"],state="abandoned",
+                       allow_open_route=True,abandon_reason="operator-decision")
+    self.assertEqual(sealed["status"],"sealed")
+    skipped=R.build_continuation_route(
+     prior,resume_from_node="execute",requested_boundary="execute",
+     reason="skip revised review",artifact_root=root,
+    )
+    self.assertEqual(skipped["first_runnable_blocker"],"ancestor-revision-affected-node-skipped")
+
+ def test_revised_successor_refuses_broken_history_owner_and_current_file(self):
+  def mutate_old_history(source,prior,evidence):
+   (R.completion_dir(source["route_id"],jobs=self._jobs)/"plan.1.json").unlink()
+  def mutate_current_history(source,prior,evidence):
+   path=R.completion_dir(source["route_id"],jobs=self._jobs)/"plan.2.json"
+   path.write_text(path.read_text()+" ",encoding="utf-8")
+  def mutate_current_file(source,prior,evidence):
+   evidence.write_bytes(b"X"*len(evidence.read_bytes()))
+  def remove_current_file(source,prior,evidence):
+   evidence.unlink()
+  def mutate_owner_status(source,prior,evidence):
+   lines=self._jobs.read_text().splitlines()
+   self._jobs.write_text("\n".join(
+    line.replace("\tdone\t","\trunning\t",1)
+    if "attempt_id=att-fixture-owner" in line else line for line in lines)+"\n")
+  def mutate_owner_binding(source,prior,evidence):
+   lines=self._jobs.read_text().splitlines()
+   self._jobs.write_text("\n".join(
+    line.replace("owner_route_hash="+prior["route_hash"],"owner_route_hash=sha256:"+"0"*64)
+    if "attempt_id=att-fixture-owner" in line else line for line in lines)+"\n")
+  def mutate_owner_terminal(source,prior,evidence):
+   log=Path(self._tmp_home.name)/"owner.jsonl"
+   log.write_text(log.read_text().replace("verdict: BLOCKED","verdict: PASS"),encoding="utf-8")
+  for name,mutate in (
+   ("old-history-missing",mutate_old_history),
+   ("current-history-tampered",mutate_current_history),
+   ("current-file-changed",mutate_current_file),
+   ("current-file-missing",remove_current_file),
+   ("owner-running",mutate_owner_status),
+   ("owner-binding",mutate_owner_binding),
+   ("owner-terminal",mutate_owner_terminal),
+  ):
+   with self.subTest(name=name),tempfile.TemporaryDirectory() as tmp:
+    source,prior,begun,evidence=self._revised_fixture(Path(tmp)/".agent_reports")
+    mutate(source,prior,evidence)
+    with self.assertRaises(ValueError):
+     R.build_continuation_route(prior,resume_from_node="plan-check",
+       requested_boundary="plan-check",reason="invalid revision",artifact_root=source["artifact_root"])
+
+ def test_revised_successor_refuses_live_or_unverifiable_owner_identity(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   source,prior,_begun,_evidence=self._revised_fixture(Path(tmp)/".agent_reports")
+   for state in ("live","unverifiable"):
+    with self.subTest(state=state),mock.patch.object(R,"attempt_process_quiescence",
+          return_value=D.ProcessQuiescence(state,"fixture")):
+     with self.assertRaisesRegex(ValueError,"ancestor-revision-source-owner-not-quiescent"):
+      R.build_continuation_route(prior,resume_from_node="plan-check",
+       requested_boundary="plan-check",reason="unsafe owner",artifact_root=source["artifact_root"])
+
+ def test_revised_successor_refuses_wrong_revision_author(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   source,prior,_begun,_evidence=self._revised_fixture(
+    Path(tmp)/".agent_reports",revision_author="att-other")
+   with self.assertRaisesRegex(ValueError,"ancestor-revision-author-unverified"):
+    R.build_continuation_route(prior,resume_from_node="plan-check",
+      requested_boundary="plan-check",reason="wrong author",artifact_root=source["artifact_root"])
+
+ def test_revised_successor_rechecks_after_build_and_rejects_forged_seal(self):
+  import review_input
+  with tempfile.TemporaryDirectory() as tmp:
+   source,prior,_begun,evidence=self._revised_fixture(Path(tmp)/".agent_reports")
+   with self.assertRaisesRegex(ValueError,"reuse-evidence"):
+    R.review_lineage_routes(prior,"plan-check")
+   successor=R.build_continuation_route(prior,resume_from_node="plan-check",
+      requested_boundary="plan-check",reason="fresh review",artifact_root=source["artifact_root"])
+   forged=json.loads(json.dumps(successor))
+   forged["ancestor_plan_refresh"]["current_marker_digest"]="sha256:"+"0"*64
+   forged["ancestor_revision_digest"]=R._sha256_record(forged["ancestor_plan_refresh"])
+   forged["route_hash"]=R.route_hash(forged)
+   forged["route_id"]="rt-"+forged["route_hash"].split(":",1)[1][:16]
+   with self.assertRaisesRegex(ValueError,"ancestor-revision-refresh-drift"):
+    R.review_lineage_routes(forged,"plan-check")
+   evidence.write_bytes(b"Y"*len(evidence.read_bytes()))
+   target=R.canonical_route_path(Path(source["artifact_root"]),successor["route_id"])
+   with self.assertRaises(ValueError):
+    R.publish_continuation_route(successor,prior,target)
+   self.assertFalse(target.exists())
+   with self.assertRaises(ValueError):
+    R.review_lineage_routes(successor,"plan-check")
+   with self.assertRaises(D.DispatchContractError):
+    review_input.resolve_input(successor,successor["nodes"][0],self._jobs)
+
+
 class SourceLineageVerdictTest(unittest.TestCase):
  """SD-156: the one first-parent lineage probe every consumer shares."""
  def _repo(self,tmp):
