@@ -371,7 +371,7 @@ harness install codex
 | Surface | Wiring | Contract |
 |---|---|---|
 | `AGENTS.md`/core/capabilities/roles/bin/tools/utilities/scaffolds | symlink using `agent-*` pointer names | Routes through generated projections under `codex_setting/` |
-| Codex-native skills/agents/modes | symlink fan-out (`skills/*`, `agents/*.toml`) | Generated from `capabilities/` and `roles/` into `codex_setting/codex-{skills,agents,modes}`; do not reimplement |
+| Codex-native skills/agents/modes | symlink fan-out (`skills/*`, `agents/*.toml`) | Generated from `capabilities/` and `roles/` into `codex_setting/codex-{skills,agents,modes}`; do not reimplement. `agents/*.toml` link the shipped profiles unless the user `agent-config/models.conf` renders different agents; then they link `.harness/native-agents/<digest>/` (`tools/install/native_agent_payload.py`) |
 | packaged activation | repo-local immutable bundle → same native surfaces | Does not use plugin marketplace, config, or cache state |
 | hooks | `codex_setting/codex-hooks` → `hooks.json` | Adapter-owned hook bridge; executes only `type:"command"` entries |
 | `config.toml` used by `/statusline` | not copied; fragment only | `config.toml` remains runtime-owned (see statusline below) |

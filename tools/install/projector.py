@@ -6,6 +6,7 @@ only computes links, copies, and delegated actions; runtime drivers apply them.
 
 from pathlib import Path
 
+import native_agent_payload
 import paths
 
 
@@ -92,11 +93,14 @@ _CODEX_TABLE = (
             "pattern": "*",
         },
         {
-            "action": "symlink_glob",
+            # Shipped `*.toml` profiles, or this runtime home's effective payload
+            # when its user models.conf renders different native agents
+            # (native_agent_payload.py). Project scope redirects agents into the
+            # project's local .codex/agents/.
+            "action": "native_agents",
             "source_dir": "codex_setting/codex-agents",
             "dest_subdir": "agents",
             "pattern": "*.toml",
-            # Project scope redirects agents into the project's local .codex/agents/.
             "project_scope_override": True,
         },
     ]
@@ -223,6 +227,29 @@ def _expand(table, runtime, scope):
         elif action == "merge":
             entries.append({"action": "merge", "note": item["note"], "source_present": True})
 
+        elif action == "native_agents":
+            # Planning only computes paths; the driver installs the payload.
+            dest_dir = _dest_dir_for(runtime, scope, item["dest_subdir"])
+            links = native_agent_payload.agent_links(
+                runtime_home, source_root=paths.agent_home()
+            )
+            if links:
+                entries.extend(
+                    {
+                        "action": "symlink",
+                        "source": str(source),
+                        "dest": str(dest_dir / name),
+                        "source_present": True,
+                        "native_agent": True,
+                    }
+                    for name, source in links.items()
+                )
+            else:
+                entries.extend(
+                    dict(entry, native_agent=True)
+                    for entry in _expand([dict(item, action="symlink_glob")], runtime, scope)
+                )
+
         elif action == "symlink_glob":
             source_dir_relpath = item["source_dir"]
             source_dir = paths.resolve_source(source_dir_relpath)
@@ -262,6 +289,7 @@ def plan(runtimes, scope="global"):
 
     Return shape: ``{runtime: [entry, ...]}``.
     {"action": "symlink"|"copy_once"|"seed_once", "source": str, "dest": str, "source_present": True}
+    Codex agent symlinks also carry ``"native_agent": True``.
     {"action": "delegate", "cmd": [...], "source_present": True}
     {"action": "merge", "note": str, "source_present": True}
     {"action": "skip", "reason": str, "dest": str}
