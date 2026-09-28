@@ -1202,7 +1202,7 @@ def _activation_failure_detail(stdout: str, stderr: str) -> str:
 
 
 def _reconcile_codex_launcher() -> dict:
-    """Reconcile the protected Codex ingress for same-release repairs.
+    """Retire legacy interactive Codex ingress during release reconciliation.
 
     This deliberately imports the launcher implementation from the active
     release instead of duplicating its transaction here.  Callers hold the
@@ -1217,7 +1217,7 @@ def _reconcile_codex_launcher() -> dict:
             "detail": f"launcher module unavailable: {exc}",
         }
     try:
-        return codex_launcher.install(profile_policy="deny")
+        return codex_launcher.uninstall()
     except codex_launcher.CodexUnavailableError as exc:
         return {
             "action": "managed-launcher",

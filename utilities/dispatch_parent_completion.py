@@ -9,8 +9,8 @@ import json
 import re
 from pathlib import Path
 from codex_managed_dispatch import (
-    MANAGED_PARENT_DELIVERY, ManagedDispatchError, probe_managed_codex_parent,
-    launch_managed_completion_sidecar, registered_parent_delivery,
+    ManagedDispatchError, probe_managed_codex_parent,
+    registered_parent_delivery,
 )
 from dispatch_contract import (DispatchContractError, annotate_attempt_row,
                                parse_registry_metadata, supervisor_lease_is_held)
@@ -37,6 +37,15 @@ def interactive_parent_identity(environ=None) -> tuple[str, str]:
 
 def default_parent_session_id(environ=None) -> str | None:
     env = os.environ if environ is None else environ
+    # A directly running interactive host is the authority for its own TUI
+    # thread. Managed entry used to export a second parent id after observing
+    # an App Server sibling, which could override the real Codex thread and
+    # strand every completion. Preserve the explicit binding only for nested
+    # workers, whose environment marks that dispatch boundary.
+    if env.get("AGENT_DISPATCH_CHILD") != "1":
+        native_session = interactive_parent_identity(env)[1]
+        if native_session:
+            return native_session
     return env.get("AGENT_DISPATCH_PARENT_SESSION_ID") or interactive_parent_identity(env)[1] or None
 
 
@@ -157,7 +166,7 @@ def parent_supervisor_is_live(args) -> bool:
 
 
 def resolve_parent_completion_delivery(args, *, probe=probe_managed_codex_parent) -> str:
-    """Select completion from the witnessed parent, independently of the child."""
+    """Select completion from the native parent runtime, not the child."""
     args.managed_gateway_binding = None
     current_thread = os.environ.get("CODEX_THREAD_ID") or os.environ.get(
         "CODEX_SESSION_ID"
@@ -169,29 +178,8 @@ def resolve_parent_completion_delivery(args, *, probe=probe_managed_codex_parent
         and bool(current_thread)
         and args.parent_session_id == current_thread
     ):
-        try:
-            args.managed_gateway_binding = probe(
-                parent_harness=args.parent_harness,
-                parent_session_id=args.parent_session_id,
-            )
-        except ManagedDispatchError as exc:
-            if os.environ.get("AGENT_CODEX_MANAGED_GATEWAY") == "1":
-                args.parent_completion_reason = str(exc)
-                args.parent_completion_reason_class = (
-                    getattr(exc, "reason_class", "") or "-"
-                )
-            else:
-                args.parent_completion_reason = (
-                    "interactive-auto-wake-unsupported"
-                )
-                args.parent_completion_reason_class = "-"
-            return "poll-fallback"
-        if getattr(args.managed_gateway_binding, "thread_advanced", False):
-            args.parent_session_id = args.managed_gateway_binding.thread_id
-            args.parent_completion_reason = "managed-thread-advanced"
-        else:
-            args.parent_completion_reason = "managed-single-ingress-live"
-        return MANAGED_PARENT_DELIVERY
+        args.parent_completion_reason = "native-thread-queue"
+        return "codex-native-queue"
     if direct_registered and args.parent_harness == "claude":
         args.parent_completion_reason = "claude-async-rewake-resume"
         return "claude-parent-runtime"
@@ -217,67 +205,28 @@ def validate_interactive_parent_launch(args) -> None:
     if getattr(args, "allow_unmanaged_parent_poll", False):
         args.parent_completion_reason = "operator-authorized-unmanaged-poll"
         return
-    # Keep truly unmanaged entry distinct from a managed TUI whose transition
-    # or control proof is missing. The reason is machine-readable and the
-    # probe fields remain attached for operator diagnostics.
-    probe = getattr(args, "parent_completion_reason", "") or "-"
-    probe_class = getattr(args, "parent_completion_reason_class", "") or "-"
-    managed = (
-        os.environ.get("AGENT_CODEX_MANAGED_GATEWAY") == "1"
-        and probe not in {"interactive-auto-wake-unsupported", "managed-entry-not-enabled"}
-    )
-    if probe_class in {"expected-thread-not-witnessed", "lineage-mismatch", "transition-unproved"}:
-        reason = "transition-unproved"
-    elif probe_class == "binding-generation-mismatch":
-        reason = "binding-generation-mismatch"
-    elif probe_class == "approval-owner-mismatch":
-        reason = "approval-owner-mismatch"
-    elif probe_class == "tui-disconnected":
-        reason = "tui-disconnected"
-    elif managed:
-        reason = "managed-gateway-not-ready"
-    else:
-        reason = "managed-entry-required"
-    explanation = (
-        "this Codex parent is already managed, but its current completion binding could not be verified"
-        if managed else
-        "this interactive Codex parent has no verified managed completion carrier"
-    )
-    if os.environ.get("HERDR_PANE_ID") or os.environ.get("HERDR_SOCKET_PATH"):
-        recovery = (
-            "inspect preflight.sh interactive-main-recovery --check in the current workspace; "
-            "if a fresh main is needed, use Herdr's supported API for a visible pane in the same workspace/tab"
-        )
-    else:
-        recovery = (
-            "check the current terminal host and its supported visible-pane API before starting "
-            "a fresh managed codex main; preserve the existing session and batch identities"
-        )
     raise DispatchContractError(
-        reason,
-        f"{explanation}; probe={probe} probe_class={probe_class}; {recovery}",
+        "native-parent-identity-unproven",
+        "Codex delivery requires the calling CODEX_THREAD_ID; inspect the native session identity",
     )
 
 
 def launch_parent_completion_sidecar(
     args,
     jobs: Path,
-    *, launch=launch_managed_completion_sidecar, annotate=annotate_attempt_row,
+    *, launch=None, annotate=annotate_attempt_row,
 ) -> None:
-    """Prelaunch one exact joiner before the managed direct child spawn claim."""
+    """Prelaunch one exact joiner before the direct child spawn claim."""
 
     args.managed_sidecar_state = "not-selected"
     args.managed_sidecar_reason = "-"
-    if args.parent_completion_delivery != MANAGED_PARENT_DELIVERY:
-        return
-    binding = getattr(args, "managed_gateway_binding", None)
-    if binding is None:
-        args.managed_sidecar_state = "launch-failed"
-        args.managed_sidecar_reason = "managed-binding-missing"
+    if args.parent_completion_delivery != "codex-native-queue":
         return
     try:
+        if launch is None:
+            from codex_queue_dispatch import launch_codex_queue_completion_sidecar
+            launch = launch_codex_queue_completion_sidecar
         sidecar = launch(
-            binding=binding,
             jobs=jobs,
             parent_session_id=args.parent_session_id or "",
             attempt_ids={args.attempt_id},

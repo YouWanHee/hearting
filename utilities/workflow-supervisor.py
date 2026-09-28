@@ -745,7 +745,7 @@ def cmd_gate(args):
 # One kind, two carriers: asyncRewake and the UserPromptSubmit sweep both
 # deliver to a `claude-parent-runtime` recipient.
 GATE_CARRIER_KINDS = frozenset({
-    "claude-parent-runtime", "codex-managed-gateway",
+    "claude-parent-runtime", "codex-managed-gateway", "codex-native-queue",
 })
 
 GATE_SESSION_GENERATION = "unsupported"
@@ -1002,14 +1002,10 @@ def create_local_frame_gate_delivery(route, gate, artifact, jobs_path, epoch, *,
         if len(metadata) != 1 or metadata[0].get("parent_sid") != session:
             raise SupervisorError("frame-gate-parent-binding-mismatch")
         attempts.append(attempt)
-    if parent_harness == "codex":
-        control = os.environ.get("AGENT_CODEX_MANAGED_CONTROL_SOCKET")
-        if not control:
-            raise SupervisorError("frame-gate-managed-parent-required")
-        try:
-            HUMAN_GATE.probe_consumer(Path(control), expected_thread_id=session)
-        except HUMAN_GATE.HumanGateReceiptError as exc:
-            raise SupervisorError(f"frame-gate-parent-unavailable: {exc}") from exc
+    # A pre-owner frame interview is already running in its interactive
+    # parent. Bind its local handback to the native session id; requiring the
+    # retired managed-gateway control socket would make an ordinary Codex TUI
+    # unable to approve its own frame results.
     artifact_path = Path(artifact)
     if not artifact_path.is_absolute() or not artifact_path.is_file():
         raise SupervisorError("frame-gate-artifact-unreadable")
@@ -1052,16 +1048,24 @@ def create_gate_delivery(
         recipient_key, route["route_id"], gate, attempt_id, epoch
     )
     route_node = _gate_route_node(route, gate)
-    if recipient_kind == HUMAN_GATE.RECIPIENT_KIND:
-        control = os.environ.get("AGENT_CODEX_MANAGED_CONTROL_SOCKET")
-        if not control:
-            raise SupervisorError("gate-carrier-unavailable: managed control socket missing")
-        try:
-            capability = HUMAN_GATE.probe_consumer(
-                Path(control), expected_thread_id=recipient_key
-            )
-        except HUMAN_GATE.HumanGateReceiptError as exc:
-            raise SupervisorError(f"gate-carrier-unavailable: {exc}") from exc
+    if recipient_kind in {HUMAN_GATE.RECIPIENT_KIND, HUMAN_GATE.LEGACY_RECIPIENT_KIND}:
+        if recipient_kind == HUMAN_GATE.RECIPIENT_KIND:
+            # Native queue binds to the immutable exact thread id. There is no
+            # gateway epoch; 1 is a protocol generation tag in the existing
+            # receipt field, not a claim about a TUI connection generation.
+            capability = {"epoch": 1}
+            session_generation = "1"
+        else:
+            control = os.environ.get("AGENT_CODEX_MANAGED_CONTROL_SOCKET")
+            if not control:
+                raise SupervisorError("gate-carrier-unavailable: managed control socket missing")
+            try:
+                capability = HUMAN_GATE.probe_consumer(
+                    Path(control), expected_thread_id=recipient_key
+                )
+            except HUMAN_GATE.HumanGateReceiptError as exc:
+                raise SupervisorError(f"gate-carrier-unavailable: {exc}") from exc
+            session_generation = str(capability["epoch"])
         owner = _owner_row(_registry_rows(jobs_path), route["route_id"])
         metadata = owner["meta"] if owner is not None else {}
         sealed_batch_id = metadata.get("managed_sealed_batch_id") or ""
@@ -1081,10 +1085,10 @@ def create_gate_delivery(
                 recipient_epoch=capability["epoch"], artifact_path=Path(artifact),
                 release_authority=release_authority, interview=bool(interview),
                 questions=int(questions), pending_delivery_id=delivery_id,
+                recipient_kind=recipient_kind,
             )
         except HUMAN_GATE.HumanGateReceiptError as exc:
             raise SupervisorError(f"gate-delivery-refused: {exc}") from exc
-        session_generation = str(capability["epoch"])
         generation_supported = "1"
         receipt_digest = HUMAN_GATE.digest(receipt)
         row_revision = f"human-gate:{gate}:{epoch + 1}"

@@ -322,6 +322,18 @@ class ClaimCasTest(IsolatedRootMixin, unittest.TestCase):
         )
         PD.create(**self.kwargs)
 
+    def test_owner_release_makes_failed_send_immediately_reclaimable(self):
+        did = self.kwargs["delivery_id"]
+        PD.claim(self.root, "sess-claim", did, claim_owner="queue", lease_seconds=86400)
+        result = PD.release_claim(self.root, "sess-claim", did, claim_owner="queue")
+        self.assertEqual(result["state"], "pending")
+        PD.claim(self.root, "sess-claim", did, claim_owner="prompt", lease_seconds=30)
+        result = PD.release_claim(self.root, "sess-claim", did, claim_owner="queue")
+        self.assertEqual(result["claim_owner"], "prompt")
+        PD.ack(self.root, "sess-claim", did, acked_by="prompt")
+        self.assertEqual(PD.release_claim(self.root, "sess-claim", did, claim_owner="prompt")["state"], "acked")
+
+
     def test_first_claim_succeeds_second_is_refused(self):
         first = PD.claim(
             self.root, "sess-claim", self.kwargs["delivery_id"],

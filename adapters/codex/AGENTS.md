@@ -53,35 +53,25 @@ and `ADAPTATION.md`; command output is authoritative for current support.
 | readiness/loops | `preflight.sh doctor [--runtime]`, `preflight.sh loop-info <oncall|note|study|drill|runtime-watch>` |
 | dispatch control | `preflight.sh dispatch-wait --attempt-id <id> --max 300..600` (operator recovery only), `preflight.sh liveness`, `preflight.sh harvest`, `preflight.sh dispatch-reconcile` |
 | dispatch readiness | `preflight.sh dispatch-readiness --worktree <path> --jobs <jobs.log> --owner-harness <h>... --child-harness <h>... --output <evidence.json>` |
-| managed Codex | `preflight.sh managed-entry [--check] --codex-home <private-dir> --state-dir <private-dir> --workspace <dir> [--jobs <jobs.log>]` |
 | install | `install-runtime-projection.sh [--install-plugin] [--skills-mode native|plugin|both]`, `check-runtime-projection.sh`, `preflight.sh runtime-projection --require-hook-trust` |
 
 Keep Codex `/statusline` responsible for model, context, token, limit, and session footer fields. `preflight.sh status` is an on-demand harness snapshot, including git dirty/worktree/dead-branch risks. Runtime config remains user-owned; strict projection checks read authoritative App Server `hooks/list` current-hash trust and never rewrite user trust state.
 The recommended footer fragment is `codex_setting/codex-config/tui-statusline.toml`; apply it only through explicit `preflight.sh tui-config`.
 
-The installed `codex` launcher puts interactive new/resume/fork sessions through
-`utilities/codex-managed-entry.py`; administrative/headless commands pass through.
-Runtime joins exact batches and resumes the parent once; the TUI remains the sole
-approval/subscription owner. The parent runtime selects delivery regardless of
-child harness. Managed completion never uses Stop continuation or PreToolUse
-parking. New unmanaged parents are
-rejected with `managed-entry-required` before registry mutation or
-spawn. Finite `poll-fallback` is operator recovery only; the
-portable owner selector and model routes cannot select it.
-Recovery and legacy migration details are in `OPERATIONS §5.10`.
+Interactive completion uses Codex's native queue, addressed to the caller's
+`CODEX_THREAD_ID`. The interactive launcher and managed gateway are retired.
+The exact-batch sidecar checks consumed and pending messages before sending;
+ambiguous sends may repeat. Only an exact Hearting item may restart an interrupted
+parent. The TUI owns questions and approvals; headless owners keep their separate
+supervisor. Empty native question answers are not user decisions.
 Arbitrary detached shell output still does not auto-resume. For non-dispatch
 long-running work, obey `preflight.sh
 loop-info runtime-watch` and its explicit automatic-follow-up-impossible fallback
 instead of ending with a detached completion promise.
 
-The managed launcher exports the session's one canonical `AGENT_DISPATCH_JOBS`.
+The session uses one canonical `AGENT_DISPATCH_JOBS`.
 Treat it as immutable at every dispatch depth; never reconstruct a registry from
 `$AGENT_HOME/.dispatch/jobs.log`, because packaged `$AGENT_HOME` is versioned source.
-
-Only an epoch TUI start, resume, or current-fork response advances binding;
-siblings, notifications, tools, failures, and stale responses do not. Seal
-thread/epoch/generation. Recovery: prove host workspace/tab/pane/cwd, use its
-native visible-pane API, never hidden tmux. Headless work is separate.
 
 ## Tool Contracts
 
@@ -137,12 +127,10 @@ Launch registered jobs only through `preflight.sh dispatch
 `worker_mode`, which must equal its portable `unit`; a dispatch-depth-1 owner is
 `_kernel/owner` with no worker mode. `worker_role` and legacy `mode` are
 read-only metadata, not bootstrap identity. A direct interactive launch selects
-completion by the parent runtime: a live `managed-entry` Codex parent uses the
-gateway and a Claude parent uses Claude resume. A new unmanaged interactive
-Codex parent fails with `managed-entry-required` before registry mutation or
-spawn; `dispatch-owner` also forbids completion-policy and unmanaged-poll
-overrides. This parent-runtime selection does not force Stop/PreToolUse trust,
-create new parent Stop state, or park the model/tool loop. Keep the parent
+completion by the parent runtime: a Codex parent uses its
+native queue and a Claude parent uses Claude resume. Parent identity is the
+calling native session; no launcher or gateway probe changes it. Native queue
+delivery does not force Stop/PreToolUse trust. Keep the parent
 conversational. Obey the receipt: `parent_next=end-turn` yields with no wait
 or poll; `parent_next=bounded-wait` runs its printed `parent_next_command` once —
 never an in-model `sleep`/liveness loop. An absent directive is not `end-turn`:
@@ -184,8 +172,8 @@ Do not end a turn while a tracked workflow has a stage with no registered
 continuation. Arm the shared supervisor
 (`utilities/workflow-supervisor.py arm|poll|watch|status|complete`), dispatch the
 next stage, or record the human gate in the same turn; when none is possible, say
-so plainly and name the checked fallback. The managed App Server gateway resumes
-this thread once per batch and never substitutes for a stage continuation. Report
+so plainly and name the checked fallback. The native queue carries
+the exact completion batch and never substitutes for a stage continuation. Report
 state from PID identity, sentinel/exit evidence, log modification time, and
 declared artifacts, never from a registry status word alone. `OPERATIONS §5.12`
 owns the mechanics.

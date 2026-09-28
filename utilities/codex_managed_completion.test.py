@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -13,6 +14,7 @@ import tempfile
 import time
 import threading
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 from typing import Any
 
@@ -735,6 +737,208 @@ class NormalizeReceiptStageAdvanceNegotiationTest(unittest.TestCase):
         )
         self.assertEqual(normalized["schema_version"], 3)
         self.assertEqual(normalized["stage_advance"], record)
+
+
+class NativeQueueDeliveryTest(unittest.TestCase):
+    def test_queue_acceptance_uses_exact_id_and_restarts_only_while_pending(self) -> None:
+        from types import SimpleNamespace
+
+        module = load_completion_module()
+        receipt = {"schema_version": 2, "state": "ready", "children": []}
+        delivery_id = "delivery-ledger-one"
+        delivery_material = "\0".join((
+            "codex-native-queue-v1", SESSION, delivery_id,
+        ))
+        client_id = "delivery-" + hashlib.sha256(
+            delivery_material.encode("utf-8")
+        ).hexdigest()[:32]
+        item = {"id": "queue-item-1", "clientUserMessageId": client_id}
+        row = SimpleNamespace(
+            attempt_id="att-one", raw="terminal-row",
+            metadata={"delivery_id": delivery_id,
+                      "delivery_recipient_kind": "codex-native-queue",
+                      "delivery_row_revision": "revision",
+                      "delivery_receipt_digest": "sha256:record-digest"},
+        )
+        ledger_record = {
+            "delivery_id": delivery_id, "recipient_kind": "codex-native-queue",
+            "attempt_ids": ["att-one"], "receipt_digest": "sha256:record-digest",
+            "row_revisions": {"att-one": "revision"}, "state": "pending",
+        }
+        args = SimpleNamespace(
+            queue_socket=Path("/tmp/app-server.sock"),
+            thread_id=SESSION,
+            sealed_batch_id="batch-exact",
+            jobs=Path("/tmp/jobs.log"),
+            timeout=3.0,
+            interval=0.01,
+            delivery_retry_interval=0.01,
+        )
+        with mock.patch.object(module.codex_queue_delivery, "_rpc", return_value={
+                "thread": {"id": SESSION, "cwd": "/tmp/repo"}}), \
+             mock.patch.object(module, "current_session_children", return_value=[row]), \
+             mock.patch.object(module.pending_delivery, "read", return_value=ledger_record), \
+             mock.patch.object(module.pending_delivery, "claim") as claim, \
+             mock.patch.object(module.pending_delivery, "release_claim") as release, \
+             mock.patch.object(module.pending_delivery, "mark_sent_ambiguous") as ambiguous, \
+             mock.patch.object(module.pending_delivery, "ack") as ack, \
+             mock.patch.object(module.codex_queue_delivery, "send_at_least_once", side_effect=[{
+                 "status": "queued", "queued_submission_id": item["id"]},
+                 {"status": "consumed"}]) as send, \
+             mock.patch.object(module.codex_queue_delivery, "list_queue", side_effect=[[item], []]), \
+             mock.patch.object(module.codex_queue_delivery,
+                               "find_turn_by_client_message_id", return_value={"id": "turn-1"}), \
+             mock.patch.object(module.codex_queue_delivery, "_latest_turn_status", return_value="interrupted"), \
+             mock.patch.object(module.codex_queue_delivery, "poll_owned_item") as restart, \
+             mock.patch.object(module.time, "sleep"):
+            result = module.deliver_to_native_queue(
+                args, receipt, {"att-one"}
+            )
+        self.assertEqual(result["status"], "accepted")
+        self.assertTrue(send.call_args.kwargs["client_message_id"].startswith("delivery-"))
+        self.assertIn("AGENT_HARNESS_COMPLETION_V1", send.call_args.kwargs["message"])
+        self.assertEqual(claim.call_count, 2)
+        self.assertEqual(release.call_count, 2)
+        ambiguous.assert_called_once()
+        ack.assert_called_once()
+        self.assertEqual(send.call_count, 2)
+        restart.assert_not_called()  # Transport owns exact restart decisions.
+
+
+    def test_refused_transport_releases_its_exact_claim_before_returning(self) -> None:
+        from types import SimpleNamespace
+
+        module = load_completion_module()
+        receipt = {"schema_version": 2, "state": "ready", "children": []}
+        delivery_id = "delivery-ledger-one"
+        delivery_material = "\0".join((
+            "codex-native-queue-v1", SESSION, delivery_id,
+        ))
+        client_id = "delivery-" + hashlib.sha256(
+            delivery_material.encode("utf-8")
+        ).hexdigest()[:32]
+        item = {"id": "queue-item-1", "clientUserMessageId": client_id}
+        row = SimpleNamespace(
+            attempt_id="att-one", raw="terminal-row",
+            metadata={"delivery_id": delivery_id,
+                      "delivery_recipient_kind": "codex-native-queue",
+                      "delivery_row_revision": "revision",
+                      "delivery_receipt_digest": "sha256:record-digest"},
+        )
+        ledger_record = {
+            "delivery_id": delivery_id, "recipient_kind": "codex-native-queue",
+            "attempt_ids": ["att-one"], "receipt_digest": "sha256:record-digest",
+            "row_revisions": {"att-one": "revision"}, "state": "pending",
+        }
+        args = SimpleNamespace(
+            queue_socket=Path("/tmp/app-server.sock"),
+            thread_id=SESSION,
+            sealed_batch_id="batch-exact",
+            jobs=Path("/tmp/jobs.log"),
+            timeout=3.0,
+            interval=0.01,
+            delivery_retry_interval=0.01,
+        )
+        with mock.patch.object(module.codex_queue_delivery, "_rpc", return_value={
+                "thread": {"id": SESSION, "cwd": "/tmp/repo"}}), \
+             mock.patch.object(module, "current_session_children", return_value=[row]), \
+             mock.patch.object(module.pending_delivery, "read", return_value=ledger_record), \
+             mock.patch.object(module.pending_delivery, "claim") as claim, \
+             mock.patch.object(module.pending_delivery, "release_claim") as release, \
+             mock.patch.object(module.pending_delivery, "mark_sent_ambiguous") as ambiguous, \
+             mock.patch.object(module.pending_delivery, "ack") as ack, \
+             mock.patch.object(module.codex_queue_delivery, "send_at_least_once",
+                 side_effect=module.codex_queue_delivery.QueueDeliveryError("queue-start-refused")):
+            with self.assertRaisesRegex(module.codex_queue_delivery.QueueDeliveryError, "queue-start-refused"):
+                module._native_queue_delivery_once(args, receipt, {"att-one"})
+        release.assert_called_once()
+        self.assertEqual(release.call_args.kwargs["claim_owner"], claim.call_args.kwargs["claim_owner"])
+        ack.assert_not_called()
+
+    def test_partial_ledger_ack_closes_the_same_batch_without_resending(self) -> None:
+        from types import SimpleNamespace
+
+        module = load_completion_module()
+        receipt = {"schema_version": 2, "state": "ready", "children": []}
+        ids = ["delivery-ledger-a", "delivery-ledger-b"]
+        material = "\0".join(("codex-native-queue-v1", SESSION, *ids))
+        client_id = "delivery-" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
+        rows = [SimpleNamespace(
+            attempt_id=f"att-{index}", raw=f"row-{index}",
+            metadata={"delivery_id": delivery_id,
+                      "delivery_recipient_kind": "codex-native-queue",
+                      "delivery_row_revision": "revision",
+                      "delivery_receipt_digest": f"digest-{index}"},
+        ) for index, delivery_id in enumerate(ids)]
+        records = [{
+            "delivery_id": delivery_id, "recipient_kind": "codex-native-queue",
+            "attempt_ids": [f"att-{index}"], "receipt_digest": f"digest-{index}",
+            "row_revisions": {f"att-{index}": "revision"},
+            "state": "acked" if index == 0 else "sent-ambiguous",
+            "acked_by": f"codex-native-queue:{client_id}" if index == 0 else None,
+        } for index, delivery_id in enumerate(ids)]
+        read_records = [*records, *records]
+        args = SimpleNamespace(
+            queue_socket=Path("/tmp/app-server.sock"), thread_id=SESSION,
+            sealed_batch_id="batch-exact", jobs=Path("/tmp/jobs.log"),
+            timeout=2.0, interval=0.01, delivery_retry_interval=0.01,
+        )
+        with mock.patch.object(module.codex_queue_delivery, "_rpc", return_value={
+                 "thread": {"id": SESSION, "cwd": "/tmp/repo"}}), \
+             mock.patch.object(module, "current_session_children", return_value=rows), \
+             mock.patch.object(module.pending_delivery, "read", side_effect=read_records), \
+             mock.patch.object(module.pending_delivery, "ack") as ack, \
+             mock.patch.object(module.codex_queue_delivery, "send_at_least_once") as send:
+            result = module.deliver_to_native_queue(args, receipt, {"att-0", "att-1"})
+        self.assertEqual(result["status"], "accepted")
+        ack.assert_called_once_with(
+            args.jobs.resolve(strict=False).parent, SESSION, ids[1],
+            acked_by=f"codex-native-queue:{client_id}",
+            expected_states=("pending", "claimed", "sent-ambiguous"),
+        )
+        send.assert_not_called()
+
+    def test_native_queue_notice_stays_unacked_while_exact_item_is_pending(self) -> None:
+        module = load_completion_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            jobs = root / "jobs.log"
+            jobs.write_text("", encoding="utf-8")
+            delivery_id = "dlv-notice-exact"
+            receipt = {
+                "schema_version": 1, "kind": "supervision",
+                "owner_attempt_id": "att-owner", "sealed_batch_id": "batch-exact",
+            }
+            path = root / "delivery-notice.json"
+            path.write_text(json.dumps({
+                "delivery_id": delivery_id, "state": "pending", "receipt": receipt,
+            }), encoding="utf-8")
+            args = SimpleNamespace(
+                queue_socket=Path("/tmp/app-server.sock"), jobs=jobs,
+                parent_session_id=SESSION, sealed_batch_id="batch-exact",
+                interval=0.1,
+            )
+            watcher = module.NoticeWatcher(args, {"att-owner"}, capability=None)
+            item = {"id": "queue-item", "clientUserMessageId": delivery_id}
+            with mock.patch.object(module.notice_receipt, "validate_pending_record"), \
+                 mock.patch.object(module.notice_receipt, "context", return_value={
+                     "additionalContext": {"notice": {"value": "typed notice"}},
+                 }), \
+                 mock.patch.object(module.notice_receipt, "gateway_delivery_id", return_value="notice-id"), \
+                 mock.patch.object(module.pending_delivery, "claim", return_value={
+                     "delivery_id": delivery_id, "state": "claimed", "receipt": receipt,
+                 }), \
+                 mock.patch.object(module.pending_delivery, "mark_sent_ambiguous") as ambiguous, \
+                 mock.patch.object(module.pending_delivery, "ack") as ack, \
+                 mock.patch.object(module.codex_queue_delivery, "send_at_least_once") as send, \
+                 mock.patch.object(module.codex_queue_delivery, "list_queue", return_value=[item]):
+                watcher._one(path)
+            send.assert_called_once_with(
+                args.queue_socket, thread_id=SESSION, client_message_id=delivery_id,
+                message="typed notice", timeout=5.0,
+            )
+            ambiguous.assert_called_once()
+            ack.assert_not_called()
 
 
 if __name__ == "__main__":
