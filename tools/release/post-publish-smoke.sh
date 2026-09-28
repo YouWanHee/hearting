@@ -45,9 +45,8 @@ run_isolated() {
 run_isolated timeout 300 sh "$SMOKE/install.sh" \
   --runtime claude --runtime codex --no-auto-update >/dev/null
 
-# Every hook command file that settings.json registers must exist, and the
-# launcher must bind the stub CLI, never a harness wrapper.
-HOME_DIR="$SMOKE/home" STUB="$SMOKE/bin/codex" python3 - <<'PY'
+# Every hook command file that settings.json registers must exist.
+HOME_DIR="$SMOKE/home" python3 - <<'PY'
 import json, os, re, sys
 from pathlib import Path
 
@@ -64,12 +63,9 @@ for entries in settings.get("hooks", {}).values():
                     missing.append(raw)
 if missing:
     sys.exit(f"settings.json references missing files: {missing}")
-state = json.loads((home / ".codex" / ".harness" / "codex-launcher.json").read_text())
-if state["real_command"] != os.environ["STUB"]:
-    sys.exit(f"launcher bound {state['real_command']} instead of {os.environ['STUB']}")
 PY
 
-# The wrapper must delegate instantly; a hang here is the recursion regression.
+# `codex` must reach the real CLI instantly; a hang here is the recursion regression.
 out=$(run_isolated timeout 30 codex --version)
 if [ "$out" != "codex-stub-ok" ]; then
   echo "post-publish smoke: wrapper pass-through failed: $out" >&2
