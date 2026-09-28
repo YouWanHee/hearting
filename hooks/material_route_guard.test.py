@@ -1641,11 +1641,9 @@ class MaterialRouteGuardTest(unittest.TestCase):
         # a fixture carrying only `core/CORE.md` + a `utilities` symlink fails.
         # The Codex-hook step below still uses `self.home`.
         compose_env["AGENT_HOME"] = str(ROOT)
-        # Force D5 self-bind to skip so this test isolates the hook fallback.
-        compose_env["AGENT_DISPATCH_DEPTH"] = "2"
         compose_result = subprocess.run(shlex.split(command), text=True, capture_output=True, env=compose_env)
         self.assertEqual(compose_result.returncode, 0, compose_result.stderr)
-        self.assertIn("session_route_bound=0 reason=dispatch-depth", compose_result.stderr)
+        self.assertNotIn("session_route_bound=", compose_result.stderr)
         payload = {
             "hook_event_name": "PostToolUse",
             "tool_name": "functions.exec_command",

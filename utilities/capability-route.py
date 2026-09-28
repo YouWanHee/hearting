@@ -663,7 +663,7 @@ def revalidate_launch_compatibility(route):
                 "expected":expected,"actual":actual,"fields":sorted(changed),
             }
     if mismatches and not malformed_roots and not gates_on():
-        same_work_or_refuse("launch-runtime-root-mismatch", json.dumps(mismatches, sort_keys=True))
+        same_work_or_refuse("launch-runtime-root-mismatch", ",".join(sorted(mismatches)))
         return True, mismatches
     return not mismatches,mismatches
 
@@ -7349,7 +7349,7 @@ def _emit_compiled_route(a,route,artifact_root,output=None):
     output=output if output is not None else getattr(a,"output",None)
     vbasis=route.get("validation_basis") or {}
     if vbasis.get("runtime_root_match") is False and not gates_on():
-        same_work_or_refuse("launch-runtime-root-mismatch", runtime_root_hint())
+        same_work_or_refuse("launch-runtime-root-mismatch")
     if vbasis.get("runtime_root_match") is False and gates_on():
         launch_tuple=route.get("launch_compatibility_tuple") or {}
         expected=launch_tuple.get("registry_root")
