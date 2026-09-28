@@ -57,6 +57,22 @@ class PreflightDispatchOwnerTest(unittest.TestCase):
             "HARNESS_CAPACITY_SCORES": "claude:80,codex:80,opencode:80",
         })
 
+        # Owner routing is tested independently of a host Claude installation.
+        # The complete help fixture satisfies the adapter's truncation probe.
+        fake_bin = self.home / "bin"
+        fake_bin.mkdir()
+        claude = fake_bin / "claude"
+        claude.write_text(
+            f"#!{sys.executable}\n"
+            "import sys\n"
+            "if sys.argv[1:] != ['--help']:\n"
+            "    raise SystemExit(2)\n"
+            "print('Usage: claude --resume --session-id\\n' + 'pad ' * 5200 + '\\nupdate|upgrade')\n",
+            encoding="utf-8",
+        )
+        claude.chmod(0o755)
+        self.env["PATH"] = str(fake_bin) + os.pathsep + self.env.get("PATH", "")
+
     def test_dispatch_owner_arm_delegates_to_selector(self):
         result = subprocess.run(
             [str(PREFLIGHT), "dispatch-owner"],
