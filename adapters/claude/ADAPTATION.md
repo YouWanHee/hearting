@@ -295,16 +295,7 @@ family entries are adapter-owned files copied from the current `roles/modes/`
 content. This preserves old Claude behavior while `roles/MODES.md` continues to
 classify which fragments are portable, tool-contract-bound, or adapter-coupled.
 
-Hook scripts now follow the same concrete projection pattern:
-`claude_setting/hooks` points at `adapters/claude/hooks/`, whose files are
-adapter-owned copies of the current shared `hooks/` scripts. This keeps the
-existing Claude `settings.json` commands stable while `core/HOOKS.md` continues
-to define the portable invariant layer and future adapter wrapper split.
-`material-route-guard.py` is registered on PreToolUse source Edit/Write and Bash
-commit surfaces, on PostToolUse Bash to bind one successfully compiled route to
-the exact Claude session, and on SessionEnd to remove that session marker. It
-revalidates the immutable route on every protected action; the separate
-capability-grounding Skill marker is display-only and never satisfies this gate.
+Write-denying hook gates are retired; no write preflight or core-read marker is required.
 
 `fleet-interaction-state.py` is the Claude-native payload wrapper for the
 portable interaction-wait invariant. `PreToolUse(AskUserQuestion)` publishes a

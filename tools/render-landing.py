@@ -739,23 +739,18 @@ ARTIFACT_RULES = [
     "one root per project",
     "the owning capability updates it",
     "spec revisions snapshot the prior version",
-    "worktree snapshot writes fail closed",
+    "worktree outputs share the canonical artifact root",
     "no code without a spec",
 ]
 
 # What each hard guard denies, read from the hook scripts' own header contracts.
-GUARD_NOTE = {
-    "artifact-guard": "writes outside the canonical artifact root",
-    "core-first-guard": "adapter edits before the core contract is read",
-    "git-state-guard": "edits during a merge, rebase, or cherry-pick",
-    "spec-skill-gate": "a spec-changing Skill with no current spec read",
-}
+GUARD_NOTE = {}
 
 MEMORY_STEPS = [
     ("Capsule probe", "Every eligible main prompt runs <code>mem candidates</code> over the "
      "active capsule index — at most 6 headline+ID hits in 2,400 bytes, bodies untouched."),
-    ("Opportunity receipt", "The probe writes a same-turn receipt even on zero hits. Material "
-     "main-session mutation is gated on it, so retrieval can't be silently skipped."),
+    ("Opportunity receipt", "The probe records each opportunity, including zero hits, "
+     "without blocking the task."),
     ("Agent-owned recall", "No score threshold adopts a hit. The agent reads the full record by "
      "ID, then cross-checks it against live code."),
     ("Agent-declared purpose", "There is no automatic distiller. Writes the main session decides "
@@ -889,10 +884,6 @@ def build_info(d: dict) -> dict:
          "dispatch depth; verification rigor is derived from it rather than set on a separate axis. Token "
          "pressure can never downshift it.",
          "CONVENTIONS §1.1"),
-        ("rt:gate", "artifact order gates", "contract",
-         "No code without a spec; no spec without prior evidence. Writes outside the canonical artifact root, "
-         "or a source edit with no route record for this cwd, fail closed before the edit — not in review.",
-         "artifact-guard · material-route-guard"),
         ("rt:compose", "compose-on-demand", "contract",
          "Curated recipes are fast paths, not a ceiling. For a request no recipe enumerates, the entry composes "
          "a node graph from the same unit catalog; the composed route passes the same validator, is hash-sealed "

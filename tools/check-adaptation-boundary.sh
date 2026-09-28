@@ -63,7 +63,7 @@ fi
 # INSTALL_LAYOUT.md doc entry. PostToolUseFailure is Claude-native; the current Codex native hook
 # surface has no verified matching event, so projecting a bridge would overclaim parity. Module-level so both consumer sites (check_install_layout_codex_projection,
 # check_codex_bin_wrappers) can read it regardless of registration order.
-HOOK_EVENT_EXEMPT="PostToolUseFailure"
+HOOK_EVENT_EXEMPT="PostToolUseFailure PreToolUse"
 
 is_mechanized_install_layout() {
   grep -Fq 'tools/install/harness.sh' INSTALL_LAYOUT.md 2>/dev/null
@@ -947,22 +947,8 @@ check_codex_bin_wrappers() {
     fail_msg "adapters/codex/AGENTS.md must document the Codex native hook projection"
   fi
 
-  if ! grep -Fq 'hook_boundary=shell-read-write-targeted-detection-explicit-preflight-fallback' adapters/codex/bin/preflight.sh \
-    || ! grep -Fq 'shell_read_write_hooks=targeted-detection' adapters/codex/bin/preflight.sh \
-    || ! grep -Fq 'targeted_shell_hooks=Bash,Shell,functions.exec_command' adapters/codex/bin/preflight.sh \
-    || ! grep -Fq 'targeted_shell_write_patterns=redirect,tee,touch,cp,mv,rm,install,rsync,dd-of,sed-i' adapters/codex/bin/preflight.sh \
-    || ! grep -Fq 'structured_write_hooks=Write,Edit,MultiEdit,apply_patch,functions.apply_patch' adapters/codex/bin/preflight.sh \
-    || ! grep -Fq 'Shell/Bash/`functions.exec_command` reads and writes have targeted hook coverage' adapters/codex/AGENTS.md \
-    || ! grep -Fq 'Shell/Bash/`functions.exec_command` gets targeted detection' adapters/codex/README.md \
-    || ! grep -Fq 'common mutation commands (`tee`, `touch`, `cp`, `mv`, `rm`, `install`, `rsync`)' adapters/codex/README.md \
-    || ! grep -Fq 'design HTML save paths' adapters/codex/README.md \
-    || ! grep -Fq 'shell-read-write-targeted-detection-explicit-preflight-fallback' adapters/codex/ADAPTATION.md; then
-    fail_msg "Codex adapter must document and report targeted shell/exec read-write hook coverage with explicit preflight fallback"
-  fi
-  if ! grep -Fq '*) fp="$PWD/$fp" ;;' hooks/spec-read-marker.sh \
-    || ! grep -Fq 'codex read wrapper resolves relative prd paths for spec gate' hooks/portable-guards.test.sh; then
-    fail_msg "spec-read-marker.sh and portable guards must prove explicit preflight read accepts relative prd paths"
-  fi
+
+
   # Derive Codex native hook bridges from build-manifest rather than hardcoding them.
   CODEX_NATIVE_HOOKS=$(python3 tools/build-manifest.py --adaptation-surface codex-hooks 2>/dev/null || true)
   if [ -z "$CODEX_NATIVE_HOOKS" ]; then
@@ -1060,10 +1046,10 @@ check_codex_bin_wrappers() {
     || ! grep -Fq 'routing_contract=core/WORKFLOW.md' adapters/codex/bin/preflight.sh \
     || ! grep -Fq 'routing_action=read-workflow-and-select-codex-skill' adapters/codex/bin/preflight.sh \
     || ! grep -Fq 'capability_entrypoints=codex-native-skills' adapters/codex/bin/preflight.sh \
-    || ! grep -Fq 'enforced_hooks=structured-write-guards,core-first-guard,posttool-read-markers,posttool-design-check,session-memory' adapters/codex/bin/preflight.sh; then
+    || ! grep -Fq 'enforced_hooks=posttool-read-markers,posttool-design-check,session-memory' adapters/codex/bin/preflight.sh; then
     fail_msg "Codex UserPromptSubmit hook must expose a structured workflow/autopilot signal"
   fi
-  if ! grep -Fq 'codex route wrapper combines status, prompt signal, capability-info, and spec gate' hooks/portable-guards.test.sh; then
+  if ! grep -Fq 'codex route wrapper combines status, prompt signal, capability-info, and capability mapping' hooks/portable-guards.test.sh; then
     fail_msg "Codex route wrapper tests must prove route includes harness status before capability gates"
   fi
 
@@ -1876,7 +1862,6 @@ check_codex_native_hook_projection() {
   stop_bridge="$hook_dir/stop-lifecycle.py"
   prompt_bridge="$hook_dir/userprompt-lifecycle.py"
   permission_bridge="$hook_dir/permissionrequest-lifecycle.py"
-  pre_bridge="$hook_dir/pretooluse-write-guard.py"
   post_bridge="$hook_dir/posttooluse-design-check.py"
   read_bridge="$hook_dir/posttooluse-read-marker.py"
   launcher="$hook_dir/run-hook.sh"
@@ -1885,7 +1870,7 @@ check_codex_native_hook_projection() {
     fail_msg "$hook_json is missing"
     return
   fi
-  for bridge in "$session_bridge" "$sessionend_bridge" "$stop_bridge" "$prompt_bridge" "$permission_bridge" "$pre_bridge" "$post_bridge" "$read_bridge" "$launcher"; do
+  for bridge in "$session_bridge" "$sessionend_bridge" "$stop_bridge" "$prompt_bridge" "$permission_bridge" "$post_bridge" "$read_bridge" "$launcher"; do
     if [ ! -x "$bridge" ]; then
       fail_msg "$bridge must be executable"
     fi
@@ -1897,7 +1882,7 @@ check_codex_native_hook_projection() {
     fail_msg "$hook_json must be valid JSON"
     cat /tmp/codex-hooks-json.err
   fi
-  for script in sessionstart-lifecycle.py sessionend-lifecycle.py stop-lifecycle.py userprompt-lifecycle.py permissionrequest-lifecycle.py pretooluse-write-guard.py posttooluse-design-check.py posttooluse-read-marker.py; do
+  for script in sessionstart-lifecycle.py sessionend-lifecycle.py stop-lifecycle.py userprompt-lifecycle.py permissionrequest-lifecycle.py posttooluse-design-check.py posttooluse-read-marker.py; do
     if ! grep -Fq "run-hook.sh\\\" $script" "$hook_json"; then
       fail_msg "$hook_json must register $script through the Codex hook launcher"
     fi
@@ -1921,9 +1906,6 @@ check_codex_native_hook_projection() {
   if ! grep -Fq '"PermissionRequest"' "$hook_json" || ! grep -Fq 'permissionrequest-lifecycle.py' "$hook_json"; then
     fail_msg "$hook_json must register the Codex PermissionRequest lifecycle bridge"
   fi
-  if ! grep -Fq '"PreToolUse"' "$hook_json" || ! grep -Fq 'pretooluse-write-guard.py' "$hook_json"; then
-    fail_msg "$hook_json must register the Codex PreToolUse write guard"
-  fi
   if ! grep -Fq 'Write|Edit|MultiEdit|apply_patch|functions\\.apply_patch|Bash|Shell|functions\\.exec_command' "$hook_json" \
     || ! grep -Fq 'Read|Bash|Shell|functions\\.exec_command' "$hook_json"; then
     fail_msg "$hook_json must attach Codex hooks to structured tools and targeted shell command tools"
@@ -1934,7 +1916,7 @@ check_codex_native_hook_projection() {
   if ! grep -Fq '"PostToolUse"' "$hook_json" || ! grep -Fq 'posttooluse-read-marker.py' "$hook_json"; then
     fail_msg "$hook_json must register the Codex PostToolUse read marker"
   fi
-  for bridge in "$session_bridge" "$sessionend_bridge" "$prompt_bridge" "$pre_bridge" "$post_bridge" "$read_bridge"; do
+  for bridge in "$session_bridge" "$sessionend_bridge" "$prompt_bridge" "$post_bridge" "$read_bridge"; do
     if ! grep -Fq 'adapters" / "codex" / "bin" / "preflight.sh' "$bridge"; then
       fail_msg "$bridge must call the Codex preflight wrapper"
     fi
@@ -1943,43 +1925,19 @@ check_codex_native_hook_projection() {
       fail_msg "$bridge must resolve cwd/session from nested Codex runtime payloads"
     fi
   done
-  for bridge in "$pre_bridge" "$post_bridge" "$read_bridge"; do
+  for bridge in "$post_bridge" "$read_bridge"; do
     if ! grep -Fq 'raw_tool = payload.get("tool")' "$bridge" \
       || ! grep -Fq 'nested_mapping(payload, "tool", "toolUse", "tool_use")' "$bridge"; then
       fail_msg "$bridge must tolerate Codex hook tool payload variants"
     fi
   done
-  if ! grep -Fq '"MultiEdit", "multi_edit", "multiedit"' "$pre_bridge" \
-    || ! grep -Fq '"MultiEdit", "multi_edit", "multiedit"' "$post_bridge"; then
+  if ! grep -Fq '"MultiEdit", "multi_edit", "multiedit"' "$post_bridge"; then
     fail_msg "Codex write/design hook bridges must treat MultiEdit as a guarded write surface"
   fi
-  if ! grep -Fq 'def is_patch_tool' "$pre_bridge" \
-    || ! grep -Fq 'functions.apply_patch' "$pre_bridge" \
-    || ! grep -Fq 'payload, "patch", "patchText", "patch_text", "input", "text"' "$pre_bridge" \
-    || ! grep -Fq 'def is_patch_tool' "$post_bridge" \
+  if ! grep -Fq 'def is_patch_tool' "$post_bridge" \
     || ! grep -Fq 'functions.apply_patch' "$post_bridge" \
     || ! grep -Fq 'payload, "patch", "patchText", "patch_text", "input", "text"' "$post_bridge"; then
     fail_msg "Codex patch hook bridges must parse qualified apply_patch names and top-level patch text"
-  fi
-  if ! grep -Fq 'functions\\.apply_patch' "$hook_json" \
-    || ! grep -Fq 'patch_files(base, patch_text(payload, args))' "$pre_bridge" \
-    || ! grep -Fq 'material-route' "$pre_bridge" \
-    || ! grep -Fq 'bind_material_route' "$read_bridge"; then
-    fail_msg "Codex apply_patch matcher/payload projection and material-route bridge must remain explicit"
-  fi
-  if ! grep -Fq 'material-route' adapters/codex/bin/preflight.sh \
-    || ! grep -Fq 'material_tool=Write' adapters/codex/bin/preflight.sh \
-    || ! grep -Fq '[ -n "${AGENT_REVIEW_OUTPUT:-}" ] && material_tool=ArtifactWrite' adapters/codex/bin/preflight.sh \
-    || ! grep -Fq '"$0" material-route check --tool "$material_tool" --file "$file" --cwd "$(dirname "$file")" --session "$sid"' adapters/codex/bin/preflight.sh \
-    || ! grep -Fq 'material_tool=Write' adapters/opencode/bin/preflight.sh \
-    || ! grep -Fq '[ -n "${AGENT_REVIEW_OUTPUT:-}" ] && material_tool=ArtifactWrite' adapters/opencode/bin/preflight.sh \
-    || ! grep -Fq '"$0" material-route check --tool "$material_tool" --file "$file" --cwd "$(dirname "$file")" --session "$sid"' adapters/opencode/bin/preflight.sh \
-    || ! grep -Fq 'material-route", "check", "--tool", "Bash"' "$pre_bridge" \
-    || ! grep -Fq 'guard.bind_after_compile(' "$read_bridge" \
-    || grep -Fq 'AGENT_PARENT_PARK_ONLY' "$pre_bridge" \
-    || ! grep -Fq 'SessionEnd' adapters/codex/hooks/sessionend-lifecycle.py \
-    || ! grep -Fq 'Stop is a' adapters/codex/hooks/sessionend-lifecycle.py; then
-    fail_msg "Codex material-route write/check/bind call sites and SessionEnd-only clear must remain wired"
   fi
   if ! python3 - "$hook_json" <<'PY'
 import json
@@ -2013,18 +1971,6 @@ PY
     || ! grep -Fq 'codex native design hook marks targeted shell design writes' hooks/portable-guards.test.sh; then
     fail_msg "$post_bridge must route targeted shell HTML writes through the design preflight"
   fi
-  if ! grep -Fq 'mutation_commands = {"tee", "touch", "cp", "mv", "rm", "install", "rsync"}' "$pre_bridge" \
-    || ! grep -Fq 'def shell_write_files' "$pre_bridge" \
-    || ! grep -Fq 'if command_name in {"cp", "install", "rsync"}' "$pre_bridge" \
-    || ! grep -Fq 'if token.startswith("of=") and len(token) > 3' "$pre_bridge" \
-    || ! grep -Fq 'if command_name == "sed"' "$pre_bridge" \
-    || ! grep -Fq 'add_file(operands[-1])' "$pre_bridge" \
-    || ! grep -Fq 'codex native hook projection blocks common shell mutation targets' hooks/portable-guards.test.sh \
-    || ! grep -Fq 'codex native hook projection treats cp destination as the shell write target' hooks/portable-guards.test.sh \
-    || ! grep -Fq 'codex native hook projection blocks install and rsync destinations' hooks/portable-guards.test.sh \
-    || ! grep -Fq 'codex native hook projection blocks dd output and sed inline edits' hooks/portable-guards.test.sh; then
-    fail_msg "$pre_bridge must route common shell mutation command targets through the write preflight"
-  fi
   if ! grep -Fq '"read"' "$read_bridge"; then
     fail_msg "$read_bridge must call the Codex read preflight"
   fi
@@ -2036,7 +1982,7 @@ PY
     || ! grep -Fq 'preflight.sh design' adapters/codex/README.md; then
     fail_msg "adapters/codex/README.md must document the Codex native hook bridges"
   fi
-  if grep -Eq "$CLAUDE_NATIVE_SURFACE_PATTERN" "$hook_json" "$session_bridge" "$sessionend_bridge" "$prompt_bridge" "$pre_bridge" "$post_bridge" "$launcher"; then
+  if grep -Eq "$CLAUDE_NATIVE_SURFACE_PATTERN" "$hook_json" "$session_bridge" "$sessionend_bridge" "$prompt_bridge" "$post_bridge" "$launcher"; then
     fail_msg "Codex hook projection must not reference Claude-native surfaces"
   fi
 }
@@ -2721,9 +2667,7 @@ check_opencode_native_plugin_projection() {
     fail_msg "$plugin must parse as JavaScript"
     cat /tmp/opencode-plugin-check.err
   fi
-  if ! grep -Fq '"tool.execute.before"' "$plugin"; then
-    fail_msg "$plugin must use OpenCode tool.execute.before hook"
-  fi
+
   if ! grep -Fq '"tool.execute.after"' "$plugin"; then
     fail_msg "$plugin must use OpenCode tool.execute.after hook for design checks"
   fi
@@ -3909,8 +3853,7 @@ check_language_neutrality_contract() {
     || ! grep -Fq 'tools/memory/recall.sh' adapters/opencode/bin/preflight.sh \
     || ! grep -Fq 'CANDIDATE_MAX_RESULTS = 6' tools/memory/mem.py \
     || ! grep -Fq 'CANDIDATE_MAX_UTF8_BYTES = 2400' tools/memory/mem.py \
-    || ! grep -Fq 'records_capsule_fts' tools/memory/mem.py \
-    || ! grep -Fq 'recall-opportunity-missing' hooks/material-route-guard.py; then
+    || ! grep -Fq 'records_capsule_fts' tools/memory/mem.py; then
     fail_msg "memory semantics must remain agent-owned while capsule candidates and same-turn opportunity are enforced mechanically"
   fi
 

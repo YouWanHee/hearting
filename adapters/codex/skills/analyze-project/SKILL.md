@@ -35,13 +35,10 @@ contract. It is adapter-owned output, not a legacy compatibility Skill copy.
 
 
 
-## Required Guards
+## Workflow Evidence
 
-- Before edits: `adapters/codex/bin/preflight.sh write <file> [session-id]`
 - Capability grounding only: `adapters/codex/bin/preflight.sh route analyze-project [cwd] [session-id]`
 - Before durable capability output: `adapters/codex/bin/preflight.sh route --capability analyze-project <complete compile arguments>`
-- Before spec-changing work: `adapters/codex/bin/preflight.sh capability analyze-project [cwd] [session-id]`
-- After actually reading a spec PRD: `adapters/codex/bin/preflight.sh read <prd.md> [session-id]`
 - For workflow state: `adapters/codex/bin/preflight.sh status [cwd] [session-id]` and `adapters/codex/bin/preflight.sh prompt-signal [cwd] [session-id]`
 
 Do not use legacy compatibility Skill files or non-native adapter Skill files

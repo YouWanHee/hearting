@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import json
-import importlib.util
 import os
 import shlex
 import subprocess
@@ -78,7 +77,7 @@ def cwd(payload: dict[str, Any]) -> Path:
 
 def effective_cwd(payload: dict[str, Any], args: dict[str, Any]) -> Path:
     """The directory a shell tool actually ran in (route-guard-recovery
-    correction 2), matching `pretooluse-write-guard.py`'s definition:
+    correction 2):
     `exec_command({cmd, workdir})` runs `cmd` in `workdir`, not the session's
     own `cwd`. Binding by the wrong cwd here is what made a `git commit` run
     with `workdir:<worktree>` refuse the next Edit as
@@ -156,46 +155,6 @@ def read_target(payload: dict[str, Any]) -> str:
     return ""
 
 
-def _tool_response(payload: dict[str, Any]) -> object:
-    for key in ("tool_response", "toolResponse", "response", "result"):
-        value = payload.get(key)
-        if isinstance(value, (dict, str)) and value:
-            return value
-    return None
-
-
-def bind_material_route(payload: dict[str, Any], session_id: str) -> None:
-    """Thin call-site over the one shared implementation
-    (`hooks/material-route-guard.py::bind_after_compile`, route-guard-recovery
-    D1/D6): Codex's own prior duplicate only recognized `--output`, so a bare
-    `compose`/`compile` (output path omitted) never bound here."""
-    name = tool_name(payload)
-    if not is_shell_tool(name):
-        return
-    args = tool_input(payload)
-    command = shell_command(payload, args)
-    guard_path = ROOT / "hooks" / "material-route-guard.py"
-    spec = importlib.util.spec_from_file_location("material_route_guard", guard_path)
-    if not spec or not spec.loader:
-        return
-    guard = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(guard)
-    warning = guard.bind_after_compile(
-        command,
-        effective_cwd(payload, args).resolve(strict=False),
-        _tool_response(payload),
-        session_id,
-        _agent_home(),
-    )
-    if warning:
-        # Codex PostToolUse bridges keep stdout empty (adapters/codex/README.md:
-        # "Interaction bridges keep stdout empty and never own approve/deny").
-        # No additionalContext-equivalent channel is proven for this event, so
-        # the warning goes to stderr like every other PostToolUse diagnostic
-        # this bridge already writes.
-        sys.stderr.write(warning + "\n")
-
-
 def main() -> int:
     try:
         payload = json.load(sys.stdin)
@@ -208,7 +167,6 @@ def main() -> int:
     if not session_id:
         session_id = first_string(nested_mapping(payload, "session"), "id")
     session_id = session_id or "codex-hook"
-    bind_material_route(payload, session_id)
     file = read_target(payload)
     if not file:
         return 0

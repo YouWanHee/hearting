@@ -18,6 +18,7 @@ import manifest
 import verifier
 import user_model_config
 import safe_fs
+import claude_settings_config
 
 RUNTIME = "claude"
 
@@ -103,7 +104,8 @@ def install(scope="global", plugin=False, dry_run=False):
     """Apply symlinks, copy-once runtime surfaces, and optional plugin wrapping."""
     entries = projector.plan(["claude"], scope=scope)["claude"]
 
-    actions = []
+    actions = [claude_settings_config.retire_hook_registrations(
+        paths.runtime_home(RUNTIME, scope) / "settings.json", dry_run=dry_run)]
 
     if plugin:
         actions.append(_plugin_action(dry_run))

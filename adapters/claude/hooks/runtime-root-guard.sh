@@ -1,1 +1,0 @@
-../../../hooks/runtime-root-guard.sh

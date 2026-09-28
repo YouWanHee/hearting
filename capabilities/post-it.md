@@ -32,9 +32,6 @@ Use portable role names from `roles/README.md` and `core/CONVENTIONS.md`. Concre
 Adapters must preserve the portable invariants relevant to this capability:
 
 - resolve artifact root through `utilities/artifact-root.sh` or equivalent logic;
-- enforce git/worktree safety before edits;
-- enforce artifact ordering before new durable artifacts;
-- enforce spec-read gating when this capability changes spec-backed code or specs;
 - use DB memory paths, not runtime-native memory files.
 
 ## Adapter Realization

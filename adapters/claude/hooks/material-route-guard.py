@@ -1,1 +1,0 @@
-../../../hooks/material-route-guard.py

@@ -25,9 +25,6 @@ is_harness_source_root() {
   [ -f "$canonical_candidate/adapters/codex/utilities/agent-home.sh" ] && [ -x "$canonical_candidate/adapters/codex/utilities/agent-home.sh" ] || return 1
   [ -f "$canonical_candidate/utilities/artifact-root.sh" ] || return 1
   [ -d "$canonical_candidate/roles" ] && [ -d "$canonical_candidate/capabilities" ] || return 1
-  expected_hook=$canonical_candidate/hooks/core-first-guard.sh; [ -f "$expected_hook" ] && [ -x "$expected_hook" ] || return 1
-  if canonical_hook=$(canonical_existing_path "$expected_hook" 2>/dev/null); then :; else return 1; fi
-  [ "$canonical_hook" = "$expected_hook" ] || return 1
   printf '%s\n' "$canonical_candidate"
 }
 typed_root_refusal() { printf 'check=failed\nreason=harness-source-root-unresolved\n' >&2; exit 69; }
@@ -71,30 +68,6 @@ PY
 }
 if ROOT=$(resolve_source_root 2>/dev/null); then :; else typed_root_refusal; fi
 
-checked_guard_target() {
-  relative_guard=$1
-  case "$relative_guard" in
-    hooks/git-state-guard.sh|hooks/core-first-guard.sh|hooks/artifact-guard.sh|hooks/material-route-guard.py|hooks/worktree-path-guard.sh) :;;
-    *) printf 'check=failed\nreason=guard-target-unresolved\n' >&2; exit 69;;
-  esac
-  expected=$ROOT/$relative_guard
-  if [ ! -f "$expected" ] || [ ! -x "$expected" ]; then printf 'check=failed\nreason=guard-target-unresolved\n' >&2; exit 69; fi
-  if target=$(canonical_existing_path "$expected" 2>/dev/null); then :; else printf 'check=failed\nreason=guard-target-unresolved\n' >&2; exit 69; fi
-  case "$relative_guard" in
-    hooks/*) name=${relative_guard#hooks/}; expected=$ROOT/hooks/$name;;
-  esac
-  if [ "$target" != "$expected" ]; then printf 'check=failed\nreason=guard-target-self-reference\n' >&2; exit 69; fi
-  printf '%s\n' "$target"
-}
-run_guard() {
-  relative_guard=$1; shift
-  target=$(checked_guard_target "$relative_guard")
-  case "$relative_guard" in
-    hooks/material-route-guard.py) exec python3 "$target" --agent-home "$AGENT_ROOT" "$@";;
-    hooks/worktree-path-guard.sh) exec "$target" "$@";;
-    *) "$target" "$@";;
-  esac
-}
 
 agent_home() {
   if [ -n "${AGENT_HOME:-}" ] && [ -f "$AGENT_HOME/core/CORE.md" ]; then
@@ -123,13 +96,6 @@ is_worker_session() {
     || [ "${MEM_DISTILL:-}" = "1" ]
 }
 
-# SD-45/round_1 finding 4: the guard identity default falls back to the
-# canonical dispatch attempt id, never a shared literal. `${x:-default}`
-# collapses both an unset and an empty AGENT_DISPATCH_ATTEMPT_ID onto the
-# `codex` default identically (POSIX), so the one case that must never
-# silently pass is a worker session that lands on that shared default —
-# whether the variable was never exported or was exported empty. An
-# interactive, non-worker session legitimately keeps the `codex` default.
 # Memory lifecycle inside a hook, and a hook has a wall clock. Codex clamps the
 # SessionEnd hook to 3 seconds whatever hooks.json asks for, and it says so on
 # every session ("clamping SessionEnd hook timeout to 3s", measured 2026-09-09).
@@ -151,13 +117,6 @@ detach_self() {
   return 0
 }
 
-guard_identity_hard_fail_if_worker() {
-  sid_value=$1
-  if [ "$sid_value" = codex ] && is_worker_session; then
-    printf 'check=failed\nreason=guard-identity-unavailable\n' >&2
-    exit 65
-  fi
-}
 
 usage() {
   cat <<'EOF'
@@ -303,7 +262,6 @@ doctor() {
     "$ROOT/adapters/codex/hooks/userprompt-lifecycle.py" \
     "$ROOT/adapters/codex/hooks/permissionrequest-lifecycle.py" \
     "$ROOT/adapters/codex/hooks/posttooluse-interaction-clear.py" \
-    "$ROOT/adapters/codex/hooks/pretooluse-write-guard.py" \
     "$ROOT/adapters/codex/hooks/posttooluse-design-check.py" \
     "$ROOT/adapters/codex/hooks/posttooluse-read-marker.py" \
     "$ROOT/adapters/codex/hooks/worker-state-compact.py" || rc=1
@@ -373,71 +331,13 @@ case "$cmd" in
     [ "$#" -ge 2 ] && [ "$#" -le 4 ] || { echo "codex preflight: write expects <file> [session-id] [turn-id]" >&2; exit 64; }
     file=$2
     case "$file" in -*) echo "codex preflight: write file must be absolute or ./-prefixed" >&2; exit 64;; esac
-    sid=${3:-${AGENT_DISPATCH_ATTEMPT_ID:-${CODEX_THREAD_ID:-codex}}}
-    guard_identity_hard_fail_if_worker "$sid"
-    turn=${4:-}
-    if [ "${AGENT_DISPATCH_STAGE_AUTHORITY:-1}" = "0" ]; then
-      [ -n "${AGENT_WORKER_STATE_LEDGER:-}" ] && [ -n "${AGENT_DISPATCH_ATTEMPT_ID:-}" ] || {
-        echo "worker sub-session ledger binding missing" >&2; exit 65;
-      }
-      python3 "$ROOT/utilities/worker-state-ledger.py" guard-edit \
-        --path "$AGENT_WORKER_STATE_LEDGER" \
-        --attempt-id "$AGENT_DISPATCH_ATTEMPT_ID" --file "$file"
-    fi
-    run_guard hooks/git-state-guard.sh --file "$file"
-    run_guard hooks/core-first-guard.sh --file "$file" --session "$sid"
-    run_guard hooks/artifact-guard.sh --file "$file" --session "$sid"
-    # Spec read gate, fitted to Codex's interception point. Claude hard-denies the
-    # ungrounded autopilot-code/spec *Skill* (PreToolUse[Skill]); Codex has no
-    # skill-invocation event (skills are implicitly selected), so the equivalent
-    # hard gate is applied where Codex *can* intercept — the write of a
-    # spec-changing artifact (plans/* or a spec blueprint). Same portable invariant
-    # (no spec-changing work without a current prd.md read marker), same shared
-    # gate script, same per-cwd marker written by posttooluse-read-marker. Editing
-    # an existing artifact while ungrounded is denied; creating the first prd.md is
-    # not (no prd.md yet → not spec-backed → gate passes, artifact-order still runs).
-    # SD-45: hand the route record to the gate as an additional evidence path
-    # (round_1-corrected plan.md Step 1.4). Only appended when set — the gate
-    # itself falls through to the marker when no route is resolved.
-    set -- ; [ -n "${AGENT_ROUTE_FILE:-}" ] && set -- --route "$AGENT_ROUTE_FILE"
-    # W7I: readable cycle output lives at campaigns/<campaign-locator>/
-    # <cycle-locator>/artifacts/<bucket>/; the W7C ID/cycles form remains a
-    # read-compatible fallback. The same gate must fire for both and for shared
-    # spec references. Legacy top-level buckets stay matched read-only. Blueprint
-    # matching moved to a basename case so every layout gates the same seven files.
-    case "$file" in
-      */.agent_reports/plans/*|*/.claude_reports/plans/*|\
-      */campaigns/*/*/artifacts/plans/*|\
-      */campaigns/*/cycles/*/artifacts/plans/*)
-        "$ROOT/hooks/spec-skill-gate.sh" --skill autopilot-code --cwd "$(dirname "$file")" --session "$sid" "$@" ;;
-      */.agent_reports/spec/*|*/.claude_reports/spec/*|\
-      */campaigns/*/*/artifacts/spec/*|\
-      */campaigns/*/cycles/*/artifacts/spec/*|\
-      */shared/spec/*/revisions/*)
-        # Authored blueprints only. `_internal/**` holds harness-written snapshots
-        # (spec version history) and stays ungated, as it was before the cutover.
-        case "$file" in
-          */_internal/*) : ;;
-          *) case "${file##*/}" in
-               prd.md|stack.md|stack_decision.md|ship.md|api_contract.md|data_model.md|ui_flow.md)
-                 "$ROOT/hooks/spec-skill-gate.sh" --skill autopilot-spec --cwd "$(dirname "$file")" --session "$sid" "$@" ;;
-             esac ;;
-        esac ;;
-    esac
-    material_tool=Write
-    [ -n "${AGENT_REVIEW_OUTPUT:-}" ] && material_tool=ArtifactWrite
-    if [ -n "$turn" ]; then
-      "$0" material-route check --tool "$material_tool" --file "$file" --cwd "$(dirname "$file")" --session "$sid" --turn "$turn"
-    else
-      "$0" material-route check --tool "$material_tool" --file "$file" --cwd "$(dirname "$file")" --session "$sid"
-    fi
+    # Compatibility command: write gates have been retired.
+
     ;;
   read)
     [ "$#" -ge 2 ] || { echo "codex preflight: read requires a file path" >&2; exit 64; }
     file=$2
     sid=${3:-${AGENT_DISPATCH_ATTEMPT_ID:-${CODEX_THREAD_ID:-codex}}}
-    guard_identity_hard_fail_if_worker "$sid"
-    "$ROOT/hooks/core-read-marker.sh" --file "$file" --session "$sid" || exit $?
     "$ROOT/hooks/spec-read-marker.sh" --file "$file" --session "$sid" || exit $?
     ;;
   compose)
@@ -472,14 +372,9 @@ case "$cmd" in
       sh "$ROOT/utilities/capability-grounding.sh" "$@" >/dev/null 2>&1 || :
     fi
     ;;
-  material-route)
-    [ "$#" -ge 2 ] || { echo "codex preflight: material-route requires an action" >&2; exit 64; }
-    shift
-    run_guard hooks/material-route-guard.py "$@"
-    ;;
-  worktree-path)
-    shift
-    run_guard hooks/worktree-path-guard.sh "$@"
+  material-route|worktree-path)
+    # Compatibility aliases for callers predating hook-gate retirement.
+    :
     ;;
   worker-route)
     shift
@@ -494,13 +389,10 @@ case "$cmd" in
     name=$2
     cwd=${3:-$PWD}
     sid=${4:-${AGENT_DISPATCH_ATTEMPT_ID:-${CODEX_THREAD_ID:-codex}}}
-    guard_identity_hard_fail_if_worker "$sid"
     if ! "$ROOT/adapters/codex/bin/capability-map.sh" "$name" >/dev/null 2>/dev/null; then
       printf 'check=failed\nreason=unknown-capability\ncapability=%s\n' "$name"
       exit 64
     fi
-    set -- ; [ -n "${AGENT_ROUTE_FILE:-}" ] && set -- --route "$AGENT_ROUTE_FILE"
-    "$ROOT/hooks/spec-skill-gate.sh" --skill "$name" --cwd "$cwd" --session "$sid" "$@"
     ;;
   session-end)
     cwd=${2:-$PWD}
@@ -550,9 +442,9 @@ case "$cmd" in
     printf 'routing_contract=core/WORKFLOW.md\n'
     printf 'routing_action=read-workflow-and-select-codex-skill\n'
     printf 'capability_entrypoints=codex-native-skills\n'
-    printf 'enforced_hooks=structured-write-guards,core-first-guard,posttool-read-markers,posttool-design-check,session-memory\n'
-    printf 'hook_boundary=shell-read-write-targeted-detection-explicit-preflight-fallback\n'
-    printf 'shell_fallback=run-preflight-for-ambiguous-shell-io\n'
+    printf 'enforced_hooks=posttool-read-markers,posttool-design-check,session-memory\n'
+    printf 'hook_boundary=spec-read-and-design-observations\n'
+    printf 'shell_fallback=explicit-spec-read-or-design-observation\n'
     ;;
   token-budget)
     cwd=${2:-$PWD}
@@ -620,14 +512,14 @@ sandbox_surface=codex --sandbox <read-only|workspace-write|danger-full-access>
 config_surface=$CODEX_HOME/config.toml
 config_fragment=codex_setting/codex-config/approval-sandbox.toml
 claude_allowed_tools=unsupported
-guard_contract=preflight-write-hooks-and-explicit-tool-contracts
-structured_write_hooks=Write,Edit,MultiEdit,apply_patch,functions.apply_patch
+guard_contract=runtime-permissions-and-tool-contracts
+structured_write_hooks=none
 targeted_shell_hooks=Bash,Shell,functions.exec_command
-shell_read_write_hooks=targeted-detection
+shell_read_write_hooks=posttool-observations-only
 targeted_shell_write_patterns=redirect,tee,touch,cp,mv,rm,install,rsync,dd-of,sed-i
-shell_fallback=run-preflight-for-ambiguous-shell-io
-fallback=configure-codex-approval-sandbox-and-run-preflight-guards
-note=Do not port Claude allowedTools into Codex; use Codex approval/sandbox settings plus adapter preflight guards.
+shell_fallback=explicit-spec-read-or-design-observation
+fallback=runtime-approval-and-sandbox
+note=Do not port Claude allowedTools into Codex; use Codex approval/sandbox settings.
 EOF
     ;;
   tui-config)

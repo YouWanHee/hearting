@@ -40,12 +40,9 @@ capability contract. It is adapter-owned output, not a legacy compatibility Skil
 - Invocation semantics: Create an initial document strategy. The internal mode enum has six values: rebuttal, paper, review, report, proposal, and presentation. Autopilot-draft's form-first paper/presentation/doc modes convert doc intent from natural-language keywords (rebuttal response, review, report, proposal, or generic) into one of these direct sub-skill mode labels. For direct invocation, require the user to provide one of the six modes as the first argument. Adapters may expose this capability through native commands, skill files, prompt instructions, or explicit wrappers. The adapter must report unsupported runtime mechanics instead of silently treating another runtime's native file format as portable.
 
 
-## Required Guards
+## Workflow Evidence
 
-- Before edits: `adapters/opencode/bin/preflight.sh write <file> [session-id]`
 
-- Before spec-changing work: `adapters/opencode/bin/preflight.sh capability draft-strategy [cwd] [session-id]`
-- After actually reading a spec PRD: `adapters/opencode/bin/preflight.sh read <prd.md> [session-id]`
 
 Do not use legacy compatibility Skill files or non-native adapter Skill files
 as OpenCode-native source. Those files are compatibility/reference surfaces only.

@@ -15,9 +15,6 @@ const preflight = path.join(root, "adapters", "opencode", "bin", "preflight.sh")
 const summaryTrigger = path.join(root, "utilities", "session_summary_trigger.py")
 const herdrProjection = path.join(root, "tools", "fleet", "herdr_projection.py")
 const designPattern = /(designs?\/|\/design\/|spec\/design|preview\.html$|slides?\.html$|03_components|scaffolds\/)/
-// Capabilities that mutate the spec blueprint — must pass the prd.md read gate in a
-// spec-backed cwd. Mirrors Claude's PreToolUse[Skill] spec-skill-gate scope.
-const specGovernedCapabilities = new Set(["autopilot-code", "autopilot-spec"])
 const promptBySession = new Map()
 const turnBySession = new Map()
 // Prompt-lifecycle context that must stay visible for every model call of a
@@ -414,16 +411,6 @@ export const AgentHarnessGuards = async (ctx) => {
   "experimental.session.compacting": async (input, output) => {
     runWorkerState("compact-before", input || {})
   },
-  "command.execute.before": async (input, output) => {
-    // Spec read gate — deny autopilot-code/spec in a spec-backed cwd until prd.md
-    // was actually read this session. Mirrors Claude's PreToolUse[Skill] hard deny:
-    // preflight `capability` exits 2 when ungrounded, and runPreflight throws to
-    // abort the command before its prompt is expanded.
-    const name = (input.command || "").replace(/^\//, "")
-    if (specGovernedCapabilities.has(name)) {
-      runPreflight("capability", [name, baseDir(ctx), input.sessionID || "opencode-plugin"])
-    }
-  },
   "shell.env": async (input, output) => {
     // Sessionless compiles/binds are a real runtime state (undocumented
     // sessionID, only typed optional upstream), not a theoretical one — never
@@ -433,39 +420,13 @@ export const AgentHarnessGuards = async (ctx) => {
     if (!output.env) output.env = {}
     output.env.OPENCODE_SESSION_ID = sid
   },
-  "tool.execute.before": async (input, output) => {
-    const files = targetFiles(ctx, input.tool || {}, output.args || {})
-    for (const file of files) {
-      const sid = input.sessionID || "opencode-plugin"
-      const turn = turnBySession.get(sid) || ""
-      runPreflight("write", [file, sid, turn])
-    }
-    // Bash/shell blind spot (A2/A3): targetFiles() yields [] for the bash
-    // tool, so a recognized-but-unclassified mutation path would otherwise
-    // reach no guard. Pass every documented bash command, verbatim as one
-    // argv element, to exactly the two guards Claude wires on its Bash
-    // matchers — no JS command classifier, no `shell` alias.
-    const toolName = typeof input.tool === "string" ? input.tool : input.tool?.name || ""
-    const command = output.args && output.args.command
-    if (toolName === "bash" && typeof command === "string" && command) {
-      const cwd = baseDir(ctx)
-      const sid = input.sessionID || "opencode-plugin"
-      const turn = turnBySession.get(sid) || ""
-      runPreflight("worktree-path", ["--tool", "Bash", "--command", command, "--cwd", cwd, "--session", sid])
-      const materialArgs = ["check", "--tool", "Bash", "--command", command, "--cwd", cwd, "--session", sid]
-      if (turn) materialArgs.push("--turn", turn)
-      runPreflight("material-route", materialArgs)
-    }
-  },
   "tool.execute.after": async (input, output) => {
     const args = input.args || output.args || {}
     const files = targetFiles(ctx, input.tool || {}, args)
     for (const file of files) {
       if (isDesignHtml(file)) runPreflight("design", [file])
     }
-    // Read-grounding marker — record actual prd.md and core/*.md reads so the
-    // spec gate and core-first adapter guard can pass. Mirrors Claude's
-    // PostToolUse[Read] marker pair.
+    // Record actual spec reads for workflow and display evidence.
     // Non-blocking: a marker failure must never abort a successful read.
     const toolName = typeof input.tool === "string" ? input.tool : input.tool?.name || ""
     if (toolName === "read") {

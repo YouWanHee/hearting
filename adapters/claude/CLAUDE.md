@@ -29,10 +29,8 @@ another adapter.
 - Resolve the canonical artifact root with `utilities/artifact-root.sh`; linked worktrees write the primary checkout's `.agent_reports/`, and legacy `.claude_reports/` is only a fallback.
 - Use portable model roles, never vendor model names, in shared artifacts.
 - Repo-root `skills/` is the canonical Skill authoring tree; `tools/sync-entry-skill-layer.py` projects it into `adapters/claude/skills/` (generated — do not hand-edit the projection). Claude-native hooks, commands, settings, and kernel helper agents live under `adapters/claude/`; behavior personas live in the portable unit catalog `roles/units/`.
-- Before adapter edits, read the governing core contract and run the applicable write guard. Before spec changes, read the current PRD and use the spec capability gate.
-- Run deterministic guards directly when hook execution is unavailable or untrusted.
 - Task-specific detail is progressively disclosed through the selected Skill and adapter README/ADAPTATION docs; do not preload unrelated procedures.
-- Call the six runtime-root-sensitive utilities (`capability-route`, `artifact_producer`, `spec-transaction`, `dispatch-owner`, `dispatch-batch`, `dispatch-node`) through the installed `$AGENT_HOME`; a checkout-relative call to one of them is allowed only under dev activation (`AGENT_HOME` is that checkout itself), enforced by `hooks/runtime-root-guard.sh`.
+- Call the six runtime-root-sensitive utilities (`capability-route`, `artifact_producer`, `spec-transaction`, `dispatch-owner`, `dispatch-batch`, `dispatch-node`) through the installed `$AGENT_HOME`; a checkout-relative call to one of them is allowed only under dev activation (`AGENT_HOME` is that checkout itself).
 - Peer-session steering (`OPERATIONS §5.14`): watch a peer depth-0 session with the checked `utilities/peer-steward.py watch`; its armed line carries the same `parent_next=` directive a launch receipt does, and `join`/`status`/`rearm`/`ack` read the watcher's disk receipt. `wait` stays a bounded foreground surface and must never be backgrounded; `peer-steward.py start` defaults a launched child session to `bypass` permissions (`dispatch-defaults.yaml` `steward.child_permission_mode`, opt-out is `inherit`). `peer-steward.py prompt` reports `prompted=true` only after the submission was observed; `failed`/`queued`/`unverified` are typed verdicts (a `blocked` target or an open form is never typed into), and a dim `❯ …` line in an *empty* target input is Claude Code's prompt suggestion, not an unsubmitted prompt. Every pane prompt goes through that wrapper (never `herdr agent prompt`/`pane send-text` directly): its ledger row (`to.pane`, caller session, digest, verdict receipt) is the only attribution herdr's own log lacks.
 
 ## Routing and Execution
@@ -64,7 +62,7 @@ material work unless scope and route are already approved — deliver it
 through `AskUserQuestion` (five fields as the question body, options
 진행(권장)/수정/중단; plain-text card only as fallback) — and close material
 work with the five-field completion card in §0.5. Load full capability detail
-only in the acting owner or worker; spec work also requires the spec-read
+only in the acting owner or worker; spec work retains spec-read
 gate.
 
 For `autopilot-code`, `direct` is inline, `quick` is one registered dispatch-depth-1
@@ -110,7 +108,7 @@ a registry status word alone. `OPERATIONS §5.12` owns the mechanics.
 
 ## Runtime Lifecycle
 
-Claude hooks realize portable invariants for workflow signals, write/spec/core gates, memory, and design checks. Use explicit wrappers when a hook cannot be trusted. Main-session memory lifecycle does not run for workers. Session end never owns destructive worktree cleanup.
+Claude hooks realize portable invariants for workflow signals, spec-read observations, memory, and design checks. Main-session memory lifecycle does not run for workers. Session end never owns destructive worktree cleanup.
 
 Use `statusline.sh` only for runtime status. Harness detail remains available through the adapter tools and docs. Runtime-owned credentials, sessions, logs, caches, databases, and config stay outside this repo.
 

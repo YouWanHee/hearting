@@ -1,9 +1,8 @@
 """SD-123 A50-9: compare the Claude template's declared `defaultMode` against
 the user's `~/.claude/settings.json`.
 
-This is a read-only comparator, not an owned config surface: install never
-seeds or edits `~/.claude/settings.json` (seed-once — SD-66/DP-23 precedent),
-so there is no `ensure()` here, only `validate()`.
+The default-mode comparator is read-only. A narrow upgrade migration also
+removes retired harness hook registrations while preserving user settings.
 """
 
 from __future__ import annotations
@@ -64,3 +63,69 @@ def validate() -> dict:
             f"defaultMode={template_mode!r} ({template})"
         ),
     }
+
+
+# Exact retired harness entrypoints. Keep this migration list after source removal
+# so upgrades from an older copy-once settings file cannot execute missing hooks.
+_RETIRED_HOOKS = (
+    "material-route-guard.py", "artifact-guard.sh", "core-first-guard.sh",
+    "spec-skill-gate.sh", "worktree-path-guard.sh", "runtime-root-guard.sh",
+    "git-state-guard.sh", "core-read-marker.sh", "pretooluse-write-guard.py",
+)
+
+
+def retire_hook_registrations(path: Path, *, dry_run: bool = False) -> dict:
+    """Remove only retired Hearting commands, retaining user settings and hooks."""
+    import safe_fs
+
+    result = {"action": "retire-hook-registrations", "dest": str(path), "status": "unchanged"}
+    # Linked projections already track their source. Never rewrite through them.
+    if path.is_symlink() or not path.exists():
+        return result
+    try:
+        before = safe_fs.capture_state(path)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        changed = remove_retired_hooks(data)
+        if not changed:
+            return result
+        result["status"] = "planned" if dry_run else "updated"
+        if not dry_run:
+            auth = safe_fs.authority(path, owner="hearting-retired-hook-registrations",
+                                     allowed_paths=(path,), expected=before)
+            safe_fs.atomic_write_bytes(auth, (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode(), path.stat().st_mode & 0o777)
+        return result
+    except (OSError, ValueError, TypeError, AttributeError, safe_fs.SafetyError) as exc:
+        return {**result, "status": "blocked", "detail": str(exc)}
+
+
+def remove_retired_hooks(data: dict) -> bool:
+    """Filter known retired harness registrations in a settings object in place."""
+    import re
+    events = data.get("hooks", {})
+    changed = False
+    for event, groups in list(events.items()):
+        remaining = []
+        for group in groups:
+            kept = []
+            for hook in group.get("hooks", []):
+                command = hook.get("command", "")
+                # Match owned path spellings, not a user script with the same basename.
+                owned = any(token in command for token in (
+                    '/.claude/hooks/', '/adapters/codex/hooks/',
+                    '$AGENT_HOME/hooks/', '${AGENT_HOME}/hooks/',
+                    '$root/adapters/codex/hooks/run-hook.sh',
+                ))
+                retired = any(re.search(r'(?<![\w.-])' + re.escape(name) + r'(?![\w.-])', command)
+                              for name in _RETIRED_HOOKS)
+                retired = retired or ('worker-state-compact.py' in command and 'guard-write' in command)
+                if owned and retired:
+                    changed = True
+                else:
+                    kept.append(hook)
+            if kept:
+                remaining.append({**group, "hooks": kept})
+        if remaining:
+            events[event] = remaining
+        elif groups:
+            del events[event]
+    return changed

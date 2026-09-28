@@ -116,12 +116,9 @@ capability contract. It is adapter-owned output, not a legacy compatibility Skil
 - Portable meaning: {meaning}
 {portable_contract}
 
-## Required Guards
+## Workflow Evidence
 
-- Before edits: `adapters/opencode/bin/preflight.sh write <file> [session-id]`
 {route_guard}
-- Before spec-changing work: `adapters/opencode/bin/preflight.sh capability {identifier} [cwd] [session-id]`
-- After actually reading a spec PRD: `adapters/opencode/bin/preflight.sh read <prd.md> [session-id]`
 
 Do not use legacy compatibility Skill files or non-native adapter Skill files
 as OpenCode-native source. Those files are compatibility/reference surfaces only.

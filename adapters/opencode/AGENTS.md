@@ -33,7 +33,8 @@ adapter.
 - Capabilities come from `capabilities/`. OpenCode-native generated Skills, commands, agents, and plugins live under `adapters/opencode/` and project through `opencode_setting/opencode-skills`, `opencode_setting/opencode-commands`, `opencode_setting/opencode-agents`, and `opencode_setting/opencode-plugins`.
 - Validate native discovery with `OPENCODE_DISABLE_CLAUDE_CODE_SKILLS=1`; Claude compatibility autoload must not mask missing OpenCode output.
 - Run `preflight.sh capability-info <capability>` and `preflight.sh mode-info <family/mode>`; obey named `tool_contract`, `tool_contract_check`, `runtime_surface`, and `fallback`.
-- Before edits run `preflight.sh write <file> [session-id]`. Read portable core first for `adapters/**`; mark core/spec reads with `preflight.sh read <file> [session-id]`; run `preflight.sh capability <name> [cwd] [session-id]` for spec changes.
+- Read the governing core contract before adapter changes. Spec reads may be
+  recorded with `preflight.sh read <prd.md>` for workflow evidence.
 - Material source work needs route participation, not a card alone: before a source write or a commit containing source changes, hold a current cwd-bound route record (`preflight.sh material-route check`), at least `autopilot-code direct` for code. Hotfixes do not bypass it.
 - Use explicit guards when the OpenCode plugin is unavailable or untrusted. Never port Claude allowedTools, settings MCP, command, agent, or hook formats.
 

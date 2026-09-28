@@ -40,12 +40,9 @@ capability contract. It is adapter-owned output, not a legacy compatibility Skil
 - Invocation semantics: Run `utilities/cairn-artifact-read.sh` with exactly one JSON object on stdin. The command emits exactly one JSON value on stdout and diagnostics only on stderr. Set `CAIRN_ROOT` to the checkout containing W3a commit `1fa0d99e4b714b5ce305f78c8f7c7773255e8f87`; set `CAIRN_READ_TOKEN` only when the read service requires it. The request is validated by W3a's `validateReadOptions`, then passed to W3a's `ArtifactProjectionClient` and `HttpReadTransport` without local query, cursor, or authorization interpretation. The token is never printed. This capability is intentionally narrower than browse/search fallback paths. It has no write, ingest, apply, activate, deactivate, migrate, or namespace switch operation and never accepts a database URL. Missing or mismatched W3a sources fail closed using W3a's imported contract errors.
 
 
-## Required Guards
+## Workflow Evidence
 
-- Before edits: `adapters/opencode/bin/preflight.sh write <file> [session-id]`
 
-- Before spec-changing work: `adapters/opencode/bin/preflight.sh capability artifact-projection-read [cwd] [session-id]`
-- After actually reading a spec PRD: `adapters/opencode/bin/preflight.sh read <prd.md> [session-id]`
 
 Do not use legacy compatibility Skill files or non-native adapter Skill files
 as OpenCode-native source. Those files are compatibility/reference surfaces only.

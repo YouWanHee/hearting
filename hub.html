@@ -854,13 +854,6 @@
       "hard_block": false
     },
     {
-      "slug": "hook__core-read-marker__PostToolUse",
-      "name": "core-read-marker",
-      "mono": "core-read-marker",
-      "event": "PostToolUse",
-      "hard_block": false
-    },
-    {
       "slug": "hook__design-postwrite__PostToolUse",
       "name": "design-postwrite",
       "mono": "design-postwrite",
@@ -878,13 +871,6 @@
       "slug": "hook__fleet-interaction-state.py__PostToolUse",
       "name": "fleet-interaction-state.py clear",
       "mono": "fleet-interaction-state.py",
-      "event": "PostToolUse",
-      "hard_block": false
-    },
-    {
-      "slug": "hook__material-route-guard.py__PostToolUse",
-      "name": "material-route-guard.py",
-      "mono": "material-route-guard.py",
       "event": "PostToolUse",
       "hard_block": false
     },
@@ -931,20 +917,6 @@
       "hard_block": false
     },
     {
-      "slug": "hook__artifact-guard__PreToolUse",
-      "name": "artifact-guard",
-      "mono": "artifact-guard",
-      "event": "PreToolUse",
-      "hard_block": true
-    },
-    {
-      "slug": "hook__core-first-guard__PreToolUse",
-      "name": "core-first-guard",
-      "mono": "core-first-guard",
-      "event": "PreToolUse",
-      "hard_block": true
-    },
-    {
       "slug": "hook__fleet-interaction-state.py__PreToolUse",
       "name": "fleet-interaction-state.py set",
       "mono": "fleet-interaction-state.py",
@@ -952,39 +924,11 @@
       "hard_block": false
     },
     {
-      "slug": "hook__git-state-guard__PreToolUse",
-      "name": "git-state-guard",
-      "mono": "git-state-guard",
-      "event": "PreToolUse",
-      "hard_block": true
-    },
-    {
       "slug": "hook__herdr-agent-state__PreToolUse",
       "name": "herdr-agent-state working",
       "mono": "herdr-agent-state",
       "event": "PreToolUse",
       "hard_block": false
-    },
-    {
-      "slug": "hook__material-route-guard.py__PreToolUse",
-      "name": "material-route-guard.py",
-      "mono": "material-route-guard.py",
-      "event": "PreToolUse",
-      "hard_block": false
-    },
-    {
-      "slug": "hook__runtime-root-guard__PreToolUse",
-      "name": "runtime-root-guard",
-      "mono": "runtime-root-guard",
-      "event": "PreToolUse",
-      "hard_block": false
-    },
-    {
-      "slug": "hook__spec-skill-gate__PreToolUse",
-      "name": "spec-skill-gate",
-      "mono": "spec-skill-gate",
-      "event": "PreToolUse",
-      "hard_block": true
     },
     {
       "slug": "hook__stage-dispatch-reminder__PreToolUse",
@@ -997,20 +941,6 @@
       "slug": "hook__subagent-model-default__PreToolUse",
       "name": "subagent-model-default",
       "mono": "subagent-model-default",
-      "event": "PreToolUse",
-      "hard_block": false
-    },
-    {
-      "slug": "hook__worker-state-compact.py__PreToolUse",
-      "name": "worker-state-compact.py guard-write",
-      "mono": "worker-state-compact.py",
-      "event": "PreToolUse",
-      "hard_block": false
-    },
-    {
-      "slug": "hook__worktree-path-guard__PreToolUse",
-      "name": "worktree-path-guard",
-      "mono": "worktree-path-guard",
       "event": "PreToolUse",
       "hard_block": false
     },
@@ -1032,13 +962,6 @@
       "slug": "hook__herdr-agent-state__SessionEnd",
       "name": "herdr-agent-state release",
       "mono": "herdr-agent-state",
-      "event": "SessionEnd",
-      "hard_block": false
-    },
-    {
-      "slug": "hook__material-route-guard.py__SessionEnd",
-      "name": "material-route-guard.py",
-      "mono": "material-route-guard.py",
       "event": "SessionEnd",
       "hard_block": false
     },
@@ -1219,10 +1142,7 @@
         "skill__autopilot-code",
         "skill__autopilot-lab"
       ],
-      "gates": [
-        "artifact-guard:after-research",
-        "artifact-guard:after-spec"
-      ]
+      "gates": []
     },
     {
       "id": "library",
@@ -1233,10 +1153,7 @@
         "skill__autopilot-spec",
         "skill__autopilot-code"
       ],
-      "gates": [
-        "artifact-guard:after-analyze",
-        "artifact-guard:after-spec"
-      ]
+      "gates": []
     },
     {
       "id": "document",
@@ -1249,9 +1166,7 @@
         "skill__autopilot-refine",
         "skill__autopilot-apply"
       ],
-      "gates": [
-        "artifact-guard:after-research"
-      ]
+      "gates": []
     },
     {
       "id": "app",
@@ -1263,9 +1178,7 @@
         "skill__autopilot-code",
         "skill__autopilot-ship"
       ],
-      "gates": [
-        "artifact-guard:after-spec"
-      ]
+      "gates": []
     }
   ]
 }

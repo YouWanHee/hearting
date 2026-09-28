@@ -34,14 +34,8 @@ Do not generate a language-companion pair by default. Preserve the target artifa
 
 ## Prepare Versioning
 
-Before dispatching the `research/research-survey` unit, prepare every existing
-canonical or companion file that the refinement will change through the active
-route's write preflight. `artifact-guard.sh` calls
-`utilities/artifact-snapshot.py prepare`, preserves exact pre-change bytes, and
-reuses one version receipt across the artifact. If hook coverage is unavailable,
-invoke the helper explicitly with `--artifact-root`, `--target`, `--route`,
-`--route-id`, and `--node` before editing and require exit 0. Never scan version
-numbers or use raw `mkdir`/`cp` as the snapshot mechanism.
+Version snapshots are managed by `utilities/artifact-snapshot.py` for the
+active refinement. Existing version receipts remain the source of snapshot paths.
 
 Pass the helper-reported version, convention, snapshot paths, canonical path,
 and existing companion paths to the `research/research-survey` unit. The helper

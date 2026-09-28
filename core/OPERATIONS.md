@@ -83,7 +83,7 @@ echo "state: branch=$br head=$head base=$def dirty=$(git status --porcelain 2>/d
 ```
 
 - **STOP and conflict-resolution authority:** halt ordinary edits and commits during merge, rebase, cherry-pick, or detached HEAD. Never auto-abort or force-checkout. The user has pre-approved **additive-only union** conflict resolution: inspect and record the exact base/ours/theirs index stages and affected paths, prove that both sides only add independent content, and preserve both additions. Lists, table rows, and imports qualify only when no existing content is modified or deleted and no key, definition, alias, ordering, or meaning conflicts. Identical additions appear once. A mixed, overlapping, ambiguous, or unproven conflict still requires an explicit user decision; neither “keep ours/theirs” nor a generic union merge driver proves eligibility.
-  After that recorded review establishes this pre-approval, or after an explicit user request to resolve the particular conflict, the acting agent may create `$GITDIR/CLAUDE_MERGE_EDIT_OK` for that operation and must remove it when the resolution ends or is abandoned. The marker is an assertion of existing authority, not a way to grant new authority. It does not authorize unrelated work, automatic abort, forced checkout, or a detached-HEAD repair. `hooks/git-state-guard.sh` keeps its existing marker mechanism. The material-route guard permits only Edit/Write of the exact currently unmerged regular file in the same worktree while the approved operation is active; this recovery check runs before importing potentially conflicted harness source. Core-first and artifact guards remain in force. Normal route/dispatch lineage checks and final commit checks remain unchanged: report a blocked completion separately rather than treating this editing exception as a general bypass.
+  After that recorded review establishes this pre-approval, or after an explicit user request to resolve the particular conflict, the acting agent may create `$GITDIR/CLAUDE_MERGE_EDIT_OK` for that operation and must remove it when the resolution ends or is abandoned. The marker is an assertion of existing authority, not a way to grant new authority. It does not authorize unrelated work, automatic abort, forced checkout, or a detached-HEAD repair.
 - **WARN:** report one line for the same branch in another worktree, upstream movement, or pre-existing session-independent dirt, then decide how to proceed.
 - **DONE-BRANCH:** after a branch is merged into base it is finished. At a new work cycle, a non-base branch that is zero commits ahead and is not a just-created branch for this task must be replaced with `git fetch origin && git switch -c <slug> origin/$def`. This applies to direct edits too; uncommitted work on a dead branch is already drift.
 - **Periodic recheck:** remember the entry `head`. Before each commit, stop if `head` changed underneath the session or a new `MERGE_HEAD` appeared. Non-git and single-checkout paths pass harmlessly.
@@ -122,7 +122,7 @@ fence and cannot hide session-root drift.
 
 Each SD item below keeps the rule an agent acts on; its full decision record is verbatim in `core/ADAPTATION.md §8`.
 
-Adapter and projection changes follow the same core-first order as other portable work: establish and read the governing `core/` contract before adapter edits. Read and write markers enforce that gate but do not replace review. A generated projection's determinism covers its file mode, not only its bytes: a generator that writes plugin JSON (`hooks.json`, `plugin.json`, marketplace manifests) fixes the mode to `0644` on every write regardless of process umask, and its `--check` counterpart fails a foreign mode as a stale projection alongside a content mismatch (S-5d, owner-supervisor-liveness — a reproducible regenerate cycle flips `hooks.json` away from `0644`; the first mutating syscall was not isolated, so the fix enforces the invariant rather than only diagnosing it).
+Adapter and projection changes follow the same core-first order as other portable work: establish and read the governing `core/` contract before adapter edits. A generated projection's determinism covers its file mode, not only its bytes: a generator that writes plugin JSON (`hooks.json`, `plugin.json`, marketplace manifests) fixes the mode to `0644` on every write regardless of process umask, and its `--check` counterpart fails a foreign mode as a stale projection alongside a content mismatch (S-5d, owner-supervisor-liveness — a reproducible regenerate cycle flips `hooks.json` away from `0644`; the first mutating syscall was not isolated, so the fix enforces the invariant rather than only diagnosing it).
 
 Actual edits, tests, and QA run in isolated worktrees while the main session
 handles triage, dispatch, harvest, and reporting. Portable `dispatch_depth`
@@ -348,14 +348,13 @@ A legacy hash collision is diagnostic
 `attempt-identity-parent-generation-conflict`, never launch evidence.
 
 1. **Overlap triage:** if a new request is likely to touch the same files as an active job, queue it behind that job on the same branch. Otherwise it may run in parallel.
-2. **Execution and naming:** create the worktree with `git worktree add <path> -b <slug> origin/<base>` using §5.9 base selection. The sole canonical path is the sibling directory `<repo>-wt/<slug>`, such as `Foo-wt/<slug>` for `Foo`; do not invent `<repo>_worktrees/`. `worktree-path-guard` hard-enforces this naming for `git worktree add`, while `WORKTREE_GUARD_BYPASS=1`, non-add subcommands, and non-git contexts fail open.
+2. **Execution and naming:** create the worktree with `git worktree add <path> -b <slug> origin/<base>` using §5.9 base selection. The sole canonical path is the sibling directory `<repo>-wt/<slug>`, such as `Foo-wt/<slug>` for `Foo`; do not invent `<repo>_worktrees/`.
    - **Source-only worktree:** immediately resolve the primary checkout's
      canonical artifact root. Dispatch wrappers inject it as
      `AGENT_ARTIFACT_ROOT`, include it in prompt/registry metadata, and open
      only that external path through runtime-native scoped access (Claude/Codex
      `--add-dir`; OpenCode exact `permission.external_directory` rule).
-     Writes to the task worktree's `.agent_reports/**` or
-     `.claude_reports/**` snapshot fail closed.
+     Task output belongs in that canonical root.
      Only the topology-sealed `autopilot-lab` `publish` node (`lab-publish`)
      resolves the create-once Hearting `REPORT_BUNDLE_ROOT` setting and projects
      that exact directory as an external writable root. Setup, media, report,

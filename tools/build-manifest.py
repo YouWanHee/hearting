@@ -71,7 +71,7 @@ GENERATED_FROM = (
 # hard_block allowlist = PreToolUse guards only (consumer attempt1 §2.4 / Claude adapter hook settings
 # PreToolUse). herdr-agent-state is also registered on PreToolUse but is a state-marker,
 # NOT a guard -> hard_block stays false for it.
-GUARDS = {"artifact-guard", "git-state-guard", "spec-skill-gate", "core-first-guard"}
+GUARDS = set()
 
 # Loop-to-layer constant, based on loops/README.md membership and consumer §2.5.
 # Study remains L4 per the OPS-view divergence recorded in consumer §23.12 V1. The layer table
@@ -87,18 +87,18 @@ TRACKS = [
     {"id": "research-lab", "label": "Research & experiments", "color_token": "--cat-1",
      "steps": ["skill__analyze-project", "skill__autopilot-research", "skill__autopilot-spec",
                "skill__autopilot-code", "skill__autopilot-lab"],
-     "gates": ["artifact-guard:after-research", "artifact-guard:after-spec"]},
+     "gates": []},
     {"id": "library", "label": "Libraries & CLI", "color_token": "--cat-5",
      "steps": ["skill__analyze-project", "skill__autopilot-spec", "skill__autopilot-code"],
-     "gates": ["artifact-guard:after-analyze", "artifact-guard:after-spec"]},
+     "gates": []},
     {"id": "document", "label": "Documents", "color_token": "--cat-2",
      "steps": ["skill__analyze-project", "skill__autopilot-research", "skill__autopilot-draft",
                "skill__autopilot-refine", "skill__autopilot-apply"],
-     "gates": ["artifact-guard:after-research"]},
+     "gates": []},
     {"id": "app", "label": "Apps", "color_token": "--cat-3",
      "steps": ["skill__autopilot-spec", "skill__autopilot-design", "skill__autopilot-code",
                "skill__autopilot-ship"],
-     "gates": ["artifact-guard:after-spec"]},
+     "gates": []},
 ]
 
 

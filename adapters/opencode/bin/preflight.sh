@@ -17,9 +17,7 @@ is_harness_source_root() {
   [ -f "$canonical_candidate/adapters/opencode/bin/preflight.sh" ] && [ -x "$canonical_candidate/adapters/opencode/bin/preflight.sh" ] || return 1
   [ -f "$canonical_candidate/adapters/opencode/utilities/agent-home.sh" ] && [ -x "$canonical_candidate/adapters/opencode/utilities/agent-home.sh" ] || return 1
   [ -f "$canonical_candidate/utilities/artifact-root.sh" ] || return 1; [ -d "$canonical_candidate/roles" ] && [ -d "$canonical_candidate/capabilities" ] || return 1
-  expected_hook=$canonical_candidate/hooks/core-first-guard.sh; [ -f "$expected_hook" ] && [ -x "$expected_hook" ] || return 1
-  if canonical_hook=$(canonical_existing_path "$expected_hook" 2>/dev/null); then :; else return 1; fi
-  [ "$canonical_hook" = "$expected_hook" ] || return 1; printf '%s\n' "$canonical_candidate"
+  printf '%s\n' "$canonical_candidate"
 }
 typed_root_refusal() { printf 'check=failed\nreason=harness-source-root-unresolved\n' >&2; exit 69; }
 if script_parent=$(dirname "$0") && SCRIPT_DIR=$(CDPATH= cd -P "$script_parent" 2>/dev/null && pwd -P); then :; else typed_root_refusal; fi
@@ -49,27 +47,6 @@ PY
 }
 if ROOT=$(resolve_source_root 2>/dev/null); then :; else typed_root_refusal; fi
 
-checked_guard_target() {
-  relative_guard=$1
-  case "$relative_guard" in
-    hooks/git-state-guard.sh|hooks/core-first-guard.sh|hooks/artifact-guard.sh|hooks/material-route-guard.py|hooks/worktree-path-guard.sh) :;;
-    *) printf 'check=failed\nreason=guard-target-unresolved\n' >&2; exit 69;;
-  esac
-  expected=$ROOT/$relative_guard
-  if [ ! -f "$expected" ] || [ ! -x "$expected" ]; then printf 'check=failed\nreason=guard-target-unresolved\n' >&2; exit 69; fi
-  if target=$(canonical_existing_path "$expected" 2>/dev/null); then :; else printf 'check=failed\nreason=guard-target-unresolved\n' >&2; exit 69; fi
-  name=${relative_guard#hooks/}; expected=$ROOT/hooks/$name
-  if [ "$target" != "$expected" ]; then printf 'check=failed\nreason=guard-target-self-reference\n' >&2; exit 69; fi
-  printf '%s\n' "$target"
-}
-run_guard() {
-  relative_guard=$1; shift; target=$(checked_guard_target "$relative_guard")
-  case "$relative_guard" in
-    hooks/material-route-guard.py) exec python3 "$target" --agent-home "$AGENT_ROOT" "$@";;
-    hooks/worktree-path-guard.sh) exec "$target" "$@";;
-    *) "$target" "$@";;
-  esac
-}
 
 agent_home() {
   if [ -n "${AGENT_HOME:-}" ] && [ -f "$AGENT_HOME/core/CORE.md" ]; then
@@ -296,41 +273,17 @@ case "$cmd" in
     [ "$#" -ge 2 ] && [ "$#" -le 4 ] || { echo "opencode preflight: write expects <file> [session-id] [turn-id]" >&2; exit 64; }
     file=$2
     case "$file" in -*) echo "opencode preflight: write file must be absolute or ./-prefixed" >&2; exit 64;; esac
-    sid=${3:-opencode}
-    turn=${4:-}
-    if [ "${AGENT_DISPATCH_STAGE_AUTHORITY:-1}" = "0" ]; then
-      [ -n "${AGENT_WORKER_STATE_LEDGER:-}" ] && [ -n "${AGENT_DISPATCH_ATTEMPT_ID:-}" ] || {
-        echo "worker sub-session ledger binding missing" >&2; exit 65;
-      }
-      python3 "$ROOT/utilities/worker-state-ledger.py" guard-edit \
-        --path "$AGENT_WORKER_STATE_LEDGER" \
-        --attempt-id "$AGENT_DISPATCH_ATTEMPT_ID" --file "$file"
-    fi
-    run_guard hooks/git-state-guard.sh --file "$file"
-    run_guard hooks/core-first-guard.sh --file "$file" --session "$sid"
-    run_guard hooks/artifact-guard.sh --file "$file" --session "$sid"
-    material_tool=Write
-    [ -n "${AGENT_REVIEW_OUTPUT:-}" ] && material_tool=ArtifactWrite
-    if [ -n "$turn" ]; then
-      "$0" material-route check --tool "$material_tool" --file "$file" --cwd "$(dirname "$file")" --session "$sid" --turn "$turn"
-    else
-      "$0" material-route check --tool "$material_tool" --file "$file" --cwd "$(dirname "$file")" --session "$sid"
-    fi
+    # Compatibility command: write gates have been retired.
+
     ;;
-  material-route)
-    [ "$#" -ge 2 ] || { echo "opencode preflight: material-route requires an action" >&2; exit 64; }
-    shift
-    run_guard hooks/material-route-guard.py "$@"
-    ;;
-  worktree-path)
-    shift
-    run_guard hooks/worktree-path-guard.sh "$@"
+  material-route|worktree-path)
+    # Compatibility aliases for callers predating hook-gate retirement.
+    :
     ;;
   read)
     [ "$#" -ge 2 ] || { echo "opencode preflight: read requires a file path" >&2; exit 64; }
     file=$2
     sid=${3:-opencode}
-    "$ROOT/hooks/core-read-marker.sh" --file "$file" --session "$sid" || exit $?
     "$ROOT/hooks/spec-read-marker.sh" --file "$file" --session "$sid" || exit $?
     ;;
   capability|skill)
@@ -338,7 +291,6 @@ case "$cmd" in
     name=$2
     cwd=${3:-$PWD}
     sid=${4:-opencode}
-    "$ROOT/hooks/spec-skill-gate.sh" --skill "$name" --cwd "$cwd" --session "$sid"
     ;;
   prompt-signal)
     cwd=${2:-$PWD}
@@ -358,7 +310,7 @@ case "$cmd" in
     printf 'routing_contract=core/WORKFLOW.md\n'
     printf 'routing_action=read-workflow-and-select-opencode-skill-or-command\n'
     printf 'capability_entrypoints=opencode-native-skills-commands\n'
-    printf 'enforced_hooks=plugin-write-guards,core-first-guard,plugin-command-spec-gate,plugin-read-markers,plugin-design-check,session-memory,prompt-recall,session-idle-sync\n'
+    printf 'enforced_hooks=plugin-read-markers,plugin-design-check,session-memory,prompt-recall,session-idle-sync\n'
     printf 'hook_boundary=plugin-tool-command-event-bridges\n'
     ;;
   ui-info)
@@ -429,9 +381,9 @@ permission_surface=opencode permission config with allow/ask/deny per tool and p
 plugin_surface=permission.ask and tool.execute hooks
 config_surface=$HOME/.config/opencode/opencode.json
 claude_allowed_tools=unsupported
-guard_contract=preflight-write-plugin-and-explicit-tool-contracts
-fallback=configure-opencode-permissions-and-run-preflight-guards
-note=Do not port Claude allowedTools into OpenCode; use OpenCode permission config plus adapter preflight/plugin guards.
+guard_contract=runtime-permissions-and-tool-contracts
+fallback=runtime-permissions
+note=Do not port Claude allowedTools into OpenCode; use OpenCode permission config.
 EOF
     ;;
   headless)

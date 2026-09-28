@@ -1358,7 +1358,8 @@ def _merge_claude_settings(
     hooks = data.setdefault("hooks", {})
     if not isinstance(hooks, dict):
         raise ActivationError(f"Claude settings hooks is not an object: {config}")
-    changed = False
+    from claude_settings_config import remove_retired_hooks
+    changed = remove_retired_hooks(data)
     added = 0
     previous_hooks = {}
     if previous:

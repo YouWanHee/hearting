@@ -47,18 +47,10 @@ SKILLS = ADAPTER / "skills"
 AGENTS = ADAPTER / "agents"
 HOOKS_SOURCE = ROOT / "hooks"
 UTILITIES_SOURCE = ROOT / "utilities"
-UTIL_BUNDLE = ["agent-home.sh", "artifact-root.sh", "artifact-snapshot.py"]
+UTIL_BUNDLE = ["agent-home.sh", "artifact-root.sh"]
 
-# INST-OPEN-1 adopt set (_internal/hooks_inventory.md): self-contained +
-# fail-open guards, plus (cycle 3, 2026-07-13) the spec-pipeline trio —
-# adopted (cycle 3, ${CLAUDE_PLUGIN_DATA} rebasing via hooks.json
-# AGENT_HOME env-prefix; see plan 2026-07-13_harness-installer-hooks).
-# memory/statusline/dispatch families remain excluded (CLI-install-owned
-# state, not self-contained under a plugin cache).
+# Non-blocking spec read observations and sync nudges.
 HOOK_ADOPT = [
-    "git-state-guard.sh",
-    "artifact-guard.sh",
-    "spec-skill-gate.sh",
     "spec-read-marker.sh",
     "spec-sync-nudge.sh",
 ]
@@ -67,27 +59,18 @@ HOOK_ADOPT = [
 # (`$SCRIPT_DIR/<helper>`). Copied alongside their owning hook so the plugin
 # cache is self-contained, but never registered as their own hooks.json event
 # — they have no independent PreToolUse/PostToolUse binding of their own.
-HOOK_HELPER_FILES = ["artifact_write_targets.py"]
+HOOK_HELPER_FILES = []
 
 # event/matcher/shell taken verbatim from adapters/claude/settings.json registration.
 _HOOK_EVENTS = {
-    "git-state-guard.sh": "PreToolUse",
-    "artifact-guard.sh": "PreToolUse",
-    "spec-skill-gate.sh": "PreToolUse",
     "spec-read-marker.sh": "PostToolUse",
     "spec-sync-nudge.sh": "PostToolUse",
 }
 _HOOK_MATCHERS = {
-    "git-state-guard.sh": "Edit|Write|MultiEdit|NotebookEdit",
-    "artifact-guard.sh": "Edit|Write|MultiEdit|Bash",
-    "spec-skill-gate.sh": "Skill",
     "spec-read-marker.sh": "Read",
     "spec-sync-nudge.sh": "Edit|Write|MultiEdit",
 }
 _HOOK_SHELLS = {
-    "git-state-guard.sh": "sh",
-    "artifact-guard.sh": "bash",
-    "spec-skill-gate.sh": "sh",
     "spec-read-marker.sh": "sh",
     "spec-sync-nudge.sh": "bash",
 }
@@ -96,7 +79,6 @@ _HOOK_SHELLS = {
 # agent-home.sh fallback — canonical hook bodies stay unmodified (they
 # already honor `AGENT_HOME` as a top-priority env override).
 _HOOK_DATA_HOME = {
-    "spec-skill-gate.sh",
     "spec-read-marker.sh",
     "spec-sync-nudge.sh",
 }

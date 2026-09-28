@@ -65,9 +65,8 @@ project Claude Skill, Agent, command, hook, or statusline files into Codex.
 |---|---|
 | capability | Read `capabilities/README.md` for meaning; run `adapters/codex/bin/preflight.sh capability-info <capability>` to confirm Codex realization; use `adapters/codex/skills/<capability>/SKILL.md` as Codex-native guidance |
 | native skill/plugin surface | Skills are materialized under `adapters/codex/skills/`; the installable plugin projection is materialized under `adapters/codex/plugins/hearting-codex`. Command-like capability entrypoints use these native Skills/plugin surfaces and are verified with Codex discoverability (`codex debug prompt-input`) |
-| native hook surface | `adapters/codex/hooks/hooks.json` registers Codex `SessionStart` lifecycle prep, synchronous `SessionEnd`, a silent `Stop` boundary, `UserPromptSubmit` bounded capsule candidates plus prompt signals and turn nudges, privacy-minimal `PermissionRequest` approval-wait publication, targeted `PreToolUse` material/write guards, `PostToolUse` approval-wait release, spec/core read markers, design HTML checks, and worker-only `PreCompact`/`PostCompact` ledger flush/re-anchor. Interaction bridges keep stdout empty and never own approve/deny; Stop has no completion authority or wildcard parent park |
-| stage-session capacity | All registered wrappers share the portable sub-session axes. Codex supplies the phase brief plus a persistent ledger anchor in the generated prompt and environment; `preflight write` enforces the three-edit cadence and fixed-file fence. Sub-sessions cannot publish a stage marker. One chain command registers the exact set and synchronously joins it inside the App Server-supervised owner, so that owner returns once after the chain. |
-| shell I/O hook boundary | Structured write tools (`Write`, `Edit`, `MultiEdit`, `apply_patch`, `functions.apply_patch`) and structured `Read` are guarded. Shell/Bash/`functions.exec_command` gets targeted detection for obvious write redirects, common mutation commands (`tee`, `touch`, `cp`, `mv`, `rm`, `install`, `rsync`), `dd of=...`, `sed -i`, direct `spec/prd.md` / `core/*.md` reads, and design HTML save paths; target-ambiguous shell I/O still requires explicit `preflight.sh write`, `preflight.sh read`, or `preflight.sh design` before touching guarded paths |
+| native hook surface | `adapters/codex/hooks/hooks.json` registers Codex `SessionStart` lifecycle prep, synchronous `SessionEnd`, a silent `Stop` boundary, `UserPromptSubmit` bounded capsule candidates plus prompt signals and turn nudges, privacy-minimal `PermissionRequest` approval-wait publication, `PostToolUse` approval-wait release, spec read markers, design HTML checks, and worker-only `PreCompact`/`PostCompact` ledger flush/re-anchor. Interaction bridges keep stdout empty and never own approve/deny; Stop has no completion authority or wildcard parent park |
+| stage-session capacity | All registered wrappers share the portable sub-session axes. Codex supplies the phase brief plus a persistent ledger anchor in the generated prompt and environment; write hooks no longer enforce ledger cadence or file fences. Sub-sessions cannot publish a stage marker. One chain command registers the exact set and synchronously joins it inside the App Server-supervised owner, so that owner returns once after the chain. |
 | role profile | Use `roles/README.md` for meaning; Codex custom agents are materialized under `adapters/codex/agents/*.toml`; `adapters/codex/bin/preflight.sh role <portable-role|role-profile|pipeline-stage>` resolves both concrete model roles and pipeline profiles such as `planning`, `implementation`, `verification`, and `report` |
 | role mode | Run `adapters/codex/bin/preflight.sh mode-info <family/mode>` before using a `roles/modes/` fragment; use the reported `native_mode_path` under `adapters/codex/modes/`; portable modes can be used directly, tool-contract modes require equivalent tools, unsupported modes report `fallback=reference-only` when no Codex-native runtime surface exists |
 | native mode surface | Mode guides are generated under `adapters/codex/modes/` from `roles/modes/`; design modes additionally require the Codex visual-harness tool contract before claiming rendered visual completion |
@@ -89,8 +88,6 @@ project Claude Skill, Agent, command, hook, or statusline files into Codex.
 | launch publication settle | When an App Server owner yields the exact runtime-wait sentinel during the atomic register-to-`launch_started=1` publication window, the Codex supervisor briefly rereads only undelivered exact-parent rows outside registry locks. A fully fenced batch parks without a model retry or continuation charge; genuinely register-only rows retain the bounded `registration-required` correction. The supervisor never replays the dispatch itself |
 | autopilot routing | Codex exposes `autopilot-*` as native Skills/plugin entries and can select matching Skills from descriptions, but the adapter does not emulate Claude slash-command routing. `prompt-signal` emits the portable routing contract and Codex-native entrypoint surface; for spec-backed work, rely on spec-read/capability gates plus the relevant Skill or explicit dispatch wrapper |
 | subagent delegation | Codex supports native subagent workflows, but they are explicit or main-dispatched. Run `adapters/codex/bin/preflight.sh subagent-info --check` to verify the `multi_agent` runtime feature and projected custom agents before claiming delegation parity. Use prompt-directed subagents or `preflight.sh dispatch`; do not treat UI/status state as an automatic delegation trigger |
-| artifact-order gate | `core/HOOKS.md` defines the invariant; run `adapters/codex/bin/preflight.sh write <file> [session-id] [turn-id]` before writes |
-| core-first gate | `core/HOOKS.md` defines marker/check semantics; Codex `PostToolUse` Read hook records actual `core/*.md` reads and `PreToolUse` write guard hard-denies ungrounded `adapters/**` edits. Explicit fallback: `adapters/codex/bin/preflight.sh read <core-doc.md> [session-id]` after core reads |
 
 For an unmanaged Codex session, the equivalent persistent opt-in is
 `codex features enable default_mode_request_user_input`, or
@@ -124,8 +121,6 @@ Registry writes and harvest rewrites are serialized with a `.lock` file; `_kerne
 | design post-write verification | `core/HOOKS.md` defines the invariant; run `adapters/codex/bin/preflight.sh design <file>` after design HTML writes |
 | design visual harness | Tool-contract check: `adapters/codex/bin/preflight.sh visual-harness <file.html>` runs the adapter-owned render/screenshot/console wrapper. Inspect the reported screenshot before claiming visual completion. Do not project Claude Design MCP files into Codex |
 | design scaffold assets | Use `<agent-home>/scaffolds/` for reusable HTML scaffold assets. `codex_setting/scaffolds` points at the Codex-owned projection under `adapters/codex/scaffolds/`, not Claude runtime paths |
-| spec read gate | `core/HOOKS.md` defines marker/check semantics; Codex `PostToolUse` Read hook records actual `spec/prd.md` reads and `PreToolUse` write guard hard-denies an ungrounded write to a spec-changing artifact (`plans/*` or `spec/` blueprint) — Codex's interception equivalent of Claude's `PreToolUse[Skill]` gate (Codex has no skill event). Explicit fallbacks: `adapters/codex/bin/preflight.sh read <prd.md> [session-id]`, `adapters/codex/bin/preflight.sh capability <name> [cwd] [session-id]` |
-| git safety gate | `core/HOOKS.md` defines the invariant; included in `adapters/codex/bin/preflight.sh write <file> [session-id]` |
 | memory injection | Codex `SessionStart` hook bridge keeps memory injection off by default because `SessionStart` can run on startup, resume, clear, and compact; set `CODEX_SESSION_MEMORY_INJECT=1` to emit `adapters/codex/bin/preflight.sh memory [cwd]` through `hookSpecificOutput.additionalContext`, or run it manually when needed |
 | memory sync | Codex `SessionEnd` runs `adapters/codex/bin/preflight.sh session-end [cwd] [session-id]`, which performs `mem sync --json` (D-78: no automatic distiller). Local sync is the default. The adapter passes the user's `MEM_SYNC_REMOTE` and deprecated `MEM_DUMP_PUSH` environment unchanged and never forces remote exchange; the alias selects immutable v2 exchange with a warning and never pushes `dump.jsonl`. A sync exit status is reported plainly. Codex `Stop` never starts this lifecycle; its only side effect is clearing the exact Fleet interaction marker |
 | memory candidate exposure and deeper retrieval | Codex `UserPromptSubmit` runs the fail-open capsule-only candidate bridge and adds at most six headline-and-ID candidates within 2,400 UTF-8 bytes. The bridge publishes a same-turn receipt; `PreToolUse` requires it before main-session material mutation. The model ignores unrelated candidates and reads relevant records in full. Use `preflight.sh recall <query> [cwd] [session-id]` for deeper search or `recall-gate` as the hook-failure recovery path. No prompt classifier or body injection is attached |
@@ -284,29 +279,7 @@ entrypoints are represented by Codex-native Skills and the installable
 
 ## Native Hook Projection
 
-`adapters/codex/hooks/` contains a Codex-native `hooks.json`, a validated
-`run-hook.sh` launcher, and concrete adapter-owned hook bridges. The
-`SessionEnd` bridge runs `mem sync --json` (D-78: no automatic distiller). It leaves remote synchronization
-off unless the user enables `MEM_SYNC_REMOTE=1` (or the deprecated alias), and
-preserves the typed sync result. `Stop` silently clears only an
-exact Fleet interaction marker; it neither schedules lifecycle work nor
-inspects the registry, waits for a child, or emits `decision=block`.
-The `UserPromptSubmit` bridge extracts the runtime's prompt field for a bounded
-capsule-index lookup and publishes the same-turn recall-opportunity receipt. It
-does not inspect bodies or decide candidate relevance. The
-`PermissionRequest` publishes only allowlisted Fleet interaction metadata
-(`approval`, source, timestamp, exact thread id), emits nothing, and leaves
-approval and sandbox decisions to Codex. A wildcard `PostToolUse` side-effect
-bridge clears that exact marker; prompt, Stop, and SessionEnd are bounded
-abandonment backstops. The targeted `PreToolUse` bridge has no completion scheduling
-or parent-park responsibility. Qualified `functions.apply_patch` payloads and
-other writes continue through
-artifact-order, git-state, and core-first checks in
-`adapters/codex/bin/preflight.sh write`. The `PostToolUse` Read bridge records
-actual `spec/prd.md` and `core/*.md` reads through `adapters/codex/bin/preflight.sh read`. The
-`PostToolUse` design bridge runs after write/edit/multiedit/patch tools,
-including qualified `functions.apply_patch` payloads, and delegates
-design HTML saves to `adapters/codex/bin/preflight.sh design`.
+Write-denying hook gates are retired; no write preflight or core-read marker is required.
 
 Fleet also reads a pending decision only from structured rollout
 `response_item` records whose `function_call(name=request_user_input, call_id)`
@@ -314,14 +287,6 @@ has no later matching `function_call_output`. It never searches transcript
 prose. This shape is fixture-verified but remains unverified in live Codex
 traffic; App Server `tool/requestUserInput` is experimental, so runtime support
 is reported as `unknown` until an observed rollout proves the projection.
-
-Shell/Bash/`functions.exec_command` I/O has targeted hook coverage for obvious
-write redirects, common mutation commands (`tee`, `touch`, `cp`, `mv`, `rm`,
-`install`, `rsync`), `dd of=...`, `sed -i`, direct `spec/prd.md` / `core/*.md` reads, and
-design HTML save paths. Treat target-ambiguous
-shell reads/writes to guarded paths as an explicit tool contract: run
-`preflight.sh write`, `preflight.sh read`, or
-`preflight.sh design` manually before the shell command.
 
 Expose it through `codex_setting/codex-hooks`, not through a plain `hooks/`
 projection:
@@ -419,14 +384,7 @@ Claude Code-specific files remain valid as implementation references, not as Cod
 When porting a behavior, copy the underlying invariant from `CORE.md`, `WORKFLOW.md`, `CONVENTIONS.md`, or `OPERATIONS.md`; then map it to Codex's tool, approval, and session model.
 # Material-route boundary
 
-The Codex hook bridge delegates material source checks to the portable
-material-route guard. `functions.apply_patch` is parsed into portable `Write`
-targets, while source-bearing shell commits are checked from the exact command.
-Binding requires one successful trusted local route compile and canonical route
-verification; interactive session markers and registered-worker route
-environment proof remain separate. `SessionEnd` clears markers, never `Stop`.
-`preflight.sh material-route` is the explicit checked fallback for unavailable,
-disabled, or untrusted hooks and does not claim hosted-tool parity.
+Hook write gates are retired. Spec-read observations, design checks, memory and session signals remain available.
 
 Resource-runner startup requires a sealed route, exact detached resource node,
 and smoke attestation before launch state or a child process exists. Installing
@@ -465,3 +423,5 @@ workspace/tab/pane, creates and verifies one visible pane with Herdr's native
 split API, and calls `herdr agent start` there. It has no tmux fallback. If a
 post-split check or start fails, it reports the created pane for operator
 cleanup. Herdr identifiers are optional provenance, never transition authority.
+
+Session and prompt bridges retain `hookSpecificOutput.additionalContext` for optional memory and lifecycle context.

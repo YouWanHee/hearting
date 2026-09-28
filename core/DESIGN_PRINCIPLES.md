@@ -71,7 +71,6 @@ Establish the shared contract in core, then derive adapters. A runtime-specific 
 - Adapters map runtimes; core owns meaning. Adapter-first edits cause behavior to diverge across Claude, Codex, and OpenCode and erase intent during the next port.
 - Claude, Codex, and OpenCode are sibling realizations. No adapter may serve as another adapter's semantic source or completion proxy; an unverified sibling keeps the shared change partial.
 - Read the relevant core document, update the contract or confirm that it already covers the behavior, then edit bootstrap, hook, or projection files.
-- `core-read-marker` and `core-first-guard` mechanically require a session read marker before `adapters/**` edits. They verify the read, while this principle and drills verify that core actually led the change.
 - The motivating incident was a 2026-07-03 adapter recall edit made before the core contract and then reverted.
 
 ---

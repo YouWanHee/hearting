@@ -201,5 +201,53 @@ class ClaudeManagedSettingsTests(unittest.TestCase):
             self.assertEqual(conflicts, [])
 
 
+class RetiredHookMigrationTests(unittest.TestCase):
+    def test_upgrade_prunes_every_retired_hook_and_preserves_user_settings(self):
+        import claude_settings_config as settings
+        from drivers import claude, codex
+        for runtime, driver, filename in (("claude", claude, "settings.json"), ("codex", codex, "hooks.json")):
+            with self.subTest(runtime=runtime), tempfile.TemporaryDirectory() as tmp:
+                home = Path(tmp)
+                if runtime == "claude":
+                    commands = [f'sh "$HOME/.claude/hooks/{name}"' for name in settings._RETIRED_HOOKS]
+                    commands.append('"$HOME/.claude/hooks/worker-state-compact.py" guard-write')
+                else:
+                    commands = ['sh "$root/adapters/codex/hooks/run-hook.sh" pretooluse-write-guard.py']
+                user = {"type": "command", "command": "sh /user/hooks/git-state-guard.sh"}
+                observer = {"type": "command", "command": 'sh "$HOME/.claude/hooks/spec-read-marker.sh"'}
+                data = {"permissions": {"defaultMode": "user-choice"}, "custom": [1, 2], "hooks": {
+                    "PreToolUse": [{"matcher": "*", "timeout": 99, "hooks": [
+                        *({"type": "command", "command": c} for c in commands), user]}],
+                    "PostToolUse": [{"hooks": [observer]}]}}
+                path = home / filename
+                path.write_text(json.dumps(data))
+                entries = [] if runtime == "claude" else [{"action": "symlink", "source": str(home / "source-hooks.json"), "dest": str(path)}]
+                with mock.patch.object(driver.paths, "runtime_home", return_value=home), mock.patch.object(driver.projector, "plan", return_value={runtime: entries}):
+                    before = path.read_bytes()
+                    driver.install(dry_run=True)
+                    self.assertEqual(path.read_bytes(), before)
+                    result = driver.install()
+                    self.assertFalse(result["blocked"], result)
+                    updated = json.loads(path.read_text())
+                    self.assertEqual(updated["hooks"]["PreToolUse"][0]["hooks"], [user])
+                    self.assertEqual(updated["hooks"]["PostToolUse"], data["hooks"]["PostToolUse"])
+                    self.assertEqual(updated["permissions"], data["permissions"])
+                    self.assertEqual(updated["custom"], data["custom"])
+                    once = path.read_bytes()
+                    driver.install()
+                    self.assertEqual(path.read_bytes(), once)
+
+    def test_activation_without_old_manifest_removes_retired_hook(self):
+        helper = ClaudeManagedSettingsTests()
+        with tempfile.TemporaryDirectory() as tmp:
+            source, home = helper._fixture(tmp)
+            user_hook = {"type": "command", "command": "echo user"}
+            helper._write_user_settings(home, {"hooks": {"PreToolUse": [{"hooks": [
+                {"type": "command", "command": 'sh "$HOME/.claude/hooks/artifact-guard.sh"'}, user_hook]}]}})
+            with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(home)}):
+                runtime_activation._merge_claude_settings(source, None)
+            self.assertEqual(helper._read_user_settings(home)["hooks"]["PreToolUse"][0]["hooks"], [user_hook])
+
+
 if __name__ == "__main__":
     unittest.main()

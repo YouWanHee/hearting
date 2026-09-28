@@ -57,14 +57,14 @@ class ReadMarkerStatus(unittest.TestCase):
         return subprocess.run(cmd, input=data, env=env, text=True, capture_output=True)
 
     def test_cli_readonly_failure_is_nonzero(self):
-        for kind in ('spec', 'core'):
+        for kind in ('spec',):
             with self.subTest(kind=kind):
                 result = self.run_marker(kind, readonly=True)
                 self.assertIn('Read-only file system', result.stderr)
                 self.assertNotEqual(result.returncode, 0, result.stderr)
 
     def test_hook_readonly_failure_is_nonblocking_and_diagnosed(self):
-        for kind in ('spec', 'core'):
+        for kind in ('spec',):
             with self.subTest(kind=kind):
                 result = self.run_marker(kind, hook=True, readonly=True)
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -72,7 +72,7 @@ class ReadMarkerStatus(unittest.TestCase):
                 self.assertEqual(result.stdout, '')
 
     def test_existing_directory_does_not_hide_marker_file_failure(self):
-        for kind in ('spec', 'core'):
+        for kind in ('spec',):
             (self.home / f'.{kind}-grounding').mkdir()
             for hook in (False, True):
                 with self.subTest(kind=kind, hook=hook):
@@ -100,7 +100,7 @@ class ReadMarkerStatus(unittest.TestCase):
         self.assertFalse((self.home/'unrelated').exists())
 
     def test_success_records_real_read_and_unrelated_read_is_noop(self):
-        for kind, source in (('spec', self.spec), ('core', self.core)):
+        for kind, source in (('spec', self.spec),):
             result = self.run_marker(kind)
             self.assertEqual(result.returncode, 0, result.stderr)
             markers = list((self.home / f'.{kind}-grounding').iterdir())
@@ -111,10 +111,10 @@ class ReadMarkerStatus(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(list((self.home/'.spec-grounding').iterdir())), 1)
 
-    def test_preflights_preserve_core_and_spec_cli_failures(self):
+    def test_preflights_preserve_spec_cli_failures(self):
         env = dict(self.env, AGENT_HOME=str(ROOT))
         for adapter in ('codex', 'opencode'):
-            for file in (self.core, self.spec):
+            for file in (self.spec,):
                 with self.subTest(adapter=adapter, file=file.name):
                     cmd = self.readonly([str(ROOT/f'adapters/{adapter}/bin/preflight.sh'),
                                          'read', str(file), 'marker-fixture'])
@@ -125,11 +125,11 @@ class ReadMarkerStatus(unittest.TestCase):
     def test_claude_delegation_keeps_cli_and_hook_status_distinct(self):
         for hook in (False, True):
             with self.subTest(hook=hook):
-                result = self.run_marker('core', readonly=True, wrapper=True, hook=hook)
+                result = self.run_marker('spec', readonly=True, wrapper=True, hook=hook)
                 self.assertIn('Read-only file system', result.stderr)
                 if hook:
                     self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertIn('core-read-marker: marker-write-failed', result.stderr)
+                    self.assertIn('spec-read-marker: marker-write-failed', result.stderr)
                 else:
                     self.assertNotEqual(result.returncode, 0, result.stderr)
 

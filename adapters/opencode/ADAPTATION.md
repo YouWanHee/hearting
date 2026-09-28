@@ -59,7 +59,7 @@ documentation.
 | Skills (`.opencode/skill/<name>/SKILL.md` or `.opencode/skills/<name>/SKILL.md`) | yes | `adapters/opencode/skills/<name>/SKILL.md` generated from `capabilities/` |
 | External skill autoload (`~/.claude/skills/<name>/SKILL.md`, `~/.agents/skills/<name>/SKILL.md`) | yes (compat) | not relied on; adapter must generate its own skills, not depend on Claude skill autoload |
 | Agents (`.opencode/agent/<name>.md` or `.opencode/agents/<name>.md`) | yes | `adapters/opencode/agents/<name>/<name>.md` generated from `roles/README.md` role profiles, plus an explicit `EXTRA_AGENTS` out-of-catalog path in `adapters/opencode/bin/sync-native-agents.py` (e.g. `memory-scout`, sourced from `core/MEMORY.md` §7.4 rather than a role-catalog row), with `mode: subagent` |
-| Plugin hooks (JS/TS: `tool.execute.before`, `tool.execute.after`, `event`, `config`, `chat.message`, `command.execute.before`, `permission.ask`, `shell.env`, ...) | yes | `adapters/opencode/plugins/hearting-guards.js` bridges write/edit/patch tool execution to the shared write guard, `command.execute.before` to the spec-skill gate, and `read` post-execution to the spec read marker |
+| Plugin hooks (JS/TS: `tool.execute.before`, `tool.execute.after`, `event`, `config`, `chat.message`, `command.execute.before`, `permission.ask`, `shell.env`, ...) | yes | `adapters/opencode/plugins/hearting-guards.js` records spec reads and design saves after tool execution |
 | Permission model (`permission` config: `allow`/`ask`/`deny` per tool, per-agent override) | yes | adapter documents recommended permission rules; not a harness guard replacement |
 | Permission contract wrapper | yes | `adapters/opencode/bin/preflight.sh permissions` reports native permission surfaces and rejects Claude `allowedTools` as a portable contract |
 | MCP servers (`mcp` config: local/remote) | yes | `adapters/opencode/bin/preflight.sh mcp` reports native MCP surfaces and rejects Claude `settings.json` MCP payloads as a portable contract |
@@ -158,29 +158,7 @@ with a bounded timeout.
 
 ## Native Plugin Hook Surface
 
-OpenCode exposes JS/TS plugin hooks that can enforce part of the harness guard
-contract. This adapter materializes a concrete OpenCode plugin at
-`adapters/opencode/plugins/hearting-guards.js`. It uses `chat.message` plus
-`experimental.chat.system.transform` to inject prompt-time workflow, memory,
-bounded capsule candidates, and briefing context through
-`adapters/opencode/bin/preflight.sh` without copying Claude hook JSON. The
-prompt is retained only from `chat.message` until that transform and is then
-discarded. It uses `tool.execute.before` to detect
-write/edit/patch targets and calls `adapters/opencode/bin/preflight.sh write
-<file> <session-id>`, which runs the portable artifact-order, git-state,
-core-first adapter edit, and memory-write guards. It also uses `tool.execute.after` to route saved design
-HTML files through `adapters/opencode/bin/preflight.sh design <file>` as a
-post-write console-check alert path.
-
-It also enforces the spec read gate, mirroring Claude's
-`PreToolUse[Skill]` + `PostToolUse[Read]` pair. `command.execute.before` calls
-`adapters/opencode/bin/preflight.sh capability <name> <cwd> <session-id>` for
-`autopilot-code` / `autopilot-spec` and throws (aborting the command before its
-prompt expands) when the cwd is spec-backed and `prd.md` was not actually read
-this session. `tool.execute.after` on a `read` of `.../spec/prd.md` calls
-`adapters/opencode/bin/preflight.sh read <file> <session-id>` to drop the
-grounding marker that lets the spec and core-first gates pass — non-blocking, so a marker failure
-never aborts a successful read.
+Write-denying hook gates are retired; no write preflight or core-read marker is required.
 
 When changing the plugin:
 
@@ -190,8 +168,8 @@ When changing the plugin:
 4. Keep shell preflight wrappers as fallback so the adapter remains usable
    when plugins are disabled.
 
-The plugin covers prompt lifecycle context, write guard enforcement, spec
-read-gate enforcement, design post-write console checks, and memory sync
+The plugin covers prompt lifecycle context, spec
+read observations, design post-write console checks, and memory sync
 (the `event` hook fires `session-end` on `session.idle`, D-78: no automatic
 distiller).
 
@@ -204,15 +182,12 @@ injections are auto-applied. The table records the current state.
 
 | Claude `settings.json` hook | OpenCode realization | Parity |
 |---|---|---|
-| `PreToolUse` git-state guard (deny) | plugin `tool.execute.before` → `preflight write` (throws) | full — auto enforced |
-| `PreToolUse` artifact-order guard (deny) | plugin `tool.execute.before` → `preflight write` (throws) | full — auto enforced |
 | `PreToolUse[Skill]` spec-skill gate (deny) | plugin `command.execute.before` → `preflight capability` (throws) | full — auto enforced (command path) |
 | `PostToolUse[Read]` spec-read marker | plugin `tool.execute.after` on `read` → `preflight read` | full — auto enforced |
 | `PostToolUse` design post-write | plugin `tool.execute.after` → `preflight design` | full — auto enforced |
 | `SessionStart`-equivalent memory inject | plugin `experimental.chat.system.transform` → `memory`, computed once per session and re-emitted on every model call | full — auto injected, persists for the whole session |
 | `UserPromptSubmit` capsule candidates / routing-contract signal / briefing | plugin `chat.message` → prompt/turn capture, then `experimental.chat.system.transform` → `candidates` / `prompt-signal` / `briefing`, computed once per user turn and re-emitted on every model call of that turn | full — candidate output is active current-project/global capsule-only, maximum six / 2,400 UTF-8 bytes; the prompt is held in plugin memory only (never written) and dropped at `session.deleted` |
 | `SessionEnd` memory sync | plugin `event` (`session.idle`) → detached `preflight session-end` → `mem sync --json` | full — auto applied (D-78: no automatic distiller) |
-| `PreToolUse` material-route guard (deny) | plugin `tool.execute.before` → `preflight write` (structured), plugin `tool.execute.before` on `bash` → `preflight material-route check --tool Bash` (verbatim command), `preflight route` binds after a checked compile | structured: full for a resolvable target — a recognized mutation tool whose target does not resolve (`normalizeFile()` returns `""`, `targetFiles()` yields `[]`) still reaches no guard (see Codex's stricter `pretooluse-write-guard.py:291-293`); bash: full for documented commands. Automatic final-session clear is **not** claimed — `session.idle` is per-turn and `session.deleted` means deletion, not exit. |
 | `PreToolUse[Bash]` worktree-path guard (deny) | plugin `tool.execute.before` on `bash` → `preflight worktree-path`, `preflight worktree-path` explicit fallback | portable `git worktree add` path check only — the built-in-worktree-tool deny is Claude-native and has **no** OpenCode counterpart (`core/HOOKS.md:45`) |
 
 Two items remain that cannot reach byte-for-byte Claude parity; they are
@@ -282,22 +257,18 @@ Harness-specific status signals need OpenCode-native realization:
 |---|---|
 | routing-contract signal | OpenCode plugin system transform runs `preflight.sh prompt-signal`; explicit preflight remains fallback when plugins are unavailable or untrusted |
 | artifact/notes/git-risk snapshot | explicit `preflight.sh status`; keep OpenCode native UI/config for model/context/session fields |
-| artifact root detection | `preflight.sh write` and shared artifact-root helper |
+| artifact root detection | shared `utilities/artifact-root.sh` helper |
 | headless/autopilot/background jobs | `preflight.sh headless` / `dispatch` / `liveness` / `harvest` provide the tool-contract path over `opencode run`; `preflight.sh status` surfaces in-flight jobs as `headless_open_jobs` / `headless_open_slugs` from the dispatch registry. A native graphical display remains optional polish |
 | sibling `-wt/<slug>` dispatch detection | preserve the worktree naming invariant; choose an OpenCode-native display surface later |
 | pipeline stage nudges | preflight/AGENTS instructions first; UI only when OpenCode exposes a suitable surface |
 | oncall/note/study/drill/runtime-watch loop nudges | `preflight.sh briefing` plus `preflight.sh loop-info <loop>` for loop-specific support/fallback status |
-| merge/rebase/merged-branch risk | `preflight.sh write` git safety checks; `preflight.sh status` reports `git_operation` (merge/rebase/cherry-pick) and `git_branch_done` (non-default branch fully merged = DONE-BRANCH hazard). A native graphical warning remains optional polish |
+| merge/rebase/merged-branch risk | `preflight.sh status` reports git operation, branch and worktree risks without blocking writes. |
 
 ## Required OpenCode Mappings
 
 | Portable invariant | OpenCode adaptation requirement |
 |---|---|
-| artifact order | Run `adapters/opencode/bin/preflight.sh write <file> [session-id]` before writes |
-| git state safety | Run `adapters/opencode/bin/preflight.sh write <file> [session-id]` before edits |
-| memory write guard | Run `adapters/opencode/bin/preflight.sh write <file> [session-id]` before writes |
 | design post-write verification | Run `adapters/opencode/bin/preflight.sh design <file>` after design HTML writes |
-| spec read gate | OpenCode plugin enforces this automatically: `command.execute.before` runs `adapters/opencode/bin/preflight.sh capability <name> [cwd] [session-id]` (throws to abort `autopilot-code`/`autopilot-spec` when ungrounded) and `tool.execute.after` on a `read` of `prd.md` runs `adapters/opencode/bin/preflight.sh read <prd.md> [session-id]`. Run both manually when plugins are unavailable |
 | routing-contract signal | OpenCode plugin system transform runs `adapters/opencode/bin/preflight.sh prompt-signal [cwd] [session-id]`; no statusline assumption |
 | memory inject | OpenCode plugin system transform runs `adapters/opencode/bin/preflight.sh memory [cwd]` once per session and re-emits that cached block on every model call; run it manually when plugins are unavailable |
 | memory candidate exposure / recall | The plugin captures the current user prompt in memory, runs `preflight.sh candidates <prompt> <cwd> <session-id> [turn-id]` once for that turn, and re-emits the result on every model call of the turn; the prompt is never written to disk and is dropped at `session.deleted`. It injects only bounded active capsule headlines/IDs and publishes the same-turn receipt; it does not inspect bodies or classify relevance. The model reads relevant records in full. Explicit `recall` provides deeper search and `recall-gate` recovers an unavailable probe |
@@ -311,12 +282,7 @@ Harness-specific status signals need OpenCode-native realization:
 | headless dispatch | Run `adapters/opencode/bin/preflight.sh headless --check <worktree>` before OpenCode `run` dispatch; it checks the worktree, command availability, and installed runtime projection without launching. The dispatch surface accepts `--model-profile deep|balanced-deep|light|mini` independently of optional behavioral `--model-role`. A route-bound profile resolves through `config/models.conf`; `_kernel/owner` rejects a stage `worker_mode` and may be profile-only, caller model/variant replacement is denied, and substantive registered `mini` is denied. Because OpenCode has no verified distinct effort variant, every profile separation is carried by the model: `balanced-deep` has its own configured tier, distinct from the deep tier, while `balanced` and `mini` collapse into `light`, so the row reports `profile_granularity=collapsed-mini` with `collapsed-balanced-to-light`, and `runtime-default` is represented by omitting `--variant`. Registry/Fleet keeps capability mode, worker mode, role, profile, tier, and granularity separate. `--start` reruns the same projection check; liveness, harvest, merge, and cleanup boundaries remain unchanged |
 | QA policy mapping | `adapters/opencode/bin/preflight.sh qa-policy <level> [code|research|doc|general]` maps the shared QA assurance budget to OpenCode role checks and fallback reporting. `stage_graph_selector=explicit-graph-or-intensity-default` preserves the core split: an explicit graph takes precedence over the default recipe; QA only scales selected checks |
 | role modes | Read `roles/MODES.md`, then run `adapters/opencode/bin/preflight.sh mode-info <family/mode>`; treat adapter-coupled modes as unsupported unless wrappers exist, obey `fallback=reference-only`, and satisfy any named `tool_contract` / `tool_contract_check` before claiming tool-contract modes |
-| hook invariants | Read `core/HOOKS.md`; OpenCode plugin hooks cover prompt lifecycle context, write/edit/patch guards, the spec read gate (command/read), and design HTML post-write checks, while explicit preflight wrappers remain fallback for disabled/untrusted plugins and events not yet covered |
 | capabilities | Read `capabilities/README.md`, then run `adapters/opencode/bin/preflight.sh capability-info <capability>`; do not assume Claude Skill invocation |
-| material route participation | Structured plugin writes transit `preflight write`, which now ends with the material-route check, **for a resolvable target** — a recognized mutation tool whose target does not resolve still reaches no guard (`hearting-guards.js` `normalizeFile()`/`targetFiles()`; see Codex's stricter `adapters/codex/hooks/pretooluse-write-guard.py:291-293`). Documented `bash` commands are passed verbatim to `preflight.sh material-route check --tool Bash`. A successful checked `preflight.sh route --capability ...` compile binds using the `shell.env`-supplied `OPENCODE_SESSION_ID`; explicit `preflight.sh material-route check|bind|clear` remains the fallback. **Automatic final-session clear is not claimed** — `session.idle` is per-turn and `session.deleted` means deletion, not exit |
-| material route caller trust (disclosure) | Direct `preflight.sh material-route bind` verifies route schema/hash, cwd, source commit, and registry/unit digests, but does **not** authenticate the calling process; any local caller able to present a valid route record can create the session marker. Same trust shape as Codex's PostToolUse auto-bind (`hooks/material-route-guard.py:801-812`) — disclosed, not defended against |
-| worktree path isolation | Documented `bash` commands are passed unchanged to `hooks/worktree-path-guard.sh` through the plugin's `tool.execute.before`; `adapters/opencode/bin/preflight.sh worktree-path` is the explicit fallback. The built-in-worktree-tool deny is Claude-native and has **no** OpenCode counterpart (`core/HOOKS.md:45`, `core/ADAPTATION_INVENTORY.md:64`) |
-| residual bash-write gap (mandatory) | Tranche A covers material commits and worktree add on the bash surface. Other bash-mediated writes do not transit `preflight write`, so the artifact and git-state/core-first guards do not run on them. **This matches the Claude Bash surface**, which also wires only worktree-path and material-route; it is a gap only against Codex's broader shell heuristic (`adapters/codex/hooks/pretooluse-write-guard.py:140-230,245-246`). The portable classifiers themselves have known limits that define "denied" vs "should have been denied" here: a quoted `git worktree add` string inside another command, a `-wt/` decoy token anywhere in the command line, and inert `echo git commit` text can all be matched or missed by the classifiers, independent of this tranche |
 | runtime qualifiers (unverified/unsupported) | The installed OpenCode version is unpinned. `shell.env`'s `sessionID` is **undocumented in the published plugin docs** and only typed `sessionID?` in the upstream `dev` source, so its runtime availability is unverified; the sessionless-compile path is the designed fallback. The `shell` tool alias, stable `tool.execute.after` exit metadata, and plugin coverage of `task`-spawned subagent tool calls remain unverified. The returned-hook-map shape this work targets is the current/legacy OpenCode plugin API; an OpenCode V2 plugin API with a different beta registration shape is a distinct, unverified migration risk, alongside the existing "installed OpenCode version is unpinned" qualifier |
 
 ## Model Mapping

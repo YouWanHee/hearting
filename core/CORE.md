@@ -152,7 +152,7 @@ never orders a move or a delete.
 | `reviews/` | review support material | `C-INT` |
 | `shards/` | parallel-leg support material | `C-INT` |
 | `.runtime/` | artifact-root-scoped runtime state (route lifecycle records, producer cutover/cycle records, stage-session ledgers under `.runtime/stage-sessions/<route_id>/`, and similar); the only bucket name for this, legacy `_runtime/` is read-only | `C-RT` |
-| `.core-grounding/` | core-document read-guard state | `C-RT` |
+| `.core-grounding/` | legacy core-read marker state (no longer written) | `C-RT` |
 | `.spec-grounding/` | spec read-guard state | `C-RT` |
 | `routes/`, `_routes/` | legacy route-record locations outside `.runtime/` | `C-LRT` |
 | `notes/`, `proposals/`, `spec-research-alternative/`, `research-alternative/` | present containers whose owner is not declared — recognized, not adopted | `C-LEG(undeclared-container)` |
@@ -444,12 +444,9 @@ Each adapter should provide:
 - a way to expose portable capabilities (`capabilities/`) and portable role profiles (`roles/`);
 - a concrete mapping from portable model roles (`fast reviewer`, `deep reviewer`, `external adversary`, etc.) to runtime-specific models, tools, or prompt profiles;
 - a projection from the neutral `<agent-home>` repository into the runtime home using symlinks, generated files, or runtime-native registration;
-- hooks or checks for artifact order, git safety, and memory writes;
-- hooks or checks that prevent adapter edits before the relevant core contract
-  has actually been read in the current session;
+- non-blocking hooks for memory, workflow signals, and session records;
 - compatibility with both `.agent_reports/` and `.claude_reports/` until legacy projects are migrated;
-- canonical artifact-root propagation plus a fail-closed guard against writes
-  to linked-worktree artifact snapshots;
+- canonical artifact-root propagation for linked-worktree output;
 - a documented realization of `<agent-notes-root>` and `<worklog-board-app>` if
   that runtime reads or updates cross-project worklog state.
 

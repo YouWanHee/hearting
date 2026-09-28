@@ -40,12 +40,9 @@ capability contract. It is adapter-owned output, not a legacy compatibility Skil
 - Invocation semantics: Run graduated verification after `code-execute` or on demand to verify code correctness. Intensity-derived rigor scales final verification and test-adequacy review; it does not force a separate parallel QA loop by itself. The capability resolves a plan path, changed-file list, or test scope, runs the applicable test levels, stops on the first failing level, and records durable evidence before reporting a verdict. When the verification target includes a report spectrogram, the graduated levels include the fail-closed figure semantic verifier against its manifest and report. Missing exact 48 kHz full-band metadata, range-compatible claims, shared-scale evidence, or a hash-current visual review is a failed level. Adapters may expose this capability through native commands, skill files, prompt instructions, or explicit wrappers. The adapter must report unsupported runtime mechanics instead of silently treating another runtime's native file format as portable.
 
 
-## Required Guards
+## Workflow Evidence
 
-- Before edits: `adapters/opencode/bin/preflight.sh write <file> [session-id]`
 
-- Before spec-changing work: `adapters/opencode/bin/preflight.sh capability code-test [cwd] [session-id]`
-- After actually reading a spec PRD: `adapters/opencode/bin/preflight.sh read <prd.md> [session-id]`
 
 Do not use legacy compatibility Skill files or non-native adapter Skill files
 as OpenCode-native source. Those files are compatibility/reference surfaces only.

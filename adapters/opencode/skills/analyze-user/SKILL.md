@@ -38,12 +38,9 @@ capability contract. It is adapter-owned output, not a legacy compatibility Skil
 - Portable meaning: Create or update a cross-project user-preference profile from coding, writing, and analysis patterns.
 
 
-## Required Guards
+## Workflow Evidence
 
-- Before edits: `adapters/opencode/bin/preflight.sh write <file> [session-id]`
 - Before durable capability output: `adapters/opencode/bin/preflight.sh route --capability analyze-user <complete compile arguments>`
-- Before spec-changing work: `adapters/opencode/bin/preflight.sh capability analyze-user [cwd] [session-id]`
-- After actually reading a spec PRD: `adapters/opencode/bin/preflight.sh read <prd.md> [session-id]`
 
 Do not use legacy compatibility Skill files or non-native adapter Skill files
 as OpenCode-native source. Those files are compatibility/reference surfaces only.

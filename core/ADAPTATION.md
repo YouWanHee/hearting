@@ -180,8 +180,6 @@ Portable hook semantics are named by invariant:
 |---|---|
 | artifact order | New artifacts must be created in the allowed dependency order |
 | git state safety | Do not edit during merge/rebase/cherry-pick/detached unsafe states |
-| spec read gate | Spec-backed work must read the current blueprint before changing code/spec |
-| core first gate | Adapter edits must be grounded in an actual current-session read of the relevant core contract |
 | memory recall/inject | Inject relevant memory and expose bounded recall candidates |
 | worklog state signal | Surface the configured notes root and board app status without moving or mutating data |
 | peer-session steering ledger | Write one append-only, body-free `peer_message_v1` record per outbound and inbound cross-session message (`OPERATIONS §5.14`) |

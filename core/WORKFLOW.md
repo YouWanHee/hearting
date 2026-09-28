@@ -10,7 +10,7 @@
 
 This is the single routing contract for spec-backed projects that contain `.agent_reports/spec`, with legacy `.claude_reports` compatibility. Read it on demand when the adapter's status or reminder surface indicates routing is due; hooks expose runtime state but do not replace or eagerly inject this contract.
 
-Every task first passes through the work-nature map in §2. Direct work, runtime plugins, and built-in Skills are used only where this router places them. Adapter and runtime projection work also remains core-first: establish the portable invariant in `core/`, read its governing document, then change adapter or generated output. A read marker enforces order but is not a substitute for review.
+Every task first passes through the work-nature map in §2. Direct work, runtime plugins, and built-in Skills are used only where this router places them. Adapter and runtime projection work also remains core-first: establish the portable invariant in `core/`, read its governing document, then change adapter or generated output.
 
 After the §0.1 read-only exemption and §0.2 semantic precedence, a request that
 clearly matches one manifest `entry-router` positive trigger and none of that
@@ -101,9 +101,9 @@ its existing legacy artifact root and memory-linked artifacts were read.
 
 - **No code without a spec:** if a code request has no `spec/`, run `autopilot-spec` first. A one-off throwaway is the only exception; repeated work graduates to a spec.
 - **No spec without prior evidence:** if neither `research/` nor `analysis_project/` grounds the spec, run `autopilot-research` or `analyze-project` first. Enforce this more strongly in unfamiliar domains and for new intent.
-- **Mechanical enforcement:** `artifact-guard.sh` fail-closes writes outside the canonical artifact root and, for a route-backed write under `spec/`, requires the active route to have declared `spec_touch` with a `spec/` write scope. For route-backed refine work, `target-artifact` resolves only to `documents/<artifact>/**` and `research/<artifact>/**`; before a major existing-file rewrite the guard invokes the deterministic snapshot helper. The artifact-creation order above is convention plus routing reminders, not a mechanical block; it does not block edits to existing artifacts or source either way.
+- Hook write gates are retired; artifact creation order remains a routing convention.
 
-**The owning capability also owns revisions.** The routing reminder and convention govern edits; `artifact-guard.sh` does not track per-artifact edit history.
+**The owning capability also owns revisions.** The routing reminder and convention govern edits.
 
 | Artifact | Sole update path | Version location |
 |---|---|---|
