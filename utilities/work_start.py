@@ -229,20 +229,8 @@ def _rows(jobs):
 
 
 def _current_parent_session_id():
-    parent = default_parent_session_id()
-    if (os.environ.get("AGENT_CODEX_MANAGED_GATEWAY") != "1"
-            or os.environ.get("AGENT_DISPATCH_CHILD") == "1"):
-        return parent
-    harness, inherited = interactive_parent_identity()
-    if harness != "codex" or parent != inherited:
-        return parent
-    # Admission records the gateway's witnessed thread after resume/fork.
-    # Reuse must consult the same proof, not the launcher's inherited seed.
-    try:
-        return probe_managed_codex_parent(
-            parent_harness=harness, parent_session_id=parent).thread_id
-    except ManagedDispatchError as exc:
-        raise DispatchContractError("work-parent-recovery-required", str(exc)) from exc
+    """The calling native session owns delivery, never a witnessed sibling."""
+    return default_parent_session_id()
 
 
 def _slot(route, node, rows):

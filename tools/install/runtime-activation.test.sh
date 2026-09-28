@@ -344,46 +344,22 @@ for row in data["runtimes"]:
     assert row["duplicate_sources"] == [] and row["external_dependencies"] == []
     assert row["session_action"] == expected[row["runtime"]]
 PY
-test -x "$HOME/.codex/.harness/bin/codex" || fail "Codex protected launcher was not installed"
+test ! -e "$HOME/.codex/.harness/bin/codex" || fail "retired Codex launcher was installed"
+test ! -e "$HOME/.codex/.harness/codex-launcher.json" || fail "launcher ownership state was created"
 test -x "$BIN/codex" || fail "vendor Codex command was lost"
-test ! -L "$HOME/.codex/.harness/bin/codex" || fail "Codex protected launcher is a symlink"
-# Model the current shell having sourced the authorized profile block.  The
-# installer remains non-interactive and does not mutate the profile; this
-# process-local PATH change is the healthy precedence state for strict doctor.
-if ! harness runtime doctor --runtime codex --strict --json > "$TMP/codex-doctor-sourced.json"; then
-  fail "strict Codex doctor rejected a shell with sourced protected PATH"
+PATH="$BIN:$ORIGINAL_PATH"
+export PATH
+if ! harness runtime doctor --runtime codex --strict --json > "$TMP/codex-doctor-native.json"; then
+  fail "strict Codex doctor rejected native CLI without protected PATH"
 fi
-python3 - "$TMP/codex-doctor-sourced.json" <<'PY'
+python3 - "$TMP/codex-doctor-native.json" <<'CHECK'
 import json, sys
 row = json.load(open(sys.argv[1]))
 assert row["exit"] == 0, row
 codex = row if row.get("runtime") == "codex" else next(item for item in row["runtimes"] if item["runtime"] == "codex")
-assert codex["managed_launcher"]["path_precedence"] == "first", codex
-PY
-PATH="$BIN:$ORIGINAL_PATH"
-export PATH
-if harness runtime doctor --runtime codex --strict --json > "$TMP/codex-doctor-missing-precedence.json"; then
-  fail "strict Codex doctor accepted missing protected PATH precedence"
-fi
-python3 - "$TMP/codex-doctor-missing-precedence.json" <<'PY'
-import json, sys
-row = json.load(open(sys.argv[1]))
-assert row["exit"] == 2, row
-codex = row if row.get("runtime") == "codex" else next(item for item in row["runtimes"] if item["runtime"] == "codex")
-assert codex["ok"] is False, codex
-assert codex["managed_launcher"]["path_precedence"] == "missing", codex
-PY
-PATH="$HOME/.codex/.harness/bin:$ORIGINAL_PATH"
-export PATH
-python3 - "$HOME/.codex/.harness/codex-launcher.json" "$BIN/codex" <<'PY'
-import json, os, stat, sys
-state=json.load(open(sys.argv[1]))
-assert state["phase"] == "installed", state
-assert state["real_command"] == os.path.abspath(sys.argv[2]), state
-assert state["previous_wrapper"] == {"kind": "missing"}, state
-assert os.path.realpath(state["ingress_path"]) == os.path.abspath(os.path.join(os.path.dirname(sys.argv[1]), "bin", "codex")), state
-assert stat.S_IMODE(os.stat(os.path.dirname(os.path.dirname(sys.argv[1]))).st_mode) == 0o700
-PY
+assert not codex["managed_launcher"]["installed"], codex
+assert codex["status"]["executable_ingress"] == {"owner": "vendor", "hearting_ingress": "none"}, codex
+CHECK
 test -L "$HOME/.config/opencode/skills/demo" || fail "OpenCode plural skills projection missing"
 test -L "$HOME/.config/opencode/agents/demo.md" || fail "OpenCode plural agents projection missing"
 test -L "$HOME/.config/opencode/commands/demo.md" || fail "OpenCode plural commands projection missing"
@@ -1185,14 +1161,12 @@ rows = {row["runtime"]: row for row in data["runtimes"]}
 codex, claude = rows["codex"], rows["claude"]
 assert codex["ok"] is True and claude["ok"] is True, (codex, claude)
 launcher = codex["managed_launcher"]
-assert launcher["installed"] is True and launcher["protected"] is True, launcher
-assert launcher["path_precedence"] == "first", launcher
-assert launcher["binding_state"], launcher
-assert codex["status"]["executable_ingress"] == {"owner": "hearting", "hearting_ingress": "see-managed-launcher"}, codex
+assert launcher["installed"] is False, launcher
+assert codex["status"]["executable_ingress"] == {"owner": "vendor", "hearting_ingress": "none"}, codex
 assert "managed_launcher" not in claude, claude
 assert claude["status"]["executable_ingress"] == {"owner": "vendor", "hearting_ingress": "none"}, claude
 PY
-ok "cross-runtime doctor distinguishes Codex protected ingress from Claude vendor ownership"
+ok "cross-runtime doctor reports vendor ownership for both native CLIs"
 
 # --- No Claude launcher/PATH block/binding state/updater-disable setting was added ---
 test ! -e "$ROOT/tools/install/drivers/claude_launcher.py" \

@@ -81,14 +81,14 @@ class PreflightDispatchOwnerTest(unittest.TestCase):
         self.assertIn("adapter=codex", result.stdout)
         self.assertIn("selection_source=configured-normal", result.stdout)
 
-    def test_unmanaged_codex_parent_fails_before_either_owner_registration(self):
+    def test_native_codex_parent_admits_either_owner_dry_run(self):
         for adapter in ("codex", "claude"):
             with self.subTest(adapter=adapter):
                 jobs = self.home / f"jobs-{adapter}.log"
                 jobs.touch()
                 log_dir = self.home / f"logs-{adapter}"
                 args = [
-                    str(PREFLIGHT), "dispatch-owner", "--adapter", adapter, "--start",
+                    str(PREFLIGHT), "dispatch-owner", "--adapter", adapter, "--dry-run",
                     "--worktree", str(ROOT), "--slug", f"unmanaged-{adapter}-owner-test",
                     "--capability", "autopilot-code", "--capability-mode", "debug",
                     "--qa", "standard", "--intensity", "standard",
@@ -98,7 +98,7 @@ class PreflightDispatchOwnerTest(unittest.TestCase):
                 ]
                 env = {
                     **self.env,
-                    "CODEX_THREAD_ID": "thread-unmanaged-test",
+                    "CODEX_THREAD_ID": "01a0dc8c-18ad-7853-8a0f-69222f4d7888",
                     "AGENT_DISPATCH_CALLER_HARNESS": "codex",
                     "AGENT_DISPATCH_CURRENT_HARNESS": "codex",
                     "AGENT_DISPATCH_CURRENT_TRANSPORT": "headless",
@@ -108,10 +108,11 @@ class PreflightDispatchOwnerTest(unittest.TestCase):
                     args, text=True, capture_output=True, env=env, timeout=20
                 )
                 output = result.stdout + result.stderr
-                self.assertEqual(result.returncode, 69, output)
+                self.assertEqual(result.returncode, 0, output)
                 self.assertIn(f"adapter={adapter}", output)
-                self.assertIn("managed-entry-required", output)
-                self.assertIn("parent_completion_delivery=poll-fallback", output)
+                self.assertNotIn("managed-entry-required", output)
+                self.assertIn("parent_session_id=01a0dc8c-18ad-7853-8a0f-69222f4d7888", output)
+                self.assertIn("status=dry-run", output)
                 self.assertIn("child_spawned=0", output)
                 self.assertEqual(jobs.read_text(encoding="utf-8"), "")
 

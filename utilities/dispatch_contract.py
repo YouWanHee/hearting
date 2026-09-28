@@ -846,7 +846,8 @@ def foreground_review_launch_identity(args: object) -> dict[str, object]:
 # future edit to either set is caught at import time instead of silently
 # drifting one guard's `{}` no-op out of sync with the other's acceptance.
 _KNOWN_DELIVERY_RECIPIENT_KINDS = frozenset({
-    "claude-parent-runtime", "codex-stop-hook", "codex-managed-gateway", "opencode-turn",
+    "claude-parent-runtime", "codex-stop-hook", "codex-managed-gateway",
+    "codex-native-queue", "opencode-turn",
 })
 if _KNOWN_DELIVERY_RECIPIENT_KINDS != frozenset(RECIPIENT_KINDS):
     raise DispatchContractError(

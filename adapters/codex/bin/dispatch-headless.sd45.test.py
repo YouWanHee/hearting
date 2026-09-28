@@ -663,21 +663,13 @@ class CodexSD78CompletionDelivery(unittest.TestCase):
         return _side_effect
 
 
-    def test_unmanaged_interactive_parent_is_identified_then_blocked(self):
+    def test_gateway_free_parent_is_admitted_with_native_queue(self):
         args = self.parent_args()
-        with mock.patch.dict(
-            os.environ,
-            {"CODEX_THREAD_ID": args.parent_session_id, "AGENT_DISPATCH_CHILD": "0"},
-            clear=True,
-        ):
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": args.parent_session_id}, clear=True):
             WH.bind_parent_completion_delivery(args)
-        self.assertEqual(args.parent_completion_delivery, "poll-fallback")
-        self.assertEqual(
-            args.parent_completion_reason, "interactive-auto-wake-unsupported"
-        )
-        with self.assertRaises(WH.DispatchContractError) as raised:
             WH.validate_interactive_parent_launch(args)
-        self.assertEqual(raised.exception.reason, "managed-entry-required")
+        self.assertEqual(args.parent_completion_delivery, "codex-native-queue")
+        self.assertEqual(args.parent_completion_reason, "native-thread-queue")
         self.assertFalse(args.require_hook_trust)
 
     def test_actual_codex_caller_overrides_synthetic_claude_parent_metadata(self):
@@ -697,13 +689,11 @@ class CodexSD78CompletionDelivery(unittest.TestCase):
         ):
             WH._bind_runtime_parent(args)
             WH.bind_parent_completion_delivery(args)
-            with self.assertRaises(WH.DispatchContractError) as raised:
-                WH.validate_interactive_parent_launch(args)
+            WH.validate_interactive_parent_launch(args)
         self.assertEqual(args.parent_harness, "codex")
         self.assertEqual(args.parent_session_id, "thread-real")
         self.assertIsNone(args.parent_slug)
-        self.assertEqual(args.parent_completion_delivery, "poll-fallback")
-        self.assertEqual(raised.exception.reason, "managed-entry-required")
+        self.assertEqual(args.parent_completion_delivery, "codex-native-queue")
 
     def test_actual_claude_caller_overrides_synthetic_codex_parent_metadata(self):
         args = self.parent_args(
@@ -736,92 +726,20 @@ class CodexSD78CompletionDelivery(unittest.TestCase):
             args.parent_completion_reason, "operator-authorized-unmanaged-poll"
         )
 
-    def test_managed_interactive_parent_selects_single_ingress_gateway(self):
-        args = self.parent_args()
-        binding = mock.Mock(thread_advanced=False)
-        with mock.patch.dict(
-            os.environ,
-            {
-                "CODEX_THREAD_ID": args.parent_session_id,
-                "AGENT_DISPATCH_CHILD": "0",
-                "AGENT_CODEX_MANAGED_GATEWAY": "1",
-                "AGENT_CODEX_MANAGED_PARENT_RUNTIME": "codex",
-            },
-            clear=True,
-        ), mock.patch.object(
-            WH, "probe_managed_codex_parent", return_value=binding
-        ) as probe:
-            WH.bind_parent_completion_delivery(args)
-        self.assertEqual(
-            args.parent_completion_delivery, WH.MANAGED_PARENT_DELIVERY
-        )
-        self.assertEqual(
-            args.parent_completion_reason, "managed-single-ingress-live"
-        )
-        self.assertIs(args.managed_gateway_binding, binding)
-        WH.validate_interactive_parent_launch(args)
-        probe.assert_called_once_with(
-            parent_harness="codex",
-            parent_session_id=args.parent_session_id,
-        )
-
-    def test_managed_interactive_parent_resolves_witnessed_fork_successor(self):
-        args = self.parent_args()
-        inherited = args.parent_session_id
-        binding = mock.Mock(
-            thread_advanced=True,
-            thread_id="thread-fork-successor",
-        )
-        with mock.patch.dict(
-            os.environ,
-            {
-                "CODEX_THREAD_ID": inherited,
-                "AGENT_DISPATCH_CHILD": "0",
-                "AGENT_CODEX_MANAGED_GATEWAY": "1",
-                "AGENT_CODEX_MANAGED_PARENT_RUNTIME": "codex",
-            },
-            clear=True,
-        ), mock.patch.object(
-            WH, "probe_managed_codex_parent", return_value=binding
-        ) as probe:
-            WH.bind_parent_completion_delivery(args)
-        self.assertEqual(
-            args.parent_completion_delivery, WH.MANAGED_PARENT_DELIVERY
-        )
-        self.assertEqual(args.parent_session_id, "thread-fork-successor")
-        self.assertEqual(
-            args.parent_completion_reason, "managed-thread-advanced"
-        )
-        probe.assert_called_once_with(
-            parent_harness="codex", parent_session_id=inherited
-        )
-
-    def test_managed_probe_failure_is_typed_poll_fallback(self):
-        args = self.parent_args()
-        with mock.patch.dict(
-            os.environ,
-            {
-                "CODEX_THREAD_ID": args.parent_session_id,
-                "AGENT_DISPATCH_CHILD": "0",
-                "AGENT_CODEX_MANAGED_GATEWAY": "1",
-            },
-            clear=True,
-        ), mock.patch.object(
-            WH,
-            "probe_managed_codex_parent",
-            side_effect=WH.ManagedDispatchError("managed-gateway-not-ready"),
-        ):
-            WH.bind_parent_completion_delivery(args)
-        self.assertEqual(args.parent_completion_delivery, "poll-fallback")
-        self.assertEqual(
-            args.parent_completion_reason, "managed-gateway-not-ready"
-        )
-        # Validation belongs to the same managed environment as binding.
-        # Otherwise CI's clean environment correctly classifies an unmanaged parent.
-        with mock.patch.dict(os.environ, {"AGENT_CODEX_MANAGED_GATEWAY": "1"}), \
-                self.assertRaises(WH.DispatchContractError) as raised:
-            WH.validate_interactive_parent_launch(args)
-        self.assertEqual(raised.exception.reason, "managed-gateway-not-ready")
+    def test_legacy_gateway_cannot_redirect_native_parent_or_block_dispatch(self):
+        for binding in (mock.Mock(thread_id="sibling", thread_advanced=True),
+                        WH.ManagedDispatchError("managed-gateway-not-ready")):
+            args = self.parent_args()
+            native = args.parent_session_id
+            with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": native,
+                    "AGENT_CODEX_MANAGED_GATEWAY": "1"}, clear=True), \
+                 mock.patch.object(WH, "probe_managed_codex_parent", return_value=binding) as probe:
+                WH.bind_parent_completion_delivery(args)
+                WH.validate_interactive_parent_launch(args)
+            probe.assert_not_called()
+            self.assertEqual(args.parent_session_id, native)
+            self.assertEqual(args.parent_completion_delivery, "codex-native-queue")
+            self.assertIsNone(args.managed_gateway_binding)
 
     def test_claude_parent_keeps_claude_wake_adapter_for_codex_child(self):
         args = self.parent_args(
@@ -874,7 +792,7 @@ class CodexSD78CompletionDelivery(unittest.TestCase):
 
     def test_managed_sidecar_is_exact_singleton_and_registry_bounded(self):
         args = self.parent_args()
-        args.parent_completion_delivery = WH.MANAGED_PARENT_DELIVERY
+        args.parent_completion_delivery = "codex-native-queue"
         args.managed_gateway_binding = object()
         args.attempt_id = "att-managed"
         sidecar = argparse.Namespace(
@@ -883,13 +801,12 @@ class CodexSD78CompletionDelivery(unittest.TestCase):
             log_file=Path("/tmp/managed.jsonl"),
         )
         with mock.patch.object(
-            WH, "launch_managed_completion_sidecar", return_value=sidecar
+            WH, "launch_codex_queue_completion_sidecar", return_value=sidecar
         ) as launch, mock.patch.object(
             WH, "annotate_attempt_row", return_value=True
         ) as annotate:
             WH.launch_parent_completion_sidecar(args, Path("/tmp/jobs.log"))
         launch.assert_called_once_with(
-            binding=args.managed_gateway_binding,
             jobs=Path("/tmp/jobs.log"),
             parent_session_id=args.parent_session_id,
             attempt_ids={"att-managed"},
@@ -907,9 +824,8 @@ class CodexSD78CompletionDelivery(unittest.TestCase):
             clear=True,
         ):
             WH.bind_parent_completion_delivery(args)
-        self.assertEqual(args.parent_completion_delivery, "poll-fallback")
-        with self.assertRaises(WH.DispatchContractError):
-            WH.validate_interactive_parent_launch(args)
+        self.assertEqual(args.parent_completion_delivery, "codex-native-queue")
+        WH.validate_interactive_parent_launch(args)
         self.assertFalse(args.require_hook_trust)
 
     def test_wrapper_has_no_native_stop_stamp_or_state_writer(self):

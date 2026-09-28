@@ -188,7 +188,7 @@ def emit_context(event_name: str, parts: list[str]) -> None:
     context = "\n".join(part.strip() for part in parts if part.strip())
     if not context:
         return
-    print(json.dumps({"hookSpecificOutput": {"hookEventName": event_name, "additionalContext": context}}, ensure_ascii=False))
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": event_name, "additionalContext": context}}, ensure_ascii=False), flush=True)
 
 
 def load_token_receipt(path: Path) -> dict[str, Any] | None:
@@ -331,6 +331,24 @@ def sd111_first_prompt_sweep(sid: str) -> None:
             continue
 
 
+def native_queue_prompt_receipts(sid: str):
+    """Render this exact session's pending queue receipts on a real prompt."""
+    if not sid:
+        return [], []
+    from dispatch_contract import dispatch_state_roots, resolve_agent_home
+    from dispatch_session_sweep import sweep_deliver, _bounded_receipt_text
+    batches, texts = [], []
+    for root in dict.fromkeys(dispatch_state_roots(resolve_agent_home())):
+        records, _ = sweep_deliver(root, "codex-native-queue", sid)
+        if records:
+            batches.append((root, records))
+            texts.extend(_bounded_receipt_text(record) for record in records)
+    if not texts:
+        return batches, []
+    return batches, ["Hearting pending completion receipts (inspect exact attempts; "
+                     "transport delay does not change child outcome):\n" + "\n".join(texts)]
+
+
 def peer_notice(payload: dict[str, Any], current_prompt: str, current_cwd: str) -> None:
     """F-100c — the receive side of a herdr steer, harness-neutral: when the prompt
     carries the `(peer-from: <harness> <sid> <name>)` trailer a steward appended, write
@@ -401,13 +419,21 @@ def main() -> int:
         )
     sd111_first_prompt_sweep(sid)
 
-    parts = []
+    batches = []
+    try:
+        batches, parts = native_queue_prompt_receipts(sid)
+    except Exception:
+        parts = []
     parts.append(candidate_context(payload, current_cwd, sid))
     parts.append(run_preflight("briefing", current_cwd))
     # Phase 1 token self-regulation is transition-only. Normal, unknown,
     # native-owned, and repeated bands return an empty string (zero injection).
     parts.append(token_budget_context(current_cwd, sid))
     emit_context("UserPromptSubmit", parts)
+    # Commit acknowledgement only after successful synchronous hook rendering.
+    from dispatch_session_sweep import ack_delivered
+    for root, records in batches:
+        ack_delivered(root, sid, records, acked_by="codex-native-prompt:" + sid)
     return 0
 
 

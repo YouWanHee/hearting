@@ -2746,9 +2746,8 @@ class TestInteractiveFrameGate(WorkflowFixture):
             lines.append("ts\tdone\t/r\t/w\tframe\t" + ",".join(k+"="+v for k,v in meta.items()))
         jobs.write_text("\n".join(lines))
         with mock.patch.dict(os.environ, {session_key: "test-depth0", "AGENT_DISPATCH_CALLER_HARNESS": harness,
-                "AGENT_DISPATCH_ATTEMPT_ID": "", "AGENT_DISPATCH_REGISTERED_WORKER": "",
-                "AGENT_CODEX_MANAGED_CONTROL_SOCKET": "/tmp/test-control", "HEARTING_GATES": "on"}, clear=True), \
-             mock.patch.object(SUP.HUMAN_GATE, "probe_consumer", return_value={"epoch": 1}), \
+                "AGENT_DISPATCH_ATTEMPT_ID": "", "AGENT_DISPATCH_REGISTERED_WORKER": "", "HEARTING_GATES": "on"}, clear=True), \
+             mock.patch.object(SUP.HUMAN_GATE, "probe_consumer") as probe_consumer, \
              mock.patch.object(DC, "completion_marker_is_current", return_value=True), \
              mock.patch.object(DC, "completion_attempt_readiness", return_value=DC.AttemptReadiness("ready", "fixture")):
             kwargs = dict(route_path=path, release_authority="depth-0", interview=True, questions=1)
@@ -2758,6 +2757,7 @@ class TestInteractiveFrameGate(WorkflowFixture):
             self.assertEqual(record["kind"], "interactive-frame-handback")
             self.assertEqual(record["recipient_session"], "test-depth0")
             self.assertEqual(len(record["attempt_ids"]), 2)
+            probe_consumer.assert_not_called()
             self.assertEqual(SUP.create_gate_delivery(route, "frame-review", str(artifact), jobs, 0, **kwargs),
                              (record_path, False))
             self.assertIsNone(SUP._owner_row(SUP._registry_rows(jobs), route["route_id"]))

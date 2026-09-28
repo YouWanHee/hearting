@@ -24,6 +24,8 @@ sys.path.insert(0, str(ROOT / "utilities"))
 from dispatch_contract import WRAPPER_PARENT_HARNESSES
 from dispatch_completion_join import (  # noqa: E402
     JoinContractError,
+    CODEX_QUEUE_PARENT_DELIVERY,
+    canonical_receipt_digest,
     MANAGED_SESSION_PARENT_DELIVERY,
     OPEN_STATES,
     advance_delivery_timing,
@@ -33,8 +35,11 @@ from dispatch_completion_join import (  # noqa: E402
     receipt_with_delivery_observability,
     receipt_with_stage_advance,
     validate_delivery_timing,
+    completion_followup_text,
 )
 import dispatch_pending_delivery as pending_delivery  # noqa: E402
+import codex_queue_delivery
+from codex_queue_dispatch import resolve_queue_socket
 import human_gate_receipt
 import dispatch_notice_receipt as notice_receipt  # noqa: E402
 
@@ -119,7 +124,11 @@ class NoticeWatcher:
     def _one(self, path: Path) -> None:
         sent = False
         try:
-            capability = negotiate_human_gate(self.args)
+            queue_socket = getattr(self.args, "queue_socket", None)
+            capability = (
+                {"epoch": 1} if queue_socket
+                else negotiate_human_gate(self.args)
+            )
             if capability is None:
                 raise CompletionError("notice-recipient-unavailable")
             self.epoch = int(capability["epoch"])
@@ -151,7 +160,8 @@ class NoticeWatcher:
                 )
             claimed = pending_delivery.claim(
                 self.root, self.recipient, record["delivery_id"],
-                claim_owner=self.owner, lease_seconds=30.0,
+                claim_owner=self.owner,
+                lease_seconds=300.0 if queue_socket else 30.0,
                 require_generation_proof=True,
                 live_recipient_generation=(self.recipient, str(self.epoch)),
             )
@@ -162,6 +172,46 @@ class NoticeWatcher:
                 expected_attempts=self.attempts,
                 expected_sealed_batch_id=self.args.sealed_batch_id,
             )
+            if queue_socket:
+                context = notice_receipt.context(
+                    receipt, notice_receipt.gateway_delivery_id(receipt)
+                )
+                additional = context.get("additionalContext")
+                values = [value.get("value") for value in additional.values()
+                          if isinstance(value, dict) and isinstance(value.get("value"), str)] \
+                    if isinstance(additional, dict) else []
+                if len(values) != 1:
+                    raise CompletionError("native-queue-notice-context-invalid")
+                sent = True
+                queue_result = codex_queue_delivery.send_at_least_once(
+                    queue_socket, thread_id=self.recipient,
+                    client_message_id=claimed["delivery_id"], message=values[0],
+                    timeout=5.0,
+                )
+                if queue_result.get("status") == "consumed":
+                    pending_delivery.ack(self.root, self.recipient, claimed["delivery_id"],
+                                         acked_by=self.owner)
+                    return
+                queued = codex_queue_delivery.list_queue(
+                    queue_socket, self.recipient, timeout=5.0
+                )
+                pending_item = next((item for item in queued
+                                     if item.get("clientUserMessageId") == claimed["delivery_id"]), None)
+                if pending_item is None:
+                    turn = codex_queue_delivery.find_turn_by_client_message_id(
+                        queue_socket, self.recipient, claimed["delivery_id"], timeout=5.0
+                    )
+                    if turn is not None:
+                        pending_delivery.ack(
+                            self.root, self.recipient, claimed["delivery_id"],
+                            acked_by=self.owner,
+                        )
+                        return
+                pending_delivery.mark_sent_ambiguous(
+                    self.root, self.recipient, claimed["delivery_id"],
+                    claim_owner=self.owner,
+                )
+                return
             request = {"schema_version": 1, "op": "deliver-notice",
                        "thread_id": self.recipient,
                        "recipient_epoch": self.epoch,
@@ -183,9 +233,6 @@ class NoticeWatcher:
                     claim_owner=self.owner,
                 )
             elif result.get("status") == "retryable":
-                # Keep the current lease. The next scan may reclaim it only
-                # after its actual deadline; a transient storage error is
-                # neither permanent rejection nor evidence of a send.
                 self._record_error(str(result.get("reason") or "gateway-retryable"))
             elif result.get("status") == "rejected":
                 reason = result.get("reason")
@@ -235,6 +282,13 @@ class NoticeWatcher:
                 except Exception:
                     pass
             self._record_error(str(exc))
+        finally:
+            if getattr(self.args, "queue_socket", None) and "claimed" in locals():
+                try:
+                    pending_delivery.release_claim(self.root, self.recipient,
+                        claimed["delivery_id"], claim_owner=self.owner)
+                except pending_delivery.PendingDeliveryError as exc:
+                    self._record_error(str(exc))
 
 
 # Compatibility name for callers; there is only one notice courier.
@@ -302,7 +356,7 @@ def wait_for_session_launch_claims(
             if (
                 metadata.get("parent_sid") != args.parent_session_id
                 or metadata.get("parent_completion_delivery")
-                != MANAGED_SESSION_PARENT_DELIVERY
+                != (CODEX_QUEUE_PARENT_DELIVERY if args.queue_socket else MANAGED_SESSION_PARENT_DELIVERY)
                 or metadata.get("attempt_schema_version") != "2"
                 or metadata.get("dispatch_depth") != "1"
                 or metadata.get("execution_surface") != "registered-headless"
@@ -341,7 +395,7 @@ def run_join(args: argparse.Namespace, attempts: set[str]) -> dict[str, Any]:
             "--parent-session-id",
             args.parent_session_id,
             "--parent-completion-delivery",
-            MANAGED_SESSION_PARENT_DELIVERY,
+            (CODEX_QUEUE_PARENT_DELIVERY if args.queue_socket else MANAGED_SESSION_PARENT_DELIVERY),
         ]
     else:
         command += ["--parent-attempt-id", args.parent_attempt_id]
@@ -386,6 +440,7 @@ def normalize_receipt(
     parent_session_id: str | None,
     delivery_parent_id: str,
     attempts: set[str],
+    parent_completion_delivery: str = MANAGED_SESSION_PARENT_DELIVERY,
     accept_stage_advance: bool = False,
     stage_advance_record: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -438,7 +493,7 @@ def normalize_receipt(
                 jobs,
                 parent_session_id,
                 attempts,
-                MANAGED_SESSION_PARENT_DELIVERY,
+                parent_completion_delivery,
             )
         else:
             rows = current_children(jobs, parent_attempt_id or "", attempts)
@@ -590,6 +645,157 @@ def deliver_with_retry(
         time.sleep(min(max(args.delivery_retry_interval, 0.05), remaining))
 
 
+def _native_queue_delivery_once(
+    args: argparse.Namespace,
+    receipt: dict[str, Any],
+    attempts: set[str],
+    *, allow_enqueue: bool = True,
+) -> dict[str, Any]:
+    """Queue one stable completion item through its durable per-child ledger."""
+    path = args.queue_socket or resolve_queue_socket()
+    if not path.is_absolute():
+        raise CompletionError("native-queue-endpoint-path-invalid")
+    thread = codex_queue_delivery._rpc(
+        path, "thread/read", {"threadId": args.thread_id}, timeout=5.0
+    ).get("thread")
+    if not isinstance(thread, dict) or thread.get("id") != args.thread_id:
+        raise CompletionError("native-queue-thread-identity-invalid")
+    if thread.get("cwd") and not isinstance(thread.get("cwd"), str):
+        raise CompletionError("native-queue-thread-cwd-invalid")
+    context = (
+        "AGENT_HARNESS_COMPLETION_V1\n"
+        + canonical(receipt)
+        + "\n"
+        + completion_followup_text(
+            receipt,
+            jobs=str(args.jobs),
+            surface=str(ROOT / "adapters" / "codex" / "bin" / "preflight.sh"),
+        )
+    )
+    delivery_material = "\0".join((
+        "codex-native-queue-v1", args.thread_id,
+        *sorted(row.metadata.get("delivery_id", "") for row in
+                current_session_children(args.jobs, args.thread_id, attempts,
+                                         CODEX_QUEUE_PARENT_DELIVERY)),
+    ))
+    client_message_id = "delivery-" + hashlib.sha256(
+        delivery_material.encode("utf-8")
+    ).hexdigest()[:32]
+    rows = current_session_children(
+        args.jobs, args.thread_id, attempts, CODEX_QUEUE_PARENT_DELIVERY
+    )
+    if {row.attempt_id for row in rows} != attempts:
+        raise CompletionError("native-queue-ledger-attempt-set-mismatch")
+    root = args.jobs.resolve(strict=False).parent
+    ledger_ids: list[str] = []
+    for row in rows:
+        delivery_id = row.metadata.get("delivery_id", "")
+        if (not delivery_id.startswith("delivery-")
+                or row.metadata.get("delivery_recipient_kind") != "codex-native-queue"):
+            raise CompletionError("native-queue-ledger-intent-invalid")
+        record = pending_delivery.read(root, args.thread_id, delivery_id)
+        if (record is None or record.get("recipient_kind") != "codex-native-queue"
+                or record.get("attempt_ids") != [row.attempt_id]
+                or record.get("receipt_digest") != row.metadata.get("delivery_receipt_digest")
+                or record.get("row_revisions", {}).get(row.attempt_id)
+                != row.metadata.get("delivery_row_revision")):
+            raise CompletionError("native-queue-ledger-record-mismatch")
+        ledger_ids.append(delivery_id)
+    records = [pending_delivery.read(root, args.thread_id, delivery_id)
+               for delivery_id in ledger_ids]
+    if any(record is None for record in records):
+        raise CompletionError("native-queue-ledger-state-invalid")
+    acked_by = f"codex-native-queue:{client_message_id}"
+    acknowledged = [record for record in records if record.get("state") == "acked"]
+    if acknowledged and (len(acknowledged) == len(records) or all(
+            record.get("acked_by") == acked_by for record in acknowledged)):
+        # Ack writes are per-record, so a crash can leave one exact batch
+        # partially acknowledged after its consumed turn was already proven.
+        # The same stable client id is that proof's batch identity: finish
+        # closing its remaining records instead of stranding or resending it.
+        for record in records:
+            if record.get("state") == "acked":
+                continue
+            if record.get("state") not in {"pending", "claimed", "sent-ambiguous"}:
+                raise CompletionError("native-queue-ledger-state-invalid")
+            pending_delivery.ack(
+                root, args.thread_id, record["delivery_id"], acked_by=acked_by,
+                expected_states=("pending", "claimed", "sent-ambiguous"),
+            )
+        return {
+            "schema_version": 1, "status": "accepted", "thread_id": args.thread_id,
+            "client_user_message_id": client_message_id,
+            "deduplicated_by": "pending-delivery-ledger",
+        }
+    records = [record for record in records if record.get("state") != "acked"]
+    if any(record.get("state") not in {"pending", "claimed", "sent-ambiguous"}
+           for record in records):
+        raise CompletionError("native-queue-ledger-state-invalid")
+    claim_owner = f"codex-native-queue:{os.getpid()}:{client_message_id}"
+    claimed: list[str] = []
+    try:
+        for record in records:
+            delivery_id = record["delivery_id"]
+            if record["state"] in {"claimed", "sent-ambiguous"}:
+                pending_delivery.reclaim(root, args.thread_id, delivery_id, now_ns=time.monotonic_ns())
+            pending_delivery.claim(root, args.thread_id, delivery_id,
+                                   claim_owner=claim_owner, lease_seconds=60.0)
+            claimed.append(delivery_id)
+        if allow_enqueue:
+            result = codex_queue_delivery.send_at_least_once(
+                path, thread_id=args.thread_id, client_message_id=client_message_id,
+                message=context, timeout=5.0)
+        elif codex_queue_delivery._known_consumed(
+                path, args.thread_id, client_message_id, timeout=5.0) is not None:
+            result = {"status": "consumed"}
+        else:
+            result = codex_queue_delivery.poll_owned_item(
+                path, thread_id=args.thread_id, client_message_id=client_message_id, timeout=5.0)
+            result["status"] = "queued"
+
+        if result["status"] == "consumed":
+            for delivery_id in claimed:
+                pending_delivery.ack(root, args.thread_id, delivery_id, acked_by=acked_by)
+            return {"schema_version": 1, "status": "accepted",
+                    "thread_id": args.thread_id, "client_user_message_id": client_message_id}
+        for delivery_id in claimed:
+            pending_delivery.mark_sent_ambiguous(
+                root, args.thread_id, delivery_id, claim_owner=claim_owner)
+        return {"schema_version": 1, "status": "sent-ambiguous",
+                "reason": "native-queue-consumption-pending", "submitted": True, "thread_id": args.thread_id,
+                "client_user_message_id": client_message_id,
+                "queued_submission_id": result.get("queued_submission_id")}
+    finally:
+        # Each network pass owns a bounded claim, never the whole watch window.
+        # A rejected send and partial claim cannot hide receipts on the next
+        # prompt; an ack or another owner's claim is preserved by the CAS.
+        for delivery_id in claimed:
+            pending_delivery.release_claim(root, args.thread_id, delivery_id, claim_owner=claim_owner)
+
+
+def deliver_to_native_queue(args, receipt, attempts):
+    deadline = time.monotonic() + max(0.0, args.timeout)
+    result = {"schema_version": 1, "status": "retryable", "reason": "native-queue-timeout"}
+    submitted = False
+    while time.monotonic() < deadline:
+        try:
+            result = _native_queue_delivery_once(args, receipt, attempts, allow_enqueue=not submitted)
+            # Positive queue acceptance is not ambiguous. Keep observing until
+            # consumed, but do not repeatedly enqueue during a history outage.
+            # A crashed courier may retry with the same id (at-least-once).
+            submitted = submitted or result.get("submitted", False)
+            if result.get("status") == "accepted":
+                return result
+        except (codex_queue_delivery.QueueDeliveryError, pending_delivery.PendingDeliveryError,
+                CompletionError) as exc:
+            result = {"schema_version": 1, "status": "retryable", "reason": str(exc),
+                      "thread_id": args.thread_id}
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(max(args.delivery_retry_interval, 0.05), remaining))
+    return result
+
+
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(description=__doc__)
     value.add_argument(
@@ -597,6 +803,7 @@ def parser() -> argparse.ArgumentParser:
         type=Path,
         default=os.environ.get("AGENT_CODEX_MANAGED_CONTROL_SOCKET"),
     )
+    value.add_argument("--queue-socket", type=Path)
     value.add_argument(
         "--jobs",
         type=Path,
@@ -670,7 +877,7 @@ def _receiver_unavailable_reason(args: argparse.Namespace, attempts: set[str]) -
     gateway is not "unavailable" (the ordinary join-deadline retry already
     covers that).
     """
-    if not _control_socket_connection_failed(args.control_socket):
+    if not _control_socket_connection_failed(args.queue_socket or args.control_socket):
         return ""
     if _any_attempt_open(args.jobs, attempts):
         return ""
@@ -724,7 +931,7 @@ def _await_notice_ack(
 
 
 def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
-    if args.control_socket is None:
+    if args.control_socket is None and args.queue_socket is None:
         raise CompletionError("control-socket-missing")
     if (
         args.jobs is None
@@ -751,7 +958,9 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     if args.parent_session_id:
         # Keep the courier alive through a disconnected gateway. It must
         # prove a live binding before each claim, including after reconnect.
-        capability = negotiate_human_gate(args)
+        capability = (
+            {"epoch": 1} if args.queue_socket else negotiate_human_gate(args)
+        )
         watcher = HumanGateWatcher(args, attempts, capability)
         watcher.start()
     try:
@@ -800,7 +1009,20 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         parent_session_id=args.parent_session_id,
         delivery_parent_id=delivery_parent,
         attempts=attempts,
+        parent_completion_delivery=(
+            CODEX_QUEUE_PARENT_DELIVERY if args.queue_socket
+            else MANAGED_SESSION_PARENT_DELIVERY
+        ),
     )
+    if args.queue_socket:
+        result = deliver_to_native_queue(args, normalized, attempts)
+        status = result.get("status")
+        return result, {
+            "accepted": 0,
+            "retryable": 75,
+            "sent-ambiguous": 74,
+            "rejected": 65,
+        }.get(status, 65)
     request = {
         "schema_version": 1,
         "op": "deliver",

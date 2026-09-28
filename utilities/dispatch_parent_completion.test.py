@@ -40,23 +40,12 @@ def args(parent="codex", **values):
 
 
 class ParentDeliveryContract(unittest.TestCase):
-    def test_managed_failure_explains_actual_reason_and_visible_host_recovery(self):
-        for probe_class, expected in (("lineage-mismatch", "transition-unproved"),
-                                      ("upstream-client-count-invalid", "managed-gateway-not-ready")):
-            with self.subTest(probe_class=probe_class), mock.patch.dict(os.environ, {
-                "AGENT_CODEX_MANAGED_GATEWAY": "1", "HERDR_PANE_ID": "wK:p3",
-                "HERDR_SOCKET_PATH": "/checked/herdr.sock",
-            }, clear=True):
-                request = args(parent_completion_delivery="poll-fallback",
-                               parent_completion_reason="managed-gateway-not-ready",
-                               parent_completion_reason_class=probe_class)
-                with self.assertRaises(P.DispatchContractError) as raised:
-                    P.validate_interactive_parent_launch(request)
-                self.assertEqual(raised.exception.reason, expected)
-                self.assertIn("already managed", str(raised.exception))
-                self.assertIn("interactive-main-recovery --check", str(raised.exception))
-                self.assertIn("visible pane", str(raised.exception))
-                self.assertNotIn("unmanaged interactive Codex parents", str(raised.exception))
+    def test_identity_failure_names_native_parent_without_gateway_recovery(self):
+        request = args(parent_completion_delivery="poll-fallback")
+        with self.assertRaises(P.DispatchContractError) as raised:
+            P.validate_interactive_parent_launch(request)
+        self.assertEqual(raised.exception.reason, "native-parent-identity-unproven")
+        self.assertIn("CODEX_THREAD_ID", str(raised.exception))
 
     def test_every_adapter_parser_binds_the_actual_parent_session(self):
         for parent, key in (("codex", "CODEX_THREAD_ID"),
@@ -121,15 +110,17 @@ class ParentDeliveryContract(unittest.TestCase):
         self.assertEqual(P.interactive_parent_identity(env), ("opencode", "actual-parent"))
         self.assertEqual(P.default_parent_session_id(env), "actual-parent")
         env["AGENT_DISPATCH_PARENT_SESSION_ID"] = "explicit-dispatch-binding"
-        self.assertEqual(P.default_parent_session_id(env), "explicit-dispatch-binding")
+        self.assertEqual(P.default_parent_session_id(env), "actual-parent")
         self.assertEqual(P.interactive_parent_identity(env), ("opencode", "actual-parent"))
+        env["AGENT_DISPATCH_CHILD"] = "1"
+        self.assertEqual(P.default_parent_session_id(env), "explicit-dispatch-binding")
         del env["AGENT_DISPATCH_CALLER_HARNESS"]
         with self.assertRaisesRegex(P.DispatchContractError, "caller-harness-ambiguous"):
             P.interactive_parent_identity(env)
 
     def test_parent_runtime_selects_delivery_for_every_child_and_worker_type(self):
         for child, wrapper in ADAPTERS.items():
-            for parent, delivery in (("codex", P.MANAGED_PARENT_DELIVERY),
+            for parent, delivery in (("codex", "codex-native-queue"),
                                      ("claude", "claude-parent-runtime"),
                                      ("opencode", "poll-fallback")):
                 for worker in ("owner", "review", "frame", "stage", "support"):
@@ -139,18 +130,19 @@ class ParentDeliveryContract(unittest.TestCase):
                              mock.patch.object(wrapper, "probe_managed_codex_parent",
                                                return_value=SimpleNamespace(thread_advanced=False)) as probe:
                             self.assertEqual(wrapper.resolve_parent_completion_delivery(request), delivery)
-                            self.assertEqual(probe.call_count, int(parent == "codex"))
+                            self.assertEqual(probe.call_count, 0)
 
-    def test_witnessed_thread_successor_is_used_by_every_child(self):
+    def test_witnessed_thread_successor_never_replaces_native_parent_identity(self):
         for child, wrapper in ADAPTERS.items():
             with self.subTest(child=child), \
                  mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "thread-parent"}, clear=True), \
                  mock.patch.object(wrapper, "probe_managed_codex_parent",
-                    return_value=SimpleNamespace(thread_advanced=True, thread_id="thread-successor")):
+                    return_value=SimpleNamespace(thread_advanced=True, thread_id="thread-successor")) as probe:
                 request = args()
-                self.assertEqual(wrapper.resolve_parent_completion_delivery(request), P.MANAGED_PARENT_DELIVERY)
-                self.assertEqual(request.parent_session_id, "thread-successor")
-                self.assertEqual(request.parent_completion_reason, "managed-thread-advanced")
+                self.assertEqual(wrapper.resolve_parent_completion_delivery(request), "codex-native-queue")
+                self.assertEqual(request.parent_session_id, "thread-parent")
+                self.assertEqual(request.parent_completion_reason, "native-thread-queue")
+                probe.assert_not_called()
 
     def test_registered_parent_retains_responsibility_only_with_a_live_controller(self):
         for child, wrapper in ADAPTERS.items():
@@ -167,14 +159,14 @@ class ParentDeliveryContract(unittest.TestCase):
     def test_unproved_codex_parent_cannot_silently_launch_without_a_carrier(self):
         for child, wrapper in ADAPTERS.items():
             with self.subTest(child=child), \
-                 mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "thread-parent"}, clear=True), \
+                 mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "different-thread"}, clear=True), \
                  mock.patch.object(wrapper, "probe_managed_codex_parent",
                                    side_effect=P.ManagedDispatchError("managed-control-unavailable")):
-                request = args()
+                request = args(parent_session_id="thread-parent")
                 request.parent_completion_delivery = wrapper.resolve_parent_completion_delivery(request)
                 with self.assertRaises(P.DispatchContractError) as caught:
                     wrapper.validate_interactive_parent_launch(request)
-                self.assertEqual(caught.exception.reason, "managed-entry-required")
+                self.assertEqual(caught.exception.reason, "native-parent-identity-unproven")
                 request.allow_unmanaged_parent_poll = True
                 wrapper.validate_interactive_parent_launch(request)
                 self.assertEqual(request.parent_completion_reason, "operator-authorized-unmanaged-poll")
@@ -183,30 +175,29 @@ class ParentDeliveryContract(unittest.TestCase):
         for child, wrapper in ADAPTERS.items():
             for recorded in (True, False):
                 with self.subTest(child=child, recorded=recorded), \
-                     mock.patch.object(wrapper, "launch_managed_completion_sidecar",
+                     mock.patch.object(wrapper, "launch_codex_queue_completion_sidecar",
                         return_value=SimpleNamespace(pid=123, sealed_batch_id="batch-exact", log_file="/tmp/log")) as launch, \
                      mock.patch.object(wrapper, "annotate_attempt_row", return_value=recorded):
-                    request = args(parent_completion_delivery=P.MANAGED_PARENT_DELIVERY,
-                                   managed_gateway_binding=object())
+                    request = args(parent_completion_delivery="codex-native-queue")
                     wrapper.launch_parent_completion_sidecar(request, Path("/tmp/jobs"))
                     self.assertEqual(launch.call_args.kwargs["attempt_ids"], {request.attempt_id})
                     self.assertEqual(launch.call_args.kwargs["parent_session_id"], "thread-parent")
                     self.assertEqual(request.managed_sidecar_state,
                                      "running" if recorded else "running-unrecorded")
+                    self.assertEqual(launch.call_args.kwargs["attempt_ids"], {request.attempt_id})
 
     def test_sidecar_failure_cannot_be_reported_as_delivery_ready(self):
         for child, wrapper in ADAPTERS.items():
             with self.subTest(child=child), \
-                 mock.patch.object(wrapper, "launch_managed_completion_sidecar",
+                 mock.patch.object(wrapper, "launch_codex_queue_completion_sidecar",
                                    side_effect=P.ManagedDispatchError("managed-control-unavailable")), \
                  mock.patch.object(wrapper, "annotate_attempt_row", return_value=True):
-                request = args(parent_completion_delivery=P.MANAGED_PARENT_DELIVERY,
-                               managed_gateway_binding=object())
+                request = args(parent_completion_delivery="codex-native-queue")
                 wrapper.launch_parent_completion_sidecar(request, Path("/tmp/jobs"))
                 self.assertEqual(request.managed_sidecar_state, "launch-failed")
 
     def test_registration_transport_is_immutable_at_start(self):
-        request = args(parent_completion_delivery=P.MANAGED_PARENT_DELIVERY)
+        request = args(parent_completion_delivery="codex-native-queue")
         with self.assertRaises(P.DispatchContractError) as caught:
             P.validate_registered_delivery(request, Path("/tmp/jobs"), read=lambda *_: "poll-fallback")
         self.assertEqual(caught.exception.reason, "attempt-parent-delivery-changed")
@@ -251,11 +242,11 @@ class ParentDeliveryContract(unittest.TestCase):
                     self.assertEqual(values["attempt_ids"], {attempt})
                     row = jobs.read_text()
                     self.assertIn("attempt_id=" + attempt, row)
-                    self.assertIn("parent_completion_delivery=" + P.MANAGED_PARENT_DELIVERY, row)
+                    self.assertIn("parent_completion_delivery=codex-native-queue", row)
                     self.assertNotIn("launch_started=1", row)
                     raise P.ManagedDispatchError("fixture-carrier-unavailable")
 
-                sidecar = stack.enter_context(mock.patch.object(wrapper, "launch_managed_completion_sidecar", side_effect=launch))
+                sidecar = stack.enter_context(mock.patch.object(wrapper, "launch_codex_queue_completion_sidecar", side_effect=launch))
                 cli = [
                     "dispatch-headless.py", "--start", "--worktree", str(worktree),
                     "--jobs", str(jobs), "--log-dir", str(root / "logs"),
