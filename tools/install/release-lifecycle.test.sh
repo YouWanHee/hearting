@@ -736,6 +736,16 @@ REPOSITORY_OVERRIDE_EXIT=$?
 set -e
 [ "$REPOSITORY_OVERRIDE_EXIT" -eq 64 ]
 
+# Seed the exact legacy owned launcher to exercise retirement/rollback.
+python3 - "$ROOT/tools/install" "$CODEX_HOME" "$HARNESS_BIN_DIR" "$VENDOR_BIN/codex" <<'SEED'
+from pathlib import Path
+import sys
+sys.path.insert(0, sys.argv[1])
+import codex_launcher
+result = codex_launcher.install(codex_home=Path(sys.argv[2]), bin_dir=Path(sys.argv[3]), real_command=Path(sys.argv[4]), allow_legacy_inplace=True)
+assert result["status"] in {"created", "unchanged"}, result
+SEED
+
 INSTALL_HANDSHAKE="$INTEGRATION/after-capture-install"
 mkdir -p "$INSTALL_HANDSHAKE"
 export HARNESS_RUNTIME_TEST_AFTER_CAPTURE_DIR="$INSTALL_HANDSHAKE"
@@ -769,25 +779,16 @@ assert updated["release"]["status"] == "up-to-date"
 
 codex_report = next(r for r in doctor["runtimes"] if r["runtime"] == "codex")
 launcher = codex_report["managed_launcher"]
-assert launcher["installed"], launcher
-assert launcher["healthy"], launcher
-# This fixture sets HARNESS_BIN_DIR globally for the top-level `harness`
-# launcher's own install location; codex_launcher.py treats that same
-# explicit-bin-dir signal as opt-in compatibility mode by design (an
-# operator naming HARNESS_BIN_DIR is exactly the documented escape hatch for
-# private/test fixtures), so it correctly reports `legacy-inplace-v1` /
-# `protected=false` here rather than the default protected-path mode.
-assert launcher["mode"] == "legacy-inplace-v1", launcher
-assert launcher["protected"] is False, launcher
-assert launcher["real_command"] == os.path.abspath(vendor_codex), launcher
+assert not launcher["installed"], launcher
+assert codex_report["status"]["executable_ingress"] == {"owner": "vendor", "hearting_ingress": "none"}, codex_report
 assert os.path.realpath(vendor_codex) == os.path.abspath(vendor_codex), (
     "same-version repair must never overwrite the vendor Codex command"
 )
 same_version_launcher = updated["release"]["launcher"]
 assert same_version_launcher is not None
-assert same_version_launcher["status"] in {"unchanged", "created"}, same_version_launcher
+assert same_version_launcher["status"] in {"not-installed", "restored"}, same_version_launcher
 PY
-echo "ok - managed release installs and same-version-repairs the protected Codex launcher without touching the vendor command"
+echo "ok - managed release retires and keeps retired the owned Codex launcher without touching the vendor command"
 
 HARNESS_INSTALL_URL="file://$INTEGRATION/assets/install.sh" "$ROOT/install.sh" --no-auto-update --json > "$INTEGRATION/legacy-redirect.json"
 python3 - "$INTEGRATION/legacy-redirect.json" <<'PY'
@@ -903,12 +904,20 @@ row = json.load(open(sys.argv[1]))
 vendor_codex = sys.argv[2]
 codex = row if row.get("runtime") == "codex" else next(r for r in row["runtimes"] if r["runtime"] == "codex")
 launcher = codex["managed_launcher"]
-assert launcher["installed"] and launcher["healthy"], launcher
-assert launcher["real_command"] == os.path.abspath(vendor_codex), (
-    "genuine version update must preserve the vendor Codex binding", launcher
-)
+assert not launcher["installed"], launcher
+assert os.path.isfile(vendor_codex), vendor_codex
 PY
-echo "ok - genuine Codex-managed version update preserves the protected launcher and vendor binding"
+echo "ok - genuine version update keeps the launcher retired and vendor command intact"
+
+# Seed the exact legacy owned launcher to exercise retirement/rollback.
+python3 - "$ROOT/tools/install" "$CODEX_HOME" "$HARNESS_BIN_DIR" "$VENDOR_BIN/codex" <<'SEED'
+from pathlib import Path
+import sys
+sys.path.insert(0, sys.argv[1])
+import codex_launcher
+result = codex_launcher.install(codex_home=Path(sys.argv[2]), bin_dir=Path(sys.argv[3]), real_command=Path(sys.argv[4]), allow_legacy_inplace=True)
+assert result["status"] in {"created", "unchanged"}, result
+SEED
 
 WRAPPER_BEFORE=$(sha256sum "$CODEX_WRAPPER" | cut -d ' ' -f 1)
 STATE_BEFORE=$(sha256sum "$CODEX_LAUNCHER_STATE" | cut -d ' ' -f 1)
@@ -1013,8 +1022,9 @@ assert not os.path.isdir(os.path.join(releases_root, "v0.0.0-integration-2")), (
 assert not wrapper.startswith(releases_root + os.sep), wrapper
 assert not state.startswith(releases_root + os.sep), state
 
-state_data = json.load(open(state))
-assert state_data["real_command"] == vendor_codex, state_data
+assert not os.path.lexists(wrapper), wrapper
+assert not os.path.lexists(state), state
+assert os.path.isfile(vendor_codex), vendor_codex
 PY
 "$HARNESS_BIN_DIR/harness" runtime doctor --runtime codex --strict --json > "$INTEGRATION/doctor-v4.json"
 python3 - "$INTEGRATION/doctor-v4.json" "$VENDOR_BIN/codex" <<'PY'
@@ -1023,10 +1033,10 @@ row = json.load(open(sys.argv[1]))
 vendor_codex = sys.argv[2]
 codex = row if row.get("runtime") == "codex" else next(r for r in row["runtimes"] if r["runtime"] == "codex")
 launcher = codex["managed_launcher"]
-assert launcher["installed"] and launcher["healthy"], launcher
-assert launcher["real_command"] == os.path.abspath(vendor_codex), launcher
+assert not launcher["installed"], launcher
+assert os.path.isfile(vendor_codex), vendor_codex
 PY
-echo "ok - pruning older managed releases never repoints or removes the protected Codex ingress, which stays vendor-bound"
+echo "ok - pruning older releases preserves native Codex and does not recreate the launcher"
 
 # I-2 regression (plan-check round-1 frame §6.4 / assignment 검증요구 (a)):
 # _cleanup_releases keeps only the 2 most recent packaged releases and

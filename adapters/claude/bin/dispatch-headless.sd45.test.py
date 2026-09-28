@@ -320,7 +320,7 @@ class ClaudeChildParentRuntimeDelivery(unittest.TestCase):
         values.update(overrides)
         return argparse.Namespace(**values)
 
-    def test_codex_parent_selects_gateway_for_claude_child(self):
+    def test_codex_parent_selects_native_queue_for_claude_child(self):
         args = self.parent_args()
         binding = object()
         with mock.patch.dict(
@@ -337,12 +337,12 @@ class ClaudeChildParentRuntimeDelivery(unittest.TestCase):
         ):
             WH.bind_parent_completion_delivery(args)
         self.assertEqual(
-            args.parent_completion_delivery, WH.MANAGED_PARENT_DELIVERY
+            args.parent_completion_delivery, "codex-native-queue"
         )
-        self.assertIs(args.managed_gateway_binding, binding)
+        self.assertIsNone(args.managed_gateway_binding)
         WH.validate_interactive_parent_launch(args)
 
-    def test_unmanaged_codex_parent_is_identified_then_blocked(self):
+    def test_unmanaged_codex_parent_is_identified_and_admitted(self):
         args = self.parent_args(
             parent_harness="claude",
             parent_session_id="synthetic",
@@ -359,12 +359,10 @@ class ClaudeChildParentRuntimeDelivery(unittest.TestCase):
         ):
             WH._bind_runtime_parent(args)
             WH.bind_parent_completion_delivery(args)
-            with self.assertRaises(WH.DispatchContractError) as raised:
-                WH.validate_interactive_parent_launch(args)
+            WH.validate_interactive_parent_launch(args)
         self.assertEqual(args.parent_harness, "codex")
         self.assertEqual(args.parent_session_id, "thread-real")
-        self.assertEqual(args.parent_completion_delivery, "poll-fallback")
-        self.assertEqual(raised.exception.reason, "managed-entry-required")
+        self.assertEqual(args.parent_completion_delivery, "codex-native-queue")
 
     def test_low_level_operator_can_explicitly_select_finite_poll_recovery(self):
         args = self.parent_args(

@@ -92,15 +92,12 @@ for row in data["runtimes"]:
     assert row["freshness"] == "fresh", row
 PY
 
-  # Strict doctor now verifies the protected Codex ingress is the command a
-  # fresh shell would resolve. Keep this private-HOME fixture hermetic instead
-  # of inheriting a host vendor command that happens to appear earlier on PATH.
-  PATH="$CODEX_HOME/.harness/bin${PATH:+:$PATH}"
-  export PATH
+  # Activation leaves the native vendor CLI on PATH without a launcher.
   hash -r 2>/dev/null || true
   resolved_codex=$(command -v codex || true)
-  test "$resolved_codex" = "$CODEX_HOME/.harness/bin/codex" \
-    || fail "$mode protected Codex ingress is not first on PATH: expected=$CODEX_HOME/.harness/bin/codex actual=${resolved_codex:-missing}"
+  test "$resolved_codex" = "$VENDOR_BIN/codex" \
+    || fail "$mode native Codex command changed: ${resolved_codex:-missing}"
+  test ! -e "$CODEX_HOME/.harness/bin/codex" || fail "$mode recreated retired launcher"
 
   test "$(count_dirs "$HOME/.codex/skills")" = "$EXPECTED_CAPABILITIES" || fail "$mode Codex skill count"
   test "$(count_dirs "$HOME/.claude/skills")" = "$EXPECTED_CAPABILITIES" || fail "$mode Claude skill count"
