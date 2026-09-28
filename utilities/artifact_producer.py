@@ -1832,20 +1832,6 @@ def _begin_cycle_record(
                 if campaign is None:
                     raise ProducerError("campaign-unknown", parent["campaign_id"])
                 requested_selection = {"by": "parent_cycle", "value": parent_cycle_id}
-        if campaign is not None:
-            if campaign.get("state") == "satisfied":
-                try:
-                    reopened = artifact_campaign._reopen_locked(
-                        root, _campaign_path(root, campaign["campaign_id"], campaign),
-                        route_id=route["route_id"], requested_selection=requested_selection)
-                except artifact_campaign.CampaignError as exc:
-                    raise ProducerError(exc.code, exc.detail) from exc
-                campaign_reopen_event_id = reopened.get("event_id")
-                campaign = read_campaign(root, campaign["campaign_id"])
-            if campaign is None or campaign.get("state") != "active":
-                raise ProducerError("campaign-not-active", campaign_id or parent_cycle_id or campaign_key)
-            if campaign_key is not None and campaign.get("key") != campaign_key:
-                raise ProducerError("campaign-key-mismatch", campaign_key)
         import artifact_workflow_groups
         # Ambient context is accepted only for the exact selected campaign;
         # the parent-cycle edge alone never selects or implies a group.
@@ -1861,7 +1847,12 @@ def _begin_cycle_record(
             if workflow_group_id and inherited_group_id and workflow_group_id != inherited_group_id:
                 raise ProducerError("workflow-group-context-conflict", workflow_group_id)
             try:
-                artifact_workflow_groups.require_group_context(root, campaign["campaign_id"], selected_group_id)
+                early_title = (resumable.get("title") if resumable is not None
+                               else _route_naming(route, campaign, title=title, goal=goal, root=root)[1])
+                early_label = workflow_stage_label or artifact_workflow_groups.stage_label_from_title(early_title)
+                artifact_workflow_groups.preflight_join_locked(
+                    root, campaign["campaign_id"], selected_group_id, early_label,
+                    cycle_id=resumable["cycle_id"] if resumable is not None else None)
             except artifact_workflow_groups.WorkflowGroupError as exc:
                 raise ProducerError(exc.code, exc.detail) from exc
         if workflow_stage_label is not None:
@@ -1869,6 +1860,20 @@ def _begin_cycle_record(
                 artifact_workflow_groups._text(workflow_stage_label, 40, "stage-label-invalid")
             except artifact_workflow_groups.WorkflowGroupError as exc:
                 raise ProducerError(exc.code, exc.detail) from exc
+        if campaign is not None:
+            if campaign.get("state") == "satisfied":
+                try:
+                    reopened = artifact_campaign._reopen_locked(
+                        root, _campaign_path(root, campaign["campaign_id"], campaign),
+                        route_id=route["route_id"], requested_selection=requested_selection)
+                except artifact_campaign.CampaignError as exc:
+                    raise ProducerError(exc.code, exc.detail) from exc
+                campaign_reopen_event_id = reopened.get("event_id")
+                campaign = read_campaign(root, campaign["campaign_id"])
+            if campaign is None or campaign.get("state") != "active":
+                raise ProducerError("campaign-not-active", campaign_id or parent_cycle_id or campaign_key)
+            if campaign_key is not None and campaign.get("key") != campaign_key:
+                raise ProducerError("campaign-key-mismatch", campaign_key)
         # Idempotent per route: one open cycle per verified lineage (D-120). A
         # continuation resuming an ancestor's open cycle is the same idempotent
         # path with `rebound=True` and an extended audit record.

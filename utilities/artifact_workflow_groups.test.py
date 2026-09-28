@@ -139,7 +139,41 @@ class WorkflowGroupsTest(fixture.ProducerTestBase):
                 plan = W.prepare(self.root, rows[0]["campaign"], self._proposal(rows, [first, second]))
                 self.assertEqual(bound.call_count, 1)
                 W.apply(self.root, plan)
-                self.assertEqual(bound.call_count, 2)
+                self.assertEqual(bound.call_count, 3)
+
+    def test_same_size_evidence_race_refuses_apply_without_metadata_write(self):
+        rows = self._cycles(2)
+        camp = rows[0]["campaign"]
+        plan = W.prepare(self.root, camp, self._proposal(rows, [self._relation(rows[0], rows[1])]))
+        original_size_check = W._evidence_size
+        calls = 0
+
+        def mutate_after_size_check(root, refs):
+            nonlocal calls
+            size = original_size_check(root, refs)
+            calls += 1
+            if calls == 2:
+                original = rows[0]["file"].read_bytes()
+                rows[0]["file"].write_bytes(b"X" * len(original))
+            return size
+
+        with mock.patch.object(W, "_evidence_size", side_effect=mutate_after_size_check):
+            with self.assertRaises(W.WorkflowGroupError) as caught:
+                W.apply(self.root, plan)
+        self.assertEqual(caught.exception.code, "evidence-not-current-manifest")
+        self.assertFalse(W.declaration_path(self.root, camp).exists())
+
+    def test_unrelated_merge_keeps_historical_stale_evidence(self):
+        rows = self._cycles(4)
+        camp = rows[0]["campaign"]
+        first = W.prepare(self.root, camp, self._proposal(rows[:2], [self._relation(rows[0], rows[1])]))
+        W.apply(self.root, first)
+        original = rows[0]["file"].read_bytes()
+        rows[0]["file"].write_bytes(b"X" * len(original))
+        second = W.prepare(self.root, camp, self._proposal(rows[2:],
+                           [self._relation(rows[2], rows[3])], title="Another workflow"))
+        self.assertEqual(W.apply(self.root, second)["status"], "applied")
+        self.assertEqual(W.verify(self.root, camp)["stale_evidence"], [rows[0]["path"]])
 
     def test_missing_and_outside_evidence_refused_before_write(self):
         rows = self._cycles(2)
@@ -178,6 +212,27 @@ class WorkflowGroupsTest(fixture.ProducerTestBase):
         self.assertNotIn("AGENT_ARTIFACT_WORKFLOW_GROUP_ID", ungrouped["env"])
         doc = W._load_existing(W.declaration_path(self.root, camp))
         self.assertEqual(len(doc["groups"][0]["members"]), 3)
+
+    def test_full_group_refuses_begin_before_cycle_or_index_write(self):
+        rows = self._cycles(64)
+        camp = rows[0]["campaign"]
+        plan = W.prepare(self.root, camp, self._proposal(rows))
+        W.apply(self.root, plan)
+        gid = plan["document"]["groups"][0]["group_id"]
+        campaign_dir = P.campaign_dir(self.root, camp)
+        protected = [campaign_dir / "campaign.json", campaign_dir / W.NAME,
+                     self.root / "campaigns" / "INDEX.json"]
+        before = {path: path.read_bytes() for path in protected}
+        before_dirs = {path.name for path in campaign_dir.iterdir()}
+        before_records = {path.name for path in (P.producer_dir(self.root) / "cycles").iterdir()}
+        route, route_file = self.route(slug="workflow-overflow", campaign_key="workflow-test")
+        with self.assertRaises(P.ProducerError) as caught:
+            P.begin(self.root, route_file=route_file, capability="autopilot-code",
+                    intensity="direct", campaign_key="workflow-test", workflow_group_id=gid)
+        self.assertEqual(caught.exception.code, "member-count-invalid")
+        self.assertEqual({path: path.read_bytes() for path in protected}, before)
+        self.assertEqual({path.name for path in campaign_dir.iterdir()}, before_dirs)
+        self.assertEqual({path.name for path in (P.producer_dir(self.root) / "cycles").iterdir()}, before_records)
 
     def test_replace_withdraws_group_and_new_evidence_drift_blocks_apply(self):
         rows = self._cycles(2)

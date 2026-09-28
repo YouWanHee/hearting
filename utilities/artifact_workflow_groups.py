@@ -676,6 +676,28 @@ def apply(root: Path, plan_value: Mapping[str, Any]) -> dict[str, Any]:
         latest = _regular(path, missing=True)
         if (_digest(latest) if latest is not None else None) != current_digest:
             raise WorkflowGroupError("declaration-preimage-conflict")
+        # Evidence files are outside the producer admission lock. Rebind only
+        # newly authored relations after the final size check, as close as
+        # possible to the metadata replacement. Old historical refs may be
+        # stale and must not block an unrelated merge.
+        final_bytes = 0
+        final_paths: set[str] = set()
+        for expected in expected_new:
+            evidence_path = expected["path"]
+            if evidence_path in final_paths:
+                continue
+            source, target = expected["from_cycle_id"], expected["to_cycle_id"]
+            ref = {key: expected[key] for key in EVIDENCE_FIELDS}
+            size = _evidence_stat(root, _safe_relative(evidence_path)).st_size
+            if final_bytes + size > MAX_EVIDENCE_TOTAL:
+                raise WorkflowGroupError("evidence-total-size-limit")
+            _bind_evidence(root, campaign, ref, ((source, dirs[source]), (target, dirs[target])),
+                           remaining=MAX_EVIDENCE_TOTAL - final_bytes)
+            final_bytes += size
+            final_paths.add(evidence_path)
+        latest = _regular(path, missing=True)
+        if (_digest(latest) if latest is not None else None) != current_digest:
+            raise WorkflowGroupError("declaration-preimage-conflict")
         producer._write_atomic(path, _bytes(doc))
         return {"status": "applied", "campaign_id": plan["campaign_id"], "sha256": plan["after_sha256"]}
     finally:
@@ -753,6 +775,35 @@ def require_group_context(root: Path, campaign_id: str, group_id: str) -> None:
     doc = _validate_document(root, campaign, directory, root_id, repo_id, _json(raw))
     if not any(group["group_id"] == group_id for group in doc["groups"]):
         raise WorkflowGroupError("group-unknown", group_id)
+
+
+def preflight_join_locked(root: Path, campaign_id: str, group_id: str,
+                          stage_label: str, *, cycle_id: str | None = None) -> None:
+    """Check a prospective join before begin writes a cycle or campaign."""
+    root = Path(root).resolve()
+    if not admission.holds_lock(root):
+        raise WorkflowGroupError("producer-lock-required")
+    label = _text(stage_label, 40, "stage-label-invalid")
+    campaign, directory, root_id, repo_id = _context(root, campaign_id)
+    raw = _regular(directory / NAME)
+    assert raw is not None
+    doc = _validate_document(root, campaign, directory, root_id, repo_id, _json(raw))
+    group = next((row for row in doc["groups"] if row["group_id"] == group_id), None)
+    if group is None:
+        raise WorkflowGroupError("group-unknown", group_id)
+    if cycle_id is not None:
+        if any(item["cycle_id"] == cycle_id for item in group["members"]):
+            return
+        if any(item["cycle_id"] == cycle_id for row in doc["groups"] for item in row["members"]):
+            raise WorkflowGroupError("member-duplicate", cycle_id)
+    if len(group["members"]) >= 64 or sum(len(row["members"]) for row in doc["groups"]) >= 256:
+        raise WorkflowGroupError("member-count-invalid", group_id)
+    # All cycle IDs have equal byte length. A placeholder checks the exact
+    # projected declaration size without requiring a record that does not yet
+    # exist; begin checks actual ID uniqueness before its first cycle write.
+    group["members"].append({"cycle_id": cycle_id or "cyc_" + "0" * 32, "stage_label": label})
+    if len(_bytes(doc)) > MAX_DECLARATION:
+        raise WorkflowGroupError("declaration-size-limit")
 
 
 def join_at_begin_locked(root: Path, campaign_id: str, cycle_id: str,
