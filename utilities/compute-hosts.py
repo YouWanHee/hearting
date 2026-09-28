@@ -850,6 +850,7 @@ def safe_label(value, fallback):
 
 def process_owner(pid, expected_start):
     candidates = {"job": [], "run": [], "session": [], "harness": []}
+    claimed_sessions = []
     seen = set()
     current = pid
     depth = 0
@@ -915,9 +916,9 @@ def process_owner(pid, expected_start):
                 continue
             harness = owner.get("harness")
             sid = owner.get("id")
-            if harness not in {"claude", "codex", "opencode"} or not isinstance(sid, str):
+            if harness not in {"claude", "codex", "opencode"} or not isinstance(sid, str) or not sid:
                 continue
-            candidates["session"].append({
+            claimed_sessions.append({
                 "kind": "session", "id": sid,
                 "label": "%s:%s" % (harness, safe_label(sid[:8], "session")),
                 "harness": harness, "evidence_pid": current,
@@ -949,6 +950,14 @@ def process_owner(pid, expected_start):
     final_stat = proc_stat(pid)
     if final_stat is None or final_stat["start"] != expected_start:
         return None, "pid-reused-or-gone", None
+    # A claim binds an exact live root process to its current session.  Its
+    # inherited launch environment may still name the previous session after
+    # a handoff; only matching claims supersede that ambient evidence.  Keep
+    # all matching claims so conflicting owners remain ambiguous.
+    if claimed_sessions:
+        if len({(claim["harness"], claim["id"]) for claim in claimed_sessions}) > 1:
+            return None, "ambiguous-session", None
+        candidates["session"] = claimed_sessions
     exact_sessions = {}
     for candidate in candidates["session"]:
         harness, sid = candidate.get("harness"), candidate.get("id")

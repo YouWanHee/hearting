@@ -843,7 +843,10 @@ environment no longer survive. It writes only to the shared run root's
 `.process-owners.json`, never to the inventory. Creation revalidates the remote
 root PID's start time, effective UID, and command-line SHA-256; every later
 probe revalidates the same tuple and requires the current GPU process ancestry
-to contain that exact root. A stale/reused PID, changed command, ambiguous
+to contain that exact root. A valid claim takes precedence over inherited
+session environment on that ancestry, allowing a live job to change displayed
+session ownership without restarting it. Conflicting valid claims remain
+ambiguous. A stale/reused PID, changed command, ambiguous
 claim, missing ancestry, or unreadable `/proc` remains unattributed. Cwd, PID
 number alone, and transcript text are never ownership evidence.
 

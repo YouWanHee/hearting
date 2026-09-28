@@ -7,6 +7,7 @@ launch, log, exit code, listing — is exercised without a network.
 import importlib.util
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -552,24 +553,36 @@ class ComputeHostsTest(unittest.TestCase):
             "OPENCODE_SESSION_ID",
         }
         clean = {key: value for key, value in os.environ.items() if key not in identity_keys}
+        gpu_pid_file = self.root / "claimed-gpu.pid"
         process = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(10)"], env=clean,
+            [sys.executable, "-c", "import pathlib, subprocess, sys; "
+             "child = subprocess.Popen([sys.executable, '-c', "
+             "'import time; time.sleep(10)']); "
+             "pathlib.Path(sys.argv[1]).write_text(str(child.pid)); child.wait()",
+             str(gpu_pid_file)],
+            env={**clean, "CLAUDE_CODE_SESSION_ID": "previous-session"},
             start_new_session=True,
         )
         try:
+            for _ in range(100):
+                if gpu_pid_file.is_file():
+                    break
+                time.sleep(0.01)
+            self.assertTrue(gpu_pid_file.is_file())
+            gpu_pid = int(gpu_pid_file.read_text())
             claimed = self.run_tool(
-                "claim", "here", str(process.pid), "--harness", "claude",
+                "claim", "here", str(process.pid), "--harness", "codex",
                 "--session", "f11a0486-c090-4098-aeb0-0fd6d79f8d0c", "--json",
             )
             self.assertEqual(claimed.returncode, 0, claimed.stderr)
             claim = json.loads(claimed.stdout)
             self.assertEqual(claim["root_pid"], process.pid)
-            self.assertEqual(claim["owner"]["label"], "claude:f11a0486")
+            self.assertEqual(claim["owner"]["label"], "codex:f11a0486")
 
             env = {
                 **clean,
                 "PATH": str(fakebin) + os.pathsep + os.environ.get("PATH", ""),
-                "CLAIMED_GPU_PID": str(process.pid),
+                "CLAIMED_GPU_PID": str(gpu_pid),
                 "HEARTING_OWNER_CLAIMS_JSON": json.dumps([claim]),
             }
             result = subprocess.run(
@@ -586,19 +599,57 @@ class ComputeHostsTest(unittest.TestCase):
             )
             self.assertEqual(stale_result.returncode, 0, stale_result.stderr)
             stale_payload = json.loads(stale_result.stdout)
+            reused_claim = {**claim, "root_start": claim["root_start"] + 1}
+            reused_result = subprocess.run(
+                ["bash", "-c", module.PROBE_SCRIPT], text=True, capture_output=True,
+                env={**env, "HEARTING_OWNER_CLAIMS_JSON": json.dumps([reused_claim])},
+                timeout=5,
+            )
+            self.assertEqual(reused_result.returncode, 0, reused_result.stderr)
+            reused_payload = json.loads(reused_result.stdout)
+            conflicting_claim = {**claim, "owner": {
+                "kind": "session", "harness": "claude", "id": "other-session",
+                "label": "claude:other-se",
+            }}
+            conflict_result = subprocess.run(
+                ["bash", "-c", module.PROBE_SCRIPT], text=True, capture_output=True,
+                env={**env, "HEARTING_OWNER_CLAIMS_JSON": json.dumps(
+                    [claim, conflicting_claim])}, timeout=5,
+            )
+            self.assertEqual(conflict_result.returncode, 0, conflict_result.stderr)
+            conflict_payload = json.loads(conflict_result.stdout)
+            child_claim_result = self.run_tool(
+                "claim", "here", str(gpu_pid), "--harness", "claude",
+                "--session", "different-session", "--json",
+            )
+            self.assertEqual(child_claim_result.returncode, 0,
+                             child_claim_result.stderr)
+            child_claim = json.loads(child_claim_result.stdout)
+            ancestry_result = subprocess.run(
+                ["bash", "-c", module.PROBE_SCRIPT], text=True, capture_output=True,
+                env={**env, "HEARTING_OWNER_CLAIMS_JSON": json.dumps(
+                    [claim, child_claim])}, timeout=5,
+            )
+            self.assertEqual(ancestry_result.returncode, 0, ancestry_result.stderr)
+            ancestry_payload = json.loads(ancestry_result.stdout)
         finally:
-            process.terminate()
+            os.killpg(process.pid, signal.SIGTERM)
             process.wait(timeout=2)
 
         owner = payload["gpus"][0]["processes"][0]["owner"]
         self.assertEqual(owner["kind"], "session")
-        self.assertEqual(owner["label"], "claude:f11a0486")
+        self.assertEqual(owner["label"], "codex:f11a0486")
         self.assertEqual(owner["source"], "persistent-claim+ancestry")
-        stale_process = stale_payload["gpus"][0]["processes"][0]
-        stale_owner = stale_process["owner"]
-        if stale_owner is not None:  # the test runner's own session ancestor may still be exact
-            self.assertNotEqual(stale_owner["label"], "claude:f11a0486")
-            self.assertNotEqual(stale_owner["source"], "persistent-claim+ancestry")
+        self.assertEqual(payload["gpus"][0]["processes"][0]["session_owner"], owner)
+        for rejected in (stale_payload, reused_payload):
+            rejected_owner = rejected["gpus"][0]["processes"][0]["owner"]
+            if rejected_owner is not None:
+                self.assertNotEqual(rejected_owner["source"], "persistent-claim+ancestry")
+        for conflict in (conflict_payload, ancestry_payload):
+            conflict_process = conflict["gpus"][0]["processes"][0]
+            self.assertIsNone(conflict_process["owner"])
+            self.assertEqual(conflict_process["attribution_reason"],
+                             "ambiguous-session")
 
 
 if __name__ == "__main__":
