@@ -4644,20 +4644,32 @@ def _gpu_resources_for_session(session, resource_index):
 
 
 def _gpu_resource_strip(resources, term_width=None, depth=0, in_card=False):
-    """One exact-session resource strip, orthogonal to work/stage/liveness rendering."""
+    """Exact-session GPU resources with claim-backed process names in place."""
     if not resources:
         return []
     indent = _conn_indent(depth, in_card)
     width = max(20, int(term_width or 200))
 
-    def build(show_model, show_memory):
+    def build(shown, show_model, show_memory):
         segs = [(indent, None)]
-        for position, resource in enumerate(resources):
+        for position, resource in enumerate(shown):
             if position:
                 segs.append((" · ", "dim"))
             identity = "GPU %s:%s" % (resource["host"], resource["index"])
             pulse_key = "g_work" if _BLINK_ON else "g_work_off"
             segs += [("●", pulse_key), (" ", None), (identity, "name_dim")]
+            labels = []
+            seen = set()
+            for process in resource.get("processes") or ():
+                exact = (process["pid"], process["proc_start"])
+                if exact in seen:
+                    continue
+                seen.add(exact)
+                label = _gpu_process_label(process["command"])
+                if label not in labels:
+                    labels.append(label)
+            if labels:
+                segs += [(" (", "dim"), (", ".join(labels), "name_dim"), (")", "dim")]
             if show_model and resource.get("model"):
                 model = _gpu_display_model(resource["model"])
                 segs += [(" · ", "dim"),
@@ -4667,13 +4679,20 @@ def _gpu_resource_strip(resources, term_width=None, depth=0, in_card=False):
                           + " GB", "dim")]
         return segs
 
-    # F-89: drop model, then memory while preserving pulse + every GPU identity.
-    return [_fit_strip([lambda: build(True, True), lambda: build(False, True),
-                        lambda: build(False, False)], width)]
+    def fit(shown):
+        return _fit_strip([lambda: build(shown, True, True),
+                           lambda: build(shown, False, True),
+                           lambda: build(shown, False, False)], width)
+
+    # Keep the usual compact strip when every GPU's name fits. At narrow
+    # widths, split GPUs so the next one's label is not lost to clipping.
+    if sum(_dw(text) for text, _key in build(resources, False, False)) <= width:
+        return [fit(resources)]
+    return [fit([resource]) for resource in resources]
 
 
-def _gpu_run_title(command):
-    """Use explicit command arguments as the compact run title when present."""
+def _gpu_process_label(command):
+    """Shorten only unambiguous command names; leave other commands literal."""
     try:
         words = shlex.split(command)
     except ValueError:
@@ -4691,34 +4710,21 @@ def _gpu_run_title(command):
         value = value_of(option)
         if value:
             title = os.path.basename(value)
-            return mode + " " + title if mode else title
+            if option == "--config":
+                stem = os.path.splitext(title)[0]
+                fine_tune = re.match(r"^_?ft0*([1-9][0-9]*)__m([0-9]+)(?:_|$)", stem,
+                                     re.IGNORECASE)
+                model = re.match(r"^_?m([0-9]+(?:_[0-9]+)?)(?:_|$)", stem,
+                                 re.IGNORECASE)
+                if fine_tune:
+                    title = "M%s_%s" % (fine_tune.group(2), fine_tune.group(1))
+                elif model:
+                    title = "M" + model.group(1)
+                else:
+                    title = stem
+            activity = "학습" if mode in {"train", "train_ft"} else None
+            return title + (" " + activity if activity else "")
     return command
-
-
-def _gpu_run_rows(resources, term_width=None, depth=0, in_card=False):
-    """Live GPU processes under their exact session, once per host/PID/start."""
-    width = max(20, int(term_width or 200))
-    indent = _conn_indent(depth, in_card)
-    seen = set()
-    rows = []
-    for resource in resources:
-        for process in resource.get("processes") or ():
-            identity = (resource["host"], process["pid"], process["proc_start"])
-            if identity in seen:
-                continue
-            seen.add(identity)
-            title = _gpu_run_title(process["command"])
-            row = [(indent, None), ("●", "g_work" if _BLINK_ON else "g_work_off"),
-                   (" RUN ", "name_dim"),
-                   (title, "name_dim"),
-                   (" · %s pid %s" % (resource["host"], process["pid"]), "dim")]
-            rows.append(_clip_segs(row, width)[0])
-    return rows
-
-
-def _gpu_session_rows(resources, term_width=None, depth=0, in_card=False):
-    return (_gpu_resource_strip(resources, term_width, depth, in_card)
-            + _gpu_run_rows(resources, term_width, depth, in_card))
 
 
 def _gpu_state(gpu):
@@ -5402,7 +5408,7 @@ def _route_card(view, session_by_identity, term_width, now, gpu_resources=None):
             resources = (_gpu_resources_for_session(session, gpu_resources or {})
                          if session else [])
         if resources:
-            out.extend(_gpu_session_rows(resources, term_width=term_width))
+            out.extend(_gpu_resource_strip(resources, term_width=term_width))
 
     if _SHOW_ALL:
         # prd.md:310 — completion gates stay behind the `a` toggle, never on the base screen.
@@ -5497,7 +5503,7 @@ def _degrade_card(job, session_by_identity, term_width, gpu_resources=None):
         resources = (_gpu_resources_for_session(session, gpu_resources or {})
                      if session else [])
     if resources:
-        out.extend(_gpu_session_rows(resources, term_width=term_width))
+        out.extend(_gpu_resource_strip(resources, term_width=term_width))
     return out, {"card_key": card_key, "fold_line": 0, "job_rows": [], "folded": folded}
 
 
@@ -5653,7 +5659,7 @@ def _build_process_lines(sessions, jobs, route_views_by_id, malformed, memory, t
         if s_subs:
             lines.extend(_subagent_strip(s_subs, term_width=term_width))
         if session_resources and not covered:
-            lines.extend(_gpu_session_rows(session_resources, term_width=term_width))
+            lines.extend(_gpu_resource_strip(session_resources, term_width=term_width))
         for plugin_job in plugin_subs:
             lines.extend(_plugin_agent_row(plugin_job, term_width=term_width))
 
@@ -6458,7 +6464,7 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
                 job_resources = (_gpu_resources_for_session(job_session, gpu_resources)
                                  if job_session else [])
             if job_resources:
-                lines.extend(_gpu_session_rows(
+                lines.extend(_gpu_resource_strip(
                     job_resources, term_width=term_width, depth=depth, in_card=in_card))
             # Everything emitted above belongs to the owner itself (identity row, its
             # NOW line, its own sub-agent strip). Descendants start here, so this index
@@ -6645,7 +6651,7 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
                 lines.extend(_subagent_strip(shown_subs, term_width=term_width))
             session_resources = _gpu_resources_for_session(s, gpu_resources)
             if session_resources:
-                lines.extend(_gpu_session_rows(session_resources, term_width=term_width))
+                lines.extend(_gpu_resource_strip(session_resources, term_width=term_width))
             # Two relation lines at most: one for messages, one for stewarding. Each
             # carries both of its directions (user 2026-09-10).
             lines.extend(_peer_link_strip(getattr(s, "peer_last_sent", None), _peer_last,

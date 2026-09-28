@@ -240,14 +240,14 @@ class GpuProcessAndResourceRenderTest(unittest.TestCase):
                          [("cnn", 0), ("cnn", 1)])
         self.assertEqual(linked[0]["process_count"], 2)
         self.assertEqual(linked[0]["used_memory_mib"], 12288)
-        self.assertEqual(render._gpu_run_rows(linked), [])  # existing job/run rows own these
+        self.assertTrue(all(not row["processes"] for row in linked))
         near = Session(harness="codex", pid=102, session_id="sid-exact-other")
         self.assertEqual(render._gpu_resources_for_session(near, resources), [])
         job = DispatchJob(key="autopilot-code", harness="codex")
         job._runtime_session_id = "sid-exact"
         self.assertEqual(render._gpu_resources_for_session(job, resources), linked)
 
-    def test_claimed_training_processes_become_run_rows_under_exact_session(self):
+    def test_claimed_training_processes_label_gpu_items_under_exact_session(self):
         codex = Session(harness="codex", pid=101, proc_start="11",
                         cwd="/tmp/f88-project", session_id="sid-exact",
                         title="Codex [92]", liveness="working")
@@ -257,18 +257,15 @@ class GpuProcessAndResourceRenderTest(unittest.TestCase):
         claimed = {"kind": "session", "harness": "codex", "id": "sid-exact",
                    "source": "persistent-claim+ancestry"}
         snapshot = {"configured": True, "hosts": [{"host": "moving4", "gpus": [
-            {"index": 0, "processes": [
+            {"index": 0, "name": "NVIDIA A100", "processes": [
                 {"pid": 3697573, "proc_start": 90,
                  "command": "python run.py --engine_mode train --config _m6_lx3nx4.yaml",
-                 "owner": claimed, "session_owner": claimed},
+                 "owner": claimed, "session_owner": claimed, "used_memory_mib": 12000},
+            ]},
+            {"index": 1, "name": "NVIDIA A100", "processes": [
                 {"pid": 1416464, "proc_start": 91,
                  "command": "python run.py --engine_mode train_ft --config _ft09__m3_lx3nx4.yaml",
-                 "owner": claimed, "session_owner": claimed},
-            ]},
-            {"index": 1, "processes": [
-                {"pid": 3697573, "proc_start": 90,
-                 "command": "python run.py --engine_mode train --config _m6_lx3nx4.yaml",
-                 "owner": claimed, "session_owner": claimed},
+                 "owner": claimed, "session_owner": claimed, "used_memory_mib": 10000},
                 {"pid": 1859127, "proc_start": 92, "command": "python other.py",
                  "owner": {**claimed, "source": "ssh-connection+ancestry"},
                  "session_owner": claimed},
@@ -279,31 +276,68 @@ class GpuProcessAndResourceRenderTest(unittest.TestCase):
         linked = render._gpu_resources_for_session(codex, resources)
         self.assertEqual(render._gpu_resources_for_session(old, resources), [])
         for width in (168, 100, 60):
-            rows = render._gpu_run_rows(linked, term_width=width)
+            rows = render._gpu_resource_strip(linked, term_width=width)
             text = [render._plain(row) for row in rows]
-            self.assertEqual(len(rows), 2)
             self.assertTrue(all(render._dw(line) <= width for line in text))
-            self.assertTrue(all(" RUN " in line for line in text))
-            self.assertIn("RUN train _m6_lx3nx4.yaml", text[0])
-            self.assertIn("RUN train_ft _ft09__m3_lx3nx4.yaml", text[1])
+            joined = "\n".join(text)
+            self.assertEqual(joined.count("GPU moving4:0 (M6 학습)"), 1)
+            self.assertEqual(joined.count("GPU moving4:1 (M3_9 학습)"), 1)
+            self.assertNotIn("other.py", "\n".join(text))
+        narrow = [render._plain(row) for row in render._gpu_resource_strip(linked, 60)]
+        self.assertEqual(len(narrow), 2)
+        self.assertIn("12 GB", narrow[0])
+        self.assertIn("9.8 GB", narrow[1])
         for lines in (
             render._build_lines([codex, old], [], "both", False, 0,
                                 layout="wide", term_width=120),
             render._build_process_lines([codex, old], [], {}, 0, None, 120, "wide"),
         ):
             text = [render._plain(line) for line in lines if line]
-            run_rows = [line for line in text if " RUN " in line]
-            self.assertEqual(len(run_rows), 2)
-            self.assertTrue(any("_m6_lx3nx4.yaml" in line for line in run_rows))
-            self.assertTrue(any("_ft09__m3_lx3nx4.yaml" in line for line in run_rows))
+            gpu_rows = [line for line in text if "GPU moving4:" in line]
+            self.assertEqual("\n".join(gpu_rows).count("GPU moving4:0 (M6 학습)"), 1)
+            self.assertEqual("\n".join(gpu_rows).count("GPU moving4:1 (M3_9 학습)"), 1)
+            self.assertFalse(any(" RUN " in line for line in text))
             self.assertLess(next(i for i, line in enumerate(text) if "Codex [92]" in line),
-                            next(i for i, line in enumerate(text) if " RUN " in line))
+                            next(i for i, line in enumerate(text) if "GPU moving4:" in line))
         render._COMPUTE_HOSTS_SET_AT -= 3 * render._COMPUTE_HOST_INTERVAL + 1
         self.assertEqual(render._gpu_session_resources(), {})
         stale_lines = render._build_lines([codex], [], "both", False, 0,
                                           layout="wide", term_width=120)
-        self.assertFalse(any(" RUN " in render._plain(line)
+        self.assertFalse(any("GPU moving4:" in render._plain(line)
                              for line in stale_lines if line))
+
+    def test_gpu_labels_require_exact_claim_and_keep_multiple_processes_on_one_gpu(self):
+        claimed = {"kind": "session", "harness": "codex", "id": "sid-exact",
+                   "source": "persistent-claim+ancestry"}
+        run = {"kind": "run", "id": "registered-run"}
+        processes = [
+            {"pid": 1, "proc_start": 10, "command": "python run.py --engine_mode train --config _m6_lx3nx4.yaml",
+             "owner": claimed, "session_owner": claimed},
+            {"pid": 2, "proc_start": 20, "command": "python run.py --engine_mode eval --config unknown_eval.yaml",
+             "owner": claimed, "session_owner": claimed},
+            {"pid": 3, "proc_start": 30, "command": "python registered.py --name registered",
+             "owner": run, "session_owner": claimed},
+            {"pid": 4, "proc_start": 40, "command": "python ambiguous.py --name ambiguous",
+             "owner": {**claimed, "source": "ambiguous-session"}, "session_owner": claimed},
+            {"pid": 5, "proc_start": 50, "command": "python wrong.py --name wrong",
+             "owner": {**claimed, "id": "sid-other"}, "session_owner": claimed},
+            {"pid": 6, "proc_start": None, "command": "python reused.py --name reused",
+             "owner": claimed, "session_owner": claimed},
+        ]
+        snapshot = {"configured": True, "hosts": [{"host": "cnn", "gpus": [
+            {"index": 0, "processes": processes},
+        ]}]}
+        linked = render._gpu_resources_for_session(
+            self.session, render._gpu_session_resources(snapshot))
+        self.assertEqual(len(linked), 1)
+        self.assertEqual(len(linked[0]["processes"]), 2)
+        text = render._plain(render._gpu_resource_strip(linked, term_width=168)[0])
+        self.assertIn("GPU cnn:0 (M6 학습, unknown_eval)", text)
+        for absent in ("registered", "ambiguous", "wrong", "reused", "unknown_eval 학습"):
+            self.assertNotIn(absent, text)
+        self.assertEqual(render._gpu_process_label("python train.py --engine_mode eval --config other.yaml"),
+                         "other")
+        self.assertEqual(render._gpu_process_label("python unusual.py"), "python unusual.py")
 
     def test_managed_run_fences_stale_ancestor_sessions_end_to_end(self):
         module = _compute_hosts_module()
