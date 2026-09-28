@@ -370,6 +370,20 @@ class TestLocatorSafety(unittest.TestCase):
                 self.assertIn(code, _codes(m.validate_locators(self._with_path(path))))
                 self.assertIn(code, _codes(m.validate_locator_path(path)))
 
+    def test_utf8_payload_names_are_preserved(self):
+        paths = ["artifacts/analysis/report/field_0928/audio/공장잡음1.wav",
+                 "artifacts/analysis/report/field_0928/fig/測定📈.png"]
+        for path in paths:
+            with self.subTest(path=path):
+                self.assertTrue(m.validate_locator_path(path).ok)
+                self.assertTrue(m.validate(self._with_path(path)).ok)
+        self.assertIn("locator-too-many-components", _codes(
+            m.validate_locator_path("artifacts/analysis/" + "nested/" * 40 + "figure.png")))
+        self.assertIn("locator-too-many-components", _codes(
+            m.validate_locator_path("nested/" * 40 + "legacy.md")))
+        self.assertIn("locator-control-char", _codes(
+            m.validate_locator_path("artifacts/analysis/report/fig/bad\nname.png")))
+
     def test_rejects_reserved_manifest_filename_locator(self):
         self.assertIn("locator-reserved-name", _codes(m.validate_locators(self._with_path("manifest.json"))))
 

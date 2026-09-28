@@ -2083,6 +2083,9 @@ def _place_loose_outputs(root: Path, record: Mapping[str, Any], directory: Path)
         return []
     sources = [p for p in sorted(output.iterdir())
                if p.name not in BUCKET_TYPES and p.name not in SUPPORT_SEGMENTS
+               # Cutover snapshots are harness-owned staging, not user output.
+               and not (p.name == "shared-input" and
+                        (p / "_internal/migration-shared-bases.json").is_file())
                and not p.name.startswith(".") and not p.is_symlink()
                and (p.is_file() or p.is_dir())]
     if not sources:
@@ -2108,6 +2111,8 @@ def _place_loose_outputs(root: Path, record: Mapping[str, Any], directory: Path)
             destination = target / source.name
         if os.path.lexists(destination):
             continue
+        if any(parent.is_symlink() for parent in destination.parents if parent != directory):
+            continue
         row = {"from": source_rel, "to": destination.relative_to(directory).as_posix()}
         placements[source_rel] = row
         # Record the intended path before moving, so a retry can find the same
@@ -2115,8 +2120,6 @@ def _place_loose_outputs(root: Path, record: Mapping[str, Any], directory: Path)
         _ensure_dir(placement_path.parent)
         _write_atomic(placement_path, _json_bytes({"moves": list(placements.values())}), 0o644)
         try:
-            if any(parent.is_symlink() for parent in destination.parents if parent != directory):
-                continue
             destination.parent.mkdir(parents=True, exist_ok=True)
             source.rename(destination)
         except OSError as exc:
@@ -2138,6 +2141,33 @@ def _output_placements(root: Path, record: Mapping[str, Any]) -> List[Dict[str, 
         isinstance(row.get(key), str) and row[key].startswith("artifacts/")
         and not any(part in {"", ".", ".."} for part in row[key].split("/"))
         for key in ("from", "to"))]
+
+
+def resolve_placed_output(path: Path) -> Path:
+    """Follow this cycle's recorded move without changing sealed evidence bytes."""
+    path = Path(path)
+    if not path.is_absolute() or os.path.lexists(path):
+        return path
+    for output in path.parents:
+        if output.name != "artifacts":
+            continue
+        directory = output.parent
+        binding = _read_json(directory / ".cycle.json") or {}
+        cid = binding.get("cycle_id", "")
+        if not artifact_identity.is_well_formed(cid, "cycle"):
+            continue
+        for root in list(directory.parents)[:4]:
+            record = read_cycle_record(root, cid)
+            if record is None:
+                continue
+            if cycle_dir(root, record["campaign_id"], cid, record) != directory:
+                continue
+            relative = path.relative_to(directory).as_posix()
+            placed = _placed_locator(relative, _output_placements(root, record))
+            candidate = directory / placed
+            if candidate.resolve().is_relative_to(output.resolve()) and candidate.exists():
+                return candidate
+    return path
 
 
 def _placed_locator(locator: Optional[str], moved: Sequence[Mapping[str, str]]) -> Optional[str]:
@@ -2876,8 +2906,12 @@ def _checkpoint_scan(directory: Path, previous: Mapping[str, Any], limits: Check
                 excluded["oversize"] += 1
                 continue
             rel = Path(path).relative_to(directory).as_posix()
-            if not artifact_manifest.validate_locator_path(rel).ok:
+            locator = artifact_manifest.validate_locator_path(rel)
+            if not locator.ok:
                 excluded["invalid-locator"] += 1
+                reason = locator.violations[0].code
+                reasons = excluded.setdefault("invalid-locator-reasons", {})
+                reasons[reason] = reasons.get(reason, 0) + 1
                 continue
             candidates.append((rel, path, info))
             total += info.st_size

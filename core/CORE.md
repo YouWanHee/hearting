@@ -239,6 +239,8 @@ and undeclared folders into the capability's default bucket, preserving their
 relative directory structure. Existing buckets and internal support paths stay
 in place; destination collisions preserve both sets in a separate subfolder.
 Compose shows the prepared absolute output folder. No caller flag is needed.
+Payload paths retain valid UTF-8 names, so report images and audio with Korean
+filenames remain in checkpoint and sealed manifests.
 The class is the display intent readers
 such as Cairn use: `C-DUR` is a durable work product meant to be shown, `C-INT`
 is support material that is kept but not listed. When `finalize` picks a

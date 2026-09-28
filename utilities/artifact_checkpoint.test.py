@@ -85,6 +85,39 @@ class InterimManifestTest(CheckpointTestBase):
         _, sealed = self.seal(primary="report/report.html")
         self.assertEqual([path for path, fields in _ids_by_path(sealed).items() if fields[-1] == "primary"], primary)
 
+    def test_html_assets_and_utf8_names_survive_checkpoint_and_seal(self):
+        paths = {
+            "analysis/report/report.html": b'<img src="field_0928/fig/image.png"><audio src="field_0928/audio/sample.wav">',
+            "analysis/report/field_0928/fig/image.png": b"image",
+            "analysis/report/field_0928/audio/sample.wav": b"audio",
+            "analysis/report/field_0928/fig/공장잡음1.png": b"unicode image",
+            "analysis/report/field_0928/audio/무잡음.wav": b"unicode audio",
+            "analysis/report/field_0928/fig/測定📈.png": b"unicode figure",
+        }
+        for path, data in paths.items():
+            self.write_output(self.result, path, data)
+        result = P.checkpoint(self.root, cycle_id=self.cycle_id)
+        self.assertEqual(result["status"], "emitted", result)
+        expected = {"artifacts/" + path for path in paths}
+        self.assertEqual(set(_ids_by_path(self.interim())), expected)
+        self.assertEqual(sum(result["excluded"].values()), 0)
+        before = _ids_by_path(self.interim())
+        _, sealed = self.seal()
+        self.assertEqual(_ids_by_path(sealed), before)
+        for path, data in paths.items():
+            self.assertEqual((Path(self.result["cycle_dir"]) / "artifacts" / path).read_bytes(), data)
+
+    def test_unrepresentable_name_reports_exclusion_reason_and_count(self):
+        self.write_output(self.result, "analysis/report/report.html", b"report")
+        self.write_output(self.result, "analysis/report/fig/bad\nname.png", b"image")
+        result = P.checkpoint(self.root, cycle_id=self.cycle_id)
+        self.assertEqual(result["status"], "emitted", result)
+        self.assertEqual(result["artifact_count"], 1)
+        self.assertEqual(result["excluded"]["invalid-locator"], 1)
+        self.assertEqual(result["excluded"]["invalid-locator-reasons"],
+                         {"locator-control-char": 1})
+        self.assertEqual(self.state()["excluded"], result["excluded"])
+
     def test_finalize_places_loose_output_without_checkpoint(self):
         self.write_output(self.result, "code_change.md", b"changes")
         result, document = self.seal(primary="code_change.md")
@@ -109,6 +142,26 @@ class InterimManifestTest(CheckpointTestBase):
         card = F.R.compose_card(self.route_obj)
         folder = Path(self.result["cycle_dir"]) / "artifacts/plans"
         self.assertIn("산출물 " + str(folder), card)
+
+    def test_completion_evidence_remains_readable_after_checkpoint_move(self):
+        evidence = self.write_output(self.result, "report/report.html", b"completed report")
+        node = next(node for node in self.route_obj["nodes"] if node.get("terminal"))
+        F.R.write_completion_marker(self.route_obj, node, node["id"], evidence)
+        P.checkpoint(self.root, cycle_id=self.cycle_id)
+        self.assertFalse(evidence.exists())
+        self.assertTrue(F.R.terminal_gate_observation(self.route_obj)[node["id"]]["passed"])
+        mapped = P.resolve_placed_output(evidence)
+        self.assertEqual(mapped.read_bytes(), b"completed report")
+        mapped.write_bytes(b"changed after completion")
+        self.assertFalse(F.R.terminal_gate_observation(self.route_obj)[node["id"]]["passed"])
+
+    def test_internal_migration_snapshot_keeps_its_recorded_paths(self):
+        self.write_output(self.result, "shared-input/_internal/migration-shared-bases.json", b"{}")
+        self.write_output(self.result, "shared-input/spec/prd.md", b"source snapshot")
+        self.write_output(self.result, "report/report.html", b"report")
+        result = P.checkpoint(self.root, cycle_id=self.cycle_id)
+        self.assertEqual([row["from"] for row in result["moved_outputs"]], ["artifacts/report"])
+        self.assertIn("artifacts/shared-input/spec/prd.md", _ids_by_path(self.interim()))
 
     def test_document_fallback_precedes_media(self):
         self.write_output(self.result, "plans/a.png", b"image")

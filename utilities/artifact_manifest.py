@@ -29,10 +29,11 @@ _MEDIA_TYPE_RE = re.compile(
 # A leading underscore is the harness's own cycle-internal convention
 # (`_internal/`, CORE.md §3 C-INT) and is therefore a valid locator component;
 # Legacy cycle-relative names retain this grammar. The explicit artifacts/
-# payload namespace also admits dot-prefixed names; dot segments remain invalid.
+# payload namespace admits UTF-8 names and dot-prefixed names; dot segments
+# and control characters remain invalid.
 _LOCATOR_COMPONENT_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$")
-_PAYLOAD_COMPONENT_RE = re.compile(r"^[A-Za-z0-9_.][A-Za-z0-9._-]{0,127}$")
-_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
+_PAYLOAD_COMPONENT_RE = re.compile(r"^(?:[A-Za-z0-9_.-]|[^\x00-\x7f]){1,128}$")
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 _MAX_LOCATOR_COMPONENTS = 32
 _MAX_LOCATOR_LENGTH = 1024
@@ -148,14 +149,18 @@ def _locator_error(path_value: Any) -> Optional[Tuple[str, str]]:
         return "locator-backslash", "backslash in path"
     if _CONTROL_CHAR_RE.search(path_value):
         return "locator-control-char", "control character in path"
+    try:
+        path_value.encode("utf-8")
+    except UnicodeEncodeError:
+        return "locator-invalid-unicode", "path is not valid UTF-8"
     if path_value.endswith("/"):
         return "locator-trailing-slash", "trailing slash"
     if len(path_value) > _MAX_LOCATOR_LENGTH:
         return "locator-too-long", "path too long"
     components = path_value.split("/")
+    payload = len(components) > 1 and components[0] == "artifacts"
     if len(components) > _MAX_LOCATOR_COMPONENTS:
         return "locator-too-many-components", "too many components"
-    payload = len(components) > 1 and components[0] == "artifacts"
     component_re = _PAYLOAD_COMPONENT_RE if payload else _LOCATOR_COMPONENT_RE
     for comp in components:
         if comp == "":

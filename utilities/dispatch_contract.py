@@ -6693,6 +6693,12 @@ def evidence_digest(evidence):
     the "recompute to re-verify" pattern the census closes.
     """
     path=Path(evidence)
+    if not os.path.lexists(path):
+        try:
+            from artifact_producer import resolve_placed_output
+            path = resolve_placed_output(path)
+        except (ImportError, OSError, ValueError):
+            pass
     if path.is_symlink():
         raise ValueError(f"evidence-symlink-not-attestable:{path}")
     if path.is_file():
