@@ -40,7 +40,8 @@ class CodexDriverLauncherRetirementTest(unittest.TestCase):
                 side_effect=codex_driver.codex_launcher.CodexLauncherError("modified successor")):
             result = codex_driver.install(plugin=False, dry_run=False)
         self.assertTrue(result["blocked"])
-        self.assertIn("modified successor", result["actions"][0]["detail"])
+        launcher = next(action for action in result["actions"] if action.get("action") == "managed-launcher")
+        self.assertIn("modified successor", launcher["detail"])
 
 
 if __name__ == "__main__":
