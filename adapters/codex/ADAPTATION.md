@@ -221,6 +221,22 @@ or project `.codex/agents/`. This adapter materializes those role profiles as
 `adapters/codex/bin/sync-native-agents.py` and projected as
 `codex_setting/codex-agents`.
 
+These committed files are the shipped profiles. Codex reads the linked copies
+in `$CODEX_HOME/agents/`, so `harness install codex`, `harness runtime
+activate|refresh`, and `install-runtime-projection.sh` link them only while the
+shipped `models.conf` is selected or the user's
+`$CODEX_HOME/agent-config/models.conf` renders them unchanged. Otherwise
+`tools/install/native_agent_payload.py` renders the same agents from the
+selected user file (whole-file selection, never merged) into
+`$CODEX_HOME/.harness/native-agents/<digest>/` and the agent links point there;
+editing the user file takes effect at the next install or refresh, and runtime
+status reports the stale payload until then. A model listed in the selected
+file's `CFG_MAIN_SESSION_ONLY_MODELS` is never written there: the agent keeps its
+shipped profile (withheld if that model is main-only too) and install/status
+report it. A user file without that key is unrestricted, like the dispatch
+wrapper's `main_session_only_policy=absent`. A user file that cannot render the
+agents falls back to the shipped profiles as a whole.
+
 Each file defines Codex's required custom agent fields (`name`, `description`,
 and `developer_instructions`) and the Codex-native runtime config fields
 `model`, `model_reasoning_effort`, and `sandbox_mode`. Adapter defaults follow

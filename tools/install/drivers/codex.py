@@ -19,6 +19,7 @@ import user_model_config
 import safe_fs
 import claude_settings_config
 import codex_launcher
+import native_agent_payload
 
 RUNTIME = "codex"
 
@@ -82,12 +83,65 @@ def _plugin_action(dry_run):
     }
 
 
+def _seed_model_config(entry, scope, dry_run):
+    try:
+        return user_model_config.seed_model_config(
+            RUNTIME,
+            entry["source"],
+            paths.runtime_home(RUNTIME, scope),
+            dry_run=dry_run,
+        )
+    except user_model_config.UserModelConfigError as exc:
+        return {
+            "action": "seed_once",
+            "source": entry["source"],
+            "dest": entry["dest"],
+            "status": "blocked",
+            "detail": str(exc),
+        }
+
+
+def _native_agent_payload_actions(scope, dry_run):
+    """Install this home's effective native-agent payload (a no-op while the
+    shipped profiles apply) and report every main-session-only filter."""
+    home = paths.runtime_home(RUNTIME, scope)
+    try:
+        plan = native_agent_payload.plan_payload(home, source_root=paths.agent_home())
+        actions = [native_agent_payload.materialize_payload(plan, dry_run=dry_run)]
+    except native_agent_payload.PayloadError as exc:
+        return [{"action": "native-agent-payload", "dest": str(home / "agents"),
+                 "status": "blocked", "detail": str(exc)}]
+    for item in plan.main_only:
+        kept = item["resolution"] == "shipped-profile"
+        actions.append({
+            "action": "native-agent-main-only",
+            "dest": str(home / "agents" / item["agent"]),
+            "status": item["resolution"],
+            "detail": (
+                f"{item['model']} is main-session-only in the selected model config; "
+                + (f"kept the shipped profile ({item['shipped_model']})" if kept
+                   else "agent withheld because its shipped model is main-session-only too")
+            ),
+        })
+    return actions
+
+
 def install(scope="global", plugin=False, dry_run=False):
     """Apply the symlink projection and optional plugin wrapper."""
     entries = projector.plan(["codex"], scope=scope)["codex"]
 
     actions = [claude_settings_config.retire_hook_registrations(
         paths.runtime_home(RUNTIME, scope) / "hooks.json", dry_run=dry_run)]
+
+    # The user model config is seeded before anything reads it; native agents
+    # are then planned against the seeded file.
+    actions.extend(
+        _seed_model_config(entry, scope, dry_run)
+        for entry in entries
+        if entry["action"] == "seed_once"
+    )
+    actions.extend(_native_agent_payload_actions(scope, dry_run))
+    entries = projector.plan(["codex"], scope=scope)["codex"]
 
     for entry in entries:
         action = entry["action"]
@@ -197,25 +251,6 @@ def install(scope="global", plugin=False, dry_run=False):
             continue
 
         if action == "seed_once":
-            try:
-                actions.append(
-                    user_model_config.seed_model_config(
-                        RUNTIME,
-                        entry["source"],
-                        paths.runtime_home(RUNTIME, scope),
-                        dry_run=dry_run,
-                    )
-                )
-            except user_model_config.UserModelConfigError as exc:
-                actions.append(
-                    {
-                        "action": "seed_once",
-                        "source": entry["source"],
-                        "dest": entry["dest"],
-                        "status": "blocked",
-                        "detail": str(exc),
-                    }
-                )
             continue
 
     if plugin:
@@ -249,6 +284,17 @@ def checks(scope="global"):
     agent_home = str(paths.agent_home())
 
     check_list = []
+
+    def _native_agent_payload_check():
+        try:
+            result = native_agent_payload.check_payload(
+                paths.runtime_home(RUNTIME, scope), source_root=paths.agent_home()
+            )
+        except native_agent_payload.PayloadError as exc:
+            return {"id": "codex.native-agent-payload", "ok": False, "detail": str(exc)}
+        return {"id": "codex.native-agent-payload", "ok": result["ok"], "detail": result["detail"]}
+
+    check_list.append(_native_agent_payload_check)
 
     for entry in entries:
         if entry["action"] == "symlink":
