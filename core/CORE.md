@@ -234,13 +234,19 @@ directly under the artifact root. Inside a cycle, the first segment below
 `artifacts/` is the bucket, and this table closes the bucket names: it lists
 exactly the keys of `BUCKET_TYPES` in `utilities/artifact_producer.py`, and
 `artifact_producer.test.py` fails when the two differ. Another first segment (for example `shards/`) is not a
-bucket; its files carry type `file`. The class is the display intent readers
+bucket. Checkpoint and finalize automatically move loose visible payload files
+and undeclared folders into the capability's default bucket, preserving their
+relative directory structure. Existing buckets and internal support paths stay
+in place; destination collisions preserve both sets in a separate subfolder.
+Compose shows the prepared absolute output folder. No caller flag is needed.
+The class is the display intent readers
 such as Cairn use: `C-DUR` is a durable work product meant to be shown, `C-INT`
 is support material that is kept but not listed. When `finalize` picks a
 primary artifact itself, it skips any path through a top-level `C-INT` name
 that is not a cycle bucket (`_internal/`, `shards/`) while the cycle holds
-another file, then takes the first `PRIMARY_CANDIDATES` name, then the first
-remaining file; an explicit `--primary` is kept as given.
+another file, then takes the first `PRIMARY_CANDIDATES` name (including nested
+`report.html`), then a Markdown or HTML document, then the first remaining file;
+an explicit `--primary` follows its file when automatically placed.
 
 | Bucket | Meaning | Disposition class |
 |---|---|---|

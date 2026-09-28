@@ -46,6 +46,15 @@ def _fault(point: str) -> None:
     if os.environ.get("HEARTING_INLINE_FINISH_CRASH_AT") == point:
         raise InlineFinishError("fault-injected-" + point)
 
+def _registry_lines(jobs: Path, inherited: bool) -> list[str]:
+    try:
+        return jobs.read_text().splitlines()
+    except FileNotFoundError:
+        if inherited:
+            raise
+        return []
+
+
 def finish(args, route: Mapping[str, Any], route_file: Path, api) -> dict[str, Any]:
     root = Path(route["artifact_root"]).resolve(strict=True)
     route_file = Path(route_file)
@@ -79,11 +88,13 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api) -> dict[str, A
         raise InlineFinishError("finish-registered-caller-ineligible")
     if dispatch_terminal_commit.require_current_cleanup("inline-finish", target=route_file) is not None:
         raise InlineFinishError("finish-foreign-cleanup-scope")
-    jobs = os.environ.get("AGENT_DISPATCH_JOBS", "")
-    if not jobs or not Path(jobs).is_file():
+    from dispatch_contract import resolve_global_registry
+    inherited_jobs = os.environ.get("AGENT_DISPATCH_JOBS", "")
+    jobs = resolve_global_registry(Path(__file__).resolve().parents[1], None, 0, "read").path
+    if inherited_jobs and not jobs.is_file():
         raise InlineFinishError("finish-registry-unavailable")
     try:
-        for line in Path(jobs).read_text().splitlines():
+        for line in _registry_lines(jobs, bool(inherited_jobs)):
             fields = line.split("\t")
             from dispatch_contract import parse_registry_metadata
             metadata = parse_registry_metadata(fields[5]) if len(fields) > 5 else {}
@@ -117,6 +128,18 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api) -> dict[str, A
         raise InlineFinishError("finish-active-review-lease")
     output = artifact_producer.cycle_dir(root, record["campaign_id"], record["cycle_id"], record) / "artifacts"
     evidence = Path(args.evidence).absolute()
+    # Place payloads before terminal evidence is bound to an exact path. Replays
+    # translate the original caller path through the runtime's move record.
+    if record.get("state") == "open" and prior_state is None:
+        with artifact_producer._checkpoint_lock(root, record["cycle_id"], timeout=artifact_producer.CHECKPOINT_FINALIZE_LOCK_SECONDS):
+            artifact_producer._place_loose_outputs(root, record, output.parent)
+    try:
+        evidence_rel = evidence.relative_to(output).as_posix()
+        placed = artifact_producer._placed_locator(evidence_rel, artifact_producer._output_placements(root, record))
+        if placed != evidence_rel:
+            evidence = output.parent / placed
+    except ValueError:
+        pass
     try:
         if evidence.is_symlink() or not stat.S_ISREG(evidence.lstat().st_mode):
             raise InlineFinishError("finish-evidence-not-regular")
@@ -179,7 +202,7 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api) -> dict[str, A
             if locked_evidence != evidence_raw or locked_summary != summary_raw:
                 raise InlineFinishError("finish-evidence-drift")
             try:
-                for line in Path(jobs).read_text().splitlines():
+                for line in _registry_lines(jobs, bool(inherited_jobs)):
                     fields = line.split("\t")
                     from dispatch_contract import parse_registry_metadata
                     metadata = parse_registry_metadata(fields[5]) if len(fields) > 5 else {}

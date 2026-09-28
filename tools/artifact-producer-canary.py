@@ -45,12 +45,7 @@ ALL_PREDICATES = [
     "no-artifact-handoff", "no-independent-verifier", "focused-verification",
 ]
 INTENSITIES = ("direct", "quick", "standard")
-BUCKET = {
-    "analyze-project": "analysis_project", "analyze-user": "user_profile", "audit": "reviews",
-    "autopilot-apply": "apply-log", "autopilot-code": "plans", "autopilot-design": "designs",
-    "autopilot-draft": "documents", "autopilot-lab": "experiments", "autopilot-refine": "documents",
-    "autopilot-research": "research", "autopilot-ship": "release-config", "autopilot-spec": "spec",
-}
+BUCKET = P.CAPABILITY_BUCKETS
 REPO_ID = "repo_" + "c" * 32
 ROOT_ID = "root_" + "d" * 32
 

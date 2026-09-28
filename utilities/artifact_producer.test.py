@@ -1212,6 +1212,9 @@ class FinalizeTest(ProducerTestBase):
         document = json.loads((Path(result["cycle_dir"]) / "manifest.json").read_text(encoding="utf-8"))
         rows = {row["locator"]["path"]: row for row in document["artifact_revisions"]}
         for locator, payload in zip(locators, payloads):
+            if locator == "artifacts/manifest.json":
+                locator = "artifacts/plans/manifest.json"
+                payload = Path(result["cycle_dir"]) / locator
             row = rows[locator]
             self.assertEqual(payload.read_bytes(), data)
             self.assertEqual(row["content_digest"], m.digest_bytes(data))
@@ -1384,7 +1387,7 @@ class FinalizeTest(ProducerTestBase):
         )
         self.assertEqual(outcome["adopted_root_outputs"], ["owner_brief.md"])
         self.assertFalse(legacy.exists())
-        self.assertTrue((Path(result["cycle_dir"]) / "artifacts" / "owner_brief.md").is_file())
+        self.assertTrue((Path(result["cycle_dir"]) / "artifacts" / "plans" / "owner_brief.md").is_file())
 
     def test_root_output_adoption_validates_all_sources_before_moving(self):
         self.activate()
@@ -2872,7 +2875,7 @@ class SharedBaseGuardTest(ProducerTestBase):
     def test_payload_or_receipt_cannot_be_added_or_changed_after_sealing(self):
         cycle = self._cycle([["a"], ["a"]])
         first = self._admit(cycle, 0)
-        base = Path(cycle["cycle_dir"]) / "artifacts/gen1"
+        base = Path(cycle["cycle_dir"]) / "artifacts/spec/gen1"
         for relative in ("a/prd.md", P.SPEC_BASE_RECEIPT):
             path = base / relative
             original = path.read_bytes() if path.exists() else None
@@ -3560,8 +3563,9 @@ class TerminalTransactionIntegrationTest(ProducerTestBase):
                         manifest = Path(result["cycle_dir"]) / "manifest.json"
                         sealed = manifest.read_bytes()
                         doc = json.loads(sealed)
+                        hidden = Path(result["cycle_dir"]) / "artifacts/plans" / rel
                         revision = next(r for r in doc["artifact_revisions"]
-                                        if r["locator"]["path"] == "artifacts/" + rel)
+                                        if r["locator"]["path"] == "artifacts/plans/" + rel)
                         self.assertEqual(revision["content_digest"], "sha256:" + hashlib.sha256(payload).hexdigest())
                         self.assertEqual(revision["byte_size"], len(payload))
                         for _ in range(2):
@@ -4926,7 +4930,7 @@ class SharedSpecMergeTest(SharedBaseGuardTest):
 
     def test_disjoint_sections_merge_source_stays_sealed_and_exact_retry_reuses(self):
         cycle, initial, winner = self.fixture()
-        source = Path(cycle["cycle_dir"]) / "artifacts/gen2"
+        source = Path(cycle["cycle_dir"]) / "artifacts/spec/gen2"
         before = P._spec_bytes(source)
         merged = self._admit(cycle, 2, base_revision=initial["shared_reference_revision_id"])
         result = P._spec_bytes(Path(merged["revision_dir"]), revision=True)

@@ -159,6 +159,18 @@ BUCKET_TYPES = {
     "analysis": "analysis", "reviews": "review", "release-config": "release-config",
     "apply-log": "apply-log", "user_profile": "profile",
 }
+CAPABILITY_BUCKETS = {
+    "analyze-project": "analysis_project", "analyze-user": "user_profile", "audit": "reviews",
+    "autopilot-apply": "apply-log", "autopilot-code": "plans", "autopilot-design": "designs",
+    "autopilot-draft": "documents", "autopilot-lab": "experiments", "autopilot-refine": "documents",
+    "autopilot-research": "research", "autopilot-ship": "release-config", "autopilot-spec": "spec",
+}
+
+
+def default_bucket(capability: str) -> str:
+    return CAPABILITY_BUCKETS.get(capability, capability if capability in BUCKET_TYPES else "analysis")
+
+
 MEDIA_TYPES = {
     ".md": "text/markdown", ".json": "application/json", ".yaml": "application/yaml",
     ".yml": "application/yaml", ".txt": "text/plain", ".csv": "text/csv",
@@ -168,7 +180,7 @@ MEDIA_TYPES = {
     ".jsonl": "application/x-ndjson", ".toml": "application/toml",
 }
 PRIMARY_CANDIDATES = (
-    "final_report.md", "report.md", "prd.md", "plan.md", "handoff.md", "verdict.json",
+    "final_report.md", "report.md", "report.html", "prd.md", "plan.md", "handoff.md", "verdict.json",
 )
 # CORE §3 top-level `C-INT` names that are not a cycle bucket: support material is
 # kept in the manifest but is not auto-nominated as a cycle's primary artifact.
@@ -2064,6 +2076,80 @@ def _is_support_locator(rel: str) -> bool:
     return any(part in SUPPORT_SEGMENTS for part in rel.split("/")[1:])
 
 
+def _place_loose_outputs(root: Path, record: Mapping[str, Any], directory: Path) -> List[Dict[str, str]]:
+    """Normalize visible payloads under the cycle lock without replacing files."""
+    output = directory / "artifacts"
+    if output.is_symlink() or not output.is_dir():
+        return []
+    sources = [p for p in sorted(output.iterdir())
+               if p.name not in BUCKET_TYPES and p.name not in SUPPORT_SEGMENTS
+               and not p.name.startswith(".") and not p.is_symlink()
+               and (p.is_file() or p.is_dir())]
+    if not sources:
+        return []
+    target = output / default_bucket(str(record.get("capability", "")))
+    # A foreign file/link at the bucket name is preserved by the existing scanner.
+    if target.is_symlink() or (target.exists() and not target.is_dir()):
+        return []
+    target.mkdir(exist_ok=True)
+    if any(os.path.lexists(target / p.name) for p in sources):
+        ordinal = 1
+        while os.path.lexists(target / f"relocated-{ordinal}"):
+            ordinal += 1
+        target = target / f"relocated-{ordinal}"
+    moved = []
+    placement_path = producer_dir(root) / "bucket-placements" / f"{record['cycle_id']}.json"
+    placements = {row["from"]: row for row in _output_placements(root, record)}
+    for source in sources:
+        source_rel = source.relative_to(directory).as_posix()
+        prior = placements.get(source_rel)
+        destination = directory / prior["to"] if prior else target / source.name
+        if os.path.lexists(destination):
+            destination = target / source.name
+        if os.path.lexists(destination):
+            continue
+        row = {"from": source_rel, "to": destination.relative_to(directory).as_posix()}
+        placements[source_rel] = row
+        # Record the intended path before moving, so a retry can find the same
+        # destination after a crash between rename and checkpoint publication.
+        _ensure_dir(placement_path.parent)
+        _write_atomic(placement_path, _json_bytes({"moves": list(placements.values())}), 0o644)
+        try:
+            if any(parent.is_symlink() for parent in destination.parents if parent != directory):
+                continue
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            source.rename(destination)
+        except OSError as exc:
+            placements.pop(source_rel, None)
+            _write_atomic(placement_path, _json_bytes({"moves": list(placements.values()),
+                          "pending": [{**row, "error": str(exc)}]}), 0o644)
+            continue
+        moved.append(row)
+    if moved:
+        print(f"artifact-buckets moved={len(moved)} paths=" + "; ".join(
+            f"{row['from']} -> {row['to']}" for row in moved), file=sys.stderr)
+    return moved
+
+
+def _output_placements(root: Path, record: Mapping[str, Any]) -> List[Dict[str, str]]:
+    path = producer_dir(root) / "bucket-placements" / f"{record['cycle_id']}.json"
+    rows = (_read_json(path) or {}).get("moves", [])
+    return [row for row in rows if isinstance(row, dict) and all(
+        isinstance(row.get(key), str) and row[key].startswith("artifacts/")
+        and not any(part in {"", ".", ".."} for part in row[key].split("/"))
+        for key in ("from", "to"))]
+
+
+def _placed_locator(locator: Optional[str], moved: Sequence[Mapping[str, str]]) -> Optional[str]:
+    if not locator:
+        return locator
+    relative = locator if locator.startswith("artifacts/") else "artifacts/" + locator
+    for row in moved:
+        if relative == row["from"] or relative.startswith(row["from"] + "/"):
+            return row["to"] + relative[len(row["from"]):]
+    return locator
+
+
 def _choose_primary(rows: Sequence[Tuple[str, bytes]], primary: Optional[str],
                     support: Sequence[str] = ()) -> Optional[str]:
     # A `support` row is attached evidence, not this cycle's output, so it is never
@@ -2087,7 +2173,8 @@ def _choose_primary(rows: Sequence[Tuple[str, bytes]], primary: Optional[str],
         for rel in durable:
             if rel.endswith("/" + wanted) or rel == "artifacts/" + wanted:
                 return rel
-    return durable[0] if durable else None
+    documents = [rel for rel in durable if Path(rel).suffix.lower() in {".md", ".html", ".htm"}]
+    return next(iter(documents or durable), None)
 
 
 def _shared_pin_reference_path(root: Path, kind: str, ref_id: str) -> Path:
@@ -2963,6 +3050,10 @@ def _checkpoint_commit(
             result["reason"] = reason
         return result
 
+    moved = _place_loose_outputs(root, fresh, directory)
+    if moved:
+        scan = _checkpoint_scan(directory, previous_stats, limits)
+        base = {**base, "moved_outputs": moved}
     if scan.get("skip"):
         detail = {key: value for key, value in scan.items() if key != "skip"}
         return settle("skipped", scan["skip"], limit_detail=detail)
@@ -3927,6 +4018,10 @@ def finalize(
         for name, source, target in adoption_moves:
             os.replace(source, target)
             adopted_root_outputs.append(name)
+        moved_outputs = _place_loose_outputs(root, record, directory)
+        placements = _output_placements(root, record)
+        primary = _placed_locator(_cycle_relative_primary(primary, directory), placements)
+        support_locators = tuple(_placed_locator(value, placements) for value in support_locators)
         excluded_hidden: List[str] = []
         rows, violations = _enumerate_output(directory, exclude_hidden=exclude_hidden, excluded=excluded_hidden)
         if violations:
@@ -4015,6 +4110,7 @@ def finalize(
                 f"cycle {cycle_id} manifest published but post-publish update failed; run recover"
             ) from exc
         sealed_result = {"excluded_hidden": excluded_hidden, "adopted_root_outputs": adopted_root_outputs,
+            "moved_outputs": moved_outputs,
             "status": "sealed", "cycle_id": cycle_id, "campaign_id": record["campaign_id"],
             "manifest_digest": digest, "manifest_path": str(manifest_path),
             "artifact_count": len(rows), "lineage_committed": True, "cycle_state": document["cycle"]["state"],
@@ -4896,6 +4992,7 @@ def admit_shared(
         source_rel = source if source.startswith("artifacts/") else "artifacts/" + source
         if ".." in source_rel.split("/"):
             raise ProducerError("source-unsafe", source)
+        source_rel = _placed_locator(source_rel, _output_placements(root, record))
         source_path = directory / source_rel
         if os.path.islink(str(source_path)) or not source_path.exists():
             raise ProducerError("source-missing", source_rel)
@@ -4904,6 +5001,7 @@ def admit_shared(
         if kind == "research":
             assert promotion_evidence is not None
             evidence_rel = promotion_evidence if promotion_evidence.startswith("artifacts/") else "artifacts/" + promotion_evidence
+            evidence_rel = _placed_locator(evidence_rel, _output_placements(root, record))
             evidence_path = directory / evidence_rel
             if os.path.islink(str(evidence_path)) or not evidence_path.is_file():
                 raise ProducerError("research-promotion-evidence-missing", evidence_rel)

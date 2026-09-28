@@ -58,6 +58,30 @@ class CampaignTitleRepairTest(unittest.TestCase):
         self.assertEqual(self.manifest.read_bytes(), before)
         self.assertEqual(repair.verify(package)["status"], "verified")
 
+    def test_partial_apply_and_rollback_preserve_other_declarations(self):
+        path = self.root / repair.DISPLAY_TITLE_REL
+        path.parent.mkdir(parents=True, exist_ok=True)
+        other = {"campaign_id": "camp_other", "campaign_locator": "other", "display_title": "Kept",
+                 "manifest_bindings": [], "manifest_revision_ids": [], "manifest_digests": []}
+        path.write_text(json.dumps({"schema": repair.DECLARATION_SCHEMA, "artifact_root_id": "root_demo",
+                                    "entries": [other], "custom": "preserved"}))
+        package = repair.prepare(self.roots, self.proposals)
+        repair.apply(package)
+        result = json.loads(path.read_text())
+        self.assertIn(other, result["entries"])
+        self.assertEqual(result["custom"], "preserved")
+        self.assertEqual(repair.verify(package)["status"], "verified")
+        repair.rollback(package)
+        self.assertEqual(json.loads(path.read_text())["entries"], [other])
+
+    def test_open_campaign_without_sealed_manifest_can_apply(self):
+        self.manifest.unlink()
+        package = repair.prepare(self.roots, self.proposals)
+        self.assertEqual(package["entries"][0]["manifest_bindings"], [])
+        self.assertEqual(repair.apply(package)["campaigns_changed"], 1)
+        self.assertEqual(repair.verify(package)["status"], "verified")
+        self.assertFalse(self.manifest.exists())
+
     def test_prepare_refuses_unlisted_campaign(self):
         self.proposals.write_text(json.dumps({"entries": []}), encoding="utf-8")
         with self.assertRaisesRegex(repair.RepairError, "proposal-missing"):

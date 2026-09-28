@@ -63,6 +63,62 @@ class CheckpointTestBase(F.ProducerTestBase):
 
 
 class InterimManifestTest(CheckpointTestBase):
+    def test_loose_report_tree_is_placed_and_html_is_primary(self):
+        self.write_output(self.result, "report/report.html", b'<img src="../field/img1.png"><audio src="audio/a.wav">')
+        self.write_output(self.result, "report/audio/a.wav", b"audio")
+        self.write_output(self.result, "field/img1.png", b"image")
+        self.write_output(self.result, "request.md", b"request")
+        self.write_output(self.result, "make_report.log", b"log")
+        result = P.checkpoint(self.root, cycle_id=self.cycle_id)
+        self.assertEqual(result["status"], "emitted", result)
+        self.assertEqual(len(result["moved_outputs"]), 4)
+        output = Path(self.result["cycle_dir"]) / "artifacts"
+        report = output / "plans/report/report.html"
+        self.assertTrue(report.is_file())
+        self.assertEqual((report.parent / "../field/img1.png").read_bytes(), b"image")
+        self.assertEqual((report.parent / "audio/a.wav").read_bytes(), b"audio")
+        primary = [path for path, fields in _ids_by_path(self.interim()).items() if fields[-1] == "primary"]
+        self.assertEqual(primary, ["artifacts/plans/report/report.html"])
+        again = P.checkpoint(self.root, cycle_id=self.cycle_id)
+        self.assertEqual(again["status"], "unchanged")
+        self.assertNotIn("moved_outputs", again)
+        _, sealed = self.seal(primary="report/report.html")
+        self.assertEqual([path for path, fields in _ids_by_path(sealed).items() if fields[-1] == "primary"], primary)
+
+    def test_finalize_places_loose_output_without_checkpoint(self):
+        self.write_output(self.result, "code_change.md", b"changes")
+        result, document = self.seal(primary="code_change.md")
+        self.assertEqual(result["moved_outputs"], [{"from": "artifacts/code_change.md", "to": "artifacts/plans/code_change.md"}])
+        self.assertIn("artifacts/plans/code_change.md", _ids_by_path(document))
+
+    def test_collision_keeps_existing_bytes_and_relative_links(self):
+        self.write_output(self.result, "plans/report/report.html", b"existing")
+        self.write_output(self.result, "report/report.html", b'<img src="../field/a.png">')
+        self.write_output(self.result, "field/a.png", b"new image")
+        result = P.checkpoint(self.root, cycle_id=self.cycle_id)
+        output = Path(self.result["cycle_dir"]) / "artifacts/plans"
+        self.assertEqual((output / "report/report.html").read_bytes(), b"existing")
+        self.assertEqual((output / "relocated-1/report/../field/a.png").read_bytes(), b"new image")
+        self.assertEqual(result["artifact_count"], 3)
+        self.assertEqual(P.checkpoint(self.root, cycle_id=self.cycle_id)["status"], "unchanged")
+
+    def test_default_bucket_mapping_and_compose_notice(self):
+        self.assertEqual(P.default_bucket("autopilot-lab"), "experiments")
+        self.assertEqual(P.default_bucket("analysis"), "analysis")
+        self.assertEqual(P.default_bucket("analyze-project"), "analysis_project")
+        card = F.R.compose_card(self.route_obj)
+        folder = Path(self.result["cycle_dir"]) / "artifacts/plans"
+        self.assertIn("산출물 " + str(folder), card)
+
+    def test_document_fallback_precedes_media(self):
+        self.write_output(self.result, "plans/a.png", b"image")
+        self.write_output(self.result, "plans/b.log", b"log")
+        self.write_output(self.result, "plans/c.wav", b"audio")
+        self.write_output(self.result, "plans/z/overview.html", b"document")
+        P.checkpoint(self.root, cycle_id=self.cycle_id)
+        self.assertEqual([path for path, fields in _ids_by_path(self.interim()).items() if fields[-1] == "primary"],
+                         ["artifacts/plans/z/overview.html"])
+
     def test_emits_the_sealed_schema_with_open_state(self):
         self.write_output(self.result, "plans/cycle/plan.md")
         self.write_output(self.result, "experiments/run/report/index.html", b"<html>epoch 1</html>\n")

@@ -2859,6 +2859,14 @@ def compose_card(route, plan=None, plan_source=None, *, owner_harness=None):
         f"  cwd {route['cwd']} · slug {route.get('slug', '-')}\n"
         + _compose_campaign_line(compose_campaign_selection(route))
     )
+    from artifact_producer import route_cycle_for, cycle_dir, default_bucket, ProducerError
+    try:
+        record = route_cycle_for(Path(route["artifact_root"]), route)
+    except (ProducerError, OSError, ValueError):
+        record = None
+    if record is not None:
+        folder = cycle_dir(Path(route["artifact_root"]), record["campaign_id"], record["cycle_id"], record)
+        card += f"\n  산출물 {folder.resolve() / 'artifacts' / default_bucket(route['capability'])}"
     if plan:
         suffix = " (상속)" if plan_source == "inherited" else ""
         card += f"\n  계획 {' › '.join(plan)}{suffix}"
@@ -7616,8 +7624,8 @@ def main():
             work_request={"text":a.prompt_file.read_text(),"owner_harness":a.owner} if a.prompt_file else None,
         )
         _plan_for_card, _plan_source_for_card = a._route_chain_plan
-        print(compose_card(route, _plan_for_card, _plan_source_for_card, owner_harness=a.owner),file=sys.stderr)
         if a.explain:
+            print(compose_card(route, _plan_for_card, _plan_source_for_card, owner_harness=a.owner),file=sys.stderr)
             print("route_file_written=0 explain=1",file=sys.stderr)
             print(json.dumps({"route_id":route["route_id"],"capability":route["capability"],
                               "effective_intensity":route["effective_intensity"],"shape":shape,
@@ -7634,6 +7642,7 @@ def main():
         if a.start:
             from work_start import start_work
             print(json.dumps(start_work(route,path,Path(a.jobs or _compose_default_jobs())),ensure_ascii=False))
+        print(compose_card(route, _plan_for_card, _plan_source_for_card, owner_harness=a.owner),file=sys.stderr)
         return 0
     if a.command=="correct":
         from dispatch_owner_input import submit, inspect, InputError

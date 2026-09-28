@@ -187,7 +187,7 @@ def manifest_binding_fields(manifests: Iterable[Mapping[str, Any]]) -> tuple[lis
 
 def entry_manifest_bindings(entry: Mapping[str, Any]) -> list[tuple[str, str]]:
     raw = entry.get("manifest_bindings")
-    if not isinstance(raw, list) or not raw:
+    if not isinstance(raw, list):
         raise RepairError("manifest-binding-pairs-required")
     pairs: list[tuple[str, str]] = []
     for row in raw:
@@ -458,7 +458,11 @@ def apply(package: Mapping[str, Any]) -> Dict[str, Any]:
     try:
         for root_id, root_entries in grouped.items():
             root_path = Path(str(root_entries[0]["artifact_root_path"])).resolve()
-            declaration_entries: list[Dict[str, Any]] = []
+            declaration_path = root_path / DISPLAY_TITLE_REL
+            declaration = read_json(declaration_path) if declaration_path.exists() else {
+                "schema": DECLARATION_SCHEMA, "artifact_root_id": root_id,
+            }
+            declaration_entries = {str(row["campaign_id"]): row for row in declaration.get("entries", [])}
             for entry, campaign_json, record in sorted(
                 (row for row in checked if str(row[0]["artifact_root_id"]) == root_id),
                 key=lambda row: str(row[0]["campaign_id"]),
@@ -467,19 +471,20 @@ def apply(package: Mapping[str, Any]) -> Dict[str, Any]:
                 updated["title"] = str(entry["display_title"])
                 write_atomic(campaign_json, updated)
                 changed += int(str(entry["old_campaign_title"]) != str(entry["display_title"]))
-                declaration_entries.append({
+                declaration_entries[str(entry["campaign_id"])] = {
                     "campaign_id": str(entry["campaign_id"]),
                     "campaign_locator": str(entry["campaign_locator"]),
                     "display_title": str(entry["display_title"]),
                     "manifest_bindings": list(entry["manifest_bindings"]),
                     "manifest_revision_ids": list(entry["manifest_revision_ids"]),
                     "manifest_digests": list(entry["manifest_digests"]),
-                })
+                }
             declaration = {
+                **declaration,
                 "schema": DECLARATION_SCHEMA,
                 "artifact_root_id": root_id,
                 "ruleset": str(package.get("ruleset", "")),
-                "entries": declaration_entries,
+                "entries": [declaration_entries[key] for key in sorted(declaration_entries)],
             }
             write_atomic(root_path / DISPLAY_TITLE_REL, declaration)
             declarations += 1
@@ -527,7 +532,7 @@ def verify(package: Mapping[str, Any]) -> Dict[str, Any]:
         if declaration.get("schema") != DECLARATION_SCHEMA or declaration.get("artifact_root_id") != root_id:
             raise RepairError(f"sidecar-mismatch:{declaration_path}")
         actual_rows = declaration.get("entries")
-        if not isinstance(actual_rows, list) or len(actual_rows) != len(root_entries):
+        if not isinstance(actual_rows, list):
             raise RepairError(f"sidecar-entry-count-drift:{declaration_path}")
         expected = {
             str(entry["campaign_id"]): (str(entry["display_title"]), tuple(entry_manifest_bindings(entry)))
@@ -538,10 +543,12 @@ def verify(package: Mapping[str, Any]) -> Dict[str, Any]:
             if not isinstance(row, Mapping):
                 raise RepairError(f"sidecar-entry-invalid:{declaration_path}")
             campaign_id = str(row.get("campaign_id", ""))
+            if campaign_id not in expected:
+                continue
             if campaign_id in actual:
                 raise RepairError(f"sidecar-entry-duplicate:{declaration_path}:{campaign_id}")
             actual[campaign_id] = (str(row.get("display_title", "")), tuple(entry_manifest_bindings(row)))
-        if actual != expected:
+        if any(actual.get(key) != value for key, value in expected.items()):
             raise RepairError(f"sidecar-binding-drift:{declaration_path}")
     return {"status": "verified", "campaigns": len(entries)}
 
@@ -591,7 +598,7 @@ def rollback(package: Mapping[str, Any]) -> Dict[str, Any]:
             (str(row.get("campaign_id")), str(row.get("display_title")), tuple(entry_manifest_bindings(row)))
             for row in declaration.get("entries", []) if isinstance(row, Mapping)
         }
-        if actual != expected:
+        if not expected.issubset(actual):
             raise RepairError(f"sidecar-ownership-mismatch:{declaration_path}")
 
     for entry, campaign_json, record in checked:
@@ -600,7 +607,14 @@ def rollback(package: Mapping[str, Any]) -> Dict[str, Any]:
         write_atomic(campaign_json, restored)
     for root_id, root_entries in grouped.items():
         declaration_path = Path(str(root_entries[0]["artifact_root_path"])).resolve() / DISPLAY_TITLE_REL
-        os.unlink(declaration_path)
+        declaration = read_json(declaration_path)
+        affected = {str(entry["campaign_id"]) for entry in root_entries}
+        declaration["entries"] = [row for row in declaration.get("entries", [])
+                                  if str(row.get("campaign_id")) not in affected]
+        if declaration["entries"]:
+            write_atomic(declaration_path, declaration)
+        else:
+            os.unlink(declaration_path)
     return {"status": "rolled-back", "rollback_kind": "full-original", "campaigns": len(entries), "declarations": len(grouped)}
 
 
