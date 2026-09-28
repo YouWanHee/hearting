@@ -1287,7 +1287,7 @@ def status(root: Path) -> Dict[str, Any]:
 
 def _env_for(root: Path, record: Mapping[str, Any]) -> Dict[str, str]:
     directory = cycle_dir(root, record["campaign_id"], record["cycle_id"], record)
-    return {
+    env = {
         "AGENT_ARTIFACT_ROOT": str(root),
         "AGENT_ARTIFACT_CAMPAIGN_ID": record["campaign_id"],
         "AGENT_ARTIFACT_CYCLE_ID": record["cycle_id"],
@@ -1295,6 +1295,14 @@ def _env_for(root: Path, record: Mapping[str, Any]) -> Dict[str, str]:
         "AGENT_ARTIFACT_CYCLE_DIR": str(directory),
         "AGENT_ARTIFACT_OUTPUT_DIR": str(directory / "artifacts"),
     }
+    # This is an already-declared producer context. Carrying it through the
+    # existing artifact env lets the next explicit same-campaign cycle join
+    # without an agent remembering a group ID or changing route lineage.
+    import artifact_workflow_groups
+    group_id = artifact_workflow_groups.group_for_cycle(root, record["campaign_id"], record["cycle_id"])
+    if group_id:
+        env["AGENT_ARTIFACT_WORKFLOW_GROUP_ID"] = group_id
+    return env
 
 
 def bind_owner_launch(args, jobs: Path, *, environ=None) -> Optional[Dict[str, Any]]:
@@ -1688,6 +1696,8 @@ def _begin_cycle_record(
     title: Optional[str] = None,
     goal: Optional[str] = None,
     parent_cycle_id: Optional[str] = None,
+    workflow_group_id: Optional[str] = None,
+    workflow_stage_label: Optional[str] = None,
     require_cycle: bool = False,
     shared_reference_pins: Optional[Sequence[Mapping[str, Any]]] = None,
     allocator: Optional[artifact_identity.IdAllocator] = None,
@@ -1836,6 +1846,29 @@ def _begin_cycle_record(
                 raise ProducerError("campaign-not-active", campaign_id or parent_cycle_id or campaign_key)
             if campaign_key is not None and campaign.get("key") != campaign_key:
                 raise ProducerError("campaign-key-mismatch", campaign_key)
+        import artifact_workflow_groups
+        # Ambient context is accepted only for the exact selected campaign;
+        # the parent-cycle edge alone never selects or implies a group.
+        inherited_group_id = (
+            os.environ.get("AGENT_ARTIFACT_WORKFLOW_GROUP_ID")
+            if campaign is not None and os.environ.get("AGENT_ARTIFACT_CAMPAIGN_ID") == campaign["campaign_id"]
+            else None
+        )
+        selected_group_id = workflow_group_id or inherited_group_id
+        if selected_group_id and owner_begin:
+            if campaign is None:
+                raise ProducerError("workflow-group-campaign-required")
+            if workflow_group_id and inherited_group_id and workflow_group_id != inherited_group_id:
+                raise ProducerError("workflow-group-context-conflict", workflow_group_id)
+            try:
+                artifact_workflow_groups.require_group_context(root, campaign["campaign_id"], selected_group_id)
+            except artifact_workflow_groups.WorkflowGroupError as exc:
+                raise ProducerError(exc.code, exc.detail) from exc
+        if workflow_stage_label is not None:
+            try:
+                artifact_workflow_groups._text(workflow_stage_label, 40, "stage-label-invalid")
+            except artifact_workflow_groups.WorkflowGroupError as exc:
+                raise ProducerError(exc.code, exc.detail) from exc
         # Idempotent per route: one open cycle per verified lineage (D-120). A
         # continuation resuming an ancestor's open cycle is the same idempotent
         # path with `rebound=True` and an extended audit record.
@@ -1857,6 +1890,13 @@ def _begin_cycle_record(
             # (raised above) but never mutates the record.
             if rebound and owner_begin:
                 _bind_cycle_route_locked(root, record, route)
+            if selected_group_id and owner_begin:
+                stage_label = workflow_stage_label or artifact_workflow_groups.stage_label_from_title(record.get("title"))
+                try:
+                    artifact_workflow_groups.join_at_begin_locked(
+                        root, record["campaign_id"], record["cycle_id"], selected_group_id, stage_label)
+                except artifact_workflow_groups.WorkflowGroupError as exc:
+                    raise ProducerError(exc.code, exc.detail) from exc
             if binding_jobs is not None and binding_owner:
                 try:
                     dispatch_terminal_commit.publish_producer_binding(
@@ -1992,6 +2032,15 @@ def _begin_cycle_record(
             except dispatch_terminal_commit.TerminalCommitError as exc:
                 raise ProducerError(exc.code, exc.detail) from exc
         artifact_locator.update_indexes(root, [campaign["campaign_id"]])
+        if selected_group_id and owner_begin:
+            stage_label = workflow_stage_label or artifact_workflow_groups.stage_label_from_title(display_title)
+            try:
+                artifact_workflow_groups.join_at_begin_locked(
+                    root, campaign["campaign_id"], new_cycle_id, selected_group_id, stage_label)
+            except artifact_workflow_groups.WorkflowGroupError as exc:
+                # The issued cycle is resumable by this exact route. Its next
+                # begin retries the same group append under admission lock.
+                raise ProducerError(exc.code, exc.detail) from exc
         return {
             "status": "begun", "layout": "cycle", "campaign_id": campaign["campaign_id"],
             "cycle_id": new_cycle_id, "producer_id": producer_id, "cycle_dir": str(target),
@@ -5906,6 +5955,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--parent-cycle",
                    help="open or sealed predecessor; inherits its campaign and records "
                         "causality, never input or completion approval")
+    p.add_argument("--workflow-group-id", help="explicit existing group for this campaign; "
+                   "the same-campaign producer context is inherited when omitted")
+    p.add_argument("--workflow-stage-label", help="display label for an explicitly grouped cycle")
     p.add_argument("--require-cycle", action="store_true")
     p.add_argument("--shared-reference", action="append", default=[],
                    help="<kind>:<ref>:<rrev>[:<content_digest>], repeatable")
@@ -6050,7 +6102,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             result = begin(root, route_file=Path(args.route), capability=args.capability,
                            intensity=args.intensity, node_id=args.node, campaign_id=args.campaign,
                            campaign_key=args.campaign_key, title=args.title, goal=args.goal,
-                           parent_cycle_id=args.parent_cycle, require_cycle=args.require_cycle,
+                           parent_cycle_id=args.parent_cycle,
+                           workflow_group_id=args.workflow_group_id,
+                           workflow_stage_label=args.workflow_stage_label,
+                           require_cycle=args.require_cycle,
                            shared_reference_pins=pins or None)
             if args.env_file:
                 lines = "".join(f"{k}={v}\n" for k, v in result.get("env", {}).items())

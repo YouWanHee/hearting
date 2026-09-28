@@ -146,7 +146,7 @@ never orders a move or a delete.
 | `documents/` | document drafts and refinement artifacts | `C-DUR` |
 | `experiments/` | experiment setup, evaluation, and run logs (declared, currently absent — a reserved boundary, not an error) | `C-DUR` |
 | `designs/` | standalone design decision records (declared, currently absent — a reserved boundary, not an error; spec-owned design instead anchors at `spec/design/`) | `C-DUR` |
-| `campaigns/` | W7C producer output: `campaigns/<campaign-locator>/<cycle-locator>/artifacts/<bucket>/…` plus machine-managed `campaign.json`, per-cycle `.cycle.json` stable-ID binding (with the cycle's start time), and `manifest.json` commit point; an optional digest-bound campaign-level `RUNLOG.md` may preserve a migrated aggregate run log without manufacturing a cycle; the only new-write target once the write-cutover is active (`utilities/artifact_producer.py`) | `C-DUR` |
+| `campaigns/` | W7C producer output: `campaigns/<campaign-locator>/<cycle-locator>/artifacts/<bucket>/…` plus machine-managed `campaign.json`, optional campaign-level `workflow-groups.json`, per-cycle `.cycle.json` stable-ID binding (with the cycle's start time), and `manifest.json` commit point; an optional digest-bound campaign-level `RUNLOG.md` may preserve a migrated aggregate run log without manufacturing a cycle; the only new-write target once the write-cutover is active (`utilities/artifact_producer.py`) | `C-DUR` |
 | `shared/` | immutable shared revisions `shared/<spec\|analysis\|research>/<ref>/revisions/<rrev>/…`; created only by `admit-shared` from a sealed cycle, research only with an explicit promotion; never a direct write target | `C-DUR` |
 | `_internal/` | cycle-internal support material — a cycle's child, not an independent entry | `C-INT` |
 | `reviews/` | review support material | `C-INT` |
@@ -285,6 +285,28 @@ and cycle manifests and route evidence remain immutable. Membership uses member
 records: an output-less cycle removed from `campaign.cycles` remains auditable
 as detached rather than causing membership drift. Abandoned cycles remain
 abandoned; closure adds neither route repair nor a residual-zero condition.
+
+**Campaign workflow groups.** A producer-owned versioned declaration at
+`campaigns/<campaign-locator>/workflow-groups.json` may group existing cycles by
+an explicitly named subgoal without changing cycle boundaries, sealed
+manifests, artifacts, route lineage, or campaign membership. Each group has an
+opaque stable ID, a human title, cycle members with display-stage labels, and
+only evidence-backed relations. `precedes` means that one cycle's material or
+criterion was used as another cycle's input; it does not claim the first cycle
+finished before the second began. `followup` means a result or handoff was
+continued, `retry` means an unsuccessful result was retried, and `parallel`
+means explicit concurrent work. A missing relation stays unspecified. The
+producer rejects cross-campaign membership, duplicate membership, missing
+references, directional cycles, and a contradictory parallel/directional pair.
+The declaration binds stable root, repository, campaign and cycle identities;
+individual evidence files bind to their observed artifact revisions. A new
+checkpoint revision does not require redeclaring a group. Readers derive each
+member's current status and primary artifact from the current sealed or open
+manifest rather than treating a historical evidence revision as current
+success. `artifact_workflow_groups.py prepare|apply|verify` owns a checked
+single-file replacement, including corrections and withdrawal; no route
+parent/`depends_on` meaning or extra workflow gate is introduced. The exact v1
+schema and verification semantics are in [WORKFLOW_GROUPS.md](WORKFLOW_GROUPS.md).
 
 **Campaign metadata amendment.** `artifact_metadata_amendment.py
 prepare|apply|verify` is the sole supported correction surface for an active
