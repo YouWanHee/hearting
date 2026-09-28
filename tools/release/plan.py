@@ -22,6 +22,8 @@ BREAKING_BODY_RE = re.compile(r"^BREAKING(?: |-)CHANGE:\s*\S", re.MULTILINE)
 
 NON_RELEASE_EXACT = {
     ".gitignore",
+    "AGENTS.md",
+    "CLAUDE.md",
     "INSTALL_LAYOUT.md",
     "LICENSE",
     "MANUAL.md",

@@ -34,6 +34,17 @@ SHA. Failed, cancelled, pull-request, and foreign-repository runs cannot admit
 a release. A later default-branch tip never replaces the tested commit. The
 workflow does not rely on the generated tag starting a second workflow.
 
+Public Markdown documentation and the project's root `AGENTS.md` / `CLAUDE.md`
+run the generated-surface and contract checks, without the full runtime,
+installation and PID-namespace suites. Main compares all changes since its
+latest published stable release, so a documentation push cannot hide earlier
+unvalidated code. Pull requests compare against their merge base. Runtime
+instructions under `core/`, `capabilities/`, `roles/` or adapters, tests, CI
+configuration, unknown paths and unavailable comparisons still run all checks.
+The release job reuses the successful checks for that exact commit instead of
+rerunning the same source suites; package construction and the published-package
+smoke test remain in the release job.
+
 Maintainers may push an explicit SemVer tag, including a prerelease such as
 `v1.2.0-rc.1`. Tag pushes and manual releases on `main` or a version tag run the
 same reusable `Checks` workflow at the caller's exact commit before the release

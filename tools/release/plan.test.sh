@@ -39,6 +39,10 @@ git -C "$REPO" tag v1.2.3
 commit_file README.md "docs: explain usage"
 assert_plan false none ""
 
+commit_file AGENTS.md "docs: project maintainer instructions"
+commit_file CLAUDE.md "docs: project bootstrap reference"
+assert_plan false none ""
+
 commit_file tools/example.test.sh "test: add coverage"
 assert_plan false none ""
 
