@@ -4798,7 +4798,7 @@ class SourceCensusTest(unittest.TestCase):
   # Self-consistency, not cycle ownership (plan A-4 "비대상" list): route
   # id/hash derivation, the `rebound` display flag, the reservation ledger's
   # own identity check, and review-output-binding's capability/route parity.
-  "load_route","begin","read_interim_reservation","prepare_review_output_binding",
+  "load_route","_begin_cycle_record","read_interim_reservation","prepare_review_output_binding",
   # Inline finish's exact-cycle binding validates the already-admitted route
   # tuple; it does not choose which cycle the route owns.
   "finalize_exact_cycle",

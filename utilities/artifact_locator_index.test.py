@@ -919,7 +919,7 @@ def _writer_census():
 # prepare_index_update/update_indexes (verified structurally is out of scope
 # here; this table is the enumeration half of the guard -- LE §5).
 _EXPECTED_WRITER_CENSUS = {
-    ("artifact_producer.py", "begin"): "incremental",
+    ("artifact_producer.py", "_begin_cycle_record"): "incremental",
     ("artifact_producer.py", "_remove_empty_cycle"): "incremental",
     ("artifact_producer.py", "_commit_sealed"): "incremental",
     ("artifact_producer.py", "mark_cycle_superseded"): "incremental",
