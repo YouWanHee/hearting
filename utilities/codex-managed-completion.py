@@ -649,6 +649,7 @@ def _native_queue_delivery_once(
     args: argparse.Namespace,
     receipt: dict[str, Any],
     attempts: set[str],
+    *, allow_enqueue: bool = True,
 ) -> dict[str, Any]:
     """Queue one stable completion item through its durable per-child ledger."""
     path = args.queue_socket or resolve_queue_socket()
@@ -740,9 +741,18 @@ def _native_queue_delivery_once(
             pending_delivery.claim(root, args.thread_id, delivery_id,
                                    claim_owner=claim_owner, lease_seconds=60.0)
             claimed.append(delivery_id)
-        result = codex_queue_delivery.send_at_least_once(
-            path, thread_id=args.thread_id, client_message_id=client_message_id,
-            message=context, timeout=5.0)
+        if allow_enqueue:
+            result = codex_queue_delivery.send_at_least_once(
+                path, thread_id=args.thread_id, client_message_id=client_message_id,
+                message=context, timeout=5.0)
+        elif codex_queue_delivery._known_consumed(
+                path, args.thread_id, client_message_id, timeout=5.0) is not None:
+            result = {"status": "consumed"}
+        else:
+            result = codex_queue_delivery.poll_owned_item(
+                path, thread_id=args.thread_id, client_message_id=client_message_id, timeout=5.0)
+            result["status"] = "queued"
+
         if result["status"] == "consumed":
             for delivery_id in claimed:
                 pending_delivery.ack(root, args.thread_id, delivery_id, acked_by=acked_by)
@@ -752,7 +762,7 @@ def _native_queue_delivery_once(
             pending_delivery.mark_sent_ambiguous(
                 root, args.thread_id, delivery_id, claim_owner=claim_owner)
         return {"schema_version": 1, "status": "sent-ambiguous",
-                "reason": "native-queue-consumption-pending", "thread_id": args.thread_id,
+                "reason": "native-queue-consumption-pending", "submitted": True, "thread_id": args.thread_id,
                 "client_user_message_id": client_message_id,
                 "queued_submission_id": result.get("queued_submission_id")}
     finally:
@@ -766,9 +776,14 @@ def _native_queue_delivery_once(
 def deliver_to_native_queue(args, receipt, attempts):
     deadline = time.monotonic() + max(0.0, args.timeout)
     result = {"schema_version": 1, "status": "retryable", "reason": "native-queue-timeout"}
+    submitted = False
     while time.monotonic() < deadline:
         try:
-            result = _native_queue_delivery_once(args, receipt, attempts)
+            result = _native_queue_delivery_once(args, receipt, attempts, allow_enqueue=not submitted)
+            # Positive queue acceptance is not ambiguous. Keep observing until
+            # consumed, but do not repeatedly enqueue during a history outage.
+            # A crashed courier may retry with the same id (at-least-once).
+            submitted = submitted or result.get("submitted", False)
             if result.get("status") == "accepted":
                 return result
         except (codex_queue_delivery.QueueDeliveryError, pending_delivery.PendingDeliveryError,
