@@ -4614,6 +4614,7 @@ def _gpu_session_resources(snapshot=None):
                 pid, proc_start = process.get("pid"), process.get("proc_start")
                 primary = process.get("owner")
                 if (isinstance(primary, dict) and primary.get("kind") == "session"
+                        and primary.get("source") == "persistent-claim+ancestry"
                         and primary.get("harness") == owner["harness"]
                         and primary.get("id") == owner["id"]
                         and isinstance(pid, int) and not isinstance(pid, bool) and pid > 0

@@ -269,6 +269,9 @@ class GpuProcessAndResourceRenderTest(unittest.TestCase):
                 {"pid": 3697573, "proc_start": 90,
                  "command": "python run.py --engine_mode train --config _m6_lx3nx4.yaml",
                  "owner": claimed, "session_owner": claimed},
+                {"pid": 1859127, "proc_start": 92, "command": "python other.py",
+                 "owner": {**claimed, "source": "ssh-connection+ancestry"},
+                 "session_owner": claimed},
             ]},
         ]}]}
         render.set_compute_hosts(snapshot)

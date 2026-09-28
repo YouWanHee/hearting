@@ -849,10 +849,10 @@ session ownership without restarting it. Conflicting valid claims remain
 ambiguous. A stale/reused PID, changed command, ambiguous
 claim, missing ancestry, or unreadable `/proc` remains unattributed. Cwd, PID
 number alone, and transcript text are never ownership evidence.
-Fleet places each currently observed GPU process with one exact session owner
-under that session as a `RUN` row, once per host/PID/start identity. Its title
-comes from the observed command; a process already owned by a registered job
-or run keeps that existing row. A stalled probe's expired sample loses its
+Fleet places each currently observed GPU process directly owned by a valid
+persistent claim under that exact session as a `RUN` row, once per host/PID/start
+identity. Its title comes from the observed command; other processes keep
+their existing job/run presentation. A stalled probe's expired sample loses its
 session rows. This read-only projection neither creates a
 resource-run registry entry nor changes the process lifecycle.
 
