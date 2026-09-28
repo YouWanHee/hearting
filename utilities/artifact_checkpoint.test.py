@@ -153,7 +153,8 @@ class InterimManifestTest(CheckpointTestBase):
         mapped = P.resolve_placed_output(evidence)
         self.assertEqual(mapped.read_bytes(), b"completed report")
         mapped.write_bytes(b"changed after completion")
-        self.assertFalse(F.R.terminal_gate_observation(self.route_obj)[node["id"]]["passed"])
+        with mock.patch.dict(os.environ, {"HEARTING_GATES": "on"}):
+            self.assertFalse(F.R.terminal_gate_observation(self.route_obj)[node["id"]]["passed"])
 
     def test_internal_migration_snapshot_keeps_its_recorded_paths(self):
         self.write_output(self.result, "shared-input/_internal/migration-shared-bases.json", b"{}")
