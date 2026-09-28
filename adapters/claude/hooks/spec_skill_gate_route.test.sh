@@ -1,1 +1,0 @@
-../../../hooks/spec_skill_gate_route.test.sh

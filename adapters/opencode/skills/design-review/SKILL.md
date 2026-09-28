@@ -40,12 +40,9 @@ capability contract. It is adapter-owned output, not a legacy compatibility Skil
 - Invocation semantics: Visual review with two gates. First, a verifier in a separate context uses the adapter visual harness to screen for console errors, layout collapse, and intent mismatch; it must pass before critique. Second, a critic evaluates hierarchy, alignment, accessibility, responsiveness, UX flow, and tone. Both gates render through the adapter-provided visual harness and inspect the image. Read only; never auto-fix. Adapters may expose this capability through native commands, skill files, prompt instructions, or explicit wrappers. The adapter must report unsupported runtime mechanics instead of silently treating another runtime's native file format as portable.
 
 
-## Required Guards
+## Workflow Evidence
 
-- Before edits: `adapters/opencode/bin/preflight.sh write <file> [session-id]`
 
-- Before spec-changing work: `adapters/opencode/bin/preflight.sh capability design-review [cwd] [session-id]`
-- After actually reading a spec PRD: `adapters/opencode/bin/preflight.sh read <prd.md> [session-id]`
 
 Do not use legacy compatibility Skill files or non-native adapter Skill files
 as OpenCode-native source. Those files are compatibility/reference surfaces only.

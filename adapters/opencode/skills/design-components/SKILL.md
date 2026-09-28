@@ -40,12 +40,9 @@ capability contract. It is adapter-owned output, not a legacy compatibility Skil
 - Invocation semantics: Component and visual-asset creation through the design role's maker mode. Produce shadcn/Tailwind components (`ui`), composed full-screen pages (`webapp`), slide visual guides (`slide`), SVG icons (`icon`), or Mermaid/direct-SVG/Excalidraw diagrams (`diagram`). Render and visually self-verify every output through a render→read→fix loop. With `--artifact standalone`, emit a self-contained single-file HTML preview. Adapters may expose this capability through native commands, skill files, prompt instructions, or explicit wrappers. The adapter must report unsupported runtime mechanics instead of silently treating another runtime's native file format as portable.
 
 
-## Required Guards
+## Workflow Evidence
 
-- Before edits: `adapters/opencode/bin/preflight.sh write <file> [session-id]`
 
-- Before spec-changing work: `adapters/opencode/bin/preflight.sh capability design-components [cwd] [session-id]`
-- After actually reading a spec PRD: `adapters/opencode/bin/preflight.sh read <prd.md> [session-id]`
 
 Do not use legacy compatibility Skill files or non-native adapter Skill files
 as OpenCode-native source. Those files are compatibility/reference surfaces only.

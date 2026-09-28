@@ -1,1 +1,0 @@
-../../../hooks/worktree-path-guard.sh

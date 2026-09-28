@@ -18,6 +18,7 @@ import verifier
 import codex_launcher
 import user_model_config
 import safe_fs
+import claude_settings_config
 
 RUNTIME = "codex"
 
@@ -85,7 +86,8 @@ def install(scope="global", plugin=False, dry_run=False):
     """Apply the symlink projection and optional plugin wrapper."""
     entries = projector.plan(["codex"], scope=scope)["codex"]
 
-    actions = []
+    actions = [claude_settings_config.retire_hook_registrations(
+        paths.runtime_home(RUNTIME, scope) / "hooks.json", dry_run=dry_run)]
 
     for entry in entries:
         action = entry["action"]
@@ -136,6 +138,11 @@ def install(scope="global", plugin=False, dry_run=False):
                         "detail": "already linked",
                     }
                 )
+                continue
+
+            if dest.name == "hooks.json" and dest.is_file() and not dest.is_symlink():
+                actions.append({"action": "symlink", "dest": str(dest), "status": "unchanged",
+                                "detail": "retired hooks removed; user hook file preserved"})
                 continue
 
             if dest.exists() and not dest.is_symlink():

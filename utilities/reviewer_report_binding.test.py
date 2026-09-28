@@ -556,68 +556,6 @@ class ReviewOutputWrapperBoundaryTest(unittest.TestCase):
                 self.assertIn("child_spawned=0", stdout)
                 self.assertEqual(jobs.read_text(), "")
 
-    def test_candidate_public_preflight_creates_only_the_exact_live_report(self):
-        attempt = "att-review-public-write"
-        output = Path(self.cycle["cycle_dir"]) / "artifacts/plans/public-report.md"
-        output.parent.mkdir(parents=True, exist_ok=True)
-        preflight = PROJECT_ROOT / "adapters/codex/bin/preflight.sh"
-        with self._live_review_authority(attempt=attempt, output=output) as env:
-            created = subprocess.run(
-                [
-                    "sh", "-c",
-                    '"$1" write "$2" "$3" && printf "%s\\n" verified > "$2"',
-                    "review-write", str(preflight), str(output), attempt,
-                ],
-                text=True, capture_output=True, env=env,
-            )
-            self.assertEqual(created.returncode, 0, created.stdout + created.stderr)
-            self.assertEqual(output.read_text(), "verified\n")
-            for denied in (
-                Path(self.cycle["cycle_dir"]) / "artifacts/_internal/foreign.md",
-                self.base / "foreign-root" / "report.md",
-                self.worktree / "source.py",
-            ):
-                before = denied.exists()
-                result = subprocess.run(
-                    [str(preflight), "write", str(denied), attempt],
-                    text=True, capture_output=True, env=env,
-                )
-                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertEqual(denied.exists(), before)
-
-    def test_public_preflight_uses_governed_flock_across_pid_namespace(self):
-        bwrap = shutil.which("bwrap")
-        if not bwrap:
-            self.skipTest("bubblewrap is unavailable")
-        base = [
-            bwrap, "--die-with-parent", "--unshare-pid", "--ro-bind", "/", "/",
-            "--proc", "/proc", "--dev", "/dev", "--bind", str(self.root),
-            str(self.root),
-        ]
-        probe = subprocess.run([*base, "true"], text=True, capture_output=True)
-        if probe.returncode:
-            self.skipTest("bubblewrap PID namespace unavailable: " + probe.stderr.strip())
-        attempt = "att-review-bwrap-write"
-        output = Path(self.cycle["cycle_dir"]) / "artifacts/plans/bwrap-report.md"
-        output.parent.mkdir(parents=True, exist_ok=True)
-        preflight = PROJECT_ROOT / "adapters/codex/bin/preflight.sh"
-        with self._live_review_authority(attempt=attempt, output=output) as env:
-            outer_pid = str(os.getpid())
-            outer_namespace = os.readlink("/proc/self/ns/pid")
-            self.assertIn(f",pid={outer_pid}", Path(env["AGENT_DISPATCH_JOBS"]).read_text())
-            created = subprocess.run(
-                [
-                    *base, "sh", "-c",
-                    'test "$(readlink /proc/self/ns/pid)" != "$5" '
-                    '&& "$1" write "$2" "$3" '
-                    '&& printf "%s\\n" namespace-verified > "$2"',
-                    "review-write", str(preflight), str(output), attempt,
-                    outer_pid, outer_namespace,
-                ],
-                text=True, capture_output=True, env=env,
-            )
-            self.assertEqual(created.returncode, 0, created.stdout + created.stderr)
-            self.assertEqual(output.read_text(), "namespace-verified\n")
 
 
 class ReviewAdapterWiringParityTest(unittest.TestCase):

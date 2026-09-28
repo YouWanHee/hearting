@@ -44,8 +44,7 @@ cycle. It receives the owner's open cycle through
 pass-through), may call `utilities/artifact_producer.py begin --node <node id>`
 on the same route to resume that cycle, and writes only inside
 `<cycle_dir>/artifacts/<bucket>/...` within its node `write_scope`.
-`artifact_producer.py check-write` (via `hooks/artifact-guard.sh`) denies any
-write outside the open cycle once the cutover is active; `finalize` and
+`artifact_producer.py` owns the open cycle and its output paths; `finalize` and
 `admit-shared` belong to the owner, never to a stage worker. See
 `producer_lifecycle` in `capabilities/topologies.json`.
 
@@ -58,9 +57,6 @@ Use portable role names from `roles/README.md` and `core/CONVENTIONS.md`. Concre
 Adapters must preserve the portable invariants relevant to this capability:
 
 - resolve artifact root through `utilities/artifact-root.sh` or equivalent logic;
-- enforce git/worktree safety before edits;
-- enforce artifact ordering before new durable artifacts;
-- enforce spec-read gating when this capability changes spec-backed code or specs;
 - use DB memory paths, not runtime-native memory files.
 
 ## Adapter Realization

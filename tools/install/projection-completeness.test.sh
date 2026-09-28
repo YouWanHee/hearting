@@ -119,7 +119,7 @@ PY
   test ! -e "$HOME/.claude/agent-modes" || fail "$mode Claude agent-modes surface should be retired"
 
   test -L "$HOME/.codex/hooks.json" || fail "$mode lost Codex kernel hooks"
-  test -L "$HOME/.claude/hooks/artifact-guard.sh" || fail "$mode lost Claude kernel hooks"
+  test -L "$HOME/.claude/hooks/spec-read-marker.sh" || fail "$mode lost Claude kernel hooks"
   test -L "$HOME/.claude/statusline.sh" || fail "$mode lost Claude statusline"
   test -x "$HOME/.claude/statusline.sh" || fail "$mode Claude statusline is not executable"
   test -L "$HOME/.config/opencode/plugins/hearting-guards.js" || fail "$mode lost OpenCode kernel guard plugin"

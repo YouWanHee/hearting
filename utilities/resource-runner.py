@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Detached process runner with PID reuse-safe reattachment."""
-import argparse, contextlib, fcntl, importlib.util, json, os, re, signal, subprocess, sys, time
+import argparse, contextlib, fcntl, json, os, re, signal, subprocess, sys, time
 from pathlib import Path
 from resource_run_registry import (
     classify_identity,
@@ -101,15 +101,20 @@ def main():
         cwd=Path(args.cwd).resolve(strict=True)
         command=args.command[1:] if args.command[:1]==["--"] else args.command
         if not command: fail("command required")
-        guard_path=Path(__file__).parents[1]/"hooks"/"material-route-guard.py"
-        spec=importlib.util.spec_from_file_location("material_route_guard", guard_path)
-        guard=importlib.util.module_from_spec(spec)
-        assert spec and spec.loader
-        spec.loader.exec_module(guard)
-        route=guard.verify_route(
-            Path(args.route), cwd, guard.resolve_agent_home(), expected_node=args.node,
-            accepted_capabilities={"autopilot-code", "autopilot-lab"},
-        )
+        route_file=Path(args.route)
+        if route_file.is_symlink():
+            fail("route-file-unsafe")
+        route_file=route_file.resolve(strict=True)
+        route=json.loads(route_file.read_text())
+        if route.get("capability") not in {"autopilot-code", "autopilot-lab"}:
+            fail("route-capability-not-accepted")
+        artifact_root=Path(str(route.get("artifact_root", ""))).resolve()
+        if not route_file.is_relative_to(artifact_root):
+            fail("route-file-outside-artifact-root")
+        subprocess.run([
+            sys.executable, str(Path(__file__).with_name("capability-route.py")),
+            "verify", "--route", str(route_file), "--cwd", str(cwd),
+        ], check=True, stdout=subprocess.DEVNULL)
         node=next((n for n in route["nodes"] if isinstance(n,dict) and n.get("id")==args.node),None)
         if not node or node.get("kind")!="resource-runner" or node.get("resource_transport")!="detached-process":
             fail("route node is not detached resource-runner")

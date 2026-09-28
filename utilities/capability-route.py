@@ -3997,9 +3997,8 @@ def retire_stale_closure(route_file):
     same canonical path — and `write_once` returns quietly because the bytes
     match. The route is therefore "open" again while the old
     `<route_id>.outcome.json` still sits beside it. Anything that reads that
-    sidecar as closure truth (the material-route-guard bind gate) then refuses
-    the new cycle, and the refusal is unrecoverable by recompiling, because
-    recompiling is what lands here.
+    sidecar as closure truth would otherwise mistake the new cycle for the
+    previous completed cycle.
 
     The closure is retired, never deleted: it records a real completed cycle.
 
@@ -7838,11 +7837,7 @@ def main():
                     raise ValueError("launch-runtime-root-mismatch")
             print(f"route_id={route['route_id']}\nroute_hash={route['route_hash']}")
             if getattr(a,"cwd",None) and _COMMIT_SHA.fullmatch(str(route.get("source_commit") or "")):
-                # SD-156/B1: `verify` is the one place `material-route-guard.py`
-                # (which never imports this module) can reach a lineage verdict --
-                # subprocess it and read this data line. Exit status and the two
-                # lines above are unchanged; every other `verify` caller is
-                # unaffected by an extra stdout line it does not parse.
+                # Publish the shared lineage verdict for CLI consumers.
                 verdict=source_lineage_verdict(route["cwd"],route["source_commit"])
                 observed=(
                     route["source_commit"] if verdict.kind=="exact"

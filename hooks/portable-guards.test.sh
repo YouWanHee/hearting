@@ -9,8 +9,6 @@ for herdr_var in $(env | sed -n 's/^\(HERDR_[A-Za-z0-9_]*\)=.*/\1/p'); do unset 
 unset herdr_var
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
-ART="$ROOT/hooks/artifact-guard.sh"
-GIT="$ROOT/hooks/git-state-guard.sh"
 CODEX="$ROOT/adapters/codex/bin/preflight.sh"
 CODEX_PROJECTION="$ROOT/codex_setting/bin/preflight.sh"
 OPENCODE="$ROOT/adapters/opencode/bin/preflight.sh"
@@ -18,12 +16,8 @@ OPENCODE_PROJECTION="$ROOT/opencode_setting/bin/preflight.sh"
 DESIGN="$ROOT/hooks/design-postwrite.sh"
 SSN="$ROOT/hooks/spec-sync-nudge.sh"
 MARK="$ROOT/hooks/spec-read-marker.sh"
-SPEC="$ROOT/hooks/spec-skill-gate.sh"
-CORE_MARK="$ROOT/hooks/core-read-marker.sh"
-CORE_GUARD="$ROOT/hooks/core-first-guard.sh"
 RECALL="$ROOT/hooks/mem-recall-inject.sh"
 BRIEF="$ROOT/hooks/mem-briefing-inject.sh"
-WTG="$ROOT/hooks/worktree-path-guard.sh"
 SDR="$ROOT/hooks/stage-dispatch-reminder.sh"
 CSG="$ROOT/hooks/conductor-stop-gate.sh"
 
@@ -98,531 +92,13 @@ CODEX_DIRECT_DISPATCH_HOME="$CODEX_WRAPPED_DISPATCH_HOME"
 OPENCODE_DIRECT_DISPATCH_HOME=$(AGENT_HOME="$TMP/not-agent-home" HOME="$DISPATCH_RESOLVER_HOME" XDG_DATA_HOME="$DISPATCH_RESOLVER_XDG" \
   "$ROOT/adapters/opencode/utilities/agent-home.sh")
 
-echo "== artifact guard CLI =="
-export AGENT_HOME="$ROOT" # Compile and verify against the same source contract.
-ROUTE_FIXTURE_JOBS="$TMP/proj/.dispatch/jobs.log"
-mkdir -p "$TMP/proj/.agent_reports/spec" "$(dirname "$ROUTE_FIXTURE_JOBS")"
-if "$ART" --file "$TMP/proj/.agent_reports/spec/prd.md" --session test >"$TMP/art.out" 2>"$TMP/art.err"; then
-  bad "spec write with no route declared should fail"
-else
-  [ "$?" -eq 2 ] && grep -q 'capability-artifact-route-required' "$TMP/art.err" \
-    && ok "spec write with no route declared fails closed" \
-    || bad "spec write with no route declared returned the wrong failure"
-fi
-rm -f "$TMP/proj/.agent_reports/spec/prd.md"
-
-fixture_route() {
-  fixture_capability=$1
-  fixture_mode=$2
-  fixture_name=$3
-  fixture_stdout="$TMP/$fixture_name.route.json"
-  fixture_stderr="$TMP/$fixture_name.route.err"
-  AGENT_HOME="$ROOT" AGENT_DISPATCH_JOBS="$ROUTE_FIXTURE_JOBS" \
-  python3 "$ROOT/utilities/capability-route.py" compile \
-    --slug "$fixture_name" \
-    --capability "$fixture_capability" --capability-mode "$fixture_mode" \
-    --intensity direct --cwd "$TMP/proj" \
-    --artifact-root "$TMP/proj/.agent_reports" \
-    --predicate atomic-outcome --predicate known-scope \
-    --predicate no-shared-contract --predicate no-resource-run \
-    --predicate no-artifact-handoff --predicate no-independent-verifier \
-    --predicate focused-verification --tracking untracked \
-    --spec-read not-applicable --drift-verdict no-project-spec \
-    --workflow-mode untracked --artifact-guard preflight-passed \
-    --inline-reason atomic-direct >"$fixture_stdout" 2>"$fixture_stderr"
-  fixture_route_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8"))["route_id"])' "$fixture_stdout")
-  printf '%s\n' "$TMP/proj/.agent_reports/.runtime/routes/$fixture_route_id.json"
-}
-fixture_route_id() {
-  python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8"))["route_id"])' "$1"
-}
-
-route_no_spec=$(fixture_route autopilot-code dev route-no-spec)
-route_no_spec_id=$(fixture_route_id "$route_no_spec")
-if AGENT_ROUTE_FILE="$route_no_spec" AGENT_ROUTE_ID="$route_no_spec_id" AGENT_ROUTE_NODE=inline \
-  "$ART" --file "$TMP/proj/.agent_reports/spec/prd.md" >"$TMP/art_route.out" 2>"$TMP/art_route.err"; then
-  bad "a non-spec capability route should not authorize spec output"
-else
-  [ "$?" -eq 2 ] && grep -q 'capability-artifact-route-required' "$TMP/art_route.err" \
-    && grep -q "$route_no_spec_id" "$TMP/art_route.err" \
-    && ok "a non-spec route is a route-addressed structured failure" \
-    || bad "non-spec route mismatch missing structured failure"
-fi
-route_spec=$(fixture_route autopilot-spec update route-spec)
-route_spec_id=$(fixture_route_id "$route_spec")
-if AGENT_ROUTE_FILE="$route_spec" AGENT_ROUTE_ID="$route_spec_id" AGENT_ROUTE_NODE=inline \
-  "$ART" --file "$TMP/proj/.agent_reports/spec/prd.md" >"$TMP/art_route_guard.out" 2>"$TMP/art_route_guard.err"; then
-  ok "verified spec route authorizes its declared output"
-else
-  bad "verified spec route should authorize its declared output"
-fi
-mkdir -p "$TMP/proj/.agent_reports/spec/dispatch-profiles/nested"
-if AGENT_ROUTE_FILE="$route_spec" AGENT_ROUTE_ID="$route_spec_id" AGENT_ROUTE_NODE=inline \
-  "$ART" --file "$TMP/proj/.agent_reports/spec/dispatch-profiles/prd.md" >"$TMP/art_component_guard.out" 2>"$TMP/art_component_guard.err"; then
-  ok "verified spec route authorizes a declared component output"
-else
-  bad "verified spec route should authorize a declared component output"
-fi
-if AGENT_ROUTE_FILE="$route_spec" AGENT_ROUTE_ID="$route_spec_id" AGENT_ROUTE_NODE=inline \
-  "$ART" --file "$TMP/proj/.agent_reports/spec/dispatch-profiles/nested/prd.md" >"$TMP/art_component_nested.out" 2>"$TMP/art_component_nested.err"; then
-  bad "a component placeholder must not absorb multiple path segments"
-else
-  [ "$?" -eq 2 ] && grep -q 'artifact-write-outside-node-scope' "$TMP/art_component_nested.err" \
-    && ok "a component placeholder binds exactly one path segment" \
-    || bad "nested component path rejection missing structured scope failure"
-fi
-
-route_plan=$(fixture_route autopilot-code dev route-plan)
-route_plan_id=$(fixture_route_id "$route_plan")
-mkdir -p "$TMP/proj/.agent_reports/plans/2026-08-03_fixture/plan" "$TMP/proj/.agent_reports/test_logs" "$TMP/proj/.agent_reports/.runtime"
-if AGENT_ROUTE_FILE="$route_plan" AGENT_ROUTE_ID="$route_plan_id" AGENT_ROUTE_NODE=inline \
-  "$ART" --file "$TMP/proj/.agent_reports/plans/2026-08-03_fixture/plan/plan.md" >"$TMP/art_scope_in.out" 2>"$TMP/art_scope_in.err"; then
-  ok "artifact write inside the declared node scope passes"
-else
-  bad "artifact write inside the declared node scope should pass"
-fi
-if AGENT_ROUTE_FILE="$route_plan" AGENT_ROUTE_ID="$route_plan_id" AGENT_ROUTE_NODE=inline \
-  "$ART" --file "$TMP/proj/.agent_reports/test_logs/run.log" >"$TMP/art_scope_out.out" 2>"$TMP/art_scope_out.err"; then
-  bad "artifact write outside the declared node scope should fail"
-else
-  [ "$?" -eq 2 ] && grep -q 'artifact-write-outside-node-scope' "$TMP/art_scope_out.err" \
-    && grep -q "$route_plan_id" "$TMP/art_scope_out.err" && ok "out-of-scope artifact write is a route-addressed structured failure" \
-    || bad "out-of-scope artifact write missing structured route failure"
-fi
-if "$ART" --file "$TMP/proj/.agent_reports/test_logs/run.log" >"$TMP/art_scope_noroute.out" 2>"$TMP/art_scope_noroute.err"; then
-  ok "artifact write with no route declared stays unbound"
-else
-  bad "artifact write with no route declared should stay unbound"
-fi
-if AGENT_ROUTE_FILE="$route_plan" AGENT_ROUTE_ID="$route_plan_id" AGENT_ROUTE_NODE=inline \
-  "$ART" --file "$TMP/proj/.agent_reports/.runtime/state.json" >"$TMP/art_scope_dot.out" 2>"$TMP/art_scope_dot.err"; then
-  ok "dot-prefixed runtime state is exempt from node scope binding"
-else
-  bad "dot-prefixed runtime state should be exempt from node scope binding"
-fi
-# NOTE: despite the file name, AGENT_ROUTE_NODE=inline below names a real
-# route node ("inline" is in route["nodes"]), so this exercises the ordinary
-# non-owner node-scope path, not the C-item owner defect (empty
-# AGENT_ROUTE_NODE). See the "owner binding" cases further down for that.
-route_owner="$route_plan"
-route_owner_id="$route_plan_id"
-if AGENT_ROUTE_FILE="$route_owner" AGENT_ROUTE_ID="$route_owner_id" AGENT_ROUTE_NODE=inline \
-  "$ART" --file "$TMP/proj/.agent_reports/plans/2026-08-03_fixture/plan/plan.md" >"$TMP/art_cycle_in.out" 2>"$TMP/art_cycle_in.err"; then
-  ok "a <cycle> placeholder scope binds one path segment"
-else
-  bad "a <cycle> placeholder scope should bind one path segment"
-fi
-if AGENT_ROUTE_FILE="$route_owner" AGENT_ROUTE_ID="$route_owner_id" AGENT_ROUTE_NODE=inline \
-  "$ART" --file "$TMP/proj/.agent_reports/test_logs/run.log" >"$TMP/art_cycle_out.out" 2>"$TMP/art_cycle_out.err"; then
-  bad "a worktree-only scope should not authorize an unrelated artifact write"
-else
-  [ "$?" -eq 2 ] && ok "a worktree-only scope does not authorize an unrelated artifact write" \
-    || bad "worktree-only scope violation wrong exit"
-fi
-
-# Item C: owner writes (empty AGENT_ROUTE_NODE, per SD-97) must skip node
-# write-scope matching, not fall through the node lookup's StopIteration.
-mkdir -p "$TMP/proj/.agent_reports/plans/owner_cycle/dev_logs"
-if AGENT_ROUTE_FILE="$route_owner" AGENT_ROUTE_ID="$route_owner_id" AGENT_ROUTE_NODE="" \
-  "$ART" --file "$TMP/proj/.agent_reports/plans/owner_cycle/checklist.md" >"$TMP/art_owner_ck.out" 2>"$TMP/art_owner_ck.err"; then
-  ok "owner binding (empty route node) can write cycle artifacts"
-else
-  bad "owner binding (empty route node) should be able to write cycle artifacts"
-fi
-if AGENT_ROUTE_FILE="$route_owner" AGENT_ROUTE_ID="$route_owner_id" AGENT_ROUTE_NODE="" \
-  "$ART" --file "$TMP/proj/.agent_reports/plans/owner_cycle/dev_logs/x.md" >"$TMP/art_owner_dl.out" 2>"$TMP/art_owner_dl.err"; then
-  ok "owner binding (empty route node) can write dev_logs artifacts"
-else
-  bad "owner binding (empty route node) should be able to write dev_logs artifacts"
-fi
-mkdir -p "$TMP/proj/.agent_reports/spec"
-if AGENT_ROUTE_FILE="$route_owner" AGENT_ROUTE_ID="$route_owner_id" AGENT_ROUTE_NODE="" \
-  "$ART" --file "$TMP/proj/.agent_reports/spec/x.md" >"$TMP/art_owner_spec.out" 2>"$TMP/art_owner_spec.err"; then
-  bad "owner binding must still be rejected from spec/ writes"
-else
-  [ "$?" -eq 2 ] && grep -q 'capability-artifact-route-required' "$TMP/art_owner_spec.err" \
-    && ok "owner binding is rejected from spec/ writes" \
-    || bad "owner binding spec/ rejection missing structured reason"
-fi
-if AGENT_ROUTE_FILE="$route_owner" AGENT_ROUTE_ID="$route_owner_id" AGENT_ROUTE_NODE=inline \
-  "$ART" --file "$TMP/proj/.agent_reports/documents/fake/doc.md" >"$TMP/art_node_scope.out" 2>"$TMP/art_node_scope.err"; then
-  bad "a real node's out-of-scope write must still be rejected"
-else
-  [ "$?" -eq 2 ] && grep -q 'capability-artifact-route-required' "$TMP/art_node_scope.err" \
-    && ok "a real node's out-of-scope write is still rejected (owner exception did not widen)" \
-    || bad "real node out-of-scope rejection missing structured reason"
-fi
-mkdir -p "$TMP/ownerrepo/.agent_reports/_internal" "$TMP/ownerrepo-wt"
-(
-  cd "$TMP/ownerrepo" || exit 1
-  git init -q
-  git config user.email test@example.com
-  git config user.name Test
-  printf 'canonical\n' > .agent_reports/_internal/marker
-  git add .
-  git commit -q -m init
-  git worktree add -q -b owner-topic "$TMP/ownerrepo-wt/topic"
-)
-if AGENT_ROUTE_FILE="$route_owner" AGENT_ROUTE_ID="$route_owner_id" AGENT_ROUTE_NODE="" \
-  "$ART" --file "$TMP/ownerrepo-wt/topic/.agent_reports/plans/owner_cycle/checklist.md" >"$TMP/art_owner_root.out" 2>"$TMP/art_owner_root.err"; then
-  bad "owner binding must still respect the canonical artifact root boundary"
-else
-  [ "$?" -eq 2 ] && grep -q 'canonical-artifact-root-mismatch' "$TMP/art_owner_root.err" \
-    && ok "owner binding does not bypass the canonical artifact root boundary" \
-    || bad "owner binding canonical-root rejection missing structured reason"
-fi
-
-route_refine=$(fixture_route autopilot-refine default route-refine)
-route_refine_id=$(fixture_route_id "$route_refine")
-mkdir -p "$TMP/proj/.agent_reports/documents/cycle" "$TMP/proj/.agent_reports/rebuttal"
-printf 'before\n' > "$TMP/proj/.agent_reports/documents/cycle/doc.md"
-printf 'legacy\n' > "$TMP/proj/.agent_reports/rebuttal/rebuttal.md"
-if AGENT_ROUTE_FILE="$route_refine" AGENT_ROUTE_ID="$route_refine_id" AGENT_ROUTE_NODE=inline \
-  "$ART" --file "$TMP/proj/.agent_reports/documents/cycle/doc.md" >"$TMP/art_refine_owned.out" 2>"$TMP/art_refine_owned.err"; then
-  [ ! -e "$TMP/proj/.agent_reports/documents/cycle/_internal/versions" ] \
-    && ok "direct refine authorizes an owned document without a snapshot" \
-    || bad "direct refine unexpectedly created a snapshot"
-else
-  bad "target-artifact should authorize an owned document"
-fi
-if AGENT_ROUTE_FILE="$route_refine" AGENT_ROUTE_ID="$route_refine_id" AGENT_ROUTE_NODE=inline \
-  "$ART" --file "$TMP/proj/.agent_reports/rebuttal/rebuttal.md" >"$TMP/art_refine_unowned.out" 2>"$TMP/art_refine_unowned.err"; then
-  bad "target-artifact should not authorize an unowned rebuttal container"
-else
-  [ "$?" -eq 2 ] && grep -q 'artifact-write-outside-node-scope' "$TMP/art_refine_unowned.err" \
-    && ok "target-artifact rejects unowned top-level artifact containers" \
-    || bad "unowned target-artifact failure was not route-addressed"
-fi
-route_refine_direct="$route_refine"
-route_refine_direct_id="$route_refine_id"
-mkdir -p "$TMP/proj/.agent_reports/documents/minor"
-printf 'minor\n' > "$TMP/proj/.agent_reports/documents/minor/doc.md"
-if AGENT_ROUTE_FILE="$route_refine_direct" AGENT_ROUTE_ID="$route_refine_direct_id" AGENT_ROUTE_NODE=inline \
-  "$ART" --file "$TMP/proj/.agent_reports/documents/minor/doc.md" >"$TMP/art_refine_direct.out" 2>"$TMP/art_refine_direct.err"; then
-  [ ! -e "$TMP/proj/.agent_reports/documents/minor/_internal/versions" ] \
-    && ok "direct minor refine remains snapshot-free" \
-    || bad "direct minor refine unexpectedly created a snapshot"
-else
-  bad "direct minor refine should pass for an owned document"
-fi
-mkdir -p "$TMP/proj/.agent_reports/plans/cycle/documents/fake"
-if AGENT_ROUTE_FILE="$route_refine_direct" AGENT_ROUTE_ID="$route_refine_direct_id" AGENT_ROUTE_NODE=inline \
-  "$ART" --file "$TMP/proj/.agent_reports/plans/cycle/documents/fake/doc.md" >"$TMP/art_refine_nested.out" 2>"$TMP/art_refine_nested.err"; then
-  bad "target-artifact must be anchored to a canonical top-level container"
-else
-  [ "$?" -eq 2 ] && ok "target-artifact cannot match an owned-looking nested suffix" \
-  || bad "nested target-artifact violation wrong exit"
-fi
-
-# A draft/refine route's declared support scopes (frame shards, strategy, stage
-# output, reviews, final) are not target documents. The snapshot helper must
-# skip exactly those declared scopes instead of failing the write closed, while
-# an owned document target still gets its pre-change snapshot. The support
-# route reuses a compiled direct draft route and adds one frame node, then
-# recomputes its sealed identity.
-route_draft=$(fixture_route autopilot-draft paper route-draft)
-route_draft_id=$(fixture_route_id "$route_draft")
-route_draft_support=$(python3 - "$route_draft" "$TMP/proj/.agent_reports/.runtime/routes" "$ROOT" <<'PY'
-import json,sys
-from pathlib import Path
-route_path,routes_dir,root=sys.argv[1:4]
-sys.path.insert(0,str(Path(root)/"utilities"))
-import route_identity
-route=json.loads(Path(route_path).read_text(encoding="utf-8"))
-inline=next(node for node in route["nodes"] if node["id"]=="inline")
-inline.setdefault("write_scope",[]).append("shards/frame/**")
-route["route_hash"]=route_identity.route_hash(route)
-route["route_id"]=route_identity.route_id_from_hash(route["route_hash"])
-out=Path(routes_dir)/f"{route['route_id']}.json"
-out.parent.mkdir(parents=True,exist_ok=True)
-out.write_text(json.dumps(route),encoding="utf-8")
-print(out)
-PY
-)
-route_draft_support_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8"))["route_id"])' "$route_draft_support")
-mkdir -p "$TMP/proj/.agent_reports/shards/frame"
-if AGENT_ROUTE_FILE="$route_draft_support" AGENT_ROUTE_ID="$route_draft_support_id" AGENT_ROUTE_NODE=inline \
-  "$ART" --file "$TMP/proj/.agent_reports/shards/frame/direction-brief.md" >"$TMP/art_draft_support.out" 2>"$TMP/art_draft_support.err"; then
-  ok "a declared draft frame shard is not a snapshot target"
-else
-  bad "a declared draft frame shard should pass the snapshot guard"
-fi
-if AGENT_ROUTE_FILE="$route_draft_support" AGENT_ROUTE_ID="$route_draft_support_id" AGENT_ROUTE_NODE=inline \
-  "$ART" --file "$TMP/proj/.agent_reports/test_logs/draft.log" >"$TMP/art_draft_scope_out.out" 2>"$TMP/art_draft_scope_out.err"; then
-  bad "a draft route must still reject a write outside the node scope"
-else
-  [ "$?" -eq 2 ] && grep -q 'artifact-write-outside-node-scope' "$TMP/art_draft_scope_out.err" \
-    && ok "a draft support route keeps its node-scope boundary" \
-    || bad "draft support route scope rejection wrong failure"
-fi
-mkdir -p "$TMP/proj/.agent_reports/documents/draftcycle"
-printf 'before\n' > "$TMP/proj/.agent_reports/documents/draftcycle/doc.md"
-if AGENT_ROUTE_FILE="$route_draft_support" AGENT_ROUTE_ID="$route_draft_support_id" AGENT_ROUTE_NODE=inline \
-  "$ART" --file "$TMP/proj/.agent_reports/documents/draftcycle/doc.md" >"$TMP/art_draft_doc.out" 2>"$TMP/art_draft_doc.err"; then
-  [ -f "$TMP/proj/.agent_reports/documents/draftcycle/_internal/versions/v1/doc.md" ] \
-    && ok "an owned draft document target keeps its pre-change snapshot" \
-    || bad "draft document target snapshot missing"
-else
-  bad "an owned draft document target should pass snapshot preparation"
-fi
-
-echo "== artifact guard Bash channel (C-2b, Tier A/B/C) =="
-# Bash-mode target resolution and Tier B observation placement are cwd-scoped
-# (matching the real runtime, where a PreToolUse hook inherits the session's
-# actual cwd) -- run this section from the fixture project root.
-cd "$TMP/proj" || exit 1
-CANON="$TMP/proj/.agent_reports"
-OBS_FILE="$CANON/.runtime/observations/undecidable-write-channel.jsonl"
-obs_count() { [ -f "$OBS_FILE" ] && wc -l < "$OBS_FILE" || echo 0; }
-
-# Required regression (2): Write tool and Bash heredoc get the same verdict
-# for the same path, both in-scope (exit 0) and out-of-scope (exit 2).
-if AGENT_ROUTE_FILE="$route_plan" AGENT_ROUTE_ID="$route_plan_id" AGENT_ROUTE_NODE=inline \
-  "$ART" --command "cat <<EOF > $TMP/proj/.agent_reports/plans/2026-08-03_fixture/plan/heredoc.md
-x
-EOF" >"$TMP/art_bash_scope_in.out" 2>"$TMP/art_bash_scope_in.err"; then
-  ok "regression (2): Bash heredoc write inside node scope matches Write tool (exit 0)"
-else
-  bad "regression (2): Bash heredoc in-scope should match Write tool exit 0"
-fi
-if AGENT_ROUTE_FILE="$route_plan" AGENT_ROUTE_ID="$route_plan_id" AGENT_ROUTE_NODE=inline \
-  "$ART" --command "cat <<EOF > $TMP/proj/.agent_reports/test_logs/bash-run.log
-x
-EOF" >"$TMP/art_bash_scope_out.out" 2>"$TMP/art_bash_scope_out.err"; then
-  bad "regression (2): Bash heredoc write outside node scope should be blocked like Write tool"
-else
-  [ "$?" -eq 2 ] && grep -q 'artifact-write-outside-node-scope' "$TMP/art_bash_scope_out.err" \
-    && ok "regression (2): Bash heredoc write outside node scope matches Write tool (exit 2)" \
-    || bad "regression (2): Bash heredoc out-of-scope failure missing structured reason"
-fi
-
-# Required regression (3): analysis_project/<mode>/** allows a real analyze
-# node scope path (reverses the C-2a real over-block record).
-route_analyze=$(fixture_route analyze-project code route-analyze)
-route_analyze_id=$(fixture_route_id "$route_analyze")
-mkdir -p "$TMP/proj/.agent_reports/analysis_project/code/mega-audit/cg"
-if AGENT_ROUTE_FILE="$route_analyze" AGENT_ROUTE_ID="$route_analyze_id" AGENT_ROUTE_NODE=inline \
-  "$ART" --command "echo x > $TMP/proj/.agent_reports/analysis_project/code/mega-audit/cg/00_overview.md" \
-  >"$TMP/art_bash_mode.out" 2>"$TMP/art_bash_mode.err"; then
-  ok "regression (3): analysis_project/<mode>/** admits a real analyze-mode path via Bash channel"
-else
-  bad "regression (3): analysis_project/<mode>/** should admit a real analyze-mode path"
-fi
-
-# Tier B: an interpreter-mediated write is undecidable -> pass, and is
-# recorded as an observation (digest only, never the raw command).
-before_obs=$(obs_count)
-if AGENT_ROUTE_FILE="$route_plan" AGENT_ROUTE_ID="$route_plan_id" AGENT_ROUTE_NODE=inline \
-  "$ART" --command "python3 -c \"open('$TMP/proj/.agent_reports/test_logs/pywrite.log','w')\"" \
-  >"$TMP/art_tierb.out" 2>"$TMP/art_tierb.err"; then
-  after_obs=$(obs_count)
-  [ "$after_obs" -eq $((before_obs + 1)) ] \
-    && ! grep -q "pywrite" "$OBS_FILE" \
-    && ok "Tier B: interpreter-mediated write passes and is observed (digest only)" \
-    || bad "Tier B: observation count/content mismatch"
-else
-  bad "Tier B: interpreter-mediated write must pass (fail-safe), not block"
-fi
-
-# sh -c depth-1 recursion is still decidable and still enforces node scope.
-if AGENT_ROUTE_FILE="$route_plan" AGENT_ROUTE_ID="$route_plan_id" AGENT_ROUTE_NODE=inline \
-  "$ART" --command "sh -c 'echo x > $TMP/proj/.agent_reports/test_logs/shc.log'" \
-  >"$TMP/art_shc.out" 2>"$TMP/art_shc.err"; then
-  bad "sh -c depth-1 recursion should still enforce node scope"
-else
-  [ "$?" -eq 2 ] && ok "sh -c depth-1 recursion still resolves to a literal, enforced target" \
-    || bad "sh -c depth-1 recursion wrong exit"
-fi
-
-# Required regression (5): canonical-root-boundary non-engagement. A literal
-# target outside the canonical artifact root is never handed to node-scope
-# matching -- exit 0, and no observation growth (Tier A decided it, cleanly).
-before_obs5=$(obs_count)
-bash_root_outside_case() {
-  desc=$1; command=$2
-  if AGENT_ROUTE_FILE="$route_plan" AGENT_ROUTE_ID="$route_plan_id" AGENT_ROUTE_NODE=inline \
-    "$ART" --command "$command" >"$TMP/art_out5.out" 2>"$TMP/art_out5.err"; then
-    ok "regression (5): $desc -> exit 0 (root-outside, guard does not engage)"
-  else
-    bad "regression (5): $desc should exit 0 (root-outside)"
-  fi
-}
-bash_root_outside_case "a: printf > /dev/null" "printf x >/dev/null"
-bash_root_outside_case "b: 2>&1 not mistaken for a file target" "some-cmd >/dev/null 2>&1"
-bash_root_outside_case "c: pipe to tee /tmp" "echo hi | tee $TMP/probe-c"
-bash_root_outside_case "d: cp artifact to /tmp" "cp $TMP/proj/.agent_reports/plans/2026-08-03_fixture/plan/plan.md $TMP/probe-d"
-bash_root_outside_case "e: rm a worktree source file" "rm $TMP/probe-e-touch-first 2>/dev/null; touch $TMP/probe-e-touch-first && rm $TMP/probe-e-touch-first"
-after_obs5=$(obs_count)
-[ "$after_obs5" -eq "$before_obs5" ] \
-  && ok "regression (5): root-outside cases grew no Tier B observations" \
-  || bad "regression (5): root-outside cases unexpectedly grew observations"
-
-# Required regression (6): the opposite direction. rm and redirects INSIDE the
-# canonical root are still judged: out-of-node-scope blocks (f/g), the node's
-# own scope and _internal pass (h/i). f and g pin `rm` to the exact opposite
-# verdict of case (5e) depending on which side of the root boundary it lands.
-mkdir -p "$TMP/proj/.agent_reports/test_logs/other-scope" "$TMP/proj/.agent_reports/plans/2026-08-03_fixture/plan/_internal"
-printf 'x\n' > "$TMP/proj/.agent_reports/test_logs/other-scope/x.md"
-if AGENT_ROUTE_FILE="$route_plan" AGENT_ROUTE_ID="$route_plan_id" AGENT_ROUTE_NODE=inline \
-  "$ART" --command "rm $TMP/proj/.agent_reports/test_logs/other-scope/x.md" \
-  >"$TMP/art_out6f.out" 2>"$TMP/art_out6f.err"; then
-  bad "regression (6f): rm inside canonical root but outside node scope should be blocked"
-else
-  [ "$?" -eq 2 ] && grep -q 'artifact-write-outside-node-scope' "$TMP/art_out6f.err" \
-    && ok "regression (6f): rm inside canonical root, outside node scope -> exit 2" \
-    || bad "regression (6f): missing structured reason"
-fi
-if AGENT_ROUTE_FILE="$route_plan" AGENT_ROUTE_ID="$route_plan_id" AGENT_ROUTE_NODE=inline \
-  "$ART" --command "echo x > $TMP/proj/.agent_reports/test_logs/other-scope/y.md" \
-  >"$TMP/art_out6g.out" 2>"$TMP/art_out6g.err"; then
-  bad "regression (6g): redirect inside canonical root but outside node scope should be blocked"
-else
-  [ "$?" -eq 2 ] && grep -q 'artifact-write-outside-node-scope' "$TMP/art_out6g.err" \
-    && ok "regression (6g): redirect inside canonical root, outside node scope -> exit 2" \
-    || bad "regression (6g): missing structured reason"
-fi
-if AGENT_ROUTE_FILE="$route_plan" AGENT_ROUTE_ID="$route_plan_id" AGENT_ROUTE_NODE=inline \
-  "$ART" --command "echo x > $TMP/proj/.agent_reports/plans/2026-08-03_fixture/plan/own.md" \
-  >"$TMP/art_out6h.out" 2>"$TMP/art_out6h.err"; then
-  ok "regression (6h): redirect inside the caller's own node scope -> exit 0"
-else
-  bad "regression (6h): redirect inside own node scope should pass"
-fi
-if AGENT_ROUTE_FILE="$route_plan" AGENT_ROUTE_ID="$route_plan_id" AGENT_ROUTE_NODE=inline \
-  "$ART" --command "echo x > $TMP/proj/.agent_reports/plans/2026-08-03_fixture/plan/_internal/x.md" \
-  >"$TMP/art_out6i.out" 2>"$TMP/art_out6i.err"; then
-  ok "regression (6i): redirect into _internal/ stays exempt -> exit 0"
-else
-  bad "regression (6i): _internal/ exemption should still hold on the Bash channel"
-fi
-
-echo "== source-only worktree artifact guard =="
-mkdir -p "$TMP/artrepo/.agent_reports/_internal" "$TMP/artrepo-wt"
-(
-  cd "$TMP/artrepo" || exit 1
-  git init -q
-  git config user.email test@example.com
-  git config user.name Test
-  printf 'canonical\n' > .agent_reports/_internal/marker
-  git add .
-  git commit -q -m init
-  git worktree add -q -b artifact-topic "$TMP/artrepo-wt/topic"
-)
-if "$ART" --file "$TMP/artrepo-wt/topic/.agent_reports/_internal/probe.md" >"$TMP/art_local.out" 2>"$TMP/art_local.err"; then
-  bad "linked-worktree artifact write should fail"
-else
-  [ "$?" -eq 2 ] \
-    && grep -q 'source-only' "$TMP/art_local.err" \
-    && ok "linked-worktree artifact write exits 2" \
-    || bad "linked-worktree artifact write wrong exit/message"
-fi
-if "$ART" --file "$TMP/artrepo/.agent_reports/_internal/probe.md" >"$TMP/art_main.out" 2>"$TMP/art_main.err"; then
-  ok "canonical artifact write passes"
-else
-  bad "canonical artifact write should pass"
-fi
-
-echo "== git state guard CLI =="
-export AGENT_HOME="$TMP/agent_home"
-mkdir -p "$TMP/repo"
-(
-  cd "$TMP/repo" || exit 1
-  git init -q
-  git config user.email test@example.com
-  git config user.name Test
-  printf 'a\n' > f
-  printf '.agent_reports/\n.dispatch/\n' > .gitignore
-  git add f .gitignore
-  git commit -q -m init
-)
-if "$GIT" --file "$TMP/repo/f" >"$TMP/git.out" 2>"$TMP/git.err"; then
-  ok "clean repo passes"
-else
-  bad "clean repo should pass"
-fi
-git -C "$TMP/repo" checkout --detach -q HEAD
-if "$GIT" --file "$TMP/repo/f" >"$TMP/git.out" 2>"$TMP/git.err"; then
-  bad "detached repo should fail"
-else
-  [ "$?" -eq 2 ] && ok "detached repo exits 2" || bad "detached repo wrong exit"
-fi
-
-echo "== worktree path guard CLI =="
-# git repo for the guard (reuse "$TMP/repo"; a git toplevel is all the guard needs).
-# (a) 내장 EnterWorktree 전면 deny (repo 안 .claude/worktrees/ 오염).
-if "$WTG" --tool EnterWorktree --cwd "$TMP/repo" --session wtgsid >"$TMP/wtg.out" 2>"$TMP/wtg.err"; then
-  bad "EnterWorktree should be denied"
-else
-  [ "$?" -eq 2 ] && grep -q 'EnterWorktree' "$TMP/wtg.err" && ok "worktree guard denies builtin EnterWorktree (exit 2)" \
-    || bad "worktree guard wrong exit/message on EnterWorktree"
-fi
-# (b) Bash `git worktree add` 대상이 <repo>-wt/ 밖 → deny.
-if "$WTG" --tool Bash --command 'git worktree add .claude/worktrees/foo -b foo' --cwd "$TMP/repo" --session wtgsid >"$TMP/wtg.out" 2>"$TMP/wtg.err"; then
-  bad "git worktree add outside -wt/ should be denied"
-else
-  [ "$?" -eq 2 ] && grep -q -- '-wt/' "$TMP/wtg.err" && ok "worktree guard denies git worktree add outside -wt/ (exit 2)" \
-    || bad "worktree guard wrong exit/message on non -wt/ worktree add"
-fi
-# 오차단 금지 ①: 정규 형제 경로 <repo>-wt/<slug> 의 git worktree add 는 절대 차단 금지 (분사 정상 흐름).
-if "$WTG" --tool Bash --command 'git worktree add /home/x/repo-wt/slug -b slug main' --cwd "$TMP/repo" --session wtgsid >"$TMP/wtg.out" 2>"$TMP/wtg.err"; then
-  ok "worktree guard passes regular <repo>-wt/<slug> add"
-else
-  bad "worktree guard should never block a regular <repo>-wt/ add"
-fi
-# 오차단 금지 ②: 비-add 서브커맨드(remove/list/prune)는 무간섭.
-if "$WTG" --tool Bash --command 'git worktree remove /home/x/repo-wt/slug' --cwd "$TMP/repo" --session wtgsid >"$TMP/wtg.out" 2>"$TMP/wtg.err" \
-  && "$WTG" --tool Bash --command 'git worktree prune' --cwd "$TMP/repo" --session wtgsid >"$TMP/wtg.out" 2>"$TMP/wtg.err" \
-  && "$WTG" --tool Bash --command 'git worktree list' --cwd "$TMP/repo" --session wtgsid >"$TMP/wtg.out" 2>"$TMP/wtg.err"; then
-  ok "worktree guard leaves non-add worktree subcommands alone"
-else
-  bad "worktree guard should leave remove/prune/list alone"
-fi
-# 오차단 금지 ③: WORKTREE_GUARD_BYPASS=1 → 전면 우회.
-if WORKTREE_GUARD_BYPASS=1 "$WTG" --tool EnterWorktree --cwd "$TMP/repo" --session wtgbypass >"$TMP/wtg.out" 2>"$TMP/wtg.err"; then
-  ok "worktree guard honors WORKTREE_GUARD_BYPASS=1"
-else
-  bad "worktree guard should bypass under WORKTREE_GUARD_BYPASS=1"
-fi
-# 오차단 금지 ④: 비-git cwd → 무간섭 (fail-open).
-if "$WTG" --tool EnterWorktree --cwd "$TMP" --session wtgsid >"$TMP/wtg.out" 2>"$TMP/wtg.err"; then
-  ok "worktree guard fails open outside a git repo"
-else
-  bad "worktree guard should fail open outside a git repo"
-fi
-# 오차단 금지 ⑤: 무관한 Bash 명령 → 무간섭.
-if "$WTG" --tool Bash --command 'ls -la && git status' --cwd "$TMP/repo" --session wtgsid >"$TMP/wtg.out" 2>"$TMP/wtg.err"; then
-  ok "worktree guard leaves unrelated Bash commands alone"
-else
-  bad "worktree guard should leave unrelated Bash commands alone"
-fi
-
-echo "== codex preflight wrapper =="
-git -C "$TMP/repo" switch -q -c work
-if "$CODEX" write "$TMP/repo/f" testsid >"$TMP/codex.out" 2>"$TMP/codex.err"; then
-  ok "codex preflight passes clean write"
-else
-  bad "codex preflight should pass clean write"
-fi
-# A3 fallback verb: `preflight worktree-path` reproduces the same CLI outcomes
-# already asserted against $WTG directly.
-if "$CODEX" worktree-path --tool Bash --command 'git worktree add .claude/worktrees/foo -b foo' --cwd "$TMP/repo" --session wtgsid >"$TMP/codex_wtp.out" 2>"$TMP/codex_wtp.err"; then
-  bad "codex preflight worktree-path should deny non -wt/ worktree add"
-else
-  [ "$?" -eq 2 ] && ok "codex preflight worktree-path fallback denies non -wt/ worktree add" \
-    || bad "codex preflight worktree-path wrong exit on non -wt/ worktree add"
-fi
-if "$CODEX" worktree-path --tool Bash --command 'git worktree add /home/x/repo-wt/slug -b slug main' --cwd "$TMP/repo" --session wtgsid >"$TMP/codex_wtp.out" 2>"$TMP/codex_wtp.err"; then
-  ok "codex preflight worktree-path fallback passes canonical <repo>-wt/ add"
-else
-  bad "codex preflight worktree-path fallback should pass canonical <repo>-wt/ add"
-fi
-if AGENT_HOME="$ROOT" bash "$DESIGN" --file "$TMP/not-design.txt" >"$TMP/design.out" 2>"$TMP/design.err" \
-  && "$CODEX" design "$TMP/not-design.txt" >"$TMP/design.out" 2>"$TMP/design.err"; then
-  ok "design postwrite wrappers no-op on non-html"
-else
-  bad "design postwrite wrappers should no-op on non-html"
-fi
-
+mkdir -p "$TMP/repo" "$TMP/proj/.agent_reports/spec"
+git -C "$TMP/repo" init -q
+git -C "$TMP/repo" config user.email fixture@example.invalid
+git -C "$TMP/repo" config user.name Fixture
+printf 'fixture\n' > "$TMP/repo/f"
+git -C "$TMP/repo" add f
+git -C "$TMP/repo" commit -qm fixture
 echo "== spec sync nudge CLI =="
 SSNPROJ="$TMP/ssnproj"
 mkdir -p "$SSNPROJ/.agent_reports/spec"
@@ -766,313 +242,6 @@ else
   bad "codex preflight should prefer a valid explicit registry override"
 fi
 
-echo "== spec read gate CLI =="
-mkdir -p "$TMP/specproj/.agent_reports/spec"
-printf 'prd\n' > "$TMP/specproj/.agent_reports/spec/prd.md"
-if "$SPEC" --skill autopilot-code --cwd "$TMP/specproj" --session testsid >"$TMP/spec.out" 2>"$TMP/spec.err"; then
-  bad "spec-backed capability without read marker should fail"
-else
-  [ "$?" -eq 2 ] && ok "spec-backed capability without read marker exits 2" || bad "spec-backed capability wrong exit"
-fi
-if "$SPEC" --skill audit --cwd "$TMP/specproj" --session testsid >"$TMP/spec.out" 2>"$TMP/spec.err"; then
-  ok "non spec-changing capability passes"
-else
-  bad "non spec-changing capability should pass"
-fi
-if "$MARK" --file "$TMP/specproj/.agent_reports/spec/prd.md" --session testsid >"$TMP/spec.out" 2>"$TMP/spec.err" \
-  && "$SPEC" --skill autopilot-code --cwd "$TMP/specproj" --session testsid >"$TMP/spec.out" 2>"$TMP/spec.err"; then
-  ok "read marker allows spec-changing capability"
-else
-  bad "read marker should allow spec-changing capability"
-fi
-sleep 1
-printf 'prd updated\n' > "$TMP/specproj/.agent_reports/spec/prd.md"
-if "$SPEC" --skill autopilot-code --cwd "$TMP/specproj" --session testsid >"$TMP/spec.out" 2>"$TMP/spec.err"; then
-  bad "updated prd after marker should fail"
-else
-  [ "$?" -eq 2 ] && ok "updated prd after marker exits 2" || bad "updated prd wrong exit"
-fi
-if "$CODEX" read "$TMP/specproj/.agent_reports/spec/prd.md" testsid >"$TMP/codex.out" 2>"$TMP/codex.err" \
-  && "$CODEX" capability autopilot-code "$TMP/specproj" testsid >"$TMP/codex.out" 2>"$TMP/codex.err"; then
-  ok "codex read+capability wrapper passes spec gate"
-else
-  bad "codex read+capability wrapper should pass spec gate"
-fi
-if (cd "$TMP/specproj" && "$CODEX" read .agent_reports/spec/prd.md relsid >"$TMP/codex_relative_read.out" 2>"$TMP/codex_relative_read.err") \
-  && "$CODEX" capability autopilot-code "$TMP/specproj" relsid >"$TMP/codex_relative_capability.out" 2>"$TMP/codex_relative_capability.err"; then
-  ok "codex read wrapper resolves relative prd paths for spec gate"
-else
-  bad "codex read wrapper should resolve relative prd paths for spec gate"
-fi
-
-mkdir -p "$TMP/canonical-spec/.agent_reports/spec" "$TMP/canonical-spec-wt"
-(
-  cd "$TMP/canonical-spec" || exit 1
-  git init -q
-  git config user.email test@example.com
-  git config user.name Test
-  printf 'canonical prd\n' > .agent_reports/spec/prd.md
-  git add .
-  git commit -q -m init
-  git worktree add -q -b spec-topic "$TMP/canonical-spec-wt/topic"
-)
-"$MARK" --file "$TMP/canonical-spec-wt/topic/.agent_reports/spec/prd.md" --session shadowread
-if "$SPEC" --skill autopilot-code --cwd "$TMP/canonical-spec-wt/topic" --session shadowread >"$TMP/spec_shadow.out" 2>"$TMP/spec_shadow.err"; then
-  bad "worker-local shadow spec read should not satisfy canonical gate"
-else
-  [ "$?" -eq 2 ] \
-    && ok "worker-local shadow spec read does not satisfy gate" \
-    || bad "worker-local shadow spec read wrong exit"
-fi
-if "$MARK" --file "$TMP/canonical-spec/.agent_reports/spec/prd.md" --session canonicalread \
-  && (cd "$TMP/canonical-spec-wt/topic" && "$SPEC" --skill autopilot-code --cwd . --session canonicalread); then
-  ok "canonical spec marker satisfies relative linked-worktree gate"
-else
-  bad "canonical spec marker should satisfy relative linked-worktree gate"
-fi
-
-echo "== spec read gate: multi-spec candidate set =="
-mkdir -p "$TMP/multispec/.agent_reports/spec/alpha/_internal/versions/v1" \
-  "$TMP/multispec/.agent_reports/spec/beta"
-printf 'root prd\n' > "$TMP/multispec/.agent_reports/spec/prd.md"
-printf 'alpha prd\n' > "$TMP/multispec/.agent_reports/spec/alpha/prd.md"
-printf 'beta prd\n' > "$TMP/multispec/.agent_reports/spec/beta/prd.md"
-printf 'internal snapshot prd\n' > "$TMP/multispec/.agent_reports/spec/alpha/_internal/versions/v1/prd.md"
-
-# a. sub-spec read passes the gate
-if "$MARK" --file "$TMP/multispec/.agent_reports/spec/alpha/prd.md" --session msubsid \
-  && "$SPEC" --skill autopilot-code --cwd "$TMP/multispec" --session msubsid; then
-  ok "sub-spec prd read satisfies multi-spec gate"
-else
-  bad "sub-spec prd read should satisfy multi-spec gate"
-fi
-
-# b. reading an _internal snapshot writes no marker and does not satisfy the gate
-"$MARK" --file "$TMP/multispec/.agent_reports/spec/alpha/_internal/versions/v1/prd.md" --session msinternalsid
-if ls "$AGENT_HOME/.spec-grounding/msinternalsid__"* >/dev/null 2>&1; then
-  bad "_internal snapshot read should not write a marker"
-else
-  ok "_internal snapshot read writes no marker"
-fi
-if "$SPEC" --skill autopilot-code --cwd "$TMP/multispec" --session msinternalsid >"$TMP/ms_internal.out" 2>"$TMP/ms_internal.err"; then
-  bad "_internal snapshot read should not satisfy the gate"
-else
-  [ "$?" -eq 2 ] && ok "_internal snapshot read leaves gate denied" || bad "_internal snapshot deny wrong exit"
-fi
-
-# c. no read at all: deny, enumerate every candidate path + the governing-scope phrase
-if "$SPEC" --skill autopilot-code --cwd "$TMP/multispec" --session msnoreadsid >"$TMP/ms_noread.out" 2>"$TMP/ms_noread.err"; then
-  bad "unread multi-spec project should deny"
-else
-  if [ "$?" -eq 2 ] \
-    && grep -qF "$TMP/multispec/.agent_reports/spec/prd.md" "$TMP/ms_noread.err" \
-    && grep -qF "$TMP/multispec/.agent_reports/spec/alpha/prd.md" "$TMP/ms_noread.err" \
-    && grep -qF "$TMP/multispec/.agent_reports/spec/beta/prd.md" "$TMP/ms_noread.err" \
-    && grep -qF "Read the one governing the declared work scope" "$TMP/ms_noread.err"; then
-    ok "unread multi-spec project lists every candidate and the governing-scope phrase"
-  else
-    bad "unread multi-spec project deny message incomplete"
-  fi
-fi
-
-# d. sub-spec drift: read alpha, pass, drift, deny, re-read, pass
-if "$MARK" --file "$TMP/multispec/.agent_reports/spec/alpha/prd.md" --session msdriftsid \
-  && "$SPEC" --skill autopilot-code --cwd "$TMP/multispec" --session msdriftsid; then
-  ok "fresh sub-spec read passes before drift"
-else
-  bad "fresh sub-spec read should pass before drift"
-fi
-sleep 1
-printf 'alpha prd updated\n' > "$TMP/multispec/.agent_reports/spec/alpha/prd.md"
-if "$SPEC" --skill autopilot-code --cwd "$TMP/multispec" --session msdriftsid >"$TMP/ms_drift.out" 2>"$TMP/ms_drift.err"; then
-  bad "drifted sub-spec candidate should deny"
-else
-  [ "$?" -eq 2 ] && ok "drifted sub-spec candidate denies" || bad "drifted sub-spec candidate wrong exit"
-fi
-if "$MARK" --file "$TMP/multispec/.agent_reports/spec/alpha/prd.md" --session msdriftsid \
-  && "$SPEC" --skill autopilot-code --cwd "$TMP/multispec" --session msdriftsid; then
-  ok "re-read after drift passes again"
-else
-  bad "re-read after drift should pass again"
-fi
-
-# e. root-only deny message parity, fresh session id (no marker at all under this sid)
-if "$SPEC" --skill autopilot-code --cwd "$TMP/specproj" --session msparitysid >"$TMP/ms_parity.out" 2>"$TMP/ms_parity.err"; then
-  bad "fresh-session root-only project should deny"
-else
-  if [ "$?" -eq 2 ] \
-    && grep -qF "This cwd is spec-backed, but prd.md was not read in this session. Read $TMP/specproj/.agent_reports/spec/prd.md directly with the Read tool, then retry. A code comment or brief quotation does not satisfy the gate." "$TMP/ms_parity.err"; then
-    ok "root-only single-candidate deny message matches byte-for-byte parity"
-  else
-    bad "root-only single-candidate deny message should match today's exact text"
-  fi
-fi
-
-# f. legacy .claude_reports sub-spec variant, in its own fixture (resolver prefers .agent_reports when both exist)
-mkdir -p "$TMP/legacyspec/.claude_reports/spec/gamma"
-printf 'legacy root prd\n' > "$TMP/legacyspec/.claude_reports/spec/prd.md"
-printf 'legacy gamma prd\n' > "$TMP/legacyspec/.claude_reports/spec/gamma/prd.md"
-if "$MARK" --file "$TMP/legacyspec/.claude_reports/spec/gamma/prd.md" --session mslegacysid \
-  && "$SPEC" --skill autopilot-code --cwd "$TMP/legacyspec" --session mslegacysid; then
-  ok "legacy .claude_reports sub-spec read satisfies gate"
-else
-  bad "legacy .claude_reports sub-spec read should satisfy gate"
-fi
-
-# g. adapters/claude/hooks/spec-skill-gate.sh must stay a symlink to the root
-# hook (mode 120000), not a hand-maintained duplicate (round_1 finding 3,
-# dispatch-guard-identity cycle) — a future accidental de-symlink would let
-# the two adapters silently diverge on the SD-45 route-record gate.
-CLAUDE_SPEC="$ROOT/adapters/claude/hooks/spec-skill-gate.sh"
-if [ -L "$CLAUDE_SPEC" ] && cmp -s "$SPEC" "$CLAUDE_SPEC"; then
-  ok "adapters/claude/hooks/spec-skill-gate.sh stays a byte-identical symlink to the root hook"
-else
-  bad "adapters/claude/hooks/spec-skill-gate.sh must remain a symlink to hooks/spec-skill-gate.sh"
-fi
-
-echo "== core-first adapter edit gate CLI =="
-mkdir -p "$TMP/coreproj/core" "$TMP/coreproj/adapters/codex"
-(
-  cd "$TMP/coreproj" || exit 1
-  git init -q
-  git config user.email test@example.com
-  git config user.name Test
-  printf 'core\n' > core/CORE.md
-  printf 'adapter\n' > adapters/codex/AGENTS.md
-  git add core/CORE.md adapters/codex/AGENTS.md
-  git commit -q -m init
-)
-if "$CORE_GUARD" --file "$TMP/coreproj/adapters/codex/AGENTS.md" --session coregatesid >"$TMP/core_gate.out" 2>"$TMP/core_gate.err"; then
-  bad "adapter edit without core read marker should fail"
-else
-  [ "$?" -eq 2 ] && ok "adapter edit without core read marker exits 2" || bad "adapter edit without core marker wrong exit"
-fi
-if "$CORE_GUARD" --file "$TMP/coreproj/adapters/codex/new/sub/AGENTS.md" --session coregatesid >"$TMP/core_gate_newdir.out" 2>"$TMP/core_gate_newdir.err"; then
-  bad "new adapter subdir edit without core read marker should fail"
-else
-  [ "$?" -eq 2 ] && ok "new adapter subdir edit without core marker exits 2" || bad "new adapter subdir core marker wrong exit"
-fi
-if "$CORE_MARK" --file "$TMP/coreproj/core/CORE.md" --session coregatesid >"$TMP/core_gate.out" 2>"$TMP/core_gate.err" \
-  && "$CORE_GUARD" --file "$TMP/coreproj/adapters/codex/AGENTS.md" --session coregatesid >"$TMP/core_gate.out" 2>"$TMP/core_gate.err"; then
-  ok "core read marker allows adapter edit"
-else
-  bad "core read marker should allow adapter edit"
-fi
-sleep 1
-printf 'core updated\n' > "$TMP/coreproj/core/CORE.md"
-if "$CORE_GUARD" --file "$TMP/coreproj/adapters/codex/AGENTS.md" --session coregatesid >"$TMP/core_gate.out" 2>"$TMP/core_gate.err"; then
-  bad "updated core after marker should fail adapter edit"
-else
-  [ "$?" -eq 2 ] && ok "updated core after marker exits 2" || bad "updated core after marker wrong exit"
-fi
-if "$CODEX" read "$TMP/coreproj/core/CORE.md" codexcoregatesid >"$TMP/codex_core_gate.out" 2>"$TMP/codex_core_gate.err" \
-  && "$CODEX" write "$TMP/coreproj/adapters/codex/AGENTS.md" codexcoregatesid >"$TMP/codex_core_gate.out" 2>"$TMP/codex_core_gate.err"; then
-  ok "codex read+write wrapper passes core-first gate"
-else
-  bad "codex read+write wrapper should pass core-first gate"
-fi
-
-echo "== core hook adapter wrapper delegation (self-exec regression) =="
-# The Claude adapter wrappers exec `$AGENT_HOME/hooks/<own name>`. That is the
-# portable guard in a repository checkout, but in an installed runtime layout
-# `$AGENT_HOME/hooks/` is the adapter projection whose entries are symlinks to
-# those same wrappers -- so the exec re-entered the wrapper without bound. The
-# gate returned no decision (core-first went silently unenforced), every
-# Edit/Write paid the registered hook timeout, and the spinning process outlived
-# the dispatch process group that launched it. `timeout` below IS the assertion:
-# a looping wrapper must fail this suite rather than hang it.
-core_wrap_installed="$TMP/core_wrap_installed"
-mkdir -p "$core_wrap_installed/hooks" "$core_wrap_installed/core"
-printf 'fixture\n' > "$core_wrap_installed/core/CORE.md"
-ln -s "$ROOT/adapters/claude/hooks/core-first-guard.sh" "$core_wrap_installed/hooks/core-first-guard.sh"
-ln -s "$ROOT/adapters/claude/hooks/core-read-marker.sh" "$core_wrap_installed/hooks/core-read-marker.sh"
-ln -s "$ROOT/adapters/claude/utilities" "$core_wrap_installed/utilities"
-# Checkout-shaped control: the same wrappers, but the active root's hooks/ holds
-# the portable guards. The pre-existing delegation must be untouched here.
-core_wrap_checkout="$TMP/core_wrap_checkout"
-mkdir -p "$core_wrap_checkout/hooks" "$core_wrap_checkout/core"
-printf 'fixture\n' > "$core_wrap_checkout/core/CORE.md"
-ln -s "$ROOT/hooks/core-first-guard.sh" "$core_wrap_checkout/hooks/core-first-guard.sh"
-ln -s "$ROOT/hooks/core-read-marker.sh" "$core_wrap_checkout/hooks/core-read-marker.sh"
-ln -s "$ROOT/adapters/claude/utilities" "$core_wrap_checkout/utilities"
-
-AGENT_HOME="$core_wrap_installed" timeout 10 sh \
-  "$core_wrap_installed/hooks/core-first-guard.sh" \
-  --file "$TMP/coreproj/adapters/codex/AGENTS.md" --session wrapsid \
-  >"$TMP/core_wrap_installed.out" 2>"$TMP/core_wrap_installed.err"
-core_wrap_rc=$?
-if [ "$core_wrap_rc" -eq 2 ] && grep -q 'Core-first gate' "$TMP/core_wrap_installed.err"; then
-  ok "adapter guard wrapper reaches a decision when the runtime projection resolves to itself"
-else
-  bad "adapter guard wrapper should deny under an installed projection (rc=$core_wrap_rc)"
-fi
-if printf '{"tool_name":"Write","tool_input":{"file_path":"%s"},"session_id":"wrapjsonsid"}\n' \
-    "$TMP/coreproj/adapters/codex/AGENTS.md" \
-  | AGENT_HOME="$core_wrap_installed" timeout 10 sh \
-      "$core_wrap_installed/hooks/core-first-guard.sh" \
-      >"$TMP/core_wrap_json.out" 2>"$TMP/core_wrap_json.err" \
-  && grep -q '"permissionDecision":"deny"' "$TMP/core_wrap_json.out"; then
-  ok "adapter guard wrapper emits hook-protocol deny JSON under an installed projection"
-else
-  bad "adapter guard wrapper should emit deny JSON under an installed projection"
-fi
-if AGENT_HOME="$core_wrap_installed" timeout 10 sh \
-     "$core_wrap_installed/hooks/core-read-marker.sh" \
-     --file "$TMP/coreproj/core/CORE.md" --session wrapsid \
-     >"$TMP/core_wrap_mark.out" 2>"$TMP/core_wrap_mark.err" \
-  && find "$core_wrap_installed/.core-grounding" -type f -name 'wrapsid__*' -print -quit | grep -q . \
-  && AGENT_HOME="$core_wrap_installed" timeout 10 sh \
-       "$core_wrap_installed/hooks/core-first-guard.sh" \
-       --file "$TMP/coreproj/adapters/codex/AGENTS.md" --session wrapsid \
-       >"$TMP/core_wrap_pass.out" 2>"$TMP/core_wrap_pass.err"; then
-  ok "adapter marker wrapper writes the marker the paired guard reads under an installed projection"
-else
-  bad "adapter wrapper pair should share one .core-grounding under an installed projection"
-fi
-AGENT_HOME="$core_wrap_checkout" timeout 10 sh \
-  "$ROOT/adapters/claude/hooks/core-first-guard.sh" \
-  --file "$TMP/coreproj/adapters/codex/AGENTS.md" --session chkwrapsid \
-  >"$TMP/core_wrap_chk.out" 2>"$TMP/core_wrap_chk.err"
-core_wrap_chk_rc=$?
-if [ "$core_wrap_chk_rc" -eq 2 ] \
-  && AGENT_HOME="$core_wrap_checkout" timeout 10 sh \
-       "$ROOT/adapters/claude/hooks/core-read-marker.sh" \
-       --file "$TMP/coreproj/core/CORE.md" --session chkwrapsid \
-       >"$TMP/core_wrap_chk.out" 2>"$TMP/core_wrap_chk.err" \
-  && find "$core_wrap_checkout/.core-grounding" -type f -name 'chkwrapsid__*' -print -quit | grep -q . \
-  && AGENT_HOME="$core_wrap_checkout" timeout 10 sh \
-       "$ROOT/adapters/claude/hooks/core-first-guard.sh" \
-       --file "$TMP/coreproj/adapters/codex/AGENTS.md" --session chkwrapsid \
-       >"$TMP/core_wrap_chk.out" 2>"$TMP/core_wrap_chk.err"; then
-  ok "adapter wrappers keep delegating to the active root's portable guards in a checkout layout"
-else
-  bad "checkout-layout delegation regressed (rc=$core_wrap_chk_rc)"
-fi
-
-# Spec reads satisfy grounding but never replace capability-route participation.
-# Ordinary source remains outside the artifact route gate.
-mkdir -p "$TMP/cxspec/.agent_reports/spec" "$TMP/cxspec/.agent_reports/research" "$TMP/cxspec/src"
-printf 'prd\n' > "$TMP/cxspec/.agent_reports/spec/prd.md"
-printf 'state: x\n' > "$TMP/cxspec/.agent_reports/spec/pipeline_state.yaml"
-if "$CODEX" write "$TMP/cxspec/.agent_reports/plans/c1/dev.md" cxwsid >"$TMP/codex_wg.out" 2>"$TMP/codex_wg.err"; then
-  bad "codex write guard should deny ungrounded spec-changing (plans) write"
-else
-  [ "$?" -eq 2 ] && ok "codex write guard denies ungrounded spec-changing write" \
-    || bad "codex write guard wrong exit on ungrounded spec write"
-fi
-"$CODEX" read "$TMP/cxspec/.agent_reports/spec/prd.md" cxwsid >/dev/null 2>&1
-if "$CODEX" write "$TMP/cxspec/.agent_reports/plans/c1/dev.md" cxwsid >"$TMP/codex_wg.out" 2>"$TMP/codex_wg.err"; then
-  bad "codex write guard should still require a route after prd read"
-else
-  [ "$?" -eq 2 ] && grep -q 'capability-artifact-route-required' "$TMP/codex_wg.err" \
-    && ok "codex write guard keeps route participation separate from prd grounding" \
-    || bad "codex write guard returned the wrong post-grounding route failure"
-fi
-if "$CODEX" write "$TMP/cxspec/src/main.py" cxwsid2 >"$TMP/codex_wg.out" 2>"$TMP/codex_wg.err"; then
-  ok "codex write guard does not gate ordinary source files"
-else
-  bad "codex write guard should not gate ordinary source files"
-fi
 mkdir -p "$TMP/codex-route-home/core" "$TMP/cg" "$TMP/codex-iso/.codex"
 printf 'fixture\n' > "$TMP/codex-route-home/core/CORE.md"
 # The fixture AGENT_HOME is not a harness root, so the wrapper would otherwise resolve its
@@ -1091,9 +260,9 @@ if AGENT_HOME="$TMP/codex-route-home" HOME="$TMP/codex-iso" CODEX_HOME="$TMP/cod
   && grep -q '^mode=debug$' "$TMP/cg/testsid" \
   && grep -q '^intensity=direct$' "$TMP/cg/testsid" \
   && [ ! -e "$TMP/codex-route-home/.capability-grounding" ]; then
-  ok "codex route wrapper combines status, prompt signal, capability-info, and spec gate"
+  ok "codex route wrapper combines status, prompt signal, capability-info, and capability mapping"
 else
-  bad "codex route wrapper should combine status, prompt signal, capability-info, and spec gate"
+  bad "codex route wrapper should combine status, prompt signal, capability-info, and capability mapping"
 fi
 AGENT_HOME="$TMP/codex-route-home" HOME="$TMP/codex-iso" CODEX_HOME="$TMP/codex-iso/.codex" "$CODEX" read "$TMP/specproj/.agent_reports/spec/prd.md" worker-testsid >/dev/null 2>&1
 if AGENT_HOME="$TMP/codex-route-home" HOME="$TMP/codex-iso" CODEX_HOME="$TMP/codex-iso/.codex" FLEET_CAPABILITY_GROUNDING_DIR="$TMP/cg" AGENT_SESSION_ROLE=worker \
@@ -1120,13 +289,7 @@ fi
 echo "== workflow lifecycle CLI =="
 mkdir -p "$TMP/flowproj/.agent_reports"
 mkdir -p "$TMP/codex-artifact/.agent_reports/spec"
-if "$CODEX" write "$TMP/codex-artifact/.agent_reports/spec/prd.md" testsid >"$TMP/codex-artifact.out" 2>"$TMP/codex-artifact.err"; then
-  bad "codex write wrapper should require a verified capability route for spec output"
-else
-  grep -q 'capability-artifact-route-required' "$TMP/codex-artifact.err" \
-    && ok "codex write wrapper requires a verified capability route for spec output" \
-    || bad "codex write wrapper returned the wrong route failure for spec output"
-fi
+
 if "$CODEX" memory "$TMP/flowproj" >"$TMP/mem_inject.out" 2>"$TMP/mem_inject.err"; then
   ok "codex memory wrapper exits cleanly"
 else
@@ -1247,7 +410,7 @@ if "$CODEX" prompt-signal "$TMP/flowproj" testsid >"$TMP/codex_prompt_signal_tra
   && grep -q '^capability_entrypoints=codex-native-skills$' "$TMP/codex_prompt_signal_tracked.out" \
   && grep -q '^hook_event=UserPromptSubmit$' "$TMP/codex_prompt_signal_tracked.out" \
   && grep -q '^hook_scope=runtime-hook$' "$TMP/codex_prompt_signal_tracked.out" \
-  && grep -q '^hook_boundary=shell-read-write-targeted-detection-explicit-preflight-fallback$' "$TMP/codex_prompt_signal_tracked.out"; then
+  && grep -q '^hook_boundary=spec-read-and-design-observations$' "$TMP/codex_prompt_signal_tracked.out"; then
   ok "codex prompt signal carries the autopilot routing contract"
 else
   bad "codex prompt signal should carry the autopilot routing contract"
@@ -1267,10 +430,10 @@ if "$CODEX" permissions >"$TMP/codex_permissions.out" 2>"$TMP/codex_permissions.
   && grep -q '^runtime_surface=codex-native-approval-sandbox$' "$TMP/codex_permissions.out" \
   && grep -q '^permission_model=approval-policy+sandbox$' "$TMP/codex_permissions.out" \
   && grep -q '^claude_allowed_tools=unsupported$' "$TMP/codex_permissions.out" \
-  && grep -q '^guard_contract=preflight-write-hooks-and-explicit-tool-contracts$' "$TMP/codex_permissions.out" \
-  && grep -q '^structured_write_hooks=Write,Edit,MultiEdit,apply_patch,functions.apply_patch$' "$TMP/codex_permissions.out" \
+  && grep -q '^guard_contract=runtime-permissions-and-tool-contracts$' "$TMP/codex_permissions.out" \
+  && grep -q '^structured_write_hooks=none$' "$TMP/codex_permissions.out" \
   && grep -q '^targeted_shell_hooks=Bash,Shell,functions.exec_command$' "$TMP/codex_permissions.out" \
-  && grep -q '^shell_read_write_hooks=targeted-detection$' "$TMP/codex_permissions.out"; then
+  && grep -q '^shell_read_write_hooks=posttool-observations-only$' "$TMP/codex_permissions.out"; then
   ok "codex permissions wrapper reports native approval/sandbox contract"
 else
   bad "codex permissions wrapper should report native approval/sandbox contract"
@@ -2604,201 +1767,6 @@ fi
 mkdir -p "$TMP/codex_hook_home/.codex"
 ln -s "$ROOT" "$TMP/codex_hook_home/.codex/hearting"
 ln -s "$ROOT/codex_setting/codex-hooks/hooks.json" "$TMP/codex_hook_home/.codex/hooks.json"
-if python3 -m json.tool "$TMP/codex_hook_home/.codex/hooks.json" >"$TMP/codex_hook_json.out" 2>"$TMP/codex_hook_json.err" \
-  && grep -q 'sessionstart-lifecycle.py' "$TMP/codex_hook_json.out" \
-  && grep -q 'sessionend-lifecycle.py' "$TMP/codex_hook_json.out" \
-  && grep -q '"Stop"' "$TMP/codex_hook_json.out" \
-  && grep -q 'userprompt-lifecycle.py' "$TMP/codex_hook_json.out" \
-  && grep -q 'permissionrequest-lifecycle.py' "$TMP/codex_hook_json.out" \
-  && grep -q 'pretooluse-write-guard.py' "$TMP/codex_hook_json.out" \
-  && grep -q 'posttooluse-read-marker.py' "$TMP/codex_hook_json.out" \
-  && grep -q 'posttooluse-design-check.py' "$TMP/codex_hook_json.out" \
-  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); h=d["hooks"]["PreToolUse"]; assert len(h)==1; assert h[0]["matcher"]==r"Write|Edit|MultiEdit|apply_patch|functions\.apply_patch|Bash|Shell|functions\.exec_command"; assert "AGENT_PARENT_PARK_ONLY=1" not in h[0]["hooks"][0]["command"]; assert "stop-lifecycle.py" in d["hooks"]["Stop"][0]["hooks"][0]["command"]' "$TMP/codex_hook_home/.codex/hooks.json" \
-  && printf '{"tool_name":"Write","tool_input":{"file_path":"%s"},"session_id":"testsid","cwd":"%s"}\n' "$TMP/repo/f" "$TMP/repo" \
-    | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/codex_hook.out" 2>"$TMP/codex_hook.err" \
-  && [ ! -s "$TMP/codex_hook.out" ]; then
-  ok "codex native hook projection bridges clean writes to preflight"
-else
-  bad "codex native hook projection should bridge clean writes to preflight"
-fi
-
-# Tier A shell-write-target extraction (tee/rm/cp/install/rsync/dd/sed) is a
-# generic mechanism shared by every downstream guard; exercise it against the
-# still-live material-route guard rather than the retired memory guard.
-if printf '{"tool_name":"Bash","tool_input":{"command":"printf x | tee %s"},"session_id":"shellteesid","cwd":"%s"}\n' "$TMP/repo/TEE.py" "$TMP/repo" \
-  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/codex_shell_tee_hook.out" 2>"$TMP/codex_shell_tee_hook.err" \
-  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["decision"]=="block"; assert "route" in d["reason"].lower()' "$TMP/codex_shell_tee_hook.out" \
-  && printf '{"tool_name":"Bash","tool_input":{"command":"rm %s"},"session_id":"shellrmsid","cwd":"%s"}\n' "$TMP/repo/RM.py" "$TMP/repo" \
-    | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/codex_shell_rm_hook.out" 2>"$TMP/codex_shell_rm_hook.err" \
-  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["decision"]=="block"; assert "route" in d["reason"].lower()' "$TMP/codex_shell_rm_hook.out"; then
-  ok "codex native hook projection blocks common shell mutation targets"
-else
-  bad "codex native hook projection should block common shell mutation targets"
-fi
-if printf '{"tool_name":"Bash","tool_input":{"command":"cp %s %s"},"session_id":"shellcpsourcesid","cwd":"%s"}\n' "$TMP/repo/SOURCE.py" "$TMP/outside-repo/copied-source.py" "$TMP/repo" \
-  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/codex_shell_cp_source_hook.out" 2>"$TMP/codex_shell_cp_source_hook.err" \
-  && [ ! -s "$TMP/codex_shell_cp_source_hook.out" ] \
-  && printf '{"tool_name":"Bash","tool_input":{"command":"cp %s %s"},"session_id":"shellcpdestsid","cwd":"%s"}\n' "$TMP/outside-repo/source.py" "$TMP/repo/COPIED.py" "$TMP/repo" \
-    | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/codex_shell_cp_dest_hook.out" 2>"$TMP/codex_shell_cp_dest_hook.err" \
-  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["decision"]=="block"; assert "route" in d["reason"].lower()' "$TMP/codex_shell_cp_dest_hook.out"; then
-  ok "codex native hook projection treats cp destination as the shell write target"
-else
-  bad "codex native hook projection should treat cp destination as the shell write target"
-fi
-if printf '{"tool_name":"Bash","tool_input":{"command":"install %s %s"},"session_id":"shellinstallsid","cwd":"%s"}\n' "$TMP/outside-repo/source.py" "$TMP/repo/INSTALLED.py" "$TMP/repo" \
-  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/codex_shell_install_hook.out" 2>"$TMP/codex_shell_install_hook.err" \
-  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["decision"]=="block"; assert "route" in d["reason"].lower()' "$TMP/codex_shell_install_hook.out" \
-  && printf '{"tool_name":"Bash","tool_input":{"command":"rsync %s %s"},"session_id":"shellrsyncsid","cwd":"%s"}\n' "$TMP/outside-repo/source.py" "$TMP/repo/RSYNCED.py" "$TMP/repo" \
-    | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/codex_shell_rsync_hook.out" 2>"$TMP/codex_shell_rsync_hook.err" \
-  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["decision"]=="block"; assert "route" in d["reason"].lower()' "$TMP/codex_shell_rsync_hook.out"; then
-  ok "codex native hook projection blocks install and rsync destinations"
-else
-  bad "codex native hook projection should block install and rsync destinations"
-fi
-if printf '{"tool_name":"Bash","tool_input":{"command":"dd if=%s of=%s"},"session_id":"shellddsid","cwd":"%s"}\n' "$TMP/outside-repo/source.py" "$TMP/repo/DD.py" "$TMP/repo" \
-  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/codex_shell_dd_hook.out" 2>"$TMP/codex_shell_dd_hook.err" \
-  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["decision"]=="block"; assert "route" in d["reason"].lower()' "$TMP/codex_shell_dd_hook.out" \
-  && printf '{"tool_name":"Bash","tool_input":{"command":"sed -i s/a/b/ %s"},"session_id":"shellsedisid","cwd":"%s"}\n' "$TMP/repo/SED.py" "$TMP/repo" \
-    | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/codex_shell_sedi_hook.out" 2>"$TMP/codex_shell_sedi_hook.err" \
-  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["decision"]=="block"; assert "route" in d["reason"].lower()' "$TMP/codex_shell_sedi_hook.out"; then
-  ok "codex native hook projection blocks dd output and sed inline edits"
-else
-  bad "codex native hook projection should block dd output and sed inline edits"
-fi
-
-# A3: the Codex shell PreToolUse bridge runs worktree-path before material-route.
-if printf '{"tool_name":"Bash","tool_input":{"command":"git worktree add /tmp/somewhere-else/slug"},"session_id":"codex-worktree-deny","cwd":"%s"}\n' "$TMP/repo" \
-  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/codex_worktree_deny.out" 2>"$TMP/codex_worktree_deny.err" \
-  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["decision"]=="block"' "$TMP/codex_worktree_deny.out"; then
-  ok "codex native hook projection denies git worktree add outside <repo>-wt/"
-else
-  bad "codex native hook projection should deny git worktree add outside <repo>-wt/"
-fi
-if printf '{"tool_name":"Bash","tool_input":{"command":"git worktree add %s-wt/slug -b slug HEAD"},"session_id":"codex-worktree-pass","cwd":"%s"}\n' "$TMP/repo" "$TMP/repo" \
-  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/codex_worktree_pass.out" 2>"$TMP/codex_worktree_pass.err" \
-  && [ ! -s "$TMP/codex_worktree_pass.out" ]; then
-  ok "codex native hook projection passes canonical <repo>-wt/ worktree add"
-else
-  bad "codex native hook projection should pass canonical <repo>-wt/ worktree add [out=$(cat "$TMP/codex_worktree_pass.out")]"
-fi
-
-# Material-route Codex projection fixtures: denial must be native JSON, while a
-# successful local compile/bind remains silent and is scoped to session + cwd.
-codex_source="$TMP/repo/source.py"
-printf 'print(1)\n' > "$codex_source"
-git -C "$TMP/repo" add "$codex_source"
-no_route_write=$(printf '{"tool_name":"Write","tool_input":{"file_path":"%s"},"session_id":"codex-no-route","cwd":"%s"}\n' "$codex_source" "$TMP/repo" \
-  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py")
-if python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["decision"]=="block"; assert "material-route" in d["reason"] or "route" in d["reason"]' "$no_route_write"; then
-  ok "codex Write without material route returns native JSON denial"
-else
-  bad "codex Write without material route should return native JSON denial [$no_route_write]"
-fi
-patch_payload=$(python3 - "$codex_source" "$TMP/repo" <<'PY'
-import json,sys
-print(json.dumps({"tool_name":"functions.apply_patch","input":f"*** Begin Patch\n*** Update File: {sys.argv[1]}\n@@\n-print(1)\n+print(2)\n*** End Patch\n","session_id":"codex-patch-no-route","cwd":sys.argv[2]}))
-PY
-)
-patch_decision=$(printf '%s\n' "$patch_payload" | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py")
-if python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["decision"]=="block"' "$patch_decision"; then
-  ok "qualified functions.apply_patch without route is denied"
-else
-  bad "qualified functions.apply_patch without route should be denied [$patch_decision]"
-fi
-commit_decision=$(printf '%s\n' "{\"tool_name\":\"functions.exec_command\",\"input\":{\"command\":\"git commit -am source\"},\"session_id\":\"codex-commit-no-route\",\"cwd\":\"$TMP/repo\"}" \
-  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py")
-if python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["decision"]=="block"' "$commit_decision"; then
-  ok "source-bearing functions.exec_command commit is denied"
-else
-  bad "source-bearing functions.exec_command commit should be denied [$commit_decision]"
-fi
-codex_route_args="--capability autopilot-code --capability-mode dev --slug material-route-fixture --intensity direct --cwd $TMP/repo --artifact-root $TMP/repo/.agent_reports --predicate atomic-outcome --predicate known-scope --predicate no-shared-contract --predicate no-resource-run --predicate no-artifact-handoff --predicate no-independent-verifier --predicate focused-verification --tracking untracked --spec-read not-applicable --drift-verdict no-project-spec --workflow-mode untracked --artifact-guard preflight-passed --inline-reason atomic-direct"
-MATERIAL_ROUTE_JOBS="$TMP/repo/.dispatch/jobs.log"
-mkdir -p "$(dirname "$MATERIAL_ROUTE_JOBS")"
-codex_bind_session="codex-bind-$(basename "$TMP")"
-recall_opportunity "$TMP/repo" "$codex_bind_session"
-AGENT_HOME="$ROOT" AGENT_DISPATCH_JOBS="$MATERIAL_ROUTE_JOBS" \
-  "$ROOT/adapters/codex/bin/preflight.sh" route $codex_route_args >"$TMP/codex_route_probe.json" 2>"$TMP/codex_route_probe.err"
-codex_route_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8"))["route_id"])' "$TMP/codex_route_probe.json")
-codex_route="$TMP/repo/.agent_reports/.runtime/routes/$codex_route_id.json"
-codex_compile="$ROOT/adapters/codex/bin/preflight.sh route $codex_route_args --output $codex_route"
-# The first compile discovers the content-addressed route ID. Remove only that
-# fixture artifact before exercising the one real explicit-output compile/bind.
-rm -f "$codex_route"
-if AGENT_HOME="$ROOT" AGENT_DISPATCH_JOBS="$MATERIAL_ROUTE_JOBS" \
-  sh -c "$codex_compile" >"$TMP/codex_compile.out" 2>"$TMP/codex_compile.err" \
-  && printf '%s\n' "{\"tool_name\":\"functions.exec_command\",\"input\":{\"command\":\"$codex_compile\"},\"session_id\":\"$codex_bind_session\",\"cwd\":\"$TMP/repo\"}" \
-  | AGENT_HOME="$ROOT" AGENT_DISPATCH_JOBS="$MATERIAL_ROUTE_JOBS" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/posttooluse-read-marker.py" >"$TMP/codex_bind.out" 2>"$TMP/codex_bind.err" \
-  && [ ! -s "$TMP/codex_bind.out" ] && [ ! -s "$TMP/codex_bind.err" ] \
-  && printf '{"tool_name":"Write","tool_input":{"file_path":"%s"},"session_id":"%s","cwd":"%s"}\n' "$codex_source" "$codex_bind_session" "$TMP/repo" \
-    | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/codex_bind_allow.out" 2>"$TMP/codex_bind_allow.err" \
-  && [ ! -s "$TMP/codex_bind_allow.out" ] && [ ! -s "$TMP/codex_bind_allow.err" ]; then
-  ok "trusted local Codex compile binds silently and same cwd/session allows Write"
-else
-  bad "trusted local Codex compile should bind silently and allow same cwd/session [compile_err=$(cat "$TMP/codex_compile.err") route=$(test -f "$codex_route" && echo yes || echo no) bind_out=$(cat "$TMP/codex_bind.out" 2>/dev/null) bind_err=$(cat "$TMP/codex_bind.err" 2>/dev/null) allow_out=$(cat "$TMP/codex_bind_allow.out" 2>/dev/null) allow_err=$(cat "$TMP/codex_bind_allow.err" 2>/dev/null)]"
-fi
-foreign_bind=$(printf '{"tool_name":"Write","tool_input":{"file_path":"%s"},"session_id":"codex-foreign","cwd":"%s"}\n' "$codex_source" "$TMP/repo" \
-  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py")
-if python3 -c 'import json,sys; assert json.loads(sys.argv[1])["decision"]=="block"' "$foreign_bind"; then
-  ok "foreign session cannot reuse trusted Codex material route"
-else
-  bad "foreign session should be denied [$foreign_bind]"
-fi
-codex_bind_marker_hash=$(python3 -c 'import hashlib,sys; print(hashlib.sha256(b"material-route-session-v1\0" + sys.argv[1].encode()).hexdigest())' "$codex_bind_session")
-codex_bind_marker="$ROOT/.route-grounding/$codex_bind_marker_hash.json"
-printf '{"hook_event_name":"Stop","session_id":"%s","cwd":"%s"}\n' "$codex_bind_session" "$TMP/repo" \
-  | MEM_STORE="$TMP/codex_hook_mem_stop" AGENT_HOME="$ROOT" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/stop-lifecycle.py" >"$TMP/codex_stop_retention.out" 2>"$TMP/codex_stop_retention.err" || true
-if [ -f "$codex_bind_marker" ] && [ ! -s "$TMP/codex_stop_retention.out" ] && [ ! -s "$TMP/codex_stop_retention.err" ]; then
-  ok "Codex Stop is a silent no-op and retains material route marker"
-else
-  bad "Codex Stop should be a silent no-op that retains material route marker"
-fi
-if printf '{"hook_event_name":"SessionEnd","session_id":"%s","cwd":"%s"}\n' "$codex_bind_session" "$TMP/repo" \
-  | MEM_STORE="$TMP/codex_hook_mem" AGENT_HOME="$ROOT" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/sessionend-lifecycle.py" >"$TMP/codex_sessionend.out" 2>"$TMP/codex_sessionend.err" \
-  && [ ! -s "$TMP/codex_sessionend.out" ] \
-  && [ ! -e "$codex_bind_marker" ] \
-  && ! grep -q 'material-route\|route-guard' "$TMP/codex_sessionend.err"; then
-  ok "Codex SessionEnd clears material route without clear-path output"
-else
-  bad "Codex SessionEnd should clear the exact material marker without clear-path output [marker=$(test -e "$codex_bind_marker" && echo present || echo absent) out=$(cat "$TMP/codex_sessionend.out") err=$(cat "$TMP/codex_sessionend.err")]"
-fi
-if printf '{"tool_name":"Write","tool_input":{"file_path":"%s"},"session_id":"parked","cwd":"%s"}\n' "$codex_source" "$TMP/repo" \
-  | AGENT_PARENT_PARK_ONLY=1 HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/codex_parent_park_only.out" 2>"$TMP/codex_parent_park_only.err" \
-  && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["decision"]=="block"; assert "route" in d["reason"]' "$TMP/codex_parent_park_only.out" \
-  && [ ! -s "$TMP/codex_parent_park_only.err" ]; then
-  ok "retired parent-park-only marker cannot bypass the material guard"
-else
-  bad "retired parent-park-only marker must not bypass the material guard"
-fi
-if printf '{"tool":"Write","input":{"path":"%s"},"session_id":"nestedpayloadsid","cwd":"%s"}\n' "$TMP/repo/nested-f" "$TMP/repo" \
-  | HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/pretooluse-write-guard.py" >"$TMP/codex_hook_nested.out" 2>"$TMP/codex_hook_nested.err" \
-  && [ ! -s "$TMP/codex_hook_nested.out" ]; then
-  ok "codex native hook projection accepts string-tool nested input payloads"
-else
-  bad "codex native hook projection should accept string-tool nested input payloads"
-fi
-codex_hook_command=$(python3 - "$TMP/codex_hook_home/.codex/hooks.json" <<'PY'
-import json
-import sys
-
-data = json.load(open(sys.argv[1], encoding="utf-8"))
-print(data["hooks"]["PreToolUse"][0]["hooks"][0]["command"])
-PY
-)
-if printf '{"tool_name":"Write","tool_input":{"file_path":"%s"},"session_id":"testsid","cwd":"%s"}\n' "$TMP/repo/f" "$TMP/repo" \
-  | AGENT_HOME="$ROOT" HOME="$TMP/no-codex-home" sh -c "$codex_hook_command" >"$TMP/codex_hook_agent_home.out" 2>"$TMP/codex_hook_agent_home.err" \
-  && [ ! -s "$TMP/codex_hook_agent_home.out" ]; then
-  ok "codex hook command resolves harness through AGENT_HOME"
-else
-  bad "codex hook command should resolve harness through AGENT_HOME"
-fi
-if printf '{"tool_name":"Write","tool_input":{"file_path":"%s"},"session_id":"testsid","cwd":"%s"}\n' "$TMP/repo/f" "$TMP/repo" \
-  | AGENT_HOME="$TMP/not-agent-home" HOME="$TMP/codex_hook_home" sh -c "$codex_hook_command" >"$TMP/codex_hook_invalid_agent_home.out" 2>"$TMP/codex_hook_invalid_agent_home.err" \
-  && [ ! -s "$TMP/codex_hook_invalid_agent_home.out" ]; then
-  ok "codex hook command ignores invalid AGENT_HOME"
-else
-  bad "codex hook command should ignore invalid AGENT_HOME"
-fi
 if (cd "$TMP/repo" && HOME="$TMP/codex_hook_home" MEM_STORE="$TMP/codex_hook_mem" python3 "$ROOT/tools/memory/mem.py" add durable thread "세션 시작 기억 주입 확인: Codex SessionStart bridge는 mem inject 결과를 hookSpecificOutput additionalContext로 전달해야 한다" >"$TMP/codex_session_seed.out" 2>"$TMP/codex_session_seed.err") \
   && printf '{"session_id":"testsid","cwd":"%s"}\n' "$TMP/repo" \
   | MEM_STORE="$TMP/codex_hook_mem" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/sessionstart-lifecycle.py" >"$TMP/codex_session_hook_default.out" 2>"$TMP/codex_session_hook_default.err" \
@@ -2964,22 +1932,6 @@ if printf '{"tool_name":"functions.exec_command","tool_input":{"cmd":"sed -n 1,1
   ok "codex native read hook marks shell reads of canonical shared spec revisions"
 else
   bad "codex native read hook should mark canonical shared spec revision reads"
-fi
-mkdir -p "$TMP/repo/core"
-printf 'core\n' > "$TMP/repo/core/MEMORY.md"
-if printf '{"tool_name":"Read","tool_input":{"file_path":"%s"},"session_id":"corereadsid","cwd":"%s"}\n' "$TMP/repo/core/MEMORY.md" "$TMP/repo" \
-  | AGENT_HOME="$TMP/codex_marker_home" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/posttooluse-read-marker.py" >"$TMP/codex_core_read_hook.out" 2>"$TMP/codex_core_read_hook.err" \
-  && find "$TMP/codex_marker_home/.core-grounding" -type f -name 'corereadsid__*' -print -quit | grep -q .; then
-  ok "codex native hook projection records core read markers"
-else
-  bad "codex native hook projection should record core read markers"
-fi
-if printf '{"tool_name":"Bash","tool_input":{"command":"cat core/MEMORY.md"},"session_id":"shellcorereadsid","cwd":"%s"}\n' "$TMP/repo" \
-  | AGENT_HOME="$TMP/codex_marker_home" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/posttooluse-read-marker.py" >"$TMP/codex_shell_core_read_hook.out" 2>"$TMP/codex_shell_core_read_hook.err" \
-  && find "$TMP/codex_marker_home/.core-grounding" -type f -name 'shellcorereadsid__*' -print -quit | grep -q .; then
-  ok "codex native read hook marks obvious shell core reads"
-else
-  bad "codex native read hook should mark obvious shell core reads"
 fi
 if printf '{"tool":{"name":"Read","input":{"path":"%s"}},"session_id":"nestedreadsid","cwd":"%s"}\n' "$TMP/repo/.agent_reports/spec/prd.md" "$TMP/repo" \
   | AGENT_HOME="$TMP/codex_marker_home" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/posttooluse-read-marker.py" >"$TMP/codex_read_hook_nested.out" 2>"$TMP/codex_read_hook_nested.err" \
@@ -3540,178 +2492,9 @@ else
   bad "opencode agent-home wrapper must retain legacy agent_setting fallback"
 fi
 
-echo "== opencode material-route + worktree-path wrapper =="
-opencode_source="$TMP/repo/opencode_source.py"
-printf 'print(1)\n' > "$opencode_source"
-git -C "$TMP/repo" add "$opencode_source"
-if AGENT_HOME="$ROOT" "$OPENCODE" material-route check --tool Write --file "$opencode_source" --cwd "$TMP/repo" --session opencode-no-route >"$TMP/opencode_mr.out" 2>"$TMP/opencode_mr.err"; then
-  bad "opencode material-route check should block a route-less material Write"
-else
-  [ "$?" -eq 2 ] && ok "opencode material-route check blocks a route-less material Write" \
-    || bad "opencode material-route check wrong exit for route-less material Write"
-fi
-if "$OPENCODE" worktree-path --tool Bash --command 'git worktree add .claude/worktrees/foo -b foo' --cwd "$TMP/repo" --session opencode-wtg >"$TMP/opencode_wtp.out" 2>"$TMP/opencode_wtp.err"; then
-  bad "opencode worktree-path should deny non -wt/ worktree add"
-else
-  [ "$?" -eq 2 ] && ok "opencode worktree-path denies non -wt/ worktree add" \
-    || bad "opencode worktree-path wrong exit on non -wt/ worktree add"
-fi
-if "$OPENCODE" worktree-path --tool Bash --command 'git worktree add /home/x/repo-wt/slug -b slug main' --cwd "$TMP/repo" --session opencode-wtg >"$TMP/opencode_wtp.out" 2>"$TMP/opencode_wtp.err"; then
-  ok "opencode worktree-path passes canonical <repo>-wt/ add"
-else
-  bad "opencode worktree-path should pass canonical <repo>-wt/ add"
-fi
-
-# route wrapper: compile-then-bind (D1). Successful same-sid/cwd bind allows a
-# subsequent material Write; every negative creates no marker while
-# preserving the compiler's own stdout/stderr/exit status.
-mkdir -p "$TMP/repo/.agent_reports/.runtime/routes"
-opencode_route_args="--capability autopilot-code --capability-mode dev --slug material-route-fixture --intensity direct --cwd $TMP/repo --artifact-root $TMP/repo/.agent_reports --predicate atomic-outcome --predicate known-scope --predicate no-shared-contract --predicate no-resource-run --predicate no-artifact-handoff --predicate no-independent-verifier --predicate focused-verification --tracking untracked --spec-read not-applicable --drift-verdict no-project-spec --workflow-mode untracked --artifact-guard preflight-passed --inline-reason atomic-direct"
-env -u OPENCODE_SESSION_ID AGENT_HOME="$ROOT" AGENT_DISPATCH_JOBS="$MATERIAL_ROUTE_JOBS" \
-  "$OPENCODE" route $opencode_route_args >"$TMP/opencode_route_probe.json" 2>"$TMP/opencode_route_probe.err"
-opencode_route_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8"))["route_id"])' "$TMP/opencode_route_probe.json")
-opencode_route="$TMP/repo/.agent_reports/.runtime/routes/$opencode_route_id.json"
-# The route id is content-addressed over the sealed cwd digest, and the probe
-# compile's own route file is part of that cwd. Remove it before the one real
-# explicit-output compile, exactly as the Codex case above does -- otherwise
-# the second compile derives a different id and the compiler refuses the
-# --output as `route-output-alias-basename`, so no bind ever happens.
-rm -f "$opencode_route"
-recall_opportunity "$TMP/repo" opencode-bind
-if OPENCODE_SESSION_ID=opencode-bind AGENT_HOME="$ROOT" AGENT_DISPATCH_JOBS="$MATERIAL_ROUTE_JOBS" \
-  "$OPENCODE" route $opencode_route_args --output "$opencode_route" >"$TMP/opencode_route.out" 2>"$TMP/opencode_route.err" \
-  && [ -f "$opencode_route" ] \
-  && AGENT_HOME="$ROOT" "$OPENCODE" material-route check --tool Write --file "$opencode_source" --cwd "$TMP/repo" --session opencode-bind >"$TMP/opencode_bind_allow.out" 2>"$TMP/opencode_bind_allow.err"; then
-  ok "opencode route wrapper binds on successful compile and allows same-sid/cwd Write"
-else
-  bad "opencode route wrapper should bind on successful compile and allow same-sid/cwd Write [route=$(test -f "$opencode_route" && echo yes || echo no)]"
-fi
-if AGENT_HOME="$ROOT" "$OPENCODE" material-route check --tool Write --file "$opencode_source" --cwd "$TMP/repo" --session opencode-foreign >"$TMP/opencode_foreign.out" 2>"$TMP/opencode_foreign.err"; then
-  bad "foreign session should not reuse the opencode material route marker"
-else
-  [ "$?" -eq 2 ] && ok "foreign session cannot reuse opencode material route marker" \
-    || bad "foreign session denial wrong exit"
-fi
-opencode_route_nooutput="$TMP/repo/.agent_reports/.runtime/routes/opencode-route-nooutput.json"
-rm -f "$opencode_route_nooutput"
-if OPENCODE_SESSION_ID=opencode-neg-nooutput AGENT_HOME="$ROOT" AGENT_DISPATCH_JOBS="$MATERIAL_ROUTE_JOBS" \
-  "$OPENCODE" route $opencode_route_args >"$TMP/opencode_neg_nooutput.out" 2>"$TMP/opencode_neg_nooutput.err" \
-  && [ ! -f "$opencode_route_nooutput" ] \
-  && "$OPENCODE" material-route check --tool Write --file "$opencode_source" --cwd "$TMP/repo" --session opencode-neg-nooutput >"$TMP/opencode_neg_nooutput_check.out" 2>"$TMP/opencode_neg_nooutput_check.err"; then
-  bad "opencode route wrapper without --output should stay unbound"
-else
-  [ ! -f "$opencode_route_nooutput" ] && ok "opencode route wrapper: no --output compiles unbound, creates no marker" \
-    || bad "opencode route wrapper: no --output should create no marker"
-fi
-opencode_route_multi_root="$TMP/repo/.agent_reports-opencode-multi"
-opencode_route_multi_args=$(printf '%s\n' "$opencode_route_args" \
-  | sed "s#--artifact-root $TMP/repo/.agent_reports#--artifact-root $opencode_route_multi_root#")
-env -u OPENCODE_SESSION_ID AGENT_HOME="$ROOT" AGENT_DISPATCH_JOBS="$MATERIAL_ROUTE_JOBS" \
-  "$OPENCODE" route $opencode_route_multi_args >"$TMP/opencode_route_multi_probe.json" 2>"$TMP/opencode_route_multi_probe.err"
-opencode_route_multi_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8"))["route_id"])' "$TMP/opencode_route_multi_probe.json")
-opencode_route_multi_a="$opencode_route_multi_root/.runtime/routes/$opencode_route_multi_id.json"
-opencode_route_multi_b="$opencode_route_multi_root/.runtime/routes/alias-$opencode_route_multi_id.json"
-rm -f "$opencode_route_multi_a" "$opencode_route_multi_b"
-if OPENCODE_SESSION_ID=opencode-neg-multi AGENT_HOME="$ROOT" AGENT_DISPATCH_JOBS="$MATERIAL_ROUTE_JOBS" \
-  "$OPENCODE" route $opencode_route_multi_args --output "$opencode_route_multi_a" --output "$opencode_route_multi_b" >"$TMP/opencode_neg_multi.out" 2>"$TMP/opencode_neg_multi.err"; then
-  :
-fi
-if "$OPENCODE" material-route check --tool Write --file "$opencode_source" --cwd "$TMP/repo" --session opencode-neg-multi >"$TMP/opencode_neg_multi_check.out" 2>"$TMP/opencode_neg_multi_check.err"; then
-  bad "opencode route wrapper with more than one --output should stay unbound"
-else
-  [ "$?" -eq 2 ] && [ ! -f "$opencode_route_multi_a" ] && [ ! -f "$opencode_route_multi_b" ] \
-    && ok "opencode route wrapper: more than one --output creates no route or marker" \
-    || bad "opencode route wrapper: more than one --output wrong denial exit"
-fi
-opencode_route_nosid_root="$TMP/repo/.agent_reports-opencode-nosid"
-opencode_route_nosid_args=$(printf '%s\n' "$opencode_route_args" \
-  | sed "s#--artifact-root $TMP/repo/.agent_reports#--artifact-root $opencode_route_nosid_root#")
-env -u OPENCODE_SESSION_ID AGENT_HOME="$ROOT" AGENT_DISPATCH_JOBS="$MATERIAL_ROUTE_JOBS" \
-  "$OPENCODE" route $opencode_route_nosid_args >"$TMP/opencode_route_nosid_probe.json" 2>"$TMP/opencode_route_nosid_probe.err"
-opencode_route_nosid_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8"))["route_id"])' "$TMP/opencode_route_nosid_probe.json")
-opencode_route_nosid="$opencode_route_nosid_root/.runtime/routes/$opencode_route_nosid_id.json"
-rm -f "$opencode_route_nosid"
-if env -u OPENCODE_SESSION_ID AGENT_HOME="$ROOT" AGENT_DISPATCH_JOBS="$MATERIAL_ROUTE_JOBS" \
-  "$OPENCODE" route $opencode_route_nosid_args --output "$opencode_route_nosid" >"$TMP/opencode_neg_nosid.out" 2>"$TMP/opencode_neg_nosid.err" \
-  && [ -f "$opencode_route_nosid" ] \
-  && "$OPENCODE" material-route check --tool Write --file "$opencode_source" --cwd "$TMP/repo" --session opencode-neg-nosid >"$TMP/opencode_neg_nosid_check.out" 2>"$TMP/opencode_neg_nosid_check.err"; then
-  bad "opencode route wrapper without OPENCODE_SESSION_ID should stay unbound"
-else
-  [ -f "$opencode_route_nosid" ] && ok "opencode route wrapper: missing sid compiles unbound, creates no marker" \
-    || bad "opencode route wrapper: missing sid should still compile the route file"
-fi
-
-echo "== opencode spec read gate =="
-if "$OPENCODE" read "$TMP/specproj/.agent_reports/spec/prd.md" opencodesid >"$TMP/opencode.out" 2>"$TMP/opencode.err" \
-  && "$OPENCODE" capability autopilot-code "$TMP/specproj" opencodesid >"$TMP/opencode.out" 2>"$TMP/opencode.err"; then
-  ok "opencode read+capability wrapper passes spec gate"
-else
-  bad "opencode read+capability wrapper should pass spec gate"
-fi
-# ungrounded spec-governed capability is hard-denied (fresh session, no prd read)
-if "$OPENCODE" capability autopilot-code "$TMP/specproj" opencode-ungrounded >"$TMP/opencode.out" 2>"$TMP/opencode.err"; then
-  bad "opencode capability should deny autopilot-code without prd read"
-else
-  [ "$?" -eq 2 ] && ok "opencode capability denies spec capability without prd read" \
-    || bad "opencode capability wrong exit without prd read"
-fi
-# non-spec-governed capability passes even ungrounded
-if "$OPENCODE" capability autopilot-research "$TMP/specproj" opencode-ungrounded >"$TMP/opencode.out" 2>"$TMP/opencode.err"; then
-  ok "opencode capability allows non-spec-governed capability ungrounded"
-else
-  bad "opencode capability should allow non-spec-governed capability ungrounded"
-fi
-
-echo "== opencode plugin spec-gate bridge =="
-# Verify the JS plugin handlers (not just the preflight CLI) wire the gate:
-# command.execute.before throws (= blocks command) when ungrounded, and
-# tool.execute.after on a prd.md read drops the grounding marker so it then passes.
-PLUGIN="$ROOT/adapters/opencode/plugins/hearting-guards.js"
-BRIDGEPROJ="$TMP/bridgeproj"
-mkdir -p "$BRIDGEPROJ/.agent_reports/spec"
-printf 'prd\n' > "$BRIDGEPROJ/.agent_reports/spec/prd.md"
-cat > "$TMP/bridge.mjs" <<MJS
-import { AgentHarnessGuards } from 'file://$PLUGIN'
-const SPEC = "$BRIDGEPROJ"
-const PRD = SPEC + "/.agent_reports/spec/prd.md"
-const SID = "bridge-grounded", SID2 = "bridge-nonspec"
-const hooks = await AgentHarnessGuards({ directory: SPEC })
-async function throws(fn){ try { await fn(); return false } catch { return true } }
-const denied = await throws(() => hooks["command.execute.before"]({command:"autopilot-code",sessionID:SID,arguments:""},{parts:[]}))
-await hooks["tool.execute.after"]({tool:"read",sessionID:SID,callID:"1",args:{filePath:PRD}},{title:"",output:"",metadata:{}})
-const passed = !(await throws(() => hooks["command.execute.before"]({command:"autopilot-code",sessionID:SID,arguments:""},{parts:[]})))
-const nonspec = !(await throws(() => hooks["command.execute.before"]({command:"autopilot-research",sessionID:SID2,arguments:""},{parts:[]})))
-process.stdout.write(JSON.stringify({denied,passed,nonspec}))
-MJS
-if command -v node >/dev/null 2>&1; then
-  if node "$TMP/bridge.mjs" >"$TMP/opencode_bridge.out" 2>"$TMP/opencode_bridge.err"; then
-    grep -q '"denied":true' "$TMP/opencode_bridge.out" \
-      && ok "opencode plugin command.execute.before blocks ungrounded spec capability" \
-      || bad "opencode plugin should block ungrounded spec capability"
-    grep -q '"passed":true' "$TMP/opencode_bridge.out" \
-      && ok "opencode plugin tool.execute.after marks prd read so gate passes" \
-      || bad "opencode plugin read marker should let gate pass"
-    grep -q '"nonspec":true' "$TMP/opencode_bridge.out" \
-      && ok "opencode plugin command.execute.before ignores non-spec capability" \
-      || bad "opencode plugin should ignore non-spec capability"
-  else
-    bad "opencode plugin bridge harness failed to run"
-  fi
-  # marker lands under the resolved harness root (.spec-grounding is gitignored); clean test sids
-  rm -f "$ROOT/.spec-grounding/"*bridge-grounded* 2>/dev/null || true
-else
-  printf '  --  skip opencode plugin bridge (node unavailable)\n'
-fi
-
 echo "== opencode workflow lifecycle CLI =="
 mkdir -p "$TMP/opencode-artifact/.agent_reports/spec"
-if "$OPENCODE" write "$TMP/opencode-artifact/.agent_reports/spec/prd.md" opencodesid >"$TMP/opencode_artifact.out" 2>"$TMP/opencode_artifact.err"; then
-  bad "opencode write wrapper should require a verified capability route for spec output"
-else
-  grep -q 'capability-artifact-route-required' "$TMP/opencode_artifact.err" \
-    && ok "opencode write wrapper requires a verified capability route for spec output" \
-    || bad "opencode write wrapper returned the wrong route failure for spec output"
-fi
+
 if "$OPENCODE" memory "$TMP/flowproj" >"$TMP/opencode_mem.out" 2>"$TMP/opencode_mem.err"; then
   ok "opencode memory wrapper exits cleanly"
 else
@@ -3766,7 +2549,7 @@ if "$OPENCODE" permissions >"$TMP/opencode_permissions.out" 2>"$TMP/opencode_per
   && grep -q '^runtime_surface=opencode-native-permission-config$' "$TMP/opencode_permissions.out" \
   && grep -q '^permission_model=permission-allow-ask-deny$' "$TMP/opencode_permissions.out" \
   && grep -q '^claude_allowed_tools=unsupported$' "$TMP/opencode_permissions.out" \
-  && grep -q '^guard_contract=preflight-write-plugin-and-explicit-tool-contracts$' "$TMP/opencode_permissions.out"; then
+  && grep -q '^guard_contract=runtime-permissions-and-tool-contracts$' "$TMP/opencode_permissions.out"; then
   ok "opencode permissions wrapper reports native permission contract"
 else
   bad "opencode permissions wrapper should report native permission contract"
@@ -4257,27 +3040,17 @@ if command -v opencode >/dev/null 2>&1; then
 else
   ok "opencode native plugin runtime discovery skipped (opencode not installed)"
 fi
-if node --input-type=module >"$TMP/opencode_plugin_hook.out" 2>"$TMP/opencode_plugin_hook.err" <<EOF
-import { AgentHarnessGuards } from "$ROOT/opencode_setting/opencode-plugins/hearting-guards.js"
-const plugin = await AgentHarnessGuards({ directory: "$TMP/repo", worktree: "$TMP/repo" })
-await plugin["tool.execute.before"]({ tool: "write", sessionID: "testsid" }, { args: { filePath: "$TMP/repo/f" } })
-EOF
-then
-  ok "opencode native plugin write hook bridges to preflight"
-else
-  bad "opencode native plugin write hook should bridge to preflight"
-fi
 mkdir -p "$TMP/fake_agent_home/adapters/opencode/bin"
 cat > "$TMP/fake_agent_home/adapters/opencode/bin/preflight.sh" <<'EOF'
 #!/usr/bin/env sh
 exit 77
 EOF
 chmod +x "$TMP/fake_agent_home/adapters/opencode/bin/preflight.sh"
-if node --input-type=module >"$TMP/opencode_plugin_invalid_home.out" 2>"$TMP/opencode_plugin_invalid_home.err" <<EOF
+if DESIGN_POSTWRITE_HOOK=0 node --input-type=module >"$TMP/opencode_plugin_invalid_home.out" 2>"$TMP/opencode_plugin_invalid_home.err" <<EOF
 process.env.AGENT_HOME = "$TMP/fake_agent_home"
 const mod = await import("$ROOT/opencode_setting/opencode-plugins/hearting-guards.js")
 const plugin = await mod.AgentHarnessGuards({ directory: "$TMP/repo", worktree: "$TMP/repo" })
-await plugin["tool.execute.before"]({ tool: "write", sessionID: "testsid" }, { args: { filePath: "$TMP/repo/f" } })
+await plugin["tool.execute.after"]({ tool: "write", sessionID: "testsid", args: { filePath: "$TMP/repo/spec/design/preview.html" } }, {})
 EOF
 then
   ok "opencode native plugin ignores invalid AGENT_HOME"
@@ -4286,11 +3059,11 @@ else
 fi
 mkdir -p "$TMP/opencode_copied_plugin"
 cp "$ROOT/opencode_setting/opencode-plugins/hearting-guards.js" "$TMP/opencode_copied_plugin/hearting-guards.js"
-if node --input-type=module >"$TMP/opencode_plugin_copy.out" 2>"$TMP/opencode_plugin_copy.err" <<EOF
+if DESIGN_POSTWRITE_HOOK=0 node --input-type=module >"$TMP/opencode_plugin_copy.out" 2>"$TMP/opencode_plugin_copy.err" <<EOF
 process.env.AGENT_HOME = "$ROOT"
 const mod = await import("$TMP/opencode_copied_plugin/hearting-guards.js")
 const plugin = await mod.AgentHarnessGuards({ directory: "$TMP/repo", worktree: "$TMP/repo" })
-await plugin["tool.execute.before"]({ tool: "write", sessionID: "testsid" }, { args: { filePath: "$TMP/repo/f" } })
+await plugin["tool.execute.after"]({ tool: "write", sessionID: "testsid", args: { filePath: "$TMP/repo/spec/design/preview.html" } }, {})
 EOF
 then
   ok "opencode native plugin copy resolves harness through AGENT_HOME"
@@ -4332,20 +3105,15 @@ const output = { system: [] }
 await plugin["experimental.chat.system.transform"]({ sessionID: "op-worker", model: {} }, output)
 if (output.system.length !== 0) process.exit(1)
 await plugin.event({ event: { type: "session.idle", properties: { sessionID: "op-worker" } } })
-try {
-  await plugin["tool.execute.before"]({ tool: "write", sessionID: "op-worker" }, { args: { filePath: "$TMP/flowproj/f" } })
-  process.exit(1)
-} catch {}
 EOF
 then
-  if grep -q '^write ' "$OPENCODE_WORKER_ROOT/calls" \
-    && ! grep -Eq '^(memory|briefing|prompt-signal|start|session-end) ' "$OPENCODE_WORKER_ROOT/calls"; then
-    ok "opencode worker plugin skips main lifecycle while retaining write guards"
+  if [ ! -e "$OPENCODE_WORKER_ROOT/calls" ]; then
+    ok "opencode worker plugin skips main lifecycle"
   else
-    bad "opencode worker plugin must separate lifecycle from safety guards"
+    bad "opencode worker plugin must skip main lifecycle"
   fi
 else
-  bad "opencode worker plugin must separate lifecycle from safety guards"
+  bad "opencode worker plugin must skip main lifecycle"
 fi
 if DESIGN_POSTWRITE_HOOK=0 node --input-type=module >"$TMP/opencode_plugin_design_hook.out" 2>"$TMP/opencode_plugin_design_hook.err" <<EOF
 import { AgentHarnessGuards } from "$ROOT/opencode_setting/opencode-plugins/hearting-guards.js"
@@ -4358,91 +3126,6 @@ else
   bad "opencode native plugin design after hook should bridge to preflight"
 fi
 
-# A1/A2/A3 plugin bridge: transitive material-write denial, bash git-commit
-# denial, bash worktree-add denial/pass, neutral/non-add pass, raw command
-# preserved verbatim, and shell.env's OPENCODE_SESSION_ID assignment.
-opencode_plugin_source="$TMP/repo/opencode_plugin_source.py"
-printf 'print(1)\n' > "$opencode_plugin_source"
-git -C "$TMP/repo" add "$opencode_plugin_source"
-if node --input-type=module >"$TMP/opencode_plugin_write_route.out" 2>"$TMP/opencode_plugin_write_route.err" <<EOF
-import { AgentHarnessGuards } from "$ROOT/opencode_setting/opencode-plugins/hearting-guards.js"
-const plugin = await AgentHarnessGuards({ directory: "$TMP/repo", worktree: "$TMP/repo" })
-try {
-  await plugin["tool.execute.before"]({ tool: "write", sessionID: "opencode-plugin-no-route" }, { args: { filePath: "$opencode_plugin_source" } })
-  process.exit(1)
-} catch (error) {
-  if (!String(error.message || error).toLowerCase().includes("route")) process.exit(1)
-}
-EOF
-then
-  ok "opencode plugin tool.execute.before denies a route-less material write end-to-end"
-else
-  bad "opencode plugin tool.execute.before should deny a route-less material write end-to-end"
-fi
-if node --input-type=module >"$TMP/opencode_plugin_bash_commit.out" 2>"$TMP/opencode_plugin_bash_commit.err" <<EOF
-import { AgentHarnessGuards } from "$ROOT/opencode_setting/opencode-plugins/hearting-guards.js"
-const plugin = await AgentHarnessGuards({ directory: "$TMP/repo", worktree: "$TMP/repo" })
-try {
-  await plugin["tool.execute.before"]({ tool: "bash", sessionID: "opencode-plugin-bash-commit" }, { args: { command: "git commit -am 'opencode_plugin_source'" } })
-  process.exit(1)
-} catch {}
-EOF
-then
-  ok "opencode plugin bash git commit of material content is denied"
-else
-  bad "opencode plugin bash git commit of material content should be denied"
-fi
-if node --input-type=module >"$TMP/opencode_plugin_bash_wt_deny.out" 2>"$TMP/opencode_plugin_bash_wt_deny.err" <<EOF
-import { AgentHarnessGuards } from "$ROOT/opencode_setting/opencode-plugins/hearting-guards.js"
-const plugin = await AgentHarnessGuards({ directory: "$TMP/repo", worktree: "$TMP/repo" })
-try {
-  await plugin["tool.execute.before"]({ tool: "bash", sessionID: "opencode-plugin-bash-wt" }, { args: { command: "git worktree add .claude/worktrees/foo -b foo" } })
-  process.exit(1)
-} catch {}
-EOF
-then
-  ok "opencode plugin bash git worktree add outside -wt/ is denied"
-else
-  bad "opencode plugin bash git worktree add outside -wt/ should be denied"
-fi
-if node --input-type=module >"$TMP/opencode_plugin_bash_wt_pass.out" 2>"$TMP/opencode_plugin_bash_wt_pass.err" <<EOF
-import { AgentHarnessGuards } from "$ROOT/opencode_setting/opencode-plugins/hearting-guards.js"
-const plugin = await AgentHarnessGuards({ directory: "$TMP/repo", worktree: "$TMP/repo" })
-await plugin["tool.execute.before"]({ tool: "bash", sessionID: "opencode-plugin-bash-wt-pass" }, { args: { command: "git worktree add /home/x/repo-wt/slug -b slug main" } })
-EOF
-then
-  ok "opencode plugin passes canonical <repo>-wt/ worktree add"
-else
-  bad "opencode plugin should pass canonical <repo>-wt/ worktree add"
-fi
-if node --input-type=module >"$TMP/opencode_plugin_bash_neutral.out" 2>"$TMP/opencode_plugin_bash_neutral.err" <<EOF
-import { AgentHarnessGuards } from "$ROOT/opencode_setting/opencode-plugins/hearting-guards.js"
-const plugin = await AgentHarnessGuards({ directory: "$TMP/repo", worktree: "$TMP/repo" })
-await plugin["tool.execute.before"]({ tool: "bash", sessionID: "opencode-plugin-bash-neutral" }, { args: { command: "git worktree remove /home/x/repo-wt/slug" } })
-await plugin["tool.execute.before"]({ tool: "bash", sessionID: "opencode-plugin-bash-neutral" }, { args: { command: "ls -la && git status" } })
-EOF
-then
-  ok "opencode plugin leaves non-add worktree subcommands and neutral commands alone"
-else
-  bad "opencode plugin should leave non-add worktree subcommands and neutral commands alone"
-fi
-if node --input-type=module >"$TMP/opencode_plugin_bash_verbatim.out" 2>"$TMP/opencode_plugin_bash_verbatim.err" <<EOF
-import { AgentHarnessGuards } from "$ROOT/opencode_setting/opencode-plugins/hearting-guards.js"
-const plugin = await AgentHarnessGuards({ directory: "$TMP/repo", worktree: "$TMP/repo" })
-// Irregular internal spacing would break a token-rejoining classifier but not
-// a verbatim single-argv passthrough; both the neutral command and the
-// worktree add must still resolve exactly as their single-space equivalents.
-await plugin["tool.execute.before"]({ tool: "bash", sessionID: "opencode-plugin-verbatim" }, { args: { command: "git status  &&  echo 'a   b'" } })
-try {
-  await plugin["tool.execute.before"]({ tool: "bash", sessionID: "opencode-plugin-verbatim" }, { args: { command: "git  worktree  add   .claude/worktrees/foo  -b  foo" } })
-  process.exit(1)
-} catch {}
-EOF
-then
-  ok "opencode plugin passes the raw bash command through verbatim as one argv element"
-else
-  bad "opencode plugin should pass the raw bash command through verbatim as one argv element"
-fi
 if node --input-type=module >"$TMP/opencode_plugin_shell_env.out" 2>"$TMP/opencode_plugin_shell_env.err" <<EOF
 import { AgentHarnessGuards } from "$ROOT/opencode_setting/opencode-plugins/hearting-guards.js"
 const plugin = await AgentHarnessGuards({ directory: "$TMP/repo", worktree: "$TMP/repo" })

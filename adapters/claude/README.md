@@ -40,10 +40,6 @@ so that residual runtime input is reported separately from profile masking.
 | agent home | `$HOME/.claude` by default; overridable with `AGENT_HOME` or `CLAUDE_HOME` |
 | artifact root | primary-checkout canonical `.agent_reports` via `utilities/artifact-root.sh`; linked-worktree snapshots are read-only; legacy fallback only at the canonical root |
 | worktree cleanup | `adapters/claude/bin/worktree-cleanup.sh`; dry-run first, apply only after merge + integrated verification + push |
-| artifact-order gate | `hooks/artifact-guard.sh` |
-| spec read gate | `hooks/spec-skill-gate.sh` + `hooks/spec-read-marker.sh` |
-| git safety gate | `hooks/git-state-guard.sh` |
-| material route gate | `hooks/material-route-guard.py`; same-session route compile marker plus source Edit/Write and `git commit` chokepoints |
 | interactive owner completion | `hooks/dispatch-owner-rewake.py`; `PostToolUse(Bash)` `asyncRewake` arms from the start receipt or the registry's same-session dispatch-depth-1 owner row — never from the command text; an arm ledger keeps one waiter per attempt and re-arms after the owner's gate closes (SD-129) — waits outside the model, wakes at once when the owner raises a human gate, and returns one exact-attempt receipt without recurring background monitors |
 | steward watch completion | `hooks/peer-steward-rewake.py`; `PostToolUse(Bash)` `asyncRewake` arms only from a same-session `peer-steward.py watch` armed line with `wake=hook`, waits on the watch receipt outside the model, acks it, and returns one exit-2 notice per watch; `hooks/peer-message-record.py prompt` sweeps un-acked receipts at the next prompt if the hook dies |
 | memory candidate exposure | `UserPromptSubmit` runs `hooks/mem-recall-inject.sh`: active current-project/global capsule headlines and IDs only, maximum six / 2,400 UTF-8 bytes, fail-open. The model decides relevance and reads full records. The bridge publishes the same-turn receipt required by main-session material mutation; explicit `recall-gate` is the fallback |

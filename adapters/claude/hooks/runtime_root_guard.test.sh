@@ -1,1 +1,0 @@
-../../../hooks/runtime_root_guard.test.sh

@@ -136,8 +136,6 @@ See [`loops/README.md`](loops/README.md).
 | **Determinism for mechanical invariants** | DESIGN §0.5 | Artifact, git-state, spec, and memory-write guards |
 | **Agent-owned semantic judgment** | MEMORY D-40 | No fixed recall signal words or prompt classifier; the acting agent chooses retrieval |
 | **Meaning ↔ rule boundary checks** | DESIGN §0.7 | `autopilot-spec`, audit, and targeted drill regressions |
-| **Hard ordering gates** | WORKFLOW §0 | `hooks/artifact-guard.sh` |
-| **Safe git state** | OPERATIONS §5.9 | `hooks/git-state-guard.sh` blocks unsafe edits during merge/rebase/detached states |
 | **Isolated parallel dispatch** | OPERATIONS §5.10 | `<repo>-wt/<slug>`, `.dispatch/jobs.log`, and liveness checks |
 | **Unified memory lifecycle** | DESIGN §7 / MEMORY §7 | `mem.py` DB plus adapter lifecycle bridges |
 | **Behavioral self-tests** | loops §L4 | `loops/drill/` fixtures, assertions, and token accounting |

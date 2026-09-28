@@ -52,18 +52,12 @@ Use portable role names from `roles/README.md` and `core/CONVENTIONS.md`. Concre
 Adapters must preserve the portable invariants relevant to this capability:
 
 - resolve artifact root through `utilities/artifact-root.sh` or equivalent logic;
-- enforce git/worktree safety before edits;
-- enforce artifact ordering before new durable artifacts;
-- enforce spec-read gating when this capability changes spec-backed code or specs;
 - use DB memory paths, not runtime-native memory files.
 
 
-## Required Guards
+## Workflow Evidence
 
-- Before edits: `adapters/codex/bin/preflight.sh write <file> [session-id]`
 - Before capability grounding/spec-changing work: `adapters/codex/bin/preflight.sh route post-it [cwd] [session-id]`
-- Before spec-changing work: `adapters/codex/bin/preflight.sh capability post-it [cwd] [session-id]`
-- After actually reading a spec PRD: `adapters/codex/bin/preflight.sh read <prd.md> [session-id]`
 - For workflow state: `adapters/codex/bin/preflight.sh status [cwd] [session-id]` and `adapters/codex/bin/preflight.sh prompt-signal [cwd] [session-id]`
 
 Do not use legacy compatibility Skill files or non-native adapter Skill files

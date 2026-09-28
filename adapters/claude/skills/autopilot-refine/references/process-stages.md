@@ -157,7 +157,7 @@ With **`--review-only`**, print Stage C and stop without Stage D.
 
 ### Stage D — Apply
 
-1. **Prepare snapshots mechanically.** For every existing file that Stage C will change, run the route-bound write preflight before the first Edit. `artifact-guard.sh` invokes `utilities/artifact-snapshot.py prepare`, captures the exact current bytes, and reuses one `_internal/versions/v{N}/` receipt for the whole route. When hook coverage is unavailable, invoke that helper explicitly with the canonical artifact root, target, route file/id, and active node, and require its success receipt. Do not calculate `N`, run `mkdir`/`cp`, or accept an empty version directory. Existing legacy sibling layouts are preserved by the same helper; new layouts are modern.
+1. **Prepare snapshots mechanically.** For every existing file that Stage C will change, the existing snapshot helper captures the exact current bytes, and reuses one `_internal/versions/v{N}/` receipt for the whole route. Do not calculate `N`, run `mkdir`/`cp`, or accept an empty version directory. Existing legacy sibling layouts are preserved by the same helper; new layouts are modern.
 2. **Apply exact-string edits** with the Edit tool. Never use `replace_all` unless the proposal explicitly says so.
 3. **Clean inline memos in memo mode.** When every memo from `--memo <file>` or `<!-- memo: ... -->` is applied, remove the inline memo and adjacent blank lines while preserving `---` separators. Preserve a memo only when the user requests it or it contains unresolved out-of-scope metadata worth surfacing.
 4. **Update `pipeline_summary.md` as the only history file:**

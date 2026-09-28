@@ -83,7 +83,7 @@ invariant.
 | Custom agents | `adapters/codex/agents/<role>.toml` generated from `roles/README.md` | `codex_setting/codex-agents` |
 | Mode guides | `adapters/codex/modes/*/*.md` generated from `roles/modes/` with Codex mode-info contracts | `codex_setting/codex-modes` |
 | Plugin marketplace | `adapters/codex/plugin-marketplace/.agents/plugins/marketplace.json` plus `adapters/codex/plugin-marketplace/plugins/hearting-codex` | `codex_setting/codex-plugin-marketplace` |
-| Hook bridge | `adapters/codex/hooks/hooks.json`, `adapters/codex/hooks/run-hook.sh`, `adapters/codex/hooks/sessionstart-lifecycle.py`, `adapters/codex/hooks/sessionend-lifecycle.py`, `adapters/codex/hooks/stop-lifecycle.py`, `adapters/codex/hooks/userprompt-lifecycle.py`, `adapters/codex/hooks/permissionrequest-lifecycle.py`, `adapters/codex/hooks/posttooluse-interaction-clear.py`, `adapters/codex/hooks/pretooluse-write-guard.py`, `adapters/codex/hooks/posttooluse-read-marker.py`, `adapters/codex/hooks/posttooluse-design-check.py` | `codex_setting/codex-hooks` |
+| Hook bridge | `adapters/codex/hooks/hooks.json`, `adapters/codex/hooks/run-hook.sh`, `adapters/codex/hooks/sessionstart-lifecycle.py`, `adapters/codex/hooks/sessionend-lifecycle.py`, `adapters/codex/hooks/stop-lifecycle.py`, `adapters/codex/hooks/userprompt-lifecycle.py`, `adapters/codex/hooks/permissionrequest-lifecycle.py`, `adapters/codex/hooks/posttooluse-interaction-clear.py`, `adapters/codex/hooks/posttooluse-read-marker.py`, `adapters/codex/hooks/posttooluse-design-check.py` | `codex_setting/codex-hooks` |
 | Permission/sandbox contract | `adapters/codex/bin/preflight.sh permissions` | `codex_setting/bin/preflight.sh permissions` |
 | MCP contract | `adapters/codex/bin/preflight.sh mcp` | `codex_setting/bin/preflight.sh mcp` |
 | Design scaffold assets | `adapters/codex/scaffolds/` Codex-owned projection of shared scaffold HTML assets | `codex_setting/scaffolds` |
@@ -291,93 +291,7 @@ runtime discovery coverage when Codex exposes one.
 
 ## Native Hook Surface
 
-Codex supports lifecycle hooks through `hooks.json` and inline config. This
-adapter materializes a Codex-native hook projection under `adapters/codex/hooks/`.
-Hook commands enter through `run-hook.sh`, which validates `AGENT_HOME` or the
-Codex harness pointer before executing bridge scripts.
-Manual `preflight.sh` entry preserves the same source/runtime separation. A
-valid explicit `AGENT_HOME` remains authoritative; otherwise the wrapper uses
-the Codex-owned agent-home resolver to select the installed
-`$HOME/hearting`, legacy `$HOME/agent_setting`, or the Codex runtime pointer. The git root containing the
-invoked script is only a standalone-checkout fallback, so a worktree-local
-preflight executable cannot silently activate an uninstalled feature worktree
-as the orchestration root.
-The `SessionStart` bridge keeps memory injection off by
-default because Codex `SessionStart` can run on startup, resume, clear, and
-compact; `CODEX_SESSION_MEMORY_INJECT=1` restores `memory` output as
-`hookSpecificOutput.additionalContext`. The `SessionEnd` bridge calls
-`session-end` for typed `mem sync --json` (D-78: no automatic distiller). It does not synthesize
-`MEM_DUMP_PUSH=1`: local sync remains the default, the user's
-`MEM_SYNC_REMOTE`/deprecated-alias environment passes through unchanged, and
-the alias can select only immutable protocol-v2 exchange, never a dump push.
-A nonzero sync class is reported plainly. The separate `Stop` bridge
-silently clears only an exact Fleet interaction marker. It never
-reads the dispatch registry, joins a child, or emits a blocking continuation. The
-`UserPromptSubmit` bridge calls the portable capsule-only candidate bridge and
-`briefing` when they have content, and a transition-only `token-budget ... hook`
-response. Token-budget output is byte-identical to Phase 1:
-it is empty for normal, unknown, repeated-band, degraded/failure, and
-validated-native states; only entry into `tight`/`critical` adds one compact
-directive. The parent lifecycle records exactly one content-free receipt-derived
-outcome after observing success, timeout, and process failure. Accounting uses a
-sha256 session digest, bounded XDG aggregate, bounded stale-safe lock, atomic
-replace, and 8 KiB/file / 256 files / 2 MiB oldest-first pruning; every failure
-is silent and fail-open. Exact inserted bytes and monotonic exact-session runtime
-counter deltas remain separate non-billing observations, with no tokenizer
-estimate absent exact runtime/model/version provenance. The directive can shorten output and defer optional
-extras, but core/CONVENTIONS.md §1.2 forbids changing intensity, dispatch/depth,
-model role, required tools/tests, safety/validation/security/error handling/
-accessibility, input context, or guards. It emits
-`hookSpecificOutput.additionalContext` only when non-default prompt context exists;
-no routing-contract or git-risk aggregate is injected per turn. The structured
-`prompt-signal` subcommand (worker-startup/manual, not a per-turn hook call) reports
-`routing_contract=core/WORKFLOW.md`,
-`routing_action=read-workflow-and-select-codex-skill`, and
-`capability_entrypoints=codex-native-skills`. The `PermissionRequest`
-bridge emits no hook output and never answers the prompt; it writes only the
-Fleet allowlist (`harness`, exact thread id, approval kind/source/time). Codex
-continues to own approval and sandbox decisions. A wildcard `PostToolUse`
-side-effect bridge clears the exact marker after success, with prompt/Stop/
-SessionEnd as abandonment backstops. The write bridge registers
-`PreToolUse` for write/edit/multiedit/patch tools, including qualified
-`functions.apply_patch` payloads, and calls
-`adapters/codex/bin/preflight.sh write <file> <session-id>`, which runs
-the portable artifact-order, git-state, core-first adapter edit, and memory-write guards, plus the spec
-read gate for spec-changing artifacts (see below). The read bridge
-registers `PostToolUse` for `Read` and calls `adapters/codex/bin/preflight.sh
-read <file> <session-id>` so actual `spec/prd.md` reads satisfy spec-backed
-capability gates and actual `core/*.md` reads satisfy the core-first adapter edit gate.
-
-Spec read gate — fitted to Codex's interception point. Claude hard-denies an
-ungrounded `autopilot-code`/`autopilot-spec` *Skill* via `PreToolUse[Skill]`.
-Codex has no skill-invocation event (Skills are implicitly selected, and there is
-no slash-command router), so the same portable invariant — no spec-changing work
-without a current `prd.md` read marker — is enforced where Codex *can* intercept:
-the write of a spec-changing artifact. `preflight.sh write` runs the shared
-`spec-skill-gate.sh` against `<artifact-root>/plans/*` (autopilot-code) and the
-`spec/` blueprints (autopilot-spec), using the same per-cwd marker the read
-bridge writes. Creating the first `prd.md` is not gated (no marker target yet —
-artifact-order still applies); editing an existing artifact while ungrounded is
-hard-denied. This is marginally stricter than Claude's skill-entry gate (it also
-covers direct artifact edits), in the safe direction: it never weakens the
-invariant. The headless `dispatch` wrapper additionally applies the gate before
-launch. The design bridge registers `PostToolUse` for the same
-write/edit/multiedit/patch surface, including qualified `functions.apply_patch`
-payloads, and calls `adapters/codex/bin/preflight.sh design
-<file>` for saved design HTML files.
-
-Current Codex hook coverage includes structured tools plus targeted shell
-detection, not arbitrary shell I/O coverage. Shell/Bash/`functions.exec_command`
-commands with obvious write redirects, common mutation commands (`tee`, `touch`,
-`cp`, `mv`, `rm`, `install`, `rsync`), `dd of=...`, `sed -i`, direct
-`spec/prd.md` / `core/*.md` reads, and design HTML save paths are routed through adapter
-hooks; target-ambiguous shell
-reads/writes still require the agent to run the matching `preflight.sh write`,
-`preflight.sh read`, or `preflight.sh design` wrapper. `preflight.sh prompt-signal` and
-`preflight.sh permissions` report this as
-`shell-read-write-targeted-detection-explicit-preflight-fallback`; do not claim
-Claude-style hard hook parity for ambiguous shell I/O until Codex provides a
-fully target-aware shell hook surface.
+Write-denying hook gates are retired; no write preflight or core-read marker is required.
 
 Do not project Claude `hooks/` or `settings.json` into Codex. Use
 `codex_setting/codex-hooks` as the install source, and keep explicit
@@ -391,8 +305,7 @@ definition's current hash, enabled state, and discovered source set to match.
 Use `adapters/codex/bin/preflight.sh runtime-projection
 --require-hook-trust` or `adapters/codex/bin/preflight.sh doctor --runtime-strict`
 when hook trust must fail runtime checks.
-The lifecycle hooks are informational/context bridges and do not replace
-deterministic write guards. The design hook is a console-check alert path, not a
+The lifecycle hooks provide informational context. The design hook is a console-check alert path, not a
 full render/screenshot visual harness.
 
 Codex CLI 0.142.x exposes `codex debug prompt-input`, but not a hook listing or
@@ -438,12 +351,12 @@ Harness-specific status signals still need Codex-native realization:
 | artifact/notes/git-risk snapshot | explicit `preflight.sh status`; includes tracked-dirty vs untracked counts and sibling worktree counts; keep Codex `/statusline` for native model/context/token/session fields |
 | UI boundary report | explicit `preflight.sh ui-info`; reports built-in footer/title support, unsupported arbitrary live statusline scripts, Skill/plugin autopilot entrypoints, and explicit/main-dispatched subagent behavior |
 | subagent delegation | explicit `preflight.sh subagent-info --check`; verifies the Codex `multi_agent` runtime feature and projected custom agents before claiming native subagent delegation parity |
-| artifact root detection | `preflight.sh write` and shared artifact-root helper |
+| artifact root detection | shared `utilities/artifact-root.sh` helper |
 | headless/autopilot/background jobs | `preflight.sh headless` / `dispatch` / `liveness` / `harvest` provide the tool-contract path; `preflight.sh status` surfaces in-flight jobs as `headless_open_jobs` / `headless_open_slugs` from the dispatch registry. A Codex-native graphical display remains optional polish |
 | sibling `-wt/<slug>` dispatch detection | preserve the worktree naming invariant; choose a Codex-native display surface later |
 | pipeline stage nudges | preflight/AGENTS instructions first; UI only when Codex exposes a suitable surface |
 | oncall/note/study/drill/runtime-watch loop nudges | `preflight.sh briefing` plus `preflight.sh loop-info <loop>` for loop-specific support/fallback status |
-| merge/rebase/merged-branch risk | `preflight.sh write` git safety checks; `preflight.sh status` reports `git_operation` (merge/rebase/cherry-pick), `git_branch_done` (non-default branch fully merged = DONE-BRANCH hazard), dirty counts, and extra worktree counts. A native graphical warning remains optional polish |
+| merge/rebase/merged-branch risk | `preflight.sh status` reports git operation, branch and worktree risks without blocking writes. |
 | fleet (multi-agent) observability | Fleet is a pure reader of registry and neutral sidecars. Each registered dispatch wrapper attaches an exact-attempt summary supervisor before releasing the worker launch fence; the supervisor owns early, debounced, and final updates even when Fleet is closed, and `dispatch-reconcile --apply` repairs a missing owner only for an exact live attempt. Interactive Codex `UserPromptSubmit`, Stop, and SessionEnd hooks trigger the same shared producer independently of Fleet. Interaction waits remain separate: `PermissionRequest` publishes approval wait and native `PostToolUse` plus turn/session boundaries release it without changing approval ownership. |
 
 observability caveat: Codex keeps native `/statusline` ownership of model,
@@ -456,12 +369,7 @@ is observed.
 
 | Portable invariant | Codex adaptation requirement |
 |---|---|
-| artifact order | Run `adapters/codex/bin/preflight.sh write <file> [session-id]` before writes |
-| git state safety | Run `adapters/codex/bin/preflight.sh write <file> [session-id]` before edits |
-| core first gate | Auto-enforced through Codex hooks: `PostToolUse[Read]` records actual `core/*.md` reads, and `PreToolUse` write guard hard-denies ungrounded `adapters/**` edits. Manual fallback: `preflight.sh read <core-doc.md>` after core reads |
-| memory write guard | Run `adapters/codex/bin/preflight.sh write <file> [session-id]` before writes |
 | design post-write verification | Run `adapters/codex/bin/preflight.sh design <file>` after design HTML writes |
-| spec read gate | Auto-enforced through Codex hooks: `PostToolUse[Read]` records actual `prd.md` reads, and `PreToolUse` write guard hard-denies an ungrounded write to a spec-changing artifact (`plans/*` or a `spec/` blueprint) — Codex's interception equivalent of Claude's `PreToolUse[Skill]` gate (no skill event exists). Manual fallbacks: `preflight.sh read <prd.md>` after reads, `preflight.sh capability <name> [cwd] [session-id]` before spec/code capabilities |
 | routing-contract signal | `adapters/codex/bin/preflight.sh prompt-signal [cwd] [session-id]` is the worker-startup/manual subcommand carrying the full routing contract; run it manually when no automatic hook is attached |
 | token/context pressure | `preflight.sh token-budget [cwd] [session-id] [kv|json|hook]` reads an exact Codex rollout session and keeps active context, exact directive bytes, and cumulative raw counters separate. `kv`/`json` are read-only L2 accounting diagnostics. Unknown/degraded signals fail open. `hook` remains transition-only and byte-identical; its parent lifecycle is the single exactly-once accounting authority for success/timeout/error and writes only a bounded content-free sha256-session aggregate under XDG state. `utilities/token-budget-experiment.py` is an explicit isolated `offline-forecast-v1` replay/evaluator: production hooks/preflight do not import or activate it, its maximum verdict is `eligible_for_user_review`, adoption stays `pending_user_decision`, and it never writes config. Native rollout-budget ownership requires `AGENT_TOKEN_BUDGET_NATIVE_VALIDATED=1` only after feature + no-side-effect config probes pass; local Codex 0.144.3 reports the feature under development and disabled, so exact-session rollout observation remains the fallback. The adapter never writes `$CODEX_HOME/config.toml` |
 | memory inject | Run `adapters/codex/bin/preflight.sh memory [cwd]` for plain-text memory injection; Codex SessionStart hook emission is opt-in via `CODEX_SESSION_MEMORY_INJECT=1` |
@@ -480,8 +388,6 @@ is observed.
 | role modes | Read `roles/MODES.md`, then run `adapters/codex/bin/preflight.sh mode-info <family/mode>`; read the reported `native_mode_path`, obey `fallback=reference-only` only for unsupported modes, and satisfy any named `tool_contract` / `tool_contract_check` before claiming tool-contract modes |
 | mode guides | Use `adapters/codex/modes/<family>/<mode>.md` as the Codex-native realization guide reported by `mode-info`; satisfy named tool contracts or report unavailable before claiming support |
 | design modes | Use `adapters/codex/modes/design/<mode>.md` as the Codex-native realization guide; satisfy `visual-harness` or report unavailable before claiming rendered visual verification |
-| hook invariants | `pretooluse-write-guard.py` owns only material-route and targeted write safety. `stop-lifecycle.py` silently clears only the exact interaction marker identified by its payload; it has no subprocess, lifecycle, registry, completion, or continuation authority. Deterministic tests assert that wildcard PreToolUse, Stop joins/blocks/subprocesses, new `codex-stop-hook` stamps, and parent-state writes are absent; legacy exact-terminal harvest recovery remains covered separately. Session, prompt, permission, read-marker, design-check, native-subagent, and explicit preflight fallback mappings remain unchanged |
-| worktree path isolation | The native shell PreToolUse bridge (`pretooluse-write-guard.py`) runs the worktree guard before material-route in its shell branch, with `preflight.sh worktree-path` as the explicit fallback. This covers shell `git worktree add`; the built-in-worktree-tool deny is Claude-native and has no Codex counterpart |
 | capabilities | Read `capabilities/README.md`, then run `adapters/codex/bin/preflight.sh capability-info <capability>`; do not assume Claude Skill invocation |
 
 The private Codex owner supervisor derives its finite continuation ceiling from
@@ -755,40 +661,16 @@ claim.
 ## Worklog Boundary
 
 Codex must treat `<agent-notes-root>` as mutable continuity state, not as harness
-source. Before changing notes/routing state, run normal `write` preflight for the
-target file and inspect `preflight.sh worklog` output. Codex may read/write
+source. The `preflight.sh worklog` output describes the configured notes surface. Codex may read/write
 notes-root files only when the task is explicitly about notes, triage, feedback,
 or worklog routing. It must not copy worklog-board DBs, caches, `.env*`, build
 output, dispatch logs, or worktrees into this repo.
-# Material-route enforcement
-
-Codex's supported local `Write`/`Edit`/`MultiEdit`/`apply_patch` and shell
-boundaries delegate material authorization to `hooks/material-route-guard.py`.
-Patch targets are normalized to portable `Write`; source-bearing `git commit`
-commands are checked independently by the material/write guard. A successful,
-trusted local `preflight.sh route --capability ... --output ...` (or direct
-router compile) binds the exact interactive session only when one output and
-canonical route verification succeed. Registered workers remain bound by their
-immutable `AGENT_ROUTE_*` proof and cannot impersonate interactive markers.
-
-`preflight.sh material-route check|bind|clear` is the explicit checked fallback
-when native hooks are unavailable. Only `SessionEnd` clears an interactive
-marker; `Stop` never does. Successful hook side effects are silent and denials
-remain Codex-shaped. Detached `resource-runner.py start` additionally requires
-the sealed route, exact `resource-runner`/`detached-process` node, and smoke
-attestation before logs, registry state, or a child process are created.
-
-This source change does not install projections or alter trust. Automatic
-enforcement begins only after the integrated source is installed as
-`AGENT_HOME` and the existing projection/current-hash trust check passes.
-
 ## Stage-session capacity contract (2026-08-06)
 
 - **Runtime support:** current Codex hook schema exposes native `PreCompact` and
   `PostCompact`; Codex also exposes checked native subagents.
 - **Adapter realization:** every registered wrapper uses the same portable
   sub-session axes. The generated prompt includes a persistent ledger anchor;
-  `preflight write` enforces exact files and a three-edit update cadence, while
   compact hooks flush/re-anchor. A sub-session is terminal evidence only and is
   rejected by `capability-route complete`; the owner alone publishes one
   aggregate stage marker.
@@ -838,3 +720,5 @@ request with no proven parent grant, and any request the current role cannot
 enforce fail before registration/model spawn.
 Owner-to-worker propagation and continuation hash binding remain a separate
 unimplemented slice.
+
+Session and prompt bridges retain `hookSpecificOutput.additionalContext` for optional memory and lifecycle context.

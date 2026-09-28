@@ -22,10 +22,6 @@ CAP_SPEC = importlib.util.spec_from_file_location(
     "inline_finish_capability_route", ROOT / "utilities/capability-route.py")
 CAP = importlib.util.module_from_spec(CAP_SPEC)
 CAP_SPEC.loader.exec_module(CAP)
-GUARD_SPEC = importlib.util.spec_from_file_location(
-    "inline_finish_material_guard", ROOT / "hooks/material-route-guard.py")
-GUARD = importlib.util.module_from_spec(GUARD_SPEC)
-GUARD_SPEC.loader.exec_module(GUARD)
 
 GATES = ["atomic-outcome", "known-scope", "no-shared-contract", "no-resource-run",
          "no-artifact-handoff", "no-independent-verifier", "focused-verification"]
@@ -41,7 +37,7 @@ class PublicInlineFinishTest(unittest.TestCase):
         self.root.mkdir()
         # The public compiler seals the harness source root as its runtime
         # identity. Keep that real source root while isolating mutable session
-        # data with unique ids and removing the marker in tearDown.
+        # data with unique ids.
         self.home = ROOT
         self.jobs = self.base / "jobs.log"
         self.jobs.write_text("", encoding="utf-8")
@@ -105,7 +101,6 @@ class PublicInlineFinishTest(unittest.TestCase):
         self.evidence.write_bytes(b"exact terminal evidence\n")
         self.summary = self.base / "summary.md"
         self.summary.write_text("Finished the inline route.\n", encoding="utf-8")
-        GUARD.bind_route(self.route_file, self.repo, os.environ["CODEX_THREAD_ID"], self.home)
         self.command = [
             sys.executable, str(ROOT / "utilities/capability-route.py"), "finish",
             "--route", str(self.route_file), "--evidence", str(self.evidence),
@@ -114,15 +109,6 @@ class PublicInlineFinishTest(unittest.TestCase):
         self.env = os.environ.copy()
 
     def tearDown(self):
-        try:
-            GUARD.clear_route("inline-finish-test-session", self.home)
-        except Exception:
-            pass
-        for harness in ("codex", "claude", "opencode"):
-            try:
-                GUARD.clear_route("inline-finish-" + harness, self.home)
-            except Exception:
-                pass
         for key, value in self.old_env.items():
             if value is None:
                 os.environ.pop(key, None)
@@ -145,7 +131,6 @@ class PublicInlineFinishTest(unittest.TestCase):
         env[{"codex":"CODEX_THREAD_ID", "claude":"CLAUDE_CODE_SESSION_ID",
              "opencode":"OPENCODE_SESSION_ID"}[harness]] = session_id
         env["AGENT_DISPATCH_CALLER_HARNESS"] = harness
-        GUARD.bind_route(self.route_file, self.repo, session_id, self.home)
         return subprocess.run(self.command, cwd=self.repo, env=env, capture_output=True, text=True)
 
     def test_public_compose_start_finish_cli_flow_and_campaign_seal(self):
@@ -157,7 +142,7 @@ class PublicInlineFinishTest(unittest.TestCase):
 
     def test_depth_zero_public_finish_resolves_all_supported_harness_sessions(self):
         # Independent fixtures preserve the one-shot finish state for each
-        # caller identity and prove that the native shared guard is runtime-neutral.
+        # caller identity across the supported runtimes.
         for harness in ("codex", "claude", "opencode"):
             with self.subTest(harness=harness):
                 fixture = PublicInlineFinishTest("test_public_finish_seals_and_exact_replay_returns_one_receipt")

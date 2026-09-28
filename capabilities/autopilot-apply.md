@@ -41,9 +41,7 @@ binds `direct`, `quick`, and `standard+`; only the acting owner differs.
    `campaigns/<campaign-locator>/<cycle-locator>/artifacts/` before any artifact exists.
 2. **write only inside the open cycle.** Every durable artifact goes under
    `<cycle_dir>/artifacts/apply-log/...` (`AGENT_ARTIFACT_OUTPUT_DIR`).
-   `artifact_producer.py check-write` is the single allow/deny oracle used by
-   `hooks/artifact-guard.sh`; an active cutover hard-denies new legacy
-   top-level writes, and `shared/` is immutable in both states.
+   `artifact_producer.py` owns cycle output paths and shared revisions.
 3. **stage workers join, never fork.** `standard+` stage workers receive
    `AGENT_ARTIFACT_CAMPAIGN_ID`/`CYCLE_ID`/`PRODUCER_ID`/`CYCLE_DIR`/`OUTPUT_DIR`
    from the owner (dispatch env pass-through) and call `begin --node <id>`
@@ -65,9 +63,6 @@ Use portable role names from `roles/README.md` and `core/CONVENTIONS.md`. Concre
 Adapters must preserve the portable invariants relevant to this capability:
 
 - resolve artifact root through `utilities/artifact-root.sh` or equivalent logic;
-- enforce git/worktree safety before edits;
-- enforce artifact ordering before new durable artifacts;
-- enforce spec-read gating when this capability changes spec-backed code or specs;
 - use DB memory paths, not runtime-native memory files.
 
 ## Adapter Realization

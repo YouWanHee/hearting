@@ -105,13 +105,7 @@ REQUIRED_SURFACES: tuple[tuple[str, tuple[str, ...]], ...] = (
         "route_hash",
         "route_id_from_hash",
     )),
-    # §13.53.9 / A82-12 -- the cleanup scope is only real where it is enforced.
-    # The helper living in `dispatch_terminal_commit` proves nothing if the
-    # hook that calls it is absent from the runtime root, so census the
-    # enforcement point too.
-    ("hooks/material-route-guard.py", (
-        "main",
-    )),
+
 )
 
 # Call sites where an argument-name change would pass a name-only census and

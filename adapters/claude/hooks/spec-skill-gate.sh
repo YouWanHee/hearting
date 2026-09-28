@@ -1,1 +1,0 @@
-../../../hooks/spec-skill-gate.sh

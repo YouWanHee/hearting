@@ -4426,9 +4426,8 @@ class SourceLineageVerdictTest(unittest.TestCase):
    )
    # A bare --route smoke isn't a real route file; assert the shared function
    # directly instead of round-tripping through a full compiled route here --
-   # `test_c_continuation_cli_rebinds_source_commit_after_fast_forward` and
-   # `hooks/material_route_guard.test.py::test_stale_source_commit_and_tampered_record_are_denied`
-   # already exercise the real `verify --cwd` subprocess end to end.
+   # `test_c_continuation_cli_rebinds_source_commit_after_fast_forward`
+   # already exercises the real `verify --cwd` subprocess end to end.
    self.assertTrue(verify.returncode != 0)
 
  def test_a_sd156_6_git_failure_reads_unverifiable_on_every_consumer(self):
@@ -4658,7 +4657,6 @@ class SourceCensusTest(unittest.TestCase):
  ROUTE_LINEAGE_CONSUMERS=(
   "utilities/capability-route.py",
   "utilities/worker-route-guard.py",
-  "hooks/material-route-guard.py",
  )
 
  def test_first_parent_probe_single_site(self):

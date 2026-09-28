@@ -35,8 +35,9 @@ local projection, and parity gaps; plan a checked fallback.
 - Capabilities come from `capabilities/`; Codex-native generated Skills/plugin, agents, and modes live under `adapters/codex/`. Expose them through `codex_setting/codex-plugin-marketplace`, `codex_setting/codex-agents`, and `codex_setting/codex-modes`.
 - Hooks are Codex bridges under `codex_setting/codex-hooks`; never project Claude settings, commands, hooks, or allowedTools.
 - Before using a capability or mode, run `adapters/codex/bin/preflight.sh capability-info <capability>` or `preflight.sh mode-info <family/mode>` and obey named `tool_contract`, `tool_contract_check`, `runtime_surface`, and `fallback`.
-- Before edits run `preflight.sh write <file> [session-id]` (default: `$CODEX_THREAD_ID`, same as the hook payload's `session_id`). Read the governing core file first for `adapters/**`; mark actual core/spec reads with `preflight.sh read <file> [session-id]`. Run `preflight.sh capability <name> [cwd] [session-id]` for spec changes. Never set `AGENT_ROUTE_*` yourself — `compose` binds the route.
-- Shell/Bash/`functions.exec_command` reads and writes have targeted hook coverage; use explicit read/write/design preflight for ambiguous guarded I/O.
+- Read the governing core contract before adapter changes. Spec reads may be
+  recorded with `preflight.sh read <prd.md>` for workflow evidence.
+- Spec reads and design saves retain observational hook coverage.
 
 Detailed lifecycle and edge-case contracts live in `adapters/codex/README.md`
 and `ADAPTATION.md`; command output is authoritative for current support.

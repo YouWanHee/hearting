@@ -1,1 +1,0 @@
-../../../hooks/artifact_write_targets.py
