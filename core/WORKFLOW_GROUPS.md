@@ -89,3 +89,7 @@ is a conflict. `verify` checks current structure/identity and reports stale or
 unverified evidence separately. An explicitly carried same-campaign group
 context can add a new cycle as a member during the existing producer `begin`;
 the parent cycle alone cannot do so. No new workflow gate is required.
+The final recheck covers newly authored evidence immediately before apply;
+independent writers can still alter artifact bytes afterward, so the declaration
+does not claim an atomic snapshot of external artifact writes. Historical stale
+evidence remains readable and does not block an unrelated merge.
