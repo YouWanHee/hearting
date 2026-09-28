@@ -2153,6 +2153,8 @@ def resolve_placed_output(path: Path) -> Path:
             continue
         directory = output.parent
         binding = _read_json(directory / ".cycle.json") or {}
+        if not isinstance(binding, dict):
+            continue
         cid = binding.get("cycle_id", "")
         if not artifact_identity.is_well_formed(cid, "cycle"):
             continue
@@ -2184,6 +2186,8 @@ def placed_output_proof(path: Path, *, route_id: str, route_hash: str) -> Option
             continue
         directory = output.parent
         binding = _read_json(directory / ".cycle.json") or {}
+        if not isinstance(binding, dict):
+            continue
         cid = binding.get("cycle_id", "")
         if not artifact_identity.is_well_formed(cid, "cycle"):
             continue
@@ -2205,12 +2209,17 @@ def placed_output_proof(path: Path, *, route_id: str, route_hash: str) -> Option
             if not isinstance(manifest, dict):
                 continue
             checkpoint = _read_json(checkpoint_state_path(root, cid)) or {}
+            if not isinstance(checkpoint, dict):
+                continue
             if (checkpoint.get("manifest_id") != manifest.get("manifest_id")
                     or checkpoint.get("manifest_revision_id") != manifest.get("manifest_revision_id")
                     or checkpoint.get("route_id") != route_id):
                 continue
             relative = origin.relative_to(directory).as_posix()
-            moves = _output_placements(root, record)
+            try:
+                moves = _output_placements(root, record)
+            except (AttributeError, TypeError):
+                continue
             applicable = [row for row in moves if relative == row["from"]
                           or relative.startswith(row["from"] + "/")]
             if len(applicable) != 1:

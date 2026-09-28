@@ -185,6 +185,8 @@ class InterimManifestTest(CheckpointTestBase):
         duplicate["moves"].append(dict(duplicate["moves"][0]))
         ledger.write_text(json.dumps(duplicate), encoding="utf-8")
         self.assertIsNone(P.placed_output_proof(original, **expected))
+        ledger.write_text("[]", encoding="utf-8")
+        self.assertIsNone(P.placed_output_proof(original, **expected))
         ledger.write_bytes(original_ledger)
         original.write_bytes(b"different file at old path")
         self.assertIsNone(P.placed_output_proof(original, **expected))

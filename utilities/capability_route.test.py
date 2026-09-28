@@ -3423,6 +3423,26 @@ class TestContinuation(unittest.TestCase):
          mock.patch.object(R,"attempt_process_quiescence",return_value=mock.Mock(state="quiescent")), \
          mock.patch.object(R,"process_namespace_identity",return_value=namespace), \
          mock.patch("artifact_producer.placed_output_proof",return_value=proof):
+     original_bytes=evidence.read_bytes()
+     original_row=jobs.read_bytes()
+     publications=(R.completion_dir(source["route_id"]),
+                   R._attempt_completion_path(source,node["id"],attempt))
+     def drift_after_proof(original):
+      def changed(*args,**kwargs):
+       evidence.write_text("changed after proof\n",encoding="utf-8")
+       return original(*args,**kwargs)
+      return changed
+     for target in ("_publish_completion_locked","write_completion_marker",
+                    "_completion_marker_replay","_next_marker_sequence"):
+      with self.subTest(drift_at=target):
+       evidence.write_bytes(original_bytes)
+       with mock.patch.object(R,target,side_effect=drift_after_proof(getattr(R,target))):
+        with self.assertRaisesRegex(ValueError,"recorded-move-evidence-drift"):
+         R.complete_node(source,node,node["id"],evidence,jobs=jobs,attempt_id=attempt)
+       self.assertEqual(jobs.read_bytes(),original_row)
+       self.assertFalse(list(publications[0].glob("execute*.json")))
+       self.assertFalse(publications[1].exists())
+     evidence.write_bytes(original_bytes)
      with mock.patch.object(R,"_atomic_registry_replace",side_effect=OSError("interrupted")):
       with self.assertRaises(OSError):
        R.complete_node(source,node,node["id"],evidence,jobs=jobs,attempt_id=attempt)
@@ -3438,6 +3458,9 @@ class TestContinuation(unittest.TestCase):
      audit=json.loads(base64.urlsafe_b64decode(metadata["terminal_correction_b64"]+"="*(-len(metadata["terminal_correction_b64"])%4)))
      self.assertEqual(audit["terminal_time"],"2026-09-28T07:29:16Z")
      self.assertEqual(audit["terminal_log_sha256"],hashlib.sha256(log.read_bytes()).hexdigest())
+     self.assertEqual(marker["evidence"]["sha256"],audit["current_content_digest"].split(":",1)[1])
+     link=json.loads(publications[1].read_text(encoding="utf-8"))
+     self.assertEqual(link["evidence_sha256"],marker["evidence"]["sha256"])
      again,_=R.complete_node(source,node,node["id"],evidence,jobs=jobs,attempt_id=attempt)
      self.assertEqual(again["sequence"],marker["sequence"])
      self.assertEqual(jobs.read_bytes(),corrected)

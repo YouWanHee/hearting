@@ -4624,7 +4624,8 @@ def _next_marker_sequence(directory, node_id):
                 maximum=max(maximum,int(middle))
     return maximum+1
 
-def _completion_marker_replay(route, node, node_id, evidence, axes, directory, *, repair=True):
+def _completion_marker_replay(route, node, node_id, evidence, axes, directory, *, repair=True,
+                              evidence_sha256=None):
     """The one answer to "is this call a replay of the marker already on disk?".
 
     N2: this used to live only inside `write_completion_marker`, and the
@@ -4650,7 +4651,7 @@ def _completion_marker_replay(route, node, node_id, evidence, axes, directory, *
         candidate = canonical_path
     existing=json.loads(candidate.read_text(encoding="utf-8"))
     identity={
-        "evidence_sha256":evidence_digest(evidence),
+        "evidence_sha256":evidence_sha256 if evidence_sha256 is not None else evidence_digest(evidence),
         **axes,
     }
     existing_identity={
@@ -4689,12 +4690,15 @@ def _completion_marker_replay(route, node, node_id, evidence, axes, directory, *
 def write_completion_marker(
     route, node, node_id, evidence, *,
     attempt_id=None, attempt_metadata=None, review_claim=None, jobs=None,
-    owner_override=False, owner_chain=False,
+    owner_override=False, owner_chain=False, expected_evidence_sha256=None,
 ):
-    _migrate_completion_dir_forward(route["route_id"])
     directory=completion_dir(route["route_id"])
     canonical_path=directory/f"{node_id}.json"
+    if expected_evidence_sha256 is None:
+        _migrate_completion_dir_forward(route["route_id"])
     sha=evidence_digest(evidence)
+    if expected_evidence_sha256 is not None and "sha256:"+sha != expected_evidence_sha256:
+        raise ValueError("recorded-move-evidence-drift")
     axes=_marker_attempt_axes(node, attempt_id, attempt_metadata)
     review_identity=resolve_review_identity(
         node, axes, attempt_metadata,
@@ -4702,7 +4706,23 @@ def write_completion_marker(
         route_id=route["route_id"], node_id=node_id,
         owner_override=owner_override, owner_chain=owner_chain,
     )
-    replayed=_completion_marker_replay(route,node,node_id,evidence,axes,directory)
+    replayed=_completion_marker_replay(
+        route,node,node_id,evidence,axes,directory,
+        repair=expected_evidence_sha256 is None,
+        evidence_sha256=sha if expected_evidence_sha256 is not None else None,
+    )
+    if expected_evidence_sha256 is not None:
+        # A correction's current-manifest digest is an input to the normal
+        # writer. Recheck after its read-only census/replay work, before any
+        # marker, history or link can be published.
+        if "sha256:"+evidence_digest(evidence) != expected_evidence_sha256:
+            raise ValueError("recorded-move-evidence-drift")
+        _migrate_completion_dir_forward(route["route_id"])
+        if replayed is not None:
+            replayed=_completion_marker_replay(
+                route,node,node_id,evidence,axes,directory,
+                evidence_sha256=sha,
+            )
     if replayed is not None:
         # A replay is the same completion, so provenance is deliberately not in
         # marker identity -- but a caller that named a reviewer this time and
@@ -4766,6 +4786,8 @@ def write_completion_marker(
             independently_reviewed=review_identity.get("review_independence")=="independent",
         )
     sequence=_next_marker_sequence(directory,node_id)
+    if expected_evidence_sha256 is not None and "sha256:"+evidence_digest(evidence) != expected_evidence_sha256:
+        raise ValueError("recorded-move-evidence-drift")
     marker={
         "schema_version":2,
         "route_id":route["route_id"],"route_hash":route["route_hash"],
@@ -5807,6 +5829,7 @@ def _publish_completion_locked(
     owner_override=False,
     owner_chain=False,
     check_only=False,
+    expected_evidence_sha256=None,
 ):
     """Publish marker history, exact-attempt link, and canonical marker under one node lock."""
 
@@ -5820,6 +5843,8 @@ def _publish_completion_locked(
     _validate_auxiliary_arbiter(route, node, evidence)
     axes=_marker_attempt_axes(node,attempt_id,attempt_metadata)
     evidence_sha=evidence_digest(evidence)
+    if expected_evidence_sha256 is not None and "sha256:"+evidence_sha != expected_evidence_sha256:
+        raise ValueError("recorded-move-evidence-drift")
     attempt_path=(
         _attempt_completion_path(route,node_id,attempt_id)
         if attempt_id else None
@@ -5910,6 +5935,7 @@ def _publish_completion_locked(
             jobs=jobs,
             owner_override=owner_override,
             owner_chain=owner_chain,
+            expected_evidence_sha256=expected_evidence_sha256,
         )
     if not attempt_id:
         return marker
@@ -6805,6 +6831,9 @@ def _complete_node_locked(
                 # inversion of what happened, which is that the owner ruled over
                 # a review that returned FAIL.
                 owner_override=owner_closure is not None,
+                expected_evidence_sha256=(
+                    correction["current_content_digest"] if correction is not None else None
+                ),
             )
             if already_closed and not marker_eligible:
                 return marker, {"attempt_id":attempt_id,"status":"already-closed"}
